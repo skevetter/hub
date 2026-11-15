@@ -36,6 +36,8 @@ export class AgentSessions {
     connection: AgentConnection;
     createOptions: () => Promise<DaemonCreateAgentOptions>;
     onEvent: (event: AgentEvent) => void;
+    /** Called just before the prompt is sent to the daemon, the one step that is not repeatable. */
+    beforePromptSend?: () => void;
   }): Promise<{
     agentId: string;
     unsubscribe: () => void;
@@ -171,6 +173,7 @@ export class AgentSessions {
       intent: LaunchMachineIntent;
       connection: AgentConnection;
       onEvent: (event: AgentEvent) => void;
+      beforePromptSend?: () => void;
     },
     agentId: string,
     startupTimeoutMs: number,
@@ -182,6 +185,7 @@ export class AgentSessions {
       if (execution.deadlineAt !== null && execution.deadlineAt.getTime() <= this.now()) {
         throw new AgentSessionError("execution_deadline_exceeded");
       }
+      input.beforePromptSend?.();
       await input.connection.send(
         agentId,
         input.executionId,

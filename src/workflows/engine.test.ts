@@ -1644,6 +1644,158 @@ describe("durable multi-step workflow engine", () => {
   });
 });
 
+describe("workflow engine transient database failures", () => {
+  const poolTimeout = () => new Error("timeout exceeded when trying to connect");
+
+  /** Fails the named database methods with `error` this many times, then lets them through. */
+  function withFaults(
+    database: Database,
+    error: () => Error = poolTimeout,
+  ): { database: Database; fail(method: keyof Database, times: number): void } {
+    const remaining = new Map<PropertyKey, number>();
+    const proxy = new Proxy(database, {
+      get(target, property) {
+        const value: unknown = Reflect.get(target, property);
+        if (typeof value !== "function") return value;
+        return async (...args: unknown[]) => {
+          const left = remaining.get(property) ?? 0;
+          if (left > 0) {
+            remaining.set(property, left - 1);
+            throw error();
+          }
+          const result: unknown = Reflect.apply(value, target, args);
+          return result;
+        };
+      },
+    });
+    return { database: proxy, fail: (method, times) => remaining.set(method, times) };
+  }
+
+  async function setup(options: { error?: () => Error } = {}) {
+    const fixture = await workflowFixture({ rawConfiguration: contextOnlyConfiguration() });
+    const faulty = withFaults(fixture.database, options.error);
+    const stream = new FailureLogStream();
+    const sleeps: number[] = [];
+    const dispatches: string[] = [];
+    const failDispatch = { times: 0 };
+    const provider = {
+      ...providerMatch(fixture.configuration, fixture.revisionId),
+      async materializeContext() {
+        return { ambient: "once" };
+      },
+    } satisfies import("../triggers/index.js").TriggerProvider;
+    const { handler, engine } = createDurableWorkflowHandler({
+      database: faulty.database,
+      entitlements: fixture.entitlements,
+      providers: [provider],
+      logger: createLogger(stream),
+      retry: {
+        sleep: async (milliseconds) => {
+          sleeps.push(milliseconds);
+        },
+        random: () => 1,
+      },
+      dispatchLaunchMachineIntent: async (intent) => {
+        if (failDispatch.times > 0) {
+          failDispatch.times -= 1;
+          throw (options.error ?? poolTimeout)();
+        }
+        dispatches.push(dispatchLabel(intent));
+        const execution = await fixture.database.findAgentExecutionByWorkflowStepRunId(
+          intent.workflowStepRunId!,
+        );
+        if (execution === undefined) throw new Error("workflow execution was not persisted");
+        return { execution };
+      },
+    });
+    await handler(fixture.trigger("run"));
+    const run = async () =>
+      (
+        await fixture.database.findTriggerRunsByProviderEventReceiptId(
+          fixture.providerEventReceiptId,
+        )
+      )[0]!;
+    const finish = async () => {
+      const steps = await fixture.database.listWorkflowStepRunsForTriggerRun((await run()).id);
+      const execution = await fixture.database.findAgentExecutionByWorkflowStepRunId(steps[0]!.id);
+      assert.ok(execution);
+      await fixture.database.transitionAgentExecution(execution.id, "succeeded", {
+        result: { status: "succeeded" },
+      });
+      await engine.processAvailable();
+    };
+    return { fixture, faulty, stream, sleeps, dispatches, failDispatch, engine, run, finish };
+  }
+
+  it("retries a pool acquire timeout while preparing the wakeup and the run ends succeeded", async () => {
+    const test = await setup();
+    test.faulty.fail("findTriggerRunById", 2);
+    await test.engine.processAvailable();
+    assert.deepEqual(test.sleeps, [250, 500]);
+    assert.equal((await test.run()).status, "running");
+    assert.equal(test.dispatches.length, 1);
+    await test.finish();
+    assert.equal((await test.run()).status, "succeeded");
+    assert.equal(test.stream.records().length, 2, "each retry is a warning, not a failure");
+    assert.ok(test.stream.records().every((record) => record["level"] === 40));
+  });
+
+  it("retries a reset connection while creating the execution without a second reservation", async () => {
+    const test = await setup({ error: () => new Error("Connection terminated unexpectedly") });
+    test.faulty.fail("createWorkflowStepExecution", 2);
+    await test.engine.processAvailable();
+    assert.equal(test.dispatches.length, 1);
+    assert.equal((await test.fixture.entitlements.usage("org-1", "executions.monthly")).used, 1);
+    await test.finish();
+    assert.equal((await test.run()).status, "succeeded");
+  });
+
+  it("retries a failed dispatch of a created execution once and launches it exactly once", async () => {
+    const test = await setup();
+    test.failDispatch.times = 2;
+    await test.engine.processAvailable();
+    assert.deepEqual(test.sleeps, [250, 500]);
+    assert.equal(test.dispatches.length, 1);
+    assert.equal((await test.fixture.entitlements.usage("org-1", "executions.monthly")).used, 1);
+    await test.finish();
+    assert.equal((await test.run()).status, "succeeded");
+  });
+
+  it("retries a serialization failure", async () => {
+    const test = await setup({
+      error: () => Object.assign(new Error("could not serialize access"), { code: "40001" }),
+    });
+    test.faulty.fail("linkWorkflowStepRunExecution", 1);
+    await test.engine.processAvailable();
+    assert.equal(test.dispatches.length, 1);
+    await test.finish();
+    assert.equal((await test.run()).status, "succeeded");
+  });
+
+  it("reports one failure with the attempt count when every attempt fails, and keeps the run alive", async () => {
+    const test = await setup();
+    test.faulty.fail("findTriggerRunById", 100);
+    await test.engine.processAvailable();
+    assert.equal(test.sleeps.length, 5);
+    const failures = test.stream.records().filter((record) => record["level"] === 50);
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0]!["operation"], "workflow.wakeup.process");
+    assert.match(JSON.stringify(failures[0]), /"attempts":6/u);
+    assert.equal(test.dispatches.length, 0);
+    assert.equal((await test.run()).status, "running");
+  });
+
+  it("fails fast on an error that is not transient", async () => {
+    const test = await setup({ error: () => new Error("workflow trigger not found") });
+    test.faulty.fail("findTriggerRunById", 1);
+    await test.engine.processAvailable();
+    assert.deepEqual(test.sleeps, []);
+    const failures = test.stream.records().filter((record) => record["level"] === 50);
+    assert.equal(failures.length, 1);
+    assert.equal(JSON.stringify(failures[0]).includes("attempts"), false);
+  });
+});
+
 interface Fixture {
   database: Database;
   entitlements: EntitlementsService;

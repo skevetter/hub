@@ -18,6 +18,7 @@ import type { DaemonRecord } from "../db/types.js";
 import { createLogger, serializeError } from "../logger.js";
 import { MAX_EXPLICIT_AGENT_TITLE_CHARS } from "@getpaseo/protocol/agent-title-limits";
 import { assertOneFailure, FailureLogStream } from "../test-utils/failure-logs.js";
+import { enrollTestDaemon, TEST_DAEMON_ID } from "../test-utils/project-configuration.js";
 
 const DAEMON_ID = "daemon-ack-test";
 const AGENT_ID = "agent-ack-test";
@@ -545,6 +546,182 @@ function toolCall(
     },
   } as DaemonEvent;
 }
+
+describe("dispatch retries transient database failures", () => {
+  const poolTimeout = () => new Error("timeout exceeded when trying to connect");
+
+  async function dispatchFixture() {
+    const database = createMemoryDatabase({ organizationIds: ["org-1"] });
+    await enrollTestDaemon(database, "org-1");
+    const project = await database.createProject({
+      organizationId: "org-1",
+      name: "Dispatch",
+      slug: "dispatch",
+      createdByUserId: "user-1",
+    });
+    const revision = await database.insertProjectConfigurationRevision({
+      projectId: project.id,
+      sourceKind: "manual",
+      sourceEvidence: { kind: "test" },
+      normalizedConfiguration: { environments: [], triggers: [] },
+      contentHash: "dispatch-test",
+      createdByUserId: "user-1",
+    });
+    const run = (
+      await database.createAcceptedTriggerRun({
+        organizationId: "org-1",
+        projectId: project.id,
+        configurationRevisionId: revision.id,
+        providerEventReceiptId: "receipt-dispatch",
+        configuredTriggerName: "dispatch",
+        prompt: "raw",
+        inputs: {},
+        triggerContext: {},
+        outputContext: {},
+        deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+        stepIds: ["step"],
+      })
+    ).run;
+    const intent: LaunchMachineIntent = {
+      kind: "launch_machine",
+      organizationId: "org-1",
+      projectId: project.id,
+      triggerRunId: run.id,
+      triggerName: "dispatch",
+      environmentName: "runner",
+      environment: {
+        kind: "daemon",
+        daemonId: TEST_DAEMON_ID,
+        authoredSlug: "runner",
+        cwd: "/repo",
+      },
+      agent: { provider: "codex" },
+      prompt: "Do the work",
+      allowOutputs: [],
+      autoArchive: false,
+      background: false,
+      triggerContext: {},
+      outputContext: {},
+      configurationRevisionId: revision.id,
+      hubConfig: {},
+    };
+    const calls = { creates: [] as string[], sends: [] as string[] };
+    const agent = { id: AGENT_ID, workspaceId: "workspace-dispatch", status: "idle" as const };
+    const agents: AgentConnection = {
+      create: async (key) => {
+        calls.creates.push(key);
+        return agent;
+      },
+      get: async () => agent,
+      restore: async () => true,
+      control: async () => {},
+      watch: async () => () => {},
+      send: async (_agentId, messageId) => {
+        calls.sends.push(messageId);
+      },
+    };
+    const sleeps: number[] = [];
+    const stream = new FailureLogStream();
+    const lifecycle = createDaemonDispatchLifecycle({
+      database,
+      connectionForDaemon: () => ({
+        agents,
+        getProviderSnapshot: async () => {
+          throw new Error("not used");
+        },
+        refreshProviderSnapshot: async () => {},
+        validateAgentConfiguration: async () => ({ valid: true }),
+      }),
+      publicBaseUrl: "https://hub.test",
+      completionTokenSecret: "test-secret",
+      test: {
+        logger: createLogger(stream),
+        retry: {
+          sleep: async (milliseconds) => {
+            sleeps.push(milliseconds);
+          },
+          random: () => 1,
+        },
+      },
+    });
+    return { database, intent, lifecycle, calls, sleeps, stream };
+  }
+
+  it("retries a pool timeout before the agent is created and launches it once", async () => {
+    const { database, intent, lifecycle, calls, sleeps } = await dispatchFixture();
+    vi.spyOn(database, "saveAgentSession")
+      .mockRejectedValueOnce(poolTimeout())
+      .mockRejectedValueOnce(poolTimeout());
+    try {
+      const result = await lifecycle.dispatchLaunchMachineIntent(intent);
+      assert.equal(result.agentId, AGENT_ID);
+      assert.deepEqual(sleeps, [250, 500]);
+      assert.equal(calls.creates.length, 1);
+      assert.deepEqual(calls.sends, [result.execution.id]);
+      assert.equal((await database.findAgentExecutionById(result.execution.id))?.status, "running");
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("retries after the agent was created without creating a second one", async () => {
+    const { database, intent, lifecycle, calls, sleeps } = await dispatchFixture();
+    vi.spyOn(database, "attachAgentToExecution").mockRejectedValueOnce(poolTimeout());
+    try {
+      const result = await lifecycle.dispatchLaunchMachineIntent(intent);
+      assert.deepEqual(sleeps, [250]);
+      assert.equal(calls.creates.length, 1, "the saved session already holds the agent");
+      assert.deepEqual(calls.sends, [result.execution.id]);
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("does not retry once the prompt send has started", async () => {
+    const { database, intent, lifecycle, calls, sleeps, stream } = await dispatchFixture();
+    vi.spyOn(database, "transitionAgentExecution").mockRejectedValueOnce(poolTimeout());
+    try {
+      await assert.rejects(lifecycle.dispatchLaunchMachineIntent(intent));
+      assert.deepEqual(sleeps, []);
+      assert.equal(calls.sends.length, 1);
+      assert.equal(
+        stream.records().some((record) => record["operation"] === "daemon.dispatch"),
+        true,
+      );
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("reports one failure with the attempt count when the attempts run out", async () => {
+    const { database, intent, lifecycle, calls, sleeps, stream } = await dispatchFixture();
+    vi.spyOn(database, "saveAgentSession").mockRejectedValue(poolTimeout());
+    try {
+      await assert.rejects(lifecycle.dispatchLaunchMachineIntent(intent));
+      assert.equal(sleeps.length, 5);
+      assert.equal(calls.creates.length, 0);
+      assert.equal(calls.sends.length, 0);
+      const failures = stream
+        .records()
+        .filter((record) => record["operation"] === "daemon.dispatch");
+      assert.equal(failures.length, 1);
+      assert.match(JSON.stringify(failures[0]), /"attempts":6/u);
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("fails at once on an error that is not transient", async () => {
+    const { database, intent, lifecycle, sleeps } = await dispatchFixture();
+    vi.spyOn(database, "saveAgentSession").mockRejectedValueOnce(new Error("constraint violated"));
+    try {
+      await assert.rejects(lifecycle.dispatchLaunchMachineIntent(intent));
+      assert.deepEqual(sleeps, []);
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+});
 
 function daemonRecord(): DaemonRecord {
   const now = new Date("2026-01-01T00:00:00.000Z");

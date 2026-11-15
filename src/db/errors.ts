@@ -71,3 +71,31 @@ function isUnavailablePgError(error: unknown): boolean {
     (typeof code === "string" && code.startsWith("08"))
   );
 }
+
+const MAX_CAUSE_DEPTH = 5;
+const TRANSIENT_CODES = new Set(["ECONNRESET", "57P01", "40001", "40P01"]);
+const TRANSIENT_MESSAGE =
+  /timeout exceeded when trying to connect|connection terminated|connection reset|econnreset/iu;
+
+/**
+ * An infrastructure failure that a later attempt can get past: the pool had no free connection
+ * in time, the connection was reset or terminated, or PostgreSQL rolled the transaction back for
+ * a serialization failure or a deadlock. Anything else, such as a constraint violation or a bug,
+ * is not transient and must not be retried.
+ */
+export function isTransientDatabaseError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current instanceof Error; depth++) {
+    // A failure that already used up its attempts stays failed, however its cause reads.
+    if (current.name === "RetryExhaustedError") return false;
+    if (current instanceof DatabaseUnavailableError) return true;
+    const parsed = PgErrorCodeSchema.safeParse(current);
+    if (parsed.success && parsed.data.code !== undefined) {
+      const code = parsed.data.code;
+      if (TRANSIENT_CODES.has(code) || code.startsWith("08")) return true;
+    }
+    if (TRANSIENT_MESSAGE.test(current.message)) return true;
+    current = current.cause;
+  }
+  return false;
+}

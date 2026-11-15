@@ -26,6 +26,8 @@ import {
   type LaunchMachineIntent,
 } from "../dispatcher/launch-machine-intent.js";
 import { logger as defaultLogger } from "../logger.js";
+import { isTransientDatabaseError } from "../db/errors.js";
+import { retryDiagnostic, retryWithBackoff, type RetryRuntime } from "../db/retry.js";
 import { MAX_EXPLICIT_AGENT_TITLE_CHARS } from "@getpaseo/protocol/agent-title-limits";
 import { reportFailure } from "../failures/index.js";
 import type { TriggerProvider } from "../triggers/index.js";
@@ -112,6 +114,7 @@ export interface DaemonDispatchLifecycleOptions {
     logger?: Logger;
     dispatchTimeoutMs?: number;
     deadlineClock?: ExecutionDeadlineClock;
+    retry?: RetryRuntime;
   };
 }
 
@@ -1454,7 +1457,7 @@ export class DaemonDispatchLifecycle {
       return;
     }
 
-    this.report(failure, "daemon.dispatch", fields);
+    this.report(failure, "daemon.dispatch", { ...fields, ...retryDiagnostic(failure.cause) });
   }
 
   private report(
@@ -1536,6 +1539,7 @@ export class DaemonDispatchLifecycle {
     executionId: string;
     intent: LaunchMachineIntent;
     hubExecutionEnv: HubExecutionEnv;
+    beforePromptSend?: () => void;
   }): Promise<string> {
     const connection = this.options.connectionForDaemon(input.daemonId);
     if (!connection) throw new DaemonDispatchFailure("daemon_unreachable");
@@ -1544,6 +1548,9 @@ export class DaemonDispatchLifecycle {
         executionId: input.executionId,
         intent: input.intent,
         connection: connection.agents,
+        ...(input.beforePromptSend === undefined
+          ? {}
+          : { beforePromptSend: input.beforePromptSend }),
         createOptions: () =>
           this.buildCreateAgentOptions(input.intent, input.hubExecutionEnv).catch(
             (error: unknown) => {
@@ -1602,12 +1609,49 @@ export class DaemonDispatchLifecycle {
     if (!(await this.armLiveExecutionDeadline(input.executionId))) {
       throw new DaemonDispatchFailure("timeout");
     }
-    const agentId = await this.dispatchSession(input);
+    const agentId = await this.dispatchSessionWithRetry(input, isCanceled);
     if (isCanceled()) {
       this.releaseExecutionResources(input.executionId);
       throw new DaemonSpawnAckTimeoutError(this.dispatchTimeoutMs);
     }
     return agentId;
+  }
+
+  /**
+   * Retries a transient database failure only while nothing irreversible has happened. Creating
+   * the agent is safe to repeat because its idempotency key is the session id. Sending the prompt
+   * is not known to be, so once the send has started a failure is final.
+   */
+  private dispatchSessionWithRetry(
+    input: {
+      daemonId: string;
+      executionId: string;
+      intent: LaunchMachineIntent;
+      hubExecutionEnv: HubExecutionEnv;
+    },
+    isCanceled: () => boolean,
+  ): Promise<string> {
+    let promptSendStarted = false;
+    return retryWithBackoff(
+      () =>
+        this.dispatchSession({
+          ...input,
+          beforePromptSend: () => {
+            promptSendStarted = true;
+          },
+        }),
+      {
+        ...this.options.test?.retry,
+        isRetryable: (error) =>
+          !promptSendStarted && !isCanceled() && !this.stopping && isTransientDatabaseError(error),
+        onRetry: ({ attempt, delayMs }) => {
+          this.logger.warn(
+            { executionId: input.executionId, attempt, delayMs: Math.round(delayMs) },
+            "agent dispatch hit a transient database error and will be retried",
+          );
+        },
+      },
+    );
   }
 
   private async waitForPendingStreamHandlers(executionId: string): Promise<void> {

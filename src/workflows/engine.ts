@@ -1,5 +1,6 @@
 import { continuationKey } from "../triggers/continuation.js";
-import { DatabaseUnavailableError } from "../db/errors.js";
+import { DatabaseUnavailableError, isTransientDatabaseError } from "../db/errors.js";
+import { retryDiagnostic, retryWithBackoff, type RetryRuntime } from "../db/retry.js";
 import type {
   AgentExecutionRecord,
   Database,
@@ -84,6 +85,8 @@ export interface DurableWorkflowEngineOptions {
   onWorkflowRunStarted?: (run: AcceptedTriggerRunRecord) => Promise<JsonValue | null | void>;
   onWorkflowRunTerminal?: (run: TriggerRunRecord) => Promise<JsonValue | null | void>;
   logger?: Pick<Logger, "warn" | "error">;
+  /** Backoff timing for transient database failures. Tests inject `sleep` and `random`. */
+  retry?: RetryRuntime;
 }
 
 export class DurableWorkflowEngine {
@@ -237,11 +240,40 @@ export class DurableWorkflowEngine {
       const wakeup = await database.claimWorkflowWakeup(this.now(), this.leaseMs, visited);
       if (wakeup === undefined) return;
       try {
-        if ((await this.processWakeup(wakeup)) === "deferred") visited.push(wakeup.triggerRunId);
+        if ((await this.processWakeupWithRetry(wakeup)) === "deferred") {
+          visited.push(wakeup.triggerRunId);
+        }
       } catch (error) {
-        this.report(error, "workflow.wakeup.process", { triggerRunId: wakeup.triggerRunId });
+        this.report(error, "workflow.wakeup.process", {
+          triggerRunId: wakeup.triggerRunId,
+          ...retryDiagnostic(error),
+        });
       }
     }
+  }
+
+  /**
+   * A pool timeout, a reset connection or a deadlock says nothing about the run, so the wakeup is
+   * tried again with backoff. Each attempt after the first runs as a reclaimed lease does:
+   * a step whose execution was created but never handed to a daemon is dispatched again, which
+   * the durable execution id makes safe. Once the attempts are used up the error goes to the
+   * caller, the wakeup stays leased, and the next lease expiry picks it up.
+   */
+  private processWakeupWithRetry(wakeup: WorkflowWakeupRecord): Promise<"deferred" | void> {
+    return retryWithBackoff(
+      (attempt) =>
+        this.processWakeup(attempt === 1 ? wakeup : { ...wakeup, leasedBeforeClaim: true }),
+      {
+        ...this.options.retry,
+        isRetryable: (error) => !this.stopped && isTransientDatabaseError(error),
+        onRetry: ({ attempt, delayMs }) => {
+          this.logger.warn(
+            { triggerRunId: wakeup.triggerRunId, attempt, delayMs: Math.round(delayMs) },
+            "workflow wakeup hit a transient database error and will be retried",
+          );
+        },
+      },
+    );
   }
 
   private async processWakeup(wakeup: WorkflowWakeupRecord): Promise<"deferred" | void> {
