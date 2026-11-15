@@ -97,24 +97,101 @@ describe("organization trigger store", () => {
   });
 
   /**
-   * `Provider 'omp' cannot preapprove exact MCP tools for unattended execution` is what the
-   * daemon says when Hub sends its tool policy to a provider that cannot honour one. Hub sends
-   * that policy with every run, so the provider is refused at save.
+   * A daemon refuses Hub's tool policy for a provider whose contract takes none, so a provider
+   * outside the unattended table is refused at save, without asking the daemon.
    */
-  it("rejects a provider that cannot run unattended, without asking the daemon", async () => {
+  it.each(["gemini", "copilot"])(
+    "rejects provider %s, which cannot run unattended, without asking the daemon",
+    async (provider) => {
+      const database = await enrolledDatabase();
+      const store = new OrganizationTriggerStore(
+        database,
+        "org",
+        catalogAgentValidator({ [provider]: { modes: ["full-access"] } }),
+      );
+
+      await assert.rejects(
+        store.save({
+          yaml: triggerYaml(true).replace("provider: codex", `provider: ${provider}`),
+          userId: null,
+        }),
+        new RegExp(
+          `run\\.agent\\.provider: Provider '${provider}' cannot run unattended Hub automations; select Claude, Codex, OpenCode, or omp`,
+          "u",
+        ),
+      );
+    },
+  );
+
+  it.each([
+    ["claude", "default"],
+    ["codex", "full-access"],
+    ["opencode", "build"],
+    ["omp", "full"],
+  ])("accepts provider %s in mode %s", async (provider, mode) => {
     const database = await enrolledDatabase();
     const store = new OrganizationTriggerStore(
       database,
       "org",
-      catalogAgentValidator({ omp: { modes: ["full-access"] } }),
+      catalogAgentValidator({ [provider]: { modes: [mode] } }),
+    );
+
+    const saved = await store.save({
+      yaml: triggerYaml(true).replace(
+        "agent: { provider: codex, mode: full-access }",
+        `agent: { provider: ${provider}, mode: ${mode} }`,
+      ),
+      userId: null,
+    });
+
+    assert.equal(saved.enabled, true);
+  });
+
+  /**
+   * omp prompts for approval in `write` and `ask`. Hub never answers a prompt, so a run in either
+   * mode would idle until its timeout. The daemon offers the modes, so only Hub can refuse them.
+   */
+  it.each(["write", "ask"])("rejects omp in mode %s, which prompts for approval", async (mode) => {
+    const database = await enrolledDatabase();
+    const store = new OrganizationTriggerStore(
+      database,
+      "org",
+      catalogAgentValidator({ omp: { modes: ["full", "write", "ask"] } }),
     );
 
     await assert.rejects(
       store.save({
-        yaml: triggerYaml(true).replace("provider: codex", "provider: omp"),
+        yaml: triggerYaml(true).replace(
+          "agent: { provider: codex, mode: full-access }",
+          `agent: { provider: omp, mode: ${mode} }`,
+        ),
         userId: null,
       }),
-      /run\.agent\.provider: Provider 'omp' cannot run unattended Hub automations; select Claude, Codex, or OpenCode/u,
+      new RegExp(
+        `run\\.agent\\.mode: Mode '${mode}' is not allowed: provider 'omp' runs unattended only in mode 'full', because it approves every tool call and Hub cannot answer approval prompts`,
+        "u",
+      ),
+    );
+    assert.equal((await store.list()).length, 0);
+  });
+
+  it("rejects omp without a mode", async () => {
+    const database = await enrolledDatabase();
+    const store = new OrganizationTriggerStore(
+      database,
+      "org",
+      catalogAgentValidator({ omp: { modes: ["full"] } }),
+    );
+
+    await assert.rejects(
+      store.save({
+        yaml: triggerYaml(true).replace(
+          "agent: { provider: codex, mode: full-access }",
+          "agent: { provider: omp }",
+        ),
+        userId: null,
+      }),
+      /mode.*required/iu,
     );
   });
 

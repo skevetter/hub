@@ -45,8 +45,11 @@ import type { HubProviderSnapshotEntry } from "../hub/protocol.js";
 import { EventFields } from "./event-fields.js";
 import { NotificationStatusCard } from "./notification-status-card.js";
 import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
-import { selectedProviderModel } from "./provider-catalog.js";
-import { supportsUnattendedRuns } from "./configuration/unattended.js";
+import {
+  selectedProviderModel,
+  unattendedAgentOptions,
+  unattendedModeOptions,
+} from "./provider-catalog.js";
 
 type BrowserTrigger = TriggerSnapshot["triggers"][number];
 type EditorMode = "form" | "yaml";
@@ -1131,24 +1134,8 @@ function ProviderCatalogFields({
   onChange: (value: TriggerFormValue) => void;
 }) {
   const selected = selectedProviderModel(entries, form.agent);
-  // A provider the daemon cannot run unattended is not offered: Hub sends a tool policy with every
-  // run, and the daemon refuses the policy at launch for any provider outside that set.
-  const agentOptions = (entries ?? []).flatMap((entry) =>
-    entry.status !== "ready" || !entry.enabled || !supportsUnattendedRuns(entry.provider)
-      ? []
-      : (entry.models ?? [])
-          .filter((model) => model.isSelectable !== false)
-          .map((model) => ({
-            value: `${entry.provider}/${model.id}`,
-            label: model.label,
-            detail: `${entry.label ?? entry.provider} · ${entry.provider}/${model.id}`,
-            keywords: [model.label, entry.label ?? entry.provider, model.id],
-          })),
-  ) satisfies ComboboxOption[];
-  const modeOptions = (selected.entry?.modes ?? []).map((mode) => ({
-    value: mode.id,
-    label: mode.label,
-  }));
+  const agentOptions = unattendedAgentOptions(entries) satisfies ComboboxOption[];
+  const modeOptions = unattendedModeOptions(selected.entry);
   const thinkingOptions = (selected.model?.thinkingOptions ?? []).map((option) => ({
     value: option.id,
     label: option.label,
@@ -1158,7 +1145,7 @@ function ProviderCatalogFields({
       <FormField
         id="trigger-agent"
         label="Agent"
-        description="Models the selected daemon can run unattended: Claude, Codex, or OpenCode."
+        description="Models the selected daemon can run unattended: Claude, Codex, OpenCode, or omp."
         required
         {...fieldError(errors, "agent")}
       >
@@ -1181,7 +1168,7 @@ function ProviderCatalogFields({
       <FormField
         id="trigger-mode"
         label="Execution mode"
-        description="Modes reported for the selected provider."
+        description="Modes reported for the selected provider. omp runs unattended only in full."
         required
         {...fieldError(errors, "mode")}
       >

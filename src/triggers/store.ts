@@ -16,7 +16,11 @@ import {
   type TriggerDocument,
   type TriggerDocumentIssue,
 } from "./configuration/index.js";
-import { supportsUnattendedRuns, unattendedProviderRefusal } from "./configuration/unattended.js";
+import {
+  supportsUnattendedRuns,
+  unattendedModeRefusal,
+  unattendedProviderRefusal,
+} from "./configuration/unattended.js";
 
 export interface SaveTriggerInput {
   triggerId?: string;
@@ -131,6 +135,11 @@ export class OrganizationTriggerStore {
           path: [...path, "provider"],
           message: unattendedProviderRefusal(agent.provider),
         });
+        continue;
+      }
+      const modeRefusal = unattendedModeRefusal(agent.provider, agent.mode);
+      if (modeRefusal !== undefined) {
+        issues.push({ path: [...path, "mode"], message: modeRefusal });
         continue;
       }
       let verdict: Awaited<

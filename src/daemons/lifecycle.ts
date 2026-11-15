@@ -32,6 +32,7 @@ import type { TriggerProvider } from "../triggers/index.js";
 import type { ExecutionAuthority } from "../execution-authority/index.js";
 import { OutputExecutorRegistry } from "../execution-capabilities/outputs.js";
 import { executionToolPolicy } from "../execution-capabilities/tool-policy.js";
+import { sendsToolPolicy } from "../triggers/configuration/unattended.js";
 import {
   notifyAgentExecutionCompleted,
   notifyAgentExecutionFailed,
@@ -1965,12 +1966,16 @@ async function buildCreateAgentOptions(
     mcpServers: {
       hub: buildExecutionCapabilityMcpServer(hubExecutionEnv),
     },
-    toolPolicy: executionToolPolicy({
-      allowOutputs: intent.allowOutputs,
-      outputContext: intent.outputContext,
-      ...(intent.outputSchema === undefined ? {} : { outputSchema: intent.outputSchema }),
-      capabilities,
-    }),
+    ...(sendsToolPolicy(intent.agent.provider)
+      ? {
+          toolPolicy: executionToolPolicy({
+            allowOutputs: intent.allowOutputs,
+            outputContext: intent.outputContext,
+            ...(intent.outputSchema === undefined ? {} : { outputSchema: intent.outputSchema }),
+            capabilities,
+          }),
+        }
+      : {}),
     ...(intent.environment.worktree === undefined
       ? {}
       : {

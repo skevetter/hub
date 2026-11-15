@@ -17,7 +17,8 @@ export interface DaemonCreateAgentOptions {
   model?: string;
   thinkingOptionId?: string;
   providerOptions?: Readonly<Record<string, JsonValue>>;
-  toolPolicy: ToolPolicy;
+  /** Absent for a provider whose daemon contract takes no tool policy (omp, run in mode full). */
+  toolPolicy?: ToolPolicy;
   cwd: string;
   env: Record<string, string>;
   mcpServers?: Record<string, McpHttpServerConfig>;

@@ -103,9 +103,9 @@ test("creates a trigger visually, preserves advanced YAML through the form, and 
       "run.agent.mode: Mode 'default' is not available for provider 'opencode'",
     );
     await triggers.replaceYaml(
-      advancedTriggerYaml(daemon).replace("provider: opencode", "provider: omp"),
+      advancedTriggerYaml(daemon).replace("provider: opencode", "provider: gemini"),
     );
-    await triggers.expectRefusedOnSubmit("Provider 'omp' cannot run unattended Hub automations");
+    await triggers.expectRefusedOnSubmit("Provider 'gemini' cannot run unattended Hub automations");
     await triggers.capture(`${SHOTS}/03b-refused-mode.png`);
   });
 

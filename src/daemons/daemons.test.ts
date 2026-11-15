@@ -241,6 +241,41 @@ describe("daemon enrollment and execution", () => {
     });
   });
 
+  it.each([
+    ["claude", "default"],
+    ["codex", "full-access"],
+    ["opencode", "build"],
+  ])("sends the exact tool policy for %s", async (provider, mode) => {
+    await hub.connectDaemon();
+
+    await hub.dispatch({ agent: { provider, mode } });
+
+    assert.deepEqual(hub.createdAgentLaunch().toolPolicy, {
+      preapproved: [{ kind: "mcp", server: "hub", tool: "finish_execution" }],
+    });
+  });
+
+  it("omits the tool policy for omp and still injects the Hub MCP server", async () => {
+    await hub.connectDaemon();
+
+    const result = await hub.dispatch({
+      agent: { provider: "omp", mode: "full" },
+      outputContext: { provider: "discord", channelId: "channel-1" },
+    });
+    const launch = hub.createdAgentLaunch();
+
+    assert.equal(launch.provider, "omp");
+    assert.equal(launch.modeId, "full");
+    assert.equal(launch.toolPolicy, undefined);
+    assert.deepEqual(launch.mcpServers, {
+      hub: {
+        type: "http",
+        url: `${hub.originUrl()}/agent-executions/${result.execution.id}/mcp`,
+        headers: { Authorization: "Bearer <private>" },
+      },
+    });
+  });
+
   it("passes provider options unchanged and keeps an omitted mode omitted", async () => {
     await hub.connectDaemon();
     const options = {
