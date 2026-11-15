@@ -33,24 +33,40 @@ function whenOrNever(value: string | null, empty: string) {
   );
 }
 
+function pollInterval(seconds: number | null) {
+  return seconds === null ? (
+    <span className="text-muted-foreground">Not polling</span>
+  ) : (
+    <span className="tabular-nums">{seconds} seconds</span>
+  );
+}
+
+/** Six facts, so the three-column grid has no empty cell. The error gets its own block. */
 function rows(status: NotificationStatusView): readonly SummaryRow[] {
   const pill = STATE_PILL[status.state];
-  const result: SummaryRow[] = [
+  return [
     { label: "Status", value: <StatusPill tone={pill.tone}>{pill.label}</StatusPill> },
     { label: "Last poll", value: whenOrNever(status.lastSuccessAt, "Not yet") },
     { label: "Next poll", value: whenOrNever(status.nextPollAt, "Not scheduled") },
+    { label: "Poll interval", value: pollInterval(status.pollIntervalSeconds) },
     {
       label: "Delivered in the last 24 hours",
       value: <span className="tabular-nums">{status.delivered24h}</span>,
     },
+    {
+      label: "Token",
+      // Only whether it is set. The Hub never sends the value to the browser.
+      value: status.tokenConfigured ? (
+        "Configured"
+      ) : (
+        <span className="text-muted-foreground">Not set</span>
+      ),
+    },
   ];
-  if (status.lastError !== null) {
-    result.push({
-      label: "Last error",
-      value: <span className="text-muted-foreground">{status.lastError}</span>,
-    });
-  }
-  return result;
+}
+
+function errorRows(message: string): readonly SummaryRow[] {
+  return [{ label: "Last error", value: <span className="text-muted-foreground">{message}</span> }];
 }
 
 /** The health of the GitHub notification poll, for an organization that has a trigger for it. */
@@ -66,6 +82,9 @@ export function NotificationStatusCard({ status }: { status: NotificationStatusV
         </WarningAlert>
       ) : null}
       <SummaryPanel label="GitHub notifications" rows={rows(status)} />
+      {status.lastError === null ? null : (
+        <SummaryPanel label="GitHub notifications error" rows={errorRows(status.lastError)} />
+      )}
     </Card>
   );
 }

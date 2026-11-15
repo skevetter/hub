@@ -128,15 +128,21 @@ comment text.
 ## Status in the UI
 
 The Triggers page shows a **GitHub notifications** card when your organization has a
-`github.notification` trigger, enabled or not. The card has these rows:
+`github.notification` trigger, enabled or not. The card has six rows in a three column grid. After a
+failure, the last error appears in its own block below the grid.
 
 | Row                            | Meaning                                                                                  |
 | ------------------------------ | ---------------------------------------------------------------------------------------- |
 | Status                         | One of the states below.                                                                 |
 | Last poll                      | When the last poll finished without an error. A `304` counts.                            |
 | Next poll                      | When the next poll may run.                                                              |
+| Poll interval                  | The configured seconds between polls, for example `60 seconds`. `Not polling` while off. |
 | Delivered in the last 24 hours | Notifications that started runs for your organization, counted by receipt.               |
-| Last error                     | The latest failure, up to 200 characters, without the token. Only shown after a failure. |
+| Token                          | `Configured` or `Not set`. The card never shows the token.                               |
+| Last error (below the grid)    | The latest failure, up to 200 characters, without the token. Only shown after a failure. |
+
+The poll interval is your setting. GitHub can ask for a longer wait with `X-Poll-Interval`, and Hub
+then waits that long.
 
 States:
 
@@ -151,6 +157,19 @@ States:
 
 The status is stored with the cursor, so every Hub process shows the same card. The card never
 shows the token.
+
+## Trigger list
+
+The **Last triggered** column shows when the trigger last ran. The line under it summarizes the runs
+from the last 24 hours, so one failed run among many does not look like a failing trigger:
+
+- All runs succeeded: `Succeeded`.
+- All runs failed or timed out: `Failed`.
+- A mix: the count, for example `2 of 12 failed`.
+- No runs in the last 24 hours: only the time.
+
+The summary covers the trigger's 100 newest runs. Runs that are still running are not counted as
+failures.
 
 ## Limits
 

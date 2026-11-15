@@ -351,6 +351,9 @@ function triggerDashboardFor(
     ? null
     : new TriggerDashboard(options.database, options.auth, hub.agentValidator, {
         githubNotificationsEnabled: options.githubNotifications !== undefined,
+        ...(options.githubNotifications === undefined
+          ? {}
+          : { githubNotificationsPollSeconds: options.githubNotifications.pollIntervalMs / 1000 }),
       });
 }
 

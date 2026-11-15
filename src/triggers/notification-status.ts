@@ -8,6 +8,10 @@ export interface NotificationStatusView {
   nextPollAt: string | null;
   lastError: string | null;
   delivered24h: number;
+  /** The configured seconds between polls. Null while polling is off. */
+  pollIntervalSeconds: number | null;
+  /** Whether the Hub has a token. The token itself never leaves the server. */
+  tokenConfigured: boolean;
 }
 
 /** A poll more than this far past its due time means the loop is not running. */
@@ -37,6 +41,8 @@ export function notificationState(input: {
 
 export function notificationStatusView(input: {
   enabled: boolean;
+  /** The configured seconds between polls. */
+  pollIntervalSeconds?: number;
   status: NotificationPollStatus;
   delivered24h: number;
   now: Date;
@@ -48,5 +54,7 @@ export function notificationStatusView(input: {
     nextPollAt: status.nextPollAt?.toISOString() ?? null,
     lastError: status.lastError,
     delivered24h: input.delivered24h,
+    pollIntervalSeconds: input.enabled ? (input.pollIntervalSeconds ?? null) : null,
+    tokenConfigured: input.enabled,
   };
 }

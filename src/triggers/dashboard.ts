@@ -8,6 +8,7 @@ import type { DaemonAgentConfigurationValidator } from "../configuration/store.j
 import { projectTriggerForm } from "./configuration/editor.js";
 import { OrganizationTriggerStore } from "./store.js";
 import { notificationStatusView, type NotificationStatusView } from "./notification-status.js";
+import { summarizeRecentRuns, type RecentRuns } from "./recent-runs.js";
 
 const DAY_MS = 24 * 60 * 60_000;
 const NOTIFICATION_EVENT = "github.notification";
@@ -15,6 +16,8 @@ const NOTIFICATION_EVENT = "github.notification";
 export interface TriggerDashboardOptions {
   /** True when this Hub has a token for the GitHub notification poll. The token never leaves it. */
   githubNotificationsEnabled?: boolean;
+  /** Seconds between polls, as configured. Shown on the status card. */
+  githubNotificationsPollSeconds?: number;
   now?: () => Date;
 }
 
@@ -40,6 +43,9 @@ export class TriggerDashboard {
     ]);
     return notificationStatusView({
       enabled: this.options.githubNotificationsEnabled === true,
+      ...(this.options.githubNotificationsPollSeconds === undefined
+        ? {}
+        : { pollIntervalSeconds: this.options.githubNotificationsPollSeconds }),
       status,
       delivered24h,
       now,
@@ -60,20 +66,24 @@ export class TriggerDashboard {
       this.database.listDaemonsForOrganization(tenant.organization.id),
       this.database.organizationConnectionUsage(tenant.organization.id),
     ]);
-    const activity = (
-      await Promise.all(triggers.map((trigger) => this.activityForTrigger(trigger)))
-    )
+    const perTrigger = await Promise.all(
+      triggers.map((trigger) => this.activityForTrigger(trigger)),
+    );
+    const activity = perTrigger
       .flat()
       .sort((left, right) => right.receivedAt.localeCompare(left.receivedAt))
       .slice(0, 100);
+    const now = (this.options.now ?? (() => new Date()))();
     const triggerViews = await Promise.all(
-      triggers.map((trigger) =>
-        triggerView(
-          store,
-          trigger,
-          activity.find(({ triggerId }) => triggerId === trigger.id),
-        ),
-      ),
+      triggers.map((trigger, index) => {
+        // The summary uses the trigger's own newest runs, not the page-wide list cut to 100.
+        const own = perTrigger[index] ?? [];
+        const latest = own.reduce<(typeof own)[number] | undefined>(
+          (found, run) => (found === undefined || run.receivedAt > found.receivedAt ? run : found),
+          undefined,
+        );
+        return triggerView(store, trigger, latest, summarizeRecentRuns(own, now));
+      }),
     );
     const notifications = await this.notificationStatus(tenant.organization.id, triggerViews);
     return {
@@ -181,6 +191,7 @@ async function triggerView(
   lastTriggered:
     | { provider: string; source: string; status: string; receivedAt: string }
     | undefined,
+  recentRuns: RecentRuns,
 ) {
   const revision = await store.activeRevision(trigger);
   const evidence = record(revision.sourceEvidence);
@@ -202,6 +213,7 @@ async function triggerView(
       event,
       provider: triggerProvider(event, lastTriggered?.provider),
       lastTriggered: operational,
+      recentRuns,
     };
   }
   const projection = projectTriggerForm(revision.yaml);
@@ -220,6 +232,7 @@ async function triggerView(
       lastTriggered?.provider,
     ),
     lastTriggered: operational,
+    recentRuns,
   };
 }
 

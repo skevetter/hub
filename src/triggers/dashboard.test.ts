@@ -71,6 +71,66 @@ describe("trigger dashboard read model", () => {
       status: "running",
       receivedAt: receivedAt.toISOString(),
     });
+    // The run is months old, so the 24 hour summary is empty.
+    assert.deepEqual(after.triggers[0]?.recentRuns, { total: 0, succeeded: 0, failed: 0 });
+  });
+
+  it("summarizes the trigger's runs from the last 24 hours, one failure among many", async () => {
+    const database = createMemoryDatabase({ memberships: [MEMBERSHIP] });
+    await enrollTestDaemon(database, "org-1");
+    const trigger = await new OrganizationTriggerStore(
+      database,
+      "org-1",
+      acceptingAgentValidator(),
+    ).save({ yaml: triggerYaml, userId: "user-1" });
+    const revision = await database.findActiveProjectConfiguration(trigger.runtimeProjectId);
+    assert.ok(revision);
+    const outcomes = [
+      // Newest first: the latest run failed, but only 2 of the 12 in the window did.
+      { hoursAgo: 1, outcome: "failed" },
+      { hoursAgo: 2, outcome: "succeeded" },
+      { hoursAgo: 3, outcome: "succeeded" },
+      { hoursAgo: 4, outcome: "failed" },
+      ...Array.from({ length: 8 }, (_, index) => ({ hoursAgo: 5 + index, outcome: "succeeded" })),
+      { hoursAgo: 30, outcome: "failed" },
+    ];
+    for (const [index, { hoursAgo, outcome }] of outcomes.entries()) {
+      const receipt = await database.persistManualEvent({
+        organizationId: "org-1",
+        projectId: trigger.runtimeProjectId,
+        deliveryId: `summary-${String(index)}`,
+        source: "manual.run",
+        payload: {},
+        receivedAt: new Date(NOW.getTime() - hoursAgo * 3_600_000),
+      });
+      assert.equal(receipt.status, "accepted");
+      if (receipt.status !== "accepted") return;
+      const { run } = await database.createAcceptedTriggerRun({
+        organizationId: "org-1",
+        projectId: trigger.runtimeProjectId,
+        configurationRevisionId: revision.id,
+        providerEventReceiptId: receipt.event.providerEventReceiptId,
+        configuredTriggerName: "manual-task",
+        prompt: "run it",
+        inputs: {},
+        triggerContext: {},
+        outputContext: {},
+        deadlineAt: new Date(NOW.getTime() + 3_600_000),
+        stepIds: ["run"],
+      });
+      if (outcome === "failed") await database.failWorkflowRun(run.id, "failed", "boom");
+      else await database.succeedTriggerRun(run.id);
+    }
+    const dashboard = new TriggerDashboard(database, accountAuth(), acceptingAgentValidator(), {
+      now: () => NOW,
+    });
+    const view = (await dashboard.snapshot(request(), "acme")).triggers[0];
+    assert.equal(view?.lastTriggered?.status, "failed");
+    assert.equal(
+      view?.lastTriggered?.receivedAt,
+      new Date(NOW.getTime() - 3_600_000).toISOString(),
+    );
+    assert.deepEqual(view?.recentRuns, { total: 12, succeeded: 10, failed: 2 });
   });
 });
 
@@ -142,6 +202,7 @@ async function notificationDashboard(options: {
   }
   return new TriggerDashboard(database, accountAuth(), acceptingAgentValidator(), {
     githubNotificationsEnabled: options.enabled ?? true,
+    githubNotificationsPollSeconds: 60,
     now: () => NOW,
   });
 }
@@ -178,6 +239,8 @@ describe("trigger dashboard notification status", () => {
       nextPollAt: nextPollAt.toISOString(),
       lastError: null,
       delivered24h: 7,
+      pollIntervalSeconds: 60,
+      tokenConfigured: true,
     });
     assert.deepEqual(counted, [
       { organizationId: "org-1", since: new Date("2026-11-13T12:00:00.000Z") },
@@ -220,7 +283,20 @@ describe("trigger dashboard notification status", () => {
       nextPollAt: null,
       lastError: null,
       delivered24h: 0,
+      pollIntervalSeconds: 60,
+      tokenConfigured: true,
     });
+  });
+
+  it("reports no interval and no token when polling is off", async () => {
+    const dashboard = await notificationDashboard({
+      store: statusStore({}).store,
+      triggerEnabled: true,
+      enabled: false,
+    });
+    const { notifications } = await dashboard.snapshot(request(), "acme");
+    assert.equal(notifications?.pollIntervalSeconds, null);
+    assert.equal(notifications?.tokenConfigured, false);
   });
 });
 

@@ -18,10 +18,9 @@ import { FormActions } from "../components/app/form-actions.js";
 import { FieldSkeleton, FormField } from "../components/app/form-field.js";
 import { LoadingLine, Spinner } from "../components/app/loading.js";
 import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
-import { RelativeTime } from "../components/app/relative-time.js";
 import { Steps } from "../components/app/steps.js";
 import { SegmentedControl, type SegmentedOption } from "../components/app/segmented-control.js";
-import { StatusPill, statusLabel } from "../components/app/status-pill.js";
+import { StatusPill } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
 import { Textarea } from "../components/ui/textarea.js";
@@ -44,6 +43,7 @@ import { daemonProviderSnapshot } from "../daemons/functions.js";
 import type { HubProviderSnapshotEntry } from "../hub/protocol.js";
 import { EventFields } from "./event-fields.js";
 import { NotificationStatusCard } from "./notification-status-card.js";
+import { LastTriggered } from "./last-triggered.js";
 import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
 import {
   selectedProviderModel,
@@ -185,14 +185,10 @@ export function TriggersPanel() {
                 )}
               </DataCell>
               <DataCell>
-                {trigger.lastTriggered === null ? (
-                  <span className="text-muted-foreground">Never</span>
-                ) : (
-                  <TwoLine
-                    primary={<RelativeTime value={trigger.lastTriggered.receivedAt} />}
-                    secondary={statusLabel(trigger.lastTriggered.status)}
-                  />
-                )}
+                <LastTriggered
+                  lastTriggered={trigger.lastTriggered}
+                  recentRuns={trigger.recentRuns}
+                />
               </DataCell>
               <DataCell>
                 <StatusPill tone={trigger.enabled ? "success" : "neutral"}>
