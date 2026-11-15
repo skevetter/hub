@@ -2,12 +2,20 @@ import { createHash } from "node:crypto";
 import { dump, load } from "js-yaml";
 import {
   compileHubConfig,
+  isScriptStep,
+  type AuthoredAgentStep,
   type AuthoredStep,
   type AuthoredTrigger,
   type CompiledEnvironment,
   type CompiledTrigger,
 } from "../../config/compiler.js";
-import { TriggerDocumentSchema, type TriggerDocument } from "./schema.js";
+import {
+  isScriptRun,
+  TriggerDocumentSchema,
+  type TriggerAgentRun,
+  type TriggerDocument,
+  type TriggerScriptRun,
+} from "./schema.js";
 
 export { TriggerDocumentSchema, type TriggerDocument } from "./schema.js";
 export {
@@ -37,20 +45,13 @@ export interface CompiledTriggerDocument {
 
 export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
   const authored = parseTriggerDocument(yaml);
-  const namedAgents = "choices" in authored.run.agent ? authored.run.agent.choices : undefined;
-  const agent = "choices" in authored.run.agent ? authored.run.agent.select : authored.run.agent;
+  const run = authored.run;
+  const namedAgents = isScriptRun(run) || !("choices" in run.agent) ? undefined : run.agent.choices;
   const environment = {
     name: "target",
     kind: "daemon" as const,
-    ...authored.run.target,
+    ...run.target,
   };
-  const allowOutputs: NonNullable<AuthoredStep["allow_outputs"]> = [];
-  for (const [type, output] of Object.entries(authored.run.outputs ?? {})) {
-    const grant: NonNullable<AuthoredStep["allow_outputs"]>[number] = { type };
-    if (output.max !== undefined) grant.max = output.max;
-    if (output.required !== undefined) grant.required = output.required;
-    allowOutputs.push(grant);
-  }
   const triggers: AuthoredTrigger[] = [];
   const events = Object.entries(authored.on);
   // A manual dispatch addresses the trigger by its name, so `manual.run` carries it wherever it
@@ -63,28 +64,9 @@ export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
     const compiledTrigger: AuthoredTrigger = {
       name: internalEventName(authored.name, index, named),
       on: event,
-      max_runtime: authored.max_runtime ?? authored.run.max_runtime,
+      max_runtime: authored.max_runtime ?? run.max_runtime,
       filters: authoredFilters(event, definition),
-      steps: [
-        {
-          id: "run",
-          environment: "target",
-          max_runtime: authored.run.max_runtime,
-          idle_timeout: authored.run.idle_timeout,
-          ...(authored.run.startup_timeout === undefined
-            ? {}
-            : { startup_timeout: authored.run.startup_timeout }),
-          agent,
-          ...(authored.run.title === undefined ? {} : { title: authored.run.title }),
-          prompt: [{ text: authored.run.prompt }],
-          ...(authored.run.env === undefined ? {} : { env: authored.run.env }),
-          ...(authored.run.github === undefined ? {} : { github: authored.run.github }),
-          ...(authored.run.output === undefined ? {} : { output: authored.run.output }),
-          ...(allowOutputs.length === 0 ? {} : { allow_outputs: allowOutputs }),
-          auto_archive: authored.run.auto_archive,
-          background: authored.run.background,
-        },
-      ],
+      steps: [isScriptRun(run) ? scriptStep(run) : agentStep(run)],
     };
     if (authored.inputs !== undefined) compiledTrigger.inputs = authored.inputs;
     triggers.push(compiledTrigger);
@@ -113,10 +95,42 @@ export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
     events: compiled.triggers.map((trigger) =>
       withAutomaticReply({
         ...trigger,
-        steps: trigger.steps.map((step) => ({ ...step, continuation: authored.run.continuation })),
+        steps: trigger.steps.map((step) =>
+          isScriptRun(run) ? step : { ...step, continuation: run.continuation },
+        ),
       }),
     ),
     authoredHash: createHash("sha256").update(yaml).digest("hex"),
+  };
+}
+
+function scriptStep(run: TriggerScriptRun): AuthoredStep {
+  return { id: "run", environment: "target", max_runtime: run.max_runtime, script: run.script };
+}
+
+function agentStep(run: TriggerAgentRun): AuthoredAgentStep {
+  const allowOutputs: NonNullable<AuthoredAgentStep["allow_outputs"]> = [];
+  for (const [type, output] of Object.entries(run.outputs ?? {})) {
+    const grant: NonNullable<AuthoredAgentStep["allow_outputs"]>[number] = { type };
+    if (output.max !== undefined) grant.max = output.max;
+    if (output.required !== undefined) grant.required = output.required;
+    allowOutputs.push(grant);
+  }
+  return {
+    id: "run",
+    environment: "target",
+    max_runtime: run.max_runtime,
+    idle_timeout: run.idle_timeout,
+    ...(run.startup_timeout === undefined ? {} : { startup_timeout: run.startup_timeout }),
+    agent: "choices" in run.agent ? run.agent.select : run.agent,
+    ...(run.title === undefined ? {} : { title: run.title }),
+    prompt: [{ text: run.prompt }],
+    ...(run.env === undefined ? {} : { env: run.env }),
+    ...(run.github === undefined ? {} : { github: run.github }),
+    ...(run.output === undefined ? {} : { output: run.output }),
+    ...(allowOutputs.length === 0 ? {} : { allow_outputs: allowOutputs }),
+    auto_archive: run.auto_archive,
+    background: run.background,
   };
 }
 
@@ -125,12 +139,16 @@ function withAutomaticReply(trigger: CompiledTrigger): CompiledTrigger {
   if (replyType === undefined) return trigger;
   return {
     ...trigger,
-    steps: trigger.steps.map((step) => ({
-      ...step,
-      allowOutputs: step.allowOutputs.some(({ type }) => type === replyType)
-        ? step.allowOutputs
-        : [...step.allowOutputs, { type: replyType, required: false }],
-    })),
+    steps: trigger.steps.map((step) =>
+      isScriptStep(step)
+        ? step
+        : {
+            ...step,
+            allowOutputs: step.allowOutputs.some(({ type }) => type === replyType)
+              ? step.allowOutputs
+              : [...step.allowOutputs, { type: replyType, required: false }],
+          },
+    ),
   };
 }
 

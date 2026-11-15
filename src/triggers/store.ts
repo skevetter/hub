@@ -16,6 +16,7 @@ import {
   type TriggerDocument,
   type TriggerDocumentIssue,
 } from "./configuration/index.js";
+import { isScriptRun, type TriggerAgentRun } from "./configuration/schema.js";
 import {
   supportsUnattendedRuns,
   unattendedModeRefusal,
@@ -30,7 +31,7 @@ export interface SaveTriggerInput {
   sourceEvidence?: unknown;
 }
 
-type AuthoredAgent = Extract<TriggerDocument["run"]["agent"], { provider: string }>;
+type AuthoredAgent = Extract<TriggerAgentRun["agent"], { provider: string }>;
 
 export class OrganizationTriggerStore {
   constructor(
@@ -172,6 +173,8 @@ export class OrganizationTriggerStore {
 function authoredAgents(
   trigger: TriggerDocument,
 ): readonly { path: readonly string[]; agent: AuthoredAgent }[] {
+  // A script has no agent to check against the daemon.
+  if (isScriptRun(trigger.run)) return [];
   if ("choices" in trigger.run.agent) {
     return Object.entries(trigger.run.agent.choices).map(([name, agent]) => ({
       path: ["run", "agent", "choices", name],
@@ -208,7 +211,10 @@ function runtimeChanged(previousYaml: string, compiled: CompiledTriggerDocument)
     return true;
   }
   const runtime = (document: TriggerDocument) =>
-    JSON.stringify({ target: document.run.target, agent: document.run.agent });
+    JSON.stringify({
+      target: document.run.target,
+      agent: isScriptRun(document.run) ? null : document.run.agent,
+    });
   return runtime(previous) !== runtime(compiled.authored);
 }
 

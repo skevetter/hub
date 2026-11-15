@@ -102,7 +102,7 @@ export const TriggerOutputSchema = z
   })
   .strict();
 
-export const TriggerRunSchema = z
+export const TriggerAgentRunSchema = z
   .object({
     target: TriggerTargetSchema,
     agent: TriggerAgentSelectionSchema,
@@ -124,6 +124,95 @@ export const TriggerRunSchema = z
     background: z.boolean().default(false),
   })
   .strict();
+
+export const DEFAULT_SCRIPT_MAX_RUNTIME = "10m";
+
+export const TriggerScriptRunSchema = z
+  .object({
+    target: z.object({ daemon: z.string().min(1), cwd: z.string().min(1) }).strict(),
+    /** The script text `/bin/sh -c` runs. It is literal: event data arrives in HUB_EVENT_JSON. */
+    script: z.string().refine((script) => script.trim().length > 0, "script must not be blank"),
+    max_runtime: z.string().min(1).default(DEFAULT_SCRIPT_MAX_RUNTIME),
+  })
+  .strict();
+
+export type TriggerAgentRun = z.infer<typeof TriggerAgentRunSchema>;
+export type TriggerScriptRun = z.infer<typeof TriggerScriptRunSchema>;
+export type TriggerRun = TriggerAgentRun | TriggerScriptRun;
+
+export function isScriptRun(run: TriggerRun): run is TriggerScriptRun {
+  return "script" in run;
+}
+
+/** The run as an agent run, for code that is only ever given one. */
+export function agentRun(run: TriggerRun): TriggerAgentRun {
+  if (isScriptRun(run)) throw new Error("expected an agent run");
+  return run;
+}
+
+const TWO_TRIGGERS = "To do both, use two triggers on the same event.";
+
+/** Why each agent-only option has no meaning for a script, so the author is told what to do instead. */
+const SCRIPT_REJECTED_OPTIONS: Readonly<Record<string, string>> = {
+  agent: `agent does not apply to a script. A trigger runs an agent prompt or a script. ${TWO_TRIGGERS}`,
+  prompt: `prompt does not apply to a script. A trigger runs an agent prompt or a script. ${TWO_TRIGGERS}`,
+  continuation:
+    "continuation does not apply to a script. It has no agent conversation to continue.",
+  output: "output does not apply to a script. Hub records the exit code and the output tail.",
+  outputs: "outputs does not apply to a script. Hub records the exit code and the output tail.",
+  github:
+    "github does not apply to a script. Hub mints no token for it; the script runs as the daemon's user.",
+  env: "env does not apply to a script. It inherits the daemon's environment and reads the event from HUB_EVENT_JSON. Set other variables inside the script.",
+  idle_timeout: "idle_timeout does not apply to a script. Use max_runtime.",
+  startup_timeout: "startup_timeout does not apply to a script. Use max_runtime.",
+  title: "title does not apply to a script. It creates no workspace.",
+  background: "background does not apply to a script. It creates no workspace.",
+  auto_archive: "auto_archive does not apply to a script. It creates no workspace.",
+};
+
+/**
+ * `run` is one of two shapes, chosen by the `script` key, so each reports its own field errors
+ * instead of a union's "Invalid input".
+ */
+export const TriggerRunSchema = z.unknown().transform((value, context): TriggerRun => {
+  const issue = (path: (string | number)[], message: string) =>
+    context.addIssue({ code: "custom", path, message });
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    issue([], "run must be an object with a target and an action: agent and prompt, or script.");
+    return z.NEVER;
+  }
+  if (!("script" in value)) {
+    if (!("agent" in value) && !("prompt" in value)) {
+      issue([], "run needs an action: agent with prompt, or script.");
+      return z.NEVER;
+    }
+    const parsed = TriggerAgentRunSchema.safeParse(value);
+    if (parsed.success) return parsed.data;
+    for (const found of parsed.error.issues) issue(issuePath(found.path), found.message);
+    return z.NEVER;
+  }
+  const refused = Object.entries(SCRIPT_REJECTED_OPTIONS).filter(([key]) => key in value);
+  for (const [key, message] of refused) issue([key], message);
+  const target: unknown = "target" in value ? value.target : undefined;
+  const worktree = typeof target === "object" && target !== null && "worktree" in target;
+  if (worktree) {
+    issue(
+      ["target", "worktree"],
+      "worktree does not apply to a script. It runs in the working directory as it is.",
+    );
+  }
+  if (refused.length > 0 || worktree) return z.NEVER;
+  const parsed = TriggerScriptRunSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  for (const found of parsed.error.issues) issue(issuePath(found.path), found.message);
+  return z.NEVER;
+});
+
+function issuePath(path: readonly PropertyKey[]): (string | number)[] {
+  return path.map((segment) =>
+    typeof segment === "symbol" ? (segment.description ?? String(segment)) : segment,
+  );
+}
 
 export const TriggerDocumentSchema = z
   .object({
@@ -186,7 +275,11 @@ export const TriggerDocumentSchema = z
         message: "at least one event is required",
       });
     }
-    if ("choices" in trigger.run.agent && Object.keys(trigger.run.agent.choices).length === 0) {
+    if (
+      !isScriptRun(trigger.run) &&
+      "choices" in trigger.run.agent &&
+      Object.keys(trigger.run.agent.choices).length === 0
+    ) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["run", "agent", "choices"],

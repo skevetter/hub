@@ -1,3 +1,5 @@
+import { agentStep } from "../../config/compiler.js";
+import { agentRun } from "../configuration/schema.js";
 import { describe, expect, it } from "vitest";
 import {
   compileTriggerDocument,
@@ -35,7 +37,7 @@ describe("github.notification configuration", () => {
       reason: "mention",
       contains: "deploy",
     });
-    expect(event!.steps[0]!.allowOutputs).toEqual([]);
+    expect(agentStep(event!.steps[0]).allowOutputs).toEqual([]);
   });
 
   it("fails closed on from_users, connection and filters the poll cannot evaluate", () => {
@@ -125,7 +127,7 @@ describe("github.notification configuration", () => {
     expect(document.on["github.notification"]).toEqual({
       filters: { repo: "acme/webapp", reason: "mention", contains: "deploy" },
     });
-    expect(parseTriggerDocument(edited).run.prompt).toBe("Changed.");
+    expect(agentRun(parseTriggerDocument(edited).run).prompt).toBe("Changed.");
 
     const merged = mergeTriggerForm(FILTERED, { ...projection.value, cwd: "/elsewhere" });
     if (merged.status !== "ok") throw new Error(merged.reason);

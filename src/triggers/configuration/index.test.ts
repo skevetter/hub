@@ -1,3 +1,5 @@
+import { agentStep } from "../../config/compiler.js";
+import { agentRun } from "./schema.js";
 import assert from "node:assert/strict";
 import { parseProjectConfiguration } from "../../configuration/store.js";
 import type { ProjectConfigurationRevisionRecord } from "../../db/types.js";
@@ -93,10 +95,10 @@ describe("self-contained trigger documents", () => {
   background: ${background}`,
           );
     const compiled = compileTriggerDocument(yaml);
-    assert.equal(compiled.authored.run.background, background ?? false);
-    assert.equal(compiled.events[0]?.steps[0]?.background, background ?? false);
+    assert.equal(agentRun(compiled.authored.run).background, background ?? false);
+    assert.equal(agentStep(compiled.events[0]?.steps[0]).background, background ?? false);
     assert.equal(
-      parseTriggerDocument(serializeTriggerDocument(compiled.authored)).run.background,
+      agentRun(parseTriggerDocument(serializeTriggerDocument(compiled.authored)).run).background,
       background ?? false,
     );
   });
@@ -111,9 +113,10 @@ describe("self-contained trigger documents", () => {
   it("compiles and preserves a configurable startup timeout", () => {
     const yaml = trigger.replace("  max_runtime: 90m", "  max_runtime: 90m\n  startup_timeout: 3m");
     const compiled = compileTriggerDocument(yaml);
-    assert.equal(compiled.events[0]?.steps[0]?.startupTimeoutMs, 180_000);
+    assert.equal(agentStep(compiled.events[0]?.steps[0]).startupTimeoutMs, 180_000);
     assert.equal(
-      parseTriggerDocument(serializeTriggerDocument(compiled.authored)).run.startup_timeout,
+      agentRun(parseTriggerDocument(serializeTriggerDocument(compiled.authored)).run)
+        .startup_timeout,
       "3m",
     );
   });
@@ -122,9 +125,9 @@ describe("self-contained trigger documents", () => {
     const title = "Intake · ${{ paseo.execution.id }}";
     const yaml = trigger.replace("  max_runtime: 90m", `  max_runtime: 90m\n  title: "${title}"`);
     const compiled = compileTriggerDocument(yaml);
-    assert.equal(compiled.events[0]?.steps[0]?.title, title);
+    assert.equal(agentStep(compiled.events[0]?.steps[0]).title, title);
     assert.equal(
-      parseTriggerDocument(serializeTriggerDocument(compiled.authored)).run.title,
+      agentRun(parseTriggerDocument(serializeTriggerDocument(compiled.authored)).run).title,
       title,
     );
   });
@@ -162,17 +165,17 @@ describe("self-contained trigger documents", () => {
       compiled.events.map(({ on }) => on),
       ["slack.mention", "github.issue_comment"],
     );
-    assert.deepEqual(compiled.events[0]?.steps[0]?.agent, {
+    assert.deepEqual(agentStep(compiled.events[0]?.steps[0]).agent, {
       selector: "${{ paseo.inputs.model }}",
       choices: {
         codex: { provider: "codex", model: "gpt-5.6-sol" },
         claude: { provider: "claude", model: "claude-opus-5" },
       },
     });
-    assert.deepEqual(compiled.events[0]?.steps[0]?.allowOutputs, [
+    assert.deepEqual(agentStep(compiled.events[0]?.steps[0]).allowOutputs, [
       { type: "slack.reply", max: 5, required: false },
     ]);
-    assert.deepEqual(compiled.events[1]?.steps[0]?.allowOutputs, [
+    assert.deepEqual(agentStep(compiled.events[1]?.steps[0]).allowOutputs, [
       { type: "slack.reply", max: 5, required: false },
       { type: "github.reply", required: false },
     ]);
@@ -196,7 +199,7 @@ run:
 `);
 
     assert.deepEqual(compiled.events[0]?.filters?.from_users, ["*"]);
-    assert.deepEqual(compiled.events[0]?.steps[0]?.allowOutputs, []);
+    assert.deepEqual(agentStep(compiled.events[0]?.steps[0]).allowOutputs, []);
   });
 
   it("automatically grants an unlimited event-native reply for a new conversational trigger", () => {
@@ -212,7 +215,7 @@ run:
   prompt: Handle it
 `);
 
-    assert.deepEqual(compiled.events[0]?.steps[0]?.allowOutputs, [
+    assert.deepEqual(agentStep(compiled.events[0]?.steps[0]).allowOutputs, [
       { type: "slack.reply", required: false },
     ]);
   });
@@ -264,7 +267,8 @@ it("applies the continuation default when reading old trigger revisions without 
     environments: [{ ...compiled.environment, daemonId: "daemon" }],
     triggers: compiled.events,
   });
-  for (const event of stored.triggers) for (const step of event.steps) delete step.continuation;
+  for (const event of stored.triggers)
+    for (const step of event.steps) delete agentStep(step).continuation;
   const revision: ProjectConfigurationRevisionRecord = {
     id: "revision",
     projectId: "project",
@@ -282,10 +286,10 @@ it("applies the continuation default when reading old trigger revisions without 
     validatedAt: new Date(),
   };
   const loaded = parseProjectConfiguration(revision);
-  assert.deepEqual(loaded.triggers[0]?.steps[0]?.continuation, { mode: "conversation" });
-  assert.equal(stored.triggers[0]?.steps[0]?.continuation, undefined);
+  assert.deepEqual(agentStep(loaded.triggers[0]?.steps[0]).continuation, { mode: "conversation" });
+  assert.equal(agentStep(stored.triggers[0]?.steps[0]).continuation, undefined);
   const legacy = parseProjectConfiguration({ ...revision, sourceEvidence: { kind: "manual" } });
-  assert.equal(legacy.triggers[0]?.steps[0]?.continuation, undefined);
+  assert.equal(agentStep(legacy.triggers[0]?.steps[0]).continuation, undefined);
   const migratedLegacy = parseProjectConfiguration({
     ...revision,
     rawYaml: JSON.stringify({
