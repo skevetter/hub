@@ -38,7 +38,7 @@ export interface ScriptRunInput {
   /** How long the script may run, counted from the start of the run on the runner's clock. */
   timeoutMs: number;
   /** Called once the terminal exists, before any polling, so the id can be made durable. */
-  onTerminal?: (terminal: { id: string }) => Promise<void>;
+  onTerminal?: (terminal: { id: string; workspaceId?: string | undefined }) => Promise<void>;
   signal?: AbortSignal;
 }
 
@@ -59,6 +59,8 @@ export interface ScriptCleanupTarget {
   name: string;
   /** Absent when the terminal was never seen, for instance after a lost create response. */
   terminalId?: string | undefined;
+  /** The workspace the daemon put the terminal in, when known. Listing prefers it to `cwd`. */
+  workspaceId?: string | undefined;
 }
 
 export interface ScriptRunnerClock {
@@ -135,7 +137,12 @@ export async function runScript(
   } catch (error) {
     thrown = error;
   }
-  const target: ScriptCleanupTarget = { cwd: input.cwd, name: input.name, terminalId: created.id };
+  const target: ScriptCleanupTarget = {
+    cwd: input.cwd,
+    name: input.name,
+    terminalId: created.id,
+    workspaceId: created.workspaceId,
+  };
   // A shutdown leaves the step running, and recovery stops the terminal: one attempt is enough.
   const attempts = isAborted(input.signal) ? 1 : undefined;
   const stopped =
@@ -162,7 +169,7 @@ export async function runScript(
       });
       created.id = terminal.id;
       if (terminal.workspaceId !== undefined) created.workspaceId = terminal.workspaceId;
-      await input.onTerminal?.({ id: terminal.id });
+      await input.onTerminal?.({ id: terminal.id, workspaceId: terminal.workspaceId });
     } catch (error) {
       if (error instanceof DaemonResponseLostError) created.lostCreate = true;
       return refused(error, input.cwd);
@@ -180,7 +187,13 @@ export async function killScriptTerminal(
 ): Promise<void> {
   const stopped =
     target.terminalId !== undefined
-      ? await stopTerminal(terminals, target.terminalId, { cwd: target.cwd }, clock, retry)
+      ? await stopTerminal(
+          terminals,
+          target.terminalId,
+          { cwd: target.cwd, workspaceId: target.workspaceId },
+          clock,
+          retry,
+        )
       : await stopByName(terminals, target, clock, retry);
   if (!stopped) throw new Error("the daemon did not confirm the terminal stopped");
 }
@@ -191,7 +204,7 @@ export async function killScriptTerminal(
  */
 export async function sweepScriptTerminals(
   terminals: TerminalConnection,
-  scope: { cwd: string },
+  scope: { cwd: string; workspaceId?: string | undefined },
   keep: (name: string) => boolean | Promise<boolean>,
   clock: ScriptRunnerClock = systemScriptRunnerClock,
   retry: RetryRuntime = {},
@@ -253,18 +266,19 @@ async function stopTerminal(
 
 async function stopByName(
   terminals: TerminalConnection,
-  target: { cwd: string; name: string },
+  target: { cwd: string; name: string; workspaceId?: string | undefined },
   clock: ScriptRunnerClock,
   retry: RetryRuntime,
   attempts?: number,
 ): Promise<boolean> {
+  const scope = { cwd: target.cwd, workspaceId: target.workspaceId };
   try {
     await retryWithBackoff(
       async () => {
-        const found = await terminals.list({ cwd: target.cwd });
+        const found = await terminals.list(scope);
         const named = found.filter(({ name }) => name === target.name);
         for (const { id } of named) {
-          if (!(await stopTerminal(terminals, id, { cwd: target.cwd }, clock, retry, attempts))) {
+          if (!(await stopTerminal(terminals, id, scope, clock, retry, attempts))) {
             throw new TerminalNotStopped();
           }
         }
@@ -291,6 +305,18 @@ async function poll(
   let lastLines: readonly string[] = [];
   let lastTotal = 0;
   let lastLivenessCheck = Number.NEGATIVE_INFINITY;
+  /** At most every few seconds, asks the daemon whether the terminal still exists. */
+  const hasEnded = async (): Promise<boolean> => {
+    if (clock.now() - lastLivenessCheck < LIVENESS_INTERVAL_MS) return false;
+    lastLivenessCheck = clock.now();
+    return !(await stillListed(terminals, terminalId, scope));
+  };
+  const ended = (): ScriptRunResult => ({
+    ...tailOf(lastLines, lastTotal),
+    status: "failed",
+    exitCode: null,
+    failureReason: TERMINAL_ENDED_MESSAGE,
+  });
   for (;;) {
     if (isAborted(input.signal)) throw new ScriptRunAborted();
     if (clock.now() >= deadlineAt) {
@@ -309,10 +335,12 @@ async function poll(
       .capture(terminalId, -CAPTURE_LINES)
       .catch((error: unknown) => error);
     if (!isCapture(capture)) {
-      // A lost capture says nothing about the script. Ask again until the deadline.
       if (capture instanceof DaemonTerminalError && capture.code === "permission_denied") {
         return { ...tailOf(lastLines, lastTotal), ...refusedFields(capture, input.cwd) };
       }
+      // A lost capture says nothing about the script, so ask again until the deadline. But a
+      // terminal the daemon no longer lists will never answer, and holds a slot for nothing.
+      if (await hasEnded()) return ended();
       continue;
     }
     const lines = capture.lines.map(cleanLine);
@@ -335,16 +363,7 @@ async function poll(
       lastTotal = capture.totalLines;
       continue;
     }
-    if (clock.now() - lastLivenessCheck < LIVENESS_INTERVAL_MS) continue;
-    lastLivenessCheck = clock.now();
-    if (!(await stillListed(terminals, terminalId, scope))) {
-      return {
-        ...tailOf(lastLines, lastTotal),
-        status: "failed",
-        exitCode: null,
-        failureReason: TERMINAL_ENDED_MESSAGE,
-      };
-    }
+    if (await hasEnded()) return ended();
   }
 }
 
@@ -449,7 +468,7 @@ export interface ScriptStepRunner {
   /** Stops leftover script terminals in a directory that `keep` does not claim. */
   sweep(
     daemonId: string,
-    scope: { cwd: string },
+    scope: { cwd: string; workspaceId?: string | undefined },
     keep: (name: string) => boolean | Promise<boolean>,
   ): Promise<{ stopped: number; unconfirmed: number }>;
 }

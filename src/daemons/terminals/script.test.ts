@@ -368,6 +368,7 @@ test("a kill answered success false for a terminal that is still listed is retri
     cwd: "/work/webapp",
     name: "hub-script-step",
     terminalId: "terminal-1",
+    workspaceId: "ws-1",
   });
   expect(daemon.killAttempts).toHaveLength(5);
 });
@@ -518,4 +519,34 @@ test("sweeping stops leftover script terminals that nothing claims", async () =>
   );
   expect(result).toEqual({ stopped: 1, unconfirmed: 0 });
   expect(daemon.killed).toEqual(["terminal-2"]);
+});
+
+test("a capture that keeps failing for a terminal the daemon no longer lists ends the run quickly", async () => {
+  const { daemon, clock, run } = setup({ timeoutMs: 10 * 60_000 });
+  daemon.captureError = "terminal worker unavailable";
+  clock.at(1_000, () => daemon.remove());
+  const result = await run();
+  expect(result).toMatchObject({
+    status: "failed",
+    exitCode: null,
+    failureReason: TERMINAL_ENDED_MESSAGE,
+  });
+  // Well before the ten-minute deadline would have freed the slot.
+  expect(clock.time).toBeLessThan(10_000);
+  expect(daemon.killAttempts).toEqual(["terminal-1"]);
+});
+
+test("a capture that keeps failing for a terminal that is still listed is not ended early", async () => {
+  const { daemon, run } = setup({ timeoutMs: 30_000 });
+  daemon.captureError = "terminal worker unavailable";
+  const result = await run();
+  expect(result.status).toBe("timed_out");
+});
+
+test("a daemon that cannot be asked at all is waited for, not given up on", async () => {
+  const { daemon, run } = setup({ timeoutMs: 30_000 });
+  daemon.captureError = "terminal worker unavailable";
+  daemon.denied.add("list_terminals_request");
+  const result = await run();
+  expect(result.status).toBe("timed_out");
 });
