@@ -11,7 +11,7 @@ export function thread(
     repo?: string;
   } = {},
 ): GitHubNotificationThread {
-  const repo = overrides.repo ?? "ThermAI-Group/flightdeck";
+  const repo = overrides.repo ?? "acme/webapp";
   return {
     id: overrides.id ?? "1001",
     reason: overrides.reason ?? "mention",

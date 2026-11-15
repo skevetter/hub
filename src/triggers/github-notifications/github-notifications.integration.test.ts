@@ -21,20 +21,20 @@ const INTERVAL_MS = 60_000;
 const T0 = new Date("2026-11-14T10:00:00Z");
 const after = (ms: number) => new Date(T0.getTime() + ms);
 
-const flightdeck = thread({
+const webapp = thread({
   id: "1001",
-  repo: "ThermAI-Group/flightdeck",
+  repo: "acme/webapp",
   reason: "mention",
   updated_at: "2026-11-14T10:00:30Z",
   title: "Fix the flaky deploy check",
 });
-const terraform = thread({
+const infra = thread({
   id: "2002",
-  repo: "ThermAI-Group/terraform",
+  repo: "acme/infra",
   reason: "review_requested",
   updated_at: "2026-11-14T10:00:40Z",
   title: "Rotate the state bucket",
-  url: "https://api.github.com/repos/ThermAI-Group/terraform/pulls/7",
+  url: "https://api.github.com/repos/acme/infra/pulls/7",
 });
 
 let cleanup: (() => Promise<void>) | undefined;
@@ -135,14 +135,11 @@ describe("github notification polling", () => {
     const { store, github, poller } = fixture;
     await store.save({ yaml: notificationYaml("all-notifications"), userId: null });
     await store.save({
-      yaml: notificationYaml(
-        "flightdeck-mentions",
-        "      repo: thermai-group/FLIGHTDECK\n      reason: mention\n",
-      ),
+      yaml: notificationYaml("webapp-mentions", "      repo: acme/WEBAPP\n      reason: mention\n"),
       userId: null,
     });
     await store.save({
-      yaml: notificationYaml("terraform-reviews", "      reason: review_requested\n"),
+      yaml: notificationYaml("infra-reviews", "      reason: review_requested\n"),
       userId: null,
     });
     await store.save({
@@ -159,7 +156,7 @@ describe("github notification polling", () => {
     expect(github.requests).toHaveLength(0);
     expect(await fixture.count("provider_event_receipts")).toBe(0);
 
-    github.reply([flightdeck, terraform], {
+    github.reply([webapp, infra], {
       "last-modified": "Sat, 14 Nov 2026 10:01:00 GMT",
       "x-poll-interval": "60",
     });
@@ -173,9 +170,9 @@ describe("github notification polling", () => {
 
     expect(await fixture.runsByTrigger()).toEqual([
       "all-notifications <- 1001:2026-11-14T10:00:30Z",
-      "flightdeck-mentions <- 1001:2026-11-14T10:00:30Z",
+      "webapp-mentions <- 1001:2026-11-14T10:00:30Z",
       "all-notifications <- 2002:2026-11-14T10:00:40Z",
-      "terraform-reviews <- 2002:2026-11-14T10:00:40Z",
+      "infra-reviews <- 2002:2026-11-14T10:00:40Z",
       "title-prefix <- 2002:2026-11-14T10:00:40Z",
     ]);
     // One receipt per organization and thread update; each matching trigger has its own run.
@@ -195,16 +192,16 @@ describe("github notification polling", () => {
     expect(receipt).toMatchObject({
       provider: "github_notification",
       source: "github.notification",
-      repo: "ThermAI-Group/flightdeck",
+      repo: "acme/webapp",
     });
     expect(receipt.payload).toEqual({
       github_notification: {
-        repo: "ThermAI-Group/flightdeck",
+        repo: "acme/webapp",
         thread_id: "1001",
         subject_type: "PullRequest",
         title: "Fix the flaky deploy check",
         number: 42,
-        html_url: "https://github.com/ThermAI-Group/flightdeck/pull/42",
+        html_url: "https://github.com/acme/webapp/pull/42",
         reason: "mention",
         updated_at: "2026-11-14T10:00:30Z",
       },
@@ -216,12 +213,12 @@ describe("github notification polling", () => {
     const fixture = await setup();
     await fixture.store.save({ yaml: notificationYaml("all-notifications"), userId: null });
     await fixture.poller.poll(T0);
-    fixture.github.reply([flightdeck], { "last-modified": "stamp-1" });
+    fixture.github.reply([webapp], { "last-modified": "stamp-1" });
     await fixture.poller.poll(after(INTERVAL_MS));
     expect(await fixture.count("trigger_runs")).toBe(1);
 
     // The overlap window returns the thread again, and a 304 returns nothing.
-    fixture.github.reply([flightdeck], { "last-modified": "stamp-2" });
+    fixture.github.reply([webapp], { "last-modified": "stamp-2" });
     expect(await fixture.poller.poll(after(2 * INTERVAL_MS))).toMatchObject({ started: 0 });
     expect(fixture.github.requests[1]!.headers["if-modified-since"]).toBe("stamp-1");
     fixture.github.reply(null, {}, 304);
@@ -230,7 +227,7 @@ describe("github notification polling", () => {
     expect(await fixture.count("trigger_runs")).toBe(1);
 
     // A later update to the same thread is new work.
-    fixture.github.reply([{ ...flightdeck, updated_at: "2026-11-14T10:05:00Z" }]);
+    fixture.github.reply([{ ...webapp, updated_at: "2026-11-14T10:05:00Z" }]);
     expect(await fixture.poller.poll(after(4 * INTERVAL_MS))).toMatchObject({ started: 1 });
     expect(await fixture.count("provider_event_receipts")).toBe(2);
   });
@@ -243,14 +240,14 @@ describe("github notification polling", () => {
     const now = after(INTERVAL_MS);
     const next = { ...cursor!, nextPollAt: after(2 * INTERVAL_MS) };
     const [first, second] = await Promise.all([
-      fixture.database.githubNotifications.deliver([flightdeck], next, now),
-      fixture.database.githubNotifications.deliver([flightdeck], next, now),
+      fixture.database.githubNotifications.deliver([webapp], next, now),
+      fixture.database.githubNotifications.deliver([webapp], next, now),
     ]);
     expect([first, second].sort((a, b) => a - b)).toEqual([0, 1]);
     expect(await fixture.count("trigger_runs")).toBe(1);
 
-    fixture.github.reply([terraform]);
-    fixture.github.reply([terraform]);
+    fixture.github.reply([infra]);
+    fixture.github.reply([infra]);
     const results = await Promise.all([
       fixture.poller.poll(after(3 * INTERVAL_MS)),
       fixture.poller.poll(after(3 * INTERVAL_MS)),
@@ -268,7 +265,7 @@ describe("github notification polling", () => {
       "GitHub notifications returned 401: Bad credentials",
     );
     expect((await fixture.database.githubNotifications.readCursor())!.since).toEqual(T0);
-    fixture.github.reply([flightdeck]);
+    fixture.github.reply([webapp]);
     expect(await fixture.poller.poll(after(2 * INTERVAL_MS))).toMatchObject({ started: 1 });
     expect(new URL(fixture.github.requests[1]!.url).searchParams.get("since")).toBe(
       "2026-11-14T10:00:00Z",
@@ -282,14 +279,14 @@ describe("github notification polling", () => {
     await fixture.bundle.runtime.query(
       "alter table workflow_wakeups add constraint reject_test_wakeup check (false) not valid",
     );
-    fixture.github.reply([flightdeck]);
+    fixture.github.reply([webapp]);
     await expect(fixture.poller.poll(after(INTERVAL_MS))).rejects.toThrow();
     expect(await fixture.count("provider_event_receipts")).toBe(0);
     expect((await fixture.database.githubNotifications.readCursor())!.since).toEqual(T0);
     await fixture.bundle.runtime.query(
       "alter table workflow_wakeups drop constraint reject_test_wakeup",
     );
-    fixture.github.reply([flightdeck]);
+    fixture.github.reply([webapp]);
     expect(await fixture.poller.poll(after(2 * INTERVAL_MS))).toMatchObject({ started: 1 });
   });
 
@@ -321,7 +318,7 @@ describe("github notification polling", () => {
   it("saves a repo filter without a GitHub connection or repository", async () => {
     const fixture = await setup();
     const saved = await fixture.store.save({
-      yaml: notificationYaml("unconnected", "      repo: ThermAI-Group/flightdeck\n"),
+      yaml: notificationYaml("unconnected", "      repo: acme/webapp\n"),
       userId: null,
     });
     expect(saved.enabled).toBe(true);
@@ -341,7 +338,7 @@ describe("github notification polling", () => {
         return () => {};
       },
     };
-    fixture.github.reply([flightdeck]);
+    fixture.github.reply([webapp]);
     const runtime = createHubRuntime({
       database: fixture.database,
       entitlements: createUnlimitedEntitlementsService(),
@@ -370,9 +367,7 @@ describe("github notification polling", () => {
       await expect.poll(() => connection.launches.length).toBe(1);
       await expect.poll(() => connection.prompts.length).toBe(1);
       expect(connection.prompts[0]).toContain("Fix the flaky deploy check");
-      expect(connection.prompts[0]).toContain(
-        "https://github.com/ThermAI-Group/flightdeck/pull/42",
-      );
+      expect(connection.prompts[0]).toContain("https://github.com/acme/webapp/pull/42");
       expect(connection.prompts[0]).not.toContain(TOKEN);
       expect(
         (await fixture.database.listOrganizationRunsSince("notify-org", new Date(0), 10)).map(

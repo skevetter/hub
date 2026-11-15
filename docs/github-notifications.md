@@ -33,12 +33,12 @@ enabled: true
 on:
   github.notification:
     filters:
-      repo: ThermAI-Group/flightdeck
+      repo: acme/webapp
       reason: review_requested
 run:
   target:
     daemon: your-daemon
-    cwd: /workspace/flightdeck
+    cwd: /workspace/webapp
   agent:
     provider: codex
     mode: full-access
@@ -76,12 +76,12 @@ comment text.
 ```json
 {
   "github_notification": {
-    "repo": "ThermAI-Group/flightdeck",
+    "repo": "acme/webapp",
     "thread_id": "1001",
     "subject_type": "PullRequest",
     "title": "Fix the flaky deploy check",
     "number": 42,
-    "html_url": "https://github.com/ThermAI-Group/flightdeck/pull/42",
+    "html_url": "https://github.com/acme/webapp/pull/42",
     "reason": "review_requested",
     "updated_at": "2026-11-14T10:00:30Z"
   }
@@ -121,6 +121,10 @@ comment text.
 - Classic personal access tokens only.
 - The token sees only your notifications. Other people's notifications are not visible to it.
 - Threads you do not take part in are not included, because Hub sets `participating=true`.
+- The token belongs to the Hub, not to an organization. On an instance with several organizations,
+  every organization's matching triggers run for each notification.
+- After a long outage, every thread that changed meanwhile starts one run at the next poll. Set
+  `repo` or `reason` filters so a backlog does not start unrelated runs.
 
 ## Security
 

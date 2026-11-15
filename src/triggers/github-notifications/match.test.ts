@@ -12,8 +12,8 @@ describe("matchesNotification", () => {
   });
 
   it("matches the repository without regard to case", () => {
-    expect(matchesNotification(payload, { repo: "thermai-group/FlightDeck" })).toBe(true);
-    expect(matchesNotification(payload, { repo: "ThermAI-Group/terraform" })).toBe(false);
+    expect(matchesNotification(payload, { repo: "acme/WebApp" })).toBe(true);
+    expect(matchesNotification(payload, { repo: "acme/infra" })).toBe(false);
   });
 
   it("matches the reason exactly", () => {
@@ -29,7 +29,7 @@ describe("matchesNotification", () => {
   });
 
   it("requires every filter that is set", () => {
-    const filters = { repo: "ThermAI-Group/flightdeck", reason: "mention", contains: "deploy" };
+    const filters = { repo: "acme/webapp", reason: "mention", contains: "deploy" };
     expect(matchesNotification(payload, filters)).toBe(true);
     expect(matchesNotification(payload, { ...filters, reason: "author" })).toBe(false);
   });
@@ -38,12 +38,12 @@ describe("matchesNotification", () => {
 describe("toNotificationPayload", () => {
   it("builds the pull request URL from the API URL", () => {
     expect(payload).toEqual({
-      repo: "ThermAI-Group/flightdeck",
+      repo: "acme/webapp",
       thread_id: "1001",
       subject_type: "PullRequest",
       title: "Fix the flaky deploy check",
       number: 42,
-      html_url: "https://github.com/ThermAI-Group/flightdeck/pull/42",
+      html_url: "https://github.com/acme/webapp/pull/42",
       reason: "mention",
       updated_at: "2026-11-14T10:00:00Z",
     });

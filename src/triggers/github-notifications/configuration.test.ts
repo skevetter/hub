@@ -15,7 +15,7 @@ import { summarizeTrigger } from "../../projects/activity-summary.js";
 import { notificationYaml } from "./test-fixture.js";
 
 const FILTERED = `# poll my mentions
-${notificationYaml("flightdeck-mentions", "      repo: ThermAI-Group/flightdeck\n      reason: mention\n      contains: deploy\n")}`;
+${notificationYaml("webapp-mentions", "      repo: acme/webapp\n      reason: mention\n      contains: deploy\n")}`;
 
 describe("github.notification configuration", () => {
   it("is a connectionless Hub event the dashboard lists", () => {
@@ -31,7 +31,7 @@ describe("github.notification configuration", () => {
     const [event] = compileTriggerDocument(FILTERED).events;
     expect(event!.on).toBe("github.notification");
     expect(event!.filters).toEqual({
-      repo: "ThermAI-Group/flightdeck",
+      repo: "acme/webapp",
       reason: "mention",
       contains: "deploy",
     });
@@ -123,14 +123,14 @@ describe("github.notification configuration", () => {
     const document = parseTriggerDocument(edited);
     expect(document.name).toBe("renamed");
     expect(document.on["github.notification"]).toEqual({
-      filters: { repo: "ThermAI-Group/flightdeck", reason: "mention", contains: "deploy" },
+      filters: { repo: "acme/webapp", reason: "mention", contains: "deploy" },
     });
     expect(parseTriggerDocument(edited).run.prompt).toBe("Changed.");
 
     const merged = mergeTriggerForm(FILTERED, { ...projection.value, cwd: "/elsewhere" });
     if (merged.status !== "ok") throw new Error(merged.reason);
     expect(parseTriggerDocument(merged.yaml).on["github.notification"]!.filters).toMatchObject({
-      repo: "ThermAI-Group/flightdeck",
+      repo: "acme/webapp",
       reason: "mention",
     });
   });
@@ -150,16 +150,16 @@ describe("github.notification configuration", () => {
     expect(
       summarizeTrigger("github.notification", {
         github_notification: {
-          repo: "ThermAI-Group/flightdeck",
+          repo: "acme/webapp",
           title: "Fix the flaky deploy check",
-          html_url: "https://github.com/ThermAI-Group/flightdeck/pull/42",
+          html_url: "https://github.com/acme/webapp/pull/42",
         },
       }),
     ).toEqual({
       provider: "github_notification",
-      headline: "ThermAI-Group/flightdeck: Fix the flaky deploy check",
+      headline: "acme/webapp: Fix the flaky deploy check",
       actor: null,
-      externalUrl: "https://github.com/ThermAI-Group/flightdeck/pull/42",
+      externalUrl: "https://github.com/acme/webapp/pull/42",
     });
     expect(summarizeTrigger("github.notification", {}).headline).toBe("GitHub notification");
   });
