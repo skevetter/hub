@@ -5,10 +5,14 @@ export const NOTIFICATION_FROM_USERS_MESSAGE =
 export const NOTIFICATION_FILTER_KEYS = ["repo", "reason", "contains", "pattern"] as const;
 
 /**
- * The notification reasons a script may run for. Each one follows the author's own action or an
- * assignment, a review request, a state change or a CI result. The rest (mention, team_mention,
- * comment, subscribed, manual and any other) can be caused by someone who has no right to run code
- * on the host, since anyone can mention a user on a public repository.
+ * The notification reasons a script may run for. They are the ones tied to the user's own work: a
+ * thread they created, an assignment, a review request, a state change, a CI result. This does not
+ * make them outsider-proof. On a public repository anyone can comment on a thread the user created
+ * (reason `author`), change the state of a thread the user follows (`state_change`), and push code
+ * that starts a run the user is told about (`ci_activity`, possibly). The excluded reasons are the
+ * ones anyone can cause at will, such as a mention. The script text stays fixed, so an outsider
+ * controls only when the script runs and what `HUB_EVENT_JSON` holds. That is why event data is
+ * untrusted and why script triggers belong on private repositories.
  */
 export const SCRIPT_NOTIFICATION_REASONS = [
   "author",

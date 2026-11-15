@@ -148,9 +148,9 @@ What Hub guarantees about that stop, and what is best effort:
   `cleanup` record with the daemon, directory, terminal name and id. The run still ends normally.
 - **A sweep finishes the job.** Hub retries every `cleanup` record when the daemon connects, when
   Hub starts, and about once a minute while the daemon is connected. It also stops any terminal
-  named `hub-script-` in the directories those records name, unless a running step owns it. When the
+  named `hub-script-` in the workspaces or directories those records name, unless a running step owns it. When the
   daemon confirms, the record is removed.
-- **Best effort.** The sweep looks only in directories named by a record. A terminal Hub never
+- **Best effort.** The sweep looks only where a record points: the workspace the daemon chose for the terminal when Hub saw it, else the directory. A terminal Hub never
   heard of, in another directory, is not found. A daemon that stays offline keeps its terminals
   until it reconnects. The script itself ends on its own when the shell does, within 30 seconds of
   finishing.
@@ -202,6 +202,8 @@ Scripts run only on a Hub process that holds the daemon's connection, and a runn
 watched by that process alone. Running two Hub processes on one database is not supported for
 scripts.
 
+Pending cleanup records for a daemon that never returns stay in the step output until it reconnects.
+
 ## Restart and recovery
 
 Hub records the terminal as soon as it exists. If Hub restarts while a script runs, the new process
@@ -228,8 +230,12 @@ permission to run code there. Hub refuses to save a script trigger that is not s
 - **GitHub notifications.** A notification has no author to allowlist, so a script on it must set
   both `filters.repo` and `filters.reason`. `reason` must be one of `author`, `assign`,
   `review_requested`, `state_change` or `ci_activity`. Hub refuses `mention`, `team_mention`,
-  `comment`, `subscribed`, `manual` and any other reason. Third parties can cause a mention
-  notification, because anyone can mention a user on a public repository.
+  `comment`, `subscribed`, `manual` and any other reason, because anyone can mention a user.
+  The allowed reasons are not outsider-proof. On a public repository an outsider can cause
+  `author` (any comment on a thread you created), `state_change`, and possibly `ci_activity`.
+  The script text stays fixed, so an outsider controls only when the script runs and what is in
+  `HUB_EVENT_JSON`. Treat the event data as untrusted, and use script triggers on private
+  repositories.
 - **Schedules.** A `schedule.tick` script needs no audience. Only Hub starts it.
 - **Manual runs.** Script actions on `manual.run` are not available yet. The actor on a manual run,
   like every API call, is a string the caller chooses, so `from_users` cannot keep anyone out of
