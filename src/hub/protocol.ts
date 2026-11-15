@@ -83,8 +83,13 @@ const HubTimelineItemSchema = z
   })
   .passthrough();
 
+/** `hub / finish_execution` is how the daemon's omp provider titles a bridged MCP tool call. */
 export function isHubFinishExecutionToolName(name: string): boolean {
-  return name === "hub.finish_execution" || name === "mcp__hub__finish_execution";
+  return (
+    name === "hub.finish_execution" ||
+    name === "mcp__hub__finish_execution" ||
+    name === "hub / finish_execution"
+  );
 }
 
 export const HubDaemonHelloSchema = z.object({

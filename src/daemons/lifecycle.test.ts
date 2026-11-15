@@ -342,6 +342,20 @@ describe("durable Hub action acknowledgement state", () => {
     await fixture.lifecycle.stop();
   });
 
+  it("archives after finish_execution reported by the omp provider's bridged tool title", async () => {
+    const fixture = await acknowledgementFixture();
+    await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);
+
+    await fixture.connection.emit(toolCall("finish-call", "hub / finish_execution", "completed"));
+    await fixture.connection.emit(turnCompleted());
+    await fixture.connection.emit(agentIdle());
+
+    const execution = await fixture.database.findAgentExecutionById(EXECUTION_ID);
+    assert.equal(execution?.hubActionAcknowledgements.finishExecutionCall?.callId, "finish-call");
+    assert.deepEqual(fixture.connection.actions, ["archive"]);
+    await fixture.lifecycle.stop();
+  });
+
   it.each(["running", "canceled"] as const)(
     "does not archive while finish_execution is %s",
     async (status) => {
