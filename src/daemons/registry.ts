@@ -1,4 +1,5 @@
 import { DaemonAgents } from "./agents/index.js";
+import { DaemonTerminals } from "./terminals/index.js";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
@@ -50,6 +51,7 @@ type PendingRequest =
   | PendingProviderRefreshRequest;
 interface ActiveSocket {
   agents: DaemonAgents;
+  terminals: DaemonTerminals;
   generation: number;
   socket: WebSocket;
   daemon: DaemonRecord;
@@ -93,6 +95,7 @@ export class ActiveDaemonRegistry {
         () => this.clock.nowDate(),
         (error, operation) => this.report(error, operation, daemon.id),
       ),
+      terminals: new DaemonTerminals((frame) => socket.send(frame)),
       generation: ++this.generation,
       socket,
       daemon,
@@ -102,6 +105,7 @@ export class ActiveDaemonRegistry {
     };
     this.active.set(daemon.id, active);
     previous?.agents.close();
+    previous?.terminals.close();
     previous?.socket.close(4001, "replaced");
     socket.on("message", (data) => this.receive(active, readText(data)));
     socket.on("error", (error) => {
@@ -115,6 +119,7 @@ export class ActiveDaemonRegistry {
     });
     socket.on("close", () => {
       active.agents.close();
+      active.terminals.close();
       if (this.active.get(daemon.id)?.generation === active.generation) {
         this.active.delete(daemon.id);
         this.rejectGeneration(daemon.id, active.generation);
@@ -161,7 +166,8 @@ export class ActiveDaemonRegistry {
     const active = this.active.get(daemonId);
     if (!active?.ready || !active.daemon.permissions.includes("hub.execute")) return undefined;
     return {
-      agents: this.active.get(daemonId)!.agents,
+      agents: active.agents,
+      terminals: active.terminals,
       getProviderSnapshot: (options) => this.getProviderSnapshot(daemonId, options),
       refreshProviderSnapshot: (options) => this.refreshProviderSnapshot(daemonId, options),
       validateAgentConfiguration: (agent) => this.validateAgentConfiguration(daemonId, agent),
@@ -291,7 +297,7 @@ export class ActiveDaemonRegistry {
       active.socket.close(4400, "invalid daemon message");
       return;
     }
-    if (active.agents.receive(value)) return;
+    if (active.agents.receive(value) || active.terminals.receive(value)) return;
     const serverInfo = HubDaemonServerInfoEnvelopeSchema.safeParse(value);
     if (serverInfo.success) {
       this.acceptServerInfo(
