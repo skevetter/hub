@@ -1,3 +1,4 @@
+import { agentStep } from "./compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { currentProjectConfigurationFiles } from "../test-utils/current-project-configuration.js";
@@ -22,15 +23,16 @@ describe("current project configuration proof", () => {
         ["classify", "work"],
       );
       const worker = trigger.steps[1]!;
-      assert.ok("selector" in worker.agent);
-      if (!("selector" in worker.agent)) continue;
-      assert.deepEqual(worker.agent.choices["codex"]?.options, {
+      const selection = agentStep(worker).agent;
+      assert.ok("selector" in selection);
+      if (!("selector" in selection)) continue;
+      assert.deepEqual(selection.choices["codex"]?.options, {
         sandbox_workspace_write: {
           writable_roots: ["/var/cache/npm"],
           network_access: false,
         },
       });
-      assert.deepEqual(worker.allowOutputs, [
+      assert.deepEqual(agentStep(worker).allowOutputs, [
         {
           type: provider.startsWith("slack") ? "slack.reply" : "discord.reply",
           max: 1,

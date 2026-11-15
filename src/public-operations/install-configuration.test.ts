@@ -1,3 +1,4 @@
+import { agentStep } from "../config/compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import {
@@ -68,7 +69,7 @@ describe("public configuration bundle installation", () => {
       files().toSorted((left, right) => left.path.localeCompare(right.path)),
     );
     const compiled = parseCompiledHubConfig(revision.normalizedConfiguration);
-    assert.deepEqual(compiled.triggers[0]?.steps[0]?.prompt, [
+    assert.deepEqual(agentStep(compiled.triggers[0]?.steps[0]).prompt, [
       {
         kind: "partial",
         path: ".paseo/workflows/partials/docs/safety.md",

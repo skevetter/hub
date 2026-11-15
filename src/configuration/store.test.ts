@@ -1,3 +1,4 @@
+import { agentStep } from "../config/compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { dump } from "js-yaml";
@@ -85,9 +86,10 @@ describe("ProjectConfigurationStore resource compilation", () => {
     const active = await store.activate(revision.id);
 
     assert.deepEqual(revisionBundleFiles(revision), authoredFiles);
-    const activeAgent = active.configuration.triggers[0]?.steps[0]?.agent;
-    const storedAgent = parseCompiledHubConfig(revision.normalizedConfiguration).triggers[0]
-      ?.steps[0]?.agent;
+    const activeAgent = agentStep(active.configuration.triggers[0]?.steps[0]).agent;
+    const storedAgent = agentStep(
+      parseCompiledHubConfig(revision.normalizedConfiguration).triggers[0]?.steps[0],
+    ).agent;
     assert.ok(activeAgent !== undefined && !("selector" in activeAgent));
     assert.ok(storedAgent !== undefined && !("selector" in storedAgent));
     if (

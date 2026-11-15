@@ -1,3 +1,4 @@
+import { agentStep } from "./compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { compileHubBundle, HubBundleError } from "./bundle.js";
@@ -116,17 +117,18 @@ describe("Hub configuration bundle", () => {
     );
     assert.equal(trigger.sourceFile, ".paseo/workflows/route.yml");
     assert.equal(step.environment, "${{ paseo.inputs.repo }}");
-    assert.ok("selector" in step.agent);
-    if (!("selector" in step.agent)) return;
-    assert.equal(step.agent.selector, "${{ paseo.inputs.agent }}");
-    assert.deepEqual(Object.keys(step.agent.choices), ["claude", "codex-safe"]);
-    assert.deepEqual(step.agent.choices["codex-safe"]?.options, {
+    const selection = agentStep(step).agent;
+    assert.ok("selector" in selection);
+    if (!("selector" in selection)) return;
+    assert.equal(selection.selector, "${{ paseo.inputs.agent }}");
+    assert.deepEqual(Object.keys(selection.choices), ["claude", "codex-safe"]);
+    assert.deepEqual(selection.choices["codex-safe"]?.options, {
       sandbox_workspace_write: {
         writable_roots: ["/var/cache/npm"],
         network_access: false,
       },
     });
-    assert.deepEqual(step.prompt[0], {
+    assert.deepEqual(agentStep(step).prompt[0], {
       kind: "partial",
       path: ".paseo/workflows/partials/shared.md",
       content: "Keep context exact.",

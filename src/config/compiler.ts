@@ -171,7 +171,7 @@ const EnvironmentSchema = z.discriminatedUnion("kind", [
 
 const AuthoredAgentSelectionSchema = z.union([AgentSchema, z.string().min(1)]);
 
-const StepSchema = z
+const AgentStepSchema = z
   .object({
     id: z.string().min(1),
     environment: z.string().min(1),
@@ -190,6 +190,49 @@ const StepSchema = z
     background: z.boolean().optional(),
   })
   .strict();
+
+/** A shell script the daemon runs in a terminal, in place of an agent. */
+const ScriptStepSchema = z
+  .object({
+    id: z.string().min(1),
+    environment: z.string().min(1),
+    max_runtime: z.string().min(1),
+    script: z.string().refine((script) => script.trim().length > 0, "script must not be blank"),
+    if: z.string().min(1).optional(),
+  })
+  .strict();
+
+/** Picks the step kind by its `script` key so each kind reports its own field errors. */
+const StepSchema = z.unknown().transform((value, context) => {
+  const kind = isRecord(value) && "script" in value ? ScriptStepSchema : AgentStepSchema;
+  const parsed = kind.safeParse(value);
+  if (parsed.success) return parsed.data;
+  forwardIssues(parsed.error.issues, [], context);
+  return z.NEVER;
+});
+
+/** Re-reports a step's issues here, descending into a union's first branch for its detail. */
+function forwardIssues(
+  issues: readonly z.core.$ZodIssue[],
+  base: readonly PropertyKey[],
+  context: z.RefinementCtx,
+): void {
+  for (const issue of issues) {
+    const path = [...base, ...issue.path];
+    const branch = issue.code === "invalid_union" ? issue.errors[0] : undefined;
+    if (branch !== undefined && branch.length > 0) {
+      forwardIssues(branch, path, context);
+      continue;
+    }
+    context.addIssue({
+      code: "custom",
+      message: issue.message,
+      path: path.map((segment) =>
+        typeof segment === "symbol" ? (segment.description ?? String(segment)) : segment,
+      ),
+    });
+  }
+}
 
 const AuthoredTriggerSchema = z
   .object({
@@ -216,7 +259,9 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { readonly [key: string]: JsonValue };
 
 export type AuthoredEnvironment = z.infer<typeof EnvironmentSchema>;
-export type AuthoredStep = z.infer<typeof StepSchema>;
+export type AuthoredAgentStep = z.infer<typeof AgentStepSchema>;
+export type AuthoredScriptStep = z.infer<typeof ScriptStepSchema>;
+export type AuthoredStep = AuthoredAgentStep | AuthoredScriptStep;
 export type AuthoredTrigger = z.infer<typeof AuthoredTriggerSchema>;
 export type AuthoredTriggerFilter = z.infer<typeof AuthoredTriggerFilterSchema>;
 export type AuthoredHubConfig = z.infer<typeof AuthoredSchema>;
@@ -249,7 +294,8 @@ export interface CompiledInput {
   choices?: readonly JsonPrimitive[] | undefined;
 }
 
-export interface CompiledStep {
+export interface CompiledAgentStep {
+  kind?: "agent" | undefined;
   continuation?: import("../triggers/continuation.js").Continuation | undefined;
   id: string;
   environment: string;
@@ -267,6 +313,30 @@ export interface CompiledStep {
   allowOutputs: readonly { type: string; max?: number | undefined; required: boolean }[];
   autoArchive: boolean;
   background: boolean;
+}
+
+/** A step that runs a shell script in a daemon terminal. It has no agent, prompt, or output. */
+export interface CompiledScriptStep {
+  kind: "script";
+  id: string;
+  environment: string;
+  maxRuntimeMs: number;
+  /** The literal script text. It is never rendered from event data. */
+  script: string;
+  condition?: Expression | undefined;
+  output?: undefined;
+}
+
+export type CompiledStep = CompiledAgentStep | CompiledScriptStep;
+
+export function isScriptStep(step: CompiledStep): step is CompiledScriptStep {
+  return step.kind === "script";
+}
+
+/** The step as an agent step, for code that is only ever given one. */
+export function agentStep(step: CompiledStep | undefined): CompiledAgentStep {
+  if (step === undefined || isScriptStep(step)) throw new Error("expected an agent step");
+  return step;
 }
 
 export type CompiledSteps = readonly CompiledStep[];
@@ -400,8 +470,9 @@ const CompiledJsonSchemaSchema = z.custom<JsonValue>(
   (value) => isJsonValue(value) && isRecord(value),
 );
 
-const CompiledStepSchema: z.ZodType<CompiledStep> = z
+const CompiledAgentStepSchema = z
   .object({
+    kind: z.literal("agent").optional(),
     continuation: ContinuationSchema.optional(),
     id: z.string().regex(IDENTIFIER),
     environment: z.string().min(1),
@@ -428,6 +499,22 @@ const CompiledStepSchema: z.ZodType<CompiledStep> = z
     background: z.boolean().default(false),
   })
   .strict();
+
+const CompiledScriptStepSchema = z
+  .object({
+    kind: z.literal("script"),
+    id: z.string().regex(IDENTIFIER),
+    environment: z.string().min(1),
+    maxRuntimeMs: z.number().int().positive().max(MAX_DURATION_MS),
+    script: z.string().min(1),
+    condition: z.custom<Expression>(isExpression).optional(),
+  })
+  .strict();
+
+const CompiledStepSchema: z.ZodType<CompiledStep> = z.union([
+  CompiledScriptStepSchema,
+  CompiledAgentStepSchema,
+]);
 
 const CompiledTriggerSchema: z.ZodType<CompiledTrigger> = z
   .object({
@@ -567,6 +654,17 @@ function compileStep(
   resolvedPromptPartials: ResolvedPromptPartials | undefined,
   namedAgents: Readonly<Record<string, CompiledAgent>>,
 ): CompiledStep {
+  checkStepEnvironment(trigger, step, environmentNames, environments);
+  if ("script" in step) return compileScriptStep(trigger, step);
+  return compileAgentStep(trigger, step, resolvedPromptPartials, namedAgents);
+}
+
+function checkStepEnvironment(
+  trigger: AuthoredTrigger,
+  step: AuthoredStep,
+  environmentNames: ReadonlySet<string>,
+  environments: ReadonlyMap<string, AuthoredEnvironment>,
+): void {
   const stepPath = ["triggers", trigger.name, "steps", step.id] as const;
   compileAt([...stepPath, "environment"], () => {
     if (!environmentNames.has(step.environment) && !step.environment.includes(EXPRESSION_START)) {
@@ -579,6 +677,47 @@ function compileStep(
       );
     }
   });
+}
+
+function compileScriptStep(trigger: AuthoredTrigger, step: AuthoredScriptStep): CompiledScriptStep {
+  const stepPath = ["triggers", trigger.name, "steps", step.id] as const;
+  const maxRuntimeMs = compileAt([...stepPath, "max_runtime"], () =>
+    parseDurationMs(step.max_runtime, `trigger ${trigger.name} step ${step.id} max_runtime`),
+  );
+  const condition =
+    step.if === undefined
+      ? undefined
+      : compileAt([...stepPath, "if"], () => parseExpression(step.if!));
+  compileAt([...stepPath, "script"], () => validateScriptText(step.script));
+  return {
+    kind: "script",
+    id: step.id,
+    environment: step.environment,
+    maxRuntimeMs,
+    script: step.script,
+    ...(condition === undefined ? {} : { condition }),
+  };
+}
+
+/**
+ * Event data reaches a script only through HUB_EVENT_JSON. A `${{ }}` in the text is never
+ * rendered, so it is refused instead of running as a bad shell substitution.
+ */
+function validateScriptText(script: string): void {
+  if (script.includes(EXPRESSION_START)) {
+    throw new Error(
+      "script text is not templated. Remove the ${{ }} expression and read event data from the HUB_EVENT_JSON environment variable.",
+    );
+  }
+}
+
+function compileAgentStep(
+  trigger: AuthoredTrigger,
+  step: AuthoredAgentStep,
+  resolvedPromptPartials: ResolvedPromptPartials | undefined,
+  namedAgents: Readonly<Record<string, CompiledAgent>>,
+): CompiledAgentStep {
+  const stepPath = ["triggers", trigger.name, "steps", step.id] as const;
   const maxRuntimeMs = compileAt([...stepPath, "max_runtime"], () =>
     parseDurationMs(step.max_runtime, `trigger ${trigger.name} step ${step.id} max_runtime`),
   );
@@ -640,7 +779,7 @@ function compileStep(
 function compileAgentSelection(
   triggerName: string,
   stepId: string,
-  authored: AuthoredStep["agent"],
+  authored: AuthoredAgentStep["agent"],
   namedAgents: Readonly<Record<string, CompiledAgent>>,
 ): CompiledAgentSelection {
   if (typeof authored === "string") {
@@ -687,7 +826,7 @@ function cloneAgent(agent: CompiledAgent): CompiledAgent {
 function compilePromptBlocks(
   triggerName: string,
   stepId: string,
-  blocks: AuthoredStep["prompt"],
+  blocks: AuthoredAgentStep["prompt"],
   resolvedPromptPartials: ResolvedPromptPartials | undefined,
 ): readonly CompiledPromptBlock[] {
   return blocks.map((block, index) => {
@@ -873,6 +1012,7 @@ function validateExpressionContract(
       validateTemplate(step.environment, ordinal, `step ${step.id} environment`, true);
       validateEnvironmentSelection(step.environment, ordinal, step.id);
     });
+    if (isScriptStep(step)) continue;
     if (step.title !== undefined)
       compileAt(["triggers", triggerName, "steps", step.id, "title"], () =>
         validateTitleTemplate(step.title!, `step ${step.id} title`),
@@ -1198,6 +1338,13 @@ function validateCompiledContract(config: CompiledHubConfig): void {
         throw new Error(`step ${step.id} references unknown environment ${step.environment}`);
       }
       validateCompiledStepEnvironment(step, trigger.inputs, environments);
+      if (isScriptStep(step)) {
+        validateScriptText(step.script);
+        if (step.condition !== undefined && !isExpression(step.condition)) {
+          throw new Error(`step ${step.id} contains an invalid condition`);
+        }
+        continue;
+      }
       validateStepEnvironmentContract(trigger.name, trigger.on, step.id, step.env, step.github);
       if (step.idleTimeoutMs > step.maxRuntimeMs) {
         throw new Error(`step ${step.id} idle_timeout must not exceed max_runtime`);
@@ -1299,7 +1446,7 @@ function validateStepEnvironmentContract(
   }
 }
 
-function validateCompiledPromptBlocks(step: CompiledStep): void {
+function validateCompiledPromptBlocks(step: CompiledAgentStep): void {
   for (const block of step.prompt) {
     if (block.kind !== "partial") continue;
     try {
@@ -1388,7 +1535,31 @@ function validateAuthoredIds(config: AuthoredHubConfig): void {
   }
 }
 
+/**
+ * A script runs arbitrary code as the daemon's user, so the event that starts it must name who
+ * or what may start it. A wildcard actor allowlist would let anyone who can reach the
+ * connection run code on the host.
+ */
+function validateScriptTriggerSecurity(trigger: CompiledTrigger): void {
+  if (trigger.on === "schedule.tick") return;
+  if (trigger.on === "github.notification") {
+    if (trigger.filters?.repo === undefined && trigger.filters?.reason === undefined) {
+      throw new Error(
+        `trigger ${trigger.name} runs a script on github.notification, which has no actor to allowlist. Set filters.repo or filters.reason so an unrelated notification cannot run code on the host.`,
+      );
+    }
+    return;
+  }
+  const users = trigger.filters?.from_users;
+  if (users === undefined || users.length === 0 || users.includes("*")) {
+    throw new Error(
+      `trigger ${trigger.name} runs a script, so ${trigger.on} needs filters.from_users that names the people allowed to start it. A wildcard or empty list would let anyone who can reach this event run code on the host.`,
+    );
+  }
+}
+
 function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
+  if (trigger.steps.some(isScriptStep)) validateScriptTriggerSecurity(trigger);
   // A notification carries no actor, so an allowlist could never be enforced. Fail closed.
   if (trigger.on === "github.notification" && trigger.filters?.from_users !== undefined) {
     throw new Error(`trigger ${trigger.name}: ${NOTIFICATION_FROM_USERS_MESSAGE}`);

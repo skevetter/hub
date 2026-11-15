@@ -1,8 +1,10 @@
 import { parseTriggerDocument } from "../triggers/configuration/index.js";
+import { isScriptRun } from "../triggers/configuration/schema.js";
 import { dump, load } from "js-yaml";
 import { z } from "zod";
 import {
   compiledConfigurationHash,
+  isScriptStep,
   parseCompiledHubConfig,
   type CompiledHubConfig,
   type CompiledTriggerFilter,
@@ -313,16 +315,15 @@ export function parseProjectConfiguration(
   // Migrate the newly introduced default at the authored-document boundary. Existing
   // execution launch intents remain untouched and finish with their original contract.
   const document = triggerDocument(revision);
-  if (document !== undefined) {
+  if (document !== undefined && !isScriptRun(document.run)) {
     const policy = document.run.continuation;
     return toProjectConfiguration({
       ...configuration,
       triggers: configuration.triggers.map((trigger) => ({
         ...trigger,
-        steps: trigger.steps.map((step) => ({
-          ...step,
-          continuation: step.continuation ?? policy,
-        })),
+        steps: trigger.steps.map((step) =>
+          isScriptStep(step) ? step : { ...step, continuation: step.continuation ?? policy },
+        ),
       })),
     });
   }

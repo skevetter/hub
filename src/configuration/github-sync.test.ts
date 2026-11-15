@@ -1,3 +1,4 @@
+import { agentStep } from "../config/compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { parseCompiledHubConfig } from "../config/compiler.js";
@@ -62,7 +63,7 @@ describe("exact-commit GitHub configuration bundle sync", () => {
     if (result.outcome !== "activated") return;
     const compiled = parseCompiledHubConfig(result.revision.normalizedConfiguration);
     assert.equal(compiled.triggers[0]?.sourceFile, ".paseo/workflows/request.yml");
-    assert.deepEqual(compiled.triggers[0]?.steps[0]?.prompt[0], {
+    assert.deepEqual(agentStep(compiled.triggers[0]?.steps[0]).prompt[0], {
       kind: "partial",
       path: ".paseo/workflows/partials/safety.md",
       content: "Safety instructions",

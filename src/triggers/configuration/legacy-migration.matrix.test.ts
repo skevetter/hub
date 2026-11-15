@@ -1,3 +1,4 @@
+import { agentStep } from "../../config/compiler.js";
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -187,11 +188,11 @@ function executionSemantics(
     environment: { ...environment, name: undefined },
     step: {
       ...step,
-      continuation: step.continuation ?? { mode: "new" },
+      continuation: agentStep(step).continuation ?? { mode: "new" },
       id: undefined,
       environment: undefined,
-      prompt: step.prompt
-        .map((block) => (block.kind === "text" ? block.value : block.content))
+      prompt: agentStep(step)
+        .prompt.map((block) => (block.kind === "text" ? block.value : block.content))
         .join("\n"),
     },
   };

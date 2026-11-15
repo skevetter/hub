@@ -1,4 +1,4 @@
-import { parseCompiledHubConfig } from "../../config/compiler.js";
+import { isScriptStep, parseCompiledHubConfig } from "../../config/compiler.js";
 import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
@@ -924,9 +924,10 @@ export class HubE2E {
       (item) => item.name === (realAgent ? "finalize" : "e2e-discord"),
     )!;
     for (const step of trigger.steps)
-      step.continuation = realAgent
-        ? { mode: "key", key: "real-agent-continuation" }
-        : { mode: "conversation" };
+      if (!isScriptStep(step))
+        step.continuation = realAgent
+          ? { mode: "key", key: "real-agent-continuation" }
+          : { mode: "conversation" };
     await this.requirePool().query(
       "update project_configuration_revisions set normalized_configuration = $2 where id = $1",
       [row.id, configuration],

@@ -9,7 +9,7 @@ import {
   WorktreeTargetSchema,
   type AuthoredEnvironment,
   type AuthoredHubConfig,
-  type AuthoredStep,
+  type AuthoredAgentStep,
   type AuthoredInput,
   type AuthoredTrigger,
   type AuthoredTriggerFilter,
@@ -33,9 +33,9 @@ export {
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
-export type AuthoredAgent = AuthoredStep["agent"];
+export type AuthoredAgent = AuthoredAgentStep["agent"];
 export type AgentConfig = AuthoredAgent;
-export type AllowOutput = NonNullable<AuthoredStep["allow_outputs"]>[number];
+export type AllowOutput = NonNullable<AuthoredAgentStep["allow_outputs"]>[number];
 export type DaemonEnvironment = Extract<AuthoredEnvironment, { kind: "daemon" }>;
 export type FlyEnvironment = Extract<AuthoredEnvironment, { kind: "fly" }>;
 export type DockerEnvironment = Extract<AuthoredEnvironment, { kind: "docker" }>;

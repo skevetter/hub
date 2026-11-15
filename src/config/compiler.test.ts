@@ -1,3 +1,4 @@
+import { agentStep } from "./compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import {
@@ -6,6 +7,7 @@ import {
   parseCompiledHubConfig,
   rawConfigurationHash,
   type CompiledHubConfig,
+  type CompiledAgentStep,
   type CompiledStep,
   type CompiledTrigger,
 } from "./compiler.js";
@@ -38,12 +40,12 @@ function configuration(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function legacyAllowOutputs(allowOutputs: CompiledStep["allowOutputs"]) {
+function legacyAllowOutputs(allowOutputs: CompiledAgentStep["allowOutputs"]) {
   return allowOutputs.map(({ type, max }) => ({ type, max }));
 }
 
 function legacyStep(step: CompiledStep) {
-  return { ...step, allowOutputs: legacyAllowOutputs(step.allowOutputs) };
+  return { ...step, allowOutputs: legacyAllowOutputs(agentStep(step).allowOutputs) };
 }
 
 function legacyTrigger(trigger: CompiledTrigger) {
@@ -76,7 +78,7 @@ describe("workflow compiler", () => {
     const authored = configuration();
     Reflect.set(authored.triggers[0]!.steps[0]!, "startup_timeout", "3m");
     const compiled = compileHubConfig(authored);
-    assert.equal(compiled.triggers[0]?.steps[0]?.startupTimeoutMs, 180_000);
+    assert.equal(agentStep(compiled.triggers[0]?.steps[0]).startupTimeoutMs, 180_000);
     assert.deepEqual(parseCompiledHubConfig(compiled), compiled);
   });
 
@@ -140,7 +142,10 @@ describe("workflow compiler", () => {
     const authored = configuration();
     Reflect.set(authored.triggers[0]!.steps[0]!, "title", "Intake · ${{ paseo.execution.id }}");
     const compiled = compileHubConfig(authored);
-    assert.equal(compiled.triggers[0]?.steps[0]?.title, "Intake · ${{ paseo.execution.id }}");
+    assert.equal(
+      agentStep(compiled.triggers[0]?.steps[0]).title,
+      "Intake · ${{ paseo.execution.id }}",
+    );
     assert.deepEqual(parseCompiledHubConfig(compiled), compiled);
   });
 
@@ -184,7 +189,7 @@ describe("workflow compiler", () => {
     });
 
     const compiled = compileHubConfig(raw);
-    const agent = compiled.triggers[0]?.steps[0]?.agent;
+    const agent = agentStep(compiled.triggers[0]?.steps[0]).agent;
     assert.ok(agent !== undefined && !("selector" in agent));
     if (agent === undefined || "selector" in agent) return;
     const options = agent.options;
@@ -274,7 +279,7 @@ describe("workflow compiler", () => {
         },
       ],
     });
-    assert.deepEqual(compiled.triggers[0]?.steps[0]?.allowOutputs, [
+    assert.deepEqual(agentStep(compiled.triggers[0]?.steps[0]).allowOutputs, [
       { type: "discord.reply", max: 1, required: true },
     ]);
 
@@ -307,10 +312,10 @@ describe("workflow compiler", () => {
     });
 
     const compiled = compileHubConfig(raw);
-    assert.deepEqual(compiled.triggers[0]?.steps[0]?.env, {
+    assert.deepEqual(agentStep(compiled.triggers[0]?.steps[0]).env, {
       SOME_TOKEN: "prefix-${{ paseo.connections.some-connection.token }}",
     });
-    assert.deepEqual(compiled.triggers[0]?.steps[0]?.github, {
+    assert.deepEqual(agentStep(compiled.triggers[0]?.steps[0]).github, {
       connection: "getpaseo-github",
       repositories: ["getpaseo/paseo"],
       permissions: { contents: "read" },
@@ -334,7 +339,7 @@ describe("workflow compiler", () => {
       ],
     });
 
-    assert.deepEqual(compiled.triggers[0]?.steps[0]?.github, {
+    assert.deepEqual(agentStep(compiled.triggers[0]?.steps[0]).github, {
       connection: "getpaseo-github",
       permissions: { contents: "read" },
       durationMs: 60 * 60 * 1000,
@@ -452,7 +457,9 @@ describe("workflow compiler", () => {
     });
 
     const compiled = compileHubConfig(raw);
-    assert.deepEqual(compiled.triggers[0]?.steps[0]?.github?.permissions, { [name]: level });
+    assert.deepEqual(agentStep(compiled.triggers[0]?.steps[0]).github?.permissions, {
+      [name]: level,
+    });
   });
 
   it.each(["actions_variables", "repository_advisories"])(

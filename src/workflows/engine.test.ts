@@ -1,3 +1,4 @@
+import { agentStep } from "../config/compiler.js";
 import assert from "node:assert/strict";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { describe, it, vi } from "vitest";
@@ -44,7 +45,7 @@ describe("durable multi-step workflow engine", () => {
       const rawConfiguration = executionWorktreeConfiguration();
       const compiled = structuredClone(compileHubConfig(rawConfiguration));
       for (const trigger of compiled.triggers) {
-        for (const step of trigger.steps) step.continuation = { mode: "conversation" };
+        for (const step of trigger.steps) agentStep(step).continuation = { mode: "conversation" };
       }
       const fixture = await workflowFixture({ compiledConfiguration: compiled });
       const baseProvider = providerMatch(fixture.configuration, fixture.revisionId);
