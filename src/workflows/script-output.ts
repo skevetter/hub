@@ -7,6 +7,8 @@ export const ScriptStepCleanupSchema = z.object({
   cwd: z.string().min(1),
   name: z.string().min(1),
   terminal_id: z.string().min(1).optional(),
+  /** Absent in records written before Hub kept it, and when the terminal was never seen. */
+  workspace_id: z.string().min(1).optional(),
 });
 export type ScriptStepCleanup = z.infer<typeof ScriptStepCleanupSchema>;
 
@@ -26,8 +28,18 @@ export const ScriptStepHandleSchema = z.object({
   cwd: z.string().min(1),
   /** Absent between the step starting and the terminal existing. */
   terminal_id: z.string().min(1).optional(),
+  /** The workspace the daemon chose for the terminal. Absent in handles written before Hub kept it. */
+  workspace_id: z.string().min(1).optional(),
 });
 export type ScriptStepHandle = z.infer<typeof ScriptStepHandleSchema>;
+
+/**
+ * Only a script step has no agent execution. An agent step keeps structured output in the same
+ * column, and an agent's output can say anything, so its shape never makes it a script step.
+ */
+export function isScriptStepRun(step: { agentExecutionId: string | null }): boolean {
+  return step.agentExecutionId === null;
+}
 
 export function readScriptStepResult(value: unknown): ScriptStepResult | undefined {
   const parsed = ScriptStepResultSchema.safeParse(value);
@@ -47,9 +59,14 @@ export function scriptTerminalName(stepRunId: string): string {
   return `${SCRIPT_TERMINAL_PREFIX}${stepRunId}`;
 }
 
-/** The step run id a script terminal's name carries, or undefined for any other terminal. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+/**
+ * The step run id a script terminal's name carries, or undefined for any other terminal and for a
+ * name whose id is not a UUID, which the database could not look up.
+ */
 export function stepRunIdFromTerminalName(name: string): string | undefined {
-  return name.startsWith(SCRIPT_TERMINAL_PREFIX)
-    ? name.slice(SCRIPT_TERMINAL_PREFIX.length)
-    : undefined;
+  if (!name.startsWith(SCRIPT_TERMINAL_PREFIX)) return undefined;
+  const id = name.slice(SCRIPT_TERMINAL_PREFIX.length);
+  return UUID.test(id) ? id : undefined;
 }

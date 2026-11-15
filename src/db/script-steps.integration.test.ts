@@ -8,6 +8,8 @@ import { compiledConfigurationHash, type CompiledHubConfig } from "../config/com
 import { createMemoryDatabase } from "./memory.js";
 import { createDatabase } from "./pg.js";
 import { embeddedDatabaseRuntime } from "./runtime/index.js";
+import { scriptTerminalName } from "../workflows/script-output.js";
+import { ScriptStepRuntime } from "../workflows/script-step.js";
 import type { Database } from "./types.js";
 
 const PROJECT_ID = "00000000-0000-4000-8000-000000000001";
@@ -318,6 +320,109 @@ describe.each(backends)("script step persistence (%s)", (_name, open) => {
       await database.recoverWorkflowWakeups(now);
       const added = await database.claimWorkflowWakeup(new Date(now.getTime() + 1_000), 30_000);
       assert.equal(added?.triggerRunId, run.id);
+    } finally {
+      await close();
+    }
+  });
+  it("never treats an ended agent step as a script step, whatever its output says", async () => {
+    const harness = await open();
+    const { database, close } = harness;
+    try {
+      const { run, step } = await acceptedRun(harness);
+      const lookalike = {
+        daemon_id: "daemon-1",
+        cwd: "/work",
+        terminal_id: "terminal-1",
+        cleanup: { daemon_id: "daemon-1", cwd: "/work", name: "hub-script-x" },
+      };
+      const execution = await database.insertAgentExecution({
+        organizationId: "org-1",
+        projectId: harness.projectId,
+        machineId: null,
+        triggerContext: null,
+        outputContext: null,
+        configurationRevisionId: run.configurationRevisionId,
+        workflowStepRunId: step.id,
+      });
+      await database.linkWorkflowStepRunExecution(step.id, execution.id);
+      await database.completeWorkflowStep(execution.id, "succeeded", lookalike);
+      const ended = await database.findWorkflowStepRunById(step.id);
+      assert.equal(ended?.status, "succeeded");
+      assert.deepEqual(ended?.output, lookalike);
+
+      assert.deepEqual(await database.listWorkflowScriptStepsPendingCleanup(), []);
+      assert.equal(
+        await database.setWorkflowScriptStepOutput(step.id, { overwritten: true }),
+        undefined,
+      );
+      assert.deepEqual((await database.findWorkflowStepRunById(step.id))?.output, lookalike);
+    } finally {
+      await close();
+    }
+  });
+  it("keeps sweeping when a terminal's name carries no step id", async () => {
+    const harness = await open();
+    const { database, close } = harness;
+    try {
+      const ended = await acceptedRun(harness);
+      await database.startWorkflowScriptStep({
+        stepRunId: ended.step.id,
+        startedAt: new Date(),
+        deadlineAt: new Date(Date.now() + 60_000),
+        output: { daemon_id: "daemon-1", cwd: "/work" },
+      });
+      await database.failWorkflowRun(ended.run.id, "failed", "stopped", ended.step.stepId);
+      const running = await acceptedRun(harness);
+      await database.startWorkflowScriptStep({
+        stepRunId: running.step.id,
+        startedAt: new Date(),
+        deadlineAt: new Date(Date.now() + 60_000),
+        output: { daemon_id: "daemon-1", cwd: "/work" },
+      });
+
+      const owned: Record<string, boolean> = {};
+      const runtime = new ScriptStepRuntime({
+        database,
+        runner: {
+          run: async () => {
+            throw new Error("unused");
+          },
+          cleanup: async () => undefined,
+          sweep: async (_daemon, _scope, keep) => {
+            for (const name of [
+              "hub-script-not-a-uuid",
+              "hub-script-",
+              "hub-script-00000000-0000-4000-8000-00000000000z",
+              scriptTerminalName(ended.step.id),
+              scriptTerminalName(running.step.id),
+              "somebody-elses",
+            ]) {
+              owned[name] = await keep(name);
+            }
+            return { stopped: 0, unconfirmed: 0 };
+          },
+        },
+        providers: [],
+        limits: { maxPerDaemon: 5, maxPerTrigger: 3 },
+        now: () => new Date(),
+        canDispatchToDaemon: undefined,
+        report: (error) => {
+          throw error;
+        },
+        failRun: async () => undefined,
+        notifyStarted: async () => undefined,
+      });
+
+      await runtime.sweep("daemon-1");
+
+      assert.deepEqual(owned, {
+        "hub-script-not-a-uuid": false,
+        "hub-script-": false,
+        "hub-script-00000000-0000-4000-8000-00000000000z": false,
+        [scriptTerminalName(ended.step.id)]: false,
+        [scriptTerminalName(running.step.id)]: true,
+        "somebody-elses": false,
+      });
     } finally {
       await close();
     }

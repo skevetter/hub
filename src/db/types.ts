@@ -1320,7 +1320,10 @@ export interface Database {
     stepRunId: string,
     update: WorkflowScriptStepUpdate,
   ): Promise<WorkflowStepRunRecord | undefined>;
-  /** Replaces a script step's output whatever its status, for cleanup after the step ended. */
+  /**
+   * Replaces a script step's output whatever its status, for cleanup after the step ended. An
+   * agent step is left alone and `undefined` comes back.
+   */
   setWorkflowScriptStepOutput(
     stepRunId: string,
     output: unknown,
@@ -1328,6 +1331,8 @@ export interface Database {
   /**
    * Ended script steps whose output still names a terminal or a pending cleanup: a stop the
    * daemon never confirmed, or a step that deadline recovery ended while its terminal ran on.
+   * Only steps with no agent execution qualify, so an agent step whose output happens to look
+   * like a script's is never returned.
    */
   listWorkflowScriptStepsPendingCleanup(): Promise<WorkflowStepRunRecord[]>;
   succeedTriggerRun(triggerRunId: string): Promise<TransitionTriggerRunResult | undefined>;

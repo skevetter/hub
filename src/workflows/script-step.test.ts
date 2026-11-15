@@ -277,7 +277,12 @@ describe("script steps in the durable workflow engine", () => {
     await untilSettled(context, engine);
     assert.deepEqual(updates[0], {
       status: "running",
-      output: { daemon_id: "daemon-1", cwd: "/workspace/webapp", terminal_id: "terminal-1" },
+      output: {
+        daemon_id: "daemon-1",
+        cwd: "/workspace/webapp",
+        terminal_id: "terminal-1",
+        workspace_id: "ws-1",
+      },
     });
     assert.equal(updates[1]?.status, "succeeded");
   });
@@ -455,6 +460,7 @@ describe("script step recovery", () => {
         cwd: "/workspace/webapp",
         name: scriptTerminalName(stepRunId),
         terminalId: "terminal-9",
+        workspaceId: undefined,
       },
     ]);
     const step = await onlyStep(context);
@@ -843,6 +849,7 @@ describe("script terminal cleanup", () => {
       cwd: "/workspace/webapp",
       name: scriptTerminalName(step.id),
       terminal_id: "terminal-1",
+      workspace_id: "ws-1",
     });
     assert.equal((await context.database.listWorkflowScriptStepsPendingCleanup()).length, 1);
 
@@ -926,6 +933,7 @@ describe("script terminal cleanup", () => {
           cwd: "/workspace/webapp",
           name: scriptTerminalName(stepRunId),
           terminalId: "terminal-1",
+          workspaceId: undefined,
         },
       },
     ]);
@@ -992,5 +1000,151 @@ describe("script terminal cleanup", () => {
     await restarted.engine.sweepScriptTerminals("daemon-1");
     await restarted.engine.stop();
     assert.deepEqual(second.sweeps, []);
+  });
+});
+
+describe("script cleanup is only for script steps", () => {
+  const lookalike = {
+    daemon_id: "daemon-1",
+    cwd: "/workspace/webapp",
+    terminal_id: "terminal-1",
+    cleanup: { daemon_id: "daemon-1", cwd: "/workspace/webapp", name: "hub-script-x" },
+  };
+
+  /** An ended step that has an agent execution, with an agent output that looks like a handle. */
+  async function endedAgentStep(context: Fixture) {
+    const step = await onlyStep(context);
+    const run = await onlyRun(context);
+    const execution = await context.database.insertAgentExecution({
+      organizationId: "org-1",
+      projectId: context.trigger.projectId,
+      machineId: null,
+      triggerContext: null,
+      outputContext: null,
+      configurationRevisionId: context.trigger.configurationRevisionId,
+      workflowStepRunId: step.id,
+    });
+    await context.database.linkWorkflowStepRunExecution(step.id, execution.id);
+    await context.database.completeWorkflowStep(execution.id, "succeeded", lookalike);
+    return { step, run };
+  }
+
+  it("kills nothing and overwrites nothing for an agent step that merely looks like one", async () => {
+    const context = await fixture();
+    const control = controllableRunner();
+    const { handler, engine } = engineFor(context, { scriptRunner: control.runner });
+    await handler(context.trigger);
+    const { step } = await endedAgentStep(context);
+
+    await engine.sweepScriptTerminals("daemon-1");
+    await engine.sweepScriptTerminals("daemon-1");
+
+    assert.deepEqual(control.cleanups, []);
+    assert.deepEqual(control.sweeps, []);
+    assert.deepEqual((await context.database.findWorkflowStepRunById(step.id))?.output, lookalike);
+    await engine.stop();
+  });
+
+  it("does the same when deadline recovery ends the run", async () => {
+    const context = await fixture();
+    const control = controllableRunner();
+    const { handler, engine } = engineFor(context, {
+      scriptRunner: control.runner,
+      now: () => new Date(Date.now() + 3 * 3_600_000),
+    });
+    await handler(context.trigger);
+    const { step } = await endedAgentStep(context);
+    await engine.processAvailable();
+    await engine.stop();
+    assert.deepEqual(control.cleanups, []);
+    assert.deepEqual((await context.database.findWorkflowStepRunById(step.id))?.output, lookalike);
+  });
+});
+
+describe("script terminal workspace", () => {
+  it("records the workspace the daemon chose beside the terminal id", async () => {
+    const context = await fixture();
+    const daemon = new FakeTerminalDaemon();
+    const clock = new FakeClock();
+    clock.at(500, () => daemon.exit(0));
+    const updates: unknown[] = [];
+    const update = context.database.updateWorkflowScriptStep.bind(context.database);
+    context.database.updateWorkflowScriptStep = async (stepRunId, change) => {
+      updates.push(change.output);
+      return update(stepRunId, change);
+    };
+    const { handler, engine } = engineFor(context, { scriptRunner: runnerFor(daemon, clock) });
+    await handler(context.trigger);
+    await untilSettled(context, engine);
+    assert.deepEqual(updates[0], {
+      daemon_id: "daemon-1",
+      cwd: "/workspace/webapp",
+      terminal_id: "terminal-1",
+      workspace_id: "ws-1",
+    });
+  });
+
+  it("keeps the workspace in a pending cleanup record", async () => {
+    const context = await fixture();
+    const daemon = new FakeTerminalDaemon();
+    const clock = new FakeClock();
+    clock.at(250, () => daemon.exit(0));
+    daemon.killSucceeds = false;
+    const { handler, engine } = engineFor(context, { scriptRunner: runnerFor(daemon, clock) });
+    await handler(context.trigger);
+    await untilSettled(context, engine);
+    const cleanup = readScriptStepResult((await onlyStep(context)).output)?.cleanup;
+    assert.equal(cleanup?.workspace_id, "ws-1");
+    await engine.stop();
+  });
+
+  async function sweepWithHandle(handle: Record<string, string>) {
+    const context = await fixture();
+    const daemon = new FakeTerminalDaemon();
+    const { handler, engine } = engineFor(context, {
+      scriptRunner: runnerFor(daemon, new FakeClock()),
+    });
+    await handler(context.trigger);
+    const run = await onlyRun(context);
+    const step = await onlyStep(context);
+    await context.database.startWorkflowScriptStep({
+      stepRunId: step.id,
+      startedAt: new Date(),
+      deadlineAt: new Date(Date.now() + 60_000),
+      output: handle,
+    });
+    await context.database.failWorkflowRun(run.id, "failed", "stopped", step.stepId);
+    await engine.sweepScriptTerminals("daemon-1");
+    return { daemon, context, step };
+  }
+
+  it("lists by that workspace when sweeping and cleaning up", async () => {
+    const { daemon } = await sweepWithHandle({
+      daemon_id: "daemon-1",
+      cwd: "/workspace/webapp",
+      workspace_id: "ws-9",
+    });
+    assert.ok(daemon.listRequests.length > 0);
+    for (const request of daemon.listRequests) {
+      assert.equal(request["workspaceId"], "ws-9");
+      assert.equal("cwd" in request, false);
+    }
+  });
+
+  it("falls back to the directory for a handle written without one", async () => {
+    const { daemon, context, step } = await sweepWithHandle({
+      daemon_id: "daemon-1",
+      cwd: "/workspace/webapp",
+    });
+    assert.ok(daemon.listRequests.length > 0);
+    for (const request of daemon.listRequests) {
+      assert.equal(request["cwd"], "/workspace/webapp");
+      assert.equal("workspaceId" in request, false);
+    }
+    assert.deepEqual((await context.database.findWorkflowStepRunById(step.id))?.output, {
+      exit_code: null,
+      output_tail: "",
+      truncated: false,
+    });
   });
 });

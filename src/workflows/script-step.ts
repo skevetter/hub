@@ -14,6 +14,7 @@ import {
 } from "../daemons/terminals/script.js";
 import { asTriggerContextValue, type TriggerProvider } from "../triggers/index.js";
 import {
+  isScriptStepRun,
   readScriptStepHandle,
   readScriptStepResult,
   scriptTerminalName,
@@ -198,10 +199,12 @@ export class ScriptStepRuntime {
       return "deferred";
     }
     let reason = SCRIPT_INTERRUPTED_REASON;
+    const handle = readScriptStepHandle(stepRun.output);
     const target: ScriptCleanupTarget = {
       cwd: launch.cwd,
       name: scriptTerminalName(stepRun.id),
-      terminalId: readScriptStepHandle(stepRun.output)?.terminal_id,
+      terminalId: handle?.terminal_id,
+      workspaceId: handle?.workspace_id,
     };
     let output: ScriptStepResult = EMPTY_RESULT;
     try {
@@ -269,22 +272,24 @@ export class ScriptStepRuntime {
         !this.active.has(step.triggerRunId)
       );
     });
-    const directories = new Map<string, Set<string>>();
+    // Each place to look once: the workspace the daemon chose when a record has it, else the directory.
+    const places = new Map<string, { daemon: string; cwd: string; workspaceId?: string }>();
     for (const step of pending) {
       await this.settleEndedStep(step);
       const target = pendingTarget(step);
       if (target === undefined) continue;
-      const cwds = directories.get(target.daemonId) ?? new Set<string>();
-      cwds.add(target.cwd);
-      directories.set(target.daemonId, cwds);
+      const workspaceId = target.workspaceId;
+      places.set(`${target.daemonId}\0${workspaceId ?? target.cwd}`, {
+        daemon: target.daemonId,
+        cwd: target.cwd,
+        ...(workspaceId === undefined ? {} : { workspaceId }),
+      });
     }
-    for (const [daemon, cwds] of directories) {
-      for (const cwd of cwds) {
-        try {
-          await runner.sweep(daemon, { cwd }, (name) => this.ownedByRunningStep(name));
-        } catch (error) {
-          this.options.report(error, "workflow.script.sweep", { daemonId: daemon });
-        }
+    for (const { daemon, ...scope } of places.values()) {
+      try {
+        await runner.sweep(daemon, scope, (name) => this.ownedByRunningStep(name));
+      } catch (error) {
+        this.options.report(error, "workflow.script.sweep", { daemonId: daemon });
       }
     }
   }
@@ -305,6 +310,7 @@ export class ScriptStepRuntime {
     if (
       step.status === "running" ||
       step.status === "pending" ||
+      !isScriptStepRun(step) ||
       this.options.runner === undefined
     ) {
       return;
@@ -346,11 +352,16 @@ export class ScriptStepRuntime {
         name: scriptTerminalName(stepRun.id),
         timeoutMs,
         signal,
-        onTerminal: async ({ id }) => {
+        onTerminal: async ({ id, workspaceId }) => {
           await this.persist(() =>
             this.options.database.updateWorkflowScriptStep(stepRun.id, {
               status: "running",
-              output: { daemon_id: daemonId, cwd: launch.cwd, terminal_id: id },
+              output: {
+                daemon_id: daemonId,
+                cwd: launch.cwd,
+                terminal_id: id,
+                ...(workspaceId === undefined ? {} : { workspace_id: workspaceId }),
+              },
               at: this.options.now(),
             }),
           );
@@ -492,6 +503,7 @@ function cleanupRecord(daemonId: string, target: ScriptCleanupTarget): ScriptSte
     cwd: target.cwd,
     name: target.name,
     ...(target.terminalId === undefined ? {} : { terminal_id: target.terminalId }),
+    ...(target.workspaceId === undefined ? {} : { workspace_id: target.workspaceId }),
   };
 }
 
@@ -503,6 +515,8 @@ function pendingDaemon(step: WorkflowStepRunRecord): string | undefined {
 function pendingTarget(
   step: WorkflowStepRunRecord,
 ): (ScriptCleanupTarget & { daemonId: string }) | undefined {
+  // An agent step's output is whatever the agent produced, so its shape proves nothing.
+  if (!isScriptStepRun(step)) return undefined;
   const result = readScriptStepResult(step.output);
   if (result?.cleanup !== undefined) {
     const { cleanup } = result;
@@ -511,6 +525,7 @@ function pendingTarget(
       cwd: cleanup.cwd,
       name: cleanup.name,
       terminalId: cleanup.terminal_id,
+      workspaceId: cleanup.workspace_id,
     };
   }
   const handle = readScriptStepHandle(step.output);
@@ -520,6 +535,7 @@ function pendingTarget(
     cwd: handle.cwd,
     name: scriptTerminalName(step.id),
     terminalId: handle.terminal_id,
+    workspaceId: handle.workspace_id,
   };
 }
 

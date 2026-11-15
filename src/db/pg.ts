@@ -1092,7 +1092,7 @@ class PgDatabase implements Database {
   async setWorkflowScriptStepOutput(stepRunId: string, output: unknown) {
     const updated = await query<WorkflowStepRunRow>(
       this.pool,
-      "update workflow_step_runs set output = $2 where id = $1 returning *",
+      "update workflow_step_runs set output = $2 where id = $1 and agent_execution_id is null returning *",
       [stepRunId, output ?? null],
     );
     return updated.rows[0] === undefined ? undefined : toWorkflowStepRunRecord(updated.rows[0]);
@@ -1103,6 +1103,7 @@ class PgDatabase implements Database {
       this.pool,
       `select * from workflow_step_runs
        where status in ('succeeded', 'failed', 'timed_out')
+         and agent_execution_id is null
          and ((output ->> 'daemon_id') is not null or (output -> 'cleanup') is not null)`,
     );
     return rows.rows.map(toWorkflowStepRunRecord);

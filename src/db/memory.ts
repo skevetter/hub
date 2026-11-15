@@ -986,7 +986,8 @@ class MemoryDatabase implements Database {
 
   async setWorkflowScriptStepOutput(stepRunId: string, output: unknown) {
     const step = this.workflowStepRuns.get(stepRunId);
-    if (step === undefined) return undefined;
+    // Never an agent step: its output is the agent's, not Hub's to rewrite.
+    if (step === undefined || step.agentExecutionId !== null) return undefined;
     const updated: WorkflowStepRunRecord = { ...step, output };
     this.workflowStepRuns.set(step.id, updated);
     return updated;
@@ -996,6 +997,8 @@ class MemoryDatabase implements Database {
     return Array.from(this.workflowStepRuns.values()).filter(
       (step) =>
         (step.status === "succeeded" || step.status === "failed" || step.status === "timed_out") &&
+        // Only a script step has no agent execution; an agent's output can look like anything.
+        step.agentExecutionId === null &&
         typeof step.output === "object" &&
         step.output !== null &&
         ("daemon_id" in step.output || "cleanup" in step.output),
