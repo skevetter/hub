@@ -46,3 +46,7 @@ run:
 Tell the agent in the prompt to call `finish_execution`. If the run ends without it, Hub waits until
 `idle_timeout` passes with no agent activity, then marks the execution failed. A run that exceeds
 `max_runtime` is marked failed the same way.
+
+To count a finished turn as done instead, set `complete_on_turn_end: true` on the agent action. See
+[Writing unattended prompts](unattended-prompts.md) for the prompt line, what the setting does, and
+when it does not apply.
