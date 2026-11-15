@@ -84,6 +84,8 @@ import type {
   WorkflowStepRunRecord,
   WorkflowWakeupRecord,
   WorkflowAgentCompletionInput,
+  WorkflowScriptStepStartInput,
+  WorkflowScriptStepUpdate,
   WorkflowDeadlineKind,
   WorkflowDeadlineRecovery,
   ProjectActivityRunListRecord,
@@ -942,6 +944,41 @@ class MemoryDatabase implements Database {
       leasedBeforeClaim: false,
     });
     return { stepRun: updatedStep, run };
+  }
+
+  async startWorkflowScriptStep(input: WorkflowScriptStepStartInput) {
+    const step = this.workflowStepRuns.get(input.stepRunId);
+    if (step === undefined) return undefined;
+    const run = this.triggerRuns.get(step.triggerRunId);
+    if (step.status !== "pending" || run?.outcome !== "accepted" || run.status !== "running") {
+      return { stepRun: step, started: false };
+    }
+    const started: WorkflowStepRunRecord = {
+      ...step,
+      status: "running",
+      startedAt: input.startedAt,
+      deadlineAt: input.deadlineAt,
+    };
+    this.workflowStepRuns.set(step.id, started);
+    return { stepRun: started, started: true };
+  }
+
+  async updateWorkflowScriptStep(stepRunId: string, update: WorkflowScriptStepUpdate) {
+    const step = this.workflowStepRuns.get(stepRunId);
+    if (step === undefined || step.status !== "running") return step;
+    const finished = update.status !== "running";
+    const updated: WorkflowStepRunRecord = {
+      ...step,
+      status: update.status,
+      output: update.output,
+      failureReason: update.failureReason ?? null,
+      completedAt: finished ? update.at : null,
+    };
+    this.workflowStepRuns.set(step.id, updated);
+    if (finished && this.triggerRuns.get(step.triggerRunId)?.status === "running") {
+      await this.wakeWorkflowRun(step.triggerRunId, update.at);
+    }
+    return updated;
   }
 
   async succeedTriggerRun(triggerRunId: string) {

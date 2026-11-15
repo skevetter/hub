@@ -18,6 +18,7 @@ export interface DispatcherOptions {
   dispatchLaunchMachineIntent?: (intent: LaunchMachineIntent) => Promise<unknown>;
   canDispatchToDaemon?: DurableWorkflowEngineOptions["canDispatchToDaemon"];
   validateLaunchMachineIntent?: DurableWorkflowEngineOptions["validateLaunchMachineIntent"];
+  scriptRunner?: DurableWorkflowEngineOptions["scriptRunner"];
   configurationRevisionId?: string;
   leaseMs?: number;
   workerIntervalMs?: number;
@@ -51,6 +52,7 @@ export function createDispatcherWithEngine(options: DispatcherOptions): {
     ...(options.validateLaunchMachineIntent === undefined
       ? {}
       : { validateLaunchMachineIntent: options.validateLaunchMachineIntent }),
+    ...(options.scriptRunner === undefined ? {} : { scriptRunner: options.scriptRunner }),
     ...(options.configurationRevisionId === undefined
       ? {}
       : { configurationRevisionId: options.configurationRevisionId }),

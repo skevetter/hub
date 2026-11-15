@@ -103,6 +103,8 @@ import type {
   WorkflowStepRunRecord,
   WorkflowWakeupRecord,
   WorkflowAgentCompletionInput,
+  WorkflowScriptStepStartInput,
+  WorkflowScriptStepUpdate,
   WorkflowDeadlineKind,
   WorkflowDeadlineRecovery,
   ProjectActivityRunListRecord,
@@ -1038,6 +1040,51 @@ class PgDatabase implements Database {
     } catch (error) {
       throw toDatabaseError(error);
     }
+  }
+
+  async startWorkflowScriptStep(input: WorkflowScriptStepStartInput) {
+    const started = await query<WorkflowStepRunRow>(
+      this.pool,
+      `update workflow_step_runs steps
+       set status = 'running', started_at = $2, deadline_at = $3
+       where steps.id = $1 and steps.status = 'pending'
+         and exists (
+           select 1 from trigger_runs runs
+           where runs.id = steps.trigger_run_id and runs.status = 'running'
+         )
+       returning steps.*`,
+      [input.stepRunId, input.startedAt, input.deadlineAt],
+    );
+    if (started.rows[0] !== undefined) {
+      return { stepRun: toWorkflowStepRunRecord(started.rows[0]), started: true };
+    }
+    const existing = await this.findWorkflowStepRunById(input.stepRunId);
+    return existing === undefined ? undefined : { stepRun: existing, started: false };
+  }
+
+  async updateWorkflowScriptStep(stepRunId: string, update: WorkflowScriptStepUpdate) {
+    const finished = update.status !== "running";
+    const updated = await query<WorkflowStepRunRow>(
+      this.pool,
+      `update workflow_step_runs
+       set status = $2, output = $3, failure_reason = $4, completed_at = $5
+       where id = $1 and status = 'running'
+       returning *`,
+      [
+        stepRunId,
+        update.status,
+        update.output ?? null,
+        update.failureReason ?? null,
+        finished ? update.at : null,
+      ],
+    );
+    const row = updated.rows[0];
+    if (row === undefined) return this.findWorkflowStepRunById(stepRunId);
+    if (finished) {
+      const run = await this.findTriggerRunById(row.trigger_run_id);
+      if (run?.status === "running") await this.wakeWorkflowRun(row.trigger_run_id, update.at);
+    }
+    return toWorkflowStepRunRecord(row);
   }
 
   async succeedTriggerRun(triggerRunId: string) {

@@ -50,6 +50,7 @@ import {
 import { createManualRunProvider } from "./triggers/manual/provider.js";
 import { OrganizationTriggerStore } from "./triggers/store.js";
 import { DaemonRegistration } from "./daemons/registration.js";
+import { createScriptStepRunner } from "./daemons/terminals/script.js";
 import { CliAuthorizations } from "./cli-authorizations/index.js";
 import type { BrowserOrganizationAccess } from "./auth/browser-organization-access.js";
 import { createPublicApi, type PublicApi, type PublicApiComposition } from "./public-api/index.js";
@@ -199,6 +200,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       : (intent: Parameters<DaemonModule["lifecycle"]["handoffLaunchMachineIntent"]>[0]) =>
           daemonModule.lifecycle.handoffLaunchMachineIntent(intent);
   const dispatcherOptions = {
+    scriptRunner: createScriptStepRunner(connectionForDaemon),
     canDispatchToDaemon: (daemonId: string) =>
       (options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId)) !== undefined,
     database: options.database,

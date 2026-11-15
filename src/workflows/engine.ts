@@ -13,7 +13,14 @@ import type {
   WorkflowDeadlineRecovery,
 } from "../db/types.js";
 import type { AgentExecutionStatus } from "../db/schema.js";
-import { parseCompiledHubConfig, type JsonPrimitive, type JsonValue } from "../config/compiler.js";
+import {
+  isScriptStep,
+  parseCompiledHubConfig,
+  type CompiledAgentStep,
+  type CompiledScriptStep,
+  type JsonPrimitive,
+  type JsonValue,
+} from "../config/compiler.js";
 import { triggerDocumentName, type CompiledProjectConfiguration } from "../configuration/store.js";
 import { logger as defaultLogger } from "../logger.js";
 import { reportFailure } from "../failures/index.js";
@@ -46,6 +53,8 @@ import {
 } from "./expression.js";
 import type { WorktreeTarget } from "../config/index.js";
 import type { Logger } from "pino";
+import type { ScriptStepRunner } from "../daemons/terminals/script.js";
+import { ScriptStepRuntime, type ScriptStepLaunch } from "./script-step.js";
 
 const DEFAULT_WAKEUP_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 250;
@@ -76,6 +85,8 @@ export interface DurableWorkflowEngineOptions {
   dispatchLaunchMachineIntent?: (intent: LaunchMachineIntent) => Promise<unknown>;
   canDispatchToDaemon?: (daemonId: string) => boolean;
   validateLaunchMachineIntent?: (intent: LaunchMachineIntent) => void;
+  /** Runs script steps in daemon terminals. Without it a script step fails the run. */
+  scriptRunner?: ScriptStepRunner;
   configurationRevisionId?: string;
   leaseMs?: number;
   workerIntervalMs?: number;
@@ -94,6 +105,7 @@ export class DurableWorkflowEngine {
   private readonly leaseMs: number;
   private readonly workerIntervalMs: number;
   private readonly now: () => Date;
+  private readonly scripts: ScriptStepRuntime | undefined;
   private workerTimer: NodeJS.Timeout | undefined;
   private processing: Promise<void> | undefined;
   private terminalNotificationProcessing: Promise<void> | undefined;
@@ -105,6 +117,28 @@ export class DurableWorkflowEngine {
     this.leaseMs = options.leaseMs ?? DEFAULT_WAKEUP_LEASE_MS;
     this.workerIntervalMs = options.workerIntervalMs ?? DEFAULT_WORKER_INTERVAL_MS;
     this.now = options.now ?? (() => new Date());
+    this.scripts =
+      options.database === null ? undefined : this.createScriptRuntime(options.database);
+  }
+
+  private createScriptRuntime(database: Database): ScriptStepRuntime {
+    return new ScriptStepRuntime({
+      database,
+      runner: this.options.scriptRunner,
+      providers: this.options.providers ?? [],
+      now: () => this.now(),
+      canDispatchToDaemon: this.options.canDispatchToDaemon,
+      report: (error, operation, diagnostic) => this.report(error, operation, diagnostic),
+      failRun: async (triggerRunId, reason, stepId) => {
+        const failed = await database.failWorkflowRun(triggerRunId, "failed", reason, stepId);
+        if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
+        await database.deleteWorkflowWakeup(triggerRunId);
+      },
+      notifyStarted: async (triggerRunId) => {
+        const started = await database.findTriggerRunById(triggerRunId);
+        if (started?.outcome === "accepted") await this.deliverWorkflowRunStarted(started);
+      },
+    });
   }
 
   start(): void {
@@ -126,6 +160,7 @@ export class DurableWorkflowEngine {
     if (this.workerTimer !== undefined) clearInterval(this.workerTimer);
     this.workerTimer = undefined;
     await this.processing;
+    await this.scripts?.stop();
     await this.terminalNotificationProcessing;
   }
 
@@ -279,8 +314,8 @@ export class DurableWorkflowEngine {
   private async processWakeup(wakeup: WorkflowWakeupRecord): Promise<"deferred" | void> {
     const database = this.options.database;
     if (database === null) return;
-    const prepared = await this.prepareWorkflowWakeup(wakeup);
-    if (prepared === undefined) return;
+    const prepared = await this.prepareUnlessScriptActive(wakeup);
+    if (prepared === undefined || prepared === "deferred") return prepared;
     const {
       run,
       configuration,
@@ -304,22 +339,12 @@ export class DurableWorkflowEngine {
       if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
       return;
     }
-    try {
-      const composedValues = composeValuesIfAvailable(trigger.values, context);
-      if (composedValues !== undefined) {
-        await database.updateTriggerRunValues(run.id, composedValues);
-      }
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : "workflow_value_evaluation_failed";
-      this.report(error, "workflow.values.evaluate", { triggerRunId: run.id, stepId: step.id });
-      const failed = await database.failWorkflowRun(run.id, "failed", reason, step.id);
-      if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
-      return;
-    }
+    if (!(await this.recordRunValues(run, trigger.values, step.id, context))) return;
     if (!shouldRun) {
       await database.markWorkflowStepSkipped(run.id, step.id, "condition_false");
       return;
     }
+    if (isScriptStep(step)) return this.startScriptStep(prepared, step, wakeup);
     const startedAt = this.now();
     const deadlineAt = new Date(
       Math.min(run.deadlineAt.getTime(), startedAt.getTime() + step.maxRuntimeMs),
@@ -394,6 +419,29 @@ export class DurableWorkflowEngine {
     await database.deleteWorkflowWakeup(run.id);
   }
 
+  /** Stores the routing values composed so far. Fails the run, and says so, when they cannot be. */
+  private async recordRunValues(
+    run: AcceptedWorkflowRun,
+    values: Readonly<Record<string, import("./expression.js").Expression>>,
+    stepId: string,
+    context: ExpressionContext,
+  ): Promise<boolean> {
+    const database = this.options.database!;
+    try {
+      const composedValues = composeValuesIfAvailable(values, context);
+      if (composedValues !== undefined) {
+        await database.updateTriggerRunValues(run.id, composedValues);
+      }
+      return true;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "workflow_value_evaluation_failed";
+      this.report(error, "workflow.values.evaluate", { triggerRunId: run.id, stepId });
+      const failed = await database.failWorkflowRun(run.id, "failed", reason, stepId);
+      if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
+      return false;
+    }
+  }
+
   private async dispatchWorkflowExecution(
     intent: LaunchMachineIntent,
     expectedExecutionId: string,
@@ -442,7 +490,7 @@ export class DurableWorkflowEngine {
   private async failDeniedReservation(
     database: Database,
     run: AcceptedWorkflowRun,
-    step: CompiledProjectConfiguration["triggers"][number]["steps"][number],
+    step: CompiledAgentStep,
     denied: MeterReservationDenied | undefined,
   ): Promise<boolean> {
     if (denied === undefined) return false;
@@ -489,9 +537,90 @@ export class DurableWorkflowEngine {
     await this.dispatchWorkflowExecution(persistedIntent, execution.id, stepRunId);
   }
 
+  private async startScriptStep(
+    prepared: PreparedWorkflowWakeup,
+    step: CompiledScriptStep,
+    wakeup: WorkflowWakeupRecord,
+  ): Promise<"deferred" | undefined> {
+    const launch = await this.scriptLaunch(prepared, step, prepared.next);
+    if (launch === undefined) return undefined;
+    return this.scripts!.start(launch, wakeup);
+  }
+
+  /** The daemon and directory a script step runs in, or the run failed when they are unavailable. */
+  private async scriptLaunch(
+    prepared: Pick<PreparedWorkflowWakeup, "run" | "configuration" | "context" | "steps">,
+    step: CompiledScriptStep,
+    stepRun: WorkflowStepRun,
+  ): Promise<ScriptStepLaunch | undefined> {
+    const database = this.options.database!;
+    const { run, configuration, context, steps } = prepared;
+    try {
+      const environmentName = authorityString(
+        renderExpressionTemplate(step.environment, context),
+        "environment",
+      );
+      const environment = configuration.environments.find(
+        (candidate) => candidate.name === environmentName,
+      );
+      if (
+        environment === undefined ||
+        environment.kind !== "daemon" ||
+        environment.daemonId === undefined
+      ) {
+        throw new Error(`workflow environment ${environmentName} is unavailable`);
+      }
+      return {
+        run,
+        step,
+        stepRun,
+        daemonId: environment.daemonId,
+        cwd: environment.cwd,
+        runAlreadyStarted: steps.some((candidate) => candidate.startedAt !== null),
+      };
+    } catch (error) {
+      this.report(error, "workflow.script.environment", { triggerRunId: run.id, stepId: step.id });
+      const failed = await database.failWorkflowRun(
+        run.id,
+        "failed",
+        error instanceof Error ? error.message : "workflow_environment_unavailable",
+        step.id,
+      );
+      if (failed?.transitioned === true) await this.notifyWorkflowRunTerminal(failed.run);
+      return undefined;
+    }
+  }
+
+  /** A script step still marked running that this process is not watching was left by a dead Hub. */
+  private async recoverRunningScripts(
+    prepared: Pick<PreparedWorkflowWakeup, "run" | "configuration" | "context" | "steps">,
+    trigger: CompiledProjectConfiguration["triggers"][number],
+    wakeup: WorkflowWakeupRecord,
+  ): Promise<"deferred" | "handled" | undefined> {
+    for (const stepRun of prepared.steps) {
+      const step = trigger.steps[stepRun.ordinal];
+      if (stepRun.status !== "running" || step === undefined || !isScriptStep(step)) continue;
+      const launch = await this.scriptLaunch(prepared, step, stepRun);
+      if (launch === undefined) return "handled";
+      return (await this.scripts!.recoverOrphan(launch, wakeup)) ?? "handled";
+    }
+    return undefined;
+  }
+
+  /** A running script is watched by this process; the wakeup the clock keeps adding is noise. */
+  private async prepareUnlessScriptActive(
+    wakeup: WorkflowWakeupRecord,
+  ): Promise<PreparedWorkflowWakeup | "deferred" | undefined> {
+    if (this.scripts?.isActive(wakeup.triggerRunId) === true) {
+      await this.options.database!.deleteWorkflowWakeup(wakeup.triggerRunId);
+      return undefined;
+    }
+    return this.prepareWorkflowWakeup(wakeup);
+  }
+
   private async prepareWorkflowWakeup(
     wakeup: WorkflowWakeupRecord,
-  ): Promise<PreparedWorkflowWakeup | undefined> {
+  ): Promise<PreparedWorkflowWakeup | "deferred" | undefined> {
     const database = this.options.database;
     if (database === null) return undefined;
     const triggerRunId = wakeup.triggerRunId;
@@ -531,6 +660,13 @@ export class DurableWorkflowEngine {
       await database.deleteWorkflowWakeup(run.id);
       return undefined;
     }
+    const context = workflowContext(reconciledRun, steps, trigger.values);
+    const recovered = await this.recoverRunningScripts(
+      { run: reconciledRun, configuration, context, steps },
+      trigger,
+      wakeup,
+    );
+    if (recovered !== undefined) return recovered === "deferred" ? "deferred" : undefined;
     const recoverPreHandoffDispatch = wakeup.leasedBeforeClaim;
     const next =
       (recoverPreHandoffDispatch ? await this.findRecoverablePreHandoffStep(steps) : undefined) ??
@@ -549,7 +685,7 @@ export class DurableWorkflowEngine {
       steps,
       next,
       step,
-      context: workflowContext(reconciledRun, steps, trigger.values),
+      context,
       recoverPreHandoffDispatch,
     };
   }
@@ -558,7 +694,7 @@ export class DurableWorkflowEngine {
     configuration: CompiledProjectConfiguration,
     triggerName: string,
     trigger: CompiledProjectConfiguration["triggers"][number],
-    step: CompiledProjectConfiguration["triggers"][number]["steps"][number],
+    step: CompiledAgentStep,
     run: AcceptedWorkflowRun,
     context: ExpressionContext,
     stepRunId: string,
@@ -593,7 +729,7 @@ export class DurableWorkflowEngine {
 
   private async materializeStepContextOrFail(
     run: AcceptedWorkflowRun,
-    step: CompiledProjectConfiguration["triggers"][number]["steps"][number],
+    step: CompiledAgentStep,
     executionId: string,
   ): Promise<JsonValue | undefined> {
     if (!stepUsesTriggerContext(step)) return null;
@@ -640,7 +776,7 @@ export class DurableWorkflowEngine {
     configuration: CompiledProjectConfiguration,
     triggerName: string,
     trigger: CompiledProjectConfiguration["triggers"][number],
-    step: CompiledProjectConfiguration["triggers"][number]["steps"][number],
+    step: CompiledAgentStep,
     run: AcceptedWorkflowRun,
     context: ExpressionContext,
     stepRunId: string,
@@ -679,7 +815,7 @@ export class DurableWorkflowEngine {
   private async failInvalidLaunchIntent(
     database: Database,
     run: AcceptedWorkflowRun,
-    step: CompiledProjectConfiguration["triggers"][number]["steps"][number],
+    step: CompiledAgentStep,
     intent: LaunchMachineIntent,
   ): Promise<boolean> {
     try {
@@ -962,7 +1098,7 @@ function buildStepIntent(
   configuration: CompiledProjectConfiguration,
   triggerName: string,
   trigger: CompiledProjectConfiguration["triggers"][number],
-  step: CompiledProjectConfiguration["triggers"][number]["steps"][number],
+  step: CompiledAgentStep,
   run: Extract<Awaited<ReturnType<Database["findTriggerRunById"]>>, { outcome: "accepted" }>,
   context: ExpressionContext,
   stepRunId: string,
@@ -1045,10 +1181,7 @@ function buildStepIntent(
   };
 }
 
-function materializeAgent(
-  selection: CompiledProjectConfiguration["triggers"][number]["steps"][number]["agent"],
-  context: ExpressionContext,
-) {
+function materializeAgent(selection: CompiledAgentStep["agent"], context: ExpressionContext) {
   const agent =
     "selector" in selection
       ? selection.choices[
@@ -1078,9 +1211,7 @@ function workflowContext(
   };
 }
 
-function stepUsesTriggerContext(
-  step: CompiledProjectConfiguration["triggers"][number]["steps"][number],
-): boolean {
+function stepUsesTriggerContext(step: CompiledAgentStep): boolean {
   return step.prompt.some((block) =>
     expressionPathsInTemplate(block.kind === "text" ? block.value : block.content).some(
       (path) => path.namespace === "paseo" && path.path === "context",

@@ -871,6 +871,21 @@ export interface WorkflowStepExecutionInput {
   reservation?: MeterReservation;
 }
 
+export interface WorkflowScriptStepStartInput {
+  stepRunId: string;
+  startedAt: Date;
+  /** Past this the step is timed out by deadline recovery, so it is set after the runner's own. */
+  deadlineAt: Date;
+}
+
+export interface WorkflowScriptStepUpdate {
+  status: "running" | "succeeded" | "failed" | "timed_out";
+  /** Replaces the step output: the terminal handle while running, the result once finished. */
+  output: unknown;
+  failureReason?: string;
+  at: Date;
+}
+
 export interface WorkflowAgentCompletionInput {
   executionId: string;
   executionStatus: "succeeded" | "failed";
@@ -1282,6 +1297,21 @@ export interface Database {
     stepId: string,
     reason: string,
   ): Promise<{ stepRun: WorkflowStepRunRecord; run: TriggerRunRecord } | undefined>;
+  /**
+   * Marks a pending script step running, once. `started` is false when the step was not pending
+   * or its run is no longer running, so a script is never started twice.
+   */
+  startWorkflowScriptStep(
+    input: WorkflowScriptStepStartInput,
+  ): Promise<{ stepRun: WorkflowStepRunRecord; started: boolean } | undefined>;
+  /**
+   * Updates a running script step. A terminal status also wakes the run so the engine finishes
+   * or fails it. A step that already ended is returned unchanged.
+   */
+  updateWorkflowScriptStep(
+    stepRunId: string,
+    update: WorkflowScriptStepUpdate,
+  ): Promise<WorkflowStepRunRecord | undefined>;
   succeedTriggerRun(triggerRunId: string): Promise<TransitionTriggerRunResult | undefined>;
   failWorkflowRun(
     triggerRunId: string,
