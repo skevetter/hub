@@ -12,6 +12,14 @@ export interface NotificationCursor {
   nextPollAt: Date;
 }
 
+/** What the Triggers page shows about the poll. Every field is null until it has happened. */
+export interface NotificationPollStatus {
+  lastSuccessAt: Date | null;
+  lastError: string | null;
+  lastErrorAt: Date | null;
+  nextPollAt: Date | null;
+}
+
 export interface GitHubNotificationStore {
   /** Runs one poll with no other process polling. */
   exclusive<T>(operation: () => Promise<T>): Promise<T>;
@@ -23,12 +31,21 @@ export interface GitHubNotificationStore {
     cursor: NotificationCursor,
     now: Date,
   ): Promise<number>;
+  /** A poll finished. Clears the last error. Does nothing before the first cursor exists. */
+  recordSuccess(now: Date): Promise<void>;
+  /** A poll failed. The message must already be free of the token. */
+  recordFailure(now: Date, message: string): Promise<void>;
+  readStatus(): Promise<NotificationPollStatus>;
+  /** Runs started by notifications for one organization since a time, counted by receipt. */
+  countDelivered(organizationId: string, since: Date): Promise<number>;
 }
 
 export interface PollResult {
   /** When the next poll may run. */
   nextPollAt: Date;
   started: number;
+  /** Set when another process polled within the interval, so this call asked GitHub nothing. */
+  skipped?: true;
 }
 
 export interface GitHubNotificationPoller {
@@ -53,7 +70,7 @@ export function createGitHubNotificationPoller(options: {
         }
         // Another process polled within the interval GitHub asked for.
         if (cursor.nextPollAt.getTime() > now.getTime()) {
-          return { nextPollAt: cursor.nextPollAt, started: 0 };
+          return { nextPollAt: cursor.nextPollAt, started: 0, skipped: true };
         }
         const result = await client.list({
           since: cursor.since,

@@ -26,6 +26,15 @@ function setup(results: ListNotificationsResult[], initial?: NotificationCursor)
       cursor = next;
       return threads.length;
     },
+    recordSuccess: async () => {},
+    recordFailure: async () => {},
+    readStatus: async () => ({
+      lastSuccessAt: null,
+      lastError: null,
+      lastErrorAt: null,
+      nextPollAt: null,
+    }),
+    countDelivered: async () => 0,
   };
   const client: GitHubNotificationsClient = {
     list: async (input) => {
@@ -94,7 +103,7 @@ describe("notification poller", () => {
   it("skips when another process polled inside the interval", async () => {
     const due = new Date(START.getTime() + 30_000);
     const { poller, requests } = setup([], { since: START, lastModified: null, nextPollAt: due });
-    expect(await poller.poll(START)).toEqual({ nextPollAt: due, started: 0 });
+    expect(await poller.poll(START)).toEqual({ nextPollAt: due, started: 0, skipped: true });
     expect(requests).toEqual([]);
   });
 

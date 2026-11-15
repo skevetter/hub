@@ -170,20 +170,57 @@ class MemoryDatabase implements Database {
       }
     );
   }
-  // Like schedules, polling needs real SQL; tests of it use the embedded runtime.
+  // Like schedules, polling needs real SQL; tests of it use the embedded runtime. This double
+  // keeps only the status the Triggers page reads, and no cursor, so it never polls GitHub.
   get githubNotifications(): import("../triggers/github-notifications/index.js").GitHubNotificationStore {
-    return (
-      this.options.githubNotifications ?? {
-        exclusive: (operation) => operation(),
-        async readCursor() {
-          return undefined;
-        },
-        async saveCursor() {},
-        async deliver() {
-          return 0;
-        },
-      }
-    );
+    this.notificationStore ??= this.options.githubNotifications ?? this.memoryNotificationStore();
+    return this.notificationStore;
+  }
+  private notificationStore:
+    | import("../triggers/github-notifications/index.js").GitHubNotificationStore
+    | undefined;
+  private memoryNotificationStore(): import("../triggers/github-notifications/index.js").GitHubNotificationStore {
+    const status = {
+      lastSuccessAt: null,
+      lastError: null,
+      lastErrorAt: null,
+      nextPollAt: null,
+    } as {
+      lastSuccessAt: Date | null;
+      lastError: string | null;
+      lastErrorAt: Date | null;
+      nextPollAt: Date | null;
+    };
+    return {
+      exclusive: (operation) => operation(),
+      async readCursor() {
+        return undefined;
+      },
+      async saveCursor(cursor) {
+        status.nextPollAt = cursor.nextPollAt;
+      },
+      async deliver() {
+        return 0;
+      },
+      async recordSuccess(now) {
+        status.lastSuccessAt = now;
+        status.lastError = null;
+      },
+      async recordFailure(now, message) {
+        status.lastError = message;
+        status.lastErrorAt = now;
+      },
+      async readStatus() {
+        return { ...status };
+      },
+      countDelivered: async (organizationId, since) =>
+        [...this.providerEventReceipts.values()].filter(
+          (receipt) =>
+            receipt.organizationId === organizationId &&
+            receipt.provider === "github_notification" &&
+            receipt.receivedAt.getTime() >= since.getTime(),
+        ).length,
+    };
   }
   private readonly providerEventReceipts = new Map<string, ProviderEventReceiptRecord>();
   private readonly providerEventReceiptIdsByDelivery = new Map<string, string>();

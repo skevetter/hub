@@ -11,7 +11,11 @@ import {
   type GitHubNotificationThread,
   toNotificationPayload,
 } from "../notification.js";
-import type { GitHubNotificationStore, NotificationCursor } from "../poller.js";
+import type {
+  GitHubNotificationStore,
+  NotificationCursor,
+  NotificationPollStatus,
+} from "../poller.js";
 
 const SOURCE = "notifications";
 const LOCK_KEY = "github-notifications:poll";
@@ -20,6 +24,13 @@ export const NOTIFICATION_EVENT = "github.notification";
 interface CursorRow extends QueryRow {
   last_modified: string | null;
   since: Date;
+  next_poll_at: Date;
+}
+
+interface StatusRow extends QueryRow {
+  last_success_at: Date | null;
+  last_error: string | null;
+  last_error_at: Date | null;
   next_poll_at: Date;
 }
 
@@ -54,6 +65,44 @@ export class GitHubNotificationRepository implements GitHubNotificationStore {
 
   async saveCursor(cursor: NotificationCursor, now: Date): Promise<void> {
     await writeCursor(this.runtime, cursor, now);
+  }
+
+  /** The cursor row exists after the first poll, so a call before that updates nothing. */
+  async recordSuccess(now: Date): Promise<void> {
+    await this.runtime.query(
+      "update github_notification_cursors set last_success_at = $2, last_error = null where source = $1",
+      [SOURCE, now],
+    );
+  }
+
+  async recordFailure(now: Date, message: string): Promise<void> {
+    await this.runtime.query(
+      "update github_notification_cursors set last_error = $2, last_error_at = $3 where source = $1",
+      [SOURCE, message, now],
+    );
+  }
+
+  async readStatus(): Promise<NotificationPollStatus> {
+    const result = await this.runtime.query<StatusRow>(
+      "select last_success_at, last_error, last_error_at, next_poll_at from github_notification_cursors where source = $1",
+      [SOURCE],
+    );
+    const row = result.rows[0];
+    return {
+      lastSuccessAt: row?.last_success_at ?? null,
+      lastError: row?.last_error ?? null,
+      lastErrorAt: row?.last_error_at ?? null,
+      nextPollAt: row?.next_poll_at ?? null,
+    };
+  }
+
+  async countDelivered(organizationId: string, since: Date): Promise<number> {
+    const result = await this.runtime.query<{ count: number }>(
+      `select count(*)::integer as count from provider_event_receipts
+      where organization_id = $1 and provider = 'github_notification' and received_at >= $2`,
+      [organizationId, since],
+    );
+    return result.rows[0]?.count ?? 0;
   }
 
   /** Receipts, runs and the cursor commit together, so a failed delivery is polled again. */

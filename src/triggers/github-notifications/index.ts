@@ -1,5 +1,6 @@
 import type { TriggerProvider, TriggerSource } from "../index.js";
 import { reportFailure } from "../../failures/index.js";
+import { redact } from "../../logger.js";
 import {
   createGitHubNotificationsClient,
   type NotificationFetch,
@@ -11,11 +12,21 @@ import {
   MIN_POLL_SECONDS,
   type GitHubNotificationPoller,
   type GitHubNotificationStore,
+  type PollResult,
 } from "./poller.js";
 import type { NotificationPayload } from "./notification.js";
 
 export { GitHubNotificationRepository } from "./internal/repository.js";
-export type { GitHubNotificationStore } from "./poller.js";
+export type { GitHubNotificationStore, NotificationPollStatus } from "./poller.js";
+
+const ERROR_MESSAGE_LIMIT = 200;
+
+/** The failure as the Triggers page shows it: no token, one short line. */
+export function storedFailureMessage(error: unknown, token: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const scrubbed = redact(message, { scrubValues: [token] });
+  return String(scrubbed).slice(0, ERROR_MESSAGE_LIMIT);
+}
 
 export interface GitHubNotificationsOptions {
   token: string;
@@ -69,9 +80,22 @@ export function createGitHubNotificationsSource(
   let cancel: (() => void) | undefined;
   let processing: Promise<unknown> | undefined;
   let notBefore = 0;
-  const run = async (now: Date): Promise<void> => {
+  // Status is for the UI. A store error here must not look like a failed poll.
+  const remember = async (operation: () => Promise<void>): Promise<void> => {
     try {
-      notBefore = (await active.poll(now)).nextPollAt.getTime();
+      await operation();
+    } catch (error) {
+      reportFailure(
+        error,
+        { operation: "github.notifications.status", component: "triggers", provider: "github" },
+        { scrubValues: [options.token] },
+      );
+    }
+  };
+  const run = async (now: Date): Promise<void> => {
+    let result: PollResult;
+    try {
+      result = await active.poll(now);
     } catch (error) {
       // A failed poll leaves the cursor alone; the next one picks up where it stopped.
       notBefore = now.getTime() + options.pollIntervalMs;
@@ -80,7 +104,12 @@ export function createGitHubNotificationsSource(
         { operation: "github.notifications.poll", component: "triggers", provider: "github" },
         { scrubValues: [options.token] },
       );
+      const message = storedFailureMessage(error, options.token);
+      await remember(() => store.recordFailure(time.now(), message));
+      return;
     }
+    notBefore = result.nextPollAt.getTime();
+    if (result.skipped !== true) await remember(() => store.recordSuccess(time.now()));
   };
   const tick = () => {
     if (processing !== undefined) return;

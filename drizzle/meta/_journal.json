@@ -358,6 +358,13 @@
       "when": 1794719397220,
       "tag": "0050_github_notifications",
       "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1794762329426,
+      "tag": "0051_github_notification_status",
+      "breakpoints": true
     }
   ]
 }

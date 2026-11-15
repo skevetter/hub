@@ -1481,6 +1481,11 @@ export const githubNotificationCursors = pgTable("github_notification_cursors", 
   /** Earliest time the next poll may run, from the poll interval GitHub asked for. */
   nextPollAt: timestamp("next_poll_at", { withTimezone: true }).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  /** Shown in the Triggers page. Not read by the poll itself. */
+  lastSuccessAt: timestamp("last_success_at", { withTimezone: true }),
+  /** The latest failure message with the token removed. Cleared by the next success. */
+  lastError: text("last_error"),
+  lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
 });
 
 export const executionAuthorities = pgTable("execution_authorities", {

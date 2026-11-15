@@ -3,6 +3,7 @@ import {
   createGitHubNotificationProvider,
   createGitHubNotificationsSource,
   readGitHubNotificationsOptions,
+  storedFailureMessage,
   type NotificationClock,
 } from "./index.js";
 import type { GitHubNotificationPoller, GitHubNotificationStore } from "./poller.js";
@@ -15,7 +16,26 @@ const store: GitHubNotificationStore = {
   readCursor: unused,
   saveCursor: unused,
   deliver: unused,
+  recordSuccess: async () => {},
+  recordFailure: async () => {},
+  readStatus: unused,
+  countDelivered: unused,
 };
+
+/** Records what the source tells the store about each poll. */
+function recordingStore() {
+  const events: string[] = [];
+  const recording: GitHubNotificationStore = {
+    ...store,
+    recordSuccess: async (now) => {
+      events.push(`success ${now.toISOString()}`);
+    },
+    recordFailure: async (now, message) => {
+      events.push(`failure ${now.toISOString()} ${message}`);
+    },
+  };
+  return { events, recording };
+}
 
 function fakeClock(start: Date) {
   let now = start;
@@ -102,6 +122,71 @@ describe("notification source", () => {
     expect(polls).toBe(1);
     await source.start(async () => {});
     time.advance(1000);
+    await source.stop();
+    expect(polls).toBe(1);
+    await source.start(async () => {});
+    time.advance(60_000);
+    await source.stop();
+    expect(polls).toBe(2);
+  });
+
+  it("records a success after each poll and nothing for a skipped one", async () => {
+    const time = fakeClock(new Date("2026-11-14T10:00:00Z"));
+    const { events, recording } = recordingStore();
+    const results = [
+      { nextPollAt: new Date("2026-11-14T10:01:00Z"), started: 0 },
+      { nextPollAt: new Date("2026-11-14T10:02:00Z"), started: 0, skipped: true as const },
+    ];
+    const poller: GitHubNotificationPoller = { poll: async () => results.shift()! };
+    const source = createGitHubNotificationsSource(recording, options(time.clock), poller);
+    await source.start(async () => {});
+    await source.stop();
+    time.advance(60_000);
+    await source.stop();
+    expect(events).toEqual(["success 2026-11-14T10:00:00.000Z"]);
+  });
+
+  it("records a failure with the token removed and the message cut to 200 characters", async () => {
+    const time = fakeClock(new Date("2026-11-14T10:00:00Z"));
+    const { events, recording } = recordingStore();
+    const poller: GitHubNotificationPoller = {
+      poll: async () => {
+        throw new Error(`GitHub notifications returned 401: bad token secret-token-xyz`);
+      },
+    };
+    const source = createGitHubNotificationsSource(
+      recording,
+      { token: "secret-token-xyz", pollIntervalMs: 60_000, clock: time.clock },
+      poller,
+    );
+    await source.start(async () => {});
+    await source.stop();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toContain(
+      "failure 2026-11-14T10:00:00.000Z GitHub notifications returned 401",
+    );
+    expect(events[0]).not.toContain("secret-token-xyz");
+    expect(storedFailureMessage(new Error("x".repeat(500)), "fake-token-0001")).toHaveLength(200);
+    expect(storedFailureMessage("plain text", "fake-token-0001")).toBe("plain text");
+  });
+
+  it("keeps polling when the status write fails", async () => {
+    const time = fakeClock(new Date("2026-11-14T10:00:00Z"));
+    let polls = 0;
+    const failing: GitHubNotificationStore = {
+      ...store,
+      recordSuccess: async () => {
+        throw new Error("database is down");
+      },
+    };
+    const poller: GitHubNotificationPoller = {
+      poll: async (now) => {
+        polls++;
+        return { nextPollAt: new Date(now.getTime() + 60_000), started: 0 };
+      },
+    };
+    const source = createGitHubNotificationsSource(failing, options(time.clock), poller);
+    await source.start(async () => {});
     await source.stop();
     expect(polls).toBe(1);
     await source.start(async () => {});

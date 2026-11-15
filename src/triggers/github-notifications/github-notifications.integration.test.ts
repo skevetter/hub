@@ -12,7 +12,7 @@ import { ScheduleTestDaemon } from "../schedule/test-daemon.js";
 import { OrganizationTriggerStore } from "../store.js";
 import { TriggerDocumentError } from "../configuration/index.js";
 import { createGitHubNotificationsClient } from "./client.js";
-import type { NotificationClock } from "./index.js";
+import { createGitHubNotificationsSource, type NotificationClock } from "./index.js";
 import { createGitHubNotificationPoller } from "./poller.js";
 import { notificationYaml, thread } from "./test-fixture.js";
 
@@ -270,6 +270,72 @@ describe("github notification polling", () => {
     expect(new URL(fixture.github.requests[1]!.url).searchParams.get("since")).toBe(
       "2026-11-14T10:00:00Z",
     );
+  });
+
+  it("stores the poll status: a scrubbed failure, cleared by the next success, and a 24 hour count", async () => {
+    const fixture = await setup();
+    const { github, database } = fixture;
+    const status = () => database.githubNotifications.readStatus();
+    await fixture.store.save({ yaml: notificationYaml("all-notifications"), userId: null });
+    let tick: (() => void) | undefined;
+    let now = T0;
+    const clock: NotificationClock = {
+      now: () => now,
+      every(callback) {
+        tick = callback;
+        return () => {};
+      },
+    };
+    const source = createGitHubNotificationsSource(database.githubNotifications, {
+      token: TOKEN,
+      pollIntervalMs: INTERVAL_MS,
+      fetch: github.fetch,
+      clock,
+    });
+    try {
+      expect(await status()).toEqual({
+        lastSuccessAt: null,
+        lastError: null,
+        lastErrorAt: null,
+        nextPollAt: null,
+      });
+
+      // First run initializes the cursor and counts as a success.
+      await source.start(async () => {});
+      await expect.poll(async () => (await status()).lastSuccessAt).toEqual(T0);
+      expect(await status()).toMatchObject({ lastError: null, nextPollAt: after(INTERVAL_MS) });
+
+      // A failure stores the message without the token and keeps the last success.
+      now = after(INTERVAL_MS);
+      github.reply({ message: `Bad credentials for ${TOKEN} ${"x".repeat(300)}` }, {}, 401);
+      tick!();
+      await expect.poll(async () => (await status()).lastError).not.toBeNull();
+      const failed = await status();
+      expect(failed.lastError).toContain("GitHub notifications returned 401");
+      expect(failed.lastError).not.toContain(TOKEN);
+      expect(failed.lastError!.length).toBeLessThanOrEqual(200);
+      expect(failed.lastErrorAt).toEqual(after(INTERVAL_MS));
+      expect(failed.lastSuccessAt).toEqual(T0);
+
+      // The next success clears the error and records its time. A 304 is a success too.
+      now = after(2 * INTERVAL_MS);
+      github.reply([webapp]);
+      tick!();
+      await expect.poll(async () => (await status()).lastError).toBeNull();
+      expect((await status()).lastSuccessAt).toEqual(after(2 * INTERVAL_MS));
+      now = after(3 * INTERVAL_MS);
+      github.reply(null, {}, 304);
+      tick!();
+      await expect.poll(async () => (await status()).lastSuccessAt).toEqual(after(3 * INTERVAL_MS));
+
+      const counts = database.githubNotifications;
+      const day = 24 * 60 * 60_000;
+      expect(await counts.countDelivered("notify-org", new Date(now.getTime() - day))).toBe(1);
+      expect(await counts.countDelivered("notify-org", new Date(now.getTime() + 1))).toBe(0);
+      expect(await counts.countDelivered("other-org", new Date(now.getTime() - day))).toBe(0);
+    } finally {
+      await source.stop();
+    }
   });
 
   it("rolls back receipts and runs with the cursor when delivery fails", async () => {
