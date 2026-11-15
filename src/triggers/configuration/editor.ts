@@ -20,6 +20,8 @@ import {
 import {
   eventDefinition,
   isEditorEvent,
+  SCRIPT_NOTIFICATION_REASONS,
+  SCRIPT_ON_MANUAL_RUN_MESSAGE,
   type EditorEvent,
   type QualifierValues,
   type QualifierKey,
@@ -183,15 +185,7 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
   }
   if (eventDefinition(value.event).origin === "hub") {
     deleteIfPresent(document, ["on", value.event, "connection"]);
-    if (needsActorFilter(value)) {
-      setIfChanged(
-        document,
-        ["on", value.event, "filters", "from_users"],
-        commaSeparated(value.allowedUsers),
-      );
-    } else {
-      deleteIfPresent(document, ["on", value.event, "filters", "from_users"]);
-    }
+    deleteIfPresent(document, ["on", value.event, "filters", "from_users"]);
   } else {
     setIfChanged(document, ["on", value.event, "connection"], value.connection);
     setIfChanged(document, ["on", value.event, "filters", "from_users"], users(value.allowedUsers));
@@ -327,10 +321,7 @@ function formEventDefinition(value: TriggerFormValue): TriggerDocument["on"][str
   if (value.event === "schedule.tick")
     return { recurrence: value.recurrence ?? DEFAULT_RECURRENCE };
   if (eventDefinition(value.event).origin === "hub") {
-    const filters = {
-      ...(needsActorFilter(value) ? { from_users: commaSeparated(value.allowedUsers) } : {}),
-      ...authoredQualifiers(value),
-    };
+    const filters = authoredQualifiers(value);
     return Object.keys(filters).length === 0 ? {} : { filters };
   }
   return {
@@ -339,13 +330,9 @@ function formEventDefinition(value: TriggerFormValue): TriggerDocument["on"][str
   };
 }
 
-/**
- * Who may start the run is named by an actor allowlist for provider events, and for a manual
- * run that executes a script, where an open default would let any caller run code on the host.
- */
-export function needsActorFilter(value: Pick<TriggerFormValue, "event" | "action">): boolean {
-  if (eventDefinition(value.event).origin === "provider") return true;
-  return value.action === "script" && value.event === "manual.run";
+/** Who may start the run is named by an actor allowlist for events that come from a provider. */
+export function needsActorFilter(value: Pick<TriggerFormValue, "event">): boolean {
+  return eventDefinition(value.event).origin === "provider";
 }
 
 function workingDirectoryErrors(value: TriggerFormValue): TriggerFieldErrors {
@@ -419,7 +406,7 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
       errors[`qualifiers.${qualifier.key}`] = `${qualifier.label} is required.`;
     }
   }
-  Object.assign(errors, scriptNotificationErrors(value));
+  Object.assign(errors, scriptEventErrors(value));
   Object.assign(errors, recurrenceErrors(value));
   if (value.daemon.trim().length === 0) errors.daemon = "Daemon is required.";
   Object.assign(errors, workingDirectoryErrors(value));
@@ -464,16 +451,25 @@ function actorErrors(value: TriggerFormValue): TriggerFieldErrors {
 }
 
 /** A notification has no actor, so a script on it must narrow by repository or reason. */
-function scriptNotificationErrors(value: TriggerFormValue): TriggerFieldErrors {
-  if (value.action !== "script" || value.event !== "github.notification") return {};
+function scriptEventErrors(value: TriggerFormValue): TriggerFieldErrors {
+  if (value.action !== "script") return {};
+  if (value.event === "manual.run") return { action: SCRIPT_ON_MANUAL_RUN_MESSAGE };
+  if (value.event !== "github.notification") return {};
+  const errors: TriggerFieldErrors = {};
   const repo = value.qualifiers.repo?.trim() ?? "";
   const reason = value.qualifiers.reason?.trim() ?? "";
-  return repo === "" && reason === ""
-    ? {
-        "qualifiers.repo":
-          "A script on a notification needs a repository or a reason, so unrelated notifications cannot run code.",
-      }
-    : {};
+  const allowed = SCRIPT_NOTIFICATION_REASONS.join(", ");
+  if (repo === "") {
+    errors["qualifiers.repo"] =
+      "A script on a notification needs a repository, so unrelated notifications cannot run code.";
+  }
+  if (reason === "") {
+    errors["qualifiers.reason"] = `A script on a notification needs a reason: ${allowed}.`;
+  } else if (!(SCRIPT_NOTIFICATION_REASONS as readonly string[]).includes(reason)) {
+    errors["qualifiers.reason"] =
+      `A script cannot run for "${reason}": third parties can cause that notification. Use one of ${allowed}.`;
+  }
+  return errors;
 }
 
 /** The message a parse refused with, or `undefined` when it accepted the value. */

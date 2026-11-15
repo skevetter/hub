@@ -2,6 +2,8 @@ import {
   eventDefinition,
   isEditorEvent,
   NOTIFICATION_FROM_USERS_MESSAGE,
+  SCRIPT_NOTIFICATION_REASONS,
+  SCRIPT_ON_MANUAL_RUN_MESSAGE,
 } from "../triggers/configuration/events.js";
 import { ContinuationSchema } from "../triggers/continuation.js";
 import { createHash } from "node:crypto";
@@ -37,6 +39,7 @@ const DURATION = /^([1-9][0-9]*)(ms|s|m|h)$/u;
 const MAX_DURATION_MS = 24 * 60 * 60_000;
 const INPUT_NAME = /^[a-z][a-z0-9_-]*$/u;
 const DYNAMIC_INPUT_REFERENCE = /^\$\{\{\s*paseo\.inputs\.([a-z][a-z0-9_-]*)\s*\}\}$/u;
+const MAX_SCRIPT_BYTES = 64 * 1024;
 const EXPRESSION_START = "${{";
 const EXPRESSION_END = "}}";
 
@@ -708,6 +711,11 @@ function validateScriptText(script: string): void {
     throw new Error(
       "script text is not templated. Remove the ${{ }} expression and read event data from the HUB_EVENT_JSON environment variable.",
     );
+  }
+  // An argument with a NUL byte cannot reach the host, and a very large one is refused by exec.
+  if (script.includes("\u0000")) throw new Error("script text must not contain NUL bytes.");
+  if (Buffer.byteLength(script) > MAX_SCRIPT_BYTES) {
+    throw new Error(`script text must be at most ${String(MAX_SCRIPT_BYTES / 1024)} KiB.`);
   }
 }
 
@@ -1541,19 +1549,47 @@ function validateAuthoredIds(config: AuthoredHubConfig): void {
  * connection run code on the host.
  */
 function validateScriptTriggerSecurity(trigger: CompiledTrigger): void {
+  refuseScriptOnManualRun(trigger);
   if (trigger.on === "schedule.tick") return;
   if (trigger.on === "github.notification") {
-    if (trigger.filters?.repo === undefined && trigger.filters?.reason === undefined) {
-      throw new Error(
-        `trigger ${trigger.name} runs a script on github.notification, which has no actor to allowlist. Set filters.repo or filters.reason so an unrelated notification cannot run code on the host.`,
-      );
-    }
+    validateNotificationScriptFilters(trigger);
     return;
   }
   const users = trigger.filters?.from_users;
   if (users === undefined || users.length === 0 || users.includes("*")) {
     throw new Error(
       `trigger ${trigger.name} runs a script, so ${trigger.on} needs filters.from_users that names the people allowed to start it. A wildcard or empty list would let anyone who can reach this event run code on the host.`,
+    );
+  }
+}
+
+/**
+ * Interim rule. The actor of a manual run is a string the caller of the API chooses, so a
+ * `from_users` list cannot keep anyone out of a script: whoever may call the API can name an
+ * allowed user. This stays until a manual run's actor comes from something the caller cannot
+ * pick, such as an API key bound to one actor. Lift it there, in this one function.
+ */
+function refuseScriptOnManualRun(trigger: CompiledTrigger): void {
+  if (trigger.on !== "manual.run") return;
+  throw new Error(SCRIPT_ON_MANUAL_RUN_MESSAGE);
+}
+
+/**
+ * A notification has no actor to allowlist, so the filters are the only thing between an
+ * outsider and the host. Both are required, and the reason must be one a third party cannot cause.
+ */
+function validateNotificationScriptFilters(trigger: CompiledTrigger): void {
+  const { repo, reason } = trigger.filters ?? {};
+  const allowed = SCRIPT_NOTIFICATION_REASONS.join(", ");
+  const prefix = `trigger ${trigger.name} runs a script on github.notification, which has no actor to allowlist.`;
+  if (repo === undefined || reason === undefined) {
+    throw new Error(
+      `${prefix} Set both filters.repo and filters.reason. reason must be one of ${allowed}.`,
+    );
+  }
+  if (!(SCRIPT_NOTIFICATION_REASONS as readonly string[]).includes(reason)) {
+    throw new Error(
+      `${prefix} filters.reason "${reason}" is not allowed for a script. Use one of ${allowed}. Third parties can cause mention, team_mention, comment, subscribed and manual notifications, so those could let an outsider run code on the host.`,
     );
   }
 }

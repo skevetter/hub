@@ -231,52 +231,47 @@ run:
     assert.deepEqual(issues(yaml), []);
   });
 
-  it("refuses a manual run script without a named audience", () => {
-    const found = issues(`
+  it.each([
+    ["no audience", "  manual.run: {}\n"],
+    ["a wildcard audience", '  manual.run:\n    filters:\n      from_users: ["*"]\n'],
+    ["named people", "  manual.run:\n    filters:\n      from_users: [alice]\n"],
+  ])(
+    "refuses a script on manual.run with %s, because the actor is the caller's choice",
+    (_, on) => {
+      const found = issues(`
 name: run-it
 on:
+${on}run:
+  target:
+    daemon: devbox
+    cwd: /workspace/webapp
+  script: ./deploy.sh
+`);
+      assert.equal(found.length, 1);
+      assert.equal(
+        found[0]?.message,
+        "Script actions on manual.run are not available yet: the actor on a manual run is chosen by the caller, so from_users cannot protect the script. Use a schedule, a GitHub notification or another external event.",
+      );
+    },
+  );
+
+  it("refuses manual.run for a script when it shares a document with a safe event", () => {
+    const found = issues(`
+name: two
+on:
+  schedule.tick:
+    recurrence:
+      start: "2026-09-09T02:00:00"
+      rule: "FREQ=DAILY"
+      timezone: Europe/Berlin
   manual.run: {}
 run:
   target:
     daemon: devbox
     cwd: /workspace/webapp
-  script: ./deploy.sh
+  script: ./nightly.sh
 `);
-    assert.match(found[0]?.message ?? "", /manual\.run needs filters\.from_users/u);
-  });
-
-  it("refuses a manual run script with a wildcard audience", () => {
-    const found = issues(`
-name: run-it
-on:
-  manual.run:
-    filters:
-      from_users: ["*"]
-run:
-  target:
-    daemon: devbox
-    cwd: /workspace/webapp
-  script: ./deploy.sh
-`);
-    assert.match(found[0]?.message ?? "", /manual\.run needs filters\.from_users/u);
-  });
-
-  it("allows a manual run script for named people", () => {
-    assert.deepEqual(
-      issues(`
-name: run-it
-on:
-  manual.run:
-    filters:
-      from_users: [alice]
-run:
-  target:
-    daemon: devbox
-    cwd: /workspace/webapp
-  script: ./deploy.sh
-`),
-      [],
-    );
+    assert.match(found[0]?.message ?? "", /Script actions on manual\.run are not available yet/u);
   });
 
   it("allows a manual run agent prompt without an audience, as before", () => {
@@ -298,53 +293,74 @@ run:
     );
   });
 
-  it("requires a repo or reason filter on a notification script", () => {
-    const found = issues(`
-name: any-notification
-on:
-  github.notification:
-    filters:
-      contains: urgent
-run:
-  target:
-    daemon: devbox
-    cwd: /workspace/webapp
-  script: ./deploy.sh
-`);
-    assert.match(found[0]?.message ?? "", /Set filters\.repo or filters\.reason/u);
-    assert.match(found[0]?.message ?? "", /no actor to allowlist/u);
-  });
-
-  it("requires a filter on a notification script with no filters at all", () => {
-    const found = issues(
-      NOTIFICATION.replace(
-        "    filters:\n      repo: acme/webapp\n      reason: review_requested\n",
-        "    {}\n",
-      ),
-    );
-    assert.match(found[0]?.message ?? "", /Set filters\.repo or filters\.reason/u);
-  });
-
-  it.each(["repo: acme/webapp", "reason: mention"])(
-    "accepts a notification script filtered by %s alone",
-    (filter) => {
-      assert.deepEqual(
-        issues(`
+  function notificationDocument(filters: string): string {
+    return `
 name: filtered
 on:
   github.notification:
     filters:
-      ${filter}
+${filters}
 run:
   target:
     daemon: devbox
     cwd: /workspace/webapp
   script: ./deploy.sh
-`),
+`;
+  }
+
+  it.each([
+    ["no filters", "      {}"],
+    ["only a repo", "      repo: acme/webapp"],
+    ["only a reason", "      reason: review_requested"],
+    ["a contains filter alone", "      contains: urgent"],
+  ])("requires both repo and reason on a notification script, got %s", (_, filters) => {
+    const document =
+      filters === "      {}"
+        ? notificationDocument("").replace("    filters:\n\n", "    {}\n")
+        : notificationDocument(filters);
+    const found = issues(document);
+    assert.match(found[0]?.message ?? "", /Set both filters\.repo and filters\.reason/u);
+    assert.match(found[0]?.message ?? "", /no actor to allowlist/u);
+    assert.match(
+      found[0]?.message ?? "",
+      /author, assign, review_requested, state_change, ci_activity/u,
+    );
+  });
+
+  it.each(["author", "assign", "review_requested", "state_change", "ci_activity"])(
+    "accepts the %s notification reason with a repo",
+    (reason) => {
+      assert.deepEqual(
+        issues(notificationDocument(`      repo: acme/webapp\n      reason: ${reason}`)),
         [],
       );
     },
   );
+
+  it.each([
+    "mention",
+    "team_mention",
+    "comment",
+    "subscribed",
+    "manual",
+    "security_alert",
+    "Author",
+  ])("refuses the %s notification reason, because a third party can cause it", (reason) => {
+    const found = issues(notificationDocument(`      repo: acme/webapp\n      reason: ${reason}`));
+    assert.match(
+      found[0]?.message ?? "",
+      new RegExp(`filters\\.reason "${reason}" is not allowed`, "u"),
+    );
+    assert.match(found[0]?.message ?? "", /Third parties can cause mention/u);
+  });
+
+  it("still lets an agent prompt run on every notification reason", () => {
+    const yaml = notificationDocument("      reason: mention").replace(
+      "  script: ./deploy.sh\n",
+      "  agent:\n    provider: codex\n    mode: full-access\n  prompt: hi\n",
+    );
+    assert.deepEqual(issues(yaml), []);
+  });
 
   it("allows a schedule script with no audience", () => {
     assert.deepEqual(
@@ -373,6 +389,7 @@ on:
   github.notification:
     filters:
       repo: acme/webapp
+      reason: author
   slack.mention:
     connection: acme-slack
     filters:
@@ -384,5 +401,26 @@ run:
   script: ./deploy.sh
 `);
     assert.match(found[0]?.message ?? "", /slack\.mention needs filters\.from_users/u);
+  });
+});
+
+describe("script text limits", () => {
+  const withScript = (script: string) =>
+    slack().replace("  script: ./deploy.sh\n", `  script: ${JSON.stringify(script)}\n`);
+
+  it("refuses a NUL byte in the script", () => {
+    const found = issues(withScript("echo a\u0000b"));
+    assert.match(found[0]?.message ?? "", /must not contain NUL bytes/u);
+  });
+
+  it("accepts a script of exactly 64 KiB and refuses one byte more", () => {
+    assert.deepEqual(issues(withScript("#".repeat(64 * 1024))), []);
+    const found = issues(withScript("#".repeat(64 * 1024 + 1)));
+    assert.match(found[0]?.message ?? "", /at most 64 KiB/u);
+  });
+
+  it("counts bytes, not characters", () => {
+    const found = issues(withScript("é".repeat(33 * 1024)));
+    assert.match(found[0]?.message ?? "", /at most 64 KiB/u);
   });
 });

@@ -4,6 +4,23 @@ export const NOTIFICATION_FROM_USERS_MESSAGE =
 /** The filters the notification poll can evaluate. Anything else would be ignored silently. */
 export const NOTIFICATION_FILTER_KEYS = ["repo", "reason", "contains", "pattern"] as const;
 
+/**
+ * The notification reasons a script may run for. Each one follows the author's own action or an
+ * assignment, a review request, a state change or a CI result. The rest (mention, team_mention,
+ * comment, subscribed, manual and any other) can be caused by someone who has no right to run code
+ * on the host, since anyone can mention a user on a public repository.
+ */
+export const SCRIPT_NOTIFICATION_REASONS = [
+  "author",
+  "assign",
+  "review_requested",
+  "state_change",
+  "ci_activity",
+] as const;
+
+export const SCRIPT_ON_MANUAL_RUN_MESSAGE =
+  "Script actions on manual.run are not available yet: the actor on a manual run is chosen by the caller, so from_users cannot protect the script. Use a schedule, a GitHub notification or another external event.";
+
 /** The YAML filter keys the form knows how to qualify. */
 export type QualifierKey = "label" | "repo" | "reason";
 

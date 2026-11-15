@@ -11,6 +11,7 @@ import {
   triggerFormErrors,
   type TriggerFormValue,
 } from "./editor.js";
+import { SCRIPT_NOTIFICATION_REASONS, SCRIPT_ON_MANUAL_RUN_MESSAGE } from "./events.js";
 import { compileTriggerDocument } from "./index.js";
 import { agentRun, isScriptRun, TriggerDocumentSchema } from "./schema.js";
 
@@ -129,28 +130,21 @@ describe("script trigger form bridge", () => {
     compileTriggerDocument(yaml);
   });
 
-  test("a script on a manual run writes its named audience", () => {
-    const yaml = createTriggerYaml(
-      scriptForm({ event: "manual.run", connection: "", allowedUsers: "alice" }),
-    );
-    expect(parseDocument(yaml).toJS()).toMatchObject({
-      on: { "manual.run": { filters: { from_users: ["alice"] } } },
-    });
-    expect(editable(yaml).allowedUsers).toBe("alice");
-    compileTriggerDocument(yaml);
-  });
-
   test("a notification script writes its repository and reason filters", () => {
     const yaml = createTriggerYaml(
       scriptForm({
         event: "github.notification",
         connection: "",
         allowedUsers: "*",
-        qualifiers: { repo: " acme/webapp ", reason: "" },
+        qualifiers: { repo: " acme/webapp ", reason: "review_requested" },
       }),
     );
     expect(parseDocument(yaml).toJS()).toMatchObject({
-      on: { "github.notification": { filters: { repo: "acme/webapp" } } },
+      on: {
+        "github.notification": {
+          filters: { repo: "acme/webapp", reason: "review_requested" },
+        },
+      },
     });
     compileTriggerDocument(yaml);
   });
@@ -194,28 +188,47 @@ describe("script trigger form bridge", () => {
     ).toBe("45m");
   });
 
-  test("an open audience is refused for a script on every actor-driven event", () => {
-    expect(needsActorFilter({ event: "slack.mention", action: "script" })).toBe(true);
-    expect(needsActorFilter({ event: "manual.run", action: "script" })).toBe(true);
-    expect(needsActorFilter({ event: "manual.run", action: "prompt" })).toBe(false);
-    expect(needsActorFilter({ event: "schedule.tick", action: "script" })).toBe(false);
-    expect(needsActorFilter({ event: "github.notification", action: "script" })).toBe(false);
+  test("an open audience is refused for a script on every provider event", () => {
+    expect(needsActorFilter({ event: "slack.mention" })).toBe(true);
+    expect(needsActorFilter({ event: "schedule.tick" })).toBe(false);
+    expect(needsActorFilter({ event: "github.notification" })).toBe(false);
     for (const allowedUsers of ["*", "", "U1, *"]) {
       expect(triggerFormErrors(scriptForm({ allowedUsers })).allowedUsers).toMatch(
         /cannot run for everyone/u,
       );
     }
-    expect(
-      triggerFormErrors(scriptForm({ event: "manual.run", allowedUsers: "*" })).allowedUsers,
-    ).toMatch(/cannot run for everyone/u);
     expect(triggerFormErrors(scriptForm())).toEqual({});
   });
 
-  test("a notification script needs a repository or a reason", () => {
+  test("a script on a manual run is refused in the form with the same message as at save", () => {
+    const errors = triggerFormErrors(
+      scriptForm({ event: "manual.run", connection: "", allowedUsers: "alice" }),
+    );
+    expect(errors.action).toBe(SCRIPT_ON_MANUAL_RUN_MESSAGE);
+    expect(
+      triggerFormErrors(scriptForm({ event: "manual.run", connection: "", action: "prompt" }))
+        .action,
+    ).toBeUndefined();
+  });
+
+  test("a notification script needs a repository and one of the safe reasons", () => {
     const base = scriptForm({ event: "github.notification", connection: "", allowedUsers: "" });
-    expect(triggerFormErrors(base)["qualifiers.repo"]).toMatch(/repository or a reason/u);
-    expect(triggerFormErrors({ ...base, qualifiers: { reason: "mention" } })).toEqual({});
-    expect(triggerFormErrors({ ...base, qualifiers: { repo: "acme/webapp" } })).toEqual({});
+    const errors = triggerFormErrors(base);
+    expect(errors["qualifiers.repo"]).toMatch(/needs a repository/u);
+    expect(errors["qualifiers.reason"]).toMatch(/needs a reason/u);
+    expect(
+      triggerFormErrors({ ...base, qualifiers: { repo: "acme/webapp", reason: "mention" } })[
+        "qualifiers.reason"
+      ],
+    ).toMatch(/third parties can cause that notification/u);
+    expect(
+      triggerFormErrors({ ...base, qualifiers: { reason: "author" } })["qualifiers.repo"],
+    ).toMatch(/needs a repository/u);
+    for (const reason of SCRIPT_NOTIFICATION_REASONS) {
+      expect(triggerFormErrors({ ...base, qualifiers: { repo: "acme/webapp", reason } })).toEqual(
+        {},
+      );
+    }
   });
 
   test("a script form is checked for its own fields only", () => {

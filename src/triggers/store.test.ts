@@ -261,6 +261,81 @@ describe("organization trigger store", () => {
   });
 });
 
+describe("script triggers through the save path", () => {
+  const scriptYaml = (on: string) => `name: build-it
+on:
+${on}run:
+  target: { daemon: devbox, cwd: /workspace }
+  script: ./build.sh
+`;
+  const notification = (filters: string) =>
+    scriptYaml(`  github.notification:\n    filters: { ${filters} }\n`);
+
+  it("saves a script on a notification filtered by repo and a safe reason", async () => {
+    const database = await enrolledDatabase();
+    const store = new OrganizationTriggerStore(database, "org", disconnectedAgentValidator());
+    const saved = await store.save({
+      yaml: notification("repo: acme/webapp, reason: review_requested"),
+      userId: null,
+    });
+    assert.equal((await store.activeRevision(saved)).version, 1);
+  });
+
+  it.each([
+    [
+      "a wildcard audience",
+      scriptYaml(
+        '  slack.mention:\n    connection: acme-slack\n    filters: { from_users: ["*"] }\n',
+      ),
+      /needs filters\.from_users that names the people/u,
+    ],
+    [
+      "no audience",
+      scriptYaml("  slack.mention:\n    connection: acme-slack\n"),
+      /needs filters\.from_users that names the people/u,
+    ],
+    [
+      "manual.run",
+      scriptYaml("  manual.run:\n    filters: { from_users: [alice] }\n"),
+      /Script actions on manual\.run are not available yet/u,
+    ],
+    [
+      "a notification reason a third party can cause",
+      notification("repo: acme/webapp, reason: mention"),
+      /filters\.reason "mention" is not allowed for a script/u,
+    ],
+    [
+      "a notification with only a repo",
+      notification("repo: acme/webapp"),
+      /Set both filters\.repo and filters\.reason/u,
+    ],
+  ])("refuses %s before anything is stored", async (_name, yaml, expected) => {
+    const database = await enrolledDatabase();
+    const store = new OrganizationTriggerStore(database, "org", disconnectedAgentValidator());
+    await assert.rejects(store.save({ yaml, userId: null }), expected);
+    assert.equal((await store.list()).length, 0);
+    assert.equal((await database.listProjectsForOrganization("org")).length, 0);
+  });
+
+  it("refuses to edit a saved script trigger into an open one", async () => {
+    const database = await enrolledDatabase();
+    const store = new OrganizationTriggerStore(database, "org", disconnectedAgentValidator());
+    const saved = await store.save({
+      yaml: notification("repo: acme/webapp, reason: author"),
+      userId: null,
+    });
+    await assert.rejects(
+      store.save({
+        triggerId: saved.id,
+        yaml: notification("repo: acme/webapp, reason: subscribed"),
+        userId: null,
+      }),
+      /not allowed for a script/u,
+    );
+    assert.equal((await store.activeRevision(saved)).version, 1);
+  });
+});
+
 async function enrolledDatabase(): Promise<Database> {
   const database = createMemoryDatabase({ organizationIds: ["org"] });
   await database.issueEnrollmentToken({
