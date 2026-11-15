@@ -143,6 +143,12 @@ Choose Schedule in the trigger editor to run agents daily or on selected weekday
 local times. See [scheduled triggers](docs/scheduled-triggers.md) for setup, YAML, timezone rules,
 and recovery behavior.
 
+## Script actions
+
+A trigger can run a shell script on the daemon's host instead of starting an agent. Choose Script
+under Action in the trigger editor. See [script actions](docs/script-actions.md) for the YAML, the
+permissions a daemon must grant, the limits of the terminal wrapper, and the security checks.
+
 ## Public API
 
 Each Hub serves a self-hosted API reference at `/api/reference` and its generated OpenAPI 3.1 contract at `/api/openapi.json`. The short [public API guide](docs/public-api.md) covers CLI login, versioning, credential scopes, and request correlation.
