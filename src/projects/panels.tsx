@@ -1,4 +1,5 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-array-as-prop, eslint-plugin-react-perf/jsx-no-new-function-as-prop, eslint-plugin-react-perf/jsx-no-new-object-as-prop, eslint-plugin-react-perf/jsx-no-jsx-as-prop, typescript-eslint/no-unsafe-type-assertion -- route links and mutation controls are intentionally scoped to each rendered tenant snapshot */
+import { isScriptStepOutput, ScriptStepOutput } from "./script-step-output.js";
 import { useSnapshotQuery } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
@@ -393,7 +394,7 @@ export function ProjectActivityRunPanel({ runId }: { runId: string }) {
             { header: "Status" },
             { header: "Deadline" },
             { header: "Agent" },
-            { header: "Structured output" },
+            { header: "Output" },
             { header: "Failure reason", fill: true },
           ]}
           isEmpty={activity.steps.length === 0}
@@ -433,7 +434,11 @@ export function ProjectActivityRunPanel({ runId }: { runId: string }) {
                 )}
               </DataCell>
               <DataCell>
-                <JsonValue value={step.output} />
+                {isScriptStepOutput(step.output) ? (
+                  <ScriptStepOutput stepId={step.id} output={step.output} />
+                ) : (
+                  <JsonValue value={step.output} />
+                )}
               </DataCell>
               <DataCell muted>{step.failureReason ?? "—"}</DataCell>
             </DataRow>

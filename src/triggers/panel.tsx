@@ -33,6 +33,7 @@ import {
   describeTriggerEvent,
   changeTriggerEvent,
   mergeTriggerForm,
+  needsActorFilter,
   projectTriggerForm,
   triggerFormErrors,
   type TriggerFieldErrors,
@@ -42,6 +43,7 @@ import { saveTrigger, triggerSnapshot, type TriggerSnapshot } from "./functions.
 import { daemonProviderSnapshot } from "../daemons/functions.js";
 import type { HubProviderSnapshotEntry } from "../hub/protocol.js";
 import { EventFields } from "./event-fields.js";
+import { ActionField, ScriptFields, triggerSecondaryLine } from "./script-fields.js";
 import { NotificationStatusCard } from "./notification-status-card.js";
 import { LastTriggered } from "./last-triggered.js";
 import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
@@ -166,11 +168,7 @@ export function TriggersPanel() {
                         {trigger.name}
                       </Link>
                     }
-                    secondary={
-                      trigger.format === "legacy_multistep"
-                        ? "Legacy YAML"
-                        : (trigger.draft?.agent ?? "Advanced YAML")
-                    }
+                    secondary={triggerSecondaryLine(trigger)}
                   />
                 </span>
               </DataCell>
@@ -602,7 +600,8 @@ function TriggerForm({
   const githubEnabled = form.githubConnection !== "";
   const [githubExpanded, setGithubExpanded] = useState(githubEnabled);
   const [optionsExpanded, setOptionsExpanded] = useState(false);
-  const everyone = form.allowedUsers.trim() === "*";
+  const script = form.action === "script";
+  const targetCopy = script ? SCRIPT_TARGET_COPY : AGENT_TARGET_COPY;
   const update = <Key extends keyof TriggerFormValue>(key: Key, value: TriggerFormValue[Key]) =>
     onChange({ ...form, [key]: value });
   const text = (key: TriggerTextField) => (value: string) => update(key, value);
@@ -610,7 +609,8 @@ function TriggerForm({
   const noDaemons = snapshot.daemons.length === 0;
   const providerCatalog = useDaemonProviderCatalog(
     snapshot.organization.slug,
-    selectedDaemon?.id,
+    // A script lists no agents, so it does not ask the daemon for any.
+    script ? undefined : selectedDaemon?.id,
     form.cwd,
   );
   return (
@@ -694,35 +694,9 @@ function TriggerForm({
           <EventFields value={form} errors={errors} onChange={onChange} />
         </Card>
 
-        {eventDefinition(form.event).origin === "hub" ? null : (
-          <Card title={EDITOR_STEPS.access.title} description={EDITOR_STEPS.access.description}>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <FormField id="trigger-audience" label="Audience">
-                {() => (
-                  <SegmentedControl
-                    label="Audience"
-                    value={everyone ? "everyone" : "specific"}
-                    options={AUDIENCE_OPTIONS}
-                    onChange={(value) => update("allowedUsers", value === "everyone" ? "*" : "")}
-                  />
-                )}
-              </FormField>
-              {everyone ? null : (
-                <FormField
-                  id="trigger-allowed-users"
-                  label="User IDs"
-                  description="Comma-separated provider user IDs."
-                  kind="text"
-                  name="allowedUsers"
-                  value={form.allowedUsers}
-                  onChange={text("allowedUsers")}
-                  required
-                  {...fieldError(errors, "allowedUsers")}
-                />
-              )}
-            </div>
-          </Card>
-        )}
+        {needsActorFilter(form) ? (
+          <AccessCard form={form} errors={errors} onChange={onChange} />
+        ) : null}
 
         <Card
           title={EDITOR_STEPS.target.title}
@@ -773,7 +747,7 @@ function TriggerForm({
                   <FormField
                     id="trigger-cwd"
                     label="Working directory"
-                    description="Absolute path of the checkout on the daemon, for example /home/you/repo. The agents you can run are read from there."
+                    description={targetCopy.cwd}
                     kind="text"
                     name="cwd"
                     value={form.cwd}
@@ -784,7 +758,7 @@ function TriggerForm({
                   <FormField
                     id="trigger-max-runtime"
                     label="Maximum runtime"
-                    description="Hard deadline for the agent, for example 2h."
+                    description={targetCopy.maxRuntime}
                     kind="text"
                     name="maxRuntime"
                     value={form.maxRuntime}
@@ -792,17 +766,19 @@ function TriggerForm({
                     required
                     {...fieldError(errors, "maxRuntime")}
                   />
-                  <FormField
-                    id="trigger-idle-timeout"
-                    label="Idle timeout"
-                    description="Stop an unresponsive agent, for example 10m."
-                    kind="text"
-                    name="idleTimeout"
-                    value={form.idleTimeout}
-                    onChange={text("idleTimeout")}
-                    required
-                    {...fieldError(errors, "idleTimeout")}
-                  />
+                  {script ? null : (
+                    <FormField
+                      id="trigger-idle-timeout"
+                      label="Idle timeout"
+                      description="Stop an unresponsive agent, for example 10m."
+                      kind="text"
+                      name="idleTimeout"
+                      value={form.idleTimeout}
+                      onChange={text("idleTimeout")}
+                      required
+                      {...fieldError(errors, "idleTimeout")}
+                    />
+                  )}
                 </div>
               )}
             </>
@@ -816,11 +792,11 @@ function TriggerForm({
         */}
         <Card
           title={EDITOR_STEPS.agent.title}
-          description={
-            selectedDaemon === undefined ? NO_AGENT_DESCRIPTION : EDITOR_STEPS.agent.description
-          }
+          description={agentStepDescription(script, selectedDaemon !== undefined)}
         >
-          {selectedDaemon === undefined ? null : (
+          <ActionField value={form} onChange={onChange} />
+          {script ? <ScriptFields value={form} errors={errors} onChange={onChange} /> : null}
+          {script || selectedDaemon === undefined ? null : (
             <>
               <div className="grid gap-4 sm:grid-cols-2">
                 <ProviderCatalogFields
@@ -971,11 +947,66 @@ function TriggerForm({
       <Card>
         <p className="flex items-center gap-2 text-sm text-muted-foreground">
           <LockKeyhole aria-hidden="true" className="size-4 shrink-0 text-link" />
-          Hub launches the agent on your daemon. Keys, provider configuration, and sandboxing stay
-          on your compute.
+          {script
+            ? "Hub runs the script in a terminal on your daemon, with the daemon's environment. Keys and sandboxing stay on your compute."
+            : "Hub launches the agent on your daemon. Keys, provider configuration, and sandboxing stay on your compute."}
         </p>
       </Card>
     </div>
+  );
+}
+
+/** Who may start the run: everyone the connection can see, or a named list. A script needs names. */
+function AccessCard({
+  form,
+  errors,
+  onChange,
+}: {
+  form: TriggerFormValue;
+  errors: TriggerFieldErrors;
+  onChange: (value: TriggerFormValue) => void;
+}) {
+  const script = form.action === "script";
+  const everyone = form.allowedUsers.trim() === "*";
+  return (
+    <Card
+      title={EDITOR_STEPS.access.title}
+      description={script ? SCRIPT_ACCESS_DESCRIPTION : EDITOR_STEPS.access.description}
+    >
+      <div className="grid gap-4 sm:grid-cols-2">
+        {script ? null : (
+          <FormField id="trigger-audience" label="Audience">
+            {() => (
+              <SegmentedControl
+                label="Audience"
+                value={everyone ? "everyone" : "specific"}
+                options={AUDIENCE_OPTIONS}
+                onChange={(value) =>
+                  onChange({ ...form, allowedUsers: value === "everyone" ? "*" : "" })
+                }
+              />
+            )}
+          </FormField>
+        )}
+        {everyone && !script ? null : (
+          <FormField
+            id="trigger-allowed-users"
+            label="User IDs"
+            description={
+              script
+                ? "Comma-separated user IDs. A script cannot run for everyone."
+                : "Comma-separated provider user IDs."
+            }
+            kind="text"
+            name="allowedUsers"
+            value={form.allowedUsers}
+            onChange={(value) => onChange({ ...form, allowedUsers: value })}
+            required
+            {...fieldError(errors, "allowedUsers")}
+          />
+        )}
+      </div>
+    </Card>
   );
 }
 
@@ -1045,6 +1076,21 @@ const EDITOR_STEPS = {
 /** What the step says while the decision above it is still missing. */
 const NO_DAEMON_DESCRIPTION =
   "No daemon is connected to this organization yet, and a trigger runs on a daemon.";
+function agentStepDescription(script: boolean, hasDaemon: boolean): string {
+  if (script) return SCRIPT_DESCRIPTION;
+  return hasDaemon ? EDITOR_STEPS.agent.description : NO_AGENT_DESCRIPTION;
+}
+
+const AGENT_TARGET_COPY = {
+  cwd: "Absolute path of the checkout on the daemon, for example /home/you/repo. The agents you can run are read from there.",
+  maxRuntime: "Hard deadline for the agent, for example 2h.",
+};
+const SCRIPT_TARGET_COPY = {
+  cwd: "Absolute path on the daemon's host, for example /home/you/repo. It must be an open project in Paseo.",
+  maxRuntime: "Hub stops the script at this deadline, for example 10m.",
+};
+const SCRIPT_DESCRIPTION = "A shell script, run by /bin/sh on the daemon's host.";
+const SCRIPT_ACCESS_DESCRIPTION = "A script runs code on your host, so name who may start it.";
 const NO_AGENT_DESCRIPTION =
   "Choose a daemon first. The agents you can run are the ones it reports.";
 
@@ -1267,6 +1313,8 @@ function defaultForm(snapshot: TriggerSnapshot): TriggerFormValue {
     githubRepositories: "",
     githubPermissions: "",
     githubDuration: "1h",
+    action: "prompt",
+    script: "",
     prompt:
       "Handle this request in the originating conversation.\n\nWhen hub.reply is available, use it for useful progress updates and your final user-facing response. Call hub.finish_execution once the request is complete.\n\nRequest:\n${{ paseo.prompt }}",
   };

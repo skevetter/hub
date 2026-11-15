@@ -7,7 +7,15 @@ import {
 import { ContinuationSchema } from "../continuation.js";
 import { parseDocument, stringify, type Document } from "yaml";
 import { z } from "zod";
-import { IDENTIFIER, TriggerDocumentSchema, type TriggerDocument } from "./schema.js";
+import {
+  DEFAULT_SCRIPT_MAX_RUNTIME,
+  IDENTIFIER,
+  isScriptRun,
+  TriggerDocumentSchema,
+  type TriggerAgentRun,
+  type TriggerDocument,
+  type TriggerScriptRun,
+} from "./schema.js";
 
 import {
   eventDefinition,
@@ -16,6 +24,10 @@ import {
   type QualifierValues,
   type QualifierKey,
 } from "./events.js";
+
+export type TriggerAction = "prompt" | "script";
+
+const DEFAULT_AGENT_MAX_RUNTIME = "2h";
 
 export interface TriggerFormValue {
   name: string;
@@ -40,6 +52,9 @@ export interface TriggerFormValue {
   githubPermissions: string;
   githubDuration: string;
   prompt: string;
+  /** What the trigger runs: an agent prompt, or a shell script on the daemon host. */
+  action: TriggerAction;
+  script: string;
 }
 
 export type TriggerFormProjection =
@@ -61,22 +76,24 @@ export function projectTriggerForm(yaml: string): TriggerFormProjection {
   if (!isEditorEvent(event)) {
     return { status: "yaml_only", reason: `The form does not support the ${event} event.` };
   }
-  if ("choices" in trigger.run.agent) {
+  const run = trigger.run;
+  if (isScriptRun(run)) {
+    return { status: "editable", value: toScriptFormValue(trigger, run, event, definition) };
+  }
+  if ("choices" in run.agent) {
     return { status: "yaml_only", reason: "Agent choices can only be edited in YAML." };
   }
-  const agent = trigger.run.agent;
   return {
     status: "editable",
-    value: toFormValue(trigger, event, definition, agent),
+    value: toFormValue(trigger, run, event, definition, run.agent),
   };
 }
 
-function toFormValue(
+function toBaseFormValue(
   trigger: TriggerDocument,
   event: EditorEvent,
   definition: TriggerDocument["on"][string],
-  agent: Extract<TriggerDocument["run"]["agent"], { provider: string }>,
-): TriggerFormValue {
+) {
   return {
     name: trigger.name,
     enabled: trigger.enabled,
@@ -85,24 +102,64 @@ function toFormValue(
     allowedUsers: definition.filters?.from_users?.join(", ") ?? "*",
     qualifiers: readQualifiers(event, definition.filters),
     recurrence: definition.recurrence ?? DEFAULT_RECURRENCE,
-    daemon: trigger.run.target.daemon,
-    cwd: trigger.run.target.cwd,
+  };
+}
+
+function toScriptFormValue(
+  trigger: TriggerDocument,
+  run: TriggerScriptRun,
+  event: EditorEvent,
+  definition: TriggerDocument["on"][string],
+): TriggerFormValue {
+  return {
+    ...toBaseFormValue(trigger, event, definition),
+    daemon: run.target.daemon,
+    cwd: run.target.cwd,
+    agent: "",
+    mode: "",
+    thinkingOptionId: "",
+    providerOptions: "",
+    continuationMode: "conversation",
+    continuationKey: "",
+    maxRuntime: run.max_runtime,
+    idleTimeout: "10m",
+    githubConnection: "",
+    githubRepositories: "",
+    githubPermissions: "",
+    githubDuration: "",
+    prompt: "",
+    action: "script",
+    script: run.script,
+  };
+}
+
+function toFormValue(
+  trigger: TriggerDocument,
+  run: TriggerAgentRun,
+  event: EditorEvent,
+  definition: TriggerDocument["on"][string],
+  agent: Extract<TriggerAgentRun["agent"], { provider: string }>,
+): TriggerFormValue {
+  return {
+    ...toBaseFormValue(trigger, event, definition),
+    daemon: run.target.daemon,
+    cwd: run.target.cwd,
     agent: joinAgentId(agent.provider, agent.model),
     mode: agent.mode ?? "",
     thinkingOptionId: agent.thinkingOptionId ?? "",
     providerOptions: agent.options === undefined ? "" : JSON.stringify(agent.options, null, 2),
-    continuationMode: trigger.run.continuation.mode,
-    continuationKey: trigger.run.continuation.mode === "key" ? trigger.run.continuation.key : "",
-    maxRuntime: trigger.run.max_runtime,
-    idleTimeout: trigger.run.idle_timeout,
-    githubConnection: trigger.run.github?.connection ?? "",
-    githubRepositories: trigger.run.github?.repositories?.join(", ") ?? "",
+    continuationMode: run.continuation.mode,
+    continuationKey: run.continuation.mode === "key" ? run.continuation.key : "",
+    maxRuntime: run.max_runtime,
+    idleTimeout: run.idle_timeout,
+    githubConnection: run.github?.connection ?? "",
+    githubRepositories: run.github?.repositories?.join(", ") ?? "",
     githubPermissions:
-      trigger.run.github?.permissions === undefined
-        ? ""
-        : JSON.stringify(trigger.run.github.permissions, null, 2),
-    githubDuration: trigger.run.github?.duration ?? "",
-    prompt: trigger.run.prompt,
+      run.github?.permissions === undefined ? "" : JSON.stringify(run.github.permissions, null, 2),
+    githubDuration: run.github?.duration ?? "",
+    prompt: run.prompt,
+    action: "prompt",
+    script: "",
   };
 }
 
@@ -126,7 +183,15 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
   }
   if (eventDefinition(value.event).origin === "hub") {
     deleteIfPresent(document, ["on", value.event, "connection"]);
-    deleteIfPresent(document, ["on", value.event, "filters", "from_users"]);
+    if (needsActorFilter(value)) {
+      setIfChanged(
+        document,
+        ["on", value.event, "filters", "from_users"],
+        commaSeparated(value.allowedUsers),
+      );
+    } else {
+      deleteIfPresent(document, ["on", value.event, "filters", "from_users"]);
+    }
   } else {
     setIfChanged(document, ["on", value.event, "connection"], value.connection);
     setIfChanged(document, ["on", value.event, "filters", "from_users"], users(value.allowedUsers));
@@ -150,6 +215,15 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
 
   setIfChanged(document, ["run", "target", "daemon"], value.daemon);
   setIfChanged(document, ["run", "target", "cwd"], value.cwd);
+  if (value.action === "script") {
+    for (const key of ["agent", "prompt", "continuation", "idle_timeout", "github"]) {
+      deleteIfPresent(document, ["run", key]);
+    }
+    setIfChanged(document, ["run", "max_runtime"], value.maxRuntime.trim());
+    setIfChanged(document, ["run", "script"], value.script);
+    return document.toString({ lineWidth: 0 });
+  }
+  deleteIfPresent(document, ["run", "script"]);
   const agent = splitAgentId(value.agent);
   setIfChanged(document, ["run", "agent", "provider"], agent.provider);
   setOptional(document, ["run", "agent", "model"], agent.model);
@@ -203,6 +277,21 @@ function incompleteReason(cause: unknown): string {
 
 export function createTriggerYaml(value: TriggerFormValue): string {
   validateFormValue(value);
+  if (value.action === "script") {
+    return stringify(
+      {
+        name: value.name,
+        enabled: value.enabled,
+        on: { [value.event]: formEventDefinition(value) },
+        run: {
+          target: { daemon: value.daemon, cwd: value.cwd },
+          script: value.script,
+          max_runtime: value.maxRuntime.trim(),
+        },
+      },
+      { lineWidth: 0, compat: ["timestamp"] },
+    );
+  }
   const agent = splitAgentId(value.agent);
   const providerOptions = parseProviderOptions(value.providerOptions);
   const github = githubAuthority(value);
@@ -237,11 +326,26 @@ export function createTriggerYaml(value: TriggerFormValue): string {
 function formEventDefinition(value: TriggerFormValue): TriggerDocument["on"][string] {
   if (value.event === "schedule.tick")
     return { recurrence: value.recurrence ?? DEFAULT_RECURRENCE };
-  if (eventDefinition(value.event).origin === "hub") return {};
+  if (eventDefinition(value.event).origin === "hub") {
+    const filters = {
+      ...(needsActorFilter(value) ? { from_users: commaSeparated(value.allowedUsers) } : {}),
+      ...authoredQualifiers(value),
+    };
+    return Object.keys(filters).length === 0 ? {} : { filters };
+  }
   return {
     connection: value.connection,
     filters: { from_users: users(value.allowedUsers), ...authoredQualifiers(value) },
   };
+}
+
+/**
+ * Who may start the run is named by an actor allowlist for provider events, and for a manual
+ * run that executes a script, where an open default would let any caller run code on the host.
+ */
+export function needsActorFilter(value: Pick<TriggerFormValue, "event" | "action">): boolean {
+  if (eventDefinition(value.event).origin === "provider") return true;
+  return value.action === "script" && value.event === "manual.run";
 }
 
 function workingDirectoryErrors(value: TriggerFormValue): TriggerFieldErrors {
@@ -307,20 +411,20 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   }
   if (eventDefinition(value.event).origin === "provider") {
     if (value.connection.trim().length === 0) errors.connection = "Connection is required.";
-    if (value.allowedUsers.trim().length === 0) {
-      errors.allowedUsers = "Name at least one user ID, or let everyone trigger it.";
-    }
   }
+  if (needsActorFilter(value)) Object.assign(errors, actorErrors(value));
   for (const qualifier of eventDefinition(value.event).qualifiers) {
     const selection = value.qualifiers[qualifier.key];
     if (qualifier.required && (selection === undefined || selection.trim().length === 0)) {
       errors[`qualifiers.${qualifier.key}`] = `${qualifier.label} is required.`;
     }
   }
+  Object.assign(errors, scriptNotificationErrors(value));
   Object.assign(errors, recurrenceErrors(value));
   if (value.daemon.trim().length === 0) errors.daemon = "Daemon is required.";
   Object.assign(errors, workingDirectoryErrors(value));
   if (value.maxRuntime.trim().length === 0) errors.maxRuntime = "Maximum runtime is required.";
+  if (value.action === "script") return Object.assign(errors, scriptErrors(value));
   if (value.idleTimeout.trim().length === 0) errors.idleTimeout = "Idle timeout is required.";
   const agent = refused(() => splitAgentId(value.agent));
   if (agent !== undefined) errors.agent = agent;
@@ -334,6 +438,42 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   Object.assign(errors, continuationErrors(value));
   if (value.prompt.trim().length === 0) errors.prompt = "Instructions are required.";
   return errors;
+}
+
+function scriptErrors(value: TriggerFormValue): TriggerFieldErrors {
+  if (value.script.trim().length === 0) return { script: "Script is required." };
+  if (value.script.includes("${{")) {
+    return {
+      script:
+        "Script text is not templated. Read event data from the HUB_EVENT_JSON environment variable.",
+    };
+  }
+  return {};
+}
+
+function actorErrors(value: TriggerFormValue): TriggerFieldErrors {
+  const named = commaSeparated(value.allowedUsers);
+  if (value.action === "script") {
+    return named.length === 0 || named.includes("*")
+      ? { allowedUsers: "Name the people allowed to start a script. It cannot run for everyone." }
+      : {};
+  }
+  return value.allowedUsers.trim().length === 0
+    ? { allowedUsers: "Name at least one user ID, or let everyone trigger it." }
+    : {};
+}
+
+/** A notification has no actor, so a script on it must narrow by repository or reason. */
+function scriptNotificationErrors(value: TriggerFormValue): TriggerFieldErrors {
+  if (value.action !== "script" || value.event !== "github.notification") return {};
+  const repo = value.qualifiers.repo?.trim() ?? "";
+  const reason = value.qualifiers.reason?.trim() ?? "";
+  return repo === "" && reason === ""
+    ? {
+        "qualifiers.repo":
+          "A script on a notification needs a repository or a reason, so unrelated notifications cannot run code.",
+      }
+    : {};
 }
 
 /** The message a parse refused with, or `undefined` when it accepted the value. */
@@ -456,6 +596,35 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
   return { ...value, event, qualifiers, connection: sameProvider ? value.connection : "" };
 }
 
+/**
+ * Moving between a prompt and a script keeps what the two share and resets what the other
+ * action's defaults would get wrong: the run limit, and an open audience a script may not have.
+ */
+export function changeTriggerAction(
+  value: TriggerFormValue,
+  action: TriggerAction,
+): TriggerFormValue {
+  if (value.action === action) return value;
+  const next = { ...value, action };
+  if (action === "script") {
+    return {
+      ...next,
+      maxRuntime:
+        value.maxRuntime === DEFAULT_AGENT_MAX_RUNTIME
+          ? DEFAULT_SCRIPT_MAX_RUNTIME
+          : value.maxRuntime,
+      allowedUsers: value.allowedUsers.trim() === "*" ? "" : value.allowedUsers,
+    };
+  }
+  return {
+    ...next,
+    maxRuntime:
+      value.maxRuntime === DEFAULT_SCRIPT_MAX_RUNTIME
+        ? DEFAULT_AGENT_MAX_RUNTIME
+        : value.maxRuntime,
+  };
+}
+
 function readQualifiers(
   event: EditorEvent,
   filters: TriggerDocument["on"][string]["filters"],
@@ -472,7 +641,8 @@ function authoredQualifiers(value: TriggerFormValue): QualifierValues {
   const filters: QualifierValues = {};
   for (const qualifier of eventDefinition(value.event).qualifiers) {
     const selection = value.qualifiers[qualifier.key];
-    if (selection !== undefined) filters[qualifier.key] = selection.trim();
+    if (selection !== undefined && selection.trim() !== "")
+      filters[qualifier.key] = selection.trim();
   }
   return filters;
 }

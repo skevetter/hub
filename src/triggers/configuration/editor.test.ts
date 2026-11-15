@@ -1,3 +1,4 @@
+import { agentRun } from "./schema.js";
 import { EDITOR_EVENTS } from "./events.js";
 import { describe, expect, test } from "vitest";
 import { parseDocument } from "yaml";
@@ -90,7 +91,7 @@ describe("trigger form YAML bridge", () => {
       cwd: "/new-workspace",
       worktree: { mode: "branch-off", newBranch: "hub-work" },
     });
-    expect(value.run.agent).toEqual({
+    expect(agentRun(value.run).agent).toEqual({
       provider: "pi",
       model: "gateway/vendor/model-v1",
       mode: "safe",
@@ -99,15 +100,15 @@ describe("trigger form YAML bridge", () => {
     });
     expect(value.inputs).toBeDefined();
     expect(value.max_runtime).toBe("4h");
-    expect(value.run.startup_timeout).toBe("3m");
-    expect(value.run.env).toEqual({ TEAM: "core" });
-    expect(value.run.github).toEqual({
+    expect(agentRun(value.run).startup_timeout).toBe("3m");
+    expect(agentRun(value.run).env).toEqual({ TEAM: "core" });
+    expect(agentRun(value.run).github).toEqual({
       connection: "company-github",
       repositories: ["paseo/hub"],
     });
-    expect(value.run.output).toBeDefined();
-    expect(value.run.outputs).toEqual({ "slack.reply": { max: 3 } });
-    expect(value.run.auto_archive).toBe(false);
+    expect(agentRun(value.run).output).toBeDefined();
+    expect(agentRun(value.run).outputs).toEqual({ "slack.reply": { max: 3 } });
+    expect(agentRun(value.run).auto_archive).toBe(false);
     expect(value.on["slack.mention"]?.filters?.channels).toEqual(["engineering"]);
   });
 
@@ -119,9 +120,10 @@ describe("trigger form YAML bridge", () => {
       providerOptions: '{"sandbox_mode":"read-only"}',
     });
     const value = TriggerDocumentSchema.parse(parseDocument(yaml).toJS());
-    if ("choices" in value.run.agent) throw new Error("expected an inline agent");
-    expect(value.run.agent.options).toEqual({ sandbox_mode: "read-only" });
-    expect(value.run.agent.thinkingOptionId).toBe("xhigh");
+    const { agent } = agentRun(value.run);
+    if ("choices" in agent) throw new Error("expected an inline agent");
+    expect(agent.options).toEqual({ sandbox_mode: "read-only" });
+    expect(agent.thinkingOptionId).toBe("xhigh");
   });
 
   test("keeps advanced YAML added before a new trigger's first save", () => {
@@ -131,9 +133,9 @@ describe("trigger form YAML bridge", () => {
     if (merged.status !== "ok") throw new Error(merged.reason);
     expect(merged.yaml).toContain("# keep this heading");
     const value = TriggerDocumentSchema.parse(parseDocument(merged.yaml).toJS());
-    expect(value.run.prompt).toBe("Changed.");
-    expect(value.run.target.worktree).toBeDefined();
-    expect(value.run.outputs).toBeDefined();
+    expect(agentRun(value.run).prompt).toBe("Changed.");
+    expect(agentRun(value.run).target.worktree).toBeDefined();
+    expect(agentRun(value.run).outputs).toBeDefined();
   });
 
   test("keeps unsupported shapes in YAML-only mode", () => {
@@ -174,6 +176,8 @@ describe("trigger form YAML bridge", () => {
       githubPermissions: "",
       githubDuration: "1h",
       prompt: "Handle it.",
+      action: "prompt",
+      script: "",
     });
     expect(parseDocument(yaml).toJS()).toEqual({
       name: "answer",
@@ -213,6 +217,8 @@ describe("trigger form YAML bridge", () => {
       githubPermissions: "",
       githubDuration: "1h",
       prompt: "${{ paseo.prompt }}",
+      action: "prompt",
+      script: "",
     });
     const projection = projectTriggerForm(initial);
     if (projection.status !== "editable") throw new Error(projection.reason);

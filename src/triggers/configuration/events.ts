@@ -5,7 +5,7 @@ export const NOTIFICATION_FROM_USERS_MESSAGE =
 export const NOTIFICATION_FILTER_KEYS = ["repo", "reason", "contains", "pattern"] as const;
 
 /** The YAML filter keys the form knows how to qualify. */
-export type QualifierKey = "label";
+export type QualifierKey = "label" | "repo" | "reason";
 
 /** Draft values for the qualifiers declared by the selected event. */
 export type QualifierValues = Partial<Record<QualifierKey, string>>;
@@ -57,6 +57,23 @@ function event(
   };
 }
 
+const NOTIFICATION_REPO: QualifierDefinition = {
+  key: "repo",
+  kind: "string",
+  label: "Repository",
+  description: "Match notifications from this repository, as owner/name. Leave blank for any.",
+  required: false,
+};
+
+const NOTIFICATION_REASON: QualifierDefinition = {
+  key: "reason",
+  kind: "string",
+  label: "Reason",
+  description:
+    "Match GitHub's reason for the notification, such as mention or review_requested. Leave blank for any.",
+  required: false,
+};
+
 const EVENTS = {
   "slack.mention": event("slack", "Slack mention"),
   "discord.mention": event("discord", "Discord mention"),
@@ -82,7 +99,10 @@ const EVENTS = {
   "linear.issue_entered_scope": event("linear", "Linear issue entered scope"),
   "linear.issue_assigned": event("linear", "Linear issue assigned"),
   "linear.comment_created": event("linear", "Linear comment created"),
-  "github.notification": event("github_notification", "GitHub notification"),
+  "github.notification": event("github_notification", "GitHub notification", [
+    NOTIFICATION_REPO,
+    NOTIFICATION_REASON,
+  ]),
   "schedule.tick": event("schedule", "Schedule"),
   "manual.run": event("manual", "Manual run"),
 };
