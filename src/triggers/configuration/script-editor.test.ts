@@ -59,6 +59,7 @@ function scriptForm(overrides: Partial<TriggerFormValue> = {}): TriggerFormValue
     continuationKey: "",
     maxRuntime: "10m",
     idleTimeout: "10m",
+    completeOnTurnEnd: false,
     githubConnection: "",
     githubRepositories: "",
     githubPermissions: "",

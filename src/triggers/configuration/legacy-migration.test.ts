@@ -58,6 +58,37 @@ steps:
     assert.doesNotMatch(trigger.yaml, /include:|partials|steps:/u);
   });
 
+  it.each([true, undefined])(
+    "carries complete_on_turn_end %s into the migrated document",
+    (flag) => {
+      const migrated = migrateLegacyBundle({
+        files: [
+          { path: ".paseo/hub.yml", content: hub },
+          {
+            path: ".paseo/workflows/solo.yml",
+            content: `
+name: solo
+on: manual.run
+max_runtime: 2h
+steps:
+  - id: work
+    environment: runner
+    max_runtime: 90m
+    idle_timeout: 10m
+    agent: codex
+    prompt: [{ text: work }]${flag === undefined ? "" : "\n    complete_on_turn_end: true"}
+`,
+          },
+        ],
+      });
+
+      const trigger = migrated[0];
+      assert.equal(trigger?.format, "single_run");
+      if (trigger?.format !== "single_run") return;
+      assert.equal(/complete_on_turn_end: true/u.test(trigger.yaml), flag === true);
+    },
+  );
+
   it("preserves a multi-step workflow as one self-contained normalized legacy trigger", () => {
     const migrated = migrateLegacyBundle({
       files: [

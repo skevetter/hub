@@ -191,6 +191,7 @@ const AgentStepSchema = z
     allow_outputs: z.array(AllowOutputSchema).optional(),
     auto_archive: z.boolean().optional(),
     background: z.boolean().optional(),
+    complete_on_turn_end: z.boolean().optional(),
   })
   .strict();
 
@@ -316,6 +317,8 @@ export interface CompiledAgentStep {
   allowOutputs: readonly { type: string; max?: number | undefined; required: boolean }[];
   autoArchive: boolean;
   background: boolean;
+  /** Absent means off. A finished agent turn then completes the step without finish_execution. */
+  completeOnTurnEnd?: boolean | undefined;
 }
 
 /** A step that runs a shell script in a daemon terminal. It has no agent, prompt, or output. */
@@ -500,6 +503,7 @@ const CompiledAgentStepSchema = z
     ),
     autoArchive: z.boolean(),
     background: z.boolean().default(false),
+    completeOnTurnEnd: z.boolean().optional(),
   })
   .strict();
 
@@ -743,6 +747,11 @@ function compileAgentStep(
     step.output === undefined ? undefined : { schema: cloneJsonValue(step.output.schema) };
   if (outputDeclaration !== undefined)
     validateOutputSchema(outputDeclaration.schema, `step ${step.id} output.schema`);
+  assertTurnEndCompletionAllowed(step.id, {
+    enabled: step.complete_on_turn_end === true,
+    structuredOutput: outputDeclaration !== undefined,
+    requiredOutputs: (step.allow_outputs ?? []).some((output) => output.required === true),
+  });
   const env = step.env === undefined ? undefined : { ...step.env };
   const github =
     step.github === undefined
@@ -781,7 +790,26 @@ function compileAgentStep(
     })),
     autoArchive: step.auto_archive ?? false,
     background: step.background ?? false,
+    ...(step.complete_on_turn_end === true ? { completeOnTurnEnd: true } : {}),
   };
+}
+
+/** A finished turn carries free text, so it cannot satisfy a declared output contract. */
+function assertTurnEndCompletionAllowed(
+  stepId: string,
+  step: { enabled: boolean; structuredOutput: boolean; requiredOutputs: boolean },
+): void {
+  if (!step.enabled) return;
+  if (step.structuredOutput) {
+    throw new Error(
+      `step ${stepId} complete_on_turn_end cannot be combined with output.schema: a finished turn has no structured output`,
+    );
+  }
+  if (step.requiredOutputs) {
+    throw new Error(
+      `step ${stepId} complete_on_turn_end cannot be combined with a required output: the agent must emit it before it finishes`,
+    );
+  }
 }
 
 function compileAgentSelection(
@@ -1358,6 +1386,11 @@ function validateCompiledContract(config: CompiledHubConfig): void {
         throw new Error(`step ${step.id} idle_timeout must not exceed max_runtime`);
       }
       validateCompiledPromptBlocks(step);
+      assertTurnEndCompletionAllowed(step.id, {
+        enabled: step.completeOnTurnEnd === true,
+        structuredOutput: step.output !== undefined,
+        requiredOutputs: step.allowOutputs.some((output) => output.required),
+      });
       if (step.condition !== undefined && !isExpression(step.condition)) {
         throw new Error(`step ${step.id} contains an invalid condition`);
       }

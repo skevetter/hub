@@ -179,6 +179,7 @@ function singleRunDocument(
       ...(Object.keys(outputs).length === 0 ? {} : { outputs }),
       auto_archive: step.autoArchive,
       background: step.background,
+      ...(step.completeOnTurnEnd === true ? { complete_on_turn_end: true } : {}),
     },
   };
 }

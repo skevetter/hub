@@ -171,6 +171,7 @@ describe("trigger form YAML bridge", () => {
       continuationKey: "",
       maxRuntime: "2h",
       idleTimeout: "10m",
+      completeOnTurnEnd: false,
       githubConnection: "",
       githubRepositories: "",
       githubPermissions: "",
@@ -194,6 +195,60 @@ describe("trigger form YAML bridge", () => {
     });
   });
 
+  test("writes complete_on_turn_end only when the box is ticked", () => {
+    const form = {
+      name: "answer",
+      enabled: true,
+      event: "manual.run" as const,
+      connection: "",
+      allowedUsers: "*",
+      qualifiers: {},
+      daemon: "office",
+      cwd: "/workspace",
+      agent: "claude",
+      mode: "default",
+      thinkingOptionId: "",
+      providerOptions: "",
+      continuationMode: "conversation",
+      continuationKey: "",
+      maxRuntime: "2h",
+      idleTimeout: "10m",
+      completeOnTurnEnd: false,
+      githubConnection: "",
+      githubRepositories: "",
+      githubPermissions: "",
+      githubDuration: "1h",
+      prompt: "Handle it.",
+      action: "prompt" as const,
+      script: "",
+    };
+    const off = createTriggerYaml(form);
+    expect(off).not.toContain("complete_on_turn_end");
+
+    const on = createTriggerYaml({ ...form, completeOnTurnEnd: true });
+    expect(parseDocument(on).getIn(["run", "complete_on_turn_end"])).toBe(true);
+    const projection = projectTriggerForm(on);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    expect(projection.value.completeOnTurnEnd).toBe(true);
+
+    const cleared = mergeTriggerForm(on, { ...projection.value, completeOnTurnEnd: false });
+    if (cleared.status !== "ok") throw new Error(cleared.reason);
+    expect(cleared.yaml).not.toContain("complete_on_turn_end");
+    const set = mergeTriggerForm(off, { ...form, completeOnTurnEnd: true });
+    if (set.status !== "ok") throw new Error(set.reason);
+    expect(parseDocument(set.yaml).getIn(["run", "complete_on_turn_end"])).toBe(true);
+  });
+
+  test("leaves an authored complete_on_turn_end: false alone when the form is unchanged elsewhere", () => {
+    const authored = ADVANCED.replace("run:", "run:\n  complete_on_turn_end: false");
+    const projection = projectTriggerForm(authored);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    expect(projection.value.completeOnTurnEnd).toBe(false);
+    const merged = mergeTriggerForm(authored, { ...projection.value, name: "renamed" });
+    if (merged.status !== "ok") throw new Error(merged.reason);
+    expect(merged.yaml).toContain("complete_on_turn_end: false");
+  });
+
   test("submits an unchanged minimal manual trigger", () => {
     const initial = createTriggerYaml({
       name: "deploy",
@@ -212,6 +267,7 @@ describe("trigger form YAML bridge", () => {
       continuationKey: "",
       maxRuntime: "2h",
       idleTimeout: "10m",
+      completeOnTurnEnd: false,
       githubConnection: "",
       githubRepositories: "",
       githubPermissions: "",

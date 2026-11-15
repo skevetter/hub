@@ -131,6 +131,7 @@ function agentStep(run: TriggerAgentRun): AuthoredAgentStep {
     ...(allowOutputs.length === 0 ? {} : { allow_outputs: allowOutputs }),
     auto_archive: run.auto_archive,
     background: run.background,
+    ...(run.complete_on_turn_end === true ? { complete_on_turn_end: true } : {}),
   };
 }
 

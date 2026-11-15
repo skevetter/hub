@@ -859,6 +859,13 @@ function TriggerForm({
                 {...fieldError(errors, "prompt")}
                 onChange={(prompt) => update("prompt", prompt)}
               />
+              <CheckboxField
+                id="trigger-complete-on-turn-end"
+                label="Complete when the agent ends its turn"
+                description="If the agent stops without calling finish_execution, count the run as done instead of failing it at the idle timeout. Not for runs with a structured output or a required output."
+                checked={form.completeOnTurnEnd}
+                onChange={(checked) => update("completeOnTurnEnd", checked)}
+              />
               <Disclosure
                 id="trigger-provider-options"
                 open={optionsExpanded}
@@ -1309,6 +1316,7 @@ function defaultForm(snapshot: TriggerSnapshot): TriggerFormValue {
     continuationKey: "",
     maxRuntime: "2h",
     idleTimeout: "10m",
+    completeOnTurnEnd: false,
     githubConnection: "",
     githubRepositories: "",
     githubPermissions: "",

@@ -38,6 +38,8 @@ export interface LaunchMachineIntent {
   idleTimeoutMs?: number;
   autoArchive: boolean;
   background: boolean;
+  /** Complete the execution when the agent's turn ends without finish_execution. */
+  completeOnTurnEnd?: boolean;
   triggerContext: unknown;
   outputContext: unknown;
   outputSchema?: JsonValue;
@@ -65,6 +67,8 @@ export function buildLaunchMachineIntent(input: {
   idleTimeoutMs?: number;
   autoArchive: boolean;
   background: boolean;
+  /** Complete the execution when the agent's turn ends without finish_execution. */
+  completeOnTurnEnd?: boolean;
   triggerContext: unknown;
   outputContext: unknown;
   hubConfig: unknown;
@@ -88,6 +92,7 @@ export function buildLaunchMachineIntent(input: {
     ...(input.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: input.idleTimeoutMs }),
     autoArchive: input.autoArchive,
     background: input.background,
+    ...(input.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
     triggerContext: input.triggerContext,
     outputContext: input.outputContext,
     configurationRevisionId: input.configurationRevisionId,

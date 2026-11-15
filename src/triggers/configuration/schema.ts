@@ -122,6 +122,8 @@ export const TriggerAgentRunSchema = z
     outputs: z.record(z.string().regex(EVENT_NAME), TriggerOutputSchema).optional(),
     auto_archive: z.boolean().default(true),
     background: z.boolean().default(false),
+    /** Count a finished agent turn as done when the agent never calls finish_execution. */
+    complete_on_turn_end: z.boolean().optional(),
   })
   .strict();
 
@@ -168,6 +170,7 @@ const SCRIPT_REJECTED_OPTIONS: Readonly<Record<string, string>> = {
   title: "title does not apply to a script. It creates no workspace.",
   background: "background does not apply to a script. It creates no workspace.",
   auto_archive: "auto_archive does not apply to a script. It creates no workspace.",
+  complete_on_turn_end: "complete_on_turn_end does not apply to a script. It has no agent turn.",
 };
 
 /**

@@ -110,6 +110,49 @@ describe("self-contained trigger documents", () => {
     );
   });
 
+  it.each([undefined, false, true])(
+    "keeps complete_on_turn_end %s off the compiled step unless it is on",
+    (completeOnTurnEnd) => {
+      const yaml =
+        completeOnTurnEnd === undefined
+          ? trigger
+          : trigger.replace("run:", `run:\n  complete_on_turn_end: ${String(completeOnTurnEnd)}`);
+      const compiled = compileTriggerDocument(yaml);
+      const step = agentStep(compiled.events[0]?.steps[0]);
+      assert.equal(step.completeOnTurnEnd, completeOnTurnEnd === true ? true : undefined);
+      assert.equal("completeOnTurnEnd" in step, completeOnTurnEnd === true);
+      const exported = serializeTriggerDocument(compiled.authored);
+      assert.equal(/complete_on_turn_end/u.test(exported), completeOnTurnEnd !== undefined);
+      assert.equal(
+        agentRun(parseTriggerDocument(exported).run).complete_on_turn_end,
+        completeOnTurnEnd,
+      );
+    },
+  );
+
+  it("rejects a non-boolean complete_on_turn_end value", () => {
+    assert.throws(
+      () => parseTriggerDocument(trigger.replace("run:", 'run:\n  complete_on_turn_end: "yes"')),
+      /run.complete_on_turn_end/,
+    );
+  });
+
+  it("refuses complete_on_turn_end beside a structured output or a required output", () => {
+    const on = trigger.replace("run:", "run:\n  complete_on_turn_end: true");
+    assert.throws(
+      () =>
+        compileTriggerDocument(
+          on.replace("  outputs:", "  output:\n    schema: { type: object }\n  outputs:"),
+        ),
+      /complete_on_turn_end cannot be combined with output.schema/,
+    );
+    assert.throws(
+      () =>
+        compileTriggerDocument(on.replace("      max: 5", "      max: 5\n      required: true")),
+      /complete_on_turn_end cannot be combined with a required output/,
+    );
+  });
+
   it("compiles and preserves a configurable startup timeout", () => {
     const yaml = trigger.replace("  max_runtime: 90m", "  max_runtime: 90m\n  startup_timeout: 3m");
     const compiled = compileTriggerDocument(yaml);

@@ -49,6 +49,8 @@ export interface TriggerFormValue {
   continuationKey: string;
   maxRuntime: string;
   idleTimeout: string;
+  /** Count a finished agent turn as done when the agent never calls finish_execution. */
+  completeOnTurnEnd: boolean;
   githubConnection: string;
   githubRepositories: string;
   githubPermissions: string;
@@ -125,6 +127,7 @@ function toScriptFormValue(
     continuationKey: "",
     maxRuntime: run.max_runtime,
     idleTimeout: "10m",
+    completeOnTurnEnd: false,
     githubConnection: "",
     githubRepositories: "",
     githubPermissions: "",
@@ -154,6 +157,7 @@ function toFormValue(
     continuationKey: run.continuation.mode === "key" ? run.continuation.key : "",
     maxRuntime: run.max_runtime,
     idleTimeout: run.idle_timeout,
+    completeOnTurnEnd: run.complete_on_turn_end === true,
     githubConnection: run.github?.connection ?? "",
     githubRepositories: run.github?.repositories?.join(", ") ?? "",
     githubPermissions:
@@ -210,7 +214,14 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
   setIfChanged(document, ["run", "target", "daemon"], value.daemon);
   setIfChanged(document, ["run", "target", "cwd"], value.cwd);
   if (value.action === "script") {
-    for (const key of ["agent", "prompt", "continuation", "idle_timeout", "github"]) {
+    for (const key of [
+      "agent",
+      "prompt",
+      "continuation",
+      "idle_timeout",
+      "github",
+      "complete_on_turn_end",
+    ]) {
       deleteIfPresent(document, ["run", key]);
     }
     setIfChanged(document, ["run", "max_runtime"], value.maxRuntime.trim());
@@ -231,6 +242,10 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
   setIfChanged(document, ["run", "continuation"], formContinuation(value));
   setIfChanged(document, ["run", "max_runtime"], value.maxRuntime.trim());
   setIfChanged(document, ["run", "idle_timeout"], value.idleTimeout.trim());
+  // An authored `false` is the default; leave it alone rather than rewrite it to nothing.
+  if (value.completeOnTurnEnd !== (document.getIn(["run", "complete_on_turn_end"]) === true)) {
+    setOptional(document, ["run", "complete_on_turn_end"], value.completeOnTurnEnd || undefined);
+  }
   setOptional(document, ["run", "github"], githubAuthority(value));
   setIfChanged(document, ["run", "prompt"], value.prompt);
   return document.toString({ lineWidth: 0 });
@@ -309,6 +324,7 @@ export function createTriggerYaml(value: TriggerFormValue): string {
         continuation: formContinuation(value),
         max_runtime: value.maxRuntime.trim(),
         idle_timeout: value.idleTimeout.trim(),
+        ...(value.completeOnTurnEnd ? { complete_on_turn_end: true } : {}),
         ...(github === undefined ? {} : { github }),
         prompt: value.prompt,
       },

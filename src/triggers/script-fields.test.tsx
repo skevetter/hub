@@ -21,6 +21,7 @@ const form: TriggerFormValue = {
   continuationKey: "",
   maxRuntime: "10m",
   idleTimeout: "10m",
+  completeOnTurnEnd: false,
   githubConnection: "",
   githubRepositories: "",
   githubPermissions: "",

@@ -148,6 +148,7 @@ describe("script actions in a trigger document", () => {
     ["title", "  title: Deploy\n", /no workspace/u],
     ["background", "  background: true\n", /no workspace/u],
     ["auto_archive", "  auto_archive: false\n", /no workspace/u],
+    ["complete_on_turn_end", "  complete_on_turn_end: true\n", /no agent turn/u],
   ])("rejects %s on a script with a reason", (key, line, reason) => {
     const found = issues(slack(line));
     assert.equal(found.length, 1);
