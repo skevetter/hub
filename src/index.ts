@@ -10,6 +10,7 @@ import type { Database } from "./db/types.js";
 import {
   embeddedDatabaseRuntime,
   postgresDatabaseRuntime,
+  readDatabasePoolOptions,
   type DatabaseRuntime,
   type DatabaseRuntimeBundle,
 } from "./db/runtime/index.js";
@@ -231,10 +232,12 @@ function createProductionAuthServer(
 }
 
 async function createDatabaseHandle(): Promise<DatabaseRuntimeBundle & { database: Database }> {
+  // Read before connecting so a bad value stops startup with its own message.
+  const poolOptions = readDatabasePoolOptions(process.env);
   const databaseUrl = process.env["DATABASE_URL"];
   if (databaseUrl !== undefined && databaseUrl.length > 0) {
     return initializeDatabaseRuntime(
-      () => postgresDatabaseRuntime(databaseUrl),
+      () => postgresDatabaseRuntime(databaseUrl, poolOptions),
       "database runtime ready: postgres",
     );
   }

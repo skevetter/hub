@@ -3,7 +3,7 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { reportFailure } from "../../../failures/index.js";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import type { PoolClient } from "pg";
-import { createPool, type PostgresPool } from "./pool.js";
+import { createPool, type PostgresPool, type PostgresPoolOptions } from "./pool.js";
 export { createPool } from "./pool.js";
 import * as schema from "../../schema.js";
 import { toDatabaseError } from "../../errors.js";
@@ -25,9 +25,10 @@ const DEFAULT_POSTGRES_DATABASE = "postgres";
 
 export async function createPostgresRuntime(
   connectionString: string,
+  poolOptions: PostgresPoolOptions = {},
 ): Promise<DatabaseRuntimeBundle> {
   await ensureDatabaseExists(connectionString);
-  const pool = createPool(connectionString);
+  const pool = createPool(connectionString, poolOptions);
   const runtime = new PostgresRuntime(pool);
   return {
     runtime,

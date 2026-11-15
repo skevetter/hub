@@ -6,10 +6,22 @@ import { reportFailure } from "../../../failures/index.js";
 import { errorForLog } from "../../../logger.js";
 
 const QUERY_DEADLINE_MS = 3_000;
+export const DEFAULT_POOL_MAX = 10;
+export const DEFAULT_ACQUIRE_TIMEOUT_MS = QUERY_DEADLINE_MS;
+
+export interface PostgresPoolOptions {
+  /** Most connections the pool opens. */
+  max?: number;
+  /** How long a caller waits for a free connection. Queries keep their own 3 second limit. */
+  acquireTimeoutMs?: number;
+}
 
 /** @package */
-export function createPool(connectionString: string): PostgresPool {
-  return new PostgresPool(connectionString);
+export function createPool(
+  connectionString: string,
+  options: PostgresPoolOptions = {},
+): PostgresPool {
+  return new PostgresPool(connectionString, options);
 }
 
 /** @package */
@@ -17,10 +29,11 @@ export class PostgresPool extends Pool {
   private readonly scrubValues: string[];
   private readonly queryPhase = new AsyncLocalStorage<{ value: "acquire" | "query" }>();
 
-  constructor(connectionString: string) {
+  constructor(connectionString: string, options: PostgresPoolOptions = {}) {
     super({
       connectionString,
-      connectionTimeoutMillis: QUERY_DEADLINE_MS,
+      max: options.max ?? DEFAULT_POOL_MAX,
+      connectionTimeoutMillis: options.acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS,
       query_timeout: QUERY_DEADLINE_MS,
       statement_timeout: QUERY_DEADLINE_MS,
     });

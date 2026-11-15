@@ -4,6 +4,10 @@ import type * as schema from "../schema.js";
 import type { Locks } from "./locks/index.js";
 import { createEmbeddedRuntime } from "./internal/embedded.js";
 import { createPostgresRuntime } from "./internal/postgres.js";
+import type { PostgresPoolOptions } from "./internal/pool.js";
+
+export { readDatabasePoolOptions } from "./internal/pool-options.js";
+export type { PostgresPoolOptions } from "./internal/pool.js";
 
 export type QueryRow = Record<string, unknown>;
 
@@ -47,8 +51,11 @@ export interface DatabaseRuntimeBundle {
   locks: Locks;
 }
 
-export function postgresDatabaseRuntime(connectionString: string): Promise<DatabaseRuntimeBundle> {
-  return createPostgresRuntime(connectionString);
+export function postgresDatabaseRuntime(
+  connectionString: string,
+  poolOptions?: PostgresPoolOptions,
+): Promise<DatabaseRuntimeBundle> {
+  return createPostgresRuntime(connectionString, poolOptions);
 }
 
 export function embeddedDatabaseRuntime(dataDirectory: string): Promise<DatabaseRuntimeBundle> {
