@@ -876,6 +876,8 @@ export interface WorkflowScriptStepStartInput {
   startedAt: Date;
   /** Past this the step is timed out by deadline recovery, so it is set after the runner's own. */
   deadlineAt: Date;
+  /** The step's first output, written with the start so it is never running without one. */
+  output?: unknown;
 }
 
 export interface WorkflowScriptStepUpdate {
@@ -1263,7 +1265,13 @@ export interface Database {
   findAgentExecutionByWorkflowStepRunId(
     stepRunId: string,
   ): Promise<AgentExecutionRecord | undefined>;
-  releaseWorkflowWakeup(triggerRunId: string, now: Date, claimedLease: Date): Promise<void>;
+  /** Gives a claimed wakeup back. `retryAt` holds it until then instead of at once. */
+  releaseWorkflowWakeup(
+    triggerRunId: string,
+    now: Date,
+    claimedLease: Date,
+    retryAt?: Date,
+  ): Promise<void>;
   claimWorkflowWakeup(
     now: Date,
     leaseMs: number,
@@ -1312,6 +1320,16 @@ export interface Database {
     stepRunId: string,
     update: WorkflowScriptStepUpdate,
   ): Promise<WorkflowStepRunRecord | undefined>;
+  /** Replaces a script step's output whatever its status, for cleanup after the step ended. */
+  setWorkflowScriptStepOutput(
+    stepRunId: string,
+    output: unknown,
+  ): Promise<WorkflowStepRunRecord | undefined>;
+  /**
+   * Ended script steps whose output still names a terminal or a pending cleanup: a stop the
+   * daemon never confirmed, or a step that deadline recovery ended while its terminal ran on.
+   */
+  listWorkflowScriptStepsPendingCleanup(): Promise<WorkflowStepRunRecord[]>;
   succeedTriggerRun(triggerRunId: string): Promise<TransitionTriggerRunResult | undefined>;
   failWorkflowRun(
     triggerRunId: string,
@@ -1335,7 +1353,8 @@ export interface Database {
     reactionState: JsonValue | null,
   ): Promise<AcceptedTriggerRunRecord | undefined>;
   recoverWorkflowDeadlines(now: Date): Promise<readonly WorkflowDeadlineRecovery[]>;
-  recoverWorkflowWakeups(now: Date): Promise<void>;
+  /** `excludedRunIds` are runs a live watcher is already handling, which need no wakeup. */
+  recoverWorkflowWakeups(now: Date, excludedRunIds?: readonly string[]): Promise<void>;
   markProviderEventDropped(
     providerEventReceiptId: string,
     reason: ProviderEventDropReasonCode,

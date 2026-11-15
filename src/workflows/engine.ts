@@ -55,6 +55,7 @@ import type { WorktreeTarget } from "../config/index.js";
 import type { Logger } from "pino";
 import type { ScriptStepRunner } from "../daemons/terminals/script.js";
 import { ScriptStepRuntime, type ScriptStepLaunch } from "./script-step.js";
+import { DEFAULT_SCRIPT_LIMITS, type ScriptLimits } from "./script-limits.js";
 
 const DEFAULT_WAKEUP_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 250;
@@ -87,6 +88,8 @@ export interface DurableWorkflowEngineOptions {
   validateLaunchMachineIntent?: (intent: LaunchMachineIntent) => void;
   /** Runs script steps in daemon terminals. Without it a script step fails the run. */
   scriptRunner?: ScriptStepRunner;
+  /** How many script steps may run at once. Defaults to 5 per daemon and 3 per trigger. */
+  scriptLimits?: ScriptLimits | undefined;
   configurationRevisionId?: string;
   leaseMs?: number;
   workerIntervalMs?: number;
@@ -106,6 +109,7 @@ export class DurableWorkflowEngine {
   private readonly workerIntervalMs: number;
   private readonly now: () => Date;
   private readonly scripts: ScriptStepRuntime | undefined;
+  private readonly background = new Set<Promise<void>>();
   private workerTimer: NodeJS.Timeout | undefined;
   private processing: Promise<void> | undefined;
   private terminalNotificationProcessing: Promise<void> | undefined;
@@ -126,6 +130,8 @@ export class DurableWorkflowEngine {
       database,
       runner: this.options.scriptRunner,
       providers: this.options.providers ?? [],
+      limits: this.options.scriptLimits ?? DEFAULT_SCRIPT_LIMITS,
+      retry: this.options.retry,
       now: () => this.now(),
       canDispatchToDaemon: this.options.canDispatchToDaemon,
       report: (error, operation, diagnostic) => this.report(error, operation, diagnostic),
@@ -161,7 +167,24 @@ export class DurableWorkflowEngine {
     this.workerTimer = undefined;
     await this.processing;
     await this.scripts?.stop();
+    await Promise.all(this.background);
     await this.terminalNotificationProcessing;
+  }
+
+  /**
+   * Stops script terminals left behind on a daemon: the ones a pending record names, and any
+   * other script terminal in those directories that no running step owns. Call it when the
+   * daemon connects.
+   */
+  sweepScriptTerminals(daemonId: string): Promise<void> {
+    return this.scripts?.sweep(daemonId) ?? Promise.resolve();
+  }
+
+  private runInBackground(work: Promise<void>, operation: string): void {
+    const tracked = work
+      .catch((error: unknown) => this.report(error, operation))
+      .finally(() => this.background.delete(tracked));
+    this.background.add(tracked);
   }
 
   async enqueue(trigger: DurableProviderEvent): Promise<TriggerDispatchOutcome> {
@@ -269,7 +292,8 @@ export class DurableWorkflowEngine {
     if (database === null) return;
     await this.recoverWorkflowDeadlines(this.now());
     this.kickTerminalNotificationRecovery();
-    await database.recoverWorkflowWakeups(this.now());
+    this.scripts?.sweepIfDue();
+    await database.recoverWorkflowWakeups(this.now(), this.scripts?.activeRunIds());
     const visited: string[] = [];
     while (!this.stopped) {
       const wakeup = await database.claimWorkflowWakeup(this.now(), this.leaseMs, visited);
@@ -863,6 +887,13 @@ export class DurableWorkflowEngine {
     for (const recovery of await database.recoverWorkflowDeadlines(now)) {
       if (this.options.onWorkflowDeadlineExceeded !== undefined) {
         await this.options.onWorkflowDeadlineExceeded(recovery);
+      }
+      // The database ended the run's steps; a script's terminal on the host is still running.
+      if (this.scripts !== undefined) {
+        this.runInBackground(
+          this.scripts.cleanupAfterDeadline(recovery.triggerRunId),
+          "workflow.script.deadline-cleanup",
+        );
       }
       const run = await database.findTriggerRunById(recovery.triggerRunId);
       if (run?.outcome === "accepted" && run.status !== "running") {

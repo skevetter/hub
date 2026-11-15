@@ -469,9 +469,11 @@ class MemoryDatabase implements Database {
     );
   }
 
-  async releaseWorkflowWakeup(triggerRunId: string, now: Date, claimedLease: Date) {
+  async releaseWorkflowWakeup(triggerRunId: string, now: Date, claimedLease: Date, retryAt?: Date) {
     const wakeup = this.workflowWakeups.get(triggerRunId);
-    if (wakeup?.leaseExpiresAt?.getTime() === claimedLease.getTime()) wakeup.leaseExpiresAt = now;
+    if (wakeup?.leaseExpiresAt?.getTime() !== claimedLease.getTime()) return;
+    wakeup.leaseExpiresAt = now;
+    if (retryAt !== undefined) wakeup.availableAt = retryAt;
   }
 
   async claimWorkflowWakeup(now: Date, leaseMs: number, excludedRunIds: readonly string[] = []) {
@@ -958,6 +960,7 @@ class MemoryDatabase implements Database {
       status: "running",
       startedAt: input.startedAt,
       deadlineAt: input.deadlineAt,
+      output: input.output ?? null,
     };
     this.workflowStepRuns.set(step.id, started);
     return { stepRun: started, started: true };
@@ -979,6 +982,24 @@ class MemoryDatabase implements Database {
       await this.wakeWorkflowRun(step.triggerRunId, update.at);
     }
     return updated;
+  }
+
+  async setWorkflowScriptStepOutput(stepRunId: string, output: unknown) {
+    const step = this.workflowStepRuns.get(stepRunId);
+    if (step === undefined) return undefined;
+    const updated: WorkflowStepRunRecord = { ...step, output };
+    this.workflowStepRuns.set(step.id, updated);
+    return updated;
+  }
+
+  async listWorkflowScriptStepsPendingCleanup() {
+    return Array.from(this.workflowStepRuns.values()).filter(
+      (step) =>
+        (step.status === "succeeded" || step.status === "failed" || step.status === "timed_out") &&
+        typeof step.output === "object" &&
+        step.output !== null &&
+        ("daemon_id" in step.output || "cleanup" in step.output),
+    );
   }
 
   async succeedTriggerRun(triggerRunId: string) {
@@ -1030,9 +1051,10 @@ class MemoryDatabase implements Database {
     return { stepRun: updatedStep, run: updatedRun, transitioned: true };
   }
 
-  async recoverWorkflowWakeups(now: Date) {
+  async recoverWorkflowWakeups(now: Date, excludedRunIds: readonly string[] = []) {
     for (const run of this.triggerRuns.values()) {
       if (run.status !== "running" || run.deadlineAt <= now) continue;
+      if (excludedRunIds.includes(run.id)) continue;
       const wakeup = this.workflowWakeups.get(run.id);
       const steps = await this.listWorkflowStepRunsForTriggerRun(run.id);
       const execution = (

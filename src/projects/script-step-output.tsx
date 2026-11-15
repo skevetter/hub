@@ -8,12 +8,24 @@ import { readScriptStepHandle, readScriptStepResult } from "../workflows/script-
  * A script step's output, or `undefined` when the value is not one, so the caller can fall back
  * to the generic JSON view. A script that is still running shows no result yet.
  */
-export function ScriptStepOutput({ stepId, output }: { stepId: string; output: unknown }) {
+export function ScriptStepOutput({
+  stepId,
+  status,
+  output,
+}: {
+  stepId: string;
+  status: string;
+  output: unknown;
+}) {
   const result = readScriptStepResult(output);
   const [open, setOpen] = useState(false);
   if (result === undefined) {
-    return readScriptStepHandle(output) === undefined ? null : (
-      <span className="text-muted-foreground">Running on the daemon</span>
+    if (readScriptStepHandle(output) === undefined) return null;
+    // Only a running step is still running. One the deadline ended has no result to show.
+    return (
+      <span className="text-muted-foreground">
+        {status === "running" ? "Running on the daemon" : "Stopped before it reported a result"}
+      </span>
     );
   }
   return (

@@ -36,6 +36,7 @@ import {
   type DaemonModule,
 } from "./daemons/index.js";
 import { createDispatcherWithEngine } from "./dispatcher/index.js";
+import type { DurableWorkflowEngine } from "./workflows/engine.js";
 import type {
   DaemonDispatchLifecycleOptions,
   ExecutionDeadlineClock,
@@ -51,6 +52,7 @@ import { createManualRunProvider } from "./triggers/manual/provider.js";
 import { OrganizationTriggerStore } from "./triggers/store.js";
 import { DaemonRegistration } from "./daemons/registration.js";
 import { createScriptStepRunner } from "./daemons/terminals/script.js";
+import type { ScriptLimits } from "./workflows/script-limits.js";
 import { CliAuthorizations } from "./cli-authorizations/index.js";
 import type { BrowserOrganizationAccess } from "./auth/browser-organization-access.js";
 import { createPublicApi, type PublicApi, type PublicApiComposition } from "./public-api/index.js";
@@ -80,6 +82,8 @@ export interface HubRuntimeOptions {
   daemonConnectionForId?: DaemonDispatchLifecycleOptions["connectionForDaemon"];
   /** Polls GitHub notifications with a Hub-level token. Omitted: the source is off. */
   githubNotifications?: GitHubNotificationsOptions;
+  /** How many script steps may run at once. */
+  scriptLimits?: ScriptLimits | undefined;
 }
 
 export interface HubRuntime {
@@ -201,6 +205,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
           daemonModule.lifecycle.handoffLaunchMachineIntent(intent);
   const dispatcherOptions = {
     scriptRunner: createScriptStepRunner(connectionForDaemon),
+    scriptLimits: options.scriptLimits,
     canDispatchToDaemon: (daemonId: string) =>
       (options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId)) !== undefined,
     database: options.database,
@@ -243,7 +248,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       ? {}
       : { dispatchLaunchMachineIntent: durableDispatchHandler }),
   });
-  connectDaemonLifecycle(daemons, daemonModule);
+  connectDaemonLifecycle(daemons, daemonModule, workflowEngine);
   let activeSources: readonly TriggerSource[] = [];
 
   const hub: HubRuntime = {
@@ -465,8 +470,11 @@ function databaseUnavailable(): Promise<Response> {
 function connectDaemonLifecycle(
   daemons: ActiveDaemonRegistry | null,
   daemonModule: DaemonModule | null,
+  workflowEngine: DurableWorkflowEngine,
 ): void {
   daemons?.onConnected((daemon) => daemonModule?.lifecycle.recoverDaemon(daemon));
+  // A daemon that reconnects may hold terminals a Hub could not stop before it dropped.
+  daemons?.onConnected((daemon) => workflowEngine.sweepScriptTerminals(daemon.id));
   daemons?.onRevoked((daemon) =>
     daemonModule?.lifecycle.failPendingExecutionsForDisconnectedMachine(
       daemon.machineId,

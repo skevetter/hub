@@ -23,6 +23,7 @@ import { loadBuiltStartServer } from "./server/build.js";
 import { createAuthServer } from "./auth/server.js";
 import { startApplication, stopApplication, type ApplicationRuntime } from "./server/runtime.js";
 import { createApplicationRuntime } from "./application-runtime.js";
+import { readScriptLimits } from "./workflows/script-limits.js";
 import {
   composeBilling,
   createStripeBillingClient,
@@ -155,6 +156,8 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
         return begin(new Request(url, { method: "POST", headers: request.headers }));
       },
     });
+    // Read before the application starts so a bad value stops startup with its own message.
+    const scriptLimits = readScriptLimits(process.env);
     const githubNotifications = readGitHubNotificationsOptions(process.env);
     if (githubNotifications !== undefined) {
       logger.info(
@@ -171,6 +174,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       providerApplications,
       publicBaseUrl: identity.appUrl,
       completionTokenSecret: identity.authSecret,
+      scriptLimits,
       ...(githubNotifications === undefined ? {} : { githubNotifications }),
       close: () => resources.close(),
     });

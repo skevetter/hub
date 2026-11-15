@@ -3,8 +3,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it } from "vitest";
 import { isScriptStepOutput, ScriptStepOutput } from "./script-step-output.js";
 
-const render = (output: unknown) =>
-  renderToStaticMarkup(<ScriptStepOutput stepId="step-1" output={output} />);
+const render = (output: unknown, status = "succeeded") =>
+  renderToStaticMarkup(<ScriptStepOutput stepId="step-1" status={status} output={output} />);
 
 describe("script step output in the run history", () => {
   it("shows the exit code and a collapsed output tail", () => {
@@ -40,14 +40,17 @@ describe("script step output in the run history", () => {
   });
 
   it("shows a running script without its terminal handle", () => {
-    const markup = render({ terminal_id: "terminal-1", daemon_id: "daemon-1" });
+    const handle = { terminal_id: "terminal-1", daemon_id: "daemon-1", cwd: "/work" };
+    const markup = render(handle, "running");
     assert.match(markup, /Running on the daemon/u);
     assert.doesNotMatch(markup, /terminal-1/u);
+    // A step the deadline ended while its output still names a terminal is not running.
+    assert.match(render(handle, "timed_out"), /Stopped before it reported a result/u);
   });
 
   it("recognises only script step output", () => {
     assert.equal(isScriptStepOutput({ exit_code: 0, output_tail: "", truncated: false }), true);
-    assert.equal(isScriptStepOutput({ terminal_id: "t", daemon_id: "d" }), true);
+    assert.equal(isScriptStepOutput({ terminal_id: "t", daemon_id: "d", cwd: "/w" }), true);
     assert.equal(isScriptStepOutput({ repo: "paseo" }), false);
     assert.equal(isScriptStepOutput(null), false);
   });

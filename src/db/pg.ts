@@ -645,11 +645,13 @@ class PgDatabase implements Database {
     return rows.rows[0] === undefined ? undefined : toAgentExecutionRecord(rows.rows[0]);
   }
 
-  async releaseWorkflowWakeup(triggerRunId: string, now: Date, claimedLease: Date) {
+  async releaseWorkflowWakeup(triggerRunId: string, now: Date, claimedLease: Date, retryAt?: Date) {
     await query(
       this.pool,
-      "update workflow_wakeups set lease_expires_at = $2 where trigger_run_id = $1 and lease_expires_at = $3",
-      [triggerRunId, now, claimedLease],
+      `update workflow_wakeups
+       set lease_expires_at = $2, available_at = coalesce($4, available_at)
+       where trigger_run_id = $1 and lease_expires_at = $3`,
+      [triggerRunId, now, claimedLease, retryAt ?? null],
     );
   }
 
@@ -1046,14 +1048,14 @@ class PgDatabase implements Database {
     const started = await query<WorkflowStepRunRow>(
       this.pool,
       `update workflow_step_runs steps
-       set status = 'running', started_at = $2, deadline_at = $3
+       set status = 'running', started_at = $2, deadline_at = $3, output = $4
        where steps.id = $1 and steps.status = 'pending'
          and exists (
            select 1 from trigger_runs runs
            where runs.id = steps.trigger_run_id and runs.status = 'running'
          )
        returning steps.*`,
-      [input.stepRunId, input.startedAt, input.deadlineAt],
+      [input.stepRunId, input.startedAt, input.deadlineAt, input.output ?? null],
     );
     if (started.rows[0] !== undefined) {
       return { stepRun: toWorkflowStepRunRecord(started.rows[0]), started: true };
@@ -1085,6 +1087,25 @@ class PgDatabase implements Database {
       if (run?.status === "running") await this.wakeWorkflowRun(row.trigger_run_id, update.at);
     }
     return toWorkflowStepRunRecord(row);
+  }
+
+  async setWorkflowScriptStepOutput(stepRunId: string, output: unknown) {
+    const updated = await query<WorkflowStepRunRow>(
+      this.pool,
+      "update workflow_step_runs set output = $2 where id = $1 returning *",
+      [stepRunId, output ?? null],
+    );
+    return updated.rows[0] === undefined ? undefined : toWorkflowStepRunRecord(updated.rows[0]);
+  }
+
+  async listWorkflowScriptStepsPendingCleanup() {
+    const rows = await query<WorkflowStepRunRow>(
+      this.pool,
+      `select * from workflow_step_runs
+       where status in ('succeeded', 'failed', 'timed_out')
+         and ((output ->> 'daemon_id') is not null or (output -> 'cleanup') is not null)`,
+    );
+    return rows.rows.map(toWorkflowStepRunRecord);
   }
 
   async succeedTriggerRun(triggerRunId: string) {
@@ -1166,7 +1187,7 @@ class PgDatabase implements Database {
     }
   }
 
-  async recoverWorkflowWakeups(now: Date) {
+  async recoverWorkflowWakeups(now: Date, excludedRunIds: readonly string[] = []) {
     await query(
       this.pool,
       `insert into workflow_wakeups (trigger_run_id, available_at, lease_expires_at)
@@ -1182,8 +1203,9 @@ class PgDatabase implements Database {
              and executions.status in ('spawning', 'running')
          )
          and wakeups.trigger_run_id is null
+         and not (runs.id = any($2::uuid[]))
        on conflict (trigger_run_id) do nothing`,
-      [now],
+      [now, excludedRunIds],
     );
   }
 

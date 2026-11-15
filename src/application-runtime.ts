@@ -31,6 +31,7 @@ import type { ProviderApplications } from "./provider-applications/index.js";
 import { DaemonProviderCatalog } from "./daemons/provider-catalog.js";
 import { HomeDashboard } from "./home/dashboard.js";
 import type { ProviderConnectionRegistration } from "./providers/registration.js";
+import type { ScriptLimits } from "./workflows/script-limits.js";
 
 export interface ApplicationCompositionOptions {
   database: Database | null;
@@ -46,6 +47,7 @@ export interface ApplicationCompositionOptions {
   testTriggerRoutes?: boolean;
   daemonConnectionForId?: DaemonDispatchLifecycleOptions["connectionForDaemon"];
   githubNotifications?: GitHubNotificationsOptions;
+  scriptLimits?: ScriptLimits | undefined;
   close(): Promise<void>;
 }
 
@@ -119,6 +121,7 @@ async function createOwnedApplicationRuntime(
     ...(options.githubNotifications === undefined
       ? {}
       : { githubNotifications: options.githubNotifications }),
+    scriptLimits: options.scriptLimits,
   });
   ownership.own(() => application.hub.stop());
   await application.hub.start(registrations.flatMap((registration) => registration.sources));

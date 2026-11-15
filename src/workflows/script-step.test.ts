@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { describe, it } from "vitest";
 import { compiledConfigurationHash, type CompiledHubConfig } from "../config/compiler.js";
+import { DatabaseUnavailableError } from "../db/errors.js";
 import { FakeClock, FakeTerminalDaemon } from "../daemons/test-utils/fake-terminal-daemon.js";
 import {
   createScriptStepRunner,
   ScriptRunAborted,
   SCRIPT_PERMISSION_MESSAGE,
+  type ScriptCleanupTarget,
+  type ScriptRunInput,
+  type ScriptRunResult,
   type ScriptStepRunner,
 } from "../daemons/terminals/script.js";
 import { createMemoryDatabase } from "../db/memory.js";
@@ -17,15 +21,17 @@ import { compileTriggerDocument } from "../triggers/configuration/index.js";
 import type { AcceptedTriggerProviderMatch, TriggerProvider } from "../triggers/index.js";
 import { parseInvocation } from "../triggers/invocation.js";
 import { createDurableWorkflowHandler, type DurableWorkflowEngine } from "./engine.js";
-import { readScriptStepResult, scriptTerminalName } from "./script-output.js";
+import { readScriptStepHandle, readScriptStepResult, scriptTerminalName } from "./script-output.js";
+import type { ScriptLimits } from "./script-limits.js";
 import { SCRIPT_INTERRUPTED_REASON, SCRIPT_RUNNER_UNAVAILABLE_REASON } from "./script-step.js";
 
 const DOCUMENT = `
 name: deploy
 on:
-  manual.run:
+  github.notification:
     filters:
-      from_users: [alice]
+      repo: acme/webapp
+      reason: review_requested
 run:
   target:
     daemon: devbox
@@ -129,9 +135,14 @@ function engineFor(
   options: {
     scriptRunner?: ScriptStepRunner | undefined;
     canDispatchToDaemon?: (daemonId: string) => boolean;
+    scriptLimits?: ScriptLimits;
+    now?: () => Date;
   } = {},
 ) {
   return createDurableWorkflowHandler({
+    retry: NO_WAIT,
+    ...(options.scriptLimits === undefined ? {} : { scriptLimits: options.scriptLimits }),
+    ...(options.now === undefined ? {} : { now: options.now }),
     database: context.database,
     entitlements: context.entitlements,
     providers: [context.provider],
@@ -169,8 +180,11 @@ async function onlyStep(context: Fixture) {
   return step;
 }
 
+/** Retries run at once, so no real time passes between attempts. */
+const NO_WAIT = { sleep: async () => undefined, random: () => 0 };
+
 function runnerFor(daemon: FakeTerminalDaemon, clock: FakeClock): ScriptStepRunner {
-  return createScriptStepRunner(() => ({ terminals: daemon.client }), clock);
+  return createScriptStepRunner(() => ({ terminals: daemon.client }), clock, NO_WAIT);
 }
 
 describe("script steps in the durable workflow engine", () => {
@@ -263,7 +277,7 @@ describe("script steps in the durable workflow engine", () => {
     await untilSettled(context, engine);
     assert.deepEqual(updates[0], {
       status: "running",
-      output: { terminal_id: "terminal-1", daemon_id: "daemon-1" },
+      output: { daemon_id: "daemon-1", cwd: "/workspace/webapp", terminal_id: "terminal-1" },
     });
     assert.equal(updates[1]?.status, "succeeded");
   });
@@ -400,6 +414,9 @@ describe("script step recovery", () => {
       async cleanup(daemonId, target) {
         cleanups.push({ daemonId, ...target });
       },
+      async sweep() {
+        return { stopped: 0, unconfirmed: 0 };
+      },
     };
     return { runner, cleanups };
   }
@@ -524,5 +541,456 @@ describe("script step recovery", () => {
     await restarted.engine.processAvailable();
     assert.equal((await onlyRun(context)).status, "running");
     assert.deepEqual(second.cleanups, []);
+  });
+});
+
+/** A runner whose scripts end only when the test says so, and whose cleanup the test can break. */
+function controllableRunner() {
+  const runs: {
+    daemonId: string;
+    input: ScriptRunInput;
+    finish: (result: ScriptRunResult) => void;
+  }[] = [];
+  const cleanups: { daemonId: string; target: ScriptCleanupTarget }[] = [];
+  const sweeps: { daemonId: string; cwd: string }[] = [];
+  const control = { cleanupError: undefined as Error | undefined };
+  const runner: ScriptStepRunner = {
+    run(daemonId, input) {
+      return new Promise<ScriptRunResult>((resolve, reject) => {
+        runs.push({ daemonId, input, finish: resolve });
+        input.signal?.addEventListener("abort", () => reject(new ScriptRunAborted()), {
+          once: true,
+        });
+        void input.onTerminal?.({ id: `terminal-${String(runs.length)}` });
+      });
+    },
+    async cleanup(daemonId, target) {
+      if (control.cleanupError !== undefined) throw control.cleanupError;
+      cleanups.push({ daemonId, target });
+    },
+    async sweep(daemonId, scope) {
+      sweeps.push({ daemonId, cwd: scope.cwd });
+      return { stopped: 0, unconfirmed: 0 };
+    },
+  };
+  return { runner, runs, cleanups, sweeps, control };
+}
+
+const SUCCESS: ScriptRunResult = {
+  status: "succeeded",
+  exitCode: 0,
+  outputTail: "ok",
+  truncated: false,
+};
+
+async function anotherRun(context: Fixture, handler: (event: DurableProviderEvent) => unknown) {
+  const receipt = await context.database.persistManualEvent({
+    organizationId: "org-1",
+    projectId: context.trigger.projectId,
+    deliveryId: randomUUID(),
+    source: "manual.run",
+    payload: {},
+    receivedAt: new Date(),
+  });
+  if (receipt.status !== "accepted") throw new Error("receipt was not accepted");
+  await handler({
+    ...context.trigger,
+    providerEventReceiptId: receipt.event.providerEventReceiptId,
+    deliveryId: receipt.event.deliveryId,
+  });
+  const [run] = await context.database.findTriggerRunsByProviderEventReceiptId(
+    receipt.event.providerEventReceiptId,
+  );
+  assert.ok(run);
+  return run;
+}
+
+async function stepOf(context: Fixture, runId: string) {
+  const [step] = await context.database.listWorkflowStepRunsForTriggerRun(runId);
+  assert.ok(step);
+  return step;
+}
+
+async function waitFor(condition: () => boolean | Promise<boolean>): Promise<void> {
+  for (let attempt = 0; attempt < 400; attempt += 1) {
+    if (await condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  throw new Error("the condition never held");
+}
+
+describe("script step concurrency caps", () => {
+  async function twoRuns(limits: ScriptLimits) {
+    const context = await fixture();
+    const control = controllableRunner();
+    let now = new Date();
+    const { handler, engine } = engineFor(context, {
+      scriptRunner: control.runner,
+      scriptLimits: limits,
+      now: () => now,
+    });
+    await handler(context.trigger);
+    await engine.processAvailable();
+    await waitFor(() => control.runs.length === 1);
+    const second = await anotherRun(context, handler);
+    await engine.processAvailable();
+    return {
+      context,
+      control,
+      engine,
+      second,
+      advance: (milliseconds: number) => {
+        now = new Date(now.getTime() + milliseconds);
+      },
+    };
+  }
+
+  it.each([
+    ["the daemon", { maxPerDaemon: 1, maxPerTrigger: 50 }],
+    ["the trigger", { maxPerDaemon: 50, maxPerTrigger: 1 }],
+  ])(
+    "keeps a step pending when %s is at its cap, and starts it once a slot frees",
+    async (_name, limits) => {
+      const { context, control, engine, second, advance } = await twoRuns(limits);
+
+      assert.equal(control.runs.length, 1);
+      assert.equal((await stepOf(context, second.id)).status, "pending");
+      assert.equal((await context.database.findTriggerRunById(second.id))?.status, "running");
+
+      // Nothing happens at the next ticks: the held step waits for its retry time.
+      await engine.processAvailable();
+      assert.equal(control.runs.length, 1);
+
+      control.runs[0]!.finish(SUCCESS);
+      await waitFor(async () => (await onlyStep(context)).status === "succeeded");
+      advance(5_000);
+      await engine.processAvailable();
+      await waitFor(() => control.runs.length === 2);
+      assert.equal((await stepOf(context, second.id)).status, "running");
+      control.runs[1]!.finish(SUCCESS);
+      await waitFor(async () => (await stepOf(context, second.id)).status === "succeeded");
+      await engine.stop();
+    },
+  );
+
+  it("does not fail a held step or start it before its retry time", async () => {
+    const { context, control, engine, second, advance } = await twoRuns({
+      maxPerDaemon: 1,
+      maxPerTrigger: 3,
+    });
+    advance(500);
+    await engine.processAvailable();
+    assert.equal(control.runs.length, 1);
+    assert.equal((await context.database.findTriggerRunById(second.id))?.status, "running");
+    await engine.stop();
+  });
+
+  it("lets runs through up to the cap", async () => {
+    const { control, engine } = await twoRuns({ maxPerDaemon: 2, maxPerTrigger: 2 });
+    await waitFor(() => control.runs.length === 2);
+    await engine.stop();
+  });
+});
+
+describe("script step wakeups", () => {
+  it("leaves a running script with a live watcher out of the wakeup recovery", async () => {
+    const context = await fixture();
+    const control = controllableRunner();
+    const excluded: (readonly string[] | undefined)[] = [];
+    const recover = context.database.recoverWorkflowWakeups.bind(context.database);
+    context.database.recoverWorkflowWakeups = async (now, excludedRunIds) => {
+      excluded.push(excludedRunIds);
+      return recover(now, excludedRunIds);
+    };
+    const { handler, engine } = engineFor(context, { scriptRunner: control.runner });
+    await handler(context.trigger);
+    await engine.processAvailable();
+    await waitFor(() => control.runs.length === 1);
+    const run = await onlyRun(context);
+
+    let deletions = 0;
+    const remove = context.database.deleteWorkflowWakeup.bind(context.database);
+    context.database.deleteWorkflowWakeup = async (runId) => {
+      deletions += 1;
+      return remove(runId);
+    };
+    for (let tick = 0; tick < 6; tick += 1) await engine.processAvailable();
+
+    assert.deepEqual(excluded.at(-1), [run.id]);
+    // No wakeup was added and claimed for it, so the database was not touched by the ticks.
+    assert.equal(deletions, 0);
+    assert.equal(
+      await context.database.claimWorkflowWakeup(new Date(Date.now() + 3_600_000), 1_000),
+      undefined,
+    );
+    await engine.stop();
+  });
+});
+
+describe("script step database writes", () => {
+  it("retries transient errors, so a script that ran is recorded as it ended", async () => {
+    const context = await fixture();
+    const daemon = new FakeTerminalDaemon();
+    const clock = new FakeClock();
+    clock.at(500, () => {
+      daemon.print("built");
+      daemon.exit(0);
+    });
+    const failures = { running: 2, finished: 3 };
+    const update = context.database.updateWorkflowScriptStep.bind(context.database);
+    context.database.updateWorkflowScriptStep = async (stepRunId, change) => {
+      const key = change.status === "running" ? "running" : "finished";
+      if (failures[key] > 0) {
+        failures[key] -= 1;
+        throw new DatabaseUnavailableError();
+      }
+      return update(stepRunId, change);
+    };
+    const { handler, engine } = engineFor(context, { scriptRunner: runnerFor(daemon, clock) });
+    await handler(context.trigger);
+
+    const run = await untilSettled(context, engine);
+
+    assert.equal(run.status, "succeeded");
+    assert.deepEqual(failures, { running: 0, finished: 0 });
+    assert.deepEqual((await onlyStep(context)).output, {
+      exit_code: 0,
+      output_tail: "built",
+      truncated: false,
+    });
+  });
+
+  it("does not retry an error that is not transient", async () => {
+    const context = await fixture();
+    const daemon = new FakeTerminalDaemon();
+    const clock = new FakeClock();
+    clock.at(500, () => daemon.exit(0));
+    let attempts = 0;
+    const update = context.database.updateWorkflowScriptStep.bind(context.database);
+    context.database.updateWorkflowScriptStep = async (stepRunId, change) => {
+      if (change.status === "succeeded") {
+        attempts += 1;
+        throw new Error("constraint violated");
+      }
+      return update(stepRunId, change);
+    };
+    const { handler, engine } = engineFor(context, { scriptRunner: runnerFor(daemon, clock) });
+    await handler(context.trigger);
+    await engine.processAvailable();
+    await waitFor(() => attempts > 0);
+    await engine.stop();
+    assert.equal(attempts, 1);
+  });
+});
+
+describe("script step output and deadlines", () => {
+  it("records a script that printed NUL and control bytes with its true exit code", async () => {
+    const context = await fixture();
+    const daemon = new FakeTerminalDaemon();
+    const clock = new FakeClock();
+    clock.at(250, () => {
+      daemon.print("a\u0000b\u0001c\u001b[31md\u001b[0m");
+      daemon.exit(7);
+    });
+    const { handler, engine } = engineFor(context, { scriptRunner: runnerFor(daemon, clock) });
+    await handler(context.trigger);
+
+    const run = await untilSettled(context, engine);
+
+    assert.equal(run.status, "failed");
+    assert.deepEqual((await onlyStep(context)).output, {
+      exit_code: 7,
+      output_tail: "abcd",
+      truncated: false,
+    });
+    assert.equal((await onlyStep(context)).failureReason, "script exited 7");
+  });
+
+  it("says the trigger's deadline ended the script when it came before the step's", async () => {
+    const context = await fixture(DOCUMENT.replace("run:", "max_runtime: 1m\nrun:"));
+    const daemon = new FakeTerminalDaemon();
+    const { handler, engine } = engineFor(context, {
+      scriptRunner: runnerFor(daemon, new FakeClock()),
+    });
+    await handler(context.trigger);
+
+    const run = await untilSettled(context, engine);
+
+    assert.equal(run.status, "timed_out");
+    assert.equal(
+      (await onlyStep(context)).failureReason,
+      "script timed out after 1m, when the trigger's deadline came first (the step allows 10m)",
+    );
+  });
+});
+
+describe("script terminal cleanup", () => {
+  it("records a stop the daemon never confirmed, and the sweep finishes it on reconnect", async () => {
+    const context = await fixture();
+    const daemon = new FakeTerminalDaemon();
+    const clock = new FakeClock();
+    clock.at(250, () => daemon.exit(0));
+    daemon.killSucceeds = false;
+    const { handler, engine } = engineFor(context, { scriptRunner: runnerFor(daemon, clock) });
+    await handler(context.trigger);
+
+    const run = await untilSettled(context, engine);
+
+    assert.equal(run.status, "succeeded");
+    const step = await onlyStep(context);
+    assert.deepEqual(readScriptStepResult(step.output)?.cleanup, {
+      daemon_id: "daemon-1",
+      cwd: "/workspace/webapp",
+      name: scriptTerminalName(step.id),
+      terminal_id: "terminal-1",
+    });
+    assert.equal((await context.database.listWorkflowScriptStepsPendingCleanup()).length, 1);
+
+    // A leftover from a finished step.
+    const make = (name: string) =>
+      daemon.client.create({
+        cwd: "/workspace/webapp",
+        name,
+        command: "/bin/sh",
+        args: [],
+        size: { rows: 50, cols: 240 },
+      });
+    await make(scriptTerminalName("00000000-0000-4000-8000-0000000000aa"));
+
+    daemon.killSucceeds = true;
+    await engine.sweepScriptTerminals("daemon-1");
+
+    assert.equal(daemon.killed.includes("terminal-1"), true);
+    assert.equal(daemon.killed.includes("terminal-2"), true);
+    const settled = await onlyStep(context);
+    assert.deepEqual(settled.output, { exit_code: 0, output_tail: "", truncated: false });
+    assert.equal((await context.database.listWorkflowScriptStepsPendingCleanup()).length, 0);
+  });
+
+  it("leaves a terminal alone when the step that owns it is still running", async () => {
+    const context = await fixture();
+    const daemon = new FakeTerminalDaemon();
+    const clock = new FakeClock();
+    clock.at(250, () => daemon.exit(0));
+    daemon.killSucceeds = false;
+    const { handler, engine } = engineFor(context, { scriptRunner: runnerFor(daemon, clock) });
+    await handler(context.trigger);
+    await untilSettled(context, engine);
+    const running = await anotherRun(context, handler);
+    await context.database.startWorkflowScriptStep({
+      stepRunId: (await stepOf(context, running.id)).id,
+      startedAt: new Date(),
+      deadlineAt: new Date(Date.now() + 60_000),
+      output: { daemon_id: "daemon-1", cwd: "/workspace/webapp" },
+    });
+    await daemon.client.create({
+      cwd: "/workspace/webapp",
+      name: scriptTerminalName((await stepOf(context, running.id)).id),
+      command: "/bin/sh",
+      args: [],
+      size: { rows: 50, cols: 240 },
+    });
+    daemon.killSucceeds = true;
+    await engine.sweepScriptTerminals("daemon-1");
+    assert.deepEqual(daemon.killed, ["terminal-1"]);
+  });
+
+  it("stops the terminal of a step the database timed out while the Hub was down", async () => {
+    const context = await fixture();
+    const first = controllableRunner();
+    const started = engineFor(context, { scriptRunner: first.runner });
+    await started.handler(context.trigger);
+    await started.engine.processAvailable();
+    await waitFor(() => first.runs.length === 1);
+    await waitFor(
+      async () => readScriptStepHandle((await onlyStep(context)).output)?.terminal_id !== undefined,
+    );
+    const stepRunId = (await onlyStep(context)).id;
+    await started.engine.stop();
+
+    // The Hub comes back after the whole run's deadline.
+    const second = controllableRunner();
+    const restarted = engineFor(context, {
+      scriptRunner: second.runner,
+      now: () => new Date(Date.now() + 3 * 3_600_000),
+    });
+    await restarted.engine.processAvailable();
+    await restarted.engine.stop();
+
+    const run = await onlyRun(context);
+    assert.equal(run.status, "timed_out");
+    assert.deepEqual(second.cleanups, [
+      {
+        daemonId: "daemon-1",
+        target: {
+          cwd: "/workspace/webapp",
+          name: scriptTerminalName(stepRunId),
+          terminalId: "terminal-1",
+        },
+      },
+    ]);
+    assert.deepEqual((await onlyStep(context)).output, {
+      exit_code: null,
+      output_tail: "",
+      truncated: false,
+    });
+  });
+
+  it("keeps a pending record when the daemon is away at the deadline, then clears it on reconnect", async () => {
+    const context = await fixture();
+    const first = controllableRunner();
+    const started = engineFor(context, { scriptRunner: first.runner });
+    await started.handler(context.trigger);
+    await started.engine.processAvailable();
+    await waitFor(() => first.runs.length === 1);
+    await waitFor(
+      async () => readScriptStepHandle((await onlyStep(context)).output)?.terminal_id !== undefined,
+    );
+    await started.engine.stop();
+
+    const second = controllableRunner();
+    second.control.cleanupError = new Error("daemon_not_connected");
+    const restarted = engineFor(context, {
+      scriptRunner: second.runner,
+      now: () => new Date(Date.now() + 3 * 3_600_000),
+    });
+    await restarted.engine.processAvailable();
+    await restarted.engine.stop();
+    assert.equal((await onlyRun(context)).status, "timed_out");
+    assert.equal(
+      readScriptStepResult((await onlyStep(context)).output)?.cleanup?.terminal_id,
+      "terminal-1",
+    );
+
+    second.control.cleanupError = undefined;
+    await restarted.engine.sweepScriptTerminals("daemon-1");
+    assert.equal(second.cleanups.length, 1);
+    assert.equal(second.cleanups[0]?.target.terminalId, "terminal-1");
+    assert.equal(readScriptStepResult((await onlyStep(context)).output)?.cleanup, undefined);
+    assert.ok(second.sweeps.length > 0);
+    for (const sweep of second.sweeps) {
+      assert.deepEqual(sweep, { daemonId: "daemon-1", cwd: "/workspace/webapp" });
+    }
+  });
+
+  it("does not sweep a daemon this process is not connected to", async () => {
+    const context = await fixture();
+    const first = controllableRunner();
+    const started = engineFor(context, { scriptRunner: first.runner });
+    await started.handler(context.trigger);
+    await started.engine.processAvailable();
+    await waitFor(() => first.runs.length === 1);
+    await started.engine.stop();
+    const second = controllableRunner();
+    second.control.cleanupError = new Error("daemon_not_connected");
+    const restarted = engineFor(context, {
+      scriptRunner: second.runner,
+      canDispatchToDaemon: () => false,
+      now: () => new Date(Date.now() + 3 * 3_600_000),
+    });
+    await restarted.engine.processAvailable();
+    await restarted.engine.sweepScriptTerminals("daemon-1");
+    await restarted.engine.stop();
+    assert.deepEqual(second.sweeps, []);
   });
 });

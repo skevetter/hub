@@ -18,11 +18,11 @@ const CONFIGURATION: CompiledHubConfig = {
   triggers: [
     {
       name: "deploy",
-      on: "manual.run",
+      on: "github.notification",
       maxRuntimeMs: 600_000,
       inputs: {},
       values: {},
-      filters: { from_users: ["alice"] },
+      filters: { repo: "acme/webapp", reason: "review_requested" },
       steps: [
         { kind: "script", id: "run", environment: "target", maxRuntimeMs: 600_000, script: "true" },
       ],
@@ -221,6 +221,103 @@ describe.each(backends)("script step persistence (%s)", (_name, open) => {
       );
       const [after] = await database.listWorkflowStepRunsForTriggerRun(run.id);
       assert.equal(after?.status, "timed_out");
+    } finally {
+      await close();
+    }
+  });
+  it("writes the first output with the start", async () => {
+    const harness = await open();
+    const { database, close } = harness;
+    try {
+      const { step } = await acceptedRun(harness);
+      const first = { daemon_id: "daemon-1", cwd: "/work" };
+      const started = await database.startWorkflowScriptStep({
+        stepRunId: step.id,
+        startedAt: new Date(),
+        deadlineAt: new Date(Date.now() + 60_000),
+        output: first,
+      });
+      assert.deepEqual(started?.stepRun.output, first);
+    } finally {
+      await close();
+    }
+  });
+
+  it("lists ended steps that still name a terminal or a pending cleanup, and nothing else", async () => {
+    const harness = await open();
+    const { database, close } = harness;
+    try {
+      const { run, step } = await acceptedRun(harness);
+      await database.startWorkflowScriptStep({
+        stepRunId: step.id,
+        startedAt: new Date(),
+        deadlineAt: new Date(Date.now() + 60_000),
+        output: { daemon_id: "daemon-1", cwd: "/work", terminal_id: "terminal-1" },
+      });
+      // Running: a watcher owns it.
+      assert.deepEqual(await database.listWorkflowScriptStepsPendingCleanup(), []);
+
+      await database.failWorkflowRun(run.id, "failed", "stopped", step.stepId);
+      const pending = await database.listWorkflowScriptStepsPendingCleanup();
+      assert.deepEqual(
+        pending.map(({ id }) => id),
+        [step.id],
+      );
+
+      const settled = { exit_code: null, output_tail: "", truncated: false };
+      await database.setWorkflowScriptStepOutput(step.id, {
+        ...settled,
+        cleanup: { daemon_id: "daemon-1", cwd: "/work", name: "hub-script-x" },
+      });
+      assert.equal((await database.listWorkflowScriptStepsPendingCleanup()).length, 1);
+
+      const cleared = await database.setWorkflowScriptStepOutput(step.id, settled);
+      assert.deepEqual(cleared?.output, settled);
+      assert.deepEqual(await database.listWorkflowScriptStepsPendingCleanup(), []);
+    } finally {
+      await close();
+    }
+  });
+
+  it("holds a released wakeup until its retry time", async () => {
+    const harness = await open();
+    const { database, close } = harness;
+    try {
+      const { run } = await acceptedRun(harness);
+      const now = new Date();
+      const claimed = await database.claimWorkflowWakeup(new Date(now.getTime() + 1_000), 30_000);
+      assert.equal(claimed?.triggerRunId, run.id);
+      const retryAt = new Date(now.getTime() + 60_000);
+      await database.releaseWorkflowWakeup(run.id, now, claimed.leaseExpiresAt!, retryAt);
+
+      assert.equal(
+        await database.claimWorkflowWakeup(new Date(now.getTime() + 10_000), 30_000),
+        undefined,
+      );
+      const later = await database.claimWorkflowWakeup(new Date(retryAt.getTime() + 1), 30_000);
+      assert.equal(later?.triggerRunId, run.id);
+    } finally {
+      await close();
+    }
+  });
+
+  it("does not add a wakeup for a run a live watcher handles", async () => {
+    const harness = await open();
+    const { database, close } = harness;
+    try {
+      const { run } = await acceptedRun(harness);
+      await database.deleteWorkflowWakeup(run.id);
+      const now = new Date();
+
+      await database.recoverWorkflowWakeups(now, [run.id]);
+      assert.equal(
+        await database.claimWorkflowWakeup(new Date(now.getTime() + 1_000), 30_000),
+        undefined,
+      );
+
+      await database.recoverWorkflowWakeups(now);
+      const added = await database.claimWorkflowWakeup(new Date(now.getTime() + 1_000), 30_000);
+      assert.equal(added?.triggerRunId, run.id);
     } finally {
       await close();
     }

@@ -435,7 +435,7 @@ export function ProjectActivityRunPanel({ runId }: { runId: string }) {
               </DataCell>
               <DataCell>
                 {isScriptStepOutput(step.output) ? (
-                  <ScriptStepOutput stepId={step.id} output={step.output} />
+                  <ScriptStepOutput stepId={step.id} status={step.status} output={step.output} />
                 ) : (
                   <JsonValue value={step.output} />
                 )}
