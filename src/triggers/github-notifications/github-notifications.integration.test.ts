@@ -239,11 +239,12 @@ describe("github notification polling", () => {
     const cursor = await fixture.database.githubNotifications.readCursor();
     const now = after(INTERVAL_MS);
     const next = { ...cursor!, nextPollAt: after(2 * INTERVAL_MS) };
+    const batch = { threads: [webapp], limit: 5, cursor: next, stoppedCursor: () => next };
     const [first, second] = await Promise.all([
-      fixture.database.githubNotifications.deliver([webapp], next, now),
-      fixture.database.githubNotifications.deliver([webapp], next, now),
+      fixture.database.githubNotifications.deliver(batch, now),
+      fixture.database.githubNotifications.deliver(batch, now),
     ]);
-    expect([first, second].sort((a, b) => a - b)).toEqual([0, 1]);
+    expect([first.started, second.started].sort((a, b) => a - b)).toEqual([0, 1]);
     expect(await fixture.count("trigger_runs")).toBe(1);
 
     fixture.github.reply([infra]);
@@ -254,6 +255,94 @@ describe("github notification polling", () => {
     ]);
     expect(results.map(({ started }) => started).sort((a, b) => a - b)).toEqual([0, 1]);
     expect(fixture.github.requests).toHaveLength(1);
+  });
+
+  it("delivers a backlog over several polls, oldest first, each thread exactly once", async () => {
+    const fixture = await setup();
+    const poller = createGitHubNotificationPoller({
+      client: createGitHubNotificationsClient({ token: TOKEN, fetch: fixture.github.fetch }),
+      store: fixture.database.githubNotifications,
+      pollIntervalMs: INTERVAL_MS,
+      maxThreadsPerPoll: 2,
+    });
+    await fixture.store.save({ yaml: notificationYaml("all-notifications"), userId: null });
+    await poller.poll(T0);
+    // Out of order on purpose: the poller sorts by update time before it applies the limit.
+    const backlog = [5, 3, 1, 4, 2].map((minute) =>
+      thread({
+        id: `30${String(minute)}`,
+        updated_at: `2026-11-14T10:0${String(minute)}:00Z`,
+      }),
+    );
+
+    fixture.github.reply(backlog, { "last-modified": "stamp-1" });
+    const first = await poller.poll(after(INTERVAL_MS));
+    expect(first).toMatchObject({ started: 2, deferred: true });
+    expect(await fixture.runsByTrigger()).toEqual([
+      "all-notifications <- 301:2026-11-14T10:01:00Z",
+      "all-notifications <- 302:2026-11-14T10:02:00Z",
+    ]);
+    const cursor = (await fixture.database.githubNotifications.readCursor())!;
+    expect(cursor.since).toEqual(new Date("2026-11-14T10:01:59Z"));
+    expect(cursor.lastModified).toBeNull();
+    expect(cursor.nextPollAt).toEqual(after(2 * INTERVAL_MS));
+
+    // The next poll cannot answer 304 and asks from just behind the last delivered thread.
+    fixture.github.reply(backlog.slice(0, 4), { "last-modified": "stamp-2" });
+    const second = await poller.poll(after(2 * INTERVAL_MS));
+    expect(second).toMatchObject({ started: 2, deferred: true });
+    expect(fixture.github.requests[1]!.headers["if-modified-since"]).toBeUndefined();
+    expect(new URL(fixture.github.requests[1]!.url).searchParams.get("since")).toBe(
+      "2026-11-14T10:01:59Z",
+    );
+
+    fixture.github.reply([backlog[0]!], { "last-modified": "stamp-3" });
+    const third = await poller.poll(after(3 * INTERVAL_MS));
+    expect(third).toMatchObject({ started: 1 });
+    expect(third.deferred).toBeUndefined();
+    expect(await fixture.runsByTrigger()).toEqual(
+      [1, 2, 3, 4, 5].map(
+        (minute) => `all-notifications <- 30${String(minute)}:2026-11-14T10:0${String(minute)}:00Z`,
+      ),
+    );
+    expect(await fixture.count("provider_event_receipts")).toBe(5);
+    expect(await fixture.count("trigger_runs")).toBe(5);
+
+    // Everything fit: the cursor never moves back, and Last-Modified is stored again.
+    const settled = (await fixture.database.githubNotifications.readCursor())!;
+    expect(settled.since).toEqual(new Date("2026-11-14T10:03:59Z"));
+    expect(settled.lastModified).toBe("stamp-3");
+  });
+
+  it("does not let threads that start nothing use up the limit or stall the backlog", async () => {
+    const fixture = await setup();
+    const poller = createGitHubNotificationPoller({
+      client: createGitHubNotificationsClient({ token: TOKEN, fetch: fixture.github.fetch }),
+      store: fixture.database.githubNotifications,
+      pollIntervalMs: INTERVAL_MS,
+      maxThreadsPerPoll: 1,
+    });
+    await fixture.store.save({
+      yaml: notificationYaml("webapp-only", "      repo: acme/webapp\n"),
+      userId: null,
+    });
+    await poller.poll(T0);
+    const mixed = [
+      thread({ id: "401", repo: "acme/other", updated_at: "2026-11-14T10:01:00Z" }),
+      thread({ id: "402", updated_at: "2026-11-14T10:01:00Z" }),
+      thread({ id: "403", updated_at: "2026-11-14T10:01:00Z" }),
+      thread({ id: "404", repo: "acme/other", updated_at: "2026-11-14T10:01:00Z" }),
+    ];
+
+    fixture.github.reply(mixed);
+    expect(await poller.poll(after(INTERVAL_MS))).toMatchObject({ started: 1, deferred: true });
+    // Same-second threads come back, the delivered one is skipped, and the limit still advances.
+    fixture.github.reply(mixed);
+    expect(await poller.poll(after(2 * INTERVAL_MS))).toMatchObject({ started: 1 });
+    expect(await fixture.runsByTrigger()).toEqual([
+      "webapp-only <- 402:2026-11-14T10:01:00Z",
+      "webapp-only <- 403:2026-11-14T10:01:00Z",
+    ]);
   });
 
   it("keeps the cursor when GitHub fails, then catches up", async () => {

@@ -14,10 +14,11 @@ or a mention, in repositories where you cannot install an app.
    authorize the token for it.
 2. Set these on the Hub process:
 
-   | Variable                            | Meaning                                                                       |
-   | ----------------------------------- | ----------------------------------------------------------------------------- |
-   | `GITHUB_NOTIFICATIONS_TOKEN`        | The token. Polling is off while this is unset.                                |
-   | `GITHUB_NOTIFICATIONS_POLL_SECONDS` | Optional. Seconds between polls. Default `60`. Values under `30` become `30`. |
+   | Variable                                    | Meaning                                                                                      |
+   | ------------------------------------------- | -------------------------------------------------------------------------------------------- |
+   | `GITHUB_NOTIFICATIONS_TOKEN`                | The token. Polling is off while this is unset.                                               |
+   | `GITHUB_NOTIFICATIONS_POLL_SECONDS`         | Optional. Seconds between polls. Default `60`. Values under `30` become `30`.                |
+   | `GITHUB_NOTIFICATIONS_MAX_THREADS_PER_POLL` | Optional. Most threads that start runs in one poll. Whole number from 1 to 100. Default `5`. |
 
 3. Restart Hub. The log shows `github notifications polling enabled`.
 4. Create a trigger with `on: github.notification`. Choose **GitHub notification** in the form, or
@@ -104,8 +105,20 @@ comment text.
 - **Overlap.** Each poll looks back two minutes. A thread update is identified by its thread id and
   `updated_at`, and Hub keeps one receipt for each organization and update. A repeated or overlapping
   poll does not start a second run. A later update to the same thread is new work.
+- **Catch-up.** One poll starts runs for at most `GITHUB_NOTIFICATIONS_MAX_THREADS_PER_POLL` threads,
+  so a backlog does not start every run at once. Hub sorts the returned threads by `updated_at`,
+  oldest first, and delivers the first ones. A thread counts toward the limit only when it starts a
+  run. A thread that no trigger matches, or that Hub already delivered, does not count. Receipts and
+  runs for the batch are saved in one transaction.
+  When threads are left over, Hub sets its starting point to one second before the last delivered
+  thread and forgets the `Last-Modified` value, so the next poll cannot answer `304` and skip them.
+  The next poll runs after the usual interval and delivers the next batch. It repeats until
+  everything fits under the limit. Then Hub goes back to a starting point two minutes behind the
+  newest thread. Every thread is delivered once. When all threads fit under the limit, a poll behaves
+  as described above and sets no limit state.
 - **Outage.** If GitHub or the network fails, Hub keeps its starting point and reports the failure.
-  The next poll after the interval picks up everything since then. The failure message never includes
+  The next poll after the interval picks up everything since then, at most
+  `GITHUB_NOTIFICATIONS_MAX_THREADS_PER_POLL` threads at a time. The failure message never includes
   the token.
 - **One poller.** A database lock lets one Hub process poll at a time. A second process waits, finds
   the interval has not passed, and skips.
@@ -150,8 +163,13 @@ shows the token.
 - Threads you do not take part in are not included, because Hub sets `participating=true`.
 - The token belongs to the Hub, not to an organization. On an instance with several organizations,
   every organization's matching triggers run for each notification.
-- After a long outage, every thread that changed meanwhile starts one run at the next poll. Set
-  `repo` or `reason` filters so a backlog does not start unrelated runs.
+- After a long outage, every thread that changed meanwhile starts one run, delivered in batches of
+  `GITHUB_NOTIFICATIONS_MAX_THREADS_PER_POLL` threads. With the defaults, 100 threads take 20 polls,
+  about 20 minutes. Set `repo` or `reason` filters so a backlog does not start unrelated runs.
+- The limit counts threads, not runs. A thread that matches several triggers starts one run per
+  trigger.
+- A startup value outside 1 to 100, or one that is not a whole number, stops Hub with a message that
+  names the variable.
 
 ## Security
 

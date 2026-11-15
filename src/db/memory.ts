@@ -200,7 +200,7 @@ class MemoryDatabase implements Database {
         status.nextPollAt = cursor.nextPollAt;
       },
       async deliver() {
-        return 0;
+        return { started: 0, deferred: false };
       },
       async recordSuccess(now) {
         status.lastSuccessAt = now;

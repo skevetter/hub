@@ -106,7 +106,7 @@ function statusStore(
     exclusive: (operation) => operation(),
     readCursor: async () => undefined,
     saveCursor: async () => {},
-    deliver: async () => 0,
+    deliver: async () => ({ started: 0, deferred: false }),
     recordSuccess: async () => {},
     recordFailure: async () => {},
     readStatus: async () => ({

@@ -244,6 +244,33 @@ describe("notification environment", () => {
         ?.pollIntervalMs,
     ).toBe(60_000);
   });
+
+  it("limits threads per poll to 5 unless set, from 1 to 100", () => {
+    const token = { GITHUB_NOTIFICATIONS_TOKEN: "t" };
+    const read = (value?: string) =>
+      readGitHubNotificationsOptions({
+        ...token,
+        ...(value === undefined ? {} : { GITHUB_NOTIFICATIONS_MAX_THREADS_PER_POLL: value }),
+      })?.maxThreadsPerPoll;
+    expect(read()).toBe(5);
+    expect(read("")).toBe(5);
+    expect(read("1")).toBe(1);
+    expect(read(" 30 ")).toBe(30);
+    expect(read("100")).toBe(100);
+  });
+
+  it("stops startup on a thread limit that is not a whole number from 1 to 100", () => {
+    for (const value of ["0", "101", "many", "2.5", "-1"]) {
+      expect(() =>
+        readGitHubNotificationsOptions({
+          GITHUB_NOTIFICATIONS_TOKEN: "t",
+          GITHUB_NOTIFICATIONS_MAX_THREADS_PER_POLL: value,
+        }),
+      ).toThrow(
+        `GITHUB_NOTIFICATIONS_MAX_THREADS_PER_POLL must be a whole number from 1 to 100, got "${value}".`,
+      );
+    }
+  });
 });
 
 describe("notification provider", () => {

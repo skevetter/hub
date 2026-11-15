@@ -8,10 +8,11 @@ import { matchesNotification } from "../match.js";
 import {
   notificationDeliveryId,
   type NotificationPayload,
-  type GitHubNotificationThread,
   toNotificationPayload,
 } from "../notification.js";
 import type {
+  DeliveryBatch,
+  DeliveryOutcome,
   GitHubNotificationStore,
   NotificationCursor,
   NotificationPollStatus,
@@ -105,20 +106,38 @@ export class GitHubNotificationRepository implements GitHubNotificationStore {
     return result.rows[0]?.count ?? 0;
   }
 
-  /** Receipts, runs and the cursor commit together, so a failed delivery is polled again. */
-  async deliver(
-    threads: readonly GitHubNotificationThread[],
-    cursor: NotificationCursor,
-    now: Date,
-  ): Promise<number> {
+  /**
+   * Receipts, runs and the cursor commit together, so a failed delivery is polled again. Threads
+   * are handled oldest first. Once `limit` threads have started runs, the next thread that would
+   * start one stops delivery and the cursor is set to resume behind the last delivered thread.
+   */
+  async deliver(batch: DeliveryBatch, now: Date): Promise<DeliveryOutcome> {
     return this.runtime.transaction(async (transaction) => {
       const triggers = await listTriggers(transaction);
       let started = 0;
-      for (const thread of threads) {
-        started += await deliverThread(transaction, triggers, toNotificationPayload(thread), now);
+      let delivered = 0;
+      let lastDelivered: Date | undefined;
+      let deferred = false;
+      for (const thread of batch.threads) {
+        const payload = toNotificationPayload(thread);
+        const matches = matchingTriggers(triggers, payload);
+        const fresh = await organizationsWithoutReceipt(transaction, matches, payload);
+        if (fresh.size === 0) continue;
+        if (delivered >= batch.limit) {
+          deferred = true;
+          break;
+        }
+        started += await deliverThread(transaction, matches, fresh, payload, now);
+        delivered++;
+        const updated = Date.parse(thread.updated_at);
+        lastDelivered = Number.isFinite(updated) ? new Date(updated) : undefined;
       }
-      await writeCursor(transaction, cursor, now);
-      return started;
+      await writeCursor(
+        transaction,
+        deferred ? batch.stoppedCursor(lastDelivered) : batch.cursor,
+        now,
+      );
+      return { started, deferred };
     });
   }
 }
@@ -153,13 +172,18 @@ async function listTriggers(transaction: QueryHandle): Promise<TriggerRow[]> {
   return result.rows;
 }
 
-async function deliverThread(
-  transaction: QueryHandle,
+interface TriggerMatch {
+  row: TriggerRow;
+  trigger: CompiledTrigger;
+}
+
+type CompiledTrigger = ReturnType<typeof parseCompiledHubConfig>["triggers"][number];
+
+function matchingTriggers(
   triggers: readonly TriggerRow[],
   payload: NotificationPayload,
-  now: Date,
-): Promise<number> {
-  const matches = triggers.flatMap((row) => {
+): TriggerMatch[] {
+  return triggers.flatMap((row) => {
     const trigger = parseCompiledHubConfig(row.normalized_configuration).triggers.find(
       ({ on }) => on === NOTIFICATION_EVENT,
     );
@@ -167,7 +191,32 @@ async function deliverThread(
       ? [{ row, trigger }]
       : [];
   });
-  const organizations = new Set(matches.map(({ row }) => row.organization_id));
+}
+
+/** Organizations with a matching trigger that have not yet received this thread update. */
+async function organizationsWithoutReceipt(
+  transaction: QueryHandle,
+  matches: readonly TriggerMatch[],
+  payload: NotificationPayload,
+): Promise<Set<string>> {
+  const organizations = [...new Set(matches.map(({ row }) => row.organization_id))];
+  if (organizations.length === 0) return new Set();
+  const received = await transaction.query<{ organization_id: string }>(
+    `select organization_id from provider_event_receipts
+    where organization_id = any($1::text[]) and delivery_id = $2`,
+    [organizations, notificationDeliveryId(payload)],
+  );
+  const have = new Set(received.rows.map((row) => row.organization_id));
+  return new Set(organizations.filter((organizationId) => !have.has(organizationId)));
+}
+
+async function deliverThread(
+  transaction: QueryHandle,
+  matches: readonly TriggerMatch[],
+  organizations: ReadonlySet<string>,
+  payload: NotificationPayload,
+  now: Date,
+): Promise<number> {
   let started = 0;
   for (const organizationId of organizations) {
     const own = matches.filter(({ row }) => row.organization_id === organizationId);

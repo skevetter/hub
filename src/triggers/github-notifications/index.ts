@@ -8,7 +8,9 @@ import {
 } from "./client.js";
 import {
   createGitHubNotificationPoller,
+  DEFAULT_MAX_THREADS_PER_POLL,
   DEFAULT_POLL_SECONDS,
+  MAX_THREADS_PER_POLL_LIMIT,
   MIN_POLL_SECONDS,
   type GitHubNotificationPoller,
   type GitHubNotificationStore,
@@ -31,6 +33,8 @@ export function storedFailureMessage(error: unknown, token: string): string {
 export interface GitHubNotificationsOptions {
   token: string;
   pollIntervalMs: number;
+  /** Most threads delivered per poll. The rest wait for the next poll. */
+  maxThreadsPerPoll?: number;
   /** Injected in tests. Production uses the global fetch. */
   fetch?: NotificationFetch;
   clock?: NotificationClock;
@@ -52,7 +56,8 @@ const clock: NotificationClock = {
 
 /**
  * The poll is off unless `GITHUB_NOTIFICATIONS_TOKEN` is set. The interval is clamped to 30
- * seconds so a typo cannot hammer the API.
+ * seconds so a typo cannot hammer the API. `GITHUB_NOTIFICATIONS_MAX_THREADS_PER_POLL` must be a
+ * whole number from 1 to 100, or startup fails.
  */
 export function readGitHubNotificationsOptions(
   environment: Readonly<Record<string, string | undefined>>,
@@ -61,7 +66,25 @@ export function readGitHubNotificationsOptions(
   if (token === undefined || token === "") return undefined;
   const configured = Number(environment["GITHUB_NOTIFICATIONS_POLL_SECONDS"]?.trim());
   const seconds = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_POLL_SECONDS;
-  return { token, pollIntervalMs: Math.max(seconds, MIN_POLL_SECONDS) * 1000 };
+  return {
+    token,
+    pollIntervalMs: Math.max(seconds, MIN_POLL_SECONDS) * 1000,
+    maxThreadsPerPoll: readMaxThreadsPerPoll(environment),
+  };
+}
+
+const MAX_THREADS_VARIABLE = "GITHUB_NOTIFICATIONS_MAX_THREADS_PER_POLL";
+
+function readMaxThreadsPerPoll(environment: Readonly<Record<string, string | undefined>>): number {
+  const raw = environment[MAX_THREADS_VARIABLE]?.trim();
+  if (raw === undefined || raw === "") return DEFAULT_MAX_THREADS_PER_POLL;
+  const value = /^\d+$/u.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_THREADS_PER_POLL_LIMIT) {
+    throw new Error(
+      `${MAX_THREADS_VARIABLE} must be a whole number from 1 to ${String(MAX_THREADS_PER_POLL_LIMIT)}, got "${raw}".`,
+    );
+  }
+  return value;
 }
 
 export function createGitHubNotificationsSource(
@@ -76,7 +99,14 @@ export function createGitHubNotificationsSource(
   });
   const active =
     poller ??
-    createGitHubNotificationPoller({ client, store, pollIntervalMs: options.pollIntervalMs });
+    createGitHubNotificationPoller({
+      client,
+      store,
+      pollIntervalMs: options.pollIntervalMs,
+      ...(options.maxThreadsPerPoll === undefined
+        ? {}
+        : { maxThreadsPerPoll: options.maxThreadsPerPoll }),
+    });
   let cancel: (() => void) | undefined;
   let processing: Promise<unknown> | undefined;
   let notBefore = 0;
