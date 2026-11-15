@@ -70,7 +70,7 @@ the step as succeeded. The step output and the execution result say it was infer
 An explicit finish has no `completion` field, so you can tell the two apart. `output` is the
 agent's closing message: the assistant text after its last tool call, cut to 16,000 characters
 with `outputTruncated: true` when longer. If the agent said nothing, there is no `output`. Hub
-does not make one up.
+does not make one up. Hub drops NUL characters and replaces unpaired surrogates with U+FFFD before it stores the text.
 
 ### When Hub counts a turn as finished
 
@@ -84,6 +84,8 @@ These cases do not complete, and fail or time out as before:
 - A turn that is still running, including a tool call in flight.
 - A turn waiting for a provider permission or question request. It has not ended.
 - A turn that errored or was canceled.
+- A turn with a `finish_execution` call that is still running or has completed. The explicit
+  finish owns the outcome. A call that failed or was canceled does not block the completion.
 - A daemon that cannot be reached when Hub checks.
 - A turn shared by several queued prompts of one continuation. One turn cannot be matched to one
   execution, so those runs use the idle timeout.
