@@ -1,3 +1,4 @@
+import { isHubFinishExecutionToolName } from "../hub/protocol.js";
 import type { AgentEvent } from "./agents/index.js";
 
 /**
@@ -33,6 +34,8 @@ export class TurnEndTracker {
   private generation = 0;
   private messageId: string | undefined;
   private text = "";
+  /** Latest status of every finish_execution call seen, by call id. */
+  private readonly finishCalls = new Map<string, string>();
 
   observe(event: AgentEvent): TurnEndVerdict {
     // Snapshots describe state from before the prompt. Status updates are not trusted either way:
@@ -50,6 +53,13 @@ export class TurnEndTracker {
         return stream.reason === "finished" ? "none" : this.interrupt(true);
       case "timeline": {
         const item = stream.item;
+        if (
+          item.type === "tool_call" &&
+          typeof item.name === "string" &&
+          isHubFinishExecutionToolName(item.name)
+        ) {
+          this.recordFinishCall(item.callId ?? "", item.status);
+        }
         if (item.type === "assistant_message" && typeof item.text === "string") {
           this.append(item.messageId, item.text);
           return this.interrupt(false);
@@ -73,15 +83,39 @@ export class TurnEndTracker {
     return this.generation;
   }
 
-  /** The agent's closing text: the trailing assistant message after its last piece of work. */
+  /**
+   * Whether a finish_execution call is still running or already completed. Either way the
+   * explicit finish owns the outcome. Only a call that failed or was canceled leaves the run
+   * unfinished. This is kept here, not read from the database, because a continuation execution
+   * records no finish acknowledgement. Events on a shared session carry no execution id, so a
+   * call is attributed to this execution; Hub also skips inference while the session has another
+   * live execution.
+   */
+  finishCallOwnsOutcome(): boolean {
+    for (const status of this.finishCalls.values()) {
+      if (status !== "failed" && status !== "canceled") return true;
+    }
+    return false;
+  }
+
+  /**
+   * The agent's closing text: the trailing assistant message after its last piece of work, as
+   * well-formed Unicode with no NUL, because Postgres jsonb rejects both.
+   */
   finalOutput(): { text: string; truncated: boolean } | undefined {
-    const text = this.text.trim();
+    const text = wellFormed(this.text).trim();
     if (text.length === 0) return undefined;
     if (text.length <= MAX_TURN_END_OUTPUT_CHARS) return { text, truncated: false };
     return {
       text: withoutSplitSurrogate(text.slice(0, MAX_TURN_END_OUTPUT_CHARS)),
       truncated: true,
     };
+  }
+
+  private recordFinishCall(callId: string, status: string | undefined): void {
+    // A completed call stays completed even if a stale running update arrives later.
+    if (this.finishCalls.get(callId) === "completed") return;
+    this.finishCalls.set(callId, status ?? "running");
   }
 
   private interrupt(clearText: boolean): TurnEndVerdict {
@@ -107,4 +141,27 @@ export class TurnEndTracker {
 function withoutSplitSurrogate(text: string): string {
   const last = text.charCodeAt(text.length - 1);
   return last >= 0xd800 && last <= 0xdbff ? text.slice(0, -1) : text;
+}
+
+/** Drops NUL and replaces each unpaired surrogate with U+FFFD. */
+function wellFormed(text: string): string {
+  let result = "";
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    if (code === 0) continue;
+    const isHigh = code >= 0xd800 && code <= 0xdbff;
+    const isLow = code >= 0xdc00 && code <= 0xdfff;
+    if (isHigh) {
+      const next = text.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        result += text.slice(index, index + 2);
+        index += 1;
+      } else {
+        result += "\uFFFD";
+      }
+    } else {
+      result += isLow ? "\uFFFD" : text[index];
+    }
+  }
+  return result;
 }

@@ -319,34 +319,142 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
       }
     });
 
-    it("does not complete while a finish_execution call is still in flight", async () => {
-      const fixture = await open({ workflow, completeOnTurnEnd: true });
-      try {
-        const { execution } = await fixture.dispatch();
-        fixture.state.status = "running";
-        await fixture.deliver(fixture.events.turnStarted());
-        await fixture.deliver(fixture.events.toolCall("mcp__hub__finish_execution", "running"));
-        fixture.state.status = "idle";
-        await fixture.deliver(fixture.events.turnCompleted());
-        await fixture.clock.advance(10 * TURN_END_SETTLE_MS);
-        assert.equal((await fixture.execution(execution.id)).status, "running");
-      } finally {
-        await fixture.lifecycle.stop();
-      }
+    describe.each([
+      { shape: "a new agent", continuationKey: undefined },
+      { shape: "a continued conversation", continuationKey: "conversation-finish" },
+    ])("finish_execution calls on $shape", ({ continuationKey }) => {
+      const finishOptions = () => ({
+        workflow,
+        completeOnTurnEnd: true,
+        ...(continuationKey === undefined ? {} : { continuationKey }),
+      });
+
+      it.each(["running", "completed"])(
+        "does not complete while a finish_execution call is %s",
+        async (status) => {
+          const fixture = await open(finishOptions());
+          try {
+            const { execution } = await fixture.dispatch();
+            fixture.state.status = "running";
+            await fixture.deliver(fixture.events.turnStarted());
+            await fixture.deliver(fixture.events.toolCall("mcp__hub__finish_execution", status));
+            fixture.state.status = "idle";
+            await fixture.deliver(fixture.events.turnCompleted());
+            await fixture.deliver(fixture.events.status("idle"));
+            await fixture.clock.advance(10 * TURN_END_SETTLE_MS);
+            assert.equal((await fixture.execution(execution.id)).status, "running");
+          } finally {
+            await fixture.lifecycle.stop();
+          }
+        },
+      );
+
+      it.each(["failed", "canceled"])(
+        "completes after a finish_execution call that %s",
+        async (status) => {
+          const fixture = await open(finishOptions());
+          try {
+            const { execution } = await fixture.dispatch();
+            fixture.state.status = "running";
+            await fixture.deliver(fixture.events.turnStarted());
+            await fixture.deliver(fixture.events.toolCall("mcp__hub__finish_execution", status));
+            await fixture.deliver(fixture.events.text("could not finish"));
+            fixture.state.status = "idle";
+            await fixture.deliver(fixture.events.turnCompleted());
+            await fixture.deliver(fixture.events.status("idle"));
+            await fixture.clock.advance(SETTLED);
+            assert.equal((await fixture.execution(execution.id)).status, "succeeded");
+          } finally {
+            await fixture.lifecycle.stop();
+          }
+        },
+      );
+
+      it("lets the explicit finish win while its call is running", async () => {
+        const fixture = await open(finishOptions());
+        try {
+          const { execution } = await fixture.dispatch();
+          fixture.state.status = "running";
+          await fixture.deliver(fixture.events.turnStarted());
+          await fixture.deliver(fixture.events.toolCall("hub.finish_execution", "running"));
+          fixture.state.status = "idle";
+          await fixture.deliver(fixture.events.turnCompleted());
+          await fixture.deliver(fixture.events.status("idle"));
+          await fixture.clock.advance(SETTLED);
+          assert.equal((await fixture.execution(execution.id)).status, "running");
+
+          await fixture.lifecycle.completeAgentExecutionFromCallback({
+            executionId: execution.id,
+            token: deriveAgentExecutionCompletionToken("test-secret", execution.id),
+          });
+          const done = await fixture.execution(execution.id);
+          assert.equal(done.status, "succeeded");
+          assert.notEqual(done.completedByAgentAt, null);
+        } finally {
+          await fixture.lifecycle.stop();
+        }
+      });
     });
 
-    it("completes after a finish_execution call that failed", async () => {
+    it.each([
+      ["a NUL", "a\u0000b", "ab"],
+      ["a lone high surrogate", "a\uD83Db", "a\uFFFDb"],
+      ["a lone low surrogate", "a\uDE00b", "a\uFFFDb"],
+      ["a pair split across two chunks", "a\uD83D|\uDE00b", "a\u{1F600}b"],
+    ])(
+      "stores a closing text with %s in a form the database accepts",
+      async (_label, said, kept) => {
+        const fixture = await open({ workflow, completeOnTurnEnd: true });
+        try {
+          const { execution, step } = await fixture.dispatch();
+          fixture.state.status = "running";
+          await fixture.deliver(fixture.events.turnStarted());
+          for (const chunk of said.split("|")) await fixture.deliver(fixture.events.text(chunk));
+          fixture.state.status = "idle";
+          await fixture.deliver(fixture.events.turnCompleted());
+          await fixture.deliver(fixture.events.status("idle"));
+          await fixture.clock.advance(SETTLED);
+
+          const done = await fixture.execution(execution.id);
+          assert.equal(done.status, "succeeded");
+          assert.equal(resultField(done.result, "output"), kept);
+          if (step !== undefined) {
+            assert.equal(
+              (await fixture.database.findWorkflowStepRunById(step.id))?.status,
+              "succeeded",
+            );
+          }
+        } finally {
+          await fixture.lifecycle.stop();
+        }
+      },
+    );
+
+    it("writes nothing when the hub stops while the daemon's status answer is pending", async () => {
       const fixture = await open({ workflow, completeOnTurnEnd: true });
       try {
         const { execution } = await fixture.dispatch();
-        fixture.state.status = "running";
-        await fixture.deliver(fixture.events.turnStarted());
-        await fixture.deliver(fixture.events.toolCall("mcp__hub__finish_execution", "failed"));
-        await fixture.deliver(fixture.events.text("could not finish"));
-        fixture.state.status = "idle";
-        await fixture.deliver(fixture.events.turnCompleted());
-        await fixture.clock.advance(SETTLED);
-        assert.equal((await fixture.execution(execution.id)).status, "succeeded");
+        await fixture.endTurn("ok");
+        const writes = vi.spyOn(
+          fixture.database,
+          workflow ? "completeWorkflowAgentExecution" : "transitionAgentExecution",
+        );
+        let release!: () => void;
+        fixture.state.statusGate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const asked = new Promise<void>((resolve) => {
+          fixture.state.onStatusRequest = resolve;
+        });
+        const settling = fixture.clock.advance(SETTLED);
+        await asked;
+
+        const stopping = fixture.lifecycle.stop();
+        release();
+        await Promise.all([settling, stopping]);
+
+        assert.equal(writes.mock.calls.length, 0);
+        assert.equal((await fixture.execution(execution.id)).status, "running");
       } finally {
         await fixture.lifecycle.stop();
       }

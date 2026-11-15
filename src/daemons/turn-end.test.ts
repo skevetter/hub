@@ -208,6 +208,74 @@ describe("runtime guard for a launch intent that skipped compile-time validation
   });
 });
 
+describe("finish_execution calls seen by the tracker", () => {
+  const call = (callId: string, status: string, name = "mcp__hub__finish_execution") =>
+    stream({
+      type: "timeline",
+      provider: "claude",
+      item: { type: "tool_call", name, callId, status },
+    });
+
+  it.each(["hub.finish_execution", "mcp__hub__finish_execution", "hub / finish_execution"])(
+    "owns the outcome while a call named %s is running or completed",
+    (name) => {
+      const running = new TurnEndTracker();
+      running.observe(call("c1", "running", name));
+      assert.equal(running.finishCallOwnsOutcome(), true);
+      running.observe(call("c1", "completed", name));
+      assert.equal(running.finishCallOwnsOutcome(), true);
+    },
+  );
+
+  it("releases the outcome only when every call failed or was canceled", () => {
+    const tracker = new TurnEndTracker();
+    tracker.observe(call("c1", "failed"));
+    tracker.observe(call("c2", "running"));
+    assert.equal(tracker.finishCallOwnsOutcome(), true);
+    tracker.observe(call("c2", "canceled"));
+    assert.equal(tracker.finishCallOwnsOutcome(), false);
+  });
+
+  it("keeps a completed call completed and ignores other tools", () => {
+    const tracker = new TurnEndTracker();
+    tracker.observe(call("c1", "completed"));
+    tracker.observe(call("c1", "running"));
+    assert.equal(tracker.finishCallOwnsOutcome(), true);
+    const other = new TurnEndTracker();
+    other.observe(call("c9", "running", "Bash"));
+    assert.equal(other.finishCallOwnsOutcome(), false);
+  });
+});
+
+describe("turn end output normalization", () => {
+  it.each([
+    ["a NUL", "a\u0000b", "ab"],
+    ["a lone high surrogate", "a\uD83Db", "a\uFFFDb"],
+    ["a lone low surrogate", "a\uDE00b", "a\uFFFDb"],
+    ["a trailing lone high surrogate", "ab\uD83D", "ab\uFFFD"],
+  ])("repairs %s", (_label, said, kept) => {
+    const tracker = new TurnEndTracker();
+    tracker.observe(text(said));
+    const output = tracker.finalOutput();
+    assert.equal(output?.text, kept);
+    assert.equal(wellFormed(output?.text), true);
+  });
+
+  it("has no output when nothing but NUL remains", () => {
+    const tracker = new TurnEndTracker();
+    tracker.observe(text("\u0000\u0000"));
+    assert.equal(tracker.finalOutput(), undefined);
+  });
+
+  it("caps in characters after repairing, and keeps a pair that fits", () => {
+    const tracker = new TurnEndTracker();
+    tracker.observe(text(`${"\u0000".repeat(50)}${"x".repeat(MAX_TURN_END_OUTPUT_CHARS + 5)}`));
+    const output = tracker.finalOutput();
+    assert.equal(output?.text, "x".repeat(MAX_TURN_END_OUTPUT_CHARS));
+    assert.equal(output?.truncated, true);
+  });
+});
+
 describe("turn end output cut", () => {
   it("drops a high surrogate left at the cut and keeps a whole pair that fits", () => {
     const split = new TurnEndTracker();

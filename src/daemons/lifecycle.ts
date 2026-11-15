@@ -166,6 +166,7 @@ export class DaemonDispatchLifecycle {
   private readonly executionSubscriptions = new Map<string, () => void>();
   private readonly turnEnds = new Map<string, TurnEndTracker>();
   private readonly turnEndTimers = new Map<string, () => void>();
+  private readonly turnEndRuns = new Set<Promise<void>>();
   private stopping = false;
 
   constructor(private readonly options: DaemonDispatchLifecycleOptions) {
@@ -194,6 +195,7 @@ export class DaemonDispatchLifecycle {
       ...this.reconcilingHubActions.values(),
       ...this.pendingStreamHandlersByExecution.values(),
       ...this.activeExecutionDispatches.values(),
+      ...this.turnEndRuns,
     ]);
   }
 
@@ -1701,9 +1703,14 @@ export class DaemonDispatchLifecycle {
     const generation = tracker.currentGeneration;
     const clear = this.scheduleDeadline(async () => {
       this.turnEndTimers.delete(executionId);
-      await this.completeFinishedTurn(executionId, generation).catch((error: unknown) => {
-        this.report(error, "daemon.execution.turn-end", { executionId });
-      });
+      // Tracked so stop() can wait for a completion that is already past its timer.
+      const run = this.completeFinishedTurn(executionId, tracker, generation)
+        .catch((error: unknown) => {
+          this.report(error, "daemon.execution.turn-end", { executionId });
+        })
+        .finally(() => this.turnEndRuns.delete(run));
+      this.turnEndRuns.add(run);
+      await run;
     }, TURN_END_SETTLE_MS);
     this.turnEndTimers.set(executionId, clear);
   }
@@ -1714,16 +1721,23 @@ export class DaemonDispatchLifecycle {
    * armed the timer may have changed. An explicit finish that wins the race is left alone: the
    * transition below changes only an execution that is still running.
    */
-  private async completeFinishedTurn(executionId: string, generation: number): Promise<void> {
+  private async completeFinishedTurn(
+    executionId: string,
+    tracker: TurnEndTracker,
+    generation: number,
+  ): Promise<void> {
+    // Shutdown and new agent activity can both land during any await below, so the same check
+    // runs after each one and again right before the write.
+    const stillWanted = () =>
+      !this.stopping && this.turnEnds.get(executionId) === tracker && tracker.isCurrent(generation);
     await this.waitForPendingStreamHandlers(executionId);
-    const tracker = this.turnEnds.get(executionId);
-    if (this.stopping || tracker === undefined || !tracker.isCurrent(generation)) return;
+    if (!stillWanted() || tracker.finishCallOwnsOutcome()) return;
     const execution = await this.options.database.findAgentExecutionById(executionId);
-    if (execution === undefined || !mayCompleteOnTurnEnd(execution)) return;
+    if (execution === undefined || !mayCompleteOnTurnEnd(execution) || !stillWanted()) return;
     if (await this.expireExecutionIfDeadlineElapsed(execution)) return;
-    if (await this.hasOtherActiveSessionExecution(execution)) return;
-    if (!(await this.agentIsIdle(execution))) return;
-    if (!tracker.isCurrent(generation)) return;
+    if (!stillWanted() || (await this.hasOtherActiveSessionExecution(execution))) return;
+    if (!stillWanted() || !(await this.agentIsIdle(execution))) return;
+    if (!stillWanted() || tracker.finishCallOwnsOutcome()) return;
     await this.completeAgentExecution(executionId, { turnEnd: tracker.finalOutput() ?? null });
   }
 

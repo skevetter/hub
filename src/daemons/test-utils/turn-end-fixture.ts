@@ -85,7 +85,13 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
   const clock = new ManualClock();
   const executionIds: string[] = [];
   const failures = new FailureLogStream();
-  const state = { status: "idle" as "idle" | "running", statusFails: false };
+  const state = {
+    status: "idle" as "idle" | "running",
+    statusFails: false,
+    /** Holds the daemon's status answer until a test releases it. */
+    statusGate: undefined as Promise<void> | undefined,
+    onStatusRequest: undefined as (() => void) | undefined,
+  };
   const listeners = new Set<(event: AgentEvent) => void>();
   const sends: string[] = [];
   const controls: string[] = [];
@@ -96,6 +102,8 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
   const agents: AgentConnection = {
     create: async () => agent(),
     get: async () => {
+      state.onStatusRequest?.();
+      if (state.statusGate !== undefined) await state.statusGate;
       if (state.statusFails) throw new Error("daemon unreachable");
       return agent();
     },
