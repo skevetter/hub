@@ -112,6 +112,33 @@ comment text.
 - **Reason can change.** GitHub can change a thread's `reason`. A thread that did not match earlier
   can match on a later update.
 
+## Status in the UI
+
+The Triggers page shows a **GitHub notifications** card when your organization has a
+`github.notification` trigger, enabled or not. The card has these rows:
+
+| Row                            | Meaning                                                                                  |
+| ------------------------------ | ---------------------------------------------------------------------------------------- |
+| Status                         | One of the states below.                                                                 |
+| Last poll                      | When the last poll finished without an error. A `304` counts.                            |
+| Next poll                      | When the next poll may run.                                                              |
+| Delivered in the last 24 hours | Notifications that started runs for your organization, counted by receipt.               |
+| Last error                     | The latest failure, up to 200 characters, without the token. Only shown after a failure. |
+
+States:
+
+- **Polling.** A token is set and the last poll succeeded.
+- **Starting.** A token is set and no poll has finished yet.
+- **Error.** The last poll failed. The next success clears the message and returns the status to
+  Polling.
+- **Stalled.** A token is set, but the next poll is more than five minutes overdue. Check the Hub
+  logs.
+- **Off.** `GITHUB_NOTIFICATIONS_TOKEN` is not set on the Hub. The card says so and links to
+  [Set up](#set-up).
+
+The status is stored with the cursor, so every Hub process shows the same card. The card never
+shows the token.
+
 ## Limits
 
 - No commenter or author filter. That needs the `repo` scope, which is write access to every private
