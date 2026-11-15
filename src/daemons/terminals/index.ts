@@ -29,7 +29,8 @@ export interface TerminalConnection {
   list(scope: { cwd: string; workspaceId?: string | undefined }): Promise<readonly TerminalInfo[]>;
   /** A negative `start` counts from the end of the scrollback. */
   capture(terminalId: string, start: number): Promise<TerminalCapture>;
-  kill(terminalId: string): Promise<void>;
+  /** False when the daemon reports nothing was stopped, as for a terminal that already ended. */
+  kill(terminalId: string): Promise<boolean>;
 }
 
 export type DaemonTerminalErrorCode = "permission_denied" | "no_workspace" | "request_failed";
@@ -64,6 +65,7 @@ const CreateResponseSchema = z.object({
 const ListResponseSchema = z.object({
   terminals: z.array(TerminalInfoSchema.partial({ cwd: true })),
 });
+const KillResponseSchema = z.object({ success: z.boolean() });
 const CaptureResponseSchema = z.object({
   lines: z.array(z.string()),
   totalLines: z.number(),
@@ -161,8 +163,11 @@ export class DaemonTerminals implements TerminalConnection {
     return { lines: response.lines, totalLines: response.totalLines };
   }
 
-  async kill(terminalId: string): Promise<void> {
-    await this.request({ type: "kill_terminal_request", terminalId });
+  async kill(terminalId: string): Promise<boolean> {
+    const response = KillResponseSchema.parse(
+      await this.request({ type: "kill_terminal_request", terminalId }),
+    );
+    return response.success;
   }
 
   private async request(

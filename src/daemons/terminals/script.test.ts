@@ -2,13 +2,19 @@ import { expect, test } from "vitest";
 import { DaemonResponseLostError } from "../protocol.js";
 import { FakeClock, FakeTerminalDaemon } from "../test-utils/fake-terminal-daemon.js";
 import {
+  createScriptStepRunner,
   MAX_OUTPUT_TAIL_BYTES,
   runScript,
+  scriptWrapper,
+  sweepScriptTerminals,
   SCRIPT_PERMISSION_MESSAGE,
   ScriptRunAborted,
   TERMINAL_ENDED_MESSAGE,
   type ScriptRunInput,
 } from "./script.js";
+
+/** Retries run at once, so no real time passes between kill attempts. */
+const NO_WAIT = { sleep: async () => undefined, random: () => 0 };
 
 function setup(overrides: Partial<ScriptRunInput> = {}) {
   const daemon = new FakeTerminalDaemon();
@@ -21,7 +27,7 @@ function setup(overrides: Partial<ScriptRunInput> = {}) {
     timeoutMs: 10 * 60_000,
     ...overrides,
   };
-  const run = () => runScript(daemon.client, input, clock);
+  const run = () => runScript(daemon.client, input, clock, NO_WAIT);
   return { daemon, clock, input, run };
 }
 
@@ -217,7 +223,7 @@ test("the script and event are separate argv elements and never in the shell str
   expect(args[3]).toBe(script);
   expect(args[4]).toBe(eventJson);
   const wrapper = args[1] ?? "";
-  expect(wrapper).toContain('HUB_EVENT_JSON="$2" /bin/sh -c "$1"');
+  expect(wrapper).toContain('HUB_EVENT_JSON="$2" /bin/sh -c -- "$1"');
   expect(wrapper).toContain("sleep 30");
   expect(wrapper).toContain(`__HUB_EXIT_${daemon.markerId()}__:%s:`);
   expect(wrapper).not.toContain("rm -rf");
@@ -283,12 +289,24 @@ test("aborting stops polling, kills the terminal, and throws", async () => {
   expect(daemon.killed).toEqual(["terminal-1"]);
 });
 
-test("a capture that fails for another reason fails the run and still kills", async () => {
-  const { daemon, run } = setup();
+test("a capture that fails is asked again until the script reports", async () => {
+  const { daemon, clock, run } = setup();
+  daemon.captureError = "terminal worker unavailable";
+  clock.at(3_000, () => {
+    daemon.captureError = undefined;
+    daemon.print("recovered");
+    daemon.exit(0);
+  });
+  const result = await run();
+  expect(result).toMatchObject({ status: "succeeded", exitCode: 0, outputTail: "recovered" });
+  expect(daemon.killed).toEqual(["terminal-1"]);
+});
+
+test("a capture that never recovers times the run out at its deadline and still kills", async () => {
+  const { daemon, run } = setup({ timeoutMs: 5_000 });
   daemon.captureError = "terminal worker unavailable";
   const result = await run();
-  expect(result.status).toBe("failed");
-  expect(result.failureReason).toContain("terminal worker unavailable");
+  expect(result).toMatchObject({ status: "timed_out", exitCode: null });
   expect(daemon.killed).toEqual(["terminal-1"]);
 });
 
@@ -309,4 +327,195 @@ test("liveness checks list by the workspace the daemon chose, name recovery by d
   await lost.run();
   expect(lost.daemon.listRequests[0]).toMatchObject({ cwd: "/work/webapp" });
   expect(lost.daemon.listRequests[0]).not.toHaveProperty("workspaceId");
+});
+
+test("a kill that fails is retried until the daemon confirms it", async () => {
+  const { daemon, clock, run } = setup();
+  clock.at(250, () => daemon.exit(0));
+  daemon.failKills = 2;
+  const result = await run();
+  expect(result.status).toBe("succeeded");
+  expect(result).not.toHaveProperty("cleanup");
+  expect(daemon.killAttempts).toEqual(["terminal-1", "terminal-1", "terminal-1"]);
+  expect(daemon.killed).toEqual(["terminal-1"]);
+});
+
+test("a kill that answers success false for a terminal that is already gone is confirmed", async () => {
+  const { daemon, clock, run } = setup();
+  clock.at(250, () => {
+    daemon.exit(0);
+  });
+  const taken = daemon.client.capture.bind(daemon.client);
+  daemon.client.capture = async (terminalId, start) => {
+    const capture = await taken(terminalId, start);
+    // The daemon drops the terminal right after the marker was read.
+    if (capture.lines.length > 0) daemon.remove();
+    return capture;
+  };
+  const result = await run();
+  expect(result.status).toBe("succeeded");
+  expect(result).not.toHaveProperty("cleanup");
+  expect(daemon.killAttempts).toEqual(["terminal-1"]);
+});
+
+test("a kill answered success false for a terminal that is still listed is retried, then reported", async () => {
+  const { daemon, clock, run } = setup();
+  clock.at(250, () => daemon.exit(0));
+  daemon.killSucceeds = false;
+  const result = await run();
+  expect(result.status).toBe("succeeded");
+  expect(result.cleanup).toEqual({
+    cwd: "/work/webapp",
+    name: "hub-script-step",
+    terminalId: "terminal-1",
+  });
+  expect(daemon.killAttempts).toHaveLength(5);
+});
+
+test("a kill the daemon keeps failing is reported as a pending cleanup", async () => {
+  const { daemon, clock, run } = setup();
+  clock.at(250, () => daemon.exit(3));
+  daemon.failKills = 99;
+  const result = await run();
+  expect(result).toMatchObject({ status: "failed", exitCode: 3 });
+  expect(result.cleanup?.terminalId).toBe("terminal-1");
+  expect(daemon.killAttempts).toHaveLength(5);
+});
+
+test("a permission refusal on kill is reported at once without retries", async () => {
+  const { daemon, clock, run } = setup();
+  clock.at(250, () => daemon.exit(0));
+  daemon.denied.add("kill_terminal_request");
+  const result = await run();
+  expect(result.cleanup?.terminalId).toBe("terminal-1");
+  expect(daemon.killAttempts).toHaveLength(0);
+  expect(
+    daemon.requests.filter((request) => request["type"] === "kill_terminal_request"),
+  ).toHaveLength(1);
+});
+
+test("a lost create response whose terminal cannot be found again is reported by name", async () => {
+  const { daemon, run } = setup();
+  daemon.client.create = async () => {
+    throw new DaemonResponseLostError();
+  };
+  daemon.denied.add("list_terminals_request");
+  const result = await run();
+  expect(result.cleanup).toEqual({
+    cwd: "/work/webapp",
+    name: "hub-script-step",
+    terminalId: undefined,
+  });
+});
+
+test("a shutdown abort tries the kill once", async () => {
+  const controller = new AbortController();
+  const { daemon, clock, run } = setup({ signal: controller.signal });
+  clock.at(500, () => controller.abort());
+  daemon.killSucceeds = false;
+  await expect(run()).rejects.toBeInstanceOf(ScriptRunAborted);
+  expect(daemon.killAttempts).toHaveLength(1);
+});
+
+test("the terminal connection is looked up again on every call", async () => {
+  const first = new FakeTerminalDaemon();
+  const second = new FakeTerminalDaemon();
+  const clock = new FakeClock();
+  let current = first;
+  let lookups = 0;
+  const runner = createScriptStepRunner(
+    () => {
+      lookups += 1;
+      return { terminals: current.client };
+    },
+    clock,
+    NO_WAIT,
+  );
+  // The daemon reconnects mid-run: the new connection already holds the same terminal.
+  clock.at(250, () => {
+    void second.client.create({
+      cwd: "/work/webapp",
+      name: "hub-script-step",
+      command: "/bin/sh",
+      args: ["-c", scriptWrapper(clock.uuidFor(1)), "sh", "x", "{}"],
+      size: { rows: 50, cols: 240 },
+    });
+    current = second;
+  });
+  clock.at(500, () => second.exit(0));
+  const result = await runner.run("daemon-1", {
+    cwd: "/work/webapp",
+    script: "true",
+    eventJson: "{}",
+    name: "hub-script-step",
+    timeoutMs: 60_000,
+  });
+  expect(result.status).toBe("succeeded");
+  expect(lookups).toBeGreaterThan(3);
+  expect(first.killed).toEqual([]);
+  expect(second.killed).toEqual(["terminal-1"]);
+});
+
+test("a run on a daemon that is not connected says so and creates nothing", async () => {
+  const runner = createScriptStepRunner(() => undefined, new FakeClock(), NO_WAIT);
+  const result = await runner.run("daemon-1", {
+    cwd: "/work",
+    script: "true",
+    eventJson: "{}",
+    name: "n",
+    timeoutMs: 1_000,
+  });
+  expect(result.failureReason).toMatch(/not connected/u);
+});
+
+test("a script that prints NUL and control bytes is recorded with its true exit code", async () => {
+  const { daemon, clock, run } = setup();
+  clock.at(250, () => {
+    daemon.print("before\u0000after\u0001\u0007bell\u001b[2Jred\ttab\u007f end");
+    daemon.exit(7);
+  });
+  const result = await run();
+  expect(result).toMatchObject({
+    status: "failed",
+    exitCode: 7,
+    outputTail: "beforeafterbellred\ttab end",
+  });
+  expect(JSON.stringify(result.outputTail)).not.toMatch(/\\u0000/u);
+});
+
+test("a silent script costs few liveness checks while it polls", async () => {
+  const { daemon, clock, run } = setup();
+  clock.at(30_000, () => daemon.exit(0));
+  await run();
+  const polls = daemon.requests.filter((request) => request["type"] === "capture_terminal_request");
+  const lists = daemon.listRequests;
+  // 250 ms for the first 10 s, then 1 s.
+  expect(polls.length).toBeGreaterThanOrEqual(40 + 19);
+  expect(polls.length).toBeLessThanOrEqual(40 + 21);
+  // A liveness check at most every 2 s.
+  expect(lists.length).toBeLessThanOrEqual(Math.ceil(30_000 / 2_000) + 1);
+});
+
+test("sweeping stops leftover script terminals that nothing claims", async () => {
+  const daemon = new FakeTerminalDaemon();
+  const make = (name: string) =>
+    daemon.client.create({
+      cwd: "/work/webapp",
+      name,
+      command: "/bin/sh",
+      args: [],
+      size: { rows: 50, cols: 240 },
+    });
+  await make("hub-script-live");
+  await make("hub-script-leftover");
+  await make("somebody-elses");
+  const result = await sweepScriptTerminals(
+    daemon.client,
+    { cwd: "/work/webapp" },
+    (name) => name === "hub-script-live",
+    new FakeClock(),
+    NO_WAIT,
+  );
+  expect(result).toEqual({ stopped: 1, unconfirmed: 0 });
+  expect(daemon.killed).toEqual(["terminal-2"]);
 });

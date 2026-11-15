@@ -54,6 +54,11 @@ export class FakeClock implements ScriptRunnerClock {
     this.timers.push({ at, run: action });
   }
 
+  /** The id `random` returned on its `call`th use. */
+  uuidFor(call: number): string {
+    return `00000000-0000-4000-8000-${String(call).padStart(12, "0")}`;
+  }
+
   random(): string {
     this.uuid += 1;
     return `00000000-0000-4000-8000-${String(this.uuid).padStart(12, "0")}`;
@@ -74,6 +79,12 @@ export class FakeTerminalDaemon {
   readonly denied = new Set<string>();
   /** Request types never answered, as when a response is lost. */
   readonly silent = new Set<string>();
+  /** The next this many kill requests fail with a daemon error. */
+  failKills = 0;
+  /** Kill requests answer `success: false` and leave the terminal running while this is false. */
+  killSucceeds = true;
+  /** Every kill request that reached the daemon, including failed ones. */
+  readonly killAttempts: string[] = [];
   createError: string | undefined;
   captureError: string | undefined;
   readonly client: DaemonTerminals;
@@ -147,10 +158,19 @@ export class FakeTerminalDaemon {
     if (type === "capture_terminal_request") return this.capture(message);
     if (type === "kill_terminal_request") {
       const id = String(message["terminalId"]);
-      this.killed.push(id);
+      this.killAttempts.push(id);
+      if (this.failKills > 0) {
+        this.failKills -= 1;
+        return this.reply("rpc_error", { requestId, error: "terminal worker busy" });
+      }
       const terminal = this.terminals.get(id);
+      if (!this.killSucceeds) {
+        return this.reply("kill_terminal_response", { requestId, terminalId: id, success: false });
+      }
+      this.killed.push(id);
+      const success = terminal?.listed === true;
       if (terminal !== undefined) terminal.listed = false;
-      return this.reply("kill_terminal_response", { requestId, terminalId: id, success: true });
+      return this.reply("kill_terminal_response", { requestId, terminalId: id, success });
     }
     throw new Error(`unexpected terminal request ${type}`);
   }
