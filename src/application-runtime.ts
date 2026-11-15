@@ -1,4 +1,5 @@
 import { createHubApplication } from "./app.js";
+import type { GitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
 import type { AuthServer } from "./auth/server.js";
 import type { BillingRuntime } from "./billing/index.js";
 import type { ConnectionResolver } from "./config/connections.js";
@@ -44,6 +45,7 @@ export interface ApplicationCompositionOptions {
   completionTokenSecret?: string;
   testTriggerRoutes?: boolean;
   daemonConnectionForId?: DaemonDispatchLifecycleOptions["connectionForDaemon"];
+  githubNotifications?: GitHubNotificationsOptions;
   close(): Promise<void>;
 }
 
@@ -114,6 +116,9 @@ async function createOwnedApplicationRuntime(
     ...(options.daemonConnectionForId === undefined
       ? {}
       : { daemonConnectionForId: options.daemonConnectionForId }),
+    ...(options.githubNotifications === undefined
+      ? {}
+      : { githubNotifications: options.githubNotifications }),
   });
   ownership.own(() => application.hub.stop());
   await application.hub.start(registrations.flatMap((registration) => registration.sources));

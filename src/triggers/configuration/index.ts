@@ -135,6 +135,8 @@ function withAutomaticReply(trigger: CompiledTrigger): CompiledTrigger {
 }
 
 function automaticReplyType(event: string): string | undefined {
+  // A notification has no installation to reply through.
+  if (event === "github.notification") return undefined;
   const provider = event.split(".", 1)[0];
   return provider === "slack" ||
     provider === "discord" ||

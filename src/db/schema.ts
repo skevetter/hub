@@ -49,7 +49,9 @@ export const providerEventReceipts = pgTable(
       .notNull()
       .references(() => organizations.id, { onDelete: "cascade" }),
     provider: text()
-      .$type<(typeof CONNECTION_PROVIDERS)[number] | "manual" | "schedule">()
+      .$type<
+        (typeof CONNECTION_PROVIDERS)[number] | "manual" | "schedule" | "github_notification"
+      >()
       .notNull(),
     connectionId: uuid("connection_id"),
     resourceId: text("resource_id"),
@@ -88,7 +90,7 @@ export const providerEventReceipts = pgTable(
     ),
     check(
       "provider_event_receipts_provider_check",
-      sql`${table.provider} in ('github', 'slack', 'discord', 'linear', 'manual', 'schedule')`,
+      sql`${table.provider} in ('github', 'slack', 'discord', 'linear', 'manual', 'schedule', 'github_notification')`,
     ),
   ],
 );
@@ -1469,6 +1471,17 @@ export const triggerSchedules = pgTable(
   },
   (table) => [index("trigger_schedules_due_idx").on(table.nextAt)],
 );
+
+/** Where the GitHub notifications poll resumes. One row per source; Hub has a single source. */
+export const githubNotificationCursors = pgTable("github_notification_cursors", {
+  source: text().primaryKey(),
+  /** Last-Modified of the newest successful response, replayed as If-Modified-Since. */
+  lastModified: text("last_modified"),
+  since: timestamp({ withTimezone: true }).notNull(),
+  /** Earliest time the next poll may run, from the poll interval GitHub asked for. */
+  nextPollAt: timestamp("next_poll_at", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
 
 export const executionAuthorities = pgTable("execution_authorities", {
   executionId: uuid("execution_id")

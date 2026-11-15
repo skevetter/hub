@@ -1,4 +1,9 @@
 import { createScheduleSource, createScheduleProvider } from "./triggers/schedule/index.js";
+import {
+  createGitHubNotificationProvider,
+  createGitHubNotificationsSource,
+  type GitHubNotificationsOptions,
+} from "./triggers/github-notifications/index.js";
 import { createExecutionCapabilityServer } from "./execution-capabilities/server.js";
 import { OutputExecutorRegistry } from "./execution-capabilities/outputs.js";
 import {
@@ -72,6 +77,8 @@ export interface HubRuntimeOptions {
   dispatchTimeoutMs?: number;
   browserOrganizationAccess?: BrowserOrganizationAccess;
   daemonConnectionForId?: DaemonDispatchLifecycleOptions["connectionForDaemon"];
+  /** Polls GitHub notifications with a Hub-level token. Omitted: the source is off. */
+  githubNotifications?: GitHubNotificationsOptions;
 }
 
 export interface HubRuntime {
@@ -151,6 +158,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
         );
   const providers = [
     createScheduleProvider(),
+    createGitHubNotificationProvider(),
     manualProvider,
     ...configuredProviders,
     ...(options.providers ?? []),
@@ -182,6 +190,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
         );
 
   const scheduleSource = appScheduleSource(options.database);
+  const notificationSource = appNotificationSource(options);
   const manualSource =
     options.database === null ? undefined : createManualTriggerSource(options.database);
   const durableDispatchHandler =
@@ -255,6 +264,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       activeSources = [
         ...(manualSource === undefined ? [] : [manualSource]),
         ...(scheduleSource === undefined ? [] : [scheduleSource]),
+        ...(notificationSource === undefined ? [] : [notificationSource]),
         ...sources,
       ];
       await Promise.all(activeSources.map(async (source) => source.start(workflowDispatcher)));
@@ -500,6 +510,15 @@ function createAppDaemonModule(
         }
       : {}),
   });
+}
+
+function appNotificationSource(options: HubRuntimeOptions): TriggerSource | undefined {
+  return options.database === null || options.githubNotifications === undefined
+    ? undefined
+    : createGitHubNotificationsSource(
+        options.database.githubNotifications,
+        options.githubNotifications,
+      );
 }
 
 function appScheduleSource(database: Database | null): TriggerSource | undefined {

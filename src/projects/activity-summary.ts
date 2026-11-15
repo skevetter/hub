@@ -18,7 +18,14 @@ import {
 } from "../triggers/github/classification.js";
 
 export interface TriggerSummary {
-  provider: "github" | "slack" | "discord" | "linear" | "manual" | "schedule";
+  provider:
+    | "github"
+    | "slack"
+    | "discord"
+    | "linear"
+    | "manual"
+    | "schedule"
+    | "github_notification";
   headline: string;
   actor: string | null;
   externalUrl: string | null;
@@ -35,6 +42,7 @@ const ManualTriggerPayloadSchema = z
  */
 export function summarizeTrigger(source: string, payload: unknown): TriggerSummary {
   const [provider] = source.split(".");
+  if (source === "github.notification") return summarizeNotification(payload);
   if (provider === "github") return summarizeGitHub(payload);
   if (provider === "slack") return summarizeSlack(payload);
   if (provider === "discord") return summarizeDiscord(payload);
@@ -205,6 +213,33 @@ function summarizeLinear(payload: unknown): TriggerSummary {
     headline: `${prefix}: ${truncate(issue.title, 96)}`,
     actor: event.data.actor?.name ?? event.data.actor?.id ?? null,
     externalUrl: issue.url ?? null,
+  };
+}
+
+const NotificationPayloadSchema = z.object({
+  github_notification: z.object({
+    repo: z.string(),
+    title: z.string(),
+    html_url: z.string().nullable().optional(),
+  }),
+});
+
+function summarizeNotification(payload: unknown): TriggerSummary {
+  const parsed = NotificationPayloadSchema.safeParse(payload);
+  if (!parsed.success) {
+    return {
+      provider: "github_notification",
+      headline: "GitHub notification",
+      actor: null,
+      externalUrl: null,
+    };
+  }
+  const { repo, title, html_url } = parsed.data.github_notification;
+  return {
+    provider: "github_notification",
+    headline: `${repo}: ${truncate(title, 96)}`,
+    actor: null,
+    externalUrl: html_url ?? null,
   };
 }
 

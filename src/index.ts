@@ -49,6 +49,7 @@ import { createInvitationMailer } from "./invitations/index.js";
 import { composeEmailDelivery } from "./email/index.js";
 import { createAccountMailer } from "./auth/account-emails.js";
 import { migrateLegacyProjectTriggers } from "./triggers/migration.js";
+import { readGitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
 
 export function startProductionRuntime(): Promise<ApplicationRuntime> {
   return startApplication(createProductionRuntime);
@@ -153,6 +154,13 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
         return begin(new Request(url, { method: "POST", headers: request.headers }));
       },
     });
+    const githubNotifications = readGitHubNotificationsOptions(process.env);
+    if (githubNotifications !== undefined) {
+      logger.info(
+        { pollIntervalSeconds: githubNotifications.pollIntervalMs / 1000 },
+        "github notifications polling enabled",
+      );
+    }
     const application = await createApplicationRuntime({
       database,
       auth,
@@ -162,6 +170,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       providerApplications,
       publicBaseUrl: identity.appUrl,
       completionTokenSecret: identity.authSecret,
+      ...(githubNotifications === undefined ? {} : { githubNotifications }),
       close: () => resources.close(),
     });
     const activationFailures = await activateProviderApplicationsAtStartup({

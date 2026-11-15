@@ -1,4 +1,8 @@
-import { eventDefinition, isEditorEvent } from "../triggers/configuration/events.js";
+import {
+  eventDefinition,
+  isEditorEvent,
+  NOTIFICATION_FROM_USERS_MESSAGE,
+} from "../triggers/configuration/events.js";
 import { ContinuationSchema } from "../triggers/continuation.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
@@ -92,6 +96,8 @@ const AuthoredTriggerFilterSchema = z
     label: z.string().min(1).optional(),
     labels: z.array(z.string().min(1)).min(1).optional(),
     repo: z.string().min(1).optional(),
+    /** GitHub notification reason, such as `mention` or `review_requested`. */
+    reason: z.string().min(1).optional(),
     guild: z.string().min(1).optional(),
     workspace: z.string().min(1).optional(),
     /** A Linear project UUID. It is deliberately a string so imported Linear IDs work verbatim. */
@@ -1383,6 +1389,10 @@ function validateAuthoredIds(config: AuthoredHubConfig): void {
 }
 
 function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
+  // A notification carries no actor, so an allowlist could never be enforced. Fail closed.
+  if (trigger.on === "github.notification" && trigger.filters?.from_users !== undefined) {
+    throw new Error(`trigger ${trigger.name}: ${NOTIFICATION_FROM_USERS_MESSAGE}`);
+  }
   if (isEditorEvent(trigger.on) && eventDefinition(trigger.on).origin === "hub") return;
   // A project scout is an intentionally autonomous, project-scoped policy. Every other
   // externally-originated Linear action remains actor-allowlisted below.

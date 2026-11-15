@@ -1,7 +1,12 @@
 import { RecurrenceSchema } from "../schedule/recurrence.js";
 import { z } from "zod";
 import { ContinuationSchema } from "../continuation.js";
-import { eventDefinition, isEditorEvent } from "./events.js";
+import {
+  eventDefinition,
+  isEditorEvent,
+  NOTIFICATION_FILTER_KEYS,
+  NOTIFICATION_FROM_USERS_MESSAGE,
+} from "./events.js";
 import { AuthoredGitHubAuthoritySchema } from "../../config/github-authority.js";
 
 type JsonPrimitive = string | number | boolean | null;
@@ -41,6 +46,7 @@ export const TriggerFilterSchema = z
     label: z.string().min(1).optional(),
     labels: z.array(z.string().min(1)).min(1).optional(),
     repo: z.string().min(1).optional(),
+    reason: z.string().min(1).optional(),
     guild: z.string().min(1).optional(),
     workspace: z.string().min(1).optional(),
     project: z.string().min(1).optional(),
@@ -160,6 +166,7 @@ export const TriggerDocumentSchema = z
           message: "Recurrence is only supported for schedule.tick.",
         });
       }
+      notificationIssues(definition, event, context);
       if (!isEditorEvent(event)) continue;
       for (const qualifier of eventDefinition(event).qualifiers) {
         const value = definition.filters?.[qualifier.key];
@@ -189,3 +196,43 @@ export const TriggerDocumentSchema = z
   });
 
 export type TriggerDocument = z.infer<typeof TriggerDocumentSchema>;
+
+/** The poll has no connection and no actor; a filter it cannot evaluate must not pass silently. */
+function notificationIssues(
+  definition: z.infer<typeof TriggerEventSchema>,
+  event: string,
+  context: z.RefinementCtx,
+): void {
+  if (event !== "github.notification") {
+    if (definition.filters?.reason !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["on", event, "filters", "reason"],
+        message: "reason is only supported for github.notification.",
+      });
+    }
+    return;
+  }
+  if (definition.connection !== undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["on", event, "connection"],
+      message: "github.notification uses the Hub notification token and takes no connection.",
+    });
+  }
+  for (const key of Object.keys(definition.filters ?? {})) {
+    if (key === "from_users") {
+      context.addIssue({
+        code: "custom",
+        path: ["on", event, "filters", key],
+        message: NOTIFICATION_FROM_USERS_MESSAGE,
+      });
+    } else if (!(NOTIFICATION_FILTER_KEYS as readonly string[]).includes(key)) {
+      context.addIssue({
+        code: "custom",
+        path: ["on", event, "filters", key],
+        message: `github.notification supports only these filters: ${NOTIFICATION_FILTER_KEYS.join(", ")}.`,
+      });
+    }
+  }
+}

@@ -1,3 +1,9 @@
+export const NOTIFICATION_FROM_USERS_MESSAGE =
+  "github.notification has no commenter or author, so it does not accept from_users.";
+
+/** The filters the notification poll can evaluate. Anything else would be ignored silently. */
+export const NOTIFICATION_FILTER_KEYS = ["repo", "reason", "contains", "pattern"] as const;
+
 /** The YAML filter keys the form knows how to qualify. */
 export type QualifierKey = "label";
 
@@ -13,7 +19,14 @@ export interface QualifierDefinition {
 }
 
 interface EventDefinition {
-  provider: "github" | "slack" | "discord" | "linear" | "manual" | "schedule";
+  provider:
+    | "github"
+    | "slack"
+    | "discord"
+    | "linear"
+    | "manual"
+    | "schedule"
+    | "github_notification";
   label: string;
   origin: "hub" | "provider";
   qualifiers: readonly QualifierDefinition[];
@@ -37,7 +50,10 @@ function event(
     provider,
     label,
     qualifiers,
-    origin: provider === "manual" || provider === "schedule" ? "hub" : "provider",
+    origin:
+      provider === "manual" || provider === "schedule" || provider === "github_notification"
+        ? "hub"
+        : "provider",
   };
 }
 
@@ -66,6 +82,7 @@ const EVENTS = {
   "linear.issue_entered_scope": event("linear", "Linear issue entered scope"),
   "linear.issue_assigned": event("linear", "Linear issue assigned"),
   "linear.comment_created": event("linear", "Linear comment created"),
+  "github.notification": event("github_notification", "GitHub notification"),
   "schedule.tick": event("schedule", "Schedule"),
   "manual.run": event("manual", "Manual run"),
 };

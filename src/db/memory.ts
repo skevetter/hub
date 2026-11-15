@@ -117,6 +117,7 @@ const OUTPUT_ATTEMPT_LEASE_MS = 5 * 60_000;
 
 export interface MemoryDatabaseOptions {
   schedules?: import("../triggers/schedule/index.js").ScheduleStore;
+  githubNotifications?: import("../triggers/github-notifications/index.js").GitHubNotificationStore;
   onInsertAgentExecution?: (execution: AgentExecutionRecord) => void;
   organizationIds?: readonly string[];
   memberships?: readonly {
@@ -164,6 +165,21 @@ class MemoryDatabase implements Database {
     return (
       this.options.schedules ?? {
         async tick() {
+          return 0;
+        },
+      }
+    );
+  }
+  // Like schedules, polling needs real SQL; tests of it use the embedded runtime.
+  get githubNotifications(): import("../triggers/github-notifications/index.js").GitHubNotificationStore {
+    return (
+      this.options.githubNotifications ?? {
+        exclusive: (operation) => operation(),
+        async readCursor() {
+          return undefined;
+        },
+        async saveCursor() {},
+        async deliver() {
           return 0;
         },
       }

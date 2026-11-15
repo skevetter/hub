@@ -1,5 +1,6 @@
 import { ExecutionAuthorityRepository } from "../execution-authority/index.js";
 import { ScheduleRepository } from "../triggers/schedule/index.js";
+import { GitHubNotificationRepository } from "../triggers/github-notifications/index.js";
 import { acceptWorkflowRun } from "./workflow-intake.js";
 import { randomUUID } from "node:crypto";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
@@ -139,6 +140,7 @@ export function createDatabase(runtime: DatabaseRuntime, locks: Locks): Database
 
 class PgDatabase implements Database {
   readonly schedules;
+  readonly githubNotifications;
   readonly executionAuthority;
   private readonly connections;
   private readonly triggerAcceptance;
@@ -148,6 +150,7 @@ class PgDatabase implements Database {
     private readonly locks: Locks,
   ) {
     this.schedules = new ScheduleRepository(this.pool);
+    this.githubNotifications = new GitHubNotificationRepository(this.pool, locks);
     this.executionAuthority = new ExecutionAuthorityRepository(this.pool);
     this.connections = new ConnectionRepository(this.pool, locks);
     this.triggerAcceptance = new ProviderEventAcceptanceRepository(

@@ -732,6 +732,8 @@ async function compileTriggers(
 }
 
 function providerForEvent(eventName: string): ConnectionProvider | undefined {
+  // Polled with a Hub-level token: no connection and no repository resolution.
+  if (eventName === "github.notification") return undefined;
   const provider = eventName.slice(0, eventName.indexOf("."));
   return provider === "github" ||
     provider === "slack" ||
