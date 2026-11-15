@@ -7,13 +7,44 @@ import { parseCompiledHubConfig } from "../config/compiler.js";
 import type { DaemonAgentConfigurationValidator } from "../configuration/store.js";
 import { projectTriggerForm } from "./configuration/editor.js";
 import { OrganizationTriggerStore } from "./store.js";
+import { notificationStatusView, type NotificationStatusView } from "./notification-status.js";
+
+const DAY_MS = 24 * 60 * 60_000;
+const NOTIFICATION_EVENT = "github.notification";
+
+export interface TriggerDashboardOptions {
+  /** True when this Hub has a token for the GitHub notification poll. The token never leaves it. */
+  githubNotificationsEnabled?: boolean;
+  now?: () => Date;
+}
 
 export class TriggerDashboard {
   constructor(
     private readonly database: Database,
     private readonly auth: AuthServer,
     private readonly agentValidator: DaemonAgentConfigurationValidator,
+    private readonly options: TriggerDashboardOptions = {},
   ) {}
+
+  /** Only an organization that uses the event sees the poll's health. */
+  private async notificationStatus(
+    organizationId: string,
+    triggers: readonly { event: string }[],
+  ): Promise<NotificationStatusView | undefined> {
+    if (!triggers.some(({ event }) => event === NOTIFICATION_EVENT)) return undefined;
+    const now = (this.options.now ?? (() => new Date()))();
+    const store = this.database.githubNotifications;
+    const [status, delivered24h] = await Promise.all([
+      store.readStatus(),
+      store.countDelivered(organizationId, new Date(now.getTime() - DAY_MS)),
+    ]);
+    return notificationStatusView({
+      enabled: this.options.githubNotificationsEnabled === true,
+      status,
+      delivered24h,
+      now,
+    });
+  }
 
   async snapshot(request: Request, organizationSlug: string) {
     const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
@@ -35,18 +66,21 @@ export class TriggerDashboard {
       .flat()
       .sort((left, right) => right.receivedAt.localeCompare(left.receivedAt))
       .slice(0, 100);
+    const triggerViews = await Promise.all(
+      triggers.map((trigger) =>
+        triggerView(
+          store,
+          trigger,
+          activity.find(({ triggerId }) => triggerId === trigger.id),
+        ),
+      ),
+    );
+    const notifications = await this.notificationStatus(tenant.organization.id, triggerViews);
     return {
       organization: tenant.organization,
       canManage: capabilitiesFor(tenant.membership.role).manageResources,
-      triggers: await Promise.all(
-        triggers.map((trigger) =>
-          triggerView(
-            store,
-            trigger,
-            activity.find(({ triggerId }) => triggerId === trigger.id),
-          ),
-        ),
-      ),
+      triggers: triggerViews,
+      ...(notifications === undefined ? {} : { notifications }),
       activity,
       // Only a daemon that can run agents is a target; one enrolled without `hub.execute` would
       // be refused at save, and Home says how to grant it.

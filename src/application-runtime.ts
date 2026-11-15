@@ -349,7 +349,9 @@ function triggerDashboardFor(
 ): TriggerDashboard | null {
   return options.database === null || options.auth === null || hub.agentValidator === null
     ? null
-    : new TriggerDashboard(options.database, options.auth, hub.agentValidator);
+    : new TriggerDashboard(options.database, options.auth, hub.agentValidator, {
+        githubNotificationsEnabled: options.githubNotifications !== undefined,
+      });
 }
 
 function homeDashboardFor(

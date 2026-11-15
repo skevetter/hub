@@ -43,6 +43,7 @@ import { saveTrigger, triggerSnapshot, type TriggerSnapshot } from "./functions.
 import { daemonProviderSnapshot } from "../daemons/functions.js";
 import type { HubProviderSnapshotEntry } from "../hub/protocol.js";
 import { EventFields } from "./event-fields.js";
+import { NotificationStatusCard } from "./notification-status-card.js";
 import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
 import { selectedProviderModel } from "./provider-catalog.js";
 import { supportsUnattendedRuns } from "./configuration/unattended.js";
@@ -123,6 +124,9 @@ export function TriggersPanel() {
             <p>Triggers need a daemon that can run agents.</p>
           </WarningAlert>
         ) : null}
+        {data.notifications === undefined ? null : (
+          <NotificationStatusCard status={data.notifications} />
+        )}
         <DataTable
           label="Triggers"
           columns={TRIGGER_COLUMNS}
