@@ -882,3 +882,90 @@ describe("workflow compiler", () => {
 function setAgent(raw: ReturnType<typeof configuration>, agent: unknown): void {
   Reflect.set(raw.triggers[0]!.steps[0]!, "agent", agent);
 }
+
+describe("complete_on_turn_end compilation", () => {
+  const authoredStep = (extra: Record<string, unknown>) => ({
+    ...configuration().triggers[0]!.steps[0]!,
+    complete_on_turn_end: true,
+    ...extra,
+  });
+  const withStep = (step: Record<string, unknown>) => ({
+    ...configuration(),
+    triggers: [{ ...configuration().triggers[0]!, steps: [step] }],
+  });
+
+  it("compiles only when on, and leaves the compiled step unchanged when off", () => {
+    const on = agentStep(compileHubConfig(withStep(authoredStep({}))).triggers[0]?.steps[0]);
+    assert.equal(on.completeOnTurnEnd, true);
+    const off = agentStep(
+      compileHubConfig(withStep(authoredStep({ complete_on_turn_end: false }))).triggers[0]
+        ?.steps[0],
+    );
+    assert.equal("completeOnTurnEnd" in off, false);
+  });
+
+  it("refuses an authored structured output", () => {
+    assert.throws(
+      () => compileHubConfig(withStep(authoredStep({ output: { schema: { type: "object" } } }))),
+      /complete_on_turn_end cannot be combined with output\.schema/u,
+    );
+  });
+
+  it("refuses an authored required output but allows an optional one", () => {
+    assert.throws(
+      () =>
+        compileHubConfig(
+          withStep(
+            authoredStep({ allow_outputs: [{ type: "manual.reply", max: 1, required: true }] }),
+          ),
+        ),
+      /complete_on_turn_end cannot be combined with a required output/u,
+    );
+    compileHubConfig(
+      withStep(
+        authoredStep({ allow_outputs: [{ type: "manual.reply", max: 1, required: false }] }),
+      ),
+    );
+  });
+
+  it("refuses the option on a script step", () => {
+    assert.throws(
+      () =>
+        compileHubConfig(
+          withStep({
+            id: "work",
+            environment: "runner",
+            max_runtime: "10m",
+            script: "true",
+            complete_on_turn_end: true,
+          }),
+        ),
+      /complete_on_turn_end/u,
+    );
+  });
+
+  it("re-checks the contract for stored compiled JSON", () => {
+    const compiled = compileHubConfig(withStep(authoredStep({})));
+    assert.equal(
+      agentStep(parseCompiledHubConfig(compiled).triggers[0]?.steps[0]).completeOnTurnEnd,
+      true,
+    );
+    const stored = (step: Record<string, unknown>) => ({
+      ...compiled,
+      triggers: [
+        { ...compiled.triggers[0]!, steps: [{ ...compiled.triggers[0]!.steps[0]!, ...step }] },
+      ],
+    });
+    assert.throws(
+      () => parseCompiledHubConfig(stored({ output: { schema: { type: "object" } } })),
+      /invalid compiled workflow contract/iu,
+    );
+    assert.throws(
+      () =>
+        parseCompiledHubConfig(
+          stored({ allowOutputs: [{ type: "manual.reply", max: 1, required: true }] }),
+        ),
+      /invalid compiled workflow contract/iu,
+    );
+  });
+});

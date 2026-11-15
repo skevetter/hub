@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
+import type { AgentExecutionRecord } from "../db/types.js";
+import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import { mayCompleteOnTurnEnd } from "./lifecycle.js";
 import type { AgentEvent } from "./agents/index.js";
 import { MAX_TURN_END_OUTPUT_CHARS, TurnEndTracker } from "./turn-end.js";
 import { registerTurnEndScenarios } from "./test-utils/turn-end-scenarios.js";
@@ -123,6 +126,87 @@ describe("turn end tracker", () => {
 function wellFormed(value: string | undefined): boolean {
   return value !== undefined && Buffer.from(value, "utf8").toString("utf8") === value;
 }
+
+describe("runtime guard for a launch intent that skipped compile-time validation", () => {
+  async function stored(
+    intent: Partial<LaunchMachineIntent>,
+    record: Partial<AgentExecutionRecord> = {},
+  ) {
+    const database = createMemoryDatabase({ organizationIds: ["org-guard"] });
+    const base: LaunchMachineIntent = {
+      kind: "launch_machine",
+      organizationId: "org-guard",
+      projectId: "project-guard",
+      triggerRunId: "run-guard",
+      triggerName: "guard",
+      environmentName: "runner",
+      environment: {
+        kind: "daemon",
+        daemonId: "daemon-guard",
+        authoredSlug: "runner",
+        cwd: "/repo",
+      },
+      agent: { provider: "claude" },
+      prompt: "work",
+      allowOutputs: [],
+      autoArchive: false,
+      background: false,
+      completeOnTurnEnd: true,
+      triggerContext: {},
+      outputContext: {},
+      configurationRevisionId: "revision-guard",
+      hubConfig: {},
+    };
+    const execution = await database.insertAgentExecution({
+      id: "00000000-0000-4000-8000-0000000000a1",
+      organizationId: "org-guard",
+      projectId: "project-guard",
+      machineId: null,
+      triggerContext: {},
+      outputContext: {},
+      configurationRevisionId: "revision-guard",
+      launchIntent: { ...base, ...intent },
+    });
+    return { ...execution, ...record };
+  }
+
+  it("allows an opted-in running execution with no output contract", async () => {
+    assert.equal(mayCompleteOnTurnEnd(await stored({})), true);
+  });
+
+  it.each([
+    ["the option is off", { completeOnTurnEnd: false }],
+    ["a structured output is declared", { outputSchema: { type: "object" } }],
+    [
+      "a required output is declared",
+      { allowOutputs: [{ type: "manual.reply", max: 1, required: true }] },
+    ],
+  ])("blocks when %s", async (_label, intent) => {
+    assert.equal(mayCompleteOnTurnEnd(await stored(intent)), false);
+  });
+
+  it("blocks a terminal execution, an explicit finish, and a finish call in flight", async () => {
+    assert.equal(mayCompleteOnTurnEnd(await stored({}, { status: "succeeded" })), false);
+    assert.equal(mayCompleteOnTurnEnd(await stored({}, { completedByAgentAt: new Date() })), false);
+    const call = (status: "running" | "completed" | "failed" | "canceled") => ({
+      hubActionAcknowledgements: {
+        terminalAt: null,
+        idleAt: null,
+        finishExecutionCall: {
+          callId: "c",
+          status,
+          observedAt: new Date(),
+          output: null,
+          at: new Date(),
+        },
+      },
+    });
+    assert.equal(mayCompleteOnTurnEnd(await stored({}, call("running"))), false);
+    assert.equal(mayCompleteOnTurnEnd(await stored({}, call("completed"))), false);
+    assert.equal(mayCompleteOnTurnEnd(await stored({}, call("failed"))), true);
+    assert.equal(mayCompleteOnTurnEnd(await stored({}, call("canceled"))), true);
+  });
+});
 
 describe("turn end output cut", () => {
   it("drops a high surrogate left at the cut and keeps a whole pair that fits", () => {

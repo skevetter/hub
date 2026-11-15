@@ -52,7 +52,7 @@ run:
 ```
 
 In the trigger form it is the checkbox **Complete when the agent ends its turn**. Exported
-trigger YAML includes the key only when it is `true`.
+trigger YAML keeps the key as authored: `true` and `false` stay, and an unset key stays unset.
 
 ### What it does
 
@@ -82,7 +82,7 @@ again, asks the daemon for the agent's status, and completes the step only if th
 These cases do not complete, and fail or time out as before:
 
 - A turn that is still running, including a tool call in flight.
-- A turn waiting for a permission or for input. It has not ended.
+- A turn waiting for a provider permission or question request. It has not ended.
 - A turn that errored or was canceled.
 - A daemon that cannot be reached when Hub checks.
 - A turn shared by several queued prompts of one continuation. One turn cannot be matched to one
@@ -106,8 +106,17 @@ turn carries free text, so it cannot satisfy either contract. Use the prompt lin
 If an agent ends a turn expecting to continue later, for example after starting background work,
 the run completes at that turn end. Leave the setting off for such prompts.
 
+A turn that ends by asking a question in plain text has ended normally. The run completes as
+succeeded, with the question as `output`. Only a provider permission or question request keeps a
+turn open.
+
+Hub checks the agent's status once, when the settle wait ends. If that lookup fails for a transient
+reason, Hub does not retry it, and the run uses the idle timeout. A new turn that starts within a
+few milliseconds of Hub writing the completion can still lose the race: the run is already
+succeeded.
+
 ## Recommendation
 
 For the most reliable runs, use both: the prompt line and `complete_on_turn_end: true`. The prompt
-line makes the agent finish on its own and gives you a structured, explicit finish. The setting
-catches the rest.
+line makes the agent finish on its own and gives you an explicit finish. The setting catches the
+rest.

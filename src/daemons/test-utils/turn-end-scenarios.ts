@@ -352,7 +352,7 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
       }
     });
 
-    it("never completes a step that declares a structured or required output", async () => {
+    it("never completes a stored launch intent that skipped compile-time validation and declares a structured or required output", async () => {
       for (const contract of [
         { outputSchema: { type: "object" } },
         { requiredOutput: true },

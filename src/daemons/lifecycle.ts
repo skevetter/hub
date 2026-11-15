@@ -2029,7 +2029,7 @@ function isTerminalExecutionStatus(status: AgentExecutionRecord["status"]): bool
  * agent has not finished explicitly, a finish call is not still in flight, and the step has no
  * output contract that free text could not meet.
  */
-function mayCompleteOnTurnEnd(execution: AgentExecutionRecord): boolean {
+export function mayCompleteOnTurnEnd(execution: AgentExecutionRecord): boolean {
   const intent = execution.launchIntent;
   if (isTerminalExecutionStatus(execution.status)) return false;
   if (intent?.completeOnTurnEnd !== true || execution.completedByAgentAt !== null) return false;
