@@ -77,9 +77,11 @@ export class TurnEndTracker {
   finalOutput(): { text: string; truncated: boolean } | undefined {
     const text = this.text.trim();
     if (text.length === 0) return undefined;
-    return text.length > MAX_TURN_END_OUTPUT_CHARS
-      ? { text: text.slice(0, MAX_TURN_END_OUTPUT_CHARS), truncated: true }
-      : { text, truncated: false };
+    if (text.length <= MAX_TURN_END_OUTPUT_CHARS) return { text, truncated: false };
+    return {
+      text: withoutSplitSurrogate(text.slice(0, MAX_TURN_END_OUTPUT_CHARS)),
+      truncated: true,
+    };
   }
 
   private interrupt(clearText: boolean): TurnEndVerdict {
@@ -99,4 +101,10 @@ export class TurnEndTracker {
     if (messageId !== undefined) this.messageId = messageId;
     this.text += text;
   }
+}
+
+/** A cut inside a surrogate pair leaves a lone surrogate, which Postgres jsonb rejects. */
+function withoutSplitSurrogate(text: string): string {
+  const last = text.charCodeAt(text.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? text.slice(0, -1) : text;
 }

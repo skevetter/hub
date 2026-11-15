@@ -2,14 +2,12 @@ import assert from "node:assert/strict";
 import { describe, it, vi } from "vitest";
 import type { Database } from "../../db/types.js";
 import { deriveAgentExecutionCompletionToken } from "../../agent-executions/completion-token.js";
-import { TURN_END_COMPLETION, TURN_END_SETTLE_MS } from "../turn-end.js";
+import { MAX_TURN_END_OUTPUT_CHARS, TURN_END_COMPLETION, TURN_END_SETTLE_MS } from "../turn-end.js";
 import { IDLE_TIMEOUT_MS, turnEndFixture, type TurnEndFixtureOptions } from "./turn-end-fixture.js";
 
 export interface TurnEndDatabase {
   database: Database;
   organizationId: string;
-  /** How long Hub's event handlers need to reach the database. Zero for memory. */
-  eventLagMs?: number;
 }
 
 const SETTLED = TURN_END_SETTLE_MS + 1;
@@ -33,13 +31,8 @@ async function transitionedCount(results: ReadonlyArray<{ value: unknown }>): Pr
 /** The same scenarios run against every database implementation the engine can use. */
 export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndDatabase>): void {
   async function open(options: Partial<TurnEndFixtureOptions> = {}) {
-    const { database, organizationId, eventLagMs } = await openDatabase();
-    return turnEndFixture({
-      database,
-      organizationId,
-      ...(eventLagMs === undefined ? {} : { eventLagMs }),
-      ...options,
-    });
+    const { database, organizationId } = await openDatabase();
+    return turnEndFixture({ database, organizationId, ...options });
   }
 
   describe.each([
@@ -111,6 +104,29 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
 
         const done = await fixture.execution(execution.id);
         assert.deepEqual(done.result, { status: "succeeded", completion: TURN_END_COMPLETION });
+      } finally {
+        await fixture.lifecycle.stop();
+      }
+    });
+
+    it("cuts a long closing text without splitting a surrogate pair", async () => {
+      const fixture = await open({ workflow, completeOnTurnEnd: true });
+      try {
+        const { execution, step } = await fixture.dispatch();
+        // The emoji straddles the cut, so a plain slice would leave a lone high surrogate.
+        await fixture.endTurn(`${"x".repeat(MAX_TURN_END_OUTPUT_CHARS - 1)}\u{1F600}`);
+        await fixture.clock.advance(SETTLED);
+
+        const done = await fixture.execution(execution.id);
+        assert.equal(done.status, "succeeded");
+        assert.equal(resultField(done.result, "output"), "x".repeat(MAX_TURN_END_OUTPUT_CHARS - 1));
+        assert.equal(resultField(done.result, "outputTruncated"), true);
+        if (step !== undefined) {
+          assert.equal(
+            (await fixture.database.findWorkflowStepRunById(step.id))?.status,
+            "succeeded",
+          );
+        }
       } finally {
         await fixture.lifecycle.stop();
       }

@@ -29,6 +29,6 @@ describe("daemon lifecycle with PostgreSQL", () => {
       organizationId,
     ]);
     await client.close();
-    return { database, organizationId, eventLagMs: 60 };
+    return { database, organizationId };
   });
 });

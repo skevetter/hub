@@ -119,6 +119,28 @@ describe("turn end tracker", () => {
   });
 });
 
+/** A lone surrogate does not survive UTF-8, which is what Postgres stores. */
+function wellFormed(value: string | undefined): boolean {
+  return value !== undefined && Buffer.from(value, "utf8").toString("utf8") === value;
+}
+
+describe("turn end output cut", () => {
+  it("drops a high surrogate left at the cut and keeps a whole pair that fits", () => {
+    const split = new TurnEndTracker();
+    split.observe(text(`${"x".repeat(MAX_TURN_END_OUTPUT_CHARS - 1)}\u{1F600}`));
+    const cut = split.finalOutput();
+    assert.equal(cut?.text, "x".repeat(MAX_TURN_END_OUTPUT_CHARS - 1));
+    assert.equal(cut?.truncated, true);
+    assert.equal(wellFormed(cut?.text), true);
+
+    const fits = new TurnEndTracker();
+    fits.observe(text(`${"x".repeat(MAX_TURN_END_OUTPUT_CHARS - 2)}\u{1F600}x`));
+    const kept = fits.finalOutput();
+    assert.equal(kept?.text.endsWith("\u{1F600}"), true);
+    assert.equal(wellFormed(kept?.text), true);
+  });
+});
+
 describe("daemon lifecycle with the in-memory database", () => {
   registerTurnEndScenarios(async () => ({
     database: createMemoryDatabase({ organizationIds: ["org-turn-end"] }),

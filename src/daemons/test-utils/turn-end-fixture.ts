@@ -53,8 +53,6 @@ export class ManualClock implements ExecutionDeadlineClock {
 export interface TurnEndFixtureOptions {
   database: Database;
   organizationId: string;
-  /** Real time to let Hub's event handlers reach a networked database. */
-  eventLagMs?: number;
   /** Run the execution as a workflow step, so the step output can be read back. */
   workflow?: boolean;
   completeOnTurnEnd?: boolean;
@@ -85,6 +83,7 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
   });
   await database.activateProjectConfigurationRevision(project.id, revision.id);
   const clock = new ManualClock();
+  const executionIds: string[] = [];
   const failures = new FailureLogStream();
   const state = { status: "idle" as "idle" | "running", statusFails: false };
   const listeners = new Set<(event: AgentEvent) => void>();
@@ -204,6 +203,7 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
       hubConfig: {},
     };
     const { execution } = await lifecycle.dispatchLaunchMachineIntent(intent);
+    executionIds.push(execution.id);
     return { execution, step };
   }
 
@@ -219,7 +219,12 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
   /** Delivers an event the way the daemon would, then lets Hub's handlers finish. */
   async function deliver(event: AgentEvent): Promise<void> {
     emit(event);
-    await flush(options.eventLagMs);
+    await handled();
+  }
+
+  /** Waits on Hub's own per-execution event queue instead of guessing how long it takes. */
+  async function handled(): Promise<void> {
+    await Promise.all(executionIds.map((id) => lifecycle.waitForPendingStreamHandlers(id)));
   }
 
   return {
@@ -233,7 +238,7 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
     dispatch,
     deliver,
     stream,
-    flush: () => flush(options.eventLagMs),
+    flush: handled,
     events: {
       turnStarted: () => stream({ type: "turn_started", provider }),
       turnCompleted: () => stream({ type: "turn_completed", provider }),
@@ -271,9 +276,4 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
       return found;
     },
   };
-}
-
-export async function flush(lagMs = 0): Promise<void> {
-  for (let turn = 0; turn < 5; turn++) await new Promise<void>((resolve) => setImmediate(resolve));
-  if (lagMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, lagMs));
 }

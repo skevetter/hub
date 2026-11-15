@@ -1751,7 +1751,8 @@ export class DaemonDispatchLifecycle {
     }
   }
 
-  private async waitForPendingStreamHandlers(executionId: string): Promise<void> {
+  /** Resolves once every daemon event already received for the execution has been handled. */
+  async waitForPendingStreamHandlers(executionId: string): Promise<void> {
     await this.pendingStreamHandlersByExecution.get(executionId)?.catch(() => undefined);
   }
 
