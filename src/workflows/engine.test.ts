@@ -95,6 +95,12 @@ describe("durable multi-step workflow engine", () => {
         );
         assert.ok(execution);
         assert.equal(intent.background, intent.triggerName === "first");
+        assert.equal(intent.completeOnTurnEnd, intent.triggerName === "first" ? true : undefined);
+        assert.equal("completeOnTurnEnd" in intent, intent.triggerName === "first");
+        assert.equal(
+          execution.launchIntent?.completeOnTurnEnd,
+          intent.triggerName === "first" ? true : undefined,
+        );
         assert.deepEqual(intent.continuation?.compatibility, {
           agent: intent.agent,
           target: fixture.configuration.environments[0],
@@ -2347,7 +2353,7 @@ function executionWorktreeConfiguration(): Record<string, unknown> {
     max_runtime: "10m",
     idle_timeout: "1m",
     agent: { provider: "codex" },
-    ...(title === undefined ? {} : { title, background: true }),
+    ...(title === undefined ? {} : { title, background: true, complete_on_turn_end: true }),
     prompt: [{ text: "Do the work." }],
   });
   return {

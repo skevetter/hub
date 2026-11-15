@@ -55,6 +55,7 @@ import type { JsonValue } from "../config/compiler.js";
 import { compileJsonSchema, formatJsonSchemaErrors } from "../workflows/json-schema.js";
 import type { Logger } from "pino";
 import { isHubFinishExecutionToolName } from "../hub/protocol.js";
+import { TURN_END_COMPLETION, TURN_END_SETTLE_MS, TurnEndTracker } from "./turn-end.js";
 
 export interface DaemonDispatchResult {
   execution: AgentExecutionRecord;
@@ -163,6 +164,8 @@ export class DaemonDispatchLifecycle {
   private readonly reconcilingHubActions = new Map<string, Promise<void>>();
   private readonly daemonRecoveries = new Set<Promise<void>>();
   private readonly executionSubscriptions = new Map<string, () => void>();
+  private readonly turnEnds = new Map<string, TurnEndTracker>();
+  private readonly turnEndTimers = new Map<string, () => void>();
   private stopping = false;
 
   constructor(private readonly options: DaemonDispatchLifecycleOptions) {
@@ -182,6 +185,9 @@ export class DaemonDispatchLifecycle {
     this.executionSubscriptions.clear();
     for (const clear of this.deadlineTimersByExecution.values()) clear();
     this.deadlineTimersByExecution.clear();
+    for (const clear of this.turnEndTimers.values()) clear();
+    this.turnEndTimers.clear();
+    this.turnEnds.clear();
     this.startedExecutions.clear();
     await Promise.allSettled([
       ...this.daemonRecoveries,
@@ -1122,7 +1128,13 @@ export class DaemonDispatchLifecycle {
 
   private async completeAgentExecution(
     executionId: string,
-    options: { completedByAgent?: boolean; output?: unknown; deferHubAction?: boolean } = {},
+    options: {
+      completedByAgent?: boolean;
+      output?: unknown;
+      deferHubAction?: boolean;
+      /** Set when the agent's turn ended without finish_execution; null when it said nothing. */
+      turnEnd?: { text: string; truncated: boolean } | null;
+    } = {},
   ): Promise<AgentExecutionRecord> {
     const existing = await this.options.database.findAgentExecutionById(executionId);
     if (existing === undefined) throw new Error(`agent execution not found: ${executionId}`);
@@ -1130,19 +1142,29 @@ export class DaemonDispatchLifecycle {
       existing.launchIntent?.outputSchema === undefined || options.output === undefined
         ? undefined
         : jsonValue(options.output);
+    const inferred =
+      options.turnEnd === undefined
+        ? undefined
+        : {
+            status: "succeeded" as const,
+            completion: TURN_END_COMPLETION,
+            ...(options.turnEnd === null ? {} : { output: options.turnEnd.text }),
+            ...(options.turnEnd?.truncated === true ? { outputTruncated: true } : {}),
+          };
     const transition = await this.transitionTerminalAgentExecution(
       executionId,
       "succeeded",
       {
         result:
-          structuredOutput === undefined
+          inferred ??
+          (structuredOutput === undefined
             ? { status: "succeeded" }
-            : { status: "succeeded", output: options.output },
+            : { status: "succeeded", output: options.output }),
         completedByAgent: options.completedByAgent === true,
       },
       {
         stepStatus: "succeeded",
-        stepOutput: structuredOutput,
+        stepOutput: inferred ?? structuredOutput,
       },
     );
     if (!transition.transitioned) {
@@ -1153,6 +1175,7 @@ export class DaemonDispatchLifecycle {
     }
 
     this.clearExecutionDeadline(executionId);
+    this.clearTurnEnd(executionId);
 
     const { execution } = transition;
     const deferArchiveAcknowledgement =
@@ -1548,9 +1571,10 @@ export class DaemonDispatchLifecycle {
         executionId: input.executionId,
         intent: input.intent,
         connection: connection.agents,
-        ...(input.beforePromptSend === undefined
-          ? {}
-          : { beforePromptSend: input.beforePromptSend }),
+        beforePromptSend: () => {
+          this.watchForTurnEnd(input.executionId, input.intent);
+          input.beforePromptSend?.();
+        },
         createOptions: () =>
           this.buildCreateAgentOptions(input.intent, input.hubExecutionEnv).catch(
             (error: unknown) => {
@@ -1574,6 +1598,8 @@ export class DaemonDispatchLifecycle {
   }
 
   private observeSessionEvent(executionId: string, daemonId: string, event: AgentEvent): void {
+    const turnEnd = this.turnEnds.get(executionId);
+    if (turnEnd !== undefined) this.observeTurnEnd(executionId, turnEnd, event);
     const normalized =
       event.type === "agent_stream"
         ? { ...event, executionId }
@@ -1654,6 +1680,77 @@ export class DaemonDispatchLifecycle {
     );
   }
 
+  /** Starts following turn ends for an opted-in execution; events before this are not counted. */
+  private watchForTurnEnd(executionId: string, intent: LaunchMachineIntent): void {
+    this.clearTurnEnd(executionId);
+    if (intent.completeOnTurnEnd === true) this.turnEnds.set(executionId, new TurnEndTracker());
+  }
+
+  private clearTurnEnd(executionId: string): void {
+    this.turnEndTimers.get(executionId)?.();
+    this.turnEndTimers.delete(executionId);
+    this.turnEnds.delete(executionId);
+  }
+
+  private observeTurnEnd(executionId: string, tracker: TurnEndTracker, event: AgentEvent): void {
+    const verdict = tracker.observe(event);
+    if (verdict === "none") return;
+    this.turnEndTimers.get(executionId)?.();
+    this.turnEndTimers.delete(executionId);
+    if (verdict !== "finished") return;
+    const generation = tracker.currentGeneration;
+    const clear = this.scheduleDeadline(async () => {
+      this.turnEndTimers.delete(executionId);
+      await this.completeFinishedTurn(executionId, generation).catch((error: unknown) => {
+        this.report(error, "daemon.execution.turn-end", { executionId });
+      });
+    }, TURN_END_SETTLE_MS);
+    this.turnEndTimers.set(executionId, clear);
+  }
+
+  /**
+   * Completes an opted-in execution whose agent ended its turn without calling finish_execution.
+   * Every check that can say no runs again here, after the settle period, because the state that
+   * armed the timer may have changed. An explicit finish that wins the race is left alone: the
+   * transition below changes only an execution that is still running.
+   */
+  private async completeFinishedTurn(executionId: string, generation: number): Promise<void> {
+    await this.waitForPendingStreamHandlers(executionId);
+    const tracker = this.turnEnds.get(executionId);
+    if (this.stopping || tracker === undefined || !tracker.isCurrent(generation)) return;
+    const execution = await this.options.database.findAgentExecutionById(executionId);
+    if (execution === undefined || !mayCompleteOnTurnEnd(execution)) return;
+    if (await this.expireExecutionIfDeadlineElapsed(execution)) return;
+    if (await this.hasOtherActiveSessionExecution(execution)) return;
+    if (!(await this.agentIsIdle(execution))) return;
+    if (!tracker.isCurrent(generation)) return;
+    await this.completeAgentExecution(executionId, { turnEnd: tracker.finalOutput() ?? null });
+  }
+
+  /** One agent turn can serve several queued prompts, so it cannot be tied to one execution. */
+  private async hasOtherActiveSessionExecution(execution: AgentExecutionRecord): Promise<boolean> {
+    if (execution.agentSessionId === null) return false;
+    const siblings = await this.options.database.listAgentSessionExecutions(
+      execution.agentSessionId,
+    );
+    return siblings.some(
+      (other) => other.id !== execution.id && !isTerminalExecutionStatus(other.status),
+    );
+  }
+
+  /** The daemon's own answer, not the events Hub happened to see. */
+  private async agentIsIdle(execution: AgentExecutionRecord): Promise<boolean> {
+    if (execution.daemonId === null || execution.daemonAgentId === null) return false;
+    const connection = this.options.connectionForDaemon(execution.daemonId);
+    if (connection === undefined) return false;
+    try {
+      return (await connection.agents.get(execution.daemonAgentId)).status === "idle";
+    } catch (error) {
+      this.report(error, "daemon.execution.turn-end.status", { executionId: execution.id });
+      return false;
+    }
+  }
+
   private async waitForPendingStreamHandlers(executionId: string): Promise<void> {
     await this.pendingStreamHandlersByExecution.get(executionId)?.catch(() => undefined);
   }
@@ -1722,6 +1819,7 @@ export class DaemonDispatchLifecycle {
   private releaseExecutionResources(executionId: string): void {
     this.executionSubscriptions.get(executionId)?.();
     this.executionSubscriptions.delete(executionId);
+    this.clearTurnEnd(executionId);
   }
 
   private async expireExecutionAtCurrentDeadline(
@@ -1923,6 +2021,23 @@ export function createDaemonDispatchLifecycle(
 
 function isTerminalExecutionStatus(status: AgentExecutionRecord["status"]): boolean {
   return status === "succeeded" || status === "failed";
+}
+
+/**
+ * A finished turn stands in for finish_execution only when nothing else owns the outcome: the
+ * agent has not finished explicitly, a finish call is not still in flight, and the step has no
+ * output contract that free text could not meet.
+ */
+function mayCompleteOnTurnEnd(execution: AgentExecutionRecord): boolean {
+  const intent = execution.launchIntent;
+  if (isTerminalExecutionStatus(execution.status)) return false;
+  if (intent?.completeOnTurnEnd !== true || execution.completedByAgentAt !== null) return false;
+  if (intent.outputSchema !== undefined) return false;
+  if (intent.allowOutputs.some((output) => output.required === true)) return false;
+  const finishCall = execution.hubActionAcknowledgements.finishExecutionCall;
+  return (
+    finishCall === null || (finishCall.status !== "running" && finishCall.status !== "completed")
+  );
 }
 
 function isHubFinishExecutionStatus(
