@@ -291,3 +291,22 @@ test("a capture that fails for another reason fails the run and still kills", as
   expect(result.failureReason).toContain("terminal worker unavailable");
   expect(daemon.killed).toEqual(["terminal-1"]);
 });
+
+test("liveness checks list by the workspace the daemon chose, name recovery by directory", async () => {
+  const { daemon, clock, run } = setup();
+  clock.at(1_000, () => daemon.exit(0));
+  await run();
+  expect(daemon.listRequests[0]).toMatchObject({
+    type: "list_terminals_request",
+    workspaceId: "ws-1",
+  });
+  expect(daemon.listRequests[0]).not.toHaveProperty("cwd");
+
+  const lost = setup();
+  lost.daemon.client.create = async () => {
+    throw new DaemonResponseLostError();
+  };
+  await lost.run();
+  expect(lost.daemon.listRequests[0]).toMatchObject({ cwd: "/work/webapp" });
+  expect(lost.daemon.listRequests[0]).not.toHaveProperty("workspaceId");
+});

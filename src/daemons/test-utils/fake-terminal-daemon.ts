@@ -68,6 +68,7 @@ export class FakeTerminalDaemon {
   readonly created: CreatedTerminal[] = [];
   readonly killed: string[] = [];
   readonly requests: Record<string, unknown>[] = [];
+  readonly listRequests: Record<string, unknown>[] = [];
   readonly terminals = new Map<string, FakeTerminal>();
   /** Request types answered with a permission refusal. */
   readonly denied = new Set<string>();
@@ -135,6 +136,7 @@ export class FakeTerminalDaemon {
     }
     if (type === "create_terminal_request") return this.create(message);
     if (type === "list_terminals_request") {
+      this.listRequests.push(message);
       return this.reply("list_terminals_response", {
         requestId,
         terminals: [...this.terminals.values()]

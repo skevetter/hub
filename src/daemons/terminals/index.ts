@@ -25,7 +25,8 @@ export interface TerminalCapture {
 /** What Hub needs from a daemon's terminal channel. The wire never reports an exit code. */
 export interface TerminalConnection {
   create(options: CreateTerminalOptions, timeoutMs?: number): Promise<TerminalInfo>;
-  list(cwd: string): Promise<readonly TerminalInfo[]>;
+  /** Lists a workspace's terminals by its id when known, else by directory. */
+  list(scope: { cwd: string; workspaceId?: string | undefined }): Promise<readonly TerminalInfo[]>;
   /** A negative `start` counts from the end of the scrollback. */
   capture(terminalId: string, start: number): Promise<TerminalCapture>;
   kill(terminalId: string): Promise<void>;
@@ -135,9 +136,16 @@ export class DaemonTerminals implements TerminalConnection {
     return response.terminal;
   }
 
-  async list(cwd: string): Promise<readonly TerminalInfo[]> {
+  async list(scope: {
+    cwd: string;
+    workspaceId?: string | undefined;
+  }): Promise<readonly TerminalInfo[]> {
+    const { cwd, workspaceId } = scope;
     const response = ListResponseSchema.parse(
-      await this.request({ type: "list_terminals_request", cwd }),
+      await this.request({
+        type: "list_terminals_request",
+        ...(workspaceId === undefined ? { cwd } : { workspaceId }),
+      }),
     );
     return response.terminals.flatMap((terminal) =>
       terminal.id === undefined || terminal.name === undefined

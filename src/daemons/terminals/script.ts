@@ -99,6 +99,7 @@ export async function runScript(
   const markerId = clock.random();
   const { command, args } = scriptTerminalCommand(markerId, input.script, input.eventJson);
   let terminalId: string | undefined;
+  let workspaceId: string | undefined;
   try {
     try {
       const terminal = await terminals.create({
@@ -109,12 +110,21 @@ export async function runScript(
         size: TERMINAL_SIZE,
       });
       terminalId = terminal.id;
+      workspaceId = terminal.workspaceId;
       await input.onTerminal?.({ id: terminal.id });
     } catch (error) {
       if (error instanceof DaemonResponseLostError) await killByName(terminals, input);
       return refused(error, input.cwd);
     }
-    return await poll(terminals, terminalId, markerId, deadlineAt, input, clock);
+    return await poll(
+      terminals,
+      terminalId,
+      markerId,
+      deadlineAt,
+      { cwd: input.cwd, workspaceId },
+      input,
+      clock,
+    );
   } finally {
     if (terminalId !== undefined) await terminals.kill(terminalId).catch(() => undefined);
   }
@@ -137,7 +147,7 @@ async function killByName(
   target: { cwd: string; name: string },
 ): Promise<void> {
   try {
-    const found = await terminals.list(target.cwd);
+    const found = await terminals.list({ cwd: target.cwd });
     await Promise.all(
       found.filter(({ name }) => name === target.name).map(({ id }) => terminals.kill(id)),
     );
@@ -151,6 +161,7 @@ async function poll(
   terminalId: string,
   markerId: string,
   deadlineAt: number,
+  scope: { cwd: string; workspaceId: string | undefined },
   input: ScriptRunInput,
   clock: ScriptRunnerClock,
 ): Promise<ScriptRunResult> {
@@ -198,7 +209,7 @@ async function poll(
       lastTotal = capture.totalLines;
       continue;
     }
-    if (!(await stillListed(terminals, terminalId, input.cwd))) {
+    if (!(await stillListed(terminals, terminalId, scope))) {
       return {
         ...tailOf(lastLines, lastTotal),
         status: "failed",
@@ -221,10 +232,10 @@ function isCapture(value: unknown): value is TerminalCapture {
 async function stillListed(
   terminals: TerminalConnection,
   terminalId: string,
-  cwd: string,
+  scope: { cwd: string; workspaceId: string | undefined },
 ): Promise<boolean> {
   try {
-    return (await terminals.list(cwd)).some(({ id }) => id === terminalId);
+    return (await terminals.list(scope)).some(({ id }) => id === terminalId);
   } catch {
     return true;
   }
