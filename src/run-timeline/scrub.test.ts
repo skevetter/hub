@@ -585,6 +585,10 @@ describe("stored-text privacy contract: whole fields redact on sensitive labels 
   it("keeps median warmed adversarial 8 KiB calls below 20 ms without quadratic regex retries", () => {
     const scrub = createTimelineScrubber({ scrubValues: [PAYLOAD] });
     const adversarial = [
+      "-".repeat(8192),
+      "-".repeat(4096) + " ".repeat(4096),
+      "-".repeat(8186) + "BEGINX",
+      "-".repeat(8186) + "BEGIXN",
       "A".repeat(8192),
       "'\"=".repeat(2730) + "==",
       "=".repeat(8192),

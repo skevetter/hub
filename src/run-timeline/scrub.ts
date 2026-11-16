@@ -7,7 +7,7 @@ const PREFIX_TOKEN =
   /(?:paseo_(?:pk|cli)_|gh[pousr]_|github_pat_|xox[abprs]-|xapp-|lin_(?:api|oauth)_|AKIA|ASIA|sk-|AIza|sk_live_|rk_live_|whsec_)[A-Za-z0-9_+/-]*/gu;
 const JWT = /(?:^|[^A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2})/gu;
 const ENTROPY_RUN = /[A-Za-z0-9+/=_-]{32,}/gu;
-const ARMORED_START = /-{3,}\s*BEGIN\b/iu;
+const ARMORED_START = /(?<!-)-{3,}\s*BEGIN\b/iu;
 const SENSITIVE_LABEL = /pass|pwd|secret|token|key|auth|basic|bearer|cred|session|cookie|sig/iu;
 const ENCODED = /\\|%|&(?:#|[a-z][a-z0-9]*;)/iu;
 const ENTITIES: Readonly<Record<string, string>> = {
