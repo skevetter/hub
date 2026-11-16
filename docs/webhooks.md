@@ -270,10 +270,34 @@ read those runs can see their content. Keep API keys out of request bodies, quer
 application logs; do not print Authorization headers. A captured request without an idempotency
 key can be replayed, since v1 has no signature or timestamp protection.
 
-Before rolling back to an older Hub binary, revoke every key that includes events:send, including
-keys that also have older scopes. Older binaries cannot parse that scope and may fail credential
-authentication. The schema additions are additive; revocation must happen before the binary
-switch, not after an error. Restore service with newly created appropriate keys after upgrading.
+Before rolling back to the pre-webhook Hub binary, take a restorable database backup. Revocation
+alone is insufficient: the old API key list parses scopes on revoked rows too, and cannot parse
+events:send. Perform this procedure before switching binaries:
+
+1. While the current binary is still running, explicitly revoke every key containing events:send
+   in every organization, including keys with a mixture of old and new scopes. Stop senders.
+2. Stop all Hub processes and other database writers. Keep them stopped through cleanup and the
+   binary switch. Keep the additive schema and migration history; do not drop columns or undo
+   migrations.
+3. Run the complete [rollback cleanup SQL](webhook-rollback.sql) against the backed-up database,
+   using a SQL client that stops on errors. It uses one transaction and locks both key and token
+   tables. If any events:send key is still active, it refuses the entire cleanup without changing
+   any rows. Roll back a failed transaction, revoke the remaining keys with the current binary,
+   stop it again, then retry.
+4. Only after the transaction commits successfully, switch to the old binary and restart Hub.
+
+The SQL strips events:send from revoked mixed-scope keys, preserving their remaining scopes and
+revocation. It deletes revoked events:send-only key rows because neither an empty scope list nor
+invented replacement permissions are valid. These deleted key records are recoverable only from
+the backup. Old-scope-only keys, active or revoked, remain unchanged.
+
+Before stripping scopes or deleting keys, the SQL expires every unconsumed enrollment token issued
+by the affected keys. It then unlinks unconsumed tokens only for keys being deleted, retaining
+the expired token rows. Consumed tokens are unchanged. The current schema has no foreign key on
+token issued_by_api_key_id or daemon registered_by_api_key_id: consumed tokens and daemon history
+keep their original issuer UUID even when that key row is deleted. Existing daemons are not revoked
+or deleted. Retain the backup to resolve those historical issuer IDs. After upgrading again, create
+new appropriate keys and reconfigure senders; this cleanup does not restore revoked credentials.
 
 See the [public API](public-api.md) for the API reference, and
 [GitHub notification triggers](github-notifications.md) for polling notifications instead of
