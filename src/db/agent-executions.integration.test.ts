@@ -98,6 +98,26 @@ describe("agent execution PostgreSQL repository", () => {
         deadlineAt: new Date(Date.now() + 60_000),
         stepIds: ["step-one"],
       });
+      const activity = await fixture.database.findOrganizationActivityRun("org-1", created.run.id);
+      assert.ok(activity);
+      assert.equal(activity.run.id, created.run.id);
+      assert.equal(activity.receipt.id, receipt.event.providerEventReceiptId);
+      assert.deepEqual(activity.receipt.payload, {});
+      assert.deepEqual(
+        activity.steps.map((step) => step.stepId),
+        ["step-one"],
+      );
+      assert.equal(
+        await fixture.database.findOrganizationActivityRun("org-2", created.run.id),
+        undefined,
+      );
+      assert.equal(
+        await fixture.database.findOrganizationActivityRun(
+          "org-1",
+          "00000000-0000-4000-8000-000000000000",
+        ),
+        undefined,
+      );
       const intent = launchIntent(
         created.run.id,
         fixture.execution.configurationRevisionId,

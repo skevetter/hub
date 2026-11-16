@@ -2115,7 +2115,7 @@ class PgDatabase implements Database {
     );
     return {
       run: toTriggerRunRecord(row),
-      receipt: toProviderEventReceiptRecord(row),
+      receipt: toProviderEventReceiptRecord({ ...row, id: row.provider_event_receipt_id }),
       steps: steps.rows.map(toWorkflowStepRunRecord),
     };
   }
