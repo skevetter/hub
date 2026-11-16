@@ -777,6 +777,7 @@ export interface ProjectActivityRunRecord {
 export interface ProjectActivityRunListRecord {
   run: TriggerRunRecord;
   receipt: ProviderEventReceiptSummary;
+  webhookActor?: string;
 }
 
 export interface WorkflowStepRunRecord {

@@ -2,16 +2,13 @@ import { useSnapshotQuery } from "../queries/index.js";
 import { KeyRound } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
 import { EmptyState } from "../components/app/empty-state.js";
-import { FailureAlert, WarningAlert, failureMessage } from "../components/app/failure-alert.js";
+import { FailureAlert, failureMessage } from "../components/app/failure-alert.js";
 import { FormActions } from "../components/app/form-actions.js";
 import { FormDialog } from "../components/app/form-dialog.js";
-import { CopyField } from "../components/app/copy-field.js";
-import { CheckboxField } from "../components/app/checkbox-field.js";
-import { FormField } from "../components/app/form-field.js";
 import { PageHeader } from "../components/app/page.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { RowActions } from "../components/app/row-actions.js";
@@ -25,22 +22,22 @@ import {
   DialogHeader,
   DialogTitle,
 } from "../components/ui/dialog.js";
-import { FieldDescription, FieldError } from "../components/ui/field.js";
 import type { Result } from "../contract/respond.js";
-import { apiKeyScopeSchema, type ApiKeyScope } from "./api-key-contract.js";
+import type { ApiKeyScope } from "./api-key-contract.js";
 import { createApiKey, listApiKeys, revokeApiKey, revokeCliCredential } from "./functions.js";
 import { useActiveAccount } from "./active-account.js";
 import { API_KEY_MUTATION_KEY } from "./tenant-mutation.js";
-
-interface ApiKeyRecord {
-  id: string;
-  name: string;
-  prefix: string;
-  scopes: ApiKeyScope[];
-  createdAt: string;
-  lastUsedAt: string | null;
-  revokedAt: string | null;
-}
+import { triggerSnapshot } from "../triggers/functions.js";
+import { webhookSettings } from "../webhooks/functions.js";
+import {
+  API_KEY_COLUMNS,
+  ApiKeyFormFields,
+  ApiKeySecretContent,
+  ApiKeyTable,
+  apiKeyFormPayload,
+  type ApiKeyRecord,
+  type ApiKeyTriggerChoices,
+} from "./api-key-presentation.js";
 
 interface CliCredentialRecord {
   id: string;
@@ -64,49 +61,6 @@ const CREATE_FAILURE =
 const REVOKE_FAILURE =
   "Hub did not receive the API-key revocation result. Check your connection and reload the key list to confirm its status.";
 
-const SCOPE_OPTIONS = [
-  {
-    value: "projects:read",
-    label: "List projects",
-    description: "List active projects in the organization.",
-  },
-  {
-    value: "configuration:validate",
-    label: "Validate configuration",
-    description: "Validate configuration without creating a revision.",
-  },
-  {
-    value: "configuration:install",
-    label: "Install configuration",
-    description: "Replace and activate a project's configuration.",
-  },
-  {
-    value: "runs:dispatch",
-    label: "Start runs",
-    description: "Dispatch manual runs for a project.",
-  },
-  {
-    value: "daemons:enroll",
-    label: "Enroll daemons",
-    description: "Issue a daemon enrollment token.",
-  },
-] as const;
-
-const TABLE_COLUMNS = [
-  { header: "Name", fill: true },
-  { header: "Prefix" },
-  { header: "Scopes", fill: true },
-  { header: "Created" },
-  { header: "Last used" },
-  { header: "Status" },
-  { header: "", align: "end" as const },
-];
-
-const EMPTY_TABLE = {
-  title: "No API keys",
-  description:
-    "Create a key to install configuration, start runs, or enroll daemons from automation.",
-};
 const EMPTY_CLI_TABLE = {
   title: "No CLI logins",
   description: "Run paseo hub login to create one.",
@@ -182,18 +136,7 @@ export function ApiKeys() {
     [account.organization.id, create, queryClient],
   );
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      const form = new FormData(event.currentTarget);
-      const nameValue = form.get("name");
-      const name = typeof nameValue === "string" ? nameValue : "";
-      const scopes = form.getAll("scopes").flatMap((value): ApiKeyScope[] => {
-        if (typeof value !== "string") return [];
-        const parsed = apiKeyScopeSchema.safeParse(value);
-        return parsed.success ? [parsed.data] : [];
-      });
-      create.mutate({ data: { name, scopes } });
-    },
+    (data: Parameters<typeof createApiKey>[0]["data"]) => create.mutate({ data }),
     [create],
   );
   const header = (
@@ -225,7 +168,7 @@ export function ApiKeys() {
       <>
         {header}
         <Section>
-          <DataTableSkeleton label="API keys" columns={TABLE_COLUMNS} />
+          <DataTableSkeleton label="API keys" columns={API_KEY_COLUMNS} />
         </Section>
         <Section title={CLI_LOGINS.title} description={CLI_LOGINS.description}>
           <DataTableSkeleton label="CLI logins" columns={CLI_COLUMNS} rows={1} />
@@ -268,22 +211,12 @@ export function ApiKeys() {
         {revokeError === undefined ? null : (
           <FailureAlert title="API key not revoked" error={revokeError} fallback={REVOKE_FAILURE} />
         )}
-        <DataTable
-          label="API keys"
-          columns={TABLE_COLUMNS}
-          isEmpty={keys.length === 0}
-          empty={EMPTY_TABLE}
-        >
-          {keys.map((record) => (
-            <ApiKeyRow
-              key={record.id}
-              record={record}
-              canManage={account.capabilities.manageResources}
-              busy={revoke.isPending}
-              onRevoke={revoke.mutate}
-            />
-          ))}
-        </DataTable>
+        <ApiKeyTable
+          records={keys}
+          canManage={account.capabilities.manageResources}
+          busy={revoke.isPending}
+          onRevoke={revoke.mutate}
+        />
       </Section>
       <Section title={CLI_LOGINS.title} description={CLI_LOGINS.description}>
         <DataTable
@@ -303,6 +236,8 @@ export function ApiKeys() {
         </DataTable>
       </Section>
       <ApiKeyDialog
+        key={account.organization.id}
+        organizationSlug={account.organization.slug}
         open={creating}
         onOpenChange={close}
         secret={secret}
@@ -360,58 +295,9 @@ function CliCredentialRow({
   );
 }
 
-function ApiKeyRow({
-  record,
-  canManage,
-  busy,
-  onRevoke,
-}: {
-  record: ApiKeyRecord;
-  canManage: boolean;
-  busy: boolean;
-  onRevoke: (input: { data: { id: string } }) => void;
-}) {
-  const revoke = useCallback(() => onRevoke({ data: { id: record.id } }), [onRevoke, record.id]);
-  return (
-    <DataRow>
-      <DataCell>{record.name}</DataCell>
-      <DataCell>
-        <span className="font-mono text-xs">{record.prefix}</span>
-      </DataCell>
-      <DataCell muted>{record.scopes.map(scopeLabel).join(", ")}</DataCell>
-      <DataCell muted>
-        <RelativeTime value={record.createdAt} />
-      </DataCell>
-      <DataCell muted>
-        {record.lastUsedAt === null ? "Never" : <RelativeTime value={record.lastUsedAt} />}
-      </DataCell>
-      <DataCell>
-        <StatusPill tone={record.revokedAt === null ? "success" : "danger"}>
-          {record.revokedAt === null ? "Active" : "Revoked"}
-        </StatusPill>
-      </DataCell>
-      <DataCell>
-        {record.revokedAt === null && canManage ? (
-          <RowActions label={`Actions for ${record.name}`}>
-            <ConfirmMenuItem
-              label="Revoke"
-              destructive
-              title={`Revoke ${record.name}?`}
-              description="Any automation using this key stops working immediately. This cannot be undone."
-              confirmLabel="Revoke key"
-              cancelLabel="Cancel"
-              busy={busy}
-              onConfirm={revoke}
-            />
-          </RowActions>
-        ) : null}
-      </DataCell>
-    </DataRow>
-  );
-}
-
 function ApiKeyDialog({
   open,
+  organizationSlug,
   onOpenChange,
   secret,
   busy,
@@ -419,34 +305,75 @@ function ApiKeyDialog({
   onSubmit,
 }: {
   open: boolean;
+  organizationSlug: string;
   onOpenChange: (open: boolean) => void;
   secret: string | undefined;
   busy: boolean;
   error: string | undefined;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (data: Parameters<typeof createApiKey>[0]["data"]) => void;
 }) {
-  const [selectedScopes, setSelectedScopes] = useState(0);
+  const [name, setName] = useState("");
+  const [actorOverride, setActorOverride] = useState<string>();
+  const [selectedScopes, setSelectedScopes] = useState<ApiKeyScope[]>([]);
   const [scopeError, setScopeError] = useState<string>();
-  const updateScope = useCallback((checked: boolean) => {
-    setSelectedScopes((count) => count + (checked ? 1 : -1));
+  const [validationError, setValidationError] = useState<string>();
+  const loadTriggers = useServerFn(triggerSnapshot);
+  const snapshot = useSnapshotQuery({
+    queryKey: ["triggers", organizationSlug],
+    queryFn: () => loadTriggers({ data: { organizationSlug } }),
+    enabled: open,
+  });
+  const { data: triggerData, status: triggerStatus, error: triggerError } = snapshot;
+  const triggers = useMemo<ApiKeyTriggerChoices>(() => {
+    if (triggerStatus === "success") {
+      return {
+        status: "success",
+        data: {
+          names: triggerData.triggers
+            .filter((trigger) => trigger.event === "manual.run")
+            .map((trigger) => trigger.name)
+            .sort(),
+        },
+        error: null,
+      };
+    }
+    if (triggerStatus === "pending") {
+      return { status: "pending", data: undefined, error: null };
+    }
+    return { status: "error", data: undefined, error: triggerError };
+  }, [triggerData, triggerError, triggerStatus]);
+  const updateScope = useCallback((scope: ApiKeyScope, checked: boolean) => {
+    setSelectedScopes((scopes) =>
+      checked ? [...scopes, scope] : scopes.filter((value) => value !== scope),
+    );
   }, []);
   useEffect(() => {
     if (!open) {
-      setSelectedScopes(0);
+      setName("");
+      setActorOverride(undefined);
+      setSelectedScopes([]);
       setScopeError(undefined);
+      setValidationError(undefined);
     }
   }, [open]);
   // A key with no scopes can do nothing, and the server refuses it. Say so where the choice is
   // rather than greying out the submit, which explains nothing to whoever clicks it.
   const submit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
-      if (selectedScopes === 0) {
+      if (selectedScopes.length === 0) {
         event.preventDefault();
         setScopeError("Select at least one scope.");
         return;
       }
       setScopeError(undefined);
-      onSubmit(event);
+      event.preventDefault();
+      const payload = apiKeyFormPayload(new FormData(event.currentTarget));
+      if (!payload.success) {
+        setValidationError(payload.error.issues.map((issue) => issue.message).join(". "));
+        return;
+      }
+      setValidationError(undefined);
+      onSubmit(payload.data);
     },
     [onSubmit, selectedScopes],
   );
@@ -465,20 +392,23 @@ function ApiKeyDialog({
       busy={busy}
       onSubmit={submit}
     >
-      <FormField kind="text" id="api-key-name" name="name" label="Name" required />
-      <fieldset className="grid gap-3">
-        <legend>Scopes</legend>
-        <div className="grid gap-3">
-          {SCOPE_OPTIONS.map((option) => (
-            <ScopeOption key={option.value} option={option} onChange={updateScope} />
-          ))}
-        </div>
-        {scopeError === undefined ? (
-          <FieldDescription>Select at least one scope.</FieldDescription>
-        ) : (
-          <FieldError>{scopeError}</FieldError>
-        )}
-      </fieldset>
+      <ApiKeyFormFields
+        name={name}
+        actorOverride={actorOverride}
+        scopes={selectedScopes}
+        triggers={triggers}
+        scopeError={scopeError}
+        onNameChange={setName}
+        onActorChange={setActorOverride}
+        onScopeChange={updateScope}
+      />
+      {validationError === undefined ? null : (
+        <FailureAlert
+          title="Check API key details"
+          error={validationError}
+          fallback="Check the actor and allowed trigger names."
+        />
+      )}
       {error === undefined ? null : (
         <FailureAlert title="API key not created" error={error} fallback={CREATE_FAILURE} />
       )}
@@ -505,6 +435,12 @@ function SecretDialog({
     event.preventDefault();
   }, []);
 
+  const loadSettings = useServerFn(webhookSettings);
+  const settings = useSnapshotQuery({
+    queryKey: ["webhook-settings"],
+    queryFn: () => loadSettings({}),
+    enabled: open,
+  });
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -518,10 +454,7 @@ function SecretDialog({
             This key is shown once. Store it in your deployment secrets now.
           </DialogDescription>
         </DialogHeader>
-        <WarningAlert title="Save this key now">
-          This secret cannot be recovered after you close this dialog.
-        </WarningAlert>
-        <CopyField label="Generated API key" value={secret} copyLabel="Copy API key" focusOnMount />
+        <ApiKeySecretContent secret={secret} settings={settings} />
         <FormActions>
           <Button type="button" onClick={close}>
             Done
@@ -529,29 +462,5 @@ function SecretDialog({
         </FormActions>
       </DialogContent>
     </Dialog>
-  );
-}
-
-function scopeLabel(scope: ApiKeyScope): string {
-  return SCOPE_OPTIONS.find((option) => option.value === scope)?.label ?? scope;
-}
-
-/** A scope, its consequence, and the box that grants it. */
-function ScopeOption({
-  option,
-  onChange,
-}: {
-  option: (typeof SCOPE_OPTIONS)[number];
-  onChange: (checked: boolean) => void;
-}) {
-  return (
-    <CheckboxField
-      id={`api-key-scope-${option.value}`}
-      name="scopes"
-      value={option.value}
-      label={option.label}
-      description={option.description}
-      onChange={onChange}
-    />
   );
 }

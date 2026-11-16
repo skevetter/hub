@@ -256,6 +256,98 @@ describe("project dashboard activity read models", () => {
     assert.equal(JSON.stringify(unroutedEvent).includes("unrouted-unrouted"), false);
     assert.equal("rawPayload" in unroutedEvent, false);
   });
+
+  it("projects bounded webhook display data without adding receipt payloads to activity lists", async () => {
+    const database = createMemoryDatabase({
+      memberships: ["acme", "other"].map((slug, index) => ({
+        userId: "user-1",
+        organizationId: `org-${String(index + 1)}`,
+        organizationName: slug,
+        organizationSlug: slug,
+        membershipId: `membership-${slug}`,
+        role: "owner" as const,
+      })),
+    });
+    const project = await database.createProject({
+      organizationId: "org-1",
+      name: "Hub",
+      slug: "hub",
+      createdByUserId: "user-1",
+    });
+    const revision = await database.insertProjectConfigurationRevision({
+      projectId: project.id,
+      sourceKind: "manual",
+      sourceEvidence: {},
+      normalizedConfiguration: { environments: [], triggers: [] },
+      contentHash: "webhook-display",
+    });
+    await database.activateProjectConfigurationRevision(project.id, revision.id, []);
+    const prompt = `${"x".repeat(120)}private tail`;
+    const receipt = await database.persistManualEvent({
+      organizationId: "org-1",
+      projectId: project.id,
+      deliveryId: "webhook-display",
+      source: "webhook.received",
+      payload: {
+        actor: "ci-partner",
+        trigger: "build-finished",
+        input: prompt,
+        data: { internal: "raw-payload-only" },
+      },
+      receivedAt: new Date("2026-11-16T12:00:00.000Z"),
+    });
+    assert.equal(receipt.status, "accepted");
+    if (receipt.status !== "accepted") throw new Error("webhook receipt was not accepted");
+    const { run } = await database.createAcceptedTriggerRun({
+      organizationId: "org-1",
+      projectId: project.id,
+      configurationRevisionId: revision.id,
+      providerEventReceiptId: receipt.event.providerEventReceiptId,
+      configuredTriggerName: "build-finished",
+      prompt,
+      inputs: {},
+      triggerContext: {},
+      outputContext: {},
+      deadlineAt: new Date("2026-11-16T13:00:00.000Z"),
+      stepIds: [],
+    });
+    const records = await database.listProjectActivityRuns(project.id, 10);
+    assert.equal(records[0]?.webhookActor, "ci-partner");
+    assert.equal("payload" in records[0].receipt, false);
+    const dashboard = new ProjectDashboard(database, accountAuth());
+    const request = new Request("https://hub.test/o/acme/projects/hub");
+    const list = await dashboard.projectSnapshot(request, {
+      organizationSlug: "acme",
+      projectSlug: "hub",
+    });
+    const detail = await dashboard.activityRunDetail(request, {
+      organizationSlug: "acme",
+      runId: run.id,
+    });
+    const legacyDetail = await dashboard.activityRunSnapshot(request, {
+      organizationSlug: "acme",
+      projectSlug: "hub",
+      runId: run.id,
+    });
+    assert.ok(detail);
+    for (const activity of [list.activity[0]!, detail.run, legacyDetail.activity]) {
+      assert.equal(activity.provider, "manual");
+      assert.equal(activity.source, "webhook.received");
+      assert.equal(activity.webhookSummary?.headline, "Webhook from ci-partner");
+      assert.equal(activity.webhookSummary?.actor, "ci-partner");
+      assert.equal(activity.webhookSummary?.triggerName, "build-finished");
+      assert.equal(activity.webhookSummary?.prompt?.length, 120);
+      assert.equal(activity.webhookSummary?.prompt?.slice(0, 119), "x".repeat(119));
+      assert.equal(JSON.stringify(activity.webhookSummary).includes("private tail"), false);
+      assert.equal(JSON.stringify(activity.webhookSummary).includes("raw-payload-only"), false);
+    }
+    assert.equal(JSON.stringify(detail.run).includes("raw-payload-only"), false);
+    assert.equal("rawPayload" in list.activity[0]!, false);
+    assert.equal(
+      await dashboard.activityRunDetail(request, { organizationSlug: "other", runId: run.id }),
+      null,
+    );
+  });
 });
 
 function accountAuth(): AuthServer {

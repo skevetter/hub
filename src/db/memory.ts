@@ -1970,7 +1970,22 @@ class MemoryDatabase implements Database {
     return (await this.listTriggerRunsForProject(projectId, limit)).flatMap((run) => {
       const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
       if (receipt === undefined) return [];
-      return [{ run, receipt: toProviderEventReceiptRecordSummary(receipt) }];
+      const payload = receipt.payload;
+      const actor =
+        receipt.source === "webhook.received" &&
+        payload !== null &&
+        typeof payload === "object" &&
+        "actor" in payload &&
+        typeof payload.actor === "string"
+          ? payload.actor
+          : undefined;
+      return [
+        {
+          run,
+          receipt: toProviderEventReceiptRecordSummary(receipt),
+          ...(actor === undefined ? {} : { webhookActor: actor }),
+        },
+      ];
     });
   }
 

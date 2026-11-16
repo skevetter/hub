@@ -21,6 +21,7 @@ import { linearConnectionRequiresReauthorization } from "../providers/linear/cli
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { resolveRouteTenant } from "./access.js";
 import { ProjectCommandError } from "./command-error.js";
+import { summarizeTrigger, type TriggerSummary } from "./activity-summary.js";
 
 /** A jsonb column value, cast at the DB boundary so it survives the server-fn serializer. */
 export type JsonValue =
@@ -44,6 +45,7 @@ export interface ActivityRunDetail {
     outcome: TriggerRunRecord["outcome"];
     status: TriggerRunRecord["status"];
     failureReason: string | null;
+    webhookSummary?: TriggerSummary;
   };
   steps: {
     id: string;
@@ -183,6 +185,9 @@ export class ProjectDashboard {
         id: run.id,
         provider: receipt.provider,
         source: receipt.source,
+        ...(receipt.source === "webhook.received"
+          ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
+          : {}),
         repo: receipt.repo,
         receivedAt: receipt.receivedAt.toISOString(),
         configuredTriggerName: run.configuredTriggerName,
@@ -399,6 +404,9 @@ function activityRunView(
     provider: receipt.provider,
     deliveryId: receipt.deliveryId,
     source: receipt.source,
+    ...(receipt.source === "webhook.received"
+      ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
+      : {}),
     repo: receipt.repo,
     receivedAt: receipt.receivedAt.toISOString(),
     rawPayload: jsonValue(receipt.payload),
@@ -458,6 +466,15 @@ function activityRunListView(activity: ProjectActivityRunListRecord) {
     provider: receipt.provider,
     deliveryId: receipt.deliveryId,
     source: receipt.source,
+    ...(receipt.source === "webhook.received"
+      ? {
+          webhookSummary: summarizeTrigger(receipt.source, {
+            actor: activity.webhookActor,
+            input: run.prompt,
+            trigger: run.configuredTriggerName,
+          }),
+        }
+      : {}),
     repo: receipt.repo,
     receivedAt: receipt.receivedAt.toISOString(),
     configuredTriggerName: run.configuredTriggerName,

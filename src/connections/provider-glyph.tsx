@@ -1,4 +1,4 @@
-import { BellIcon, TerminalIcon, ClockIcon } from "lucide-react";
+import { BellIcon, TerminalIcon, ClockIcon, WebhookIcon } from "lucide-react";
 
 /**
  * Brand marks for the connection providers. Lucide dropped brand icons, and a generic
@@ -8,6 +8,7 @@ import { BellIcon, TerminalIcon, ClockIcon } from "lucide-react";
  */
 export function ProviderGlyph({
   provider,
+  source,
 }: {
   provider:
     | "github"
@@ -17,7 +18,11 @@ export function ProviderGlyph({
     | "manual"
     | "schedule"
     | "github_notification";
+  source?: string;
 }) {
+  if (source === "webhook.received") {
+    return <WebhookIcon className="size-4.5" aria-hidden="true" />;
+  }
   if (provider === "schedule") return <ClockIcon className="size-4.5" aria-hidden="true" />;
   if (provider === "github_notification") {
     return <BellIcon className="size-4.5" aria-hidden="true" />;

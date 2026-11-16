@@ -9,6 +9,7 @@ import { projectTriggerForm } from "./configuration/editor.js";
 import { OrganizationTriggerStore } from "./store.js";
 import { notificationStatusView, type NotificationStatusView } from "./notification-status.js";
 import { summarizeRecentRuns, type RecentRuns } from "./recent-runs.js";
+import { summarizeTrigger } from "../projects/activity-summary.js";
 
 const DAY_MS = 24 * 60 * 60_000;
 const NOTIFICATION_EVENT = "github.notification";
@@ -150,16 +151,29 @@ export class TriggerDashboard {
           current.some((candidate) => candidate.run.id === run.id) ||
           run.configuredTriggerName === legacyTriggerName,
       )
-      .map(({ run, receipt }) => ({
-        id: run.id,
-        triggerId: trigger.id,
-        triggerName: trigger.name,
-        provider: receipt.provider,
-        source: receipt.source,
-        repo: receipt.repo,
-        status: run.status,
-        receivedAt: receipt.receivedAt.toISOString(),
-      }));
+      .map(({ run, receipt, webhookActor }) =>
+        Object.assign(
+          {
+            id: run.id,
+            triggerId: trigger.id,
+            triggerName: trigger.name,
+            provider: receipt.provider,
+            source: receipt.source,
+            repo: receipt.repo,
+            status: run.status,
+            receivedAt: receipt.receivedAt.toISOString(),
+          },
+          receipt.source === "webhook.received"
+            ? {
+                webhookSummary: summarizeTrigger(receipt.source, {
+                  actor: webhookActor,
+                  input: run.prompt,
+                  trigger: run.configuredTriggerName,
+                }),
+              }
+            : {},
+        ),
+      );
   }
 
   async save(

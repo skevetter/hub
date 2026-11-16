@@ -2063,7 +2063,11 @@ class PgDatabase implements Database {
       `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
               receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
               receipts.provider_configuration_version, receipts.source, receipts.repo,
-              receipts.received_at, receipts.dropped_reason
+              receipts.received_at, receipts.dropped_reason,
+              case when receipts.source = 'webhook.received'
+                     and jsonb_typeof(receipts.payload->'actor') = 'string'
+                then receipts.payload->>'actor'
+              end as webhook_actor
        from trigger_runs runs
        join provider_event_receipts receipts
          on receipts.id = runs.provider_event_receipt_id
@@ -2135,6 +2139,7 @@ class PgDatabase implements Database {
     return {
       run: toTriggerRunRecord(row),
       receipt: toProviderEventReceiptSummary(row),
+      ...(row.webhook_actor === null ? {} : { webhookActor: row.webhook_actor }),
     };
   }
 
@@ -4678,6 +4683,7 @@ interface ProjectActivityRunListRow extends TriggerRunRow {
   repo: string | null;
   received_at: Date;
   dropped_reason: string | null;
+  webhook_actor: string | null;
 }
 
 interface WorkflowStepRunRow extends QueryRow {

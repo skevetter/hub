@@ -3,6 +3,7 @@ import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it, vi } from "vitest";
 import type { ActivityRunDetail as RunDetail } from "../projects/dashboard.js";
+import { summarizeTrigger } from "../projects/activity-summary.js";
 import { ActivityRunDetail, pollActiveRun } from "./activity-run-panel.js";
 
 const detail: RunDetail = {
@@ -45,6 +46,40 @@ describe("activity run detail", () => {
     assert.match(markup, /Run failed/u);
     assert.match(markup, /2026-01-01T00:02:00.000Z/u);
     assert.match(markup, /No steps/u);
+  });
+
+  it("labels webhook detail from its receipt source while retaining the manual provider", () => {
+    const summary = summarizeTrigger("webhook.received", {
+      actor: "ci-partner",
+      trigger: "build-finished",
+      input: `${"x".repeat(120)}private tail`,
+    });
+    const markup = render({
+      ...detail,
+      run: {
+        ...detail.run,
+        provider: "manual",
+        source: "webhook.received",
+        configuredTriggerName: "build-finished",
+        webhookSummary: summary,
+      },
+    });
+    assert.match(markup, /Webhook from ci-partner/u);
+    assert.match(markup, /build-finished/u);
+    assert.match(markup, /lucide-webhook/u);
+    assert.match(markup, /Message/u);
+    assert.match(markup, /x{119}/u);
+    assert.doesNotMatch(markup, /x{120}|private tail|lucide-terminal/u);
+  });
+
+  it("leaves an ordinary manual detail label and glyph unchanged", () => {
+    const markup = render({
+      ...detail,
+      run: { ...detail.run, provider: "manual", source: "manual.run" },
+    });
+    assert.match(markup, /manual.run/u);
+    assert.match(markup, /lucide-terminal/u);
+    assert.doesNotMatch(markup, /Webhook|lucide-webhook/u);
   });
 
   it("renders a successful script result", () => {

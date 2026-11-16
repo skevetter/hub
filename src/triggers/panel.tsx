@@ -6,6 +6,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { ArrowLeft, Braces, FileText, LockKeyhole, Plus } from "lucide-react";
 import { useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { parseDocument } from "yaml";
 
 import { Card } from "../components/app/card.js";
 import { Combobox, type ComboboxOption } from "../components/app/combobox.js";
@@ -46,6 +47,9 @@ import { EventFields } from "./event-fields.js";
 import { ActionField, ScriptFields, triggerSecondaryLine } from "./script-fields.js";
 import { NotificationStatusCard } from "./notification-status-card.js";
 import { LastTriggered } from "./last-triggered.js";
+import { WebhookCard } from "./webhook-card.js";
+import { IDENTIFIER, TriggerDocumentSchema } from "./configuration/schema.js";
+import { webhookSettings } from "../webhooks/functions.js";
 import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
 import {
   selectedProviderModel,
@@ -297,6 +301,21 @@ function TriggerEditor({
 }) {
   const legacy = trigger?.format === "legacy_multistep";
   const editor = useTriggerEditorState(trigger, snapshot, legacy, onSave);
+  const webhook = useMemo(() => {
+    if (editor.mode === "form") {
+      return editor.form.event === "manual.run" && IDENTIFIER.test(editor.form.name)
+        ? { triggerName: editor.form.name, enabled: editor.form.enabled }
+        : null;
+    }
+    try {
+      const parsed = TriggerDocumentSchema.safeParse(parseDocument(editor.yaml).toJS());
+      return parsed.success && parsed.data.on["manual.run"] !== undefined
+        ? { triggerName: parsed.data.name, enabled: parsed.data.enabled }
+        : null;
+    } catch {
+      return null;
+    }
+  }, [editor.mode, editor.form, editor.yaml]);
   const title = trigger === null ? "New trigger" : trigger.name;
   const submitLabel = triggerSubmitLabel(editor.mode, trigger === null);
   // Saving is refused only for what the reader cannot act on here: a request in flight, a
@@ -394,6 +413,13 @@ function TriggerEditor({
               onChange={editor.setForm}
             />
           )}
+          {webhook === null ? null : (
+            <TriggerWebhookCard
+              organizationSlug={snapshot.organization.slug}
+              triggerName={webhook.triggerName}
+              enabled={webhook.enabled}
+            />
+          )}
           <FormActions pinned>
             <Button type="button" variant="ghost" onClick={onCancel}>
               Cancel
@@ -406,6 +432,41 @@ function TriggerEditor({
         </form>
       </div>
     </>
+  );
+}
+
+function TriggerWebhookCard({
+  organizationSlug,
+  triggerName,
+  enabled,
+}: {
+  organizationSlug: string;
+  triggerName: string;
+  enabled: boolean;
+}) {
+  const load = useServerFn(webhookSettings);
+  const settings = useSnapshotQuery({
+    queryKey: ["webhooks", "settings", organizationSlug],
+    queryFn: () => load(),
+  });
+  if (settings.status === "pending") {
+    return (
+      <Card title="Webhook">
+        <LoadingLine>Loading webhook address</LoadingLine>
+      </Card>
+    );
+  }
+  if (settings.status === "error") {
+    return (
+      <FailureAlert
+        title="Webhook address unavailable"
+        error={settings.error}
+        fallback="Hub couldn't load the webhook address. Reload the page."
+      />
+    );
+  }
+  return (
+    <WebhookCard baseUrl={settings.data.baseUrl} triggerName={triggerName} enabled={enabled} />
   );
 }
 

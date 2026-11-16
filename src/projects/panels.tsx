@@ -381,7 +381,7 @@ export function ProjectActivityRunPanel({ runId }: { runId: string }) {
     <>
       <PageHeader
         title="Run detail"
-        description={`${activity.provider} · ${activity.configuredTriggerName}`}
+        description={`${activity.webhookSummary === undefined ? activity.provider : "Webhook"} \u00b7 ${activity.configuredTriggerName}`}
       />
       <Section title="Invocation">
         <SummaryPanel label="Invocation" rows={invocationRows(activity)} />
@@ -559,6 +559,19 @@ function SetupCard({ label, ready, detail }: { label: string; ready: boolean; de
 /** What one run amounts to, in the order an operator reads it: what was asked, then what happened. */
 function invocationRows(activity: RunActivity): readonly SummaryRow[] {
   return [
+    ...(activity.webhookSummary === undefined
+      ? []
+      : [
+          {
+            label: "Source",
+            value: (
+              <span className="flex items-center gap-2">
+                <ProviderGlyph provider={activity.provider} source={activity.source} />
+                {activity.webhookSummary.headline}
+              </span>
+            ),
+          },
+        ]),
     { label: "Prompt", value: <CodeBlock label="Prompt">{activity.prompt}</CodeBlock> },
     { label: "Typed inputs", value: <JsonValue value={activity.inputs} /> },
     { label: "Composed routing values", value: <JsonValue value={activity.values} /> },
@@ -646,7 +659,21 @@ function ActivityTable({
               />
             </DataCell>
             <DataCell>{event.provider}</DataCell>
-            <DataCell>{event.source}</DataCell>
+            <DataCell>
+              <div className="flex items-center gap-2">
+                <ProviderGlyph provider={event.provider} source={event.source} />
+                <TwoLine
+                  primary={
+                    "webhookSummary" in event
+                      ? (event.webhookSummary?.headline ?? event.source)
+                      : event.source
+                  }
+                  {...("webhookSummary" in event && event.webhookSummary?.prompt !== undefined
+                    ? { secondary: event.webhookSummary.prompt }
+                    : {})}
+                />
+              </div>
+            </DataCell>
             <DataCell>
               <StatusPill tone={executionTone(status)}>{statusLabel(status)}</StatusPill>
             </DataCell>

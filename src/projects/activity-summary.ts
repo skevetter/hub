@@ -29,10 +29,20 @@ export interface TriggerSummary {
   headline: string;
   actor: string | null;
   externalUrl: string | null;
+  prompt?: string;
+  triggerName?: string;
 }
 
 const ManualTriggerPayloadSchema = z
   .object({ trigger: z.string().optional(), actor: z.string().optional() })
+  .passthrough();
+
+const WebhookTriggerPayloadSchema = z
+  .object({
+    trigger: z.string().optional(),
+    actor: z.string().optional(),
+    input: z.string().optional(),
+  })
   .passthrough();
 
 /**
@@ -42,6 +52,7 @@ const ManualTriggerPayloadSchema = z
  */
 export function summarizeTrigger(source: string, payload: unknown): TriggerSummary {
   const [provider] = source.split(".");
+  if (source === "webhook.received") return summarizeWebhook(payload);
   if (source === "github.notification") return summarizeNotification(payload);
   if (provider === "github") return summarizeGitHub(payload);
   if (provider === "slack") return summarizeSlack(payload);
@@ -251,6 +262,23 @@ function summarizeManual(payload: unknown): TriggerSummary {
     headline: triggerName === undefined ? "Manual run" : `Manual run: ${triggerName}`,
     actor: parsed.success ? (parsed.data.actor ?? null) : null,
     externalUrl: null,
+  };
+}
+
+function summarizeWebhook(payload: unknown): TriggerSummary {
+  const parsed = WebhookTriggerPayloadSchema.safeParse(payload);
+  const actor = parsed.success ? (parsed.data.actor ?? null) : null;
+  return {
+    provider: "manual",
+    headline: actor === null ? "Webhook" : `Webhook from ${actor}`,
+    actor,
+    externalUrl: null,
+    ...(parsed.success && parsed.data.input !== undefined
+      ? { prompt: truncate(parsed.data.input, 120) }
+      : {}),
+    ...(parsed.success && parsed.data.trigger !== undefined
+      ? { triggerName: parsed.data.trigger }
+      : {}),
   };
 }
 

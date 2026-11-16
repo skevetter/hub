@@ -73,6 +73,7 @@ describe("trigger dashboard read model", () => {
     });
     // The run is months old, so the 24 hour summary is empty.
     assert.deepEqual(after.triggers[0]?.recentRuns, { total: 0, succeeded: 0, failed: 0 });
+    assert.equal("webhookSummary" in after.activity[0]!, false);
   });
 
   it("summarizes the trigger's runs from the last 24 hours, one failure among many", async () => {
@@ -131,6 +132,73 @@ describe("trigger dashboard read model", () => {
       new Date(NOW.getTime() - 3_600_000).toISOString(),
     );
     assert.deepEqual(view?.recentRuns, { total: 12, succeeded: 10, failed: 2 });
+  });
+
+  it("exposes a bounded webhook summary from the receipt actor only within its organization", async () => {
+    const database = createMemoryDatabase({
+      memberships: [
+        MEMBERSHIP,
+        {
+          ...MEMBERSHIP,
+          organizationId: "org-2",
+          organizationSlug: "other",
+          organizationName: "Other",
+          membershipId: "membership-2",
+        },
+      ],
+    });
+    await enrollTestDaemon(database, "org-1");
+    const trigger = await new OrganizationTriggerStore(
+      database,
+      "org-1",
+      acceptingAgentValidator(),
+    ).save({ yaml: triggerYaml, userId: "user-1" });
+    const revision = await database.findActiveProjectConfiguration(trigger.runtimeProjectId);
+    assert.ok(revision);
+    const prompt = `${"x".repeat(120)}private tail`;
+    const receipt = await database.persistManualEvent({
+      organizationId: "org-1",
+      projectId: trigger.runtimeProjectId,
+      deliveryId: "webhook-summary",
+      source: "webhook.received",
+      payload: {
+        actor: "ci-partner",
+        trigger: "manual-task",
+        input: prompt,
+        data: { internal: "raw-payload-only" },
+      },
+      receivedAt: NOW,
+    });
+    assert.equal(receipt.status, "accepted");
+    if (receipt.status !== "accepted") throw new Error("webhook receipt was not accepted");
+    await database.createAcceptedTriggerRun({
+      organizationId: "org-1",
+      projectId: trigger.runtimeProjectId,
+      configurationRevisionId: revision.id,
+      providerEventReceiptId: receipt.event.providerEventReceiptId,
+      configuredTriggerName: "manual-task",
+      prompt,
+      inputs: {},
+      triggerContext: {},
+      outputContext: {},
+      deadlineAt: new Date(NOW.getTime() + 3_600_000),
+      stepIds: [],
+    });
+    const dashboard = new TriggerDashboard(database, accountAuth(), acceptingAgentValidator(), {
+      now: () => NOW,
+    });
+    const snapshot = await dashboard.snapshot(request(), "acme");
+    const activity = snapshot.activity[0];
+    assert.ok(activity);
+    assert.equal(activity.provider, "manual");
+    assert.equal(activity.source, "webhook.received");
+    assert.equal(activity.webhookSummary?.headline, "Webhook from ci-partner");
+    assert.equal(activity.webhookSummary?.triggerName, "manual-task");
+    assert.equal(activity.webhookSummary?.prompt?.length, 120);
+    assert.equal(JSON.stringify(activity).includes("private tail"), false);
+    assert.equal(JSON.stringify(activity).includes("raw-payload-only"), false);
+    assert.equal("rawPayload" in activity, false);
+    assert.deepEqual((await dashboard.snapshot(request(), "other")).activity, []);
   });
 });
 

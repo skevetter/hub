@@ -8,6 +8,7 @@ import { PageHeader } from "../components/app/page.js";
 import { formatAbsolute } from "../components/app/relative-time.js";
 import { StatusPill, statusLabel } from "../components/app/status-pill.js";
 import { SummaryPanel } from "../components/app/summary-panel.js";
+import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { useRouteTenant } from "../projects/context.js";
 import type { ActivityRunDetail as RunDetail } from "../projects/dashboard.js";
 import { activityRunDetail } from "../projects/functions.js";
@@ -77,7 +78,18 @@ export function ActivityRunDetail({ detail }: { detail: RunDetail }) {
   );
   const rows = useMemo(
     () => [
-      { label: "Source", value: run.source },
+      {
+        label: "Source",
+        value: (
+          <span className="flex items-center gap-2">
+            <ProviderGlyph provider={run.provider} source={run.source} />
+            {run.webhookSummary?.headline ?? run.source}
+          </span>
+        ),
+      },
+      ...(run.webhookSummary?.prompt === undefined
+        ? []
+        : [{ label: "Message", value: run.webhookSummary.prompt }]),
       { label: "Repository", value: run.repo ?? "—" },
       { label: "Received", value: time(run.receivedAt) },
       { label: "Created", value: time(run.createdAt) },
@@ -98,7 +110,7 @@ export function ActivityRunDetail({ detail }: { detail: RunDetail }) {
     <>
       <PageHeader
         title="Run detail"
-        description={`${run.provider} · ${run.configuredTriggerName}`}
+        description={`${run.webhookSummary === undefined ? run.provider : "Webhook"} \u00b7 ${run.configuredTriggerName}`}
         status={status}
       />
       <SummaryPanel label="Run" rows={rows} />

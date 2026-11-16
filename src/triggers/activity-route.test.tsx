@@ -6,6 +6,7 @@ import type * as ReactStart from "@tanstack/react-start";
 import type * as ProjectContext from "../projects/context.js";
 import type * as Queries from "../queries/index.js";
 import { describe, it, vi } from "vitest";
+import { summarizeTrigger } from "../projects/activity-summary.js";
 import { routeTree } from "../routeTree.gen.js";
 import { Route as RootRoute } from "../routes/__root.js";
 import { Route as ShellRoute } from "../routes/_shell.js";
@@ -62,11 +63,42 @@ describe("organization activity routes", () => {
             status: "succeeded",
             receivedAt: "2026-01-01T00:00:00.000Z",
           },
+          {
+            id: "webhook-run",
+            triggerName: "build-finished",
+            repo: null,
+            provider: "manual",
+            source: "webhook.received",
+            status: "succeeded",
+            receivedAt: "2026-01-01T00:01:00.000Z",
+            webhookSummary: summarizeTrigger("webhook.received", {
+              actor: "ci-partner",
+              trigger: "build-finished",
+              input: `${"x".repeat(120)}private tail`,
+            }),
+          },
+          {
+            id: "manual-run",
+            triggerName: "ordinary-manual",
+            repo: null,
+            provider: "manual",
+            source: "manual.run",
+            status: "succeeded",
+            receivedAt: "2026-01-01T00:02:00.000Z",
+          },
         ],
       };
       const listing = await renderRoute("/o/acme%20team/activity");
       assert.match(listing, /href="\/o\/acme%20team\/activity\/run%2Fone"/u);
       assert.match(listing, /Deploy/u);
+      assert.match(listing, /Webhook from ci-partner/u);
+      assert.match(listing, /build-finished/u);
+      assert.match(listing, /lucide-webhook/u);
+      assert.match(listing, /x{119}/u);
+      assert.doesNotMatch(listing, /x{120}|private tail/u);
+      assert.match(listing, /ordinary-manual/u);
+      assert.match(listing, /manual.run/u);
+      assert.match(listing, /lucide-terminal/u);
       assert.ok(
         state.queryKeys.some(
           (key) => JSON.stringify(key) === JSON.stringify(["triggers", "acme team"]),

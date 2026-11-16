@@ -179,4 +179,66 @@ describe("summarizeTrigger", () => {
       externalUrl: null,
     });
   });
+
+  it("summarizes a webhook with its bound actor, message, and trigger without changing provider", () => {
+    assert.deepEqual(
+      summarizeTrigger("webhook.received", {
+        trigger: "build-finished",
+        actor: "ci-partner",
+        input: "Build finished",
+        data: { message: "Build finished", status: "failed" },
+      }),
+      {
+        provider: "manual",
+        headline: "Webhook from ci-partner",
+        actor: "ci-partner",
+        externalUrl: null,
+        prompt: "Build finished",
+        triggerName: "build-finished",
+      },
+    );
+  });
+
+  it("limits a webhook prompt preview to 120 characters", () => {
+    const summary = summarizeTrigger("webhook.received", {
+      trigger: "build-finished",
+      actor: "ci-partner",
+      input: `${"x".repeat(120)}private tail`,
+    });
+    assert.equal(summary.prompt?.length, 120);
+    assert.equal(summary.prompt?.slice(0, 119), "x".repeat(119));
+    assert.ok(!summary.prompt?.includes("private tail"));
+    assert.equal(
+      summarizeTrigger("webhook.received", { input: "x".repeat(120) }).prompt,
+      "x".repeat(120),
+    );
+  });
+
+  it("keeps ordinary manual runs unchanged even if their payload names the webhook source", () => {
+    assert.deepEqual(
+      summarizeTrigger("manual.run", {
+        trigger: "rollback",
+        actor: "dana",
+        input: "Run now",
+        source: "webhook.received",
+      }),
+      {
+        provider: "manual",
+        headline: "Manual run: rollback",
+        actor: "dana",
+        externalUrl: null,
+      },
+    );
+  });
+
+  it("uses a safe webhook label for malformed or missing display data", () => {
+    for (const payload of [null, {}, { actor: 7, input: [] }]) {
+      assert.deepEqual(summarizeTrigger("webhook.received", payload), {
+        provider: "manual",
+        headline: "Webhook",
+        actor: null,
+        externalUrl: null,
+      });
+    }
+  });
 });

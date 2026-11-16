@@ -397,7 +397,7 @@ function runStep(
 }
 
 /** How to make a trigger fire, said for the events the organization actually listens to. */
-function runHint(triggers: HomeSnapshot["triggers"]): string {
+export function runHint(triggers: HomeSnapshot["triggers"]): string {
   if (triggers.length === 0) return "Once a trigger exists, fire its event.";
   const hints = new Set<string>();
   for (const { event } of triggers) {
@@ -413,7 +413,9 @@ function runHint(triggers: HomeSnapshot["triggers"]): string {
     } else if (provider === "github_notification") {
       hints.add("Receive a GitHub notification that matches its filters.");
     } else {
-      hints.add("Dispatch it with an API key: POST /api/v1/manual-runs.");
+      hints.add(
+        "Send an event with an API key: POST /api/v1/hooks/{trigger} or POST /api/v1/manual-runs.",
+      );
     }
   }
   return [...hints].join(" ");

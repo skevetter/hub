@@ -65,6 +65,7 @@ export interface ApplicationRuntime {
   hub: HubRuntime;
   operations: HubOperations;
   publicApi: PublicApi;
+  publicBaseUrl?: string | undefined;
   resources: OrganizationResources | null;
   /** HOSTED only. Null self-hosted; present when the composition root has a billing config. */
   billing: BillingRuntime | null;

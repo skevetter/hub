@@ -153,6 +153,7 @@ async function createOwnedApplicationRuntime(
     hub: application.hub,
     operations: application.operations,
     publicApi: application.publicApi,
+    publicBaseUrl: options.publicBaseUrl,
     resources,
     billing: options.billing,
     providerApplications: providerApplicationsFor(options),
