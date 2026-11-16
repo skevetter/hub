@@ -5,13 +5,22 @@ const INPUT_LIMIT = 8192;
 const INVISIBLE = /[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
 const PREFIX_TOKEN =
   /(?:paseo_(?:pk|cli)_|gh[pousr]_|github_pat_|xox[abprs]-|xapp-|lin_(?:api|oauth)_|AKIA|ASIA|sk-|AIza|sk_live_|rk_live_|whsec_)[A-Za-z0-9_+/-]*/gu;
-const AUTHORIZATION =
-  /\bAuthorization[ \t]*:[ \t]*(?:Bearer|Basic|Token)[ \t]+[^\s,;]+|\bBearer[ \t]+[^\s,;]+/giu;
+const QUOTED_VALUE = String.raw`(?:"(?:\\[^\n]|[^"\\\n])*"?|'(?:\\[^\n]|[^'\\\n])*'?)`;
+const AUTHORIZATION = new RegExp(
+  String.raw`\bAuthorization[ \t]*:[ \t]*(?:Bearer|Basic|Token)[ \t]+(?:${QUOTED_VALUE}|[^\s,;]+)|\b(?:Bearer|Basic|Token)[ \t]+(?:${QUOTED_VALUE}|[^\s,;]+)`,
+  "giu",
+);
 const JWT = /(?:^|[^A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2})/gu;
-const ASSIGNMENT =
-  /(^|[\s,;{])(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*[=:][ \t]*(?:"[^"\n]*"?|'[^'\n]*'?|[^\s,;}]+)/gu;
-const SENSITIVE_NAME = /TOKEN|SECRET|PASSWORD|PASSWD|API[_-]KEY|PRIVATE[_-]KEY|CREDENTIAL/iu;
-const FLAG = /--(?:token|password|secret|api-key)(?:=|[ \t]+)(?:"[^"\n]*"?|'[^'\n]*'?|[^\s,;]+)/giu;
+const ASSIGNMENT = new RegExp(
+  String.raw`(^|[\s,;{])(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*[=:][ \t]*(?:${QUOTED_VALUE}|[^\s,;}]+)`,
+  "gu",
+);
+const SENSITIVE_NAME =
+  /TOKEN|SECRET|PASSWORD|PASSWD|API[_-]KEY|PRIVATE[_-]KEY|CREDENTIAL|AUTHORIZATION/iu;
+const FLAG = new RegExp(
+  String.raw`--(?:token|password|secret|api-key)(?:=|[ \t]+)(?:${QUOTED_VALUE}|[^\s,;]+)`,
+  "giu",
+);
 const QUERY =
   /([?&](?:token|key|secret|password|sig|signature|code|auth|api_key|access_token)=)[^&#\s]*/giu;
 const USERINFO = /([A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^\s/:@]*:[^\s/@]*@/gu;

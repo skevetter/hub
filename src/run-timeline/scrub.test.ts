@@ -213,6 +213,59 @@ describe("stored-text privacy contract: known normalized secrets lose every 8-co
     expect(scrub("-----BEGIN PRIVATE KEY-----\ntiny", 120)).toBe("[redacted]");
   });
 
+  it("consumes escaped quoted assignments and flags through the closing quote without known values or entropy", () => {
+    const scrub = createTimelineScrubber();
+    for (const quote of ['"', "'"]) {
+      for (const escape of ["", "\\"]) {
+        const secret = ["aBcD0192", escape, quote, " ", "EfGh3456", "IjKl7890"].join("");
+        const encoded = secret.replaceAll("\\", "\\\\").replaceAll(quote, `\\${quote}`);
+        expect(scrub(secret, 240)).toBe(secret);
+        const forbidden = new Set([...eightGrams(secret), ...eightGrams(encoded)]);
+        for (const label of ["TOKEN", "PASSWORD", "SECRET", "API_KEY", "Authorization"]) {
+          for (const separator of ["=", ": "]) {
+            const input = `${label}${separator}${quote}${encoded}${quote} tail`;
+            const safe = scrub(input, 240);
+            expect(safe).toBe(`${label}=[redacted] tail`);
+            assertPrivate(safe, forbidden, 240);
+          }
+        }
+        for (const flag of ["token", "password", "secret", "api-key"]) {
+          for (const separator of ["=", " "]) {
+            const input = `--${flag}${separator}${quote}${encoded}${quote} tail`;
+            const safe = scrub(input, 240);
+            assertPrivate(safe, forbidden, 240);
+            assertPrivate(scrub(input.slice(0, -6), 240), forbidden, 240);
+          }
+        }
+      }
+    }
+  });
+
+  it.each(["Bearer", "Basic", "Token"])(
+    "removes quoted Authorization assignments and escaped quoted %s values without known values or entropy",
+    (scheme) => {
+      const scrub = createTimelineScrubber();
+      const secret = ["aBcD0192", '" ', "EfGh3456", "IjKl7890"].join("");
+      const plain = ["aBcD0192", "EfGh3456", "IjKl7890"].join("");
+      expect(scrub(secret, 240)).toBe(secret);
+      expect(scrub(plain, 240)).toBe(plain);
+      const forbidden = new Set([...eightGrams(secret), ...eightGrams(plain)]);
+      for (const input of [
+        JSON.stringify({ Authorization: `${scheme} ${plain}` }),
+        JSON.stringify({ Authorization: `${scheme} ${secret}` }),
+        `{'Authorization':'${scheme} ${plain}'}`,
+        `"Authorization" = "${scheme} ${plain}"`,
+        `Authorization: ${scheme} ${JSON.stringify(secret)} tail`,
+        `${scheme} ${JSON.stringify(secret)} tail`,
+      ]) {
+        const safe = scrub(input, 240);
+        assertPrivate(safe, forbidden, 240);
+        expect(safe).not.toBe(input);
+      }
+      expect(scrub(`${scheme} ${JSON.stringify(secret)} tail`, 240)).toBe("[redacted] tail");
+    },
+  );
+
   it("normalizes NFKC, removes controls, zero-width and variation characters, and retains tabs and newlines", () => {
     const scrub = createTimelineScrubber();
     const obfuscated = ["\uff53\uff4b", "\u200b", "-", "a\u0000b\u2060c\ufe0f"].join("");
@@ -305,6 +358,9 @@ describe("stored-text privacy contract: known normalized secrets lose every 8-co
       "-----BEGIN".repeat(819).slice(0, 8192),
       "custom://" + ":".repeat(8183),
       "custom://" + "a".repeat(8183),
+      'PASSWORD="' + '\\" '.repeat(2727),
+      '--password="' + '\\" '.repeat(2726),
+      'Authorization: Token "' + '\\" '.repeat(2723),
     ];
     for (const value of adversarial) {
       for (let warmup = 0; warmup < 50; warmup += 1) scrub(value, 240);

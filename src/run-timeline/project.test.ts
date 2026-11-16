@@ -21,6 +21,8 @@ const RUN_END: Extract<TimelineProjectionInput, { kind: "run_finished" }> = {
   steps: STEPS,
   stepRowsOmitted: 0,
 };
+const SHORT_CREDENTIAL = ["aBcD0192", "EfGh3456", "IjKl7890"].join("");
+const ESCAPED_CREDENTIAL = ["aBcD0192", '" ', "EfGh3456", "IjKl7890"].join("");
 
 function daemon(event: DaemonAgentStreamEvent): TimelineProjectionInput {
   return { kind: "agent_event", event };
@@ -379,6 +381,74 @@ describe("closed stored-event projection", () => {
       );
     }
   });
+
+  it.each([
+    {
+      name: "JSON password with an escaped quote followed by whitespace",
+      value: JSON.stringify({ PASSWORD: ESCAPED_CREDENTIAL }),
+      secret: ESCAPED_CREDENTIAL,
+    },
+    {
+      name: "CLI password with an escaped quote followed by whitespace",
+      value: `--password=${JSON.stringify(ESCAPED_CREDENTIAL)}`,
+      secret: ESCAPED_CREDENTIAL,
+    },
+    ...["Bearer", "Basic", "Token"].flatMap((scheme) => [
+      {
+        name: `JSON ${scheme} Authorization`,
+        value: JSON.stringify({ Authorization: `${scheme} ${SHORT_CREDENTIAL}` }),
+        secret: SHORT_CREDENTIAL,
+      },
+      {
+        name: `JSON ${scheme} Authorization with an escaped quote followed by whitespace`,
+        value: JSON.stringify({ Authorization: `${scheme} ${ESCAPED_CREDENTIAL}` }),
+        secret: ESCAPED_CREDENTIAL,
+      },
+      {
+        name: `single-quoted ${scheme} Authorization`,
+        value: `{'Authorization':'${scheme} ${SHORT_CREDENTIAL}'}`,
+        secret: SHORT_CREDENTIAL,
+      },
+      {
+        name: `quoted ${scheme} header value`,
+        value: `Authorization: ${scheme} ${JSON.stringify(ESCAPED_CREDENTIAL)}`,
+        secret: ESCAPED_CREDENTIAL,
+      },
+      {
+        name: `bare quoted ${scheme} value`,
+        value: `${scheme} ${JSON.stringify(ESCAPED_CREDENTIAL)}`,
+        secret: ESCAPED_CREDENTIAL,
+      },
+    ]),
+  ])(
+    "removes every secret eight-gram from projected $name without known values or entropy",
+    ({ value, secret }) => {
+      expect(scrub(secret, 240)).toBe(secret);
+      const inputs: { input: TimelineProjectionInput; field: string }[] = [
+        { input: { kind: "run_started", trigger: value, steps: 1 }, field: "trigger" },
+        {
+          input: daemon({ type: "turn_failed", provider: "claude", error: value }),
+          field: "error",
+        },
+        {
+          input: daemon({ type: "turn_canceled", provider: "claude", reason: value }),
+          field: "reason",
+        },
+        { input: { ...STEP_END, failure: value }, field: "failure" },
+        { input: { ...RUN_END, failure: value }, field: "failure" },
+      ];
+      for (const { input, field } of inputs) {
+        const row = projectTimelineEvent(input, scrub);
+        const text = row?.data[field];
+        expect(text).toContain("[redacted]");
+        for (let index = 0; index <= secret.length - 8; index += 1) {
+          const fragment = secret.slice(index, index + 8);
+          expect(text).not.toContain(fragment);
+          expect(JSON.stringify(row)).not.toContain(fragment);
+        }
+      }
+    },
+  );
 
   it("uses tool names only when the scrubbed name pattern permits them and never includes an unnamed permission tool", () => {
     for (const name of ["bad=name", "Read\n", "\ud800", "", ["gh", "p_short"].join("")]) {

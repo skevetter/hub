@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Stored timeline redaction handles escaped quoted credentials and quoted Authorization values.
 - Background sweep tests restore real worker timers and fail fast if a fake timer leaks into another file.
 - Progress message admission waits for concurrent retention before checking timeline expiry, so a tombstoned run cannot regain a progress row.
 - Timeline notifications coalesce stalled asynchronous subscribers into one pending wake and discard it on unsubscribe.
