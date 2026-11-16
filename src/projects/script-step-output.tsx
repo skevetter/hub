@@ -45,7 +45,7 @@ export function ScriptStepOutput({
         description={truncated ? "The last 64 KB of the output." : "Everything the script printed."}
       >
         <CodeBlock label="Script output">
-          {outputTail === "" ? "(no output)" : outputTail.slice(0, expanded ? undefined : 4096)}
+          {outputTail === "" ? "(no output)" : outputTail.slice(expanded ? 0 : -4096)}
         </CodeBlock>
         {!expanded && outputTail.length > 4096 ? (
           <button type="button" onClick={showMore}>
