@@ -91,6 +91,89 @@ const CORPUS = [
   { family: "entropy", input: PAYLOAD, secret: PAYLOAD },
 ];
 
+const REVIEW_SECRET = ["aBcD0192", "EfGh3456", "IjKl7890"].join("");
+const SHORT_SECRET = ["aB3d", "Ef8h", "Q2"].join("");
+const FIELD_CORPUS = [
+  {
+    name: "URL-like custom authority",
+    input: `custom_scheme://user:${SHORT_SECRET}@host/db`,
+    secret: SHORT_SECRET,
+  },
+  {
+    name: "protocol-relative authority",
+    input: `//user:${SHORT_SECRET}@host/db`,
+    secret: SHORT_SECRET,
+  },
+  {
+    name: "credential query code",
+    input: `https://example.test/?code=${SHORT_SECRET}`,
+    secret: SHORT_SECRET,
+  },
+  {
+    name: "expanded Unicode case label",
+    input: `pa\u00dfword=${SHORT_SECRET}`,
+    secret: SHORT_SECRET,
+  },
+  {
+    name: "nested JSON",
+    input: JSON.stringify({ err: JSON.stringify({ PASSWORD: REVIEW_SECRET }) }),
+    secret: REVIEW_SECRET,
+  },
+  { name: "env wrapper", input: `env=PASSWORD=${SHORT_SECRET}`, secret: SHORT_SECRET },
+  { name: "bracket assignment", input: `[DB_PASSWORD=${SHORT_SECRET}]`, secret: SHORT_SECRET },
+  {
+    name: "parenthesized assignment",
+    input: `connect(password=${SHORT_SECRET})`,
+    secret: SHORT_SECRET,
+  },
+  {
+    name: "escaped CLI space",
+    input: `--password=${REVIEW_SECRET.slice(0, 8)}\\ ${REVIEW_SECRET.slice(8)}`,
+    secret: REVIEW_SECRET,
+  },
+  {
+    name: "escaped env space",
+    input: `PASSWORD=${REVIEW_SECRET.slice(0, 8)}\\ ${REVIEW_SECRET.slice(8)}`,
+    secret: REVIEW_SECRET,
+  },
+  {
+    name: "YAML scalar",
+    input: `password: ${REVIEW_SECRET.slice(0, 8)} ${REVIEW_SECRET.slice(8)}`,
+    secret: REVIEW_SECRET,
+  },
+  { name: "YAML block", input: `password: |\n  ${REVIEW_SECRET}`, secret: REVIEW_SECRET },
+  {
+    name: "embedded userinfo at sign",
+    input: `postgres://user:ab@${["cd1234", "5678"].join("")}@host/db`,
+    secret: ["ab@", "cd1234", "5678"].join(""),
+  },
+  ...["=", " "].map((separator) => ({
+    name: `CLI ${separator === "=" ? "equals" : "space"}`,
+    input: `--password${separator}${REVIEW_SECRET}`,
+    secret: REVIEW_SECRET,
+  })),
+  {
+    name: "env file",
+    input: `NORMAL=value\nexport PASSWORD=${REVIEW_SECRET}\nNEXT=value`,
+    secret: REVIEW_SECRET,
+  },
+  ...["postgres", "redis", "amqp", "ftp", "mongodb+srv", "https", "custom+app"].map((scheme) => ({
+    name: `${scheme} userinfo`,
+    input: `before ${scheme}://user:${SHORT_SECRET}@inside@host/db after`,
+    secret: SHORT_SECRET,
+  })),
+  ...["PRIVATE KEY", "PGP MESSAGE", "CERTIFICATE", "OPENSSH PRIVATE KEY"].map((kind) => ({
+    name: `${kind} armor`,
+    input: `before\n-----BEGIN ${kind}-----\n${SHORT_SECRET}\n-----END ${kind}-----\nafter`,
+    secret: SHORT_SECRET,
+  })),
+  {
+    name: "encoded authority with an encoded slash in the password",
+    input: `%63ustom%3a%2f%2fuser%3a${SHORT_SECRET}%2fpart%40host/db`,
+    secret: SHORT_SECRET,
+  },
+];
+
 function eightGrams(value: string): Set<string> {
   const result = new Set<string>();
   for (let index = 0; index <= value.length - 8; index += 1)
@@ -118,12 +201,167 @@ function context(seed: number): string {
   );
 }
 
-describe("stored-text privacy contract: known normalized secrets lose every 8-code-unit fragment across every input and UTF-8 output cut; unknown prefix families are conservatively removed even below historical minima", () => {
-  it("states limits: unlabeled unknown short passwords, dictionary secrets and personal data are not detected; rare benign over-redaction and dropping text after a private-key header are intentional; this is not an outbound-content boundary", () => {
+describe("stored-text privacy contract: whole fields redact on sensitive labels or userinfo; known normalized secrets lose every 8-code-unit fragment across cuts; arbitrary unlabeled base64/hex secrets and unknown unlabeled passwords are explicit non-guarantees", () => {
+  it("states limits: arbitrary unlabeled base64/hex secrets, unknown unlabeled passwords and personal data are not guaranteed; benign sensitive-label mentions intentionally redact whole fields", () => {
     const scrub = createTimelineScrubber();
-    for (const value of ["a short password", "dictionary", "person@example.test"])
+    const secret = ["quiet ", "orchard"].join("");
+    for (const value of [
+      secret,
+      Buffer.from(secret).toString("base64"),
+      Buffer.from(secret).toString("hex"),
+      "person@example.test",
+    ])
       expect(scrub(value, 240)).toBe(value);
+    for (const value of [
+      "a short password",
+      "token count is zero",
+      "reset your password",
+      "keyframe: ordinary",
+      "Basic concepts only",
+      "credit is available",
+    ])
+      expect(scrub(value, 240)).toBe("[redacted]");
     expect(CORPUS.length).toBeGreaterThanOrEqual(40);
+  });
+
+  it.each(FIELD_CORPUS)(
+    "redacts the whole $name field before any partial rewrite",
+    ({ input, secret }) => {
+      const safe = createTimelineScrubber()(input, 240);
+      expect(safe).toBe("[redacted]");
+      assertPrivate(safe, eightGrams(secret), 240);
+    },
+  );
+
+  it("detects case-insensitive sensitive labels anywhere after removing separators and decoding JSON/JS, percent and HTML entities", () => {
+    const scrub = createTimelineScrubber();
+    const labels = [
+      "password",
+      "passwd",
+      "pwd",
+      "passphrase",
+      "secret",
+      "token",
+      "api key",
+      "apikey",
+      "auth",
+      "authorization",
+      "basic",
+      "bearer",
+      "credentials",
+      "private key",
+      "key",
+      "session",
+      "cookie",
+      "signature",
+      "sig",
+      "cred",
+    ];
+    for (const label of labels) {
+      const variants = [
+        label.toUpperCase(),
+        label.replaceAll("i", "\u0130"),
+        label.split("").join("._- \n"),
+        label
+          .split("")
+          .map((character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`)
+          .join(""),
+        label
+          .split("")
+          .map((character) => `\\x${character.charCodeAt(0).toString(16)}`)
+          .join(""),
+        label
+          .split("")
+          .map((character) => `\\u{${character.charCodeAt(0).toString(16)}}`)
+          .join(""),
+        label
+          .split("")
+          .map((character) => `%${character.charCodeAt(0).toString(16)}`)
+          .join(""),
+        label
+          .split("")
+          .map((character) => `&#${character.charCodeAt(0)};`)
+          .join(""),
+        label
+          .split("")
+          .map((character) => `&#x${character.charCodeAt(0).toString(16)};`)
+          .join(""),
+      ];
+      for (const variant of variants) {
+        const input = `ordinary ${variant}=${SHORT_SECRET} trailing`;
+        const safe = scrub(input, 240);
+        expect(safe).toBe("[redacted]");
+        assertPrivate(safe, eightGrams(SHORT_SECRET), 240);
+      }
+    }
+    for (const input of [
+      JSON.stringify(JSON.stringify({ PASSWORD: REVIEW_SECRET })),
+      `custom&colon;&sol;&sol;user&colon;${SHORT_SECRET}&commat;inside&commat;host/path`,
+      `custom%3A%2F%2Fuser%3A${SHORT_SECRET}%40inside%40host/path`,
+      `custom\\x3a\\u002f\\u{2f}user:${SHORT_SECRET}\\x40host/path`,
+    ]) {
+      expect(scrub(input, 240)).toBe("[redacted]");
+    }
+  });
+
+  it("retains prefix, JWT and entropy protection after canonicalization without extracting credential tails", () => {
+    const scrub = createTimelineScrubber();
+    for (const secret of [
+      ["gh", "p_", PAYLOAD].join(""),
+      ["ey", "JhbGci.fixtureA1.fixtureB2"].join(""),
+      PAYLOAD,
+    ]) {
+      const encoded = secret
+        .split("")
+        .map((character) => `%${character.charCodeAt(0).toString(16)}`)
+        .join("");
+      expect(scrub(encoded, 240)).toBe("[redacted]");
+      assertPrivate(scrub(encoded, 240), eightGrams(secret), 240);
+    }
+  });
+
+  it("bounds canonicalization to three passes and fails closed on unresolved or ambiguous encodings", () => {
+    const scrub = createTimelineScrubber();
+    const encode = (value: string) =>
+      value
+        .split("")
+        .map((character) => `%${character.charCodeAt(0).toString(16)}`)
+        .join("");
+    let ordinary = "ordinary";
+    for (let pass = 0; pass < 3; pass += 1) ordinary = encode(ordinary);
+    expect(scrub(ordinary, 240)).toBe(ordinary);
+    expect(scrub(encode(ordinary), 240)).toBe("[redacted]");
+    for (const input of [
+      "%zz",
+      "%e0%80",
+      "\\u12",
+      "\\xq0",
+      "&unknown;",
+      "&constructor;",
+      "&#x110000;",
+      "trailing\\",
+    ])
+      expect(scrub(input, 240)).toBe("[redacted]");
+    expect(scrub("https://host/path@ordinary", 240)).toBe("https://host/path@ordinary");
+  });
+
+  it("applies whole-field markers within every byte budget without introducing startup-known eight-grams", () => {
+    for (const known of [[], ["[redacted]"], ["[reda...", "[redacte"]]) {
+      const scrub = createTimelineScrubber({ scrubValues: known });
+      const forbidden = new Set<string>();
+      for (const { secret } of FIELD_CORPUS)
+        for (const fragment of eightGrams(secret)) forbidden.add(fragment);
+      for (const value of known) for (const fragment of eightGrams(value)) forbidden.add(fragment);
+      for (const { input } of FIELD_CORPUS) {
+        for (let budget = 0; budget <= 16; budget += 1) {
+          const safe = scrub(input, budget);
+          assertPrivate(safe, forbidden, budget);
+          expect(
+            safe === "" || safe === "[redacted]" || safe.endsWith("...") || /^\.*$/u.test(safe),
+          ).toBe(true);
+        }
+      }
+    }
   });
 
   it.each(CORPUS)(
@@ -178,7 +416,6 @@ describe("stored-text privacy contract: known normalized secrets lose every 8-co
       "v1.24.3-beta.2",
       "The build completed with 12 files and 4 warnings.",
       "name=ordinary",
-      "keyframe: ordinary",
     ];
     for (const value of negatives) expect(scrub(value, 240)).toBe(value);
     expect(scrub("0123456789abcdef".repeat(4), 240)).toBe("[redacted]");
@@ -206,9 +443,7 @@ describe("stored-text privacy contract: known normalized secrets lose every 8-co
     for (const scheme of ["Bearer", "Basic", "Token"])
       expect(scrub(`Authorization: ${scheme} tiny`, 120)).toBe("[redacted]");
     expect(scrub("Bearer tiny", 120)).toBe("[redacted]");
-    expect(scrub("ftp://user:tiny@example.test/path", 120)).toBe(
-      "ftp://[redacted]@example.test/path",
-    );
+    expect(scrub("ftp://user:tiny@example.test/path", 120)).toBe("[redacted]");
     expect(scrub("custom://example.test/path?token=tiny", 120)).not.toContain("tiny");
     expect(scrub("-----BEGIN PRIVATE KEY-----\ntiny", 120)).toBe("[redacted]");
   });
@@ -225,7 +460,7 @@ describe("stored-text privacy contract: known normalized secrets lose every 8-co
           for (const separator of ["=", ": "]) {
             const input = `${label}${separator}${quote}${encoded}${quote} tail`;
             const safe = scrub(input, 240);
-            expect(safe).toBe(`${label}=[redacted] tail`);
+            expect(safe).toBe("[redacted]");
             assertPrivate(safe, forbidden, 240);
           }
         }
@@ -262,7 +497,9 @@ describe("stored-text privacy contract: known normalized secrets lose every 8-co
         assertPrivate(safe, forbidden, 240);
         expect(safe).not.toBe(input);
       }
-      expect(scrub(`${scheme} ${JSON.stringify(secret)} tail`, 240)).toBe("[redacted] tail");
+      const safe = scrub(`${scheme} ${JSON.stringify(secret)} tail`, 240);
+      assertPrivate(safe, forbidden, 240);
+      expect(safe).toContain("[redacted]");
     },
   );
 

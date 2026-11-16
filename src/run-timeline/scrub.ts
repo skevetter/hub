@@ -5,27 +5,86 @@ const INPUT_LIMIT = 8192;
 const INVISIBLE = /[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
 const PREFIX_TOKEN =
   /(?:paseo_(?:pk|cli)_|gh[pousr]_|github_pat_|xox[abprs]-|xapp-|lin_(?:api|oauth)_|AKIA|ASIA|sk-|AIza|sk_live_|rk_live_|whsec_)[A-Za-z0-9_+/-]*/gu;
-const QUOTED_VALUE = String.raw`(?:"(?:\\[^\n]|[^"\\\n])*"?|'(?:\\[^\n]|[^'\\\n])*'?)`;
-const AUTHORIZATION = new RegExp(
-  String.raw`\bAuthorization[ \t]*:[ \t]*(?:Bearer|Basic|Token)[ \t]+(?:${QUOTED_VALUE}|[^\s,;]+)|\b(?:Bearer|Basic|Token)[ \t]+(?:${QUOTED_VALUE}|[^\s,;]+)`,
-  "giu",
-);
 const JWT = /(?:^|[^A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2})/gu;
-const ASSIGNMENT = new RegExp(
-  String.raw`(^|[\s,;{])(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\2[ \t]*[=:][ \t]*(?:${QUOTED_VALUE}|[^\s,;}]+)`,
-  "gu",
-);
-const SENSITIVE_NAME =
-  /TOKEN|SECRET|PASSWORD|PASSWD|API[_-]KEY|PRIVATE[_-]KEY|CREDENTIAL|AUTHORIZATION/iu;
-const FLAG = new RegExp(
-  String.raw`--(?:token|password|secret|api-key)(?:=|[ \t]+)(?:${QUOTED_VALUE}|[^\s,;]+)`,
-  "giu",
-);
-const QUERY =
-  /([?&](?:token|key|secret|password|sig|signature|code|auth|api_key|access_token)=)[^&#\s]*/giu;
-const USERINFO = /([A-Za-z][A-Za-z0-9+.-]{0,31}:\/\/)[^\s/:@]*:[^\s/@]*@/gu;
 const ENTROPY_RUN = /[A-Za-z0-9+/=_-]{32,}/gu;
-const PRIVATE_START = /-----BEGIN[ A-Z0-9-]{0,80}PRIVATE KEY-----/gu;
+const ARMORED_START = /-{3,}\s*BEGIN\b/iu;
+const SENSITIVE_LABEL = /pass|pwd|secret|token|key|auth|basic|bearer|cred|session|cookie|sig/iu;
+const ENCODED = /\\|%|&(?:#|[a-z][a-z0-9]*;)/iu;
+const ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&",
+  quot: '"',
+  apos: "'",
+  lt: "<",
+  gt: ">",
+  sol: "/",
+  bsol: "\\",
+  colon: ":",
+  commat: "@",
+  percnt: "%",
+  lowbar: "_",
+  hyphen: "-",
+  equals: "=",
+  tab: "\t",
+  newline: "\n",
+};
+const ESCAPES: Readonly<Record<string, string>> = {
+  n: "\n",
+  r: "\r",
+  t: "\t",
+  b: "\b",
+  f: "\f",
+  v: "\v",
+};
+
+function hasUserinfo(value: string): boolean {
+  let authority = false;
+  let slash = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]!;
+    const encodedSlash = value.startsWith("%2f", index) || value.startsWith("%2F", index);
+    if (authority) {
+      if (character === "@" || value.startsWith("%40", index)) return true;
+      if (!/[/?#\s]/u.test(character)) {
+        if (encodedSlash) index += 2;
+        continue;
+      }
+      authority = false;
+      slash = false;
+    }
+    if (character === "/" || encodedSlash) {
+      authority = slash;
+      slash = !authority;
+      if (encodedSlash) index += 2;
+    } else slash = false;
+  }
+  return false;
+}
+
+function decode(value: string): string {
+  return value
+    .replace(
+      /\\(?:u\{([0-9a-f]{1,6})\}|u([0-9a-f]{4})|x([0-9a-f]{2})|([0-7]{1,3})|([\s\S]))/giu,
+      (_match, point: string, unicode: string, hex: string, octal: string, literal: string) => {
+        if (point) return String.fromCodePoint(Number.parseInt(point, 16));
+        if (unicode || hex) return String.fromCharCode(Number.parseInt(unicode || hex, 16));
+        if (octal) return String.fromCharCode(Number.parseInt(octal, 8));
+        if (/^[ux]$/iu.test(literal)) throw new Error("ambiguous escape");
+        return ESCAPES[literal] ?? literal;
+      },
+    )
+    .replace(/(?:%[0-9a-f]{2})+/giu, (encoded) => decodeURIComponent(encoded))
+    .replace(
+      /&(?:#(x[0-9a-f]+|[0-9]+)|([a-z][a-z0-9]*));/giu,
+      (entity, numeric: string, name: string) => {
+        if (numeric)
+          return String.fromCodePoint(
+            Number.parseInt(numeric.replace(/^x/iu, ""), /^x/iu.test(numeric) ? 16 : 10),
+          );
+        const key = name.toLowerCase();
+        return Object.hasOwn(ENTITIES, key) ? ENTITIES[key]! : entity;
+      },
+    );
+}
 
 function normalize(value: string): string {
   for (const character of value) {
@@ -93,6 +152,29 @@ export function createTimelineScrubber(
     return false;
   };
   const marker = containsSensitive("[redacted]") ? "" : "[redacted]";
+  const unsafeField = (value: string): boolean => {
+    let canonical = value;
+    for (let pass = 0; pass <= 3; pass += 1) {
+      const labels = canonical
+        .toUpperCase()
+        .toLowerCase()
+        .replace(/[^a-z0-9]/gu, "");
+      if (
+        SENSITIVE_LABEL.test(labels) ||
+        (/[?&]/u.test(canonical) && labels.includes("code")) ||
+        hasUserinfo(canonical) ||
+        ARMORED_START.test(canonical) ||
+        (canonical !== value && scrub(canonical) !== canonical)
+      ) {
+        return true;
+      }
+      if (!ENCODED.test(canonical)) return false;
+      if (pass === 3) return true;
+      canonical = normalize(decode(canonical));
+      if (Buffer.byteLength(canonical, "utf8") > INPUT_LIMIT) return true;
+    }
+    return true;
+  };
   const tooLong = containsSensitive("[too long]") ? marker : "[too long]";
   const protectFragments = (value: string): string => {
     const masked = new Uint8Array(value.length);
@@ -127,22 +209,11 @@ export function createTimelineScrubber(
     const exact = redact(safe, { scrubValues });
     if (typeof exact !== "string") throw new Error("invalid redaction");
     safe = exact.replaceAll("[Redacted]", marker);
-    const privateStart = safe.search(PRIVATE_START);
-    if (privateStart !== -1) {
-      safe = safe.slice(0, privateStart) + marker;
-    }
     safe = safe.replace(PREFIX_TOKEN, marker);
-    safe = safe.replace(AUTHORIZATION, marker);
     safe = safe.replace(
       JWT,
       (match: string, token: string) => match.slice(0, -token.length) + marker,
     );
-    safe = safe.replace(USERINFO, `$1${marker}@`);
-    safe = safe.replace(QUERY, (_match: string, prefix: string) => prefix + marker);
-    safe = safe.replace(ASSIGNMENT, (match: string, prefix: string, quote: string, name: string) =>
-      SENSITIVE_NAME.test(name) ? `${prefix}${quote}${name}${quote}=${marker}` : match,
-    );
-    safe = safe.replace(FLAG, marker);
     return protectFragments(
       safe.replace(ENTROPY_RUN, (candidate) => (highEntropy(candidate) ? marker : candidate)),
     );
@@ -161,6 +232,7 @@ export function createTimelineScrubber(
       }
       const normalized = normalize(value);
       if (Buffer.byteLength(normalized, "utf8") > INPUT_LIMIT) return fallback(tooLong, limit);
+      if (unsafeField(normalized)) return fallback(marker, limit);
       const safe = cut(scrub(cut(scrub(normalized), limit)), limit);
       return containsSensitive(safe) ? "" : safe;
     } catch {

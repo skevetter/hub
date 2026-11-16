@@ -393,6 +393,62 @@ describe("closed stored-event projection", () => {
       value: `--password=${JSON.stringify(ESCAPED_CREDENTIAL)}`,
       secret: ESCAPED_CREDENTIAL,
     },
+    {
+      name: "nested serialized password",
+      value: JSON.stringify({ err: JSON.stringify({ PASSWORD: SHORT_CREDENTIAL }) }),
+      secret: SHORT_CREDENTIAL,
+    },
+    ...[
+      `env=PASSWORD=${["aB3d", "Ef8h", "Q2"].join("")}`,
+      `[DB_PASSWORD=${["aB3d", "Ef8h", "Q2"].join("")}]`,
+      `connect(password=${["aB3d", "Ef8h", "Q2"].join("")})`,
+    ].map((value, index) => ({
+      name: `short boundary assignment ${index}`,
+      value,
+      secret: ["aB3d", "Ef8h", "Q2"].join(""),
+    })),
+    ...[
+      `--password=${SHORT_CREDENTIAL.slice(0, 8)}\\ ${SHORT_CREDENTIAL.slice(8)}`,
+      `PASSWORD=${SHORT_CREDENTIAL.slice(0, 8)}\\ ${SHORT_CREDENTIAL.slice(8)}`,
+      `password: ${SHORT_CREDENTIAL.slice(0, 8)} ${SHORT_CREDENTIAL.slice(8)}`,
+      `password: |\n  ${SHORT_CREDENTIAL}`,
+      `NORMAL=value\nPASSWORD=${SHORT_CREDENTIAL}\nNEXT=value`,
+      `--password ${SHORT_CREDENTIAL}`,
+    ].map((value, index) => ({
+      name: `escaped or multiline password ${index}`,
+      value,
+      secret: SHORT_CREDENTIAL,
+    })),
+    {
+      name: "PostgreSQL password containing an at sign",
+      value: `postgres://user:ab@${["cd1234", "5678"].join("")}@host/db`,
+      secret: ["ab@", "cd1234", "5678"].join(""),
+    },
+    ...["redis", "amqp", "ftp", "mongodb+srv", "https", "custom+app"].map((scheme) => ({
+      name: `${scheme} embedded userinfo at sign`,
+      value: `${scheme}://user:${SHORT_CREDENTIAL}@inside@host/db`,
+      secret: SHORT_CREDENTIAL,
+    })),
+    {
+      name: "encoded userinfo",
+      value: `custom%3A%2F%2Fuser%3A${SHORT_CREDENTIAL}%40inside%40host/db`,
+      secret: SHORT_CREDENTIAL,
+    },
+    {
+      name: "encoded authority with encoded password path delimiters",
+      value: `%63ustom%3a%2f%2fuser%3a${SHORT_CREDENTIAL}%2fpart%40host/db`,
+      secret: SHORT_CREDENTIAL,
+    },
+    {
+      name: "HTML encoded sensitive label",
+      value: `pass&#119;ord=${SHORT_CREDENTIAL}`,
+      secret: SHORT_CREDENTIAL,
+    },
+    {
+      name: "non-key armored block",
+      value: `before\n-----BEGIN PGP MESSAGE-----\n${SHORT_CREDENTIAL}\n-----END PGP MESSAGE-----\nafter`,
+      secret: SHORT_CREDENTIAL,
+    },
     ...["Bearer", "Basic", "Token"].flatMap((scheme) => [
       {
         name: `JSON ${scheme} Authorization`,
@@ -440,7 +496,7 @@ describe("closed stored-event projection", () => {
       for (const { input, field } of inputs) {
         const row = projectTimelineEvent(input, scrub);
         const text = row?.data[field];
-        expect(text).toContain("[redacted]");
+        expect(text).toBe("[redacted]");
         for (let index = 0; index <= secret.length - 8; index += 1) {
           const fragment = secret.slice(index, index + 8);
           expect(text).not.toContain(fragment);

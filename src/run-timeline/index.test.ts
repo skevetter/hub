@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterEach, describe, it, vi } from "vitest";
 import type { DaemonAgentStreamEvent } from "../daemons/protocol.js";
 import { HubExecutionAgentStreamEventSchema } from "../hub/protocol.js";
@@ -304,6 +304,34 @@ describe("RunTimeline capture", () => {
         ["tool_finished", undefined],
       ],
     );
+  });
+
+  it("durably deduplicates a sensitive call id across two events without storing it raw or collapsing distinct ids", async () => {
+    const stepId = "password_step";
+    const { database, run, executions } = await fixture([stepId]);
+    const executionId = executions[0]!.id;
+    const callIds = ["password_first", "password_second"];
+    const first = capture(database).timeline;
+    first.begin(executionId);
+    for (const callId of callIds) observe(first, executionId, tool("completed", callId));
+    await first.flush();
+    await first.stop();
+    captures.delete(first);
+    const resumed = capture(database).timeline;
+    resumed.begin(executionId);
+    for (const callId of callIds) observe(resumed, executionId, tool("completed", callId));
+    await resumed.flush();
+    const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
+    assert.deepEqual(
+      rows.map((row) => [row.kind, row.stepId, row.data["callId"]]),
+      callIds.map((callId) => [
+        "tool_finished",
+        stepId,
+        createHash("sha256").update(callId).digest("hex").slice(0, 16),
+      ]),
+    );
+    for (const callId of callIds) assert.equal(JSON.stringify(rows).includes(callId), false);
+    assert.notEqual(rows[0]!.data["callId"], rows[1]!.data["callId"]);
   });
 
   it("keeps a reused call id distinct in two steps, including UTF-8 step ids shortened by the shared hash helper", async () => {
