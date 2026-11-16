@@ -121,6 +121,12 @@ export interface UpdateRunProgressMessageInput extends RunProgressLeaseInput {
 }
 export interface RunTimelineStore {
   appendRunTimelineEvent(input: AppendRunTimelineEventInput): Promise<AppendRunTimelineEventResult>;
+  recordRunTimelineDrops(
+    organizationId: string,
+    runId: string,
+    count: number,
+    at: Date,
+  ): Promise<{ seq: number; inserted: boolean } | undefined>;
   listRunTimelineEvents(
     organizationId: string,
     runId: string,

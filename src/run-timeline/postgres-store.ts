@@ -36,6 +36,49 @@ const MESSAGE = `trigger_run_id as "triggerRunId", organization_id as "organizat
 export class RunTimelineRepository {
   constructor(private readonly runtime: DatabaseRuntime) {}
 
+  async recordRunTimelineDrops(organizationId: string, runId: string, count: number, at: Date) {
+    if (!Number.isSafeInteger(count) || count <= 0)
+      throw new RangeError("Invalid timeline drop count");
+    return this.runtime.transaction(async (transaction) => {
+      const run = await transaction.query(
+        `select id from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' for key share`,
+        [runId, organizationId],
+      );
+      if (run.rowCount === 0) return undefined;
+      await transaction.query(
+        `insert into run_timeline_state (trigger_run_id, organization_id, origin) values ($1, $2, 'captured') on conflict do nothing`,
+        [runId, organizationId],
+      );
+      const state = (
+        await transaction.query<Row<RunTimelineState>>(
+          `select ${STATE} from run_timeline_state where trigger_run_id = $1 and organization_id = $2 for update`,
+          [runId, organizationId],
+        )
+      ).rows[0]!;
+      if (state.expiredAt !== null) return undefined;
+      await transaction.query(
+        `update run_timeline_state set dropped_count = dropped_count + $2 where trigger_run_id = $1`,
+        [runId, count],
+      );
+      if (state.sealedSeq !== null) return { seq: state.eventCount, inserted: false };
+      const notice = await transaction.query(
+        `select 1 from run_timeline_events where trigger_run_id = $1 and kind = 'truncated'`,
+        [runId],
+      );
+      if (notice.rowCount !== 0) return { seq: state.eventCount, inserted: false };
+      const seq = state.eventCount + 1;
+      await transaction.query(
+        `insert into run_timeline_events (trigger_run_id, organization_id, seq, kind, at, step_id, data) values ($1, $2, $3, 'truncated', $4, '', $5::jsonb)`,
+        [runId, organizationId, seq, at, JSON.stringify({ dropped: state.droppedCount + count })],
+      );
+      await transaction.query(
+        `update run_timeline_state set event_count = $2 where trigger_run_id = $1`,
+        [runId, seq],
+      );
+      return { seq, inserted: true };
+    });
+  }
+
   async appendRunTimelineEvent(
     input: AppendRunTimelineEventInput,
   ): Promise<AppendRunTimelineEventResult> {

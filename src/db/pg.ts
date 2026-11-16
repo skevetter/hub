@@ -151,6 +151,12 @@ class PgDatabase implements Database {
   private readonly timeline;
   appendRunTimelineEvent: RunTimelineStore["appendRunTimelineEvent"] = (input) =>
     this.timeline.appendRunTimelineEvent(input);
+  recordRunTimelineDrops: RunTimelineStore["recordRunTimelineDrops"] = (
+    organizationId,
+    runId,
+    count,
+    at,
+  ) => this.timeline.recordRunTimelineDrops(organizationId, runId, count, at);
   listRunTimelineEvents: RunTimelineStore["listRunTimelineEvents"] = (
     organizationId,
     runId,

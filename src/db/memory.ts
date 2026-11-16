@@ -369,6 +369,46 @@ class MemoryDatabase implements Database {
     return { seq: event.seq, inserted: true };
   }
 
+  async recordRunTimelineDrops(organizationId: string, runId: string, count: number, at: Date) {
+    if (!Number.isSafeInteger(count) || count <= 0)
+      throw new RangeError("Invalid timeline drop count");
+    const run = this.triggerRuns.get(runId);
+    if (run === undefined || run.organizationId !== organizationId || run.outcome !== "accepted")
+      return undefined;
+    let state = this.runTimelineStates.get(runId);
+    if (state?.expiredAt != null) return undefined;
+    if (state === undefined) {
+      const opened = this.openTimelineForAppend(
+        {
+          triggerRunId: runId,
+          organizationId,
+          kind: "truncated",
+          at,
+          data: {},
+          origin: "captured",
+        },
+        undefined,
+      );
+      if (opened === undefined || !("eventCount" in opened)) return undefined;
+      state = opened;
+    }
+    state.droppedCount += count;
+    const notice =
+      this.runTimelineEvents.get(runId)?.some((event) => event.kind === "truncated") ?? false;
+    if (state.sealedSeq !== null || notice) return { seq: state.eventCount, inserted: false };
+    const seq = state.eventCount + 1;
+    this.insertTimelineEvent(state, {
+      triggerRunId: runId,
+      organizationId,
+      seq,
+      kind: "truncated",
+      at: new Date(at),
+      stepId: "",
+      data: { dropped: state.droppedCount },
+    });
+    return { seq, inserted: true };
+  }
+
   private openTimelineForAppend(
     input: AppendRunTimelineEventInput,
     dedupeKey: string | undefined,
