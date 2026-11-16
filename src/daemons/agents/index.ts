@@ -46,6 +46,7 @@ export class DaemonAgentError extends Error {}
 /** The ordinary daemon protocol. This channel knows nothing about Hub executions or triggers. */
 export class DaemonAgents implements AgentConnection {
   private supported = false;
+  private closed = false;
   private readonly pending = new Map<
     string,
     { resolve: (value: Record<string, unknown>) => void; reject: (error: Error) => void }
@@ -59,6 +60,7 @@ export class DaemonAgents implements AgentConnection {
   ) {}
 
   receive(value: unknown): boolean {
+    if (this.closed) return false;
     const envelope = EnvelopeSchema.safeParse(value);
     if (!envelope.success) return false;
     const { type, payload } = envelope.data.message;
@@ -105,6 +107,9 @@ export class DaemonAgents implements AgentConnection {
   }
 
   close(): void {
+    this.closed = true;
+    this.supported = false;
+    this.observing = false;
     for (const pending of this.pending.values()) pending.reject(new DaemonResponseLostError());
     this.pending.clear();
     this.listeners.clear();
@@ -150,6 +155,7 @@ export class DaemonAgents implements AgentConnection {
     try {
       await this.request({ type: "workspace.title.set.request", workspaceId, title });
     } catch (error) {
+      if (this.closed) throw error;
       this.reportFailure(error, "daemon.workspace.title.set");
     }
   }
@@ -198,6 +204,7 @@ export class DaemonAgents implements AgentConnection {
     );
   }
   async watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void> {
+    this.assertOpen();
     const listeners = this.listeners.get(agentId) ?? new Set();
     listeners.add(listener);
     this.listeners.set(agentId, listeners);
@@ -208,6 +215,7 @@ export class DaemonAgents implements AgentConnection {
           includeBackground: true,
           subscribe: { subscriptionId: "hub-continuation" },
         });
+        this.assertOpen();
         this.observing = true;
       }
       await this.request({
@@ -218,6 +226,7 @@ export class DaemonAgents implements AgentConnection {
       // Fetch individually: the directory is paginated and later watches share its subscription.
       try {
         const response = await this.request({ type: "fetch_agent_request", agentId });
+        this.assertOpen();
         const agent = SnapshotSchema.safeParse(response["agent"]);
         if (agent.success && agent.data.id === agentId)
           listener({
@@ -226,13 +235,16 @@ export class DaemonAgents implements AgentConnection {
             timestamp: this.now().toISOString(),
           });
       } catch (error) {
+        if (this.closed) throw error;
         // Snapshot reads are best effort; older daemons keep their live subscription usable.
         this.reportFailure(error, "daemon.agent.watch.snapshot");
       }
     } catch (error) {
       listeners.delete(listener);
+      if (listeners.size === 0) this.listeners.delete(agentId);
       throw error;
     }
+    this.assertOpen();
     return () => {
       listeners.delete(listener);
       if (listeners.size === 0) this.listeners.delete(agentId);
@@ -241,10 +253,14 @@ export class DaemonAgents implements AgentConnection {
   private emit(agentId: string, event: AgentEvent): void {
     for (const listener of this.listeners.get(agentId) ?? []) listener(event);
   }
+  private assertOpen(): void {
+    if (this.closed) throw new DaemonAgentError("Daemon agent connection is closed");
+  }
   private async request(
     message: Record<string, unknown>,
     timeoutMs = 30_000,
   ): Promise<Record<string, unknown>> {
+    this.assertOpen();
     if (!this.supported) throw new DaemonAgentError("Update the Paseo daemon to run Hub agents");
     const requestId = randomUUID();
     let timeout: ReturnType<typeof setTimeout> | undefined;
