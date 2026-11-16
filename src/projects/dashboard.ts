@@ -9,7 +9,6 @@ import type {
   ProviderEventReceiptSummary,
   ProviderEventReceiptRecord,
   TriggerRunRecord,
-  WorkflowDeadlineKind,
   WorkflowStepRunRecord,
 } from "../db/types.js";
 import { formatInvocationRejection } from "../triggers/invocation.js";
@@ -35,44 +34,28 @@ export type JsonValue =
 export interface ActivityRunDetail {
   run: {
     id: string;
-    providerEventReceiptId: string;
     provider: ProviderEventReceiptRecord["provider"];
-    deliveryId: string;
     source: string;
     repo: string | null;
     receivedAt: string;
-    rawPayload: JsonValue;
     configuredTriggerName: string;
-    prompt: string;
-    inputs: JsonValue;
-    values: JsonValue;
-    triggerContext: JsonValue;
-    outputContext: JsonValue;
     createdAt: string;
     completedAt: string | null;
     outcome: TriggerRunRecord["outcome"];
     status: TriggerRunRecord["status"];
-    deadlineAt: string | null;
-    deadlineKind: WorkflowDeadlineKind | null;
     failureReason: string | null;
-    rejectionReason: string | null;
   };
   steps: {
-    agentId: AgentExecutionRecord["daemonAgentId"];
-    agentSessionId: AgentExecutionRecord["agentSessionId"];
-    agentSessionAction: AgentExecutionRecord["agentSessionAction"];
-    agentExecutionId: string | null;
     id: string;
     stepId: string;
     ordinal: number;
     status: WorkflowStepRunRecord["status"];
-    deadlineAt: string | null;
-    idleDeadlineAt: string | null;
-    deadlineKind: WorkflowDeadlineKind | null;
     startedAt: string | null;
     output: JsonValue;
     failureReason: string | null;
     completedAt: string | null;
+    isAgent: boolean;
+    completion: "explicit_finish" | "inferred_from_turn_end" | null;
   }[];
 }
 
@@ -187,18 +170,59 @@ export class ProjectDashboard {
       scope.runId,
     );
     if (activity === undefined) return null;
-    const view = activityRunView(
-      activity,
-      await Promise.all(
-        activity.steps.map(async (step) =>
-          step.agentExecutionId === null
-            ? undefined
-            : this.database.findAgentExecutionById(step.agentExecutionId),
-        ),
+    const executions = await Promise.all(
+      activity.steps.map(async (step) =>
+        step.agentExecutionId === null
+          ? undefined
+          : this.database.findAgentExecutionById(step.agentExecutionId),
       ),
     );
-    const { steps, ...run } = view;
-    return { run, steps };
+    const { run, receipt, steps } = activity;
+    return {
+      run: {
+        id: run.id,
+        provider: receipt.provider,
+        source: receipt.source,
+        repo: receipt.repo,
+        receivedAt: receipt.receivedAt.toISOString(),
+        configuredTriggerName: run.configuredTriggerName,
+        createdAt: run.createdAt.toISOString(),
+        completedAt: run.completedAt?.toISOString() ?? null,
+        outcome: run.outcome,
+        status: run.status,
+        failureReason:
+          run.outcome === "rejected"
+            ? formatInvocationRejection(run.rejection)
+            : displayFailureReason(run.failureReason),
+      },
+      steps: steps.map((step, index) => {
+        const execution = executions[index];
+        const result = execution?.result;
+        let completion: "explicit_finish" | "inferred_from_turn_end" | null = null;
+        if (execution?.completedByAgentAt != null) {
+          completion = "explicit_finish";
+        } else if (
+          result !== null &&
+          typeof result === "object" &&
+          "completion" in result &&
+          result.completion === "inferred_from_turn_end"
+        ) {
+          completion = "inferred_from_turn_end";
+        }
+        return {
+          id: step.id,
+          stepId: step.stepId,
+          ordinal: step.ordinal,
+          status: step.status,
+          startedAt: step.startedAt?.toISOString() ?? null,
+          completedAt: step.completedAt?.toISOString() ?? null,
+          output: jsonValue(step.output),
+          failureReason: displayFailureReason(step.failureReason),
+          isAgent: step.agentExecutionId !== null,
+          completion,
+        };
+      }),
+    };
   }
 
   async createProject(

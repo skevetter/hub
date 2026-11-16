@@ -25,6 +25,11 @@ const STEP_COLUMNS = [
 ];
 const EMPTY_STEPS = { title: "No steps" };
 
+export function pollActiveRun(refetch: (options?: { cancelRefetch?: boolean }) => void) {
+  const timer = setInterval(() => refetch({ cancelRefetch: false }), 5_000);
+  return () => clearInterval(timer);
+}
+
 export function TriggerActivityRunPanel({ runId }: { runId: string }) {
   const tenant = useRouteTenant();
   const organizationSlug = tenant.organization.slug;
@@ -39,8 +44,7 @@ export function TriggerActivityRunPanel({ runId }: { runId: string }) {
     snapshot.data.run.completedAt === null;
   useEffect(() => {
     if (!active) return undefined;
-    const timer = setInterval(snapshot.refetch, 5_000);
-    return () => clearInterval(timer);
+    return pollActiveRun(snapshot.refetch);
   }, [active, snapshot.refetch]);
   if (snapshot.status === "pending")
     return <PageHeader title="Run detail" description="Loading run…" />;
@@ -127,22 +131,25 @@ export function ActivityRunDetail({ detail }: { detail: RunDetail }) {
 }
 
 function StepOutput({ step }: { step: RunDetail["steps"][number] }) {
-  if (step.output === null) return "No output";
-  if (step.agentExecutionId === null && isScriptStepOutput(step.output)) {
+  const completion = step.isAgent ? step.completion : null;
+  if (!step.isAgent && isScriptStepOutput(step.output)) {
     return <ScriptStepOutput stepId={step.id} status={step.status} output={step.output} />;
   }
-  if (step.output !== null && typeof step.output === "object" && !Array.isArray(step.output)) {
-    const output = step.output;
-    if ("completion" in output && typeof output["completion"] === "string") {
-      return (
-        <>
-          <span>Completion: {output["completion"]}</span>
-          <PlainOutput id={step.id} value={"output" in output ? output["output"] : output} />
-        </>
-      );
-    }
+  let output = step.output;
+  if (
+    completion === "inferred_from_turn_end" &&
+    output !== null &&
+    typeof output === "object" &&
+    !Array.isArray(output)
+  ) {
+    output = output["output"] ?? null;
   }
-  return <PlainOutput id={step.id} value={step.output} />;
+  return (
+    <>
+      {completion === null ? null : <span>Completion: {completion}</span>}
+      {output === null ? "No output" : <PlainOutput id={step.id} value={output} />}
+    </>
+  );
 }
 
 function PlainOutput({ id, value }: { id: string; value: unknown }) {

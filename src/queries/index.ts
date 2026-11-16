@@ -21,7 +21,10 @@ export function useSnapshotQuery<T>(options: {
   queryFn: () => Promise<Result<T>>;
   enabled?: boolean;
   refetchInterval?: number;
-}): Snapshot<T> & { refetch: () => void; isFetching: boolean } {
+}): Snapshot<T> & {
+  refetch: (options?: { cancelRefetch?: boolean }) => void;
+  isFetching: boolean;
+} {
   const query = useQuery({
     ...options,
     queryFn: async () => {
@@ -32,9 +35,12 @@ export function useSnapshotQuery<T>(options: {
     retry: 2,
   });
   const reload = query.refetch;
-  const refetch = useCallback(() => {
-    void reload();
-  }, [reload]);
+  const refetch = useCallback(
+    (refetchOptions?: { cancelRefetch?: boolean }) => {
+      void reload(refetchOptions);
+    },
+    [reload],
+  );
   if (query.data !== undefined)
     return {
       status: "success",

@@ -192,13 +192,24 @@ describe("project dashboard activity read models", () => {
     });
     assert.ok(organizationDetail);
     assert.equal(organizationDetail.run.id, run.run.id);
-    assert.deepEqual(organizationDetail.run.rawPayload, rawPayload);
-    assert.deepEqual(organizationDetail.run.triggerContext, triggerContext);
+    for (const key of [
+      "rawPayload",
+      "triggerContext",
+      "outputContext",
+      "inputs",
+      "values",
+      "prompt",
+      "deliveryId",
+      "providerEventReceiptId",
+    ]) {
+      assert.equal(key in organizationDetail.run, false);
+    }
     assert.deepEqual(
       organizationDetail.steps.map((step) => step.stepId),
       ["step"],
     );
-    assert.equal(organizationDetail.steps[0]?.agentExecutionId, null);
+    assert.equal(organizationDetail.steps[0]?.isAgent, false);
+    assert.equal(organizationDetail.steps[0]?.completion, null);
     assert.equal(organizationDetail.steps[0]?.output, null);
     assert.equal(
       await dashboard.activityRunDetail(request, {
