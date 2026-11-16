@@ -155,7 +155,7 @@ export class DaemonAgents implements AgentConnection {
     try {
       await this.request({ type: "workspace.title.set.request", workspaceId, title });
     } catch (error) {
-      if (this.closed) throw error;
+      if (this.closed || error instanceof DaemonResponseLostError) throw error;
       this.reportFailure(error, "daemon.workspace.title.set");
     }
   }
@@ -235,7 +235,7 @@ export class DaemonAgents implements AgentConnection {
             timestamp: this.now().toISOString(),
           });
       } catch (error) {
-        if (this.closed) throw error;
+        if (this.closed || error instanceof DaemonResponseLostError) throw error;
         // Snapshot reads are best effort; older daemons keep their live subscription usable.
         this.reportFailure(error, "daemon.agent.watch.snapshot");
       }
@@ -254,7 +254,7 @@ export class DaemonAgents implements AgentConnection {
     for (const listener of this.listeners.get(agentId) ?? []) listener(event);
   }
   private assertOpen(): void {
-    if (this.closed) throw new DaemonAgentError("Daemon agent connection is closed");
+    if (this.closed) throw new DaemonResponseLostError();
   }
   private async request(
     message: Record<string, unknown>,

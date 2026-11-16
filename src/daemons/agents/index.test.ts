@@ -1,7 +1,7 @@
 import { setImmediate } from "node:timers/promises";
 import { z } from "zod";
 import { expect, test, vi } from "vitest";
-import { DaemonAgentError, DaemonAgents, type AgentEvent } from "./index.js";
+import { DaemonAgents, type AgentEvent } from "./index.js";
 import { DaemonResponseLostError, type DaemonCreateAgentOptions } from "../protocol.js";
 
 const prompt = "Full request context. ".repeat(1_000) + "End.";
@@ -141,7 +141,7 @@ test("a lost response remains recoverable instead of reporting a rejected creati
 });
 
 test.each(["create", "get", "send", "restore", "interrupt", "archive", "watch"] as const)(
-  "%s rejects after close without sending a frame or reopening on server info",
+  "%s remains recoverable after close without sending a frame or reopening on server info",
   async (operation) => {
     const frames: string[] = [];
     const agents = new DaemonAgents((frame) => frames.push(frame));
@@ -157,13 +157,12 @@ test.each(["create", "get", "send", "restore", "interrupt", "archive", "watch"] 
       return agents.control("agent", "workspace", operation);
     };
     const outcome = start().catch((error: unknown) => error);
-    expect(await outcome).toBeInstanceOf(DaemonAgentError);
-    expect(await outcome).toMatchObject({ message: "Daemon agent connection is closed" });
+    expect(await outcome).toBeInstanceOf(DaemonResponseLostError);
     expect(frames).toEqual([]);
   },
 );
 
-test("a send resuming after an awaited dispatch step cannot use a closed connection", async () => {
+test("a send resuming after an awaited dispatch step reports recoverable transport loss", async () => {
   const frames: string[] = [];
   const agents = new DaemonAgents((frame) => frames.push(frame));
   enable(agents);
@@ -174,7 +173,7 @@ test("a send resuming after an awaited dispatch step cannot use a closed connect
   })().catch((error: unknown) => error);
   agents.close();
   ready.resolve();
-  expect(await dispatch).toMatchObject({ message: "Daemon agent connection is closed" });
+  expect(await dispatch).toBeInstanceOf(DaemonResponseLostError);
   expect(frames).toEqual([]);
 });
 
@@ -293,8 +292,70 @@ test.each(["title", "restore", "watch"] as const)(
       if (operation === "restore") return agents.restore("workspace");
       return agents.watch("agent", () => {});
     };
-    await expect(start()).rejects.toThrow("Daemon agent connection is closed");
+    await expect(start()).rejects.toBeInstanceOf(DaemonResponseLostError);
     expect(frames).toHaveLength(1);
+  },
+);
+
+test.each(["title", "watch"] as const)(
+  "a lost %s response remains recoverable instead of being swallowed as best effort",
+  async (operation) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const failures: unknown[] = [];
+    const requests: Record<string, unknown>[] = [];
+    const events: AgentEvent[] = [];
+    const agents = new DaemonAgents(
+      (frame) => {
+        const { message } = z
+          .object({ message: z.record(z.string(), z.unknown()) })
+          .parse(JSON.parse(frame));
+        requests.push(message);
+        if (
+          message["type"] ===
+          (operation === "title" ? "workspace.title.set.request" : "fetch_agent_request")
+        )
+          return;
+        agents.receive({
+          type: "session",
+          message: {
+            type: "response",
+            payload: {
+              requestId: message["requestId"],
+              agent: { id: "agent", workspaceId: "workspace", status: "idle" },
+            },
+          },
+        });
+      },
+      undefined,
+      (error) => failures.push(error),
+    );
+    enable(agents);
+    try {
+      const outcome = (
+        operation === "title"
+          ? agents.create("key", { ...options, workspaceTitle: "Workspace" })
+          : agents.watch("agent", (event) => events.push(event))
+      ).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(await outcome).toBeInstanceOf(DaemonResponseLostError);
+      expect(failures).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(requests).toHaveLength(operation === "title" ? 2 : 3);
+      agents.receive({
+        type: "session",
+        message: {
+          type: "agent_update",
+          payload: {
+            kind: "upsert",
+            agent: { id: "agent", workspaceId: "workspace", status: "idle" },
+          },
+        },
+      });
+      expect(events).toEqual([]);
+    } finally {
+      agents.close();
+      vi.useRealTimers();
+    }
   },
 );
 

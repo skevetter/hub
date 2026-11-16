@@ -1121,6 +1121,70 @@ describe("daemon enrollment and execution", () => {
     assert.equal(hub.createdAgentCount(), 1);
   });
 
+  it("keeps a direct dispatch paused across a database await recoverable after daemon replacement", async () => {
+    const daemonId = await hub.connectDaemon();
+    hub.holdSessionAttachment();
+    const dispatch = hub.beginDispatch();
+    const outcome = dispatch.catch((error: unknown) => error);
+    const executionId = await hub.sessionAttachmentBegins();
+    try {
+      const suspended = await hub.execution(executionId);
+      assert.equal(suspended.status, "spawning");
+      assert.notEqual(suspended.agentSessionId, null);
+      assert.equal(suspended.daemonAgentId, null);
+      assert.equal(hub.createdAgentRequestCount(), 0);
+      await hub.replaceDaemon({ acceptSpawns: true });
+      assert.equal(hub.createdAgentRequestCount(), 0);
+    } finally {
+      hub.releaseSessionAttachment();
+    }
+
+    assert.ok((await outcome) instanceof DaemonResponseLostError);
+    const recovered = await hub.waitForRecoveredExecution(executionId, "running");
+    assert.equal(recovered.daemonId, daemonId);
+    assert.equal(recovered.result, null);
+    assert.equal(hub.failureHookCount(), 0);
+    assert.equal(hub.createdAgentRequestCount(), 1);
+    assert.equal(hub.createdAgentCount(), 1);
+    assert.equal(hub.createdAgentLaunch().prompt, "Reply pong.");
+  });
+
+  it.each(["durable dispatch", "recovery"] as const)(
+    "retries %s paused across a database await through the replacement daemon",
+    async (operation) => {
+      const daemonId = await hub.connectDaemon();
+      await hub.installConfiguration({ yaml: hub.manualConfigurationYaml() });
+      hub.holdSessionAttachment();
+      const batch =
+        operation === "durable dispatch"
+          ? await hub.handoffBatch(["suspended-replacement"])
+          : await hub.persistUnlaunchedBatch(["suspended-replacement"]);
+      const pending = batch.executions[0];
+      assert(pending !== undefined);
+      try {
+        if (operation === "recovery") await hub.replaceDaemon({ acceptSpawns: true });
+        assert.equal(await hub.sessionAttachmentBegins(), pending.id);
+        const suspended = await hub.execution(pending.id);
+        assert.equal(suspended.status, "spawning");
+        assert.notEqual(suspended.agentSessionId, null);
+        assert.equal(suspended.daemonAgentId, null);
+        assert.equal(hub.createdAgentRequestCount(), 0);
+        await hub.replaceDaemon({ acceptSpawns: true });
+        assert.equal(hub.createdAgentRequestCount(), 0);
+      } finally {
+        hub.releaseSessionAttachment();
+      }
+
+      const recovered = await hub.waitForRecoveredExecution(pending.id, "running");
+      assert.equal(recovered.daemonId, daemonId);
+      assert.equal(recovered.result, null);
+      assert.equal(hub.failureHookCount(), 0);
+      assert.equal(hub.createdAgentRequestCount(), 1);
+      assert.equal(hub.createdAgentCount(), 1);
+      assert.equal(hub.createdAgentLaunch().prompt, "Reply pong.");
+    },
+  );
+
   it("keeps an ambiguous direct create nonterminal when its socket closes", async () => {
     const daemonId = await hub.connectDaemon();
     hub.holdSpawnAcknowledgement();

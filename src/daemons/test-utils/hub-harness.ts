@@ -181,6 +181,15 @@ export class HubHarness {
   private acceptanceHookFails = false;
   private acceptanceGate: { promise: Promise<void>; release(): void } | undefined;
   private materializationGate: { promise: Promise<void>; release(): void } | undefined;
+  private sessionAttachmentGate:
+    | {
+        claimed: boolean;
+        reached: Promise<string>;
+        markReached(executionId: string): void;
+        released: Promise<void>;
+        release(): void;
+      }
+    | undefined;
   private recoveryRefreshGate:
     | {
         executionId: string;
@@ -947,6 +956,25 @@ export class HubHarness {
   }
   launchMaterializationCount(): number {
     return this.materializations;
+  }
+  holdSessionAttachment(): void {
+    const reached = Promise.withResolvers<string>();
+    const released = Promise.withResolvers<void>();
+    this.sessionAttachmentGate = {
+      claimed: false,
+      reached: reached.promise,
+      markReached: reached.resolve,
+      released: released.promise,
+      release: released.resolve,
+    };
+  }
+  sessionAttachmentBegins(): Promise<string> {
+    if (this.sessionAttachmentGate === undefined) throw new Error("Session attachment is not held");
+    return this.sessionAttachmentGate.reached;
+  }
+  releaseSessionAttachment(): void {
+    this.sessionAttachmentGate?.release();
+    this.sessionAttachmentGate = undefined;
   }
   holdRecoveryRefresh(executionId: string): void {
     let markReached!: () => void;
@@ -1990,6 +2018,19 @@ export class HubHarness {
               await activityGate.released;
             }
             return target.findAgentExecutionById(executionId);
+          };
+        }
+        if (property === "attachExecutionToSession") {
+          return async (...args: Parameters<Database["attachExecutionToSession"]>) => {
+            const gate = this.sessionAttachmentGate;
+            if (gate !== undefined && !gate.claimed) {
+              gate.claimed = true;
+              await target.attachExecutionToSession(...args);
+              gate.markReached(args[0]);
+              await gate.released;
+              return;
+            }
+            return target.attachExecutionToSession(...args);
           };
         }
         const value: unknown = Reflect.get(target, property);
