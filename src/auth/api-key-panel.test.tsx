@@ -111,6 +111,19 @@ describe("API key form", () => {
     );
   });
 
+  it("submits the read-only timeline scope without granting dispatch", () => {
+    const markup = renderFields("Timeline reader", ["runs:read"]);
+    assert.match(markup, /Read run timelines/u);
+    const checkbox = [...markup.matchAll(/<input\b[^>]*>/gu)].find(([element]) =>
+      element.includes('value="runs:read"'),
+    )?.[0];
+    assert.ok(checkbox);
+    assert.match(checkbox, /checked=""/u);
+    const result = apiKeyFormPayload(form(["runs:read"]));
+    assert.equal(result.success, true);
+    if (result.success) assert.deepEqual(result.data.scopes, ["runs:read"]);
+  });
+
   it("renders the reusable checkbox list with empty selection meaning any allowed actor trigger", () => {
     const markup = renderToStaticMarkup(<ApiKeyTriggerField triggers={triggers} />);
     assert.match(markup, /Allowed triggers/u);

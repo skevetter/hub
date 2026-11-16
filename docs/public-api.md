@@ -18,10 +18,15 @@ Hub exposes organization-scoped operator operations under `/api/v1`:
 Create a scoped API key in the Hub dashboard or approve `paseo hub login` in the browser, then send the resulting organization credential as `Authorization: Bearer <credential>`. CLI credentials carry all current operator scopes, are stored server-side only as verifiers, and can be revoked under Settings, API keys, CLI logins. They are not daemon credentials and cannot call the hooks endpoint.
 
 The available API key scopes are `projects:read`, `configuration:validate`, `configuration:install`,
-`runs:dispatch`, `events:send`, and `daemons:enroll`. Grant only the scopes a sender needs.
+`runs:dispatch`, `runs:read`, `events:send`, and `daemons:enroll`. Grant only the scopes a sender needs.
 `events:send` authorizes hooks only, not manual-runs. Hooks require an API key with a bound actor;
 optional allowed trigger names further restrict it. See [authenticated webhook triggers](webhooks.md)
 for key creation, executable examples, response and error tables, retries, limits and retention.
+
+`runs:read` is reserved for authenticated run timeline reads. It does not grant dispatch access.
+The timeline store and its retention are available, but capture and streaming are not enabled by this build.
+CLI credentials also include this scope. Before rolling back to a build without it, revoke keys
+that hold `runs:read`, because older builds reject that scope when authenticating a key.
 
 CLI login starts anonymously at `POST /api/v1/cli-authorizations` and polls at `POST /api/v1/cli-authorizations/poll`. An authenticated owner or admin explicitly approves the active organization at `/cli-login`. The expiring grant is poll-throttled and discloses its durable credential exactly once. Daemons enroll only through the short-lived, single-use token issued by the authenticated enrollment-token operation. A daemon may connect with no permissions and remain available for identity and presence only; only daemons that explicitly grant `hub.execute` are eligible workflow targets.
 

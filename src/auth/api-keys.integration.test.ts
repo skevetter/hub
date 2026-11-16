@@ -159,6 +159,32 @@ describe("organization API-key boundary", () => {
     assert.notEqual(used?.lastUsedAt, null);
   });
 
+  it("issues run readers without granting dispatch and keeps dispatch separate", async () => {
+    const reader = await auth.apiKeys!.create("organization-a", "user-a", "Timeline reader", [
+      "runs:read",
+    ]);
+    const sender = await auth.apiKeys!.create("organization-a", "user-a", "Run sender", [
+      "runs:dispatch",
+    ]);
+    try {
+      assert.equal(
+        (await auth.apiKeys!.authorize(request(reader.secret), "runs:read")).status,
+        "authorized",
+      );
+      assert.equal(
+        (await auth.apiKeys!.authorize(request(reader.secret), "runs:dispatch")).status,
+        "forbidden",
+      );
+      assert.equal(
+        (await auth.apiKeys!.authorize(request(sender.secret), "runs:read")).status,
+        "forbidden",
+      );
+    } finally {
+      await auth.apiKeys!.revoke("organization-a", reader.summary.id);
+      await auth.apiKeys!.revoke("organization-a", sender.summary.id);
+    }
+  });
+
   it("authenticates every public v1 operation across the real PostgreSQL key matrix", async () => {
     const database = await createDatabase(databaseUrl);
     const projectSlug = `public-api-${randomUUID()}`;
