@@ -6,6 +6,8 @@ runs the script there, and records the exit code and the end of the output in th
 
 Hub does not check that the script works on the host. You own that. Hub reports what happened.
 
+To start a script from your own service with a bound API key, see [authenticated webhook triggers](webhooks.md).
+
 ## Where to see a script's result
 
 Open **Activity** and select the run to see its status, exit code, and output. Hub stores the
@@ -101,7 +103,7 @@ Save each as its own trigger. The two do not wait for each other and do not shar
 
 The script gets the event as JSON in the `HUB_EVENT_JSON` environment variable. It is the same
 JSON an agent prompt receives for `${{ paseo.context }}`: the notification, the GitHub, Slack,
-Discord or Linear event, or the schedule tick.
+Discord or Linear event, the schedule tick, or a manual or webhook event.
 
 Hub passes the event and the script as separate arguments to the terminal's process, never inside a
 shell string, so event text cannot change what the shell runs. Both arguments are visible in the
@@ -242,12 +244,12 @@ permission to run code there. Hub refuses to save a script trigger that is not s
   `HUB_EVENT_JSON`. Treat the event data as untrusted, and use script triggers on private
   repositories.
 - **Schedules.** A `schedule.tick` script needs no audience. Only Hub starts it.
-- **Manual runs.** Script actions on `manual.run` are not available yet. The actor on a manual run,
-  like every API call, is a string the caller chooses, so `from_users` cannot keep anyone out of
-  the script: whoever can call the API can name an allowed user. `from_users` is a filter on events
-  that arrive signed from a provider. It is not an authorization boundary for API callers. Hub
-  refuses the trigger with `Script actions on manual.run are not available yet`, until a manual
-  run's actor comes from something the caller cannot pick, such as an API key bound to one actor.
+- **Manual runs and webhooks.** A `manual.run` script must name its allowed actors in
+  `filters.from_users`; a wildcard or empty audience is refused. Both the hooks and manual-runs
+  endpoints require an API key with a bound actor for script actions, returning
+  `403 key_actor_required` for an unbound key or CLI credential. Hooks always uses the bound
+  actor. Manual-runs permits no different body actor and returns `403 actor_forbidden` for one.
+  Event data reaches the script only through `HUB_EVENT_JSON`, never through command templates.
 
 The same event can still start an agent trigger for everyone. The checks apply to the script
 trigger alone.
@@ -269,7 +271,7 @@ every daemon that grants Hub the permissions above, so give that role carefully.
 | The daemon is not connected to this Hub, so it cannot run the script.                                                                                          | Connect the daemon. A script runs only on a daemon connected to this Hub process.           |
 | trigger `<name>` runs a script, so `<event>` needs filters.from_users...                                                                                       | Name the people allowed to start it.                                                        |
 | trigger `<name>` runs a script on github.notification...                                                                                                       | Set both `filters.repo` and `filters.reason`, and use a reason that is not a mention.       |
-| Script actions on manual.run are not available yet...                                                                                                          | Use a schedule, a GitHub notification, or another external event.                           |
+| key_actor_required on a manual or webhook script run                                                                                                           | Use an API key with a bound actor named in filters.from_users, not a CLI credential.        |
 | script text is not templated...                                                                                                                                | Remove the `${{ }}` and read `HUB_EVENT_JSON` in the script.                                |
 
 ## Ownership

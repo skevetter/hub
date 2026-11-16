@@ -7,6 +7,8 @@ GitHub App, no connection, and nothing stored in the database except a cursor.
 Use it when you want a run for events that only reach you as a notification, such as a review request
 or a mention, in repositories where you cannot install an app.
 
+For events sent directly by your own services with an API key, use [authenticated webhook triggers](webhooks.md).
+
 ## Set up
 
 1. Create a classic personal access token with the `notifications` scope. Fine-grained tokens and

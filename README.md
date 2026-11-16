@@ -165,6 +165,12 @@ Choose Schedule in the trigger editor to run agents daily or on selected weekday
 local times. See [scheduled triggers](docs/scheduled-triggers.md) for setup, YAML, timezone rules,
 and recovery behavior.
 
+## Authenticated webhooks
+
+Send messages and structured data from your services to a named trigger with a scoped API key.
+See [authenticated webhook triggers](docs/webhooks.md) for setup, curl, Node.js and Python
+examples, identity restrictions, retry guidance, limits and payload retention.
+
 ## Script actions
 
 A trigger can run a shell script on the daemon's host instead of starting an agent. Choose Script

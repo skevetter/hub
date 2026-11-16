@@ -5,13 +5,23 @@ Hub exposes organization-scoped operator operations under `/api/v1`:
 | Operation                                   | Scope                    | Endpoint                                 |
 | ------------------------------------------- | ------------------------ | ---------------------------------------- |
 | List active projects                        | `projects:read`          | `GET /api/v1/projects`                   |
+| List organization triggers                  | `configuration:validate` | `GET /api/v1/triggers`                   |
+| Validate one trigger without writing        | `configuration:validate` | `POST /api/v1/triggers/validate`         |
+| Install or replace one trigger              | `configuration:install`  | `POST /api/v1/triggers/install`          |
 | Validate configuration without writing      | `configuration:validate` | `POST /api/v1/configurations/validate`   |
 | List resolvable configuration resources     | `configuration:validate` | `GET /api/v1/configuration-resources`    |
 | Install and activate configuration          | `configuration:install`  | `POST /api/v1/configurations/install`    |
 | Dispatch a durable manual run               | `runs:dispatch`          | `POST /api/v1/manual-runs`               |
+| Send an authenticated webhook event         | `events:send`            | `POST /api/v1/hooks/{trigger}`           |
 | Issue a short-lived daemon enrollment token | `daemons:enroll`         | `POST /api/v1/daemons/enrollment-tokens` |
 
-Create a scoped API key in the Hub dashboard or approve `paseo hub login` in the browser, then send the resulting organization credential as `Authorization: Bearer <credential>`. CLI credentials carry all current operator scopes, are stored server-side only as verifiers, and can be revoked under Settings → API keys → CLI logins. They are not daemon credentials.
+Create a scoped API key in the Hub dashboard or approve `paseo hub login` in the browser, then send the resulting organization credential as `Authorization: Bearer <credential>`. CLI credentials carry all current operator scopes, are stored server-side only as verifiers, and can be revoked under Settings, API keys, CLI logins. They are not daemon credentials and cannot call the hooks endpoint.
+
+The available API key scopes are `projects:read`, `configuration:validate`, `configuration:install`,
+`runs:dispatch`, `events:send`, and `daemons:enroll`. Grant only the scopes a sender needs.
+`events:send` authorizes hooks only, not manual-runs. Hooks require an API key with a bound actor;
+optional allowed trigger names further restrict it. See [authenticated webhook triggers](webhooks.md)
+for key creation, executable examples, response and error tables, retries, limits and retention.
 
 CLI login starts anonymously at `POST /api/v1/cli-authorizations` and polls at `POST /api/v1/cli-authorizations/poll`. An authenticated owner or admin explicitly approves the active organization at `/cli-login`. The expiring grant is poll-throttled and discloses its durable credential exactly once. Daemons enroll only through the short-lived, single-use token issued by the authenticated enrollment-token operation. A daemon may connect with no permissions and remain available for identity and presence only; only daemons that explicitly grant `hub.execute` are eligible workflow targets.
 
@@ -34,6 +44,14 @@ Hub sends each daemon the authored rendered prompt unchanged. Execution tools ar
 Daemon environments may author `worktree.newBranch: "trigger-${{ paseo.execution.id }}"` for a stable branch name unique to each agent execution. Hub materializes the execution UUID before persisting or dispatching the launch intent; recovery reuses that fully rendered intent. This is independent of whether a manual, Slack, Discord, GitHub, or Linear trigger selected the reusable environment. No prompt, context, input, value, step output, or provider event namespace is available in environment configuration, and unsupported expressions fail bundle activation at the authored `newBranch` field.
 
 `deliveryKey` is caller-supplied request identity for the existing durable manual-event path. Hub namespaces it by the authenticated organization and resolved project before persistence, so the same caller key can be used independently in different tenants or projects. Existing receipt/run de-duplication applies, but this API does not promise exactly-once execution or guaranteed response replay; retries can still fail or conflict during restart and timing races. A successful representation contains `deliveryKey`, `providerEventReceiptId`, `triggerRunId`, `configuredTriggerName`, and the durable `workflowStatus`.
+
+For manual-runs, `deliveryKey` remains required. A bound API key supplies the actor; omit `actor`
+or send the same value. A different actor returns `403 actor_forbidden`. A legacy key without a
+bound actor must supply `actor` and cannot start script actions (`403 key_actor_required`).
+An object `input` maps its fields to declared typed inputs, and manual context is available through
+`${{ paseo.context }}`. Unknown triggers and projects without an active configuration return `404`.
+Input errors remain `400 invalid_input`, unlike hooks' `422 invalid_input`. Manual filter mismatches
+retain `409 dispatch_conflict`; hooks instead accept them as filtered deliveries.
 
 The self-hosted Scalar reference is served with a restrictive Content Security Policy and does not require external fonts, scripts, telemetry, registries, or proxies.
 
@@ -127,5 +145,5 @@ prose that no template can contradict.
 matching Stripe's own `Price` convention; a free plan prices at `0`. An interval is absent when the
 plan has no active price at that interval. `slug` is catalog identity and does not change with the
 displayed `name`. A self-hosted instance without `STRIPE_SECRET_KEY` 404s this route rather than
-serving an empty catalog — the billing boundary means the route is never registered on an
+serving an empty catalog. The billing boundary means the route is never registered on an
 unconfigured instance. See docs/billing.md.

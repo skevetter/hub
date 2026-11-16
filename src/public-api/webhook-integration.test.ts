@@ -109,6 +109,12 @@ describe("embedded authenticated webhook intake", () => {
       });
       assert.equal(JSON.stringify(receipt).includes(hub.key.secret), false);
       assert.equal(JSON.stringify(run).includes(hub.key.secret), false);
+      const listed = (await hub.database.listProjectActivityRuns(run.projectId, 10)).find(
+        (entry) => entry.run.id === run.id,
+      );
+      assert.ok(listed);
+      assert.equal(listed.webhookActor, "sender");
+      assert.equal("payload" in listed.receipt, false);
     } finally {
       await hub.close();
     }
