@@ -54,6 +54,7 @@ import { migrateLegacyProjectTriggers } from "./triggers/migration.js";
 import { readGitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
 import { readWebhookOptions } from "./webhook-config.js";
 import { readRunProgressSettings } from "./run-progress/settings.js";
+import { readTimelineScrubValues } from "./run-timeline/secrets.js";
 import {
   createServerShutdown,
   installShutdownSignals,
@@ -186,6 +187,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       scriptLimits,
       webhookOptions,
       runProgress,
+      timelineScrubValues: readTimelineScrubValues(process.env, Object.values(providerEnvironment)),
       ...(githubNotifications === undefined ? {} : { githubNotifications }),
       close: () => resources.close(),
     });

@@ -24,7 +24,8 @@ optional allowed trigger names further restrict it. See [authenticated webhook t
 for key creation, executable examples, response and error tables, retries, limits and retention.
 
 `runs:read` is reserved for authenticated run timeline reads. It does not grant dispatch access.
-The timeline store and its retention are available, but capture and streaming are not enabled by this build.
+Timeline capture is off by default and can be enabled with `PASEO_HUB_RUN_TIMELINE=true`.
+Streaming is not provided by this build.
 CLI credentials also include this scope. Before rolling back to a build without it, revoke keys
 that hold `runs:read`, because older builds reject that scope when authenticating a key.
 
@@ -37,6 +38,27 @@ Every canonical `/api/v1` response, including unknown paths and wrong methods, u
 Configuration YAML may include an optional top-level `name` slug as deployment metadata. An explicit request `projectSlug` (including the CLI's `--project`/`-p` option) is authoritative. Otherwise Hub resolves or creates the named project in the authenticated organization; without either field, it resolves or restores that organization's `default` project. Changing `name` targets a different project and leaves the old project's history intact.
 
 Configuration validation and installation accept the same YAML, optional `projectSlug`, and prompt-partial bundle. Both use the same parser, compiler, project selection, daemon/provider resolution, and business validation. Validation returns the resolved `projectSlug` and `wouldCreateProject` without creating a project, recording a revision, or changing active configuration. Installation silently creates a missing bundle-named or default project, then records and activates the revision.
+
+## Run timeline capture
+
+With `PASEO_HUB_RUN_TIMELINE=true`, Hub stores projected run, step and agent lifecycle events, tool names and categories, permission waits, and terminal summaries. Assistant text, reasoning, tool arguments and results, permission details, and script output are never copied into the timeline. Script steps contribute their duration and exit code only.
+
+The timeline queue holds at most 200 ordinary events per run. Overflow is counted durably and produces one truncation notice. Ordinary events have a separate count and byte budget, so they cannot displace the first 100 terminal step rows or the final run row and seal. A run with more terminal steps records the omission count and outcome counts for every step. Terminal summaries count pending or running steps left when a run ends as not run without changing workflow rows.
+
+| Setting                             | Default | Range          |
+| ----------------------------------- | ------- | -------------- |
+| `PASEO_HUB_TIMELINE_MAX_EVENTS`     | `500`   | `50` to `5000` |
+| `PASEO_HUB_TIMELINE_RETENTION_DAYS` | `30`    | `1` to `365`   |
+
+Text is normalized and scrubbed before storage and after byte truncation. Conservative token prefixes are redacted even when incomplete. For startup-known secret values, normalized fragments of eight characters are also removed. This can redact benign text that shares a fragment with a secret, including parts of a database URL. Unknown short passwords, unlabeled dictionary values, and personal data are not reliably detected. This scrubber is not a guarantee for every unknown secret format.
+
+Reconciliation derives missing start, terminal step and run rows from persisted workflow state. It never copies an agent's closing answer or reconstructs missed tool activity. A derived timeline records its origin. Runs sharing one conversation can record each other's tool calls. Events missed during a Hub or daemon disconnect are not replayed.
+
+Finished timelines expire after the configured retention period. Cleanup continues with capture disabled. Existing state rows remain as expiry tombstones and are never reconstructed, even if retention is later extended. A historical run that never had a state row can receive only derived lifecycle rows if an extended window makes it eligible again.
+
+Capture remains an internal storage feature in this build. There is no timeline stream or source progress message yet.
+
+The instance operator console reads organization identity, entitlements, usage and entitlement history. It does not read run or timeline records. Capture does not add operator access.
 
 ## Workflow MCP tools
 

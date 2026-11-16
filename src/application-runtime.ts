@@ -1,4 +1,11 @@
-import { createHubApplication } from "./app.js";
+import { createHubApplication, type HubRuntimeOptions } from "./app.js";
+import { logger } from "./logger.js";
+import { RunTimeline } from "./run-timeline/index.js";
+import { RunTimelineReconciler } from "./run-timeline/reconcile.js";
+import { RunTimelineBus } from "./run-timeline/bus.js";
+import { createTimelineScrubber } from "./run-timeline/scrub.js";
+import { createObservedDatabase } from "./run-timeline/observed-database.js";
+import type { TimelineRunScope } from "./run-timeline/capture-types.js";
 import type { GitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
 import type { AuthServer } from "./auth/server.js";
 import type { BillingRuntime } from "./billing/index.js";
@@ -56,6 +63,7 @@ export interface ApplicationCompositionOptions {
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
   runProgress?: RunProgressSettings;
+  timelineScrubValues?: readonly string[];
   close(): Promise<void>;
 }
 
@@ -76,7 +84,7 @@ async function createOwnedApplicationRuntime(
   options: ApplicationCompositionOptions,
   ownership: CompositionResources,
 ): Promise<ApplicationRuntime> {
-  startTimelineRetention(options, ownership);
+  const timelineRuntime = createRunTimelineRuntime(options, ownership);
   const registrations = options.registrations ?? [];
   const connections = new Map(
     registrations.map((registration) => [registration.connection.name, registration.connection]),
@@ -102,7 +110,7 @@ async function createOwnedApplicationRuntime(
   }
 
   const application = createHubApplication({
-    database: options.database,
+    ...timelineRuntime,
     entitlements: options.entitlements,
     providerFactories: registrations.flatMap((registration) => registration.triggerProviders),
     ...(executionAuthority === undefined ? {} : { executionAuthority }),
@@ -367,14 +375,15 @@ async function createOwnedApplicationRuntime(
   };
 }
 
-function startTimelineRetention(
+function createRunTimelineRuntime(
   options: ApplicationCompositionOptions,
   ownership: CompositionResources,
-): void {
-  const runProgress = options.runProgress ?? readRunProgressSettings({});
-  if (options.database === null) return;
-  const retention = new TimelineRetention(options.database, {
-    retentionDays: runProgress.retentionDays,
+): Pick<HubRuntimeOptions, "database" | "runTimeline" | "runTimelineReconciler"> {
+  const settings = options.runProgress ?? readRunProgressSettings({});
+  const database = options.database;
+  if (database === null) return { database };
+  const retention = new TimelineRetention(database, {
+    retentionDays: settings.retentionDays,
     reportFailure: (error) =>
       reportFailure(error, {
         operation: "run.timeline.retention",
@@ -383,6 +392,65 @@ function startTimelineRetention(
   });
   ownership.own(() => retention.stop(), "composition.timeline_retention");
   retention.start();
+  if (!settings.runTimelineEnabled) return { database };
+  const scrubValues = [
+    ...(options.timelineScrubValues ?? []),
+    ...(options.completionTokenSecret === undefined ? [] : [options.completionTokenSecret]),
+    ...(settings.githubToken === undefined ? [] : [settings.githubToken]),
+  ];
+  const report = (error: unknown, operation: string, scope?: TimelineRunScope) => {
+    reportFailure(
+      error,
+      {
+        operation,
+        component: "run-progress",
+        ...(scope === undefined ? {} : { organizationId: scope.organizationId }),
+      },
+      {
+        scrubValues,
+        ...(scope === undefined ? {} : { diagnostic: { triggerRunId: scope.triggerRunId } }),
+      },
+    );
+  };
+  const bus = new RunTimelineBus({
+    reportFailure: (error) => report(error, "run.timeline.notify"),
+  });
+  const scrub = createTimelineScrubber({ scrubValues });
+  const timeline = new RunTimeline(database, {
+    maxEvents: settings.timelineMaxEvents,
+    retentionDays: settings.retentionDays,
+    scrub,
+    bus,
+    reportFailure: report,
+  });
+  ownership.own(() => timeline.stop(), "composition.timeline_capture");
+  const reconciler = new RunTimelineReconciler(database, {
+    queue: timeline,
+    maxEvents: settings.timelineMaxEvents,
+    retentionDays: settings.retentionDays,
+    scrub,
+    bus,
+    reportFailure: report,
+  });
+  ownership.own(() => reconciler.stop(), "composition.timeline_reconciliation");
+  reconciler.start();
+  logger.info(
+    {
+      operation: "run.timeline.start",
+      component: "run-progress",
+      maxEvents: settings.timelineMaxEvents,
+      retentionDays: settings.retentionDays,
+      timelineEnabled: settings.runTimelineEnabled,
+      streamEnabled: settings.runStreamEnabled,
+      progressMessagesEnabled: settings.progressMessagesEnabled,
+    },
+    "run timeline capture enabled",
+  );
+  return {
+    database: createObservedDatabase(database, { timeline, reconciler, reportFailure: report }),
+    runTimeline: timeline,
+    runTimelineReconciler: reconciler,
+  };
 }
 
 function triggerDashboardFor(

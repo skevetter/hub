@@ -4,7 +4,7 @@
 
 ### Added
 
-- Run timeline storage adds durable event budgets, ordered cursors, progress message leases, and retention with expiry tombstones. Capture, streaming and source messages remain off. API keys can include the separate `runs:read` scope.
+- Optional run timeline capture records redacted lifecycle and tool events, persisted step outcomes, and sealed run summaries. Durable queues, byte budgets, reconciliation and expiry tombstones preserve terminal state. Capture is off by default. Streaming and source progress messages are not yet provided. API keys can include the separate `runs:read` scope.
 - Authenticated webhook triggers accept messages and typed input data at `POST /api/v1/hooks/{trigger}` with scoped, actor-bound API keys, optional allowed trigger names, durable idempotency, size and rate limits, and named-audience script support. See [authenticated webhook triggers](docs/webhooks.md) for setup, examples, retention and rollback safety.
 - `run.complete_on_turn_end: true` completes an agent run as succeeded when the agent ends its turn without calling `finish_execution`, instead of failing it at `idle_timeout`. It is off by default. The result records `completion: inferred_from_turn_end` and the agent's closing message. See `docs/unattended-prompts.md`.
 - `github.pull_request_synchronized` triggers a workflow when new commits are pushed to a pull request, with the pushed head SHA in the agent context.
