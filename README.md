@@ -112,6 +112,23 @@ The image is published as `ghcr.io/getpaseo/hub:latest`.
 See the [self-hosting guide](https://paseo.sh/docs/hub/self-hosting) for production deployment details.
 For Linear setup and workflows, see the public [Linear app](https://paseo.sh/docs/hub/self-hosting/linear-app) and [Linear triggers](https://paseo.sh/docs/hub/triggers/linear) guides.
 
+## Stop and restart
+
+On SIGTERM or SIGINT, Hub stops accepting HTTP connections and stops its runtime concurrently.
+Repeated signals are ignored. Structured shutdown logs show each stage and its elapsed time.
+
+`PASEO_HUB_SHUTDOWN_GRACE_MS` defaults to 10000 milliseconds and accepts whole numbers from
+1000 to 40000. At that deadline, Hub destroys remaining connections, including daemon
+websockets, in-flight HTTP requests, and running agent streams. Workflow state is durable
+and recovery resumes after restart. Interrupted work is not a guarantee of exactly-once
+external effects.
+
+`PASEO_HUB_SHUTDOWN_HARD_EXIT_MS` defaults to 15000 milliseconds and accepts whole numbers
+from 1001 to 44000. It must exceed the grace budget. Hub exits with code 0 when all shutdown
+stages finish before the grace deadline. It exits with code 1 after a stage fails or either
+deadline is reached. The hard deadline forces exit even if a runtime drain never resolves.
+Keep the service manager stop timeout above the configured hard deadline.
+
 ## Provider options and Hub tools
 
 Workflow steps may pass a JSON-compatible, provider-native `agent.options` object. Hub preserves
