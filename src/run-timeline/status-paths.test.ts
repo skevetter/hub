@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, it } from "vitest";
 import { OBSERVED_DATABASE_METHODS } from "./observed-database.js";
@@ -111,8 +112,119 @@ function sqlStatusTables(sql: string): string[] {
   return tables;
 }
 
-function analyzeStatusPaths(source: string): { writes: StatusWrite[]; uncovered: string[] } {
-  const file = ts.createSourceFile("pg.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+function postgresStatusTables(node: ts.Node): string[] {
+  if (ts.isStringLiteralLike(node) || ts.isTemplateExpression(node)) {
+    const sql = ts.isTemplateExpression(node)
+      ? node.head.text +
+        node.templateSpans.map((span) => ` <expression> ${span.literal.text}`).join("")
+      : node.text;
+    return sqlStatusTables(sql);
+  }
+  if (ts.isCallExpression(node)) {
+    const table = drizzleStatusTable(node);
+    return table === undefined ? [] : [table];
+  }
+  return [];
+}
+
+function memoryStatusTables(node: ts.Node, checker: ts.TypeChecker): string[] {
+  function recordTables(expression: ts.Expression): string[] {
+    const recordType = checker.getTypeAtLocation(expression);
+    function tables(type: ts.Type): string[] {
+      if (type.isUnion()) return type.types.flatMap(tables);
+      const name = type.aliasSymbol?.name ?? type.getSymbol()?.name;
+      if (name === "WorkflowStepRunRecord") return ["workflow_step_runs"];
+      if (
+        name === "TriggerRunRecord" ||
+        name === "AcceptedTriggerRunRecord" ||
+        name === "RejectedTriggerRunRecord"
+      )
+        return ["trigger_runs"];
+      const status = type.getProperty("status");
+      return (status?.declarations ?? []).flatMap((declaration) => {
+        const parent = declaration.parent;
+        if (!ts.isInterfaceDeclaration(parent)) return [];
+        if (parent.name.text === "WorkflowStepRunRecord") return ["workflow_step_runs"];
+        if (
+          parent.name.text === "AcceptedTriggerRunRecord" ||
+          parent.name.text === "RejectedTriggerRunRecord"
+        )
+          return ["trigger_runs"];
+        return [];
+      });
+    }
+    return [...new Set(tables(recordType))];
+  }
+  function statusProperties(object: ts.ObjectLiteralExpression): boolean {
+    return object.properties.some(
+      (property) => "name" in property && expressionName(property.name) === "status",
+    );
+  }
+  if (
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+    node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+    (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left))
+  ) {
+    const name = ts.isPropertyAccessExpression(node.left)
+      ? node.left.name.text
+      : expressionName(node.left.argumentExpression);
+    if (name === "status") return recordTables(node.left.expression);
+  }
+  if (ts.isObjectLiteralExpression(node) && statusProperties(node)) {
+    return [
+      ...new Set(
+        node.properties.flatMap((property) =>
+          ts.isSpreadAssignment(property) ? recordTables(property.expression) : [],
+        ),
+      ),
+    ];
+  }
+  if (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    ts.isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === "Object" &&
+    node.expression.name.text === "assign" &&
+    node.arguments[0] &&
+    node.arguments
+      .slice(1)
+      .some((argument) => ts.isObjectLiteralExpression(argument) && statusProperties(argument))
+  )
+    return recordTables(node.arguments[0]);
+  return [];
+}
+
+function memorySourceFile(source: string): { file: ts.SourceFile; checker: ts.TypeChecker } {
+  const path = fileURLToPath(new URL("../db/memory.ts", import.meta.url));
+  const options: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    strict: true,
+    skipLibCheck: true,
+    noEmit: true,
+  };
+  const host = ts.createCompilerHost(options);
+  const getSourceFile = host.getSourceFile.bind(host);
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) =>
+    fileName === path
+      ? ts.createSourceFile(fileName, source, languageVersion, true, ts.ScriptKind.TS)
+      : getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
+  const program = ts.createProgram([path], options, host);
+  const file = program.getSourceFile(path);
+  assert.ok(file);
+  return { file, checker: program.getTypeChecker() };
+}
+
+function analyzeStatusPaths(
+  source: string,
+  backend: "postgres" | "memory" = "postgres",
+): { writes: StatusWrite[]; uncovered: string[] } {
+  const memory = backend === "memory" ? memorySourceFile(source) : undefined;
+  const file =
+    memory?.file ??
+    ts.createSourceFile("pg.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const owners = new Map<string, Owner>();
   const declarations = new Map<ts.Node, Owner>();
   function discover(node: ts.Node, className?: string): void {
@@ -159,18 +271,8 @@ function analyzeStatusPaths(source: string): { writes: StatusWrite[]; uncovered:
   const writes: StatusWrite[] = [];
   function inspect(node: ts.Node, parentOwner?: Owner): void {
     const owner = declarations.get(node) ?? parentOwner;
-    if (ts.isStringLiteralLike(node) || ts.isTemplateExpression(node)) {
-      const sql = ts.isTemplateExpression(node)
-        ? node.head.text +
-          node.templateSpans.map((span) => ` <expression> ${span.literal.text}`).join("")
-        : node.text;
-      for (const table of sqlStatusTables(sql))
-        writes.push({ owner: owner?.id ?? "<unowned>", table, roots: [] });
-    }
-    if (ts.isCallExpression(node)) {
-      const table = drizzleStatusTable(node);
-      if (table) writes.push({ owner: owner?.id ?? "<unowned>", table, roots: [] });
-    }
+    const tables = memory ? memoryStatusTables(node, memory.checker) : postgresStatusTables(node);
+    for (const table of tables) writes.push({ owner: owner?.id ?? "<unowned>", table, roots: [] });
     if (owner && ts.isCallExpression(node)) {
       if (ts.isIdentifier(node.expression)) owner.calls.add(node.expression.text);
       if (
@@ -224,6 +326,118 @@ describe("workflow status persistence observation", () => {
       );
     }
     assert.deepEqual(uncovered, []);
+  });
+
+  it("covers every memory status mutation and every public root reaching its helpers", async () => {
+    const source = await readFile(new URL("../db/memory.ts", import.meta.url), "utf8");
+    const { writes, uncovered } = analyzeStatusPaths(source, "memory");
+    for (const method of OBSERVED_DATABASE_METHODS) {
+      assert.ok(
+        writes.some((write) => write.roots.includes(method)),
+        `memory status inventory did not reach ${method}`,
+      );
+    }
+    for (const helper of ["timeoutWorkflowRun", "timeoutWorkflowStep", "finishWorkflowStep"]) {
+      for (const table of ["workflow_step_runs", "trigger_runs"]) {
+        assert.ok(
+          writes.some(
+            (write) =>
+              write.owner === `MemoryDatabase.${helper}` &&
+              write.table === table &&
+              write.roots.includes("completeWorkflowAgentExecution") &&
+              write.roots.includes("completeWorkflowStep"),
+          ),
+          `memory status inventory missed ${helper}: ${table}`,
+        );
+      }
+    }
+    assert.deepEqual(uncovered, []);
+  });
+
+  it("rejects an unobserved memory-only public status writer inserted into the actual source", async () => {
+    const source = await readFile(new URL("../db/memory.ts", import.meta.url), "utf8");
+    const file = ts.createSourceFile("memory.ts", source, ts.ScriptTarget.Latest, true);
+    const database = file.statements.find(
+      (statement): statement is ts.ClassDeclaration =>
+        ts.isClassDeclaration(statement) && statement.name?.text === "MemoryDatabase",
+    );
+    assert.ok(database);
+    const insertion = database.end - 1;
+    const mutated = `${source.slice(0, insertion)}
+      unobservedMemoryStatusWrite(stepRunId: string) {
+        const step = this.workflowStepRuns.get(stepRunId);
+        if (step !== undefined) step.status = "failed";
+      }
+    ${source.slice(insertion)}`;
+    const { writes, uncovered } = analyzeStatusPaths(mutated, "memory");
+    assert.ok(
+      writes.some(
+        (write) =>
+          write.owner === "MemoryDatabase.unobservedMemoryStatusWrite" &&
+          write.table === "workflow_step_runs",
+      ),
+    );
+    assert.deepEqual(uncovered, [
+      "unobservedMemoryStatusWrite -> MemoryDatabase.unobservedMemoryStatusWrite: workflow_step_runs",
+    ]);
+  });
+
+  it("tracks typed memory aliases, replacements, helper callers and orphan helpers without treating other records or initial inserts as mutations", async () => {
+    const source = await readFile(new URL("../db/memory.ts", import.meta.url), "utf8");
+    const result = analyzeStatusPaths(
+      `${source}
+      class MemoryInventoryProbe {
+        private readonly arbitrarySteps = new Map<string, WorkflowStepRunRecord>();
+        private readonly arbitraryRuns = new Map<string, TriggerRunRecord>();
+        createWorkflowStepExecution() { this.changeStep(); }
+        addedCaller() { this.changeStep(); }
+        private changeStep() {
+          const original = this.arbitrarySteps.get("step");
+          if (original === undefined) return;
+          const renamed = original;
+          renamed["status"] = "failed";
+          Object.assign(renamed, { status: "failed" });
+          this.arbitrarySteps.set(renamed.id, { ...renamed, status: "failed" });
+          this.arbitrarySteps.set(renamed.id, { ...renamed, output: { status: "failed" } });
+          const unrelated = { status: "running" };
+          unrelated.status = "failed";
+          const fresh: WorkflowStepRunRecord = { status: "pending" } as WorkflowStepRunRecord;
+          this.arbitrarySteps.set("fresh", fresh);
+        }
+        addedRunWriter() {
+          for (const branch of this.arbitraryRuns.values()) {
+            branch.status = "failed";
+            this.arbitraryRuns.set(branch.id, { ...branch, status: "failed" });
+          }
+        }
+      }
+      function orphanMemoryWriter(step: WorkflowStepRunRecord) {
+        step.status = "failed";
+      }
+    `,
+      "memory",
+    );
+    const probeWrites = result.writes.filter((write) =>
+      write.owner.startsWith("MemoryInventoryProbe."),
+    );
+    assert.deepEqual(
+      probeWrites.map((write) => [write.owner, write.table]),
+      [
+        ["MemoryInventoryProbe.changeStep", "workflow_step_runs"],
+        ["MemoryInventoryProbe.changeStep", "workflow_step_runs"],
+        ["MemoryInventoryProbe.changeStep", "workflow_step_runs"],
+        ["MemoryInventoryProbe.addedRunWriter", "trigger_runs"],
+        ["MemoryInventoryProbe.addedRunWriter", "trigger_runs"],
+      ],
+    );
+    assert.deepEqual(result.uncovered, [
+      "addedCaller -> MemoryInventoryProbe.changeStep: workflow_step_runs",
+      "addedCaller -> MemoryInventoryProbe.changeStep: workflow_step_runs",
+      "addedCaller -> MemoryInventoryProbe.changeStep: workflow_step_runs",
+      "addedRunWriter -> MemoryInventoryProbe.addedRunWriter: trigger_runs",
+      "addedRunWriter -> MemoryInventoryProbe.addedRunWriter: trigger_runs",
+      "orphanMemoryWriter: workflow_step_runs has no public entry root",
+    ]);
   });
 
   it("detects new unobserved writers, indirect helper callers and orphan helpers", () => {
