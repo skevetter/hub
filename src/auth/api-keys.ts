@@ -6,20 +6,25 @@ import type {
   TransactionHandle,
 } from "../db/runtime/index.js";
 import type { Locks } from "../db/runtime/locks/index.js";
-import { z } from "zod";
-import { apiKeyScopesSchema, type ApiKeyScope } from "./api-key-contract.js";
+import {
+  apiKeyCreateSchema,
+  apiKeyScopesSchema,
+  type ApiKeyIdentityOptions,
+  type ApiKeyScope,
+} from "./api-key-contract.js";
 import { withApiKeySerialization } from "../db/api-key-serialization.js";
 
 const API_KEY_PREFIX = "paseo_pk_";
 const API_KEY_PREFIX_LENGTH = 12;
 const API_KEY_SECRET_BYTES = 32;
-const apiKeyNameSchema = z.string().trim().min(1).max(100);
 
 export interface ApiKeySummary {
   id: string;
   name: string;
   prefix: string;
   scopes: readonly ApiKeyScope[];
+  actor: string | null;
+  allowedTriggers: readonly string[] | null;
   createdAt: Date;
   lastUsedAt: Date | null;
   revokedAt: Date | null;
@@ -35,6 +40,8 @@ export interface OperationAuthorization {
   credentialId: string;
   organizationId: string;
   scopes: readonly ApiKeyScope[];
+  actor?: string | null;
+  allowedTriggers?: readonly string[] | null;
 }
 
 export type OperationAuthorizationResult =
@@ -49,6 +56,8 @@ interface ApiKeyRow extends QueryRow {
   prefix: string;
   verifier: string;
   scopes: string[];
+  actor: string | null;
+  allowed_triggers: string[] | null;
   created_at: Date;
   last_used_at: Date | null;
   revoked_at: Date | null;
@@ -66,25 +75,32 @@ export class OrganizationApiKeys {
     name: string,
     scopes: readonly ApiKeyScope[],
     client: QueryHandle = this.pool,
+    identity: ApiKeyIdentityOptions = {},
   ): Promise<CreatedApiKey> {
-    const keyName = apiKeyNameSchema.parse(name);
-    const keyScopes = apiKeyScopesSchema.parse([...new Set(scopes)]);
+    const input = apiKeyCreateSchema.parse({
+      ...identity,
+      name,
+      scopes: [...new Set(scopes)],
+    });
     const prefix = `${API_KEY_PREFIX}${randomBytes(9).toString("base64url").slice(0, API_KEY_PREFIX_LENGTH)}`;
     const secret = `${prefix}_${randomBytes(API_KEY_SECRET_BYTES).toString("base64url")}`;
     const result = await client.query<ApiKeyRow>(
       `insert into organization_api_keys
-         (id, organization_id, name, prefix, verifier, scopes, created_by_user_id)
-       values ($1, $2, $3, $4, $5, $6, $7)
+         (id, organization_id, name, prefix, verifier, scopes, created_by_user_id,
+          actor, allowed_triggers)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        returning id, organization_id, name, prefix, verifier, scopes,
-                 created_at, last_used_at, revoked_at`,
+                 actor, allowed_triggers, created_at, last_used_at, revoked_at`,
       [
         randomUUID(),
         organizationId,
-        keyName,
+        input.name,
         prefix,
         hashSecret(secret),
-        keyScopes,
+        input.scopes,
         createdByUserId,
+        input.actor,
+        input.allowedTriggers,
       ],
     );
     const row = result.rows[0];
@@ -95,7 +111,7 @@ export class OrganizationApiKeys {
   async list(organizationId: string): Promise<ApiKeySummary[]> {
     const result = await this.pool.query<ApiKeyRow>(
       `select id, organization_id, name, prefix, verifier, scopes,
-              created_at, last_used_at, revoked_at
+              actor, allowed_triggers, created_at, last_used_at, revoked_at
        from organization_api_keys
        where organization_id = $1
        order by created_at desc, id desc`,
@@ -129,7 +145,7 @@ export class OrganizationApiKeys {
 
     const result = await this.pool.query<ApiKeyRow>(
       `select id, organization_id, name, prefix, verifier, scopes,
-              created_at, last_used_at, revoked_at
+              actor, allowed_triggers, created_at, last_used_at, revoked_at
        from organization_api_keys
        where prefix = $1`,
       [parsed.prefix],
@@ -139,14 +155,13 @@ export class OrganizationApiKeys {
     if (!constantTimeSecretMatch(parsed.token, row.verifier)) return { status: "unauthorized" };
     const scopes = apiKeyScopesSchema.parse(row.scopes);
     if (!scopes.includes(requiredScope)) return { status: "forbidden" };
-    const used = await this.pool.query(
+    await this.pool.query(
       `update organization_api_keys
-      set last_used_at = greatest(coalesce(last_used_at, to_timestamp(0)), now())
+       set last_used_at = now()
        where id = $1 and revoked_at is null
-       returning id`,
+         and (last_used_at is null or last_used_at < now() - interval '1 minute')`,
       [row.id],
     );
-    if (used.rowCount !== 1) return { status: "unauthorized" };
     return {
       status: "authorized",
       access: {
@@ -154,6 +169,8 @@ export class OrganizationApiKeys {
         credentialId: row.id,
         organizationId: row.organization_id,
         scopes,
+        actor: row.actor,
+        allowedTriggers: row.allowed_triggers,
       },
     };
   }
@@ -189,6 +206,8 @@ function summary(row: ApiKeyRow): ApiKeySummary {
     name: row.name,
     prefix: row.prefix,
     scopes: apiKeyScopesSchema.parse(row.scopes),
+    actor: row.actor,
+    allowedTriggers: row.allowed_triggers,
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
     revokedAt: row.revoked_at,

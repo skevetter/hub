@@ -8,6 +8,8 @@ export interface PublicAuthorization {
   credentialId: string;
   organizationId: string;
   scopes: readonly ApiKeyScope[];
+  actor?: string | null;
+  allowedTriggers?: readonly string[] | null;
 }
 
 export interface InstallConfigurationInput {

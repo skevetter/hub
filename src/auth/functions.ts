@@ -11,7 +11,13 @@ import {
   organizationRoleSchema,
 } from "./organization-contract.js";
 import { PASSWORD_MIN_LENGTH } from "./instance-policy.js";
-import { API_KEY_SCOPES, apiKeyScopeSchema } from "./api-key-contract.js";
+import {
+  API_KEY_SCOPES,
+  apiKeyActorSchema,
+  apiKeyAllowedTriggersSchema,
+  apiKeyCreateSchema,
+  apiKeyScopeSchema,
+} from "./api-key-contract.js";
 import { parseEntitlementDenial, type EntitlementDenialPayload } from "../entitlements/denial.js";
 
 const credentialsSchema = z.object({
@@ -43,16 +49,14 @@ const passwordChangeSchema = z.object({
   currentPassword: z.string().min(1),
   newPassword: z.string().min(PASSWORD_MIN_LENGTH),
 });
-const apiKeyCreateSchema = z.object({
-  name: z.string().trim().min(1).max(100),
-  scopes: z.array(apiKeyScopeSchema).min(1),
-});
 const apiKeyIdSchema = z.object({ id: z.string().uuid() });
 const apiKeySummarySchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
   prefix: z.string(),
   scopes: z.array(apiKeyScopeSchema),
+  actor: apiKeyActorSchema.nullable(),
+  allowedTriggers: apiKeyAllowedTriggersSchema.nullable(),
   createdAt: z.string(),
   lastUsedAt: z.string().nullable(),
   revokedAt: z.string().nullable(),

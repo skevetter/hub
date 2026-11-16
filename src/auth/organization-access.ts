@@ -10,7 +10,7 @@ import { z } from "zod";
 import { reportFailure } from "../failures/index.js";
 import { OrganizationApiKeys } from "./api-keys.js";
 import { OrganizationCliCredentials } from "./cli-credentials.js";
-import { apiKeyScopeSchema } from "./api-key-contract.js";
+import { apiKeyCreateSchema } from "./api-key-contract.js";
 import type { InstanceAuthPolicy } from "./instance-policy.js";
 import type { InstanceSetup } from "../instance-setup/index.js";
 import type { InstanceAppOnboarding } from "../instance-setup/app-onboarding.js";
@@ -151,9 +151,7 @@ const changeRoleBody = z
   .object({ memberId: z.string().min(1), role: organizationRoleSchema })
   .strict();
 const removeMemberBody = z.object({ memberId: z.string().min(1) }).strict();
-const createApiKeyBody = z
-  .object({ name: z.string().trim().min(1).max(100), scopes: z.array(z.string()).min(1) })
-  .strict();
+const createApiKeyBody = apiKeyCreateSchema;
 const apiKeyIdBody = z.object({ id: z.string().uuid() }).strict();
 export class OrganizationAccess {
   constructor(private readonly options: OrganizationAccessOptions) {}
@@ -363,6 +361,8 @@ export class OrganizationAccess {
         name: key.name,
         prefix: key.prefix,
         scopes: key.scopes,
+        actor: key.actor,
+        allowedTriggers: key.allowedTriggers,
         createdAt: key.createdAt.toISOString(),
         lastUsedAt: key.lastUsedAt?.toISOString() ?? null,
         revokedAt: key.revokedAt?.toISOString() ?? null,
@@ -381,16 +381,6 @@ export class OrganizationAccess {
     const session = await this.requireSession(request);
     const input = await parseBody(request, createApiKeyBody);
     const access = await this.requireActiveAccess(session);
-    const scopes = input.scopes.flatMap((scope) => {
-      const parsed = apiKeyScopeSchema.safeParse(scope);
-      return parsed.success ? [parsed.data] : [];
-    });
-    if (scopes.length !== new Set(input.scopes).size) {
-      throw new ProductRequestError(400, "invalid_api_key_scopes");
-    }
-    if (scopes.length !== input.scopes.length) {
-      throw new ProductRequestError(400, "invalid_api_key_scopes");
-    }
     const created = await this.options.pool.transaction(async (client) => {
       await lockOrganizationMembershipTransitions(
         this.options.locks,
@@ -405,8 +395,9 @@ export class OrganizationAccess {
         access.organization.id,
         session.userId,
         input.name,
-        scopes,
+        input.scopes,
         client,
+        { actor: input.actor, allowedTriggers: input.allowedTriggers },
       );
     });
     return Response.json(
@@ -416,6 +407,8 @@ export class OrganizationAccess {
           name: created.summary.name,
           prefix: created.summary.prefix,
           scopes: created.summary.scopes,
+          actor: created.summary.actor,
+          allowedTriggers: created.summary.allowedTriggers,
           createdAt: created.summary.createdAt.toISOString(),
           lastUsedAt: null,
           revokedAt: null,

@@ -47,6 +47,73 @@ describe("database migration application", () => {
     await postgres.stop();
   }, 120_000);
 
+  it("adds nullable API key identity while enforcing actor and scope constraints", async () => {
+    const url = await createHistoricalBaseline({
+      postgres,
+      prefix: "webhook_key_identity",
+      through: "0051_github_notification_status",
+    });
+    await poolQuery(
+      url,
+      `insert into organization (id, name, slug)
+         values ('organization-keys', 'Key organization', 'key-organization');
+       insert into organization_api_keys
+         (organization_id, name, prefix, verifier, scopes)
+         values ('organization-keys', 'Legacy key', 'migration-key', 'migration-verifier',
+                 ARRAY['runs:dispatch'])`,
+    );
+
+    const upgraded = await createDatabase(url);
+    await upgraded.close();
+
+    assert.deepEqual(
+      (
+        await poolQuery<{ actor: string | null; allowed_triggers: string[] | null }>(
+          url,
+          `select actor, allowed_triggers from organization_api_keys`,
+        )
+      ).rows,
+      [{ actor: null, allowed_triggers: null }],
+    );
+    await poolQuery(
+      url,
+      `update organization_api_keys
+       set actor = 'ci.partner-1', allowed_triggers = ARRAY['build-finished', 'deploy_check'],
+           scopes = ARRAY['events:send']`,
+    );
+    assert.deepEqual(
+      (
+        await poolQuery<{ actor: string; allowed_triggers: string[]; scopes: string[] }>(
+          url,
+          `select actor, allowed_triggers, scopes from organization_api_keys`,
+        )
+      ).rows,
+      [
+        {
+          actor: "ci.partner-1",
+          allowed_triggers: ["build-finished", "deploy_check"],
+          scopes: ["events:send"],
+        },
+      ],
+    );
+    for (const actor of ["a", "0", "a".repeat(63)]) {
+      await poolQuery(url, `update organization_api_keys set actor = $1`, [actor]);
+    }
+    for (const actor of ["", "-ci", "_ci", ".ci", "CI", "ci partner", "a".repeat(64)]) {
+      await assert.rejects(
+        poolQuery(url, `update organization_api_keys set actor = $1`, [actor]),
+        /organization_api_keys_actor_check/,
+      );
+    }
+    for (const scopes of [[], ["unknown:scope"], ["events:send", "unknown:scope"]]) {
+      await assert.rejects(
+        poolQuery(url, `update organization_api_keys set scopes = $1`, [scopes]),
+        /organization_api_keys_scopes_check/,
+      );
+    }
+    await poolQuery(url, `update organization_api_keys set actor = null, allowed_triggers = null`);
+  }, 120_000);
+
   it("promotes unambiguous daemon names to slugs without inventing collision aliases", async () => {
     const url = await createHistoricalBaseline({
       postgres,
@@ -312,7 +379,7 @@ describe("database migration application", () => {
     assert.deepEqual(after, before);
     assert.deepEqual(await historicalShape(fixture.url), {
       authTables: 7,
-      drizzleMigrations: 52,
+      drizzleMigrations: 53,
       legacyArtifacts: null,
       legacyOperatorPrincipals: null,
       bootstrapOrganizationId: fixture.organizationId,

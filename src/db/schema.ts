@@ -1327,6 +1327,8 @@ export const organizationApiKeys = pgTable(
     prefix: text().notNull(),
     verifier: text().notNull(),
     scopes: text().array().$type<readonly (typeof API_KEY_SCOPES)[number][]>().notNull(),
+    actor: text(),
+    allowedTriggers: text("allowed_triggers").array(),
     createdByUserId: text("created_by_user_id").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -1342,7 +1344,11 @@ export const organizationApiKeys = pgTable(
     ),
     check(
       "organization_api_keys_scopes_check",
-      sql`${table.scopes} <@ ARRAY['projects:read', 'configuration:validate', 'configuration:install', 'runs:dispatch', 'daemons:enroll']::text[] and cardinality(${table.scopes}) > 0`,
+      sql`${table.scopes} <@ ARRAY['projects:read', 'configuration:validate', 'configuration:install', 'runs:dispatch', 'daemons:enroll', 'events:send']::text[] and cardinality(${table.scopes}) > 0`,
+    ),
+    check(
+      "organization_api_keys_actor_check",
+      sql`${table.actor} is null or ${table.actor} ~ '^[a-z0-9][a-z0-9_.-]{0,62}$'`,
     ),
   ],
 );

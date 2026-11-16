@@ -1,0 +1,5 @@
+ALTER TABLE "organization_api_keys" DROP CONSTRAINT "organization_api_keys_scopes_check";--> statement-breakpoint
+ALTER TABLE "organization_api_keys" ADD COLUMN "actor" text;--> statement-breakpoint
+ALTER TABLE "organization_api_keys" ADD COLUMN "allowed_triggers" text[];--> statement-breakpoint
+ALTER TABLE "organization_api_keys" ADD CONSTRAINT "organization_api_keys_actor_check" CHECK ("organization_api_keys"."actor" is null or "organization_api_keys"."actor" ~ '^[a-z0-9][a-z0-9_.-]{0,62}$');--> statement-breakpoint
+ALTER TABLE "organization_api_keys" ADD CONSTRAINT "organization_api_keys_scopes_check" CHECK ("organization_api_keys"."scopes" <@ ARRAY['projects:read', 'configuration:validate', 'configuration:install', 'runs:dispatch', 'daemons:enroll', 'events:send']::text[] and cardinality("organization_api_keys"."scopes") > 0);
