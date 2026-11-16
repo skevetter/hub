@@ -3,6 +3,7 @@ import { expect, test } from "vitest";
 import { AgentSessions } from "./index.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { OutputExecutorRegistry, replyOutputTool } from "../execution-capabilities/outputs.js";
+import { FinishCallRegistry } from "../execution-capabilities/finish-calls.js";
 import { createExecutionCapabilityServer } from "../execution-capabilities/server.js";
 import type { AgentConnection, AgentSnapshot } from "../daemons/agents/index.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
@@ -51,7 +52,7 @@ class TestAgents implements AgentConnection {
   }
 }
 
-async function fixture(now = Date.now) {
+async function fixture(now = Date.now, finishCalls?: FinishCallRegistry) {
   const database = createMemoryDatabase();
   const connection = new TestAgents();
   const outputs = new OutputExecutorRegistry();
@@ -68,6 +69,7 @@ async function fixture(now = Date.now) {
     database,
     outputs,
     completionTokenSecret: "secret",
+    ...(finishCalls === undefined ? {} : { finishCalls }),
     completeExecution: async ({ executionId }) =>
       (await database.transitionAgentExecution(executionId, "succeeded")).execution,
   });
@@ -307,4 +309,22 @@ test("a ping cannot send more work after the inherited deadline while timeout cl
   });
   await expect(next.dispatch()).rejects.toThrow("execution_deadline_exceeded");
   expect(f.connection.deliveries).toHaveLength(1);
+});
+
+test("a session finish call is recorded against the execution named in its arguments", async () => {
+  const finishCalls = new FinishCallRegistry();
+  const f = await fixture(Date.now, finishCalls);
+  const first = await f.arrival();
+  const second = await f.arrival();
+  await first.dispatch();
+  await second.dispatch();
+
+  await f.call(first.executionId, "finish_execution", {});
+
+  expect(finishCalls.ownsOutcome(first.executionId)).toBe(true);
+  expect(finishCalls.ownsOutcome(second.executionId)).toBe(false);
+
+  const rejected = await f.call(second.executionId, "finish_execution", { unexpected: true });
+  expect(rejected).toMatchObject({ result: { isError: true } });
+  expect(finishCalls.ownsOutcome(second.executionId)).toBe(false);
 });

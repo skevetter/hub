@@ -1,4 +1,3 @@
-import { isHubFinishExecutionToolName } from "../hub/protocol.js";
 import type { AgentEvent } from "./agents/index.js";
 
 /**
@@ -34,8 +33,6 @@ export class TurnEndTracker {
   private generation = 0;
   private messageId: string | undefined;
   private text = "";
-  /** Latest status of every finish_execution call seen, by call id. */
-  private readonly finishCalls = new Map<string, string>();
 
   observe(event: AgentEvent): TurnEndVerdict {
     // Snapshots describe state from before the prompt. Status updates are not trusted either way:
@@ -53,13 +50,6 @@ export class TurnEndTracker {
         return stream.reason === "finished" ? "none" : this.interrupt(true);
       case "timeline": {
         const item = stream.item;
-        if (
-          item.type === "tool_call" &&
-          typeof item.name === "string" &&
-          isHubFinishExecutionToolName(item.name)
-        ) {
-          this.recordFinishCall(item.callId ?? "", item.status);
-        }
         if (item.type === "assistant_message" && typeof item.text === "string") {
           this.append(item.messageId, item.text);
           return this.interrupt(false);
@@ -84,21 +74,6 @@ export class TurnEndTracker {
   }
 
   /**
-   * Whether a finish_execution call is still running or already completed. Either way the
-   * explicit finish owns the outcome. Only a call that failed or was canceled leaves the run
-   * unfinished. This is kept here, not read from the database, because a continuation execution
-   * records no finish acknowledgement. Events on a shared session carry no execution id, so a
-   * call is attributed to this execution; Hub also skips inference while the session has another
-   * live execution.
-   */
-  finishCallOwnsOutcome(): boolean {
-    for (const status of this.finishCalls.values()) {
-      if (status !== "failed" && status !== "canceled") return true;
-    }
-    return false;
-  }
-
-  /**
    * The agent's closing text: the trailing assistant message after its last piece of work, as
    * well-formed Unicode with no NUL, because Postgres jsonb rejects both.
    */
@@ -110,12 +85,6 @@ export class TurnEndTracker {
       text: withoutSplitSurrogate(text.slice(0, MAX_TURN_END_OUTPUT_CHARS)),
       truncated: true,
     };
-  }
-
-  private recordFinishCall(callId: string, status: string | undefined): void {
-    // A completed call stays completed even if a stale running update arrives later.
-    if (this.finishCalls.get(callId) === "completed") return;
-    this.finishCalls.set(callId, status ?? "running");
   }
 
   private interrupt(clearText: boolean): TurnEndVerdict {

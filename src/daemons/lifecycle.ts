@@ -33,6 +33,7 @@ import { reportFailure } from "../failures/index.js";
 import type { TriggerProvider } from "../triggers/index.js";
 import type { ExecutionAuthority } from "../execution-authority/index.js";
 import { OutputExecutorRegistry } from "../execution-capabilities/outputs.js";
+import { FinishCallRegistry } from "../execution-capabilities/finish-calls.js";
 import { executionToolPolicy } from "../execution-capabilities/tool-policy.js";
 import { sendsToolPolicy } from "../triggers/configuration/unattended.js";
 import {
@@ -109,6 +110,8 @@ export interface DaemonDispatchLifecycleOptions {
   executionCapabilities?: OutputExecutorRegistry;
   providers?: readonly TriggerProvider[];
   executionAuthority?: ExecutionAuthority;
+  /** Shared with the MCP handler, which records each finish_execution call by its execution. */
+  finishCalls?: FinishCallRegistry;
   publicBaseUrl?: string;
   completionTokenSecret?: string;
   test?: {
@@ -168,8 +171,10 @@ export class DaemonDispatchLifecycle {
   private readonly turnEndTimers = new Map<string, () => void>();
   private readonly turnEndRuns = new Set<Promise<void>>();
   private stopping = false;
+  readonly finishCalls: FinishCallRegistry;
 
   constructor(private readonly options: DaemonDispatchLifecycleOptions) {
+    this.finishCalls = options.finishCalls ?? new FinishCallRegistry();
     this.executionCapabilities = options.executionCapabilities ?? new OutputExecutorRegistry();
     this.providersByName = new Map(
       (options.providers ?? []).map((provider) => [provider.name, provider]),
@@ -1178,6 +1183,7 @@ export class DaemonDispatchLifecycle {
 
     this.clearExecutionDeadline(executionId);
     this.clearTurnEnd(executionId);
+    this.finishCalls.release(executionId);
 
     const { execution } = transition;
     const deferArchiveAcknowledgement =
@@ -1731,13 +1737,13 @@ export class DaemonDispatchLifecycle {
     const stillWanted = () =>
       !this.stopping && this.turnEnds.get(executionId) === tracker && tracker.isCurrent(generation);
     await this.waitForPendingStreamHandlers(executionId);
-    if (!stillWanted() || tracker.finishCallOwnsOutcome()) return;
+    if (!stillWanted() || this.finishCalls.ownsOutcome(executionId)) return;
     const execution = await this.options.database.findAgentExecutionById(executionId);
     if (execution === undefined || !mayCompleteOnTurnEnd(execution) || !stillWanted()) return;
     if (await this.expireExecutionIfDeadlineElapsed(execution)) return;
     if (!stillWanted() || (await this.hasOtherActiveSessionExecution(execution))) return;
     if (!stillWanted() || !(await this.agentIsIdle(execution))) return;
-    if (!stillWanted() || tracker.finishCallOwnsOutcome()) return;
+    if (!stillWanted() || this.finishCalls.ownsOutcome(executionId)) return;
     await this.completeAgentExecution(executionId, { turnEnd: tracker.finalOutput() ?? null });
   }
 
@@ -1835,6 +1841,7 @@ export class DaemonDispatchLifecycle {
     this.executionSubscriptions.get(executionId)?.();
     this.executionSubscriptions.delete(executionId);
     this.clearTurnEnd(executionId);
+    this.finishCalls.release(executionId);
   }
 
   private async expireExecutionAtCurrentDeadline(

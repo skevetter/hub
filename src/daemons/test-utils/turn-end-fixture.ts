@@ -278,6 +278,25 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
       await deliver(this.events.turnCompleted());
       await deliver(this.events.status("idle"));
     },
+    /**
+     * A finish_execution call as the hub sees it: the MCP handler tells the registry which
+     * execution made it, and the agent's stream reports the same call without that name.
+     */
+    async finishCall(
+      executionId: string,
+      status: "running" | "completed" | "failed",
+      callId = `finish-${randomUUID()}`,
+    ): Promise<void> {
+      lifecycle.finishCalls.start(executionId);
+      if (status !== "running") lifecycle.finishCalls.resolve(executionId, status);
+      await deliver(
+        stream({
+          type: "timeline",
+          provider,
+          item: { type: "tool_call", name: "mcp__hub__finish_execution", status, callId },
+        }),
+      );
+    },
     async execution(id: string): Promise<AgentExecutionRecord> {
       const found = await database.findAgentExecutionById(id);
       if (found === undefined) throw new Error("execution is missing");

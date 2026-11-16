@@ -11,6 +11,7 @@ import type { AgentExecutionRecord, Database } from "../db/types.js";
 import { registerResponseLifecycle } from "../http/response-lifecycle.js";
 import { reportFailure, withReference } from "../failures/index.js";
 import { compileJsonSchema, formatJsonSchemaErrors } from "../workflows/json-schema.js";
+import type { FinishCallRegistry } from "./finish-calls.js";
 import {
   executionToolDefinitions,
   finishExecutionToolName,
@@ -36,6 +37,8 @@ interface ExecutionCapabilityOptions {
     output?: unknown;
   }): Promise<AgentExecutionRecord>;
   now?: () => Date;
+  /** Told when a finish_execution call starts and ends, keyed by the execution that made it. */
+  finishCalls?: FinishCallRegistry;
 }
 
 export function createExecutionCapabilityServer(
@@ -222,7 +225,10 @@ function createMcpServer(
 }
 
 async function callExecutionTool(
-  options: Pick<ExecutionCapabilityOptions, "database" | "outputs" | "completeExecution" | "now">,
+  options: Pick<
+    ExecutionCapabilityOptions,
+    "database" | "outputs" | "completeExecution" | "now" | "finishCalls"
+  >,
   execution: AgentExecutionRecord,
   token: string,
   materializedOutputs: readonly MaterializedOutputCapability[],
@@ -248,7 +254,35 @@ async function callExecutionTool(
     : executeOutputCall(options, execution, toolName, output, args);
 }
 
+/**
+ * Both MCP entry points reach finish_execution here with the owning execution known, so the
+ * registry hears about the call before it runs and how it ended.
+ */
 async function finishExecutionCall(
+  options: ExecutionCapabilityOptions,
+  execution: AgentExecutionRecord,
+  token: string,
+  args: Record<string, unknown>,
+  materializedOutputs: readonly MaterializedOutputCapability[],
+) {
+  options.finishCalls?.start(execution.id);
+  let outcome: "completed" | "failed" = "failed";
+  try {
+    const result = await attemptFinishExecution(
+      options,
+      execution,
+      token,
+      args,
+      materializedOutputs,
+    );
+    if (!("isError" in result)) outcome = "completed";
+    return result;
+  } finally {
+    options.finishCalls?.resolve(execution.id, outcome);
+  }
+}
+
+async function attemptFinishExecution(
   options: ExecutionCapabilityOptions,
   execution: AgentExecutionRecord,
   token: string,

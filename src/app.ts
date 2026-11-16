@@ -440,6 +440,7 @@ function createAppExecutionCapabilityServer(
       : { completionTokenSecret: options.completionTokenSecret }),
     database: options.database,
     outputs: outputRegistry,
+    finishCalls: daemonModule.lifecycle.finishCalls,
     completeExecution: (input) =>
       daemonModule.lifecycle.completeAgentExecutionFromCallback(input, { deferHubAction: true }),
   });

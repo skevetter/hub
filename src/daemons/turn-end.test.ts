@@ -208,45 +208,6 @@ describe("runtime guard for a launch intent that skipped compile-time validation
   });
 });
 
-describe("finish_execution calls seen by the tracker", () => {
-  const call = (callId: string, status: string, name = "mcp__hub__finish_execution") =>
-    stream({
-      type: "timeline",
-      provider: "claude",
-      item: { type: "tool_call", name, callId, status },
-    });
-
-  it.each(["hub.finish_execution", "mcp__hub__finish_execution", "hub / finish_execution"])(
-    "owns the outcome while a call named %s is running or completed",
-    (name) => {
-      const running = new TurnEndTracker();
-      running.observe(call("c1", "running", name));
-      assert.equal(running.finishCallOwnsOutcome(), true);
-      running.observe(call("c1", "completed", name));
-      assert.equal(running.finishCallOwnsOutcome(), true);
-    },
-  );
-
-  it("releases the outcome only when every call failed or was canceled", () => {
-    const tracker = new TurnEndTracker();
-    tracker.observe(call("c1", "failed"));
-    tracker.observe(call("c2", "running"));
-    assert.equal(tracker.finishCallOwnsOutcome(), true);
-    tracker.observe(call("c2", "canceled"));
-    assert.equal(tracker.finishCallOwnsOutcome(), false);
-  });
-
-  it("keeps a completed call completed and ignores other tools", () => {
-    const tracker = new TurnEndTracker();
-    tracker.observe(call("c1", "completed"));
-    tracker.observe(call("c1", "running"));
-    assert.equal(tracker.finishCallOwnsOutcome(), true);
-    const other = new TurnEndTracker();
-    other.observe(call("c9", "running", "Bash"));
-    assert.equal(other.finishCallOwnsOutcome(), false);
-  });
-});
-
 describe("turn end output normalization", () => {
   it.each([
     ["a NUL", "a\u0000b", "ab"],

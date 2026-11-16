@@ -19,6 +19,7 @@ import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js
 import { createFetchServer } from "../http/node-server.js";
 import { registerResponseLifecycle, takeResponseLifecycle } from "../http/response-lifecycle.js";
 import { OutputExecutorRegistry, replyOutputTool, type OutputCapability } from "./outputs.js";
+import { FinishCallRegistry } from "./finish-calls.js";
 import { createExecutionCapabilityServer } from "./server.js";
 
 const RpcResponseSchema = z
@@ -166,6 +167,58 @@ describe("execution capability MCP boundary", () => {
       await client.close();
       await closeServer(endpoint.server);
     }
+  });
+
+  it("tells the finish call registry when a finish call starts and how it ended", async () => {
+    const finishCalls = new FinishCallRegistry();
+    const fixture = await capabilityFixture(
+      undefined,
+      "succeeded",
+      1,
+      undefined,
+      false,
+      [],
+      undefined,
+      [],
+      finishCalls,
+    );
+    const seen: boolean[] = [];
+    const original = fixture.database.transitionAgentExecution.bind(fixture.database);
+    vi.spyOn(fixture.database, "transitionAgentExecution").mockImplementation(async (...args) => {
+      seen.push(finishCalls.ownsOutcome(fixture.executionId));
+      return original(...args);
+    });
+
+    const failed = await fixture.call("tools/call", {
+      name: "finish_execution",
+      arguments: { x: 1 },
+    });
+    assert.equal(ToolResultSchema.parse(failed.result).isError, true);
+    assert.equal(finishCalls.ownsOutcome(fixture.executionId), false, "an invalid call failed");
+    assert.deepEqual(seen, []);
+
+    const done = await fixture.call("tools/call", { name: "finish_execution", arguments: {} });
+    assert.equal(ToolResultSchema.parse(done.result).isError, undefined);
+    assert.deepEqual(seen, [true], "the call was registered before the completion ran");
+    assert.equal(finishCalls.ownsOutcome(fixture.executionId), true);
+  });
+
+  it("records a finish call that failed to complete as failed", async () => {
+    const finishCalls = new FinishCallRegistry();
+    const fixture = await capabilityFixture(
+      undefined,
+      "failed",
+      1,
+      undefined,
+      false,
+      [],
+      undefined,
+      [],
+      finishCalls,
+    );
+    const result = await fixture.call("tools/call", { name: "finish_execution", arguments: {} });
+    assert.equal(ToolResultSchema.parse(result.result).isError, true);
+    assert.equal(finishCalls.ownsOutcome(fixture.executionId), false);
   });
 
   it("allows an event-native reply to be sent repeatedly without a synthetic cap", async () => {
@@ -736,6 +789,7 @@ async function capabilityFixture(
   requiredOutputTypes: readonly string[] = [],
   outputTool = replyOutputTool,
   additionalCapabilities: readonly OutputCapability[] = [],
+  finishCalls?: FinishCallRegistry,
 ) {
   const database = createMemoryDatabase();
   const executionId = randomUUID();
@@ -771,6 +825,7 @@ async function capabilityFixture(
   const server = createExecutionCapabilityServer({
     database,
     outputs,
+    ...(finishCalls === undefined ? {} : { finishCalls }),
     async completeExecution(input) {
       completions.push(input);
       return (

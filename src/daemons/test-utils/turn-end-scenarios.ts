@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it, vi } from "vitest";
 import type { Database } from "../../db/types.js";
 import { deriveAgentExecutionCompletionToken } from "../../agent-executions/completion-token.js";
+import type { FinishCallRegistry } from "../../execution-capabilities/finish-calls.js";
 import { MAX_TURN_END_OUTPUT_CHARS, TURN_END_COMPLETION, TURN_END_SETTLE_MS } from "../turn-end.js";
 import { IDLE_TIMEOUT_MS, turnEndFixture, type TurnEndFixtureOptions } from "./turn-end-fixture.js";
 
@@ -14,6 +15,15 @@ const SETTLED = TURN_END_SETTLE_MS + 1;
 
 function resultField(result: unknown, key: string): unknown {
   return typeof result === "object" && result !== null ? Reflect.get(result, key) : undefined;
+}
+
+/** Ends one finish call the way the MCP handler does. */
+function lifecycleResolve(
+  fixture: { lifecycle: { finishCalls: FinishCallRegistry } },
+  executionId: string,
+  outcome: "completed" | "failed",
+): void {
+  fixture.lifecycle.finishCalls.resolve(executionId, outcome);
 }
 
 /** How many of the spied completion calls actually changed the execution. */
@@ -329,7 +339,7 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
         ...(continuationKey === undefined ? {} : { continuationKey }),
       });
 
-      it.each(["running", "completed"])(
+      it.each(["running", "completed"] as const)(
         "does not complete while a finish_execution call is %s",
         async (status) => {
           const fixture = await open(finishOptions());
@@ -337,7 +347,7 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
             const { execution } = await fixture.dispatch();
             fixture.state.status = "running";
             await fixture.deliver(fixture.events.turnStarted());
-            await fixture.deliver(fixture.events.toolCall("mcp__hub__finish_execution", status));
+            await fixture.finishCall(execution.id, status);
             fixture.state.status = "idle";
             await fixture.deliver(fixture.events.turnCompleted());
             await fixture.deliver(fixture.events.status("idle"));
@@ -349,7 +359,7 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
         },
       );
 
-      it.each(["failed", "canceled"])(
+      it.each(["failed"] as const)(
         "completes after a finish_execution call that %s",
         async (status) => {
           const fixture = await open(finishOptions());
@@ -357,7 +367,7 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
             const { execution } = await fixture.dispatch();
             fixture.state.status = "running";
             await fixture.deliver(fixture.events.turnStarted());
-            await fixture.deliver(fixture.events.toolCall("mcp__hub__finish_execution", status));
+            await fixture.finishCall(execution.id, status);
             await fixture.deliver(fixture.events.text("could not finish"));
             fixture.state.status = "idle";
             await fixture.deliver(fixture.events.turnCompleted());
@@ -376,7 +386,7 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
           const { execution } = await fixture.dispatch();
           fixture.state.status = "running";
           await fixture.deliver(fixture.events.turnStarted());
-          await fixture.deliver(fixture.events.toolCall("hub.finish_execution", "running"));
+          await fixture.finishCall(execution.id, "running");
           fixture.state.status = "idle";
           await fixture.deliver(fixture.events.turnCompleted());
           await fixture.deliver(fixture.events.status("idle"));
@@ -394,6 +404,132 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
           await fixture.lifecycle.stop();
         }
       });
+    });
+
+    describe("finish calls are owned by the execution that made them", () => {
+      const options = { workflow, completeOnTurnEnd: true, continuationKey: "shared-session" };
+      const token = (executionId: string) =>
+        deriveAgentExecutionCompletionToken("test-secret", executionId);
+
+      /** The shared agent ends its turn after saying `said`. */
+      async function sharedTurn(fixture: Awaited<ReturnType<typeof open>>, said: string) {
+        fixture.state.status = "running";
+        await fixture.deliver(fixture.events.turnStarted());
+        await fixture.deliver(fixture.events.text(said));
+        fixture.state.status = "idle";
+        await fixture.deliver(fixture.events.turnCompleted());
+        await fixture.deliver(fixture.events.status("idle"));
+      }
+
+      it("completes B by inference after A finished explicitly on the same session", async () => {
+        const fixture = await open(options);
+        try {
+          const a = await fixture.dispatch();
+          const b = await fixture.dispatch();
+          await fixture.finishCall(a.execution.id, "completed");
+          await fixture.lifecycle.completeAgentExecutionFromCallback({
+            executionId: a.execution.id,
+            token: token(a.execution.id),
+          });
+          assert.equal((await fixture.execution(a.execution.id)).status, "succeeded");
+          assert.equal(fixture.lifecycle.finishCalls.ownsOutcome(a.execution.id), false);
+
+          await sharedTurn(fixture, "B is done");
+          await fixture.clock.advance(SETTLED);
+
+          const done = await fixture.execution(b.execution.id);
+          assert.equal(done.status, "succeeded");
+          assert.equal(resultField(done.result, "completion"), TURN_END_COMPLETION);
+          assert.equal(resultField(done.result, "output"), "B is done");
+        } finally {
+          await fixture.lifecycle.stop();
+        }
+      });
+
+      it("blocks B on its own running finish call and not on A's failed one", async () => {
+        const fixture = await open(options);
+        try {
+          const a = await fixture.dispatch();
+          const b = await fixture.dispatch();
+          await fixture.finishCall(a.execution.id, "failed");
+          await fixture.finishCall(b.execution.id, "running");
+          assert.equal(fixture.lifecycle.finishCalls.ownsOutcome(a.execution.id), false);
+          assert.equal(fixture.lifecycle.finishCalls.ownsOutcome(b.execution.id), true);
+
+          // A explicitly finishes while B's own call is still running.
+          await fixture.lifecycle.completeAgentExecutionFromCallback({
+            executionId: a.execution.id,
+            token: token(a.execution.id),
+          });
+          await sharedTurn(fixture, "B says something");
+          await fixture.clock.advance(10 * TURN_END_SETTLE_MS);
+          assert.equal((await fixture.execution(b.execution.id)).status, "running");
+        } finally {
+          await fixture.lifecycle.stop();
+        }
+      });
+
+      it("blocks while one of two overlapping finish calls on an execution is still running", async () => {
+        const fixture = await open(options);
+        try {
+          const a = await fixture.dispatch();
+          await fixture.finishCall(a.execution.id, "running");
+          await fixture.finishCall(a.execution.id, "running");
+          lifecycleResolve(fixture, a.execution.id, "failed");
+          await sharedTurn(fixture, "ok");
+          await fixture.clock.advance(10 * TURN_END_SETTLE_MS);
+          assert.equal((await fixture.execution(a.execution.id)).status, "running");
+
+          lifecycleResolve(fixture, a.execution.id, "failed");
+          await sharedTurn(fixture, "ok again");
+          await fixture.clock.advance(SETTLED);
+          assert.equal((await fixture.execution(a.execution.id)).status, "succeeded");
+        } finally {
+          await fixture.lifecycle.stop();
+        }
+      });
+
+      it("does not block on a finish call that failed with nothing else running", async () => {
+        const fixture = await open(options);
+        try {
+          const a = await fixture.dispatch();
+          await fixture.finishCall(a.execution.id, "failed");
+          await sharedTurn(fixture, "could not finish");
+          await fixture.clock.advance(SETTLED);
+          assert.equal((await fixture.execution(a.execution.id)).status, "succeeded");
+        } finally {
+          await fixture.lifecycle.stop();
+        }
+      });
+
+      it.each(["inference", "explicit finish", "failure"])(
+        "frees the registry entry when the execution ends by %s",
+        async (ending) => {
+          const fixture = await open(options);
+          try {
+            const a = await fixture.dispatch();
+            await fixture.finishCall(a.execution.id, "running");
+            if (ending === "inference") {
+              lifecycleResolve(fixture, a.execution.id, "failed");
+              await sharedTurn(fixture, "ok");
+              await fixture.clock.advance(SETTLED);
+            } else if (ending === "explicit finish") {
+              await fixture.lifecycle.completeAgentExecutionFromCallback({
+                executionId: a.execution.id,
+                token: token(a.execution.id),
+              });
+              lifecycleResolve(fixture, a.execution.id, "completed");
+            } else {
+              fixture.state.status = "running";
+              await fixture.deliver(fixture.events.status("error"));
+            }
+            assert.notEqual((await fixture.execution(a.execution.id)).status, "running");
+            assert.equal(fixture.lifecycle.finishCalls.size, 0);
+          } finally {
+            await fixture.lifecycle.stop();
+          }
+        },
+      );
     });
 
     it.each([
