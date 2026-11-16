@@ -153,6 +153,12 @@ describe("optional capture application composition", () => {
         },
       });
       try {
+        assert.deepEqual(
+          runtime.hub.resourceCounts(),
+          enabled
+            ? { executionSubscriptions: 0, timelineQueueDepth: 0 }
+            : { executionSubscriptions: 0 },
+        );
         const receipt = await database.persistManualEvent({
           organizationId: ORGANIZATION,
           projectId: project.id,
@@ -247,8 +253,12 @@ describe("optional capture application composition", () => {
         await runtime.stop();
       }
       assert.equal(closed, true);
-      assert.equal(runtime.hub.resourceCounts().executionSubscriptions, 0);
-      assert.equal(runtime.hub.resourceCounts().timelineQueueDepth, 0);
+      assert.deepEqual(
+        runtime.hub.resourceCounts(),
+        enabled
+          ? { executionSubscriptions: 0, timelineQueueDepth: 0 }
+          : { executionSubscriptions: 0 },
+      );
     },
   );
 });

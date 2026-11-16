@@ -100,7 +100,7 @@ export interface HubRuntime {
   agentValidator: DaemonAgentConfigurationValidator | null;
   resourceCounts(): {
     executionSubscriptions: number;
-    timelineQueueDepth: number;
+    timelineQueueDepth?: number;
   };
   processWorkflowOutbox(): Promise<void>;
   handleUpgrade: ReturnType<typeof createDaemonUpgradeHandler> | null;
@@ -267,7 +267,9 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     agentValidator,
     resourceCounts: () => ({
       executionSubscriptions: daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0,
-      timelineQueueDepth: options.runTimeline?.depth() ?? 0,
+      ...(options.runTimeline === undefined
+        ? {}
+        : { timelineQueueDepth: options.runTimeline.depth() }),
     }),
     processWorkflowOutbox: () => workflowEngine.processAvailable(),
     handleUpgrade:

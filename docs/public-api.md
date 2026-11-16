@@ -45,6 +45,8 @@ With `PASEO_HUB_RUN_TIMELINE=true`, Hub stores projected run, step and agent lif
 
 The timeline queue holds at most 200 ordinary events per run. Overflow is counted durably and produces one truncation notice. Ordinary events have a separate count and byte budget, so they cannot displace the first 100 terminal step rows or the final run row and seal. A run with more terminal steps records the omission count and outcome counts for every step. Terminal summaries count pending or running steps left when a run ends as not run without changing workflow rows.
 
+Runtime resource counts include timeline queue depth only when capture is enabled. With capture off, the resource-count shape is unchanged.
+
 | Setting                             | Default | Range          |
 | ----------------------------------- | ------- | -------------- |
 | `PASEO_HUB_TIMELINE_MAX_EVENTS`     | `500`   | `50` to `5000` |
