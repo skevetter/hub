@@ -7,6 +7,10 @@ import type {
   ProjectActivityRunListRecord,
   ProjectActivityRunRecord,
   ProviderEventReceiptSummary,
+  ProviderEventReceiptRecord,
+  TriggerRunRecord,
+  WorkflowDeadlineKind,
+  WorkflowStepRunRecord,
 } from "../db/types.js";
 import { formatInvocationRejection } from "../triggers/invocation.js";
 import { providerEventDropReasonSummary } from "../triggers/drop-reason.js";
@@ -27,6 +31,50 @@ export type JsonValue =
   | null
   | JsonValue[]
   | { [key: string]: JsonValue };
+
+export interface ActivityRunDetail {
+  run: {
+    id: string;
+    providerEventReceiptId: string;
+    provider: ProviderEventReceiptRecord["provider"];
+    deliveryId: string;
+    source: string;
+    repo: string | null;
+    receivedAt: string;
+    rawPayload: JsonValue;
+    configuredTriggerName: string;
+    prompt: string;
+    inputs: JsonValue;
+    values: JsonValue;
+    triggerContext: JsonValue;
+    outputContext: JsonValue;
+    createdAt: string;
+    completedAt: string | null;
+    outcome: TriggerRunRecord["outcome"];
+    status: TriggerRunRecord["status"];
+    deadlineAt: string | null;
+    deadlineKind: WorkflowDeadlineKind | null;
+    failureReason: string | null;
+    rejectionReason: string | null;
+  };
+  steps: {
+    agentId: AgentExecutionRecord["daemonAgentId"];
+    agentSessionId: AgentExecutionRecord["agentSessionId"];
+    agentSessionAction: AgentExecutionRecord["agentSessionAction"];
+    agentExecutionId: string | null;
+    id: string;
+    stepId: string;
+    ordinal: number;
+    status: WorkflowStepRunRecord["status"];
+    deadlineAt: string | null;
+    idleDeadlineAt: string | null;
+    deadlineKind: WorkflowDeadlineKind | null;
+    startedAt: string | null;
+    output: JsonValue;
+    failureReason: string | null;
+    completedAt: string | null;
+  }[];
+}
 
 export interface ProjectRouteScope {
   organizationSlug: string;
@@ -127,6 +175,30 @@ export class ProjectDashboard {
         ),
       ),
     };
+  }
+
+  async activityRunDetail(
+    request: Request,
+    scope: { organizationSlug: string; runId: string },
+  ): Promise<ActivityRunDetail | null> {
+    const { tenant } = await this.resolve(request, { organizationSlug: scope.organizationSlug });
+    const activity = await this.database.findOrganizationActivityRun(
+      tenant.organization.id,
+      scope.runId,
+    );
+    if (activity === undefined) return null;
+    const view = activityRunView(
+      activity,
+      await Promise.all(
+        activity.steps.map(async (step) =>
+          step.agentExecutionId === null
+            ? undefined
+            : this.database.findAgentExecutionById(step.agentExecutionId),
+        ),
+      ),
+    );
+    const { steps, ...run } = view;
+    return { run, steps };
   }
 
   async createProject(
@@ -318,6 +390,7 @@ function activityRunView(
       agentId: executions[index]?.daemonAgentId ?? null,
       agentSessionId: executions[index]?.agentSessionId ?? null,
       agentSessionAction: executions[index]?.agentSessionAction ?? null,
+      agentExecutionId: step.agentExecutionId,
       id: step.id,
       stepId: step.stepId,
       ordinal: step.ordinal,

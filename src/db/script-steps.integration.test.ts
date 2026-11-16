@@ -68,8 +68,7 @@ async function embeddedHarness(): Promise<Harness> {
   };
 }
 
-/** One accepted run with a single pending script step. */
-async function acceptedRun({ database, projectId }: Harness) {
+async function acceptedRun({ database, projectId }: Harness, stepIds = ["run"]) {
   const revision = await database.insertProjectConfigurationRevision({
     projectId,
     sourceKind: "manual",
@@ -98,7 +97,7 @@ async function acceptedRun({ database, projectId }: Harness) {
     triggerContext: { provider: "manual" },
     outputContext: { provider: "manual" },
     deadlineAt: new Date(Date.now() + 3_600_000),
-    stepIds: ["run"],
+    stepIds,
   });
   const [step] = await database.listWorkflowStepRunsForTriggerRun(created.run.id);
   assert.ok(step);
@@ -111,6 +110,31 @@ const backends = [
 ] as const;
 
 describe.each(backends)("script step persistence (%s)", (_name, open) => {
+  it("reads an organization-scoped run with ordered steps", async () => {
+    const harness = await open();
+    try {
+      const { run } = await acceptedRun(harness, ["third", "first", "second"]);
+      const detail = await harness.database.findOrganizationActivityRun("org-1", run.id);
+      assert.ok(detail);
+      assert.equal(detail.run.id, run.id);
+      assert.deepEqual(
+        detail.steps.map(({ stepId, ordinal }) => ({ stepId, ordinal })),
+        [
+          { stepId: "third", ordinal: 0 },
+          { stepId: "first", ordinal: 1 },
+          { stepId: "second", ordinal: 2 },
+        ],
+      );
+      assert.equal(await harness.database.findOrganizationActivityRun("org-2", run.id), undefined);
+      assert.equal(
+        await harness.database.findOrganizationActivityRun("org-1", randomUUID()),
+        undefined,
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("starts a pending step once and records the terminal while it runs", async () => {
     const harness = await open();
     const { database, close } = harness;

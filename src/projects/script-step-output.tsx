@@ -28,6 +28,8 @@ export function ScriptStepOutput({
       </span>
     );
   }
+  const outputTail = result.output_tail.slice(-64 * 1024);
+  const truncated = result.truncated || outputTail.length < result.output_tail.length;
   return (
     <div className="grid gap-2">
       <span>
@@ -38,12 +40,10 @@ export function ScriptStepOutput({
         open={open}
         onOpenChange={setOpen}
         title="Output"
-        description={
-          result.truncated ? "The last 64 KB of the output." : "Everything the script printed."
-        }
+        description={truncated ? "The last 64 KB of the output." : "Everything the script printed."}
       >
         <CodeBlock label="Script output">
-          {result.output_tail === "" ? "(no output)" : result.output_tail}
+          {outputTail === "" ? "(no output)" : outputTail}
         </CodeBlock>
       </Disclosure>
     </div>

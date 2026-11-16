@@ -1961,6 +1961,14 @@ class MemoryDatabase implements Database {
     return { run, receipt, steps: this.listSteps(run.id) };
   }
 
+  async findOrganizationActivityRun(organizationId: string, runId: string) {
+    const run = this.triggerRuns.get(runId);
+    if (run === undefined || run.organizationId !== organizationId) return undefined;
+    const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
+    if (receipt === undefined || receipt.organizationId !== organizationId) return undefined;
+    return { run, receipt, steps: this.listSteps(run.id) };
+  }
+
   private listSteps(triggerRunId: string): WorkflowStepRunRecord[] {
     return [...this.workflowStepRuns.values()]
       .filter((step) => step.triggerRunId === triggerRunId)

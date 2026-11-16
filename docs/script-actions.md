@@ -6,6 +6,11 @@ runs the script there, and records the exit code and the end of the output in th
 
 Hub does not check that the script works on the host. You own that. Hub reports what happened.
 
+## Where to see a script's result
+
+Open **Activity** and select the run to see its status, exit code, and output. Hub stores the
+output and shows it to organization members. Scripts should not print secrets.
+
 ## YAML
 
 Put `script` under `run` in place of `agent` and `prompt`. This trigger runs a build whenever

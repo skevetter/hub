@@ -94,6 +94,14 @@ describe("project dashboard activity read models", () => {
           membershipId: "membership-1",
           role: "owner",
         },
+        {
+          userId: "user-1",
+          organizationId: "org-2",
+          organizationName: "Other",
+          organizationSlug: "other",
+          membershipId: "membership-2",
+          role: "owner",
+        },
       ],
     });
     const project = await database.createProject({
@@ -164,6 +172,50 @@ describe("project dashboard activity read models", () => {
     });
     assert.deepEqual(detail.activity.rawPayload, rawPayload);
     assert.deepEqual(detail.activity.triggerContext, triggerContext);
+
+    const organizationDetail = await dashboard.activityRunDetail(request, {
+      organizationSlug: "acme",
+      runId: run.run.id,
+    });
+    assert.ok(organizationDetail);
+    assert.equal(organizationDetail.run.id, run.run.id);
+    assert.deepEqual(organizationDetail.run.rawPayload, rawPayload);
+    assert.deepEqual(organizationDetail.run.triggerContext, triggerContext);
+    assert.deepEqual(
+      organizationDetail.steps.map((step) => step.stepId),
+      ["step"],
+    );
+    assert.equal(organizationDetail.steps[0]?.agentExecutionId, null);
+    assert.equal(organizationDetail.steps[0]?.output, null);
+    assert.equal(
+      await dashboard.activityRunDetail(request, {
+        organizationSlug: "other",
+        runId: run.run.id,
+      }),
+      null,
+    );
+    assert.equal(
+      await dashboard.activityRunDetail(request, {
+        organizationSlug: "acme",
+        runId: "00000000-0000-4000-8000-000000000000",
+      }),
+      null,
+    );
+    await assert.rejects(
+      dashboard.activityRunDetail(request, {
+        organizationSlug: "inaccessible",
+        runId: run.run.id,
+      }),
+      { name: "TenantRouteNotFoundError" },
+    );
+    const anonymous = new ProjectDashboard(database, {
+      ...accountAuth(),
+      resolveAccount: () => Promise.reject(new Error("unauthenticated")),
+    });
+    await assert.rejects(
+      anonymous.activityRunDetail(request, { organizationSlug: "acme", runId: run.run.id }),
+      /unauthenticated/,
+    );
 
     const organization = await dashboard.organizationSnapshot(request, {
       organizationSlug: "acme",

@@ -2085,6 +2085,26 @@ class PgDatabase implements Database {
     return row === undefined ? undefined : this.toProjectActivityRun(row);
   }
 
+  async findOrganizationActivityRun(organizationId: string, runId: string) {
+    const rows = await query<ProjectActivityRunRow>(
+      this.pool,
+      `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
+              receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
+              receipts.provider_configuration_version, receipts.source, receipts.repo,
+              receipts.payload, receipts.received_at, receipts.dropped_reason,
+              receipts.accepted_routes
+       from trigger_runs runs
+       join provider_event_receipts receipts
+         on receipts.id = runs.provider_event_receipt_id
+        and receipts.organization_id = runs.organization_id
+       where runs.organization_id = $1 and runs.id = $2
+       limit 1`,
+      [organizationId, runId],
+    );
+    const row = rows.rows[0];
+    return row === undefined ? undefined : this.toProjectActivityRun(row);
+  }
+
   private async toProjectActivityRun(
     row: ProjectActivityRunRow,
   ): Promise<ProjectActivityRunRecord> {

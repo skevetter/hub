@@ -1258,6 +1258,10 @@ export interface Database {
     projectId: string,
     runId: string,
   ): Promise<ProjectActivityRunRecord | undefined>;
+  findOrganizationActivityRun(
+    organizationId: string,
+    runId: string,
+  ): Promise<ProjectActivityRunRecord | undefined>;
   updateTriggerRunValues(triggerRunId: string, values: unknown): Promise<TriggerRunRecord>;
   findWorkflowStepRunById(id: string): Promise<WorkflowStepRunRecord | undefined>;
   findWorkflowStepRunByTriggerRun(triggerRunId: string): Promise<WorkflowStepRunRecord | undefined>;

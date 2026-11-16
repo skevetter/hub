@@ -5,7 +5,6 @@ import { FailureAlert } from "../components/app/failure-alert.js";
 import { PageHeader } from "../components/app/page.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { StatusPill, statusLabel } from "../components/app/status-pill.js";
-import { TwoLine } from "../components/app/two-line.js";
 import { useRouteTenant } from "../projects/context.js";
 import { triggerSnapshot } from "./functions.js";
 
@@ -26,6 +25,7 @@ export function TriggerActivityPanel() {
   const snapshot = useSnapshotQuery({
     queryKey: ["triggers", organizationSlug],
     queryFn: () => load({ data: { organizationSlug } }),
+    refetchInterval: 5_000,
   });
   if (snapshot.status === "pending") {
     return (
@@ -57,10 +57,13 @@ export function TriggerActivityPanel() {
         {activity.map((run) => (
           <DataRow key={run.id}>
             <DataCell>
-              <TwoLine
-                primary={run.triggerName}
-                {...(run.repo === null ? {} : { secondary: run.repo })}
-              />
+              <a
+                href={`/o/${encodeURIComponent(organizationSlug)}/activity/${encodeURIComponent(run.id)}`}
+                className="text-primary hover:underline"
+              >
+                {run.triggerName}
+              </a>
+              {run.repo === null ? null : <div className="text-muted-foreground">{run.repo}</div>}
             </DataCell>
             <DataCell>{run.provider}</DataCell>
             <DataCell>{run.source}</DataCell>

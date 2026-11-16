@@ -29,6 +29,17 @@ describe("script step output in the run history", () => {
     assert.match(markup, /\(no output\)/u);
   });
 
+  it("caps oversized script output to its tail", () => {
+    const markup = render({
+      exit_code: 0,
+      output_tail: "x".repeat(70_000) + "tail",
+      truncated: false,
+    });
+    assert.match(markup, /The last 64 KB of the output\./u);
+    assert.match(markup, /tail/u);
+    assert.doesNotMatch(markup, /x{65536}/u);
+  });
+
   it("escapes what the script printed", () => {
     const markup = render({
       exit_code: 1,

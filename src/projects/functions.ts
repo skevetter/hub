@@ -7,7 +7,7 @@ import { respondWithFailure } from "../failures/index.js";
 import { projectSlugSchema } from "../project-slug.js";
 import { isTenantRouteNotFoundError } from "./access.js";
 import { ProjectCommandError, projectCommandErrorCode } from "./command-error.js";
-import type { ProjectDashboard } from "./dashboard.js";
+import type { ActivityRunDetail, ProjectDashboard } from "./dashboard.js";
 
 const organizationScopeSchema = z
   .object({ organizationSlug: z.string().trim().min(1).max(100) })
@@ -16,6 +16,9 @@ const projectScopeSchema = organizationScopeSchema
   .extend({ projectSlug: z.string().trim().min(1).max(100) })
   .strict();
 const activityRunScopeSchema = projectScopeSchema.extend({ runId: z.string().uuid() }).strict();
+const organizationActivityRunScopeSchema = organizationScopeSchema
+  .extend({ runId: z.string().uuid() })
+  .strict();
 const createProjectSchema = organizationScopeSchema.extend({
   name: z.string().trim().min(1).max(100),
   slug: projectSlugSchema,
@@ -55,6 +58,13 @@ export const activityRunSnapshot = createServerFn({ method: "GET" })
       data,
     }): Promise<Result<Awaited<ReturnType<ProjectDashboard["activityRunSnapshot"]>>>> =>
       read(data, (dashboard) => dashboard.activityRunSnapshot(getRequest(), data)),
+  );
+
+export const activityRunDetail = createServerFn({ method: "GET" })
+  .validator(organizationActivityRunScopeSchema)
+  .handler(
+    async ({ data }): Promise<Result<ActivityRunDetail | null>> =>
+      read(data, (dashboard) => dashboard.activityRunDetail(getRequest(), data)),
   );
 
 export const createProject = createServerFn({ method: "POST" })
