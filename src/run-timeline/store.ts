@@ -136,7 +136,7 @@ export interface RunTimelineStore {
     count: number,
     at: Date,
     batchId: string,
-  ): Promise<{ seq: number; inserted: boolean } | undefined>;
+  ): Promise<{ seq: number; inserted: boolean; noticeSeq?: number } | undefined>;
   listRunTimelineEvents(
     organizationId: string,
     runId: string,

@@ -64,8 +64,17 @@ export class RunTimelineRepository {
         )
       ).rows[0]!;
       if (state.expiredAt !== null) return undefined;
-      if (state.accountingBatchIds?.includes(batchId))
-        return { seq: state.eventCount, inserted: false };
+      if (state.accountingBatchIds?.includes(batchId)) {
+        const notice = (
+          await transaction.query<{ seq: number }>(
+            `select seq from run_timeline_events where trigger_run_id = $1 and kind = 'truncated' limit 1`,
+            [runId],
+          )
+        ).rows[0];
+        return notice === undefined
+          ? { seq: state.eventCount, inserted: false }
+          : { seq: state.eventCount, inserted: false, noticeSeq: notice.seq };
+      }
       const batchIds = (state.accountingBatchIds ?? []).slice(-15);
       batchIds.push(batchId);
       await transaction.query(

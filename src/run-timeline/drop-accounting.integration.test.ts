@@ -208,14 +208,29 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
       const before = await database.readRunTimelineState(ORGANIZATION, run.id);
       const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
       assert.ok(before?.sealedSeq);
+      const batchId = randomUUID();
       const result = await database.recordRunTimelineDrops(
         ORGANIZATION,
         run.id,
         11,
         new Date(),
-        randomUUID(),
+        batchId,
       );
       assert.deepEqual(result, { seq: before.eventCount, inserted: false });
+      assert.deepEqual(await database.readRunTimelineState(ORGANIZATION, run.id), {
+        ...before,
+        droppedCount: before.droppedCount + 11,
+      });
+      assert.deepEqual(await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE), rows);
+      const notice = rows.find((row) => row.kind === "truncated");
+      assert.deepEqual(
+        await database.recordRunTimelineDrops(ORGANIZATION, run.id, 11, new Date(), batchId),
+        {
+          seq: before.eventCount,
+          inserted: false,
+          ...(notice === undefined ? {} : { noticeSeq: notice.seq }),
+        },
+      );
       assert.deepEqual(await database.readRunTimelineState(ORGANIZATION, run.id), {
         ...before,
         droppedCount: before.droppedCount + 11,
@@ -326,7 +341,7 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
     assert.equal(before?.droppedCount, 8);
     assert.deepEqual(
       await database.recordRunTimelineDrops(ORGANIZATION, run.id, 3, new Date(), batchId),
-      { seq: 1, inserted: false },
+      { seq: 1, inserted: false, noticeSeq: notice[0]!.seq },
     );
     assert.deepEqual(await database.readRunTimelineState(ORGANIZATION, run.id), before);
     assert.deepEqual(await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE), notice);
@@ -340,7 +355,7 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
     ] as const) {
       assert.deepEqual(
         await database.recordRunTimelineDrops(ORGANIZATION, run.id, count, new Date(), id),
-        { seq: sealed.eventCount, inserted: false },
+        { seq: sealed.eventCount, inserted: false, noticeSeq: notice[0]!.seq },
       );
       assert.deepEqual(await database.readRunTimelineState(ORGANIZATION, run.id), sealed);
     }
@@ -353,7 +368,7 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
     assert.deepEqual(await database.readRunTimelineState(ORGANIZATION, run.id), finalState);
     assert.deepEqual(
       await database.recordRunTimelineDrops(ORGANIZATION, run.id, 7, new Date(), finalBatchId),
-      { seq: sealed.eventCount, inserted: false },
+      { seq: sealed.eventCount, inserted: false, noticeSeq: notice[0]!.seq },
     );
     assert.deepEqual(await database.readRunTimelineState(ORGANIZATION, run.id), finalState);
     assert.deepEqual(await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE), rows);
@@ -389,6 +404,11 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
     const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
     assert.equal(rows.length, 1);
     assert.deepEqual(rows[0]?.data, { dropped: 3 });
+    assert.ok(
+      results
+        .filter((result) => !result?.inserted)
+        .every((result) => result?.noticeSeq === rows[0]?.seq),
+    );
   });
 
   it("keeps only the most recent 16 accepted batch identities without charging byte budgets", async () => {
@@ -413,7 +433,7 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
     for (const batchId of [batchIds[1]!, batchIds[16]!]) {
       assert.deepEqual(
         await database.recordRunTimelineDrops(ORGANIZATION, run.id, 1, new Date(), batchId),
-        { seq: 3, inserted: false },
+        { seq: 3, inserted: false, noticeSeq: rows.find((row) => row.kind === "truncated")!.seq },
       );
       assert.deepEqual(await database.readRunTimelineState(ORGANIZATION, run.id), before);
     }
@@ -502,7 +522,7 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
     );
     assert.deepEqual(
       await database.recordRunTimelineDrops(ORGANIZATION, run.id, 3, new Date(), batchId),
-      { seq: 1, inserted: false },
+      { seq: 1, inserted: false, noticeSeq: 1 },
     );
     assert.equal((await database.readRunTimelineState(ORGANIZATION, run.id))?.droppedCount, 3);
   });
@@ -565,7 +585,7 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
       assert.equal(before?.byteCount, 0);
       assert.deepEqual(
         await database.recordRunTimelineDrops(ORGANIZATION, run.id, 3, new Date(), batchId),
-        { seq: 1, inserted: false },
+        { seq: 1, inserted: false, noticeSeq: 1 },
       );
       assert.deepEqual(await database.readRunTimelineState(ORGANIZATION, run.id), before);
       const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
@@ -633,7 +653,11 @@ describe.each(backends)("durable timeline drop accounting (%s)", (name, open) =>
           assert.equal(state?.byteCount, before?.byteCount);
           assert.equal(state?.stepEndBytes, before?.stepEndBytes);
           assert.deepEqual(firstResult, { seq: 2, inserted: true });
-          assert.deepEqual(secondResult, { seq: 2, inserted: false });
+          assert.deepEqual(secondResult, {
+            seq: 2,
+            inserted: false,
+            ...(sameBatch ? { noticeSeq: rows.find((row) => row.kind === "truncated")!.seq } : {}),
+          });
           assert.deepEqual(
             rows.map((row) => [row.seq, row.kind]),
             [

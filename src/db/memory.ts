@@ -402,7 +402,12 @@ class MemoryDatabase implements Database {
       state = opened;
     }
     const batchIds = this.runTimelineAccountingBatchIds.get(runId) ?? [];
-    if (batchIds.includes(batchId)) return { seq: state.eventCount, inserted: false };
+    if (batchIds.includes(batchId)) {
+      const notice = this.runTimelineEvents.get(runId)?.find((event) => event.kind === "truncated");
+      return notice === undefined
+        ? { seq: state.eventCount, inserted: false }
+        : { seq: state.eventCount, inserted: false, noticeSeq: notice.seq };
+    }
     batchIds.push(batchId);
     if (batchIds.length > 16) batchIds.shift();
     this.runTimelineAccountingBatchIds.set(runId, batchIds);

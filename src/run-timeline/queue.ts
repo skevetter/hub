@@ -253,7 +253,7 @@ export class RunTimelineQueue implements TimelineQueue {
       if (scheduled) queue.recoveryAttempts += 1;
       queue.inFlightDrops = batch.count;
       queue.dropsReady = false;
-      let result: { seq: number; inserted: boolean } | undefined;
+      let result: { seq: number; inserted: boolean; noticeSeq?: number } | undefined;
       try {
         result = await this.database.recordRunTimelineDrops(
           queue.scope.organizationId,
@@ -281,7 +281,8 @@ export class RunTimelineQueue implements TimelineQueue {
       queue.recoveryAt = undefined;
       queue.recoveryAttempts = 0;
       queue.dropsReady = queue.dropped !== 0;
-      if (result?.inserted) this.options.bus.publish(queue.scope.triggerRunId, result.seq);
+      if (result !== undefined && (result.inserted || result.noticeSeq !== undefined))
+        this.options.bus.publish(queue.scope.triggerRunId, result.noticeSeq ?? result.seq);
     }
   }
 
