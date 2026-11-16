@@ -104,4 +104,33 @@ describe("activity run detail", () => {
     });
     assert.match(markup, /\(no output\)/u);
   });
+  it("shows explicit and inferred agent completion", () => {
+    for (const completion of ["explicit_finish", "inferred_from_turn_end"]) {
+      const markup = render({
+        ...detail,
+        steps: [
+          { ...step, agentExecutionId: "execution-1", output: { completion, output: "finished" } },
+        ],
+      });
+      assert.match(markup, new RegExp(completion, "u"));
+      assert.match(markup, /finished/u);
+    }
+  });
+
+  it("shows a timed out script result", () => {
+    const markup = render({
+      ...detail,
+      steps: [
+        {
+          ...step,
+          status: "timed_out",
+          failureReason: "script timed out",
+          output: { exit_code: null, output_tail: "partial", truncated: true },
+        },
+      ],
+    });
+    assert.match(markup, /script timed out/u);
+    assert.match(markup, /No exit code/u);
+    assert.match(markup, /partial/u);
+  });
 });

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { CodeBlock } from "../components/app/copy-field.js";
 import { DataCell, DataRow, DataTable } from "../components/app/data-table.js";
@@ -131,11 +131,24 @@ function StepOutput({ step }: { step: RunDetail["steps"][number] }) {
   if (step.agentExecutionId === null && isScriptStepOutput(step.output)) {
     return <ScriptStepOutput stepId={step.id} status={step.status} output={step.output} />;
   }
+  if (step.output !== null && typeof step.output === "object" && !Array.isArray(step.output)) {
+    const output = step.output;
+    if ("completion" in output && typeof output["completion"] === "string") {
+      return (
+        <>
+          <span>Completion: {output["completion"]}</span>
+          <PlainOutput id={step.id} value={"output" in output ? output["output"] : output} />
+        </>
+      );
+    }
+  }
   return <PlainOutput id={step.id} value={step.output} />;
 }
 
 function PlainOutput({ id, value }: { id: string; value: unknown }) {
   const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const showMore = useCallback(() => setExpanded(true), []);
   const text = typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? "");
   const truncated = text.length > OUTPUT_LIMIT;
   return (
@@ -147,8 +160,13 @@ function PlainOutput({ id, value }: { id: string; value: unknown }) {
       {...(truncated ? { description: "Output limited to 65,536 characters." } : {})}
     >
       <CodeBlock label="Step output">
-        {text === "" ? "(no output)" : text.slice(0, OUTPUT_LIMIT)}
+        {text === "" ? "(no output)" : text.slice(0, expanded ? OUTPUT_LIMIT : 4096)}
       </CodeBlock>
+      {!expanded && text.length > 4096 ? (
+        <button type="button" onClick={showMore}>
+          Show more
+        </button>
+      ) : null}
     </Disclosure>
   );
 }

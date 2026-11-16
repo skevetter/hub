@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 
 import { CodeBlock } from "../components/app/copy-field.js";
 import { Disclosure } from "../components/app/disclosure.js";
@@ -19,6 +19,8 @@ export function ScriptStepOutput({
 }) {
   const result = readScriptStepResult(output);
   const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  const showMore = useCallback(() => setExpanded(true), []);
   if (result === undefined) {
     if (readScriptStepHandle(output) === undefined) return null;
     // Only a running step is still running. One the deadline ended has no result to show.
@@ -43,8 +45,13 @@ export function ScriptStepOutput({
         description={truncated ? "The last 64 KB of the output." : "Everything the script printed."}
       >
         <CodeBlock label="Script output">
-          {outputTail === "" ? "(no output)" : outputTail}
+          {outputTail === "" ? "(no output)" : outputTail.slice(0, expanded ? undefined : 4096)}
         </CodeBlock>
+        {!expanded && outputTail.length > 4096 ? (
+          <button type="button" onClick={showMore}>
+            Show more
+          </button>
+        ) : null}
       </Disclosure>
     </div>
   );
