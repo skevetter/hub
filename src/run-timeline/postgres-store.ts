@@ -245,14 +245,26 @@ export class RunTimelineRepository {
   async insertRunProgressMessageIfAbsent(
     input: InsertRunProgressMessageInput,
   ): Promise<RunProgressMessage | undefined> {
-    await this.runtime.query(
-      `insert into run_progress_messages (trigger_run_id,organization_id,provider,created_at,updated_at)
-      select id, organization_id, $3, $4, $4 from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted'
-      and not exists(select 1 from run_timeline_state where trigger_run_id = $1 and expired_at is not null)
-      on conflict do nothing`,
-      [input.triggerRunId, input.organizationId, input.provider, input.now],
-    );
-    return this.findRunProgressMessage(input.organizationId, input.triggerRunId);
+    return this.runtime.transaction(async (transaction) => {
+      const run = await transaction.query(
+        `select id from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' for key share`,
+        [input.triggerRunId, input.organizationId],
+      );
+      if (run.rowCount === 0) return undefined;
+      await transaction.query(
+        `insert into run_progress_messages (trigger_run_id,organization_id,provider,created_at,updated_at)
+        select id, organization_id, $3, $4, $4 from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted'
+        and not exists(select 1 from run_timeline_state where trigger_run_id = $1 and expired_at is not null)
+        on conflict do nothing`,
+        [input.triggerRunId, input.organizationId, input.provider, input.now],
+      );
+      return (
+        await transaction.query<Row<RunProgressMessage>>(
+          `select ${MESSAGE} from run_progress_messages where organization_id = $1 and trigger_run_id = $2`,
+          [input.organizationId, input.triggerRunId],
+        )
+      ).rows[0];
+    });
   }
 
   async findRunProgressMessage(
