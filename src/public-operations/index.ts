@@ -388,10 +388,7 @@ async function dispatchManualRun(
 }
 
 function validateManualInput(input: unknown) {
-  const storable =
-    typeof input === "string"
-      ? hasPostgresText(input)
-      : isPostgresJson(input, { maxDepth: 20, maxKeysPerObject: 1000 });
+  const storable = typeof input === "string" ? hasPostgresText(input) : isPostgresJson(input);
   if (!storable) {
     return { path: ["input"], message: "Input contains unsupported JSON or Unicode text." };
   }
