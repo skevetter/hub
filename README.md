@@ -118,6 +118,8 @@ On SIGTERM or SIGINT, Hub stops accepting connections and new upgrades. Requests
 on existing connections receive HTTP 503 with `Retry-After: 1`. Hub closes daemon sockets
 and drains admitted HTTP requests before stopping trigger sources, runtime resources, and
 the database. Repeated signals are ignored. Structured logs show each stage and its elapsed time.
+Disconnected response streams leave the request drain even while backpressured or while
+their body cancellation is still pending.
 
 `PASEO_HUB_SHUTDOWN_GRACE_MS` defaults to 10000 milliseconds and accepts whole numbers from
 1000 to 40000. At that deadline, unfinished handlers receive HTTP 503 where headers have not

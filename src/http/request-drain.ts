@@ -6,6 +6,10 @@ export class HttpRequestDrain {
   private readonly active = new Set<ServerResponse>();
   private readonly completion = Promise.withResolvers<void>();
 
+  get activeRequests(): number {
+    return this.active.size;
+  }
+
   admit(response: ServerResponse): boolean {
     if (this.stopping) {
       this.unavailable(response);

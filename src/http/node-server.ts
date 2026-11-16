@@ -1,6 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { once } from "node:events";
 import { isIP } from "node:net";
 import type { Socket } from "node:net";
 import type { Duplex } from "node:stream";
@@ -75,9 +74,16 @@ export function createFetchServer(
 export function beginHttpShutdown(server: Server): {
   drained: Promise<void>;
   expire: () => ReadonlySet<Socket>;
+  readonly activeRequests: number;
 } {
   const drain = requestDrains.get(server) ?? new HttpRequestDrain();
-  return { drained: drain.begin(), expire: () => drain.expire() };
+  return {
+    drained: drain.begin(),
+    expire: () => drain.expire(),
+    get activeRequests() {
+      return drain.activeRequests;
+    },
+  };
 }
 
 async function forwardRequest(
@@ -95,7 +101,13 @@ async function forwardRequest(
     }, options.logger);
     const { response } = tracked;
     if (outgoing.writableEnded || outgoing.destroyed) {
-      await response.body?.cancel();
+      void response.body?.cancel().catch((error: unknown) => {
+        reportFailure(
+          error,
+          { operation: "http.response.cancel", component: "http", method: request.method },
+          { logger: options.logger ?? defaultLogger },
+        );
+      });
       return;
     }
     let responseRequestId: string | undefined;
@@ -160,36 +172,90 @@ async function forwardRequest(
       outgoing.end();
       return;
     }
-    const reader = response.body.getReader();
-    const cancelReader = () => {
-      void reader.cancel().catch((error: unknown) => {
-        reportFailure(
-          error,
-          { operation: "http.response.cancel", component: "http", method: request.method },
-          { logger: options.logger ?? defaultLogger },
-        );
-      });
-    };
-    outgoing.once("close", cancelReader);
-    try {
-      if (outgoing.destroyed) {
-        await reader.cancel();
-        return;
-      }
-      for (;;) {
-        const chunk = await reader.read();
-        if (chunk.done || outgoing.destroyed) break;
-        if (!outgoing.write(chunk.value)) await once(outgoing, "drain");
-      }
-      responseForwarded = !outgoing.destroyed;
-      outgoing.end();
-    } finally {
-      outgoing.off("close", cancelReader);
-      reader.releaseLock();
-    }
+    responseForwarded = await forwardResponseBody(
+      response.body,
+      outgoing,
+      request.method,
+      options.logger ?? defaultLogger,
+    );
+    if (responseForwarded) outgoing.end();
   } catch (error) {
     respondToRequestFailure(error, incoming, outgoing, options.logger ?? defaultLogger);
   }
+}
+
+async function forwardResponseBody(
+  body: ReadableStream<Uint8Array>,
+  outgoing: ServerResponse,
+  method: string,
+  logger: Pick<Logger, "warn" | "error">,
+): Promise<boolean> {
+  const reader = body.getReader();
+  let canceled = false;
+  const cancelReader = () => {
+    if (canceled) return;
+    canceled = true;
+    void reader.cancel().catch((error: unknown) => {
+      reportFailure(
+        error,
+        { operation: "http.response.cancel", component: "http", method },
+        { logger },
+      );
+    });
+  };
+  const onError = (error: Error) => {
+    reportFailure(
+      error,
+      { operation: "http.response.stream", component: "http", method },
+      { logger },
+    );
+    cancelReader();
+    outgoing.destroy();
+  };
+  outgoing.once("close", cancelReader);
+  outgoing.once("error", onError);
+  try {
+    if (outgoing.destroyed || outgoing.writableEnded) {
+      cancelReader();
+      return false;
+    }
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done || canceled || outgoing.destroyed) break;
+      if (!outgoing.write(chunk.value) && !canceled) {
+        if (!(await waitForResponseDrain(outgoing))) {
+          cancelReader();
+          break;
+        }
+      }
+    }
+    return !canceled && !outgoing.destroyed;
+  } catch (error) {
+    cancelReader();
+    outgoing.destroy();
+    throw error;
+  } finally {
+    outgoing.off("close", cancelReader);
+    outgoing.off("error", onError);
+    reader.releaseLock();
+  }
+}
+
+function waitForResponseDrain(outgoing: ServerResponse): Promise<boolean> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  const finish = (drained: boolean) => {
+    outgoing.off("drain", onDrain);
+    outgoing.off("close", onClose);
+    outgoing.off("error", onClose);
+    resolve(drained);
+  };
+  const onDrain = () => finish(true);
+  const onClose = () => finish(false);
+  outgoing.once("drain", onDrain);
+  outgoing.once("close", onClose);
+  outgoing.once("error", onClose);
+  if (outgoing.destroyed || outgoing.writableEnded) finish(false);
+  return promise;
 }
 
 function respondToRequestFailure(
