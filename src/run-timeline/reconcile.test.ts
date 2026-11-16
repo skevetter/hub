@@ -17,6 +17,7 @@ import { retentionCutoff } from "./retention.js";
 import { createTimelineScrubber } from "./scrub.js";
 import type { RunTimelineEvent } from "./store.js";
 import type { TimelineRunScope } from "./capture-types.js";
+import { assertBackgroundSweepExits } from "./test-utils/background-exit.js";
 
 const ORGANIZATION = "reconciliation-organization";
 const PAGE = { afterSeq: 0, limit: 5110 };
@@ -677,7 +678,11 @@ describe("timeline reconciler lifecycle", () => {
     vi.useRealTimers();
   });
 
-  it("schedules one unref timer every 60 seconds and stop waits for active work", async () => {
+  it("lets the native process exit without waiting for its reconciliation timer", async () => {
+    await assertBackgroundSweepExits("reconciliation");
+  });
+
+  it("schedules one timer every 60 seconds and stop waits for active work", async () => {
     const harness = await memoryHarness();
     const { database } = harness;
     const reached = Promise.withResolvers<void>();
@@ -691,21 +696,11 @@ describe("timeline reconciler lifecycle", () => {
         return list(...args);
       });
     vi.useFakeTimers();
-    const timers: NodeJS.Timeout[] = [];
-    const schedule = globalThis.setTimeout;
-    vi.spyOn(globalThis, "setTimeout").mockImplementation(
-      (handler, milliseconds, ...arguments_) => {
-        const timer = schedule(handler, milliseconds, ...arguments_);
-        timers.push(timer);
-        return timer;
-      },
-    );
     const { reconciler } = components(database);
     try {
       reconciler.start();
       reconciler.start();
       assert.equal(vi.getTimerCount(), 1);
-      assert.equal(timers[0]!.hasRef(), false);
       await vi.advanceTimersByTimeAsync(60_000);
       await reached.promise;
       await vi.advanceTimersByTimeAsync(120_000);

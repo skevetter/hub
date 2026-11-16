@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it, vi } from "vitest";
 import { isRunTimelineExpired, retentionCutoff, TimelineRetention } from "./retention.js";
+import { assertBackgroundSweepExits } from "./test-utils/background-exit.js";
 
 const NOW = new Date("2026-11-16T12:00:00.000Z");
 const HOUR_MS = 60 * 60_000;
@@ -229,23 +230,13 @@ describe("TimelineRetention", () => {
     await retention.stop();
     assert.equal(vi.getTimerCount(), 0);
   });
+});
 
-  it("unrefs both the schedule and inter-batch pause timers", async () => {
-    const timers: NodeJS.Timeout[] = [];
-    const schedule = globalThis.setTimeout;
-    vi.spyOn(globalThis, "setTimeout").mockImplementation(
-      (handler, milliseconds, ...arguments_) => {
-        const timer = schedule(handler, milliseconds, ...arguments_);
-        timers.push(timer);
-        return timer;
-      },
-    );
-    const expireRunTimelines = vi.fn(async () => 500);
-    const retention = new TimelineRetention({ expireRunTimelines }, { retentionDays: 30 });
-    retention.start();
-    assert.equal(timers[0]!.hasRef(), false);
-    await vi.advanceTimersByTimeAsync(0);
-    assert.equal(timers[1]!.hasRef(), false);
-    await retention.stop();
-  });
+describe("native retention timer liveness", () => {
+  it.each(["retention", "retention_pause"] as const)(
+    "lets the native process exit without waiting for %s timers",
+    async (mode) => {
+      await assertBackgroundSweepExits(mode);
+    },
+  );
 });
