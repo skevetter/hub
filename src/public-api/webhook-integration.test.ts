@@ -312,7 +312,7 @@ describe("embedded authenticated webhook intake", () => {
     }
   }, 120_000);
 
-  it("returns original ids on duplicates, separates triggers, dedupes concurrent calls and keeps invalid keys free", async () => {
+  it("returns original ids on duplicates, separates triggers and keeps invalid keys free", async () => {
     const hub = await webhookFixture();
     try {
       const trigger = await hub.save();
@@ -341,20 +341,6 @@ describe("embedded authenticated webhook intake", () => {
         dispatchedSchema.parse(await different.json()).triggerRunId,
         original.triggerRunId,
       );
-      const concurrentKey = randomUUID();
-      const pair = await Promise.all([
-        hub.send(trigger.name, {}, { deliveryKey: concurrentKey }),
-        hub.send(trigger.name, {}, { deliveryKey: concurrentKey }),
-      ]);
-      assert.ok(pair.some((response) => response.status === 202));
-      assert.ok(pair.every((response) => [200, 202, 409].includes(response.status)));
-      const final = await hub.send(trigger.name, {}, { deliveryKey: concurrentKey });
-      assert.equal(final.status, 200);
-      const result = dispatchedSchema.parse(await final.json());
-      const runs = await hub.database.findTriggerRunsByProviderEventReceiptId(
-        result.providerEventReceiptId,
-      );
-      assert.equal(runs.length, 1);
       const freshKey = randomUUID();
       const rejected = await hub.send(trigger.name, { count: "wrong" }, { deliveryKey: freshKey });
       await error(rejected, 422, "invalid_input");
@@ -365,6 +351,68 @@ describe("embedded authenticated webhook intake", () => {
       const noKeyB = dispatchedSchema.parse(await (await hub.send(trigger.name)).json());
       assert.notEqual(noKeyA.triggerRunId, noKeyB.triggerRunId);
     } finally {
+      await hub.close();
+    }
+  }, 120_000);
+
+  it("returns exactly one new delivery and one duplicate through a controlled persistence overlap", async () => {
+    const hub = await webhookFixture();
+    const persistedFirst = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    const persist = hub.database.persistManualEvent.bind(hub.database);
+    let first: Promise<Response> | undefined;
+    let replays = 0;
+    try {
+      const trigger = await hub.save();
+      const deliveryKey = randomUUID();
+      hub.database.persistManualEvent = async (input) => {
+        const result = await persist(input);
+        if (result.replayed === true) replays += 1;
+        else {
+          persistedFirst.resolve();
+          await releaseFirst.promise;
+        }
+        return result;
+      };
+      first = hub.send(trigger.name, { message: "original", count: 2 }, { deliveryKey });
+      await Promise.race([
+        persistedFirst.promise,
+        first.then(() => {
+          throw new Error("First request ended before its receipt was persisted");
+        }),
+      ]);
+      const second = await hub.send(
+        trigger.name,
+        { message: "replacement", count: 3 },
+        { deliveryKey },
+      );
+      assert.equal(second.status, 200);
+      const duplicate = dispatchedSchema.parse(await second.json());
+      assert.equal(duplicate.duplicate, true);
+      releaseFirst.resolve();
+      const originalResponse = await first;
+      assert.equal(originalResponse.status, 202);
+      const original = dispatchedSchema.parse(await originalResponse.json());
+      assert.equal(original.duplicate, false);
+      assert.equal(
+        [originalResponse, second].filter((response) => response.status === 202).length,
+        1,
+      );
+      assert.equal(duplicate.deliveryKey, original.deliveryKey);
+      assert.equal(duplicate.providerEventReceiptId, original.providerEventReceiptId);
+      assert.equal(duplicate.triggerRunId, original.triggerRunId);
+      assert.equal(duplicate.configuredTriggerName, original.configuredTriggerName);
+      assert.equal(replays, 1);
+      const runs = await hub.database.findTriggerRunsByProviderEventReceiptId(
+        original.providerEventReceiptId,
+      );
+      assert.equal(runs.length, 1);
+      assert.equal(runs[0]?.prompt, "original");
+      assert.deepEqual(runs[0]?.inputs, { status: "failed", count: 2 });
+    } finally {
+      releaseFirst.resolve();
+      if (first !== undefined) await Promise.allSettled([first]);
+      hub.database.persistManualEvent = persist;
       await hub.close();
     }
   }, 120_000);
