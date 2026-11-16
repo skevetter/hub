@@ -164,6 +164,191 @@ describe("bounded per-run timeline queue", () => {
     }
   });
 
+  it("retains all 51 overflow drops after a failed accounting write and retries before sealing", async () => {
+    const { database, scope, bus, append } = await fixture();
+    const failure = new Error("Drop accounting unavailable");
+    const dropWrite = vi.spyOn(database, "recordRunTimelineDrops").mockRejectedValueOnce(failure);
+    const reportFailure = vi.fn();
+    const queue = new RunTimelineQueue(database, { bus, reportFailure });
+    const release = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    queue.enqueue(scope, async () => {
+      entered.resolve();
+      await release.promise;
+      await append(0);
+    });
+    try {
+      await entered.promise;
+      let refused = 0;
+      for (let value = 1; value < 251; value++) {
+        const accepted = queue.enqueue(scope, () => append(value));
+        assert.equal(accepted, value < 200);
+        if (!accepted) refused += 1;
+      }
+      assert.equal(refused, 51);
+      assert.equal(queue.depth(), 200);
+      release.resolve();
+      assert.equal(await queue.flush(), true);
+      assert.equal(queue.depth(), 0);
+      assert.equal(dropWrite.mock.calls.length, 1);
+      assert.equal(dropWrite.mock.calls[0]?.[2], 51);
+      assert.equal(
+        (await database.readRunTimelineState(ORGANIZATION, scope.triggerRunId))?.droppedCount,
+        0,
+      );
+      assert.deepEqual(reportFailure.mock.calls, [[failure, "run.timeline.write", scope]]);
+
+      await queue.run(scope, async () => {
+        assert.equal(
+          (await database.readRunTimelineState(ORGANIZATION, scope.triggerRunId))?.droppedCount,
+          51,
+        );
+        await database.appendRunTimelineEvent({
+          ...scope,
+          kind: "run_finished",
+          at: new Date(),
+          data: { status: "succeeded" },
+          origin: "captured",
+        });
+      });
+      assert.equal(await queue.flush(), true);
+      assert.deepEqual(
+        dropWrite.mock.calls.map((call) => call[2]),
+        [51, 51],
+      );
+      const rows = await database.listRunTimelineEvents(ORGANIZATION, scope.triggerRunId, PAGE);
+      assert.deepEqual(
+        rows.slice(-2).map((row) => row.kind),
+        ["truncated", "run_finished"],
+      );
+      assert.deepEqual(rows.at(-2)?.data, { dropped: 51 });
+      const state = await database.readRunTimelineState(ORGANIZATION, scope.triggerRunId);
+      assert.equal(state?.droppedCount, 51);
+      assert.equal(state?.sealedSeq, rows.at(-1)?.seq);
+      assert.equal(queue.depth(), 0);
+    } finally {
+      release.resolve();
+      await queue.flush();
+    }
+  });
+
+  it("bounds persistent drop-accounting failures to later wakes without blocking seal or drain", async () => {
+    const { database, scope, bus } = await fixture();
+    const record = database.recordRunTimelineDrops.bind(database);
+    const failure = new Error("Drop accounting unavailable");
+    const dropWrite = vi.spyOn(database, "recordRunTimelineDrops").mockRejectedValue(failure);
+    const reportFailure = vi.fn();
+    let now = 0;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    const queue = new RunTimelineQueue(database, {
+      bus,
+      now: () => new Date(now),
+      reportFailure,
+    });
+    const notifications = vi.fn();
+    const unsubscribe = bus.subscribe(scope.triggerRunId, notifications);
+    try {
+      queue.recordDrops(scope, 51);
+      assert.equal(await queue.flush(), true);
+      assert.equal(dropWrite.mock.calls.length, 1);
+      assert.equal(queue.depth(), 0);
+      assert.equal(reportFailure.mock.calls.length, 1);
+      assert.equal(vi.getTimerCount(), 0);
+
+      await queue.run(scope, async () => {
+        await database.appendRunTimelineEvent({
+          ...scope,
+          kind: "run_finished",
+          at: new Date(),
+          data: { status: "succeeded" },
+          origin: "captured",
+        });
+      });
+      assert.equal(await queue.flush(), true);
+      assert.equal(dropWrite.mock.calls.length, 2);
+      assert.equal(reportFailure.mock.calls.length, 1);
+      const sealed = await database.readRunTimelineState(ORGANIZATION, scope.triggerRunId);
+      assert.equal(sealed?.droppedCount, 0);
+      assert.equal(sealed?.sealedSeq, 1);
+      assert.equal(queue.depth(), 0);
+      await vi.advanceTimersByTimeAsync(60_000);
+      assert.equal(dropWrite.mock.calls.length, 2);
+      assert.equal(vi.getTimerCount(), 0);
+
+      now = 30_000;
+      const control = vi.fn(async () => undefined);
+      await queue.run(scope, control);
+      assert.equal(await queue.flush(), true);
+      assert.equal(control.mock.calls.length, 1);
+      assert.equal(dropWrite.mock.calls.length, 3);
+      assert.equal(reportFailure.mock.calls.length, 2);
+      dropWrite.mockImplementation(record);
+      await queue.run(scope, control);
+      assert.equal(await queue.flush(), true);
+      assert.equal(control.mock.calls.length, 2);
+      assert.deepEqual(
+        dropWrite.mock.calls.map((call) => call[2]),
+        [51, 51, 51, 51],
+      );
+      const recovered = await database.readRunTimelineState(ORGANIZATION, scope.triggerRunId);
+      assert.equal(recovered?.droppedCount, 51);
+      assert.equal(recovered?.sealedSeq, sealed?.sealedSeq);
+      const rows = await database.listRunTimelineEvents(ORGANIZATION, scope.triggerRunId, PAGE);
+      assert.deepEqual(
+        rows.map((row) => row.kind),
+        ["run_finished"],
+      );
+      assert.equal(notifications.mock.calls.length, 0);
+      assert.equal(queue.depth(), 0);
+      assert.equal(vi.getTimerCount(), 0);
+    } finally {
+      unsubscribe();
+      await queue.flush();
+    }
+  });
+
+  it("coalesces restored drops with a later wake arriving during the failed write", async () => {
+    const { database, scope, bus } = await fixture();
+    const release = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const dropWrite = vi
+      .spyOn(database, "recordRunTimelineDrops")
+      .mockImplementationOnce(async () => {
+        entered.resolve();
+        await release.promise;
+        throw new Error("Drop accounting unavailable");
+      });
+    const queue = new RunTimelineQueue(database, { bus });
+    let control: Promise<void> | undefined;
+    try {
+      queue.recordDrops(scope, 3);
+      await entered.promise;
+      queue.recordDrops(scope, 4);
+      control = queue.run(scope, async () => {
+        assert.equal(
+          (await database.readRunTimelineState(ORGANIZATION, scope.triggerRunId))?.droppedCount,
+          7,
+        );
+      });
+      release.resolve();
+      await control;
+      assert.equal(await queue.flush(), true);
+      assert.deepEqual(
+        dropWrite.mock.calls.map((call) => call[2]),
+        [3, 7],
+      );
+      assert.equal(
+        (await database.readRunTimelineState(ORGANIZATION, scope.triggerRunId))?.droppedCount,
+        7,
+      );
+      assert.equal(queue.depth(), 0);
+    } finally {
+      release.resolve();
+      await control?.catch(() => undefined);
+      await queue.flush();
+    }
+  });
+
   it("propagates a rejected control without poisoning subsequent ordinary or control work", async () => {
     const { database, scope, bus, append } = await fixture();
     const queue = new RunTimelineQueue(database, { bus });

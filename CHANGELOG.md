@@ -22,6 +22,7 @@
 - Timeline drain and terminal reconciliation waits are bounded during shutdown.
 - Terminal reconciliation errors use startup credential protection when reporting failures.
 - Excess terminal steps refresh live omission counts and create one truncation notice.
+- Failed drop-accounting batches retry on later queue wakes without blocking completion.
 - Background sweep tests restore real worker timers and fail fast if a fake timer leaks into another file.
 - Progress message admission waits for concurrent retention before checking timeline expiry, so a tombstoned run cannot regain a progress row.
 - Timeline notifications coalesce stalled asynchronous subscribers into one pending wake and discard it on unsubscribe.

@@ -19,6 +19,7 @@ interface PendingRun {
   ordinaryCount: number;
   controlCount: number;
   dropped: number;
+  dropsReady: boolean;
 }
 
 export interface RunTimelineQueueOptions {
@@ -43,6 +44,7 @@ export class RunTimelineQueue implements TimelineQueue {
     const queue = this.pending(scope);
     if (queue.ordinaryCount >= 200) {
       queue.dropped += 1;
+      queue.dropsReady = true;
       return false;
     }
     queue.ordinaryCount += 1;
@@ -54,6 +56,7 @@ export class RunTimelineQueue implements TimelineQueue {
     if (this.closed || count === 0) return;
     const queue = this.pending(scope);
     queue.dropped += count;
+    queue.dropsReady = true;
     this.start(queue);
   }
 
@@ -92,7 +95,14 @@ export class RunTimelineQueue implements TimelineQueue {
   private pending(scope: TimelineRunScope): PendingRun {
     let queue = this.queues.get(scope.triggerRunId);
     if (queue === undefined) {
-      queue = { scope, running: false, ordinaryCount: 0, controlCount: 0, dropped: 0 };
+      queue = {
+        scope,
+        running: false,
+        ordinaryCount: 0,
+        controlCount: 0,
+        dropped: 0,
+        dropsReady: false,
+      };
       this.queues.set(scope.triggerRunId, queue);
     } else if (queue.scope.organizationId !== scope.organizationId) {
       throw new Error("Timeline queue organization mismatch");
@@ -104,6 +114,7 @@ export class RunTimelineQueue implements TimelineQueue {
     if (queue.tail === undefined) queue.head = work;
     else queue.tail.next = work;
     queue.tail = work;
+    queue.dropsReady = true;
     this.start(queue);
   }
 
@@ -116,8 +127,12 @@ export class RunTimelineQueue implements TimelineQueue {
       .finally(() => {
         this.active.delete(operation);
         queue.running = false;
-        if (!this.closed && (queue.head !== undefined || queue.dropped !== 0)) this.start(queue);
-        else if (this.queues.get(queue.scope.triggerRunId) === queue)
+        if (!this.closed && (queue.head !== undefined || (queue.dropped !== 0 && queue.dropsReady)))
+          this.start(queue);
+        else if (
+          (this.closed || queue.dropped === 0) &&
+          this.queues.get(queue.scope.triggerRunId) === queue
+        )
           this.queues.delete(queue.scope.triggerRunId);
       })
       .catch((error: unknown) => this.report(error, queue.scope));
@@ -151,20 +166,24 @@ export class RunTimelineQueue implements TimelineQueue {
   }
 
   private async flushDrops(queue: PendingRun): Promise<void> {
-    if (queue.dropped === 0 || this.closed) return;
+    if (queue.dropped === 0 || !queue.dropsReady || this.closed) return;
     const count = queue.dropped;
     queue.dropped = 0;
+    queue.dropsReady = false;
+    let result: { seq: number; inserted: boolean } | undefined;
     try {
-      const result = await this.database.recordRunTimelineDrops(
+      result = await this.database.recordRunTimelineDrops(
         queue.scope.organizationId,
         queue.scope.triggerRunId,
         count,
         this.options.now?.() ?? new Date(),
       );
-      if (result?.inserted) this.options.bus.publish(queue.scope.triggerRunId, result.seq);
     } catch (error) {
+      if (!this.closed) queue.dropped += count;
       this.report(error, queue.scope);
+      return;
     }
+    if (result?.inserted) this.options.bus.publish(queue.scope.triggerRunId, result.seq);
   }
 
   private closePending(): void {
