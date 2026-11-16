@@ -13,6 +13,9 @@ export interface RunTimelineBusOptions {
 interface RunTimelineSubscription {
   readonly listener: RunTimelineListener;
   readonly generation: number;
+  active: boolean;
+  running: boolean;
+  pendingSeq: number | undefined;
 }
 
 export class RunTimelineBus {
@@ -35,6 +38,9 @@ export class RunTimelineBus {
     const subscription: RunTimelineSubscription = {
       listener,
       generation: this.nextGeneration++,
+      active: true,
+      running: false,
+      pendingSeq: undefined,
     };
     let listeners = this.listeners.get(runId);
     if (!listeners) {
@@ -45,6 +51,8 @@ export class RunTimelineBus {
     this.subscriptionCount += 1;
     return () => {
       if (!listeners.delete(subscription)) return;
+      subscription.active = false;
+      subscription.pendingSeq = undefined;
       this.subscriptionCount -= 1;
       if (listeners.size === 0) this.listeners.delete(runId);
     };
@@ -57,12 +65,48 @@ export class RunTimelineBus {
     const generation = this.nextGeneration;
     for (const subscription of listeners) {
       if (subscription.generation >= generation) break;
-      try {
-        const pending = subscription.listener(notification);
-        if (pending) void pending.catch((error: unknown) => this.report(error));
-      } catch (error) {
-        this.report(error);
+      this.deliver(runId, subscription, notification);
+    }
+  }
+
+  private deliver(
+    runId: string,
+    subscription: RunTimelineSubscription,
+    notification: RunTimelineNotification,
+  ): void {
+    if (subscription.running) {
+      subscription.pendingSeq = notification.seq;
+      return;
+    }
+    subscription.running = true;
+    try {
+      const pending = subscription.listener(notification);
+      if (pending) {
+        void pending.then(
+          () => this.settle(runId, subscription),
+          (error: unknown) => {
+            this.report(error);
+            this.settle(runId, subscription);
+          },
+        );
+        return;
       }
+    } catch (error) {
+      this.report(error);
+    }
+    if (subscription.active && subscription.pendingSeq !== undefined) {
+      queueMicrotask(() => this.settle(runId, subscription));
+    } else {
+      subscription.running = false;
+    }
+  }
+
+  private settle(runId: string, subscription: RunTimelineSubscription): void {
+    subscription.running = false;
+    const seq = subscription.pendingSeq;
+    subscription.pendingSeq = undefined;
+    if (subscription.active && seq !== undefined) {
+      this.deliver(runId, subscription, Object.freeze({ runId, seq }));
     }
   }
 

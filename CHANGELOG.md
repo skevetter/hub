@@ -18,6 +18,7 @@
 ### Fixed
 
 - Progress message admission waits for concurrent retention before checking timeline expiry, so a tombstoned run cannot regain a progress row.
+- Timeline notifications coalesce stalled asynchronous subscribers into one pending wake and discard it on unsubscribe.
 
 ## 0.11.0 - 2026-10-25
 
