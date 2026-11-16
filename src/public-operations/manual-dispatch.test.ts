@@ -231,4 +231,26 @@ describe("manual dispatch validation", () => {
       await hub.stop();
     }
   });
+
+  it("rejects unsupported text and JSON strings before reserving a manual delivery key", async () => {
+    const hub = await harness();
+    try {
+      const inputs = [
+        "status=failed hello\u0000",
+        { status: "failed", message: "hello", extra: "\u0000" },
+        { status: "failed", message: "hello", ["bad\u0000key"]: "value" },
+        { status: "failed", message: "\ud800" },
+        { status: "failed", message: "hello", nested: ["\udc00"] },
+      ];
+      for (const input of inputs) {
+        const response = await hub.send({ input });
+        assert.equal(response.status, 400);
+        assert.equal(ProblemSchema.parse(await response.json()).code, "invalid_input");
+        assert.equal(await hub.receipt(), undefined);
+      }
+      assert.equal((await hub.send()).status, 200);
+    } finally {
+      await hub.stop();
+    }
+  });
 });

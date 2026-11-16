@@ -6,6 +6,7 @@ import type { DaemonClock } from "../daemons/index.js";
 import { DaemonDispatchFailure } from "../daemons/index.js";
 import { ENROLLMENT_LIFETIME_MS } from "../daemons/registration.js";
 import { isDatabaseUnavailableError } from "../db/errors.js";
+import { hasPostgresText, isPostgresJson } from "../http/json-storage.js";
 import { formatInvocationRejection } from "../triggers/invocation.js";
 import {
   ManualRunRejected,
@@ -321,7 +322,7 @@ async function prepareManualRun(
     input: input.input,
     publicDeliveryKey: input.deliveryKey,
   };
-  const inputIssue = validateManualMessage(input.input);
+  const inputIssue = validateManualInput(input.input);
   if (inputIssue !== undefined) return { status: "invalid_input", issues: [inputIssue] };
   const invocation = parseManualInvocation(payload, trigger.inputs);
   if (invocation.status === "rejected") {
@@ -386,7 +387,14 @@ async function dispatchManualRun(
   };
 }
 
-function validateManualMessage(input: unknown) {
+function validateManualInput(input: unknown) {
+  const storable =
+    typeof input === "string"
+      ? hasPostgresText(input)
+      : isPostgresJson(input, { maxDepth: 20, maxKeysPerObject: 1000 });
+  if (!storable) {
+    return { path: ["input"], message: "Input contains unsupported JSON or Unicode text." };
+  }
   let message: unknown;
   if (typeof input === "string") message = input;
   else if (typeof input === "object" && input !== null && !Array.isArray(input)) {

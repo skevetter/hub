@@ -7,6 +7,7 @@ import type { OperationAuthenticator } from "../auth/operation-auth.js";
 import { isDatabaseUnavailableError } from "../db/errors.js";
 import { reportFailure } from "../failures/index.js";
 import { readBoundedRequestBody } from "../http/request-body.js";
+import { hasPostgresText, isPostgresJson } from "../http/json-storage.js";
 import type {
   DispatchManualRunResult,
   ReceiveWebhookInput,
@@ -705,7 +706,7 @@ function parseWebhookPayload(
         422,
         "invalid_body",
         "Invalid body",
-        "Send a JSON object with finite numbers, maximum depth 20, and at most 1000 keys per object.",
+        "Send a JSON object with Unicode scalar strings and keys without NUL, finite numbers, maximum depth 20, and at most 1000 keys per object.",
       );
     }
     data = value;
@@ -721,13 +722,13 @@ function parseWebhookPayload(
       );
     }
     input = message ?? "";
-  } else if (text.length === 0) {
+  } else if (text.length === 0 || !hasPostgresText(text)) {
     return problem(
       requestId,
       400,
       "invalid_request",
       "Invalid request",
-      "Send a nonempty text body.",
+      "Send a nonempty text body with Unicode scalar text without NUL.",
     );
   }
   if (Buffer.byteLength(input, "utf8") > 65_536) {
@@ -765,17 +766,8 @@ function isWebhookObject(value: unknown): value is Record<string, unknown> {
     value !== null &&
     typeof value === "object" &&
     !Array.isArray(value) &&
-    validWebhookValue(value, 1)
+    isPostgresJson(value, { maxDepth: 20, maxKeysPerObject: 1000 })
   );
-}
-
-function validWebhookValue(value: unknown, depth: number): boolean {
-  if (typeof value === "number") return Number.isFinite(value);
-  if (value === null || typeof value !== "object") return true;
-  if (depth > 20) return false;
-  if (Array.isArray(value)) return value.every((item) => validWebhookValue(item, depth + 1));
-  const entries = Object.values(value);
-  return entries.length <= 1000 && entries.every((item) => validWebhookValue(item, depth + 1));
 }
 
 function webhookResponse(requestId: string, result: ReceiveWebhookResult): Response {

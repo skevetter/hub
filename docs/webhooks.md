@@ -156,6 +156,12 @@ Empty text is invalid. JSON arrays and scalar values are invalid bodies. Empty o
 is invalid JSON. A UTF-8 byte order mark is stripped; invalid UTF-8 is refused. Duplicate JSON
 object keys use the last value.
 
+JSON string values and object keys must contain Unicode scalar values without U+0000. Escaped
+NUL or an unpaired UTF-16 surrogate anywhere in JSON, including `message`, returns `422 invalid_body`.
+A text body containing U+0000, or any body containing invalid UTF-8, including UTF-8 encodings of
+surrogate code points, returns `400 invalid_request`. Valid surrogate pairs representing astral
+characters are accepted. These rejections store no receipt and do not reserve the `Idempotency-Key`.
+
 `${{ paseo.context }}` contains a `manual` object with `actor`, `input`, optional `data`, `trigger`,
 `delivery_id` and `source`. JSON `data` is the entire parsed object, including `message`. Context
 is opt in: include the expression only where the agent needs it.
