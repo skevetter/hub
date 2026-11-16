@@ -114,14 +114,17 @@ For Linear setup and workflows, see the public [Linear app](https://paseo.sh/doc
 
 ## Stop and restart
 
-On SIGTERM or SIGINT, Hub stops accepting HTTP connections and stops its runtime concurrently.
-Repeated signals are ignored. Structured shutdown logs show each stage and its elapsed time.
+On SIGTERM or SIGINT, Hub stops accepting connections and new upgrades. Requests arriving
+on existing connections receive HTTP 503 with `Retry-After: 1`. Hub closes daemon sockets
+and drains admitted HTTP requests before stopping trigger sources, runtime resources, and
+the database. Repeated signals are ignored. Structured logs show each stage and its elapsed time.
 
 `PASEO_HUB_SHUTDOWN_GRACE_MS` defaults to 10000 milliseconds and accepts whole numbers from
-1000 to 40000. At that deadline, Hub destroys remaining connections, including daemon
-websockets, in-flight HTTP requests, and running agent streams. Workflow state is durable
-and recovery resumes after restart. Interrupted work is not a guarantee of exactly-once
-external effects.
+1000 to 40000. At that deadline, unfinished handlers receive HTTP 503 where headers have not
+been sent, and remaining streams and sockets are cut. Late handler results cannot replace
+that retryable response. Runtime teardown proceeds after the drain completes or expires.
+Workflow state is durable and recovery resumes after restart. Interrupted work is not a
+guarantee of exactly-once external effects.
 
 `PASEO_HUB_SHUTDOWN_HARD_EXIT_MS` defaults to 15000 milliseconds and accepts whole numbers
 from 1001 to 44000. It must exceed the grace budget. Hub exits with code 0 when all shutdown

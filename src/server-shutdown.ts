@@ -1,8 +1,10 @@
-import type { Server } from "node:http";
+import type { IncomingMessage, Server } from "node:http";
 import type { Socket } from "node:net";
+import type { Duplex } from "node:stream";
 import type { Logger } from "pino";
 import { logger as defaultLogger } from "./logger.js";
 import { reportFailure } from "./failures/index.js";
+import { beginHttpShutdown } from "./http/node-server.js";
 
 export interface ShutdownBudgets {
   graceMs: number;
@@ -36,11 +38,17 @@ export function createServerShutdown(
 ): () => Promise<boolean> {
   const logger = options.logger ?? defaultLogger;
   const sockets = new Set<Socket>();
+  const upgrades = new Set<Duplex>();
+  const trackUpgrade = (_request: IncomingMessage, socket: Duplex) => {
+    upgrades.add(socket);
+    socket.once("close", () => upgrades.delete(socket));
+  };
   const trackSocket = (socket: Socket) => {
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
   };
   server.on("connection", trackSocket);
+  server.on("upgrade", trackUpgrade);
   let shutdown: Promise<boolean> | undefined;
   return () => {
     shutdown ??= stop();
@@ -50,11 +58,14 @@ export function createServerShutdown(
   async function stop(): Promise<boolean> {
     const started = performance.now();
     const pending = new Set<string>();
+    const requests = beginHttpShutdown(server);
     let expired = false;
     let hardExited = false;
-    const destroySockets = () => {
-      server.closeAllConnections();
-      for (const socket of sockets) socket.destroy();
+    const destroySockets = (flushing: ReadonlySet<Socket> = new Set()) => {
+      if (flushing.size === 0) server.closeAllConnections();
+      for (const socket of sockets) {
+        if (!flushing.has(socket)) socket.destroy();
+      }
     };
     const grace = setTimeout(() => {
       expired = true;
@@ -62,7 +73,7 @@ export function createServerShutdown(
         { pendingStages: [...pending], elapsedMs: performance.now() - started },
         "shutdown grace deadline reached; destroying remaining connections",
       );
-      destroySockets();
+      destroySockets(requests.expire());
     }, options.graceMs);
     const watchdog = setTimeout(() => {
       hardExited = true;
@@ -82,9 +93,14 @@ export function createServerShutdown(
           else resolve();
         });
         server.closeIdleConnections();
+        for (const socket of upgrades) socket.destroy();
         return promise;
       });
-      const runtimeStop = stage("runtime.stop", stopRuntime);
+      const runtimeStop = (async () => {
+        await stage("http.requests", () => requests.drained);
+        server.closeIdleConnections();
+        await stage("runtime.stop", stopRuntime);
+      })();
       const outcomes = await Promise.allSettled([httpClose, runtimeStop]);
       const clean = !expired && outcomes.every((outcome) => outcome.status === "fulfilled");
       if (!hardExited) options.exit(clean ? 0 : 1);
@@ -93,6 +109,7 @@ export function createServerShutdown(
       clearTimeout(grace);
       clearTimeout(watchdog);
       server.off("connection", trackSocket);
+      server.off("upgrade", trackUpgrade);
     }
 
     async function stage(name: string, action: () => Promise<void>): Promise<void> {

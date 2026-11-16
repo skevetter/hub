@@ -1,6 +1,6 @@
 import { agentStep } from "../config/compiler.js";
 import assert from "node:assert/strict";
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { createHmac, generateKeyPairSync, randomUUID } from "node:crypto";
 import { describe, it, vi } from "vitest";
 import {
   compileHubConfig,
@@ -37,8 +37,87 @@ import { notifyAgentExecutionCompleted } from "../triggers/lifecycle.js";
 import { runWithFailureTracking } from "../failures/index.js";
 import { createLogger } from "../logger.js";
 import { assertOneFailure, FailureLogStream } from "../test-utils/failure-logs.js";
+import { once } from "node:events";
+import { createWebhookSource } from "../triggers/github/webhook.js";
+import { createFetchServer } from "../http/node-server.js";
+import { createServerShutdown } from "../server-shutdown.js";
 
 describe("durable multi-step workflow engine", () => {
+  it("drains an admitted webhook into a durable workflow before runtime teardown", async () => {
+    const fixture = await workflowFixture();
+    const { handler, engine } = engineFor(fixture, []);
+    const accepting = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const secret = "shutdown-webhook-test";
+    const source = createWebhookSource(secret, {
+      accept: async () => {
+        accepting.resolve();
+        await release.promise;
+        return {
+          status: "accepted",
+          receiptId: fixture.providerEventReceiptId,
+          events: [fixture.trigger("the triggering body")],
+        };
+      },
+      applyLifecycle: async () => undefined,
+    });
+    await source.start(handler);
+    const server = createFetchServer((request) => source.handle(request));
+    let resourcesStopped = false;
+    const shutdown = createServerShutdown(
+      server,
+      async () => {
+        await source.stop();
+        await engine.stop();
+        resourcesStopped = true;
+      },
+      { graceMs: 1000, hardExitMs: 1500, exit: (code) => assert.equal(code, 0) },
+    );
+    const listening = once(server, "listening");
+    server.listen(0, "127.0.0.1");
+    await listening;
+    const address = server.address();
+    assert.ok(address !== null && typeof address !== "string");
+    const body = JSON.stringify({
+      action: "created",
+      installation: { id: 42 },
+      repository: { id: 9001, full_name: "acme/widgets" },
+    });
+    const response = fetch(`http://127.0.0.1:${address.port}/webhook`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-github-delivery": fixture.deliveryId,
+        "x-github-event": "issue_comment",
+        "x-hub-signature-256": "sha256=" + createHmac("sha256", secret).update(body).digest("hex"),
+      },
+      body,
+    });
+    await accepting.promise;
+    const stopped = shutdown();
+    try {
+      assert.equal(resourcesStopped, false);
+      release.resolve();
+      const result = await response;
+      assert.equal(result.status, 200);
+      await result.text();
+      assert.equal(await stopped, true);
+      const runs = await fixture.database.findTriggerRunsByProviderEventReceiptId(
+        fixture.providerEventReceiptId,
+      );
+      assert.equal(runs.length, 1);
+      assert.equal(runs[0]!.configuredTriggerName, "route-request");
+      assert.equal(runs[0]!.outcome, "accepted");
+      assert.equal(resourcesStopped, true);
+    } finally {
+      release.resolve();
+      await stopped;
+      server.closeAllConnections();
+      server.close();
+      await fixture.database.close();
+    }
+  });
+
   it.each(["github", "discord"] as const)(
     "materializes one reusable environment from each %s execution identity before persistence",
     async (providerName) => {

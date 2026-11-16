@@ -339,13 +339,13 @@ async function main(): Promise<void> {
       ? {}
       : { trustedClientIpHeader: config.trustedClientIpHeader }),
     ...(canonicalRequestOrigin === undefined ? {} : { canonicalRequestOrigin }),
-  });
-  server.on("upgrade", (request, socket, head) => {
-    void handleDaemonUpgradeRequest({
-      request,
-      socket,
-      handle: () => build.handleDaemonUpgrade(request, socket, head),
-    });
+    handleUpgrade: (request, socket, head) => {
+      void handleDaemonUpgradeRequest({
+        request,
+        socket,
+        handle: () => build.handleDaemonUpgrade(request, socket, head),
+      });
+    },
   });
   const appUrl =
     nonEmptyEnvironment(process.env["PASEO_HUB_APP_URL"]) ?? `http://localhost:${port}`;

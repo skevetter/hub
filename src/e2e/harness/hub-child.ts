@@ -272,9 +272,10 @@ async function main(): Promise<void> {
       await entitlements.close();
     },
   }));
-  const server = createFetchServer((request) => start.default.fetch(request));
-  server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
-    void hub?.handleUpgrade?.(request, socket, head);
+  const server = createFetchServer((request) => start.default.fetch(request), {
+    handleUpgrade: (request: IncomingMessage, socket: Duplex, head: Buffer) => {
+      void hub?.handleUpgrade?.(request, socket, head);
+    },
   });
   server.listen(port, "127.0.0.1");
 

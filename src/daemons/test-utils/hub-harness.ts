@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import type { IncomingMessage } from "node:http";
 import type { Server } from "node:http";
 import { createServer } from "node:net";
-import type { Duplex } from "node:stream";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { createStartHandler, defaultStreamHandler } from "@tanstack/react-start/server";
 import { createPostgresQueryRuntime } from "../../db/test-utils/runtime.js";
@@ -1836,12 +1834,9 @@ export class HubHarness {
       providerRequest: () => Promise.resolve(new Response("Not Found", { status: 404 })),
       stop: () => hub.stop(),
     }));
-    const server = createFetchServer(createStartHandler(defaultStreamHandler));
-    server.on(
-      "upgrade",
-      (request: IncomingMessage, socket: Duplex, head: Buffer) =>
-        void hub?.handleUpgrade?.(request, socket, head),
-    );
+    const server = createFetchServer(createStartHandler(defaultStreamHandler), {
+      handleUpgrade: (request, socket, head) => void hub?.handleUpgrade?.(request, socket, head),
+    });
     server.listen(port, "127.0.0.1");
     await new Promise<void>((resolve) => server.once("listening", resolve));
     this.hub = hub;

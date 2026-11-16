@@ -318,11 +318,13 @@ async function main(): Promise<void> {
   await start.startApplication(() => runtime);
   const server = createFetchServer(
     (request) => browserProviderPage(request, publicBaseUrl) ?? start.default.fetch(request),
-    await testServerOptions(),
+    {
+      ...(await testServerOptions()),
+      handleUpgrade: (request: IncomingMessage, socket: Duplex, head: Buffer) => {
+        void runtime.hub.handleUpgrade?.(request, socket, head);
+      },
+    },
   );
-  server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
-    void runtime.hub.handleUpgrade?.(request, socket, head);
-  });
   await requestPortHandoff();
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);

@@ -2,6 +2,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createServer as createHttpsServer } from "node:https";
 import { once } from "node:events";
 import { isIP } from "node:net";
+import type { Socket } from "node:net";
+import type { Duplex } from "node:stream";
 import type { Logger } from "pino";
 import { logger as defaultLogger } from "../logger.js";
 import {
@@ -13,6 +15,9 @@ import {
 import { INTERNAL_CLIENT_ADDRESS_HEADER } from "./client-address.js";
 import { takeResponseLifecycle } from "./response-lifecycle.js";
 import { TRUSTED_REQUEST_ORIGIN_HEADER } from "./request-origin.js";
+import { HttpRequestDrain } from "./request-drain.js";
+
+const requestDrains = new WeakMap<Server, HttpRequestDrain>();
 
 export type FetchHandler = (request: Request) => Response | Promise<Response>;
 
@@ -27,6 +32,7 @@ interface FetchServerOptions {
   /** Test and embedded adapters may terminate TLS directly; production normally uses its proxy. */
   tls?: { key: string; cert: string };
   logger?: Pick<Logger, "warn" | "error">;
+  handleUpgrade?: (request: IncomingMessage, socket: Duplex, head: Buffer) => void;
 }
 
 export function createFetchServer(
@@ -39,12 +45,39 @@ export function createFetchServer(
       ? {}
       : { canonicalRequestOrigin: parseHttpOrigin(options.canonicalRequestOrigin) }),
   };
+  const drain = new HttpRequestDrain();
   const handler = (request: IncomingMessage, response: ServerResponse) => {
-    void forwardRequest(fetchHandler, request, response, resolvedOptions);
+    if (!drain.admit(response)) return;
+    void forwardRequest(fetchHandler, request, response, resolvedOptions).finally(() => {
+      drain.complete(response);
+    });
   };
-  return resolvedOptions.tls === undefined
-    ? createServer(handler)
-    : createHttpsServer(resolvedOptions.tls, handler);
+  const server =
+    resolvedOptions.tls === undefined
+      ? createServer(handler)
+      : createHttpsServer(resolvedOptions.tls, handler);
+  requestDrains.set(server, drain);
+  const handleUpgrade = options.handleUpgrade;
+  if (handleUpgrade !== undefined) {
+    server.on("upgrade", (request, socket, head) => {
+      if (!drain.acceptsUpgrades()) {
+        socket.end(
+          "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        );
+        return;
+      }
+      handleUpgrade(request, socket, head);
+    });
+  }
+  return server;
+}
+
+export function beginHttpShutdown(server: Server): {
+  drained: Promise<void>;
+  expire: () => ReadonlySet<Socket>;
+} {
+  const drain = requestDrains.get(server) ?? new HttpRequestDrain();
+  return { drained: drain.begin(), expire: () => drain.expire() };
 }
 
 async function forwardRequest(
@@ -61,6 +94,10 @@ async function forwardRequest(
       return { response, failureReported: failureWasReported() };
     }, options.logger);
     const { response } = tracked;
+    if (outgoing.writableEnded || outgoing.destroyed) {
+      await response.body?.cancel();
+      return;
+    }
     let responseRequestId: string | undefined;
     if (response.status >= 400 && !tracked.failureReported) {
       responseRequestId = reportFailure(
@@ -151,33 +188,43 @@ async function forwardRequest(
       reader.releaseLock();
     }
   } catch (error) {
-    const path = safeRequestPath(incoming.url);
-    const report = reportFailure(
-      error,
-      {
-        operation: "http.request",
-        component: "http",
-        method: incoming.method ?? "GET",
-        path,
-      },
-      { logger: options.logger ?? defaultLogger },
-    );
-    outgoing.statusCode = 500;
-    outgoing.setHeader("x-request-id", report.requestId);
-    if (path.startsWith("/api/")) {
-      outgoing.setHeader("content-type", "application/json; charset=utf-8");
-      outgoing.end(
-        JSON.stringify({
-          error: "internal_error",
-          message: "Hub couldn't complete this API request.",
-          requestId: report.requestId,
-        }),
-      );
-      return;
-    }
-    outgoing.setHeader("content-type", "text/plain; charset=utf-8");
-    outgoing.end(withReference("Hub couldn't complete this request.", report.requestId));
+    respondToRequestFailure(error, incoming, outgoing, options.logger ?? defaultLogger);
   }
+}
+
+function respondToRequestFailure(
+  error: unknown,
+  incoming: IncomingMessage,
+  outgoing: ServerResponse,
+  logger: Pick<Logger, "warn" | "error">,
+): void {
+  if (outgoing.writableEnded || outgoing.destroyed) return;
+  const path = safeRequestPath(incoming.url);
+  const report = reportFailure(
+    error,
+    {
+      operation: "http.request",
+      component: "http",
+      method: incoming.method ?? "GET",
+      path,
+    },
+    { logger },
+  );
+  outgoing.statusCode = 500;
+  outgoing.setHeader("x-request-id", report.requestId);
+  if (path.startsWith("/api/")) {
+    outgoing.setHeader("content-type", "application/json; charset=utf-8");
+    outgoing.end(
+      JSON.stringify({
+        error: "internal_error",
+        message: "Hub couldn't complete this API request.",
+        requestId: report.requestId,
+      }),
+    );
+    return;
+  }
+  outgoing.setHeader("content-type", "text/plain; charset=utf-8");
+  outgoing.end(withReference("Hub couldn't complete this request.", report.requestId));
 }
 
 function safeRequestPath(value: string | undefined): string {

@@ -10,7 +10,7 @@ import {
   installShutdownSignals,
   readShutdownBudgets,
 } from "./server-shutdown.js";
-import { createFetchServer } from "./http/node-server.js";
+import { beginHttpShutdown, createFetchServer } from "./http/node-server.js";
 import { createLogger } from "./logger.js";
 import { assertOneFailure, FailureLogStream } from "./test-utils/failure-logs.js";
 
@@ -27,6 +27,136 @@ afterEach(() => {
 });
 
 describe("production shutdown", () => {
+  it("rejects a late request on an existing connection with HTTP 503 and Retry-After", async () => {
+    const admitted = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let handled = 0;
+    let runtimeStopped = false;
+    const server = createFetchServer(async () => {
+      handled++;
+      admitted.resolve();
+      await release.promise;
+      return new Response("admitted");
+    });
+    const exit = vi.fn();
+    const stop = createServerShutdown(
+      server,
+      async () => {
+        runtimeStopped = true;
+      },
+      { ...budgets, logger, exit },
+    );
+    const port = await listen(server);
+    const client = connect(port, "127.0.0.1");
+    const chunks: Buffer[] = [];
+    client.on("data", (chunk: Buffer) => chunks.push(chunk));
+    const closed = once(client, "close");
+    await once(client, "connect");
+    client.write("GET /admitted HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    await admitted.promise;
+    const stopped = stop();
+    try {
+      const arriving = once(server, "request");
+      client.write("GET /late HTTP/1.1\r\nHost: localhost\r\n\r\n");
+      await arriving;
+      assert.equal(runtimeStopped, false);
+      assert.equal(handled, 1);
+      release.resolve();
+      assert.equal(await stopped, true);
+      await closed;
+      const response = Buffer.concat(chunks).toString();
+      assert.match(response, /HTTP\/1\.1 503 Service Unavailable/u);
+      assert.match(response, /retry-after: 1/iu);
+      assert.match(response, /HTTP\/1\.1 200 OK/u);
+      assert.deepEqual(exit.mock.calls, [[0]]);
+    } finally {
+      release.resolve();
+      await stopped;
+      client.destroy();
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+
+  it("rejects upgrades after HTTP admission closes", async () => {
+    const upgraded = vi.fn();
+    const server = createFetchServer(() => new Response("unexpected"), {
+      handleUpgrade: upgraded,
+    });
+    const stop = createServerShutdown(server, async () => {}, {
+      ...budgets,
+      logger,
+      exit: () => {},
+    });
+    const port = await listen(server);
+    const drain = beginHttpShutdown(server);
+    await drain.drained;
+    const client = connect(port, "127.0.0.1");
+    const chunks: Buffer[] = [];
+    client.on("data", (chunk: Buffer) => chunks.push(chunk));
+    const closed = once(client, "close");
+    try {
+      await once(client, "connect");
+      client.write(
+        "GET /late HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+      );
+      await closed;
+      const response = Buffer.concat(chunks).toString();
+      assert.match(response, /HTTP\/1\.1 503 Service Unavailable/u);
+      assert.match(response, /Retry-After: 1/u);
+      assert.equal(upgraded.mock.calls.length, 0);
+      assert.equal(await stop(), true);
+    } finally {
+      client.destroy();
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+
+  it("returns HTTP 503 at the admission deadline and discards a late successful result", async () => {
+    const admitted = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const canceled = Promise.withResolvers<void>();
+    const body = new ReadableStream<Uint8Array>({ cancel: canceled.resolve });
+    const server = createFetchServer(async () => {
+      admitted.resolve();
+      await release.promise;
+      return new Response(body);
+    });
+    let runtimeStopped = false;
+    const exit = vi.fn();
+    const stop = createServerShutdown(
+      server,
+      async () => {
+        runtimeStopped = true;
+      },
+      { ...budgets, logger, exit },
+    );
+    const port = await listen(server);
+    const response = fetch(`http://127.0.0.1:${port}/pending`, { method: "POST" });
+    await admitted.promise;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const stopped = stop();
+    try {
+      await vi.advanceTimersByTimeAsync(budgets.graceMs - 1);
+      assert.equal(runtimeStopped, false);
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await response;
+      assert.equal(result.status, 503);
+      assert.equal(result.headers.get("retry-after"), "1");
+      await result.text();
+      assert.equal(await stopped, false);
+      assert.deepEqual(exit.mock.calls, [[1]]);
+      release.resolve();
+      await canceled.promise;
+    } finally {
+      release.resolve();
+      await stopped;
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+
   it("finishes SIGTERM with a connected websocket before the grace deadline", async () => {
     const server = createServer();
     const webSockets = new WebSocketServer({ noServer: true });
@@ -63,7 +193,6 @@ describe("production shutdown", () => {
       await connected;
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       signals.emit("SIGTERM");
-      assert.equal(stopRuntime.mock.calls.length, 1);
       await finished.promise;
       assert.deepEqual(exit.mock.calls, [[0]]);
       assert.equal(logger.warn.mock.calls.length, 0);
@@ -116,7 +245,10 @@ describe("production shutdown", () => {
       await closed.promise;
       await canceled.promise;
       assert.deepEqual(exit.mock.calls, [[1]]);
-      assert.deepEqual(logRecord(logger.warn.mock.calls[0]?.[0])["pendingStages"], ["http.close"]);
+      assert.deepEqual(logRecord(logger.warn.mock.calls[0]?.[0])["pendingStages"], [
+        "http.close",
+        "http.requests",
+      ]);
     } finally {
       client.destroy();
       server.closeAllConnections();
@@ -192,7 +324,7 @@ describe("production shutdown", () => {
     assert.equal(await stop(), true);
     assert.deepEqual(exit.mock.calls, [[0]]);
     const records = logger.info.mock.calls.map(([record]) => logRecord(record));
-    for (const stage of ["http.close", "runtime.stop"]) {
+    for (const stage of ["http.close", "http.requests", "runtime.stop"]) {
       assert.deepEqual(
         records.filter((record) => record["stage"] === stage).map((record) => record["phase"]),
         ["start", "end"],
