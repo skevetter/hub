@@ -993,7 +993,7 @@ export class DurableWorkflowEngine {
       );
       if (run === undefined) return;
       try {
-        await this.options.timelineReconciler?.reconcile(run.organizationId, run.id);
+        await this.options.timelineReconciler?.reconcileBeforeTerminal(run.organizationId, run.id);
       } catch (error) {
         this.report(error, "run.timeline.reconcile", { triggerRunId: run.id });
       }

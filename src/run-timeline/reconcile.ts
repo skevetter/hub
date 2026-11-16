@@ -46,11 +46,22 @@ function duration(start: Date | null, end: Date): number {
   return start === null ? 0 : Math.max(0, end.getTime() - start.getTime());
 }
 
+function earliestStepStart(steps: readonly WorkflowStepRunRecord[], fallback: Date): Date {
+  let startedAt: Date | undefined;
+  for (const step of steps) {
+    if (step.startedAt !== null && (startedAt === undefined || step.startedAt < startedAt))
+      startedAt = step.startedAt;
+  }
+  return startedAt ?? fallback;
+}
+
 export class RunTimelineReconciler {
   private readonly pending = new Map<string, PendingReconciliation>();
   private activeSweep: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
   private stopped = true;
+  private accepting = true;
+  private closed = false;
 
   constructor(
     private readonly database: Database,
@@ -58,6 +69,7 @@ export class RunTimelineReconciler {
   ) {}
 
   reconcile(organizationId: string, runId: string): Promise<void> {
+    if (!this.accepting) return Promise.resolve();
     const scope = { organizationId, triggerRunId: runId };
     const key = JSON.stringify([organizationId, runId]);
     const current = this.pending.get(key);
@@ -76,6 +88,7 @@ export class RunTimelineReconciler {
   }
 
   sweep(): Promise<void> {
+    if (!this.accepting) return Promise.resolve();
     if (this.activeSweep) return this.activeSweep;
     const completion = Promise.withResolvers<void>();
     this.activeSweep = completion.promise;
@@ -86,17 +99,50 @@ export class RunTimelineReconciler {
   start(): void {
     if (!this.stopped) return;
     this.stopped = false;
+    this.accepting = true;
+    this.closed = false;
     this.schedule();
   }
 
-  async stop(): Promise<void> {
+  stopAdmission(): void {
+    this.accepting = false;
     this.stopped = true;
     clearTimeout(this.timer);
     this.timer = undefined;
-    await Promise.allSettled([
-      ...(this.activeSweep ? [this.activeSweep] : []),
-      ...Array.from(this.pending.values(), ({ promise }) => promise),
-    ]);
+  }
+
+  async stop(): Promise<void> {
+    this.stopAdmission();
+    try {
+      await this.withDeadline(
+        Promise.allSettled([
+          ...(this.activeSweep ? [this.activeSweep] : []),
+          ...Array.from(this.pending.values(), ({ promise }) => promise),
+        ]).then(() => undefined),
+      );
+    } catch (error) {
+      this.report(error, "run.timeline.stop");
+    } finally {
+      this.closed = true;
+    }
+  }
+
+  async reconcileBeforeTerminal(organizationId: string, runId: string): Promise<void> {
+    await this.withDeadline(this.reconcile(organizationId, runId));
+  }
+
+  private async withDeadline(operation: Promise<void>): Promise<void> {
+    const deadline = Promise.withResolvers<void>();
+    const timer = setTimeout(
+      () => deadline.reject(new Error("Timeline reconciliation deadline exceeded")),
+      2000,
+    );
+    timer.unref();
+    try {
+      await Promise.race([operation, deadline.promise]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async performReconciliation(
@@ -129,6 +175,7 @@ export class RunTimelineReconciler {
         500,
       );
       for (const run of runs) {
+        if (!this.accepting) break;
         const scope = { organizationId: run.organizationId, triggerRunId: run.id };
         try {
           await this.reconcile(run.organizationId, run.id);
@@ -161,6 +208,7 @@ export class RunTimelineReconciler {
   }
 
   private async reconcileRun(scope: TimelineRunScope): Promise<void> {
+    if (this.closed) return;
     const context = await this.readContext(scope);
     if (context === undefined) return;
     const { run, steps, origin, startedAt } = context;
@@ -208,13 +256,14 @@ export class RunTimelineReconciler {
       scope.organizationId,
       scope.triggerRunId,
     );
-    if (run === undefined || run.outcome !== "accepted") return undefined;
+    if (this.closed || run === undefined || run.outcome !== "accepted") return undefined;
     const state = await this.database.readRunTimelineState(
       scope.organizationId,
       scope.triggerRunId,
     );
     const now = this.options.now?.() ?? new Date();
     if (
+      this.closed ||
       state?.sealedSeq != null ||
       isRunTimelineExpired(
         {
@@ -227,18 +276,13 @@ export class RunTimelineReconciler {
       return undefined;
     if (state === undefined && run.status === "running") return undefined;
     const steps = await this.database.listWorkflowStepRunsForTriggerRun(run.id);
-    let startedAt: Date | undefined;
-    for (const step of steps) {
-      if (step.startedAt !== null && (startedAt === undefined || step.startedAt < startedAt))
-        startedAt = step.startedAt;
-    }
     return {
       scope,
       run,
       steps,
       origin: state?.origin ?? "derived",
       now,
-      startedAt: startedAt ?? run.createdAt,
+      startedAt: earliestStepStart(steps, run.createdAt),
     };
   }
 
@@ -308,6 +352,7 @@ export class RunTimelineReconciler {
     input: TimelineProjectionInput,
     stepId?: string,
   ): Promise<boolean> {
+    if (this.closed) return false;
     const projected = projectTimelineEvent(input, this.options.scrub);
     if (projected === undefined) throw new Error("Persisted timeline event could not be projected");
     const result = await this.database.appendRunTimelineEvent({

@@ -423,7 +423,6 @@ function createRunTimelineRuntime(
     bus,
     reportFailure: report,
   });
-  ownership.own(() => timeline.stop(), "composition.timeline_capture");
   const reconciler = new RunTimelineReconciler(database, {
     queue: timeline,
     maxEvents: settings.timelineMaxEvents,
@@ -432,7 +431,11 @@ function createRunTimelineRuntime(
     bus,
     reportFailure: report,
   });
-  ownership.own(() => reconciler.stop(), "composition.timeline_reconciliation");
+  ownership.own(async () => {
+    reconciler.stopAdmission();
+    await timeline.stop();
+    await reconciler.stop();
+  }, "composition.timeline_capture");
   reconciler.start();
   logger.info(
     {

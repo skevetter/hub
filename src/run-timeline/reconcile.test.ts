@@ -678,6 +678,56 @@ describe("timeline reconciler lifecycle", () => {
     vi.useRealTimers();
   });
 
+  it("bounds stopping an active reconciliation and rejects later admission without late database work", async () => {
+    const harness = await memoryHarness();
+    const { database } = harness;
+    const run = await acceptedRun(harness);
+    await capture(database, run.id);
+    const { reconciler, reportFailure } = components(database);
+    const reached = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const read = database.findTriggerRunForOrganization.bind(database);
+    const find = vi
+      .spyOn(database, "findTriggerRunForOrganization")
+      .mockImplementation(async (...args) => {
+        const result = await read(...args);
+        reached.resolve();
+        await release.promise;
+        return result;
+      });
+    const stateRead = vi.spyOn(database, "readRunTimelineState");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const pending = reconciler.reconcile(ORGANIZATION, run.id);
+    try {
+      await reached.promise;
+      let stopped = false;
+      const stopping = reconciler.stop().then(() => {
+        stopped = true;
+        return true;
+      });
+      await vi.advanceTimersByTimeAsync(1_999);
+      assert.equal(stopped, false);
+      await vi.advanceTimersByTimeAsync(1);
+      assert.equal(stopped, true);
+      await stopping;
+      await reconciler.reconcile(ORGANIZATION, run.id);
+      await reconciler.sweep();
+      assert.equal(find.mock.calls.length, 1);
+      release.resolve();
+      await pending;
+      assert.equal(stateRead.mock.calls.length, 0);
+      assert.equal(reportFailure.mock.calls[0]?.[1], "run.timeline.stop");
+      assert.deepEqual(
+        (await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE)).map((row) => row.kind),
+        ["turn_started"],
+      );
+    } finally {
+      release.resolve();
+      await pending;
+      await harness.close();
+    }
+  });
+
   it("lets the native process exit without waiting for its reconciliation timer", async () => {
     await assertBackgroundSweepExits("reconciliation");
   });

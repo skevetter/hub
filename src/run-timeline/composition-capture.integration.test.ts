@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { describe, it, vi } from "vitest";
+import { afterEach, describe, it, vi } from "vitest";
 import { createApplicationRuntime } from "../application-runtime.js";
 import { createMemoryDatabase } from "../db/memory.js";
+import type { Database } from "../db/types.js";
 import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
 import {
   createActiveProjectConfiguration,
@@ -23,10 +24,40 @@ const DATABASE_SECRET =
   "postgresql://fixture-user:fixture-password@invalid.example/fixture-database";
 const PRIVATE_KEY = ["fixture-private-key-", "P8r4I2v9A5t7E3k6"].join("");
 
+async function stopWithStalledTimeline(
+  runtime: Awaited<ReturnType<typeof createApplicationRuntime>>,
+  database: Database,
+  runId: string,
+  isClosed: () => boolean,
+): Promise<void> {
+  const processing = runtime.hub.processWorkflowOutbox();
+  await vi.advanceTimersByTimeAsync(0);
+  let stopped = false;
+  const stopping = runtime.stop().then(() => {
+    stopped = true;
+    return true;
+  });
+  await vi.advanceTimersByTimeAsync(15_000);
+  assert.equal(stopped, true);
+  assert.equal(isClosed(), true);
+  await Promise.all([processing, stopping]);
+  const terminal = await database.findTriggerRunById(runId);
+  assert.ok(terminal?.outcome === "accepted" && terminal.terminalNotificationDeliveredAt);
+}
+
 describe("optional capture application composition", () => {
-  it.each([false, true])(
-    "completes a real workflow with timeline capture enabled=%s and scrubs startup-known values",
-    async (enabled) => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it.each([
+    [false, false],
+    [true, false],
+    [true, true],
+  ] as const)(
+    "completes and stops a real workflow with capture=%s and stalled persistence=%s",
+    async (enabled, stalled) => {
       const database = createMemoryDatabase({ organizationIds: [ORGANIZATION] });
       await enrollTestDaemon(database, ORGANIZATION);
       const { project, revision } = await createActiveProjectConfiguration(
@@ -130,6 +161,17 @@ describe("optional capture application composition", () => {
         validateAgentConfiguration: async () => ({ valid: true }),
       };
       let closed = false;
+      const release = Promise.withResolvers<void>();
+      const reached = Promise.withResolvers<void>();
+      if (stalled) {
+        const append = database.appendRunTimelineEvent.bind(database);
+        vi.spyOn(database, "appendRunTimelineEvent").mockImplementation(async (input) => {
+          reached.resolve();
+          await release.promise;
+          return append(input);
+        });
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+      }
       const runtime = await createApplicationRuntime({
         database,
         auth: null,
@@ -200,7 +242,7 @@ describe("optional capture application composition", () => {
           assert.equal((await database.findAgentExecutionById(execution.id))?.status, "running"),
         );
         await runtime.hub.daemonModule.lifecycle.waitForPendingStreamHandlers(execution.id);
-        if (enabled) {
+        if (enabled && !stalled) {
           await vi.waitFor(async () => {
             const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, {
               afterSeq: 0,
@@ -215,6 +257,11 @@ describe("optional capture application composition", () => {
           executionId: execution.id,
           token: deriveAgentExecutionCompletionToken(AUTH_SECRET, execution.id),
         });
+        if (stalled) {
+          await reached.promise;
+          await stopWithStalledTimeline(runtime, database, run.id, () => closed);
+          return;
+        }
         await runtime.hub.processWorkflowOutbox();
         await vi.waitFor(async () => {
           const terminal = await database.findTriggerRunById(run.id);
@@ -250,6 +297,7 @@ describe("optional capture application composition", () => {
           assert.equal(state, undefined);
         }
       } finally {
+        release.resolve();
         await runtime.stop();
       }
       assert.equal(closed, true);
