@@ -1,3 +1,5 @@
+import type { RunTimeline } from "../../run-timeline/index.js";
+import type { TriggerProvider } from "../../triggers/index.js";
 import { randomUUID } from "node:crypto";
 import type { AgentConnection, AgentEvent } from "../agents/index.js";
 import type { DaemonAgentStreamEvent } from "../protocol.js";
@@ -52,6 +54,10 @@ export class ManualClock implements ExecutionDeadlineClock {
 
 export interface TurnEndFixtureOptions {
   database: Database;
+  timeline?: RunTimeline;
+  providers?: readonly TriggerProvider[];
+  triggerContext?: JsonValue;
+  outputContext?: JsonValue;
   organizationId: string;
   /** Run the execution as a workflow step, so the step output can be read back. */
   workflow?: boolean;
@@ -133,6 +139,8 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
   const lifecycle: DaemonDispatchLifecycle = createDaemonDispatchLifecycle({
     database,
     executionCapabilities,
+    ...(options.timeline === undefined ? {} : { timeline: options.timeline }),
+    ...(options.providers === undefined ? {} : { providers: options.providers }),
     connectionForDaemon: () => ({
       agents,
       getProviderSnapshot: async () => {
@@ -168,8 +176,8 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
         configuredTriggerName: "turn-end",
         prompt: "raw",
         inputs: {},
-        triggerContext: {},
-        outputContext: {},
+        triggerContext: options.triggerContext ?? {},
+        outputContext: options.outputContext ?? {},
         deadlineAt: new Date(clock.now() + 2 * 60 * 60_000),
         stepIds: ["step"],
       })
@@ -205,8 +213,8 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
       ...(options.continuationKey === undefined
         ? {}
         : { continuation: { key: options.continuationKey, compatibility: {} } }),
-      triggerContext: {},
-      outputContext: {},
+      triggerContext: options.triggerContext ?? {},
+      outputContext: options.outputContext ?? {},
       configurationRevisionId: revision.id,
       hubConfig: {},
     };
@@ -243,6 +251,7 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
     sends,
     controls,
     failures,
+    agents,
     dispatch,
     deliver,
     stream,

@@ -1,3 +1,5 @@
+import type { RunTimeline } from "../run-timeline/index.js";
+import type { RunTimelineReconciler } from "../run-timeline/reconcile.js";
 import { continuationKey } from "../triggers/continuation.js";
 import { DatabaseUnavailableError, isTransientDatabaseError } from "../db/errors.js";
 import { retryDiagnostic, retryWithBackoff, type RetryRuntime } from "../db/retry.js";
@@ -98,6 +100,8 @@ export interface DurableWorkflowEngineOptions {
   onWorkflowRunAccepted?: (run: AcceptedTriggerRunRecord) => Promise<JsonValue | null | void>;
   onWorkflowRunStarted?: (run: AcceptedTriggerRunRecord) => Promise<JsonValue | null | void>;
   onWorkflowRunTerminal?: (run: TriggerRunRecord) => Promise<JsonValue | null | void>;
+  timeline?: RunTimeline;
+  timelineReconciler?: RunTimelineReconciler;
   logger?: Pick<Logger, "warn" | "error">;
   /** Backoff timing for transient database failures. Tests inject `sleep` and `random`. */
   retry?: RetryRuntime;
@@ -132,6 +136,7 @@ export class DurableWorkflowEngine {
       providers: this.options.providers ?? [],
       limits: this.options.scriptLimits ?? DEFAULT_SCRIPT_LIMITS,
       retry: this.options.retry,
+      ...(this.options.timeline === undefined ? {} : { timeline: this.options.timeline }),
       now: () => this.now(),
       canDispatchToDaemon: this.options.canDispatchToDaemon,
       report: (error, operation, diagnostic) => this.report(error, operation, diagnostic),
@@ -500,7 +505,18 @@ export class DurableWorkflowEngine {
     executionId: string,
     intent: LaunchMachineIntent,
   ): Promise<void> {
-    await database.linkWorkflowStepRunExecution(stepRunId, executionId, intent);
+    const startedStep = await database.linkWorkflowStepRunExecution(stepRunId, executionId, intent);
+    try {
+      this.options.timeline?.recordStepStart(
+        {
+          organizationId: intent.organizationId,
+          triggerRunId,
+        },
+        startedStep.stepId,
+      );
+    } catch (error) {
+      this.report(error, "run.timeline.capture", { triggerRunId });
+    }
     if (steps.some((candidate) => candidate.startedAt !== null)) return;
     const started = await database.findTriggerRunById(triggerRunId);
     if (started?.outcome === "accepted") await this.deliverWorkflowRunStarted(started);
@@ -923,6 +939,14 @@ export class DurableWorkflowEngine {
   }
 
   private async deliverWorkflowRunStarted(run: AcceptedTriggerRunRecord): Promise<void> {
+    try {
+      this.options.timeline?.recordRunStart({
+        organizationId: run.organizationId,
+        triggerRunId: run.id,
+      });
+    } catch (error) {
+      this.report(error, "run.timeline.capture", { triggerRunId: run.id });
+    }
     const callback = this.options.onWorkflowRunStarted;
     if (callback === undefined || this.options.database === null) return;
     try {
@@ -968,6 +992,11 @@ export class DurableWorkflowEngine {
         this.leaseMs,
       );
       if (run === undefined) return;
+      try {
+        await this.options.timelineReconciler?.reconcile(run.organizationId, run.id);
+      } catch (error) {
+        this.report(error, "run.timeline.reconcile", { triggerRunId: run.id });
+      }
       try {
         const reactionState = await this.options.onWorkflowRunTerminal?.(run);
         const deliveredReactionState =

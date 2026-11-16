@@ -28,6 +28,8 @@ export interface DispatcherOptions {
   onWorkflowRunAccepted?: DurableWorkflowEngineOptions["onWorkflowRunAccepted"];
   onWorkflowRunStarted?: DurableWorkflowEngineOptions["onWorkflowRunStarted"];
   onWorkflowRunTerminal?: DurableWorkflowEngineOptions["onWorkflowRunTerminal"];
+  timeline?: DurableWorkflowEngineOptions["timeline"];
+  timelineReconciler?: DurableWorkflowEngineOptions["timelineReconciler"];
 }
 
 export function createDispatcher(options: DispatcherOptions): TriggerHandler {
@@ -55,6 +57,10 @@ export function createDispatcherWithEngine(options: DispatcherOptions): {
       : { validateLaunchMachineIntent: options.validateLaunchMachineIntent }),
     ...(options.scriptRunner === undefined ? {} : { scriptRunner: options.scriptRunner }),
     scriptLimits: options.scriptLimits,
+    ...(options.timeline === undefined ? {} : { timeline: options.timeline }),
+    ...(options.timelineReconciler === undefined
+      ? {}
+      : { timelineReconciler: options.timelineReconciler }),
     ...(options.configurationRevisionId === undefined
       ? {}
       : { configurationRevisionId: options.configurationRevisionId }),

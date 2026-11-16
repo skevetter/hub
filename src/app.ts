@@ -1,3 +1,5 @@
+import type { RunTimeline } from "./run-timeline/index.js";
+import type { RunTimelineReconciler } from "./run-timeline/reconcile.js";
 import { createScheduleSource, createScheduleProvider } from "./triggers/schedule/index.js";
 import {
   createGitHubNotificationProvider,
@@ -87,6 +89,8 @@ export interface HubRuntimeOptions {
   /** How many script steps may run at once. */
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
+  runTimeline?: RunTimeline;
+  runTimelineReconciler?: RunTimelineReconciler;
 }
 
 export interface HubRuntime {
@@ -96,6 +100,7 @@ export interface HubRuntime {
   agentValidator: DaemonAgentConfigurationValidator | null;
   resourceCounts(): {
     executionSubscriptions: number;
+    timelineQueueDepth: number;
   };
   processWorkflowOutbox(): Promise<void>;
   handleUpgrade: ReturnType<typeof createDaemonUpgradeHandler> | null;
@@ -212,6 +217,8 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     canDispatchToDaemon: (daemonId: string) =>
       (options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId)) !== undefined,
     database: options.database,
+    timeline: options.runTimeline,
+    timelineReconciler: options.runTimelineReconciler,
     entitlements: options.entitlements,
     providers,
     ...(options.configurationRevisionId === undefined
@@ -260,6 +267,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     agentValidator,
     resourceCounts: () => ({
       executionSubscriptions: daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0,
+      timelineQueueDepth: options.runTimeline?.depth() ?? 0,
     }),
     processWorkflowOutbox: () => workflowEngine.processAvailable(),
     handleUpgrade:
@@ -523,6 +531,7 @@ function createAppDaemonModule(
     database: options.database,
     connectionForDaemon: options.daemonConnectionForId ?? ((id) => daemons?.connection(id)),
     executionCapabilities: outputRegistry,
+    ...(options.runTimeline === undefined ? {} : { timeline: options.runTimeline }),
     ...(options.completionTokenSecret === undefined
       ? {}
       : { completionTokenSecret: options.completionTokenSecret }),

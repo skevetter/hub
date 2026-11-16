@@ -1,3 +1,4 @@
+import type { RunTimeline } from "../run-timeline/index.js";
 import { DaemonAgentError } from "./agents/index.js";
 import { AgentSessions, AgentSessionError } from "../agent-sessions/index.js";
 import type { AgentEvent } from "./agents/index.js";
@@ -110,6 +111,7 @@ export interface DaemonDispatchLifecycleOptions {
   executionCapabilities?: OutputExecutorRegistry;
   providers?: readonly TriggerProvider[];
   executionAuthority?: ExecutionAuthority;
+  timeline?: RunTimeline;
   /** Shared with the MCP handler, which records each finish_execution call by its execution. */
   finishCalls?: FinishCallRegistry;
   publicBaseUrl?: string;
@@ -654,6 +656,19 @@ export class DaemonDispatchLifecycle {
     return assertNeverAgentStreamEvent(event);
   }
 
+  private captureTimelineEvent(
+    executionId: string,
+    event: Extract<DaemonEvent, { type: "agent_stream" }>["event"],
+    observedAt: Date,
+    source: "live" | "snapshot",
+  ): void {
+    try {
+      this.options.timeline?.observeAgentEvent(executionId, event, observedAt, source);
+    } catch (error) {
+      this.report(error, "run.timeline.capture", { executionId });
+    }
+  }
+
   private async handleDaemonEvent(
     executionId: string,
     daemonId: string,
@@ -662,6 +677,7 @@ export class DaemonDispatchLifecycle {
   ): Promise<void> {
     if (event.type === "agent_stream") {
       const observedAt = new Date(event.timestamp);
+      this.captureTimelineEvent(executionId, event.event, observedAt, source);
       if (event.event.type === "timeline" && event.event.item.type === "tool_call") {
         const item = event.event.item;
         if (
@@ -1077,6 +1093,20 @@ export class DaemonDispatchLifecycle {
   ): Promise<void> {
     const execution = await this.options.database.findAgentExecutionById(executionId);
     if (!execution?.daemonAgentId) return;
+    try {
+      const intent = execution.launchIntent;
+      this.options.timeline?.begin(
+        executionId,
+        intent === null
+          ? undefined
+          : {
+              organizationId: execution.organizationId,
+              triggerRunId: intent.triggerRunId,
+            },
+      );
+    } catch (error) {
+      this.report(error, "run.timeline.capture", { executionId });
+    }
     const unsubscribe = await connection.agents.watch(execution.daemonAgentId, (event) =>
       this.observeSessionEvent(executionId, daemonId, event),
     );
@@ -1581,6 +1611,14 @@ export class DaemonDispatchLifecycle {
         connection: connection.agents,
         beforePromptSend: () => {
           this.watchForTurnEnd(input.executionId, input.intent);
+          try {
+            this.options.timeline?.begin(input.executionId, {
+              organizationId: input.intent.organizationId,
+              triggerRunId: input.intent.triggerRunId,
+            });
+          } catch (error) {
+            this.report(error, "run.timeline.capture", { executionId: input.executionId });
+          }
           input.beforePromptSend?.();
         },
         createOptions: () =>
@@ -1838,6 +1876,11 @@ export class DaemonDispatchLifecycle {
   }
 
   private releaseExecutionResources(executionId: string): void {
+    try {
+      this.options.timeline?.release(executionId);
+    } catch (error) {
+      this.report(error, "run.timeline.capture", { executionId });
+    }
     this.executionSubscriptions.get(executionId)?.();
     this.executionSubscriptions.delete(executionId);
     this.clearTurnEnd(executionId);
