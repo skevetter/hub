@@ -44,10 +44,11 @@ describe("daemon socket shutdown deadline", () => {
       createdAt: now,
     };
     const stream = new FailureLogStream();
+    const setDaemonPresence = vi.fn(async (): Promise<void> => undefined);
     const registry = new ActiveDaemonRegistry(
       {
         touchDaemon: async () => undefined,
-        setDaemonPresence: async () => undefined,
+        setDaemonPresence,
       },
       undefined,
       createLogger(stream),
@@ -60,10 +61,10 @@ describe("daemon socket shutdown deadline", () => {
       if (closeImmediately) socket.emit("close", 1001, Buffer.alloc(0));
     });
     const terminate = vi.spyOn(socket, "terminate").mockImplementation(() => {
-      socket.emit("close", 1006, Buffer.alloc(0));
+      setTimeout(() => socket.emit("close", 1006, Buffer.alloc(0)), 1);
     });
     registry.accept(daemon, socket);
-    return { registry, socket, close, terminate, stream };
+    return { registry, socket, close, terminate, stream, setDaemonPresence };
   }
 
   it("terminates an unresponsive socket after one second and reports the deadline", async () => {
@@ -79,6 +80,8 @@ describe("daemon socket shutdown deadline", () => {
     assert.equal(stopped, false);
     assert.equal(terminate.mock.calls.length, 0);
     await vi.advanceTimersByTimeAsync(1);
+    assert.equal(stopped, false);
+    await vi.advanceTimersByTimeAsync(1);
     await stopping;
     assert.equal(terminate.mock.calls.length, 1);
     assert.equal(vi.getTimerCount(), 0);
@@ -90,6 +93,80 @@ describe("daemon socket shutdown deadline", () => {
       canary: "shutdown-never-logged",
     });
   });
+
+  it("waits for offline presence after asynchronous terminated socket close", async () => {
+    vi.useFakeTimers();
+    const { registry, socket, setDaemonPresence } = setup(false);
+    const offlinePresence = Promise.withResolvers<void>();
+    setDaemonPresence.mockReturnValue(offlinePresence.promise);
+    let stopped = false;
+    const stopping = registry.stop().then(() => {
+      stopped = true;
+      return undefined;
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+    assert.equal(stopped, false);
+    assert.equal(setDaemonPresence.mock.calls.length, 0);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(setDaemonPresence.mock.calls.length, 1);
+    assert.equal(stopped, false);
+
+    offlinePresence.resolve();
+    await stopping;
+    assert.equal(stopped, true);
+    assert.equal(vi.getTimerCount(), 0);
+    assert.equal(socket.listenerCount("close"), 1);
+  });
+
+  it("rejects shutdown if a terminated socket does not close within one second", async () => {
+    vi.useFakeTimers();
+    const { registry, socket, terminate, setDaemonPresence } = setup(false);
+    terminate.mockImplementation(() => {});
+    let settled = false;
+    const stopping = registry.stop();
+    void stopping.then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      () => {
+        settled = true;
+        return undefined;
+      },
+    );
+    const rejected = assert.rejects(stopping, {
+      message: "daemon socket did not close after termination",
+    });
+
+    await vi.advanceTimersByTimeAsync(1999);
+    assert.equal(terminate.mock.calls.length, 1);
+    assert.equal(settled, false);
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+    assert.equal(settled, true);
+    assert.equal(setDaemonPresence.mock.calls.length, 0);
+    assert.equal(vi.getTimerCount(), 0);
+    assert.equal(socket.listenerCount("close"), 1);
+  });
+
+  it.each(["close", "terminate"] as const)(
+    "cleans up shutdown waiters when %s throws",
+    async (method) => {
+      vi.useFakeTimers();
+      const { registry, socket, close, terminate } = setup(false);
+      const failure = new Error("socket shutdown failed");
+      const operation = method === "close" ? close : terminate;
+      operation.mockImplementation(() => {
+        throw failure;
+      });
+      const rejected = assert.rejects(registry.stop(), failure);
+      if (method === "terminate") await vi.advanceTimersByTimeAsync(1000);
+      await rejected;
+      assert.equal(vi.getTimerCount(), 0);
+      assert.equal(socket.listenerCount("close"), 1);
+    },
+  );
 
   it("clears the shutdown timer after a normal close handshake", async () => {
     vi.useFakeTimers();

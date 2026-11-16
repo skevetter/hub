@@ -220,28 +220,45 @@ export class ActiveDaemonRegistry {
   async stop(): Promise<void> {
     const activeDaemons = Array.from(this.active.values());
     const sockets = activeDaemons.map((active) => {
-      const { promise, resolve } = Promise.withResolvers<void>();
+      const { promise, resolve, reject } = Promise.withResolvers<void>();
       if (active.socket.readyState === WebSocket.CLOSED) {
         resolve();
         return promise;
       }
-      const finish = () => {
+      const cleanup = () => {
         clearTimeout(timer);
         active.socket.off("close", finish);
+      };
+      const finish = () => {
+        cleanup();
         resolve();
       };
-      const timer = setTimeout(() => {
+      const fail = (error: unknown) => {
+        cleanup();
+        reject(error);
+      };
+      let timer = setTimeout(() => {
         this.report(
           new Error("daemon socket close exceeded the shutdown deadline"),
           "daemon.socket.close",
           active.daemon.id,
           "network",
         );
-        active.socket.terminate();
-        finish();
+        timer = setTimeout(() => {
+          fail(new Error("daemon socket did not close after termination"));
+        }, 1000);
+        try {
+          active.socket.terminate();
+        } catch (error) {
+          fail(error);
+        }
       }, 1000);
       active.socket.once("close", finish);
-      active.socket.close(1001, "server shutdown");
+      try {
+        active.socket.close(1001, "server shutdown");
+      } catch (error) {
+        fail(error);
+      }
       return promise;
     });
     await Promise.all(sockets);
