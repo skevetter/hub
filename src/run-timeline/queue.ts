@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { Database } from "../db/types.js";
 import type { TimelineQueue, TimelineRunScope } from "./capture-types.js";
 import type { RunTimelineBus } from "./bus.js";
@@ -10,6 +11,12 @@ interface TimelineWork {
   next?: TimelineWork | undefined;
 }
 
+interface DropBatch {
+  id: string;
+  count: number;
+  at: Date;
+}
+
 interface PendingRun {
   scope: TimelineRunScope;
   head?: TimelineWork | undefined;
@@ -19,6 +26,7 @@ interface PendingRun {
   ordinaryCount: number;
   controlCount: number;
   dropped: number;
+  batch?: DropBatch | undefined;
   dropsReady: boolean;
   inFlightDrops: number;
   recoveryAt?: number | undefined;
@@ -93,7 +101,7 @@ export class RunTimelineQueue implements TimelineQueue {
   } {
     let retainedEntries = 0;
     for (const queue of this.queues.values()) {
-      if (queue.dropped !== 0 || queue.inFlightDrops !== 0) retainedEntries += 1;
+      if (this.hasDrops(queue)) retainedEntries += 1;
     }
     return {
       queueEntries: this.queues.size,
@@ -113,7 +121,7 @@ export class RunTimelineQueue implements TimelineQueue {
       return drained;
     }
     for (const queue of this.queues.values()) {
-      if (queue.dropped !== 0) {
+      if (this.hasDrops(queue)) {
         queue.dropsReady = true;
         this.start(queue);
       }
@@ -184,7 +192,10 @@ export class RunTimelineQueue implements TimelineQueue {
       .finally(() => {
         this.active.delete(operation);
         queue.running = false;
-        if (!this.closed && (queue.head !== undefined || (queue.dropped !== 0 && queue.dropsReady)))
+        if (
+          !this.closed &&
+          (queue.head !== undefined || (this.hasDrops(queue) && queue.dropsReady))
+        )
           this.start(queue);
         else this.reclaim(queue);
         this.scheduleRecovery();
@@ -220,41 +231,58 @@ export class RunTimelineQueue implements TimelineQueue {
     }
   }
 
+  private hasDrops(queue: PendingRun): boolean {
+    return queue.dropped !== 0 || queue.batch !== undefined;
+  }
+
   private async flushDrops(queue: PendingRun): Promise<void> {
-    if (queue.dropped === 0 || !queue.dropsReady || this.closed) return;
-    const count = queue.dropped;
-    const scheduled = queue.recoveryReady;
-    queue.recoveryReady = false;
-    if (scheduled) queue.recoveryAttempts += 1;
-    queue.dropped = 0;
-    queue.inFlightDrops = count;
-    queue.dropsReady = false;
-    let result: { seq: number; inserted: boolean } | undefined;
-    try {
-      result = await this.database.recordRunTimelineDrops(
-        queue.scope.organizationId,
-        queue.scope.triggerRunId,
-        count,
-        this.options.now?.() ?? new Date(),
-      );
-    } catch (error) {
-      if (this.stopping || this.closed || queue.recoveryAttempts >= 5) {
-        this.abandon(queue, count);
-        queue.recoveryAt = undefined;
-        queue.recoveryAttempts = 0;
-      } else {
-        queue.dropped += count;
-        queue.recoveryAt ??= performance.now() + 30000;
-        if (scheduled) queue.recoveryAt = performance.now() + 30000;
+    const batches = queue.batch === undefined ? 1 : 2;
+    for (let remaining = batches; remaining > 0; remaining--) {
+      if (!this.hasDrops(queue) || !queue.dropsReady || this.closed) return;
+      if (queue.batch === undefined) {
+        queue.batch = {
+          id: randomUUID(),
+          count: queue.dropped,
+          at: this.options.now?.() ?? new Date(),
+        };
+        queue.dropped = 0;
       }
-      this.report(error, queue.scope);
-      return;
-    } finally {
-      queue.inFlightDrops = 0;
+      const batch = queue.batch;
+      const scheduled = queue.recoveryReady;
+      queue.recoveryReady = false;
+      if (scheduled) queue.recoveryAttempts += 1;
+      queue.inFlightDrops = batch.count;
+      queue.dropsReady = false;
+      let result: { seq: number; inserted: boolean } | undefined;
+      try {
+        result = await this.database.recordRunTimelineDrops(
+          queue.scope.organizationId,
+          queue.scope.triggerRunId,
+          batch.count,
+          batch.at,
+          batch.id,
+        );
+      } catch (error) {
+        if (this.stopping || this.closed || queue.recoveryAttempts >= 5) {
+          this.abandon(queue, batch.count);
+          queue.batch = undefined;
+          queue.recoveryAt = undefined;
+          queue.recoveryAttempts = 0;
+        } else {
+          queue.recoveryAt ??= performance.now() + 30000;
+          if (scheduled) queue.recoveryAt = performance.now() + 30000;
+        }
+        this.report(error, queue.scope);
+        return;
+      } finally {
+        queue.inFlightDrops = 0;
+      }
+      queue.batch = undefined;
+      queue.recoveryAt = undefined;
+      queue.recoveryAttempts = 0;
+      queue.dropsReady = queue.dropped !== 0;
+      if (result?.inserted) this.options.bus.publish(queue.scope.triggerRunId, result.seq);
     }
-    queue.recoveryAt = undefined;
-    queue.recoveryAttempts = 0;
-    if (result?.inserted) this.options.bus.publish(queue.scope.triggerRunId, result.seq);
   }
 
   private clearRecoveryTimer(): void {
@@ -267,7 +295,7 @@ export class RunTimelineQueue implements TimelineQueue {
     if (this.stopping || this.closed) return;
     let due = Number.POSITIVE_INFINITY;
     for (const queue of this.queues.values()) {
-      if (!queue.running && queue.dropped !== 0 && queue.recoveryAt !== undefined)
+      if (!queue.running && this.hasDrops(queue) && queue.recoveryAt !== undefined)
         due = Math.min(due, queue.recoveryAt);
     }
     if (due === Number.POSITIVE_INFINITY) {
@@ -286,7 +314,7 @@ export class RunTimelineQueue implements TimelineQueue {
         for (const queue of this.queues.values()) {
           if (
             queue.running ||
-            queue.dropped === 0 ||
+            !this.hasDrops(queue) ||
             queue.recoveryAt === undefined ||
             queue.recoveryAt > now
           )
@@ -307,6 +335,7 @@ export class RunTimelineQueue implements TimelineQueue {
     if (
       queue.head === undefined &&
       queue.dropped === 0 &&
+      queue.batch === undefined &&
       queue.inFlightDrops === 0 &&
       this.queues.get(queue.scope.triggerRunId) === queue
     )
@@ -337,7 +366,9 @@ export class RunTimelineQueue implements TimelineQueue {
         work.next = undefined;
         work = next;
       }
-      this.abandon(queue, queue.dropped);
+      const retained = queue.inFlightDrops === 0 ? (queue.batch?.count ?? 0) : 0;
+      this.abandon(queue, queue.dropped + retained);
+      if (queue.inFlightDrops === 0) queue.batch = undefined;
       queue.dropped = 0;
       queue.dropsReady = false;
       queue.recoveryAt = undefined;

@@ -1,0 +1,1 @@
+ALTER TABLE "run_timeline_state" ADD COLUMN "accounting_batch_ids" text[];

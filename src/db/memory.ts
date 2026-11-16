@@ -123,6 +123,7 @@ import {
   timelineDedupeKey,
   timelineStepId,
 } from "../run-timeline/data.js";
+import { timelineAccountingBatchId } from "../run-timeline/store.js";
 import type {
   AppendRunTimelineEventInput,
   AppendRunTimelineEventResult,
@@ -252,6 +253,7 @@ class MemoryDatabase implements Database {
   private readonly runTimelineStates = new Map<string, RunTimelineState>();
   private readonly runTimelineEvents = new Map<string, RunTimelineEvent[]>();
   private readonly runTimelineDedupe = new Map<string, Map<string, number>>();
+  private readonly runTimelineAccountingBatchIds = new Map<string, string[]>();
   private readonly runProgressMessages = new Map<string, RunProgressMessage>();
   private readonly triggerRunIdsByProviderEventReceipt = new Map<
     string,
@@ -369,9 +371,16 @@ class MemoryDatabase implements Database {
     return { seq: event.seq, inserted: true };
   }
 
-  async recordRunTimelineDrops(organizationId: string, runId: string, count: number, at: Date) {
+  async recordRunTimelineDrops(
+    organizationId: string,
+    runId: string,
+    count: number,
+    at: Date,
+    batchId: string,
+  ) {
     if (!Number.isSafeInteger(count) || count <= 0)
       throw new RangeError("Invalid timeline drop count");
+    batchId = timelineAccountingBatchId(batchId);
     const run = this.triggerRuns.get(runId);
     if (run === undefined || run.organizationId !== organizationId || run.outcome !== "accepted")
       return undefined;
@@ -392,6 +401,11 @@ class MemoryDatabase implements Database {
       if (opened === undefined || !("eventCount" in opened)) return undefined;
       state = opened;
     }
+    const batchIds = this.runTimelineAccountingBatchIds.get(runId) ?? [];
+    if (batchIds.includes(batchId)) return { seq: state.eventCount, inserted: false };
+    batchIds.push(batchId);
+    if (batchIds.length > 16) batchIds.shift();
+    this.runTimelineAccountingBatchIds.set(runId, batchIds);
     state.droppedCount += count;
     const notice =
       this.runTimelineEvents.get(runId)?.some((event) => event.kind === "truncated") ?? false;
@@ -586,6 +600,7 @@ class MemoryDatabase implements Database {
     for (const run of candidates) {
       this.runTimelineEvents.delete(run.id);
       this.runTimelineDedupe.delete(run.id);
+      this.runTimelineAccountingBatchIds.delete(run.id);
       this.runProgressMessages.delete(run.id);
       const state = this.runTimelineStates.get(run.id);
       if (state !== undefined && state.expiredAt === null) {

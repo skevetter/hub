@@ -18,6 +18,7 @@
 ### Fixed
 
 - URL userinfo containing whitespace is redacted as a whole field, including non-HTTP schemes and encoded separators.
+- Retained drop-accounting batches use durable identities so lost acknowledgements do not increment their counters twice.
 - Projected free text with credential hints, userinfo, armored blocks or unresolved encodings is replaced as a whole field.
 - Failed accounting recovers after sealing without run activity, reclaims idle queues and exposes bounded-retry abandonment counters.
 - Stored timeline redaction handles escaped quoted credentials and quoted Authorization values.

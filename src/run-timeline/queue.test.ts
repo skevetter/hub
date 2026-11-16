@@ -677,7 +677,7 @@ describe("bounded per-run timeline queue", () => {
     }
   });
 
-  it("coalesces restored drops with a later wake arriving during the failed write", async () => {
+  it("keeps later drops separate from the retried batch and accounts for both before the next control", async () => {
     const { database, scope, bus } = await fixture();
     const release = Promise.withResolvers<void>();
     const entered = Promise.withResolvers<void>();
@@ -705,8 +705,10 @@ describe("bounded per-run timeline queue", () => {
       assert.equal(await queue.flush(), true);
       assert.deepEqual(
         dropWrite.mock.calls.map((call) => call[2]),
-        [3, 7],
+        [3, 3, 4],
       );
+      assert.equal(dropWrite.mock.calls[0]?.[4], dropWrite.mock.calls[1]?.[4]);
+      assert.notEqual(dropWrite.mock.calls[1]?.[4], dropWrite.mock.calls[2]?.[4]);
       assert.equal(
         (await database.readRunTimelineState(ORGANIZATION, scope.triggerRunId))?.droppedCount,
         7,

@@ -561,6 +561,7 @@ export const runTimelineState = pgTable(
     stepEndBytes: integer("step_end_bytes").notNull().default(0),
     stepRowsOmitted: integer("step_rows_omitted").notNull().default(0),
     droppedCount: integer("dropped_count").notNull().default(0),
+    accountingBatchIds: text("accounting_batch_ids").array(),
     sealedSeq: integer("sealed_seq"),
     sealedAt: timestamp("sealed_at", { withTimezone: true }),
     origin: text().$type<"captured" | "derived">().notNull(),

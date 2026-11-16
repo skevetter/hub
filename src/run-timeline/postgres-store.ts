@@ -8,6 +8,7 @@ import {
   timelineCallIdText,
   timelineStepId,
 } from "./data.js";
+import { timelineAccountingBatchId } from "./store.js";
 import type {
   AppendRunTimelineEventInput,
   AppendRunTimelineEventResult,
@@ -36,9 +37,16 @@ const MESSAGE = `trigger_run_id as "triggerRunId", organization_id as "organizat
 export class RunTimelineRepository {
   constructor(private readonly runtime: DatabaseRuntime) {}
 
-  async recordRunTimelineDrops(organizationId: string, runId: string, count: number, at: Date) {
+  async recordRunTimelineDrops(
+    organizationId: string,
+    runId: string,
+    count: number,
+    at: Date,
+    batchId: string,
+  ) {
     if (!Number.isSafeInteger(count) || count <= 0)
       throw new RangeError("Invalid timeline drop count");
+    batchId = timelineAccountingBatchId(batchId);
     return this.runtime.transaction(async (transaction) => {
       const run = await transaction.query(
         `select id from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' for key share`,
@@ -50,15 +58,19 @@ export class RunTimelineRepository {
         [runId, organizationId],
       );
       const state = (
-        await transaction.query<Row<RunTimelineState>>(
-          `select ${STATE} from run_timeline_state where trigger_run_id = $1 and organization_id = $2 for update`,
+        await transaction.query<Row<RunTimelineState> & { accountingBatchIds: string[] | null }>(
+          `select ${STATE}, accounting_batch_ids as "accountingBatchIds" from run_timeline_state where trigger_run_id = $1 and organization_id = $2 for update`,
           [runId, organizationId],
         )
       ).rows[0]!;
       if (state.expiredAt !== null) return undefined;
+      if (state.accountingBatchIds?.includes(batchId))
+        return { seq: state.eventCount, inserted: false };
+      const batchIds = (state.accountingBatchIds ?? []).slice(-15);
+      batchIds.push(batchId);
       await transaction.query(
-        `update run_timeline_state set dropped_count = dropped_count + $2 where trigger_run_id = $1`,
-        [runId, count],
+        `update run_timeline_state set dropped_count = dropped_count + $2, accounting_batch_ids = $3::text[] where trigger_run_id = $1`,
+        [runId, count, batchIds],
       );
       if (state.sealedSeq !== null) return { seq: state.eventCount, inserted: false };
       const notice = await transaction.query(
@@ -278,7 +290,7 @@ export class RunTimelineRepository {
         [ids],
       );
       await transaction.query(
-        `update run_timeline_state set expired_at = $2 where trigger_run_id = any($1::uuid[]) and expired_at is null`,
+        `update run_timeline_state set expired_at = $2, accounting_batch_ids = null where trigger_run_id = any($1::uuid[]) and expired_at is null`,
         [ids, cutoff],
       );
       return ids.length;

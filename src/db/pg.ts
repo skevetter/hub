@@ -156,7 +156,8 @@ class PgDatabase implements Database {
     runId,
     count,
     at,
-  ) => this.timeline.recordRunTimelineDrops(organizationId, runId, count, at);
+    batchId,
+  ) => this.timeline.recordRunTimelineDrops(organizationId, runId, count, at, batchId);
   listRunTimelineEvents: RunTimelineStore["listRunTimelineEvents"] = (
     organizationId,
     runId,

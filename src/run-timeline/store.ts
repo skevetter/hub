@@ -119,6 +119,15 @@ export interface UpdateRunProgressMessageInput extends RunProgressLeaseInput {
     >
   >;
 }
+export function timelineAccountingBatchId(value: string): string {
+  if (
+    typeof value !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
+  )
+    throw new RangeError("Invalid timeline accounting batch ID");
+  return value.toLowerCase();
+}
+
 export interface RunTimelineStore {
   appendRunTimelineEvent(input: AppendRunTimelineEventInput): Promise<AppendRunTimelineEventResult>;
   recordRunTimelineDrops(
@@ -126,6 +135,7 @@ export interface RunTimelineStore {
     runId: string,
     count: number,
     at: Date,
+    batchId: string,
   ): Promise<{ seq: number; inserted: boolean } | undefined>;
   listRunTimelineEvents(
     organizationId: string,
