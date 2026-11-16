@@ -671,8 +671,8 @@ export interface PersistManualEventInput extends InsertProviderEventInput {
 }
 
 export type ManualEventPersistence =
-  | { status: "accepted"; event: DurableProviderEvent }
-  | { status: "duplicate"; providerEventReceiptId: string };
+  | { status: "accepted"; event: DurableProviderEvent; replayed?: boolean }
+  | { status: "duplicate"; providerEventReceiptId: string; replayed?: boolean };
 
 export interface GitHubInstallationSyncOwner {
   providerApplicationId: string;

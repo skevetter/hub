@@ -63,7 +63,7 @@ export async function dispatchManualTrigger(
       },
       "manual event intake completed",
     );
-    return { providerEventReceiptId: persisted.providerEventReceiptId };
+    return { providerEventReceiptId: persisted.providerEventReceiptId, replayed: true };
   }
   if (state.handler === undefined) {
     await state.database.markProviderEventDropped(
@@ -80,7 +80,10 @@ export async function dispatchManualTrigger(
       },
       "manual event intake completed",
     );
-    return { providerEventReceiptId: persisted.event.providerEventReceiptId };
+    return {
+      providerEventReceiptId: persisted.event.providerEventReceiptId,
+      ...(persisted.replayed === true ? { replayed: true } : {}),
+    };
   }
   logger.info(
     {
@@ -91,7 +94,14 @@ export async function dispatchManualTrigger(
     },
     "manual event intake completed",
   );
-  return state.handler(persisted.event);
+  const outcome = await state.handler(persisted.event);
+  return persisted.replayed === true
+    ? {
+        ...outcome,
+        providerEventReceiptId: persisted.event.providerEventReceiptId,
+        replayed: true,
+      }
+    : outcome;
 }
 
 async function handleManualRequest(request: Request, source: TriggerSource): Promise<Response> {

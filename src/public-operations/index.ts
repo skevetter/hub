@@ -7,13 +7,18 @@ import { DaemonDispatchFailure } from "../daemons/index.js";
 import { ENROLLMENT_LIFETIME_MS } from "../daemons/registration.js";
 import { isDatabaseUnavailableError } from "../db/errors.js";
 import { formatInvocationRejection } from "../triggers/invocation.js";
-import { ManualRunRejected } from "../triggers/manual/provider.js";
+import {
+  ManualRunRejected,
+  parseManualInvocation,
+  type ManualRunPayload,
+} from "../triggers/manual/provider.js";
 import type {
   DispatchManualRunInput,
   DispatchManualRunResult,
   PublicOperationCapabilities,
   PublicOperationRepository,
   PublicOperations,
+  PublicAuthorization,
 } from "./types.js";
 import { TriggerDocumentError } from "../triggers/configuration/index.js";
 
@@ -236,18 +241,74 @@ function triggerCapability(capabilities: PublicOperationCapabilities, organizati
   return capabilities.triggerForOrganization(organizationId);
 }
 
+async function prepareManualRun(
+  capabilities: PublicOperationCapabilities,
+  authorization: PublicAuthorization,
+  projectId: string,
+  input: DispatchManualRunInput,
+): Promise<DispatchManualRunResult | { status: "prepared"; payload: ManualRunPayload }> {
+  const boundActor = authorization.actor;
+  if (boundActor != null && input.actor !== undefined && input.actor !== boundActor) {
+    return { status: "actor_forbidden" };
+  }
+  const actor = boundActor ?? input.actor;
+  if (actor === undefined) {
+    return {
+      status: "invalid_input",
+      issues: [{ path: ["actor"], message: "An actor is required for an unbound credential." }],
+    };
+  }
+  const stored = await capabilities.configurationForProject(projectId).getActive();
+  if (stored === undefined) return { status: "configuration_not_found" };
+  if (input.expectedVersionId !== undefined && input.expectedVersionId !== stored.revision.id) {
+    return { status: "expected_configuration_not_current" };
+  }
+  const trigger = stored.configuration.triggers.find(
+    (candidate) => candidate.name === input.trigger && candidate.on === "manual.run",
+  );
+  if (trigger === undefined) return { status: "trigger_not_found" };
+  if (
+    !trigger.filters?.from_users?.includes("*") &&
+    !trigger.filters?.from_users?.includes(actor)
+  ) {
+    return { status: "actor_forbidden" };
+  }
+  const payload: ManualRunPayload = {
+    ...(input.expectedVersionId === undefined
+      ? {}
+      : { expectedVersionId: input.expectedVersionId }),
+    trigger: input.trigger,
+    actor,
+    input: input.input,
+    publicDeliveryKey: input.deliveryKey,
+  };
+  const inputIssue = validateManualMessage(input.input);
+  if (inputIssue !== undefined) return { status: "invalid_input", issues: [inputIssue] };
+  const invocation = parseManualInvocation(payload, trigger.inputs);
+  if (invocation.status === "rejected") {
+    return {
+      status: "invalid_input",
+      issues: [
+        {
+          path: ["input", invocation.rejection.inputName],
+          message: formatInvocationRejection(invocation.rejection),
+        },
+      ],
+    };
+  }
+  return { status: "prepared", payload };
+}
+
 async function dispatchManualRun(
   repository: PublicOperationRepository,
   capabilities: PublicOperationCapabilities,
-  authorization: {
-    organizationId: string;
-    kind: "apiKey" | "cliCredential";
-    credentialId: string;
-  },
+  authorization: PublicAuthorization,
   projectId: string,
   input: DispatchManualRunInput,
   deliveryId: string,
 ): Promise<DispatchManualRunResult> {
+  const prepared = await prepareManualRun(capabilities, authorization, projectId, input);
+  if (prepared.status !== "prepared") return prepared;
   const outcome = await capabilities.dispatchManualEvent({
     organizationId: authorization.organizationId,
     projectId,
@@ -255,13 +316,7 @@ async function dispatchManualRun(
     deliveryId,
     receivedAt: new Date(),
     payload: {
-      ...(input.expectedVersionId === undefined
-        ? {}
-        : { expectedVersionId: input.expectedVersionId }),
-      trigger: input.trigger,
-      actor: input.actor,
-      input: input.input,
-      publicDeliveryKey: input.deliveryKey,
+      ...prepared.payload,
       authenticatedBy: {
         kind: authorization.kind === "apiKey" ? "api-key" : "cli-credential",
         credentialId: authorization.credentialId,
@@ -289,6 +344,24 @@ async function dispatchManualRun(
     configuredTriggerName: run.configuredTriggerName,
     workflowStatus: run.status,
   };
+}
+
+function validateManualMessage(input: unknown) {
+  let message: unknown;
+  if (typeof input === "string") message = input;
+  else if (typeof input === "object" && input !== null && !Array.isArray(input)) {
+    message = Object.hasOwn(input, "message") && "message" in input ? input.message : "";
+  }
+  if (typeof message !== "string") {
+    return {
+      path: ["input", "message"],
+      message: "Input must be text or an object with a string message.",
+    };
+  }
+  if (Buffer.byteLength(message, "utf8") > 65_536) {
+    return { path: ["input", "message"], message: "Message exceeds 65536 UTF-8 bytes." };
+  }
+  return undefined;
 }
 
 async function resolveConfigurationDeployment(

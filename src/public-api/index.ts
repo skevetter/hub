@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { OperationAuthenticator } from "../auth/operation-auth.js";
 import { isDatabaseUnavailableError } from "../db/errors.js";
 import { reportFailure } from "../failures/index.js";
+import { readBoundedRequestBody } from "../http/request-body.js";
 import type {
   DispatchManualRunResult,
   InstallConfigurationResult,
@@ -199,7 +200,16 @@ async function execute(
   const access: PublicAuthorization = authorization.access;
   let input: unknown;
   if (definition.requestSchema !== undefined) {
-    const parsedBody = await readJson(request);
+    const parsedBody = await readJson(request, id === "dispatchManualRun" ? 262_144 : undefined);
+    if (!parsedBody.success && parsedBody.tooLarge) {
+      return problem(
+        requestId,
+        413,
+        "payload_too_large",
+        "Payload too large",
+        "The request body exceeds the byte limit.",
+      );
+    }
     if (!parsedBody.success) {
       return problem(
         requestId,
@@ -387,11 +397,20 @@ function validationResponse(requestId: string, result: ValidateConfigurationResu
 
 async function readJson(
   request: Request,
-): Promise<{ success: true; value: unknown } | { success: false }> {
+  maxBytes?: number,
+): Promise<{ success: true; value: unknown } | { success: false; tooLarge?: boolean }> {
   if (!request.headers.get("content-type")?.toLowerCase().includes("application/json")) {
     return { success: false };
   }
   try {
+    if (maxBytes !== undefined) {
+      const body = await readBoundedRequestBody(request, maxBytes);
+      if (body instanceof Response) return { success: false, tooLarge: true };
+      return {
+        success: true,
+        value: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body)) as unknown,
+      };
+    }
     return { success: true, value: await request.json() };
   } catch {
     return { success: false };
@@ -520,7 +539,7 @@ function manualRunResponse(requestId: string, result: DispatchManualRunResult): 
         400,
         "invalid_input",
         "Invalid trigger input",
-        `Run ${result.triggerRunId} rejected the submitted input.`,
+        "The submitted input does not match the trigger's declared inputs.",
         result.issues,
       );
     case "dispatch_conflict":

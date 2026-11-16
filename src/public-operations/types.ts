@@ -2,6 +2,7 @@ import type { ApiKeyScope } from "../auth/api-key-contract.js";
 import type { HubBundleFile } from "../config/bundle.js";
 import type { TriggerRunRecord } from "../db/types.js";
 import type { DeploymentProjectResolution } from "../project-deployments/index.js";
+import type { StoredProjectConfiguration } from "../configuration/store.js";
 
 export interface PublicAuthorization {
   kind: "apiKey" | "cliCredential";
@@ -89,7 +90,7 @@ export interface DispatchManualRunInput {
   projectSlug: string;
   expectedVersionId?: string | undefined;
   trigger: string;
-  actor: string;
+  actor?: string | undefined;
   deliveryKey: string;
   input: unknown;
 }
@@ -111,9 +112,9 @@ export type DispatchManualRunResult =
   | { status: "trigger_not_found" }
   | {
       status: "invalid_input";
-      providerEventReceiptId: string;
-      triggerRunId: string;
-      configuredTriggerName: string;
+      providerEventReceiptId?: string;
+      triggerRunId?: string;
+      configuredTriggerName?: string;
       issues: readonly DomainIssue[];
     }
   | { status: "dispatch_conflict" }
@@ -232,6 +233,7 @@ export interface PublicOperationCapabilities {
     }): Promise<{ triggerId: string; name: string; revisionId: string; version: number }>;
   };
   configurationForProject(projectId: string): {
+    getActive(): Promise<StoredProjectConfiguration | undefined>;
     validateBundle(
       files: readonly HubBundleFile[],
     ): Promise<{ valid: true } | { valid: false; validationErrors: unknown }>;
@@ -252,9 +254,9 @@ export interface PublicOperationCapabilities {
   dispatchManualEvent(input: {
     organizationId: string;
     projectId: string;
-    source: "manual.run";
+    source: "manual.run" | "webhook.received";
     deliveryId: string;
     receivedAt: Date;
     payload: unknown;
-  }): Promise<{ providerEventReceiptId: string } | void>;
+  }): Promise<{ providerEventReceiptId: string; replayed?: boolean } | void>;
 }

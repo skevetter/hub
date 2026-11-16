@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
-import { parseInvocation } from "./invocation.js";
+import {
+  parseInvocation,
+  parseStructuredInvocation,
+  type InvocationInputDefinitions,
+} from "./invocation.js";
 
 const inputs = {
   repo: { type: "string" as const, choices: ["paseo", "hub"] },
@@ -138,5 +142,154 @@ describe("provider-neutral message invocation parser", () => {
       prompt: "-- repo=hub investigate",
       inputs: { agent: "codex" },
     });
+  });
+});
+
+describe("structured invocation parser", () => {
+  it("maps only declared fields without interpreting the prompt as headers", () => {
+    const prompt = "repo=paseo count=99  investigate\n";
+    const data = {
+      repo: "hub",
+      count: 2.5,
+      dry: false,
+      extra: { nested: ["untrusted", { agent: "opus" }] },
+    };
+    const original = structuredClone(data);
+    const result = parseStructuredInvocation(prompt, data, requiredInputs);
+    assert.deepEqual(result, {
+      status: "accepted",
+      prompt,
+      inputs: { repo: "hub", count: 2.5, dry: false, agent: "codex" },
+    });
+    assert.ok(Object.isFrozen(result.inputs));
+    assert.deepEqual(data, original);
+  });
+
+  it.each([
+    ["string", 1],
+    ["string", true],
+    ["string", null],
+    ["string", {}],
+    ["string", []],
+    ["number", "1"],
+    ["number", true],
+    ["number", null],
+    ["number", Number.NaN],
+    ["number", Number.POSITIVE_INFINITY],
+    ["number", Number.NEGATIVE_INFINITY],
+    ["boolean", "true"],
+    ["boolean", 1],
+    ["boolean", null],
+  ] as const)("rejects a non-%s value without coercion", (type, value) => {
+    const result = parseStructuredInvocation("unchanged", { field: value }, { field: { type } });
+    assert.equal(result.status, "rejected");
+    if (result.status !== "rejected") throw new Error("expected input rejection");
+    assert.equal(result.prompt, "unchanged");
+    assert.deepEqual(result.rejection, {
+      code: "invalid_type",
+      inputName: "field",
+      expectedType: type,
+    });
+  });
+
+  it.each([
+    ["string", ""],
+    ["number", 0],
+    ["number", -2.5e10],
+    ["boolean", false],
+  ] as const)("accepts a strict %s value", (type, value) => {
+    assert.deepEqual(parseStructuredInvocation("", { field: value }, { field: { type } }), {
+      status: "accepted",
+      prompt: "",
+      inputs: { field: value },
+    });
+  });
+
+  it("applies defaults before checking required inputs", () => {
+    const definitions = {
+      repo: { type: "string", required: true, default: "hub", choices: ["hub"] },
+      count: { type: "number", default: 0 },
+      dry: { type: "boolean", default: false },
+    } satisfies InvocationInputDefinitions;
+    assert.deepEqual(parseStructuredInvocation("request", {}, definitions), {
+      status: "accepted",
+      prompt: "request",
+      inputs: { repo: "hub", count: 0, dry: false },
+    });
+    const missing = parseStructuredInvocation("request", {}, requiredInputs);
+    assert.equal(missing.status, "rejected");
+    if (missing.status === "rejected") {
+      assert.deepEqual(missing.rejection, { code: "missing_required", inputName: "dry" });
+    }
+  });
+
+  it.each([
+    {
+      definition: { type: "number", default: "1" },
+      code: "invalid_default_type",
+    },
+    {
+      definition: { type: "number", default: Number.POSITIVE_INFINITY },
+      code: "invalid_default_type",
+    },
+    {
+      definition: { type: "string", default: "opus", choices: ["codex"] },
+      code: "invalid_default_choice",
+    },
+  ] as const)("rejects an invalid default with $code", ({ definition, code }) => {
+    const result = parseStructuredInvocation("request", {}, { field: definition });
+    assert.equal(result.status, "rejected");
+    if (result.status === "rejected") {
+      assert.equal(result.rejection.code, code);
+      assert.equal(result.rejection.inputName, "field");
+    }
+  });
+
+  it("enforces typed choices and never falls back from an explicit null to a default", () => {
+    const choice = parseStructuredInvocation("request", { repo: "other" }, inputs);
+    assert.equal(choice.status, "rejected");
+    if (choice.status === "rejected") {
+      assert.deepEqual(choice.rejection, {
+        code: "invalid_choice",
+        inputName: "repo",
+        value: "other",
+        choices: ["paseo", "hub"],
+      });
+    }
+    const result = parseStructuredInvocation("request", { agent: null }, inputs);
+    assert.equal(result.status, "rejected");
+    if (result.status === "rejected") {
+      assert.deepEqual(result.rejection, {
+        code: "invalid_type",
+        inputName: "agent",
+        expectedType: "string",
+      });
+    }
+  });
+
+  it("ignores inherited data and inherited definitions", () => {
+    const data: Record<string, unknown> = { agent: "opus" };
+    Object.setPrototypeOf(data, { repo: "hub" });
+    const definitions: Record<string, { type: "string"; required?: boolean }> = {
+      repo: { type: "string", required: true },
+    };
+    Object.setPrototypeOf(definitions, { agent: { type: "string" } });
+    const result = parseStructuredInvocation("request", data, definitions);
+    assert.equal(result.status, "rejected");
+    assert.deepEqual(result.inputs, {});
+    if (result.status === "rejected") {
+      assert.deepEqual(result.rejection, { code: "missing_required", inputName: "repo" });
+    }
+  });
+
+  it("keeps an own declared prototype-named field as data without changing prototypes", () => {
+    const data = { ["__proto__"]: "value", constructor: "ignored" };
+    const definitions = { ["__proto__"]: { type: "string" as const, required: true } };
+    const result = parseStructuredInvocation("", data, definitions);
+    assert.equal(result.status, "accepted");
+    assert.equal(Object.getPrototypeOf(result.inputs), Object.prototype);
+    assert.equal(Object.hasOwn(result.inputs, "__proto__"), true);
+    assert.equal(result.inputs["__proto__"], "value");
+    assert.equal(Object.hasOwn(result.inputs, "constructor"), false);
   });
 });

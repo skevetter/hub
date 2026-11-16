@@ -277,7 +277,7 @@ export const DispatchManualRunRequestSchema = z
     projectSlug: z.string().trim().min(1).max(100),
     expectedVersionId: z.string().uuid().optional(),
     trigger: z.string().trim().min(1).max(200),
-    actor: z.string().trim().min(1).max(200),
+    actor: z.string().trim().min(1).max(200).optional(),
     deliveryKey: z.string().trim().min(1).max(200),
     input: z.unknown(),
   })

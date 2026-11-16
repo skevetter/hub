@@ -1,6 +1,7 @@
 import type { Locks } from "./runtime/locks/index.js";
 import { and, eq, isNull, or, lte, sql, isNotNull } from "drizzle-orm";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
+import { ManualRunRejected } from "../triggers/manual/provider.js";
 import type { DatabaseRuntime, DrizzleHandle } from "./runtime/index.js";
 import * as schema from "./schema.js";
 import { ConnectionRepository, replaceGitHubRepositories } from "./connections.js";
@@ -169,10 +170,11 @@ export class ProviderEventAcceptanceRepository {
       if (existing !== undefined) {
         const route = parseAcceptedRoutes(existing.acceptedRoutes)?.[0];
         if (route === undefined) {
-          return { status: "duplicate", providerEventReceiptId: existing.id };
+          return { status: "duplicate", providerEventReceiptId: existing.id, replayed: true };
         }
         return {
           status: "accepted",
+          replayed: true,
           event: eventFromReceipt(existing, route),
         };
       }
@@ -187,7 +189,7 @@ export class ProviderEventAcceptanceRepository {
           ),
         );
       if (project?.configurationRevisionId === null || project === undefined) {
-        throw new Error("manual project configuration unavailable");
+        throw new ManualRunRejected("configuration_not_found");
       }
       const route: ProviderEventRouteSnapshot = {
         projectId: input.projectId,
@@ -206,9 +208,13 @@ export class ProviderEventAcceptanceRepository {
         const duplicate = await findReceipt(transaction, input, input.organizationId);
         const duplicateRoute = parseAcceptedRoutes(duplicate?.acceptedRoutes)?.[0];
         if (duplicate === undefined || duplicateRoute === undefined) {
-          return { status: "duplicate", providerEventReceiptId: receipt.id };
+          return { status: "duplicate", providerEventReceiptId: receipt.id, replayed: true };
         }
-        return { status: "accepted", event: eventFromReceipt(duplicate, duplicateRoute) };
+        return {
+          status: "accepted",
+          event: eventFromReceipt(duplicate, duplicateRoute),
+          replayed: true,
+        };
       }
       await transaction
         .update(schema.providerEventReceipts)

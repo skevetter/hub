@@ -2,7 +2,12 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "vitest";
 import type { DurableProviderEvent } from "../../db/types.js";
 import { createMemoryDatabase } from "../../db/memory.js";
-import { createManualTriggerSource, handleManualTriggerRequest } from "./source.js";
+import type { TriggerDispatchOutcome, TriggerHandler, TriggerSource } from "../index.js";
+import {
+  createManualTriggerSource,
+  dispatchManualTrigger,
+  handleManualTriggerRequest,
+} from "./source.js";
 
 describe("manual trigger source", () => {
   it("passes arbitrary provider-namespaced payloads to the handler", async () => {
@@ -55,6 +60,109 @@ describe("manual trigger source", () => {
       },
     );
   });
+
+  it.each(["void", "result"] as const)(
+    "propagates replay flags when the handler returns %s",
+    async (resultKind) => {
+      let handlerResult: TriggerDispatchOutcome | undefined;
+      const manual = await ManualTriggers.recording(async (event) => {
+        handlerResult =
+          resultKind === "void"
+            ? undefined
+            : { providerEventReceiptId: event.providerEventReceiptId, replayed: false };
+        return handlerResult;
+      });
+      const delivery = {
+        organizationId: "org_1",
+        projectId: manual.projectId,
+        source: "webhook.received",
+        deliveryId: "replayed-delivery",
+        payload: { input: "original" },
+      };
+      const fresh = await manual.dispatch(delivery);
+      assert.equal(fresh, handlerResult);
+      const replayed = await manual.dispatch({
+        ...delivery,
+        source: "manual.run",
+        payload: { input: "replacement" },
+      });
+      assert.deepEqual(replayed, {
+        providerEventReceiptId: manual.events()[0]?.providerEventReceiptId,
+        replayed: true,
+      });
+      assert.deepEqual(manual.received(), [delivery, delivery]);
+    },
+  );
+
+  it("redispatches the original event after a handler failure", async () => {
+    let calls = 0;
+    const manual = await ManualTriggers.recording(async () => {
+      if (++calls === 1) throw new Error("dispatch interrupted");
+    });
+    const delivery = {
+      organizationId: "org_1",
+      projectId: manual.projectId,
+      source: "webhook.received",
+      deliveryId: "interrupted-delivery",
+      payload: { input: "original" },
+    };
+    await assert.rejects(manual.dispatch(delivery), /dispatch interrupted/);
+    assert.deepEqual(await manual.dispatch(delivery), {
+      providerEventReceiptId: manual.events()[0]?.providerEventReceiptId,
+      replayed: true,
+    });
+    assert.equal(calls, 2);
+    assert.deepEqual(manual.events()[0], manual.events()[1]);
+  });
+
+  it("retains replay flags without a running handler and recovers after restart", async () => {
+    const manual = await ManualTriggers.recording();
+    await manual.source.stop();
+    const delivery = {
+      organizationId: "org_1",
+      projectId: manual.projectId,
+      source: "manual.run",
+      deliveryId: "stopped-delivery",
+      payload: {},
+    };
+    const fresh = await manual.dispatch(delivery);
+    assert.ok(fresh);
+    assert.notEqual(fresh.replayed, true);
+    assert.deepEqual(await manual.dispatch(delivery), { ...fresh, replayed: true });
+    const recovered: DurableProviderEvent[] = [];
+    await manual.source.start(async (event) => {
+      recovered.push(event);
+    });
+    assert.deepEqual(await manual.dispatch(delivery), { ...fresh, replayed: true });
+    assert.equal(recovered.length, 1);
+    assert.equal(recovered[0]?.providerEventReceiptId, fresh.providerEventReceiptId);
+  });
+
+  it("returns the replay flag for a receipt without accepted routes", async () => {
+    const database = createMemoryDatabase();
+    database.persistManualEvent = async () => ({
+      status: "duplicate",
+      providerEventReceiptId: "unrouted-receipt",
+      replayed: true,
+    });
+    const source = createManualTriggerSource(database);
+    let called = false;
+    await source.start(async () => {
+      called = true;
+    });
+    assert.deepEqual(
+      await dispatchManualTrigger(source, {
+        organizationId: "org_1",
+        projectId: "00000000-0000-4000-8000-000000000001",
+        source: "manual.run",
+        deliveryId: "unrouted-delivery",
+        payload: {},
+        receivedAt: new Date(0),
+      }),
+      { providerEventReceiptId: "unrouted-receipt", replayed: true },
+    );
+    assert.equal(called, false);
+  });
 });
 
 interface ManualDelivery {
@@ -69,11 +177,11 @@ class ManualTriggers {
   private readonly handled: DurableProviderEvent[] = [];
 
   private constructor(
-    private readonly source: ReturnType<typeof createManualTriggerSource>,
+    readonly source: TriggerSource,
     readonly projectId: string,
   ) {}
 
-  static async recording(): Promise<ManualTriggers> {
+  static async recording(handler?: TriggerHandler): Promise<ManualTriggers> {
     const database = createMemoryDatabase();
     const project = await database.createProject({
       organizationId: "org_1",
@@ -92,6 +200,7 @@ class ManualTriggers {
     const manual = new ManualTriggers(createManualTriggerSource(database), project.id);
     await manual.source.start(async (trigger) => {
       manual.handled.push(trigger);
+      return handler?.(trigger);
     });
     return manual;
   }
@@ -107,6 +216,14 @@ class ManualTriggers {
       "trigger",
     );
     return { status: response.status, body: await response.json() };
+  }
+
+  dispatch(delivery: ManualDelivery) {
+    return dispatchManualTrigger(this.source, { ...delivery, receivedAt: new Date(0) });
+  }
+
+  events() {
+    return this.handled;
   }
 
   received(): ManualDelivery[] {

@@ -19,6 +19,7 @@ export interface ExternalTrigger {
 
 export interface TriggerDispatchOutcome {
   providerEventReceiptId: string;
+  replayed?: boolean;
 }
 
 export type TriggerHandler = (

@@ -111,6 +111,49 @@ export function parseInvocation(
     return rejected(prompt, inputs, consumed.reason.message, consumed.reason.rejection);
   }
 
+  return completeInvocation(prompt, definitions, inputs);
+}
+
+export function parseStructuredInvocation(
+  prompt: string,
+  data: Readonly<Record<string, unknown>>,
+  definitions: InvocationInputDefinitions,
+): InvocationParseResult {
+  const inputs: Record<string, JsonPrimitive> = {};
+  Object.setPrototypeOf(inputs, null);
+  for (const [name, definition] of Object.entries(definitions)) {
+    if (!Object.hasOwn(data, name)) continue;
+    const value = data[name];
+    if (!isValueForType(value, definition.type)) {
+      const rejection: InvocationRejection = {
+        code: "invalid_type",
+        inputName: name,
+        expectedType: definition.type,
+      };
+      return rejected(prompt, inputs, formatInvocationRejection(rejection), rejection);
+    }
+    if (
+      definition.choices !== undefined &&
+      !definition.choices.some((choice) => choice === value)
+    ) {
+      const rejection: InvocationRejection = {
+        code: "invalid_choice",
+        inputName: name,
+        value,
+        choices: definition.choices,
+      };
+      return rejected(prompt, inputs, formatInvocationRejection(rejection), rejection);
+    }
+    inputs[name] = value;
+  }
+  return completeInvocation(prompt, definitions, inputs);
+}
+
+function completeInvocation(
+  prompt: string,
+  definitions: InvocationInputDefinitions,
+  inputs: Record<string, JsonPrimitive>,
+): InvocationParseResult {
   const defaults = applyDefaults(definitions, inputs);
   if (defaults !== undefined) {
     return rejected(prompt, inputs, defaults.message, defaults.rejection);
@@ -291,7 +334,7 @@ function removeMention(parserMessage: string, mention: string | undefined): stri
   return message.slice(mention.length).trimStart();
 }
 
-function isValueForType(value: JsonPrimitive, type: InvocationInputType): boolean {
+function isValueForType(value: unknown, type: InvocationInputType): value is JsonPrimitive {
   if (type === "string") return typeof value === "string";
   if (type === "number") return typeof value === "number" && Number.isFinite(value);
   return typeof value === "boolean";

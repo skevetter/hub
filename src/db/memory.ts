@@ -3,6 +3,7 @@ import type { AgentExecutionStatus, MachineStatus } from "./schema.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
+import { ManualRunRejected } from "../triggers/manual/provider.js";
 import { launchedAgent } from "./mappers.js";
 import type {
   AgentExecutionRecord,
@@ -1211,10 +1212,15 @@ class MemoryDatabase implements Database {
       const receipt = this.providerEventReceipts.get(existing);
       const route = receipt?.acceptedRoutes?.[0];
       if (receipt === undefined || route === undefined) {
-        return { status: "duplicate" as const, providerEventReceiptId: existing };
+        return {
+          status: "duplicate" as const,
+          providerEventReceiptId: existing,
+          replayed: true,
+        };
       }
       return {
         status: "accepted" as const,
+        replayed: true,
         event: {
           providerEventReceiptId: receipt.id,
           organizationId: receipt.organizationId,
@@ -1232,9 +1238,10 @@ class MemoryDatabase implements Database {
     const project = this.projects.get(input.projectId);
     if (
       project?.organizationId !== input.organizationId ||
+      project.status !== "active" ||
       project.activeConfigurationRevisionId === null
     ) {
-      throw new Error("manual project configuration unavailable");
+      throw new ManualRunRejected("configuration_not_found");
     }
     const receipt = this.insertProviderEventReceipt({
       organizationId: input.organizationId,

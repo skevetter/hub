@@ -367,6 +367,7 @@ async function installHarness(validator?: DaemonAgentConfigurationValidator) {
   const store = new ProjectConfigurationStore(database, project.id, validator);
   const operations = createPublicOperations(createDatabasePublicOperationRepository(database), {
     configurationForProject: () => ({
+      getActive: () => store.getActive(),
       validateBundle: (bundle) => store.validateBundle(bundle),
       async insertManualBundleRevision(input) {
         insertions += 1;
