@@ -1,3 +1,4 @@
+import type { RunTimelineStore } from "../run-timeline/store.js";
 import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
 import type { JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
@@ -1221,7 +1222,7 @@ export interface TerminateMachineFields {
   reason: string;
 }
 
-export interface Database {
+export interface Database extends RunTimelineStore {
   readonly executionAuthority: import("../execution-authority/index.js").ExecutionAuthorityStore;
   readonly schedules: import("../triggers/schedule/index.js").ScheduleStore;
   readonly githubNotifications: import("../triggers/github-notifications/index.js").GitHubNotificationStore;

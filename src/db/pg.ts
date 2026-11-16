@@ -1,3 +1,5 @@
+import { RunTimelineRepository } from "../run-timeline/postgres-store.js";
+import type { RunTimelineStore } from "../run-timeline/store.js";
 import { ExecutionAuthorityRepository } from "../execution-authority/index.js";
 import { ScheduleRepository } from "../triggers/schedule/index.js";
 import { GitHubNotificationRepository } from "../triggers/github-notifications/index.js";
@@ -146,12 +148,85 @@ class PgDatabase implements Database {
   readonly executionAuthority;
   private readonly connections;
   private readonly triggerAcceptance;
+  private readonly timeline;
+  appendRunTimelineEvent: RunTimelineStore["appendRunTimelineEvent"] = (input) =>
+    this.timeline.appendRunTimelineEvent(input);
+  listRunTimelineEvents: RunTimelineStore["listRunTimelineEvents"] = (
+    organizationId,
+    runId,
+    page,
+  ) => this.timeline.listRunTimelineEvents(organizationId, runId, page);
+  readRunTimelineState: RunTimelineStore["readRunTimelineState"] = (organizationId, runId) =>
+    this.timeline.readRunTimelineState(organizationId, runId);
+  expireRunTimelines: RunTimelineStore["expireRunTimelines"] = (cutoff, batch) =>
+    this.timeline.expireRunTimelines(cutoff, batch);
+  insertRunProgressMessageIfAbsent: RunTimelineStore["insertRunProgressMessageIfAbsent"] = (
+    input,
+  ) => this.timeline.insertRunProgressMessageIfAbsent(input);
+  findRunProgressMessage: RunTimelineStore["findRunProgressMessage"] = (organizationId, runId) =>
+    this.timeline.findRunProgressMessage(organizationId, runId);
+  acquireRunProgressLease: RunTimelineStore["acquireRunProgressLease"] = (input) =>
+    this.timeline.acquireRunProgressLease(input);
+  updateRunProgressMessage: RunTimelineStore["updateRunProgressMessage"] = (input) =>
+    this.timeline.updateRunProgressMessage(input);
+  listRunProgressMessagesToFinish: RunTimelineStore["listRunProgressMessagesToFinish"] = (
+    now,
+    limit,
+  ) => this.timeline.listRunProgressMessagesToFinish(now, limit);
+  requestCompensation: RunTimelineStore["requestCompensation"] = (
+    organizationId,
+    runId,
+    notBefore,
+  ) => this.timeline.requestCompensation(organizationId, runId, notBefore);
+  completeCompensation: RunTimelineStore["completeCompensation"] = (
+    organizationId,
+    runId,
+    observedGen,
+  ) => this.timeline.completeCompensation(organizationId, runId, observedGen);
+
+  async findTriggerRunForOrganization(organizationId: string, runId: string) {
+    const rows = await query<TriggerRunRow>(
+      this.pool,
+      `select * from trigger_runs where organization_id = $1 and id = $2`,
+      [organizationId, runId],
+    );
+    return rows.rows[0] === undefined ? undefined : toTriggerRunRecord(rows.rows[0]);
+  }
+
+  async resolveRunForExecution(executionId: string) {
+    return (
+      await query<{ triggerRunId: string; organizationId: string; stepId: string }>(
+        this.pool,
+        `select run.id as "triggerRunId", run.organization_id as "organizationId", step.step_id as "stepId"
+       from agent_executions execution join workflow_step_runs step on step.id = execution.workflow_step_run_id
+       join trigger_runs run on run.id = step.trigger_run_id where execution.id = $1`,
+        [executionId],
+      )
+    ).rows[0];
+  }
+
+  async listUnsealedTerminalRuns(olderThan: Date, cutoff: Date, limit: number) {
+    return (
+      await query<TriggerRunRow>(
+        this.pool,
+        `select run.* from trigger_runs run
+      left join run_timeline_state state on state.trigger_run_id = run.id
+      where run.outcome = 'accepted' and run.status <> 'running' and run.completed_at >= $2
+        and run.completed_at < $1 and state.sealed_seq is null and state.expired_at is null
+      order by run.completed_at, run.id limit $3`,
+        [olderThan, cutoff, limit],
+      )
+    ).rows
+      .map(toTriggerRunRecord)
+      .filter((run): run is AcceptedTriggerRunRecord => run.outcome === "accepted");
+  }
 
   constructor(
     private readonly pool: DatabaseRuntime,
     private readonly locks: Locks,
   ) {
     this.schedules = new ScheduleRepository(this.pool);
+    this.timeline = new RunTimelineRepository(this.pool);
     this.githubNotifications = new GitHubNotificationRepository(this.pool, locks);
     this.executionAuthority = new ExecutionAuthorityRepository(this.pool);
     this.connections = new ConnectionRepository(this.pool, locks);
