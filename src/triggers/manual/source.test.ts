@@ -112,7 +112,9 @@ describe("manual trigger source", () => {
       replayed: true,
     });
     assert.equal(calls, 2);
-    assert.deepEqual(manual.events()[0], manual.events()[1]);
+    const [original, replay] = manual.events();
+    assert.ok(original);
+    assert.deepEqual(replay, { ...original, manualRetryAuthorization: null });
   });
 
   it("retains replay flags without a running handler and recovers after restart", async () => {

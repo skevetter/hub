@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { describe, it } from "vitest";
+import { z } from "zod";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
 import { OrganizationTriggerStore } from "../triggers/store.js";
@@ -21,6 +22,7 @@ function manualRequest(
   trigger: string,
   deliveryKey: string,
   actor = "sender",
+  message = "Original event",
 ) {
   return api.handle(
     new Request("http://hub.test/api/v1/manual-runs", {
@@ -31,7 +33,7 @@ function manualRequest(
         trigger,
         actor,
         deliveryKey,
-        input: { message: "Original event" },
+        input: { message },
       }),
     }),
   );
@@ -228,4 +230,96 @@ describe("manual authorization against the persisted revision", () => {
       await hub.close();
     }
   }, 120_000);
+
+  it.each(["manual", "webhook"] as const)(
+    "preserves original %s attribution when another permitted actor recovers a pending script",
+    async (path) => {
+      const hub = await webhookFixture();
+      try {
+        const trigger = await hub.save("shared-attribution", {
+          script: true,
+          actor: "sender, outsider",
+        });
+        const sender = await hub.createKey(["runs:dispatch", "events:send"], { actor: "sender" });
+        const outsider = await hub.createKey(["runs:dispatch", "events:send"], {
+          actor: "outsider",
+        });
+        const deliveryKey = randomUUID();
+        const deliver = (secret: string, actor: string, message: string) =>
+          path === "manual"
+            ? manualRequest(
+                hub.application.publicApi,
+                secret,
+                trigger.name,
+                deliveryKey,
+                actor,
+                message,
+              )
+            : hub.send(trigger.name, { message }, { secret, deliveryKey });
+        const persist = hub.database.persistManualEvent.bind(hub.database);
+        let receiptId: string | undefined;
+        hub.database.persistManualEvent = async (input) => {
+          const result = await persist(input);
+          if (result.status === "accepted") receiptId = result.event.providerEventReceiptId;
+          throw new Error("Interrupted before provider matching");
+        };
+        let interrupted: Response;
+        try {
+          interrupted = await deliver(sender.secret, "sender", "Original attribution");
+        } finally {
+          hub.database.persistManualEvent = persist;
+        }
+        assert.equal(interrupted.status, 500);
+        assert.ok(receiptId);
+        const original = await hub.database.findProviderEventReceiptById(receiptId);
+        assert.ok(original);
+        assert.deepEqual(await hub.database.findTriggerRunsByProviderEventReceiptId(receiptId), []);
+        const replay = await deliver(outsider.secret, "outsider", "Replacement must not run");
+        assert.equal(replay.status, 200);
+        const runs = await hub.database.findTriggerRunsByProviderEventReceiptId(receiptId);
+        assert.equal(runs.length, 1);
+        const run = runs[0];
+        assert.ok(run);
+        assert.equal(run.prompt, "Original attribution");
+        const originalPayload = z
+          .object({
+            actor: z.string(),
+            input: z.unknown(),
+            data: z.unknown().optional(),
+            authenticatedBy: z.object({ credentialId: z.string() }),
+          })
+          .parse(original.payload);
+        assert.equal(originalPayload.actor, "sender");
+        assert.equal(originalPayload.authenticatedBy.credentialId, sender.summary.id);
+        const context = z
+          .object({
+            event: z.object({
+              manual: z.object({ actor: z.string(), input: z.string(), data: z.unknown() }),
+            }),
+          })
+          .parse(run.triggerContext);
+        assert.equal(context.event.manual.actor, originalPayload.actor);
+        assert.equal(context.event.manual.input, run.prompt);
+        assert.deepEqual(
+          context.event.manual.data,
+          path === "manual" ? originalPayload.input : originalPayload.data,
+        );
+        assert.equal(z.object({ actor: z.string() }).parse(run.outputContext).actor, "sender");
+        assert.deepEqual(await hub.database.findProviderEventReceiptById(receiptId), original);
+        const activity = await hub.database.findOrganizationActivityRun("webhook-a", run.id);
+        assert.ok(activity);
+        assert.deepEqual(activity.receipt, original);
+        const activityActor = z.object({ actor: z.string() }).parse(activity.receipt.payload).actor;
+        assert.equal(context.event.manual.actor, activityActor);
+        const listed = (
+          await hub.database.listProjectActivityRuns(trigger.runtimeProjectId, 10)
+        ).find((entry) => entry.run.id === run.id);
+        assert.ok(listed);
+        if (path === "webhook") assert.equal(listed.webhookActor, activityActor);
+      } finally {
+        await hub.close();
+      }
+    },
+    120_000,
+  );
 });

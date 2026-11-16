@@ -99,7 +99,7 @@ export async function dispatchManualTrigger(
   );
   const event =
     persisted.replayed === true
-      ? reauthorizeManualReplay(persisted.event, trigger)
+      ? withManualRetryAuthorization(persisted.event, trigger)
       : persisted.event;
   const outcome = await state.handler(event);
   return persisted.replayed === true
@@ -111,26 +111,10 @@ export async function dispatchManualTrigger(
     : outcome;
 }
 
-function reauthorizeManualReplay(
-  event: DurableProviderEvent,
-  request: ManualTriggerInput,
-): DurableProviderEvent {
+function withManualRetryAuthorization(event: DurableProviderEvent, request: ManualTriggerInput) {
   if (event.source !== "manual.run" && event.source !== "webhook.received") return event;
-  const payload = event.payload;
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return event;
   const identity = ReplayIdentitySchema.safeParse(request.payload);
-  if (identity.success) {
-    return {
-      ...event,
-      payload: {
-        ...payload,
-        actor: identity.data.actor,
-        authenticatedBy: identity.data.authenticatedBy,
-      },
-    };
-  }
-  if (!Object.hasOwn(payload, "authenticatedBy")) return event;
-  return { ...event, payload: { ...payload, authenticatedBy: undefined } };
+  return { ...event, manualRetryAuthorization: identity.success ? identity.data : null };
 }
 
 async function handleManualRequest(request: Request, source: TriggerSource): Promise<Response> {

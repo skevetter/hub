@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { ProjectConfigurationStore } from "../../configuration/store.js";
-import { isScriptStep } from "../../config/compiler.js";
+import { isScriptStep, type CompiledTrigger } from "../../config/compiler.js";
 import { type TriggerProvider, type TriggerProviderMatch } from "../index.js";
 import {
   formatInvocationRejection,
@@ -30,6 +30,7 @@ export const ManualRunPayloadSchema = z.object({
 });
 
 export type ManualRunPayload = z.infer<typeof ManualRunPayloadSchema>;
+export type ManualRunIdentity = Pick<ManualRunPayload, "actor" | "authenticatedBy">;
 
 const MAX_MANUAL_CONTEXT_BYTES = 64 * 1024;
 
@@ -153,18 +154,7 @@ export function createManualRunProvider(
         (candidate) => candidate.name === payload.trigger && candidate.on === "manual.run",
       );
       if (!trigger) throw new ManualRunRejected("trigger_not_found");
-      if (
-        trigger.steps.some(isScriptStep) &&
-        (payload.authenticatedBy?.kind !== "api-key" ||
-          payload.authenticatedBy.boundActor !== payload.actor)
-      ) {
-        throw new ManualRunRejected("key_actor_required");
-      }
-      if (
-        !trigger.filters?.from_users?.includes("*") &&
-        !trigger.filters?.from_users?.includes(payload.actor)
-      )
-        throw new ManualRunRejected("actor_forbidden");
+      authorizeManualTrigger(trigger, payload, external.manualRetryAuthorization);
       const invocation = parseManualInvocation(payload, trigger.inputs);
       const triggerContext = createManualRunContext(
         payload,
@@ -202,6 +192,30 @@ export function createManualRunProvider(
       return triggerContext.event;
     },
   };
+}
+
+function authorizeManualTrigger(
+  trigger: CompiledTrigger,
+  payload: ManualRunPayload,
+  retry: ManualRunIdentity | null | undefined,
+): void {
+  if (retry === null) throw new ManualRunRejected("key_actor_required");
+  const identity = retry ?? payload;
+  if (
+    trigger.steps.some(isScriptStep) &&
+    (identity.authenticatedBy?.kind !== "api-key" ||
+      identity.authenticatedBy.boundActor !== identity.actor)
+  ) {
+    throw new ManualRunRejected("key_actor_required");
+  }
+  const users = trigger.filters?.from_users;
+  if (users?.includes("*")) return;
+  if (
+    !users?.includes(payload.actor) ||
+    (identity.actor !== payload.actor && !users?.includes(identity.actor))
+  ) {
+    throw new ManualRunRejected("actor_forbidden");
+  }
 }
 
 function createManualRunContext(

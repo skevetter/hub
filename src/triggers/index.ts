@@ -3,6 +3,7 @@ import type { JsonValue } from "../config/compiler.js";
 import type { WorktreeTarget } from "../config/index.js";
 import type { InvocationParseResult } from "./invocation.js";
 import type { ProviderEventDropReasonCode } from "./drop-reason.js";
+import type { ManualRunIdentity } from "./manual/provider.js";
 
 export interface ExternalTrigger {
   providerEventReceiptId: string;
@@ -15,6 +16,7 @@ export interface ExternalTrigger {
   payload: unknown;
   connectionId?: string | null;
   resourceId?: string | null;
+  manualRetryAuthorization?: ManualRunIdentity | null;
 }
 
 export interface TriggerDispatchOutcome {
