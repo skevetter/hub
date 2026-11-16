@@ -62,6 +62,24 @@ describe("activity run detail", () => {
     assert.match(markup, /No steps/u);
   });
 
+  it("renders a successful script result", () => {
+    const markup = render({
+      ...detail,
+      steps: [
+        {
+          ...step,
+          status: "succeeded",
+          failureReason: null,
+          output: { exit_code: 0, output_tail: "build complete", truncated: false },
+        },
+      ],
+    });
+    assert.match(markup, /Succeeded/u);
+    assert.match(markup, /Exit code 0/u);
+    assert.match(markup, /build complete/u);
+    assert.match(markup, /Everything the script printed/u);
+  });
+
   it("renders ordered steps, script results, and absent output", () => {
     const markup = render({
       ...detail,

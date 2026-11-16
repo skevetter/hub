@@ -142,6 +142,19 @@ describe("project dashboard activity read models", () => {
       deadlineAt: new Date("2026-08-06T13:00:00.000Z"),
       stepIds: ["step"],
     });
+    const storedActivity = await database.findOrganizationActivityRun("org-1", run.run.id);
+    assert.ok(storedActivity);
+    assert.equal(storedActivity.run.id, run.run.id);
+    assert.deepEqual(storedActivity.receipt.payload, rawPayload);
+    assert.deepEqual(
+      storedActivity.steps.map((step) => step.stepId),
+      ["step"],
+    );
+    assert.equal(await database.findOrganizationActivityRun("org-2", run.run.id), undefined);
+    assert.equal(
+      await database.findOrganizationActivityRun("org-1", "00000000-0000-4000-8000-000000000000"),
+      undefined,
+    );
     const unroutedPayload = { body: "unrouted-".repeat(20_000) };
     const unroutedReceipt = await database.persistManualEvent({
       organizationId: "org-1",
