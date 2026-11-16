@@ -94,7 +94,7 @@ async function forwardRequest(
 ): Promise<void> {
   try {
     const clientAddress = resolveClientAddress(incoming, options.trustedClientIpHeader);
-    const request = toRequest(incoming, clientAddress, options);
+    const request = toRequest(incoming, outgoing, clientAddress, options);
     const tracked = await runWithFailureTracking(async () => {
       const response = await fetchHandler(request);
       return { response, failureReported: failureWasReported() };
@@ -167,6 +167,7 @@ async function forwardRequest(
     if (responseRequestId !== undefined) outgoing.setHeader("x-request-id", responseRequestId);
     const cookies = response.headers.getSetCookie();
     if (cookies.length > 0) outgoing.setHeader("set-cookie", cookies);
+    if (!outgoing.shouldKeepAlive) outgoing.setHeader("connection", "close");
     if (response.body === null) {
       responseForwarded = true;
       outgoing.end();
@@ -304,6 +305,7 @@ function safeRequestPath(value: string | undefined): string {
 
 function toRequest(
   incoming: IncomingMessage,
+  outgoing: ServerResponse,
   clientAddress: string,
   options: FetchServerOptions,
 ): Request {
@@ -318,7 +320,7 @@ function toRequest(
   }
   const streaming = {
     ...base,
-    body: requestBody(incoming),
+    body: requestBody(incoming, outgoing),
     duplex: "half",
   } satisfies StreamingRequestInit;
   return new Request(new URL(incoming.url ?? "/", origin), streaming);
@@ -336,26 +338,63 @@ function resolveClientAddress(
   return isIP(address) === 0 ? peerAddress : address;
 }
 
-function requestBody(incoming: IncomingMessage): ReadableStream<Uint8Array> {
-  let iterator: AsyncIterator<unknown> | undefined;
+function requestBody(
+  incoming: IncomingMessage,
+  outgoing: ServerResponse,
+): ReadableStream<Uint8Array> {
+  let stopped = false;
+  let controller: ReadableByteStreamController;
+  const cleanup = () => {
+    stopped = true;
+    incoming.off("readable", onReadable);
+    incoming.off("end", onEnd);
+    incoming.off("error", onError);
+    incoming.off("close", onClose);
+  };
+  const onEnd = () => {
+    if (stopped) return;
+    cleanup();
+    controller.close();
+  };
+  const onError = (error: unknown) => {
+    if (stopped) return;
+    cleanup();
+    controller.error(error);
+  };
+  const onClose = () => {
+    if (incoming.readableEnded) onEnd();
+    else onError(new Error("Request body closed before completion"));
+  };
+  const onReadable = () => {
+    if (stopped) return;
+    try {
+      const chunk: unknown = incoming.read();
+      if (chunk === null) {
+        if (incoming.readableEnded) onEnd();
+        else incoming.once("readable", onReadable);
+      } else {
+        controller.enqueue(readChunk(chunk));
+      }
+    } catch (error) {
+      onError(error);
+    }
+  };
   const source = {
     type: "bytes",
-    async pull(controller) {
-      iterator ??= incoming[Symbol.asyncIterator]();
-      try {
-        const chunk = await iterator.next();
-        if (chunk.done) {
-          controller.close();
-          return;
-        }
-        controller.enqueue(readChunk(chunk.value));
-      } catch (error) {
-        controller.error(error);
-      }
+    start(bodyController) {
+      controller = bodyController;
+      incoming.once("end", onEnd);
+      incoming.once("error", onError);
+      incoming.once("close", onClose);
     },
-    async cancel() {
-      await iterator?.return?.();
-      incoming.destroy();
+    pull: onReadable,
+    cancel() {
+      cleanup();
+      incoming.read(0);
+      incoming.pause();
+      incoming.socket.pause();
+      outgoing.shouldKeepAlive = false;
+      if (!outgoing.headersSent) outgoing.setHeader("connection", "close");
     },
   } satisfies UnderlyingByteSource;
   return new ReadableStream(source);
