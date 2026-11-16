@@ -241,7 +241,7 @@ export class RunTimelineReconciler {
       }
       counts[step.status] += 1;
       terminalCount += 1;
-      if (terminalCount <= 100 && !(await this.appendStepEnd(context, step, step.status))) return;
+      if (!(await this.appendStepEnd(context, step, step.status))) return;
     }
     if (run.status === "running") return;
     const endedAt = run.completedAt ?? context.now;

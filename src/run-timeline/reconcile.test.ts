@@ -512,6 +512,73 @@ describe.each(backends)("timeline reconciliation (%s)", (_name, open) => {
     assert.deepEqual(await database.listWorkflowStepRunsForTriggerRun(run.id), before);
   });
 
+  it("refreshes the live omission count when the 101st terminal step completes without ordinary overflow", async () => {
+    const run = await acceptedRun(
+      harness,
+      Array.from({ length: 101 }, (_, index) => `live-${index}`),
+    );
+    await capture(database, run.id);
+    const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
+    for (const step of steps.slice(0, 100))
+      await database.markWorkflowStepSkipped(run.id, step.stepId, "condition false");
+    const { reconciler } = components(database);
+    await reconciler.reconcile(ORGANIZATION, run.id);
+    assert.equal((await database.readRunTimelineState(ORGANIZATION, run.id))?.stepRowsOmitted, 0);
+    assert.equal(
+      (await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE)).some(
+        (row) => row.kind === "truncated",
+      ),
+      false,
+    );
+    await database.markWorkflowStepSkipped(run.id, steps[100]!.stepId, "condition false");
+    const before = await database.listWorkflowStepRunsForTriggerRun(run.id);
+    await reconciler.reconcile(ORGANIZATION, run.id);
+    const state = await database.readRunTimelineState(ORGANIZATION, run.id);
+    const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
+    assert.equal(state?.stepRowsOmitted, 1);
+    assert.equal(state?.stepEndCount, 100);
+    assert.equal(state?.droppedCount, 0);
+    assert.equal(state?.sealedSeq, null);
+    assert.equal(rows.filter((row) => row.kind === "truncated").length, 1);
+    assert.equal(
+      rows.some((row) => row.kind === "run_finished"),
+      false,
+    );
+    assert.deepEqual(await database.listWorkflowStepRunsForTriggerRun(run.id), before);
+  });
+
+  it("stores one omission notice for 150 terminal steps without any ordinary overflow", async () => {
+    const run = await acceptedRun(
+      harness,
+      Array.from({ length: 150 }, (_, index) => `notice-${index}`),
+    );
+    await capture(database, run.id);
+    const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
+    for (const step of steps)
+      await database.markWorkflowStepSkipped(run.id, step.stepId, "condition false");
+    await database.succeedTriggerRun(run.id);
+    const before = await database.listWorkflowStepRunsForTriggerRun(run.id);
+    await components(database).reconciler.reconcile(ORGANIZATION, run.id);
+    const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
+    const state = await database.readRunTimelineState(ORGANIZATION, run.id);
+    assert.equal(rows.filter((row) => row.kind === "step_finished").length, 100);
+    assert.equal(rows.filter((row) => row.kind === "truncated").length, 1);
+    assert.equal(state?.droppedCount, 0);
+    assert.equal(state?.stepRowsOmitted, 50);
+    assert.equal(finishRow(rows).data["stepRowsOmitted"], 50);
+    assert.deepEqual(finishRow(rows).data["steps"], {
+      succeeded: 0,
+      failed: 0,
+      timed_out: 0,
+      skipped: 150,
+      not_run: 0,
+      total: 150,
+    });
+    assert.equal(state?.sealedSeq, finishRow(rows).seq);
+    assert.ok(rows.reduce((sum, row) => sum + jsonbBytes(row.data), 0) <= 248448);
+    assert.deepEqual(await database.listWorkflowStepRunsForTriggerRun(run.id), before);
+  });
+
   it("keeps 100 ordinal step ends and all 150 counts after ordinary bytes are exhausted by large rows", async () => {
     const run = await acceptedRun(
       harness,
