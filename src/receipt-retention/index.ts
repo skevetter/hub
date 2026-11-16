@@ -47,6 +47,7 @@ export class ReceiptRetention {
          delete from provider_event_receipts receipts
          using candidates
          where receipts.id = candidates.id
+           and receipts.source <> 'webhook.received'
            and receipts.received_at < $2
            and receipts.dropped_reason = any($4::text[])
            and not exists (

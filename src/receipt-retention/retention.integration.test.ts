@@ -41,6 +41,11 @@ describe("unhandled receipt retention", () => {
           'retention', 'github', 'retained-' || n, 'github.push', '{}',
           '2026-10-26T00:00:00Z', 'no_project_route' from generate_series(1, 501) n;
         insert into provider_event_receipts
+          (id, organization_id, provider, delivery_id, source, payload, received_at, dropped_reason)
+        select ('00000000-0000-4000-7000-' || lpad(n::text, 12, '0'))::uuid,
+          'retention', 'manual', 'retained-webhook-' || n, 'webhook.received', '{"status":"passed"}',
+          '2026-10-01T00:00:00Z', 'trigger_filters_rejected' from generate_series(1, 501) n;
+        insert into provider_event_receipts
           (organization_id, provider, delivery_id, source, payload, received_at, dropped_reason, accepted_routes)
         values
           ('retention', 'github', 'young', 'github.push', '{}', '2026-10-26T00:00:00Z', 'no_project_route', null),
@@ -86,7 +91,7 @@ describe("unhandled receipt retention", () => {
           assert.ok(passes < 10, "cleanup must advance beyond retained receipts");
         }
         assert.equal(deleted, 1202);
-        assert.ok(passes >= 4);
+        assert.ok(passes >= 5);
         const remaining = await runtime.query<{ delivery_id: string }>(
           "select delivery_id from provider_event_receipts where delivery_id not like 'retained-%' order by delivery_id",
         );
@@ -94,6 +99,11 @@ describe("unhandled receipt retention", () => {
           remaining.rows.map((row) => row.delivery_id),
           ["attachment", "boundary", "lifecycle", "pending", "routed", "run", "young"],
         );
+        const webhooks = await runtime.query<{ count: number }>(
+          `select count(*)::int as count from provider_event_receipts
+           where source = 'webhook.received' and payload = '{"status":"passed"}'::jsonb`,
+        );
+        assert.equal(webhooks.rows[0]!.count, 501);
         // A later sweep revisits retained rows as they cross the seven-day boundary.
         let laterDeleted = 0;
         for (;;) {
