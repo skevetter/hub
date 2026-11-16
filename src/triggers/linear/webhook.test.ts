@@ -58,6 +58,68 @@ describe("Linear webhook", () => {
     },
   );
 
+  it.each([
+    {
+      name: "an absent signature",
+      body: agentSessionBody(),
+      signature: "absent",
+      status: 401,
+    },
+    {
+      name: "an incorrect signature",
+      body: agentSessionBody(),
+      signature: "invalid",
+      status: 401,
+    },
+    {
+      name: "a stale timestamp",
+      body: agentSessionBody({ webhookTimestamp: NOW - 60_001 }),
+      signature: "valid",
+      status: 401,
+    },
+    {
+      name: "an oversized body",
+      body: agentSessionBody({ padding: "x".repeat(1_048_576) }),
+      signature: "valid",
+      status: 413,
+    },
+    {
+      name: "signed malformed JSON",
+      body: "{",
+      signature: "valid",
+      status: 400,
+    },
+    {
+      name: "incorrectly signed malformed JSON",
+      body: "{",
+      signature: "invalid",
+      status: 401,
+    },
+  ])("verifies AgentSessionEvent requests before acknowledging $name", async (scenario) => {
+    const endpoint = webhookSource(async () => {
+      throw new Error("invalid agent sessions must not create receipts");
+    });
+    const headers = new Headers({
+      "content-type": "application/json",
+      "linear-delivery": "agent-session-delivery",
+      "linear-event": "AgentSessionEvent",
+    });
+    if (scenario.signature !== "absent") {
+      headers.set(
+        "linear-signature",
+        sign(scenario.signature === "valid" ? scenario.body : "different body"),
+      );
+    }
+    const response = await endpoint.handle(
+      new Request("https://hub.test/api/integrations/linear/events", {
+        method: "POST",
+        headers,
+        body: scenario.body,
+      }),
+    );
+    assert.equal(response.status, scenario.status);
+  });
+
   it("normalizes an issue, durably accepts it, and dispatches its selected route", async () => {
     const accepted: unknown[] = [];
     const dispatched: DurableProviderEvent[] = [];
@@ -231,6 +293,17 @@ describe("Linear webhook", () => {
     assert.equal((await endpoint.handle(request(issueEnvelope()))).status, 503);
   });
 });
+
+function agentSessionBody(extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    type: "AgentSessionEvent",
+    action: "created",
+    organizationId: "linear-org",
+    webhookTimestamp: NOW,
+    agentSession: { id: "session", issue: { id: "issue" } },
+    ...extra,
+  });
+}
 
 function webhookSource(
   accept: (
