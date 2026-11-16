@@ -17,6 +17,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import type { JsonValue } from "../config/compiler.js";
 import { INVITATION_ROLES, ORGANIZATION_ROLES } from "../auth/organization-contract.js";
 import { API_KEY_SCOPES } from "../auth/api-key-contract.js";
 
@@ -447,6 +448,7 @@ export const triggerRuns = pgTable(
     completedAt: timestamp("completed_at", { withTimezone: true }),
   },
   (table) => [
+    uniqueIndex("trigger_runs_id_organization_unique").on(table.id, table.organizationId),
     uniqueIndex("trigger_runs_receipt_project_configured_unique").on(
       table.providerEventReceiptId,
       table.projectId,
@@ -503,6 +505,143 @@ export const triggerRuns = pgTable(
   ],
 );
 
+export const runTimelineEvents = pgTable(
+  "run_timeline_events",
+  {
+    triggerRunId: uuid("trigger_run_id").notNull(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    seq: integer().notNull(),
+    kind: text().notNull(),
+    at: timestamp({ withTimezone: true }).notNull(),
+    stepId: text("step_id").notNull().default(""),
+    data: jsonb().notNull().default({}),
+  },
+  (table) => [
+    primaryKey({ columns: [table.triggerRunId, table.seq] }),
+    check("run_timeline_events_seq_check", sql`${table.seq} between 1 and 5110`),
+    check(
+      "run_timeline_events_kind_check",
+      sql`${table.kind} in ('run_started', 'step_started', 'agent_started', 'turn_started', 'turn_ended', 'tool_started', 'tool_finished', 'permission_requested', 'permission_resolved', 'turn_failed', 'turn_canceled', 'step_finished', 'run_finished', 'truncated')`,
+    ),
+    check(
+      "run_timeline_events_data_check",
+      sql`octet_length(${table.data}::text) <= case when ${table.kind} = 'truncated' then 128 when ${table.kind} in ('step_finished', 'run_finished') then 512 else 1024 end`,
+    ),
+    foreignKey({
+      columns: [table.triggerRunId, table.organizationId],
+      foreignColumns: [triggerRuns.id, triggerRuns.organizationId],
+      name: "run_timeline_events_run_organization_fk",
+    }).onDelete("cascade"),
+    uniqueIndex("run_timeline_events_lifecycle_unique")
+      .on(table.triggerRunId, table.kind, table.stepId)
+      .where(
+        sql`${table.kind} in ('run_started', 'step_started', 'step_finished', 'run_finished', 'agent_started')`,
+      ),
+    uniqueIndex("run_timeline_events_call_unique")
+      .on(table.triggerRunId, table.stepId, table.kind, sql`(${table.data}->>'callId')`)
+      .where(
+        sql`${table.kind} in ('tool_started', 'tool_finished') and (${table.data}->>'callId') is not null`,
+      ),
+    index("run_timeline_events_organization_at_idx").on(table.organizationId, table.at),
+  ],
+);
+
+export const runTimelineState = pgTable(
+  "run_timeline_state",
+  {
+    triggerRunId: uuid("trigger_run_id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    eventCount: integer("event_count").notNull().default(0),
+    byteCount: integer("byte_count").notNull().default(0),
+    stepEndCount: integer("step_end_count").notNull().default(0),
+    stepEndBytes: integer("step_end_bytes").notNull().default(0),
+    stepRowsOmitted: integer("step_rows_omitted").notNull().default(0),
+    droppedCount: integer("dropped_count").notNull().default(0),
+    sealedSeq: integer("sealed_seq"),
+    sealedAt: timestamp("sealed_at", { withTimezone: true }),
+    origin: text().$type<"captured" | "derived">().notNull(),
+    expiredAt: timestamp("expired_at", { withTimezone: true }),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.triggerRunId, table.organizationId],
+      foreignColumns: [triggerRuns.id, triggerRuns.organizationId],
+      name: "run_timeline_state_run_organization_fk",
+    }).onDelete("cascade"),
+    check("run_timeline_state_origin_check", sql`${table.origin} in ('captured', 'derived')`),
+    check(
+      "run_timeline_state_budget_check",
+      sql`${table.eventCount} between 0 and 5102 and ${table.byteCount} between 0 and 196608 and ${table.stepEndCount} between 0 and 100 and ${table.stepEndBytes} between 0 and 51200 and ${table.droppedCount} >= 0 and ${table.stepRowsOmitted} >= 0`,
+    ),
+  ],
+);
+
+export const runProgressMessages = pgTable(
+  "run_progress_messages",
+  {
+    triggerRunId: uuid("trigger_run_id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    provider: text().$type<"github" | "linear" | "slack">().notNull(),
+    state: text()
+      .$type<
+        | "pending"
+        | "creating"
+        | "active"
+        | "finished"
+        | "gone"
+        | "unavailable"
+        | "refused"
+        | "abandoned"
+      >()
+      .notNull()
+      .default("pending"),
+    externalRef: jsonb("external_ref").$type<JsonValue>(),
+    version: integer().notNull().default(0),
+    leaseOwner: text("lease_owner"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    lastRenderedHash: text("last_rendered_hash"),
+    lastEditAt: timestamp("last_edit_at", { withTimezone: true }),
+    editCount: integer("edit_count").notNull().default(0),
+    visibility: text().$type<"public" | "private" | "unknown">(),
+    visibilityCheckedAt: timestamp("visibility_checked_at", { withTimezone: true }),
+    failure: text(),
+    compensationRequestedGen: integer("compensation_requested_gen").notNull().default(0),
+    compensationDoneGen: integer("compensation_done_gen").notNull().default(0),
+    compensationNotBefore: timestamp("compensation_not_before", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.triggerRunId, table.organizationId],
+      foreignColumns: [triggerRuns.id, triggerRuns.organizationId],
+      name: "run_progress_messages_run_organization_fk",
+    }).onDelete("cascade"),
+    check(
+      "run_progress_messages_provider_check",
+      sql`${table.provider} in ('github', 'linear', 'slack')`,
+    ),
+    check(
+      "run_progress_messages_state_check",
+      sql`${table.state} in ('pending', 'creating', 'active', 'finished', 'gone', 'unavailable', 'refused', 'abandoned')`,
+    ),
+    check(
+      "run_progress_messages_visibility_check",
+      sql`${table.visibility} is null or ${table.visibility} in ('public', 'private', 'unknown')`,
+    ),
+    check(
+      "run_progress_messages_generation_check",
+      sql`${table.compensationRequestedGen} >= ${table.compensationDoneGen} and ${table.compensationDoneGen} >= 0`,
+    ),
+    index("run_progress_messages_sweep_idx").on(table.state, table.leaseExpiresAt),
+  ],
+);
 export const workflowStepRuns = pgTable(
   "workflow_step_runs",
   {
@@ -1344,7 +1483,7 @@ export const organizationApiKeys = pgTable(
     ),
     check(
       "organization_api_keys_scopes_check",
-      sql`${table.scopes} <@ ARRAY['projects:read', 'configuration:validate', 'configuration:install', 'runs:dispatch', 'daemons:enroll', 'events:send']::text[] and cardinality(${table.scopes}) > 0`,
+      sql`${table.scopes} <@ ARRAY['projects:read', 'configuration:validate', 'configuration:install', 'runs:dispatch', 'runs:read', 'daemons:enroll', 'events:send']::text[] and cardinality(${table.scopes}) > 0`,
     ),
     check(
       "organization_api_keys_actor_check",
