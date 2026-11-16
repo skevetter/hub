@@ -7,6 +7,14 @@ import { projectTimelineEvent } from "./project.js";
 import { createTimelineScrubber } from "./scrub.js";
 import { TIMELINE_KINDS } from "./store.js";
 import { USERINFO_SCHEMES, USERINFO_WHITESPACE_CASES } from "./test-utils/userinfo-fixtures.js";
+import {
+  BENIGN_URL_CASES,
+  hasParsedUserinfo,
+  URL_USERINFO_CANDIDATES,
+  URL_USERINFO_CASES,
+  URL_USERINFO_SCHEMES,
+  URL_USERINFO_SECRET,
+} from "./test-utils/url-userinfo-fixtures.js";
 
 const scrub = createTimelineScrubber();
 const STEPS = { succeeded: 1, failed: 1, timed_out: 1, skipped: 1, not_run: 1, total: 5 };
@@ -536,6 +544,102 @@ describe("closed stored-event projection", () => {
       }
     },
   );
+
+  it("keeps the differential URL oracle populated for every scheme, raw mix and separator length", () => {
+    expect(scrub(URL_USERINFO_SECRET, 240) === URL_USERINFO_SECRET).toBe(true);
+    for (const scheme of URL_USERINFO_SCHEMES) {
+      expect(
+        URL_USERINFO_CASES.some((sample) => sample.scheme === scheme),
+        `oracle coverage for ${scheme}`,
+      ).toBe(true);
+      for (let separatorLength = 0; separatorLength <= 4; separatorLength += 1) {
+        const candidates = URL_USERINFO_CANDIDATES.filter(
+          (sample) =>
+            sample.scheme === scheme &&
+            sample.separatorLength === separatorLength &&
+            sample.variant === "raw" &&
+            sample.credential === "password",
+        );
+        expect(
+          new Set(candidates.map((sample) => sample.separators)).size === 2 ** separatorLength,
+          `raw mix coverage for ${scheme} length ${separatorLength}`,
+        ).toBe(true);
+        if (scheme !== "mongodb" && scheme !== "postgres") {
+          expect(
+            candidates.every(({ value }) => hasParsedUserinfo(value)),
+            `oracle coverage for ${scheme} length ${separatorLength}`,
+          ).toBe(true);
+        }
+      }
+    }
+    for (let separatorLength = 0; separatorLength <= 4; separatorLength += 1) {
+      expect(
+        URL_USERINFO_CASES.some((sample) => sample.separatorLength === separatorLength),
+        `oracle coverage for separator length ${separatorLength}`,
+      ).toBe(true);
+    }
+    for (const credential of ["password", "username only", "password only"]) {
+      expect(
+        URL_USERINFO_CASES.some((sample) => sample.credential === credential),
+        `oracle coverage for ${credential}`,
+      ).toBe(true);
+    }
+  });
+
+  it("redacts every oracle-confirmed differential URL across all five free-text paths", () => {
+    for (const sample of URL_USERINFO_CASES) {
+      const inputs: { input: TimelineProjectionInput; field: string }[] = [
+        { input: { kind: "run_started", trigger: sample.value, steps: 1 }, field: "trigger" },
+        {
+          input: daemon({ type: "turn_failed", provider: "claude", error: sample.value }),
+          field: "error",
+        },
+        {
+          input: daemon({ type: "turn_canceled", provider: "claude", reason: sample.value }),
+          field: "reason",
+        },
+        { input: { ...STEP_END, failure: sample.value }, field: "failure" },
+        { input: { ...RUN_END, failure: sample.value }, field: "failure" },
+      ];
+      for (const { input, field } of inputs) {
+        const row = projectTimelineEvent(input, scrub);
+        expect(
+          row?.data[field] === "[redacted]",
+          `whole-field marker for ${sample.name} ${input.kind} ${field}`,
+        ).toBe(true);
+        expect(
+          JSON.stringify(row).includes(URL_USERINFO_SECRET),
+          `credential retained for ${sample.name} ${input.kind}`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("preserves useful credential-free URL authorities and paths across free-text projections", () => {
+    for (const sample of BENIGN_URL_CASES) {
+      expect(hasParsedUserinfo(sample.value), `no userinfo for ${sample.name}`).toBe(false);
+      const inputs: { input: TimelineProjectionInput; field: string }[] = [
+        { input: { kind: "run_started", trigger: sample.value, steps: 1 }, field: "trigger" },
+        {
+          input: daemon({ type: "turn_failed", provider: "claude", error: sample.value }),
+          field: "error",
+        },
+        {
+          input: daemon({ type: "turn_canceled", provider: "claude", reason: sample.value }),
+          field: "reason",
+        },
+        { input: { ...STEP_END, failure: sample.value }, field: "failure" },
+        { input: { ...RUN_END, failure: sample.value }, field: "failure" },
+      ];
+      for (const { input, field } of inputs) {
+        const value = projectTimelineEvent(input, scrub)?.data[field];
+        expect(
+          typeof value === "string" && value.includes(sample.useful),
+          `useful URL for ${sample.name} ${input.kind} ${field}`,
+        ).toBe(true);
+      }
+    }
+  });
 
   it.each(
     USERINFO_SCHEMES.flatMap((scheme) =>

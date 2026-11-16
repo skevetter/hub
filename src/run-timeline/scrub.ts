@@ -36,27 +36,61 @@ const ESCAPES: Readonly<Record<string, string>> = {
   v: "\v",
 };
 
+const URL_SCHEME_START = /[A-Za-z]/u;
+const URL_SCHEME_PART = /[0-9+.-]/u;
+const URL_BOUNDARY = /[/?#]/u;
+
+function hasEncodedUrlSlash(value: string, index: number): boolean {
+  return (
+    value.startsWith("%2f", index) ||
+    value.startsWith("%2F", index) ||
+    value.startsWith("%5c", index) ||
+    value.startsWith("%5C", index)
+  );
+}
+
 function hasUserinfo(value: string): boolean {
   const detection = value.replace(/[\t\n\r]/gu, "");
   let authority = false;
-  let slash = false;
+  let prefix = false;
+  let schemeToken = false;
+  let sawSlash = false;
   for (let index = 0; index < detection.length; index += 1) {
     const character = detection[index]!;
-    const encodedSlash = detection.startsWith("%2f", index) || detection.startsWith("%2F", index);
+    const encodedSlash = character === "%" && hasEncodedUrlSlash(detection, index);
+    const slash = character === "/" || character === "\\" || encodedSlash;
     if (authority) {
+      if (prefix && (slash || character === " ")) {
+        if (character === "%") index += 2;
+        continue;
+      }
+      prefix = false;
       if (character === "@" || detection.startsWith("%40", index)) return true;
-      if (!/[/?#]/u.test(character)) {
+      if (!URL_BOUNDARY.test(character)) {
         if (encodedSlash) index += 2;
         continue;
       }
       authority = false;
-      slash = false;
+      sawSlash = false;
     }
-    if (character === "/" || encodedSlash) {
-      authority = slash;
-      slash = !authority;
+    if (character === ":" && schemeToken) {
+      authority = true;
+      prefix = true;
+      schemeToken = false;
+      sawSlash = false;
+      continue;
+    }
+    if (slash) {
+      authority = sawSlash;
+      prefix = authority;
+      sawSlash = !authority;
+      schemeToken = false;
       if (encodedSlash) index += 2;
-    } else slash = false;
+      continue;
+    }
+    sawSlash = false;
+    schemeToken =
+      URL_SCHEME_START.test(character) || (schemeToken && URL_SCHEME_PART.test(character));
   }
   return false;
 }

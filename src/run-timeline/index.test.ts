@@ -21,6 +21,10 @@ import {
   USERINFO_WHITESPACE,
   userinfoWhitespaceCase,
 } from "./test-utils/userinfo-fixtures.js";
+import {
+  BENIGN_URL_CASES,
+  URL_USERINFO_STORAGE_CASES,
+} from "./test-utils/url-userinfo-fixtures.js";
 
 const ORGANIZATION = "capture-organization";
 const PAGE = { afterSeq: 0, limit: 5110 };
@@ -323,7 +327,7 @@ describe("RunTimeline capture", () => {
     },
     { name: "embedded PostgreSQL", open: embeddedPrivacyDatabase },
   ])(
-    "stores only whole-field markers for whitespace userinfo on $name",
+    "stores whole-field URL userinfo markers and useful credential-free paths on $name",
     async ({ open }) => {
       const harness = await open();
       const { database } = harness;
@@ -338,13 +342,37 @@ describe("RunTimeline capture", () => {
           bus: new RunTimelineBus(),
           reportFailure,
         });
+        const groups: {
+          name: string;
+          useful: string | null;
+          samples: { name: string; value: string; secret: string }[];
+        }[] = [];
         for (const [index, variant] of USERINFO_WHITESPACE.entries()) {
-          const samples = Array.from({ length: 4 }, (_, field) =>
-            userinfoWhitespaceCase(
-              USERINFO_SCHEMES[(index + field) % USERINFO_SCHEMES.length]!,
-              variant,
-            ),
-          );
+          const samples = [];
+          for (let field = 0; field < 4; field++)
+            samples.push(
+              userinfoWhitespaceCase(
+                USERINFO_SCHEMES[(index + field) % USERINFO_SCHEMES.length]!,
+                variant,
+              ),
+            );
+          groups.push({ name: variant.name, useful: null, samples });
+        }
+        for (const sample of URL_USERINFO_STORAGE_CASES)
+          groups.push({
+            name: sample.name,
+            useful: null,
+            samples: [sample, sample, sample, sample],
+          });
+        for (const benign of BENIGN_URL_CASES) {
+          const sample = { ...benign, secret: "" };
+          groups.push({
+            name: sample.name,
+            useful: sample.useful,
+            samples: [sample, sample, sample, sample],
+          });
+        }
+        for (const { name, useful, samples } of groups) {
           const run = await createRun(["work"], samples[0]!.value);
           const [execution] = await link(run);
           assert.ok(execution);
@@ -378,10 +406,15 @@ describe("RunTimeline capture", () => {
             ["step_finished", "failure"],
             ["run_finished", "failure"],
           ]) {
-            assert.ok(
-              rows.find((row) => row.kind === kind)?.data[field!] === "[redacted]",
-              `whole-field marker for ${variant.name} ${kind}`,
-            );
+            const value = rows.find((row) => row.kind === kind)?.data[field!];
+            if (useful === null) {
+              assert.ok(value === "[redacted]", `whole-field marker for ${name} ${kind}`);
+            } else {
+              assert.ok(
+                typeof value === "string" && value.includes(useful),
+                `useful URL for ${name} ${kind}`,
+              );
+            }
           }
           const stored = JSON.stringify({
             rows,

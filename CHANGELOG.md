@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- URL userinfo detection covers special-scheme slash and backslash forms before logger rewriting, with differential URL-parser coverage.
 - URL userinfo containing whitespace is redacted as a whole field, including non-HTTP schemes and encoded separators.
 - Retained drop-accounting batches use durable identities so lost acknowledgements do not increment their counters twice.
 - Projected free text with credential hints, userinfo, armored blocks or unresolved encodings is replaced as a whole field.
