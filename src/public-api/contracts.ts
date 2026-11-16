@@ -311,6 +311,73 @@ export const DispatchedManualRunSchema = z
     },
   });
 
+export const WebhookPathSchema = z
+  .object({ trigger: z.string().regex(/^[a-z][a-z0-9_-]*$/u) })
+  .strict()
+  .openapi("WebhookPath", { example: { trigger: "build-finished" } });
+
+export const WebhookHeadersSchema = z
+  .object({
+    "idempotency-key": z
+      .string()
+      .min(1)
+      .max(200)
+      .regex(/^[\x20-\x7e]+$/u)
+      .optional(),
+    "x-request-id": z
+      .string()
+      .regex(/^[A-Za-z0-9._-]{1,128}$/u)
+      .optional(),
+  })
+  .strict()
+  .openapi("WebhookHeaders", {
+    example: { "idempotency-key": "build-43", "x-request-id": "build-43-request" },
+  });
+
+export const WebhookJsonBodySchema = z
+  .object({ message: z.string().optional() })
+  .catchall(z.unknown())
+  .openapi("WebhookJsonBody", {
+    example: { message: "Build finished", status: "failed", failures: 2 },
+    description:
+      "A JSON object. message is an optional UTF-8 string of at most 64 KiB. Other fields are event data. Maximum depth 20 and 1000 keys per object.",
+  });
+
+export const WebhookTextBodySchema = z.string().min(1).openapi("WebhookTextBody", {
+  example: "Build finished",
+  description: "UTF-8 prompt text, at most 64 KiB.",
+});
+
+export const ReceiveWebhookInputSchema = z
+  .object({
+    trigger: WebhookPathSchema.shape.trigger,
+    deliveryKey: z
+      .string()
+      .min(1)
+      .max(200)
+      .regex(/^[\x20-\x7e]+$/u),
+    input: z.string(),
+    data: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict()
+  .transform(({ data, ...input }) => (data === undefined ? input : { ...input, data }));
+
+export const ReceivedWebhookSchema = z
+  .union([
+    DispatchedManualRunSchema.extend({ duplicate: z.boolean() }).strict(),
+    z.object({ status: z.literal("filtered"), duplicate: z.boolean() }).strict(),
+  ])
+  .openapi("ReceivedWebhook", {
+    example: {
+      deliveryKey: "build-43",
+      providerEventReceiptId: "845e9d26-7977-45e1-bc69-d80a7b55a9cc",
+      triggerRunId: "f83dc934-02a0-4849-8de7-699110be24ed",
+      configuredTriggerName: "build-finished",
+      workflowStatus: "running",
+      duplicate: false,
+    },
+  });
+
 export const EnrollmentTokenSchema = z
   .object({
     token: z.string().min(32),

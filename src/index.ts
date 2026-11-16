@@ -52,6 +52,7 @@ import { composeEmailDelivery } from "./email/index.js";
 import { createAccountMailer } from "./auth/account-emails.js";
 import { migrateLegacyProjectTriggers } from "./triggers/migration.js";
 import { readGitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
+import { readWebhookOptions } from "./webhook-config.js";
 import {
   createServerShutdown,
   installShutdownSignals,
@@ -83,6 +84,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
   const resources = new CompositionResources();
   try {
     const config = loadRuntimeConfig();
+    const webhookOptions = readWebhookOptions(process.env);
     const { database, runtime, locks } = await createDatabaseHandle();
     resources.own(() => database.close(), "composition.database");
     const migration = await migrateLegacyProjectTriggers(database);
@@ -180,6 +182,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       publicBaseUrl: identity.appUrl,
       completionTokenSecret: identity.authSecret,
       scriptLimits,
+      webhookOptions,
       ...(githubNotifications === undefined ? {} : { githubNotifications }),
       close: () => resources.close(),
     });

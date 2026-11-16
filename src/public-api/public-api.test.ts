@@ -15,6 +15,7 @@ import {
   SetupResourcesSchema,
   createPublicApi,
   DispatchedManualRunSchema,
+  ReceivedWebhookSchema,
   EnrollmentTokenSchema,
   InstalledConfigurationSchema,
   ProjectListSchema,
@@ -29,11 +30,13 @@ const authorization = {
   kind: "apiKey" as const,
   credentialId: "key-1",
   organizationId: "organization-1",
+  actor: "automation",
   scopes: [
     "projects:read",
     "configuration:validate",
     "configuration:install",
     "runs:dispatch",
+    "events:send",
     "daemons:enroll",
   ] as const,
 };
@@ -203,6 +206,15 @@ describe("public API interface", () => {
         )
       ).json(),
     );
+    ReceivedWebhookSchema.parse(
+      await (
+        await successApi.handle(
+          request("/api/v1/hooks/deploy", {
+            body: JSON.stringify({ message: "Deploy" }),
+          }),
+        )
+      ).json(),
+    );
 
     const cases: readonly {
       operations: PublicOperations;
@@ -245,6 +257,28 @@ describe("public API interface", () => {
         request: request("/api/v1/daemons/enrollment-tokens", { contentType: false }),
         status: 401,
         code: "unauthorized",
+      },
+      {
+        operations: {
+          ...successfulOperations(),
+          dispatchManualRun: () => Promise.resolve({ status: "key_actor_required" }),
+        },
+        request: manualRequest("/api/v1/manual-runs"),
+        status: 403,
+        code: "key_actor_required",
+      },
+      {
+        operations: {
+          ...successfulOperations(),
+          dispatchManualRun: () =>
+            Promise.resolve({
+              status: "invalid_input",
+              issues: [{ path: ["environment"], message: "Required" }],
+            }),
+        },
+        request: manualRequest("/api/v1/manual-runs"),
+        status: 400,
+        code: "invalid_input",
       },
     ];
     for (const testCase of cases) {
@@ -297,6 +331,7 @@ describe("generated public OpenAPI", () => {
       "/api/v1/configurations/install",
       "/api/v1/configurations/validate",
       "/api/v1/daemons/enrollment-tokens",
+      "/api/v1/hooks/{trigger}",
       "/api/v1/manual-runs",
       "/api/v1/projects",
       "/api/v1/setup-resources",
@@ -322,7 +357,26 @@ describe("generated public OpenAPI", () => {
       "/api/v1/projects": ["projects:read", ["200", "401", "403", "500", "503"]],
       "/api/v1/manual-runs": [
         "runs:dispatch",
-        ["200", "400", "401", "403", "404", "409", "500", "503"],
+        ["200", "400", "401", "403", "404", "409", "413", "500", "503"],
+      ],
+      "/api/v1/hooks/{trigger}": [
+        "events:send",
+        [
+          "200",
+          "202",
+          "400",
+          "401",
+          "403",
+          "404",
+          "405",
+          "409",
+          "413",
+          "415",
+          "422",
+          "429",
+          "500",
+          "503",
+        ],
       ],
       "/api/v1/daemons/enrollment-tokens": ["daemons:enroll", ["201", "401", "403", "500", "503"]],
     } as const;
@@ -501,6 +555,16 @@ function successfulOperations(): PublicOperations {
         triggerRunId: "f83dc934-02a0-4849-8de7-699110be24ed",
         configuredTriggerName: input.trigger,
         workflowStatus: "running",
+      }),
+    receiveWebhook: (_authorization, input) =>
+      Promise.resolve({
+        status: "dispatched",
+        deliveryKey: input.deliveryKey,
+        providerEventReceiptId: "845e9d26-7977-45e1-bc69-d80a7b55a9cc",
+        triggerRunId: "f83dc934-02a0-4849-8de7-699110be24ed",
+        configuredTriggerName: input.trigger,
+        workflowStatus: "running",
+        duplicate: false,
       }),
     issueEnrollmentToken: () =>
       Promise.resolve({

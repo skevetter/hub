@@ -1,6 +1,7 @@
 import type { ApiKeyScope } from "../auth/api-key-contract.js";
 import type {
   DispatchManualRunResult,
+  ReceiveWebhookResult,
   InstallConfigurationResult,
   InstallTriggerResult,
   IssueEnrollmentTokenResult,
@@ -15,6 +16,8 @@ import type {
 import {
   DispatchManualRunRequestSchema,
   DispatchedManualRunSchema,
+  ReceivedWebhookSchema,
+  ReceiveWebhookInputSchema,
   EnrollmentTokenSchema,
   InstallConfigurationRequestSchema,
   InstalledConfigurationSchema,
@@ -38,6 +41,7 @@ export type PublicOperationId =
   | "validateConfiguration"
   | "installConfiguration"
   | "dispatchManualRun"
+  | "receiveWebhook"
   | "issueEnrollmentToken";
 
 export interface PublicOperationDefinition {
@@ -59,8 +63,10 @@ export interface PublicOperationDefinition {
     | typeof ConfigurationResourcesSchema
     | typeof SetupResourcesSchema
     | typeof DispatchedManualRunSchema
-    | typeof EnrollmentTokenSchema;
-  successStatus: 200 | 201;
+    | typeof EnrollmentTokenSchema
+    | typeof ReceivedWebhookSchema;
+  successStatus: 200 | 201 | 202;
+  webhook?: boolean;
   resultMapping:
     | "trigger-validation"
     | "triggers"
@@ -71,10 +77,11 @@ export interface PublicOperationDefinition {
     | "validation"
     | "configuration"
     | "manual-run"
+    | "webhook"
     | "enrollment-token";
   summary: string;
   description: string;
-  tag: "Triggers" | "Projects" | "Configurations" | "Runs" | "Daemons";
+  tag: "Triggers" | "Projects" | "Configurations" | "Runs" | "Daemons" | "Webhooks";
   responses: Readonly<Record<number, string>>;
   invoke(
     operations: PublicOperations,
@@ -90,6 +97,7 @@ export interface PublicOperationDefinition {
     | ValidateConfigurationResult
     | InstallConfigurationResult
     | DispatchManualRunResult
+    | ReceiveWebhookResult
     | IssueEnrollmentTokenResult
   >;
 }
@@ -298,14 +306,47 @@ export const publicOperationManifest: readonly PublicOperationDefinition[] = [
       200: "The durable manual event resolved to a run.",
       400: "The JSON request or trigger input is invalid.",
       401: "The bearer credential is missing, malformed, or revoked.",
-      403: "The bearer credential lacks runs:dispatch or the actor is forbidden.",
+      403: "The bearer credential lacks runs:dispatch, its actor is forbidden, or a script trigger requires a bound actor.",
       404: "The project, configuration, or manual trigger does not exist.",
       409: "The existing manual event path could not resolve a run.",
+      413: "The raw request body exceeds the configured webhook byte limit.",
       500: "The operation failed unexpectedly.",
       503: "Hub authentication or storage is unavailable.",
     },
     invoke: (operations, authorization, input) =>
       operations.dispatchManualRun(authorization, DispatchManualRunRequestSchema.parse(input)),
+  },
+  {
+    id: "receiveWebhook",
+    method: "post",
+    path: "/api/v1/hooks/{trigger}",
+    scope: "events:send",
+    webhook: true,
+    successSchema: ReceivedWebhookSchema,
+    successStatus: 202,
+    resultMapping: "webhook",
+    summary: "Receive a webhook",
+    description:
+      "Accepts a UTF-8 JSON object or text prompt for one enabled manual.run trigger. Requires an API key with a bound actor. Idempotency keys deduplicate without expiry. Raw bodies are capped by server configuration (256 KiB by default).",
+    tag: "Webhooks",
+    responses: {
+      200: "A duplicate delivery, including a previously filtered delivery.",
+      202: "A new delivery was dispatched or filtered.",
+      400: "invalid_json or invalid_request: malformed JSON, invalid UTF-8, empty text, or invalid idempotency key.",
+      401: "unauthorized: the bearer API key is missing, invalid, or revoked.",
+      403: "insufficient_scope, key_actor_required, or actor_forbidden.",
+      404: "trigger_not_found: no allowed, enabled manual trigger matches.",
+      405: "method_not_allowed: use POST.",
+      409: "dispatch_conflict: retry with the same idempotency key.",
+      413: "payload_too_large: the raw body or prompt exceeds its byte limit.",
+      415: "unsupported_media_type: use application/json or text/plain with UTF-8.",
+      422: "invalid_body or invalid_input: invalid structure or declared trigger inputs.",
+      429: "rate_limited or trigger_busy: retry after the indicated delay.",
+      500: "internal_error: the operation failed unexpectedly.",
+      503: "authentication_unavailable or infrastructure_unavailable.",
+    },
+    invoke: (operations, authorization, input) =>
+      operations.receiveWebhook(authorization, ReceiveWebhookInputSchema.parse(input)),
   },
   {
     id: "issueEnrollmentToken",

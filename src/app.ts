@@ -61,6 +61,7 @@ import { createPublicOperations } from "./public-operations/index.js";
 import { createDatabasePublicOperationRepository } from "./public-operations/database-adapter.js";
 import type { EntitlementsService } from "./entitlements/service.js";
 import type { ExecutionAuthority } from "./execution-authority/index.js";
+import type { WebhookOptions } from "./webhook-config.js";
 
 export interface HubRuntimeOptions {
   database: Database | null;
@@ -85,6 +86,7 @@ export interface HubRuntimeOptions {
   githubNotifications?: GitHubNotificationsOptions;
   /** How many script steps may run at once. */
   scriptLimits?: ScriptLimits | undefined;
+  webhookOptions?: WebhookOptions | undefined;
 }
 
 export interface HubRuntime {
@@ -310,7 +312,9 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     storeForProject,
     agentValidator,
   );
-  const publicApi = createPublicApi(options.publicApi, publicOperations);
+  const publicApi = createPublicApi(options.publicApi, publicOperations, {
+    webhookOptions: options.webhookOptions,
+  });
   const operations: HubOperations = {
     handleDaemonEnrollment: (request) =>
       options.database === null
@@ -441,6 +445,7 @@ function createAppPublicOperations(
       dispatchManualEvent: (input) => dispatchManualTrigger(manualSource, input),
     },
     options.daemonClock,
+    options.webhookOptions,
   );
 }
 

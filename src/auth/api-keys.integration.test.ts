@@ -220,6 +220,8 @@ describe("organization API-key boundary", () => {
           "user-a",
           `valid-${operation.scope}-${randomUUID()}`,
           [operation.scope],
+          undefined,
+          { actor: "automation" },
         );
         const insufficientScope =
           operation.scope === "configuration:install" ? "runs:dispatch" : "configuration:install";

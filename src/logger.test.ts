@@ -24,6 +24,38 @@ class CaptureStream extends Writable {
 }
 
 describe("logger redaction", () => {
+  it("preserves only fixed public webhook codes while retaining credential and nested-code redaction", () => {
+    const stream = new CaptureStream();
+    const logger = createLogger(stream);
+    logger.info({
+      operation: "webhook.received",
+      code: "invalid_input",
+      body: "fake-payload-secret",
+      headers: { authorization: "fake-key-secret" },
+      nested: { code: "fake-nested-secret" },
+    });
+    logger.info({ operation: "webhook.received", code: "fake-code-secret" });
+    logger.info({ operation: "webhook.received", code: null });
+    logger.info({ operation: "other.operation", code: "invalid_input" });
+    const records = stream
+      .text()
+      .trim()
+      .split("\n")
+      .map((line) => logRecordSchema.parse(JSON.parse(line)));
+    assert.equal(records[0]?.["code"], "invalid_input");
+    assert.equal(records[1]?.["code"], "[Redacted]");
+    assert.equal(records[2]?.["code"], null);
+    assert.equal(records[3]?.["code"], "[Redacted]");
+    for (const secret of [
+      "fake-payload-secret",
+      "fake-key-secret",
+      "fake-nested-secret",
+      "fake-code-secret",
+    ]) {
+      assert.equal(stream.text().includes(secret), false);
+    }
+  });
+
   it("redacts formatless secrets by provenance while preserving safe error diagnostics", () => {
     const stream = new CaptureStream();
     const logger = createLogger(stream);

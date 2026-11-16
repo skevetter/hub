@@ -609,6 +609,17 @@ class PgDatabase implements Database {
     return rows.rows.map(toTriggerRunRecord);
   }
 
+  async countActiveTriggerRuns(organizationId: string, projectId: string, triggerName: string) {
+    const rows = await query<{ count: number }>(
+      this.pool,
+      `select count(*)::integer as count from trigger_runs
+       where organization_id = $1 and project_id = $2
+         and configured_trigger_name = $3 and status = 'running'`,
+      [organizationId, projectId, triggerName],
+    );
+    return rows.rows[0]?.count ?? 0;
+  }
+
   async findWorkflowStepRunById(id: string) {
     const rows = await query<WorkflowStepRunRow>(
       this.pool,

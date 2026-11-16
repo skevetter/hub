@@ -21,6 +21,9 @@ import type {
   PublicAuthorization,
 } from "./types.js";
 import { TriggerDocumentError } from "../triggers/configuration/index.js";
+import { isScriptStep } from "../config/compiler.js";
+import { DEFAULT_WEBHOOK_OPTIONS, type WebhookOptions } from "../webhook-config.js";
+import { receiveWebhook } from "./webhook.js";
 
 export type * from "./types.js";
 
@@ -28,6 +31,7 @@ export function createPublicOperations(
   repository: PublicOperationRepository,
   capabilities: PublicOperationCapabilities,
   clock: DaemonClock = { nowDate: () => new Date() },
+  webhookOptions: Pick<WebhookOptions, "maxActiveRuns"> = DEFAULT_WEBHOOK_OPTIONS,
 ): PublicOperations {
   return {
     async listTriggers(authorization) {
@@ -221,6 +225,24 @@ export function createPublicOperations(
         return storageUnavailableOrThrow(error);
       }
     },
+    async receiveWebhook(authorization, input) {
+      try {
+        return await receiveWebhook(
+          repository,
+          capabilities,
+          authorization,
+          input,
+          webhookOptions.maxActiveRuns,
+        );
+      } catch (error) {
+        if (error instanceof ManualRunRejected) {
+          return {
+            status: error.code === "actor_forbidden" ? "actor_forbidden" : "trigger_not_found",
+          };
+        }
+        return storageUnavailableOrThrow(error);
+      }
+    },
     async issueEnrollmentToken(authorization) {
       try {
         const token = randomBytes(32).toString("base64url");
@@ -241,23 +263,33 @@ function triggerCapability(capabilities: PublicOperationCapabilities, organizati
   return capabilities.triggerForOrganization(organizationId);
 }
 
+function resolveManualActor(
+  authorization: PublicAuthorization,
+  claimed: string | undefined,
+):
+  | { status: "resolved"; actor: string }
+  | Extract<DispatchManualRunResult, { status: "actor_forbidden" | "invalid_input" }> {
+  if (authorization.actor != null && claimed !== undefined && claimed !== authorization.actor) {
+    return { status: "actor_forbidden" };
+  }
+  const actor = authorization.actor ?? claimed;
+  if (actor === undefined)
+    return {
+      status: "invalid_input",
+      issues: [{ path: ["actor"], message: "An actor is required for an unbound credential." }],
+    };
+  return { status: "resolved", actor };
+}
+
 async function prepareManualRun(
   capabilities: PublicOperationCapabilities,
   authorization: PublicAuthorization,
   projectId: string,
   input: DispatchManualRunInput,
 ): Promise<DispatchManualRunResult | { status: "prepared"; payload: ManualRunPayload }> {
-  const boundActor = authorization.actor;
-  if (boundActor != null && input.actor !== undefined && input.actor !== boundActor) {
-    return { status: "actor_forbidden" };
-  }
-  const actor = boundActor ?? input.actor;
-  if (actor === undefined) {
-    return {
-      status: "invalid_input",
-      issues: [{ path: ["actor"], message: "An actor is required for an unbound credential." }],
-    };
-  }
+  const identity = resolveManualActor(authorization, input.actor);
+  if (identity.status !== "resolved") return identity;
+  const actor = identity.actor;
   const stored = await capabilities.configurationForProject(projectId).getActive();
   if (stored === undefined) return { status: "configuration_not_found" };
   if (input.expectedVersionId !== undefined && input.expectedVersionId !== stored.revision.id) {
@@ -267,6 +299,12 @@ async function prepareManualRun(
     (candidate) => candidate.name === input.trigger && candidate.on === "manual.run",
   );
   if (trigger === undefined) return { status: "trigger_not_found" };
+  if (
+    trigger.steps.some(isScriptStep) &&
+    (authorization.kind !== "apiKey" || authorization.actor == null)
+  ) {
+    return { status: "key_actor_required" };
+  }
   if (
     !trigger.filters?.from_users?.includes("*") &&
     !trigger.filters?.from_users?.includes(actor)

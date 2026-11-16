@@ -43,6 +43,26 @@ const STACK_FRAME = /^\s+at\s+/u;
 const ABSOLUTE_URL = /https?:\/\/[^\s"'<>]+/giu;
 const errorRedaction = new WeakMap<Error, RedactionOptions>();
 const safeErrorDiagnostics = new WeakSet<object>();
+const PUBLIC_WEBHOOK_PROBLEM_CODES: Readonly<Record<string, true>> = {
+  invalid_json: true,
+  invalid_request: true,
+  unauthorized: true,
+  insufficient_scope: true,
+  key_actor_required: true,
+  actor_forbidden: true,
+  trigger_not_found: true,
+  method_not_allowed: true,
+  dispatch_conflict: true,
+  payload_too_large: true,
+  unsupported_media_type: true,
+  invalid_input: true,
+  invalid_body: true,
+  rate_limited: true,
+  trigger_busy: true,
+  infrastructure_unavailable: true,
+  authentication_unavailable: true,
+  internal_error: true,
+};
 
 export interface RedactionOptions {
   /** Values already known to be sensitive at the boundary. Never serialized into the record. */
@@ -172,11 +192,23 @@ function redactObject(
   path: readonly string[],
   scrubValues: readonly string[],
 ): Record<string, unknown> {
+  const webhook = path.length === 0 && Reflect.get(value, "operation") === "webhook.received";
   return Object.fromEntries(
     Object.entries(value).map(([entryKey, entryValue]) => [
       entryKey,
-      redactValue(entryValue, entryKey, [...path, normalizeKey(entryKey)], scrubValues),
+      webhook && entryKey === "code" && publicWebhookCode(entryValue, scrubValues)
+        ? entryValue
+        : redactValue(entryValue, entryKey, [...path, normalizeKey(entryKey)], scrubValues),
     ]),
+  );
+}
+
+function publicWebhookCode(value: unknown, scrubValues: readonly string[]): boolean {
+  return (
+    value === null ||
+    (typeof value === "string" &&
+      Object.hasOwn(PUBLIC_WEBHOOK_PROBLEM_CODES, value) &&
+      !scrubValues.includes(value))
   );
 }
 

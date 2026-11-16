@@ -1,6 +1,6 @@
 import type { ApiKeyScope } from "../auth/api-key-contract.js";
 import type { HubBundleFile } from "../config/bundle.js";
-import type { TriggerRunRecord } from "../db/types.js";
+import type { TriggerRunRecord, ProviderEventReceiptRecord } from "../db/types.js";
 import type { DeploymentProjectResolution } from "../project-deployments/index.js";
 import type { StoredProjectConfiguration } from "../configuration/store.js";
 
@@ -106,6 +106,7 @@ export type DispatchManualRunResult =
     }
   | { status: "project_not_found" }
   | { status: "actor_forbidden" }
+  | { status: "key_actor_required" }
   | { status: "daemon_offline" }
   | { status: "expected_configuration_not_current" }
   | { status: "configuration_not_found" }
@@ -119,6 +120,27 @@ export type DispatchManualRunResult =
     }
   | { status: "dispatch_conflict" }
   | InfrastructureUnavailable;
+
+export interface ReceiveWebhookInput {
+  trigger: string;
+  deliveryKey: string;
+  input: string;
+  data?: Readonly<Record<string, unknown>>;
+}
+
+export type ReceiveWebhookResult =
+  | (Extract<DispatchManualRunResult, { status: "dispatched" }> & { duplicate: boolean })
+  | { status: "filtered"; duplicate: boolean }
+  | Extract<DispatchManualRunResult, { status: "invalid_input" }>
+  | {
+      status:
+        | "trigger_not_found"
+        | "actor_forbidden"
+        | "key_actor_required"
+        | "trigger_busy"
+        | "dispatch_conflict"
+        | "infrastructure_unavailable";
+    };
 
 export type IssueEnrollmentTokenResult =
   | { status: "issued"; token: string; expiresAt: Date }
@@ -194,6 +216,10 @@ export interface PublicOperations {
     authorization: PublicAuthorization,
     input: DispatchManualRunInput,
   ): Promise<DispatchManualRunResult>;
+  receiveWebhook(
+    authorization: PublicAuthorization,
+    input: ReceiveWebhookInput,
+  ): Promise<ReceiveWebhookResult>;
   issueEnrollmentToken(authorization: PublicAuthorization): Promise<IssueEnrollmentTokenResult>;
 }
 
@@ -201,6 +227,19 @@ export interface PublicOperationRepository {
   listActiveProjects(organizationId: string): Promise<readonly PublicProject[]>;
   listConfigurationResources(organizationId: string): Promise<ConfigurationResources>;
   listSetupResources(organizationId: string): Promise<SetupResources>;
+  resolveWebhookProject(
+    organizationId: string,
+    triggerName: string,
+  ): Promise<{ id: string } | undefined>;
+  findWebhookReceipt(
+    organizationId: string,
+    deliveryId: string,
+  ): Promise<ProviderEventReceiptRecord | undefined>;
+  countActiveTriggerRuns(
+    organizationId: string,
+    projectId: string,
+    triggerName: string,
+  ): Promise<number>;
   resolveManualRunProject(
     organizationId: string,
     triggerName: string,

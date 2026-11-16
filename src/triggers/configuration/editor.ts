@@ -21,7 +21,6 @@ import {
   eventDefinition,
   isEditorEvent,
   SCRIPT_NOTIFICATION_REASONS,
-  SCRIPT_ON_MANUAL_RUN_MESSAGE,
   type EditorEvent,
   type QualifierValues,
   type QualifierKey,
@@ -469,7 +468,6 @@ function actorErrors(value: TriggerFormValue): TriggerFieldErrors {
 /** A notification has no actor, so a script on it must narrow by repository or reason. */
 function scriptEventErrors(value: TriggerFormValue): TriggerFieldErrors {
   if (value.action !== "script") return {};
-  if (value.event === "manual.run") return { action: SCRIPT_ON_MANUAL_RUN_MESSAGE };
   if (value.event !== "github.notification") return {};
   const errors: TriggerFieldErrors = {};
   const repo = value.qualifiers.repo?.trim() ?? "";

@@ -450,6 +450,20 @@ class MemoryDatabase implements Database {
       .slice(0, limit);
   }
 
+  async countActiveTriggerRuns(organizationId: string, projectId: string, triggerName: string) {
+    let count = 0;
+    for (const run of this.triggerRuns.values()) {
+      if (
+        run.organizationId === organizationId &&
+        run.projectId === projectId &&
+        run.configuredTriggerName === triggerName &&
+        run.status === "running"
+      )
+        count += 1;
+    }
+    return count;
+  }
+
   async findWorkflowStepRunById(id: string) {
     return this.workflowStepRuns.get(id);
   }

@@ -3,7 +3,6 @@ import {
   isEditorEvent,
   NOTIFICATION_FROM_USERS_MESSAGE,
   SCRIPT_NOTIFICATION_REASONS,
-  SCRIPT_ON_MANUAL_RUN_MESSAGE,
 } from "../triggers/configuration/events.js";
 import { ContinuationSchema } from "../triggers/continuation.js";
 import { createHash } from "node:crypto";
@@ -1582,7 +1581,6 @@ function validateAuthoredIds(config: AuthoredHubConfig): void {
  * connection run code on the host.
  */
 function validateScriptTriggerSecurity(trigger: CompiledTrigger): void {
-  refuseScriptOnManualRun(trigger);
   if (trigger.on === "schedule.tick") return;
   if (trigger.on === "github.notification") {
     validateNotificationScriptFilters(trigger);
@@ -1594,17 +1592,6 @@ function validateScriptTriggerSecurity(trigger: CompiledTrigger): void {
       `trigger ${trigger.name} runs a script, so ${trigger.on} needs filters.from_users that names the people allowed to start it. A wildcard or empty list would let anyone who can reach this event run code on the host.`,
     );
   }
-}
-
-/**
- * Interim rule. The actor of a manual run is a string the caller of the API chooses, so a
- * `from_users` list cannot keep anyone out of a script: whoever may call the API can name an
- * allowed user. This stays until a manual run's actor comes from something the caller cannot
- * pick, such as an API key bound to one actor. Lift it there, in this one function.
- */
-function refuseScriptOnManualRun(trigger: CompiledTrigger): void {
-  if (trigger.on !== "manual.run") return;
-  throw new Error(SCRIPT_ON_MANUAL_RUN_MESSAGE);
 }
 
 /**

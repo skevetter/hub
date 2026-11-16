@@ -5,6 +5,10 @@ import {
   PollCliAuthorizationRequestSchema,
   ProblemSchema,
   StartCliAuthorizationRequestSchema,
+  WebhookPathSchema,
+  WebhookHeadersSchema,
+  WebhookJsonBodySchema,
+  WebhookTextBodySchema,
 } from "./contracts.js";
 import { publicOperationManifest } from "./operation-manifest.js";
 
@@ -75,7 +79,7 @@ for (const definition of publicOperationManifest) {
   const responses = Object.fromEntries(
     Object.entries(definition.responses).map(([status, description]) => [
       status,
-      Number(status) === definition.successStatus
+      Number(status) === definition.successStatus || (definition.webhook && Number(status) === 200)
         ? {
             description,
             headers: requestIdResponseHeader,
@@ -93,11 +97,48 @@ for (const definition of publicOperationManifest) {
                     },
                   }
                 : {}),
+              ...(Number(status) === 429 || Number(status) === 503
+                ? {
+                    "Retry-After": {
+                      description: "Seconds to wait before retrying.",
+                      schema: { type: "integer" as const, minimum: 1, example: 30 },
+                    },
+                  }
+                : {}),
+              ...(Number(status) === 405
+                ? {
+                    Allow: {
+                      description: "Allowed HTTP method.",
+                      schema: { type: "string" as const, example: "POST" },
+                    },
+                  }
+                : {}),
             },
             content: { "application/problem+json": { schema: ProblemSchema } },
           },
     ]),
   );
+  let request: Parameters<typeof registry.registerPath>[0]["request"];
+  if (definition.webhook) {
+    request = {
+      params: WebhookPathSchema,
+      headers: WebhookHeadersSchema,
+      body: {
+        required: true,
+        content: {
+          "application/json": { schema: WebhookJsonBodySchema },
+          "text/plain": { schema: WebhookTextBodySchema },
+        },
+      },
+    };
+  } else if (definition.requestSchema !== undefined) {
+    request = {
+      body: {
+        required: true,
+        content: { "application/json": { schema: definition.requestSchema } },
+      },
+    };
+  }
   registry.registerPath({
     method: definition.method,
     path: definition.path,
@@ -106,16 +147,7 @@ for (const definition of publicOperationManifest) {
     description: definition.description,
     tags: [definition.tag],
     security: [{ bearerAuth: [] }],
-    ...(definition.requestSchema === undefined
-      ? {}
-      : {
-          request: {
-            body: {
-              required: true,
-              content: { "application/json": { schema: definition.requestSchema } },
-            },
-          },
-        }),
+    ...(request === undefined ? {} : { request }),
     responses,
     "x-required-scopes": [definition.scope],
   });
@@ -133,6 +165,8 @@ export const publicOpenApiDocument = new OpenApiGeneratorV31(registry.definition
     servers: [{ url: "/", description: "This Hub instance" }],
     tags: [
       { name: "CLI login" },
+      { name: "Triggers" },
+      { name: "Webhooks" },
       { name: "Projects" },
       { name: "Configurations" },
       { name: "Runs" },

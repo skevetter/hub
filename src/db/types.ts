@@ -1250,6 +1250,11 @@ export interface Database {
     providerEventReceiptId: string,
   ): Promise<TriggerRunRecord[]>;
   listTriggerRunsForProject(projectId: string, limit: number): Promise<TriggerRunRecord[]>;
+  countActiveTriggerRuns(
+    organizationId: string,
+    projectId: string,
+    triggerName: string,
+  ): Promise<number>;
   listProjectActivityRuns(
     projectId: string,
     limit: number,

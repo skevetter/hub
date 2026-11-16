@@ -235,11 +235,8 @@ run:
   it.each([
     ["no audience", "  manual.run: {}\n"],
     ["a wildcard audience", '  manual.run:\n    filters:\n      from_users: ["*"]\n'],
-    ["named people", "  manual.run:\n    filters:\n      from_users: [alice]\n"],
-  ])(
-    "refuses a script on manual.run with %s, because the actor is the caller's choice",
-    (_, on) => {
-      const found = issues(`
+  ])("refuses a manual script with %s", (_, on) => {
+    const found = issues(`
 name: run-it
 on:
 ${on}run:
@@ -248,13 +245,24 @@ ${on}run:
     cwd: /workspace/webapp
   script: ./deploy.sh
 `);
-      assert.equal(found.length, 1);
-      assert.equal(
-        found[0]?.message,
-        "Script actions on manual.run are not available yet: the actor on a manual run is chosen by the caller, so from_users cannot protect the script. Use a schedule, a GitHub notification or another external event.",
-      );
-    },
-  );
+    assert.match(found[0]?.message ?? "", /needs filters\.from_users that names/u);
+  });
+
+  it("accepts a manual script with a named key actor", () => {
+    assert.deepEqual(
+      issues(`
+name: run-it
+on:
+  manual.run:
+    filters:
+      from_users: [sender]
+run:
+  target: { daemon: devbox, cwd: /workspace/webapp }
+  script: ./deploy.sh
+`),
+      [],
+    );
+  });
 
   it("refuses manual.run for a script when it shares a document with a safe event", () => {
     const found = issues(`
@@ -272,7 +280,7 @@ run:
     cwd: /workspace/webapp
   script: ./nightly.sh
 `);
-    assert.match(found[0]?.message ?? "", /Script actions on manual\.run are not available yet/u);
+    assert.match(found[0]?.message ?? "", /needs filters\.from_users that names/u);
   });
 
   it("allows a manual run agent prompt without an audience, as before", () => {

@@ -22,9 +22,6 @@ export const SCRIPT_NOTIFICATION_REASONS = [
   "ci_activity",
 ] as const;
 
-export const SCRIPT_ON_MANUAL_RUN_MESSAGE =
-  "Script actions on manual.run are not available yet: the actor on a manual run is chosen by the caller, so from_users cannot protect the script. Use a schedule, a GitHub notification or another external event.";
-
 /** The YAML filter keys the form knows how to qualify. */
 export type QualifierKey = "label" | "repo" | "reason";
 

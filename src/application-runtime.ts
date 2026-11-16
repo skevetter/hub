@@ -34,6 +34,7 @@ import type { ProviderConnectionRegistration } from "./providers/registration.js
 import type { ScriptLimits } from "./workflows/script-limits.js";
 import { runShutdownStage } from "./shutdown-stage.js";
 import type { TriggerHandler } from "./triggers/index.js";
+import type { WebhookOptions } from "./webhook-config.js";
 
 export interface ApplicationCompositionOptions {
   database: Database | null;
@@ -50,6 +51,7 @@ export interface ApplicationCompositionOptions {
   daemonConnectionForId?: DaemonDispatchLifecycleOptions["connectionForDaemon"];
   githubNotifications?: GitHubNotificationsOptions;
   scriptLimits?: ScriptLimits | undefined;
+  webhookOptions?: WebhookOptions | undefined;
   close(): Promise<void>;
 }
 
@@ -124,6 +126,7 @@ async function createOwnedApplicationRuntime(
       ? {}
       : { githubNotifications: options.githubNotifications }),
     scriptLimits: options.scriptLimits,
+    webhookOptions: options.webhookOptions,
   });
   ownership.own(() => application.hub.stop(), "composition.hub");
   await application.hub.start(

@@ -55,6 +55,16 @@ export function createDatabasePublicOperationRepository(
         slack: connections.slack.map(({ teamId, teamName }) => ({ teamId, teamName })),
       };
     },
+    async resolveWebhookProject(organizationId, triggerName) {
+      const trigger = (await database.listOrganizationTriggers(organizationId)).find(
+        ({ name, enabled }) => name === triggerName && enabled,
+      );
+      return trigger === undefined ? undefined : { id: trigger.runtimeProjectId };
+    },
+    findWebhookReceipt: (organizationId, deliveryId) =>
+      database.findProviderEventReceiptByDeliveryId(deliveryId, organizationId),
+    countActiveTriggerRuns: (organizationId, projectId, triggerName) =>
+      database.countActiveTriggerRuns(organizationId, projectId, triggerName),
     async resolveManualRunProject(organizationId, triggerName, projectSlug) {
       const organizationTrigger = (await database.listOrganizationTriggers(organizationId)).find(
         ({ name }) => name === triggerName,

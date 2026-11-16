@@ -11,7 +11,7 @@ import {
   triggerFormErrors,
   type TriggerFormValue,
 } from "./editor.js";
-import { SCRIPT_NOTIFICATION_REASONS, SCRIPT_ON_MANUAL_RUN_MESSAGE } from "./events.js";
+import { SCRIPT_NOTIFICATION_REASONS } from "./events.js";
 import { compileTriggerDocument } from "./index.js";
 import { agentRun, isScriptRun, TriggerDocumentSchema } from "./schema.js";
 
@@ -201,11 +201,11 @@ describe("script trigger form bridge", () => {
     expect(triggerFormErrors(scriptForm())).toEqual({});
   });
 
-  test("a script on a manual run is refused in the form with the same message as at save", () => {
+  test("a script on a manual run accepts a named key actor", () => {
     const errors = triggerFormErrors(
       scriptForm({ event: "manual.run", connection: "", allowedUsers: "alice" }),
     );
-    expect(errors.action).toBe(SCRIPT_ON_MANUAL_RUN_MESSAGE);
+    expect(errors).toEqual({});
     expect(
       triggerFormErrors(scriptForm({ event: "manual.run", connection: "", action: "prompt" }))
         .action,

@@ -33,7 +33,7 @@ export interface ManualMergeData {
   manual: {
     actor: string;
     input: string | TruncatedManualValue;
-    data?: Readonly<Record<string, unknown>> | TruncatedManualValue;
+    data?: Readonly<Record<string, unknown>> | TruncatedManualValue | undefined;
     source: "manual.run" | "webhook.received";
     trigger: string;
     delivery_id: string;

@@ -237,6 +237,7 @@ describe("HTTP failure ownership", () => {
       validateConfiguration: failOperation,
       installConfiguration: failOperation,
       dispatchManualRun: failOperation,
+      receiveWebhook: failOperation,
       issueEnrollmentToken: failOperation,
     };
     const api = createPublicApi(
