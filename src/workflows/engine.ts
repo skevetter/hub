@@ -992,11 +992,7 @@ export class DurableWorkflowEngine {
         this.leaseMs,
       );
       if (run === undefined) return;
-      try {
-        await this.options.timelineReconciler?.reconcileBeforeTerminal(run.organizationId, run.id);
-      } catch (error) {
-        this.report(error, "run.timeline.reconcile", { triggerRunId: run.id });
-      }
+      await this.options.timelineReconciler?.reconcileBeforeTerminal(run.organizationId, run.id);
       try {
         const reactionState = await this.options.onWorkflowRunTerminal?.(run);
         const deliveredReactionState =

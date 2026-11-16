@@ -19,6 +19,7 @@ import { RunTimelineReconciler } from "./reconcile.js";
 import { createObservedDatabase } from "./observed-database.js";
 import { createTimelineScrubber } from "./scrub.js";
 import { jsonbBytes } from "./data.js";
+import { readTimelineScrubValues } from "./secrets.js";
 
 const ORGANIZATION = "capture-integration-organization";
 const PAGE = { afterSeq: 0, limit: 5110 };
@@ -41,11 +42,14 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function pipeline(database: Database = createMemoryDatabase({ organizationIds: [ORGANIZATION] })) {
+function pipeline(
+  database: Database = createMemoryDatabase({ organizationIds: [ORGANIZATION] }),
+  scrubValues: readonly string[] = [SECRET],
+) {
   const logs = new FailureLogStream();
   const logger = createLogger(logs);
   const bus = new RunTimelineBus();
-  const scrub = createTimelineScrubber({ scrubValues: [SECRET] });
+  const scrub = createTimelineScrubber({ scrubValues });
   let now = new Date();
   const options = {
     bus,
@@ -54,11 +58,7 @@ function pipeline(database: Database = createMemoryDatabase({ organizationIds: [
     retentionDays: 30,
     now: () => now,
     reportFailure: (error: unknown, operation: string) => {
-      reportFailure(
-        error,
-        { operation, component: "run-progress" },
-        { logger, scrubValues: [SECRET] },
-      );
+      reportFailure(error, { operation, component: "run-progress" }, { logger, scrubValues });
     },
   };
   const timeline = new RunTimeline(database, options);
@@ -344,6 +344,55 @@ describe("daemon capture through persisted workflow transitions", () => {
     assert.equal(after.filter((row) => row.kind === "agent_started").length, 1);
     assert.equal(after.filter((row) => row.data["callId"] === "old-call").length, 1);
     assert.equal(after.at(-1)?.data["callId"], "new-call");
+  });
+
+  it("scrubs a startup-known credential from multiline terminal reconciliation errors through the real engine", async () => {
+    const credential = ["fixture-known-", "qwertyuioplkjhgf"].join("");
+    const runtime = pipeline(
+      undefined,
+      readTimelineScrubValues({ PASEO_HUB_AUTH_SECRET: credential }),
+    );
+    const fixture = await turnEndFixture({
+      database: runtime.observed,
+      organizationId: ORGANIZATION,
+      workflow: true,
+      timeline: runtime.timeline,
+    });
+    cleanup.push(() => fixture.lifecycle.stop());
+    const { execution, step } = await fixture.dispatch();
+    assert.ok(step);
+    await runtime.observed.linkWorkflowStepRunExecution(step.id, execution.id);
+    await fixture.lifecycle.completeAgentExecutionFromCallback({
+      executionId: execution.id,
+      token: deriveAgentExecutionCompletionToken("test-secret", execution.id),
+    });
+    await runtime.reconciler.reconcile(ORGANIZATION, step.triggerRunId);
+    await runtime.database.succeedTriggerRun(step.triggerRunId);
+    vi.spyOn(runtime.database, "appendRunTimelineEvent").mockRejectedValue(
+      new Error(`query rejected\n    at ${credential}`),
+    );
+    const notified: string[] = [];
+    const engine = new DurableWorkflowEngine({
+      database: runtime.database,
+      entitlements: createUnlimitedEntitlementsService(),
+      timelineReconciler: runtime.reconciler,
+      logger: runtime.logger,
+      onWorkflowRunTerminal: async (run) => {
+        notified.push(run.id);
+      },
+    });
+    cleanup.push(() => engine.stop());
+    await engine.processAvailable();
+    await vi.waitFor(() => assert.deepEqual(notified, [step.triggerRunId]));
+    await engine.stop();
+    const records = runtime.logs
+      .records()
+      .filter((record) => record["operation"] === "run.timeline.reconcile");
+    assert.equal(records.length, 1);
+    for (let index = 0; index + 8 <= credential.length; index += 1)
+      assert.equal(runtime.logs.text().includes(credential.slice(index, index + 8)), false);
+    const terminal = await runtime.database.findTriggerRunById(step.triggerRunId);
+    assert.ok(terminal?.outcome === "accepted" && terminal.terminalNotificationDeliveredAt);
   });
 
   it("seals terminal rows before the durable notification callback can observe the ended run", async () => {

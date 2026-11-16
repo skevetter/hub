@@ -128,7 +128,11 @@ export class RunTimelineReconciler {
   }
 
   async reconcileBeforeTerminal(organizationId: string, runId: string): Promise<void> {
-    await this.withDeadline(this.reconcile(organizationId, runId));
+    try {
+      await this.withDeadline(this.reconcile(organizationId, runId));
+    } catch (error) {
+      this.report(error, "run.timeline.reconcile", { organizationId, triggerRunId: runId });
+    }
   }
 
   private async withDeadline(operation: Promise<void>): Promise<void> {
