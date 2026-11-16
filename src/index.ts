@@ -53,6 +53,7 @@ import { createAccountMailer } from "./auth/account-emails.js";
 import { migrateLegacyProjectTriggers } from "./triggers/migration.js";
 import { readGitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
 import { readWebhookOptions } from "./webhook-config.js";
+import { readRunProgressSettings } from "./run-progress/settings.js";
 import {
   createServerShutdown,
   installShutdownSignals,
@@ -85,6 +86,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
   try {
     const config = loadRuntimeConfig();
     const webhookOptions = readWebhookOptions(process.env);
+    const runProgress = readRunProgressSettings(process.env);
     const { database, runtime, locks } = await createDatabaseHandle();
     resources.own(() => database.close(), "composition.database");
     const migration = await migrateLegacyProjectTriggers(database);
@@ -183,6 +185,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       completionTokenSecret: identity.authSecret,
       scriptLimits,
       webhookOptions,
+      runProgress,
       ...(githubNotifications === undefined ? {} : { githubNotifications }),
       close: () => resources.close(),
     });

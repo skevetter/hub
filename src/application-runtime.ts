@@ -35,6 +35,9 @@ import type { ScriptLimits } from "./workflows/script-limits.js";
 import { runShutdownStage } from "./shutdown-stage.js";
 import type { TriggerHandler } from "./triggers/index.js";
 import type { WebhookOptions } from "./webhook-config.js";
+import { readRunProgressSettings, type RunProgressSettings } from "./run-progress/settings.js";
+import { TimelineRetention } from "./run-timeline/retention.js";
+import { reportFailure } from "./failures/index.js";
 
 export interface ApplicationCompositionOptions {
   database: Database | null;
@@ -52,6 +55,7 @@ export interface ApplicationCompositionOptions {
   githubNotifications?: GitHubNotificationsOptions;
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
+  runProgress?: RunProgressSettings;
   close(): Promise<void>;
 }
 
@@ -72,6 +76,7 @@ async function createOwnedApplicationRuntime(
   options: ApplicationCompositionOptions,
   ownership: CompositionResources,
 ): Promise<ApplicationRuntime> {
+  startTimelineRetention(options, ownership);
   const registrations = options.registrations ?? [];
   const connections = new Map(
     registrations.map((registration) => [registration.connection.name, registration.connection]),
@@ -360,6 +365,24 @@ async function createOwnedApplicationRuntime(
       requests.get(name)?.(request) ?? Promise.resolve(new Response("Not Found", { status: 404 })),
     stop: () => ownership.close(),
   };
+}
+
+function startTimelineRetention(
+  options: ApplicationCompositionOptions,
+  ownership: CompositionResources,
+): void {
+  const runProgress = options.runProgress ?? readRunProgressSettings({});
+  if (options.database === null) return;
+  const retention = new TimelineRetention(options.database, {
+    retentionDays: runProgress.retentionDays,
+    reportFailure: (error) =>
+      reportFailure(error, {
+        operation: "run.timeline.retention",
+        component: "run-progress",
+      }),
+  });
+  ownership.own(() => retention.stop(), "composition.timeline_retention");
+  retention.start();
 }
 
 function triggerDashboardFor(
