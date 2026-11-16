@@ -111,7 +111,7 @@ async function handoffLinearEvent(
   try {
     let event = normalizeLinearEvent(verified.payload, verified.eventName);
     if (event === undefined) {
-      logger.info({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
+      logger.debug({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
       return new Response("OK", { status: 200 });
     }
     if (eventProjectId(event) === undefined && options.resolveIssue !== undefined) {

@@ -6,6 +6,8 @@ import type { OrganizationAccessValue } from "../../auth/organization-access.js"
 import type { AuthServer } from "../../auth/server.js";
 import { createMemoryDatabase } from "../../db/memory.js";
 import type { StartConnectionAttemptInput } from "../../db/types.js";
+import { createActiveProjectConfiguration } from "../../test-utils/project-configuration.js";
+import { isAcceptedTriggerProviderMatch } from "../../triggers/index.js";
 import type { LinearApiClient, LinearConnectionClient } from "./client.js";
 import { createLinearRegistration } from "./index.js";
 
@@ -155,7 +157,7 @@ describe("Linear registration", () => {
       accessToken: "expired-token",
       refreshToken: null,
       accessTokenExpiresAt: new Date(0),
-      scopes: ["read", "comments:create"],
+      scopes: ["read", "comments:create", "app:assignable", "app:mentionable"],
     };
     assert.deepEqual(
       registration.connection.status({ github: [], discord: [], slack: [], linear: [expired] }),
@@ -170,6 +172,124 @@ describe("Linear registration", () => {
       }),
       { status: "connected" },
     );
+    assert.deepEqual(
+      registration.connection.status({
+        github: [],
+        discord: [],
+        slack: [],
+        linear: [
+          { ...expired, scopes: ["read", "comments:create"], refreshToken: "refresh-token" },
+        ],
+      }),
+      { status: "requiresReauthorization" },
+    );
+  });
+
+  it("deduplicates a repeated delegated webhook delivery into one run", async () => {
+    const database = createMemoryDatabase();
+    database.findLinearConnection = async () => ({
+      id: "linear-connection",
+      organizationId: "org",
+      slug: "workspace",
+      providerApplicationId: "client",
+      linearOrganizationId: "linear-org",
+      linearOrganizationName: "Workspace",
+      appUserId: "installed-app",
+      accessToken: "token",
+      refreshToken: "refresh-token",
+      accessTokenExpiresAt: null,
+      scopes: ["read", "comments:create", "app:assignable", "app:mentionable"],
+    });
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      database,
+      {
+        environments: [{ name: "runner", kind: "daemon", daemon: "runner", cwd: "/repo" }],
+        triggers: [
+          {
+            name: "assignment",
+            on: "linear.issue_assigned",
+            max_runtime: "1h",
+            filters: { project: "linear-project", from_users: ["operator"] },
+            steps: [
+              {
+                id: "work",
+                environment: "runner",
+                max_runtime: "1h",
+                idle_timeout: "5m",
+                agent: { provider: "codex" },
+                prompt: [{ text: "Work from ${{ paseo.context }}" }],
+              },
+            ],
+          },
+        ],
+      },
+      { organizationId: "org" },
+    );
+    await database.activateProjectConfigurationRevision(project.id, revision.id, [
+      {
+        provider: "linear",
+        connectionId: "linear-connection",
+        resourceId: "linear-project",
+        triggerName: "assignment",
+      },
+    ]);
+    const registration = createLinearRegistration({
+      database,
+      auth: null,
+      applicationBaseUrl: "https://hub.test",
+      publicBaseUrl: "https://hub.test",
+      configuration: linearConfiguration(),
+    });
+    const provider = registration.triggerProviders[0]!({
+      configurationStoreForProject: () => store,
+      connectionsForProject: () => () => {
+        throw new Error("delegation must not resolve configuration connection values");
+      },
+    });
+    assert(provider !== undefined);
+    const runs: Array<{ id: string; created: boolean; receiptId: string; prompt: string }> = [];
+    await registration.sources[0]!.start(async (event) => {
+      const matches = await provider.match(event);
+      assert.notEqual(typeof matches, "string");
+      if (typeof matches === "string") throw new Error(matches);
+      for (const match of matches) {
+        if (!isAcceptedTriggerProviderMatch(match)) throw new Error("expected an accepted match");
+        const accepted = await database.createAcceptedTriggerRun({
+          organizationId: event.organizationId,
+          projectId: event.projectId,
+          configurationRevisionId: event.configurationRevisionId,
+          providerEventReceiptId: event.providerEventReceiptId,
+          configuredTriggerName: match.triggerName,
+          prompt: match.invocation.prompt,
+          inputs: match.invocation.inputs,
+          triggerContext: match.triggerContext,
+          outputContext: match.outputContext,
+          deadlineAt: new Date(Date.now() + 3_600_000),
+          stepIds: ["work"],
+        });
+        runs.push({
+          id: accepted.run.id,
+          created: accepted.created,
+          receiptId: event.providerEventReceiptId,
+          prompt: accepted.run.prompt,
+        });
+      }
+    });
+    const endpoint = registration.requests[0]!;
+    assert.equal((await endpoint.handle(delegatedIssueRequest("Original issue"))).status, 200);
+    assert.equal((await endpoint.handle(delegatedIssueRequest("Changed retry body"))).status, 200);
+    assert.equal(runs.length, 2);
+    assert.deepEqual(
+      runs.map((run) => run.created),
+      [true, false],
+    );
+    assert.equal(runs[0]?.id, runs[1]?.id);
+    assert.equal(runs[0]?.receiptId, runs[1]?.receiptId);
+    assert.deepEqual(
+      runs.map((run) => run.prompt),
+      ["Original issue", "Original issue"],
+    );
+    await registration.sources[0]!.stop();
   });
 
   it("drops an under-scoped compact event before attempting issue hydration", async () => {
@@ -230,6 +350,36 @@ describe("Linear registration", () => {
 
 function linearConfiguration() {
   return { clientId: "client", clientSecret: "secret", webhookSecret: "webhook-secret" };
+}
+
+function delegatedIssueRequest(title: string): Request {
+  const body = JSON.stringify({
+    action: "update",
+    type: "Issue",
+    organizationId: "linear-org",
+    actor: { id: "operator" },
+    webhookTimestamp: Date.now(),
+    data: {
+      id: "issue",
+      title,
+      projectId: "linear-project",
+      assigneeId: null,
+      delegate: { id: "installed-app" },
+    },
+    updatedFrom: { delegateId: null },
+  });
+  return new Request("https://hub.test/api/integrations/linear/events", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "linear-delivery": "delegated-delivery",
+      "linear-event": "Issue",
+      "linear-signature": createHmac("sha256", linearConfiguration().webhookSecret)
+        .update(body)
+        .digest("hex"),
+    },
+    body,
+  });
 }
 
 function linearCommentRequest(): Request {

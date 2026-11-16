@@ -66,9 +66,10 @@ export function matchLinearTriggers(
   config: { triggers: readonly MatchedTriggerDefinition[] },
   event: NormalizedLinearEvent,
   connectionId?: string | null,
+  appUserId?: string,
 ): MatchedLinearTrigger[] {
   return config.triggers.flatMap((trigger) => {
-    if (!matchesLinearEvent(trigger.on, event)) return [];
+    if (!matchesLinearEvent(trigger.on, event, appUserId)) return [];
     if (!matchesTriggerFilter(trigger, event, connectionId)) return [];
     return [{ event, trigger }];
   });
@@ -101,7 +102,11 @@ export function matchesIssueScope(
   return true;
 }
 
-function matchesLinearEvent(eventName: string, event: NormalizedLinearEvent): boolean {
+function matchesLinearEvent(
+  eventName: string,
+  event: NormalizedLinearEvent,
+  appUserId: string | undefined,
+): boolean {
   if (eventName === "linear.issue_entered_scope") {
     return event.type === "issue" && (event.action === "create" || event.action === "update");
   }
@@ -109,8 +114,11 @@ function matchesLinearEvent(eventName: string, event: NormalizedLinearEvent): bo
     return (
       event.type === "issue" &&
       event.action === "update" &&
-      event.issue.assigneeId !== null &&
-      Object.hasOwn(event.updatedFrom, "assigneeId")
+      ((event.issue.assigneeId !== null && Object.hasOwn(event.updatedFrom, "assigneeId")) ||
+        (appUserId !== undefined &&
+          event.issue.delegateId === appUserId &&
+          Object.hasOwn(event.updatedFrom, "delegateId") &&
+          event.updatedFrom.delegateId !== appUserId))
     );
   }
   return (

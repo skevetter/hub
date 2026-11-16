@@ -111,6 +111,7 @@ The image is published as `ghcr.io/getpaseo/hub:latest`.
 
 See the [self-hosting guide](https://paseo.sh/docs/hub/self-hosting) for production deployment details.
 For Linear setup and workflows, see the public [Linear app](https://paseo.sh/docs/hub/self-hosting/linear-app) and [Linear triggers](https://paseo.sh/docs/hub/triggers/linear) guides.
+For this fork's agent scopes, delegation behavior and reauthorization requirements, see [Linear agents](docs/linear-agents.md).
 
 ## Stop and restart
 

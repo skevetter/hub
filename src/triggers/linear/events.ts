@@ -12,12 +12,14 @@ const LinearIssueSchema = z.object({
   projectId: LinearIdSchema.nullable(),
   stateId: LinearIdSchema.nullable(),
   assigneeId: LinearIdSchema.nullable(),
+  delegateId: LinearIdSchema.nullable().optional(),
   labelIds: z.array(LinearIdSchema),
 });
 const LinearIssuePreviousSchema = z.object({
   projectId: LinearIdSchema.nullable().optional(),
   stateId: LinearIdSchema.nullable().optional(),
   assigneeId: LinearIdSchema.nullable().optional(),
+  delegateId: LinearIdSchema.nullable().optional(),
   labelIds: z.array(LinearIdSchema).optional(),
 });
 
@@ -184,6 +186,7 @@ function normalizeIssue(
     projectId: relatedId(data, "projectId", "project", hydrated?.projectId ?? null),
     stateId: relatedId(data, "stateId", "state", hydrated?.stateId ?? null),
     assigneeId: relatedId(data, "assigneeId", "assignee", hydrated?.assigneeId ?? null),
+    delegateId: relatedId(data, "delegateId", "delegate", null),
     labelIds: firstDefined(readLabelIds(data), hydrated?.labelIds) ?? [],
   };
 }
@@ -235,6 +238,9 @@ function normalizePreviousIssue(value: unknown): z.infer<typeof LinearIssuePrevi
       : {}),
     ...(hasOwn(previous, "assigneeId") || hasOwn(previous, "assignee")
       ? { assigneeId: readPreviousRelatedId(previous, "assigneeId", "assignee") }
+      : {}),
+    ...(hasOwn(previous, "delegateId") || hasOwn(previous, "delegate")
+      ? { delegateId: readPreviousRelatedId(previous, "delegateId", "delegate") }
       : {}),
     ...(hasOwn(previous, "labelIds") || hasOwn(previous, "labels")
       ? { labelIds: readLabelIds(previous) ?? [] }

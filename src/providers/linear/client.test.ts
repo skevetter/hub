@@ -11,6 +11,7 @@ import {
   createLinearApiClient,
   createLinearConnectionClient,
   hasRequiredLinearScopes,
+  linearConnectionRequiresReauthorization,
 } from "./client.js";
 
 describe("Linear connection client", () => {
@@ -44,9 +45,13 @@ describe("Linear connection client", () => {
       authorization.searchParams.get("redirect_uri"),
       "https://hub.test/api/integrations/linear/callback",
     );
-    assert.equal(authorization.searchParams.get("scope"), "read,comments:create");
+    assert.equal(
+      authorization.searchParams.get("scope"),
+      "read,comments:create,app:assignable,app:mentionable",
+    );
     assert.equal(authorization.searchParams.get("actor"), "app");
     assert.equal(authorization.searchParams.get("state"), "state-value");
+    assert.equal(authorization.searchParams.get("prompt"), "consent");
 
     assert.deepEqual(await client.exchangeCode("code-value"), {
       linearOrganizationId: "linear-org",
@@ -77,7 +82,12 @@ describe("Linear connection client", () => {
 
     const installation = await client.exchangeCode("code-value");
 
-    assert.deepEqual(installation.scopes, ["read", "comments:create"]);
+    assert.deepEqual(installation.scopes, [
+      "read",
+      "comments:create",
+      "app:assignable",
+      "app:mentionable",
+    ]);
   });
 
   it("reads a bounded, chronological history before the triggering comment", async () => {
@@ -485,9 +495,28 @@ describe("Linear connection client", () => {
     assert.deepEqual(requests, ["Bearer fresh-token", "Bearer fresh-token"]);
   });
 
-  it("requires read access and the narrow comment-creation scope", () => {
-    assert.equal(hasRequiredLinearScopes(["read", "comments:create"]), true);
-    assert.equal(hasRequiredLinearScopes(["read"]), false);
+  it("requires each agent scope while preserving the recorded grants", () => {
+    const scopes = ["read", "comments:create", "app:assignable", "app:mentionable"];
+    assert.equal(hasRequiredLinearScopes([...scopes, "write"]), true);
+    for (const missing of scopes) {
+      const granted = scopes.filter((scope) => scope !== missing);
+      const connection = {
+        scopes: granted,
+        refreshToken: "refresh-token",
+        accessTokenExpiresAt: null,
+      };
+      assert.equal(hasRequiredLinearScopes(granted), false, missing);
+      assert.equal(linearConnectionRequiresReauthorization(connection), true, missing);
+      assert.deepEqual(connection.scopes, granted);
+    }
+    assert.equal(
+      linearConnectionRequiresReauthorization({
+        scopes,
+        refreshToken: "refresh-token",
+        accessTokenExpiresAt: null,
+      }),
+      false,
+    );
   });
 });
 

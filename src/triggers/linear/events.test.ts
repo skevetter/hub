@@ -3,6 +3,22 @@ import { describe, it } from "vitest";
 import { normalizeLinearEvent } from "./events.js";
 
 describe("Linear event normalization", () => {
+  it.each([
+    [{ delegateId: "installed-app" }, { delegateId: null }],
+    [{ delegate: { id: "installed-app" } }, { delegate: null }],
+  ])("normalizes current and previous delegates", (current, previous) => {
+    const event = normalizeLinearEvent({
+      action: "update",
+      type: "Issue",
+      organizationId: "linear-org",
+      updatedFrom: previous,
+      data: { id: "issue", title: "Delegated issue", ...current },
+    });
+    if (event?.type !== "issue") throw new Error("expected an issue event");
+    assert.equal(event.issue.delegateId, "installed-app");
+    assert.deepEqual(event.updatedFrom, { delegateId: null });
+  });
+
   it("uses a comment's own timestamp as the causal history anchor", () => {
     const event = normalizeLinearEvent({
       action: "create",

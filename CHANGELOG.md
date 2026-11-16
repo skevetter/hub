@@ -12,6 +12,7 @@
 
 ### Changed
 
+- Linear connections request assignable and mentionable agent scopes and show consent for each installation. Existing connections require reauthorization. The assigned issue trigger also accepts delegation to the installed app. See [Linear agents](docs/linear-agents.md).
 - Unhandled provider event receipts expire automatically after seven days on every instance. Receipts routed to a trigger or still referenced by a run or attachment remain available.
 
 ## 0.11.0 - 2026-10-25

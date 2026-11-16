@@ -9,6 +9,55 @@ import { createLinearTriggerProvider } from "./provider.js";
 
 describe("Linear trigger provider", () => {
   it.each([
+    {
+      id: "linear-connection",
+      organizationId: "hub-org",
+      appUserId: "installed-app",
+      matches: true,
+    },
+    { id: "another", organizationId: "hub-org", appUserId: "installed-app", matches: false },
+    {
+      id: "linear-connection",
+      organizationId: "another",
+      appUserId: "installed-app",
+      matches: false,
+    },
+    { id: "linear-connection", organizationId: "hub-org", appUserId: "another", matches: false },
+  ])("binds delegation matching to the installed connection %j", async (connection) => {
+    const configuration = linearCommentConfiguration();
+    configuration.triggers[0]!.on = "linear.issue_assigned";
+    const { project, revision, store } = await activeConfiguration(configuration);
+    const provider = createLinearTriggerProvider({
+      configurationStoreForProject: () => store,
+      connectionForLinearOrganization: async () => connection,
+    });
+    const issue = event("2026-01-02T00:00:00.000Z").issue;
+    const result = await provider.match({
+      ...external(project.id, revision.id),
+      source: "linear.issue",
+      payload: {
+        type: "issue",
+        action: "update",
+        id: "issue",
+        organizationId: "linear-org",
+        actor: { id: "operator" },
+        issue: { ...issue, delegateId: "installed-app" },
+        updatedFrom: { delegateId: null },
+      },
+    });
+    if (connection.matches) {
+      assert.notEqual(typeof result, "string");
+      if (typeof result === "string") throw new Error(result);
+      assert.deepEqual(
+        result.map((match) => match.triggerName),
+        ["comment"],
+      );
+    } else {
+      assert.equal(result, "trigger_filters_rejected");
+    }
+  });
+
+  it.each([
     ["pattern", { pattern: "/run" }, "/run priority=high investigate"],
     ["contains", { contains: "/run" }, "please /run priority=high investigate"],
   ] as const)(

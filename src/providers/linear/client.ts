@@ -1,8 +1,12 @@
 import { z } from "zod";
 import type { Database, LinearConnectionRecord } from "../../db/types.js";
 
-/** The minimum authority required to read issues and leave an outcome on the issue. */
-export const LINEAR_REQUIRED_SCOPES = ["read", "comments:create"] as const;
+export const LINEAR_REQUIRED_SCOPES = [
+  "read",
+  "comments:create",
+  "app:assignable",
+  "app:mentionable",
+] as const;
 
 /** Keep an issue description plus its preceding discussion within one bounded context window. */
 export const LINEAR_ISSUE_CONTEXT_LIMIT = 50;
@@ -201,9 +205,8 @@ export function createLinearConnectionClient(options: {
         response_type: "code",
         scope: LINEAR_REQUIRED_SCOPES.join(","),
         state,
-        // Keep workflow results visibly attributable to the installed Paseo application instead
-        // of impersonating the administrator who completed the connection.
         actor: "app",
+        prompt: "consent",
       });
       return `https://linear.app/oauth/authorize?${parameters.toString()}`;
     },

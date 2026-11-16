@@ -1,3 +1,4 @@
+import type { LinearConnectionRecord } from "../../db/types.js";
 import type { ProjectConfigurationStore } from "../../configuration/store.js";
 import {
   LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT,
@@ -5,7 +6,7 @@ import {
   type LinearIssueComment,
 } from "../../providers/linear/client.js";
 import { reportFailure } from "../../failures/index.js";
-import type { TriggerProvider, TriggerProviderMatch } from "../index.js";
+import type { ExternalTrigger, TriggerProvider, TriggerProviderMatch } from "../index.js";
 import { matchesInputFilters, parseInvocation } from "../invocation.js";
 import { NormalizedLinearEventSchema, type NormalizedLinearEvent } from "./events.js";
 import { matchLinearTriggers, readLinearCommentInvocationParserMessage } from "./match.js";
@@ -69,12 +70,33 @@ export interface LinearMaterializedContext {
 export function createLinearTriggerProvider(options: {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
   client?: Pick<LinearApiClient, "readIssueComments">;
+  connectionForLinearOrganization?: (
+    linearOrganizationId: string,
+  ) => Promise<Pick<LinearConnectionRecord, "id" | "organizationId" | "appUserId"> | undefined>;
 }): TriggerProvider<
   "linear",
   LinearTriggerContext,
   LinearOutputContext,
   LinearMaterializedContext
 > {
+  const installedAppUserIdFor = async (
+    event: NormalizedLinearEvent,
+    trigger: Pick<ExternalTrigger, "connectionId" | "organizationId">,
+  ): Promise<string | undefined> => {
+    if (
+      event.type !== "issue" ||
+      event.issue.delegateId == null ||
+      !Object.hasOwn(event.updatedFrom, "delegateId")
+    ) {
+      return undefined;
+    }
+    const connection = await options.connectionForLinearOrganization?.(event.organizationId);
+    return connection?.id === trigger.connectionId &&
+      connection?.organizationId === trigger.organizationId
+      ? connection?.appUserId
+      : undefined;
+  };
+
   return {
     name: "linear",
     eventNames: ["linear.issue", "linear.comment"],
@@ -87,10 +109,12 @@ export function createLinearTriggerProvider(options: {
       if (!hasSourceTrigger(stored.configuration.triggers, externalTrigger.source)) {
         return "no_trigger_for_source";
       }
+      const appUserId = await installedAppUserIdFor(event, externalTrigger);
       const matched = matchLinearTriggers(
         stored.configuration,
         event,
         externalTrigger.connectionId,
+        appUserId,
       );
       if (matched.length === 0) return "trigger_filters_rejected";
 

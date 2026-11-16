@@ -61,6 +61,94 @@ describe("Linear trigger matching", () => {
     );
   });
 
+  it("starts the assigned trigger only on delegation to the installed app", () => {
+    const config = {
+      triggers: configuration().triggers.filter(
+        (trigger) => trigger.on === "linear.issue_assigned",
+      ),
+    };
+    const delegated = issue({
+      action: "update",
+      updatedFrom: { delegateId: null },
+    });
+    delegated.issue.delegateId = "installed-app";
+    assert.deepEqual(
+      matchLinearTriggers(config, delegated, undefined, "installed-app").map(
+        (match) => match.trigger.name,
+      ),
+      ["assignment"],
+    );
+    for (const rejected of [
+      { ...delegated, action: "create" as const },
+      { ...delegated, action: "remove" as const },
+      { ...delegated, updatedFrom: {} },
+      { ...delegated, updatedFrom: { delegateId: "installed-app" } },
+      { ...delegated, issue: { ...delegated.issue, delegateId: null } },
+      { ...delegated, issue: { ...delegated.issue, delegateId: "another-app" } },
+      { ...delegated, actor: { id: "untrusted" } },
+      { ...delegated, issue: { ...delegated.issue, projectId: "another-project" } },
+    ]) {
+      assert.deepEqual(matchLinearTriggers(config, rejected, undefined, "installed-app"), []);
+    }
+    assert.deepEqual(matchLinearTriggers(config, delegated), []);
+    const reassigned = { ...delegated, updatedFrom: { assigneeId: "previous-user" } };
+    assert.deepEqual(
+      matchLinearTriggers(config, reassigned, undefined, "another-app").map(
+        (match) => match.trigger.name,
+      ),
+      ["assignment"],
+    );
+  });
+
+  it("applies scope and actor filters to delegation without replacing the human assignee", () => {
+    const config = {
+      triggers: [
+        {
+          name: "assignment",
+          on: "linear.issue_assigned",
+          filters: {
+            connectionId: "connection",
+            project: "project-1",
+            states: ["ready"],
+            assignees: ["user-1"],
+            labels: ["eligible"],
+            exclude_labels: ["excluded"],
+            from_users: ["operator"],
+          },
+        },
+      ],
+    };
+    const delegated = issue({
+      action: "update",
+      updatedFrom: { delegateId: "previous-app" },
+      labelIds: ["eligible"],
+    });
+    delegated.issue.delegateId = "installed-app";
+    assert.deepEqual(
+      matchLinearTriggers(config, delegated, "connection", "installed-app").map(
+        (match) => match.trigger.name,
+      ),
+      ["assignment"],
+    );
+    assert.deepEqual(matchLinearTriggers(config, delegated, "another", "installed-app"), []);
+    for (const changes of [
+      { stateId: "backlog" },
+      { assigneeId: null },
+      { labelIds: [] },
+      { labelIds: ["eligible", "excluded"] },
+    ]) {
+      assert.deepEqual(
+        matchLinearTriggers(
+          config,
+          { ...delegated, issue: { ...delegated.issue, ...changes } },
+          "connection",
+          "installed-app",
+        ),
+        [],
+      );
+    }
+  });
+
   it("keeps triggers isolated to their configured Linear connection", () => {
     const connectionId = "11111111-1111-4111-8111-111111111111";
     const config = configuration();

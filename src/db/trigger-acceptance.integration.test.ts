@@ -168,7 +168,7 @@ describe("trigger acceptance persistence", () => {
     );
 
     await client.query(
-      `update linear_connections set scopes = '["read", "comments:create"]'::jsonb
+      `update linear_connections set scopes = '["read", "comments:create", "app:assignable", "app:mentionable"]'::jsonb
        where id = '${connectionId}'`,
     );
     const accepted = await database.acceptLinearEvent({
@@ -181,6 +181,16 @@ describe("trigger acceptance persistence", () => {
     });
     assert.equal(accepted.status, "accepted");
     if (accepted.status === "accepted") assert.equal(accepted.events[0]?.projectId, projectId);
+    const replay = await database.acceptLinearEvent({
+      linearOrganizationId: "linear-scope-workspace",
+      projectId: "another-project",
+      deliveryId: "linear-reauthorized",
+      signatureHash: "different-signature",
+      source: "linear.issue",
+      payload: { title: "Changed retry body" },
+      receivedAt: new Date(2),
+    });
+    assert.deepEqual(replay, accepted);
 
     await client.query(
       `update linear_connections

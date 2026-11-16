@@ -24,6 +24,40 @@ describe("Linear webhook", () => {
     assert.equal(verifyLinearWebhookTimestamp({ webhookTimestamp: "not-a-time" }, NOW), false);
   });
 
+  it.each(["created", "prompted"])(
+    "acknowledges and ignores an AgentSessionEvent %s delivery",
+    async (action) => {
+      const endpoint = createLinearWebhookSource({
+        signingSecret: SECRET,
+        now: () => NOW,
+        resolveIssue: async () => {
+          throw new Error("agent sessions must not hydrate issues");
+        },
+        accept: async () => {
+          throw new Error("agent sessions must not create receipts");
+        },
+      });
+      await endpoint.start(async () => {
+        throw new Error("agent sessions must not dispatch");
+      });
+      const response = await endpoint.handle(
+        request(
+          {
+            type: "AgentSessionEvent",
+            action,
+            organizationId: "linear-org",
+            webhookTimestamp: NOW,
+            agentSession: { id: "session", issue: { id: "issue" } },
+          },
+          "AgentSessionEvent",
+        ),
+      );
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), "OK");
+      await endpoint.stop();
+    },
+  );
+
   it("normalizes an issue, durably accepts it, and dispatches its selected route", async () => {
     const accepted: unknown[] = [];
     const dispatched: DurableProviderEvent[] = [];
@@ -64,6 +98,7 @@ describe("Linear webhook", () => {
           projectId: "project-1",
           stateId: "ready",
           assigneeId: "user-2",
+          delegateId: null,
           labelIds: ["label-1"],
         },
         updatedFrom: {},
