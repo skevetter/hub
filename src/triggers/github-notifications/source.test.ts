@@ -220,6 +220,44 @@ describe("notification source", () => {
     await stopping;
     expect(finished).toBe(true);
   });
+
+  it("aborts an in-flight fetch on stop and can restart without recording a failure", async () => {
+    const now = new Date("2026-11-14T10:00:00Z");
+    const time = fakeClock(now);
+    const { events, recording } = recordingStore();
+    const signals: AbortSignal[] = [];
+    let requested = Promise.withResolvers<void>();
+    const source = createGitHubNotificationsSource(
+      {
+        ...recording,
+        exclusive: (operation) => operation(),
+        readCursor: async () => ({ since: now, lastModified: null, nextPollAt: now }),
+      },
+      {
+        ...options(time.clock),
+        fetch: (_url, init) => {
+          const signal = init.signal!;
+          signals.push(signal);
+          const request = Promise.withResolvers<Response>();
+          signal.addEventListener("abort", () => request.reject(signal.reason), { once: true });
+          requested.resolve();
+          return request.promise;
+        },
+      },
+    );
+    await source.start(async () => {});
+    await requested.promise;
+    await source.stop();
+    expect(signals[0]!.aborted).toBe(true);
+    expect(events).toEqual([]);
+    requested = Promise.withResolvers<void>();
+    await source.start(async () => {});
+    await requested.promise;
+    expect(signals[1]!.aborted).toBe(false);
+    expect(signals[1]).not.toBe(signals[0]);
+    await source.stop();
+    expect(events).toEqual([]);
+  });
 });
 
 describe("notification environment", () => {

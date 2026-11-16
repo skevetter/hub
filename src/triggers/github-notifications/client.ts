@@ -13,6 +13,7 @@ export interface ListNotificationsInput {
   since: Date;
   /** The Last-Modified of the previous successful poll. */
   lastModified: string | null;
+  signal?: AbortSignal;
 }
 
 export type ListNotificationsResult =
@@ -54,23 +55,37 @@ export function createGitHubNotificationsClient(
     options.token.length === 0 ? text : text.replaceAll(options.token, "[redacted]");
 
   return {
-    async list({ since, lastModified }) {
+    async list({ since, lastModified, signal }) {
       const notifications: GitHubNotificationThread[] = [];
       let firstLastModified: string | null = null;
       let pollIntervalSeconds: number | undefined;
       let url: string | undefined = firstPage(root, since);
       for (let page = 0; url !== undefined; page++) {
+        signal?.throwIfAborted();
         if (page >= MAX_PAGES) {
           throw new GitHubNotificationsError("GitHub notifications exceeded the page limit.");
         }
-        const response = await send(request, url, options.token, page === 0 ? lastModified : null);
+        const response = await send(
+          request,
+          url,
+          options.token,
+          page === 0 ? lastModified : null,
+          signal,
+        );
+        signal?.throwIfAborted();
         pollIntervalSeconds ??= readPollInterval(response);
         if (response.status === 304 && page === 0) {
           return { status: "not_modified", pollIntervalSeconds };
         }
-        if (!response.ok) throw await failure(response, scrub);
+        if (!response.ok) {
+          const error = await failure(response, scrub);
+          signal?.throwIfAborted();
+          throw error;
+        }
         if (page === 0) firstLastModified = response.headers.get("last-modified");
-        notifications.push(...(await readPage(response, scrub)));
+        const threads = await readPage(response, scrub, signal);
+        signal?.throwIfAborted();
+        notifications.push(...threads);
         url = nextLink(response.headers.get("link"), root);
       }
       return {
@@ -87,6 +102,7 @@ export function createGitHubNotificationsClient(
     target: string,
     token: string,
     ifModifiedSince: string | null,
+    signal: AbortSignal | undefined,
   ): Promise<Response> {
     const headers: Record<string, string> = {
       accept: "application/vnd.github+json",
@@ -96,8 +112,13 @@ export function createGitHubNotificationsClient(
     };
     if (ifModifiedSince !== null) headers["if-modified-since"] = ifModifiedSince;
     try {
-      return await fetcher(target, { method: "GET", headers });
+      return await fetcher(target, {
+        method: "GET",
+        headers,
+        ...(signal === undefined ? {} : { signal }),
+      });
     } catch (error) {
+      signal?.throwIfAborted();
       const reason = error instanceof Error ? error.message : "request failed";
       throw new GitHubNotificationsError(scrub(`GitHub notifications request failed: ${reason}`));
     }
@@ -123,11 +144,13 @@ function readPollInterval(response: Response): number | undefined {
 async function readPage(
   response: Response,
   scrub: (text: string) => string,
+  signal: AbortSignal | undefined,
 ): Promise<GitHubNotificationThread[]> {
   let body: unknown;
   try {
     body = await response.json();
   } catch {
+    signal?.throwIfAborted();
     throw new GitHubNotificationsError("GitHub notifications returned a body that is not JSON.");
   }
   const parsed = z.array(GitHubNotificationThreadSchema).safeParse(body);

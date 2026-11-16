@@ -76,7 +76,7 @@ function setup(
     pollIntervalMs: 60_000,
     ...(maxThreadsPerPoll === undefined ? {} : { maxThreadsPerPoll }),
   });
-  return { poller, requests, delivered, cursor: () => cursor };
+  return { poller, client, requests, delivered, cursor: () => cursor };
 }
 
 describe("notification poller", () => {
@@ -136,6 +136,54 @@ describe("notification poller", () => {
     const { poller, requests } = setup([], { since: START, lastModified: null, nextPollAt: due });
     expect(await poller.poll(START)).toEqual({ nextPollAt: due, started: 0, skipped: true });
     expect(requests).toEqual([]);
+  });
+
+  it("forwards cancellation and leaves pre-cancelled polls untouched", async () => {
+    const initial = { since: START, lastModified: "stamp-0", nextPollAt: START };
+    const { poller, requests, cursor, delivered } = setup(
+      [{ status: "not_modified", pollIntervalSeconds: undefined }],
+      initial,
+    );
+    const controller = new AbortController();
+    await poller.poll(START, controller.signal);
+    expect(requests).toEqual([
+      { since: START, lastModified: "stamp-0", signal: controller.signal },
+    ]);
+    expect(delivered).toEqual([]);
+
+    const cancelled = setup([], initial);
+    controller.abort();
+    await expect(cancelled.poller.poll(START, controller.signal)).rejects.toBe(
+      controller.signal.reason,
+    );
+    expect(cancelled.requests).toEqual([]);
+    expect(cancelled.cursor()).toEqual(initial);
+    expect(cursor()?.since).toEqual(START);
+  });
+
+  it("does not deliver results received after cancellation", async () => {
+    const initial = { since: START, lastModified: "stamp-0", nextPollAt: START };
+    const { poller, client, cursor, delivered } = setup([], initial);
+    const requested = Promise.withResolvers<void>();
+    const listing = Promise.withResolvers<ListNotificationsResult>();
+    client.list = () => {
+      requested.resolve();
+      return listing.promise;
+    };
+    const controller = new AbortController();
+    const polling = poller.poll(START, controller.signal);
+    const rejected = expect(polling).rejects.toMatchObject({ name: "AbortError" });
+    await requested.promise;
+    controller.abort();
+    listing.resolve({
+      status: "ok",
+      notifications: [thread()],
+      lastModified: "stamp-1",
+      pollIntervalSeconds: undefined,
+    });
+    await rejected;
+    expect(cursor()).toEqual(initial);
+    expect(delivered).toEqual([]);
   });
 
   it("leaves the cursor untouched when the client fails", async () => {

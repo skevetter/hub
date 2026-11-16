@@ -18,6 +18,90 @@ function rawDataToText(data: RawData): string {
   return data.toString();
 }
 
+describe("daemon socket shutdown deadline", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function setup(closeImmediately: boolean) {
+    const now = new Date();
+    const daemon: DaemonRecord = {
+      id: "shutdown-daemon",
+      slug: "shutdown-daemon",
+      machineId: "shutdown-machine",
+      serverId: "shutdown-server",
+      daemonPublicKey: "public-key",
+      credentialVerifier: "verifier",
+      permissions: ["hub.execute"],
+      registeredByApiKeyId: null,
+      registeredByCliCredentialId: null,
+      status: "active",
+      presence: "connected",
+      connectedAt: now,
+      disconnectedAt: null,
+      lastSeenAt: now,
+      createdAt: now,
+    };
+    const stream = new FailureLogStream();
+    const registry = new ActiveDaemonRegistry(
+      {
+        touchDaemon: async () => undefined,
+        setDaemonPresence: async () => undefined,
+      },
+      undefined,
+      createLogger(stream),
+    );
+    const socket = z
+      .instanceof(WebSocket)
+      .parse(Reflect.construct(WebSocket, [null, undefined, { autoPong: true }]));
+    vi.spyOn(socket, "send").mockImplementation(() => {});
+    const close = vi.spyOn(socket, "close").mockImplementation(() => {
+      if (closeImmediately) socket.emit("close", 1001, Buffer.alloc(0));
+    });
+    const terminate = vi.spyOn(socket, "terminate").mockImplementation(() => {
+      socket.emit("close", 1006, Buffer.alloc(0));
+    });
+    registry.accept(daemon, socket);
+    return { registry, socket, close, terminate, stream };
+  }
+
+  it("terminates an unresponsive socket after one second and reports the deadline", async () => {
+    vi.useFakeTimers();
+    const { registry, socket, close, terminate, stream } = setup(false);
+    let stopped = false;
+    const stopping = registry.stop().then(() => {
+      stopped = true;
+      return undefined;
+    });
+    assert.deepEqual(close.mock.calls, [[1001, "server shutdown"]]);
+    await vi.advanceTimersByTimeAsync(999);
+    assert.equal(stopped, false);
+    assert.equal(terminate.mock.calls.length, 0);
+    await vi.advanceTimersByTimeAsync(1);
+    await stopping;
+    assert.equal(terminate.mock.calls.length, 1);
+    assert.equal(vi.getTimerCount(), 0);
+    assert.equal(socket.listenerCount("close"), 1);
+    assertOneFailure(stream, {
+      operation: "daemon.socket.close",
+      component: "daemons",
+      failureKind: "network",
+      canary: "shutdown-never-logged",
+    });
+  });
+
+  it("clears the shutdown timer after a normal close handshake", async () => {
+    vi.useFakeTimers();
+    const { registry, terminate, stream } = setup(true);
+    await registry.stop();
+    assert.equal(vi.getTimerCount(), 0);
+    await vi.advanceTimersByTimeAsync(1000);
+    assert.equal(terminate.mock.calls.length, 0);
+    assert.equal(stream.records().length, 0);
+  });
+});
+
 describe("daemon socket protocol negotiation", () => {
   it.each([
     {

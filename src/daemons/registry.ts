@@ -219,14 +219,31 @@ export class ActiveDaemonRegistry {
 
   async stop(): Promise<void> {
     const activeDaemons = Array.from(this.active.values());
-    const sockets = activeDaemons.map(
-      (active) =>
-        new Promise<void>((resolve) => {
-          if (active.socket.readyState === WebSocket.CLOSED) return resolve();
-          active.socket.once("close", () => resolve());
-          active.socket.close(1001, "server shutdown");
-        }),
-    );
+    const sockets = activeDaemons.map((active) => {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      if (active.socket.readyState === WebSocket.CLOSED) {
+        resolve();
+        return promise;
+      }
+      const finish = () => {
+        clearTimeout(timer);
+        active.socket.off("close", finish);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        this.report(
+          new Error("daemon socket close exceeded the shutdown deadline"),
+          "daemon.socket.close",
+          active.daemon.id,
+          "network",
+        );
+        active.socket.terminate();
+        finish();
+      }, 1000);
+      active.socket.once("close", finish);
+      active.socket.close(1001, "server shutdown");
+      return promise;
+    });
     await Promise.all(sockets);
     await Promise.all(this.presenceWrites);
     for (const [daemonId, pending] of this.pendingByDaemon) {

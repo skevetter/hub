@@ -8,12 +8,13 @@ const since = new Date("2026-11-14T09:00:00.000Z");
 interface Seen {
   url: string;
   headers: Record<string, string>;
+  signal: AbortSignal | null | undefined;
 }
 
 function fakeFetch(responses: (Response | Error)[]) {
   const seen: Seen[] = [];
   const fetch = async (url: string, init: RequestInit) => {
-    seen.push({ url, headers: Object.fromEntries(new Headers(init.headers)) });
+    seen.push({ url, headers: Object.fromEntries(new Headers(init.headers)), signal: init.signal });
     const next = responses.shift();
     if (next === undefined) throw new Error("unexpected request");
     if (next instanceof Error) throw next;
@@ -72,6 +73,7 @@ describe("GitHub notifications client", () => {
 
   it("follows pagination and keeps the first page Last-Modified", async () => {
     const next = "https://api.github.com/notifications?page=2&per_page=50";
+    const controller = new AbortController();
     const { fetch, seen } = fakeFetch([
       json([thread({ id: "1" })], {
         link: `<${next}>; rel="next", <https://api.github.com/notifications?page=2>; rel="last"`,
@@ -82,11 +84,13 @@ describe("GitHub notifications client", () => {
     const result = await createGitHubNotificationsClient({ token: TOKEN, fetch }).list({
       since,
       lastModified: "older",
+      signal: controller.signal,
     });
     expect(result).toMatchObject({ status: "ok", lastModified: "first" });
     expect(result.status === "ok" && result.notifications.map(({ id }) => id)).toEqual(["1", "2"]);
     expect(seen[1]!.url).toBe(next);
     expect(seen[1]!.headers["if-modified-since"]).toBeUndefined();
+    expect(seen.map(({ signal }) => signal)).toEqual([controller.signal, controller.signal]);
   });
 
   it("does not follow a next link to another host", async () => {
@@ -120,6 +124,41 @@ describe("GitHub notifications client", () => {
     expect(error.message).not.toContain(TOKEN);
     expect(error.message).toContain("[redacted]");
   });
+
+  it.each([200, 401])(
+    "aborts an in-flight %s response body without masking cancellation",
+    async (status) => {
+      const controller = new AbortController();
+      const reading = Promise.withResolvers<void>();
+      const client = createGitHubNotificationsClient({
+        token: TOKEN,
+        fetch: async (_url, init) => {
+          const response = new Response(
+            new ReadableStream({
+              start(stream) {
+                init.signal!.addEventListener("abort", () => stream.error(init.signal!.reason), {
+                  once: true,
+                });
+              },
+            }),
+            { status },
+          );
+          const read: () => Promise<unknown> = response.json.bind(response);
+          response.json = async () => {
+            reading.resolve();
+            return read();
+          };
+          return response;
+        },
+      });
+      const listing = client.list({ since, lastModified: null, signal: controller.signal });
+      const rejected = expect(listing).rejects.toMatchObject({ name: "AbortError" });
+      await reading.promise;
+      controller.abort();
+      await expect(listing).rejects.toBe(controller.signal.reason);
+      await rejected;
+    },
+  );
 
   it("rejects a response that is not a notification list", async () => {
     const { fetch } = fakeFetch([json({ unexpected: true })]);

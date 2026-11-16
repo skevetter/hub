@@ -1,6 +1,7 @@
 import { basename } from "node:path";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { reportFailure } from "../../../failures/index.js";
+import { logger } from "../../../logger.js";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import type { PoolClient } from "pg";
 import { createPool, type PostgresPool, type PostgresPoolOptions } from "./pool.js";
@@ -87,7 +88,45 @@ class PostgresRuntime implements DatabaseRuntime {
   }
 
   async close(): Promise<void> {
-    await this.pool.end();
+    const started = performance.now();
+    const stage = "database.close";
+    logger.info({ stage, event: "start", elapsedMs: 0 }, "Database close started");
+    let timer: NodeJS.Timeout | undefined;
+    let outcome = "error";
+    const ending = Promise.resolve()
+      .then(() => this.pool.end())
+      .then(
+        () => "closed" as const,
+        (error: unknown) => {
+          reportFailure(error, {
+            operation: "database.postgres.close",
+            component: "database",
+          });
+          throw error;
+        },
+      );
+    try {
+      const deadline = Promise.withResolvers<"deadline">();
+      timer = setTimeout(() => deadline.resolve("deadline"), 3000);
+      outcome = await Promise.race([ending, deadline.promise]);
+      if (outcome === "deadline") {
+        reportFailure(new Error("PostgreSQL pool close exceeded the shutdown deadline"), {
+          operation: "database.postgres.close",
+          component: "database",
+        });
+      }
+    } finally {
+      clearTimeout(timer);
+      logger.info(
+        {
+          stage,
+          event: "end",
+          elapsedMs: Math.round(performance.now() - started),
+          outcome,
+        },
+        "Database close finished",
+      );
+    }
   }
 
   async withConnection<T>(operation: (connection: QueryHandle) => Promise<T>): Promise<T> {

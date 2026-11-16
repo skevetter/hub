@@ -75,7 +75,7 @@ export interface PollResult {
 }
 
 export interface GitHubNotificationPoller {
-  poll(now: Date): Promise<PollResult>;
+  poll(now: Date, signal?: AbortSignal): Promise<PollResult>;
 }
 
 export function createGitHubNotificationPoller(options: {
@@ -88,9 +88,10 @@ export function createGitHubNotificationPoller(options: {
   const { client, store } = options;
   const limit = options.maxThreadsPerPoll ?? DEFAULT_MAX_THREADS_PER_POLL;
   return {
-    poll: (now) =>
+    poll: (now, signal) =>
       store.exclusive(async () => {
         const cursor = await store.readCursor();
+        signal?.throwIfAborted();
         // The first run starts from now. Notifications that already exist are not replayed.
         if (cursor === undefined) {
           const nextPollAt = new Date(now.getTime() + options.pollIntervalMs);
@@ -104,7 +105,9 @@ export function createGitHubNotificationPoller(options: {
         const result = await client.list({
           since: cursor.since,
           lastModified: cursor.lastModified,
+          ...(signal === undefined ? {} : { signal }),
         });
+        signal?.throwIfAborted();
         const intervalMs = Math.max(
           options.pollIntervalMs,
           (result.pollIntervalSeconds ?? 0) * 1000,

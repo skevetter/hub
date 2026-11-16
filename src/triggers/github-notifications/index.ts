@@ -109,6 +109,7 @@ export function createGitHubNotificationsSource(
     });
   let cancel: (() => void) | undefined;
   let processing: Promise<unknown> | undefined;
+  let controller: AbortController | undefined;
   let notBefore = 0;
   // Status is for the UI. A store error here must not look like a failed poll.
   const remember = async (operation: () => Promise<void>): Promise<void> => {
@@ -122,11 +123,12 @@ export function createGitHubNotificationsSource(
       );
     }
   };
-  const run = async (now: Date): Promise<void> => {
+  const run = async (now: Date, signal: AbortSignal): Promise<void> => {
     let result: PollResult;
     try {
-      result = await active.poll(now);
+      result = await active.poll(now, signal);
     } catch (error) {
+      if (signal.aborted && error === signal.reason) return;
       // A failed poll leaves the cursor alone; the next one picks up where it stopped.
       notBefore = now.getTime() + options.pollIntervalMs;
       reportFailure(
@@ -145,7 +147,9 @@ export function createGitHubNotificationsSource(
     if (processing !== undefined) return;
     const now = time.now();
     if (now.getTime() < notBefore) return;
-    processing = run(now).finally(() => {
+    controller = new AbortController();
+    processing = run(now, controller.signal).finally(() => {
+      controller = undefined;
       processing = undefined;
     });
   };
@@ -157,6 +161,7 @@ export function createGitHubNotificationsSource(
     async stop() {
       cancel?.();
       cancel = undefined;
+      controller?.abort();
       await processing;
     },
   };
