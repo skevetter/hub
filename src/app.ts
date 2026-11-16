@@ -101,6 +101,10 @@ export interface HubRuntime {
   resourceCounts(): {
     executionSubscriptions: number;
     timelineQueueDepth?: number;
+    timelineQueueEntries?: number;
+    timelineAccountingEntries?: number;
+    timelineAccountingGiveUps?: number;
+    timelineAccountingDropsAbandoned?: number;
   };
   processWorkflowOutbox(): Promise<void>;
   handleUpgrade: ReturnType<typeof createDaemonUpgradeHandler> | null;
@@ -265,12 +269,19 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     daemonModule,
     connectionForDaemon,
     agentValidator,
-    resourceCounts: () => ({
-      executionSubscriptions: daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0,
-      ...(options.runTimeline === undefined
-        ? {}
-        : { timelineQueueDepth: options.runTimeline.depth() }),
-    }),
+    resourceCounts: () => {
+      const executionSubscriptions = daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0;
+      if (options.runTimeline === undefined) return { executionSubscriptions };
+      const accounting = options.runTimeline.accountingStats();
+      return {
+        executionSubscriptions,
+        timelineQueueDepth: options.runTimeline.depth(),
+        timelineQueueEntries: accounting.queueEntries,
+        timelineAccountingEntries: accounting.retainedEntries,
+        timelineAccountingGiveUps: accounting.giveUps,
+        timelineAccountingDropsAbandoned: accounting.abandonedDrops,
+      };
+    },
     processWorkflowOutbox: () => workflowEngine.processAvailable(),
     handleUpgrade:
       options.database === null ? null : createDaemonUpgradeHandler(options.database, daemons!),

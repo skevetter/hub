@@ -179,7 +179,8 @@ export class RunTimeline implements TimelineQueue {
   }
 
   run(scope: TimelineRunScope, operation: () => Promise<void>): Promise<void> {
-    if (this.closed) return Promise.reject(new Error("Timeline capture is closed"));
+    if (this.closed || this.stopping)
+      return Promise.reject(new Error("Timeline capture is closed"));
     return this.queue.run(scope, operation);
   }
 
@@ -189,6 +190,10 @@ export class RunTimeline implements TimelineQueue {
     return total;
   }
 
+  accountingStats(): ReturnType<RunTimelineQueue["accountingStats"]> {
+    return this.queue.accountingStats();
+  }
+
   activeExecutionCount(): number {
     return this.executions.size;
   }
@@ -196,11 +201,15 @@ export class RunTimeline implements TimelineQueue {
   async stop(): Promise<void> {
     this.stopping = true;
     this.executions.clear();
-    await this.flush(2000);
+    await this.drain(2000, true);
     this.closed = true;
   }
 
   async flush(deadlineMs = 2000): Promise<void> {
+    await this.drain(deadlineMs, false);
+  }
+
+  private async drain(deadlineMs: number, closing: boolean): Promise<void> {
     const started = performance.now();
     const deadline = Promise.withResolvers<void>();
     const timer = setTimeout(() => deadline.resolve(), deadlineMs);
@@ -212,7 +221,10 @@ export class RunTimeline implements TimelineQueue {
         this.closed = true;
         for (const capture of this.executions.values()) capture.pending.length = 0;
       }
-      if (!(await this.queue.flush(remaining))) this.closed = true;
+      const drained = closing
+        ? await this.queue.stop(remaining)
+        : await this.queue.flush(remaining);
+      if (!drained) this.closed = true;
     } finally {
       clearTimeout(timer);
     }

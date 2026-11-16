@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 
 const execute = promisify(execFile);
 export async function assertBackgroundSweepExits(
-  mode: "reconciliation" | "retention" | "retention_pause",
+  mode: "reconciliation" | "retention" | "retention_pause" | "accounting",
 ): Promise<void> {
   const result = await execute(
     process.execPath,

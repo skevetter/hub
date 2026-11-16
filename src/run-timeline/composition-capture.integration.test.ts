@@ -198,7 +198,14 @@ describe("optional capture application composition", () => {
         assert.deepEqual(
           runtime.hub.resourceCounts(),
           enabled
-            ? { executionSubscriptions: 0, timelineQueueDepth: 0 }
+            ? {
+                executionSubscriptions: 0,
+                timelineQueueDepth: 0,
+                timelineQueueEntries: 0,
+                timelineAccountingEntries: 0,
+                timelineAccountingGiveUps: 0,
+                timelineAccountingDropsAbandoned: 0,
+              }
             : { executionSubscriptions: 0 },
         );
         const receipt = await database.persistManualEvent({
@@ -304,7 +311,14 @@ describe("optional capture application composition", () => {
       assert.deepEqual(
         runtime.hub.resourceCounts(),
         enabled
-          ? { executionSubscriptions: 0, timelineQueueDepth: 0 }
+          ? {
+              executionSubscriptions: 0,
+              timelineQueueDepth: 0,
+              timelineQueueEntries: 0,
+              timelineAccountingEntries: 0,
+              timelineAccountingGiveUps: 0,
+              timelineAccountingDropsAbandoned: 0,
+            }
           : { executionSubscriptions: 0 },
       );
     },

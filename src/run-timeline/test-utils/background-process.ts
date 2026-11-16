@@ -4,6 +4,7 @@ import { RunTimeline } from "../index.js";
 import { RunTimelineReconciler } from "../reconcile.js";
 import { TimelineRetention } from "../retention.js";
 import { createTimelineScrubber } from "../scrub.js";
+import { RunTimelineQueue } from "../queue.js";
 
 const mode = process.argv[2];
 if (mode === "reconciliation") {
@@ -29,6 +30,16 @@ if (mode === "reconciliation") {
     },
     { retentionDays: 30 },
   ).start();
+} else if (mode === "accounting") {
+  const queue = new RunTimelineQueue(
+    {
+      recordRunTimelineDrops: async () => {
+        throw new Error("Fixture accounting unavailable");
+      },
+    },
+    { bus: new RunTimelineBus() },
+  );
+  queue.recordDrops({ organizationId: "fixture", triggerRunId: "fixture" }, 1);
 } else {
   throw new Error("Unknown background sweeper mode");
 }
