@@ -434,9 +434,12 @@ describe("database migration application", () => {
     const after = await durableSnapshot(fixture.url);
 
     assert.deepEqual(after, before);
+    const journal = migrationJournalSchema.parse(
+      JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/_journal.json"), "utf8")),
+    );
     assert.deepEqual(await historicalShape(fixture.url), {
       authTables: 7,
-      drizzleMigrations: 54,
+      drizzleMigrations: journal.entries.length,
       legacyArtifacts: null,
       legacyOperatorPrincipals: null,
       bootstrapOrganizationId: fixture.organizationId,
