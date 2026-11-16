@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { AgentSessions } from "./index.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { OutputExecutorRegistry, replyOutputTool } from "../execution-capabilities/outputs.js";
@@ -318,11 +318,22 @@ test("a session finish call is recorded against the execution named in its argum
   const second = await f.arrival();
   await first.dispatch();
   await second.dispatch();
+  const owners: boolean[][] = [];
+  const transition = f.database.transitionAgentExecution.bind(f.database);
+  vi.spyOn(f.database, "transitionAgentExecution").mockImplementation(async (...args) => {
+    owners.push([
+      finishCalls.ownsOutcome(first.executionId),
+      finishCalls.ownsOutcome(second.executionId),
+    ]);
+    return transition(...args);
+  });
 
   await f.call(first.executionId, "finish_execution", {});
 
-  expect(finishCalls.ownsOutcome(first.executionId)).toBe(true);
-  expect(finishCalls.ownsOutcome(second.executionId)).toBe(false);
+  // Only the execution that named itself was registered, and before its completion ran.
+  expect(owners).toEqual([[true, false]]);
+  // Its completion ended it, so the entry is freed once the call returns.
+  expect(finishCalls.size).toBe(0);
 
   const rejected = await f.call(second.executionId, "finish_execution", { unexpected: true });
   expect(rejected).toMatchObject({ result: { isError: true } });

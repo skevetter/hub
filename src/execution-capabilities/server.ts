@@ -279,6 +279,27 @@ async function finishExecutionCall(
     return result;
   } finally {
     options.finishCalls?.resolve(execution.id, outcome);
+    await releaseIfTerminal(options, execution.id);
+  }
+}
+
+/**
+ * The handler checks that an execution is live before it reads the request, so a delayed call can
+ * start after the execution ended and was released, which would recreate its entry. Nothing else
+ * releases it then, so the call's end does, based on the execution's stored state.
+ */
+async function releaseIfTerminal(
+  options: Pick<ExecutionCapabilityOptions, "database" | "finishCalls">,
+  executionId: string,
+): Promise<void> {
+  if (options.finishCalls === undefined) return;
+  try {
+    const current = await options.database.findAgentExecutionById(executionId);
+    if (current === undefined || current.status === "succeeded" || current.status === "failed") {
+      options.finishCalls.release(executionId);
+    }
+  } catch {
+    // A failed read must not replace the tool result; the entry is freed when the process ends.
   }
 }
 

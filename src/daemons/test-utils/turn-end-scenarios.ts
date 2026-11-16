@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it, vi } from "vitest";
 import type { Database } from "../../db/types.js";
 import { deriveAgentExecutionCompletionToken } from "../../agent-executions/completion-token.js";
+import { OutputExecutorRegistry } from "../../execution-capabilities/outputs.js";
+import { createExecutionCapabilityServer } from "../../execution-capabilities/server.js";
 import type { FinishCallRegistry } from "../../execution-capabilities/finish-calls.js";
 import { MAX_TURN_END_OUTPUT_CHARS, TURN_END_COMPLETION, TURN_END_SETTLE_MS } from "../turn-end.js";
 import { IDLE_TIMEOUT_MS, turnEndFixture, type TurnEndFixtureOptions } from "./turn-end-fixture.js";
@@ -497,6 +499,68 @@ export function registerTurnEndScenarios(openDatabase: () => Promise<TurnEndData
           await sharedTurn(fixture, "could not finish");
           await fixture.clock.advance(SETTLED);
           assert.equal((await fixture.execution(a.execution.id)).status, "succeeded");
+        } finally {
+          await fixture.lifecycle.stop();
+        }
+      });
+
+      it("frees the registry entry of a finish call that reaches the handler after inference completed", async () => {
+        const fixture = await open({ workflow, completeOnTurnEnd: true });
+        try {
+          const { execution } = await fixture.dispatch();
+          const server = createExecutionCapabilityServer({
+            database: fixture.database,
+            outputs: new OutputExecutorRegistry(),
+            finishCalls: fixture.lifecycle.finishCalls,
+            completeExecution: (input) =>
+              fixture.lifecycle.completeAgentExecutionFromCallback(input, { deferHubAction: true }),
+          });
+          // The handler has authenticated the request and found the execution live, then waits
+          // for the body, which is how a delayed request looks to it.
+          let release!: () => void;
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              release = () => {
+                controller.enqueue(
+                  new TextEncoder().encode(
+                    JSON.stringify({
+                      jsonrpc: "2.0",
+                      id: 1,
+                      method: "tools/call",
+                      params: { name: "finish_execution", arguments: {} },
+                    }),
+                  ),
+                );
+                controller.close();
+              };
+            },
+          });
+          const held = server.handle(
+            new Request("https://hub.test/agent-executions/mcp", {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${token(execution.id)}`,
+                "content-type": "application/json",
+                accept: "application/json, text/event-stream",
+              },
+              body,
+              duplex: "half",
+            } as RequestInit),
+            execution.id,
+          );
+          await fixture.flush();
+
+          await fixture.endTurn("ok");
+          await fixture.clock.advance(SETTLED);
+          assert.equal((await fixture.execution(execution.id)).status, "succeeded");
+          assert.equal(fixture.lifecycle.finishCalls.size, 0);
+
+          release();
+          const response = await held;
+          await response.text();
+
+          assert.equal(fixture.lifecycle.finishCalls.size, 0);
+          assert.equal(fixture.lifecycle.finishCalls.ownsOutcome(execution.id), false);
         } finally {
           await fixture.lifecycle.stop();
         }

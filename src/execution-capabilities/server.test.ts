@@ -200,7 +200,9 @@ describe("execution capability MCP boundary", () => {
     const done = await fixture.call("tools/call", { name: "finish_execution", arguments: {} });
     assert.equal(ToolResultSchema.parse(done.result).isError, undefined);
     assert.deepEqual(seen, [true], "the call was registered before the completion ran");
-    assert.equal(finishCalls.ownsOutcome(fixture.executionId), true);
+    // The completion ended the execution, so its entry is freed once the call returns.
+    assert.equal(finishCalls.ownsOutcome(fixture.executionId), false);
+    assert.equal(finishCalls.size, 0);
   });
 
   it("records a finish call that failed to complete as failed", async () => {
