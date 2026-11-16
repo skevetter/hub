@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { ProjectConfigurationStore } from "../../configuration/store.js";
+import { isScriptStep } from "../../config/compiler.js";
 import { type TriggerProvider, type TriggerProviderMatch } from "../index.js";
 import {
   formatInvocationRejection,
@@ -19,6 +20,13 @@ export const ManualRunPayloadSchema = z.object({
   data: z.record(z.string(), z.unknown()).optional(),
   source: z.enum(["manual.run", "webhook.received"]).optional(),
   publicDeliveryKey: z.string().min(1).optional(),
+  authenticatedBy: z
+    .object({
+      kind: z.enum(["api-key", "cli-credential"]),
+      credentialId: z.string().min(1),
+      boundActor: z.string().nullable().optional(),
+    })
+    .optional(),
 });
 
 export type ManualRunPayload = z.infer<typeof ManualRunPayloadSchema>;
@@ -54,7 +62,8 @@ export type ManualRunRejectionCode =
   | "configuration_not_found"
   | "expected_configuration_not_current"
   | "trigger_not_found"
-  | "actor_forbidden";
+  | "actor_forbidden"
+  | "key_actor_required";
 
 export class ManualRunRejected extends Error {
   constructor(readonly code: ManualRunRejectionCode) {
@@ -144,6 +153,13 @@ export function createManualRunProvider(
         (candidate) => candidate.name === payload.trigger && candidate.on === "manual.run",
       );
       if (!trigger) throw new ManualRunRejected("trigger_not_found");
+      if (
+        trigger.steps.some(isScriptStep) &&
+        (payload.authenticatedBy?.kind !== "api-key" ||
+          payload.authenticatedBy.boundActor !== payload.actor)
+      ) {
+        throw new ManualRunRejected("key_actor_required");
+      }
       if (
         !trigger.filters?.from_users?.includes("*") &&
         !trigger.filters?.from_users?.includes(payload.actor)

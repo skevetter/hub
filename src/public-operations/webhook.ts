@@ -143,7 +143,11 @@ export async function receiveWebhook(
     receivedAt: new Date(),
     payload: {
       ...payload,
-      authenticatedBy: { kind: "api-key", credentialId: authorization.credentialId },
+      authenticatedBy: {
+        kind: "api-key",
+        credentialId: authorization.credentialId,
+        boundActor: target.actor,
+      },
     },
   });
   if (outcome === undefined) return { status: "dispatch_conflict" };

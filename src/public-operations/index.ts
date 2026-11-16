@@ -236,9 +236,10 @@ export function createPublicOperations(
         );
       } catch (error) {
         if (error instanceof ManualRunRejected) {
-          return {
-            status: error.code === "actor_forbidden" ? "actor_forbidden" : "trigger_not_found",
-          };
+          if (error.code === "actor_forbidden" || error.code === "key_actor_required") {
+            return { status: error.code };
+          }
+          return { status: "trigger_not_found" };
         }
         return storageUnavailableOrThrow(error);
       }
@@ -358,6 +359,7 @@ async function dispatchManualRun(
       authenticatedBy: {
         kind: authorization.kind === "apiKey" ? "api-key" : "cli-credential",
         credentialId: authorization.credentialId,
+        boundActor: authorization.kind === "apiKey" ? (authorization.actor ?? null) : null,
       },
     },
   });

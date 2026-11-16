@@ -1,10 +1,13 @@
 import { isDatabaseUnavailableError } from "../../db/errors.js";
-import type { Database } from "../../db/types.js";
+import type { Database, DurableProviderEvent } from "../../db/types.js";
 import { reportFailure } from "../../failures/index.js";
 import { logger } from "../../logger.js";
 import type { TriggerDispatchOutcome, TriggerHandler, TriggerSource } from "../index.js";
 import { parseManualTriggerPayload } from "./parse.js";
 import type { ManualTriggerInput } from "./schema.js";
+import { ManualRunPayloadSchema } from "./provider.js";
+
+const ReplayIdentitySchema = ManualRunPayloadSchema.pick({ actor: true, authenticatedBy: true });
 
 interface ManualTriggerState {
   database: Database;
@@ -94,7 +97,11 @@ export async function dispatchManualTrigger(
     },
     "manual event intake completed",
   );
-  const outcome = await state.handler(persisted.event);
+  const event =
+    persisted.replayed === true
+      ? reauthorizeManualReplay(persisted.event, trigger)
+      : persisted.event;
+  const outcome = await state.handler(event);
   return persisted.replayed === true
     ? {
         ...outcome,
@@ -102,6 +109,28 @@ export async function dispatchManualTrigger(
         replayed: true,
       }
     : outcome;
+}
+
+function reauthorizeManualReplay(
+  event: DurableProviderEvent,
+  request: ManualTriggerInput,
+): DurableProviderEvent {
+  if (event.source !== "manual.run" && event.source !== "webhook.received") return event;
+  const payload = event.payload;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return event;
+  const identity = ReplayIdentitySchema.safeParse(request.payload);
+  if (identity.success) {
+    return {
+      ...event,
+      payload: {
+        ...payload,
+        actor: identity.data.actor,
+        authenticatedBy: identity.data.authenticatedBy,
+      },
+    };
+  }
+  if (!Object.hasOwn(payload, "authenticatedBy")) return event;
+  return { ...event, payload: { ...payload, authenticatedBy: undefined } };
 }
 
 async function handleManualRequest(request: Request, source: TriggerSource): Promise<Response> {
