@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- URL userinfo containing whitespace is redacted as a whole field, including non-HTTP schemes and encoded separators.
 - Projected free text with credential hints, userinfo, armored blocks or unresolved encodings is replaced as a whole field.
 - Failed accounting recovers after sealing without run activity, reclaims idle queues and exposes bounded-retry abandonment counters.
 - Stored timeline redaction handles escaped quoted credentials and quoted Authorization values.

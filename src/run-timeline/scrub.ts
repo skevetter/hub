@@ -37,14 +37,15 @@ const ESCAPES: Readonly<Record<string, string>> = {
 };
 
 function hasUserinfo(value: string): boolean {
+  const detection = value.replace(/[\t\n\r]/gu, "");
   let authority = false;
   let slash = false;
-  for (let index = 0; index < value.length; index += 1) {
-    const character = value[index]!;
-    const encodedSlash = value.startsWith("%2f", index) || value.startsWith("%2F", index);
+  for (let index = 0; index < detection.length; index += 1) {
+    const character = detection[index]!;
+    const encodedSlash = detection.startsWith("%2f", index) || detection.startsWith("%2F", index);
     if (authority) {
-      if (character === "@" || value.startsWith("%40", index)) return true;
-      if (!/[/?#\s]/u.test(character)) {
+      if (character === "@" || detection.startsWith("%40", index)) return true;
+      if (!/[/?#]/u.test(character)) {
         if (encodedSlash) index += 2;
         continue;
       }

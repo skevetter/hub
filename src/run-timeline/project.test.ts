@@ -6,6 +6,7 @@ import type { TimelineProjectionInput } from "./capture-types.js";
 import { projectTimelineEvent } from "./project.js";
 import { createTimelineScrubber } from "./scrub.js";
 import { TIMELINE_KINDS } from "./store.js";
+import { USERINFO_SCHEMES, USERINFO_WHITESPACE_CASES } from "./test-utils/userinfo-fixtures.js";
 
 const scrub = createTimelineScrubber();
 const STEPS = { succeeded: 1, failed: 1, timed_out: 1, skipped: 1, not_run: 1, total: 5 };
@@ -505,6 +506,56 @@ describe("closed stored-event projection", () => {
       }
     },
   );
+
+  it.each(USERINFO_WHITESPACE_CASES)(
+    "redacts the whole projected $name field across all free-text paths",
+    ({ value, secret }) => {
+      expect(scrub(secret, 240) === secret).toBe(true);
+      const inputs: { input: TimelineProjectionInput; field: string }[] = [
+        { input: { kind: "run_started", trigger: value, steps: 1 }, field: "trigger" },
+        {
+          input: daemon({ type: "turn_failed", provider: "claude", error: value }),
+          field: "error",
+        },
+        {
+          input: daemon({ type: "turn_canceled", provider: "claude", reason: value }),
+          field: "reason",
+        },
+        { input: { ...STEP_END, failure: value }, field: "failure" },
+        { input: { ...RUN_END, failure: value }, field: "failure" },
+      ];
+      for (const { input, field } of inputs) {
+        const row = projectTimelineEvent(input, scrub);
+        expect(row?.data[field] === "[redacted]", `whole-field marker for ${field}`).toBe(true);
+        for (let index = 0; index <= secret.length - 8; index += 1) {
+          expect(
+            JSON.stringify(row).includes(secret.slice(index, index + 8)),
+            `credential fragment retained in ${field}`,
+          ).toBe(false);
+        }
+      }
+    },
+  );
+
+  it.each(
+    USERINFO_SCHEMES.flatMap((scheme) =>
+      ["/path@ordinary", "?item=@ordinary", "#path@ordinary"].map((suffix) => ({
+        name: `${scheme} ${suffix[0]} boundary`,
+        authority: `${scheme}://host`,
+        value: `${scheme}://host${suffix}`,
+      })),
+    ),
+  )("keeps the non-userinfo authority visible after the $name", ({ value, authority }) => {
+    const row = projectTimelineEvent({ ...RUN_END, failure: value }, scrub);
+    expect(row?.data["failure"]).toContain(authority);
+  });
+
+  it("treats ambiguous authority whitespace conservatively without requiring a parseable URL", () => {
+    const value = "postgres://host ordinary prose @reader";
+    expect(projectTimelineEvent({ ...RUN_END, failure: value }, scrub)?.data["failure"]).toBe(
+      "[redacted]",
+    );
+  });
 
   it("uses tool names only when the scrubbed name pattern permits them and never includes an unnamed permission tool", () => {
     for (const name of ["bad=name", "Read\n", "\ud800", "", ["gh", "p_short"].join("")]) {

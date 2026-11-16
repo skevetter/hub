@@ -1,22 +1,35 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, it, vi } from "vitest";
 import type { DaemonAgentStreamEvent } from "../daemons/protocol.js";
 import { HubExecutionAgentStreamEventSchema } from "../hub/protocol.js";
 import { CAPTURED_TOOL_CALLS } from "../daemons/test-utils/tool-call-fixtures.js";
 import { createMemoryDatabase } from "../db/memory.js";
+import { createDatabase } from "../db/pg.js";
+import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
 import type { AcceptedTriggerRunRecord, Database } from "../db/types.js";
 import { RunTimelineBus } from "./bus.js";
 import { timelineStepId } from "./data.js";
 import { RunTimeline } from "./index.js";
+import { RunTimelineReconciler } from "./reconcile.js";
 import { createTimelineScrubber } from "./scrub.js";
+import {
+  USERINFO_SCHEMES,
+  USERINFO_WHITESPACE,
+  userinfoWhitespaceCase,
+} from "./test-utils/userinfo-fixtures.js";
 
 const ORGANIZATION = "capture-organization";
 const PAGE = { afterSeq: 0, limit: 5110 };
 const captures = new Set<RunTimeline>();
 
-async function fixture(stepIds = ["work"]) {
-  const database = createMemoryDatabase({ organizationIds: [ORGANIZATION] });
+async function fixture(
+  stepIds = ["work"],
+  database: Database = createMemoryDatabase({ organizationIds: [ORGANIZATION] }),
+) {
   const project = await database.createProject({
     organizationId: ORGANIZATION,
     name: "Capture",
@@ -31,7 +44,7 @@ async function fixture(stepIds = ["work"]) {
     contentHash: "capture-configuration",
   });
   await database.activateProjectConfigurationRevision(project.id, revision.id, []);
-  async function createRun(ids: string[]) {
+  async function createRun(ids: string[], configuredTriggerName = "timeline") {
     const receipt = await database.persistManualEvent({
       organizationId: ORGANIZATION,
       projectId: project.id,
@@ -48,7 +61,7 @@ async function fixture(stepIds = ["work"]) {
         projectId: project.id,
         configurationRevisionId: revision.id,
         providerEventReceiptId: receipt.event.providerEventReceiptId,
-        configuredTriggerName: "timeline",
+        configuredTriggerName,
         conversation: { key: "shared-conversation", label: "Shared conversation" },
         prompt: "",
         inputs: {},
@@ -81,6 +94,29 @@ async function fixture(stepIds = ["work"]) {
   const executions = await link(run);
   const scope = { organizationId: ORGANIZATION, triggerRunId: run.id };
   return { database, run, executions, scope, createRun, link };
+}
+
+async function embeddedPrivacyDatabase() {
+  const root = await mkdtemp(join(tmpdir(), "hub-timeline-privacy-"));
+  const { runtime, locks } = await embeddedDatabaseRuntime(join(root, "database"));
+  try {
+    await runtime.migrate();
+    await runtime.query(
+      "insert into organization (id, name, slug) values ($1, 'Capture', 'capture')",
+      [ORGANIZATION],
+    );
+    return {
+      database: createDatabase(runtime, locks),
+      close: async () => {
+        await runtime.close();
+        await rm(root, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await runtime.close();
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function capture(database: Database, reportFailure = vi.fn()) {
@@ -276,6 +312,101 @@ describe("RunTimeline capture", () => {
     assert.equal((await database.listWorkflowStepRunsForTriggerRun(run.id))[0]?.status, "running");
     assert.equal((await database.readRunTimelineState(ORGANIZATION, run.id))?.sealedSeq, null);
   });
+
+  it.each([
+    {
+      name: "memory",
+      open: async () => ({
+        database: createMemoryDatabase({ organizationIds: [ORGANIZATION] }),
+        close: async () => undefined,
+      }),
+    },
+    { name: "embedded PostgreSQL", open: embeddedPrivacyDatabase },
+  ])(
+    "stores only whole-field markers for whitespace userinfo on $name",
+    async ({ open }) => {
+      const harness = await open();
+      const { database } = harness;
+      const { timeline, reportFailure } = capture(database);
+      try {
+        const { createRun, link } = await fixture(["work"], database);
+        const reconciler = new RunTimelineReconciler(database, {
+          queue: timeline,
+          maxEvents: 500,
+          retentionDays: 30,
+          scrub: createTimelineScrubber(),
+          bus: new RunTimelineBus(),
+          reportFailure,
+        });
+        for (const [index, variant] of USERINFO_WHITESPACE.entries()) {
+          const samples = Array.from({ length: 4 }, (_, field) =>
+            userinfoWhitespaceCase(
+              USERINFO_SCHEMES[(index + field) % USERINFO_SCHEMES.length]!,
+              variant,
+            ),
+          );
+          const run = await createRun(["work"], samples[0]!.value);
+          const [execution] = await link(run);
+          assert.ok(execution);
+          const scope = { organizationId: ORGANIZATION, triggerRunId: run.id };
+          timeline.recordRunStart(scope);
+          timeline.begin(execution.id, scope);
+          observe(timeline, execution.id, {
+            type: "turn_failed",
+            provider: "claude",
+            error: samples[1]!.value,
+          });
+          observe(timeline, execution.id, {
+            type: "turn_canceled",
+            provider: "claude",
+            reason: samples[2]!.value,
+          });
+          await timeline.flush();
+          await database.completeWorkflowAgentExecution({
+            executionId: execution.id,
+            executionStatus: "failed",
+            stepStatus: "failed",
+            result: {},
+            failureReason: samples[3]!.value,
+          });
+          await reconciler.reconcile(ORGANIZATION, run.id);
+          const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, PAGE);
+          for (const [kind, field] of [
+            ["run_started", "trigger"],
+            ["turn_failed", "error"],
+            ["turn_canceled", "reason"],
+            ["step_finished", "failure"],
+            ["run_finished", "failure"],
+          ]) {
+            assert.ok(
+              rows.find((row) => row.kind === kind)?.data[field!] === "[redacted]",
+              `whole-field marker for ${variant.name} ${kind}`,
+            );
+          }
+          const stored = JSON.stringify({
+            rows,
+            state: await database.readRunTimelineState(ORGANIZATION, run.id),
+          });
+          for (const sample of samples) {
+            for (let offset = 0; offset <= sample.secret.length - 8; offset += 1) {
+              assert.equal(
+                stored.includes(sample.secret.slice(offset, offset + 8)),
+                false,
+                `credential fragment retained for ${sample.name}`,
+              );
+            }
+          }
+          timeline.release(execution.id);
+        }
+        assert.equal(reportFailure.mock.calls.length, 0);
+      } finally {
+        await timeline.stop();
+        captures.delete(timeline);
+        await harness.close();
+      }
+    },
+    30_000,
+  );
 
   it("deduplicates starts and finals separately, accepts completed-first, and deliberately cannot deduplicate no-id finals", async () => {
     const { database, run, executions } = await fixture();
