@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
+import { isScriptStep, parseCompiledHubConfig } from "../config/compiler.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import type { Database } from "../db/types.js";
 import {
@@ -281,6 +282,24 @@ ${on}run:
     assert.equal((await store.activeRevision(saved)).version, 1);
   });
 
+  it("saves a manual script with a named actor", async () => {
+    const database = await enrolledDatabase();
+    const store = new OrganizationTriggerStore(database, "org", disconnectedAgentValidator());
+    const saved = await store.save({
+      yaml: scriptYaml("  manual.run:\n    filters: { from_users: [alice] }\n"),
+      userId: null,
+    });
+    const revision = await database.findActiveProjectConfiguration(saved.runtimeProjectId);
+    assert.ok(revision);
+    const trigger = parseCompiledHubConfig(revision.normalizedConfiguration).triggers[0];
+    assert.ok(trigger);
+    assert.equal(trigger.on, "manual.run");
+    assert.deepEqual(trigger.filters?.from_users, ["alice"]);
+    const step = trigger.steps[0];
+    assert.ok(step && isScriptStep(step));
+    assert.equal(step.script, "./build.sh");
+  });
+
   it.each([
     [
       "a wildcard audience",
@@ -295,9 +314,9 @@ ${on}run:
       /needs filters\.from_users that names the people/u,
     ],
     [
-      "manual.run",
-      scriptYaml("  manual.run:\n    filters: { from_users: [alice] }\n"),
-      /Script actions on manual\.run are not available yet/u,
+      "a manual wildcard audience",
+      scriptYaml('  manual.run:\n    filters: { from_users: ["*"] }\n'),
+      /needs filters\.from_users that names the people/u,
     ],
     [
       "a notification reason a third party can cause",
