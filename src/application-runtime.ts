@@ -32,6 +32,8 @@ import { DaemonProviderCatalog } from "./daemons/provider-catalog.js";
 import { HomeDashboard } from "./home/dashboard.js";
 import type { ProviderConnectionRegistration } from "./providers/registration.js";
 import type { ScriptLimits } from "./workflows/script-limits.js";
+import { runShutdownStage } from "./shutdown-stage.js";
+import type { TriggerHandler } from "./triggers/index.js";
 
 export interface ApplicationCompositionOptions {
   database: Database | null;
@@ -55,7 +57,7 @@ export async function createApplicationRuntime(
   options: ApplicationCompositionOptions,
 ): Promise<ApplicationRuntime> {
   const resources = new CompositionResources();
-  resources.own(() => options.close());
+  resources.own(() => options.close(), "composition.resources");
   try {
     return await createOwnedApplicationRuntime(options, resources);
   } catch (error) {
@@ -123,8 +125,18 @@ async function createOwnedApplicationRuntime(
       : { githubNotifications: options.githubNotifications }),
     scriptLimits: options.scriptLimits,
   });
-  ownership.own(() => application.hub.stop());
-  await application.hub.start(registrations.flatMap((registration) => registration.sources));
+  ownership.own(() => application.hub.stop(), "composition.hub");
+  await application.hub.start(
+    registrations.flatMap((registration) =>
+      registration.sources.map((source, index) => ({
+        start: (handler: TriggerHandler) => source.start(handler),
+        stop: () =>
+          runShutdownStage(`trigger.provider.${registration.connection.name}.${index}`, () =>
+            source.stop(),
+          ),
+      })),
+    ),
+  );
 
   const resources = options.database === null ? null : new OrganizationResources(options.database);
   const requests = new Map<string, (incoming: Request) => Promise<Response>>();

@@ -12,6 +12,7 @@ import { WebSocket, type RawData } from "ws";
 import { z } from "zod";
 import { createHubApplication, type HubRuntime } from "../../app.js";
 import { createFetchServer } from "../../http/node-server.js";
+import { createServerShutdown } from "../../server-shutdown.js";
 import { startApplication, stopApplication } from "../../server/runtime.js";
 import {
   HubExecutionAgentValidateRequestSchema,
@@ -166,6 +167,7 @@ export class HubHarness {
   private database: Database | undefined;
   private readonly entitlements = createUnlimitedEntitlementsService();
   private server: Server | undefined;
+  private shutdownServer: (() => Promise<boolean>) | undefined;
   private hub: HubRuntime | undefined;
   private connectedDaemon: TestDaemon | undefined;
   private origin = "";
@@ -1816,6 +1818,16 @@ export class HubHarness {
     await new Promise<void>((resolve) => server.once("listening", resolve));
     this.hub = hub;
     this.server = server;
+    const deadline = Promise.withResolvers<boolean>();
+    const shutdown = createServerShutdown(server, () => stopApplication(), {
+      graceMs: 5_000,
+      hardExitMs: 10_000,
+      exit: (code) => {
+        if (code !== 0)
+          deadline.reject(new Error("Hub harness shutdown exceeded its deadline or failed"));
+      },
+    });
+    this.shutdownServer = () => Promise.race([shutdown(), deadline.promise]);
   }
 
   private createExecutionAuthority(): ExecutionAuthority {
@@ -1863,13 +1875,10 @@ export class HubHarness {
     const server = this.server;
     this.hub = undefined;
     this.server = undefined;
-    await stopApplication();
-    if (server) {
-      if ("closeAllConnections" in server && typeof server.closeAllConnections === "function") {
-        server.closeAllConnections();
-      }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
+    const shutdown = this.shutdownServer;
+    this.shutdownServer = undefined;
+    if (server && shutdown) await shutdown();
+    else await stopApplication();
   }
 
   private intent(authoredSlug = this.requireDaemon().slug): LaunchMachineIntent {

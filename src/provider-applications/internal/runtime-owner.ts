@@ -23,6 +23,7 @@ import type {
 import { parseProviderApplicationConfiguration } from "./store.js";
 import type { SlackDeliveryStatus } from "../../triggers/slack/source/index.js";
 import { GITHUB_TRIGGER_SOURCE_NAMES } from "../../triggers/github/classification.js";
+import { runShutdownStage } from "../../shutdown-stage.js";
 
 interface Slot {
   active: ActiveRegistration | undefined;
@@ -636,7 +637,15 @@ async function startSources(active: ActiveRegistration, handler: TriggerHandler)
     }
     active.sourcesStarted = true;
   } catch (error) {
-    const cleanup = await Promise.allSettled(started.toReversed().map((source) => source.stop()));
+    const cleanup = await Promise.allSettled(
+      started
+        .toReversed()
+        .map((source, index) =>
+          runShutdownStage(`provider.${active.provider}.cleanup-source.${index}`, () =>
+            source.stop(),
+          ),
+        ),
+    );
     for (const failure of cleanup) {
       if (failure.status === "rejected") {
         reportFailure(failure.reason, {
@@ -654,7 +663,11 @@ async function stopSources(active: ActiveRegistration): Promise<void> {
   if (!active.sourcesStarted) return;
   active.sourcesStarted = false;
   const results = await Promise.allSettled(
-    active.registration.sources.toReversed().map((source) => source.stop()),
+    active.registration.sources
+      .toReversed()
+      .map((source, index) =>
+        runShutdownStage(`provider.${active.provider}.source.${index}`, () => source.stop()),
+      ),
   );
   const rejected = results.find((result) => result.status === "rejected");
   if (rejected?.status === "rejected") throw rejected.reason;

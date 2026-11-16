@@ -124,13 +124,32 @@ async function forwardRequest(
       return;
     }
     const reader = response.body.getReader();
-    for (;;) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      if (!outgoing.write(chunk.value)) await once(outgoing, "drain");
+    const cancelReader = () => {
+      void reader.cancel().catch((error: unknown) => {
+        reportFailure(
+          error,
+          { operation: "http.response.cancel", component: "http", method: request.method },
+          { logger: options.logger ?? defaultLogger },
+        );
+      });
+    };
+    outgoing.once("close", cancelReader);
+    try {
+      if (outgoing.destroyed) {
+        await reader.cancel();
+        return;
+      }
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done || outgoing.destroyed) break;
+        if (!outgoing.write(chunk.value)) await once(outgoing, "drain");
+      }
+      responseForwarded = !outgoing.destroyed;
+      outgoing.end();
+    } finally {
+      outgoing.off("close", cancelReader);
+      reader.releaseLock();
     }
-    responseForwarded = true;
-    outgoing.end();
   } catch (error) {
     const path = safeRequestPath(incoming.url);
     const report = reportFailure(

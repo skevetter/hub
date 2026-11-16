@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AuthServer } from "./auth/server.js";
 import type { OrganizationAccessValue } from "./auth/organization-access.js";
 import { createMemoryDatabase } from "./db/memory.js";
@@ -8,6 +8,83 @@ import { EntitlementsService } from "./entitlements/service.js";
 import type { ProviderRegistration, TriggerProviderResources } from "./providers/registration.js";
 import { createApplicationRuntime } from "./application-runtime.js";
 import { replyOutputTool } from "./execution-capabilities/outputs.js";
+import { logger } from "./logger.js";
+import { runShutdownStage } from "./shutdown-stage.js";
+
+describe("shutdown stage logging", () => {
+  it("identifies the provider source while its drain is pending", async () => {
+    const log = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+    const { promise: sourceStopped, resolve: finishStop } = Promise.withResolvers<void>();
+    const registration = fakeRegistration();
+    registration.sources = [
+      {
+        start: async () => undefined,
+        stop: () => sourceStopped,
+      },
+    ];
+    const runtime = await createApplicationRuntime({
+      database: null,
+      auth: null,
+      entitlements: null,
+      billing: null,
+      registrations: [registration],
+      close: async () => undefined,
+    });
+    const stopping = runtime.stop();
+    try {
+      assert.deepEqual(log.mock.calls, [
+        [{ stage: "composition.hub", phase: "start", elapsedMs: 0 }, "shutdown stage started"],
+        [{ stage: "trigger.source.0", phase: "start", elapsedMs: 0 }, "shutdown stage started"],
+        [
+          { stage: "trigger.provider.fake.0", phase: "start", elapsedMs: 0 },
+          "shutdown stage started",
+        ],
+      ]);
+      finishStop();
+      await stopping;
+      const elapsedMs: unknown = expect.any(Number);
+      for (const stage of [
+        "composition.hub",
+        "trigger.source.0",
+        "trigger.provider.fake.0",
+        "workflow.drain",
+        "composition.resources",
+      ]) {
+        expect(log).toHaveBeenCalledWith(
+          expect.objectContaining({ stage, phase: "end", elapsedMs, failed: false }),
+          "shutdown stage ended",
+        );
+      }
+    } finally {
+      finishStop();
+      await stopping;
+      log.mockRestore();
+    }
+  });
+
+  it("logs a failed stage end and preserves the original rejection", async () => {
+    const log = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+    const failure = new Error("stop failed");
+    const elapsedMs: unknown = expect.any(Number);
+    try {
+      await assert.rejects(
+        runShutdownStage("test.failure", () => Promise.reject(failure)),
+        (error) => error === failure,
+      );
+      assert.equal(log.mock.calls.length, 2);
+      const [record, message] = log.mock.calls[1]!;
+      expect(record).toMatchObject({
+        stage: "test.failure",
+        phase: "end",
+        failed: true,
+        elapsedMs,
+      });
+      assert.equal(message, "shutdown stage ended");
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
 
 describe("application runtime provider composition", () => {
   it("collects a fake registration without a concrete-provider case", async () => {

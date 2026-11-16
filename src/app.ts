@@ -53,6 +53,7 @@ import { OrganizationTriggerStore } from "./triggers/store.js";
 import { DaemonRegistration } from "./daemons/registration.js";
 import { createScriptStepRunner } from "./daemons/terminals/script.js";
 import type { ScriptLimits } from "./workflows/script-limits.js";
+import { runShutdownStage } from "./shutdown-stage.js";
 import { CliAuthorizations } from "./cli-authorizations/index.js";
 import type { BrowserOrganizationAccess } from "./auth/browser-organization-access.js";
 import { createPublicApi, type PublicApi, type PublicApiComposition } from "./public-api/index.js";
@@ -278,11 +279,28 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     },
     async stop() {
       try {
-        await Promise.all(activeSources.map(async (source) => source.stop()));
+        await Promise.all(
+          activeSources.map((source, index) => {
+            let stage = `trigger.source.${index}`;
+            if (source === manualSource) stage = "trigger.manual";
+            else if (source === scheduleSource) stage = "trigger.schedule";
+            else if (source === notificationSource) stage = "trigger.github-notifications";
+            return runShutdownStage(stage, () => source.stop());
+          }),
+        );
         activeSources = [];
-        await Promise.all([workflowEngine.stop(), daemonModule?.lifecycle.stop(), daemons?.stop()]);
+        await Promise.all([
+          runShutdownStage("workflow.drain", () => workflowEngine.stop()),
+          daemonModule === null
+            ? undefined
+            : runShutdownStage("lifecycle.drain", () => daemonModule.lifecycle.stop()),
+          daemons === null ? undefined : runShutdownStage("registry.drain", () => daemons.stop()),
+        ]);
       } finally {
-        await options.executionAuthority?.stop();
+        const executionAuthority = options.executionAuthority;
+        if (executionAuthority !== undefined) {
+          await runShutdownStage("execution-authority.stop", () => executionAuthority.stop());
+        }
       }
     },
   };

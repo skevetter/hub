@@ -3,7 +3,7 @@ import { Duplex } from "node:stream";
 import { describe, it } from "vitest";
 import { createLogger } from "./logger.js";
 import { assertOneFailure, FailureLogStream } from "./test-utils/failure-logs.js";
-import { handleDaemonUpgradeRequest, shutdownProductionServer } from "./index.js";
+import { handleDaemonUpgradeRequest } from "./index.js";
 
 class UpgradeSocket extends Duplex {
   destroyedByOwner = false;
@@ -43,22 +43,5 @@ describe("production server failure ownership", () => {
     });
     assert.equal(record["method"], "GET");
     assert.equal(record["path"], "/api/daemons/connect");
-  });
-
-  it("logs a shutdown rejection exactly once and returns a fatal outcome", async () => {
-    const canary = "shutdown-secret-817c";
-    const stream = new FailureLogStream();
-
-    const clean = await shutdownProductionServer(
-      () => Promise.reject(new Error(canary)),
-      createLogger(stream),
-    );
-
-    assert.equal(clean, false);
-    assertOneFailure(stream, {
-      operation: "server.shutdown",
-      component: "server",
-      canary,
-    });
   });
 });

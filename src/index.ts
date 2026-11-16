@@ -52,6 +52,11 @@ import { composeEmailDelivery } from "./email/index.js";
 import { createAccountMailer } from "./auth/account-emails.js";
 import { migrateLegacyProjectTriggers } from "./triggers/migration.js";
 import { readGitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
+import {
+  createServerShutdown,
+  installShutdownSignals,
+  readShutdownBudgets,
+} from "./server-shutdown.js";
 
 export function startProductionRuntime(): Promise<ApplicationRuntime> {
   return startApplication(createProductionRuntime);
@@ -79,14 +84,14 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
   try {
     const config = loadRuntimeConfig();
     const { database, runtime, locks } = await createDatabaseHandle();
-    resources.own(() => database.close());
+    resources.own(() => database.close(), "composition.database");
     const migration = await migrateLegacyProjectTriggers(database);
     if (migration.projects > 0) {
       logger.info(migration, "migrated project configurations to organization triggers");
     }
     const identity = await resolveHubIdentity(runtime, readPort());
     const entitlements = composeEntitlements(database, runtime);
-    resources.own(() => entitlements.close());
+    resources.own(() => entitlements.close(), "composition.entitlements");
     const billingConfig = readBillingConfig();
     const emailDelivery = composeEmailDelivery();
     const invitationMailer =
@@ -123,7 +128,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       invitationMailer,
       accountMailer,
     );
-    resources.own(() => auth.close());
+    resources.own(() => auth.close(), "composition.auth");
     await auth.initialize?.();
     const providerEnvironment = await readProviderApplicationEnvironment(process.env);
     const providerStore = createProviderApplicationStore(runtime, locks, database);
@@ -194,7 +199,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       });
     }
     const receiptRetention = new ReceiptRetention(runtime);
-    resources.own(() => receiptRetention.stop());
+    resources.own(() => receiptRetention.stop(), "composition.receipt_retention");
     receiptRetention.start();
     return application;
   } catch (error) {
@@ -322,6 +327,7 @@ function nonEmptyEnvironment(value: string | undefined): string | undefined {
 }
 
 async function main(): Promise<void> {
+  const shutdownBudgets = readShutdownBudgets(process.env);
   const removeProcessFailureHandlers = installProcessFailureHandlers();
   const build = await loadBuiltStartServer();
   await build.startProductionRuntime();
@@ -347,45 +353,11 @@ async function main(): Promise<void> {
     logger.info(`server started, available at: ${appUrl}`);
   });
 
-  const stop = async () => {
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => {
-        if (error !== undefined) {
-          reject(error);
-          return;
-        }
-        resolve();
-      });
-    });
-    await build.stopProductionRuntime();
-  };
-  const stopAfterSignal = () => {
-    void shutdownProductionServer(stop)
-      .then((clean) => {
-        if (!clean) process.exitCode = 1;
-        return undefined;
-      })
-      .finally(removeProcessFailureHandlers);
-  };
-  process.once("SIGTERM", stopAfterSignal);
-  process.once("SIGINT", stopAfterSignal);
-}
-
-export async function shutdownProductionServer(
-  stop: () => Promise<void>,
-  failureLogger?: Pick<Logger, "warn" | "error">,
-): Promise<boolean> {
-  try {
-    await stop();
-    return true;
-  } catch (error) {
-    reportFailure(
-      error,
-      { operation: "server.shutdown", component: "server" },
-      failureLogger === undefined ? {} : { logger: failureLogger },
-    );
-    return false;
-  }
+  const stop = createServerShutdown(server, () => build.stopProductionRuntime(), {
+    ...shutdownBudgets,
+    exit: (code) => process.exit(code),
+  });
+  installShutdownSignals(process, stop, removeProcessFailureHandlers);
 }
 
 export async function handleDaemonUpgradeRequest(options: {
