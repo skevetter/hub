@@ -2,8 +2,40 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 
 import { readBillingConfig } from "./config.js";
+import { readTimelineScrubValues } from "../run-timeline/secrets.js";
+import { createTimelineScrubber } from "../run-timeline/scrub.js";
+import { projectTimelineEvent } from "../run-timeline/project.js";
 
 describe("readBillingConfig", () => {
+  it("protects raw and effective billing startup credentials accepted by the reader", () => {
+    const environment = {
+      STRIPE_SECRET_KEY: "  sk_test_mmmmmmmmmmmm  ",
+      STRIPE_WEBHOOK_SECRET: "  whsec_mmmmmmmmmmmm  ",
+    };
+    const configuration = readBillingConfig(environment);
+    assert.ok(configuration);
+    const values = [
+      environment.STRIPE_SECRET_KEY,
+      environment.STRIPE_WEBHOOK_SECRET,
+      configuration.stripeSecretKey,
+      configuration.stripeWebhookSecret,
+    ];
+    const collected = readTimelineScrubValues(environment);
+    for (const value of values) assert.ok(collected.includes(value));
+    const projected = projectTimelineEvent(
+      {
+        kind: "agent_event",
+        event: { type: "turn_failed", provider: "claude", error: values.join(" ") },
+      },
+      createTimelineScrubber({ scrubValues: collected }),
+    );
+    assert.equal(projected?.kind, "turn_failed");
+    const stored = JSON.stringify(projected);
+    for (const value of values)
+      for (let index = 0; index + 8 <= value.length; index += 1)
+        assert.equal(stored.includes(value.slice(index, index + 8)), false);
+  });
+
   it("returns undefined when STRIPE_SECRET_KEY is absent", () => {
     assert.equal(readBillingConfig({}), undefined);
   });

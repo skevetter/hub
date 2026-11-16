@@ -1,30 +1,27 @@
-const SECRET_ENVIRONMENT_NAMES = [
-  "GITHUB_NOTIFICATIONS_TOKEN",
-  "PASEO_HUB_PROGRESS_GITHUB_TOKEN",
-  "PASEO_HUB_AUTH_SECRET",
-  "DATABASE_URL",
-  "STRIPE_SECRET_KEY",
-  "STRIPE_WEBHOOK_SECRET",
-  "GITHUB_APP_CLIENT_SECRET",
-  "GITHUB_APP_PRIVATE_KEY",
-  "GITHUB_WEBHOOK_SECRET",
-  "SLACK_CLIENT_SECRET",
-  "SLACK_SIGNING_SECRET",
-  "SLACK_APP_TOKEN",
-  "DISCORD_CLIENT_SECRET",
-  "DISCORD_BOT_TOKEN",
-  "LINEAR_CLIENT_SECRET",
-  "LINEAR_WEBHOOK_SECRET",
-] as const;
+const NON_SECRET_ENVIRONMENT_NAMES: Readonly<Record<string, true | undefined>> = {
+  GITHUB_APP_PRIVATE_KEY_PATH: true,
+  PASEO_HUB_STREAM_MAX_PER_KEY: true,
+  PASEO_E2E_TLS_KEY: true,
+  PASEO_E2E_MACHINE_KEY_FILE: true,
+  HUB_E2E_MACHINE_KEY_FILE: true,
+};
 
 export function readTimelineScrubValues(
   environment: Readonly<Record<string, string | undefined>>,
   providerConfigurations: readonly object[] = [],
 ): readonly string[] {
   const values = new Set<string>();
-  for (const name of SECRET_ENVIRONMENT_NAMES) {
-    const value = environment[name];
-    if (value !== undefined && value.length !== 0) values.add(value);
+  for (const [name, value] of Object.entries(environment)) {
+    if (
+      value !== undefined &&
+      value.length !== 0 &&
+      NON_SECRET_ENVIRONMENT_NAMES[name] !== true &&
+      (name === "DATABASE_URL" || /KEY|SECRET|TOKEN|PASSWORD/u.test(name))
+    ) {
+      values.add(value);
+      const effective = value.trim();
+      if (effective.length !== 0) values.add(effective);
+    }
   }
   for (const configuration of providerConfigurations) {
     for (const [name, value] of Object.entries(configuration)) {
