@@ -25,6 +25,24 @@ export interface RunEventSubscriptionOptions {
   onSeal: () => void;
 }
 
+interface TimelineMetadata {
+  status: string;
+  sealedSeq: number | null;
+  stepRowsOmitted: number;
+  origin?: RunEventPage["origin"] | undefined;
+  events?: RunEventPage["events"];
+  timelineUnavailable?: boolean;
+}
+
+function hasTimeline(metadata: TimelineMetadata) {
+  return (
+    metadata.timelineUnavailable === false ||
+    (metadata.events?.length ?? 0) > 0 ||
+    metadata.origin != null ||
+    metadata.sealedSeq != null
+  );
+}
+
 export class RunEventSubscription {
   private state: RunEventState;
   private readonly listeners = new Set<() => void>();
@@ -35,21 +53,24 @@ export class RunEventSubscription {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private sealNotified = false;
   private persistedTerminal: boolean;
+  private timelineKnown: boolean;
 
   constructor(private readonly options: RunEventSubscriptionOptions) {
     const events = options.initial.expired ? [] : mergeRunEvents([], options.initial.events);
     const lastSeq = Math.max(options.after, events.at(-1)?.seq ?? 0);
     this.persistedTerminal = options.initial.status !== "running";
-    const complete =
-      options.initial.expired ||
-      timelineRead(lastSeq, options.initial.sealedSeq) ||
-      (options.initial.timelineUnavailable && this.persistedTerminal);
+    this.timelineKnown = hasTimeline(options.initial);
+    const unavailable = options.initial.timelineUnavailable && !this.timelineKnown;
+    const sealedOrExpired =
+      options.initial.expired || timelineRead(lastSeq, options.initial.sealedSeq);
+    const complete = sealedOrExpired || (unavailable && this.persistedTerminal);
     const connection = options.initial.streamEnabled ? "Reconnecting" : "Polling";
-    this.sealNotified = complete;
+    this.sealNotified = sealedOrExpired;
     this.state = {
       ...options.initial,
       events,
       lastSeq,
+      timelineUnavailable: unavailable,
       connection: complete ? null : connection,
     };
   }
@@ -85,16 +106,18 @@ export class RunEventSubscription {
     const expired = this.state.expired || page.expired;
     const events = expired ? [] : mergeRunEvents(this.state.events, page.events);
     const lastSeq = Math.max(this.state.lastSeq, events.at(-1)?.seq ?? 0);
-    this.update({
-      ...this.state,
-      ...page,
-      events,
-      lastSeq,
-      expired,
-      sealedSeq: page.sealedSeq ?? this.state.sealedSeq,
-    });
-    if (!page.streamEnabled && this.state.connection !== null) this.poll();
-    this.finishIfRead();
+    const state = this.mergeMetadata(page);
+    state.events = events;
+    state.lastSeq = lastSeq;
+    state.expired = expired;
+    state.droppedCount = Math.max(this.state.droppedCount, page.droppedCount);
+    this.update(state);
+    if (this.finishIfRead()) return;
+    if (
+      this.state.connection === null ||
+      (!page.streamEnabled && this.state.connection !== "Polling")
+    )
+      this.poll();
   }
 
   private update(state: RunEventState) {
@@ -102,9 +125,35 @@ export class RunEventSubscription {
     for (const listener of this.listeners) listener();
   }
 
+  private mergeMetadata(incoming: TimelineMetadata) {
+    this.timelineKnown ||= hasTimeline(incoming);
+    const seal = Math.max(this.state.sealedSeq ?? -1, incoming.sealedSeq ?? -1);
+    const state: RunEventState = {
+      ...this.state,
+      ...incoming,
+      origin: this.state.origin ?? incoming.origin ?? null,
+      sealedSeq: seal < 0 ? null : seal,
+      stepRowsOmitted: Math.max(this.state.stepRowsOmitted, incoming.stepRowsOmitted),
+      status: this.state.status === "running" ? incoming.status : this.state.status,
+      timelineUnavailable:
+        !this.timelineKnown &&
+        (this.state.timelineUnavailable || incoming.timelineUnavailable === true),
+    };
+    return state;
+  }
+
+  private acceptStatus(status: TimelineMetadata, connection = this.state.connection) {
+    const state = this.mergeMetadata(status);
+    state.connection = connection;
+    this.update(state);
+  }
+
   private finishIfRead() {
     const unavailable =
-      this.state.timelineUnavailable && this.persistedTerminal && this.state.status !== "running";
+      !this.timelineKnown &&
+      this.state.timelineUnavailable &&
+      this.persistedTerminal &&
+      this.state.status !== "running";
     if (
       !this.state.expired &&
       !timelineRead(this.state.lastSeq, this.state.sealedSeq) &&
@@ -146,13 +195,17 @@ export class RunEventSubscription {
       listen(kind, (event) => {
         const row = this.parse(event.data, runEventSchema);
         if (row === undefined) return;
+        this.timelineKnown = true;
         const events = mergeRunEvents(this.state.events, [row]);
         this.update({
           ...this.state,
           events,
           lastSeq: Math.max(this.state.lastSeq, row.seq),
+          timelineUnavailable: false,
           status:
-            row.kind === "run_finished" && typeof row.data["status"] === "string"
+            this.state.status === "running" &&
+            row.kind === "run_finished" &&
+            typeof row.data["status"] === "string"
               ? row.data["status"]
               : this.state.status,
         });
@@ -162,18 +215,13 @@ export class RunEventSubscription {
       const status = this.parse(event.data, runEventStatusSchema);
       if (status === undefined) return;
       this.failures = 0;
-      this.update({
-        ...this.state,
-        ...status,
-        origin: status.origin ?? this.state.origin,
-        connection: "Live",
-      });
+      this.acceptStatus(status, "Live");
       this.finishIfRead();
     });
     listen("end", (event) => {
       const status = this.parse(event.data, runEventStatusSchema);
       if (status === undefined) return;
-      this.update({ ...this.state, ...status, origin: status.origin ?? this.state.origin });
+      this.acceptStatus(status);
       if (!this.finishIfRead()) this.poll();
     });
     const reconnect = () => {

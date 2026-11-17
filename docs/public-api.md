@@ -82,6 +82,8 @@ Live connections use same-origin cookies. After three consecutive connection fai
 
 The server marks a timeline unavailable only when capture is off and both the state row and returned event page are absent. Once final persisted results are loaded for such a terminal run, event polling also stops. Retained captured or derived timelines still require their seal or expiry, even if capture has since been turned off.
 
+Timeline presence is monotonic in the page. Once rows, captured or derived provenance, a seal, or an explicit available result have been observed, a stale unavailable response cannot declare the timeline absent. Successful in-flight event reads are still accepted after an unavailable result made the page idle, and can resume polling until the seal. Cursors, seals, omission and drop counts never decrease, expiry sticks, and terminal status does not return to running. Capture and stream switches remain point-in-time configuration, not proof that retained history is absent.
+
 Derived timelines show only persisted lifecycle events and say that no tool events were recorded. Expired timelines show no event rows. Pending steps left after a run ends read as Not run. Timeline text is plain text without Markdown or automatic links. The Progress message row describes the disabled Hub setting in this build. It does not imply a provider message was posted.
 
 Running durations use human units and update only while the tab is visible. Updates range from one second for short runs to thirty seconds for runs lasting hours. Terminal durations are static. Long trigger names remain contained in the header. An unavailable run includes a Back to activity link.

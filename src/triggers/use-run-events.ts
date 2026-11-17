@@ -66,9 +66,8 @@ export function useRunEvents({
     ...(polling ? { refetchInterval: 5000 } : {}),
   });
   useEffect(() => {
-    if (polling && page.status === "success" && page.data !== null)
-      subscription.acceptPage(page.data);
-  }, [subscription, polling, page.status, page.data]);
+    if (page.status === "success" && page.data !== null) subscription.acceptPage(page.data);
+  }, [subscription, page.status, page.data]);
   useEffect(() => {
     if (initial.status !== "running") return undefined;
     return pollRunDetail(refreshDetail);

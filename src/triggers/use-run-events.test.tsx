@@ -126,7 +126,7 @@ describe("run event subscription", () => {
   });
 
   it("handles end by closing and invalidating, without ending on terminal status alone", () => {
-    const { subscription, sources, seal } = fixture();
+    const { subscription, sources, seal } = fixture({ ...emptyTimeline, origin: null });
     sources.at(0)!.emit("status", {
       status: "succeeded",
       sealedSeq: null,
@@ -209,7 +209,11 @@ describe("run event subscription", () => {
 
   it("captures polling expiry and stored provenance and refreshes persisted steps every five seconds", async () => {
     vi.useFakeTimers();
-    const { subscription, seal } = fixture({ ...emptyTimeline, streamEnabled: false });
+    const { subscription, seal } = fixture({
+      ...emptyTimeline,
+      streamEnabled: false,
+      origin: null,
+    });
     subscription.acceptPage({
       ...emptyTimeline,
       streamEnabled: false,
@@ -223,8 +227,8 @@ describe("run event subscription", () => {
     await vi.advanceTimersByTimeAsync(20000);
     assert.equal(refresh.mock.calls.length, 4);
     stop();
-    subscription.acceptPage({ ...emptyTimeline, expired: true, events: [], origin: "captured" });
-    assert.equal(subscription.snapshot().origin, "captured");
+    subscription.acceptPage({ ...emptyTimeline, expired: true, events: [], origin: null });
+    assert.equal(subscription.snapshot().origin, "derived");
     assert.equal(subscription.snapshot().connection, null);
     assert.equal(seal.mock.calls.length, 1);
     subscription.stop();
@@ -303,6 +307,219 @@ describe("run event subscription", () => {
     );
     assert.equal(seal.mock.calls.length, 1);
     subscription.stop();
+  });
+
+  const absent: RunEventPage = {
+    ...emptyTimeline,
+    timelineEnabled: false,
+    timelineUnavailable: true,
+    streamEnabled: false,
+    origin: null,
+  };
+  const deliveryOrders = [
+    ["snapshot", "known", "seal"],
+    ["snapshot", "seal", "known"],
+    ["known", "snapshot", "seal"],
+    ["known", "seal", "snapshot"],
+    ["seal", "snapshot", "known"],
+    ["seal", "known", "snapshot"],
+  ] as const;
+  for (const initiallyAvailable of [false, true]) {
+    for (const origin of ["captured", "derived"] as const) {
+      for (const order of deliveryOrders) {
+        it(`retains ${origin} evidence across ${initiallyAvailable ? "on-to-off" : "off-to-on"} ${order.join("/")}`, () => {
+          const initial = {
+            ...absent,
+            timelineEnabled: initiallyAvailable,
+            timelineUnavailable: !initiallyAvailable,
+          };
+          const staleSnapshot = { ...absent, status: "succeeded" };
+          const known = {
+            ...emptyTimeline,
+            status: "succeeded",
+            streamEnabled: false,
+            origin,
+            timelineEnabled: !initiallyAvailable,
+            stepRowsOmitted: 7,
+            droppedCount: 9,
+            events: [runEvent(1, "run_started")],
+          };
+          const { subscription, seal } = fixture(initial);
+          try {
+            for (const operation of order) {
+              if (operation === "snapshot") subscription.acceptSnapshot(staleSnapshot);
+              else if (operation === "known") subscription.acceptPage(known);
+              else
+                subscription.acceptPage({
+                  ...known,
+                  sealedSeq: 2,
+                  events: [runEvent(2, "run_finished", { status: "succeeded" })],
+                });
+            }
+            const state = subscription.snapshot();
+            assert.equal(state.connection, null);
+            assert.equal(state.timelineUnavailable, false);
+            assert.equal(state.origin, origin);
+            assert.equal(state.status, "succeeded");
+            assert.equal(state.stepRowsOmitted, 7);
+            assert.equal(state.droppedCount, 9);
+            assert.equal(state.lastSeq, 2);
+            assert.equal(state.sealedSeq, 2);
+            assert.equal(seal.mock.calls.length, 1);
+            subscription.acceptSnapshot(staleSnapshot);
+            subscription.acceptPage(absent);
+            assert.deepEqual(
+              subscription.snapshot().events.map((event) => event.seq),
+              [1, 2],
+            );
+            assert.equal(subscription.snapshot().sealedSeq, 2);
+            assert.equal(subscription.snapshot().lastSeq, 2);
+            assert.equal(subscription.snapshot().stepRowsOmitted, 7);
+            assert.equal(subscription.snapshot().droppedCount, 9);
+            assert.equal(subscription.snapshot().status, "succeeded");
+            assert.equal(subscription.snapshot().origin, origin);
+            assert.equal(subscription.snapshot().timelineUnavailable, false);
+            assert.equal(subscription.snapshot().connection, null);
+            assert.equal(seal.mock.calls.length, 1);
+          } finally {
+            subscription.stop();
+          }
+        });
+      }
+    }
+  }
+
+  const evidence: { name: string; patch: Partial<RunEventPage> }[] = [
+    { name: "rows", patch: { events: [runEvent(1, "run_started")] } },
+    { name: "captured origin", patch: { origin: "captured" } },
+    { name: "derived origin", patch: { origin: "derived" } },
+    { name: "seal", patch: { sealedSeq: 2 } },
+    { name: "availability", patch: { timelineUnavailable: false } },
+  ];
+  for (const signal of evidence) {
+    for (const snapshotFirst of [false, true]) {
+      it(`keeps positive ${signal.name} with unavailable snapshot ${snapshotFirst ? "first" : "last"}`, () => {
+        const { subscription, seal } = fixture(absent);
+        const snapshot = { ...absent, status: "succeeded" };
+        const page = { ...snapshot, ...signal.patch };
+        try {
+          if (snapshotFirst) subscription.acceptSnapshot(snapshot);
+          subscription.acceptPage(page);
+          if (!snapshotFirst) subscription.acceptSnapshot(snapshot);
+          assert.equal(subscription.snapshot().timelineUnavailable, false);
+          assert.equal(subscription.snapshot().connection, "Polling");
+          subscription.acceptPage({
+            ...page,
+            timelineUnavailable: false,
+            sealedSeq: 2,
+            events: [
+              runEvent(1, "run_started"),
+              runEvent(2, "run_finished", { status: "succeeded" }),
+            ],
+          });
+          assert.deepEqual(
+            subscription.snapshot().events.map((event) => event.seq),
+            [1, 2],
+          );
+          assert.equal(subscription.snapshot().connection, null);
+          assert.equal(seal.mock.calls.length, 1);
+        } finally {
+          subscription.stop();
+        }
+      });
+    }
+  }
+
+  for (const snapshotFirst of [false, true]) {
+    it(`keeps seal, counters and expiry when stale snapshot is ${snapshotFirst ? "first" : "last"}`, () => {
+      const { subscription } = fixture(absent);
+      const known = {
+        ...emptyTimeline,
+        streamEnabled: false,
+        status: "succeeded",
+        origin: "captured" as const,
+        sealedSeq: 2,
+        stepRowsOmitted: 7,
+        droppedCount: 9,
+        events: [runEvent(1, "run_started")],
+      };
+      try {
+        if (snapshotFirst) subscription.acceptSnapshot(absent);
+        subscription.acceptPage(known);
+        if (!snapshotFirst) subscription.acceptSnapshot(absent);
+        assert.equal(subscription.snapshot().status, "succeeded");
+        assert.equal(subscription.snapshot().sealedSeq, 2);
+        assert.equal(subscription.snapshot().stepRowsOmitted, 7);
+        assert.equal(subscription.snapshot().droppedCount, 9);
+        subscription.acceptPage({ ...known, expired: true, events: [] });
+        subscription.acceptSnapshot(absent);
+        assert.equal(subscription.snapshot().expired, true);
+        assert.equal(subscription.snapshot().origin, "captured");
+        assert.equal(subscription.snapshot().sealedSeq, 2);
+        assert.equal(subscription.snapshot().lastSeq, 1);
+        assert.equal(subscription.snapshot().timelineUnavailable, false);
+        assert.deepEqual(subscription.snapshot().events, []);
+        assert.equal(subscription.snapshot().connection, null);
+      } finally {
+        subscription.stop();
+      }
+    });
+  }
+
+  it("resumes an initially unavailable terminal timeline when late positive data arrives", () => {
+    const { subscription, seal } = fixture({ ...absent, status: "succeeded" });
+    try {
+      assert.equal(subscription.snapshot().connection, null);
+      const known = {
+        ...emptyTimeline,
+        streamEnabled: false,
+        status: "succeeded",
+        events: [runEvent(1, "run_started")],
+      };
+      subscription.acceptPage(known);
+      assert.equal(subscription.snapshot().connection, "Polling");
+      subscription.acceptPage({
+        ...known,
+        sealedSeq: 2,
+        events: [runEvent(2, "run_finished", { status: "succeeded" })],
+      });
+      assert.equal(subscription.snapshot().connection, null);
+      assert.equal(seal.mock.calls.length, 1);
+    } finally {
+      subscription.stop();
+    }
+  });
+
+  it("keeps newer stream status metadata when a stale status and snapshot arrive", () => {
+    const { subscription, sources, seal } = fixture({ ...emptyTimeline, origin: null });
+    const source = sources.at(0)!;
+    try {
+      source.emit("status", {
+        status: "succeeded",
+        sealedSeq: 3,
+        stepRowsOmitted: 7,
+        origin: "derived",
+      });
+      source.emit("status", {
+        status: "running",
+        sealedSeq: null,
+        stepRowsOmitted: 0,
+        origin: null,
+      });
+      subscription.acceptSnapshot({ ...emptyTimeline, origin: null });
+      assert.equal(subscription.snapshot().origin, "derived");
+      assert.equal(subscription.snapshot().sealedSeq, 3);
+      assert.equal(subscription.snapshot().stepRowsOmitted, 7);
+      assert.equal(subscription.snapshot().status, "succeeded");
+      source.emit("run_started", runEvent(1, "run_started"));
+      source.emit("step_started", runEvent(2, "step_started"));
+      source.emit("run_finished", runEvent(3, "run_finished", { status: "succeeded" }));
+      assert.equal(subscription.snapshot().connection, null);
+      assert.equal(source.closed, true);
+      assert.equal(seal.mock.calls.length, 1);
+    } finally {
+      subscription.stop();
+    }
   });
 
   it("refreshes completed persisted step output with capture and streaming off, then stops", async () => {
