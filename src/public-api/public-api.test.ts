@@ -334,6 +334,7 @@ describe("generated public OpenAPI", () => {
       "/api/v1/hooks/{trigger}",
       "/api/v1/manual-runs",
       "/api/v1/projects",
+      "/api/v1/runs/{id}/events",
       "/api/v1/setup-resources",
       "/api/v1/triggers",
       "/api/v1/triggers/install",
@@ -428,7 +429,10 @@ describe("generated public OpenAPI", () => {
         responses: Object.keys(responses).sort(),
       })),
       Object.entries(publicOpenApiDocument.paths ?? {})
-        .filter(([path]) => !path.startsWith("/api/v1/cli-authorizations"))
+        .filter(
+          ([path]) =>
+            !path.startsWith("/api/v1/cli-authorizations") && path !== "/api/v1/runs/{id}/events",
+        )
         .map(([path, item]) => {
           const method = item?.get === undefined ? "post" : "get";
           const operation = item?.[method];

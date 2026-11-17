@@ -23,9 +23,9 @@ The available API key scopes are `projects:read`, `configuration:validate`, `con
 optional allowed trigger names further restrict it. See [authenticated webhook triggers](webhooks.md)
 for key creation, executable examples, response and error tables, retries, limits and retention.
 
-`runs:read` is reserved for authenticated run timeline reads. It does not grant dispatch access.
-Timeline capture is off by default and can be enabled with `PASEO_HUB_RUN_TIMELINE=true`.
-Streaming is not provided by this build.
+`runs:read` permits authenticated run timeline reads. It does not grant dispatch access.
+Timeline capture and streaming are off by default. Set `PASEO_HUB_RUN_TIMELINE=true` and
+`PASEO_HUB_RUN_STREAM=true` to enable streams.
 CLI credentials also include this scope. Before rolling back to a build without it, revoke keys
 that hold `runs:read`, because older builds reject that scope when authenticating a key.
 
@@ -70,9 +70,71 @@ Reconciliation derives missing start, terminal step and run rows from persisted 
 
 Finished timelines expire after the configured retention period. Cleanup continues with capture disabled. Existing state rows remain as expiry tombstones and are never reconstructed, even if retention is later extended. A historical run that never had a state row can receive only derived lifecycle rows if an extended window makes it eligible again.
 
-Capture remains an internal storage feature in this build. There is no timeline stream or source progress message yet.
+Source progress messages are not provided by this build.
 
 The instance operator console reads organization identity, entitlements, usage and entitlement history. It does not read run or timeline records. Capture does not add operator access.
+
+## Run event streams
+
+`GET /api/v1/runs/{id}/events` reads only stored timeline rows. Create a separate API key for each consumer and grant only `runs:read`. `runs:dispatch` does not imply read access. CLI credentials also work, while their owner remains an owner or admin. A browser member of any role can use a same-origin session with `?organization=<slug>`.
+
+```sh
+curl -N -H "Authorization: Bearer $HUB_KEY" "$HUB_URL/api/v1/runs/$RUN_ID/events"
+```
+
+Save this Node example as an ES module. It reconnects using the last timeline id:
+
+```js
+import { createInterface } from "node:readline";
+import { Readable } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
+
+let after = "";
+let finished = false;
+while (!finished) {
+  const response = await fetch(`${process.env.HUB_URL}/api/v1/runs/${process.env.RUN_ID}/events`, {
+    headers: {
+      Authorization: `Bearer ${process.env.HUB_KEY}`,
+      ...(after === "" ? {} : { "Last-Event-ID": after }),
+    },
+  });
+  if (!response.ok || response.body === null) {
+    throw new Error(`Stream request failed with status ${response.status}`);
+  }
+  const lines = createInterface({
+    input: Readable.fromWeb(response.body),
+    crlfDelay: Infinity,
+  });
+  for await (const line of lines) {
+    if (line.startsWith("id: ")) after = line.slice(4);
+    if (line === "event: end") finished = true;
+    process.stdout.write(`${line}\n`);
+  }
+  if (!finished) await delay(5000);
+}
+```
+
+The stream starts with `retry: 5000`, `: stream open` and a `status` event. Status includes `runId`, `status`, `firstSeq`, `lastSeq`, `sealedSeq`, `stepRowsOmitted` and the stored `origin`. Origin is null if capture has not persisted its first row. A timeline row has `id: <seq>`, `event: <kind>` and one JSON `data` line containing `seq`, `kind`, `at`, `stepId` and `data`. No extra free text is added. Heartbeats are `: ping`.
+
+Resume with `Last-Event-ID` or `?after=<seq>`. The query parameter wins. Cursors must be non-negative safe integers. An older cursor replays from the first retained row. A cursor beyond the latest row waits for newer rows. Each subscriber reads pages of at most 100 rows with a 16 KiB high water mark and a 256 KiB safety cap. Shared per-run notifiers hold no event backlog. A bounded 500-row read cache is discarded with the notifier. A 2 second state poll recovers lost bus notifications and writes from another process.
+
+`end` means the run is terminal, reconciled, sealed and all rows through the seal have been read. It carries `status`, `lastSeq`, `sealedSeq` and `stepRowsOmitted`. A terminal status alone does not mean the timeline is complete. `reconnect` and `shutdown` carry `reconnectMs: 5000` and ask the client to reconnect with its last id. Control events have no id. A failed 60 second credential or session check sends `error` with `code: unauthorized` and closes. Reauthorization does not update credential last-use evidence.
+
+| Setting                              | Default | Range           |
+| ------------------------------------ | ------- | --------------- |
+| `PASEO_HUB_STREAM_MAX_PER_KEY`       | `5`     | `1` to `100`    |
+| `PASEO_HUB_STREAM_MAX_PER_ORG`       | `20`    | `1` to `500`    |
+| `PASEO_HUB_STREAM_MAX_TOTAL`         | `200`   | `1` to `2000`   |
+| `PASEO_HUB_STREAM_HEARTBEAT_SECONDS` | `15`    | `5` to `60`     |
+| `PASEO_HUB_STREAM_MAX_SECONDS`       | `3600`  | `60` to `86400` |
+
+Limits are per process, credential kind and id, organization, and user id for sessions. HTTP 429 `too_many_streams` has `Retry-After: 30`. Shutdown returns HTTP 503 `shutting_down` with `Retry-After: 5` before stream admission closes. Missing authentication returns 401 `unauthorized` with a Bearer challenge. Missing scope returns 403 `insufficient_scope`. Unknown, foreign, rejected and invalid run ids share 404 `run_not_found`. An authorized expired timeline returns 410 `timeline_expired` and is never reconstructed. An invalid cursor returns 400 `invalid_request`. Unavailable storage returns 503 `infrastructure_unavailable`. With streaming off the route returns 404 `not_found`.
+
+Headers are `Content-Type: text/event-stream; charset=utf-8`, `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no`. No CORS headers are added. Hub does not override Better Auth's cookie defaults: HttpOnly, SameSite=Lax and Secure for an HTTPS base URL. Cross-origin script cannot read the response. The route does not use forwarded client address headers.
+
+Cloudflare and Caddy buffering behavior is not verified here. Heartbeats are below Cloudflare's 125 second read timeout. The public proxy must flush the initial event and each heartbeat. No proxy configuration is changed. A lifecycle-managed socket with no drain for 30 seconds is destroyed. Client disconnects cancel the reader and release stream and notifier counters. Shutdown closes stream admission and sends `shutdown` before HTTP draining and runtime teardown. The existing HTTP shutdown grace and hard-exit budgets remain backstops.
+
+The runtime exposes `runStreams` and `streamNotifiers` when streaming is enabled. Both return to zero when streams close.
 
 ## Workflow MCP tools
 

@@ -1,4 +1,5 @@
 import { OpenAPIRegistry, OpenApiGeneratorV31 } from "@asteasolutions/zod-to-openapi";
+import { z } from "zod";
 import {
   CliAuthorizationPollSchema,
   CliAuthorizationSchema,
@@ -66,6 +67,76 @@ registry.registerPath({
     },
     503: { description: "Durable storage is unavailable." },
   },
+});
+
+registry.registerComponent("securitySchemes", "browserSession", {
+  type: "apiKey",
+  in: "cookie",
+  name: "__Secure-better-auth.session_token",
+  description: "Same-origin browser session. Local HTTP uses better-auth.session_token.",
+});
+
+const runStreamResponses: Parameters<typeof registry.registerPath>[0]["responses"] = {
+  200: {
+    description:
+      "A pull-based event stream. retry: 5000 and : stream open precede status. Stored rows use id: seq, event: kind and one JSON data line. Heartbeats are : ping. Control events status, end, shutdown, reconnect and error never have ids.",
+    content: { "text/event-stream": { schema: z.string() } },
+  },
+};
+for (const [status, description] of [
+  [400, "Invalid cursor."],
+  [401, "Missing or invalid credential or session."],
+  [403, "Missing runs:read scope."],
+  [404, "Unknown, foreign or rejected run, or disabled route."],
+  [410, "The authorized run timeline has expired."],
+  [429, "An open stream limit was reached. Retry after 30 seconds."],
+  [503, "Hub is stopping or storage is unavailable. Shutdown retry is 5 seconds."],
+] as const) {
+  runStreamResponses[status] = {
+    description,
+    headers: {
+      ...(status === 401
+        ? { "WWW-Authenticate": { schema: { type: "string", example: "Bearer" } } }
+        : {}),
+      ...(status === 429 || status === 503
+        ? { "Retry-After": { schema: { type: "integer" } } }
+        : {}),
+    },
+    content: { "application/problem+json": { schema: ProblemSchema } },
+  };
+}
+
+registry.registerPath({
+  method: "get",
+  path: "/api/v1/runs/{id}/events",
+  operationId: "streamRunEvents",
+  summary: "Stream a run timeline",
+  description:
+    "Read stored timeline rows with runs:read or an organization member session. Resume after the last event id. End is sent only after terminal reconciliation and the seal.",
+  tags: ["Runs"],
+  security: [{ bearerAuth: [] }, { browserSession: [] }],
+  "x-required-scopes": ["runs:read"],
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    headers: z.object({
+      "Last-Event-ID": z
+        .string()
+        .regex(/^[0-9]+$/u)
+        .optional(),
+    }),
+    query: z.object({
+      after: z
+        .string()
+        .regex(/^[0-9]+$/u)
+        .optional()
+        .describe("Non-negative safe integer cursor. Overrides Last-Event-ID."),
+      organization: z
+        .string()
+        .optional()
+        .describe("Organization slug. Required with a browser session."),
+    }),
+  },
+  responses: runStreamResponses,
 });
 
 const requestIdResponseHeader = {
