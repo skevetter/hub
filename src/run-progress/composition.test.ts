@@ -178,6 +178,54 @@ describe("run progress composition", () => {
   });
 });
 
+describe("reporter admission", () => {
+  it.each([
+    { flag: false, provider: true, starts: false },
+    { flag: true, provider: false, starts: false },
+    { flag: true, provider: true, starts: true },
+  ])(
+    "opens reporter work only with the flag and a provider ($flag/$provider)",
+    async ({ flag, provider, starts }) => {
+      vi.useFakeTimers();
+      const database = createMemoryDatabase();
+      const list = vi.spyOn(database, "listOpenRunProgressMessages");
+      let runtime: ApplicationRuntime | undefined;
+      try {
+        runtime = await createApplicationRuntime({
+          database,
+          auth: null,
+          entitlements: createUnlimitedEntitlementsService(),
+          billing: null,
+          runProgress: readRunProgressSettings({
+            PASEO_HUB_RUN_TIMELINE: "true",
+            PASEO_HUB_PROGRESS_MESSAGES: String(flag),
+          }),
+          progressProviders: provider
+            ? [
+                {
+                  name: "linear",
+                  maxBodyChars: 4000,
+                  destination: () => undefined,
+                  authorize: async () => "ok",
+                  secrets: async () => [],
+                  create: async () => ({ status: "gone" }),
+                  edit: async () => ({ status: "gone" }),
+                },
+              ]
+            : [],
+          close: async () => undefined,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        assert.equal(list.mock.calls.length, starts ? 1 : 0);
+      } finally {
+        await runtime?.stop();
+        list.mockRestore();
+        vi.useRealTimers();
+      }
+    },
+  );
+});
+
 function registration(events: string[]): ProviderRegistration {
   return {
     connection: { name: "fake", status: () => ({ status: "connected" }), actions: {} },
