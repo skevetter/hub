@@ -45,6 +45,7 @@ interface PreparedStream extends StreamContext {
 
 const errors = {
   not_found: [404, "Not found", "The requested route does not exist."],
+  method_not_allowed: [405, "Method not allowed", "This route only accepts GET requests."],
   unauthorized: [401, "Unauthorized", "A valid credential or browser session is required."],
   insufficient_scope: [403, "Insufficient scope", "The credential requires runs:read."],
   run_not_found: [404, "Run not found", "The requested run is unavailable."],
@@ -87,6 +88,7 @@ export class RunStream {
     const requestId = requestIdentifier(request);
     const { database, bus, reconciler, settings } = this.options;
     if (!settings.runStreamEnabled) return this.failure(requestId, "not_found");
+    if (request.method !== "GET") return this.failure(requestId, "method_not_allowed");
     if (this.closing) return this.failure(requestId, "shutting_down");
     if (database === null || bus === undefined || reconciler === undefined)
       return this.failure(requestId, "infrastructure_unavailable");
@@ -109,6 +111,7 @@ export class RunStream {
     let headers: Record<string, string> | undefined;
     if (code === "too_many_streams") headers = { "retry-after": "30" };
     else if (code === "shutting_down") headers = { "retry-after": "5" };
+    else if (code === "method_not_allowed") headers = { allow: "GET" };
     return problem(requestId, status, code, title, detail, undefined, headers);
   }
 

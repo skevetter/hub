@@ -87,6 +87,7 @@ for (const [status, description] of [
   [400, "Invalid cursor."],
   [401, "Missing or invalid credential or session."],
   [403, "Missing runs:read scope."],
+  [405, "Only GET is supported. HEAD and other methods never open a stream."],
   [404, "Unknown, foreign or rejected run, or disabled route."],
   [410, "The authorized run timeline has expired."],
   [429, "An open stream limit was reached. Retry after 30 seconds."],
@@ -101,6 +102,7 @@ for (const [status, description] of [
       ...(status === 429 || status === 503
         ? { "Retry-After": { schema: { type: "integer" } } }
         : {}),
+      ...(status === 405 ? { Allow: { schema: { type: "string", example: "GET" } } } : {}),
     },
     content: { "application/problem+json": { schema: ProblemSchema } },
   };

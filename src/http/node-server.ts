@@ -112,6 +112,7 @@ async function forwardRequest(
     }
     let responseRequestId: string | undefined;
     if (response.status >= 400 && !tracked.failureReported) {
+      const requestId = response.headers.get("x-request-id");
       responseRequestId = reportFailure(
         new Error(`HTTP response completed with status ${response.status}`),
         {
@@ -120,6 +121,7 @@ async function forwardRequest(
           method: request.method,
           path: new URL(request.url).pathname,
           status: response.status,
+          ...(requestId === null ? {} : { requestId }),
         },
         {
           status: response.status,
