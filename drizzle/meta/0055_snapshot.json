@@ -1,5 +1,5 @@
 {
-  "id": "b259343e-7e37-4a12-8253-17de5bcc8506",
+  "id": "0872382c-a467-4817-81de-1d379986bffb",
   "prevId": "9b4c2087-ffa1-4d90-8a54-28d79ed518a1",
   "version": "7",
   "dialect": "postgresql",
@@ -5283,6 +5283,18 @@
           "primaryKey": false,
           "notNull": false
         },
+        "last_regular_attempt_at": {
+          "name": "last_regular_attempt_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_regular_reservation_version": {
+          "name": "last_regular_reservation_version",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": false
+        },
         "edit_count": {
           "name": "edit_count",
           "type": "integer",
@@ -5306,6 +5318,24 @@
         },
         "retry_at": {
           "name": "retry_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "credential_key": {
+          "name": "credential_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "credential_retry_at": {
+          "name": "credential_retry_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "credential_rejected_until": {
+          "name": "credential_rejected_until",
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
@@ -5389,6 +5419,22 @@
           ],
           "isUnique": false,
           "where": "\"run_progress_messages\".\"settle_at\" is not null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "run_progress_messages_credential_idx": {
+          "name": "run_progress_messages_credential_idx",
+          "columns": [
+            {
+              "expression": "credential_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"run_progress_messages\".\"credential_key\" is not null",
           "concurrently": false,
           "method": "btree",
           "with": {}

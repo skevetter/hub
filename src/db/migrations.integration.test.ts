@@ -104,6 +104,104 @@ describe("database migration application", () => {
       await upgraded.close();
     }
   }, 120_000);
+  it("adds reporter scheduling state in one migration over populated release-10 progress rows", async () => {
+    const url = await createHistoricalBaseline({
+      postgres,
+      prefix: "release_10_progress_upgrade",
+      through: "0054_timeline_accounting_batches",
+    });
+    const messages = () =>
+      poolQuery<{ message: Record<string, unknown> }>(
+        url,
+        `select to_jsonb(progress) as message from run_progress_messages progress order by state`,
+      );
+    const journal = () =>
+      poolQuery<{ hash: string }>(url, `select hash from drizzle.__drizzle_migrations order by id`);
+
+    await poolQuery(
+      url,
+      `
+      insert into organization (id, name, slug) values ('release-10', 'Release 10', 'release-10');
+      insert into projects (id, organization_id, name, slug)
+        values ('10000000-0000-4000-8000-000000000001', 'release-10', 'Progress', 'progress');
+      insert into project_configuration_revisions
+        (id, project_id, organization_id, version, source_kind, source_evidence, normalized_configuration, content_hash)
+        values ('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000001',
+          'release-10', 1, 'manual', '{}', '{}', 'progress');
+      with receipts as (
+        insert into provider_event_receipts (organization_id, provider, delivery_id, source, payload)
+        values ('release-10', 'linear', 'active', 'linear.issue', '{}'),
+               ('release-10', 'linear', 'finished', 'linear.issue', '{}')
+        returning id, delivery_id
+      ), runs as (
+        insert into trigger_runs
+          (organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
+           configured_trigger_name, status, prompt, deadline_at, completed_at)
+        select 'release-10', '10000000-0000-4000-8000-000000000001',
+          '20000000-0000-4000-8000-000000000001', id, delivery_id,
+          case when delivery_id = 'active' then 'running' else 'succeeded' end, '',
+          now() + interval '1 hour', case when delivery_id = 'finished' then now() end
+        from receipts
+        returning id, configured_trigger_name
+      )
+      insert into run_progress_messages
+        (trigger_run_id, organization_id, provider, state, external_ref, version, edit_count,
+         compensation_requested_gen, compensation_done_gen)
+      select id, 'release-10', 'linear', configured_trigger_name,
+        jsonb_build_object('id', configured_trigger_name), 7, 3, 4, 1
+      from runs;
+    `,
+    );
+    const before = await messages();
+    const releasedJournal = await journal();
+    assert.equal(before.rowCount, 2);
+
+    const upgraded = await createDatabase(url);
+    await upgraded.close();
+
+    const reporterMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0055_run_progress_reporter.sql"),
+      "utf8",
+    );
+    assert.deepEqual((await journal()).rows, [
+      ...releasedJournal.rows,
+      { hash: createHash("sha256").update(reporterMigration).digest("hex") },
+    ]);
+    assert.deepEqual(
+      (await messages()).rows,
+      before.rows.map(({ message }) => ({
+        message: {
+          ...message,
+          last_regular_attempt_at: null,
+          last_regular_reservation_version: null,
+          failed_edits: 0,
+          final_failures: 0,
+          retry_at: null,
+          credential_key: null,
+          credential_retry_at: null,
+          credential_rejected_until: null,
+          settle_at: null,
+          repeat_final: false,
+        },
+      })),
+    );
+    assert.deepEqual(
+      (
+        await poolQuery<{ indexname: string }>(
+          url,
+          `select indexname from pg_indexes
+           where schemaname = 'public' and tablename = 'run_progress_messages'
+             and indexname in ('run_progress_messages_credential_idx', 'run_progress_messages_settle_idx')
+           order by indexname`,
+        )
+      ).rows,
+      [
+        { indexname: "run_progress_messages_credential_idx" },
+        { indexname: "run_progress_messages_settle_idx" },
+      ],
+    );
+  }, 120_000);
+
   it("adds nullable API key identity while enforcing actor and scope constraints", async () => {
     const url = await createHistoricalBaseline({
       postgres,
