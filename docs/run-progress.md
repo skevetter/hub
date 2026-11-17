@@ -10,10 +10,11 @@ the message. Access to the linked run requires a Hub login.
 | ------------------------------------- | ------- | ------------------------------------------------------------------------------------- |
 | `PASEO_HUB_PROGRESS_MESSAGES`         | `false` | `true` or `false`                                                                     |
 | `PASEO_HUB_PROGRESS_MIN_EDIT_SECONDS` | `20`    | Whole seconds from 5 to 600. After 15 minutes, regular edits are paced at 60 seconds. |
-| `PASEO_HUB_PROGRESS_MAX_EDITS`        | `120`   | Whole edits from 10 to 1,000 per run. Final and repair edits are outside this cap.    |
+| `PASEO_HUB_PROGRESS_MAX_EDITS`        | `120`   | Whole regular edit attempts from 10 to 1,000 per run.                                 |
 | `PASEO_HUB_TIMELINE_RETENTION_DAYS`   | `30`    | Whole days from 1 to 365 after run completion.                                        |
 
-Hub rejects invalid settings at startup. Retention removes local progress rows even when the
+Failed and uncertain regular writes count toward pacing and the edit cap. Final and repair
+edits are outside the cap. Hub rejects invalid settings at startup. Retention removes local progress rows even when the
 reporter is off. Messages already posted remain at the source.
 
 Hub shares credential cooldowns across processes through the database. Each process still
