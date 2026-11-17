@@ -5,6 +5,7 @@ export const API_KEY_SCOPES = [
   "configuration:validate",
   "configuration:install",
   "runs:dispatch",
+  "runs:read",
   "events:send",
   "daemons:enroll",
 ] as const;

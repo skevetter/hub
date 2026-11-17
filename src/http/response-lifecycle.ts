@@ -6,26 +6,30 @@ export interface ResponseLifecycle {
   onAbort?: ResponseAbortCleanup;
 }
 
-const responseLifecycles = new WeakMap<Response, ResponseLifecycle>();
+const RESPONSE_LIFECYCLE = Symbol.for("@getpaseo/hub/response-lifecycle");
+
+interface LifecycleResponse extends Response {
+  [RESPONSE_LIFECYCLE]?: ResponseLifecycle;
+}
 
 export function registerResponseFinishCleanup(
   response: Response,
   cleanup: ResponseFinishCleanup,
 ): Response {
-  responseLifecycles.set(response, { onFinish: cleanup });
-  return response;
+  return registerResponseLifecycle(response, { onFinish: cleanup });
 }
 
 export function registerResponseLifecycle(
   response: Response,
   lifecycle: ResponseLifecycle,
 ): Response {
-  responseLifecycles.set(response, lifecycle);
+  Object.defineProperty(response, RESPONSE_LIFECYCLE, { value: lifecycle, configurable: true });
   return response;
 }
 
 export function takeResponseLifecycle(response: Response): ResponseLifecycle | undefined {
-  const lifecycle = responseLifecycles.get(response);
-  responseLifecycles.delete(response);
+  const owned = response as LifecycleResponse;
+  const lifecycle = owned[RESPONSE_LIFECYCLE];
+  delete owned[RESPONSE_LIFECYCLE];
   return lifecycle;
 }

@@ -10,6 +10,14 @@ import { OrganizationTriggerStore } from "./store.js";
 import { notificationStatusView, type NotificationStatusView } from "./notification-status.js";
 import { summarizeRecentRuns, type RecentRuns } from "./recent-runs.js";
 import { summarizeTrigger } from "../projects/activity-summary.js";
+import { activityRunDetailView } from "../projects/activity-run-view.js";
+import { isRunTimelineExpired, retentionCutoff } from "../run-timeline/retention.js";
+import { timelineStepId } from "../run-timeline/data.js";
+import type { RunTimelineReconciler } from "../run-timeline/reconcile.js";
+import type { RunProgressSettings } from "../run-progress/settings.js";
+import type { TriggerRunRecord } from "../db/types.js";
+import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
+import type { RunTimelineState } from "../run-timeline/store.js";
 
 const DAY_MS = 24 * 60 * 60_000;
 const NOTIFICATION_EVENT = "github.notification";
@@ -20,6 +28,11 @@ export interface TriggerDashboardOptions {
   /** Seconds between polls, as configured. Shown on the status card. */
   githubNotificationsPollSeconds?: number;
   now?: () => Date;
+  runProgress?: Pick<
+    RunProgressSettings,
+    "runTimelineEnabled" | "runStreamEnabled" | "retentionDays" | "progressMessagesEnabled"
+  >;
+  reconciler?: Pick<RunTimelineReconciler, "reconcileBeforeTerminal">;
 }
 
 export class TriggerDashboard {
@@ -126,6 +139,114 @@ export class TriggerDashboard {
           label: linearOrganizationName,
         })),
       ],
+    };
+  }
+  async runDetail(
+    request: Request,
+    organizationSlug: string,
+    runId: string,
+  ): Promise<RunDetailSnapshot | null> {
+    const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+      organizationSlug,
+    });
+    const run = await this.database.findTriggerRunForOrganization(tenant.organization.id, runId);
+    if (run === undefined) return null;
+    const activity = await this.database.findProjectActivityRun(run.projectId, runId);
+    if (activity === undefined) return null;
+    const [executions, timeline, progress] = await Promise.all([
+      Promise.all(
+        activity.steps.map(async (step) =>
+          step.agentExecutionId === null
+            ? undefined
+            : this.database.findAgentExecutionById(step.agentExecutionId),
+        ),
+      ),
+      this.timelinePage(tenant.organization.id, run, 0),
+      this.database.findRunProgressMessage(tenant.organization.id, runId),
+    ]);
+    const detail = activityRunDetailView(activity, executions);
+    return {
+      ...detail,
+      steps: detail.steps.map((step) =>
+        Object.assign(step, { timelineStepId: timelineStepId(step.stepId) }),
+      ),
+      timeline,
+      progressMessagesEnabled: this.options.runProgress?.progressMessagesEnabled ?? false,
+      progress:
+        progress === undefined
+          ? null
+          : { state: progress.state, provider: progress.provider, failure: progress.failure },
+    };
+  }
+
+  async runEvents(
+    request: Request,
+    organizationSlug: string,
+    runId: string,
+    after: number,
+  ): Promise<RunEventPage | null> {
+    const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+      organizationSlug,
+    });
+    const run = await this.database.findTriggerRunForOrganization(tenant.organization.id, runId);
+    if (run === undefined) return null;
+    return this.timelinePage(tenant.organization.id, run, after);
+  }
+
+  private async timelinePage(
+    organizationId: string,
+    run: TriggerRunRecord,
+    after: number,
+  ): Promise<RunEventPage> {
+    const settings = this.options.runProgress ?? {
+      runTimelineEnabled: false,
+      runStreamEnabled: false,
+      retentionDays: 30,
+      progressMessagesEnabled: false,
+    };
+    const retentionDays = settings.retentionDays;
+    const cutoff = retentionCutoff((this.options.now ?? (() => new Date()))(), retentionDays);
+    let state = await this.database.readRunTimelineState(organizationId, run.id);
+    let expired = isRunTimelineExpired(
+      { completedAt: run.completedAt, expiredAt: state?.expiredAt ?? null },
+      cutoff,
+    );
+    if (
+      !expired &&
+      settings.runTimelineEnabled &&
+      run.outcome === "accepted" &&
+      run.status !== "running" &&
+      state?.sealedSeq == null
+    ) {
+      await this.options.reconciler?.reconcileBeforeTerminal(organizationId, run.id);
+      state = await this.database.readRunTimelineState(organizationId, run.id);
+      expired = isRunTimelineExpired(
+        { completedAt: run.completedAt, expiredAt: state?.expiredAt ?? null },
+        cutoff,
+      );
+    }
+    const events = expired
+      ? []
+      : await this.database.listRunTimelineEvents(organizationId, run.id, {
+          afterSeq: after,
+          limit: 100,
+        });
+    return {
+      events: events.map(({ seq, kind, at, stepId, data }) => ({
+        seq,
+        kind,
+        at: at.toISOString(),
+        stepId,
+        data,
+      })),
+      status: run.status,
+      ...timelineSummary(state),
+      expired,
+      timelineEnabled: settings.runTimelineEnabled,
+      timelineUnavailable:
+        !settings.runTimelineEnabled && state === undefined && events.length === 0,
+      streamEnabled: settings.runStreamEnabled,
+      retentionDays,
     };
   }
 
@@ -289,4 +410,13 @@ function stringArray(value: unknown): string[] {
 
 function string(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function timelineSummary(state: RunTimelineState | undefined) {
+  return {
+    sealedSeq: state?.sealedSeq ?? null,
+    stepRowsOmitted: state?.stepRowsOmitted ?? 0,
+    origin: state?.origin ?? null,
+    droppedCount: state?.droppedCount ?? 0,
+  };
 }

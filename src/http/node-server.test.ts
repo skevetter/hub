@@ -244,6 +244,7 @@ describe("HTTP failure ownership", () => {
       {
         status: "enabled",
         authenticator: {
+          reauthorize: async () => false,
           authorize: () =>
             Promise.resolve({
               status: "authorized" as const,

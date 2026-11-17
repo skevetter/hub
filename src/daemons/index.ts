@@ -1,3 +1,4 @@
+import type { RunTimeline } from "../run-timeline/index.js";
 import type { Database } from "../db/types.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import type { TriggerProvider } from "../triggers/index.js";
@@ -39,6 +40,7 @@ export interface DaemonModuleOptions {
   executionCapabilities?: OutputExecutorRegistry;
   providers?: readonly TriggerProvider[];
   executionAuthority?: ExecutionAuthority;
+  timeline?: RunTimeline;
   connectionForDaemon(daemonId: string): DaemonConnection | undefined;
   publicBaseUrl?: string;
   completionTokenSecret?: string;
@@ -56,6 +58,7 @@ export function createDaemonModule(options: DaemonModuleOptions): DaemonModule {
     lifecycle: createDaemonDispatchLifecycle({
       database: options.database,
       connectionForDaemon: (daemonId) => options.connectionForDaemon(daemonId),
+      ...(options.timeline === undefined ? {} : { timeline: options.timeline }),
       ...(options.executionCapabilities === undefined
         ? {}
         : { executionCapabilities: options.executionCapabilities }),

@@ -33,7 +33,7 @@ export function TriggerActivityTable({
           <DataCell>
             <a
               href={`/o/${encodeURIComponent(organizationSlug)}/activity/${encodeURIComponent(run.id)}`}
-              className="text-primary hover:underline"
+              className="text-link hover:underline"
             >
               {run.triggerName}
             </a>

@@ -115,6 +115,25 @@ import {
   isProviderEventDropReasonCode,
   type ProviderEventDropReasonCode,
 } from "../triggers/drop-reason.js";
+import {
+  isOrdinary,
+  jsonbBytes,
+  prepareTimelineData,
+  timelineBudgetExceeded,
+  timelineDedupeKey,
+  timelineStepId,
+} from "../run-timeline/data.js";
+import { timelineAccountingBatchId } from "../run-timeline/store.js";
+import type {
+  AppendRunTimelineEventInput,
+  AppendRunTimelineEventResult,
+  InsertRunProgressMessageInput,
+  RunProgressLeaseInput,
+  RunProgressMessage,
+  RunTimelineEvent,
+  RunTimelineState,
+  UpdateRunProgressMessageInput,
+} from "../run-timeline/store.js";
 
 const OUTPUT_ATTEMPT_LEASE_MS = 5 * 60_000;
 
@@ -231,6 +250,11 @@ class MemoryDatabase implements Database {
   private readonly machines = new Map<string, MachineRecord>();
   private readonly agentExecutions = new Map<string, AgentExecutionRecord>();
   private readonly triggerRuns = new Map<string, TriggerRunRecord>();
+  private readonly runTimelineStates = new Map<string, RunTimelineState>();
+  private readonly runTimelineEvents = new Map<string, RunTimelineEvent[]>();
+  private readonly runTimelineDedupe = new Map<string, Map<string, number>>();
+  private readonly runTimelineAccountingBatchIds = new Map<string, string[]>();
+  private readonly runProgressMessages = new Map<string, RunProgressMessage>();
   private readonly triggerRunIdsByProviderEventReceipt = new Map<
     string,
     Map<string, Map<string, string>>
@@ -289,6 +313,501 @@ class MemoryDatabase implements Database {
 
   private now(): Date {
     return this.options.now?.() ?? new Date();
+  }
+
+  async appendRunTimelineEvent(
+    input: AppendRunTimelineEventInput,
+  ): Promise<AppendRunTimelineEventResult> {
+    const maxEvents = input.maxEvents ?? 500;
+    if (!Number.isInteger(maxEvents) || maxEvents < 50 || maxEvents > 5000) {
+      throw new RangeError("Invalid timeline event limit");
+    }
+    const stepId = timelineStepId(input.stepId ?? "");
+    const dedupeKey = timelineDedupeKey(input.kind, stepId, input.data);
+    const opened = this.openTimelineForAppend(input, dedupeKey);
+    if (opened === undefined || !("eventCount" in opened)) return opened;
+    const state = opened;
+    const notice =
+      this.runTimelineEvents.get(state.triggerRunId)?.some((row) => row.kind === "truncated") ??
+      false;
+    if (state.stepEndCount >= 100 || input.kind === "run_finished")
+      this.refreshTimelineStepOmissions(state);
+    const data = prepareTimelineData(
+      input.kind,
+      input.kind === "run_finished"
+        ? { ...input.data, stepRowsOmitted: state.stepRowsOmitted }
+        : input.data,
+    );
+    const bytes = jsonbBytes(data);
+    if (timelineBudgetExceeded(state, input.kind, bytes, maxEvents, notice)) {
+      this.dropTimelineEvent(state, input, notice);
+      return { reason: "cap" };
+    }
+    const event: RunTimelineEvent = {
+      triggerRunId: state.triggerRunId,
+      organizationId: state.organizationId,
+      seq: state.eventCount + 1,
+      kind: input.kind,
+      at: new Date(input.at),
+      stepId,
+      data,
+    };
+    this.insertTimelineEvent(state, event);
+    if (dedupeKey !== undefined) {
+      const dedupe = this.runTimelineDedupe.get(state.triggerRunId) ?? new Map<string, number>();
+      dedupe.set(dedupeKey, event.seq);
+      this.runTimelineDedupe.set(state.triggerRunId, dedupe);
+    }
+    if (isOrdinary(input.kind)) state.byteCount += bytes;
+    if (input.kind === "step_finished") {
+      state.stepEndCount += 1;
+      state.stepEndBytes += bytes;
+      if (state.stepEndCount >= 100) this.refreshTimelineStepOmissions(state);
+    }
+    if (input.kind === "run_finished") {
+      state.sealedSeq = event.seq;
+      state.sealedAt = new Date(input.at);
+    }
+    return { seq: event.seq, inserted: true };
+  }
+
+  async recordRunTimelineDrops(
+    organizationId: string,
+    runId: string,
+    count: number,
+    at: Date,
+    batchId: string,
+  ) {
+    if (!Number.isSafeInteger(count) || count <= 0)
+      throw new RangeError("Invalid timeline drop count");
+    batchId = timelineAccountingBatchId(batchId);
+    const run = this.triggerRuns.get(runId);
+    if (run === undefined || run.organizationId !== organizationId || run.outcome !== "accepted")
+      return undefined;
+    let state = this.runTimelineStates.get(runId);
+    if (state?.expiredAt != null) return undefined;
+    if (state === undefined) {
+      const opened = this.openTimelineForAppend(
+        {
+          triggerRunId: runId,
+          organizationId,
+          kind: "truncated",
+          at,
+          data: {},
+          origin: "captured",
+        },
+        undefined,
+      );
+      if (opened === undefined || !("eventCount" in opened)) return undefined;
+      state = opened;
+    }
+    const batchIds = this.runTimelineAccountingBatchIds.get(runId) ?? [];
+    if (batchIds.includes(batchId)) {
+      const notice = this.runTimelineEvents.get(runId)?.find((event) => event.kind === "truncated");
+      return notice === undefined
+        ? { seq: state.eventCount, inserted: false }
+        : { seq: state.eventCount, inserted: false, noticeSeq: notice.seq };
+    }
+    batchIds.push(batchId);
+    if (batchIds.length > 16) batchIds.shift();
+    this.runTimelineAccountingBatchIds.set(runId, batchIds);
+    state.droppedCount += count;
+    const notice =
+      this.runTimelineEvents.get(runId)?.some((event) => event.kind === "truncated") ?? false;
+    if (state.sealedSeq !== null || notice) return { seq: state.eventCount, inserted: false };
+    const seq = state.eventCount + 1;
+    this.insertTimelineEvent(state, {
+      triggerRunId: runId,
+      organizationId,
+      seq,
+      kind: "truncated",
+      at: new Date(at),
+      stepId: "",
+      data: { dropped: state.droppedCount },
+    });
+    return { seq, inserted: true };
+  }
+
+  private openTimelineForAppend(
+    input: AppendRunTimelineEventInput,
+    dedupeKey: string | undefined,
+  ): RunTimelineState | AppendRunTimelineEventResult {
+    const run = this.triggerRuns.get(input.triggerRunId);
+    if (
+      run === undefined ||
+      run.organizationId !== input.organizationId ||
+      run.outcome !== "accepted"
+    )
+      return undefined;
+    let state = this.runTimelineStates.get(run.id);
+    if (state?.expiredAt != null) return { reason: "expired" };
+    if (state?.sealedSeq != null) {
+      if (isOrdinary(input.kind)) state.droppedCount += 1;
+      return { reason: "sealed" };
+    }
+    const existingSeq =
+      dedupeKey === undefined ? undefined : this.runTimelineDedupe.get(run.id)?.get(dedupeKey);
+    if (existingSeq !== undefined) return { seq: existingSeq, inserted: false };
+    if (input.kind === "truncated") {
+      const notice = this.runTimelineEvents.get(run.id)?.find((row) => row.kind === "truncated");
+      if (notice !== undefined) return { seq: notice.seq, inserted: false };
+    }
+    if (state === undefined) {
+      state = {
+        triggerRunId: run.id,
+        organizationId: run.organizationId,
+        eventCount: 0,
+        byteCount: 0,
+        stepEndCount: 0,
+        stepEndBytes: 0,
+        stepRowsOmitted: 0,
+        droppedCount: 0,
+        sealedSeq: null,
+        sealedAt: null,
+        origin: input.origin,
+        expiredAt: null,
+      };
+      this.runTimelineStates.set(run.id, state);
+    }
+    return state;
+  }
+
+  private dropTimelineEvent(
+    state: RunTimelineState,
+    input: AppendRunTimelineEventInput,
+    notice: boolean,
+  ): void {
+    if (isOrdinary(input.kind)) state.droppedCount += 1;
+    else this.refreshTimelineStepOmissions(state);
+    if (!notice)
+      this.insertTimelineEvent(state, {
+        triggerRunId: state.triggerRunId,
+        organizationId: state.organizationId,
+        seq: state.eventCount + 1,
+        kind: "truncated",
+        at: new Date(input.at),
+        stepId: "",
+        data: { dropped: state.droppedCount },
+      });
+  }
+
+  private insertTimelineEvent(state: RunTimelineState, event: RunTimelineEvent): void {
+    const events = this.runTimelineEvents.get(state.triggerRunId) ?? [];
+    events.push(event);
+    this.runTimelineEvents.set(state.triggerRunId, events);
+    state.eventCount = event.seq;
+  }
+
+  private refreshTimelineStepOmissions(state: RunTimelineState): void {
+    let terminalCount = 0;
+    for (const step of this.workflowStepRuns.values()) {
+      if (
+        step.triggerRunId === state.triggerRunId &&
+        step.status !== "pending" &&
+        step.status !== "running"
+      )
+        terminalCount += 1;
+    }
+    state.stepRowsOmitted = Math.max(state.stepRowsOmitted, terminalCount - state.stepEndCount);
+  }
+
+  async listRunTimelineEvents(
+    organizationId: string,
+    runId: string,
+    page: { afterSeq: number; limit: number },
+  ): Promise<RunTimelineEvent[]> {
+    if (this.triggerRuns.get(runId)?.organizationId !== organizationId) return [];
+    return structuredClone(
+      (this.runTimelineEvents.get(runId) ?? [])
+        .filter((event) => event.organizationId === organizationId && event.seq > page.afterSeq)
+        .slice(0, Math.max(0, Math.min(5110, page.limit))),
+    );
+  }
+
+  async readRunTimelineState(
+    organizationId: string,
+    runId: string,
+  ): Promise<RunTimelineState | undefined> {
+    const state = this.runTimelineStates.get(runId);
+    return state?.organizationId === organizationId &&
+      this.triggerRuns.get(runId)?.organizationId === organizationId
+      ? structuredClone(state)
+      : undefined;
+  }
+
+  async findTriggerRunForOrganization(
+    organizationId: string,
+    runId: string,
+  ): Promise<TriggerRunRecord | undefined> {
+    const run = this.triggerRuns.get(runId);
+    return run?.organizationId === organizationId ? structuredClone(run) : undefined;
+  }
+
+  async resolveRunForExecution(
+    executionId: string,
+  ): Promise<{ triggerRunId: string; organizationId: string; stepId: string } | undefined> {
+    const execution = this.agentExecutions.get(executionId);
+    if (execution?.workflowStepRunId === null || execution === undefined) return undefined;
+    const step = this.workflowStepRuns.get(execution.workflowStepRunId);
+    const run = step === undefined ? undefined : this.triggerRuns.get(step.triggerRunId);
+    return run === undefined ||
+      step === undefined ||
+      run.organizationId !== execution.organizationId
+      ? undefined
+      : { triggerRunId: run.id, organizationId: run.organizationId, stepId: step.stepId };
+  }
+
+  async listUnsealedTerminalRuns(
+    olderThan: Date,
+    cutoff: Date,
+    limit: number,
+  ): Promise<AcceptedTriggerRunRecord[]> {
+    return structuredClone(
+      [...this.triggerRuns.values()]
+        .filter((run): run is AcceptedTriggerRunRecord => {
+          const state = this.runTimelineStates.get(run.id);
+          return (
+            run.outcome === "accepted" &&
+            run.status !== "running" &&
+            run.completedAt !== null &&
+            run.completedAt < olderThan &&
+            run.completedAt >= cutoff &&
+            state?.sealedSeq == null &&
+            state?.expiredAt == null
+          );
+        })
+        .sort(
+          (left, right) =>
+            left.completedAt!.getTime() - right.completedAt!.getTime() ||
+            left.id.localeCompare(right.id),
+        )
+        .slice(0, Math.max(0, limit)),
+    );
+  }
+
+  async expireRunTimelines(cutoff: Date, batch: number): Promise<number> {
+    const candidates = [...this.triggerRuns.values()]
+      .filter((run) => {
+        if (run.status === "running" || run.completedAt === null || run.completedAt >= cutoff) {
+          return false;
+        }
+        const state = this.runTimelineStates.get(run.id);
+        return (
+          (state !== undefined && state.expiredAt === null) || this.runProgressMessages.has(run.id)
+        );
+      })
+      .sort(
+        (left, right) =>
+          left.completedAt!.getTime() - right.completedAt!.getTime() ||
+          left.id.localeCompare(right.id),
+      )
+      .slice(0, Math.min(500, Math.max(0, Math.floor(batch))));
+    for (const run of candidates) {
+      this.runTimelineEvents.delete(run.id);
+      this.runTimelineDedupe.delete(run.id);
+      this.runTimelineAccountingBatchIds.delete(run.id);
+      this.runProgressMessages.delete(run.id);
+      const state = this.runTimelineStates.get(run.id);
+      if (state !== undefined && state.expiredAt === null) {
+        state.expiredAt = new Date(cutoff);
+      }
+    }
+    return candidates.length;
+  }
+
+  async insertRunProgressMessageIfAbsent(
+    input: InsertRunProgressMessageInput,
+  ): Promise<RunProgressMessage | undefined> {
+    const run = this.triggerRuns.get(input.triggerRunId);
+    if (
+      run?.organizationId !== input.organizationId ||
+      run.outcome !== "accepted" ||
+      this.runTimelineStates.get(run.id)?.expiredAt != null
+    )
+      return undefined;
+    const existing = this.runProgressMessages.get(run.id);
+    if (existing !== undefined) return structuredClone(existing);
+    const message: RunProgressMessage = {
+      triggerRunId: run.id,
+      organizationId: run.organizationId,
+      provider: input.provider,
+      state: "pending",
+      externalRef: null,
+      version: 0,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastRenderedHash: null,
+      lastEditAt: null,
+      editCount: 0,
+      visibility: null,
+      visibilityCheckedAt: null,
+      failure: null,
+      compensationRequestedGen: 0,
+      compensationDoneGen: 0,
+      compensationNotBefore: null,
+      createdAt: new Date(input.now),
+      updatedAt: new Date(input.now),
+    };
+    this.runProgressMessages.set(run.id, message);
+    return structuredClone(message);
+  }
+
+  async findRunProgressMessage(
+    organizationId: string,
+    runId: string,
+  ): Promise<RunProgressMessage | undefined> {
+    const message = this.runProgressMessages.get(runId);
+    return message?.organizationId === organizationId &&
+      this.triggerRuns.get(runId)?.organizationId === organizationId
+      ? structuredClone(message)
+      : undefined;
+  }
+
+  async acquireRunProgressLease(
+    input: RunProgressLeaseInput,
+  ): Promise<RunProgressMessage | undefined> {
+    const message = this.runProgressMessages.get(input.triggerRunId);
+    if (
+      message?.organizationId !== input.organizationId ||
+      this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
+      (message.leaseOwner !== null &&
+        message.leaseOwner !== input.owner &&
+        message.leaseExpiresAt !== null &&
+        message.leaseExpiresAt > input.now)
+    )
+      return undefined;
+    message.leaseOwner = input.owner;
+    message.leaseExpiresAt = new Date(input.now.getTime() + 60_000);
+    message.version += 1;
+    message.updatedAt = new Date(input.now);
+    return structuredClone(message);
+  }
+
+  async updateRunProgressMessage(
+    input: UpdateRunProgressMessageInput,
+  ): Promise<RunProgressMessage | undefined> {
+    const message = this.runProgressMessages.get(input.triggerRunId);
+    if (
+      message?.organizationId !== input.organizationId ||
+      this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
+      message.leaseOwner !== input.owner ||
+      message.version !== input.version ||
+      message.leaseExpiresAt === null ||
+      message.leaseExpiresAt <= input.now
+    )
+      return undefined;
+    const keys = [
+      "state",
+      "externalRef",
+      "lastRenderedHash",
+      "lastEditAt",
+      "editCount",
+      "visibility",
+      "visibilityCheckedAt",
+      "failure",
+    ] as const;
+    for (const key of keys) {
+      if (input.patch[key] !== undefined) {
+        Object.assign(message, { [key]: structuredClone(input.patch[key]) });
+      }
+    }
+    if (input.releaseLease !== false) {
+      message.leaseOwner = null;
+      message.leaseExpiresAt = null;
+    }
+    message.updatedAt = new Date(input.now);
+    return structuredClone(message);
+  }
+
+  async listRunProgressMessagesToFinish(now: Date, limit: number): Promise<RunProgressMessage[]> {
+    return structuredClone(
+      [...this.runProgressMessages.values()]
+        .filter((message) => {
+          const run = this.triggerRuns.get(message.triggerRunId);
+          if (
+            run === undefined ||
+            run.organizationId !== message.organizationId ||
+            run.outcome !== "accepted"
+          )
+            return false;
+          const terminal = run.status !== "running";
+          if (this.progressMessageNeedsRepair(message, now)) return true;
+          if (message.state === "active" && terminal) return true;
+          if (message.state !== "pending") return false;
+          if (
+            terminal ||
+            (this.runTimelineEvents.get(run.id) ?? []).some((event) => event.kind === "run_started")
+          )
+            return true;
+          for (const step of this.workflowStepRuns.values()) {
+            if (step.triggerRunId === run.id && step.startedAt !== null) return true;
+          }
+          return false;
+        })
+        .sort(
+          (left, right) =>
+            left.updatedAt.getTime() - right.updatedAt.getTime() ||
+            left.triggerRunId.localeCompare(right.triggerRunId),
+        )
+        .slice(0, Math.max(0, limit)),
+    );
+  }
+
+  private progressMessageNeedsRepair(message: RunProgressMessage, now: Date): boolean {
+    const expiredLease =
+      message.leaseOwner !== null &&
+      message.leaseExpiresAt !== null &&
+      message.leaseExpiresAt <= now;
+    if ((message.state === "creating" || message.state === "active") && expiredLease) return true;
+    return (
+      (message.state === "active" || message.state === "finished") &&
+      message.compensationRequestedGen > message.compensationDoneGen &&
+      (message.compensationNotBefore === null || message.compensationNotBefore <= now)
+    );
+  }
+
+  async requestCompensation(
+    organizationId: string,
+    runId: string,
+    notBefore?: Date,
+  ): Promise<number | undefined> {
+    const message = this.runProgressMessages.get(runId);
+    if (
+      message?.organizationId !== organizationId ||
+      this.triggerRuns.get(runId)?.organizationId !== organizationId
+    )
+      return undefined;
+    const pending = message.compensationRequestedGen > message.compensationDoneGen;
+    message.compensationRequestedGen += 1;
+    message.compensationNotBefore =
+      notBefore === undefined || (pending && message.compensationNotBefore === null)
+        ? null
+        : new Date(
+            pending && message.compensationNotBefore !== null
+              ? Math.min(message.compensationNotBefore.getTime(), notBefore.getTime())
+              : notBefore,
+          );
+    return message.compensationRequestedGen;
+  }
+
+  async completeCompensation(
+    organizationId: string,
+    runId: string,
+    observedGen: number,
+  ): Promise<void> {
+    if (!Number.isInteger(observedGen) || observedGen < 0) {
+      throw new RangeError("compensation generation must be a nonnegative integer");
+    }
+    const message = this.runProgressMessages.get(runId);
+    if (
+      message?.organizationId !== organizationId ||
+      this.triggerRuns.get(runId)?.organizationId !== organizationId
+    )
+      return;
+    message.compensationDoneGen = Math.max(
+      message.compensationDoneGen,
+      Math.min(message.compensationRequestedGen, observedGen),
+    );
   }
 
   private pendingTerminalNotification(

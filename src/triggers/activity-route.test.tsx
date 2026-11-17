@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRouter, Outlet, RouterProvider } from "@tanstack/react-router";
 import { renderToStaticMarkup } from "react-dom/server";
 import type * as ReactStart from "@tanstack/react-start";
@@ -28,20 +28,27 @@ vi.mock("../projects/context.js", async (importOriginal) => ({
 
 vi.mock("../queries/index.js", async (importOriginal) => ({
   ...(await importOriginal<typeof Queries>()),
-  useSnapshotQuery: ({ queryKey }: { queryKey: unknown }) => {
+  useSnapshotQuery: ({ queryKey }: { queryKey: readonly unknown[] }) => {
     state.queryKeys.push(queryKey);
-    return { status: "success", data: state.snapshot, refetch: () => {} };
+    const data =
+      queryKey[0] === "run-detail" ? { sequence: 1, value: state.snapshot } : state.snapshot;
+    return { status: "success", data, refetch: () => {} };
   },
 }));
 
 async function renderRoute(path: string) {
+  const client = new QueryClient();
   const router = createRouter({
     routeTree,
     history: createMemoryHistory({ initialEntries: [path] }),
-    context: { queryClient: new QueryClient() },
+    context: { queryClient: client },
   });
   await router.load();
-  return renderToStaticMarkup(<RouterProvider router={router} />);
+  return renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
 }
 
 describe("organization activity routes", () => {
@@ -107,13 +114,14 @@ describe("organization activity routes", () => {
 
       state.snapshot = null;
       const missing = await renderRoute("/o/acme%20team/activity/missing-run");
-      assert.match(missing, /Run not found/u);
+      assert.match(missing, /Run unavailable/u);
       assert.match(missing, /This run is unavailable/u);
       assert.match(missing, /href="\/o\/acme%20team\/activity"/u);
+      assert.match(missing, /Back to activity/u);
       assert.ok(
         state.queryKeys.some(
           (key) =>
-            JSON.stringify(key) === JSON.stringify(["activity-run", "acme team", "missing-run"]),
+            JSON.stringify(key) === JSON.stringify(["run-detail", "acme team", "missing-run"]),
         ),
       );
     } finally {

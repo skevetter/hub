@@ -65,6 +65,7 @@ async function harness(access = authorization) {
     publicApi: {
       status: "enabled",
       authenticator: {
+        reauthorize: async () => false,
         async authorize() {
           return { status: "authorized", access };
         },

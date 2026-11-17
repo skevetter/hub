@@ -1,3 +1,6 @@
+import type { RunTimeline } from "./run-timeline/index.js";
+import type { RunTimelineReconciler } from "./run-timeline/reconcile.js";
+import type { RunStream } from "./run-stream/index.js";
 import { createScheduleSource, createScheduleProvider } from "./triggers/schedule/index.js";
 import {
   createGitHubNotificationProvider,
@@ -87,6 +90,9 @@ export interface HubRuntimeOptions {
   /** How many script steps may run at once. */
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
+  runTimeline?: RunTimeline;
+  runTimelineReconciler?: RunTimelineReconciler;
+  runStream?: RunStream;
 }
 
 export interface HubRuntime {
@@ -96,6 +102,13 @@ export interface HubRuntime {
   agentValidator: DaemonAgentConfigurationValidator | null;
   resourceCounts(): {
     executionSubscriptions: number;
+    timelineQueueDepth?: number;
+    timelineQueueEntries?: number;
+    timelineAccountingEntries?: number;
+    timelineAccountingGiveUps?: number;
+    timelineAccountingDropsAbandoned?: number;
+    runStreams?: number;
+    streamNotifiers?: number;
   };
   processWorkflowOutbox(): Promise<void>;
   handleUpgrade: ReturnType<typeof createDaemonUpgradeHandler> | null;
@@ -212,6 +225,8 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     canDispatchToDaemon: (daemonId: string) =>
       (options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId)) !== undefined,
     database: options.database,
+    timeline: options.runTimeline,
+    timelineReconciler: options.runTimelineReconciler,
     entitlements: options.entitlements,
     providers,
     ...(options.configurationRevisionId === undefined
@@ -258,9 +273,25 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     daemonModule,
     connectionForDaemon,
     agentValidator,
-    resourceCounts: () => ({
-      executionSubscriptions: daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0,
-    }),
+    resourceCounts: () => {
+      const executionSubscriptions = daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0;
+      if (options.runTimeline === undefined) return { executionSubscriptions };
+      const accounting = options.runTimeline.accountingStats();
+      return {
+        executionSubscriptions,
+        ...(options.runStream === undefined
+          ? {}
+          : {
+              runStreams: options.runStream.activeStreamCount(),
+              streamNotifiers: options.runStream.notifierCount(),
+            }),
+        timelineQueueDepth: options.runTimeline.depth(),
+        timelineQueueEntries: accounting.queueEntries,
+        timelineAccountingEntries: accounting.retainedEntries,
+        timelineAccountingGiveUps: accounting.giveUps,
+        timelineAccountingDropsAbandoned: accounting.abandonedDrops,
+      };
+    },
     processWorkflowOutbox: () => workflowEngine.processAvailable(),
     handleUpgrade:
       options.database === null ? null : createDaemonUpgradeHandler(options.database, daemons!),
@@ -280,6 +311,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       await Promise.all(activeSources.map(async (source) => source.start(workflowDispatcher)));
     },
     async stop() {
+      if (options.runStream !== undefined) await options.runStream.beginShutdown();
       try {
         await Promise.all(
           activeSources.map((source, index) => {
@@ -523,6 +555,7 @@ function createAppDaemonModule(
     database: options.database,
     connectionForDaemon: options.daemonConnectionForId ?? ((id) => daemons?.connection(id)),
     executionCapabilities: outputRegistry,
+    ...(options.runTimeline === undefined ? {} : { timeline: options.runTimeline }),
     ...(options.completionTokenSecret === undefined
       ? {}
       : { completionTokenSecret: options.completionTokenSecret }),

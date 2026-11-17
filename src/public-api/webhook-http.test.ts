@@ -90,6 +90,7 @@ function fixture(
     {
       status: "enabled",
       authenticator: {
+        reauthorize: async () => true,
         authorize: async (request, scope) => {
           authCalls += 1;
           assert.equal(

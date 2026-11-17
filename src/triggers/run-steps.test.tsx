@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, it, vi } from "vitest";
-import type { ActivityRunDetail as RunDetail } from "../projects/dashboard.js";
+import { describe, it } from "vitest";
+import type { ActivityRunDetail as RunDetail } from "../projects/activity-run-view.js";
 import { summarizeTrigger } from "../projects/activity-summary.js";
-import { ActivityRunDetail, pollActiveRun } from "./activity-run-panel.js";
+import { RunDetailView } from "./run-detail.js";
+import { emptyTimeline } from "./test-utils/run-detail.js";
 
 const detail: RunDetail = {
   run: {
@@ -36,7 +36,20 @@ const step: RunDetail["steps"][number] = {
   failureReason: "Build failed",
 };
 
-const render = (value: RunDetail) => renderToStaticMarkup(<ActivityRunDetail detail={value} />);
+function detailWithTimeline(value: RunDetail) {
+  return {
+    ...value,
+    steps: value.steps.map((item) => Object.assign({}, item, { timelineStepId: item.stepId })),
+    timeline: { ...emptyTimeline, status: value.run.status },
+    progress: null,
+    progressMessagesEnabled: false,
+  };
+}
+
+const render = (value: RunDetail) => {
+  const data = detailWithTimeline(value);
+  return renderToStaticMarkup(<RunDetailView detail={data} />);
+};
 
 describe("activity run detail", () => {
   it("shows run status, outcome, timestamps, failure, and empty steps", () => {
@@ -217,44 +230,5 @@ describe("activity run detail", () => {
     assert.match(markup, /script timed out/u);
     assert.match(markup, /No exit code/u);
     assert.match(markup, /partial/u);
-  });
-});
-
-describe("active run polling", () => {
-  it("lets a slow request finish and stops polling after a terminal result", async () => {
-    vi.useFakeTimers();
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    let finish!: (value: RunDetail) => void;
-    const request = new Promise<RunDetail>((resolve) => {
-      finish = resolve;
-    });
-    const queryFn = vi.fn(() => request);
-    const active = { ...detail, run: { ...detail.run, completedAt: null } };
-    const observer = new QueryObserver(client, {
-      queryKey: ["activity-run", "acme", "run-1"],
-      queryFn,
-      initialData: active,
-      staleTime: Infinity,
-    });
-    const stop = pollActiveRun((options) => {
-      void observer.refetch(options);
-    });
-    const unsubscribe = observer.subscribe((result) => {
-      if (result.data !== undefined && result.data.run.completedAt !== null) stop();
-    });
-    try {
-      await vi.advanceTimersByTimeAsync(16_000);
-      assert.equal(queryFn.mock.calls.length, 1);
-      finish(detail);
-      await vi.advanceTimersByTimeAsync(1);
-      assert.equal(observer.getCurrentResult().data?.run.completedAt, detail.run.completedAt);
-      await vi.advanceTimersByTimeAsync(20_000);
-      assert.equal(queryFn.mock.calls.length, 1);
-    } finally {
-      stop();
-      unsubscribe();
-      client.clear();
-      vi.useRealTimers();
-    }
   });
 });

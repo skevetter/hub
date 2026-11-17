@@ -7,6 +7,7 @@ export default defineConfig({
   test: {
     environment: "node",
     testTimeout: 30_000,
+    setupFiles: ["./src/test-utils/real-timers.ts"],
     pool: "forks",
     poolOptions: {
       forks: {

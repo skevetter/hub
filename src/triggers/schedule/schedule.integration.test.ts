@@ -321,6 +321,7 @@ it("validates, installs, exports and edits scheduled YAML through the existing p
     publicApi: {
       status: "enabled",
       authenticator: {
+        reauthorize: async () => false,
         async authorize() {
           return {
             status: "authorized",
@@ -372,6 +373,7 @@ it("runs one trigger from its schedule and from a manual dispatch by the trigger
     publicApi: {
       status: "enabled",
       authenticator: {
+        reauthorize: async () => false,
         async authorize() {
           return {
             status: "authorized",

@@ -34,10 +34,8 @@ import {
   TriggerListSchema,
   ConfigurationResourcesSchema,
   SetupResourcesSchema,
-  ProblemSchema,
   ValidatedConfigurationSchema,
   ValidatedTriggerSchema,
-  type Problem,
 } from "./contracts.js";
 import { publicOpenApiDocument } from "./openapi.js";
 import {
@@ -46,6 +44,7 @@ import {
   type PublicOperationId,
   type PublicOperationDefinition,
 } from "./operation-manifest.js";
+import { problem as problemResponse, requestIdentifier } from "./problem.js";
 
 export type { PublicOperationId } from "./operation-manifest.js";
 
@@ -99,11 +98,6 @@ const responseMetadata = new WeakMap<
   Response,
   { code: string | null; duplicate: boolean | null }
 >();
-
-function requestIdentifier(request: Request): string {
-  const value = request.headers.get("x-request-id");
-  return value !== null && /^[A-Za-z0-9._-]{1,128}$/u.test(value) ? value : randomUUID();
-}
 
 function webhookTrigger(pathname: string): string | undefined {
   const match = /^\/api\/v1\/hooks\/([^/]+)$/u.exec(pathname);
@@ -1064,24 +1058,7 @@ function problem(
   issues?: readonly { path: readonly (string | number)[]; message: string }[],
   headers?: Readonly<Record<string, string>>,
 ): Response {
-  const body: Problem = ProblemSchema.parse({
-    type: `https://paseo.sh/problems/${code.replaceAll("_", "-")}`,
-    title,
-    status,
-    detail,
-    code,
-    requestId,
-    ...(issues === undefined ? {} : { issues }),
-  });
-  const response = Response.json(body, {
-    status,
-    headers: {
-      "content-type": "application/problem+json",
-      "x-request-id": requestId,
-      ...(status === 401 ? { "www-authenticate": "Bearer" } : {}),
-      ...headers,
-    },
-  });
+  const response = problemResponse(requestId, status, code, title, detail, issues, headers);
   responseMetadata.set(response, { code, duplicate: null });
   return response;
 }

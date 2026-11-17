@@ -21,7 +21,13 @@ import { installProcessFailureHandlers } from "./failures/process.js";
 import { createFetchServer } from "./http/node-server.js";
 import { loadBuiltStartServer } from "./server/build.js";
 import { createAuthServer } from "./auth/server.js";
-import { startApplication, stopApplication, type ApplicationRuntime } from "./server/runtime.js";
+import {
+  getApplication,
+  hasApplication,
+  startApplication,
+  stopApplication,
+  type ApplicationRuntime,
+} from "./server/runtime.js";
 import { createApplicationRuntime } from "./application-runtime.js";
 import { readScriptLimits } from "./workflows/script-limits.js";
 import {
@@ -53,6 +59,8 @@ import { createAccountMailer } from "./auth/account-emails.js";
 import { migrateLegacyProjectTriggers } from "./triggers/migration.js";
 import { readGitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
 import { readWebhookOptions } from "./webhook-config.js";
+import { readRunProgressSettings } from "./run-progress/settings.js";
+import { readTimelineScrubValues } from "./run-timeline/secrets.js";
 import {
   createServerShutdown,
   installShutdownSignals,
@@ -65,6 +73,10 @@ export function startProductionRuntime(): Promise<ApplicationRuntime> {
 
 export async function stopProductionRuntime(): Promise<void> {
   await stopApplication();
+}
+
+export async function beginProductionShutdown(): Promise<void> {
+  if (hasApplication()) await (await getApplication()).runStream.beginShutdown();
 }
 
 export async function handleDaemonUpgrade(
@@ -85,6 +97,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
   try {
     const config = loadRuntimeConfig();
     const webhookOptions = readWebhookOptions(process.env);
+    const runProgress = readRunProgressSettings(process.env);
     const { database, runtime, locks } = await createDatabaseHandle();
     resources.own(() => database.close(), "composition.database");
     const migration = await migrateLegacyProjectTriggers(database);
@@ -183,6 +196,8 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       completionTokenSecret: identity.authSecret,
       scriptLimits,
       webhookOptions,
+      runProgress,
+      timelineScrubValues: readTimelineScrubValues(process.env, Object.values(providerEnvironment)),
       ...(githubNotifications === undefined ? {} : { githubNotifications }),
       close: () => resources.close(),
     });
@@ -358,6 +373,7 @@ async function main(): Promise<void> {
 
   const stop = createServerShutdown(server, () => build.stopProductionRuntime(), {
     ...shutdownBudgets,
+    beginShutdown: () => build.beginShutdown(),
     exit: (code) => process.exit(code),
   });
   installShutdownSignals(process, stop, removeProcessFailureHandlers);

@@ -1,4 +1,11 @@
-import { createHubApplication } from "./app.js";
+import { createHubApplication, type HubRuntimeOptions } from "./app.js";
+import { logger } from "./logger.js";
+import { RunTimeline } from "./run-timeline/index.js";
+import { RunTimelineReconciler } from "./run-timeline/reconcile.js";
+import { RunTimelineBus } from "./run-timeline/bus.js";
+import { createTimelineScrubber } from "./run-timeline/scrub.js";
+import { createObservedDatabase } from "./run-timeline/observed-database.js";
+import type { TimelineRunScope } from "./run-timeline/capture-types.js";
 import type { GitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
 import type { AuthServer } from "./auth/server.js";
 import type { BillingRuntime } from "./billing/index.js";
@@ -35,6 +42,10 @@ import type { ScriptLimits } from "./workflows/script-limits.js";
 import { runShutdownStage } from "./shutdown-stage.js";
 import type { TriggerHandler } from "./triggers/index.js";
 import type { WebhookOptions } from "./webhook-config.js";
+import { readRunProgressSettings, type RunProgressSettings } from "./run-progress/settings.js";
+import { TimelineRetention } from "./run-timeline/retention.js";
+import { RunStream } from "./run-stream/index.js";
+import { reportFailure } from "./failures/index.js";
 
 export interface ApplicationCompositionOptions {
   database: Database | null;
@@ -52,6 +63,8 @@ export interface ApplicationCompositionOptions {
   githubNotifications?: GitHubNotificationsOptions;
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
+  runProgress?: RunProgressSettings;
+  timelineScrubValues?: readonly string[];
   close(): Promise<void>;
 }
 
@@ -72,6 +85,12 @@ async function createOwnedApplicationRuntime(
   options: ApplicationCompositionOptions,
   ownership: CompositionResources,
 ): Promise<ApplicationRuntime> {
+  const timelineRuntime = createRunTimelineRuntime(options, ownership);
+  const { runStream, hubOptions: streamOptions } = createRunStreamRuntime(
+    options,
+    timelineRuntime,
+    ownership,
+  );
   const registrations = options.registrations ?? [];
   const connections = new Map(
     registrations.map((registration) => [registration.connection.name, registration.connection]),
@@ -97,7 +116,8 @@ async function createOwnedApplicationRuntime(
   }
 
   const application = createHubApplication({
-    database: options.database,
+    ...timelineRuntime,
+    ...streamOptions,
     entitlements: options.entitlements,
     providerFactories: registrations.flatMap((registration) => registration.triggerProviders),
     ...(executionAuthority === undefined ? {} : { executionAuthority }),
@@ -153,6 +173,7 @@ async function createOwnedApplicationRuntime(
     hub: application.hub,
     operations: application.operations,
     publicApi: application.publicApi,
+    runStream,
     publicBaseUrl: options.publicBaseUrl,
     resources,
     billing: options.billing,
@@ -161,7 +182,11 @@ async function createOwnedApplicationRuntime(
       options.database === null || options.auth === null
         ? null
         : new ProjectDashboard(options.database, options.auth),
-    triggerDashboard: triggerDashboardFor(options, application.hub),
+    triggerDashboard: triggerDashboardFor(
+      options,
+      application.hub,
+      timelineRuntime.runTimelineReconciler,
+    ),
     daemonProviderCatalog: daemonProviderCatalogFor(options, application.hub),
     homeDashboard: homeDashboardFor(options, connections),
     ...entitlementSurfaces(options),
@@ -362,14 +387,137 @@ async function createOwnedApplicationRuntime(
   };
 }
 
+function createRunStreamRuntime(
+  options: ApplicationCompositionOptions,
+  timeline: { timelineBus?: RunTimelineBus; runTimelineReconciler?: RunTimelineReconciler },
+  ownership: CompositionResources,
+) {
+  const settings = options.runProgress ?? readRunProgressSettings({});
+  const scrubValues = [
+    ...(options.timelineScrubValues ?? []),
+    ...(options.completionTokenSecret === undefined ? [] : [options.completionTokenSecret]),
+    ...(settings.githubToken === undefined ? [] : [settings.githubToken]),
+  ];
+  const runStream = new RunStream({
+    database: options.database,
+    auth: options.auth,
+    credentials: options.auth?.publicCredentials,
+    bus: timeline.timelineBus,
+    reconciler: timeline.runTimelineReconciler,
+    settings,
+    reportFailure: (error, requestId) => {
+      reportFailure(
+        error,
+        { operation: "run.stream.handle", component: "run-progress", requestId },
+        { scrubValues },
+      );
+    },
+  });
+  if (settings.runStreamEnabled) {
+    ownership.own(() => runStream.beginShutdown(), "composition.run_stream");
+  }
+  const hubOptions: Pick<HubRuntimeOptions, "runStream"> = settings.runStreamEnabled
+    ? { runStream }
+    : {};
+  return { runStream, hubOptions };
+}
+
+function createRunTimelineRuntime(
+  options: ApplicationCompositionOptions,
+  ownership: CompositionResources,
+): Pick<HubRuntimeOptions, "database" | "runTimeline" | "runTimelineReconciler"> & {
+  timelineBus?: RunTimelineBus;
+} {
+  const settings = options.runProgress ?? readRunProgressSettings({});
+  const database = options.database;
+  if (database === null) return { database };
+  const retention = new TimelineRetention(database, {
+    retentionDays: settings.retentionDays,
+    reportFailure: (error) =>
+      reportFailure(error, {
+        operation: "run.timeline.retention",
+        component: "run-progress",
+      }),
+  });
+  ownership.own(() => retention.stop(), "composition.timeline_retention");
+  retention.start();
+  if (!settings.runTimelineEnabled) return { database };
+  const scrubValues = [
+    ...(options.timelineScrubValues ?? []),
+    ...(options.completionTokenSecret === undefined ? [] : [options.completionTokenSecret]),
+    ...(settings.githubToken === undefined ? [] : [settings.githubToken]),
+  ];
+  const report = (error: unknown, operation: string, scope?: TimelineRunScope) => {
+    reportFailure(
+      error,
+      {
+        operation,
+        component: "run-progress",
+        ...(scope === undefined ? {} : { organizationId: scope.organizationId }),
+      },
+      {
+        scrubValues,
+        ...(scope === undefined ? {} : { diagnostic: { triggerRunId: scope.triggerRunId } }),
+      },
+    );
+  };
+  const bus = new RunTimelineBus({
+    maxSubscriptions: Math.max(1024, settings.streamMaxTotal),
+    reportFailure: (error) => report(error, "run.timeline.notify"),
+  });
+  const scrub = createTimelineScrubber({ scrubValues });
+  const timeline = new RunTimeline(database, {
+    maxEvents: settings.timelineMaxEvents,
+    retentionDays: settings.retentionDays,
+    scrub,
+    bus,
+    reportFailure: report,
+  });
+  const reconciler = new RunTimelineReconciler(database, {
+    queue: timeline,
+    maxEvents: settings.timelineMaxEvents,
+    retentionDays: settings.retentionDays,
+    scrub,
+    bus,
+    reportFailure: report,
+  });
+  ownership.own(async () => {
+    reconciler.stopAdmission();
+    await timeline.stop();
+    await reconciler.stop();
+  }, "composition.timeline_capture");
+  reconciler.start();
+  logger.info(
+    {
+      operation: "run.timeline.start",
+      component: "run-progress",
+      maxEvents: settings.timelineMaxEvents,
+      retentionDays: settings.retentionDays,
+      timelineEnabled: settings.runTimelineEnabled,
+      streamEnabled: settings.runStreamEnabled,
+      progressMessagesEnabled: settings.progressMessagesEnabled,
+    },
+    "run timeline capture enabled",
+  );
+  return {
+    database: createObservedDatabase(database, { timeline, reconciler, reportFailure: report }),
+    runTimeline: timeline,
+    runTimelineReconciler: reconciler,
+    timelineBus: bus,
+  };
+}
+
 function triggerDashboardFor(
   options: ApplicationCompositionOptions,
   hub: import("./app.js").HubRuntime,
+  reconciler: RunTimelineReconciler | undefined,
 ): TriggerDashboard | null {
   return options.database === null || options.auth === null || hub.agentValidator === null
     ? null
     : new TriggerDashboard(options.database, options.auth, hub.agentValidator, {
         githubNotificationsEnabled: options.githubNotifications !== undefined,
+        runProgress: options.runProgress ?? readRunProgressSettings({}),
+        ...(reconciler === undefined ? {} : { reconciler }),
         ...(options.githubNotifications === undefined
           ? {}
           : { githubNotificationsPollSeconds: options.githubNotifications.pollIntervalMs / 1000 }),

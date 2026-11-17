@@ -1,0 +1,117 @@
+export const CAPTURED_TOOL_CALLS = [
+  {
+    provider: "claude",
+    items: [
+      {
+        type: "tool_call",
+        callId: "fixture-claude-1",
+        name: "Read",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "read",
+          filePath: "/fixture/input.txt",
+          content: "fixture contents",
+          offset: 0,
+        },
+      },
+      {
+        type: "tool_call",
+        callId: "fixture-claude-2",
+        name: "Bash",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "shell",
+          command: "fixture command",
+          output: "fixture output",
+        },
+      },
+      {
+        type: "tool_call",
+        callId: "fixture-claude-3",
+        name: "Edit",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "edit",
+          filePath: "/fixture/input.txt",
+          oldString: "fixture before",
+          newString: "fixture after",
+        },
+      },
+      {
+        type: "tool_call",
+        callId: "fixture-claude-4",
+        name: "Read",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "read",
+          filePath: "/fixture/input.txt",
+          content: "fixture contents",
+          offset: 0,
+        },
+      },
+    ],
+  },
+  {
+    provider: "codex",
+    items: [
+      {
+        type: "tool_call",
+        callId: "fixture-codex-1",
+        name: "shell",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "shell",
+          command: "fixture command",
+          cwd: "/fixture",
+          output: "fixture output",
+          exitCode: 0,
+        },
+      },
+      {
+        type: "tool_call",
+        callId: "fixture-codex-2",
+        name: "shell",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "shell",
+          command: "fixture command",
+          cwd: "/fixture",
+          output: "fixture output",
+          exitCode: 0,
+        },
+      },
+      {
+        type: "tool_call",
+        callId: "fixture-codex-3",
+        name: "apply_patch",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "edit",
+          filePath: "/fixture/input.txt",
+          unifiedDiff: "fixture patch",
+        },
+      },
+      {
+        type: "tool_call",
+        callId: "fixture-codex-4",
+        name: "shell",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "shell",
+          command: "fixture command",
+          cwd: "/fixture",
+          output: "fixture output",
+          exitCode: 0,
+        },
+      },
+    ],
+  },
+] as const;

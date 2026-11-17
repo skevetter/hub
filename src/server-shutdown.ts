@@ -33,6 +33,7 @@ export function createServerShutdown(
   stopRuntime: () => Promise<void>,
   options: ShutdownBudgets & {
     logger?: Pick<Logger, "info" | "warn" | "error">;
+    beginShutdown?: () => Promise<void>;
     exit: (code: number) => void;
   },
 ): () => Promise<boolean> {
@@ -86,6 +87,10 @@ export function createServerShutdown(
     }, options.hardExitMs);
     watchdog.unref();
     try {
+      const streamOutcomes =
+        options.beginShutdown === undefined
+          ? []
+          : await Promise.allSettled([stage("streams.close", options.beginShutdown)]);
       const httpClose = stage("http.close", () => {
         const { promise, resolve, reject } = Promise.withResolvers<void>();
         server.close((error) => {
@@ -101,7 +106,7 @@ export function createServerShutdown(
         server.closeIdleConnections();
         await stage("runtime.stop", stopRuntime);
       })();
-      const outcomes = await Promise.allSettled([httpClose, runtimeStop]);
+      const outcomes = [...streamOutcomes, ...(await Promise.allSettled([httpClose, runtimeStop]))];
       const clean = !expired && outcomes.every((outcome) => outcome.status === "fulfilled");
       if (!hardExited) options.exit(clean ? 0 : 1);
       return clean;

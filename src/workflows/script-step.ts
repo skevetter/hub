@@ -1,3 +1,4 @@
+import type { RunTimeline } from "../run-timeline/index.js";
 import type { CompiledScriptStep, JsonValue } from "../config/compiler.js";
 import { retryWithBackoff, type BackoffPolicy, type RetryRuntime } from "../db/retry.js";
 import type {
@@ -55,6 +56,7 @@ export interface ScriptStepRuntimeOptions {
   notifyStarted: (triggerRunId: string) => Promise<void>;
   /** Makes the retries of the watcher's database writes deterministic in tests. */
   retry?: RetryRuntime | undefined;
+  timeline?: RunTimeline;
 }
 
 export interface ScriptStepLaunch {
@@ -150,6 +152,17 @@ export class ScriptStepRuntime {
     if (started?.started !== true) {
       await database.deleteWorkflowWakeup(run.id);
       return undefined;
+    }
+    try {
+      this.options.timeline?.recordStepStart(
+        {
+          organizationId: run.organizationId,
+          triggerRunId: run.id,
+        },
+        started.stepRun.stepId,
+      );
+    } catch (error) {
+      this.options.report(error, "run.timeline.capture", { triggerRunId: run.id });
     }
     if (!launch.runAlreadyStarted) await this.options.notifyStarted(run.id);
     const controller = new AbortController();

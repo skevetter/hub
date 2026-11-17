@@ -49,6 +49,11 @@ export const SCOPE_OPTIONS = [
     description: "Dispatch manual runs for a project.",
   },
   {
+    value: "runs:read",
+    label: "Read run timelines",
+    description: "Read run timelines in the organization when run streaming is enabled.",
+  },
+  {
     value: "events:send",
     label: "Send events",
     description: "Send authenticated events to webhook triggers as this key's actor.",

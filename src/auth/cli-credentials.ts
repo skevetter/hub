@@ -3,7 +3,7 @@ import type { DatabaseRuntime, QueryHandle, QueryRow } from "../db/runtime/index
 import { API_KEY_SCOPES, type ApiKeyScope } from "./api-key-contract.js";
 import { ORGANIZATION_ROLES } from "./organization-contract.js";
 import { capabilitiesFor } from "./organization-policy.js";
-import type { OperationAuthorizationResult } from "./api-keys.js";
+import type { OperationAuthorization, OperationAuthorizationResult } from "./api-keys.js";
 
 export const CLI_CREDENTIAL_PREFIX = "paseo_cli_";
 const CLI_CREDENTIAL_PREFIX_LENGTH = 12;
@@ -19,6 +19,19 @@ interface CliCredentialRow extends QueryRow {
 
 export class OrganizationCliCredentials {
   constructor(private readonly pool: DatabaseRuntime) {}
+
+  async reauthorize(access: OperationAuthorization, requiredScope: ApiKeyScope): Promise<boolean> {
+    if (access.kind !== "cliCredential" || !API_KEY_SCOPES.includes(requiredScope)) return false;
+    const result = await this.pool.query(
+      `select 1 from organization_cli_credentials credential
+       join member on member.organization_id = credential.organization_id
+         and member.user_id = credential.created_by_user_id
+       where credential.id = $1 and credential.organization_id = $2
+         and credential.revoked_at is null and member.role = any($3::text[])`,
+      [access.credentialId, access.organizationId, credentialRoles],
+    );
+    return result.rowCount === 1;
+  }
 
   async authorize(
     request: Request,

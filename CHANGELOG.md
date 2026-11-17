@@ -4,6 +4,9 @@
 
 ### Added
 
+- Optional run timeline capture records redacted lifecycle and tool events, persisted step outcomes, and sealed run summaries. Durable queues, byte budgets, reconciliation and expiry tombstones preserve terminal state. Capture is off by default. Source progress messages are not yet provided. API keys can include the separate `runs:read` scope.
+- Optional run event streams support scoped API keys, CLI credentials and member sessions, cursor replay, live polling recovery, bounded queues, reauthorization and graceful shutdown.
+- Activity links open tenant-scoped run details with live tool timelines, permission waits, script results, polling fallback, and timeline expiry and provenance.
 - Authenticated webhook triggers accept messages and typed input data at `POST /api/v1/hooks/{trigger}` with scoped, actor-bound API keys, optional allowed trigger names, durable idempotency, size and rate limits, and named-audience script support. See [authenticated webhook triggers](docs/webhooks.md) for setup, examples, retention and rollback safety.
 - `run.complete_on_turn_end: true` completes an agent run as succeeded when the agent ends its turn without calling `finish_execution`, instead of failing it at `idle_timeout`. It is off by default. The result records `completion: inferred_from_turn_end` and the agent's closing message. See `docs/unattended-prompts.md`.
 - `github.pull_request_synchronized` triggers a workflow when new commits are pushed to a pull request, with the pushed head SHA in the agent context.
@@ -14,6 +17,40 @@
 
 - Linear connections request assignable and mentionable agent scopes and show consent for each installation. Existing connections require reauthorization. The assigned issue trigger also accepts delegation to the installed app. See [Linear agents](docs/linear-agents.md).
 - Unhandled provider event receipts expire automatically after seven days on every instance. Receipts routed to a trigger or still referenced by a run or attachment remain available.
+
+### Fixed
+
+- Run timelines retain stored history and order configuration evidence by request issuance across delayed reads.
+- Completed capture-off run pages stop event polling after final results load when no timeline remains.
+- Run details refresh completed step results when timeline capture is off.
+- Running durations use human units and update while the tab is visible.
+- Long trigger names remain contained in run detail headers.
+- Unavailable runs retain a tenant-scoped return link to Activity.
+- Stream reauthorization tests wait for pending pooled queries before advancing the clock.
+- Fetch-forbidden HTTP methods return a transport method problem before request construction.
+- Stream storage failure reports retain the request identifier returned in the response.
+- Registered responses returned after client disconnect run abort cleanup once and cancel their bodies.
+- Response lifecycle ownership survives the compiled server boundary, including stalled stream deadlines.
+- Run stream HEAD and unsupported methods reject without opening subscribers or falling through to page rendering.
+- Stream closure logs retain safe authentication kind and subject identifiers without changing credential redaction.
+- Disabled run streaming preserves the existing shutdown admission and resource order.
+- URL userinfo detection covers special-scheme slash and backslash forms before logger rewriting, with differential URL-parser coverage.
+- Armored-block detection avoids quadratic retries within long dash runs at the accepted input limit.
+- Truncation notices wake subscribers after a committed accounting acknowledgement is lost and later recovered.
+- URL userinfo containing whitespace is redacted as a whole field, including non-HTTP schemes and encoded separators.
+- Retained drop-accounting batches use durable identities so lost acknowledgements do not increment their counters twice.
+- Projected free text with credential hints, userinfo, armored blocks or unresolved encodings is replaced as a whole field.
+- Failed accounting recovers after sealing without run activity, reclaims idle queues and exposes bounded-retry abandonment counters.
+- Stored timeline redaction handles escaped quoted credentials and quoted Authorization values.
+- Startup credential protection includes raw and effective Resend API keys and bootstrap owner passwords with reader coverage checks.
+- Timeline drain and terminal reconciliation waits are bounded during shutdown.
+- Terminal reconciliation errors use startup credential protection when reporting failures.
+- Excess terminal steps refresh live omission counts and create one truncation notice.
+- Failed drop-accounting batches retry on later queue wakes without blocking completion.
+- Status-writer coverage checks both PostgreSQL and memory persistence.
+- Background sweep tests restore real worker timers and fail fast if a fake timer leaks into another file.
+- Progress message admission waits for concurrent retention before checking timeline expiry, so a tombstoned run cannot regain a progress row.
+- Timeline notifications coalesce stalled asynchronous subscribers into one pending wake and discard it on unsubscribe.
 
 ## 0.11.0 - 2026-10-25
 

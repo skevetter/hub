@@ -187,6 +187,8 @@ The run detail shows the step's exit code and a collapsible **Output**. The step
 Hub removes terminal escape codes and every control character except tab and newline from the
 output before storing it, so a script that prints NUL bytes is still recorded with its exit code.
 
+With `PASEO_HUB_RUN_TIMELINE=true`, the stored run timeline also records script start, duration and exit code. It does not copy script output. See [run timeline capture](public-api.md#run-timeline-capture).
+
 **The output is stored and shown.** Hub keeps the output tail in its database and shows it in the
 run history to everyone who can read the project's runs. That includes anything the script prints:
 secrets from the daemon's environment, `set -x` traces, tokens in error messages. Do not print

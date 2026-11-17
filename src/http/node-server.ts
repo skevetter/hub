@@ -15,8 +15,14 @@ import { INTERNAL_CLIENT_ADDRESS_HEADER } from "./client-address.js";
 import { takeResponseLifecycle } from "./response-lifecycle.js";
 import { TRUSTED_REQUEST_ORIGIN_HEADER } from "./request-origin.js";
 import { HttpRequestDrain } from "./request-drain.js";
+import { problem, requestIdentifier } from "../public-api/problem.js";
 
 const requestDrains = new WeakMap<Server, HttpRequestDrain>();
+const FETCH_FORBIDDEN_METHODS: Readonly<Record<string, true>> = {
+  CONNECT: true,
+  TRACE: true,
+  TRACK: true,
+};
 
 export type FetchHandler = (request: Request) => Response | Promise<Response>;
 
@@ -47,7 +53,10 @@ export function createFetchServer(
   const drain = new HttpRequestDrain();
   const handler = (request: IncomingMessage, response: ServerResponse) => {
     if (!drain.admit(response)) return;
-    void forwardRequest(fetchHandler, request, response, resolvedOptions).finally(() => {
+    const forwarding = Object.hasOwn(FETCH_FORBIDDEN_METHODS, request.method ?? "")
+      ? rejectTransportMethod(request, response, options.logger ?? defaultLogger)
+      : forwardRequest(fetchHandler, request, response, resolvedOptions);
+    void forwarding.finally(() => {
       drain.complete(response);
     });
   };
@@ -86,6 +95,29 @@ export function beginHttpShutdown(server: Server): {
   };
 }
 
+async function rejectTransportMethod(
+  incoming: IncomingMessage,
+  outgoing: ServerResponse,
+  logger: Pick<Logger, "warn" | "error">,
+): Promise<void> {
+  try {
+    const response = problem(
+      requestIdentifier({ headers: requestHeaders(incoming) }),
+      405,
+      "method_not_allowed",
+      "Method not allowed",
+      "This transport does not support the requested method.",
+      undefined,
+      { allow: "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS" },
+    );
+    outgoing.statusCode = response.status;
+    for (const [name, value] of response.headers) outgoing.setHeader(name, value);
+    outgoing.end(await response.text());
+  } catch (error) {
+    respondToRequestFailure(error, incoming, outgoing, logger);
+  }
+}
+
 async function forwardRequest(
   fetchHandler: FetchHandler,
   incoming: IncomingMessage,
@@ -100,7 +132,31 @@ async function forwardRequest(
       return { response, failureReported: failureWasReported() };
     }, options.logger);
     const { response } = tracked;
+    const lifecycle = takeResponseLifecycle(response);
+    let responseForwarded = false;
+    let lifecycleSettled = false;
+    const reportLifecycleFailure = (error: unknown): void => {
+      reportFailure(
+        error,
+        { operation: "http.response.lifecycle", component: "http", method: request.method },
+        options.logger === undefined ? {} : { logger: options.logger },
+      );
+    };
+    const runLifecycle = (callback: (() => void | Promise<void>) | undefined): void => {
+      if (callback === undefined || lifecycleSettled) return;
+      lifecycleSettled = true;
+      try {
+        void Promise.resolve(callback()).catch(reportLifecycleFailure);
+      } catch (error) {
+        reportLifecycleFailure(error);
+      }
+    };
+    const abortLifecycle = (): void => {
+      if (lifecycle === undefined) return;
+      runLifecycle(lifecycle.onAbort);
+    };
     if (outgoing.writableEnded || outgoing.destroyed) {
+      abortLifecycle();
       void response.body?.cancel().catch((error: unknown) => {
         reportFailure(
           error,
@@ -112,6 +168,7 @@ async function forwardRequest(
     }
     let responseRequestId: string | undefined;
     if (response.status >= 400 && !tracked.failureReported) {
+      const requestId = response.headers.get("x-request-id");
       responseRequestId = reportFailure(
         new Error(`HTTP response completed with status ${response.status}`),
         {
@@ -120,6 +177,7 @@ async function forwardRequest(
           method: request.method,
           path: new URL(request.url).pathname,
           status: response.status,
+          ...(requestId === null ? {} : { requestId }),
         },
         {
           status: response.status,
@@ -127,37 +185,24 @@ async function forwardRequest(
         },
       ).requestId;
     }
-    const lifecycle = takeResponseLifecycle(response);
-    let responseForwarded = false;
-    let lifecycleSettled = false;
-    const runLifecycle = (callback: (() => void | Promise<void>) | undefined): void => {
-      if (callback === undefined || lifecycleSettled) return;
-      lifecycleSettled = true;
-      void Promise.resolve(callback()).catch((error: unknown) => {
-        reportFailure(
-          error,
-          { operation: "http.response.lifecycle", component: "http", method: request.method },
-          options.logger === undefined ? {} : { logger: options.logger },
-        );
-      });
-    };
-    const abortLifecycle = (): void => {
-      if (lifecycle === undefined) return;
-      runLifecycle(lifecycle.onAbort);
-    };
     if (lifecycle !== undefined) {
-      outgoing.once("finish", () => {
-        if (!responseForwarded) {
-          abortLifecycle();
-          return;
-        }
-        runLifecycle(lifecycle.onFinish);
-      });
+      const removeLifecycleListeners = () => {
+        outgoing.off("finish", finishLifecycle);
+        outgoing.off("close", markResponseAborted);
+        outgoing.off("error", markResponseAborted);
+      };
+      const finishLifecycle = () => {
+        removeLifecycleListeners();
+        if (!responseForwarded) abortLifecycle();
+        else runLifecycle(lifecycle.onFinish);
+      };
       const markResponseAborted = () => {
+        removeLifecycleListeners();
         if (outgoing.writableFinished) return;
         responseForwarded = false;
         abortLifecycle();
       };
+      outgoing.once("finish", finishLifecycle);
       outgoing.once("close", markResponseAborted);
       outgoing.once("error", markResponseAborted);
     }
@@ -167,7 +212,9 @@ async function forwardRequest(
     if (responseRequestId !== undefined) outgoing.setHeader("x-request-id", responseRequestId);
     const cookies = response.headers.getSetCookie();
     if (cookies.length > 0) outgoing.setHeader("set-cookie", cookies);
-    if (!outgoing.shouldKeepAlive) outgoing.setHeader("connection", "close");
+    if (response.headers.get("content-type")?.startsWith("text/event-stream"))
+      outgoing.removeHeader("connection");
+    else if (!outgoing.shouldKeepAlive) outgoing.setHeader("connection", "close");
     if (response.body === null) {
       responseForwarded = true;
       outgoing.end();
@@ -178,6 +225,7 @@ async function forwardRequest(
       outgoing,
       request.method,
       options.logger ?? defaultLogger,
+      lifecycle !== undefined,
     );
     if (responseForwarded) outgoing.end();
   } catch (error) {
@@ -190,6 +238,7 @@ async function forwardResponseBody(
   outgoing: ServerResponse,
   method: string,
   logger: Pick<Logger, "warn" | "error">,
+  boundedStall: boolean,
 ): Promise<boolean> {
   const reader = body.getReader();
   let canceled = false;
@@ -224,7 +273,7 @@ async function forwardResponseBody(
       const chunk = await reader.read();
       if (chunk.done || canceled || outgoing.destroyed) break;
       if (!outgoing.write(chunk.value) && !canceled) {
-        if (!(await waitForResponseDrain(outgoing))) {
+        if (!(await waitForResponseDrain(outgoing, boundedStall))) {
           cancelReader();
           break;
         }
@@ -242,9 +291,16 @@ async function forwardResponseBody(
   }
 }
 
-function waitForResponseDrain(outgoing: ServerResponse): Promise<boolean> {
+function waitForResponseDrain(outgoing: ServerResponse, boundedStall: boolean): Promise<boolean> {
   const { promise, resolve } = Promise.withResolvers<boolean>();
+  const timer = boundedStall
+    ? setTimeout(() => {
+        outgoing.destroy();
+        finish(false);
+      }, 30_000).unref()
+    : undefined;
   const finish = (drained: boolean) => {
+    clearTimeout(timer);
     outgoing.off("drain", onDrain);
     outgoing.off("close", onClose);
     outgoing.off("error", onClose);

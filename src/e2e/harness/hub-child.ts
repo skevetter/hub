@@ -21,6 +21,8 @@ import { OrganizationResources } from "../../organizations/resources.js";
 import { parseProjectConfiguration, ProjectConfigurationStore } from "../../configuration/store.js";
 import { hashTemplate, UNLIMITED_TEMPLATE } from "../../entitlements/catalog.js";
 import { configurationBundleFixture } from "../../test-utils/configuration-bundle.js";
+import { RunStream } from "../../run-stream/index.js";
+import { readRunProgressSettings } from "../../run-progress/settings.js";
 
 const E2E_PROJECT_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -241,6 +243,14 @@ async function main(): Promise<void> {
     hub,
     operations: application.operations,
     publicApi: application.publicApi,
+    runStream: new RunStream({
+      database: null,
+      auth: null,
+      credentials: undefined,
+      bus: undefined,
+      reconciler: undefined,
+      settings: readRunProgressSettings({}),
+    }),
     resources,
     billing: null,
     projectDashboard: null,

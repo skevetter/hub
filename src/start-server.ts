@@ -8,6 +8,7 @@ import {
 } from "./index.js";
 import { hasApplication, startApplication } from "./server/runtime.js";
 export { startApplication } from "./server/runtime.js";
+export { beginProductionShutdown as beginShutdown } from "./index.js";
 
 const startFetch = createStartHandler(defaultStreamHandler);
 

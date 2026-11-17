@@ -17,7 +17,7 @@ import { configurationBundleFixture } from "../test-utils/configuration-bundle.j
 import { InstanceSetup } from "../instance-setup/index.js";
 import { UNLIMITED_PROVISIONING } from "../organizations/provisioning.js";
 import type { InstanceAuthPolicy } from "../auth/instance-policy.js";
-import type { ApiKeyScope } from "../auth/api-key-contract.js";
+import { API_KEY_SCOPES, type ApiKeyScope } from "../auth/api-key-contract.js";
 import type { OperationAuthenticator } from "../auth/operation-auth.js";
 import { EntitlementsService } from "../entitlements/service.js";
 import { migrateLegacyProjectTriggers } from "../triggers/migration.js";
@@ -47,6 +47,63 @@ describe("database migration application", () => {
     await postgres.stop();
   }, 120_000);
 
+  it("upgrades populated run and key tables before adding timeline foreign keys", async () => {
+    const url = await createHistoricalBaseline({
+      postgres,
+      prefix: "run_progress_upgrade",
+      through: "0052_webhook_keys",
+    });
+    await poolQuery(
+      url,
+      `
+      insert into organization (id, name, slug) values ('timeline-organization', 'Timeline', 'timeline');
+      insert into projects (id, organization_id, name, slug)
+        values ('10000000-0000-4000-8000-000000000001', 'timeline-organization', 'Timeline', 'timeline');
+      insert into project_configuration_revisions
+        (id, project_id, organization_id, version, source_kind, source_evidence, normalized_configuration, content_hash)
+        values ('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000001',
+          'timeline-organization', 1, 'manual', '{}', '{}', 'timeline');
+      insert into provider_event_receipts (id, organization_id, provider, delivery_id, source, payload)
+        values ('30000000-0000-4000-8000-000000000001', 'timeline-organization', 'manual', 'timeline', 'manual.run', '{}');
+      insert into trigger_runs
+        (id, organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
+         configured_trigger_name, status, prompt, deadline_at, completed_at)
+        values ('40000000-0000-4000-8000-000000000001', 'timeline-organization',
+          '10000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000001',
+          '30000000-0000-4000-8000-000000000001', 'timeline', 'succeeded', '', now(), now());
+      insert into organization_api_keys (organization_id, name, prefix, verifier, scopes, actor)
+        values ('timeline-organization', 'Existing', 'timeline', 'verifier', ARRAY['events:send'], 'sender');
+    `,
+    );
+    const upgraded = await createDatabase(url);
+    try {
+      assert.deepEqual(
+        await upgraded.appendRunTimelineEvent({
+          organizationId: "timeline-organization",
+          triggerRunId: "40000000-0000-4000-8000-000000000001",
+          kind: "run_started",
+          at: new Date(),
+          origin: "derived",
+          data: { trigger: "timeline", steps: 0 },
+        }),
+        { seq: 1, inserted: true },
+      );
+      for (const scope of API_KEY_SCOPES) {
+        await poolQuery(url, `update organization_api_keys set scopes = $1`, [[scope]]);
+      }
+      await poolQuery(url, `update organization_api_keys set scopes = $1`, [[...API_KEY_SCOPES]]);
+      for (const scopes of [[], ["unknown:scope"], ["runs:read", "unknown:scope"]]) {
+        await assert.rejects(
+          poolQuery(url, `update organization_api_keys set scopes = $1`, [scopes]),
+          /organization_api_keys_scopes_check/,
+        );
+      }
+      assert.equal((await poolQuery(url, `select id from trigger_runs`)).rowCount, 1);
+      assert.equal((await poolQuery(url, `select id from organization_api_keys`)).rowCount, 1);
+    } finally {
+      await upgraded.close();
+    }
+  }, 120_000);
   it("adds nullable API key identity while enforcing actor and scope constraints", async () => {
     const url = await createHistoricalBaseline({
       postgres,
@@ -377,9 +434,12 @@ describe("database migration application", () => {
     const after = await durableSnapshot(fixture.url);
 
     assert.deepEqual(after, before);
+    const journal = migrationJournalSchema.parse(
+      JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/_journal.json"), "utf8")),
+    );
     assert.deepEqual(await historicalShape(fixture.url), {
       authTables: 7,
-      drizzleMigrations: 53,
+      drizzleMigrations: journal.entries.length,
       legacyArtifacts: null,
       legacyOperatorPrincipals: null,
       bootstrapOrganizationId: fixture.organizationId,
@@ -2012,6 +2072,7 @@ class LegacyUpgrade {
       await client.close();
     }
     const operationAuth: OperationAuthenticator = {
+      reauthorize: async () => false,
       async authorize(request: Request, _scope: ApiKeyScope) {
         return request.headers.get("authorization") === `Bearer ${apiKey}`
           ? {

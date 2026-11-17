@@ -69,6 +69,17 @@ export class OrganizationApiKeys {
     private readonly locks: Locks,
   ) {}
 
+  async reauthorize(access: OperationAuthorization, requiredScope: ApiKeyScope): Promise<boolean> {
+    if (access.kind !== "apiKey") return false;
+    const result = await this.pool.query(
+      `select 1 from organization_api_keys
+       where id = $1 and organization_id = $2 and revoked_at is null
+         and $3 = any(scopes)`,
+      [access.credentialId, access.organizationId, requiredScope],
+    );
+    return result.rowCount === 1;
+  }
+
   async create(
     organizationId: string,
     createdByUserId: string,

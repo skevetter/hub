@@ -14,4 +14,10 @@ export class PublicCredentialAuthenticator implements OperationAuthenticator {
       ? this.cliCredentials.authorize(request, requiredScope)
       : this.apiKeys.authorize(request, requiredScope);
   }
+
+  reauthorize(...args: Parameters<OperationAuthenticator["reauthorize"]>) {
+    return args[0].kind === "cliCredential"
+      ? this.cliCredentials.reauthorize(...args)
+      : this.apiKeys.reauthorize(...args);
+  }
 }

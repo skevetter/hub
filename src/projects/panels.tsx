@@ -1,5 +1,4 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-array-as-prop, eslint-plugin-react-perf/jsx-no-new-function-as-prop, eslint-plugin-react-perf/jsx-no-new-object-as-prop, eslint-plugin-react-perf/jsx-no-jsx-as-prop, typescript-eslint/no-unsafe-type-assertion -- route links and mutation controls are intentionally scoped to each rendered tenant snapshot */
-import { isScriptStepOutput, ScriptStepOutput } from "./script-step-output.js";
 import { useSnapshotQuery } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
@@ -9,19 +8,17 @@ import { CONNECTION_MUTATION_KEY } from "../auth/tenant-mutation.js";
 import { useActiveAccount } from "../auth/active-account.js";
 import { Card, CardSkeleton } from "../components/app/card.js";
 import { ConfirmAction, ConfirmMenuItem } from "../components/app/confirm-action.js";
-import { CodeBlock } from "../components/app/copy-field.js";
 import { DataCell, DataRow, DataTable } from "../components/app/data-table.js";
 import { FormActions } from "../components/app/form-actions.js";
 import { FormField } from "../components/app/form-field.js";
 import { FailureAlert, NoticeAlert } from "../components/app/failure-alert.js";
 import { EmptyState } from "../components/app/empty-state.js";
 import { PageHeader } from "../components/app/page.js";
-import { RelativeTime, formatAbsolute } from "../components/app/relative-time.js";
+import { RelativeTime } from "../components/app/relative-time.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RowActions } from "../components/app/row-actions.js";
 import { Section } from "../components/app/section.js";
 import { StatusPill, statusLabel } from "../components/app/status-pill.js";
-import { SummaryPanel, type SummaryRow } from "../components/app/summary-panel.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { useConnectionReturn } from "../connections/result.js";
@@ -50,7 +47,7 @@ import {
   type OrganizationSnapshot,
   type ProjectSnapshot,
 } from "./panel-state.js";
-import { archiveProject, activityRunSnapshot, updateProjectSlug } from "./functions.js";
+import { archiveProject, updateProjectSlug } from "./functions.js";
 const CONNECTIONS_DESCRIPTION = "Organization provider connections.";
 const CONNECTION_PROVIDERS = ["github", "discord", "slack", "linear"] as const;
 type ConnectionProviderName = (typeof CONNECTION_PROVIDERS)[number];
@@ -357,98 +354,6 @@ export function ProjectActivityPanel() {
   );
 }
 
-type RunActivity = Awaited<ReturnType<ProjectDashboard["activityRunSnapshot"]>>["activity"];
-
-export function ProjectActivityRunPanel({ runId }: { runId: string }) {
-  const tenant = useRouteTenant();
-  const load = useServerFn(activityRunSnapshot);
-  const scope = {
-    organizationSlug: tenant.organization.slug,
-    projectSlug: tenant.project?.slug ?? "",
-    runId,
-  };
-  const query = useSnapshotQuery({
-    queryKey: ["project-activity-run", tenant.account.id, tenant.organization.id, runId],
-    queryFn: () => load({ data: scope }),
-  });
-  const snapshot = queryState<Awaited<ReturnType<ProjectDashboard["activityRunSnapshot"]>>>(
-    query,
-    "Run unavailable",
-  );
-  if (!snapshot.ok) return snapshot.element;
-  const activity = snapshot.data.activity;
-  return (
-    <>
-      <PageHeader
-        title="Run detail"
-        description={`${activity.webhookSummary === undefined ? activity.provider : "Webhook"} \u00b7 ${activity.configuredTriggerName}`}
-      />
-      <Section title="Invocation">
-        <SummaryPanel label="Invocation" rows={invocationRows(activity)} />
-      </Section>
-      <Section title="Steps" description="Ordered durable step state and structured outputs.">
-        <DataTable
-          label="Run steps"
-          columns={[
-            { header: "Step", fill: true },
-            { header: "Status" },
-            { header: "Deadline" },
-            { header: "Agent" },
-            { header: "Output" },
-            { header: "Failure reason", fill: true },
-          ]}
-          isEmpty={activity.steps.length === 0}
-          empty={{ title: "No steps" }}
-        >
-          {activity.steps.map((step) => (
-            <DataRow key={step.id}>
-              <DataCell>
-                <span>
-                  {step.ordinal + 1}. {step.stepId}
-                </span>
-              </DataCell>
-              <DataCell>
-                <StatusPill tone={executionTone(step.status)}>
-                  {statusLabel(step.status)}
-                </StatusPill>
-              </DataCell>
-              <DataCell muted>
-                <span className="font-mono text-xs">
-                  {step.deadlineAt === null ? "—" : formatAbsolute(step.deadlineAt)}
-                  {step.deadlineKind === null ? "" : ` · ${step.deadlineKind}`}
-                  {step.idleDeadlineAt === null
-                    ? ""
-                    : ` · idle ${formatAbsolute(step.idleDeadlineAt)}`}
-                </span>
-              </DataCell>
-              <DataCell>
-                {step.agentId === null ? (
-                  "—"
-                ) : (
-                  <span title={step.agentId}>
-                    {step.agentSessionAction === null
-                      ? "Created"
-                      : statusLabel(step.agentSessionAction)}{" "}
-                    · <span className="font-mono text-xs">{step.agentId.slice(0, 8)}</span>
-                  </span>
-                )}
-              </DataCell>
-              <DataCell>
-                {isScriptStepOutput(step.output) ? (
-                  <ScriptStepOutput stepId={step.id} status={step.status} output={step.output} />
-                ) : (
-                  <JsonValue value={step.output} />
-                )}
-              </DataCell>
-              <DataCell muted>{step.failureReason ?? "—"}</DataCell>
-            </DataRow>
-          ))}
-        </DataTable>
-      </Section>
-    </>
-  );
-}
-
 export function ProjectGeneralSettingsPanel() {
   const tenant = useRouteTenant();
   const queryClient = useQueryClient();
@@ -554,51 +459,6 @@ function SetupCard({ label, ready, detail }: { label: string; ready: boolean; de
       <p className="text-sm text-muted-foreground">{detail}</p>
     </Card>
   );
-}
-
-/** What one run amounts to, in the order an operator reads it: what was asked, then what happened. */
-function invocationRows(activity: RunActivity): readonly SummaryRow[] {
-  return [
-    ...(activity.webhookSummary === undefined
-      ? []
-      : [
-          {
-            label: "Source",
-            value: (
-              <span className="flex items-center gap-2">
-                <ProviderGlyph provider={activity.provider} source={activity.source} />
-                {activity.webhookSummary.headline}
-              </span>
-            ),
-          },
-        ]),
-    { label: "Prompt", value: <CodeBlock label="Prompt">{activity.prompt}</CodeBlock> },
-    { label: "Typed inputs", value: <JsonValue value={activity.inputs} /> },
-    { label: "Composed routing values", value: <JsonValue value={activity.values} /> },
-    {
-      label: "Run status",
-      value: (
-        <StatusPill tone={executionTone(activity.status)}>
-          {statusLabel(activity.status)}
-        </StatusPill>
-      ),
-    },
-    {
-      label: "Run deadline",
-      value: (
-        <span className="font-mono text-xs">
-          {activity.deadlineAt === null ? "—" : formatAbsolute(activity.deadlineAt)}
-          {activity.deadlineKind === null ? "" : ` · ${activity.deadlineKind}`}
-        </span>
-      ),
-    },
-    { label: "Failure reason", value: activity.failureReason ?? "—" },
-    { label: "Delivery", value: <span className="font-mono text-xs">{activity.deliveryId}</span> },
-  ];
-}
-
-function JsonValue({ value }: { value: unknown }) {
-  return <CodeBlock>{JSON.stringify(value, null, 2) ?? "—"}</CodeBlock>;
 }
 
 function executionTone(status: string): "success" | "warning" | "danger" | "neutral" {
