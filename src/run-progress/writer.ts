@@ -138,7 +138,7 @@ export function regularEditAt(
   const interval = now - ageFrom > 900_000 ? 60_000 : seconds * 1000;
   return Math.max(
     row.retryAt?.getTime() ?? 0,
-    (row.lastEditAt?.getTime() ?? now - interval) + interval,
+    ((row.lastRegularAttemptAt ?? row.lastEditAt)?.getTime() ?? now - interval) + interval,
   );
 }
 
@@ -411,9 +411,10 @@ export class MessageWriter {
     const { lease, ref, body, kind, budget } = operation;
     const { clock, database, backoff } = this.options;
     const expected = kind === "create" ? "creating" : lease.state;
-    if (kind === "create") {
-      const creating = await budget.run(() => this.update(lease, { state: "creating" }, false));
-      if (creating === undefined) return {};
+    const reservation = this.writeReservation(operation);
+    if (reservation !== undefined) {
+      const reserved = await budget.run(() => this.update(lease, reservation, false));
+      if (reserved === undefined) return {};
     }
     const current = await budget.run(() =>
       database.findRunProgressMessage(lease.organizationId, lease.triggerRunId),
@@ -448,6 +449,17 @@ export class MessageWriter {
       this.options.report("outcome_record_failed", lease);
       return { row: lease, wakeAt: clock.now() + LEASE_RETRY_MS };
     }
+  }
+
+  private writeReservation({ kind, lease }: Operation): Patch | undefined {
+    if (kind === "create") return { state: "creating" };
+    if (kind === "regular") {
+      return {
+        lastRegularAttemptAt: new Date(this.options.clock.now()),
+        editCount: lease.editCount + 1,
+      };
+    }
+    return undefined;
   }
 
   private async record(
@@ -557,7 +569,6 @@ export class MessageWriter {
     return {
       lastRenderedHash: hash,
       lastEditAt: new Date(now),
-      editCount: lease.editCount + Number(kind === "regular"),
       failedEdits: kind === "repair" ? lease.failedEdits : 0,
       retryAt: null,
       failure: null,

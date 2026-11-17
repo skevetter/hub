@@ -176,6 +176,11 @@ class PgDatabase implements Database {
     this.timeline.acquireRunProgressLease(input);
   updateRunProgressMessage: RunTimelineStore["updateRunProgressMessage"] = (input) =>
     this.timeline.updateRunProgressMessage(input);
+  readProgressCredentialCooldown: RunTimelineStore["readProgressCredentialCooldown"] = (key) =>
+    this.timeline.readProgressCredentialCooldown(key);
+  recordProgressCredentialCooldown: RunTimelineStore["recordProgressCredentialCooldown"] = (
+    input,
+  ) => this.timeline.recordProgressCredentialCooldown(input);
   listRunProgressMessagesToFinish: RunTimelineStore["listRunProgressMessagesToFinish"] = (
     now,
     limit,

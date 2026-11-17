@@ -13,6 +13,8 @@ import type {
   AppendRunTimelineEventInput,
   AppendRunTimelineEventResult,
   InsertRunProgressMessageInput,
+  ProgressCredentialCooldown,
+  RecordProgressCredentialCooldownInput,
   RunProgressLeaseInput,
   RunProgressMessage,
   RunTimelineEvent,
@@ -29,8 +31,9 @@ const EVENT = `trigger_run_id as "triggerRunId", organization_id as "organizatio
  step_id as "stepId", data`;
 const MESSAGE = `trigger_run_id as "triggerRunId", organization_id as "organizationId", provider, state,
  external_ref as "externalRef", version, lease_owner as "leaseOwner", lease_expires_at as "leaseExpiresAt",
- last_rendered_hash as "lastRenderedHash", last_edit_at as "lastEditAt", edit_count as "editCount",
+ last_rendered_hash as "lastRenderedHash", last_edit_at as "lastEditAt", last_regular_attempt_at as "lastRegularAttemptAt", edit_count as "editCount",
  failed_edits as "failedEdits", final_failures as "finalFailures", retry_at as "retryAt",
+ credential_key as "credentialKey", credential_retry_at as "credentialRetryAt", credential_rejected_until as "credentialRejectedUntil",
  settle_at as "settleAt", repeat_final as "repeatFinal", visibility, visibility_checked_at as "visibilityCheckedAt", failure,
  compensation_requested_gen as "compensationRequestedGen", compensation_done_gen as "compensationDoneGen",
  compensation_not_before as "compensationNotBefore", created_at as "createdAt", updated_at as "updatedAt"`;
@@ -370,6 +373,7 @@ export class RunTimelineRepository {
       externalRef,
       lastRenderedHash,
       lastEditAt,
+      lastRegularAttemptAt,
       editCount,
       failedEdits,
       finalFailures,
@@ -388,6 +392,7 @@ export class RunTimelineRepository {
         externalRef,
         lastRenderedHash,
         lastEditAt,
+        lastRegularAttemptAt,
         editCount,
         failedEdits,
         finalFailures,
@@ -411,6 +416,28 @@ export class RunTimelineRepository {
       )
       .returning();
     return result[0];
+  }
+
+  async readProgressCredentialCooldown(key: string): Promise<ProgressCredentialCooldown> {
+    const result = await this.runtime.query<Row<ProgressCredentialCooldown>>(
+      `select max(credential_retry_at) as "retryAt", max(credential_rejected_until) as "rejectedUntil"
+       from run_progress_messages where credential_key = $1`,
+      [key],
+    );
+    return result.rows[0]!;
+  }
+
+  async recordProgressCredentialCooldown(
+    input: RecordProgressCredentialCooldownInput,
+  ): Promise<void> {
+    await this.runtime.query(
+      `update run_progress_messages set credential_retry_at = greatest(
+         case when credential_key = $3 then credential_retry_at end, $4::timestamptz),
+       credential_rejected_until = greatest(
+         case when credential_key = $3 then credential_rejected_until end, $5::timestamptz),
+       credential_key = $3 where organization_id = $1 and trigger_run_id = $2`,
+      [input.organizationId, input.triggerRunId, input.key, input.retryAt, input.rejectedUntil],
+    );
   }
 
   async listOpenRunProgressMessages(

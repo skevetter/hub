@@ -608,10 +608,14 @@ export const runProgressMessages = pgTable(
     leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
     lastRenderedHash: text("last_rendered_hash"),
     lastEditAt: timestamp("last_edit_at", { withTimezone: true }),
+    lastRegularAttemptAt: timestamp("last_regular_attempt_at", { withTimezone: true }),
     editCount: integer("edit_count").notNull().default(0),
     failedEdits: integer("failed_edits").notNull().default(0),
     finalFailures: integer("final_failures").notNull().default(0),
     retryAt: timestamp("retry_at", { withTimezone: true }),
+    credentialKey: text("credential_key"),
+    credentialRetryAt: timestamp("credential_retry_at", { withTimezone: true }),
+    credentialRejectedUntil: timestamp("credential_rejected_until", { withTimezone: true }),
     settleAt: timestamp("settle_at", { withTimezone: true }),
     repeatFinal: boolean("repeat_final").notNull().default(false),
     visibility: text().$type<"public" | "private" | "unknown">(),
@@ -648,6 +652,9 @@ export const runProgressMessages = pgTable(
     index("run_progress_messages_settle_idx")
       .on(table.settleAt)
       .where(sql`${table.settleAt} is not null`),
+    index("run_progress_messages_credential_idx")
+      .on(table.credentialKey)
+      .where(sql`${table.credentialKey} is not null`),
     index("run_progress_messages_sweep_idx").on(table.state, table.leaseExpiresAt),
   ],
 );

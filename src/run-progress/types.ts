@@ -62,6 +62,8 @@ export type ProgressStore = Pick<
   | "findRunProgressMessage"
   | "acquireRunProgressLease"
   | "updateRunProgressMessage"
+  | "readProgressCredentialCooldown"
+  | "recordProgressCredentialCooldown"
   | "listRunProgressMessagesToFinish"
   | "listOpenRunProgressMessages"
   | "requestCompensation"

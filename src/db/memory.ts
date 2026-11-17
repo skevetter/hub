@@ -128,6 +128,8 @@ import type {
   AppendRunTimelineEventInput,
   AppendRunTimelineEventResult,
   InsertRunProgressMessageInput,
+  ProgressCredentialCooldown,
+  RecordProgressCredentialCooldownInput,
   RunProgressLeaseInput,
   RunProgressMessage,
   RunTimelineEvent,
@@ -175,6 +177,11 @@ function transitionWithTerminalRun(
   return !transition.transitioned || run === undefined || run.status === "running"
     ? transition
     : { ...transition, terminalRun: run };
+}
+
+function laterCooldown(previous: Date | null, next: Date | null): Date | null {
+  if (next === null || (previous !== null && previous >= next)) return previous;
+  return new Date(next);
 }
 
 export function createMemoryDatabase(options: MemoryDatabaseOptions = {}): Database {
@@ -638,10 +645,14 @@ class MemoryDatabase implements Database {
       leaseExpiresAt: null,
       lastRenderedHash: null,
       lastEditAt: null,
+      lastRegularAttemptAt: null,
       editCount: 0,
       failedEdits: 0,
       finalFailures: 0,
       retryAt: null,
+      credentialKey: null,
+      credentialRetryAt: null,
+      credentialRejectedUntil: null,
       settleAt: null,
       repeatFinal: false,
       visibility: null,
@@ -706,6 +717,7 @@ class MemoryDatabase implements Database {
       "externalRef",
       "lastRenderedHash",
       "lastEditAt",
+      "lastRegularAttemptAt",
       "editCount",
       "failedEdits",
       "finalFailures",
@@ -727,6 +739,34 @@ class MemoryDatabase implements Database {
     }
     message.updatedAt = new Date(input.now);
     return structuredClone(message);
+  }
+
+  async readProgressCredentialCooldown(key: string): Promise<ProgressCredentialCooldown> {
+    let retryAt: Date | null = null;
+    let rejectedUntil: Date | null = null;
+    for (const row of this.runProgressMessages.values()) {
+      if (row.credentialKey !== key) continue;
+      retryAt = laterCooldown(retryAt, row.credentialRetryAt);
+      rejectedUntil = laterCooldown(rejectedUntil, row.credentialRejectedUntil);
+    }
+    return structuredClone({ retryAt, rejectedUntil });
+  }
+
+  async recordProgressCredentialCooldown(
+    input: RecordProgressCredentialCooldownInput,
+  ): Promise<void> {
+    const row = this.runProgressMessages.get(input.triggerRunId);
+    if (row?.organizationId !== input.organizationId) return;
+    const sameCredential = row.credentialKey === input.key;
+    row.credentialKey = input.key;
+    row.credentialRetryAt = laterCooldown(
+      sameCredential ? row.credentialRetryAt : null,
+      input.retryAt,
+    );
+    row.credentialRejectedUntil = laterCooldown(
+      sameCredential ? row.credentialRejectedUntil : null,
+      input.rejectedUntil,
+    );
   }
 
   async listOpenRunProgressMessages(

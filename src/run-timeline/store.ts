@@ -80,10 +80,14 @@ export interface RunProgressMessage {
   leaseExpiresAt: Date | null;
   lastRenderedHash: string | null;
   lastEditAt: Date | null;
+  lastRegularAttemptAt: Date | null;
   editCount: number;
   failedEdits: number;
   finalFailures: number;
   retryAt: Date | null;
+  credentialKey: string | null;
+  credentialRetryAt: Date | null;
+  credentialRejectedUntil: Date | null;
   settleAt: Date | null;
   repeatFinal: boolean;
   visibility: "public" | "private" | "unknown" | null;
@@ -101,6 +105,15 @@ export interface InsertRunProgressMessageInput {
   provider: ProgressProviderName;
   now: Date;
 }
+export interface ProgressCredentialCooldown {
+  retryAt: Date | null;
+  rejectedUntil: Date | null;
+}
+export interface RecordProgressCredentialCooldownInput extends ProgressCredentialCooldown {
+  organizationId: string;
+  triggerRunId: string;
+  key: string;
+}
 export interface RunProgressLeaseInput {
   triggerRunId: string;
   organizationId: string;
@@ -117,6 +130,7 @@ export interface UpdateRunProgressMessageInput extends RunProgressLeaseInput {
       | "externalRef"
       | "lastRenderedHash"
       | "lastEditAt"
+      | "lastRegularAttemptAt"
       | "editCount"
       | "failedEdits"
       | "finalFailures"
@@ -180,6 +194,8 @@ export interface RunTimelineStore {
   updateRunProgressMessage(
     input: UpdateRunProgressMessageInput,
   ): Promise<RunProgressMessage | undefined>;
+  readProgressCredentialCooldown(key: string): Promise<ProgressCredentialCooldown>;
+  recordProgressCredentialCooldown(input: RecordProgressCredentialCooldownInput): Promise<void>;
   listRunProgressMessagesToFinish(
     now: Date,
     limit: number,
