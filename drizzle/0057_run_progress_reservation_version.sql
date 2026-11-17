@@ -1,0 +1,1 @@
+ALTER TABLE "run_progress_messages" ADD COLUMN "last_regular_reservation_version" integer;

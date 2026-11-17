@@ -34,7 +34,8 @@ const EVENT = `trigger_run_id as "triggerRunId", organization_id as "organizatio
  step_id as "stepId", data`;
 const MESSAGE = `trigger_run_id as "triggerRunId", organization_id as "organizationId", provider, state,
  external_ref as "externalRef", version, lease_owner as "leaseOwner", lease_expires_at as "leaseExpiresAt",
- last_rendered_hash as "lastRenderedHash", last_edit_at as "lastEditAt", last_regular_attempt_at as "lastRegularAttemptAt", edit_count as "editCount",
+ last_rendered_hash as "lastRenderedHash", last_edit_at as "lastEditAt", last_regular_attempt_at as "lastRegularAttemptAt",
+ last_regular_reservation_version as "lastRegularReservationVersion", edit_count as "editCount",
  failed_edits as "failedEdits", final_failures as "finalFailures", retry_at as "retryAt",
  credential_key as "credentialKey", credential_retry_at as "credentialRetryAt", credential_rejected_until as "credentialRejectedUntil",
  settle_at as "settleAt", repeat_final as "repeatFinal", visibility, visibility_checked_at as "visibilityCheckedAt", failure,
@@ -447,8 +448,10 @@ export class RunTimelineRepository {
            set state = case when $2 = 'create' then 'creating' else state end,
                edit_count = edit_count + case when $2 = 'regular' then 1 else 0 end,
                last_regular_attempt_at = case when $2 = 'regular' then $3::timestamptz else last_regular_attempt_at end,
+               last_regular_reservation_version = case when $2 = 'regular' then version else last_regular_reservation_version end,
                updated_at = $3
-           where trigger_run_id = $1`,
+           where trigger_run_id = $1
+             and ($2 <> 'regular' or last_regular_reservation_version is distinct from version)`,
           [input.triggerRunId, input.reservation, input.now],
         );
       }

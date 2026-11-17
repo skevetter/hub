@@ -609,6 +609,7 @@ export const runProgressMessages = pgTable(
     lastRenderedHash: text("last_rendered_hash"),
     lastEditAt: timestamp("last_edit_at", { withTimezone: true }),
     lastRegularAttemptAt: timestamp("last_regular_attempt_at", { withTimezone: true }),
+    lastRegularReservationVersion: integer("last_regular_reservation_version"),
     editCount: integer("edit_count").notNull().default(0),
     failedEdits: integer("failed_edits").notNull().default(0),
     finalFailures: integer("final_failures").notNull().default(0),

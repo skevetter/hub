@@ -23,7 +23,7 @@ import { createDatabase } from "../db/pg.js";
 import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
 import type { AcceptedTriggerRunRecord, Database } from "../db/types.js";
 import { RunTimelineBus } from "../run-timeline/bus.js";
-import type { RunTimelineEvent } from "../run-timeline/store.js";
+import type { AdmitProgressWriteInput, RunTimelineEvent } from "../run-timeline/store.js";
 import { ProgressReporter } from "./index.js";
 import { CredentialBackoff } from "./backoff.js";
 import { LateWriteObservers, MessageWriter } from "./writer.js";
@@ -1626,5 +1626,56 @@ it.each([
 
     assert.equal(requestRepair.mock.calls.length, Number(repair));
     assert.equal(observers.size, 0);
+  },
+);
+
+it.each(["memory", "embedded Postgres", "pooled Postgres"] as const)(
+  "reserves one regular edit for concurrent replays of a lease in %s",
+  async (backend) => {
+    let database: Database | undefined;
+    let peer: Database | undefined;
+    if (backend === "embedded Postgres") database = await embedded();
+    if (backend === "pooled Postgres") {
+      const postgres = await createTimelinePostgresHarness();
+      cleanup.push(() => postgres.close());
+      await postgres.runtime.query(
+        "insert into organization (id, name, slug) values ($1, 'Progress', 'progress')",
+        [ORGANIZATION],
+      );
+      const [first, second] = await Promise.all([postgres.connect(), postgres.connect()]);
+      assert.notEqual(first.pid, second.pid);
+      database = first.database;
+      peer = second.database;
+    }
+    const f = fixture(database);
+    const run = await f.seed({ state: "active" });
+    const lease = await run.acquire("writer");
+    assert.ok(lease);
+    const request: AdmitProgressWriteInput = {
+      triggerRunId: run.run.id,
+      organizationId: ORGANIZATION,
+      owner: "writer",
+      version: lease.version,
+      state: "active",
+      key: "test-credential",
+      reservation: "regular",
+      now: f.clock.date(),
+    };
+    assert.deepEqual(
+      await Promise.all([
+        f.store.admitProgressWrite(request),
+        (peer ?? f.store).admitProgressWrite(request),
+      ]),
+      [{ status: "admitted" }, { status: "admitted" }],
+    );
+    assert.equal((await run.read())?.editCount, 1);
+    assert.deepEqual((await run.read())?.lastRegularAttemptAt, request.now);
+
+    const nextLease = await run.acquire("writer");
+    assert.ok(nextLease && nextLease.version !== lease.version);
+    assert.deepEqual(await f.store.admitProgressWrite({ ...request, version: nextLease.version }), {
+      status: "admitted",
+    });
+    assert.equal((await run.read())?.editCount, 2);
   },
 );

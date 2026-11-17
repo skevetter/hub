@@ -648,6 +648,7 @@ class MemoryDatabase implements Database {
       lastRenderedHash: null,
       lastEditAt: null,
       lastRegularAttemptAt: null,
+      lastRegularReservationVersion: null,
       editCount: 0,
       failedEdits: 0,
       finalFailures: 0,
@@ -763,7 +764,11 @@ class MemoryDatabase implements Database {
       message.state = "creating";
       message.updatedAt = new Date(input.now);
     }
-    if (input.reservation === "regular") {
+    if (
+      input.reservation === "regular" &&
+      message.lastRegularReservationVersion !== input.version
+    ) {
+      message.lastRegularReservationVersion = input.version;
       message.editCount += 1;
       message.lastRegularAttemptAt = new Date(input.now);
       message.updatedAt = new Date(input.now);

@@ -81,6 +81,7 @@ export interface RunProgressMessage {
   lastRenderedHash: string | null;
   lastEditAt: Date | null;
   lastRegularAttemptAt: Date | null;
+  lastRegularReservationVersion: number | null;
   editCount: number;
   failedEdits: number;
   finalFailures: number;
