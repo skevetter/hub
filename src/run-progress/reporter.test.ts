@@ -204,6 +204,16 @@ function fixture(database?: Database, drain?: () => Promise<void>) {
     return reporter;
   };
 
+  const writer = () =>
+    new MessageWriter({
+      database: store,
+      clock,
+      settings: { minEditSeconds: 20, maxEdits: 120, retentionDays: 30 },
+      signal: new AbortController().signal,
+      backoff: new CredentialBackoff(() => 0.5),
+      report: (code) => failures.push(code),
+    });
+
   async function event(
     run: AcceptedTriggerRunRecord,
     kind: RunTimelineEvent["kind"] = "run_started",
@@ -228,8 +238,10 @@ function fixture(database?: Database, drain?: () => Promise<void>) {
   async function seed({
     started = true,
     state = "pending",
+    reference = REFERENCE,
   }: {
     started?: boolean;
+    reference?: StoredRef;
     state?: "pending" | "creating" | "active" | "finished";
   } = {}) {
     const run = await createRun(store, clock);
@@ -272,14 +284,14 @@ function fixture(database?: Database, drain?: () => Promise<void>) {
         await update(
           "seed",
           lease.version,
-          { state, externalRef: REFERENCE },
+          { state, externalRef: reference },
           state !== "creating",
         ),
       );
     }
     return { run, read, acquire, update, compensate, finish };
   }
-  return { clock, bus, store, provider, failures, start, event, seed };
+  return { clock, bus, store, provider, failures, start, event, seed, writer };
 }
 
 describe("run progress reporter", () => {
@@ -405,6 +417,7 @@ describe("run progress reporter", () => {
     f.provider.onWrite = () => new Promise(() => {});
     await f.clock.advanceTo(10_000);
     assert.equal((await uncertain.read())?.state, "abandoned");
+    assert.equal((await uncertain.read())?.compensationRequestedGen, 1);
     assert.equal((await expired.read())?.state, "creating");
     await f.clock.advanceTo(180_000);
     assert.equal((await expired.read())?.state, "abandoned");
@@ -664,21 +677,28 @@ describe("progress repair across writers", () => {
         return;
       }
 
-      if (mode === "rate limited") {
-        f.provider.onWrite = (request, land) =>
-          request.time === 182_000
-            ? { status: "retry", afterMs: 1_000_000, notCreated: false }
-            : land();
-      }
-      await f.clock.advanceTo(63_000);
-      await staleLands();
       const repairTime = mode === "rate limited" ? 1_082_000 : 182_000;
+      f.provider.onWrite = async (request, land) => {
+        if (mode === "rate limited" && request.time === 182_000) {
+          return { status: "retry", afterMs: 1_000_000, notCreated: false };
+        }
+        await new Promise<void>((resolve) => f.clock.timer(resolve, 2_000));
+        return land();
+      };
+      const staleTime = 63_000;
+      await f.clock.advanceTo(staleTime);
+      await staleLands();
       await f.clock.advanceTo(repairTime - 1);
       assert.equal(f.provider.visible.get("comment"), "stale");
       assert.equal((await run.read())?.leaseOwner, null);
       await f.clock.advanceTo(repairTime);
       assert.equal(f.provider.requests.at(-1)?.time, repairTime);
+      await f.clock.advanceTo(repairTime + 1_999);
+      assert.equal(f.provider.visible.get("comment"), "stale");
+      const landedAt = repairTime + 2_000;
+      await f.clock.advanceTo(landedAt);
       assert.match(f.provider.visible.get("comment") ?? "", /Succeeded/u);
+      assert.ok(landedAt - staleTime <= (mode === "rate limited" ? 1_045_000 : 145_000));
       assert.equal((await run.read())?.settleAt, null);
     },
   );
@@ -1031,14 +1051,15 @@ describe("progress scheduling", () => {
         ? { status: "retry", notCreated: false, afterMs: 0 }
         : land();
     await f.event(run.run, "tool_finished", 1);
-    await f.clock.advanceTo(40_000);
+    await f.clock.advanceTo(160_000);
     assert.equal(f.provider.requests.length, 9);
     assert.equal((await run.read())?.failedEdits, 8);
+    assert.equal((await run.read())?.editCount, 8);
     await f.event(run.run, "tool_finished", 2);
-    await f.clock.advanceTo(60_000);
+    await f.clock.advanceTo(180_000);
     assert.equal(f.provider.requests.length, 9);
     await run.finish();
-    await f.clock.advanceTo(60_000);
+    await f.clock.advanceTo(180_000);
     assert.equal(f.provider.requests.length, 10);
     assert.match(f.provider.visible.get("comment") ?? "", /Succeeded/u);
   });
@@ -1057,7 +1078,7 @@ describe("progress scheduling", () => {
   });
 });
 
-it("serializes finalization against a separate Hub process and recovers its expired lease", async () => {
+it("shares leases and credential cooldowns with a separate Hub process", async () => {
   const container = await new PostgreSqlContainer("postgres:17-alpine").start();
   cleanup.push(async () => {
     await container.stop();
@@ -1075,34 +1096,14 @@ it("serializes finalization against a separate Hub process and recovers its expi
     const run = await f.seed({ state: "active" });
     const scope = { triggerRunId: run.run.id, organizationId: ORGANIZATION };
     const child = startExternalWriter(connection, scope, f.clock.now());
-    cleanup.push(async () => {
-      if (child.exitCode !== null || child.signalCode !== null) return;
-      const exited = once(child, "exit");
-      child.kill("SIGKILL");
-      await exited;
-    });
-    const message: unknown[] = await Promise.race([
-      once(child, "message"),
-      once(child, "exit").then(() => {
-        throw new Error("Writer exited before sending");
-      }),
-    ]);
-    const [body] = message;
-    assert.ok(typeof body === "string");
+    const body = await externalMessage(child);
     assert.match(body, /Paseo run: Running/u);
     const old = await run.read();
     assert.ok(old?.leaseOwner);
     const firstRequest = f.provider.requests.length;
 
     await run.finish();
-    const replacement = new MessageWriter({
-      database: f.store,
-      clock: f.clock,
-      settings: { minEditSeconds: 20, maxEdits: 120, retentionDays: 30 },
-      signal: new AbortController().signal,
-      backoff: new CredentialBackoff(),
-      report: () => {},
-    });
+    const replacement = f.writer();
     const blocked = await replacement.write(scope, f.provider);
     assert.equal(blocked.wakeAt, f.clock.now() + 5_000);
     assert.equal(f.provider.requests.length, firstRequest);
@@ -1124,7 +1125,53 @@ it("serializes finalization against a separate Hub process and recovers its expi
     assert.equal((await run.read())?.state, "finished");
     if (exit === "crash") assert.equal((await run.read())?.compensationRequestedGen, 2);
   }
+
+  const origin = f.clock.monotonic();
+  const rateLimited = await f.seed({ state: "active" });
+  const sibling = await f.seed({
+    state: "active",
+    reference: { ...REFERENCE, commentId: "postgres sibling" },
+  });
+  const child = startExternalWriter(
+    connection,
+    { organizationId: ORGANIZATION, triggerRunId: rateLimited.run.id },
+    f.clock.now(),
+  );
+  assert.match(await externalMessage(child), /Paseo run: Running/u);
+  const recorded = externalMessage(child);
+  child.send("rate-limit");
+  assert.equal(await recorded, "cooldown recorded");
+  assert.equal((await rateLimited.read())?.credentialRetryAt?.getTime(), f.clock.now() + 65_000);
+  const replacement = f.writer();
+  const scope = { organizationId: ORGANIZATION, triggerRunId: sibling.run.id };
+  const count = f.provider.requests.length;
+  await f.clock.advanceTo(origin + 1_000);
+  assert.equal((await replacement.write(scope, f.provider)).wakeAt, f.clock.now() + 64_000);
+  await f.clock.advanceTo(origin + 64_999);
+  await replacement.write(scope, f.provider);
+  assert.equal(f.provider.requests.length, count);
+  assert.equal((await sibling.read())?.editCount, 0);
+  await f.clock.advanceTo(origin + 65_000);
+  await replacement.write(scope, f.provider);
+  assert.equal(f.provider.requests.length, count + 1);
+  assert.equal(f.provider.requests.at(-1)?.time, origin + 65_000);
+  assert.equal(f.provider.requests.at(-1)?.ref["commentId"], "postgres sibling");
+  const exited = once(child, "exit");
+  child.send("close");
+  assert.deepEqual(await exited, [0, null]);
 }, 45_000);
+
+async function externalMessage(child: ReturnType<typeof startExternalWriter>): Promise<string> {
+  const message: unknown[] = await Promise.race([
+    once(child, "message"),
+    once(child, "exit").then(() => {
+      throw new Error("Writer exited before sending");
+    }),
+  ]);
+  const [body] = message;
+  assert.ok(typeof body === "string");
+  return body;
+}
 
 function startExternalWriter(
   connection: string,
@@ -1157,20 +1204,33 @@ function startExternalWriter(
         edit: async (_ref, body) => {
           const landing = once(process, "message");
           process.send(body);
-          await landing;
+          const [instruction] = await landing;
+          if (instruction === "rate-limit") return { status: "retry", afterMs: 65000, notCreated: false };
           return { status: "ok" };
         },
       });
       if (result.row?.editCount !== 1) process.exitCode = 2;
+      if (result.row?.credentialRetryAt != null) {
+        const finished = once(process, "message");
+        process.send("cooldown recorded");
+        await finished;
+      }
     } finally {
       await runtime.close();
       process.disconnect();
     }
   `;
-  return spawn(process.execPath, ["--import", "tsx", "--eval", source], {
+  const child = spawn(process.execPath, ["--import", "tsx", "--eval", source], {
     env: { ...process.env, PASEO_REPORTER_TEST_DATABASE: connection },
     stdio: ["ignore", "ignore", "inherit", "ipc"],
   });
+  cleanup.push(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = once(child, "exit");
+    child.kill("SIGKILL");
+    await exited;
+  });
+  return child;
 }
 
 it("keeps the lease recoverable if recording a write and its repair request both fail", async () => {
@@ -1197,4 +1257,166 @@ it("keeps the lease recoverable if recording a write and its repair request both
   await f.clock.advanceTo(60_000);
   assert.equal(f.provider.requests.length, 2);
   assert.equal((await run.read())?.compensationDoneGen, 1);
+});
+
+it("repairs an aborted edit that reports success after the final settle", async () => {
+  const f = fixture();
+  const run = await f.seed();
+  const late = Promise.withResolvers<void>();
+  let aborted = false;
+  f.provider.onWrite = async (request, land, signal) => {
+    if (request.time === 20_000) {
+      signal.addEventListener(
+        "abort",
+        () => {
+          aborted = true;
+        },
+        { once: true },
+      );
+      await late.promise;
+    }
+    return land();
+  };
+  f.start();
+  await f.clock.advanceTo(0);
+  await f.event(run.run, "tool_finished", 1);
+  await f.clock.advanceTo(20_000);
+  await run.finish();
+  await f.clock.advanceTo(30_000);
+  assert.equal(aborted, true);
+  assert.equal((await run.read())?.compensationRequestedGen, 1);
+  await f.clock.advanceTo(190_000);
+  assert.deepEqual(
+    f.provider.requests.map(({ time }) => time),
+    [0, 20_000, 32_000, 34_000, 152_000],
+  );
+  const settled = await run.read();
+  assert.ok(settled);
+  assert.equal(settled.compensationRequestedGen, settled.compensationDoneGen);
+  late.resolve();
+  await f.clock.advanceTo(190_000);
+  assert.match(f.provider.visible.get("comment") ?? "", /Running/u);
+  assert.equal((await run.read())?.compensationRequestedGen, settled.compensationDoneGen + 1);
+  await f.clock.advanceTo(245_000);
+  assert.match(f.provider.visible.get("comment") ?? "", /Succeeded/u);
+  assert.equal((await run.read())?.compensationDoneGen, settled.compensationDoneGen + 1);
+});
+
+it("paces the running message from a timed-out attempt rather than from its previous success", async () => {
+  const f = fixture();
+  const run = await f.seed();
+  f.provider.onWrite = (request, land) =>
+    request.time === 20_000 ? new Promise(() => {}) : land();
+  f.start();
+  await f.clock.advanceTo(0);
+  await f.event(run.run, "tool_finished", 1);
+  await f.clock.advanceTo(20_000);
+  assert.equal((await run.read())?.editCount, 1);
+  assert.equal((await run.read())?.lastRegularAttemptAt?.getTime(), f.clock.now());
+  await f.clock.advanceTo(30_000);
+  await f.event(run.run, "tool_finished", 2);
+  await f.clock.advanceTo(39_999);
+  assert.deepEqual(
+    f.provider.requests.map(({ time }) => time),
+    [0, 20_000],
+  );
+  await f.clock.advanceTo(40_000);
+  assert.match(f.provider.visible.get("comment") ?? "", /2 commands/u);
+  await f.clock.advanceTo(41_000);
+  await f.event(run.run, "tool_finished", 3);
+  await f.clock.advanceTo(41_000);
+  assert.equal((await run.read())?.editCount, 2);
+  assert.match(f.provider.visible.get("comment") ?? "", /3 commands/u);
+});
+
+it.each(["success", "applied 5xx"] as const)(
+  "blocks a changed 121st regular edit after first result %s",
+  async (result) => {
+    const f = fixture();
+    const run = await f.seed();
+    const regularBodies: string[] = [];
+    f.provider.onWrite = async (request, land) => {
+      const row = await run.read();
+      if (request.action === "edit" && row?.lastRegularAttemptAt?.getTime() === f.clock.now()) {
+        regularBodies.push(request.body);
+        if (regularBodies.length === 1 && result === "applied 5xx") {
+          land();
+          return { status: "retry", notCreated: false, afterMs: 0, transient: true };
+        }
+      }
+      return land();
+    };
+    f.start();
+    await f.clock.advanceTo(0);
+    await f.event(run.run, "tool_finished", 1);
+    await f.clock.advanceTo(20_000);
+    assert.equal((await run.read())?.editCount, 1);
+    if (result === "applied 5xx") {
+      assert.equal((await run.read())?.compensationRequestedGen, 1);
+      assert.match(f.provider.visible.get("comment") ?? "", /1 command/u);
+    }
+    for (let count = 2; count <= 121; count += 1) {
+      const now = count * 61_000;
+      await f.clock.advanceTo(now);
+      await f.event(run.run, "tool_finished", count);
+      await f.clock.advanceTo(now);
+    }
+    assert.equal(regularBodies.length, 120);
+    assert.equal((await run.read())?.editCount, 120);
+    assert.match(f.provider.visible.get("comment") ?? "", /120 commands/u);
+  },
+);
+
+it("blocks a send when authorization completes and ownership changes with both deadlines live", async () => {
+  const f = fixture();
+  const run = await f.seed({ state: "active" });
+  await run.finish();
+  let authorized = false;
+  f.provider.authorize = async () => {
+    authorized = true;
+    return "ok";
+  };
+  f.provider.secrets = async () => {
+    assert.equal(authorized, true);
+    const row = await run.read();
+    assert.ok(row?.leaseOwner);
+    await f.clock.advanceTo(500);
+    assert.ok(await run.update(row.leaseOwner, row.version, {}));
+    assert.ok(await run.acquire("replacement"));
+    return [];
+  };
+  const scope = { organizationId: ORGANIZATION, triggerRunId: run.run.id };
+  await f.writer().write(scope, f.provider);
+  assert.deepEqual(f.provider.requests, []);
+  assert.equal((await run.read())?.leaseOwner, "replacement");
+});
+
+it("shares a 65-second Retry-After between memory writers on distinct runs", async () => {
+  const f = fixture();
+  const first = await f.seed({ state: "active" });
+  const second = await f.seed({
+    state: "active",
+    reference: { ...REFERENCE, commentId: "memory sibling" },
+  });
+  const firstWriter = f.writer();
+  const secondWriter = f.writer();
+  f.provider.onWrite = (_request, land) =>
+    f.provider.requests.length === 1
+      ? { status: "retry", notCreated: false, afterMs: 65_000 }
+      : land();
+  await firstWriter.write({ organizationId: ORGANIZATION, triggerRunId: first.run.id }, f.provider);
+  const scope = { organizationId: ORGANIZATION, triggerRunId: second.run.id };
+  await f.clock.advanceTo(1_000);
+  assert.equal((await secondWriter.write(scope, f.provider)).wakeAt, f.clock.now() + 64_000);
+  await f.clock.advanceTo(64_999);
+  await secondWriter.write(scope, f.provider);
+  assert.equal(f.provider.requests.length, 1);
+  await f.clock.advanceTo(65_000);
+  await secondWriter.write(scope, f.provider);
+  assert.deepEqual(
+    f.provider.requests.map(({ time }) => time),
+    [0, 65_000],
+  );
+  assert.equal(f.provider.requests.at(-1)?.ref["commentId"], "memory sibling");
+  assert.equal((await second.read())?.editCount, 1);
 });
