@@ -401,10 +401,10 @@ function createRunStreamRuntime(
     bus: timeline.timelineBus,
     reconciler: timeline.runTimelineReconciler,
     settings,
-    reportFailure: (error) => {
+    reportFailure: (error, requestId) => {
       reportFailure(
         error,
-        { operation: "run.stream.handle", component: "run-progress" },
+        { operation: "run.stream.handle", component: "run-progress", requestId },
         { scrubValues },
       );
     },

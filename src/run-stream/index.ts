@@ -29,7 +29,7 @@ export interface RunStreamOptions {
   reconciler: Pick<RunTimelineReconciler, "reconcileBeforeTerminal"> | undefined;
   settings: RunProgressSettings;
   logger?: Pick<Logger, "info">;
-  reportFailure?: (error: unknown) => void;
+  reportFailure?: (error: unknown, requestId: string) => void;
 }
 
 interface StreamInfrastructure {
@@ -101,7 +101,7 @@ export class RunStream {
       if (this.closing) return this.failure(requestId, "shutting_down");
       return this.open(request, requestId, access, prepared, infrastructure);
     } catch (error) {
-      this.report(error);
+      this.report(error, requestId);
       return this.failure(requestId, "infrastructure_unavailable");
     }
   }
@@ -186,7 +186,7 @@ export class RunStream {
       context: prepared,
       firstSeq: prepared.firstSeq,
       after: prepared.after,
-      reportFailure: (error) => this.report(error),
+      reportFailure: (error) => this.report(error, requestId),
       reauthorize: () => access.reauthorize(),
       release: (reason, durationMs, eventsSent) => {
         this.subscribers.delete(subscriber);
@@ -229,9 +229,9 @@ export class RunStream {
     });
   }
 
-  private report(error: unknown): void {
+  private report(error: unknown, requestId: string): void {
     try {
-      this.options.reportFailure?.(error);
+      this.options.reportFailure?.(error, requestId);
     } catch {}
   }
 
