@@ -161,6 +161,12 @@ describe("progress message vocabulary", () => {
         subject: adversarial,
       }),
     );
+    const statuses = {
+      running: "Running",
+      failed: "Failed in 4m 02s: the run failed (failed).",
+      timed_out: "Timed out in 4m 02s: the run reached its time limit (run_timeout).",
+      succeeded: "Succeeded in 4m 02s",
+    };
     const authored = new Set(
       Array.from({ length: AUTHOR_TEXT.length - 3 }, (_, index) =>
         AUTHOR_TEXT.slice(index, index + 4),
@@ -177,7 +183,12 @@ describe("progress message vocabulary", () => {
           events: [
             events[0]!,
             ...activity,
-            event("permission_requested", 5002, working, { request: adversarial }),
+            event("tool_finished", 5002, working, {
+              callId: "invalid",
+              category: adversarial,
+              status: "failed",
+            }),
+            event("permission_requested", 5003, working, { request: adversarial }),
           ],
           run: {
             ...run,
@@ -186,27 +197,25 @@ describe("progress message vocabulary", () => {
             failureReason: adversarial,
           },
         });
-        assert.match(
-          body,
-          /^(?:<!-- paseo-hub-progress run=[a-f0-9-]+ -->\n)?Paseo run: (?:Running|Succeeded in 4m 02s|Failed in 4m 02s: the run failed \(failed\)\.|Timed out in 4m 02s: the run reached its time limit \(run_timeout\)\.)\n/u,
-        );
-        assert.match(
-          body,
-          /Activity: 556 commands, 556 reads, 556 edits, 556 web calls, 556 subagents, 555 plans, 555 MCP calls, 555 finish calls, 555 other calls\. 5000 tool calls, 5000 failed\./u,
-        );
-        assert.match(
-          body,
+        const expected = [];
+        if (provider === "github") expected.push(`<!-- paseo-hub-progress run=${RUN_ID} -->`);
+        expected.push(`Paseo run: ${statuses[status]}`);
+        if (status === "running") {
+          expected.push(
+            "Started 10:02:11 UTC. Updated 10:02:14 UTC.",
+            "Now: waiting for permission",
+          );
+        } else {
+          expected.push("Finished 10:06:13 UTC.");
+        }
+        expected.push(
+          "Activity: 556 commands, 556 reads, 556 edits, 556 web calls, 556 subagents, 555 plans, 555 MCP calls, 555 finish calls, 555 other calls. 5001 tool calls, 5001 failed.",
           status === "running"
-            ? /Step 149 of 150 running since 10:02:14 UTC\./u
-            : /Steps: 148 succeeded, 2 not run of 150\./u,
+            ? "Step 149 of 150 running since 10:02:14 UTC."
+            : "Steps: 148 succeeded, 2 not run of 150.",
+          `Run details: https://hub.example.org/base/o/acme/activity/${RUN_ID}`,
         );
-        assert.match(
-          body,
-          new RegExp(
-            `Run details: https://hub\\.example\\.org/base/o/acme/activity/${RUN_ID}$`,
-            "u",
-          ),
-        );
+        assert.equal(body, expected.join("\n"));
         for (const fragment of authored) assert.equal(body.includes(fragment), false);
         assert.doesNotMatch(body, /@everyone|<!channel>|secret\.example/u);
         assert.equal(Buffer.byteLength(body, "utf8"), body.length);
