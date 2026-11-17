@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRouter, Outlet, RouterProvider } from "@tanstack/react-router";
 import { renderToStaticMarkup } from "react-dom/server";
 import type * as ReactStart from "@tanstack/react-start";
@@ -28,20 +28,27 @@ vi.mock("../projects/context.js", async (importOriginal) => ({
 
 vi.mock("../queries/index.js", async (importOriginal) => ({
   ...(await importOriginal<typeof Queries>()),
-  useSnapshotQuery: ({ queryKey }: { queryKey: unknown }) => {
+  useSnapshotQuery: ({ queryKey }: { queryKey: readonly unknown[] }) => {
     state.queryKeys.push(queryKey);
-    return { status: "success", data: state.snapshot, refetch: () => {} };
+    const data =
+      queryKey[0] === "run-detail" ? { sequence: 1, value: state.snapshot } : state.snapshot;
+    return { status: "success", data, refetch: () => {} };
   },
 }));
 
 async function renderRoute(path: string) {
+  const client = new QueryClient();
   const router = createRouter({
     routeTree,
     history: createMemoryHistory({ initialEntries: [path] }),
-    context: { queryClient: new QueryClient() },
+    context: { queryClient: client },
   });
   await router.load();
-  return renderToStaticMarkup(<RouterProvider router={router} />);
+  return renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
 }
 
 describe("organization activity routes", () => {

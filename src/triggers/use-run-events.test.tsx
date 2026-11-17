@@ -13,10 +13,13 @@ import { emptyTimeline, runDetailFixture, runEvent } from "./test-utils/run-deta
 import { timelineRows } from "./run-timeline-view.js";
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
 import { RunDetailView } from "./run-detail.js";
+import { RunRequestClock } from "./run-read.js";
 vi.mock("@tanstack/react-start", async (importOriginal) => ({
   ...(await importOriginal<typeof ReactStart>()),
   useServerFn: (fn: unknown) => fn,
 }));
+
+const requests = new RunRequestClock();
 
 class FakeEventSource implements RunEventSource {
   listeners = new Map<string, (event: MessageEvent<string>) => void>();
@@ -37,6 +40,7 @@ function fixture(initial: RunEventPage = emptyTimeline, status = 200) {
   const seal = vi.fn();
   const subscription = new RunEventSubscription({
     initial,
+    initialSequence: 0,
     after: 0,
     url: "/api/v1/runs/run/events?organization=acme",
     source: (url) => {
@@ -148,27 +152,36 @@ describe("run event subscription", () => {
     await Promise.resolve();
     assert.equal(subscription.snapshot().connection, "Polling");
     assert.equal(sources.at(0)!.closed, true);
-    subscription.acceptPage({
-      ...emptyTimeline,
-      status: "failed",
-      events: [runEvent(1, "run_started")],
-    });
+    subscription.acceptPage(
+      {
+        ...emptyTimeline,
+        status: "failed",
+        events: [runEvent(1, "run_started")],
+      },
+      requests.issue(),
+    );
     assert.equal(subscription.snapshot().connection, "Polling");
     assert.equal(seal.mock.calls.length, 0);
-    subscription.acceptPage({
-      ...emptyTimeline,
-      status: "failed",
-      sealedSeq: 3,
-      events: [runEvent(2, "step_finished", { status: "failed" })],
-      stepRowsOmitted: 2,
-    });
+    subscription.acceptPage(
+      {
+        ...emptyTimeline,
+        status: "failed",
+        sealedSeq: 3,
+        events: [runEvent(2, "step_finished", { status: "failed" })],
+        stepRowsOmitted: 2,
+      },
+      requests.issue(),
+    );
     assert.equal(subscription.snapshot().connection, "Polling");
-    subscription.acceptPage({
-      ...emptyTimeline,
-      status: "failed",
-      sealedSeq: 3,
-      events: [runEvent(3, "run_finished", { status: "failed" })],
-    });
+    subscription.acceptPage(
+      {
+        ...emptyTimeline,
+        status: "failed",
+        sealedSeq: 3,
+        events: [runEvent(3, "run_finished", { status: "failed" })],
+      },
+      requests.issue(),
+    );
     assert.equal(subscription.snapshot().connection, null);
     assert.equal(seal.mock.calls.length, 1);
     subscription.stop();
@@ -214,12 +227,15 @@ describe("run event subscription", () => {
       streamEnabled: false,
       origin: null,
     });
-    subscription.acceptPage({
-      ...emptyTimeline,
-      streamEnabled: false,
-      origin: "derived",
-      stepRowsOmitted: 12,
-    });
+    subscription.acceptPage(
+      {
+        ...emptyTimeline,
+        streamEnabled: false,
+        origin: "derived",
+        stepRowsOmitted: 12,
+      },
+      requests.issue(),
+    );
     assert.equal(subscription.snapshot().origin, "derived");
     assert.equal(subscription.snapshot().stepRowsOmitted, 12);
     const refresh = vi.fn();
@@ -227,7 +243,10 @@ describe("run event subscription", () => {
     await vi.advanceTimersByTimeAsync(20000);
     assert.equal(refresh.mock.calls.length, 4);
     stop();
-    subscription.acceptPage({ ...emptyTimeline, expired: true, events: [], origin: null });
+    subscription.acceptPage(
+      { ...emptyTimeline, expired: true, events: [], origin: null },
+      requests.issue(),
+    );
     assert.equal(subscription.snapshot().origin, "derived");
     assert.equal(subscription.snapshot().connection, null);
     assert.equal(seal.mock.calls.length, 1);
@@ -241,7 +260,10 @@ describe("run event subscription", () => {
       events: [runEvent(1, "run_started")],
     });
     assert.equal(sources.length, 0);
-    subscription.acceptPage({ ...emptyTimeline, events: [runEvent(1, "run_started")] });
+    subscription.acceptPage(
+      { ...emptyTimeline, events: [runEvent(1, "run_started")] },
+      requests.issue(),
+    );
     assert.deepEqual(subscription.snapshot().events, []);
     assert.equal(subscription.snapshot().connection, null);
     subscription.stop();
@@ -257,9 +279,9 @@ describe("run event subscription", () => {
     };
     const { subscription, sources, seal } = fixture(initial);
     const terminal = { ...initial, status: "succeeded" };
-    subscription.acceptPage(terminal);
+    subscription.acceptPage(terminal, requests.issue());
     assert.equal(subscription.snapshot().connection, "Polling");
-    subscription.acceptSnapshot(terminal);
+    subscription.acceptSnapshot(terminal, requests.issue());
     assert.equal(subscription.snapshot().connection, null);
     assert.equal(sources.length, 0);
     assert.equal(seal.mock.calls.length, 0);
@@ -291,15 +313,21 @@ describe("run event subscription", () => {
       events: [runEvent(1, "run_started")],
     };
     const { subscription, seal } = fixture(initial);
-    subscription.acceptPage({
-      ...initial,
-      events: [runEvent(2, "step_finished", { status: "failed" })],
-    });
+    subscription.acceptPage(
+      {
+        ...initial,
+        events: [runEvent(2, "step_finished", { status: "failed" })],
+      },
+      requests.issue(),
+    );
     assert.equal(subscription.snapshot().connection, "Polling");
-    subscription.acceptPage({
-      ...initial,
-      events: [runEvent(3, "run_finished", { status: "failed" })],
-    });
+    subscription.acceptPage(
+      {
+        ...initial,
+        events: [runEvent(3, "run_finished", { status: "failed" })],
+      },
+      requests.issue(),
+    );
     assert.equal(subscription.snapshot().connection, null);
     assert.deepEqual(
       subscription.snapshot().events.map((event) => event.seq),
@@ -347,14 +375,17 @@ describe("run event subscription", () => {
           const { subscription, seal } = fixture(initial);
           try {
             for (const operation of order) {
-              if (operation === "snapshot") subscription.acceptSnapshot(staleSnapshot);
-              else if (operation === "known") subscription.acceptPage(known);
+              if (operation === "snapshot") subscription.acceptSnapshot(staleSnapshot, 1);
+              else if (operation === "known") subscription.acceptPage(known, 2);
               else
-                subscription.acceptPage({
-                  ...known,
-                  sealedSeq: 2,
-                  events: [runEvent(2, "run_finished", { status: "succeeded" })],
-                });
+                subscription.acceptPage(
+                  {
+                    ...known,
+                    sealedSeq: 2,
+                    events: [runEvent(2, "run_finished", { status: "succeeded" })],
+                  },
+                  3,
+                );
             }
             const state = subscription.snapshot();
             assert.equal(state.connection, null);
@@ -366,8 +397,8 @@ describe("run event subscription", () => {
             assert.equal(state.lastSeq, 2);
             assert.equal(state.sealedSeq, 2);
             assert.equal(seal.mock.calls.length, 1);
-            subscription.acceptSnapshot(staleSnapshot);
-            subscription.acceptPage(absent);
+            subscription.acceptSnapshot(staleSnapshot, 1);
+            subscription.acceptPage(absent, 0);
             assert.deepEqual(
               subscription.snapshot().events.map((event) => event.seq),
               [1, 2],
@@ -398,25 +429,28 @@ describe("run event subscription", () => {
   ];
   for (const signal of evidence) {
     for (const snapshotFirst of [false, true]) {
-      it(`keeps positive ${signal.name} with unavailable snapshot ${snapshotFirst ? "first" : "last"}`, () => {
+      it(`keeps newer ${signal.name} evidence with older unavailable snapshot ${snapshotFirst ? "first" : "last"}`, () => {
         const { subscription, seal } = fixture(absent);
         const snapshot = { ...absent, status: "succeeded" };
         const page = { ...snapshot, ...signal.patch };
         try {
-          if (snapshotFirst) subscription.acceptSnapshot(snapshot);
-          subscription.acceptPage(page);
-          if (!snapshotFirst) subscription.acceptSnapshot(snapshot);
+          if (snapshotFirst) subscription.acceptSnapshot(snapshot, 1);
+          subscription.acceptPage(page, 2);
+          if (!snapshotFirst) subscription.acceptSnapshot(snapshot, 1);
           assert.equal(subscription.snapshot().timelineUnavailable, false);
           assert.equal(subscription.snapshot().connection, "Polling");
-          subscription.acceptPage({
-            ...page,
-            timelineUnavailable: false,
-            sealedSeq: 2,
-            events: [
-              runEvent(1, "run_started"),
-              runEvent(2, "run_finished", { status: "succeeded" }),
-            ],
-          });
+          subscription.acceptPage(
+            {
+              ...page,
+              timelineUnavailable: false,
+              sealedSeq: 2,
+              events: [
+                runEvent(1, "run_started"),
+                runEvent(2, "run_finished", { status: "succeeded" }),
+              ],
+            },
+            3,
+          );
           assert.deepEqual(
             subscription.snapshot().events.map((event) => event.seq),
             [1, 2],
@@ -444,15 +478,15 @@ describe("run event subscription", () => {
         events: [runEvent(1, "run_started")],
       };
       try {
-        if (snapshotFirst) subscription.acceptSnapshot(absent);
-        subscription.acceptPage(known);
-        if (!snapshotFirst) subscription.acceptSnapshot(absent);
+        if (snapshotFirst) subscription.acceptSnapshot(absent, 1);
+        subscription.acceptPage(known, 2);
+        if (!snapshotFirst) subscription.acceptSnapshot(absent, 1);
         assert.equal(subscription.snapshot().status, "succeeded");
         assert.equal(subscription.snapshot().sealedSeq, 2);
         assert.equal(subscription.snapshot().stepRowsOmitted, 7);
         assert.equal(subscription.snapshot().droppedCount, 9);
-        subscription.acceptPage({ ...known, expired: true, events: [] });
-        subscription.acceptSnapshot(absent);
+        subscription.acceptPage({ ...known, expired: true, events: [] }, 3);
+        subscription.acceptSnapshot(absent, 1);
         assert.equal(subscription.snapshot().expired, true);
         assert.equal(subscription.snapshot().origin, "captured");
         assert.equal(subscription.snapshot().sealedSeq, 2);
@@ -476,13 +510,16 @@ describe("run event subscription", () => {
         status: "succeeded",
         events: [runEvent(1, "run_started")],
       };
-      subscription.acceptPage(known);
+      subscription.acceptPage(known, requests.issue());
       assert.equal(subscription.snapshot().connection, "Polling");
-      subscription.acceptPage({
-        ...known,
-        sealedSeq: 2,
-        events: [runEvent(2, "run_finished", { status: "succeeded" })],
-      });
+      subscription.acceptPage(
+        {
+          ...known,
+          sealedSeq: 2,
+          events: [runEvent(2, "run_finished", { status: "succeeded" })],
+        },
+        requests.issue(),
+      );
       assert.equal(subscription.snapshot().connection, null);
       assert.equal(seal.mock.calls.length, 1);
     } finally {
@@ -506,7 +543,7 @@ describe("run event subscription", () => {
         stepRowsOmitted: 0,
         origin: null,
       });
-      subscription.acceptSnapshot({ ...emptyTimeline, origin: null });
+      subscription.acceptSnapshot({ ...emptyTimeline, origin: null }, requests.issue());
       assert.equal(subscription.snapshot().origin, "derived");
       assert.equal(subscription.snapshot().sealedSeq, 3);
       assert.equal(subscription.snapshot().stepRowsOmitted, 7);
@@ -591,6 +628,7 @@ describe("run event subscription", () => {
         runId: "run",
         after: 0,
         initial: emptyTimeline,
+        initialSequence: 0,
       });
       return <span>{state.connection}</span>;
     }

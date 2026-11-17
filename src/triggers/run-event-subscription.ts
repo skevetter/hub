@@ -19,6 +19,7 @@ export interface RunEventState extends RunEventPage {
 export interface RunEventSubscriptionOptions {
   url: string;
   initial: RunEventPage;
+  initialSequence: number;
   after: number;
   source: (url: string) => RunEventSource;
   probe: (url: string, signal: AbortSignal) => Promise<number>;
@@ -34,12 +35,9 @@ interface TimelineMetadata {
   timelineUnavailable?: boolean;
 }
 
-function hasTimeline(metadata: TimelineMetadata) {
+function hasHistory(metadata: TimelineMetadata) {
   return (
-    metadata.timelineUnavailable === false ||
-    (metadata.events?.length ?? 0) > 0 ||
-    metadata.origin != null ||
-    metadata.sealedSeq != null
+    (metadata.events?.length ?? 0) > 0 || metadata.origin != null || metadata.sealedSeq != null
   );
 }
 
@@ -53,14 +51,18 @@ export class RunEventSubscription {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private sealNotified = false;
   private persistedTerminal: boolean;
-  private timelineKnown: boolean;
+  private historyKnown: boolean;
+  private configurationSequence: number;
+  private configurationUnavailable: boolean;
 
   constructor(private readonly options: RunEventSubscriptionOptions) {
     const events = options.initial.expired ? [] : mergeRunEvents([], options.initial.events);
     const lastSeq = Math.max(options.after, events.at(-1)?.seq ?? 0);
     this.persistedTerminal = options.initial.status !== "running";
-    this.timelineKnown = hasTimeline(options.initial);
-    const unavailable = options.initial.timelineUnavailable && !this.timelineKnown;
+    this.historyKnown = hasHistory(options.initial);
+    this.configurationSequence = options.initialSequence;
+    this.configurationUnavailable = options.initial.timelineUnavailable;
+    const unavailable = this.configurationUnavailable && !this.historyKnown;
     const sealedOrExpired =
       options.initial.expired || timelineRead(lastSeq, options.initial.sealedSeq);
     const complete = sealedOrExpired || (unavailable && this.persistedTerminal);
@@ -96,17 +98,23 @@ export class RunEventSubscription {
     clearTimeout(this.reconnectTimer);
   }
 
-  acceptSnapshot(page: RunEventPage) {
+  acceptSnapshot(page: RunEventPage, sequence: number) {
     this.persistedTerminal ||= page.status !== "running";
-    this.acceptPage(page);
+    this.acceptPage(page, sequence);
   }
 
-  acceptPage(page: RunEventPage) {
+  acceptPage(page: RunEventPage, sequence: number) {
     if (this.stopped) return;
     const expired = this.state.expired || page.expired;
     const events = expired ? [] : mergeRunEvents(this.state.events, page.events);
     const lastSeq = Math.max(this.state.lastSeq, events.at(-1)?.seq ?? 0);
-    const state = this.mergeMetadata(page);
+    const configurationCurrent = sequence >= this.configurationSequence;
+    const state = this.mergeMetadata(page, sequence);
+    if (configurationCurrent) {
+      state.timelineEnabled = page.timelineEnabled;
+      state.streamEnabled = page.streamEnabled;
+      state.retentionDays = page.retentionDays;
+    }
     state.events = events;
     state.lastSeq = lastSeq;
     state.expired = expired;
@@ -115,7 +123,7 @@ export class RunEventSubscription {
     if (this.finishIfRead()) return;
     if (
       this.state.connection === null ||
-      (!page.streamEnabled && this.state.connection !== "Polling")
+      (!this.state.streamEnabled && this.state.connection !== "Polling")
     )
       this.poll();
   }
@@ -125,19 +133,20 @@ export class RunEventSubscription {
     for (const listener of this.listeners) listener();
   }
 
-  private mergeMetadata(incoming: TimelineMetadata) {
-    this.timelineKnown ||= hasTimeline(incoming);
+  private mergeMetadata(incoming: TimelineMetadata, sequence?: number) {
+    this.historyKnown ||= hasHistory(incoming);
+    if (sequence !== undefined && sequence >= this.configurationSequence) {
+      this.configurationSequence = sequence;
+      this.configurationUnavailable = incoming.timelineUnavailable === true;
+    }
     const seal = Math.max(this.state.sealedSeq ?? -1, incoming.sealedSeq ?? -1);
     const state: RunEventState = {
       ...this.state,
-      ...incoming,
       origin: this.state.origin ?? incoming.origin ?? null,
       sealedSeq: seal < 0 ? null : seal,
       stepRowsOmitted: Math.max(this.state.stepRowsOmitted, incoming.stepRowsOmitted),
       status: this.state.status === "running" ? incoming.status : this.state.status,
-      timelineUnavailable:
-        !this.timelineKnown &&
-        (this.state.timelineUnavailable || incoming.timelineUnavailable === true),
+      timelineUnavailable: !this.historyKnown && this.configurationUnavailable,
     };
     return state;
   }
@@ -150,7 +159,7 @@ export class RunEventSubscription {
 
   private finishIfRead() {
     const unavailable =
-      !this.timelineKnown &&
+      !this.historyKnown &&
       this.state.timelineUnavailable &&
       this.persistedTerminal &&
       this.state.status !== "running";
@@ -195,7 +204,7 @@ export class RunEventSubscription {
       listen(kind, (event) => {
         const row = this.parse(event.data, runEventSchema);
         if (row === undefined) return;
-        this.timelineKnown = true;
+        this.historyKnown = true;
         const events = mergeRunEvents(this.state.events, [row]);
         this.update({
           ...this.state,

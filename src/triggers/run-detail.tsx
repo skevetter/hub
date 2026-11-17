@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { useServerFn } from "@tanstack/react-start";
+import { useQueryClient } from "@tanstack/react-query";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
 import { FailureAlert, NoticeAlert } from "../components/app/failure-alert.js";
 import { FollowBottom } from "../components/app/follow-bottom.js";
@@ -17,6 +18,7 @@ import type { RunConnection, RunDetailSnapshot, RunEventPage } from "./run-event
 import { RunSteps } from "./run-steps.js";
 import { activityCounts, timelineRows, type TimelineRow } from "./run-timeline-view.js";
 import { runDetailKey, useRunEvents } from "./use-run-events.js";
+import { runReadClock, runReadResult } from "./run-read.js";
 
 const TIMELINE_COLUMNS = [
   { header: "Time" },
@@ -31,9 +33,13 @@ export function RunDetailPanel({ runId }: { runId: string }) {
   const tenant = useRouteTenant();
   const organizationSlug = tenant.organization.slug;
   const load = useServerFn(runDetailSnapshot);
+  const requests = runReadClock(useQueryClient());
   const snapshot = useSnapshotQuery({
     queryKey: runDetailKey(organizationSlug, runId),
-    queryFn: () => load({ data: { organizationSlug, runId } }),
+    queryFn: async () => {
+      const sequence = requests.issue();
+      return runReadResult(sequence, await load({ data: { organizationSlug, runId } }));
+    },
   });
   if (snapshot.status === "pending")
     return (
@@ -42,7 +48,7 @@ export function RunDetailPanel({ runId }: { runId: string }) {
         <DataTableSkeleton label="Run timeline" columns={TIMELINE_COLUMNS} />
       </>
     );
-  if (snapshot.status === "error" || snapshot.data === null)
+  if (snapshot.status === "error" || snapshot.data.value === null)
     return (
       <Section>
         <FailureAlert
@@ -61,7 +67,8 @@ export function RunDetailPanel({ runId }: { runId: string }) {
   return (
     <LiveRunDetail
       key={`${organizationSlug}\0${runId}`}
-      detail={snapshot.data}
+      detail={snapshot.data.value}
+      initialSequence={snapshot.data.sequence}
       organizationSlug={organizationSlug}
     />
   );
@@ -70,15 +77,18 @@ export function RunDetailPanel({ runId }: { runId: string }) {
 function LiveRunDetail({
   detail,
   organizationSlug,
+  initialSequence,
 }: {
   detail: RunDetailSnapshot;
   organizationSlug: string;
+  initialSequence: number;
 }) {
   const state = useRunEvents({
     organizationSlug,
     runId: detail.run.id,
     after: detail.timeline.events.at(-1)?.seq ?? 0,
     initial: detail.timeline,
+    initialSequence,
   });
   return <RunDetailView detail={detail} timeline={state} connection={state.connection} />;
 }

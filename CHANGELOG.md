@@ -19,7 +19,7 @@
 
 ### Fixed
 
-- Run timelines retain known availability and terminal metadata across delayed snapshots and event reads.
+- Run timelines retain stored history and order configuration evidence by request issuance across delayed reads.
 - Completed capture-off run pages stop event polling after final results load when no timeline remains.
 - Run details refresh completed step results when timeline capture is off.
 - Running durations use human units and update while the tab is visible.
