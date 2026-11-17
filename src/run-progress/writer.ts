@@ -198,11 +198,13 @@ export function regularEditAt(
   now: number,
   ageFrom: number,
   seconds: number,
+  localSendStart?: number,
 ): number {
   const interval = now - ageFrom > 900_000 ? 60_000 : seconds * 1000;
+  const durableStart = (row.lastRegularAttemptAt ?? row.lastEditAt)?.getTime() ?? now - interval;
   return Math.max(
     row.retryAt?.getTime() ?? 0,
-    ((row.lastRegularAttemptAt ?? row.lastEditAt)?.getTime() ?? now - interval) + interval,
+    Math.max(durableStart, localSendStart ?? -Infinity) + interval,
   );
 }
 
@@ -219,11 +221,17 @@ export function repairAt(row: RunProgressMessage): number | undefined {
 
 export class MessageWriter {
   private readonly owner = randomUUID();
+  private readonly recentRegularStarts = new Map<string, number>();
 
-  constructor(private readonly options: WriterOptions) {}
+  constructor(private readonly options: WriterOptions) {
+    options.signal.addEventListener("abort", () => this.recentRegularStarts.clear(), {
+      once: true,
+    });
+  }
 
   async write(scope: MessageScope, provider: ProgressProvider): Promise<WriteResult> {
     const { database, clock, signal } = this.options;
+    this.pruneRegularStarts(clock.now());
     const previous = await database.findRunProgressMessage(
       scope.organizationId,
       scope.triggerRunId,
@@ -312,12 +320,7 @@ export class MessageWriter {
     const nextAt = lease.retryAt?.getTime() ?? 0;
     if (nextAt > clock.now()) return this.release(lease, {}, nextAt);
     if (kind === "regular") {
-      const due = regularEditAt(
-        lease,
-        clock.now(),
-        run.createdAt.getTime(),
-        this.options.settings.minEditSeconds,
-      );
+      const due = this.regularDue(lease, run);
       if (due > clock.now()) return { ...(await this.release(lease, {}, due)), regularPace: true };
     }
     return this.prepare(lease, run, kind, provider, budget);
@@ -464,8 +467,8 @@ export class MessageWriter {
     provider: ProgressProvider,
     secrets: readonly string[],
   ): Promise<WriteResult> {
-    const { lease, ref, kind, budget } = operation;
-    const { clock, database, backoff } = this.options;
+    const { lease, kind, budget } = operation;
+    const { clock, database } = this.options;
     const admission = await budget.run(() =>
       database.admitProgressWrite({
         triggerRunId: lease.triggerRunId,
@@ -495,7 +498,6 @@ export class MessageWriter {
     )
       return {};
     const observedGen = current.compensationRequestedGen;
-    const sentAt = clock.now();
     let outcome: MutationOutcome;
     try {
       outcome = await budget.run(
@@ -504,8 +506,6 @@ export class MessageWriter {
       );
     } catch (error) {
       outcome = error instanceof OperationDeadline ? "timeout" : "transient";
-    } finally {
-      backoff.sent(ref.credential, sentAt);
     }
     try {
       return await this.record(operation, current, observedGen, outcome, secrets);
@@ -521,6 +521,12 @@ export class MessageWriter {
     provider: ProgressProvider,
     signal: AbortSignal,
   ): Promise<ProgressCall> {
+    const sentAt = this.options.clock.now();
+    this.options.backoff.sent(ref.credential, sentAt);
+    if (kind === "regular") {
+      this.recentRegularStarts.delete(lease.triggerRunId);
+      this.recentRegularStarts.set(lease.triggerRunId, sentAt);
+    }
     const pending =
       kind === "create" ? provider.create(ref, body, signal) : provider.edit(ref, body, signal);
     (this.options.lateWrites ?? lateWrites).observe(pending, this.options.clock, {
@@ -542,15 +548,27 @@ export class MessageWriter {
   ) {
     if (!uncertain(outcome)) return;
     const { kind, run } = operation;
-    const { clock, settings } = this.options;
     // A running message observes regular pacing. Finalization can still proceed after its own wait.
-    const notBefore =
-      kind === "regular"
-        ? new Date(
-            regularEditAt(current, clock.now(), run.createdAt.getTime(), settings.minEditSeconds),
-          )
-        : undefined;
+    const notBefore = kind === "regular" ? new Date(this.regularDue(current, run)) : undefined;
     await this.requestCompensation(current, notBefore);
+  }
+
+  private regularDue(row: RunProgressMessage, run: AcceptedTriggerRunRecord): number {
+    return regularEditAt(
+      row,
+      this.options.clock.now(),
+      run.createdAt.getTime(),
+      this.options.settings.minEditSeconds,
+      this.recentRegularStarts.get(row.triggerRunId),
+    );
+  }
+
+  private pruneRegularStarts(now: number): void {
+    const cutoff = now - Math.max(60_000, this.options.settings.minEditSeconds * 1000);
+    for (const [runId, startedAt] of this.recentRegularStarts) {
+      if (startedAt > cutoff) break;
+      this.recentRegularStarts.delete(runId);
+    }
   }
 
   private credentialRejected(lease: RunProgressMessage): Promise<WriteResult> {

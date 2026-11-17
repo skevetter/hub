@@ -1519,3 +1519,50 @@ it("evicts the oldest late-write observation at 256 entries", async () => {
   await clock.advanceTo(600_000);
   assert.equal(observers.size, 0);
 });
+
+it.each(["memory", "embedded Postgres"] as const)(
+  "paces local edits from the actual send after a delayed final read in %s",
+  async (backend) => {
+    const f = fixture(backend === "memory" ? undefined : await embedded());
+    const run = await f.seed();
+    const read = f.store.findRunProgressMessage.bind(f.store);
+    let delayNextRead = false;
+    f.provider.secrets = async () => {
+      if (f.clock.monotonic() === 20_000) delayNextRead = true;
+      return [];
+    };
+    vi.spyOn(f.store, "findRunProgressMessage").mockImplementation(async (...args) => {
+      if (delayNextRead) {
+        delayNextRead = false;
+        await new Promise<void>((resolve) => f.clock.timer(resolve, 5_000));
+      }
+      return read(...args);
+    });
+    f.provider.onWrite = (request, land) =>
+      request.time === 25_000 ? { status: "retry", notCreated: false, afterMs: 1 } : land();
+    f.start();
+    await f.clock.advanceTo(0);
+    await f.event(run.run, "tool_finished", 1);
+    await f.clock.advanceTo(20_000);
+    const reservedAt = f.clock.now();
+    assert.equal((await run.read())?.lastRegularAttemptAt?.getTime(), reservedAt);
+    assert.equal((await run.read())?.editCount, 1);
+    assert.equal(f.provider.requests.length, 1);
+
+    await f.clock.advanceTo(25_000);
+    assert.equal((await run.read())?.lastRegularAttemptAt?.getTime(), reservedAt);
+    await f.event(run.run, "tool_finished", 2);
+    await f.clock.advanceTo(44_999);
+    assert.deepEqual(
+      f.provider.requests.map(({ time }) => time),
+      [0, 25_000],
+    );
+    assert.equal((await run.read())?.editCount, 1);
+    await f.clock.advanceTo(45_000);
+    assert.deepEqual(
+      f.provider.requests.map(({ time }) => time),
+      [0, 25_000, 45_000],
+    );
+    assert.equal((await run.read())?.editCount, 2);
+  },
+);
