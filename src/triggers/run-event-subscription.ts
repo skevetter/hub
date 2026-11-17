@@ -206,7 +206,7 @@ export class RunEventSubscription {
   }
 }
 
-export function pollOmittedSteps(refresh: () => void) {
-  const timer = setInterval(refresh, 10_000);
+export function pollRunDetail(refresh: () => void) {
+  const timer = setInterval(refresh, 5_000);
   return () => clearInterval(timer);
 }

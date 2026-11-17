@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useSnapshotQuery } from "../queries/index.js";
 import { runEventsSnapshot } from "./functions.js";
 import type { RunEventPage } from "./run-events.js";
-import { pollOmittedSteps, RunEventSubscription } from "./run-event-subscription.js";
+import { pollRunDetail, RunEventSubscription } from "./run-event-subscription.js";
 
 export function runDetailKey(organizationSlug: string, runId: string) {
   return ["run-detail", organizationSlug, runId] as const;
@@ -21,16 +21,20 @@ export function useRunEvents({
   runId,
   after,
   initial,
-  stepCount,
 }: {
   organizationSlug: string;
   runId: string;
   after: number;
   initial: RunEventPage;
-  stepCount: number;
 }) {
   const queryClient = useQueryClient();
   const load = useServerFn(runEventsSnapshot);
+  const refreshDetail = useCallback(() => {
+    void queryClient.invalidateQueries(
+      { queryKey: runDetailKey(organizationSlug, runId) },
+      { cancelRefetch: false },
+    );
+  }, [queryClient, organizationSlug, runId]);
   const seed = useRef({ initial, after });
   seed.current = { initial, after };
   const subscription = useMemo(
@@ -41,11 +45,9 @@ export function useRunEvents({
         after: seed.current.after,
         source: (url) => new EventSource(url),
         probe: probeStream,
-        onSeal: () => {
-          void queryClient.invalidateQueries({ queryKey: runDetailKey(organizationSlug, runId) });
-        },
+        onSeal: refreshDetail,
       }),
-    [organizationSlug, runId, queryClient],
+    [organizationSlug, runId, refreshDetail],
   );
   const state = useSyncExternalStore(
     subscription.subscribe,
@@ -68,11 +70,11 @@ export function useRunEvents({
       subscription.acceptPage(page.data);
   }, [subscription, polling, page.status, page.data]);
   useEffect(() => {
-    if (state.status !== "running" || (state.stepRowsOmitted === 0 && stepCount <= 100))
-      return undefined;
-    return pollOmittedSteps(() => {
-      void queryClient.invalidateQueries({ queryKey: runDetailKey(organizationSlug, runId) });
-    });
-  }, [queryClient, organizationSlug, runId, state.status, state.stepRowsOmitted, stepCount]);
+    if (initial.status !== "running") return undefined;
+    return pollRunDetail(refreshDetail);
+  }, [initial.status, refreshDetail]);
+  useEffect(() => {
+    if (initial.status === "running" && state.status !== "running") refreshDetail();
+  }, [initial.status, state.status, refreshDetail]);
   return state;
 }

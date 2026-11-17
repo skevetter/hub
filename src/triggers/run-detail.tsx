@@ -70,7 +70,6 @@ function LiveRunDetail({
     runId: detail.run.id,
     after: detail.timeline.events.at(-1)?.seq ?? 0,
     initial: detail.timeline,
-    stepCount: detail.steps.length,
   });
   return <RunDetailView detail={detail} timeline={state} connection={state.connection} />;
 }

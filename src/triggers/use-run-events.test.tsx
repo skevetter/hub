@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, it, vi } from "vitest";
 import type * as ReactStart from "@tanstack/react-start";
 import {
   RunEventSubscription,
-  pollOmittedSteps,
+  pollRunDetail,
   type RunEventSource,
 } from "./run-event-subscription.js";
-import { useRunEvents } from "./use-run-events.js";
-import { emptyTimeline, runEvent } from "./test-utils/run-detail.js";
+import { runDetailKey, useRunEvents } from "./use-run-events.js";
+import { emptyTimeline, runDetailFixture, runEvent } from "./test-utils/run-detail.js";
 import { timelineRows } from "./run-timeline-view.js";
-import type { RunEventPage } from "./run-events.js";
+import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
+import { RunDetailView } from "./run-detail.js";
 vi.mock("@tanstack/react-start", async (importOriginal) => ({
   ...(await importOriginal<typeof ReactStart>()),
   useServerFn: (fn: unknown) => fn,
@@ -206,7 +207,7 @@ describe("run event subscription", () => {
     assert.equal(sources.length, 2);
   });
 
-  it("captures polling expiry and stored provenance and refreshes omitted steps every ten seconds", async () => {
+  it("captures polling expiry and stored provenance and refreshes persisted steps every five seconds", async () => {
     vi.useFakeTimers();
     const { subscription, seal } = fixture({ ...emptyTimeline, streamEnabled: false });
     subscription.acceptPage({
@@ -218,9 +219,9 @@ describe("run event subscription", () => {
     assert.equal(subscription.snapshot().origin, "derived");
     assert.equal(subscription.snapshot().stepRowsOmitted, 12);
     const refresh = vi.fn();
-    const stop = pollOmittedSteps(refresh);
+    const stop = pollRunDetail(refresh);
     await vi.advanceTimersByTimeAsync(20000);
-    assert.equal(refresh.mock.calls.length, 2);
+    assert.equal(refresh.mock.calls.length, 4);
     stop();
     subscription.acceptPage({ ...emptyTimeline, expired: true, events: [], origin: "captured" });
     assert.equal(subscription.snapshot().origin, "captured");
@@ -242,6 +243,63 @@ describe("run event subscription", () => {
     subscription.stop();
   });
 
+  it("refreshes completed persisted step output with capture and streaming off, then stops", async () => {
+    vi.useFakeTimers();
+    const initial = {
+      ...runDetailFixture,
+      timeline: { ...emptyTimeline, timelineEnabled: false, streamEnabled: false },
+    };
+    const completed = {
+      ...initial,
+      run: {
+        ...initial.run,
+        status: "succeeded" as const,
+        completedAt: "2026-11-16T10:00:30.000Z",
+      },
+      timeline: { ...initial.timeline, status: "succeeded" },
+      steps: initial.steps.map((step) =>
+        Object.assign({}, step, {
+          status: "succeeded" as const,
+          completedAt: "2026-11-16T10:00:30.000Z",
+          output: "persisted-step-result",
+        }),
+      ),
+    };
+    const client = new QueryClient();
+    const queryKey = runDetailKey("acme", initial.run.id);
+    const load = vi.fn(async () => completed);
+    const observer = new QueryObserver<RunDetailSnapshot>(client, {
+      queryKey,
+      queryFn: load,
+      initialData: initial,
+      staleTime: Infinity,
+    });
+    let stop: () => void = () => undefined;
+    const unsubscribe = observer.subscribe((result) => {
+      if (result.data?.run.status !== "running") stop();
+    });
+    stop = pollRunDetail(() => {
+      void client.invalidateQueries({ queryKey }, { cancelRefetch: false });
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(4999);
+      assert.equal(observer.getCurrentResult().data?.run.status, "running");
+      await vi.advanceTimersByTimeAsync(1);
+      const latest = observer.getCurrentResult().data;
+      assert.ok(latest);
+      const markup = renderToStaticMarkup(<RunDetailView detail={latest} />);
+      assert.match(markup, /Succeeded/u);
+      assert.match(markup, /persisted-step-result/u);
+      assert.doesNotMatch(markup, /Not run|No output/u);
+      await vi.advanceTimersByTimeAsync(15000);
+      assert.equal(load.mock.calls.length, 1);
+    } finally {
+      stop();
+      unsubscribe();
+      client.clear();
+    }
+  });
+
   it("never constructs EventSource during server rendering", () => {
     const createSource = vi.fn(() => {
       throw new Error("source created during SSR");
@@ -254,7 +312,6 @@ describe("run event subscription", () => {
         runId: "run",
         after: 0,
         initial: emptyTimeline,
-        stepCount: 101,
       });
       return <span>{state.connection}</span>;
     }
