@@ -10,7 +10,13 @@ import {
   type ProgressProvider,
   type ProgressStore,
 } from "./types.js";
-import { MessageWriter, SWEEP_MS, type MessageScope, repairAt } from "./writer.js";
+import {
+  MessageWriter,
+  SWEEP_MS,
+  type LateWriteObservers,
+  type MessageScope,
+  repairAt,
+} from "./writer.js";
 
 export type { ProgressProvider } from "./types.js";
 
@@ -22,6 +28,7 @@ interface ProgressReporterOptions {
   providers: readonly ProgressProvider[];
   settings: Pick<RunProgressSettings, "minEditSeconds" | "maxEdits" | "retentionDays">;
   clock?: ProgressClock;
+  lateWrites?: LateWriteObservers | undefined;
   random?: () => number;
   publicBaseUrl?: string | undefined;
   reportFailure?: (code: string, scope?: MessageScope) => void;

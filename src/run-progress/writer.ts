@@ -27,7 +27,59 @@ const FINAL_RETRY_MS = [5_000, 15_000, 45_000, 120_000, 300_000];
 const FINAL_WINDOW_MS = 6 * 60 * 60_000;
 const REGULAR_FAILURE_LIMIT = 8;
 const REGULAR_TIMEOUT_WAIT_MS = 2_000;
-const providerWrites = new Set<Promise<ProgressCall>>();
+const LATE_WRITE_LIFETIME_MS = 600_000;
+const MAX_LATE_WRITE_OBSERVERS = 256;
+
+interface LateWriteObserver {
+  signal: AbortSignal;
+  repair: () => Promise<unknown>;
+  report: () => void;
+  cancel: () => void;
+}
+
+export class LateWriteObservers {
+  private readonly pending = new Map<symbol, LateWriteObserver>();
+
+  get size(): number {
+    return this.pending.size;
+  }
+
+  observe(
+    write: Promise<ProgressCall>,
+    clock: ProgressClock,
+    observation: Omit<LateWriteObserver, "cancel">,
+  ): void {
+    const ticket = Symbol();
+    const oldest = this.pending.keys().next().value;
+    if (this.size === MAX_LATE_WRITE_OBSERVERS && oldest !== undefined) this.drop(oldest);
+    const cancel = clock.timer(() => this.drop(ticket), LATE_WRITE_LIFETIME_MS);
+    this.pending.set(ticket, { ...observation, cancel });
+    // The promise retains only the ticket when the observation expires or is evicted.
+    void write.then(
+      ({ status }) => this.complete(ticket, status === "ok"),
+      () => this.drop(ticket),
+    );
+  }
+
+  private drop(ticket: symbol): LateWriteObserver | undefined {
+    const observer = this.pending.get(ticket);
+    this.pending.delete(ticket);
+    observer?.cancel();
+    return observer;
+  }
+
+  private async complete(ticket: symbol, succeeded: boolean): Promise<void> {
+    const observer = this.drop(ticket);
+    if (!succeeded || !observer?.signal.aborted) return;
+    try {
+      await observer.repair();
+    } catch {
+      observer.report();
+    }
+  }
+}
+
+const lateWrites = new LateWriteObservers();
 
 export type MessageScope = Pick<RunProgressMessage, "triggerRunId" | "organizationId">;
 type Patch = UpdateRunProgressMessageInput["patch"];
@@ -45,6 +97,7 @@ interface WriterOptions {
   clock: ProgressClock;
   settings: Pick<RunProgressSettings, "minEditSeconds" | "maxEdits" | "retentionDays">;
   backoff: CredentialBackoff;
+  lateWrites?: LateWriteObservers | undefined;
   publicBaseUrl?: string | undefined;
   report: Report;
   signal: AbortSignal;
@@ -468,20 +521,11 @@ export class MessageWriter {
   ): Promise<ProgressCall> {
     const pending =
       kind === "create" ? provider.create(ref, body, signal) : provider.edit(ref, body, signal);
-    providerWrites.add(pending);
-    // A provider can finish a write after Hub stops waiting for it.
-    void pending
-      .then(
-        (outcome) => {
-          providerWrites.delete(pending);
-          if (signal.aborted && outcome.status === "ok") return this.requestCompensation(lease);
-          return undefined;
-        },
-        () => {
-          providerWrites.delete(pending);
-        },
-      )
-      .catch(() => this.options.report("late_repair_request_failed", lease));
+    (this.options.lateWrites ?? lateWrites).observe(pending, this.options.clock, {
+      signal,
+      repair: () => this.requestCompensation(lease),
+      report: () => this.options.report("late_repair_request_failed", lease),
+    });
     return pending;
   }
 

@@ -26,7 +26,7 @@ import { RunTimelineBus } from "../run-timeline/bus.js";
 import type { RunTimelineEvent } from "../run-timeline/store.js";
 import { ProgressReporter } from "./index.js";
 import { CredentialBackoff } from "./backoff.js";
-import { MessageWriter } from "./writer.js";
+import { LateWriteObservers, MessageWriter } from "./writer.js";
 import type { ProgressCall, ProgressClock, ProgressProvider, StoredRef } from "./types.js";
 
 const ORGANIZATION = "org-progress";
@@ -189,10 +189,16 @@ function fixture(database?: Database, drain?: () => Promise<void>) {
   const bus = new RunTimelineBus();
   const provider = new FakeProvider(clock);
   const failures: string[] = [];
-  const start = (maxEdits = 120, localBus = bus, localStore = store) => {
+  const start = (
+    maxEdits = 120,
+    localBus = bus,
+    localStore = store,
+    lateWrites?: LateWriteObservers,
+  ) => {
     const reporter = new ProgressReporter({
       database: localStore,
       bus: localBus,
+      lateWrites,
       providers: [provider],
       clock,
       random: () => 0.5,
@@ -1419,4 +1425,67 @@ it("shares a 65-second Retry-After between memory writers on distinct runs", asy
   );
   assert.equal(f.provider.requests.at(-1)?.ref["commentId"], "memory sibling");
   assert.equal((await second.read())?.editCount, 1);
+});
+
+it("bounds the lifetime of never-settling edits after the reporter stops", async () => {
+  const f = fixture();
+  const observers = new LateWriteObservers();
+  const runs = [];
+  const signals: AbortSignal[] = [];
+  for (let index = 0; index < 64; index += 1) {
+    runs.push(
+      await f.seed({
+        state: "active",
+        reference: {
+          ...REFERENCE,
+          credential: {
+            kind: "linear-organization",
+            linearOrganizationId: String(index),
+          },
+        },
+      }),
+    );
+  }
+  f.provider.onWrite = (_request, _land, signal) => {
+    signals.push(signal);
+    return new Promise(() => {});
+  };
+  const reporter = f.start(120, f.bus, f.store, observers);
+  await f.clock.advanceTo(0);
+  for (const { run } of runs) await f.event(run, "tool_finished", 1);
+  await f.clock.advanceTo(150_000);
+  assert.equal(signals.length, 64);
+  assert.equal(observers.size, 64);
+  reporter.stop();
+  assert.ok(signals.every((signal) => signal.aborted));
+  await f.clock.advanceTo(451_000);
+  assert.equal(f.provider.requests.length, 64);
+  assert.ok(observers.size <= 256);
+  await f.clock.advanceTo(750_000);
+  assert.equal(observers.size, 0);
+});
+
+it("evicts the oldest late-write observation at 256 entries", async () => {
+  const clock = new FakeClock();
+  const observers = new LateWriteObservers();
+  const observations = [];
+  const repairs: number[] = [];
+  for (let index = 0; index < 260; index += 1) {
+    const write = Promise.withResolvers<ProgressCall>();
+    observers.observe(write.promise, clock, {
+      signal: AbortSignal.abort(),
+      repair: async () => {
+        repairs.push(index);
+      },
+      report: () => assert.fail("unexpected repair error"),
+    });
+    observations.push(write);
+  }
+  assert.equal(observers.size, 256);
+  for (const index of [0, 3, 4, 259]) observations[index]!.resolve({ status: "ok" });
+  await clock.advanceTo(0);
+  assert.deepEqual(repairs, [4, 259]);
+  assert.equal(observers.size, 254);
+  await clock.advanceTo(600_000);
+  assert.equal(observers.size, 0);
 });
