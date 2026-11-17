@@ -179,7 +179,12 @@ class PgDatabase implements Database {
   listRunProgressMessagesToFinish: RunTimelineStore["listRunProgressMessagesToFinish"] = (
     now,
     limit,
-  ) => this.timeline.listRunProgressMessagesToFinish(now, limit);
+    settleThrough,
+  ) => this.timeline.listRunProgressMessagesToFinish(now, limit, settleThrough);
+  listOpenRunProgressMessages: RunTimelineStore["listOpenRunProgressMessages"] = (
+    afterRunId,
+    limit,
+  ) => this.timeline.listOpenRunProgressMessages(afterRunId, limit);
   requestCompensation: RunTimelineStore["requestCompensation"] = (
     organizationId,
     runId,

@@ -81,6 +81,11 @@ export interface RunProgressMessage {
   lastRenderedHash: string | null;
   lastEditAt: Date | null;
   editCount: number;
+  failedEdits: number;
+  finalFailures: number;
+  retryAt: Date | null;
+  settleAt: Date | null;
+  repeatFinal: boolean;
   visibility: "public" | "private" | "unknown" | null;
   visibilityCheckedAt: Date | null;
   failure: string | null;
@@ -113,6 +118,11 @@ export interface UpdateRunProgressMessageInput extends RunProgressLeaseInput {
       | "lastRenderedHash"
       | "lastEditAt"
       | "editCount"
+      | "failedEdits"
+      | "finalFailures"
+      | "retryAt"
+      | "settleAt"
+      | "repeatFinal"
       | "visibility"
       | "visibilityCheckedAt"
       | "failure"
@@ -170,7 +180,15 @@ export interface RunTimelineStore {
   updateRunProgressMessage(
     input: UpdateRunProgressMessageInput,
   ): Promise<RunProgressMessage | undefined>;
-  listRunProgressMessagesToFinish(now: Date, limit: number): Promise<RunProgressMessage[]>;
+  listRunProgressMessagesToFinish(
+    now: Date,
+    limit: number,
+    settleThrough?: Date,
+  ): Promise<RunProgressMessage[]>;
+  listOpenRunProgressMessages(
+    afterRunId: string | null,
+    limit: number,
+  ): Promise<RunProgressMessage[]>;
   requestCompensation(
     organizationId: string,
     runId: string,

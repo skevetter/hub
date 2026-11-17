@@ -609,6 +609,11 @@ export const runProgressMessages = pgTable(
     lastRenderedHash: text("last_rendered_hash"),
     lastEditAt: timestamp("last_edit_at", { withTimezone: true }),
     editCount: integer("edit_count").notNull().default(0),
+    failedEdits: integer("failed_edits").notNull().default(0),
+    finalFailures: integer("final_failures").notNull().default(0),
+    retryAt: timestamp("retry_at", { withTimezone: true }),
+    settleAt: timestamp("settle_at", { withTimezone: true }),
+    repeatFinal: boolean("repeat_final").notNull().default(false),
     visibility: text().$type<"public" | "private" | "unknown">(),
     visibilityCheckedAt: timestamp("visibility_checked_at", { withTimezone: true }),
     failure: text(),
@@ -640,6 +645,9 @@ export const runProgressMessages = pgTable(
       "run_progress_messages_generation_check",
       sql`${table.compensationRequestedGen} >= ${table.compensationDoneGen} and ${table.compensationDoneGen} >= 0`,
     ),
+    index("run_progress_messages_settle_idx")
+      .on(table.settleAt)
+      .where(sql`${table.settleAt} is not null`),
     index("run_progress_messages_sweep_idx").on(table.state, table.leaseExpiresAt),
   ],
 );

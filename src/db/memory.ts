@@ -639,6 +639,11 @@ class MemoryDatabase implements Database {
       lastRenderedHash: null,
       lastEditAt: null,
       editCount: 0,
+      failedEdits: 0,
+      finalFailures: 0,
+      retryAt: null,
+      settleAt: null,
+      repeatFinal: false,
       visibility: null,
       visibilityCheckedAt: null,
       failure: null,
@@ -702,6 +707,11 @@ class MemoryDatabase implements Database {
       "lastRenderedHash",
       "lastEditAt",
       "editCount",
+      "failedEdits",
+      "finalFailures",
+      "retryAt",
+      "settleAt",
+      "repeatFinal",
       "visibility",
       "visibilityCheckedAt",
       "failure",
@@ -719,7 +729,27 @@ class MemoryDatabase implements Database {
     return structuredClone(message);
   }
 
-  async listRunProgressMessagesToFinish(now: Date, limit: number): Promise<RunProgressMessage[]> {
+  async listOpenRunProgressMessages(
+    afterRunId: string | null,
+    limit: number,
+  ): Promise<RunProgressMessage[]> {
+    return structuredClone(
+      [...this.runProgressMessages.values()]
+        .filter(
+          (row) =>
+            (afterRunId === null || row.triggerRunId > afterRunId) &&
+            (["pending", "active"].includes(row.state) || row.settleAt !== null),
+        )
+        .sort((left, right) => left.triggerRunId.localeCompare(right.triggerRunId))
+        .slice(0, limit),
+    );
+  }
+
+  async listRunProgressMessagesToFinish(
+    now: Date,
+    limit: number,
+    settleThrough = now,
+  ): Promise<RunProgressMessage[]> {
     return structuredClone(
       [...this.runProgressMessages.values()]
         .filter((message) => {
@@ -731,7 +761,9 @@ class MemoryDatabase implements Database {
           )
             return false;
           const terminal = run.status !== "running";
+          if (this.progressMessageNeedsSettle(message, settleThrough)) return true;
           if (this.progressMessageNeedsRepair(message, now)) return true;
+          if (message.retryAt !== null && message.retryAt > now) return false;
           if (message.state === "active" && terminal) return true;
           if (message.state !== "pending") return false;
           if (
@@ -753,6 +785,15 @@ class MemoryDatabase implements Database {
     );
   }
 
+  private progressMessageNeedsSettle(message: RunProgressMessage, through: Date): boolean {
+    return (
+      message.state === "finished" &&
+      message.settleAt !== null &&
+      message.settleAt <= through &&
+      (message.retryAt === null || message.retryAt <= through)
+    );
+  }
+
   private progressMessageNeedsRepair(message: RunProgressMessage, now: Date): boolean {
     const expiredLease =
       message.leaseOwner !== null &&
@@ -761,6 +802,7 @@ class MemoryDatabase implements Database {
     if ((message.state === "creating" || message.state === "active") && expiredLease) return true;
     return (
       (message.state === "active" || message.state === "finished") &&
+      (message.retryAt === null || message.retryAt <= now) &&
       message.compensationRequestedGen > message.compensationDoneGen &&
       (message.compensationNotBefore === null || message.compensationNotBefore <= now)
     );

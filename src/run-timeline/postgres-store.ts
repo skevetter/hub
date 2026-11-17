@@ -30,7 +30,8 @@ const EVENT = `trigger_run_id as "triggerRunId", organization_id as "organizatio
 const MESSAGE = `trigger_run_id as "triggerRunId", organization_id as "organizationId", provider, state,
  external_ref as "externalRef", version, lease_owner as "leaseOwner", lease_expires_at as "leaseExpiresAt",
  last_rendered_hash as "lastRenderedHash", last_edit_at as "lastEditAt", edit_count as "editCount",
- visibility, visibility_checked_at as "visibilityCheckedAt", failure,
+ failed_edits as "failedEdits", final_failures as "finalFailures", retry_at as "retryAt",
+ settle_at as "settleAt", repeat_final as "repeatFinal", visibility, visibility_checked_at as "visibilityCheckedAt", failure,
  compensation_requested_gen as "compensationRequestedGen", compensation_done_gen as "compensationDoneGen",
  compensation_not_before as "compensationNotBefore", created_at as "createdAt", updated_at as "updatedAt"`;
 
@@ -364,28 +365,11 @@ export class RunTimelineRepository {
   async updateRunProgressMessage(
     input: UpdateRunProgressMessageInput,
   ): Promise<RunProgressMessage | undefined> {
-    const {
-      state,
-      externalRef,
-      lastRenderedHash,
-      lastEditAt,
-      editCount,
-      visibility,
-      visibilityCheckedAt,
-      failure,
-    } = input.patch;
     const result = await this.runtime
       .drizzle()
       .update(runProgressMessages)
       .set({
-        state,
-        externalRef,
-        lastRenderedHash,
-        lastEditAt,
-        editCount,
-        visibility,
-        visibilityCheckedAt,
-        failure,
+        ...input.patch,
         updatedAt: input.now,
         ...(input.releaseLease === false ? {} : { leaseOwner: null, leaseExpiresAt: null }),
       })
@@ -402,7 +386,25 @@ export class RunTimelineRepository {
     return result[0];
   }
 
-  async listRunProgressMessagesToFinish(now: Date, limit: number): Promise<RunProgressMessage[]> {
+  async listOpenRunProgressMessages(
+    afterRunId: string | null,
+    limit: number,
+  ): Promise<RunProgressMessage[]> {
+    return (
+      await this.runtime.query<Row<RunProgressMessage>>(
+        `select ${MESSAGE} from run_progress_messages
+         where ($1::uuid is null or trigger_run_id > $1) and (state in ('pending', 'active') or settle_at is not null)
+         order by trigger_run_id limit $2`,
+        [afterRunId, limit],
+      )
+    ).rows;
+  }
+
+  async listRunProgressMessagesToFinish(
+    now: Date,
+    limit: number,
+    settleThrough = now,
+  ): Promise<RunProgressMessage[]> {
     return (
       await this.runtime.query<Row<RunProgressMessage>>(
         `select ${MESSAGE.split(",")
@@ -410,12 +412,14 @@ export class RunTimelineRepository {
           .join(",")} from run_progress_messages message
       join trigger_runs run on run.id = message.trigger_run_id
       where (message.state in ('creating','active') and message.lease_owner is not null and message.lease_expires_at <= $1)
-        or (message.state in ('active','finished') and message.compensation_requested_gen > message.compensation_done_gen and (message.compensation_not_before is null or message.compensation_not_before <= $1))
-        or (message.state in ('pending','active') and run.status <> 'running')
-        or (message.state = 'pending' and (exists(select 1 from run_timeline_events event where event.trigger_run_id = run.id and event.kind = 'run_started')
-          or exists(select 1 from workflow_step_runs step where step.trigger_run_id = run.id and step.started_at is not null)))
+        or (message.state = 'finished' and message.settle_at <= $3 and (message.retry_at is null or message.retry_at <= $3))
+        or ((message.retry_at is null or message.retry_at <= $1) and (
+          (message.state in ('active','finished') and message.compensation_requested_gen > message.compensation_done_gen and (message.compensation_not_before is null or message.compensation_not_before <= $1))
+          or (message.state in ('pending','active') and run.status <> 'running')
+          or (message.state = 'pending' and (exists(select 1 from run_timeline_events event where event.trigger_run_id = run.id and event.kind = 'run_started')
+            or exists(select 1 from workflow_step_runs step where step.trigger_run_id = run.id and step.started_at is not null)))))
       order by message.updated_at, message.trigger_run_id limit $2`,
-        [now, limit],
+        [now, limit, settleThrough],
       )
     ).rows;
   }
