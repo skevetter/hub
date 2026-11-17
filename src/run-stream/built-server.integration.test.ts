@@ -5,12 +5,15 @@ import { readFile } from "node:fs/promises";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { setImmediate } from "node:timers/promises";
 import { afterAll, afterEach, beforeAll, describe, it } from "vitest";
-import { createApplicationRuntime } from "../application-runtime.js";
 import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
 import { createFetchServer } from "../http/node-server.js";
-import { loadBuiltStartServer, type BuiltStartServer } from "../server/build.js";
+import type { BuiltStartServer } from "../server/build.js";
 import type { ApplicationRuntime } from "../server/runtime.js";
 import { createStreamHarness, settings, StreamReader, type StreamHarness } from "./test-utils.js";
+import {
+  loadCompiledStreamRuntime,
+  type CompiledStreamRuntime,
+} from "./test-utils/compiled-runtime.js";
 
 async function runClient(command: string, args: string[], environment: Record<string, string>) {
   const child = spawn(command, args, {
@@ -41,6 +44,7 @@ async function runClient(command: string, args: string[], environment: Record<st
 describe("built run event route and documented clients", () => {
   let harness: StreamHarness;
   let build: BuiltStartServer;
+  let compiled: CompiledStreamRuntime;
   let application: ApplicationRuntime;
   let server: Server;
   let baseUrl: string;
@@ -58,9 +62,10 @@ describe("built run event route and documented clients", () => {
   }
   beforeAll(async () => {
     harness = await createStreamHarness("embedded");
-    build = await loadBuiltStartServer();
+    compiled = await loadCompiledStreamRuntime();
+    build = compiled.build;
     application = await build.startApplication(() =>
-      createApplicationRuntime({
+      compiled.createApplicationRuntime({
         database: harness.database,
         auth: harness.auth,
         entitlements: createUnlimitedEntitlementsService(),
@@ -129,6 +134,7 @@ describe("built run event route and documented clients", () => {
     }
     await build?.stopProductionRuntime();
     await harness?.close();
+    await compiled?.remove();
   }, 120_000);
 
   it("serves the file route through the compiled router with actual runtime resource counts", async () => {
