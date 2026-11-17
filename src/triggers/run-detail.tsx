@@ -3,6 +3,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
 import { FailureAlert, NoticeAlert } from "../components/app/failure-alert.js";
 import { FollowBottom } from "../components/app/follow-bottom.js";
+import { Duration } from "../components/app/duration.js";
 import { PageHeader } from "../components/app/page.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
@@ -155,9 +156,7 @@ function runSummaryRows(
     run.createdAt,
   );
   const durationMs =
-    typeof finished?.data["durationMs"] === "number"
-      ? finished.data["durationMs"]
-      : Math.max(0, Date.parse(completedAt ?? new Date().toISOString()) - Date.parse(startedAt));
+    typeof finished?.data["durationMs"] === "number" ? finished.data["durationMs"] : null;
   return [
     {
       label: "Status",
@@ -178,7 +177,17 @@ function runSummaryRows(
       ),
     },
     { label: "Started", value: <RelativeTime value={startedAt} /> },
-    { label: "Duration", value: `${String(Math.floor(durationMs / 1000))}s` },
+    {
+      label: "Duration",
+      value: (
+        <Duration
+          startedAt={startedAt}
+          completedAt={completedAt}
+          durationMs={durationMs}
+          running={status === "running"}
+        />
+      ),
+    },
     { label: "Activity", value: activityCounts(rows) },
     { label: "Progress message", value: progressMessageLabel(detail) },
     ...(run.webhookSummary?.prompt === undefined
