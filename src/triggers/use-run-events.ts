@@ -56,7 +56,7 @@ export function useRunEvents({
   );
   useEffect(() => subscription.start(), [subscription]);
   useEffect(() => {
-    subscription.acceptPage(initial);
+    subscription.acceptSnapshot(initial);
   }, [subscription, initial]);
   const polling = state.connection === "Polling";
   const page = useSnapshotQuery({

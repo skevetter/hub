@@ -80,6 +80,8 @@ Any organization member can open a run from Activity. The page combines the stor
 
 Live connections use same-origin cookies. After three consecutive connection failures or a disabled stream response, timeline events are polled every five seconds until the stored seal is read or the timeline expires. Separately, persisted run and step details refresh every five seconds while the persisted run is running, even when capture is off. A terminal live status requests the final persisted results. This single detail refresh loop also covers omitted step rows and runs with more than 100 steps without duplicate timers. Reading the seal still refreshes persisted results.
 
+The server marks a timeline unavailable only when capture is off and both the state row and returned event page are absent. Once final persisted results are loaded for such a terminal run, event polling also stops. Retained captured or derived timelines still require their seal or expiry, even if capture has since been turned off.
+
 Derived timelines show only persisted lifecycle events and say that no tool events were recorded. Expired timelines show no event rows. Pending steps left after a run ends read as Not run. Timeline text is plain text without Markdown or automatic links. The Progress message row describes the disabled Hub setting in this build. It does not imply a provider message was posted.
 
 Running durations use human units and update only while the tab is visible. Updates range from one second for short runs to thirty seconds for runs lasting hours. Terminal durations are static. Long trigger names remain contained in the header. An unavailable run includes a Back to activity link.

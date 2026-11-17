@@ -243,6 +243,8 @@ export class TriggerDashboard {
       ...timelineSummary(state),
       expired,
       timelineEnabled: settings.runTimelineEnabled,
+      timelineUnavailable:
+        !settings.runTimelineEnabled && state === undefined && events.length === 0,
       streamEnabled: settings.runStreamEnabled,
       retentionDays,
     };

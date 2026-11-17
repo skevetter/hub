@@ -34,11 +34,16 @@ export class RunEventSubscription {
   private probe: AbortController | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private sealNotified = false;
+  private persistedTerminal: boolean;
 
   constructor(private readonly options: RunEventSubscriptionOptions) {
     const events = options.initial.expired ? [] : mergeRunEvents([], options.initial.events);
     const lastSeq = Math.max(options.after, events.at(-1)?.seq ?? 0);
-    const complete = options.initial.expired || timelineRead(lastSeq, options.initial.sealedSeq);
+    this.persistedTerminal = options.initial.status !== "running";
+    const complete =
+      options.initial.expired ||
+      timelineRead(lastSeq, options.initial.sealedSeq) ||
+      (options.initial.timelineUnavailable && this.persistedTerminal);
     const connection = options.initial.streamEnabled ? "Reconnecting" : "Polling";
     this.sealNotified = complete;
     this.state = {
@@ -70,6 +75,11 @@ export class RunEventSubscription {
     clearTimeout(this.reconnectTimer);
   }
 
+  acceptSnapshot(page: RunEventPage) {
+    this.persistedTerminal ||= page.status !== "running";
+    this.acceptPage(page);
+  }
+
   acceptPage(page: RunEventPage) {
     if (this.stopped) return;
     const expired = this.state.expired || page.expired;
@@ -93,14 +103,20 @@ export class RunEventSubscription {
   }
 
   private finishIfRead() {
-    if (!this.state.expired && !timelineRead(this.state.lastSeq, this.state.sealedSeq))
+    const unavailable =
+      this.state.timelineUnavailable && this.persistedTerminal && this.state.status !== "running";
+    if (
+      !this.state.expired &&
+      !timelineRead(this.state.lastSeq, this.state.sealedSeq) &&
+      !unavailable
+    )
       return false;
     this.source?.close();
     this.source = undefined;
     this.probe?.abort();
     clearTimeout(this.reconnectTimer);
     if (this.state.connection !== null) this.update({ ...this.state, connection: null });
-    if (!this.sealNotified) {
+    if (!this.sealNotified && !unavailable) {
       this.sealNotified = true;
       this.options.onSeal();
     }

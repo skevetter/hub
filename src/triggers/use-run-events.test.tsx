@@ -243,6 +243,68 @@ describe("run event subscription", () => {
     subscription.stop();
   });
 
+  it("waits for final persisted results before closing an unavailable timeline", () => {
+    const initial = {
+      ...emptyTimeline,
+      timelineEnabled: false,
+      timelineUnavailable: true,
+      streamEnabled: false,
+      origin: null,
+    };
+    const { subscription, sources, seal } = fixture(initial);
+    const terminal = { ...initial, status: "succeeded" };
+    subscription.acceptPage(terminal);
+    assert.equal(subscription.snapshot().connection, "Polling");
+    subscription.acceptSnapshot(terminal);
+    assert.equal(subscription.snapshot().connection, null);
+    assert.equal(sources.length, 0);
+    assert.equal(seal.mock.calls.length, 0);
+    subscription.stop();
+  });
+
+  it("opens an already completed unavailable timeline without an event source or poll", () => {
+    const { subscription, sources, seal } = fixture({
+      ...emptyTimeline,
+      status: "succeeded",
+      timelineEnabled: false,
+      timelineUnavailable: true,
+      streamEnabled: false,
+      origin: null,
+    });
+    assert.equal(subscription.snapshot().connection, null);
+    assert.equal(sources.length, 0);
+    assert.equal(seal.mock.calls.length, 0);
+    subscription.stop();
+  });
+
+  it("reads retained capture-off rows through their seal before closing", () => {
+    const initial = {
+      ...emptyTimeline,
+      status: "failed",
+      timelineEnabled: false,
+      streamEnabled: false,
+      sealedSeq: 3,
+      events: [runEvent(1, "run_started")],
+    };
+    const { subscription, seal } = fixture(initial);
+    subscription.acceptPage({
+      ...initial,
+      events: [runEvent(2, "step_finished", { status: "failed" })],
+    });
+    assert.equal(subscription.snapshot().connection, "Polling");
+    subscription.acceptPage({
+      ...initial,
+      events: [runEvent(3, "run_finished", { status: "failed" })],
+    });
+    assert.equal(subscription.snapshot().connection, null);
+    assert.deepEqual(
+      subscription.snapshot().events.map((event) => event.seq),
+      [1, 2, 3],
+    );
+    assert.equal(seal.mock.calls.length, 1);
+    subscription.stop();
+  });
+
   it("refreshes completed persisted step output with capture and streaming off, then stops", async () => {
     vi.useFakeTimers();
     const initial = {

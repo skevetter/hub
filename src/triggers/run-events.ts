@@ -36,6 +36,7 @@ export interface RunEventPage {
   origin: "captured" | "derived" | null;
   expired: boolean;
   timelineEnabled: boolean;
+  timelineUnavailable: boolean;
   streamEnabled: boolean;
   retentionDays: number;
   droppedCount: number;

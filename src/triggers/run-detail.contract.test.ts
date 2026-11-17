@@ -179,6 +179,41 @@ for (const backend of ["memory", "embedded"] as const)
       assert.equal(sealed?.events[0]?.kind, "run_finished");
     });
 
+    it("distinguishes unavailable capture-off timelines from retained and reconcilable rows", async () => {
+      const run = await createRun();
+      const reader = new TriggerDashboard(database, auth, acceptingAgentValidator(), {
+        now: () => NOW,
+        runProgress: readRunProgressSettings({}),
+      });
+      assert.equal(
+        (await dashboard.runEvents(request, "one", run.id, 0))?.timelineUnavailable,
+        false,
+      );
+      assert.equal(
+        (await reader.runDetail(request, "one", run.id))?.timeline.timelineUnavailable,
+        true,
+      );
+      await database.failWorkflowRun(run.id, "failed", "synthetic failure");
+      assert.equal((await reader.runEvents(request, "one", run.id, 0))?.timelineUnavailable, true);
+      for (let index = 0; index < 103; index += 1) {
+        await database.appendRunTimelineEvent({
+          organizationId: "one",
+          triggerRunId: run.id,
+          kind: "turn_started",
+          at: NOW,
+          data: {},
+          origin: "captured",
+        });
+      }
+      const retained = await reader.runEvents(request, "one", run.id, 100);
+      assert.equal(retained?.timelineUnavailable, false);
+      assert.deepEqual(
+        retained?.events.map((event) => event.seq),
+        [101, 102, 103],
+      );
+      assert.equal(retained?.sealedSeq, null);
+    });
+
     it("keeps expired tombstones empty and does not invoke reconciliation", async () => {
       const run = await createRun();
       await database.appendRunTimelineEvent({

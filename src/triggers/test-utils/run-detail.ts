@@ -8,6 +8,7 @@ export const emptyTimeline: RunEventPage = {
   origin: "captured",
   expired: false,
   timelineEnabled: true,
+  timelineUnavailable: false,
   streamEnabled: true,
   retentionDays: 30,
   droppedCount: 0,
