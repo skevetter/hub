@@ -203,8 +203,8 @@ export class RunStream {
         (this.options.logger ?? logger).info(
           {
             operation: "run.stream.closed",
-            credentialKind: access.kind,
-            credentialId: access.credentialId,
+            authKind: access.kind,
+            authSubjectId: access.credentialId,
             triggerRunId: runId,
             reason,
             durationMs,
