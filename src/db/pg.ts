@@ -176,6 +176,8 @@ class PgDatabase implements Database {
     this.timeline.acquireRunProgressLease(input);
   updateRunProgressMessage: RunTimelineStore["updateRunProgressMessage"] = (input) =>
     this.timeline.updateRunProgressMessage(input);
+  admitProgressWrite: RunTimelineStore["admitProgressWrite"] = (input) =>
+    this.timeline.admitProgressWrite(input);
   readProgressCredentialCooldown: RunTimelineStore["readProgressCredentialCooldown"] = (key) =>
     this.timeline.readProgressCredentialCooldown(key);
   recordProgressCredentialCooldown: RunTimelineStore["recordProgressCredentialCooldown"] = (
@@ -243,7 +245,7 @@ class PgDatabase implements Database {
     private readonly locks: Locks,
   ) {
     this.schedules = new ScheduleRepository(this.pool);
-    this.timeline = new RunTimelineRepository(this.pool);
+    this.timeline = new RunTimelineRepository(this.pool, locks);
     this.githubNotifications = new GitHubNotificationRepository(this.pool, locks);
     this.executionAuthority = new ExecutionAuthorityRepository(this.pool);
     this.connections = new ConnectionRepository(this.pool, locks);

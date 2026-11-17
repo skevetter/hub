@@ -123,8 +123,10 @@ import {
   timelineDedupeKey,
   timelineStepId,
 } from "../run-timeline/data.js";
-import { timelineAccountingBatchId } from "../run-timeline/store.js";
+import { progressCooldownDecision, timelineAccountingBatchId } from "../run-timeline/store.js";
 import type {
+  AdmitProgressWriteInput,
+  ProgressWriteAdmission,
   AppendRunTimelineEventInput,
   AppendRunTimelineEventResult,
   InsertRunProgressMessageInput,
@@ -702,16 +704,8 @@ class MemoryDatabase implements Database {
   async updateRunProgressMessage(
     input: UpdateRunProgressMessageInput,
   ): Promise<RunProgressMessage | undefined> {
-    const message = this.runProgressMessages.get(input.triggerRunId);
-    if (
-      message?.organizationId !== input.organizationId ||
-      this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
-      message.leaseOwner !== input.owner ||
-      message.version !== input.version ||
-      message.leaseExpiresAt === null ||
-      message.leaseExpiresAt <= input.now
-    )
-      return undefined;
+    const message = this.leasedProgressMessage(input);
+    if (message === undefined) return undefined;
     const keys = [
       "state",
       "externalRef",
@@ -741,7 +735,47 @@ class MemoryDatabase implements Database {
     return structuredClone(message);
   }
 
+  private leasedProgressMessage(
+    input: RunProgressLeaseInput & { version: number },
+  ): RunProgressMessage | undefined {
+    const message = this.runProgressMessages.get(input.triggerRunId);
+    if (
+      message?.organizationId !== input.organizationId ||
+      this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
+      message.leaseOwner !== input.owner ||
+      message.version !== input.version ||
+      message.leaseExpiresAt === null ||
+      message.leaseExpiresAt <= input.now
+    )
+      return undefined;
+    return message;
+  }
+
+  async admitProgressWrite(input: AdmitProgressWriteInput): Promise<ProgressWriteAdmission> {
+    const message = this.leasedProgressMessage(input);
+    if (message?.state !== input.state) return { status: "lease_lost" };
+    const cooldown = progressCooldownDecision(
+      this.progressCredentialCooldown(input.key),
+      input.now,
+    );
+    if (cooldown !== undefined) return cooldown;
+    if (input.reservation === "create") {
+      message.state = "creating";
+      message.updatedAt = new Date(input.now);
+    }
+    if (input.reservation === "regular") {
+      message.editCount += 1;
+      message.lastRegularAttemptAt = new Date(input.now);
+      message.updatedAt = new Date(input.now);
+    }
+    return { status: "admitted" };
+  }
+
   async readProgressCredentialCooldown(key: string): Promise<ProgressCredentialCooldown> {
+    return structuredClone(this.progressCredentialCooldown(key));
+  }
+
+  private progressCredentialCooldown(key: string): ProgressCredentialCooldown {
     let retryAt: Date | null = null;
     let rejectedUntil: Date | null = null;
     for (const row of this.runProgressMessages.values()) {
@@ -749,7 +783,7 @@ class MemoryDatabase implements Database {
       retryAt = laterCooldown(retryAt, row.credentialRetryAt);
       rejectedUntil = laterCooldown(rejectedUntil, row.credentialRejectedUntil);
     }
-    return structuredClone({ retryAt, rejectedUntil });
+    return { retryAt, rejectedUntil };
   }
 
   async recordProgressCredentialCooldown(

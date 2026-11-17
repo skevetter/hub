@@ -410,12 +410,7 @@ export class MessageWriter {
     );
     const admission = backoff.admit(locator, clock.now(), shared);
     if ("waitUntil" in admission) return this.release(lease, {}, admission.waitUntil);
-    if ("rejected" in admission)
-      return this.release(lease, {
-        state: "unavailable",
-        failure: "credential_rejected",
-        settleAt: null,
-      });
+    if ("rejected" in admission) return this.credentialRejected(lease);
     try {
       let authorization: Awaited<ReturnType<ProgressProvider["authorize"]>>;
       let secrets: readonly string[] = [];
@@ -448,11 +443,7 @@ export class MessageWriter {
             status: "unavailable",
             code: "credential_rejected",
           });
-          return this.release(lease, {
-            state: "unavailable",
-            failure: "credential_rejected",
-            settleAt: null,
-          });
+          return this.credentialRejected(lease);
         }
         return this.stopMessage(
           lease,
@@ -475,12 +466,23 @@ export class MessageWriter {
   ): Promise<WriteResult> {
     const { lease, ref, kind, budget } = operation;
     const { clock, database, backoff } = this.options;
+    const admission = await budget.run(() =>
+      database.admitProgressWrite({
+        triggerRunId: lease.triggerRunId,
+        organizationId: lease.organizationId,
+        owner: this.owner,
+        version: lease.version,
+        now: new Date(clock.now()),
+        state: lease.state,
+        key: credentialKey(operation),
+        reservation: kind === "create" || kind === "regular" ? kind : undefined,
+      }),
+    );
+    if (admission.status === "lease_lost") return {};
+    if (admission.status === "retry") return this.release(lease, {}, admission.at.getTime());
+    if (admission.status === "rejected") return this.credentialRejected(lease);
+
     const expected = kind === "create" ? "creating" : lease.state;
-    const reservation = this.writeReservation(operation);
-    if (reservation !== undefined) {
-      const reserved = await budget.run(() => this.update(lease, reservation, false));
-      if (reserved === undefined) return {};
-    }
     const current = await budget.run(() =>
       database.findRunProgressMessage(lease.organizationId, lease.triggerRunId),
     );
@@ -551,15 +553,12 @@ export class MessageWriter {
     await this.requestCompensation(current, notBefore);
   }
 
-  private writeReservation({ kind, lease }: Operation): Patch | undefined {
-    if (kind === "create") return { state: "creating" };
-    if (kind === "regular") {
-      return {
-        lastRegularAttemptAt: new Date(this.options.clock.now()),
-        editCount: lease.editCount + 1,
-      };
-    }
-    return undefined;
+  private credentialRejected(lease: RunProgressMessage): Promise<WriteResult> {
+    return this.release(lease, {
+      state: "unavailable",
+      failure: "credential_rejected",
+      settleAt: null,
+    });
   }
 
   private async record(

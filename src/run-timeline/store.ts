@@ -120,6 +120,28 @@ export interface RunProgressLeaseInput {
   owner: string;
   now: Date;
 }
+export interface AdmitProgressWriteInput extends RunProgressLeaseInput {
+  version: number;
+  state: ProgressMessageState;
+  key: string;
+  reservation: "create" | "regular" | undefined;
+}
+
+type ProgressCooldownDecision = { status: "retry"; at: Date } | { status: "rejected" };
+export type ProgressWriteAdmission =
+  | { status: "admitted" }
+  | { status: "lease_lost" }
+  | ProgressCooldownDecision;
+
+export function progressCooldownDecision(
+  { retryAt, rejectedUntil }: ProgressCredentialCooldown,
+  now: Date,
+): ProgressCooldownDecision | undefined {
+  if (rejectedUntil !== null && rejectedUntil > now) return { status: "rejected" };
+  if (retryAt !== null && retryAt > now) return { status: "retry", at: retryAt };
+  return undefined;
+}
+
 export interface UpdateRunProgressMessageInput extends RunProgressLeaseInput {
   version: number;
   releaseLease?: boolean;
@@ -194,6 +216,7 @@ export interface RunTimelineStore {
   updateRunProgressMessage(
     input: UpdateRunProgressMessageInput,
   ): Promise<RunProgressMessage | undefined>;
+  admitProgressWrite(input: AdmitProgressWriteInput): Promise<ProgressWriteAdmission>;
   readProgressCredentialCooldown(key: string): Promise<ProgressCredentialCooldown>;
   recordProgressCredentialCooldown(input: RecordProgressCredentialCooldownInput): Promise<void>;
   listRunProgressMessagesToFinish(

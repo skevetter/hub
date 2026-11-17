@@ -1144,15 +1144,27 @@ it("shares leases and credential cooldowns with a separate Hub process", async (
     f.clock.now(),
   );
   assert.match(await externalMessage(child), /Paseo run: Running/u);
+  const replacement = f.writer();
+  const scope = { organizationId: ORGANIZATION, triggerRunId: sibling.run.id };
+  const authorizing = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  f.provider.authorize = async () => {
+    authorizing.resolve();
+    await resume.promise;
+    return "ok";
+  };
+  const firstAdmission = replacement.write(scope, f.provider);
+  await authorizing.promise;
   const recorded = externalMessage(child);
   child.send("rate-limit");
   assert.equal(await recorded, "cooldown recorded");
   assert.equal((await rateLimited.read())?.credentialRetryAt?.getTime(), f.clock.now() + 65_000);
-  const replacement = f.writer();
-  const scope = { organizationId: ORGANIZATION, triggerRunId: sibling.run.id };
   const count = f.provider.requests.length;
   await f.clock.advanceTo(origin + 1_000);
-  assert.equal((await replacement.write(scope, f.provider)).wakeAt, f.clock.now() + 64_000);
+  resume.resolve();
+  assert.equal((await firstAdmission).wakeAt, f.clock.now() + 64_000);
+  assert.equal((await sibling.read())?.editCount, 0);
+  assert.equal(f.provider.requests.length, count);
   await f.clock.advanceTo(origin + 64_999);
   await replacement.write(scope, f.provider);
   assert.equal(f.provider.requests.length, count);
@@ -1373,31 +1385,35 @@ it.each(["success", "applied 5xx"] as const)(
   },
 );
 
-it("blocks a send when authorization completes and ownership changes with both deadlines live", async () => {
+it("blocks a send when ownership changes during the final read with both deadlines live", async () => {
   const f = fixture();
   const run = await f.seed({ state: "active" });
   await run.finish();
   let authorized = false;
+  let transferred = false;
   f.provider.authorize = async () => {
     authorized = true;
     return "ok";
   };
-  f.provider.secrets = async () => {
-    assert.equal(authorized, true);
-    const row = await run.read();
+  const read = f.store.findRunProgressMessage.bind(f.store);
+  vi.spyOn(f.store, "findRunProgressMessage").mockImplementation(async (...args) => {
+    const row = await read(...args);
+    if (!authorized || transferred) return row;
+    transferred = true;
     assert.ok(row?.leaseOwner);
     await f.clock.advanceTo(500);
     assert.ok(await run.update(row.leaseOwner, row.version, {}));
     assert.ok(await run.acquire("replacement"));
-    return [];
-  };
+    return read(...args);
+  });
   const scope = { organizationId: ORGANIZATION, triggerRunId: run.run.id };
   await f.writer().write(scope, f.provider);
+  assert.ok(transferred);
   assert.deepEqual(f.provider.requests, []);
   assert.equal((await run.read())?.leaseOwner, "replacement");
 });
 
-it("shares a 65-second Retry-After between memory writers on distinct runs", async () => {
+it("rechecks a memory credential cooldown published during another writer's authorization", async () => {
   const f = fixture();
   const first = await f.seed({ state: "active" });
   const second = await f.seed({
@@ -1406,14 +1422,28 @@ it("shares a 65-second Retry-After between memory writers on distinct runs", asy
   });
   const firstWriter = f.writer();
   const secondWriter = f.writer();
+  const authorizing = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  f.provider.authorize = async (_locator, run) => {
+    if (run.id === second.run.id) {
+      authorizing.resolve();
+      await resume.promise;
+    }
+    return "ok";
+  };
   f.provider.onWrite = (_request, land) =>
     f.provider.requests.length === 1
       ? { status: "retry", notCreated: false, afterMs: 65_000 }
       : land();
-  await firstWriter.write({ organizationId: ORGANIZATION, triggerRunId: first.run.id }, f.provider);
   const scope = { organizationId: ORGANIZATION, triggerRunId: second.run.id };
+  const firstAdmission = secondWriter.write(scope, f.provider);
+  await authorizing.promise;
+  await firstWriter.write({ organizationId: ORGANIZATION, triggerRunId: first.run.id }, f.provider);
   await f.clock.advanceTo(1_000);
-  assert.equal((await secondWriter.write(scope, f.provider)).wakeAt, f.clock.now() + 64_000);
+  resume.resolve();
+  assert.equal((await firstAdmission).wakeAt, f.clock.now() + 64_000);
+  assert.equal((await second.read())?.editCount, 0);
+  assert.equal(f.provider.requests.length, 1);
   await f.clock.advanceTo(64_999);
   await secondWriter.write(scope, f.provider);
   assert.equal(f.provider.requests.length, 1);

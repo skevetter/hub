@@ -1,5 +1,6 @@
 import { and, eq, gt } from "drizzle-orm";
-import type { DatabaseRuntime, TransactionHandle } from "../db/runtime/index.js";
+import type { DatabaseRuntime, QueryHandle, TransactionHandle } from "../db/runtime/index.js";
+import type { Locks } from "../db/runtime/locks/index.js";
 import { runProgressMessages } from "../db/schema.js";
 import {
   isOrdinary,
@@ -8,8 +9,10 @@ import {
   timelineCallIdText,
   timelineStepId,
 } from "./data.js";
-import { timelineAccountingBatchId } from "./store.js";
+import { progressCooldownDecision, timelineAccountingBatchId } from "./store.js";
 import type {
+  AdmitProgressWriteInput,
+  ProgressWriteAdmission,
   AppendRunTimelineEventInput,
   AppendRunTimelineEventResult,
   InsertRunProgressMessageInput,
@@ -39,7 +42,10 @@ const MESSAGE = `trigger_run_id as "triggerRunId", organization_id as "organizat
  compensation_not_before as "compensationNotBefore", created_at as "createdAt", updated_at as "updatedAt"`;
 
 export class RunTimelineRepository {
-  constructor(private readonly runtime: DatabaseRuntime) {}
+  constructor(
+    private readonly runtime: DatabaseRuntime,
+    private readonly locks: Locks,
+  ) {}
 
   async recordRunTimelineDrops(
     organizationId: string,
@@ -418,8 +424,47 @@ export class RunTimelineRepository {
     return result[0];
   }
 
+  async admitProgressWrite(input: AdmitProgressWriteInput): Promise<ProgressWriteAdmission> {
+    return this.runtime.transaction(async (transaction) => {
+      const row = await this.lockProgressRow(transaction, input);
+      if (
+        row?.leaseOwner !== input.owner ||
+        row.version !== input.version ||
+        row.state !== input.state ||
+        row.leaseExpiresAt === null ||
+        row.leaseExpiresAt <= input.now
+      )
+        return { status: "lease_lost" };
+      await this.locks.withTxLock(transaction, `progress-credential:${input.key}`);
+      const cooldown = progressCooldownDecision(
+        await this.progressCredentialCooldown(transaction, input.key),
+        input.now,
+      );
+      if (cooldown !== undefined) return cooldown;
+      if (input.reservation !== undefined) {
+        await transaction.query(
+          `update run_progress_messages
+           set state = case when $2 = 'create' then 'creating' else state end,
+               edit_count = edit_count + case when $2 = 'regular' then 1 else 0 end,
+               last_regular_attempt_at = case when $2 = 'regular' then $3::timestamptz else last_regular_attempt_at end,
+               updated_at = $3
+           where trigger_run_id = $1`,
+          [input.triggerRunId, input.reservation, input.now],
+        );
+      }
+      return { status: "admitted" };
+    });
+  }
+
   async readProgressCredentialCooldown(key: string): Promise<ProgressCredentialCooldown> {
-    const result = await this.runtime.query<Row<ProgressCredentialCooldown>>(
+    return this.progressCredentialCooldown(this.runtime, key);
+  }
+
+  private async progressCredentialCooldown(
+    query: QueryHandle,
+    key: string,
+  ): Promise<ProgressCredentialCooldown> {
+    const result = await query.query<Row<ProgressCredentialCooldown>>(
       `select max(credential_retry_at) as "retryAt", max(credential_rejected_until) as "rejectedUntil"
        from run_progress_messages where credential_key = $1`,
       [key],
@@ -427,17 +472,35 @@ export class RunTimelineRepository {
     return result.rows[0]!;
   }
 
+  private async lockProgressRow(
+    transaction: TransactionHandle,
+    scope: Pick<RunProgressMessage, "triggerRunId" | "organizationId">,
+  ) {
+    type LeaseRow = Pick<RunProgressMessage, "leaseOwner" | "leaseExpiresAt" | "version" | "state">;
+    const result = await transaction.query<Row<LeaseRow>>(
+      `select lease_owner as "leaseOwner", lease_expires_at as "leaseExpiresAt", version, state
+       from run_progress_messages where trigger_run_id = $1 and organization_id = $2 for no key update`,
+      [scope.triggerRunId, scope.organizationId],
+    );
+    return result.rows[0];
+  }
+
   async recordProgressCredentialCooldown(
     input: RecordProgressCredentialCooldownInput,
   ): Promise<void> {
-    await this.runtime.query(
-      `update run_progress_messages set credential_retry_at = greatest(
-         case when credential_key = $3 then credential_retry_at end, $4::timestamptz),
-       credential_rejected_until = greatest(
-         case when credential_key = $3 then credential_rejected_until end, $5::timestamptz),
-       credential_key = $3 where organization_id = $1 and trigger_run_id = $2`,
-      [input.organizationId, input.triggerRunId, input.key, input.retryAt, input.rejectedUntil],
-    );
+    await this.runtime.transaction(async (transaction) => {
+      // Both paths lock the message first so waiting on one message does not stall its credential.
+      if ((await this.lockProgressRow(transaction, input)) === undefined) return;
+      await this.locks.withTxLock(transaction, `progress-credential:${input.key}`);
+      await transaction.query(
+        `update run_progress_messages set credential_retry_at = greatest(
+           case when credential_key = $3 then credential_retry_at end, $4::timestamptz),
+         credential_rejected_until = greatest(
+           case when credential_key = $3 then credential_rejected_until end, $5::timestamptz),
+         credential_key = $3 where organization_id = $1 and trigger_run_id = $2`,
+        [input.organizationId, input.triggerRunId, input.key, input.retryAt, input.rejectedUntil],
+      );
+    });
   }
 
   async listOpenRunProgressMessages(
