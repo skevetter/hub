@@ -19,6 +19,10 @@
 
 ### Fixed
 
+- Run details refresh completed step results when timeline capture is off.
+- Running durations use human units and update while the tab is visible.
+- Long trigger names remain contained in run detail headers.
+- Unavailable runs retain a tenant-scoped return link to Activity.
 - Stream reauthorization tests wait for pending pooled queries before advancing the clock.
 - Fetch-forbidden HTTP methods return a transport method problem before request construction.
 - Stream storage failure reports retain the request identifier returned in the response.

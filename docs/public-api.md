@@ -78,9 +78,11 @@ The instance operator console reads organization identity, entitlements, usage a
 
 Any organization member can open a run from Activity. The page combines the stored run summary, timeline and step results. Tool starts and finishes share a row within each step. Permission waits stay open until resolved. New events follow the bottom only while the reader is there. Jump to latest resumes following.
 
-Live connections use same-origin cookies. After three consecutive connection failures or a disabled stream response, the page polls every five seconds. A terminal run status alone does not stop polling. The reader must reach the stored seal, or the timeline must expire. The page refreshes persisted step results at the seal and every ten seconds during runs with omitted step rows or more than 100 steps.
+Live connections use same-origin cookies. After three consecutive connection failures or a disabled stream response, timeline events are polled every five seconds until the stored seal is read or the timeline expires. Separately, persisted run and step details refresh every five seconds while the persisted run is running, even when capture is off. A terminal live status requests the final persisted results. This single detail refresh loop also covers omitted step rows and runs with more than 100 steps without duplicate timers. Reading the seal still refreshes persisted results.
 
 Derived timelines show only persisted lifecycle events and say that no tool events were recorded. Expired timelines show no event rows. Pending steps left after a run ends read as Not run. Timeline text is plain text without Markdown or automatic links. The Progress message row describes the disabled Hub setting in this build. It does not imply a provider message was posted.
+
+Running durations use human units and update only while the tab is visible. Updates range from one second for short runs to thirty seconds for runs lasting hours. Terminal durations are static. Long trigger names remain contained in the header. An unavailable run includes a Back to activity link.
 
 ## Run event streams
 

@@ -109,6 +109,8 @@ describe("organization activity routes", () => {
       const missing = await renderRoute("/o/acme%20team/activity/missing-run");
       assert.match(missing, /Run unavailable/u);
       assert.match(missing, /This run is unavailable/u);
+      assert.match(missing, /href="\/o\/acme%20team\/activity"/u);
+      assert.match(missing, /Back to activity/u);
       assert.ok(
         state.queryKeys.some(
           (key) =>

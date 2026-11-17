@@ -44,11 +44,19 @@ export function RunDetailPanel({ runId }: { runId: string }) {
     );
   if (snapshot.status === "error" || snapshot.data === null)
     return (
-      <FailureAlert
-        title="Run unavailable"
-        error={snapshot.error}
-        fallback="This run is unavailable."
-      />
+      <Section>
+        <FailureAlert
+          title="Run unavailable"
+          error={snapshot.error}
+          fallback="This run is unavailable."
+        />
+        <a
+          className="text-link hover:underline"
+          href={`/o/${encodeURIComponent(organizationSlug)}/activity`}
+        >
+          Back to activity
+        </a>
+      </Section>
     );
   return (
     <LiveRunDetail
