@@ -3,63 +3,23 @@ import { capabilitiesFor } from "../auth/organization-policy.js";
 import { revisionBundleFiles } from "../configuration/store.js";
 import type {
   Database,
-  AgentExecutionRecord,
   ProjectActivityRunListRecord,
-  ProjectActivityRunRecord,
   ProviderEventReceiptSummary,
-  ProviderEventReceiptRecord,
-  TriggerRunRecord,
-  WorkflowStepRunRecord,
 } from "../db/types.js";
 import { formatInvocationRejection } from "../triggers/invocation.js";
 import { providerEventDropReasonSummary } from "../triggers/drop-reason.js";
-import {
-  decodeEntitlementDenialFailureReason,
-  entitlementDenialSummary,
-} from "../entitlements/denial.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { resolveRouteTenant } from "./access.js";
 import { ProjectCommandError } from "./command-error.js";
-import { summarizeTrigger, type TriggerSummary } from "./activity-summary.js";
-
-/** A jsonb column value, cast at the DB boundary so it survives the server-fn serializer. */
-export type JsonValue =
-  | string
-  | number
-  | boolean
-  | null
-  | JsonValue[]
-  | { [key: string]: JsonValue };
-
-export interface ActivityRunDetail {
-  run: {
-    id: string;
-    provider: ProviderEventReceiptRecord["provider"];
-    source: string;
-    repo: string | null;
-    receivedAt: string;
-    configuredTriggerName: string;
-    createdAt: string;
-    completedAt: string | null;
-    outcome: TriggerRunRecord["outcome"];
-    status: TriggerRunRecord["status"];
-    failureReason: string | null;
-    webhookSummary?: TriggerSummary;
-  };
-  steps: {
-    id: string;
-    stepId: string;
-    ordinal: number;
-    status: WorkflowStepRunRecord["status"];
-    startedAt: string | null;
-    output: JsonValue;
-    failureReason: string | null;
-    completedAt: string | null;
-    isAgent: boolean;
-    completion: "explicit_finish" | "inferred_from_turn_end" | null;
-  }[];
-}
+import { summarizeTrigger } from "./activity-summary.js";
+import {
+  activityRunView,
+  activityRunDetailView,
+  displayFailureReason,
+  jsonValue,
+  type ActivityRunDetail,
+} from "./activity-run-view.js";
 
 export interface ProjectRouteScope {
   organizationSlug: string;
@@ -179,55 +139,7 @@ export class ProjectDashboard {
           : this.database.findAgentExecutionById(step.agentExecutionId),
       ),
     );
-    const { run, receipt, steps } = activity;
-    return {
-      run: {
-        id: run.id,
-        provider: receipt.provider,
-        source: receipt.source,
-        ...(receipt.source === "webhook.received"
-          ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
-          : {}),
-        repo: receipt.repo,
-        receivedAt: receipt.receivedAt.toISOString(),
-        configuredTriggerName: run.configuredTriggerName,
-        createdAt: run.createdAt.toISOString(),
-        completedAt: run.completedAt?.toISOString() ?? null,
-        outcome: run.outcome,
-        status: run.status,
-        failureReason:
-          run.outcome === "rejected"
-            ? formatInvocationRejection(run.rejection)
-            : displayFailureReason(run.failureReason),
-      },
-      steps: steps.map((step, index) => {
-        const execution = executions[index];
-        const result = execution?.result;
-        let completion: "explicit_finish" | "inferred_from_turn_end" | null = null;
-        if (execution?.completedByAgentAt != null) {
-          completion = "explicit_finish";
-        } else if (
-          result !== null &&
-          typeof result === "object" &&
-          "completion" in result &&
-          result.completion === "inferred_from_turn_end"
-        ) {
-          completion = "inferred_from_turn_end";
-        }
-        return {
-          id: step.id,
-          stepId: step.stepId,
-          ordinal: step.ordinal,
-          status: step.status,
-          startedAt: step.startedAt?.toISOString() ?? null,
-          completedAt: step.completedAt?.toISOString() ?? null,
-          output: jsonValue(step.output),
-          failureReason: displayFailureReason(step.failureReason),
-          isAgent: step.agentExecutionId !== null,
-          completion,
-        };
-      }),
-    };
+    return activityRunDetailView(activity, executions);
   }
 
   async createProject(
@@ -393,71 +305,6 @@ function configurationView(
   };
 }
 
-function activityRunView(
-  activity: ProjectActivityRunRecord,
-  executions: (AgentExecutionRecord | undefined)[],
-) {
-  const { run, receipt, steps } = activity;
-  const base = {
-    id: run.id,
-    providerEventReceiptId: run.providerEventReceiptId,
-    provider: receipt.provider,
-    deliveryId: receipt.deliveryId,
-    source: receipt.source,
-    ...(receipt.source === "webhook.received"
-      ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
-      : {}),
-    repo: receipt.repo,
-    receivedAt: receipt.receivedAt.toISOString(),
-    rawPayload: jsonValue(receipt.payload),
-    configuredTriggerName: run.configuredTriggerName,
-    prompt: run.prompt,
-    inputs: jsonValue(run.inputs),
-    values: jsonValue(run.values),
-    triggerContext: jsonValue(run.triggerContext),
-    outputContext: jsonValue(run.outputContext),
-    createdAt: run.createdAt.toISOString(),
-    completedAt: run.completedAt?.toISOString() ?? null,
-    steps: steps.map((step, index) => ({
-      agentId: executions[index]?.daemonAgentId ?? null,
-      agentSessionId: executions[index]?.agentSessionId ?? null,
-      agentSessionAction: executions[index]?.agentSessionAction ?? null,
-      agentExecutionId: step.agentExecutionId,
-      id: step.id,
-      stepId: step.stepId,
-      ordinal: step.ordinal,
-      status: step.status,
-      deadlineAt: step.deadlineAt?.toISOString() ?? null,
-      idleDeadlineAt: step.idleDeadlineAt?.toISOString() ?? null,
-      deadlineKind: step.deadlineKind,
-      startedAt: step.startedAt?.toISOString() ?? null,
-      output: step.output === null ? null : jsonValue(step.output),
-      failureReason: displayFailureReason(step.failureReason),
-      completedAt: step.completedAt?.toISOString() ?? null,
-    })),
-  };
-  if (run.outcome === "rejected") {
-    return {
-      ...base,
-      outcome: run.outcome,
-      status: run.status,
-      deadlineAt: null,
-      deadlineKind: null,
-      failureReason: formatInvocationRejection(run.rejection),
-      rejectionReason: formatInvocationRejection(run.rejection),
-    };
-  }
-  return {
-    ...base,
-    outcome: run.outcome,
-    status: run.status,
-    deadlineAt: run.deadlineAt.toISOString(),
-    deadlineKind: run.deadlineKind,
-    failureReason: displayFailureReason(run.failureReason),
-    rejectionReason: null,
-  };
-}
-
 function activityRunListView(activity: ProjectActivityRunListRecord) {
   const { run, receipt } = activity;
   const base = {
@@ -507,16 +354,6 @@ function activityRunListView(activity: ProjectActivityRunListRecord) {
   };
 }
 
-/**
- * A run/step `failure_reason` for display. An entitlement denial is stored as a machine-parseable
- * payload (see engine.ts), so it is decoded into a typed denial and summarized here rather than
- * shown as raw JSON; every other reason (timeouts, crashes) passes through unchanged.
- */
-function displayFailureReason(reason: string | null): string | null {
-  const denial = decodeEntitlementDenialFailureReason(reason);
-  return denial === undefined ? reason : entitlementDenialSummary(denial);
-}
-
 function unroutedEventView(receipt: ProviderEventReceiptSummary) {
   return {
     id: receipt.id,
@@ -543,14 +380,4 @@ function unroutedEventView(receipt: ProviderEventReceiptSummary) {
     rejectionReason: null,
     steps: [],
   };
-}
-
-function jsonValue(value: unknown): JsonValue {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (Array.isArray(value)) return value.map(jsonValue);
-  if (typeof value === "object" && value !== null) {
-    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, jsonValue(child)]));
-  }
-  return null;
 }

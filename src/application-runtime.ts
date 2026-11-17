@@ -182,7 +182,11 @@ async function createOwnedApplicationRuntime(
       options.database === null || options.auth === null
         ? null
         : new ProjectDashboard(options.database, options.auth),
-    triggerDashboard: triggerDashboardFor(options, application.hub),
+    triggerDashboard: triggerDashboardFor(
+      options,
+      application.hub,
+      timelineRuntime.runTimelineReconciler,
+    ),
     daemonProviderCatalog: daemonProviderCatalogFor(options, application.hub),
     homeDashboard: homeDashboardFor(options, connections),
     ...entitlementSurfaces(options),
@@ -506,11 +510,14 @@ function createRunTimelineRuntime(
 function triggerDashboardFor(
   options: ApplicationCompositionOptions,
   hub: import("./app.js").HubRuntime,
+  reconciler: RunTimelineReconciler | undefined,
 ): TriggerDashboard | null {
   return options.database === null || options.auth === null || hub.agentValidator === null
     ? null
     : new TriggerDashboard(options.database, options.auth, hub.agentValidator, {
         githubNotificationsEnabled: options.githubNotifications !== undefined,
+        runProgress: options.runProgress ?? readRunProgressSettings({}),
+        ...(reconciler === undefined ? {} : { reconciler }),
         ...(options.githubNotifications === undefined
           ? {}
           : { githubNotificationsPollSeconds: options.githubNotifications.pollIntervalMs / 1000 }),

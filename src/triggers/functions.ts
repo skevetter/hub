@@ -6,11 +6,44 @@ import { respondWithFailure } from "../failures/index.js";
 import { getApplication } from "../server/runtime.js";
 import type { TriggerDashboard } from "./dashboard.js";
 
+import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
 const scopeSchema = z.object({ organizationSlug: z.string().trim().min(1).max(100) });
 const saveSchema = scopeSchema.extend({
   triggerId: z.string().uuid().optional(),
   yaml: z.string().min(1),
 });
+
+const runScopeSchema = scopeSchema.extend({ runId: z.string().uuid() });
+
+export const runDetailSnapshot = createServerFn({ method: "GET" })
+  .validator(runScopeSchema)
+  .handler(async ({ data }): Promise<Result<RunDetailSnapshot | null>> => {
+    try {
+      const dashboard = (await getApplication()).triggerDashboard;
+      if (dashboard == null) throw new Error("trigger dashboard unavailable");
+      return respondOk(await dashboard.runDetail(getRequest(), data.organizationSlug, data.runId));
+    } catch (error) {
+      return respondWithFailure(error, triggerContext("run.detail", data.organizationSlug), {
+        fallback: "Hub couldn't load this run.",
+      });
+    }
+  });
+
+export const runEventsSnapshot = createServerFn({ method: "GET" })
+  .validator(runScopeSchema.extend({ after: z.number().int().nonnegative() }))
+  .handler(async ({ data }): Promise<Result<RunEventPage | null>> => {
+    try {
+      const dashboard = (await getApplication()).triggerDashboard;
+      if (dashboard == null) throw new Error("trigger dashboard unavailable");
+      return respondOk(
+        await dashboard.runEvents(getRequest(), data.organizationSlug, data.runId, data.after),
+      );
+    } catch (error) {
+      return respondWithFailure(error, triggerContext("run.events", data.organizationSlug), {
+        fallback: "Hub couldn't load this run.",
+      });
+    }
+  });
 
 export const triggerSnapshot = createServerFn({ method: "GET" })
   .validator(scopeSchema)

@@ -7,7 +7,8 @@ import { respondWithFailure } from "../failures/index.js";
 import { projectSlugSchema } from "../project-slug.js";
 import { isTenantRouteNotFoundError } from "./access.js";
 import { ProjectCommandError, projectCommandErrorCode } from "./command-error.js";
-import type { ActivityRunDetail, ProjectDashboard } from "./dashboard.js";
+import type { ProjectDashboard } from "./dashboard.js";
+import type { ActivityRunDetail } from "./activity-run-view.js";
 
 const organizationScopeSchema = z
   .object({ organizationSlug: z.string().trim().min(1).max(100) })
