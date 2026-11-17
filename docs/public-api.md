@@ -78,7 +78,9 @@ The instance operator console reads organization identity, entitlements, usage a
 
 `GET /api/v1/runs/{id}/events` reads only stored timeline rows. Create a separate API key for each consumer and grant only `runs:read`. `runs:dispatch` does not imply read access. CLI credentials also work, while their owner remains an owner or admin. A browser member of any role can use a same-origin session with `?organization=<slug>`.
 
-HEAD and other methods return 405 `method_not_allowed` with `Allow: GET`, without authentication, a subscriber or an admission slot. When streaming is disabled, every method returns 404 `not_found`.
+HEAD and other Fetch-compatible methods return 405 `method_not_allowed` with `Allow: GET`, without authentication, a subscriber or an admission slot. When streaming is disabled, these methods return 404 `not_found`.
+
+The outer HTTP adapter rejects Fetch-forbidden methods such as TRACE with 405 `method_not_allowed` before constructing a Request or reaching authentication and routes. Its generic Allow header lists `GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS`, regardless of the route or stream switch. Node's parser and unhandled CONNECT behavior are unchanged. An unhandled CONNECT closes the socket without an HTTP response.
 
 ```sh
 curl -N -H "Authorization: Bearer $HUB_KEY" "$HUB_URL/api/v1/runs/$RUN_ID/events"

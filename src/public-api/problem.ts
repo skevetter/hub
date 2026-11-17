@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { ProblemSchema } from "./contracts.js";
 
-export function requestIdentifier(request: Request): string {
+export function requestIdentifier(request: Pick<Request, "headers">): string {
   const value = request.headers.get("x-request-id");
   return value !== null && /^[A-Za-z0-9._-]{1,128}$/u.test(value) ? value : randomUUID();
 }

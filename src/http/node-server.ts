@@ -15,8 +15,14 @@ import { INTERNAL_CLIENT_ADDRESS_HEADER } from "./client-address.js";
 import { takeResponseLifecycle } from "./response-lifecycle.js";
 import { TRUSTED_REQUEST_ORIGIN_HEADER } from "./request-origin.js";
 import { HttpRequestDrain } from "./request-drain.js";
+import { problem, requestIdentifier } from "../public-api/problem.js";
 
 const requestDrains = new WeakMap<Server, HttpRequestDrain>();
+const FETCH_FORBIDDEN_METHODS: Readonly<Record<string, true>> = {
+  CONNECT: true,
+  TRACE: true,
+  TRACK: true,
+};
 
 export type FetchHandler = (request: Request) => Response | Promise<Response>;
 
@@ -47,7 +53,10 @@ export function createFetchServer(
   const drain = new HttpRequestDrain();
   const handler = (request: IncomingMessage, response: ServerResponse) => {
     if (!drain.admit(response)) return;
-    void forwardRequest(fetchHandler, request, response, resolvedOptions).finally(() => {
+    const forwarding = Object.hasOwn(FETCH_FORBIDDEN_METHODS, request.method ?? "")
+      ? rejectTransportMethod(request, response, options.logger ?? defaultLogger)
+      : forwardRequest(fetchHandler, request, response, resolvedOptions);
+    void forwarding.finally(() => {
       drain.complete(response);
     });
   };
@@ -84,6 +93,29 @@ export function beginHttpShutdown(server: Server): {
       return drain.activeRequests;
     },
   };
+}
+
+async function rejectTransportMethod(
+  incoming: IncomingMessage,
+  outgoing: ServerResponse,
+  logger: Pick<Logger, "warn" | "error">,
+): Promise<void> {
+  try {
+    const response = problem(
+      requestIdentifier({ headers: requestHeaders(incoming) }),
+      405,
+      "method_not_allowed",
+      "Method not allowed",
+      "This transport does not support the requested method.",
+      undefined,
+      { allow: "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS" },
+    );
+    outgoing.statusCode = response.status;
+    for (const [name, value] of response.headers) outgoing.setHeader(name, value);
+    outgoing.end(await response.text());
+  } catch (error) {
+    respondToRequestFailure(error, incoming, outgoing, logger);
+  }
 }
 
 async function forwardRequest(
