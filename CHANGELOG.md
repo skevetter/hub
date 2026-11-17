@@ -20,6 +20,7 @@
 
 - Fetch-forbidden HTTP methods return a transport method problem before request construction.
 - Stream storage failure reports retain the request identifier returned in the response.
+- Registered responses returned after client disconnect run abort cleanup once and cancel their bodies.
 - Response lifecycle ownership survives the compiled server boundary, including stalled stream deadlines.
 - Run stream HEAD and unsupported methods reject without opening subscribers or falling through to page rendering.
 - Stream closure logs retain safe authentication kind and subject identifiers without changing credential redaction.

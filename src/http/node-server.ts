@@ -132,7 +132,31 @@ async function forwardRequest(
       return { response, failureReported: failureWasReported() };
     }, options.logger);
     const { response } = tracked;
+    const lifecycle = takeResponseLifecycle(response);
+    let responseForwarded = false;
+    let lifecycleSettled = false;
+    const reportLifecycleFailure = (error: unknown): void => {
+      reportFailure(
+        error,
+        { operation: "http.response.lifecycle", component: "http", method: request.method },
+        options.logger === undefined ? {} : { logger: options.logger },
+      );
+    };
+    const runLifecycle = (callback: (() => void | Promise<void>) | undefined): void => {
+      if (callback === undefined || lifecycleSettled) return;
+      lifecycleSettled = true;
+      try {
+        void Promise.resolve(callback()).catch(reportLifecycleFailure);
+      } catch (error) {
+        reportLifecycleFailure(error);
+      }
+    };
+    const abortLifecycle = (): void => {
+      if (lifecycle === undefined) return;
+      runLifecycle(lifecycle.onAbort);
+    };
     if (outgoing.writableEnded || outgoing.destroyed) {
+      abortLifecycle();
       void response.body?.cancel().catch((error: unknown) => {
         reportFailure(
           error,
@@ -161,24 +185,6 @@ async function forwardRequest(
         },
       ).requestId;
     }
-    const lifecycle = takeResponseLifecycle(response);
-    let responseForwarded = false;
-    let lifecycleSettled = false;
-    const runLifecycle = (callback: (() => void | Promise<void>) | undefined): void => {
-      if (callback === undefined || lifecycleSettled) return;
-      lifecycleSettled = true;
-      void Promise.resolve(callback()).catch((error: unknown) => {
-        reportFailure(
-          error,
-          { operation: "http.response.lifecycle", component: "http", method: request.method },
-          options.logger === undefined ? {} : { logger: options.logger },
-        );
-      });
-    };
-    const abortLifecycle = (): void => {
-      if (lifecycle === undefined) return;
-      runLifecycle(lifecycle.onAbort);
-    };
     if (lifecycle !== undefined) {
       const removeLifecycleListeners = () => {
         outgoing.off("finish", finishLifecycle);
