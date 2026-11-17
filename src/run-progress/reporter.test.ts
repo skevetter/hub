@@ -1596,3 +1596,35 @@ it.each(["memory", "embedded Postgres"] as const)(
     assert.equal((await run.read())?.editCount, 2);
   },
 );
+
+it.each([
+  { acknowledgedAt: 599_999, repair: true },
+  { acknowledgedAt: 600_001, repair: false },
+])(
+  "checks the observation deadline at $acknowledgedAt ms with expiry still queued",
+  async ({ acknowledgedAt, repair }) => {
+    let elapsed = 0;
+    const queued = new FakeClock();
+    const clock: ProgressClock = {
+      now: queued.now,
+      monotonic: () => elapsed,
+      timer: queued.timer.bind(queued),
+    };
+    const observers = new LateWriteObservers();
+    const write = Promise.withResolvers<ProgressCall>();
+    const requestRepair = vi.fn(async () => {});
+    observers.observe(write.promise, clock, {
+      signal: AbortSignal.abort(),
+      repair: requestRepair,
+      report: () => assert.fail("unexpected repair error"),
+    });
+
+    elapsed = acknowledgedAt;
+    assert.equal(observers.size, 1);
+    write.resolve({ status: "ok" });
+    await nextTurn();
+
+    assert.equal(requestRepair.mock.calls.length, Number(repair));
+    assert.equal(observers.size, 0);
+  },
+);

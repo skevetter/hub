@@ -35,6 +35,8 @@ interface LateWriteObserver {
   repair: () => Promise<unknown>;
   report: () => void;
   cancel: () => void;
+  clock: ProgressClock;
+  expiresAt: number;
 }
 
 export class LateWriteObservers {
@@ -47,13 +49,14 @@ export class LateWriteObservers {
   observe(
     write: Promise<ProgressCall>,
     clock: ProgressClock,
-    observation: Omit<LateWriteObserver, "cancel">,
+    observation: Omit<LateWriteObserver, "cancel" | "clock" | "expiresAt">,
   ): void {
     const ticket = Symbol();
     const oldest = this.pending.keys().next().value;
     if (this.size === MAX_LATE_WRITE_OBSERVERS && oldest !== undefined) this.drop(oldest);
+    const expiresAt = clock.monotonic() + LATE_WRITE_LIFETIME_MS;
     const cancel = clock.timer(() => this.drop(ticket), LATE_WRITE_LIFETIME_MS);
-    this.pending.set(ticket, { ...observation, cancel });
+    this.pending.set(ticket, { ...observation, cancel, clock, expiresAt });
     // The promise retains only the ticket when the observation expires or is evicted.
     void write.then(
       ({ status }) => this.complete(ticket, status === "ok"),
@@ -70,7 +73,8 @@ export class LateWriteObservers {
 
   private async complete(ticket: symbol, succeeded: boolean): Promise<void> {
     const observer = this.drop(ticket);
-    if (!succeeded || !observer?.signal.aborted) return;
+    if (!succeeded || !observer?.signal.aborted || observer.clock.monotonic() >= observer.expiresAt)
+      return;
     try {
       await observer.repair();
     } catch {
