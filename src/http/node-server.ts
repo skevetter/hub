@@ -146,18 +146,23 @@ async function forwardRequest(
       runLifecycle(lifecycle.onAbort);
     };
     if (lifecycle !== undefined) {
-      outgoing.once("finish", () => {
-        if (!responseForwarded) {
-          abortLifecycle();
-          return;
-        }
-        runLifecycle(lifecycle.onFinish);
-      });
+      const removeLifecycleListeners = () => {
+        outgoing.off("finish", finishLifecycle);
+        outgoing.off("close", markResponseAborted);
+        outgoing.off("error", markResponseAborted);
+      };
+      const finishLifecycle = () => {
+        removeLifecycleListeners();
+        if (!responseForwarded) abortLifecycle();
+        else runLifecycle(lifecycle.onFinish);
+      };
       const markResponseAborted = () => {
+        removeLifecycleListeners();
         if (outgoing.writableFinished) return;
         responseForwarded = false;
         abortLifecycle();
       };
+      outgoing.once("finish", finishLifecycle);
       outgoing.once("close", markResponseAborted);
       outgoing.once("error", markResponseAborted);
     }
@@ -167,7 +172,9 @@ async function forwardRequest(
     if (responseRequestId !== undefined) outgoing.setHeader("x-request-id", responseRequestId);
     const cookies = response.headers.getSetCookie();
     if (cookies.length > 0) outgoing.setHeader("set-cookie", cookies);
-    if (!outgoing.shouldKeepAlive) outgoing.setHeader("connection", "close");
+    if (response.headers.get("content-type")?.startsWith("text/event-stream"))
+      outgoing.removeHeader("connection");
+    else if (!outgoing.shouldKeepAlive) outgoing.setHeader("connection", "close");
     if (response.body === null) {
       responseForwarded = true;
       outgoing.end();
@@ -178,6 +185,7 @@ async function forwardRequest(
       outgoing,
       request.method,
       options.logger ?? defaultLogger,
+      lifecycle !== undefined,
     );
     if (responseForwarded) outgoing.end();
   } catch (error) {
@@ -190,6 +198,7 @@ async function forwardResponseBody(
   outgoing: ServerResponse,
   method: string,
   logger: Pick<Logger, "warn" | "error">,
+  boundedStall: boolean,
 ): Promise<boolean> {
   const reader = body.getReader();
   let canceled = false;
@@ -224,7 +233,7 @@ async function forwardResponseBody(
       const chunk = await reader.read();
       if (chunk.done || canceled || outgoing.destroyed) break;
       if (!outgoing.write(chunk.value) && !canceled) {
-        if (!(await waitForResponseDrain(outgoing))) {
+        if (!(await waitForResponseDrain(outgoing, boundedStall))) {
           cancelReader();
           break;
         }
@@ -242,9 +251,16 @@ async function forwardResponseBody(
   }
 }
 
-function waitForResponseDrain(outgoing: ServerResponse): Promise<boolean> {
+function waitForResponseDrain(outgoing: ServerResponse, boundedStall: boolean): Promise<boolean> {
   const { promise, resolve } = Promise.withResolvers<boolean>();
+  const timer = boundedStall
+    ? setTimeout(() => {
+        outgoing.destroy();
+        finish(false);
+      }, 30_000).unref()
+    : undefined;
   const finish = (drained: boolean) => {
+    clearTimeout(timer);
     outgoing.off("drain", onDrain);
     outgoing.off("close", onClose);
     outgoing.off("error", onClose);

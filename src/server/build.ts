@@ -12,6 +12,7 @@ export interface BuiltStartServer {
   ): Promise<ApplicationRuntime>;
   startProductionRuntime(): Promise<ApplicationRuntime>;
   stopProductionRuntime(): Promise<void>;
+  beginShutdown(): Promise<void>;
   handleDaemonUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<void>;
 }
 
@@ -24,6 +25,7 @@ const BuiltStartServerSchema = z.custom<BuiltStartServer>((value) => {
     typeof value["startApplication"] === "function" &&
     typeof value["startProductionRuntime"] === "function" &&
     typeof value["stopProductionRuntime"] === "function" &&
+    typeof value["beginShutdown"] === "function" &&
     typeof value["handleDaemonUpgrade"] === "function"
   );
 });

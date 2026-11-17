@@ -21,7 +21,13 @@ import { installProcessFailureHandlers } from "./failures/process.js";
 import { createFetchServer } from "./http/node-server.js";
 import { loadBuiltStartServer } from "./server/build.js";
 import { createAuthServer } from "./auth/server.js";
-import { startApplication, stopApplication, type ApplicationRuntime } from "./server/runtime.js";
+import {
+  getApplication,
+  hasApplication,
+  startApplication,
+  stopApplication,
+  type ApplicationRuntime,
+} from "./server/runtime.js";
 import { createApplicationRuntime } from "./application-runtime.js";
 import { readScriptLimits } from "./workflows/script-limits.js";
 import {
@@ -67,6 +73,10 @@ export function startProductionRuntime(): Promise<ApplicationRuntime> {
 
 export async function stopProductionRuntime(): Promise<void> {
   await stopApplication();
+}
+
+export async function beginProductionShutdown(): Promise<void> {
+  if (hasApplication()) await (await getApplication()).runStream.beginShutdown();
 }
 
 export async function handleDaemonUpgrade(
@@ -363,6 +373,7 @@ async function main(): Promise<void> {
 
   const stop = createServerShutdown(server, () => build.stopProductionRuntime(), {
     ...shutdownBudgets,
+    beginShutdown: () => build.beginShutdown(),
     exit: (code) => process.exit(code),
   });
   installShutdownSignals(process, stop, removeProcessFailureHandlers);
