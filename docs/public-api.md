@@ -134,6 +134,8 @@ Limits are per process, credential kind and id, organization, and user id for se
 
 Headers are `Content-Type: text/event-stream; charset=utf-8`, `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no`. No CORS headers are added. Hub does not override Better Auth's cookie defaults: HttpOnly, SameSite=Lax and Secure for an HTTPS base URL. Cross-origin script cannot read the response. The route does not use forwarded client address headers.
 
+The cookie path relies on SameSite=Lax session cookies, and the route sends no CORS headers. It performs no Origin or Sec-Fetch-Site check, so cross-origin request admission is not independently rejected.
+
 Cloudflare and Caddy buffering behavior is not verified here. Heartbeats are below Cloudflare's 125 second read timeout. The public proxy must flush the initial event and each heartbeat. No proxy configuration is changed. A lifecycle-managed socket with no drain for 30 seconds is destroyed. Client disconnects cancel the reader and release stream and notifier counters. Shutdown closes stream admission and sends `shutdown` before HTTP draining and runtime teardown. The existing HTTP shutdown grace and hard-exit budgets remain backstops.
 
 The runtime exposes `runStreams` and `streamNotifiers` when streaming is enabled. Both return to zero when streams close.

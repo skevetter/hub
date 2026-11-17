@@ -18,6 +18,9 @@
 
 ### Fixed
 
+- Response lifecycle ownership survives the compiled server boundary, including stalled stream deadlines.
+- Run stream HEAD and unsupported methods reject without opening subscribers or falling through to page rendering.
+- Stream closure logs retain safe authentication kind and subject identifiers without changing credential redaction.
 - Disabled run streaming preserves the existing shutdown admission and resource order.
 - URL userinfo detection covers special-scheme slash and backslash forms before logger rewriting, with differential URL-parser coverage.
 - Armored-block detection avoids quadratic retries within long dash runs at the accepted input limit.
