@@ -2072,6 +2072,7 @@ class LegacyUpgrade {
       await client.close();
     }
     const operationAuth: OperationAuthenticator = {
+      reauthorize: async () => false,
       async authorize(request: Request, _scope: ApiKeyScope) {
         return request.headers.get("authorization") === `Bearer ${apiKey}`
           ? {

@@ -30,6 +30,7 @@ it("rejects webhook POST after HTTP shutdown begins before authentication or ope
     {
       status: "enabled",
       authenticator: {
+        reauthorize: async () => false,
         authorize: async () => {
           authCalls += 1;
           return { status: "unauthorized" };

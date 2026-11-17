@@ -44,6 +44,7 @@ import type { TriggerHandler } from "./triggers/index.js";
 import type { WebhookOptions } from "./webhook-config.js";
 import { readRunProgressSettings, type RunProgressSettings } from "./run-progress/settings.js";
 import { TimelineRetention } from "./run-timeline/retention.js";
+import { RunStream } from "./run-stream/index.js";
 import { reportFailure } from "./failures/index.js";
 
 export interface ApplicationCompositionOptions {
@@ -85,6 +86,7 @@ async function createOwnedApplicationRuntime(
   ownership: CompositionResources,
 ): Promise<ApplicationRuntime> {
   const timelineRuntime = createRunTimelineRuntime(options, ownership);
+  const { runStream, hubOptions: streamOptions } = createRunStreamRuntime(options, timelineRuntime);
   const registrations = options.registrations ?? [];
   const connections = new Map(
     registrations.map((registration) => [registration.connection.name, registration.connection]),
@@ -111,6 +113,7 @@ async function createOwnedApplicationRuntime(
 
   const application = createHubApplication({
     ...timelineRuntime,
+    ...streamOptions,
     entitlements: options.entitlements,
     providerFactories: registrations.flatMap((registration) => registration.triggerProviders),
     ...(executionAuthority === undefined ? {} : { executionAuthority }),
@@ -142,6 +145,7 @@ async function createOwnedApplicationRuntime(
     webhookOptions: options.webhookOptions,
   });
   ownership.own(() => application.hub.stop(), "composition.hub");
+  ownership.own(() => runStream.beginShutdown(), "composition.run_stream");
   await application.hub.start(
     registrations.flatMap((registration) =>
       registration.sources.map((source, index) => ({
@@ -166,6 +170,7 @@ async function createOwnedApplicationRuntime(
     hub: application.hub,
     operations: application.operations,
     publicApi: application.publicApi,
+    runStream,
     publicBaseUrl: options.publicBaseUrl,
     resources,
     billing: options.billing,
@@ -375,10 +380,43 @@ async function createOwnedApplicationRuntime(
   };
 }
 
+function createRunStreamRuntime(
+  options: ApplicationCompositionOptions,
+  timeline: { timelineBus?: RunTimelineBus; runTimelineReconciler?: RunTimelineReconciler },
+) {
+  const settings = options.runProgress ?? readRunProgressSettings({});
+  const scrubValues = [
+    ...(options.timelineScrubValues ?? []),
+    ...(options.completionTokenSecret === undefined ? [] : [options.completionTokenSecret]),
+    ...(settings.githubToken === undefined ? [] : [settings.githubToken]),
+  ];
+  const runStream = new RunStream({
+    database: options.database,
+    auth: options.auth,
+    credentials: options.auth?.publicCredentials,
+    bus: timeline.timelineBus,
+    reconciler: timeline.runTimelineReconciler,
+    settings,
+    reportFailure: (error) => {
+      reportFailure(
+        error,
+        { operation: "run.stream.handle", component: "run-progress" },
+        { scrubValues },
+      );
+    },
+  });
+  const hubOptions: Pick<HubRuntimeOptions, "runStream"> = settings.runStreamEnabled
+    ? { runStream }
+    : {};
+  return { runStream, hubOptions };
+}
+
 function createRunTimelineRuntime(
   options: ApplicationCompositionOptions,
   ownership: CompositionResources,
-): Pick<HubRuntimeOptions, "database" | "runTimeline" | "runTimelineReconciler"> {
+): Pick<HubRuntimeOptions, "database" | "runTimeline" | "runTimelineReconciler"> & {
+  timelineBus?: RunTimelineBus;
+} {
   const settings = options.runProgress ?? readRunProgressSettings({});
   const database = options.database;
   if (database === null) return { database };
@@ -413,6 +451,7 @@ function createRunTimelineRuntime(
     );
   };
   const bus = new RunTimelineBus({
+    maxSubscriptions: Math.max(1024, settings.streamMaxTotal),
     reportFailure: (error) => report(error, "run.timeline.notify"),
   });
   const scrub = createTimelineScrubber({ scrubValues });
@@ -453,6 +492,7 @@ function createRunTimelineRuntime(
     database: createObservedDatabase(database, { timeline, reconciler, reportFailure: report }),
     runTimeline: timeline,
     runTimelineReconciler: reconciler,
+    timelineBus: bus,
   };
 }
 

@@ -58,6 +58,8 @@ import {
 import type { GitHubAuthorityRegistration } from "../../providers/registration.js";
 import { configurationBundleFixture } from "../../test-utils/configuration-bundle.js";
 import type { HubBundleFile } from "../../config/bundle.js";
+import { RunStream } from "../../run-stream/index.js";
+import { readRunProgressSettings } from "../../run-progress/settings.js";
 
 const HUB_ORGANIZATION_ID = "org_1";
 const HUB_PROJECT_ID = "00000000-0000-4000-8000-000000000001";
@@ -66,6 +68,7 @@ const HUB_USER_ID = "hub-harness";
 const HUB_API_KEY = "paseo_pk_hub-harness_test";
 const HUB_API_KEY_ID = "00000000-0000-4000-8000-0000000000aa";
 const hubOperationAuth: OperationAuthenticator = {
+  reauthorize: async () => false,
   async authorize(request: Request, _scope: ApiKeyScope) {
     return request.headers.get("authorization") === `Bearer ${HUB_API_KEY}`
       ? {
@@ -1811,6 +1814,14 @@ export class HubHarness {
       hub,
       operations: application.operations,
       publicApi: application.publicApi,
+      runStream: new RunStream({
+        database: null,
+        auth: null,
+        credentials: undefined,
+        bus: undefined,
+        reconciler: undefined,
+        settings: readRunProgressSettings({}),
+      }),
       resources: null,
       billing: null,
       projectDashboard: null,

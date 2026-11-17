@@ -463,6 +463,7 @@ function authenticator(
   outcome: "authorized" | "unauthorized" | "forbidden" | "unavailable" = "authorized",
 ): OperationAuthenticator {
   return {
+    reauthorize: async () => outcome === "authorized",
     authorize(_request: Request, requiredScope: ApiKeyScope) {
       if (outcome === "unavailable") return Promise.reject(new DatabaseUnavailableError());
       if (outcome !== "authorized") return Promise.resolve({ status: outcome });

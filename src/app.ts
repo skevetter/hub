@@ -1,5 +1,6 @@
 import type { RunTimeline } from "./run-timeline/index.js";
 import type { RunTimelineReconciler } from "./run-timeline/reconcile.js";
+import type { RunStream } from "./run-stream/index.js";
 import { createScheduleSource, createScheduleProvider } from "./triggers/schedule/index.js";
 import {
   createGitHubNotificationProvider,
@@ -91,6 +92,7 @@ export interface HubRuntimeOptions {
   webhookOptions?: WebhookOptions | undefined;
   runTimeline?: RunTimeline;
   runTimelineReconciler?: RunTimelineReconciler;
+  runStream?: RunStream;
 }
 
 export interface HubRuntime {
@@ -105,6 +107,8 @@ export interface HubRuntime {
     timelineAccountingEntries?: number;
     timelineAccountingGiveUps?: number;
     timelineAccountingDropsAbandoned?: number;
+    runStreams?: number;
+    streamNotifiers?: number;
   };
   processWorkflowOutbox(): Promise<void>;
   handleUpgrade: ReturnType<typeof createDaemonUpgradeHandler> | null;
@@ -275,6 +279,12 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       const accounting = options.runTimeline.accountingStats();
       return {
         executionSubscriptions,
+        ...(options.runStream === undefined
+          ? {}
+          : {
+              runStreams: options.runStream.activeStreamCount(),
+              streamNotifiers: options.runStream.notifierCount(),
+            }),
         timelineQueueDepth: options.runTimeline.depth(),
         timelineQueueEntries: accounting.queueEntries,
         timelineAccountingEntries: accounting.retainedEntries,
@@ -301,6 +311,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       await Promise.all(activeSources.map(async (source) => source.start(workflowDispatcher)));
     },
     async stop() {
+      await options.runStream?.beginShutdown();
       try {
         await Promise.all(
           activeSources.map((source, index) => {
