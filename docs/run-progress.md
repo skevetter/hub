@@ -18,3 +18,12 @@ reporter is off. Messages already posted remain at the source.
 
 Hub shares credential cooldowns across processes through the database. Each process still
 limits its own provider calls to four in flight.
+
+A write that times out or has an uncertain outcome schedules a repair. Hub also watches for a
+late success after an abort and requests another repair when one arrives. If the provider
+commits after the abort and never reports success, only a scheduled repair can overwrite it.
+A write that lands after the last scheduled repair can remain visible.
+
+Hub schedules the settle edit 120 seconds after the final edit. When the settle is the only
+repair, allow up to 145 seconds from a stale write to visible repair, including the repair's
+operation budget. Rate limiting can add up to 900 seconds (1,045 seconds in total).

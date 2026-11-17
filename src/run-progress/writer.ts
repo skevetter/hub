@@ -27,6 +27,7 @@ const FINAL_RETRY_MS = [5_000, 15_000, 45_000, 120_000, 300_000];
 const FINAL_WINDOW_MS = 6 * 60 * 60_000;
 const REGULAR_FAILURE_LIMIT = 8;
 const REGULAR_TIMEOUT_WAIT_MS = 2_000;
+const providerWrites = new Set<Promise<ProgressCall>>();
 
 export type MessageScope = Pick<RunProgressMessage, "triggerRunId" | "organizationId">;
 type Patch = UpdateRunProgressMessageInput["patch"];
@@ -103,6 +104,10 @@ function credentialKey({ lease, ref }: Operation): string {
 }
 
 type MutationOutcome = ProgressCall | "transient" | "timeout";
+
+function uncertain(outcome: MutationOutcome): boolean {
+  return typeof outcome === "string" || (outcome.status === "retry" && outcome.transient === true);
+}
 const FAILURE_CODES = new Set([
   "connection_not_owned",
   "credential_rejected",
@@ -415,7 +420,7 @@ export class MessageWriter {
     provider: ProgressProvider,
     secrets: readonly string[],
   ): Promise<WriteResult> {
-    const { lease, ref, body, kind, budget } = operation;
+    const { lease, ref, kind, budget } = operation;
     const { clock, database, backoff } = this.options;
     const expected = kind === "create" ? "creating" : lease.state;
     const reservation = this.writeReservation(operation);
@@ -439,12 +444,10 @@ export class MessageWriter {
     let outcome: MutationOutcome;
     try {
       outcome = await budget.run(
-        (signal) =>
-          kind === "create" ? provider.create(ref, body, signal) : provider.edit(ref, body, signal),
+        (signal) => this.invokeMutation(operation, provider, signal),
         PROVIDER_MS,
       );
     } catch (error) {
-      if (this.options.signal.aborted) return {};
       outcome = error instanceof OperationDeadline ? "timeout" : "transient";
     } finally {
       backoff.sent(ref.credential, sentAt);
@@ -456,6 +459,52 @@ export class MessageWriter {
       this.options.report("outcome_record_failed", lease);
       return { row: lease, wakeAt: clock.now() + LEASE_RETRY_MS };
     }
+  }
+
+  private invokeMutation(
+    { kind, ref, body, lease }: Operation,
+    provider: ProgressProvider,
+    signal: AbortSignal,
+  ): Promise<ProgressCall> {
+    const pending =
+      kind === "create" ? provider.create(ref, body, signal) : provider.edit(ref, body, signal);
+    providerWrites.add(pending);
+    // A provider can finish a write after Hub stops waiting for it.
+    void pending
+      .then(
+        (outcome) => {
+          providerWrites.delete(pending);
+          if (signal.aborted && outcome.status === "ok") return this.requestCompensation(lease);
+          return undefined;
+        },
+        () => {
+          providerWrites.delete(pending);
+        },
+      )
+      .catch(() => this.options.report("late_repair_request_failed", lease));
+    return pending;
+  }
+
+  private requestCompensation({ organizationId, triggerRunId }: MessageScope, notBefore?: Date) {
+    return this.options.database.requestCompensation(organizationId, triggerRunId, notBefore);
+  }
+
+  private async requestUncertainRepair(
+    operation: Operation,
+    current: RunProgressMessage,
+    outcome: MutationOutcome,
+  ) {
+    if (!uncertain(outcome)) return;
+    const { kind, run } = operation;
+    const { clock, settings } = this.options;
+    // A running message observes regular pacing. Finalization can still proceed after its own wait.
+    const notBefore =
+      kind === "regular"
+        ? new Date(
+            regularEditAt(current, clock.now(), run.createdAt.getTime(), settings.minEditSeconds),
+          )
+        : undefined;
+    await this.requestCompensation(current, notBefore);
   }
 
   private writeReservation({ kind, lease }: Operation): Patch | undefined {
@@ -479,6 +528,8 @@ export class MessageWriter {
     const { lease, kind } = operation;
     const { database, clock } = this.options;
     const now = clock.now();
+    await this.requestUncertainRepair(operation, current, outcome);
+    if (this.options.signal.aborted) return {};
     if (outcome === "timeout" && kind === "regular") {
       return this.transientFailure(operation, now + REGULAR_TIMEOUT_WAIT_MS, true, true);
     }
