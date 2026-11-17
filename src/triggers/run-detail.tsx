@@ -98,10 +98,12 @@ export function RunDetailView({
   const notice = timelineNotice(timeline);
   return (
     <>
-      <PageHeader
-        title="Run detail"
-        description={`${run.webhookSummary === undefined ? run.provider : "Webhook"} - ${run.configuredTriggerName}`}
-      />
+      <div className="min-w-0 max-w-full overflow-hidden [&_p]:break-words">
+        <PageHeader
+          title="Run detail"
+          description={`${run.webhookSummary === undefined ? run.provider : "Webhook"} - ${run.configuredTriggerName}`}
+        />
+      </div>
       <Section>
         <SummaryPanel label="Run" rows={summary} />
       </Section>
