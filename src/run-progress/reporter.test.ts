@@ -683,28 +683,56 @@ describe("progress repair across writers", () => {
         return;
       }
 
-      const repairTime = mode === "rate limited" ? 1_082_000 : 182_000;
+      const rateLimited = mode === "rate limited";
+      const operationStarts: number[] = [];
+      const delay = (ms: number) => new Promise<void>((resolve) => f.clock.timer(resolve, ms));
+      if (rateLimited) {
+        f.provider.authorize = async () => {
+          operationStarts.push(f.clock.monotonic());
+          await delay(9_000);
+          return "ok";
+        };
+        f.provider.secrets = async () => {
+          await delay(9_000);
+          return [];
+        };
+      }
       f.provider.onWrite = async (request, land) => {
-        if (mode === "rate limited" && request.time === 182_000) {
+        await delay(2_000);
+        if (rateLimited && request.time === 200_000) {
           return { status: "retry", afterMs: 1_000_000, notCreated: false };
         }
-        await new Promise<void>((resolve) => f.clock.timer(resolve, 2_000));
         return land();
       };
       const staleTime = 63_000;
       await f.clock.advanceTo(staleTime);
       await staleLands();
-      await f.clock.advanceTo(repairTime - 1);
+      await f.clock.advanceTo(181_999);
       assert.equal(f.provider.visible.get("comment"), "stale");
       assert.equal((await run.read())?.leaseOwner, null);
-      await f.clock.advanceTo(repairTime);
-      assert.equal(f.provider.requests.at(-1)?.time, repairTime);
-      await f.clock.advanceTo(repairTime + 1_999);
+
+      if (rateLimited) {
+        await f.clock.advanceTo(202_000);
+        assert.deepEqual(operationStarts, [182_000]);
+        assert.equal(f.provider.requests.at(-1)?.time, 200_000);
+        assert.equal((await run.read())?.retryAt?.getTime(), f.clock.now() + 900_000);
+      }
+
+      const repairSendAt = rateLimited ? 1_120_000 : 182_000;
+      await f.clock.advanceTo(repairSendAt);
+      assert.equal(f.provider.requests.at(-1)?.time, repairSendAt);
+      await f.clock.advanceTo(repairSendAt + 1_999);
       assert.equal(f.provider.visible.get("comment"), "stale");
-      const landedAt = repairTime + 2_000;
+      const landedAt = repairSendAt + 2_000;
       await f.clock.advanceTo(landedAt);
       assert.match(f.provider.visible.get("comment") ?? "", /Succeeded/u);
-      assert.ok(landedAt - staleTime <= (mode === "rate limited" ? 1_045_000 : 145_000));
+      if (rateLimited) {
+        assert.deepEqual(operationStarts, [182_000, 1_102_000]);
+        assert.equal(landedAt - staleTime, 1_059_000);
+        assert.ok(landedAt - staleTime <= 1_070_000);
+      } else {
+        assert.ok(landedAt - staleTime <= 145_000);
+      }
       assert.equal((await run.read())?.settleAt, null);
     },
   );
@@ -1490,7 +1518,9 @@ it("bounds the lifetime of never-settling edits after the reporter stops", async
   assert.ok(signals.every((signal) => signal.aborted));
   await f.clock.advanceTo(451_000);
   assert.equal(f.provider.requests.length, 64);
-  assert.ok(observers.size <= 256);
+  assert.equal(observers.size, 64);
+  await f.clock.advanceTo(749_999);
+  assert.ok(observers.size > 0 && observers.size < 64);
   await f.clock.advanceTo(750_000);
   assert.equal(observers.size, 0);
 });

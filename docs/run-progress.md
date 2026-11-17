@@ -13,18 +13,27 @@ the message. Access to the linked run requires a Hub login.
 | `PASEO_HUB_PROGRESS_MAX_EDITS`        | `120`   | Whole regular edit attempts from 10 to 1,000 per run.                                 |
 | `PASEO_HUB_TIMELINE_RETENTION_DAYS`   | `30`    | Whole days from 1 to 365 after run completion.                                        |
 
-Failed and uncertain regular writes count toward pacing and the edit cap. Final and repair
-edits are outside the cap. Hub rejects invalid settings at startup. Retention removes local progress rows even when the
+Failed and uncertain regular writes count toward pacing and the edit cap. A crash between the
+durable reservation and the provider call consumes one of the default 120 regular edit slots.
+Keeping the slot charged ensures the cap cannot permit an extra provider call. Final, repair,
+and settle edits remain outside the regular edit cap.
+
+Hub rejects invalid settings at startup. Retention removes local progress rows even when the
 reporter is off. Messages already posted remain at the source.
 
-Hub shares credential cooldowns across processes through the database. Each process still
-limits its own provider calls to four in flight.
+Hub shares credential cooldowns across processes through the database. Admission checks
+the latest cooldown before reserving an attempt. Each process limits its own provider calls
+to four in flight and paces its regular edits from the actual send start. Other processes
+use the durable reservation as their pacing lower bound.
 
-A write that times out or has an uncertain outcome schedules a repair. Hub also watches for a
-late success after an abort and requests another repair when one arrives. If the provider
-commits after the abort and never reports success, only a scheduled repair can overwrite it.
-A write that lands after the last scheduled repair can remain visible.
+A write that times out or has an uncertain outcome schedules a repair. Hub watches for a late
+success for up to 10 minutes from the start of the write and keeps at most 256 observations
+per process, evicting the oldest first. A late success detected in that window requests
+another repair. If the provider commits without reporting success within that window, only a
+scheduled repair can overwrite it. A write that lands after the last scheduled repair can
+remain visible.
 
 Hub schedules the settle edit 120 seconds after the final edit. When the settle is the only
 repair, allow up to 145 seconds from a stale write to visible repair, including the repair's
-operation budget. Rate limiting can add up to 900 seconds (1,045 seconds in total).
+operation budget. With one rate limit at the 900-second cap, allow up to 1,070 seconds.
+That includes the 120-second settle delay and two 25-second operation budgets.
