@@ -799,7 +799,8 @@ class MemoryDatabase implements Database {
       message.leaseOwner !== null &&
       message.leaseExpiresAt !== null &&
       message.leaseExpiresAt <= now;
-    if ((message.state === "creating" || message.state === "active") && expiredLease) return true;
+    if (message.state === "creating") return message.leaseOwner === null || expiredLease;
+    if (message.state === "active" && expiredLease) return true;
     return (
       (message.state === "active" || message.state === "finished") &&
       (message.retryAt === null || message.retryAt <= now) &&

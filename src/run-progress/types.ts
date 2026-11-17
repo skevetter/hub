@@ -28,7 +28,7 @@ export function parseStoredRef(value: JsonValue | undefined): StoredRef | undefi
 
 export type ProgressCall =
   | { status: "ok"; ref?: StoredRef }
-  | { status: "retry"; afterMs: number; notCreated: boolean }
+  | { status: "retry"; afterMs: number; notCreated: boolean; transient?: true }
   | { status: "gone" }
   | { status: "unavailable"; code: string }
   | { status: "refused"; code: string };

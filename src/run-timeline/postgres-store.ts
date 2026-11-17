@@ -365,11 +365,38 @@ export class RunTimelineRepository {
   async updateRunProgressMessage(
     input: UpdateRunProgressMessageInput,
   ): Promise<RunProgressMessage | undefined> {
+    const {
+      state,
+      externalRef,
+      lastRenderedHash,
+      lastEditAt,
+      editCount,
+      failedEdits,
+      finalFailures,
+      retryAt,
+      settleAt,
+      repeatFinal,
+      visibility,
+      visibilityCheckedAt,
+      failure,
+    } = input.patch;
     const result = await this.runtime
       .drizzle()
       .update(runProgressMessages)
       .set({
-        ...input.patch,
+        state,
+        externalRef,
+        lastRenderedHash,
+        lastEditAt,
+        editCount,
+        failedEdits,
+        finalFailures,
+        retryAt,
+        settleAt,
+        repeatFinal,
+        visibility,
+        visibilityCheckedAt,
+        failure,
         updatedAt: input.now,
         ...(input.releaseLease === false ? {} : { leaseOwner: null, leaseExpiresAt: null }),
       })
@@ -411,7 +438,8 @@ export class RunTimelineRepository {
           .map((part) => `message.${part.trim()}`)
           .join(",")} from run_progress_messages message
       join trigger_runs run on run.id = message.trigger_run_id
-      where (message.state in ('creating','active') and message.lease_owner is not null and message.lease_expires_at <= $1)
+      where (message.state = 'creating' and (message.lease_owner is null or message.lease_expires_at <= $1))
+        or (message.state = 'active' and message.lease_owner is not null and message.lease_expires_at <= $1)
         or (message.state = 'finished' and message.settle_at <= $3 and (message.retry_at is null or message.retry_at <= $3))
         or ((message.retry_at is null or message.retry_at <= $1) and (
           (message.state in ('active','finished') and message.compensation_requested_gen > message.compensation_done_gen and (message.compensation_not_before is null or message.compensation_not_before <= $1))

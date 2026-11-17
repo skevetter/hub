@@ -39,7 +39,7 @@ import {
   type DaemonModule,
 } from "./daemons/index.js";
 import { createDispatcherWithEngine } from "./dispatcher/index.js";
-import type { DurableWorkflowEngine } from "./workflows/engine.js";
+import type { DurableWorkflowEngine, DurableWorkflowEngineOptions } from "./workflows/engine.js";
 import type {
   DaemonDispatchLifecycleOptions,
   ExecutionDeadlineClock,
@@ -90,6 +90,7 @@ export interface HubRuntimeOptions {
   /** How many script steps may run at once. */
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
+  onProgressRequested?: DurableWorkflowEngineOptions["onProgressRequested"];
   runTimeline?: RunTimeline;
   runTimelineReconciler?: RunTimelineReconciler;
   runStream?: RunStream;
@@ -225,6 +226,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     canDispatchToDaemon: (daemonId: string) =>
       (options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId)) !== undefined,
     database: options.database,
+    onProgressRequested: options.onProgressRequested,
     timeline: options.runTimeline,
     timelineReconciler: options.runTimelineReconciler,
     entitlements: options.entitlements,

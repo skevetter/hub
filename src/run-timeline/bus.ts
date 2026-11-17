@@ -19,6 +19,7 @@ interface RunTimelineSubscription {
 }
 
 export class RunTimelineBus {
+  private readonly observers = new Set<(notification: RunTimelineNotification) => void>();
   private readonly listeners = new Map<string, Set<RunTimelineSubscription>>();
   private readonly maxSubscriptions: number;
   private subscriptionCount = 0;
@@ -58,10 +59,25 @@ export class RunTimelineBus {
     };
   }
 
+  observe(listener: (notification: RunTimelineNotification) => void): () => void {
+    this.observers.add(listener);
+    return () => {
+      this.observers.delete(listener);
+    };
+  }
+
   publish(runId: string, seq: number): void {
     const listeners = this.listeners.get(runId);
-    if (!listeners) return;
+    if (listeners === undefined && this.observers.size === 0) return;
     const notification: RunTimelineNotification = Object.freeze({ runId, seq });
+    for (const observer of this.observers) {
+      try {
+        observer(notification);
+      } catch (error) {
+        this.report(error);
+      }
+    }
+    if (listeners === undefined) return;
     const generation = this.nextGeneration;
     for (const subscription of listeners) {
       if (subscription.generation >= generation) break;

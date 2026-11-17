@@ -28,6 +28,7 @@ export interface DispatcherOptions {
   onWorkflowRunAccepted?: DurableWorkflowEngineOptions["onWorkflowRunAccepted"];
   onWorkflowRunStarted?: DurableWorkflowEngineOptions["onWorkflowRunStarted"];
   onWorkflowRunTerminal?: DurableWorkflowEngineOptions["onWorkflowRunTerminal"];
+  onProgressRequested?: DurableWorkflowEngineOptions["onProgressRequested"];
   timeline?: DurableWorkflowEngineOptions["timeline"];
   timelineReconciler?: DurableWorkflowEngineOptions["timelineReconciler"];
 }
@@ -57,6 +58,9 @@ export function createDispatcherWithEngine(options: DispatcherOptions): {
       : { validateLaunchMachineIntent: options.validateLaunchMachineIntent }),
     ...(options.scriptRunner === undefined ? {} : { scriptRunner: options.scriptRunner }),
     scriptLimits: options.scriptLimits,
+    ...(options.onProgressRequested === undefined
+      ? {}
+      : { onProgressRequested: options.onProgressRequested }),
     ...(options.timeline === undefined ? {} : { timeline: options.timeline }),
     ...(options.timelineReconciler === undefined
       ? {}

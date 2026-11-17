@@ -43,6 +43,7 @@ import { runShutdownStage } from "./shutdown-stage.js";
 import type { TriggerHandler } from "./triggers/index.js";
 import type { WebhookOptions } from "./webhook-config.js";
 import { readRunProgressSettings, type RunProgressSettings } from "./run-progress/settings.js";
+import { ProgressReporter, type ProgressProvider } from "./run-progress/index.js";
 import { TimelineRetention } from "./run-timeline/retention.js";
 import { RunStream } from "./run-stream/index.js";
 import { reportFailure } from "./failures/index.js";
@@ -64,6 +65,7 @@ export interface ApplicationCompositionOptions {
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
   runProgress?: RunProgressSettings;
+  progressProviders?: readonly ProgressProvider[];
   timelineScrubValues?: readonly string[];
   close(): Promise<void>;
 }
@@ -115,7 +117,9 @@ async function createOwnedApplicationRuntime(
     outputRegistry.register(output);
   }
 
+  const progress = createProgressReporter(options, timelineRuntime.timelineBus, ownership);
   const application = createHubApplication({
+    ...progress.hubOptions,
     ...timelineRuntime,
     ...streamOptions,
     entitlements: options.entitlements,
@@ -149,6 +153,7 @@ async function createOwnedApplicationRuntime(
     webhookOptions: options.webhookOptions,
   });
   ownership.own(() => application.hub.stop(), "composition.hub");
+  progress.start();
   await application.hub.start(
     registrations.flatMap((registration) =>
       registration.sources.map((source, index) => ({
@@ -384,6 +389,46 @@ async function createOwnedApplicationRuntime(
     providerRequest: (name, request) =>
       requests.get(name)?.(request) ?? Promise.resolve(new Response("Not Found", { status: 404 })),
     stop: () => ownership.close(),
+  };
+}
+
+function createProgressReporter(
+  options: ApplicationCompositionOptions,
+  bus: RunTimelineBus | undefined,
+  ownership: CompositionResources,
+): { hubOptions: Pick<HubRuntimeOptions, "onProgressRequested">; start: () => void } {
+  const { database, runProgress, progressProviders, publicBaseUrl } = options;
+  if (
+    database === null ||
+    bus === undefined ||
+    runProgress?.progressMessagesEnabled !== true ||
+    progressProviders === undefined ||
+    progressProviders.length === 0
+  )
+    return { hubOptions: {}, start: () => undefined };
+  const reporter = new ProgressReporter({
+    database,
+    bus,
+    settings: runProgress,
+    providers: progressProviders,
+    publicBaseUrl,
+    reportFailure: (code, scope) =>
+      reportFailure(
+        new Error(code),
+        {
+          operation: "run.progress.reporter",
+          component: "run-progress",
+          ...(scope === undefined ? {} : { organizationId: scope.organizationId }),
+        },
+        scope === undefined ? {} : { diagnostic: { triggerRunId: scope.triggerRunId } },
+      ),
+  });
+  return {
+    hubOptions: { onProgressRequested: (run) => reporter.request(run) },
+    start: () => {
+      ownership.own(async () => reporter.stop(), "composition.progress_reporter");
+      reporter.start();
+    },
   };
 }
 
