@@ -89,6 +89,43 @@ steps:
     },
   );
 
+  it.each([undefined, false, true])(
+    "exports only an enabled progress_message from a compiled legacy trigger (%s)",
+    (flag) => {
+      const migrated = migrateLegacyBundle({
+        files: [
+          { path: ".paseo/hub.yml", content: hub },
+          {
+            path: ".paseo/workflows/solo.yml",
+            content: `
+name: solo
+on: slack.mention
+max_runtime: 2h
+filters: { from_users: [U123] }
+${
+  flag === undefined
+    ? ""
+    : `progress_message: ${String(flag)}
+`
+}steps:
+  - id: work
+    environment: runner
+    max_runtime: 90m
+    idle_timeout: 10m
+    agent: codex
+    prompt: [{ text: work }]
+`,
+          },
+        ],
+      });
+
+      const [trigger] = migrated;
+      assert.ok(trigger?.format === "single_run");
+      assert.equal(/^progress_message:/mu.test(trigger.yaml), flag === true);
+      assert.equal(trigger.compiled.events[0]?.progressMessage, flag === true ? true : undefined);
+    },
+  );
+
   it("preserves a multi-step workflow as one self-contained normalized legacy trigger", () => {
     const migrated = migrateLegacyBundle({
       files: [

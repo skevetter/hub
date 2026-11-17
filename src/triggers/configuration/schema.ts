@@ -1,6 +1,7 @@
 import { RecurrenceSchema } from "../schedule/recurrence.js";
 import { z } from "zod";
 import { ContinuationSchema } from "../continuation.js";
+import { hasProgressDestination, PROGRESS_DESTINATION_REQUIRED } from "../progress-events.js";
 import {
   eventDefinition,
   isEditorEvent,
@@ -225,9 +226,22 @@ export const TriggerDocumentSchema = z
     inputs: z.record(z.string().regex(IDENTIFIER), TriggerInputSchema).optional(),
     /** A distinct whole-trigger deadline; new one-run triggers normally omit it. */
     max_runtime: z.string().min(1).optional(),
+    progress_message: z.boolean().optional(),
     run: TriggerRunSchema,
   })
   .strict()
+  .superRefine((trigger, context) => {
+    if (
+      trigger.progress_message === true &&
+      Object.keys(trigger.on).some((event) => !hasProgressDestination(event))
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["progress_message"],
+        message: PROGRESS_DESTINATION_REQUIRED,
+      });
+    }
+  })
   .superRefine((trigger, context) => {
     for (const [event, definition] of Object.entries(trigger.on)) {
       if (event === "schedule.tick") {

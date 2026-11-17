@@ -23,6 +23,7 @@ import type {
 import type { AcceptedTriggerProviderMatch } from "../triggers/index.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { parseInvocation } from "../triggers/invocation.js";
+import { compileTriggerDocument } from "../triggers/configuration/index.js";
 import { UNLIMITED_TEMPLATE } from "../entitlements/catalog.js";
 import { EntitlementsService } from "../entitlements/service.js";
 import { createDurableWorkflowHandler } from "./engine.js";
@@ -43,6 +44,85 @@ import { createFetchServer } from "../http/node-server.js";
 import { createServerShutdown } from "../server-shutdown.js";
 
 describe("durable multi-step workflow engine", () => {
+  it.each([
+    { flag: false, requestProgress: () => undefined, warns: false },
+    { flag: true, requestProgress: () => undefined, warns: false },
+    {
+      flag: true,
+      requestProgress: () => {
+        throw new Error("progress unavailable");
+      },
+      warns: true,
+    },
+    {
+      flag: true,
+      requestProgress: () => Promise.reject(new Error("progress unavailable")),
+      warns: true,
+    },
+  ])(
+    "requests progress once per new opted-in run (flag=$flag, warns=$warns)",
+    async ({ flag, requestProgress, warns }) => {
+      const document = compileTriggerDocument(`
+name: progress-run
+on:
+  slack.mention:
+    filters: { from_users: [U123] }
+progress_message: ${String(flag)}
+run:
+  target: { daemon: runner, cwd: /workspace }
+  agent: { provider: codex }
+  prompt: work
+`);
+      const fixture = await workflowFixture({
+        compiledConfiguration: { environments: [document.environment], triggers: document.events },
+      });
+      const receipt = await fixture.database.persistManualEvent({
+        organizationId: "org-1",
+        projectId: fixture.projectId,
+        deliveryId: randomUUID(),
+        source: "slack.mention",
+        payload: {},
+        receivedAt: new Date(),
+      });
+      assert.ok(receipt.status === "accepted");
+      const provider = {
+        ...providerMatch(fixture.configuration, fixture.revisionId),
+        name: "slack",
+        eventNames: ["slack.mention"] as const,
+      } satisfies import("../triggers/index.js").TriggerProvider;
+      const onProgressRequested = vi.fn((run: TriggerRunRecord) => {
+        assert.equal(run.outcome, "accepted");
+        return requestProgress();
+      });
+      const onWorkflowRunAccepted = vi.fn(async () => {});
+      const warn = vi.fn();
+      const { handler } = createDurableWorkflowHandler({
+        database: fixture.database,
+        entitlements: fixture.entitlements,
+        providers: [provider],
+        onProgressRequested,
+        onWorkflowRunAccepted,
+        logger: { warn, error: vi.fn() },
+      });
+
+      await handler(receipt.event);
+      await handler(receipt.event);
+
+      const runs = await fixture.database.findTriggerRunsByProviderEventReceiptId(
+        receipt.event.providerEventReceiptId,
+      );
+      assert.equal(runs.length, 1);
+      assert.equal(runs[0]?.outcome, "accepted");
+      assert.equal(onWorkflowRunAccepted.mock.calls.length, 1);
+      assert.equal(onProgressRequested.mock.calls.length, flag ? 1 : 0);
+      assert.equal(onProgressRequested.mock.calls[0]?.[0].id, flag ? runs[0]?.id : undefined);
+      assert.deepEqual(
+        warn.mock.calls,
+        warns ? [[{ triggerRunId: runs[0]?.id }, "could not request run progress"]] : [],
+      );
+    },
+  );
+
   it("drains an admitted webhook into a durable workflow before runtime teardown", async () => {
     const fixture = await workflowFixture();
     const { handler, engine } = engineFor(fixture, []);

@@ -65,6 +65,7 @@ export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
       name: internalEventName(authored.name, index, named),
       on: event,
       max_runtime: authored.max_runtime ?? run.max_runtime,
+      ...(authored.progress_message === true ? { progress_message: true } : {}),
       filters: authoredFilters(event, definition),
       steps: [isScriptRun(run) ? scriptStep(run) : agentStep(run)],
     };
@@ -202,7 +203,9 @@ export function parseTriggerDocument(yaml: string): TriggerDocument {
 }
 
 export function serializeTriggerDocument(trigger: TriggerDocument): string {
-  return dump(trigger, { noRefs: true, lineWidth: -1, sortKeys: false });
+  const exported = { ...trigger };
+  if (exported.progress_message !== true) delete exported.progress_message;
+  return dump(exported, { noRefs: true, lineWidth: -1, sortKeys: false });
 }
 
 function internalEventName(name: string, index: number, named: number): string {

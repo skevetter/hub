@@ -1,5 +1,6 @@
-import { agentStep } from "../../config/compiler.js";
+import { agentStep, parseCompiledHubConfig } from "../../config/compiler.js";
 import { agentRun } from "./schema.js";
+import { DEFAULT_RECURRENCE } from "../schedule/recurrence.js";
 import assert from "node:assert/strict";
 import { parseProjectConfiguration } from "../../configuration/store.js";
 import type { ProjectConfigurationRevisionRecord } from "../../db/types.js";
@@ -83,6 +84,70 @@ run:
     slack.reply:
       max: 5
 `;
+
+describe("trigger progress opt-in", () => {
+  it.each([undefined, false, true])("compiles and exports progress_message %s", (flag) => {
+    const yaml =
+      flag === undefined
+        ? trigger
+        : `progress_message: ${String(flag)}
+${trigger}`;
+    const compiled = compileTriggerDocument(yaml);
+    assert.equal(compiled.authored.progress_message, flag);
+    const expected = flag === true ? true : undefined;
+    const configuration = parseCompiledHubConfig({
+      environments: [compiled.environment],
+      triggers: compiled.events,
+    });
+    assert.equal(configuration.triggers.length, 2);
+    for (const event of configuration.triggers) {
+      assert.equal(event.progressMessage, expected);
+      assert.equal(Object.hasOwn(event, "progressMessage"), flag === true);
+    }
+    const exported = serializeTriggerDocument(compiled.authored);
+    assert.equal(/^progress_message: true$/mu.test(exported), flag === true);
+    const roundTrip = compileTriggerDocument(exported);
+    assert.equal(roundTrip.authored.progress_message, expected);
+    assert.deepEqual(roundTrip.events, compiled.events);
+  });
+
+  it.each(['"true"', "1", "null", "{}", "[]"])("refuses progress_message %s", (value) => {
+    assert.throws(
+      () =>
+        parseTriggerDocument(`progress_message: ${value}
+${trigger}`),
+      {
+        name: "TriggerDocumentError",
+        message: /^progress_message: .*expected boolean/u,
+      },
+    );
+  });
+
+  it.each([
+    ["github.push", "{}"],
+    ["manual.run", "{}"],
+    ["schedule.tick", JSON.stringify({ recurrence: DEFAULT_RECURRENCE })],
+    ["discord.mention", "{}"],
+    ["webhook.received", "{}"],
+  ])("refuses progress_message on %s even alongside a supported event", (event, definition) => {
+    const yaml = `progress_message: true
+${trigger.replace(
+  "on:",
+  `on:
+  ${event}: ${definition}`,
+)}`;
+    assert.throws(() => parseTriggerDocument(yaml), {
+      name: "TriggerDocumentError",
+      message:
+        "progress_message: progress_message needs an event with a place to post: a GitHub issue or pull request event, a GitHub notification, a Slack mention or a Linear event. github.push, manual.run, schedule.tick and Discord events have none.",
+    });
+    assert.equal(
+      parseTriggerDocument(yaml.replace("progress_message: true", "progress_message: false"))
+        .progress_message,
+      false,
+    );
+  });
+});
 
 describe("self-contained trigger documents", () => {
   it.each([undefined, false, true])("compiles and round-trips background %s", (background) => {

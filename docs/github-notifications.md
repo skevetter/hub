@@ -52,6 +52,14 @@ run:
   idle_timeout: 10m
 ```
 
+## Progress messages
+
+Set the top-level key `progress_message: true` to request live progress for an agent or script run.
+It defaults to `false`. Every event under `on` must have a place to post, such as a GitHub issue or
+pull request, a GitHub notification, a Slack mention, or a Linear event. You can save the trigger
+while the Hub setting `PASEO_HUB_PROGRESS_MESSAGES` is off, which is the default. Posting requires a
+reporter.
+
 ## Filters
 
 All filters are optional. A trigger with none runs for every notification. A trigger runs only when

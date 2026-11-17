@@ -5,6 +5,10 @@ import {
   SCRIPT_NOTIFICATION_REASONS,
 } from "../triggers/configuration/events.js";
 import { ContinuationSchema } from "../triggers/continuation.js";
+import {
+  hasProgressDestination,
+  PROGRESS_DESTINATION_REQUIRED,
+} from "../triggers/progress-events.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
@@ -242,6 +246,7 @@ const AuthoredTriggerSchema = z
     name: z.string().min(1),
     on: z.string().min(1),
     max_runtime: z.string().min(1),
+    progress_message: z.boolean().optional(),
     steps: z.array(StepSchema).min(1),
     inputs: z.record(z.string(), AuthoredInputSchema).optional(),
     values: z.record(z.string(), z.string().min(1)).optional(),
@@ -372,6 +377,7 @@ export interface CompiledTrigger {
   sourceFile?: string | undefined;
   on: string;
   maxRuntimeMs: number;
+  progressMessage?: true | undefined;
   steps: CompiledSteps;
   inputs: Readonly<Record<string, CompiledInput>>;
   values: Readonly<Record<string, Expression>>;
@@ -528,6 +534,7 @@ const CompiledTriggerSchema: z.ZodType<CompiledTrigger> = z
     sourceFile: z.string().min(1).optional(),
     on: z.string().regex(EVENT_NAME),
     maxRuntimeMs: z.number().int().positive().max(MAX_DURATION_MS),
+    progressMessage: z.literal(true).optional(),
     steps: z.array(CompiledStepSchema),
     inputs: z.record(z.string(), CompiledInputSchema),
     values: z.record(z.string(), z.custom<Expression>(isExpression)),
@@ -627,6 +634,12 @@ function compileTrigger(
   compileAt([...triggerPath, "on"], () => {
     if (!EVENT_NAME.test(trigger.on)) throw new Error(`invalid trigger event: ${trigger.on}`);
   });
+  if (trigger.progress_message === true && !hasProgressDestination(trigger.on)) {
+    throw new HubConfigurationCompilationError(
+      [...triggerPath, "progress_message"],
+      PROGRESS_DESTINATION_REQUIRED,
+    );
+  }
   const inputs = compileAt([...triggerPath, "inputs"], () => compileInputs(trigger));
   compileAt([...triggerPath, "filters"], () => validateInputFilters(trigger, inputs));
   compileAt([...triggerPath, "steps"], () =>
@@ -643,6 +656,7 @@ function compileTrigger(
     maxRuntimeMs: compileAt([...triggerPath, "max_runtime"], () =>
       parseDurationMs(trigger.max_runtime, `trigger ${trigger.name} max_runtime`),
     ),
+    ...(trigger.progress_message === true ? { progressMessage: true as const } : {}),
     steps,
     inputs,
     values,

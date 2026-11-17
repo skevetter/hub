@@ -58,6 +58,18 @@ function legacyCompiledConfiguration(compiled: CompiledHubConfig): unknown {
 }
 
 describe("workflow compiler", () => {
+  it("refuses a legacy workflow progress opt-in without a destination", () => {
+    const authored = configuration();
+    const trigger = authored.triggers[0]!;
+    assert.throws(
+      () => compileHubConfig({ ...authored, triggers: [{ ...trigger, progress_message: true }] }),
+      {
+        path: ["triggers", "run", "progress_message"],
+        message: /^progress_message needs an event with a place to post:/u,
+      },
+    );
+  });
+
   it("round-trips the ready-for-review event and its actor allowlist", () => {
     const authored = configuration();
     authored.triggers[0]!.on = "github.pull_request_ready_for_review";

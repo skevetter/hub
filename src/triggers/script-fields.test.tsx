@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it } from "vitest";
 import type { TriggerFormValue } from "./configuration/editor.js";
+import { ProgressMessageField } from "./panel.js";
 import { ActionField, ScriptFields, triggerSecondaryLine } from "./script-fields.js";
 
 const form: TriggerFormValue = {
@@ -33,6 +34,49 @@ const form: TriggerFormValue = {
 
 const promptForm: TriggerFormValue = { ...form, action: "prompt" };
 const noop = () => undefined;
+
+describe("trigger progress message field", () => {
+  it.each(["github.push", "manual.run", "schedule.tick", "discord.mention"] as const)(
+    "hides the control on %s",
+    (event) => {
+      const markup = renderToStaticMarkup(
+        <ProgressMessageField event={event} checked={false} hubEnabled onChange={noop} />,
+      );
+      assert.equal(markup, "");
+    },
+  );
+
+  it.each(["github.notification", "slack.mention", "linear.comment_created"] as const)(
+    "shows the checkbox and its visibility copy on %s",
+    (event) => {
+      const markup = renderToStaticMarkup(
+        <ProgressMessageField event={event} checked hubEnabled onChange={noop} />,
+      );
+      assert.match(markup, /type="checkbox"[^>]*checked=""/u);
+      assert.match(markup, /Post live progress at the source/u);
+      assert.match(
+        markup,
+        /Anyone who can see the source can read the message\. It shows only run status, counts, and durations/u,
+      );
+      assert.match(markup, /never includes agent output/u);
+      assert.doesNotMatch(markup, /turned off/u);
+    },
+  );
+
+  it("explains when the Hub switch is off and still allows authors to opt in", () => {
+    const markup = renderToStaticMarkup(
+      <ProgressMessageField
+        event="slack.mention"
+        checked={false}
+        hubEnabled={false}
+        onChange={noop}
+      />,
+    );
+    assert.match(markup, /This Hub has progress messages turned off/u);
+    assert.match(markup, /type="checkbox"/u);
+    assert.doesNotMatch(markup, /(?:disabled|checked)=""/u);
+  });
+});
 
 describe("trigger action choice", () => {
   it("offers Prompt and Script, with Script chosen for a script trigger", () => {

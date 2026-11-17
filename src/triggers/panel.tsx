@@ -47,6 +47,7 @@ import { EventFields } from "./event-fields.js";
 import { ActionField, ScriptFields, triggerSecondaryLine } from "./script-fields.js";
 import { NotificationStatusCard } from "./notification-status-card.js";
 import { LastTriggered } from "./last-triggered.js";
+import { hasProgressDestination } from "./progress-events.js";
 import { WebhookCard } from "./webhook-card.js";
 import { IDENTIFIER, TriggerDocumentSchema } from "./configuration/schema.js";
 import { webhookSettings } from "../webhooks/functions.js";
@@ -623,6 +624,33 @@ function fieldError(errors: TriggerFieldErrors, key: keyof TriggerFormValue) {
   return error === undefined ? {} : { error };
 }
 
+export function ProgressMessageField({
+  event,
+  checked,
+  hubEnabled,
+  onChange,
+}: {
+  event: TriggerFormValue["event"];
+  checked: boolean;
+  hubEnabled: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  if (!hasProgressDestination(event)) return null;
+  const description =
+    "Anyone who can see the source can read the message. It shows only run status, counts, and durations and never includes agent output.";
+  return (
+    <CheckboxField
+      id="trigger-progress-message"
+      label="Post live progress at the source"
+      description={
+        hubEnabled ? description : `${description} This Hub has progress messages turned off.`
+      }
+      checked={checked}
+      onChange={onChange}
+    />
+  );
+}
+
 function TriggerForm({
   form,
   errors,
@@ -753,6 +781,12 @@ function TriggerForm({
             )}
           </div>
           <EventFields value={form} errors={errors} onChange={onChange} />
+          <ProgressMessageField
+            event={form.event}
+            checked={form.progressMessage === true}
+            hubEnabled={snapshot.progressMessagesEnabled}
+            onChange={(checked) => update("progressMessage", checked)}
+          />
         </Card>
 
         {needsActorFilter(form) ? (

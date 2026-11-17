@@ -98,6 +98,7 @@ export interface DurableWorkflowEngineOptions {
   now?: () => Date;
   onWorkflowDeadlineExceeded?: (recovery: WorkflowDeadlineRecovery) => Promise<void>;
   onWorkflowRunAccepted?: (run: AcceptedTriggerRunRecord) => Promise<JsonValue | null | void>;
+  onProgressRequested?: (run: AcceptedTriggerRunRecord) => void | Promise<void>;
   onWorkflowRunStarted?: (run: AcceptedTriggerRunRecord) => Promise<JsonValue | null | void>;
   onWorkflowRunTerminal?: (run: TriggerRunRecord) => Promise<JsonValue | null | void>;
   timeline?: RunTimeline;
@@ -268,7 +269,15 @@ export class DurableWorkflowEngine {
           stepIds: compiledTrigger.steps.map((step) => step.id),
           createdAt,
         });
-        if (created.created) await this.deliverWorkflowRunAccepted(created.run);
+        if (!created.created) return;
+        if (compiledTrigger.progressMessage === true) {
+          try {
+            await this.options.onProgressRequested?.(created.run);
+          } catch {
+            this.logger.warn({ triggerRunId: created.run.id }, "could not request run progress");
+          }
+        }
+        await this.deliverWorkflowRunAccepted(created.run);
       }),
     );
     logProviderEventRouting({

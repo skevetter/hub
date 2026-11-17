@@ -5,10 +5,30 @@ import { createMemoryDatabase } from "../db/memory.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
 import type { GitHubNotificationStore } from "./github-notifications/index.js";
+import { readRunProgressSettings } from "../run-progress/settings.js";
 import { TriggerDashboard } from "./dashboard.js";
 import { OrganizationTriggerStore } from "./store.js";
 
 describe("trigger dashboard read model", () => {
+  it.each([undefined, "false", "true"])(
+    "exposes the configured progress message switch (%s)",
+    async (flag) => {
+      const database = createMemoryDatabase({ memberships: [MEMBERSHIP] });
+      const dashboard = new TriggerDashboard(database, accountAuth(), acceptingAgentValidator(), {
+        runProgress: readRunProgressSettings({
+          PASEO_HUB_RUN_TIMELINE: "true",
+          PASEO_HUB_PROGRESS_MESSAGES: flag,
+        }),
+      });
+      const request = new Request("https://hub.test/o/acme/triggers");
+
+      assert.equal(
+        (await dashboard.snapshot(request, "acme")).progressMessagesEnabled,
+        flag === "true",
+      );
+    },
+  );
+
   it("describes the provider and latest run on the organization trigger list", async () => {
     const database = createMemoryDatabase({
       memberships: [

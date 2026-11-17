@@ -25,6 +25,7 @@ const NOTIFICATION_EVENT = "github.notification";
 export interface TriggerDashboardOptions {
   /** True when this Hub has a token for the GitHub notification poll. The token never leaves it. */
   githubNotificationsEnabled?: boolean;
+  progressMessagesEnabled?: boolean;
   /** Seconds between polls, as configured. Shown on the status card. */
   githubNotificationsPollSeconds?: number;
   now?: () => Date;
@@ -36,12 +37,17 @@ export interface TriggerDashboardOptions {
 }
 
 export class TriggerDashboard {
+  private readonly progressMessagesEnabled: boolean;
+
   constructor(
     private readonly database: Database,
     private readonly auth: AuthServer,
     private readonly agentValidator: DaemonAgentConfigurationValidator,
     private readonly options: TriggerDashboardOptions = {},
-  ) {}
+  ) {
+    this.progressMessagesEnabled =
+      options.progressMessagesEnabled ?? options.runProgress?.progressMessagesEnabled ?? false;
+  }
 
   /** Only an organization that uses the event sees the poll's health. */
   private async notificationStatus(
@@ -103,6 +109,7 @@ export class TriggerDashboard {
     return {
       organization: tenant.organization,
       canManage: capabilitiesFor(tenant.membership.role).manageResources,
+      progressMessagesEnabled: this.progressMessagesEnabled,
       triggers: triggerViews,
       ...(notifications === undefined ? {} : { notifications }),
       activity,
@@ -171,7 +178,7 @@ export class TriggerDashboard {
         Object.assign(step, { timelineStepId: timelineStepId(step.stepId) }),
       ),
       timeline,
-      progressMessagesEnabled: this.options.runProgress?.progressMessagesEnabled ?? false,
+      progressMessagesEnabled: this.progressMessagesEnabled,
       progress:
         progress === undefined
           ? null

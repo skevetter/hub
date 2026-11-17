@@ -5,6 +5,7 @@ import {
   type Recurrence,
 } from "../schedule/recurrence.js";
 import { ContinuationSchema } from "../continuation.js";
+import { hasProgressDestination, PROGRESS_DESTINATION_REQUIRED } from "../progress-events.js";
 import { parseDocument, stringify, type Document } from "yaml";
 import { z } from "zod";
 import {
@@ -33,6 +34,7 @@ const DEFAULT_AGENT_MAX_RUNTIME = "2h";
 export interface TriggerFormValue {
   name: string;
   enabled: boolean;
+  progressMessage?: boolean;
   event: EditorEvent;
   connection: string;
   allowedUsers: string;
@@ -100,6 +102,9 @@ function toBaseFormValue(
   return {
     name: trigger.name,
     enabled: trigger.enabled,
+    ...(trigger.progress_message === undefined
+      ? {}
+      : { progressMessage: trigger.progress_message }),
     event,
     connection: definition.connection ?? "",
     allowedUsers: definition.filters?.from_users?.join(", ") ?? "*",
@@ -172,11 +177,14 @@ function toFormValue(
 export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string {
   const projection = projectTriggerForm(yaml);
   if (projection.status !== "editable") throw new Error(projection.reason);
-  if (sameFormValue(projection.value, value)) return yaml;
-  validateFormValue(value);
+  const unchanged = sameFormValue(projection.value, value);
+  if (unchanged && value.progressMessage !== false) return yaml;
+  if (!unchanged) validateFormValue(value);
 
   const document = parseDocument(yaml, { compat: ["timestamp"] });
   assertDocument(document);
+  setOptional(document, ["progress_message"], value.progressMessage === true ? true : undefined);
+  if (unchanged) return document.toString({ lineWidth: 0 });
   setIfChanged(document, ["name"], value.name);
   setIfChanged(document, ["enabled"], value.enabled);
 
@@ -285,12 +293,16 @@ function incompleteReason(cause: unknown): string {
 
 export function createTriggerYaml(value: TriggerFormValue): string {
   validateFormValue(value);
+  const trigger = {
+    name: value.name,
+    enabled: value.enabled,
+    on: { [value.event]: formEventDefinition(value) },
+    ...(value.progressMessage === true ? { progress_message: true } : {}),
+  };
   if (value.action === "script") {
     return stringify(
       {
-        name: value.name,
-        enabled: value.enabled,
-        on: { [value.event]: formEventDefinition(value) },
+        ...trigger,
         run: {
           target: { daemon: value.daemon, cwd: value.cwd },
           script: value.script,
@@ -303,12 +315,9 @@ export function createTriggerYaml(value: TriggerFormValue): string {
   const agent = splitAgentId(value.agent);
   const providerOptions = parseProviderOptions(value.providerOptions);
   const github = githubAuthority(value);
-  const definition = formEventDefinition(value);
   return stringify(
     {
-      name: value.name,
-      enabled: value.enabled,
-      on: { [value.event]: definition },
+      ...trigger,
       run: {
         target: { daemon: value.daemon, cwd: value.cwd },
         agent: {
@@ -354,6 +363,12 @@ function workingDirectoryErrors(value: TriggerFormValue): TriggerFieldErrors {
   const cwd = value.cwd.trim();
   if (cwd.length === 0) return { cwd: "Working directory is required." };
   return cwd.startsWith("/") ? {} : { cwd: "Working directory must be an absolute path." };
+}
+
+function progressMessageErrors(value: TriggerFormValue): TriggerFieldErrors {
+  return value.progressMessage === true && !hasProgressDestination(value.event)
+    ? { progressMessage: PROGRESS_DESTINATION_REQUIRED }
+    : {};
 }
 
 function recurrenceErrors(value: TriggerFormValue): TriggerFieldErrors {
@@ -414,6 +429,7 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   if (eventDefinition(value.event).origin === "provider") {
     if (value.connection.trim().length === 0) errors.connection = "Connection is required.";
   }
+  Object.assign(errors, progressMessageErrors(value));
   if (needsActorFilter(value)) Object.assign(errors, actorErrors(value));
   for (const qualifier of eventDefinition(value.event).qualifiers) {
     const selection = value.qualifiers[qualifier.key];
@@ -603,7 +619,15 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
       }
     }
   }
-  return { ...value, event, qualifiers, connection: sameProvider ? value.connection : "" };
+  return {
+    ...value,
+    event,
+    qualifiers,
+    connection: sameProvider ? value.connection : "",
+    ...(value.progressMessage === true && !hasProgressDestination(event)
+      ? { progressMessage: false }
+      : {}),
+  };
 }
 
 /**

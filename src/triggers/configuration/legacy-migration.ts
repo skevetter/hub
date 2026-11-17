@@ -143,6 +143,7 @@ function singleRunDocument(
     ...(trigger.maxRuntimeMs === step.maxRuntimeMs
       ? {}
       : { max_runtime: duration(trigger.maxRuntimeMs) }),
+    ...(trigger.progressMessage === true ? { progress_message: true } : {}),
     run: {
       continuation: { mode: "new" },
       target: {

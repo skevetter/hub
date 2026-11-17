@@ -195,6 +195,37 @@ describe("trigger form YAML bridge", () => {
     });
   });
 
+  test.each([undefined, false, true])("projects and exports progress_message %s", (flag) => {
+    const yaml =
+      flag === undefined
+        ? ADVANCED
+        : `progress_message: ${String(flag)}
+${ADVANCED}`;
+    const projection = projectTriggerForm(yaml);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    expect(projection.value.progressMessage).toBe(flag);
+
+    const exported = patchTriggerYaml(yaml, projection.value);
+    expect(parseDocument(exported).get("progress_message")).toBe(flag === true ? true : undefined);
+    expect(exported).toContain("# keep this heading");
+
+    const edited = patchTriggerYaml(yaml, { ...projection.value, progressMessage: flag !== true });
+    expect(parseDocument(edited).get("progress_message")).toBe(flag === true ? undefined : true);
+
+    const fresh = createTriggerYaml(projection.value);
+    expect(parseDocument(fresh).get("progress_message")).toBe(flag === true ? true : undefined);
+  });
+
+  test("clears the hidden progress opt-in when changing to a destinationless event", () => {
+    const yaml = `progress_message: true
+${ADVANCED}`;
+    const projection = projectTriggerForm(yaml);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    const form = changeTriggerEvent(projection.value, "manual.run");
+    expect(form.progressMessage).toBe(false);
+    expect(parseDocument(patchTriggerYaml(yaml, form)).has("progress_message")).toBe(false);
+  });
+
   test("writes complete_on_turn_end only when the box is ticked", () => {
     const form = {
       name: "answer",

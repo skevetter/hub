@@ -104,6 +104,15 @@ describe("script trigger form bridge", () => {
     expect(editable(yaml).script).toBe("make deploy\nmake verify\n");
   });
 
+  test("writes and projects the same progress opt-in for a script", () => {
+    const yaml = createTriggerYaml(scriptForm({ progressMessage: true }));
+    expect(editable(yaml).progressMessage).toBe(true);
+    expect(compileTriggerDocument(yaml).events[0]?.progressMessage).toBe(true);
+
+    const cleared = patchTriggerYaml(yaml, { ...editable(yaml), progressMessage: false });
+    expect(parseDocument(cleared).has("progress_message")).toBe(false);
+  });
+
   test("a multi-line script survives create, project, and merge unchanged", () => {
     const script = "set -eu\nif [ -n \"$HUB_EVENT_JSON\" ]; then\n  echo 'it''s \"quoted\"'\nfi\n";
     const yaml = createTriggerYaml(scriptForm({ script }));
