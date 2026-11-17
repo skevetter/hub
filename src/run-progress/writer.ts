@@ -6,7 +6,7 @@ import type {
   UpdateRunProgressMessageInput,
 } from "../run-timeline/store.js";
 import { isRunTimelineExpired, retentionCutoff } from "../run-timeline/retention.js";
-import { CredentialBackoff } from "./backoff.js";
+import { CREDENTIAL_CIRCUIT_MS, CredentialBackoff } from "./backoff.js";
 import { renderProgress } from "./render.js";
 import type { RunProgressSettings } from "./settings.js";
 import {
@@ -94,6 +94,12 @@ interface Operation {
   body: string;
   hash: string;
   budget: Budget;
+}
+
+function credentialKey({ lease, ref }: Operation): string {
+  return createHash("sha256")
+    .update(JSON.stringify([lease.provider, ref.credential]))
+    .digest("hex");
 }
 
 type MutationOutcome = ProgressCall | "transient" | "timeout";
@@ -339,9 +345,12 @@ export class MessageWriter {
     provider: ProgressProvider,
   ): Promise<WriteResult> {
     const { lease, run, ref, body, budget } = operation;
-    const { backoff, clock, report } = this.options;
+    const { backoff, clock, database } = this.options;
     const locator = ref.credential;
-    const admission = backoff.admit(locator, clock.now());
+    const shared = await budget.run(() =>
+      database.readProgressCredentialCooldown(credentialKey(operation)),
+    );
+    const admission = backoff.admit(locator, clock.now(), shared);
     if ("waitUntil" in admission) return this.release(lease, {}, admission.waitUntil);
     if ("rejected" in admission)
       return this.release(lease, {
@@ -366,7 +375,7 @@ export class MessageWriter {
           secrets = await budget.run((signal) => provider.secrets(locator, signal), PROVIDER_MS);
       } catch {
         if (this.options.signal.aborted) return {};
-        const retryAt = backoff.result(locator, clock.now(), "transient", () => undefined);
+        const retryAt = await this.recordBackoff(operation, "transient");
         return this.transientFailure(operation, retryAt, false, false);
       }
       if (authorization !== "ok") {
@@ -377,12 +386,10 @@ export class MessageWriter {
             failureCode(authorization.refused, "policy_refused"),
           );
         if (authorization.unavailable === "credential_rejected") {
-          backoff.result(
-            locator,
-            clock.now(),
-            { status: "unavailable", code: "credential_rejected" },
-            () => report("credential_rejected", lease),
-          );
+          await this.recordBackoff(operation, {
+            status: "unavailable",
+            code: "credential_rejected",
+          });
           return this.release(lease, {
             state: "unavailable",
             failure: "credential_rejected",
@@ -469,17 +476,15 @@ export class MessageWriter {
     outcome: MutationOutcome,
     secrets: readonly string[],
   ): Promise<WriteResult> {
-    const { lease, kind, ref } = operation;
-    const { database, clock, backoff, report } = this.options;
+    const { lease, kind } = operation;
+    const { database, clock } = this.options;
     const now = clock.now();
     if (outcome === "timeout" && kind === "regular") {
       return this.transientFailure(operation, now + REGULAR_TIMEOUT_WAIT_MS, true, true);
     }
-    const retryAt = backoff.result(
-      ref.credential,
-      now,
+    const retryAt = await this.recordBackoff(
+      operation,
       typeof outcome === "string" ? "transient" : outcome,
-      () => report("credential_rejected", lease),
     );
     if (typeof outcome === "string" || outcome.status === "retry") {
       const safeCreate = typeof outcome !== "string" && outcome.notCreated && !outcome.transient;
@@ -503,6 +508,32 @@ export class MessageWriter {
       };
     }
     return result;
+  }
+
+  private async recordBackoff(
+    operation: Operation,
+    outcome: ProgressCall | "transient",
+  ): Promise<number> {
+    const { lease, ref } = operation;
+    const { database, clock, backoff, report } = this.options;
+    const now = clock.now();
+    const retryAt = backoff.result(ref.credential, now, outcome, () =>
+      report("credential_rejected", lease),
+    );
+    const rejected =
+      outcome !== "transient" &&
+      outcome.status === "unavailable" &&
+      outcome.code === "credential_rejected";
+    if (retryAt > now || rejected) {
+      await database.recordProgressCredentialCooldown({
+        triggerRunId: lease.triggerRunId,
+        organizationId: lease.organizationId,
+        key: credentialKey(operation),
+        retryAt: retryAt > now ? new Date(retryAt) : null,
+        rejectedUntil: rejected ? new Date(now + CREDENTIAL_CIRCUIT_MS) : null,
+      });
+    }
+    return retryAt;
   }
 
   private async recordRefusal(

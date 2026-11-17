@@ -1,7 +1,8 @@
+import type { ProgressCredentialCooldown } from "../run-timeline/store.js";
 import type { CredentialLocator, ProgressCall } from "./types.js";
 
 const MAX_RETRY_AFTER = 900_000;
-const CIRCUIT_MS = 600_000;
+export const CREDENTIAL_CIRCUIT_MS = 600_000;
 const MAX_IN_FLIGHT = 4;
 const WRITE_SPACING_MS = 1_000;
 
@@ -42,7 +43,7 @@ export class CredentialBackoff {
 
   constructor(private readonly random = Math.random) {}
 
-  admit(locator: CredentialLocator, now: number): Admission {
+  admit(locator: CredentialLocator, now: number, shared?: ProgressCredentialCooldown): Admission {
     const key = JSON.stringify(locator);
     let state = this.states.get(key);
     if (state === undefined) {
@@ -55,8 +56,9 @@ export class CredentialBackoff {
       };
       this.states.set(key, state);
     }
-    if (state.rejectedUntil > now) return { rejected: true };
-    const waitUntil = Math.max(state.writeAfter, state.retryAfter);
+    if (Math.max(state.rejectedUntil, shared?.rejectedUntil?.getTime() ?? 0) > now)
+      return { rejected: true };
+    const waitUntil = Math.max(state.writeAfter, state.retryAfter, shared?.retryAt?.getTime() ?? 0);
     if (waitUntil > now) return { waitUntil };
     if (state.busy || this.inFlight >= MAX_IN_FLIGHT) return { waitUntil: now + 250 };
 
@@ -90,7 +92,7 @@ export class CredentialBackoff {
       state.retryAfter = now + clampRetryAfter(result.afterMs);
     } else if (result.status === "unavailable" && result.code === "credential_rejected") {
       if (state.rejectedUntil <= now) reportRejected();
-      state.rejectedUntil = now + CIRCUIT_MS;
+      state.rejectedUntil = now + CREDENTIAL_CIRCUIT_MS;
     } else if (result.status === "ok") {
       state.sequentialFailures = 0;
     }

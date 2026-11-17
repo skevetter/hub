@@ -15,3 +15,6 @@ the message. Access to the linked run requires a Hub login.
 
 Hub rejects invalid settings at startup. Retention removes local progress rows even when the
 reporter is off. Messages already posted remain at the source.
+
+Hub shares credential cooldowns across processes through the database. Each process still
+limits its own provider calls to four in flight.
