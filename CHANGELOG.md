@@ -18,6 +18,7 @@
 
 ### Fixed
 
+- Disabled run streaming preserves the existing shutdown admission and resource order.
 - URL userinfo detection covers special-scheme slash and backslash forms before logger rewriting, with differential URL-parser coverage.
 - Armored-block detection avoids quadratic retries within long dash runs at the accepted input limit.
 - Truncation notices wake subscribers after a committed accounting acknowledgement is lost and later recovered.

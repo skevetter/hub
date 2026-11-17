@@ -86,7 +86,11 @@ async function createOwnedApplicationRuntime(
   ownership: CompositionResources,
 ): Promise<ApplicationRuntime> {
   const timelineRuntime = createRunTimelineRuntime(options, ownership);
-  const { runStream, hubOptions: streamOptions } = createRunStreamRuntime(options, timelineRuntime);
+  const { runStream, hubOptions: streamOptions } = createRunStreamRuntime(
+    options,
+    timelineRuntime,
+    ownership,
+  );
   const registrations = options.registrations ?? [];
   const connections = new Map(
     registrations.map((registration) => [registration.connection.name, registration.connection]),
@@ -145,7 +149,6 @@ async function createOwnedApplicationRuntime(
     webhookOptions: options.webhookOptions,
   });
   ownership.own(() => application.hub.stop(), "composition.hub");
-  ownership.own(() => runStream.beginShutdown(), "composition.run_stream");
   await application.hub.start(
     registrations.flatMap((registration) =>
       registration.sources.map((source, index) => ({
@@ -383,6 +386,7 @@ async function createOwnedApplicationRuntime(
 function createRunStreamRuntime(
   options: ApplicationCompositionOptions,
   timeline: { timelineBus?: RunTimelineBus; runTimelineReconciler?: RunTimelineReconciler },
+  ownership: CompositionResources,
 ) {
   const settings = options.runProgress ?? readRunProgressSettings({});
   const scrubValues = [
@@ -405,6 +409,9 @@ function createRunStreamRuntime(
       );
     },
   });
+  if (settings.runStreamEnabled) {
+    ownership.own(() => runStream.beginShutdown(), "composition.run_stream");
+  }
   const hubOptions: Pick<HubRuntimeOptions, "runStream"> = settings.runStreamEnabled
     ? { runStream }
     : {};

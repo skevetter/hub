@@ -311,7 +311,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       await Promise.all(activeSources.map(async (source) => source.start(workflowDispatcher)));
     },
     async stop() {
-      await options.runStream?.beginShutdown();
+      if (options.runStream !== undefined) await options.runStream.beginShutdown();
       try {
         await Promise.all(
           activeSources.map((source, index) => {
