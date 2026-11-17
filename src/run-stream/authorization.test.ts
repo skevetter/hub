@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { setImmediate } from "node:timers/promises";
 import { afterAll, afterEach, beforeAll, describe, it, vi } from "vitest";
 import { RunStream } from "./index.js";
+import type { DatabaseRuntime } from "../db/runtime/index.js";
 import {
   createStreamHarness,
   FOREIGN,
@@ -17,6 +18,33 @@ function browserRequest(runId: string, organization = "stream") {
   return new Request(`http://localhost/api/v1/runs/${runId}/events?organization=${organization}`, {
     headers: { cookie: "session=member", "x-request-id": "stream-request" },
   });
+}
+
+function trackQueryCompletion(runtime: DatabaseRuntime) {
+  const pending = new Set<Promise<unknown>>();
+  const originalQuery = runtime.query.bind(runtime);
+  runtime.query = new Proxy(originalQuery, {
+    apply(operation, receiver: unknown, args: unknown[]) {
+      const result: unknown = Reflect.apply(operation, receiver, args);
+      if (result instanceof Promise) {
+        pending.add(result);
+        void result.finally(() => pending.delete(result)).catch(() => undefined);
+      }
+      return result;
+    },
+  });
+  return {
+    async settle() {
+      while (true) {
+        await setImmediate();
+        if (pending.size === 0) return;
+        await Promise.all(pending);
+      }
+    },
+    restore() {
+      runtime.query = originalQuery;
+    },
+  };
 }
 
 for (const backend of ["embedded", "pooled"] as const) {
@@ -192,35 +220,38 @@ for (const backend of ["embedded", "pooled"] as const) {
       const request = isBrowser
         ? browserRequest(run.id)
         : streamRequest(run.id, isCli ? cli.token : key.secret);
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
-      const service = stream();
-      const reader = new StreamReader(await service.handle(request, run.id));
-      await reader.event("status");
-      const table = isCli ? "organization_cli_credentials" : "organization_api_keys";
-      const id = isCli ? cli.id : key.summary.id;
-      const before = await harness.runtime!.query<{ last_used_at: Date }>(
-        `select last_used_at from ${table} where id = $1`,
-        [id],
-      );
-      if (mode === "key revocation") await harness.apiKeys!.revoke(ORGANIZATION, key.summary.id);
-      if (mode === "scope removal")
-        await harness.runtime!.query(
-          "update organization_api_keys set scopes = ARRAY['runs:dispatch'] where id = $1",
-          [key.summary.id],
-        );
-      if (mode === "CLI revocation") await harness.cliCredentials!.revoke(ORGANIZATION, cli.id);
-      if (mode === "owner removal")
-        await harness.runtime!.query("delete from member where id = 'stream-owner-row'");
-      if (mode === "owner demotion")
-        await harness.runtime!.query(
-          "update member set role = 'member' where id = 'stream-owner-row'",
-        );
-      if (mode === "session expiry") harness.setSessionActive(false);
-      if (mode === "member removal") await harness.removeMember();
+      const queries = trackQueryCompletion(harness.runtime!);
       try {
+        vi.useFakeTimers({
+          toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+        });
+        const service = stream();
+        const reader = new StreamReader(await service.handle(request, run.id));
+        await reader.event("status");
+        const table = isCli ? "organization_cli_credentials" : "organization_api_keys";
+        const id = isCli ? cli.id : key.summary.id;
+        const before = await harness.runtime!.query<{ last_used_at: Date }>(
+          `select last_used_at from ${table} where id = $1`,
+          [id],
+        );
+        if (mode === "key revocation") await harness.apiKeys!.revoke(ORGANIZATION, key.summary.id);
+        if (mode === "scope removal")
+          await harness.runtime!.query(
+            "update organization_api_keys set scopes = ARRAY['runs:dispatch'] where id = $1",
+            [key.summary.id],
+          );
+        if (mode === "CLI revocation") await harness.cliCredentials!.revoke(ORGANIZATION, cli.id);
+        if (mode === "owner removal")
+          await harness.runtime!.query("delete from member where id = 'stream-owner-row'");
+        if (mode === "owner demotion")
+          await harness.runtime!.query(
+            "update member set role = 'member' where id = 'stream-owner-row'",
+          );
+        if (mode === "session expiry") harness.setSessionActive(false);
+        if (mode === "member removal") await harness.removeMember();
         for (let tick = 0; tick < 30; tick++) {
           await vi.advanceTimersByTimeAsync(2000);
-          for (let fence = 0; fence < 4; fence++) await harness.runtime!.query("select 1");
+          await queries.settle();
         }
         const error = await reader.event("error");
         assert.deepEqual(error.data, { code: "unauthorized" });
@@ -235,6 +266,8 @@ for (const backend of ["embedded", "pooled"] as const) {
         assert.equal(service.notifierCount(), 0);
         await setImmediate();
       } finally {
+        vi.useRealTimers();
+        queries.restore();
         await harness.runtime!.query(
           `insert into member (id, organization_id, user_id, role) values ('stream-owner-row', 'stream-organization', 'stream-owner', 'owner') on conflict (id) do update set role = 'owner'`,
         );

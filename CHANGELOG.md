@@ -19,6 +19,7 @@
 
 ### Fixed
 
+- Stream reauthorization tests wait for pending pooled queries before advancing the clock.
 - Fetch-forbidden HTTP methods return a transport method problem before request construction.
 - Stream storage failure reports retain the request identifier returned in the response.
 - Registered responses returned after client disconnect run abort cleanup once and cancel their bodies.
