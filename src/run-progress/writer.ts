@@ -441,7 +441,13 @@ export class MessageWriter {
     } finally {
       backoff.sent(ref.credential, sentAt);
     }
-    return this.record(operation, current, observedGen, outcome, secrets);
+    try {
+      return await this.record(operation, current, observedGen, outcome, secrets);
+    } catch {
+      // Preserve the lease for recovery when the outcome and repair signal are both uncertain.
+      this.options.report("outcome_record_failed", lease);
+      return { row: lease, wakeAt: clock.now() + LEASE_RETRY_MS };
+    }
   }
 
   private async record(

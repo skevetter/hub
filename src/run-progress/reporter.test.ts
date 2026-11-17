@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setImmediate as nextTurn, setTimeout as wait } from "node:timers/promises";
+import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { afterEach, describe, it, vi } from "vitest";
 import { createDaemonDispatchLifecycle } from "../daemons/lifecycle.js";
 import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
@@ -14,6 +17,7 @@ import {
 import type { TriggerProvider } from "../triggers/index.js";
 import { createDurableWorkflowHandler } from "../workflows/engine.js";
 import { createTimelinePostgresHarness } from "../db/test-utils/run-timeline-postgres.js";
+import { createPostgresTestRuntime } from "../db/test-utils/runtime.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { createDatabase } from "../db/pg.js";
 import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
@@ -21,6 +25,8 @@ import type { AcceptedTriggerRunRecord, Database } from "../db/types.js";
 import { RunTimelineBus } from "../run-timeline/bus.js";
 import type { RunTimelineEvent } from "../run-timeline/store.js";
 import { ProgressReporter } from "./index.js";
+import { CredentialBackoff } from "./backoff.js";
+import { MessageWriter } from "./writer.js";
 import type { ProgressCall, ProgressClock, ProgressProvider, StoredRef } from "./types.js";
 
 const ORGANIZATION = "org-progress";
@@ -1049,4 +1055,146 @@ describe("progress scheduling", () => {
     assert.equal((await run.read())?.state, "abandoned");
     assert.equal((await run.read())?.failure, "final_retry_expired");
   });
+});
+
+it("serializes finalization against a separate Hub process and recovers its expired lease", async () => {
+  const container = await new PostgreSqlContainer("postgres:17-alpine").start();
+  cleanup.push(async () => {
+    await container.stop();
+  });
+  const connection = container.getConnectionUri();
+  const postgres = await createPostgresTestRuntime(connection);
+  cleanup.push(() => postgres.runtime.close());
+  await postgres.runtime.query(
+    "insert into organization (id, name, slug) values ($1, 'Progress', 'progress')",
+    [ORGANIZATION],
+  );
+  const f = fixture(postgres.database);
+
+  for (const exit of ["complete", "crash"] as const) {
+    const run = await f.seed({ state: "active" });
+    const scope = { triggerRunId: run.run.id, organizationId: ORGANIZATION };
+    const child = startExternalWriter(connection, scope, f.clock.now());
+    cleanup.push(async () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, "exit");
+      child.kill("SIGKILL");
+      await exited;
+    });
+    const message: unknown[] = await Promise.race([
+      once(child, "message"),
+      once(child, "exit").then(() => {
+        throw new Error("Writer exited before sending");
+      }),
+    ]);
+    const [body] = message;
+    assert.ok(typeof body === "string");
+    assert.match(body, /Paseo run: Running/u);
+    const old = await run.read();
+    assert.ok(old?.leaseOwner);
+    const firstRequest = f.provider.requests.length;
+
+    await run.finish();
+    const replacement = new MessageWriter({
+      database: f.store,
+      clock: f.clock,
+      settings: { minEditSeconds: 20, maxEdits: 120, retentionDays: 30 },
+      signal: new AbortController().signal,
+      backoff: new CredentialBackoff(),
+      report: () => {},
+    });
+    const blocked = await replacement.write(scope, f.provider);
+    assert.equal(blocked.wakeAt, f.clock.now() + 5_000);
+    assert.equal(f.provider.requests.length, firstRequest);
+    assert.equal((await run.read())?.leaseOwner, old.leaseOwner);
+
+    const exited = once(child, "exit");
+    if (exit === "complete") child.send("land");
+    else child.kill("SIGKILL");
+    assert.deepEqual(await exited, exit === "complete" ? [0, null] : [null, "SIGKILL"]);
+
+    if (exit === "crash") {
+      await f.clock.advanceTo(59_999);
+      assert.equal((await replacement.write(scope, f.provider)).row?.leaseOwner, old.leaseOwner);
+      await f.clock.advanceTo(60_000);
+    }
+    await replacement.write(scope, f.provider);
+    assert.equal(f.provider.requests.length, firstRequest + 1);
+    assert.match(f.provider.requests.at(-1)?.body ?? "", /Paseo run: Succeeded/u);
+    assert.equal((await run.read())?.state, "finished");
+    if (exit === "crash") assert.equal((await run.read())?.compensationRequestedGen, 2);
+  }
+}, 45_000);
+
+function startExternalWriter(
+  connection: string,
+  scope: { triggerRunId: string; organizationId: string },
+  now: number,
+) {
+  const source = `
+    import { once } from "node:events";
+    import { createDatabase } from "./src/db/pg.ts";
+    import { postgresDatabaseRuntime } from "./src/db/runtime/index.ts";
+    import { CredentialBackoff } from "./src/run-progress/backoff.ts";
+    import { progressClock } from "./src/run-progress/types.ts";
+    import { MessageWriter } from "./src/run-progress/writer.ts";
+
+    const { runtime, locks } = await postgresDatabaseRuntime(process.env.PASEO_REPORTER_TEST_DATABASE, { max: 1 });
+    try {
+      const writer = new MessageWriter({
+        database: createDatabase(runtime, locks),
+        clock: { ...progressClock, now: () => ${JSON.stringify(now)} },
+        settings: { minEditSeconds: 20, maxEdits: 120, retentionDays: 30 },
+        signal: new AbortController().signal,
+        backoff: new CredentialBackoff(),
+        report: () => {},
+      });
+      const result = await writer.write(${JSON.stringify(scope)}, {
+        name: "linear",
+        maxBodyChars: 4000,
+        authorize: async () => "ok",
+        secrets: async () => [],
+        edit: async (_ref, body) => {
+          const landing = once(process, "message");
+          process.send(body);
+          await landing;
+          return { status: "ok" };
+        },
+      });
+      if (result.row?.editCount !== 1) process.exitCode = 2;
+    } finally {
+      await runtime.close();
+      process.disconnect();
+    }
+  `;
+  return spawn(process.execPath, ["--import", "tsx", "--eval", source], {
+    env: { ...process.env, PASEO_REPORTER_TEST_DATABASE: connection },
+    stdio: ["ignore", "ignore", "inherit", "ipc"],
+  });
+}
+
+it("keeps the lease recoverable if recording a write and its repair request both fail", async () => {
+  const f = fixture();
+  const run = await f.seed({ state: "active" });
+  const update = f.store.updateRunProgressMessage.bind(f.store);
+  let failOnce = true;
+  vi.spyOn(f.store, "updateRunProgressMessage").mockImplementation(async (input) => {
+    if (failOnce && input.patch.lastRenderedHash !== undefined) {
+      failOnce = false;
+      throw new Error("database unavailable");
+    }
+    return update(input);
+  });
+  vi.spyOn(f.store, "requestCompensation").mockRejectedValueOnce(new Error("database unavailable"));
+  f.start();
+  await f.clock.advanceTo(0);
+  await f.event(run.run, "tool_finished", 1);
+  await f.clock.advanceTo(0);
+  assert.equal(f.provider.requests.length, 1);
+  const old = await run.read();
+  assert.ok(old?.leaseOwner);
+  assert.deepEqual(f.failures, ["outcome_record_failed"]);
+  await f.clock.advanceTo(60_000);
+  assert.equal(f.provider.requests.length, 2);
+  assert.equal((await run.read())?.compensationDoneGen, 1);
 });
