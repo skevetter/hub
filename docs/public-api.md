@@ -74,6 +74,14 @@ Source progress messages are not provided by this build.
 
 The instance operator console reads organization identity, entitlements, usage and entitlement history. It does not read run or timeline records. Capture does not add operator access.
 
+## Run detail in Activity
+
+Any organization member can open a run from Activity. The page combines the stored run summary, timeline and step results. Tool starts and finishes share a row within each step. Permission waits stay open until resolved. New events follow the bottom only while the reader is there. Jump to latest resumes following.
+
+Live connections use same-origin cookies. After three consecutive connection failures or a disabled stream response, the page polls every five seconds. A terminal run status alone does not stop polling. The reader must reach the stored seal, or the timeline must expire. The page refreshes persisted step results at the seal and every ten seconds during runs with omitted step rows or more than 100 steps.
+
+Derived timelines show only persisted lifecycle events and say that no tool events were recorded. Expired timelines show no event rows. Pending steps left after a run ends read as Not run. Timeline text is plain text without Markdown or automatic links. The Progress message row describes the disabled Hub setting in this build. It does not imply a provider message was posted.
+
 ## Run event streams
 
 `GET /api/v1/runs/{id}/events` reads only stored timeline rows. Create a separate API key for each consumer and grant only `runs:read`. `runs:dispatch` does not imply read access. CLI credentials also work, while their owner remains an owner or admin. A browser member of any role can use a same-origin session with `?organization=<slug>`.

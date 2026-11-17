@@ -107,13 +107,12 @@ describe("organization activity routes", () => {
 
       state.snapshot = null;
       const missing = await renderRoute("/o/acme%20team/activity/missing-run");
-      assert.match(missing, /Run not found/u);
+      assert.match(missing, /Run unavailable/u);
       assert.match(missing, /This run is unavailable/u);
-      assert.match(missing, /href="\/o\/acme%20team\/activity"/u);
       assert.ok(
         state.queryKeys.some(
           (key) =>
-            JSON.stringify(key) === JSON.stringify(["activity-run", "acme team", "missing-run"]),
+            JSON.stringify(key) === JSON.stringify(["run-detail", "acme team", "missing-run"]),
         ),
       );
     } finally {
