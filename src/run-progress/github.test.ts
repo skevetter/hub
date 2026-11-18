@@ -673,6 +673,16 @@ describe("GitHub run progress", () => {
     },
   );
 
+  it("writes only the signed hidden marker without exposing the raw run id", async () => {
+    const f = await fixture();
+    await f.seed();
+    await f.writer().write(f.scope, f.provider);
+    const body = f.state.comments[0]!.body;
+    assert.doesNotMatch(body, new RegExp(f.run.id, "u"));
+    assert.deepEqual(body.match(/<!--[^>]*-->/gu), [body.split("\n").at(-1)]);
+    assert.match(body, /<!-- paseo-run-progress:[a-f0-9]{64} -->$/u);
+  });
+
   it("stops visibility retries when the installation is revoked during the first read", async () => {
     const f = await fixture("app");
     await f.seed();

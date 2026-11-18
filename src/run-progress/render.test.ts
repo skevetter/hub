@@ -107,7 +107,7 @@ describe("progress message vocabulary", () => {
     );
   });
 
-  it("renders a successful final message with a GitHub marker", () => {
+  it("renders a successful GitHub final message without hidden identifiers", () => {
     const actual = renderProgress({
       ...defaults,
       provider: "github",
@@ -117,7 +117,6 @@ describe("progress message vocabulary", () => {
     assert.equal(
       actual,
       [
-        `<!-- paseo-hub-progress run=${RUN_ID} -->`,
         "Paseo run: Succeeded in 4m 02s",
         "Finished 10:06:13 UTC.",
         "Activity: 1 command, 1 read. 2 tool calls, 1 failed.",
@@ -204,7 +203,6 @@ describe("progress message vocabulary", () => {
           },
         });
         const expected = [];
-        if (provider === "github") expected.push(`<!-- paseo-hub-progress run=${RUN_ID} -->`);
         const linear = provider === "linear";
         expected.push(`Paseo run: ${(linear ? linearStatuses : statuses)[status]}`);
         if (status === "running") {

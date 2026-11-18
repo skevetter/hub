@@ -130,9 +130,6 @@ export function renderProgress(input: ProgressRenderInput): string {
     );
   }
 
-  if (provider === "github" && /^[0-9a-f-]{36}$/iu.test(run.id)) {
-    lines.unshift(`<!-- paseo-hub-progress run=${run.id} -->`);
-  }
   const escape = (text: string) =>
     provider === "slack"
       ? text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
