@@ -912,6 +912,7 @@ describe.each(backends)("run timeline contract (%s)", (_name, open) => {
           provider: "github",
           now: EVENT_AT,
         });
+        await settleProgress(store, run.id);
         await store.failWorkflowRun(run.id, "failed", "failed");
       }
       const withoutTimeline = await acceptedRun(isolated);
@@ -979,7 +980,7 @@ describe.each(backends)("run timeline contract (%s)", (_name, open) => {
     }
   }, 120_000);
 
-  it("expires progress-only rows without creating tombstones or touching the cutoff and live runs", async () => {
+  it("keeps unsettled progress and removes settled progress without creating tombstones", async () => {
     const isolated = await open();
     const store = isolated.database;
     try {
@@ -1008,6 +1009,9 @@ describe.each(backends)("run timeline contract (%s)", (_name, open) => {
         provider: "github",
         now: EVENT_AT,
       });
+      assert.equal(await store.expireRunTimelines(completed.run.completedAt, 500), 0);
+      assert.equal((await store.findRunProgressMessage(ORGANIZATION, old.id))?.state, "pending");
+      await settleProgress(store, old.id);
       assert.equal(await store.expireRunTimelines(completed.run.completedAt, 500), 1);
       assert.equal(await store.findRunProgressMessage(ORGANIZATION, old.id), undefined);
       assert.equal(await store.readRunTimelineState(ORGANIZATION, old.id), undefined);
@@ -1075,3 +1079,21 @@ it("matches PostgreSQL jsonb text and byte accounting for escaped, nested, multi
     await harness.close();
   }
 }, 120_000);
+
+async function settleProgress(database: Harness["database"], triggerRunId: string) {
+  const scope = {
+    organizationId: ORGANIZATION,
+    triggerRunId,
+    now: EVENT_AT,
+    owner: "retention-test",
+  };
+  const lease = await database.acquireRunProgressLease(scope);
+  assert.ok(lease);
+  assert.ok(
+    await database.updateRunProgressMessage({
+      ...scope,
+      version: lease.version,
+      patch: { state: "finished" },
+    }),
+  );
+}

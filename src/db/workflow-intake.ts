@@ -3,7 +3,11 @@ import type { CreateAcceptedTriggerRunInput } from "./types.js";
 
 /** Atomically accept work inside the caller’s transaction, including durable steps and wakeup. */
 export async function acceptWorkflowRun(client: QueryHandle, input: CreateAcceptedTriggerRunInput) {
-  const inserted = await client.query<{ id: string; outcome: string }>(
+  const inserted = await client.query<{
+    id: string;
+    outcome: string;
+    payload_expiry_state: string | null;
+  }>(
     `insert into trigger_runs
            (id, organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
            configured_trigger_name, outcome, status,
@@ -30,7 +34,11 @@ export async function acceptWorkflowRun(client: QueryHandle, input: CreateAccept
   let run = inserted.rows[0];
   const created = run !== undefined;
   if (run === undefined) {
-    const existing = await client.query<{ id: string; outcome: string }>(
+    const existing = await client.query<{
+      id: string;
+      outcome: string;
+      payload_expiry_state: string | null;
+    }>(
       `select * from trigger_runs
            where provider_event_receipt_id = $1 and project_id = $2 and configured_trigger_name = $3
            for update`,
@@ -40,6 +48,7 @@ export async function acceptWorkflowRun(client: QueryHandle, input: CreateAccept
   }
   if (run === undefined) throw new Error("trigger run insert returned no row");
   if (run.outcome !== "accepted") throw new Error("trigger branch outcome conflict");
+  if (run.payload_expiry_state !== null) return { id: run.id, created };
   for (const [ordinal, stepId] of input.stepIds.entries()) {
     await client.query(
       `insert into workflow_step_runs

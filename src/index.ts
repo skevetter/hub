@@ -1,3 +1,4 @@
+import { readRunPayloadRetentionSettings } from "./run-payload-retention/settings.js";
 import { randomBytes } from "node:crypto";
 import { validateHeaderName, type IncomingMessage } from "node:http";
 import { fileURLToPath } from "node:url";
@@ -103,6 +104,10 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     const webhookOptions = readWebhookOptions(process.env);
     const webhookSigning = readWebhookSigningSettings(process.env);
     const runProgress = readRunProgressSettings(process.env);
+    const runPayloadRetention = readRunPayloadRetentionSettings(
+      process.env,
+      runProgress.retentionDays,
+    );
     const { database, runtime, locks } = await createDatabaseHandle();
     resources.own(() => database.close(), "composition.database");
     const migration = await migrateLegacyProjectTriggers(database);
@@ -204,6 +209,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       scriptLimits,
       webhookOptions,
       runProgress,
+      runPayloadRetention,
       timelineScrubValues: readTimelineScrubValues(process.env, Object.values(providerEnvironment)),
       ...(githubNotifications === undefined ? {} : { githubNotifications }),
       close: () => resources.close(),

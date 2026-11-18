@@ -5,7 +5,6 @@ import type {
   RunTimelineEvent,
   UpdateRunProgressMessageInput,
 } from "../run-timeline/store.js";
-import { isRunTimelineExpired, retentionCutoff } from "../run-timeline/retention.js";
 import { CREDENTIAL_CIRCUIT_MS, CredentialBackoff } from "./backoff.js";
 import { GitHubProgressProvider } from "./github.js";
 import { renderProgress } from "./render.js";
@@ -314,15 +313,7 @@ export class MessageWriter {
       database.findTriggerRunForOrganization(lease.organizationId, lease.triggerRunId),
     );
     if (run?.outcome !== "accepted") return this.release(lease);
-    if (
-      isRunTimelineExpired(
-        run,
-        retentionCutoff(new Date(clock.now()), this.options.settings.retentionDays),
-      )
-    ) {
-      await this.release(lease);
-      return {};
-    }
+    if (run.payloadExpiredAt != null) return this.release(lease);
     const kind = this.kind(lease, run, clock.now());
     if (kind === undefined) return this.release(lease);
     if (
@@ -347,13 +338,12 @@ export class MessageWriter {
   ): Promise<WriteResult> {
     if (!(provider instanceof GitHubProgressProvider))
       return this.stopMessage(lease, "abandoned", "create_unknown");
-    const { database, clock, backoff, settings } = this.options;
+    const { database, clock, backoff } = this.options;
     const run = await budget.run(() =>
       database.findTriggerRunForOrganization(lease.organizationId, lease.triggerRunId),
     );
     if (run?.outcome !== "accepted") return this.stopMessage(lease, "abandoned", "create_unknown");
-    if (isRunTimelineExpired(run, retentionCutoff(new Date(clock.now()), settings.retentionDays)))
-      return this.release(lease);
+    if (run.payloadExpiredAt != null) return this.release(lease);
     const target = parseStoredRef(lease.externalRef);
     if (target === undefined) return this.stopMessage(lease, "abandoned", "create_unknown");
     const shared = await budget.run(() =>

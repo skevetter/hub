@@ -307,13 +307,14 @@ function configurationView(
 
 function activityRunListView(activity: ProjectActivityRunListRecord) {
   const { run, receipt } = activity;
+  const expired = run.payloadExpiredAt != null;
   const base = {
     id: run.id,
     providerEventReceiptId: run.providerEventReceiptId,
     provider: receipt.provider,
     deliveryId: receipt.deliveryId,
     source: receipt.source,
-    ...(receipt.source === "webhook.received"
+    ...(!expired && receipt.source === "webhook.received"
       ? {
           webhookSummary: summarizeTrigger(receipt.source, {
             actor: activity.webhookActor,
@@ -322,10 +323,12 @@ function activityRunListView(activity: ProjectActivityRunListRecord) {
           }),
         }
       : {}),
-    repo: receipt.repo,
+    repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
+    payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
+    payloadSummary: run.payloadSummary ?? null,
     receivedAt: receipt.receivedAt.toISOString(),
     configuredTriggerName: run.configuredTriggerName,
-    prompt: run.prompt,
+    prompt: expired ? null : run.prompt,
     inputs: jsonValue(run.inputs),
     values: jsonValue(run.values),
     outputContext: jsonValue(run.outputContext),

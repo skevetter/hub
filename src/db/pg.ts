@@ -1,3 +1,5 @@
+import { scanRunPayloads } from "./run-payload-retention.js";
+import { reduceRejection, type PayloadCompletion } from "../run-payload-retention/summary.js";
 import { RunTimelineRepository } from "../run-timeline/postgres-store.js";
 import type { RunTimelineStore } from "../run-timeline/store.js";
 import { ExecutionAuthorityRepository } from "../execution-authority/index.js";
@@ -127,6 +129,31 @@ import type {
   ReconcileOrganizationBillingInput,
 } from "./types.js";
 
+const STEP_PAYLOAD_PROJECTION = `step.id, step.trigger_run_id, step.step_id, step.ordinal, step.status,
+  step.agent_execution_id, step.deadline_kind, step.deadline_at, step.idle_deadline_at,
+  step.started_at, step.completed_at, step.payload_summary,
+  run.payload_expiry_state is not null as payload_hidden,
+  case when run.payload_expiry_state is null then step.output end as output,
+  case when run.payload_expiry_state is null then step.failure_reason end as failure_reason,
+  case when run.payload_expiry_state is null then step.dispatch_intent end as dispatch_intent`;
+
+const OPEN_STEP_RUN = `select run.id from trigger_runs run join workflow_step_runs step
+  on step.trigger_run_id = run.id where step.id = $1 and run.payload_expiry_state is null
+  for share of run`;
+
+const OPEN_EXECUTION_RUN = `not exists (
+  select 1 from trigger_runs run
+  where (run.id in (
+    select step.trigger_run_id from workflow_step_runs step
+    where step.id = execution.workflow_step_run_id or step.agent_execution_id = execution.id
+  ) or (execution.workflow_step_run_id is null and execution.launch_intent ->> 'kind' = 'launch_machine'
+    and run.id::text = execution.launch_intent ->> 'triggerRunId'
+    and run.organization_id = execution.organization_id and run.project_id = execution.project_id))
+    and run.payload_expiry_state is not null
+)`;
+
+const EXECUTION_PAYLOAD_PROJECTION = `execution.*, not (${OPEN_EXECUTION_RUN}) as payload_hidden`;
+
 const OUTPUT_ATTEMPT_LEASE_MS = 5 * 60_000;
 
 function transitionWithTerminalRun(
@@ -143,6 +170,12 @@ export function createDatabase(runtime: DatabaseRuntime, locks: Locks): Database
 }
 
 class PgDatabase implements Database {
+  scanRunPayloads: Database["scanRunPayloads"] = (after, cutoff, limit, countOnly) =>
+    scanRunPayloads(this.pool, after, cutoff, limit, countOnly);
+  async expireRunPayloadChunk(): Promise<"skipped"> {
+    return "skipped";
+  }
+
   readonly schedules;
   readonly githubNotifications;
   readonly executionAuthority;
@@ -230,7 +263,7 @@ class PgDatabase implements Database {
         this.pool,
         `select run.* from trigger_runs run
       left join run_timeline_state state on state.trigger_run_id = run.id
-      where run.outcome = 'accepted' and run.status <> 'running' and run.completed_at >= $2
+      where run.outcome = 'accepted' and run.status <> 'running' and run.payload_expiry_state is null and run.completed_at >= $2
         and run.completed_at < $1 and state.sealed_seq is null and state.expired_at is null
       order by run.completed_at, run.id limit $3`,
         [olderThan, cutoff, limit],
@@ -717,7 +750,8 @@ class PgDatabase implements Database {
   async findWorkflowStepRunById(id: string) {
     const rows = await query<WorkflowStepRunRow>(
       this.pool,
-      `select * from workflow_step_runs where id = $1`,
+      `select ${STEP_PAYLOAD_PROJECTION} from workflow_step_runs step
+       join trigger_runs run on run.id = step.trigger_run_id where step.id = $1`,
       [id],
     );
     return rows.rows[0] === undefined ? undefined : toWorkflowStepRunRecord(rows.rows[0]);
@@ -726,7 +760,8 @@ class PgDatabase implements Database {
   async findWorkflowStepRunByTriggerRun(triggerRunId: string) {
     const rows = await query<WorkflowStepRunRow>(
       this.pool,
-      `select * from workflow_step_runs where trigger_run_id = $1 order by ordinal limit 1`,
+      `select ${STEP_PAYLOAD_PROJECTION} from workflow_step_runs step
+       join trigger_runs run on run.id = step.trigger_run_id where step.trigger_run_id = $1 order by step.ordinal limit 1`,
       [triggerRunId],
     );
     return rows.rows[0] === undefined ? undefined : toWorkflowStepRunRecord(rows.rows[0]);
@@ -735,7 +770,8 @@ class PgDatabase implements Database {
   async listWorkflowStepRunsForTriggerRun(triggerRunId: string) {
     const rows = await query<WorkflowStepRunRow>(
       this.pool,
-      `select * from workflow_step_runs where trigger_run_id = $1 order by ordinal`,
+      `select ${STEP_PAYLOAD_PROJECTION} from workflow_step_runs step
+       join trigger_runs run on run.id = step.trigger_run_id where step.trigger_run_id = $1 order by step.ordinal`,
       [triggerRunId],
     );
     return rows.rows.map(toWorkflowStepRunRecord);
@@ -744,7 +780,7 @@ class PgDatabase implements Database {
   async findAgentExecutionByWorkflowStepRunId(stepRunId: string) {
     const rows = await query<AgentExecutionRow>(
       this.pool,
-      `select * from agent_executions where workflow_step_run_id = $1 limit 1`,
+      `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution where workflow_step_run_id = $1 limit 1`,
       [stepRunId],
     );
     return rows.rows[0] === undefined ? undefined : toAgentExecutionRecord(rows.rows[0]);
@@ -790,7 +826,7 @@ class PgDatabase implements Database {
     await query(
       this.pool,
       `insert into workflow_wakeups (trigger_run_id, available_at, lease_expires_at)
-       values ($1, $2, null)
+       select id, $2, null from trigger_runs where id = $1 and payload_expiry_state is null for share
        on conflict (trigger_run_id) do update
        set available_at = least(workflow_wakeups.available_at, excluded.available_at),
            lease_expires_at = null`,
@@ -821,7 +857,14 @@ class PgDatabase implements Database {
           );
           const step = stepRows.rows[0];
           if (step === undefined) throw new Error("workflow step run not found");
-          return { stepRun: toWorkflowStepRunRecord(step), execution: undefined, created: false };
+          return {
+            stepRun: toWorkflowStepRunRecord({
+              ...step,
+              payload_hidden: run.payload_expiry_state != null,
+            }),
+            execution: undefined,
+            created: false,
+          };
         }
         if (run.deadline_at === null || run.deadline_at.getTime() <= startedAt.getTime()) {
           await timeoutWorkflowRunOnClient(client, run, startedAt);
@@ -938,6 +981,16 @@ class PgDatabase implements Database {
   ) {
     try {
       return await this.pool.transaction(async (client) => {
+        if ((await client.query(OPEN_STEP_RUN, [stepRunId])).rowCount === 0) {
+          const current = await client.query<WorkflowStepRunRow>(
+            `select ${STEP_PAYLOAD_PROJECTION} from workflow_step_runs step
+             join trigger_runs run on run.id = step.trigger_run_id where step.id = $1`,
+            [stepRunId],
+          );
+          if (current.rows[0] === undefined)
+            throw new Error(`workflow step run not found: ${stepRunId}`);
+          return toWorkflowStepRunRecord(current.rows[0]);
+        }
         const selected = await client.query<WorkflowStepRunRow>(
           `select * from workflow_step_runs where id = $1 for update`,
           [stepRunId],
@@ -1047,6 +1100,12 @@ class PgDatabase implements Database {
         const execution = executionRows.rows[0];
         if (execution === undefined)
           throw new Error(`agent execution not found: ${input.executionId}`);
+        if (run.payload_expiry_state != null) {
+          return {
+            execution: toAgentExecutionRecord({ ...execution, payload_hidden: true }),
+            transitioned: false,
+          };
+        }
         const observedAt = input.observedAt ?? new Date();
         if (execution.status === "spawning" || execution.status === "running") {
           const deadlineKind = workflowDeadlineKind(execution, step, run, observedAt);
@@ -1109,16 +1168,17 @@ class PgDatabase implements Database {
   async markWorkflowStepSkipped(triggerRunId: string, stepId: string, reason: string) {
     try {
       return await this.pool.transaction(async (client) => {
-        const stepRows = await client.query<WorkflowStepRunRow>(
-          `select * from workflow_step_runs where trigger_run_id = $1 and step_id = $2 for update`,
-          [triggerRunId, stepId],
-        );
-        const step = stepRows.rows[0];
         const runRows = await client.query<TriggerRunRow>(
           `select * from trigger_runs where id = $1 for update`,
           [triggerRunId],
         );
         const run = runRows.rows[0];
+        if (run?.payload_expiry_state != null) return undefined;
+        const stepRows = await client.query<WorkflowStepRunRow>(
+          `select * from workflow_step_runs where trigger_run_id = $1 and step_id = $2 for update`,
+          [triggerRunId, stepId],
+        );
+        const step = stepRows.rows[0];
         if (step === undefined || run === undefined) {
           return undefined;
         }
@@ -1152,13 +1212,12 @@ class PgDatabase implements Database {
   async startWorkflowScriptStep(input: WorkflowScriptStepStartInput) {
     const started = await query<WorkflowStepRunRow>(
       this.pool,
-      `update workflow_step_runs steps
+      `with open_run as materialized (${OPEN_STEP_RUN})
+       update workflow_step_runs steps
        set status = 'running', started_at = $2, deadline_at = $3, output = $4
        where steps.id = $1 and steps.status = 'pending'
-         and exists (
-           select 1 from trigger_runs runs
-           where runs.id = steps.trigger_run_id and runs.status = 'running'
-         )
+         and exists (select 1 from open_run join trigger_runs runs on runs.id = open_run.id
+           where runs.status = 'running')
        returning steps.*`,
       [input.stepRunId, input.startedAt, input.deadlineAt, input.output ?? null],
     );
@@ -1173,9 +1232,10 @@ class PgDatabase implements Database {
     const finished = update.status !== "running";
     const updated = await query<WorkflowStepRunRow>(
       this.pool,
-      `update workflow_step_runs
+      `with open_run as materialized (${OPEN_STEP_RUN})
+       update workflow_step_runs
        set status = $2, output = $3, failure_reason = $4, completed_at = $5
-       where id = $1 and status = 'running'
+       where id = $1 and status = 'running' and exists (select 1 from open_run)
        returning *`,
       [
         stepRunId,
@@ -1197,7 +1257,10 @@ class PgDatabase implements Database {
   async setWorkflowScriptStepOutput(stepRunId: string, output: unknown) {
     const updated = await query<WorkflowStepRunRow>(
       this.pool,
-      "update workflow_step_runs set output = $2 where id = $1 and agent_execution_id is null returning *",
+      `with open_run as materialized (${OPEN_STEP_RUN})
+       update workflow_step_runs set output = $2
+       where id = $1 and agent_execution_id is null and exists (select 1 from open_run)
+       returning *`,
       [stepRunId, output ?? null],
     );
     return updated.rows[0] === undefined ? undefined : toWorkflowStepRunRecord(updated.rows[0]);
@@ -1206,10 +1269,10 @@ class PgDatabase implements Database {
   async listWorkflowScriptStepsPendingCleanup() {
     const rows = await query<WorkflowStepRunRow>(
       this.pool,
-      `select * from workflow_step_runs
-       where status in ('succeeded', 'failed', 'timed_out')
-         and agent_execution_id is null
-         and ((output ->> 'daemon_id') is not null or (output -> 'cleanup') is not null)`,
+      `select step.* from workflow_step_runs step join trigger_runs run on run.id = step.trigger_run_id
+       where run.payload_expiry_state is null and step.status in ('succeeded', 'failed', 'timed_out')
+         and step.agent_execution_id is null
+         and ((step.output ->> 'daemon_id') is not null or (step.output -> 'cleanup') is not null)`,
     );
     return rows.rows.map(toWorkflowStepRunRecord);
   }
@@ -1257,7 +1320,10 @@ class PgDatabase implements Database {
         }
         if (run.status !== "running") {
           return {
-            stepRun: toWorkflowStepRunRecord(step),
+            stepRun: toWorkflowStepRunRecord({
+              ...step,
+              payload_hidden: run.payload_expiry_state != null,
+            }),
             run: toTriggerRunRecord(run),
             transitioned: false,
           };
@@ -1322,6 +1388,7 @@ class PgDatabase implements Database {
           `select * from trigger_runs
          where outcome = 'accepted'
            and status <> 'running'
+           and payload_expiry_state is null
            and terminal_notification_pending_at is not null
            and terminal_notification_delivered_at is null
            and (
@@ -1338,20 +1405,37 @@ class PgDatabase implements Database {
         }
         const updated = await client.query<TriggerRunRow>(
           `update trigger_runs
-         set terminal_notification_lease_expires_at = $2
-         where id = $1
+         set terminal_notification_lease_expires_at = $2,
+             terminal_notification_generation = terminal_notification_generation + 1
+         where id = $1 and payload_expiry_state is null
          returning *`,
           [run.id, new Date(now.getTime() + leaseMs)],
         );
-        return toTriggerRunRecord(updated.rows[0]!);
+        const row = updated.rows[0]!;
+        const record = toTriggerRunRecord(row);
+        if (record.outcome !== "accepted") throw new Error("unexpected notification run outcome");
+        return { ...record, terminalNotificationGeneration: row.terminal_notification_generation };
       });
     } catch (error) {
       throw toDatabaseError(error);
     }
   }
 
+  async ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number, now: Date) {
+    const rows = await query(
+      this.pool,
+      `select 1 from trigger_runs
+       where id = $1 and terminal_notification_generation = $2
+         and terminal_notification_lease_expires_at > $3
+         and terminal_notification_delivered_at is null and payload_expiry_state is null`,
+      [triggerRunId, generation, now],
+    );
+    return rows.rowCount === 1;
+  }
+
   async markWorkflowRunTerminalNotificationDelivered(
     triggerRunId: string,
+    generation: number,
     deliveredAt: Date,
     reactionState: JsonValue | null,
   ) {
@@ -1361,10 +1445,12 @@ class PgDatabase implements Database {
        set reaction_state = $3,
            terminal_notification_delivered_at = coalesce(terminal_notification_delivered_at, $2),
            terminal_notification_lease_expires_at = null
-       where id = $1
+       where id = $1 and payload_expiry_state is null
+         and terminal_notification_generation = $4
+         and terminal_notification_lease_expires_at is not null
          and terminal_notification_pending_at is not null
          and terminal_notification_delivered_at is null`,
-      [triggerRunId, deliveredAt, reactionState],
+      [triggerRunId, deliveredAt, reactionState, generation],
     );
   }
 
@@ -1373,7 +1459,7 @@ class PgDatabase implements Database {
       this.pool,
       `update trigger_runs
        set reaction_state = $2
-       where id = $1 and outcome = 'accepted'
+       where id = $1 and outcome = 'accepted' and payload_expiry_state is null
        returning *`,
       [triggerRunId, reactionState],
     );
@@ -2083,7 +2169,7 @@ class PgDatabase implements Database {
     try {
       const rows = await query<AgentExecutionRow>(
         this.pool,
-        "select * from agent_executions where id = $1 limit 1",
+        `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution where id = $1 limit 1`,
         [id],
       );
 
@@ -2099,15 +2185,17 @@ class PgDatabase implements Database {
   ): Promise<AgentExecutionRecord> {
     const rows = await query<AgentExecutionRow>(
       this.pool,
-      `update agent_executions
+      `update agent_executions execution
        set reaction_state = $2
-       where id = $1
+       where id = $1 and ${OPEN_EXECUTION_RUN}
        returning *`,
       [executionId, reactionState],
     );
     const row = rows.rows[0];
-    if (row === undefined) throw new Error(`agent execution not found: ${executionId}`);
-    return toAgentExecutionRecord(row);
+    if (row !== undefined) return toAgentExecutionRecord(row);
+    const current = await this.findAgentExecutionById(executionId);
+    if (current === undefined) throw new Error(`agent execution not found: ${executionId}`);
+    return current;
   }
 
   async findAgentExecutionForOrganization(
@@ -2117,7 +2205,7 @@ class PgDatabase implements Database {
     try {
       const rows = await query<AgentExecutionRow>(
         this.pool,
-        `select * from agent_executions
+        `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution
          where id = $1 and organization_id = $2 limit 1`,
         [id, organizationId],
       );
@@ -2131,7 +2219,7 @@ class PgDatabase implements Database {
   async findAgentExecutionForProject(projectId: string, id: string) {
     const rows = await query<AgentExecutionRow>(
       this.pool,
-      `select * from agent_executions where id = $1 and project_id = $2 limit 1`,
+      `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution where id = $1 and project_id = $2 limit 1`,
       [id, projectId],
     );
     return rows.rows[0] === undefined ? undefined : toAgentExecutionRecord(rows.rows[0]);
@@ -2140,12 +2228,14 @@ class PgDatabase implements Database {
   async updateTriggerRunValues(triggerRunId: string, values: unknown): Promise<TriggerRunRecord> {
     const rows = await query<TriggerRunRow>(
       this.pool,
-      `update trigger_runs set values = $2 where id = $1 returning *`,
+      `update trigger_runs set values = $2 where id = $1 and payload_expiry_state is null returning *`,
       [triggerRunId, values],
     );
     const row = rows.rows[0];
-    if (row === undefined) throw new Error(`trigger run not found: ${triggerRunId}`);
-    return toTriggerRunRecord(row);
+    if (row !== undefined) return toTriggerRunRecord(row);
+    const existing = await this.findTriggerRunById(triggerRunId);
+    if (existing === undefined) throw new Error(`trigger run not found: ${triggerRunId}`);
+    return existing;
   }
 
   async listProjectActivityRuns(
@@ -2158,7 +2248,7 @@ class PgDatabase implements Database {
               receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
               receipts.provider_configuration_version, receipts.source, receipts.repo,
               receipts.received_at, receipts.dropped_reason,
-              case when receipts.source = 'webhook.received'
+              case when runs.payload_expiry_state is null and receipts.source = 'webhook.received'
                      and jsonb_typeof(receipts.payload->'actor') = 'string'
                 then receipts.payload->>'actor'
               end as webhook_actor
@@ -2180,8 +2270,9 @@ class PgDatabase implements Database {
       `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
               receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
               receipts.provider_configuration_version, receipts.source, receipts.repo,
-              receipts.payload, receipts.received_at, receipts.dropped_reason,
-              receipts.accepted_routes
+              case when runs.payload_expiry_state is null then receipts.payload end as payload,
+              receipts.received_at, receipts.dropped_reason,
+              case when runs.payload_expiry_state is null then receipts.accepted_routes end as accepted_routes
        from trigger_runs runs
        join provider_event_receipts receipts
          on receipts.id = runs.provider_event_receipt_id
@@ -2200,8 +2291,9 @@ class PgDatabase implements Database {
       `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
               receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
               receipts.provider_configuration_version, receipts.source, receipts.repo,
-              receipts.payload, receipts.received_at, receipts.dropped_reason,
-              receipts.accepted_routes
+              case when runs.payload_expiry_state is null then receipts.payload end as payload,
+              receipts.received_at, receipts.dropped_reason,
+              case when runs.payload_expiry_state is null then receipts.accepted_routes end as accepted_routes
        from trigger_runs runs
        join provider_event_receipts receipts
          on receipts.id = runs.provider_event_receipt_id
@@ -2217,15 +2309,24 @@ class PgDatabase implements Database {
   private async toProjectActivityRun(
     row: ProjectActivityRunRow,
   ): Promise<ProjectActivityRunRecord> {
-    const steps = await query<WorkflowStepRunRow>(
-      this.pool,
-      `select * from workflow_step_runs where trigger_run_id = $1 order by ordinal`,
-      [row.id],
-    );
+    const steps = await this.listWorkflowStepRunsForTriggerRun(row.id);
+    const current = await this.findTriggerRunById(row.id);
+    const hidden = current?.payloadExpiredAt != null;
     return {
-      run: toTriggerRunRecord(row),
-      receipt: toProviderEventReceiptRecord({ ...row, id: row.provider_event_receipt_id }),
-      steps: steps.rows.map(toWorkflowStepRunRecord),
+      run: current ?? toTriggerRunRecord(row),
+      receipt: toProviderEventReceiptRecord({
+        ...row,
+        id: row.provider_event_receipt_id,
+        ...(hidden ? { payload: null, accepted_routes: null } : {}),
+      }),
+      steps: hidden
+        ? steps.map((step) => ({
+            ...step,
+            output: null,
+            failureReason: step.payloadSummary?.failureCode ?? null,
+            dispatchIntent: null,
+          }))
+        : steps,
     };
   }
 
@@ -4715,6 +4816,10 @@ export interface ProviderEventReceiptRow extends QueryRow {
 }
 
 interface TriggerRunRow extends QueryRow {
+  payload_expiry_state: TriggerRunRecord["payloadExpiryState"];
+  payload_expired_at: Date | null;
+  payload_summary: TriggerRunRecord["payloadSummary"];
+  terminal_notification_generation: number;
   conversation: import("../triggers/continuation.js").Conversation | null;
   id: string;
   organization_id: string;
@@ -4781,6 +4886,8 @@ interface ProjectActivityRunListRow extends TriggerRunRow {
 }
 
 interface WorkflowStepRunRow extends QueryRow {
+  payload_summary?: WorkflowStepRunRecord["payloadSummary"];
+  payload_hidden?: boolean;
   id: string;
   trigger_run_id: string;
   step_id: string;
@@ -4803,22 +4910,9 @@ interface WorkflowWakeupRow extends QueryRow {
   lease_expires_at: Date | null;
 }
 
-function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
-  const evidence = {
-    conversation: row.conversation,
-    id: row.id,
-    organizationId: row.organization_id,
-    projectId: row.project_id,
-    configurationRevisionId: row.configuration_revision_id,
-    providerEventReceiptId: row.provider_event_receipt_id,
-    configuredTriggerName: row.configured_trigger_name,
-    prompt: row.prompt,
-    inputs: parseInvocationInputs(row.inputs),
-    values: row.values,
-    triggerContext: row.trigger_context,
-    outputContext: row.output_context,
-    createdAt: row.created_at,
-  };
+export function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
+  const expired = row.payload_expiry_state != null;
+  const evidence = toRunEvidence(row, expired);
   if (row.outcome === "rejected") {
     if (row.status !== "rejected" || row.rejection === null || row.rejection === undefined) {
       throw new Error(`invalid rejected trigger run ${row.id}`);
@@ -4827,7 +4921,9 @@ function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
       ...evidence,
       outcome: "rejected",
       status: "rejected",
-      rejection: parseInvocationRejection(row.rejection),
+      rejection: expired
+        ? reduceRejection(parseInvocationRejection(row.rejection))
+        : parseInvocationRejection(row.rejection),
       completedAt: row.completed_at ?? row.created_at,
     };
     return rejected;
@@ -4842,8 +4938,9 @@ function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
     status: row.status,
     deadlineAt: row.deadline_at,
     deadlineKind: row.deadline_kind,
-    failureReason: row.failure_reason,
+    failureReason: expired ? (row.payload_summary?.failureCode ?? null) : row.failure_reason,
     reactionState: row.reaction_state,
+    terminalNotificationGeneration: row.terminal_notification_generation,
     terminalNotificationPendingAt: row.terminal_notification_pending_at,
     terminalNotificationDeliveredAt: row.terminal_notification_delivered_at,
     terminalNotificationLeaseExpiresAt: row.terminal_notification_lease_expires_at,
@@ -4852,22 +4949,46 @@ function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
   return accepted;
 }
 
-function toWorkflowStepRunRecord(row: WorkflowStepRunRow): WorkflowStepRunRecord {
+function toRunEvidence(row: TriggerRunRow, expired: boolean) {
   return {
+    payloadExpiredAt: row.payload_expired_at,
+    payloadExpiryState: row.payload_expiry_state ?? null,
+    payloadSummary: row.payload_summary ?? null,
+    conversation: expired ? null : row.conversation,
+    id: row.id,
+    organizationId: row.organization_id,
+    projectId: row.project_id,
+    configurationRevisionId: row.configuration_revision_id,
+    providerEventReceiptId: row.provider_event_receipt_id,
+    configuredTriggerName: row.configured_trigger_name,
+    prompt: expired ? "" : row.prompt,
+    inputs: expired ? {} : parseInvocationInputs(row.inputs),
+    values: expired ? {} : row.values,
+    triggerContext: expired ? {} : row.trigger_context,
+    outputContext: expired ? {} : row.output_context,
+    createdAt: row.created_at,
+  };
+}
+
+export function toWorkflowStepRunRecord(row: WorkflowStepRunRow): WorkflowStepRunRecord {
+  return {
+    payloadSummary: row.payload_summary ?? null,
     id: row.id,
     triggerRunId: row.trigger_run_id,
     stepId: row.step_id,
     ordinal: row.ordinal,
     status: row.status,
     agentExecutionId: row.agent_execution_id,
-    output: row.output,
-    failureReason: row.failure_reason,
+    output: row.payload_hidden ? null : row.output,
+    failureReason: row.payload_hidden
+      ? (row.payload_summary?.failureCode ?? null)
+      : row.failure_reason,
     deadlineKind: row.deadline_kind,
     deadlineAt: row.deadline_at,
     idleDeadlineAt: row.idle_deadline_at,
     startedAt: row.started_at,
     completedAt: row.completed_at,
-    dispatchIntent: row.dispatch_intent,
+    dispatchIntent: row.payload_hidden ? null : row.dispatch_intent,
   };
 }
 
@@ -4897,6 +5018,8 @@ export interface MachineRow extends QueryRow {
 }
 
 export interface AgentExecutionRow extends QueryRow {
+  payload_completion?: PayloadCompletion | null;
+  payload_hidden?: boolean;
   agent_session_id: string | null;
   agent_session_action: import("../agent-sessions/index.js").AgentSessionAction | null;
   id: string;

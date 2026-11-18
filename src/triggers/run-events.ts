@@ -7,6 +7,7 @@ export interface RunDetailSnapshot extends Omit<ActivityRunDetail, "steps"> {
   steps: (ActivityRunDetail["steps"][number] & { timelineStepId: string })[];
   timeline: RunEventPage;
   progressMessagesEnabled: boolean;
+  progressUnavailable?: boolean;
   progress: {
     state: ProgressMessageState;
     provider: ProgressProviderName;

@@ -130,6 +130,26 @@ describe("pooled progress admission", () => {
       const message = await admitting;
       assert.equal(message?.triggerRunId, runId);
       assert.equal(message?.state, "pending");
+      assert.equal(await retention.database.expireRunTimelines(cutoff, 500), 0);
+      assert.equal(
+        (await admission.database.findRunProgressMessage(TIMELINE_ORGANIZATION, runId))?.state,
+        "pending",
+      );
+      const scope = {
+        organizationId: TIMELINE_ORGANIZATION,
+        triggerRunId: runId,
+        now: new Date(),
+        owner: "retention-test",
+      };
+      const lease = await admission.database.acquireRunProgressLease(scope);
+      assert.ok(lease);
+      assert.ok(
+        await admission.database.updateRunProgressMessage({
+          ...scope,
+          version: lease.version,
+          patch: { state: "finished" },
+        }),
+      );
       assert.equal(await retention.database.expireRunTimelines(cutoff, 500), 1);
       assert.equal(
         await harness.database.findRunProgressMessage(TIMELINE_ORGANIZATION, runId),

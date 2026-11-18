@@ -98,6 +98,7 @@ function stepState(
 
 function StepOutput({ step, status }: { step: RunDetail["steps"][number]; status: string }) {
   const completion = step.isAgent ? step.completion : null;
+  if (step.outputExpired || step.payloadSummary != null) return <ExpiredStepOutput step={step} />;
   if (!step.isAgent && isScriptStepOutput(step.output)) {
     return <ScriptStepOutput stepId={step.id} status={status} output={step.output} />;
   }
@@ -114,6 +115,25 @@ function StepOutput({ step, status }: { step: RunDetail["steps"][number]; status
     <>
       {completion === null ? null : <span>Completion: {completion}</span>}
       {output === null ? "No output" : <PlainOutput id={step.id} value={output} />}
+    </>
+  );
+}
+
+function ExpiredStepOutput({ step }: { step: RunDetail["steps"][number] }) {
+  const completion = step.completion;
+  const summary = step.payloadSummary;
+  return (
+    <>
+      {step.outputExpired ? <span>Output expired</span> : <span>No output</span>}
+      {summary?.exitCode == null ? null : <span>Exit code {summary.exitCode}</span>}
+      {summary?.truncated === true ? <span>Output was truncated</span> : null}
+      {summary?.provider == null ? null : (
+        <span>
+          {summary.provider}
+          {summary.model == null ? "" : ` / ${summary.model}`}
+        </span>
+      )}
+      {completion === null ? null : <span>Completion: {completion}</span>}
     </>
   );
 }

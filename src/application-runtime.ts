@@ -1,3 +1,8 @@
+import { RunPayloadRetention } from "./run-payload-retention/index.js";
+import {
+  assertRunPayloadWindow,
+  type RunPayloadRetentionSettings,
+} from "./run-payload-retention/settings.js";
 import { createHubApplication, type HubRuntimeOptions } from "./app.js";
 import { logger } from "./logger.js";
 import { RunTimeline } from "./run-timeline/index.js";
@@ -66,6 +71,7 @@ export interface ApplicationCompositionOptions {
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
   runProgress?: RunProgressSettings;
+  runPayloadRetention?: RunPayloadRetentionSettings;
   progressProviders?: readonly ProgressProvider[];
   timelineScrubValues?: readonly string[];
   close(): Promise<void>;
@@ -88,6 +94,7 @@ async function createOwnedApplicationRuntime(
   options: ApplicationCompositionOptions,
   ownership: CompositionResources,
 ): Promise<ApplicationRuntime> {
+  validateRunPayloadRetention(options);
   const timelineRuntime = createRunTimelineRuntime(options, ownership);
   const { runStream, hubOptions: streamOptions } = createRunStreamRuntime(
     options,
@@ -170,6 +177,8 @@ async function createOwnedApplicationRuntime(
       })),
     ),
   );
+
+  startRunPayloadRetention(options, ownership);
 
   const resources = options.database === null ? null : new OrganizationResources(options.database);
   const requests = new Map<string, (incoming: Request) => Promise<Response>>();
@@ -500,6 +509,25 @@ function createRunStreamRuntime(
     ? { runStream }
     : {};
   return { runStream, hubOptions };
+}
+
+function validateRunPayloadRetention(options: ApplicationCompositionOptions) {
+  if (options.runPayloadRetention !== undefined) {
+    assertRunPayloadWindow(
+      options.runPayloadRetention,
+      options.runProgress?.retentionDays ?? readRunProgressSettings({}).retentionDays,
+    );
+  }
+}
+
+function startRunPayloadRetention(
+  options: ApplicationCompositionOptions,
+  ownership: CompositionResources,
+) {
+  if (options.database === null || options.runPayloadRetention?.mode !== "count") return;
+  const retention = new RunPayloadRetention(options.database, options.runPayloadRetention);
+  ownership.own(() => retention.stop(), "composition.run_payload_retention");
+  retention.start();
 }
 
 function createRunTimelineRuntime(

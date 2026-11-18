@@ -1,3 +1,9 @@
+import type { RunPayloadRetentionStore } from "../run-payload-retention/store.js";
+import type {
+  PayloadCompletion,
+  RunPayloadSummary,
+  StepPayloadSummary,
+} from "../run-payload-retention/summary.js";
 import type { RunTimelineStore } from "../run-timeline/store.js";
 import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
 import type { JsonValue } from "../config/compiler.js";
@@ -119,6 +125,7 @@ export interface MachineRecord {
 }
 
 export interface AgentExecutionRecord {
+  payloadCompletion?: PayloadCompletion | null;
   agentSessionId: string | null;
   agentSessionAction: import("../agent-sessions/index.js").AgentSessionAction | null;
   id: string;
@@ -739,6 +746,9 @@ export interface InsertAgentExecutionInput {
 }
 
 interface TriggerRunEvidence {
+  payloadExpiredAt?: Date | null;
+  payloadSummary?: RunPayloadSummary | null;
+  payloadExpiryState?: "expiring" | "expired" | null;
   conversation: import("../triggers/continuation.js").Conversation | null;
   id: string;
   organizationId: string;
@@ -761,6 +771,7 @@ export interface AcceptedTriggerRunRecord extends TriggerRunEvidence {
   deadlineKind: WorkflowDeadlineKind | null;
   failureReason: string | null;
   reactionState: JsonValue | null;
+  terminalNotificationGeneration?: number;
   terminalNotificationPendingAt: Date | null;
   terminalNotificationDeliveredAt: Date | null;
   terminalNotificationLeaseExpiresAt: Date | null;
@@ -789,6 +800,7 @@ export interface ProjectActivityRunListRecord {
 }
 
 export interface WorkflowStepRunRecord {
+  payloadSummary?: StepPayloadSummary | null;
   id: string;
   triggerRunId: string;
   stepId: string;
@@ -1229,7 +1241,7 @@ export interface TerminateMachineFields {
   reason: string;
 }
 
-export interface Database extends RunTimelineStore {
+export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
   readonly executionAuthority: import("../execution-authority/index.js").ExecutionAuthorityStore;
   readonly schedules: import("../triggers/schedule/index.js").ScheduleStore;
   readonly githubNotifications: import("../triggers/github-notifications/index.js").GitHubNotificationStore;
@@ -1365,9 +1377,15 @@ export interface Database extends RunTimelineStore {
   claimPendingWorkflowRunTerminalNotification(
     now: Date,
     leaseMs: number,
-  ): Promise<TriggerRunRecord | undefined>;
+  ): Promise<(AcceptedTriggerRunRecord & { terminalNotificationGeneration: number }) | undefined>;
+  ownsWorkflowRunTerminalNotification(
+    triggerRunId: string,
+    generation: number,
+    now: Date,
+  ): Promise<boolean>;
   markWorkflowRunTerminalNotificationDelivered(
     triggerRunId: string,
+    generation: number,
     deliveredAt: Date,
     reactionState: JsonValue | null,
   ): Promise<void>;

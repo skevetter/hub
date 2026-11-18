@@ -168,7 +168,7 @@ export class TriggerDashboard {
             : this.database.findAgentExecutionById(step.agentExecutionId),
         ),
       ),
-      this.timelinePage(tenant.organization.id, run, 0),
+      this.timelinePage(tenant.organization.id, activity.run, 0),
       this.database.findRunProgressMessage(tenant.organization.id, runId),
     ]);
     const detail = activityRunDetailView(activity, executions);
@@ -179,8 +179,9 @@ export class TriggerDashboard {
       ),
       timeline,
       progressMessagesEnabled: this.progressMessagesEnabled,
+      progressUnavailable: progress === undefined && timeline.expired,
       progress:
-        progress === undefined
+        progress === undefined || activity.run.payloadExpiredAt != null
           ? null
           : { state: progress.state, provider: progress.provider, failure: progress.failure },
     };
@@ -215,7 +216,11 @@ export class TriggerDashboard {
     const cutoff = retentionCutoff((this.options.now ?? (() => new Date()))(), retentionDays);
     let state = await this.database.readRunTimelineState(organizationId, run.id);
     let expired = isRunTimelineExpired(
-      { completedAt: run.completedAt, expiredAt: state?.expiredAt ?? null },
+      {
+        completedAt: run.completedAt,
+        expiredAt: state?.expiredAt ?? null,
+        payloadExpiredAt: run.payloadExpiredAt,
+      },
       cutoff,
     );
     if (
@@ -228,7 +233,11 @@ export class TriggerDashboard {
       await this.options.reconciler?.reconcileBeforeTerminal(organizationId, run.id);
       state = await this.database.readRunTimelineState(organizationId, run.id);
       expired = isRunTimelineExpired(
-        { completedAt: run.completedAt, expiredAt: state?.expiredAt ?? null },
+        {
+          completedAt: run.completedAt,
+          expiredAt: state?.expiredAt ?? null,
+          payloadExpiredAt: run.payloadExpiredAt,
+        },
         cutoff,
       );
     }
@@ -291,7 +300,7 @@ export class TriggerDashboard {
             status: run.status,
             receivedAt: receipt.receivedAt.toISOString(),
           },
-          receipt.source === "webhook.received"
+          run.payloadExpiredAt == null && receipt.source === "webhook.received"
             ? {
                 webhookSummary: summarizeTrigger(receipt.source, {
                   actor: webhookActor,

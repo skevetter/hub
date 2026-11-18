@@ -1,4 +1,5 @@
-import { and, eq, gt } from "drizzle-orm";
+import { PROGRESS_UNSETTLED_SQL } from "../run-payload-retention/store.js";
+import { and, eq, gt, sql } from "drizzle-orm";
 import type { DatabaseRuntime, QueryHandle, TransactionHandle } from "../db/runtime/index.js";
 import type { Locks } from "../db/runtime/locks/index.js";
 import { runProgressMessages } from "../db/schema.js";
@@ -42,6 +43,11 @@ const MESSAGE = `trigger_run_id as "triggerRunId", organization_id as "organizat
  compensation_requested_gen as "compensationRequestedGen", compensation_done_gen as "compensationDoneGen",
  compensation_not_before as "compensationNotBefore", created_at as "createdAt", updated_at as "updatedAt"`;
 
+const OPEN_PROGRESS_RUN = `select id from trigger_runs where id = $1
+  and organization_id = $2 and payload_expiry_state is null for share`;
+const PROGRESS_RETENTION_BLOCKED = `(${PROGRESS_UNSETTLED_SQL}
+  or message.credential_retry_at > now() or message.credential_rejected_until > now())`;
+
 export class RunTimelineRepository {
   constructor(
     private readonly runtime: DatabaseRuntime,
@@ -60,7 +66,7 @@ export class RunTimelineRepository {
     batchId = timelineAccountingBatchId(batchId);
     return this.runtime.transaction(async (transaction) => {
       const run = await transaction.query(
-        `select id from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' for key share`,
+        `select id from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' and payload_expiry_state is null for key share`,
         [runId, organizationId],
       );
       if (run.rowCount === 0) return undefined;
@@ -121,10 +127,17 @@ export class RunTimelineRepository {
     const data = prepareTimelineData(input.kind, input.data);
     return this.runtime.transaction(async (transaction) => {
       const run = await transaction.query(
-        `select id from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' for key share`,
+        `select id from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' and payload_expiry_state is null for key share`,
         [input.triggerRunId, input.organizationId],
       );
-      if (run.rowCount === 0) return undefined;
+      if (run.rowCount === 0) {
+        const expired = await transaction.query(
+          `select 1 from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted'
+           and payload_expiry_state is not null`,
+          [input.triggerRunId, input.organizationId],
+        );
+        return expired.rowCount === 0 ? undefined : { reason: "expired" };
+      }
       await transaction.query(
         `insert into run_timeline_state (trigger_run_id, organization_id, origin) values ($1, $2, $3) on conflict do nothing`,
         [input.triggerRunId, input.organizationId, input.origin],
@@ -268,7 +281,9 @@ export class RunTimelineRepository {
   ): Promise<RunTimelineEvent[]> {
     return (
       await this.runtime.query<Row<RunTimelineEvent>>(
-        `select ${EVENT} from run_timeline_events where organization_id = $1 and trigger_run_id = $2 and seq > $3 order by seq limit $4`,
+        `select ${EVENT} from run_timeline_events where organization_id = $1 and trigger_run_id = $2 and seq > $3
+           and exists (select 1 from trigger_runs where id = $2 and organization_id = $1 and payload_expiry_state is null)
+           order by seq limit $4`,
         [organizationId, runId, page.afterSeq, Math.max(0, Math.min(5110, page.limit))],
       )
     ).rows;
@@ -292,10 +307,20 @@ export class RunTimelineRepository {
         `select run.id from trigger_runs run where run.status <> 'running' and run.completed_at < $1
         and (exists (select 1 from run_timeline_state state where state.trigger_run_id = run.id and state.expired_at is null)
           or exists (select 1 from run_progress_messages message where message.trigger_run_id = run.id))
+        and not exists (select 1 from run_progress_messages message
+          where message.trigger_run_id = run.id and ${PROGRESS_RETENTION_BLOCKED})
         order by run.completed_at, run.id for update of run skip locked limit $2`,
         [cutoff, Math.max(0, Math.min(500, batch))],
       );
-      const ids = expired.rows.map((row) => row.id);
+      const lockedIds = expired.rows.map((row) => row.id);
+      if (lockedIds.length === 0) return 0;
+      const settled = await transaction.query<{ id: string }>(
+        `select unnest as id from unnest($1::uuid[]) where not exists (
+          select 1 from run_progress_messages message where message.trigger_run_id = unnest
+          and ${PROGRESS_RETENTION_BLOCKED})`,
+        [lockedIds],
+      );
+      const ids = settled.rows.map((row) => row.id);
       if (ids.length === 0) return 0;
       await transaction.query(
         `select trigger_run_id from run_timeline_state where trigger_run_id = any($1::uuid[]) order by trigger_run_id for update`,
@@ -322,20 +347,21 @@ export class RunTimelineRepository {
   ): Promise<RunProgressMessage | undefined> {
     return this.runtime.transaction(async (transaction) => {
       const run = await transaction.query(
-        `select id from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' for key share`,
+        `select id from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' and payload_expiry_state is null for key share`,
         [input.triggerRunId, input.organizationId],
       );
       if (run.rowCount === 0) return undefined;
       await transaction.query(
         `insert into run_progress_messages (trigger_run_id,organization_id,provider,created_at,updated_at)
-        select id, organization_id, $3, $4, $4 from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted'
+        select id, organization_id, $3, $4, $4 from trigger_runs where id = $1 and organization_id = $2 and outcome = 'accepted' and payload_expiry_state is null
         and not exists(select 1 from run_timeline_state where trigger_run_id = $1 and expired_at is not null)
         on conflict do nothing`,
         [input.triggerRunId, input.organizationId, input.provider, input.now],
       );
       return (
         await transaction.query<Row<RunProgressMessage>>(
-          `select ${MESSAGE} from run_progress_messages where organization_id = $1 and trigger_run_id = $2`,
+          `select ${MESSAGE} from run_progress_messages where organization_id = $1 and trigger_run_id = $2
+        and exists (select 1 from trigger_runs where id = $2 and organization_id = $1 and payload_expiry_state is null)`,
           [input.organizationId, input.triggerRunId],
         )
       ).rows[0];
@@ -348,7 +374,8 @@ export class RunTimelineRepository {
   ): Promise<RunProgressMessage | undefined> {
     return (
       await this.runtime.query<Row<RunProgressMessage>>(
-        `select ${MESSAGE} from run_progress_messages where organization_id = $1 and trigger_run_id = $2`,
+        `select ${MESSAGE} from run_progress_messages where organization_id = $1 and trigger_run_id = $2
+        and exists (select 1 from trigger_runs where id = $2 and organization_id = $1 and payload_expiry_state is null)`,
         [organizationId, runId],
       )
     ).rows[0];
@@ -359,8 +386,9 @@ export class RunTimelineRepository {
   ): Promise<RunProgressMessage | undefined> {
     return (
       await this.runtime.query<Row<RunProgressMessage>>(
-        `update run_progress_messages set lease_owner = $3, lease_expires_at = $5, version = version + 1, updated_at = $4
-      where trigger_run_id = $1 and organization_id = $2 and (lease_owner is null or lease_expires_at <= $4 or lease_owner = $3) returning ${MESSAGE}`,
+        `with open_run as materialized (${OPEN_PROGRESS_RUN})
+      update run_progress_messages set lease_owner = $3, lease_expires_at = $5, version = version + 1, updated_at = $4
+      where trigger_run_id = $1 and organization_id = $2 and exists (select 1 from open_run) and (lease_owner is null or lease_expires_at <= $4 or lease_owner = $3) returning ${MESSAGE}`,
         [
           input.triggerRunId,
           input.organizationId,
@@ -419,6 +447,8 @@ export class RunTimelineRepository {
           eq(runProgressMessages.version, input.version),
           eq(runProgressMessages.leaseOwner, input.owner),
           gt(runProgressMessages.leaseExpiresAt, input.now),
+          sql`exists (select 1 from trigger_runs where id = ${input.triggerRunId}
+            and organization_id = ${input.organizationId} and payload_expiry_state is null)`,
         ),
       )
       .returning();
@@ -427,6 +457,11 @@ export class RunTimelineRepository {
 
   async admitProgressWrite(input: AdmitProgressWriteInput): Promise<ProgressWriteAdmission> {
     return this.runtime.transaction(async (transaction) => {
+      const open = await transaction.query(OPEN_PROGRESS_RUN, [
+        input.triggerRunId,
+        input.organizationId,
+      ]);
+      if (open.rowCount === 0) return { status: "lease_lost" };
       const row = await this.lockProgressRow(transaction, input);
       if (
         row?.leaseOwner !== input.owner ||
@@ -493,6 +528,11 @@ export class RunTimelineRepository {
     input: RecordProgressCredentialCooldownInput,
   ): Promise<void> {
     await this.runtime.transaction(async (transaction) => {
+      const open = await transaction.query(OPEN_PROGRESS_RUN, [
+        input.triggerRunId,
+        input.organizationId,
+      ]);
+      if (open.rowCount === 0) return;
       // Both paths lock the message first so waiting on one message does not stall its credential.
       if ((await this.lockProgressRow(transaction, input)) === undefined) return;
       await this.locks.withTxLock(transaction, `progress-credential:${input.key}`);
@@ -515,6 +555,7 @@ export class RunTimelineRepository {
       await this.runtime.query<Row<RunProgressMessage>>(
         `select ${MESSAGE} from run_progress_messages
          where ($1::uuid is null or trigger_run_id > $1) and (state in ('pending', 'active') or settle_at is not null)
+           and exists (select 1 from trigger_runs run where run.id = trigger_run_id and run.payload_expiry_state is null)
          order by trigger_run_id limit $2`,
         [afterRunId, limit],
       )
@@ -532,14 +573,14 @@ export class RunTimelineRepository {
           .map((part) => `message.${part.trim()}`)
           .join(",")} from run_progress_messages message
       join trigger_runs run on run.id = message.trigger_run_id
-      where (message.state = 'creating' and (message.lease_owner is null or message.lease_expires_at <= $1))
+      where run.payload_expiry_state is null and ((message.state = 'creating' and (message.lease_owner is null or message.lease_expires_at <= $1))
         or (message.state = 'active' and message.lease_owner is not null and message.lease_expires_at <= $1)
         or (message.state = 'finished' and message.settle_at <= $3 and (message.retry_at is null or message.retry_at <= $3))
         or ((message.retry_at is null or message.retry_at <= $1) and (
           (message.state in ('active','finished') and message.compensation_requested_gen > message.compensation_done_gen and (message.compensation_not_before is null or message.compensation_not_before <= $1))
           or (message.state in ('pending','active') and run.status <> 'running')
           or (message.state = 'pending' and (exists(select 1 from run_timeline_events event where event.trigger_run_id = run.id and event.kind = 'run_started')
-            or exists(select 1 from workflow_step_runs step where step.trigger_run_id = run.id and step.started_at is not null)))))
+            or exists(select 1 from workflow_step_runs step where step.trigger_run_id = run.id and step.started_at is not null))))))
       order by message.updated_at, message.trigger_run_id limit $2`,
         [now, limit, settleThrough],
       )
@@ -553,12 +594,13 @@ export class RunTimelineRepository {
   ): Promise<number | undefined> {
     return (
       await this.runtime.query<{ generation: number }>(
-        `update run_progress_messages set compensation_requested_gen = compensation_requested_gen + 1,
+        `with open_run as materialized (${OPEN_PROGRESS_RUN})
+        update run_progress_messages set compensation_requested_gen = compensation_requested_gen + 1,
       compensation_not_before = case when $3::timestamptz is null then null
         when compensation_requested_gen > compensation_done_gen and compensation_not_before is null then null
         when compensation_requested_gen > compensation_done_gen then least(compensation_not_before, $3::timestamptz)
-        else $3::timestamptz end where organization_id = $1 and trigger_run_id = $2 returning compensation_requested_gen as generation`,
-        [organizationId, runId, notBefore ?? null],
+        else $3::timestamptz end where trigger_run_id = $1 and organization_id = $2 and exists (select 1 from open_run) returning compensation_requested_gen as generation`,
+        [runId, organizationId, notBefore ?? null],
       )
     ).rows[0]?.generation;
   }
@@ -571,8 +613,10 @@ export class RunTimelineRepository {
     if (!Number.isInteger(observedGen) || observedGen < 0)
       throw new RangeError("Invalid compensation generation");
     await this.runtime.query(
-      `update run_progress_messages set compensation_done_gen = greatest(compensation_done_gen, least(compensation_requested_gen, $3)) where organization_id = $1 and trigger_run_id = $2`,
-      [organizationId, runId, observedGen],
+      `with open_run as materialized (${OPEN_PROGRESS_RUN})
+       update run_progress_messages set compensation_done_gen = greatest(compensation_done_gen, least(compensation_requested_gen, $3))
+       where trigger_run_id = $1 and organization_id = $2 and exists (select 1 from open_run)`,
+      [runId, organizationId, observedGen],
     );
   }
 }

@@ -300,7 +300,11 @@ export class RunTimeline implements TimelineQueue {
     );
     if (
       isRunTimelineExpired(
-        { completedAt: run.completedAt, expiredAt: state?.expiredAt ?? null },
+        {
+          completedAt: run.completedAt,
+          expiredAt: state?.expiredAt ?? null,
+          payloadExpiredAt: run.payloadExpiredAt,
+        },
         retentionCutoff(this.options.now?.() ?? new Date(), this.options.retentionDays),
       )
     )

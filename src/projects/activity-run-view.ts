@@ -1,3 +1,8 @@
+import {
+  payloadCompletion,
+  type RunPayloadSummary,
+  type StepPayloadSummary,
+} from "../run-payload-retention/summary.js";
 import type {
   AgentExecutionRecord,
   ProjectActivityRunRecord,
@@ -28,6 +33,8 @@ export interface ActivityRunDetail {
     repo: string | null;
     receivedAt: string;
     configuredTriggerName: string;
+    payloadExpiredAt?: string | null;
+    payloadSummary?: RunPayloadSummary | null;
     createdAt: string;
     completedAt: string | null;
     outcome: TriggerRunRecord["outcome"];
@@ -42,6 +49,8 @@ export interface ActivityRunDetail {
     status: WorkflowStepRunRecord["status"];
     startedAt: string | null;
     output: JsonValue;
+    payloadSummary?: StepPayloadSummary | null;
+    outputExpired?: boolean;
     failureReason: string | null;
     completedAt: string | null;
     isAgent: boolean;
@@ -54,15 +63,18 @@ export function activityRunDetailView(
   executions: (AgentExecutionRecord | undefined)[],
 ): ActivityRunDetail {
   const { run, receipt, steps } = activity;
+  const expired = run.payloadExpiredAt != null;
   return {
     run: {
       id: run.id,
       provider: receipt.provider,
       source: receipt.source,
-      ...(receipt.source === "webhook.received"
+      ...(!expired && receipt.source === "webhook.received"
         ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
         : {}),
-      repo: receipt.repo,
+      repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
+      payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
+      payloadSummary: run.payloadSummary ?? null,
       receivedAt: receipt.receivedAt.toISOString(),
       configuredTriggerName: run.configuredTriggerName,
       createdAt: run.createdAt.toISOString(),
@@ -76,16 +88,7 @@ export function activityRunDetailView(
     },
     steps: steps.map((step, index) => {
       const execution = executions[index];
-      const result = execution?.result;
-      let completion: "explicit_finish" | "inferred_from_turn_end" | null = null;
-      if (execution?.completedByAgentAt != null) completion = "explicit_finish";
-      else if (
-        result !== null &&
-        typeof result === "object" &&
-        "completion" in result &&
-        result.completion === "inferred_from_turn_end"
-      )
-        completion = "inferred_from_turn_end";
+      const completion = executionCompletion(execution, expired);
       return {
         id: step.id,
         stepId: step.stepId,
@@ -93,8 +96,12 @@ export function activityRunDetailView(
         status: step.status,
         startedAt: step.startedAt?.toISOString() ?? null,
         completedAt: step.completedAt?.toISOString() ?? null,
-        output: jsonValue(step.output),
-        failureReason: displayFailureReason(step.failureReason),
+        output: expired ? null : jsonValue(step.output),
+        payloadSummary: expired ? (step.payloadSummary ?? null) : null,
+        outputExpired: expired && (step.payloadSummary?.hadOutput ?? step.startedAt !== null),
+        failureReason: expired
+          ? (step.payloadSummary?.failureCode ?? null)
+          : displayFailureReason(step.failureReason),
         isAgent: step.agentExecutionId !== null,
         completion,
       };
@@ -107,24 +114,27 @@ export function activityRunView(
   executions: (AgentExecutionRecord | undefined)[],
 ) {
   const { run, receipt, steps } = activity;
+  const expired = run.payloadExpiredAt != null;
   const base = {
     id: run.id,
     providerEventReceiptId: run.providerEventReceiptId,
     provider: receipt.provider,
     deliveryId: receipt.deliveryId,
     source: receipt.source,
-    ...(receipt.source === "webhook.received"
+    ...(!expired && receipt.source === "webhook.received"
       ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
       : {}),
-    repo: receipt.repo,
+    repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
+    payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
+    payloadSummary: run.payloadSummary ?? null,
     receivedAt: receipt.receivedAt.toISOString(),
-    rawPayload: jsonValue(receipt.payload),
+    rawPayload: expired ? null : jsonValue(receipt.payload),
     configuredTriggerName: run.configuredTriggerName,
-    prompt: run.prompt,
-    inputs: jsonValue(run.inputs),
-    values: jsonValue(run.values),
-    triggerContext: jsonValue(run.triggerContext),
-    outputContext: jsonValue(run.outputContext),
+    prompt: expired ? null : run.prompt,
+    inputs: expired ? null : jsonValue(run.inputs),
+    values: expired ? null : jsonValue(run.values),
+    triggerContext: expired ? null : jsonValue(run.triggerContext),
+    outputContext: expired ? null : jsonValue(run.outputContext),
     createdAt: run.createdAt.toISOString(),
     completedAt: run.completedAt?.toISOString() ?? null,
     steps: steps.map((step, index) => ({
@@ -140,8 +150,12 @@ export function activityRunView(
       idleDeadlineAt: step.idleDeadlineAt?.toISOString() ?? null,
       deadlineKind: step.deadlineKind,
       startedAt: step.startedAt?.toISOString() ?? null,
-      output: step.output === null ? null : jsonValue(step.output),
-      failureReason: displayFailureReason(step.failureReason),
+      output: expired ? null : jsonValue(step.output),
+      payloadSummary: step.payloadSummary,
+      completion: executionCompletion(executions[index], expired),
+      failureReason: expired
+        ? (step.payloadSummary?.failureCode ?? null)
+        : displayFailureReason(step.failureReason),
       completedAt: step.completedAt?.toISOString() ?? null,
     })),
   };
@@ -164,6 +178,11 @@ export function activityRunView(
     failureReason: displayFailureReason(run.failureReason),
     rejectionReason: null,
   };
+}
+
+function executionCompletion(execution: AgentExecutionRecord | undefined, expired: boolean) {
+  if (execution === undefined) return null;
+  return expired ? (execution.payloadCompletion ?? null) : payloadCompletion(execution);
 }
 
 export function displayFailureReason(reason: string | null): string | null {

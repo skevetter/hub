@@ -122,6 +122,12 @@ export function RunDetailView({
           description={`${run.webhookSummary === undefined ? run.provider : "Webhook"} - ${run.configuredTriggerName}`}
         />
       </div>
+      {run.payloadExpiredAt == null ? null : (
+        <NoticeAlert standalone tone="neutral" title="Run payload expired">
+          This run's original event, inputs, prompts, and outputs expired under this Hub's retention
+          policy.
+        </NoticeAlert>
+      )}
       <Section>
         <SummaryPanel label="Run" rows={summary} />
       </Section>
@@ -208,8 +214,36 @@ function runSummaryRows(
         />
       ),
     },
-    { label: "Activity", value: activityCounts(rows) },
-    { label: "Progress message", value: progressMessageLabel(detail) },
+    {
+      label: "Activity",
+      value:
+        run.payloadSummary?.timelineCounts == null
+          ? activityCounts(rows)
+          : `${run.payloadSummary.timelineCounts.events} timeline events (${run.payloadSummary.timelineCounts.dropped} dropped)`,
+    },
+    ...(run.payloadSummary?.providerLink == null
+      ? []
+      : [
+          {
+            label: "Provider",
+            value: (
+              <a className="text-link hover:underline" href={run.payloadSummary.providerLink}>
+                Open provider item
+              </a>
+            ),
+          },
+        ]),
+    {
+      label: "Progress message",
+      value:
+        run.payloadSummary?.progress.link == null ? (
+          progressMessageLabel(detail)
+        ) : (
+          <a className="text-link hover:underline" href={run.payloadSummary.progress.link}>
+            {progressMessageLabel(detail)}
+          </a>
+        ),
+    },
     ...(run.webhookSummary?.prompt === undefined
       ? []
       : [{ label: "Message", value: run.webhookSummary.prompt }]),

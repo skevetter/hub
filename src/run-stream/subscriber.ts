@@ -226,7 +226,11 @@ export class RunStreamSubscriber {
     }
     if (
       isRunTimelineExpired(
-        { completedAt: run.completedAt, expiredAt: state?.expiredAt ?? null },
+        {
+          completedAt: run.completedAt,
+          expiredAt: state?.expiredAt ?? null,
+          payloadExpiredAt: run.payloadExpiredAt,
+        },
         retentionCutoff(new Date(), settings.retentionDays),
       )
     ) {

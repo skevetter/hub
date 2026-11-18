@@ -1,3 +1,5 @@
+import { isProgressUnsettled, type RunPayloadDisposition } from "../run-payload-retention/store.js";
+import { readScriptStepHandle } from "../workflows/script-output.js";
 import { randomUUID } from "node:crypto";
 import type { AgentExecutionStatus, MachineStatus } from "./schema.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
@@ -191,6 +193,96 @@ export function createMemoryDatabase(options: MemoryDatabaseOptions = {}): Datab
 }
 
 class MemoryDatabase implements Database {
+  async scanRunPayloads(after: string | null, cutoff: Date, limit: number, countOnly: boolean) {
+    return [...this.triggerRuns.values()]
+      .filter(
+        (run) =>
+          (after === null || run.id > after) &&
+          run.payloadExpiryState !== "expired" &&
+          (countOnly ||
+            (run.status !== "running" && run.completedAt !== null && run.completedAt < cutoff)),
+      )
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .slice(0, limit)
+      .map((run) => ({
+        id: run.id,
+        disposition: this.runPayloadDisposition(run, cutoff),
+        ageFrom: run.completedAt ?? run.createdAt,
+        expiring: run.payloadExpiryState === "expiring",
+      }));
+  }
+
+  async expireRunPayloadChunk(): Promise<"skipped"> {
+    return "skipped";
+  }
+
+  private runPayloadDisposition(run: TriggerRunRecord, cutoff: Date): RunPayloadDisposition {
+    if (run.payloadExpiryState === "expiring") return "eligible";
+    if (run.status === "running") return "live";
+    if (run.completedAt === null) return "missing_completion";
+    if (run.completedAt >= cutoff) return "not_old_enough";
+    const steps = this.listSteps(run.id);
+    if (
+      steps.some(
+        (step) =>
+          scriptCleanupPending(step) ||
+          (step.agentExecutionId === null && readScriptStepHandle(step.output) !== undefined),
+      )
+    )
+      return "cleanup_blocked";
+    if (
+      this.workflowWakeups.has(run.id) ||
+      steps.some(
+        (step) =>
+          step.status === "running" || (step.status === "pending" && step.dispatchIntent !== null),
+      ) ||
+      this.runPayloadExecutions(run, steps).some(
+        (execution) =>
+          !isTerminalAgentExecutionStatus(execution.status) ||
+          execution.completedAt === null ||
+          (execution.hubAction !== null && execution.hubActionCompletedAt === null),
+      )
+    )
+      return "live";
+    if (
+      run.outcome === "accepted" &&
+      (run.terminalNotificationLeaseExpiresAt !== null ||
+        (run.terminalNotificationPendingAt !== null &&
+          run.terminalNotificationDeliveredAt === null))
+    )
+      return "notification_pending";
+    const message = this.runProgressMessages.get(run.id);
+    if (message !== undefined && isProgressUnsettled(message)) return "reporter_pending";
+    const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
+    const branches = this.triggerRunIdsByProviderEventReceipt.get(run.providerEventReceiptId);
+    if (
+      receipt?.acceptedRoutes?.some(
+        (route) =>
+          ![...(branches?.get(route.projectId)?.values() ?? [])].some(
+            (id) =>
+              this.triggerRuns.get(id)?.configurationRevisionId === route.configurationRevisionId,
+          ),
+      )
+    )
+      return "fan_out_unresolved";
+    return "eligible";
+  }
+
+  private runPayloadExecutions(run: TriggerRunRecord, steps: readonly WorkflowStepRunRecord[]) {
+    return [...this.agentExecutions.values()].filter(
+      (execution) =>
+        steps.some(
+          (step) =>
+            execution.workflowStepRunId === step.id || execution.id === step.agentExecutionId,
+        ) ||
+        (execution.workflowStepRunId === null &&
+          execution.launchIntent?.kind === "launch_machine" &&
+          execution.launchIntent.triggerRunId === run.id &&
+          execution.organizationId === run.organizationId &&
+          execution.projectId === run.projectId),
+    );
+  }
+
   // This test double has no background work. Scheduling tests use the actual embedded/PG runtime.
   get schedules(): import("../triggers/schedule/index.js").ScheduleStore {
     return (
@@ -391,8 +483,7 @@ class MemoryDatabase implements Database {
       throw new RangeError("Invalid timeline drop count");
     batchId = timelineAccountingBatchId(batchId);
     const run = this.triggerRuns.get(runId);
-    if (run === undefined || run.organizationId !== organizationId || run.outcome !== "accepted")
-      return undefined;
+    if (!isOpenTimelineRun(run, organizationId)) return undefined;
     let state = this.runTimelineStates.get(runId);
     if (state?.expiredAt != null) return undefined;
     if (state === undefined) {
@@ -448,6 +539,7 @@ class MemoryDatabase implements Database {
       run.outcome !== "accepted"
     )
       return undefined;
+    if (run.payloadExpiredAt != null) return { reason: "expired" };
     let state = this.runTimelineStates.get(run.id);
     if (state?.expiredAt != null) return { reason: "expired" };
     if (state?.sealedSeq != null) {
@@ -525,7 +617,8 @@ class MemoryDatabase implements Database {
     runId: string,
     page: { afterSeq: number; limit: number },
   ): Promise<RunTimelineEvent[]> {
-    if (this.triggerRuns.get(runId)?.organizationId !== organizationId) return [];
+    const run = this.triggerRuns.get(runId);
+    if (run?.organizationId !== organizationId || run.payloadExpiredAt != null) return [];
     return structuredClone(
       (this.runTimelineEvents.get(runId) ?? [])
         .filter((event) => event.organizationId === organizationId && event.seq > page.afterSeq)
@@ -581,6 +674,7 @@ class MemoryDatabase implements Database {
             run.completedAt !== null &&
             run.completedAt < olderThan &&
             run.completedAt >= cutoff &&
+            run.payloadExpiredAt == null &&
             state?.sealedSeq == null &&
             state?.expiredAt == null
           );
@@ -601,9 +695,15 @@ class MemoryDatabase implements Database {
           return false;
         }
         const state = this.runTimelineStates.get(run.id);
-        return (
-          (state !== undefined && state.expiredAt === null) || this.runProgressMessages.has(run.id)
-        );
+        const progress = this.runProgressMessages.get(run.id);
+        if (
+          progress !== undefined &&
+          (isProgressUnsettled(progress) ||
+            (progress.credentialRetryAt?.getTime() ?? 0) > Date.now() ||
+            (progress.credentialRejectedUntil?.getTime() ?? 0) > Date.now())
+        )
+          return false;
+        return (state !== undefined && state.expiredAt === null) || progress !== undefined;
       })
       .sort(
         (left, right) =>
@@ -631,6 +731,7 @@ class MemoryDatabase implements Database {
     if (
       run?.organizationId !== input.organizationId ||
       run.outcome !== "accepted" ||
+      run.payloadExpiredAt != null ||
       this.runTimelineStates.get(run.id)?.expiredAt != null
     )
       return undefined;
@@ -677,7 +778,8 @@ class MemoryDatabase implements Database {
   ): Promise<RunProgressMessage | undefined> {
     const message = this.runProgressMessages.get(runId);
     return message?.organizationId === organizationId &&
-      this.triggerRuns.get(runId)?.organizationId === organizationId
+      this.triggerRuns.get(runId)?.organizationId === organizationId &&
+      this.triggerRuns.get(runId)?.payloadExpiredAt == null
       ? structuredClone(message)
       : undefined;
   }
@@ -689,6 +791,7 @@ class MemoryDatabase implements Database {
     if (
       message?.organizationId !== input.organizationId ||
       this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
+      this.triggerRuns.get(input.triggerRunId)?.payloadExpiredAt != null ||
       (message.leaseOwner !== null &&
         message.leaseOwner !== input.owner &&
         message.leaseExpiresAt !== null &&
@@ -743,6 +846,7 @@ class MemoryDatabase implements Database {
     if (
       message?.organizationId !== input.organizationId ||
       this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
+      this.triggerRuns.get(input.triggerRunId)?.payloadExpiredAt != null ||
       message.leaseOwner !== input.owner ||
       message.version !== input.version ||
       message.leaseExpiresAt === null ||
@@ -796,7 +900,11 @@ class MemoryDatabase implements Database {
     input: RecordProgressCredentialCooldownInput,
   ): Promise<void> {
     const row = this.runProgressMessages.get(input.triggerRunId);
-    if (row?.organizationId !== input.organizationId) return;
+    if (
+      row?.organizationId !== input.organizationId ||
+      this.triggerRuns.get(input.triggerRunId)?.payloadExpiredAt != null
+    )
+      return;
     const sameCredential = row.credentialKey === input.key;
     row.credentialKey = input.key;
     row.credentialRetryAt = laterCooldown(
@@ -818,6 +926,7 @@ class MemoryDatabase implements Database {
         .filter(
           (row) =>
             (afterRunId === null || row.triggerRunId > afterRunId) &&
+            this.triggerRuns.get(row.triggerRunId)?.payloadExpiredAt == null &&
             (["pending", "active"].includes(row.state) || row.settleAt !== null),
         )
         .sort((left, right) => left.triggerRunId.localeCompare(right.triggerRunId))
@@ -837,7 +946,8 @@ class MemoryDatabase implements Database {
           if (
             run === undefined ||
             run.organizationId !== message.organizationId ||
-            run.outcome !== "accepted"
+            run.outcome !== "accepted" ||
+            run.payloadExpiredAt != null
           )
             return false;
           const terminal = run.status !== "running";
@@ -897,7 +1007,8 @@ class MemoryDatabase implements Database {
     const message = this.runProgressMessages.get(runId);
     if (
       message?.organizationId !== organizationId ||
-      this.triggerRuns.get(runId)?.organizationId !== organizationId
+      this.triggerRuns.get(runId)?.organizationId !== organizationId ||
+      this.triggerRuns.get(runId)?.payloadExpiredAt != null
     )
       return undefined;
     const pending = message.compensationRequestedGen > message.compensationDoneGen;
@@ -924,7 +1035,8 @@ class MemoryDatabase implements Database {
     const message = this.runProgressMessages.get(runId);
     if (
       message?.organizationId !== organizationId ||
-      this.triggerRuns.get(runId)?.organizationId !== organizationId
+      this.triggerRuns.get(runId)?.organizationId !== organizationId ||
+      this.triggerRuns.get(runId)?.payloadExpiredAt != null
     )
       return;
     message.compensationDoneGen = Math.max(
@@ -1107,7 +1219,40 @@ class MemoryDatabase implements Database {
   }
 
   async findWorkflowStepRunById(id: string) {
-    return this.workflowStepRuns.get(id);
+    const step = this.workflowStepRuns.get(id);
+    return step === undefined ? undefined : this.projectStepPayload(step);
+  }
+
+  private projectStepPayload(step: WorkflowStepRunRecord): WorkflowStepRunRecord {
+    if (this.triggerRuns.get(step.triggerRunId)?.payloadExpiredAt == null) return step;
+    return {
+      ...step,
+      output: null,
+      dispatchIntent: null,
+      failureReason: step.payloadSummary?.failureCode ?? null,
+    };
+  }
+
+  private projectExecutionPayload(execution: AgentExecutionRecord): AgentExecutionRecord {
+    if (!this.executionPayloadExpired(execution)) return execution;
+    return { ...execution, result: null, triggerContext: null, outputContext: null };
+  }
+
+  private executionPayloadExpired(execution: AgentExecutionRecord): boolean {
+    const step =
+      execution.workflowStepRunId === null
+        ? [...this.workflowStepRuns.values()].find(
+            (candidate) => candidate.agentExecutionId === execution.id,
+          )
+        : this.workflowStepRuns.get(execution.workflowStepRunId);
+    const runId = step?.triggerRunId ?? execution.launchIntent?.triggerRunId;
+    if (runId == null) return false;
+    const run = this.triggerRuns.get(runId);
+    return (
+      run?.organizationId === execution.organizationId &&
+      run.projectId === execution.projectId &&
+      run.payloadExpiredAt != null
+    );
   }
 
   async findWorkflowStepRunByTriggerRun(triggerRunId: string) {
@@ -1115,15 +1260,14 @@ class MemoryDatabase implements Database {
   }
 
   async listWorkflowStepRunsForTriggerRun(triggerRunId: string) {
-    return Array.from(this.workflowStepRuns.values())
-      .filter((step) => step.triggerRunId === triggerRunId)
-      .sort((left, right) => left.ordinal - right.ordinal);
+    return this.listSteps(triggerRunId).map((step) => this.projectStepPayload(step));
   }
 
   async findAgentExecutionByWorkflowStepRunId(stepRunId: string) {
-    return Array.from(this.agentExecutions.values()).find(
-      (execution) => execution.workflowStepRunId === stepRunId,
+    const execution = [...this.agentExecutions.values()].find(
+      (candidate) => candidate.workflowStepRunId === stepRunId,
     );
+    return execution === undefined ? undefined : this.projectExecutionPayload(execution);
   }
 
   async releaseWorkflowWakeup(triggerRunId: string, now: Date, claimedLease: Date, retryAt?: Date) {
@@ -1153,6 +1297,7 @@ class MemoryDatabase implements Database {
   }
 
   async wakeWorkflowRun(triggerRunId: string, availableAt: Date) {
+    if (this.triggerRuns.get(triggerRunId)?.payloadExpiredAt != null) return;
     const current = this.workflowWakeups.get(triggerRunId);
     this.workflowWakeups.set(triggerRunId, {
       triggerRunId,
@@ -1267,8 +1412,10 @@ class MemoryDatabase implements Database {
       throw new Error(`workflow step run already linked: ${stepRunId}`);
     }
     if (step.agentExecutionId === executionId) return step;
-    const execution = await this.findAgentExecutionById(executionId);
+    const execution = this.agentExecutions.get(executionId);
     if (execution === undefined) throw new Error(`agent execution not found: ${executionId}`);
+    if (this.triggerRuns.get(step.triggerRunId)?.payloadExpiredAt != null)
+      return this.projectStepPayload(step);
     const updated = {
       ...step,
       status:
@@ -1307,16 +1454,11 @@ class MemoryDatabase implements Database {
 
   async completeWorkflowAgentExecution(input: WorkflowAgentCompletionInput) {
     const execution = this.readAgentExecution(input.executionId);
+    if (this.executionPayloadExpired(execution))
+      return { execution: this.projectExecutionPayload(execution), transitioned: false };
     if (execution.workflowStepRunId === null) {
       return this.transitionAgentExecution(execution.id, input.executionStatus, {
-        result: input.result,
-        ...(input.completedByAgent === undefined
-          ? {}
-          : { completedByAgent: input.completedByAgent }),
-        ...(input.deadlineCondition === undefined
-          ? {}
-          : { deadlineCondition: input.deadlineCondition }),
-        ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
+        ...executionTransitionFields(input),
       });
     }
     const step = this.workflowStepRuns.get(execution.workflowStepRunId);
@@ -1350,16 +1492,11 @@ class MemoryDatabase implements Database {
 
     const transitioned =
       execution.status === "spawning" || execution.status === "running"
-        ? await this.transitionAgentExecution(execution.id, input.executionStatus, {
-            result: input.result,
-            ...(input.completedByAgent === undefined
-              ? {}
-              : { completedByAgent: input.completedByAgent }),
-            ...(input.deadlineCondition === undefined
-              ? {}
-              : { deadlineCondition: input.deadlineCondition }),
-            ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
-          })
+        ? await this.transitionAgentExecution(
+            execution.id,
+            input.executionStatus,
+            executionTransitionFields(input),
+          )
         : { execution, transitioned: false };
     if (transitioned.transitioned || isTerminalAgentExecutionStatus(execution.status)) {
       this.finishWorkflowStep(step, run, input);
@@ -1583,10 +1720,9 @@ class MemoryDatabase implements Database {
 
   async markWorkflowStepSkipped(triggerRunId: string, stepId: string, reason: string) {
     const run = this.triggerRuns.get(triggerRunId);
-    const step = (await this.listWorkflowStepRunsForTriggerRun(triggerRunId)).find(
-      (candidate) => candidate.stepId === stepId,
-    );
-    if (run === undefined || step === undefined || run.outcome !== "accepted") return undefined;
+    if (run?.outcome !== "accepted" || run.payloadExpiredAt != null) return undefined;
+    const step = this.listSteps(triggerRunId).find((candidate) => candidate.stepId === stepId);
+    if (step === undefined) return undefined;
     if (step.status !== "pending") return { stepRun: step, run };
     const now = this.options.now?.() ?? new Date();
     const updatedStep = {
@@ -1643,22 +1779,22 @@ class MemoryDatabase implements Database {
 
   async setWorkflowScriptStepOutput(stepRunId: string, output: unknown) {
     const step = this.workflowStepRuns.get(stepRunId);
-    // Never an agent step: its output is the agent's, not Hub's to rewrite.
-    if (step === undefined || step.agentExecutionId !== null) return undefined;
+    if (
+      step === undefined ||
+      step.agentExecutionId !== null ||
+      this.triggerRuns.get(step.triggerRunId)?.payloadExpiredAt != null
+    )
+      return undefined;
     const updated: WorkflowStepRunRecord = { ...step, output };
     this.workflowStepRuns.set(step.id, updated);
     return updated;
   }
 
   async listWorkflowScriptStepsPendingCleanup() {
-    return Array.from(this.workflowStepRuns.values()).filter(
+    return [...this.workflowStepRuns.values()].filter(
       (step) =>
-        (step.status === "succeeded" || step.status === "failed" || step.status === "timed_out") &&
-        // Only a script step has no agent execution; an agent's output can look like anything.
-        step.agentExecutionId === null &&
-        typeof step.output === "object" &&
-        step.output !== null &&
-        ("daemon_id" in step.output || "cleanup" in step.output),
+        this.triggerRuns.get(step.triggerRunId)?.payloadExpiredAt == null &&
+        scriptCleanupPending(step),
     );
   }
 
@@ -1747,6 +1883,7 @@ class MemoryDatabase implements Database {
         (run): run is AcceptedTriggerRunRecord =>
           run.outcome === "accepted" &&
           run.status !== "running" &&
+          run.payloadExpiredAt == null &&
           run.terminalNotificationPendingAt !== null &&
           run.terminalNotificationDeliveredAt === null &&
           (run.terminalNotificationLeaseExpiresAt === null ||
@@ -1761,14 +1898,28 @@ class MemoryDatabase implements Database {
     if (candidate === undefined) return undefined;
     const updated = {
       ...candidate,
+      terminalNotificationGeneration: (candidate.terminalNotificationGeneration ?? 0) + 1,
       terminalNotificationLeaseExpiresAt: new Date(now.getTime() + leaseMs),
     };
     this.triggerRuns.set(updated.id, updated);
     return updated;
   }
 
+  async ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number, now: Date) {
+    const run = this.triggerRuns.get(triggerRunId);
+    return (
+      run?.outcome === "accepted" &&
+      run.payloadExpiredAt == null &&
+      run.terminalNotificationGeneration === generation &&
+      run.terminalNotificationDeliveredAt === null &&
+      run.terminalNotificationLeaseExpiresAt !== null &&
+      run.terminalNotificationLeaseExpiresAt > now
+    );
+  }
+
   async markWorkflowRunTerminalNotificationDelivered(
     triggerRunId: string,
+    generation: number,
     deliveredAt: Date,
     reactionState: JsonValue | null,
   ) {
@@ -1776,6 +1927,9 @@ class MemoryDatabase implements Database {
     if (
       run === undefined ||
       run.outcome !== "accepted" ||
+      run.payloadExpiredAt != null ||
+      run.terminalNotificationGeneration !== generation ||
+      run.terminalNotificationLeaseExpiresAt === null ||
       run.terminalNotificationPendingAt === null ||
       run.terminalNotificationDeliveredAt !== null
     ) {
@@ -1791,7 +1945,8 @@ class MemoryDatabase implements Database {
 
   async setWorkflowRunReactionState(triggerRunId: string, reactionState: JsonValue | null) {
     const run = this.triggerRuns.get(triggerRunId);
-    if (run === undefined || run.outcome !== "accepted") return undefined;
+    if (run === undefined || run.outcome !== "accepted" || run.payloadExpiredAt != null)
+      return undefined;
     const updated = { ...run, reactionState };
     this.triggerRuns.set(run.id, updated);
     return updated;
@@ -2612,7 +2767,8 @@ class MemoryDatabase implements Database {
   }
 
   async findAgentExecutionById(id: string): Promise<AgentExecutionRecord | undefined> {
-    return this.agentExecutions.get(id);
+    const execution = this.agentExecutions.get(id);
+    return execution === undefined ? undefined : this.projectExecutionPayload(execution);
   }
 
   async setAgentExecutionReactionState(
@@ -2620,6 +2776,7 @@ class MemoryDatabase implements Database {
     reactionState: JsonValue | null,
   ): Promise<AgentExecutionRecord> {
     const execution = this.readAgentExecution(executionId);
+    if (this.executionPayloadExpired(execution)) return this.projectExecutionPayload(execution);
     const updated = { ...execution, reactionState };
     this.agentExecutions.set(executionId, updated);
     return updated;
@@ -2633,16 +2790,17 @@ class MemoryDatabase implements Database {
     const machine =
       execution.machineId === null ? undefined : this.machines.get(execution.machineId);
     return machine?.orgId === organizationId || execution.organizationId === organizationId
-      ? execution
+      ? this.projectExecutionPayload(execution)
       : undefined;
   }
   async findAgentExecutionForProject(projectId: string, id: string) {
     const execution = this.agentExecutions.get(id);
-    return execution?.projectId === projectId ? execution : undefined;
+    return execution?.projectId === projectId ? this.projectExecutionPayload(execution) : undefined;
   }
   async updateTriggerRunValues(triggerRunId: string, values: unknown): Promise<TriggerRunRecord> {
     const run = this.triggerRuns.get(triggerRunId);
     if (run === undefined) throw new Error(`trigger run not found: ${triggerRunId}`);
+    if (run.payloadExpiredAt != null) return run;
     const updated = { ...run, values: freezeEvidence(values) } as TriggerRunRecord;
     this.triggerRuns.set(triggerRunId, updated);
     return updated;
@@ -2655,7 +2813,7 @@ class MemoryDatabase implements Database {
     return (await this.listTriggerRunsForProject(projectId, limit)).flatMap((run) => {
       const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
       if (receipt === undefined) return [];
-      const payload = receipt.payload;
+      const payload = run.payloadExpiredAt == null ? receipt.payload : null;
       const actor =
         receipt.source === "webhook.received" &&
         payload !== null &&
@@ -2679,7 +2837,14 @@ class MemoryDatabase implements Database {
     if (run === undefined || run.projectId !== projectId) return undefined;
     const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
     if (receipt === undefined) return undefined;
-    return { run, receipt, steps: this.listSteps(run.id) };
+    return {
+      run,
+      receipt:
+        run.payloadExpiredAt == null
+          ? receipt
+          : { ...receipt, payload: null, acceptedRoutes: null },
+      steps: await this.listWorkflowStepRunsForTriggerRun(run.id),
+    };
   }
 
   async findOrganizationActivityRun(organizationId: string, runId: string) {
@@ -2687,7 +2852,14 @@ class MemoryDatabase implements Database {
     if (run === undefined || run.organizationId !== organizationId) return undefined;
     const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
     if (receipt === undefined || receipt.organizationId !== organizationId) return undefined;
-    return { run, receipt, steps: this.listSteps(run.id) };
+    return {
+      run,
+      receipt:
+        run.payloadExpiredAt == null
+          ? receipt
+          : { ...receipt, payload: null, acceptedRoutes: null },
+      steps: await this.listWorkflowStepRunsForTriggerRun(run.id),
+    };
   }
 
   private listSteps(triggerRunId: string): WorkflowStepRunRecord[] {
@@ -4527,4 +4699,36 @@ function hasBoundWebhookEvidence(evidence: unknown, id: string): boolean {
     "triggerId" in evidence &&
     evidence.triggerId === id
   );
+}
+
+function scriptCleanupPending(step: WorkflowStepRunRecord): boolean {
+  const output = step.output;
+  return (
+    (step.status === "succeeded" || step.status === "failed" || step.status === "timed_out") &&
+    step.agentExecutionId === null &&
+    output !== null &&
+    typeof output === "object" &&
+    (("daemon_id" in output && output.daemon_id != null) || "cleanup" in output)
+  );
+}
+
+function isOpenTimelineRun(run: TriggerRunRecord | undefined, organizationId: string): boolean {
+  return (
+    run?.organizationId === organizationId &&
+    run.outcome === "accepted" &&
+    run.payloadExpiredAt == null
+  );
+}
+
+function executionTransitionFields(
+  input: WorkflowAgentCompletionInput,
+): TransitionAgentExecutionFields {
+  return {
+    result: input.result,
+    ...(input.completedByAgent === undefined ? {} : { completedByAgent: input.completedByAgent }),
+    ...(input.deadlineCondition === undefined
+      ? {}
+      : { deadlineCondition: input.deadlineCondition }),
+    ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
+  };
 }

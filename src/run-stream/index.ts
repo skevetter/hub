@@ -128,7 +128,11 @@ export class RunStream {
     let state = await database.readRunTimelineState(organizationId, run.id);
     const expired = () =>
       isRunTimelineExpired(
-        { completedAt: run.completedAt, expiredAt: state?.expiredAt ?? null },
+        {
+          completedAt: run.completedAt,
+          expiredAt: state?.expiredAt ?? null,
+          payloadExpiredAt: run.payloadExpiredAt,
+        },
         retentionCutoff(new Date(), this.options.settings.retentionDays),
       );
     if (expired()) return "timeline_expired";
@@ -146,7 +150,10 @@ export class RunStream {
       afterSeq: 0,
       limit: 1,
     });
-    return { run, state, after, firstSeq: first[0]?.seq ?? null };
+    const current = await database.findTriggerRunForOrganization(organizationId, runId);
+    if (current?.outcome !== "accepted") return "run_not_found";
+    if (current.payloadExpiredAt != null) return "timeline_expired";
+    return { run: current, state, after, firstSeq: first[0]?.seq ?? null };
   }
 
   private open(

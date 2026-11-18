@@ -78,12 +78,22 @@ describe("pooled PostgreSQL timeline concurrency", () => {
       seq: 1,
       inserted: true,
     });
+    const scope = {
+      triggerRunId: run.id,
+      organizationId: TIMELINE_ORGANIZATION,
+      now: new Date(),
+      owner: "retention-test",
+    };
     assert.ok(
-      await harness.database.insertRunProgressMessageIfAbsent({
-        triggerRunId: run.id,
-        organizationId: TIMELINE_ORGANIZATION,
-        provider: "github",
-        now: new Date(),
+      await harness.database.insertRunProgressMessageIfAbsent({ ...scope, provider: "github" }),
+    );
+    const lease = await harness.database.acquireRunProgressLease(scope);
+    assert.ok(lease);
+    assert.ok(
+      await harness.database.updateRunProgressMessage({
+        ...scope,
+        version: lease.version,
+        patch: { state: "finished" },
       }),
     );
     const completed = await harness.database.failWorkflowRun(run.id, "failed", "finished");

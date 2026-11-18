@@ -11,10 +11,15 @@ export function retentionCutoff(now: Date, retentionDays: number): Date {
 }
 
 export function isRunTimelineExpired(
-  run: { completedAt: Date | null; expiredAt?: Date | null },
+  run: {
+    completedAt: Date | null;
+    expiredAt?: Date | null;
+    payloadExpiredAt?: Date | null | undefined;
+  },
   cutoff: Date,
 ): boolean {
   return (
+    run.payloadExpiredAt != null ||
     run.expiredAt != null ||
     (run.completedAt !== null && run.completedAt.getTime() < cutoff.getTime())
   );

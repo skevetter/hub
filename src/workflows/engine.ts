@@ -1003,11 +1003,15 @@ export class DurableWorkflowEngine {
       if (run === undefined) return;
       await this.options.timelineReconciler?.reconcileBeforeTerminal(run.organizationId, run.id);
       try {
+        const generation = run.terminalNotificationGeneration;
+        if (!(await database.ownsWorkflowRunTerminalNotification(run.id, generation, this.now())))
+          continue;
         const reactionState = await this.options.onWorkflowRunTerminal?.(run);
         const deliveredReactionState =
           reactionState === undefined ? terminalReactionState(run) : reactionState;
         await database.markWorkflowRunTerminalNotificationDelivered(
           run.id,
+          generation,
           this.now(),
           deliveredReactionState,
         );
