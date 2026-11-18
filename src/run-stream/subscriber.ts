@@ -23,8 +23,7 @@ export interface StreamContext {
 }
 
 const encoder = new TextEncoder();
-const HIGH_WATER_MARK = 16 * 1024;
-const MAX_QUEUE_BYTES = 256 * 1024;
+const MAX_FRAME_BYTES = 256 * 1024;
 
 export function controlEvent(kind: string, data: unknown): string {
   return `event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -61,6 +60,9 @@ export class RunStreamSubscriber {
     },
   ) {
     let cursor = options.after;
+    // Prefetch a page without queuing event frames ahead of the next consumer read.
+    let initialPage = options.firstSeq === null ? undefined : options.notifier.page(cursor);
+    void initialPage?.catch(() => undefined);
     this.body = new ReadableStream<Uint8Array>(
       {
         start: (controller) => {
@@ -82,6 +84,20 @@ export class RunStreamSubscriber {
           const produce = async () => {
             while (!this.closed) {
               if (this.index < this.page.length) {
+                const { run } = options.context;
+                const current = await options.store.findTriggerRunForOrganization(
+                  run.organizationId,
+                  run.id,
+                );
+                if (this.closed) return;
+                if (current?.outcome !== "accepted") {
+                  this.finish("error", controlEvent("error", { code: "run_not_found" }));
+                  return;
+                }
+                if (current.payloadExpiredAt != null) {
+                  this.finish("error", controlEvent("error", { code: "timeline_expired" }));
+                  return;
+                }
                 const row = this.page[this.index++]!;
                 if (
                   this.enqueue(
@@ -109,18 +125,10 @@ export class RunStreamSubscriber {
               const version = options.notifier.version;
               const context = await this.readContext();
               if (this.closed || context === undefined) return;
-              const page = await options.notifier.page(cursor);
+              const page = await (initialPage ?? options.notifier.page(cursor));
+              initialPage = undefined;
               if (this.closed) return;
               if (page.length > 0) {
-                const current = await options.store.findTriggerRunForOrganization(
-                  context.run.organizationId,
-                  context.run.id,
-                );
-                if (this.closed) return;
-                if (current?.payloadExpiredAt != null) {
-                  this.finish("error", controlEvent("error", { code: "timeline_expired" }));
-                  return;
-                }
                 this.page = page;
                 continue;
               }
@@ -154,7 +162,7 @@ export class RunStreamSubscriber {
         },
         cancel: () => this.finish("abort"),
       },
-      { highWaterMark: HIGH_WATER_MARK, size: (chunk) => chunk.byteLength },
+      { highWaterMark: 0 },
     );
     options.request.signal.addEventListener("abort", this.onAbort, { once: true });
     if (options.request.signal.aborted) {
@@ -210,7 +218,7 @@ export class RunStreamSubscriber {
   private enqueue(frame: string): boolean {
     if (this.closed) return false;
     const bytes = encoder.encode(frame);
-    if (HIGH_WATER_MARK - (this.controller.desiredSize ?? 0) + bytes.byteLength > MAX_QUEUE_BYTES) {
+    if (bytes.byteLength > MAX_FRAME_BYTES) {
       this.finish("slow_consumer", controlEvent("error", { code: "slow_consumer" }));
       return false;
     }
