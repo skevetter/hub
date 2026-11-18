@@ -19,7 +19,8 @@ The worker starts in the background after startup and runs hourly. Count mode re
 number and oldest age of eligible and blocked runs without changing rows or logging content.
 Pending workflow work, execution or script cleanup, unresolved receipt fan-out, terminal
 notifications and reporter work can keep old runs ineligible. Ordinary provider receipts
-without a route snapshot count as unresolved fan-out. Hub also counts terminal runs
+need a pinned route snapshot with an admitted branch for every workflow for that provider.
+If Hub cannot prove that from stored rows, the receipt counts as unresolved fan-out. Hub also counts terminal runs
 that lack a completion time. Apply mode records expiry before clearing child rows in batches,
 and resumes interrupted redactions after a restart in `on` mode.
 
@@ -33,3 +34,8 @@ This policy covers logical redaction in the live Hub database. Backups, WAL, old
 daemon transcripts, and provider comments and files are outside this policy. Receipts still
 hold the raw event body and are scheduled for expiry in a later build. This build also keeps
 launch intents and sessions.
+
+Set the mode to `off` before a rollback. Keep every binary at this build or newer while
+`on` is enabled or after it has redacted any content. Build 12 and earlier bypass both
+expiry fences. Their activity reads can return the retained receipt body, and their script
+output writers can restore content to a redacted step.
