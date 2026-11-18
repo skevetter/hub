@@ -443,6 +443,15 @@ export const triggerRuns = pgTable(
     terminalNotificationLeaseExpiresAt: timestamp("terminal_notification_lease_expires_at", {
       withTimezone: true,
     }),
+    terminalNotificationGeneration: integer("terminal_notification_generation")
+      .notNull()
+      .default(0),
+    payloadExpiredAt: timestamp("payload_expired_at", { withTimezone: true }),
+    payloadExpiryState: text("payload_expiry_state").$type<"expiring" | "expired">(),
+    payloadSummary:
+      jsonb("payload_summary").$type<
+        import("../run-payload-retention/summary.js").RunPayloadSummary
+      >(),
     rejection: jsonb(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     completedAt: timestamp("completed_at", { withTimezone: true }),
@@ -456,6 +465,11 @@ export const triggerRuns = pgTable(
     ),
     index("trigger_runs_status_deadline_idx").on(table.status, table.deadlineAt),
     index("trigger_runs_project_created_idx").on(table.projectId, table.createdAt.desc()),
+    index("trigger_runs_payload_expiry_idx")
+      .on(table.completedAt, table.id)
+      .where(
+        sql`${table.status} <> 'running' and ${table.payloadExpiryState} is distinct from 'expired'`,
+      ),
     index("trigger_runs_terminal_notification_idx").on(
       table.terminalNotificationDeliveredAt,
       table.terminalNotificationLeaseExpiresAt,
@@ -463,6 +477,12 @@ export const triggerRuns = pgTable(
     check(
       "trigger_runs_status_check",
       sql`${table.status} in ('running', 'succeeded', 'failed', 'timed_out', 'rejected')`,
+    ),
+    check(
+      "trigger_runs_payload_expiry_check",
+      sql`(${table.payloadExpiryState} is null and ${table.payloadExpiredAt} is null and ${table.payloadSummary} is null)
+        or (${table.payloadExpiryState} is not null and ${table.payloadExpiryState} in ('expiring', 'expired')
+            and ${table.payloadExpiredAt} is not null and ${table.payloadSummary} is not null)`,
     ),
     check(
       "trigger_runs_outcome_check",
@@ -676,6 +696,10 @@ export const workflowStepRuns = pgTable(
     deadlineAt: timestamp("deadline_at", { withTimezone: true }),
     idleDeadlineAt: timestamp("idle_deadline_at", { withTimezone: true }),
     dispatchIntent: jsonb("dispatch_intent").$type<LaunchMachineIntent>(),
+    payloadSummary:
+      jsonb("payload_summary").$type<
+        import("../run-payload-retention/summary.js").StepPayloadSummary
+      >(),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
   },
@@ -880,6 +904,10 @@ export const agentExecutions = pgTable(
     deadlineAt: timestamp("deadline_at", { withTimezone: true }),
     idleDeadlineAt: timestamp("idle_deadline_at", { withTimezone: true }),
     result: jsonb(),
+    payloadCompletion:
+      text("payload_completion").$type<
+        import("../run-payload-retention/summary.js").PayloadCompletion
+      >(),
     triggerContext: jsonb("trigger_context"),
     outputContext: jsonb("output_context"),
     reactionState: jsonb("reaction_state"),
@@ -909,6 +937,14 @@ export const agentExecutions = pgTable(
     index("agent_executions_machine_id_idx").on(table.machineId),
     index("agent_executions_project_started_at_idx").on(table.projectId, table.startedAt.desc()),
     index("agent_executions_status_idx").on(table.status),
+    index("agent_executions_workflow_step_idx")
+      .on(table.workflowStepRunId)
+      .where(sql`${table.workflowStepRunId} is not null`),
+    index("agent_executions_legacy_run_idx")
+      .on(table.organizationId, table.projectId, sql`(${table.launchIntent} ->> 'triggerRunId')`)
+      .where(
+        sql`${table.workflowStepRunId} is null and ${table.launchIntent} ->> 'kind' = 'launch_machine'`,
+      ),
     check(
       "agent_executions_hub_action_check",
       sql`${table.hubAction} is null or ${table.hubAction} in ('interrupt', 'archive')`,
