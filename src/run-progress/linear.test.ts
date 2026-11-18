@@ -550,6 +550,32 @@ describe("Linear run progress", () => {
     assert.equal(fetch.mock.calls.length, 0);
   });
 
+  it("uses rotated tokens from the same binding at the final lookup", async () => {
+    const fetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      assert.equal(new Headers(init?.headers).get("authorization"), "Bearer rotated-access-token");
+      return Response.json({ data: { commentUpdate: { success: true } } });
+    });
+    const { provider, connection, authorize, lookup, refresh } = fixture(fetch);
+    await authorize(ref);
+    const selected = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    lookup.mockImplementationOnce(async () => {
+      const snapshot = { ...connection };
+      selected.resolve();
+      await release.promise;
+      return snapshot;
+    });
+    const edit = provider.edit(ref, "Finished", signal);
+    await selected.promise;
+    connection.accessToken = "rotated-access-token";
+    connection.refreshToken = "rotated-refresh-token";
+    connection.accessTokenExpiresAt = new Date(Date.now() + 3_600_000);
+    release.resolve();
+    assert.deepEqual(await edit, { status: "ok" });
+    assert.equal(refresh.mock.calls.length, 0);
+    assert.equal(fetch.mock.calls.length, 1);
+  });
+
   it("refuses to send the refreshed access token in a progress body", async () => {
     const fetch = vi.fn(neverFetch);
     const { provider, connection, authorize, refresh } = fixture(fetch);

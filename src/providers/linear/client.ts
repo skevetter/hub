@@ -427,23 +427,19 @@ export function createLinearApiClient(options: {
     payload: GraphqlPayload,
     write?: LinearCommentWriteOptions,
   ): Promise<unknown> => {
-    const connection = await connectionForToken(input.linearOrganizationId, write);
+    let connection = await connectionForToken(input.linearOrganizationId, write);
     if (write !== undefined) {
       write.signal.throwIfAborted();
       const current = await options.connectionForLinearOrganization(input.linearOrganizationId);
       write.signal.throwIfAborted();
-      if (
-        current === undefined ||
-        current.accessToken !== connection.accessToken ||
-        current.refreshToken !== connection.refreshToken
-      )
-        throw new LinearCredentialError("connection_not_owned");
+      if (current === undefined) throw new LinearCredentialError("connection_not_owned");
       checkWriteConnection(current, write);
       if (
         input.body.includes(current.accessToken) ||
         (current.refreshToken && input.body.includes(current.refreshToken))
       )
         throw new LinearCredentialError("body_contains_secret");
+      connection = current;
     }
     return graphql(request, connection.accessToken, payload, {
       mutation: true,

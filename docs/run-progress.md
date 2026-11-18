@@ -47,3 +47,7 @@ Verify this in a live Linear workspace before enabling progress messages for Lin
 
 Hub refuses an edit with `target_mismatch` when the stored issue or workspace differs from
 the run's Linear destination, or when the stored reference lacks the bound issue or workspace.
+
+A connection rebind can commit after the final database lookup takes its snapshot and before
+the HTTP request is sent. In that window, a comment mutation can use the previous binding's
+token. The Linear organization ID still identifies the same workspace.
