@@ -17,6 +17,7 @@ const issuePath = `${repoPath}/issues/9`;
 const commentsPath = `${issuePath}/comments`;
 const editPath = `${repoPath}/issues/comments/18`;
 const organizationId = "hub-organization";
+const unmappedOrganizationId = "other-organization";
 const progressToken = "fake-progress-token";
 const installationToken = "fake-installation-token";
 const notificationsToken = "fake-notifications-token";
@@ -42,11 +43,15 @@ async function fixture(path: "app" | "token" = "token") {
     },
   };
   const database = createMemoryDatabase({
-    organizationIds: [organizationId],
+    organizationIds: [organizationId, unmappedOrganizationId],
     now: () => new Date(time.value),
   });
   let slug = "mapped";
-  database.findOrganizationSlugById = async () => slug;
+  database.findOrganizationSlugById = async (requestedOrganizationId) => {
+    if (requestedOrganizationId === organizationId) return slug;
+    if (requestedOrganizationId === unmappedOrganizationId) return "unmapped";
+    return undefined;
+  };
   const connection: GitHubConnectionRecord = {
     id: "connection",
     organizationId,
@@ -149,10 +154,12 @@ async function fixture(path: "app" | "token" = "token") {
       fetch,
     });
   const provider = makeProvider();
-  async function createRun(options: { issue?: number | null; repo?: string } = {}) {
-    const { issue = 9, repo = "acme/widgets" } = options;
+  async function createRun(
+    options: { issue?: number | null; repo?: string; ownerId?: string } = {},
+  ) {
+    const { issue = 9, repo = "acme/widgets", ownerId = organizationId } = options;
     const { run } = await database.createAcceptedTriggerRun({
-      organizationId,
+      organizationId: ownerId,
       projectId: "project",
       configurationRevisionId: "revision",
       providerEventReceiptId: `receipt-${crypto.randomUUID()}`,
@@ -445,11 +452,12 @@ describe("GitHub run progress", () => {
     assert.deepEqual(await f.provider.authorize(f.ref.credential, outside, signal), {
       refused: "repo_not_allowed",
     });
-    f.rename("unmapped");
-    assert.deepEqual(await f.provider.authorize(f.ref.credential, f.run, signal), {
+    const sameNotification = await f.createRun({ ownerId: unmappedOrganizationId });
+    assert.deepEqual(sameNotification.triggerContext, f.run.triggerContext);
+    assert.deepEqual(await f.provider.authorize(f.ref.credential, sameNotification, signal), {
       refused: "org_not_mapped",
     });
-    f.rename("mapped");
+    assert.equal(f.requests.length, 0);
     await f.authorize();
     f.rename("renamed");
     assert.deepEqual(await f.provider.edit(f.ref, "Running", signal), {
