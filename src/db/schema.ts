@@ -1485,6 +1485,9 @@ export const organizationApiKeys = pgTable(
     scopes: text().array().$type<readonly (typeof API_KEY_SCOPES)[number][]>().notNull(),
     actor: text(),
     allowedTriggers: text("allowed_triggers").array(),
+    webhookAuthMode: text("webhook_auth_mode").$type<"hmac">(),
+    webhookSignatureProfile: text("webhook_signature_profile").$type<"github_sha256">(),
+    webhookTargetTriggerId: uuid("webhook_target_trigger_id"),
     createdByUserId: text("created_by_user_id").references(() => users.id, {
       onDelete: "set null",
     }),
@@ -1494,6 +1497,22 @@ export const organizationApiKeys = pgTable(
   },
   (table) => [
     uniqueIndex("organization_api_keys_prefix_unique").on(table.prefix),
+    uniqueIndex("organization_api_keys_org_id_unique").on(table.organizationId, table.id),
+    check(
+      "organization_api_keys_webhook_auth_check",
+      sql`(
+        ${table.webhookAuthMode} is null and ${table.webhookSignatureProfile} is null
+        and ${table.webhookTargetTriggerId} is null
+      ) or (
+        ${table.webhookAuthMode} is not null and ${table.webhookAuthMode} = 'hmac'
+        and ${table.webhookSignatureProfile} is not null
+        and ${table.webhookSignatureProfile} = 'github_sha256'
+        and ${table.webhookTargetTriggerId} is not null and ${table.actor} is not null
+        and ${table.scopes} = ARRAY['events:send']::text[]
+        and ${table.allowedTriggers} is not null and cardinality(${table.allowedTriggers}) = 1
+        and coalesce(${table.allowedTriggers}[1] ~ '^[a-z][a-z0-9_-]*$', false)
+      )`,
+    ),
     index("organization_api_keys_organization_created_idx").on(
       table.organizationId,
       table.createdAt.desc(),
@@ -1505,6 +1524,38 @@ export const organizationApiKeys = pgTable(
     check(
       "organization_api_keys_actor_check",
       sql`${table.actor} is null or ${table.actor} ~ '^[a-z0-9][a-z0-9_.-]{0,62}$'`,
+    ),
+  ],
+);
+
+export const organizationWebhookSecrets = pgTable(
+  "organization_webhook_secrets",
+  {
+    organizationId: text("organization_id").notNull(),
+    apiKeyId: uuid("api_key_id").notNull(),
+    slot: text().$type<"current" | "previous">().notNull(),
+    versionId: uuid("version_id").notNull().unique(),
+    masterKeyId: text("master_key_id").notNull(),
+    salt: text().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    acceptUntil: timestamp("accept_until", { withTimezone: true }),
+  },
+  (table) => [
+    primaryKey({ columns: [table.apiKeyId, table.slot] }),
+    foreignKey({
+      name: "organization_webhook_secrets_parent_fk",
+      columns: [table.organizationId, table.apiKeyId],
+      foreignColumns: [organizationApiKeys.organizationId, organizationApiKeys.id],
+    }).onDelete("cascade"),
+    check(
+      "organization_webhook_secrets_slot_check",
+      sql`(${table.slot} = 'current' and ${table.acceptUntil} is null)
+        or (${table.slot} = 'previous' and ${table.acceptUntil} is not null)`,
+    ),
+    check(
+      "organization_webhook_secrets_material_check",
+      sql`${table.masterKeyId} ~ '^[A-Za-z0-9_-]{1,64}$'
+        and ${table.salt} ~ '^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'`,
     ),
   ],
 );
