@@ -970,15 +970,7 @@ class PgDatabase implements Database {
   }
 
   async wakeWorkflowRun(triggerRunId: string, availableAt: Date) {
-    await query(
-      this.pool,
-      `insert into workflow_wakeups (trigger_run_id, available_at, lease_expires_at)
-       select id, $2, null from trigger_runs where id = $1 and payload_expiry_state is null for share
-       on conflict (trigger_run_id) do update
-       set available_at = least(workflow_wakeups.available_at, excluded.available_at),
-           lease_expires_at = null`,
-      [triggerRunId, availableAt],
-    );
+    await wakeWorkflowRun(this.pool, triggerRunId, availableAt);
   }
 
   async deleteWorkflowWakeup(triggerRunId: string) {
@@ -1339,13 +1331,7 @@ class PgDatabase implements Database {
          where id = $1 and status = 'pending' returning *`,
           [step.id, reason, completedAt],
         );
-        await client.query(
-          `insert into workflow_wakeups (trigger_run_id, available_at, lease_expires_at)
-         values ($1, $2, null)
-         on conflict (trigger_run_id) do update
-         set available_at = least(workflow_wakeups.available_at, excluded.available_at), lease_expires_at = null`,
-          [triggerRunId, completedAt],
-        );
+        await wakeWorkflowRun(client, triggerRunId, completedAt);
         return {
           stepRun: toWorkflowStepRunRecord(updatedRows.rows[0] ?? step),
           run: toTriggerRunRecord(run),
@@ -1511,6 +1497,7 @@ class PgDatabase implements Database {
        from trigger_runs runs
        left join workflow_wakeups wakeups on wakeups.trigger_run_id = runs.id
        where runs.status = 'running'
+         and runs.payload_expiry_state is null
          and runs.deadline_at > $1
          and not exists (
            select 1 from agent_executions executions
@@ -1520,6 +1507,7 @@ class PgDatabase implements Database {
          )
          and wakeups.trigger_run_id is null
          and not (runs.id = any($2::uuid[]))
+       order by runs.id for share of runs
        on conflict (trigger_run_id) do nothing`,
       [now, excludedRunIds],
     );
@@ -2162,13 +2150,12 @@ class PgDatabase implements Database {
     daemonId: string,
     agentId: string,
   ): Promise<AgentExecutionRecord> {
-    const rows = await query<AgentExecutionRow>(
+    await query(
       this.pool,
-      `update agent_executions set daemon_id = $2, daemon_agent_id = $3 where id = $1 returning *`,
+      `update agent_executions set daemon_id = $2, daemon_agent_id = $3 where id = $1`,
       [executionId, daemonId, agentId],
     );
-    if (!rows.rows[0]) throw new Error(`agent execution not found: ${executionId}`);
-    return toAgentExecutionRecord(rows.rows[0]);
+    return this.requireAgentExecution(executionId);
   }
 
   async limitAgentExecutionDeadline(executionId: string, deadlineAt: Date): Promise<void> {
@@ -2272,16 +2259,9 @@ class PgDatabase implements Database {
             [row.workflow_step_run_id, row.idle_deadline_at],
           );
         }
-        const current =
-          row === undefined
-            ? ((
-                await client.query<AgentExecutionRow>(
-                  `select * from agent_executions where id = $1`,
-                  [executionId],
-                )
-              ).rows[0] ?? existing)
-            : row;
-        return toAgentExecutionRecord(current);
+        const current = await findAgentExecutionOnClient(client, executionId);
+        if (current === undefined) throw new Error(`agent execution not found: ${executionId}`);
+        return current;
       });
     } catch (error) {
       throw toDatabaseError(error);
@@ -2304,6 +2284,10 @@ class PgDatabase implements Database {
       [executionId, daemonId, machineId, completionTokenHash],
     );
     if (rows.rows[0] !== undefined) return toAgentExecutionRecord(rows.rows[0]);
+    return this.requireAgentExecution(executionId);
+  }
+
+  private async requireAgentExecution(executionId: string) {
     const execution = await this.findAgentExecutionById(executionId);
     if (execution === undefined) throw new Error(`agent execution not found: ${executionId}`);
     return execution;
@@ -2311,13 +2295,7 @@ class PgDatabase implements Database {
 
   async findAgentExecutionById(id: string): Promise<AgentExecutionRecord | undefined> {
     try {
-      const rows = await query<AgentExecutionRow>(
-        this.pool,
-        `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution ${EXECUTION_FENCE} where id = $1 limit 1`,
-        [id],
-      );
-
-      return rows.rows[0] === undefined ? undefined : toAgentExecutionRecord(rows.rows[0]);
+      return await findAgentExecutionOnClient(this.pool, id);
     } catch (error) {
       throw toDatabaseError(error);
     }
@@ -2565,7 +2543,7 @@ class PgDatabase implements Database {
           return undefined;
         }
         if (attempt.status === "succeeded") {
-          return execution;
+          return findAgentExecutionOnClient(client, executionId);
         }
         if (attempt.status !== "pending") {
           return undefined;
@@ -2589,12 +2567,11 @@ class PgDatabase implements Database {
           ...execution.outputEmissions,
           [attempt.outputType]: (execution.outputEmissions[attempt.outputType] ?? 0) + 1,
         };
-        const updated = await client.query<AgentExecutionRow>(
+        await client.query(
           `update agent_executions
          set output_emissions = $2::jsonb,
              output_delivery_attempts = $3::jsonb
-         where id = $1
-         returning *`,
+         where id = $1`,
           [
             executionId,
             JSON.stringify(outputEmissions),
@@ -2604,7 +2581,7 @@ class PgDatabase implements Database {
             }),
           ],
         );
-        return updated.rows[0] === undefined ? undefined : toAgentExecutionRecord(updated.rows[0]);
+        return findAgentExecutionOnClient(client, executionId);
       });
     } catch (error) {
       throw toDatabaseError(error);
@@ -2828,7 +2805,7 @@ class PgDatabase implements Database {
               ${state}->>'${field}' is null
               or (${state}->>'${field}')::timestamptz < $2::timestamptz
             )
-          returning *`;
+          returning id`;
         parameters = [executionId, acknowledgement.observedAt];
       } else {
         statement = `
@@ -2854,7 +2831,7 @@ class PgDatabase implements Database {
                 )
               )
             )
-          returning *`;
+          returning id`;
         parameters = [
           executionId,
           acknowledgement.observedAt,
@@ -2862,8 +2839,8 @@ class PgDatabase implements Database {
           acknowledgement.status,
         ];
       }
-      const rows = await query<AgentExecutionRow>(this.pool, statement, parameters);
-      return rows.rows[0] === undefined ? undefined : toAgentExecutionRecord(rows.rows[0]);
+      const rows = await query<{ id: string }>(this.pool, statement, parameters);
+      return rows.rows[0] === undefined ? undefined : this.findAgentExecutionById(executionId);
     } catch (error) {
       throw toDatabaseError(error);
     }
@@ -3277,7 +3254,8 @@ class PgDatabase implements Database {
 
   async listAgentSessionExecutions(sessionId: string): Promise<AgentExecutionRecord[]> {
     const result = await this.pool.query<AgentExecutionRow>(
-      "select * from agent_executions where agent_session_id = $1",
+      `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution ${EXECUTION_FENCE}
+       where agent_session_id = $1`,
       [sessionId],
     );
     return result.rows.map(toAgentExecutionRecord);
@@ -5940,7 +5918,7 @@ async function findAgentExecutionOnClient(
   executionId: string,
 ): Promise<AgentExecutionRecord | undefined> {
   const rows = await client.query<AgentExecutionRow>(
-    `select * from agent_executions where id = $1`,
+    `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution ${EXECUTION_FENCE} where id = $1`,
     [executionId],
   );
   return rows.rows[0] === undefined ? undefined : toAgentExecutionRecord(rows.rows[0]);
@@ -5953,7 +5931,7 @@ async function wakeWorkflowRun(
 ): Promise<void> {
   await client.query(
     `insert into workflow_wakeups (trigger_run_id, available_at, lease_expires_at)
-     values ($1, $2, null)
+     select id, $2, null from trigger_runs where id = $1 and payload_expiry_state is null for share
      on conflict (trigger_run_id) do update
      set available_at = least(workflow_wakeups.available_at, excluded.available_at),
          lease_expires_at = null`,

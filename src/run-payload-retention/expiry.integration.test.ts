@@ -9,8 +9,9 @@ import { scanRunPayloads } from "../db/run-payload-retention.js";
 import { embeddedDatabaseRuntime, type QueryHandle, type QueryRow } from "../db/runtime/index.js";
 import { createTimelinePostgresHarness } from "../db/test-utils/run-timeline-postgres.js";
 import { createPostgresTestRuntime } from "../db/test-utils/runtime.js";
-import type { Database } from "../db/types.js";
+import type { AgentExecutionRecord, Database } from "../db/types.js";
 import { activityRunDetailView, activityRunView } from "../projects/activity-run-view.js";
+import { enrollTestDaemon, TEST_DAEMON_ID } from "../test-utils/project-configuration.js";
 import { RunPayloadRetention } from "./index.js";
 
 const NOW = new Date("2026-11-18T00:00:00Z");
@@ -24,6 +25,8 @@ const STEP = "00000000-0000-4000-8000-500000000001";
 const AGENT_STEP = "00000000-0000-4000-8000-500000000002";
 const EXECUTION = "00000000-0000-4000-8000-600000000001";
 const LEGACY_EXECUTION = "00000000-0000-4000-8000-600000000002";
+const SESSION = "00000000-0000-4000-8000-700000000001";
+const COMPLETED_ATTEMPT = "completed-attempt";
 const runId = (index: number) =>
   `00000000-0000-4000-8000-4000000000${String(index).padStart(2, "0")}`;
 const marker = /raw-sentinel-/u;
@@ -143,6 +146,65 @@ async function assertProtectedReads(database: Database) {
   assert.match(JSON.stringify(activityRunView(live, [])), /raw-sentinel-receipt/u);
 }
 
+async function seedCompletedExecutionOutput(runtime: QueryHandle) {
+  await runtime.query(
+    "insert into agent_sessions (id, organization_id, project_id, data) values ($1, $2, $3, '{}')",
+    [SESSION, ORG, PROJECT],
+  );
+  await runtime.query(
+    "update agent_executions set agent_session_id = $2, output_delivery_attempts = $3, deadline_at = $4 where id = $1",
+    [
+      EXECUTION,
+      SESSION,
+      {
+        [COMPLETED_ATTEMPT]: {
+          id: COMPLETED_ATTEMPT,
+          outputType: "reply",
+          status: "succeeded",
+          startedAt: OLD,
+          leaseExpiresAt: NOW.toISOString(),
+          completedAt: OLD,
+        },
+      },
+      NOW,
+    ],
+  );
+}
+
+function assertProjectedExecution(execution: AgentExecutionRecord | undefined) {
+  assert.equal(execution?.id, EXECUTION);
+  assert.equal(execution?.status, "succeeded");
+  assert.deepEqual(execution?.deadlineAt, NOW);
+  assert.equal(execution?.result, null);
+  assert.equal(execution?.triggerContext, null);
+  assert.equal(execution?.outputContext, null);
+}
+
+async function assertProtectedExecutionReaders(database: Database, runtime: QueryHandle) {
+  const raw = await runtime.query(
+    "select result, trigger_context, output_context from agent_executions where id = $1",
+    [EXECUTION],
+  );
+  assert.match(JSON.stringify(raw.rows), /raw-sentinel-result/u);
+  const sessionExecutions = await database.listAgentSessionExecutions(SESSION);
+  assert.equal(sessionExecutions.length, 1);
+  assertProjectedExecution(sessionExecutions[0]);
+  assertProjectedExecution(
+    await database.completeAgentExecutionOutput(EXECUTION, COMPLETED_ATTEMPT, NOW),
+  );
+  assertProjectedExecution(await database.setAgentExecutionIdleDeadline(EXECUTION, NOW, NOW, NOW));
+  assertProjectedExecution(
+    await database.recordAgentExecutionHubAcknowledgement(EXECUTION, {
+      kind: "terminal",
+      observedAt: NOW,
+    }),
+  );
+  await enrollTestDaemon(database, ORG);
+  assertProjectedExecution(
+    await database.attachAgentToExecution(EXECUTION, TEST_DAEMON_ID, "agent"),
+  );
+}
+
 async function drain(retention: RunPayloadRetention) {
   for (let index = 0; index < 12; index++) {
     const result = await retention.runBatch(NOW);
@@ -171,6 +233,7 @@ describe("run payload expiry", () => {
       try {
         await runtime.migrate();
         await seed(runtime);
+        await seedCompletedExecutionOutput(runtime);
         const database = createDatabase(runtime, locks);
         const first = await database.claimPendingWorkflowRunTerminalNotification(new Date(OLD), 1);
         assert.ok(first);
@@ -230,6 +293,7 @@ describe("run payload expiry", () => {
         assert.equal((await firstWorker.runBatch(NOW)).complete, false);
         assert.equal((await database.findTriggerRunById(first.id))?.payloadExpiryState, "expiring");
         await assertProtectedReads(database);
+        await assertProtectedExecutionReaders(database, runtime);
         assert.equal(
           await database.setWorkflowScriptStepOutput(STEP, { text: "raw-sentinel-late-cleanup" }),
           undefined,
@@ -299,7 +363,7 @@ describe("run payload expiry", () => {
         const stored = await runtime.query(
           `select to_jsonb(run) as run,
           (select jsonb_agg(step) from workflow_step_runs step where step.trigger_run_id = run.id) as steps,
-          (select jsonb_agg(execution) from agent_executions execution where id in ($2, $3)) as executions
+          (select jsonb_agg(execution order by execution.id) from agent_executions execution where id in ($2, $3)) as executions
          from trigger_runs run where run.id = $1`,
           [first.id, EXECUTION, LEGACY_EXECUTION],
         );

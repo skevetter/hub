@@ -1,3 +1,4 @@
+import { needsPinnedFanoutProof } from "./run-payload-retention.js";
 import {
   payloadCompletion,
   reduceRejection,
@@ -345,19 +346,32 @@ class MemoryDatabase implements Database {
 
   private hasUnresolvedRunFanout(receiptId: string): boolean {
     const receipt = this.providerEventReceipts.get(receiptId);
-    if (receipt?.acceptedRoutes === null) {
-      return ["github", "linear", "slack", "discord"].includes(receipt.provider);
-    }
+    if (receipt === undefined) return false;
+    const pinned = needsPinnedFanoutProof(receipt.provider);
+    const routes = receipt.acceptedRoutes ?? [];
+    if (routes.length === 0) return pinned;
     const branches = this.triggerRunIdsByProviderEventReceipt.get(receiptId);
-    return (
-      receipt?.acceptedRoutes?.some(
-        (route) =>
-          ![...(branches?.get(route.projectId)?.values() ?? [])].some(
-            (id) =>
-              this.triggerRuns.get(id)?.configurationRevisionId === route.configurationRevisionId,
-          ),
-      ) ?? false
-    );
+    return routes.some((route) => {
+      const runs = [...(branches?.get(route.projectId)?.values() ?? [])]
+        .map((id) => this.triggerRuns.get(id))
+        .filter((run) => run?.configurationRevisionId === route.configurationRevisionId);
+      if (runs.length === 0) return true;
+      if (!pinned) return false;
+      const revision = this.configurationRevisions.get(route.configurationRevisionId);
+      if (
+        revision?.projectId !== route.projectId ||
+        revision.organizationId !== receipt.organizationId
+      )
+        return true;
+      const possible = pinnedProviderWorkflowNames(
+        revision.normalizedConfiguration,
+        receipt.provider,
+      );
+      return (
+        possible.length === 0 ||
+        possible.some((name) => !runs.some((run) => run?.configuredTriggerName === name))
+      );
+    });
   }
 
   private runPayloadExecutions(run: TriggerRunRecord, steps: readonly WorkflowStepRunRecord[]) {
@@ -1942,7 +1956,8 @@ class MemoryDatabase implements Database {
 
   async recoverWorkflowWakeups(now: Date, excludedRunIds: readonly string[] = []) {
     for (const run of this.triggerRuns.values()) {
-      if (run.status !== "running" || run.deadlineAt <= now) continue;
+      if (run.status !== "running" || run.payloadExpiredAt != null || run.deadlineAt <= now)
+        continue;
       if (excludedRunIds.includes(run.id)) continue;
       const wakeup = this.workflowWakeups.get(run.id);
       const steps = await this.listWorkflowStepRunsForTriggerRun(run.id);
@@ -1959,7 +1974,14 @@ class MemoryDatabase implements Database {
           candidate !== undefined &&
           (candidate.status === "spawning" || candidate.status === "running"),
       );
-      if (wakeup === undefined && execution === undefined) {
+      const current = this.triggerRuns.get(run.id);
+      if (
+        current?.status === "running" &&
+        current.payloadExpiredAt == null &&
+        wakeup === undefined &&
+        execution === undefined &&
+        !this.workflowWakeups.has(run.id)
+      ) {
         this.workflowWakeups.set(run.id, {
           triggerRunId: run.id,
           availableAt: now,
@@ -2791,7 +2813,7 @@ class MemoryDatabase implements Database {
     const value = this.readAgentExecution(executionId);
     const updated = { ...value, daemonId: daemonId, daemonAgentId: agentId };
     this.agentExecutions.set(executionId, updated);
-    return updated;
+    return this.projectExecutionPayload(updated);
   }
 
   async limitAgentExecutionDeadline(executionId: string, deadlineAt: Date) {
@@ -2824,13 +2846,14 @@ class MemoryDatabase implements Database {
     processedAt: Date,
   ) {
     const execution = this.readAgentExecution(executionId);
-    if (isTerminalAgentExecutionStatus(execution.status)) return execution;
+    if (isTerminalAgentExecutionStatus(execution.status))
+      return this.projectExecutionPayload(execution);
     if (
       (execution.deadlineAt !== null && execution.deadlineAt.getTime() <= processedAt.getTime()) ||
       (execution.idleDeadlineAt !== null &&
         execution.idleDeadlineAt.getTime() <= observedAt.getTime())
     ) {
-      return execution;
+      return this.projectExecutionPayload(execution);
     }
     if (execution.workflowStepRunId !== null) {
       const step = this.workflowStepRuns.get(execution.workflowStepRunId);
@@ -2842,7 +2865,7 @@ class MemoryDatabase implements Database {
         run.status !== "running" ||
         run.deadlineAt.getTime() <= processedAt.getTime()
       ) {
-        return execution;
+        return this.projectExecutionPayload(execution);
       }
     }
     const boundedIdleDeadlineAt = capIdleDeadline(idleDeadlineAt, execution.deadlineAt);
@@ -2864,7 +2887,8 @@ class MemoryDatabase implements Database {
     completionTokenHash: string,
   ) {
     const execution = this.readAgentExecution(executionId);
-    if (isTerminalAgentExecutionStatus(execution.status)) return execution;
+    if (isTerminalAgentExecutionStatus(execution.status))
+      return this.projectExecutionPayload(execution);
     const updated = {
       ...execution,
       daemonId,
@@ -3030,7 +3054,7 @@ class MemoryDatabase implements Database {
     if (execution === undefined) return undefined;
     const attempt = execution.outputDeliveryAttempts[attemptId];
     if (attempt === undefined) return undefined;
-    if (attempt.status === "succeeded") return execution;
+    if (attempt.status === "succeeded") return this.projectExecutionPayload(execution);
     if (attempt.status !== "pending" || attempt.leaseExpiresAt <= completedAt) {
       if (attempt.status === "pending" && attempt.leaseExpiresAt <= completedAt) {
         this.agentExecutions.set(executionId, {
@@ -3053,7 +3077,7 @@ class MemoryDatabase implements Database {
       },
     };
     this.agentExecutions.set(executionId, updated);
-    return updated;
+    return this.projectExecutionPayload(updated);
   }
 
   async failAgentExecutionOutput(
@@ -3083,7 +3107,7 @@ class MemoryDatabase implements Database {
   ): Promise<TransitionAgentExecutionResult> {
     const execution = this.readAgentExecution(id);
     if (isTerminalAgentExecutionStatus(execution.status)) {
-      return { execution, transitioned: false };
+      return { execution: this.projectExecutionPayload(execution), transitioned: false };
     }
     if (fields.deadlineCondition !== undefined) {
       const current =
@@ -3212,7 +3236,7 @@ class MemoryDatabase implements Database {
     }
     const updated = { ...execution, hubActionAcknowledgements: updatedAcknowledgements };
     this.agentExecutions.set(executionId, updated);
-    return updated;
+    return this.projectExecutionPayload(updated);
   }
 
   async completeHubAction(executionId: string, action: "interrupt" | "archive"): Promise<boolean> {
@@ -3539,9 +3563,9 @@ class MemoryDatabase implements Database {
     });
   }
   async listAgentSessionExecutions(sessionId: string): Promise<AgentExecutionRecord[]> {
-    return [...this.agentExecutions.values()].filter(
-      (execution) => execution.agentSessionId === sessionId,
-    );
+    return [...this.agentExecutions.values()]
+      .filter((execution) => execution.agentSessionId === sessionId)
+      .map((execution) => this.projectExecutionPayload(execution));
   }
 
   async withAdvisoryLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
@@ -4852,4 +4876,27 @@ function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
     (execution.hubAction !== null && execution.hubActionCompletedAt === null) ||
     Object.values(execution.outputDeliveryAttempts).some((attempt) => attempt.status === "pending")
   );
+}
+
+function pinnedProviderWorkflowNames(configuration: unknown, provider: string): string[] {
+  if (configuration === null || typeof configuration !== "object" || !("triggers" in configuration))
+    return [];
+  const workflows: unknown = configuration.triggers;
+  if (!Array.isArray(workflows)) return [];
+  const candidates: string[] = [];
+  for (const workflow of workflows as unknown[]) {
+    if (
+      workflow === null ||
+      typeof workflow !== "object" ||
+      !("on" in workflow) ||
+      typeof workflow.on !== "string" ||
+      !("name" in workflow) ||
+      typeof workflow.name !== "string"
+    )
+      return [];
+    if (workflow.on.startsWith(`${provider}.`) && workflow.on !== "github.notification") {
+      candidates.push(workflow.name);
+    }
+  }
+  return candidates;
 }

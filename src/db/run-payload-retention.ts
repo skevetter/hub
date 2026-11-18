@@ -5,6 +5,49 @@ import {
 } from "../run-payload-retention/store.js";
 import type { QueryHandle } from "./runtime/index.js";
 
+export function needsPinnedFanoutProof(provider: string): boolean {
+  return ["github", "linear", "slack", "discord"].includes(provider);
+}
+
+const ORDINARY_PROVIDER_SQL = "receipt.provider in ('github', 'linear', 'slack', 'discord')";
+
+// Every workflow for the provider is an upper bound on what the pinned revision could match.
+const UNPROVEN_PINNED_FANOUT_SQL = `(
+  ${ORDINARY_PROVIDER_SQL}
+  and not exists (
+    select 1 from project_configuration_revisions revision
+    cross join lateral (
+      select count(*) filter (
+        where workflow ->> 'on' like receipt.provider || '.%'
+          and workflow ->> 'on' <> 'github.notification'
+      ) as possible,
+      count(*) filter (
+        where jsonb_typeof(workflow -> 'name') is distinct from 'string'
+           or jsonb_typeof(workflow -> 'on') is distinct from 'string'
+      ) as malformed,
+      count(*) filter (
+        where workflow ->> 'on' like receipt.provider || '.%'
+          and workflow ->> 'on' <> 'github.notification'
+          and not exists (
+            select 1 from trigger_runs branch
+            where branch.provider_event_receipt_id = receipt.id
+              and branch.project_id = revision.project_id
+              and branch.configuration_revision_id = revision.id
+              and branch.configured_trigger_name = workflow ->> 'name'
+          )
+      ) as missing
+      from jsonb_array_elements(
+        case when jsonb_typeof(revision.normalized_configuration -> 'triggers') = 'array'
+          then revision.normalized_configuration -> 'triggers' else '[]'::jsonb end
+      ) workflow
+    ) proof
+    where revision.id::text = route ->> 'configurationRevisionId'
+      and revision.project_id::text = route ->> 'projectId'
+      and revision.organization_id = receipt.organization_id
+      and proof.possible > 0 and proof.missing = 0 and proof.malformed = 0
+  )
+)`;
+
 export const RUN_PAYLOAD_DISPOSITION_SQL = `case
   when run.status = 'running' then 'live'
   when run.completed_at is null then 'missing_completion'
@@ -33,7 +76,8 @@ export const RUN_PAYLOAD_DISPOSITION_SQL = `case
   when exists (
     select 1 from provider_event_receipts receipt
     where receipt.id = run.provider_event_receipt_id and (
-      (receipt.accepted_routes is null and receipt.provider in ('github', 'linear', 'slack', 'discord'))
+      (${ORDINARY_PROVIDER_SQL}
+        and coalesce(receipt.accepted_routes, '[]'::jsonb) = '[]'::jsonb)
       or jsonb_typeof(receipt.accepted_routes) <> 'array'
       or exists (
         select 1 from jsonb_array_elements(case when jsonb_typeof(receipt.accepted_routes) = 'array'
@@ -43,7 +87,7 @@ export const RUN_PAYLOAD_DISPOSITION_SQL = `case
           where branch.provider_event_receipt_id = receipt.id
             and branch.project_id::text = route ->> 'projectId'
             and branch.configuration_revision_id::text = route ->> 'configurationRevisionId'
-        )
+        ) or ${UNPROVEN_PINNED_FANOUT_SQL}
       )
     )
   )
