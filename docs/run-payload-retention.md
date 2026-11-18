@@ -19,10 +19,17 @@ The worker starts in the background after startup and runs hourly. Count mode re
 number and oldest age of eligible and blocked runs without changing rows or logging content.
 Pending workflow work, execution or script cleanup, unresolved receipt fan-out, terminal
 notifications and reporter work can keep old runs ineligible. Ordinary provider receipts
-need a pinned route snapshot with an admitted branch for every workflow for that provider.
-If Hub cannot prove that from stored rows, the receipt counts as unresolved fan-out. Hub also counts terminal runs
-that lack a completion time. Apply mode records expiry before clearing child rows in batches,
-and resumes interrupted redactions after a restart in `on` mode.
+need a persisted branch for each workflow that admission matches against the stored receipt
+and the configuration revision pinned to each route. Slack and Discord receipts and Linear
+delegate changes that depend on the installed app user count as unresolved fan-out because
+matching requires provider state outside the receipt. Missing evidence also counts as unresolved
+fan-out. Hub counts terminal runs that lack a completion time. Apply mode records expiry
+before clearing child rows in batches and resumes interrupted redactions after a restart in
+`on` mode.
+
+An open timeline stream checks the run's expiry marker before each buffered event and ends
+with `timeline_expired` when it sees the marker. An event already read when the marker
+commits may still be delivered on that open connection.
 
 The run page marks expired content and keeps status, dates, step summaries, and available
 counts and links. Deduplication still recognizes the original delivery and run identity.
@@ -36,6 +43,6 @@ hold the raw event body and are scheduled for expiry in a later build. This buil
 launch intents and sessions.
 
 Set the mode to `off` before a rollback. Keep every binary at this build or newer while
-`on` is enabled or after it has redacted any content. Build 12 and earlier bypass both
+`on` is enabled or after it has redacted any content. Build 13 and earlier bypass both
 expiry fences. Their activity reads can return the retained receipt body, and their script
 output writers can restore content to a redacted step.
