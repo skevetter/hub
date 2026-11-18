@@ -111,7 +111,7 @@ export class LinearApiError extends Error {
     readonly status: number,
     readonly code?: string,
     readonly retryAfterMs?: number,
-    readonly hasPartialData = false,
+    readonly rateLimitBeforeExecution = false,
   ) {
     super(message);
     this.name = "LinearApiError";
@@ -711,31 +711,38 @@ async function readResponseBody(
 
 function checkGraphqlResponse(response: Response, result: unknown, now: () => Date): void {
   const envelope = GraphqlErrorsSchema.safeParse(result);
-  const errors = envelope.success
-    ? envelope.data.errors.flatMap((value) => {
-        const error = GraphqlErrorSchema.safeParse(value);
-        return error.success ? [error.data] : [];
-      })
-    : [];
+  if (response.ok && !envelope.success) return;
+  const rawErrors = envelope.success ? envelope.data.errors : [];
+  const errors = rawErrors.flatMap((value) => {
+    const parsed = GraphqlErrorSchema.safeParse(value);
+    return parsed.success ? [parsed.data] : [];
+  });
   const rateLimited = errors.find(
     ({ extensions }) => extensions?.code?.toUpperCase() === "RATELIMITED",
   );
   const error = rateLimited ?? errors[0];
-  if (!response.ok || envelope.success) {
-    const delay =
-      rateLimited !== undefined || response.status === 429
-        ? linearRetryAfterMs(response.headers, now().getTime())
-        : undefined;
-    throw new LinearApiError(
-      response.ok
-        ? `Linear GraphQL ${error?.message ?? "response contained errors"}`
-        : `Linear GraphQL HTTP ${response.status}`,
-      response.status,
-      error?.extensions?.code,
-      delay,
-      result != null && typeof result === "object" && "data" in result && result.data != null,
-    );
-  }
+  const delay =
+    rateLimited !== undefined || response.status === 429
+      ? linearRetryAfterMs(response.headers, now().getTime())
+      : undefined;
+  const rateLimitBeforeExecution =
+    rateLimited !== undefined &&
+    (response.status === 400 || response.status === 429) &&
+    !hasResponseField(result, "data") &&
+    !rawErrors.some((entry) => hasResponseField(entry, "path"));
+  throw new LinearApiError(
+    response.ok
+      ? `Linear GraphQL ${error?.message ?? "response contained errors"}`
+      : `Linear GraphQL HTTP ${response.status}`,
+    response.status,
+    error?.extensions?.code,
+    delay,
+    rateLimitBeforeExecution,
+  );
+}
+
+function hasResponseField(value: unknown, field: string): boolean {
+  return value !== null && typeof value === "object" && Object.hasOwn(value, field);
 }
 
 function linearRetryAfterMs(headers: Headers, now: number): number | undefined {

@@ -131,12 +131,9 @@ const targetMismatch = { status: "refused", code: "target_mismatch" } as const;
 const uncertainWrite = { status: "retry", afterMs: 0, notCreated: false, transient: true } as const;
 
 function mapCreateError(error: unknown): ProgressCall {
-  if (error instanceof LinearApiError) {
-    if (error.status < 400 || error.hasPartialData) return uncertainWrite;
-    if (error.code?.toUpperCase() === "RATELIMITED" && error.status !== 400 && error.status !== 429)
-      return uncertainWrite;
-  }
-  return mapWriteError(error);
+  if (error instanceof LinearApiError && error.status < 400) return uncertainWrite;
+  const outcome = mapWriteError(error);
+  return outcome.status === "retry" && !outcome.notCreated ? uncertainWrite : outcome;
 }
 
 function mapWriteError(error: unknown): ProgressCall {
@@ -178,6 +175,6 @@ function rateLimited(error: LinearApiError): ProgressCall {
   return {
     status: "retry",
     afterMs: error.retryAfterMs ?? 30_000,
-    notCreated: !error.hasPartialData && (error.status === 429 || error.status === 400),
+    notCreated: error.rateLimitBeforeExecution,
   };
 }

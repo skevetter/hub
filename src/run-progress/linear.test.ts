@@ -246,6 +246,49 @@ describe("Linear run progress", () => {
     },
   );
 
+  const rateLimitError = { message: "Rate limited", extensions: { code: "RATELIMITED" } };
+  const fieldError = { ...rateLimitError, path: ["commentCreate", "comment", "id"] };
+
+  it.each([
+    {
+      name: "HTTP 400 with null data and an execution path",
+      status: 400,
+      body: JSON.stringify({ data: null, errors: [fieldError] }),
+    },
+    {
+      name: "HTTP 429 with null data and an execution path",
+      status: 429,
+      body: JSON.stringify({ data: null, errors: [fieldError] }),
+    },
+    {
+      name: "truncated HTTP 429 JSON",
+      status: 429,
+      body: '{"data":{"commentCreate":{"success":true',
+    },
+    {
+      name: "HTTP 429 with null data alone",
+      status: 429,
+      body: JSON.stringify({ data: null, errors: [rateLimitError] }),
+    },
+    {
+      name: "HTTP 400 with a path alone",
+      status: 400,
+      body: JSON.stringify({ errors: [fieldError] }),
+    },
+    {
+      name: "HTTP 429 with no structured code",
+      status: 429,
+      body: JSON.stringify({ errors: [{ message: "Rate limited" }] }),
+    },
+    { name: "empty HTTP 429", status: 429, body: null },
+  ])("keeps a create uncertain after one POST for $name", async ({ status, body }) => {
+    const fetch = vi.fn(async () => new Response(body, { status }));
+    const { provider, authorize } = fixture(fetch);
+    await authorize(destination);
+    assert.deepEqual(await provider.create(destination, "Started", signal), uncertain);
+    assert.equal(fetch.mock.calls.length, 1);
+  });
+
   it("treats an edit transport failure as transient", async () => {
     const fetch = vi.fn(() => Promise.reject(new TypeError("connection reset")));
     const { provider, authorize } = fixture(fetch);
