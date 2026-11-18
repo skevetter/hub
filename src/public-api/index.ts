@@ -761,7 +761,7 @@ async function deliverWebhook(
   ) {
     return webhookResponse(requestId, { status: "trigger_not_found" });
   }
-  return webhookResponse(requestId, result);
+  return webhookResponse(requestId, result, input.githubSignature !== undefined);
 }
 
 async function readWebhook(
@@ -962,7 +962,11 @@ function isWebhookObject(value: unknown): value is Record<string, unknown> {
   );
 }
 
-function webhookResponse(requestId: string, result: ReceiveWebhookResult): Response {
+function webhookResponse(
+  requestId: string,
+  result: ReceiveWebhookResult,
+  signed = false,
+): Response {
   switch (result.status) {
     case "dispatched":
       return success(requestId, result.duplicate ? 200 : 202, ReceivedWebhookSchema, {
@@ -1017,7 +1021,9 @@ function webhookResponse(requestId: string, result: ReceiveWebhookResult): Respo
         409,
         result.status,
         "Run not dispatched",
-        "Retry the request with the same Idempotency-Key.",
+        signed
+          ? "Retry with the exact same body and a valid GitHub signature."
+          : "Retry the request with the same Idempotency-Key.",
       );
     case "infrastructure_unavailable":
       return infrastructureProblem(requestId);

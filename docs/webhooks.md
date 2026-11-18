@@ -4,7 +4,7 @@ Send a message and data from a service you control to a named Hub trigger. Each 
 only that trigger. To start several triggers, call each URL. This is a server to server API;
 there is no CORS or browser preflight support.
 
-## Create a sender key
+## Create a Bearer sender key
 
 1. Open **Settings**, then **API keys** in the organization that owns the trigger. Create a key
    named `CI partner`.
@@ -236,8 +236,9 @@ online key only after no eligible versions reference it. Keep offline copies for
 Restore with signing disabled. Reconcile revocations and retire or rotate restored signing
 versions before exposure. Restoring an older dump can restore old keys and lose delivery
 history. Before rolling back to a binary without signature enforcement, revoke signed keys
-with the current binary and preserve the additive schema. The existing no-expiry receipt
-and run payload policy also applies to signed deliveries.
+with the current binary and preserve the additive schema. A predecessor that also predates
+`runs:read` or `events:send` needs that feature's scope cleanup before the switch.
+The existing no-expiry receipt and run payload policy also applies to signed deliveries.
 
 ## Request contract
 
@@ -297,8 +298,11 @@ payload retention limit.
 Success uses `application/json`. Failures use RFC 9457 `application/problem+json` with `code`,
 `detail` and `requestId`. Responses also include `X-Request-ID`. Check run progress in Hub.
 
-Idempotency is scoped by organization, project and trigger name, with no expiry. Reuse a key only
-for the same event. Omitting the header generates a random delivery identity and does not dedupe.
+Bearer delivery idempotency is scoped by organization, project and trigger name, with no expiry.
+Reuse an Idempotency-Key for the same event. Omitting that header on the Bearer route generates
+a random delivery identity. GitHub SHA-256 always deduplicates by signed body, even when the
+header is omitted.
+
 A duplicate still passes authentication, permissions, media type, UTF-8, envelope size, message,
 depth and object key limits, and rate limiting. Once a valid duplicate envelope is recognized,
 its new typed input values are ignored and the active run cap is bypassed. It returns the original
@@ -306,7 +310,7 @@ result, even if the new body would fail typed input validation. Rejected request
 do not reserve a key. Races can return `409 dispatch_conflict`; retry with the same key. This is
 not an exactly once execution guarantee, including across restarts.
 
-Retry only `409`, `429`, `503`, or a network failure. Keep the same body and Idempotency-Key.
+Retry only `409`, `429`, `503`, or a network failure. Keep the same body and any Idempotency-Key.
 Use exponential backoff with full jitter: before retry number n, choose a random delay from zero
 to `min(60, 2^(n-1))` seconds. The first retry window is 1 second, and the cap is 60 seconds.
 Make at most 8 total attempts, including the initial request. If `Retry-After` is present, wait
@@ -316,26 +320,26 @@ key is how to discover whether the original event was accepted.
 
 ## Errors and troubleshooting
 
-| HTTP status | Code                         | What to check                                                                                   |
-| ----------- | ---------------------------- | ----------------------------------------------------------------------------------------------- |
-| `400`       | `invalid_json`               | Send valid, nonempty JSON when using application/json.                                          |
-| `400`       | `invalid_request`            | Check Idempotency-Key characters and length, UTF-8 encoding, and nonempty text.                 |
-| `401`       | `unauthorized`               | Supply a valid, unrevoked key in the header. Includes `WWW-Authenticate: Bearer`.               |
-| `403`       | `insufficient_scope`         | Create a key with events:send.                                                                  |
-| `403`       | `key_actor_required`         | Use an API key with a bound actor, not a CLI credential or a legacy unbound key.                |
-| `403`       | `actor_forbidden`            | Add the key's actor to the trigger's from_users audience.                                       |
-| `404`       | `trigger_not_found`          | Check the organization, exact name, enabled state, manual.run event and allowed trigger names.  |
-| `405`       | `method_not_allowed`         | Use POST. The response includes Allow: POST.                                                    |
-| `409`       | `dispatch_conflict`          | Retry the same delivery key after a concurrent dispatch race.                                   |
-| `413`       | `payload_too_large`          | Reduce the raw body or message to the limits below.                                             |
-| `415`       | `unsupported_media_type`     | Use application/json or text/plain with UTF-8 charset.                                          |
-| `422`       | `invalid_input`              | Fix message type, declared input types, required fields or choices. The issues identify fields. |
-| `422`       | `invalid_body`               | Send a JSON object with finite numbers and stay within depth and object key limits.             |
-| `429`       | `rate_limited`               | The sender's per-key bucket is empty. Honor Retry-After, rounded up to whole seconds.           |
-| `429`       | `trigger_busy`               | Too many running runs for this trigger. Retry-After is 30 seconds.                              |
-| `503`       | `infrastructure_unavailable` | Storage is unavailable. Retry with backoff.                                                     |
-| `503`       | `authentication_unavailable` | The credential store is unavailable. Retry with backoff.                                        |
-| `500`       | `internal_error`             | Use requestId to investigate the unexpected server failure; do not automatically retry.         |
+| HTTP status | Code                         | What to check                                                                                                     |
+| ----------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `400`       | `invalid_json`               | Send valid, nonempty JSON when using application/json.                                                            |
+| `400`       | `invalid_request`            | Check Idempotency-Key characters and length, UTF-8 encoding, and nonempty text.                                   |
+| `401`       | `unauthorized`               | Check the API key or the GitHub signature and signing key. Invalid Bearer credentials receive a Bearer challenge. |
+| `403`       | `insufficient_scope`         | Create a key with events:send.                                                                                    |
+| `403`       | `key_actor_required`         | Use an API key with a bound actor, not a CLI credential or a legacy unbound key.                                  |
+| `403`       | `actor_forbidden`            | Add the key's actor to the trigger's from_users audience.                                                         |
+| `404`       | `trigger_not_found`          | Check the organization, exact name, enabled state, manual.run event and allowed trigger names.                    |
+| `405`       | `method_not_allowed`         | Use POST. The response includes Allow: POST.                                                                      |
+| `409`       | `dispatch_conflict`          | Retry the same Bearer delivery key or the same signed body after a concurrent dispatch race.                      |
+| `413`       | `payload_too_large`          | Reduce the raw body or message to the limits below.                                                               |
+| `415`       | `unsupported_media_type`     | Use UTF-8 JSON or plain text for Bearer. Use identity-encoded UTF-8 JSON for GitHub SHA-256.                      |
+| `422`       | `invalid_input`              | Fix message type, declared input types, required fields or choices. The issues identify fields.                   |
+| `422`       | `invalid_body`               | Send a JSON object with finite numbers and stay within depth and object key limits.                               |
+| `429`       | `rate_limited`               | The sender's per-key bucket is empty. Honor Retry-After, rounded up to whole seconds.                             |
+| `429`       | `trigger_busy`               | Too many running runs for this trigger. Retry-After is 30 seconds.                                                |
+| `503`       | `infrastructure_unavailable` | Storage is unavailable. Retry with backoff.                                                                       |
+| `503`       | `authentication_unavailable` | The credential store is unavailable. Retry with backoff.                                                          |
+| `500`       | `internal_error`             | Use requestId to investigate the unexpected server failure; do not automatically retry.                           |
 
 ## Limits and operation
 
@@ -354,8 +358,9 @@ Set environment settings on the Hub process and restart it. Values must be whole
 the stated ranges. Invalid values fail startup rather than falling back to a default. Raw body
 limits apply while streaming too, including chunked requests. Oversized bodies and messages return
 `413`; depth and key violations return `422 invalid_body`. Invalid media types and oversized
-bodies do not consume rate tokens. Authentication runs before the body checks; unauthenticated
-floods are not covered by this per-key limiter. Use a separately approved edge rate limit if needed.
+bodies do not consume rate tokens. Bearer authentication runs before body intake. On the signer
+route Hub checks key eligibility before intake and verifies the signature over the bounded bytes.
+The per-key limiter applies after authentication. Use a separately approved edge rate limit if needed.
 
 Buckets live in each Hub process. With several processes sharing PostgreSQL, the effective rate
 and burst can reach the configured amounts times the process count. Restarting loses bucket state.
@@ -379,8 +384,9 @@ shell code. See [script actions](script-actions.md) for host permissions and inh
 Never send secrets in events. Hub retains the full receipt payload and the run's prompt and typed
 inputs with no expiry. The bounded context copy does not delete the full payload. Anyone able to
 read those runs can see their content. Keep API keys out of request bodies, query strings and
-application logs; do not print Authorization headers. A captured request without an idempotency
-key can be replayed, since v1 has no signature or timestamp protection.
+application logs. Keep Authorization and signature headers out of logs as well. A captured
+Bearer request without an idempotency key can be replayed. A captured GitHub request can be
+accepted while its signing secret is valid if Hub has never accepted that exact body.
 
 Before rolling back to the pre-webhook Hub binary, take a restorable database backup. Revocation
 alone is insufficient: the old API key list parses scopes on revoked rows too, and cannot parse
