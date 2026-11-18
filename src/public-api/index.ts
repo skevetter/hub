@@ -310,13 +310,6 @@ async function executeSafely(
         composition.webhookKeys,
       );
     }
-    if (
-      id === "receiveWebhook" &&
-      (request.headers.has("x-hub-signature-256") ||
-        request.headers.has("x-hub-signature") ||
-        request.headers.has("x-paseo-signature"))
-    )
-      return signedUnauthorized(requestId);
     return await execute(id, request, requestId, composition.authenticator, operations, options);
   } catch (error) {
     reportFailure(

@@ -351,6 +351,35 @@ describe("GitHub signer webhook intake", () => {
     }
   });
 
+  it.each([false, true])(
+    "accepts Bearer deliveries with signature headers when signing enabled is %s",
+    async (enabled) => {
+      const fixture = enabled ? hub : await webhookFixture();
+      try {
+        if (!enabled) await fixture.save();
+        const proof = {
+          "x-hub-signature": "sha1=deadbeef",
+          "x-hub-signature-256": sign("wrong secret", body),
+          "x-paseo-signature": "forwarded metadata",
+        };
+        const accepted = await fixture.send("build-finished", JSON.parse(body) as unknown, {
+          deliveryKey: "bearer-forwarded-signatures",
+          headers: proof,
+        });
+        assert.equal((await result(accepted, 202)).duplicate, false);
+        const unauthorized = await fixture.send(
+          "build-finished",
+          {},
+          { secret: null, headers: proof },
+        );
+        assert.equal(unauthorized.status, 401);
+        assert.equal(unauthorized.headers.get("www-authenticate"), "Bearer");
+      } finally {
+        if (!enabled) await fixture.close();
+      }
+    },
+  );
+
   it("refuses a same-name replacement between authorization and persistence", async () => {
     const temporary = await hub.save("recreated");
     const signer = await hub.createSigner(temporary.id);
