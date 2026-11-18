@@ -8,9 +8,12 @@ import {
 } from "../../providers/linear/client.js";
 import { reportFailure } from "../../failures/index.js";
 import type { ExternalTrigger, TriggerProvider, TriggerProviderMatch } from "../index.js";
-import { matchesInputFilters, parseInvocation } from "../invocation.js";
 import { NormalizedLinearEventSchema, type NormalizedLinearEvent } from "./events.js";
-import { matchLinearTriggers, readLinearCommentInvocationParserMessage } from "./match.js";
+import {
+  hasLinearSourceTrigger,
+  linearInvocationUsesAppUser,
+  matchLinearInvocations,
+} from "./match.js";
 
 export const LinearOutputContextSchema = z.object({
   provider: z.literal("linear"),
@@ -86,13 +89,7 @@ export function createLinearTriggerProvider(options: {
     event: NormalizedLinearEvent,
     trigger: Pick<ExternalTrigger, "connectionId" | "organizationId">,
   ): Promise<string | undefined> => {
-    if (
-      event.type !== "issue" ||
-      event.issue.delegateId == null ||
-      !Object.hasOwn(event.updatedFrom, "delegateId")
-    ) {
-      return undefined;
-    }
+    if (!linearInvocationUsesAppUser(event)) return undefined;
     const connection = await options.connectionForLinearOrganization?.(event.organizationId);
     return connection?.id === trigger.connectionId &&
       connection?.organizationId === trigger.organizationId
@@ -109,83 +106,55 @@ export function createLinearTriggerProvider(options: {
         .configurationStoreForProject(externalTrigger.projectId)
         .getRevision(externalTrigger.configurationRevisionId);
       if (stored === undefined) return "configuration_unavailable";
-      if (!hasSourceTrigger(stored.configuration.triggers, externalTrigger.source)) {
+      if (!hasLinearSourceTrigger(stored.configuration.triggers, externalTrigger.source)) {
         return "no_trigger_for_source";
       }
       const appUserId = await installedAppUserIdFor(event, externalTrigger);
-      const matched = matchLinearTriggers(
+      const matches = matchLinearInvocations(
         stored.configuration,
         event,
         externalTrigger.connectionId,
         appUserId,
       );
-      if (matched.length === 0) return "trigger_filters_rejected";
+      if (matches.length === 0 || event.issue === null) return "trigger_filters_rejected";
 
-      const matches: TriggerProviderMatch<LinearTriggerContext, LinearOutputContext>[] = [];
-      for (const candidate of matched) {
-        const compiledTrigger = stored.configuration.triggers.find(
-          (trigger) => trigger.name === candidate.trigger.name,
-        );
-        if (compiledTrigger === undefined) {
-          throw new Error(`compiled trigger not found: ${candidate.trigger.name}`);
-        }
-        const issue = event.type === "issue" ? event.issue : event.issue;
-        if (issue === null) continue;
-        const outputContext: LinearOutputContext = {
-          provider: "linear",
-          linearOrganizationId: event.organizationId,
-          issueId: issue.id,
-        };
-        const triggerContext: LinearTriggerContext = {
-          provider: "linear",
-          target: outputContext,
-          event: {
-            linear: buildLinearContext(
-              event,
-              externalTrigger.deliveryId,
-              externalTrigger.connectionId,
-            ),
-          },
-        };
-        const prompt = promptForEvent(event);
-        const invocation = parseInvocation(
-          prompt,
-          compiledTrigger.inputs,
-          undefined,
-          event.type === "comment"
-            ? readLinearCommentInvocationParserMessage(event, compiledTrigger.filters)
-            : prompt,
-        );
-        if (invocation.status === "accepted") {
-          if (!matchesInputFilters(invocation.inputs, compiledTrigger.filters?.inputs)) continue;
-          matches.push({
-            conversation: {
-              key: JSON.stringify(["linear", event.organizationId, issue.id]),
-              label: "Linear issue",
-            },
-            triggerName: candidate.trigger.name,
+      const outputContext: LinearOutputContext = {
+        provider: "linear",
+        linearOrganizationId: event.organizationId,
+        issueId: event.issue.id,
+      };
+      const triggerContext: LinearTriggerContext = {
+        provider: "linear",
+        target: outputContext,
+        event: {
+          linear: buildLinearContext(
+            event,
+            externalTrigger.deliveryId,
+            externalTrigger.connectionId,
+          ),
+        },
+      };
+      const conversation = {
+        key: JSON.stringify(["linear", event.organizationId, event.issue.id]),
+        label: "Linear issue",
+      };
+      return matches.map(
+        ({
+          triggerName,
+          invocation,
+        }): TriggerProviderMatch<LinearTriggerContext, LinearOutputContext> => {
+          const match = {
+            conversation,
+            triggerName,
             triggerContext,
             outputContext,
             configurationRevisionId: stored.revision.id,
             hubConfig: stored.configuration,
-            invocation,
-          });
-        } else {
-          matches.push({
-            conversation: {
-              key: JSON.stringify(["linear", event.organizationId, issue.id]),
-              label: "Linear issue",
-            },
-            triggerName: candidate.trigger.name,
-            triggerContext,
-            outputContext,
-            configurationRevisionId: stored.revision.id,
-            hubConfig: stored.configuration,
-            invocation,
-          });
-        }
-      }
-      return matches.length === 0 ? "trigger_filters_rejected" : matches;
+          };
+          if (invocation.status === "accepted") return Object.assign(match, { invocation });
+          return Object.assign(match, { invocation });
+        },
+      );
     },
     async materializeContext(launch): Promise<LinearMaterializedContext> {
       const { trigger_thread_context: locator, ...linear } = launch.triggerContext.event.linear;
@@ -268,21 +237,6 @@ function isBeforeLinearTrigger(comment: LinearIssueComment, beforeCreatedAt: str
 function compareLinearCommentOrder(left: LinearIssueComment, right: LinearIssueComment): number {
   const byCreatedAt = Date.parse(left.createdAt) - Date.parse(right.createdAt);
   return byCreatedAt === 0 ? left.id.localeCompare(right.id) : byCreatedAt;
-}
-
-function hasSourceTrigger(triggers: readonly { on: string }[], source: string): boolean {
-  return triggers.some((trigger) =>
-    source === "linear.issue"
-      ? trigger.on === "linear.issue_entered_scope" || trigger.on === "linear.issue_assigned"
-      : source === "linear.comment" && trigger.on === "linear.comment_created",
-  );
-}
-
-function promptForEvent(event: NormalizedLinearEvent): string {
-  if (event.type === "comment") return event.comment.body;
-  return event.issue.description === null
-    ? event.issue.title
-    : `${event.issue.title}\n\n${event.issue.description}`;
 }
 
 function buildLinearContext(

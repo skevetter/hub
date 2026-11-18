@@ -4,6 +4,8 @@ import type {
 } from "../../config/index.js";
 import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
 import { classifyGitHubEvent } from "./classification.js";
+import type { ExternalTrigger } from "../index.js";
+import { matchesInputFilters, parseInvocation, type InvocationParseResult } from "../invocation.js";
 
 type MatchedTriggerDefinition = Pick<CompiledTrigger, "name" | "on" | "filters">;
 
@@ -58,6 +60,35 @@ export function matchTriggers(
   }
 
   return matches;
+}
+
+export function matchGitHubInvocations(
+  configuration: { triggers: readonly CompiledTrigger[] },
+  event: NormalizedGitHubEvent,
+  route: Pick<ExternalTrigger, "source" | "connectionId">,
+) {
+  const sourceNames = new Set([route.source, classifyGitHubEvent(event).semanticEvent]);
+  if (!configuration.triggers.some((trigger) => sourceNames.has(trigger.on))) {
+    return "no_trigger_for_source" as const;
+  }
+  const matches: { triggerName: string; invocation: InvocationParseResult }[] = [];
+  for (const { trigger } of matchTriggers(configuration, event, route.connectionId)) {
+    const compiled = configuration.triggers.find((candidate) => candidate.name === trigger.name);
+    if (compiled === undefined) throw new Error(`compiled trigger not found: ${trigger.name}`);
+    const invocation = parseInvocation(
+      readGitHubInvocationMessage(event),
+      compiled.inputs,
+      readGitHubMention(event, compiled.filters),
+      readGitHubInvocationParserMessage(event, compiled.filters),
+    );
+    if (
+      invocation.status === "accepted" &&
+      !matchesInputFilters(invocation.inputs, compiled.filters?.inputs)
+    )
+      continue;
+    matches.push({ triggerName: trigger.name, invocation });
+  }
+  return matches.length === 0 ? ("trigger_filters_rejected" as const) : matches;
 }
 
 function matchesFilter(

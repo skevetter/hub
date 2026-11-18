@@ -9,6 +9,8 @@ import type {
   NormalizedLinearIssueEvent,
 } from "./events.js";
 
+import { matchesInputFilters, parseInvocation, type InvocationParseResult } from "../invocation.js";
+
 type MatchedTriggerDefinition = Pick<CompiledTrigger, "name" | "on" | "filters">;
 
 export interface MatchedLinearTrigger {
@@ -73,6 +75,62 @@ export function matchLinearTriggers(
     if (!matchesTriggerFilter(trigger, event, connectionId)) return [];
     return [{ event, trigger }];
   });
+}
+
+export function hasLinearSourceTrigger(
+  triggers: readonly { on: string }[],
+  source: string,
+): boolean {
+  return triggers.some((trigger) =>
+    source === "linear.issue"
+      ? trigger.on === "linear.issue_entered_scope" || trigger.on === "linear.issue_assigned"
+      : source === "linear.comment" && trigger.on === "linear.comment_created",
+  );
+}
+
+function promptForEvent(event: NormalizedLinearEvent): string {
+  if (event.type === "comment") return event.comment.body;
+  return event.issue.description === null
+    ? event.issue.title
+    : `${event.issue.title}\n\n${event.issue.description}`;
+}
+
+export function linearInvocationUsesAppUser(event: NormalizedLinearEvent): boolean {
+  return (
+    event.type === "issue" &&
+    event.issue.delegateId != null &&
+    Object.hasOwn(event.updatedFrom, "delegateId")
+  );
+}
+
+export function matchLinearInvocations(
+  configuration: { triggers: readonly CompiledTrigger[] },
+  event: NormalizedLinearEvent,
+  connectionId?: string | null,
+  appUserId?: string,
+) {
+  const matches: { triggerName: string; invocation: InvocationParseResult }[] = [];
+  for (const { trigger } of matchLinearTriggers(configuration, event, connectionId, appUserId)) {
+    const compiled = configuration.triggers.find((candidate) => candidate.name === trigger.name);
+    if (compiled === undefined) throw new Error(`compiled trigger not found: ${trigger.name}`);
+    if (event.issue === null) continue;
+    const prompt = promptForEvent(event);
+    const invocation = parseInvocation(
+      prompt,
+      compiled.inputs,
+      undefined,
+      event.type === "comment"
+        ? readLinearCommentInvocationParserMessage(event, compiled.filters)
+        : prompt,
+    );
+    if (
+      invocation.status === "accepted" &&
+      !matchesInputFilters(invocation.inputs, compiled.filters?.inputs)
+    )
+      continue;
+    matches.push({ triggerName: trigger.name, invocation });
+  }
+  return matches;
 }
 
 export function matchesIssueScope(

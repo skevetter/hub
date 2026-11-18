@@ -12,13 +12,7 @@ import {
   missingBillingUrl,
 } from "../failure-notice.js";
 import type { GitHubReplyClient } from "./reply.js";
-import {
-  matchTriggers,
-  readGitHubInvocationMessage,
-  readGitHubInvocationParserMessage,
-  readGitHubMention,
-} from "./match.js";
-import { matchesInputFilters, parseInvocation } from "../invocation.js";
+import { matchGitHubInvocations } from "./match.js";
 import {
   IssueCommentPayloadSchema,
   IssuesPayloadSchema,
@@ -177,64 +171,29 @@ export function createGitHubTriggerProvider(options: {
         .configurationStoreForProject(externalTrigger.projectId)
         .getRevision(externalTrigger.configurationRevisionId);
       if (stored === undefined) return "configuration_unavailable";
-      if (
-        !stored.configuration.triggers.some((candidate) =>
-          [externalTrigger.source, classifyGitHubEvent(event).semanticEvent].includes(candidate.on),
-        )
-      )
-        return "no_trigger_for_source";
-      const matches: TriggerProviderMatch<GitHubTriggerContext>[] = [];
-
-      for (const match of matchTriggers(
-        stored.configuration,
-        event,
-        externalTrigger.connectionId,
-      )) {
-        const compiledTrigger = stored.configuration.triggers.find(
-          (candidate) => candidate.name === match.trigger.name,
-        );
-        if (compiledTrigger === undefined)
-          throw new Error(`compiled trigger not found: ${match.trigger.name}`);
-        const triggerContext: GitHubTriggerContext = {
-          provider: "github",
-          organizationId: externalTrigger.organizationId,
-          target: { installationId: event.installationId, repository: event.repo },
-          event: buildGitHubMergeData(event),
-          reactionSubject: reactionSubjectForEvent(event),
-        };
-        const invocation = parseInvocation(
-          readGitHubInvocationMessage(event),
-          compiledTrigger.inputs,
-          readGitHubMention(event, compiledTrigger.filters),
-          readGitHubInvocationParserMessage(event, compiledTrigger.filters),
-        );
-        if (invocation.status === "accepted") {
-          if (!matchesInputFilters(invocation.inputs, compiledTrigger.filters?.inputs)) continue;
-        }
-        if (invocation.status === "rejected") {
-          matches.push({
+      const matches = matchGitHubInvocations(stored.configuration, event, externalTrigger);
+      if (typeof matches === "string") return matches;
+      const triggerContext: GitHubTriggerContext = {
+        provider: "github",
+        organizationId: externalTrigger.organizationId,
+        target: { installationId: event.installationId, repository: event.repo },
+        event: buildGitHubMergeData(event),
+        reactionSubject: reactionSubjectForEvent(event),
+      };
+      return matches.map(
+        ({ triggerName, invocation }): TriggerProviderMatch<GitHubTriggerContext> => {
+          const match = {
             conversation: githubConversation(event),
-            triggerName: match.trigger.name,
+            triggerName,
             triggerContext,
             outputContext: triggerContext,
             configurationRevisionId: stored.revision.id,
             hubConfig: stored.configuration,
-            invocation,
-          });
-          continue;
-        }
-        matches.push({
-          conversation: githubConversation(event),
-          triggerName: match.trigger.name,
-          triggerContext,
-          outputContext: triggerContext,
-          configurationRevisionId: stored.revision.id,
-          hubConfig: stored.configuration,
-          invocation,
-        });
-      }
-
-      return matches.length === 0 ? "trigger_filters_rejected" : matches;
+          };
+          if (invocation.status === "accepted") return Object.assign(match, { invocation });
+          return Object.assign(match, { invocation });
+        },
+      );
     },
     async materializeContext(launch) {
       return launch.triggerContext.event;
