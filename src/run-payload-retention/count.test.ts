@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { it } from "vitest";
 import { createDatabase } from "../db/pg.js";
 import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
+import type { TriggerRunRecord } from "../db/types.js";
+import { summarizeRunPayload } from "./summary.js";
 import { RunPayloadRetention } from "./index.js";
 import { readRunPayloadRetentionSettings } from "./settings.js";
 
@@ -131,4 +133,81 @@ it("counts with a fixed cutoff and leaves all rows byte-for-byte unchanged", asy
     await runtime.close();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+it("constructs provider links from validated IDs and drops event text and untrusted URLs", () => {
+  const run: TriggerRunRecord = {
+    id: "run",
+    organizationId: "org",
+    projectId: "project",
+    configurationRevisionId: "revision",
+    providerEventReceiptId: "receipt",
+    configuredTriggerName: "workflow",
+    createdAt: NOW,
+    outcome: "rejected",
+    status: "rejected",
+    completedAt: NOW,
+    rejection: { code: "missing_required", inputName: "field" },
+    conversation: { key: "raw-sentinel-private", label: "raw-sentinel-title" },
+    prompt: "raw-sentinel-prompt",
+    inputs: {},
+    values: {},
+    triggerContext: {},
+    outputContext: {},
+  };
+  const summarize = (
+    provider: "github" | "slack" | "discord",
+    outputContext: unknown,
+    triggerContext: unknown = {},
+    repo: string | null = null,
+  ) =>
+    summarizeRunPayload(
+      { ...run, outputContext, triggerContext },
+      { provider, repo },
+      {},
+      undefined,
+      undefined,
+    );
+  const github = summarize(
+    "github",
+    {},
+    {
+      event: {
+        github: {
+          item: {
+            type: "pull_request",
+            number: 7,
+            title: "raw-sentinel-title",
+            url: "https://invalid.example/raw-sentinel-url",
+          },
+        },
+      },
+    },
+    "owner/repo",
+  );
+  assert.equal(github.providerLink, "https://github.com/owner/repo/pull/7");
+  assert.doesNotMatch(JSON.stringify(github), /raw-sentinel-/u);
+  assert.equal(
+    summarize("slack", {
+      channelId: "C0123456789",
+      messageTs: "1750000000.123456",
+    }).providerLink,
+    "https://app.slack.com/archives/C0123456789/p1750000000123456",
+  );
+  assert.equal(
+    summarize("slack", {
+      channelId: "C0123456789/raw-sentinel-query",
+      messageTs: "1750000000.123456",
+    }).providerLink,
+    null,
+  );
+  assert.equal(
+    summarize("discord", {
+      guildId: "12345678901234567",
+      channelId: "22345678901234567",
+      messageId: "32345678901234567",
+    }).providerLink,
+    "https://discord.com/channels/12345678901234567/22345678901234567/32345678901234567",
+  );
+  assert.equal(summarize("github", {}, {}, "../raw-sentinel-repo").providerLink, null);
 });

@@ -18,8 +18,10 @@ durable reservation and the provider call consumes one of the default 120 regula
 Keeping the slot charged ensures the cap cannot permit an extra provider call. Final, repair,
 and settle edits remain outside the regular edit cap.
 
-Hub rejects invalid settings at startup. Retention removes local progress rows even when the
-reporter is off. Messages already posted remain at the source.
+Hub rejects invalid settings at startup. Timeline retention removes settled local progress
+rows even when the reporter is off. Final edits, repairs, and credential cooldowns can keep
+a progress row beyond the timeline window. Messages already posted remain at the source.
+See [run payload retention](run-payload-retention.md) for the separate settings for run-owned content.
 
 Hub shares credential cooldowns across processes through the database. Admission checks
 the latest cooldown before reserving an attempt. Each process limits its own provider calls

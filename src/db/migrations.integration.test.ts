@@ -106,7 +106,7 @@ describe("database migration application", () => {
       await upgraded.close();
     }
   }, 120_000);
-  it("adds reporter scheduling state in one migration over populated release-10 progress rows", async () => {
+  it("adds reporter scheduling and expiry markers over populated release-10 rows", async () => {
     const url = await createHistoricalBaseline({
       postgres,
       prefix: "release_10_progress_upgrade",
@@ -169,11 +169,30 @@ describe("database migration application", () => {
       join(DRIZZLE_MIGRATIONS, "0056_webhook_signatures.sql"),
       "utf8",
     );
+    const expiryMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0057_run_payload_expiry.sql"),
+      "utf8",
+    );
     assert.deepEqual((await journal()).rows, [
       ...releasedJournal.rows,
       { hash: createHash("sha256").update(reporterMigration).digest("hex") },
       { hash: createHash("sha256").update(signingMigration).digest("hex") },
+      { hash: createHash("sha256").update(expiryMigration).digest("hex") },
     ]);
+    const runs = await poolQuery(
+      url,
+      "select payload_expired_at, payload_expiry_state, payload_summary from trigger_runs",
+    );
+    assert.equal(runs.rowCount, 2);
+    assert.ok(
+      runs.rows.every(
+        (row) =>
+          row["payload_expired_at"] === null &&
+          row["payload_expiry_state"] === null &&
+          row["payload_summary"] === null,
+      ),
+    );
+
     assert.deepEqual(
       (await messages()).rows,
       before.rows.map(({ message }) => ({

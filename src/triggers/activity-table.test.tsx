@@ -11,6 +11,7 @@ const row = {
   provider: "manual" as const,
   source: "webhook.received",
   repo: null,
+  payloadExpiredAt: null,
   status: "running" as const,
   receivedAt: "2026-11-16T12:00:00.000Z",
 };

@@ -10,6 +10,64 @@ const render = (detail: RunDetailSnapshot) =>
   renderToStaticMarkup(<RunDetailView detail={detail} />);
 
 describe("run timeline UI", () => {
+  it("marks expired run content and keeps safe script and progress summaries", () => {
+    const expiredAt = "2026-11-17T10:00:00.000Z";
+    const script = runDetailFixture.steps[0];
+    assert.ok(script);
+    const markup = render({
+      ...runDetailFixture,
+      run: {
+        ...runDetailFixture.run,
+        status: "failed",
+        completedAt: expiredAt,
+        payloadExpiredAt: expiredAt,
+        payloadSummary: {
+          version: 1,
+          workflowKey: "review",
+          repository: "example/service",
+          providerLink: "https://github.com/example/service/pull/7",
+          failureCode: "run_failed",
+          stepCounts: { failed: 1 },
+          timelineCounts: { events: 2, dropped: 0 },
+          progress: { status: "unknown", link: null },
+        },
+      },
+      steps: [
+        {
+          ...script,
+          isAgent: false,
+          status: "failed",
+          completedAt: expiredAt,
+          outputExpired: true,
+          output: { output_tail: "raw-sentinel-render-output" },
+          payloadSummary: {
+            version: 1,
+            stepKey: "review",
+            status: "failed",
+            durationMs: 1000,
+            hadOutput: true,
+            exitCode: 7,
+            truncated: true,
+            provider: null,
+            model: null,
+            failureCode: "step_failed",
+          },
+        },
+      ],
+      timeline: { ...emptyTimeline, status: "failed", expired: true },
+      progressUnavailable: true,
+    });
+    assert.match(markup, /Run payload expired/u);
+    assert.match(markup, /original event, inputs, prompts, and outputs expired/u);
+    assert.match(markup, /Output expired/u);
+    assert.match(markup, /Exit code 7/u);
+    assert.match(markup, /Output was truncated/u);
+    assert.match(markup, /2 timeline events/u);
+    assert.match(markup, /href="https:\/\/github\.com\/example\/service\/pull\/7"/u);
+    assert.match(markup, /Unavailable/u);
+    assert.doesNotMatch(markup, /raw-sentinel-render-output/u);
+  });
+
   it("shows summary counts from merged tool calls and distinct steps", () => {
     const markup = render({
       ...runDetailFixture,

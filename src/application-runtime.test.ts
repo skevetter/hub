@@ -11,6 +11,20 @@ import { replyOutputTool } from "./execution-capabilities/outputs.js";
 import { logger } from "./logger.js";
 import { runShutdownStage } from "./shutdown-stage.js";
 
+it("rejects on mode with a payload window shorter than timeline retention", async () => {
+  await assert.rejects(
+    createApplicationRuntime({
+      database: null,
+      auth: null,
+      entitlements: null,
+      billing: null,
+      runPayloadRetention: { mode: "on", retentionDays: 7, maxRunsPerPass: 50 },
+      close: async () => undefined,
+    }),
+    /PASEO_HUB_RUN_PAYLOAD_RETENTION_DAYS=7.*PASEO_HUB_TIMELINE_RETENTION_DAYS=30/u,
+  );
+});
+
 describe("shutdown stage logging", () => {
   it("identifies the provider source while its drain is pending", async () => {
     const log = vi.spyOn(logger, "info").mockImplementation(() => undefined);

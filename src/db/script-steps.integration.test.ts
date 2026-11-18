@@ -199,13 +199,19 @@ describe.each(backends)("script step persistence (%s)", (_name, open) => {
         "failureReason",
         "id",
         "outcome",
+        "payloadExpiredAt",
+        "payloadSummary",
         "provider",
         "receivedAt",
         "repo",
         "source",
         "status",
       ]);
+      assert.equal(detail.run.payloadExpiredAt, null);
+      assert.equal(detail.run.payloadSummary, null);
       for (const step of detail.steps) {
+        assert.equal(step.outputExpired, false);
+        assert.equal(step.payloadSummary, null);
         assert.deepEqual(Object.keys(step).sort(), [
           "completedAt",
           "completion",
@@ -214,6 +220,8 @@ describe.each(backends)("script step persistence (%s)", (_name, open) => {
           "isAgent",
           "ordinal",
           "output",
+          "outputExpired",
+          "payloadSummary",
           "startedAt",
           "status",
           "stepId",

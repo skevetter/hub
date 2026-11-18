@@ -117,7 +117,8 @@ export function HomePanel() {
                   primary={run.triggerName}
                   secondary={
                     <>
-                      {run.payloadExpiredAt == null ? run.source : "Run payload expired"} ·{" "}
+                      {run.payloadExpiredAt == null ? run.source : "Run payload expired"}
+                      {" \u00b7 "}
                       <RelativeTime value={run.receivedAt} />
                     </>
                   }
