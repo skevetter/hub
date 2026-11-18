@@ -83,7 +83,7 @@ async function fixture(path: "app" | "token" = "token") {
     locked: false,
     metadata: true,
     oauthScopes: "",
-    comments: [] as { id: number; body: string; user: { id: number } }[],
+    comments: [] as { id: number; body: string; user: { id: number }; issue_url: string }[],
     nextWrite: undefined as Response | undefined,
     writeError: undefined as Error | undefined,
     onRefresh: () => {},
@@ -128,7 +128,12 @@ async function fixture(path: "app" | "token" = "token") {
     assert.equal(url.pathname, request.method === "POST" ? commentsPath : editPath);
     const body = z.object({ body: z.string() }).parse(await request.clone().json()).body;
     if (request.method === "POST") {
-      const comment = { id: 18 + state.comments.length, body, user: { id: 23 } };
+      const comment = {
+        id: 18 + state.comments.length,
+        body,
+        user: { id: 23 },
+        issue_url: `https://api.github.com${issuePath}`,
+      };
       state.comments.push(comment);
       return Response.json(comment, { status: 201 });
     }
@@ -357,6 +362,75 @@ describe("GitHub run progress", () => {
     },
   );
 
+  it.each(["app", "token"] as const)(
+    "abandons a %s create with a contradictory 201 without registering the id",
+    async (path) => {
+      const f = await fixture(path);
+      await f.seed();
+      f.state.nextWrite = Response.json(
+        {
+          id: 18,
+          issue_url: `https://api.github.com${issuePath}`,
+          status: 429,
+          message: "rejected",
+        },
+        { status: 201 },
+      );
+      await f.writer().write(f.scope, f.provider);
+      assert.equal((await f.read())?.state, "abandoned");
+      assert.equal((await f.read())?.failure, "create_unknown");
+      assert.equal((await f.read())?.externalRef, null);
+      assert.equal(f.mutations().length, 1);
+    },
+  );
+
+  it.each(["app", "token"] as const)(
+    "keeps an invalid %s PATCH uncertain for regular and final edits",
+    async (path) => {
+      const f = await fixture(path);
+      await f.seed();
+      await f.writer().write(f.scope, f.provider);
+      f.advance(20_000);
+      await f.event("tool_finished");
+      f.state.nextWrite = Response.json({ id: 99 }, { status: 200 });
+      await f.writer().write(f.scope, f.makeProvider());
+      assert.equal((await f.read())?.state, "active");
+      assert.equal((await f.read())?.failedEdits, 1);
+      f.advance(60_000);
+      await f.database.succeedTriggerRun(f.run.id);
+      f.state.nextWrite = new Response("<html>gateway error</html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+      await f.writer().write(f.scope, f.makeProvider());
+      assert.equal((await f.read())?.state, "active");
+      assert.equal((await f.read())?.finalFailures, 1);
+      assert.match(f.state.comments[0]!.body, /Running/u);
+    },
+  );
+
+  it("stops a gone edit and records an unavailable create on HTTP 410", async () => {
+    const create = await fixture();
+    await create.seed();
+    create.state.nextWrite = Response.json({ message: "gone" }, { status: 410 });
+    await create.writer().write(create.scope, create.provider);
+    assert.equal((await create.read())?.state, "unavailable");
+    assert.equal((await create.read())?.failure, "target_not_found");
+
+    const edit = await fixture();
+    await edit.seed();
+    await edit.writer().write(edit.scope, edit.provider);
+    edit.advance(20_000);
+    await edit.database.succeedTriggerRun(edit.run.id);
+    edit.state.nextWrite = Response.json({ message: "gone" }, { status: 410 });
+    const writer = edit.writer();
+    await writer.write(edit.scope, edit.makeProvider());
+    assert.equal((await edit.read())?.state, "gone");
+    edit.advance(60_000);
+    await writer.write(edit.scope, edit.makeProvider());
+    assert.equal(edit.mutations().length, 2);
+  });
+
   it("allows the writer to retry a create only after a confirmed rate-limit rejection", async () => {
     const f = await fixture();
     await f.seed();
@@ -395,6 +469,16 @@ describe("GitHub run progress", () => {
 
   it.each([
     [201, {}],
+    [201, { id: 18 }],
+    [201, { id: 18, issue_url: "https://api.github.com/repos/acme/widgets/issues/10" }],
+    [
+      201,
+      {
+        id: 18,
+        issue_url: "https://api.github.com/repos/acme/widgets/issues/9",
+        message: "rejected",
+      },
+    ],
     [429, { id: 18, message: "too fast" }],
     [429, { status: "201", message: "unexpected status" }],
     [403, { data: { id: 18 }, message: "too fast" }],

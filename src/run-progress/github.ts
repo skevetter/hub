@@ -37,14 +37,21 @@ const notificationContext = z.object({
 });
 const repositoryMetadata = z.object({ id: githubId, private: z.boolean() });
 const commentId = z.object({ id: githubId });
-const createdComment = commentId.extend({
+const responseIdentity = commentId.extend({
+  status: z.union([z.number(), z.string()]).optional(),
+  message: z.never().optional(),
+  error: z.never().optional(),
   errors: z.never().optional(),
   data: z.never().optional(),
+  documentation_url: z.never().optional(),
+});
+const commentIdentity = responseIdentity.extend({
+  issue_url: z.string().optional(),
+  html_url: z.string().optional(),
 });
 const lockedIssue = z.object({ locked: z.literal(true) });
 const commentList = z.array(
-  z.object({
-    id: githubId,
+  commentIdentity.extend({
     body: z.string().nullable(),
     user: z.object({ id: githubId }).nullable(),
   }),
@@ -233,10 +240,11 @@ export class GitHubProgressProvider implements ProgressProvider {
     const auth = this.takeAuthorization(target.credential);
     if (auth === undefined) return undefined;
     const actorResponse = await auth.request(signal, "GET", auth.actorPath);
-    const actor = commentId.safeParse(actorResponse.data);
+    const actor = responseIdentity.safeParse(actorResponse.data);
     if (
-      actorResponse.status !== 200 ||
+      !jsonSuccess(actorResponse) ||
       !actor.success ||
+      !matchingStatus(actor.data.status, actorResponse.status) ||
       !sameBinding(await this.readBinding(run, target), auth.binding)
     )
       return undefined;
@@ -248,9 +256,17 @@ export class GitHubProgressProvider implements ProgressProvider {
       "GET",
       `${issueCommentsPath(owner, repo, target.issueNumber)}?${query}`,
     );
-    if (response.status !== 200) return undefined;
+    if (!jsonSuccess(response)) return undefined;
     const comments = commentList.safeParse(response.data);
-    if (!comments.success || comments.data.length > 100) return undefined;
+    if (
+      !comments.success ||
+      comments.data.length > 100 ||
+      comments.data.some(
+        (comment) =>
+          !matchingStatus(comment.status, response.status) || !matchesIssue(comment, target),
+      )
+    )
+      return undefined;
     const matches = comments.data.filter(
       ({ body, user }) => user?.id === actor.data.id && body?.endsWith(`\n\n${auth.marker}`),
     );
@@ -454,7 +470,7 @@ export class GitHubProgressProvider implements ProgressProvider {
 
 ${auth.marker}`,
       );
-      return await mutationResult(auth, method === "POST", response, signal);
+      return await mutationResult(auth, commentNumber, response, signal);
     } catch {
       return unknownWrite;
     }
@@ -498,17 +514,26 @@ function matchesTarget(auth: Authorization, ref: StoredRef, edit: boolean): bool
 
 async function mutationResult(
   auth: Authorization,
-  create: boolean,
+  commentNumber: number | undefined,
   response: GitHubResponse,
   signal: AbortSignal,
 ): Promise<ProgressCall> {
-  if (create && response.status === 201) {
-    const created = createdComment.safeParse(response.data);
-    return created.success
-      ? { status: "ok", ref: storedReference(auth, created.data.id) }
-      : unknownWrite;
+  const create = commentNumber === undefined;
+  if (response.status >= 200 && response.status < 300) {
+    const comment = commentIdentity.safeParse(response.data);
+    if (
+      !jsonSuccess(response) ||
+      !comment.success ||
+      !matchingStatus(comment.data.status, response.status)
+    )
+      return unknownWrite;
+    if (create) {
+      return response.status === 201 && matchesIssue(comment.data, auth.target)
+        ? { status: "ok", ref: storedReference(auth, comment.data.id) }
+        : unknownWrite;
+    }
+    return comment.data.id === commentNumber ? { status: "ok" } : unknownWrite;
   }
-  if (!create && response.status === 200) return { status: "ok" };
   const failure = writeFailure(response, create);
   if (failure.status !== "unavailable" || failure.code !== "scope_missing") return failure;
   const [owner, repo] = splitRepository(auth.target);
@@ -518,6 +543,51 @@ async function mutationResult(
   return issue?.status === 200 && lockedIssue.safeParse(issue.data).success
     ? { status: "unavailable", code: "locked" }
     : failure;
+}
+
+function jsonSuccess(response: GitHubResponse): boolean {
+  const type = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+  return (
+    response.status >= 200 &&
+    response.status < 300 &&
+    (type === "application/json" ||
+      (type?.startsWith("application/") === true && type.endsWith("+json")))
+  );
+}
+
+function matchingStatus(bodyStatus: number | string | undefined, status: number): boolean {
+  return bodyStatus === undefined || bodyStatus === status || bodyStatus === String(status);
+}
+
+function matchesIssue(comment: z.infer<typeof commentIdentity>, target: Destination): boolean {
+  const { issue_url, html_url } = comment;
+  if (issue_url === undefined && html_url === undefined) return false;
+  const repository = target.repository.toLowerCase();
+  const issue = target.issueNumber;
+  return (
+    (issue_url === undefined ||
+      matchingUrl(issue_url, GITHUB_API_ORIGIN, [`/repos/${repository}/issues/${issue}`], "")) &&
+    (html_url === undefined ||
+      matchingUrl(
+        html_url,
+        "https://github.com",
+        [`/${repository}/issues/${issue}`, `/${repository}/pull/${issue}`],
+        `#issuecomment-${comment.id}`,
+      ))
+  );
+}
+
+function matchingUrl(value: string, origin: string, paths: readonly string[], fragment: string) {
+  const url = URL.parse(value);
+  return (
+    url !== null &&
+    url.origin === origin &&
+    url.username === "" &&
+    url.password === "" &&
+    url.search === "" &&
+    (url.hash === "" || url.hash === fragment) &&
+    paths.includes(url.pathname.toLowerCase())
+  );
 }
 
 function sameBinding(current: Binding | Refusal, expected: Binding): boolean {
@@ -587,7 +657,7 @@ function writeFailure({ status, headers, data }: GitHubResponse, create: boolean
   const evidence = rejection.safeParse(data);
   if (create && evidence.data?.partial === true) return unknownWrite;
   if (status === 401) return credentialRejected;
-  if (status === 404)
+  if (status === 404 || status === 410)
     return create ? { status: "unavailable", code: "target_not_found" } : { status: "gone" };
   if (status === 422) return { status: "unavailable", code: "rejected" };
   if (status === 403 && headers.has("x-github-sso"))

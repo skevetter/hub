@@ -43,7 +43,8 @@ export function githubProgressFetch(request: typeof fetch): typeof fetch {
           headers,
         });
       }
-      if (body !== null) headers.set("content-type", "application/json");
+      const contentType = response.headers.get("content-type");
+      if (contentType !== null) headers.set("content-type", contentType.split(";")[0]!);
       return new Response(body, { status: response.status, headers });
     } catch {
       throw new Error("GitHub progress request failed");
