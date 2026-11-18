@@ -45,17 +45,22 @@ function fixture(fetch: typeof globalThis.fetch) {
   const persist = vi.fn(async (tokens: LinearConnectionTokenUpdate) => {
     Object.assign(connection, tokens);
   });
+  const database = createMemoryDatabase();
   const lock = {
+    requested: vi.fn(),
     acquire: () => Promise.resolve(),
     release: () => {},
   };
   const client = createLinearApiClient({
     connectionForLinearOrganization: lookup,
-    withLinearConnectionRefresh: async (_id, operation) => {
-      await lock.acquire();
-      const result = await operation(await lookup(), persist);
-      lock.release();
-      return result;
+    withLinearConnectionRefresh: (id, operation) => {
+      lock.requested();
+      return database.withAdvisoryLock(id, async () => {
+        await lock.acquire();
+        const result = await operation(await lookup(), persist);
+        lock.release();
+        return result;
+      });
     },
     connectionClient: { refresh },
     fetch,
@@ -673,5 +678,45 @@ describe("Linear run progress", () => {
     await assert.rejects(provider.edit(ref, "Finished", controller.signal), { name: "AbortError" });
     assert.equal(persist.mock.calls.length, 0);
     assert.equal(fetch.mock.calls.length, 0);
+  });
+  it("lets an uncanceled follower refresh after a canceled leader", async () => {
+    const fetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      assert.equal(new Headers(init?.headers).get("authorization"), "Bearer refreshed-token");
+      return Response.json({ data: { commentUpdate: { success: true } } });
+    });
+    const { provider, connection, authorize, refresh, persist, lock } = fixture(fetch);
+    connection.accessTokenExpiresAt = new Date(0);
+    const refreshStarted = Promise.withResolvers<void>();
+    const releaseRefresh = Promise.withResolvers<{ accessToken: string }>();
+    refresh.mockImplementationOnce(() => {
+      refreshStarted.resolve();
+      return releaseRefresh.promise;
+    });
+
+    const controller = new AbortController();
+    await authorize(ref);
+    const leader = assert.rejects(provider.edit(ref, "First edit", controller.signal), {
+      name: "AbortError",
+    });
+    await refreshStarted.promise;
+    const followerRef = { ...ref, credential: { ...credential } };
+    await authorize(followerRef);
+    const follower = provider.edit(followerRef, "Second edit", signal).then(
+      (result) => result,
+      (error: unknown) => ({ error }),
+    );
+
+    try {
+      await vi.waitFor(() => assert.equal(lock.requested.mock.calls.length, 2));
+      assert.equal(refresh.mock.calls.length, 1);
+    } finally {
+      controller.abort();
+      releaseRefresh.resolve({ accessToken: "canceled-token" });
+      await leader;
+    }
+    assert.deepEqual(await follower, { status: "ok" });
+    assert.equal(refresh.mock.calls.length, 2);
+    assert.deepEqual(persist.mock.calls, [[{ accessToken: "refreshed-token" }]]);
+    assert.equal(fetch.mock.calls.length, 1);
   });
 });

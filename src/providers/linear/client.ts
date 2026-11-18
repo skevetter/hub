@@ -382,40 +382,38 @@ export function createLinearApiClient(options: {
     checkWriteConnection(connection, write);
     if (hasUsableAccessToken(connection)) return connection;
     if (connection.refreshToken === null) throw new LinearCredentialError("reauthorize");
-    return refreshConnection(linearOrganizationId, connection, write);
+    return refreshConnection(linearOrganizationId, connection.id, write);
   };
+
+  const refreshUnderLock = (linearOrganizationId: string, write?: LinearCommentWriteOptions) =>
+    options.withLinearConnectionRefresh(linearOrganizationId, async (current, updateTokens) => {
+      write?.signal.throwIfAborted();
+      if (current === undefined) throw new LinearCredentialError("connection_unavailable");
+      checkWriteConnection(current, write);
+      if (hasUsableAccessToken(current)) return current;
+      if (current.refreshToken === null) throw new LinearCredentialError("reauthorize");
+      const refreshed = await options.connectionClient.refresh(current.refreshToken, write?.signal);
+      write?.signal.throwIfAborted();
+      await updateTokens(refreshed);
+      write?.signal.throwIfAborted();
+      return { ...current, ...refreshed };
+    });
 
   const refreshConnection = async (
     linearOrganizationId: string,
-    connection: LinearConnectionRecord,
+    connectionId: string,
     write?: LinearCommentWriteOptions,
   ): Promise<LinearConnectionRecord> => {
-    const key = JSON.stringify([connection.id, write?.binding.organizationId]);
-    const existing = refreshes.get(key);
+    // A scoped write's cancellation must not abort another writer's refresh.
+    if (write !== undefined) return refreshUnderLock(linearOrganizationId, write);
+    const existing = refreshes.get(connectionId);
     if (existing !== undefined) return existing;
-    const pending = options.withLinearConnectionRefresh(
-      linearOrganizationId,
-      async (current, updateTokens) => {
-        write?.signal.throwIfAborted();
-        if (current === undefined) throw new LinearCredentialError("connection_unavailable");
-        checkWriteConnection(current, write);
-        if (hasUsableAccessToken(current)) return current;
-        if (current.refreshToken === null) throw new LinearCredentialError("reauthorize");
-        const refreshed = await options.connectionClient.refresh(
-          current.refreshToken,
-          write?.signal,
-        );
-        write?.signal.throwIfAborted();
-        await updateTokens(refreshed);
-        write?.signal.throwIfAborted();
-        return { ...current, ...refreshed };
-      },
-    );
-    refreshes.set(key, pending);
+    const pending = refreshUnderLock(linearOrganizationId);
+    refreshes.set(connectionId, pending);
     try {
       return await pending;
     } finally {
-      if (refreshes.get(key) === pending) refreshes.delete(key);
+      if (refreshes.get(connectionId) === pending) refreshes.delete(connectionId);
     }
   };
 
