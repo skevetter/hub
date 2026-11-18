@@ -13,10 +13,9 @@ import {
 import { PASSWORD_MIN_LENGTH } from "./instance-policy.js";
 import {
   API_KEY_SCOPES,
-  apiKeyActorSchema,
-  apiKeyAllowedTriggersSchema,
+  apiKeyCreateResultSchema,
+  apiKeySummarySchema,
   apiKeyCreateSchema,
-  apiKeyScopeSchema,
   rotateSigningSecretSchema,
   retireSigningSecretSchema,
   webhookSigningSummarySchema,
@@ -53,18 +52,6 @@ const passwordChangeSchema = z.object({
   newPassword: z.string().min(PASSWORD_MIN_LENGTH),
 });
 const apiKeyIdSchema = z.object({ id: z.string().uuid() });
-const apiKeySummarySchema = z.object({
-  id: z.string().uuid(),
-  name: z.string(),
-  prefix: z.string(),
-  scopes: z.array(apiKeyScopeSchema),
-  actor: apiKeyActorSchema.nullable(),
-  allowedTriggers: apiKeyAllowedTriggersSchema.nullable(),
-  authentication: webhookSigningSummarySchema.optional(),
-  createdAt: z.string(),
-  lastUsedAt: z.string().nullable(),
-  revokedAt: z.string().nullable(),
-});
 const cliCredentialSummarySchema = z.object({
   id: z.string().uuid(),
   prefix: z.string(),
@@ -72,23 +59,6 @@ const cliCredentialSummarySchema = z.object({
   lastUsedAt: z.string().nullable(),
   revokedAt: z.string().nullable(),
 });
-const apiKeyCreateResultSchema = z.union([
-  z
-    .object({
-      key: apiKeySummarySchema.extend({
-        authentication: webhookSigningSummarySchema,
-        allowedTriggers: z.tuple([z.string()]),
-      }),
-      signingSecret: z.string().min(1),
-    })
-    .strict(),
-  z
-    .object({
-      key: apiKeySummarySchema.extend({ authentication: z.undefined() }),
-      secret: z.string().min(1),
-    })
-    .strict(),
-]);
 const rotatedSigningSecretSchema = z.object({
   authentication: webhookSigningSummarySchema,
   signingSecret: z.string().min(1),

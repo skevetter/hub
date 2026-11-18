@@ -88,6 +88,37 @@ export const webhookSigningSummarySchema = webhookSigningAuthenticationSchema.ex
   previousAcceptUntil: z.iso.datetime().nullable(),
 });
 
+export const apiKeySummarySchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  prefix: z.string(),
+  scopes: z.array(apiKeyScopeSchema),
+  actor: apiKeyActorSchema.nullable(),
+  allowedTriggers: apiKeyAllowedTriggersSchema.nullable(),
+  authentication: webhookSigningSummarySchema.optional(),
+  createdAt: z.string(),
+  lastUsedAt: z.string().nullable(),
+  revokedAt: z.string().nullable(),
+});
+
+export const apiKeyCreateResultSchema = z.union([
+  z
+    .object({
+      key: apiKeySummarySchema.extend({
+        authentication: webhookSigningSummarySchema,
+        allowedTriggers: z.tuple([z.string()]),
+      }),
+      signingSecret: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      key: apiKeySummarySchema.extend({ authentication: z.undefined().optional() }),
+      secret: z.string().min(1),
+    })
+    .strict(),
+]);
+
 export const rotateSigningSecretSchema = z
   .object({
     id: z.uuid(),

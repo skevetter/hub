@@ -11,18 +11,29 @@ import {
   apiKeyActorSchema,
   apiKeyAllowedTriggersSchema,
   apiKeyCreateSchema,
+  apiKeyCreateResultSchema,
   defaultApiKeyActor,
   type ApiKeyIdentityOptions,
   webhookSigningSummarySchema,
 } from "./api-key-contract.js";
 import { createDatabase } from "../db/pg.js";
+import type { Locks } from "../db/runtime/locks/index.js";
 import { OrganizationTriggerStore } from "../triggers/store.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
-import { readWebhookSigningSettings } from "./webhook-signatures.js";
+import { readWebhookSigningSettings, type WebhookSigningSettings } from "./webhook-signatures.js";
 import { createAuthServer, type AuthServer } from "./server.js";
 
 const ORIGIN = "http://localhost:3000";
+const signingSettings = readWebhookSigningSettings({
+  PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
+  PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",
+  PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS: '["identity-a"]',
+  PASEO_HUB_WEBHOOK_HMAC_KEYRING: JSON.stringify({
+    "test-key": Buffer.alloc(32, 0x14).toString("base64"),
+  }),
+  PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID: "test-key",
+});
 const keySummarySchema = z.object({
   id: z.string().uuid(),
   name: z.string(),
@@ -31,6 +42,13 @@ const keySummarySchema = z.object({
   scopes: z.array(z.string()),
 });
 const keyResponseSchema = z.object({ key: keySummarySchema, secret: z.string() });
+
+const signedKeyResponseSchema = z
+  .object({
+    key: keySummarySchema.extend({ authentication: webhookSigningSummarySchema }),
+    signingSecret: z.string(),
+  })
+  .strict();
 
 const invalidIdentities: ApiKeyIdentityOptions[] = [
   { actor: "Uppercase" },
@@ -122,6 +140,7 @@ describe("API key identity contracts", () => {
 describe("embedded API key identities", () => {
   let directory: string;
   let runtime: DatabaseRuntime;
+  let locks: Locks;
   let auth: AuthServer;
   let cookie: string;
   let targetTriggerId: string;
@@ -130,6 +149,7 @@ describe("embedded API key identities", () => {
     directory = await mkdtemp(join(tmpdir(), "hub-webhook-keys-"));
     const bundle = await embeddedDatabaseRuntime(join(directory, "database"));
     runtime = bundle.runtime;
+    locks = bundle.locks;
     await runtime.migrate();
     await runtime.query(`
       insert into organization (id, name, slug) values
@@ -146,7 +166,7 @@ describe("embedded API key identities", () => {
         ('identity-member-a', 'identity-a', 'identity-owner-a', 'owner'),
         ('identity-member-b', 'identity-b', 'identity-owner-b', 'owner');
     `);
-    const database = createDatabase(runtime, bundle.locks);
+    const database = createDatabase(runtime, locks);
     await enrollTestDaemon(database, "identity-a");
     const target = await new OrganizationTriggerStore(
       database,
@@ -165,23 +185,7 @@ run:
 `,
     });
     targetTriggerId = target.id;
-    auth = createAuthServer({
-      database: runtime,
-      locks: bundle.locks,
-      entitlements: createUnlimitedEntitlementsService(),
-      secret: "webhook-key-test-auth-secret-at-least-32-characters",
-      baseURL: ORIGIN,
-      webhookSigning: readWebhookSigningSettings({
-        PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
-        PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",
-        PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS: '["identity-a"]',
-        PASEO_HUB_WEBHOOK_HMAC_KEYRING: JSON.stringify({
-          "test-key": Buffer.alloc(32, 0x14).toString("base64"),
-        }),
-        PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID: "test-key",
-      }),
-      policy: { registrationMode: "open", organizationCreation: "disabled", bootstrap: undefined },
-    });
+    auth = createTestAuth(signingSettings);
     const signup = await auth.handle(
       new Request(`${ORIGIN}/api/auth/sign-up/email`, {
         method: "POST",
@@ -276,16 +280,103 @@ run:
     assert.deepEqual(stored?.allowedTriggers, created.key.allowedTriggers);
   });
 
+  it.each([false, true])(
+    "parses the ordinary browser account reply when signing enabled is %s",
+    async (enabled) => {
+      const server = createTestAuth(enabled ? signingSettings : readWebhookSigningSettings({}));
+      try {
+        const name = "Browser Bearer";
+        const response = await server.browserAccount!(
+          new Request(ORIGIN + "/api/auth/paseo/api-keys", {
+            method: "POST",
+            headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
+            body: JSON.stringify({ name, scopes: ["events:send"] }),
+          }),
+        );
+        assert.equal(response.status, 201);
+        assert.equal(response.headers.get("cache-control"), "no-store");
+        assert.equal(response.headers.get("pragma"), "no-cache");
+        const created = apiKeyCreateResultSchema.parse(await response.json());
+        assert.ok("secret" in created);
+        assert.equal(created.key.name, name);
+        assert.equal(created.key.authentication, undefined);
+        assert.equal(
+          (await server.apiKeys!.authorize(bearerRequest(created.secret), "events:send")).status,
+          "authorized",
+        );
+      } finally {
+        await server.close();
+      }
+    },
+  );
+
+  it("accepts a 72-hour signing overlap and rejects one second beyond it", async () => {
+    const issued = await browserRequest("/api/auth/paseo/api-keys", signedKeyInput("Overlap cap"));
+    assert.equal(issued.status, 201);
+    const { key } = signedKeyResponseSchema.parse(await issued.json());
+    const input = { id: key.id, expectedCurrentVersionId: key.authentication.currentVersionId };
+    const route = "/api/auth/paseo/rotate-api-key-signing-secret";
+    const limit = 72 * 3600;
+    const rejected = await browserRequest(route, { ...input, overlapSeconds: limit + 1 });
+    assert.equal(rejected.status, 400);
+    assert.deepEqual(await rejected.json(), { error: "invalid_request" });
+    const accepted = await browserRequest(route, { ...input, overlapSeconds: limit });
+    assert.equal(accepted.status, 200);
+    const rotated = z
+      .object({ authentication: webhookSigningSummarySchema })
+      .parse(await accepted.json());
+    assert.equal(rotated.authentication.previousVersionId, input.expectedCurrentVersionId);
+    assert.notEqual(rotated.authentication.currentVersionId, input.expectedCurrentVersionId);
+  });
+
+  it("denies signing key creation, rotation and retirement in an excluded organization", async () => {
+    const created = await browserRequest(
+      "/api/auth/paseo/api-keys",
+      signedKeyInput("Excluded signer"),
+    );
+    assert.equal(created.status, 201);
+    const { key } = signedKeyResponseSchema.parse(await created.json());
+    const id = key.id;
+    const rotated = await browserRequest("/api/auth/paseo/rotate-api-key-signing-secret", {
+      id,
+      expectedCurrentVersionId: key.authentication.currentVersionId,
+    });
+    assert.equal(rotated.status, 200);
+    const { authentication } = z
+      .object({ authentication: webhookSigningSummarySchema })
+      .parse(await rotated.json());
+    const excluded = createTestAuth({
+      ...signingSettings,
+      organizationIds: new Set(["identity-b"]),
+    });
+    try {
+      const before = await excluded.apiKeys!.list("identity-a");
+      for (const [path, input] of [
+        ["/api/auth/paseo/api-keys", signedKeyInput("Denied signer")],
+        [
+          "/api/auth/paseo/rotate-api-key-signing-secret",
+          { id, expectedCurrentVersionId: authentication.currentVersionId },
+        ],
+        [
+          "/api/auth/paseo/retire-api-key-signing-secret",
+          { id, expectedPreviousVersionId: authentication.previousVersionId },
+        ],
+      ] as const) {
+        const response = await browserRequest(path, input, excluded);
+        assert.equal(response.status, 403, path);
+        assert.deepEqual(await response.json(), { error: "signature_authentication_disabled" });
+      }
+      assert.deepEqual(await excluded.apiKeys!.list("identity-a"), before);
+    } finally {
+      await excluded.close();
+    }
+  });
+
   it("reveals a signed key only on same-origin creation and rotation, and retires by version", async () => {
     const createPath = "/api/auth/paseo/api-keys";
     const rotatePath = "/api/auth/paseo/rotate-api-key-signing-secret";
     const retirePath = "/api/auth/paseo/retire-api-key-signing-secret";
-    const input = {
-      name: "GitHub signer",
-      actor: "ci-partner",
-      scopes: ["events:send"],
-      authentication: { mode: "hmac", profile: "github_sha256", targetTriggerId },
-    };
+    const input = signedKeyInput("GitHub signer");
     const forbiddenRequest = (path: string, data: unknown) =>
       new Request(ORIGIN + path, {
         method: "POST",
@@ -316,13 +407,7 @@ run:
     assert.equal(issued.status, 201, await issued.clone().text());
     assert.equal(issued.headers.get("cache-control"), "no-store");
     assert.equal(issued.headers.get("pragma"), "no-cache");
-    const creationSchema = z
-      .object({
-        key: keySummarySchema.extend({ authentication: webhookSigningSummarySchema }),
-        signingSecret: z.string(),
-      })
-      .strict();
-    const created = creationSchema.parse(await issued.json());
+    const created = signedKeyResponseSchema.parse(await issued.json());
     assert.deepEqual(created.key.allowedTriggers, ["signed-trigger"]);
     assert.equal(created.key.authentication.targetTriggerId, targetTriggerId);
     const id = created.key.id;
@@ -574,8 +659,29 @@ run:
     assert.deepEqual(await lastUsed(), refreshed);
   });
 
-  async function browserRequest(path: string, body?: unknown): Promise<Response> {
-    return auth.handle(
+  function signedKeyInput(name: string) {
+    return {
+      name,
+      actor: "ci-partner",
+      scopes: ["events:send"],
+      authentication: { mode: "hmac", profile: "github_sha256", targetTriggerId },
+    };
+  }
+
+  function createTestAuth(webhookSigning: WebhookSigningSettings): AuthServer {
+    return createAuthServer({
+      database: runtime,
+      locks,
+      entitlements: createUnlimitedEntitlementsService(),
+      secret: "webhook-key-test-auth-secret-at-least-32-characters",
+      baseURL: ORIGIN,
+      webhookSigning,
+      policy: { registrationMode: "open", organizationCreation: "disabled", bootstrap: undefined },
+    });
+  }
+
+  async function browserRequest(path: string, body?: unknown, server = auth): Promise<Response> {
+    return server.handle(
       new Request(`${ORIGIN}${path}`, {
         method: body === undefined ? "GET" : "POST",
         headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
