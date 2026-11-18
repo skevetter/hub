@@ -29,9 +29,70 @@ describe("run timeline UI", () => {
     });
     assert.match(markup, /1 command, 1 read/u);
     assert.equal([...markup.matchAll(/>Bash - completed/gu)].length, 1);
+    assert.match(markup, />Tool finished</u);
+    assert.match(markup, />Tool running</u);
     for (const label of ["Status", "Source", "Started", "Duration", "Activity", "Progress message"])
       assert.ok(markup.includes(`>${label}</dt>`));
     assert.match(markup, /Not posted: this Hub has progress messages off/u);
+  });
+
+  it.each([
+    { name: "no finish", events: [], label: "Tool running" },
+    {
+      name: "an earlier step finish",
+      events: [runEvent(1, "step_finished")],
+      label: "Tool running",
+    },
+    {
+      name: "an earlier run finish",
+      events: [runEvent(1, "run_finished", {}, "")],
+      label: "Tool running",
+    },
+    {
+      name: "a different step finishes",
+      events: [runEvent(3, "step_finished", {}, "other-step")],
+      label: "Tool running",
+    },
+    {
+      name: "the call's step finishes",
+      events: [runEvent(3, "step_finished")],
+      label: "Tool called",
+    },
+    {
+      name: "the run finishes",
+      events: [runEvent(3, "run_finished", {}, "")],
+      label: "Tool called",
+    },
+    {
+      name: "a matching tool finish",
+      events: [
+        runEvent(3, "tool_finished", { callId: "finish", status: "completed" }),
+        runEvent(4, "run_finished", {}, ""),
+      ],
+      label: "Tool finished",
+    },
+    {
+      name: "a matching tool finish arrives before the start",
+      events: [
+        runEvent(1, "tool_finished", { callId: "finish", status: "completed" }),
+        runEvent(3, "run_finished", {}, ""),
+      ],
+      label: "Tool finished",
+    },
+  ])("shows $label with $name", ({ events, label }) => {
+    const started = runEvent(2, "tool_started", {
+      tool: "mcp__hub__finish_execution",
+      callId: "finish",
+      category: "finish",
+    });
+    const tools = timelineRows(
+      [...events, started].sort((a, b) => a.seq - b.seq),
+      0,
+    ).filter((row) => row.tool);
+    assert.deepEqual(
+      tools.map((row) => row.label),
+      [label],
+    );
   });
 
   it("shows an open permission wait, resolves it in place and displays final dropped count", () => {

@@ -112,20 +112,32 @@ describe("run event subscription", () => {
 
   it("stops at a delivered seal and refetches the snapshot once", () => {
     const { subscription, sources, seal } = fixture();
-    sources.at(0)!.emit("status", {
+    const source = sources.at(0)!;
+    source.emit("status", {
       status: "failed",
       sealedSeq: 2,
       stepRowsOmitted: 4,
       origin: "captured",
     });
-    sources.at(0)!.emit("run_started", runEvent(1, "run_started"));
+    source.emit("tool_started", runEvent(1, "tool_started", { callId: "finish" }));
     assert.equal(subscription.snapshot().connection, "Live");
-    sources.at(0)!.emit("run_finished", runEvent(2, "run_finished", { status: "failed" }));
-    sources.at(0)!.emit("end", { status: "failed", sealedSeq: 2, stepRowsOmitted: 4 });
+    assert.match(
+      renderToStaticMarkup(
+        <RunDetailView detail={runDetailFixture} timeline={subscription.snapshot()} />,
+      ),
+      />Tool running</u,
+    );
+    source.emit("run_finished", runEvent(2, "run_finished", { status: "failed" }));
+    source.emit("end", { status: "failed", sealedSeq: 2, stepRowsOmitted: 4 });
     assert.equal(sources.at(0)!.closed, true);
     assert.equal(subscription.snapshot().connection, null);
     assert.equal(subscription.snapshot().stepRowsOmitted, 4);
     assert.equal(seal.mock.calls.length, 1);
+    const markup = renderToStaticMarkup(
+      <RunDetailView detail={runDetailFixture} timeline={subscription.snapshot()} />,
+    );
+    assert.match(markup, />Tool called</u);
+    assert.doesNotMatch(markup, />Tool running</u);
     subscription.stop();
   });
 
@@ -156,12 +168,18 @@ describe("run event subscription", () => {
       {
         ...emptyTimeline,
         status: "failed",
-        events: [runEvent(1, "run_started")],
+        events: [runEvent(1, "tool_started", { callId: "finish" })],
       },
       requests.issue(),
     );
     assert.equal(subscription.snapshot().connection, "Polling");
     assert.equal(seal.mock.calls.length, 0);
+    assert.match(
+      renderToStaticMarkup(
+        <RunDetailView detail={runDetailFixture} timeline={subscription.snapshot()} />,
+      ),
+      />Tool running</u,
+    );
     subscription.acceptPage(
       {
         ...emptyTimeline,
@@ -173,6 +191,11 @@ describe("run event subscription", () => {
       requests.issue(),
     );
     assert.equal(subscription.snapshot().connection, "Polling");
+    const markup = renderToStaticMarkup(
+      <RunDetailView detail={runDetailFixture} timeline={subscription.snapshot()} />,
+    );
+    assert.match(markup, />Tool called</u);
+    assert.doesNotMatch(markup, />Tool running</u);
     subscription.acceptPage(
       {
         ...emptyTimeline,

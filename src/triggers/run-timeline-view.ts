@@ -28,19 +28,20 @@ const labels: Record<RunEvent["kind"], string> = {
 };
 
 export function timelineRows(events: readonly RunEvent[], droppedCount: number): TimelineRow[] {
+  const labelFor = timelineLabels(events);
   const rows: TimelineRow[] = [];
   const calls = new Map<string, TimelineRow>();
   const permissions = new Map<string, TimelineRow[]>();
   for (const event of events) {
-    const { kind, data, stepId } = event;
+    const { kind, data, stepId, seq } = event;
     const tool = kind === "tool_started" || kind === "tool_finished";
     const callId = text(data["callId"]);
-    const key = tool && callId !== "" ? `${stepId}\0${callId}` : `seq:${String(event.seq)}`;
+    const key = tool && callId !== "" ? `${stepId}\0${callId}` : `seq:${String(seq)}`;
     const row: TimelineRow = {
       key,
-      seq: event.seq,
+      seq,
       at: event.at,
-      label: labels[kind],
+      label: labelFor(event),
       detail: eventDetail(event, droppedCount),
       category: tool ? text(data["category"]) : null,
       tool,
@@ -48,10 +49,12 @@ export function timelineRows(events: readonly RunEvent[], droppedCount: number):
     switch (kind) {
       case "tool_started":
       case "tool_finished": {
-        const previous = tool && callId !== "" ? calls.get(key) : undefined;
+        const previous = calls.get(key);
         if (previous !== undefined) {
-          previous.label = row.label;
-          previous.detail = row.detail;
+          if (kind === "tool_finished" || previous.label !== labels.tool_finished) {
+            previous.label = row.label;
+            previous.detail = row.detail;
+          }
           continue;
         }
         if (callId !== "") calls.set(key, row);
@@ -76,6 +79,21 @@ export function timelineRows(events: readonly RunEvent[], droppedCount: number):
     rows.push(row);
   }
   return rows.sort((left, right) => left.seq - right.seq);
+}
+
+function timelineLabels(events: readonly RunEvent[]) {
+  let runFinishedSeq = -Infinity;
+  const stepFinishedSeqs = new Map<string, number>();
+  for (const { kind, stepId, seq } of events) {
+    if (kind === "run_finished") runFinishedSeq = Math.max(runFinishedSeq, seq);
+    if (kind === "step_finished")
+      stepFinishedSeqs.set(stepId, Math.max(stepFinishedSeqs.get(stepId) ?? -Infinity, seq));
+  }
+  return ({ kind, stepId, seq }: RunEvent) =>
+    kind === "tool_started" &&
+    seq < Math.max(runFinishedSeq, stepFinishedSeqs.get(stepId) ?? -Infinity)
+      ? "Tool called"
+      : labels[kind];
 }
 
 function eventDetail({ kind, data, stepId }: RunEvent, droppedCount: number) {
