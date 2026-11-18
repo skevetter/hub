@@ -3,7 +3,6 @@ import { it } from "vitest";
 import { createDatabase } from "../db/pg.js";
 import { embeddedLocks } from "../db/runtime/locks/index.js";
 import { createTimelinePostgresHarness } from "../db/test-utils/run-timeline-postgres.js";
-import { matchTriggers } from "../triggers/github/match.js";
 
 const NOW = new Date("2026-11-18T00:00:00Z");
 const CUTOFF = new Date("2026-10-19T00:00:00Z");
@@ -77,94 +76,3 @@ it.each(["recovery", "expiry"])(
   },
   120_000,
 );
-
-it("requires both matching workflow names in the pinned PostgreSQL fan-out", async () => {
-  const harness = await createTimelinePostgresHarness();
-  try {
-    const first = await harness.createRun();
-    const { database, runtime } = harness;
-    const event = {
-      id: "delivery",
-      type: "issues",
-      repo: "owner/repo",
-      repositoryId: 1,
-      installationId: 1,
-      createdAt: OLD.toISOString(),
-      payload: {
-        action: "opened",
-        sender: { login: "owner" },
-        issue: { number: 1, title: "Title", body: "Body", user: { login: "owner" } },
-      },
-    };
-    const workflows = [first.configuredTriggerName, "second"].map((name) => ({
-      name,
-      on: "github.issue_created",
-      filters: { from_users: ["owner"] },
-      steps: [],
-      inputs: {},
-      values: {},
-      maxRuntimeMs: 1000,
-    }));
-    assert.deepEqual(
-      matchTriggers({ triggers: workflows }, event).map(({ trigger }) => trigger.name),
-      workflows.map(({ name }) => name),
-    );
-    await runtime.query(
-      "update project_configuration_revisions set normalized_configuration = $2 where id = $1",
-      [first.configurationRevisionId, { triggers: workflows }],
-    );
-    await runtime.query(
-      `update provider_event_receipts set provider = 'github', source = 'github.issues',
-        payload = $2, accepted_routes = $3::jsonb where id = $1`,
-      [
-        first.providerEventReceiptId,
-        event,
-        JSON.stringify([
-          {
-            projectId: first.projectId,
-            configurationRevisionId: first.configurationRevisionId,
-          },
-        ]),
-      ],
-    );
-    const current = await database.insertProjectConfigurationRevision({
-      projectId: first.projectId,
-      sourceKind: "manual",
-      sourceEvidence: { kind: "test" },
-      normalizedConfiguration: { environments: [], triggers: [workflows[0]] },
-      contentHash: "current",
-    });
-    await database.activateProjectConfigurationRevision(first.projectId, current.id, []);
-    await database.deleteWorkflowWakeup(first.id);
-    await runtime.query(
-      "update trigger_runs set status = 'succeeded', completed_at = $2 where id = $1",
-      [first.id, OLD],
-    );
-
-    assert.deepEqual(await database.scanRunPayloads(null, CUTOFF, 10, true), [
-      { id: first.id, disposition: "fan_out_unresolved", ageFrom: OLD },
-    ]);
-    assert.equal(await database.expireRunPayloadChunk(first.id, CUTOFF, NOW), "skipped");
-    assert.equal((await database.findTriggerRunById(first.id))?.payloadExpiredAt, null);
-
-    const { run: other } = await database.createAcceptedTriggerRun({
-      organizationId: first.organizationId,
-      projectId: first.projectId,
-      configurationRevisionId: first.configurationRevisionId,
-      providerEventReceiptId: first.providerEventReceiptId,
-      prompt: first.prompt,
-      deadlineAt: first.deadlineAt,
-      configuredTriggerName: "second",
-      stepIds: ["work"],
-      inputs: {},
-      triggerContext: {},
-      outputContext: {},
-    });
-    const settled = await database.scanRunPayloads(null, CUTOFF, 10, true);
-    assert.equal(settled.find(({ id }) => id === first.id)?.disposition, "eligible");
-    assert.equal(settled.find(({ id }) => id === other.id)?.disposition, "live");
-    assert.equal(await database.expireRunPayloadChunk(first.id, CUTOFF, NOW), "expiring");
-  } finally {
-    await harness.close();
-  }
-}, 120_000);

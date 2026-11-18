@@ -5,6 +5,8 @@ import {
 import {
   RUN_PAYLOAD_DISPOSITION_SQL,
   runExecutions,
+  prepareRunPayloadFanout,
+  recheckRunPayloadFanout,
   scanRunPayloads,
 } from "./run-payload-retention.js";
 import {
@@ -293,18 +295,29 @@ class PgDatabase implements Database {
   scanRunPayloads: Database["scanRunPayloads"] = (after, cutoff, limit, countOnly) =>
     scanRunPayloads(this.pool, after, cutoff, limit, countOnly);
   async expireRunPayloadChunk(id: string, cutoff: Date, now: Date) {
+    const fanout = await prepareRunPayloadFanout(this.pool, id, cutoff);
+    if (fanout?.expected === undefined) return "skipped";
     return this.pool.transaction(async (client) => {
       const locked = await client.query<TriggerRunRow>(
         `select * from trigger_runs where id = $1 and payload_expiry_state is distinct from 'expired' for update skip locked`,
         [id],
       );
       const row = locked.rows[0];
-      if (row === undefined) return "skipped";
+      if (
+        row === undefined ||
+        row.provider_event_receipt_id !== fanout.receiptId ||
+        row.organization_id !== fanout.organizationId
+      )
+        return "skipped";
       const result = await client.query<{ disposition: RunPayloadDisposition }>(
         `select ${RUN_PAYLOAD_DISPOSITION_SQL} as disposition from trigger_runs run where id = $1`,
         [id, cutoff],
       );
-      if (result.rows[0]?.disposition !== "eligible") return "skipped";
+      if (
+        result.rows[0]?.disposition !== "eligible" ||
+        !(await recheckRunPayloadFanout(client, fanout))
+      )
+        return "skipped";
       if (row.payload_expiry_state == null) {
         await stageRunPayload(client, row, now);
         return "expiring";

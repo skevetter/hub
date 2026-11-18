@@ -1,4 +1,4 @@
-import { needsPinnedFanoutProof } from "./run-payload-retention.js";
+import { coversExpectedFanout, expectedFanout } from "../run-payload-retention/fanout.js";
 import {
   payloadCompletion,
   reduceRejection,
@@ -346,32 +346,16 @@ class MemoryDatabase implements Database {
 
   private hasUnresolvedRunFanout(receiptId: string): boolean {
     const receipt = this.providerEventReceipts.get(receiptId);
-    if (receipt === undefined) return false;
-    const pinned = needsPinnedFanoutProof(receipt.provider);
-    const routes = receipt.acceptedRoutes ?? [];
-    if (routes.length === 0) return pinned;
+    if (receipt === undefined) return true;
+    const expected = expectedFanout(receipt, (id) => this.configurationRevisions.get(id));
     const branches = this.triggerRunIdsByProviderEventReceipt.get(receiptId);
-    return routes.some((route) => {
-      const runs = [...(branches?.get(route.projectId)?.values() ?? [])]
-        .map((id) => this.triggerRuns.get(id))
-        .filter((run) => run?.configurationRevisionId === route.configurationRevisionId);
-      if (runs.length === 0) return true;
-      if (!pinned) return false;
-      const revision = this.configurationRevisions.get(route.configurationRevisionId);
-      if (
-        revision?.projectId !== route.projectId ||
-        revision.organizationId !== receipt.organizationId
-      )
-        return true;
-      const possible = pinnedProviderWorkflowNames(
-        revision.normalizedConfiguration,
-        receipt.provider,
-      );
-      return (
-        possible.length === 0 ||
-        possible.some((name) => !runs.some((run) => run?.configuredTriggerName === name))
-      );
-    });
+    const runs = [...(branches?.values() ?? [])].flatMap((project) =>
+      [...project.values()].flatMap((id) => {
+        const run = this.triggerRuns.get(id);
+        return run === undefined ? [] : [run];
+      }),
+    );
+    return !coversExpectedFanout(expected, runs);
   }
 
   private runPayloadExecutions(run: TriggerRunRecord, steps: readonly WorkflowStepRunRecord[]) {
@@ -4876,27 +4860,4 @@ function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
     (execution.hubAction !== null && execution.hubActionCompletedAt === null) ||
     Object.values(execution.outputDeliveryAttempts).some((attempt) => attempt.status === "pending")
   );
-}
-
-function pinnedProviderWorkflowNames(configuration: unknown, provider: string): string[] {
-  if (configuration === null || typeof configuration !== "object" || !("triggers" in configuration))
-    return [];
-  const workflows: unknown = configuration.triggers;
-  if (!Array.isArray(workflows)) return [];
-  const candidates: string[] = [];
-  for (const workflow of workflows as unknown[]) {
-    if (
-      workflow === null ||
-      typeof workflow !== "object" ||
-      !("on" in workflow) ||
-      typeof workflow.on !== "string" ||
-      !("name" in workflow) ||
-      typeof workflow.name !== "string"
-    )
-      return [];
-    if (workflow.on.startsWith(`${provider}.`) && workflow.on !== "github.notification") {
-      candidates.push(workflow.name);
-    }
-  }
-  return candidates;
 }

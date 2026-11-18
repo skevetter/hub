@@ -5,48 +5,95 @@ import {
 } from "../run-payload-retention/store.js";
 import type { QueryHandle } from "./runtime/index.js";
 
-export function needsPinnedFanoutProof(provider: string): boolean {
-  return ["github", "linear", "slack", "discord"].includes(provider);
+import {
+  coversExpectedFanout,
+  expectedFanout,
+  readPinnedRoutes,
+  type AdmittedBranch,
+  type ExpectedFanout,
+  type FanoutReceipt,
+  type FanoutRevision,
+} from "../run-payload-retention/fanout.js";
+
+interface ReceiptFanout {
+  receiptId: string;
+  organizationId: string;
+  expected: ExpectedFanout | undefined;
 }
 
-const ORDINARY_PROVIDER_SQL = "receipt.provider in ('github', 'linear', 'slack', 'discord')";
+async function loadReceiptFanout(database: QueryHandle, receiptIds: readonly string[]) {
+  const proofs = new Map<string, ReceiptFanout>();
+  if (receiptIds.length === 0) return proofs;
+  const receipts = await database.query<FanoutReceipt & Record<string, unknown>>(
+    `select id, organization_id as "organizationId", provider, source, accepted_routes as "acceptedRoutes",
+       case when provider in ('github', 'linear') then payload end as payload
+     from provider_event_receipts where id = any($1::uuid[])`,
+    [receiptIds],
+  );
+  const revisionIds = new Set<string>();
+  for (const receipt of receipts.rows) {
+    if (receipt.provider !== "github" && receipt.provider !== "linear") continue;
+    for (const route of readPinnedRoutes(receipt) ?? [])
+      revisionIds.add(route.configurationRevisionId);
+  }
+  const revisions = new Map<string, FanoutRevision>();
+  if (revisionIds.size > 0) {
+    const found = await database.query<FanoutRevision & { id: string } & Record<string, unknown>>(
+      `select id, project_id as "projectId", organization_id as "organizationId",
+         normalized_configuration as "normalizedConfiguration"
+       from project_configuration_revisions where id = any($1::uuid[])`,
+      [[...revisionIds]],
+    );
+    for (const revision of found.rows) revisions.set(revision.id, revision);
+  }
+  for (const receipt of receipts.rows) {
+    proofs.set(receipt.id, {
+      receiptId: receipt.id,
+      organizationId: receipt.organizationId,
+      expected: expectedFanout(receipt, (id) => revisions.get(id)),
+    });
+  }
+  return proofs;
+}
 
-// Every workflow for the provider is an upper bound on what the pinned revision could match.
-const UNPROVEN_PINNED_FANOUT_SQL = `(
-  ${ORDINARY_PROVIDER_SQL}
-  and not exists (
-    select 1 from project_configuration_revisions revision
-    cross join lateral (
-      select count(*) filter (
-        where workflow ->> 'on' like receipt.provider || '.%'
-          and workflow ->> 'on' <> 'github.notification'
-      ) as possible,
-      count(*) filter (
-        where jsonb_typeof(workflow -> 'name') is distinct from 'string'
-           or jsonb_typeof(workflow -> 'on') is distinct from 'string'
-      ) as malformed,
-      count(*) filter (
-        where workflow ->> 'on' like receipt.provider || '.%'
-          and workflow ->> 'on' <> 'github.notification'
-          and not exists (
-            select 1 from trigger_runs branch
-            where branch.provider_event_receipt_id = receipt.id
-              and branch.project_id = revision.project_id
-              and branch.configuration_revision_id = revision.id
-              and branch.configured_trigger_name = workflow ->> 'name'
-          )
-      ) as missing
-      from jsonb_array_elements(
-        case when jsonb_typeof(revision.normalized_configuration -> 'triggers') = 'array'
-          then revision.normalized_configuration -> 'triggers' else '[]'::jsonb end
-      ) workflow
-    ) proof
-    where revision.id::text = route ->> 'configurationRevisionId'
-      and revision.project_id::text = route ->> 'projectId'
-      and revision.organization_id = receipt.organization_id
-      and proof.possible > 0 and proof.missing = 0 and proof.malformed = 0
-  )
-)`;
+async function loadAdmittedBranches(database: QueryHandle, receiptIds: readonly string[]) {
+  const byReceipt = new Map<string, AdmittedBranch[]>();
+  if (receiptIds.length === 0) return byReceipt;
+  const result = await database.query<
+    AdmittedBranch & { receiptId: string } & Record<string, unknown>
+  >(
+    `select provider_event_receipt_id as "receiptId", project_id as "projectId",
+       configuration_revision_id as "configurationRevisionId", configured_trigger_name as "configuredTriggerName"
+     from trigger_runs where provider_event_receipt_id = any($1::uuid[])`,
+    [receiptIds],
+  );
+  for (const branch of result.rows) {
+    const existing = byReceipt.get(branch.receiptId);
+    if (existing === undefined) byReceipt.set(branch.receiptId, [branch]);
+    else existing.push(branch);
+  }
+  return byReceipt;
+}
+
+export async function prepareRunPayloadFanout(database: QueryHandle, runId: string, cutoff: Date) {
+  const runs = await database.query<{ receiptId: string }>(
+    `select provider_event_receipt_id as "receiptId" from trigger_runs
+     where id = $1 and status <> 'running' and completed_at is not null
+       and payload_expiry_state is distinct from 'expired'
+       and (completed_at < $2 or payload_expiry_state = 'expiring')`,
+    [runId, cutoff],
+  );
+  const run = runs.rows[0];
+  if (run === undefined) return undefined;
+  return (await loadReceiptFanout(database, [run.receiptId])).get(run.receiptId);
+}
+
+export async function recheckRunPayloadFanout(database: QueryHandle, receipt: ReceiptFanout) {
+  if (receipt.expected === undefined) return false;
+  if (receipt.expected.length === 0) return true;
+  const branches = await loadAdmittedBranches(database, [receipt.receiptId]);
+  return coversExpectedFanout(receipt.expected, branches.get(receipt.receiptId) ?? []);
+}
 
 export const RUN_PAYLOAD_DISPOSITION_SQL = `case
   when run.status = 'running' then 'live'
@@ -73,25 +120,6 @@ export const RUN_PAYLOAD_DISPOSITION_SQL = `case
   when exists (select 1 from run_progress_messages message
     where message.trigger_run_id = run.id and ${PROGRESS_UNSETTLED_SQL})
     then 'reporter_pending'
-  when exists (
-    select 1 from provider_event_receipts receipt
-    where receipt.id = run.provider_event_receipt_id and (
-      (${ORDINARY_PROVIDER_SQL}
-        and coalesce(receipt.accepted_routes, '[]'::jsonb) = '[]'::jsonb)
-      or jsonb_typeof(receipt.accepted_routes) <> 'array'
-      or exists (
-        select 1 from jsonb_array_elements(case when jsonb_typeof(receipt.accepted_routes) = 'array'
-          then receipt.accepted_routes else '[]'::jsonb end) route
-        where not exists (
-          select 1 from trigger_runs branch
-          where branch.provider_event_receipt_id = receipt.id
-            and branch.project_id::text = route ->> 'projectId'
-            and branch.configuration_revision_id::text = route ->> 'configurationRevisionId'
-        ) or ${UNPROVEN_PINNED_FANOUT_SQL}
-      )
-    )
-  )
-    then 'fan_out_unresolved'
   else 'eligible'
 end`;
 
@@ -121,7 +149,9 @@ export async function scanRunPayloads(
   limit: number,
   countOnly: boolean,
 ): Promise<RunPayloadCandidate[]> {
-  const result = await database.query<RunPayloadCandidate & Record<string, unknown>>(
+  const result = await database.query<
+    RunPayloadCandidate & { receiptId: string; organizationId: string } & Record<string, unknown>
+  >(
     `with candidates as materialized (
       select id, status, completed_at, created_at, payload_expiry_state,
         organization_id, project_id, provider_event_receipt_id, terminal_notification_lease_expires_at,
@@ -131,10 +161,30 @@ export async function scanRunPayloads(
         ${countOnly ? "" : "and status <> 'running' and (completed_at < $2 or payload_expiry_state = 'expiring')"}
       order by id limit $3
     )
-    select run.id, ${RUN_PAYLOAD_DISPOSITION_SQL} as disposition,
+    select run.id, run.provider_event_receipt_id as "receiptId", run.organization_id as "organizationId",
+      ${RUN_PAYLOAD_DISPOSITION_SQL} as disposition,
       coalesce(run.completed_at, run.created_at) as "ageFrom"
     from candidates run order by run.id`,
     [after, cutoff, limit],
   );
-  return result.rows;
+  const eligibleReceipts = [
+    ...new Set(
+      result.rows.filter((run) => run.disposition === "eligible").map((run) => run.receiptId),
+    ),
+  ];
+  const proofs = await loadReceiptFanout(database, eligibleReceipts);
+  const branches = await loadAdmittedBranches(
+    database,
+    [...proofs.values()]
+      .filter((proof) => (proof.expected?.length ?? 0) > 0)
+      .map((proof) => proof.receiptId),
+  );
+  return result.rows.map(({ id, disposition, ageFrom, receiptId, organizationId }) => {
+    if (disposition !== "eligible") return { id, disposition, ageFrom };
+    const proof = proofs.get(receiptId);
+    const settled =
+      proof?.organizationId === organizationId &&
+      coversExpectedFanout(proof.expected, branches.get(receiptId) ?? []);
+    return { id, disposition: settled ? "eligible" : "fan_out_unresolved", ageFrom };
+  });
 }
