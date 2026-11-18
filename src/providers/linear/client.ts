@@ -31,18 +31,10 @@ const ViewerResponseSchema = z.object({
   }),
 });
 
+const GraphqlErrorsSchema = z.object({ errors: z.array(z.unknown()).min(1) });
 const GraphqlErrorSchema = z.object({
-  errors: z
-    .array(
-      z.object({
-        message: z.string(),
-        extensions: z
-          .object({ code: z.string().optional(), type: z.string().optional() })
-          .optional(),
-      }),
-    )
-    .min(1)
-    .optional(),
+  message: z.string().optional(),
+  extensions: z.object({ code: z.string().optional(), type: z.string().optional() }).optional(),
 });
 
 const IssueResponseSchema = z.object({
@@ -116,9 +108,17 @@ export class LinearApiError extends Error {
     readonly code?: string,
     readonly retryAfterMs?: number,
     readonly graphqlMessage?: string,
+    readonly hasPartialData = false,
   ) {
     super(message);
     this.name = "LinearApiError";
+  }
+}
+
+export class LinearTransportError extends Error {
+  constructor(cause: unknown) {
+    super("Linear request failed", { cause });
+    this.name = "LinearTransportError";
   }
 }
 
@@ -477,8 +477,7 @@ export function createLinearApiClient(options: {
             }`,
             variables: { issueId: input.issueId, body: input.body },
           },
-          write?.signal,
-          now,
+          { mutation: true, signal: write?.signal, now },
         ),
       );
       return result.data.commentCreate.comment.id;
@@ -497,8 +496,7 @@ export function createLinearApiClient(options: {
             }`,
             variables: { id: input.commentId, body: input.body },
           },
-          write?.signal,
-          now,
+          { mutation: true, signal: write?.signal, now },
         ),
       );
     },
@@ -559,9 +557,9 @@ async function graphql(
   request: typeof fetch,
   accessToken: string,
   payload: { query: string; variables: Record<string, string> },
-  signal?: AbortSignal,
-  now: () => Date = () => new Date(),
+  options: { mutation?: true; signal?: AbortSignal | undefined; now?: () => Date } = {},
 ): Promise<unknown> {
+  const { signal, mutation, now = () => new Date() } = options;
   signal?.throwIfAborted();
   const response = await request("https://api.linear.app/graphql", {
     method: "POST",
@@ -570,7 +568,11 @@ async function graphql(
       "content-type": "application/json",
     },
     body: JSON.stringify(payload),
+    ...(mutation ? { redirect: "error" } : {}),
     ...(signal === undefined ? {} : { signal }),
+  }).catch((error: unknown) => {
+    if (signal?.aborted) throw error;
+    throw new LinearTransportError(error);
   });
   let result: unknown;
   try {
@@ -583,23 +585,31 @@ async function graphql(
 }
 
 function checkGraphqlResponse(response: Response, result: unknown, now: () => Date): void {
-  const envelope = GraphqlErrorSchema.safeParse(result);
-  const errors = envelope.success ? envelope.data.errors : undefined;
-  const errorCode = (error: NonNullable<typeof errors>[number]) =>
+  const envelope = GraphqlErrorsSchema.safeParse(result);
+  const errors = envelope.success
+    ? envelope.data.errors.flatMap((value) => {
+        const error = GraphqlErrorSchema.safeParse(value);
+        return error.success ? [error.data] : [];
+      })
+    : [];
+  const errorCode = (error: (typeof errors)[number]) =>
     error.extensions?.code ?? error.extensions?.type;
-  const rateLimited = errors?.find((error) => errorCode(error)?.toUpperCase() === "RATELIMITED");
-  const error = rateLimited ?? errors?.[0];
-  if (!response.ok || error !== undefined) {
+  const rateLimited = errors.find((error) => errorCode(error)?.toUpperCase() === "RATELIMITED");
+  const error = rateLimited ?? errors[0];
+  if (!response.ok || envelope.success) {
     const delay =
       rateLimited !== undefined || response.status === 429
         ? linearRetryAfterMs(response.headers, now().getTime())
         : undefined;
     throw new LinearApiError(
-      response.ok ? `Linear GraphQL ${error?.message}` : `Linear GraphQL HTTP ${response.status}`,
+      response.ok
+        ? `Linear GraphQL ${error?.message ?? "response contained errors"}`
+        : `Linear GraphQL HTTP ${response.status}`,
       response.status,
       error === undefined ? undefined : errorCode(error),
       delay,
       error?.message,
+      result != null && typeof result === "object" && "data" in result && result.data != null,
     );
   }
 }

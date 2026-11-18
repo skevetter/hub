@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { createServer } from "node:http";
 import { describe, it, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import type { LinearConnectionRecord } from "../db/types.js";
@@ -172,6 +174,74 @@ describe("Linear run progress", () => {
       assert.equal(fetch.mock.calls.length, 1);
     },
   );
+
+  it.each([200, 400, 429])(
+    "keeps a partial HTTP %i rate-limited create uncertain after one POST",
+    async (status) => {
+      const fetch = vi.fn(async () =>
+        Response.json(
+          {
+            data: { commentCreate: { success: true, comment: null } },
+            errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }],
+          },
+          { status },
+        ),
+      );
+      const { provider, authorize } = fixture(fetch);
+      await authorize(destination);
+      assert.deepEqual(await provider.create(destination, "Started", signal), {
+        status: "retry",
+        afterMs: 0,
+        notCreated: false,
+        transient: true,
+      });
+      assert.equal(fetch.mock.calls.length, 1);
+    },
+  );
+
+  it("keeps a successful create with a null comment uncertain after one POST", async () => {
+    const fetch = vi.fn(async () =>
+      Response.json({ data: { commentCreate: { success: true, comment: null } } }),
+    );
+    const { provider, authorize } = fixture(fetch);
+    await authorize(destination);
+    await assert.rejects(provider.create(destination, "Started", signal));
+    assert.equal(fetch.mock.calls.length, 1);
+  });
+
+  it("keeps a redirected create uncertain without replaying the POST", async () => {
+    const requests: Array<{ method: string | undefined; path: string | undefined }> = [];
+    const server = createServer((request, response) => {
+      requests.push({ method: request.method, path: request.url });
+      if (request.url === "/graphql") response.writeHead(307, { location: "/redirected" });
+      response.end();
+    });
+    server.listen(0, "127.0.0.1");
+    try {
+      await once(server, "listening");
+      const address = server.address();
+      assert.ok(address !== null && typeof address !== "string");
+      const { provider, authorize } = fixture((_url, init) =>
+        fetch(`http://127.0.0.1:${address.port}/graphql`, init),
+      );
+      await authorize(destination);
+      assert.deepEqual(await provider.create(destination, "Started", signal), {
+        status: "retry",
+        afterMs: 0,
+        notCreated: false,
+        transient: true,
+      });
+      assert.deepEqual(requests, [{ method: "POST", path: "/graphql" }]);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        }),
+      );
+    }
+  });
 
   it("keeps a server error uncertain and sends a create only once", async () => {
     const fetch = vi.fn(async () => new Response("error", { status: 503 }));

@@ -2,6 +2,7 @@ import type { Database, LinearConnectionRecord } from "../db/types.js";
 import {
   LinearApiError,
   LinearCredentialError,
+  LinearTransportError,
   linearConnectionRequiresReauthorization,
   type LinearApiClient,
 } from "../providers/linear/client.js";
@@ -77,7 +78,7 @@ export function createLinearProgressProvider(options: LinearProgressOptions): Pr
         );
         return { status: "ok", ref: { credential, commentId } };
       } catch (error) {
-        return mapWriteError(error);
+        return mapCreateError(error);
       }
     },
     async edit({ credential, commentId }, body, signal) {
@@ -107,12 +108,25 @@ const permissionErrorCodes = new Set([
   "INVALIDSCOPE",
   "ACCESSDENIED",
 ]);
+const missingTargetCodes = new Set(["NOTFOUND", "ENTITYNOTFOUND"]);
 const permissionErrorMessage =
   /\b(?:forbidden|access denied|not (?:authorized|allowed) to)\b|\b(?:scope|permission)s?\b.*\b(?:required|missing|denied)\b|\b(?:required|missing|insufficient)\b.*\b(?:scope|permission)s?\b/iu;
 const missingTargetMessage =
   /\b(?:comment|issue|entity)\b.{0,80}\b(?:not found|does not exist)\b|\b(?:could not|cannot) find (?:the )?(?:comment|issue|entity)\b/iu;
 
+const uncertainWrite = { status: "retry", afterMs: 0, notCreated: false, transient: true } as const;
+
+function mapCreateError(error: unknown): ProgressCall {
+  if (error instanceof LinearApiError) {
+    if (error.status < 400 || error.hasPartialData) return uncertainWrite;
+    if (error.code?.toUpperCase() === "RATELIMITED" && error.status !== 400 && error.status !== 429)
+      return uncertainWrite;
+  }
+  return mapWriteError(error);
+}
+
 function mapWriteError(error: unknown): ProgressCall {
+  if (error instanceof LinearTransportError) return uncertainWrite;
   if (error instanceof LinearCredentialError) {
     return error.code === "connection_not_owned" || error.code === "body_contains_secret"
       ? { status: "refused", code: error.code }
@@ -131,12 +145,7 @@ function mapWriteError(error: unknown): ProgressCall {
       return { status: "unavailable", code: "scope_missing" };
     if (error.status === 401 || code === "UNAUTHENTICATED" || code === "AUTHENTICATIONERROR")
       return { status: "unavailable", code: "reauthorize" };
-    if (
-      error.status === 404 ||
-      code === "NOTFOUND" ||
-      code === "ENTITYNOTFOUND" ||
-      missingTargetMessage.test(message)
-    )
+    if (error.status === 404 || missingTargetCodes.has(code) || missingTargetMessage.test(message))
       return { status: "gone" };
   }
   throw error;
