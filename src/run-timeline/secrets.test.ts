@@ -39,6 +39,7 @@ const SECRET_NAMES = [
 const NON_SECRET_NAMES: Readonly<Record<string, string>> = {
   GITHUB_APP_PRIVATE_KEY_PATH: "filesystem path; loaded private-key bytes are collected separately",
   PASEO_HUB_STREAM_MAX_PER_KEY: "numeric stream admission limit, not an API key",
+  PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID: "signing key identifier, not key material",
   PASEO_E2E_TLS_KEY: "fixture TLS key filesystem path, not private-key bytes",
   PASEO_E2E_MACHINE_KEY_FILE: "fixture output filesystem path, not the generated credential",
   HUB_E2E_MACHINE_KEY_FILE: "fixture output filesystem path, not the generated credential",
@@ -161,6 +162,20 @@ describe("startup credential reader coverage", () => {
     expectProtected({ NEW_SERVICE_PASSWORD: "  nnnnnnnnnnnn  " }, [
       "  nnnnnnnnnnnn  ",
       "nnnnnnnnnnnn",
+    ]);
+  });
+
+  it("scrubs each signing key inside the webhook keyring", () => {
+    const keyring = JSON.stringify({
+      "key-1": "A".repeat(43) + "=",
+      "key-2": "B".repeat(43) + "=",
+    });
+    const collected = readTimelineScrubValues({ PASEO_HUB_WEBHOOK_HMAC_KEYRING: keyring });
+    expect(collected).toEqual(
+      expect.arrayContaining([keyring, "A".repeat(43) + "=", "B".repeat(43) + "="]),
+    );
+    expect(readTimelineScrubValues({ PASEO_HUB_WEBHOOK_HMAC_KEYRING: "not json" })).toEqual([
+      "not json",
     ]);
   });
 

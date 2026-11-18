@@ -1,6 +1,7 @@
 const NON_SECRET_ENVIRONMENT_NAMES: Readonly<Record<string, true | undefined>> = {
   GITHUB_APP_PRIVATE_KEY_PATH: true,
   PASEO_HUB_STREAM_MAX_PER_KEY: true,
+  PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID: true,
   PASEO_E2E_TLS_KEY: true,
   PASEO_E2E_MACHINE_KEY_FILE: true,
   HUB_E2E_MACHINE_KEY_FILE: true,
@@ -21,6 +22,7 @@ export function readTimelineScrubValues(
       values.add(value);
       const effective = value.trim();
       if (effective.length !== 0) values.add(effective);
+      if (name === "PASEO_HUB_WEBHOOK_HMAC_KEYRING") addKeyringEntries(value, values);
     }
   }
   for (const configuration of providerConfigurations) {
@@ -30,4 +32,18 @@ export function readTimelineScrubValues(
     }
   }
   return [...values];
+}
+
+// The keyring is a JSON object, so each key must be scrubbed on its own when it appears outside the JSON.
+function addKeyringEntries(keyring: string, values: Set<string>): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(keyring);
+  } catch {
+    return;
+  }
+  if (typeof parsed !== "object" || parsed === null) return;
+  for (const entry of Object.values(parsed)) {
+    if (typeof entry === "string" && entry.length !== 0) values.add(entry);
+  }
 }
