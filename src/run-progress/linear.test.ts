@@ -12,7 +12,12 @@ const scope = { id: "run", organizationId: "hub-org", projectId: "project" };
 const credential = { kind: "linear-organization", linearOrganizationId: "linear-org" } as const;
 const outputContext = { provider: "linear", linearOrganizationId: "linear-org", issueId: "issue" };
 const destination = { credential, issueId: "issue" };
-const ref = { credential, commentId: "comment" };
+const ref = {
+  credential,
+  commentId: "comment",
+  issueId: "issue",
+  linearOrganizationId: "linear-org",
+};
 const signal = new AbortController().signal;
 
 function fixture(fetch: typeof globalThis.fetch) {
@@ -52,6 +57,7 @@ function fixture(fetch: typeof globalThis.fetch) {
   const provider = createLinearProgressProvider({
     client,
     connectionForLinearOrganization: lookup,
+    readRunOutputContext: () => Promise.resolve(outputContext),
     clientSecret: "fake-client-secret",
   });
   async function authorize(target: ProgressDestination) {
@@ -260,6 +266,48 @@ describe("Linear run progress", () => {
     await authorize(destination);
     await assert.rejects(provider.create(destination, "Started", signal), /HTTP 503/u);
     assert.equal(fetch.mock.calls.length, 1);
+  });
+
+  it.each([
+    { ...ref, issueId: "other-issue", commentId: "other-issue-comment" },
+    { ...ref, issueId: undefined },
+    { ...ref, linearOrganizationId: "other-workspace", commentId: "other-workspace-comment" },
+  ])("refuses a mismatched stored target for comment $commentId", async (stored) => {
+    const fetch = vi.fn(neverFetch);
+    const { provider, authorize } = fixture(fetch);
+    await authorize(ref);
+    const { issueId, ...fields } = stored;
+    const target = issueId === undefined ? fields : { ...fields, issueId };
+    assert.deepEqual(await provider.edit(target, "Finished", signal), {
+      status: "refused",
+      code: "target_mismatch",
+    });
+    assert.equal(fetch.mock.calls.length, 0);
+  });
+
+  it("refuses a locator from a workspace other than the run's workspace", async () => {
+    const fetch = vi.fn(neverFetch);
+    const { provider, lookup } = fixture(fetch);
+    assert.deepEqual(
+      await provider.authorize(
+        { ...credential, linearOrganizationId: "other-workspace" },
+        scope,
+        signal,
+      ),
+      { refused: "target_mismatch" },
+    );
+    assert.equal(lookup.mock.calls.length, 0);
+    assert.equal(fetch.mock.calls.length, 0);
+  });
+
+  it("refuses a connection returned for a different workspace", async () => {
+    const fetch = vi.fn(neverFetch);
+    const { provider, connection } = fixture(fetch);
+    connection.linearOrganizationId = "other-workspace";
+    assert.deepEqual(await provider.authorize(credential, scope, signal), {
+      refused: "target_mismatch",
+    });
+    assert.equal(fetch.mock.calls.length, 0);
   });
 
   it("requires reauthorization before using an expired connection without a refresh token", async () => {

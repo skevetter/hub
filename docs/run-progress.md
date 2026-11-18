@@ -44,3 +44,6 @@ With the reporter enabled and the Linear integration configured, an opted-in Lin
 creates a Paseo app comment on the source issue and edits it as the run advances.
 The Linear connection must grant the app token permission to edit its own comments.
 Verify this in a live Linear workspace before enabling progress messages for Linear runs.
+
+Hub refuses an edit with `target_mismatch` when the stored issue or workspace differs from
+the run's Linear destination, or when the stored reference lacks the bound issue or workspace.

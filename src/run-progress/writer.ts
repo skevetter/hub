@@ -182,6 +182,7 @@ const FAILURE_CODES = new Set([
   "repo_not_allowed",
   "scope_missing",
   "sso_required",
+  "target_mismatch",
   "target_not_found",
   "target_unavailable",
   "visibility_changed",

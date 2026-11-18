@@ -174,6 +174,15 @@ export function createLinearRegistration(
           progressProvider: createLinearProgressProvider({
             client: api,
             connectionForLinearOrganization,
+            async readRunOutputContext(scope) {
+              const run = await database.findTriggerRunForOrganization(
+                scope.organizationId,
+                scope.id,
+              );
+              if (run?.outcome === "accepted" && run.projectId === scope.projectId)
+                return run.outputContext;
+              return undefined;
+            },
             clientSecret: configuration.clientSecret,
           }),
         }),
