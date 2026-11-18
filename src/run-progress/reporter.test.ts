@@ -460,12 +460,17 @@ describe("run progress reporter", () => {
     ["locked thread", "unavailable", "locked_thread"],
     ["public repository", "refused", "public_repository"],
     ["credential rejected", "unavailable", "credential_rejected"],
+    ["reauthorization required", "unavailable", "reauthorize"],
     ["deleted message", "gone", "gone"],
   ] as const)("stops after %s without recreating", async (reason, state, code) => {
     const f = fixture();
     const run = await f.seed();
     if (reason === "absent destination") f.provider.destination = () => undefined;
-    if (reason === "locked thread" || reason === "credential rejected")
+    if (
+      reason === "locked thread" ||
+      reason === "credential rejected" ||
+      reason === "reauthorization required"
+    )
       f.provider.authorize = async () => ({ unavailable: code });
     if (reason === "public repository") f.provider.authorize = async () => ({ refused: code });
     f.start();
@@ -481,6 +486,19 @@ describe("run progress reporter", () => {
     assert.equal((await run.read())?.failure, code);
     assert.equal(f.provider.requests.length, reason === "deleted message" ? 2 : 0);
     assert.deepEqual(f.failures, [code]);
+  });
+
+  it("persists the reauthorization diagnosis from a final edit", async () => {
+    const f = fixture();
+    const run = await f.seed({ state: "active" });
+    f.provider.onWrite = () => ({ status: "unavailable", code: "reauthorize" });
+    await run.finish();
+    f.start();
+    await f.clock.advanceTo(0);
+    assert.equal((await run.read())?.state, "unavailable");
+    assert.equal((await run.read())?.failure, "reauthorize");
+    assert.equal(f.provider.requests.length, 1);
+    assert.deepEqual(f.failures, ["reauthorize"]);
   });
 
   it("keeps shutdown synchronous with an in-flight provider and stops all later sends", async () => {

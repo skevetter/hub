@@ -642,7 +642,7 @@ describe("Linear comment mutations", () => {
     const api = commentApi(async () =>
       json({
         data: { commentUpdate: { success: true } },
-        errors: [{ message: "Permission denied", extensions: { type: "Forbidden" } }],
+        errors: [{ message: "Permission denied", extensions: { code: "FORBIDDEN" } }],
       }),
     );
     await assert.rejects(
@@ -650,7 +650,7 @@ describe("Linear comment mutations", () => {
       (error) =>
         error instanceof LinearApiError &&
         error.status === 200 &&
-        error.code === "Forbidden" &&
+        error.code === "FORBIDDEN" &&
         error.retryAfterMs === undefined,
     );
   });

@@ -4,7 +4,11 @@ import { createServer } from "node:http";
 import { describe, it, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import type { LinearConnectionRecord, LinearConnectionTokenUpdate } from "../db/types.js";
-import { createLinearApiClient, LINEAR_REQUIRED_SCOPES } from "../providers/linear/client.js";
+import {
+  createLinearApiClient,
+  createLinearConnectionClient,
+  LINEAR_REQUIRED_SCOPES,
+} from "../providers/linear/client.js";
 import { createLinearProgressProvider } from "./linear.js";
 import type { ProgressDestination } from "./types.js";
 
@@ -35,7 +39,9 @@ function fixture(fetch: typeof globalThis.fetch) {
     scopes: [...LINEAR_REQUIRED_SCOPES],
   };
   const lookup = vi.fn(async () => ({ ...connection }));
-  const refresh = vi.fn(async () => ({ accessToken: "refreshed-token" }));
+  const refresh = vi.fn((_refreshToken: string, _signal?: AbortSignal) =>
+    Promise.resolve({ accessToken: "refreshed-token" }),
+  );
   const persist = vi.fn(async (tokens: LinearConnectionTokenUpdate) => {
     Object.assign(connection, tokens);
   });
@@ -133,42 +139,68 @@ describe("Linear run progress", () => {
     ]);
   });
 
+  const uncertain = { status: "retry", afterMs: 0, notCreated: false, transient: true };
+
   it.each([
     {
-      status: 400,
-      message: "Comment not found",
-      code: "INVALID_INPUT",
+      status: 404,
+      message: "Forbidden",
+      code: undefined,
+      expected: { status: "gone" },
+    },
+    {
+      status: 200,
+      message: "Lookup failed",
+      code: "ENTITY_NOT_FOUND",
       expected: { status: "gone" },
     },
     {
       status: 200,
       message: "Could not find the comment",
       code: undefined,
-      expected: { status: "gone" },
+      expected: uncertain,
     },
     {
       status: 200,
       message: "Forbidden",
       code: undefined,
+      expected: uncertain,
+    },
+    {
+      status: 200,
+      message: "Edit blocked",
+      code: "FORBIDDEN",
       expected: { status: "unavailable", code: "scope_missing" },
     },
     {
       status: 403,
-      message: "Forbidden",
-      code: "FORBIDDEN",
+      message: "Edit blocked",
+      code: undefined,
       expected: { status: "unavailable", code: "scope_missing" },
     },
     {
       status: 200,
       message: "Missing write scope",
       code: "BAD_USER_INPUT",
-      expected: { status: "unavailable", code: "scope_missing" },
+      expected: uncertain,
     },
     {
       status: 401,
-      message: "Credential expired",
+      message: "Not authorized to access Linear",
+      code: "FORBIDDEN",
+      expected: { status: "unavailable", code: "reauthorize" },
+    },
+    {
+      status: 200,
+      message: "Not authorized to access Linear",
       code: "UNAUTHENTICATED",
       expected: { status: "unavailable", code: "reauthorize" },
+    },
+    {
+      status: 500,
+      message: "Forbidden during internal processing",
+      code: "INTERNAL_SERVER_ERROR",
+      expected: uncertain,
     },
     {
       status: 400,
@@ -188,6 +220,76 @@ describe("Linear run progress", () => {
       const { provider, authorize } = fixture(fetch);
       await authorize(ref);
       assert.deepEqual(await provider.edit(ref, "Finished", signal), expected);
+      assert.equal(fetch.mock.calls.length, 1);
+    },
+  );
+
+  it.each([400, 429])(
+    "allows retry of an HTTP %i rate-limited create with no data",
+    async (status) => {
+      const fetch = vi.fn(async () =>
+        Response.json(
+          {
+            errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }],
+          },
+          { status, headers: { "retry-after": "9" } },
+        ),
+      );
+      const { provider, authorize } = fixture(fetch);
+      await authorize(destination);
+      assert.deepEqual(await provider.create(destination, "Started", signal), {
+        status: "retry",
+        afterMs: 9_000,
+        notCreated: true,
+      });
+      assert.equal(fetch.mock.calls.length, 1);
+    },
+  );
+
+  it("treats an edit transport failure as transient", async () => {
+    const fetch = vi.fn(() => Promise.reject(new TypeError("connection reset")));
+    const { provider, authorize } = fixture(fetch);
+    await authorize(ref);
+    assert.deepEqual(await provider.edit(ref, "Finished", signal), uncertain);
+    assert.equal(fetch.mock.calls.length, 1);
+  });
+
+  it("requires reauthorization when the refresh token grant is invalid", async () => {
+    const fetch = vi.fn(neverFetch);
+    const { provider, connection, authorize, refresh, persist } = fixture(fetch);
+    connection.accessTokenExpiresAt = new Date(0);
+    const oauth = vi.fn(async () => Response.json({ error: "invalid_grant" }, { status: 400 }));
+    const connectionClient = createLinearConnectionClient({
+      clientId: "fake-client",
+      clientSecret: "fake-secret",
+      publicBaseUrl: "https://hub.test",
+      fetch: oauth,
+    });
+    refresh.mockImplementationOnce((token, abort) => connectionClient.refresh(token, abort));
+    await authorize(ref);
+    assert.deepEqual(await provider.edit(ref, "Finished", signal), {
+      status: "unavailable",
+      code: "reauthorize",
+    });
+    assert.equal(oauth.mock.calls.length, 1);
+    assert.equal(persist.mock.calls.length, 0);
+    assert.equal(fetch.mock.calls.length, 0);
+  });
+
+  it.each([200, 422])(
+    "keeps a rate-limit code on HTTP %i uncertain even without data",
+    async (status) => {
+      const fetch = vi.fn(async () =>
+        Response.json(
+          {
+            errors: [{ message: "Rate limited", extensions: { code: "RATELIMITED" } }],
+          },
+          { status },
+        ),
+      );
+      const { provider, authorize } = fixture(fetch);
+      await authorize(destination);
+      assert.deepEqual(await provider.create(destination, "Started", signal), uncertain);
       assert.equal(fetch.mock.calls.length, 1);
     },
   );
@@ -264,7 +366,7 @@ describe("Linear run progress", () => {
     const fetch = vi.fn(async () => new Response("error", { status: 503 }));
     const { provider, authorize } = fixture(fetch);
     await authorize(destination);
-    await assert.rejects(provider.create(destination, "Started", signal), /HTTP 503/u);
+    assert.deepEqual(await provider.create(destination, "Started", signal), uncertain);
     assert.equal(fetch.mock.calls.length, 1);
   });
 

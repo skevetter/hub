@@ -24,6 +24,8 @@ const LinearTokenResponseSchema = z
   })
   .passthrough();
 
+const OAuthErrorSchema = z.object({ error: z.string() });
+
 const ViewerResponseSchema = z.object({
   data: z.object({
     viewer: z.object({
@@ -33,10 +35,10 @@ const ViewerResponseSchema = z.object({
   }),
 });
 
-const GraphqlErrorsSchema = z.object({ errors: z.array(z.unknown()).min(1) });
+const GraphqlErrorsSchema = z.object({ errors: z.array(z.unknown()) });
 const GraphqlErrorSchema = z.object({
   message: z.string().optional(),
-  extensions: z.object({ code: z.string().optional(), type: z.string().optional() }).optional(),
+  extensions: z.object({ code: z.string().optional() }).optional(),
 });
 
 const IssueResponseSchema = z.object({
@@ -109,7 +111,6 @@ export class LinearApiError extends Error {
     readonly status: number,
     readonly code?: string,
     readonly retryAfterMs?: number,
-    readonly graphqlMessage?: string,
     readonly hasPartialData = false,
   ) {
     super(message);
@@ -572,8 +573,7 @@ async function exchangeToken(
   accessTokenExpiresAt?: Date;
   scopes?: string[];
 }> {
-  signal?.throwIfAborted();
-  const response = await request("https://api.linear.app/oauth/token", {
+  const response = await linearRequest(request, "https://api.linear.app/oauth/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -584,8 +584,14 @@ async function exchangeToken(
     ...(signal === undefined ? {} : { signal }),
   });
   if (!response.ok) {
-    discardResponseBody(response);
-    throw new Error(`Linear OAuth HTTP ${response.status}`);
+    if (signal !== undefined && response.status === 400) {
+      const error = OAuthErrorSchema.safeParse(await readApiResponseJson(response, signal));
+      if (error.success && error.data.error === "invalid_grant")
+        throw new LinearCredentialError("reauthorize");
+    } else {
+      discardResponseBody(response);
+    }
+    throw new LinearApiError(`Linear OAuth HTTP ${response.status}`, response.status);
   }
   const token = LinearTokenResponseSchema.parse(await readResponseJson(response, signal));
   return {
@@ -615,8 +621,7 @@ async function graphql(
   options: { mutation?: true; signal?: AbortSignal | undefined; now?: () => Date } = {},
 ): Promise<unknown> {
   const { signal, mutation, now = () => new Date() } = options;
-  signal?.throwIfAborted();
-  const response = await request("https://api.linear.app/graphql", {
+  const response = await linearRequest(request, "https://api.linear.app/graphql", {
     method: "POST",
     headers: {
       authorization: `Bearer ${accessToken}`,
@@ -625,24 +630,29 @@ async function graphql(
     body: JSON.stringify(payload),
     ...(mutation ? { redirect: "error" } : {}),
     ...(signal === undefined ? {} : { signal }),
-  }).catch((error: unknown) => {
-    if (signal?.aborted) throw error;
-    throw new LinearTransportError(error);
   });
   if (!response.ok && (signal === undefined || response.status >= 500)) {
     discardResponseBody(response);
     throw new LinearApiError(`Linear GraphQL HTTP ${response.status}`, response.status);
   }
-  const result = await readGraphqlBody(response, signal);
+  const result = await readApiResponseJson(response, signal);
   checkGraphqlResponse(response, result, now);
   return result;
+}
+
+function linearRequest(request: typeof fetch, url: string, init: RequestInit): Promise<Response> {
+  init.signal?.throwIfAborted();
+  return request(url, init).catch((error: unknown) => {
+    if (init.signal?.aborted) throw error;
+    throw new LinearTransportError(error);
+  });
 }
 
 function discardResponseBody(response: Response): void {
   void response.body?.cancel().catch(() => undefined);
 }
 
-async function readGraphqlBody(response: Response, signal?: AbortSignal): Promise<unknown> {
+async function readApiResponseJson(response: Response, signal?: AbortSignal): Promise<unknown> {
   try {
     return await readResponseJson(response, signal);
   } catch (error) {
@@ -707,9 +717,9 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
         return error.success ? [error.data] : [];
       })
     : [];
-  const errorCode = (error: (typeof errors)[number]) =>
-    error.extensions?.code ?? error.extensions?.type;
-  const rateLimited = errors.find((error) => errorCode(error)?.toUpperCase() === "RATELIMITED");
+  const rateLimited = errors.find(
+    ({ extensions }) => extensions?.code?.toUpperCase() === "RATELIMITED",
+  );
   const error = rateLimited ?? errors[0];
   if (!response.ok || envelope.success) {
     const delay =
@@ -721,9 +731,8 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
         ? `Linear GraphQL ${error?.message ?? "response contained errors"}`
         : `Linear GraphQL HTTP ${response.status}`,
       response.status,
-      error === undefined ? undefined : errorCode(error),
+      error?.extensions?.code,
       delay,
-      error?.message,
       result != null && typeof result === "object" && "data" in result && result.data != null,
     );
   }

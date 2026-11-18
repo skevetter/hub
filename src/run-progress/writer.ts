@@ -166,10 +166,15 @@ function uncertain(outcome: MutationOutcome): boolean {
   return typeof outcome === "string" || (outcome.status === "retry" && outcome.transient === true);
 }
 const FAILURE_CODES = new Set([
+  "body_contains_secret",
   "connection_not_owned",
+  "connection_unavailable",
   "credential_rejected",
   "edit_window_closed",
   "installation_not_owned",
+  "invalid_credential",
+  "invalid_destination",
+  "invalid_reference",
   "locked",
   "locked_thread",
   "missing_scope",
@@ -179,6 +184,7 @@ const FAILURE_CODES = new Set([
   "org_not_mapped",
   "public_repo",
   "public_repository",
+  "reauthorize",
   "repo_not_allowed",
   "scope_missing",
   "sso_required",

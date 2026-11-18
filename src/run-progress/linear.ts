@@ -128,19 +128,6 @@ export function createLinearProgressProvider(options: LinearProgressOptions): Pr
 
 const targetMismatch = { status: "refused", code: "target_mismatch" } as const;
 
-const permissionErrorCodes = new Set([
-  "FORBIDDEN",
-  "PERMISSIONDENIED",
-  "INSUFFICIENTSCOPE",
-  "INVALIDSCOPE",
-  "ACCESSDENIED",
-]);
-const missingTargetCodes = new Set(["NOTFOUND", "ENTITYNOTFOUND"]);
-const permissionErrorMessage =
-  /\b(?:forbidden|access denied|not (?:authorized|allowed) to)\b|\b(?:scope|permission)s?\b.*\b(?:required|missing|denied)\b|\b(?:required|missing|insufficient)\b.*\b(?:scope|permission)s?\b/iu;
-const missingTargetMessage =
-  /\b(?:comment|issue|entity)\b.{0,80}\b(?:not found|does not exist)\b|\b(?:could not|cannot) find (?:the )?(?:comment|issue|entity)\b/iu;
-
 const uncertainWrite = { status: "retry", afterMs: 0, notCreated: false, transient: true } as const;
 
 function mapCreateError(error: unknown): ProgressCall {
@@ -159,21 +146,38 @@ function mapWriteError(error: unknown): ProgressCall {
       ? { status: "refused", code: error.code }
       : { status: "unavailable", code: error.code };
   }
-  if (error instanceof LinearApiError) {
-    const code = (error.code ?? "").replaceAll("_", "").toUpperCase();
-    const message = error.graphqlMessage ?? error.message;
-    if (error.status === 429 || code === "RATELIMITED")
-      return { status: "retry", afterMs: error.retryAfterMs ?? 30_000, notCreated: true };
-    if (
-      error.status === 403 ||
-      permissionErrorCodes.has(code) ||
-      permissionErrorMessage.test(message)
-    )
-      return { status: "unavailable", code: "scope_missing" };
-    if (error.status === 401 || code === "UNAUTHENTICATED" || code === "AUTHENTICATIONERROR")
+  if (!(error instanceof LinearApiError)) throw error;
+  if (error.status >= 500) return uncertainWrite;
+  switch (error.status) {
+    case 401:
       return { status: "unavailable", code: "reauthorize" };
-    if (error.status === 404 || missingTargetCodes.has(code) || missingTargetMessage.test(message))
+    case 403:
+      return { status: "unavailable", code: "scope_missing" };
+    case 404:
       return { status: "gone" };
+    case 429:
+      return rateLimited(error);
   }
-  throw error;
+  switch (error.code?.toUpperCase()) {
+    case "UNAUTHENTICATED":
+      return { status: "unavailable", code: "reauthorize" };
+    case "FORBIDDEN":
+      return { status: "unavailable", code: "scope_missing" };
+    case "NOT_FOUND":
+    case "ENTITY_NOT_FOUND":
+    case "ENTITYNOTFOUND":
+      return { status: "gone" };
+    case "RATELIMITED":
+      return rateLimited(error);
+    default:
+      return uncertainWrite;
+  }
+}
+
+function rateLimited(error: LinearApiError): ProgressCall {
+  return {
+    status: "retry",
+    afterMs: error.retryAfterMs ?? 30_000,
+    notCreated: !error.hasPartialData && (error.status === 429 || error.status === 400),
+  };
 }
