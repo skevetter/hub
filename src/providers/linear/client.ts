@@ -12,6 +12,8 @@ export const LINEAR_REQUIRED_SCOPES = [
 export const LINEAR_ISSUE_CONTEXT_LIMIT = 50;
 export const LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT = LINEAR_ISSUE_CONTEXT_LIMIT - 1;
 const LINEAR_ACCESS_TOKEN_REFRESH_SKEW_MS = 60_000;
+const LINEAR_RESPONSE_BODY_LIMIT_BYTES = 1024 * 1024;
+const LINEAR_RESPONSE_BODY_TIMEOUT_MS = 5_000;
 
 const LinearTokenResponseSchema = z
   .object({
@@ -581,8 +583,11 @@ async function exchangeToken(
     }),
     ...(signal === undefined ? {} : { signal }),
   });
-  if (!response.ok) throw new Error(`Linear OAuth HTTP ${response.status}`);
-  const token = LinearTokenResponseSchema.parse(await response.json());
+  if (!response.ok) {
+    discardResponseBody(response);
+    throw new Error(`Linear OAuth HTTP ${response.status}`);
+  }
+  const token = LinearTokenResponseSchema.parse(await readResponseJson(response, signal));
   return {
     accessToken: token.access_token,
     ...(token.refresh_token === undefined ? {} : { refreshToken: token.refresh_token }),
@@ -624,14 +629,74 @@ async function graphql(
     if (signal?.aborted) throw error;
     throw new LinearTransportError(error);
   });
-  let result: unknown;
-  try {
-    result = await response.json();
-  } catch (error) {
-    if (response.ok || signal?.aborted) throw error;
+  if (!response.ok && (signal === undefined || response.status >= 500)) {
+    discardResponseBody(response);
+    throw new LinearApiError(`Linear GraphQL HTTP ${response.status}`, response.status);
   }
+  const result = await readGraphqlBody(response, signal);
   checkGraphqlResponse(response, result, now);
   return result;
+}
+
+function discardResponseBody(response: Response): void {
+  void response.body?.cancel().catch(() => undefined);
+}
+
+async function readGraphqlBody(response: Response, signal?: AbortSignal): Promise<unknown> {
+  try {
+    return await readResponseJson(response, signal);
+  } catch (error) {
+    if (response.ok || signal?.aborted || !(error instanceof SyntaxError)) throw error;
+    return undefined;
+  }
+}
+
+async function readResponseJson(response: Response, signal?: AbortSignal): Promise<unknown> {
+  if (signal?.aborted) {
+    discardResponseBody(response);
+    signal.throwIfAborted();
+  }
+  const reader = response.body?.getReader();
+  if (reader === undefined) return undefined;
+  const { promise, reject } = Promise.withResolvers<never>();
+  const deadline = performance.now() + LINEAR_RESPONSE_BODY_TIMEOUT_MS;
+  const timeout = () => new Error("Linear response body read timed out");
+  const timer = setTimeout(() => reject(timeout()), LINEAR_RESPONSE_BODY_TIMEOUT_MS);
+  const abort = () => reject(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
+  let body: string;
+  try {
+    body = await Promise.race([readResponseBody(reader, deadline, timeout), promise]);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    throw new LinearTransportError(error);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    void reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+  const value: unknown = JSON.parse(body);
+  return value;
+}
+
+async function readResponseBody(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  deadline: number,
+  timeout: () => Error,
+): Promise<string> {
+  const decoder = new TextDecoder();
+  let body = "";
+  let bytes = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (performance.now() >= deadline) throw timeout();
+    if (done) return body + decoder.decode();
+    bytes += value.byteLength;
+    if (bytes > LINEAR_RESPONSE_BODY_LIMIT_BYTES)
+      throw new Error("Linear response body exceeds 1 MiB");
+    body += decoder.decode(value, { stream: true });
+  }
 }
 
 function checkGraphqlResponse(response: Response, result: unknown, now: () => Date): void {

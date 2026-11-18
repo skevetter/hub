@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 import type {
   Database,
   LinearConnectionRecord,
@@ -12,6 +12,8 @@ import {
   createLinearConnectionClient,
   hasRequiredLinearScopes,
   LinearApiError,
+  LinearTransportError,
+  LINEAR_REQUIRED_SCOPES,
   type LinearApiClient,
   linearConnectionRequiresReauthorization,
 } from "./client.js";
@@ -524,6 +526,18 @@ describe("Linear connection client", () => {
   });
 });
 
+const progressWrite = {
+  binding: {
+    id: "connection",
+    organizationId: "hub-org",
+    linearOrganizationId: "linear-org",
+    providerApplicationId: "linear-app",
+    appUserId: "app-user",
+  },
+  signal: new AbortController().signal,
+};
+const commentInput = { linearOrganizationId: "linear-org", issueId: "issue", body: "Run" };
+
 describe("Linear comment mutations", () => {
   it("updates the comment using the stored id and the new body", async () => {
     const api = commentApi(async (_url, init) => {
@@ -567,7 +581,7 @@ describe("Linear comment mutations", () => {
         );
       });
       await assert.rejects(
-        api.createComment({ linearOrganizationId: "linear-org", issueId: "issue", body: "Run" }),
+        api.createComment(commentInput, progressWrite),
         (error) =>
           error instanceof LinearApiError &&
           error.status === status &&
@@ -577,6 +591,52 @@ describe("Linear comment mutations", () => {
       assert.equal(requests, 1);
     },
   );
+
+  it.each([undefined, progressWrite])(
+    "fails on 503 headers without reading an open body",
+    async (write) => {
+      const stream = openBody();
+      const api = commentApi(async () => new Response(stream.body, { status: 503 }));
+      await assert.rejects(
+        api.createComment(commentInput, write),
+        (error) => error instanceof LinearApiError && error.status === 503,
+      );
+      assert.equal(stream.pull.mock.calls.length, 0);
+      assert.equal(stream.cancel.mock.calls.length, 1);
+    },
+  );
+
+  it.each([200, 429])("limits the size of an HTTP %i response body", async (status) => {
+    const api = commentApi(async () => new Response("x".repeat(1024 * 1024 + 1), { status }));
+    await assert.rejects(
+      api.createComment(commentInput, progressWrite),
+      (error) =>
+        error instanceof LinearTransportError &&
+        error.cause instanceof Error &&
+        /exceeds 1 MiB/u.test(error.cause.message),
+    );
+  });
+
+  it.each([200, 429])("cancels an open HTTP %i body at the read deadline", async (status) => {
+    vi.useFakeTimers();
+    try {
+      const stream = openBody();
+      const api = commentApi(async () => new Response(stream.body, { status }));
+      const failed = assert.rejects(
+        api.createComment(commentInput, progressWrite),
+        (error) =>
+          error instanceof LinearTransportError &&
+          error.cause instanceof Error &&
+          /timed out/u.test(error.cause.message),
+      );
+      await vi.advanceTimersByTimeAsync(5_000);
+      await failed;
+      assert.equal(stream.pull.mock.calls.length, 1);
+      assert.equal(stream.cancel.mock.calls.length, 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("reports GraphQL errors even when Linear returns HTTP 200 and data", async () => {
     const api = commentApi(async () =>
@@ -596,6 +656,13 @@ describe("Linear comment mutations", () => {
   });
 });
 
+function openBody() {
+  const pull = vi.fn(() => new Promise<void>(() => {}));
+  const cancel = vi.fn();
+  const body = new ReadableStream<Uint8Array>({ pull, cancel }, { highWaterMark: 0 });
+  return { body, pull, cancel };
+}
+
 function commentApi(fetch: typeof globalThis.fetch): LinearApiClient {
   const connection: LinearConnectionRecord = {
     id: "connection",
@@ -608,7 +675,7 @@ function commentApi(fetch: typeof globalThis.fetch): LinearApiClient {
     accessToken: "access-token",
     refreshToken: null,
     accessTokenExpiresAt: null,
-    scopes: ["comments:create", "read"],
+    scopes: [...LINEAR_REQUIRED_SCOPES],
   };
   return createLinearApiClient({
     connectionForLinearOrganization: async () => connection,
