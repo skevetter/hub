@@ -130,6 +130,7 @@ export class LinearTransportError extends Error {
 const credentialErrorMessages = {
   connection_unavailable: "Linear connection unavailable",
   connection_not_owned: "Linear connection belongs to another Hub organization",
+  scope_missing: "Linear progress connection lacks the write scope",
   reauthorize: "Linear connection requires reauthorization",
   body_contains_secret: "Linear progress body contains the access token",
 } as const;
@@ -367,6 +368,7 @@ export function createLinearApiClient(options: {
       connection.appUserId !== binding.appUserId
     )
       throw new LinearCredentialError("connection_not_owned");
+    if (!connection.scopes.includes("write")) throw new LinearCredentialError("scope_missing");
     if (linearConnectionRequiresReauthorization(connection, now()))
       throw new LinearCredentialError("reauthorize");
   };

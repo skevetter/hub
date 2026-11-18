@@ -2,15 +2,21 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { describe, it, vi } from "vitest";
+import { createApplicationRuntime } from "../application-runtime.js";
 import { createMemoryDatabase } from "../db/memory.js";
-import type { LinearConnectionRecord, LinearConnectionTokenUpdate } from "../db/types.js";
+import type { Database, LinearConnectionRecord, LinearConnectionTokenUpdate } from "../db/types.js";
+import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
+import { logger } from "../logger.js";
 import {
   createLinearApiClient,
   createLinearConnectionClient,
   LINEAR_REQUIRED_SCOPES,
 } from "../providers/linear/client.js";
+import { CredentialBackoff } from "./backoff.js";
 import { createLinearProgressProvider } from "./linear.js";
-import type { ProgressDestination } from "./types.js";
+import { readRunProgressSettings } from "./settings.js";
+import { progressClock, type ProgressDestination } from "./types.js";
+import { MessageWriter } from "./writer.js";
 
 const scope = { id: "run", organizationId: "hub-org", projectId: "project" };
 const credential = { kind: "linear-organization", linearOrganizationId: "linear-org" } as const;
@@ -36,7 +42,7 @@ function fixture(fetch: typeof globalThis.fetch) {
     accessToken: "fake-access-token",
     refreshToken: "fake-refresh-token",
     accessTokenExpiresAt: null,
-    scopes: [...LINEAR_REQUIRED_SCOPES],
+    scopes: [...LINEAR_REQUIRED_SCOPES, "write"],
   };
   const lookup = vi.fn(async () => ({ ...connection }));
   const refresh = vi.fn((_refreshToken: string, _signal?: AbortSignal) =>
@@ -74,12 +80,148 @@ function fixture(fetch: typeof globalThis.fetch) {
   async function authorize(target: ProgressDestination) {
     assert.equal(await provider.authorize(target.credential, scope, signal), "ok");
   }
-  return { provider, connection, lookup, refresh, persist, lock, authorize };
+  return { provider, connection, lookup, refresh, persist, lock, authorize, database };
 }
 
-const neverFetch = () => Promise.reject(new Error("unexpected Linear request"));
+const neverFetch = (): Promise<Response> => Promise.reject(new Error("unexpected Linear request"));
+
+async function seedRun(database: Database) {
+  const { run } = await database.createAcceptedTriggerRun({
+    organizationId: scope.organizationId,
+    projectId: scope.projectId,
+    configurationRevisionId: "revision",
+    providerEventReceiptId: "receipt",
+    configuredTriggerName: "test",
+    prompt: "",
+    inputs: {},
+    triggerContext: {},
+    outputContext,
+    stepIds: [],
+    deadlineAt: new Date(Date.now() + 60_000),
+  });
+  return run;
+}
+
+async function seedProgress(database: Database) {
+  const run = await seedRun(database);
+  const message = { organizationId: run.organizationId, triggerRunId: run.id };
+  const now = new Date();
+  await database.appendRunTimelineEvent({
+    ...message,
+    at: now,
+    kind: "run_started",
+    origin: "captured",
+    data: {},
+    maxEvents: 500,
+  });
+  await database.insertRunProgressMessageIfAbsent({ ...message, provider: "linear", now });
+  const writer = new MessageWriter({
+    database,
+    clock: progressClock,
+    settings: readRunProgressSettings({}),
+    signal,
+    backoff: new CredentialBackoff(),
+    report: () => undefined,
+  });
+  return {
+    message,
+    writer,
+    read: () => database.findRunProgressMessage(run.organizationId, run.id),
+  };
+}
 
 describe("Linear run progress", () => {
+  it.each(["create", "edit", "final"] as const)(
+    "persists a missing write scope before attempting %s",
+    async (operation) => {
+      const fetch = vi.fn(neverFetch);
+      const { provider, connection, database, refresh } = fixture(fetch);
+      const { message, writer, read } = await seedProgress(database);
+      if (operation !== "create") {
+        const now = new Date();
+        const owner = "seed";
+        const lease = await database.acquireRunProgressLease({ ...message, now, owner });
+        assert.ok(lease);
+        await database.updateRunProgressMessage({
+          ...message,
+          now,
+          owner,
+          version: lease.version,
+          patch: { state: "active", externalRef: ref },
+        });
+      }
+      if (operation === "final") await database.succeedTriggerRun(message.triggerRunId);
+      connection.scopes = [...LINEAR_REQUIRED_SCOPES];
+      connection.accessTokenExpiresAt = new Date(0);
+      const admit = vi.spyOn(database, "admitProgressWrite");
+      await writer.write(message, provider);
+      const row = await read();
+      assert.equal(row?.state, "unavailable");
+      assert.equal(row.failure, "scope_missing");
+      assert.equal(admit.mock.calls.length, 0);
+      assert.equal(refresh.mock.calls.length, 0);
+      assert.equal(fetch.mock.calls.length, 0);
+    },
+  );
+
+  it("warns once without provider content when Linear refuses an edit after creation", async () => {
+    const providerContent = "provider details with fake-access-token";
+    const fetch = vi
+      .fn(neverFetch)
+      .mockResolvedValueOnce(
+        Response.json({ data: { commentCreate: { success: true, comment: { id: "comment" } } } }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          errors: [{ message: providerContent, extensions: { code: "FORBIDDEN" } }],
+        }),
+      );
+    const { provider, database } = fixture(fetch);
+    const { message, writer, read } = await seedProgress(database);
+    assert.equal((await writer.write(message, provider)).row?.state, "active");
+    await database.succeedTriggerRun(message.triggerRunId);
+
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(logger, "error").mockImplementation(() => undefined);
+    vi.useFakeTimers();
+    let runtime: Awaited<ReturnType<typeof createApplicationRuntime>> | undefined;
+    try {
+      runtime = await createApplicationRuntime({
+        database,
+        auth: null,
+        entitlements: createUnlimitedEntitlementsService(),
+        billing: null,
+        progressProviders: [provider],
+        runProgress: readRunProgressSettings({
+          PASEO_HUB_RUN_TIMELINE: "true",
+          PASEO_HUB_PROGRESS_MESSAGES: "true",
+        }),
+        close: async () => undefined,
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      assert.equal((await read())?.state, "unavailable");
+      assert.equal((await read())?.failure, "scope_missing");
+      assert.equal(fetch.mock.calls.length, 2);
+      const warnings = warn.mock.calls.filter(
+        ([, summary]) => summary === "run.progress.reporter failed",
+      );
+      assert.equal(warnings.length, 1);
+      const record = JSON.stringify(warnings[0]);
+      assert.match(record, /permissionMissing/u);
+      assert.match(record, /scope_missing/u);
+      assert.doesNotMatch(record, /provider details|fake-access-token|Paseo run:/u);
+      assert.equal(
+        error.mock.calls.filter(([, summary]) => summary === "run.progress.reporter failed").length,
+        0,
+      );
+    } finally {
+      await runtime?.stop();
+      vi.useRealTimers();
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+
   it("uses the stored issue destination and edits the same comment through completion", async () => {
     const replies = [
       { commentCreate: { success: true, comment: { id: "comment" } } },
@@ -97,19 +239,7 @@ describe("Linear run progress", () => {
       bodies.push(payload.variables);
       return Response.json({ data: replies.shift() });
     });
-    const { run } = await createMemoryDatabase().createAcceptedTriggerRun({
-      organizationId: scope.organizationId,
-      projectId: scope.projectId,
-      configurationRevisionId: "revision",
-      providerEventReceiptId: "receipt",
-      configuredTriggerName: "test",
-      prompt: "",
-      inputs: {},
-      triggerContext: {},
-      outputContext,
-      stepIds: [],
-      deadlineAt: new Date(Date.now() + 60_000),
-    });
+    const run = await seedRun(createMemoryDatabase());
     const target = provider.destination(run);
     assert.deepEqual(target, destination);
     assert.equal(
@@ -579,6 +709,19 @@ describe("Linear run progress", () => {
     assert.deepEqual(await edit, { status: "ok" });
     assert.equal(refresh.mock.calls.length, 0);
     assert.equal(fetch.mock.calls.length, 1);
+  });
+
+  it("refuses to create when the final lookup sees that write was removed", async () => {
+    const fetch = vi.fn(neverFetch);
+    const { provider, connection, authorize, lookup } = fixture(fetch);
+    await authorize(destination);
+    lookup.mockResolvedValueOnce({ ...connection });
+    connection.scopes = [...LINEAR_REQUIRED_SCOPES];
+    assert.deepEqual(await provider.create(destination, "Started", signal), {
+      status: "unavailable",
+      code: "scope_missing",
+    });
+    assert.equal(fetch.mock.calls.length, 0);
   });
 
   it("refuses to send the refreshed access token in a progress body", async () => {

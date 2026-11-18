@@ -42,8 +42,9 @@ That includes the 120-second settle delay and two 25-second operation budgets.
 
 With the reporter enabled and the Linear integration configured, an opted-in Linear run
 creates a Paseo app comment on the source issue and edits it as the run advances.
-The Linear connection must grant the app token permission to edit its own comments.
-Verify this in a live Linear workspace before enabling progress messages for Linear runs.
+The Linear reporter requires a connection with the `write` scope before it can post or edit
+comments. Current connections lack that scope, so the reporter skips Linear runs until the
+owner reauthorizes the connection with `write`.
 
 Hub refuses an edit with `target_mismatch` when the stored issue or workspace differs from
 the run's Linear destination, or when the stored reference lacks the bound issue or workspace.

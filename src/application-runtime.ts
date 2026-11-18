@@ -441,7 +441,17 @@ function createProgressReporter(
           component: "run-progress",
           ...(scope === undefined ? {} : { organizationId: scope.organizationId }),
         },
-        scope === undefined ? {} : { diagnostic: { triggerRunId: scope.triggerRunId } },
+        {
+          ...(code === "scope_missing" ? { kind: "permissionMissing" } : {}),
+          ...(scope === undefined
+            ? {}
+            : {
+                diagnostic: {
+                  triggerRunId: scope.triggerRunId,
+                  ...(code === "scope_missing" ? { reason: code } : {}),
+                },
+              }),
+        },
       ),
   });
   return {

@@ -69,6 +69,7 @@ export function createLinearProgressProvider(options: LinearProgressOptions): Pr
         return { refused: "target_mismatch" };
       if (connection.organizationId !== run.organizationId)
         return { refused: "connection_not_owned" };
+      if (!connection.scopes.includes("write")) return { unavailable: "scope_missing" };
       if (linearConnectionRequiresReauthorization(connection))
         return { unavailable: "reauthorize" };
       authorized.set(locator, { connection, issueId: context.data.issueId });

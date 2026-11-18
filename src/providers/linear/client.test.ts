@@ -675,7 +675,7 @@ function commentApi(fetch: typeof globalThis.fetch): LinearApiClient {
     accessToken: "access-token",
     refreshToken: null,
     accessTokenExpiresAt: null,
-    scopes: [...LINEAR_REQUIRED_SCOPES],
+    scopes: [...LINEAR_REQUIRED_SCOPES, "write"],
   };
   return createLinearApiClient({
     connectionForLinearOrganization: async () => connection,
