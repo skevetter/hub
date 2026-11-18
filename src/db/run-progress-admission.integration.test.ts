@@ -24,6 +24,39 @@ describe("pooled progress admission", () => {
     return { runId: run.id, cutoff: new Date(completed.run.completedAt.getTime() + 1) };
   }
 
+  it("persists the original GitHub binding with the create reservation", async () => {
+    const { database } = harness;
+    const run = await harness.createRun();
+    const scope = { organizationId: TIMELINE_ORGANIZATION, triggerRunId: run.id, now: new Date() };
+    await database.insertRunProgressMessageIfAbsent({ ...scope, provider: "github" });
+    const owner = "original-writer";
+    const lease = await database.acquireRunProgressLease({ ...scope, owner });
+    assert.ok(lease);
+    const createReference = {
+      credential: { kind: "installation", installationId: 11 },
+      connectionId: "original-binding",
+      repository: "acme/widgets",
+      repositoryId: 31,
+      issueNumber: 9,
+    };
+    assert.deepEqual(
+      await database.admitProgressWrite({
+        ...scope,
+        owner,
+        version: lease.version,
+        state: "pending",
+        key: "installation-11",
+        reservation: "create",
+        createReference,
+      }),
+      { status: "admitted" },
+    );
+    const restarted = await harness.connect();
+    const reserved = await restarted.database.findRunProgressMessage(scope.organizationId, run.id);
+    assert.equal(reserved?.state, "creating");
+    assert.deepEqual(reserved?.externalRef, createReference);
+  });
+
   it("refuses admission after waiting for a retention transaction to tombstone the run", async () => {
     const { runId, cutoff } = await completedRun();
     const locked = Promise.withResolvers<void>();

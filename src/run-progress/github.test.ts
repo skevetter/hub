@@ -87,6 +87,7 @@ async function fixture(path: "app" | "token" = "token") {
     nextWrite: undefined as Response | undefined,
     writeError: undefined as Error | undefined,
     onRefresh: () => {},
+    respond: (_request: Request): Response | undefined => undefined,
   };
   const fetch: typeof globalThis.fetch = async (input, init) => {
     const request = new Request(input, init);
@@ -105,6 +106,8 @@ async function fixture(path: "app" | "token" = "token") {
       request.headers.get("authorization"),
       path === "token" ? `Bearer ${progressToken}` : `token ${installationToken}`,
     );
+    const override = state.respond(request);
+    if (override !== undefined) return override;
     if (request.method === "GET") {
       const headers = { "x-oauth-scopes": state.oauthScopes };
       if (url.pathname === repoPath) {
@@ -194,7 +197,12 @@ async function fixture(path: "app" | "token" = "token") {
   }
   const run = await createRun();
   const target = provider.destination(run)!;
-  const ref: StoredRef = { ...target, repositoryId: 31, commentId: 18 };
+  const ref: StoredRef = {
+    ...target,
+    repositoryId: 31,
+    commentId: 18,
+    ...(path === "app" ? { connectionId: connection.id } : {}),
+  };
   const scope = { organizationId, triggerRunId: run.id };
   const authorize = async (writeRef = ref, using = provider) =>
     assert.equal(await using.authorize(writeRef.credential, run, signal), "ok");
@@ -665,6 +673,159 @@ describe("GitHub run progress", () => {
     },
   );
 
+  it("stops visibility retries when the installation is revoked during the first read", async () => {
+    const f = await fixture("app");
+    await f.seed();
+    f.state.respond = (request) => {
+      if (new URL(request.url).pathname !== repoPath) return undefined;
+      f.lookup.mockResolvedValue(undefined);
+      return Response.json({});
+    };
+    await f.writer().write(f.scope, f.provider);
+    assert.equal((await f.read())?.failure, "installation_not_owned");
+    assert.equal(f.requests.filter(({ method }) => method === "GET").length, 1);
+    assert.equal(f.mutations().length, 0);
+  });
+
+  it("guards the locked-issue follow-up after a mutation", async () => {
+    const f = await fixture("app");
+    await f.seed();
+    f.state.respond = (request) => {
+      if (new URL(request.url).pathname !== commentsPath) return undefined;
+      f.lookup.mockResolvedValue(undefined);
+      return Response.json({ message: "forbidden" }, { status: 403 });
+    };
+    await f.writer().write(f.scope, f.provider);
+    assert.equal((await f.read())?.failure, "installation_not_owned");
+    assert.equal(
+      f.requests.some(({ url }) => new URL(url).pathname === issuePath),
+      false,
+    );
+    assert.equal(f.mutations().length, 1);
+  });
+
+  it.each([
+    ["issue", { issueNumber: 42 }],
+    ["repository", { repository: "other/widgets" }],
+    ["credential", { credential: { kind: "installation", installationId: 12 } }],
+  ] as const)(
+    "refuses a mismatched stored %s before initializing the app client",
+    async (_label, patch) => {
+      const f = await fixture("app");
+      await f.seed();
+      await f.writer().write(f.scope, f.provider);
+      const scope = { ...f.scope, now: new Date(f.clock.now()), owner: "test-edit" };
+      const lease = await f.database.acquireRunProgressLease(scope);
+      assert.ok(lease);
+      await f.database.updateRunProgressMessage({
+        ...scope,
+        version: lease.version,
+        patch: { externalRef: { ...f.ref, ...patch } },
+      });
+      await f.database.succeedTriggerRun(f.run.id);
+      f.requests.length = 0;
+      f.install.mockClear();
+      await f.writer().write(f.scope, f.makeProvider());
+      assert.equal((await f.read())?.failure, "target_mismatch");
+      assert.equal(f.requests.length, 0);
+      assert.equal(f.install.mock.calls.length, 0);
+    },
+  );
+
+  it.each(["edit", "recover"] as const)(
+    "refuses to %s a comment after the App is reconnected",
+    async (operation) => {
+      const f = await fixture("app");
+      await f.seed();
+      if (operation === "recover") loseCreateResult(f);
+      await f.writer().write(f.scope, f.provider);
+      assert.equal((await f.read())?.state, operation === "edit" ? "active" : "creating");
+      const reserved = (await f.read())?.externalRef;
+      assert.ok(reserved && typeof reserved === "object" && "connectionId" in reserved);
+      assert.equal(reserved["connectionId"], "connection");
+      f.advance(60_000);
+      f.connection.id = "replacement";
+      f.repository.connectionId = "replacement";
+      if (operation === "edit") await f.database.succeedTriggerRun(f.run.id);
+      f.requests.length = 0;
+      await f.writer().write(f.scope, f.makeProvider());
+      assert.equal((await f.read())?.state, "refused");
+      assert.equal((await f.read())?.failure, "connection_replaced");
+      assert.equal(f.requests.length, 0);
+    },
+  );
+
+  it("edits the original comment after a token refresh on the same connection", async () => {
+    const f = await fixture("app");
+    await f.seed();
+    await f.writer().write(f.scope, f.provider);
+    f.advance(3600_000);
+    await f.database.succeedTriggerRun(f.run.id);
+    await f.writer().write(f.scope, f.makeProvider());
+    assert.equal((await f.read())?.state, "finished");
+    assert.equal(f.requests.filter(({ url }) => url.endsWith("/access_tokens")).length, 2);
+    assert.deepEqual(
+      f.mutations().map(({ method }) => method),
+      ["POST", "PATCH"],
+    );
+  });
+
+  it("guards recovery reads after an actor response revokes the binding", async () => {
+    const f = await fixture("app");
+    await f.seed();
+    loseCreateResult(f);
+    await f.writer().write(f.scope, f.provider);
+    f.advance(60_000);
+    f.state.respond = (request) => {
+      if (decodeURIComponent(new URL(request.url).pathname) !== "/users/paseo[bot]")
+        return undefined;
+      f.lookup.mockResolvedValue(undefined);
+      return Response.json({ id: 23 });
+    };
+    await f.writer().write(f.scope, f.makeProvider());
+    assert.equal((await f.read())?.state, "refused");
+    assert.equal((await f.read())?.failure, "installation_not_owned");
+    assert.equal(
+      f.requests.some(
+        ({ method, url }) => method === "GET" && new URL(url).pathname === commentsPath,
+      ),
+      false,
+    );
+  });
+
+  it.each(["wrong issue", "HTML actor", "contradictory comment"] as const)(
+    "abandons adoption with %s evidence",
+    async (scenario) => {
+      const f = await fixture("token");
+      await f.seed();
+      loseCreateResult(f);
+      await f.writer().write(f.scope, f.provider);
+      f.advance(60_000);
+      f.state.respond = (request) => {
+        const { pathname } = new URL(request.url);
+        if (scenario === "HTML actor" && pathname === "/user")
+          return new Response("<html>unknown</html>", {
+            status: 200,
+            headers: { "content-type": "text/html" },
+          });
+        if (pathname !== commentsPath) return undefined;
+        const [comment] = f.state.comments;
+        return Response.json([
+          {
+            ...comment,
+            ...(scenario === "wrong issue"
+              ? { issue_url: "https://api.github.com/repos/acme/widgets/issues/10" }
+              : { status: 404 }),
+          },
+        ]);
+      };
+      await f.writer().write(f.scope, f.makeProvider());
+      assert.equal((await f.read())?.state, "abandoned");
+      assert.equal((await f.read())?.externalRef, null);
+      assert.equal(f.mutations().length, 1);
+    },
+  );
+
   it.each(["app", "token"] as const)(
     "adopts a %s comment after restart without writing a second comment",
     async (path) => {
@@ -731,3 +892,16 @@ describe("GitHub run progress", () => {
     assert.equal(f.mutations().length, 2);
   });
 });
+
+function loseCreateResult(f: Awaited<ReturnType<typeof fixture>>) {
+  const update = f.database.updateRunProgressMessage.bind(f.database);
+  const interruption = vi
+    .spyOn(f.database, "updateRunProgressMessage")
+    .mockImplementation(async (input) => {
+      if (input.patch.externalRef !== undefined) {
+        interruption.mockRestore();
+        throw new Error("process stopped before recording create");
+      }
+      return update(input);
+    });
+}

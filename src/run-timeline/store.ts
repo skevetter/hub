@@ -126,6 +126,7 @@ export interface AdmitProgressWriteInput extends RunProgressLeaseInput {
   state: ProgressMessageState;
   key: string;
   reservation: "create" | "regular" | undefined;
+  createReference?: JsonValue;
 }
 
 type ProgressCooldownDecision = { status: "retry"; at: Date } | { status: "rejected" };

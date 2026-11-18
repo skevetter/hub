@@ -446,13 +446,14 @@ export class RunTimelineRepository {
         await transaction.query(
           `update run_progress_messages
            set state = case when $2 = 'create' then 'creating' else state end,
+               external_ref = case when $2 = 'create' then $4::jsonb else external_ref end,
                edit_count = edit_count + case when $2 = 'regular' then 1 else 0 end,
                last_regular_attempt_at = case when $2 = 'regular' then $3::timestamptz else last_regular_attempt_at end,
                last_regular_reservation_version = case when $2 = 'regular' then version else last_regular_reservation_version end,
                updated_at = $3
            where trigger_run_id = $1
              and ($2 <> 'regular' or last_regular_reservation_version is distinct from version)`,
-          [input.triggerRunId, input.reservation, input.now],
+          [input.triggerRunId, input.reservation, input.now, input.createReference ?? null],
         );
       }
       return { status: "admitted" };

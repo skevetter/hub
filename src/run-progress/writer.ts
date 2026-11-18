@@ -171,6 +171,7 @@ const FAILURE_CODES = new Set([
   "connection_not_owned",
   "connection_unavailable",
   "credential_rejected",
+  "connection_replaced",
   "edit_window_closed",
   "installation_not_owned",
   "invalid_credential",
@@ -353,7 +354,7 @@ export class MessageWriter {
     if (run?.outcome !== "accepted") return this.stopMessage(lease, "abandoned", "create_unknown");
     if (isRunTimelineExpired(run, retentionCutoff(new Date(clock.now()), settings.retentionDays)))
       return this.release(lease);
-    const target = provider.destination(run);
+    const target = parseStoredRef(lease.externalRef);
     if (target === undefined) return this.stopMessage(lease, "abandoned", "create_unknown");
     const shared = await budget.run(() =>
       database.readProgressCredentialCooldown(credentialKey({ lease, ref: target })),
@@ -363,14 +364,16 @@ export class MessageWriter {
     if ("rejected" in admission) return this.stopMessage(lease, "abandoned", "create_unknown");
     try {
       const found = await budget
-        .run((signal) => provider.adopt(run, signal), PROVIDER_MS)
+        .run((signal) => provider.adopt(run, target, signal), PROVIDER_MS)
         .catch(() => undefined);
       if (found === undefined) return this.stopMessage(lease, "abandoned", "create_unknown");
+      if (found.status !== "ok")
+        return this.stopMessage(lease, found.status, failureCode(found.code, found.status));
       return this.release(
         lease,
         {
           state: "active",
-          externalRef: found,
+          externalRef: found.ref,
           lastEditAt: new Date(clock.now()),
           retryAt: null,
           failure: null,
@@ -461,7 +464,7 @@ export class MessageWriter {
     operation: Operation,
     provider: ProgressProvider,
   ): Promise<WriteResult> {
-    const { lease, run, ref, body, budget } = operation;
+    const { lease, run, ref, body, budget, kind } = operation;
     const { backoff, clock, database } = this.options;
     const locator = ref.credential;
     const shared = await budget.run(() =>
@@ -479,14 +482,18 @@ export class MessageWriter {
           (signal) =>
             provider instanceof GitHubProgressProvider
               ? provider.authorize(locator, run, signal, {
-                  visibility: lease.visibility,
-                  visibilityCheckedAt: lease.visibilityCheckedAt,
-                  now: clock.now(),
-                  expectedRepositoryId:
-                    typeof ref["repositoryId"] === "number" ? ref["repositoryId"] : undefined,
-                  force: run.status !== "running",
-                  record: (result) => {
-                    visibility = result;
+                  ref,
+                  kind: kind === "create" ? "create" : "edit",
+                  visibility: {
+                    visibility: lease.visibility,
+                    visibilityCheckedAt: lease.visibilityCheckedAt,
+                    now: clock.now(),
+                    expectedRepositoryId:
+                      typeof ref["repositoryId"] === "number" ? ref["repositoryId"] : undefined,
+                    force: run.status !== "running",
+                    record: (result) => {
+                      visibility = result;
+                    },
                   },
                 })
               : provider.authorize(locator, run, signal),
@@ -539,6 +546,15 @@ export class MessageWriter {
   ): Promise<WriteResult> {
     const { lease, kind, budget } = operation;
     const { clock, database } = this.options;
+    const createReference =
+      kind === "create" && provider instanceof GitHubProgressProvider
+        ? provider.createReservation(operation.ref.credential)
+        : undefined;
+    if (createReference !== undefined) {
+      const serialized = JSON.stringify(createReference);
+      if (secrets.some((secret) => secret !== "" && serialized.includes(secret)))
+        return this.stopMessage(lease, "refused", "body_contains_secret");
+    }
     const admission = await budget.run(() =>
       database.admitProgressWrite({
         triggerRunId: lease.triggerRunId,
@@ -549,6 +565,7 @@ export class MessageWriter {
         state: lease.state,
         key: credentialKey(operation),
         reservation: kind === "create" || kind === "regular" ? kind : undefined,
+        ...(createReference === undefined ? {} : { createReference }),
       }),
     );
     if (admission.status === "lease_lost") return {};
@@ -671,7 +688,11 @@ export class MessageWriter {
     if (typeof outcome === "string" || outcome.status === "retry") {
       const safeCreate = typeof outcome !== "string" && outcome.notCreated && !outcome.transient;
       if (kind === "create" && !safeCreate)
-        return this.afterSend(lease, { state: "abandoned", failure: "create_unknown" });
+        return this.afterSend(lease, {
+          state: "abandoned",
+          failure: "create_unknown",
+          externalRef: null,
+        });
       return this.transientFailure(operation, retryAt, false, true);
     }
     if (outcome.status !== "ok") return this.recordRefusal(operation, outcome);
@@ -727,7 +748,12 @@ export class MessageWriter {
     const goneCode = targetGone ? "target_not_found" : "gone";
     const failure =
       outcome.status === "gone" ? goneCode : failureCode(outcome.code, outcome.status);
-    const result = await this.afterSend(lease, { state, failure, settleAt: null });
+    const result = await this.afterSend(lease, {
+      state,
+      failure,
+      settleAt: null,
+      ...(kind === "create" ? { externalRef: null } : {}),
+    });
     if (result.row !== undefined && failure !== "credential_rejected")
       this.options.report(failure, lease);
     return result;
@@ -746,7 +772,11 @@ export class MessageWriter {
       JSON.stringify(stored.credential) !== JSON.stringify(ref.credential) ||
       secrets.some((secret) => secret !== "" && JSON.stringify(stored).includes(secret))
     ) {
-      return this.afterSend(lease, { state: "abandoned", failure: "invalid_reference" });
+      return this.afterSend(lease, {
+        state: "abandoned",
+        failure: "invalid_reference",
+        externalRef: null,
+      });
     }
     return this.afterSend(lease, {
       ...this.successPatch(operation, now),
@@ -805,7 +835,7 @@ export class MessageWriter {
           )
         : Math.max(retryAt, now + 1);
     const patch: Patch = {
-      ...(kind === "create" ? { state: "pending" } : {}),
+      ...(kind === "create" ? { state: "pending", externalRef: null } : {}),
       failedEdits: lease.failedEdits + Number(kind === "regular"),
       finalFailures,
       repeatFinal: lease.repeatFinal || timeout,
@@ -839,7 +869,12 @@ export class MessageWriter {
     state: "abandoned" | "refused" | "unavailable",
     failure: string,
   ): Promise<WriteResult> {
-    return this.release(lease, { state, failure, settleAt: null }).then((result) => {
+    return this.release(lease, {
+      state,
+      failure,
+      settleAt: null,
+      ...(lease.state === "creating" ? { externalRef: null } : {}),
+    }).then((result) => {
       if (result.row !== undefined) this.options.report(failure, lease);
       return result;
     });

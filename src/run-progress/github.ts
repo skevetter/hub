@@ -61,6 +61,8 @@ const markerPrefix = "<!-- paseo-run-progress:";
 const unknownWrite = { status: "retry", afterMs: 0, notCreated: false, transient: true } as const;
 const targetMismatch = { status: "refused", code: "target_mismatch" } as const;
 const installationNotOwned = { status: "refused", code: "installation_not_owned" } as const;
+const connectionReplaced = { status: "refused", code: "connection_replaced" } as const;
+const invalidReference = { status: "unavailable", code: "invalid_reference" } as const;
 const invalidCredential = { status: "refused", code: "invalid_credential" } as const;
 const credentialRejected = { status: "unavailable", code: "credential_rejected" } as const;
 const visibilityUnknown = { status: "unavailable", code: "visibility_unknown" } as const;
@@ -100,8 +102,18 @@ interface VisibilityCheck extends Visibility {
   force: boolean;
   record: (visibility: Visibility) => void;
 }
+interface AuthorizationRequest {
+  ref: StoredRef;
+  kind: "create" | "edit" | "recover";
+  visibility?: VisibilityCheck;
+}
+class BindingRefused extends Error {
+  constructor(readonly outcome: Refusal) {
+    super(outcome.code);
+  }
+}
+
 interface Authorization {
-  run: RunScope;
   target: Destination;
   binding: Binding;
   repositoryId: number;
@@ -165,12 +177,79 @@ export class GitHubProgressProvider implements ProgressProvider {
     locator: CredentialLocator,
     scope: RunScope,
     signal: AbortSignal,
-    check?: VisibilityCheck,
+    operation?: AuthorizationRequest,
   ) {
     this.authorized.delete(locator);
+    try {
+      return await this.authorizeOperation(locator, scope, signal, operation);
+    } catch (error) {
+      if (error instanceof BindingRefused) return authorizationRefusal(error.outcome);
+      throw error;
+    }
+  }
+
+  private async authorizeOperation(
+    locator: CredentialLocator,
+    scope: RunScope,
+    signal: AbortSignal,
+    operation: AuthorizationRequest | undefined,
+  ) {
+    const resolved = await this.readTarget(locator, scope, signal, operation);
+    if ("status" in resolved) return authorizationRefusal(resolved);
+    const { target } = resolved;
+    const binding = await this.readBinding(scope, target);
+    signal.throwIfAborted();
+    if ("status" in binding) return authorizationRefusal(binding);
+    const pinned = operation?.kind === "create" ? undefined : operation?.ref;
+    const mismatch = pinned === undefined ? undefined : pinnedBindingMismatch(binding, pinned);
+    if (mismatch !== undefined) return authorizationRefusal(mismatch);
+    const guard = (requestSignal: AbortSignal) =>
+      this.guardBinding(scope, target, binding, requestSignal);
+    await guard(signal);
+    const client = await this.client(target.credential, signal, guard);
+    if ("status" in client) return authorizationRefusal(client);
+    const request: GitHubRequest = async (requestSignal, method, path, body) => {
+      await guard(requestSignal);
+      requestSignal.throwIfAborted();
+      return client.request(requestSignal, method, path, body);
+    };
+    const metadata = await this.checkVisibility(target, request, signal, operation?.visibility);
+    if ("status" in metadata) return authorizationRefusal(metadata);
+    if (binding.kind === "installation" && binding.repositoryId !== metadata.repositoryId)
+      return { refused: targetMismatch.code };
+    const marker = createHmac("sha256", client.markerKey)
+      .update(
+        JSON.stringify([
+          scope.organizationId,
+          scope.id,
+          target.repository.toLowerCase(),
+          target.issueNumber,
+        ]),
+      )
+      .digest("hex");
+    if (pinned !== undefined && pinned["repositoryId"] !== metadata.repositoryId)
+      return authorizationRefusal(targetMismatch);
+    this.authorized.set(locator, {
+      target,
+      binding,
+      marker: `${markerPrefix}${marker} -->`,
+      ...metadata,
+      secrets: client.secrets,
+      actorPath: client.actorPath,
+      request,
+    });
+    return "ok" as const;
+  }
+
+  private async readTarget(
+    locator: CredentialLocator,
+    scope: RunScope,
+    signal: AbortSignal,
+    operation: AuthorizationRequest | undefined,
+  ): Promise<{ target: Destination } | Refusal> {
     signal.throwIfAborted();
     if (locator.kind !== "installation" && locator.kind !== "progress-token")
-      return { refused: invalidCredential.code };
+      return invalidCredential;
     const run = await this.options.database.findTriggerRunForOrganization(
       scope.organizationId,
       scope.id,
@@ -185,39 +264,11 @@ export class GitHubProgressProvider implements ProgressProvider {
       target === undefined ||
       !sameCredential(locator, target.credential)
     )
-      return { refused: targetMismatch.code };
-    const binding = await this.readBinding(run, target);
-    signal.throwIfAborted();
-    if ("status" in binding) return authorizationRefusal(binding);
-    const client = await this.client(locator, signal);
-    if ("status" in client) return authorizationRefusal(client);
-    signal.throwIfAborted();
-    if (!sameBinding(await this.readBinding(run, target), binding))
-      return authorizationRefusal(bindingChanged(locator));
-    signal.throwIfAborted();
-    const metadata = await this.checkVisibility(target, client.request, signal, check);
-    if ("status" in metadata) return authorizationRefusal(metadata);
-    if (binding.kind === "installation" && binding.repositoryId !== metadata.repositoryId)
-      return { refused: targetMismatch.code };
-    const marker = createHmac("sha256", client.markerKey)
-      .update(
-        JSON.stringify([
-          run.organizationId,
-          run.id,
-          target.repository.toLowerCase(),
-          target.issueNumber,
-        ]),
-      )
-      .digest("hex");
-    this.authorized.set(locator, {
-      run,
-      target,
-      binding,
-      marker: `${markerPrefix}${marker} -->`,
-      ...metadata,
-      ...client,
-    });
-    return "ok" as const;
+      return targetMismatch;
+    if (operation !== undefined && !matchesTarget(target, operation.ref)) return targetMismatch;
+    if (operation?.kind === "edit" && !githubId.safeParse(operation.ref["commentId"]).success)
+      return invalidReference;
+    return { target };
   }
 
   async secrets(locator: CredentialLocator, signal: AbortSignal): Promise<readonly string[]> {
@@ -233,19 +284,47 @@ export class GitHubProgressProvider implements ProgressProvider {
     return this.write("PATCH", ref, body, signal);
   }
 
-  async adopt(run: AcceptedTriggerRunRecord, signal: AbortSignal): Promise<StoredRef | undefined> {
-    const target = this.destination(run);
-    if (target === undefined || (await this.authorize(target.credential, run, signal)) !== "ok")
-      return undefined;
-    const auth = this.takeAuthorization(target.credential);
+  createReservation(locator: CredentialLocator): StoredRef | undefined {
+    const auth = this.authorized.get(locator);
+    return auth === undefined ? undefined : boundReference(auth);
+  }
+
+  async adopt(
+    run: AcceptedTriggerRunRecord,
+    reservation: StoredRef,
+    signal: AbortSignal,
+  ): Promise<{ status: "ok"; ref: StoredRef } | Refusal | undefined> {
+    try {
+      const authorized = await this.authorize(reservation.credential, run, signal, {
+        ref: reservation,
+        kind: "recover",
+      });
+      if (authorized !== "ok")
+        return "refused" in authorized
+          ? { status: "refused", code: authorized.refused }
+          : { status: "unavailable", code: authorized.unavailable };
+      const ref = await this.findAdoptableComment(run, reservation.credential, signal);
+      return ref === undefined ? undefined : { status: "ok", ref };
+    } catch (error) {
+      if (error instanceof BindingRefused) return error.outcome;
+      throw error;
+    }
+  }
+
+  private async findAdoptableComment(
+    run: AcceptedTriggerRunRecord,
+    locator: CredentialLocator,
+    signal: AbortSignal,
+  ) {
+    const auth = this.takeAuthorization(locator);
     if (auth === undefined) return undefined;
+    const { target } = auth;
     const actorResponse = await auth.request(signal, "GET", auth.actorPath);
     const actor = responseIdentity.safeParse(actorResponse.data);
     if (
       !jsonSuccess(actorResponse) ||
       !actor.success ||
-      !matchingStatus(actor.data.status, actorResponse.status) ||
-      !sameBinding(await this.readBinding(run, target), auth.binding)
+      !matchingStatus(actor.data.status, actorResponse.status)
     )
       return undefined;
     signal.throwIfAborted();
@@ -276,6 +355,25 @@ export class GitHubProgressProvider implements ProgressProvider {
     return auth.secrets.some((secret) => secret !== "" && serialized.includes(secret))
       ? undefined
       : ref;
+  }
+
+  private async guardBinding(
+    scope: RunScope,
+    target: Destination,
+    expected: Binding,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
+    const current = await this.readBinding(scope, target);
+    signal.throwIfAborted();
+    if ("status" in current) throw new BindingRefused(current);
+    if (!sameBinding(current, expected)) {
+      const replaced =
+        current.kind === "installation" &&
+        expected.kind === "installation" &&
+        current.connectionId !== expected.connectionId;
+      throw new BindingRefused(replaced ? connectionReplaced : bindingChanged(target.credential));
+    }
   }
 
   private async readBinding(run: RunScope, target: Destination): Promise<Binding | Refusal> {
@@ -319,6 +417,7 @@ export class GitHubProgressProvider implements ProgressProvider {
   private async client(
     locator: GitHubLocator,
     signal: AbortSignal,
+    guard: (signal: AbortSignal) => Promise<void>,
   ): Promise<
     | {
         request: GitHubRequest;
@@ -346,13 +445,19 @@ export class GitHubProgressProvider implements ProgressProvider {
       .createInstallationOctokit(locator.installationId, {
         retries: "off",
         signal,
+        beforeTokenRequest: () => guard(signal),
       })
-      .catch((error: unknown) => octokitError(error));
+      .catch((error: unknown) => {
+        if (error instanceof BindingRefused) throw error;
+        return octokitError(error);
+      });
     signal.throwIfAborted();
     if (octokit !== undefined && "status" in octokit && octokit.status === 401)
       return credentialRejected;
     if (octokit === undefined || "status" in octokit)
       throw new Error("GitHub progress installation client unavailable");
+    await guard(signal);
+    signal.throwIfAborted();
     const auth: unknown = await Promise.resolve(octokit.auth()).catch(() => undefined);
     const token = z.object({ token: z.string().min(1) }).safeParse(auth);
     if (!token.success) return noCredential;
@@ -451,12 +556,14 @@ export class GitHubProgressProvider implements ProgressProvider {
       if (method === "PATCH" && !comment.success)
         return { status: "unavailable", code: "invalid_reference" };
       const commentNumber = method === "PATCH" ? comment.data?.id : undefined;
-      if (!matchesTarget(auth, ref, commentNumber !== undefined)) return targetMismatch;
+      if (!matchesTarget(auth.target, ref)) return targetMismatch;
+      if (commentNumber !== undefined) {
+        const mismatch = pinnedBindingMismatch(auth.binding, ref);
+        if (mismatch !== undefined) return mismatch;
+        if (ref["repositoryId"] !== auth.repositoryId) return targetMismatch;
+      }
       if (body.includes(markerPrefix) || auth.secrets.some((secret) => body.includes(secret)))
         return { status: "refused", code: "body_contains_secret" };
-      if (!sameBinding(await this.readBinding(auth.run, auth.target), auth.binding))
-        return bindingChanged(auth.target.credential);
-      signal.throwIfAborted();
       const [owner, repo] = splitRepository(auth.target);
       const path =
         commentNumber === undefined
@@ -471,8 +578,8 @@ export class GitHubProgressProvider implements ProgressProvider {
 ${auth.marker}`,
       );
       return await mutationResult(auth, commentNumber, response, signal);
-    } catch {
-      return unknownWrite;
+    } catch (error) {
+      return error instanceof BindingRefused ? error.outcome : unknownWrite;
     }
   }
 }
@@ -492,7 +599,7 @@ async function readRepository(request: GitHubRequest, path: string, signal: Abor
   for (let attempt = 0; attempt < 3; attempt++) {
     signal.throwIfAborted();
     const readSignal = AbortSignal.any([signal, AbortSignal.timeout(2_500)]);
-    const response = await request(readSignal, "GET", path).catch(() => undefined);
+    const response = await request(readSignal, "GET", path).catch(ignoreRequestFailure);
     signal.throwIfAborted();
     if (response?.status === 401) return credentialRejected;
     if (response?.status !== 200) continue;
@@ -502,14 +609,25 @@ async function readRepository(request: GitHubRequest, path: string, signal: Abor
   return visibilityUnknown;
 }
 
-function matchesTarget(auth: Authorization, ref: StoredRef, edit: boolean): boolean {
+function ignoreRequestFailure(error: unknown): undefined {
+  if (error instanceof BindingRefused) throw error;
+  return undefined;
+}
+
+function matchesTarget(target: Destination, ref: StoredRef): boolean {
   const repository = ref["repository"];
   return (
-    ref["issueNumber"] === auth.target.issueNumber &&
+    ref["issueNumber"] === target.issueNumber &&
     typeof repository === "string" &&
-    repository.toLowerCase() === auth.target.repository.toLowerCase() &&
-    (!edit || ref["repositoryId"] === auth.repositoryId)
+    repository.toLowerCase() === target.repository.toLowerCase()
   );
+}
+
+function pinnedBindingMismatch(binding: Binding, ref: StoredRef): Refusal | undefined {
+  if (!githubId.safeParse(ref["repositoryId"]).success) return invalidReference;
+  if (binding.kind !== "installation") return undefined;
+  if (ref["connectionId"] !== binding.connectionId) return connectionReplaced;
+  return ref["repositoryId"] === binding.repositoryId ? undefined : targetMismatch;
 }
 
 async function mutationResult(
@@ -539,7 +657,7 @@ async function mutationResult(
   const [owner, repo] = splitRepository(auth.target);
   const issue = await auth
     .request(signal, "GET", `${repositoryPath(owner, repo)}/issues/${auth.target.issueNumber}`)
-    .catch(() => undefined);
+    .catch(ignoreRequestFailure);
   return issue?.status === 200 && lockedIssue.safeParse(issue.data).success
     ? { status: "unavailable", code: "locked" }
     : failure;
@@ -624,8 +742,16 @@ function splitRepository(target: Destination): [string, string] {
   return [owner!, repo!];
 }
 
+function boundReference({ target, binding, repositoryId }: Authorization): StoredRef {
+  return {
+    ...target,
+    repositoryId,
+    ...(binding.kind === "installation" ? { connectionId: binding.connectionId } : {}),
+  };
+}
+
 function storedReference(auth: Authorization, id: number): StoredRef {
-  return { ...auth.target, repositoryId: auth.repositoryId, commentId: id };
+  return { ...boundReference(auth), commentId: id };
 }
 
 function octokitError(error: unknown): GitHubResponse | undefined {

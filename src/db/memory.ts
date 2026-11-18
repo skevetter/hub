@@ -762,6 +762,7 @@ class MemoryDatabase implements Database {
     if (cooldown !== undefined) return cooldown;
     if (input.reservation === "create") {
       message.state = "creating";
+      message.externalRef = structuredClone(input.createReference ?? null);
       message.updatedAt = new Date(input.now);
     }
     if (

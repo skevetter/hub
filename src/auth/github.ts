@@ -35,6 +35,7 @@ const GitHubAppBotIdentitySchema = z.object({ id: z.number().int().positive(), l
 interface ProgressOctokitOptions {
   retries: "off";
   signal?: AbortSignal;
+  beforeTokenRequest?: () => Promise<void>;
 }
 
 export interface GitHubAuth {
@@ -175,6 +176,8 @@ export function createGitHubAuth(options: CreateGitHubAuthOptions): GitHubAuth {
   ) {
     progress?.signal?.throwIfAborted();
     const octokit = await getAppOctokit(progress);
+    progress?.signal?.throwIfAborted();
+    await progress?.beforeTokenRequest?.();
     progress?.signal?.throwIfAborted();
     const response = await octokit.request(
       "POST /app/installations/{installation_id}/access_tokens",
