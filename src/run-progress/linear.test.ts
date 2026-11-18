@@ -224,6 +224,62 @@ describe("Linear run progress", () => {
     },
   );
 
+  it.each([
+    ["INSUFFICIENT_SCOPE", "scope_missing"],
+    ["INVALID_SCOPE", "scope_missing"],
+    ["FORBIDDEN", "scope_missing"],
+    ["PERMISSION_DENIED", "scope_missing"],
+    ["ACCESS_DENIED", "scope_missing"],
+    ["AUTHENTICATION_ERROR", "reauthorize"],
+    ["UNAUTHENTICATED", "reauthorize"],
+  ])(
+    "treats structured %s as permanent on HTTP 200 for creates and edits",
+    async (code, reason) => {
+      const fetch = vi.fn(async () =>
+        Response.json({
+          errors: [
+            { message: "Provider warning" },
+            { message: "Mutation rejected", extensions: { code } },
+          ],
+        }),
+      );
+      const { provider, authorize } = fixture(fetch);
+      const expected = { status: "unavailable", code: reason };
+      await authorize(destination);
+      assert.deepEqual(await provider.create(destination, "Started", signal), expected);
+      await authorize(ref);
+      assert.deepEqual(await provider.edit(ref, "Finished", signal), expected);
+      assert.equal(fetch.mock.calls.length, 2);
+    },
+  );
+
+  it.each([
+    { status: 401, expected: { status: "unavailable", code: "reauthorize" } },
+    { status: 403, expected: { status: "unavailable", code: "scope_missing" } },
+    { status: 404, expected: { status: "gone" } },
+  ])("classifies HTTP $status even with an oversized body", async ({ status, expected }) => {
+    const body = "x".repeat(1024 * 1024 + 1);
+    const fetch = vi.fn(async () => new Response(body, { status }));
+    const { provider, authorize } = fixture(fetch);
+    await authorize(destination);
+    assert.deepEqual(await provider.create(destination, "Started", signal), expected);
+    await authorize(ref);
+    assert.deepEqual(await provider.edit(ref, "Finished", signal), expected);
+    assert.equal(fetch.mock.calls.length, 2);
+  });
+
+  it("keeps a create with a GraphQL missing-target code uncertain", async () => {
+    const fetch = vi.fn(async () =>
+      Response.json({
+        errors: [{ message: "Lookup failed", extensions: { code: "ENTITY_NOT_FOUND" } }],
+      }),
+    );
+    const { provider, authorize } = fixture(fetch);
+    await authorize(destination);
+    assert.deepEqual(await provider.create(destination, "Started", signal), uncertain);
+    assert.equal(fetch.mock.calls.length, 1);
+  });
+
   it.each([400, 429])(
     "allows retry of an HTTP %i rate-limited create with no data",
     async (status) => {

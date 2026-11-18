@@ -130,10 +130,22 @@ const targetMismatch = { status: "refused", code: "target_mismatch" } as const;
 
 const uncertainWrite = { status: "retry", afterMs: 0, notCreated: false, transient: true } as const;
 
+const scopeErrorCodes = new Set([
+  "INSUFFICIENT_SCOPE",
+  "INVALID_SCOPE",
+  "FORBIDDEN",
+  "PERMISSION_DENIED",
+  "ACCESS_DENIED",
+]);
+const authenticationErrorCodes = new Set(["AUTHENTICATION_ERROR", "UNAUTHENTICATED"]);
+const missingTargetCodes = new Set(["NOT_FOUND", "ENTITY_NOT_FOUND", "ENTITYNOTFOUND"]);
+
 function mapCreateError(error: unknown): ProgressCall {
-  if (error instanceof LinearApiError && error.status < 400) return uncertainWrite;
   const outcome = mapWriteError(error);
-  return outcome.status === "retry" && !outcome.notCreated ? uncertainWrite : outcome;
+  if (outcome.status === "retry" && !outcome.notCreated) return uncertainWrite;
+  if (outcome.status === "gone" && error instanceof LinearApiError && error.status !== 404)
+    return uncertainWrite;
+  return outcome;
 }
 
 function mapWriteError(error: unknown): ProgressCall {
@@ -152,23 +164,15 @@ function mapWriteError(error: unknown): ProgressCall {
       return { status: "unavailable", code: "scope_missing" };
     case 404:
       return { status: "gone" };
-    case 429:
-      return rateLimited(error);
   }
-  switch (error.code?.toUpperCase()) {
-    case "UNAUTHENTICATED":
-      return { status: "unavailable", code: "reauthorize" };
-    case "FORBIDDEN":
-      return { status: "unavailable", code: "scope_missing" };
-    case "NOT_FOUND":
-    case "ENTITY_NOT_FOUND":
-    case "ENTITYNOTFOUND":
-      return { status: "gone" };
-    case "RATELIMITED":
-      return rateLimited(error);
-    default:
-      return uncertainWrite;
-  }
+  const { graphqlCodes } = error;
+  if (graphqlCodes.some((code) => authenticationErrorCodes.has(code)))
+    return { status: "unavailable", code: "reauthorize" };
+  if (graphqlCodes.some((code) => scopeErrorCodes.has(code)))
+    return { status: "unavailable", code: "scope_missing" };
+  if (error.status === 429 || graphqlCodes.includes("RATELIMITED")) return rateLimited(error);
+  if (graphqlCodes.some((code) => missingTargetCodes.has(code))) return { status: "gone" };
+  return uncertainWrite;
 }
 
 function rateLimited(error: LinearApiError): ProgressCall {

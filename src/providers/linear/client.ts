@@ -14,6 +14,7 @@ export const LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT = LINEAR_ISSUE_CONTEXT_LIMIT - 1
 const LINEAR_ACCESS_TOKEN_REFRESH_SKEW_MS = 60_000;
 const LINEAR_RESPONSE_BODY_LIMIT_BYTES = 1024 * 1024;
 const LINEAR_RESPONSE_BODY_TIMEOUT_MS = 5_000;
+const LINEAR_HEADER_FAILURE_STATUSES = new Set([401, 403, 404]);
 
 const LinearTokenResponseSchema = z
   .object({
@@ -112,6 +113,7 @@ export class LinearApiError extends Error {
     readonly code?: string,
     readonly retryAfterMs?: number,
     readonly rateLimitBeforeExecution = false,
+    readonly graphqlCodes: readonly string[] = [],
   ) {
     super(message);
     this.name = "LinearApiError";
@@ -631,7 +633,12 @@ async function graphql(
     ...(mutation ? { redirect: "error" } : {}),
     ...(signal === undefined ? {} : { signal }),
   });
-  if (!response.ok && (signal === undefined || response.status >= 500)) {
+  if (
+    !response.ok &&
+    (signal === undefined ||
+      response.status >= 500 ||
+      LINEAR_HEADER_FAILURE_STATUSES.has(response.status))
+  ) {
     discardResponseBody(response);
     throw new LinearApiError(`Linear GraphQL HTTP ${response.status}`, response.status);
   }
@@ -720,6 +727,9 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
   const rateLimited = errors.find(
     ({ extensions }) => extensions?.code?.toUpperCase() === "RATELIMITED",
   );
+  const codes = errors.flatMap(({ extensions }) =>
+    extensions?.code === undefined ? [] : [extensions.code.toUpperCase()],
+  );
   const error = rateLimited ?? errors[0];
   const delay =
     rateLimited !== undefined || response.status === 429
@@ -738,6 +748,7 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
     error?.extensions?.code,
     delay,
     rateLimitBeforeExecution,
+    codes,
   );
 }
 
