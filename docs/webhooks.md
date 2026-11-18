@@ -229,9 +229,10 @@ record and the corresponding master key. Verify both sources in an isolated rest
 enabling signing. Invalid enabled key configuration or missing master keys for eligible
 stored versions refuse startup.
 
-To rotate the master, add the new key ID to the keyring and make it active. Rotate each sender
-to a new signing secret, update GitHub, and wait for or retire the old overlap. Remove the old
-online key only after no eligible versions reference it. Keep offline copies for retained backups.
+Keep the master bytes for each existing key ID identical. To rotate the master, add a new
+key ID to the keyring and make it active. Rotate each sender to a new signing secret, update
+GitHub, and wait for or retire the old overlap. Remove the old online key only after no
+eligible versions reference it. Keep offline copies for retained backups.
 
 Restore with signing disabled. Reconcile revocations and retire or rotate restored signing
 versions before exposure. Restoring an older dump can restore old keys and lose delivery

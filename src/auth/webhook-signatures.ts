@@ -81,6 +81,7 @@ function parseSetting(value: string | undefined, name: string, fallback: unknown
 
 export function deriveSigningSecret(
   master: Buffer,
+  masterKeyId: string,
   salt: string,
   organizationId: string,
   apiKeyId: string,
@@ -90,7 +91,14 @@ export function deriveSigningSecret(
   if (master.length !== 32 || decoded.length !== 32 || decoded.toString("base64url") !== salt) {
     throw new Error("Invalid webhook signing material");
   }
-  const info = JSON.stringify(["paseo.webhook.secret", 1, organizationId, apiKeyId, versionId]);
+  const info = JSON.stringify([
+    "paseo.webhook.secret",
+    1,
+    masterKeyId,
+    organizationId,
+    apiKeyId,
+    versionId,
+  ]);
   const bytes = new Uint8Array(hkdfSync("sha256", master, decoded, info, 32));
   try {
     return "paseo_whsec_" + Buffer.from(bytes.buffer).toString("base64url");

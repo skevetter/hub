@@ -162,7 +162,14 @@ export class WebhookSecretStore {
     if (masterKeyId === undefined || master === undefined) throw unavailable();
     const versionId = randomUUID();
     const salt = randomBytes(32).toString("base64url");
-    const signingSecret = deriveSigningSecret(master, salt, organizationId, id, versionId);
+    const signingSecret = deriveSigningSecret(
+      master,
+      masterKeyId,
+      salt,
+      organizationId,
+      id,
+      versionId,
+    );
     await transaction.query(
       `insert into organization_webhook_secrets
          (organization_id, api_key_id, slot, version_id, master_key_id, salt)
@@ -272,6 +279,7 @@ export class WebhookSecretStore {
         if (master === undefined) throw unavailable();
         return deriveSigningSecret(
           master,
+          version.master_key_id,
           version.salt,
           key.organization_id,
           key.id,
