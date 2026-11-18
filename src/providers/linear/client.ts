@@ -156,7 +156,7 @@ export interface LinearTokenRefresh {
 export interface LinearConnectionClient {
   authorizationUrl(state: string): string;
   exchangeCode(code: string): Promise<LinearInstallation>;
-  refresh(refreshToken: string): Promise<LinearTokenRefresh>;
+  refresh(refreshToken: string, signal?: AbortSignal): Promise<LinearTokenRefresh>;
   revoke(accessToken: string): Promise<void>;
 }
 
@@ -204,9 +204,19 @@ export interface LinearApiClient {
   ): Promise<void>;
 }
 
+type LinearConnectionBinding = Pick<
+  LinearConnectionRecord,
+  "id" | "organizationId" | "linearOrganizationId" | "providerApplicationId" | "appUserId"
+>;
+
 interface LinearCommentWriteOptions {
-  organizationId: string;
+  binding: LinearConnectionBinding;
   signal: AbortSignal;
+}
+
+interface GraphqlPayload {
+  query: string;
+  variables: Record<string, string>;
 }
 
 export function hasRequiredLinearScopes(scopes: readonly string[]): boolean {
@@ -283,7 +293,7 @@ export function createLinearConnectionClient(options: {
         scopes: token.scopes ?? [...LINEAR_REQUIRED_SCOPES],
       };
     },
-    async refresh(refreshToken) {
+    async refresh(refreshToken, signal) {
       const token = await exchangeToken(
         request,
         options,
@@ -292,6 +302,7 @@ export function createLinearConnectionClient(options: {
           refresh_token: refreshToken,
         },
         now,
+        signal,
       );
       return {
         accessToken: token.accessToken,
@@ -342,26 +353,31 @@ export function createLinearApiClient(options: {
     write?: LinearCommentWriteOptions,
   ): void => {
     if (write === undefined) return;
-    if (connection.organizationId !== write.organizationId)
+    const { binding } = write;
+    if (
+      connection.id !== binding.id ||
+      connection.organizationId !== binding.organizationId ||
+      connection.linearOrganizationId !== binding.linearOrganizationId ||
+      connection.providerApplicationId !== binding.providerApplicationId ||
+      connection.appUserId !== binding.appUserId
+    )
       throw new LinearCredentialError("connection_not_owned");
     if (linearConnectionRequiresReauthorization(connection, now()))
       throw new LinearCredentialError("reauthorize");
   };
 
-  const accessTokenFor = async (
+  const connectionForToken = async (
     linearOrganizationId: string,
     write?: LinearCommentWriteOptions,
-  ): Promise<string> => {
+  ): Promise<LinearConnectionRecord> => {
     write?.signal.throwIfAborted();
     const connection = await options.connectionForLinearOrganization(linearOrganizationId);
     write?.signal.throwIfAborted();
     if (connection === undefined) throw new LinearCredentialError("connection_unavailable");
     checkWriteConnection(connection, write);
-    if (hasUsableAccessToken(connection)) return connection.accessToken;
+    if (hasUsableAccessToken(connection)) return connection;
     if (connection.refreshToken === null) throw new LinearCredentialError("reauthorize");
-    const refreshed = await refreshConnection(linearOrganizationId, connection, write);
-    checkWriteConnection(refreshed, write);
-    return refreshed.accessToken;
+    return refreshConnection(linearOrganizationId, connection, write);
   };
 
   const refreshConnection = async (
@@ -369,18 +385,24 @@ export function createLinearApiClient(options: {
     connection: LinearConnectionRecord,
     write?: LinearCommentWriteOptions,
   ): Promise<LinearConnectionRecord> => {
-    const key = JSON.stringify([connection.id, write?.organizationId]);
+    const key = JSON.stringify([connection.id, write?.binding.organizationId]);
     const existing = refreshes.get(key);
     if (existing !== undefined) return existing;
     const pending = options.withLinearConnectionRefresh(
       linearOrganizationId,
       async (current, updateTokens) => {
+        write?.signal.throwIfAborted();
         if (current === undefined) throw new LinearCredentialError("connection_unavailable");
         checkWriteConnection(current, write);
         if (hasUsableAccessToken(current)) return current;
         if (current.refreshToken === null) throw new LinearCredentialError("reauthorize");
-        const refreshed = await options.connectionClient.refresh(current.refreshToken);
+        const refreshed = await options.connectionClient.refresh(
+          current.refreshToken,
+          write?.signal,
+        );
+        write?.signal.throwIfAborted();
         await updateTokens(refreshed);
+        write?.signal.throwIfAborted();
         return { ...current, ...refreshed };
       },
     );
@@ -390,6 +412,39 @@ export function createLinearApiClient(options: {
     } finally {
       if (refreshes.get(key) === pending) refreshes.delete(key);
     }
+  };
+
+  const accessTokenFor = async (linearOrganizationId: string) =>
+    (await connectionForToken(linearOrganizationId)).accessToken;
+
+  const commentMutation = async (
+    input: { linearOrganizationId: string; body: string },
+    payload: GraphqlPayload,
+    write?: LinearCommentWriteOptions,
+  ): Promise<unknown> => {
+    const connection = await connectionForToken(input.linearOrganizationId, write);
+    if (write !== undefined) {
+      write.signal.throwIfAborted();
+      const current = await options.connectionForLinearOrganization(input.linearOrganizationId);
+      write.signal.throwIfAborted();
+      if (
+        current === undefined ||
+        current.accessToken !== connection.accessToken ||
+        current.refreshToken !== connection.refreshToken
+      )
+        throw new LinearCredentialError("connection_not_owned");
+      checkWriteConnection(current, write);
+      if (
+        input.body.includes(current.accessToken) ||
+        (current.refreshToken && input.body.includes(current.refreshToken))
+      )
+        throw new LinearCredentialError("body_contains_secret");
+    }
+    return graphql(request, connection.accessToken, payload, {
+      mutation: true,
+      signal: write?.signal,
+      now,
+    });
   };
 
   return {
@@ -464,39 +519,31 @@ export function createLinearApiClient(options: {
       };
     },
     async createComment(input, write) {
-      const token = await accessTokenFor(input.linearOrganizationId, write);
-      if (write !== undefined && input.body.includes(token))
-        throw new LinearCredentialError("body_contains_secret");
       const result = CommentCreateResponseSchema.parse(
-        await graphql(
-          request,
-          token,
+        await commentMutation(
+          input,
           {
             query: `mutation PaseoComment($issueId: String!, $body: String!) {
-              commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
-            }`,
+            commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+          }`,
             variables: { issueId: input.issueId, body: input.body },
           },
-          { mutation: true, signal: write?.signal, now },
+          write,
         ),
       );
       return result.data.commentCreate.comment.id;
     },
     async updateComment(input, write) {
-      const token = await accessTokenFor(input.linearOrganizationId, write);
-      if (write !== undefined && input.body.includes(token))
-        throw new LinearCredentialError("body_contains_secret");
       CommentUpdateResponseSchema.parse(
-        await graphql(
-          request,
-          token,
+        await commentMutation(
+          input,
           {
             query: `mutation PaseoUpdateComment($id: String!, $body: String!) {
-              commentUpdate(id: $id, input: { body: $body }) { success }
-            }`,
+            commentUpdate(id: $id, input: { body: $body }) { success }
+          }`,
             variables: { id: input.commentId, body: input.body },
           },
-          { mutation: true, signal: write?.signal, now },
+          write,
         ),
       );
     },
@@ -516,12 +563,14 @@ async function exchangeToken(
   options: Pick<Parameters<typeof createLinearConnectionClient>[0], "clientId" | "clientSecret">,
   values: Record<string, string>,
   now: () => Date,
+  signal?: AbortSignal,
 ): Promise<{
   accessToken: string;
   refreshToken?: string;
   accessTokenExpiresAt?: Date;
   scopes?: string[];
 }> {
+  signal?.throwIfAborted();
   const response = await request("https://api.linear.app/oauth/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -530,6 +579,7 @@ async function exchangeToken(
       client_secret: options.clientSecret,
       ...values,
     }),
+    ...(signal === undefined ? {} : { signal }),
   });
   if (!response.ok) throw new Error(`Linear OAuth HTTP ${response.status}`);
   const token = LinearTokenResponseSchema.parse(await response.json());
@@ -556,7 +606,7 @@ async function readViewer(request: typeof fetch, accessToken: string) {
 async function graphql(
   request: typeof fetch,
   accessToken: string,
-  payload: { query: string; variables: Record<string, string> },
+  payload: GraphqlPayload,
   options: { mutation?: true; signal?: AbortSignal | undefined; now?: () => Date } = {},
 ): Promise<unknown> {
   const { signal, mutation, now = () => new Date() } = options;

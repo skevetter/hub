@@ -24,7 +24,12 @@ export function createLinearProgressProvider(options: LinearProgressOptions): Pr
     const connection = authorized.get(locator);
     authorized.delete(locator);
     if (connection === undefined) throw new LinearCredentialError("connection_not_owned");
-    return { organizationId: connection.organizationId, signal };
+    const { id, organizationId, linearOrganizationId, providerApplicationId, appUserId } =
+      connection;
+    return {
+      binding: { id, organizationId, linearOrganizationId, providerApplicationId, appUserId },
+      signal,
+    };
   };
 
   return {

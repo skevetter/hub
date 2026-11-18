@@ -3,7 +3,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import { describe, it, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
-import type { LinearConnectionRecord } from "../db/types.js";
+import type { LinearConnectionRecord, LinearConnectionTokenUpdate } from "../db/types.js";
 import { createLinearApiClient, LINEAR_REQUIRED_SCOPES } from "../providers/linear/client.js";
 import { createLinearProgressProvider } from "./linear.js";
 import type { ProgressDestination } from "./types.js";
@@ -31,10 +31,21 @@ function fixture(fetch: typeof globalThis.fetch) {
   };
   const lookup = vi.fn(async () => ({ ...connection }));
   const refresh = vi.fn(async () => ({ accessToken: "refreshed-token" }));
+  const persist = vi.fn(async (tokens: LinearConnectionTokenUpdate) => {
+    Object.assign(connection, tokens);
+  });
+  const lock = {
+    acquire: () => Promise.resolve(),
+    release: () => {},
+  };
   const client = createLinearApiClient({
     connectionForLinearOrganization: lookup,
-    withLinearConnectionRefresh: async (_id, operation) =>
-      operation(await lookup(), async () => undefined),
+    withLinearConnectionRefresh: async (_id, operation) => {
+      await lock.acquire();
+      const result = await operation(await lookup(), persist);
+      lock.release();
+      return result;
+    },
     connectionClient: { refresh },
     fetch,
   });
@@ -46,7 +57,7 @@ function fixture(fetch: typeof globalThis.fetch) {
   async function authorize(target: ProgressDestination) {
     assert.equal(await provider.authorize(target.credential, scope, signal), "ok");
   }
-  return { provider, connection, lookup, refresh, authorize };
+  return { provider, connection, lookup, refresh, persist, lock, authorize };
 }
 
 const neverFetch = () => Promise.reject(new Error("unexpected Linear request"));
@@ -330,6 +341,62 @@ describe("Linear run progress", () => {
       code: "connection_not_owned",
     });
     assert.equal(refresh.mock.calls.length, 0);
+    assert.equal(fetch.mock.calls.length, 0);
+  });
+  it.each([
+    { organizationId: "other-org", id: "rebound" },
+    { organizationId: scope.organizationId, id: "reconnected" },
+  ])("refuses the earlier token after the refresh lock releases to $id", async (binding) => {
+    const fetch = vi.fn(neverFetch);
+    const { provider, connection, authorize, refresh, persist, lock } = fixture(fetch);
+    connection.accessTokenExpiresAt = new Date(0);
+    await authorize(ref);
+    lock.release = () => {
+      Object.assign(connection, binding);
+    };
+    assert.deepEqual(await provider.edit(ref, "Finished", signal), {
+      status: "refused",
+      code: "connection_not_owned",
+    });
+    assert.equal(refresh.mock.calls.length, 1);
+    assert.equal(persist.mock.calls.length, 1);
+    assert.equal(fetch.mock.calls.length, 0);
+  });
+
+  it("skips refresh and persistence when canceled while waiting for the lock", async () => {
+    const fetch = vi.fn(neverFetch);
+    const { provider, connection, authorize, refresh, persist, lock } = fixture(fetch);
+    connection.accessTokenExpiresAt = new Date(0);
+    await authorize(ref);
+    const started = Promise.withResolvers<void>();
+    const acquired = Promise.withResolvers<void>();
+    lock.acquire = () => {
+      started.resolve();
+      return acquired.promise;
+    };
+    const controller = new AbortController();
+    const pending = provider.edit(ref, "Finished", controller.signal);
+    await started.promise;
+    controller.abort();
+    acquired.resolve();
+    await assert.rejects(pending, { name: "AbortError" });
+    assert.equal(refresh.mock.calls.length, 0);
+    assert.equal(persist.mock.calls.length, 0);
+    assert.equal(fetch.mock.calls.length, 0);
+  });
+
+  it("skips persistence if cancellation arrives during the refresh request", async () => {
+    const fetch = vi.fn(neverFetch);
+    const { provider, connection, authorize, refresh, persist } = fixture(fetch);
+    connection.accessTokenExpiresAt = new Date(0);
+    const controller = new AbortController();
+    await authorize(ref);
+    refresh.mockImplementationOnce(async () => {
+      controller.abort();
+      return { accessToken: "late-token" };
+    });
+    await assert.rejects(provider.edit(ref, "Finished", controller.signal), { name: "AbortError" });
+    assert.equal(persist.mock.calls.length, 0);
     assert.equal(fetch.mock.calls.length, 0);
   });
 });
