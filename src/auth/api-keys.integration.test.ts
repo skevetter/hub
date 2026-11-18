@@ -352,12 +352,15 @@ describe("organization API-key boundary", () => {
       });
       assert.equal(await acceptedIssue, true);
       assert.equal(await revokeAfterIssue, true);
-      const token = await client.query<{ expires_at: Date }>(
-        `select expires_at from daemon_enrollment_tokens where id = $1`,
+      const token = await client.query<{ expired: boolean; expired_at_revocation: boolean }>(
+        `select token.expires_at <= clock_timestamp() as expired,
+                token.expires_at = keys.revoked_at as expired_at_revocation
+         from daemon_enrollment_tokens token
+         join organization_api_keys keys on keys.id = token.issued_by_api_key_id
+         where token.id = $1`,
         [issuedTokenId],
       );
-      assert.equal(token.rowCount, 1);
-      assert.ok(token.rows[0]!.expires_at <= new Date());
+      assert.deepEqual(token.rows, [{ expired: true, expired_at_revocation: true }]);
     } finally {
       await client.close();
       await database.close();
