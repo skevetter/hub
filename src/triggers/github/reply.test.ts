@@ -4,7 +4,7 @@ import { createGitHubReplyExecutor, githubReplyAvailable } from "./reply.js";
 
 describe("GitHub reply output", () => {
   it("posts a comment to the originating issue or pull request", async () => {
-    const createIssueComment = vi.fn(() => Promise.resolve());
+    const createIssueComment = vi.fn(() => Promise.resolve({ id: 1 }));
     const outputContext = {
       provider: "github",
       target: { installationId: 42, repository: "getpaseo/hub" },

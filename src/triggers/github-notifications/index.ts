@@ -15,6 +15,7 @@ import {
   type GitHubNotificationPoller,
   type GitHubNotificationStore,
   type PollResult,
+  type NotificationProgressRequest,
 } from "./poller.js";
 import type { NotificationPayload } from "./notification.js";
 
@@ -38,6 +39,7 @@ export interface GitHubNotificationsOptions {
   /** Injected in tests. Production uses the global fetch. */
   fetch?: NotificationFetch;
   clock?: NotificationClock;
+  onProgressRequested?: NotificationProgressRequest;
 }
 
 export interface NotificationClock {
@@ -103,6 +105,9 @@ export function createGitHubNotificationsSource(
       client,
       store,
       pollIntervalMs: options.pollIntervalMs,
+      ...(options.onProgressRequested === undefined
+        ? {}
+        : { onProgressRequested: options.onProgressRequested }),
       ...(options.maxThreadsPerPoll === undefined
         ? {}
         : { maxThreadsPerPoll: options.maxThreadsPerPoll }),

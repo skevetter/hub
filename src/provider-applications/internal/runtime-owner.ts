@@ -1,3 +1,4 @@
+import type { RunProgressSettings } from "../../run-progress/settings.js";
 import type { AuthServer } from "../../auth/server.js";
 import { createHash } from "node:crypto";
 import type { Database } from "../../db/types.js";
@@ -66,6 +67,7 @@ interface DynamicProviderRuntimeOptions {
   auth: AuthServer;
   applicationBaseUrl: string;
   fetch?: typeof fetch;
+  runProgress?: RunProgressSettings;
   registrationFactory?: (input: {
     provider: Provider;
     configuration: ProviderApplicationConfiguration;
@@ -231,7 +233,13 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
       ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
     };
     if (provider === "github" && configuration.provider === "github") {
-      return createGitHubRegistration({ ...shared, configuration });
+      return createGitHubRegistration({
+        ...shared,
+        configuration,
+        ...(this.options.runProgress === undefined
+          ? {}
+          : { runProgress: this.options.runProgress }),
+      });
     }
     if (provider === "slack" && configuration.provider === "slack") {
       return createSlackRegistration({

@@ -153,6 +153,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       database,
       auth,
       applicationBaseUrl: identity.appUrl,
+      runProgress,
     });
     const providerApplications = createProviderApplications({
       auth,

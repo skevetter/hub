@@ -24,6 +24,11 @@ export interface NotificationPollStatus {
   nextPollAt: Date | null;
 }
 
+export type NotificationProgressRequest = (run: {
+  organizationId: string;
+  triggerRunId: string;
+}) => Promise<void>;
+
 export interface DeliveryBatch {
   /** Oldest first, so a limit always leaves the newest threads for the next poll. */
   threads: readonly GitHubNotificationThread[];
@@ -54,7 +59,11 @@ export interface GitHubNotificationStore {
   readCursor(): Promise<NotificationCursor | undefined>;
   saveCursor(cursor: NotificationCursor, now: Date): Promise<void>;
   /** Starts runs and saves the cursor in one transaction. */
-  deliver(batch: DeliveryBatch, now: Date): Promise<DeliveryOutcome>;
+  deliver(
+    batch: DeliveryBatch,
+    now: Date,
+    onProgressRequested?: NotificationProgressRequest,
+  ): Promise<DeliveryOutcome>;
   /** A poll finished. Clears the last error. Does nothing before the first cursor exists. */
   recordSuccess(now: Date): Promise<void>;
   /** A poll failed. The message must already be free of the token. */
@@ -82,6 +91,7 @@ export function createGitHubNotificationPoller(options: {
   client: GitHubNotificationsClient;
   store: GitHubNotificationStore;
   pollIntervalMs: number;
+  onProgressRequested?: NotificationProgressRequest;
   /** Most threads delivered per poll. Defaults to 5. */
   maxThreadsPerPoll?: number;
 }): GitHubNotificationPoller {
@@ -135,6 +145,7 @@ export function createGitHubNotificationPoller(options: {
             }),
           },
           now,
+          options.onProgressRequested,
         );
         return {
           nextPollAt,

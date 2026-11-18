@@ -31,6 +31,7 @@ describe("GitHub Phase 1 trigger provider", () => {
       comments: {
         createIssueComment: async () => {
           comments += 1;
+          return { id: 1 };
         },
       },
     });
@@ -76,6 +77,7 @@ describe("GitHub Phase 1 trigger provider", () => {
         comments: {
           createIssueComment: async (input) => {
             comments.push(input);
+            return { id: 1 };
           },
         },
       });

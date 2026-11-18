@@ -232,6 +232,32 @@ describe("github notification polling", () => {
     expect(await fixture.count("provider_event_receipts")).toBe(2);
   });
 
+  it("requests progress once for an opted-in run after the delivery commits", async () => {
+    const { store, database, github } = await setup();
+    await store.save({
+      yaml: `progress_message: true
+${notificationYaml("with-progress")}`,
+      userId: null,
+    });
+    await store.save({ yaml: notificationYaml("without-progress"), userId: null });
+    const requested: string[] = [];
+    const poller = createGitHubNotificationPoller({
+      client: createGitHubNotificationsClient({ token: TOKEN, fetch: github.fetch }),
+      store: database.githubNotifications,
+      pollIntervalMs: INTERVAL_MS,
+      async onProgressRequested({ organizationId, triggerRunId }) {
+        const run = await database.findTriggerRunForOrganization(organizationId, triggerRunId);
+        if (run?.outcome === "accepted") requested.push(run.configuredTriggerName);
+      },
+    });
+    await poller.poll(T0);
+    github.reply([webapp]);
+    expect(await poller.poll(after(INTERVAL_MS))).toMatchObject({ started: 2 });
+    github.reply([webapp]);
+    expect(await poller.poll(after(2 * INTERVAL_MS))).toMatchObject({ started: 0 });
+    expect(requested).toEqual(["with-progress"]);
+  });
+
   it("is safe when two deliveries overlap and when two processes poll together", async () => {
     const fixture = await setup();
     await fixture.store.save({ yaml: notificationYaml("all-notifications"), userId: null });

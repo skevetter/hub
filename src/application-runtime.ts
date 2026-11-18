@@ -42,6 +42,7 @@ import type { ScriptLimits } from "./workflows/script-limits.js";
 import { runShutdownStage } from "./shutdown-stage.js";
 import type { TriggerHandler } from "./triggers/index.js";
 import type { WebhookOptions } from "./webhook-config.js";
+import { GitHubProgressProvider } from "./run-progress/github.js";
 import { readRunProgressSettings, type RunProgressSettings } from "./run-progress/settings.js";
 import { ProgressReporter, type ProgressProvider } from "./run-progress/index.js";
 import { TimelineRetention } from "./run-timeline/retention.js";
@@ -404,7 +405,11 @@ function createProgressReporter(
     (registration) => "progressProvider" in registration,
   );
   const providers = progressProviders ?? [];
-  if (registered.length === 0 && providers.length === 0)
+  const tokenProvider =
+    runProgress.githubToken === undefined
+      ? undefined
+      : new GitHubProgressProvider({ database, settings: runProgress });
+  if (registered.length === 0 && providers.length === 0 && tokenProvider === undefined)
     return { hubOptions: {}, start: () => undefined };
 
   const reporter = new ProgressReporter({
@@ -412,15 +417,17 @@ function createProgressReporter(
     bus,
     settings: runProgress,
     // Provider applications can activate or be replaced after Hub starts.
-    providers:
-      registered.length === 0
-        ? providers
-        : () => [
-            ...providers,
-            ...registered.flatMap(({ progressProvider }) =>
-              progressProvider === undefined ? [] : [progressProvider],
-            ),
-          ],
+    providers: () => {
+      const active = [
+        ...providers,
+        ...registered.flatMap(({ progressProvider }) =>
+          progressProvider === undefined ? [] : [progressProvider],
+        ),
+      ];
+      if (tokenProvider !== undefined && !active.some(({ name }) => name === "github"))
+        active.push(tokenProvider);
+      return active;
+    },
     publicBaseUrl,
     reportFailure: (code, scope) =>
       reportFailure(

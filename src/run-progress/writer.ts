@@ -7,6 +7,7 @@ import type {
 } from "../run-timeline/store.js";
 import { isRunTimelineExpired, retentionCutoff } from "../run-timeline/retention.js";
 import { CREDENTIAL_CIRCUIT_MS, CredentialBackoff } from "./backoff.js";
+import { GitHubProgressProvider } from "./github.js";
 import { renderProgress } from "./render.js";
 import type { RunProgressSettings } from "./settings.js";
 import {
@@ -154,7 +155,7 @@ interface Operation {
   budget: Budget;
 }
 
-function credentialKey({ lease, ref }: Operation): string {
+function credentialKey({ lease, ref }: Pick<Operation, "lease" | "ref">): string {
   return createHash("sha256")
     .update(JSON.stringify([lease.provider, ref.credential]))
     .digest("hex");
@@ -185,6 +186,7 @@ const FAILURE_CODES = new Set([
   "public_repo",
   "public_repository",
   "reauthorize",
+  "rejected",
   "repo_not_allowed",
   "scope_missing",
   "sso_required",
@@ -296,7 +298,7 @@ export class MessageWriter {
     budget: Budget,
   ): Promise<WriteResult> {
     const { database, clock } = this.options;
-    if (lease.state === "creating") return this.stopMessage(lease, "abandoned", "create_unknown");
+    if (lease.state === "creating") return this.recoverCreate(lease, provider, budget);
     const expired = previous.leaseOwner !== null && lease.version === previous.version + 1;
     if (expired && lease.state === "active") {
       const generation = await budget.run(() =>
@@ -335,6 +337,49 @@ export class MessageWriter {
       if (due > clock.now()) return { ...(await this.release(lease, {}, due)), regularPace: true };
     }
     return this.prepare(lease, run, kind, provider, budget);
+  }
+
+  private async recoverCreate(
+    lease: RunProgressMessage,
+    provider: ProgressProvider,
+    budget: Budget,
+  ): Promise<WriteResult> {
+    if (!(provider instanceof GitHubProgressProvider))
+      return this.stopMessage(lease, "abandoned", "create_unknown");
+    const { database, clock, backoff, settings } = this.options;
+    const run = await budget.run(() =>
+      database.findTriggerRunForOrganization(lease.organizationId, lease.triggerRunId),
+    );
+    if (run?.outcome !== "accepted") return this.stopMessage(lease, "abandoned", "create_unknown");
+    if (isRunTimelineExpired(run, retentionCutoff(new Date(clock.now()), settings.retentionDays)))
+      return this.release(lease);
+    const target = provider.destination(run);
+    if (target === undefined) return this.stopMessage(lease, "abandoned", "create_unknown");
+    const shared = await budget.run(() =>
+      database.readProgressCredentialCooldown(credentialKey({ lease, ref: target })),
+    );
+    const admission = backoff.admit(target.credential, clock.now(), shared);
+    if ("waitUntil" in admission) return this.release(lease, {}, admission.waitUntil);
+    if ("rejected" in admission) return this.stopMessage(lease, "abandoned", "create_unknown");
+    try {
+      const found = await budget
+        .run((signal) => provider.adopt(run, signal), PROVIDER_MS)
+        .catch(() => undefined);
+      if (found === undefined) return this.stopMessage(lease, "abandoned", "create_unknown");
+      return this.release(
+        lease,
+        {
+          state: "active",
+          externalRef: found,
+          lastEditAt: new Date(clock.now()),
+          retryAt: null,
+          failure: null,
+        },
+        clock.now(),
+      );
+    } finally {
+      admission.release();
+    }
   }
 
   private kind(
@@ -429,15 +474,29 @@ export class MessageWriter {
       let authorization: Awaited<ReturnType<ProgressProvider["authorize"]>>;
       let secrets: readonly string[] = [];
       try {
+        let visibility: Pick<Patch, "visibility" | "visibilityCheckedAt"> | undefined;
         authorization = await budget.run(
           (signal) =>
-            provider.authorize(
-              locator,
-              { id: run.id, organizationId: run.organizationId, projectId: run.projectId },
-              signal,
-            ),
+            provider instanceof GitHubProgressProvider
+              ? provider.authorize(locator, run, signal, {
+                  visibility: lease.visibility,
+                  visibilityCheckedAt: lease.visibilityCheckedAt,
+                  now: clock.now(),
+                  expectedRepositoryId:
+                    typeof ref["repositoryId"] === "number" ? ref["repositoryId"] : undefined,
+                  force: run.status !== "running",
+                  record: (result) => {
+                    visibility = result;
+                  },
+                })
+              : provider.authorize(locator, run, signal),
           PROVIDER_MS,
         );
+        const visibilityPatch = visibility;
+        if (visibilityPatch !== undefined) {
+          const updated = await budget.run(() => this.update(lease, visibilityPatch, false));
+          if (updated === undefined) return {};
+        }
         if (authorization === "ok")
           secrets = await budget.run((signal) => provider.secrets(locator, signal), PROVIDER_MS);
       } catch {

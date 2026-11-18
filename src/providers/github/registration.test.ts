@@ -15,10 +15,36 @@ import {
 import type { ProjectRecord, StartConnectionAttemptInput } from "../../db/types.js";
 import type { GitHubConnectionClient } from "./client.js";
 import { createGitHubRegistration } from "./index.js";
+import { readRunProgressSettings } from "../../run-progress/settings.js";
 import type { GitHubConfigurationProvider } from "../../configuration/github-sync.js";
 import { configurationBundleFixture } from "../../test-utils/configuration-bundle.js";
 
 describe("GitHub registration", () => {
+  it("registers GitHub progress only for an enabled and configured App", () => {
+    const options = {
+      database: createMemoryDatabase(),
+      auth: null,
+      applicationBaseUrl: "https://hub.test",
+      publicBaseUrl: "https://hub.test",
+      configuration: githubConfiguration(),
+      appAuth: githubAuth(),
+    };
+    const enabled = readRunProgressSettings({
+      PASEO_HUB_RUN_TIMELINE: "true",
+      PASEO_HUB_PROGRESS_MESSAGES: "true",
+    });
+    assert.equal(createGitHubRegistration(options).progressProvider, undefined);
+    assert.equal(
+      createGitHubRegistration({ ...options, configuration: null, runProgress: enabled })
+        .progressProvider,
+      undefined,
+    );
+    assert.equal(
+      createGitHubRegistration({ ...options, runProgress: enabled }).progressProvider?.name,
+      "github",
+    );
+  });
+
   it("synchronizes the default branch at the exact push SHA and preserves the valid revision", async () => {
     const database = createMemoryDatabase();
     await enrollTestDaemon(database);

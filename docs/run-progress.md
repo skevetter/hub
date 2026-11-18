@@ -51,3 +51,38 @@ the run's Linear destination, or when the stored reference lacks the bound issue
 A connection rebind can commit after the final database lookup takes its snapshot and before
 the HTTP request is sent. In that window, a comment mutation can use the previous binding's
 token. The Linear organization ID still identifies the same workspace.
+
+## GitHub
+
+GitHub progress uses one conversation comment on the source issue or pull request. For GitHub
+App events, enable progress messages and configure the existing GitHub App. The App needs
+Issues or Pull requests write access on the repository. Hub checks that the active installation
+belongs to the run's organization and that the installation synced the repository before each
+write. Start live verification with the App on a repository you own.
+
+Notification runs can use a separate write credential. Configure both
+`PASEO_HUB_PROGRESS_GITHUB_TOKEN` and `PASEO_HUB_PROGRESS_GITHUB_ORGS` to enable this path.
+Hub reads the variables at startup. Restart Hub to rotate the token or change the mapping.
+A token without a mapping stops startup. The token should have write access only to the
+intended repositories. Hub warns if GitHub reports a broad classic token scope. The
+`GITHUB_NOTIFICATIONS_TOKEN` setting is used by the notification poller.
+
+| Setting                           | Default  | Accepted values                                                                                                                                          |
+| --------------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PASEO_HUB_PROGRESS_GITHUB_TOKEN` | Unset    | A separate GitHub comment-write token for notification runs.                                                                                             |
+| `PASEO_HUB_PROGRESS_GITHUB_ORGS`  | Unset    | `slug:owner/repo,owner/repo;other-slug:owner/*`. Maximum 20 Hub organization slugs and 100 repository patterns. Repository matching is case-insensitive. |
+| `PASEO_HUB_PROGRESS_PUBLIC_REPOS` | `refuse` | `refuse` or `allow`.                                                                                                                                     |
+
+The public repository setting applies to both credentials. Hub rechecks repository visibility
+when the previous check is ten minutes old and before the final edit. If a private repository
+becomes public under the `refuse` policy, Hub stops updating the comment. The existing comment
+remains visible. If GitHub cannot confirm visibility, Hub stops after three failed checks.
+
+Hub never retries an uncertain create. If the process restarts after posting and before saving
+the comment ID, Hub looks for the run's hidden marker on one page of recent comments. Hub adopts
+a unique match from the authenticated GitHub actor. Credential rotation can prevent adoption.
+A recovery miss ends the message without creating a replacement.
+
+Automated tests use fake GitHub responses to verify both credential paths, organization and
+repository checks, visibility changes, rate limits, and crash recovery. Verify the live App's
+installation permissions separately before enabling the reporter on an opted-in trigger.

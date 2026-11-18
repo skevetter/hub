@@ -16,6 +16,7 @@ import type {
   GitHubNotificationStore,
   NotificationCursor,
   NotificationPollStatus,
+  NotificationProgressRequest,
 } from "../poller.js";
 
 const SOURCE = "notifications";
@@ -111,8 +112,14 @@ export class GitHubNotificationRepository implements GitHubNotificationStore {
    * are handled oldest first. Once `limit` threads have started runs, the next thread that would
    * start one stops delivery and the cursor is set to resume behind the last delivered thread.
    */
-  async deliver(batch: DeliveryBatch, now: Date): Promise<DeliveryOutcome> {
-    return this.runtime.transaction(async (transaction) => {
+  async deliver(
+    batch: DeliveryBatch,
+    now: Date,
+    onProgressRequested?: NotificationProgressRequest,
+  ): Promise<DeliveryOutcome> {
+    const optedIn: Parameters<NotificationProgressRequest>[0][] | undefined =
+      onProgressRequested === undefined ? undefined : [];
+    const outcome = await this.runtime.transaction(async (transaction) => {
       const triggers = await listTriggers(transaction);
       let started = 0;
       let delivered = 0;
@@ -127,7 +134,7 @@ export class GitHubNotificationRepository implements GitHubNotificationStore {
           deferred = true;
           break;
         }
-        started += await deliverThread(transaction, matches, fresh, payload, now);
+        started += await deliverThread(transaction, matches, fresh, payload, now, optedIn);
         delivered++;
         const updated = Date.parse(thread.updated_at);
         lastDelivered = Number.isFinite(updated) ? new Date(updated) : undefined;
@@ -139,6 +146,9 @@ export class GitHubNotificationRepository implements GitHubNotificationStore {
       );
       return { started, deferred };
     });
+    if (onProgressRequested !== undefined && optedIn !== undefined)
+      await Promise.allSettled(optedIn.map(async (run) => onProgressRequested(run)));
+    return outcome;
   }
 }
 
@@ -216,6 +226,7 @@ async function deliverThread(
   organizations: ReadonlySet<string>,
   payload: NotificationPayload,
   now: Date,
+  optedIn: Parameters<NotificationProgressRequest>[0][] | undefined,
 ): Promise<number> {
   let started = 0;
   for (const organizationId of organizations) {
@@ -249,7 +260,7 @@ async function deliverThread(
     // The organization already received this thread update on an earlier or overlapping poll.
     if (inserted.rowCount === 0) continue;
     for (const { row, trigger } of own) {
-      await acceptWorkflowRun(transaction, {
+      const accepted = await acceptWorkflowRun(transaction, {
         organizationId,
         projectId: row.runtime_project_id,
         configurationRevisionId: row.configuration_revision_id,
@@ -264,6 +275,8 @@ async function deliverThread(
         stepIds: trigger.steps.map(({ id }) => id),
         createdAt: now,
       });
+      if (accepted.created && trigger.progressMessage === true)
+        optedIn?.push({ organizationId, triggerRunId: accepted.id });
       started++;
     }
   }

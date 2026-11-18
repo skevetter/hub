@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { OutputExecutor } from "../../execution-capabilities/outputs.js";
 
 const GitHubReplyArgsSchema = z.object({ content: z.string().min(1) });
-const GitHubReplyOutputContextSchema = z.object({
+export const GitHubReplyOutputContextSchema = z.object({
   provider: z.literal("github"),
   target: z.object({
     installationId: z.number().int().positive(),
@@ -27,7 +27,29 @@ export interface GitHubReplyClient {
     repo: string;
     issueNumber: number;
     body: string;
+  }): Promise<{ id: number }>;
+}
+
+export interface GitHubCommentClient extends GitHubReplyClient {
+  updateIssueComment(input: {
+    installationId: number;
+    owner: string;
+    repo: string;
+    commentId: number;
+    body: string;
   }): Promise<void>;
+}
+
+export function issueCommentsPath(owner: string, repo: string, issueNumber: number): string {
+  return `${repositoryPath(owner, repo)}/issues/${issueNumber}/comments`;
+}
+
+export function issueCommentPath(owner: string, repo: string, commentId: number): string {
+  return `${repositoryPath(owner, repo)}/issues/comments/${commentId}`;
+}
+
+export function repositoryPath(owner: string, repo: string): string {
+  return `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 }
 
 export function createGitHubReplyExecutor(options: { client: GitHubReplyClient }): OutputExecutor {

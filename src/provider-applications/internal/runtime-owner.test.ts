@@ -82,6 +82,7 @@ describe("dynamic provider runtime", () => {
               client: {
                 createIssueComment: async (comment) => {
                   comments.push(comment);
+                  return { id: 1 };
                 },
               },
             }),

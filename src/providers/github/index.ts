@@ -1,5 +1,7 @@
 import { createGitHubLifecycle } from "./lifecycle.js";
 import { createHash } from "node:crypto";
+import { GitHubProgressProvider } from "../../run-progress/github.js";
+import type { RunProgressSettings } from "../../run-progress/settings.js";
 import type { AuthServer } from "../../auth/server.js";
 import { createGitHubAuth, repositoryNamesForAccount, type GitHubAuth } from "../../auth/github.js";
 import { DatabaseUnavailableError } from "../../db/errors.js";
@@ -40,7 +42,12 @@ import { createGitHubConfigurationProvider } from "./configuration.js";
 import type { ConnectionResolutionContext } from "../../config/connections.js";
 import type { ProjectConfigurationStore } from "../../configuration/store.js";
 import { replyOutputTool } from "../../execution-capabilities/outputs.js";
-import { createGitHubReplyExecutor, githubReplyAvailable } from "../../triggers/github/reply.js";
+import {
+  createGitHubReplyExecutor,
+  githubReplyAvailable,
+  issueCommentPath,
+  type GitHubCommentClient,
+} from "../../triggers/github/reply.js";
 
 export interface GitHubRegistrationConfiguration {
   appId: string;
@@ -64,6 +71,7 @@ export interface CreateGitHubRegistrationOptions {
   fetch?: typeof fetch;
   configurationProvider?: GitHubConfigurationProvider;
   configurationVersion?: number;
+  runProgress?: RunProgressSettings;
 }
 
 interface GitHubConnectionOptions {
@@ -90,7 +98,11 @@ export function createGitHubRegistration(
 
   const appAuth =
     options.appAuth ??
-    createGitHubAuth({ appId: configuration.appId, privateKey: configuration.privateKey });
+    createGitHubAuth({
+      appId: configuration.appId,
+      privateKey: configuration.privateKey,
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+    });
   const client =
     options.connectionClient ??
     createGitHubConnectionClient({
@@ -162,21 +174,18 @@ export function createGitHubRegistration(
     },
   });
   const reactions = options.reactionClient ?? createGitHubReactionClient(appAuth);
-  const comments = {
-    async createIssueComment(input: {
-      installationId: number;
-      owner: string;
-      repo: string;
-      issueNumber: number;
-      body: string;
-    }) {
-      const octokit = await appAuth.createInstallationOctokit(input.installationId);
-      await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
-        owner: input.owner,
-        repo: input.repo,
-        issue_number: input.issueNumber,
-        body: input.body,
-      });
+  const comments: GitHubCommentClient = {
+    async createIssueComment({ installationId, owner, repo, issueNumber, body }) {
+      const octokit = await appAuth.createInstallationOctokit(installationId);
+      const response = await octokit.request(
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
+        { owner, repo, issue_number: issueNumber, body },
+      );
+      return { id: response.data.id };
+    },
+    async updateIssueComment({ installationId, owner, repo, commentId, body }) {
+      const octokit = await appAuth.createInstallationOctokit(installationId);
+      await octokit.request(`PATCH ${issueCommentPath(owner, repo, commentId)}`, { body });
     },
   };
   logger.info("using webhook event source");
@@ -186,6 +195,21 @@ export function createGitHubRegistration(
       callbackOrigin: options.publicBaseUrl,
     },
     connection,
+    ...(options.runProgress?.progressMessagesEnabled !== true
+      ? {}
+      : {
+          progressProvider: new GitHubProgressProvider({
+            database,
+            settings: options.runProgress,
+            app: {
+              id: configuration.appId,
+              slug: configuration.appSlug,
+              privateKey: configuration.privateKey,
+              auth: appAuth,
+            },
+            ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+          }),
+        }),
     integration: {
       async resolve(projectId, connectionSlug, value, context?: ConnectionResolutionContext) {
         if (value !== "token") {

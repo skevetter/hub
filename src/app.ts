@@ -1,3 +1,4 @@
+import { logger } from "./logger.js";
 import type { RunTimeline } from "./run-timeline/index.js";
 import type { RunTimelineReconciler } from "./run-timeline/reconcile.js";
 import type { RunStream } from "./run-stream/index.js";
@@ -582,12 +583,26 @@ function createAppDaemonModule(
 }
 
 function appNotificationSource(options: HubRuntimeOptions): TriggerSource | undefined {
-  return options.database === null || options.githubNotifications === undefined
-    ? undefined
-    : createGitHubNotificationsSource(
-        options.database.githubNotifications,
-        options.githubNotifications,
-      );
+  const { database, githubNotifications, onProgressRequested } = options;
+  if (database === null || githubNotifications === undefined) return undefined;
+  return createGitHubNotificationsSource(database.githubNotifications, {
+    ...githubNotifications,
+    ...(onProgressRequested === undefined
+      ? {}
+      : {
+          async onProgressRequested({ organizationId, triggerRunId }) {
+            try {
+              const run = await database.findTriggerRunForOrganization(
+                organizationId,
+                triggerRunId,
+              );
+              if (run?.outcome === "accepted") await onProgressRequested(run);
+            } catch {
+              logger.warn({ triggerRunId }, "could not request run progress");
+            }
+          },
+        }),
+  });
 }
 
 function appScheduleSource(database: Database | null): TriggerSource | undefined {
