@@ -59,7 +59,9 @@ export function createDatabasePublicOperationRepository(
       const trigger = (await database.listOrganizationTriggers(organizationId)).find(
         ({ name, enabled }) => name === triggerName && enabled,
       );
-      return trigger === undefined ? undefined : { id: trigger.runtimeProjectId };
+      return trigger === undefined
+        ? undefined
+        : { id: trigger.runtimeProjectId, triggerId: trigger.id };
     },
     findWebhookReceipt: (organizationId, deliveryId) =>
       database.findProviderEventReceiptByDeliveryId(deliveryId, organizationId),

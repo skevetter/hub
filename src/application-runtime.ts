@@ -138,7 +138,11 @@ async function createOwnedApplicationRuntime(
     publicApi:
       options.auth?.publicCredentials === undefined
         ? { status: "unavailable" }
-        : { status: "enabled", authenticator: options.auth.publicCredentials },
+        : {
+            status: "enabled",
+            authenticator: options.auth.publicCredentials,
+            webhookKeys: options.auth.apiKeys,
+          },
     ...(options.publicBaseUrl === undefined ? {} : { publicBaseUrl: options.publicBaseUrl }),
     ...(options.completionTokenSecret === undefined
       ? {}

@@ -6,6 +6,7 @@ import type { DatabaseRuntime, DrizzleHandle } from "./runtime/index.js";
 import * as schema from "./schema.js";
 import { ConnectionRepository, replaceGitHubRepositories } from "./connections.js";
 import type {
+  BoundWebhookTrigger,
   AcceptDiscordEventInput,
   AcceptGitHubEventInput,
   AcceptLinearEventInput,
@@ -166,34 +167,30 @@ export class ProviderEventAcceptanceRepository {
 
   persistManual(input: PersistManualEventInput): Promise<ManualEventPersistence> {
     return this.database.transaction(async (transaction) => {
+      const binding = input.boundWebhookTrigger;
+      const projectQuery = manualProject(transaction, input);
+      const boundRevision =
+        binding === undefined
+          ? undefined
+          : await lockBoundWebhookTarget(transaction, input, binding);
       const existing = await findReceipt(transaction, input, input.organizationId);
       if (existing !== undefined) {
         const route = parseAcceptedRoutes(existing.acceptedRoutes)?.[0];
         if (route === undefined) {
           return { status: "duplicate", providerEventReceiptId: existing.id, replayed: true };
         }
+        if (binding !== undefined) await assertBoundReceipt(transaction, input, route, binding.id);
         return {
           status: "accepted",
           replayed: true,
           event: eventFromReceipt(existing, route),
         };
       }
-      const [project] = await transaction
-        .select({ configurationRevisionId: schema.projects.activeConfigurationRevisionId })
-        .from(schema.projects)
-        .where(
-          and(
-            eq(schema.projects.id, input.projectId),
-            eq(schema.projects.organizationId, input.organizationId),
-            eq(schema.projects.status, "active"),
-          ),
-        );
-      if (project?.configurationRevisionId === null || project === undefined) {
-        throw new ManualRunRejected("configuration_not_found");
-      }
+      const activeRevision = boundRevision ?? (await projectQuery)[0]?.configurationRevisionId;
+      if (activeRevision == null) throw new ManualRunRejected("configuration_not_found");
       const route: ProviderEventRouteSnapshot = {
         projectId: input.projectId,
-        configurationRevisionId: project.configurationRevisionId,
+        configurationRevisionId: activeRevision,
         connectionId: input.connectionId ?? null,
         resourceId: input.resourceId ?? null,
       };
@@ -210,6 +207,8 @@ export class ProviderEventAcceptanceRepository {
         if (duplicate === undefined || duplicateRoute === undefined) {
           return { status: "duplicate", providerEventReceiptId: receipt.id, replayed: true };
         }
+        if (binding !== undefined)
+          await assertBoundReceipt(transaction, input, duplicateRoute, binding.id);
         return {
           status: "accepted",
           event: eventFromReceipt(duplicate, duplicateRoute),
@@ -475,6 +474,91 @@ function eventFromReceipt(
     connectionId: route.connectionId,
     resourceId: route.resourceId,
   };
+}
+
+function manualProject(transaction: HubTransaction, input: PersistManualEventInput) {
+  return transaction
+    .select({ configurationRevisionId: schema.projects.activeConfigurationRevisionId })
+    .from(schema.projects)
+    .where(
+      and(
+        eq(schema.projects.id, input.projectId),
+        eq(schema.projects.organizationId, input.organizationId),
+        eq(schema.projects.status, "active"),
+      ),
+    );
+}
+
+async function lockBoundWebhookTarget(
+  transaction: HubTransaction,
+  input: PersistManualEventInput,
+  binding: BoundWebhookTrigger,
+): Promise<string> {
+  const triggers = schema.organizationTriggers;
+  const [trigger] = await transaction
+    .select({ id: triggers.id })
+    .from(triggers)
+    .where(
+      and(
+        eq(triggers.id, binding.id),
+        eq(triggers.name, binding.name),
+        eq(triggers.organizationId, input.organizationId),
+        eq(triggers.runtimeProjectId, input.projectId),
+        eq(triggers.enabled, true),
+      ),
+    )
+    .for("share");
+  if (trigger === undefined) throw new ManualRunRejected("configuration_not_found");
+  const [project] = await manualProject(transaction, input).for("share");
+  if (project?.configurationRevisionId !== binding.configurationRevisionId) {
+    throw new ManualRunRejected("configuration_not_found");
+  }
+  await assertBoundRevision(
+    transaction,
+    input.organizationId,
+    input.projectId,
+    binding.id,
+    binding.configurationRevisionId,
+  );
+  return binding.configurationRevisionId;
+}
+
+async function assertBoundReceipt(
+  transaction: HubTransaction,
+  input: PersistManualEventInput,
+  route: ProviderEventRouteSnapshot,
+  triggerId: string,
+): Promise<void> {
+  if (route.projectId !== input.projectId) throw new ManualRunRejected("configuration_not_found");
+  return assertBoundRevision(
+    transaction,
+    input.organizationId,
+    input.projectId,
+    triggerId,
+    route.configurationRevisionId,
+  );
+}
+
+async function assertBoundRevision(
+  transaction: HubTransaction,
+  organizationId: string,
+  projectId: string,
+  triggerId: string,
+  revisionId: string,
+): Promise<void> {
+  const revisions = schema.projectConfigurationRevisions;
+  const [revision] = await transaction
+    .select({ id: revisions.id })
+    .from(revisions)
+    .where(
+      and(
+        eq(revisions.id, revisionId),
+        eq(revisions.projectId, projectId),
+        eq(revisions.organizationId, organizationId),
+        sql`${revisions.sourceEvidence}->>'triggerId' = ${triggerId}`,
+      ),
+    );
+  if (revision === undefined) throw new ManualRunRejected("configuration_not_found");
 }
 
 async function findReceipt(

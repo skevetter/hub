@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { BoundWebhookTrigger } from "../../db/types.js";
 
 export const ManualTriggerPayloadSchema = z.object({
   organizationId: z.string().min(1, "organizationId is required"),
@@ -25,4 +26,6 @@ export const ManualTriggerPayloadSchema = z.object({
   payload: z.unknown(),
 });
 
-export type ManualTriggerInput = z.infer<typeof ManualTriggerPayloadSchema>;
+export type ManualTriggerInput = z.infer<typeof ManualTriggerPayloadSchema> & {
+  boundWebhookTrigger?: BoundWebhookTrigger;
+};

@@ -3,6 +3,9 @@ import type { Logger } from "pino";
 import { logger as defaultLogger } from "../logger.js";
 import { DEFAULT_WEBHOOK_OPTIONS, type WebhookOptions } from "../webhook-config.js";
 import { WebhookRateLimiter } from "./rate-limit.js";
+import type { OrganizationApiKeys } from "../auth/api-keys.js";
+import { githubBodyDigest, parseGitHubSignature } from "../auth/webhook-signatures.js";
+import { SigningRequestError, type WebhookSigner } from "../auth/webhook-secret-store.js";
 import type { OperationAuthenticator } from "../auth/operation-auth.js";
 import { isDatabaseUnavailableError } from "../db/errors.js";
 import { reportFailure } from "../failures/index.js";
@@ -68,7 +71,11 @@ export interface PublicApi {
 }
 
 export type PublicApiComposition =
-  | { status: "enabled"; authenticator: OperationAuthenticator }
+  | {
+      status: "enabled";
+      authenticator: OperationAuthenticator;
+      webhookKeys?: OrganizationApiKeys | undefined;
+    }
   | { status: "unavailable" };
 
 export interface PublicApiOptions {
@@ -82,12 +89,16 @@ interface WebhookRequestLog {
   trigger: string | null;
   bytes: number;
   deliveryKeyHash: string | null;
+  authenticationMode?: "hmac";
+  signatureProfile?: "github_sha256";
+  matchedSlot?: "current" | "previous";
 }
 
 interface ApiExecutionOptions {
   webhookOptions: WebhookOptions;
   limiter: WebhookRateLimiter;
   log: WebhookRequestLog | undefined;
+  hook: WebhookRoute | undefined;
 }
 
 interface StreamingRequestInit extends RequestInit {
@@ -99,12 +110,21 @@ const responseMetadata = new WeakMap<
   { code: string | null; duplicate: boolean | null }
 >();
 
-function webhookTrigger(pathname: string): string | undefined {
-  const match = /^\/api\/v1\/hooks\/([^/]+)$/u.exec(pathname);
+interface WebhookRoute {
+  trigger: string;
+  keyId?: string;
+}
+
+function webhookRoute(pathname: string): WebhookRoute | undefined {
+  const match =
+    /^\/api\/v1\/hooks\/([^/]+)(?:\/signers\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))?$/u.exec(
+      pathname,
+    );
   if (match === null) return undefined;
   try {
     const trigger = decodeURIComponent(match[1]!);
-    return /^[a-z][a-z0-9_-]*$/u.test(trigger) ? trigger : undefined;
+    if (!/^[a-z][a-z0-9_-]*$/u.test(trigger)) return undefined;
+    return { trigger, ...(match[2] === undefined ? {} : { keyId: match[2] }) };
   } catch {
     return undefined;
   }
@@ -127,14 +147,15 @@ export function createPublicApi(
     const isHook =
       pathname === "/api/v1/hooks" ||
       pathname.startsWith("/api/v1/hooks/") ||
-      operationId === "receiveWebhook";
+      operationId === "receiveWebhook" ||
+      operationId === "receiveGitHubWebhook";
     const startedAt = now();
     const requestId = requestIdentifier(request);
-    const trigger = webhookTrigger(pathname);
+    const hook = webhookRoute(pathname);
     const log: WebhookRequestLog | undefined = isHook
-      ? { keyId: null, trigger: trigger ?? null, bytes: 0, deliveryKeyHash: null }
+      ? { keyId: null, trigger: hook?.trigger ?? null, bytes: 0, deliveryKeyHash: null }
       : undefined;
-    const execution = { webhookOptions, limiter, log };
+    const execution = { webhookOptions, limiter, log, hook };
     const response = await routeRequest(
       request,
       requestId,
@@ -188,7 +209,8 @@ async function routeRequest(
         "No matching webhook trigger exists.",
       );
     }
-    return executeSafely("receiveWebhook", request, requestId, composition, operations, options);
+    const id = options.hook?.keyId === undefined ? "receiveWebhook" : "receiveGitHubWebhook";
+    return executeSafely(id, request, requestId, composition, operations, options);
   }
   if (operationId !== undefined) {
     return executeSafely(operationId, request, requestId, composition, operations, options);
@@ -239,6 +261,9 @@ function logWebhookResponse(
   const fields = {
     operation: "webhook.received",
     ...log,
+    ...(log.authenticationMode === "hmac" && response.status >= 400
+      ? { failureCategory: signedFailureCategory(response.status) }
+      : {}),
     status: response.status,
     code,
     durationMs,
@@ -248,6 +273,13 @@ function logWebhookResponse(
   if (response.status >= 400 && response.status < 500 && response.status !== 401)
     logger.warn(fields);
   else logger.info(fields);
+}
+
+function signedFailureCategory(status: number): string {
+  if (status === 401) return "auth_rejected";
+  if (status === 503) return "unavailable";
+  if (status === 400 || status === 413 || status === 415) return "representation";
+  return "dispatch";
 }
 
 async function executeSafely(
@@ -268,10 +300,27 @@ async function executeSafely(
         "Public API authentication or storage is currently unavailable.",
       );
     }
+    if (id === "receiveGitHubWebhook") {
+      return await executeSignedWebhook(
+        request,
+        requestId,
+        operations,
+        options,
+        options.hook!.keyId!,
+        composition.webhookKeys,
+      );
+    }
+    if (
+      id === "receiveWebhook" &&
+      (request.headers.has("x-hub-signature-256") ||
+        request.headers.has("x-hub-signature") ||
+        request.headers.has("x-paseo-signature"))
+    )
+      return signedUnauthorized(requestId);
     return await execute(id, request, requestId, composition.authenticator, operations, options);
   } catch (error) {
     reportFailure(
-      error,
+      options.hook?.keyId === undefined ? error : new Error("Signed webhook operation failed"),
       {
         operation: `public-api.${id}`,
         component: "public-api",
@@ -346,23 +395,7 @@ async function execute(
     }
     const parsed = await readWebhook(request, requestId, options);
     if (parsed instanceof Response) return parsed;
-    const bucket = options.limiter.take(access.credentialId);
-    if (!bucket.allowed) {
-      return problem(
-        requestId,
-        429,
-        "rate_limited",
-        "Rate limited",
-        "The API key has exceeded its webhook rate limit.",
-        undefined,
-        { "Retry-After": String(bucket.retryAfter) },
-      );
-    }
-    return operationResponse(
-      "webhook",
-      requestId,
-      await definition.invoke(operations, access, parsed),
-    );
+    return deliverWebhook(requestId, operations, options, access, parsed);
   }
   let input: unknown;
   if (definition.requestSchema !== undefined) {
@@ -571,6 +604,166 @@ function validationResponse(requestId: string, result: ValidateConfigurationResu
   return assertNever(result);
 }
 
+async function executeSignedWebhook(
+  request: Request,
+  requestId: string,
+  operations: PublicOperations,
+  options: ApiExecutionOptions,
+  keyId: string,
+  keys: OrganizationApiKeys | undefined,
+): Promise<Response> {
+  if (options.log !== undefined) {
+    options.log.authenticationMode = "hmac";
+    options.log.signatureProfile = "github_sha256";
+  }
+  const proof = await authenticateSignedWebhook(request, requestId, options, keyId, keys);
+  if (proof instanceof Response) return proof;
+  const { access, bytes } = proof;
+  const text = decodeWebhookText(bytes, requestId);
+  if (text instanceof Response) return text;
+  const payload = parseWebhookPayload(text, "application/json", requestId);
+  if (payload instanceof Response) return payload;
+  const bodyDigest = githubBodyDigest(bytes);
+  const deliveryKey = `github-sha256:${bodyDigest}`;
+  const requestedKey = request.headers.get("idempotency-key");
+  if (requestedKey !== null && requestedKey !== deliveryKey) {
+    return problem(
+      requestId,
+      400,
+      "invalid_request",
+      "Invalid request",
+      "Idempotency-Key must match the signed body's delivery key when supplied.",
+    );
+  }
+  return deliverWebhook(
+    requestId,
+    operations,
+    options,
+    access,
+    {
+      ...payload,
+      trigger: options.hook!.trigger,
+      deliveryKey,
+      githubSignature: { targetTriggerId: access.targetTriggerId, bodyDigest },
+    },
+    proof.keys,
+  );
+}
+
+async function authenticateSignedWebhook(
+  request: Request,
+  requestId: string,
+  options: ApiExecutionOptions,
+  keyId: string,
+  keys: OrganizationApiKeys | undefined,
+): Promise<{ access: WebhookSigner; bytes: Uint8Array; keys: OrganizationApiKeys } | Response> {
+  const signature = parseGitHubSignature(request.headers.get("x-hub-signature-256"));
+  if (
+    signature === undefined ||
+    request.headers.has("authorization") ||
+    request.headers.has("x-paseo-signature")
+  )
+    return signedUnauthorized(requestId);
+
+  const state = keys?.signing.availability();
+  if (keys === undefined || state === "disabled") return signedUnauthorized(requestId);
+  if (state === "unavailable") return signedUnavailable(requestId);
+
+  try {
+    if ((await keys.signing.findSigner(keyId)) === undefined) return signedUnauthorized(requestId);
+    if (
+      webhookMediaType(request.headers.get("content-type")) !== "application/json" ||
+      ![null, "identity"].includes(request.headers.get("content-encoding")?.toLowerCase() ?? null)
+    ) {
+      return problem(
+        requestId,
+        415,
+        "unsupported_media_type",
+        "Unsupported media type",
+        "Use identity-encoded application/json with UTF-8.",
+      );
+    }
+    const body = await readWebhookBytes(request, requestId, options);
+    if (body instanceof Response) return body;
+    const verified = await keys.signing.verify(keyId, signature, body);
+    if (verified.status === "unauthorized") return signedUnauthorized(requestId);
+    if (options.log !== undefined) {
+      options.log.keyId = verified.signer.credentialId;
+      options.log.matchedSlot = verified.matchedSlot;
+    }
+    return { access: verified.signer, bytes: body, keys };
+  } catch (error) {
+    if (error instanceof SigningRequestError || isDatabaseUnavailableError(error)) {
+      return signedUnavailable(requestId);
+    }
+    throw error;
+  }
+}
+
+function signedUnauthorized(requestId: string): Response {
+  const response = problem(
+    requestId,
+    401,
+    "unauthorized",
+    "Authentication required",
+    "Provide a valid GitHub SHA-256 signature for this signer.",
+  );
+  response.headers.delete("www-authenticate");
+  return response;
+}
+
+function signedUnavailable(requestId: string): Response {
+  return problem(
+    requestId,
+    503,
+    "authentication_unavailable",
+    "Authentication unavailable",
+    "Webhook signature authentication is currently unavailable. Retry the request later.",
+  );
+}
+
+async function deliverWebhook(
+  requestId: string,
+  operations: PublicOperations,
+  options: ApiExecutionOptions,
+  access: PublicAuthorization,
+  input: ReceiveWebhookInput,
+  signingKeys?: OrganizationApiKeys,
+): Promise<Response> {
+  const bucket = options.limiter.take(access.credentialId);
+  if (!bucket.allowed) {
+    return problem(
+      requestId,
+      429,
+      "rate_limited",
+      "Rate limited",
+      "The API key has exceeded its webhook rate limit.",
+      undefined,
+      { "Retry-After": String(bucket.retryAfter) },
+    );
+  }
+  if (signingKeys !== undefined) {
+    try {
+      await signingKeys.markUsed(access.credentialId);
+    } catch (error) {
+      if (isDatabaseUnavailableError(error)) return signedUnavailable(requestId);
+      throw error;
+    }
+  }
+  const operation = publicOperation(
+    input.githubSignature === undefined ? "receiveWebhook" : "receiveGitHubWebhook",
+  );
+  const result = await operation.invoke(operations, access, input);
+  if (!isWebhookResult(result)) throw new Error("invalid webhook operation result");
+  if (
+    input.githubSignature !== undefined &&
+    (result.status === "actor_forbidden" || result.status === "key_actor_required")
+  ) {
+    return webhookResponse(requestId, { status: "trigger_not_found" });
+  }
+  return webhookResponse(requestId, result);
+}
+
 async function readWebhook(
   request: Request,
   requestId: string,
@@ -586,7 +779,9 @@ async function readWebhook(
       "Use application/json or text/plain with UTF-8.",
     );
   }
-  const text = await readWebhookText(request, requestId, options);
+  const bytes = await readWebhookBytes(request, requestId, options);
+  if (bytes instanceof Response) return bytes;
+  const text = decodeWebhookText(bytes, requestId);
   if (text instanceof Response) return text;
   const payload = parseWebhookPayload(text, type, requestId);
   if (payload instanceof Response) return payload;
@@ -607,9 +802,8 @@ async function readWebhook(
       .digest("hex")
       .slice(0, 12);
   }
-  const trigger = webhookTrigger(new URL(request.url).pathname);
-  if (trigger === undefined) throw new Error("webhook route was not validated");
-  return { trigger, deliveryKey, ...payload };
+  if (options.hook === undefined) throw new Error("webhook route was not validated");
+  return { trigger: options.hook.trigger, deliveryKey, ...payload };
 }
 
 function webhookMediaType(
@@ -633,11 +827,11 @@ function webhookMediaType(
   return type;
 }
 
-async function readWebhookText(
+async function readWebhookBytes(
   request: Request,
   requestId: string,
   options: ApiExecutionOptions,
-): Promise<string | Response> {
+): Promise<Uint8Array | Response> {
   const declaredLength = request.headers.get("content-length");
   const declaredBytes =
     declaredLength !== null && /^\d+$/u.test(declaredLength) ? Number(declaredLength) : 0;
@@ -667,6 +861,10 @@ async function readWebhookText(
       "The request body exceeds the byte limit.",
     );
   }
+  return bytes;
+}
+
+function decodeWebhookText(bytes: Uint8Array, requestId: string): string | Response {
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {

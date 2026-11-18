@@ -332,6 +332,7 @@ describe("generated public OpenAPI", () => {
       "/api/v1/configurations/validate",
       "/api/v1/daemons/enrollment-tokens",
       "/api/v1/hooks/{trigger}",
+      "/api/v1/hooks/{trigger}/signers/{keyId}",
       "/api/v1/manual-runs",
       "/api/v1/projects",
       "/api/v1/runs/{id}/events",

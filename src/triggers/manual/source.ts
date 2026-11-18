@@ -60,7 +60,7 @@ export async function dispatchManualTrigger(
     logger.info(
       {
         source: trigger.source,
-        deliveryId: trigger.deliveryId,
+        ...(trigger.boundWebhookTrigger === undefined ? { deliveryId: trigger.deliveryId } : {}),
         receiptId: persisted.providerEventReceiptId,
         outcome: "duplicate",
       },
@@ -76,7 +76,7 @@ export async function dispatchManualTrigger(
     logger.info(
       {
         source: trigger.source,
-        deliveryId: trigger.deliveryId,
+        ...(trigger.boundWebhookTrigger === undefined ? { deliveryId: trigger.deliveryId } : {}),
         receiptId: persisted.event.providerEventReceiptId,
         outcome: "dropped",
         reason: "configuration_unavailable",
@@ -91,7 +91,7 @@ export async function dispatchManualTrigger(
   logger.info(
     {
       source: trigger.source,
-      deliveryId: trigger.deliveryId,
+      ...(trigger.boundWebhookTrigger === undefined ? { deliveryId: trigger.deliveryId } : {}),
       receiptId: persisted.event.providerEventReceiptId,
       outcome: "accepted",
     },

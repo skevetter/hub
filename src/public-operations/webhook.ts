@@ -15,6 +15,7 @@ interface WebhookTarget {
   status: "resolved";
   projectId: string;
   trigger: CompiledTrigger;
+  configurationRevisionId: string;
   actor: string;
 }
 
@@ -23,6 +24,7 @@ async function resolveTarget(
   capabilities: PublicOperationCapabilities,
   authorization: PublicAuthorization,
   name: string,
+  targetTriggerId: string | undefined,
 ): Promise<
   WebhookTarget | { status: "trigger_not_found" | "actor_forbidden" | "key_actor_required" }
 > {
@@ -31,16 +33,26 @@ async function resolveTarget(
   if (authorization.allowedTriggers != null && !authorization.allowedTriggers.includes(name))
     return { status: "trigger_not_found" };
   const project = await repository.resolveWebhookProject(authorization.organizationId, name);
-  if (project === undefined) return { status: "trigger_not_found" };
+  if (
+    project === undefined ||
+    (targetTriggerId !== undefined && project.triggerId !== targetTriggerId)
+  )
+    return { status: "trigger_not_found" };
   const stored = await capabilities.configurationForProject(project.id).getActive();
   const trigger = stored?.configuration.triggers.find(
     (candidate) => candidate.name === name && candidate.on === "manual.run",
   );
-  if (trigger === undefined) return { status: "trigger_not_found" };
+  if (stored === undefined || trigger === undefined) return { status: "trigger_not_found" };
   const users = trigger.filters?.from_users;
   if (!users?.includes("*") && !users?.includes(authorization.actor))
     return { status: "actor_forbidden" };
-  return { status: "resolved", projectId: project.id, trigger, actor: authorization.actor };
+  return {
+    status: "resolved",
+    projectId: project.id,
+    trigger,
+    actor: authorization.actor,
+    configurationRevisionId: stored.revision.id,
+  };
 }
 
 async function receiptResult(
@@ -86,18 +98,37 @@ export async function receiveWebhook(
   input: ReceiveWebhookInput,
   maxActiveRuns: number,
 ): Promise<ReceiveWebhookResult> {
-  const target = await resolveTarget(repository, capabilities, authorization, input.trigger);
+  const signature = input.githubSignature;
+  const target = await resolveTarget(
+    repository,
+    capabilities,
+    authorization,
+    input.trigger,
+    signature?.targetTriggerId,
+  );
   if (target.status !== "resolved") return target;
-  const deliveryId = `public-manual-${createHash("sha256")
-    .update(
-      JSON.stringify([
-        authorization.organizationId,
-        target.projectId,
-        input.trigger,
-        input.deliveryKey,
-      ]),
-    )
-    .digest("base64url")}`;
+
+  const deliveryId =
+    signature === undefined
+      ? `public-manual-${createHash("sha256")
+          .update(
+            JSON.stringify([
+              authorization.organizationId,
+              target.projectId,
+              input.trigger,
+              input.deliveryKey,
+            ]),
+          )
+          .digest("base64url")}`
+      : `public-signature-${createHash("sha256")
+          .update(
+            JSON.stringify([
+              authorization.organizationId,
+              authorization.credentialId,
+              signature.bodyDigest,
+            ]),
+          )
+          .digest("hex")}`;
   const existing = await repository.findWebhookReceipt(authorization.organizationId, deliveryId);
   if (existing !== undefined) {
     const replay = await receiptResult(repository, existing, input, true);
@@ -141,6 +172,15 @@ export async function receiveWebhook(
     source: "webhook.received",
     deliveryId,
     receivedAt: new Date(),
+    ...(signature === undefined
+      ? {}
+      : {
+          boundWebhookTrigger: {
+            id: signature.targetTriggerId,
+            name: input.trigger,
+            configurationRevisionId: target.configurationRevisionId,
+          },
+        }),
     payload: {
       ...payload,
       authenticatedBy: {

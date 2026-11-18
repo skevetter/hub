@@ -666,7 +666,14 @@ export interface AcceptLinearEventInput extends ProviderEventEvidence {
   projectId?: string;
 }
 
+export interface BoundWebhookTrigger {
+  id: string;
+  name: string;
+  configurationRevisionId: string;
+}
+
 export interface PersistManualEventInput extends InsertProviderEventInput {
+  boundWebhookTrigger?: BoundWebhookTrigger;
   organizationId: string;
   projectId: string;
 }

@@ -334,6 +334,20 @@ export const WebhookHeadersSchema = z
     example: { "idempotency-key": "build-43", "x-request-id": "build-43-request" },
   });
 
+export const GitHubWebhookPathSchema = WebhookPathSchema.extend({
+  keyId: z.string().uuid().describe("Public id of the trigger's GitHub signing key."),
+}).openapi("GitHubWebhookPath");
+
+export const GitHubWebhookHeadersSchema = WebhookHeadersSchema.extend({
+  "idempotency-key": z
+    .string()
+    .regex(/^github-sha256:[0-9a-f]{64}$/u)
+    .optional()
+    .describe(
+      "When supplied, must equal github-sha256: followed by the raw body SHA-256 hex digest.",
+    ),
+}).openapi("GitHubWebhookHeaders");
+
 export const WebhookJsonBodySchema = z
   .object({ message: z.string().optional() })
   .catchall(z.unknown())
@@ -348,7 +362,7 @@ export const WebhookTextBodySchema = z.string().min(1).openapi("WebhookTextBody"
   description: "UTF-8 prompt text, at most 64 KiB.",
 });
 
-export const ReceiveWebhookInputSchema = z
+const webhookInputSchema = z
   .object({
     trigger: WebhookPathSchema.shape.trigger,
     deliveryKey: z
@@ -359,7 +373,21 @@ export const ReceiveWebhookInputSchema = z
     input: z.string(),
     data: z.record(z.string(), z.unknown()).optional(),
   })
-  .strict()
+  .strict();
+
+export const ReceiveWebhookInputSchema = webhookInputSchema.transform(({ data, ...input }) =>
+  data === undefined ? input : { ...input, data },
+);
+
+export const ReceiveGitHubWebhookInputSchema = webhookInputSchema
+  .extend({
+    githubSignature: z
+      .object({
+        targetTriggerId: z.uuid(),
+        bodyDigest: z.string().regex(/^[0-9a-f]{64}$/u),
+      })
+      .strict(),
+  })
   .transform(({ data, ...input }) => (data === undefined ? input : { ...input, data }));
 
 export const ReceivedWebhookSchema = z

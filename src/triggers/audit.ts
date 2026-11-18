@@ -44,7 +44,9 @@ export function logProviderEventRouting(input: {
   (input.log ?? logger).info(
     {
       source: input.source,
-      deliveryId: input.deliveryId,
+      ...(input.source === "webhook.received" && input.deliveryId.startsWith("public-signature-")
+        ? {}
+        : { deliveryId: input.deliveryId }),
       receiptId: input.receiptId,
       projectId: input.projectId,
       outcome: input.dropReason === undefined ? "matched" : "dropped",

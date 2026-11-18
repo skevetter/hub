@@ -1859,6 +1859,7 @@ class MemoryDatabase implements Database {
   }
 
   async persistManualEvent(input: PersistManualEventInput) {
+    this.assertBoundWebhookTarget(input);
     const existing = this.findReceiptId(
       input.organizationId,
       input.deliveryId,
@@ -1874,6 +1875,7 @@ class MemoryDatabase implements Database {
           replayed: true,
         };
       }
+      this.assertBoundWebhookReceipt(input, route);
       return {
         status: "accepted" as const,
         replayed: true,
@@ -1928,6 +1930,47 @@ class MemoryDatabase implements Database {
         resourceId: input.resourceId ?? null,
       },
     };
+  }
+
+  private assertBoundWebhookTarget(input: PersistManualEventInput): void {
+    const binding = input.boundWebhookTrigger;
+    if (binding !== undefined) {
+      const trigger = this.organizationTriggers.get(binding.id);
+      const project = this.projects.get(input.projectId);
+      if (
+        trigger?.organizationId !== input.organizationId ||
+        !trigger.enabled ||
+        trigger.name !== binding.name ||
+        trigger.runtimeProjectId !== input.projectId ||
+        project?.organizationId !== input.organizationId ||
+        project.status !== "active" ||
+        project.activeConfigurationRevisionId !== binding.configurationRevisionId ||
+        !hasBoundWebhookEvidence(
+          this.configurationRevisions.get(binding.configurationRevisionId)?.sourceEvidence,
+          binding.id,
+        )
+      ) {
+        throw new ManualRunRejected("configuration_not_found");
+      }
+    }
+  }
+
+  private assertBoundWebhookReceipt(
+    input: PersistManualEventInput,
+    route: NonNullable<ProviderEventReceiptRecord["acceptedRoutes"]>[number],
+  ): void {
+    const binding = input.boundWebhookTrigger;
+    if (binding !== undefined) {
+      const pinned = this.configurationRevisions.get(route.configurationRevisionId);
+      if (
+        route.projectId !== input.projectId ||
+        pinned?.organizationId !== input.organizationId ||
+        pinned.projectId !== input.projectId ||
+        !hasBoundWebhookEvidence(pinned.sourceEvidence, binding.id)
+      ) {
+        throw new ManualRunRejected("configuration_not_found");
+      }
+    }
   }
 
   private readonly githubInstallationSyncs = new Map<
@@ -4475,4 +4518,13 @@ function attachmentSourceKey(
   sourceId: string,
 ): string {
   return `${providerEventReceiptId}:${provider}:${sourceId}`;
+}
+
+function hasBoundWebhookEvidence(evidence: unknown, id: string): boolean {
+  return (
+    typeof evidence === "object" &&
+    evidence !== null &&
+    "triggerId" in evidence &&
+    evidence.triggerId === id
+  );
 }

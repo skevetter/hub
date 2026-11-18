@@ -1,6 +1,10 @@
 import type { ApiKeyScope } from "../auth/api-key-contract.js";
 import type { HubBundleFile } from "../config/bundle.js";
-import type { TriggerRunRecord, ProviderEventReceiptRecord } from "../db/types.js";
+import type {
+  BoundWebhookTrigger,
+  TriggerRunRecord,
+  ProviderEventReceiptRecord,
+} from "../db/types.js";
 import type { DeploymentProjectResolution } from "../project-deployments/index.js";
 import type { StoredProjectConfiguration } from "../configuration/store.js";
 
@@ -124,6 +128,7 @@ export type DispatchManualRunResult =
 export interface ReceiveWebhookInput {
   trigger: string;
   deliveryKey: string;
+  githubSignature?: { targetTriggerId: string; bodyDigest: string };
   input: string;
   data?: Readonly<Record<string, unknown>>;
 }
@@ -230,7 +235,7 @@ export interface PublicOperationRepository {
   resolveWebhookProject(
     organizationId: string,
     triggerName: string,
-  ): Promise<{ id: string } | undefined>;
+  ): Promise<{ id: string; triggerId: string } | undefined>;
   findWebhookReceipt(
     organizationId: string,
     deliveryId: string,
@@ -294,6 +299,7 @@ export interface PublicOperationCapabilities {
     organizationId: string;
     projectId: string;
     source: "manual.run" | "webhook.received";
+    boundWebhookTrigger?: BoundWebhookTrigger;
     deliveryId: string;
     receivedAt: Date;
     payload: unknown;

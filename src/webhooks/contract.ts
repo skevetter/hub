@@ -2,6 +2,13 @@ export function webhookUrl(baseUrl: string, trigger: string): string {
   return new URL(`/api/v1/hooks/${encodeURIComponent(trigger)}`, baseUrl).toString();
 }
 
+export function githubSignerUrl(baseUrl: string, trigger: string, keyId: string): string {
+  return new URL(
+    `/api/v1/hooks/${encodeURIComponent(trigger)}/signers/${encodeURIComponent(keyId)}`,
+    baseUrl,
+  ).toString();
+}
+
 export function webhookCurl(
   baseUrl: string,
   trigger: string,

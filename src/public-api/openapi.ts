@@ -7,6 +7,8 @@ import {
   ProblemSchema,
   StartCliAuthorizationRequestSchema,
   WebhookPathSchema,
+  GitHubWebhookPathSchema,
+  GitHubWebhookHeadersSchema,
   WebhookHeadersSchema,
   WebhookJsonBodySchema,
   WebhookTextBodySchema,
@@ -21,6 +23,14 @@ registry.registerComponent("securitySchemes", "bearerAuth", {
   bearerFormat: "Paseo organization credential",
   description:
     "An organization API key or durable CLI login credential. Each operation requires the scope shown on the operation.",
+});
+
+registry.registerComponent("securitySchemes", "githubWebhookSignature", {
+  type: "apiKey",
+  in: "header",
+  name: "X-Hub-Signature-256",
+  description:
+    "HMAC-SHA256 of the exact raw body, formatted as sha256= followed by 64 lowercase hex digits.",
 });
 
 registry.registerPath({
@@ -149,6 +159,7 @@ const requestIdResponseHeader = {
 };
 
 for (const definition of publicOperationManifest) {
+  const signed = definition.webhook === "github_sha256";
   const responses = Object.fromEntries(
     Object.entries(definition.responses).map(([status, description]) => [
       status,
@@ -162,7 +173,7 @@ for (const definition of publicOperationManifest) {
             description,
             headers: {
               ...requestIdResponseHeader,
-              ...(Number(status) === 401
+              ...(Number(status) === 401 && !signed
                 ? {
                     "WWW-Authenticate": {
                       description: "Bearer authentication challenge.",
@@ -194,13 +205,13 @@ for (const definition of publicOperationManifest) {
   let request: Parameters<typeof registry.registerPath>[0]["request"];
   if (definition.webhook) {
     request = {
-      params: WebhookPathSchema,
-      headers: WebhookHeadersSchema,
+      params: signed ? GitHubWebhookPathSchema : WebhookPathSchema,
+      headers: signed ? GitHubWebhookHeadersSchema : WebhookHeadersSchema,
       body: {
         required: true,
         content: {
           "application/json": { schema: WebhookJsonBodySchema },
-          "text/plain": { schema: WebhookTextBodySchema },
+          ...(signed ? {} : { "text/plain": { schema: WebhookTextBodySchema } }),
         },
       },
     };
@@ -219,7 +230,7 @@ for (const definition of publicOperationManifest) {
     summary: definition.summary,
     description: definition.description,
     tags: [definition.tag],
-    security: [{ bearerAuth: [] }],
+    security: signed ? [{ githubWebhookSignature: [] }] : [{ bearerAuth: [] }],
     ...(request === undefined ? {} : { request }),
     responses,
     "x-required-scopes": [definition.scope],

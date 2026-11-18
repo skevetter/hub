@@ -18,6 +18,7 @@ import {
   DispatchedManualRunSchema,
   ReceivedWebhookSchema,
   ReceiveWebhookInputSchema,
+  ReceiveGitHubWebhookInputSchema,
   EnrollmentTokenSchema,
   InstallConfigurationRequestSchema,
   InstalledConfigurationSchema,
@@ -42,6 +43,7 @@ export type PublicOperationId =
   | "installConfiguration"
   | "dispatchManualRun"
   | "receiveWebhook"
+  | "receiveGitHubWebhook"
   | "issueEnrollmentToken";
 
 export interface PublicOperationDefinition {
@@ -66,7 +68,7 @@ export interface PublicOperationDefinition {
     | typeof EnrollmentTokenSchema
     | typeof ReceivedWebhookSchema;
   successStatus: 200 | 201 | 202;
-  webhook?: boolean;
+  webhook?: "bearer" | "github_sha256";
   resultMapping:
     | "trigger-validation"
     | "triggers"
@@ -321,7 +323,7 @@ export const publicOperationManifest: readonly PublicOperationDefinition[] = [
     method: "post",
     path: "/api/v1/hooks/{trigger}",
     scope: "events:send",
-    webhook: true,
+    webhook: "bearer",
     successSchema: ReceivedWebhookSchema,
     successStatus: 202,
     resultMapping: "webhook",
@@ -347,6 +349,37 @@ export const publicOperationManifest: readonly PublicOperationDefinition[] = [
     },
     invoke: (operations, authorization, input) =>
       operations.receiveWebhook(authorization, ReceiveWebhookInputSchema.parse(input)),
+  },
+  {
+    id: "receiveGitHubWebhook",
+    method: "post",
+    path: "/api/v1/hooks/{trigger}/signers/{keyId}",
+    scope: "events:send",
+    webhook: "github_sha256",
+    successSchema: ReceivedWebhookSchema,
+    successStatus: 202,
+    resultMapping: "webhook",
+    summary: "Receive a GitHub-signed webhook",
+    description:
+      "Requires an enabled GitHub SHA-256 signing key bound to one manual.run trigger. Sign the exact identity-encoded UTF-8 JSON body with HMAC-SHA256 using the full signing secret. Send X-Hub-Signature-256 as sha256= followed by 64 lowercase hex digits. The key id is public. GitHub delivery and event headers are unsigned and ignored for routing and deduplication. Exact bodies deduplicate permanently per key, including across secret rotation. An unseen captured body can be accepted later because the signature has no timestamp.",
+    tag: "Webhooks",
+    responses: {
+      200: "A duplicate delivery with the original run identity or original filtered result.",
+      202: "A new delivery was dispatched or filtered.",
+      400: "invalid_json or invalid_request: malformed JSON, invalid UTF-8, or an idempotency key that differs from the body digest.",
+      401: "unauthorized: the GitHub signature is missing or invalid, the signing key is unavailable, or the feature is disabled.",
+      404: "trigger_not_found: no allowed, enabled manual trigger matches the immutable binding.",
+      405: "method_not_allowed: use POST.",
+      409: "dispatch_conflict: retry with the exact same body and valid signature.",
+      413: "payload_too_large: the raw body or prompt exceeds its byte limit.",
+      415: "unsupported_media_type: use identity-encoded application/json with UTF-8.",
+      422: "invalid_body or invalid_input: invalid structure or declared trigger inputs.",
+      429: "rate_limited or trigger_busy: retry after the indicated delay.",
+      500: "internal_error: the operation failed unexpectedly.",
+      503: "authentication_unavailable or infrastructure_unavailable.",
+    },
+    invoke: (operations, authorization, input) =>
+      operations.receiveWebhook(authorization, ReceiveGitHubWebhookInputSchema.parse(input)),
   },
   {
     id: "issueEnrollmentToken",
