@@ -20,8 +20,10 @@ Create a scoped API key in the Hub dashboard or approve `paseo hub login` in the
 The available API key scopes are `projects:read`, `configuration:validate`, `configuration:install`,
 `runs:dispatch`, `runs:read`, `events:send`, and `daemons:enroll`. Grant only the scopes a sender needs.
 `events:send` authorizes hooks only, not manual-runs. Hooks require an API key with a bound actor;
-optional allowed trigger names further restrict it. See [authenticated webhook triggers](webhooks.md)
-for key creation, executable examples, response and error tables, retries, limits and retention.
+optional allowed trigger names further restrict it. If GitHub SHA-256 is enabled, a separate
+HMAC-only signing key can call `POST /api/v1/hooks/{trigger}/signers/{keyId}`. It signs the
+exact JSON bytes, is bound to one trigger, and deduplicates the same body permanently per key.
+See [authenticated webhook triggers](webhooks.md) for setup, examples, rotation and limitations.
 
 `runs:read` permits authenticated run timeline reads. It does not grant dispatch access.
 Timeline capture and streaming are off by default. Set `PASEO_HUB_RUN_TIMELINE=true` and

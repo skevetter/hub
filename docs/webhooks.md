@@ -126,6 +126,119 @@ with urllib.request.urlopen(request, timeout=30) as response:
     print(response.read().decode("utf-8"))
 ```
 
+## GitHub SHA-256 signing keys
+
+When your operator enables GitHub SHA-256 for the organization, choose **GitHub SHA-256**
+under **Settings > API keys > Create API key**. Choose one existing enabled manual trigger
+and an actor allowed by its `from_users` filter. The key keeps that trigger's identity and
+name for its lifetime. To use a different trigger or replace a deleted trigger, create a new key.
+
+In GitHub's webhook settings, paste the **GitHub webhook URL** into **Payload URL**,
+choose `application/json` as the content type, and paste the **Signing secret** into **Secret**.
+Hub shows the secret once. The URL contains the public key UUID and can be copied separately.
+The trigger receives GitHub JSON as context. A native event without a `message` field
+has an empty prompt, so include `${{ paseo.context }}` where the workflow needs the data.
+
+| Route                                          | Authentication                                                                         |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `POST /api/v1/hooks/{trigger}`                 | Organization Bearer API key with `events:send` and a bound actor                       |
+| `POST /api/v1/hooks/{trigger}/signers/{keyId}` | GitHub SHA-256 signing key with `events:send`, a bound actor and one immutable trigger |
+
+The signer route requires one `X-Hub-Signature-256: sha256=<64 lowercase hex digits>` header.
+Compute HMAC-SHA256 over the exact request bytes, using the full `paseo_whsec_...` string as
+the UTF-8 key. Sign the BOM, whitespace and final newline if present. Send identity-encoded
+UTF-8 JSON. The `Authorization` and `X-Paseo-Signature` headers are rejected on the signer
+route. Hub v1, SHA-1-only signing, dual authentication and other signed sender formats are unsupported.
+
+Hub uses the SHA-256 digest of the raw body to record a delivery permanently for the signing
+key. Reuse the exact bytes to retry. A duplicate returns the original run identity or filtered
+result, even after secret rotation. If supplied, `Idempotency-Key` must equal `github-sha256:`
+followed by the lowercase raw-body SHA-256 hex digest. `X-GitHub-Delivery` and `X-GitHub-Event`
+are unsigned and have no effect on routing, authorization or deduplication.
+
+GitHub signs the body without a timestamp. An unseen captured request can be accepted later
+while its secret remains eligible. Identical legitimate payloads collapse. Different bytes
+signed by an authorized sender count as a separate delivery. Replacing the entire key
+starts a new delivery history and generates a new secret.
+
+Invalid signatures, revoked keys and disabled signing return `401 unauthorized` without a
+Bearer challenge. Unavailable signing authentication returns `503 authentication_unavailable`.
+After valid authentication, a missing, disabled, changed or forbidden target returns
+`404 trigger_not_found`. The payload, size, rate and active-run limits below also apply.
+
+### Send a GitHub-compatible request
+
+Set `HUB_SIGNER_URL` to the URL shown at creation, `HUB_SIGNING_SECRET` to the one-time
+secret and `HUB_BODY_FILE` to a JSON file containing the request bytes. This Node.js example
+sends the file unchanged. Set a different `GITHUB_DELIVERY_ID` to retry with a different
+unsigned delivery header.
+
+```javascript
+import { createHmac } from "node:crypto";
+import { readFile } from "node:fs/promises";
+
+const body = await readFile(process.env.HUB_BODY_FILE);
+const signature = createHmac("sha256", process.env.HUB_SIGNING_SECRET).update(body).digest("hex");
+const response = await fetch(process.env.HUB_SIGNER_URL, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "X-Hub-Signature-256": "sha256=" + signature,
+    "X-GitHub-Delivery": process.env.GITHUB_DELIVERY_ID ?? "example-delivery",
+  },
+  body,
+});
+if (!response.ok) throw new Error(`Webhook returned ${response.status}`);
+console.log(await response.text());
+```
+
+### Rotate a signing secret
+
+Use the key's **Rotate signing secret** action and update GitHub. During the overlap, both
+versions can authenticate. The default is one hour and the supported range is zero to 72 hours.
+Choose zero for immediate cutover after a compromise when no overlap is appropriate. Revoke the
+key if you need to invalidate both versions. In-flight requests that already passed
+authentication may complete. Retire the previous version explicitly or wait until it expires
+before rotating again. If you lose a reveal response, reload the list to check its version, then
+rotate explicitly or revoke the key. The list and API never recover an issued secret.
+
+Session-authenticated managers can create a signing key with
+`POST /api/auth/paseo/api-keys` using `scopes: ["events:send"]`, a bound `actor`, and
+`authentication: { mode: "hmac", profile: "github_sha256", targetTriggerId }`.
+The response includes `signingSecret` once and uses `Cache-Control: no-store`.
+`POST /api/auth/paseo/rotate-api-key-signing-secret` takes `id`, `expectedCurrentVersionId`
+and optional `overlapSeconds`. `POST /api/auth/paseo/retire-api-key-signing-secret`
+takes `id` and `expectedPreviousVersionId`. Stale versions and an unexpired previous
+version during rotation return `409`. Listing returns version metadata only. Revocation
+continues to work when signing is disabled.
+
+### Enable signing on a self-hosted Hub
+
+| Setting                                       | Value                                                                                               |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `PASEO_HUB_WEBHOOK_HMAC_ENABLED`              | `true` to enable webhook signatures. Defaults to `false`.                                           |
+| `PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED` | `true` to enable GitHub SHA-256. Defaults to `false`.                                               |
+| `PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS`     | JSON array of eligible organization IDs. Defaults to an empty array.                                |
+| `PASEO_HUB_WEBHOOK_HMAC_KEYRING`              | Secret JSON object mapping up to two versioned key IDs to canonical base64 of 32 random bytes each. |
+| `PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID`        | Key ID used for new signing secret versions. Required when HMAC is enabled.                         |
+
+Inject the master keyring from a secret manager or encrypted vault through the service
+environment. Keep the master keys and their recovery copy separate from database dumps.
+The database holds random salts and key IDs. A signing secret requires both its database
+record and the corresponding master key. Verify both sources in an isolated restore before
+enabling signing. Invalid enabled key configuration or missing master keys for eligible
+stored versions refuse startup.
+
+To rotate the master, add the new key ID to the keyring and make it active. Rotate each sender
+to a new signing secret, update GitHub, and wait for or retire the old overlap. Remove the old
+online key only after no eligible versions reference it. Keep offline copies for retained backups.
+
+Restore with signing disabled. Reconcile revocations and retire or rotate restored signing
+versions before exposure. Restoring an older dump can restore old keys and lose delivery
+history. Before rolling back to a binary without signature enforcement, revoke signed keys
+with the current binary and preserve the additive schema. The existing no-expiry receipt
+and run payload policy also applies to signed deliveries.
+
 ## Request contract
 
 Use `POST /api/v1/hooks/{trigger}`, without a trailing slash. The name is URL decoded once.
@@ -138,9 +251,8 @@ No project slug fallback exists. Other methods return `405` and `Allow: POST`.
 | `Idempotency-Key`             | No       | 1 to 200 printable ASCII characters. Supply it whenever retrying.                                            |
 | `X-Request-ID`                | No       | Echoed if it matches `^[A-Za-z0-9._-]{1,128}$`; otherwise Hub generates an id.                               |
 
-Credentials are accepted only in the Authorization header, never query parameters. CLI login
-credentials cannot call this endpoint, even though they have operator scopes. HMAC signatures
-are not supported in v1. Services that cannot set an Authorization header cannot use this API.
+The original hooks route accepts organization API keys in the Authorization header.
+Query parameters carry no credentials. CLI logins cannot call either hooks route.
 
 A JSON body must be an object. Optional `message` must be a string and becomes the complete
 `${{ paseo.prompt }}`. Without it the prompt is empty. Top level fields fill only declared inputs:

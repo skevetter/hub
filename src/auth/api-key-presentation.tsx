@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
 import { CopyBlock, CopyField } from "../components/app/copy-field.js";
 import { CheckboxField } from "../components/app/checkbox-field.js";
@@ -7,13 +7,20 @@ import { EmptyState } from "../components/app/empty-state.js";
 import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
 import { FormField } from "../components/app/form-field.js";
 import { LoadingLine } from "../components/app/loading.js";
-import { RelativeTime } from "../components/app/relative-time.js";
+import { formatAbsolute, RelativeTime } from "../components/app/relative-time.js";
 import { RowActions } from "../components/app/row-actions.js";
+import { TwoLine } from "../components/app/two-line.js";
+import { DropdownMenuItem } from "../components/ui/dropdown-menu.js";
 import { StatusPill } from "../components/app/status-pill.js";
 import { FieldDescription, FieldError } from "../components/ui/field.js";
 import type { Snapshot } from "../queries/index.js";
-import { webhookCurl } from "../webhooks/contract.js";
-import { apiKeyCreateSchema, defaultApiKeyActor, type ApiKeyScope } from "./api-key-contract.js";
+import { githubSignerUrl, webhookCurl } from "../webhooks/contract.js";
+import {
+  apiKeyCreateSchema,
+  defaultApiKeyActor,
+  type ApiKeyScope,
+  type WebhookSigningSummary,
+} from "./api-key-contract.js";
 
 export interface ApiKeyRecord {
   id: string;
@@ -25,6 +32,7 @@ export interface ApiKeyRecord {
   createdAt: string;
   lastUsedAt: string | null;
   revokedAt: string | null;
+  authentication?: WebhookSigningSummary | undefined;
 }
 
 export const SCOPE_OPTIONS = [
@@ -67,7 +75,7 @@ export const SCOPE_OPTIONS = [
 
 export const API_KEY_COLUMNS = [
   { header: "Name", fill: true },
-  { header: "Prefix" },
+  { header: "Authentication" },
   { header: "Scopes", fill: true },
   { header: "Actor" },
   { header: "Triggers", fill: true },
@@ -87,9 +95,25 @@ const TRIGGER_LIST_FAILURE =
   "Hub did not receive the trigger list. Check your connection and reload, or enter trigger names below.";
 
 export type ApiKeyTriggerChoices = Snapshot<{ names: string[] }>;
+export type ApiKeySigningAvailability = "enabled" | "disabled" | "unavailable";
+export type ApiKeyReveal =
+  | { secret: string }
+  | { signingSecret: string; keyId: string; trigger: string };
 export type ApiKeyWebhookSettings = Snapshot<{ baseUrl: string }>;
 
-export function apiKeyFormPayload(form: FormData) {
+export function apiKeyFormPayload(form: FormData, signing = false) {
+  if (signing) {
+    return apiKeyCreateSchema.safeParse({
+      name: form.get("name"),
+      actor: form.get("actor"),
+      scopes: ["events:send"],
+      authentication: {
+        mode: "hmac",
+        profile: "github_sha256",
+        targetTriggerId: form.get("targetTriggerId"),
+      },
+    });
+  }
   const actor = form.get("actor");
   const names = form
     .getAll("allowedTriggers")
@@ -111,6 +135,7 @@ export function ApiKeyFormFields({
   onNameChange,
   onActorChange,
   onScopeChange,
+  signingTarget,
 }: {
   name: string;
   actorOverride: string | undefined;
@@ -120,6 +145,7 @@ export function ApiKeyFormFields({
   onNameChange: (name: string) => void;
   onActorChange: (actor: string) => void;
   onScopeChange: (scope: ApiKeyScope, checked: boolean) => void;
+  signingTarget?: React.ReactNode;
 }) {
   return (
     <>
@@ -145,25 +171,29 @@ export function ApiKeyFormFields({
         pattern={"[a-z0-9][a-z0-9_.\\-]{0,62}"}
         maxLength={63}
       />
-      <fieldset className="grid gap-3">
-        <legend>Scopes</legend>
-        <div className="grid gap-3">
-          {SCOPE_OPTIONS.map((option) => (
-            <ScopeOption
-              key={option.value}
-              option={option}
-              checked={scopes.includes(option.value)}
-              onChange={onScopeChange}
-            />
-          ))}
-        </div>
-        {scopeError === undefined ? (
-          <FieldDescription>Select at least one scope.</FieldDescription>
-        ) : (
-          <FieldError>{scopeError}</FieldError>
-        )}
-      </fieldset>
-      <ApiKeyTriggerField triggers={triggers} />
+      {signingTarget ?? (
+        <>
+          <fieldset className="grid gap-3">
+            <legend>Scopes</legend>
+            <div className="grid gap-3">
+              {SCOPE_OPTIONS.map((option) => (
+                <ScopeOption
+                  key={option.value}
+                  option={option}
+                  checked={scopes.includes(option.value)}
+                  onChange={onScopeChange}
+                />
+              ))}
+            </div>
+            {scopeError === undefined ? (
+              <FieldDescription>Select at least one scope.</FieldDescription>
+            ) : (
+              <FieldError>{scopeError}</FieldError>
+            )}
+          </fieldset>
+          <ApiKeyTriggerField triggers={triggers} />
+        </>
+      )}
     </>
   );
 }
@@ -260,8 +290,14 @@ export function ApiKeyTable({
   canManage,
   busy,
   onRevoke,
+  signingAvailability = "disabled",
+  onRotate,
+  onRetire,
 }: {
   records: ApiKeyRecord[];
+  signingAvailability?: ApiKeySigningAvailability;
+  onRotate?: (record: ApiKeyRecord) => void;
+  onRetire?: (id: string, versionId: string) => void;
   canManage: boolean;
   busy: boolean;
   onRevoke: (input: { data: { id: string } }) => void;
@@ -280,6 +316,9 @@ export function ApiKeyTable({
           canManage={canManage}
           busy={busy}
           onRevoke={onRevoke}
+          signingAvailability={signingAvailability}
+          onRotate={onRotate}
+          onRetire={onRetire}
         />
       ))}
     </DataTable>
@@ -291,13 +330,27 @@ function ApiKeyRow({
   canManage,
   busy,
   onRevoke,
+  signingAvailability,
+  onRotate,
+  onRetire,
 }: {
   record: ApiKeyRecord;
+  signingAvailability: ApiKeySigningAvailability;
+  onRotate: ((record: ApiKeyRecord) => void) | undefined;
+  onRetire: ((id: string, versionId: string) => void) | undefined;
   canManage: boolean;
   busy: boolean;
   onRevoke: (input: { data: { id: string } }) => void;
 }) {
   const revoke = useCallback(() => onRevoke({ data: { id: record.id } }), [onRevoke, record.id]);
+  const auth = record.authentication;
+  const previousDeadline = auth?.previousAcceptUntil;
+  const overlapActive = useActiveOverlap(previousDeadline);
+  const rotate = useCallback(() => onRotate?.(record), [onRotate, record]);
+  const retire = useCallback(() => {
+    const id = auth?.previousVersionId;
+    if (id != null) onRetire?.(record.id, id);
+  }, [auth?.previousVersionId, onRetire, record.id]);
   let allowedTriggers = "All";
   if (record.allowedTriggers !== null) {
     allowedTriggers =
@@ -307,7 +360,19 @@ function ApiKeyRow({
     <DataRow>
       <DataCell>{record.name}</DataCell>
       <DataCell>
-        <span className="font-mono text-xs">{record.prefix}</span>
+        {auth === undefined ? (
+          <TwoLine primary="Bearer token" secondary={record.prefix} mono />
+        ) : (
+          <TwoLine
+            primary="GitHub SHA-256"
+            secondary={signingStatus(
+              record.revokedAt,
+              signingAvailability,
+              previousDeadline,
+              overlapActive,
+            )}
+          />
+        )}
       </DataCell>
       <DataCell muted>
         {record.scopes
@@ -330,6 +395,25 @@ function ApiKeyRow({
       <DataCell>
         {record.revokedAt === null && canManage ? (
           <RowActions label={`Actions for ${record.name}`}>
+            {signingAvailability === "enabled" &&
+            auth?.currentVersionId != null &&
+            !overlapActive ? (
+              <DropdownMenuItem disabled={busy} onSelect={rotate}>
+                Rotate signing secret
+              </DropdownMenuItem>
+            ) : null}
+            {signingAvailability === "enabled" && auth?.previousVersionId != null ? (
+              <ConfirmMenuItem
+                label="Retire previous secret"
+                title="Retire previous signing secret?"
+                description={`Version ${auth.previousVersionId} will stop working immediately. Retire it before rotating again during an overlap.`}
+                confirmLabel="Retire previous secret"
+                cancelLabel="Cancel"
+                destructive
+                busy={busy}
+                onConfirm={retire}
+              />
+            ) : null}
             <ConfirmMenuItem
               label="Revoke"
               destructive
@@ -344,6 +428,91 @@ function ApiKeyRow({
         ) : null}
       </DataCell>
     </DataRow>
+  );
+}
+
+function signingStatus(
+  revokedAt: string | null,
+  availability: ApiKeySigningAvailability,
+  deadline: string | null | undefined,
+  active: boolean,
+): React.ReactNode {
+  if (revokedAt !== null) return "HMAC signature";
+  if (availability === "disabled") return "Signature authentication disabled";
+  if (availability === "unavailable") return "Signature authentication unavailable";
+  if (deadline == null) return "HMAC signature";
+  if (!active) return "Previous version expired";
+  return (
+    <>
+      Previous expires <RelativeTime value={deadline} />
+    </>
+  );
+}
+
+function useActiveOverlap(deadline: string | null | undefined): boolean {
+  const [, tick] = useState(0);
+  const remaining = deadline == null ? 0 : new Date(deadline).getTime() - Date.now();
+  useEffect(() => {
+    if (remaining <= 0) return undefined;
+    const timer = setTimeout(() => tick((value) => value + 1), remaining);
+    return () => clearTimeout(timer);
+  }, [remaining]);
+  return remaining > 0;
+}
+
+export function signingOverlapDeadline(value: string): string {
+  return `${formatAbsolute(value)} local time (${value} UTC)`;
+}
+
+export function GitHubSecretContent({
+  reveal,
+  settings,
+}: {
+  reveal: Extract<ApiKeyReveal, { signingSecret: string }>;
+  settings: ApiKeyWebhookSettings;
+}) {
+  return (
+    <>
+      <WarningAlert title="Save this signing secret now">
+        This secret cannot be recovered after you close this dialog.
+      </WarningAlert>
+      <CopyField
+        label="Signing secret"
+        value={reveal.signingSecret}
+        copyLabel="Copy signing secret"
+        focusOnMount
+      />
+      <CopyField label="Public signer id" value={reveal.keyId} copyLabel="Copy signer id" />
+      <GitHubSignerAddress settings={settings} trigger={reveal.trigger} keyId={reveal.keyId} />
+    </>
+  );
+}
+
+function GitHubSignerAddress({
+  settings,
+  trigger,
+  keyId,
+}: {
+  settings: ApiKeyWebhookSettings;
+  trigger: string;
+  keyId: string;
+}) {
+  if (settings.status === "pending") return <LoadingLine>Loading webhook address</LoadingLine>;
+  if (settings.status === "error") {
+    return (
+      <FailureAlert
+        title="Webhook address unavailable"
+        error={settings.error}
+        fallback="Find the webhook address in the GitHub SHA-256 setup guide."
+      />
+    );
+  }
+  return (
+    <CopyField
+      label="GitHub webhook URL"
+      value={githubSignerUrl(settings.data.baseUrl, trigger, keyId)}
+      copyLabel="Copy webhook URL"
+    />
   );
 }
 

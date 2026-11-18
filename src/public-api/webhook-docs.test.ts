@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { createHash, createHmac } from "node:crypto";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { it } from "vitest";
 import { z } from "zod";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { OrganizationTriggerStore } from "../triggers/store.js";
-import { webhookFixture } from "./test-utils/webhook-fixture.js";
+import { testSigningSettings, webhookFixture } from "./test-utils/webhook-fixture.js";
 
 const execFileAsync = promisify(execFile);
 const responseSchema = z
@@ -33,10 +35,10 @@ it("runs every webhook guide example against the embedded HTTP server", async ()
   }));
   assert.deepEqual(
     examples.map((example) => example.language),
-    ["yaml", "sh", "javascript", "python"],
+    ["yaml", "sh", "javascript", "python", "javascript"],
     "Every fence must be a recognized executable example, with its execution covered below",
   );
-  const hub = await webhookFixture();
+  const hub = await webhookFixture({}, { signing: testSigningSettings() });
   try {
     const key = await hub.createKey(["events:send"], {
       actor: "ci-partner",
@@ -58,11 +60,13 @@ it("runs every webhook guide example against the embedded HTTP server", async ()
     const executed: string[] = [];
     const runIds = new Set<string>();
     let projectId: string | undefined;
+    let triggerId: string | undefined;
     for (const example of examples) {
       if (example.language === "yaml") {
         const trigger = await store.save({ yaml: example.code, userId: "webhook-owner" });
         assert.equal(trigger.name, "build-finished");
         projectId = trigger.runtimeProjectId;
+        triggerId = trigger.id;
         executed.push(example.language);
         continue;
       }
@@ -84,6 +88,62 @@ it("runs every webhook guide example against the embedded HTTP server", async ()
           break;
         default:
           throw new Error(`Unexecuted documentation language: ${example.language}`);
+      }
+      if (example.code.includes("HUB_SIGNING_SECRET")) {
+        assert.ok(triggerId);
+        const signer = await hub.createSigner(triggerId, "ci-partner");
+        const file = join(hub.directory, "github-example.json");
+        const bytes = Buffer.from(JSON.stringify(report, null, 2) + "\n");
+        await writeFile(file, bytes);
+        const signedEnv = {
+          ...env,
+          HUB_SIGNER_URL: `${origin}/api/v1/hooks/build-finished/signers/${signer.summary.id}`,
+          HUB_SIGNING_SECRET: signer.signingSecret,
+          HUB_BODY_FILE: file,
+        };
+        const first = responseSchema.parse(
+          JSON.parse((await execFileAsync(command, args, { env: signedEnv })).stdout),
+        );
+        const digest = createHash("sha256").update(bytes).digest("hex");
+        assert.equal(first.deliveryKey, "github-sha256:" + digest);
+        assert.equal(first.duplicate, false);
+        runIds.add(first.triggerRunId);
+        const run = await hub.database.findTriggerRunById(first.triggerRunId);
+        assert.equal(run?.prompt, report.message);
+        assert.deepEqual(run?.inputs, { status: report.status, failures: report.failures });
+        const receipt = await hub.database.findProviderEventReceiptById(
+          first.providerEventReceiptId,
+        );
+        assert.equal(
+          receipt?.deliveryId,
+          "public-signature-" +
+            createHash("sha256")
+              .update(JSON.stringify(["webhook-a", signer.summary.id, digest]))
+              .digest("hex"),
+        );
+        assert.deepEqual(
+          z.object({ actor: z.string(), data: z.unknown() }).parse(receipt?.payload),
+          { actor: "ci-partner", data: report },
+        );
+        const retry = await execFileAsync(command, args, {
+          env: { ...signedEnv, GITHUB_DELIVERY_ID: "retry" },
+        });
+        assert.deepEqual(responseSchema.parse(JSON.parse(retry.stdout)), {
+          ...first,
+          duplicate: true,
+        });
+        const altered = await fetch(signedEnv.HUB_SIGNER_URL, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-hub-signature-256":
+              "sha256=" + createHmac("sha256", signer.signingSecret).update(bytes).digest("hex"),
+          },
+          body: bytes.toString().replace("43", "44"),
+        });
+        assert.equal(altered.status, 401);
+        executed.push(example.language);
+        continue;
       }
       const execute = () => execFileAsync(command, args, { env, timeout: 30_000 });
       const first = responseSchema.parse(JSON.parse((await execute()).stdout));
@@ -131,8 +191,8 @@ it("runs every webhook guide example against the embedded HTTP server", async ()
       executed,
       examples.map((example) => example.language),
     );
-    assert.equal(executed.length, 4);
-    assert.equal(runIds.size, 3);
+    assert.equal(executed.length, 5);
+    assert.equal(runIds.size, 4);
     assert.ok(projectId);
     const runs = await hub.database.listTriggerRunsForProject(projectId, 10);
     assert.deepEqual(new Set(runs.map((run) => run.id)), runIds);

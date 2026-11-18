@@ -1,8 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
-import { getRequest } from "@tanstack/react-start/server";
+import { getRequest, setResponseHeader } from "@tanstack/react-start/server";
 import { isAPIError } from "better-auth/api";
 import { z } from "zod";
-import { respondOk, type Result } from "../contract/respond.js";
+import { respondError, respondOk, type Result } from "../contract/respond.js";
 import { reportFailure, respondWithFailure } from "../failures/index.js";
 import { getApplication } from "../server/runtime.js";
 import {
@@ -17,6 +17,9 @@ import {
   apiKeyAllowedTriggersSchema,
   apiKeyCreateSchema,
   apiKeyScopeSchema,
+  rotateSigningSecretSchema,
+  retireSigningSecretSchema,
+  webhookSigningSummarySchema,
 } from "./api-key-contract.js";
 import { parseEntitlementDenial, type EntitlementDenialPayload } from "../entitlements/denial.js";
 
@@ -57,6 +60,7 @@ const apiKeySummarySchema = z.object({
   scopes: z.array(apiKeyScopeSchema),
   actor: apiKeyActorSchema.nullable(),
   allowedTriggers: apiKeyAllowedTriggersSchema.nullable(),
+  authentication: webhookSigningSummarySchema.optional(),
   createdAt: z.string(),
   lastUsedAt: z.string().nullable(),
   revokedAt: z.string().nullable(),
@@ -68,9 +72,26 @@ const cliCredentialSummarySchema = z.object({
   lastUsedAt: z.string().nullable(),
   revokedAt: z.string().nullable(),
 });
-const apiKeyCreateResultSchema = z.object({
-  key: apiKeySummarySchema,
-  secret: z.string().min(1),
+const apiKeyCreateResultSchema = z.union([
+  z
+    .object({
+      key: apiKeySummarySchema.extend({
+        authentication: webhookSigningSummarySchema,
+        allowedTriggers: z.tuple([z.string()]),
+      }),
+      signingSecret: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      key: apiKeySummarySchema.extend({ authentication: z.undefined() }),
+      secret: z.string().min(1),
+    })
+    .strict(),
+]);
+const rotatedSigningSecretSchema = z.object({
+  authentication: webhookSigningSummarySchema,
+  signingSecret: z.string().min(1),
 });
 
 export const accountState = createServerFn({ method: "GET" })
@@ -283,6 +304,7 @@ export const listApiKeys = createServerFn({ method: "GET" }).handler(
   async (): Promise<
     Result<{
       keys: z.infer<typeof apiKeySummarySchema>[];
+      signingAvailability: "enabled" | "disabled" | "unavailable";
       cliCredentials: z.infer<typeof cliCredentialSummarySchema>[];
     }>
   > => {
@@ -304,6 +326,7 @@ export const listApiKeys = createServerFn({ method: "GET" }).handler(
         z
           .object({
             keys: z.array(apiKeySummarySchema),
+            signingAvailability: z.enum(["enabled", "disabled", "unavailable"]),
             cliCredentials: z.array(cliCredentialSummarySchema),
           })
           .parse(await response.json()),
@@ -319,29 +342,108 @@ export const listApiKeys = createServerFn({ method: "GET" }).handler(
 export const createApiKey = createServerFn({ method: "POST" })
   .validator(apiKeyCreateSchema)
   .handler(async ({ data }): Promise<Result<z.infer<typeof apiKeyCreateResultSchema>>> => {
+    markSecretResponse();
     const response = await sendAccountCommand("/api/auth/paseo/api-keys", data);
     if (response instanceof AccountRequestError)
       return accountTransportFailure(
         response,
         "auth.api_keys.create",
-        "Hub couldn't create the API key. No key was issued.",
+        "Reload the key list to check whether the API key was created.",
       );
-    if (!response.ok)
+    if (!response.ok) {
+      if (data.authentication !== undefined) return signingResponseFailure(response);
       return accountResponseFailure(
         "auth.api_keys.create",
         response,
-        "Hub couldn't create the API key. No key was issued.",
+        "Hub couldn't create the API key. Reload the key list to check its status.",
       );
+    }
     try {
       const result = apiKeyCreateResultSchema.parse(await response.json());
       return respondOk(result);
-    } catch (error) {
-      return respondWithFailure(error, accountContext("auth.api_keys.create_response"), {
-        fallback:
-          "Hub couldn't read the new API key. Revoke the key from this page if it appears in the list.",
+    } catch {
+      return respondWithFailure(
+        new Error("Invalid API-key creation response"),
+        accountContext("auth.api_keys.create_response"),
+        {
+          fallback:
+            "Hub couldn't read the new API key. Revoke the key from this page if it appears in the list.",
+        },
+      );
+    }
+  });
+
+export const rotateApiKeySigningSecret = createServerFn({ method: "POST" })
+  .validator(rotateSigningSecretSchema)
+  .handler(async ({ data }): Promise<Result<z.infer<typeof rotatedSigningSecretSchema>>> => {
+    markSecretResponse();
+    const response = await sendAccountCommand(
+      "/api/auth/paseo/rotate-api-key-signing-secret",
+      data,
+    );
+    if (response instanceof AccountRequestError) {
+      return respondError({
+        message: "Reload the key list before rotating again. A new version may have been issued.",
+      });
+    }
+    if (!response.ok) return signingResponseFailure(response);
+    try {
+      return respondOk(rotatedSigningSecretSchema.parse(await response.json()));
+    } catch {
+      return respondError({
+        message:
+          "Reload the key list. If the current version changed, retire any previous version before rotating again.",
       });
     }
   });
+
+export const retireApiKeySigningSecret = createServerFn({ method: "POST" })
+  .validator(retireSigningSecretSchema)
+  .handler(async ({ data }): Promise<Result<Record<string, never>>> => {
+    const response = await sendAccountCommand(
+      "/api/auth/paseo/retire-api-key-signing-secret",
+      data,
+    );
+    if (response instanceof AccountRequestError) {
+      return respondError({
+        message: "Reload the key list to check whether the previous version was retired.",
+      });
+    }
+    if (!response.ok) return signingResponseFailure(response);
+    return respondOk({});
+  });
+
+function markSecretResponse(): void {
+  setResponseHeader("cache-control", "no-store");
+  setResponseHeader("pragma", "no-cache");
+}
+
+async function signingResponseFailure(response: Response) {
+  const messages: Record<string, string> = {
+    authentication_unavailable:
+      "Signature authentication is unavailable. Contact the Hub operator.",
+    signature_authentication_disabled:
+      "Signature authentication is disabled for this organization.",
+    forbidden: "You need permission to manage API keys in this organization.",
+    signing_version_changed:
+      "The signing version changed. Reload the key list before trying again.",
+    rotation_in_progress:
+      "A previous version is still valid. Wait for it to expire or retire it first.",
+    api_key_unavailable: "This signing key is no longer available. Reload the key list.",
+    trigger_not_found: "The selected manual trigger is unavailable. Reload the trigger list.",
+    invalid_request: "Check the signing key details and try again.",
+  };
+  const payload: unknown = await response.json().catch(() => null);
+  const code = z.object({ error: z.string() }).safeParse(payload);
+  const message =
+    code.success && Object.hasOwn(messages, code.data.error)
+      ? messages[code.data.error]
+      : undefined;
+  return respondError({
+    message:
+      message ?? "Hub couldn't complete the request. Reload the key list to check its status.",
+  });
+}
 
 export const revokeApiKey = createServerFn({ method: "POST" })
   .validator(apiKeyIdSchema)

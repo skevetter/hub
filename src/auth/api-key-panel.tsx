@@ -6,14 +6,23 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
 import { EmptyState } from "../components/app/empty-state.js";
-import { FailureAlert, failureMessage } from "../components/app/failure-alert.js";
+import { FailureAlert, WarningAlert, failureMessage } from "../components/app/failure-alert.js";
 import { FormActions } from "../components/app/form-actions.js";
+import { FormField } from "../components/app/form-field.js";
 import { FormDialog } from "../components/app/form-dialog.js";
 import { PageHeader } from "../components/app/page.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { RowActions } from "../components/app/row-actions.js";
+import { SegmentedControl } from "../components/app/segmented-control.js";
 import { Section } from "../components/app/section.js";
 import { StatusPill } from "../components/app/status-pill.js";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../components/ui/select.js";
 import { Button } from "../components/ui/button.js";
 import {
   Dialog,
@@ -24,7 +33,14 @@ import {
 } from "../components/ui/dialog.js";
 import type { Result } from "../contract/respond.js";
 import type { ApiKeyScope } from "./api-key-contract.js";
-import { createApiKey, listApiKeys, revokeApiKey, revokeCliCredential } from "./functions.js";
+import {
+  createApiKey,
+  listApiKeys,
+  revokeApiKey,
+  revokeCliCredential,
+  rotateApiKeySigningSecret,
+  retireApiKeySigningSecret,
+} from "./functions.js";
 import { useActiveAccount } from "./active-account.js";
 import { API_KEY_MUTATION_KEY } from "./tenant-mutation.js";
 import { triggerSnapshot } from "../triggers/functions.js";
@@ -33,6 +49,10 @@ import {
   API_KEY_COLUMNS,
   ApiKeyFormFields,
   ApiKeySecretContent,
+  GitHubSecretContent,
+  signingOverlapDeadline,
+  type ApiKeyReveal,
+  type ApiKeySigningAvailability,
   ApiKeyTable,
   apiKeyFormPayload,
   type ApiKeyRecord,
@@ -47,8 +67,16 @@ interface CliCredentialRecord {
   revokedAt: string | null;
 }
 
-type ListResult = Result<{ keys: ApiKeyRecord[]; cliCredentials: CliCredentialRecord[] }>;
-type CreateResult = Result<{ key: ApiKeyRecord; secret: string }>;
+type ListResult = Result<{
+  keys: ApiKeyRecord[];
+  cliCredentials: CliCredentialRecord[];
+  signingAvailability: ApiKeySigningAvailability;
+}>;
+const GITHUB_SIGNER_SCOPES = ["events:send"] as const;
+const AUTHENTICATION_OPTIONS = [
+  { label: "Bearer token", value: "bearer" },
+  { label: "GitHub SHA-256", value: "github" },
+];
 
 /**
  * Every failure on this page names what did not happen, because none of them are recoverable by
@@ -80,9 +108,21 @@ const CLI_LOGINS = {
 
 export function ApiKeys() {
   const account = useActiveAccount();
+  return <OrganizationApiKeys key={account.organization.id} account={account} />;
+}
+
+function OrganizationApiKeys({ account }: { account: ReturnType<typeof useActiveAccount> }) {
   const queryClient = useQueryClient();
   const [creating, setCreating] = useState(false);
-  const [secret, setSecret] = useState<string>();
+  const [reveal, setReveal] = useState<ApiKeyReveal>();
+  const [rotating, setRotating] = useState<ApiKeyRecord>();
+  const createKey = useServerFn(createApiKey);
+  const rotateKey = useServerFn(rotateApiKeySigningSecret);
+  const retireKey = useServerFn(retireApiKeySigningSecret);
+  const invalidate = useCallback(
+    () => queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] }),
+    [account.organization.id, queryClient],
+  );
   const load = useServerFn(listApiKeys) as (
     input: Parameters<typeof listApiKeys>[0],
   ) => Promise<ListResult>;
@@ -93,12 +133,51 @@ export function ApiKeys() {
   });
   const create = useMutation({
     mutationKey: API_KEY_MUTATION_KEY,
-    mutationFn: useServerFn(createApiKey) as (
-      input: Parameters<typeof createApiKey>[0],
-    ) => Promise<CreateResult>,
-    onSuccess: (result) => {
-      if (result.status === "ok") setSecret(result.data.secret);
+    retry: false,
+    mutationFn: async (input: Parameters<typeof createApiKey>[0]) => {
+      const result = await createKey(input);
+      if (result.status === "error") return result.error.message;
+      const issued = result.data;
+      setReveal(
+        "signingSecret" in issued
+          ? {
+              signingSecret: issued.signingSecret,
+              keyId: issued.key.id,
+              trigger: issued.key.allowedTriggers[0],
+            }
+          : { secret: issued.secret },
+      );
+      return undefined;
     },
+  });
+  const rotate = useMutation({
+    mutationKey: API_KEY_MUTATION_KEY,
+    retry: false,
+    mutationFn: async (input: {
+      record: ApiKeyRecord;
+      versionId: string;
+      overlapSeconds: number;
+    }) => {
+      const { record, versionId, overlapSeconds } = input;
+      const trigger = record.allowedTriggers?.[0];
+      if (trigger === undefined) return "Reload the key list to confirm the signing key's trigger.";
+      const result = await rotateKey({
+        data: { id: record.id, expectedCurrentVersionId: versionId, overlapSeconds },
+      });
+      if (result.status === "error") return result.error.message;
+      setReveal({
+        signingSecret: result.data.signingSecret,
+        keyId: record.id,
+        trigger,
+      });
+      return undefined;
+    },
+  });
+  const retire = useMutation({
+    mutationKey: API_KEY_MUTATION_KEY,
+    retry: false,
+    mutationFn: retireKey,
+    onSettled: invalidate,
   });
   const revoke = useMutation({
     mutationKey: API_KEY_MUTATION_KEY,
@@ -126,18 +205,45 @@ export function ApiKeys() {
   const reload = snapshot.refetch;
   const close = useCallback(
     (open: boolean) => {
+      if (!open && create.isPending) return;
       setCreating(open);
       if (!open) {
-        setSecret(undefined);
+        setReveal(undefined);
         create.reset();
-        void queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] });
+        void invalidate();
       }
     },
-    [account.organization.id, create, queryClient],
+    [create, invalidate],
   );
   const submit = useCallback(
     (data: Parameters<typeof createApiKey>[0]["data"]) => create.mutate({ data }),
     [create],
+  );
+  const closeRotation = useCallback(
+    (open: boolean) => {
+      if (open || rotate.isPending) return;
+      setRotating(undefined);
+      setReveal(undefined);
+      rotate.reset();
+      void invalidate();
+    },
+    [invalidate, rotate],
+  );
+  const submitRotation = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      const versionId = rotating?.authentication?.currentVersionId;
+      const overlapSeconds = Number(new FormData(event.currentTarget).get("overlapHours")) * 3600;
+      if (rotating !== undefined && versionId != null) {
+        rotate.mutate({ record: rotating, versionId, overlapSeconds });
+      }
+    },
+    [rotate, rotating],
+  );
+  const retireVersion = useCallback(
+    (id: string, versionId: string) =>
+      retire.mutate({ data: { id, expectedPreviousVersionId: versionId } }),
+    [retire],
   );
   const header = (
     <PageHeader title="API keys" description={`Machine access for ${account.organization.name}.`}>
@@ -196,14 +302,36 @@ export function ApiKeys() {
   const cliCredentials = [...snapshot.data.cliCredentials].sort((left, right) =>
     right.createdAt.localeCompare(left.createdAt),
   );
-  const createError =
-    create.isError || create.data?.status === "error"
-      ? failureMessage(create.data, CREATE_FAILURE)
+  const createError = create.isError ? CREATE_FAILURE : create.data;
+  const rotateError = rotate.isError
+    ? "Reload the key list before rotating again. A new version may have been issued."
+    : rotate.data;
+  const retireError =
+    retire.isError || retire.data?.status === "error"
+      ? failureMessage(
+          retire.data,
+          "Reload the key list to check whether the previous version was retired.",
+        )
       : undefined;
   const revokeError =
     revoke.isError || revoke.data?.status === "error"
       ? failureMessage(revoke.data, REVOKE_FAILURE)
       : undefined;
+  let rotationDialog;
+  if (rotating !== undefined) {
+    rotationDialog =
+      reveal === undefined ? (
+        <RotationDialog
+          record={rotating}
+          busy={rotate.isPending}
+          error={rotateError}
+          onOpenChange={closeRotation}
+          onSubmit={submitRotation}
+        />
+      ) : (
+        <SecretDialog open onOpenChange={closeRotation} reveal={reveal} />
+      );
+  }
   return (
     <>
       {header}
@@ -211,10 +339,21 @@ export function ApiKeys() {
         {revokeError === undefined ? null : (
           <FailureAlert title="API key not revoked" error={revokeError} fallback={REVOKE_FAILURE} />
         )}
+        {retireError === undefined ? null : (
+          <FailureAlert
+            title="Could not confirm retirement"
+            error={retireError}
+            fallback={retireError}
+            onRetry={reload}
+          />
+        )}
         <ApiKeyTable
           records={keys}
+          signingAvailability={snapshot.data.signingAvailability}
+          onRotate={setRotating}
+          onRetire={retireVersion}
           canManage={account.capabilities.manageResources}
-          busy={revoke.isPending}
+          busy={revoke.isPending || retire.isPending || rotate.isPending}
           onRevoke={revoke.mutate}
         />
       </Section>
@@ -240,12 +379,66 @@ export function ApiKeys() {
         organizationSlug={account.organization.slug}
         open={creating}
         onOpenChange={close}
-        secret={secret}
+        reveal={creating ? reveal : undefined}
+        canSign={snapshot.data.signingAvailability === "enabled"}
         busy={create.isPending}
         error={createError}
         onSubmit={submit}
       />
+      {rotationDialog}
     </>
+  );
+}
+
+function RotationDialog({
+  record,
+  busy,
+  error,
+  onOpenChange,
+  onSubmit,
+}: {
+  record: ApiKeyRecord;
+  busy: boolean;
+  error: string | undefined;
+  onOpenChange: (open: boolean) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  const [hours, setHours] = useState("1");
+  const deadline = record.authentication?.previousAcceptUntil;
+  return (
+    <FormDialog
+      open
+      onOpenChange={onOpenChange}
+      title="Rotate signing secret"
+      description={`Current version ${record.authentication?.currentVersionId ?? ""}`}
+      label="Rotate signing secret"
+      submitLabel="Rotate signing secret"
+      busy={busy}
+      onSubmit={onSubmit}
+    >
+      {deadline == null ? null : <p>Previous deadline {signingOverlapDeadline(deadline)}</p>}
+      <FormField
+        kind="number"
+        id="signing-overlap-hours"
+        name="overlapHours"
+        label="Overlap in hours"
+        description="Choose 0 to 72 hours. Update GitHub before the overlap ends."
+        min={0}
+        step={1}
+        required
+        value={hours}
+        onChange={setHours}
+        {...(Number(hours) > 72 ? { error: "Use 72 hours or less." } : {})}
+      />
+      {hours === "0" ? (
+        <WarningAlert title="Immediate cutover">
+          The current secret stops working as soon as you rotate.
+        </WarningAlert>
+      ) : null}
+      {error === undefined ? null : (
+        <FailureAlert title="Rotation needs attention" error={error} fallback={error} />
+      )}
+    </FormDialog>
   );
 }
 
@@ -299,7 +492,8 @@ function ApiKeyDialog({
   open,
   organizationSlug,
   onOpenChange,
-  secret,
+  reveal,
+  canSign,
   busy,
   error,
   onSubmit,
@@ -307,11 +501,14 @@ function ApiKeyDialog({
   open: boolean;
   organizationSlug: string;
   onOpenChange: (open: boolean) => void;
-  secret: string | undefined;
+  reveal: ApiKeyReveal | undefined;
+  canSign: boolean;
   busy: boolean;
   error: string | undefined;
   onSubmit: (data: Parameters<typeof createApiKey>[0]["data"]) => void;
 }) {
+  const [mode, setMode] = useState("bearer");
+  const signing = mode === "github";
   const [name, setName] = useState("");
   const [actorOverride, setActorOverride] = useState<string>();
   const [selectedScopes, setSelectedScopes] = useState<ApiKeyScope[]>([]);
@@ -349,6 +546,7 @@ function ApiKeyDialog({
   }, []);
   useEffect(() => {
     if (!open) {
+      setMode("bearer");
       setName("");
       setActorOverride(undefined);
       setSelectedScopes([]);
@@ -360,14 +558,21 @@ function ApiKeyDialog({
   // rather than greying out the submit, which explains nothing to whoever clicks it.
   const submit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
-      if (selectedScopes.length === 0) {
+      if (signing && !canSign) {
+        event.preventDefault();
+        setValidationError(
+          "Signature authentication is unavailable. Reload the key list before trying again.",
+        );
+        return;
+      }
+      if (!signing && selectedScopes.length === 0) {
         event.preventDefault();
         setScopeError("Select at least one scope.");
         return;
       }
       setScopeError(undefined);
       event.preventDefault();
-      const payload = apiKeyFormPayload(new FormData(event.currentTarget));
+      const payload = apiKeyFormPayload(new FormData(event.currentTarget), signing);
       if (!payload.success) {
         setValidationError(payload.error.issues.map((issue) => issue.message).join(". "));
         return;
@@ -375,12 +580,16 @@ function ApiKeyDialog({
       setValidationError(undefined);
       onSubmit(payload.data);
     },
-    [onSubmit, selectedScopes],
+    [canSign, onSubmit, selectedScopes, signing],
   );
 
-  if (secret !== undefined) {
-    return <SecretDialog open={open} onOpenChange={onOpenChange} secret={secret} />;
+  if (reveal !== undefined) {
+    return <SecretDialog open={open} onOpenChange={onOpenChange} reveal={reveal} />;
   }
+  const targets =
+    triggerStatus === "success"
+      ? triggerData.triggers.filter((trigger) => trigger.enabled && trigger.event === "manual.run")
+      : [];
   return (
     <FormDialog
       open={open}
@@ -392,15 +601,67 @@ function ApiKeyDialog({
       busy={busy}
       onSubmit={submit}
     >
+      {canSign ? (
+        <SegmentedControl
+          label="Authentication"
+          options={AUTHENTICATION_OPTIONS}
+          value={mode}
+          onChange={setMode}
+        />
+      ) : null}
       <ApiKeyFormFields
         name={name}
         actorOverride={actorOverride}
-        scopes={selectedScopes}
+        scopes={signing ? GITHUB_SIGNER_SCOPES : selectedScopes}
         triggers={triggers}
         scopeError={scopeError}
         onNameChange={setName}
         onActorChange={setActorOverride}
         onScopeChange={updateScope}
+        signingTarget={
+          signing ? (
+            <>
+              <FormField
+                id="github-signer-target"
+                label="Manual trigger"
+                required
+                description="This key can send events to this trigger only. Its scope is Send events."
+              >
+                {(control) => (
+                  <Select name="targetTriggerId" required disabled={targets.length === 0}>
+                    <SelectTrigger {...control}>
+                      <SelectValue placeholder="Select a trigger" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {targets.map((target) => (
+                        <SelectItem key={target.id} value={target.id}>
+                          {target.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
+              </FormField>
+              {triggerStatus === "error" && (
+                <FailureAlert
+                  title="Triggers unavailable"
+                  error={triggerError}
+                  fallback="Reload the trigger list before creating a GitHub signing key."
+                  onRetry={snapshot.refetch}
+                />
+              )}
+              {triggerStatus === "pending" && <p>Loading triggers...</p>}
+              {triggerStatus === "success" && targets.length === 0 && (
+                <p>Create or enable a manual trigger first.</p>
+              )}
+              <WarningAlert title="Identical bodies are accepted once per key">
+                GitHub signs the body without a timestamp. Hub ignores delivery headers for routing
+                and deduplication. A captured body that Hub has never accepted can still arrive
+                later.
+              </WarningAlert>
+            </>
+          ) : undefined
+        }
       />
       {validationError === undefined ? null : (
         <FailureAlert
@@ -424,11 +685,11 @@ function ApiKeyDialog({
 function SecretDialog({
   open,
   onOpenChange,
-  secret,
+  reveal,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  secret: string;
+  reveal: ApiKeyReveal;
 }) {
   const close = useCallback(() => onOpenChange(false), [onOpenChange]);
   const preventDismissal = useCallback((event: { preventDefault: () => void }) => {
@@ -449,12 +710,18 @@ function SecretDialog({
         onPointerDownOutside={preventDismissal}
       >
         <DialogHeader>
-          <DialogTitle>Copy your API key</DialogTitle>
+          <DialogTitle>
+            {"signingSecret" in reveal ? "Copy your GitHub signing secret" : "Copy your API key"}
+          </DialogTitle>
           <DialogDescription>
             This key is shown once. Store it in your deployment secrets now.
           </DialogDescription>
         </DialogHeader>
-        <ApiKeySecretContent secret={secret} settings={settings} />
+        {"signingSecret" in reveal ? (
+          <GitHubSecretContent reveal={reveal} settings={settings} />
+        ) : (
+          <ApiKeySecretContent secret={reveal.secret} settings={settings} />
+        )}
         <FormActions>
           <Button type="button" onClick={close}>
             Done

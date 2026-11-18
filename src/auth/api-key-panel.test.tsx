@@ -6,6 +6,7 @@ import {
   ApiKeySecretContent,
   ApiKeyTable,
   ApiKeyTriggerField,
+  GitHubSecretContent,
   apiKeyFormPayload,
   type ApiKeyRecord,
   type ApiKeyTriggerChoices,
@@ -279,5 +280,68 @@ describe("one-time API key presentation", () => {
     assert.match(markup, /Webhook example unavailable/u);
     assert.match(markup, /Hub did not receive the webhook address/u);
     assert.doesNotMatch(markup, /curl -sS|\/api\/v1\/hooks\//u);
+  });
+});
+
+const keyId = "5bc27548-a159-4d3b-a85a-ff5713fde2cc";
+const targetTriggerId = "d79c7455-a094-481e-aad2-ecfd6178ecf1";
+const signingSecret = "paseo_whsec_fake-browser-test-secret";
+
+const issued = { signingSecret, trigger: "build-finished", keyId };
+const signedRecord: ApiKeyRecord = {
+  ...record,
+  id: keyId,
+  actor: "sender",
+  scopes: ["events:send"],
+  allowedTriggers: ["build-finished"],
+  authentication: {
+    mode: "hmac",
+    profile: "github_sha256",
+    targetTriggerId,
+    currentVersionId: keyId,
+    previousVersionId: targetTriggerId,
+    previousAcceptUntil: "2000-01-01T00:00:00.000Z",
+  },
+};
+const records = [signedRecord];
+
+describe("GitHub signing keys", () => {
+  it("requires a selected trigger id and submits only the fixed scope", () => {
+    const fields = form(["runs:read"]);
+    assert.equal(apiKeyFormPayload(fields, true).success, false);
+    fields.set("targetTriggerId", targetTriggerId);
+    const payload = apiKeyFormPayload(fields, true);
+    assert.equal(payload.success, true);
+    assert.deepEqual(payload.data.authentication, {
+      mode: "hmac",
+      profile: "github_sha256",
+      targetTriggerId,
+    });
+    assert.deepEqual(payload.data.scopes, ["events:send"]);
+    assert.equal(payload.data.allowedTriggers, null);
+  });
+
+  it("renders copy controls only in the reveal and expiry metadata in the table", () => {
+    const reveal = renderToStaticMarkup(
+      <GitHubSecretContent settings={webhookSettings} reveal={issued} />,
+    );
+
+    assert.match(reveal, /Copy signing secret/u);
+    assert.match(reveal, /hub.example.test\/api\/v1\/hooks\/build-finished\/signers\//u);
+    assert.ok(reveal.includes(signingSecret));
+    const disabled = renderTable(records);
+    assert.match(disabled, /Signature authentication disabled/u);
+    assert.ok(!disabled.includes(signingSecret));
+    assert.ok(!disabled.includes(signedRecord.prefix));
+    const enabled = renderToStaticMarkup(
+      <ApiKeyTable
+        records={records}
+        canManage={false}
+        busy={false}
+        onRevoke={noop}
+        signingAvailability="enabled"
+      />,
+    );
+    assert.match(enabled, /Previous version expired/u);
   });
 });
