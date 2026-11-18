@@ -160,10 +160,15 @@ export function summarizeRunPayload(
   };
 }
 
-export function summarizeStepPayload(step: WorkflowStepRunRecord): StepPayloadSummary {
+type StepSource = Pick<
+  WorkflowStepRunRecord,
+  "stepId" | "status" | "startedAt" | "completedAt" | "agentExecutionId" | "output"
+> & { dispatchIntent: { agent?: { provider?: unknown; model?: unknown } } | null };
+
+export function summarizeStepPayload(step: StepSource): StepPayloadSummary {
   const script = step.agentExecutionId === null ? readScriptStepResult(step.output) : undefined;
-  const provider = step.dispatchIntent?.agent.provider;
-  const model = step.dispatchIntent?.agent.model;
+  const provider = step.dispatchIntent?.agent?.provider;
+  const model = step.dispatchIntent?.agent?.model;
   return {
     version: 1,
     stepKey: step.stepId,
