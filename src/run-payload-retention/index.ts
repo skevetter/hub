@@ -46,7 +46,7 @@ export class RunPayloadRetention {
     for (const candidate of page) {
       if (shouldStop()) return { complete: false, counts: this.counts, expired: this.expired };
       if (!countOnly && candidate.disposition === "eligible") {
-        const result = await this.store.expireRunPayloadChunk(candidate.id, cutoff, this.now);
+        const result = await this.store.expireRunPayloadChunk(candidate.id, cutoff, now);
         if (result === "expiring") {
           return { complete: false, counts: this.counts, expired: this.expired };
         }

@@ -15,6 +15,7 @@ import { ProjectCommandError } from "./command-error.js";
 import { summarizeTrigger } from "./activity-summary.js";
 import {
   activityRunView,
+  readActivityExecutions,
   activityRunDetailView,
   displayFailureReason,
   jsonValue,
@@ -101,24 +102,17 @@ export class ProjectDashboard {
 
   async activityRunSnapshot(request: Request, scope: ProjectRouteScope & { runId: string }) {
     const { account, tenant } = await this.resolveProject(request, scope);
-    const activity = await this.database.findProjectActivityRun(tenant.project.id, scope.runId);
-    if (activity === undefined) throw new ProjectCommandError("run_unavailable");
+    const read = await readActivityExecutions(this.database, () =>
+      this.database.findProjectActivityRun(tenant.project.id, scope.runId),
+    );
+    if (read === undefined) throw new ProjectCommandError("run_unavailable");
     return {
       account: account.account,
       organization: tenant.organization,
       membership: tenant.membership,
       capabilities: capabilitiesFor(tenant.membership.role),
       project: projectView(tenant.project),
-      activity: activityRunView(
-        activity,
-        await Promise.all(
-          activity.steps.map(async (step) =>
-            step.agentExecutionId === null
-              ? undefined
-              : this.database.findAgentExecutionById(step.agentExecutionId),
-          ),
-        ),
-      ),
+      activity: activityRunView(read.activity, read.executions),
     };
   }
 
@@ -127,19 +121,10 @@ export class ProjectDashboard {
     scope: { organizationSlug: string; runId: string },
   ): Promise<ActivityRunDetail | null> {
     const { tenant } = await this.resolve(request, { organizationSlug: scope.organizationSlug });
-    const activity = await this.database.findOrganizationActivityRun(
-      tenant.organization.id,
-      scope.runId,
+    const read = await readActivityExecutions(this.database, () =>
+      this.database.findOrganizationActivityRun(tenant.organization.id, scope.runId),
     );
-    if (activity === undefined) return null;
-    const executions = await Promise.all(
-      activity.steps.map(async (step) =>
-        step.agentExecutionId === null
-          ? undefined
-          : this.database.findAgentExecutionById(step.agentExecutionId),
-      ),
-    );
-    return activityRunDetailView(activity, executions);
+    return read === undefined ? null : activityRunDetailView(read.activity, read.executions);
   }
 
   async createProject(

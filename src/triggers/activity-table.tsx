@@ -44,7 +44,11 @@ export function TriggerActivityTable({
             <div className="flex items-center gap-2">
               <ProviderGlyph provider={run.provider} source={run.source} />
               <TwoLine
-                primary={run.webhookSummary?.headline ?? run.source}
+                primary={
+                  run.payloadExpiredAt == null
+                    ? (run.webhookSummary?.headline ?? run.source)
+                    : "Run payload expired"
+                }
                 {...(run.webhookSummary?.prompt === undefined
                   ? {}
                   : { secondary: run.webhookSummary.prompt })}

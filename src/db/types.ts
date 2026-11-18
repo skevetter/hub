@@ -66,6 +66,7 @@ export interface OrganizationRunRecord {
   source: string;
   status: TriggerRunRecord["status"];
   receivedAt: Date;
+  payloadExpiredAt?: string | null;
   /** The agent the dispatched launch intent named; null before dispatch or when nothing launched. */
   agent: { provider: string; model: string | null } | null;
 }

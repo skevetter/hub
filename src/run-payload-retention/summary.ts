@@ -62,11 +62,29 @@ function uuid(value: unknown): string | null {
     : null;
 }
 
+function slackMessageLink(context: unknown): string | null {
+  const channel = field(context, "channelId");
+  const message = field(context, "messageTs");
+  if (typeof channel !== "string" || !/^[CGD][A-Z0-9]{8,31}$/u.test(channel)) return null;
+  if (typeof message !== "string" || !/^\d{9,12}\.\d{6}$/u.test(message)) return null;
+  return `https://app.slack.com/archives/${channel}/p${message.replace(".", "")}`;
+}
+
+function discordMessageLink(context: unknown): string | null {
+  const parts = ["guildId", "channelId", "messageId"].map((key) => field(context, key));
+  const ids = parts.filter(
+    (part): part is string => typeof part === "string" && /^[1-9]\d{16,19}$/u.test(part),
+  );
+  return ids.length === 3 ? `https://discord.com/channels/${ids.join("/")}` : null;
+}
+
 function providerLink(
   run: TriggerRunRecord,
   receipt: Pick<ProviderEventReceiptSummary, "provider">,
   repo: string | null,
 ): string | null {
+  if (receipt.provider === "slack") return slackMessageLink(run.outputContext);
+  if (receipt.provider === "discord") return discordMessageLink(run.outputContext);
   const event = field(run.triggerContext, "event");
   if (receipt.provider === "linear") {
     const id = uuid(field(run.outputContext, "issueId"));
@@ -76,20 +94,21 @@ function providerLink(
   if (receipt.provider === "github_notification") {
     const notification = field(event, "github_notification");
     const number = positiveId(field(notification, "number"));
-    const type = field(notification, "type");
-    return number === null
-      ? null
-      : `https://github.com/${repo}/${type === "PullRequest" ? "pull" : "issues"}/${number}`;
+    const type = field(notification, "subject_type");
+    if (number === null || (type !== "PullRequest" && type !== "Issue")) return null;
+    return `https://github.com/${repo}/${type === "PullRequest" ? "pull" : "issues"}/${number}`;
   }
   if (receipt.provider !== "github") return null;
   const github = field(event, "github");
   const number = positiveId(field(field(github, "item"), "number"));
   if (number === null) return `https://github.com/${repo}`;
-  const pull = field(field(github, "item"), "kind") === "pull_request";
+  const pull = field(field(github, "item"), "type") === "pull_request";
   return `https://github.com/${repo}/${pull ? "pull" : "issues"}/${number}`;
 }
 
-function progressSummary(message: RunProgressMessage | undefined): RunPayloadSummary["progress"] {
+function progressSummary(
+  message: Pick<RunProgressMessage, "state" | "provider" | "externalRef"> | undefined,
+): RunPayloadSummary["progress"] {
   if (message?.state !== "finished") {
     return {
       status: message === undefined || message.state === "abandoned" ? "unknown" : "failed",
@@ -123,7 +142,7 @@ export function summarizeRunPayload(
   receipt: Pick<ProviderEventReceiptSummary, "provider" | "repo">,
   stepCounts: RunPayloadSummary["stepCounts"],
   timeline: Pick<RunTimelineState, "eventCount" | "droppedCount"> | undefined,
-  progress: RunProgressMessage | undefined,
+  progress: Pick<RunProgressMessage, "state" | "provider" | "externalRef"> | undefined,
 ): RunPayloadSummary {
   const repo = repositoryName(receipt.repo);
   return {

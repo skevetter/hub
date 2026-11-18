@@ -5,6 +5,7 @@ import {
 } from "../run-payload-retention/summary.js";
 import type {
   AgentExecutionRecord,
+  Database,
   ProjectActivityRunRecord,
   ProviderEventReceiptRecord,
   TriggerRunRecord,
@@ -56,6 +57,38 @@ export interface ActivityRunDetail {
     isAgent: boolean;
     completion: "explicit_finish" | "inferred_from_turn_end" | null;
   }[];
+}
+
+export async function readActivityExecutions(
+  database: Database,
+  read: () => Promise<ProjectActivityRunRecord | undefined>,
+) {
+  const activity = await read();
+  if (activity === undefined) return undefined;
+  const executions = await executionsForActivity(database, activity);
+  if (activity.run.payloadExpiredAt == null) {
+    const current = await database.findTriggerRunForOrganization(
+      activity.run.organizationId,
+      activity.run.id,
+    );
+    if (current === undefined) return undefined;
+    if (current.payloadExpiredAt != null) {
+      const expired = await read();
+      if (expired === undefined) return undefined;
+      return { activity: expired, executions: await executionsForActivity(database, expired) };
+    }
+  }
+  return { activity, executions };
+}
+
+function executionsForActivity(database: Database, activity: ProjectActivityRunRecord) {
+  return Promise.all(
+    activity.steps.map(async (step) =>
+      step.agentExecutionId === null
+        ? undefined
+        : database.findAgentExecutionById(step.agentExecutionId),
+    ),
+  );
 }
 
 export function activityRunDetailView(

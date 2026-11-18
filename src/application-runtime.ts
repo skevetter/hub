@@ -524,8 +524,9 @@ function startRunPayloadRetention(
   options: ApplicationCompositionOptions,
   ownership: CompositionResources,
 ) {
-  if (options.database === null || options.runPayloadRetention?.mode !== "count") return;
-  const retention = new RunPayloadRetention(options.database, options.runPayloadRetention);
+  const settings = options.runPayloadRetention;
+  if (options.database === null || settings === undefined || settings.mode === "off") return;
+  const retention = new RunPayloadRetention(options.database, settings);
   ownership.own(() => retention.stop(), "composition.run_payload_retention");
   retention.start();
 }

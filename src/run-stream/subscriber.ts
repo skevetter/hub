@@ -112,6 +112,15 @@ export class RunStreamSubscriber {
               const page = await options.notifier.page(cursor);
               if (this.closed) return;
               if (page.length > 0) {
+                const current = await options.store.findTriggerRunForOrganization(
+                  context.run.organizationId,
+                  context.run.id,
+                );
+                if (this.closed) return;
+                if (current?.payloadExpiredAt != null) {
+                  this.finish("error", controlEvent("error", { code: "timeline_expired" }));
+                  return;
+                }
                 this.page = page;
                 continue;
               }

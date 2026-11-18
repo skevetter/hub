@@ -270,9 +270,16 @@ export function ConnectionPill({ connection }: { connection: RunConnection }) {
 }
 
 export function progressMessageLabel(
-  detail: Pick<RunDetailSnapshot, "progress" | "progressMessagesEnabled">,
+  detail: Pick<RunDetailSnapshot, "progress" | "progressMessagesEnabled" | "progressUnavailable"> &
+    Partial<Pick<RunDetailSnapshot, "run">>,
 ) {
+  const summary = detail.run?.payloadSummary?.progress;
+  if (summary !== undefined) {
+    if (summary.status === "posted") return "Posted";
+    return summary.status === "failed" ? "Posting failed" : "Unavailable";
+  }
   const progress = detail.progress;
+  if (progress === null && detail.progressUnavailable) return "Unavailable";
   if (progress === null)
     return detail.progressMessagesEnabled
       ? "Off for this trigger"

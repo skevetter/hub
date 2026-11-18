@@ -10,7 +10,7 @@ import { OrganizationTriggerStore } from "./store.js";
 import { notificationStatusView, type NotificationStatusView } from "./notification-status.js";
 import { summarizeRecentRuns, type RecentRuns } from "./recent-runs.js";
 import { summarizeTrigger } from "../projects/activity-summary.js";
-import { activityRunDetailView } from "../projects/activity-run-view.js";
+import { activityRunDetailView, readActivityExecutions } from "../projects/activity-run-view.js";
 import { isRunTimelineExpired, retentionCutoff } from "../run-timeline/retention.js";
 import { timelineStepId } from "../run-timeline/data.js";
 import type { RunTimelineReconciler } from "../run-timeline/reconcile.js";
@@ -158,19 +158,29 @@ export class TriggerDashboard {
     });
     const run = await this.database.findTriggerRunForOrganization(tenant.organization.id, runId);
     if (run === undefined) return null;
-    const activity = await this.database.findProjectActivityRun(run.projectId, runId);
-    if (activity === undefined) return null;
-    const [executions, timeline, progress] = await Promise.all([
-      Promise.all(
-        activity.steps.map(async (step) =>
-          step.agentExecutionId === null
-            ? undefined
-            : this.database.findAgentExecutionById(step.agentExecutionId),
-        ),
-      ),
-      this.timelinePage(tenant.organization.id, activity.run, 0),
-      this.database.findRunProgressMessage(tenant.organization.id, runId),
+    return this.runDetailForProject(tenant.organization.id, run.projectId, runId);
+  }
+
+  private async runDetailForProject(
+    organizationId: string,
+    projectId: string,
+    runId: string,
+  ): Promise<RunDetailSnapshot | null> {
+    const read = await readActivityExecutions(this.database, () =>
+      this.database.findProjectActivityRun(projectId, runId),
+    );
+    if (read === undefined || read.activity.run.organizationId !== organizationId) return null;
+    const { activity, executions } = read;
+    const [timeline, progress] = await Promise.all([
+      this.timelinePage(organizationId, activity.run, 0),
+      this.database.findRunProgressMessage(organizationId, runId),
     ]);
+    if (activity.run.payloadExpiredAt == null) {
+      const current = await this.database.findTriggerRunForOrganization(organizationId, runId);
+      if (current === undefined) return null;
+      if (current.payloadExpiredAt != null)
+        return this.runDetailForProject(organizationId, projectId, runId);
+    }
     const detail = activityRunDetailView(activity, executions);
     return {
       ...detail,
@@ -247,8 +257,12 @@ export class TriggerDashboard {
           afterSeq: after,
           limit: 100,
         });
+    if (!expired) {
+      const current = await this.database.findTriggerRunForOrganization(organizationId, run.id);
+      expired = current?.payloadExpiredAt != null;
+    }
     return {
-      events: events.map(({ seq, kind, at, stepId, data }) => ({
+      events: (expired ? [] : events).map(({ seq, kind, at, stepId, data }) => ({
         seq,
         kind,
         at: at.toISOString(),
@@ -296,7 +310,11 @@ export class TriggerDashboard {
             triggerName: trigger.name,
             provider: receipt.provider,
             source: receipt.source,
-            repo: receipt.repo,
+            repo:
+              run.payloadExpiredAt == null
+                ? receipt.repo
+                : (run.payloadSummary?.repository ?? null),
+            payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
             status: run.status,
             receivedAt: receipt.receivedAt.toISOString(),
           },

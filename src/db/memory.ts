@@ -1,3 +1,10 @@
+import {
+  payloadCompletion,
+  reduceRejection,
+  summarizeRunPayload,
+  summarizeStepPayload,
+  type RunPayloadSummary,
+} from "../run-payload-retention/summary.js";
 import { isProgressUnsettled, type RunPayloadDisposition } from "../run-payload-retention/store.js";
 import { readScriptStepHandle } from "../workflows/script-output.js";
 import { randomUUID } from "node:crypto";
@@ -200,7 +207,9 @@ class MemoryDatabase implements Database {
           (after === null || run.id > after) &&
           run.payloadExpiryState !== "expired" &&
           (countOnly ||
-            (run.status !== "running" && run.completedAt !== null && run.completedAt < cutoff)),
+            (run.status !== "running" &&
+              run.completedAt !== null &&
+              (run.completedAt < cutoff || run.payloadExpiryState === "expiring"))),
       )
       .sort((left, right) => left.id.localeCompare(right.id))
       .slice(0, limit)
@@ -208,19 +217,100 @@ class MemoryDatabase implements Database {
         id: run.id,
         disposition: this.runPayloadDisposition(run, cutoff),
         ageFrom: run.completedAt ?? run.createdAt,
-        expiring: run.payloadExpiryState === "expiring",
       }));
   }
 
-  async expireRunPayloadChunk(): Promise<"skipped"> {
-    return "skipped";
+  async expireRunPayloadChunk(id: string, cutoff: Date, now: Date) {
+    const run = this.triggerRuns.get(id);
+    if (
+      run === undefined ||
+      run.payloadExpiryState === "expired" ||
+      this.runPayloadDisposition(run, cutoff) !== "eligible"
+    )
+      return "skipped";
+    const steps = this.listSteps(id);
+    if (run.payloadExpiryState == null) {
+      this.stageRunPayload(run, steps, now);
+      return "expiring";
+    }
+    const executions = this.runPayloadExecutions(run, steps)
+      .filter(
+        (execution) =>
+          execution.result != null ||
+          execution.triggerContext != null ||
+          execution.outputContext != null ||
+          (execution.completedByAgentAt !== null && execution.payloadCompletion == null),
+      )
+      .slice(0, 50);
+    if (executions.length > 0) {
+      for (const execution of executions) {
+        this.agentExecutions.set(execution.id, {
+          ...execution,
+          payloadCompletion: payloadCompletion(execution),
+          result: null,
+          triggerContext: null,
+          outputContext: null,
+        });
+      }
+      return "expiring";
+    }
+    const chunk = steps.filter((step) => step.payloadSummary == null).slice(0, 50);
+    if (chunk.length > 0) {
+      for (const step of chunk) {
+        this.workflowStepRuns.set(step.id, {
+          ...step,
+          payloadSummary: summarizeStepPayload(step),
+          output: null,
+          failureReason: null,
+          dispatchIntent: null,
+        });
+      }
+      return "expiring";
+    }
+    this.triggerRuns.set(id, { ...run, payloadExpiryState: "expired" });
+    return "expired";
+  }
+
+  private stageRunPayload(
+    run: TriggerRunRecord,
+    steps: readonly WorkflowStepRunRecord[],
+    now: Date,
+  ) {
+    const stepCounts: RunPayloadSummary["stepCounts"] = {};
+    for (const step of steps) stepCounts[step.status] = (stepCounts[step.status] ?? 0) + 1;
+    const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
+    if (receipt === undefined) throw new Error("run payload receipt unavailable");
+    const summary = summarizeRunPayload(
+      run,
+      receipt,
+      stepCounts,
+      this.runTimelineStates.get(run.id),
+      this.runProgressMessages.get(run.id),
+    );
+    const reduced = {
+      ...run,
+      payloadExpiredAt: new Date(now),
+      payloadExpiryState: "expiring" as const,
+      payloadSummary: summary,
+      prompt: "",
+      inputs: {},
+      values: {},
+      triggerContext: {},
+      outputContext: {},
+      conversation: null,
+    };
+    this.triggerRuns.set(
+      run.id,
+      reduced.outcome === "rejected"
+        ? { ...reduced, rejection: reduceRejection(reduced.rejection) }
+        : { ...reduced, failureReason: summary.failureCode },
+    );
   }
 
   private runPayloadDisposition(run: TriggerRunRecord, cutoff: Date): RunPayloadDisposition {
-    if (run.payloadExpiryState === "expiring") return "eligible";
     if (run.status === "running") return "live";
     if (run.completedAt === null) return "missing_completion";
-    if (run.completedAt >= cutoff) return "not_old_enough";
+    if (run.completedAt >= cutoff && run.payloadExpiryState !== "expiring") return "not_old_enough";
     const steps = this.listSteps(run.id);
     if (
       steps.some(
@@ -236,12 +326,7 @@ class MemoryDatabase implements Database {
         (step) =>
           step.status === "running" || (step.status === "pending" && step.dispatchIntent !== null),
       ) ||
-      this.runPayloadExecutions(run, steps).some(
-        (execution) =>
-          !isTerminalAgentExecutionStatus(execution.status) ||
-          execution.completedAt === null ||
-          (execution.hubAction !== null && execution.hubActionCompletedAt === null),
-      )
+      this.runPayloadExecutions(run, steps).some(isRunExecutionUnfinished)
     )
       return "live";
     if (
@@ -253,34 +338,42 @@ class MemoryDatabase implements Database {
       return "notification_pending";
     const message = this.runProgressMessages.get(run.id);
     if (message !== undefined && isProgressUnsettled(message)) return "reporter_pending";
-    const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
-    const branches = this.triggerRunIdsByProviderEventReceipt.get(run.providerEventReceiptId);
-    if (
+    return this.hasUnresolvedRunFanout(run.providerEventReceiptId)
+      ? "fan_out_unresolved"
+      : "eligible";
+  }
+
+  private hasUnresolvedRunFanout(receiptId: string): boolean {
+    const receipt = this.providerEventReceipts.get(receiptId);
+    if (receipt?.acceptedRoutes === null) {
+      return ["github", "linear", "slack", "discord"].includes(receipt.provider);
+    }
+    const branches = this.triggerRunIdsByProviderEventReceipt.get(receiptId);
+    return (
       receipt?.acceptedRoutes?.some(
         (route) =>
           ![...(branches?.get(route.projectId)?.values() ?? [])].some(
             (id) =>
               this.triggerRuns.get(id)?.configurationRevisionId === route.configurationRevisionId,
           ),
-      )
-    )
-      return "fan_out_unresolved";
-    return "eligible";
+      ) ?? false
+    );
   }
 
   private runPayloadExecutions(run: TriggerRunRecord, steps: readonly WorkflowStepRunRecord[]) {
-    return [...this.agentExecutions.values()].filter(
-      (execution) =>
+    return [...this.agentExecutions.values()].filter((execution) => {
+      if (execution.organizationId !== run.organizationId || execution.projectId !== run.projectId)
+        return false;
+      return (
         steps.some(
           (step) =>
             execution.workflowStepRunId === step.id || execution.id === step.agentExecutionId,
         ) ||
         (execution.workflowStepRunId === null &&
           execution.launchIntent?.kind === "launch_machine" &&
-          execution.launchIntent.triggerRunId === run.id &&
-          execution.organizationId === run.organizationId &&
-          execution.projectId === run.projectId),
-    );
+          execution.launchIntent.triggerRunId === run.id)
+      );
+    });
   }
 
   // This test double has no background work. Scheduling tests use the actual embedded/PG runtime.
@@ -2442,6 +2535,8 @@ class MemoryDatabase implements Database {
       hubActionAcknowledgements: emptyHubActionAcknowledgements(),
     };
 
+    if (this.executionPayloadExpired(execution))
+      throw new Error("agent execution insert returned no row");
     this.agentExecutions.set(execution.id, execution);
     this.options.onInsertAgentExecution?.(execution);
     return execution;
@@ -2451,6 +2546,20 @@ class MemoryDatabase implements Database {
     input: InsertAgentExecutionInput & { id: string },
   ): Promise<AgentExecutionRecord | undefined> {
     if (this.agentExecutions.has(input.id)) return undefined;
+    const stepId = input.workflowStepRunId;
+    const runId =
+      stepId == null
+        ? input.launchIntent?.triggerRunId
+        : this.workflowStepRuns.get(stepId)?.triggerRunId;
+    if (runId !== undefined) {
+      const run = this.triggerRuns.get(runId);
+      if (
+        run?.organizationId === input.organizationId &&
+        run.projectId === input.projectId &&
+        run.payloadExpiredAt != null
+      )
+        return undefined;
+    }
     return this.insertAgentExecution(input);
   }
 
@@ -4215,7 +4324,10 @@ class MemoryDatabase implements Database {
             source: receipt.source,
             status: run.status,
             receivedAt: receipt.receivedAt,
-            agent: launchedAgent(execution?.launchIntent?.agent),
+            agent: launchedAgent(
+              run.payloadExpiredAt == null ? execution?.launchIntent?.agent : step?.payloadSummary,
+            ),
+            payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
           },
         ];
       });
@@ -4731,4 +4843,13 @@ function executionTransitionFields(
       : { deadlineCondition: input.deadlineCondition }),
     ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
   };
+}
+
+function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
+  return (
+    !isTerminalAgentExecutionStatus(execution.status) ||
+    execution.completedAt === null ||
+    (execution.hubAction !== null && execution.hubActionCompletedAt === null) ||
+    Object.values(execution.outputDeliveryAttempts).some((attempt) => attempt.status === "pending")
+  );
 }

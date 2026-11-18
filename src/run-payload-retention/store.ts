@@ -14,7 +14,6 @@ export interface RunPayloadCandidate {
   id: string;
   disposition: RunPayloadDisposition;
   ageFrom: Date;
-  expiring: boolean;
 }
 
 export interface RunPayloadRetentionStore {
@@ -50,8 +49,9 @@ export const PROGRESS_UNSETTLED_SQL = `(
   or message.repeat_final or message.compensation_requested_gen > message.compensation_done_gen
 )`;
 
-export const SCRIPT_CLEANUP_SQL = `step.agent_execution_id is null and (
-  (step.status in ('succeeded', 'failed', 'timed_out') and
-    ((step.output ->> 'daemon_id') is not null or (step.output -> 'cleanup') is not null))
-  or ((step.output ->> 'daemon_id') is not null and (step.output ->> 'cwd') is not null)
-)`;
+export const PENDING_SCRIPT_CLEANUP_SQL = `step.agent_execution_id is null
+  and step.status in ('succeeded', 'failed', 'timed_out')
+  and ((step.output ->> 'daemon_id') is not null or (step.output -> 'cleanup') is not null)`;
+
+export const SCRIPT_CLEANUP_SQL = `(${PENDING_SCRIPT_CLEANUP_SQL}) or
+  (step.agent_execution_id is null and (step.output ->> 'daemon_id') is not null and (step.output ->> 'cwd') is not null)`;

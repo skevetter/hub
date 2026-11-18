@@ -1,7 +1,21 @@
-import { scanRunPayloads } from "./run-payload-retention.js";
-import { reduceRejection, type PayloadCompletion } from "../run-payload-retention/summary.js";
+import {
+  PENDING_SCRIPT_CLEANUP_SQL,
+  type RunPayloadDisposition,
+} from "../run-payload-retention/store.js";
+import {
+  RUN_PAYLOAD_DISPOSITION_SQL,
+  runExecutions,
+  scanRunPayloads,
+} from "./run-payload-retention.js";
+import {
+  reduceRejection,
+  summarizeRunPayload,
+  summarizeStepPayload,
+  type PayloadCompletion,
+  type RunPayloadSummary,
+} from "../run-payload-retention/summary.js";
 import { RunTimelineRepository } from "../run-timeline/postgres-store.js";
-import type { RunTimelineStore } from "../run-timeline/store.js";
+import type { RunProgressMessage, RunTimelineStore } from "../run-timeline/store.js";
 import { ExecutionAuthorityRepository } from "../execution-authority/index.js";
 import { ScheduleRepository } from "../triggers/schedule/index.js";
 import { GitHubNotificationRepository } from "../triggers/github-notifications/index.js";
@@ -137,22 +151,128 @@ const STEP_PAYLOAD_PROJECTION = `step.id, step.trigger_run_id, step.step_id, ste
   case when run.payload_expiry_state is null then step.failure_reason end as failure_reason,
   case when run.payload_expiry_state is null then step.dispatch_intent end as dispatch_intent`;
 
-const OPEN_STEP_RUN = `select run.id from trigger_runs run join workflow_step_runs step
+const OPEN_STEP_RUN = `select run.id, run.status from trigger_runs run join workflow_step_runs step
   on step.trigger_run_id = run.id where step.id = $1 and run.payload_expiry_state is null
   for share of run`;
 
-const OPEN_EXECUTION_RUN = `not exists (
-  select 1 from trigger_runs run
-  where (run.id in (
+const EXECUTION_RUN_OWNERS = `select run.payload_expiry_state from trigger_runs run
+  where run.id in (
     select step.trigger_run_id from workflow_step_runs step
     where step.id = execution.workflow_step_run_id or step.agent_execution_id = execution.id
   ) or (execution.workflow_step_run_id is null and execution.launch_intent ->> 'kind' = 'launch_machine'
     and run.id::text = execution.launch_intent ->> 'triggerRunId'
-    and run.organization_id = execution.organization_id and run.project_id = execution.project_id))
-    and run.payload_expiry_state is not null
-)`;
+    and run.organization_id = execution.organization_id and run.project_id = execution.project_id)`;
 
-const EXECUTION_PAYLOAD_PROJECTION = `execution.*, not (${OPEN_EXECUTION_RUN}) as payload_hidden`;
+const EXECUTION_INSERT_OWNERS = `select run.payload_expiry_state from trigger_runs run
+  where run.id = (select trigger_run_id from workflow_step_runs where id = $15)
+    or ($15::uuid is null and $14::jsonb ->> 'kind' = 'launch_machine' and run.id::text = $14::jsonb ->> 'triggerRunId'
+      and run.organization_id = $2 and run.project_id = $3)
+  for share of run`;
+
+const EXECUTION_PAYLOAD_PROJECTION = `execution.id, execution.agent_session_id, execution.agent_session_action,
+  execution.organization_id, execution.project_id, execution.machine_id, execution.status,
+  execution.started_at, execution.completed_at, execution.completed_by_agent_at, execution.deadline_at,
+  execution.idle_deadline_at, execution.reaction_state, execution.configuration_revision_id,
+  execution.completion_token_hash, execution.reply_claimed_at, execution.reply_claim_count, execution.output_emissions,
+  execution.output_delivery_attempts, execution.launch_intent, execution.daemon_id, execution.daemon_agent_id,
+  execution.workflow_step_run_id, execution.hub_action, execution.hub_action_completed_at,
+  execution.hub_action_ready_at, execution.hub_action_acknowledgements, execution.payload_completion,
+  case when not fence.hidden then execution.result end as result,
+  case when not fence.hidden then execution.trigger_context end as trigger_context,
+  case when not fence.hidden then execution.output_context end as output_context`;
+
+const EXECUTION_FENCE = `cross join lateral (
+  select exists (select 1 from (${EXECUTION_RUN_OWNERS}) owners where payload_expiry_state is not null) as hidden
+) fence`;
+
+const PAYLOAD_CHILD_BATCH = 50;
+
+async function stageRunPayload(client: QueryHandle, row: TriggerRunRow, now: Date) {
+  const run = toTriggerRunRecord(row);
+  const receipt = await client.query<Pick<ProviderEventReceiptRecord, "provider" | "repo">>(
+    `select provider, repo from provider_event_receipts where id = $1 and organization_id = $2`,
+    [run.providerEventReceiptId, run.organizationId],
+  );
+  const counts = await client.query<{ status: WorkflowStepRunRecord["status"]; count: number }>(
+    `select status, count(*)::int as count from workflow_step_runs where trigger_run_id = $1 group by status`,
+    [run.id],
+  );
+  const timeline = await client.query<{ eventCount: number; droppedCount: number }>(
+    `select event_count as "eventCount", dropped_count as "droppedCount"
+     from run_timeline_state where trigger_run_id = $1`,
+    [run.id],
+  );
+  const progress = await client.query<
+    Pick<RunProgressMessage, "state" | "provider" | "externalRef">
+  >(
+    `select state, provider, external_ref as "externalRef" from run_progress_messages where trigger_run_id = $1`,
+    [run.id],
+  );
+  const stepCounts: RunPayloadSummary["stepCounts"] = {};
+  for (const count of counts.rows) stepCounts[count.status] = count.count;
+  const summary = summarizeRunPayload(
+    run,
+    receipt.rows[0]!,
+    stepCounts,
+    timeline.rows[0],
+    progress.rows[0],
+  );
+  await client.query(
+    `update trigger_runs set payload_expiry_state = 'expiring', payload_expired_at = $2,
+      payload_summary = $3, prompt = '', inputs = '{}', values = '{}', trigger_context = '{}',
+      output_context = '{}', conversation = null, failure_reason = $4, rejection = $5
+     where id = $1 and payload_expiry_state is null`,
+    [
+      run.id,
+      now,
+      summary,
+      summary.failureCode,
+      run.outcome === "rejected" ? reduceRejection(run.rejection) : null,
+    ],
+  );
+}
+
+async function redactExecutionChunk(client: QueryHandle, runId: string) {
+  const owned = runExecutions(
+    "run",
+    "execution.id, execution.result is not null or execution.trigger_context is not null or execution.output_context is not null or (execution.completed_by_agent_at is not null and execution.payload_completion is null) as has_payload",
+  );
+  const result = await client.query(
+    `with run as (select id, organization_id, project_id from trigger_runs where id = $1),
+     chunk as (select owned.id from run cross join lateral (${owned}) owned
+               where owned.has_payload order by owned.id limit $2)
+     update agent_executions execution
+     set payload_completion = case
+           when completed_by_agent_at is not null then 'explicit_finish'
+           when result ->> 'completion' = 'inferred_from_turn_end' then 'inferred_from_turn_end'
+           else payload_completion end,
+         result = null, trigger_context = null, output_context = null
+     where execution.id in (select id from chunk)`,
+    [runId, PAYLOAD_CHILD_BATCH],
+  );
+  return result.rowCount > 0;
+}
+
+async function redactStepChunk(client: QueryHandle, runId: string) {
+  const steps = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs where trigger_run_id = $1 and payload_summary is null
+     order by ordinal limit $2`,
+    [runId, PAYLOAD_CHILD_BATCH],
+  );
+  if (steps.rowCount === 0) return false;
+  const summaries = steps.rows.map((row) => ({
+    id: row.id,
+    summary: summarizeStepPayload(toWorkflowStepRunRecord(row)),
+  }));
+  await client.query(
+    `update workflow_step_runs step
+     set payload_summary = item.summary, output = null, failure_reason = null, dispatch_intent = null
+     from jsonb_to_recordset($2::jsonb) as item(id uuid, summary jsonb)
+     where step.trigger_run_id = $1 and step.id = item.id`,
+    [runId, JSON.stringify(summaries)],
+  );
+  return true;
+}
 
 const OUTPUT_ATTEMPT_LEASE_MS = 5 * 60_000;
 
@@ -172,8 +292,31 @@ export function createDatabase(runtime: DatabaseRuntime, locks: Locks): Database
 class PgDatabase implements Database {
   scanRunPayloads: Database["scanRunPayloads"] = (after, cutoff, limit, countOnly) =>
     scanRunPayloads(this.pool, after, cutoff, limit, countOnly);
-  async expireRunPayloadChunk(): Promise<"skipped"> {
-    return "skipped";
+  async expireRunPayloadChunk(id: string, cutoff: Date, now: Date) {
+    return this.pool.transaction(async (client) => {
+      const locked = await client.query<TriggerRunRow>(
+        `select * from trigger_runs where id = $1 and payload_expiry_state is distinct from 'expired' for update skip locked`,
+        [id],
+      );
+      const row = locked.rows[0];
+      if (row === undefined) return "skipped";
+      const result = await client.query<{ disposition: RunPayloadDisposition }>(
+        `select ${RUN_PAYLOAD_DISPOSITION_SQL} as disposition from trigger_runs run where id = $1`,
+        [id, cutoff],
+      );
+      if (result.rows[0]?.disposition !== "eligible") return "skipped";
+      if (row.payload_expiry_state == null) {
+        await stageRunPayload(client, row, now);
+        return "expiring";
+      }
+      if (await redactExecutionChunk(client, id)) return "expiring";
+      if (await redactStepChunk(client, id)) return "expiring";
+      await client.query(
+        `update trigger_runs set payload_expiry_state = 'expired' where id = $1 and payload_expiry_state = 'expiring'`,
+        [id],
+      );
+      return "expired";
+    });
   }
 
   readonly schedules;
@@ -478,6 +621,7 @@ class PgDatabase implements Database {
       const rows = await query<AgentExecutionRow>(
         this.pool,
         `
+          with owners as materialized (${EXECUTION_INSERT_OWNERS})
           insert into agent_executions (
             id,
             organization_id,
@@ -510,6 +654,7 @@ class PgDatabase implements Database {
                  $17
           from projects
           where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
+            and not exists (select 1 from owners where payload_expiry_state is not null)
             and exists (
               select 1 from project_configuration_revisions
               where id = $10 and project_id = $3 and organization_id = $2
@@ -563,6 +708,7 @@ class PgDatabase implements Database {
       const rows = await query<AgentExecutionRow>(
         this.pool,
         `
+          with owners as materialized (${EXECUTION_INSERT_OWNERS})
           insert into agent_executions (
             id,
             organization_id,
@@ -593,6 +739,7 @@ class PgDatabase implements Database {
                  case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end
           from projects
           where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
+            and not exists (select 1 from owners where payload_expiry_state is not null)
             and exists (
               select 1 from project_configuration_revisions
               where id = $10 and project_id = $3 and organization_id = $2
@@ -780,7 +927,7 @@ class PgDatabase implements Database {
   async findAgentExecutionByWorkflowStepRunId(stepRunId: string) {
     const rows = await query<AgentExecutionRow>(
       this.pool,
-      `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution where workflow_step_run_id = $1 limit 1`,
+      `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution ${EXECUTION_FENCE} where workflow_step_run_id = $1 limit 1`,
       [stepRunId],
     );
     return rows.rows[0] === undefined ? undefined : toAgentExecutionRecord(rows.rows[0]);
@@ -1216,8 +1363,7 @@ class PgDatabase implements Database {
        update workflow_step_runs steps
        set status = 'running', started_at = $2, deadline_at = $3, output = $4
        where steps.id = $1 and steps.status = 'pending'
-         and exists (select 1 from open_run join trigger_runs runs on runs.id = open_run.id
-           where runs.status = 'running')
+         and exists (select 1 from open_run where status = 'running')
        returning steps.*`,
       [input.stepRunId, input.startedAt, input.deadlineAt, input.output ?? null],
     );
@@ -1270,9 +1416,7 @@ class PgDatabase implements Database {
     const rows = await query<WorkflowStepRunRow>(
       this.pool,
       `select step.* from workflow_step_runs step join trigger_runs run on run.id = step.trigger_run_id
-       where run.payload_expiry_state is null and step.status in ('succeeded', 'failed', 'timed_out')
-         and step.agent_execution_id is null
-         and ((step.output ->> 'daemon_id') is not null or (step.output -> 'cleanup') is not null)`,
+       where run.payload_expiry_state is null and (${PENDING_SCRIPT_CLEANUP_SQL})`,
     );
     return rows.rows.map(toWorkflowStepRunRecord);
   }
@@ -2169,7 +2313,7 @@ class PgDatabase implements Database {
     try {
       const rows = await query<AgentExecutionRow>(
         this.pool,
-        `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution where id = $1 limit 1`,
+        `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution ${EXECUTION_FENCE} where id = $1 limit 1`,
         [id],
       );
 
@@ -2185,9 +2329,13 @@ class PgDatabase implements Database {
   ): Promise<AgentExecutionRecord> {
     const rows = await query<AgentExecutionRow>(
       this.pool,
-      `update agent_executions execution
-       set reaction_state = $2
-       where id = $1 and ${OPEN_EXECUTION_RUN}
+      `with owners as materialized (
+         select owner.payload_expiry_state from agent_executions execution
+         cross join lateral (${EXECUTION_RUN_OWNERS} for share of run) owner
+         where execution.id = $1
+       )
+       update agent_executions set reaction_state = $2
+       where id = $1 and not exists (select 1 from owners where payload_expiry_state is not null)
        returning *`,
       [executionId, reactionState],
     );
@@ -2205,7 +2353,7 @@ class PgDatabase implements Database {
     try {
       const rows = await query<AgentExecutionRow>(
         this.pool,
-        `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution
+        `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution ${EXECUTION_FENCE}
          where id = $1 and organization_id = $2 limit 1`,
         [id, organizationId],
       );
@@ -2219,7 +2367,7 @@ class PgDatabase implements Database {
   async findAgentExecutionForProject(projectId: string, id: string) {
     const rows = await query<AgentExecutionRow>(
       this.pool,
-      `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution where id = $1 and project_id = $2 limit 1`,
+      `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution ${EXECUTION_FENCE} where id = $1 and project_id = $2 limit 1`,
       [id, projectId],
     );
     return rows.rows[0] === undefined ? undefined : toAgentExecutionRecord(rows.rows[0]);
@@ -4448,11 +4596,13 @@ class PgDatabase implements Database {
     const rows = await query<OrganizationRunRow>(
       this.pool,
       `select runs.id, coalesce(triggers.name, runs.configured_trigger_name) as trigger_name,
-              runs.status, receipts.provider, receipts.source, receipts.received_at,
-              (select executions.launch_intent -> 'agent'
+              runs.status, receipts.provider, receipts.source, receipts.received_at, runs.payload_expired_at,
+              (select case when runs.payload_expiry_state is null then executions.launch_intent -> 'agent'
+                           else jsonb_build_object('provider', steps.payload_summary ->> 'provider',
+                                                   'model', steps.payload_summary ->> 'model') end
                  from workflow_step_runs steps
-                 join agent_executions executions on executions.id = steps.agent_execution_id
-                where steps.trigger_run_id = runs.id
+                 left join agent_executions executions on executions.id = steps.agent_execution_id
+                where steps.trigger_run_id = runs.id and steps.agent_execution_id is not null
                 order by steps.ordinal
                 limit 1) as agent
        from trigger_runs runs
@@ -4475,6 +4625,7 @@ class PgDatabase implements Database {
       status: row.status,
       receivedAt: row.received_at,
       agent: launchedAgent(row.agent),
+      payloadExpiredAt: row.payload_expired_at?.toISOString() ?? null,
     }));
   }
 
@@ -4870,6 +5021,7 @@ interface OrganizationRunRow extends QueryRow {
   source: string;
   received_at: Date;
   agent: unknown;
+  payload_expired_at: Date | null;
 }
 
 interface ProjectActivityRunListRow extends TriggerRunRow {

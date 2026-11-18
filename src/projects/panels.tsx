@@ -523,11 +523,7 @@ function ActivityTable({
               <div className="flex items-center gap-2">
                 <ProviderGlyph provider={event.provider} source={event.source} />
                 <TwoLine
-                  primary={
-                    "webhookSummary" in event
-                      ? (event.webhookSummary?.headline ?? event.source)
-                      : event.source
-                  }
+                  primary={activitySourceLabel(event)}
                   {...("webhookSummary" in event && event.webhookSummary?.prompt !== undefined
                     ? { secondary: event.webhookSummary.prompt }
                     : {})}
@@ -624,4 +620,13 @@ function connectionStatusLabel(status: string): string {
 function formString(form: FormData, name: string) {
   const value = form.get(name);
   return typeof value === "string" ? value : "";
+}
+
+function activitySourceLabel(event: {
+  source: string;
+  payloadExpiredAt?: string | null;
+  webhookSummary?: { headline: string };
+}) {
+  if (event.payloadExpiredAt != null) return "Run payload expired";
+  return event.webhookSummary?.headline ?? event.source;
 }
