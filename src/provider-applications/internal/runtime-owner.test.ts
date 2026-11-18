@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
+import { createApplicationRuntime } from "../../application-runtime.js";
 import type { AuthServer } from "../../auth/server.js";
 import { createMemoryDatabase } from "../../db/memory.js";
 import type { DurableProviderEvent } from "../../db/types.js";
+import { createUnlimitedEntitlementsService } from "../../entitlements/test-utils.js";
 import type { ProviderRegistration } from "../../providers/registration.js";
+import { readRunProgressSettings } from "../../run-progress/settings.js";
+import { SWEEP_MS } from "../../run-progress/writer.js";
 import type { ExternalTrigger, TriggerHandler, TriggerProvider } from "../../triggers/index.js";
 import type {
   Provider,
@@ -16,6 +20,51 @@ import { OutputExecutorRegistry, replyOutputTool } from "../../execution-capabil
 import { createGitHubReplyExecutor, githubReplyAvailable } from "../../triggers/github/reply.js";
 
 describe("dynamic provider runtime", () => {
+  it.each([false, true])(
+    "opens Linear progress work only after activation with progress = %s",
+    async (enabled) => {
+      vi.useFakeTimers();
+      const database = createMemoryDatabase();
+      const readOpen = vi.spyOn(database, "listOpenRunProgressMessages");
+      const providerRuntime = new DynamicProviderRuntime({
+        database,
+        auth: testAuth(),
+        applicationBaseUrl: "https://hub.test",
+      });
+      let application: Awaited<ReturnType<typeof createApplicationRuntime>> | undefined;
+      try {
+        application = await createApplicationRuntime({
+          database,
+          auth: null,
+          entitlements: createUnlimitedEntitlementsService(),
+          billing: null,
+          registrations: providerRuntime.registrations(),
+          runProgress: readRunProgressSettings({
+            PASEO_HUB_RUN_TIMELINE: "true",
+            PASEO_HUB_PROGRESS_MESSAGES: String(enabled),
+          }),
+          close: async () => undefined,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        assert.equal(readOpen.mock.calls.length, 0);
+        const candidate = await providerRuntime.prepare(
+          "linear",
+          providerConfiguration("linear", "app"),
+          "https://hub.test",
+          providerIdentity("linear", "app"),
+          1,
+        );
+        await candidate.start();
+        candidate.publish();
+        await vi.advanceTimersByTimeAsync(SWEEP_MS);
+        assert.equal(readOpen.mock.calls.length, enabled ? 1 : 0);
+      } finally {
+        await application?.stop();
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("exposes and delivers GitHub replies through the hosted provider registration", async () => {
     const comments: unknown[] = [];
     const runtime = new DynamicProviderRuntime({

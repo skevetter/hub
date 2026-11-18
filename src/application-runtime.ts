@@ -398,19 +398,29 @@ function createProgressReporter(
   ownership: CompositionResources,
 ): { hubOptions: Pick<HubRuntimeOptions, "onProgressRequested">; start: () => void } {
   const { database, runProgress, progressProviders, publicBaseUrl } = options;
-  if (
-    database === null ||
-    bus === undefined ||
-    runProgress?.progressMessagesEnabled !== true ||
-    progressProviders === undefined ||
-    progressProviders.length === 0
-  )
+  if (database === null || bus === undefined || runProgress?.progressMessagesEnabled !== true)
     return { hubOptions: {}, start: () => undefined };
+  const registered = (options.registrations ?? []).filter(
+    (registration) => "progressProvider" in registration,
+  );
+  const providers = progressProviders ?? [];
+  if (registered.length === 0 && providers.length === 0)
+    return { hubOptions: {}, start: () => undefined };
+
   const reporter = new ProgressReporter({
     database,
     bus,
     settings: runProgress,
-    providers: progressProviders,
+    // Provider applications can activate or be replaced after Hub starts.
+    providers:
+      registered.length === 0
+        ? providers
+        : () => [
+            ...providers,
+            ...registered.flatMap(({ progressProvider }) =>
+              progressProvider === undefined ? [] : [progressProvider],
+            ),
+          ],
     publicBaseUrl,
     reportFailure: (code, scope) =>
       reportFailure(

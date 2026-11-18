@@ -91,10 +91,10 @@ describe("progress message vocabulary", () => {
   it("renders running and permission-wait states from durable events", () => {
     const body = [
       "Paseo run: Running",
-      "Started 10:02:11 UTC. Updated 10:02:14 UTC.",
-      "Activity: 1 command, 1 read. 2 tool calls, 1 failed.",
-      "Step 2 of 3 running since 10:02:14 UTC.",
-      `Run details: https://hub.example.org/base/o/acme/activity/${RUN_ID}`,
+      "Started `10:02:11 UTC`. Updated `10:02:14 UTC`.",
+      "Activity: `1 command`, `1 read`. `2 tool calls`, `1` failed.",
+      "Step `2` of `3` running since `10:02:14 UTC`.",
+      `Run details: \`https://hub.example.org/base/o/acme/activity/${RUN_ID}\``,
     ];
     assert.equal(renderProgress(defaults), body.join("\n"));
     body.splice(2, 0, "Now: waiting for permission");
@@ -136,11 +136,11 @@ describe("progress message vocabulary", () => {
     assert.equal(
       actual,
       [
-        "Paseo run: Failed in 4m 02s: the agent was idle too long (idle_timeout).",
-        "Finished 10:06:13 UTC.",
-        "Activity: 1 command, 1 read. 2 tool calls, 1 failed.",
-        "Steps: 1 succeeded, 1 failed, 2 not run of 4.",
-        `Run details: https://hub.example.org/base/o/acme/activity/${RUN_ID}`,
+        "Paseo run: `Failed` in `4m 02s`: `the agent was idle too long` (`idle_timeout`).",
+        "Finished `10:06:13 UTC`.",
+        "Activity: `1 command`, `1 read`. `2 tool calls`, `1` failed.",
+        "Steps: `1 succeeded`, `1 failed`, `2 not run` of `4`.",
+        `Run details: \`https://hub.example.org/base/o/acme/activity/${RUN_ID}\``,
       ].join("\n"),
     );
   });
@@ -166,6 +166,12 @@ describe("progress message vocabulary", () => {
       failed: "Failed in 4m 02s: the run failed (failed).",
       timed_out: "Timed out in 4m 02s: the run reached its time limit (run_timeout).",
       succeeded: "Succeeded in 4m 02s",
+    };
+    const linearStatuses = {
+      running: "Running",
+      failed: "`Failed` in `4m 02s`: `the run failed` (`failed`).",
+      timed_out: "`Timed out` in `4m 02s`: `the run reached its time limit` (`run_timeout`).",
+      succeeded: "Succeeded in `4m 02s`",
     };
     const authored = new Set(
       Array.from({ length: AUTHOR_TEXT.length - 3 }, (_, index) =>
@@ -199,22 +205,35 @@ describe("progress message vocabulary", () => {
         });
         const expected = [];
         if (provider === "github") expected.push(`<!-- paseo-hub-progress run=${RUN_ID} -->`);
-        expected.push(`Paseo run: ${statuses[status]}`);
+        const linear = provider === "linear";
+        expected.push(`Paseo run: ${(linear ? linearStatuses : statuses)[status]}`);
         if (status === "running") {
           expected.push(
-            "Started 10:02:11 UTC. Updated 10:02:14 UTC.",
+            linear
+              ? "Started `10:02:11 UTC`. Updated `10:02:14 UTC`."
+              : "Started 10:02:11 UTC. Updated 10:02:14 UTC.",
             "Now: waiting for permission",
           );
         } else {
-          expected.push("Finished 10:06:13 UTC.");
+          expected.push(linear ? "Finished `10:06:13 UTC`." : "Finished 10:06:13 UTC.");
         }
-        expected.push(
-          "Activity: 556 commands, 556 reads, 556 edits, 556 web calls, 556 subagents, 555 plans, 555 MCP calls, 555 finish calls, 555 other calls. 5001 tool calls, 5001 failed.",
-          status === "running"
-            ? "Step 149 of 150 running since 10:02:14 UTC."
-            : "Steps: 148 succeeded, 2 not run of 150.",
-          `Run details: https://hub.example.org/base/o/acme/activity/${RUN_ID}`,
-        );
+        if (linear) {
+          expected.push(
+            "Activity: `556 commands`, `556 reads`, `556 edits`, `556 web calls`, `556 subagents`, `555 plans`, `555 MCP calls`, `555 finish calls`, `555 other calls`. `5001 tool calls`, `5001` failed.",
+            status === "running"
+              ? "Step `149` of `150` running since `10:02:14 UTC`."
+              : "Steps: `148 succeeded`, `2 not run` of `150`.",
+            `Run details: \`https://hub.example.org/base/o/acme/activity/${RUN_ID}\``,
+          );
+        } else {
+          expected.push(
+            "Activity: 556 commands, 556 reads, 556 edits, 556 web calls, 556 subagents, 555 plans, 555 MCP calls, 555 finish calls, 555 other calls. 5001 tool calls, 5001 failed.",
+            status === "running"
+              ? "Step 149 of 150 running since 10:02:14 UTC."
+              : "Steps: 148 succeeded, 2 not run of 150.",
+            `Run details: https://hub.example.org/base/o/acme/activity/${RUN_ID}`,
+          );
+        }
         assert.equal(body, expected.join("\n"));
         for (const fragment of authored) assert.equal(body.includes(fragment), false);
         assert.doesNotMatch(body, /@everyone|<!channel>|secret\.example/u);
@@ -222,6 +241,18 @@ describe("progress message vocabulary", () => {
         assert.ok(body.length <= maxBodyChars);
       }
     }
+  });
+
+  it("keeps a mention-like URL inside its Linear code span", () => {
+    const body = renderProgress({
+      ...defaults,
+      publicBaseUrl: "https://hub.example.org/@operator/`",
+      organizationSlug: "@workspace",
+    });
+    assert.equal(
+      body.split("\n").at(-1),
+      `Run details: \`https://hub.example.org/@operator/%60/o/%40workspace/activity/${RUN_ID}\``,
+    );
   });
 
   it("keeps the status within the provider limit when a configured link is too long", () => {

@@ -37,3 +37,10 @@ Hub schedules the settle edit 120 seconds after the final edit. When the settle 
 repair, allow up to 145 seconds from a stale write to visible repair, including the repair's
 operation budget. With one rate limit at the 900-second cap, allow up to 1,070 seconds.
 That includes the 120-second settle delay and two 25-second operation budgets.
+
+## Linear
+
+With the reporter enabled and the Linear integration configured, an opted-in Linear run
+creates a Paseo app comment on the source issue and edits it as the run advances.
+The Linear connection must grant the app token permission to edit its own comments.
+Verify this in a live Linear workspace before enabling progress messages for Linear runs.

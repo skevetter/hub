@@ -11,6 +11,8 @@ import {
   createLinearApiClient,
   createLinearConnectionClient,
   hasRequiredLinearScopes,
+  LinearApiError,
+  type LinearApiClient,
   linearConnectionRequiresReauthorization,
 } from "./client.js";
 
@@ -209,15 +211,17 @@ describe("Linear connection client", () => {
           authorization: new Headers(init?.headers).get("authorization"),
           body: readableBody(init?.body),
         });
-        return json({ data: { commentCreate: { success: true } } });
+        return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
       },
     });
 
-    await api.createComment({
+    const commentId = await api.createComment({
       linearOrganizationId: "linear-org",
       issueId: "issue-1",
       body: "Done",
     });
+    assert.equal(commentId, "comment-1");
+    assert.match(graphqlRequest(requests[0]!.body).query, /comment\s*\{\s*id\s*\}/u);
     assert.deepEqual(updates, [
       {
         connectionId: "connection-1",
@@ -252,7 +256,7 @@ describe("Linear connection client", () => {
         tokenRequests += 1;
         return json({ access_token: "fresh-token" });
       }
-      return json({ data: { commentCreate: { success: true } } });
+      return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
     };
     const updateTokens = async (update: UpdateLinearConnectionTokensInput) => {
       updates.push(update);
@@ -352,7 +356,7 @@ describe("Linear connection client", () => {
       now: () => new Date(1_700_000_010_000),
       fetch: async (_url, init) => {
         requests.push(new Headers(init?.headers).get("authorization") ?? "");
-        return json({ data: { commentCreate: { success: true } } });
+        return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
       },
     });
 
@@ -457,7 +461,7 @@ describe("Linear connection client", () => {
       now: () => new Date(1_700_000_010_000),
       fetch: async (_url: RequestInfo | URL, init?: RequestInit) => {
         requests.push(new Headers(init?.headers).get("authorization") ?? "");
-        return json({ data: { commentCreate: { success: true } } });
+        return json({ data: { commentCreate: { success: true, comment: { id: "comment-1" } } } });
       },
     };
     const firstProcess = createLinearApiClient(sharedOptions);
@@ -519,6 +523,105 @@ describe("Linear connection client", () => {
     );
   });
 });
+
+describe("Linear comment mutations", () => {
+  it("updates the comment using the stored id and the new body", async () => {
+    const api = commentApi(async (_url, init) => {
+      const { query, variables } = graphqlRequest(readableBody(init?.body));
+      assert.match(query, /commentUpdate\(id: \$id, input: \{ body: \$body \}\)/u);
+      assert.deepEqual(variables, { id: "stored-comment", body: "Finished" });
+      return json({ data: { commentUpdate: { success: true } } });
+    });
+    await api.updateComment({
+      linearOrganizationId: "linear-org",
+      commentId: "stored-comment",
+      body: "Finished",
+    });
+  });
+
+  it.each<{ status: number; headers: HeadersInit; delay: number }>([
+    {
+      status: 400,
+      headers: {
+        "x-ratelimit-requests-remaining": "1",
+        "x-ratelimit-requests-reset": "1700000090000",
+        "x-ratelimit-endpoint-requests-remaining": "0",
+        "x-ratelimit-endpoint-requests-reset": "1700000004500",
+      },
+      delay: 4500,
+    },
+    {
+      status: 429,
+      headers: { "retry-after": "12", "x-ratelimit-requests-reset": "1700000090000" },
+      delay: 12000,
+    },
+  ])(
+    "reports Linear rate limits on HTTP $status without retrying",
+    async ({ status, headers, delay }) => {
+      let requests = 0;
+      const api = commentApi(async () => {
+        requests += 1;
+        return Response.json(
+          { errors: [{ message: "Too many requests", extensions: { code: "RATELIMITED" } }] },
+          { status, headers },
+        );
+      });
+      await assert.rejects(
+        api.createComment({ linearOrganizationId: "linear-org", issueId: "issue", body: "Run" }),
+        (error) =>
+          error instanceof LinearApiError &&
+          error.status === status &&
+          error.code === "RATELIMITED" &&
+          error.retryAfterMs === delay,
+      );
+      assert.equal(requests, 1);
+    },
+  );
+
+  it("reports GraphQL errors even when Linear returns HTTP 200 and data", async () => {
+    const api = commentApi(async () =>
+      json({
+        data: { commentUpdate: { success: true } },
+        errors: [{ message: "Permission denied", extensions: { type: "Forbidden" } }],
+      }),
+    );
+    await assert.rejects(
+      api.updateComment({ linearOrganizationId: "linear-org", commentId: "comment", body: "Run" }),
+      (error) =>
+        error instanceof LinearApiError &&
+        error.status === 200 &&
+        error.code === "Forbidden" &&
+        error.retryAfterMs === undefined,
+    );
+  });
+});
+
+function commentApi(fetch: typeof globalThis.fetch): LinearApiClient {
+  const connection: LinearConnectionRecord = {
+    id: "connection",
+    organizationId: "hub-org",
+    slug: "acme-linear",
+    providerApplicationId: "linear-app",
+    linearOrganizationId: "linear-org",
+    linearOrganizationName: "Acme",
+    appUserId: "app-user",
+    accessToken: "access-token",
+    refreshToken: null,
+    accessTokenExpiresAt: null,
+    scopes: ["comments:create", "read"],
+  };
+  return createLinearApiClient({
+    connectionForLinearOrganization: async () => connection,
+    withLinearConnectionRefresh: withinLinearRefresh(connection, async () => {}),
+    connectionClient: {
+      refresh: async () => {
+        throw new Error("unexpected refresh");
+      },
+    },
+    now: () => new Date(1_700_000_000_000),
+    fetch,
+  });
+}
 
 function json(value: unknown): Response {
   return new Response(JSON.stringify(value), {

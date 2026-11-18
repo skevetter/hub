@@ -33,7 +33,14 @@ const ViewerResponseSchema = z.object({
 
 const GraphqlErrorSchema = z.object({
   errors: z
-    .array(z.object({ message: z.string().min(1) }))
+    .array(
+      z.object({
+        message: z.string(),
+        extensions: z
+          .object({ code: z.string().optional(), type: z.string().optional() })
+          .optional(),
+      }),
+    )
     .min(1)
     .optional(),
 });
@@ -87,11 +94,47 @@ const IssueCommentHistoryResponseSchema = z.object({
   }),
 });
 
-const CommentResponseSchema = z.object({
+const CommentCreateResponseSchema = z.object({
   data: z.object({
-    commentCreate: z.object({ success: z.literal(true) }),
+    commentCreate: z.object({
+      success: z.literal(true),
+      comment: z.object({ id: z.string().min(1) }),
+    }),
   }),
 });
+
+const CommentUpdateResponseSchema = z.object({
+  data: z.object({
+    commentUpdate: z.object({ success: z.literal(true) }),
+  }),
+});
+
+export class LinearApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+    readonly retryAfterMs?: number,
+    readonly graphqlMessage?: string,
+  ) {
+    super(message);
+    this.name = "LinearApiError";
+  }
+}
+
+const credentialErrorMessages = {
+  connection_unavailable: "Linear connection unavailable",
+  connection_not_owned: "Linear connection belongs to another Hub organization",
+  reauthorize: "Linear connection requires reauthorization",
+  body_contains_secret: "Linear progress body contains the access token",
+} as const;
+
+export class LinearCredentialError extends Error {
+  constructor(readonly code: keyof typeof credentialErrorMessages) {
+    super(credentialErrorMessages[code]);
+    this.name = "LinearCredentialError";
+  }
+}
 
 export interface LinearInstallation {
   linearOrganizationId: string;
@@ -151,11 +194,19 @@ export interface LinearApiClient {
     issueId: string;
     beforeCreatedAt: string;
   }): Promise<LinearIssueCommentHistory>;
-  createComment(input: {
-    linearOrganizationId: string;
-    issueId: string;
-    body: string;
-  }): Promise<void>;
+  createComment(
+    input: { linearOrganizationId: string; issueId: string; body: string },
+    options?: LinearCommentWriteOptions,
+  ): Promise<string>;
+  updateComment(
+    input: { linearOrganizationId: string; commentId: string; body: string },
+    options?: LinearCommentWriteOptions,
+  ): Promise<void>;
+}
+
+interface LinearCommentWriteOptions {
+  organizationId: string;
+  signal: AbortSignal;
 }
 
 export function hasRequiredLinearScopes(scopes: readonly string[]): boolean {
@@ -281,43 +332,63 @@ export function createLinearApiClient(options: {
   const now = options.now ?? (() => new Date());
   // Avoid duplicate local work, while the database transaction remains the cross-process source of
   // truth for refresh serialization and rebind safety.
-  const refreshes = new Map<string, Promise<string>>();
+  const refreshes = new Map<string, Promise<LinearConnectionRecord>>();
 
   const hasUsableAccessToken = (connection: LinearConnectionRecord): boolean =>
     hasUsableLinearAccessToken(connection, now());
 
-  const accessTokenFor = async (linearOrganizationId: string): Promise<string> => {
-    const connection = await options.connectionForLinearOrganization(linearOrganizationId);
-    if (connection === undefined) throw new Error("Linear connection unavailable");
-    if (hasUsableAccessToken(connection)) return connection.accessToken;
-    if (connection.refreshToken === null)
-      throw new Error("Linear connection requires reauthorization");
-    return refreshAccessToken(linearOrganizationId, connection);
+  const checkWriteConnection = (
+    connection: LinearConnectionRecord,
+    write?: LinearCommentWriteOptions,
+  ): void => {
+    if (write === undefined) return;
+    if (connection.organizationId !== write.organizationId)
+      throw new LinearCredentialError("connection_not_owned");
+    if (linearConnectionRequiresReauthorization(connection, now()))
+      throw new LinearCredentialError("reauthorize");
   };
 
-  const refreshAccessToken = async (
+  const accessTokenFor = async (
+    linearOrganizationId: string,
+    write?: LinearCommentWriteOptions,
+  ): Promise<string> => {
+    write?.signal.throwIfAborted();
+    const connection = await options.connectionForLinearOrganization(linearOrganizationId);
+    write?.signal.throwIfAborted();
+    if (connection === undefined) throw new LinearCredentialError("connection_unavailable");
+    checkWriteConnection(connection, write);
+    if (hasUsableAccessToken(connection)) return connection.accessToken;
+    if (connection.refreshToken === null) throw new LinearCredentialError("reauthorize");
+    const refreshed = await refreshConnection(linearOrganizationId, connection, write);
+    checkWriteConnection(refreshed, write);
+    return refreshed.accessToken;
+  };
+
+  const refreshConnection = async (
     linearOrganizationId: string,
     connection: LinearConnectionRecord,
-  ): Promise<string> => {
-    const existing = refreshes.get(connection.id);
+    write?: LinearCommentWriteOptions,
+  ): Promise<LinearConnectionRecord> => {
+    const key = JSON.stringify([connection.id, write?.organizationId]);
+    const existing = refreshes.get(key);
     if (existing !== undefined) return existing;
     const pending = options.withLinearConnectionRefresh(
       linearOrganizationId,
       async (current, updateTokens) => {
-        if (current === undefined) throw new Error("Linear connection unavailable");
-        if (hasUsableAccessToken(current)) return current.accessToken;
-        if (current.refreshToken === null)
-          throw new Error("Linear connection requires reauthorization");
+        if (current === undefined) throw new LinearCredentialError("connection_unavailable");
+        checkWriteConnection(current, write);
+        if (hasUsableAccessToken(current)) return current;
+        if (current.refreshToken === null) throw new LinearCredentialError("reauthorize");
         const refreshed = await options.connectionClient.refresh(current.refreshToken);
         await updateTokens(refreshed);
-        return refreshed.accessToken;
+        return { ...current, ...refreshed };
       },
     );
-    refreshes.set(connection.id, pending);
+    refreshes.set(key, pending);
     try {
       return await pending;
     } finally {
-      if (refreshes.get(connection.id) === pending) refreshes.delete(connection.id);
+      if (refreshes.get(key) === pending) refreshes.delete(key);
     }
   };
 
@@ -392,16 +463,44 @@ export function createLinearApiClient(options: {
         complete: !result.data.comments.pageInfo.hasPreviousPage,
       };
     },
-    async createComment(input) {
-      const result = CommentResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `mutation PaseoComment($issueId: String!, $body: String!) {
-            commentCreate(input: { issueId: $issueId, body: $body }) { success }
-          }`,
-          variables: { issueId: input.issueId, body: input.body },
-        }),
+    async createComment(input, write) {
+      const token = await accessTokenFor(input.linearOrganizationId, write);
+      if (write !== undefined && input.body.includes(token))
+        throw new LinearCredentialError("body_contains_secret");
+      const result = CommentCreateResponseSchema.parse(
+        await graphql(
+          request,
+          token,
+          {
+            query: `mutation PaseoComment($issueId: String!, $body: String!) {
+              commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+            }`,
+            variables: { issueId: input.issueId, body: input.body },
+          },
+          write?.signal,
+          now,
+        ),
       );
-      if (!result.data.commentCreate.success) throw new Error("Linear comment was not accepted");
+      return result.data.commentCreate.comment.id;
+    },
+    async updateComment(input, write) {
+      const token = await accessTokenFor(input.linearOrganizationId, write);
+      if (write !== undefined && input.body.includes(token))
+        throw new LinearCredentialError("body_contains_secret");
+      CommentUpdateResponseSchema.parse(
+        await graphql(
+          request,
+          token,
+          {
+            query: `mutation PaseoUpdateComment($id: String!, $body: String!) {
+              commentUpdate(id: $id, input: { body: $body }) { success }
+            }`,
+            variables: { id: input.commentId, body: input.body },
+          },
+          write?.signal,
+          now,
+        ),
+      );
     },
   };
 }
@@ -460,7 +559,10 @@ async function graphql(
   request: typeof fetch,
   accessToken: string,
   payload: { query: string; variables: Record<string, string> },
+  signal?: AbortSignal,
+  now: () => Date = () => new Date(),
 ): Promise<unknown> {
+  signal?.throwIfAborted();
   const response = await request("https://api.linear.app/graphql", {
     method: "POST",
     headers: {
@@ -468,14 +570,59 @@ async function graphql(
       "content-type": "application/json",
     },
     body: JSON.stringify(payload),
+    ...(signal === undefined ? {} : { signal }),
   });
-  if (!response.ok) throw new Error(`Linear GraphQL HTTP ${response.status}`);
-  const result: unknown = await response.json();
-  const errors = GraphqlErrorSchema.safeParse(result);
-  if (errors.success && errors.data.errors !== undefined) {
-    throw new Error(`Linear GraphQL ${errors.data.errors[0]!.message}`);
+  let result: unknown;
+  try {
+    result = await response.json();
+  } catch (error) {
+    if (response.ok || signal?.aborted) throw error;
   }
+  checkGraphqlResponse(response, result, now);
   return result;
+}
+
+function checkGraphqlResponse(response: Response, result: unknown, now: () => Date): void {
+  const envelope = GraphqlErrorSchema.safeParse(result);
+  const errors = envelope.success ? envelope.data.errors : undefined;
+  const errorCode = (error: NonNullable<typeof errors>[number]) =>
+    error.extensions?.code ?? error.extensions?.type;
+  const rateLimited = errors?.find((error) => errorCode(error)?.toUpperCase() === "RATELIMITED");
+  const error = rateLimited ?? errors?.[0];
+  if (!response.ok || error !== undefined) {
+    const delay =
+      rateLimited !== undefined || response.status === 429
+        ? linearRetryAfterMs(response.headers, now().getTime())
+        : undefined;
+    throw new LinearApiError(
+      response.ok ? `Linear GraphQL ${error?.message}` : `Linear GraphQL HTTP ${response.status}`,
+      response.status,
+      error === undefined ? undefined : errorCode(error),
+      delay,
+      error?.message,
+    );
+  }
+}
+
+function linearRetryAfterMs(headers: Headers, now: number): number | undefined {
+  const retryAfter = headers.get("retry-after");
+  if (retryAfter !== null) {
+    const delay = /^\d+$/u.test(retryAfter)
+      ? Number(retryAfter) * 1_000
+      : Date.parse(retryAfter) - now;
+    if (Number.isFinite(delay)) return Math.max(0, delay);
+  }
+
+  const resets = ["requests", "endpoint-requests", "complexity"]
+    .flatMap((limit) => {
+      const remaining = headers.get(`x-ratelimit-${limit}-remaining`);
+      const reset = headers.get(`x-ratelimit-${limit}-reset`);
+      return (remaining === null || remaining === "0") && reset !== null && /^\d+$/u.test(reset)
+        ? [Number(reset) - now]
+        : [];
+    })
+    .filter(Number.isFinite);
+  return resets.length === 0 ? undefined : Math.max(0, ...resets);
 }
 
 function parseLinearScopes(scope: string | undefined): string[] {

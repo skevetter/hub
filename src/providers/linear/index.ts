@@ -21,6 +21,7 @@ import type {
 } from "../../db/types.js";
 import { outputContextProvider, replyOutputTool } from "../../execution-capabilities/outputs.js";
 import { logger } from "../../logger.js";
+import { createLinearProgressProvider } from "../../run-progress/linear.js";
 import { createLinearTriggerProvider } from "../../triggers/linear/provider.js";
 import { createLinearReplyExecutor } from "../../triggers/linear/reply.js";
 import { createLinearWebhookSource } from "../../triggers/linear/webhook.js";
@@ -91,13 +92,14 @@ export function createLinearRegistration(
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     });
   const database = options.database;
+  const connectionForLinearOrganization = (linearOrganizationId: string) =>
+    database?.findLinearConnection(linearOrganizationId) ?? Promise.resolve(undefined);
   const api =
     database === null
       ? undefined
       : (options.apiClient ??
         createLinearApiClient({
-          connectionForLinearOrganization: (linearOrganizationId) =>
-            database.findLinearConnection(linearOrganizationId),
+          connectionForLinearOrganization,
           withLinearConnectionRefresh: database.withLinearConnectionRefresh.bind(database),
           connectionClient,
           ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
@@ -166,13 +168,21 @@ export function createLinearRegistration(
       callbackOrigin: options.publicBaseUrl,
     },
     connection,
+    ...(api === undefined
+      ? {}
+      : {
+          progressProvider: createLinearProgressProvider({
+            client: api,
+            connectionForLinearOrganization,
+            clientSecret: configuration.clientSecret,
+          }),
+        }),
     triggerProviders: [
       ({ configurationStoreForProject }) =>
         createLinearTriggerProvider({
           configurationStoreForProject,
           ...(api === undefined ? {} : { client: api }),
-          connectionForLinearOrganization: (linearOrganizationId) =>
-            database.findLinearConnection(linearOrganizationId),
+          connectionForLinearOrganization,
         }),
     ],
     sources: [webhook],

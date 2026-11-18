@@ -1,3 +1,4 @@
+import { z } from "zod";
 import type { LinearConnectionRecord } from "../../db/types.js";
 import type { ProjectConfigurationStore } from "../../configuration/store.js";
 import {
@@ -11,11 +12,13 @@ import { matchesInputFilters, parseInvocation } from "../invocation.js";
 import { NormalizedLinearEventSchema, type NormalizedLinearEvent } from "./events.js";
 import { matchLinearTriggers, readLinearCommentInvocationParserMessage } from "./match.js";
 
-export interface LinearOutputContext {
-  provider: "linear";
-  linearOrganizationId: string;
-  issueId: string;
-}
+export const LinearOutputContextSchema = z.object({
+  provider: z.literal("linear"),
+  linearOrganizationId: z.string().min(1),
+  issueId: z.string().min(1),
+});
+
+export type LinearOutputContext = z.infer<typeof LinearOutputContextSchema>;
 
 export interface LinearTriggerContext {
   provider: "linear";

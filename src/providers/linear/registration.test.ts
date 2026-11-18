@@ -40,6 +40,7 @@ describe("Linear registration", () => {
     });
 
     assert.equal(registration.connection.name, "linear");
+    assert.equal(registration.progressProvider?.name, "linear");
     assert.equal(registration.sources.length, 1);
     assert.equal(registration.triggerProviders.length, 1);
     assert.deepEqual(
@@ -80,6 +81,7 @@ describe("Linear registration", () => {
       registration.connection.status({ github: [], discord: [], slack: [], linear: [] }),
       { status: "notConfigured" },
     );
+    assert.equal(registration.progressProvider, undefined);
     assert.deepEqual(registration.sources, []);
     assert.deepEqual(registration.outputs, []);
     assert.deepEqual(registration.requests, []);
@@ -328,7 +330,8 @@ describe("Linear registration", () => {
         throw new Error("under-scoped token must not hydrate");
       },
       readIssueComments: async () => ({ comments: [], complete: true }),
-      createComment: async () => {},
+      createComment: async () => "comment-id",
+      updateComment: async () => {},
     };
     const registration = createLinearRegistration({
       database,

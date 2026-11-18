@@ -41,18 +41,11 @@ describe("Linear reply output", () => {
   });
 });
 
-class RecordingLinearClient implements LinearApiClient {
+class RecordingLinearClient implements Pick<LinearApiClient, "createComment"> {
   comments: Array<{ linearOrganizationId: string; issueId: string; body: string }> = [];
 
-  async readIssue(): Promise<undefined> {
-    return undefined;
-  }
-
-  async readIssueComments() {
-    return { comments: [], complete: true };
-  }
-
-  async createComment(input: (typeof this.comments)[number]): Promise<void> {
+  async createComment(input: (typeof this.comments)[number]): Promise<string> {
     this.comments.push(input);
+    return "comment-id";
   }
 }

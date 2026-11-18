@@ -12,7 +12,6 @@ import {
 
 interface Entry {
   scope: MessageScope;
-  provider: ProgressProvider;
   row: RunProgressMessage;
   wakeAt: number;
   running: boolean;
@@ -24,6 +23,7 @@ interface Entry {
 interface ScheduleOptions {
   database: ProgressStore;
   writer: MessageWriter;
+  providerFor: (name: ProgressProvider["name"]) => ProgressProvider | undefined;
   clock: ProgressClock;
   settings: Pick<RunProgressSettings, "minEditSeconds" | "maxEdits">;
   report: (code: string, scope: MessageScope) => void;
@@ -52,13 +52,12 @@ export class MessageSchedule {
     for (const entry of this.entries.values()) this.remove(entry);
   }
 
-  track(row: RunProgressMessage, provider: ProgressProvider, wakeAt?: number): void {
+  track(row: RunProgressMessage, wakeAt?: number): void {
     if (this.stopped) return;
     let entry = this.entries.get(row.triggerRunId);
     if (entry === undefined) {
       entry = {
         scope: { organizationId: row.organizationId, triggerRunId: row.triggerRunId },
-        provider,
         row,
         wakeAt: Infinity,
         running: false,
@@ -127,10 +126,9 @@ export class MessageSchedule {
     if (!this.isCurrent(entry)) return;
     entry.running = true;
     try {
-      const { row, wakeAt, regularPace } = await this.options.writer.write(
-        entry.scope,
-        entry.provider,
-      );
+      const provider = this.options.providerFor(entry.row.provider);
+      if (provider === undefined) return;
+      const { row, wakeAt, regularPace } = await this.options.writer.write(entry.scope, provider);
       if (!this.isCurrent(entry)) return;
       if (row === undefined) {
         this.remove(entry);

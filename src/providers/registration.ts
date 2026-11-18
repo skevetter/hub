@@ -8,6 +8,7 @@ import type {
   AttachmentProvider,
   AttachmentResolver,
 } from "../attachments/capabilities.js";
+import type { ProgressProvider } from "../run-progress/types.js";
 import type { SlackDeliveryStatus } from "../triggers/slack/source/index.js";
 
 export interface TriggerProviderResources {
@@ -77,5 +78,6 @@ export interface ProviderRegistration {
   outputs: readonly ProviderOutputRegistration[];
   requests: readonly ProviderRequestRegistration[];
   attachment?: ProviderAttachmentRegistration;
+  progressProvider?: ProgressProvider | undefined;
   slackDelivery?: { status(): SlackDeliveryStatus; retry(): Promise<void> };
 }
