@@ -6,6 +6,8 @@ import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.j
 import type { ProviderRegistration } from "../providers/registration.js";
 import { TimelineRetention } from "../run-timeline/retention.js";
 import type { ApplicationRuntime } from "../server/runtime.js";
+import { z } from "zod";
+import { ProgressReporter } from "./index.js";
 import { readRunProgressSettings } from "./settings.js";
 
 describe("run progress composition", () => {
@@ -179,6 +181,64 @@ describe("run progress composition", () => {
 });
 
 describe("reporter admission", () => {
+  it("keeps the progress token out of serialized reporter and writer state", async () => {
+    const token = "test-progress-credential-for-state-check";
+    let serialized: string | undefined;
+    const start = vi
+      .spyOn(ProgressReporter.prototype, "start")
+      .mockImplementation(function (this: ProgressReporter) {
+        serialized = JSON.stringify(this);
+      });
+    let runtime: ApplicationRuntime | undefined;
+    try {
+      runtime = await createApplicationRuntime({
+        database: createMemoryDatabase(),
+        auth: null,
+        entitlements: createUnlimitedEntitlementsService(),
+        billing: null,
+        runProgress: readRunProgressSettings({
+          PASEO_HUB_RUN_TIMELINE: "true",
+          PASEO_HUB_PROGRESS_MESSAGES: "true",
+          PASEO_HUB_PROGRESS_GITHUB_TOKEN: token,
+          PASEO_HUB_PROGRESS_GITHUB_ORGS: "acme:acme/widgets",
+          PASEO_HUB_PROGRESS_MIN_EDIT_SECONDS: "23",
+          PASEO_HUB_PROGRESS_MAX_EDITS: "27",
+          PASEO_HUB_TIMELINE_RETENTION_DAYS: "15",
+        }),
+        close: async () => {},
+      });
+      assert.ok(serialized);
+      assert.equal(serialized.includes(token), false);
+      const state = z
+        .object({
+          schedule: z.object({
+            options: z.object({
+              settings: z.strictObject({ minEditSeconds: z.number(), maxEdits: z.number() }),
+              writer: z.object({
+                options: z.object({
+                  settings: z.strictObject({
+                    minEditSeconds: z.number(),
+                    maxEdits: z.number(),
+                    retentionDays: z.number(),
+                  }),
+                }),
+              }),
+            }),
+          }),
+        })
+        .parse(JSON.parse(serialized));
+      assert.deepEqual(state.schedule.options.settings, { minEditSeconds: 23, maxEdits: 27 });
+      assert.deepEqual(state.schedule.options.writer.options.settings, {
+        minEditSeconds: 23,
+        maxEdits: 27,
+        retentionDays: 15,
+      });
+    } finally {
+      await runtime?.stop();
+      start.mockRestore();
+    }
+  });
+
   it.each([
     { flag: false, provider: true, starts: false },
     { flag: true, provider: false, starts: false },

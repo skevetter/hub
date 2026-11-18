@@ -34,6 +34,7 @@ interface ProgressReporterOptions {
 }
 
 export class ProgressReporter {
+  private readonly options: Pick<ProgressReporterOptions, "database" | "bus" | "reportFailure">;
   private readonly clock: ProgressClock;
   private readonly providers: () => ReadonlyMap<ProgressProvider["name"], ProgressProvider>;
   private readonly schedule: MessageSchedule;
@@ -43,9 +44,11 @@ export class ProgressReporter {
   private sweeping = false;
   private restored = false;
 
-  constructor(private readonly options: ProgressReporterOptions) {
+  constructor(options: ProgressReporterOptions) {
+    const { database, bus, providers, reportFailure } = options;
+    this.options = { database, bus, ...(reportFailure === undefined ? {} : { reportFailure }) };
     this.clock = options.clock ?? progressClock;
-    const { providers } = options;
+    const { minEditSeconds, maxEdits, retentionDays } = options.settings;
     if (typeof providers === "function") {
       this.providers = () => indexProviders(providers());
     } else {
@@ -54,18 +57,21 @@ export class ProgressReporter {
     }
     const report = (code: string, scope: MessageScope) => this.report(code, scope);
     const writer = new MessageWriter({
-      ...options,
+      database,
+      settings: { minEditSeconds, maxEdits, retentionDays },
+      publicBaseUrl: options.publicBaseUrl,
+      lateWrites: options.lateWrites,
       clock: this.clock,
       backoff: new CredentialBackoff(options.random),
       report,
       signal: this.shutdown.signal,
     });
     this.schedule = new MessageSchedule({
-      ...options,
+      database,
       writer,
       providerFor: (name) => this.providers().get(name),
       clock: this.clock,
-      settings: options.settings,
+      settings: { minEditSeconds, maxEdits },
       report,
     });
   }

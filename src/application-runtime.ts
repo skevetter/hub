@@ -405,17 +405,21 @@ function createProgressReporter(
     (registration) => "progressProvider" in registration,
   );
   const providers = progressProviders ?? [];
-  const tokenProvider =
-    runProgress.githubToken === undefined
-      ? undefined
-      : new GitHubProgressProvider({ database, settings: runProgress });
-  if (registered.length === 0 && providers.length === 0 && tokenProvider === undefined)
+  const githubFallback =
+    runProgress.githubToken !== undefined || options.githubNotifications !== undefined
+      ? new GitHubProgressProvider({ database, settings: runProgress })
+      : undefined;
+  if (registered.length === 0 && providers.length === 0 && githubFallback === undefined)
     return { hubOptions: {}, start: () => undefined };
 
   const reporter = new ProgressReporter({
     database,
     bus,
-    settings: runProgress,
+    settings: {
+      minEditSeconds: runProgress.minEditSeconds,
+      maxEdits: runProgress.maxEdits,
+      retentionDays: runProgress.retentionDays,
+    },
     // Provider applications can activate or be replaced after Hub starts.
     providers: () => {
       const active = [
@@ -424,8 +428,8 @@ function createProgressReporter(
           progressProvider === undefined ? [] : [progressProvider],
         ),
       ];
-      if (tokenProvider !== undefined && !active.some(({ name }) => name === "github"))
-        active.push(tokenProvider);
+      if (githubFallback !== undefined && !active.some(({ name }) => name === "github"))
+        active.push(githubFallback);
       return active;
     },
     publicBaseUrl,

@@ -3,6 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createApplicationRuntime } from "../../application-runtime.js";
+import { readRunProgressSettings } from "../../run-progress/settings.js";
 import { createHubRuntime } from "../../app.js";
 import { createDatabase } from "../../db/pg.js";
 import { embeddedDatabaseRuntime, type DatabaseRuntimeBundle } from "../../db/runtime/index.js";
@@ -505,6 +507,63 @@ ${notificationYaml("with-progress")}`,
     expect(saved.enabled).toBe(true);
     const routes = await fixture.bundle.runtime.query("select * from project_trigger_routes");
     expect(routes.rows).toEqual([]);
+  });
+
+  it("records no_credential for an opted-in run when GitHub only has a notification reader", async () => {
+    const fixture = await setup();
+    const connection = new ScheduleTestDaemon();
+    let tick: (() => void) | undefined;
+    let now = T0;
+    const clock: NotificationClock = {
+      now: () => now,
+      every(callback) {
+        tick = callback;
+        return () => {};
+      },
+    };
+    await fixture.store.save({
+      yaml: `progress_message: true
+${notificationYaml("reader-only")}`,
+      userId: null,
+    });
+    const runtime = await createApplicationRuntime({
+      database: fixture.database,
+      auth: null,
+      entitlements: createUnlimitedEntitlementsService(),
+      billing: null,
+      publicBaseUrl: "http://notify.test",
+      completionTokenSecret: "notify-test-secret",
+      daemonConnectionForId: (id) => (id === fixture.daemonId ? connection : undefined),
+      githubNotifications: {
+        token: TOKEN,
+        pollIntervalMs: INTERVAL_MS,
+        fetch: fixture.github.fetch,
+        clock,
+      },
+      runProgress: readRunProgressSettings({
+        PASEO_HUB_RUN_TIMELINE: "true",
+        PASEO_HUB_PROGRESS_MESSAGES: "true",
+      }),
+      close: async () => {},
+    });
+    try {
+      await expect.poll(() => fixture.database.githubNotifications.readCursor()).toBeDefined();
+      fixture.github.reply([webapp]);
+      now = after(INTERVAL_MS);
+      tick!();
+      await expect.poll(() => fixture.count("trigger_runs")).toBe(1);
+      await runtime.hub.processWorkflowOutbox();
+      await expect
+        .poll(
+          async () =>
+            (await fixture.bundle.runtime.query("select state, failure from run_progress_messages"))
+              .rows,
+        )
+        .toEqual([{ state: "unavailable", failure: "no_credential" }]);
+      expect(fixture.github.requests).toHaveLength(1);
+    } finally {
+      await runtime.stop();
+    }
   });
 
   it("starts a run through the hub runtime and hands the notification to the agent", async () => {
