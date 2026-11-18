@@ -1,3 +1,4 @@
+import type { WebhookSigningSettings } from "./webhook-signatures.js";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { tanstackStartCookies } from "better-auth/tanstack-start";
@@ -78,6 +79,7 @@ export interface AuthServer {
 }
 
 export interface AuthServerOptions {
+  webhookSigning?: WebhookSigningSettings;
   database: DatabaseRuntime;
   locks: Locks;
   /** Owned by the composition root, injected here — auth consumes entitlements, never owns them. */
@@ -133,7 +135,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
   const policy = options.policy ?? defaultInstanceAuthPolicy();
   const provisioningEntitlements =
     options.provisioningEntitlements ?? (() => Promise.resolve(UNLIMITED_PROVISIONING));
-  const apiKeys = new OrganizationApiKeys(options.database, options.locks);
+  const apiKeys = new OrganizationApiKeys(options.database, options.locks, options.webhookSigning);
   const cliCredentials = new OrganizationCliCredentials(options.database);
   const publicCredentials = new PublicCredentialAuthenticator(apiKeys, cliCredentials);
   const registration = new RegistrationAdmission(options.database, options.locks, policy);
@@ -279,12 +281,18 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
     },
     browserAccount: (request) => {
       const path = new URL(request.url).pathname;
-      if (path === "/api/auth/change-password") {
+      if (
+        path === "/api/auth/change-password" ||
+        path === "/api/auth/paseo/api-keys" ||
+        path === "/api/auth/paseo/rotate-api-key-signing-secret" ||
+        path === "/api/auth/paseo/retire-api-key-signing-secret"
+      ) {
         const rejected = rejectCrossOriginCookieMutation(
           request,
           requestBrowserOrigin(request, browserOrigin),
         );
-        return rejected === undefined ? changePassword(request) : Promise.resolve(rejected);
+        if (rejected !== undefined) return Promise.resolve(rejected);
+        if (path === "/api/auth/change-password") return changePassword(request);
       }
       return access.handle(request);
     },
@@ -375,7 +383,10 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
     resolveAccount: (request) => access.account(request),
     rejectCookieMutation: (request) =>
       rejectCrossOriginCookieMutation(request, requestBrowserOrigin(request, browserOrigin)),
-    initialize: () => instanceSetup.initializeFromPolicy(),
+    initialize: async () => {
+      await apiKeys.signing.checkReadiness();
+      await instanceSetup.initializeFromPolicy();
+    },
     apiKeys,
     cliCredentials,
     publicCredentials,

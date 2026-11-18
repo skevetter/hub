@@ -38,8 +38,17 @@ export function defaultApiKeyActor(name: string): string {
     .slice(0, 63);
 }
 
+export const webhookSigningAuthenticationSchema = z
+  .object({
+    mode: z.literal("hmac"),
+    profile: z.literal("github_sha256"),
+    targetTriggerId: z.uuid(),
+  })
+  .strict();
+
 export const apiKeyCreateSchema = apiKeyIdentitySchema
   .extend({
+    authentication: webhookSigningAuthenticationSchema.optional(),
     name: z.string().trim().min(1).max(100),
     scopes: apiKeyScopesSchema.refine((scopes) => new Set(scopes).size === scopes.length, {
       message: "API key scopes must be unique",
@@ -59,5 +68,45 @@ export const apiKeyCreateSchema = apiKeyIdentitySchema
       });
       return z.NEVER;
     }
+    if (
+      input.authentication !== undefined &&
+      (input.scopes.length !== 1 || input.scopes[0] !== "events:send")
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["scopes"],
+        message: "A GitHub signing key requires only the Send events scope",
+      });
+      return z.NEVER;
+    }
     return { ...input, actor, allowedTriggers: input.allowedTriggers ?? null };
   });
+
+export const webhookSigningSummarySchema = webhookSigningAuthenticationSchema.extend({
+  currentVersionId: z.uuid().nullable(),
+  previousVersionId: z.uuid().nullable(),
+  previousAcceptUntil: z.iso.datetime().nullable(),
+});
+
+export const rotateSigningSecretSchema = z
+  .object({
+    id: z.uuid(),
+    expectedCurrentVersionId: z.uuid(),
+    overlapSeconds: z
+      .number()
+      .int()
+      .min(0)
+      .max(72 * 3600)
+      .default(3600),
+  })
+  .strict();
+
+export const retireSigningSecretSchema = z
+  .object({
+    id: z.uuid(),
+    expectedPreviousVersionId: z.uuid(),
+  })
+  .strict();
+
+export type WebhookSigningAuthentication = z.infer<typeof webhookSigningAuthenticationSchema>;
+export type WebhookSigningSummary = z.infer<typeof webhookSigningSummarySchema>;

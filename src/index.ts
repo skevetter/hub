@@ -58,6 +58,10 @@ import { composeEmailDelivery } from "./email/index.js";
 import { createAccountMailer } from "./auth/account-emails.js";
 import { migrateLegacyProjectTriggers } from "./triggers/migration.js";
 import { readGitHubNotificationsOptions } from "./triggers/github-notifications/index.js";
+import {
+  readWebhookSigningSettings,
+  type WebhookSigningSettings,
+} from "./auth/webhook-signatures.js";
 import { readWebhookOptions } from "./webhook-config.js";
 import { readRunProgressSettings } from "./run-progress/settings.js";
 import { readTimelineScrubValues } from "./run-timeline/secrets.js";
@@ -97,6 +101,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
   try {
     const config = loadRuntimeConfig();
     const webhookOptions = readWebhookOptions(process.env);
+    const webhookSigning = readWebhookSigningSettings(process.env);
     const runProgress = readRunProgressSettings(process.env);
     const { database, runtime, locks } = await createDatabaseHandle();
     resources.own(() => database.close(), "composition.database");
@@ -142,6 +147,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       billing,
       invitationMailer,
       accountMailer,
+      webhookSigning,
     );
     resources.own(() => auth.close(), "composition.auth");
     await auth.initialize?.();
@@ -237,9 +243,11 @@ function createProductionAuthServer(
   billing: BillingRuntime | null,
   invitationMailer: ReturnType<typeof createInvitationMailer> | undefined,
   accountMailer: ReturnType<typeof createAccountMailer> | undefined,
+  webhookSigning: WebhookSigningSettings,
 ) {
   return createAuthServer({
     database,
+    webhookSigning,
     locks,
     entitlements: entitlements.service,
     secret: identity.authSecret,

@@ -8,9 +8,15 @@ import type {
 import type { Locks } from "../db/runtime/locks/index.js";
 import { z } from "zod";
 import { reportFailure } from "../failures/index.js";
-import { OrganizationApiKeys } from "./api-keys.js";
+import { OrganizationApiKeys, type ApiKeySummary } from "./api-keys.js";
+import { SigningRequestError } from "./webhook-secret-store.js";
+import { logger } from "../logger.js";
 import { OrganizationCliCredentials } from "./cli-credentials.js";
-import { apiKeyCreateSchema } from "./api-key-contract.js";
+import {
+  apiKeyCreateSchema,
+  retireSigningSecretSchema,
+  rotateSigningSecretSchema,
+} from "./api-key-contract.js";
 import type { InstanceAuthPolicy } from "./instance-policy.js";
 import type { InstanceSetup } from "../instance-setup/index.js";
 import type { InstanceAppOnboarding } from "../instance-setup/app-onboarding.js";
@@ -185,13 +191,11 @@ export class OrganizationAccess {
         return await this.changeMemberRole(request);
       }
       if (path === "/api/auth/paseo/remove-member") return await this.removeMember(request);
-      if (path === "/api/auth/paseo/api-keys") return await this.createApiKey(request);
-      if (path === "/api/auth/paseo/revoke-api-key") return await this.revokeApiKey(request);
-      if (path === "/api/auth/paseo/revoke-cli-credential") {
-        return await this.revokeCliCredential(request);
-      }
-      return notFound();
+      return await this.handleKeyCommand(path, request);
     } catch (error) {
+      if (error instanceof SigningRequestError) {
+        return Response.json({ error: error.code }, { status: error.status });
+      }
       if (error instanceof ProductRequestError) return error.response();
       if (error instanceof EntitlementDenied) return entitlementDenialResponse(error.payload());
       reportFailure(error, {
@@ -348,6 +352,23 @@ export class OrganizationAccess {
     return Response.json({ organizationId: input.organizationId });
   }
 
+  private handleKeyCommand(path: string, request: Request): Promise<Response> {
+    switch (path) {
+      case "/api/auth/paseo/api-keys":
+        return this.createApiKey(request);
+      case "/api/auth/paseo/revoke-api-key":
+        return this.revokeApiKey(request);
+      case "/api/auth/paseo/revoke-cli-credential":
+        return this.revokeCliCredential(request);
+      case "/api/auth/paseo/rotate-api-key-signing-secret":
+        return this.rotateSigningSecret(request);
+      case "/api/auth/paseo/retire-api-key-signing-secret":
+        return this.retireSigningSecret(request);
+      default:
+        return Promise.resolve(notFound());
+    }
+  }
+
   private async listApiKeys(request: Request): Promise<Response> {
     const access = await this.requireActiveAccess(await this.requireSession(request));
     if (!access.capabilities.manageResources) {
@@ -356,17 +377,8 @@ export class OrganizationAccess {
     const keys = await this.options.apiKeys.list(access.organization.id);
     const cliCredentials = await this.options.cliCredentials.list(access.organization.id);
     return Response.json({
-      keys: keys.map((key) => ({
-        id: key.id,
-        name: key.name,
-        prefix: key.prefix,
-        scopes: key.scopes,
-        actor: key.actor,
-        allowedTriggers: key.allowedTriggers,
-        createdAt: key.createdAt.toISOString(),
-        lastUsedAt: key.lastUsedAt?.toISOString() ?? null,
-        revokedAt: key.revokedAt?.toISOString() ?? null,
-      })),
+      keys: keys.map(apiKeyJson),
+      signingAvailability: this.options.apiKeys.signing.availability(access.organization.id),
       cliCredentials: cliCredentials.map((credential) => ({
         id: credential.id,
         prefix: credential.prefix,
@@ -381,49 +393,102 @@ export class OrganizationAccess {
     const session = await this.requireSession(request);
     const input = await parseBody(request, createApiKeyBody);
     const access = await this.requireActiveAccess(session);
-    const created = await this.options.pool.transaction(async (client) => {
-      await lockOrganizationMembershipTransitions(
-        this.options.locks,
-        client,
-        access.organization.id,
+    const { apiKeys } = this.options;
+    const organizationId = access.organization.id;
+    if (input.authentication === undefined) {
+      const created = await this.withApiKeyManager(access, (client) =>
+        apiKeys.create(organizationId, session.userId, input.name, input.scopes, client, {
+          actor: input.actor,
+          allowedTriggers: input.allowedTriggers,
+        }),
       );
-      const actorRole = await currentActorRole(client, access);
-      if (!capabilitiesFor(actorRole).manageResources) {
-        throw new ProductRequestError(403, "forbidden");
-      }
-      return this.options.apiKeys.create(
-        access.organization.id,
-        session.userId,
-        input.name,
-        input.scopes,
-        client,
-        { actor: input.actor, allowedTriggers: input.allowedTriggers },
+      return Response.json(
+        { key: apiKeyJson(created.summary), secret: created.secret },
+        { status: 201, headers: secretResponseHeaders },
       );
+    }
+    const authentication = input.authentication;
+    const created = await this.withApiKeyManager(access, (client) =>
+      apiKeys.createSigned(client, organizationId, session.userId, input, authentication),
+    );
+    logger.info({
+      event: "webhook_signing.created",
+      organizationId,
+      userId: session.userId,
+      keyId: created.summary.id,
+      versionId: created.summary.authentication.currentVersionId,
     });
     return Response.json(
       {
-        key: {
-          id: created.summary.id,
-          name: created.summary.name,
-          prefix: created.summary.prefix,
-          scopes: created.summary.scopes,
-          actor: created.summary.actor,
-          allowedTriggers: created.summary.allowedTriggers,
-          createdAt: created.summary.createdAt.toISOString(),
-          lastUsedAt: null,
-          revokedAt: null,
-        },
-        secret: created.secret,
+        key: apiKeyJson(created.summary),
+        signingSecret: created.signingSecret,
       },
-      { status: 201 },
+      { status: 201, headers: secretResponseHeaders },
     );
+  }
+
+  private async rotateSigningSecret(request: Request): Promise<Response> {
+    const session = await this.requireSession(request);
+    const input = await parseBody(request, rotateSigningSecretSchema);
+    const access = await this.requireActiveAccess(session);
+    const organizationId = access.organization.id;
+    const rotated = await this.withApiKeyManager(access, (client) =>
+      this.options.apiKeys.signing.rotate(client, organizationId, input),
+    );
+    logger.info({
+      event: "webhook_signing.rotated",
+      organizationId,
+      userId: session.userId,
+      keyId: input.id,
+      versionId: rotated.authentication.currentVersionId,
+      previousVersionId: rotated.authentication.previousVersionId,
+      previousAcceptUntil: rotated.authentication.previousAcceptUntil,
+    });
+    return Response.json(rotated, { headers: secretResponseHeaders });
+  }
+
+  private async retireSigningSecret(request: Request): Promise<Response> {
+    const session = await this.requireSession(request);
+    const input = await parseBody(request, retireSigningSecretSchema);
+    const access = await this.requireActiveAccess(session);
+    const organizationId = access.organization.id;
+    await this.withApiKeyManager(access, (client) =>
+      this.options.apiKeys.signing.retire(client, organizationId, input),
+    );
+    logger.info({
+      event: "webhook_signing.previous_retired",
+      organizationId,
+      userId: session.userId,
+      keyId: input.id,
+      versionId: input.expectedPreviousVersionId,
+    });
+    return Response.json({ retired: true });
   }
 
   private async revokeApiKey(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
     const input = await parseBody(request, apiKeyIdBody);
     const access = await this.requireActiveAccess(session);
-    await this.options.pool.transaction(async (client) => {
+    const organizationId = access.organization.id;
+    await this.withApiKeyManager(access, async (client) => {
+      if (!(await this.options.apiKeys.revoke(organizationId, input.id, client))) {
+        throw new ProductRequestError(404, "api_key_unavailable");
+      }
+    });
+    logger.info({
+      event: "api_key.revoked",
+      organizationId,
+      userId: session.userId,
+      keyId: input.id,
+    });
+    return Response.json({ revoked: true });
+  }
+
+  private withApiKeyManager<T>(
+    access: OrganizationAccessValue,
+    operation: (client: TransactionHandle) => Promise<T>,
+  ): Promise<T> {
+    return this.options.pool.transaction(async (client) => {
       await lockOrganizationMembershipTransitions(
         this.options.locks,
         client,
@@ -433,11 +498,8 @@ export class OrganizationAccess {
       if (!capabilitiesFor(actorRole).manageResources) {
         throw new ProductRequestError(403, "forbidden");
       }
-      if (!(await this.options.apiKeys.revoke(access.organization.id, input.id, client))) {
-        throw new ProductRequestError(404, "api_key_unavailable");
-      }
+      return operation(client);
     });
-    return Response.json({ revoked: true });
   }
 
   private async revokeCliCredential(request: Request): Promise<Response> {
@@ -1051,6 +1113,23 @@ async function protectLastOwner(
     [organizationId],
   );
   if (owners.rows[0]?.count === 1) throw new ProductRequestError(409, "last_owner_required");
+}
+
+const secretResponseHeaders = { "Cache-Control": "no-store", Pragma: "no-cache" };
+
+function apiKeyJson(key: ApiKeySummary) {
+  return {
+    id: key.id,
+    name: key.name,
+    prefix: key.prefix,
+    scopes: key.scopes,
+    actor: key.actor,
+    allowedTriggers: key.allowedTriggers,
+    createdAt: key.createdAt.toISOString(),
+    lastUsedAt: key.lastUsedAt?.toISOString() ?? null,
+    revokedAt: key.revokedAt?.toISOString() ?? null,
+    ...(key.authentication === undefined ? {} : { authentication: key.authentication }),
+  };
 }
 
 function normalizeEmail(email: string): string {

@@ -13,7 +13,13 @@ import {
   apiKeyCreateSchema,
   defaultApiKeyActor,
   type ApiKeyIdentityOptions,
+  webhookSigningSummarySchema,
 } from "./api-key-contract.js";
+import { createDatabase } from "../db/pg.js";
+import { OrganizationTriggerStore } from "../triggers/store.js";
+import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
+import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
+import { readWebhookSigningSettings } from "./webhook-signatures.js";
 import { createAuthServer, type AuthServer } from "./server.js";
 
 const ORIGIN = "http://localhost:3000";
@@ -118,6 +124,7 @@ describe("embedded API key identities", () => {
   let runtime: DatabaseRuntime;
   let auth: AuthServer;
   let cookie: string;
+  let targetTriggerId: string;
 
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), "hub-webhook-keys-"));
@@ -139,12 +146,40 @@ describe("embedded API key identities", () => {
         ('identity-member-a', 'identity-a', 'identity-owner-a', 'owner'),
         ('identity-member-b', 'identity-b', 'identity-owner-b', 'owner');
     `);
+    const database = createDatabase(runtime, bundle.locks);
+    await enrollTestDaemon(database, "identity-a");
+    const target = await new OrganizationTriggerStore(
+      database,
+      "identity-a",
+      acceptingAgentValidator(),
+    ).save({
+      userId: "identity-owner-a",
+      yaml: `name: signed-trigger
+on:
+  manual.run:
+    filters:
+      from_users: [ci-partner]
+run:
+  target: { daemon: ${TEST_DAEMON_SLUG}, cwd: /workspace }
+  script: printf ok
+`,
+    });
+    targetTriggerId = target.id;
     auth = createAuthServer({
       database: runtime,
       locks: bundle.locks,
       entitlements: createUnlimitedEntitlementsService(),
       secret: "webhook-key-test-auth-secret-at-least-32-characters",
       baseURL: ORIGIN,
+      webhookSigning: readWebhookSigningSettings({
+        PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
+        PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",
+        PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS: '["identity-a"]',
+        PASEO_HUB_WEBHOOK_HMAC_KEYRING: JSON.stringify({
+          "test-key": Buffer.alloc(32, 0x14).toString("base64"),
+        }),
+        PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID: "test-key",
+      }),
       policy: { registrationMode: "open", organizationCreation: "disabled", bootstrap: undefined },
     });
     const signup = await auth.handle(
@@ -239,6 +274,95 @@ describe("embedded API key identities", () => {
     const stored = (await auth.apiKeys!.list("identity-a")).find(({ id }) => id === created.key.id);
     assert.equal(stored?.actor, "ci-partner");
     assert.deepEqual(stored?.allowedTriggers, created.key.allowedTriggers);
+  });
+
+  it("reveals a signed key only on same-origin creation and rotation, and retires by version", async () => {
+    const createPath = "/api/auth/paseo/api-keys";
+    const rotatePath = "/api/auth/paseo/rotate-api-key-signing-secret";
+    const retirePath = "/api/auth/paseo/retire-api-key-signing-secret";
+    const input = {
+      name: "GitHub signer",
+      actor: "ci-partner",
+      scopes: ["events:send"],
+      authentication: { mode: "hmac", profile: "github_sha256", targetTriggerId },
+    };
+    const forbiddenRequest = (path: string, data: unknown) =>
+      new Request(ORIGIN + path, {
+        method: "POST",
+        headers: {
+          cookie,
+          origin: "https://cross-origin.test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(data),
+      });
+    assert.equal((await auth.handle(forbiddenRequest(createPath, input))).status, 403);
+    assert.equal((await auth.browserAccount!(forbiddenRequest(createPath, input))).status, 403);
+    const invalid = await browserRequest(createPath, {
+      ...input,
+      scopes: ["events:send", "runs:read"],
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(
+      (
+        await browserRequest(createPath, {
+          ...input,
+          authentication: { ...input.authentication, targetTriggerId: randomUUID() },
+        })
+      ).status,
+      404,
+    );
+    const issued = await browserRequest(createPath, input);
+    assert.equal(issued.status, 201, await issued.clone().text());
+    assert.equal(issued.headers.get("cache-control"), "no-store");
+    assert.equal(issued.headers.get("pragma"), "no-cache");
+    const creationSchema = z
+      .object({
+        key: keySummarySchema.extend({ authentication: webhookSigningSummarySchema }),
+        signingSecret: z.string(),
+      })
+      .strict();
+    const created = creationSchema.parse(await issued.json());
+    assert.deepEqual(created.key.allowedTriggers, ["signed-trigger"]);
+    assert.equal(created.key.authentication.targetTriggerId, targetTriggerId);
+    const id = created.key.id;
+    const previous = created.key.authentication.currentVersionId;
+    const listingBefore = await browserRequest(createPath);
+    assert.equal(listingBefore.status, 200);
+    assert.ok(!(await listingBefore.text()).includes(created.signingSecret));
+    const rotationInput = { id, expectedCurrentVersionId: previous };
+    assert.equal((await auth.handle(forbiddenRequest(rotatePath, rotationInput))).status, 403);
+    const rotated = await browserRequest(rotatePath, rotationInput);
+    assert.equal(rotated.status, 200);
+    assert.equal(rotated.headers.get("cache-control"), "no-store");
+    assert.equal(rotated.headers.get("pragma"), "no-cache");
+    const next = z
+      .object({ authentication: webhookSigningSummarySchema, signingSecret: z.string() })
+      .parse(await rotated.json());
+    assert.notEqual(next.signingSecret, created.signingSecret);
+    assert.equal(next.authentication.previousVersionId, previous);
+    const stale = await browserRequest(rotatePath, rotationInput);
+    assert.equal(stale.status, 409);
+    assert.deepEqual(await stale.json(), { error: "signing_version_changed" });
+    const retireInput = { id, expectedPreviousVersionId: previous };
+    assert.equal((await auth.handle(forbiddenRequest(retirePath, retireInput))).status, 403);
+    assert.equal(
+      (await browserRequest(retirePath, { id, expectedPreviousVersionId: randomUUID() })).status,
+      409,
+    );
+    assert.equal((await browserRequest(retirePath, retireInput)).status, 200);
+    const listingAfter = await browserRequest(createPath);
+    const listed = await listingAfter.text();
+    for (const secret of [
+      created.signingSecret,
+      next.signingSecret,
+      "master_key_id",
+      "verifier",
+      "salt",
+    ]) {
+      assert.ok(!listed.includes(secret));
+    }
+    assert.equal((await browserRequest("/api/auth/paseo/revoke-api-key", { id })).status, 200);
   });
 
   it("preserves positional transactions and permits identities on other scopes", async () => {

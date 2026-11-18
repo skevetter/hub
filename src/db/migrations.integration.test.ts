@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, it } from "vitest";
@@ -17,6 +17,8 @@ import { configurationBundleFixture } from "../test-utils/configuration-bundle.j
 import { InstanceSetup } from "../instance-setup/index.js";
 import { UNLIMITED_PROVISIONING } from "../organizations/provisioning.js";
 import type { InstanceAuthPolicy } from "../auth/instance-policy.js";
+import { OrganizationApiKeys } from "../auth/api-keys.js";
+import { readWebhookSigningSettings } from "../auth/webhook-signatures.js";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../auth/api-key-contract.js";
 import type { OperationAuthenticator } from "../auth/operation-auth.js";
 import { EntitlementsService } from "../entitlements/service.js";
@@ -163,9 +165,14 @@ describe("database migration application", () => {
       join(DRIZZLE_MIGRATIONS, "0055_run_progress_reporter.sql"),
       "utf8",
     );
+    const signingMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0056_webhook_signatures.sql"),
+      "utf8",
+    );
     assert.deepEqual((await journal()).rows, [
       ...releasedJournal.rows,
       { hash: createHash("sha256").update(reporterMigration).digest("hex") },
+      { hash: createHash("sha256").update(signingMigration).digest("hex") },
     ]);
     assert.deepEqual(
       (await messages()).rows,
@@ -200,6 +207,168 @@ describe("database migration application", () => {
         { indexname: "run_progress_messages_settle_idx" },
       ],
     );
+  }, 120_000);
+
+  it("preserves populated legacy scopes and enforces signed key, tenant and slot constraints", async () => {
+    const url = await createHistoricalBaseline({
+      postgres,
+      prefix: "webhook_signing_upgrade",
+      through: "0055_run_progress_reporter",
+    });
+    await poolQuery(
+      url,
+      `
+      insert into organization (id, name, slug) values ('signing-a', 'A', 'signing-a'), ('signing-b', 'B', 'signing-b');
+      insert into organization_api_keys (organization_id, name, prefix, verifier, scopes, actor)
+      values ('signing-a', 'Timeline', 'legacy-reader', 'legacy-verifier',
+              ARRAY['runs:read','runs:dispatch','events:send'], 'sender');
+    `,
+    );
+    const { runtime, locks } = await postgresDatabaseRuntime(url);
+    try {
+      await runtime.migrate();
+      const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
+      assert.equal(journal.rowCount, 57);
+      const settings = readWebhookSigningSettings({
+        PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
+        PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",
+        PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS: '["signing-a"]',
+        PASEO_HUB_WEBHOOK_HMAC_KEYRING: JSON.stringify({
+          local: Buffer.alloc(32, 0x11).toString("base64"),
+        }),
+        PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID: "local",
+      });
+      const keys = new OrganizationApiKeys(runtime, locks, settings);
+      const [legacy] = await keys.list("signing-a");
+      assert.deepEqual(legacy?.scopes, ["runs:read", "runs:dispatch", "events:send"]);
+      assert.equal(legacy?.authentication, undefined);
+      const parent = `insert into organization_api_keys
+        (id,organization_id,name,prefix,verifier,scopes,actor,allowed_triggers,
+          webhook_auth_mode,webhook_signature_profile,webhook_target_trigger_id)
+        values ($1,'signing-a','Signed','new-signer','unused',$2,'sender',$3,$4,$5,$6)`;
+      const id = randomUUID();
+      const target = randomUUID();
+      for (const args of [
+        [["events:send", "runs:read"], ["test"], "hmac", "github_sha256", target],
+        [["events:send"], ["test"], "hmac", null, target],
+        [["events:send"], [null], "hmac", "github_sha256", target],
+        [["events:send"], ["test"], "hmac", "github_sha256", null],
+      ])
+        await assert.rejects(
+          runtime.query(parent, [id, ...args]),
+          /organization_api_keys_webhook_auth_check/u,
+        );
+      await runtime.query(parent, [id, ["events:send"], ["test"], "hmac", "github_sha256", target]);
+      const created = await runtime.transaction((client) =>
+        keys.signing.createCurrent(client, "signing-a", id, target),
+      );
+      const storeVersion = `insert into organization_webhook_secrets
+        (organization_id,api_key_id,slot,version_id,master_key_id,salt,accept_until) values ($1,$2,$3,$4,'local',$5,$6)`;
+      const salt = Buffer.alloc(32, 0x22).toString("base64url");
+      await assert.rejects(
+        runtime.query(storeVersion, ["signing-b", id, "previous", randomUUID(), salt, new Date()]),
+        /organization_webhook_secrets_parent_fk/u,
+      );
+      await assert.rejects(
+        runtime.query(storeVersion, ["signing-a", id, "current", randomUUID(), salt, null]),
+        /organization_webhook_secrets_api_key_id_slot_pk/u,
+      );
+      await assert.rejects(
+        runtime.query(storeVersion, ["signing-a", id, "previous", randomUUID(), salt, null]),
+        /organization_webhook_secrets_slot_check/u,
+      );
+      const databaseDump = await postgres.exec([
+        "pg_dump",
+        "-U",
+        postgres.getUsername(),
+        "-d",
+        new URL(url).pathname.slice(1),
+        "--data-only",
+        "-t",
+        "organization_api_keys",
+        "-t",
+        "organization_webhook_secrets",
+      ]);
+      assert.equal(databaseDump.exitCode, 0);
+      assert.ok(databaseDump.output.includes(id));
+      assert.ok(!databaseDump.output.includes(created.signingSecret));
+      assert.ok(!databaseDump.output.includes(settings.keyring.get("local")!.toString("base64")));
+
+      await assertSigningRestore(postgres, url, keys, id, created.signingSecret, settings);
+      const current = created.authentication.currentVersionId!;
+      const rotate = () =>
+        runtime.transaction((client) =>
+          keys.signing.rotate(client, "signing-a", {
+            id,
+            expectedCurrentVersionId: current,
+            overlapSeconds: 0,
+          }),
+        );
+      const rotations = await Promise.allSettled([rotate(), rotate()]);
+      const winner = rotations.find((rotation) => rotation.status === "fulfilled");
+      assert.ok(winner);
+      assert.equal(winner.value.authentication.previousVersionId, null);
+      assert.equal(rotations.filter((rotation) => rotation.status === "fulfilled").length, 1);
+      const stale = rotations.find((rotation) => rotation.status === "rejected");
+      assert.ok(stale);
+      assert.match(String(stale.reason), /signing_version_changed/u);
+      assert.equal(
+        (
+          await runtime.query("select 1 from organization_webhook_secrets where api_key_id = $1", [
+            id,
+          ])
+        ).rowCount,
+        1,
+      );
+
+      const parentLocked = Promise.withResolvers<void>();
+      const releaseParent = Promise.withResolvers<void>();
+      const revocation = runtime.transaction(async (client) => {
+        await client.query("select id from organization_api_keys where id = $1 for update", [id]);
+        parentLocked.resolve();
+        await releaseParent.promise;
+        await client.query("update organization_api_keys set revoked_at = now() where id = $1", [
+          id,
+        ]);
+        await client.query("delete from organization_webhook_secrets where api_key_id = $1", [id]);
+      });
+      await parentLocked.promise;
+      const competingRotation = runtime.transaction((client) =>
+        keys.signing.rotate(client, "signing-a", {
+          id,
+          expectedCurrentVersionId: winner.value.authentication.currentVersionId!,
+          overlapSeconds: 3600,
+        }),
+      );
+      const rejected = assert.rejects(competingRotation, /api_key_unavailable/u);
+      try {
+        const until = performance.now() + 5000;
+        let waiting = false;
+        while (!waiting && performance.now() < until) {
+          const waits = await runtime.query(
+            "select 1 from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' and query like '%organization_api_keys%for update%'",
+          );
+          waiting = waits.rowCount > 0;
+        }
+        assert.ok(
+          waiting,
+          "rotation must wait on the locked parent on a separate pooled connection",
+        );
+      } finally {
+        releaseParent.resolve();
+        await Promise.all([revocation, rejected]);
+      }
+      assert.equal(
+        (
+          await runtime.query("select 1 from organization_webhook_secrets where api_key_id = $1", [
+            id,
+          ])
+        ).rowCount,
+        0,
+      );
+    } finally {
+      await runtime.close();
+    }
   }, 120_000);
 
   it("adds nullable API key identity while enforcing actor and scope constraints", async () => {
@@ -1972,6 +2141,53 @@ interface HistoricalBaselineOptions {
   postgres: StartedPostgreSqlContainer;
   prefix: string;
   through: string;
+}
+
+async function assertSigningRestore(
+  postgres: StartedPostgreSqlContainer,
+  originalUrl: string,
+  keys: OrganizationApiKeys,
+  signerId: string,
+  secret: string,
+  settings: ReturnType<typeof readWebhookSigningSettings>,
+): Promise<void> {
+  const restoredName = "restored_signing_" + randomUUID().replaceAll("-", "");
+  const username = postgres.getUsername();
+  const created = await postgres.exec(["createdb", "-U", username, restoredName]);
+  assert.equal(created.exitCode, 0);
+  const restored = await postgres.exec([
+    "sh",
+    "-ec",
+    'set -o pipefail; pg_dump -U "$1" --no-owner "$2" | psql -X -q -v ON_ERROR_STOP=1 -U "$1" "$3"',
+    "restore",
+    username,
+    new URL(originalUrl).pathname.slice(1),
+    restoredName,
+  ]);
+  assert.equal(restored.exitCode, 0);
+  const restoredUrl = new URL(originalUrl);
+  restoredUrl.pathname = "/" + restoredName;
+  const { runtime, locks } = await postgresDatabaseRuntime(restoredUrl.toString());
+  try {
+    await runtime.migrate();
+    const body = Buffer.from('{"message":"restore check"}');
+    const signature = createHmac("sha256", secret).update(body).digest();
+    const rehydrated = new OrganizationApiKeys(runtime, locks, settings);
+    await rehydrated.signing.checkReadiness();
+    assert.deepEqual(
+      await rehydrated.signing.verify(signerId, signature, body),
+      await keys.signing.verify(signerId, signature, body),
+    );
+    const missing = new OrganizationApiKeys(runtime, locks, {
+      ...settings,
+      keyring: new Map(),
+      activeKeyId: undefined,
+    });
+    await assert.rejects(missing.signing.checkReadiness(), /authentication_unavailable/u);
+    assert.equal(missing.signing.availability(), "unavailable");
+  } finally {
+    await runtime.close();
+  }
 }
 
 async function createHistoricalBaseline(options: HistoricalBaselineOptions): Promise<string> {
