@@ -170,6 +170,31 @@ async function verifyRetainedIdentity(
   assert.deepEqual(runs.map(({ id }) => id).sort(), fixture.runs.sort());
 }
 
+async function readDumpMarkers(postgres: StartedPostgreSqlContainer, url: URL, markers: string[]) {
+  const path = "/tmp/receipt-proof.sql";
+  const dump = await postgres.exec([
+    "pg_dump",
+    "--data-only",
+    "--no-owner",
+    "--file",
+    path,
+    "-U",
+    url.username,
+    "-d",
+    url.pathname.slice(1),
+  ]);
+  assert.equal(dump.exitCode, 0, dump.stderr);
+  const matches = await postgres.exec([
+    "awk",
+    `BEGIN { for (i = 2; i < ARGC; i++) { markers[ARGV[i]] = 1; delete ARGV[i] } }
+      { for (marker in markers) if (index($0, marker)) { print marker; delete markers[marker] } }`,
+    path,
+    ...markers,
+  ]);
+  assert.equal(matches.exitCode, 0, matches.stderr);
+  return new Set(matches.stdout.trim().split("\n"));
+}
+
 describe("receipt shape proof and expiry", () => {
   let postgres: StartedPostgreSqlContainer;
   beforeAll(async () => {
@@ -189,36 +214,30 @@ describe("receipt shape proof and expiry", () => {
       );
       const database = createDatabase(runtime, locks);
       const cases = await verifyMatrix(database, runtime, true);
-      const dump = await postgres.exec([
-        "pg_dump",
-        "--data-only",
-        "--no-owner",
-        "-U",
-        url.username,
-        "-d",
-        url.pathname.slice(1),
-      ]);
-      assert.equal(dump.exitCode, 0);
+      const capabilityMarkers = [
+        "capability-slack-locator-marker",
+        "capability-slack-filename-marker.txt",
+        "capability-discord-locator-marker",
+        "capability-discord-filename-marker.txt",
+      ];
+      const markers = cases
+        .flatMap(({ marker, routeMarker, deliveryId, signatureHash }) => [
+          marker,
+          routeMarker,
+          deliveryId,
+          signatureHash,
+        ])
+        .filter((value) => value !== null);
+      const present = await readDumpMarkers(postgres, url, [...markers, ...capabilityMarkers]);
       for (const fixture of cases) {
-        assert.equal(
-          dump.output.includes(fixture.marker),
-          fixture.disposition !== "eligible",
-          fixture.key,
-        );
-        if (fixture.routeMarker !== null) {
-          assert.equal(
-            dump.output.includes(fixture.routeMarker),
-            fixture.disposition !== "eligible",
-            fixture.key,
-          );
-        }
-        assert.ok(dump.output.includes(fixture.deliveryId), fixture.key);
-        if (fixture.signatureHash !== null) assert.ok(dump.output.includes(fixture.signatureHash));
+        const retained = fixture.disposition !== "eligible";
+        assert.equal(present.has(fixture.marker), retained, fixture.key);
+        if (fixture.routeMarker !== null)
+          assert.equal(present.has(fixture.routeMarker), retained, fixture.key + " route");
+        assert.ok(present.has(fixture.deliveryId), fixture.key);
+        if (fixture.signatureHash !== null) assert.ok(present.has(fixture.signatureHash));
       }
-      for (const provider of ["slack", "discord"]) {
-        assert.ok(dump.output.includes("capability-" + provider + "-locator-marker"));
-        assert.ok(dump.output.includes("capability-" + provider + "-filename-marker.txt"));
-      }
+      for (const marker of capabilityMarkers) assert.ok(present.has(marker), marker);
       await assert.rejects(
         runtime.query(
           `insert into provider_event_receipts
