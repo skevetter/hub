@@ -113,19 +113,15 @@ async function handoffLinearEvent(
   handlers: Set<TriggerHandler>,
   options: LinearWebhookSourceOptions,
 ): Promise<Response> {
+  let linearOrganizationId: string | undefined;
   try {
     let event = normalizeLinearEvent(verified.payload, verified.eventName);
     if (event === undefined) {
       logger.debug({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
       return new Response("OK", { status: 200 });
     }
-    if (
-      await options.findMarkedReceipt?.(
-        event.organizationId,
-        verified.deliveryId,
-        verified.signatureHash,
-      )
-    )
+    linearOrganizationId = event.organizationId;
+    if (await findMarkedReceipt(options, verified, linearOrganizationId))
       return new Response("OK", { status: 200 });
     if (eventProjectId(event) === undefined && options.resolveIssue !== undefined) {
       const source = linearEventSource(event);
@@ -142,6 +138,8 @@ async function handoffLinearEvent(
       event = normalizeLinearEvent(verified.payload, verified.eventName, issue);
     }
     if (event === undefined) {
+      if (await findMarkedReceipt(options, verified, linearOrganizationId))
+        return new Response("OK", { status: 200 });
       logger.warn({ deliveryId: verified.deliveryId }, "Linear event issue hydration was invalid");
       return Response.json({ error: "invalid_linear_event" }, { status: 400 });
     }
@@ -153,9 +151,28 @@ async function handoffLinearEvent(
       options,
     );
   } catch (error) {
+    if (
+      linearOrganizationId !== undefined &&
+      (await findMarkedReceipt(options, verified, linearOrganizationId).catch(() => false))
+    )
+      return new Response("OK", { status: 200 });
     logger.error({ err: error, deliveryId: verified.deliveryId }, "Linear event handoff failed");
     return Response.json({ error: "event_handoff_unavailable" }, { status: 503 });
   }
+}
+
+async function findMarkedReceipt(
+  options: LinearWebhookSourceOptions,
+  verified: VerifiedLinearRequest,
+  linearOrganizationId: string,
+): Promise<boolean> {
+  return (
+    (await options.findMarkedReceipt?.(
+      linearOrganizationId,
+      verified.deliveryId,
+      verified.signatureHash,
+    )) ?? false
+  );
 }
 
 async function acceptAndDispatchLinearEvent(

@@ -196,15 +196,24 @@ export class DurableWorkflowEngine {
   async enqueue(trigger: DurableProviderEvent): Promise<TriggerDispatchOutcome> {
     const database = this.options.database;
     if (database === null) throw new DatabaseUnavailableError();
-    const receipt = await database.findProviderEventReplayMetadata(trigger.organizationId, {
-      id: trigger.providerEventReceiptId,
-    });
-    if (receipt?.payloadExpiryState != null)
-      return { providerEventReceiptId: trigger.providerEventReceiptId, replayed: true };
-    const { matches, dropReason } = await collectProviderMatches(
+    const receiptMarked = async () => {
+      const receipt = await database.findProviderEventReplayMetadata(trigger.organizationId, {
+        id: trigger.providerEventReceiptId,
+      });
+      return receipt?.payloadExpiryState != null;
+    };
+    const replay = {
+      providerEventReceiptId: trigger.providerEventReceiptId,
+      replayed: true,
+    } as const;
+    if (await receiptMarked()) return replay;
+    const selection = await collectProviderMatches(
       this.options.providers ?? [],
       trigger,
+      receiptMarked,
     );
+    if (selection === null) return replay;
+    const { matches, dropReason } = selection;
     if (matches.length === 0) {
       const dropped = await database.markProviderEventDropped(
         trigger.providerEventReceiptId,
@@ -1411,15 +1420,17 @@ function terminalReactionState(run: TriggerRunRecord): JsonValue | null {
 async function collectProviderMatches(
   providers: readonly TriggerProvider[],
   trigger: DurableProviderEvent,
+  receiptMarked: () => Promise<boolean>,
 ): Promise<{
   matches: readonly TriggerProviderMatch[];
   dropReason: ProviderEventDropReasonCode;
-}> {
+} | null> {
   if (!isTriggerEventName(trigger.source))
     return { matches: [], dropReason: "no_trigger_for_source" };
   const matchingProviders = providers.filter((provider) =>
     provider.eventNames.some((name) => name === trigger.source),
   );
+  if (matchingProviders.length > 0 && (await receiptMarked())) return null;
   const results = await Promise.all(matchingProviders.map((provider) => provider.match(trigger)));
   const matches = results.flatMap((result) => (typeof result === "string" ? [] : result));
   const reasons = results.filter(
