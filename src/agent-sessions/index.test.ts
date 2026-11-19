@@ -2,14 +2,28 @@ import { randomUUID } from "node:crypto";
 import { expect, test, vi } from "vitest";
 import { AgentSessions } from "./index.js";
 import { createMemoryDatabase } from "../db/memory.js";
+import type { AgentExecutionRecord } from "../db/types.js";
 import { OutputExecutorRegistry, replyOutputTool } from "../execution-capabilities/outputs.js";
 import { FinishCallRegistry } from "../execution-capabilities/finish-calls.js";
 import { createExecutionCapabilityServer } from "../execution-capabilities/server.js";
 import { TestAgents } from "./test-utils.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import { RunPayloadRetention } from "../run-payload-retention/index.js";
+import {
+  build14Selection,
+  credentialHistories,
+  upgradedSelection,
+} from "./credential-test-fixtures.js";
 
-async function fixture(now = Date.now, finishCalls?: FinishCallRegistry) {
-  const database = createMemoryDatabase({ now: () => new Date(now()) });
+async function fixture(
+  now = Date.now,
+  finishCalls?: FinishCallRegistry,
+  onInsertAgentExecution?: (execution: AgentExecutionRecord) => void,
+) {
+  const database = createMemoryDatabase({
+    now: () => new Date(now()),
+    ...(onInsertAgentExecution === undefined ? {} : { onInsertAgentExecution }),
+  });
   const connection = new TestAgents();
   const outputs = new OutputExecutorRegistry();
   const replies: { executionId: string; context: unknown }[] = [];
@@ -276,6 +290,82 @@ test("an expired credentialed launch still rotates its session in memory", async
   expect((await f.execution(next.executionId)).daemonAgentId).not.toBe(original.agentId);
   expect((await f.database.findAgentSession(sessionId))?.continuationKey).toBeNull();
 });
+
+test.each(credentialHistories)(
+  "preserves credential selection for $key in memory",
+  async (history) => {
+    const old = new Date("2026-10-10T00:00:00Z");
+    const now = new Date("2026-11-18T00:00:00Z");
+    for (const phase of ["migrated", "redacted"] as const) {
+      let nextHistory: { intent: object | null; fact: boolean | null } | undefined;
+      const f = await fixture(
+        () => old.getTime(),
+        undefined,
+        (execution) => {
+          if (nextHistory === undefined) return;
+          const { intent, fact } = nextHistory;
+          const stored = execution.launchIntent!;
+          for (const field of ["environment", "env", "github", "triggerRunId"]) {
+            Reflect.deleteProperty(stored, field);
+          }
+          execution.launchIntent = intent === null ? null : Object.assign(stored, intent);
+          execution.usedTemporaryCredentials = fact;
+        },
+      );
+      async function addHistory(intent: object | null, fact: boolean | null) {
+        nextHistory = { intent, fact };
+        const arrival = await f.arrival(history.key);
+        nextHistory = undefined;
+        return arrival;
+      }
+      const [initial, ...remaining] = history.intents;
+      const first = await addHistory(initial ?? null, history.migrated[0] ?? null);
+      const original = await first.dispatch();
+      const { execution } = await f.database.transitionAgentExecution(
+        first.executionId,
+        "succeeded",
+      );
+      const ids = [first.executionId];
+      for (const [index, intent] of remaining.entries()) {
+        const extra = await addHistory(intent, history.migrated[index + 1] ?? null);
+        await f.database.attachExecutionToSession(extra.executionId, execution.agentSessionId!);
+        await f.database.transitionAgentExecution(extra.executionId, "succeeded");
+        ids.push(extra.executionId);
+      }
+      const before = await Promise.all(ids.map((id) => f.execution(id)));
+      expect(build14Selection(before.map(({ launchIntent }) => launchIntent))).toBe(
+        history.build14,
+      );
+      expect(before.map(({ usedTemporaryCredentials }) => usedTemporaryCredentials)).toEqual(
+        history.migrated,
+      );
+      if (phase === "redacted") {
+        const sweep = new RunPayloadRetention(f.database, {
+          mode: "on",
+          retentionDays: 30,
+          maxRunsPerPass: 50,
+        });
+        expect((await sweep.runBatch(now)).complete).toBe(true);
+        const after = await Promise.all(ids.map((id) => f.execution(id)));
+        expect(after.map(({ usedTemporaryCredentials }) => usedTemporaryCredentials)).toEqual(
+          history.backfilled,
+        );
+        expect(after.map(({ launchIntentExpiredAt }) => launchIntentExpiredAt != null)).toEqual(
+          history.backfilled.map((fact) => fact !== null),
+        );
+      }
+      const next = await f.arrival(history.key);
+      const expected = upgradedSelection(history);
+      if (expected === "error") {
+        await expect(next.dispatch()).rejects.toThrow(/unsupported interpolation|reading 'env'/u);
+      } else {
+        const selected = await next.dispatch();
+        expect(selected.action).toBe(expected);
+        expect(selected.agentId === original.agentId).toBe(expected === "continued");
+      }
+    }
+  },
+);
 
 test("a ping cannot send more work after the inherited deadline while timeout cleanup is pending", async () => {
   let now = Date.parse("2030-01-01T00:00:00Z");

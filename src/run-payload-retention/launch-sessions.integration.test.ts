@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { readMigrationFiles } from "drizzle-orm/migrator";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { afterAll, beforeAll, describe, it, vi } from "vitest";
 import { AgentSessions } from "../agent-sessions/index.js";
+import {
+  build14Selection,
+  credentialHistories,
+  upgradedSelection,
+  type SessionSelection,
+} from "../agent-sessions/credential-test-fixtures.js";
 import { TestAgents } from "../agent-sessions/test-utils.js";
 import { createDatabase } from "../db/pg.js";
 import {
@@ -68,6 +75,25 @@ async function seed(runtime: QueryHandle) {
         '{"body":"machine-context"}', '{"body":"machine-specs"}', 'machine-shutdown')`,
   ])
     await runtime.query(sql);
+}
+
+async function migrateToBuild14(runtime: DatabaseRuntime) {
+  const migrations = readMigrationFiles({ migrationsFolder: "drizzle" }).slice(0, 58);
+  await runtime.transaction(async (client) => {
+    await client.query("create schema drizzle");
+    await client.query(
+      "create table drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint)",
+    );
+    for (const migration of migrations) {
+      for (const statement of migration.sql) {
+        if (statement.trim()) await client.query(statement);
+      }
+      await client.query(
+        "insert into drizzle.__drizzle_migrations (hash, created_at) values ($1, $2)",
+        [migration.hash, migration.folderMillis],
+      );
+    }
+  });
 }
 
 async function newRun(runtime: QueryHandle) {
@@ -255,14 +281,16 @@ describe("launch and session expiry in PostgreSQL", () => {
     await postgres?.stop();
   }, 120_000);
 
-  async function freshDatabase() {
+  async function freshDatabase(
+    migrate: (runtime: DatabaseRuntime) => Promise<void> = (runtime) => runtime.migrate(),
+  ) {
     const name = "launch_" + randomUUID().replaceAll("-", "");
     const created = await postgres.exec(["createdb", "-U", postgres.getUsername(), name]);
     assert.equal(created.exitCode, 0, created.output);
     const url = new URL(postgres.getConnectionUri());
     url.pathname = "/" + name;
     const bundle = await postgresDatabaseRuntime(url.toString());
-    await bundle.runtime.migrate();
+    await migrate(bundle.runtime);
     await seed(bundle.runtime);
     return {
       ...bundle,
@@ -283,6 +311,120 @@ describe("launch and session expiry in PostgreSQL", () => {
     assert.equal(result.exitCode, 0, result.output);
     return result.output;
   }
+
+  it("preserves credential selection across migration, backfill and launch redaction", async () => {
+    const { runtime, database, url } = await freshDatabase(migrateToBuild14);
+    try {
+      const cases = [];
+      for (const history of credentialHistories) {
+        const ids = [];
+        const before = [];
+        for (const intent of history.intents) {
+          const id = randomUUID();
+          const result = await runtime.query<{ launch_intent: LaunchMachineIntent | null }>(
+            `insert into agent_executions (id, organization_id, project_id, configuration_revision_id,
+                status, completed_at, started_at, launch_intent)
+             values ($1, $2, $3, $4, 'succeeded', $5, $5, $6)
+             returning launch_intent`,
+            [id, ORG, PROJECT, REVISION, OLD, intent],
+          );
+          ids.push(id);
+          before.push(result.rows[0]!.launch_intent);
+        }
+        assert.equal(build14Selection(before), history.build14, history.key);
+        cases.push({ history, ids });
+      }
+
+      await runtime.migrate();
+      const fixture = arrivals(database);
+      const sessions = [];
+      for (const { history, ids } of cases) {
+        const actual = await Promise.all(ids.map((id) => database.findAgentExecutionById(id)));
+        assert.deepEqual(
+          actual.map((execution) => execution?.usedTemporaryCredentials),
+          history.migrated,
+          history.key,
+        );
+        const starter = await fixture.arrival({ key: history.key });
+        await starter.dispatch();
+        const { session } = await starter.finish(runtime);
+        for (const id of ids) await database.attachExecutionToSession(id, session.id, "created");
+        await runtime.query("delete from agent_executions where id = $1", [starter.id]);
+        sessions.push({ history, ids, session });
+      }
+
+      async function checkArrival(key: string, sessionId: string, expected: SessionSelection) {
+        const next = await fixture.arrival({ key });
+        if (expected === "error") {
+          await assert.rejects(next.dispatch(), /unsupported interpolation|reading 'env'/u);
+        } else {
+          assert.equal((await next.dispatch()).action, expected, key);
+        }
+        const attached = (await database.findAgentExecutionById(next.id))?.agentSessionId;
+        await runtime.query("delete from agent_executions where id = $1", [next.id]);
+        if (attached != null && attached !== sessionId) {
+          await runtime.query("delete from agent_sessions where id = $1", [attached]);
+          await runtime.query(
+            `update agent_sessions set continuation_key = $2,
+              data = jsonb_set(data, '{continuationKey}', to_jsonb($2::text)) where id = $1`,
+            [sessionId, key],
+          );
+        }
+      }
+      for (const { history, session } of sessions) {
+        await checkArrival(history.key, session.id, upgradedSelection(history));
+      }
+
+      const hashes = await tableHashes(runtime);
+      const off = await drain(new RunPayloadRetention(database, { ...settings, mode: "off" }));
+      assert.equal(off.credentialFactsBackfilled, 0);
+      assert.deepEqual(await tableHashes(runtime), hashes);
+
+      const count = await drain(
+        new RunPayloadRetention(database, { ...settings, mode: "count", maxRunsPerPass: 1 }),
+      );
+      assert.equal(count.credentialFactsBackfilled, 1);
+      assert.equal(count.launchIntentsExpired, 0);
+      assert.equal(count.sessionsReduced, 0);
+      const afterCount = await tableHashes(runtime);
+      assert.deepEqual(
+        [...afterCount].filter(([name, hash]) => hash !== hashes.get(name)).map(([name]) => name),
+        ['"public"."agent_executions"'],
+      );
+      const unredacted = await runtime.query<{ all_unmarked: boolean }>(
+        "select bool_and(launch_intent_expired_at is null) as all_unmarked from agent_executions",
+      );
+      assert.equal(unredacted.rows[0]?.all_unmarked, true);
+
+      const restarted = await postgresDatabaseRuntime(url);
+      try {
+        const next = createDatabase(restarted.runtime, restarted.locks);
+        const applied = await drain(new RunPayloadRetention(next, settings));
+        assert.equal(applied.credentialFactsBackfilled, 5);
+        assert.equal(applied.launchIntentsExpired, 10);
+        assert.equal(applied.sessionsReduced, 9);
+        assert.equal(applied.auxiliaryCounts.launchIntent.flag_unknown?.count, 2);
+        for (const { history, session, ids } of sessions) {
+          const actual = await Promise.all(ids.map((id) => next.findAgentExecutionById(id)));
+          assert.deepEqual(
+            actual.map((execution) => execution?.usedTemporaryCredentials),
+            history.backfilled,
+            history.key,
+          );
+          assert.deepEqual(
+            actual.map((execution) => execution?.launchIntentExpiredAt != null),
+            history.backfilled.map((fact) => fact !== null),
+            history.key,
+          );
+          await checkArrival(history.key, session.id, upgradedSelection(history));
+        }
+      } finally {
+        await restarted.runtime.close();
+      }
+    } finally {
+      await runtime.close();
+    }
+  });
 
   it("counts without writes and removes only eligible markers from a full dump", async () => {
     const { runtime, database, name } = await freshDatabase();
