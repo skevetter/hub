@@ -18,7 +18,7 @@ import {
 } from "../../auth/webhook-signatures.js";
 import { createMemoryDatabase } from "../../db/memory.js";
 import { createDatabase } from "../../db/pg.js";
-import { embeddedDatabaseRuntime } from "../../db/runtime/index.js";
+import { embeddedDatabaseRuntime, type DatabaseRuntimeBundle } from "../../db/runtime/index.js";
 import { createUnlimitedEntitlementsService } from "../../entitlements/test-utils.js";
 import { createFetchServer } from "../../http/node-server.js";
 import { acceptingAgentValidator } from "../../test-utils/agent-validator.js";
@@ -43,10 +43,15 @@ export function testSigningSettings(overrides: Partial<WebhookSigningSettings> =
 
 export async function webhookFixture(
   overrides: Partial<WebhookOptions> = {},
-  fixtureOptions: { signing?: WebhookSigningSettings; memory?: boolean } = {},
+  fixtureOptions: {
+    signing?: WebhookSigningSettings;
+    memory?: boolean;
+    bundle?: DatabaseRuntimeBundle;
+  } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), "hub-webhook-api-"));
-  const bundle = await embeddedDatabaseRuntime(join(directory, "database"));
+  const bundle =
+    fixtureOptions.bundle ?? (await embeddedDatabaseRuntime(join(directory, "database")));
   const runtime = bundle.runtime;
   await runtime.migrate();
   await runtime.query(
