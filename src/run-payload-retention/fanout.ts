@@ -1,10 +1,13 @@
 import { z } from "zod";
-import { NormalizedGitHubEventSchema } from "../auth/github-events.js";
-import { parseCompiledHubConfig } from "../config/compiler.js";
+import { NormalizedGitHubEventSchema, type NormalizedGitHubEvent } from "../auth/github-events.js";
+import { parseCompiledHubConfig, type CompiledHubConfig } from "../config/compiler.js";
 import type { ProviderEventReceiptRecord } from "../db/types.js";
 import { GITHUB_TRIGGER_SOURCE_NAMES } from "../triggers/github/classification.js";
 import { matchGitHubInvocations } from "../triggers/github/match.js";
-import { NormalizedLinearEventSchema } from "../triggers/linear/events.js";
+import {
+  NormalizedLinearEventSchema,
+  type NormalizedLinearEvent,
+} from "../triggers/linear/events.js";
 import {
   hasLinearSourceTrigger,
   linearInvocationUsesAppUser,
@@ -25,12 +28,13 @@ export type FanoutReceipt = Pick<
 };
 
 type RouteKey = z.infer<typeof routeKey>;
-type PinnedRoute = z.infer<typeof pinnedRoute>;
+export type PinnedRoute = z.infer<typeof pinnedRoute>;
 
 export interface FanoutRevision {
   projectId: string;
   organizationId: string;
   normalizedConfiguration: unknown;
+  sourceEvidence?: unknown;
 }
 
 export type ExpectedFanout = readonly (RouteKey & { names: readonly string[] | null })[];
@@ -47,7 +51,11 @@ export function usesPinnedFanout(provider: FanoutReceipt["provider"]): boolean {
 
 export function readPinnedRoutes(receipt: FanoutReceipt): PinnedRoute[] | undefined {
   if (!usesPinnedFanout(receipt.provider)) return [];
-  const parsed = z.array(pinnedRoute).min(1).safeParse(receipt.acceptedRoutes);
+  return parsePinnedRoutes(receipt.acceptedRoutes);
+}
+
+export function parsePinnedRoutes(value: unknown): PinnedRoute[] | undefined {
+  const parsed = z.array(pinnedRoute).min(1).safeParse(value);
   return parsed.success ? parsed.data : undefined;
 }
 
@@ -71,19 +79,21 @@ export function expectedFanout(
 
   const expected: (RouteKey & { names: readonly string[] })[] = [];
   try {
+    const event = readPinnedProviderEvent(receipt);
+    if (event === undefined) return undefined;
     for (const route of routes) {
-      const revision = revisionById(route.configurationRevisionId);
-      if (
-        revision?.projectId !== route.projectId ||
-        revision.organizationId !== receipt.organizationId
-      )
-        return undefined;
-      const names = expectedWorkflowNames(receipt, route, revision);
-      if (names === undefined) return undefined;
+      const config = pinnedConfiguration(
+        revisionById(route.configurationRevisionId),
+        receipt.organizationId,
+        route,
+      );
+      if (config === undefined) return undefined;
+      const matches = matchPinnedProviderInvocations(config, event, receipt.source, route);
+      if (matches === undefined) return undefined;
       expected.push({
         projectId: route.projectId,
         configurationRevisionId: route.configurationRevisionId,
-        names,
+        names: matches.map(({ triggerName }) => triggerName),
       });
     }
   } catch {
@@ -92,35 +102,58 @@ export function expectedFanout(
   return expected;
 }
 
-function expectedWorkflowNames(
-  receipt: FanoutReceipt,
+export function pinnedConfiguration(
+  revision: FanoutRevision | undefined,
+  organizationId: string,
   route: PinnedRoute,
-  revision: FanoutRevision,
 ) {
-  const configuration = parseCompiledHubConfig(revision.normalizedConfiguration);
-  if (configuration.environments.some((env) => env.kind === "daemon" && env.daemonId === undefined))
+  if (revision?.projectId !== route.projectId || revision.organizationId !== organizationId)
     return undefined;
+  const config = parseCompiledHubConfig(revision.normalizedConfiguration);
+  return config.environments.some((env) => env.kind === "daemon" && env.daemonId === undefined)
+    ? undefined
+    : config;
+}
+
+export type PinnedProviderEvent =
+  | { provider: "github"; event: NormalizedGitHubEvent }
+  | { provider: "linear"; event: NormalizedLinearEvent };
+
+export function readPinnedProviderEvent(receipt: FanoutReceipt): PinnedProviderEvent | undefined {
   if (receipt.provider === "github") {
-    const event = NormalizedGitHubEventSchema.parse(receipt.payload);
+    const parsed = NormalizedGitHubEventSchema.safeParse(receipt.payload);
+    if (!parsed.success) return undefined;
+    const event = parsed.data;
     if (
       receipt.source !== `github.${event.type}` ||
       !GITHUB_TRIGGER_SOURCE_NAMES.some((source) => source === receipt.source)
     )
       return undefined;
+    return { provider: "github", event };
+  }
+  if (receipt.provider !== "linear") return undefined;
+  const parsed = NormalizedLinearEventSchema.safeParse(receipt.payload);
+  if (!parsed.success) return undefined;
+  const event = parsed.data;
+  return receipt.source === `linear.${event.type}` ? { provider: "linear", event } : undefined;
+}
+
+export function matchPinnedProviderInvocations(
+  configuration: CompiledHubConfig,
+  { provider, event }: PinnedProviderEvent,
+  source: string,
+  route: PinnedRoute,
+) {
+  if (provider === "github") {
     const matches = matchGitHubInvocations(configuration, event, {
-      source: receipt.source,
+      source,
       connectionId: route.connectionId,
     });
-    return typeof matches === "string" ? [] : matches.map((match) => match.triggerName);
+    return typeof matches === "string" ? [] : matches;
   }
-
-  const event = NormalizedLinearEventSchema.parse(receipt.payload);
-  if (receipt.source !== `linear.${event.type}`) return undefined;
-  if (!hasLinearSourceTrigger(configuration.triggers, receipt.source)) return [];
+  if (!hasLinearSourceTrigger(configuration.triggers, source)) return [];
   if (linearInvocationUsesAppUser(event)) return undefined;
-  return matchLinearInvocations(configuration, event, route.connectionId).map(
-    (match) => match.triggerName,
-  );
+  return matchLinearInvocations(configuration, event, route.connectionId);
 }
 
 export function coversExpectedFanout(

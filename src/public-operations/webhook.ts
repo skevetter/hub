@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { bearerWebhookDeliveryId, signedWebhookDeliveryId } from "../webhooks/delivery-id.js";
 import type { CompiledTrigger } from "../config/compiler.js";
 import type { ProviderEventReplayMetadata } from "../db/types.js";
 import { formatInvocationRejection } from "../triggers/invocation.js";
@@ -134,25 +134,17 @@ export async function receiveWebhook(
 
   const deliveryId =
     signature === undefined
-      ? `public-manual-${createHash("sha256")
-          .update(
-            JSON.stringify([
-              authorization.organizationId,
-              target.projectId,
-              input.trigger,
-              input.deliveryKey,
-            ]),
-          )
-          .digest("base64url")}`
-      : `public-signature-${createHash("sha256")
-          .update(
-            JSON.stringify([
-              authorization.organizationId,
-              authorization.credentialId,
-              signature.bodyDigest,
-            ]),
-          )
-          .digest("hex")}`;
+      ? bearerWebhookDeliveryId(
+          authorization.organizationId,
+          target.projectId,
+          input.trigger,
+          input.deliveryKey,
+        )
+      : signedWebhookDeliveryId(
+          authorization.organizationId,
+          authorization.credentialId,
+          signature.bodyDigest,
+        );
   const existing = await repository.findManualReceipt(authorization.organizationId, deliveryId);
   if (existing !== undefined) {
     if (existing.payloadExpiryState != null) {

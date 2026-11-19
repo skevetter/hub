@@ -175,8 +175,7 @@ export function createManualRunProvider(
           },
         ];
       }
-      if (!matchesInputFilters(invocation.inputs, trigger.filters?.inputs))
-        return "trigger_filters_rejected";
+      if (!manualInvocationPassesFilters(trigger, invocation)) return "trigger_filters_rejected";
       const match: TriggerProviderMatch<ManualRunContext, ManualRunOutputContext> = {
         conversation: null,
         triggerName: trigger.name,
@@ -192,6 +191,16 @@ export function createManualRunProvider(
       return triggerContext.event;
     },
   };
+}
+
+export function manualInvocationPassesFilters(
+  trigger: CompiledTrigger,
+  invocation: InvocationParseResult,
+) {
+  return (
+    invocation.status === "rejected" ||
+    matchesInputFilters(invocation.inputs, trigger.filters?.inputs)
+  );
 }
 
 function authorizeManualTrigger(

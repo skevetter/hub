@@ -16,16 +16,18 @@ export const GitHubNotificationThreadSchema = z.object({
 export type GitHubNotificationThread = z.infer<typeof GitHubNotificationThreadSchema>;
 
 /** What Hub stores and hands to the run. Nothing else from the thread is kept. */
-export interface NotificationPayload {
-  repo: string;
-  thread_id: string;
-  subject_type: string;
-  title: string;
-  number: number | null;
-  html_url: string | null;
-  reason: string;
-  updated_at: string;
-}
+export const NotificationPayloadSchema = z.object({
+  repo: z.string().min(1),
+  thread_id: z.string().min(1),
+  subject_type: z.string(),
+  title: z.string(),
+  number: z.number().int().positive().nullable(),
+  html_url: z.string().nullable(),
+  reason: z.string(),
+  updated_at: z.string().min(1),
+});
+
+export type NotificationPayload = z.infer<typeof NotificationPayloadSchema>;
 
 const SUBJECT_NUMBER = /\/(?:pulls|issues)\/(\d+)$/u;
 
