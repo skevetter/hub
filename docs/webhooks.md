@@ -311,6 +311,13 @@ result, even if the new body would fail typed input validation. Rejected request
 do not reserve a key. Races can return `409 dispatch_conflict`; retry with the same key. This is
 not an exactly once execution guarantee, including across restarts.
 
+[Run payload retention](run-payload-retention.md) preserves public webhook deduplication after
+the receipt body expires. An authorized Bearer retry with the same key returns the original run
+or filtered result even if the valid envelope carries a different body. Signed retries still
+require the exact original bytes and a currently valid signer for the original trigger. During
+key rotation, a valid overlapping or current key for that signer can authenticate the same
+retry. Expiry leaves the recorded result available and prevents new work for that delivery.
+
 Retry only `409`, `429`, `503`, or a network failure. Keep the same body and any Idempotency-Key.
 Use exponential backoff with full jitter: before retry number n, choose a random delay from zero
 to `min(60, 2^(n-1))` seconds. The first retry window is 1 second, and the cap is 60 seconds.
@@ -382,12 +389,16 @@ refused for a script trigger; a bound key cannot override its actor. Webhook dat
 only through HUB_EVENT_JSON, never by interpolation into command text. Parse it as data, never as
 shell code. See [script actions](script-actions.md) for host permissions and inherited environment.
 
-Never send secrets in events. Hub retains the full receipt payload and the run's prompt and typed
-inputs with no expiry. The bounded context copy does not delete the full payload. Anyone able to
-read those runs can see their content. Keep API keys out of request bodies, query strings and
+Never send secrets in events. Hub stores the full receipt payload and the run's prompt and typed
+inputs. Anyone able to read those runs can see their retained content. The optional
+[run payload retention](run-payload-retention.md) sweep can clear eligible payloads. It defaults
+to `off`. Keep API keys out of request bodies, query strings and
 application logs. Keep Authorization and signature headers out of logs as well. A captured
 Bearer request without an idempotency key can be replayed. A captured GitHub request can be
 accepted while its signing secret is valid if Hub has never accepted that exact body.
+
+If receipt expiry has run, set its mode to `off` first and keep every Hub binary at this release
+or newer. The pre-webhook rollback below applies only to a database without expired receipts.
 
 Before rolling back to the pre-webhook Hub binary, take a restorable database backup. Revocation
 alone is insufficient: the old API key list parses scopes on revoked rows too, and cannot parse
