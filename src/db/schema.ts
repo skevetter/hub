@@ -879,6 +879,12 @@ export const agentSessions = pgTable(
       .references(() => projects.id),
     continuationKey: text("continuation_key"),
     data: jsonb().$type<import("../agent-sessions/index.js").AgentSessionRecord>().notNull(),
+    creationOptions:
+      jsonb("creation_options").$type<
+        import("../agent-sessions/index.js").AgentSessionRecord["creationOptions"]
+      >(),
+    optionsReducedAt: timestamp("options_reduced_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }),
   },
   (table) => [
     uniqueIndex("agent_sessions_project_key_unique").on(table.projectId, table.continuationKey),
@@ -918,6 +924,13 @@ export const agentExecutions = pgTable(
     outputEmissions: jsonb("output_emissions").notNull().default({}),
     outputDeliveryAttempts: jsonb("output_delivery_attempts").notNull().default({}),
     launchIntent: jsonb("launch_intent"),
+    usedTemporaryCredentials: boolean("used_temporary_credentials"),
+    launchIntentExpiredAt: timestamp("launch_intent_expired_at", { withTimezone: true }),
+    launchRunId: uuid("launch_run_id"),
+    launchAgent:
+      jsonb("launch_agent").$type<
+        import("../run-payload-retention/summary.js").PayloadAgentSummary
+      >(),
     daemonId: uuid("daemon_id"),
     daemonAgentId: text("daemon_agent_id"),
     workflowStepRunId: uuid("workflow_step_run_id"),
@@ -945,6 +958,14 @@ export const agentExecutions = pgTable(
       .where(
         sql`${table.workflowStepRunId} is null and ${table.launchIntent} ->> 'kind' = 'launch_machine'`,
       ),
+    index("agent_executions_launch_run_idx")
+      .on(table.organizationId, table.projectId, table.launchRunId)
+      .where(sql`${table.launchRunId} is not null`),
+    check(
+      "agent_executions_launch_expiry_check",
+      sql`${table.launchIntentExpiredAt} is null or
+        (${table.launchIntent} is null and ${table.usedTemporaryCredentials} is not null)`,
+    ),
     check(
       "agent_executions_hub_action_check",
       sql`${table.hubAction} is null or ${table.hubAction} in ('interrupt', 'archive')`,

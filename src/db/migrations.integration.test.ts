@@ -49,6 +49,79 @@ describe("database migration application", () => {
     await postgres.stop();
   }, 120_000);
 
+  it("preserves populated build 14 options and backfills launch credential facts", async () => {
+    const url = await createHistoricalBaseline({
+      postgres,
+      prefix: "launch_payload_upgrade",
+      through: "0057_run_payload_expiry",
+    });
+    const project = randomUUID();
+    const revisionId = randomUUID();
+    const session = randomUUID();
+    await poolQuery(
+      url,
+      `
+      insert into organization (id, name, slug) values ('launch-upgrade', 'Launch', 'launch-upgrade');
+      insert into projects (id, organization_id, name, slug)
+        values ('${project}', 'launch-upgrade', 'Launch', 'launch');
+      insert into project_configuration_revisions
+        (id, project_id, organization_id, version, source_kind, source_evidence, normalized_configuration, content_hash)
+        values ('${revisionId}', '${project}', 'launch-upgrade', 1, 'manual', '{}', '{}', 'launch');
+      insert into agent_sessions (id, organization_id, project_id, data)
+        values ('${session}', 'launch-upgrade', '${project}',
+          '{"creationOptions":{"workspaceTitle":"upgrade-session-options"}}');
+    `,
+    );
+    const reference = "${{\n paseo.connections.github-app.token \t}}";
+    const base = { env: { TOKEN: reference } };
+    const intents = [
+      { prompt: "upgrade-launch-intent", environment: base },
+      { environment: base, env: { TOKEN: "plain" } },
+      { environment: {}, env: { TOKEN: "prefix " + reference + reference } },
+      { environment: {}, github: {} },
+      { environment: {} },
+      { environment: {}, env: { TOKEN: "${{ broken }}" } },
+      { environment: {}, env: { TOKEN: "${{ unterminated" } },
+      { environment: {}, env: { TOKEN: "${{ invalid }token }}" } },
+      { environment: { env: [] } },
+      null,
+    ];
+    const { runtime } = await postgresDatabaseRuntime(url);
+    try {
+      for (const [index, intent] of intents.entries()) {
+        await runtime.query(
+          `insert into agent_executions (organization_id, project_id, configuration_revision_id,
+            status, completed_at, started_at, launch_intent, agent_session_id)
+           values ('launch-upgrade', $1, $2, 'succeeded', now(), to_timestamp($3), $4, $5)`,
+          [project, revisionId, index, intent, session],
+        );
+      }
+      await runtime.migrate();
+      const result = await runtime.query(
+        `select used_temporary_credentials as fact, launch_intent as intent,
+           launch_intent_expired_at as expired from agent_executions order by started_at`,
+      );
+      assert.deepEqual(
+        result.rows.map((row) => row["fact"]),
+        [true, false, true, true, false, null, null, null, null, null],
+      );
+      assert.deepEqual(
+        result.rows.map((row) => row["intent"]),
+        intents,
+      );
+      assert.ok(result.rows.every((row) => row["expired"] === null));
+      const options = await runtime.query(
+        `select creation_options as options, data -> 'creationOptions' as embedded, options_reduced_at
+         from agent_sessions where id = $1`,
+        [session],
+      );
+      const full = { workspaceTitle: "upgrade-session-options" };
+      assert.deepEqual(options.rows, [{ options: full, embedded: full, options_reduced_at: null }]);
+    } finally {
+      await runtime.close();
+    }
+  });
+
   it("upgrades populated run and key tables before adding timeline foreign keys", async () => {
     const url = await createHistoricalBaseline({
       postgres,
@@ -173,11 +246,16 @@ describe("database migration application", () => {
       join(DRIZZLE_MIGRATIONS, "0057_run_payload_expiry.sql"),
       "utf8",
     );
+    const launchExpiryMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0058_launch_payload_expiry.sql"),
+      "utf8",
+    );
     assert.deepEqual((await journal()).rows, [
       ...releasedJournal.rows,
       { hash: createHash("sha256").update(reporterMigration).digest("hex") },
       { hash: createHash("sha256").update(signingMigration).digest("hex") },
       { hash: createHash("sha256").update(expiryMigration).digest("hex") },
+      { hash: createHash("sha256").update(launchExpiryMigration).digest("hex") },
     ]);
     const runs = await poolQuery(
       url,
@@ -247,7 +325,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 58);
+      assert.equal(journal.rowCount, 59);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",

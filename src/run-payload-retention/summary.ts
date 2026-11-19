@@ -167,8 +167,6 @@ type StepSource = Pick<
 
 export function summarizeStepPayload(step: StepSource): StepPayloadSummary {
   const script = step.agentExecutionId === null ? readScriptStepResult(step.output) : undefined;
-  const provider = step.dispatchIntent?.agent?.provider;
-  const model = step.dispatchIntent?.agent?.model;
   return {
     version: 1,
     stepKey: step.stepId,
@@ -180,13 +178,28 @@ export function summarizeStepPayload(step: StepSource): StepPayloadSummary {
     hadOutput: step.output !== null,
     exitCode: script?.exit_code ?? null,
     truncated: script?.truncated ?? null,
+    ...summarizePayloadAgent(step.dispatchIntent?.agent),
+    failureCode: stepFailureCode(step.status),
+  };
+}
+
+export interface PayloadAgentSummary {
+  provider: string | null;
+  model: string | null;
+}
+
+export function summarizePayloadAgent(agent?: {
+  provider?: unknown;
+  model?: unknown;
+}): PayloadAgentSummary {
+  const { provider, model } = agent ?? {};
+  return {
     provider:
       typeof provider === "string" && /^[a-z][a-z0-9_-]{0,31}$/u.test(provider) ? provider : null,
     model:
       typeof model === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/u.test(model)
         ? model
         : null,
-    failureCode: stepFailureCode(step.status),
   };
 }
 
