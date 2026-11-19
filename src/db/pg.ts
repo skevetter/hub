@@ -543,9 +543,8 @@ class PgDatabase implements Database {
     );
   }
 
-  pendingGitHubInstallationSyncs(owner: GitHubInstallationSyncOwner) {
-    return this.triggerAcceptance.pendingGitHubInstallationSyncs(owner);
-  }
+  pendingGitHubInstallationSyncs: Database["pendingGitHubInstallationSyncs"] = (owner, selected) =>
+    this.triggerAcceptance.pendingGitHubInstallationSyncs(owner, selected);
 
   claimGitHubLifecycleReceipt(input: GitHubLifecycleReceiptClaimInput) {
     return this.triggerAcceptance.claimGitHubLifecycleReceipt(input);

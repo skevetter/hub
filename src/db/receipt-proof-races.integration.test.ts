@@ -222,9 +222,10 @@ describe("production receipt expiry lock ordering", () => {
     });
     const first = await harness.database.findProviderEventReceiptById(receipt.id);
     assert.ok(first?.payloadExpiredAt);
-    assert.deepEqual(await harness.database.scanReceiptPayloads(null, OLD, 5, "expiring"), [
-      { id: receipt.id, ageFrom: OLD, disposition: "expiring" },
-    ]);
+    assert.deepEqual(await harness.database.scanReceiptPayloads(null, OLD, 5, "expiring"), {
+      candidates: [{ id: receipt.id, ageFrom: OLD, disposition: "expiring" }],
+      nextCursor: null,
+    });
     assert.deepEqual(await harness.database.expireReceiptPayload(receipt.id, OLD, NOW), {
       status: "expired",
     });
@@ -417,7 +418,7 @@ it("rechecks recovery, reporter and notification work even behind a final run ma
       disposition: "live_execution" | "reporter_pending" | "notification_pending",
     ) => {
       assert.equal(
-        (await database.scanReceiptPayloads(null, CUTOFF, 5))[0]?.disposition,
+        (await database.scanReceiptPayloads(null, CUTOFF, 5)).candidates[0]?.disposition,
         disposition,
       );
       assert.deepEqual(await database.expireReceiptPayload(receipt.id, CUTOFF, NOW), {

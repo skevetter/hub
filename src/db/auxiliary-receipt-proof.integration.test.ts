@@ -135,7 +135,20 @@ async function verifyPair(database: Database) {
       hasCopy ? OLD.getTime() : undefined,
     );
   }
-  assert.deepEqual(await database.scanReceiptPayloads(null, syncCutoff, 10), []);
+  const firstReceiptPage = await database.scanReceiptPayloads(null, syncCutoff, 1);
+  assert.deepEqual(firstReceiptPage.candidates, []);
+  assert.ok(firstReceiptPage.nextCursor);
+  const nextReceiptPage = await database.scanReceiptPayloads(
+    firstReceiptPage.nextCursor,
+    syncCutoff,
+    1,
+  );
+  assert.deepEqual(nextReceiptPage.candidates, []);
+  assert.ok(nextReceiptPage.nextCursor && nextReceiptPage.nextCursor > firstReceiptPage.nextCursor);
+  assert.deepEqual(await database.scanReceiptPayloads(nextReceiptPage.nextCursor, syncCutoff, 1), {
+    candidates: [],
+    nextCursor: null,
+  });
   assert.deepEqual(await database.expireReceiptPayload(copy.id, syncCutoff, syncExpiry), {
     status: "skipped",
     disposition: "lifecycle_pending",

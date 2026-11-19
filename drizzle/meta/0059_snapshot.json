@@ -1,5 +1,5 @@
 {
-  "id": "6ab28f6f-918e-47c3-b4d2-b541df7defec",
+  "id": "d00eb171-2f9c-49f3-8f4f-c888e807766c",
   "prevId": "138fc3f6-4f90-43ff-889d-bd9a57e097bb",
   "version": "7",
   "dialect": "postgresql",
@@ -2268,6 +2268,22 @@
         }
       },
       "indexes": {
+        "github_installation_syncs_payload_unmarked_idx": {
+          "name": "github_installation_syncs_payload_unmarked_idx",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"github_installation_syncs\".\"kind\" = 'webhook' and \"github_installation_syncs\".\"payload_expired_at\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "github_installation_syncs_pending_idx": {
           "name": "github_installation_syncs_pending_idx",
           "columns": [
@@ -5431,6 +5447,53 @@
             }
           ],
           "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "provider_event_receipts_delivery_idx": {
+          "name": "provider_event_receipts_delivery_idx",
+          "columns": [
+            {
+              "expression": "delivery_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "provider_event_receipts_unmarked_idx": {
+          "name": "provider_event_receipts_unmarked_idx",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"provider_event_receipts\".\"payload_expiry_state\" is null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "provider_event_receipts_expiring_idx": {
+          "name": "provider_event_receipts_expiring_idx",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"provider_event_receipts\".\"payload_expiry_state\" = 'expiring'",
           "concurrently": false,
           "method": "btree",
           "with": {}

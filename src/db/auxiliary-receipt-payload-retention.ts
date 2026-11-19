@@ -19,14 +19,15 @@ type SyncRow = GitHubSyncPayloadEvidence & { hasAnyCopy: boolean } & Record<stri
 type CopyRow = SyncReceiptEvidence & { hasReferences: boolean } & Record<string, unknown>;
 type CursorRow = CursorDiagnosticEvidence & { source: string } & Record<string, unknown>;
 
-const SYNC_EVIDENCE = `
+const SYNC_COLUMNS = `
   sync.id, sync.provider_application_id as "providerApplicationId", sync.connection_id as "connectionId",
   sync.delivery_id as "deliveryId", sync.signature_hash as "signatureHash", sync.source,
   sync.retry_at as "retryAt", sync.received_at as "receivedAt", sync.settled_at as "settledAt",
-  sync.audit_link as "auditLink", sync.payload_expired_at as "payloadExpiredAt",
-  exists (select 1 from provider_event_receipts receipt
+  sync.audit_link as "auditLink", sync.payload_expired_at as "payloadExpiredAt"`;
+
+const SYNC_HAS_COPY = `exists (select 1 from provider_event_receipts receipt
      where receipt.signature_hash = sync.signature_hash
-       or (sync.audit_link->>'kind' = 'none' and receipt.delivery_id = sync.delivery_id)) as "hasAnyCopy"`;
+       or receipt.delivery_id = sync.delivery_id)`;
 
 async function readCopies(client: QueryHandle, ids: readonly string[]) {
   if (ids.length === 0) return new Map<string, CopyRow>();
@@ -52,21 +53,33 @@ export async function scanGitHubSyncPayloads(
   cutoff: Date,
   limit: number,
 ): Promise<SyncExpiryCandidate[]> {
-  const syncs = await client.query<SyncRow & { receiptCopyAgeFrom: Date | null }>(
-    `select ${SYNC_EVIDENCE},
+  const syncs = await client.query<
+    SyncRow & { receiptCopyAgeFrom: Date | null; needsProof: boolean | null }
+  >(
+    `with page as materialized (
+       select id, received_at < $3 and settled_at < $3 and retry_at is null as "needsProof"
+       from github_installation_syncs
+       where ($1::uuid is null or id > $1) and kind = 'webhook' and payload_expired_at is null
+       order by id limit $2
+     )
+     select ${SYNC_COLUMNS}, page."needsProof",
+        case when page."needsProof" and sync.audit_link->>'kind' = 'none'
+          then ${SYNC_HAS_COPY} else false end as "hasAnyCopy",
         (select receipt.received_at from provider_event_receipts receipt
          where receipt.signature_hash = sync.signature_hash and receipt.provider = 'github'
            and receipt.source in ('github.installation', 'github.installation_repositories')
            and receipt.dropped_reason = 'github_lifecycle' and receipt.payload_expiry_state is null
         ) as "receiptCopyAgeFrom"
-      from github_installation_syncs sync
-      where ($1::uuid is null or sync.id > $1) and sync.kind = 'webhook' and sync.payload_expired_at is null
-      order by sync.id limit $2`,
-    [after, limit],
+      from page
+      cross join lateral (
+        select * from github_installation_syncs where id = page.id limit 1
+      ) sync order by page.id`,
+    [after, limit, cutoff],
   );
   const copies = await readCopies(
     client,
     syncs.rows.flatMap((sync) => {
+      if (!sync.needsProof) return [];
       const link = readSyncAuditLink(sync.auditLink);
       return link?.kind === "receipt" ? [link.receiptId] : [];
     }),
@@ -108,7 +121,9 @@ export async function expireGitHubSyncPayload(
     }
     const sync = (
       await client.query<SyncRow>(
-        `select ${SYNC_EVIDENCE} from github_installation_syncs sync where id = $1`,
+        `select ${SYNC_COLUMNS},
+           case when sync.audit_link->>'kind' = 'none' then ${SYNC_HAS_COPY} else false end as "hasAnyCopy"
+         from github_installation_syncs sync where id = $1`,
         [id],
       )
     ).rows[0]!;

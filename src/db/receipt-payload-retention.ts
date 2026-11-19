@@ -2,31 +2,34 @@ import type { DatabaseRuntime, QueryHandle } from "./runtime/index.js";
 import { readFanoutRevisions, runPayloadWorkDisposition } from "./run-payload-retention.js";
 import { parsePinnedRoutes } from "../run-payload-retention/fanout.js";
 import {
+  isLifecycleReceipt,
   proveReceipt,
   type ReceiptProofBranch,
   type ReceiptProofEvidence,
 } from "../run-payload-retention/receipt-proof.js";
 import type {
-  ReceiptExpiryCandidate,
+  ReceiptExpiryPage,
   ReceiptExpiryResult,
 } from "../run-payload-retention/receipt-store.js";
 
-const RECEIPT_COLUMNS = `
+const receiptColumns = (needsProof = "true") => `
   receipt.id, receipt.organization_id as "organizationId", receipt.provider,
   receipt.connection_id as "connectionId", receipt.resource_id as "resourceId",
   receipt.delivery_id as "deliveryId", receipt.signature_hash as "signatureHash",
   receipt.provider_application_id as "providerApplicationId",
   receipt.provider_configuration_version as "providerConfigurationVersion",
-  receipt.source, receipt.repo, receipt.payload, receipt.received_at as "receivedAt",
-  receipt.dropped_reason as "droppedReason", receipt.accepted_routes as "acceptedRoutes",
+  receipt.source, receipt.repo, receipt.received_at as "receivedAt",
+  case when ${needsProof} then receipt.payload else '{}'::jsonb end as payload,
+  receipt.dropped_reason as "droppedReason",
+  case when ${needsProof} then receipt.accepted_routes end as "acceptedRoutes",
   receipt.payload_expiry_state as "payloadExpiryState", receipt.payload_expired_at as "payloadExpiredAt",
   receipt.pre_routing_drop as "preRoutingDrop", receipt.manual_replay_binding as "manualReplayBinding",
-  exists (select 1 from attachment_capabilities capability
-    where capability.provider_event_receipt_id = receipt.id) as "hasCapability",
+  case when ${needsProof} then exists (select 1 from attachment_capabilities capability
+    where capability.provider_event_receipt_id = receipt.id) else false end as "hasCapability",
   (receipt.provider = 'github' and exists (select 1 from github_installation_syncs sync
     where sync.retry_at is not null and (sync.delivery_id = receipt.delivery_id or sync.signature_hash = receipt.signature_hash)
   )) as "hasLifecycleWork",
-  (
+  case when ${needsProof} then (
     (receipt.provider = 'github' and exists (
       select 1 from github_connections connection
        where connection.id = receipt.connection_id and connection.organization_id = receipt.organization_id
@@ -36,7 +39,7 @@ const RECEIPT_COLUMNS = `
        where connection.id = receipt.connection_id and connection.organization_id = receipt.organization_id
          and (receipt.provider_application_id is null or connection.provider_application_id = receipt.provider_application_id)
     ))
-  ) as "legacyBindingValid"`;
+  ) else false end as "legacyBindingValid"`;
 
 const LIFECYCLE_RECEIPT_SQL = `receipt.provider = 'github'
   and receipt.source in ('github.installation', 'github.installation_repositories')
@@ -50,9 +53,17 @@ async function checkReceipts(
   cutoff: Date,
 ) {
   if (receipts.length === 0) return [];
-  const ids = receipts.map((receipt) => receipt.id);
+  const needingProof = receipts.filter(
+    (receipt) =>
+      (receipt.receivedAt < cutoff || receipt.payloadExpiryState === "expiring") &&
+      !isLifecycleReceipt(receipt) &&
+      !receipt.hasLifecycleWork,
+  );
+  if (needingProof.length === 0)
+    return receipts.map((receipt) => proveReceipt(receipt, [], () => undefined, cutoff));
+  const ids = needingProof.map((receipt) => receipt.id);
   const revisionIds = new Set(
-    receipts.flatMap((receipt) =>
+    needingProof.flatMap((receipt) =>
       (parsePinnedRoutes(receipt.acceptedRoutes) ?? []).map(
         (route) => route.configurationRevisionId,
       ),
@@ -91,25 +102,39 @@ export async function scanReceiptPayloads(
   cutoff: Date,
   limit: number,
   state: "intact" | "expiring" = "intact",
-): Promise<ReceiptExpiryCandidate[]> {
-  const receipts = await client.query<ProofRow>(
-    `select ${RECEIPT_COLUMNS}
-     from provider_event_receipts receipt
-     where ($1::uuid is null or receipt.id > $1)
-       and receipt.payload_expiry_state is not distinct from $3
-       and not ((${LIFECYCLE_RECEIPT_SQL}) and exists (
+): Promise<ReceiptExpiryPage> {
+  const markerPredicate =
+    state === "intact" ? "payload_expiry_state is null" : "payload_expiry_state = 'expiring'";
+  // Advance by the physical page even when all its receipts belong to the sync stage.
+  const receipts = await client.query<ProofRow & { syncOwned: boolean }>(
+    `with page as materialized (
+       select id, received_at < $3 or payload_expiry_state is not null as "needsProof"
+       from provider_event_receipts
+       where ($1::uuid is null or id > $1)
+         and ${markerPredicate}
+       order by id limit $2
+     )
+     select ${receiptColumns('page."needsProof"')},
+       ((${LIFECYCLE_RECEIPT_SQL}) and exists (
          select 1 from github_installation_syncs sync
           where sync.delivery_id = receipt.delivery_id or sync.signature_hash = receipt.signature_hash
-       ))
-     order by receipt.id limit $2`,
-    [after, limit, state === "intact" ? null : state],
+       )) as "syncOwned"
+     from page
+     cross join lateral (
+       select * from provider_event_receipts where id = page.id limit 1
+     ) receipt order by page.id`,
+    [after, limit, cutoff],
   );
-  const proofs = await checkReceipts(client, receipts.rows, cutoff);
-  return receipts.rows.map((receipt, index) => ({
-    id: receipt.id,
-    ageFrom: receipt.receivedAt,
-    disposition: proofs[index]!.disposition,
-  }));
+  const standalone = receipts.rows.filter((receipt) => !receipt.syncOwned);
+  const proofs = await checkReceipts(client, standalone, cutoff);
+  return {
+    candidates: standalone.map((receipt, index) => ({
+      id: receipt.id,
+      ageFrom: receipt.receivedAt,
+      disposition: proofs[index]!.disposition,
+    })),
+    nextCursor: receipts.rows.length === limit ? (receipts.rows.at(-1)?.id ?? null) : null,
+  };
 }
 
 export async function expireReceiptPayload(
@@ -136,7 +161,7 @@ export async function expireReceiptPayload(
       };
     }
     const receipts = await client.query<ProofRow>(
-      `select ${RECEIPT_COLUMNS} from provider_event_receipts receipt where receipt.id = $1`,
+      `select ${receiptColumns()} from provider_event_receipts receipt where receipt.id = $1`,
       [id],
     );
     const [proof] = await checkReceipts(client, receipts.rows, cutoff);

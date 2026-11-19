@@ -6,6 +6,10 @@ ALTER TABLE "provider_event_receipts" ADD COLUMN "payload_expiry_state" text;-->
 ALTER TABLE "provider_event_receipts" ADD COLUMN "payload_expired_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "provider_event_receipts" ADD COLUMN "pre_routing_drop" text;--> statement-breakpoint
 ALTER TABLE "provider_event_receipts" ADD COLUMN "manual_replay_binding" jsonb;--> statement-breakpoint
+CREATE INDEX "github_installation_syncs_payload_unmarked_idx" ON "github_installation_syncs" USING btree ("id") WHERE "github_installation_syncs"."kind" = 'webhook' and "github_installation_syncs"."payload_expired_at" is null;--> statement-breakpoint
+CREATE INDEX "provider_event_receipts_delivery_idx" ON "provider_event_receipts" USING btree ("delivery_id");--> statement-breakpoint
+CREATE INDEX "provider_event_receipts_unmarked_idx" ON "provider_event_receipts" USING btree ("id") WHERE "provider_event_receipts"."payload_expiry_state" is null;--> statement-breakpoint
+CREATE INDEX "provider_event_receipts_expiring_idx" ON "provider_event_receipts" USING btree ("id") WHERE "provider_event_receipts"."payload_expiry_state" = 'expiring';--> statement-breakpoint
 ALTER TABLE "github_installation_syncs" ADD CONSTRAINT "github_installation_syncs_settlement_check" CHECK (("github_installation_syncs"."settled_at" is null and "github_installation_syncs"."audit_link" is null and "github_installation_syncs"."payload_expired_at" is null)
         or ("github_installation_syncs"."kind" = 'webhook' and "github_installation_syncs"."settled_at" is not null
             and "github_installation_syncs"."retry_at" is null and "github_installation_syncs"."audit_link" is not null));--> statement-breakpoint

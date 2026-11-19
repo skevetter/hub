@@ -10,7 +10,7 @@ import { reportFailure } from "../../failures/index.js";
 /** A receipt and its pending job are accepted together before acknowledging GitHub. */
 export function createGitHubLifecycle(
   database: Database,
-  client: GitHubConnectionClient,
+  client: Pick<GitHubConnectionClient, "getInstallation">,
   repositories: Pick<GitHubConfigurationProvider, "listInstallationRepositories">,
   owner: GitHubInstallationSyncOwner,
 ) {
@@ -21,8 +21,10 @@ export function createGitHubLifecycle(
     for (;;) {
       const pending = await database.pendingGitHubInstallationSyncs(owner);
       if (pending.length === 0) return;
-      for (const claim of pending) {
-        await database.synchronizeGitHubInstallation(claim.installationId, async () => {
+      for (const selected of pending) {
+        await database.synchronizeGitHubInstallation(selected.installationId, async () => {
+          const [claim] = await database.pendingGitHubInstallationSyncs(owner, selected);
+          if (claim === undefined) return;
           try {
             const evidence = await client.getInstallation(claim.installationId);
             if (evidence.status === "absent") {

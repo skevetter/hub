@@ -418,7 +418,10 @@ export class ProviderEventAcceptanceRepository {
     });
   }
 
-  async pendingGitHubInstallationSyncs(owner: GitHubInstallationSyncOwner) {
+  async pendingGitHubInstallationSyncs(
+    owner: GitHubInstallationSyncOwner,
+    selected?: Extract<GitHubInstallationSyncClaim, { status: "claimed" }>,
+  ) {
     if (!(await githubSyncOwnerActive(this.database, owner))) return [];
     const rows = await this.database
       .select({
@@ -434,6 +437,12 @@ export class ProviderEventAcceptanceRepository {
       )
       .where(
         and(
+          selected === undefined
+            ? undefined
+            : and(
+                eq(schema.githubInstallationSyncs.id, selected.installationSyncId),
+                eq(schema.githubInstallationSyncs.installationId, selected.installationId),
+              ),
           lte(schema.githubInstallationSyncs.retryAt, new Date()),
           isNull(schema.githubInstallationSyncs.payloadExpiredAt),
           or(

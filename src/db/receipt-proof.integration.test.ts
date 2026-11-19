@@ -86,8 +86,8 @@ async function verifyMatrix(database: Database, runtime?: QueryHandle, sweep = f
   let after: string | null = null;
   do {
     const page = await database.scanReceiptPayloads(after, CUTOFF, 5);
-    candidates.push(...page);
-    after = page.at(-1)?.id ?? null;
+    candidates.push(...page.candidates);
+    after = page.nextCursor;
   } while (after !== null);
   assert.equal(candidates.length, cases.length);
   if (sweep) {
@@ -119,7 +119,10 @@ async function verifyMatrix(database: Database, runtime?: QueryHandle, sweep = f
     if (!sweep) await verifyApplied(database, fixture);
     await verifyRetainedIdentity(database, fixture);
   }
-  assert.deepEqual(await database.scanReceiptPayloads(null, CUTOFF, 5, "expiring"), []);
+  assert.deepEqual(await database.scanReceiptPayloads(null, CUTOFF, 5, "expiring"), {
+    candidates: [],
+    nextCursor: null,
+  });
   return cases;
 }
 

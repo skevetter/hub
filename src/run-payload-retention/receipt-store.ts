@@ -20,6 +20,11 @@ export interface ReceiptExpiryCandidate {
   disposition: ReceiptDisposition;
 }
 
+export interface ReceiptExpiryPage {
+  candidates: ReceiptExpiryCandidate[];
+  nextCursor: string | null;
+}
+
 export interface SyncExpiryCandidate {
   id: string;
   ageFrom: Date;
@@ -62,7 +67,7 @@ export interface ReceiptPayloadStore {
     cutoff: Date,
     limit: number,
     state?: "intact" | "expiring",
-  ): Promise<ReceiptExpiryCandidate[]>;
+  ): Promise<ReceiptExpiryPage>;
   expireReceiptPayload(id: string, cutoff: Date, now: Date): Promise<ReceiptExpiryResult>;
   scanGitHubSyncPayloads(
     after: string | null,

@@ -92,6 +92,13 @@ export const providerEventReceipts = pgTable(
       table.organizationId,
       table.deliveryId,
     ),
+    index("provider_event_receipts_delivery_idx").on(table.deliveryId),
+    index("provider_event_receipts_unmarked_idx")
+      .on(table.id)
+      .where(sql`${table.payloadExpiryState} is null`),
+    index("provider_event_receipts_expiring_idx")
+      .on(table.id)
+      .where(sql`${table.payloadExpiryState} = 'expiring'`),
     uniqueIndex("provider_event_receipts_signature_unique")
       .on(table.signatureHash)
       .where(sql`${table.signatureHash} is not null`),
@@ -1212,6 +1219,9 @@ export const githubInstallationSyncs = pgTable(
     payloadExpiredAt: timestamp("payload_expired_at", { withTimezone: true }),
   },
   (table) => [
+    index("github_installation_syncs_payload_unmarked_idx")
+      .on(table.id)
+      .where(sql`${table.kind} = 'webhook' and ${table.payloadExpiredAt} is null`),
     index("github_installation_syncs_pending_idx")
       .on(table.retryAt)
       .where(sql`${table.retryAt} is not null`),

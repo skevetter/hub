@@ -62,6 +62,18 @@ type SweepCandidate =
   | (SyncExpiryCandidate & { kind: "installationSync" })
   | (Omit<CursorDiagnosticCandidate, "source"> & { id: string; kind: "cursorDiagnostic" });
 
+interface SweepPage {
+  candidates: SweepCandidate[];
+  nextCursor: string | null;
+}
+
+function sweepPage(candidates: SweepCandidate[], limit: number): SweepPage {
+  return {
+    candidates,
+    nextCursor: candidates.length === limit ? (candidates.at(-1)?.id ?? null) : null,
+  };
+}
+
 function auxiliaryCounts(): Record<
   AuxiliaryPayloadKind,
   DispositionCounts<AuxiliaryPayloadDisposition>
@@ -163,7 +175,7 @@ export class RunPayloadRetention {
     for (let stage = this.stages[0]; stage !== undefined; stage = this.stages[0]) {
       if (shouldStop()) return report(false);
       const page = await this.scanStage(stage, cutoff, limit, countOnly);
-      for (const candidate of page) {
+      for (const candidate of page.candidates) {
         if (shouldStop()) return report(false);
         if (!(await this.processCandidate(candidate, cutoff, now, this.now))) return report(false);
         this.cursor = candidate.id;
@@ -183,7 +195,10 @@ export class RunPayloadRetention {
       }
       const stageCapped =
         stage === "credentials" && this.credentialFactsBackfilled >= this.settings.maxRunsPerPass;
-      if (page.length >= limit && !stageCapped) return report(false);
+      if (page.nextCursor !== null && !stageCapped) {
+        this.cursor = page.nextCursor;
+        return report(false);
+      }
       this.cursor = null;
       if (!this.beginIntactReceiptScan(stage)) this.stages.shift();
     }
@@ -201,19 +216,25 @@ export class RunPayloadRetention {
     cutoff: Date,
     limit: number,
     countOnly: boolean,
-  ): Promise<SweepCandidate[]> {
+  ): Promise<SweepPage> {
     if (stage === "credentials") {
       const page = await this.store.scanUnknownTemporaryCredentials(this.cursor, limit);
-      return page.map((id) => ({ id, kind: stage }));
+      return sweepPage(
+        page.map((id) => ({ id, kind: stage })),
+        limit,
+      );
     }
     if (stage === "run") {
       const page = await this.store.scanRunPayloads(this.cursor, cutoff, limit, countOnly);
-      return page.map(({ id, disposition, ageFrom }) => ({
-        id,
-        disposition,
-        ageFrom,
-        kind: stage,
-      }));
+      return sweepPage(
+        page.map(({ id, disposition, ageFrom }) => ({
+          id,
+          disposition,
+          ageFrom,
+          kind: stage,
+        })),
+        limit,
+      );
     }
     if (stage === "receipt") {
       const page = await this.store.scanReceiptPayloads(
@@ -222,34 +243,46 @@ export class RunPayloadRetention {
         limit,
         this.receiptState,
       );
-      return page.map(({ id, disposition, ageFrom }) => ({
-        id,
-        disposition,
-        ageFrom,
-        kind: stage,
-      }));
+      return {
+        candidates: page.candidates.map(({ id, disposition, ageFrom }) => ({
+          id,
+          disposition,
+          ageFrom,
+          kind: stage,
+        })),
+        nextCursor: page.nextCursor,
+      };
     }
     if (stage === "installationSync") {
       const page = await this.store.scanGitHubSyncPayloads(this.cursor, cutoff, limit);
-      return page.map(({ id, disposition, ageFrom, receiptCopyAgeFrom }) => ({
-        id,
-        disposition,
-        ageFrom,
-        receiptCopyAgeFrom,
-        kind: stage,
-      }));
+      return sweepPage(
+        page.map(({ id, disposition, ageFrom, receiptCopyAgeFrom }) => ({
+          id,
+          disposition,
+          ageFrom,
+          receiptCopyAgeFrom,
+          kind: stage,
+        })),
+        limit,
+      );
     }
     if (stage === "cursorDiagnostic") {
       const page = await this.store.scanGitHubCursorDiagnostics(this.cursor, cutoff, limit);
-      return page.map(({ source, disposition, ageFrom }) => ({
-        id: source,
-        disposition,
-        ageFrom,
-        kind: stage,
-      }));
+      return sweepPage(
+        page.map(({ source, disposition, ageFrom }) => ({
+          id: source,
+          disposition,
+          ageFrom,
+          kind: stage,
+        })),
+        limit,
+      );
     }
     const page = await this.store.scanAuxiliaryPayloads(stage, this.cursor, cutoff, limit);
-    return page.map(({ id, disposition, ageFrom }) => ({ id, disposition, ageFrom, kind: stage }));
+    return sweepPage(
+      page.map(({ id, disposition, ageFrom }) => ({ id, disposition, ageFrom, kind: stage })),
+      limit,
+    );
   }
 
   private async processCandidate(

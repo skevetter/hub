@@ -441,28 +441,37 @@ class MemoryDatabase implements Database {
     cutoff,
     limit,
     state = "intact",
-  ) =>
-    [...this.providerEventReceipts.values()]
+  ) => {
+    const page = [...this.providerEventReceipts.values()]
       .filter(
         (receipt) =>
           (after === null || receipt.id > after) &&
           (state === "intact"
             ? receipt.payloadExpiryState == null
-            : receipt.payloadExpiryState === state) &&
-          (!isLifecycleReceipt(receipt) ||
-            ![...this.githubInstallationSyncs.values()].some(
-              (sync) =>
-                sync.deliveryId === receipt.deliveryId ||
-                sync.signatureHash === receipt.signatureHash,
-            )),
+            : receipt.payloadExpiryState === state),
       )
       .sort((left, right) => left.id.localeCompare(right.id))
-      .slice(0, limit)
+      .slice(0, limit);
+    const candidates = page
+      .filter(
+        (receipt) =>
+          !isLifecycleReceipt(receipt) ||
+          ![...this.githubInstallationSyncs.values()].some(
+            (sync) =>
+              sync.deliveryId === receipt.deliveryId ||
+              sync.signatureHash === receipt.signatureHash,
+          ),
+      )
       .map((receipt) => ({
         id: receipt.id,
         ageFrom: receipt.receivedAt,
         disposition: this.receiptProof(receipt, cutoff).disposition,
       }));
+    return {
+      candidates,
+      nextCursor: page.length === limit ? (page.at(-1)?.id ?? null) : null,
+    };
+  };
 
   expireReceiptPayload: Database["expireReceiptPayload"] = async (id, cutoff, now) => {
     const receipt = this.providerEventReceipts.get(id);
@@ -2816,25 +2825,36 @@ class MemoryDatabase implements Database {
     }
   }
 
-  pendingGitHubInstallationSyncs(owner: GitHubInstallationSyncOwner) {
-    if (!this.githubSyncOwnerActive(owner)) return Promise.resolve([]);
-    return Promise.resolve(
-      [...this.githubInstallationSyncs.entries()]
-        .filter(
-          ([, receipt]) =>
-            receipt.providerApplicationId === owner.providerApplicationId &&
-            receipt.retryAt !== null &&
-            receipt.retryAt <= new Date() &&
-            (receipt.connectionId !== null || this.githubConnections.has(receipt.installationId)),
-        )
-        .map(([id, receipt]) => ({
-          status: "claimed" as const,
-          installationSyncId: id,
-          installationId: receipt.installationId,
-          removeBinding: receipt.source === "github.installation",
-        })),
-    );
-  }
+  pendingGitHubInstallationSyncs: Database["pendingGitHubInstallationSyncs"] = async (
+    owner,
+    selected,
+  ) => {
+    if (!this.githubSyncOwnerActive(owner)) return [];
+    const receipts =
+      selected === undefined
+        ? [...this.githubInstallationSyncs.values()]
+        : [this.githubInstallationSyncs.get(selected.installationSyncId)];
+    const now = new Date();
+    return receipts
+      .filter(
+        (receipt): receipt is MemoryGitHubSync =>
+          receipt !== undefined &&
+          (selected === undefined || receipt.installationId === selected.installationId) &&
+          receipt.providerApplicationId === owner.providerApplicationId &&
+          receipt.payloadExpiredAt === null &&
+          receipt.retryAt !== null &&
+          receipt.retryAt <= now &&
+          (receipt.connectionId !== null ||
+            this.githubConnections.get(receipt.installationId)?.providerApplicationId ===
+              owner.providerApplicationId),
+      )
+      .map((receipt) => ({
+        status: "claimed" as const,
+        installationSyncId: receipt.id,
+        installationId: receipt.installationId,
+        removeBinding: receipt.source === "github.installation",
+      }));
+  };
 
   async claimGitHubLifecycleReceipt(
     input: GitHubLifecycleReceiptClaimInput,

@@ -1480,6 +1480,7 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
   synchronizeGitHubInstallation<T>(installationId: number, operation: () => Promise<T>): Promise<T>;
   pendingGitHubInstallationSyncs(
     owner: GitHubInstallationSyncOwner,
+    selected?: Extract<GitHubInstallationSyncClaim, { status: "claimed" }>,
   ): Promise<
     Array<Extract<GitHubInstallationSyncClaim, { status: "claimed" }> & { removeBinding: boolean }>
   >;

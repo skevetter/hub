@@ -209,8 +209,8 @@ it("paces receipt pages, repeats hourly and starts no scans in off mode", async 
     .spyOn(database, "scanReceiptPayloads")
     .mockImplementation(async (after, _cutoff, _limit, state) =>
       after === null && state === "intact"
-        ? [{ id: "pending", ageFrom: OLD, disposition: "pending_admission" }]
-        : [],
+        ? { candidates: [], nextCursor: "lifecycle-copy" }
+        : { candidates: [], nextCursor: null },
     );
   const info = vi.spyOn(logger, "info").mockImplementation(() => undefined);
   const settings = { retentionDays: 30, maxRunsPerPass: 1 };
