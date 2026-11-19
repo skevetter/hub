@@ -1,4 +1,5 @@
 import type { RunPayloadRetentionStore } from "../run-payload-retention/store.js";
+import type { ReceiptPayloadStore } from "../run-payload-retention/receipt-store.js";
 import type {
   PayloadCompletion,
   RunPayloadSummary,
@@ -1290,7 +1291,7 @@ export interface TerminateMachineFields {
   reason: string;
 }
 
-export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
+export interface Database extends RunTimelineStore, RunPayloadRetentionStore, ReceiptPayloadStore {
   readonly executionAuthority: import("../execution-authority/index.js").ExecutionAuthorityStore;
   readonly schedules: import("../triggers/schedule/index.js").ScheduleStore;
   readonly githubNotifications: import("../triggers/github-notifications/index.js").GitHubNotificationStore;

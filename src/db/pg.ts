@@ -1,3 +1,10 @@
+import { expireReceiptPayload, scanReceiptPayloads } from "./receipt-payload-retention.js";
+import {
+  expireGitHubSyncPayload,
+  scanGitHubSyncPayloads,
+  expireGitHubCursorDiagnostic,
+  scanGitHubCursorDiagnostics,
+} from "./auxiliary-receipt-payload-retention.js";
 import {
   PENDING_SCRIPT_CLEANUP_SQL,
   type RunPayloadDisposition,
@@ -325,6 +332,19 @@ class PgDatabase implements Database {
     expireLaunchIntent(this.pool, id, cutoff, now);
   reduceSessionOptions: Database["reduceSessionOptions"] = (id, cutoff, now) =>
     reduceSessionOptions(this.pool, this.locks, id, cutoff, now);
+
+  scanReceiptPayloads: Database["scanReceiptPayloads"] = (after, cutoff, limit, state) =>
+    scanReceiptPayloads(this.pool, after, cutoff, limit, state);
+  expireReceiptPayload: Database["expireReceiptPayload"] = (id, cutoff, now) =>
+    expireReceiptPayload(this.pool, id, cutoff, now);
+  scanGitHubSyncPayloads: Database["scanGitHubSyncPayloads"] = (after, cutoff, limit) =>
+    scanGitHubSyncPayloads(this.pool, after, cutoff, limit);
+  expireGitHubSyncPayload: Database["expireGitHubSyncPayload"] = (id, cutoff, now) =>
+    expireGitHubSyncPayload(this.pool, id, cutoff, now);
+  scanGitHubCursorDiagnostics: Database["scanGitHubCursorDiagnostics"] = (after, cutoff, limit) =>
+    scanGitHubCursorDiagnostics(this.pool, after, cutoff, limit);
+  expireGitHubCursorDiagnostic: Database["expireGitHubCursorDiagnostic"] = (source, cutoff, now) =>
+    expireGitHubCursorDiagnostic(this.pool, source, cutoff, now);
 
   scanRunPayloads: Database["scanRunPayloads"] = (after, cutoff, limit, countOnly) =>
     scanRunPayloads(this.pool, after, cutoff, limit, countOnly);

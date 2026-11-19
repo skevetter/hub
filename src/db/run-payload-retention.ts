@@ -36,16 +36,7 @@ async function loadReceiptFanout(database: QueryHandle, receiptIds: readonly str
     for (const route of readPinnedRoutes(receipt) ?? [])
       revisionIds.add(route.configurationRevisionId);
   }
-  const revisions = new Map<string, FanoutRevision>();
-  if (revisionIds.size > 0) {
-    const found = await database.query<FanoutRevision & { id: string } & Record<string, unknown>>(
-      `select id, project_id as "projectId", organization_id as "organizationId",
-         normalized_configuration as "normalizedConfiguration"
-       from project_configuration_revisions where id = any($1::uuid[])`,
-      [[...revisionIds]],
-    );
-    for (const revision of found.rows) revisions.set(revision.id, revision);
-  }
+  const revisions = await readFanoutRevisions(database, [...revisionIds]);
   for (const receipt of receipts.rows) {
     proofs.set(receipt.id, {
       receiptId: receipt.id,
@@ -54,6 +45,17 @@ async function loadReceiptFanout(database: QueryHandle, receiptIds: readonly str
     });
   }
   return proofs;
+}
+
+export async function readFanoutRevisions(database: QueryHandle, ids: readonly string[]) {
+  if (ids.length === 0) return new Map<string, FanoutRevision>();
+  const found = await database.query<FanoutRevision & { id: string } & Record<string, unknown>>(
+    `select id, project_id as "projectId", organization_id as "organizationId",
+        normalized_configuration as "normalizedConfiguration", source_evidence as "sourceEvidence"
+     from project_configuration_revisions where id = any($1::uuid[])`,
+    [ids],
+  );
+  return new Map(found.rows.map((revision) => [revision.id, revision]));
 }
 
 async function loadAdmittedBranches(database: QueryHandle, receiptIds: readonly string[]) {
@@ -99,6 +101,12 @@ export const RUN_PAYLOAD_DISPOSITION_SQL = `case
   when run.status = 'running' then 'live'
   when run.completed_at is null then 'missing_completion'
   when run.completed_at >= $2 and run.payload_expiry_state is distinct from 'expiring' then 'not_old_enough'
+  else (${runPayloadWorkDisposition()})
+end`;
+
+export function runPayloadWorkDisposition() {
+  return `case
+  when run.status = 'running' then 'live'
   when exists (select 1 from workflow_step_runs step where step.trigger_run_id = run.id and (${SCRIPT_CLEANUP_SQL}))
     then 'cleanup_blocked'
   when exists (select 1 from workflow_wakeups wakeup where wakeup.trigger_run_id = run.id)
@@ -122,6 +130,7 @@ export const RUN_PAYLOAD_DISPOSITION_SQL = `case
     then 'reporter_pending'
   else 'eligible'
 end`;
+}
 
 export function runExecutions(run: string, projection: string) {
   return `

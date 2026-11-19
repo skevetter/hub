@@ -72,14 +72,14 @@ export class GitHubNotificationRepository implements GitHubNotificationStore {
   /** The cursor row exists after the first poll, so a call before that updates nothing. */
   async recordSuccess(now: Date): Promise<void> {
     await this.runtime.query(
-      "update github_notification_cursors set last_success_at = $2, last_error = null where source = $1",
+      "update github_notification_cursors set last_success_at = $2, last_error = null, diagnostic_expired_at = null where source = $1",
       [SOURCE, now],
     );
   }
 
   async recordFailure(now: Date, message: string): Promise<void> {
     await this.runtime.query(
-      "update github_notification_cursors set last_error = $2, last_error_at = $3 where source = $1",
+      "update github_notification_cursors set last_error = $2, last_error_at = $3, diagnostic_expired_at = null where source = $1",
       [SOURCE, message, now],
     );
   }

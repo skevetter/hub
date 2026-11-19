@@ -1,3 +1,17 @@
+import {
+  EXPIRED_CURSOR_DIAGNOSTIC,
+  cursorDiagnosticDisposition,
+  isExactSyncReceipt,
+  readSyncAuditLink,
+  syncPayloadDisposition,
+  type GitHubSyncPayloadEvidence,
+} from "../run-payload-retention/auxiliary-receipt-proof.js";
+import {
+  isLifecycleReceipt,
+  proveReceipt,
+  type ReceiptProofBranch,
+} from "../run-payload-retention/receipt-proof.js";
+import type { GitHubSyncAuditLink } from "./schema.js";
 import { temporaryCredentialFact } from "../agent-sessions/credentials.js";
 import { sessionLock } from "../agent-sessions/index.js";
 import type { AgentSessionRecord } from "../agent-sessions/types.js";
@@ -184,6 +198,8 @@ export interface MemoryDatabaseOptions {
   }[];
   now?: () => Date;
   slackConnections?: readonly SlackConnectionRecord[];
+  githubConnections?: readonly GitHubConnectionRecord[];
+  githubSyncOwner?: GitHubInstallationSyncOwner;
 }
 
 function usageKey(organizationId: string, meter: string, periodStart: Date): string {
@@ -420,6 +436,204 @@ class MemoryDatabase implements Database {
     );
   }
 
+  scanReceiptPayloads: Database["scanReceiptPayloads"] = async (
+    after,
+    cutoff,
+    limit,
+    state = "intact",
+  ) =>
+    [...this.providerEventReceipts.values()]
+      .filter(
+        (receipt) =>
+          (after === null || receipt.id > after) &&
+          (state === "intact"
+            ? receipt.payloadExpiryState == null
+            : receipt.payloadExpiryState === state) &&
+          (!isLifecycleReceipt(receipt) ||
+            ![...this.githubInstallationSyncs.values()].some(
+              (sync) =>
+                sync.deliveryId === receipt.deliveryId ||
+                sync.signatureHash === receipt.signatureHash,
+            )),
+      )
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .slice(0, limit)
+      .map((receipt) => ({
+        id: receipt.id,
+        ageFrom: receipt.receivedAt,
+        disposition: this.receiptProof(receipt, cutoff).disposition,
+      }));
+
+  expireReceiptPayload: Database["expireReceiptPayload"] = async (id, cutoff, now) => {
+    const receipt = this.providerEventReceipts.get(id);
+    if (receipt === undefined || receipt.payloadExpiryState === "expired")
+      return { status: "skipped", disposition: "locked_or_missing" };
+    const proof = this.receiptProof(receipt, cutoff);
+    if (proof.disposition !== "eligible" && proof.disposition !== "expiring")
+      return { status: "skipped", disposition: proof.disposition };
+    this.providerEventReceipts.set(id, {
+      ...receipt,
+      payload: {},
+      acceptedRoutes: null,
+      preRoutingDrop: null,
+      manualReplayBinding:
+        proof.disposition === "eligible" ? proof.binding : (receipt.manualReplayBinding ?? null),
+      payloadExpiryState: "expired",
+      payloadExpiredAt: receipt.payloadExpiredAt ?? new Date(now),
+    });
+    return { status: "expired" };
+  };
+
+  private receiptProof(receipt: ProviderEventReceiptRecord, cutoff: Date) {
+    const branches: ReceiptProofBranch[] = [];
+    for (const project of this.triggerRunIdsByProviderEventReceipt.get(receipt.id)?.values() ??
+      []) {
+      for (const id of project.values()) {
+        const run = this.triggerRuns.get(id);
+        if (run === undefined) continue;
+        const work = this.runPayloadWorkDisposition(run);
+        const blocker = work === "live" || work === "cleanup_blocked" ? "live_execution" : work;
+        branches.push({
+          ...run,
+          payloadExpiryState: run.payloadExpiryState ?? null,
+          payloadExpiredAt: run.payloadExpiredAt ?? null,
+          blocker: blocker === "eligible" ? null : blocker,
+        });
+      }
+    }
+    const connections =
+      receipt.provider === "github"
+        ? this.githubConnections.values()
+        : this.linearConnections.values();
+    const legacyBindingValid =
+      (receipt.provider === "github" || receipt.provider === "linear") &&
+      [...connections].some(
+        (connection) =>
+          connection.id === receipt.connectionId &&
+          connection.organizationId === receipt.organizationId &&
+          (receipt.providerApplicationId === null ||
+            connection.providerApplicationId === receipt.providerApplicationId),
+      );
+    return proveReceipt(
+      {
+        ...receipt,
+        legacyBindingValid,
+        hasCapability: [...this.attachments.values()].some(
+          (cap) => cap.providerEventReceiptId === receipt.id,
+        ),
+        hasLifecycleWork:
+          receipt.provider === "github" &&
+          [...this.githubInstallationSyncs.values()].some(
+            (sync) =>
+              sync.retryAt !== null &&
+              (sync.deliveryId === receipt.deliveryId ||
+                sync.signatureHash === receipt.signatureHash),
+          ),
+      },
+      branches,
+      (id) => this.configurationRevisions.get(id),
+      cutoff,
+    );
+  }
+
+  scanGitHubSyncPayloads: Database["scanGitHubSyncPayloads"] = async (after, cutoff, limit) =>
+    [...this.githubInstallationSyncs.values()]
+      .filter((sync) => sync.payloadExpiredAt === null && (after === null || sync.id > after))
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .slice(0, limit)
+      .map((sync) => ({
+        id: sync.id,
+        ageFrom: sync.settledAt ?? sync.receivedAt,
+        disposition: this.syncDisposition(sync, cutoff),
+        receiptCopy: this.hasAnySyncCopy(sync, readSyncAuditLink(sync.auditLink)?.kind === "none"),
+      }));
+
+  expireGitHubSyncPayload: Database["expireGitHubSyncPayload"] = async (id, cutoff, now) => {
+    const sync = this.githubInstallationSyncs.get(id);
+    if (sync === undefined || sync.payloadExpiredAt !== null)
+      return { status: "skipped", disposition: "locked_or_missing" };
+    const disposition = this.syncDisposition(sync, cutoff);
+    if (disposition !== "eligible") return { status: "skipped", disposition };
+    const link = readSyncAuditLink(sync.auditLink);
+    const copy =
+      link?.kind === "receipt" ? this.providerEventReceipts.get(link.receiptId) : undefined;
+    if (copy !== undefined) {
+      this.providerEventReceipts.set(copy.id, {
+        ...copy,
+        payload: {},
+        acceptedRoutes: null,
+        preRoutingDrop: null,
+        manualReplayBinding: null,
+        payloadExpiryState: "expired",
+        payloadExpiredAt: new Date(now),
+      });
+    }
+    this.githubInstallationSyncs.set(id, { ...sync, payload: {}, payloadExpiredAt: new Date(now) });
+    return { status: "expired", receiptCopy: copy !== undefined };
+  };
+
+  private hasAnySyncCopy(
+    sync: Pick<GitHubLifecycleReceiptClaimInput, "deliveryId" | "signatureHash">,
+    checkDelivery: boolean,
+  ) {
+    return [...this.providerEventReceipts.values()].some(
+      (receipt) =>
+        receipt.signatureHash === sync.signatureHash ||
+        (checkDelivery && receipt.deliveryId === sync.deliveryId),
+    );
+  }
+
+  private syncDisposition(sync: MemoryGitHubSync, cutoff: Date) {
+    const link = readSyncAuditLink(sync.auditLink);
+    const copy =
+      link?.kind === "receipt" ? this.providerEventReceipts.get(link.receiptId) : undefined;
+    return syncPayloadDisposition(
+      sync,
+      copy === undefined
+        ? undefined
+        : {
+            ...copy,
+            hasReferences:
+              this.triggerRunIdsByProviderEventReceipt.has(copy.id) ||
+              [...this.attachments.values()].some((cap) => cap.providerEventReceiptId === copy.id),
+          },
+      this.hasAnySyncCopy(sync, link?.kind === "none"),
+      cutoff,
+    );
+  }
+
+  scanGitHubCursorDiagnostics: Database["scanGitHubCursorDiagnostics"] = async (
+    after,
+    cutoff,
+    limit,
+  ) => {
+    const status = this.notificationStatus;
+    return limit === 0 || (after !== null && after >= "notifications") || status.lastError === null
+      ? []
+      : [
+          {
+            source: "notifications",
+            ageFrom: status.lastErrorAt,
+            disposition: cursorDiagnosticDisposition(status, cutoff),
+          },
+        ];
+  };
+
+  expireGitHubCursorDiagnostic: Database["expireGitHubCursorDiagnostic"] = async (
+    source,
+    cutoff,
+    now,
+  ) => {
+    const status = this.notificationStatus;
+    if (source !== "notifications" || status.lastError === null)
+      return { status: "skipped", disposition: "locked_or_missing" };
+    const disposition = cursorDiagnosticDisposition(status, cutoff);
+    if (disposition !== "eligible") return { status: "skipped", disposition };
+    status.lastError = EXPIRED_CURSOR_DIAGNOSTIC;
+    status.diagnosticExpiredAt = new Date(now);
+    return { status: "expired" };
+  };
+
   async scanRunPayloads(after: string | null, cutoff: Date, limit: number, countOnly: boolean) {
     return [...this.triggerRuns.values()]
       .filter(
@@ -531,6 +745,15 @@ class MemoryDatabase implements Database {
     if (run.status === "running") return "live";
     if (run.completedAt === null) return "missing_completion";
     if (run.completedAt >= cutoff && run.payloadExpiryState !== "expiring") return "not_old_enough";
+    const work = this.runPayloadWorkDisposition(run);
+    if (work !== "eligible") return work;
+    return this.hasUnresolvedRunFanout(run.providerEventReceiptId)
+      ? "fan_out_unresolved"
+      : "eligible";
+  }
+
+  private runPayloadWorkDisposition(run: TriggerRunRecord) {
+    if (run.status === "running") return "live";
     const steps = this.listSteps(run.id);
     if (
       steps.some(
@@ -558,9 +781,7 @@ class MemoryDatabase implements Database {
       return "notification_pending";
     const message = this.runProgressMessages.get(run.id);
     if (message !== undefined && isProgressUnsettled(message)) return "reporter_pending";
-    return this.hasUnresolvedRunFanout(run.providerEventReceiptId)
-      ? "fan_out_unresolved"
-      : "eligible";
+    return "eligible";
   }
 
   private hasUnresolvedRunFanout(receiptId: string): boolean {
@@ -610,21 +831,25 @@ class MemoryDatabase implements Database {
     this.notificationStore ??= this.options.githubNotifications ?? this.memoryNotificationStore();
     return this.notificationStore;
   }
+  private readonly notificationStatus = {
+    lastSuccessAt: null,
+    lastError: null,
+    lastErrorAt: null,
+    nextPollAt: null,
+    diagnosticExpiredAt: null,
+  } as {
+    lastSuccessAt: Date | null;
+    lastError: string | null;
+    lastErrorAt: Date | null;
+    nextPollAt: Date | null;
+    diagnosticExpiredAt: Date | null;
+  };
+
   private notificationStore:
     | import("../triggers/github-notifications/index.js").GitHubNotificationStore
     | undefined;
   private memoryNotificationStore(): import("../triggers/github-notifications/index.js").GitHubNotificationStore {
-    const status = {
-      lastSuccessAt: null,
-      lastError: null,
-      lastErrorAt: null,
-      nextPollAt: null,
-    } as {
-      lastSuccessAt: Date | null;
-      lastError: string | null;
-      lastErrorAt: Date | null;
-      nextPollAt: Date | null;
-    };
+    const status = this.notificationStatus;
     return {
       exclusive: (operation) => operation(),
       async readCursor() {
@@ -639,13 +864,16 @@ class MemoryDatabase implements Database {
       async recordSuccess(now) {
         status.lastSuccessAt = now;
         status.lastError = null;
+        status.diagnosticExpiredAt = null;
       },
       async recordFailure(now, message) {
         status.lastError = message;
         status.lastErrorAt = now;
+        status.diagnosticExpiredAt = null;
       },
       async readStatus() {
-        return { ...status };
+        const { lastSuccessAt, lastError, lastErrorAt, nextPollAt } = status;
+        return { lastSuccessAt, lastError, lastErrorAt, nextPollAt };
       },
       countDelivered: async (organizationId, since) =>
         [...this.providerEventReceipts.values()].filter(
@@ -718,6 +946,8 @@ class MemoryDatabase implements Database {
 
   constructor(private readonly options: MemoryDatabaseOptions = {}) {
     this.organizationIds = new Set(options.organizationIds);
+    for (const connection of options.githubConnections ?? [])
+      this.githubConnections.set(connection.installationId, connection);
     for (const connection of options.slackConnections ?? []) {
       this.slackConnections.set(connection.teamId, connection);
     }
@@ -2563,10 +2793,7 @@ class MemoryDatabase implements Database {
     }
   }
 
-  private readonly githubInstallationSyncs = new Map<
-    string,
-    GitHubLifecycleReceiptClaimInput & { connectionId: string | null; retryAt: number | null }
-  >();
+  private readonly githubInstallationSyncs = new Map<string, MemoryGitHubSync>();
   private readonly githubSyncs = new Map<number, Promise<unknown>>();
 
   async synchronizeGitHubInstallation<T>(
@@ -2584,13 +2811,14 @@ class MemoryDatabase implements Database {
   }
 
   pendingGitHubInstallationSyncs(owner: GitHubInstallationSyncOwner) {
+    if (!this.githubSyncOwnerActive(owner)) return Promise.resolve([]);
     return Promise.resolve(
       [...this.githubInstallationSyncs.entries()]
         .filter(
           ([, receipt]) =>
             receipt.providerApplicationId === owner.providerApplicationId &&
             receipt.retryAt !== null &&
-            receipt.retryAt <= Date.now() &&
+            receipt.retryAt <= new Date() &&
             (receipt.connectionId !== null || this.githubConnections.has(receipt.installationId)),
         )
         .map(([id, receipt]) => ({
@@ -2610,21 +2838,21 @@ class MemoryDatabase implements Database {
         receipt.deliveryId === input.deliveryId || receipt.signatureHash === input.signatureHash,
     );
     if (existing !== undefined) return { status: "duplicate", installationSyncId: existing[0] };
-    const connection = await this.findGitHubConnection(input.installationId);
+    const connection = this.githubConnections.get(input.installationId);
+    const bound =
+      connection?.providerApplicationId === input.providerApplicationId ? connection : undefined;
     const id = randomUUID();
-    this.githubInstallationSyncs.set(id, {
+    const sync = {
       ...input,
-      connectionId: connection?.id ?? null,
-      retryAt: Date.now(),
-    });
-    if (connection !== undefined)
-      this.insertProviderEventReceipt({
-        organizationId: connection.organizationId,
-        provider: "github",
-        connectionId: connection.id,
-        resourceId: null,
-        input: { ...input, dropReason: "github_lifecycle" },
-      });
+      id,
+      connectionId: bound?.id ?? null,
+      retryAt: new Date(),
+      settledAt: null,
+      auditLink: null,
+      payloadExpiredAt: null,
+    };
+    if (bound !== undefined) this.auditMemorySync(sync, bound);
+    this.githubInstallationSyncs.set(id, sync);
     return { status: "claimed", installationSyncId: id, installationId: input.installationId };
   }
 
@@ -2633,40 +2861,82 @@ class MemoryDatabase implements Database {
     claim: Extract<GitHubInstallationSyncClaim, { status: "claimed" }>,
     result: GitHubInstallationSyncResult,
   ): Promise<void> {
+    if (!this.githubSyncOwnerActive(owner)) return;
     const receipt = this.githubInstallationSyncs.get(claim.installationSyncId);
     if (
       receipt === undefined ||
       receipt.retryAt === null ||
+      receipt.payloadExpiredAt !== null ||
       receipt.providerApplicationId !== owner.providerApplicationId
     )
       return;
-    const connection = this.githubConnections.get(claim.installationId);
-    if (connection === undefined && receipt.connectionId === null) return;
-    receipt.retryAt = null;
-    if (
-      connection === undefined ||
-      (receipt.connectionId !== null && receipt.connectionId !== connection.id)
-    )
-      return;
-    receipt.connectionId = connection.id;
-    if (
-      this.findReceiptId(connection.organizationId, receipt.deliveryId, receipt.signatureHash) ===
-      undefined
-    )
-      this.insertProviderEventReceipt({
-        organizationId: connection.organizationId,
-        provider: "github",
-        connectionId: connection.id,
-        resourceId: null,
-        input: { ...receipt, dropReason: "github_lifecycle" },
-      });
-    if (result.status === "present") {
-      this.githubConnections.set(claim.installationId, { ...connection, ...result.identity });
-      await this.replaceGitHubRepositorySnapshot(connection, result.repositories);
+    const connection = this.githubConnections.get(receipt.installationId);
+    const bound =
+      receipt.connectionId === null || receipt.connectionId === connection?.id
+        ? connection
+        : undefined;
+    if (bound !== undefined && bound.providerApplicationId !== owner.providerApplicationId) return;
+    if (bound === undefined) {
+      if (receipt.connectionId !== null) receipt.retryAt = null;
+      else if (result.status === "absent")
+        this.settleMemorySync(receipt, {
+          kind: this.hasAnySyncCopy(receipt, true) ? "unproven" : "none",
+        });
       return;
     }
-    if (!result.removeBinding) return;
-    this.githubConnections.delete(claim.installationId);
+    const auditLink = this.auditMemorySync(receipt, bound);
+    receipt.connectionId = bound.id;
+    if (result.status === "present") {
+      this.githubConnections.set(receipt.installationId, { ...bound, ...result.identity });
+      this.replaceGitHubRepositorySnapshot(bound, result.repositories);
+      this.settleMemorySync(receipt, auditLink);
+      return;
+    }
+    if (result.removeBinding) this.removeMemorySyncConnection(bound);
+    this.settleMemorySync(receipt, auditLink);
+  }
+
+  private auditMemorySync(
+    sync: MemoryGitHubSync,
+    connection: GitHubConnectionRecord,
+  ): GitHubSyncAuditLink {
+    const id = this.findReceiptId(connection.organizationId, sync.deliveryId, sync.signatureHash);
+    const receipt =
+      id === undefined
+        ? this.insertProviderEventReceipt({
+            organizationId: connection.organizationId,
+            provider: "github",
+            connectionId: connection.id,
+            resourceId: null,
+            input: { ...sync, dropReason: "github_lifecycle" },
+          })
+        : this.providerEventReceipts.get(id);
+    return receipt !== undefined &&
+      isExactSyncReceipt(
+        { ...sync, connectionId: connection.id },
+        receipt,
+        connection.organizationId,
+      )
+      ? { kind: "receipt", receiptId: receipt.id, organizationId: receipt.organizationId }
+      : { kind: "unproven" };
+  }
+
+  private settleMemorySync(sync: MemoryGitHubSync, auditLink: GitHubSyncAuditLink) {
+    sync.retryAt = null;
+    sync.settledAt = this.now();
+    sync.auditLink = auditLink;
+  }
+
+  private githubSyncOwnerActive(owner: GitHubInstallationSyncOwner): boolean {
+    const active = this.options.githubSyncOwner;
+    return (
+      active?.providerApplicationId === owner.providerApplicationId &&
+      active.configurationVersion === owner.configurationVersion
+    );
+  }
+
+  private removeMemorySyncConnection(connection: GitHubConnectionRecord) {
+    this.githubConnections.delete(connection.installationId);
     for (const [key, repository] of this.githubRepositories) {
       if (repository.connectionId === connection.id) this.githubRepositories.delete(key);
     }
@@ -2693,10 +2963,10 @@ class MemoryDatabase implements Database {
     }
   }
 
-  private async replaceGitHubRepositorySnapshot(
+  private replaceGitHubRepositorySnapshot(
     connection: GitHubConnectionRecord,
     repositories: GitHubRepositorySnapshot,
-  ): Promise<void> {
+  ): void {
     for (const [key, repository] of this.githubRepositories) {
       if (
         repository.connectionId === connection.id &&
@@ -2704,15 +2974,21 @@ class MemoryDatabase implements Database {
       )
         this.githubRepositories.delete(key);
     }
-    await this.upsertGitHubRepositories(connection.organizationId, connection.id, repositories);
+    this.upsertGitHubRepositories(connection.organizationId, connection.id, repositories);
   }
 
   retryGitHubInstallationSync(
-    _owner: GitHubInstallationSyncOwner,
+    owner: GitHubInstallationSyncOwner,
     installationSyncId: string,
   ): Promise<void> {
     const receipt = this.githubInstallationSyncs.get(installationSyncId);
-    if (receipt !== undefined && receipt.retryAt !== null) receipt.retryAt = Date.now() + 30_000;
+    if (
+      this.githubSyncOwnerActive(owner) &&
+      receipt?.providerApplicationId === owner.providerApplicationId &&
+      receipt.retryAt !== null &&
+      receipt.payloadExpiredAt === null
+    )
+      receipt.retryAt = new Date(Date.now() + 30_000);
     return Promise.resolve();
   }
 
@@ -4595,7 +4871,7 @@ class MemoryDatabase implements Database {
     return rows[0];
   }
 
-  private async upsertGitHubRepositories(
+  private upsertGitHubRepositories(
     organizationId: string,
     connectionId: string,
     repositories: Array<
@@ -5168,6 +5444,12 @@ function linearDropReason(
   }
   return undefined;
 }
+
+type MemoryGitHubSync = GitHubLifecycleReceiptClaimInput &
+  Pick<
+    GitHubSyncPayloadEvidence,
+    "id" | "connectionId" | "retryAt" | "settledAt" | "payloadExpiredAt"
+  > & { auditLink: GitHubSyncAuditLink | null };
 
 interface MemoryCliAuthorization extends CliAuthorizationRecord {
   deviceVerifier: string;

@@ -1,3 +1,4 @@
+import { isExactSyncReceipt } from "../run-payload-retention/auxiliary-receipt-proof.js";
 import type { Locks } from "./runtime/locks/index.js";
 import { and, eq, getTableColumns, isNull, or, lte, sql, isNotNull } from "drizzle-orm";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
@@ -296,7 +297,7 @@ export class ProviderEventAcceptanceRepository {
         .returning();
       if (receipt === undefined) {
         const [existing] = await transaction
-          .select()
+          .select({ id: schema.githubInstallationSyncs.id })
           .from(schema.githubInstallationSyncs)
           .where(
             or(
@@ -335,6 +336,7 @@ export class ProviderEventAcceptanceRepository {
           and(
             eq(schema.githubInstallationSyncs.id, claim.installationSyncId),
             isNotNull(schema.githubInstallationSyncs.retryAt),
+            isNull(schema.githubInstallationSyncs.payloadExpiredAt),
           ),
         )
         .for("update");
@@ -361,42 +363,58 @@ export class ProviderEventAcceptanceRepository {
         connection.providerApplicationId !== owner.providerApplicationId
       )
         return;
-      if (connection === undefined && receipt.connectionId === null) return;
-      await transaction
-        .update(schema.githubInstallationSyncs)
-        .set({
-          retryAt: null,
-          connectionId: connection?.id ?? receipt.connectionId,
-          providerApplicationId: owner.providerApplicationId,
-        })
-        .where(eq(schema.githubInstallationSyncs.id, receipt.id));
-      if (connection === undefined) return;
-      await auditGitHubLifecycle(transaction, receipt, connection);
+      if (connection === undefined) {
+        if (receipt.connectionId !== null) {
+          await settleGitHubSync(transaction, receipt, owner, receipt.connectionId);
+        } else if (receipt.kind === "webhook" && result.status === "absent") {
+          const copies = schema.providerEventReceipts;
+          const [copy] = await transaction
+            .select({ id: copies.id })
+            .from(copies)
+            .where(
+              or(
+                receipt.deliveryId === null ? undefined : eq(copies.deliveryId, receipt.deliveryId),
+                receipt.signatureHash === null
+                  ? undefined
+                  : eq(copies.signatureHash, receipt.signatureHash),
+              ),
+            )
+            .limit(1);
+          await settleGitHubSync(transaction, receipt, owner, null, {
+            kind: copy === undefined ? "none" : "unproven",
+          });
+        }
+        return;
+      }
+
+      const auditLink = await auditGitHubLifecycle(transaction, receipt, connection);
       if (result.status === "absent") {
-        if (result.removeBinding)
+        if (result.removeBinding) {
           await this.connections.removeGitHubByInstallationInTransaction(
             transaction,
             receipt.installationId,
           );
-        return;
+        }
+      } else {
+        await transaction
+          .update(schema.githubConnections)
+          .set({
+            accountId: result.identity.accountId,
+            accountLogin: result.identity.accountLogin,
+            accountType: result.identity.accountType,
+            status: result.identity.status,
+            suspendedAt: result.identity.status === "suspended" ? new Date() : null,
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.githubConnections.id, connection.id));
+        await replaceGitHubRepositories(
+          transaction,
+          connection.organizationId,
+          connection.id,
+          result.repositories,
+        );
       }
-      await transaction
-        .update(schema.githubConnections)
-        .set({
-          accountId: result.identity.accountId,
-          accountLogin: result.identity.accountLogin,
-          accountType: result.identity.accountType,
-          status: result.identity.status,
-          suspendedAt: result.identity.status === "suspended" ? new Date() : null,
-          updatedAt: new Date(),
-        })
-        .where(eq(schema.githubConnections.id, connection.id));
-      await replaceGitHubRepositories(
-        transaction,
-        connection.organizationId,
-        connection.id,
-        result.repositories,
-      );
+      await settleGitHubSync(transaction, receipt, owner, connection.id, auditLink);
     });
   }
 
@@ -417,6 +435,7 @@ export class ProviderEventAcceptanceRepository {
       .where(
         and(
           lte(schema.githubInstallationSyncs.retryAt, new Date()),
+          isNull(schema.githubInstallationSyncs.payloadExpiredAt),
           or(
             eq(schema.githubInstallationSyncs.providerApplicationId, owner.providerApplicationId),
             and(
@@ -459,6 +478,17 @@ export class ProviderEventAcceptanceRepository {
           and(
             eq(schema.githubInstallationSyncs.id, installationSyncId),
             isNotNull(schema.githubInstallationSyncs.retryAt),
+            isNull(schema.githubInstallationSyncs.payloadExpiredAt),
+            or(
+              eq(schema.githubInstallationSyncs.providerApplicationId, owner.providerApplicationId),
+              and(
+                eq(schema.githubInstallationSyncs.kind, "reconcile"),
+                isNull(schema.githubInstallationSyncs.providerApplicationId),
+                sql`exists (select 1 from github_connections connection
+                   where connection.id = ${schema.githubInstallationSyncs.connectionId}
+                     and connection.provider_application_id = ${owner.providerApplicationId})`,
+              ),
+            ),
           ),
         );
     });
@@ -842,8 +872,8 @@ async function auditGitHubLifecycle(
   transaction: HubTransaction,
   receipt: typeof schema.githubInstallationSyncs.$inferSelect,
   connection: typeof schema.githubConnections.$inferSelect,
-): Promise<void> {
-  if (receipt.kind === "reconcile") return;
+): Promise<schema.GitHubSyncAuditLink | undefined> {
+  if (receipt.kind === "reconcile") return undefined;
   if (
     receipt.deliveryId === null ||
     receipt.signatureHash === null ||
@@ -851,7 +881,7 @@ async function auditGitHubLifecycle(
     receipt.providerApplicationId === null
   )
     throw new Error("GitHub webhook receipt evidence unavailable");
-  await claimProviderReceipt(transaction, {
+  const audit = await claimProviderReceipt(transaction, {
     organizationId: connection.organizationId,
     provider: "github",
     connectionId: connection.id,
@@ -866,6 +896,52 @@ async function auditGitHubLifecycle(
       dropReason: GITHUB_LIFECYCLE,
     },
   });
+  if (audit.inserted)
+    return { kind: "receipt", receiptId: audit.id, organizationId: connection.organizationId };
+
+  const copies = schema.providerEventReceipts;
+  const [copy] = await transaction
+    .select({
+      id: copies.id,
+      organizationId: copies.organizationId,
+      provider: copies.provider,
+      source: copies.source,
+      connectionId: copies.connectionId,
+      resourceId: copies.resourceId,
+      providerApplicationId: copies.providerApplicationId,
+      deliveryId: copies.deliveryId,
+      signatureHash: copies.signatureHash,
+      receivedAt: copies.receivedAt,
+      droppedReason: copies.droppedReason,
+      acceptedRoutes: copies.acceptedRoutes,
+      payloadExpiryState: copies.payloadExpiryState,
+    })
+    .from(copies)
+    .where(and(eq(copies.id, audit.id), eq(copies.organizationId, connection.organizationId)))
+    .for("share");
+  return copy !== undefined &&
+    isExactSyncReceipt({ ...receipt, connectionId: connection.id }, copy, connection.organizationId)
+    ? { kind: "receipt", receiptId: copy.id, organizationId: copy.organizationId }
+    : { kind: "unproven" };
+}
+
+async function settleGitHubSync(
+  transaction: HubTransaction,
+  sync: typeof schema.githubInstallationSyncs.$inferSelect,
+  owner: GitHubInstallationSyncOwner,
+  connectionId: string | null,
+  auditLink?: schema.GitHubSyncAuditLink,
+) {
+  const syncs = schema.githubInstallationSyncs;
+  await transaction
+    .update(syncs)
+    .set({
+      retryAt: null,
+      connectionId,
+      providerApplicationId: owner.providerApplicationId,
+      ...(auditLink === undefined ? {} : { settledAt: sql`clock_timestamp()`, auditLink }),
+    })
+    .where(and(eq(syncs.id, sync.id), isNotNull(syncs.retryAt), isNull(syncs.payloadExpiredAt)));
 }
 
 async function githubSyncOwnerActive(
