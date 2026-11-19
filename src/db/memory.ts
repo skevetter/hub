@@ -23,6 +23,11 @@ import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { ManualRunRejected } from "../triggers/manual/provider.js";
+import {
+  markedProviderReplay,
+  preRoutingDropEvidence,
+  requireManualReceiptReplayBinding,
+} from "./receipt-replay.js";
 import { launchedAgent } from "./mappers.js";
 import type {
   AgentExecutionRecord,
@@ -37,6 +42,7 @@ import type {
   TransitionAgentExecutionFields,
   TransitionAgentExecutionResult,
   ProviderEventReceiptRecord,
+  ProviderEventReplayMetadata,
   EnrollDaemonInput,
   EnrollmentTokenRecord,
   DaemonRecord,
@@ -71,6 +77,8 @@ import type {
   AttachmentRecord,
   GitHubInstallationSyncResult,
   PersistManualEventInput,
+  ManualEventPersistence,
+  ManualReceiptReplayTarget,
   ProviderEventAcceptance,
   CreateProjectInput,
   InsertProjectConfigurationRevisionInput,
@@ -100,6 +108,7 @@ import type {
   AcceptedTriggerRunRecord,
   RejectedTriggerRunRecord,
   TriggerRunRecord,
+  TriggerRunAdmission,
   WorkflowStepExecutionInput,
   WorkflowStepRunRecord,
   WorkflowWakeupRecord,
@@ -556,7 +565,7 @@ class MemoryDatabase implements Database {
 
   private hasUnresolvedRunFanout(receiptId: string): boolean {
     const receipt = this.providerEventReceipts.get(receiptId);
-    if (receipt === undefined) return true;
+    if (receipt === undefined || receipt.payloadExpiryState != null) return true;
     const expected = expectedFanout(receipt, (id) => this.configurationRevisions.get(id));
     const branches = this.triggerRunIdsByProviderEventReceipt.get(receiptId);
     const runs = [...(branches?.values() ?? [])].flatMap((project) =>
@@ -1358,14 +1367,24 @@ class MemoryDatabase implements Database {
     };
   }
 
+  createAcceptedTriggerRun(
+    input: CreateAcceptedTriggerRunInput,
+  ): Promise<{ run: AcceptedTriggerRunRecord; created: boolean }>;
+  createAcceptedTriggerRun(
+    input: CreateAcceptedTriggerRunInput,
+    replay: "acknowledge",
+  ): Promise<TriggerRunAdmission<AcceptedTriggerRunRecord>>;
   async createAcceptedTriggerRun(
     input: CreateAcceptedTriggerRunInput,
-  ): Promise<{ run: AcceptedTriggerRunRecord; created: boolean }> {
+    replay?: "acknowledge",
+  ): Promise<TriggerRunAdmission<AcceptedTriggerRunRecord>> {
     const projectRuns =
       this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
       new Map<string, Map<string, string>>();
     const triggerRuns = projectRuns.get(input.projectId) ?? new Map<string, string>();
     const existingId = triggerRuns.get(input.configuredTriggerName);
+    const marked = this.checkReceiptAdmission(input, existingId, replay);
+    if (marked !== undefined) return marked;
     if (existingId !== undefined) {
       const existing = this.triggerRuns.get(existingId);
       if (existing === undefined)
@@ -1431,14 +1450,24 @@ class MemoryDatabase implements Database {
     return { run, created: true };
   }
 
+  createRejectedTriggerRun(
+    input: CreateRejectedTriggerRunInput,
+  ): Promise<{ run: RejectedTriggerRunRecord; created: boolean }>;
+  createRejectedTriggerRun(
+    input: CreateRejectedTriggerRunInput,
+    replay: "acknowledge",
+  ): Promise<TriggerRunAdmission<RejectedTriggerRunRecord>>;
   async createRejectedTriggerRun(
     input: CreateRejectedTriggerRunInput,
-  ): Promise<{ run: RejectedTriggerRunRecord; created: boolean }> {
+    replay?: "acknowledge",
+  ): Promise<TriggerRunAdmission<RejectedTriggerRunRecord>> {
     const projectRuns =
       this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
       new Map<string, Map<string, string>>();
     const triggerRuns = projectRuns.get(input.projectId) ?? new Map<string, string>();
     const existingId = triggerRuns.get(input.configuredTriggerName);
+    const marked = this.checkReceiptAdmission(input, existingId, replay);
+    if (marked !== undefined) return marked;
     if (existingId !== undefined) {
       const existing = this.triggerRuns.get(existingId);
       if (existing === undefined)
@@ -1473,8 +1502,43 @@ class MemoryDatabase implements Database {
     return { run, created: true };
   }
 
+  private checkReceiptAdmission(
+    input: CreateAcceptedTriggerRunInput | CreateRejectedTriggerRunInput,
+    runId: string | undefined,
+    replay: "acknowledge" | undefined,
+  ) {
+    const receipt = this.providerEventReceipts.get(input.providerEventReceiptId);
+    if (receipt !== undefined && receipt.organizationId !== input.organizationId)
+      throw new Error("provider event receipt unavailable");
+    if (receipt?.payloadExpiryState == null) return undefined;
+    if (replay === "acknowledge") {
+      const run = runId === undefined ? undefined : this.triggerRuns.get(runId);
+      return {
+        created: false,
+        receiptReplay: true,
+        runId: run?.organizationId === input.organizationId ? run.id : undefined,
+      } as const;
+    }
+    if (runId === undefined) throw new Error("marked receipt has no matching trigger branch");
+    return undefined;
+  }
+
   async findTriggerRunById(id: string) {
     return this.triggerRuns.get(id);
+  }
+
+  async findTriggerRunForReceipt(
+    organizationId: string,
+    projectId: string,
+    providerEventReceiptId: string,
+    triggerName: string,
+  ) {
+    const id = this.triggerRunIdsByProviderEventReceipt
+      .get(providerEventReceiptId)
+      ?.get(projectId)
+      ?.get(triggerName);
+    const run = id === undefined ? undefined : this.triggerRuns.get(id);
+    return run?.organizationId === organizationId ? run : undefined;
   }
 
   async findTriggerRunsByProviderEventReceiptId(providerEventReceiptId: string) {
@@ -2268,14 +2332,20 @@ class MemoryDatabase implements Database {
   async markProviderEventDropped(
     providerEventReceiptId: string,
     reason: ProviderEventDropReasonCode,
-  ): Promise<void> {
+    organizationId?: string,
+  ): Promise<boolean> {
     const receipt = this.providerEventReceipts.get(providerEventReceiptId);
-    if (receipt === undefined)
+    if (
+      receipt === undefined ||
+      (organizationId !== undefined && receipt.organizationId !== organizationId)
+    )
       throw new Error(`provider event receipt not found: ${providerEventReceiptId}`);
+    if (receipt.payloadExpiryState != null) return false;
     this.providerEventReceipts.set(providerEventReceiptId, {
       ...receipt,
       droppedReason: receipt.droppedReason ?? reason,
     });
+    return true;
   }
 
   async acceptGitHubEvent(input: AcceptGitHubEventInput): Promise<ProviderEventAcceptance> {
@@ -2326,7 +2396,19 @@ class MemoryDatabase implements Database {
     );
   }
 
-  async persistManualEvent(input: PersistManualEventInput) {
+  async findMarkedLinearReceipt(
+    linearOrganizationId: string,
+    deliveryId: string,
+    signatureHash: string,
+  ) {
+    const connection = await this.findLinearConnection(linearOrganizationId);
+    if (connection === undefined) return false;
+    const id = this.findReceiptId(connection.organizationId, deliveryId, signatureHash);
+    const receipt = id === undefined ? undefined : this.providerEventReceipts.get(id);
+    return receipt?.provider === "linear" && receipt.payloadExpiryState != null;
+  }
+
+  async persistManualEvent(input: PersistManualEventInput): Promise<ManualEventPersistence> {
     this.assertBoundWebhookTarget(input);
     const existing = this.findReceiptId(
       input.organizationId,
@@ -2335,6 +2417,16 @@ class MemoryDatabase implements Database {
     );
     if (existing !== undefined) {
       const receipt = this.providerEventReceipts.get(existing);
+      if (receipt?.payloadExpiryState != null) {
+        if (input.publicTriggerName !== undefined || input.boundWebhookTrigger !== undefined)
+          this.validateMarkedManualReceipt(input, receipt);
+        return {
+          status: "duplicate",
+          providerEventReceiptId: receipt.id,
+          replayed: true,
+          payloadExpiryState: receipt.payloadExpiryState,
+        };
+      }
       const route = receipt?.acceptedRoutes?.[0];
       if (receipt === undefined || route === undefined) {
         return {
@@ -2400,7 +2492,37 @@ class MemoryDatabase implements Database {
     };
   }
 
-  private assertBoundWebhookTarget(input: PersistManualEventInput): void {
+  async authorizeSignedReceiptReplay(
+    input: ManualReceiptReplayTarget & { organizationId: string; receiptId: string },
+  ) {
+    if (input.boundWebhookTrigger === undefined)
+      throw new ManualRunRejected("configuration_not_found");
+    this.assertBoundWebhookTarget(input);
+    const receipt = this.providerEventReceipts.get(input.receiptId);
+    if (receipt?.organizationId !== input.organizationId || receipt.payloadExpiryState == null)
+      throw new ManualRunRejected("configuration_not_found");
+    this.validateMarkedManualReceipt(input, receipt);
+  }
+
+  private validateMarkedManualReceipt(
+    input: ManualReceiptReplayTarget & { organizationId: string },
+    receipt: ProviderEventReceiptRecord,
+  ) {
+    const binding = requireManualReceiptReplayBinding(receipt, input);
+    if (binding.triggerId !== null) {
+      const revision = this.configurationRevisions.get(binding.configurationRevisionId);
+      if (
+        revision?.organizationId !== input.organizationId ||
+        revision.projectId !== binding.projectId ||
+        !hasBoundWebhookEvidence(revision.sourceEvidence, binding.triggerId)
+      )
+        throw new ManualRunRejected("configuration_not_found");
+    }
+  }
+
+  private assertBoundWebhookTarget(
+    input: Pick<PersistManualEventInput, "organizationId" | "projectId" | "boundWebhookTrigger">,
+  ): void {
     const binding = input.boundWebhookTrigger;
     if (binding !== undefined) {
       const trigger = this.organizationTriggers.get(binding.id);
@@ -2601,14 +2723,51 @@ class MemoryDatabase implements Database {
     const id = this.providerEventReceiptIdsByDelivery.get(
       organizationId === undefined ? deliveryId : `${organizationId}:${deliveryId}`,
     );
-    return id === undefined ? undefined : this.providerEventReceipts.get(id);
+    return id === undefined ? undefined : this.findProviderEventReceiptById(id);
   }
 
-  async findProviderEventReceiptById(id: string): Promise<ProviderEventReceiptRecord | undefined> {
-    return this.providerEventReceipts.get(id);
+  async findProviderEventReceiptById(
+    id: string,
+    projection?: "metadata",
+  ): Promise<ProviderEventReceiptRecord | undefined> {
+    const receipt = this.providerEventReceipts.get(id);
+    if (receipt === undefined) return undefined;
+    return receipt.payloadExpiryState != null || projection === "metadata"
+      ? { ...receipt, payload: null, acceptedRoutes: null }
+      : receipt;
+  }
+
+  async findProviderEventReplayMetadata(
+    organizationId: string,
+    key: { id: string } | { deliveryId: string },
+  ): Promise<ProviderEventReplayMetadata | undefined> {
+    const id = "id" in key ? key.id : this.findReceiptId(organizationId, key.deliveryId, null);
+    const receipt = id === undefined ? undefined : this.providerEventReceipts.get(id);
+    if (receipt?.organizationId !== organizationId) return undefined;
+    const {
+      provider,
+      source,
+      droppedReason,
+      payloadExpiryState = null,
+      manualReplayBinding = null,
+    } = receipt;
+    return {
+      id: receipt.id,
+      provider,
+      source,
+      droppedReason,
+      payloadExpiryState,
+      manualReplayBinding,
+    };
   }
 
   async insertAttachment(input: InsertAttachmentInput): Promise<AttachmentRecord> {
+    const receipt = this.providerEventReceipts.get(input.providerEventReceiptId);
+    if (
+      receipt !== undefined &&
+      (receipt.organizationId !== input.organizationId || receipt.payloadExpiryState != null)
+    )
+      throw new Error("attachment receipt unavailable");
     const sourceKey = attachmentSourceKey(
       input.providerEventReceiptId,
       input.provider,
@@ -2639,6 +2798,8 @@ class MemoryDatabase implements Database {
     provider: AttachmentProvider,
     sourceId: string,
   ): Promise<AttachmentRecord | undefined> {
+    if (this.providerEventReceipts.get(providerEventReceiptId)?.payloadExpiryState != null)
+      return undefined;
     const id = this.attachmentIdsBySource.get(
       attachmentSourceKey(providerEventReceiptId, provider, sourceId),
     );
@@ -2652,6 +2813,11 @@ class MemoryDatabase implements Database {
     const execution = this.agentExecutions.get(executionId);
     const attachment = this.attachments.get(attachmentId);
     if (execution === undefined || attachment === undefined) return undefined;
+    if (execution.status !== "spawning" && execution.status !== "running") return undefined;
+    if (
+      this.providerEventReceipts.get(attachment.providerEventReceiptId)?.payloadExpiryState != null
+    )
+      return undefined;
     const stepRun =
       execution.workflowStepRunId === null
         ? undefined
@@ -3148,7 +3314,8 @@ class MemoryDatabase implements Database {
     return (await this.listTriggerRunsForProject(projectId, limit)).flatMap((run) => {
       const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
       if (receipt === undefined) return [];
-      const payload = run.payloadExpiredAt == null ? receipt.payload : null;
+      const payload =
+        run.payloadExpiredAt == null && receipt.payloadExpiryState == null ? receipt.payload : null;
       const actor =
         receipt.source === "webhook.received" &&
         payload !== null &&
@@ -3175,7 +3342,7 @@ class MemoryDatabase implements Database {
     return {
       run,
       receipt:
-        run.payloadExpiredAt == null
+        run.payloadExpiredAt == null && receipt.payloadExpiryState == null
           ? receipt
           : { ...receipt, payload: null, acceptedRoutes: null },
       steps: await this.listWorkflowStepRunsForTriggerRun(run.id),
@@ -3190,7 +3357,7 @@ class MemoryDatabase implements Database {
     return {
       run,
       receipt:
-        run.payloadExpiredAt == null
+        run.payloadExpiredAt == null && receipt.payloadExpiryState == null
           ? receipt
           : { ...receipt, payload: null, acceptedRoutes: null },
       steps: await this.listWorkflowStepRunsForTriggerRun(run.id),
@@ -4747,6 +4914,8 @@ class MemoryDatabase implements Database {
     if (receiptId !== undefined) {
       const receipt = this.providerEventReceipts.get(receiptId);
       if (receipt === undefined) throw new Error("provider receipt unavailable");
+      const marked = markedProviderReplay(receipt);
+      if (marked !== undefined) return marked;
       if (receipt.droppedReason !== null) {
         return { status: "dropped", receiptId, reason: receipt.droppedReason };
       }
@@ -4783,7 +4952,11 @@ class MemoryDatabase implements Database {
       input,
     });
     if (reason !== undefined) {
-      this.providerEventReceipts.set(receipt.id, { ...receipt, droppedReason: reason });
+      this.providerEventReceipts.set(receipt.id, {
+        ...receipt,
+        droppedReason: reason,
+        preRoutingDrop: preRoutingDropEvidence(reason),
+      });
       return {
         status: "dropped",
         receiptId: receipt.id,
@@ -4794,7 +4967,9 @@ class MemoryDatabase implements Database {
     const routes = Array.from(this.projectTriggerRoutes.entries()).flatMap(
       ([projectId, candidates]) => {
         const project = this.projects.get(projectId);
-        return project?.status === "active" && project.activeConfigurationRevisionId !== null
+        return project?.organizationId === organizationId &&
+          project.status === "active" &&
+          project.activeConfigurationRevisionId !== null
           ? candidates
               .filter(
                 (route) =>
@@ -4810,6 +4985,7 @@ class MemoryDatabase implements Database {
       this.providerEventReceipts.set(receipt.id, {
         ...receipt,
         droppedReason: "no_project_route",
+        preRoutingDrop: "no_project_route",
       });
       return { status: "dropped", receiptId: receipt.id, reason: "no_project_route" };
     }
@@ -4846,12 +5022,18 @@ class MemoryDatabase implements Database {
     signatureHash: string | null | undefined,
   ): string | undefined {
     if (organizationId === undefined) return undefined;
-    return signatureHash === undefined || signatureHash === null
-      ? this.providerEventReceiptIdsByDelivery.get(triggerDeliveryKey(organizationId, deliveryId))
-      : (this.providerEventReceiptIdsBySignature.get(signatureHash) ??
-          this.providerEventReceiptIdsByDelivery.get(
-            triggerDeliveryKey(organizationId, deliveryId),
-          ));
+    const bySignature =
+      signatureHash == null
+        ? undefined
+        : this.providerEventReceiptIdsBySignature.get(signatureHash);
+    if (
+      bySignature !== undefined &&
+      this.providerEventReceipts.get(bySignature)?.organizationId === organizationId
+    )
+      return bySignature;
+    return this.providerEventReceiptIdsByDelivery.get(
+      triggerDeliveryKey(organizationId, deliveryId),
+    );
   }
 
   private insertProviderEventReceipt(input: {
@@ -4871,6 +5053,9 @@ class MemoryDatabase implements Database {
       dropReason?: string;
     };
   }): ProviderEventReceiptRecord {
+    const signature = input.input.signatureHash;
+    if (signature != null && this.providerEventReceiptIdsBySignature.has(signature))
+      throw new Error("provider receipt unavailable");
     const receipt: ProviderEventReceiptRecord = {
       id: randomUUID(),
       organizationId: input.organizationId,
@@ -4887,6 +5072,10 @@ class MemoryDatabase implements Database {
       receivedAt: input.input.receivedAt,
       droppedReason: input.input.dropReason ?? null,
       acceptedRoutes: null,
+      payloadExpiryState: null,
+      payloadExpiredAt: null,
+      preRoutingDrop: null,
+      manualReplayBinding: null,
     };
     this.providerEventReceipts.set(receipt.id, receipt);
     this.providerEventReceiptIdsByDelivery.set(

@@ -16,8 +16,31 @@ import type {
   ProjectRecord,
   ProviderEventReceiptSummary,
   ProviderEventReceiptRecord,
+  ProviderEventReplayMetadata,
   OrganizationRunRecord,
 } from "./types.js";
+import { parseManualReceiptReplayBinding } from "./receipt-replay.js";
+
+export function toProviderEventReplayMetadata(
+  row: Pick<
+    ProviderEventReceiptRow,
+    | "id"
+    | "provider"
+    | "source"
+    | "dropped_reason"
+    | "payload_expiry_state"
+    | "manual_replay_binding"
+  >,
+): ProviderEventReplayMetadata {
+  return {
+    id: row.id,
+    provider: row.provider,
+    source: row.source,
+    droppedReason: row.dropped_reason,
+    payloadExpiryState: row.payload_expiry_state,
+    manualReplayBinding: parseManualReceiptReplayBinding(row.manual_replay_binding),
+  };
+}
 
 /** The `agent` object of a stored launch intent, read back as the overview needs it. */
 export function launchedAgent(value: unknown): OrganizationRunRecord["agent"] {
@@ -41,6 +64,7 @@ type ProviderEventReceiptSummaryRow = Pick<
   | "repo"
   | "received_at"
   | "dropped_reason"
+  | "payload_expiry_state"
 >;
 
 export function toProviderEventReceiptSummary(
@@ -58,6 +82,7 @@ export function toProviderEventReceiptSummary(
     repo: row.repo,
     receivedAt: row.received_at,
     droppedReason: row.dropped_reason,
+    payloadExpiryState: row.payload_expiry_state,
   };
 }
 
@@ -76,6 +101,7 @@ export function toProviderEventReceiptRecordSummary(
     repo: receipt.repo,
     receivedAt: receipt.receivedAt,
     droppedReason: receipt.droppedReason,
+    payloadExpiryState: receipt.payloadExpiryState ?? null,
   };
 }
 
@@ -83,21 +109,23 @@ export function toProviderEventReceiptRecord(
   row: ProviderEventReceiptRow,
 ): ProviderEventReceiptRecord {
   return {
-    id: row.id,
+    ...toProviderEventReplayMetadata(row),
     organizationId: row.organization_id,
-    provider: row.provider,
     connectionId: row.connection_id,
     resourceId: row.resource_id,
     deliveryId: row.delivery_id,
     signatureHash: row.signature_hash,
     providerApplicationId: row.provider_application_id,
     providerConfigurationVersion: row.provider_configuration_version,
-    source: row.source,
     repo: row.repo,
-    payload: row.payload,
+    payload: row.payload_expiry_state === null ? row.payload : null,
     receivedAt: row.received_at,
-    droppedReason: row.dropped_reason,
-    acceptedRoutes: parseProviderEventRouteSnapshots(row.accepted_routes),
+    acceptedRoutes:
+      row.payload_expiry_state === null
+        ? parseProviderEventRouteSnapshots(row.accepted_routes)
+        : null,
+    payloadExpiredAt: row.payload_expired_at,
+    preRoutingDrop: row.pre_routing_drop,
   };
 }
 

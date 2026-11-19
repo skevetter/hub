@@ -60,18 +60,7 @@ export function createAttachmentCapabilityRegistry(options: {
   return {
     async register(input) {
       validateRegistration(input);
-      const existing = await options.database.findAttachmentBySource(
-        input.providerEventReceiptId,
-        input.provider,
-        input.sourceId,
-      );
-      const record =
-        existing ??
-        (await options.database.insertAttachment({
-          ...input,
-          contentType: input.contentType ?? null,
-          byteSize: input.byteSize ?? null,
-        }));
+      const record = await options.database.insertAttachment(input);
       return toReference(record);
     },
 

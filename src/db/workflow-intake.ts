@@ -1,8 +1,57 @@
 import type { QueryHandle } from "./runtime/index.js";
-import type { CreateAcceptedTriggerRunInput } from "./types.js";
+import type {
+  CreateAcceptedTriggerRunInput,
+  CreateRejectedTriggerRunInput,
+  ReceiptPayloadExpiryState,
+} from "./types.js";
 
-/** Atomically accept work inside the caller’s transaction, including durable steps and wakeup. */
+export async function lockProviderReceipt(
+  client: QueryHandle,
+  receiptId: string,
+  organizationId: string,
+) {
+  const result = await client.query<{ payload_expiry_state: ReceiptPayloadExpiryState | null }>(
+    `select payload_expiry_state from provider_event_receipts
+     where id = $1 and organization_id = $2 for share`,
+    [receiptId, organizationId],
+  );
+  return result.rows[0];
+}
+
+export async function markedReceiptAdmission(
+  client: QueryHandle,
+  input: CreateAcceptedTriggerRunInput | CreateRejectedTriggerRunInput,
+) {
+  const receipt = await lockProviderReceipt(
+    client,
+    input.providerEventReceiptId,
+    input.organizationId,
+  );
+  if (receipt === undefined) throw new Error("provider event receipt unavailable");
+  if (receipt.payload_expiry_state === null) return undefined;
+  const result = await client.query<{ id: string }>(
+    `select id from trigger_runs
+     where organization_id = $1 and provider_event_receipt_id = $2
+       and project_id = $3 and configured_trigger_name = $4`,
+    [
+      input.organizationId,
+      input.providerEventReceiptId,
+      input.projectId,
+      input.configuredTriggerName,
+    ],
+  );
+  return { created: false, receiptReplay: true, runId: result.rows[0]?.id } as const;
+}
+
+export function requiredExistingRun(id: string | undefined): string {
+  if (id === undefined) throw new Error("marked receipt has no matching trigger branch");
+  return id;
+}
+
+/** Atomically accept work inside the caller's transaction, including steps and wakeup. */
 export async function acceptWorkflowRun(client: QueryHandle, input: CreateAcceptedTriggerRunInput) {
+  const replay = await markedReceiptAdmission(client, input);
+  if (replay !== undefined) return replay;
   const inserted = await client.query<{
     id: string;
     outcome: string;
@@ -41,8 +90,14 @@ export async function acceptWorkflowRun(client: QueryHandle, input: CreateAccept
     }>(
       `select * from trigger_runs
            where provider_event_receipt_id = $1 and project_id = $2 and configured_trigger_name = $3
+             and organization_id = $4
            for update`,
-      [input.providerEventReceiptId, input.projectId, input.configuredTriggerName],
+      [
+        input.providerEventReceiptId,
+        input.projectId,
+        input.configuredTriggerName,
+        input.organizationId,
+      ],
     );
     run = existing.rows[0];
   }

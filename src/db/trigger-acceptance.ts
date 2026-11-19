@@ -1,10 +1,15 @@
 import type { Locks } from "./runtime/locks/index.js";
-import { and, eq, isNull, or, lte, sql, isNotNull } from "drizzle-orm";
+import { and, eq, getTableColumns, isNull, or, lte, sql, isNotNull } from "drizzle-orm";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { ManualRunRejected } from "../triggers/manual/provider.js";
 import type { DatabaseRuntime, DrizzleHandle } from "./runtime/index.js";
 import * as schema from "./schema.js";
 import { ConnectionRepository, replaceGitHubRepositories } from "./connections.js";
+import {
+  markedProviderReplay,
+  preRoutingDropEvidence,
+  requireManualReceiptReplayBinding,
+} from "./receipt-replay.js";
 import type {
   BoundWebhookTrigger,
   AcceptDiscordEventInput,
@@ -16,10 +21,13 @@ import type {
   GitHubLifecycleReceiptClaimInput,
   GitHubInstallationSyncResult,
   ManualEventPersistence,
+  ManualReceiptReplayTarget,
   PersistManualEventInput,
   ProviderEventAcceptance,
   ProviderEventEvidence,
+  ProviderEventReplayMetadata,
   ProviderEventRouteSnapshot,
+  ReceiptPreRoutingDrop,
 } from "./types.js";
 
 type HubDatabase = DrizzleHandle;
@@ -53,6 +61,28 @@ export class ProviderEventAcceptanceRepository {
     return this.acceptProvider("linear", input.linearOrganizationId, input.projectId, input);
   }
 
+  async findMarkedLinearReceipt(
+    linearOrganizationId: string,
+    deliveryId: string,
+    signatureHash: string,
+  ): Promise<boolean> {
+    const connection = await findConnection(this.database, "linear", linearOrganizationId);
+    if (connection === undefined) return false;
+    const receipts = schema.providerEventReceipts;
+    const [receipt] = await this.database
+      .select({ id: receipts.id })
+      .from(receipts)
+      .where(
+        and(
+          receiptIdentity({ deliveryId, signatureHash }, connection.organizationId),
+          eq(receipts.provider, "linear"),
+          isNotNull(receipts.payloadExpiryState),
+        ),
+      )
+      .limit(1);
+    return receipt !== undefined;
+  }
+
   private async acceptProvider(
     provider: "github" | "slack" | "discord" | "linear",
     externalId: number | string,
@@ -80,11 +110,10 @@ export class ProviderEventAcceptanceRepository {
         connectionId: connection.id,
         resourceId: resourceId === undefined ? null : String(resourceId),
         input: dropReason === undefined ? input : { ...input, dropReason },
+        preRoutingDrop: preRoutingDropEvidence(dropReason),
       });
       if (!receipt.inserted) {
-        const existingReceipt = await findReceipt(transaction, input, connection.organizationId);
-        if (existingReceipt === undefined) throw new Error("provider receipt unavailable");
-        return replayProviderReceipt(existingReceipt);
+        return replayProviderReceipt(receipt.existing);
       }
       if (dropReason !== undefined) {
         return { status: "dropped", receiptId: receipt.id, reason: dropReason };
@@ -130,8 +159,8 @@ export class ProviderEventAcceptanceRepository {
         const reason = "no_project_route";
         await transaction
           .update(schema.providerEventReceipts)
-          .set({ droppedReason: reason })
-          .where(eq(schema.providerEventReceipts.id, receipt.id));
+          .set({ droppedReason: reason, preRoutingDrop: reason })
+          .where(writableReceipt(receipt.id, connection.organizationId));
         return { status: "dropped", receiptId: receipt.id, reason };
       }
 
@@ -144,7 +173,7 @@ export class ProviderEventAcceptanceRepository {
       await transaction
         .update(schema.providerEventReceipts)
         .set({ acceptedRoutes })
-        .where(eq(schema.providerEventReceipts.id, receipt.id));
+        .where(writableReceipt(receipt.id, connection.organizationId));
 
       return {
         status: "accepted",
@@ -174,18 +203,7 @@ export class ProviderEventAcceptanceRepository {
           ? undefined
           : await lockBoundWebhookTarget(transaction, input, binding);
       const existing = await findReceipt(transaction, input, input.organizationId);
-      if (existing !== undefined) {
-        const route = parseAcceptedRoutes(existing.acceptedRoutes)?.[0];
-        if (route === undefined) {
-          return { status: "duplicate", providerEventReceiptId: existing.id, replayed: true };
-        }
-        if (binding !== undefined) await assertBoundReceipt(transaction, input, route, binding.id);
-        return {
-          status: "accepted",
-          replayed: true,
-          event: eventFromReceipt(existing, route),
-        };
-      }
+      if (existing !== undefined) return replayManualReceipt(transaction, input, existing);
       const activeRevision = boundRevision ?? (await projectQuery)[0]?.configurationRevisionId;
       if (activeRevision == null) throw new ManualRunRejected("configuration_not_found");
       const route: ProviderEventRouteSnapshot = {
@@ -202,23 +220,12 @@ export class ProviderEventAcceptanceRepository {
         input,
       });
       if (!receipt.inserted) {
-        const duplicate = await findReceipt(transaction, input, input.organizationId);
-        const duplicateRoute = parseAcceptedRoutes(duplicate?.acceptedRoutes)?.[0];
-        if (duplicate === undefined || duplicateRoute === undefined) {
-          return { status: "duplicate", providerEventReceiptId: receipt.id, replayed: true };
-        }
-        if (binding !== undefined)
-          await assertBoundReceipt(transaction, input, duplicateRoute, binding.id);
-        return {
-          status: "accepted",
-          event: eventFromReceipt(duplicate, duplicateRoute),
-          replayed: true,
-        };
+        return replayManualReceipt(transaction, input, receipt.existing);
       }
       await transaction
         .update(schema.providerEventReceipts)
         .set({ acceptedRoutes: [route] })
-        .where(eq(schema.providerEventReceipts.id, receipt.id));
+        .where(writableReceipt(receipt.id, input.organizationId));
       return {
         status: "accepted",
         event: {
@@ -234,6 +241,34 @@ export class ProviderEventAcceptanceRepository {
           resourceId: input.resourceId ?? null,
         },
       };
+    });
+  }
+
+  authorizeSignedReceiptReplay(
+    input: ManualReceiptReplayTarget & { organizationId: string; receiptId: string },
+  ): Promise<void> {
+    return this.database.transaction(async (transaction) => {
+      if (input.boundWebhookTrigger === undefined)
+        throw new ManualRunRejected("configuration_not_found");
+      await lockBoundWebhookTarget(transaction, input, input.boundWebhookTrigger);
+      const receipts = schema.providerEventReceipts;
+      const [receipt] = await transaction
+        .select({
+          id: receipts.id,
+          provider: receipts.provider,
+          source: receipts.source,
+          droppedReason: receipts.droppedReason,
+          payloadExpiryState: receipts.payloadExpiryState,
+          manualReplayBinding: receipts.manualReplayBinding,
+        })
+        .from(receipts)
+        .where(
+          and(eq(receipts.id, input.receiptId), eq(receipts.organizationId, input.organizationId)),
+        )
+        .for("share");
+      if (receipt?.payloadExpiryState == null)
+        throw new ManualRunRejected("configuration_not_found");
+      await validateMarkedManualReceipt(transaction, input, receipt);
     });
   }
 
@@ -476,7 +511,12 @@ function eventFromReceipt(
   };
 }
 
-function manualProject(transaction: HubTransaction, input: PersistManualEventInput) {
+interface ManualProject {
+  organizationId: string;
+  projectId: string;
+}
+
+function manualProject(transaction: HubTransaction, input: ManualProject) {
   return transaction
     .select({ configurationRevisionId: schema.projects.activeConfigurationRevisionId })
     .from(schema.projects)
@@ -491,7 +531,7 @@ function manualProject(transaction: HubTransaction, input: PersistManualEventInp
 
 async function lockBoundWebhookTarget(
   transaction: HubTransaction,
-  input: PersistManualEventInput,
+  input: ManualProject,
   binding: BoundWebhookTrigger,
 ): Promise<string> {
   const triggers = schema.organizationTriggers;
@@ -566,27 +606,86 @@ async function findReceipt(
   input: ProviderEventEvidence,
   organizationId: string,
 ) {
+  const receipts = schema.providerEventReceipts;
   const [receipt] = await transaction
-    .select()
-    .from(schema.providerEventReceipts)
-    .where(
-      and(
-        eq(schema.providerEventReceipts.organizationId, organizationId),
-        input.signatureHash === undefined || input.signatureHash === null
-          ? eq(schema.providerEventReceipts.deliveryId, input.deliveryId)
-          : or(
-              eq(schema.providerEventReceipts.deliveryId, input.deliveryId),
-              eq(schema.providerEventReceipts.signatureHash, input.signatureHash),
-            ),
-      ),
-    )
+    .select({
+      ...getTableColumns(receipts),
+      payload: sql<unknown>`case when ${receipts.payloadExpiryState} is null then ${receipts.payload} end`,
+      acceptedRoutes: sql<unknown>`case when ${receipts.payloadExpiryState} is null then ${receipts.acceptedRoutes} end`,
+    })
+    .from(receipts)
+    .where(receiptIdentity(input, organizationId))
     .limit(1);
   return receipt;
+}
+
+function receiptIdentity(
+  input: Pick<ProviderEventEvidence, "deliveryId" | "signatureHash">,
+  organizationId: string,
+) {
+  const receipts = schema.providerEventReceipts;
+  const delivery = eq(receipts.deliveryId, input.deliveryId);
+  return and(
+    eq(receipts.organizationId, organizationId),
+    input.signatureHash == null
+      ? delivery
+      : or(delivery, eq(receipts.signatureHash, input.signatureHash)),
+  );
+}
+
+function writableReceipt(id: string, organizationId: string) {
+  const receipts = schema.providerEventReceipts;
+  return and(
+    eq(receipts.id, id),
+    eq(receipts.organizationId, organizationId),
+    isNull(receipts.payloadExpiryState),
+  );
+}
+
+async function replayManualReceipt(
+  transaction: HubTransaction,
+  input: PersistManualEventInput,
+  receipt: typeof schema.providerEventReceipts.$inferSelect,
+): Promise<ManualEventPersistence> {
+  const duplicate = {
+    status: "duplicate",
+    providerEventReceiptId: receipt.id,
+    replayed: true,
+  } as const;
+  if (receipt.payloadExpiryState !== null) {
+    if (input.publicTriggerName !== undefined || input.boundWebhookTrigger !== undefined)
+      await validateMarkedManualReceipt(transaction, input, receipt);
+    return { ...duplicate, payloadExpiryState: receipt.payloadExpiryState };
+  }
+  const route = parseAcceptedRoutes(receipt.acceptedRoutes)?.[0];
+  if (route === undefined) return duplicate;
+  if (input.boundWebhookTrigger !== undefined)
+    await assertBoundReceipt(transaction, input, route, input.boundWebhookTrigger.id);
+  return { status: "accepted", replayed: true, event: eventFromReceipt(receipt, route) };
+}
+
+async function validateMarkedManualReceipt(
+  transaction: HubTransaction,
+  input: ManualReceiptReplayTarget & ManualProject,
+  receipt: ProviderEventReplayMetadata,
+): Promise<void> {
+  const binding = requireManualReceiptReplayBinding(receipt, input);
+  if (binding.triggerId !== null) {
+    await assertBoundRevision(
+      transaction,
+      input.organizationId,
+      binding.projectId,
+      binding.triggerId,
+      binding.configurationRevisionId,
+    );
+  }
 }
 
 function replayProviderReceipt(
   receipt: typeof schema.providerEventReceipts.$inferSelect,
 ): ProviderEventAcceptance {
+  const marked = markedProviderReplay(receipt);
+  if (marked !== undefined) return marked;
   if (receipt.droppedReason !== null) {
     return { status: "dropped", receiptId: receipt.id, reason: receipt.droppedReason };
   }
@@ -706,8 +805,12 @@ async function claimProviderReceipt(
     connectionId: string | null;
     resourceId: string | null;
     input: ProviderEventEvidence;
+    preRoutingDrop?: ReceiptPreRoutingDrop | null;
   },
-): Promise<{ id: string; inserted: boolean }> {
+): Promise<
+  | { id: string; inserted: true }
+  | { id: string; inserted: false; existing: typeof schema.providerEventReceipts.$inferSelect }
+> {
   const [receipt] = await transaction
     .insert(schema.providerEventReceipts)
     .values({
@@ -724,6 +827,7 @@ async function claimProviderReceipt(
       payload: input.input.payload,
       receivedAt: input.input.receivedAt,
       droppedReason: input.input.dropReason ?? null,
+      preRoutingDrop: input.preRoutingDrop ?? null,
     })
     .onConflictDoNothing()
     .returning({ id: schema.providerEventReceipts.id });
@@ -731,7 +835,7 @@ async function claimProviderReceipt(
 
   const existing = await findReceipt(transaction, input.input, input.organizationId);
   if (existing === undefined) throw new Error("provider receipt unavailable");
-  return { id: existing.id, inserted: false };
+  return { id: existing.id, inserted: false, existing };
 }
 
 async function auditGitHubLifecycle(

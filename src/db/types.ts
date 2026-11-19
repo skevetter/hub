@@ -5,7 +5,19 @@ import type {
   StepPayloadSummary,
 } from "../run-payload-retention/summary.js";
 import type { RunTimelineStore } from "../run-timeline/store.js";
-import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
+import type {
+  AgentExecutionStatus,
+  MachineSource,
+  MachineStatus,
+  ReceiptPayloadExpiryState,
+  ReceiptPreRoutingDrop,
+  ManualReceiptReplayBinding,
+} from "./schema.js";
+export type {
+  ReceiptPayloadExpiryState,
+  ReceiptPreRoutingDrop,
+  ManualReceiptReplayBinding,
+} from "./schema.js";
 import type { JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import type { InvocationRejection } from "../triggers/invocation.js";
@@ -17,6 +29,13 @@ import type {
 } from "../entitlements/catalog.js";
 
 export type WorkflowDeadlineKind = "step_hard" | "step_idle" | "whole_run";
+
+export interface ManualReceiptReplayTarget {
+  projectId: string;
+  source: string;
+  publicTriggerName?: string;
+  boundWebhookTrigger?: BoundWebhookTrigger;
+}
 
 export interface ProviderEventReceiptRecord {
   id: string;
@@ -41,6 +60,10 @@ export interface ProviderEventReceiptRecord {
   receivedAt: Date;
   droppedReason: string | null;
   acceptedRoutes: readonly ProviderEventRouteSnapshot[] | null;
+  payloadExpiryState?: ReceiptPayloadExpiryState | null;
+  payloadExpiredAt?: Date | null;
+  preRoutingDrop?: ReceiptPreRoutingDrop | null;
+  manualReplayBinding?: ManualReceiptReplayBinding | null;
 }
 
 export interface ProviderEventReceiptSummary {
@@ -55,7 +78,17 @@ export interface ProviderEventReceiptSummary {
   repo: string | null;
   receivedAt: Date;
   droppedReason: string | null;
+  payloadExpiryState?: ReceiptPayloadExpiryState | null;
 }
+
+export type ProviderEventReplayMetadata = Pick<
+  ProviderEventReceiptRecord,
+  "id" | "provider" | "source" | "droppedReason" | "payloadExpiryState" | "manualReplayBinding"
+>;
+
+export type TriggerRunAdmission<T extends TriggerRunRecord> =
+  | { run: T; created: boolean }
+  | { created: false; receiptReplay: true; runId: string | undefined };
 
 /** One run as an organization overview reads it: what fired, what happened, and which agent ran. */
 export interface OrganizationRunRecord {
@@ -645,8 +678,13 @@ export interface DurableProviderEvent {
 
 export type ProviderEventAcceptance =
   | { status: "accepted"; events: DurableProviderEvent[]; receiptId: string }
-  | { status: "duplicate"; receiptId: string }
-  | { status: "dropped"; receiptId: string; reason: string };
+  | { status: "duplicate"; receiptId: string; payloadExpiryState?: ReceiptPayloadExpiryState }
+  | {
+      status: "dropped";
+      receiptId: string;
+      reason: string;
+      payloadExpiryState?: ReceiptPayloadExpiryState;
+    };
 
 export interface ProviderEventEvidence {
   deliveryId: string;
@@ -686,13 +724,19 @@ export interface BoundWebhookTrigger {
 
 export interface PersistManualEventInput extends InsertProviderEventInput {
   boundWebhookTrigger?: BoundWebhookTrigger;
+  publicTriggerName?: string;
   organizationId: string;
   projectId: string;
 }
 
 export type ManualEventPersistence =
   | { status: "accepted"; event: DurableProviderEvent; replayed?: boolean }
-  | { status: "duplicate"; providerEventReceiptId: string; replayed?: boolean };
+  | {
+      status: "duplicate";
+      providerEventReceiptId: string;
+      replayed?: boolean;
+      payloadExpiryState?: ReceiptPayloadExpiryState;
+    };
 
 export interface GitHubInstallationSyncOwner {
   providerApplicationId: string;
@@ -1268,13 +1312,27 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
   createAcceptedTriggerRun(
     input: CreateAcceptedTriggerRunInput,
   ): Promise<{ run: AcceptedTriggerRunRecord; created: boolean }>;
+  createAcceptedTriggerRun(
+    input: CreateAcceptedTriggerRunInput,
+    replay: "acknowledge",
+  ): Promise<TriggerRunAdmission<AcceptedTriggerRunRecord>>;
   createRejectedTriggerRun(
     input: CreateRejectedTriggerRunInput,
   ): Promise<{ run: RejectedTriggerRunRecord; created: boolean }>;
+  createRejectedTriggerRun(
+    input: CreateRejectedTriggerRunInput,
+    replay: "acknowledge",
+  ): Promise<TriggerRunAdmission<RejectedTriggerRunRecord>>;
   findTriggerRunById(id: string): Promise<TriggerRunRecord | undefined>;
   findTriggerRunsByProviderEventReceiptId(
     providerEventReceiptId: string,
   ): Promise<TriggerRunRecord[]>;
+  findTriggerRunForReceipt(
+    organizationId: string,
+    projectId: string,
+    providerEventReceiptId: string,
+    triggerName: string,
+  ): Promise<TriggerRunRecord | undefined>;
   listTriggerRunsForProject(projectId: string, limit: number): Promise<TriggerRunRecord[]>;
   countActiveTriggerRuns(
     organizationId: string,
@@ -1404,12 +1462,21 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
   markProviderEventDropped(
     providerEventReceiptId: string,
     reason: ProviderEventDropReasonCode,
-  ): Promise<void>;
+    organizationId?: string,
+  ): Promise<boolean>;
   acceptGitHubEvent(input: AcceptGitHubEventInput): Promise<ProviderEventAcceptance>;
   acceptDiscordEvent(input: AcceptDiscordEventInput): Promise<ProviderEventAcceptance>;
   acceptSlackEvent(input: AcceptSlackEventInput): Promise<ProviderEventAcceptance>;
   acceptLinearEvent(input: AcceptLinearEventInput): Promise<ProviderEventAcceptance>;
+  findMarkedLinearReceipt(
+    linearOrganizationId: string,
+    deliveryId: string,
+    signatureHash: string,
+  ): Promise<boolean>;
   persistManualEvent(input: PersistManualEventInput): Promise<ManualEventPersistence>;
+  authorizeSignedReceiptReplay(
+    input: ManualReceiptReplayTarget & { organizationId: string; receiptId: string },
+  ): Promise<void>;
   synchronizeGitHubInstallation<T>(installationId: number, operation: () => Promise<T>): Promise<T>;
   pendingGitHubInstallationSyncs(
     owner: GitHubInstallationSyncOwner,
@@ -1432,7 +1499,14 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
     deliveryId: string,
     organizationId?: string,
   ): Promise<ProviderEventReceiptRecord | undefined>;
-  findProviderEventReceiptById(id: string): Promise<ProviderEventReceiptRecord | undefined>;
+  findProviderEventReceiptById(
+    id: string,
+    projection?: "metadata",
+  ): Promise<ProviderEventReceiptRecord | undefined>;
+  findProviderEventReplayMetadata(
+    organizationId: string,
+    key: { id: string } | { deliveryId: string },
+  ): Promise<ProviderEventReplayMetadata | undefined>;
   insertAttachment(input: InsertAttachmentInput): Promise<AttachmentRecord>;
   findAttachmentBySource(
     providerEventReceiptId: string,

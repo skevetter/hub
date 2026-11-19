@@ -7,9 +7,11 @@ settings to enable or tune it.
 A receipt expires when its `received_at` is strictly older than seven days, its committed drop
 reason is one of the four public unhandled-event reasons (`no_project_route`,
 `no_trigger_for_source`, `trigger_filters_rejected`, `configuration_unavailable`), and neither a
-trigger run nor an attachment capability references it. Admission snapshots in `accepted_routes`
-precede trigger matching and do not prove an event was handled. Receipts without a drop decision
-and internal markers for handled events such as `github_lifecycle` stay too. Expired receipts lose
+trigger run nor an attachment capability references it. Marked receipts and `webhook.received`
+receipts are excluded. Admission snapshots in `accepted_routes` precede trigger matching. A
+zero-match route can stamp a drop even when another route has yet to admit work, so this sweep
+can delete the receipt before that route finishes. Receipts without a drop decision
+and internal markers for handled events such as `github_lifecycle` stay too. Deleted receipts lose
 their payload, history, and delivery/signature deduplication; a subsequent delivery is evaluated
 against the current configuration.
 

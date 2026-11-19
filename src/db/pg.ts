@@ -31,7 +31,12 @@ import { ExecutionAuthorityRepository } from "../execution-authority/index.js";
 import { temporaryCredentialFact } from "../agent-sessions/credentials.js";
 import { ScheduleRepository } from "../triggers/schedule/index.js";
 import { GitHubNotificationRepository } from "../triggers/github-notifications/index.js";
-import { acceptWorkflowRun } from "./workflow-intake.js";
+import {
+  acceptWorkflowRun,
+  lockProviderReceipt,
+  markedReceiptAdmission,
+  requiredExistingRun,
+} from "./workflow-intake.js";
 import { randomUUID } from "node:crypto";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
@@ -54,6 +59,7 @@ import {
   toProjectRecord,
   toProviderEventReceiptSummary,
   toProviderEventReceiptRecord,
+  toProviderEventReplayMetadata,
   launchedAgent,
 } from "./mappers.js";
 import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
@@ -76,6 +82,7 @@ import type {
   TransitionAgentExecutionFields,
   TransitionAgentExecutionResult,
   ProviderEventReceiptRecord,
+  ProviderEventReplayMetadata,
   ProviderEventReceiptSummary,
   OrganizationRunRecord,
   UnroutedProviderEventCount,
@@ -111,6 +118,7 @@ import type {
   GitHubLifecycleReceiptClaimInput,
   GitHubInstallationSyncResult,
   PersistManualEventInput,
+  ManualReceiptReplayTarget,
   ProjectConfigurationReadModel,
   ProjectConfigurationRevisionRecord,
   ProjectRecord,
@@ -129,6 +137,7 @@ import type {
   AcceptedTriggerRunRecord,
   RejectedTriggerRunRecord,
   TriggerRunRecord,
+  TriggerRunAdmission,
   WorkflowStepExecutionInput,
   WorkflowStepRunRecord,
   WorkflowWakeupRecord,
@@ -490,6 +499,20 @@ class PgDatabase implements Database {
     return this.triggerAcceptance.persistManual(input);
   }
 
+  findMarkedLinearReceipt(linearOrganizationId: string, deliveryId: string, signatureHash: string) {
+    return this.triggerAcceptance.findMarkedLinearReceipt(
+      linearOrganizationId,
+      deliveryId,
+      signatureHash,
+    );
+  }
+
+  authorizeSignedReceiptReplay(
+    input: ManualReceiptReplayTarget & { organizationId: string; receiptId: string },
+  ) {
+    return this.triggerAcceptance.authorizeSignedReceiptReplay(input);
+  }
+
   synchronizeGitHubInstallation<T>(
     installationId: number,
     operation: () => Promise<T>,
@@ -523,16 +546,24 @@ class PgDatabase implements Database {
   async markProviderEventDropped(
     providerEventReceiptId: string,
     reason: ProviderEventDropReasonCode,
-  ): Promise<void> {
+    organizationId?: string,
+  ): Promise<boolean> {
     const rows = await query(
       this.pool,
       `update provider_event_receipts
       set dropped_reason = coalesce(dropped_reason, $2)
-      where id = $1`,
-      [providerEventReceiptId, reason],
+      where id = $1 and ($3::text is null or organization_id = $3) and payload_expiry_state is null`,
+      [providerEventReceiptId, reason, organizationId ?? null],
     );
-    if (rows.rowCount === 0)
+    if (rows.rowCount !== 0) return true;
+    const receipt = await this.pool.query(
+      `select id from provider_event_receipts
+        where id = $1 and ($2::text is null or organization_id = $2) and payload_expiry_state is not null`,
+      [providerEventReceiptId, organizationId ?? null],
+    );
+    if (receipt.rowCount === 0)
       throw new Error(`provider event receipt not found: ${providerEventReceiptId}`);
+    return false;
   }
 
   async findProviderEventReceiptByDeliveryId(
@@ -547,6 +578,20 @@ class PgDatabase implements Database {
       organizationId === undefined ? [deliveryId] : [deliveryId, organizationId],
     );
     return rows.rows[0] === undefined ? undefined : toProviderEventReceiptRecord(rows.rows[0]);
+  }
+
+  async findProviderEventReplayMetadata(
+    organizationId: string,
+    key: { id: string } | { deliveryId: string },
+  ): Promise<ProviderEventReplayMetadata | undefined> {
+    const byId = "id" in key;
+    const result = await this.pool.query<ProviderEventReceiptRow>(
+      `select id, provider, source, dropped_reason, payload_expiry_state, manual_replay_binding
+         from provider_event_receipts where organization_id = $1
+         and ${byId ? "id" : "delivery_id"} = $2`,
+      [organizationId, byId ? key.id : key.deliveryId],
+    );
+    return result.rows[0] === undefined ? undefined : toProviderEventReplayMetadata(result.rows[0]);
   }
 
   async insertMachine(input: InsertMachineInput): Promise<MachineRecord> {
@@ -824,12 +869,23 @@ class PgDatabase implements Database {
     }
   }
 
+  createAcceptedTriggerRun(
+    input: CreateAcceptedTriggerRunInput,
+  ): Promise<{ run: AcceptedTriggerRunRecord; created: boolean }>;
+  createAcceptedTriggerRun(
+    input: CreateAcceptedTriggerRunInput,
+    replay: "acknowledge",
+  ): Promise<TriggerRunAdmission<AcceptedTriggerRunRecord>>;
   async createAcceptedTriggerRun(
     input: CreateAcceptedTriggerRunInput,
-  ): Promise<{ run: AcceptedTriggerRunRecord; created: boolean }> {
+    replay?: "acknowledge",
+  ): Promise<TriggerRunAdmission<AcceptedTriggerRunRecord>> {
     try {
       return await this.pool.transaction(async (client) => {
-        const { id, created } = await acceptWorkflowRun(client, input);
+        const admission = await acceptWorkflowRun(client, input);
+        if ("receiptReplay" in admission && replay === "acknowledge") return admission;
+        const id =
+          "receiptReplay" in admission ? requiredExistingRun(admission.runId) : admission.id;
         const selected = await client.query<TriggerRunRow>(
           "select * from trigger_runs where id = $1",
           [id],
@@ -837,18 +893,37 @@ class PgDatabase implements Database {
         const run = selected.rows[0]!;
         const record = toTriggerRunRecord(run);
         if (record.outcome !== "accepted") throw new Error("trigger branch outcome conflict");
-        return { run: record, created };
+        return { run: record, created: admission.created };
       });
     } catch (error) {
       throw toDatabaseError(error);
     }
   }
 
+  createRejectedTriggerRun(
+    input: CreateRejectedTriggerRunInput,
+  ): Promise<{ run: RejectedTriggerRunRecord; created: boolean }>;
+  createRejectedTriggerRun(
+    input: CreateRejectedTriggerRunInput,
+    replay: "acknowledge",
+  ): Promise<TriggerRunAdmission<RejectedTriggerRunRecord>>;
   async createRejectedTriggerRun(
     input: CreateRejectedTriggerRunInput,
-  ): Promise<{ run: RejectedTriggerRunRecord; created: boolean }> {
+    replay?: "acknowledge",
+  ): Promise<TriggerRunAdmission<RejectedTriggerRunRecord>> {
     try {
       return await this.pool.transaction(async (client) => {
+        const marked = await markedReceiptAdmission(client, input);
+        if (marked !== undefined) {
+          if (replay === "acknowledge") return marked;
+          const selected = await client.query<TriggerRunRow>(
+            "select * from trigger_runs where id = $1",
+            [requiredExistingRun(marked.runId)],
+          );
+          const record = toTriggerRunRecord(selected.rows[0]!);
+          if (record.outcome !== "rejected") throw new Error("trigger branch outcome conflict");
+          return { run: record, created: false };
+        }
         const createdAt = input.createdAt ?? new Date();
         const inserted = await client.query<TriggerRunRow>(
           `insert into trigger_runs
@@ -880,8 +955,14 @@ class PgDatabase implements Database {
           const existing = await client.query<TriggerRunRow>(
             `select * from trigger_runs
            where provider_event_receipt_id = $1 and project_id = $2 and configured_trigger_name = $3
+             and organization_id = $4
            for update`,
-            [input.providerEventReceiptId, input.projectId, input.configuredTriggerName],
+            [
+              input.providerEventReceiptId,
+              input.projectId,
+              input.configuredTriggerName,
+              input.organizationId,
+            ],
           );
           run = existing.rows[0];
         }
@@ -900,6 +981,20 @@ class PgDatabase implements Database {
     const rows = await query<TriggerRunRow>(this.pool, `select * from trigger_runs where id = $1`, [
       id,
     ]);
+    return rows.rows[0] === undefined ? undefined : toTriggerRunRecord(rows.rows[0]);
+  }
+
+  async findTriggerRunForReceipt(
+    organizationId: string,
+    projectId: string,
+    providerEventReceiptId: string,
+    triggerName: string,
+  ) {
+    const rows = await this.pool.query<TriggerRunRow>(
+      `select * from trigger_runs where organization_id = $1 and project_id = $2
+         and provider_event_receipt_id = $3 and configured_trigger_name = $4`,
+      [organizationId, projectId, providerEventReceiptId, triggerName],
+    );
     return rows.rows[0] === undefined ? undefined : toTriggerRunRecord(rows.rows[0]);
   }
 
@@ -2419,7 +2514,9 @@ class PgDatabase implements Database {
               receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
               receipts.provider_configuration_version, receipts.source, receipts.repo,
               receipts.received_at, receipts.dropped_reason,
-              case when runs.payload_expiry_state is null and receipts.source = 'webhook.received'
+              receipts.payload_expiry_state as receipt_payload_expiry_state,
+              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null
+                     and receipts.source = 'webhook.received'
                      and jsonb_typeof(receipts.payload->'actor') = 'string'
                 then receipts.payload->>'actor'
               end as webhook_actor
@@ -2441,9 +2538,11 @@ class PgDatabase implements Database {
       `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
               receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
               receipts.provider_configuration_version, receipts.source, receipts.repo,
-              case when runs.payload_expiry_state is null then receipts.payload end as payload,
-              receipts.received_at, receipts.dropped_reason,
-              case when runs.payload_expiry_state is null then receipts.accepted_routes end as accepted_routes
+              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null then receipts.payload end as payload,
+              receipts.received_at, receipts.dropped_reason, receipts.pre_routing_drop,
+              receipts.payload_expiry_state as receipt_payload_expiry_state,
+              receipts.payload_expired_at as receipt_payload_expired_at,
+              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null then receipts.accepted_routes end as accepted_routes
        from trigger_runs runs
        join provider_event_receipts receipts
          on receipts.id = runs.provider_event_receipt_id
@@ -2462,9 +2561,11 @@ class PgDatabase implements Database {
       `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
               receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
               receipts.provider_configuration_version, receipts.source, receipts.repo,
-              case when runs.payload_expiry_state is null then receipts.payload end as payload,
-              receipts.received_at, receipts.dropped_reason,
-              case when runs.payload_expiry_state is null then receipts.accepted_routes end as accepted_routes
+              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null then receipts.payload end as payload,
+              receipts.received_at, receipts.dropped_reason, receipts.pre_routing_drop,
+              receipts.payload_expiry_state as receipt_payload_expiry_state,
+              receipts.payload_expired_at as receipt_payload_expired_at,
+              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null then receipts.accepted_routes end as accepted_routes
        from trigger_runs runs
        join provider_event_receipts receipts
          on receipts.id = runs.provider_event_receipt_id
@@ -2488,6 +2589,9 @@ class PgDatabase implements Database {
       receipt: toProviderEventReceiptRecord({
         ...row,
         id: row.provider_event_receipt_id,
+        payload_expiry_state: row.receipt_payload_expiry_state,
+        payload_expired_at: row.receipt_payload_expired_at,
+        manual_replay_binding: null,
         ...(hidden ? { payload: null, accepted_routes: null } : {}),
       }),
       steps: hidden
@@ -2504,7 +2608,10 @@ class PgDatabase implements Database {
   private toProjectActivityRunList(row: ProjectActivityRunListRow): ProjectActivityRunListRecord {
     return {
       run: toTriggerRunRecord(row),
-      receipt: toProviderEventReceiptSummary(row),
+      receipt: toProviderEventReceiptSummary({
+        ...row,
+        payload_expiry_state: row.receipt_payload_expiry_state,
+      }),
       ...(row.webhook_actor === null ? {} : { webhookActor: row.webhook_actor }),
     };
   }
@@ -4603,11 +4710,11 @@ class PgDatabase implements Database {
   async listUnroutedProviderEventsForOrganization(
     organizationId: string,
   ): Promise<ProviderEventReceiptSummary[]> {
-    const rows = await query<ProjectActivityRunListRow>(
+    const rows = await query<ProviderEventReceiptRow>(
       this.pool,
       `select receipts.id, receipts.organization_id, receipts.provider, receipts.connection_id,
               receipts.resource_id, receipts.delivery_id, receipts.signature_hash, receipts.source,
-              receipts.repo, receipts.received_at, receipts.dropped_reason
+              receipts.repo, receipts.received_at, receipts.dropped_reason, receipts.payload_expiry_state
        from provider_event_receipts receipts
        where receipts.organization_id = $1
          and receipts.dropped_reason in (
@@ -4798,11 +4905,20 @@ class PgDatabase implements Database {
     await this.pool.close();
   }
 
-  async findProviderEventReceiptById(id: string): Promise<ProviderEventReceiptRecord | undefined> {
+  async findProviderEventReceiptById(
+    id: string,
+    projection?: "metadata",
+  ): Promise<ProviderEventReceiptRecord | undefined> {
     const rows = await query<ProviderEventReceiptRow>(
       this.pool,
-      "select * from provider_event_receipts where id = $1 limit 1",
-      [id],
+      `select id, organization_id, provider, connection_id, resource_id, delivery_id,
+              signature_hash, provider_application_id, provider_configuration_version, source, repo,
+              received_at, dropped_reason, payload_expiry_state, payload_expired_at,
+              manual_replay_binding, pre_routing_drop,
+              case when not $2 and payload_expiry_state is null then payload end as payload,
+              case when not $2 and payload_expiry_state is null then accepted_routes end as accepted_routes
+       from provider_event_receipts where id = $1 limit 1`,
+      [id, projection === "metadata"],
     );
 
     return rows.rows[0] === undefined ? undefined : toProviderEventReceiptRecord(rows.rows[0]);
@@ -4810,9 +4926,19 @@ class PgDatabase implements Database {
 
   async insertAttachment(input: InsertAttachmentInput): Promise<AttachmentRecord> {
     try {
-      const rows = await query<AttachmentRow>(
-        this.pool,
-        `insert into attachment_capabilities (
+      return await this.pool.transaction(async (transaction) => {
+        const receipt = await lockProviderReceipt(
+          transaction,
+          input.providerEventReceiptId,
+          input.organizationId,
+        );
+        if (receipt === undefined || receipt.payload_expiry_state !== null)
+          throw new Error("attachment receipt unavailable");
+        const key = [input.providerEventReceiptId, input.provider, input.sourceId] as const;
+        const registered = await readAttachmentBySource(transaction, ...key);
+        if (registered !== undefined) return registered;
+        const rows = await transaction.query<AttachmentRow>(
+          `insert into attachment_capabilities (
            provider_event_receipt_id,
            organization_id,
            connection_id,
@@ -4825,27 +4951,24 @@ class PgDatabase implements Database {
          ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          on conflict (provider_event_receipt_id, provider, source_id) do nothing
          returning *`,
-        [
-          input.providerEventReceiptId,
-          input.organizationId,
-          input.connectionId,
-          input.provider,
-          input.sourceId,
-          JSON.stringify(input.locator),
-          input.filename,
-          input.contentType ?? null,
-          input.byteSize ?? null,
-        ],
-      );
-      const inserted = rows.rows[0];
-      if (inserted !== undefined) return toAttachmentRecord(inserted);
-      const existing = await this.findAttachmentBySource(
-        input.providerEventReceiptId,
-        input.provider,
-        input.sourceId,
-      );
-      if (existing === undefined) throw new Error("attachment insert conflict without row");
-      return existing;
+          [
+            input.providerEventReceiptId,
+            input.organizationId,
+            input.connectionId,
+            input.provider,
+            input.sourceId,
+            JSON.stringify(input.locator),
+            input.filename,
+            input.contentType ?? null,
+            input.byteSize ?? null,
+          ],
+        );
+        const inserted = rows.rows[0];
+        if (inserted !== undefined) return toAttachmentRecord(inserted);
+        const existing = await readAttachmentBySource(transaction, ...key);
+        if (existing === undefined) throw new Error("attachment insert conflict without row");
+        return existing;
+      });
     } catch (error) {
       throw toDatabaseError(error);
     }
@@ -4856,13 +4979,7 @@ class PgDatabase implements Database {
     provider: AttachmentProvider,
     sourceId: string,
   ): Promise<AttachmentRecord | undefined> {
-    const rows = await query<AttachmentRow>(
-      this.pool,
-      `select * from attachment_capabilities
-       where provider_event_receipt_id = $1 and provider = $2 and source_id = $3 limit 1`,
-      [providerEventReceiptId, provider, sourceId],
-    );
-    return rows.rows[0] === undefined ? undefined : toAttachmentRecord(rows.rows[0]);
+    return readAttachmentBySource(this.pool, providerEventReceiptId, provider, sourceId);
   }
 
   async findAttachmentForExecution(
@@ -4876,16 +4993,38 @@ class PgDatabase implements Database {
        join agent_executions execution
          on execution.id = $1
         and execution.organization_id = attachment.organization_id
+        and execution.status in ('spawning', 'running')
        join workflow_step_runs step_run
          on step_run.id = execution.workflow_step_run_id
        join trigger_runs trigger_run
          on trigger_run.id = step_run.trigger_run_id
         and trigger_run.provider_event_receipt_id = attachment.provider_event_receipt_id
+       join provider_event_receipts receipt
+         on receipt.id = attachment.provider_event_receipt_id
+        and receipt.organization_id = attachment.organization_id
+        and receipt.payload_expiry_state is null
        where attachment.id = $2 limit 1`,
       [executionId, attachmentId],
     );
     return rows.rows[0] === undefined ? undefined : toAttachmentRecord(rows.rows[0]);
   }
+}
+
+async function readAttachmentBySource(
+  handle: QueryHandle,
+  receiptId: string,
+  provider: AttachmentProvider,
+  sourceId: string,
+): Promise<AttachmentRecord | undefined> {
+  const rows = await handle.query<AttachmentRow>(
+    `select attachment.* from attachment_capabilities attachment
+       join provider_event_receipts receipt on receipt.id = attachment.provider_event_receipt_id
+       and receipt.organization_id = attachment.organization_id
+     where receipt.id = $1 and attachment.provider = $2 and attachment.source_id = $3
+       and receipt.payload_expiry_state is null limit 1`,
+    [receiptId, provider, sourceId],
+  );
+  return rows.rows[0] === undefined ? undefined : toAttachmentRecord(rows.rows[0]);
 }
 
 async function lockValidProjectRevision(
@@ -5004,6 +5143,10 @@ export interface ProviderEventReceiptRow extends QueryRow {
   received_at: Date;
   dropped_reason: string | null;
   accepted_routes: unknown;
+  payload_expiry_state: NonNullable<ProviderEventReceiptRecord["payloadExpiryState"]> | null;
+  payload_expired_at: Date | null;
+  pre_routing_drop: NonNullable<ProviderEventReceiptRecord["preRoutingDrop"]> | null;
+  manual_replay_binding: unknown;
 }
 
 interface TriggerRunRow extends QueryRow {
@@ -5051,6 +5194,9 @@ interface ProjectActivityRunRow extends TriggerRunRow {
   received_at: Date;
   dropped_reason: string | null;
   accepted_routes: unknown;
+  receipt_payload_expiry_state: ProviderEventReceiptRow["payload_expiry_state"];
+  receipt_payload_expired_at: Date | null;
+  pre_routing_drop: ProviderEventReceiptRow["pre_routing_drop"];
 }
 
 interface OrganizationRunRow extends QueryRow {
@@ -5075,6 +5221,7 @@ interface ProjectActivityRunListRow extends TriggerRunRow {
   received_at: Date;
   dropped_reason: string | null;
   webhook_actor: string | null;
+  receipt_payload_expiry_state: ProviderEventReceiptRow["payload_expiry_state"];
 }
 
 interface WorkflowStepRunRow extends QueryRow {

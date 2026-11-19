@@ -27,7 +27,7 @@ async function loadReceiptFanout(database: QueryHandle, receiptIds: readonly str
   const receipts = await database.query<FanoutReceipt & Record<string, unknown>>(
     `select id, organization_id as "organizationId", provider, source, accepted_routes as "acceptedRoutes",
        case when provider in ('github', 'linear') then payload end as payload
-     from provider_event_receipts where id = any($1::uuid[])`,
+     from provider_event_receipts where id = any($1::uuid[]) and payload_expiry_state is null`,
     [receiptIds],
   );
   const revisionIds = new Set<string>();
