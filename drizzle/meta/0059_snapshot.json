@@ -1,5 +1,5 @@
 {
-  "id": "5210b97c-a19b-4ee8-953a-e705a4770e44",
+  "id": "c99ad545-ef16-4d11-8e85-ee2bca4e8f8a",
   "prevId": "138fc3f6-4f90-43ff-889d-bd9a57e097bb",
   "version": "7",
   "dialect": "postgresql",
@@ -2247,6 +2247,24 @@
           "primaryKey": false,
           "notNull": false,
           "default": "now()"
+        },
+        "settled_at": {
+          "name": "settled_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "audit_link": {
+          "name": "audit_link",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "payload_expired_at": {
+          "name": "payload_expired_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
         }
       },
       "indexes": {
@@ -2283,6 +2301,10 @@
       },
       "policies": {},
       "checkConstraints": {
+        "github_installation_syncs_settlement_check": {
+          "name": "github_installation_syncs_settlement_check",
+          "value": "(\"github_installation_syncs\".\"settled_at\" is null and \"github_installation_syncs\".\"audit_link\" is null and \"github_installation_syncs\".\"payload_expired_at\" is null)\n        or (\"github_installation_syncs\".\"kind\" = 'webhook' and \"github_installation_syncs\".\"settled_at\" is not null\n            and \"github_installation_syncs\".\"retry_at\" is null and \"github_installation_syncs\".\"audit_link\" is not null)"
+        },
         "github_installation_syncs_evidence_check": {
           "name": "github_installation_syncs_evidence_check",
           "value": "(\n    \"github_installation_syncs\".\"kind\" = 'webhook' AND \"github_installation_syncs\".\"provider_application_id\" IS NOT NULL AND \"github_installation_syncs\".\"delivery_id\" IS NOT NULL AND \"github_installation_syncs\".\"signature_hash\" IS NOT NULL\n    AND \"github_installation_syncs\".\"source\" IS NOT NULL AND \"github_installation_syncs\".\"source\" IN ('github.installation', 'github.installation_repositories') AND \"github_installation_syncs\".\"payload\" IS NOT NULL\n  ) OR (\n    \"github_installation_syncs\".\"kind\" = 'reconcile' AND \"github_installation_syncs\".\"connection_id\" IS NOT NULL AND \"github_installation_syncs\".\"delivery_id\" IS NULL\n    AND \"github_installation_syncs\".\"signature_hash\" IS NULL AND \"github_installation_syncs\".\"source\" IS NULL AND \"github_installation_syncs\".\"payload\" IS NULL\n  )"
@@ -2339,6 +2361,12 @@
         },
         "last_error_at": {
           "name": "last_error_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "diagnostic_expired_at": {
+          "name": "diagnostic_expired_at",
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false

@@ -1187,6 +1187,11 @@ export const githubConnections = pgTable(
   ],
 );
 
+export type GitHubSyncAuditLink =
+  | { kind: "receipt"; receiptId: string; organizationId: string }
+  | { kind: "none" }
+  | { kind: "unproven" };
+
 export const githubInstallationSyncs = pgTable(
   "github_installation_syncs",
   {
@@ -1202,11 +1207,20 @@ export const githubInstallationSyncs = pgTable(
     payload: jsonb(),
     receivedAt: timestamp("received_at", { withTimezone: true }).defaultNow().notNull(),
     retryAt: timestamp("retry_at", { withTimezone: true }).defaultNow(),
+    settledAt: timestamp("settled_at", { withTimezone: true }),
+    auditLink: jsonb("audit_link").$type<GitHubSyncAuditLink>(),
+    payloadExpiredAt: timestamp("payload_expired_at", { withTimezone: true }),
   },
   (table) => [
     index("github_installation_syncs_pending_idx")
       .on(table.retryAt)
       .where(sql`${table.retryAt} is not null`),
+    check(
+      "github_installation_syncs_settlement_check",
+      sql`(${table.settledAt} is null and ${table.auditLink} is null and ${table.payloadExpiredAt} is null)
+        or (${table.kind} = 'webhook' and ${table.settledAt} is not null
+            and ${table.retryAt} is null and ${table.auditLink} is not null)`,
+    ),
     check(
       "github_installation_syncs_evidence_check",
       sql`(
@@ -1783,6 +1797,7 @@ export const githubNotificationCursors = pgTable("github_notification_cursors", 
   /** The latest failure message with the token removed. Cleared by the next success. */
   lastError: text("last_error"),
   lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
+  diagnosticExpiredAt: timestamp("diagnostic_expired_at", { withTimezone: true }),
 });
 
 export const executionAuthorities = pgTable("execution_authorities", {

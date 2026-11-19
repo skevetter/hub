@@ -191,7 +191,12 @@ describe("database migration application", () => {
        insert into provider_event_receipts
          (organization_id, provider, delivery_id, signature_hash, source, payload, accepted_routes)
        values ('receipt-upgrade', 'github', 'delivery', 'signature', 'github.issues',
-               '{"body":"original"}', '[{"historical":true}]');`,
+               '{"body":"original"}', '[{"historical":true}]');
+       insert into github_installation_syncs
+         (kind, provider_application_id, installation_id, delivery_id, signature_hash, source, payload, retry_at)
+       values ('webhook','app',1,'sync-delivery','sync-signature','github.installation','{"body":"original sync"}',null);
+       insert into github_notification_cursors (source, since, next_poll_at, last_error, last_error_at)
+       values ('notifications',now(),now(),'old diagnostic',now());`,
     );
     const before = await poolQuery<{ value: Record<string, unknown> }>(
       url,
@@ -199,6 +204,31 @@ describe("database migration application", () => {
     );
     const database = await createDatabase(url);
     try {
+      assert.deepEqual(
+        (
+          await poolQuery(
+            url,
+            "select settled_at, audit_link, payload_expired_at, payload from github_installation_syncs",
+          )
+        ).rows,
+        [
+          {
+            settled_at: null,
+            audit_link: null,
+            payload_expired_at: null,
+            payload: { body: "original sync" },
+          },
+        ],
+      );
+      assert.deepEqual(
+        (
+          await poolQuery(
+            url,
+            "select last_error, diagnostic_expired_at from github_notification_cursors",
+          )
+        ).rows,
+        [{ last_error: "old diagnostic", diagnostic_expired_at: null }],
+      );
       const after = await poolQuery<{ value: object }>(
         url,
         "select to_jsonb(receipt) as value from provider_event_receipts receipt",
