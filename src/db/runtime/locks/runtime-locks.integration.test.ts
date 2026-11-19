@@ -48,6 +48,10 @@ async function assertSameKeySerializes(bundle: DatabaseRuntimeBundle): Promise<v
     events.push("first:end");
   });
   await entered;
+  const skipped = await bundle.runtime.transaction((transaction) =>
+    bundle.locks.tryTxLock(transaction, "shared"),
+  );
+  assert.equal(skipped, false);
   const second = bundle.locks.withLock("shared", async () => {
     events.push("second:start");
     events.push("second:end");
@@ -57,4 +61,10 @@ async function assertSameKeySerializes(bundle: DatabaseRuntimeBundle): Promise<v
   releaseFirst();
   await Promise.all([first, second]);
   assert.deepEqual(events, ["first:start", "first:end", "second:start", "second:end"]);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const acquired = await bundle.runtime.transaction((transaction) =>
+      bundle.locks.tryTxLock(transaction, "shared"),
+    );
+    assert.equal(acquired, true);
+  }
 }
