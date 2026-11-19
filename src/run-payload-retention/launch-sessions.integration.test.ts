@@ -721,4 +721,112 @@ describe("launch and session expiry in PostgreSQL", () => {
       }
     },
   );
+
+  it.each(["link", "expiry"] as const)(
+    "serializes reverse-only workflow ownership with %s first",
+    async (first) => {
+      const { runtime, locks, database, url } = await freshDatabase();
+      const other = await postgresDatabaseRuntime(url);
+      const paused = pauseAfter(runtime, (statement) =>
+        first === "link"
+          ? statement === "select * from agent_executions where id = $1 for update"
+          : statement.includes('owners."runId", execution.launch_intent'),
+      );
+      const firstStore = createDatabase(paused.database, locks);
+      const secondStore = createDatabase(other.runtime, other.locks);
+      try {
+        const run = await newRun(runtime);
+        const step = randomUUID();
+        await runtime.query(
+          `insert into workflow_step_runs (id, trigger_run_id, step_id, ordinal, status)
+           values ($1, $2, 'agent', 0, 'pending')`,
+          [step, run],
+        );
+        const old = await arrivals(database).arrival();
+        await database.transitionAgentExecution(old.id, "succeeded");
+        await runtime.query("update agent_executions set completed_at = $2 where id = $1", [
+          old.id,
+          OLD,
+        ]);
+        if (first === "link") {
+          const linking = firstStore.linkWorkflowStepRunExecution(step, old.id);
+          await paused.held;
+          try {
+            assert.equal(await secondStore.expireLaunchIntent(old.id, CUTOFF, NOW), false);
+          } finally {
+            paused.release();
+            assert.equal((await linking).agentExecutionId, old.id);
+          }
+          assert.equal(await secondStore.expireLaunchIntent(old.id, CUTOFF, NOW), false);
+          assert.ok((await database.findAgentExecutionById(old.id))?.launchIntent);
+        } else {
+          const expiring = firstStore.expireLaunchIntent(old.id, CUTOFF, NOW);
+          await paused.held;
+          const rejected = assert.rejects(
+            secondStore.linkWorkflowStepRunExecution(step, old.id),
+            /launch intent expired/u,
+          );
+          try {
+            await vi.waitFor(async () => {
+              const result = await other.runtime.query<{ waiting: boolean }>(
+                "select exists (select 1 from pg_locks where locktype = 'transactionid' and not granted) as waiting",
+              );
+              assert.equal(result.rows[0]?.waiting, true);
+            });
+          } finally {
+            paused.release();
+            await Promise.allSettled([expiring, rejected]);
+          }
+          assert.equal(await expiring, true);
+          await rejected;
+          const untouched = await database.findWorkflowStepRunById(step);
+          assert.equal(untouched?.status, "pending");
+          assert.equal(untouched.agentExecutionId, null);
+          assert.equal((await database.findAgentExecutionById(old.id))?.launchIntent, null);
+        }
+      } finally {
+        paused.release();
+        await Promise.all([runtime.close(), other.runtime.close()]);
+      }
+    },
+  );
+
+  it("keeps a nonarchiving launch while its finish acknowledgement is pending", async () => {
+    const { runtime, database } = await freshDatabase();
+    try {
+      const { id } = await arrivals(database).arrival();
+      await runtime.query(
+        `update agent_executions
+         set launch_intent = (launch_intent - 'continuation') || '{"autoArchive": false}' where id = $1`,
+        [id],
+      );
+      const observation = { kind: "finish_execution", callId: "fixture-call" } as const;
+      await database.recordAgentExecutionHubAcknowledgement(id, {
+        ...observation,
+        status: "running",
+        observedAt: OLD,
+      });
+      await database.transitionAgentExecution(id, "succeeded", {
+        completedByAgent: true,
+        hubAction: null,
+      });
+      await runtime.query("update agent_executions set completed_at = $2 where id = $1", [id, OLD]);
+      const report = await drain(new RunPayloadRetention(database, settings));
+      assert.equal(report.auxiliaryCounts.launchIntent.pending_hub_action?.count, 1);
+      assert.equal(report.launchIntentsExpired, 0);
+      assert.equal(await database.expireLaunchIntent(id, CUTOFF, NOW), false);
+      const acknowledged = await database.recordAgentExecutionHubAcknowledgement(id, {
+        ...observation,
+        status: "completed",
+        observedAt: NOW,
+      });
+      assert.equal(
+        acknowledged?.hubActionAcknowledgements.finishExecutionCall?.status,
+        "completed",
+      );
+      assert.equal(await database.expireLaunchIntent(id, CUTOFF, NOW), true);
+    } finally {
+      await runtime.close();
+    }
+  });
 });

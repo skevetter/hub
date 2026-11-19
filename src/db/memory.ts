@@ -318,7 +318,9 @@ class MemoryDatabase implements Database {
     const run = runId === null ? undefined : this.triggerRuns.get(runId);
     const ageFrom = execution.completedAt ?? execution.startedAt;
     let disposition: AuxiliaryPayloadCandidate["disposition"] = "eligible";
-    if (execution.usedTemporaryCredentials == null) disposition = "flag_unknown";
+    if (execution.hubActionAcknowledgements.finishExecutionCall?.status === "running")
+      disposition = "pending_hub_action";
+    else if (execution.usedTemporaryCredentials == null) disposition = "flag_unknown";
     else if (
       this.hasUnsettledExecution(execution) ||
       ids.size > 1 ||
@@ -352,6 +354,13 @@ class MemoryDatabase implements Database {
     else if (executions.length === 0) disposition = "unused_session";
     else if (!executions.some((execution) => execution.agentSessionAction !== null))
       disposition = "incomplete_bootstrap";
+    else if (
+      executions.some(
+        (execution) =>
+          execution.hubActionAcknowledgements.finishExecutionCall?.status === "running",
+      )
+    )
+      disposition = "pending_hub_action";
     else if (executions.some((execution) => this.hasUnsettledExecution(execution)))
       disposition = "live_owner";
     else if (executions.some((execution) => execution.usedTemporaryCredentials == null))
@@ -1682,6 +1691,8 @@ class MemoryDatabase implements Database {
     if (execution === undefined) throw new Error(`agent execution not found: ${executionId}`);
     if (this.triggerRuns.get(step.triggerRunId)?.payloadExpiredAt != null)
       return this.projectStepPayload(step);
+    if (execution.launchIntentExpiredAt != null)
+      throw new Error("agent execution launch intent expired");
     const updated = {
       ...step,
       status:
@@ -3724,6 +3735,7 @@ class MemoryDatabase implements Database {
     if (
       !execution ||
       !session ||
+      execution.launchIntentExpiredAt != null ||
       execution.projectId !== session.projectId ||
       execution.organizationId !== session.organizationId ||
       (execution.agentSessionId !== null && execution.agentSessionId !== sessionId)

@@ -19,6 +19,8 @@ const UNSETTLED_EXECUTION = `(
   or exists (select 1 from execution_credential_leases where execution_id = execution.id)
 )`;
 
+const PENDING_FINISH_ACK = `execution.hub_action_acknowledgements #>> '{finish_execution_call,status}' = 'running'`;
+
 const EXECUTION_OWNERS = `
   cross join lateral (
     select case when execution.launch_intent ->> 'triggerRunId'
@@ -41,6 +43,7 @@ const EXECUTION_OWNERS = `
   ) owners on true`;
 
 const LAUNCH_INTENT_DISPOSITION = `case
+  when ${PENDING_FINISH_ACK} then 'pending_hub_action'
   when execution.used_temporary_credentials is null then 'flag_unknown'
   when ${UNSETTLED_EXECUTION}
     or owners.count > 1
@@ -56,6 +59,7 @@ const SESSION_OWNERS = `
   left join lateral (
     select count(*) as count, bool_or(execution.agent_session_action is not null) as bootstrapped,
            bool_or(${UNSETTLED_EXECUTION}) as live,
+           bool_or(${PENDING_FINISH_ACK}) as pending_finish_ack,
            bool_or(execution.used_temporary_credentials is null) as unknown,
            max(coalesce(execution.completed_at, execution.started_at)) as last_activity
     from agent_executions execution where execution.agent_session_id = session.id
@@ -69,6 +73,7 @@ const SESSION_DISPOSITION = `case
   when owners.count = 0 then 'unused_session'
   when owners.bootstrapped is not true or jsonb_typeof(session.creation_options) is distinct from 'object'
     then 'incomplete_bootstrap'
+  when owners.pending_finish_ack then 'pending_hub_action'
   when owners.live then 'live_owner'
   when owners.unknown then 'flag_unknown'
   when owners.last_activity >= $2 then 'not_old_enough'

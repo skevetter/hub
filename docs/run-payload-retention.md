@@ -1,14 +1,19 @@
 # Run payload retention
 
+**Rollback after redaction.** Set the mode to `off` first and keep every Hub binary at the
+build that added launch and session expiry or newer. Once `on` has removed a launch intent
+or reduced session options, never run build 14 or older against that database. Build 14
+can resume a previously credentialed agent and write removed session options back.
+
 Hub can expire run-owned content after a terminal run has a recorded completion time. The
 retention window starts at completion. A run becomes old enough strictly after that window
 and stays eligible only while its work is settled.
 
-| Setting                                          | Default | Accepted values                                                                        |
-| ------------------------------------------------ | ------- | -------------------------------------------------------------------------------------- |
-| `PASEO_HUB_RUN_PAYLOAD_EXPIRY`                   | `off`   | `off` skips the sweep, `count` reports eligibility, and `on` redacts eligible content. |
-| `PASEO_HUB_RUN_PAYLOAD_RETENTION_DAYS`           | `30`    | Whole days from 1 to 365.                                                              |
-| `PASEO_HUB_RUN_PAYLOAD_EXPIRY_MAX_RUNS_PER_PASS` | `50`    | A positive whole number. Caps completed run, launch and session redactions per sweep.  |
+| Setting                                          | Default | Accepted values                                                                                                                                                                                                                                                          |
+| ------------------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PASEO_HUB_RUN_PAYLOAD_EXPIRY`                   | `off`   | `off` skips the sweep and `count` reports eligibility. `on` redacts eligible content. After `on` removes a launch intent or reduces session options, set the mode to `off` first for rollback and keep every binary at this build or newer. Never run build 14 or older. |
+| `PASEO_HUB_RUN_PAYLOAD_RETENTION_DAYS`           | `30`    | Whole days from 1 to 365.                                                                                                                                                                                                                                                |
+| `PASEO_HUB_RUN_PAYLOAD_EXPIRY_MAX_RUNS_PER_PASS` | `50`    | A positive whole number. Caps completed run, launch and session redactions per sweep.                                                                                                                                                                                    |
 
 Set these environment variables on the Hub process and restart. The run payload and timeline
 windows are configured independently. Hub rejects startup in `on` mode when the payload
@@ -52,7 +57,4 @@ This policy covers logical redaction in the live Hub database. Backups, WAL, old
 daemon transcripts, and provider comments and files are outside this policy. Receipts still
 hold the raw event body and are scheduled for expiry in a later build.
 
-Set the mode to `off` before a rollback. Keep every binary at this build or newer while
-`on` is enabled or after it has redacted any content. Build 14 can miss credentialed-session
-history after a launch intent expires and can overwrite reduced options. Build 13 and
-earlier can also expose a retained receipt body or restore redacted step output.
+Build 13 and earlier can also expose a retained receipt body or restore redacted step output.

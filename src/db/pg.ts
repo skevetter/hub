@@ -1179,12 +1179,14 @@ class PgDatabase implements Database {
           return toWorkflowStepRunRecord(step);
         }
         const execution = await client.query<AgentExecutionRow>(
-          `select * from agent_executions where id = $1`,
+          `select * from agent_executions where id = $1 for update`,
           [executionId],
         );
         const executionRow = execution.rows[0];
         if (executionRow === undefined)
           throw new Error(`agent execution not found: ${executionId}`);
+        if (executionRow.launch_intent_expired_at != null)
+          throw new Error("agent execution launch intent expired");
         const updated = await client.query<WorkflowStepRunRow>(
           `update workflow_step_runs
          set status = case when status = 'pending' then 'running' else status end,
@@ -3296,6 +3298,7 @@ class PgDatabase implements Database {
       `update agent_executions e set agent_session_id = s.id, agent_session_action = coalesce(e.agent_session_action, $3) from agent_sessions s
        where e.id = $1 and s.id = $2 and e.project_id = s.project_id
        and e.organization_id = s.organization_id
+       and e.launch_intent_expired_at is null
        and (e.agent_session_id is null or e.agent_session_id = s.id)`,
       [executionId, sessionId, action ?? null],
     );

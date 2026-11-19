@@ -21,6 +21,7 @@ export type AuxiliaryPayloadKind = "launchIntent" | "session" | "machine";
 export type AuxiliaryPayloadDisposition =
   | "eligible"
   | "flag_unknown"
+  | "pending_hub_action"
   | "live_owner"
   | "unbound_session"
   | "incomplete_bootstrap"
