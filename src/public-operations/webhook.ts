@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import type { CompiledTrigger } from "../config/compiler.js";
-import type { ProviderEventReceiptRecord } from "../db/types.js";
+import type { ProviderEventReplayMetadata } from "../db/types.js";
 import { formatInvocationRejection } from "../triggers/invocation.js";
 import { parseManualInvocation, type ManualRunPayload } from "../triggers/manual/provider.js";
+import { authorizeMarkedManualReplay, publicManualIdentity } from "./manual-replay.js";
 import type {
   PublicAuthorization,
   PublicOperationCapabilities,
@@ -57,11 +58,20 @@ async function resolveTarget(
 
 async function receiptResult(
   repository: PublicOperationRepository,
-  receipt: ProviderEventReceiptRecord,
+  receipt: ProviderEventReplayMetadata,
+  organizationId: string,
+  projectId: string,
   input: ReceiveWebhookInput,
   duplicate: boolean,
 ): Promise<ReceiveWebhookResult> {
-  const run = await repository.findManualRun(receipt.id, input.trigger);
+  const run = await repository.findManualRun(organizationId, projectId, receipt.id, input.trigger);
+  if (
+    run !== undefined &&
+    receipt.payloadExpiryState != null &&
+    run.configurationRevisionId !== receipt.manualReplayBinding?.configurationRevisionId
+  ) {
+    return { status: "dispatch_conflict" };
+  }
   if (run === undefined) {
     return receipt.droppedReason === "trigger_filters_rejected"
       ? { status: "filtered", duplicate }
@@ -107,6 +117,20 @@ export async function receiveWebhook(
     signature?.targetTriggerId,
   );
   if (target.status !== "resolved") return target;
+  const replayTarget = {
+    projectId: target.projectId,
+    publicTriggerName: input.trigger,
+    source: "webhook.received" as const,
+    ...(signature === undefined
+      ? {}
+      : {
+          boundWebhookTrigger: {
+            id: signature.targetTriggerId,
+            name: input.trigger,
+            configurationRevisionId: target.configurationRevisionId,
+          },
+        }),
+  };
 
   const deliveryId =
     signature === undefined
@@ -129,9 +153,34 @@ export async function receiveWebhook(
             ]),
           )
           .digest("hex")}`;
-  const existing = await repository.findWebhookReceipt(authorization.organizationId, deliveryId);
+  const existing = await repository.findManualReceipt(authorization.organizationId, deliveryId);
   if (existing !== undefined) {
-    const replay = await receiptResult(repository, existing, input, true);
+    if (existing.payloadExpiryState != null) {
+      await authorizeMarkedManualReplay(
+        repository,
+        capabilities,
+        authorization,
+        existing,
+        replayTarget,
+        target.actor,
+      );
+      return receiptResult(
+        repository,
+        existing,
+        authorization.organizationId,
+        target.projectId,
+        input,
+        true,
+      );
+    }
+    const replay = await receiptResult(
+      repository,
+      existing,
+      authorization.organizationId,
+      target.projectId,
+      input,
+      true,
+    );
     if (replay.status !== "dispatch_conflict") return replay;
   }
   const payload: ManualRunPayload = {
@@ -167,31 +216,33 @@ export async function receiveWebhook(
     if (active >= maxActiveRuns) return { status: "trigger_busy" };
   }
   const outcome = await capabilities.dispatchManualEvent({
+    ...replayTarget,
     organizationId: authorization.organizationId,
-    projectId: target.projectId,
-    source: "webhook.received",
     deliveryId,
     receivedAt: new Date(),
-    ...(signature === undefined
-      ? {}
-      : {
-          boundWebhookTrigger: {
-            id: signature.targetTriggerId,
-            name: input.trigger,
-            configurationRevisionId: target.configurationRevisionId,
-          },
-        }),
     payload: {
       ...payload,
-      authenticatedBy: {
-        kind: "api-key",
-        credentialId: authorization.credentialId,
-        boundActor: target.actor,
-      },
+      ...publicManualIdentity(authorization, target.actor),
     },
   });
   if (outcome === undefined) return { status: "dispatch_conflict" };
-  const receipt = await repository.findWebhookReceipt(authorization.organizationId, deliveryId);
+  const receipt = await repository.findManualReceipt(authorization.organizationId, deliveryId);
   if (receipt === undefined) return { status: "dispatch_conflict" };
-  return receiptResult(repository, receipt, input, outcome.replayed === true);
+  if (receipt.payloadExpiryState != null)
+    await authorizeMarkedManualReplay(
+      repository,
+      capabilities,
+      authorization,
+      receipt,
+      replayTarget,
+      target.actor,
+    );
+  return receiptResult(
+    repository,
+    receipt,
+    authorization.organizationId,
+    target.projectId,
+    input,
+    outcome.replayed === true || receipt.payloadExpiryState != null,
+  );
 }

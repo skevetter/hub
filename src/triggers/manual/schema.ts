@@ -28,4 +28,5 @@ export const ManualTriggerPayloadSchema = z.object({
 
 export type ManualTriggerInput = z.infer<typeof ManualTriggerPayloadSchema> & {
   boundWebhookTrigger?: BoundWebhookTrigger;
+  publicTriggerName?: string;
 };

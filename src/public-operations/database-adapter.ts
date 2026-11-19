@@ -63,8 +63,9 @@ export function createDatabasePublicOperationRepository(
         ? undefined
         : { id: trigger.runtimeProjectId, triggerId: trigger.id };
     },
-    findWebhookReceipt: (organizationId, deliveryId) =>
-      database.findProviderEventReceiptByDeliveryId(deliveryId, organizationId),
+    findManualReceipt: (organizationId, deliveryId) =>
+      database.findProviderEventReplayMetadata(organizationId, { deliveryId }),
+    authorizeSignedReceiptReplay: (input) => database.authorizeSignedReceiptReplay(input),
     countActiveTriggerRuns: (organizationId, projectId, triggerName) =>
       database.countActiveTriggerRuns(organizationId, projectId, triggerName),
     async resolveManualRunProject(organizationId, triggerName, projectSlug) {
@@ -82,11 +83,7 @@ export function createDatabasePublicOperationRepository(
         : { status: "resolved", id: project.id };
     },
     resolveDeploymentProject: (input) => deploymentProjects.resolve(input),
-    async findManualRun(providerEventReceiptId, trigger) {
-      return (await database.findTriggerRunsByProviderEventReceiptId(providerEventReceiptId)).find(
-        (candidate) => candidate.configuredTriggerName === trigger,
-      );
-    },
+    findManualRun: (...scope) => database.findTriggerRunForReceipt(...scope),
     async issueEnrollmentToken(authorization, input) {
       const issued = await database.issueEnrollmentToken({
         id: randomUUID(),

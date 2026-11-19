@@ -194,16 +194,25 @@ export class DurableWorkflowEngine {
   }
 
   async enqueue(trigger: DurableProviderEvent): Promise<TriggerDispatchOutcome> {
-    if (this.options.database === null) throw new DatabaseUnavailableError();
+    const database = this.options.database;
+    if (database === null) throw new DatabaseUnavailableError();
+    const receipt = await database.findProviderEventReplayMetadata(trigger.organizationId, {
+      id: trigger.providerEventReceiptId,
+    });
+    if (receipt?.payloadExpiryState != null)
+      return { providerEventReceiptId: trigger.providerEventReceiptId, replayed: true };
     const { matches, dropReason } = await collectProviderMatches(
       this.options.providers ?? [],
       trigger,
     );
     if (matches.length === 0) {
-      await this.options.database.markProviderEventDropped(
+      const dropped = await database.markProviderEventDropped(
         trigger.providerEventReceiptId,
         dropReason,
+        trigger.organizationId,
       );
+      if (!dropped)
+        return { providerEventReceiptId: trigger.providerEventReceiptId, replayed: true };
       logProviderEventRouting({
         source: trigger.source,
         deliveryId: trigger.deliveryId,
@@ -217,27 +226,30 @@ export class DurableWorkflowEngine {
       return { providerEventReceiptId: trigger.providerEventReceiptId };
     }
     const createdAt = this.now();
-    await Promise.all(
+    const replays = await Promise.all(
       matches.map(async (match) => {
         const configurationRevisionId =
           match.configurationRevisionId ?? this.options.configurationRevisionId;
         if (configurationRevisionId === undefined)
           throw new Error("workflow_configuration_revision_required");
         if (match.invocation.status === "rejected") {
-          await this.options.database!.createRejectedTriggerRun({
-            organizationId: trigger.organizationId,
-            projectId: trigger.projectId,
-            configurationRevisionId,
-            providerEventReceiptId: trigger.providerEventReceiptId,
-            configuredTriggerName: match.triggerName,
-            prompt: match.invocation.prompt,
-            inputs: match.invocation.inputs,
-            triggerContext: match.triggerContext,
-            outputContext: match.outputContext,
-            rejection: match.invocation.rejection,
-            createdAt,
-          });
-          return;
+          const rejected = await database.createRejectedTriggerRun(
+            {
+              organizationId: trigger.organizationId,
+              projectId: trigger.projectId,
+              configurationRevisionId,
+              providerEventReceiptId: trigger.providerEventReceiptId,
+              configuredTriggerName: match.triggerName,
+              prompt: match.invocation.prompt,
+              inputs: match.invocation.inputs,
+              triggerContext: match.triggerContext,
+              outputContext: match.outputContext,
+              rejection: match.invocation.rejection,
+              createdAt,
+            },
+            "acknowledge",
+          );
+          return "receiptReplay" in rejected;
         }
         if (!isAcceptedTriggerProviderMatch(match))
           throw new Error("accepted workflow match required");
@@ -254,22 +266,25 @@ export class DurableWorkflowEngine {
         // Accepting a trigger reserves nothing: a trigger can skip every step, and multi-step
         // workflows create several executions. Metering happens per execution, at creation time
         // (see processWakeup), so the meter is genuinely per-execution and atomic with the work.
-        const created = await this.options.database!.createAcceptedTriggerRun({
-          organizationId: trigger.organizationId,
-          projectId: trigger.projectId,
-          configurationRevisionId,
-          providerEventReceiptId: trigger.providerEventReceiptId,
-          configuredTriggerName: acceptedMatch.triggerName,
-          prompt: acceptedMatch.invocation.prompt,
-          inputs: acceptedMatch.invocation.inputs,
-          triggerContext: acceptedMatch.triggerContext,
-          outputContext: acceptedMatch.outputContext,
-          conversation: acceptedMatch.conversation,
-          deadlineAt: runDeadline,
-          stepIds: compiledTrigger.steps.map((step) => step.id),
-          createdAt,
-        });
-        if (!created.created) return;
+        const created = await database.createAcceptedTriggerRun(
+          {
+            organizationId: trigger.organizationId,
+            projectId: trigger.projectId,
+            configurationRevisionId,
+            providerEventReceiptId: trigger.providerEventReceiptId,
+            configuredTriggerName: acceptedMatch.triggerName,
+            prompt: acceptedMatch.invocation.prompt,
+            inputs: acceptedMatch.invocation.inputs,
+            triggerContext: acceptedMatch.triggerContext,
+            outputContext: acceptedMatch.outputContext,
+            conversation: acceptedMatch.conversation,
+            deadlineAt: runDeadline,
+            stepIds: compiledTrigger.steps.map((step) => step.id),
+            createdAt,
+          },
+          "acknowledge",
+        );
+        if (!created.created) return "receiptReplay" in created;
         if (compiledTrigger.progressMessage === true) {
           try {
             await this.options.onProgressRequested?.(created.run);
@@ -278,8 +293,11 @@ export class DurableWorkflowEngine {
           }
         }
         await this.deliverWorkflowRunAccepted(created.run);
+        return false;
       }),
     );
+    if (replays.some(Boolean))
+      return { providerEventReceiptId: trigger.providerEventReceiptId, replayed: true };
     logProviderEventRouting({
       source: trigger.source,
       deliveryId: trigger.deliveryId,

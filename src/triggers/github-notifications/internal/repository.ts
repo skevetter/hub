@@ -127,14 +127,17 @@ export class GitHubNotificationRepository implements GitHubNotificationStore {
       let deferred = false;
       for (const thread of batch.threads) {
         const payload = toNotificationPayload(thread);
-        const matches = matchingTriggers(triggers, payload);
-        const fresh = await organizationsWithoutReceipt(transaction, matches, payload);
-        if (fresh.size === 0) continue;
+        const fresh = await organizationsWithoutReceipt(transaction, triggers, payload);
+        const matches = matchingTriggers(
+          triggers.filter((row) => fresh.has(row.organization_id)),
+          payload,
+        );
+        if (matches.length === 0) continue;
         if (delivered >= batch.limit) {
           deferred = true;
           break;
         }
-        started += await deliverThread(transaction, matches, fresh, payload, now, optedIn);
+        started += await deliverThread(transaction, matches, payload, now, optedIn);
         delivered++;
         const updated = Date.parse(thread.updated_at);
         lastDelivered = Number.isFinite(updated) ? new Date(updated) : undefined;
@@ -203,13 +206,13 @@ function matchingTriggers(
   });
 }
 
-/** Organizations with a matching trigger that have not yet received this thread update. */
+/** Organizations that have yet to receive this thread update. */
 async function organizationsWithoutReceipt(
   transaction: QueryHandle,
-  matches: readonly TriggerMatch[],
+  triggers: readonly TriggerRow[],
   payload: NotificationPayload,
 ): Promise<Set<string>> {
-  const organizations = [...new Set(matches.map(({ row }) => row.organization_id))];
+  const organizations = [...new Set(triggers.map((row) => row.organization_id))];
   if (organizations.length === 0) return new Set();
   const received = await transaction.query<{ organization_id: string }>(
     `select organization_id from provider_event_receipts
@@ -223,13 +226,12 @@ async function organizationsWithoutReceipt(
 async function deliverThread(
   transaction: QueryHandle,
   matches: readonly TriggerMatch[],
-  organizations: ReadonlySet<string>,
   payload: NotificationPayload,
   now: Date,
   optedIn: Parameters<NotificationProgressRequest>[0][] | undefined,
 ): Promise<number> {
   let started = 0;
-  for (const organizationId of organizations) {
+  for (const organizationId of new Set(matches.map(({ row }) => row.organization_id))) {
     const own = matches.filter(({ row }) => row.organization_id === organizationId);
     const deliveryId = notificationDeliveryId(payload);
     const event = { github_notification: payload };
@@ -275,7 +277,8 @@ async function deliverThread(
         stepIds: trigger.steps.map(({ id }) => id),
         createdAt: now,
       });
-      if (accepted.created && trigger.progressMessage === true)
+      if (!accepted.created) continue;
+      if (trigger.progressMessage === true)
         optedIn?.push({ organizationId, triggerRunId: accepted.id });
       started++;
     }

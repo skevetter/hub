@@ -69,10 +69,13 @@ export async function dispatchManualTrigger(
     return { providerEventReceiptId: persisted.providerEventReceiptId, replayed: true };
   }
   if (state.handler === undefined) {
-    await state.database.markProviderEventDropped(
+    const dropped = await state.database.markProviderEventDropped(
       persisted.event.providerEventReceiptId,
       "configuration_unavailable",
+      persisted.event.organizationId,
     );
+    if (!dropped)
+      return { providerEventReceiptId: persisted.event.providerEventReceiptId, replayed: true };
     logger.info(
       {
         source: trigger.source,

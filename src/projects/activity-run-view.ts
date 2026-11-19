@@ -67,12 +67,17 @@ export async function readActivityExecutions(
   if (activity === undefined) return undefined;
   const executions = await executionsForActivity(database, activity);
   if (activity.run.payloadExpiredAt == null) {
-    const current = await database.findTriggerRunForOrganization(
-      activity.run.organizationId,
-      activity.run.id,
-    );
+    const [current, receipt] = await Promise.all([
+      database.findTriggerRunForOrganization(activity.run.organizationId, activity.run.id),
+      database.findProviderEventReplayMetadata(activity.run.organizationId, {
+        id: activity.receipt.id,
+      }),
+    ]);
     if (current === undefined) return undefined;
-    if (current.payloadExpiredAt != null) {
+    if (
+      current.payloadExpiredAt != null ||
+      (activity.receipt.payloadExpiryState == null && receipt?.payloadExpiryState != null)
+    ) {
       const expired = await read();
       if (expired === undefined) return undefined;
       return { activity: expired, executions: await executionsForActivity(database, expired) };
@@ -97,12 +102,13 @@ export function activityRunDetailView(
 ): ActivityRunDetail {
   const { run, receipt, steps } = activity;
   const expired = run.payloadExpiredAt != null;
+  const receiptHidden = expired || receipt.payloadExpiryState != null;
   return {
     run: {
       id: run.id,
       provider: receipt.provider,
       source: receipt.source,
-      ...(!expired && receipt.source === "webhook.received"
+      ...(!receiptHidden && receipt.source === "webhook.received"
         ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
         : {}),
       repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
@@ -148,20 +154,21 @@ export function activityRunView(
 ) {
   const { run, receipt, steps } = activity;
   const expired = run.payloadExpiredAt != null;
+  const receiptHidden = expired || receipt.payloadExpiryState != null;
   const base = {
     id: run.id,
     providerEventReceiptId: run.providerEventReceiptId,
     provider: receipt.provider,
     deliveryId: receipt.deliveryId,
     source: receipt.source,
-    ...(!expired && receipt.source === "webhook.received"
+    ...(!receiptHidden && receipt.source === "webhook.received"
       ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
       : {}),
     repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
     payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
     payloadSummary: run.payloadSummary ?? null,
     receivedAt: receipt.receivedAt.toISOString(),
-    rawPayload: expired ? null : jsonValue(receipt.payload),
+    rawPayload: receiptHidden ? null : jsonValue(receipt.payload),
     configuredTriggerName: run.configuredTriggerName,
     prompt: expired ? null : run.prompt,
     inputs: expired ? null : jsonValue(run.inputs),

@@ -101,8 +101,16 @@ export class ProgressReporter {
     const scope = { organizationId: run.organizationId, triggerRunId: run.id };
     try {
       const { database } = this.options;
-      const receipt = await database.findProviderEventReceiptById(run.providerEventReceiptId);
-      if (this.shutdown.signal.aborted || receipt?.organizationId !== run.organizationId) return;
+      const receipt = await database.findProviderEventReceiptById(
+        run.providerEventReceiptId,
+        "metadata",
+      );
+      if (
+        this.shutdown.signal.aborted ||
+        receipt?.organizationId !== run.organizationId ||
+        receipt.payloadExpiryState != null
+      )
+        return;
       const name = receipt.provider === "github_notification" ? "github" : receipt.provider;
       if (name !== "github" && name !== "linear" && name !== "slack") return;
       if (!this.providers().has(name)) return;

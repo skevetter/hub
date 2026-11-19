@@ -163,6 +163,8 @@ async function handleVerifiedWebhook(
     resourceId: String(event.repositoryId),
     acceptance,
   });
+  if (acceptance.status !== "accepted" && acceptance.payloadExpiryState !== undefined)
+    return new Response("OK", { status: 200 });
   if (eventType === "push" && options.synchronizePush !== undefined) {
     await options.synchronizePush({
       installationId: event.installationId,

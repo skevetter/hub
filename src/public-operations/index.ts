@@ -22,9 +22,10 @@ import type {
   PublicAuthorization,
 } from "./types.js";
 import { TriggerDocumentError } from "../triggers/configuration/index.js";
-import { isScriptStep } from "../config/compiler.js";
+import { isScriptStep, type CompiledTrigger } from "../config/compiler.js";
 import { DEFAULT_WEBHOOK_OPTIONS, type WebhookOptions } from "../webhook-config.js";
 import { receiveWebhook } from "./webhook.js";
+import { authorizeMarkedManualReplay, publicManualIdentity } from "./manual-replay.js";
 
 export type * from "./types.js";
 
@@ -288,7 +289,10 @@ async function prepareManualRun(
   authorization: PublicAuthorization,
   projectId: string,
   input: DispatchManualRunInput,
-): Promise<DispatchManualRunResult | { status: "prepared"; payload: ManualRunPayload }> {
+): Promise<
+  | DispatchManualRunResult
+  | { status: "prepared"; payload: ManualRunPayload; trigger: CompiledTrigger }
+> {
   const identity = resolveManualActor(authorization, input.actor);
   if (identity.status !== "resolved") return identity;
   const actor = identity.actor;
@@ -322,21 +326,7 @@ async function prepareManualRun(
     input: input.input,
     publicDeliveryKey: input.deliveryKey,
   };
-  const inputIssue = validateManualInput(input.input);
-  if (inputIssue !== undefined) return { status: "invalid_input", issues: [inputIssue] };
-  const invocation = parseManualInvocation(payload, trigger.inputs);
-  if (invocation.status === "rejected") {
-    return {
-      status: "invalid_input",
-      issues: [
-        {
-          path: ["input", invocation.rejection.inputName],
-          message: formatInvocationRejection(invocation.rejection),
-        },
-      ],
-    };
-  }
-  return { status: "prepared", payload };
+  return { status: "prepared", payload, trigger };
 }
 
 async function dispatchManualRun(
@@ -349,25 +339,67 @@ async function dispatchManualRun(
 ): Promise<DispatchManualRunResult> {
   const prepared = await prepareManualRun(capabilities, authorization, projectId, input);
   if (prepared.status !== "prepared") return prepared;
-  const outcome = await capabilities.dispatchManualEvent({
-    organizationId: authorization.organizationId,
+  const organizationId = authorization.organizationId;
+  const replayTarget = {
     projectId,
-    source: "manual.run",
-    deliveryId,
-    receivedAt: new Date(),
-    payload: {
-      ...prepared.payload,
-      authenticatedBy: {
-        kind: authorization.kind === "apiKey" ? "api-key" : "cli-credential",
-        credentialId: authorization.credentialId,
-        boundActor: authorization.kind === "apiKey" ? (authorization.actor ?? null) : null,
+    source: "manual.run" as const,
+    publicTriggerName: input.trigger,
+  };
+  let receipt = await repository.findManualReceipt(organizationId, deliveryId);
+  let providerEventReceiptId = receipt?.id;
+  if (receipt?.payloadExpiryState == null) {
+    if (receipt === undefined) {
+      const inputIssue = validateManualInput(input.input);
+      if (inputIssue !== undefined) return { status: "invalid_input", issues: [inputIssue] };
+      const invocation = parseManualInvocation(prepared.payload, prepared.trigger.inputs);
+      if (invocation.status === "rejected") {
+        return {
+          status: "invalid_input",
+          issues: [
+            {
+              path: ["input", invocation.rejection.inputName],
+              message: formatInvocationRejection(invocation.rejection),
+            },
+          ],
+        };
+      }
+    }
+    const outcome = await capabilities.dispatchManualEvent({
+      ...replayTarget,
+      organizationId,
+      deliveryId,
+      receivedAt: new Date(),
+      payload: {
+        ...prepared.payload,
+        ...publicManualIdentity(authorization, prepared.payload.actor),
       },
-    },
-  });
-  const providerEventReceiptId = outcome?.providerEventReceiptId;
+    });
+    providerEventReceiptId = outcome?.providerEventReceiptId;
+    if (outcome?.replayed === true)
+      receipt = await repository.findManualReceipt(organizationId, deliveryId);
+  }
   if (providerEventReceiptId === undefined) return { status: "dispatch_conflict" };
-  const run = await repository.findManualRun(providerEventReceiptId, input.trigger);
+  if (receipt?.payloadExpiryState != null)
+    await authorizeMarkedManualReplay(
+      repository,
+      capabilities,
+      authorization,
+      receipt,
+      replayTarget,
+      prepared.payload.actor,
+    );
+  const run = await repository.findManualRun(
+    organizationId,
+    projectId,
+    providerEventReceiptId,
+    input.trigger,
+  );
   if (run === undefined) return { status: "dispatch_conflict" };
+  if (
+    receipt?.payloadExpiryState != null &&
+    run.configurationRevisionId !== receipt.manualReplayBinding?.configurationRevisionId
+  )
+    return { status: "dispatch_conflict" };
   if (run.outcome === "rejected") {
     return {
       status: "invalid_input",

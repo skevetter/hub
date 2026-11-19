@@ -15,6 +15,11 @@ export interface LinearWebhookSourceOptions {
   signingSecret: string;
   now?: () => number;
   canHydrateIssue?(linearOrganizationId: string): Promise<boolean>;
+  findMarkedReceipt?(
+    linearOrganizationId: string,
+    deliveryId: string,
+    signatureHash: string,
+  ): Promise<boolean>;
   resolveIssue?(input: {
     linearOrganizationId: string;
     issueId: string;
@@ -114,6 +119,14 @@ async function handoffLinearEvent(
       logger.debug({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
       return new Response("OK", { status: 200 });
     }
+    if (
+      await options.findMarkedReceipt?.(
+        event.organizationId,
+        verified.deliveryId,
+        verified.signatureHash,
+      )
+    )
+      return new Response("OK", { status: 200 });
     if (eventProjectId(event) === undefined && options.resolveIssue !== undefined) {
       const source = linearEventSource(event);
       if (

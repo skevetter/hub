@@ -318,7 +318,9 @@ export class TriggerDashboard {
             status: run.status,
             receivedAt: receipt.receivedAt.toISOString(),
           },
-          run.payloadExpiredAt == null && receipt.source === "webhook.received"
+          run.payloadExpiredAt == null &&
+            receipt.payloadExpiryState == null &&
+            receipt.source === "webhook.received"
             ? {
                 webhookSummary: summarizeTrigger(receipt.source, {
                   actor: webhookActor,

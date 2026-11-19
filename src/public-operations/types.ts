@@ -2,8 +2,9 @@ import type { ApiKeyScope } from "../auth/api-key-contract.js";
 import type { HubBundleFile } from "../config/bundle.js";
 import type {
   BoundWebhookTrigger,
+  ManualReceiptReplayTarget,
   TriggerRunRecord,
-  ProviderEventReceiptRecord,
+  ProviderEventReplayMetadata,
 } from "../db/types.js";
 import type { DeploymentProjectResolution } from "../project-deployments/index.js";
 import type { StoredProjectConfiguration } from "../configuration/store.js";
@@ -236,10 +237,13 @@ export interface PublicOperationRepository {
     organizationId: string,
     triggerName: string,
   ): Promise<{ id: string; triggerId: string } | undefined>;
-  findWebhookReceipt(
+  findManualReceipt(
     organizationId: string,
     deliveryId: string,
-  ): Promise<ProviderEventReceiptRecord | undefined>;
+  ): Promise<ProviderEventReplayMetadata | undefined>;
+  authorizeSignedReceiptReplay(
+    input: ManualReceiptReplayTarget & { organizationId: string; receiptId: string },
+  ): Promise<void>;
   countActiveTriggerRuns(
     organizationId: string,
     projectId: string,
@@ -257,6 +261,8 @@ export interface PublicOperationRepository {
     dryRun: boolean;
   }): Promise<DeploymentProjectResolution>;
   findManualRun(
+    organizationId: string,
+    projectId: string,
     providerEventReceiptId: string,
     trigger: string,
   ): Promise<TriggerRunRecord | undefined>;
@@ -278,6 +284,7 @@ export interface PublicOperationCapabilities {
   };
   configurationForProject(projectId: string): {
     getActive(): Promise<StoredProjectConfiguration | undefined>;
+    getRevision?(revisionId: string): Promise<StoredProjectConfiguration | undefined>;
     validateBundle(
       files: readonly HubBundleFile[],
     ): Promise<{ valid: true } | { valid: false; validationErrors: unknown }>;
@@ -300,6 +307,7 @@ export interface PublicOperationCapabilities {
     projectId: string;
     source: "manual.run" | "webhook.received";
     boundWebhookTrigger?: BoundWebhookTrigger;
+    publicTriggerName?: string;
     deliveryId: string;
     receivedAt: Date;
     payload: unknown;

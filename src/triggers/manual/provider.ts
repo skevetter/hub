@@ -201,6 +201,19 @@ function authorizeManualTrigger(
 ): void {
   if (retry === null) throw new ManualRunRejected("key_actor_required");
   const identity = retry ?? payload;
+  authorizeManualIdentity(trigger, identity);
+  if (
+    !trigger.filters?.from_users?.includes("*") &&
+    !trigger.filters?.from_users?.includes(payload.actor)
+  ) {
+    throw new ManualRunRejected("actor_forbidden");
+  }
+}
+
+export function authorizeManualIdentity(
+  trigger: CompiledTrigger,
+  identity: ManualRunIdentity,
+): void {
   if (
     trigger.steps.some(isScriptStep) &&
     (identity.authenticatedBy?.kind !== "api-key" ||
@@ -210,12 +223,7 @@ function authorizeManualTrigger(
   }
   const users = trigger.filters?.from_users;
   if (users?.includes("*")) return;
-  if (
-    !users?.includes(payload.actor) ||
-    (identity.actor !== payload.actor && !users?.includes(identity.actor))
-  ) {
-    throw new ManualRunRejected("actor_forbidden");
-  }
+  if (!users?.includes(identity.actor)) throw new ManualRunRejected("actor_forbidden");
 }
 
 function createManualRunContext(
