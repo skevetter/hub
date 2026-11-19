@@ -121,6 +121,9 @@ it("counts with a fixed cutoff and leaves all rows byte-for-byte unchanged", asy
     assert.deepEqual(await retention.runBatch(NOW), {
       complete: true,
       expired: 0,
+      launchIntentsExpired: 0,
+      sessionsReduced: 0,
+      auxiliaryCounts: { launchIntent: {}, session: {}, machine: {} },
       counts: {
         eligible: { count: 1, oldestAgeMs: 30 * 86_400_000 + 1 },
         not_old_enough: { count: 1, oldestAgeMs: 30 * 86_400_000 },

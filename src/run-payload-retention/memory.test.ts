@@ -132,7 +132,13 @@ it("keeps retry logs free of database diagnostics and lets shutdown cancel the s
   const scan = vi.fn().mockRejectedValue(new Error(MARKER));
   const expire = vi.fn();
   const retention = new RunPayloadRetention(
-    { scanRunPayloads: scan, expireRunPayloadChunk: expire },
+    {
+      scanRunPayloads: scan,
+      expireRunPayloadChunk: expire,
+      scanAuxiliaryPayloads: vi.fn(),
+      expireLaunchIntent: vi.fn(),
+      reduceSessionOptions: vi.fn(),
+    },
     {
       mode: "count",
       retentionDays: 30,

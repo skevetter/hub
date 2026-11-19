@@ -21,6 +21,13 @@ export class EmbeddedLocks implements EmbeddedLockLifecycle {
     this.transactionReleases.set(transaction, held);
   }
 
+  async tryTxLock(transaction: TransactionHandle, key: string): Promise<boolean> {
+    if (this.transactionReleases.get(transaction)?.has(key)) return true;
+    if (this.tails.has(key)) return false;
+    await this.withTxLock(transaction, key);
+    return true;
+  }
+
   releaseTransaction(transaction: TransactionHandle): void {
     const held = this.transactionReleases.get(transaction);
     if (held === undefined) return;

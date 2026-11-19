@@ -1233,7 +1233,16 @@ export class HubHarness {
     const execution = await this.execution(executionId);
     assert.ok(execution.agentSessionId);
     const session = await this.requireDatabase().findAgentSession(execution.agentSessionId);
-    const mcp = session?.creationOptions.mcpServers?.["hub"];
+    assert.ok(session);
+    const mcp =
+      session.optionsReducedAt == null
+        ? session.creationOptions.mcpServers?.["hub"]
+        : {
+            url: new URL(`/agent-sessions/${session.id}/mcp`, this.origin).toString(),
+            headers: {
+              Authorization: `Bearer ${deriveAgentExecutionCompletionToken("hub-harness-completion-secret", `session:${session.id}`)}`,
+            },
+          };
     assert.ok(mcp);
     const response = await fetch(new URL(new URL(mcp.url).pathname, this.origin), {
       method: "POST",

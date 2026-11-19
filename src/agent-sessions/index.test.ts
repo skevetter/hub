@@ -5,55 +5,11 @@ import { createMemoryDatabase } from "../db/memory.js";
 import { OutputExecutorRegistry, replyOutputTool } from "../execution-capabilities/outputs.js";
 import { FinishCallRegistry } from "../execution-capabilities/finish-calls.js";
 import { createExecutionCapabilityServer } from "../execution-capabilities/server.js";
-import type { AgentConnection, AgentSnapshot } from "../daemons/agents/index.js";
+import { TestAgents } from "./test-utils.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
-import type { DaemonCreateAgentOptions } from "../daemons/protocol.js";
-
-class TestAgents implements AgentConnection {
-  readonly agents = new Map<string, AgentSnapshot>();
-  readonly deliveries: { agentId: string; text: string }[] = [];
-  readonly creates: DaemonCreateAgentOptions[] = [];
-  readonly messages = new Set<string>();
-  archives = 0;
-  restorations = 0;
-  async create(_key: string, options: DaemonCreateAgentOptions) {
-    this.creates.push(options);
-    const agent = { id: randomUUID(), workspaceId: randomUUID(), status: "idle" as const };
-    this.agents.set(agent.id, agent);
-    return agent;
-  }
-  async get(id: string) {
-    const agent = this.agents.get(id);
-    if (!agent) throw new Error("missing");
-    return agent;
-  }
-  async send(agentId: string, messageId: string, text: string) {
-    if (this.messages.has(messageId)) return;
-    this.messages.add(messageId);
-    this.deliveries.push({ agentId, text });
-  }
-  async watch() {
-    return () => {};
-  }
-  async restore(workspaceId: string) {
-    this.restorations++;
-    for (const [id, agent] of this.agents)
-      if (agent.workspaceId === workspaceId) this.agents.set(id, { ...agent, archivedAt: null });
-    return true;
-  }
-  async control(agentId: string, _workspaceId: string, action: "interrupt" | "archive") {
-    if (action === "archive") {
-      this.archives++;
-      this.agents.set(agentId, {
-        ...(await this.get(agentId)),
-        archivedAt: new Date().toISOString(),
-      });
-    }
-  }
-}
 
 async function fixture(now = Date.now, finishCalls?: FinishCallRegistry) {
-  const database = createMemoryDatabase();
+  const database = createMemoryDatabase({ now: () => new Date(now()) });
   const connection = new TestAgents();
   const outputs = new OutputExecutorRegistry();
   const replies: { executionId: string; context: unknown }[] = [];
@@ -79,6 +35,7 @@ async function fixture(now = Date.now, finishCalls?: FinishCallRegistry) {
     env: Record<string, string> = {},
     prompt = "hello",
     overrides: Partial<LaunchMachineIntent> = {},
+    standalone = false,
   ) {
     const executionId = randomUUID();
     const intent: LaunchMachineIntent = {
@@ -102,6 +59,8 @@ async function fixture(now = Date.now, finishCalls?: FinishCallRegistry) {
       ...(key === false ? {} : { continuation: { key, compatibility: { target } } }),
       ...overrides,
     };
+    const storedIntent = { ...intent };
+    if (standalone) Reflect.deleteProperty(storedIntent, "triggerRunId");
     await database.insertAgentExecution({
       id: executionId,
       organizationId: "org",
@@ -110,7 +69,7 @@ async function fixture(now = Date.now, finishCalls?: FinishCallRegistry) {
       triggerContext: {},
       outputContext: intent.outputContext,
       configurationRevisionId: intent.configurationRevisionId,
-      launchIntent: intent,
+      launchIntent: storedIntent,
       ...(intent.deadlineAt === undefined ? {} : { deadlineAt: intent.deadlineAt }),
     });
     return {
@@ -143,7 +102,8 @@ async function fixture(now = Date.now, finishCalls?: FinishCallRegistry) {
   ) {
     const owner = await execution(ownerId);
     const session = await database.findAgentSession(owner.agentSessionId!);
-    const mcp = session!.creationOptions.mcpServers!["hub"]!;
+    if (!session || session.optionsReducedAt != null) throw new Error("missing bootstrap options");
+    const mcp = session.creationOptions.mcpServers!["hub"]!;
     const response = await capabilities.handleSession(
       new Request(mcp.url, {
         method: "POST",
@@ -159,7 +119,7 @@ async function fixture(now = Date.now, finishCalls?: FinishCallRegistry) {
           params: { name, arguments: { ...args, executionId } },
         }),
       }),
-      session!.id,
+      session.id,
     );
     const result: unknown = await response.json();
     return result;
@@ -294,6 +254,27 @@ test("a completed credentialed task gets a fresh agent and isolates the previous
   expect(await f.call(next.executionId, "finish_execution", {}, first.executionId)).toMatchObject({
     result: { isError: true },
   });
+});
+
+test("an expired credentialed launch still rotates its session in memory", async () => {
+  const f = await fixture(() => Date.parse("2026-10-01T00:00:00Z"));
+  const env = { TOKEN: "${{ paseo.connections.support.token }}" };
+  const first = await f.arrival("conversation", "daemon", env, "old launch", {}, true);
+  const original = await first.dispatch();
+  const completed = await f.database.transitionAgentExecution(first.executionId, "succeeded");
+  const sessionId = completed.execution.agentSessionId!;
+  const cutoff = new Date("2026-10-19T00:00:00Z");
+  const now = new Date("2026-11-18T00:00:00Z");
+  expect(await f.database.expireLaunchIntent(first.executionId, cutoff, now)).toBe(true);
+  expect(await f.database.reduceSessionOptions(sessionId, cutoff, now)).toBe(true);
+  expect(await f.execution(first.executionId)).toMatchObject({
+    launchIntent: null,
+    usedTemporaryCredentials: true,
+  });
+  const next = await f.arrival("conversation", "daemon", env);
+  expect(await next.dispatch()).toMatchObject({ action: "created" });
+  expect((await f.execution(next.executionId)).daemonAgentId).not.toBe(original.agentId);
+  expect((await f.database.findAgentSession(sessionId))?.continuationKey).toBeNull();
 });
 
 test("a ping cannot send more work after the inherited deadline while timeout cleanup is pending", async () => {

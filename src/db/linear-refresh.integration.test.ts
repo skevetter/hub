@@ -37,6 +37,7 @@ describe("Linear token refresh persistence", () => {
         markSecondExternalLock = resolve;
       });
       const locks: Locks = {
+        tryTxLock: (transaction, key) => bundle.locks.tryTxLock(transaction, key),
         withLock: async <T>(key: string, operation: () => Promise<T>): Promise<T> => {
           sessionLockCalls += 1;
           return bundle.locks.withLock(key, operation);

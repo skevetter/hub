@@ -150,6 +150,10 @@ export interface AgentExecutionRecord {
   outputEmissions: Readonly<Record<string, number>>;
   outputDeliveryAttempts: Readonly<Record<string, AgentExecutionOutputAttempt>>;
   launchIntent: LaunchMachineIntent | null;
+  usedTemporaryCredentials?: boolean | null;
+  launchIntentExpiredAt?: Date | null;
+  launchRunId?: string | null;
+  launchAgent?: import("../run-payload-retention/summary.js").PayloadAgentSummary | null;
   daemonId: string | null;
   daemonAgentId: string | null;
   workflowStepRunId: string | null;

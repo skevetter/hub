@@ -10,6 +10,13 @@ import {
   scanRunPayloads,
 } from "./run-payload-retention.js";
 import {
+  expireLaunchIntent,
+  reduceSessionOptions,
+  scanAuxiliaryPayloads,
+} from "./launch-payload-retention.js";
+import type { AgentSessionRecord, ReducedAgentSessionOptions } from "../agent-sessions/types.js";
+import type { DaemonCreateAgentOptions } from "../daemons/protocol.js";
+import {
   reduceRejection,
   summarizeRunPayload,
   summarizeStepPayload,
@@ -19,6 +26,7 @@ import {
 import { RunTimelineRepository } from "../run-timeline/postgres-store.js";
 import type { RunProgressMessage, RunTimelineStore } from "../run-timeline/store.js";
 import { ExecutionAuthorityRepository } from "../execution-authority/index.js";
+import { temporaryCredentialFact } from "../agent-sessions/credentials.js";
 import { ScheduleRepository } from "../triggers/schedule/index.js";
 import { GitHubNotificationRepository } from "../triggers/github-notifications/index.js";
 import { acceptWorkflowRun } from "./workflow-intake.js";
@@ -161,8 +169,9 @@ const EXECUTION_RUN_OWNERS = `select run.payload_expiry_state from trigger_runs 
   where run.id in (
     select step.trigger_run_id from workflow_step_runs step
     where step.id = execution.workflow_step_run_id or step.agent_execution_id = execution.id
-  ) or (execution.workflow_step_run_id is null and execution.launch_intent ->> 'kind' = 'launch_machine'
-    and run.id::text = execution.launch_intent ->> 'triggerRunId'
+  ) or (execution.workflow_step_run_id is null
+    and (run.id = execution.launch_run_id or (execution.launch_intent ->> 'kind' = 'launch_machine'
+      and run.id::text = execution.launch_intent ->> 'triggerRunId'))
     and run.organization_id = execution.organization_id and run.project_id = execution.project_id)`;
 
 const EXECUTION_INSERT_OWNERS = `select run.payload_expiry_state from trigger_runs run
@@ -176,7 +185,9 @@ const EXECUTION_PAYLOAD_PROJECTION = `execution.id, execution.agent_session_id, 
   execution.started_at, execution.completed_at, execution.completed_by_agent_at, execution.deadline_at,
   execution.idle_deadline_at, execution.reaction_state, execution.configuration_revision_id,
   execution.completion_token_hash, execution.reply_claimed_at, execution.reply_claim_count, execution.output_emissions,
-  execution.output_delivery_attempts, execution.launch_intent, execution.daemon_id, execution.daemon_agent_id,
+  execution.output_delivery_attempts, execution.launch_intent, execution.used_temporary_credentials,
+  execution.launch_intent_expired_at, execution.launch_run_id, execution.launch_agent,
+  execution.daemon_id, execution.daemon_agent_id,
   execution.workflow_step_run_id, execution.hub_action, execution.hub_action_completed_at,
   execution.hub_action_ready_at, execution.hub_action_acknowledgements, execution.payload_completion,
   case when not fence.hidden then execution.result end as result,
@@ -292,6 +303,13 @@ export function createDatabase(runtime: DatabaseRuntime, locks: Locks): Database
 }
 
 class PgDatabase implements Database {
+  scanAuxiliaryPayloads: Database["scanAuxiliaryPayloads"] = (kind, after, cutoff, limit) =>
+    scanAuxiliaryPayloads(this.pool, kind, after, cutoff, limit);
+  expireLaunchIntent: Database["expireLaunchIntent"] = (id, cutoff, now) =>
+    expireLaunchIntent(this.pool, id, cutoff, now);
+  reduceSessionOptions: Database["reduceSessionOptions"] = (id, cutoff, now) =>
+    reduceSessionOptions(this.pool, this.locks, id, cutoff, now);
+
   scanRunPayloads: Database["scanRunPayloads"] = (after, cutoff, limit, countOnly) =>
     scanRunPayloads(this.pool, after, cutoff, limit, countOnly);
   async expireRunPayloadChunk(id: string, cutoff: Date, now: Date) {
@@ -653,7 +671,8 @@ class PgDatabase implements Database {
             workflow_step_run_id,
             result,
             completed_at,
-            reaction_state
+            reaction_state,
+            used_temporary_credentials
           )
           select coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
                  $12,
@@ -664,7 +683,7 @@ class PgDatabase implements Database {
                  end,
                  $14, $15, $16,
                  case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
-                 $17
+                 $17, $18
           from projects
           where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
             and not exists (select 1 from owners where payload_expiry_state is not null)
@@ -700,6 +719,7 @@ class PgDatabase implements Database {
           input.workflowStepRunId ?? null,
           input.result ?? null,
           input.reactionState ?? null,
+          temporaryCredentialFact(input.launchIntent ?? null),
         ],
       );
       const execution = rows.rows[0];
@@ -739,7 +759,8 @@ class PgDatabase implements Database {
             launch_intent,
             workflow_step_run_id,
             result,
-            completed_at
+            completed_at,
+            used_temporary_credentials
           )
           select $1, $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
                  $12,
@@ -749,7 +770,8 @@ class PgDatabase implements Database {
                    else least($12::timestamptz, $13::timestamptz)
                  end,
                  $14, $15, $16,
-                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end
+                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
+                 $17
           from projects
           where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
             and not exists (select 1 from owners where payload_expiry_state is not null)
@@ -785,6 +807,7 @@ class PgDatabase implements Database {
           input.launchIntent ?? null,
           input.workflowStepRunId ?? null,
           input.result ?? null,
+          temporaryCredentialFact(input.launchIntent ?? null),
         ],
       );
       const execution = rows.rows[0];
@@ -2833,7 +2856,7 @@ class PgDatabase implements Database {
             ),
             true
           )
-          where id = $1
+          where id = $1 and launch_intent_expired_at is null
             and (
               ${state}->'finish_execution_call'->>'observed_at' is null
               or (
@@ -3224,30 +3247,44 @@ class PgDatabase implements Database {
   }
 
   async findAgentSession(id: string) {
-    const result = await this.pool.query<{
-      data: import("../agent-sessions/index.js").AgentSessionRecord;
-    }>("select data from agent_sessions where id = $1", [id]);
-    return result.rows[0]?.data;
+    const result = await this.pool.query<AgentSessionRow>(
+      "select data, creation_options, options_reduced_at from agent_sessions where id = $1",
+      [id],
+    );
+    return readAgentSession(result.rows[0]);
   }
 
-  async saveAgentSession(
-    session: import("../agent-sessions/index.js").AgentSessionRecord,
-  ): Promise<void> {
+  async saveAgentSession(session: AgentSessionRecord): Promise<void> {
     await this.pool.query(
-      `insert into agent_sessions (id, organization_id, project_id, continuation_key, data)
-       values ($1, $2, $3, $4, $5) on conflict (id) do update set data = excluded.data, continuation_key = excluded.continuation_key`,
-      [session.id, session.organizationId, session.projectId, session.continuationKey, session],
+      `insert into agent_sessions (id, organization_id, project_id, continuation_key,
+          data, creation_options, options_reduced_at, created_at)
+       values ($1, $2, $3, $4, $5, $6, $7, now())
+       on conflict (id) do update set
+         data = case when agent_sessions.options_reduced_at is null then excluded.data
+           when excluded.continuation_key is null then jsonb_set(agent_sessions.data, '{continuationKey}', 'null'::jsonb)
+           else agent_sessions.data end,
+         continuation_key = case when agent_sessions.options_reduced_at is null or excluded.continuation_key is null
+           then excluded.continuation_key else agent_sessions.continuation_key end,
+         creation_options = case when agent_sessions.options_reduced_at is null
+           then excluded.creation_options else agent_sessions.creation_options end`,
+      [
+        session.id,
+        session.organizationId,
+        session.projectId,
+        session.continuationKey,
+        session,
+        session.creationOptions,
+        session.optionsReducedAt ?? null,
+      ],
     );
   }
 
   async findAgentSessionByKey(projectId: string, key: string) {
-    const result = await this.pool.query<{
-      data: import("../agent-sessions/index.js").AgentSessionRecord;
-    }>("select data from agent_sessions where project_id = $1 and continuation_key = $2", [
-      projectId,
-      key,
-    ]);
-    return result.rows[0]?.data;
+    const result = await this.pool.query<AgentSessionRow>(
+      "select data, creation_options, options_reduced_at from agent_sessions where project_id = $1 and continuation_key = $2",
+      [projectId, key],
+    );
+    return readAgentSession(result.rows[0]);
   }
 
   async attachExecutionToSession(
@@ -4589,8 +4626,9 @@ class PgDatabase implements Database {
       `select runs.id, coalesce(triggers.name, runs.configured_trigger_name) as trigger_name,
               runs.status, receipts.provider, receipts.source, receipts.received_at, runs.payload_expired_at,
               (select case when runs.payload_expiry_state is null then executions.launch_intent -> 'agent'
-                           else jsonb_build_object('provider', steps.payload_summary ->> 'provider',
-                                                   'model', steps.payload_summary ->> 'model') end
+                           else coalesce(executions.launch_agent,
+                             jsonb_build_object('provider', steps.payload_summary ->> 'provider',
+                                                'model', steps.payload_summary ->> 'model')) end
                  from workflow_step_runs steps
                  left join agent_executions executions on executions.id = steps.agent_execution_id
                 where steps.trigger_run_id = runs.id and steps.agent_execution_id is not null
@@ -4888,7 +4926,7 @@ async function insertAgentExecutionOnClient(
     `insert into agent_executions
        (id, organization_id, project_id, machine_id, daemon_id, status, started_at,
         trigger_context, output_context, configuration_revision_id, completion_token_hash,
-        deadline_at, idle_deadline_at, launch_intent, workflow_step_run_id, result, completed_at)
+        deadline_at, idle_deadline_at, launch_intent, workflow_step_run_id, result, completed_at, used_temporary_credentials)
      select coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
             $12,
             case
@@ -4897,7 +4935,7 @@ async function insertAgentExecutionOnClient(
               else least($12::timestamptz, $13::timestamptz)
             end,
             $14, $15, $16,
-            case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end
+            case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end, $17
      from projects
      where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
        and exists (
@@ -4928,6 +4966,7 @@ async function insertAgentExecutionOnClient(
       input.launchIntent ?? null,
       input.workflowStepRunId ?? null,
       input.result ?? null,
+      temporaryCredentialFact(input.launchIntent ?? null),
     ],
   );
   const execution = rows.rows[0];
@@ -5186,6 +5225,10 @@ export interface AgentExecutionRow extends QueryRow {
   output_emissions: unknown;
   output_delivery_attempts: unknown;
   launch_intent: AgentExecutionRecord["launchIntent"];
+  used_temporary_credentials?: boolean | null;
+  launch_intent_expired_at?: Date | null;
+  launch_run_id?: string | null;
+  launch_agent?: AgentExecutionRecord["launchAgent"];
   daemon_id: string | null;
   daemon_agent_id: string | null;
   workflow_step_run_id: string | null;
@@ -5193,6 +5236,36 @@ export interface AgentExecutionRow extends QueryRow {
   hub_action_completed_at: Date | null;
   hub_action_ready_at: Date | null;
   hub_action_acknowledgements: unknown;
+}
+
+type AgentSessionRow = QueryRow &
+  (
+    | {
+        data: Extract<AgentSessionRecord, { optionsReducedAt?: null }>;
+        creation_options: DaemonCreateAgentOptions | null;
+        options_reduced_at: null;
+      }
+    | {
+        data: Omit<Extract<AgentSessionRecord, { optionsReducedAt: Date }>, "optionsReducedAt">;
+        creation_options: ReducedAgentSessionOptions;
+        options_reduced_at: Date;
+      }
+  );
+
+function readAgentSession(row: AgentSessionRow | undefined): AgentSessionRecord | undefined {
+  if (row === undefined) return undefined;
+  if (row.options_reduced_at === null) {
+    return {
+      ...row.data,
+      optionsReducedAt: null,
+      creationOptions: row.creation_options ?? row.data.creationOptions,
+    };
+  }
+  return {
+    ...row.data,
+    optionsReducedAt: row.options_reduced_at,
+    creationOptions: row.creation_options,
+  };
 }
 
 export interface AttachmentRow extends QueryRow {

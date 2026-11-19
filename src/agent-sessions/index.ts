@@ -1,4 +1,3 @@
-import { parseConnectionTemplate } from "../config/connection-template.js";
 import { createHash } from "node:crypto";
 import type { Database, AgentExecutionRecord } from "../db/types.js";
 import {
@@ -65,10 +64,7 @@ export class AgentSessions {
       return (
         executions.length > 0 &&
         !executions.some(isActive) &&
-        executions.some(
-          (execution) =>
-            execution.launchIntent !== null && hasTemporaryCredentials(execution.launchIntent),
-        )
+        executions.some((execution) => execution.usedTemporaryCredentials !== false)
       );
     };
     // External credential minting must not hold a database connection open during shutdown.
@@ -140,7 +136,11 @@ export class AgentSessions {
       await this.database.attachExecutionToSession(input.executionId, id);
       let action: "created" | "continued" | "restored" = "continued";
       if (session.agentId === null) {
-        const agent = await input.connection.create(id, session.creationOptions, startupTimeoutMs);
+        const agent = await input.connection.create(
+          id,
+          bootstrapOptions(session),
+          startupTimeoutMs,
+        );
         session = { ...session, agentId: agent.id, workspaceId: agent.workspaceId };
         await this.database.saveAgentSession(session);
         action = "created";
@@ -254,6 +254,11 @@ export class AgentSessions {
   }
 }
 
+function bootstrapOptions(session: AgentSessionRecord): DaemonCreateAgentOptions {
+  if (session.optionsReducedAt != null) throw new Error("Reduced session is missing its agent");
+  return session.creationOptions;
+}
+
 function deriveSessionId(projectId: string, key: string): string {
   const hex = createHash("sha256")
     .update(JSON.stringify(["agent-session", projectId, key]))
@@ -275,14 +280,8 @@ function fingerprint(value: unknown): string {
 function isActive(execution: AgentExecutionRecord): boolean {
   return execution.status === "spawning" || execution.status === "running";
 }
-function hasTemporaryCredentials(intent: LaunchMachineIntent): boolean {
-  return (
-    intent.github !== undefined ||
-    Object.values({ ...intent.environment.env, ...intent.env }).some(
-      (value) => parseConnectionTemplate(value).length > 0,
-    )
-  );
-}
-function sessionLock(session: AgentSessionRecord): string {
+export function sessionLock(
+  session: Pick<AgentSessionRecord, "id" | "projectId" | "continuationKey">,
+): string {
   return `agent-session:${session.continuationKey === null ? session.id : deriveSessionId(session.projectId, session.continuationKey)}`;
 }

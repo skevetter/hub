@@ -16,7 +16,33 @@ export interface RunPayloadCandidate {
   ageFrom: Date;
 }
 
+export type AuxiliaryPayloadKind = "launchIntent" | "session" | "machine";
+
+export type AuxiliaryPayloadDisposition =
+  | "eligible"
+  | "flag_unknown"
+  | "live_owner"
+  | "unbound_session"
+  | "incomplete_bootstrap"
+  | "unused_session"
+  | "not_old_enough"
+  | "machine_legacy";
+
+export interface AuxiliaryPayloadCandidate {
+  id: string;
+  disposition: AuxiliaryPayloadDisposition;
+  ageFrom: Date | null;
+}
+
 export interface RunPayloadRetentionStore {
+  scanAuxiliaryPayloads(
+    kind: AuxiliaryPayloadKind,
+    after: string | null,
+    cutoff: Date,
+    limit: number,
+  ): Promise<AuxiliaryPayloadCandidate[]>;
+  expireLaunchIntent(id: string, cutoff: Date, now: Date): Promise<boolean>;
+  reduceSessionOptions(id: string, cutoff: Date, now: Date): Promise<boolean>;
   scanRunPayloads(
     after: string | null,
     cutoff: Date,

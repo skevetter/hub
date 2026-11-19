@@ -137,8 +137,9 @@ export function runExecutions(run: string, projection: string) {
     union
     select ${projection} from agent_executions execution
     where execution.workflow_step_run_id is null
-      and execution.launch_intent ->> 'kind' = 'launch_machine'
-      and execution.launch_intent ->> 'triggerRunId' = ${run}.id::text
+      and (execution.launch_run_id = ${run}.id or
+        (execution.launch_intent ->> 'kind' = 'launch_machine'
+          and execution.launch_intent ->> 'triggerRunId' = ${run}.id::text))
       and execution.organization_id = ${run}.organization_id and execution.project_id = ${run}.project_id`;
 }
 

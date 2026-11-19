@@ -5,6 +5,7 @@ import { PostgresLocks } from "./internal/postgres.js";
 export interface Locks {
   withLock<T>(key: string, operation: () => Promise<T>): Promise<T>;
   withTxLock(transaction: TransactionHandle, key: string): Promise<void>;
+  tryTxLock(transaction: TransactionHandle, key: string): Promise<boolean>;
 }
 
 /** @package */

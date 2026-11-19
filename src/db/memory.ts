@@ -1,12 +1,21 @@
+import { temporaryCredentialFact } from "../agent-sessions/credentials.js";
+import { sessionLock } from "../agent-sessions/index.js";
+import type { AgentSessionRecord } from "../agent-sessions/types.js";
 import { coversExpectedFanout, expectedFanout } from "../run-payload-retention/fanout.js";
 import {
   payloadCompletion,
   reduceRejection,
+  summarizePayloadAgent,
   summarizeRunPayload,
   summarizeStepPayload,
   type RunPayloadSummary,
 } from "../run-payload-retention/summary.js";
-import { isProgressUnsettled, type RunPayloadDisposition } from "../run-payload-retention/store.js";
+import {
+  isProgressUnsettled,
+  type AuxiliaryPayloadCandidate,
+  type AuxiliaryPayloadKind,
+  type RunPayloadDisposition,
+} from "../run-payload-retention/store.js";
 import { readScriptStepHandle } from "../workflows/script-output.js";
 import { randomUUID } from "node:crypto";
 import type { AgentExecutionStatus, MachineStatus } from "./schema.js";
@@ -201,6 +210,170 @@ export function createMemoryDatabase(options: MemoryDatabaseOptions = {}): Datab
 }
 
 class MemoryDatabase implements Database {
+  async scanAuxiliaryPayloads(
+    kind: AuxiliaryPayloadKind,
+    after: string | null,
+    cutoff: Date,
+    limit: number,
+  ): Promise<AuxiliaryPayloadCandidate[]> {
+    const inPage = (id: string) => after === null || id > after;
+    const page = <T extends { id: string }>(items: T[]) =>
+      items.sort((left, right) => left.id.localeCompare(right.id)).slice(0, limit);
+    if (kind === "launchIntent") {
+      return page(
+        [...this.agentExecutions.values()].filter(
+          (row) => row.launchIntent !== null && inPage(row.id),
+        ),
+      ).map((row) => this.launchIntentCandidate(row, cutoff));
+    }
+    if (kind === "session") {
+      return page(
+        [...this.agentSessions.values()].filter(
+          (row) => row.optionsReducedAt == null && inPage(row.id),
+        ),
+      ).map((row) => this.sessionOptionsCandidate(row, cutoff));
+    }
+    return page(
+      [...this.machines.values()].filter(
+        (machine) =>
+          inPage(machine.id) &&
+          machine.status === "terminated" &&
+          machine.terminatedAt !== null &&
+          machine.terminatedAt < cutoff &&
+          (machine.triggerContext != null ||
+            machine.specs != null ||
+            machine.shutdownReason !== null) &&
+          ![...this.agentExecutions.values()].some(
+            (execution) => execution.machineId === machine.id,
+          ) &&
+          ![...this.daemons.values()].some((daemon) => daemon.machineId === machine.id),
+      ),
+    ).map((machine) => ({
+      id: machine.id,
+      disposition: "machine_legacy",
+      ageFrom: machine.terminatedAt,
+    }));
+  }
+
+  async expireLaunchIntent(id: string, cutoff: Date, now: Date): Promise<boolean> {
+    const execution = this.agentExecutions.get(id);
+    if (execution?.launchIntent == null) return false;
+    const candidate = this.launchIntentCandidate(execution, cutoff);
+    if (candidate.disposition !== "eligible") return false;
+    this.agentExecutions.set(id, {
+      ...execution,
+      launchIntent: null,
+      launchIntentExpiredAt: new Date(now),
+      launchRunId: candidate.runId,
+      launchAgent: summarizePayloadAgent(execution.launchIntent.agent),
+    });
+    return true;
+  }
+
+  async reduceSessionOptions(id: string, cutoff: Date, now: Date): Promise<boolean> {
+    const prior = this.agentSessions.get(id);
+    if (prior === undefined || prior.optionsReducedAt != null) return false;
+    const key = sessionLock(prior);
+    if (this.advisoryLocks.has(key)) return false;
+    return this.withAdvisoryLock(key, async () => {
+      const session = this.agentSessions.get(id);
+      if (
+        session === undefined ||
+        session.optionsReducedAt != null ||
+        session.continuationKey !== prior.continuationKey ||
+        !session.agentId ||
+        !session.workspaceId ||
+        this.sessionOptionsCandidate(session, cutoff).disposition !== "eligible"
+      )
+        return false;
+      this.agentSessions.set(id, {
+        ...session,
+        agentId: session.agentId,
+        workspaceId: session.workspaceId,
+        optionsReducedAt: new Date(now),
+        creationOptions: {
+          ...summarizePayloadAgent(session.creationOptions),
+          toolPolicy: session.creationOptions.toolPolicy,
+        },
+      });
+      return true;
+    });
+  }
+
+  private launchIntentCandidate(
+    execution: AgentExecutionRecord,
+    cutoff: Date,
+  ): AuxiliaryPayloadCandidate & { runId: string | null } {
+    const declared = execution.launchIntent?.triggerRunId ?? null;
+    const ids = new Set(
+      [...this.workflowStepRuns.values()]
+        .filter(
+          (step) =>
+            step.id === execution.workflowStepRunId || step.agentExecutionId === execution.id,
+        )
+        .map((step) => step.triggerRunId),
+    );
+    if (declared !== null) ids.add(declared);
+    const [runId = null] = ids;
+    const run = runId === null ? undefined : this.triggerRuns.get(runId);
+    const ageFrom = execution.completedAt ?? execution.startedAt;
+    let disposition: AuxiliaryPayloadCandidate["disposition"] = "eligible";
+    if (execution.usedTemporaryCredentials == null) disposition = "flag_unknown";
+    else if (
+      this.hasUnsettledExecution(execution) ||
+      ids.size > 1 ||
+      (execution.workflowStepRunId !== null && runId === null) ||
+      (runId !== null &&
+        (run?.organizationId !== execution.organizationId ||
+          run.projectId !== execution.projectId ||
+          run.payloadExpiryState !== "expired"))
+    )
+      disposition = "live_owner";
+    else if (ageFrom >= cutoff) disposition = "not_old_enough";
+    return { id: execution.id, ageFrom, disposition, runId };
+  }
+
+  private sessionOptionsCandidate(
+    session: AgentSessionRecord,
+    cutoff: Date,
+  ): AuxiliaryPayloadCandidate {
+    const executions = [...this.agentExecutions.values()].filter(
+      (row) => row.agentSessionId === session.id,
+    );
+    const ageFrom =
+      executions.reduce<Date | null>((latest, execution) => {
+        const activity = execution.completedAt ?? execution.startedAt;
+        return latest === null || activity > latest ? activity : latest;
+      }, null) ??
+      this.agentSessionCreatedAt.get(session.id) ??
+      null;
+    let disposition: AuxiliaryPayloadCandidate["disposition"] = "eligible";
+    if (!session.agentId || !session.workspaceId) disposition = "unbound_session";
+    else if (executions.length === 0) disposition = "unused_session";
+    else if (!executions.some((execution) => execution.agentSessionAction !== null))
+      disposition = "incomplete_bootstrap";
+    else if (executions.some((execution) => this.hasUnsettledExecution(execution)))
+      disposition = "live_owner";
+    else if (executions.some((execution) => execution.usedTemporaryCredentials == null))
+      disposition = "flag_unknown";
+    else if (ageFrom !== null && ageFrom >= cutoff) disposition = "not_old_enough";
+    return { id: session.id, ageFrom, disposition };
+  }
+
+  private hasUnsettledExecution(execution: AgentExecutionRecord): boolean {
+    return (
+      execution.completedAt === null ||
+      execution.status === "spawning" ||
+      execution.status === "running" ||
+      (execution.hubAction !== null && execution.hubActionCompletedAt === null) ||
+      Object.values(execution.outputDeliveryAttempts).some(
+        (attempt) => attempt.status === "pending",
+      ) ||
+      this.authorityRecords.has(execution.id) ||
+      [...this.authorityLeases.values()].some((lease) => lease.executionId === execution.id)
+    );
+  }
+
   async scanRunPayloads(after: string | null, cutoff: Date, limit: number, countOnly: boolean) {
     return [...this.triggerRuns.values()]
       .filter(
@@ -368,8 +541,9 @@ class MemoryDatabase implements Database {
             execution.workflowStepRunId === step.id || execution.id === step.agentExecutionId,
         ) ||
         (execution.workflowStepRunId === null &&
-          execution.launchIntent?.kind === "launch_machine" &&
-          execution.launchIntent.triggerRunId === run.id)
+          (execution.launchRunId === run.id ||
+            (execution.launchIntent?.kind === "launch_machine" &&
+              execution.launchIntent.triggerRunId === run.id)))
       );
     });
   }
@@ -1336,7 +1510,8 @@ class MemoryDatabase implements Database {
             (candidate) => candidate.agentExecutionId === execution.id,
           )
         : this.workflowStepRuns.get(execution.workflowStepRunId);
-    const runId = step?.triggerRunId ?? execution.launchIntent?.triggerRunId;
+    const runId =
+      step?.triggerRunId ?? execution.launchRunId ?? execution.launchIntent?.triggerRunId;
     if (runId == null) return false;
     const run = this.triggerRuns.get(runId);
     return (
@@ -2532,6 +2707,10 @@ class MemoryDatabase implements Database {
       outputEmissions: {},
       outputDeliveryAttempts: {},
       launchIntent: input.launchIntent ?? null,
+      usedTemporaryCredentials: temporaryCredentialFact(input.launchIntent ?? null),
+      launchIntentExpiredAt: null,
+      launchRunId: null,
+      launchAgent: null,
       daemonId: input.daemonId ?? null,
       daemonAgentId: null,
       workflowStepRunId: input.workflowStepRunId ?? null,
@@ -3182,6 +3361,8 @@ class MemoryDatabase implements Database {
   ): Promise<AgentExecutionRecord | undefined> {
     const execution = this.agentExecutions.get(executionId);
     if (execution === undefined) return undefined;
+    if (acknowledgement.kind === "finish_execution" && execution.launchIntentExpiredAt != null)
+      return undefined;
     const current = execution.hubActionAcknowledgements;
     const updatedAcknowledgements: AgentExecutionHubAcknowledgements = {
       terminalAt: current.terminalAt,
@@ -3509,6 +3690,7 @@ class MemoryDatabase implements Database {
     string,
     import("../agent-sessions/index.js").AgentSessionRecord
   >();
+  private readonly agentSessionCreatedAt = new Map<string, Date>();
   async findAgentSession(id: string) {
     return structuredClone(this.agentSessions.get(id));
   }
@@ -3522,6 +3704,14 @@ class MemoryDatabase implements Database {
   async saveAgentSession(
     session: import("../agent-sessions/index.js").AgentSessionRecord,
   ): Promise<void> {
+    const current = this.agentSessions.get(session.id);
+    if (current === undefined) this.agentSessionCreatedAt.set(session.id, new Date());
+    if (current?.optionsReducedAt != null) {
+      if (session.continuationKey === null) {
+        this.agentSessions.set(session.id, { ...current, continuationKey: null });
+      }
+      return;
+    }
     this.agentSessions.set(session.id, structuredClone(session));
   }
   async attachExecutionToSession(
@@ -4333,7 +4523,9 @@ class MemoryDatabase implements Database {
             status: run.status,
             receivedAt: receipt.receivedAt,
             agent: launchedAgent(
-              run.payloadExpiredAt == null ? execution?.launchIntent?.agent : step?.payloadSummary,
+              run.payloadExpiredAt == null
+                ? execution?.launchIntent?.agent
+                : (execution?.launchAgent ?? step?.payloadSummary),
             ),
             payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
           },

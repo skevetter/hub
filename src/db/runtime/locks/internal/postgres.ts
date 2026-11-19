@@ -30,4 +30,12 @@ export class PostgresLocks implements Locks {
   async withTxLock(transaction: TransactionHandle, key: string): Promise<void> {
     await transaction.query(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [key]);
   }
+
+  async tryTxLock(transaction: TransactionHandle, key: string): Promise<boolean> {
+    const result = await transaction.query<{ acquired: boolean }>(
+      `select pg_try_advisory_xact_lock(hashtextextended($1, 0)) as acquired`,
+      [key],
+    );
+    return result.rows[0]?.acquired === true;
+  }
 }
