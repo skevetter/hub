@@ -8,8 +8,9 @@ import {
   build14Selection,
   credentialHistories,
   upgradedSelection,
-  type SessionSelection,
+  type CredentialHistory,
 } from "../agent-sessions/credential-test-fixtures.js";
+import type { AgentSessionRecord } from "../agent-sessions/types.js";
 import { TestAgents } from "../agent-sessions/test-utils.js";
 import { createDatabase } from "../db/pg.js";
 import {
@@ -51,7 +52,7 @@ const KEEP_MARKERS = [
 const settings = { mode: "on", retentionDays: 30, maxRunsPerPass: 50 } as const;
 
 async function drain(retention: RunPayloadRetention) {
-  for (let batch = 0; batch < 50; batch++) {
+  for (let batch = 0; batch < 100; batch++) {
     const result = await retention.runBatch(NOW);
     if (result.complete) return result;
   }
@@ -317,18 +318,25 @@ describe("launch and session expiry in PostgreSQL", () => {
     try {
       const cases = [];
       for (const history of credentialHistories) {
-        const ids = [];
+        const ids = history.intents
+          .map(() => randomUUID())
+          .sort((left, right) => left.localeCompare(right));
         const before = [];
-        for (const intent of history.intents) {
-          const id = randomUUID();
+        for (const [index, intent] of history.intents.entries()) {
           const result = await runtime.query<{ launch_intent: LaunchMachineIntent | null }>(
             `insert into agent_executions (id, organization_id, project_id, configuration_revision_id,
                 status, completed_at, started_at, launch_intent)
-             values ($1, $2, $3, $4, 'succeeded', $5, $5, $6)
+             values ($1, $2, $3, $4, 'succeeded', $5, $5, $6::jsonb)
              returning launch_intent`,
-            [id, ORG, PROJECT, REVISION, OLD, intent],
+            [
+              ids[index],
+              ORG,
+              PROJECT,
+              REVISION,
+              OLD,
+              intent === null ? null : JSON.stringify(intent),
+            ],
           );
-          ids.push(id);
           before.push(result.rows[0]!.launch_intent);
         }
         assert.equal(build14Selection(before), history.build14, history.key);
@@ -353,26 +361,36 @@ describe("launch and session expiry in PostgreSQL", () => {
         sessions.push({ history, ids, session });
       }
 
-      async function checkArrival(key: string, sessionId: string, expected: SessionSelection) {
+      async function checkArrival(
+        history: CredentialHistory,
+        session: AgentSessionRecord,
+        ids: readonly string[],
+      ) {
+        const { key } = history;
+        const historical = await database.listAgentSessionExecutions(session.id);
+        assert.deepEqual(
+          historical.map(({ id }) => id),
+          ids,
+          key,
+        );
         const next = await fixture.arrival({ key });
-        if (expected === "error") {
-          await assert.rejects(next.dispatch(), /unsupported interpolation|reading 'env'/u);
-        } else {
-          assert.equal((await next.dispatch()).action, expected, key);
-        }
+        const expected = upgradedSelection(history);
+        const selected = await next.dispatch();
+        assert.equal(selected.action, expected, key);
+        assert.equal(selected.agentId === session.agentId, expected === "continued", key);
         const attached = (await database.findAgentExecutionById(next.id))?.agentSessionId;
         await runtime.query("delete from agent_executions where id = $1", [next.id]);
-        if (attached != null && attached !== sessionId) {
+        if (attached != null && attached !== session.id) {
           await runtime.query("delete from agent_sessions where id = $1", [attached]);
           await runtime.query(
             `update agent_sessions set continuation_key = $2,
               data = jsonb_set(data, '{continuationKey}', to_jsonb($2::text)) where id = $1`,
-            [sessionId, key],
+            [session.id, key],
           );
         }
       }
-      for (const { history, session } of sessions) {
-        await checkArrival(history.key, session.id, upgradedSelection(history));
+      for (const { history, session, ids } of sessions) {
+        await checkArrival(history, session, ids);
       }
 
       const hashes = await tableHashes(runtime);
@@ -399,11 +417,29 @@ describe("launch and session expiry in PostgreSQL", () => {
       const restarted = await postgresDatabaseRuntime(url);
       try {
         const next = createDatabase(restarted.runtime, restarted.locks);
+        const settledCount = await drain(
+          new RunPayloadRetention(next, { ...settings, mode: "count" }),
+        );
+        assert.equal(settledCount.credentialFactsBackfilled, 14);
+        assert.equal(settledCount.launchIntentsExpired, 0);
+        for (const { history, session, ids } of sessions) {
+          const actual = await next.listAgentSessionExecutions(session.id);
+          assert.deepEqual(
+            actual.map((execution) => execution.usedTemporaryCredentials),
+            history.backfilled,
+            history.key,
+          );
+          assert.ok(
+            actual.every((execution) => execution.launchIntentExpiredAt == null),
+            history.key,
+          );
+          await checkArrival(history, session, ids);
+        }
         const applied = await drain(new RunPayloadRetention(next, settings));
-        assert.equal(applied.credentialFactsBackfilled, 5);
-        assert.equal(applied.launchIntentsExpired, 10);
-        assert.equal(applied.sessionsReduced, 9);
-        assert.equal(applied.auxiliaryCounts.launchIntent.flag_unknown?.count, 2);
+        assert.equal(applied.credentialFactsBackfilled, 0);
+        assert.equal(applied.launchIntentsExpired, 21);
+        assert.equal(applied.sessionsReduced, 16);
+        assert.equal(applied.auxiliaryCounts.launchIntent.flag_unknown?.count, 7);
         for (const { history, session, ids } of sessions) {
           const actual = await Promise.all(ids.map((id) => next.findAgentExecutionById(id)));
           assert.deepEqual(
@@ -416,7 +452,7 @@ describe("launch and session expiry in PostgreSQL", () => {
             history.backfilled.map((fact) => fact !== null),
             history.key,
           );
-          await checkArrival(history.key, session.id, upgradedSelection(history));
+          await checkArrival(history, session, ids);
         }
       } finally {
         await restarted.runtime.close();

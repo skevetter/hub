@@ -36,8 +36,10 @@ before clearing child rows in batches and resumes interrupted redactions after a
 
 The same window covers launch intents of settled standalone executions and executions
 whose runs have already expired. Hub keeps the run association, provider and model
-labels, and the recorded credential fact used to rotate sessions. Unknown credential
-history blocks expiry. A running finish-tool acknowledgement keeps the launch intent
+labels, and the recorded credential fact used to rotate sessions. Hub starts a fresh agent
+for an idle session if any execution used temporary credentials or its credential history
+cannot be determined. Unknown credential history blocks expiry. A running finish-tool
+acknowledgement keeps the launch intent
 and its session options until the acknowledgement settles. Hub reduces creation options for
 old, bound sessions with completed bootstrap and settled owners. The session keeps its continuation key,
 identity, compatibility, tool contract and capability verifier. This includes custom

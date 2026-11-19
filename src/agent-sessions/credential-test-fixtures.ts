@@ -2,12 +2,15 @@ import { parseConnectionTemplate } from "../config/connection-template.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 
 const reference = "${{ paseo.connections.installation.token }}";
+const credentialedEnvironment = { environment: { env: { TOKEN: reference } } };
+const nullEnvironmentValue = { environment: { env: { VALUE: null } } };
 
 export type SessionSelection = "continued" | "created" | "error";
+export type LegacyLaunchIntent = object | string | null;
 
-interface CredentialHistory {
+export interface CredentialHistory {
   key: string;
-  intents: readonly (object | null)[];
+  intents: readonly LegacyLaunchIntent[];
   build14: SessionSelection;
   migrated: readonly (boolean | null)[];
   backfilled: readonly (boolean | null)[];
@@ -30,7 +33,7 @@ export const credentialHistories: readonly CredentialHistory[] = [
   },
   {
     key: "base",
-    intents: [{ environment: { env: { TOKEN: reference } } }],
+    intents: [credentialedEnvironment],
     build14: "created",
     migrated: [null],
     backfilled: [true],
@@ -98,6 +101,90 @@ export const credentialHistories: readonly CredentialHistory[] = [
     migrated: [null],
     backfilled: [null],
   },
+  {
+    key: "nested-null",
+    intents: [nullEnvironmentValue],
+    build14: "error",
+    migrated: [null],
+    backfilled: [null],
+  },
+  {
+    key: "nested-null-overridden",
+    intents: [{ ...nullEnvironmentValue, env: { VALUE: reference } }],
+    build14: "created",
+    migrated: [null],
+    backfilled: [true],
+  },
+  {
+    key: "array-map",
+    intents: [{ environment: { env: [reference] } }],
+    build14: "created",
+    migrated: [null],
+    backfilled: [true],
+  },
+  {
+    key: "execution-array-map",
+    intents: [{ environment: { env: { "0": reference } }, env: ["plain"] }],
+    build14: "continued",
+    migrated: [null],
+    backfilled: [false],
+  },
+  {
+    key: "nested-object",
+    intents: [{ environment: { env: { VALUE: { TOKEN: reference } } } }],
+    build14: "continued",
+    migrated: [null],
+    backfilled: [false],
+  },
+  {
+    key: "github-null-presence",
+    intents: [{ github: null }],
+    build14: "created",
+    migrated: [true],
+    backfilled: [true],
+  },
+  {
+    key: "three-owners",
+    intents: [{ environment: {} }, { environment: { env: null } }, credentialedEnvironment],
+    build14: "created",
+    migrated: [false, null, null],
+    backfilled: [false, false, true],
+  },
+  {
+    key: "mixed-credential-first",
+    intents: [credentialedEnvironment, nullEnvironmentValue],
+    build14: "created",
+    migrated: [null, null],
+    backfilled: [true, null],
+  },
+  {
+    key: "mixed-malformed-first",
+    intents: [nullEnvironmentValue, credentialedEnvironment],
+    build14: "error",
+    migrated: [null, null],
+    backfilled: [null, true],
+  },
+  {
+    key: "top-level-array",
+    intents: [["github"]],
+    build14: "error",
+    migrated: [null],
+    backfilled: [null],
+  },
+  {
+    key: "top-level-string",
+    intents: ["github"],
+    build14: "error",
+    migrated: [null],
+    backfilled: [null],
+  },
+  {
+    key: "string-env-map",
+    intents: [{ environment: { env: reference } }],
+    build14: "continued",
+    migrated: [null],
+    backfilled: [false],
+  },
 ];
 
 export function build14Selection(
@@ -119,6 +206,6 @@ export function build14Selection(
   }
 }
 
-export function upgradedSelection(history: CredentialHistory): SessionSelection {
-  return history.key === "null" ? "created" : history.build14;
+export function upgradedSelection(history: CredentialHistory): Exclude<SessionSelection, "error"> {
+  return history.key !== "null" && history.build14 === "continued" ? "continued" : "created";
 }

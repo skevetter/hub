@@ -3315,7 +3315,8 @@ class PgDatabase implements Database {
   async listAgentSessionExecutions(sessionId: string): Promise<AgentExecutionRecord[]> {
     const result = await this.pool.query<AgentExecutionRow>(
       `select ${EXECUTION_PAYLOAD_PROJECTION} from agent_executions execution ${EXECUTION_FENCE}
-       where agent_session_id = $1`,
+       where execution.agent_session_id = $1
+       order by execution.started_at, execution.id`,
       [sessionId],
     );
     return result.rows.map(toAgentExecutionRecord);

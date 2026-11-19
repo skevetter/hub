@@ -13,6 +13,7 @@ import {
   build14Selection,
   credentialHistories,
   upgradedSelection,
+  type LegacyLaunchIntent,
 } from "./credential-test-fixtures.js";
 
 async function fixture(
@@ -296,30 +297,29 @@ test.each(credentialHistories)(
   async (history) => {
     const old = new Date("2026-10-10T00:00:00Z");
     const now = new Date("2026-11-18T00:00:00Z");
-    for (const phase of ["migrated", "redacted"] as const) {
-      let nextHistory: { intent: object | null; fact: boolean | null } | undefined;
+    for (const phase of ["migrated", "backfilled", "redacted"] as const) {
+      let nextHistory:
+        | { intent: LegacyLaunchIntent; fact: boolean | null; ordinal: number }
+        | undefined;
       const f = await fixture(
         () => old.getTime(),
         undefined,
         (execution) => {
           if (nextHistory === undefined) return;
-          const { intent, fact } = nextHistory;
-          const stored = execution.launchIntent!;
-          for (const field of ["environment", "env", "github", "triggerRunId"]) {
-            Reflect.deleteProperty(stored, field);
-          }
-          execution.launchIntent = intent === null ? null : Object.assign(stored, intent);
+          const { intent, fact, ordinal } = nextHistory;
+          Reflect.set(execution, "launchIntent", intent);
           execution.usedTemporaryCredentials = fact;
+          execution.startedAt = new Date(old.getTime() + ordinal);
         },
       );
-      async function addHistory(intent: object | null, fact: boolean | null) {
-        nextHistory = { intent, fact };
+      async function addHistory(intent: LegacyLaunchIntent, ordinal: number) {
+        nextHistory = { intent, fact: history.migrated[ordinal] ?? null, ordinal };
         const arrival = await f.arrival(history.key);
         nextHistory = undefined;
         return arrival;
       }
       const [initial, ...remaining] = history.intents;
-      const first = await addHistory(initial ?? null, history.migrated[0] ?? null);
+      const first = await addHistory(initial ?? null, 0);
       const original = await first.dispatch();
       const { execution } = await f.database.transitionAgentExecution(
         first.executionId,
@@ -327,7 +327,7 @@ test.each(credentialHistories)(
       );
       const ids = [first.executionId];
       for (const [index, intent] of remaining.entries()) {
-        const extra = await addHistory(intent, history.migrated[index + 1] ?? null);
+        const extra = await addHistory(intent, index + 1);
         await f.database.attachExecutionToSession(extra.executionId, execution.agentSessionId!);
         await f.database.transitionAgentExecution(extra.executionId, "succeeded");
         ids.push(extra.executionId);
@@ -339,9 +339,9 @@ test.each(credentialHistories)(
       expect(before.map(({ usedTemporaryCredentials }) => usedTemporaryCredentials)).toEqual(
         history.migrated,
       );
-      if (phase === "redacted") {
+      if (phase !== "migrated") {
         const sweep = new RunPayloadRetention(f.database, {
-          mode: "on",
+          mode: phase === "backfilled" ? "count" : "on",
           retentionDays: 30,
           maxRunsPerPass: 50,
         });
@@ -351,18 +351,16 @@ test.each(credentialHistories)(
           history.backfilled,
         );
         expect(after.map(({ launchIntentExpiredAt }) => launchIntentExpiredAt != null)).toEqual(
-          history.backfilled.map((fact) => fact !== null),
+          history.backfilled.map((fact) => phase === "redacted" && fact !== null),
         );
       }
+      const chronological = await f.database.listAgentSessionExecutions(execution.agentSessionId!);
+      expect(chronological.map(({ id }) => id)).toEqual(ids);
       const next = await f.arrival(history.key);
       const expected = upgradedSelection(history);
-      if (expected === "error") {
-        await expect(next.dispatch()).rejects.toThrow(/unsupported interpolation|reading 'env'/u);
-      } else {
-        const selected = await next.dispatch();
-        expect(selected.action).toBe(expected);
-        expect(selected.agentId === original.agentId).toBe(expected === "continued");
-      }
+      const selected = await next.dispatch();
+      expect(selected.action).toBe(expected);
+      expect(selected.agentId === original.agentId).toBe(expected === "continued");
     }
   },
 );

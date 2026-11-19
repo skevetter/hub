@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { hasTemporaryCredentials } from "./credentials.js";
+import { temporaryCredentialFact } from "./credentials.js";
 import type { Database, AgentExecutionRecord } from "../db/types.js";
 import {
   DEFAULT_STARTUP_TIMEOUT_MS,
@@ -60,22 +60,20 @@ export class AgentSessions {
           )
         : this.database.findAgentSessionByKey(projectId, continuationKey);
     };
-    const isFinishedCredentialedSession = async (session: AgentSessionRecord) => {
+    const shouldRotateFinishedSession = async (session: AgentSessionRecord) => {
       const executions = await this.database.listAgentSessionExecutions(session.id);
-      return (
-        executions.length > 0 &&
-        !executions.some(isActive) &&
-        executions.some(
-          ({ usedTemporaryCredentials, launchIntent }) =>
-            usedTemporaryCredentials ??
-            (launchIntent === null || hasTemporaryCredentials(launchIntent)),
-        )
-      );
+      if (executions.some(isActive)) return false;
+      let rotate = false;
+      for (const { usedTemporaryCredentials, launchIntent } of executions) {
+        const fact = usedTemporaryCredentials ?? temporaryCredentialFact(launchIntent);
+        if (fact !== false) rotate = true;
+      }
+      return rotate;
     };
     // External credential minting must not hold a database connection open during shutdown.
     const storedSession = await findSession();
     const options =
-      !storedSession || (await isFinishedCredentialedSession(storedSession))
+      !storedSession || (await shouldRotateFinishedSession(storedSession))
         ? await input.createOptions()
         : undefined;
     const dispatched = await this.database.withAdvisoryLock(`agent-session:${lockId}`, async () => {
@@ -85,7 +83,7 @@ export class AgentSessions {
       );
       const compatibility = fingerprint({ settings: policy?.compatibility, tools });
       let session = await findSession();
-      if (session && (await isFinishedCredentialedSession(session))) {
+      if (session && (await shouldRotateFinishedSession(session))) {
         // Completion may have raced credential preparation. Retry outside the lock.
         if (!options) return undefined;
         await this.database.saveAgentSession({ ...session, continuationKey: null });

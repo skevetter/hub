@@ -3779,6 +3779,10 @@ class MemoryDatabase implements Database {
   async listAgentSessionExecutions(sessionId: string): Promise<AgentExecutionRecord[]> {
     return [...this.agentExecutions.values()]
       .filter((execution) => execution.agentSessionId === sessionId)
+      .sort(
+        (left, right) =>
+          left.startedAt.getTime() - right.startedAt.getTime() || left.id.localeCompare(right.id),
+      )
       .map((execution) => this.projectExecutionPayload(execution));
   }
 
