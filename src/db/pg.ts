@@ -4626,9 +4626,8 @@ class PgDatabase implements Database {
       `select runs.id, coalesce(triggers.name, runs.configured_trigger_name) as trigger_name,
               runs.status, receipts.provider, receipts.source, receipts.received_at, runs.payload_expired_at,
               (select case when runs.payload_expiry_state is null then executions.launch_intent -> 'agent'
-                           else coalesce(executions.launch_agent,
-                             jsonb_build_object('provider', steps.payload_summary ->> 'provider',
-                                                'model', steps.payload_summary ->> 'model')) end
+                           when steps.payload_summary ->> 'provider' is not null then steps.payload_summary
+                           else executions.launch_agent end
                  from workflow_step_runs steps
                  left join agent_executions executions on executions.id = steps.agent_execution_id
                 where steps.trigger_run_id = runs.id and steps.agent_execution_id is not null

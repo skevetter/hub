@@ -648,6 +648,16 @@ describe("launch and session expiry in PostgreSQL", () => {
           step,
           old.id,
         ]);
+        if (first === "completion") {
+          await runtime.query(
+            "update agent_executions set launch_intent = launch_intent - 'agent' where id = $1",
+            [old.id],
+          );
+          await runtime.query(
+            `update workflow_step_runs set dispatch_intent = '{"agent":{"provider":"codex","model":"gpt-5"}}' where id = $1`,
+            [step],
+          );
+        }
         const complete = (owner: Database) =>
           owner.completeWorkflowAgentExecution({
             executionId: old.id,

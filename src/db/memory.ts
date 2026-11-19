@@ -4522,11 +4522,10 @@ class MemoryDatabase implements Database {
             source: receipt.source,
             status: run.status,
             receivedAt: receipt.receivedAt,
-            agent: launchedAgent(
+            agent:
               run.payloadExpiredAt == null
-                ? execution?.launchIntent?.agent
-                : (execution?.launchAgent ?? step?.payloadSummary),
-            ),
+                ? launchedAgent(execution?.launchIntent?.agent)
+                : (launchedAgent(step?.payloadSummary) ?? launchedAgent(execution?.launchAgent)),
             payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
           },
         ];
