@@ -3,7 +3,12 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { postgresDatabaseRuntime } from "../db/runtime/index.js";
-import { markTestReceipt, waitForReceiptLock } from "../db/test-utils/receipt-expiry.js";
+import {
+  ageReceiptAndSettleRuns,
+  drainReceiptSweep,
+  markTestReceipt,
+  waitForReceiptLock,
+} from "../db/test-utils/receipt-expiry.js";
 import type { ManualReceiptReplayBinding } from "../db/types.js";
 import { githubSignerUrl } from "../webhooks/contract.js";
 import { DispatchedManualRunSchema, ProblemSchema, ReceivedWebhookSchema } from "./contracts.js";
@@ -228,7 +233,6 @@ describe("native public receipt replay", () => {
 
   it("requires the retained manual revision's script authority when current configuration is an agent", async () => {
     const target = await hub.save("manual-script-replay", { script: true });
-    const binding = await bindingFor(hub, target);
     const sender = await hub.createKey(["runs:dispatch"], { actor: "sender" });
     const unbound = await hub.createKey(["runs:dispatch"], { actor: null });
     const deliveryKey = randomUUID();
@@ -249,8 +253,28 @@ describe("native public receipt replay", () => {
     const first = await request(sender.secret, { message: "script" });
     assert.equal(first.status, 200, await first.clone().text());
     const original = DispatchedManualRunSchema.parse(await first.json());
-    await markTestReceipt(hub.runtime, original.providerEventReceiptId, "expired", { binding });
+    const originalRun = await hub.database.findTriggerRunById(original.triggerRunId);
+    assert.ok(originalRun);
+    const expiryNow = new Date("2080-02-01T00:00:00Z");
+    await hub.runtime.transaction((tx) =>
+      ageReceiptAndSettleRuns(
+        tx,
+        original.providerEventReceiptId,
+        new Date("2000-01-01"),
+        expiryNow,
+      ),
+    );
     await hub.save(target.name, { triggerId: target.id });
+    await drainReceiptSweep(hub.database, expiryNow);
+    const receipt = await hub.database.findProviderEventReceiptById(
+      original.providerEventReceiptId,
+    );
+    assert.equal(receipt?.payloadExpiryState, "expired");
+    assert.equal(receipt?.manualReplayBinding?.projectId, target.runtimeProjectId);
+    assert.equal(
+      receipt?.manualReplayBinding?.configurationRevisionId,
+      originalRun.configurationRevisionId,
+    );
     const duplicate = await request(sender.secret, {
       message: "different",
       status: "invalid-choice",

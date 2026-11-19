@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
 import { ChannelType, Client, Message, TextChannel } from "discord.js";
 import { afterAll, beforeAll, describe, it, vi } from "vitest";
-import { markTestReceipt, waitForReceiptLock } from "../db/test-utils/receipt-expiry.js";
+import {
+  ageReceiptAndSettleRuns,
+  drainReceiptSweep,
+  markTestReceipt,
+  waitForReceiptLock,
+} from "../db/test-utils/receipt-expiry.js";
+import { compiledFixture } from "../db/test-utils/receipt-proof-fixture.js";
 import {
   createTimelinePostgresHarness,
   TIMELINE_ORGANIZATION as org,
@@ -18,12 +24,14 @@ import { DurableWorkflowEngine } from "../workflows/engine.js";
 import { createDiscordGatewaySource } from "./discord/gateway.js";
 import { MemoryDiscordBotClient } from "./discord/memory-bot.js";
 import { createWebhookSource } from "./github/webhook.js";
+import { createGitHubTriggerProvider } from "./github/provider.js";
 import {
   notificationDeliveryId,
   toNotificationPayload,
 } from "./github-notifications/notification.js";
 import { notificationYaml, thread } from "./github-notifications/test-fixture.js";
 import { createLinearWebhookSource } from "./linear/webhook.js";
+import { createLinearTriggerProvider } from "./linear/provider.js";
 import { createManualRunProvider } from "./manual/provider.js";
 import { ScheduleOccurrenceConflict } from "./schedule/internal/repository.js";
 import { scheduleYaml } from "./schedule/test-fixture.js";
@@ -33,6 +41,7 @@ import { OrganizationTriggerStore } from "./store.js";
 
 const secret = "fixture-signing-only";
 const now = new Date("2026-10-14T10:00:00Z");
+const sweepNow = new Date("2026-11-19T00:00:00Z");
 const connections = {
   github: randomUUID(),
   linear: randomUUID(),
@@ -41,9 +50,12 @@ const connections = {
 };
 const providers = ["github", "linear", "slack", "discord"] as const;
 
-function githubRequest(delivery: string, event: "issue_comment" | "push", change = "") {
+function githubRequest(delivery: string, event: "issue_comment" | "issues" | "push", change = "") {
   const body = JSON.stringify({
-    action: "created",
+    action: event === "issues" ? "opened" : "created",
+    ...(event === "issues"
+      ? { issue: { number: 1, title: "Issue" }, sender: { login: "sender" } }
+      : {}),
     installation: { id: 42 },
     repository: { id: 9001, full_name: "acme/widgets" },
     change,
@@ -147,7 +159,10 @@ async function providerRoutes(database: Database) {
     projectId: project.id,
     sourceKind: "manual",
     sourceEvidence: {},
-    normalizedConfiguration: { triggers: [], environments: [] },
+    normalizedConfiguration: {
+      triggers: [],
+      environments: compiledFixture("manual.run").environments,
+    },
     contentHash: "provider-replay",
   });
   await database.activateProjectConfigurationRevision(
@@ -243,6 +258,12 @@ describe("native provider receipt replay", () => {
 
   it("keeps the lifecycle audit copy fenced behind the original sync claim", async () => {
     let newSyncs = 0;
+    const owner = { providerApplicationId: "fixture-app", configurationVersion: 1 };
+    await harness.runtime.query(
+      `insert into runtime_provider_activation(provider, provider_application_id, configuration_version)
+         values ('github',$1,$2)`,
+      [owner.providerApplicationId, owner.configurationVersion],
+    );
     const source = createWebhookSource(secret, {
       accept: async () => assert.fail("lifecycle reached workflow routing"),
       applyLifecycle: async (input) => {
@@ -250,7 +271,13 @@ describe("native provider receipt replay", () => {
           ...input,
           providerApplicationId: "fixture-app",
         });
-        if (claim.status === "claimed") newSyncs++;
+        if (claim.status === "claimed") {
+          newSyncs++;
+          await harness.database.applyGitHubInstallationSync(owner, claim, {
+            status: "absent",
+            removeBinding: false,
+          });
+        }
       },
     });
     const send = (delivery: string) => {
@@ -271,7 +298,14 @@ describe("native provider receipt replay", () => {
     assert.equal((await send("lifecycle")).status, 200);
     const receipt = await harness.database.findProviderEventReceiptByDeliveryId("lifecycle", org);
     assert.ok(receipt);
-    await markTestReceipt(harness.runtime, receipt.id, "expired");
+    await harness.runtime.query(
+      "update github_installation_syncs set received_at = $1, settled_at = $1 where delivery_id = 'lifecycle'",
+      [now],
+    );
+    await ageReceiptAndSettleRuns(harness.runtime, receipt.id, now, sweepNow);
+    const applied = await drainReceiptSweep(harness.database, sweepNow);
+    assert.equal(applied.receiptApply.installationSync.applied, 1);
+    assert.equal(applied.receiptApply.lifecycleAuditCopy.applied, 1);
     assert.equal((await send("lifecycle-new-header")).status, 200);
     assert.equal(newSyncs, 1);
     assert.equal((await harness.database.findProviderEventReceiptById(receipt.id))?.payload, null);
@@ -512,7 +546,7 @@ describe("native provider receipt replay", () => {
       (await database.findProviderEventReceiptById(first.receiptId))?.preRoutingDrop,
       "no_trigger_for_source",
     );
-    await markTestReceipt(harness.runtime, first.receiptId, "expired");
+    await drainReceiptSweep(database, sweepNow);
     assert.deepEqual(
       await database.acceptGitHubEvent({ ...input, deliveryId: "unsupported-retry" }),
       {
@@ -675,8 +709,8 @@ run:
       "update project_configuration_revisions set normalized_configuration = '{}' where id = $1",
       [current.id],
     );
+    await ageReceiptAndSettleRuns(runtime, receipt.id, now, sweepNow);
     for (const expiryFirst of [false, true]) {
-      const state = expiryFirst ? "expired" : "expiring";
       await runtime.query(
         "update trigger_schedules set next_at = $2, active_run_id = null where trigger_id = $1",
         [trigger.id, due],
@@ -693,7 +727,7 @@ run:
       });
       const marker = () =>
         expiry.runtime.transaction(async (tx) => {
-          await markTestReceipt(tx, receipt.id, state);
+          await markTestReceipt(tx, receipt.id, "expiring");
           if (!expiryFirst) return;
           held.resolve();
           await release.promise;
@@ -721,6 +755,20 @@ run:
       assert.equal(schedule?.active_run_id, original.id);
       assert.ok(schedule.next_at > due);
     }
+    await drainReceiptSweep(database, sweepNow);
+    assert.equal(
+      (await database.findProviderEventReceiptById(receipt.id))?.payloadExpiryState,
+      "expired",
+    );
+    await runtime.query(
+      "update trigger_schedules set next_at = $2, active_run_id = null where trigger_id = $1",
+      [trigger.id, due],
+    );
+    assert.equal(await database.schedules.tick(due), 0);
+    assert.deepEqual(
+      (await database.findTriggerRunsByProviderEventReceiptId(receipt.id)).map(({ id }) => id),
+      [original.id],
+    );
     await runtime.query(
       "update trigger_schedules set next_at = $2, active_run_id = null where trigger_id = $1",
       [trigger.id, due],
@@ -759,13 +807,16 @@ run:
       'update project_configuration_revisions set normalized_configuration = \'{"triggers":[{"on":"github.notification"}]}\' where id = $1',
       [newRevision.id],
     );
-    for (const state of ["expiring", "expired"] as const) {
-      await markTestReceipt(runtime, receipt.id, state);
-      assert.deepEqual(await database.githubNotifications.deliver(batch, now), {
-        started: 0,
-        deferred: false,
-      });
-    }
+    await ageReceiptAndSettleRuns(runtime, receipt.id, now, sweepNow);
+    await drainReceiptSweep(database, sweepNow);
+    assert.equal(
+      (await database.findProviderEventReceiptById(receipt.id))?.payloadExpiryState,
+      "expired",
+    );
+    assert.deepEqual(await database.githubNotifications.deliver(batch, now), {
+      started: 0,
+      deferred: false,
+    });
     assert.equal(
       (await database.listTriggerRunsForProject(trigger.runtimeProjectId, 10)).length,
       1,
@@ -820,5 +871,122 @@ run:
     assert.deepEqual(await delivery, { started: 0, deferred: false });
     assert.deepEqual(await database.findTriggerRunsByProviderEventReceiptId(id), []);
     assert.deepEqual(await database.githubNotifications.readCursor(), cursor);
+  });
+  it("replays real admitted GitHub and Linear deliveries after the receipt sweep", async () => {
+    const { database, runtime } = harness;
+    const configurationStoreForProject = (id: string) =>
+      new ProjectConfigurationStore(database, id);
+    const githubProvider = createGitHubTriggerProvider({
+      configurationStoreForProject,
+      reactions: { createReaction: async () => null, deleteReaction: async () => {} },
+    });
+    const linearProvider = createLinearTriggerProvider({ configurationStoreForProject });
+    const workflow = new DurableWorkflowEngine({
+      database,
+      entitlements: null,
+      providers: [githubProvider, linearProvider],
+    });
+    const github = createWebhookSource(secret, {
+      accept: (input) => database.acceptGitHubEvent(input),
+      applyLifecycle: async () => assert.fail("not a lifecycle event"),
+    });
+    let hydrateCount = 0;
+    const linear = createLinearWebhookSource({
+      signingSecret: secret,
+      now: () => now.getTime(),
+      accept: (input) => database.acceptLinearEvent(input),
+      findMarkedReceipt: (...args) => database.findMarkedLinearReceipt(...args),
+      resolveIssue: async () => {
+        hydrateCount++;
+        return {
+          id: "issue",
+          identifier: "ENG-1",
+          title: "Test title",
+          description: null,
+          projectId: "linear-project",
+          stateId: "ready",
+          assigneeId: null,
+          labelIds: [],
+        };
+      },
+    });
+    let handoffError: unknown;
+    const dispatch = async (event: DurableProviderEvent) => {
+      try {
+        await workflow.enqueue(event);
+      } catch (error) {
+        handoffError = error;
+        throw error;
+      }
+    };
+    await github.start(dispatch);
+    await linear.start(dispatch);
+    try {
+      const githubSend = (delivery: string) =>
+        github.handle(githubRequest(delivery, "issues", "routed"));
+      const linearDelivery = "linear-routed-expiry";
+      const linearSend = () => linear.handle(linearRequest(linearDelivery, now.getTime() + 1));
+      for (const [provider, trigger, actor, originalDelivery, retryDelivery, send] of [
+        [
+          "github",
+          "github.issue_created",
+          "sender",
+          "github-routed-expiry",
+          "github-routed-retry",
+          githubSend,
+        ],
+        ["linear", "linear.comment_created", "user", linearDelivery, linearDelivery, linearSend],
+      ] as const) {
+        const project = await database.createProject({
+          organizationId: org,
+          name: provider + " routed expiry",
+          slug: provider + "-routed-expiry",
+          createdByUserId: null,
+        });
+        const revision = await database.insertProjectConfigurationRevision({
+          projectId: project.id,
+          sourceKind: "manual",
+          sourceEvidence: {},
+          normalizedConfiguration: compiledFixture(trigger, { from_users: [actor] }),
+          contentHash: provider + "-routed-expiry",
+        });
+        await database.activateProjectConfigurationRevision(project.id, revision.id, [
+          {
+            provider,
+            connectionId: connections[provider],
+            resourceId: null,
+            triggerName: "target",
+          },
+        ]);
+        const response = await send(originalDelivery);
+        assert.ifError(handoffError);
+        assert.equal(response.status, 200, provider);
+        const receipt = await database.findProviderEventReceiptByDeliveryId(originalDelivery, org);
+        assert.ok(receipt, provider);
+        const runs = await database.findTriggerRunsByProviderEventReceiptId(receipt.id);
+        assert.equal(runs.length, 1, provider);
+        assert.equal(runs[0]?.outcome, "accepted", provider);
+        assert.equal(runs[0]?.configurationRevisionId, revision.id);
+        await ageReceiptAndSettleRuns(runtime, receipt.id, now, sweepNow);
+        await drainReceiptSweep(database, sweepNow);
+        assert.equal(
+          (await database.findProviderEventReceiptById(receipt.id))?.payloadExpiryState,
+          "expired",
+        );
+        assert.equal((await send(retryDelivery)).status, 200);
+        assert.deepEqual(
+          (await database.findTriggerRunsByProviderEventReceiptId(receipt.id)).map(({ id }) => id),
+          runs.map(({ id }) => id),
+        );
+      }
+      assert.equal(hydrateCount, 1);
+      assert.equal(
+        await database.findProviderEventReceiptByDeliveryId("github-routed-retry", org),
+        undefined,
+      );
+    } finally {
+      await github.stop();
+      await linear.stop();
+    }
   });
 });

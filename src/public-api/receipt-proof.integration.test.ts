@@ -3,7 +3,8 @@ import { createHmac, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { postgresDatabaseRuntime } from "../db/runtime/index.js";
-import { CUTOFF, NOW, OLD } from "../db/test-utils/receipt-proof-fixture.js";
+import { ageReceiptAndSettleRuns, drainReceiptSweep } from "../db/test-utils/receipt-expiry.js";
+import { NOW, OLD } from "../db/test-utils/receipt-proof-fixture.js";
 import { githubSignerUrl } from "../webhooks/contract.js";
 import { ReceivedWebhookSchema } from "./contracts.js";
 import { testSigningSettings, webhookFixture } from "./test-utils/webhook-fixture.js";
@@ -17,24 +18,14 @@ async function workflowResult(response: Response, status: number) {
   return result;
 }
 
-async function expireOriginal(hub: Hub, receiptId: string, runId: string) {
-  await hub.runtime.transaction(async (tx) => {
-    await tx.query("update provider_event_receipts set received_at = $2 where id = $1", [
-      receiptId,
-      OLD,
-    ]);
-    await tx.query("delete from workflow_wakeups where trigger_run_id = $1", [runId]);
-    await tx.query(
-      `update trigger_runs set status = 'succeeded', completed_at = $2,
-            payload_expiry_state = 'expired', payload_expired_at = $2, payload_summary = '{"stepCounts":{}}',
-            terminal_notification_pending_at = null, terminal_notification_lease_expires_at = null
-         where id = $1`,
-      [runId, NOW],
-    );
-  });
-  assert.deepEqual(await hub.database.expireReceiptPayload(receiptId, CUTOFF, NOW), {
-    status: "expired",
-  });
+async function expireOriginal(hub: Hub, receiptId: string) {
+  await hub.runtime.transaction((tx) => ageReceiptAndSettleRuns(tx, receiptId, OLD, NOW));
+  const swept = await drainReceiptSweep(hub.database, NOW);
+  assert.equal(swept.receiptApply.receipt.applied, 1);
+  assert.equal(
+    (await hub.database.findProviderEventReceiptById(receiptId))?.payloadExpiryState,
+    "expired",
+  );
 }
 
 describe("public webhook replay after production receipt expiry", () => {
@@ -68,7 +59,7 @@ describe("public webhook replay after production receipt expiry", () => {
       200,
     );
     assert.equal(before.triggerRunId, original.triggerRunId);
-    await expireOriginal(hub, original.providerEventReceiptId, original.triggerRunId);
+    await expireOriginal(hub, original.providerEventReceiptId);
     const after = await workflowResult(
       await hub.send(target.name, conflicting, { deliveryKey }),
       200,
@@ -110,7 +101,7 @@ describe("public webhook replay after production receipt expiry", () => {
     await hub.save(target.name, { triggerId: target.id, filtered: true });
     const current = await hub.database.findActiveProjectConfiguration(target.runtimeProjectId);
     assert.notEqual(current?.id, originalRun.configurationRevisionId);
-    await expireOriginal(hub, original.providerEventReceiptId, original.triggerRunId);
+    await expireOriginal(hub, original.providerEventReceiptId);
     const receipt = await hub.database.findProviderEventReceiptById(
       original.providerEventReceiptId,
     );
@@ -151,13 +142,7 @@ describe("public webhook replay after production receipt expiry", () => {
       )
     ).rows;
     assert.ok(receipt);
-    await hub.runtime.query("update provider_event_receipts set received_at = $2 where id = $1", [
-      receipt.id,
-      OLD,
-    ]);
-    assert.deepEqual(await hub.database.expireReceiptPayload(receipt.id, CUTOFF, NOW), {
-      status: "expired",
-    });
+    await expireOriginal(hub, receipt.id);
     const duplicate = await hub.send(
       target.name,
       { message: "retry", status: "failed" },

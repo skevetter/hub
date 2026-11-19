@@ -78,6 +78,35 @@ async function seed(runtime: QueryHandle) {
     await runtime.query(sql);
 }
 
+async function seedReceiptStages(runtime: QueryHandle) {
+  await runtime.query(
+    `insert into provider_event_receipts (organization_id, provider, source, delivery_id,
+        payload, received_at, connection_id, dropped_reason, pre_routing_drop)
+      values ($1,'github','github.unknown','drop-delivery','{"body":"old-dropped-body"}',
+        $2, $3,'no_trigger_for_source','no_trigger_for_source'),
+        ($1,'github','github.unknown','pending-delivery','{"body":"pending-drop-body"}',
+        $2, $3,null,null)`,
+    [ORG, OLD, DAEMON],
+  );
+  await runtime.query(
+    `insert into github_installation_syncs
+       (kind, provider_application_id, installation_id, delivery_id, signature_hash,
+        source, payload, received_at, retry_at, settled_at, audit_link)
+     values ('webhook','app',1,'old-sync','old-signature','github.installation',
+         '{"body":"old-sync-body"}',$1,null,$1,'{"kind":"none"}'),
+       ('webhook','app',2,'pending-sync','pending-signature','github.installation',
+         '{"body":"pending-sync-body"}',$1,$1,null,null)`,
+    [OLD],
+  );
+  await runtime.query(
+    `insert into github_notification_cursors
+       (source, since, next_poll_at, last_error, last_error_at)
+     values ('old-cursor',$1,$2,'old-cursor-body',$1),
+       ('recent-cursor',$1,$2,'recent-cursor-body',$2)`,
+    [OLD, NOW],
+  );
+}
+
 async function migrateToBuild14(runtime: DatabaseRuntime) {
   const migrations = readMigrationFiles({ migrationsFolder: "drizzle" }).slice(0, 58);
   await runtime.transaction(async (client) => {
@@ -231,7 +260,7 @@ async function tableHashes(runtime: QueryHandle) {
     assert.match(schemaname, /^[a-z0-9_]+$/u);
     const name = `"${schemaname}"."${tablename}"`;
     const { rows: values } = await runtime.query<{ hash: string }>(
-      `select md5(coalesce(string_agg(row::text, ',' order by row::text), '')) as hash from ${name} row`,
+      `select md5(coalesce(string_agg(row.xmin::text || row::text, ',' order by row::text), '')) as hash from ${name} row`,
     );
     hashes.set(name, values[0]!.hash);
   }
@@ -393,6 +422,10 @@ describe("launch and session expiry in PostgreSQL", () => {
         await checkArrival(history, session, ids);
       }
 
+      const credentialRows = () =>
+        runtime.query(`select to_jsonb(execution) - 'used_temporary_credentials' as row
+          from agent_executions execution order by id`);
+      const beforeCredentials = await credentialRows();
       const hashes = await tableHashes(runtime);
       const off = await drain(new RunPayloadRetention(database, { ...settings, mode: "off" }));
       assert.equal(off.credentialFactsBackfilled, 0);
@@ -405,6 +438,7 @@ describe("launch and session expiry in PostgreSQL", () => {
       assert.equal(count.launchIntentsExpired, 0);
       assert.equal(count.sessionsReduced, 0);
       const afterCount = await tableHashes(runtime);
+      assert.deepEqual(await credentialRows(), beforeCredentials);
       assert.deepEqual(
         [...afterCount].filter(([name, hash]) => hash !== hashes.get(name)).map(([name]) => name),
         ['"public"."agent_executions"'],
@@ -524,8 +558,25 @@ describe("launch and session expiry in PostgreSQL", () => {
         "update trigger_runs set status = 'succeeded', completed_at = $2 where id = $1",
         [run, OLD],
       );
+      await seedReceiptStages(runtime);
+      const expiredMarkers = [
+        ...LAUNCH_MARKERS,
+        ...SESSION_MARKERS,
+        bearer,
+        "old-dropped-body",
+        "old-sync-body",
+        "old-cursor-body",
+      ];
+      const retainedMarkers = [
+        ...KEEP_MARKERS,
+        "pending-drop-body",
+        "pending-sync-body",
+        "recent-cursor-body",
+        "drop-delivery",
+        "old-signature",
+      ];
       const before = await dump(name);
-      for (const marker of [...LAUNCH_MARKERS, ...SESSION_MARKERS, ...KEEP_MARKERS, bearer])
+      for (const marker of [...expiredMarkers, ...retainedMarkers])
         assert.ok(before.includes(marker), marker);
       const hashes = await tableHashes(runtime);
       const counted = await drain(
@@ -550,14 +601,17 @@ describe("launch and session expiry in PostgreSQL", () => {
       assert.equal(applied.launchIntentsExpired, 1);
       assert.equal(applied.sessionsReduced, 1);
       assert.equal(applied.auxiliaryCounts.machine.machine_legacy, undefined);
+      assert.deepEqual(applied.receiptCounts, counted.receiptCounts);
+      assert.equal(applied.receiptApply.receipt.applied, 1);
+      assert.equal(applied.receiptApply.installationSync.applied, 1);
+      assert.equal(applied.receiptApply.cursorDiagnostic.applied, 1);
       assert.equal((await database.findAgentExecutionById(old.id))?.launchRunId, run);
       assert.equal((await database.findAgentSession(incomplete.id))?.optionsReducedAt, null);
       assert.equal((await database.findAgentSession(unused.id))?.optionsReducedAt, null);
       await database.saveAgentSession(session);
       const after = await dump(name);
-      for (const marker of [...LAUNCH_MARKERS, ...SESSION_MARKERS, bearer])
-        assert.ok(!after.includes(marker), marker);
-      for (const marker of KEEP_MARKERS) assert.ok(after.includes(marker), marker);
+      for (const marker of expiredMarkers) assert.ok(!after.includes(marker), marker);
+      for (const marker of retainedMarkers) assert.ok(after.includes(marker), marker);
       const reduced = await database.findAgentSession(session.id);
       assert.ok(reduced?.optionsReducedAt);
       assert.deepEqual(reduced.creationOptions, {
@@ -651,7 +705,7 @@ describe("launch and session expiry in PostgreSQL", () => {
     }
   });
 
-  it("shares a cap of one across run, launch and session redactions", async () => {
+  it("rotates a cap of one across run, launch, session, receipt, sync and diagnostic expiry", async () => {
     const { runtime, database } = await freshDatabase();
     try {
       const run = await newRun(runtime);
@@ -662,16 +716,27 @@ describe("launch and session expiry in PostgreSQL", () => {
         "update trigger_runs set status = 'succeeded', completed_at = $2 where id = $1",
         [run, OLD],
       );
+      await seedReceiptStages(runtime);
       const sweep = new RunPayloadRetention(database, { ...settings, maxRunsPerPass: 1 });
       const totals: number[][] = [];
-      for (let pass = 0; pass < 3; pass++) {
-        const { expired, launchIntentsExpired, sessionsReduced } = await drain(sweep);
-        totals.push([expired, launchIntentsExpired, sessionsReduced]);
+      for (let pass = 0; pass < 6; pass++) {
+        const result = await drain(sweep);
+        totals.push([
+          result.expired,
+          result.launchIntentsExpired,
+          result.sessionsReduced,
+          result.receiptApply.receipt.applied,
+          result.receiptApply.installationSync.applied,
+          result.receiptApply.cursorDiagnostic.applied,
+        ]);
       }
       assert.deepEqual(totals, [
-        [1, 0, 0],
-        [0, 1, 0],
-        [0, 0, 1],
+        [1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 1],
       ]);
     } finally {
       await runtime.close();
