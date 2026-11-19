@@ -9,11 +9,11 @@ Hub can expire run-owned content after a terminal run has a recorded completion 
 retention window starts at completion. A run becomes old enough strictly after that window
 and stays eligible only while its work is settled.
 
-| Setting                                          | Default | Accepted values                                                                                                                                                                                                                                                          |
-| ------------------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `PASEO_HUB_RUN_PAYLOAD_EXPIRY`                   | `off`   | `off` skips the sweep and `count` reports eligibility. `on` redacts eligible content. After `on` removes a launch intent or reduces session options, set the mode to `off` first for rollback and keep every binary at this build or newer. Never run build 14 or older. |
-| `PASEO_HUB_RUN_PAYLOAD_RETENTION_DAYS`           | `30`    | Whole days from 1 to 365.                                                                                                                                                                                                                                                |
-| `PASEO_HUB_RUN_PAYLOAD_EXPIRY_MAX_RUNS_PER_PASS` | `50`    | A positive whole number. Caps completed run, launch and session redactions per sweep.                                                                                                                                                                                    |
+| Setting                                          | Default | Accepted values                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------ | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PASEO_HUB_RUN_PAYLOAD_EXPIRY`                   | `off`   | `off` skips the sweep. `count` reports eligibility and fills missing credential facts. `on` redacts eligible content. After `on` removes a launch intent or reduces session options, set the mode to `off` first for rollback and keep every binary at this build or newer. Never run build 14 or older. It can reuse credentialed agents and restore removed options. |
+| `PASEO_HUB_RUN_PAYLOAD_RETENTION_DAYS`           | `30`    | Whole days from 1 to 365.                                                                                                                                                                                                                                                                                                                                              |
+| `PASEO_HUB_RUN_PAYLOAD_EXPIRY_MAX_RUNS_PER_PASS` | `50`    | A positive whole number. Caps credential facts filled and run, launch and session redactions per sweep.                                                                                                                                                                                                                                                                |
 
 Set these environment variables on the Hub process and restart. The run payload and timeline
 windows are configured independently. Hub rejects startup in `on` mode when the payload
@@ -21,7 +21,9 @@ window is shorter than `PASEO_HUB_TIMELINE_RETENTION_DAYS`. Count mode accepts a
 window so operators can evaluate it.
 
 The worker starts in the background after startup and runs hourly. Count mode reports the
-number and oldest age of eligible and blocked runs without changing rows or logging content.
+number and oldest age of eligible and blocked rows without logging content. Both `count`
+and `on` can write missing credential facts when the stored launch intent proves them.
+Only `on` can redact payloads.
 Pending workflow work, execution or script cleanup, unresolved receipt fan-out, terminal
 notifications and reporter work can keep old runs ineligible. Ordinary provider receipts
 need a persisted branch for each workflow that admission matches against the stored receipt
@@ -35,8 +37,9 @@ before clearing child rows in batches and resumes interrupted redactions after a
 The same window covers launch intents of settled standalone executions and executions
 whose runs have already expired. Hub keeps the run association, provider and model
 labels, and the recorded credential fact used to rotate sessions. Unknown credential
-history blocks expiry. Hub also reduces creation options for old, bound sessions with
-completed bootstrap and settled owners. The session keeps its continuation key,
+history blocks expiry. A running finish-tool acknowledgement keeps the launch intent
+and its session options until the acknowledgement settles. Hub reduces creation options for
+old, bound sessions with completed bootstrap and settled owners. The session keeps its continuation key,
 identity, compatibility, tool contract and capability verifier. This includes custom
 continuation keys built from event input. Unused, unbound, and incomplete sessions
 remain available for recovery. Count mode also inventories legacy payloads on old,

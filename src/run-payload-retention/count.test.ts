@@ -121,6 +121,7 @@ it("counts with a fixed cutoff and leaves all rows byte-for-byte unchanged", asy
     assert.deepEqual(await retention.runBatch(NOW), {
       complete: true,
       expired: 0,
+      credentialFactsBackfilled: 0,
       launchIntentsExpired: 0,
       sessionsReduced: 0,
       auxiliaryCounts: { launchIntent: {}, session: {}, machine: {} },

@@ -10,9 +10,11 @@ import {
   scanRunPayloads,
 } from "./run-payload-retention.js";
 import {
+  backfillTemporaryCredentialFact,
   expireLaunchIntent,
   reduceSessionOptions,
   scanAuxiliaryPayloads,
+  scanUnknownTemporaryCredentials,
 } from "./launch-payload-retention.js";
 import type { AgentSessionRecord, ReducedAgentSessionOptions } from "../agent-sessions/types.js";
 import type { DaemonCreateAgentOptions } from "../daemons/protocol.js";
@@ -303,6 +305,11 @@ export function createDatabase(runtime: DatabaseRuntime, locks: Locks): Database
 }
 
 class PgDatabase implements Database {
+  scanUnknownTemporaryCredentials: Database["scanUnknownTemporaryCredentials"] = (after, limit) =>
+    scanUnknownTemporaryCredentials(this.pool, after, limit);
+  backfillTemporaryCredentialFact: Database["backfillTemporaryCredentialFact"] = (id) =>
+    backfillTemporaryCredentialFact(this.pool, id);
+
   scanAuxiliaryPayloads: Database["scanAuxiliaryPayloads"] = (kind, after, cutoff, limit) =>
     scanAuxiliaryPayloads(this.pool, kind, after, cutoff, limit);
   expireLaunchIntent: Database["expireLaunchIntent"] = (id, cutoff, now) =>

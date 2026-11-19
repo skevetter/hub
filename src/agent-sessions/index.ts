@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { hasTemporaryCredentials } from "./credentials.js";
 import type { Database, AgentExecutionRecord } from "../db/types.js";
 import {
   DEFAULT_STARTUP_TIMEOUT_MS,
@@ -64,7 +65,11 @@ export class AgentSessions {
       return (
         executions.length > 0 &&
         !executions.some(isActive) &&
-        executions.some((execution) => execution.usedTemporaryCredentials !== false)
+        executions.some(
+          ({ usedTemporaryCredentials, launchIntent }) =>
+            usedTemporaryCredentials ??
+            (launchIntent === null || hasTemporaryCredentials(launchIntent)),
+        )
       );
     };
     // External credential minting must not hold a database connection open during shutdown.

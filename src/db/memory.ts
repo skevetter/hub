@@ -210,6 +210,34 @@ export function createMemoryDatabase(options: MemoryDatabaseOptions = {}): Datab
 }
 
 class MemoryDatabase implements Database {
+  async scanUnknownTemporaryCredentials(after: string | null, limit: number): Promise<string[]> {
+    return [...this.agentExecutions.values()]
+      .filter(
+        (row) =>
+          (after === null || row.id > after) &&
+          row.usedTemporaryCredentials == null &&
+          row.launchIntent !== null &&
+          row.launchIntentExpiredAt == null,
+      )
+      .map(({ id }) => id)
+      .sort((left, right) => left.localeCompare(right))
+      .slice(0, limit);
+  }
+
+  async backfillTemporaryCredentialFact(id: string): Promise<boolean> {
+    const row = this.agentExecutions.get(id);
+    if (
+      row?.launchIntent == null ||
+      row.usedTemporaryCredentials != null ||
+      row.launchIntentExpiredAt != null
+    )
+      return false;
+    const fact = temporaryCredentialFact(row.launchIntent);
+    if (fact === null) return false;
+    this.agentExecutions.set(id, { ...row, usedTemporaryCredentials: fact });
+    return true;
+  }
+
   async scanAuxiliaryPayloads(
     kind: AuxiliaryPayloadKind,
     after: string | null,

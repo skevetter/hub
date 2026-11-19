@@ -134,6 +134,8 @@ it("keeps retry logs free of database diagnostics and lets shutdown cancel the s
   const retention = new RunPayloadRetention(
     {
       scanRunPayloads: scan,
+      scanUnknownTemporaryCredentials: vi.fn().mockResolvedValue([]),
+      backfillTemporaryCredentialFact: vi.fn(),
       expireRunPayloadChunk: expire,
       scanAuxiliaryPayloads: vi.fn(),
       expireLaunchIntent: vi.fn(),

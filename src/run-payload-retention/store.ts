@@ -36,6 +36,8 @@ export interface AuxiliaryPayloadCandidate {
 }
 
 export interface RunPayloadRetentionStore {
+  scanUnknownTemporaryCredentials(after: string | null, limit: number): Promise<string[]>;
+  backfillTemporaryCredentialFact(id: string): Promise<boolean>;
   scanAuxiliaryPayloads(
     kind: AuxiliaryPayloadKind,
     after: string | null,

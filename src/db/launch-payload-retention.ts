@@ -1,5 +1,7 @@
 import { sessionLock } from "../agent-sessions/index.js";
+import { temporaryCredentialFact } from "../agent-sessions/credentials.js";
 import type { AgentSessionRecord } from "../agent-sessions/types.js";
+import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { summarizePayloadAgent } from "../run-payload-retention/summary.js";
 import type {
   AuxiliaryPayloadCandidate,
@@ -79,6 +81,44 @@ const SESSION_DISPOSITION = `case
   when owners.last_activity >= $2 then 'not_old_enough'
   else 'eligible'
 end`;
+
+const UNKNOWN_CREDENTIAL_FACT = `used_temporary_credentials is null and launch_intent is not null
+  and launch_intent_expired_at is null`;
+
+export async function scanUnknownTemporaryCredentials(
+  database: QueryHandle,
+  after: string | null,
+  limit: number,
+): Promise<string[]> {
+  const result = await database.query<{ id: string }>(
+    `select id from agent_executions
+     where ($1::uuid is null or id > $1) and ${UNKNOWN_CREDENTIAL_FACT}
+     order by id limit $2`,
+    [after, limit],
+  );
+  return result.rows.map(({ id }) => id);
+}
+
+export async function backfillTemporaryCredentialFact(database: DatabaseRuntime, id: string) {
+  return database.transaction(async (client) => {
+    const result = await client.query<{ launch_intent: LaunchMachineIntent }>(
+      `select launch_intent from agent_executions
+       where id = $1 and ${UNKNOWN_CREDENTIAL_FACT}
+       for update skip locked`,
+      [id],
+    );
+    const intent = result.rows[0]?.launch_intent;
+    if (intent === undefined) return false;
+    const fact = temporaryCredentialFact(intent);
+    if (fact === null) return false;
+    const update = await client.query(
+      `update agent_executions set used_temporary_credentials = $2
+       where id = $1 and ${UNKNOWN_CREDENTIAL_FACT}`,
+      [id, fact],
+    );
+    return update.rowCount === 1;
+  });
+}
 
 export async function scanAuxiliaryPayloads(
   database: QueryHandle,

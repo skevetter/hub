@@ -49,7 +49,7 @@ describe("database migration application", () => {
     await postgres.stop();
   }, 120_000);
 
-  it("preserves populated build 14 options and backfills launch credential facts", async () => {
+  it("preserves populated build 14 options and migrates certain credential facts", async () => {
     const url = await createHistoricalBaseline({
       postgres,
       prefix: "launch_payload_upgrade",
@@ -103,7 +103,7 @@ describe("database migration application", () => {
       );
       assert.deepEqual(
         result.rows.map((row) => row["fact"]),
-        [true, false, true, true, false, null, null, null, null, null],
+        [null, false, null, true, false, null, null, null, null, null],
       );
       assert.deepEqual(
         result.rows.map((row) => row["intent"]),

@@ -19,9 +19,10 @@ type Counts = Partial<Record<RunPayloadDisposition, { count: number; oldestAgeMs
 type AuxiliaryCounts = Partial<
   Record<AuxiliaryPayloadDisposition, { count: number; oldestAgeMs: number | null }>
 >;
-const APPLY_STAGES = ["run", "launchIntent", "session"] as const;
+const APPLY_STAGES = ["credentials", "run", "launchIntent", "session"] as const;
 type Stage = (typeof APPLY_STAGES)[number] | "machine";
 type SweepCandidate =
+  | { id: string; kind: "credentials" }
   | (RunPayloadCandidate & { kind: "run" })
   | (AuxiliaryPayloadCandidate & { kind: AuxiliaryPayloadKind });
 
@@ -39,6 +40,7 @@ export class RunPayloadRetention {
   private counts: Counts = {};
   private auxiliaryCounts = auxiliaryCounts();
   private expired = 0;
+  private credentialFactsBackfilled = 0;
   private launchIntentsExpired = 0;
   private sessionsReduced = 0;
   private stageOffset = 0;
@@ -76,30 +78,34 @@ export class RunPayloadRetention {
       counts: this.counts,
       auxiliaryCounts: this.auxiliaryCounts,
       expired: this.expired,
+      credentialFactsBackfilled: this.credentialFactsBackfilled,
       launchIntentsExpired: this.launchIntentsExpired,
       sessionsReduced: this.sessionsReduced,
     });
+    if (this.settings.mode === "off") return this.finishSweep(report(true));
     for (let stage = this.stages[0]; stage !== undefined; stage = this.stages[0]) {
       if (shouldStop()) return report(false);
       const page = await this.scanStage(stage, cutoff, limit, countOnly);
       for (const candidate of page) {
         if (shouldStop()) return report(false);
-        if (!countOnly && candidate.disposition === "eligible") {
-          const completed = await this.applyCandidate(candidate, cutoff, now);
-          if (!completed) return report(false);
-        }
-        this.countCandidate(candidate, this.now);
+        if (!(await this.processCandidate(candidate, cutoff, now, this.now))) return report(false);
         this.cursor = candidate.id;
         if (
+          !countOnly &&
           stage !== "machine" &&
-          this.expired + this.launchIntentsExpired + this.sessionsReduced >=
+          this.credentialFactsBackfilled +
+            this.expired +
+            this.launchIntentsExpired +
+            this.sessionsReduced >=
             this.settings.maxRunsPerPass
         ) {
           this.stageOffset = (APPLY_STAGES.indexOf(stage) + 1) % APPLY_STAGES.length;
           return this.finishSweep(report(true));
         }
       }
-      if (page.length >= limit) return report(false);
+      const stageCapped =
+        stage === "credentials" && this.credentialFactsBackfilled >= this.settings.maxRunsPerPass;
+      if (page.length >= limit && !stageCapped) return report(false);
       this.stages.shift();
       this.cursor = null;
     }
@@ -112,6 +118,10 @@ export class RunPayloadRetention {
     limit: number,
     countOnly: boolean,
   ): Promise<SweepCandidate[]> {
+    if (stage === "credentials") {
+      const page = await this.store.scanUnknownTemporaryCredentials(this.cursor, limit);
+      return page.map((id) => ({ id, kind: stage }));
+    }
     if (stage === "run") {
       const page = await this.store.scanRunPayloads(this.cursor, cutoff, limit, countOnly);
       return page.map(({ id, disposition, ageFrom }) => ({
@@ -125,8 +135,33 @@ export class RunPayloadRetention {
     return page.map(({ id, disposition, ageFrom }) => ({ id, disposition, ageFrom, kind: stage }));
   }
 
-  private async applyCandidate(
+  private async processCandidate(
     candidate: SweepCandidate,
+    cutoff: Date,
+    now: Date,
+    countAt: Date,
+  ): Promise<boolean> {
+    if (candidate.kind === "credentials") {
+      if (
+        this.credentialFactsBackfilled < this.settings.maxRunsPerPass &&
+        (await this.store.backfillTemporaryCredentialFact(candidate.id))
+      ) {
+        this.credentialFactsBackfilled++;
+      }
+      return true;
+    }
+    if (
+      this.settings.mode === "on" &&
+      candidate.disposition === "eligible" &&
+      !(await this.applyCandidate(candidate, cutoff, now))
+    )
+      return false;
+    this.countCandidate(candidate, countAt);
+    return true;
+  }
+
+  private async applyCandidate(
+    candidate: Exclude<SweepCandidate, { kind: "credentials" }>,
     cutoff: Date,
     now: Date,
   ): Promise<boolean> {
@@ -145,7 +180,10 @@ export class RunPayloadRetention {
     return true;
   }
 
-  private countCandidate(candidate: SweepCandidate, now: Date): void {
+  private countCandidate(
+    candidate: Exclude<SweepCandidate, { kind: "credentials" }>,
+    now: Date,
+  ): void {
     if (candidate.kind === "run") {
       const count = this.counts[candidate.disposition] ?? { count: 0, oldestAgeMs: 0 };
       count.count++;
@@ -173,6 +211,7 @@ export class RunPayloadRetention {
     this.counts = {};
     this.auxiliaryCounts = auxiliaryCounts();
     this.expired = 0;
+    this.credentialFactsBackfilled = 0;
     this.launchIntentsExpired = 0;
     this.sessionsReduced = 0;
     return result;
