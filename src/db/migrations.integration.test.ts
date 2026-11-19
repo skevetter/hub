@@ -202,8 +202,25 @@ describe("database migration application", () => {
       url,
       "select to_jsonb(receipt) as value from provider_event_receipts receipt",
     );
+    const baseline = await poolQuery<{ hash: string }>(
+      url,
+      "select hash from drizzle.__drizzle_migrations order by id",
+    );
+    assert.equal(baseline.rows.length, 59);
+    const receiptMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0059_run_payload_expiry_receipts.sql"),
+    );
     const database = await createDatabase(url);
     try {
+      const migrated = await poolQuery<{ hash: string }>(
+        url,
+        "select hash from drizzle.__drizzle_migrations order by id",
+      );
+      assert.equal(migrated.rowCount, baseline.rows.length + 1);
+      assert.deepEqual(migrated.rows, [
+        ...baseline.rows,
+        { hash: createHash("sha256").update(receiptMigration).digest("hex") },
+      ]);
       assert.deepEqual(
         (
           await poolQuery(
