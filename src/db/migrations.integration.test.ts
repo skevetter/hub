@@ -179,6 +179,56 @@ describe("database migration application", () => {
       await upgraded.close();
     }
   }, 120_000);
+  it("adds nullable receipt fences over populated launch-expiry rows", async () => {
+    const url = await createHistoricalBaseline({
+      postgres,
+      prefix: "receipt_expiry_upgrade",
+      through: "0058_launch_payload_expiry",
+    });
+    await poolQuery(
+      url,
+      `insert into organization (id, name, slug) values ('receipt-upgrade','Receipts','receipt-upgrade');
+       insert into provider_event_receipts
+         (organization_id, provider, delivery_id, signature_hash, source, payload, accepted_routes)
+       values ('receipt-upgrade', 'github', 'delivery', 'signature', 'github.issues',
+               '{"body":"original"}', '[{"historical":true}]');`,
+    );
+    const before = await poolQuery<{ value: Record<string, unknown> }>(
+      url,
+      "select to_jsonb(receipt) as value from provider_event_receipts receipt",
+    );
+    const database = await createDatabase(url);
+    try {
+      const after = await poolQuery<{ value: object }>(
+        url,
+        "select to_jsonb(receipt) as value from provider_event_receipts receipt",
+      );
+      assert.deepEqual(after.rows, [
+        {
+          value: {
+            ...before.rows[0]?.value,
+            payload_expiry_state: null,
+            payload_expired_at: null,
+            manual_replay_binding: null,
+            pre_routing_drop: null,
+          },
+        },
+      ]);
+      for (const set of [
+        "payload_expiry_state = 'expired'",
+        "payload_expired_at = now()",
+        "payload_expiry_state = 'invalid', payload_expired_at = now()",
+      ]) {
+        await assert.rejects(
+          poolQuery(url, `update provider_event_receipts set ${set}`),
+          /provider_event_receipts_payload_expiry_check/u,
+        );
+      }
+    } finally {
+      await database.close();
+    }
+  }, 120_000);
+
   it("adds reporter scheduling and expiry markers over populated release-10 rows", async () => {
     const url = await createHistoricalBaseline({
       postgres,
@@ -250,12 +300,17 @@ describe("database migration application", () => {
       join(DRIZZLE_MIGRATIONS, "0058_launch_payload_expiry.sql"),
       "utf8",
     );
+    const receiptExpiryMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0059_run_payload_expiry_receipts.sql"),
+      "utf8",
+    );
     assert.deepEqual((await journal()).rows, [
       ...releasedJournal.rows,
       { hash: createHash("sha256").update(reporterMigration).digest("hex") },
       { hash: createHash("sha256").update(signingMigration).digest("hex") },
       { hash: createHash("sha256").update(expiryMigration).digest("hex") },
       { hash: createHash("sha256").update(launchExpiryMigration).digest("hex") },
+      { hash: createHash("sha256").update(receiptExpiryMigration).digest("hex") },
     ]);
     const runs = await poolQuery(
       url,
@@ -325,7 +380,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 59);
+      assert.equal(journal.rowCount, 60);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",

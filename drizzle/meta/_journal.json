@@ -414,6 +414,13 @@
       "when": 1795062860980,
       "tag": "0058_launch_payload_expiry",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1795066964507,
+      "tag": "0059_run_payload_expiry_receipts",
+      "breakpoints": true
     }
   ]
 }

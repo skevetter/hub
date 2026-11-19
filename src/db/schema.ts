@@ -34,6 +34,18 @@ export const PROJECT_STATUSES = ["active", "archived"] as const;
 export const CONFIGURATION_SOURCE_KINDS = ["github", "manual"] as const;
 export const TRIGGER_FORMATS = ["single_run", "legacy_multistep"] as const;
 export const CONNECTION_PROVIDERS = ["github", "slack", "discord", "linear"] as const;
+export type ReceiptPayloadExpiryState = "expiring" | "expired";
+export type ReceiptPreRoutingDrop =
+  | "no_project_route"
+  | "no_trigger_for_source"
+  | "configuration_unavailable";
+
+export interface ManualReceiptReplayBinding {
+  projectId: string;
+  configurationRevisionId: string;
+  triggerName: string;
+  triggerId: string | null;
+}
 
 export type MachineSource =
   | { kind: "manual"; userId?: string }
@@ -66,6 +78,10 @@ export const providerEventReceipts = pgTable(
     receivedAt: timestamp("received_at", { withTimezone: true }).defaultNow().notNull(),
     droppedReason: text("dropped_reason"),
     acceptedRoutes: jsonb("accepted_routes"),
+    payloadExpiryState: text("payload_expiry_state").$type<ReceiptPayloadExpiryState>(),
+    payloadExpiredAt: timestamp("payload_expired_at", { withTimezone: true }),
+    preRoutingDrop: text("pre_routing_drop").$type<ReceiptPreRoutingDrop>(),
+    manualReplayBinding: jsonb("manual_replay_binding").$type<ManualReceiptReplayBinding>(),
   },
   (table) => [
     uniqueIndex("provider_event_receipts_id_organization_unique").on(
@@ -92,6 +108,17 @@ export const providerEventReceipts = pgTable(
     check(
       "provider_event_receipts_provider_check",
       sql`${table.provider} in ('github', 'slack', 'discord', 'linear', 'manual', 'schedule', 'github_notification')`,
+    ),
+    check(
+      "provider_event_receipts_payload_expiry_check",
+      sql`(${table.payloadExpiryState} is null and ${table.payloadExpiredAt} is null)
+        or (${table.payloadExpiryState} is not null and ${table.payloadExpiryState} in ('expiring', 'expired')
+            and ${table.payloadExpiredAt} is not null)`,
+    ),
+    check(
+      "provider_event_receipts_pre_routing_drop_check",
+      sql`${table.preRoutingDrop} is null or (${table.preRoutingDrop} in ('no_project_route', 'no_trigger_for_source', 'configuration_unavailable')
+        and ${table.preRoutingDrop} is not distinct from ${table.droppedReason} and ${table.acceptedRoutes} is null)`,
     ),
   ],
 );
