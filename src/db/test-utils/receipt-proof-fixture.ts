@@ -122,7 +122,14 @@ export async function seedProofReceipt(
   } = input;
   const deliveryId = input.deliveryId ?? input.key;
   const receivedAt = input.receivedAt ?? OLD;
-  const payload = { ...input.payload, sentinel: marker };
+  const payload = {
+    ...input.payload,
+    sentinel: marker,
+    fixture: {
+      actor: marker + "-actor",
+      data: { content: marker + "-content", deliveryKey: marker + "-key" },
+    },
+  };
   const signatureHash =
     provider === "github" || provider === "linear" ? "signature-" + input.key : null;
   const received = await database.persistManualEvent({
@@ -136,8 +143,11 @@ export async function seedProofReceipt(
   });
   assert.equal(received.status, "accepted");
   const id = received.event.providerEventReceiptId;
+  const routeMarker = input.noRoutes === true ? null : "receipt-route-" + input.key + "-marker";
   const acceptedRoutes =
-    input.noRoutes === true ? null : [route, ...(input.additionalRoutes ?? [])];
+    routeMarker === null
+      ? null
+      : [{ ...route, fixture: routeMarker }, ...(input.additionalRoutes ?? [])];
   if (runtime !== undefined) {
     await runtime.query(
       `update provider_event_receipts set provider = $2, connection_id = $3, resource_id = $4, repo = $5,
@@ -174,6 +184,7 @@ export async function seedProofReceipt(
     id,
     key: input.key,
     marker,
+    routeMarker,
     deliveryId,
     signatureHash,
     disposition: input.disposition,

@@ -7,6 +7,7 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testconta
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { createMemoryDatabase } from "./memory.js";
 import { createDatabase } from "./pg.js";
+import { drainReceiptSweep } from "./test-utils/receipt-expiry.js";
 import {
   embeddedDatabaseRuntime,
   postgresDatabaseRuntime,
@@ -31,7 +32,7 @@ async function hashTables(runtime: QueryHandle) {
   for (const table of tables.rows) {
     const row = (
       await runtime.query<{ hash: string }>(
-        `select md5(coalesce(string_agg(row::text, '' order by row::text), '')) as hash
+        `select md5(coalesce(string_agg(row.xmin::text || row::text, '' order by row::text), '')) as hash
          from ${identifier(table.schema)}.${identifier(table.name)} row`,
       )
     ).rows[0];
@@ -41,7 +42,34 @@ async function hashTables(runtime: QueryHandle) {
   return hashes;
 }
 
-async function verifyMatrix(database: Database, runtime?: QueryHandle) {
+async function prepareFullSweepFixture(
+  database: Database,
+  runtime: QueryHandle,
+  cases: Awaited<ReturnType<typeof seedProofMatrix>>,
+) {
+  // Keep the sibling unexpired throughout the static count and apply comparison.
+  const sibling = cases.find(({ key }) => key === "github-expiring-sibling")?.runs.at(-1);
+  assert.ok(sibling);
+  for (const { id, key } of cases) {
+    if (key !== "slack" && key !== "discord") continue;
+    await database.insertAttachment({
+      providerEventReceiptId: id,
+      organizationId: MATRIX_ORG,
+      connectionId: CONNECTION_ID,
+      provider: key,
+      sourceId: key + "-file",
+      locator: { fileId: "capability-" + key + "-locator-marker" },
+      filename: "capability-" + key + "-filename-marker.txt",
+    });
+  }
+  await runtime.query(
+    `update trigger_runs set payload_expiry_state = null, payload_expired_at = null,
+        payload_summary = null where id = $1`,
+    [sibling],
+  );
+}
+
+async function verifyMatrix(database: Database, runtime?: QueryHandle, sweep = false) {
   await runtime?.query(
     `insert into github_connections
         (id,organization_id,installation_id,slug,account_id,account_login,account_type,status)
@@ -49,6 +77,10 @@ async function verifyMatrix(database: Database, runtime?: QueryHandle) {
     [CONNECTION_ID, MATRIX_ORG],
   );
   const cases = await seedProofMatrix(database, runtime);
+  if (sweep) {
+    assert.ok(runtime);
+    await prepareFullSweepFixture(database, runtime, cases);
+  }
   const before = runtime === undefined ? undefined : await hashTables(runtime);
   const candidates = [];
   let after: string | null = null;
@@ -58,14 +90,34 @@ async function verifyMatrix(database: Database, runtime?: QueryHandle) {
     after = page.at(-1)?.id ?? null;
   } while (after !== null);
   assert.equal(candidates.length, cases.length);
-  if (runtime !== undefined) assert.deepEqual(await hashTables(runtime), before);
+  if (sweep) {
+    assert.ok(runtime);
+    const count = await drainReceiptSweep(database, NOW, "count");
+    assert.deepEqual(await hashTables(runtime), before);
+    for (const disposition of new Set(cases.map((fixture) => fixture.disposition))) {
+      assert.equal(
+        count.receiptCounts.receipts[disposition]?.count,
+        cases.filter((fixture) => fixture.disposition === disposition).length,
+        disposition,
+      );
+    }
+    assert.deepEqual(count.receiptApply.receipt, { applied: 0, locked: 0, changedOrMissing: 0 });
+    const applied = await drainReceiptSweep(database, NOW);
+    assert.deepEqual(applied.receiptCounts, count.receiptCounts);
+    assert.equal(
+      applied.receiptApply.receipt.applied,
+      count.receiptCounts.receipts.eligible?.count,
+    );
+  }
+  if (!sweep && runtime !== undefined) assert.deepEqual(await hashTables(runtime), before);
   for (const fixture of cases) {
     assert.equal(
       candidates.find(({ id }) => id === fixture.id)?.disposition,
       fixture.disposition,
       fixture.key,
     );
-    await verifyApplied(database, fixture);
+    if (!sweep) await verifyApplied(database, fixture);
+    await verifyRetainedIdentity(database, fixture);
   }
   assert.deepEqual(await database.scanReceiptPayloads(null, CUTOFF, 5, "expiring"), []);
   return cases;
@@ -80,11 +132,17 @@ async function verifyApplied(
     assert.deepEqual(applied, { status: "expired" }, fixture.key);
     assert.deepEqual(await database.expireReceiptPayload(fixture.id, CUTOFF, NOW), {
       status: "skipped",
-      disposition: "locked_or_missing",
+      disposition: "changed_or_missing",
     });
   } else {
     assert.deepEqual(applied, { status: "skipped", disposition: fixture.disposition }, fixture.key);
   }
+}
+
+async function verifyRetainedIdentity(
+  database: Database,
+  fixture: Awaited<ReturnType<typeof seedProofMatrix>>[number],
+) {
   const byId = await database.findProviderEventReceiptById(fixture.id);
   const byDelivery = await database.findProviderEventReceiptByDeliveryId(
     fixture.deliveryId,
@@ -130,7 +188,7 @@ describe("receipt shape proof and expiry", () => {
         [MATRIX_ORG],
       );
       const database = createDatabase(runtime, locks);
-      const cases = await verifyMatrix(database, runtime);
+      const cases = await verifyMatrix(database, runtime, true);
       const dump = await postgres.exec([
         "pg_dump",
         "--data-only",
@@ -147,8 +205,19 @@ describe("receipt shape proof and expiry", () => {
           fixture.disposition !== "eligible",
           fixture.key,
         );
+        if (fixture.routeMarker !== null) {
+          assert.equal(
+            dump.output.includes(fixture.routeMarker),
+            fixture.disposition !== "eligible",
+            fixture.key,
+          );
+        }
         assert.ok(dump.output.includes(fixture.deliveryId), fixture.key);
         if (fixture.signatureHash !== null) assert.ok(dump.output.includes(fixture.signatureHash));
+      }
+      for (const provider of ["slack", "discord"]) {
+        assert.ok(dump.output.includes("capability-" + provider + "-locator-marker"));
+        assert.ok(dump.output.includes("capability-" + provider + "-filename-marker.txt"));
       }
       await assert.rejects(
         runtime.query(

@@ -1,5 +1,16 @@
 import { logger } from "../logger.js";
 import { retentionCutoff } from "../run-timeline/retention.js";
+import type {
+  CursorDiagnosticCandidate,
+  CursorDiagnosticDisposition,
+  CursorDiagnosticExpiryResult,
+  ReceiptExpiryCandidate,
+  ReceiptExpiryResult,
+  SyncExpiryCandidate,
+  SyncExpiryResult,
+  SyncPayloadDisposition,
+} from "./receipt-store.js";
+import type { ReceiptDisposition } from "./receipt-proof.js";
 import type { RunPayloadRetentionSettings } from "./settings.js";
 import type {
   AuxiliaryPayloadDisposition,
@@ -15,19 +26,79 @@ const HOUR_MS = 60 * 60_000;
 const BATCH_DELAY_MS = 250;
 const RETRY_DELAY_MS = 60_000;
 
-type Counts = Partial<Record<RunPayloadDisposition, { count: number; oldestAgeMs: number }>>;
-type AuxiliaryCounts = Partial<
-  Record<AuxiliaryPayloadDisposition, { count: number; oldestAgeMs: number | null }>
->;
-const APPLY_STAGES = ["credentials", "run", "launchIntent", "session"] as const;
+type DispositionCounts<
+  Disposition extends string,
+  Age extends number | null = number | null,
+> = Partial<Record<Disposition, { count: number; oldestAgeMs: Age }>>;
+interface ApplyCounts {
+  applied: number;
+  locked: number;
+  changedOrMissing: number;
+}
+type ReceiptApplyResult = ReceiptExpiryResult | SyncExpiryResult | CursorDiagnosticExpiryResult;
+
+type SyncCountDisposition =
+  | Exclude<SyncPayloadDisposition, "eligible">
+  | "eligible_pair"
+  | "eligible_copy_free";
+
+const APPLY_STAGES = [
+  "credentials",
+  "run",
+  "launchIntent",
+  "session",
+  "receipt",
+  "installationSync",
+  "cursorDiagnostic",
+] as const;
 type Stage = (typeof APPLY_STAGES)[number] | "machine";
+type ReceiptStage = "receipt" | "installationSync" | "cursorDiagnostic";
+
 type SweepCandidate =
   | { id: string; kind: "credentials" }
   | (RunPayloadCandidate & { kind: "run" })
-  | (AuxiliaryPayloadCandidate & { kind: AuxiliaryPayloadKind });
+  | (AuxiliaryPayloadCandidate & { kind: AuxiliaryPayloadKind })
+  | (ReceiptExpiryCandidate & { kind: "receipt" })
+  | (SyncExpiryCandidate & { kind: "installationSync" })
+  | (Omit<CursorDiagnosticCandidate, "source"> & { id: string; kind: "cursorDiagnostic" });
 
-function auxiliaryCounts(): Record<AuxiliaryPayloadKind, AuxiliaryCounts> {
+function auxiliaryCounts(): Record<
+  AuxiliaryPayloadKind,
+  DispositionCounts<AuxiliaryPayloadDisposition>
+> {
   return { launchIntent: {}, session: {}, machine: {} };
+}
+
+function receiptCounts(): {
+  receipts: DispositionCounts<ReceiptDisposition>;
+  installationSyncs: DispositionCounts<SyncCountDisposition>;
+  lifecycleAuditCopies: DispositionCounts<Exclude<SyncCountDisposition, "eligible_copy_free">>;
+  cursorDiagnostics: DispositionCounts<CursorDiagnosticDisposition>;
+} {
+  return { receipts: {}, installationSyncs: {}, lifecycleAuditCopies: {}, cursorDiagnostics: {} };
+}
+
+function applyCounts(): Record<ReceiptStage | "lifecycleAuditCopy", ApplyCounts> {
+  return {
+    receipt: { applied: 0, locked: 0, changedOrMissing: 0 },
+    installationSync: { applied: 0, locked: 0, changedOrMissing: 0 },
+    lifecycleAuditCopy: { applied: 0, locked: 0, changedOrMissing: 0 },
+    cursorDiagnostic: { applied: 0, locked: 0, changedOrMissing: 0 },
+  };
+}
+
+function countDisposition<Disposition extends string>(
+  counts: DispositionCounts<Disposition>,
+  disposition: Disposition,
+  ageFrom: Date | null,
+  now: Date,
+): void {
+  const count = counts[disposition] ?? { count: 0, oldestAgeMs: null };
+  count.count++;
+  if (ageFrom !== null) {
+    count.oldestAgeMs = Math.max(count.oldestAgeMs ?? 0, now.getTime() - ageFrom.getTime());
+  }
+  counts[disposition] = count;
 }
 
 export class RunPayloadRetention {
@@ -37,8 +108,12 @@ export class RunPayloadRetention {
   private cursor: string | null = null;
   private cutoff: Date | undefined;
   private now: Date | undefined;
-  private counts: Counts = {};
+  private counts: DispositionCounts<RunPayloadDisposition, number> = {};
+  private receiptState: "expiring" | "intact" = "expiring";
   private auxiliaryCounts = auxiliaryCounts();
+  private receiptCounts = receiptCounts();
+  private receiptApply = applyCounts();
+  private receiptWork = 0;
   private expired = 0;
   private credentialFactsBackfilled = 0;
   private launchIntentsExpired = 0;
@@ -77,6 +152,8 @@ export class RunPayloadRetention {
       complete,
       counts: this.counts,
       auxiliaryCounts: this.auxiliaryCounts,
+      receiptCounts: this.receiptCounts,
+      receiptApply: this.receiptApply,
       expired: this.expired,
       credentialFactsBackfilled: this.credentialFactsBackfilled,
       launchIntentsExpired: this.launchIntentsExpired,
@@ -96,7 +173,8 @@ export class RunPayloadRetention {
           this.credentialFactsBackfilled +
             this.expired +
             this.launchIntentsExpired +
-            this.sessionsReduced >=
+            this.sessionsReduced +
+            this.receiptWork >=
             this.settings.maxRunsPerPass
         ) {
           this.stageOffset = (APPLY_STAGES.indexOf(stage) + 1) % APPLY_STAGES.length;
@@ -106,10 +184,16 @@ export class RunPayloadRetention {
       const stageCapped =
         stage === "credentials" && this.credentialFactsBackfilled >= this.settings.maxRunsPerPass;
       if (page.length >= limit && !stageCapped) return report(false);
-      this.stages.shift();
       this.cursor = null;
+      if (!this.beginIntactReceiptScan(stage)) this.stages.shift();
     }
     return this.finishSweep(report(true));
+  }
+
+  private beginIntactReceiptScan(stage: Stage): boolean {
+    if (stage !== "receipt" || this.receiptState === "intact") return false;
+    this.receiptState = "intact";
+    return true;
   }
 
   private async scanStage(
@@ -126,6 +210,39 @@ export class RunPayloadRetention {
       const page = await this.store.scanRunPayloads(this.cursor, cutoff, limit, countOnly);
       return page.map(({ id, disposition, ageFrom }) => ({
         id,
+        disposition,
+        ageFrom,
+        kind: stage,
+      }));
+    }
+    if (stage === "receipt") {
+      const page = await this.store.scanReceiptPayloads(
+        this.cursor,
+        cutoff,
+        limit,
+        this.receiptState,
+      );
+      return page.map(({ id, disposition, ageFrom }) => ({
+        id,
+        disposition,
+        ageFrom,
+        kind: stage,
+      }));
+    }
+    if (stage === "installationSync") {
+      const page = await this.store.scanGitHubSyncPayloads(this.cursor, cutoff, limit);
+      return page.map(({ id, disposition, ageFrom, receiptCopyAgeFrom }) => ({
+        id,
+        disposition,
+        ageFrom,
+        receiptCopyAgeFrom,
+        kind: stage,
+      }));
+    }
+    if (stage === "cursorDiagnostic") {
+      const page = await this.store.scanGitHubCursorDiagnostics(this.cursor, cutoff, limit);
+      return page.map(({ source, disposition, ageFrom }) => ({
+        id: source,
         disposition,
         ageFrom,
         kind: stage,
@@ -152,7 +269,7 @@ export class RunPayloadRetention {
     }
     if (
       this.settings.mode === "on" &&
-      candidate.disposition === "eligible" &&
+      (candidate.disposition === "eligible" || candidate.disposition === "expiring") &&
       !(await this.applyCandidate(candidate, cutoff, now))
     )
       return false;
@@ -177,7 +294,37 @@ export class RunPayloadRetention {
     if (kind === "session" && (await this.store.reduceSessionOptions(id, cutoff, now))) {
       this.sessionsReduced++;
     }
+    if (kind === "receipt") {
+      const result = await this.store.expireReceiptPayload(id, cutoff, now);
+      this.recordReceiptOperation(kind, result);
+    }
+    if (kind === "installationSync") {
+      const result = await this.store.expireGitHubSyncPayload(id, cutoff, now);
+      this.recordReceiptOperation(kind, result);
+      const hasCopy =
+        result.status === "expired" ? result.receiptCopy : candidate.receiptCopyAgeFrom !== null;
+      if (hasCopy) this.recordReceiptResult("lifecycleAuditCopy", result);
+    }
+    if (kind === "cursorDiagnostic") {
+      const result = await this.store.expireGitHubCursorDiagnostic(id, cutoff, now);
+      this.recordReceiptOperation(kind, result);
+    }
     return true;
+  }
+
+  private recordReceiptOperation(stage: ReceiptStage, result: ReceiptApplyResult): void {
+    this.receiptWork++;
+    this.recordReceiptResult(stage, result);
+  }
+
+  private recordReceiptResult(
+    stage: ReceiptStage | "lifecycleAuditCopy",
+    result: ReceiptApplyResult,
+  ): void {
+    const counts = this.receiptApply[stage];
+    if (result.status === "expired") counts.applied++;
+    else if (result.disposition === "locked") counts.locked++;
+    else counts.changedOrMissing++;
   }
 
   private countCandidate(
@@ -191,16 +338,28 @@ export class RunPayloadRetention {
       this.counts[candidate.disposition] = count;
       return;
     }
-    const counts = this.auxiliaryCounts[candidate.kind];
-    const count = counts[candidate.disposition] ?? { count: 0, oldestAgeMs: null };
-    count.count++;
-    if (candidate.ageFrom !== null) {
-      count.oldestAgeMs = Math.max(
-        count.oldestAgeMs ?? 0,
-        now.getTime() - candidate.ageFrom.getTime(),
-      );
+    const { kind, disposition, ageFrom } = candidate;
+    if (kind === "receipt") {
+      countDisposition(this.receiptCounts.receipts, disposition, ageFrom, now);
+    } else if (kind === "installationSync") {
+      if (candidate.receiptCopyAgeFrom !== null) {
+        const pairDisposition = disposition === "eligible" ? "eligible_pair" : disposition;
+        countDisposition(this.receiptCounts.installationSyncs, pairDisposition, ageFrom, now);
+        countDisposition(
+          this.receiptCounts.lifecycleAuditCopies,
+          pairDisposition,
+          candidate.receiptCopyAgeFrom,
+          now,
+        );
+      } else {
+        const syncDisposition = disposition === "eligible" ? "eligible_copy_free" : disposition;
+        countDisposition(this.receiptCounts.installationSyncs, syncDisposition, ageFrom, now);
+      }
+    } else if (kind === "cursorDiagnostic") {
+      countDisposition(this.receiptCounts.cursorDiagnostics, disposition, ageFrom, now);
+    } else {
+      countDisposition(this.auxiliaryCounts[kind], disposition, ageFrom, now);
     }
-    counts[candidate.disposition] = count;
   }
 
   private finishSweep<T>(result: T): T {
@@ -210,6 +369,10 @@ export class RunPayloadRetention {
     this.now = undefined;
     this.counts = {};
     this.auxiliaryCounts = auxiliaryCounts();
+    this.receiptCounts = receiptCounts();
+    this.receiptApply = applyCounts();
+    this.receiptWork = 0;
+    this.receiptState = "expiring";
     this.expired = 0;
     this.credentialFactsBackfilled = 0;
     this.launchIntentsExpired = 0;

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, it } from "vitest";
+import { afterAll, beforeAll, describe, it, vi } from "vitest";
+import { logger } from "../logger.js";
+import { RunPayloadRetention } from "../run-payload-retention/index.js";
 import { ReceiptRetention } from "../receipt-retention/index.js";
-import { markTestReceipt } from "./test-utils/receipt-expiry.js";
+import { drainReceiptSweep, markTestReceipt } from "./test-utils/receipt-expiry.js";
 import {
   CUTOFF,
   MATRIX_ORG,
@@ -191,7 +193,7 @@ describe("production receipt expiry lock ordering", () => {
       try {
         assert.deepEqual(await expirer.database.expireReceiptPayload(receipt.id, CUTOFF, NOW), {
           status: "skipped",
-          disposition: "locked_or_missing",
+          disposition: "locked",
         });
       } finally {
         release.resolve();
@@ -231,6 +233,109 @@ describe("production receipt expiry lock ordering", () => {
       first.payloadExpiredAt,
     );
   });
+  it("rolls back a first marker, joins the in-flight batch and resumes the durable receipt first", async () => {
+    const settings = { mode: "on", retentionDays: 30, maxRunsPerPass: 1 } as const;
+    const first = await fixture(harness, route);
+    const fresh = await fixture(harness, route);
+    const interrupted = await harness.connect({
+      async afterQuery(sql) {
+        if (sql.includes("set payload_expiry_state = 'expiring'")) throw new Error("interrupted");
+      },
+    });
+    await assert.rejects(drainReceiptSweep(interrupted.database, NOW), /interrupted/u);
+    const intact = await harness.database.findProviderEventReceiptById(first.id);
+    assert.equal(intact?.payloadExpiryState, null);
+    assert.match(JSON.stringify(intact?.payload), /old body/u);
+
+    await markTestReceipt(harness.runtime, first.id, "expiring", {
+      binding: {
+        projectId: route.projectId,
+        configurationRevisionId: route.configurationRevisionId,
+        triggerName: "target",
+        triggerId: null,
+      },
+    });
+    const durable = await harness.database.findProviderEventReceiptById(first.id);
+    assert.ok(durable?.payloadExpiredAt);
+    const off = await drainReceiptSweep(harness.database, NOW, "off");
+    assert.deepEqual(off.receiptCounts.receipts, {});
+    assert.deepEqual(await harness.database.findProviderEventReceiptById(first.id), durable);
+
+    const held = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const worker = await harness.connect({
+      async afterQuery(sql) {
+        if (!sql.includes("set payload_expiry_state = 'expired'")) return;
+        held.resolve();
+        await release.promise;
+      },
+    });
+    const sweep = new RunPayloadRetention(worker.database, settings);
+    const info = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+    let stopping: Promise<void> | undefined;
+    try {
+      sweep.start();
+      await held.promise;
+      let stopped = false;
+      const stop = async () => {
+        await sweep.stop();
+        stopped = true;
+      };
+      stopping = stop();
+      const other = await harness.connect();
+      const competing = await new RunPayloadRetention(other.database, settings).runBatch(NOW);
+      assert.equal(competing.complete, true);
+      assert.equal(competing.receiptCounts.receipts.expiring?.count, 1);
+      assert.deepEqual(competing.receiptApply.receipt, {
+        applied: 0,
+        locked: 1,
+        changedOrMissing: 0,
+      });
+      assert.equal(stopped, false);
+      assert.equal(
+        (await other.database.findProviderEventReceiptById(first.id))?.payloadExpiryState,
+        "expiring",
+      );
+      assert.equal(
+        (await other.database.findProviderEventReceiptById(fresh.id))?.payloadExpiryState,
+        null,
+      );
+      release.resolve();
+      await stopping;
+      assert.equal(stopped, true);
+      const reports = info.mock.calls.filter(([, message]) => message === "run payload retention");
+      assert.equal(reports.length, 1);
+      const logged = JSON.stringify(reports);
+      for (const value of [
+        first.id,
+        first.deliveryId,
+        first.marker,
+        fresh.id,
+        fresh.marker,
+        route.projectId,
+      ]) {
+        assert.equal(logged.includes(value), false);
+      }
+      assert.match(logged, /"applied":1/u);
+    } finally {
+      release.resolve();
+      await (stopping ?? sweep.stop());
+      info.mockRestore();
+    }
+    const finished = await harness.database.findProviderEventReceiptById(first.id);
+    assert.equal(finished?.payloadExpiryState, "expired");
+    assert.deepEqual(finished.payloadExpiredAt, durable.payloadExpiredAt);
+    assert.equal(
+      (await harness.database.findProviderEventReceiptById(fresh.id))?.payloadExpiryState,
+      null,
+    );
+    const restarted = await harness.connect();
+    await drainReceiptSweep(restarted.database, NOW);
+    assert.equal(
+      (await restarted.database.findProviderEventReceiptById(fresh.id))?.payloadExpiryState,
+      "expired",
+    );
+  });
 });
 
 it("preserves the seven-day sweep order before, during and after the real first marker", async () => {
@@ -253,7 +358,7 @@ it("preserves the seven-day sweep order before, during and after the real first 
     assert.equal((await new ReceiptRetention(harness.runtime).runBatch(NOW)).deleted, 1);
     assert.deepEqual(await harness.database.expireReceiptPayload(removed.id, CUTOFF, NOW), {
       status: "skipped",
-      disposition: "locked_or_missing",
+      disposition: "changed_or_missing",
     });
 
     const kept = await fixture(harness, route);

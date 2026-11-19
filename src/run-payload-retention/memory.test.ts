@@ -140,6 +140,12 @@ it("keeps retry logs free of database diagnostics and lets shutdown cancel the s
       scanAuxiliaryPayloads: vi.fn(),
       expireLaunchIntent: vi.fn(),
       reduceSessionOptions: vi.fn(),
+      scanReceiptPayloads: vi.fn(),
+      expireReceiptPayload: vi.fn(),
+      scanGitHubSyncPayloads: vi.fn(),
+      expireGitHubSyncPayload: vi.fn(),
+      scanGitHubCursorDiagnostics: vi.fn(),
+      expireGitHubCursorDiagnostic: vi.fn(),
     },
     {
       mode: "count",
@@ -192,5 +198,46 @@ it("returns the existing SSE 410 on initial open and reconnect after payload exp
   } finally {
     await stream.beginShutdown();
     await harness.close();
+  }
+});
+
+it("paces receipt pages, repeats hourly and starts no scans in off mode", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(NOW);
+  const database = createMemoryDatabase();
+  const scan = vi
+    .spyOn(database, "scanReceiptPayloads")
+    .mockImplementation(async (after, _cutoff, _limit, state) =>
+      after === null && state === "intact"
+        ? [{ id: "pending", ageFrom: OLD, disposition: "pending_admission" }]
+        : [],
+    );
+  const info = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+  const settings = { retentionDays: 30, maxRunsPerPass: 1 };
+  const off = new RunPayloadRetention(database, { ...settings, mode: "off" });
+  const sweep = new RunPayloadRetention(database, { ...settings, mode: "on" });
+  try {
+    off.start();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(scan.mock.calls.length, 0);
+    sweep.start();
+    await vi.advanceTimersByTimeAsync(249);
+    assert.equal(scan.mock.calls.length, 2);
+    assert.equal(info.mock.calls.length, 0);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(scan.mock.calls.length, 3);
+    assert.equal(info.mock.calls.length, 1);
+    await vi.advanceTimersByTimeAsync(60 * 60_000 - 1);
+    assert.equal(scan.mock.calls.length, 3);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(scan.mock.calls.length, 5);
+    await sweep.stop();
+    await vi.advanceTimersByTimeAsync(250);
+    assert.equal(scan.mock.calls.length, 5);
+  } finally {
+    await off.stop();
+    await sweep.stop();
+    info.mockRestore();
+    vi.useRealTimers();
   }
 });

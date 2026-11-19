@@ -467,7 +467,7 @@ class MemoryDatabase implements Database {
   expireReceiptPayload: Database["expireReceiptPayload"] = async (id, cutoff, now) => {
     const receipt = this.providerEventReceipts.get(id);
     if (receipt === undefined || receipt.payloadExpiryState === "expired")
-      return { status: "skipped", disposition: "locked_or_missing" };
+      return { status: "skipped", disposition: "changed_or_missing" };
     const proof = this.receiptProof(receipt, cutoff);
     if (proof.disposition !== "eligible" && proof.disposition !== "expiring")
       return { status: "skipped", disposition: proof.disposition };
@@ -545,13 +545,19 @@ class MemoryDatabase implements Database {
         id: sync.id,
         ageFrom: sync.settledAt ?? sync.receivedAt,
         disposition: this.syncDisposition(sync, cutoff),
-        receiptCopy: this.hasAnySyncCopy(sync, readSyncAuditLink(sync.auditLink)?.kind === "none"),
+        receiptCopyAgeFrom:
+          [...this.providerEventReceipts.values()].find(
+            (receipt) =>
+              receipt.signatureHash === sync.signatureHash &&
+              receipt.payloadExpiryState == null &&
+              isLifecycleReceipt(receipt),
+          )?.receivedAt ?? null,
       }));
 
   expireGitHubSyncPayload: Database["expireGitHubSyncPayload"] = async (id, cutoff, now) => {
     const sync = this.githubInstallationSyncs.get(id);
     if (sync === undefined || sync.payloadExpiredAt !== null)
-      return { status: "skipped", disposition: "locked_or_missing" };
+      return { status: "skipped", disposition: "changed_or_missing" };
     const disposition = this.syncDisposition(sync, cutoff);
     if (disposition !== "eligible") return { status: "skipped", disposition };
     const link = readSyncAuditLink(sync.auditLink);
@@ -626,7 +632,7 @@ class MemoryDatabase implements Database {
   ) => {
     const status = this.notificationStatus;
     if (source !== "notifications" || status.lastError === null)
-      return { status: "skipped", disposition: "locked_or_missing" };
+      return { status: "skipped", disposition: "changed_or_missing" };
     const disposition = cursorDiagnosticDisposition(status, cutoff);
     if (disposition !== "eligible") return { status: "skipped", disposition };
     status.lastError = EXPIRED_CURSOR_DIAGNOSTIC;

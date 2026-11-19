@@ -52,8 +52,14 @@ export async function scanGitHubSyncPayloads(
   cutoff: Date,
   limit: number,
 ): Promise<SyncExpiryCandidate[]> {
-  const syncs = await client.query<SyncRow>(
-    `select ${SYNC_EVIDENCE} from github_installation_syncs sync
+  const syncs = await client.query<SyncRow & { receiptCopyAgeFrom: Date | null }>(
+    `select ${SYNC_EVIDENCE},
+        (select receipt.received_at from provider_event_receipts receipt
+         where receipt.signature_hash = sync.signature_hash and receipt.provider = 'github'
+           and receipt.source in ('github.installation', 'github.installation_repositories')
+           and receipt.dropped_reason = 'github_lifecycle' and receipt.payload_expiry_state is null
+        ) as "receiptCopyAgeFrom"
+      from github_installation_syncs sync
       where ($1::uuid is null or sync.id > $1) and sync.kind = 'webhook' and sync.payload_expired_at is null
       order by sync.id limit $2`,
     [after, limit],
@@ -72,7 +78,7 @@ export async function scanGitHubSyncPayloads(
       id: sync.id,
       ageFrom: sync.settledAt ?? sync.receivedAt,
       disposition: syncPayloadDisposition(sync, copy, sync.hasAnyCopy, cutoff),
-      receiptCopy: sync.hasAnyCopy,
+      receiptCopyAgeFrom: sync.receiptCopyAgeFrom,
     };
   });
 }
@@ -89,7 +95,17 @@ export async function expireGitHubSyncPayload(
        where id = $1 and kind = 'webhook' and payload_expired_at is null for update skip locked`,
       [id],
     );
-    if (lock.rowCount === 0) return { status: "skipped", disposition: "locked_or_missing" };
+    if (lock.rowCount === 0) {
+      const remaining = await client.query(
+        `select id from github_installation_syncs
+         where id = $1 and kind = 'webhook' and payload_expired_at is null`,
+        [id],
+      );
+      return {
+        status: "skipped",
+        disposition: remaining.rowCount ? "locked" : "changed_or_missing",
+      };
+    }
     const sync = (
       await client.query<SyncRow>(
         `select ${SYNC_EVIDENCE} from github_installation_syncs sync where id = $1`,
@@ -106,7 +122,7 @@ export async function expireGitHubSyncPayload(
       );
       copy = (await readCopies(client, [receiptId])).get(receiptId);
       if (receiptLock.rowCount === 0 && copy !== undefined)
-        return { status: "skipped", disposition: "locked_or_missing" };
+        return { status: "skipped", disposition: "locked" };
     }
     const disposition = syncPayloadDisposition(sync, copy, sync.hasAnyCopy, cutoff);
     if (disposition !== "eligible") return { status: "skipped", disposition };
@@ -167,7 +183,17 @@ export async function expireGitHubCursorDiagnostic(
         [source],
       )
     ).rows[0];
-    if (row === undefined) return { status: "skipped", disposition: "locked_or_missing" };
+    if (row === undefined) {
+      const remaining = await client.query(
+        `select source from github_notification_cursors
+         where source = $1 and last_error is not null and diagnostic_expired_at is null`,
+        [source],
+      );
+      return {
+        status: "skipped",
+        disposition: remaining.rowCount ? "locked" : "changed_or_missing",
+      };
+    }
     const disposition = cursorDiagnosticDisposition(row, cutoff);
     if (disposition !== "eligible") return { status: "skipped", disposition };
     const result = await client.query(

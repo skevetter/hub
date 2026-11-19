@@ -24,7 +24,7 @@ export interface SyncExpiryCandidate {
   id: string;
   ageFrom: Date;
   disposition: SyncPayloadDisposition;
-  receiptCopy: boolean;
+  receiptCopyAgeFrom: Date | null;
 }
 
 export interface CursorDiagnosticCandidate {
@@ -33,25 +33,27 @@ export interface CursorDiagnosticCandidate {
   disposition: CursorDiagnosticDisposition;
 }
 
+type ApplyMiss = "locked" | "changed_or_missing";
+
 export type ReceiptExpiryResult =
   | { status: "expired" }
   | {
       status: "skipped";
-      disposition: Exclude<ReceiptDisposition, "eligible" | "expiring"> | "locked_or_missing";
+      disposition: Exclude<ReceiptDisposition, "eligible" | "expiring"> | ApplyMiss;
     };
 
 export type SyncExpiryResult =
   | { status: "expired"; receiptCopy: boolean }
   | {
       status: "skipped";
-      disposition: Exclude<SyncPayloadDisposition, "eligible"> | "locked_or_missing";
+      disposition: Exclude<SyncPayloadDisposition, "eligible"> | ApplyMiss;
     };
 
 export type CursorDiagnosticExpiryResult =
   | { status: "expired" }
   | {
       status: "skipped";
-      disposition: Exclude<CursorDiagnosticDisposition, "eligible"> | "locked_or_missing";
+      disposition: Exclude<CursorDiagnosticDisposition, "eligible"> | ApplyMiss;
     };
 
 export interface ReceiptPayloadStore {

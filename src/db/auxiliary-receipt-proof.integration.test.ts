@@ -13,6 +13,7 @@ import {
   postgresDatabaseRuntime,
   type QueryHandle,
 } from "./runtime/index.js";
+import { drainReceiptSweep } from "./test-utils/receipt-expiry.js";
 import { CUTOFF, NOW, OLD } from "./test-utils/receipt-proof-fixture.js";
 import { createTimelinePostgresHarness } from "./test-utils/run-timeline-postgres.js";
 import type { Database, GitHubConnectionRecord } from "./types.js";
@@ -25,7 +26,7 @@ const identity = {
   accountType: "Organization",
   status: "active",
 } as const;
-const syncCutoff = new Date("2080-01-01T00:00:00Z");
+const syncCutoff = new Date("2080-01-02T00:00:00Z");
 const syncExpiry = new Date("2080-02-01T00:00:00Z");
 
 function binding(installationId: number): GitHubConnectionRecord {
@@ -129,27 +130,35 @@ async function verifyPair(database: Database) {
       scan.find(({ id }) => id === work.installationSyncId)?.disposition,
       disposition,
     );
-    assert.equal(scan.find(({ id }) => id === work.installationSyncId)?.receiptCopy, hasCopy);
+    assert.equal(
+      scan.find(({ id }) => id === work.installationSyncId)?.receiptCopyAgeFrom?.getTime(),
+      hasCopy ? OLD.getTime() : undefined,
+    );
   }
   assert.deepEqual(await database.scanReceiptPayloads(null, syncCutoff, 10), []);
   assert.deepEqual(await database.expireReceiptPayload(copy.id, syncCutoff, syncExpiry), {
     status: "skipped",
     disposition: "lifecycle_pending",
   });
-  assert.deepEqual(
-    await database.expireGitHubSyncPayload(claim.installationSyncId, syncCutoff, syncExpiry),
-    {
-      status: "expired",
-      receiptCopy: true,
-    },
-  );
-  assert.deepEqual(
-    await database.expireGitHubSyncPayload(unbound.installationSyncId, syncCutoff, syncExpiry),
-    {
-      status: "expired",
-      receiptCopy: false,
-    },
-  );
+  const applied = await drainReceiptSweep(database, syncExpiry);
+  assert.deepEqual(applied.receiptApply.installationSync, {
+    applied: 2,
+    locked: 0,
+    changedOrMissing: 0,
+  });
+  assert.deepEqual(applied.receiptApply.lifecycleAuditCopy, {
+    applied: 1,
+    locked: 0,
+    changedOrMissing: 0,
+  });
+  assert.equal(applied.receiptApply.receipt.applied, 0);
+  assert.equal(applied.receiptCounts.installationSyncs.eligible_pair?.count, 1);
+  assert.equal(applied.receiptCounts.installationSyncs.eligible_copy_free?.count, 1);
+  assert.equal(applied.receiptCounts.installationSyncs.sync_pending?.count, 1);
+  assert.deepEqual(applied.receiptCounts.lifecycleAuditCopies.eligible_pair, {
+    count: 1,
+    oldestAgeMs: syncExpiry.getTime() - OLD.getTime(),
+  });
   const markedCopy = await database.findProviderEventReceiptById(copy.id);
   assert.equal(markedCopy?.payloadExpiryState, "expired");
   assert.equal(markedCopy?.signatureHash, input.signatureHash);
@@ -176,7 +185,7 @@ async function verifyPair(database: Database) {
     await database.expireGitHubSyncPayload(claim.installationSyncId, syncCutoff, syncExpiry),
     {
       status: "skipped",
-      disposition: "locked_or_missing",
+      disposition: "changed_or_missing",
     },
   );
   return { claim, copy, unbound, unresolved };
@@ -194,9 +203,13 @@ async function verifyDiagnostic(database: Database, runtime?: QueryHandle) {
       "select to_jsonb(cursor) - 'last_error' - 'diagnostic_expired_at' as row from github_notification_cursors cursor",
     );
   const before = await readRaw();
-  assert.deepEqual(await database.expireGitHubCursorDiagnostic("notifications", CUTOFF, NOW), {
-    status: "expired",
+  const count = await drainReceiptSweep(database, NOW, "count");
+  assert.deepEqual(count.receiptCounts.cursorDiagnostics, {
+    eligible: { count: 1, oldestAgeMs: NOW.getTime() - OLD.getTime() },
   });
+  const applied = await drainReceiptSweep(database, NOW);
+  assert.deepEqual(applied.receiptCounts.cursorDiagnostics, count.receiptCounts.cursorDiagnostics);
+  assert.equal(applied.receiptApply.cursorDiagnostic.applied, 1);
   assert.deepEqual(await readRaw(), before);
   assert.equal(
     (await database.githubNotifications.readStatus()).lastError,
@@ -456,7 +469,7 @@ it.each(["success", "failure"] as const)(
               await second.database.expireGitHubCursorDiagnostic("notifications", CUTOFF, NOW),
               {
                 status: "skipped",
-                disposition: "locked_or_missing",
+                disposition: "locked",
               },
             );
           } finally {
@@ -516,7 +529,7 @@ it("uses sync-before-receipt ordering and commits both lifecycle markers togethe
         ),
         {
           status: "skipped",
-          disposition: "locked_or_missing",
+          disposition: "locked",
         },
       );
     } finally {

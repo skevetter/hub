@@ -124,13 +124,23 @@ export async function expireReceiptPayload(
        where id = $1 and payload_expiry_state is distinct from 'expired' for update skip locked`,
       [id],
     );
-    if (lock.rowCount === 0) return { status: "skipped", disposition: "locked_or_missing" };
+    if (lock.rowCount === 0) {
+      const remaining = await client.query(
+        `select id from provider_event_receipts
+         where id = $1 and payload_expiry_state is distinct from 'expired'`,
+        [id],
+      );
+      return {
+        status: "skipped",
+        disposition: remaining.rowCount ? "locked" : "changed_or_missing",
+      };
+    }
     const receipts = await client.query<ProofRow>(
       `select ${RECEIPT_COLUMNS} from provider_event_receipts receipt where receipt.id = $1`,
       [id],
     );
     const [proof] = await checkReceipts(client, receipts.rows, cutoff);
-    if (proof === undefined) return { status: "skipped", disposition: "locked_or_missing" };
+    if (proof === undefined) return { status: "skipped", disposition: "changed_or_missing" };
     if (proof.disposition !== "eligible" && proof.disposition !== "expiring")
       return { status: "skipped", disposition: proof.disposition };
     if (proof.disposition === "eligible") {
@@ -140,7 +150,7 @@ export async function expireReceiptPayload(
           where id = $1 and payload_expiry_state is null and received_at < $3`,
         [id, now, cutoff, proof.binding],
       );
-      if (staged.rowCount !== 1) return { status: "skipped", disposition: "locked_or_missing" };
+      if (staged.rowCount !== 1) return { status: "skipped", disposition: "changed_or_missing" };
     }
     const result = await client.query(
       `update provider_event_receipts set payload_expiry_state = 'expired'

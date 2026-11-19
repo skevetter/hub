@@ -1,3 +1,4 @@
+import type { ReceiptPayloadStore } from "./receipt-store.js";
 import type { RunProgressMessage } from "../run-timeline/store.js";
 
 export type RunPayloadDisposition =
@@ -35,7 +36,7 @@ export interface AuxiliaryPayloadCandidate {
   ageFrom: Date | null;
 }
 
-export interface RunPayloadRetentionStore {
+export interface RunPayloadRetentionStore extends ReceiptPayloadStore {
   scanUnknownTemporaryCredentials(after: string | null, limit: number): Promise<string[]>;
   backfillTemporaryCredentialFact(id: string): Promise<boolean>;
   scanAuxiliaryPayloads(

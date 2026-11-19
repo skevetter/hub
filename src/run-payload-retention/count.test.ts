@@ -89,8 +89,9 @@ it("counts with a fixed cutoff and leaves all rows byte-for-byte unchanged", asy
        (id, project_id, organization_id, version, source_kind, source_evidence, normalized_configuration, content_hash)
        values ('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000001',
        'count', 1, 'manual', '{}', '{}', 'count')`,
-      `insert into provider_event_receipts (organization_id, provider, delivery_id, source, payload)
-       values ('count', 'manual', 'count', 'webhook.received', '{"sentinel":"receipt-raw"}')`,
+      `insert into provider_event_receipts
+         (organization_id, provider, delivery_id, source, payload, received_at)
+       values ('count', 'manual', 'count', 'webhook.received', '{"sentinel":"receipt-raw"}', '2026-10-01Z')`,
       `insert into trigger_runs (id, organization_id, project_id, configuration_revision_id,
        provider_event_receipt_id, configured_trigger_name, status, completed_at, created_at, prompt, deadline_at)
        select ('30000000-0000-4000-8000-00000000000' || n)::uuid,
@@ -118,7 +119,15 @@ it("counts with a fixed cutoff and leaves all rows byte-for-byte unchanged", asy
     });
     assert.equal((await retention.runBatch(NOW)).complete, false);
     assert.equal((await retention.runBatch(new Date("2027-01-01"))).complete, false);
-    assert.deepEqual(await retention.runBatch(NOW), {
+    const { receiptCounts, receiptApply, ...report } = await retention.runBatch(NOW);
+    assert.deepEqual(receiptCounts, {
+      receipts: { run_payload_pending: { count: 1, oldestAgeMs: 48 * 86_400_000 } },
+      installationSyncs: {},
+      lifecycleAuditCopies: {},
+      cursorDiagnostics: {},
+    });
+    assert.ok(Object.values(receiptApply).every(({ applied }) => applied === 0));
+    assert.deepEqual(report, {
       complete: true,
       expired: 0,
       credentialFactsBackfilled: 0,
