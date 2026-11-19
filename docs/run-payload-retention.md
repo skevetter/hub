@@ -1,10 +1,12 @@
 # Run payload retention
 
-**Rollback after redaction.** Set `PASEO_HUB_RUN_PAYLOAD_EXPIRY=off` first. Once receipt expiry
-has run, keep every Hub binary that shares the database at this release or newer. Older binaries
-can replay a redacted receipt without honoring its fence. If only launch or session expiry has
-run, keep all binaries at the release that added those stages or newer. Build 14 can resume a
-previously credentialed agent and restore removed options.
+**Rollback after redaction.** Set `PASEO_HUB_RUN_PAYLOAD_EXPIRY=off` first. Once any receipt
+has expired, never roll back below build 16 (`0.11.0-notifications.16`), the first build that
+protects marked receipts. Build 14, build 15 and older builds run the seven-day unhandled-receipt
+sweep even with payload expiry set to `off`. Their sweep can delete a marked receipt and its
+duplicate-delivery keys. A retry can then create a new receipt and a new run. If only launch or
+session expiry has run, keep all binaries at the release that added those stages or newer.
+Build 14 can resume a previously credentialed agent and restore removed options.
 
 Hub can expire run-owned content after a terminal run has a recorded completion time. The
 retention window starts at completion. A run becomes old enough strictly after that window

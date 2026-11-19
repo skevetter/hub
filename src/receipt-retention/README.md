@@ -31,3 +31,9 @@ cutoff and requires proof that every branch has settled before clearing a receip
 delivery and signature keys in a tombstone. The seven-day sweep skips tombstones in both
 `expiring` and `expired` states. Its deletion counts and replay horizon are independent of the
 optional sweep and its `off`, `count` and `on` settings.
+
+Build 16 (`0.11.0-notifications.16`) is the first build that protects marked receipts. In builds
+14 and 15 and older, the seven-day sweep can delete a marked receipt and its duplicate-delivery
+keys even with payload expiry set to `off`. A duplicate can then create a new receipt and a new
+run. Once any receipt has expired, set payload expiry to `off` before rollback and keep every
+binary at build 16 or newer.
