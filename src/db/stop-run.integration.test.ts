@@ -1,12 +1,18 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { scanRunPayloads } from "./run-payload-retention.js";
-import { createTimelinePostgresHarness } from "./test-utils/run-timeline-postgres.js";
+import { enrollTestDaemon, TEST_DAEMON_ID } from "../test-utils/project-configuration.js";
+import {
+  createTimelinePostgresHarness,
+  TIMELINE_ORGANIZATION,
+} from "./test-utils/run-timeline-postgres.js";
 
 describe("PostgreSQL run cancellation", () => {
   let pg: Awaited<ReturnType<typeof createTimelinePostgresHarness>>;
   beforeAll(async () => {
     pg = await createTimelinePostgresHarness();
+    await enrollTestDaemon(pg.database, TIMELINE_ORGANIZATION);
   }, 120_000);
   afterAll(async () => pg?.close(), 120_000);
 
@@ -48,6 +54,58 @@ describe("PostgreSQL run cancellation", () => {
     const afterFinish = await stop.database.cancelTriggerRun(finished.organizationId, finished.id);
     assert.equal(afterFinish?.transitioned, false);
     assert.equal(afterFinish?.run.status, "succeeded");
+  });
+
+  it("refuses Stop when the confirmed attached run count changed", async () => {
+    const run = await pg.createRun();
+    const stopped = await pg.database.cancelTriggerRun(run.organizationId, run.id, "stop-user", 1);
+    assert.equal(stopped?.conflict, 0);
+    assert.equal((await pg.database.findTriggerRunById(run.id))?.status, "running");
+    await pg.database.succeedTriggerRun(run.id);
+  });
+
+  it("only lets the PostgreSQL lease holder update and settle a pending Stop interrupt", async () => {
+    const run = await pg.createRun();
+    const [step] = await pg.database.listWorkflowStepRunsForTriggerRun(run.id);
+    assert.ok(step);
+    const id = randomUUID();
+    await pg.runtime.query(
+      `insert into agent_executions
+        (id, organization_id, project_id, configuration_revision_id, workflow_step_run_id, daemon_id, status)
+       values ($1, $2, $3, $4, $5, $6, 'running')`,
+      [id, run.organizationId, run.projectId, run.configurationRevisionId, step.id, TEST_DAEMON_ID],
+    );
+    await pg.database.cancelTriggerRun(run.organizationId, run.id);
+    const other = await pg.connect();
+    const stores = [pg.database.stopInterrupts, other.database.stopInterrupts] as const;
+    const granted = await Promise.all(
+      stores.map((store, index) => store.claim(id, String(index), null)),
+    );
+    assert.equal(granted.filter(Boolean).length, 1);
+    const winner = granted[0] === undefined ? 1 : 0;
+    const state = {
+      approvedPeerIds: [],
+      target: { agentId: "agent", attachmentFingerprint: "target", peerIds: [] },
+    };
+    assert.equal(await stores[1 - winner]!.save(id, String(1 - winner), state), false);
+    assert.equal(await stores[winner].save(id, String(winner), state), true);
+    await pg.runtime.query(
+      `update agent_executions set hub_action_acknowledgements =
+        jsonb_set(hub_action_acknowledgements, '{stop_interrupt_claim,until}', to_jsonb(clock_timestamp() - interval '1 second'))
+       where id = $1`,
+      [id],
+    );
+    assert.deepEqual(await stores[1 - winner]!.claim(id, "takeover", String(winner)), { state });
+    await stores[winner].complete(id, String(winner));
+    assert.equal((await pg.database.findAgentExecutionById(id))?.hubActionCompletedAt, null);
+    await stores[1 - winner]!.release(id, "takeover");
+    assert.equal(await stores[winner].claim(id, "stale", "takeover"), undefined);
+    const execution = await pg.database.findAgentExecutionById(id);
+    const generation = execution?.hubActionAcknowledgements.stopInterruptGeneration;
+    assert.equal(generation, "takeover:released");
+    assert.deepEqual(await stores[winner].claim(id, "retry", generation), { state });
+    await stores[winner].complete(id, "retry");
+    assert.equal(await stores[winner].claim(id, "later", "retry"), undefined);
   });
 
   it("records the stopping actor atomically and attributes only the first stop", async () => {

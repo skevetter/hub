@@ -279,7 +279,8 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     daemonModule,
     connectionForDaemon,
     agentValidator,
-    stopRun: (actor, runId) => workflowEngine.stopRun(actor, runId),
+    stopRun: (actor, runId, confirmedPeerCount) =>
+      workflowEngine.stopRun(actor, runId, confirmedPeerCount),
     resourceCounts: () => {
       const executionSubscriptions = daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0;
       if (options.runTimeline === undefined) return { executionSubscriptions };

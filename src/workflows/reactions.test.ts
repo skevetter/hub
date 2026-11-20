@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
+import { z } from "zod";
 import { deriveAgentExecutionCompletionToken } from "../agent-executions/completion-token.js";
 import { compiledConfigurationHash, parseCompiledHubConfig } from "../config/compiler.js";
+import { DaemonAgents } from "../daemons/agents/index.js";
 import { ProjectConfigurationStore } from "../configuration/store.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import type {
@@ -31,6 +33,13 @@ import type { TriggerProvider } from "../triggers/index.js";
 import { createDurableWorkflowHandler, type DurableWorkflowEngine } from "./engine.js";
 
 describe("workflow-owned provider reactions", () => {
+  it.each(["new-arrival", "same-work", "parallel", "parallel-lost"] as const)(
+    "fences wire interrupt recovery (%s)",
+    async (retry) => {
+      await runTwoStepWorkflow(createDiscordReactionFixture(), { shared: true, retry });
+    },
+  );
+
   it.each(["stop", "stop_offline"] as const)(
     "interrupts a shared agent once and settles the other run (%s)",
     async (outcome) => {
@@ -269,6 +278,7 @@ interface WorkflowScenarioOptions {
   outcome?: WorkflowOutcome;
   skipAllSteps?: boolean;
   shared?: boolean;
+  retry?: "new-arrival" | "same-work" | "parallel" | "parallel-lost";
 }
 
 async function runTwoStepWorkflow<
@@ -374,17 +384,16 @@ async function runTwoStepWorkflow<
   const controls: string[] = [];
   const released: string[] = [];
   const link = { connected: true };
+  const wire = makeInterruptWire(options.retry, controls);
   const connection: DaemonConnection = {
     agents: {
       create: async (key) => {
         if (options.outcome === "prelaunch_failure") throw new Error("daemon rejected agent");
         return { id: key, workspaceId: "workspace", status: "idle" };
       },
-      get: async (id) => ({ id, workspaceId: "workspace", status: "idle" }),
+      get: wire.get,
       send: async () => {},
-      control: async (_agentId, _workspaceId, action) => {
-        controls.push(action);
-      },
+      control: wire.control,
       restore: async () => false,
       watch: async () => () => {},
     },
@@ -396,24 +405,26 @@ async function runTwoStepWorkflow<
       throw new Error("not used");
     },
   };
-  const lifecycle = createDaemonDispatchLifecycle({
-    database,
-    connectionForDaemon: (daemonId) =>
-      link.connected && daemonId === TEST_DAEMON_ID ? connection : undefined,
-    executionAuthority: {
-      materialize: async () => ({ env: {} }),
-      canResume: async () => true,
-      recover: async () => {},
-      onExecutionTerminal: async (id) => {
-        released.push(id);
+  const createLifecycle = () =>
+    createDaemonDispatchLifecycle({
+      database,
+      connectionForDaemon: (daemonId) =>
+        link.connected && daemonId === TEST_DAEMON_ID ? connection : undefined,
+      executionAuthority: {
+        materialize: async () => ({ env: {} }),
+        canResume: async () => true,
+        recover: async () => {},
+        onExecutionTerminal: async (id) => {
+          released.push(id);
+        },
+        resourceCounts: () => ({ executionStates: 0, leases: 0, pendingMaterializations: 0 }),
+        stop: async () => {},
       },
-      resourceCounts: () => ({ executionStates: 0, leases: 0, pendingMaterializations: 0 }),
-      stop: async () => {},
-    },
-    providers: [input.provider],
-    publicBaseUrl: "https://hub.test",
-    completionTokenSecret: "reaction-secret",
-  });
+      providers: [input.provider],
+      publicBaseUrl: "https://hub.test",
+      completionTokenSecret: "reaction-secret",
+    });
+  const lifecycle = createLifecycle();
   const createEngine = () =>
     createDurableWorkflowHandler({
       database,
@@ -434,7 +445,22 @@ async function runTwoStepWorkflow<
     const acceptedState = await lifecycle.notifyWorkflowRunAccepted(run);
     await database.setWorkflowRunReactionState(run.id, acceptedState);
     await engine.processAvailable();
-    if (options.skipAllSteps === true) {
+    if (options.retry !== undefined) {
+      assert.ok(peer);
+      await exerciseWireRetry({
+        database,
+        engine,
+        lifecycle,
+        createLifecycle,
+        run,
+        peer,
+        createRun,
+        link,
+        controls,
+        wire,
+        scenario: options.retry,
+      });
+    } else if (options.skipAllSteps === true) {
       await waitForTerminalRun(database, run.id);
     } else if (options.outcome === "stop" || options.outcome === "stop_offline") {
       await exerciseStop({
@@ -493,6 +519,204 @@ async function runTwoStepWorkflow<
   }
 }
 
+function makeInterruptWire(retry: WorkflowScenarioOptions["retry"], controls: string[]) {
+  const reached = Promise.withResolvers<void>();
+  const acknowledge = Promise.withResolvers<void>();
+  const agent = { unavailable: false, reads: 0 };
+  function connect() {
+    const adapter = new DaemonAgents((frame) => {
+      const { message: request } = z
+        .object({
+          message: z.object({
+            requestId: z.string(),
+            type: z.string(),
+            agentId: z.string(),
+          }),
+        })
+        .parse(JSON.parse(frame));
+      const reply = (payload: Record<string, unknown>) =>
+        adapter.receive({
+          type: "session",
+          message: { type: "response", payload: { requestId: request.requestId, ...payload } },
+        });
+      if (request.type === "fetch_agent_request") {
+        agent.reads += 1;
+        reply(
+          agent.unavailable
+            ? { error: "daemon state unavailable" }
+            : { agent: { id: request.agentId, workspaceId: "workspace", status: "running" } },
+        );
+        return;
+      }
+      assert.equal(request.type, "cancel_agent_request");
+      controls.push("interrupt");
+      if (controls.length === 1 && (retry === "parallel" || retry === "parallel-lost")) {
+        reached.resolve();
+        void acknowledge.promise.then(() => {
+          if (retry === "parallel-lost") adapter.close();
+          return reply({ accepted: true });
+        });
+      } else if (controls.length === 1) {
+        adapter.close();
+      } else {
+        reply({ accepted: true });
+      }
+    });
+    adapter.receive({
+      type: "session",
+      message: {
+        type: "server_info",
+        payload: {
+          features: { hubAgentRpc: true, agentRequestReceipts: true },
+        },
+      },
+    });
+    return adapter;
+  }
+  let adapter = connect();
+  return {
+    agent,
+    reached: reached.promise,
+    acknowledge: acknowledge.resolve,
+    reconnect: () => {
+      adapter = connect();
+    },
+    get: (id: string) =>
+      retry === undefined
+        ? Promise.resolve({ id, workspaceId: "workspace", status: "idle" as const })
+        : adapter.get(id),
+    control: async (id: string, workspaceId: string, action: "interrupt" | "archive") => {
+      if (retry === undefined) controls.push(action);
+      else await adapter.control(id, workspaceId, action);
+    },
+  };
+}
+
+async function exerciseWireRetry({
+  database,
+  engine,
+  lifecycle,
+  createLifecycle,
+  run,
+  peer,
+  createRun,
+  link,
+  controls,
+  wire,
+  scenario,
+}: {
+  database: Database;
+  engine: DurableWorkflowEngine;
+  lifecycle: DaemonDispatchLifecycle;
+  createLifecycle: () => DaemonDispatchLifecycle;
+  run: AcceptedTriggerRunRecord;
+  peer: AcceptedTriggerRunRecord;
+  createRun: () => Promise<{ run: AcceptedTriggerRunRecord }>;
+  link: { connected: boolean };
+  controls: readonly string[];
+  wire: ReturnType<typeof makeInterruptWire>;
+  scenario: NonNullable<WorkflowScenarioOptions["retry"]>;
+}) {
+  const selected = await runningStepExecution(database, run.id, "first");
+  const other = await runningStepExecution(database, peer.id, "first");
+  assert.equal(selected.daemonAgentId, other.daemonAgentId);
+  const parallel = scenario === "parallel" || scenario === "parallel-lost";
+  link.connected = !parallel;
+  const actor = { organizationId: run.organizationId, userId: "admin", role: "admin" } as const;
+  await engine.stopRun(actor, run.id);
+  assert.equal((await database.findTriggerRunById(run.id))?.status, "canceled");
+  assert.equal(
+    (await database.readRunStopDetails(run.organizationId, run.id))?.cleanupPending,
+    true,
+  );
+  if (parallel) {
+    link.connected = true;
+    await exerciseParallelRecovery({
+      database,
+      lifecycle,
+      createLifecycle,
+      wire,
+      controls,
+      loseAck: scenario === "parallel-lost",
+    });
+  } else {
+    assert.deepEqual(controls, ["interrupt"]);
+    wire.reconnect();
+    if (scenario === "new-arrival") {
+      const { run: newer } = await createRun();
+      await engine.processAvailable();
+      assert.equal(
+        (await runningStepExecution(database, newer.id, "first")).daemonAgentId,
+        selected.daemonAgentId,
+      );
+      await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
+      assert.deepEqual(controls, ["interrupt"]);
+      assert.equal((await database.findTriggerRunById(newer.id))?.status, "running");
+    } else {
+      const reads = wire.agent.reads;
+      wire.agent.unavailable = true;
+      await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
+      assert.equal(wire.agent.reads, reads + 1);
+      assert.deepEqual(controls, ["interrupt"]);
+      assert.equal(
+        (await database.readRunStopDetails(run.organizationId, run.id))?.cleanupPending,
+        true,
+      );
+      wire.agent.unavailable = false;
+      await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
+      assert.equal(wire.agent.reads, reads + 2);
+      assert.deepEqual(controls, ["interrupt", "interrupt"]);
+      assert.equal((await database.findTriggerRunById(peer.id))?.status, "failed");
+    }
+  }
+  assert.deepEqual(await database.findPendingHubActions(TEST_DAEMON_ID), []);
+}
+
+async function exerciseParallelRecovery({
+  database,
+  lifecycle,
+  createLifecycle,
+  wire,
+  controls,
+  loseAck,
+}: {
+  database: Database;
+  lifecycle: DaemonDispatchLifecycle;
+  createLifecycle: () => DaemonDispatchLifecycle;
+  wire: ReturnType<typeof makeInterruptWire>;
+  controls: readonly string[];
+  loseAck: boolean;
+}) {
+  const competitor = createLifecycle();
+  const reachedClaim = Promise.withResolvers<void>();
+  const resumeClaim = Promise.withResolvers<void>();
+  const claim = database.stopInterrupts.claim.bind(database.stopInterrupts);
+  const claims = vi.spyOn(database.stopInterrupts, "claim").mockImplementation(async (...args) => {
+    if (claims.mock.calls.length === 2) {
+      reachedClaim.resolve();
+      await resumeClaim.promise;
+    }
+    return claim(...args);
+  });
+  const first = lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
+  await wire.reached;
+  const second = competitor.recoverPendingHubActions(TEST_DAEMON_ID);
+  await reachedClaim.promise;
+  wire.acknowledge();
+  await first;
+  wire.reconnect();
+  resumeClaim.resolve();
+  await second;
+  await competitor.stop();
+  claims.mockRestore();
+  assert.deepEqual(controls, ["interrupt"]);
+  if (loseAck) {
+    assert.equal((await database.findPendingHubActions(TEST_DAEMON_ID)).length, 1);
+    await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
+    assert.deepEqual(controls, ["interrupt", "interrupt"]);
+  }
+}
+
 async function exerciseStop({
   database,
   engine,
@@ -520,7 +744,10 @@ async function exerciseStop({
     const peerExecution = await runningStepExecution(database, peer.id, "first");
     assert.equal(peerExecution.agentSessionId, execution.agentSessionId);
     assert.equal(peerExecution.daemonAgentId, execution.daemonAgentId);
-    assert.equal((await database.readRunStopDetails(organizationId, run.id))?.sharedAgent, true);
+    assert.equal(
+      (await database.readRunStopDetails(organizationId, run.id))?.otherAttachedRunCount,
+      1,
+    );
   }
   link.connected = !offline;
   const actor = { organizationId, userId: "admin", role: "admin" } as const;

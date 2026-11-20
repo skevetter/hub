@@ -196,14 +196,25 @@ export class DurableWorkflowEngine {
     return tracked;
   }
 
-  async stopRun(actor: RunStopActor, runId: string): Promise<StopRunResult> {
+  async stopRun(
+    actor: RunStopActor,
+    runId: string,
+    confirmedPeerCount?: number,
+  ): Promise<StopRunResult> {
     const database = this.options.database;
     if (database === null) throw new DatabaseUnavailableError();
     const existing = await database.findTriggerRunForOrganization(actor.organizationId, runId);
     if (existing === undefined) return { status: "run_not_found" };
     if (!canStopRun(actor, existing)) return { status: "forbidden" };
-    const cancellation = await database.cancelTriggerRun(actor.organizationId, runId, actor.userId);
+    const cancellation = await database.cancelTriggerRun(
+      actor.organizationId,
+      runId,
+      actor.userId,
+      confirmedPeerCount,
+    );
     if (cancellation === undefined) return { status: "run_not_found" };
+    if (cancellation.conflict !== undefined)
+      return { status: "conflict", otherAttachedRunCount: cancellation.conflict };
     if (cancellation.transitioned) {
       await this.notifyWorkflowRunTerminal(cancellation.run);
       await Promise.all([

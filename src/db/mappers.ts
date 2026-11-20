@@ -274,7 +274,13 @@ function toAgentExecutionHubAcknowledgements(value: unknown): AgentExecutionHubA
       finishExecutionCall = { callId: callId ?? null, status, observedAt };
     }
   }
-  return { terminalAt, idleAt, finishExecutionCall };
+  const stopInterruptGeneration = value["stop_interrupt_generation"];
+  return {
+    terminalAt,
+    idleAt,
+    finishExecutionCall,
+    ...(typeof stopInterruptGeneration === "string" ? { stopInterruptGeneration } : {}),
+  };
 }
 
 function emptyAgentExecutionHubAcknowledgements(): AgentExecutionHubAcknowledgements {

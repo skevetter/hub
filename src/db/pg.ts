@@ -36,6 +36,7 @@ import {
 import { RunTimelineRepository } from "../run-timeline/postgres-store.js";
 import type { RunProgressMessage, RunTimelineStore } from "../run-timeline/store.js";
 import { ExecutionAuthorityRepository } from "../execution-authority/index.js";
+import { postgresStopInterrupts } from "./stop-interrupt.js";
 import { temporaryCredentialFact } from "../agent-sessions/credentials.js";
 import { ScheduleRepository } from "../triggers/schedule/index.js";
 import { GitHubNotificationRepository } from "../triggers/github-notifications/index.js";
@@ -187,6 +188,19 @@ const OPEN_STEP_RUN = `select run.id, run.status from trigger_runs run join work
   on step.trigger_run_id = run.id where step.id = $1 and run.payload_expiry_state is null
   for share of run`;
 
+const RUN_STOP_OWNED = runExecutions(
+  "run",
+  "execution.id, execution.organization_id, execution.project_id, execution.agent_session_id, execution.status, execution.hub_action, execution.hub_action_completed_at",
+);
+
+const RUN_STOP_PEERS = `
+  select distinct peer.id, coalesce(step.trigger_run_id::text, peer.launch_run_id::text, peer.id::text) as run_id
+  from owned join agent_executions peer on peer.agent_session_id = owned.agent_session_id
+  left join workflow_step_runs step on step.id = peer.workflow_step_run_id
+  where owned.status in ('spawning', 'running') and peer.status in ('spawning', 'running')
+    and peer.organization_id = owned.organization_id and peer.project_id = owned.project_id
+    and not exists (select 1 from owned other where other.id = peer.id)`;
+
 const EXECUTION_RUN_OWNERS = `select run.payload_expiry_state from trigger_runs run
   where run.id in (
     select step.trigger_run_id from workflow_step_runs step
@@ -325,6 +339,9 @@ export function createDatabase(runtime: DatabaseRuntime, locks: Locks): Database
 }
 
 class PgDatabase implements Database {
+  get stopInterrupts() {
+    return postgresStopInterrupts(this.pool);
+  }
   scanUnknownTemporaryCredentials: Database["scanUnknownTemporaryCredentials"] = (after, limit) =>
     scanUnknownTemporaryCredentials(this.pool, after, limit);
   backfillTemporaryCredentialFact: Database["backfillTemporaryCredentialFact"] = (id) =>
@@ -1584,17 +1601,15 @@ class PgDatabase implements Database {
     const result = await query<{
       stoppedByName: string | null;
       cleanupPending: boolean;
-      sharedAgent: boolean;
+      otherAttachedRunCount: number;
     }>(
       this.pool,
       `
       with target as (
         select id, project_id, organization_id, status from trigger_runs where organization_id = $1 and id = $2
       ), owned as materialized (
-        select linked.* from target run cross join lateral (
-          ${runExecutions("run", "execution.id, execution.agent_session_id, execution.status, execution.hub_action, execution.hub_action_completed_at")}
-        ) linked
-      )
+        select linked.* from target run cross join lateral (${RUN_STOP_OWNED}) linked
+      ), peers as (${RUN_STOP_PEERS})
       select
         (select account.name from audit_events event join "user" account on account.id = event.actor_identity
          where event.organization_id = run.organization_id and event.project_id = run.project_id
@@ -1605,37 +1620,62 @@ class PgDatabase implements Database {
           exists (select 1 from workflow_step_runs step where step.trigger_run_id = run.id and (${SCRIPT_CLEANUP_SQL}))
           or exists (select 1 from owned where hub_action is not null and hub_action_completed_at is null)
         )) as "cleanupPending",
-        (run.status = 'running' and exists (
-          select 1 from owned join agent_executions peer on peer.agent_session_id = owned.agent_session_id
-          where owned.status in ('spawning', 'running') and peer.status in ('spawning', 'running')
-            and peer.organization_id = run.organization_id and peer.project_id = run.project_id
-            and not exists (select 1 from owned other where other.id = peer.id)
-        )) as "sharedAgent"
+        (select count(distinct run_id)::int from peers) as "otherAttachedRunCount"
       from target run`,
       [organizationId, triggerRunId],
     );
     return result.rows[0];
   }
 
-  async cancelTriggerRun(organizationId: string, triggerRunId: string, stoppedByUserId?: string) {
+  async cancelTriggerRun(
+    organizationId: string,
+    triggerRunId: string,
+    stoppedByUserId?: string,
+    confirmedPeerCount?: number,
+  ) {
     try {
       return await this.pool.transaction(async (client) => {
+        const locked = await client.query<TriggerRunRow>(
+          "select * from trigger_runs where organization_id = $1 and id = $2 for update",
+          [organizationId, triggerRunId],
+        );
+        const current = locked.rows[0];
+        if (current === undefined) return undefined;
+        if (current.status !== "running")
+          return { run: toTriggerRunRecord(current), transitioned: false, executionIds: [] };
+        // Attaching an execution takes a foreign-key lock on its session row.
+        await client.query(
+          `select session.id from agent_sessions session
+           where session.id in (
+             select owned.agent_session_id from trigger_runs run
+             cross join lateral (${RUN_STOP_OWNED}) owned
+             where run.id = $1 and owned.status in ('spawning', 'running')
+           )
+           order by session.id for update`,
+          [triggerRunId],
+        );
+        const peers = await client.query<{ id: string; run_id: string }>(
+          `with owned as materialized (
+             select linked.* from trigger_runs run cross join lateral (${RUN_STOP_OWNED}) linked
+             where run.id = $1
+           ) ${RUN_STOP_PEERS}`,
+          [triggerRunId],
+        );
+        const peerCount = new Set(peers.rows.map(({ run_id }) => run_id)).size;
+        if (confirmedPeerCount !== undefined && confirmedPeerCount !== peerCount)
+          return {
+            run: toTriggerRunRecord(current),
+            transitioned: false,
+            executionIds: [],
+            conflict: peerCount,
+          };
         const updated = await client.query<TriggerRunRow>(
           `update trigger_runs set status = 'canceled', completed_at = now(),
              terminal_notification_pending_at = now(), terminal_notification_lease_expires_at = null
            where organization_id = $1 and id = $2 and status = 'running' returning *`,
           [organizationId, triggerRunId],
         );
-        const run = updated.rows[0];
-        if (run === undefined) {
-          const current = await client.query<TriggerRunRow>(
-            `select * from trigger_runs where organization_id = $1 and id = $2`,
-            [organizationId, triggerRunId],
-          );
-          return current.rows[0] === undefined
-            ? undefined
-            : { run: toTriggerRunRecord(current.rows[0]), transitioned: false, executionIds: [] };
-        }
+        const run = updated.rows[0]!;
         await client.query(
           `update workflow_step_runs
            set status = case when status = 'running' then 'canceled' else 'skipped' end,
@@ -1648,14 +1688,21 @@ class PgDatabase implements Database {
            set status = 'failed', completed_at = $2, idle_deadline_at = null,
                result = '{"status":"canceled"}',
                hub_action = case when daemon_id is not null then 'interrupt' end,
-               hub_action_completed_at = null
+               hub_action_completed_at = null,
+               hub_action_acknowledgements = jsonb_set(
+                 coalesce(hub_action_acknowledgements, '{}'::jsonb),
+                 '{stop_interrupt}', $3::jsonb)
            where status in ('spawning', 'running') and id in (
              select execution_id from trigger_runs run
              cross join lateral (${runExecutions("run", "execution.id as execution_id")}) linked
              where run.id = $1
            )
            returning id`,
-          [run.id, run.completed_at],
+          [
+            run.id,
+            run.completed_at,
+            JSON.stringify({ approvedPeerIds: peers.rows.map(({ id }) => id) }),
+          ],
         );
         await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [run.id]);
         if (stoppedByUserId !== undefined) {

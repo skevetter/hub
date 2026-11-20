@@ -11,6 +11,11 @@ import {
   proveReceipt,
   type ReceiptProofBranch,
 } from "../run-payload-retention/receipt-proof.js";
+import {
+  STOP_INTERRUPT_LEASE_MS,
+  type StopInterruptState,
+  type StopInterruptStore,
+} from "./stop-interrupt.js";
 import type { GitHubSyncAuditLink } from "./schema.js";
 import { temporaryCredentialFact } from "../agent-sessions/credentials.js";
 import { sessionLock } from "../agent-sessions/index.js";
@@ -908,6 +913,59 @@ class MemoryDatabase implements Database {
   private readonly providerEventReceiptIdsBySignature = new Map<string, string>();
   private readonly machines = new Map<string, MachineRecord>();
   private readonly agentExecutions = new Map<string, AgentExecutionRecord>();
+  private readonly stopInterruptStates = new Map<string, StopInterruptState>();
+  private readonly stopInterruptClaims = new Map<string, { token: string; until: number }>();
+
+  readonly stopInterrupts: StopInterruptStore = {
+    claim: async (id, token, generation) => {
+      const execution = this.agentExecutions.get(id);
+      const now = this.now().getTime();
+      if (
+        execution?.hubAction !== "interrupt" ||
+        execution.hubActionCompletedAt !== null ||
+        (execution.hubActionAcknowledgements.stopInterruptGeneration ?? null) !== generation ||
+        (this.stopInterruptClaims.get(id)?.until ?? 0) > now
+      )
+        return undefined;
+      this.stopInterruptClaims.set(id, { token, until: now + STOP_INTERRUPT_LEASE_MS });
+      this.setStopInterruptGeneration(execution, token);
+      return { state: structuredClone(this.stopInterruptStates.get(id) ?? null) };
+    },
+    save: async (id, token, state) => {
+      const claim = this.stopInterruptClaims.get(id);
+      const now = this.now().getTime();
+      if (claim?.token !== token || claim.until <= now) return false;
+      this.stopInterruptStates.set(id, structuredClone(state));
+      claim.until = now + STOP_INTERRUPT_LEASE_MS;
+      return true;
+    },
+    complete: async (id, token) => {
+      if (this.stopInterruptClaims.get(id)?.token !== token) return;
+      await this.completeHubAction(id, "interrupt");
+      await this.stopInterrupts.release(id, token);
+    },
+    release: async (id, token) => {
+      if (this.stopInterruptClaims.get(id)?.token !== token) return;
+      this.stopInterruptClaims.delete(id);
+      const execution = this.agentExecutions.get(id);
+      if (execution?.hubActionCompletedAt === null)
+        this.setStopInterruptGeneration(execution, `${token}:released`);
+    },
+  };
+
+  private setStopInterruptGeneration(
+    execution: AgentExecutionRecord,
+    stopInterruptGeneration: string,
+  ) {
+    this.agentExecutions.set(execution.id, {
+      ...execution,
+      hubActionAcknowledgements: {
+        ...execution.hubActionAcknowledgements,
+        stopInterruptGeneration,
+      },
+    });
+  }
+
   private readonly triggerRuns = new Map<string, TriggerRunRecord>();
   private readonly runTimelineStates = new Map<string, RunTimelineState>();
   private readonly runTimelineEvents = new Map<string, RunTimelineEvent[]>();
@@ -2440,14 +2498,6 @@ class MemoryDatabase implements Database {
     if (run?.organizationId !== organizationId) return undefined;
     const steps = this.listSteps(run.id);
     const owned = this.runPayloadExecutions(run, steps);
-    const sessions = new Set(
-      owned
-        .filter(
-          (execution) =>
-            !isTerminalAgentExecutionStatus(execution.status) && execution.agentSessionId !== null,
-        )
-        .map(({ agentSessionId }) => agentSessionId),
-    );
     return {
       stoppedByName: null,
       cleanupPending:
@@ -2456,18 +2506,44 @@ class MemoryDatabase implements Database {
           owned.some(
             (execution) => execution.hubAction !== null && execution.hubActionCompletedAt === null,
           )),
-      sharedAgent:
-        run.status === "running" &&
-        [...this.agentExecutions.values()].some(
-          (execution) =>
-            sessions.has(execution.agentSessionId) &&
-            !owned.includes(execution) &&
-            !isTerminalAgentExecutionStatus(execution.status),
-        ),
+      otherAttachedRunCount: this.countStopPeerRuns(this.stopPeers(owned)),
     };
   }
 
-  async cancelTriggerRun(organizationId: string, triggerRunId: string) {
+  private stopPeers(owned: readonly AgentExecutionRecord[]) {
+    const sessions = new Set(
+      owned
+        .filter(
+          (execution) =>
+            !isTerminalAgentExecutionStatus(execution.status) && execution.agentSessionId !== null,
+        )
+        .map(({ agentSessionId }) => agentSessionId),
+    );
+    return [...this.agentExecutions.values()].filter(
+      (execution) =>
+        sessions.has(execution.agentSessionId) &&
+        !owned.includes(execution) &&
+        !isTerminalAgentExecutionStatus(execution.status),
+    );
+  }
+
+  private countStopPeerRuns(peers: readonly AgentExecutionRecord[]) {
+    return new Set(
+      peers.map(
+        (execution) =>
+          this.workflowStepRuns.get(execution.workflowStepRunId ?? "")?.triggerRunId ??
+          execution.launchRunId ??
+          execution.id,
+      ),
+    ).size;
+  }
+
+  async cancelTriggerRun(
+    organizationId: string,
+    triggerRunId: string,
+    _actor?: string,
+    confirmedPeerCount?: number,
+  ) {
     const run = this.triggerRuns.get(triggerRunId);
     if (run?.organizationId !== organizationId) return undefined;
     if (run.status !== "running") return { run, transitioned: false, executionIds: [] };
@@ -2475,6 +2551,11 @@ class MemoryDatabase implements Database {
     const steps = [...this.workflowStepRuns.values()].filter(
       (step) => step.triggerRunId === run.id,
     );
+    const owned = this.runPayloadExecutions(run, steps);
+    const peers = this.stopPeers(owned);
+    const peerCount = this.countStopPeerRuns(peers);
+    if (confirmedPeerCount !== undefined && confirmedPeerCount !== peerCount)
+      return { run, transitioned: false, executionIds: [], conflict: peerCount };
     for (const step of steps) {
       if (step.status !== "pending" && step.status !== "running") continue;
       this.workflowStepRuns.set(step.id, {
@@ -2484,7 +2565,7 @@ class MemoryDatabase implements Database {
       });
     }
     const executionIds: string[] = [];
-    for (const execution of this.runPayloadExecutions(run, steps)) {
+    for (const execution of owned) {
       if (isTerminalAgentExecutionStatus(execution.status)) continue;
       this.agentExecutions.set(execution.id, {
         ...execution,
@@ -2495,6 +2576,7 @@ class MemoryDatabase implements Database {
         hubAction: execution.daemonId === null ? null : "interrupt",
         hubActionCompletedAt: null,
       });
+      this.stopInterruptStates.set(execution.id, { approvedPeerIds: peers.map(({ id }) => id) });
       executionIds.push(execution.id);
     }
     const updated = {
@@ -4024,9 +4106,7 @@ class MemoryDatabase implements Database {
       return undefined;
     const current = execution.hubActionAcknowledgements;
     const updatedAcknowledgements: AgentExecutionHubAcknowledgements = {
-      terminalAt: current.terminalAt,
-      idleAt: current.idleAt,
-      finishExecutionCall: current.finishExecutionCall,
+      ...current,
     };
     if (acknowledgement.kind === "terminal") {
       if (

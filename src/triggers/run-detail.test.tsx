@@ -9,7 +9,7 @@ import type { RunDetailSnapshot } from "./run-events.js";
 const render = (detail: RunDetailSnapshot) =>
   renderToStaticMarkup(<RunDetailView detail={detail} />);
 
-const confirmStop = () => undefined;
+const confirmStop = async () => undefined;
 
 describe("run timeline UI", () => {
   it("shows Stop only for people with permission while the run is live", () => {
@@ -28,7 +28,7 @@ describe("run timeline UI", () => {
     const detail: RunDetailSnapshot = {
       ...runDetailFixture,
       timeline: { ...runDetailFixture.timeline, status: "canceled" },
-      stopDetails: { stoppedByName: "Avery", cleanupPending: true, sharedAgent: false },
+      stopDetails: { stoppedByName: "Avery", cleanupPending: true, otherAttachedRunCount: 0 },
     };
     assert.match(render(detail), /Stopped by Avery/u);
     assert.match(render(detail), /retry cleanup when it reconnects/u);

@@ -12,11 +12,23 @@ Hub marks the run canceled immediately, skips steps that have not started, and
 interrupts any active agent or script. If the daemon is offline, Hub records the
 stop immediately and retries pending cleanup on reconnect. A canceled run
 remains subject to the run payload retention policy once cleanup and reporting
-settle. If another active run shares the agent, Stop interrupts both turns. The
-selected run ends canceled. Other runs that are still active when Hub handles
-the interrupt follow the normal agent-interrupted failure path, and any run
-that has already reached a terminal state keeps it. Stop can win after the last
-step succeeds if the workflow itself is still running.
+settle.
+
+Stop interrupts the agent's current work. Every other run that still has active
+work attached to that agent follows the normal agent-interrupted failure path.
+Runs between steps continue through normal scheduling and can use the same
+session for their next step.
+The confirmation shows how many other runs have attached work and asks you
+to review the impact again if that count changes.
+
+Hub records which executions were attached at the first interrupt attempt. If
+the acknowledgement is lost, Hub checks the daemon's state before retrying.
+It leaves the action pending when the daemon state is unavailable. If the agent
+has stopped or another execution has joined, Hub settles the pending action
+without sending another interrupt. A delayed first attempt also skips the
+interrupt if it would affect executions that attached after Stop was accepted.
+
+Stop can win after the last step succeeds if the workflow itself is still running.
 
 The public endpoint is `POST /api/v1/runs/{id}/stop`. It requires a bearer
 credential from an organization CLI login and has no request body. An authorized

@@ -226,6 +226,7 @@ export interface AgentExecutionHubAcknowledgements {
   terminalAt: Date | null;
   idleAt: Date | null;
   finishExecutionCall: AgentExecutionHubFinishExecutionAcknowledgement | null;
+  stopInterruptGeneration?: string;
 }
 
 export type AgentExecutionHubAcknowledgementInput =
@@ -1470,7 +1471,11 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
     organizationId: string,
     triggerRunId: string,
     stoppedByUserId?: string,
-  ): Promise<(TransitionTriggerRunResult & { executionIds: string[] }) | undefined>;
+    confirmedPeerCount?: number,
+  ): Promise<
+    (TransitionTriggerRunResult & { executionIds: string[]; conflict?: number }) | undefined
+  >;
+  readonly stopInterrupts: import("./stop-interrupt.js").StopInterruptStore;
   succeedTriggerRun(triggerRunId: string): Promise<TransitionTriggerRunResult | undefined>;
   failWorkflowRun(
     triggerRunId: string,

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isCanceledExecution } from "../triggers/run-stop.js";
+import type { StopInterruptState } from "../db/stop-interrupt.js";
 import { temporaryCredentialFact } from "./credentials.js";
 import type { Database, AgentExecutionRecord } from "../db/types.js";
 import {
@@ -216,29 +216,100 @@ export class AgentSessions {
     connection: AgentConnection,
     action: "interrupt" | "archive",
   ): Promise<readonly string[] | undefined> {
-    const canceled = isCanceledExecution(execution);
-    if (!execution.agentSessionId) {
-      if (action === "interrupt" && canceled && execution.daemonAgentId !== null) {
-        const agent = await connection.get(execution.daemonAgentId);
-        await connection.control(agent.id, agent.workspaceId, action);
-      }
-      return [];
-    }
     const id = execution.agentSessionId;
+    if (id === null) return [];
     const session = await this.database.findAgentSession(id);
-    if (session === undefined) return canceled ? [] : undefined;
-    if (!canceled && (!session.agentId || !session.workspaceId)) return undefined;
+    if (!session?.agentId || !session.workspaceId) return undefined;
+    const { agentId, workspaceId } = session;
     return this.database.withAdvisoryLock(sessionLock(session), async () => {
-      // Agent creation holds the same lock. If it never finished, it could not send a prompt.
-      const target = canceled ? await this.database.findAgentSession(id) : session;
-      if (!target?.agentId || !target.workspaceId) return canceled ? [] : undefined;
       const executions = await this.database.listAgentSessionExecutions(id);
-      const active = executions.filter(isActive);
-      // Automatic terminal actions cannot interrupt a newer arrival. An explicit Stop can.
-      if (!canceled && active.length > 0) return [];
-      await connection.control(target.agentId, target.workspaceId, action);
-      return active.map((arrival) => arrival.id);
+      if (!executions.some(isActive)) await connection.control(agentId, workspaceId, action);
+      return [];
     });
+  }
+
+  async interruptStoppedExecution(
+    execution: AgentExecutionRecord,
+    connection: AgentConnection,
+    token: string,
+    state: StopInterruptState,
+  ): Promise<readonly string[] | undefined> {
+    if (state.settledPeerIds !== undefined) return state.settledPeerIds;
+    const id = execution.agentSessionId;
+    const session = id === null ? undefined : await this.database.findAgentSession(id);
+    const lock =
+      session === undefined
+        ? `stop-agent:${execution.daemonId}:${execution.daemonAgentId ?? execution.id}`
+        : sessionLock(session);
+    return this.database.withAdvisoryLock(lock, async () => {
+      const current = await this.database.findAgentExecutionById(execution.id);
+      if (
+        current?.hubAction !== "interrupt" ||
+        current.hubActionCompletedAt !== null ||
+        current.agentSessionId !== id
+      )
+        return undefined;
+      const refreshed = id === null ? undefined : await this.database.findAgentSession(id);
+      const agentId = refreshed?.agentId ?? current.daemonAgentId;
+      if (agentId === null) return state.target === undefined ? [] : undefined;
+      const arrivals = id === null ? [current] : await this.database.listAgentSessionExecutions(id);
+      return this.sendStopInterrupt(execution.id, connection, token, state, {
+        agentId,
+        workspaceId: refreshed?.workspaceId ?? null,
+        arrivals,
+      });
+    });
+  }
+
+  private async sendStopInterrupt(
+    id: string,
+    connection: AgentConnection,
+    token: string,
+    state: StopInterruptState,
+    current: {
+      agentId: string;
+      workspaceId: string | null;
+      arrivals: readonly AgentExecutionRecord[];
+    },
+  ): Promise<readonly string[] | undefined> {
+    const attachmentFingerprint = fingerprint(current.arrivals.map((arrival) => arrival.id).sort());
+    const peerIds = current.arrivals.filter(isActive).map((arrival) => arrival.id);
+    const target = state.target ?? { agentId: current.agentId, attachmentFingerprint, peerIds };
+    if (state.target === undefined && peerIds.some((peer) => !state.approvedPeerIds.includes(peer)))
+      return this.settleStopInterrupt(id, token, state, []);
+
+    let workspaceId = current.workspaceId;
+    if (state.target !== undefined || workspaceId === null) {
+      const observed = await connection.get(current.agentId);
+      if (
+        target.agentId !== current.agentId ||
+        observed.id !== target.agentId ||
+        target.attachmentFingerprint !== attachmentFingerprint
+      )
+        return this.settleStopInterrupt(id, token, state, []);
+      if (state.target !== undefined && ["idle", "closed", "error"].includes(observed.status))
+        return this.settleStopInterrupt(id, token, state, target.peerIds);
+      if (state.target !== undefined && observed.status !== "running") return undefined;
+      workspaceId = observed.workspaceId;
+    }
+    // The session lock serializes dispatch with the membership check and the agent-wide send.
+    const attempted = { ...state, target };
+    if (!(await this.database.stopInterrupts.save(id, token, attempted))) return undefined;
+    await connection.control(target.agentId, workspaceId, "interrupt");
+    return this.settleStopInterrupt(id, token, attempted, target.peerIds);
+  }
+
+  private async settleStopInterrupt(
+    id: string,
+    token: string,
+    state: StopInterruptState,
+    peerIds: string[],
+  ) {
+    const settled = await this.database.stopInterrupts.save(id, token, {
+      ...state,
+      settledPeerIds: peerIds,
+    });
+    return settled ? peerIds : undefined;
   }
 
   async releaseAuthority(

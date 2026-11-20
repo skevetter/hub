@@ -3,6 +3,7 @@ import { getRequest, setResponseStatus } from "@tanstack/react-start/server";
 import { z } from "zod";
 import { respondError, respondOk, type Result } from "../contract/respond.js";
 import { respondWithFailure } from "../failures/index.js";
+import type { BrowserStopResult } from "./run-stop.js";
 import { getApplication } from "../server/runtime.js";
 import { ACTIVITY_PAGE_SIZE_MAX } from "./activity-cursor.js";
 import type { TriggerDashboard } from "./dashboard.js";
@@ -31,13 +32,22 @@ export const runDetailSnapshot = createServerFn({ method: "GET" })
   });
 
 export const stopRun = createServerFn({ method: "POST" })
-  .validator(runScopeSchema)
-  .handler(async ({ data }): Promise<Result<{ status: string }>> => {
+  .validator(runScopeSchema.extend({ confirmedPeerCount: z.number().int().nonnegative() }))
+  .handler(async ({ data }): Promise<Result<BrowserStopResult>> => {
     try {
       const dashboard = (await getApplication()).triggerDashboard;
       if (dashboard == null) throw new Error("trigger dashboard unavailable");
-      const result = await dashboard.stopRun(getRequest(), data.organizationSlug, data.runId);
-      if (result.status === "stopped") return respondOk({ status: result.runStatus });
+      const result = await dashboard.stopRun(
+        getRequest(),
+        data.organizationSlug,
+        data.runId,
+        data.confirmedPeerCount,
+      );
+      if (result.status === "stopped") return respondOk(result);
+      if (result.status === "conflict") {
+        setResponseStatus(409);
+        return respondOk(result);
+      }
       setResponseStatus(result.status === "forbidden" ? 403 : 404);
       return respondError({
         message:

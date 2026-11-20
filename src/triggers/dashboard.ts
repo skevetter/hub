@@ -181,7 +181,12 @@ export class TriggerDashboard {
     return { ...detail, canStop, ...(stopDetails === undefined ? {} : { stopDetails }) };
   }
 
-  async stopRun(request: Request, organizationSlug: string, runId: string) {
+  async stopRun(
+    request: Request,
+    organizationSlug: string,
+    runId: string,
+    confirmedPeerCount: number,
+  ) {
     const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, {
       organizationSlug,
     });
@@ -193,6 +198,7 @@ export class TriggerDashboard {
         userId: account.account.id,
       },
       runId,
+      confirmedPeerCount,
     );
   }
 

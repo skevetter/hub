@@ -1,4 +1,11 @@
-import { createContext, useCallback, useContext, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
 
 import {
   AlertDialog,
@@ -85,16 +92,35 @@ export function ConfirmMenuItem({
 export function ConfirmAction({
   label,
   busy = false,
+  confirmDisabled = false,
+  keepOpenOnConfirm = false,
+  open,
+  onOpenChange,
   ...confirmation
-}: Confirmation & { label: string; busy?: boolean }) {
+}: Confirmation & {
+  label: string;
+  busy?: boolean;
+  confirmDisabled?: boolean;
+  keepOpenOnConfirm?: boolean;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}) {
   return (
-    <AlertDialog>
+    <AlertDialog
+      {...(open === undefined ? {} : { open })}
+      {...(onOpenChange === undefined ? {} : { onOpenChange })}
+    >
       <AlertDialogTrigger asChild>
         <Button type="button" variant="outline" size="sm" disabled={busy}>
           {label}
         </Button>
       </AlertDialogTrigger>
-      <ConfirmBody confirmation={confirmation} busy={busy} />
+      <ConfirmBody
+        confirmation={confirmation}
+        busy={busy}
+        confirmDisabled={confirmDisabled}
+        keepOpenOnConfirm={keepOpenOnConfirm}
+      />
     </AlertDialog>
   );
 }
@@ -115,7 +141,17 @@ function ConfirmDialog({
   );
 }
 
-function ConfirmBody({ confirmation, busy }: { confirmation: Confirmation; busy: boolean }) {
+function ConfirmBody({
+  confirmation,
+  busy,
+  confirmDisabled = false,
+  keepOpenOnConfirm = false,
+}: {
+  confirmation: Confirmation;
+  busy: boolean;
+  confirmDisabled?: boolean;
+  keepOpenOnConfirm?: boolean;
+}) {
   const {
     title,
     description,
@@ -124,6 +160,13 @@ function ConfirmBody({ confirmation, busy }: { confirmation: Confirmation; busy:
     onConfirm,
     destructive = false,
   } = confirmation;
+  const confirm = useCallback(
+    (event: MouseEvent<HTMLButtonElement>) => {
+      if (keepOpenOnConfirm) event.preventDefault();
+      onConfirm();
+    },
+    [keepOpenOnConfirm, onConfirm],
+  );
   return (
     <AlertDialogContent>
       <AlertDialogHeader>
@@ -136,8 +179,8 @@ function ConfirmBody({ confirmation, busy }: { confirmation: Confirmation; busy:
         </AlertDialogCancel>
         <AlertDialogAction
           variant={destructive ? "destructive" : "default"}
-          disabled={busy}
-          onClick={onConfirm}
+          disabled={busy || confirmDisabled}
+          onClick={confirm}
         >
           {confirmLabel}
         </AlertDialogAction>

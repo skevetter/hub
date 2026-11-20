@@ -1394,7 +1394,7 @@ export class DaemonDispatchLifecycle {
     }
     const existing = this.reconcilingHubActions.get(current.id);
     if (existing !== undefined) return existing;
-    const operation = this.sendPendingHubAction(current.id).finally(() => {
+    const operation = this.sendPendingHubAction(current).finally(() => {
       if (this.reconcilingHubActions.get(current.id) === operation) {
         this.reconcilingHubActions.delete(current.id);
       }
@@ -1403,26 +1403,58 @@ export class DaemonDispatchLifecycle {
     await operation;
   }
 
-  private async sendPendingHubAction(executionId: string): Promise<void> {
-    const execution = await this.options.database.findAgentExecutionById(executionId);
+  private async sendPendingHubAction(candidate: AgentExecutionRecord): Promise<void> {
+    const execution = await this.options.database.findAgentExecutionById(candidate.id);
     if (execution === undefined || execution.hubActionCompletedAt !== null || this.stopping) return;
     const action = execution.hubAction;
     const daemonId = execution.daemonId;
     if (action === null || daemonId === null) return;
     const connection = this.options.connectionForDaemon(daemonId);
     if (connection === undefined) return;
-    const interrupted = await withHubActionTimeout(
+    if (action === "interrupt" && isCanceledExecution(execution)) {
+      // Keep the generation observed by this recovery so a queued contender cannot
+      // claim a new attempt after another worker releases the row.
+      const generation = candidate.hubActionAcknowledgements.stopInterruptGeneration ?? null;
+      await this.sendStopInterrupt(execution, connection.agents, generation);
+      return;
+    }
+    const settled = await withHubActionTimeout(
       this.sessionOwner().control(execution, connection.agents, action),
       this.dispatchTimeoutMs,
       (callback, delayMs) => this.scheduleDeadline(async () => callback(), delayMs),
     );
-    if (interrupted === undefined) return;
-    await Promise.all(
-      interrupted.map((id) =>
-        this.failAgentExecution(id, "agent_interrupted", { alreadyInterrupted: true }),
-      ),
-    );
-    await this.options.database.completeHubAction(execution.id, action);
+    if (settled !== undefined) await this.options.database.completeHubAction(execution.id, action);
+  }
+
+  private async sendStopInterrupt(
+    execution: AgentExecutionRecord,
+    agents: DaemonConnection["agents"],
+    generation: string | null,
+  ) {
+    const { stopInterrupts } = this.options.database;
+    const token = randomUUID();
+    const claimed = await stopInterrupts.claim(execution.id, token, generation);
+    if (claimed === undefined) return;
+    try {
+      const interrupted =
+        claimed.state === null
+          ? []
+          : await this.sessionOwner().interruptStoppedExecution(
+              execution,
+              agents,
+              token,
+              claimed.state,
+            );
+      if (interrupted === undefined) return;
+      await Promise.all(
+        interrupted.map((id) =>
+          this.failAgentExecution(id, "agent_interrupted", { alreadyInterrupted: true }),
+        ),
+      );
+      await stopInterrupts.complete(execution.id, token);
+    } finally {
+      await stopInterrupts.release(execution.id, token);
+    }
   }
 
   private async notifyMachineTerminated(

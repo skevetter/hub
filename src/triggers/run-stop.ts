@@ -12,10 +12,11 @@ export interface RunStopActor {
 export interface RunStopDetails {
   stoppedByName: string | null;
   cleanupPending: boolean;
-  sharedAgent: boolean;
+  otherAttachedRunCount: number;
 }
 
 export type StopRunResult =
+  | { status: "conflict"; otherAttachedRunCount: number }
   | {
       status: "stopped";
       runId: string;
@@ -24,7 +25,13 @@ export type StopRunResult =
     }
   | { status: "forbidden" | "run_not_found" };
 
-export type StopRun = (actor: RunStopActor, runId: string) => Promise<StopRunResult>;
+export type BrowserStopResult = Extract<StopRunResult, { status: "conflict" | "stopped" }>;
+
+export type StopRun = (
+  actor: RunStopActor,
+  runId: string,
+  confirmedPeerCount?: number,
+) => Promise<StopRunResult>;
 
 export function canStopRun(actor: RunStopActor, run: TriggerRunRecord): boolean {
   return (

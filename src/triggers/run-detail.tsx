@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
@@ -17,7 +17,7 @@ import { useSnapshotQuery } from "../queries/index.js";
 import { runDetailSnapshot, stopRun } from "./functions.js";
 import type { RunConnection, RunDetailSnapshot, RunEventPage } from "./run-events.js";
 import { RunSteps } from "./run-steps.js";
-import { CANCELED_RUN_NOTE } from "./run-stop.js";
+import { CANCELED_RUN_NOTE, type BrowserStopResult } from "./run-stop.js";
 import { activityCounts, timelineRows, type TimelineRow } from "./run-timeline-view.js";
 import { pollRunDetail } from "./run-event-subscription.js";
 import { runDetailKey, useRunEvents } from "./use-run-events.js";
@@ -103,16 +103,35 @@ function LiveRunDetail({
     });
   }, [cleanupPending, organizationSlug, queryClient, runId]);
   const sendStop = useServerFn(stopRun);
+  const load = useServerFn(runDetailSnapshot);
   const stop = useMutation({
-    mutationFn: () => sendStop({ data: { organizationSlug, runId: detail.run.id } }),
+    mutationFn: (confirmedPeerCount: number) =>
+      sendStop({ data: { organizationSlug, runId, confirmedPeerCount } }),
     onSuccess: async (result) => {
-      if (result.status === "ok")
+      if (result.status === "ok" && result.data.status === "stopped")
         await queryClient.invalidateQueries({
           queryKey: runDetailKey(organizationSlug, detail.run.id),
         });
     },
   });
-  const stoppedStatus = stop.data?.status === "ok" ? stop.data.data.status : undefined;
+  const sendConfirmation = stop.mutateAsync;
+  const confirm = useCallback(
+    async (confirmedPeerCount: number) => {
+      const result = await sendConfirmation(confirmedPeerCount).catch(() => undefined);
+      return result?.status === "ok" ? result.data : undefined;
+    },
+    [sendConfirmation],
+  );
+  const readImpact = useCallback(async () => {
+    const result = await load({ data: { organizationSlug, runId } });
+    return result.status === "ok" && result.data?.canStop
+      ? result.data.stopDetails?.otherAttachedRunCount
+      : undefined;
+  }, [load, organizationSlug, runId]);
+  const stoppedStatus =
+    stop.data?.status === "ok" && stop.data.data.status === "stopped"
+      ? stop.data.data.runStatus
+      : undefined;
   const timeline = useMemo(
     () => (stoppedStatus === undefined ? state : { ...state, status: stoppedStatus }),
     [state, stoppedStatus],
@@ -123,7 +142,8 @@ function LiveRunDetail({
       timeline={timeline}
       connection={state.connection}
       stopBusy={stop.isPending}
-      onStop={stop.mutate}
+      onStop={confirm}
+      readStopImpact={readImpact}
       stopError={stop.data?.status === "error" ? stop.data : stop.error}
     />
   );
@@ -135,13 +155,15 @@ export function RunDetailView({
   connection = null,
   stopBusy = false,
   onStop,
+  readStopImpact,
   stopError,
 }: {
   detail: RunDetailSnapshot;
   timeline?: RunEventPage;
   connection?: RunConnection;
   stopBusy?: boolean;
-  onStop?: () => void;
+  onStop?: (confirmedPeerCount: number) => Promise<BrowserStopResult | undefined>;
+  readStopImpact?: () => Promise<number | undefined>;
   stopError?: Failure;
 }) {
   const { run } = detail;
@@ -163,7 +185,13 @@ export function RunDetailView({
           title="Run detail"
           description={`${run.webhookSummary === undefined ? run.provider : "Webhook"} - ${run.configuredTriggerName}`}
         >
-          <StopRunAction detail={detail} terminal={terminal} busy={stopBusy} onConfirm={onStop} />
+          <StopRunAction
+            detail={detail}
+            terminal={terminal}
+            busy={stopBusy}
+            onConfirm={onStop}
+            readImpact={readStopImpact}
+          />
         </PageHeader>
       </div>
       {stopError == null ? null : (
@@ -223,29 +251,91 @@ function StopRunAction({
   terminal,
   busy,
   onConfirm,
+  readImpact,
 }: {
   detail: RunDetailSnapshot;
   terminal: boolean;
   busy: boolean;
-  onConfirm: (() => void) | undefined;
+  onConfirm: ((confirmedPeerCount: number) => Promise<BrowserStopResult | undefined>) | undefined;
+  readImpact: (() => Promise<number | undefined>) | undefined;
 }) {
+  const [confirmation, setConfirmation] = useState<{ peerCount?: number; message?: string } | null>(
+    null,
+  );
+  const request = useRef(0);
+  const snapshotCount = detail.stopDetails?.otherAttachedRunCount;
+  const changeOpen = useCallback(
+    (open: boolean) => {
+      const generation = ++request.current;
+      setConfirmation(open ? {} : null);
+      if (!open) return;
+      const read = readImpact?.() ?? Promise.resolve(snapshotCount);
+      void read
+        .catch(() => undefined)
+        .then((peerCount) => {
+          if (request.current !== generation) return undefined;
+          setConfirmation(
+            peerCount === undefined
+              ? { message: "Hub couldn't check the impact. Close the dialog and try again." }
+              : { peerCount },
+          );
+          return undefined;
+        });
+    },
+    [readImpact, snapshotCount],
+  );
+  const peerCount = confirmation?.peerCount;
+  const confirm = useCallback(() => {
+    if (peerCount === undefined || onConfirm === undefined) return;
+    const generation = request.current;
+    void onConfirm(peerCount).then((result) => {
+      if (request.current !== generation) return undefined;
+      if (result?.status === "conflict") {
+        setConfirmation({
+          peerCount: result.otherAttachedRunCount,
+          message: "Review the updated impact and confirm again.",
+        });
+      } else if (result?.status === "stopped") {
+        changeOpen(false);
+      } else {
+        setConfirmation({ peerCount, message: "Hub couldn't stop this run. Try again." });
+      }
+      return undefined;
+    });
+  }, [changeOpen, onConfirm, peerCount]);
   if (!detail.canStop || terminal || onConfirm === undefined) return null;
   return (
     <ConfirmAction
       label="Stop run"
       title="Stop this run?"
-      description={
-        detail.stopDetails?.sharedAgent
-          ? "This agent is also working on another run. Stopping interrupts both turns. Hub skips the remaining steps of this run and retries cleanup when an offline daemon reconnects."
-          : "Hub will interrupt the active agent or script and skip remaining steps. If its daemon is offline, Hub will retry cleanup when it reconnects."
-      }
+      description={stopDescription(peerCount, confirmation?.message)}
       confirmLabel="Stop run"
       cancelLabel="Keep running"
       destructive
       busy={busy}
-      onConfirm={onConfirm}
+      confirmDisabled={peerCount === undefined}
+      keepOpenOnConfirm
+      open={confirmation !== null}
+      onOpenChange={changeOpen}
+      onConfirm={confirm}
     />
   );
+}
+
+function stopDescription(peerCount: number | undefined, message: string | undefined): string {
+  if (peerCount === undefined)
+    return message ?? "Checking which runs have work attached to the agent...";
+  const impact =
+    peerCount === 0
+      ? "Hub will interrupt the active agent or script and skip remaining steps."
+      : `${peerCount} other ${peerCount === 1 ? "run has" : "runs have"} work attached to this agent. Stopping interrupts the agent's current work. This run will be canceled and the other attached runs will fail.`;
+  return [
+    message,
+    impact,
+    "If the daemon is offline, Hub will retry pending cleanup when it reconnects.",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function CanceledRunNotice({ details }: { details: RunDetailSnapshot["stopDetails"] }) {
