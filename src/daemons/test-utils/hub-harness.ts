@@ -118,7 +118,7 @@ const ExecutionSessionRequestSchema = z.object({
         .object({
           provider: z.string(),
           cwd: z.string(),
-          mcpServers: z.record(z.string(), z.object({ url: z.string() }).passthrough()),
+          mcpServers: z.record(z.string(), z.object({ url: z.string() }).passthrough()).optional(),
         })
         .passthrough(),
       env: z.record(z.string(), z.string()).optional(),
@@ -141,7 +141,11 @@ const ExecutionSessionRequestSchema = z.object({
       requestId: z.string(),
       includeBackground: z.boolean().optional(),
     }),
-    z.object({ type: z.literal("agent.timeline.set_subscription.request"), requestId: z.string() }),
+    z.object({
+      type: z.literal("agent.timeline.set_subscription.request"),
+      requestId: z.string(),
+      agentIds: z.array(z.string()).optional(),
+    }),
     z.object({
       type: z.literal("send_agent_message_request"),
       requestId: z.string(),
@@ -162,6 +166,7 @@ const ExecutionSessionRequestSchema = z.object({
     }),
   ]),
 });
+type FakeAgentRequest = z.infer<typeof ExecutionSessionRequestSchema>["message"];
 
 export class HubHarness {
   private postgres: StartedPostgreSqlContainer | undefined;
@@ -2227,7 +2232,8 @@ interface Enrollment {
   webSocketUrl: string;
   permissions: string[];
 }
-class TestDaemon {
+export class TestDaemon {
+  timelineAgentIds: readonly string[] = [];
   private socket: WebSocket | undefined;
   private permissions: string[] = [];
   private readonly agents = new Map<string, Record<string, unknown>>();
@@ -2704,13 +2710,7 @@ class TestDaemon {
       return;
     }
     if (request.type === "send_agent_message_request") {
-      const agent = this.agents.get(request.agentId);
-      if (!agent) throw new Error("Unknown agent");
-      agent["prompt"] = request.text;
-      this.send({
-        type: "send_agent_message_response",
-        payload: { requestId: request.requestId, accepted: true },
-      });
+      this.sendAgentMessage(request);
       return;
     }
     if (request.type === "cancel_agent_request" || request.type === "archive_workspace_request") {
@@ -2730,8 +2730,35 @@ class TestDaemon {
       else this.acknowledgeControl(control);
       return;
     }
+    this.createAgent(request);
+  }
+
+  private sendAgentMessage(
+    request: Extract<FakeAgentRequest, { type: "send_agent_message_request" }>,
+  ) {
+    const agent = this.agents.get(request.agentId);
+    if (!agent) throw new Error("Unknown agent");
+    agent["prompt"] = request.text;
+    if (agent["mcpServers"] === undefined) agent["status"] = "running";
+    this.send({
+      type: "send_agent_message_response",
+      payload: { requestId: request.requestId, accepted: true },
+    });
+  }
+
+  private createAgent(request: Extract<FakeAgentRequest, { type: "create_agent_request" }>) {
+    const hubMcp = request.config.mcpServers?.["hub"];
+    const interactive =
+      request.config.mcpServers === undefined &&
+      /^isession:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}:[1-9][0-9]*$/u.test(
+        request.idempotencyKey,
+      );
+    // The real daemon does not require Hub MCP to create an interactive agent.
+    const executionId = interactive
+      ? request.idempotencyKey
+      : hubMcp && URL.parse(hubMcp.url)?.pathname.split("/")[2];
+    if (!executionId) return;
     this.createRequests += 1;
-    const executionId = new URL(request.config.mcpServers["hub"]!.url).pathname.split("/")[2]!;
     const pending = { requestId: request.requestId, executionId };
     const agentId = `agent-${executionId}`;
     if (this.materializeSpawn && !this.agents.has(agentId)) {
@@ -2742,7 +2769,7 @@ class TestDaemon {
         worktree: request.worktree,
         background: request.background,
         executionId,
-        status: "running",
+        status: interactive ? "idle" : "running",
       });
     }
     this.resolveSpawn();
@@ -2754,9 +2781,11 @@ class TestDaemon {
     type: "fetch_agents_request" | "agent.timeline.set_subscription.request";
     requestId: string;
     includeBackground?: boolean | undefined;
+    agentIds?: string[] | undefined;
   }): void {
     if (request.type === "fetch_agents_request")
       this.includeBackground = request.includeBackground === true;
+    else this.timelineAgentIds = request.agentIds ?? [];
     this.send({
       type:
         request.type === "fetch_agents_request"
@@ -2834,6 +2863,10 @@ class TestDaemon {
     executionId: string;
     action: HubExecutionControlAction;
   }): void {
+    const agent = this.agents.get(`agent-${request.executionId}`);
+    if (agent && agent["mcpServers"] === undefined && request.action === "interrupt") {
+      agent["status"] = "idle";
+    }
     this.send({
       type: request.action === "archive" ? "archive_workspace_response" : "cancel_agent_response",
       payload: { requestId: request.requestId, error: null },
