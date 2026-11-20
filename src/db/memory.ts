@@ -5669,6 +5669,8 @@ function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
   );
 }
 
+// Milliseconds only, unlike PostgreSQL. The packaged embedded database runs the SQL path; this
+// store is for tests.
 function runOrder(run: { createdAt: Date; id: string }) {
   return { micros: BigInt(run.createdAt.getTime()) * 1000n, id: run.id };
 }

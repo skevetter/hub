@@ -7,6 +7,7 @@ export const ACTIVITY_PAGE_SIZE_MAX = 100;
 type Position = NonNullable<ActivityRunPageRequest["position"]>;
 
 const CURSOR_MAX = 512;
+const BASE64URL = /^[A-Za-z0-9_-]+$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 export function encodeActivityCursor(
@@ -18,9 +19,14 @@ export function encodeActivityCursor(
 
 /** A cursor the reader cannot trust is no position: the page falls back to the newest runs. */
 export function decodeActivityCursor(cursor: string | undefined): Position | undefined {
-  if (cursor === undefined || cursor.length > CURSOR_MAX) return undefined;
+  if (cursor === undefined || cursor.length > CURSOR_MAX || !BASE64URL.test(cursor)) {
+    return undefined;
+  }
   try {
-    const parsed: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+    // Node's decoder skips what it cannot read, so only the exact text the encoder writes counts.
+    const bytes = Buffer.from(cursor, "base64url");
+    if (bytes.toString("base64url") !== cursor) return undefined;
+    const parsed: unknown = JSON.parse(bytes.toString("utf8"));
     if (!Array.isArray(parsed) || parsed.length !== 3) return undefined;
     const [direction, createdAt, id] = parsed as unknown[];
     if (

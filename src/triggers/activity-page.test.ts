@@ -161,6 +161,18 @@ describe("trigger activity pages", () => {
     assert.ok(exact.activity.every(({ id }) => id !== ms.id));
   });
 
+  it("accepts only the exact text the encoder writes", async () => {
+    const { dashboard, request } = await dashboardWithRuns(TOTAL);
+    const first = await dashboard.activityPage(request, "acme", { limit: 3 });
+    const good = first.nextCursor!;
+    assert.ok(decodeActivityCursor(good));
+    for (const cursor of [`${good}!!`, `${good}=`, `${good}\n`, ` ${good}`, `${good}AA`, "123"]) {
+      assert.equal(decodeActivityCursor(cursor), undefined, JSON.stringify(cursor));
+    }
+    const page = await dashboard.activityPage(request, "acme", { limit: 3, cursor: `${good}!!` });
+    assert.equal(page.previousCursor, null);
+  });
+
   it("reads back the cursors it writes", () => {
     const key = { createdAt: "2026-01-01 00:00:00.123456+00", id: crypto.randomUUID() };
     assert.deepEqual(decodeActivityCursor(encodeActivityCursor("after", key)), {

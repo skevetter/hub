@@ -57,12 +57,7 @@ export function PageHeader({
     <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
       <div className="grid min-w-0 gap-1">
         <span className="flex items-center gap-2">
-          <h1
-            ref={heading}
-            id={id}
-            {...(focusOnMount ? { tabIndex: -1 } : {})}
-            className="text-xl font-title"
-          >
+          <h1 ref={heading} id={id} tabIndex={-1} className="text-xl font-title">
             {title}
           </h1>
           {status === undefined ? null : <StatusPill tone={status.tone}>{status.label}</StatusPill>}

@@ -6,19 +6,19 @@ import { FailureAlert } from "../components/app/failure-alert.js";
 import { PageHeader } from "../components/app/page.js";
 import { useRouteTenant } from "../projects/context.js";
 import { Pagination, type PaginationTarget } from "../components/app/pagination.js";
-import { ACTIVITY_PAGE_SIZE } from "./activity-cursor.js";
 import { activityPageKey, activityPageRequest } from "./activity-query.js";
 import { triggerActivityPage } from "./functions.js";
 import { ACTIVITY_COLUMNS, TriggerActivityTable } from "./activity-table.js";
 
 const route = getRouteApi("/_shell/o/$organizationSlug/activity/");
+const HEADING_ID = "activity-title";
 const LIVE_REFRESH_MS = 5_000;
 const ACTIVITY_DESCRIPTION = "Agent runs launched by organization triggers.";
 
 export function TriggerActivityPanel() {
   const tenant = useRouteTenant();
   const load = useServerFn(triggerActivityPage);
-  const { cursor, page } = route.useSearch();
+  const { cursor } = route.useSearch();
   const organizationSlug = tenant.organization.slug;
   const snapshot = useSnapshotQuery({
     queryKey: activityPageKey(organizationSlug, cursor),
@@ -29,7 +29,7 @@ export function TriggerActivityPanel() {
   if (snapshot.status === "pending") {
     return (
       <>
-        <PageHeader title="Activity" description={ACTIVITY_DESCRIPTION} />
+        <PageHeader id={HEADING_ID} title="Activity" description={ACTIVITY_DESCRIPTION} />
         <DataTableSkeleton label="Trigger activity" columns={ACTIVITY_COLUMNS} />
       </>
     );
@@ -45,16 +45,12 @@ export function TriggerActivityPanel() {
   }
   const { activity, nextCursor, previousCursor } = snapshot.data;
   // The route drops a cursor the server could not use, so a cursor here always has a page behind it.
-  const current = page ?? (previousCursor === null ? 1 : 2);
-  const first = (current - 1) * ACTIVITY_PAGE_SIZE + 1;
-  const newer =
-    previousCursor === null
-      ? null
-      : pageTarget(organizationSlug, Math.max(1, current - 1), previousCursor);
-  const older = nextCursor === null ? null : pageTarget(organizationSlug, current + 1, nextCursor);
+  const newer = previousCursor === null ? null : pageTarget(organizationSlug, previousCursor);
+  const older = nextCursor === null ? null : pageTarget(organizationSlug, nextCursor);
+  const count = `${activity.length} ${activity.length === 1 ? "run" : "runs"}`;
   return (
     <>
-      <PageHeader title="Activity" description={ACTIVITY_DESCRIPTION} />
+      <PageHeader id={HEADING_ID} title="Activity" description={ACTIVITY_DESCRIPTION} />
       {snapshot.refreshFailure === null ? null : (
         <FailureAlert
           title="Activity may be out of date"
@@ -69,7 +65,8 @@ export function TriggerActivityPanel() {
         <Pagination
           label="Activity pages"
           position={cursor ?? ""}
-          range={`${first} to ${first + activity.length - 1}`}
+          fallbackFocusId={HEADING_ID}
+          summary={previousCursor === null ? `Showing the newest ${count}` : `Showing ${count}`}
           newer={newer}
           older={older}
         />
@@ -79,10 +76,10 @@ export function TriggerActivityPanel() {
 }
 
 /** Newer follows the server's reverse cursor, so rows inserted since are not skipped. */
-function pageTarget(organizationSlug: string, page: number, cursor: string): PaginationTarget {
+function pageTarget(organizationSlug: string, cursor: string): PaginationTarget {
   return {
     to: "/o/$organizationSlug/activity",
     params: { organizationSlug },
-    search: { cursor, page },
+    search: { cursor },
   };
 }
