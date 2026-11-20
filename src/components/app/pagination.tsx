@@ -1,4 +1,5 @@
 import { Link } from "@tanstack/react-router";
+import { useEffect, useRef } from "react";
 import type { LinkProps } from "@tanstack/react-router";
 
 import { Button } from "../ui/button.js";
@@ -13,18 +14,29 @@ export type PaginationTarget = Pick<LinkProps, "to" | "search" | "params">;
  */
 export function Pagination({
   label,
+  position,
   range,
   newer,
   older,
 }: {
   label: string;
+  /** Changes whenever the reader moves. Focus follows if the control they used went away. */
+  position: string;
   /** The rows on screen, such as "26 to 50". */
   range: string;
   newer: PaginationTarget | null;
   older: PaginationTarget | null;
 }) {
+  const nav = useRef<HTMLElement>(null);
+  const moved = useRef(position);
+  useEffect(() => {
+    if (moved.current === position) return;
+    moved.current = position;
+    const active = document.activeElement;
+    if (active === null || active === document.body) nav.current?.querySelector("a")?.focus();
+  }, [position]);
   return (
-    <nav aria-label={label} className="flex items-center justify-between gap-3 pt-3">
+    <nav ref={nav} aria-label={label} className="flex items-center justify-between gap-3 pt-3">
       <span className="text-xs text-muted-foreground">{range}</span>
       <div className="flex gap-2">
         <PageLink target={newer}>Newer</PageLink>

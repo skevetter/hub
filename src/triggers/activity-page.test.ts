@@ -1,12 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
-import type { AuthServer } from "../auth/server.js";
-import { createMemoryDatabase } from "../db/memory.js";
-import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
-import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
+import { dashboardWithRuns } from "../test-utils/activity-dashboard.js";
 import { decodeActivityCursor, encodeActivityCursor } from "./activity-cursor.js";
-import { TriggerDashboard } from "./dashboard.js";
-import { OrganizationTriggerStore } from "./store.js";
 
 const TOTAL = 7;
 
@@ -89,6 +84,83 @@ describe("trigger activity pages", () => {
     assert.equal(page.previousCursor, null);
   });
 
+  it("refuses timestamps that are not real calendar times or offsets", () => {
+    const id = "00000000-0000-4000-8000-000000000000";
+    for (const createdAt of [
+      "2026-13-40T25:61:61Z",
+      "2026-02-30T00:00:00Z",
+      "2026-01-01T24:00:00Z",
+      "2026-01-01T00:00:00+25:00",
+      "2026-01-01T00:00:00+05:75",
+      "2026-01-01 00:00:00.1234567+00",
+    ]) {
+      assert.equal(
+        decodeActivityCursor(encodeActivityCursor("before", { createdAt, id })),
+        undefined,
+        createdAt,
+      );
+    }
+    assert.ok(
+      decodeActivityCursor(
+        encodeActivityCursor("before", { createdAt: "2024-02-29 23:59:59.999999-05:30", id }),
+      ),
+    );
+    assert.equal(decodeActivityCursor("a".repeat(513)), undefined);
+  });
+
+  it("serves the newest page for a cursor that is too long or has an impossible timestamp", async () => {
+    const { dashboard, request } = await dashboardWithRuns(TOTAL);
+    const newest = await dashboard.activityPage(request, "acme", { limit: 3 });
+    const cursors = [
+      "a".repeat(513),
+      encodeActivityCursor("before", {
+        createdAt: "2026-13-40T25:61:61Z",
+        id: newest.activity[0]!.id,
+      }),
+    ];
+    for (const cursor of cursors) {
+      const page = await dashboard.activityPage(request, "acme", { limit: 3, cursor });
+      assert.deepEqual(
+        page.activity.map(({ id }) => id),
+        newest.activity.map(({ id }) => id),
+      );
+    }
+  });
+
+  it("compares cursor ids without regard to case, as PostgreSQL does for uuid", async () => {
+    const { dashboard, request } = await dashboardWithRuns(TOTAL);
+    const first = await dashboard.activityPage(request, "acme", { limit: 3 });
+    const raw = decodeActivityCursor(first.nextCursor!)!;
+    const upper = encodeActivityCursor("before", { ...raw.key, id: raw.key.id.toUpperCase() });
+    const exact = await dashboard.activityPage(request, "acme", {
+      limit: 3,
+      cursor: first.nextCursor!,
+    });
+    const shouted = await dashboard.activityPage(request, "acme", { limit: 3, cursor: upper });
+    assert.deepEqual(
+      shouted.activity.map(({ id }) => id),
+      exact.activity.map(({ id }) => id),
+    );
+  });
+
+  it("orders a cursor against runs by microseconds, not milliseconds", async () => {
+    const { dashboard, request } = await dashboardWithRuns(TOTAL);
+    const first = await dashboard.activityPage(request, "acme", { limit: 1 });
+    const ms = decodeActivityCursor(first.nextCursor!)!.key;
+    const justAfter = { createdAt: ms.createdAt.replace("Z", "500Z"), id: ms.id };
+    // A key 500 microseconds after the run's millisecond is newer than that run.
+    const older = await dashboard.activityPage(request, "acme", {
+      limit: TOTAL,
+      cursor: encodeActivityCursor("before", justAfter),
+    });
+    assert.ok(older.activity.some(({ id }) => id === ms.id));
+    const exact = await dashboard.activityPage(request, "acme", {
+      limit: TOTAL,
+      cursor: encodeActivityCursor("before", ms),
+    });
+    assert.ok(exact.activity.every(({ id }) => id !== ms.id));
+  });
+
   it("reads back the cursors it writes", () => {
     const key = { createdAt: "2026-01-01 00:00:00.123456+00", id: crypto.randomUUID() };
     assert.deepEqual(decodeActivityCursor(encodeActivityCursor("after", key)), {
@@ -98,81 +170,3 @@ describe("trigger activity pages", () => {
     assert.equal(decodeActivityCursor(undefined), undefined);
   });
 });
-
-async function dashboardWithRuns(count: number) {
-  const database = createMemoryDatabase({
-    memberships: [
-      {
-        userId: "user-1",
-        organizationId: "org-1",
-        organizationName: "Acme",
-        organizationSlug: "acme",
-        membershipId: "membership-1",
-        role: "owner",
-      },
-    ],
-  });
-  await enrollTestDaemon(database, "org-1");
-  const trigger = await new OrganizationTriggerStore(
-    database,
-    "org-1",
-    acceptingAgentValidator(),
-  ).save({ yaml: triggerYaml, userId: "user-1" });
-  const revision = await database.findActiveProjectConfiguration(trigger.runtimeProjectId);
-  assert.ok(revision);
-  for (let index = 0; index < count; index += 1) {
-    const receipt = await database.persistManualEvent({
-      organizationId: "org-1",
-      projectId: trigger.runtimeProjectId,
-      deliveryId: `activity-page-${index}`,
-      source: "manual.run",
-      payload: {},
-      receivedAt: new Date(),
-    });
-    assert.equal(receipt.status, "accepted");
-    if (receipt.status !== "accepted") throw new Error("receipt was not accepted");
-    await database.createAcceptedTriggerRun({
-      organizationId: "org-1",
-      projectId: trigger.runtimeProjectId,
-      configurationRevisionId: revision.id,
-      providerEventReceiptId: receipt.event.providerEventReceiptId,
-      configuredTriggerName: "manual-task",
-      prompt: "run it",
-      inputs: {},
-      triggerContext: {},
-      outputContext: {},
-      deadlineAt: new Date(Date.now() + 3_600_000),
-      stepIds: ["run"],
-    });
-  }
-  return {
-    dashboard: new TriggerDashboard(database, accountAuth(), acceptingAgentValidator()),
-    request: new Request("https://hub.test/o/acme/activity"),
-  };
-}
-
-const triggerYaml = `name: manual-task
-enabled: true
-on:
-  manual.run: {}
-run:
-  target: { daemon: ${TEST_DAEMON_SLUG}, cwd: /workspace }
-  agent: { provider: codex, mode: full-access }
-  prompt: Handle it
-`;
-
-function accountAuth(): AuthServer {
-  return {
-    handle: () => Promise.resolve(new Response()),
-    resources: () => Promise.reject(new Error("unused")),
-    resolveOrganizationAccess: () => Promise.reject(new Error("unused")),
-    resolveAccount: () =>
-      Promise.resolve({
-        session: { id: "session-1", activeOrganizationId: "org-1" },
-        account: { id: "user-1", name: "User", email: "user@example.test" },
-        isInstanceOperator: false,
-      }),
-    rejectCookieMutation: () => undefined,
-    close: () => Promise.resolve(),
-  };
-}

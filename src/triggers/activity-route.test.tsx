@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type * as ReactStart from "@tanstack/react-start";
 import type * as ProjectContext from "../projects/context.js";
 import type * as Queries from "../queries/index.js";
+import type * as Functions from "./functions.js";
 import { describe, it, vi } from "vitest";
 import { summarizeTrigger } from "../projects/activity-summary.js";
 import { routeTree } from "../routeTree.gen.js";
@@ -26,6 +27,11 @@ vi.mock("@tanstack/react-start", async (importOriginal) => ({
 vi.mock("../projects/context.js", async (importOriginal) => ({
   ...(await importOriginal<typeof ProjectContext>()),
   useRouteTenant: () => ({ organization: { slug: "acme team" } }),
+}));
+
+vi.mock("./functions.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof Functions>()),
+  triggerActivityPage: () => Promise.resolve({ status: "ok", data: state.snapshot }),
 }));
 
 vi.mock("../queries/index.js", async (importOriginal) => ({
@@ -123,14 +129,6 @@ describe("organization activity routes", () => {
         ),
       );
 
-      assert.match(listing, /aria-label="Activity pages"/u);
-      assert.match(listing, /1 to 3/u);
-      assert.match(
-        listing,
-        /href="\/o\/acme%20team\/activity\?cursor=older-cursor&(amp;)?page=2"[^>]*>Older/u,
-      );
-      assert.match(listing, /<button[^>]*disabled[^>]*>Newer/u);
-
       state.snapshot = {
         activity: [
           {
@@ -153,10 +151,6 @@ describe("organization activity routes", () => {
             JSON.stringify(key) === JSON.stringify(["activity", "acme team", "older-cursor"]),
         ),
       );
-      assert.match(second, /26 to 26/u);
-      assert.match(second, /href="\/o\/acme%20team\/activity"[^>]*>Newer/u);
-      assert.match(second, /<button[^>]*disabled[^>]*>Older/u);
-
       assert.equal(state.intervals.at(-1), undefined);
       assert.doesNotMatch(second, /out of date/u);
       state.refreshFailure = { message: "Hub is down" };

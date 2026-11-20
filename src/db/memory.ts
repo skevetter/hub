@@ -155,6 +155,7 @@ import {
   entitlementOverridesSchema,
   mergeOverrides,
 } from "../entitlements/catalog.js";
+import { activityTimestampMicros, compareRunsNewestFirst } from "./activity-key.js";
 import { toProviderEventReceiptRecordSummary } from "./mappers.js";
 import {
   isProviderEventDropReasonCode,
@@ -3662,12 +3663,14 @@ class MemoryDatabase implements Database {
           ),
       )
       .flatMap((run) => this.activityListRecord(run) ?? [])
-      .sort((left, right) => newestFirst(left.run, right.run));
+      .sort((left, right) => compareRunsNewestFirst(runOrder(left.run), runOrder(right.run)));
     const bound = request.position;
+    const boundMicros =
+      bound === undefined ? undefined : activityTimestampMicros(bound.key.createdAt);
     const inRange = records.filter(({ run }) => {
-      if (bound === undefined) return true;
-      const order = newestFirst(run, {
-        createdAt: new Date(bound.key.createdAt),
+      if (bound === undefined || boundMicros === undefined) return true;
+      const order = compareRunsNewestFirst(runOrder(run), {
+        micros: boundMicros,
         id: bound.key.id,
       });
       return bound.direction === "before" ? order > 0 : order < 0;
@@ -3685,11 +3688,13 @@ class MemoryDatabase implements Database {
     return {
       records: page,
       older:
-        last !== undefined && records.some(({ run }) => newestFirst(run, last) > 0)
+        last !== undefined &&
+        records.some(({ run }) => compareRunsNewestFirst(runOrder(run), runOrder(last)) > 0)
           ? key(last)
           : null,
       newer:
-        first !== undefined && records.some(({ run }) => newestFirst(run, first) < 0)
+        first !== undefined &&
+        records.some(({ run }) => compareRunsNewestFirst(runOrder(run), runOrder(first)) < 0)
           ? key(first)
           : null,
     };
@@ -5664,9 +5669,6 @@ function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
   );
 }
 
-function newestFirst(
-  left: { createdAt: Date; id: string },
-  right: { createdAt: Date; id: string },
-): number {
-  return right.createdAt.getTime() - left.createdAt.getTime() || right.id.localeCompare(left.id);
+function runOrder(run: { createdAt: Date; id: string }) {
+  return { micros: BigInt(run.createdAt.getTime()) * 1000n, id: run.id };
 }

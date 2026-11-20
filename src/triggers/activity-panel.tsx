@@ -7,6 +7,7 @@ import { PageHeader } from "../components/app/page.js";
 import { useRouteTenant } from "../projects/context.js";
 import { Pagination, type PaginationTarget } from "../components/app/pagination.js";
 import { ACTIVITY_PAGE_SIZE } from "./activity-cursor.js";
+import { activityPageKey, activityPageRequest } from "./activity-query.js";
 import { triggerActivityPage } from "./functions.js";
 import { ACTIVITY_COLUMNS, TriggerActivityTable } from "./activity-table.js";
 
@@ -20,15 +21,8 @@ export function TriggerActivityPanel() {
   const { cursor, page } = route.useSearch();
   const organizationSlug = tenant.organization.slug;
   const snapshot = useSnapshotQuery({
-    queryKey: ["activity", organizationSlug, cursor ?? null],
-    queryFn: () =>
-      load({
-        data: {
-          organizationSlug,
-          limit: ACTIVITY_PAGE_SIZE,
-          ...(cursor === undefined ? {} : { cursor }),
-        },
-      }),
+    queryKey: activityPageKey(organizationSlug, cursor),
+    queryFn: () => load({ data: activityPageRequest(organizationSlug, cursor) }),
     // Only the newest page is live. An older page does not move, and a hidden tab is not polled.
     ...(cursor === undefined ? { refetchInterval: LIVE_REFRESH_MS } : {}),
   });
@@ -50,11 +44,13 @@ export function TriggerActivityPanel() {
     );
   }
   const { activity, nextCursor, previousCursor } = snapshot.data;
-  // The server falls back to the newest page when a cursor is stale, so the label follows it.
-  const current = previousCursor === null ? 1 : (page ?? 2);
+  // The route drops a cursor the server could not use, so a cursor here always has a page behind it.
+  const current = page ?? (previousCursor === null ? 1 : 2);
   const first = (current - 1) * ACTIVITY_PAGE_SIZE + 1;
   const newer =
-    previousCursor === null ? null : pageTarget(organizationSlug, current - 1, previousCursor);
+    previousCursor === null
+      ? null
+      : pageTarget(organizationSlug, Math.max(1, current - 1), previousCursor);
   const older = nextCursor === null ? null : pageTarget(organizationSlug, current + 1, nextCursor);
   return (
     <>
@@ -72,6 +68,7 @@ export function TriggerActivityPanel() {
       {activity.length === 0 ? null : (
         <Pagination
           label="Activity pages"
+          position={cursor ?? ""}
           range={`${first} to ${first + activity.length - 1}`}
           newer={newer}
           older={older}
@@ -81,11 +78,11 @@ export function TriggerActivityPanel() {
   );
 }
 
-/** The first page is the bare address, so Newer back to it leaves no cursor behind. */
+/** Newer follows the server's reverse cursor, so rows inserted since are not skipped. */
 function pageTarget(organizationSlug: string, page: number, cursor: string): PaginationTarget {
   return {
     to: "/o/$organizationSlug/activity",
     params: { organizationSlug },
-    search: page > 1 ? { cursor, page } : {},
+    search: { cursor, page },
   };
 }

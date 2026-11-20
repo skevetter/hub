@@ -94,6 +94,75 @@ describe("organization activity pages on PostgreSQL", () => {
     assert.notEqual(ids(next)[0], ids(page)[0]);
   });
 
+  it("treats an uppercase uuid in a cursor as the same run", async () => {
+    const newest = await harness.database.listOrganizationActivityPage(organizationId, scopes(), {
+      limit: 4,
+    });
+    const key = newest.older!;
+    const read = (id: string) =>
+      harness.database.listOrganizationActivityPage(organizationId, scopes(), {
+        limit: 4,
+        position: { direction: "before", key: { ...key, id } },
+      });
+    assert.deepEqual(ids(await read(key.id.toUpperCase())), ids(await read(key.id)));
+  });
+
+  it("separates runs a hundred microseconds apart whatever their uuid order", async () => {
+    const { rows } = await harness.runtime.query<{ id: string }>(
+      "select id from trigger_runs order by id limit 2",
+    );
+    const [low, high] = [rows[0]!.id, rows[1]!.id];
+    // The higher uuid is the older run, the reverse of how a tie would break.
+    await harness.runtime.query(
+      `update trigger_runs set created_at = case id when $1 then timestamptz '2027-01-01 00:00:00.000100+00'
+                                                   else timestamptz '2027-01-01 00:00:00.000000+00' end
+       where id in ($1, $2)`,
+      [low, high],
+    );
+    const walked: string[] = [];
+    let position: { direction: "before"; key: ActivityRunKey } | undefined;
+    for (;;) {
+      const page = await harness.database.listOrganizationActivityPage(organizationId, scopes(), {
+        limit: 1,
+        ...(position === undefined ? {} : { position }),
+      });
+      walked.push(...ids(page));
+      if (page.older === null) break;
+      position = { direction: "before", key: page.older };
+    }
+    assert.deepEqual(walked.slice(0, 2), [low, high]);
+    assert.equal(new Set(walked).size, walked.length);
+    const { rows: all } = await harness.runtime.query<{ id: string }>(
+      "select id from trigger_runs order by created_at desc, id desc",
+    );
+    assert.deepEqual(
+      walked,
+      all.map(({ id }) => id),
+    );
+  });
+
+  it("reads Newer from the cursor, so runs inserted since are not skipped", async () => {
+    const newest = await harness.database.listOrganizationActivityPage(organizationId, scopes(), {
+      limit: 3,
+    });
+    const second = await harness.database.listOrganizationActivityPage(organizationId, scopes(), {
+      limit: 3,
+      position: { direction: "before", key: newest.older! },
+    });
+    for (const run of [await harness.createRun(), await harness.createRun()]) {
+      await harness.runtime.query(
+        "update trigger_runs set created_at = timestamptz '2030-01-01 00:00:00+00' where id = $1",
+        [run.id],
+      );
+    }
+    const back = await harness.database.listOrganizationActivityPage(organizationId, scopes(), {
+      limit: 3,
+      position: { direction: "after", key: second.newer! },
+    });
+    assert.deepEqual(ids(back), ids(newest));
+    assert.notEqual(back.newer, null);
+  });
+
   it("returns nothing for another organization, an unknown project or a named trigger without runs", async () => {
     for (const [org, narrowed] of [
       ["someone-else", scopes()],

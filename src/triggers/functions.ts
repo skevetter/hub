@@ -62,7 +62,7 @@ export const triggerSnapshot = createServerFn({ method: "GET" })
 
 const activityPageSchema = scopeSchema.extend({
   limit: z.number().int().min(1).max(ACTIVITY_PAGE_SIZE_MAX).optional(),
-  cursor: z.string().max(512).optional(),
+  cursor: z.string().optional(),
 });
 
 export const triggerActivityPage = createServerFn({ method: "GET" })
