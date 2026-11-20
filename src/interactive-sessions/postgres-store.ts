@@ -30,12 +30,15 @@ import { capabilities } from "./access.js";
 import {
   advanceForCommand,
   claimPatch,
+  canRetryMessage,
+  exhaustedControlState,
+  finalDeliveryCode,
+  retryMessagePatch,
   commandCapability,
   commandHash,
   commandLeaseEligible,
   commandRefusal,
   deliveryEvent,
-  maxDeliveryAttempts,
   messageEvent,
   messageRecord,
   newCommand,
@@ -309,6 +312,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       const allowed = rights?.[commandCapability[input.kind]];
       if (!rights?.view && !allowed) return refused("not_found");
       if (!allowed) return refused("forbidden");
+      if (input.kind === "retry") return this.rearmMessage(db, session, input);
       const hash = commandHash(input);
       const [prior] = await db
         .select()
@@ -325,22 +329,13 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
           ? { status: "replayed", session, command: replayCommand(prior, input.bodyCutoff) }
           : refused("idempotency_conflict");
       }
+      if (input.kind !== "close" && !(await this.activeSessionDaemon(db, session)))
+        return refused("daemon_unavailable");
       const refusal = commandRefusal(session, input);
       if (refusal) return refused(refusal);
       if (input.kind === "message") {
-        const [queued] = await db
-          .select({ count: count() })
-          .from(commands)
-          .where(
-            and(
-              commandScope(session),
-              eq(commands.generation, session.generation),
-              eq(commands.kind, "message"),
-              inArray(commands.status, unsettledStatuses),
-              sql`${commands.failureCode} is distinct from 'delivery_unconfirmed'`,
-            ),
-          );
-        if (queued!.count >= input.maxQueued) return refused("queue_full");
+        if ((await this.queuedMessageCount(db, session)) >= input.maxQueued)
+          return refused("queue_full");
         if (!(await this.reserveUsage(tx, sessionUsage(input.principal, input.usage))))
           return refused("usage_limit");
       }
@@ -481,6 +476,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       const db = tx.drizzle();
       const session = await this.lockSession(db, input.organizationId, input.sessionId);
       if (!session || session.state === "failed") return undefined;
+      if (!(await this.activeSessionDaemon(db, session))) return undefined;
       const candidates = await db
         .select()
         .from(commands)
@@ -498,6 +494,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         .for("update");
       const leaseNow = await leaseTime(tx);
       const drafts: SessionEventDraft[] = [];
+      let nextSession = session;
       let claimed: SessionCommandRecord | undefined;
       if (
         !candidates.some(
@@ -517,9 +514,15 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
             claimed = updated;
             break;
           }
+          nextSession = exhaustedControlState(session, updated);
+          if (nextSession !== session) {
+            drafts.push(stateEvent(nextSession, "stop_unconfirmed"));
+
+            break;
+          }
         }
       }
-      if (drafts.length > 0) await this.append(db, session, input.now, drafts);
+      if (drafts.length > 0) await this.append(db, nextSession, input.now, drafts);
       return claimed;
     });
   }
@@ -544,16 +547,20 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         )
         .for("update");
       if (!command?.claimExpiresAt || command.claimExpiresAt <= (await leaseTime(tx))) return false;
-      const failureCode =
-        input.status === "unknown" && command.attempts >= maxDeliveryAttempts
-          ? "delivery_unconfirmed"
-          : input.failureCode;
       const updated = await this.updateCommand(
         db,
         command,
-        settlePatch(input.status, input.now, failureCode),
+        settlePatch(input.status, input.now, finalDeliveryCode(command, input)),
       );
-      await this.append(db, session, input.now, [deliveryEvent(updated)]);
+      const next =
+        input.status === "unknown" || input.status === "failed"
+          ? exhaustedControlState(session, updated)
+          : session;
+      const drafts = [deliveryEvent(updated)];
+      if (next !== session) {
+        drafts.push(stateEvent(next, "stop_unconfirmed"));
+      }
+      await this.append(db, next, input.now, drafts);
       return true;
     });
   }
@@ -833,6 +840,64 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       })),
     );
     return stored!;
+  }
+
+  private async rearmMessage(
+    db: DrizzleHandle,
+    session: SessionRecord,
+    input: Extract<AcceptCommandInput, { kind: "retry" }>,
+  ): Promise<AcceptCommandResult> {
+    if (!(await this.activeSessionDaemon(db, session))) return refused("daemon_unavailable");
+    const refusal = commandRefusal(session, input);
+    if (refusal) return refused(refusal);
+    const userId = input.principal.userId;
+    const [original] = await db
+      .select()
+      .from(commands)
+      .where(
+        and(
+          commandScope(session),
+          eq(commands.id, input.commandId),
+          eq(commands.authorUserId, userId),
+          eq(commands.generation, session.generation),
+          eq(commands.kind, "message"),
+        ),
+      )
+      .for("update");
+    if (!original || !canRetryMessage(original, input.bodyCutoff)) return refused("not_retryable");
+    if ((await this.queuedMessageCount(db, session)) >= input.maxQueued)
+      return refused("queue_full");
+    const command = await this.updateCommand(db, original, retryMessagePatch(original, input.now));
+    const stored = await this.append(db, session, input.now, [deliveryEvent(command)]);
+    await this.audit(db, session, userId, "retry", { commandId: command.id }, input.now);
+    return { status: "accepted", session: stored, command };
+  }
+
+  private async queuedMessageCount(db: DrizzleHandle, session: SessionRecord): Promise<number> {
+    const [queued] = await db
+      .select({ count: count() })
+      .from(commands)
+      .where(
+        and(
+          commandScope(session),
+          eq(commands.generation, session.generation),
+          eq(commands.kind, "message"),
+          inArray(commands.status, unsettledStatuses),
+          sql`${commands.failureCode} is distinct from 'delivery_unconfirmed'`,
+        ),
+      );
+    return queued!.count;
+  }
+
+  private async activeSessionDaemon(db: DrizzleHandle, session: SessionRecord): Promise<boolean> {
+    const [daemon] = await db
+      .select({ status: daemons.status, permissions: daemons.permissions })
+      .from(daemons)
+      .where(
+        and(eq(daemons.id, session.daemonId), eq(daemons.organizationId, session.organizationId)),
+      )
+      .for("share");
+    return daemon?.status === "active" && daemon.permissions.includes("hub.execute");
   }
 
   private async audit(

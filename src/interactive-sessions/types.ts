@@ -46,6 +46,8 @@ export type RefusalCode =
   | "stale_generation"
   | "session_closed"
   | "session_failed"
+  | "session_stopping"
+  | "not_retryable"
   | "waiting_permission"
   | "not_stoppable"
   | "usage_limit"
@@ -162,6 +164,7 @@ export interface SessionMessageRecord {
   failureCode: CommandFailureCode | null;
   body: string | null;
   expired: boolean;
+  retryable: boolean;
   createdAt: Date;
 }
 
@@ -177,7 +180,7 @@ type SessionEvent =
       commandId: null;
       data: {
         state: SessionState;
-        stateReason: SessionStateReason | null;
+        stateReason: SessionStateReason | "stop_unconfirmed" | null;
         generation: number;
         turn: number;
       };

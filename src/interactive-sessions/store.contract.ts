@@ -522,11 +522,10 @@ export function interactiveSessionStoreContract(
         now,
       });
       assert.equal(stop.status, "accepted");
-      const afterLease = new Date(now.getTime() + 60_001);
+      await fixture.expireLease(claim);
       assert.equal(
         await database.claimInteractiveSessionCommand({
           ...claimInput,
-          now: afterLease,
           owner: "another-worker",
         }),
         undefined,
@@ -539,6 +538,176 @@ export function interactiveSessionStoreContract(
       );
       assert.equal(message?.status, "unknown");
       assert.equal(message.failureCode, "delivery_unconfirmed");
+    });
+
+    async function storeRunning() {
+      const { session } = await started();
+      const scope = { organizationId: session.organizationId, sessionId: session.id };
+      const observation = { ...scope, generation: 1, agentId: null, now };
+      assert.ok(
+        await database.applyInteractiveSessionState({
+          ...observation,
+          turn: 0,
+          from: ["starting"],
+          to: "running",
+        }),
+      );
+      const claim = {
+        ...scope,
+        lane: "message" as const,
+        owner: "worker",
+        leaseMs: 60_000,
+        agentIdle: false,
+        bodyCutoff: null,
+        now,
+      };
+      const stop = { ...command(session.id), kind: "stop" as const };
+      return { scope, observation, claim, stop };
+    }
+
+    it("refuses new steer and queue messages while stopping without reserving usage", async () => {
+      const { scope, stop } = await storeRunning();
+      assert.equal((await database.acceptInteractiveSessionCommand(stop)).status, "accepted");
+      for (const delivery of ["steer", "queue"] as const) {
+        assert.deepEqual(
+          await database.acceptInteractiveSessionCommand({
+            ...command(scope.sessionId),
+            delivery,
+          }),
+          { status: "refused", code: "session_stopping" },
+        );
+      }
+      assert.equal((await usage())?.used, 1);
+    });
+
+    it("refuses new messages and claims after revocation without charging again or invalidating replays", async () => {
+      const { scope, claim } = await storeRunning();
+      const request = command(scope.sessionId);
+      const accepted = await database.acceptInteractiveSessionCommand(request);
+      assert.equal(accepted.status, "accepted");
+      await database.revokeDaemon(daemonId);
+      assert.deepEqual(await database.acceptInteractiveSessionCommand(command(scope.sessionId)), {
+        status: "refused",
+        code: "daemon_unavailable",
+      });
+      const replay = await database.acceptInteractiveSessionCommand(request);
+      assert.equal(replay.status, "replayed");
+      assert.equal(replay.command.id, accepted.command.id);
+      assert.equal(await database.claimInteractiveSessionCommand(claim), undefined);
+      assert.equal((await usage())?.used, 2);
+    });
+
+    it("settles a definitive acknowledgement under the original claim after Stop", async () => {
+      const { claim, scope, stop } = await storeRunning();
+      const held = await database.claimInteractiveSessionCommand(claim);
+      assert.ok(held);
+      assert.equal((await database.acceptInteractiveSessionCommand(stop)).status, "accepted");
+      assert.ok(
+        await database.settleInteractiveSessionCommand({
+          ...scope,
+          commandId: held.id,
+          claimOwner: claim.owner,
+          generation: held.generation,
+          attempts: held.attempts,
+          status: "delivered",
+          now,
+        }),
+      );
+    });
+
+    it("retries a stopped send by its stored ID and exact body without a new charge", async () => {
+      const { claim, scope, stop, observation } = await storeRunning();
+      const held = await database.claimInteractiveSessionCommand(claim);
+      assert.ok(held);
+      assert.equal((await database.acceptInteractiveSessionCommand(stop)).status, "accepted");
+      await database.settleInteractiveSessionCommand({
+        ...scope,
+        commandId: held.id,
+        claimOwner: claim.owner,
+        generation: held.generation,
+        attempts: held.attempts,
+        status: "unknown",
+        now,
+      });
+      assert.ok(
+        await database.applyInteractiveSessionState({
+          ...observation,
+          turn: 1,
+          from: ["stopping"],
+          to: "idle",
+          reason: "stopped_by_person",
+        }),
+      );
+      assert.equal(await database.claimInteractiveSessionCommand(claim), undefined);
+      const retry = { ...command(scope.sessionId), kind: "retry" as const, commandId: held.id };
+      const result = await database.acceptInteractiveSessionCommand(retry);
+      assert.equal(result.status, "accepted");
+      assert.equal(result.command.id, held.id);
+      assert.equal(result.command.body, held.body);
+      const retried = await database.claimInteractiveSessionCommand(claim);
+      assert.equal(retried?.id, held.id);
+      assert.equal(retried.attempts, held.attempts + 1);
+      assert.equal((await usage())?.used, 1);
+    });
+
+    it("blocks pending steer claims during permission waits under the session lock", async () => {
+      const { claim, observation } = await storeRunning();
+      assert.ok(
+        await database.applyInteractiveSessionState({
+          ...observation,
+          turn: 1,
+          from: ["running"],
+          to: "waiting_permission",
+        }),
+      );
+      assert.equal(
+        await database.claimInteractiveSessionCommand({ ...claim, agentIdle: true }),
+        undefined,
+      );
+      assert.ok(
+        await database.applyInteractiveSessionState({
+          ...observation,
+          turn: 1,
+          from: ["waiting_permission"],
+          to: "running",
+        }),
+      );
+      assert.ok(await database.claimInteractiveSessionCommand(claim));
+    });
+
+    it("records an unconfirmed Stop in a state event and allows a second Stop", async () => {
+      const { scope, claim, stop } = await storeRunning();
+      assert.equal((await database.acceptInteractiveSessionCommand(stop)).status, "accepted");
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        const held = await database.claimInteractiveSessionCommand({ ...claim, lane: "control" });
+        assert.ok(held);
+        assert.equal(held.attempts, attempt);
+        assert.ok(
+          await database.settleInteractiveSessionCommand({
+            ...scope,
+            commandId: held.id,
+            claimOwner: claim.owner,
+            generation: held.generation,
+            attempts: held.attempts,
+            status: "unknown",
+            now,
+          }),
+        );
+      }
+      const events = await database.listInteractiveSessionEvents(
+        scope.organizationId,
+        scope.sessionId,
+        0,
+        100,
+      );
+      const latest = events.findLast((event) => event.kind === "state");
+      assert.equal(latest?.data.state, "running");
+      assert.equal(latest.data.stateReason, "stop_unconfirmed");
+      assert.equal(
+        (await database.acceptInteractiveSessionCommand({ ...stop, idempotencyKey: randomUUID() }))
+          .status,
+        "accepted",
+      );
     });
 
     async function startAsMember() {

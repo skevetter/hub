@@ -89,6 +89,7 @@ export type AcceptCommandInput = {
       maxQueued: number;
       usage: UsageReservation;
     }
+  | { kind: "retry"; commandId: string; maxQueued: number }
   | { kind: Exclude<CommandKind, "message"> }
 );
 
@@ -469,7 +470,10 @@ export function commandRefusal(
       ? undefined
       : "not_stoppable";
   }
-  if (input.kind === "message") {
+  if (input.kind === "message" || input.kind === "retry") {
+    if (session.state === "stopping") return "session_stopping";
+    if (input.kind === "retry")
+      return session.state === "waiting_permission" ? "waiting_permission" : undefined;
     if (session.state === "waiting_permission" && input.delivery === "steer")
       return "waiting_permission";
     if (!validMessage(input.message)) return "message_too_long";
@@ -544,12 +548,15 @@ export function interruptCommand(
   if (command.status === "pending" || command.status === "queued")
     return settlePatch("superseded", now);
   if (command.failureCode === "delivery_unconfirmed") return undefined;
-  // Interrupting a claimed send may leave the daemon's outcome unknown.
+  // The original lease can still receive a definitive acknowledgement, but cannot auto-resend.
+  if (kind === "stop" && command.status === "dispatching")
+    return { failureCode: "delivery_unconfirmed", updatedAt: now };
   return settlePatch("unknown", now, "delivery_unconfirmed");
 }
 
 export const commandCapability = {
   message: "send",
+  retry: "send",
   stop: "stop",
   close: "close",
   replace: "replaceAgent",
@@ -572,6 +579,12 @@ export function commandLeaseEligible(
   sessionState: SessionState,
   leaseNow: Date,
 ): boolean {
+  if (
+    command.kind === "message" &&
+    (sessionState === "waiting_permission" || sessionState === "stopping") &&
+    !(command.status === "dispatching" && command.failureCode === "delivery_unconfirmed")
+  )
+    return false;
   return (
     (command.claimExpiresAt === null || command.claimExpiresAt <= leaseNow) &&
     (command.status === "pending" ||
@@ -587,7 +600,11 @@ export function claimPatch(
   rights: ReturnType<typeof capabilities> | undefined,
   leaseNow: Date,
 ): Partial<SessionCommandRecord> {
-  if (!canDispatchCommand(command, input, rights) || command.attempts >= maxDeliveryAttempts) {
+  if (
+    command.failureCode === "delivery_unconfirmed" ||
+    !canDispatchCommand(command, input, rights) ||
+    command.attempts >= maxDeliveryAttempts
+  ) {
     if (command.status === "unknown" || command.status === "dispatching") {
       return settlePatch("unknown", input.now, "delivery_unconfirmed");
     }
@@ -602,6 +619,56 @@ export function claimPatch(
     dispatchedAt: input.now,
     settledAt: null,
     updatedAt: input.now,
+  };
+}
+
+export function finalDeliveryCode(
+  command: SessionCommandRecord,
+  input: SettleCommandInput,
+): CommandFailureCode | undefined {
+  if (
+    input.status === "unknown" &&
+    (command.attempts >= maxDeliveryAttempts || command.failureCode === "delivery_unconfirmed")
+  )
+    return "delivery_unconfirmed";
+  return input.failureCode;
+}
+
+export function exhaustedControlState(
+  session: SessionRecord,
+  command: SessionCommandRecord,
+): SessionRecord {
+  if (
+    command.kind === "stop" &&
+    session.state === "stopping" &&
+    (command.attempts >= maxDeliveryAttempts ||
+      command.status === "superseded" ||
+      command.failureCode === "delivery_unconfirmed")
+  )
+    return { ...session, state: "running", stateReason: null };
+  return session;
+}
+
+export function canRetryMessage(command: SessionCommandRecord, cutoff: Date | null): boolean {
+  return (
+    command.kind === "message" &&
+    command.status === "unknown" &&
+    command.failureCode === "delivery_unconfirmed" &&
+    command.attempts < maxDeliveryAttempts &&
+    command.body !== null &&
+    bodyVisible(command, cutoff)
+  );
+}
+
+export function retryMessagePatch(
+  command: SessionCommandRecord,
+  now: Date,
+): Partial<SessionCommandRecord> {
+  return {
+    status: command.delivery === "queue" ? "queued" : "pending",
+    updatedAt: now,
+    failureCode: null,
+    settledAt: null,
   };
 }
 
@@ -627,13 +694,16 @@ type EventDraft = SessionEventRecord extends infer Event
   : never;
 export type SessionEventDraft = EventDraft;
 
-export function stateEvent(session: SessionRecord): SessionEventDraft {
+export function stateEvent(
+  session: SessionRecord,
+  reason: SessionStateReason | "stop_unconfirmed" | null = session.stateReason,
+): SessionEventDraft {
   return {
     kind: "state",
     commandId: null,
     data: {
       state: session.state,
-      stateReason: session.stateReason,
+      stateReason: reason,
       generation: session.generation,
       turn: session.turn,
     },
@@ -699,6 +769,7 @@ export function messageRecord(
     failureCode: command.failureCode,
     body: expired ? null : command.body,
     expired,
+    retryable: canRetryMessage(command, cutoff),
     createdAt: command.createdAt,
   };
 }

@@ -1,14 +1,18 @@
 import { isCanceledExecution, type StopCleanupState } from "../triggers/run-stop.js";
+import type { AcceptCommandInput, AcceptCommandResult } from "../interactive-sessions/store.js";
 import { capabilities } from "../interactive-sessions/access.js";
 import {
   advanceForCommand,
   claimPatch,
+  canRetryMessage,
+  exhaustedControlState,
+  finalDeliveryCode,
+  retryMessagePatch,
   commandCapability,
   commandHash,
   commandLeaseEligible,
   commandRefusal,
   deliveryEvent,
-  maxDeliveryAttempts,
   messageEvent,
   messageRecord,
   newCommand,
@@ -450,6 +454,7 @@ class MemoryDatabase implements Database {
       if (!rights?.view && !allowed) return refused("not_found");
       if (!allowed) return refused("forbidden");
       const commands = this.interactiveCommands.get(session.id)!;
+      if (input.kind === "retry") return this.rearmSessionMessage(row, input);
       const hash = commandHash(input);
       const prior = commands.find(
         (command) =>
@@ -464,17 +469,12 @@ class MemoryDatabase implements Database {
             }
           : refused("idempotency_conflict");
       }
+      if (input.kind !== "close" && !this.activeSessionDaemon(session))
+        return refused("daemon_unavailable");
       const refusal = commandRefusal(session, input);
       if (refusal) return refused(refusal);
       if (input.kind === "message") {
-        const queued = commands.filter(
-          (command) =>
-            command.generation === session.generation &&
-            command.kind === "message" &&
-            command.failureCode !== "delivery_unconfirmed" &&
-            unsettledStatuses.some((status) => status === command.status),
-        );
-        if (queued.length >= input.maxQueued) return refused("queue_full");
+        if (this.queuedMessageCount(session) >= input.maxQueued) return refused("queue_full");
         if (!(await this.consumeOrganizationUsage(sessionUsage(input.principal, input.usage))))
           return refused("usage_limit");
       }
@@ -575,6 +575,7 @@ class MemoryDatabase implements Database {
       const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
       if (!row || row.session.state === "failed") return undefined;
       const { session } = row;
+      if (!this.activeSessionDaemon(session)) return undefined;
       const leaseNow = this.now();
       const drafts: SessionEventDraft[] = [];
       const candidates = this.interactiveCommands
@@ -595,6 +596,7 @@ class MemoryDatabase implements Database {
         )
       )
         return undefined;
+      let nextSession = session;
       let claimed: SessionCommandRecord | undefined;
       for (const command of candidates) {
         if (!commandLeaseEligible(command, input, session.state, leaseNow)) continue;
@@ -606,8 +608,14 @@ class MemoryDatabase implements Database {
           claimed = command;
           break;
         }
+        nextSession = exhaustedControlState(session, command);
+        if (nextSession !== session) {
+          drafts.push(stateEvent(nextSession, "stop_unconfirmed"));
+
+          break;
+        }
       }
-      if (drafts.length > 0) this.appendSessionEvents(row, session, input.now, drafts);
+      if (drafts.length > 0) this.appendSessionEvents(row, nextSession, input.now, drafts);
       return structuredClone(claimed);
     });
 
@@ -629,12 +637,19 @@ class MemoryDatabase implements Database {
             entry.claimExpiresAt > leaseNow,
         );
       if (!command) return false;
-      const failureCode =
-        input.status === "unknown" && command.attempts >= maxDeliveryAttempts
-          ? "delivery_unconfirmed"
-          : input.failureCode;
-      Object.assign(command, structuredClone(settlePatch(input.status, input.now, failureCode)));
-      this.appendSessionEvents(row, row.session, input.now, [deliveryEvent(command)]);
+      Object.assign(
+        command,
+        settlePatch(input.status, input.now, finalDeliveryCode(command, input)),
+      );
+      const next =
+        input.status === "unknown" || input.status === "failed"
+          ? exhaustedControlState(row.session, command)
+          : row.session;
+      const drafts = [deliveryEvent(command)];
+      if (next !== row.session) {
+        drafts.push(stateEvent(next, "stop_unconfirmed"));
+      }
+      this.appendSessionEvents(row, next, input.now, drafts);
       return true;
     });
 
@@ -790,6 +805,50 @@ class MemoryDatabase implements Database {
     return role
       ? capabilities({ userId, organizationId, role }, row.session, row.participants)
       : undefined;
+  }
+
+  private rearmSessionMessage(
+    row: SessionWithParticipants,
+    input: Extract<AcceptCommandInput, { kind: "retry" }>,
+  ): AcceptCommandResult {
+    const { session } = row;
+    if (!this.activeSessionDaemon(session)) return refused("daemon_unavailable");
+    const refusal = commandRefusal(session, input);
+    if (refusal) return refused(refusal);
+    const userId = input.principal.userId;
+    const command = this.interactiveCommands
+      .get(session.id)!
+      .find(
+        (entry) =>
+          entry.id === input.commandId.toLowerCase() &&
+          entry.authorUserId === userId &&
+          entry.generation === session.generation,
+      );
+    if (!command || !canRetryMessage(command, input.bodyCutoff)) return refused("not_retryable");
+    if (this.queuedMessageCount(session) >= input.maxQueued) return refused("queue_full");
+    Object.assign(command, retryMessagePatch(command, input.now));
+    this.appendSessionEvents(row, session, input.now, [deliveryEvent(command)]);
+    this.saveSessionAudit(
+      sessionAudit(session, userId, "retry", { commandId: command.id }, input.now),
+    );
+    return { status: "accepted", ...structuredClone({ session: row.session, command }) };
+  }
+
+  private queuedMessageCount(session: SessionRecord): number {
+    const commands = this.interactiveCommands.get(session.id)!;
+    const queued = commands.filter(
+      (command) =>
+        command.generation === session.generation &&
+        command.kind === "message" &&
+        command.failureCode !== "delivery_unconfirmed" &&
+        unsettledStatuses.some((status) => status === command.status),
+    );
+    return queued.length;
+  }
+
+  private activeSessionDaemon(session: SessionRecord): boolean {
+    const daemon = this.daemons.get(session.daemonId);
+    return daemon?.status === "active" && daemon.permissions.includes("hub.execute");
   }
 
   private supersedeInteractiveCommands(
