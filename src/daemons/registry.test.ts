@@ -285,23 +285,27 @@ describe("daemon socket protocol negotiation", () => {
       client.on("message", (data: RawData) => {
         messages.push(rawDataToText(data));
       });
-      await new Promise<void>((resolve, reject) => {
-        client.once("open", resolve);
-        client.once("error", reject);
-      });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-
-      assert.equal(negotiatedProtocol, expectedProtocol);
-      assert.equal(
-        messages.some((message) => HubDaemonHelloSchema.safeParse(JSON.parse(message)).success),
-        expectsHello,
-      );
-      assert.equal(registry.connection(daemon.id) !== undefined, expectsReady);
-
-      client.close();
-      await new Promise<void>((resolve) => client.once("close", () => resolve()));
-      await registry.stop();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      const receivedHello = () =>
+        messages.some((message) => HubDaemonHelloSchema.safeParse(JSON.parse(message)).success);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          client.once("open", resolve);
+          client.once("error", reject);
+        });
+        if (expectsHello)
+          await vi.waitFor(() => assert.equal(receivedHello(), true), { timeout: 1_000 });
+        assert.equal(negotiatedProtocol, expectedProtocol);
+        assert.equal(registry.connection(daemon.id) !== undefined, expectsReady);
+      } finally {
+        if (client.readyState !== WebSocket.CLOSED) {
+          const closed = new Promise<void>((resolve) => client.once("close", () => resolve()));
+          client.close();
+          await closed;
+        }
+        await registry.stop();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+      assert.equal(receivedHello(), expectsHello);
     },
   );
 });
