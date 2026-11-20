@@ -34,6 +34,7 @@ import {
   describeTriggerEvent,
   changeTriggerEvent,
   droppedTriggerRules,
+  isManualNoCallers,
   mergeTriggerForm,
   needsActorFilter,
   projectTriggerForm,
@@ -51,7 +52,7 @@ import { NotificationStatusCard } from "./notification-status-card.js";
 import { LastTriggered } from "./last-triggered.js";
 import { hasProgressDestination } from "./progress-events.js";
 import { WebhookCard } from "./webhook-card.js";
-import { IDENTIFIER, TriggerDocumentSchema } from "./configuration/schema.js";
+import { IDENTIFIER, TriggerDocumentSchema, TriggerFilterSchema } from "./configuration/schema.js";
 import { webhookSettings } from "../webhooks/functions.js";
 import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
 import {
@@ -321,10 +322,7 @@ function TriggerEditor({
   }, [editor.mode, editor.form, editor.yaml]);
   const title = trigger === null ? "New trigger" : trigger.name;
   const submitLabel = triggerSubmitLabel(editor.mode, trigger === null);
-  // Saving is refused only for what the reader cannot act on here: a request in flight, a
-  // read-only role, a legacy document. A half-filled form is something they can act on, so the
-  // button stays live and pressing it says which fields are in the way.
-  const saveDisabled = saving || !snapshot.canManage || legacy;
+  const saveDisabled = saving || !snapshot.canManage || legacy || editor.invalidDocument;
   // Nor is the YAML view a dead segment. A form that cannot serialise yet is a form with fields
   // to fix, and pressing YAML marks them instead of doing nothing at all. Only the legacy
   // document has a mode that is genuinely unreachable, and its own alert says why.
@@ -384,7 +382,9 @@ function TriggerEditor({
             fallback="Hub couldn't save this trigger."
           />
         )}
-        {editor.mode === "form" ? <TriggerRefusalSummary errors={editor.errors} /> : null}
+        {editor.mode === "form" ? (
+          <TriggerRefusalSummary errors={editor.errors} documentError={editor.documentError} />
+        ) : null}
         <div className="sm:hidden">{modeSwitch}</div>
         {/*
           The document decides what is missing, not the browser. Left to constraint validation an
@@ -509,10 +509,11 @@ function useTriggerEditorState(
   const description = useMemo(() => {
     if (legacy) return TRIGGER_EDITOR_DESCRIPTION;
     if (mode === "yaml") return describeTriggerYaml(yaml) ?? TRIGGER_EDITOR_DESCRIPTION;
-    if (other.status === "ok") {
+    if (other.status === "ok" || other.status === "invalid_document") {
       const summary = describeTriggerYaml(other.yaml);
       if (summary !== undefined) return summary;
     }
+    if (yaml !== "") return `When ${triggerEventClause(form.event)}, run the configured action.`;
     const target = form.daemon === "" ? "the selected host" : `host ${form.daemon}`;
     const action = form.action === "script" ? "a script" : form.agent || "the selected agent";
     return `When ${triggerEventClause(form.event)}, run ${action} on ${target}.`;
@@ -526,7 +527,7 @@ function useTriggerEditorState(
   const refuse = () => setRefused(true);
   const switchMode = (next: EditorMode) => {
     if (next === mode) return;
-    if (other.status === "ok") setYaml(other.yaml);
+    if (other.status === "ok" || other.status === "invalid_document") setYaml(other.yaml);
     else if (other.status === "editable") setForm(other.value);
     else {
       refuse();
@@ -547,6 +548,11 @@ function useTriggerEditorState(
     form,
     description,
     errors: refused ? errors : NO_FIELD_ERRORS,
+    invalidDocument: mode === "form" && other.status === "invalid_document",
+    documentError:
+      other.status === "invalid_document" || (refused && Object.keys(errors).length === 0)
+        ? blocked
+        : undefined,
     // Legacy workflows are explained by their own alert; repeating the schema error underneath it
     // would say the same thing twice in less useful words.
     blocked: legacy ? undefined : blocked,
@@ -570,8 +576,14 @@ const NO_FIELD_ERRORS: TriggerFieldErrors = {};
  * page to be marked at all. The summary takes the keyboard when it arrives, so pressing a button
  * that cannot do anything yet always answers in the same place.
  */
-function TriggerRefusalSummary({ errors }: { errors: TriggerFieldErrors }) {
-  const reasons = Object.values(errors);
+function TriggerRefusalSummary({
+  errors,
+  documentError,
+}: {
+  errors: TriggerFieldErrors;
+  documentError: string | undefined;
+}) {
+  const reasons = documentError === undefined ? Object.values(errors) : [documentError];
   const [first] = reasons;
   if (first === undefined) return null;
   return (
@@ -679,6 +691,9 @@ function TriggerEventCard({
   onChange: (value: TriggerFormValue) => void;
 }) {
   const { provider, origin } = eventDefinition(form.event);
+  const advancedFilters = (form.advancedFilters ?? []).filter((key) =>
+    Object.hasOwn(TriggerFilterSchema.shape, key),
+  );
   const connectionOptions = connections
     .filter((connection) => connection.provider === provider)
     .map((connection) => ({ value: connection.slug, label: connection.label }));
@@ -763,11 +778,11 @@ function TriggerEventCard({
           </FormActions>
         </>
       )}
-      {form.advancedFilters === undefined || form.advancedFilters.length === 0 ? null : (
+      {advancedFilters.length === 0 ? null : (
         <WarningAlert title="Advanced filters">
           <p>Open YAML to edit these filters. Form edits preserve them.</p>
           <ul className="list-disc pl-4">
-            {form.advancedFilters.map((key) => (
+            {advancedFilters.map((key) => (
               <li key={key}>{key}</li>
             ))}
           </ul>
@@ -1155,6 +1170,7 @@ function AccessCard({
   const manual = form.event === "manual.run";
   const chooseAudience = !script && audience === "wildcard";
   const everyone = chooseAudience && form.allowedUsers.trim() === "*";
+  const noCallers = isManualNoCallers(form);
   let description: string = EDITOR_STEPS.access.description;
   if (script) description = SCRIPT_ACCESS_DESCRIPTION;
   else if (manual) description = "Choose who can start this trigger manually or by webhook.";
@@ -1162,7 +1178,12 @@ function AccessCard({
     description = "Restrict which Linear users can start the run, or leave the list empty.";
   return (
     <Card title={EDITOR_STEPS.access.title} description={description}>
-      <div className="grid gap-4 sm:grid-cols-2">
+      {noCallers ? (
+        <WarningAlert title="Nobody can run this trigger">
+          <p>The caller list is empty.</p>
+        </WarningAlert>
+      ) : null}
+      <div className="grid min-w-0 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
         {chooseAudience ? (
           <FormField id="trigger-audience" label="Audience">
             {() => (
@@ -1171,7 +1192,11 @@ function AccessCard({
                 value={everyone ? "everyone" : "specific"}
                 options={AUDIENCE_OPTIONS}
                 onChange={(value) =>
-                  onChange({ ...form, allowedUsers: value === "everyone" ? "*" : "" })
+                  onChange({
+                    ...form,
+                    allowedUsers: value === "everyone" ? "*" : "",
+                    manualNoCallers: false,
+                  })
                 }
               />
             )}
@@ -1189,8 +1214,8 @@ function AccessCard({
             kind="text"
             name="allowedUsers"
             value={form.allowedUsers}
-            onChange={(value) => onChange({ ...form, allowedUsers: value })}
-            required={script || audience !== "optional"}
+            onChange={(value) => onChange({ ...form, allowedUsers: value, manualNoCallers: false })}
+            required={!noCallers && (script || audience !== "optional")}
             {...fieldError(errors, "allowedUsers")}
           />
         )}

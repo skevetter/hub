@@ -258,6 +258,104 @@ test("keeps named manual callers when saving and previews the audience dropped b
   await expect(page.getByRole("textbox", { name: "Trigger YAML" })).not.toContainText("from_users");
 });
 
+for (const scenario of [
+  "viewport with a long caller",
+  "unknown filter blocks saving",
+  "empty caller list remains editable",
+  "serialization errors reach the form",
+] as const) {
+  test(`trigger editor review: ${scenario}`, async ({ hub, page }) => {
+    await hub.signUpAs("owner", owner);
+    await hub.createOrganization("owner", "Acme");
+    const daemon = await hub.connectProviderDaemon("owner", "Acme");
+    const triggers = new OrganizationTriggers(page);
+    await triggers.open();
+    await triggers.startNew();
+    await triggers.configureManual({
+      name: "manual-review",
+      daemon,
+      cwd: "/workspace/acme",
+      agent: "opencode/gateway/vendor/model-v1",
+      mode: "full-access",
+      thinking: "low",
+      prompt: "Handle the request.",
+    });
+    if (scenario === "viewport with a long caller") {
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.getByRole("radio", { name: "Specific people" }).check();
+      const name = "x".repeat(1024);
+      await page.getByLabel("Caller names").fill(name);
+      await expect(page.getByText(new RegExp(name, "u"))).toBeVisible();
+      const layout = await page.evaluate(() => ({
+        viewport: document.documentElement.clientWidth,
+        document: document.documentElement.scrollWidth,
+        caller: document.getElementById("trigger-allowed-users")?.getBoundingClientRect().right,
+      }));
+      expect(layout.viewport).toBe(390);
+      expect(layout.document).toBe(390);
+      expect(layout.caller).toBeLessThanOrEqual(390);
+      return;
+    }
+    await triggers.switchToYaml();
+    const filters = {
+      "unknown filter blocks saving": "      from_users: [alice]\n      future_filter: true\n",
+      "empty caller list remains editable": "      from_users: []\n",
+      "serialization errors reach the form": "      from_users: &audience [alice]\n",
+    }[scenario];
+    await triggers.replaceYaml(`name: manual-review
+on:
+  manual.run:
+    filters:
+${filters}run:
+  target: { daemon: ${daemon}, cwd: /workspace/acme }
+  agent:
+    provider: opencode
+    model: gateway/vendor/model-v1
+    mode: full-access
+${scenario === "serialization errors reach the form" ? "    options: { audience: *audience }\n" : ""}  prompt: Handle the request.
+`);
+    if (scenario === "empty caller list remains editable") {
+      await triggers.save("manual-review");
+      await triggers.openTrigger("manual-review");
+      await expect(
+        page.getByRole("alert").filter({ hasText: "Nobody can run this trigger" }),
+      ).toBeVisible();
+      await page.getByLabel("Working directory").fill("/workspace/other");
+      await triggers.save("manual-review");
+      await triggers.openTrigger("manual-review");
+      await triggers.switchToYaml();
+      await triggers.expectYamlContains("from_users: []", "/workspace/other");
+      return;
+    }
+    await page.getByRole("radio", { name: "Form", exact: true }).check();
+    if (scenario === "unknown filter blocks saving") {
+      await page.getByLabel("Working directory").fill("/workspace/other");
+      await expect(page.getByRole("alert").filter({ hasText: "future_filter" })).toContainText(
+        "Unrecognized key",
+      );
+      await expect(page.getByRole("button", { name: "Create trigger" }).first()).toBeDisabled();
+      await triggers.switchToYaml();
+      await triggers.expectYamlContains("future_filter: true", "/workspace/other");
+      await triggers.replaceYaml(`name: manual-review
+on:
+  manual.run:
+    filters: { from_users: [alice] }
+run:
+  target: { daemon: ${daemon}, cwd: /workspace/other }
+  agent: { provider: opencode, model: gateway/vendor/model-v1, mode: full-access }
+  prompt: Handle the request.
+`);
+      await page.getByRole("radio", { name: "Form", exact: true }).check();
+      await expect(page.getByRole("button", { name: "Create trigger" }).first()).toBeEnabled();
+      return;
+    }
+    await page.getByRole("combobox", { name: "When this happens" }).click();
+    await page.getByRole("option", { name: "Schedule schedule.tick" }).click();
+    await page.getByRole("button", { name: "Change event", exact: true }).click();
+    await triggers.expectRefusedOnSubmit("Unresolved alias");
+  });
+}
+
 function advancedTriggerYaml(daemon: string) {
   return `# survives form edits
 name: slack-help

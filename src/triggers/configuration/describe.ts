@@ -1,4 +1,4 @@
-import { parseDocument } from "yaml";
+import { isAlias, isMap, isNode, parseDocument, visit, type Document, type Node } from "yaml";
 
 import { recurrenceSummary } from "../schedule/recurrence.js";
 import { eventDefinition, isEditorEvent, type QualifierDefinition } from "./events.js";
@@ -39,35 +39,91 @@ export function triggerEventClause(event: string): string {
   );
 }
 
-export function describeTrigger(document: TriggerDocument): string {
-  const events = Object.entries(document.on).map(([event, definition]) => {
-    if (event === "schedule.tick" && definition.recurrence !== undefined) {
-      const schedule = recurrenceSummary(definition.recurrence);
-      return schedule.startsWith("Every")
-        ? schedule
-        : `On the configured schedule in ${definition.recurrence.timezone}`;
+type Literal = (path: readonly string[]) => boolean;
+
+export function describeTrigger(document: TriggerDocument, literal: Literal = () => true): string {
+  const eligible: string[] = [];
+  const blocked: string[] = [];
+  for (const [event, definition] of Object.entries(document.on)) {
+    const path = ["on", event];
+    if (!literal(path)) {
+      eligible.push("When a configured event arrives");
+      continue;
     }
-    return `When ${triggerEventClause(event)}${describeFilters(event, definition.filters)}`;
-  });
+    const filterPath = [...path, "filters"];
+    const entries = Object.entries(definition.filters ?? {});
+    const direct = entries.filter(([key]) => literal([...filterPath, key]));
+    const filters: Filters = Object.fromEntries(direct);
+    const reason = blockedReason(event, definition.filters ?? {});
+    if (reason !== undefined) {
+      blocked.push(reason);
+      continue;
+    }
+    if (event === "schedule.tick" && definition.recurrence !== undefined) {
+      eligible.push(describeSchedule(definition.recurrence, literal([...path, "recurrence"])));
+      continue;
+    }
+    const opaque = direct.length < entries.length ? " with additional configured filters" : "";
+    eligible.push(
+      `When ${triggerEventClause(event)}${describeFilters(event, filters, Boolean(definition.filters?.pattern))}${opaque}`,
+    );
+  }
+  if (eligible.length === 0) return `${joinClauses(blocked)}.`;
   const run = document.run;
-  const conditions = alternatives.format(
-    events.map((condition, index) =>
-      index === 0 ? condition : condition.charAt(0).toLowerCase() + condition.slice(1),
-    ),
-  );
-  return `${conditions}, run ${describeAction(run)} on host ${run.target.daemon}.`;
+  const host = literal(["run", "target", "daemon"])
+    ? `host ${run.target.daemon}`
+    : "the configured host";
+  const action = describeAction(run, literal);
+  const excluded = blocked.length === 0 ? "" : `, while ${lowerFirst(joinClauses(blocked))}`;
+  return `${joinClauses(eligible)}, run ${action} on ${host}${excluded}.`;
 }
 
-function describeAction(run: TriggerDocument["run"]): string {
+function lowerFirst(value: string): string {
+  return value.charAt(0).toLowerCase() + value.slice(1);
+}
+
+function joinClauses(clauses: string[]): string {
+  return alternatives.format(
+    clauses.map((clause, index) => (index === 0 ? clause : lowerFirst(clause))),
+  );
+}
+
+function describeSchedule(
+  recurrence: NonNullable<TriggerDocument["on"][string]["recurrence"]>,
+  literal: boolean,
+): string {
+  if (!literal) return "On the configured schedule";
+  const schedule = recurrenceSummary(recurrence);
+  return schedule.startsWith("Every")
+    ? schedule
+    : `On the configured schedule in ${recurrence.timezone}`;
+}
+
+function describeAction(run: TriggerDocument["run"], literal: Literal): string {
   if (isScriptRun(run)) return "a script";
-  if ("choices" in run.agent) return "the selected agent";
+  if ("choices" in run.agent || !literal(["run", "agent", "provider"])) return "the selected agent";
   const { provider, model } = run.agent;
-  return model === undefined ? provider : `${provider}/${model}`;
+  if (model === undefined || !literal(["run", "agent", "model"])) return provider;
+  return `${provider}/${model}`;
+}
+
+function blockedReason(event: string, filters: NonNullable<Filters>): string | undefined {
+  if (event === "manual.run" && filters.from_users?.length === 0) {
+    return "For manual and webhook requests, no callers can run this trigger";
+  }
+  if (filters.channels?.length === 0) {
+    if (event === "slack.mention") return "For Slack mentions, no channels can match";
+    if (event === "discord.mention") return "For Discord mentions, no channels can match";
+  }
+  if (event === "github.push" && filters.from_users && !filters.from_users.includes("*")) {
+    return "A named sender filter cannot match because push events carry no sender";
+  }
+  return undefined;
 }
 
 type Filters = TriggerDocument["on"][string]["filters"];
 
-function describeFilters(event: string, filters: Filters): string {
+function describeFilters(event: string, filters: Filters, hasPattern: boolean): string {
   if (filters === undefined || !isEditorEvent(event)) return "";
   const definition = eventDefinition(event);
   const prefixCommand = definition.provider === "slack" || definition.provider === "discord";
@@ -81,7 +137,7 @@ function describeFilters(event: string, filters: Filters): string {
     clauses.push(`from ${alternatives.format(names)}`);
   }
   for (const qualifier of definition.qualifiers) {
-    if (prefixCommand && qualifier.key === "contains" && filters.pattern) continue;
+    if (prefixCommand && qualifier.key === "contains" && hasPattern) continue;
     const value = filters[qualifier.key];
     const clause = describeQualifier(qualifier, value, prefixCommand);
     if (clause !== undefined) clauses.push(clause);
@@ -121,8 +177,47 @@ export function describeTriggerYaml(yaml: string): string | undefined {
     const document = parseDocument(yaml, { compat: ["timestamp"] });
     if (document.errors.length > 0) return undefined;
     const parsed = TriggerDocumentSchema.safeParse(document.toJS());
-    return parsed.success ? describeTrigger(parsed.data) : undefined;
+    if (!parsed.success) return undefined;
+    const targets = collectAliasTargets(document);
+    return describeTrigger(parsed.data, (path) => isLiteralAt(document, path, targets));
   } catch {
     return undefined;
   }
+}
+
+function collectAliasTargets(document: Document): Set<Node> {
+  const targets = new Set<Node>();
+  visit(document, {
+    Alias(_key, alias) {
+      const target = alias.resolve(document);
+      if (target !== undefined) targets.add(target);
+    },
+  });
+  return targets;
+}
+
+function isLiteralAt(
+  document: Document,
+  path: readonly string[],
+  aliasTargets: Set<Node>,
+): boolean {
+  let node: unknown = document.contents;
+  for (const key of path) {
+    if (!isMap(node) || aliasTargets.has(node) || node.items.some((pair) => isAlias(pair.key))) {
+      return false;
+    }
+    node = node.get(key, true);
+  }
+  if (!isNode(node)) return false;
+  // Event names are safe when the authored mapping key is literal, even if the rule is opaque.
+  if (path.length === 2 && path[0] === "on") return true;
+  let literal = true;
+  visit(node, (_key, value) => {
+    if (isNode(value) && (isAlias(value) || aliasTargets.has(value))) {
+      literal = false;
+      return visit.BREAK;
+    }
+    return undefined;
+  });
+  return literal;
 }

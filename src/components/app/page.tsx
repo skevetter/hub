@@ -56,14 +56,21 @@ export function PageHeader({
   return (
     <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
       <div className="grid min-w-0 gap-1">
-        <span className="flex items-center gap-2">
-          <h1 ref={heading} id={id} tabIndex={-1} className="text-xl font-title">
+        <span className="flex min-w-0 flex-wrap items-center gap-2">
+          <h1
+            ref={heading}
+            id={id}
+            tabIndex={-1}
+            className="min-w-0 wrap-anywhere text-xl font-title"
+          >
             {title}
           </h1>
           {status === undefined ? null : <StatusPill tone={status.tone}>{status.label}</StatusPill>}
         </span>
         {description === undefined ? null : (
-          <p className="text-sm text-balance text-muted-foreground">{description}</p>
+          <p className="min-w-0 wrap-anywhere text-sm text-balance text-muted-foreground">
+            {description}
+          </p>
         )}
       </div>
       {children === undefined ? null : (
@@ -86,7 +93,9 @@ export function PageHeaderSkeleton({ description }: { description?: string }) {
       {description === undefined ? (
         <Skeleton className="h-5 w-80 max-w-full" />
       ) : (
-        <p className="text-sm text-balance text-muted-foreground">{description}</p>
+        <p className="min-w-0 wrap-anywhere text-sm text-balance text-muted-foreground">
+          {description}
+        </p>
       )}
     </header>
   );

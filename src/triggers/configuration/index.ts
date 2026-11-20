@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { dump, load } from "js-yaml";
+import { dump } from "js-yaml";
 import {
   compileHubConfig,
   isScriptStep,
@@ -11,30 +11,24 @@ import {
 } from "../../config/compiler.js";
 import {
   isScriptRun,
-  TriggerDocumentSchema,
   type TriggerAgentRun,
   type TriggerDocument,
   type TriggerScriptRun,
 } from "./schema.js";
 
+import { parseTriggerDocument, TriggerDocumentError } from "./document.js";
+
+export {
+  parseTriggerDocument,
+  TriggerDocumentError,
+  type TriggerDocumentIssue,
+} from "./document.js";
 export { TriggerDocumentSchema, type TriggerDocument } from "./schema.js";
 export {
   migrateLegacyBundle,
   type MigratedLegacyTrigger,
   type SelfContainedLegacyTrigger,
 } from "./legacy-migration.js";
-
-export interface TriggerDocumentIssue {
-  path: readonly (string | number)[];
-  message: string;
-}
-
-export class TriggerDocumentError extends Error {
-  constructor(readonly issues: readonly TriggerDocumentIssue[]) {
-    super(issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("\n"));
-    this.name = "TriggerDocumentError";
-  }
-}
 
 export interface CompiledTriggerDocument {
   authored: TriggerDocument;
@@ -177,29 +171,6 @@ function authoredFilters(
       : {}),
     ...(definition.connection === undefined ? {} : { connection: definition.connection }),
   };
-}
-
-export function parseTriggerDocument(yaml: string): TriggerDocument {
-  let input: unknown;
-  try {
-    input = load(yaml);
-  } catch (error) {
-    throw new TriggerDocumentError([
-      { path: [], message: error instanceof Error ? error.message : "invalid YAML" },
-    ]);
-  }
-  const parsed = TriggerDocumentSchema.safeParse(input);
-  if (!parsed.success) {
-    throw new TriggerDocumentError(
-      parsed.error.issues.map((issue) => ({
-        path: issue.path.map((segment) =>
-          typeof segment === "symbol" ? (segment.description ?? String(segment)) : segment,
-        ),
-        message: issue.message,
-      })),
-    );
-  }
-  return parsed.data;
 }
 
 export function serializeTriggerDocument(trigger: TriggerDocument): string {

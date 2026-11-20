@@ -7,15 +7,22 @@ import {
 import { ContinuationSchema } from "../continuation.js";
 import { hasProgressDestination, PROGRESS_DESTINATION_REQUIRED } from "../progress-events.js";
 import {
+  isAlias,
   isCollection,
   isMap,
   isNode,
   isScalar,
+  isSeq,
   parseDocument,
   stringify,
+  visit,
   type Document,
+  type Alias,
+  type Node,
+  type YAMLSeq,
 } from "yaml";
 import { z } from "zod";
+import { parseTriggerDocument } from "./document.js";
 import {
   DEFAULT_SCRIPT_MAX_RUNTIME,
   IDENTIFIER,
@@ -48,6 +55,7 @@ export interface TriggerFormValue {
   event: EditorEvent;
   connection: string;
   allowedUsers: string;
+  manualNoCallers?: boolean;
   qualifiers: QualifierValues;
   advancedFilters?: string[];
   recurrence?: Recurrence;
@@ -128,6 +136,9 @@ function toBaseFormValue(
     event,
     connection: definition.connection ?? "",
     allowedUsers: definition.filters?.from_users?.join(", ") ?? defaultAudience(event),
+    ...(event === "manual.run" && definition.filters?.from_users?.length === 0
+      ? { manualNoCallers: true }
+      : {}),
     qualifiers: readQualifiers(event, definition.filters),
     recurrence: definition.recurrence ?? DEFAULT_RECURRENCE,
   };
@@ -205,49 +216,93 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
   assertDocument(document);
   setOptional(document, ["progress_message"], value.progressMessage === true ? true : undefined);
   if (unchanged) return document.toString({ lineWidth: 0 });
-  setIfChanged(document, ["name"], value.name);
-  setIfChanged(document, ["enabled"], value.enabled);
-
-  patchEvent(document, projection.value, value);
-
-  setIfChanged(document, ["run", "target", "daemon"], value.daemon);
-  setIfChanged(document, ["run", "target", "cwd"], value.cwd);
-  if (value.action === "script") {
-    for (const key of [
-      "agent",
-      "prompt",
-      "continuation",
-      "idle_timeout",
-      "github",
-      "complete_on_turn_end",
-    ]) {
-      deleteIfPresent(document, ["run", key]);
-    }
-    setIfChanged(document, ["run", "max_runtime"], value.maxRuntime.trim());
-    setIfChanged(document, ["run", "script"], value.script);
-    return document.toString({ lineWidth: 0 });
-  }
-  deleteIfPresent(document, ["run", "script"]);
-  const agent = splitAgentId(value.agent);
-  setIfChanged(document, ["run", "agent", "provider"], agent.provider);
-  setOptional(document, ["run", "agent", "model"], agent.model);
-  setIfChanged(document, ["run", "agent", "mode"], value.mode.trim());
-  setOptional(
-    document,
-    ["run", "agent", "thinkingOptionId"],
-    blankToUndefined(value.thinkingOptionId),
-  );
-  setOptional(document, ["run", "agent", "options"], parseProviderOptions(value.providerOptions));
-  setIfChanged(document, ["run", "continuation"], formContinuation(value));
-  setIfChanged(document, ["run", "max_runtime"], value.maxRuntime.trim());
-  setIfChanged(document, ["run", "idle_timeout"], value.idleTimeout.trim());
-  // An authored `false` is the default; leave it alone rather than rewrite it to nothing.
-  if (value.completeOnTurnEnd !== (document.getIn(["run", "complete_on_turn_end"]) === true)) {
-    setOptional(document, ["run", "complete_on_turn_end"], value.completeOnTurnEnd || undefined);
-  }
-  setOptional(document, ["run", "github"], githubAuthority(value));
-  setIfChanged(document, ["run", "prompt"], value.prompt);
+  const previous = projection.value;
+  if (previous.name !== value.name) setIfChanged(document, ["name"], value.name);
+  if (previous.enabled !== value.enabled) setIfChanged(document, ["enabled"], value.enabled);
+  patchEvent(document, previous, value);
+  patchRun(document, previous, value);
   return document.toString({ lineWidth: 0 });
+}
+
+function patchRun(document: Document, previous: TriggerFormValue, next: TriggerFormValue): void {
+  if (previous.daemon !== next.daemon)
+    setIfChanged(document, ["run", "target", "daemon"], next.daemon);
+  if (previous.cwd !== next.cwd) setIfChanged(document, ["run", "target", "cwd"], next.cwd);
+  const actionChanged = previous.action !== next.action;
+  if (actionChanged || previous.maxRuntime !== next.maxRuntime) {
+    setIfChanged(document, ["run", "max_runtime"], next.maxRuntime.trim());
+  }
+  if (next.action === "script") {
+    if (actionChanged) {
+      for (const key of [
+        "agent",
+        "prompt",
+        "continuation",
+        "idle_timeout",
+        "github",
+        "complete_on_turn_end",
+      ]) {
+        deleteIfPresent(document, ["run", key]);
+      }
+    }
+    if (actionChanged || previous.script !== next.script) {
+      setIfChanged(document, ["run", "script"], next.script);
+    }
+    return;
+  }
+  if (actionChanged) deleteIfPresent(document, ["run", "script"]);
+  patchAgentRun(document, previous, next);
+}
+
+function patchAgentRun(
+  document: Document,
+  previous: TriggerFormValue,
+  next: TriggerFormValue,
+): void {
+  const changed = (...fields: (keyof TriggerFormValue)[]) =>
+    previous.action !== next.action || fields.some((field) => previous[field] !== next[field]);
+  if (changed("agent")) {
+    const agent = splitAgentId(next.agent);
+    setIfChanged(document, ["run", "agent", "provider"], agent.provider);
+    setOptional(document, ["run", "agent", "model"], agent.model);
+  }
+  if (changed("mode")) setIfChanged(document, ["run", "agent", "mode"], next.mode.trim());
+  if (changed("thinkingOptionId")) {
+    setOptional(
+      document,
+      ["run", "agent", "thinkingOptionId"],
+      blankToUndefined(next.thinkingOptionId),
+    );
+  }
+  if (changed("providerOptions")) {
+    setOptional(document, ["run", "agent", "options"], parseProviderOptions(next.providerOptions));
+  }
+  if (changed("continuationMode", "continuationKey")) {
+    setIfChanged(document, ["run", "continuation"], formContinuation(next));
+  }
+  if (changed("idleTimeout")) {
+    setIfChanged(document, ["run", "idle_timeout"], next.idleTimeout.trim());
+  }
+  if (changed("completeOnTurnEnd")) {
+    setOptional(document, ["run", "complete_on_turn_end"], next.completeOnTurnEnd || undefined);
+  }
+  if (changed("githubConnection", "githubRepositories", "githubPermissions", "githubDuration")) {
+    patchGitHubAuthority(document, next);
+  }
+  if (changed("prompt")) setIfChanged(document, ["run", "prompt"], next.prompt);
+}
+
+function patchGitHubAuthority(document: Document, value: TriggerFormValue): void {
+  const path = ["run", "github"];
+  const github = githubAuthority(value);
+  if (github === undefined || !isMap(document.getIn(path, true))) {
+    setOptional(document, path, github);
+    return;
+  }
+  setIfChanged(document, [...path, "connection"], github.connection);
+  setListFilter(document, [...path, "repositories"], github.repositories);
+  setOptional(document, [...path, "permissions"], github.permissions);
+  setOptional(document, [...path, "duration"], github.duration);
 }
 
 function patchEvent(document: Document, previous: TriggerFormValue, next: TriggerFormValue) {
@@ -297,19 +352,32 @@ function patchEventFilters(
   for (const key of eventFilterKeys(previous.event)) {
     if (!owned.has(key) || !sameProvider) deleteIfPresent(document, [...path, key]);
   }
-  if (needsActorFilter(next) && (!sameProvider || previous.allowedUsers !== next.allowedUsers)) {
-    setOptional(document, [...path, "from_users"], authoredAudience(next));
+  if (needsActorFilter(next) && audienceChanged(previous, next)) {
+    setListFilter(document, [...path, "from_users"], authoredAudience(next));
   }
   for (const qualifier of after.qualifiers) {
     const draft = next.qualifiers[qualifier.key];
     if (!sameProvider || previous.qualifiers[qualifier.key] !== draft) {
-      setOptional(document, [...path, qualifier.key], authoredQualifier(qualifier, draft));
+      const value = authoredQualifier(qualifier, draft);
+      const keyPath = [...path, qualifier.key];
+      if (qualifier.kind === "list") setListFilter(document, keyPath, value);
+      else setOptional(document, keyPath, value);
     }
   }
 }
 
+function audienceChanged(previous: TriggerFormValue, next: TriggerFormValue): boolean {
+  return (
+    (previous.event !== next.event &&
+      eventDefinition(previous.event).provider !== eventDefinition(next.event).provider) ||
+    previous.allowedUsers !== next.allowedUsers ||
+    previous.manualNoCallers !== next.manualNoCallers
+  );
+}
+
 export type TriggerYamlResult =
   | { status: "ok"; yaml: string }
+  | { status: "invalid_document"; yaml: string; reason: string }
   | { status: "incomplete"; reason: string };
 
 /**
@@ -322,13 +390,17 @@ export type TriggerYamlResult =
  * control, instead of surfacing a stray exception somewhere far from the field that caused it.
  */
 export function mergeTriggerForm(yaml: string, value: TriggerFormValue): TriggerYamlResult {
+  let patched: string;
   try {
-    return {
-      status: "ok",
-      yaml: yaml.trim() === "" ? createTriggerYaml(value) : patchTriggerYaml(yaml, value),
-    };
+    patched = yaml.trim() === "" ? createTriggerYaml(value) : patchTriggerYaml(yaml, value);
   } catch (cause) {
     return { status: "incomplete", reason: incompleteReason(cause) };
+  }
+  try {
+    parseTriggerDocument(patched);
+    return { status: "ok", yaml: patched };
+  } catch (cause) {
+    return { status: "invalid_document", yaml: patched, reason: incompleteReason(cause) };
   }
 }
 
@@ -417,8 +489,18 @@ function defaultAudience(event: EditorEvent): string {
 function authoredAudience(value: TriggerFormValue): string[] | undefined {
   if (!needsActorFilter(value)) return undefined;
   const names = commaSeparated(value.allowedUsers);
+  if (isManualNoCallers(value)) return [];
   if (value.event === "manual.run" && names.length === 1 && names[0] === "*") return undefined;
   return names.length === 0 ? undefined : names;
+}
+
+export function isManualNoCallers(value: TriggerFormValue): boolean {
+  return (
+    value.event === "manual.run" &&
+    value.action === "prompt" &&
+    value.manualNoCallers === true &&
+    value.allowedUsers === ""
+  );
 }
 
 function eventFilterKeys(event: EditorEvent): Set<string> {
@@ -547,6 +629,7 @@ function scriptErrors(value: TriggerFormValue): TriggerFieldErrors {
 }
 
 function actorErrors(value: TriggerFormValue): TriggerFieldErrors {
+  if (isManualNoCallers(value)) return {};
   const named = commaSeparated(value.allowedUsers);
   if (value.action === "script") {
     return named.length === 0 || named.includes("*")
@@ -679,10 +762,61 @@ function assertDocument(document: Document): void {
   if (document.errors.length > 0) throw new Error(document.errors[0]!.message);
 }
 
+function setListFilter(document: Document, path: string[], value: unknown): void {
+  const node = document.getIn(path, true);
+  if (value === undefined && isSeq(node)) {
+    const aliases = sequenceAliases(document);
+    deleteIfPresent(document, path);
+    restoreSequenceAliases(document, aliases);
+    return;
+  }
+  setOptional(document, path, value);
+}
+
+function updateSequence(document: Document, sequence: YAMLSeq, values: readonly unknown[]): void {
+  const oldItems = new Map<unknown, unknown[]>();
+  for (const item of sequence.items) {
+    const value: unknown = isNode(item) ? item.toJS(document) : item;
+    const matches = oldItems.get(value) ?? [];
+    matches.push(item);
+    oldItems.set(value, matches);
+  }
+  const aliases = sequenceAliases(document);
+  sequence.items = values.map(
+    (value) => oldItems.get(value)?.shift() ?? document.createNode(value),
+  );
+  restoreSequenceAliases(document, aliases);
+}
+
+function sequenceAliases(document: Document): Map<Alias, Node> {
+  const aliases = new Map<Alias, Node>();
+  visit(document, {
+    Alias(_key, alias) {
+      const target = alias.resolve(document);
+      if (target !== undefined) aliases.set(alias, target);
+    },
+  });
+  return aliases;
+}
+
+function restoreSequenceAliases(document: Document, aliases: Map<Alias, Node>): void {
+  // Promote the first surviving alias if a list edit removed its anchor.
+  visit(document, {
+    Alias(_key, alias) {
+      return alias.resolve(document) === undefined ? aliases.get(alias) : undefined;
+    },
+  });
+}
+
 function setIfChanged(document: Document, path: readonly string[], value: unknown): void {
   const node = document.getIn(path, true);
   const current: unknown = isNode(node) ? node.toJS(document) : node;
   if (sameValue(current, value)) return;
+  const target = isAlias(node) ? node.resolve(document) : node;
+  if (isSeq(target) && Array.isArray(value)) {
+    updateSequence(document, target, value);
+    return;
+  }
   if (isCollection(node) && typeof value === "object" && value !== null) {
     const replacement = document.createNode(value);
     if (isCollection(replacement)) {
@@ -737,10 +871,7 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
     for (const qualifier of next.qualifiers) {
       if (
         previous.qualifiers.some(
-          (candidate) =>
-            candidate.key === qualifier.key &&
-            candidate.kind === qualifier.kind &&
-            candidate.label === qualifier.label,
+          (candidate) => candidate.key === qualifier.key && candidate.kind === qualifier.kind,
         )
       ) {
         const selection = value.qualifiers[qualifier.key];
@@ -763,6 +894,7 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
       : {}),
   };
   if (value.advancedFilters !== undefined) result.advancedFilters = [];
+  delete result.manualNoCallers;
   return result;
 }
 
@@ -781,8 +913,7 @@ export function droppedTriggerRules(previous: TriggerFormValue, next: TriggerFor
   if (
     !sameProvider &&
     needsActorFilter(previous) &&
-    previous.allowedUsers !== "" &&
-    previous.allowedUsers !== "*"
+    (isManualNoCallers(previous) || (previous.allowedUsers !== "" && previous.allowedUsers !== "*"))
   ) {
     dropped.push("Audience");
   }

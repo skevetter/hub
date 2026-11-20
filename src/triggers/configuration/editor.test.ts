@@ -704,22 +704,28 @@ const LINEAR_FILTERS = ADVANCED.replace(
       channels: [unused] # outside this event's form`,
   );
 
-test("retains advanced and unknown filter keys and their comments on ordinary form edits", () => {
-  const yaml = LINEAR_FILTERS.replace("channels: [unused]", "future_filter: { value: 5 }");
-  const projection = projectTriggerForm(yaml);
+test("retains schema-known advanced filter keys and their comments on ordinary form edits", () => {
+  const projection = projectTriggerForm(LINEAR_FILTERS);
   if (projection.status !== "editable") throw new Error(projection.reason);
-  expect(projection.value.advancedFilters).toEqual(["future_filter"]);
-  const saved = mergeTriggerForm(yaml, {
+  expect(projection.value.advancedFilters).toEqual(["channels"]);
+  const saved = mergeTriggerForm(LINEAR_FILTERS, {
     ...projection.value,
     qualifiers: { ...projection.value.qualifiers, exclude_labels: "hold\nblocked" },
   });
   if (saved.status !== "ok") throw new Error(saved.reason);
-  expect(saved.yaml).toContain("future_filter: { value: 5 } # outside this event's form");
+  expect(saved.yaml).toMatch(/channels: \[\s*unused\s*\] # outside this event's form/u);
   expect(saved.yaml).toContain("# keep this filter comment");
-  expect(TriggerDocumentSchema.safeParse(parseDocument(saved.yaml).toJS()).success).toBe(false);
-  const edited = projectTriggerForm(saved.yaml);
-  if (edited.status !== "editable") throw new Error(edited.reason);
-  expect(edited.value.qualifiers.exclude_labels).toBe("hold\nblocked");
+  expect(TriggerDocumentSchema.safeParse(parseDocument(saved.yaml).toJS()).success).toBe(true);
+});
+
+test("refuses a form save with a schema-unknown filter and names the key", () => {
+  const yaml = LINEAR_FILTERS.replace("channels: [unused]", "future_filter: { value: 5 }");
+  const projection = projectTriggerForm(yaml);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const result = mergeTriggerForm(yaml, { ...projection.value, cwd: "/other" });
+  expect(result.status).toBe("invalid_document");
+  if (result.status !== "invalid_document") throw new Error("Expected a schema error.");
+  expect(result.reason).toContain('Unrecognized key: "future_filter"');
 });
 
 test("a same-provider change previews dropped rules and keeps compatible Linear rules", () => {
@@ -780,4 +786,103 @@ test("an existing non-projectable document cannot be replaced by a fresh form do
   if (projection.status !== "editable") throw new Error(projection.reason);
   const invalid = ADVANCED.replace("name: answer", "name: [");
   expect(mergeTriggerForm(invalid, projection.value).status).toBe("incomplete");
+});
+
+test.each(["from_users", "channels"] as const)(
+  "edits the anchored %s sequence while retaining aliases and per-item comments",
+  (key) => {
+    const original = key === "from_users" ? 'from_users: ["*"]' : "channels: [engineering]";
+    const yaml = ADVANCED.replace(
+      original,
+      `${key}: &entries
+        - alice # retain Alice's comment
+        - someone-else # remove this item
+        - bob # retain Bob's comment`,
+    ).replace("sandbox_mode: workspace-write", "selected: *entries");
+    const projection = projectTriggerForm(yaml);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    const draft =
+      key === "from_users"
+        ? { ...projection.value, allowedUsers: "bob, alice, carol" }
+        : { ...projection.value, qualifiers: { channels: "bob\nalice\ncarol" } };
+    const saved = mergeTriggerForm(yaml, draft);
+    if (saved.status !== "ok") throw new Error(saved.reason);
+    expect(saved.yaml).toContain(`${key}: &entries`);
+    expect(saved.yaml).toContain("- alice # retain Alice's comment");
+    expect(saved.yaml).toContain("- bob # retain Bob's comment");
+    expect(saved.yaml).toContain("selected: *entries");
+    const parsed = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
+    expect(parsed.on["slack.mention"]?.filters?.[key]).toEqual(["bob", "alice", "carol"]);
+    expect(agentRun(parsed.run).agent).toMatchObject({
+      options: { selected: ["bob", "alice", "carol"] },
+    });
+  },
+);
+
+const githubEvents = [...GITHUB_SEMANTIC_TRIGGER_EVENT_NAMES, ...GITHUB_TRIGGER_SOURCE_NAMES];
+test.each(githubEvents.flatMap((from) => githubEvents.map((to) => [from, to] as const)))(
+  "carries GitHub matcher text rules from %s to %s only when both events support them",
+  (from, to) => {
+    const projection = projectTriggerForm(ADVANCED);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    const text = { pattern: "/run", contains: "deploy", exclude_contains: "skip" };
+    const previous = {
+      ...projection.value,
+      event: from,
+      qualifiers: from === "github.push" ? {} : text,
+    };
+    const fromYaml = createTriggerYaml({
+      ...previous,
+      qualifiers: { ...previous.qualifiers, label: "ready" },
+    });
+    const authored = projectTriggerForm(fromYaml);
+    if (authored.status !== "editable") throw new Error(authored.reason);
+    const next = changeTriggerEvent(authored.value, to);
+    const stays = from !== "github.push" && to !== "github.push";
+    for (const key of ["pattern", "contains", "exclude_contains"] as const) {
+      expect(next.qualifiers[key]).toBe(stays ? text[key] : undefined);
+    }
+    const saved = patchTriggerYaml(fromYaml, {
+      ...next,
+      qualifiers: { ...next.qualifiers, label: "ready" },
+    });
+    const filters = TriggerDocumentSchema.parse(parseDocument(saved).toJS()).on[to]?.filters;
+    for (const key of ["pattern", "contains", "exclude_contains"] as const) {
+      expect(filters?.[key]).toBe(stays ? text[key] : undefined);
+    }
+  },
+);
+
+test("preserves an explicit empty manual caller list during an unrelated edit", () => {
+  const yaml = ADVANCED.replace("slack.mention:", "manual.run:").replace(
+    '      from_users: ["*"]',
+    "      from_users: [] # nobody can invoke this",
+  );
+  const projection = projectTriggerForm(yaml);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const saved = mergeTriggerForm(yaml, { ...projection.value, cwd: "/other" });
+  if (saved.status !== "ok") throw new Error(saved.reason);
+  expect(saved.yaml).toContain("# nobody can invoke this");
+  const parsed = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
+  expect(parsed.on["manual.run"]?.filters?.from_users).toEqual([]);
+  expect(parsed.run.target.cwd).toBe("/other");
+});
+
+test("clearing an anchored list preserves its values and comments at the remaining aliases", () => {
+  const yaml = ADVANCED.replace(
+    "channels: [engineering]",
+    "channels: &channels\n        - engineering # keep here",
+  ).replace("sandbox_mode: workspace-write", "selected: *channels\n      checked: *channels");
+  const projection = projectTriggerForm(yaml);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const saved = mergeTriggerForm(yaml, { ...projection.value, qualifiers: { channels: "" } });
+  if (saved.status !== "ok") throw new Error(saved.reason);
+  expect(saved.yaml).toContain("selected: &channels");
+  expect(saved.yaml).toContain("checked: *channels");
+  expect(saved.yaml).toContain("- engineering # keep here");
+  const parsed = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
+  expect(parsed.on["slack.mention"]?.filters?.channels).toBeUndefined();
+  expect(agentRun(parsed.run).agent).toMatchObject({
+    options: { selected: ["engineering"], checked: ["engineering"] },
+  });
 });

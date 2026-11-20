@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import { DEFAULT_RECURRENCE } from "../schedule/recurrence.js";
-import { describeTrigger } from "./describe.js";
+import { describeTrigger, describeTriggerYaml } from "./describe.js";
 import { TriggerDocumentSchema } from "./schema.js";
 
 const agent = {
@@ -68,4 +68,77 @@ test("describes multiple events and the script action without including script t
   expect(describeTrigger(TriggerDocumentSchema.parse({ name: "example", on, run }))).toBe(
     "Every day at 09:00 (UTC) or when a manual or webhook request arrives from hook-ci, run a script on host office.",
   );
+});
+
+test.each([
+  ["prompt", "  agent: { provider: codex }\n  prompt: &private SYNTHETIC-PROMPT"],
+  ["script", "  script: &private SYNTHETIC-SCRIPT"],
+  [
+    "environment",
+    "  agent: { provider: codex }\n  prompt: Go.\n  env: { PRIVATE: &private SYNTHETIC-ENV }",
+  ],
+])("uses an opaque summary for a filter aliased to the %s", (_field, run) => {
+  const yaml = `name: example
+run:
+  target: { daemon: office, cwd: /workspace }
+${run}
+on:
+  github.notification:
+    filters:
+      repo: acme/web
+      reason: review_requested
+      contains: *private
+`;
+  const summary = describeTriggerYaml(yaml);
+  expect(summary).toContain("a GitHub notification arrives");
+  expect(summary).toContain("on host office");
+  expect(summary).not.toContain("SYNTHETIC-");
+});
+
+test.each([
+  ["manual.run", { from_users: [] }, "no callers can run this trigger"],
+  ["slack.mention", { from_users: ["*"], channels: [] }, "no channels can match"],
+  ["discord.mention", { from_users: ["*"], channels: [] }, "no channels can match"],
+  ["github.push", { from_users: ["alice"] }, "push events carry no sender"],
+])("explains why %s cannot match", (event, filters, message) => {
+  const document = TriggerDocumentSchema.parse({
+    name: "example",
+    on: { [event]: { filters } },
+    run: agent,
+  });
+  const summary = describeTrigger(document);
+  expect(summary).toContain(message);
+  expect(summary).not.toContain("from alice");
+});
+
+test("keeps an anchor in a visible field opaque when the prompt references it", () => {
+  const summary = describeTriggerYaml(`name: example
+on:
+  github.notification:
+    filters:
+      contains: &private SYNTHETIC-CONTENT
+run:
+  target: { daemon: office, cwd: /workspace }
+  agent: { provider: codex }
+  prompt: *private
+`);
+  expect(summary).toContain("with additional configured filters");
+  expect(summary).not.toContain("SYNTHETIC-CONTENT");
+});
+
+test("keeps aliased lists and execution fields opaque", () => {
+  const summary = describeTriggerYaml(`name: example
+run:
+  target: { daemon: &host SYNTHETIC-HOST, cwd: /workspace }
+  agent: { provider: codex, model: &model SYNTHETIC-MODEL }
+  prompt: &private SYNTHETIC-PROMPT
+  env: { HOST: *host, MODEL: *model }
+on:
+  manual.run:
+    filters:
+      from_users: [*private, alice]
+`);
+  expect(summary).toContain("with additional configured filters");
+  expect(summary).toContain("run codex on the configured host");
+  expect(summary).not.toContain("SYNTHETIC-");
 });
