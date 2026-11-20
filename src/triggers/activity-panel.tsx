@@ -11,6 +11,7 @@ import { triggerActivityPage } from "./functions.js";
 import { ACTIVITY_COLUMNS, TriggerActivityTable } from "./activity-table.js";
 
 const route = getRouteApi("/_shell/o/$organizationSlug/activity/");
+const LIVE_REFRESH_MS = 5_000;
 const ACTIVITY_DESCRIPTION = "Agent runs launched by organization triggers.";
 
 export function TriggerActivityPanel() {
@@ -28,7 +29,8 @@ export function TriggerActivityPanel() {
           ...(cursor === undefined ? {} : { cursor }),
         },
       }),
-    refetchInterval: 5_000,
+    // Only the newest page is live. An older page does not move, and a hidden tab is not polled.
+    ...(cursor === undefined ? { refetchInterval: LIVE_REFRESH_MS } : {}),
   });
   if (snapshot.status === "pending") {
     return (
@@ -57,6 +59,15 @@ export function TriggerActivityPanel() {
   return (
     <>
       <PageHeader title="Activity" description={ACTIVITY_DESCRIPTION} />
+      {snapshot.refreshFailure === null ? null : (
+        <FailureAlert
+          title="Activity may be out of date"
+          error={snapshot.refreshFailure.message}
+          fallback="Hub couldn't refresh trigger activity."
+          onRetry={snapshot.refetch}
+          standalone
+        />
+      )}
       <TriggerActivityTable activity={activity} organizationSlug={organizationSlug} />
       {activity.length === 0 ? null : (
         <Pagination

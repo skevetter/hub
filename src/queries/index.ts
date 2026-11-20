@@ -24,6 +24,8 @@ export function useSnapshotQuery<T>(options: {
 }): Snapshot<T> & {
   refetch: (options?: { cancelRefetch?: boolean }) => void;
   isFetching: boolean;
+  /** Set when a background refresh failed and the data shown is the last good answer. */
+  refreshFailure: { message: string | null } | null;
 } {
   const query = useQuery({
     ...options,
@@ -48,6 +50,9 @@ export function useSnapshotQuery<T>(options: {
       error: null,
       refetch,
       isFetching: query.isFetching,
+      refreshFailure: query.isRefetchError
+        ? { message: query.error instanceof SnapshotFailure ? query.error.message : null }
+        : null,
     };
   if (query.isPending)
     return {
@@ -56,6 +61,7 @@ export function useSnapshotQuery<T>(options: {
       error: null,
       refetch,
       isFetching: query.isFetching,
+      refreshFailure: null,
     };
   return {
     status: "error",
@@ -63,5 +69,6 @@ export function useSnapshotQuery<T>(options: {
     error: query.error instanceof SnapshotFailure ? query.error.message : null,
     refetch,
     isFetching: query.isFetching,
+    refreshFailure: null,
   };
 }

@@ -14,6 +14,8 @@ import { Route as ShellRoute } from "../routes/_shell.js";
 const state = vi.hoisted(() => ({
   snapshot: null as unknown,
   queryKeys: [] as unknown[],
+  intervals: [] as (number | undefined)[],
+  refreshFailure: null as { message: string | null } | null,
 }));
 
 vi.mock("@tanstack/react-start", async (importOriginal) => ({
@@ -28,11 +30,18 @@ vi.mock("../projects/context.js", async (importOriginal) => ({
 
 vi.mock("../queries/index.js", async (importOriginal) => ({
   ...(await importOriginal<typeof Queries>()),
-  useSnapshotQuery: ({ queryKey }: { queryKey: readonly unknown[] }) => {
+  useSnapshotQuery: ({
+    queryKey,
+    ...options
+  }: {
+    queryKey: readonly unknown[];
+    refetchInterval?: number;
+  }) => {
+    state.intervals.push(options.refetchInterval);
     state.queryKeys.push(queryKey);
     const data =
       queryKey[0] === "run-detail" ? { sequence: 1, value: state.snapshot } : state.snapshot;
-    return { status: "success", data, refetch: () => {} };
+    return { status: "success", data, refetch: () => {}, refreshFailure: state.refreshFailure };
   },
 }));
 
@@ -147,6 +156,18 @@ describe("organization activity routes", () => {
       assert.match(second, /26 to 26/u);
       assert.match(second, /href="\/o\/acme%20team\/activity"[^>]*>Newer/u);
       assert.match(second, /<button[^>]*disabled[^>]*>Older/u);
+
+      assert.equal(state.intervals.at(-1), undefined);
+      assert.doesNotMatch(second, /out of date/u);
+      state.refreshFailure = { message: "Hub is down" };
+      const stale = await renderRoute("/o/acme%20team/activity?cursor=older-cursor&page=2");
+      assert.match(stale, /Activity may be out of date/u);
+      assert.match(stale, /Hub is down/u);
+      state.refreshFailure = null;
+
+      state.intervals = [];
+      await renderRoute("/o/acme%20team/activity");
+      assert.equal(state.intervals.at(-1), 5000);
 
       state.snapshot = { activity: [], nextCursor: null, previousCursor: null };
       assert.doesNotMatch(await renderRoute("/o/acme%20team/activity"), /Activity pages/u);
