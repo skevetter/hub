@@ -53,6 +53,7 @@ import { Route as ShellOOrganizationSlugTriggersIndexRouteImport } from './route
 import { Route as ShellOOrganizationSlugSettingsIndexRouteImport } from './routes/_shell/o/$organizationSlug/settings/index'
 import { Route as ShellOOrganizationSlugActivityIndexRouteImport } from './routes/_shell/o/$organizationSlug/activity/index'
 import { Route as ApiV1RunsRunIdEventsRouteImport } from './routes/api/v1/runs/$runId/events'
+import { Route as ApiV1InteractiveSessionsSessionIdEventsRouteImport } from './routes/api/v1/interactive-sessions/$sessionId/events'
 import { Route as ShellOOrganizationSlugTriggersTriggerIdRouteImport } from './routes/_shell/o/$organizationSlug/triggers/$triggerId'
 import { Route as ShellOOrganizationSlugSettingsUsageRouteImport } from './routes/_shell/o/$organizationSlug/settings/usage'
 import { Route as ShellOOrganizationSlugSettingsTeamRouteImport } from './routes/_shell/o/$organizationSlug/settings/team'
@@ -299,6 +300,12 @@ const ApiV1RunsRunIdEventsRoute = ApiV1RunsRunIdEventsRouteImport.update({
   path: '/api/v1/runs/$runId/events',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiV1InteractiveSessionsSessionIdEventsRoute =
+  ApiV1InteractiveSessionsSessionIdEventsRouteImport.update({
+    id: '/api/v1/interactive-sessions/$sessionId/events',
+    path: '/api/v1/interactive-sessions/$sessionId/events',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ShellOOrganizationSlugTriggersTriggerIdRoute =
   ShellOOrganizationSlugTriggersTriggerIdRouteImport.update({
     id: '/$triggerId',
@@ -382,6 +389,7 @@ export interface FileRoutesByFullPath {
   '/o/$organizationSlug/settings/team': typeof ShellOOrganizationSlugSettingsTeamRoute
   '/o/$organizationSlug/settings/usage': typeof ShellOOrganizationSlugSettingsUsageRoute
   '/o/$organizationSlug/triggers/$triggerId': typeof ShellOOrganizationSlugTriggersTriggerIdRoute
+  '/api/v1/interactive-sessions/$sessionId/events': typeof ApiV1InteractiveSessionsSessionIdEventsRoute
   '/api/v1/runs/$runId/events': typeof ApiV1RunsRunIdEventsRoute
   '/o/$organizationSlug/activity/': typeof ShellOOrganizationSlugActivityIndexRoute
   '/o/$organizationSlug/settings/': typeof ShellOOrganizationSlugSettingsIndexRoute
@@ -430,6 +438,7 @@ export interface FileRoutesByTo {
   '/o/$organizationSlug/settings/team': typeof ShellOOrganizationSlugSettingsTeamRoute
   '/o/$organizationSlug/settings/usage': typeof ShellOOrganizationSlugSettingsUsageRoute
   '/o/$organizationSlug/triggers/$triggerId': typeof ShellOOrganizationSlugTriggersTriggerIdRoute
+  '/api/v1/interactive-sessions/$sessionId/events': typeof ApiV1InteractiveSessionsSessionIdEventsRoute
   '/api/v1/runs/$runId/events': typeof ApiV1RunsRunIdEventsRoute
   '/o/$organizationSlug/activity': typeof ShellOOrganizationSlugActivityIndexRoute
   '/o/$organizationSlug/settings': typeof ShellOOrganizationSlugSettingsIndexRoute
@@ -483,6 +492,7 @@ export interface FileRoutesById {
   '/_shell/o/$organizationSlug/settings/team': typeof ShellOOrganizationSlugSettingsTeamRoute
   '/_shell/o/$organizationSlug/settings/usage': typeof ShellOOrganizationSlugSettingsUsageRoute
   '/_shell/o/$organizationSlug/triggers/$triggerId': typeof ShellOOrganizationSlugTriggersTriggerIdRoute
+  '/api/v1/interactive-sessions/$sessionId/events': typeof ApiV1InteractiveSessionsSessionIdEventsRoute
   '/api/v1/runs/$runId/events': typeof ApiV1RunsRunIdEventsRoute
   '/_shell/o/$organizationSlug/activity/': typeof ShellOOrganizationSlugActivityIndexRoute
   '/_shell/o/$organizationSlug/settings/': typeof ShellOOrganizationSlugSettingsIndexRoute
@@ -536,6 +546,7 @@ export interface FileRouteTypes {
     | '/o/$organizationSlug/settings/team'
     | '/o/$organizationSlug/settings/usage'
     | '/o/$organizationSlug/triggers/$triggerId'
+    | '/api/v1/interactive-sessions/$sessionId/events'
     | '/api/v1/runs/$runId/events'
     | '/o/$organizationSlug/activity/'
     | '/o/$organizationSlug/settings/'
@@ -584,6 +595,7 @@ export interface FileRouteTypes {
     | '/o/$organizationSlug/settings/team'
     | '/o/$organizationSlug/settings/usage'
     | '/o/$organizationSlug/triggers/$triggerId'
+    | '/api/v1/interactive-sessions/$sessionId/events'
     | '/api/v1/runs/$runId/events'
     | '/o/$organizationSlug/activity'
     | '/o/$organizationSlug/settings'
@@ -636,6 +648,7 @@ export interface FileRouteTypes {
     | '/_shell/o/$organizationSlug/settings/team'
     | '/_shell/o/$organizationSlug/settings/usage'
     | '/_shell/o/$organizationSlug/triggers/$triggerId'
+    | '/api/v1/interactive-sessions/$sessionId/events'
     | '/api/v1/runs/$runId/events'
     | '/_shell/o/$organizationSlug/activity/'
     | '/_shell/o/$organizationSlug/settings/'
@@ -670,6 +683,7 @@ export interface RootRouteChildren {
   ApiIntegrationsLinearEventsRoute: typeof ApiIntegrationsLinearEventsRoute
   ApiIntegrationsSlackCallbackRoute: typeof ApiIntegrationsSlackCallbackRoute
   ApiIntegrationsSlackEventsRoute: typeof ApiIntegrationsSlackEventsRoute
+  ApiV1InteractiveSessionsSessionIdEventsRoute: typeof ApiV1InteractiveSessionsSessionIdEventsRoute
   ApiV1RunsRunIdEventsRoute: typeof ApiV1RunsRunIdEventsRoute
 }
 
@@ -983,6 +997,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiV1RunsRunIdEventsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/v1/interactive-sessions/$sessionId/events': {
+      id: '/api/v1/interactive-sessions/$sessionId/events'
+      path: '/api/v1/interactive-sessions/$sessionId/events'
+      fullPath: '/api/v1/interactive-sessions/$sessionId/events'
+      preLoaderRoute: typeof ApiV1InteractiveSessionsSessionIdEventsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/_shell/o/$organizationSlug/triggers/$triggerId': {
       id: '/_shell/o/$organizationSlug/triggers/$triggerId'
       path: '/$triggerId'
@@ -1170,6 +1191,8 @@ const rootRouteChildren: RootRouteChildren = {
   ApiIntegrationsLinearEventsRoute: ApiIntegrationsLinearEventsRoute,
   ApiIntegrationsSlackCallbackRoute: ApiIntegrationsSlackCallbackRoute,
   ApiIntegrationsSlackEventsRoute: ApiIntegrationsSlackEventsRoute,
+  ApiV1InteractiveSessionsSessionIdEventsRoute:
+    ApiV1InteractiveSessionsSessionIdEventsRoute,
   ApiV1RunsRunIdEventsRoute: ApiV1RunsRunIdEventsRoute,
 }
 export const routeTree = rootRouteImport
