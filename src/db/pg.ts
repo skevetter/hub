@@ -1,3 +1,4 @@
+import { InteractiveSessionRepository } from "../interactive-sessions/postgres-store.js";
 import { expireReceiptPayload, scanReceiptPayloads } from "./receipt-payload-retention.js";
 import {
   expireGitHubSyncPayload,
@@ -351,6 +352,41 @@ class PgDatabase implements Database {
   get stopInterrupts() {
     return postgresStopInterrupts(this.pool);
   }
+  private readonly interactiveSessions: InteractiveSessionRepository;
+  listSessionProfiles: Database["listSessionProfiles"] = (...args) =>
+    this.interactiveSessions.listSessionProfiles(...args);
+  findSessionProfile: Database["findSessionProfile"] = (...args) =>
+    this.interactiveSessions.findSessionProfile(...args);
+  saveSessionProfile: Database["saveSessionProfile"] = (...args) =>
+    this.interactiveSessions.saveSessionProfile(...args);
+  startInteractiveSession: Database["startInteractiveSession"] = (...args) =>
+    this.interactiveSessions.startInteractiveSession(...args);
+  acceptInteractiveSessionCommand: Database["acceptInteractiveSessionCommand"] = (...args) =>
+    this.interactiveSessions.acceptInteractiveSessionCommand(...args);
+  listInteractiveSessions: Database["listInteractiveSessions"] = (...args) =>
+    this.interactiveSessions.listInteractiveSessions(...args);
+  findInteractiveSession: Database["findInteractiveSession"] = (...args) =>
+    this.interactiveSessions.findInteractiveSession(...args);
+  listInteractiveSessionMessages: Database["listInteractiveSessionMessages"] = (...args) =>
+    this.interactiveSessions.listInteractiveSessionMessages(...args);
+  listInteractiveSessionEvents: Database["listInteractiveSessionEvents"] = (...args) =>
+    this.interactiveSessions.listInteractiveSessionEvents(...args);
+  claimInteractiveSessionCommand: Database["claimInteractiveSessionCommand"] = (...args) =>
+    this.interactiveSessions.claimInteractiveSessionCommand(...args);
+  settleInteractiveSessionCommand: Database["settleInteractiveSessionCommand"] = (...args) =>
+    this.interactiveSessions.settleInteractiveSessionCommand(...args);
+  bindInteractiveSessionAgent: Database["bindInteractiveSessionAgent"] = (...args) =>
+    this.interactiveSessions.bindInteractiveSessionAgent(...args);
+  applyInteractiveSessionState: Database["applyInteractiveSessionState"] = (...args) =>
+    this.interactiveSessions.applyInteractiveSessionState(...args);
+  setInteractiveSessionParticipant: Database["setInteractiveSessionParticipant"] = (...args) =>
+    this.interactiveSessions.setInteractiveSessionParticipant(...args);
+  listRecoverableInteractiveSessions: Database["listRecoverableInteractiveSessions"] = (...args) =>
+    this.interactiveSessions.listRecoverableInteractiveSessions(...args);
+  expireInteractiveSessionMessageBodies: Database["expireInteractiveSessionMessageBodies"] = (
+    ...args
+  ) => this.interactiveSessions.expireInteractiveSessionMessageBodies(...args);
+
   scanUnknownTemporaryCredentials: Database["scanUnknownTemporaryCredentials"] = (after, limit) =>
     scanUnknownTemporaryCredentials(this.pool, after, limit);
   backfillTemporaryCredentialFact: Database["backfillTemporaryCredentialFact"] = (id) =>
@@ -523,6 +559,11 @@ class PgDatabase implements Database {
   ) {
     this.schedules = new ScheduleRepository(this.pool);
     this.timeline = new RunTimelineRepository(this.pool, locks);
+    this.interactiveSessions = new InteractiveSessionRepository(
+      this.pool,
+      locks,
+      reserveOrganizationUsageOnClient,
+    );
     this.githubNotifications = new GitHubNotificationRepository(this.pool, locks);
     this.executionAuthority = new ExecutionAuthorityRepository(this.pool);
     this.connections = new ConnectionRepository(this.pool, locks);

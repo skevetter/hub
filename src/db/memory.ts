@@ -1,4 +1,41 @@
 import { isCanceledExecution, type StopCleanupState } from "../triggers/run-stop.js";
+import { capabilities } from "../interactive-sessions/access.js";
+import {
+  advanceForCommand,
+  claimPatch,
+  commandCapability,
+  commandHash,
+  commandLeaseEligible,
+  commandRefusal,
+  deliveryEvent,
+  maxDeliveryAttempts,
+  messageEvent,
+  messageRecord,
+  newCommand,
+  newSession,
+  interruptCommand,
+  profileRecord,
+  profileSettings,
+  profileValidation,
+  profileVersionMatches,
+  refused,
+  sessionPage,
+  sessionUsage,
+  settlePatch,
+  startHash,
+  startParticipants,
+  stateEvent,
+  unsettledStatuses,
+  validMessage,
+} from "../interactive-sessions/store.js";
+import type { SessionEventDraft } from "../interactive-sessions/store.js";
+import type {
+  SessionCommandRecord,
+  SessionEventRecord,
+  SessionProfileRecord,
+  SessionRecord,
+  SessionWithParticipants,
+} from "../interactive-sessions/types.js";
 import {
   EXPIRED_CURSOR_DIAGNOSTIC,
   cursorDiagnosticDisposition,
@@ -247,6 +284,508 @@ export function createMemoryDatabase(options: MemoryDatabaseOptions = {}): Datab
 }
 
 class MemoryDatabase implements Database {
+  private readonly sessionProfiles = new Map<string, SessionProfileRecord>();
+  private readonly interactiveSessions = new Map<string, SessionWithParticipants>();
+  private readonly interactiveCommands = new Map<string, SessionCommandRecord[]>();
+  private readonly interactiveEvents = new Map<string, SessionEventRecord[]>();
+
+  listSessionProfiles: Database["listSessionProfiles"] = async (organizationId) =>
+    structuredClone(
+      [...this.sessionProfiles.values()]
+        .filter((profile) => profile.organizationId === organizationId)
+        .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)),
+    );
+
+  findSessionProfile: Database["findSessionProfile"] = async (organizationId, id) => {
+    const profile = this.sessionProfiles.get(id.toLowerCase());
+    return profile?.organizationId === organizationId ? structuredClone(profile) : undefined;
+  };
+
+  saveSessionProfile: Database["saveSessionProfile"] = (input) =>
+    this.withAdvisoryLock("isession-memory", async () => {
+      const { organizationId, userId } = input.principal;
+      const settings = profileSettings(input);
+      const invalid = profileValidation(settings);
+      if (invalid) return invalid;
+      const role = this.sessionMemberRole(organizationId, userId);
+      if (!role || role === "member") return "forbidden";
+      const daemon = await this.findDaemonForOrganization(organizationId, input.daemonId);
+      if (daemon?.status !== "active" || !daemon.permissions.includes("hub.execute"))
+        return "daemon_unavailable";
+      if (role !== "owner" && this.sessionDaemonEnroller(organizationId, daemon) !== userId) {
+        return "forbidden";
+      }
+      const current =
+        input.id === null ? undefined : this.sessionProfiles.get(input.id.toLowerCase());
+      if (!profileVersionMatches(input, current)) return "version_conflict";
+      if (current && role !== "owner" && current.createdByUserId !== userId) return "forbidden";
+      if (
+        [...this.sessionProfiles.values()].some(
+          (profile) =>
+            profile.organizationId === organizationId &&
+            profile.name === input.name &&
+            profile.id !== current?.id,
+        )
+      )
+        return "name_taken";
+      const record = profileRecord(input, settings, current);
+      this.sessionProfiles.set(record.id, structuredClone(record));
+      return structuredClone(record);
+    });
+
+  startInteractiveSession: Database["startInteractiveSession"] = (input) =>
+    this.withAdvisoryLock("isession-memory", async () => {
+      const { organizationId, userId } = input.principal;
+      if (!this.sessionMemberRole(organizationId, userId)) return refused("forbidden");
+      const people = startParticipants(input);
+      const hash = startHash(input, people);
+      const prior = [...this.interactiveSessions.values()].find(
+        ({ session }) =>
+          session.organizationId === organizationId &&
+          session.startedByUserId === userId &&
+          session.startIdempotencyKey === input.idempotencyKey.toLowerCase(),
+      );
+      if (prior) {
+        return prior.session.startRequestHash === hash
+          ? {
+              status: "replayed",
+              ...structuredClone({
+                session: prior.session,
+                command: this.interactiveCommands.get(prior.session.id)![0]!,
+              }),
+            }
+          : refused("idempotency_conflict");
+      }
+      if (!validMessage(input.message)) return refused("message_too_long");
+      const profile = this.sessionProfiles.get(input.profileId.toLowerCase());
+      if (profile?.organizationId !== organizationId || profile.status !== "active")
+        return refused("profile_unavailable");
+      if (profile.version !== input.profileVersion) return refused("profile_changed");
+      const daemon = await this.findDaemonForOrganization(organizationId, profile.daemonId);
+      if (
+        daemon?.status !== "active" ||
+        daemon.presence !== "connected" ||
+        !daemon.permissions.includes("hub.execute")
+      ) {
+        return refused("daemon_unavailable");
+      }
+      const active = [...this.interactiveSessions.values()].filter(
+        ({ session }) =>
+          session.organizationId === organizationId &&
+          session.daemonId === profile.daemonId &&
+          session.state !== "closed",
+      );
+      if (active.length >= input.maxActivePerDaemon) return refused("active_limit");
+      if (!people.every((person) => this.sessionMemberRole(organizationId, person.userId)))
+        return refused("invalid_participant");
+      if (!(await this.consumeOrganizationUsage(sessionUsage(input.principal, input.usage))))
+        return refused("usage_limit");
+      const session = newSession(input, profile, hash);
+      const command = newCommand(session, input, "message", "steer", input.message, hash);
+      const row: SessionWithParticipants = {
+        session,
+        participants: people.map(({ userId: participantId, role }) => ({
+          userId: participantId,
+          role,
+          organizationId,
+          sessionId: session.id,
+          addedByUserId: userId,
+          createdAt: input.now,
+        })),
+      };
+      this.interactiveSessions.set(session.id, row);
+      this.interactiveCommands.set(session.id, [structuredClone(command)]);
+      this.interactiveEvents.set(session.id, []);
+      this.appendSessionEvents(row, session, input.now, [
+        stateEvent(session),
+        messageEvent(command),
+      ]);
+      return { status: "created", ...structuredClone({ session: row.session, command }) };
+    });
+
+  acceptInteractiveSessionCommand: Database["acceptInteractiveSessionCommand"] = (input) =>
+    this.withAdvisoryLock("isession-memory", async () => {
+      const { organizationId, userId } = input.principal;
+      const row = this.scopedInteractiveSession(organizationId, input.sessionId);
+      if (!row) return refused("not_found");
+      const { session } = row;
+      const rights = this.sessionRights(row, userId);
+      const allowed = rights?.[commandCapability[input.kind]];
+      if (!rights?.view && !allowed) return refused("not_found");
+      if (!allowed) return refused("forbidden");
+      const commands = this.interactiveCommands.get(session.id)!;
+      const hash = commandHash(input);
+      const prior = commands.find(
+        (command) =>
+          command.authorUserId === userId &&
+          command.idempotencyKey === input.idempotencyKey.toLowerCase(),
+      );
+      if (prior) {
+        return prior.requestHash === hash
+          ? { status: "replayed", ...structuredClone({ session, command: prior }) }
+          : refused("idempotency_conflict");
+      }
+      const refusal = commandRefusal(session, input);
+      if (refusal) return refused(refusal);
+      if (input.kind === "message") {
+        const queued = commands.filter(
+          (command) =>
+            command.generation === session.generation &&
+            command.kind === "message" &&
+            command.failureCode !== "delivery_unconfirmed" &&
+            unsettledStatuses.some((status) => status === command.status),
+        );
+        if (queued.length >= input.maxQueued) return refused("queue_full");
+        if (!(await this.consumeOrganizationUsage(sessionUsage(input.principal, input.usage))))
+          return refused("usage_limit");
+      }
+      const next = advanceForCommand(session, input);
+      const command = newCommand(
+        next,
+        input,
+        input.kind,
+        input.kind === "message" ? input.delivery : null,
+        input.kind === "message" ? input.message : null,
+        hash,
+      );
+      const drafts =
+        input.kind === "message"
+          ? [messageEvent(command)]
+          : [
+              stateEvent(next),
+              ...this.supersedeInteractiveCommands(session, input.kind, input.now),
+            ];
+      commands.push(structuredClone(command));
+      this.appendSessionEvents(row, next, input.now, drafts);
+      return { status: "accepted", ...structuredClone({ session: row.session, command }) };
+    });
+
+  listInteractiveSessions: Database["listInteractiveSessions"] = async (
+    organizationId,
+    viewer,
+    page,
+  ) => {
+    const role = this.sessionMemberRole(organizationId, viewer.userId);
+    if (viewer.organizationId !== organizationId || !role) return sessionPage([], page.limit);
+    const rows = [...this.interactiveSessions.values()]
+      .filter(
+        ({ session, participants }) =>
+          session.organizationId === organizationId &&
+          (page.filter !== "active" || session.state !== "closed") &&
+          capabilities({ ...viewer, role }, session, participants).view,
+      )
+      .map(({ session }) => session)
+      .filter(
+        (session) =>
+          !page.cursor ||
+          session.lastActivityAt < page.cursor.lastActivityAt ||
+          (session.lastActivityAt.getTime() === page.cursor.lastActivityAt.getTime() &&
+            session.id < page.cursor.id),
+      )
+      .sort(
+        (a, b) =>
+          b.lastActivityAt.getTime() - a.lastActivityAt.getTime() || b.id.localeCompare(a.id),
+      );
+    return structuredClone(sessionPage(rows, page.limit));
+  };
+
+  findInteractiveSession: Database["findInteractiveSession"] = async (organizationId, sessionId) =>
+    structuredClone(this.scopedInteractiveSession(organizationId, sessionId));
+
+  listInteractiveSessionMessages: Database["listInteractiveSessionMessages"] = async (
+    organizationId,
+    sessionId,
+    page,
+    cutoff,
+  ) => {
+    if (!this.scopedInteractiveSession(organizationId, sessionId)) return [];
+    return structuredClone(
+      this.interactiveCommands
+        .get(sessionId.toLowerCase())!
+        .filter(
+          (command) =>
+            command.kind === "message" &&
+            (page.beforeOrdinal === null || command.ordinal < page.beforeOrdinal),
+        )
+        .toReversed()
+        .slice(0, page.limit)
+        .map((command) => messageRecord(command, cutoff)),
+    );
+  };
+
+  listInteractiveSessionEvents: Database["listInteractiveSessionEvents"] = async (
+    organizationId,
+    sessionId,
+    afterSeq,
+    limit,
+  ) => {
+    if (!this.scopedInteractiveSession(organizationId, sessionId)) return [];
+    return structuredClone(
+      this.interactiveEvents
+        .get(sessionId.toLowerCase())!
+        .filter((event) => event.seq > afterSeq)
+        .slice(0, limit),
+    );
+  };
+
+  claimInteractiveSessionCommand: Database["claimInteractiveSessionCommand"] = (input) =>
+    this.withAdvisoryLock("isession-memory", async () => {
+      const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
+      if (!row || row.session.state === "failed") return undefined;
+      const { session } = row;
+      const drafts: SessionEventDraft[] = [];
+      const candidates = this.interactiveCommands
+        .get(session.id)!
+        .filter(
+          (command) =>
+            command.generation === session.generation &&
+            (input.lane !== "message" || command.kind === "message") &&
+            (input.lane !== "control" || command.kind !== "message") &&
+            (session.state !== "closed" || command.kind === "close"),
+        );
+      if (
+        candidates.some(
+          (command) =>
+            command.status === "dispatching" &&
+            command.claimExpiresAt !== null &&
+            command.claimExpiresAt > input.now,
+        )
+      )
+        return undefined;
+      let claimed: SessionCommandRecord | undefined;
+      for (const command of candidates) {
+        if (!commandLeaseEligible(command, input)) continue;
+        const rights = this.sessionRights(row, command.authorUserId);
+        const patch = claimPatch(command, input, rights);
+        Object.assign(command, structuredClone(patch));
+        drafts.push(deliveryEvent(command));
+        if (command.status === "dispatching") {
+          claimed = command;
+          break;
+        }
+      }
+      if (drafts.length > 0) this.appendSessionEvents(row, session, input.now, drafts);
+      return structuredClone(claimed);
+    });
+
+  settleInteractiveSessionCommand: Database["settleInteractiveSessionCommand"] = (input) =>
+    this.withAdvisoryLock("isession-memory", async () => {
+      const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
+      if (!row || row.session.generation !== input.generation) return false;
+      const command = this.interactiveCommands
+        .get(row.session.id)!
+        .find(
+          (entry) =>
+            entry.id === input.commandId.toLowerCase() &&
+            entry.generation === input.generation &&
+            entry.status === "dispatching" &&
+            entry.claimOwner === input.claimOwner &&
+            entry.attempts === input.attempts &&
+            entry.claimExpiresAt !== null &&
+            entry.claimExpiresAt > input.now,
+        );
+      if (!command) return false;
+      const failureCode =
+        input.status === "unknown" && command.attempts >= maxDeliveryAttempts
+          ? "delivery_unconfirmed"
+          : input.failureCode;
+      Object.assign(command, structuredClone(settlePatch(input.status, input.now, failureCode)));
+      this.appendSessionEvents(row, row.session, input.now, [deliveryEvent(command)]);
+      return true;
+    });
+
+  bindInteractiveSessionAgent: Database["bindInteractiveSessionAgent"] = (input) =>
+    this.withAdvisoryLock("isession-memory", async () => {
+      const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
+      if (!row || row.session.generation !== input.generation || row.session.state !== "starting")
+        return false;
+      const { session } = row;
+      if (session.daemonAgentId !== null) {
+        return (
+          session.daemonAgentId === input.agentId && session.daemonWorkspaceId === input.workspaceId
+        );
+      }
+      const next = {
+        ...session,
+        daemonAgentId: input.agentId,
+        daemonWorkspaceId: input.workspaceId,
+      };
+      this.appendSessionEvents(row, next, input.now, [stateEvent(next)]);
+      return true;
+    });
+
+  applyInteractiveSessionState: Database["applyInteractiveSessionState"] = (input) =>
+    this.withAdvisoryLock("isession-memory", async () => {
+      const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
+      if (!row) return undefined;
+      const { session } = row;
+      if (
+        session.generation !== input.generation ||
+        session.daemonAgentId !== input.agentId ||
+        session.state === "closed" ||
+        !input.from.includes(session.state)
+      )
+        return undefined;
+      const next = { ...session, state: input.to, stateReason: input.reason ?? null };
+      if (next.state !== session.state || next.stateReason !== session.stateReason) {
+        const drafts = [stateEvent(next)];
+        if (input.reason === "daemon_revoked")
+          drafts.push(...this.supersedeInteractiveCommands(session, "close", input.now));
+        this.appendSessionEvents(row, next, input.now, drafts);
+      }
+      return structuredClone(row.session);
+    });
+
+  setInteractiveSessionParticipant: Database["setInteractiveSessionParticipant"] = (input) =>
+    this.withAdvisoryLock("isession-memory", async () => {
+      const { organizationId, userId } = input.principal;
+      const row = this.scopedInteractiveSession(organizationId, input.sessionId);
+      if (!row) return "not_found";
+      const rights = this.sessionRights(row, userId);
+      if (!rights?.view) return "not_found";
+      if (!rights.manageParticipants) return "forbidden";
+      if (input.role !== null && !this.sessionMemberRole(organizationId, input.userId))
+        return "not_member";
+      const current = row.participants.find((person) => person.userId === input.userId);
+      if ((current?.role ?? null) === input.role) return input.role === null ? "removed" : "set";
+      if (
+        current?.role === "controller" &&
+        input.role !== "controller" &&
+        !row.participants.some(
+          (person) =>
+            person.userId !== input.userId &&
+            person.role === "controller" &&
+            this.sessionMemberRole(organizationId, person.userId),
+        )
+      )
+        return "last_controller";
+      if (input.role === null) {
+        row.participants = row.participants.filter((person) => person.userId !== input.userId);
+      } else if (current) {
+        current.role = input.role;
+        current.addedByUserId = userId;
+      } else {
+        row.participants.push({
+          userId: input.userId,
+          role: input.role,
+          organizationId,
+          sessionId: input.sessionId,
+          addedByUserId: userId,
+          createdAt: new Date(input.now),
+        });
+        row.participants.sort((a, b) => a.userId.localeCompare(b.userId));
+      }
+      this.appendSessionEvents(row, row.session, input.now, [
+        { kind: "participants", commandId: null, data: { userId: input.userId, role: input.role } },
+      ]);
+      return input.role === null ? "removed" : "set";
+    });
+
+  listRecoverableInteractiveSessions: Database["listRecoverableInteractiveSessions"] = async (
+    organizationId,
+    daemonId,
+  ) =>
+    structuredClone(
+      [...this.interactiveSessions.values()]
+        .map(({ session }) => session)
+        .filter(
+          (session) =>
+            session.organizationId === organizationId &&
+            session.state !== "closed" &&
+            (daemonId === null || session.daemonId === daemonId),
+        )
+        .sort((a, b) => a.id.localeCompare(b.id)),
+    );
+
+  expireInteractiveSessionMessageBodies: Database["expireInteractiveSessionMessageBodies"] = (
+    cutoff,
+    limit,
+    now,
+  ) =>
+    this.withAdvisoryLock("isession-memory", async () => {
+      const batch = [...this.interactiveCommands.values()]
+        .flat()
+        .filter((command) => command.body !== null && command.createdAt < cutoff)
+        .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
+        .slice(0, limit);
+      for (const command of batch) {
+        command.body = null;
+        command.bodyExpiredAt = new Date(now);
+        if (command.updatedAt < now) command.updatedAt = new Date(now);
+      }
+      return batch.length;
+    });
+
+  private scopedInteractiveSession(organizationId: string, id: string) {
+    const row = this.interactiveSessions.get(id.toLowerCase());
+    return row?.session.organizationId === organizationId ? row : undefined;
+  }
+
+  private sessionDaemonEnroller(organizationId: string, daemon: DaemonRecord) {
+    if (daemon.registeredByCliCredentialId === null) return undefined;
+    const enrollment = Array.from(this.cliAuthorizations.values()).find(
+      (authorization) =>
+        authorization.credential?.id === daemon.registeredByCliCredentialId &&
+        authorization.approvedOrganizationId === organizationId,
+    );
+    return enrollment?.approvedByUserId;
+  }
+
+  private sessionMemberRole(organizationId: string, userId: string) {
+    return this.options.memberships?.find(
+      (member) => member.organizationId === organizationId && member.userId === userId,
+    )?.role;
+  }
+
+  private sessionRights(row: SessionWithParticipants, userId: string | null) {
+    if (userId === null) return undefined;
+    const { organizationId } = row.session;
+    const role = this.sessionMemberRole(organizationId, userId);
+    return role
+      ? capabilities({ userId, organizationId, role }, row.session, row.participants)
+      : undefined;
+  }
+
+  private supersedeInteractiveCommands(
+    session: SessionRecord,
+    kind: "stop" | "close" | "replace",
+    now: Date,
+  ) {
+    const drafts: SessionEventDraft[] = [];
+    for (const command of this.interactiveCommands.get(session.id)!) {
+      if (command.generation !== session.generation) continue;
+      const patch = interruptCommand(command, kind, now);
+      if (!patch) continue;
+      Object.assign(command, structuredClone(patch));
+      drafts.push(deliveryEvent(command));
+    }
+    return drafts;
+  }
+
+  private appendSessionEvents(
+    row: SessionWithParticipants,
+    session: SessionRecord,
+    now: Date,
+    drafts: readonly SessionEventDraft[],
+  ) {
+    const events = this.interactiveEvents.get(session.id)!;
+    events.push(
+      ...drafts.map((event, index) => ({
+        ...event,
+        organizationId: session.organizationId,
+        sessionId: session.id,
+        seq: session.hubSeq + index + 1,
+        at: new Date(now),
+      })),
+    );
+    row.session = structuredClone({
+      ...session,
+      hubSeq: session.hubSeq + drafts.length,
+      lastActivityAt: session.lastActivityAt > now ? session.lastActivityAt : now,
+      updatedAt: session.updatedAt > now ? session.updatedAt : now,
+    });
+  }
+
   async scanUnknownTemporaryCredentials(after: string | null, limit: number): Promise<string[]> {
     return [...this.agentExecutions.values()]
       .filter(

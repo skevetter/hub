@@ -1839,3 +1839,284 @@ export const executionCredentialLeases = pgTable(
   },
   (table) => [index("execution_credential_leases_execution_idx").on(table.executionId)],
 );
+
+export const interactiveSessionProfiles = pgTable(
+  "interactive_session_profiles",
+  {
+    id: uuid().primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    name: text().notNull(),
+    daemonId: uuid("daemon_id").notNull(),
+    cwd: text().notNull(),
+    worktree:
+      jsonb().$type<
+        import("../interactive-sessions/types.js").SessionProfileSettings["worktree"]
+      >(),
+    provider: text().notNull(),
+    model: text(),
+    mode: text(),
+    thinkingOptionId: text("thinking_option_id"),
+    providerOptions: jsonb("provider_options")
+      .$type<Readonly<Record<string, JsonValue>>>()
+      .default({})
+      .notNull(),
+    fullAccessAcknowledged: boolean("full_access_acknowledged").default(false).notNull(),
+    status: text()
+      .$type<import("../interactive-sessions/types.js").SessionProfileStatus>()
+      .notNull(),
+    version: integer().default(1).notNull(),
+    createdByUserId: text("created_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("interactive_session_profiles_id_org_unique").on(table.id, table.organizationId),
+    uniqueIndex("interactive_session_profiles_org_name_unique").on(
+      table.organizationId,
+      table.name,
+    ),
+    foreignKey({
+      columns: [table.daemonId, table.organizationId],
+      foreignColumns: [daemons.id, daemons.organizationId],
+      name: "interactive_session_profiles_daemon_org_fk",
+    }),
+    check(
+      "interactive_session_profiles_name_check",
+      sql`char_length(${table.name}) between 1 and 80`,
+    ),
+    check(
+      "interactive_session_profiles_cwd_check",
+      sql`octet_length(${table.cwd}) <= 1024 and (
+      left(${table.cwd}, 1) = '/' or left(${table.cwd}, 2) = repeat(chr(92), 2)
+      or (left(${table.cwd}, 2) ~ '^[A-Za-z]:$' and substr(${table.cwd}, 3, 1) in ('/', chr(92))))`,
+    ),
+    check(
+      "interactive_session_profiles_worktree_check",
+      sql`${table.worktree} is null or (
+      jsonb_typeof(${table.worktree}) = 'object' and
+      ${table.worktree} @> '{"mode":"branch-off"}'::jsonb and
+      ${table.worktree} - 'mode' - 'base' = '{}'::jsonb and
+      (not (${table.worktree} ? 'base') or jsonb_typeof(${table.worktree}->'base') = 'string'))`,
+    ),
+    check(
+      "interactive_session_profiles_options_check",
+      sql`jsonb_typeof(${table.providerOptions}) = 'object' and octet_length(${table.providerOptions}::text) <= 4096`,
+    ),
+    check(
+      "interactive_session_profiles_access_check",
+      sql`${table.provider} <> 'omp' or
+      (${table.mode} is not null and (${table.mode} <> 'full' or ${table.fullAccessAcknowledged}))`,
+    ),
+    check(
+      "interactive_session_profiles_status_check",
+      sql`${table.status} in ('active', 'disabled') and ${table.version} > 0`,
+    ),
+  ],
+);
+
+export const interactiveSessions = pgTable(
+  "interactive_sessions",
+  {
+    id: uuid().primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    profileId: uuid("profile_id").notNull(),
+    profileVersion: integer("profile_version").notNull(),
+    launch: jsonb().$type<import("../interactive-sessions/types.js").SessionLaunch>().notNull(),
+    daemonId: uuid("daemon_id").notNull(),
+    title: text().notNull(),
+    state: text().$type<import("../interactive-sessions/types.js").SessionState>().notNull(),
+    stateReason:
+      text("state_reason").$type<import("../interactive-sessions/types.js").SessionStateReason>(),
+    generation: integer().default(1).notNull(),
+    daemonAgentId: text("daemon_agent_id"),
+    daemonWorkspaceId: text("daemon_workspace_id"),
+    hubSeq: integer("hub_seq").default(0).notNull(),
+    commandSeq: integer("command_seq").default(0).notNull(),
+    startedByUserId: text("started_by_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    startIdempotencyKey: uuid("start_idempotency_key").notNull(),
+    startRequestHash: text("start_request_hash").notNull(),
+    lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).defaultNow().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    closedAt: timestamp("closed_at", { withTimezone: true }),
+    closedByUserId: text("closed_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  },
+  (table) => [
+    uniqueIndex("interactive_sessions_id_org_unique").on(table.id, table.organizationId),
+    uniqueIndex("interactive_sessions_start_key_unique").on(
+      table.organizationId,
+      table.startedByUserId,
+      table.startIdempotencyKey,
+    ),
+    index("interactive_sessions_org_activity_idx").on(
+      table.organizationId,
+      table.lastActivityAt.desc(),
+      table.id.desc(),
+    ),
+    index("interactive_sessions_open_daemon_idx")
+      .on(table.daemonId)
+      .where(sql`${table.state} <> 'closed'`),
+    foreignKey({
+      columns: [table.profileId, table.organizationId],
+      foreignColumns: [interactiveSessionProfiles.id, interactiveSessionProfiles.organizationId],
+      name: "interactive_sessions_profile_org_fk",
+    }),
+    foreignKey({
+      columns: [table.daemonId, table.organizationId],
+      foreignColumns: [daemons.id, daemons.organizationId],
+      name: "interactive_sessions_daemon_org_fk",
+    }),
+    check(
+      "interactive_sessions_state_check",
+      sql`${table.state} in ('starting', 'running', 'idle', 'waiting_permission', 'stopping', 'failed', 'closed')`,
+    ),
+    check(
+      "interactive_sessions_reason_check",
+      sql`${table.stateReason} in ('stopped_by_person', 'launch_failed', 'agent_missing', 'daemon_revoked', 'closed_by_person')`,
+    ),
+    check(
+      "interactive_sessions_closed_check",
+      sql`(${table.state} = 'closed') = (${table.closedAt} is not null)`,
+    ),
+  ],
+);
+
+export const interactiveSessionParticipants = pgTable(
+  "interactive_session_participants",
+  {
+    sessionId: uuid("session_id").notNull(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    role: text().$type<import("../interactive-sessions/types.js").ParticipantRole>().notNull(),
+    addedByUserId: text("added_by_user_id").references(() => users.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.sessionId, table.userId] }),
+    foreignKey({
+      columns: [table.sessionId, table.organizationId],
+      foreignColumns: [interactiveSessions.id, interactiveSessions.organizationId],
+      name: "interactive_session_participants_session_org_fk",
+    }).onDelete("cascade"),
+    index("interactive_session_participants_org_user_idx").on(table.organizationId, table.userId),
+    check(
+      "interactive_session_participants_role_check",
+      sql`${table.role} in ('controller', 'viewer')`,
+    ),
+  ],
+);
+
+export const interactiveSessionCommands = pgTable(
+  "interactive_session_commands",
+  {
+    id: uuid().primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    sessionId: uuid("session_id").notNull(),
+    ordinal: integer().notNull(),
+    generation: integer().notNull(),
+    kind: text().$type<import("../interactive-sessions/types.js").CommandKind>().notNull(),
+    delivery: text().$type<import("../interactive-sessions/types.js").Delivery>(),
+    status: text().$type<import("../interactive-sessions/types.js").CommandStatus>().notNull(),
+    failureCode:
+      text("failure_code").$type<import("../interactive-sessions/types.js").CommandFailureCode>(),
+    body: text(),
+    bodyExpiredAt: timestamp("body_expired_at", { withTimezone: true }),
+    authorUserId: text("author_user_id").references(() => users.id, { onDelete: "set null" }),
+    idempotencyKey: uuid("idempotency_key").notNull(),
+    requestHash: text("request_hash").notNull(),
+    attempts: integer().default(0).notNull(),
+    claimOwner: text("claim_owner"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
+    settledAt: timestamp("settled_at", { withTimezone: true }),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.sessionId, table.organizationId],
+      foreignColumns: [interactiveSessions.id, interactiveSessions.organizationId],
+      name: "interactive_session_commands_session_org_fk",
+    }).onDelete("cascade"),
+    uniqueIndex("interactive_session_commands_ordinal_unique").on(table.sessionId, table.ordinal),
+    uniqueIndex("interactive_session_commands_key_unique").on(
+      table.sessionId,
+      table.authorUserId,
+      table.idempotencyKey,
+    ),
+    index("interactive_session_commands_dispatch_idx")
+      .on(table.sessionId, table.ordinal)
+      .where(sql`${table.status} in ('pending', 'queued', 'dispatching', 'unknown')`),
+    index("interactive_session_commands_expiry_idx")
+      .on(table.createdAt)
+      .where(sql`${table.body} is not null`),
+    check(
+      "interactive_session_commands_kind_check",
+      sql`${table.kind} in ('message', 'stop', 'close', 'replace')`,
+    ),
+    check(
+      "interactive_session_commands_status_check",
+      sql`${table.status} in ('pending', 'queued', 'dispatching', 'delivered', 'unknown', 'superseded', 'failed', 'done')`,
+    ),
+    check(
+      "interactive_session_commands_delivery_check",
+      sql`(${table.kind} = 'message') = (${table.delivery} is not null) and ${table.delivery} in ('steer', 'queue')`,
+    ),
+    check(
+      "interactive_session_commands_body_check",
+      sql`octet_length(${table.body}) <= 16384 and
+      (${table.kind} <> 'message' or ${table.body} is not null or ${table.bodyExpiredAt} is not null) and
+      (${table.bodyExpiredAt} is null or ${table.body} is null)`,
+    ),
+    check(
+      "interactive_session_commands_failure_check",
+      sql`${table.failureCode} in ('key_conflict', 'agent_missing', 'daemon_rejected', 'launch_failed', 'delivery_unconfirmed')`,
+    ),
+  ],
+);
+
+export const interactiveSessionEvents = pgTable(
+  "interactive_session_events",
+  {
+    sessionId: uuid("session_id").notNull(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    seq: integer().notNull(),
+    kind: text()
+      .$type<import("../interactive-sessions/types.js").SessionEventRecord["kind"]>()
+      .notNull(),
+    commandId: uuid("command_id"),
+    data: jsonb()
+      .$type<import("../interactive-sessions/types.js").SessionEventRecord["data"]>()
+      .notNull(),
+    at: timestamp({ withTimezone: true }).notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.sessionId, table.seq] }),
+    foreignKey({
+      columns: [table.sessionId, table.organizationId],
+      foreignColumns: [interactiveSessions.id, interactiveSessions.organizationId],
+      name: "interactive_session_events_session_org_fk",
+    }).onDelete("cascade"),
+    check(
+      "interactive_session_events_kind_check",
+      sql`${table.kind} in ('message', 'delivery', 'state', 'participants')`,
+    ),
+    check("interactive_session_events_data_check", sql`octet_length(${table.data}::text) <= 1024`),
+  ],
+);
