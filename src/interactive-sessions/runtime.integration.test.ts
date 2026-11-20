@@ -17,6 +17,7 @@ import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.j
 import { createFetchServer } from "../http/node-server.js";
 import { DaemonAgents } from "../daemons/agents/index.js";
 import { beginProductionShutdown, startProductionRuntime } from "../index.js";
+import { createLogger, logger } from "../logger.js";
 import { startApplication, stopApplication, type ApplicationRuntime } from "../server/runtime.js";
 import { handleInteractiveSessionEvents } from "../routes/api/v1/interactive-sessions/$sessionId/events.js";
 import { InteractiveSessionCoordinator, type CommandOutcome } from "./coordinator.js";
@@ -74,6 +75,40 @@ it("keeps the disabled runtime off the daemon and refuses its stream", async () 
     const state = await fixture.accountState(runtime);
     expect(state.status).toBe("active");
     expect(state).not.toHaveProperty("features");
+  } finally {
+    await fixture.close();
+  }
+}, 120_000);
+
+it("logs only the interactive stream failure class and code as error details", async () => {
+  const fixture = await embeddedHub();
+  try {
+    const { origin } = await fixture.start(true);
+    const lines: string[] = [];
+    const sink = createLogger({ write: (line) => lines.push(line) });
+    sink.level = "warn";
+    vi.spyOn(logger, "warn").mockImplementation(sink.warn.bind(sink));
+    vi.spyOn(InteractiveSessionService.prototype, "authorizeStream").mockRejectedValue(
+      Object.assign(
+        new TypeError("private upstream diagnostic", {
+          cause: new Error("private provider cause"),
+        }),
+        { code: "E_UPSTREAM", body: "private provider body" },
+      ),
+    );
+    const response = await handleInteractiveSessionEvents({
+      request: new Request(origin + "/events"),
+      params: { sessionId: randomUUID() },
+    });
+    expect(response.status).toBe(503);
+    const line = lines.find((entry) => entry.includes("interactive session stream failed"));
+    assert.ok(line);
+    const logRecord: unknown = JSON.parse(line);
+    expect(logRecord).toMatchObject({ errorType: "TypeError", errorCode: "E_UPSTREAM" });
+    expect(logRecord).not.toHaveProperty("err");
+    expect(line).not.toMatch(
+      /private upstream diagnostic|private provider cause|private provider body/u,
+    );
   } finally {
     await fixture.close();
   }

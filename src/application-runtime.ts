@@ -10,7 +10,7 @@ import {
   type HubRuntime,
   type HubRuntimeOptions,
 } from "./app.js";
-import { logger } from "./logger.js";
+import { logger, serializeError } from "./logger.js";
 import { RunTimeline } from "./run-timeline/index.js";
 import { RunTimelineReconciler } from "./run-timeline/reconcile.js";
 import { RunTimelineBus } from "./run-timeline/bus.js";
@@ -540,9 +540,13 @@ function createInteractiveSessionsRuntime(
   }
   const scrubValues = timelineScrubValues(options);
   const scrub = createTimelineScrubber({ scrubValues });
+  const failureFields = (error: unknown) => {
+    const { type, code } = serializeError(error, { scrubValues });
+    return { errorType: type, ...(code === undefined ? {} : { errorCode: code }) };
+  };
   const bodyCutoff = (now: Date) => sessionMessageBodyCutoff(runPayloadRetention, now);
-  const bus = new SessionEventBus(() =>
-    logger.warn("interactive session event notification failed"),
+  const bus = new SessionEventBus((error) =>
+    logger.warn(failureFields(error), "interactive session event notification failed"),
   );
   const coordinator = new InteractiveSessionCoordinator({
     database,
@@ -554,8 +558,11 @@ function createInteractiveSessionsRuntime(
     scrubValues,
     instanceId: randomUUID(),
     bodyCutoff,
-    reportFailure: (_error, operation) =>
-      logger.warn({ operation }, "interactive session coordinator operation failed"),
+    reportFailure: (error, operation) =>
+      logger.warn(
+        { operation, ...failureFields(error) },
+        "interactive session coordinator operation failed",
+      ),
   });
   const service = new InteractiveSessionService({
     database,
@@ -572,8 +579,8 @@ function createInteractiveSessionsRuntime(
     service,
     bus,
     settings: options.runProgress ?? readRunProgressSettings({}),
-    reportFailure: (_error, requestId) =>
-      logger.warn({ requestId }, "interactive session stream failed"),
+    reportFailure: (error, requestId) =>
+      logger.warn({ requestId, ...failureFields(error) }, "interactive session stream failed"),
   });
   return {
     hubOptions: { interactiveSessions: coordinator },
