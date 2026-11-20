@@ -1,8 +1,124 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, describe, it } from "vitest";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+import { SendAgentMessageResponseMessageSchema } from "@getpaseo/protocol/messages";
+import { afterEach, beforeEach, describe, it, onTestFinished, vi } from "vitest";
+import { WebSocket } from "ws";
+import { z } from "zod";
+import { DaemonAgents } from "../daemons/agents/index.js";
+import { DaemonResponseLostError } from "../daemons/protocol.js";
+import { HubDaemonServerInfoEnvelopeSchema } from "../hub/protocol.js";
 import { HubE2E } from "./harness/index.js";
+import { SourcePaseo } from "./harness/source-paseo.js";
 
 const describeRealAgent = process.env["RUN_HUB_REAL_AGENT_E2E"] === "1" ? describe : describe.skip;
+
+async function connectAgentAdapter(daemonHost: string, dropSendAcknowledgement = false) {
+  const socket = await vi.waitFor(
+    async () => {
+      const candidate = new WebSocket(`ws://${daemonHost}/ws`, { handshakeTimeout: 5_000 });
+      await once(candidate, "open");
+      return candidate;
+    },
+    { timeout: 15_000, interval: 100 },
+  );
+  const agents = new DaemonAgents((frame) => socket.send(frame));
+  const closed = new Promise<void>((resolveClose) => {
+    socket.once("close", () => {
+      agents.close();
+      resolveClose();
+    });
+  });
+  socket.on("error", () => socket.terminate());
+  onTestFinished(async () => {
+    socket.terminate();
+    await closed;
+  });
+
+  let ready = false;
+  let dropped = false;
+  socket.on("message", (data) => {
+    assert(Buffer.isBuffer(data));
+    const frame: unknown = JSON.parse(data.toString());
+    const session = z.object({ type: z.literal("session"), message: z.unknown() }).safeParse(frame);
+    const acknowledgement = SendAgentMessageResponseMessageSchema.safeParse(
+      session.data?.message,
+    ).data;
+    // Only drop a successful response, so replay follows a send the daemon already accepted.
+    if (dropSendAcknowledgement && acknowledgement?.payload.accepted) {
+      dropped = true;
+      socket.terminate();
+      return;
+    }
+    agents.receive(frame);
+    if (HubDaemonServerInfoEnvelopeSchema.safeParse(frame).success) ready = true;
+  });
+  socket.send(
+    JSON.stringify({
+      type: "hello",
+      clientType: "cli",
+      clientId: randomUUID(),
+      protocolVersion: 1,
+    }),
+  );
+  await vi.waitFor(() => assert(ready, "expected daemon server info"), { timeout: 10_000 });
+  return { agents, droppedAcknowledgement: () => dropped };
+}
+
+describeRealAgent("Hub interactive session daemon adapter", () => {
+  it("shows one user row with the sent message id after replaying a dropped acknowledgement", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "hub-replay-"));
+    onTestFinished(() => rm(workspace, { recursive: true, force: true }));
+    await promisify(execFile)("git", ["init", "--quiet", workspace]);
+    const source = await SourcePaseo.start();
+    onTestFinished(async () => assert.deepEqual((await source.stop()).leakedProcesses, []));
+    const codexHome = join(workspace, "codex-home");
+    await mkdir(codexHome);
+    // Admission and receipts need a real harness but do not require a model response.
+    await writeFile(
+      join(codexHome, "config.toml"),
+      [
+        'model_provider = "hub_e2e"',
+        "[model_providers.hub_e2e]",
+        'name = "Hub E2E"',
+        `base_url = "http://${source.paths.daemonHost}/e2e-no-inference"`,
+        'wire_api = "responses"',
+        "request_max_retries = 0",
+        "stream_max_retries = 0",
+      ].join("\n"),
+    );
+    const original = await connectAgentAdapter(source.paths.daemonHost, true);
+    const agent = await original.agents.create(randomUUID(), {
+      provider: "codex",
+      cwd: workspace,
+      env: { CODEX_HOME: codexHome },
+    });
+    const messageId = randomUUID();
+    const prompt = "Reply with ACK.";
+
+    await assert.rejects(
+      original.agents.send(agent.id, messageId, prompt),
+      DaemonResponseLostError,
+    );
+    assert.equal(original.droppedAcknowledgement(), true);
+
+    const replacement = await connectAgentAdapter(source.paths.daemonHost);
+    await replacement.agents.send(agent.id, messageId, prompt);
+    const page = await replacement.agents.timeline(agent.id, { direction: "tail", limit: 50 });
+    const userRows = page.entries
+      .map((entry) => entry.item)
+      .filter((item) => item.type === "user_message");
+    assert.deepEqual(
+      userRows.map((row) => ({ text: row.text, messageId: row.messageId })),
+      [{ text: prompt, messageId }],
+    );
+  }, 300_000);
+});
 
 describeRealAgent("Hub execution MCP real-agent smoke", () => {
   let hub: HubE2E;

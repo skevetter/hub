@@ -77,6 +77,7 @@ export type AgentValidationVerdict =
 
 export interface DaemonConnection {
   agents: import("./agents/index.js").AgentConnection;
+  history?: import("./agents/index.js").AgentHistory;
   /** Absent on a connection that cannot run script steps. */
   terminals?: import("./terminals/index.js").TerminalConnection;
   getProviderSnapshot(options: { cwd?: string }): Promise<HubProviderSnapshot>;

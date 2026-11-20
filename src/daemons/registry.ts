@@ -66,12 +66,14 @@ const DAEMON_SESSION_PROTOCOL_HEADER = "x-paseo-session-protocol";
 const DAEMON_SESSION_PROTOCOL_VERSION = "1";
 
 type DaemonConnectedHandler = (daemon: DaemonRecord) => void | Promise<void>;
+type DaemonDisconnectedHandler = (daemon: DaemonRecord) => void;
 type DaemonRevokedHandler = (daemon: DaemonRecord) => void | Promise<void>;
 
 export class ActiveDaemonRegistry {
   private readonly active = new Map<string, ActiveSocket>();
   private readonly pendingByDaemon = new Map<string, Map<string, PendingRequest>>();
   private readonly connectedHandlers = new Set<DaemonConnectedHandler>();
+  private readonly disconnectedHandlers = new Set<DaemonDisconnectedHandler>();
   private readonly revokedHandlers = new Set<DaemonRevokedHandler>();
   private readonly presenceWrites = new Set<Promise<void>>();
   private generation = 0;
@@ -136,6 +138,13 @@ export class ActiveDaemonRegistry {
             this.report(error, "daemon.presence.offline", daemon.id);
           },
         );
+        for (const handler of this.disconnectedHandlers) {
+          this.observeHandler(
+            () => handler(active.daemon),
+            "daemon.disconnected.handler",
+            daemon.id,
+          );
+        }
       }
     });
     if (sessionProtocol === "legacy") {
@@ -160,6 +169,11 @@ export class ActiveDaemonRegistry {
     return () => this.connectedHandlers.delete(handler);
   }
 
+  onDisconnected(handler: DaemonDisconnectedHandler): () => void {
+    this.disconnectedHandlers.add(handler);
+    return () => this.disconnectedHandlers.delete(handler);
+  }
+
   onRevoked(handler: DaemonRevokedHandler): () => void {
     this.revokedHandlers.add(handler);
     return () => this.revokedHandlers.delete(handler);
@@ -170,6 +184,7 @@ export class ActiveDaemonRegistry {
     if (!active?.ready || !active.daemon.permissions.includes("hub.execute")) return undefined;
     return {
       agents: active.agents,
+      history: active.agents,
       terminals: active.terminals,
       getProviderSnapshot: (options) => this.getProviderSnapshot(daemonId, options),
       refreshProviderSnapshot: (options) => this.refreshProviderSnapshot(daemonId, options),

@@ -1,7 +1,7 @@
 import { setImmediate } from "node:timers/promises";
 import { z } from "zod";
 import { expect, test, vi } from "vitest";
-import { DaemonAgents, type AgentEvent } from "./index.js";
+import { DaemonAgentError, DaemonAgents, type AgentEvent } from "./index.js";
 import { DaemonResponseLostError, type DaemonCreateAgentOptions } from "../protocol.js";
 
 const prompt = "Full request context. ".repeat(1_000) + "End.";
@@ -78,6 +78,145 @@ test("ordinary creation keeps prompt delivery separate from creation and preserv
     messageId: "stable-message-key",
     text: prompt,
   });
+});
+
+test("timeline sends a projected request and returns entries with cursors", async () => {
+  const epoch = "timeline-epoch";
+  const page = {
+    epoch,
+    reset: false,
+    staleCursor: false,
+    gap: true,
+    startCursor: { epoch, seq: 5 },
+    endCursor: { epoch, seq: 7 },
+    hasOlder: true,
+    hasNewer: false,
+    entries: [
+      {
+        item: { type: "user_message", text: "hello", messageId: "message-key" },
+        turnId: "turn",
+        timestamp: "2026-11-20T12:00:00.000Z",
+        seqStart: 5,
+        seqEnd: 7,
+      },
+    ],
+  };
+  const query = { direction: "after", cursor: { epoch, seq: 3 }, limit: 10 } as const;
+  const agents = new DaemonAgents((frame) => {
+    const { message } = z
+      .object({ message: z.object({ requestId: z.string() }).passthrough() })
+      .parse(JSON.parse(frame));
+    expect(message).toEqual({
+      type: "fetch_agent_timeline_request",
+      agentId: "agent",
+      requestId: message.requestId,
+      projection: "projected",
+      ...query,
+    });
+    agents.receive({
+      type: "session",
+      message: {
+        type: "fetch_agent_timeline_response",
+        payload: {
+          ...page,
+          requestId: message.requestId,
+          agentId: "agent",
+          agent: null,
+          direction: query.direction,
+          projection: "projected",
+          window: { minSeq: 1, maxSeq: 7, nextSeq: 8 },
+          error: null,
+          entries: page.entries.map((entry) => ({
+            ...entry,
+            provider: "codex",
+            sourceSeqRanges: [{ startSeq: 5, endSeq: 7 }],
+            collapsed: ["identity"],
+          })),
+        },
+      },
+    });
+  });
+  enable(agents);
+  await expect(agents.timeline("agent", query)).resolves.toEqual(page);
+});
+
+test("agent stream events keep the daemon seq and epoch", async () => {
+  const agents = connect([]);
+  const listener = vi.fn<(event: AgentEvent) => void>();
+  const unwatch = await agents.watch("agent", listener);
+  listener.mockClear();
+  const payload = {
+    agentId: "agent",
+    event: {
+      type: "timeline",
+      provider: "codex",
+      item: { type: "user_message", text: "hello", messageId: "message-key" },
+    },
+    timestamp: "2026-11-20T12:00:00.000Z",
+  };
+  agents.receive({
+    type: "session",
+    message: { type: "agent_stream", payload: { ...payload, seq: 0, epoch: "timeline-epoch" } },
+  });
+  agents.receive({ type: "session", message: { type: "agent_stream", payload } });
+  expect(listener).toHaveBeenCalledTimes(2);
+  expect(listener).toHaveBeenNthCalledWith(1, {
+    ...payload,
+    type: "agent_stream",
+    timestamp: expect.any(String) as unknown,
+    seq: 0,
+    epoch: "timeline-epoch",
+  });
+  expect(listener).toHaveBeenNthCalledWith(2, {
+    ...payload,
+    type: "agent_stream",
+    timestamp: expect.any(String) as unknown,
+  });
+  unwatch();
+  agents.close();
+});
+
+test.each(["agent_request_key_conflict", "agent_request_outcome_unknown"])(
+  "keeps rpc error code %s on DaemonAgentError",
+  async (code) => {
+    const agents = new DaemonAgents((frame) => {
+      const { message } = z
+        .object({ message: z.object({ requestId: z.string() }) })
+        .parse(JSON.parse(frame));
+      agents.receive({
+        type: "session",
+        message: {
+          type: "rpc_error",
+          payload: { requestId: message.requestId, error: "Send rejected", code },
+        },
+      });
+    });
+    enable(agents);
+    const outcome = await agents
+      .send("agent", "message-key", "hello")
+      .catch((error: unknown) => error);
+    expect(outcome).toBeInstanceOf(DaemonAgentError);
+    expect(outcome).toMatchObject({ message: "Send rejected", code });
+  },
+);
+
+test("a lost send acknowledgement rejects with DaemonResponseLostError", async () => {
+  vi.useFakeTimers();
+  const sendFrame = vi.fn<(frame: string) => void>();
+  const agents = new DaemonAgents(sendFrame);
+  try {
+    enable(agents);
+    const send = agents.send("agent", "message-key", "hello", 100);
+    const rejected = expect(send).rejects.toBeInstanceOf(DaemonResponseLostError);
+    expect(sendFrame).toHaveBeenCalledOnce();
+    expect(sendFrame).toHaveBeenCalledWith(expect.stringContaining('"messageId":"message-key"'));
+    await vi.advanceTimersByTimeAsync(100);
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    agents.close();
+    vi.useRealTimers();
+  }
 });
 
 test("a titled creation names the agent and then the workspace the daemon created for it", async () => {

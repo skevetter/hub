@@ -24,6 +24,14 @@ describe("daemon socket shutdown deadline", () => {
     vi.restoreAllMocks();
   });
 
+  function unopenedSocket(): WebSocket {
+    const socket = z
+      .instanceof(WebSocket)
+      .parse(Reflect.construct(WebSocket, [null, undefined, { autoPong: true }]));
+    vi.spyOn(socket, "send").mockImplementation(() => {});
+    return socket;
+  }
+
   function setup(closeImmediately: boolean) {
     const now = new Date();
     const daemon: DaemonRecord = {
@@ -53,10 +61,7 @@ describe("daemon socket shutdown deadline", () => {
       undefined,
       createLogger(stream),
     );
-    const socket = z
-      .instanceof(WebSocket)
-      .parse(Reflect.construct(WebSocket, [null, undefined, { autoPong: true }]));
-    vi.spyOn(socket, "send").mockImplementation(() => {});
+    const socket = unopenedSocket();
     const close = vi.spyOn(socket, "close").mockImplementation(() => {
       if (closeImmediately) socket.emit("close", 1001, Buffer.alloc(0));
     });
@@ -64,8 +69,43 @@ describe("daemon socket shutdown deadline", () => {
       setTimeout(() => socket.emit("close", 1006, Buffer.alloc(0)), 1);
     });
     registry.accept(daemon, socket);
-    return { registry, socket, close, terminate, stream, setDaemonPresence };
+    return { registry, daemon, socket, close, terminate, stream, setDaemonPresence };
   }
+
+  it("reports a disconnect once per socket generation and ignores a replaced socket", async () => {
+    const { registry, daemon, socket } = setup(true);
+    const disconnected = vi.fn<(record: DaemonRecord) => void>();
+    const unsubscribe = registry.onDisconnected(disconnected);
+
+    const current = unopenedSocket();
+    registry.accept(daemon, current, "legacy");
+    socket.emit("close", 4001, Buffer.alloc(0));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(disconnected.mock.calls.length, 0);
+
+    current.emit("close", 1000, Buffer.alloc(0));
+    current.emit("close", 1000, Buffer.alloc(0));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(disconnected.mock.calls, [[daemon]]);
+
+    const reconnected = unopenedSocket();
+    registry.accept(daemon, reconnected, "legacy");
+    reconnected.emit("close", 1000, Buffer.alloc(0));
+    await registry.stop();
+    assert.deepEqual(disconnected.mock.calls, [[daemon], [daemon]]);
+    unsubscribe();
+  });
+
+  it("exposes timeline history through the active agent adapter", async () => {
+    const { registry, daemon } = setup(true);
+    const socket = unopenedSocket();
+    registry.accept(daemon, socket, "legacy");
+    const connection = registry.connection(daemon.id);
+    assert(connection);
+    assert.equal(connection.history, connection.agents);
+    socket.emit("close", 1000, Buffer.alloc(0));
+    await registry.stop();
+  });
 
   it("terminates an unresponsive socket after one second and reports the deadline", async () => {
     vi.useFakeTimers();

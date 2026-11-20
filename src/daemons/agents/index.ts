@@ -1,10 +1,16 @@
 import { randomUUID } from "node:crypto";
+import {
+  AgentStreamMessageSchema,
+  AgentTimelineCursorSchema,
+  AgentTimelineEntryPayloadSchema,
+  FetchAgentTimelineResponseMessageSchema,
+} from "@getpaseo/protocol/messages";
 import { z } from "zod";
 import {
   HubExecutionAgentStreamEventSchema,
   HubExecutionAgentSnapshotSchema,
 } from "../../hub/protocol.js";
-import type { DaemonCreateAgentOptions, DaemonAgentStreamEvent } from "../protocol.js";
+import type { DaemonCreateAgentOptions } from "../protocol.js";
 import { DaemonResponseLostError } from "../protocol.js";
 
 const SnapshotSchema = z.object({
@@ -13,10 +19,45 @@ const SnapshotSchema = z.object({
   status: HubExecutionAgentSnapshotSchema.shape.status,
   archivedAt: z.unknown().optional(),
 });
+const StreamSchema = AgentStreamMessageSchema.shape.payload
+  .pick({ agentId: true, timestamp: true, seq: true, epoch: true })
+  .extend({ event: HubExecutionAgentStreamEventSchema });
+const TimelinePageSchema = FetchAgentTimelineResponseMessageSchema.shape.payload
+  .pick({
+    epoch: true,
+    reset: true,
+    staleCursor: true,
+    gap: true,
+    startCursor: true,
+    endCursor: true,
+    hasOlder: true,
+    hasNewer: true,
+  })
+  .extend({
+    entries: z.array(
+      AgentTimelineEntryPayloadSchema.pick({
+        item: true,
+        turnId: true,
+        timestamp: true,
+        seqStart: true,
+        seqEnd: true,
+      }),
+    ),
+  });
 export type AgentSnapshot = z.infer<typeof SnapshotSchema>;
 export type AgentEvent =
   | { type: "agent_update" | "agent_snapshot"; agent: AgentSnapshot; timestamp: string }
-  | { type: "agent_stream"; agentId: string; event: DaemonAgentStreamEvent; timestamp: string };
+  | ({ type: "agent_stream" } & z.infer<typeof StreamSchema>);
+type AgentTimelineCursor = z.infer<typeof AgentTimelineCursorSchema>;
+interface AgentTimelineQuery {
+  direction: "tail" | "before" | "after";
+  cursor?: AgentTimelineCursor;
+  limit: number;
+}
+export type AgentTimelinePage = z.infer<typeof TimelinePageSchema>;
+export interface AgentHistory {
+  timeline(agentId: string, query: AgentTimelineQuery): Promise<AgentTimelinePage>;
+}
 export interface AgentConnection {
   create(
     key: string,
@@ -46,12 +87,19 @@ const ResultSchema = z
   .object({ error: z.string().nullable().optional(), accepted: z.boolean().optional() })
   .passthrough();
 
-export class DaemonAgentError extends Error {}
+export class DaemonAgentError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message);
+  }
+}
 export class DaemonAgentMissingError extends DaemonAgentError {}
 export class DaemonFrameNotSentError extends DaemonResponseLostError {}
 
 /** The ordinary daemon protocol. This channel knows nothing about Hub executions or triggers. */
-export class DaemonAgents implements AgentConnection {
+export class DaemonAgents implements AgentConnection, AgentHistory {
   private supported = false;
   private closed = false;
   private readonly pending = new Map<
@@ -83,7 +131,12 @@ export class DaemonAgents implements AgentConnection {
     if (pending) {
       if (type === "rpc_error" || payload["status"] === "agent_create_failed") {
         pending.reject(
-          new DaemonAgentError(z.string().catch("Daemon request rejected").parse(payload["error"])),
+          new DaemonAgentError(
+            z.string().catch("Daemon request rejected").parse(payload["error"]),
+            type === "rpc_error" && typeof payload["code"] === "string"
+              ? payload["code"]
+              : undefined,
+          ),
         );
       } else pending.resolve(payload);
       return true;
@@ -95,13 +148,7 @@ export class DaemonAgents implements AgentConnection {
       return true;
     }
     if (type === "agent_stream") {
-      const stream = z
-        .object({
-          agentId: z.string(),
-          timestamp: z.string(),
-          event: HubExecutionAgentStreamEventSchema,
-        })
-        .safeParse(payload);
+      const stream = StreamSchema.safeParse(payload);
       if (stream.success)
         this.emit(stream.data.agentId, {
           type,
@@ -173,6 +220,15 @@ export class DaemonAgents implements AgentConnection {
         "Continuation agent was deleted; use a new key or choose a new agent",
       );
     return SnapshotSchema.parse(response["agent"]);
+  }
+  async timeline(agentId: string, query: AgentTimelineQuery): Promise<AgentTimelinePage> {
+    const response = await this.request({
+      ...query,
+      type: "fetch_agent_timeline_request",
+      agentId,
+      projection: "projected",
+    });
+    return TimelinePageSchema.parse(response);
   }
   async send(agentId: string, messageId: string, text: string, timeoutMs?: number): Promise<void> {
     await this.request(
