@@ -99,6 +99,7 @@ export interface SessionRecord {
   state: SessionState;
   stateReason: SessionStateReason | null;
   generation: number;
+  turn: number;
   daemonAgentId: string | null;
   daemonWorkspaceId: string | null;
   hubSeq: number;
@@ -174,7 +175,12 @@ type SessionEvent =
   | {
       kind: "state";
       commandId: null;
-      data: { state: SessionState; stateReason: SessionStateReason | null; generation: number };
+      data: {
+        state: SessionState;
+        stateReason: SessionStateReason | null;
+        generation: number;
+        turn: number;
+      };
     }
   | {
       kind: "participants";
@@ -188,6 +194,18 @@ export type SessionEventRecord = SessionEvent & {
   seq: number;
   at: Date;
 };
+
+export interface SessionAuditRecord {
+  id: string;
+  organizationId: string;
+  actorKind: "user";
+  actorIdentity: string;
+  action: string;
+  subjectType: "interactive_session";
+  subjectId: string;
+  evidence: Readonly<Record<string, JsonValue>>;
+  createdAt: Date;
+}
 
 export interface SessionCursor {
   lastActivityAt: Date;

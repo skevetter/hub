@@ -13,12 +13,15 @@ import {
   messageRecord,
   newCommand,
   newSession,
+  observedSessionTransition,
   interruptCommand,
   profileRecord,
   profileSettings,
   profileValidation,
   profileVersionMatches,
   refused,
+  replayCommand,
+  sessionAudit,
   sessionPage,
   sessionUsage,
   settlePatch,
@@ -30,6 +33,7 @@ import {
 } from "../interactive-sessions/store.js";
 import type { SessionEventDraft } from "../interactive-sessions/store.js";
 import type {
+  SessionAuditRecord,
   SessionCommandRecord,
   SessionEventRecord,
   SessionProfileRecord,
@@ -279,7 +283,11 @@ function laterCooldown(previous: Date | null, next: Date | null): Date | null {
   return new Date(next);
 }
 
-export function createMemoryDatabase(options: MemoryDatabaseOptions = {}): Database {
+const interactiveSessionLock = "isession-memory";
+
+export function createMemoryDatabase(
+  options: MemoryDatabaseOptions = {},
+): Database & Pick<MemoryDatabase, "listInteractiveSessionAuditEvents"> {
   return new MemoryDatabase(options);
 }
 
@@ -288,6 +296,21 @@ class MemoryDatabase implements Database {
   private readonly interactiveSessions = new Map<string, SessionWithParticipants>();
   private readonly interactiveCommands = new Map<string, SessionCommandRecord[]>();
   private readonly interactiveEvents = new Map<string, SessionEventRecord[]>();
+  private readonly interactiveAudit = new Map<string, SessionAuditRecord[]>();
+
+  listInteractiveSessionAuditEvents(
+    organizationId: string,
+    sessionId: string,
+  ): SessionAuditRecord[] {
+    const row = this.scopedInteractiveSession(organizationId, sessionId);
+    return row ? structuredClone(this.interactiveAudit.get(row.session.id) ?? []) : [];
+  }
+
+  private saveSessionAudit(record: SessionAuditRecord) {
+    const audit = this.interactiveAudit.get(record.subjectId) ?? [];
+    audit.push(structuredClone(record));
+    this.interactiveAudit.set(record.subjectId, audit);
+  }
 
   listSessionProfiles: Database["listSessionProfiles"] = async (organizationId) =>
     structuredClone(
@@ -302,7 +325,7 @@ class MemoryDatabase implements Database {
   };
 
   saveSessionProfile: Database["saveSessionProfile"] = (input) =>
-    this.withAdvisoryLock("isession-memory", async () => {
+    this.withAdvisoryLock(interactiveSessionLock, async () => {
       const { organizationId, userId } = input.principal;
       const settings = profileSettings(input);
       const invalid = profileValidation(settings);
@@ -334,7 +357,7 @@ class MemoryDatabase implements Database {
     });
 
   startInteractiveSession: Database["startInteractiveSession"] = (input) =>
-    this.withAdvisoryLock("isession-memory", async () => {
+    this.withAdvisoryLock(interactiveSessionLock, async () => {
       const { organizationId, userId } = input.principal;
       if (!this.sessionMemberRole(organizationId, userId)) return refused("forbidden");
       const people = startParticipants(input);
@@ -346,12 +369,16 @@ class MemoryDatabase implements Database {
           session.startIdempotencyKey === input.idempotencyKey.toLowerCase(),
       );
       if (prior) {
+        if (!this.sessionRights(prior, userId)?.view) return refused("forbidden");
         return prior.session.startRequestHash === hash
           ? {
               status: "replayed",
               ...structuredClone({
                 session: prior.session,
-                command: this.interactiveCommands.get(prior.session.id)![0]!,
+                command: replayCommand(
+                  this.interactiveCommands.get(prior.session.id)![0]!,
+                  input.bodyCutoff,
+                ),
               }),
             }
           : refused("idempotency_conflict");
@@ -400,11 +427,20 @@ class MemoryDatabase implements Database {
         stateEvent(session),
         messageEvent(command),
       ]);
+      this.saveSessionAudit(
+        sessionAudit(
+          session,
+          userId,
+          "started",
+          { profileId: profile.id, commandId: command.id },
+          input.now,
+        ),
+      );
       return { status: "created", ...structuredClone({ session: row.session, command }) };
     });
 
   acceptInteractiveSessionCommand: Database["acceptInteractiveSessionCommand"] = (input) =>
-    this.withAdvisoryLock("isession-memory", async () => {
+    this.withAdvisoryLock(interactiveSessionLock, async () => {
       const { organizationId, userId } = input.principal;
       const row = this.scopedInteractiveSession(organizationId, input.sessionId);
       if (!row) return refused("not_found");
@@ -422,7 +458,10 @@ class MemoryDatabase implements Database {
       );
       if (prior) {
         return prior.requestHash === hash
-          ? { status: "replayed", ...structuredClone({ session, command: prior }) }
+          ? {
+              status: "replayed",
+              ...structuredClone({ session, command: replayCommand(prior, input.bodyCutoff) }),
+            }
           : refused("idempotency_conflict");
       }
       const refusal = commandRefusal(session, input);
@@ -457,6 +496,9 @@ class MemoryDatabase implements Database {
             ];
       commands.push(structuredClone(command));
       this.appendSessionEvents(row, next, input.now, drafts);
+      this.saveSessionAudit(
+        sessionAudit(session, userId, input.kind, { commandId: command.id }, input.now),
+      );
       return { status: "accepted", ...structuredClone({ session: row.session, command }) };
     });
 
@@ -529,10 +571,11 @@ class MemoryDatabase implements Database {
   };
 
   claimInteractiveSessionCommand: Database["claimInteractiveSessionCommand"] = (input) =>
-    this.withAdvisoryLock("isession-memory", async () => {
+    this.withAdvisoryLock(interactiveSessionLock, async () => {
       const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
       if (!row || row.session.state === "failed") return undefined;
       const { session } = row;
+      const leaseNow = this.now();
       const drafts: SessionEventDraft[] = [];
       const candidates = this.interactiveCommands
         .get(session.id)!
@@ -548,15 +591,15 @@ class MemoryDatabase implements Database {
           (command) =>
             command.status === "dispatching" &&
             command.claimExpiresAt !== null &&
-            command.claimExpiresAt > input.now,
+            command.claimExpiresAt > leaseNow,
         )
       )
         return undefined;
       let claimed: SessionCommandRecord | undefined;
       for (const command of candidates) {
-        if (!commandLeaseEligible(command, input, session.state)) continue;
+        if (!commandLeaseEligible(command, input, session.state, leaseNow)) continue;
         const rights = this.sessionRights(row, command.authorUserId);
-        const patch = claimPatch(command, input, rights);
+        const patch = claimPatch(command, input, rights, leaseNow);
         Object.assign(command, structuredClone(patch));
         drafts.push(deliveryEvent(command));
         if (command.status === "dispatching") {
@@ -569,9 +612,10 @@ class MemoryDatabase implements Database {
     });
 
   settleInteractiveSessionCommand: Database["settleInteractiveSessionCommand"] = (input) =>
-    this.withAdvisoryLock("isession-memory", async () => {
+    this.withAdvisoryLock(interactiveSessionLock, async () => {
       const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
       if (!row || row.session.generation !== input.generation) return false;
+      const leaseNow = this.now();
       const command = this.interactiveCommands
         .get(row.session.id)!
         .find(
@@ -582,7 +626,7 @@ class MemoryDatabase implements Database {
             entry.claimOwner === input.claimOwner &&
             entry.attempts === input.attempts &&
             entry.claimExpiresAt !== null &&
-            entry.claimExpiresAt > input.now,
+            entry.claimExpiresAt > leaseNow,
         );
       if (!command) return false;
       const failureCode =
@@ -595,7 +639,7 @@ class MemoryDatabase implements Database {
     });
 
   bindInteractiveSessionAgent: Database["bindInteractiveSessionAgent"] = (input) =>
-    this.withAdvisoryLock("isession-memory", async () => {
+    this.withAdvisoryLock(interactiveSessionLock, async () => {
       const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
       if (!row || row.session.generation !== input.generation || row.session.state !== "starting")
         return false;
@@ -615,19 +659,17 @@ class MemoryDatabase implements Database {
     });
 
   applyInteractiveSessionState: Database["applyInteractiveSessionState"] = (input) =>
-    this.withAdvisoryLock("isession-memory", async () => {
+    this.withAdvisoryLock(interactiveSessionLock, async () => {
       const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
       if (!row) return undefined;
       const { session } = row;
+      const next = observedSessionTransition(session, input);
+      if (!next) return undefined;
       if (
-        session.generation !== input.generation ||
-        session.daemonAgentId !== input.agentId ||
-        session.state === "closed" ||
-        !input.from.includes(session.state)
-      )
-        return undefined;
-      const next = { ...session, state: input.to, stateReason: input.reason ?? null };
-      if (next.state !== session.state || next.stateReason !== session.stateReason) {
+        next.state !== session.state ||
+        next.stateReason !== session.stateReason ||
+        next.turn !== session.turn
+      ) {
         const drafts = [stateEvent(next)];
         if (input.reason === "daemon_revoked")
           drafts.push(...this.supersedeInteractiveCommands(session, "close", input.now));
@@ -637,7 +679,7 @@ class MemoryDatabase implements Database {
     });
 
   setInteractiveSessionParticipant: Database["setInteractiveSessionParticipant"] = (input) =>
-    this.withAdvisoryLock("isession-memory", async () => {
+    this.withAdvisoryLock(interactiveSessionLock, async () => {
       const { organizationId, userId } = input.principal;
       const row = this.scopedInteractiveSession(organizationId, input.sessionId);
       if (!row) return "not_found";
@@ -675,9 +717,13 @@ class MemoryDatabase implements Database {
         });
         row.participants.sort((a, b) => a.userId.localeCompare(b.userId));
       }
+      const data = { userId: input.userId, role: input.role };
       this.appendSessionEvents(row, row.session, input.now, [
-        { kind: "participants", commandId: null, data: { userId: input.userId, role: input.role } },
+        { kind: "participants", commandId: null, data },
       ]);
+      this.saveSessionAudit(
+        sessionAudit(row.session, userId, "participant_changed", data, input.now),
+      );
       return input.role === null ? "removed" : "set";
     });
 
@@ -702,7 +748,7 @@ class MemoryDatabase implements Database {
     limit,
     now,
   ) =>
-    this.withAdvisoryLock("isession-memory", async () => {
+    this.withAdvisoryLock(interactiveSessionLock, async () => {
       const batch = [...this.interactiveCommands.values()]
         .flat()
         .filter((command) => command.body !== null && command.createdAt < cutoff)
@@ -4354,46 +4400,61 @@ class MemoryDatabase implements Database {
       .sort((left, right) => left.slug.localeCompare(right.slug));
   }
   async renameDaemonForOrganization(organizationId: string, id: string, slug: string) {
-    const daemon = await this.findDaemonForOrganization(organizationId, id);
-    if (daemon === undefined) return undefined;
-    const slugTaken = Array.from(this.daemons.values()).some(
-      (candidate) =>
-        candidate.id !== id &&
-        candidate.slug === slug &&
-        this.machines.get(candidate.machineId)?.orgId === organizationId,
-    );
-    if (slugTaken) return { status: "slug_conflict" as const, slug };
-    const renamed = { ...daemon, slug };
-    this.daemons.set(id, renamed);
-    return renamed;
+    return this.withAdvisoryLock(interactiveSessionLock, async () => {
+      const daemon = await this.findDaemonForOrganization(organizationId, id);
+      if (daemon === undefined) return undefined;
+      const slugTaken = Array.from(this.daemons.values()).some(
+        (candidate) =>
+          candidate.id !== id &&
+          candidate.slug === slug &&
+          this.machines.get(candidate.machineId)?.orgId === organizationId,
+      );
+      if (slugTaken) return { status: "slug_conflict" as const, slug };
+      const renamed = { ...daemon, slug };
+      this.daemons.set(id, renamed);
+      return renamed;
+    });
   }
   async touchDaemon(id: string) {
-    const value = this.daemons.get(id);
-    if (value) this.daemons.set(id, { ...value, lastSeenAt: new Date() });
+    return this.withAdvisoryLock(interactiveSessionLock, async () => {
+      const value = this.daemons.get(id);
+      if (value) this.daemons.set(id, { ...value, lastSeenAt: new Date() });
+    });
   }
   async setDaemonPresence(id: string, presence: "offline" | "connected") {
-    const value = this.daemons.get(id);
-    if (!value) return;
-    this.daemons.set(id, {
-      ...value,
-      presence,
-      connectedAt: presence === "connected" ? new Date() : value.connectedAt,
-      disconnectedAt: presence === "offline" ? new Date() : value.disconnectedAt,
+    return this.withAdvisoryLock(interactiveSessionLock, async () => {
+      const value = this.daemons.get(id);
+      if (!value) return;
+      this.daemons.set(id, {
+        ...value,
+        presence,
+        connectedAt: presence === "connected" ? new Date() : value.connectedAt,
+        disconnectedAt: presence === "offline" ? new Date() : value.disconnectedAt,
+      });
     });
   }
   async setDaemonPermissions(id: string, permissions: string[]) {
-    const value = this.daemons.get(id);
-    if (!value) return undefined;
-    const updated = { ...value, permissions: [...permissions] };
-    this.daemons.set(id, updated);
-    return updated;
+    return this.withAdvisoryLock(interactiveSessionLock, async () => {
+      const value = this.daemons.get(id);
+      if (!value || value.status !== "active") return undefined;
+      const updated = { ...value, permissions: [...permissions] };
+      this.daemons.set(id, updated);
+      return updated;
+    });
   }
   async revokeDaemon(id: string) {
-    const value = this.daemons.get(id);
-    if (!value || value.status === "revoked") return false;
-    this.daemons.set(id, { ...value, status: "revoked" });
-    await this.stopInterrupts.revoke(id);
-    return true;
+    return this.withAdvisoryLock(interactiveSessionLock, async () => {
+      const value = this.daemons.get(id);
+      if (!value || value.status === "revoked") return false;
+      this.daemons.set(id, {
+        ...value,
+        status: "revoked",
+        presence: "offline",
+        disconnectedAt: this.now(),
+      });
+      await this.stopInterrupts.revoke(id);
+      return true;
+    });
   }
   async attachAgentToExecution(executionId: string, daemonId: string, agentId: string) {
     const value = this.readAgentExecution(executionId);

@@ -40,12 +40,15 @@ import {
   messageRecord,
   newCommand,
   newSession,
+  observedSessionTransition,
   interruptCommand,
   profileRecord,
   profileSettings,
   profileValidation,
   profileVersionMatches,
   refused,
+  replayCommand,
+  sessionAudit,
   sessionPage,
   sessionUsage,
   settlePatch,
@@ -73,6 +76,7 @@ import type {
   StartSessionResult,
 } from "./store.js";
 import type {
+  SessionAuditRecord,
   SessionCommandRecord,
   SessionEventRecord,
   SessionParticipantRecord,
@@ -120,6 +124,12 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       const role = await this.role(db, organizationId, userId);
       if (role === undefined || role === "member") return "forbidden";
 
+      await this.locks.withTxLock(tx, "isession-profiles:" + organizationId);
+      const current =
+        input.id === null ? undefined : await this.lockProfile(db, organizationId, input.id);
+      if (!profileVersionMatches(input, current)) return "version_conflict";
+      if (current && role !== "owner" && current.createdByUserId !== userId) return "forbidden";
+
       const [daemon] = await db
         .select({
           status: daemons.status,
@@ -134,7 +144,8 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
             eq(cliCredentials.organizationId, organizationId),
           ),
         )
-        .where(and(eq(daemons.organizationId, organizationId), eq(daemons.id, input.daemonId)));
+        .where(and(eq(daemons.organizationId, organizationId), eq(daemons.id, input.daemonId)))
+        .for("share", { of: daemons });
       if (daemon?.status !== "active" || !daemon.permissions.includes("hub.execute"))
         return "daemon_unavailable";
       // Personal CLI enrollment proves who enrolled the daemon. Legacy and shared-key enrollments require the owner.
@@ -147,11 +158,6 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       ]);
       if (options === undefined || options.size > 4096) return "invalid_profile";
 
-      await this.locks.withTxLock(tx, "isession-profiles:" + organizationId);
-      const current =
-        input.id === null ? undefined : await this.lockProfile(db, organizationId, input.id);
-      if (!profileVersionMatches(input, current)) return "version_conflict";
-      if (current && role !== "owner" && current.createdByUserId !== userId) return "forbidden";
       const [named] = await db
         .select({ id: profiles.id })
         .from(profiles)
@@ -197,12 +203,17 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         )
         .for("share");
       if (prior) {
+        if (!(await this.rights(db, prior, userId))?.view) return refused("forbidden");
         if (prior.startRequestHash !== hash) return refused("idempotency_conflict");
         const [command] = await db
           .select()
           .from(commands)
           .where(and(commandScope(prior), eq(commands.ordinal, 1)));
-        return { status: "replayed", session: prior, command: command! };
+        return {
+          status: "replayed",
+          session: prior,
+          command: replayCommand(command!, input.bodyCutoff),
+        };
       }
       if (!validMessage(input.message)) return refused("message_too_long");
       const [profile] = await db
@@ -311,7 +322,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         );
       if (prior) {
         return prior.requestHash === hash
-          ? { status: "replayed", session, command: prior }
+          ? { status: "replayed", session, command: replayCommand(prior, input.bodyCutoff) }
           : refused("idempotency_conflict");
       }
       const refusal = commandRefusal(session, input);
@@ -485,6 +496,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         )
         .orderBy(asc(commands.ordinal))
         .for("update");
+      const leaseNow = await leaseTime(tx);
       const drafts: SessionEventDraft[] = [];
       let claimed: SessionCommandRecord | undefined;
       if (
@@ -492,13 +504,13 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
           (command) =>
             command.status === "dispatching" &&
             command.claimExpiresAt !== null &&
-            command.claimExpiresAt > input.now,
+            command.claimExpiresAt > leaseNow,
         )
       ) {
         for (const command of candidates) {
-          if (!commandLeaseEligible(command, input, session.state)) continue;
+          if (!commandLeaseEligible(command, input, session.state, leaseNow)) continue;
           const rights = await this.rights(db, session, command.authorUserId);
-          const patch = claimPatch(command, input, rights);
+          const patch = claimPatch(command, input, rights, leaseNow);
           const updated = await this.updateCommand(db, command, patch);
           drafts.push(deliveryEvent(updated));
           if (updated.status === "dispatching") {
@@ -528,11 +540,10 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
             eq(commands.status, "dispatching"),
             eq(commands.claimOwner, input.claimOwner),
             eq(commands.attempts, input.attempts),
-            gt(commands.claimExpiresAt, input.now),
           ),
         )
         .for("update");
-      if (!command) return false;
+      if (!command?.claimExpiresAt || command.claimExpiresAt <= (await leaseTime(tx))) return false;
       const failureCode =
         input.status === "unknown" && command.attempts >= maxDeliveryAttempts
           ? "delivery_unconfirmed"
@@ -571,16 +582,15 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
     return this.runtime.transaction(async (tx) => {
       const db = tx.drizzle();
       const session = await this.lockSession(db, input.organizationId, input.sessionId);
+      if (!session) return undefined;
+      const next = observedSessionTransition(session, input);
+      if (!next) return undefined;
       if (
-        !session ||
-        session.generation !== input.generation ||
-        session.daemonAgentId !== input.agentId ||
-        session.state === "closed" ||
-        !input.from.includes(session.state)
+        next.state === session.state &&
+        next.stateReason === session.stateReason &&
+        next.turn === session.turn
       )
-        return undefined;
-      const next = { ...session, state: input.to, stateReason: input.reason ?? null };
-      if (next.state === session.state && next.stateReason === session.stateReason) return session;
+        return session;
       const drafts = [stateEvent(next)];
       if (input.reason === "daemon_revoked")
         drafts.push(...(await this.supersede(db, session, "close", input.now)));
@@ -801,6 +811,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         state: session.state,
         stateReason: session.stateReason,
         generation: session.generation,
+        turn: session.turn,
         daemonAgentId: session.daemonAgentId,
         daemonWorkspaceId: session.daemonWorkspaceId,
         closedAt: session.closedAt,
@@ -829,20 +840,21 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
     session: SessionRecord,
     actorIdentity: string,
     action: string,
-    evidence: object,
+    evidence: SessionAuditRecord["evidence"],
     now: Date,
   ) {
-    await db.insert(auditEvents).values({
-      organizationId: session.organizationId,
-      actorKind: "user",
-      actorIdentity,
-      action: "interactive_session." + action,
-      subjectType: "interactive_session",
-      subjectId: session.id,
-      evidence,
-      createdAt: now,
-    });
+    await db
+      .insert(auditEvents)
+      .values(sessionAudit(session, actorIdentity, action, evidence, now));
   }
+}
+
+async function leaseTime(tx: QueryHandle): Promise<Date> {
+  // now() is fixed at transaction start, before waits for the session or command locks.
+  const {
+    rows: [clock],
+  } = await tx.query<{ now: Date }>("select clock_timestamp() as now");
+  return clock!.now;
 }
 
 function sessionScope(organizationId: string, sessionId: string) {

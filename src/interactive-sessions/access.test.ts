@@ -15,7 +15,14 @@ it("capabilities: starter and admins may stop, only controllers may send, non-pa
     role: "owner" | "admin" | "member" = "member",
     org = organizationId,
   ) => capabilities({ organizationId: org, userId, role }, session, participants);
+  assert.equal(rights("starter").stop, false);
+  assert.equal(rights("starter").close, false);
+  participants.push({ userId: "starter", role: "viewer" });
   assert.equal(rights("starter").stop, true);
+  assert.equal(rights("starter").close, true);
+  assert.equal(rights("starter").view, true);
+  assert.equal(rights("starter").manageParticipants, false);
+  participants.pop();
   assert.equal(rights("starter").view, false);
   assert.equal(rights("starter").send, false);
   assert.equal(rights("admin", "admin").stop, true);

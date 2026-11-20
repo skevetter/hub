@@ -3,6 +3,20 @@ import { randomUUID } from "node:crypto";
 import { beforeEach, describe, it } from "vitest";
 import type { Database } from "../db/types.js";
 import type { AcceptCommandInput, StartSessionInput } from "./store.js";
+import type { SessionCommandRecord } from "./types.js";
+
+export interface SessionStoreFixture {
+  database: Database;
+  expireLease(command: SessionCommandRecord): Promise<void>;
+  readAudit(
+    sessionId: string,
+  ): Promise<{ action: string; actorIdentity: string; evidence: unknown }[]>;
+  insertEventForAnotherCommand?: (sessionId: string, commandId: string) => Promise<void>;
+  insertParticipantOutsideOrganization?: (sessionId: string) => Promise<void>;
+  raceProfileSaveWithRevocation?: (
+    input: Parameters<Database["saveSessionProfile"]>[0],
+  ) => ReturnType<Database["saveSessionProfile"]>;
+}
 
 export function sessionOrganization(organizationId: string) {
   return {
@@ -18,17 +32,31 @@ export function sessionOrganization(organizationId: string) {
 
 export function interactiveSessionStoreContract(
   backend: string,
-  createDatabase: (organization: ReturnType<typeof sessionOrganization>) => Promise<Database>,
+  createDatabase: (
+    organization: ReturnType<typeof sessionOrganization>,
+    now: Date,
+  ) => Promise<SessionStoreFixture>,
 ) {
   describe(backend + " interactive session store", () => {
     const now = new Date("2026-11-20T00:00:00Z");
     const periodStart = new Date("2026-11-01T00:00:00Z");
+    let fixture: SessionStoreFixture;
     let database: Database;
+    let daemonId: string;
     let start: StartSessionInput;
 
     beforeEach(async () => {
       const { organizationId, users } = sessionOrganization(randomUUID());
-      database = await createDatabase({ organizationId, users });
+      fixture = await createDatabase({ organizationId, users }, now);
+      ({ database } = fixture);
+      ({ daemonId, start } = await prepareStart(database, organizationId, users));
+    });
+
+    async function prepareStart(
+      target: Database,
+      organizationId: string,
+      users: ReturnType<typeof sessionOrganization>["users"],
+    ) {
       const enrollment = {
         id: randomUUID(),
         verifier: randomUUID(),
@@ -36,11 +64,11 @@ export function interactiveSessionStoreContract(
         expiresAt: new Date(now.getTime() + 60_000),
         consumedAt: null,
       };
-      assert.equal(await database.issueEnrollmentToken(enrollment), true);
-      const daemonId = randomUUID();
+      assert.equal(await target.issueEnrollmentToken(enrollment), true);
+      const enrolledDaemonId = randomUUID();
       assert.ok(
-        await database.enrollDaemon({
-          daemonId,
+        await target.enrollDaemon({
+          daemonId: enrolledDaemonId,
           idempotencyKey: randomUUID(),
           tokenVerifier: enrollment.verifier,
           serverId: randomUUID(),
@@ -50,13 +78,13 @@ export function interactiveSessionStoreContract(
           now,
         }),
       );
-      await database.setDaemonPresence(daemonId, "connected");
+      await target.setDaemonPresence(enrolledDaemonId, "connected");
       const principal = { organizationId, ...users[0]! };
-      const profile = await database.saveSessionProfile({
+      const profile = await target.saveSessionProfile({
         principal,
         id: null,
         version: null,
-        daemonId,
+        daemonId: enrolledDaemonId,
         name: "Contract profile",
         cwd: "/repo",
         worktree: { mode: "branch-off", base: "main" },
@@ -71,7 +99,7 @@ export function interactiveSessionStoreContract(
       });
       assert.equal(typeof profile, "object");
       if (typeof profile === "string") throw new Error(profile);
-      start = {
+      const request: StartSessionInput = {
         principal,
         profileId: profile.id,
         profileVersion: profile.version,
@@ -83,9 +111,11 @@ export function interactiveSessionStoreContract(
         ],
         usage: { periodStart, limit: 100 },
         maxActivePerDaemon: 4,
+        bodyCutoff: null,
         now,
       };
-    });
+      return { daemonId: enrolledDaemonId, start: request };
+    }
 
     async function started() {
       const result = await database.startInteractiveSession(start);
@@ -113,6 +143,7 @@ export function interactiveSessionStoreContract(
         message: "follow-up",
         maxQueued: 100,
         usage: start.usage,
+        bodyCutoff: null,
         now,
       };
     }
@@ -248,6 +279,7 @@ export function interactiveSessionStoreContract(
         owner: "worker",
         leaseMs: 60_000,
         agentIdle: false,
+        bodyCutoff: null,
         now,
       });
       assert.ok(claim);
@@ -265,6 +297,7 @@ export function interactiveSessionStoreContract(
           ...scope,
           generation: 1,
           agentId: "agent",
+          turn: 0,
           from: ["starting"],
           to: "failed",
           reason: "agent_missing",
@@ -300,6 +333,7 @@ export function interactiveSessionStoreContract(
           ...scope,
           generation: 2,
           agentId: "agent",
+          turn: 0,
           from: ["starting"],
           to: "idle",
           now,
@@ -319,6 +353,7 @@ export function interactiveSessionStoreContract(
         sessionId: session.id,
         leaseMs: 60_000,
         agentIdle: false,
+        bodyCutoff: null,
         now,
       };
       const claims = await Promise.all(
@@ -329,9 +364,9 @@ export function interactiveSessionStoreContract(
       const held = claims.filter((claim) => claim !== undefined);
       assert.equal(held.length, 1);
       assert.equal(held[0]!.id, first.id);
+      await fixture.expireLease(held[0]!);
       const reclaimed = await database.claimInteractiveSessionCommand({
         ...input,
-        now: new Date(now.getTime() + 60_000),
         owner: "worker-c",
       });
       assert.equal(reclaimed?.id, first.id);
@@ -357,7 +392,7 @@ export function interactiveSessionStoreContract(
           claimOwner: "worker-c",
           attempts: 2,
           status: "delivered",
-          now: new Date(now.getTime() + 60_000),
+          now,
         }),
         true,
       );
@@ -366,8 +401,8 @@ export function interactiveSessionStoreContract(
     it("a stale idle observation cannot claim a second queued message in the same turn", async () => {
       const { session } = await started();
       const scope = { organizationId: session.organizationId, sessionId: session.id };
-      const agent = { ...scope, generation: session.generation, agentId: "agent", now };
-      const claim = { ...scope, lane: "message" as const, leaseMs: 60_000, now };
+      const agent = { ...scope, generation: session.generation, agentId: "agent", turn: 0, now };
+      const claim = { ...scope, lane: "message" as const, leaseMs: 60_000, bodyCutoff: null, now };
       const owner = "first-worker";
       const settleDelivered = (commandId: string, attempts: number) =>
         database.settleInteractiveSessionCommand({
@@ -405,7 +440,12 @@ export function interactiveSessionStoreContract(
         assert.equal(queued.status, "accepted");
       }
       assert.ok(
-        await database.applyInteractiveSessionState({ ...agent, from: ["running"], to: "idle" }),
+        await database.applyInteractiveSessionState({
+          ...agent,
+          turn: 1,
+          from: ["running"],
+          to: "idle",
+        }),
       );
       const observedIdle =
         (await database.findInteractiveSession(scope.organizationId, scope.sessionId))?.session
@@ -423,7 +463,12 @@ export function interactiveSessionStoreContract(
       });
       assert.equal(first?.body, "first queued");
       assert.ok(
-        await database.applyInteractiveSessionState({ ...agent, from: ["idle"], to: "running" }),
+        await database.applyInteractiveSessionState({
+          ...agent,
+          turn: 1,
+          from: ["idle"],
+          to: "running",
+        }),
       );
       assert.ok(await settleDelivered(first.id, first.attempts));
 
@@ -431,7 +476,12 @@ export function interactiveSessionStoreContract(
       assert.equal(await database.claimInteractiveSessionCommand(secondWorker), undefined);
 
       assert.ok(
-        await database.applyInteractiveSessionState({ ...agent, from: ["running"], to: "idle" }),
+        await database.applyInteractiveSessionState({
+          ...agent,
+          turn: 2,
+          from: ["running"],
+          to: "idle",
+        }),
       );
       const second = await database.claimInteractiveSessionCommand(secondWorker);
       assert.equal(second?.body, "second queued");
@@ -446,6 +496,7 @@ export function interactiveSessionStoreContract(
         owner: "worker",
         leaseMs: 60_000,
         agentIdle: false,
+        bodyCutoff: null,
         now,
       };
       const claim = await database.claimInteractiveSessionCommand(claimInput);
@@ -455,6 +506,7 @@ export function interactiveSessionStoreContract(
           ...scope,
           generation: 1,
           agentId: null,
+          turn: 0,
           from: ["starting"],
           to: "running",
           now,
@@ -466,6 +518,7 @@ export function interactiveSessionStoreContract(
         generation: 1,
         idempotencyKey: randomUUID(),
         kind: "stop",
+        bodyCutoff: null,
         now,
       });
       assert.equal(stop.status, "accepted");
@@ -487,6 +540,394 @@ export function interactiveSessionStoreContract(
       assert.equal(message?.status, "unknown");
       assert.equal(message.failureCode, "delivery_unconfirmed");
     });
+
+    async function startAsMember() {
+      const principal = {
+        ...start.principal,
+        userId: start.principal.organizationId + "-outsider",
+        role: "member" as const,
+      };
+      const result = await database.startInteractiveSession({ ...start, principal });
+      assert.equal(result.status, "created");
+      return { principal, session: result.session };
+    }
+
+    it("removing a member starter revokes stop and close rights", async () => {
+      const { principal, session } = await startAsMember();
+      assert.equal(
+        await database.setInteractiveSessionParticipant({
+          principal: start.principal,
+          sessionId: session.id,
+          userId: principal.userId,
+          role: null,
+          now,
+        }),
+        "removed",
+      );
+      assert.deepEqual(await database.startInteractiveSession({ ...start, principal }), {
+        status: "refused",
+        code: "forbidden",
+      });
+      for (const kind of ["stop", "close"] as const) {
+        assert.deepEqual(
+          await database.acceptInteractiveSessionCommand({
+            ...command(session.id),
+            principal,
+            kind,
+          }),
+          { status: "refused", code: "not_found" },
+        );
+      }
+    });
+
+    it("a starter demoted to viewer cannot promote themselves", async () => {
+      const { principal, session } = await startAsMember();
+      const change = { sessionId: session.id, userId: principal.userId, now };
+      assert.equal(
+        await database.setInteractiveSessionParticipant({
+          ...change,
+          principal: start.principal,
+          role: "viewer",
+        }),
+        "set",
+      );
+      assert.equal(
+        await database.setInteractiveSessionParticipant({
+          ...change,
+          principal,
+          role: "controller",
+        }),
+        "forbidden",
+      );
+    });
+
+    it("start and command replays redact expired bodies before the sweep", async () => {
+      const { session } = await started();
+      const send = command(session.id);
+      assert.equal((await database.acceptInteractiveSessionCommand(send)).status, "accepted");
+      const cutoff = new Date(now.getTime() + 1);
+      const replayedStart = await database.startInteractiveSession({
+        ...start,
+        bodyCutoff: cutoff,
+      });
+      const replayedSend = await database.acceptInteractiveSessionCommand({
+        ...send,
+        bodyCutoff: cutoff,
+      });
+      assert.equal(replayedStart.status, "replayed");
+      assert.equal(replayedSend.status, "replayed");
+      assert.deepEqual([replayedStart.command.body, replayedSend.command.body], [null, null]);
+      assert.equal((await usage())?.used, 2);
+    });
+
+    it("claim leaves an expired body unclaimed before the sweep", async () => {
+      const { session } = await started();
+      assert.equal(
+        await database.claimInteractiveSessionCommand({
+          organizationId: session.organizationId,
+          sessionId: session.id,
+          owner: "worker",
+          leaseMs: 60_000,
+          agentIdle: false,
+          bodyCutoff: new Date(now.getTime() + 1),
+          now,
+        }),
+        undefined,
+      );
+    });
+
+    it("provider options enforce the jsonb text size at the byte boundary", async () => {
+      const profile = await database.findSessionProfile(
+        start.principal.organizationId,
+        start.profileId,
+      );
+      assert.ok(profile);
+      const save = {
+        ...profile,
+        principal: start.principal,
+        id: null,
+        version: null,
+        name: "Sized options",
+        now,
+      };
+      // Each compact separator gains one byte when PostgreSQL renders jsonb.
+      const options = (length: number) => ({
+        a: Array.from({ length: 15 }, () => 0),
+        b: "x".repeat(length),
+      });
+      const oversized = await database.saveSessionProfile({
+        ...save,
+        providerOptions: options(4036),
+      });
+      assert.equal(oversized, "invalid_profile");
+      const atLimit = await database.saveSessionProfile({
+        ...save,
+        providerOptions: options(4035),
+      });
+      assert.equal(typeof atLimit, "object");
+    });
+
+    it("writes metadata-only audit rows and does not audit idempotent replays twice", async () => {
+      const { session, command: initial } = await started();
+      const send = command(session.id);
+      const sent = await database.acceptInteractiveSessionCommand(send);
+      assert.equal(sent.status, "accepted");
+      assert.equal((await database.acceptInteractiveSessionCommand(send)).status, "replayed");
+      const userId = start.participants[0]!.userId;
+      assert.equal(
+        await database.setInteractiveSessionParticipant({
+          principal: start.principal,
+          sessionId: session.id,
+          userId,
+          role: "viewer",
+          now,
+        }),
+        "set",
+      );
+      const audit = await fixture.readAudit(session.id);
+      assert.deepEqual(
+        audit.toSorted((a, b) => a.action.localeCompare(b.action)),
+        [
+          {
+            action: "interactive_session.message",
+            actorIdentity: start.principal.userId,
+            evidence: { commandId: sent.command.id },
+          },
+          {
+            action: "interactive_session.participant_changed",
+            actorIdentity: start.principal.userId,
+            evidence: { userId, role: "viewer" },
+          },
+          {
+            action: "interactive_session.started",
+            actorIdentity: start.principal.userId,
+            evidence: { profileId: start.profileId, commandId: initial.id },
+          },
+        ],
+      );
+    });
+
+    it("close supersedes an earlier pending stop", async () => {
+      const { session } = await started();
+      const scope = { organizationId: session.organizationId, sessionId: session.id };
+      assert.ok(
+        await database.applyInteractiveSessionState({
+          ...scope,
+          generation: 1,
+          turn: 0,
+          agentId: null,
+          from: ["starting"],
+          to: "running",
+          now,
+        }),
+      );
+      const stop = { ...command(session.id), kind: "stop" as const };
+      assert.equal((await database.acceptInteractiveSessionCommand(stop)).status, "accepted");
+      assert.equal(
+        (await database.acceptInteractiveSessionCommand({ ...command(session.id), kind: "close" }))
+          .status,
+        "accepted",
+      );
+      const replay = await database.acceptInteractiveSessionCommand(stop);
+      assert.equal(replay.status, "replayed");
+      assert.equal(replay.command.status, "superseded");
+      const close = await database.claimInteractiveSessionCommand({
+        ...scope,
+        owner: "worker",
+        lane: "control",
+        leaseMs: 60_000,
+        agentIdle: false,
+        bodyCutoff: null,
+        now,
+      });
+      assert.equal(close?.kind, "close");
+    });
+
+    it("a caller 61 seconds ahead cannot steal or invalidate a live lease", async () => {
+      const { session } = await started();
+      const input = {
+        organizationId: session.organizationId,
+        sessionId: session.id,
+        leaseMs: 60_000,
+        agentIdle: false,
+        bodyCutoff: null,
+        now,
+      };
+      const first = await database.claimInteractiveSessionCommand({ ...input, owner: "first" });
+      assert.ok(first);
+      const skewed = new Date(first.claimExpiresAt!.getTime() + 1_000);
+      assert.equal(
+        await database.claimInteractiveSessionCommand({ ...input, owner: "ahead", now: skewed }),
+        undefined,
+      );
+      assert.equal(
+        await database.settleInteractiveSessionCommand({
+          ...input,
+          commandId: first.id,
+          generation: first.generation,
+          claimOwner: "first",
+          attempts: first.attempts,
+          status: "delivered",
+          now: skewed,
+        }),
+        true,
+      );
+    });
+
+    it("a caller behind the store clock cannot settle an expired lease", async () => {
+      const { session } = await started();
+      const input = {
+        organizationId: session.organizationId,
+        sessionId: session.id,
+        leaseMs: 60_000,
+        agentIdle: false,
+        bodyCutoff: null,
+        now,
+      };
+      const first = await database.claimInteractiveSessionCommand({ ...input, owner: "first" });
+      assert.ok(first);
+      await fixture.expireLease(first);
+      assert.equal(
+        await database.settleInteractiveSessionCommand({
+          ...input,
+          commandId: first.id,
+          generation: first.generation,
+          claimOwner: "first",
+          attempts: first.attempts,
+          status: "delivered",
+          now: new Date(first.claimExpiresAt!.getTime() - 121_000),
+        }),
+        false,
+      );
+    });
+
+    it("a delayed transition from an older turn preserves the current turn in the same generation", async () => {
+      const { session } = await started();
+      const agent = {
+        organizationId: session.organizationId,
+        sessionId: session.id,
+        generation: session.generation,
+        agentId: "agent",
+        now,
+      };
+      assert.ok(await database.bindInteractiveSessionAgent({ ...agent, workspaceId: "workspace" }));
+      async function enterTurn(turn: number, from: "starting" | "idle") {
+        return database.applyInteractiveSessionState({
+          ...agent,
+          turn,
+          from: [from],
+          to: "running",
+        });
+      }
+      const complete = { ...agent, turn: 1, from: ["running"] as const, to: "idle" as const };
+      assert.ok(await enterTurn(0, "starting"));
+      assert.ok(await database.applyInteractiveSessionState(complete));
+      const next = await enterTurn(1, "idle");
+      assert.ok(next);
+      assert.equal(await database.applyInteractiveSessionState(complete), undefined);
+      assert.equal(next.turn, 2);
+      assert.equal(
+        (await database.findInteractiveSession(session.organizationId, session.id))?.session.state,
+        "running",
+      );
+      assert.ok(await database.applyInteractiveSessionState({ ...complete, turn: 2 }));
+    });
+
+    it("an authoritative replacement turn advances the fence while the session stays running", async () => {
+      const { session } = await started();
+      const agent = {
+        organizationId: session.organizationId,
+        sessionId: session.id,
+        generation: session.generation,
+        agentId: null,
+        now,
+      };
+      assert.ok(
+        await database.applyInteractiveSessionState({
+          ...agent,
+          turn: 0,
+          from: ["starting"],
+          to: "running",
+        }),
+      );
+      const steerStartedNewTurn = {
+        ...agent,
+        turn: 1,
+        from: ["running"] as const,
+        to: "running" as const,
+        beginsTurn: true as const,
+      };
+      const replacement = await database.applyInteractiveSessionState(steerStartedNewTurn);
+      assert.equal(replacement?.turn, 2);
+      assert.equal(
+        await database.applyInteractiveSessionState({
+          ...agent,
+          turn: 1,
+          from: ["running"],
+          to: "idle",
+        }),
+        undefined,
+      );
+    });
+
+    it("a new start rechecks daemon presence, permissions, and revocation", async () => {
+      const refused = { status: "refused", code: "daemon_unavailable" };
+      await database.setDaemonPresence(daemonId, "offline");
+      assert.deepEqual(await database.startInteractiveSession(start), refused);
+      await database.setDaemonPresence(daemonId, "connected");
+      await database.setDaemonPermissions(daemonId, []);
+      assert.deepEqual(await database.startInteractiveSession(start), refused);
+      await database.setDaemonPermissions(daemonId, ["hub.execute"]);
+      await database.revokeDaemon(daemonId);
+      assert.deepEqual(await database.startInteractiveSession(start), refused);
+      assert.equal(await usage(), undefined);
+    });
+
+    if (backend === "PostgreSQL") {
+      it("the database rejects session events linked to another organization's command", async () => {
+        const { session } = await started();
+        const foreign = sessionOrganization(randomUUID());
+        const other = await createDatabase(foreign, now);
+        const foreignStart = await prepareStart(
+          other.database,
+          foreign.organizationId,
+          foreign.users,
+        );
+        const created = await other.database.startInteractiveSession(foreignStart.start);
+        assert.equal(created.status, "created");
+        assert.ok(fixture.insertEventForAnotherCommand);
+        await assert.rejects(
+          fixture.insertEventForAnotherCommand(session.id, created.command.id),
+          /foreign key/u,
+        );
+      });
+
+      it("profile save rechecks daemon state after waiting for the profile lock", async () => {
+        const profile = await database.findSessionProfile(
+          start.principal.organizationId,
+          start.profileId,
+        );
+        assert.ok(profile);
+        assert.ok(fixture.raceProfileSaveWithRevocation);
+        assert.equal(
+          await fixture.raceProfileSaveWithRevocation({
+            ...profile,
+            principal: start.principal,
+            now,
+          }),
+          "daemon_unavailable",
+        );
+      });
+
+      it("the database rejects participants without an organization membership", async () => {
+        const { session } = await started();
+        assert.ok(fixture.insertParticipantOutsideOrganization);
+        await assert.rejects(
+          fixture.insertParticipantOutsideOrganization(session.id),
+          /foreign key/u,
+        );
+      });
+    }
 
     it("the per-daemon active limit holds under concurrent starts", async () => {
       const results = await Promise.all(

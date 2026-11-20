@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { posix } from "node:path";
 import type { capabilities } from "./access.js";
+import type { JsonValue } from "../config/compiler.js";
 import type { ConsumeOrganizationUsageInput } from "../db/types.js";
 import type {
   CommandFailureCode,
@@ -9,6 +10,7 @@ import type {
   Delivery,
   ParticipantRole,
   RefusalCode,
+  SessionAuditRecord,
   SessionCommandRecord,
   SessionCursor,
   SessionEventRecord,
@@ -47,6 +49,7 @@ export interface StartSessionInput {
   participants: readonly Participant[];
   usage: UsageReservation;
   maxActivePerDaemon: number;
+  bodyCutoff: Date | null;
   now: Date;
 }
 
@@ -76,6 +79,7 @@ export type AcceptCommandInput = {
   sessionId: string;
   generation: number;
   idempotencyKey: string;
+  bodyCutoff: Date | null;
   now: Date;
 } & (
   | {
@@ -105,7 +109,7 @@ export interface ClaimCommandInput extends SessionScope {
   // A false hint blocks queued claims even when the stored state is idle.
   agentIdle: boolean;
   lane?: "message" | "control";
-  bodyCutoff?: Date | null;
+  bodyCutoff: Date | null;
   now: Date;
 }
 
@@ -128,6 +132,10 @@ export interface BindSessionAgentInput extends SessionScope {
 
 export interface ApplySessionStateInput extends SessionScope {
   generation: number;
+  // Use the turn associated with the observation, even if a later turn is already running.
+  turn: number;
+  // A confirmed replacement can begin a new turn while the visible state stays running.
+  beginsTurn?: true;
   agentId: string | null;
   from: readonly SessionState[];
   to: Exclude<SessionState, "closed">;
@@ -260,11 +268,44 @@ export function profileValidation(
     nameLength > 80 ||
     !(posix.isAbsolute(settings.cwd) || /^(?:[A-Za-z]:[\\/]|\\\\)/u.test(settings.cwd)) ||
     Buffer.byteLength(settings.cwd) > 1024 ||
-    Buffer.byteLength(JSON.stringify(settings.providerOptions)) > 4096 ||
+    jsonbTextSize(settings.providerOptions) > 4096 ||
     settings.cwd.includes("\0")
   )
     return "invalid_profile";
   return undefined;
+}
+
+function jsonbTextSize(value: JsonValue): number {
+  if (Array.isArray(value)) {
+    return (
+      2 +
+      value.reduce<number>((bytes, item) => bytes + jsonbTextSize(item), 0) +
+      2 * Math.max(0, value.length - 1)
+    );
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value);
+    return (
+      2 +
+      entries.reduce(
+        (bytes, [key, item]) =>
+          bytes + Buffer.byteLength(JSON.stringify(key)) + 2 + jsonbTextSize(item),
+        0,
+      ) +
+      2 * Math.max(0, entries.length - 1)
+    );
+  }
+  const encoded = JSON.stringify(value);
+  if (typeof value !== "number") return Buffer.byteLength(encoded);
+
+  // PostgreSQL expands exponent notation when rendering JSONB numbers.
+  const [mantissa, exponent] = encoded.split("e");
+  if (exponent === undefined) return encoded.length;
+  const power = Number(exponent);
+  const sign = value < 0 ? 1 : 0;
+  if (power >= 0) return sign + power + 1;
+  const digits = mantissa!.replace(/[-.]/gu, "").length;
+  return sign + 1 - power + digits;
 }
 
 export function profileVersionMatches(
@@ -361,6 +402,7 @@ export function newSession(
     state: "starting",
     stateReason: null,
     generation: 1,
+    turn: 0,
     daemonAgentId: null,
     daemonWorkspaceId: null,
     hubSeq: 0,
@@ -457,6 +499,7 @@ export function advanceForCommand(
         state: "starting",
         stateReason: null,
         generation: next.generation + 1,
+        turn: 0,
         daemonAgentId: null,
         daemonWorkspaceId: null,
       };
@@ -465,13 +508,38 @@ export function advanceForCommand(
   }
 }
 
+export function observedSessionTransition(
+  session: SessionRecord,
+  input: ApplySessionStateInput,
+): SessionRecord | undefined {
+  if (
+    session.generation !== input.generation ||
+    session.turn !== input.turn ||
+    session.daemonAgentId !== input.agentId ||
+    session.state === "closed" ||
+    !input.from.includes(session.state)
+  )
+    return undefined;
+  const newTurn =
+    input.to === "running" &&
+    (input.beginsTurn === true || session.state === "starting" || session.state === "idle");
+  return {
+    ...session,
+    state: input.to,
+    stateReason: input.reason ?? null,
+    turn: session.turn + Number(newTurn),
+  };
+}
+
 export function interruptCommand(
   command: SessionCommandRecord,
   kind: "stop" | "close" | "replace",
   now: Date,
 ): Partial<SessionCommandRecord> | undefined {
   if (!unsettledStatuses.some((status) => status === command.status)) return undefined;
-  if (kind === "replace") return settlePatch("superseded", now);
+  if (kind === "replace" || (kind === "close" && command.kind === "stop")) {
+    return settlePatch("superseded", now);
+  }
   if (command.kind !== "message") return undefined;
   if (command.status === "pending" || command.status === "queued")
     return settlePatch("superseded", now);
@@ -494,8 +562,7 @@ function canDispatchCommand(
 ): boolean {
   if (!rights?.[commandCapability[command.kind]]) return false;
   return (
-    command.kind !== "message" ||
-    (command.body !== null && (input.bodyCutoff == null || command.createdAt >= input.bodyCutoff))
+    command.kind !== "message" || (command.body !== null && bodyVisible(command, input.bodyCutoff))
   );
 }
 
@@ -503,9 +570,10 @@ export function commandLeaseEligible(
   command: SessionCommandRecord,
   input: ClaimCommandInput,
   sessionState: SessionState,
+  leaseNow: Date,
 ): boolean {
   return (
-    (command.claimExpiresAt === null || command.claimExpiresAt <= input.now) &&
+    (command.claimExpiresAt === null || command.claimExpiresAt <= leaseNow) &&
     (command.status === "pending" ||
       (command.status === "unknown" && command.failureCode !== "delivery_unconfirmed") ||
       command.status === "dispatching" ||
@@ -517,6 +585,7 @@ export function claimPatch(
   command: SessionCommandRecord,
   input: ClaimCommandInput,
   rights: ReturnType<typeof capabilities> | undefined,
+  leaseNow: Date,
 ): Partial<SessionCommandRecord> {
   if (!canDispatchCommand(command, input, rights) || command.attempts >= maxDeliveryAttempts) {
     if (command.status === "unknown" || command.status === "dispatching") {
@@ -529,7 +598,7 @@ export function claimPatch(
     failureCode: null,
     attempts: command.attempts + 1,
     claimOwner: input.owner,
-    claimExpiresAt: new Date(input.now.getTime() + input.leaseMs),
+    claimExpiresAt: new Date(leaseNow.getTime() + input.leaseMs),
     dispatchedAt: input.now,
     settledAt: null,
     updatedAt: input.now,
@@ -566,6 +635,7 @@ export function stateEvent(session: SessionRecord): SessionEventDraft {
       state: session.state,
       stateReason: session.stateReason,
       generation: session.generation,
+      turn: session.turn,
     },
   };
 }
@@ -582,12 +652,43 @@ export function deliveryEvent(command: SessionCommandRecord): SessionEventDraft 
   };
 }
 
+function bodyVisible(command: SessionCommandRecord, cutoff: Date | null): boolean {
+  return command.bodyExpiredAt === null && (cutoff === null || command.createdAt >= cutoff);
+}
+
+export function replayCommand(
+  command: SessionCommandRecord,
+  cutoff: Date | null,
+): SessionCommandRecord {
+  return bodyVisible(command, cutoff) ? command : { ...command, body: null };
+}
+
+export function sessionAudit(
+  session: SessionRecord,
+  actorIdentity: string,
+  action: string,
+  evidence: SessionAuditRecord["evidence"],
+  now: Date,
+): SessionAuditRecord {
+  return {
+    id: randomUUID(),
+    organizationId: session.organizationId,
+    actorKind: "user",
+    actorIdentity,
+    action: "interactive_session." + action,
+    subjectType: "interactive_session",
+    subjectId: session.id,
+    evidence,
+    createdAt: now,
+  };
+}
+
 export function messageRecord(
   command: SessionCommandRecord,
   cutoff: Date | null,
 ): SessionMessageRecord {
   if (command.delivery === null) throw new Error("Session message is missing its delivery mode");
-  const expired = command.bodyExpiredAt !== null || (cutoff !== null && command.createdAt < cutoff);
+  const expired = !bodyVisible(command, cutoff);
   return {
     commandId: command.id,
     ordinal: command.ordinal,
