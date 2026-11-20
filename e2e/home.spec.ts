@@ -117,12 +117,56 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await home.expectOpen();
     await expect(home.finishSetup()).toBeVisible();
     await home.capture(`${SHOTS}/04-complete.png`);
-    await home.finishSetup().click();
+    await home.finishSetup().focus();
+    await page.keyboard.press("Space");
     await home.expectChecklistHidden();
+    await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeFocused();
     await home.reload();
     await home.expectRecentRun("deploy", "Running");
     await home.expectChecklistHidden();
   });
+});
+
+test("returns to the checklist when the last run ages out before Finish setup", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.seedSlackConnection("owner", "slack", "Acme");
+  const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  const triggers = new OrganizationTriggers(page);
+  await triggers.startNew();
+  await triggers.configureManual({
+    name: "deploy",
+    daemon,
+    cwd: "/workspace",
+    agent: "codex/gpt-5.4",
+    mode: "full-access",
+    thinking: "high",
+    prompt: "Run it",
+  });
+  await triggers.save("deploy");
+  await hub.seedTriggerRun("deploy", { minutesAgo: 1, status: "succeeded" });
+  const home = new OrganizationHome(page);
+  await home.open();
+  await hub.grantOperator("owner");
+  await expect(home.finishSetup()).toBeVisible();
+
+  await hub
+    .primaryApplication()
+    .query(
+      "update trigger_runs set created_at = now() - interval '8 days' where configured_trigger_name = $1",
+      ["deploy"],
+    );
+  await home.finishSetup().press("Enter");
+
+  const alert = page.getByRole("alert").filter({ hasText: "Setup could not be finished" });
+  await expect(alert).toContainText("Complete all four checklist steps before finishing setup.");
+  await expect(home.allSet()).toHaveCount(0);
+  await home.expectProgress("3 of 4 done");
+  await home.expectStep("Run it", "To do");
+  await expect(alert).toBeFocused();
 });
 
 /** A self-hosted operator who deferred app setup is sent back to it from the first step. */

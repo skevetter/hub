@@ -961,7 +961,10 @@ class MemoryDatabase implements Database {
   private readonly homeChecklistCompletions = new Map<string, Date>();
 
   constructor(private readonly options: MemoryDatabaseOptions = {}) {
-    this.organizationIds = new Set(options.organizationIds);
+    this.organizationIds = new Set([
+      ...(options.organizationIds ?? []),
+      ...(options.memberships ?? []).map(({ organizationId }) => organizationId),
+    ]);
     for (const connection of options.githubConnections ?? [])
       this.githubConnections.set(connection.installationId, connection);
     for (const connection of options.slackConnections ?? []) {
@@ -4871,6 +4874,7 @@ class MemoryDatabase implements Database {
   }
 
   async completeHomeChecklist(organizationId: string): Promise<Date> {
+    if (!this.organizationIds.has(organizationId)) throw new Error("organization is unavailable");
     const completedAt = this.homeChecklistCompletions.get(organizationId) ?? this.now();
     this.homeChecklistCompletions.set(organizationId, completedAt);
     return completedAt;

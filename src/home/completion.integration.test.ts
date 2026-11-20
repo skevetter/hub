@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it, vi } from "vitest";
 import { composeEntitlements } from "../auth/entitlements.js";
 import { createAuthServer } from "../auth/server.js";
+import { createMemoryDatabase } from "../db/memory.js";
 import { createDatabase } from "../db/pg.js";
 import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
@@ -62,6 +63,38 @@ describe("organization checklist completion", () => {
       await fixture.dashboard.completeChecklist(fixture.post(), fixture.slug),
       completedAt,
     );
+  });
+
+  it("requires an Origin header even when the Referer matches, including on replay", async () => {
+    await fixture.recordRun();
+    const refererOnly = fixture.post();
+    refererOnly.headers.set("referer", refererOnly.url);
+    refererOnly.headers.delete("origin");
+    const rejected = {
+      status: "error",
+      error: { message: "Reload Home and try again." },
+    };
+
+    assert.deepEqual(await finish(refererOnly, fixture.slug), rejected);
+    assert.equal((await fixture.snapshot()).checklistCompletedAt, null);
+    assert.equal((await finish(fixture.post(), fixture.slug)).status, "ok");
+    assert.deepEqual(await finish(refererOnly, fixture.slug), rejected);
+  });
+
+  it("refuses to complete setup for an unknown organization in either store", async () => {
+    const memory = createMemoryDatabase({ organizationIds: [fixture.organizationId] });
+    for (const database of [fixture.database, memory]) {
+      await assert.rejects(database.completeHomeChecklist("absent"), {
+        message: "organization is unavailable",
+      });
+      assert.equal(await database.getHomeChecklistCompletedAt("absent"), null);
+      assert.equal(await database.getHomeChecklistCompletedAt(fixture.organizationId), null);
+      const completedAt = await database.completeHomeChecklist(fixture.organizationId);
+      assert.deepEqual(
+        await database.getHomeChecklistCompletedAt(fixture.organizationId),
+        completedAt,
+      );
+    }
   });
 
   it("refuses invalid origins, non-operators, other organizations and premature calls, then returns one timestamp", async () => {
@@ -158,6 +191,7 @@ async function startInstance() {
       new Request(path, { method: "POST", headers: { cookie, origin } });
 
     return {
+      database,
       dashboard,
       organizationId,
       slug,

@@ -41,18 +41,28 @@ export function HomePanel() {
   });
   const home = queryState<HomeSnapshot>(snapshot, "Overview unavailable", <HomeLoading />);
   if (!home.ok) return home.element;
-  const data = home.data;
+  return (
+    <HomeView
+      key={home.data.organization.id}
+      data={home.data}
+      operator={account.isInstanceOperator}
+    />
+  );
+}
+
+function HomeView({ data, operator }: { data: HomeSnapshot; operator: boolean }) {
+  const [focusOnCompletion, setFocusOnCompletion] = useState(false);
   const base = `/o/${data.organization.slug}`;
   const unroutedCount = data.unrouted.reduce((total, { count }) => total + count, 0);
   return (
     <>
-      <PageHeader title="Home" description={HOME_DESCRIPTION} />
+      <PageHeader title="Home" description={HOME_DESCRIPTION} focusOnMount={focusOnCompletion} />
       {data.checklistCompletedAt === null ? (
         <HomeChecklist
-          key={data.organization.id}
           snapshot={data}
           base={base}
-          operator={account.isInstanceOperator}
+          operator={operator}
+          onFinished={() => setFocusOnCompletion(true)}
         />
       ) : null}
       {unroutedCount === 0 ? null : (
@@ -184,68 +194,67 @@ function HomeChecklist({
   snapshot,
   base,
   operator,
+  onFinished,
 }: {
   snapshot: HomeSnapshot;
   base: string;
   operator: boolean;
+  onFinished: () => void;
 }) {
+  const { organization } = snapshot;
   const checklist = deriveChecklist(snapshot);
-  if (checklist.complete) {
-    return <FinishSetup organization={snapshot.organization} operator={operator} />;
-  }
-  return <GetStarted checklist={checklist} snapshot={snapshot} base={base} operator={operator} />;
-}
-
-function FinishSetup({
-  organization,
-  operator,
-}: {
-  organization: HomeSnapshot["organization"];
-  operator: boolean;
-}) {
   const queryClient = useQueryClient();
   const finish = useServerFn(finishHomeSetup);
   const completion = useMutation({
     mutationFn: () => finish({ data: { organizationSlug: organization.slug } }),
-    onSuccess: async (result) => {
-      if (result.status !== "ok") return;
+    onSettled: async (result) => {
       const queryKey = ["home", organization.id];
+      if (result?.status !== "ok") {
+        await queryClient.invalidateQueries({ queryKey });
+        return;
+      }
       await queryClient.cancelQueries({ queryKey });
-      queryClient.setQueriesData<HomeSnapshot>({ queryKey }, (snapshot) =>
-        snapshot === undefined
+      queryClient.setQueriesData<HomeSnapshot>({ queryKey }, (cached) =>
+        cached === undefined
           ? undefined
-          : { ...snapshot, checklistCompletedAt: result.data.completedAt },
+          : { ...cached, checklistCompletedAt: result.data.completedAt },
       );
+      onFinished();
     },
   });
   return (
     <Section>
-      <Card
-        title="You are all set"
-        description={
-          operator ? "All four setup steps are complete." : "An instance operator can finish setup."
-        }
-        action={
-          operator ? (
-            <Button
-              disabled={completion.isPending}
-              aria-busy={completion.isPending}
-              onClick={() => completion.mutate()}
-            >
-              Finish setup
-            </Button>
-          ) : undefined
-        }
-      >
-        {completion.isError || completion.data?.status === "error" ? (
-          <FailureAlert
-            title="Setup could not be finished"
-            error={completion.error ?? completion.data}
-            fallback="Try finishing setup again."
-            focusOnArrival
-          />
-        ) : null}
-      </Card>
+      {completion.isError || completion.data?.status === "error" ? (
+        <FailureAlert
+          title="Setup could not be finished"
+          error={completion.error ?? completion.data}
+          fallback="Try finishing setup again."
+          focusOnArrival
+        />
+      ) : null}
+      {checklist.complete ? (
+        <Card
+          title="You are all set"
+          description={
+            operator
+              ? "All four setup steps are complete."
+              : "An instance operator can finish setup."
+          }
+          action={
+            operator ? (
+              <Button
+                disabled={completion.isPending}
+                aria-busy={completion.isPending}
+                onClick={() => completion.mutate()}
+              >
+                Finish setup
+              </Button>
+            ) : undefined
+          }
+        />
+      ) : (
+        <GetStarted checklist={checklist} snapshot={snapshot} base={base} operator={operator} />
+      )}
     </Section>
   );
 }
@@ -268,25 +277,23 @@ function GetStarted({
   // simply absent from that render and arrives with the client.
   const origin = typeof window === "undefined" ? undefined : window.location.origin;
   return (
-    <Section>
-      <Disclosure
-        id="get-started"
-        open={open}
-        onOpenChange={setOpen}
-        title="Get started"
-        description="Connect an app and a daemon, create a trigger, and run it."
-        status={<StatusPill tone="neutral">{progress}</StatusPill>}
-      >
-        <RecordList label="Get started">
-          {checklist.steps.map((step) => (
-            <StepRow
-              key={step.key}
-              {...stepPresentation(step, snapshot, { base, operator, origin })}
-            />
-          ))}
-        </RecordList>
-      </Disclosure>
-    </Section>
+    <Disclosure
+      id="get-started"
+      open={open}
+      onOpenChange={setOpen}
+      title="Get started"
+      description="Connect an app and a daemon, create a trigger, and run it."
+      status={<StatusPill tone="neutral">{progress}</StatusPill>}
+    >
+      <RecordList label="Get started">
+        {checklist.steps.map((step) => (
+          <StepRow
+            key={step.key}
+            {...stepPresentation(step, snapshot, { base, operator, origin })}
+          />
+        ))}
+      </RecordList>
+    </Disclosure>
   );
 }
 

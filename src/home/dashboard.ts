@@ -57,7 +57,7 @@ export class HomeDashboard {
   }
 
   async completeChecklist(request: Request, organizationSlug: string): Promise<string> {
-    if (this.auth.rejectCookieMutation(request) !== undefined)
+    if (this.auth.rejectCookieMutation(request, { requireOrigin: true }) !== undefined)
       throw new ProductRequestError(400, "invalid_origin");
     const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, {
       organizationSlug,

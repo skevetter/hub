@@ -41,6 +41,10 @@ import { TRUSTED_REQUEST_ORIGIN_HEADER } from "../http/request-origin.js";
 import type { InvitationMailer } from "../invitations/index.js";
 import type { AccountMailer } from "./account-emails.js";
 
+interface CookieMutationOptions {
+  requireOrigin?: boolean;
+}
+
 export interface AuthServer {
   handle(request: Request): Promise<Response>;
   browserAccount?(request: Request): Promise<Response>;
@@ -70,7 +74,7 @@ export interface AuthServer {
   ): Promise<OrganizationResourceReader>;
   resolveOrganizationAccess(request: Request): Promise<OrganizationAccessValue>;
   resolveAccount(request: Request): Promise<AccountAccessValue>;
-  rejectCookieMutation(request: Request): Response | undefined;
+  rejectCookieMutation(request: Request, options?: CookieMutationOptions): Response | undefined;
   initialize?(): Promise<void>;
   apiKeys?: OrganizationApiKeys;
   cliCredentials?: OrganizationCliCredentials;
@@ -381,8 +385,12 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
     },
     resolveOrganizationAccess: (request) => access.resolve(request),
     resolveAccount: (request) => access.account(request),
-    rejectCookieMutation: (request) =>
-      rejectCrossOriginCookieMutation(request, requestBrowserOrigin(request, browserOrigin)),
+    rejectCookieMutation: (request, originPolicy) =>
+      rejectCrossOriginCookieMutation(
+        request,
+        requestBrowserOrigin(request, browserOrigin),
+        originPolicy,
+      ),
     initialize: async () => {
       await apiKeys.signing.checkReadiness();
       await instanceSetup.initializeFromPolicy();
@@ -467,20 +475,28 @@ function requireBrowserOrigin(headers: Headers, browserOrigin: string): void {
 function rejectCrossOriginCookieMutation(
   request: Request,
   browserOrigin: string,
+  { requireOrigin = false }: CookieMutationOptions = {},
 ): Response | undefined {
-  if (request.method !== "POST" || !request.headers.has("cookie")) return undefined;
+  if (request.method !== "POST" || (!requireOrigin && !request.headers.has("cookie")))
+    return undefined;
   if (request.headers.get("sec-fetch-site") === "cross-site") {
     return authBoundaryError(
       "Cross-site navigation login blocked. This request appears to be a CSRF attack.",
       "CROSS_SITE_NAVIGATION_LOGIN_BLOCKED",
     );
   }
-  const suppliedOrigin = request.headers.get("origin") ?? request.headers.get("referer");
+  const origin = request.headers.get("origin");
+  const suppliedOrigin = requireOrigin ? origin : (origin ?? request.headers.get("referer"));
   if (suppliedOrigin === null || suppliedOrigin === "null") {
     return authBoundaryError("Missing or null Origin", "MISSING_OR_NULL_ORIGIN");
   }
   try {
-    if (new URL(suppliedOrigin).origin === browserOrigin) return undefined;
+    if (
+      requireOrigin
+        ? suppliedOrigin === browserOrigin
+        : new URL(suppliedOrigin).origin === browserOrigin
+    )
+      return undefined;
   } catch {
     // Invalid browser origins fail through the same public boundary as hostile origins.
   }
