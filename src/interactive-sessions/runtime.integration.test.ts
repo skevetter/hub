@@ -15,10 +15,12 @@ import { createDatabase } from "../db/pg.js";
 import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
 import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
 import { createFetchServer } from "../http/node-server.js";
+import { DaemonAgents } from "../daemons/agents/index.js";
 import { beginProductionShutdown, startProductionRuntime } from "../index.js";
 import { startApplication, stopApplication, type ApplicationRuntime } from "../server/runtime.js";
 import { handleInteractiveSessionEvents } from "../routes/api/v1/interactive-sessions/$sessionId/events.js";
 import { InteractiveSessionCoordinator, type CommandOutcome } from "./coordinator.js";
+import { InteractiveSessionService } from "./service.js";
 import { readInteractiveSessionSettings } from "./settings.js";
 
 afterEach(async () => {
@@ -26,10 +28,14 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+const providerSecret = "gh-app-webhook-Qx7Lm2Vp9Rt4";
+const authSecret = "embedded-auth-fixture-Qx7Lm2V";
+
 it.each([
   ["PASEO_HUB_INTERACTIVE_SESSIONS", "yes"],
   ["PASEO_HUB_SESSION_MAX_ACTIVE_PER_DAEMON", "51"],
   ["PASEO_HUB_SESSION_MAX_QUEUED", "101"],
+  ["PASEO_HUB_SESSION_MAX_MESSAGES_PER_MINUTE", "0"],
 ])("refuses startup with an invalid %s before connecting to the database", async (name, value) => {
   vi.stubEnv("DATABASE_URL", "postgres://postgres@127.0.0.1:1/postgres");
   vi.stubEnv(name, value);
@@ -55,6 +61,15 @@ it("keeps the disabled runtime off the daemon and refuses its stream", async () 
     });
     expect(response.status).toBe(404);
     expect(await response.json()).toMatchObject({ code: "not_found" });
+    const authorize = vi.spyOn(InteractiveSessionService.prototype, "authorizeStream");
+    for (const method of ["GET", "HEAD", "POST", "OPTIONS"]) {
+      const anonymous = await handleInteractiveSessionEvents({
+        request: new Request(origin + "/events", { method }),
+        params: { sessionId: randomUUID() },
+      });
+      expect(anonymous.status).toBe(404);
+    }
+    expect(authorize).not.toHaveBeenCalled();
     expect(runtime.interactiveSessions).toBeNull();
     const state = await fixture.accountState(runtime);
     expect(state.status).toBe("active");
@@ -113,6 +128,33 @@ it("starts, steers, queues and stops through the real embedded runtime, then re-
       { timeout: 5000 },
     );
     expect(daemon.createdAgent()).not.toHaveProperty("mcpServers");
+
+    const history = vi.spyOn(DaemonAgents.prototype, "timeline").mockResolvedValue({
+      epoch: "epoch",
+      reset: false,
+      staleCursor: false,
+      gap: false,
+      startCursor: { epoch: "epoch", seq: 1 },
+      endCursor: { epoch: "epoch", seq: 1 },
+      hasOlder: false,
+      hasNewer: false,
+      entries: [
+        {
+          item: {
+            type: "assistant_message",
+            text: `The webhook secret is ${providerSecret} in config. Auth uses ${authSecret}.`,
+          },
+          timestamp: new Date().toISOString(),
+          seqStart: 1,
+          seqEnd: 1,
+        },
+      ],
+    });
+    const page = await service.history(request, { ...scope, before: null, limit: 20 });
+    expect(page).toMatchObject({
+      entries: [{ text: "The webhook secret is [redacted] in config. Auth uses [redacted]." }],
+    });
+    history.mockRestore();
 
     const command = { ...scope, generation: 1 };
     const steer = accepted(
@@ -269,6 +311,8 @@ async function embeddedHub() {
           entitlements,
           billing: null,
           publicBaseUrl: origin,
+          completionTokenSecret: authSecret,
+          timelineScrubValues: [providerSecret],
           interactiveSessions: readInteractiveSessionSettings({
             PASEO_HUB_INTERACTIVE_SESSIONS: String(enabled),
           }),

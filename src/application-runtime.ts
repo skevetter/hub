@@ -480,17 +480,21 @@ function createProgressReporter(
   };
 }
 
+function timelineScrubValues(options: ApplicationCompositionOptions): string[] {
+  return [
+    ...(options.timelineScrubValues ?? []),
+    options.completionTokenSecret,
+    options.runProgress?.githubToken,
+  ].filter((value): value is string => value !== undefined);
+}
+
 function createRunStreamRuntime(
   options: ApplicationCompositionOptions,
   timeline: { timelineBus?: RunTimelineBus; runTimelineReconciler?: RunTimelineReconciler },
   ownership: CompositionResources,
 ) {
   const settings = options.runProgress ?? readRunProgressSettings({});
-  const scrubValues = [
-    ...(options.timelineScrubValues ?? []),
-    ...(options.completionTokenSecret === undefined ? [] : [options.completionTokenSecret]),
-    ...(settings.githubToken === undefined ? [] : [settings.githubToken]),
-  ];
+  const scrubValues = timelineScrubValues(options);
   const runStream = new RunStream({
     database: options.database,
     auth: options.auth,
@@ -534,12 +538,8 @@ function createInteractiveSessionsRuntime(
   if (databaseQuery === undefined || entitlements === null) {
     throw new Error("Interactive sessions require a database query handle and entitlements.");
   }
-  const scrub = createTimelineScrubber({
-    scrubValues: [
-      ...(options.timelineScrubValues ?? []),
-      ...(options.completionTokenSecret === undefined ? [] : [options.completionTokenSecret]),
-    ],
-  });
+  const scrubValues = timelineScrubValues(options);
+  const scrub = createTimelineScrubber({ scrubValues });
   const bodyCutoff = (now: Date) => sessionMessageBodyCutoff(runPayloadRetention, now);
   const bus = new SessionEventBus(() =>
     logger.warn("interactive session event notification failed"),
@@ -551,6 +551,7 @@ function createInteractiveSessionsRuntime(
     bus,
     settings,
     scrub,
+    scrubValues,
     instanceId: randomUUID(),
     bodyCutoff,
     reportFailure: (_error, operation) =>
@@ -564,6 +565,7 @@ function createInteractiveSessionsRuntime(
     bus,
     connectionForDaemon,
     scrub,
+    scrubValues,
     bodyCutoff: () => bodyCutoff(new Date()),
   });
   const stream = new InteractiveSessionStream({
@@ -664,11 +666,7 @@ function createRunTimelineRuntime(
   ownership.own(() => retention.stop(), "composition.timeline_retention");
   retention.start();
   if (!settings.runTimelineEnabled) return { database };
-  const scrubValues = [
-    ...(options.timelineScrubValues ?? []),
-    ...(options.completionTokenSecret === undefined ? [] : [options.completionTokenSecret]),
-    ...(settings.githubToken === undefined ? [] : [settings.githubToken]),
-  ];
+  const scrubValues = timelineScrubValues(options);
   const report = (error: unknown, operation: string, scope?: TimelineRunScope) => {
     reportFailure(
       error,
