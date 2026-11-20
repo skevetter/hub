@@ -65,6 +65,7 @@ import {
 } from "./auth/webhook-signatures.js";
 import { readWebhookOptions } from "./webhook-config.js";
 import { readRunProgressSettings } from "./run-progress/settings.js";
+import { readInteractiveSessionSettings } from "./interactive-sessions/settings.js";
 import { readTimelineScrubValues } from "./run-timeline/secrets.js";
 import {
   createServerShutdown,
@@ -81,7 +82,10 @@ export async function stopProductionRuntime(): Promise<void> {
 }
 
 export async function beginProductionShutdown(): Promise<void> {
-  if (hasApplication()) await (await getApplication()).runStream.beginShutdown();
+  if (!hasApplication()) return;
+  const { runStream, interactiveSessions } = await getApplication();
+  if (!interactiveSessions) return runStream.beginShutdown();
+  await Promise.all([runStream.beginShutdown(), interactiveSessions.stream.beginShutdown()]);
 }
 
 export async function handleDaemonUpgrade(
@@ -104,6 +108,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     const webhookOptions = readWebhookOptions(process.env);
     const webhookSigning = readWebhookSigningSettings(process.env);
     const runProgress = readRunProgressSettings(process.env);
+    const interactiveSessions = readInteractiveSessionSettings(process.env);
     const runPayloadRetention = readRunPayloadRetentionSettings(
       process.env,
       runProgress.retentionDays,
@@ -199,6 +204,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     }
     const application = await createApplicationRuntime({
       database,
+      databaseQuery: runtime,
       auth,
       entitlements: entitlements.service,
       billing,
@@ -209,6 +215,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       scriptLimits,
       webhookOptions,
       runProgress,
+      interactiveSessions,
       runPayloadRetention,
       timelineScrubValues: readTimelineScrubValues(process.env, Object.values(providerEnvironment)),
       ...(githubNotifications === undefined ? {} : { githubNotifications }),

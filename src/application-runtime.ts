@@ -3,7 +3,13 @@ import {
   assertRunPayloadWindow,
   type RunPayloadRetentionSettings,
 } from "./run-payload-retention/settings.js";
-import { createHubApplication, type HubRuntimeOptions } from "./app.js";
+import { randomUUID } from "node:crypto";
+import {
+  createHubApplication,
+  type HubApplication,
+  type HubRuntime,
+  type HubRuntimeOptions,
+} from "./app.js";
 import { logger } from "./logger.js";
 import { RunTimeline } from "./run-timeline/index.js";
 import { RunTimelineReconciler } from "./run-timeline/reconcile.js";
@@ -16,6 +22,8 @@ import type { AuthServer } from "./auth/server.js";
 import type { BillingRuntime } from "./billing/index.js";
 import type { ConnectionResolver } from "./config/connections.js";
 import type { Database } from "./db/types.js";
+import type { QueryHandle } from "./db/runtime/index.js";
+import { withInteractiveSessionAccountFeature } from "./auth/organization-access.js";
 import { resolveRouteTenant } from "./projects/access.js";
 import { capabilitiesFor } from "./auth/organization-policy.js";
 import type { DaemonDispatchLifecycleOptions } from "./daemons/lifecycle.js";
@@ -53,9 +61,19 @@ import { ProgressReporter, type ProgressProvider } from "./run-progress/index.js
 import { TimelineRetention } from "./run-timeline/retention.js";
 import { RunStream } from "./run-stream/index.js";
 import { reportFailure } from "./failures/index.js";
+import { SessionEventBus } from "./interactive-sessions/bus.js";
+import { InteractiveSessionCoordinator } from "./interactive-sessions/coordinator.js";
+import {
+  SessionMessageRetention,
+  sessionMessageBodyCutoff,
+} from "./interactive-sessions/retention.js";
+import { InteractiveSessionService } from "./interactive-sessions/service.js";
+import type { InteractiveSessionSettings } from "./interactive-sessions/settings.js";
+import { InteractiveSessionStream } from "./interactive-sessions/stream.js";
 
 export interface ApplicationCompositionOptions {
   database: Database | null;
+  databaseQuery?: QueryHandle;
   auth: AuthServer | null;
   /** The composition root's single EntitlementsService; present whenever a database is. */
   entitlements: EntitlementsService | null;
@@ -71,6 +89,7 @@ export interface ApplicationCompositionOptions {
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
   runProgress?: RunProgressSettings;
+  interactiveSessions?: InteractiveSessionSettings;
   runPayloadRetention?: RunPayloadRetentionSettings;
   progressProviders?: readonly ProgressProvider[];
   timelineScrubValues?: readonly string[];
@@ -102,18 +121,7 @@ async function createOwnedApplicationRuntime(
     ownership,
   );
   const registrations = options.registrations ?? [];
-  const connections = new Map(
-    registrations.map((registration) => [registration.connection.name, registration.connection]),
-  );
-  if (connections.size !== registrations.length) {
-    throw new Error("provider connection registrations must have unique names");
-  }
-  const integrations = new Map<string, ProviderIntegrationRegistration>();
-  for (const registration of registrations) {
-    if (registration.integration !== undefined) {
-      integrations.set(registration.connection.name, registration.integration);
-    }
-  }
+  const { connections, integrations } = collectProviderConnections(registrations);
   const connectionsForProject = createConnectionsForProject(options.database, integrations);
   const executionAuthority = createRuntimeExecutionAuthority(
     options.database,
@@ -126,10 +134,14 @@ async function createOwnedApplicationRuntime(
   }
 
   const progress = createProgressReporter(options, timelineRuntime.timelineBus, ownership);
-  const application = createHubApplication({
+  const interactiveSessions = createInteractiveSessionsRuntime(options, (daemonId) =>
+    application.hub.connectionForDaemon(daemonId),
+  );
+  const application: HubApplication = createHubApplication({
     ...progress.hubOptions,
     ...timelineRuntime,
     ...streamOptions,
+    ...interactiveSessions?.hubOptions,
     entitlements: options.entitlements,
     providerFactories: registrations.flatMap((registration) => registration.triggerProviders),
     ...(executionAuthority === undefined ? {} : { executionAuthority }),
@@ -165,6 +177,7 @@ async function createOwnedApplicationRuntime(
     webhookOptions: options.webhookOptions,
   });
   ownership.own(() => application.hub.stop(), "composition.hub");
+  interactiveSessions?.ownStream(ownership);
   progress.start();
   await application.hub.start(
     registrations.flatMap((registration) =>
@@ -179,20 +192,16 @@ async function createOwnedApplicationRuntime(
   );
 
   startRunPayloadRetention(options, ownership);
+  interactiveSessions?.startRetention(ownership);
 
   const resources = options.database === null ? null : new OrganizationResources(options.database);
-  const requests = new Map<string, (incoming: Request) => Promise<Response>>();
-  for (const request of registrations.flatMap((registration) => registration.requests)) {
-    if (requests.has(request.name)) {
-      throw new Error(`provider request registrations must have unique names: ${request.name}`);
-    }
-    requests.set(request.name, (incoming) => request.handle(incoming));
-  }
+  const requests = collectProviderRequests(registrations);
   return {
     hub: application.hub,
     operations: application.operations,
     publicApi: application.publicApi,
     runStream,
+    interactiveSessions: interactiveSessions?.browser ?? null,
     publicBaseUrl: options.publicBaseUrl,
     resources,
     billing: options.billing,
@@ -218,12 +227,7 @@ async function createOwnedApplicationRuntime(
         ? Promise.resolve(Response.json({ error: "auth_unavailable" }, { status: 503 }))
         : options.auth.handle(request);
     },
-    browserAccount: (request) => {
-      if (options.database === null || options.auth?.browserAccount === undefined) {
-        return Promise.resolve(Response.json({ error: "auth_unavailable" }, { status: 503 }));
-      }
-      return options.auth.browserAccount(request);
-    },
+    browserAccount: (request) => browserAccount(options, request, interactiveSessions !== null),
     signInEmail(data, headers) {
       if (options.database === null || options.auth?.signInEmail === undefined) {
         return Promise.reject(new Error("auth unavailable"));
@@ -518,6 +522,115 @@ function validateRunPayloadRetention(options: ApplicationCompositionOptions) {
       options.runProgress?.retentionDays ?? readRunProgressSettings({}).retentionDays,
     );
   }
+}
+
+function createInteractiveSessionsRuntime(
+  options: ApplicationCompositionOptions,
+  connectionForDaemon: HubRuntime["connectionForDaemon"],
+) {
+  const { database, databaseQuery, auth, entitlements, runPayloadRetention } = options;
+  const settings = options.interactiveSessions;
+  if (settings?.enabled !== true || database === null || auth === null) return null;
+  if (databaseQuery === undefined || entitlements === null) {
+    throw new Error("Interactive sessions require a database query handle and entitlements.");
+  }
+  const scrub = createTimelineScrubber({
+    scrubValues: [
+      ...(options.timelineScrubValues ?? []),
+      ...(options.completionTokenSecret === undefined ? [] : [options.completionTokenSecret]),
+    ],
+  });
+  const bodyCutoff = (now: Date) => sessionMessageBodyCutoff(runPayloadRetention, now);
+  const bus = new SessionEventBus(() =>
+    logger.warn("interactive session event notification failed"),
+  );
+  const coordinator = new InteractiveSessionCoordinator({
+    database,
+    entitlements,
+    connectionForDaemon,
+    bus,
+    settings,
+    scrub,
+    instanceId: randomUUID(),
+    bodyCutoff,
+    reportFailure: (_error, operation) =>
+      logger.warn({ operation }, "interactive session coordinator operation failed"),
+  });
+  const service = new InteractiveSessionService({
+    database,
+    pool: databaseQuery,
+    auth,
+    coordinator,
+    bus,
+    connectionForDaemon,
+    scrub,
+    bodyCutoff: () => bodyCutoff(new Date()),
+  });
+  const stream = new InteractiveSessionStream({
+    service,
+    bus,
+    settings: options.runProgress ?? readRunProgressSettings({}),
+    reportFailure: (_error, requestId) =>
+      logger.warn({ requestId }, "interactive session stream failed"),
+  });
+  return {
+    hubOptions: { interactiveSessions: coordinator },
+    browser: { service, stream },
+    ownStream(ownership: CompositionResources) {
+      ownership.own(() => stream.beginShutdown(), "composition.interactive_sessions.stream");
+    },
+    startRetention(ownership: CompositionResources) {
+      if (runPayloadRetention === undefined || runPayloadRetention.mode === "off") return;
+      const retention = new SessionMessageRetention(database, databaseQuery, runPayloadRetention);
+      ownership.own(() => retention.stop(), "composition.interactive_sessions.retention");
+      retention.start();
+    },
+  };
+}
+
+function browserAccount(
+  { database, auth }: ApplicationCompositionOptions,
+  request: Request,
+  interactiveSessions: boolean,
+): Promise<Response> {
+  if (database === null || auth?.browserAccount === undefined) {
+    return Promise.resolve(Response.json({ error: "auth_unavailable" }, { status: 503 }));
+  }
+  const response = auth.browserAccount(request);
+  if (
+    interactiveSessions &&
+    request.method === "GET" &&
+    new URL(request.url).pathname === "/api/auth/paseo/state"
+  )
+    return response.then(withInteractiveSessionAccountFeature);
+  return response;
+}
+
+function collectProviderRequests(registrations: readonly ProviderRegistration[]) {
+  const requests = new Map<string, (incoming: Request) => Promise<Response>>();
+  for (const request of registrations.flatMap((registration) => registration.requests)) {
+    if (requests.has(request.name)) {
+      throw new Error(`provider request registrations must have unique names: ${request.name}`);
+    }
+    requests.set(request.name, (incoming) => request.handle(incoming));
+  }
+  return requests;
+}
+
+function collectProviderConnections(registrations: readonly ProviderRegistration[]) {
+  const connections = new Map(
+    registrations.map((registration) => [registration.connection.name, registration.connection]),
+  );
+  if (connections.size !== registrations.length) {
+    throw new Error("provider connection registrations must have unique names");
+  }
+  const integrations = new Map<string, ProviderIntegrationRegistration>();
+  for (const registration of registrations) {
+    if (registration.integration !== undefined) {
+      integrations.set(registration.connection.name, registration.integration);
+    }
+  }
+  return { connections, integrations };
 }
 
 function startRunPayloadRetention(

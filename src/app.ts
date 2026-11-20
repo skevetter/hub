@@ -66,6 +66,7 @@ import { createDatabasePublicOperationRepository } from "./public-operations/dat
 import type { EntitlementsService } from "./entitlements/service.js";
 import type { ExecutionAuthority } from "./execution-authority/index.js";
 import type { WebhookOptions } from "./webhook-config.js";
+import type { InteractiveSessionCoordinator } from "./interactive-sessions/coordinator.js";
 
 export interface HubRuntimeOptions {
   database: Database | null;
@@ -95,11 +96,13 @@ export interface HubRuntimeOptions {
   runTimeline?: RunTimeline;
   runTimelineReconciler?: RunTimelineReconciler;
   runStream?: RunStream;
+  interactiveSessions?: InteractiveSessionCoordinator;
 }
 
 export interface HubRuntime {
   stopRun: import("./triggers/run-stop.js").StopRun;
   daemonModule: DaemonModule | null;
+  interactiveSessions: InteractiveSessionCoordinator | null;
   connectionForDaemon(daemonId: string): import("./daemons/index.js").DaemonConnection | undefined;
   /** The daemons' own answer about an agent configuration; null without a database. */
   agentValidator: DaemonAgentConfigurationValidator | null;
@@ -272,11 +275,17 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       ? {}
       : { dispatchLaunchMachineIntent: durableDispatchHandler }),
   });
-  connectDaemonLifecycle(daemons, daemonModule, workflowEngine);
+  const interactiveSessions = connectDaemonLifecycle(
+    daemons,
+    daemonModule,
+    workflowEngine,
+    options.interactiveSessions,
+  );
   let activeSources: readonly TriggerSource[] = [];
 
   const hub: HubRuntime = {
     daemonModule,
+    interactiveSessions,
     connectionForDaemon,
     agentValidator,
     stopRun: (actor, runId, confirmedPeerCount, retryAttemptId) =>
@@ -310,6 +319,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
         daemonModule?.lifecycle.recoverPendingHubActions(),
       ]);
       daemonModule?.lifecycle.startStopInterruptRecovery();
+      if (interactiveSessions !== null) await interactiveSessions.begin();
       workflowEngine.start();
       activeSources = [
         ...(manualSource === undefined ? [] : [manualSource]),
@@ -338,6 +348,11 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
             ? undefined
             : runShutdownStage("lifecycle.drain", () => daemonModule.lifecycle.stop()),
           daemons === null ? undefined : runShutdownStage("registry.drain", () => daemons.stop()),
+          interactiveSessions === null
+            ? undefined
+            : runShutdownStage("interactive-sessions.drain", () =>
+                interactiveSessions.stopAccepting(),
+              ),
         ]);
       } finally {
         const executionAuthority = options.executionAuthority;
@@ -539,7 +554,8 @@ function connectDaemonLifecycle(
   daemons: ActiveDaemonRegistry | null,
   daemonModule: DaemonModule | null,
   workflowEngine: DurableWorkflowEngine,
-): void {
+  interactiveSessions: InteractiveSessionCoordinator | undefined,
+): InteractiveSessionCoordinator | null {
   daemons?.onConnected((daemon) => daemonModule?.lifecycle.recoverDaemon(daemon));
   // A daemon that reconnects may hold terminals a Hub could not stop before it dropped.
   daemons?.onConnected((daemon) => workflowEngine.sweepScriptTerminals(daemon.id));
@@ -549,6 +565,11 @@ function connectDaemonLifecycle(
       "daemon_revoked",
     ),
   );
+  if (daemons === null || interactiveSessions === undefined) return null;
+  daemons.onConnected((daemon) => interactiveSessions.recoverDaemon(daemon));
+  daemons.onDisconnected((daemon) => interactiveSessions.daemonDisconnected(daemon));
+  daemons.onRevoked((daemon) => interactiveSessions.daemonRevoked(daemon));
+  return interactiveSessions;
 }
 
 function createAppDaemonModule(

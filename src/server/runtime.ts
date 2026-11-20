@@ -19,6 +19,8 @@ import type { ProviderApplications } from "../provider-applications/index.js";
 import type { DaemonProviderCatalog } from "../daemons/provider-catalog.js";
 import type { HomeDashboard } from "../home/dashboard.js";
 import type { RunStream } from "../run-stream/index.js";
+import type { InteractiveSessionService } from "../interactive-sessions/service.js";
+import type { InteractiveSessionStream } from "../interactive-sessions/stream.js";
 
 /**
  * The public plan catalog shape is billing's own: `src/billing/public-catalog.ts` decides which
@@ -67,6 +69,10 @@ export interface ApplicationRuntime {
   operations: HubOperations;
   publicApi: PublicApi;
   runStream: RunStream;
+  interactiveSessions?: {
+    service: InteractiveSessionService;
+    stream: InteractiveSessionStream;
+  } | null;
   publicBaseUrl?: string | undefined;
   resources: OrganizationResources | null;
   /** HOSTED only. Null self-hosted; present when the composition root has a billing config. */

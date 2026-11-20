@@ -25,6 +25,7 @@ import type {
   OrganizationResources,
 } from "../organizations/resources.js";
 import {
+  accountStateSchema,
   invitationRoleSchema,
   organizationRoleSchema,
   type OrganizationCapabilities,
@@ -159,6 +160,19 @@ const changeRoleBody = z
 const removeMemberBody = z.object({ memberId: z.string().min(1) }).strict();
 const createApiKeyBody = apiKeyCreateSchema;
 const apiKeyIdBody = z.object({ id: z.string().uuid() }).strict();
+
+export async function withInteractiveSessionAccountFeature(response: Response): Promise<Response> {
+  if (!response.ok) return response;
+  const state = accountStateSchema.parse(await response.clone().json());
+  if (state.status !== "active") return response;
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  return Response.json(
+    { ...state, features: { interactiveSessions: true } },
+    { status: response.status, headers },
+  );
+}
+
 export class OrganizationAccess {
   constructor(private readonly options: OrganizationAccessOptions) {}
 

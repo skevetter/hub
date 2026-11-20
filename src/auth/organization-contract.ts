@@ -78,6 +78,7 @@ export const accountStateSchema = z.discriminatedUnion("status", [
   }),
   z.object({
     status: z.literal("active"),
+    features: z.object({ interactiveSessions: z.literal(true) }).optional(),
     account: accountSchema,
     memberships: z.array(membershipSchema),
     organization: z.object({ id: z.string(), name: z.string(), slug: z.string() }),

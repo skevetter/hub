@@ -4,6 +4,8 @@
 
 ### Added
 
+- Optional interactive session runtime lets Hub start and steer agents on enrolled Paseo daemons, queue messages, and reconnect to the existing agent after a restart. It is off by default. See [interactive sessions](docs/interactive-sessions.md) for settings and message retention.
+
 - Optional run timeline capture records redacted lifecycle and tool events, persisted step outcomes, and sealed run summaries. Durable queues, byte budgets, reconciliation and expiry tombstones preserve terminal state. Capture is off by default. Source progress messages are not yet provided. API keys can include the separate `runs:read` scope.
 - Optional run event streams support scoped API keys, CLI credentials and member sessions, cursor replay, live polling recovery, bounded queues, reauthorization and graceful shutdown.
 - Activity links open tenant-scoped run details with live tool timelines, permission waits, script results, polling fallback, and timeline expiry and provenance.
