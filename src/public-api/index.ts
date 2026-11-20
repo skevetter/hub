@@ -1081,7 +1081,7 @@ function stopRunResponse(requestId: string, result: PublicOperationResult): Resp
       return success(requestId, 200, StoppedRunSchema, {
         runId: result.runId,
         status: result.runStatus,
-        ...(result.runStatus === "canceled" ? { note: CANCELED_RUN_NOTE } : {}),
+        ...(result.cleanupPending === true ? { note: CANCELED_RUN_NOTE } : {}),
       });
     case "forbidden":
       return problem(

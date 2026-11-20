@@ -1255,6 +1255,7 @@ export class DaemonDispatchLifecycle {
     executionId: string,
     reason: string,
     details: {
+      alreadyInterrupted?: boolean;
       lastInvalidOutput?: unknown;
       notifyProvider?: boolean;
       deadlineCondition?: {
@@ -1288,6 +1289,7 @@ export class DaemonDispatchLifecycle {
       "failed",
       {
         result,
+        ...(details.alreadyInterrupted === true ? { hubAction: null } : {}),
         ...(details.deadlineCondition === undefined
           ? {}
           : { deadlineCondition: details.deadlineCondition }),
@@ -1330,6 +1332,8 @@ export class DaemonDispatchLifecycle {
   ): Promise<TransitionAgentExecutionResult> {
     const execution = await this.options.database.findAgentExecutionById(executionId);
     if (execution === undefined) throw new Error(`agent execution not found: ${executionId}`);
+    const hubAction =
+      fields.hubAction === undefined ? deriveHubAction(execution, status) : fields.hubAction;
     if (execution.workflowStepRunId !== null) {
       return this.options.database.completeWorkflowAgentExecution({
         executionId,
@@ -1345,12 +1349,12 @@ export class DaemonDispatchLifecycle {
           ? {}
           : { deadlineCondition: fields.deadlineCondition }),
         observedAt: new Date(this.now()),
-        hubAction: deriveHubAction(execution, status),
+        hubAction,
       });
     }
     return this.options.database.transitionAgentExecution(executionId, status, {
       ...fields,
-      hubAction: deriveHubAction(execution, status),
+      hubAction,
     });
   }
 
@@ -1407,12 +1411,18 @@ export class DaemonDispatchLifecycle {
     if (action === null || daemonId === null) return;
     const connection = this.options.connectionForDaemon(daemonId);
     if (connection === undefined) return;
-    const completed = await withHubActionTimeout(
+    const interrupted = await withHubActionTimeout(
       this.sessionOwner().control(execution, connection.agents, action),
       this.dispatchTimeoutMs,
       (callback, delayMs) => this.scheduleDeadline(async () => callback(), delayMs),
     );
-    if (completed) await this.options.database.completeHubAction(execution.id, action);
+    if (interrupted === undefined) return;
+    await Promise.all(
+      interrupted.map((id) =>
+        this.failAgentExecution(id, "agent_interrupted", { alreadyInterrupted: true }),
+      ),
+    );
+    await this.options.database.completeHubAction(execution.id, action);
   }
 
   private async notifyMachineTerminated(

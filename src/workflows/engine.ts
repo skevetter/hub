@@ -202,7 +202,7 @@ export class DurableWorkflowEngine {
     const existing = await database.findTriggerRunForOrganization(actor.organizationId, runId);
     if (existing === undefined) return { status: "run_not_found" };
     if (!canStopRun(actor, existing)) return { status: "forbidden" };
-    const cancellation = await database.cancelTriggerRun(actor.organizationId, runId);
+    const cancellation = await database.cancelTriggerRun(actor.organizationId, runId, actor.userId);
     if (cancellation === undefined) return { status: "run_not_found" };
     if (cancellation.transitioned) {
       await this.notifyWorkflowRunTerminal(cancellation.run);
@@ -218,7 +218,17 @@ export class DurableWorkflowEngine {
         ),
       ]);
     }
-    return { status: "stopped", runId, runStatus: cancellation.run.status };
+    const runStatus = cancellation.run.status;
+    const details =
+      runStatus === "canceled"
+        ? await database.readRunStopDetails(actor.organizationId, runId)
+        : undefined;
+    return {
+      status: "stopped",
+      runId,
+      runStatus,
+      ...(details?.cleanupPending ? { cleanupPending: true } : {}),
+    };
   }
 
   async enqueue(trigger: DurableProviderEvent): Promise<TriggerDispatchOutcome> {

@@ -1,12 +1,14 @@
 import { z } from "zod";
 import { TIMELINE_KINDS } from "../run-timeline/store.js";
 import type { ActivityRunDetail } from "../projects/activity-run-view.js";
+import type { RunStopDetails } from "./run-stop.js";
 import type { ProgressMessageState, ProgressProviderName } from "../run-timeline/store.js";
 
 export interface RunDetailSnapshot extends Omit<ActivityRunDetail, "steps"> {
   steps: (ActivityRunDetail["steps"][number] & { timelineStepId: string })[];
   timeline: RunEventPage;
   canStop?: boolean;
+  stopDetails?: RunStopDetails;
   progressMessagesEnabled: boolean;
   progressUnavailable?: boolean;
   progress: {

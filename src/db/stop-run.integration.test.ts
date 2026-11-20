@@ -50,6 +50,28 @@ describe("PostgreSQL run cancellation", () => {
     assert.equal(afterFinish?.run.status, "succeeded");
   });
 
+  it("records the stopping actor atomically and attributes only the first stop", async () => {
+    const run = await pg.createRun();
+    await pg.runtime.query('insert into "user" (id, name, email) values ($1, $2, $3)', [
+      "stop-user",
+      "Avery",
+      "avery@example.test",
+    ]);
+    const canceled = await pg.database.cancelTriggerRun(run.organizationId, run.id, "stop-user");
+    await pg.database.cancelTriggerRun(run.organizationId, run.id, "ignored-user");
+    const audit = await pg.runtime.query(
+      "select actor_kind, actor_identity, created_at from audit_events where organization_id = $1 and subject_type = 'trigger_run' and subject_id = $2 and action = 'run.canceled'",
+      [run.organizationId, run.id],
+    );
+    assert.deepEqual(audit.rows, [
+      { actor_kind: "user", actor_identity: "stop-user", created_at: canceled?.run.completedAt },
+    ]);
+    assert.equal(
+      (await pg.database.readRunStopDetails(run.organizationId, run.id))?.stoppedByName,
+      "Avery",
+    );
+  });
+
   it("leaves terminal notification fences in place and expires a settled canceled run", async () => {
     const run = await pg.createRun();
     const [step] = await pg.database.listWorkflowStepRunsForTriggerRun(run.id);
@@ -68,8 +90,16 @@ describe("PostgreSQL run cancellation", () => {
       (await scanRunPayloads(pg.runtime, null, cutoff, 100, false)).find(({ id }) => id === run.id)
         ?.disposition;
     assert.equal(await disposition(), "cleanup_blocked");
+    assert.equal(
+      (await pg.database.readRunStopDetails(run.organizationId, run.id))?.cleanupPending,
+      true,
+    );
     assert.equal((await pg.database.listWorkflowScriptStepsPendingCleanup()).length, 1);
     await pg.database.setWorkflowScriptStepOutput(step.id, null);
+    assert.equal(
+      (await pg.database.readRunStopDetails(run.organizationId, run.id))?.cleanupPending,
+      false,
+    );
     assert.equal(await disposition(), "notification_pending");
     const now = new Date(cutoff.getTime() + 1000);
     assert.equal(await pg.database.expireRunPayloadChunk(run.id, cutoff, now), "skipped");

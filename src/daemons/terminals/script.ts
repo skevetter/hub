@@ -143,7 +143,7 @@ export async function runScript(
     terminalId: created.id,
     workspaceId: created.workspaceId,
   };
-  // A shutdown leaves the step running, and recovery stops the terminal: one attempt is enough.
+  // Aborted scripts leave unconfirmed terminal cleanup for recovery.
   const attempts = isAborted(input.signal) ? 1 : undefined;
   const stopped =
     created.id !== undefined

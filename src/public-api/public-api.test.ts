@@ -61,7 +61,12 @@ describe("public API interface", () => {
       { status: "enabled", authenticator: authenticator() },
       {
         ...successfulOperations(),
-        stopRun: async () => ({ status: "stopped", runId: id, runStatus: "canceled" }),
+        stopRun: async () => ({
+          status: "stopped",
+          runId: id,
+          runStatus: "canceled",
+          cleanupPending: true,
+        }),
       },
     );
     const stopped = await stopApi.handle(

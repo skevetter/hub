@@ -24,6 +24,20 @@ describe("run timeline UI", () => {
     );
   });
 
+  it("shows the stopping person's name and hides the cleanup note once settled", () => {
+    const detail: RunDetailSnapshot = {
+      ...runDetailFixture,
+      timeline: { ...runDetailFixture.timeline, status: "canceled" },
+      stopDetails: { stoppedByName: "Avery", cleanupPending: true, sharedAgent: false },
+    };
+    assert.match(render(detail), /Stopped by Avery/u);
+    assert.match(render(detail), /retry cleanup when it reconnects/u);
+    assert.doesNotMatch(
+      render({ ...detail, stopDetails: { ...detail.stopDetails!, cleanupPending: false } }),
+      /retry cleanup when it reconnects/u,
+    );
+  });
+
   it("marks expired run content and keeps safe script and progress summaries", () => {
     const expiredAt = "2026-11-17T10:00:00.000Z";
     const script = runDetailFixture.steps[0];

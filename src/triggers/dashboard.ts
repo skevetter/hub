@@ -162,22 +162,23 @@ export class TriggerDashboard {
     const run = await this.database.findTriggerRunForOrganization(tenant.organization.id, runId);
     if (run === undefined) return null;
     const detail = await this.runDetailForProject(tenant.organization.id, run.projectId, runId);
-    return detail === null
-      ? null
-      : {
-          ...detail,
-          canStop:
-            this.options.stopRun !== undefined &&
-            detail.timeline.status === "running" &&
-            canStopRun(
-              {
-                organizationId: tenant.organization.id,
-                role: tenant.membership.role,
-                userId: account.account.id,
-              },
-              run,
-            ),
-        };
+    if (detail === null) return null;
+    const canStop =
+      this.options.stopRun !== undefined &&
+      detail.timeline.status === "running" &&
+      canStopRun(
+        {
+          organizationId: tenant.organization.id,
+          role: tenant.membership.role,
+          userId: account.account.id,
+        },
+        run,
+      );
+    const stopDetails =
+      canStop || detail.run.status === "canceled"
+        ? await this.database.readRunStopDetails(tenant.organization.id, runId)
+        : undefined;
+    return { ...detail, canStop, ...(stopDetails === undefined ? {} : { stopDetails }) };
   }
 
   async stopRun(request: Request, organizationSlug: string, runId: string) {

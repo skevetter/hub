@@ -1462,9 +1462,14 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
    * like a script's is never returned.
    */
   listWorkflowScriptStepsPendingCleanup(): Promise<WorkflowStepRunRecord[]>;
+  readRunStopDetails(
+    organizationId: string,
+    triggerRunId: string,
+  ): Promise<import("../triggers/run-stop.js").RunStopDetails | undefined>;
   cancelTriggerRun(
     organizationId: string,
     triggerRunId: string,
+    stoppedByUserId?: string,
   ): Promise<(TransitionTriggerRunResult & { executionIds: string[] }) | undefined>;
   succeedTriggerRun(triggerRunId: string): Promise<TransitionTriggerRunResult | undefined>;
   failWorkflowRun(

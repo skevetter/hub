@@ -2435,6 +2435,38 @@ class MemoryDatabase implements Database {
     );
   }
 
+  async readRunStopDetails(organizationId: string, triggerRunId: string) {
+    const run = this.triggerRuns.get(triggerRunId);
+    if (run?.organizationId !== organizationId) return undefined;
+    const steps = this.listSteps(run.id);
+    const owned = this.runPayloadExecutions(run, steps);
+    const sessions = new Set(
+      owned
+        .filter(
+          (execution) =>
+            !isTerminalAgentExecutionStatus(execution.status) && execution.agentSessionId !== null,
+        )
+        .map(({ agentSessionId }) => agentSessionId),
+    );
+    return {
+      stoppedByName: null,
+      cleanupPending:
+        run.status === "canceled" &&
+        (steps.some(scriptCleanupPending) ||
+          owned.some(
+            (execution) => execution.hubAction !== null && execution.hubActionCompletedAt === null,
+          )),
+      sharedAgent:
+        run.status === "running" &&
+        [...this.agentExecutions.values()].some(
+          (execution) =>
+            sessions.has(execution.agentSessionId) &&
+            !owned.includes(execution) &&
+            !isTerminalAgentExecutionStatus(execution.status),
+        ),
+    };
+  }
+
   async cancelTriggerRun(organizationId: string, triggerRunId: string) {
     const run = this.triggerRuns.get(triggerRunId);
     if (run?.organizationId !== organizationId) return undefined;

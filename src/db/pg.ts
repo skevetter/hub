@@ -7,6 +7,7 @@ import {
 } from "./auxiliary-receipt-payload-retention.js";
 import {
   PENDING_SCRIPT_CLEANUP_SQL,
+  SCRIPT_CLEANUP_SQL,
   type RunPayloadDisposition,
 } from "../run-payload-retention/store.js";
 import {
@@ -1579,7 +1580,44 @@ class PgDatabase implements Database {
     return rows.rows.map(toWorkflowStepRunRecord);
   }
 
-  async cancelTriggerRun(organizationId: string, triggerRunId: string) {
+  async readRunStopDetails(organizationId: string, triggerRunId: string) {
+    const result = await query<{
+      stoppedByName: string | null;
+      cleanupPending: boolean;
+      sharedAgent: boolean;
+    }>(
+      this.pool,
+      `
+      with target as (
+        select id, project_id, organization_id, status from trigger_runs where organization_id = $1 and id = $2
+      ), owned as materialized (
+        select linked.* from target run cross join lateral (
+          ${runExecutions("run", "execution.id, execution.agent_session_id, execution.status, execution.hub_action, execution.hub_action_completed_at")}
+        ) linked
+      )
+      select
+        (select account.name from audit_events event join "user" account on account.id = event.actor_identity
+         where event.organization_id = run.organization_id and event.project_id = run.project_id
+           and event.subject_type = 'trigger_run' and event.subject_id = run.id::text
+           and event.action = 'run.canceled' and event.actor_kind = 'user'
+         order by event.created_at desc limit 1) as "stoppedByName",
+        (run.status = 'canceled' and (
+          exists (select 1 from workflow_step_runs step where step.trigger_run_id = run.id and (${SCRIPT_CLEANUP_SQL}))
+          or exists (select 1 from owned where hub_action is not null and hub_action_completed_at is null)
+        )) as "cleanupPending",
+        (run.status = 'running' and exists (
+          select 1 from owned join agent_executions peer on peer.agent_session_id = owned.agent_session_id
+          where owned.status in ('spawning', 'running') and peer.status in ('spawning', 'running')
+            and peer.organization_id = run.organization_id and peer.project_id = run.project_id
+            and not exists (select 1 from owned other where other.id = peer.id)
+        )) as "sharedAgent"
+      from target run`,
+      [organizationId, triggerRunId],
+    );
+    return result.rows[0];
+  }
+
+  async cancelTriggerRun(organizationId: string, triggerRunId: string, stoppedByUserId?: string) {
     try {
       return await this.pool.transaction(async (client) => {
         const updated = await client.query<TriggerRunRow>(
@@ -1620,6 +1658,14 @@ class PgDatabase implements Database {
           [run.id, run.completed_at],
         );
         await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [run.id]);
+        if (stoppedByUserId !== undefined) {
+          await client.query(
+            `insert into audit_events
+             (organization_id, project_id, actor_kind, actor_identity, action, subject_type, subject_id, evidence, created_at)
+             values ($1, $2, 'user', $3, 'run.canceled', 'trigger_run', $4, '{}'::jsonb, $5)`,
+            [organizationId, run.project_id, stoppedByUserId, run.id, run.completed_at],
+          );
+        }
         return {
           run: toTriggerRunRecord(run),
           transitioned: true,

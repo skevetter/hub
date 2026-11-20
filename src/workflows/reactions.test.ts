@@ -2,9 +2,14 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { describe, it } from "vitest";
 import { deriveAgentExecutionCompletionToken } from "../agent-executions/completion-token.js";
+import { compiledConfigurationHash, parseCompiledHubConfig } from "../config/compiler.js";
 import { ProjectConfigurationStore } from "../configuration/store.js";
 import { createMemoryDatabase } from "../db/memory.js";
-import type { Database } from "../db/types.js";
+import type {
+  AcceptedTriggerRunRecord,
+  Database,
+  ProjectConfigurationRevisionRecord,
+} from "../db/types.js";
 import {
   createDaemonDispatchLifecycle,
   type DaemonDispatchLifecycle,
@@ -23,9 +28,27 @@ import { createGitHubTriggerProvider } from "../triggers/github/provider.js";
 import type { SlackBotClient } from "../triggers/slack/client.js";
 import { createSlackTriggerProvider } from "../triggers/slack/provider.js";
 import type { TriggerProvider } from "../triggers/index.js";
-import { createDurableWorkflowHandler } from "./engine.js";
+import { createDurableWorkflowHandler, type DurableWorkflowEngine } from "./engine.js";
 
 describe("workflow-owned provider reactions", () => {
+  it.each(["stop", "stop_offline"] as const)(
+    "interrupts a shared agent once and settles the other run (%s)",
+    async (outcome) => {
+      const result = await runTwoStepWorkflow(createDiscordReactionFixture(), {
+        outcome,
+        shared: true,
+      });
+      assert.equal(result.run.status, "canceled");
+      assert.deepEqual(result.controls, ["interrupt"]);
+      assert.equal(result.peerRun?.status, "failed");
+      assert.equal(
+        result.peerRun?.outcome === "accepted" && result.peerRun.failureReason,
+        "agent_interrupted",
+      );
+      assert.equal(new Set(result.released).size, 2);
+    },
+  );
+
   it.each(["connected", "offline"] as const)(
     "stops a run with a %s daemon and releases execution authority",
     async (availability) => {
@@ -245,6 +268,7 @@ type WorkflowOutcome = "step_failure" | "timeout" | "prelaunch_failure" | "stop"
 interface WorkflowScenarioOptions {
   outcome?: WorkflowOutcome;
   skipAllSteps?: boolean;
+  shared?: boolean;
 }
 
 async function runTwoStepWorkflow<
@@ -325,26 +349,31 @@ async function runTwoStepWorkflow<
     },
     { organizationId },
   );
-  const { run } = await database.createAcceptedTriggerRun({
-    organizationId,
-    projectId: project.id,
-    configurationRevisionId: revision.id,
-    providerEventReceiptId: randomUUID(),
-    configuredTriggerName: "multi",
-    prompt: "run",
-    inputs: {},
-    triggerContext: input.triggerContext,
-    outputContext: input.outputContext,
-    deadlineAt:
-      options.outcome === "timeout"
-        ? new Date(now.getTime() + 1_000)
-        : new Date("2099-01-01T00:00:00.000Z"),
-    stepIds: ["first", "second"],
-    createdAt: now,
-  });
+  const revisionId =
+    options.shared === true ? await enableSharedContinuation(database, revision) : revision.id;
+  const createRun = () =>
+    database.createAcceptedTriggerRun({
+      organizationId,
+      projectId: project.id,
+      configurationRevisionId: revisionId,
+      providerEventReceiptId: randomUUID(),
+      configuredTriggerName: "multi",
+      prompt: "run",
+      inputs: {},
+      triggerContext: input.triggerContext,
+      outputContext: input.outputContext,
+      deadlineAt:
+        options.outcome === "timeout"
+          ? new Date(now.getTime() + 1_000)
+          : new Date("2099-01-01T00:00:00.000Z"),
+      stepIds: ["first", "second"],
+      createdAt: now,
+    });
+  const { run } = await createRun();
+  const peer = options.shared === true ? (await createRun()).run : undefined;
   const controls: string[] = [];
   const released: string[] = [];
-  let connected = true;
+  const link = { connected: true };
   const connection: DaemonConnection = {
     agents: {
       create: async (key) => {
@@ -370,7 +399,7 @@ async function runTwoStepWorkflow<
   const lifecycle = createDaemonDispatchLifecycle({
     database,
     connectionForDaemon: (daemonId) =>
-      connected && daemonId === TEST_DAEMON_ID ? connection : undefined,
+      link.connected && daemonId === TEST_DAEMON_ID ? connection : undefined,
     executionAuthority: {
       materialize: async () => ({ env: {} }),
       canResume: async () => true,
@@ -408,23 +437,17 @@ async function runTwoStepWorkflow<
     if (options.skipAllSteps === true) {
       await waitForTerminalRun(database, run.id);
     } else if (options.outcome === "stop" || options.outcome === "stop_offline") {
-      const execution = await runningStepExecution(database, run.id, "first");
-      connected = options.outcome === "stop";
-      const actor = { organizationId, userId: "admin", role: "admin" } as const;
-      const stopped = await engine.stopRun(actor, run.id);
-      assert.equal(stopped.status, "stopped");
-      assert.deepEqual(await engine.stopRun(actor, run.id), stopped);
-      assert.equal((await database.findTriggerRunById(run.id))?.status, "canceled");
-      assert.deepEqual(released, [execution.id]);
-      if (!connected) {
-        assert.deepEqual(controls, []);
-        assert.deepEqual(
-          (await database.findPendingHubActions()).map(({ id }) => id),
-          [execution.id],
-        );
-        connected = true;
-        await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
-      }
+      await exerciseStop({
+        database,
+        engine,
+        lifecycle,
+        run,
+        peer,
+        controls,
+        released,
+        link,
+        offline: options.outcome === "stop_offline",
+      });
     } else if (options.outcome === "step_failure") {
       const first = await runningStepExecution(database, run.id, "first");
       assert.ok(first.machineId);
@@ -456,6 +479,7 @@ async function runTwoStepWorkflow<
     if (terminalRun?.outcome !== "accepted") throw new Error("accepted workflow run not found");
     return {
       run: terminalRun,
+      peerRun: peer === undefined ? undefined : await database.findTriggerRunById(peer.id),
       steps: (await database.listWorkflowStepRunsForTriggerRun(run.id)).map(({ status }) => status),
       controls,
       released,
@@ -467,6 +491,105 @@ async function runTwoStepWorkflow<
     await lifecycle.stop();
     throw error;
   }
+}
+
+async function exerciseStop({
+  database,
+  engine,
+  lifecycle,
+  run,
+  peer,
+  controls,
+  released,
+  link,
+  offline,
+}: {
+  database: Database;
+  engine: DurableWorkflowEngine;
+  lifecycle: DaemonDispatchLifecycle;
+  run: AcceptedTriggerRunRecord;
+  peer: AcceptedTriggerRunRecord | undefined;
+  controls: readonly string[];
+  released: readonly string[];
+  link: { connected: boolean };
+  offline: boolean;
+}) {
+  const { organizationId } = run;
+  const execution = await runningStepExecution(database, run.id, "first");
+  if (peer !== undefined) {
+    const peerExecution = await runningStepExecution(database, peer.id, "first");
+    assert.equal(peerExecution.agentSessionId, execution.agentSessionId);
+    assert.equal(peerExecution.daemonAgentId, execution.daemonAgentId);
+    assert.equal((await database.readRunStopDetails(organizationId, run.id))?.sharedAgent, true);
+  }
+  link.connected = !offline;
+  const actor = { organizationId, userId: "admin", role: "admin" } as const;
+  const stopped = await engine.stopRun(actor, run.id);
+  assert.equal(stopped.status, "stopped");
+  assert.deepEqual(await engine.stopRun(actor, run.id), stopped);
+  assert.equal((await database.findTriggerRunById(run.id))?.status, "canceled");
+  if (peer === undefined) assert.deepEqual(released, [execution.id]);
+  if (offline) {
+    assert.deepEqual(controls, []);
+    assert.equal((await database.readRunStopDetails(organizationId, run.id))?.cleanupPending, true);
+    assert.deepEqual(
+      (await database.findPendingHubActions()).map(({ id }) => id),
+      [execution.id],
+    );
+    link.connected = true;
+    await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
+    assert.equal(
+      (await database.readRunStopDetails(organizationId, run.id))?.cleanupPending,
+      false,
+    );
+  }
+  if (peer !== undefined) await assertSharedInterrupt(database, lifecycle, peer.id, controls);
+}
+
+async function enableSharedContinuation(
+  database: Database,
+  revision: ProjectConfigurationRevisionRecord,
+) {
+  const original = parseCompiledHubConfig(revision.normalizedConfiguration);
+  const configuration = {
+    ...original,
+    triggers: original.triggers.map((trigger) =>
+      Object.assign({}, trigger, {
+        steps: trigger.steps.map((step) =>
+          Object.assign({}, step, { continuation: { mode: "key" as const, key: "shared" } }),
+        ),
+      }),
+    ),
+  };
+  const shared = await database.insertProjectConfigurationRevision({
+    projectId: revision.projectId,
+    sourceKind: "manual",
+    sourceEvidence: { kind: "test" },
+    normalizedConfiguration: configuration,
+    contentHash: compiledConfigurationHash(configuration),
+  });
+  await database.activateProjectConfigurationRevision(revision.projectId, shared.id);
+  return shared.id;
+}
+
+async function assertSharedInterrupt(
+  database: Database,
+  lifecycle: DaemonDispatchLifecycle,
+  runId: string,
+  controls: readonly string[],
+) {
+  assert.deepEqual(controls, ["interrupt"]);
+  assert.equal((await waitForTerminalRun(database, runId)).status, "failed");
+  const step = await database.findWorkflowStepRunByTriggerRun(runId);
+  assert.ok(step?.agentExecutionId);
+  const late = await database.completeWorkflowAgentExecution({
+    executionId: step.agentExecutionId,
+    executionStatus: "succeeded",
+    stepStatus: "succeeded",
+    result: {},
+  });
+  assert.equal(late.transitioned, false);
+  await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
 }
 
 async function runningStepExecution(database: Database, triggerRunId: string, stepId: string) {

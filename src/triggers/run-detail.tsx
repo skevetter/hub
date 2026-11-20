@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
@@ -19,6 +19,7 @@ import type { RunConnection, RunDetailSnapshot, RunEventPage } from "./run-event
 import { RunSteps } from "./run-steps.js";
 import { CANCELED_RUN_NOTE } from "./run-stop.js";
 import { activityCounts, timelineRows, type TimelineRow } from "./run-timeline-view.js";
+import { pollRunDetail } from "./run-event-subscription.js";
 import { runDetailKey, useRunEvents } from "./use-run-events.js";
 import { runReadClock, runReadResult } from "./run-read.js";
 
@@ -93,6 +94,14 @@ function LiveRunDetail({
     initialSequence,
   });
   const queryClient = useQueryClient();
+  const runId = detail.run.id;
+  const cleanupPending = detail.stopDetails?.cleanupPending;
+  useEffect(() => {
+    if (!cleanupPending) return undefined;
+    return pollRunDetail(() => {
+      void queryClient.invalidateQueries({ queryKey: runDetailKey(organizationSlug, runId) });
+    });
+  }, [cleanupPending, organizationSlug, queryClient, runId]);
   const sendStop = useServerFn(stopRun);
   const stop = useMutation({
     mutationFn: () => sendStop({ data: { organizationSlug, runId: detail.run.id } }),
@@ -124,7 +133,7 @@ export function RunDetailView({
   detail,
   timeline = detail.timeline,
   connection = null,
-  stopBusy,
+  stopBusy = false,
   onStop,
   stopError,
 }: {
@@ -154,18 +163,7 @@ export function RunDetailView({
           title="Run detail"
           description={`${run.webhookSummary === undefined ? run.provider : "Webhook"} - ${run.configuredTriggerName}`}
         >
-          {detail.canStop && !terminal && onStop !== undefined ? (
-            <ConfirmAction
-              label="Stop run"
-              title="Stop this run?"
-              description="Hub will interrupt the active agent or script and skip remaining steps. If its daemon is offline, Hub will retry cleanup when it reconnects."
-              confirmLabel="Stop run"
-              cancelLabel="Keep running"
-              destructive
-              busy={stopBusy ?? false}
-              onConfirm={onStop}
-            />
-          ) : null}
+          <StopRunAction detail={detail} terminal={terminal} busy={stopBusy} onConfirm={onStop} />
         </PageHeader>
       </div>
       {stopError == null ? null : (
@@ -176,11 +174,7 @@ export function RunDetailView({
           fallback="Hub couldn't stop this run."
         />
       )}
-      {timeline.status === "canceled" ? (
-        <NoticeAlert standalone tone="neutral" title="Stopped by a person">
-          {CANCELED_RUN_NOTE}
-        </NoticeAlert>
-      ) : null}
+      {timeline.status === "canceled" ? <CanceledRunNotice details={detail.stopDetails} /> : null}
       {run.payloadExpiredAt == null ? null : (
         <NoticeAlert standalone tone="neutral" title="Run payload expired">
           This run's original event, inputs, prompts, and outputs expired under this Hub's retention
@@ -221,6 +215,48 @@ export function RunDetailView({
       </Section>
       <RunSteps steps={detail.steps} events={events} terminal={terminal} />
     </>
+  );
+}
+
+function StopRunAction({
+  detail,
+  terminal,
+  busy,
+  onConfirm,
+}: {
+  detail: RunDetailSnapshot;
+  terminal: boolean;
+  busy: boolean;
+  onConfirm: (() => void) | undefined;
+}) {
+  if (!detail.canStop || terminal || onConfirm === undefined) return null;
+  return (
+    <ConfirmAction
+      label="Stop run"
+      title="Stop this run?"
+      description={
+        detail.stopDetails?.sharedAgent
+          ? "This agent is also working on another run. Stopping interrupts both turns. Hub skips the remaining steps of this run and retries cleanup when an offline daemon reconnects."
+          : "Hub will interrupt the active agent or script and skip remaining steps. If its daemon is offline, Hub will retry cleanup when it reconnects."
+      }
+      confirmLabel="Stop run"
+      cancelLabel="Keep running"
+      destructive
+      busy={busy}
+      onConfirm={onConfirm}
+    />
+  );
+}
+
+function CanceledRunNotice({ details }: { details: RunDetailSnapshot["stopDetails"] }) {
+  return (
+    <NoticeAlert
+      standalone
+      tone="neutral"
+      title={`Stopped by ${details?.stoppedByName || "a person"}`}
+    >
+      {details?.cleanupPending ? CANCELED_RUN_NOTE : null}
+    </NoticeAlert>
   );
 }
 

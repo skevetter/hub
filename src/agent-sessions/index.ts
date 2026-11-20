@@ -215,29 +215,29 @@ export class AgentSessions {
     execution: AgentExecutionRecord,
     connection: AgentConnection,
     action: "interrupt" | "archive",
-  ): Promise<boolean> {
+  ): Promise<readonly string[] | undefined> {
     const canceled = isCanceledExecution(execution);
     if (!execution.agentSessionId) {
       if (action === "interrupt" && canceled && execution.daemonAgentId !== null) {
         const agent = await connection.get(execution.daemonAgentId);
         await connection.control(agent.id, agent.workspaceId, action);
       }
-      return true;
+      return [];
     }
     const id = execution.agentSessionId;
     const session = await this.database.findAgentSession(id);
-    if (session === undefined) return canceled;
-    if (!canceled && (!session.agentId || !session.workspaceId)) return false;
+    if (session === undefined) return canceled ? [] : undefined;
+    if (!canceled && (!session.agentId || !session.workspaceId)) return undefined;
     return this.database.withAdvisoryLock(sessionLock(session), async () => {
       // Agent creation holds the same lock. If it never finished, it could not send a prompt.
       const target = canceled ? await this.database.findAgentSession(id) : session;
-      if (!target?.agentId || !target.workspaceId) return canceled;
+      if (!target?.agentId || !target.workspaceId) return canceled ? [] : undefined;
       const executions = await this.database.listAgentSessionExecutions(id);
-      // A completed arrival cannot stop work belonging to a newer arrival.
-      if (executions.some((item) => item.status === "spawning" || item.status === "running"))
-        return true;
+      const active = executions.filter(isActive);
+      // Automatic terminal actions cannot interrupt a newer arrival. An explicit Stop can.
+      if (!canceled && active.length > 0) return [];
       await connection.control(target.agentId, target.workspaceId, action);
-      return true;
+      return active.map((arrival) => arrival.id);
     });
   }
 

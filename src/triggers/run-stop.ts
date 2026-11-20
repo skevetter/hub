@@ -9,8 +9,19 @@ export interface RunStopActor {
   role: TenantRouteAccess["membership"]["role"];
 }
 
+export interface RunStopDetails {
+  stoppedByName: string | null;
+  cleanupPending: boolean;
+  sharedAgent: boolean;
+}
+
 export type StopRunResult =
-  | { status: "stopped"; runId: string; runStatus: TriggerRunRecord["status"] }
+  | {
+      status: "stopped";
+      runId: string;
+      runStatus: TriggerRunRecord["status"];
+      cleanupPending?: boolean;
+    }
   | { status: "forbidden" | "run_not_found" };
 
 export type StopRun = (actor: RunStopActor, runId: string) => Promise<StopRunResult>;

@@ -401,7 +401,7 @@ export const publicOperationManifest: readonly PublicOperationDefinition[] = [
     resultMapping: "run-stop",
     summary: "Stop a run",
     description:
-      "Requires an organization CLI login. A run's starter or an organization admin can cancel active work. Hub records cancellation immediately and retries pending cleanup when an offline daemon reconnects. Repeated requests return the current run status.",
+      "Requires an organization CLI login. A run's starter or an organization admin can cancel active work. When active runs share an agent, Stop interrupts every active turn on that agent. Other runs that are still active follow normal agent-interrupted failure handling. Hub records cancellation immediately and retries pending cleanup when an offline daemon reconnects. Repeated requests return the current run status.",
     tag: "Runs",
     responses: {
       200: "The current run status.",
