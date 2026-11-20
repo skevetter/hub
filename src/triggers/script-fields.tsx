@@ -8,6 +8,7 @@ import { SegmentedControl, type SegmentedOption } from "../components/app/segmen
 import { Textarea } from "../components/ui/textarea.js";
 import {
   changeTriggerAction,
+  sharedYamlField,
   type TriggerAction,
   type TriggerFieldErrors,
   type TriggerFormValue,
@@ -68,6 +69,7 @@ export function ScriptFields({
         id="trigger-script"
         label="Script"
         description="Run by /bin/sh -c. Output and the exit code are kept in the run history. Event data is in the HUB_EVENT_JSON environment variable."
+        {...sharedYamlField(value, "script")}
         required
         {...(error === undefined ? {} : { error })}
       >

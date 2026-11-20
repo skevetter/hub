@@ -352,9 +352,100 @@ run:
     await page.getByRole("combobox", { name: "When this happens" }).click();
     await page.getByRole("option", { name: "Schedule schedule.tick" }).click();
     await page.getByRole("button", { name: "Change event", exact: true }).click();
-    await triggers.expectRefusedOnSubmit("Unresolved alias");
+    await triggers.expectRefusedOnSubmit("shared with another field through a YAML anchor");
   });
 }
+
+test("editing aliased GitHub labels keeps the sender allowlist fixed", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  await hub.connectGitHub("owner");
+  const triggers = new OrganizationTriggers(page);
+  await triggers.open();
+  await triggers.startNew();
+  await triggers.configureManual({
+    name: "alias-audience",
+    daemon,
+    cwd: "/workspace/acme",
+    agent: "opencode/gateway/vendor/model-v1",
+    mode: "full-access",
+    thinking: "low",
+    prompt: "Review the issue.",
+  });
+  await triggers.switchToYaml();
+  await triggers.replaceYaml(`name: alias-audience
+on:
+  github.issue_created:
+    connection: acme-inc-github
+    filters:
+      from_users: &names
+        - alice # keep Alice
+      labels: *names
+run:
+  target: { daemon: ${daemon}, cwd: /workspace/acme }
+  agent: { provider: opencode, model: gateway/vendor/model-v1, mode: full-access }
+  prompt: Review the issue.
+`);
+  await triggers.save("alias-audience");
+  await triggers.openTrigger("alias-audience");
+  const users = page.getByLabel("User IDs", { exact: true });
+  const labels = page.getByLabel("Required labels", { exact: true });
+  await expect(users).toHaveValue("alice");
+  await expect(users).toBeDisabled();
+  await expect(labels).toHaveValue("alice");
+  await labels.fill("alice\nbob");
+  await triggers.save("alias-audience");
+  await triggers.openTrigger("alias-audience");
+  await expect(users).toHaveValue("alice");
+  await expect(users).toBeEditable();
+  await expect(labels).toHaveValue("alice\nbob");
+  await triggers.switchToYaml();
+  await triggers.expectYamlContains("from_users: &names", "alice # keep Alice");
+});
+
+test("shared YAML anchors are read-only in the form until the reference is removed", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  const triggers = new OrganizationTriggers(page);
+  await triggers.open();
+  await triggers.startNew();
+  await triggers.configureManual({
+    name: "shared-anchor",
+    daemon,
+    cwd: "/workspace/acme",
+    agent: "opencode/gateway/vendor/model-v1",
+    mode: "full-access",
+    thinking: "low",
+    prompt: "Handle the request.",
+  });
+  await triggers.switchToYaml();
+  await triggers.replaceYaml(`name: shared-anchor
+on:
+  manual.run:
+    filters:
+      from_users: &names [alice]
+run:
+  target: { daemon: ${daemon}, cwd: /workspace/acme }
+  agent:
+    provider: opencode
+    model: gateway/vendor/model-v1
+    mode: full-access
+    options: { names: *names }
+  prompt: Handle the request.
+`);
+  await page.getByRole("radio", { name: "Form", exact: true }).check();
+  await expect(page.getByLabel("Caller names")).toBeDisabled();
+  await expect(page.getByRole("radio", { name: "Everyone", exact: true })).toBeDisabled();
+  await expect(page.getByLabel("Caller names")).toHaveAccessibleDescription(
+    /shared with another field through a YAML anchor/u,
+  );
+  await expect(page.getByLabel("Working directory")).toBeEditable();
+});
 
 function advancedTriggerYaml(daemon: string) {
   return `# survives form edits

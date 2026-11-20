@@ -58,6 +58,7 @@ export interface TriggerFormValue {
   manualNoCallers?: boolean;
   qualifiers: QualifierValues;
   advancedFilters?: string[];
+  sharedFields?: TriggerFormField[];
   recurrence?: Recurrence;
   daemon: string;
   cwd: string;
@@ -80,6 +81,22 @@ export interface TriggerFormValue {
   action: TriggerAction;
   script: string;
 }
+
+export type TriggerFormField = keyof TriggerFormValue | `qualifiers.${QualifierKey}`;
+
+export const SHARED_YAML_FIELD =
+  "This field is shared with another field through a YAML anchor. Edit it in YAML.";
+
+export function sharedYamlField(
+  form: TriggerFormValue,
+  field: TriggerFormField,
+): { disabled?: true; description?: string } {
+  return form.sharedFields?.includes(field) === true
+    ? { disabled: true, description: SHARED_YAML_FIELD }
+    : {};
+}
+
+const GITHUB_TEXT_KEYS: readonly QualifierKey[] = ["pattern", "contains", "exclude_contains"];
 
 export type TriggerFormProjection =
   | { status: "editable"; value: TriggerFormValue }
@@ -105,12 +122,16 @@ export function projectTriggerForm(yaml: string): TriggerFormProjection {
     ...Object.keys(definition.filters ?? {}),
     ...parsed.unknownFilters,
   ].filter((key) => !ownedKeys.has(key));
-  const advanced = advancedFilters.length === 0 ? {} : { advancedFilters };
+  const sharedFields = sharedTriggerFields(parsed.source, event);
+  const metadata = {
+    ...(advancedFilters.length === 0 ? {} : { advancedFilters }),
+    ...(sharedFields.length === 0 ? {} : { sharedFields }),
+  };
   const run = trigger.run;
   if (isScriptRun(run)) {
     return {
       status: "editable",
-      value: { ...toScriptFormValue(trigger, run, event, definition), ...advanced },
+      value: { ...toScriptFormValue(trigger, run, event, definition), ...metadata },
     };
   }
   if ("choices" in run.agent) {
@@ -118,8 +139,53 @@ export function projectTriggerForm(yaml: string): TriggerFormProjection {
   }
   return {
     status: "editable",
-    value: { ...toFormValue(trigger, run, event, definition, run.agent), ...advanced },
+    value: { ...toFormValue(trigger, run, event, definition, run.agent), ...metadata },
   };
+}
+
+function sharedTriggerFields(source: Document, event: EditorEvent): TriggerFormField[] {
+  const aliases = yamlAliases(source);
+  if (aliases.size === 0) return [];
+
+  const eventPath = ["on", event];
+  const fields: [TriggerFormField, ...string[]][] = [
+    ["name", "name"],
+    ["enabled", "enabled"],
+    ["progressMessage", "progress_message"],
+    ["event", "on"],
+    ["connection", ...eventPath, "connection"],
+    ["allowedUsers", ...eventPath, "filters", "from_users"],
+    ["recurrence", ...eventPath, "recurrence"],
+    ["daemon", "run", "target", "daemon"],
+    ["cwd", "run", "target", "cwd"],
+    ["agent", "run", "agent", "provider"],
+    ["agent", "run", "agent", "model"],
+    ["mode", "run", "agent", "mode"],
+    ["thinkingOptionId", "run", "agent", "thinkingOptionId"],
+    ["providerOptions", "run", "agent", "options"],
+    ["continuationMode", "run", "continuation"],
+    ["continuationKey", "run", "continuation"],
+    ["maxRuntime", "run", "max_runtime"],
+    ["idleTimeout", "run", "idle_timeout"],
+    ["completeOnTurnEnd", "run", "complete_on_turn_end"],
+    ["githubConnection", "run", "github", "connection"],
+    ["githubRepositories", "run", "github", "repositories"],
+    ["githubPermissions", "run", "github", "permissions"],
+    ["githubDuration", "run", "github", "duration"],
+    ["prompt", "run", "prompt"],
+    ["script", "run", "script"],
+  ];
+  const definition = eventDefinition(event);
+  const keys = new Set(definition.qualifiers.map(({ key }) => key));
+  if (definition.provider === "github") {
+    for (const key of GITHUB_TEXT_KEYS) keys.add(key);
+  }
+  for (const key of keys) fields.push([`qualifiers.${key}`, ...eventPath, "filters", key]);
+  const shared = new Set<TriggerFormField>();
+  for (const [field, ...path] of fields) {
+    if (sharedYamlPath(source, path, aliases, field !== "event")) shared.add(field);
+  }
+  return [...shared];
 }
 
 function toBaseFormValue(
@@ -208,15 +274,21 @@ function toFormValue(
 export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string {
   const projection = projectTriggerForm(yaml);
   if (projection.status !== "editable") throw new Error(projection.reason);
-  const unchanged = sameFormValue(projection.value, value);
+  const previous = projection.value;
+  const unchanged = sameFormValue(previous, value);
   if (unchanged && value.progressMessage !== false) return yaml;
   if (!unchanged) validateFormValue(value);
 
   const document = parseDocument(yaml, { compat: ["timestamp"] });
   assertDocument(document);
-  setOptional(document, ["progress_message"], value.progressMessage === true ? true : undefined);
+  const progressPath = ["progress_message"];
+  const progressLinked =
+    previous.sharedFields?.includes("progressMessage") ||
+    isAlias(document.getIn(progressPath, true));
+  if (!progressLinked || previous.progressMessage !== value.progressMessage) {
+    setOptional(document, progressPath, value.progressMessage === true ? true : undefined);
+  }
   if (unchanged) return document.toString({ lineWidth: 0 });
-  const previous = projection.value;
   if (previous.name !== value.name) setIfChanged(document, ["name"], value.name);
   if (previous.enabled !== value.enabled) setIfChanged(document, ["enabled"], value.enabled);
   patchEvent(document, previous, value);
@@ -300,7 +372,7 @@ function patchGitHubAuthority(document: Document, value: TriggerFormValue): void
     return;
   }
   setIfChanged(document, [...path, "connection"], github.connection);
-  setListFilter(document, [...path, "repositories"], github.repositories);
+  setOptional(document, [...path, "repositories"], github.repositories);
   setOptional(document, [...path, "permissions"], github.permissions);
   setOptional(document, [...path, "duration"], github.duration);
 }
@@ -328,6 +400,9 @@ function patchEvent(document: Document, previous: TriggerFormValue, next: Trigge
 }
 
 function renameEvent(document: Document, previous: EditorEvent, next: EditorEvent): void {
+  if (sharedYamlPath(document, ["on"], yamlAliases(document), false)) {
+    throw new Error(SHARED_YAML_FIELD);
+  }
   const events = document.getIn(["on"], true);
   if (!isMap(events)) throw new Error("Expected an event mapping.");
   const entry = events.items.find(({ key }) => isScalar(key) && key.value === previous);
@@ -344,6 +419,7 @@ function patchEventFilters(
   const after = eventDefinition(next.event);
   const sameProvider = eventDefinition(previous.event).provider === after.provider;
   for (const key of previous.advancedFilters ?? []) {
+    if (sameProvider && carriedGitHubText(next, key)) continue;
     if (previous.event !== next.event || next.advancedFilters?.length === 0) {
       deleteIfPresent(document, [...path, key]);
     }
@@ -353,15 +429,12 @@ function patchEventFilters(
     if (!owned.has(key) || !sameProvider) deleteIfPresent(document, [...path, key]);
   }
   if (needsActorFilter(next) && audienceChanged(previous, next)) {
-    setListFilter(document, [...path, "from_users"], authoredAudience(next));
+    setOptional(document, [...path, "from_users"], authoredAudience(next));
   }
   for (const qualifier of after.qualifiers) {
     const draft = next.qualifiers[qualifier.key];
     if (!sameProvider || previous.qualifiers[qualifier.key] !== draft) {
-      const value = authoredQualifier(qualifier, draft);
-      const keyPath = [...path, qualifier.key];
-      if (qualifier.kind === "list") setListFilter(document, keyPath, value);
-      else setOptional(document, keyPath, value);
+      setOptional(document, [...path, qualifier.key], authoredQualifier(qualifier, draft));
     }
   }
 }
@@ -558,9 +631,7 @@ function parsePermissions(value: string): Record<string, "read" | "write" | "adm
 }
 
 /** What is wrong with each field, keyed by the field that has to change. */
-export type TriggerFieldErrors = Partial<
-  Record<keyof TriggerFormValue | `qualifiers.${QualifierKey}`, string>
->;
+export type TriggerFieldErrors = Partial<Record<TriggerFormField, string>>;
 
 /**
  * Every reason this form cannot become a trigger document, addressed to the field that owns it.
@@ -726,13 +797,14 @@ const EditorEventFiltersSchema = z.looseObject({
 function parseEditorDocument(
   yaml: string,
 ):
-  | { success: true; data: TriggerDocument; unknownFilters: string[] }
+  | { success: true; data: TriggerDocument; unknownFilters: string[]; source: Document }
   | { success: false; error: string } {
   const document = parseDocument(yaml, { compat: ["timestamp"] });
   if (document.errors.length > 0) return { success: false, error: document.errors[0]!.message };
   const raw: unknown = document.toJS();
   const parsed = TriggerDocumentSchema.safeParse(raw);
-  if (parsed.success) return { success: true, data: parsed.data, unknownFilters: [] };
+  if (parsed.success)
+    return { success: true, data: parsed.data, unknownFilters: [], source: document };
 
   // The editor can preserve unrecognized filter nodes without extending the saved schema.
   const shape = EditorEventFiltersSchema.safeParse(raw);
@@ -751,7 +823,8 @@ function parseEditorDocument(
         ...shape.data,
         on: { [event]: { ...definition, filters } },
       });
-      if (projected.success) return { success: true, data: projected.data, unknownFilters };
+      if (projected.success)
+        return { success: true, data: projected.data, unknownFilters, source: document };
     }
   }
   const issue = parsed.error.issues[0]!;
@@ -762,17 +835,6 @@ function assertDocument(document: Document): void {
   if (document.errors.length > 0) throw new Error(document.errors[0]!.message);
 }
 
-function setListFilter(document: Document, path: string[], value: unknown): void {
-  const node = document.getIn(path, true);
-  if (value === undefined && isSeq(node)) {
-    const aliases = sequenceAliases(document);
-    deleteIfPresent(document, path);
-    restoreSequenceAliases(document, aliases);
-    return;
-  }
-  setOptional(document, path, value);
-}
-
 function updateSequence(document: Document, sequence: YAMLSeq, values: readonly unknown[]): void {
   const oldItems = new Map<unknown, unknown[]>();
   for (const item of sequence.items) {
@@ -781,14 +843,14 @@ function updateSequence(document: Document, sequence: YAMLSeq, values: readonly 
     matches.push(item);
     oldItems.set(value, matches);
   }
-  const aliases = sequenceAliases(document);
+  const aliases = yamlAliases(document);
   sequence.items = values.map(
     (value) => oldItems.get(value)?.shift() ?? document.createNode(value),
   );
   restoreSequenceAliases(document, aliases);
 }
 
-function sequenceAliases(document: Document): Map<Alias, Node> {
+function yamlAliases(document: Document): Map<Alias, Node> {
   const aliases = new Map<Alias, Node>();
   visit(document, {
     Alias(_key, alias) {
@@ -797,6 +859,57 @@ function sequenceAliases(document: Document): Map<Alias, Node> {
     },
   });
   return aliases;
+}
+
+function sharedYamlPath(
+  document: Document,
+  path: readonly string[],
+  aliases: Map<Alias, Node>,
+  includeDescendants = true,
+): boolean {
+  if (aliases.size === 0) return false;
+  let node: unknown = document.contents;
+  for (const key of path) {
+    if (isAlias(node)) return true;
+    if (!isMap(node)) return false;
+    if (hasExternalReference(node, aliases, false)) return true;
+    node = node.get(key, true);
+  }
+  return (
+    isNode(node) &&
+    ((isAlias(node) && !includeDescendants) ||
+      hasExternalReference(node, aliases, includeDescendants))
+  );
+}
+
+function hasExternalReference(
+  node: Node,
+  aliases: Map<Alias, Node>,
+  includeDescendants: boolean,
+): boolean {
+  for (const [alias, target] of aliases) {
+    if (
+      (target === node || (includeDescendants && yamlContains(node, target))) &&
+      !yamlContains(node, alias)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function yamlContains(parent: Node, child: Node): boolean {
+  if (parent === child) return true;
+  return (
+    parent.range != null &&
+    child.range != null &&
+    parent.range[0] <= child.range[0] &&
+    child.range[2] <= parent.range[2]
+  );
+}
+
+function requireWritableYaml(document: Document, path: readonly string[]): void {
+  if (sharedYamlPath(document, path, yamlAliases(document))) throw new Error(SHARED_YAML_FIELD);
 }
 
 function restoreSequenceAliases(document: Document, aliases: Map<Alias, Node>): void {
@@ -812,21 +925,21 @@ function setIfChanged(document: Document, path: readonly string[], value: unknow
   const node = document.getIn(path, true);
   const current: unknown = isNode(node) ? node.toJS(document) : node;
   if (sameValue(current, value)) return;
-  const target = isAlias(node) ? node.resolve(document) : node;
-  if (isSeq(target) && Array.isArray(value)) {
-    updateSequence(document, target, value);
+  requireWritableYaml(document, path);
+  if (isSeq(node) && Array.isArray(value)) {
+    updateSequence(document, node, value);
     return;
   }
-  if (isCollection(node) && typeof value === "object" && value !== null) {
+  if (isAlias(node) || isCollection(node)) {
+    // Write at the alias site so a field edit cannot change the value at its anchor.
     const replacement = document.createNode(value);
-    if (isCollection(replacement)) {
-      if (node.comment !== undefined) replacement.comment = node.comment;
-      if (node.commentBefore !== undefined) replacement.commentBefore = node.commentBefore;
-      if (node.spaceBefore !== undefined) replacement.spaceBefore = node.spaceBefore;
-      if (node.flow !== undefined) replacement.flow = node.flow;
-      document.setIn(path, replacement);
-      return;
-    }
+    if (node.comment !== undefined) replacement.comment = node.comment;
+    if (node.commentBefore !== undefined) replacement.commentBefore = node.commentBefore;
+    if (node.spaceBefore !== undefined) replacement.spaceBefore = node.spaceBefore;
+    if (isCollection(node) && isCollection(replacement) && node.flow !== undefined)
+      replacement.flow = node.flow;
+    document.setIn(path, replacement);
+    return;
   }
   document.setIn(path, value);
 }
@@ -837,7 +950,9 @@ function setOptional(document: Document, path: readonly string[], value: unknown
 }
 
 function deleteIfPresent(document: Document, path: readonly string[]): void {
-  if (document.hasIn(path)) document.deleteIn(path);
+  if (!document.hasIn(path)) return;
+  requireWritableYaml(document, path);
+  document.deleteIn(path);
 }
 
 function sameFormValue(left: TriggerFormValue, right: TriggerFormValue): boolean {
@@ -870,6 +985,7 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
   if (sameProvider) {
     for (const qualifier of next.qualifiers) {
       if (
+        (next.provider === "github" && GITHUB_TEXT_KEYS.includes(qualifier.key)) ||
         previous.qualifiers.some(
           (candidate) => candidate.key === qualifier.key && candidate.kind === qualifier.kind,
         )
@@ -908,7 +1024,11 @@ export function droppedTriggerRules(previous: TriggerFormValue, next: TriggerFor
       ({ key }) => previous.qualifiers[key] !== undefined && next.qualifiers[key] === undefined,
     )
     .map(({ label }) => label);
-  dropped.push(...(previous.advancedFilters ?? []));
+  dropped.push(
+    ...(previous.advancedFilters ?? []).filter(
+      (key) => !sameProvider || !carriedGitHubText(next, key),
+    ),
+  );
   if (!sameProvider && previous.connection !== "") dropped.push("Connection");
   if (
     !sameProvider &&
@@ -953,12 +1073,32 @@ export function changeTriggerAction(
   };
 }
 
+function carriedGitHubText(value: TriggerFormValue, key: string): boolean {
+  const definition = eventDefinition(value.event);
+  return (
+    definition.provider === "github" &&
+    definition.qualifiers.some(
+      (qualifier) =>
+        qualifier.key === key &&
+        GITHUB_TEXT_KEYS.includes(qualifier.key) &&
+        value.qualifiers[qualifier.key] !== undefined,
+    )
+  );
+}
+
 function readQualifiers(
   event: EditorEvent,
   filters: TriggerDocument["on"][string]["filters"],
 ): QualifierValues {
   const values: QualifierValues = {};
-  for (const qualifier of eventDefinition(event).qualifiers) {
+  const definition = eventDefinition(event);
+  if (definition.provider === "github") {
+    for (const key of GITHUB_TEXT_KEYS) {
+      const value = filters?.[key];
+      if (typeof value === "string") values[key] = value;
+    }
+  }
+  for (const qualifier of definition.qualifiers) {
     const value = filters?.[qualifier.key];
     if (Array.isArray(value)) values[qualifier.key] = value.join("\n");
     else if (typeof value === "string") values[qualifier.key] = value;

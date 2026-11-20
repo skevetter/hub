@@ -16,6 +16,7 @@ export type FormFieldKind = "text" | "email" | "password" | "secret" | "multilin
 export interface FieldControl {
   id: string;
   required?: boolean;
+  disabled?: boolean;
   "aria-invalid": boolean;
   "aria-describedby"?: string;
 }
@@ -25,6 +26,7 @@ interface Frame {
   label: string;
   description?: string;
   error?: string;
+  disabled?: boolean;
   /**
    * Validation semantics only — it reaches the control, and nothing is drawn beside the label.
    * A mark on the label is text as far as an accessible name is concerned, so "New password*"
@@ -43,7 +45,6 @@ interface TypedControl {
   defaultValue?: string;
   value?: string;
   readOnly?: boolean;
-  disabled?: boolean;
   autoComplete?: string;
   placeholder?: string;
   minLength?: number;
@@ -77,7 +78,7 @@ interface TypedControl {
 export function FormField(
   props: Frame & (TypedControl | { children: (control: FieldControl) => ReactNode }),
 ) {
-  const { id, label, description, error, required } = props;
+  const { id, label, description, error, required, disabled } = props;
   const descriptionId = `${id}-description`;
   const errorId = `${id}-error`;
   const control = useMemo<FieldControl>(() => {
@@ -90,10 +91,11 @@ export function FormField(
     return {
       id,
       ...(required === undefined ? {} : { required }),
+      ...(disabled === undefined ? {} : { disabled }),
       "aria-invalid": error !== undefined,
       ...(describedBy === "" ? {} : { "aria-describedby": describedBy }),
     };
-  }, [description, descriptionId, error, errorId, id, required]);
+  }, [description, descriptionId, disabled, error, errorId, id, required]);
   return (
     <Field data-invalid={error !== undefined}>
       <FieldLabel htmlFor={id}>{label}</FieldLabel>
@@ -120,7 +122,6 @@ function TypedInput({
   defaultValue,
   value,
   readOnly,
-  disabled,
   autoComplete,
   placeholder,
   minLength,
@@ -142,7 +143,6 @@ function TypedInput({
     ...(defaultValue === undefined ? {} : { defaultValue }),
     ...(value === undefined ? {} : { value }),
     ...(readOnly === undefined ? {} : { readOnly }),
-    ...(disabled === undefined ? {} : { disabled }),
     ...(placeholder === undefined ? {} : { placeholder }),
     ...(minLength === undefined ? {} : { minLength }),
     ...(maxLength === undefined ? {} : { maxLength }),

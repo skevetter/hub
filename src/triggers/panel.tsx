@@ -35,6 +35,7 @@ import {
   changeTriggerEvent,
   droppedTriggerRules,
   isManualNoCallers,
+  sharedYamlField,
   mergeTriggerForm,
   needsActorFilter,
   projectTriggerForm,
@@ -654,11 +655,15 @@ export function ProgressMessageField({
   event,
   checked,
   hubEnabled,
+  disabled,
+  description: sharedDescription,
   onChange,
 }: {
   event: TriggerFormValue["event"];
   checked: boolean;
   hubEnabled: boolean;
+  disabled?: boolean;
+  description?: string;
   onChange: (checked: boolean) => void;
 }) {
   if (!hasProgressDestination(event)) return null;
@@ -669,8 +674,10 @@ export function ProgressMessageField({
       id="trigger-progress-message"
       label="Post live progress at the source"
       description={
-        hubEnabled ? description : `${description} This Hub has progress messages turned off.`
+        sharedDescription ??
+        (hubEnabled ? description : `${description} This Hub has progress messages turned off.`)
       }
+      {...(disabled === undefined ? {} : { disabled })}
       checked={checked}
       onChange={onChange}
     />
@@ -717,7 +724,7 @@ function TriggerEventCard({
   return (
     <Card title={EDITOR_STEPS.event.title} description={EDITOR_STEPS.event.description}>
       <div className="grid gap-4 sm:grid-cols-2">
-        <FormField id="trigger-event" label="When this happens">
+        <FormField id="trigger-event" label="When this happens" {...sharedYamlField(form, "event")}>
           {(control) => (
             <Combobox
               {...control}
@@ -735,6 +742,7 @@ function TriggerEventCard({
             label="Connection"
             description="The organization connection that receives the event."
             required
+            {...sharedYamlField(form, "connection")}
             {...fieldError(errors, "connection")}
           >
             {(control) => (
@@ -793,6 +801,7 @@ function TriggerEventCard({
         event={form.event}
         checked={form.progressMessage === true}
         hubEnabled={progressMessagesEnabled}
+        {...sharedYamlField(form, "progressMessage")}
         onChange={(progressMessage) => onChange({ ...form, progressMessage })}
       />
     </Card>
@@ -857,6 +866,7 @@ function TriggerForm({
             value={form.name}
             onChange={text("name")}
             required
+            {...sharedYamlField(form, "name")}
             {...fieldError(errors, "name")}
           />
           <FormField
@@ -874,6 +884,7 @@ function TriggerForm({
           label="Enabled"
           description="A disabled trigger keeps its configuration and stops responding to events."
           checked={form.enabled}
+          {...sharedYamlField(form, "enabled")}
           onChange={(checked) => update("enabled", checked)}
         />
       </Card>
@@ -912,6 +923,7 @@ function TriggerForm({
                 id="trigger-daemon"
                 label="Run on daemon"
                 required
+                {...sharedYamlField(form, "daemon")}
                 {...fieldError(errors, "daemon")}
               >
                 {(control) => (
@@ -946,6 +958,7 @@ function TriggerForm({
                     value={form.cwd}
                     onChange={text("cwd")}
                     required
+                    {...sharedYamlField(form, "cwd")}
                     {...fieldError(errors, "cwd")}
                   />
                   <FormField
@@ -957,6 +970,7 @@ function TriggerForm({
                     value={form.maxRuntime}
                     onChange={text("maxRuntime")}
                     required
+                    {...sharedYamlField(form, "maxRuntime")}
                     {...fieldError(errors, "maxRuntime")}
                   />
                   {script ? null : (
@@ -969,6 +983,7 @@ function TriggerForm({
                       value={form.idleTimeout}
                       onChange={text("idleTimeout")}
                       required
+                      {...sharedYamlField(form, "idleTimeout")}
                       {...fieldError(errors, "idleTimeout")}
                     />
                   )}
@@ -1011,29 +1026,33 @@ function TriggerForm({
                   onRetry={providerCatalog.refresh}
                 />
               )}
-              <SegmentedControl
-                label="Agent continuity"
-                description="Agent continuity"
-                value={form.continuationMode}
-                onChange={text("continuationMode")}
-                options={[
-                  {
-                    value: "conversation",
-                    label: "Same conversation",
-                    hint: "Continue the same agent for this conversation. Events without a conversation start a new agent. Archived workspaces are restored.",
-                  },
-                  {
-                    value: "key",
-                    label: "Custom key",
-                    hint: "Arrivals with the same key in this project share an agent. Agent and workspace settings must match.",
-                  },
-                  {
-                    value: "new",
-                    label: "New agent",
-                    hint: "Create a separate agent for every request.",
-                  },
-                ]}
-              />
+              <fieldset disabled={sharedYamlField(form, "continuationMode").disabled}>
+                <SegmentedControl
+                  label="Agent continuity"
+                  description={
+                    sharedYamlField(form, "continuationMode").description ?? "Agent continuity"
+                  }
+                  value={form.continuationMode}
+                  onChange={text("continuationMode")}
+                  options={[
+                    {
+                      value: "conversation",
+                      label: "Same conversation",
+                      hint: "Continue the same agent for this conversation. Events without a conversation start a new agent. Archived workspaces are restored.",
+                    },
+                    {
+                      value: "key",
+                      label: "Custom key",
+                      hint: "Arrivals with the same key in this project share an agent. Agent and workspace settings must match.",
+                    },
+                    {
+                      value: "new",
+                      label: "New agent",
+                      hint: "Create a separate agent for every request.",
+                    },
+                  ]}
+                />
+              </fieldset>
               {form.continuationMode === "key" ? (
                 <FormField
                   id="trigger-continuation-key"
@@ -1044,11 +1063,13 @@ function TriggerForm({
                   onChange={text("continuationKey")}
                   description="A key or expression, for example ${{ paseo.inputs.ticket }}."
                   required
+                  {...sharedYamlField(form, "continuationKey")}
                   {...fieldError(errors, "continuationKey")}
                 />
               ) : null}
               <PromptEditor
                 value={form.prompt}
+                {...sharedYamlField(form, "prompt")}
                 {...fieldError(errors, "prompt")}
                 onChange={(prompt) => update("prompt", prompt)}
               />
@@ -1057,6 +1078,7 @@ function TriggerForm({
                 label="Complete when the agent ends its turn"
                 description="If the agent stops without calling finish_execution, count the run as done instead of failing it at the idle timeout. Not for runs with a structured output or a required output."
                 checked={form.completeOnTurnEnd}
+                {...sharedYamlField(form, "completeOnTurnEnd")}
                 onChange={(checked) => update("completeOnTurnEnd", checked)}
               />
               <Disclosure
@@ -1075,6 +1097,7 @@ function TriggerForm({
                   value={form.providerOptions}
                   onChange={text("providerOptions")}
                   placeholder={'{"sandbox_mode":"workspace-write"}'}
+                  {...sharedYamlField(form, "providerOptions")}
                   {...fieldError(errors, "providerOptions")}
                 />
               </Disclosure>
@@ -1090,6 +1113,7 @@ function TriggerForm({
                     id="trigger-github-connection"
                     label="GitHub connection"
                     description="Mints a short-lived, restricted GH_TOKEN for this run."
+                    {...sharedYamlField(form, "githubConnection")}
                   >
                     {(control) => (
                       <Combobox
@@ -1112,6 +1136,7 @@ function TriggerForm({
                         name="githubRepositories"
                         value={form.githubRepositories}
                         onChange={text("githubRepositories")}
+                        {...sharedYamlField(form, "githubRepositories")}
                         required
                       />
                       <FormField
@@ -1122,6 +1147,7 @@ function TriggerForm({
                         name="githubDuration"
                         value={form.githubDuration}
                         onChange={text("githubDuration")}
+                        {...sharedYamlField(form, "githubDuration")}
                         required
                       />
                       <FormField
@@ -1133,6 +1159,7 @@ function TriggerForm({
                         value={form.githubPermissions}
                         onChange={text("githubPermissions")}
                         placeholder={'{"contents":"write","pull_requests":"write"}'}
+                        {...sharedYamlField(form, "githubPermissions")}
                         {...fieldError(errors, "githubPermissions")}
                       />
                     </>
@@ -1171,6 +1198,7 @@ function AccessCard({
   const chooseAudience = !script && audience === "wildcard";
   const everyone = chooseAudience && form.allowedUsers.trim() === "*";
   const noCallers = isManualNoCallers(form);
+  const sharedAudience = sharedYamlField(form, "allowedUsers");
   let description: string = EDITOR_STEPS.access.description;
   if (script) description = SCRIPT_ACCESS_DESCRIPTION;
   else if (manual) description = "Choose who can start this trigger manually or by webhook.";
@@ -1185,12 +1213,12 @@ function AccessCard({
       ) : null}
       <div className="grid min-w-0 gap-4 sm:grid-cols-2 [&>*]:min-w-0">
         {chooseAudience ? (
-          <FormField id="trigger-audience" label="Audience">
+          <FormField id="trigger-audience" label="Audience" {...(everyone ? sharedAudience : {})}>
             {() => (
               <SegmentedControl
                 label="Audience"
                 value={everyone ? "everyone" : "specific"}
-                options={AUDIENCE_OPTIONS}
+                options={sharedAudience.disabled ? SHARED_AUDIENCE_OPTIONS : AUDIENCE_OPTIONS}
                 onChange={(value) =>
                   onChange({
                     ...form,
@@ -1216,6 +1244,7 @@ function AccessCard({
             value={form.allowedUsers}
             onChange={(value) => onChange({ ...form, allowedUsers: value, manualNoCallers: false })}
             required={!noCallers && (script || audience !== "optional")}
+            {...sharedAudience}
             {...fieldError(errors, "allowedUsers")}
           />
         )}
@@ -1228,6 +1257,11 @@ const AUDIENCE_OPTIONS: readonly SegmentedOption[] = [
   { value: "everyone", label: "Everyone" },
   { value: "specific", label: "Specific people" },
 ];
+const SHARED_AUDIENCE_OPTIONS = AUDIENCE_OPTIONS.map(({ value, label }) => ({
+  value,
+  label,
+  disabled: true,
+}));
 
 /**
  * The trigger editor before the snapshot arrives. The back link, the step titles, and the page
@@ -1311,10 +1345,14 @@ const NO_AGENT_DESCRIPTION =
 function PromptEditor({
   value,
   error,
+  disabled,
+  description,
   onChange,
 }: {
   value: string;
   error?: string;
+  disabled?: boolean;
+  description?: string;
   onChange: (value: string) => void;
 }) {
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -1340,6 +1378,8 @@ function PromptEditor({
       <FormField
         id="trigger-prompt"
         label="Instructions"
+        {...(disabled === undefined ? {} : { disabled })}
+        {...(description === undefined ? {} : { description })}
         required
         {...(error === undefined ? {} : { error })}
       >
@@ -1364,6 +1404,7 @@ function PromptEditor({
             variant="outline"
             size="xs"
             className="font-mono"
+            disabled={disabled}
             onClick={() => insert(mergeTag)}
           >
             {mergeTag}
@@ -1403,6 +1444,7 @@ function ProviderCatalogFields({
         label="Agent"
         description="Models the selected daemon can run unattended: Claude, Codex, OpenCode, or omp."
         required
+        {...sharedYamlField(form, "agent")}
         {...fieldError(errors, "agent")}
       >
         {(control) => (
@@ -1426,6 +1468,7 @@ function ProviderCatalogFields({
         label="Execution mode"
         description="Modes reported for the selected provider. omp runs unattended only in full."
         required
+        {...sharedYamlField(form, "mode")}
         {...fieldError(errors, "mode")}
       >
         {(control) => (
@@ -1445,6 +1488,7 @@ function ProviderCatalogFields({
           id="trigger-thinking"
           label="Thinking"
           description="Thinking options reported for the selected model."
+          {...sharedYamlField(form, "thinkingOptionId")}
           required
         >
           {(control) => (

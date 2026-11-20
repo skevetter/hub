@@ -1,5 +1,8 @@
+import { compileTriggerDocument, parseTriggerDocument } from "./index.js";
+import { matchTriggers } from "../github/match.js";
+import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
 import { agentRun } from "./schema.js";
-import { EDITOR_EVENTS } from "./events.js";
+import { EDITOR_EVENTS, eventDefinition } from "./events.js";
 import { describe, expect, test } from "vitest";
 import { parseDocument } from "yaml";
 import { TriggerDocumentSchema } from "./schema.js";
@@ -789,7 +792,7 @@ test("an existing non-projectable document cannot be replaced by a fresh form do
 });
 
 test.each(["from_users", "channels"] as const)(
-  "edits the anchored %s sequence while retaining aliases and per-item comments",
+  "keeps comments when editing an unshared anchor on %s",
   (key) => {
     const original = key === "from_users" ? 'from_users: ["*"]' : "channels: [engineering]";
     const yaml = ADVANCED.replace(
@@ -798,7 +801,7 @@ test.each(["from_users", "channels"] as const)(
         - alice # retain Alice's comment
         - someone-else # remove this item
         - bob # retain Bob's comment`,
-    ).replace("sandbox_mode: workspace-write", "selected: *entries");
+    );
     const projection = projectTriggerForm(yaml);
     if (projection.status !== "editable") throw new Error(projection.reason);
     const draft =
@@ -810,45 +813,147 @@ test.each(["from_users", "channels"] as const)(
     expect(saved.yaml).toContain(`${key}: &entries`);
     expect(saved.yaml).toContain("- alice # retain Alice's comment");
     expect(saved.yaml).toContain("- bob # retain Bob's comment");
-    expect(saved.yaml).toContain("selected: *entries");
     const parsed = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
     expect(parsed.on["slack.mention"]?.filters?.[key]).toEqual(["bob", "alice", "carol"]);
-    expect(agentRun(parsed.run).agent).toMatchObject({
-      options: { selected: ["bob", "alice", "carol"] },
-    });
   },
 );
 
+const GITHUB_ALIAS_YAML = `name: alias-audience
+on:
+  github.issue_created:
+    connection: git
+    filters:
+      from_users: &names
+        - alice # keep Alice
+      labels: *names # keep label reference
+run:
+  target: { daemon: office, cwd: /workspace }
+  agent: { provider: codex, mode: full-access }
+  prompt: Review the issue.
+`;
+
+test("editing an aliased GitHub label list leaves Bob outside the sender allowlist", () => {
+  const projection = projectTriggerForm(GITHUB_ALIAS_YAML);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const result = mergeTriggerForm(GITHUB_ALIAS_YAML, {
+    ...projection.value,
+    qualifiers: { ...projection.value.qualifiers, labels: "alice\nbob" },
+  });
+  if (result.status !== "ok") throw new Error(result.reason);
+  const delivery: NormalizedGitHubEvent = {
+    id: "delivery",
+    installationId: 1,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    type: "issues",
+    repo: "acme/web",
+    repositoryId: 1,
+    payload: {
+      action: "opened",
+      sender: { login: "bob" },
+      issue: { title: "A review", body: "", labels: [{ name: "alice" }, { name: "bob" }] },
+    },
+  };
+  expect(
+    matchTriggers({ triggers: compileTriggerDocument(GITHUB_ALIAS_YAML).events }, delivery, "git"),
+  ).toHaveLength(0);
+  expect(
+    matchTriggers({ triggers: compileTriggerDocument(result.yaml).events }, delivery, "git"),
+  ).toHaveLength(0);
+  expect(parseTriggerDocument(result.yaml).on["github.issue_created"]?.filters).toEqual({
+    from_users: ["alice"],
+    labels: ["alice", "bob"],
+  });
+  expect(result.yaml).toContain("from_users: &names");
+  expect(result.yaml).toContain("- alice # keep Alice");
+  expect(result.yaml).toContain("# keep label reference");
+});
+
+test.each(["from_users", "channels"] as const)(
+  "refuses direct edits to a shared %s anchor",
+  (key) => {
+    const original = key === "from_users" ? 'from_users: ["*"]' : "channels: [engineering]";
+    const yaml = ADVANCED.replace(original, `${key}: &entries [alice]`).replace(
+      "sandbox_mode: workspace-write",
+      "selected: *entries",
+    );
+    const projection = projectTriggerForm(yaml);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    const value =
+      key === "from_users"
+        ? { ...projection.value, allowedUsers: "alice, bob" }
+        : { ...projection.value, qualifiers: { channels: "alice\nbob" } };
+    const result = mergeTriggerForm(yaml, value);
+    expect(result.status).toBe("incomplete");
+    if (result.status !== "incomplete") throw new Error("Expected a shared anchor error.");
+    expect(result.reason).toContain("through a YAML anchor");
+    const unrelated = mergeTriggerForm(yaml, { ...projection.value, cwd: "/other" });
+    if (unrelated.status !== "ok") throw new Error(unrelated.reason);
+    expect(unrelated.yaml).toContain("selected: *entries");
+  },
+);
+
+test("scalar aliases copy on write and their shared anchors cannot be edited in the form", () => {
+  const yaml = GITHUB_ALIAS_YAML.replace(
+    "      labels: *names # keep label reference",
+    "      pattern: &text /run\n      contains: *text # retain alias comment",
+  );
+  const projection = projectTriggerForm(yaml);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const patched = patchTriggerYaml(yaml, {
+    ...projection.value,
+    qualifiers: { ...projection.value.qualifiers, contains: "deploy" },
+  });
+  expect(patched).toContain("pattern: &text /run");
+  expect(patched).toContain("contains: deploy # retain alias comment");
+  expect(() =>
+    patchTriggerYaml(yaml, {
+      ...projection.value,
+      qualifiers: { ...projection.value.qualifiers, pattern: "deploy" },
+    }),
+  ).toThrow("through a YAML anchor");
+});
+
 const githubEvents = [...GITHUB_SEMANTIC_TRIGGER_EVENT_NAMES, ...GITHUB_TRIGGER_SOURCE_NAMES];
+const labelEvents = new Set([
+  "github.issue_label_added",
+  "github.pull_request_label_added",
+  "github.issues",
+  "github.pull_request",
+]);
 test.each(githubEvents.flatMap((from) => githubEvents.map((to) => [from, to] as const)))(
-  "carries GitHub matcher text rules from %s to %s only when both events support them",
+  "carries GitHub matcher text rules from %s to %s when the destination supports them",
   (from, to) => {
     const projection = projectTriggerForm(ADVANCED);
     if (projection.status !== "editable") throw new Error(projection.reason);
     const text = { pattern: "/run", contains: "deploy", exclude_contains: "skip" };
-    const previous = {
-      ...projection.value,
-      event: from,
-      qualifiers: from === "github.push" ? {} : text,
-    };
-    const fromYaml = createTriggerYaml({
-      ...previous,
-      qualifiers: { ...previous.qualifiers, label: "ready" },
-    });
+    const document = parseDocument(
+      createTriggerYaml({
+        ...projection.value,
+        event: from,
+        qualifiers: { label: "ready" },
+      }),
+    );
+    const sourcePath = ["on", from, "filters"];
+    for (const [key, value] of Object.entries(text)) document.setIn([...sourcePath, key], value);
+    const fromYaml = document.toString();
     const authored = projectTriggerForm(fromYaml);
     if (authored.status !== "editable") throw new Error(authored.reason);
     const next = changeTriggerEvent(authored.value, to);
-    const stays = from !== "github.push" && to !== "github.push";
-    for (const key of ["pattern", "contains", "exclude_contains"] as const) {
-      expect(next.qualifiers[key]).toBe(stays ? text[key] : undefined);
-    }
+    const dropsText = from !== to && to === "github.push";
+    const expectedDrops = dropsText
+      ? eventDefinition(from)
+          .qualifiers.filter(({ key }) => Object.hasOwn(text, key))
+          .map(({ label }) => label)
+      : [];
+    if (labelEvents.has(from) && !labelEvents.has(to)) expectedDrops.unshift("Added label");
+    expect(droppedTriggerRules(authored.value, next)).toEqual(expectedDrops);
     const saved = patchTriggerYaml(fromYaml, {
       ...next,
-      qualifiers: { ...next.qualifiers, label: "ready" },
+      qualifiers: { ...next.qualifiers, ...(labelEvents.has(to) ? { label: "ready" } : {}) },
     });
-    const filters = TriggerDocumentSchema.parse(parseDocument(saved).toJS()).on[to]?.filters;
+    const filters = parseTriggerDocument(saved).on[to]?.filters;
     for (const key of ["pattern", "contains", "exclude_contains"] as const) {
-      expect(filters?.[key]).toBe(stays ? text[key] : undefined);
+      expect(filters?.[key]).toBe(dropsText ? undefined : text[key]);
     }
   },
 );
@@ -868,21 +973,33 @@ test("preserves an explicit empty manual caller list during an unrelated edit", 
   expect(parsed.run.target.cwd).toBe("/other");
 });
 
-test("clearing an anchored list preserves its values and comments at the remaining aliases", () => {
-  const yaml = ADVANCED.replace(
-    "channels: [engineering]",
-    "channels: &channels\n        - engineering # keep here",
-  ).replace("sandbox_mode: workspace-write", "selected: *channels\n      checked: *channels");
+test("clearing an aliased list leaves the original list and its other aliases in place", () => {
+  const yaml = GITHUB_ALIAS_YAML.replace(
+    "  prompt: Review the issue.",
+    "  prompt: Review the issue.\n  agent: { provider: codex, mode: full-access, options: { checked: *names } }",
+  ).replace("  agent: { provider: codex, mode: full-access }\n", "");
   const projection = projectTriggerForm(yaml);
   if (projection.status !== "editable") throw new Error(projection.reason);
-  const saved = mergeTriggerForm(yaml, { ...projection.value, qualifiers: { channels: "" } });
+  const saved = mergeTriggerForm(yaml, { ...projection.value, qualifiers: { labels: "" } });
   if (saved.status !== "ok") throw new Error(saved.reason);
-  expect(saved.yaml).toContain("selected: &channels");
-  expect(saved.yaml).toContain("checked: *channels");
-  expect(saved.yaml).toContain("- engineering # keep here");
-  const parsed = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
-  expect(parsed.on["slack.mention"]?.filters?.channels).toBeUndefined();
-  expect(agentRun(parsed.run).agent).toMatchObject({
-    options: { selected: ["engineering"], checked: ["engineering"] },
+  expect(saved.yaml).toContain("from_users: &names");
+  expect(saved.yaml).toContain("checked: *names");
+  expect(saved.yaml).toContain("- alice # keep Alice");
+  expect(parseTriggerDocument(saved.yaml).on["github.issue_created"]?.filters).toEqual({
+    from_users: ["alice"],
   });
+});
+
+test("keeps an anchored progress flag and its alias during an unrelated edit", () => {
+  const yaml = ADVANCED.replace(
+    "enabled: true",
+    "enabled: true\nprogress_message: &flag false",
+  ).replace("sandbox_mode: workspace-write", "report: *flag");
+  const projection = projectTriggerForm(yaml);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const saved = mergeTriggerForm(yaml, { ...projection.value, cwd: "/other" });
+  if (saved.status !== "ok") throw new Error(saved.reason);
+  expect(saved.yaml).toContain("progress_message: &flag false");
+  expect(saved.yaml).toContain("report: *flag");
+  expect(parseTriggerDocument(saved.yaml).run.target.cwd).toBe("/other");
 });

@@ -1,7 +1,11 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop -- event controls bind their own configuration */
 import { FormField } from "../components/app/form-field.js";
 import { eventDefinition, type QualifierKey } from "./configuration/events.js";
-import type { TriggerFieldErrors, TriggerFormValue } from "./configuration/editor.js";
+import {
+  sharedYamlField,
+  type TriggerFieldErrors,
+  type TriggerFormValue,
+} from "./configuration/editor.js";
 import { ScheduleFields } from "./schedule/fields.js";
 
 /** Source-specific controls live behind the event form boundary. */
@@ -17,14 +21,22 @@ export function EventFields({
   const updateQualifier = (key: QualifierKey, next: string) =>
     onChange({ ...value, qualifiers: { ...value.qualifiers, [key]: next } });
   const { qualifiers } = eventDefinition(value.event);
+  const sharedRecurrence = sharedYamlField(value, "recurrence");
   return (
     <>
-      <ScheduleFields
-        event={value.event}
-        value={value.recurrence}
-        error={errors.recurrence}
-        onChange={(recurrence) => onChange({ ...value, recurrence })}
-      />
+      {value.event === "schedule.tick" ? (
+        <fieldset disabled={sharedRecurrence.disabled} className="grid min-w-0 gap-4">
+          {sharedRecurrence.description === undefined ? null : (
+            <p className="text-sm text-muted-foreground">{sharedRecurrence.description}</p>
+          )}
+          <ScheduleFields
+            event={value.event}
+            value={value.recurrence}
+            error={errors.recurrence}
+            onChange={(recurrence) => onChange({ ...value, recurrence })}
+          />
+        </fieldset>
+      ) : null}
       {qualifiers.length === 0 ? null : (
         <div className="grid gap-4 sm:grid-cols-2">
           {qualifiers.map((qualifier) => {
@@ -45,6 +57,7 @@ export function EventFields({
                 value={draft}
                 onChange={(next) => updateQualifier(qualifier.key, next)}
                 required={qualifier.required}
+                {...sharedYamlField(value, `qualifiers.${qualifier.key}`)}
                 {...(error === undefined ? {} : { error })}
               />
             );
