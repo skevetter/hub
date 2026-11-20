@@ -3,8 +3,32 @@ import type { TimelineScrubber } from "./capture-types.js";
 
 const INPUT_LIMIT = 8192;
 const INVISIBLE = /[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu;
-const PREFIX_TOKEN =
-  /(?:paseo_(?:pk|cli)_|gh[pousr]_|github_pat_|xox[abprs]-|xapp-|lin_(?:api|oauth)_|AKIA|ASIA|sk-|AIza|sk_live_|rk_live_|whsec_)[A-Za-z0-9_+/-]*/gu;
+const TOKEN_PREFIXES = [
+  "paseo_pk_",
+  "paseo_cli_",
+  "ghp_",
+  "gho_",
+  "ghu_",
+  "ghs_",
+  "ghr_",
+  "github_pat_",
+  "xoxa-",
+  "xoxb-",
+  "xoxp-",
+  "xoxr-",
+  "xoxs-",
+  "xapp-",
+  "lin_api_",
+  "lin_oauth_",
+  "AKIA",
+  "ASIA",
+  "sk-",
+  "AIza",
+  "sk_live_",
+  "rk_live_",
+  "whsec_",
+];
+const PREFIX_TOKEN = new RegExp(`(?:${TOKEN_PREFIXES.join("|")})[A-Za-z0-9_+/-]*`, "gu");
 const JWT = /(?:^|[^A-Za-z0-9_-])(eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2})/gu;
 const ENTROPY_RUN = /[A-Za-z0-9+/=_-]{32,}/gu;
 const ARMORED_START = /(?<!-)-{3,}\s*BEGIN\b/iu;
@@ -38,61 +62,73 @@ const ESCAPES: Readonly<Record<string, string>> = {
 
 const URL_SCHEME_START = /[A-Za-z]/u;
 const URL_SCHEME_PART = /[0-9+.-]/u;
-const URL_BOUNDARY = /[/?#]/u;
+const URL_PART = /%2f|%5c|%40|[\s\S]/giu;
+const URL_SLASH = /^(?:[/\\]|%2f|%5c)$/iu;
+const STRUCTURED_URL_BOUNDARY = /[/?#]/u;
+const PROSE_URL_BOUNDARY = /[/?#\s]/u;
 
-function hasEncodedUrlSlash(value: string, index: number): boolean {
-  return (
-    value.startsWith("%2f", index) ||
-    value.startsWith("%2F", index) ||
-    value.startsWith("%5c", index) ||
-    value.startsWith("%5C", index)
-  );
+interface CredentialSpan {
+  start: number;
+  end: number;
 }
 
-function hasUserinfo(value: string): boolean {
-  const detection = value.replace(/[\t\n\r]/gu, "");
+function urlUserinfo(value: string, prose = false): CredentialSpan[] {
+  if (!value.includes("@") && !value.includes("%40")) return [];
+  if (prose) return scanUrlUserinfo(value, PROSE_URL_BOUNDARY, false);
+  const offsets: number[] = [];
+  let compact = "";
+  for (let index = 0; index < value.length; index += 1) {
+    if (/[\t\n\r]/u.test(value[index]!)) continue;
+    offsets.push(index);
+    compact += value[index];
+  }
+  return scanUrlUserinfo(compact, STRUCTURED_URL_BOUNDARY, true).map(({ start, end }) => ({
+    start: offsets[start]!,
+    end: offsets[end - 1]! + 1,
+  }));
+}
+
+function scanUrlUserinfo(
+  value: string,
+  boundary: RegExp,
+  allowImplicitAuthority: boolean,
+): CredentialSpan[] {
+  const spans: CredentialSpan[] = [];
   let authority = false;
   let prefix = false;
   let schemeToken = false;
   let sawSlash = false;
-  for (let index = 0; index < detection.length; index += 1) {
-    const character = detection[index]!;
-    const encodedSlash = character === "%" && hasEncodedUrlSlash(detection, index);
-    const slash = character === "/" || character === "\\" || encodedSlash;
+  let start = 0;
+  for (const part of value.matchAll(URL_PART)) {
+    const token = part[0];
+    const end = part.index + token.length;
+    const slash = URL_SLASH.test(token);
     if (authority) {
-      if (prefix && (slash || character === " ")) {
-        if (character === "%") index += 2;
+      if (prefix && (slash || token === " ")) {
+        start = end;
         continue;
       }
       prefix = false;
-      if (character === "@" || detection.startsWith("%40", index)) return true;
-      if (!URL_BOUNDARY.test(character)) {
-        if (encodedSlash) index += 2;
+      if (token === "@" || token === "%40") {
+        spans.push({ start, end });
+        authority = sawSlash = schemeToken = false;
         continue;
       }
-      authority = false;
-      sawSlash = false;
+      if (!boundary.test(token)) continue;
+      authority = sawSlash = false;
     }
-    if (character === ":" && schemeToken) {
-      authority = true;
-      prefix = true;
-      schemeToken = false;
-      sawSlash = false;
-      continue;
-    }
-    if (slash) {
-      authority = sawSlash;
+    if ((allowImplicitAuthority && token === ":" && schemeToken) || slash) {
+      authority = !slash || sawSlash;
       prefix = authority;
+      start = end;
       sawSlash = !authority;
       schemeToken = false;
-      if (encodedSlash) index += 2;
       continue;
     }
     sawSlash = false;
-    schemeToken =
-      URL_SCHEME_START.test(character) || (schemeToken && URL_SCHEME_PART.test(character));
+    schemeToken = URL_SCHEME_START.test(token) || (schemeToken && URL_SCHEME_PART.test(token));
   }
-  return false;
+  return spans;
 }
 
 function decode(value: string): string {
@@ -197,7 +233,7 @@ export function createTimelineScrubber(
       if (
         SENSITIVE_LABEL.test(labels) ||
         (/[?&]/u.test(canonical) && labels.includes("code")) ||
-        hasUserinfo(canonical) ||
+        urlUserinfo(canonical).length > 0 ||
         ARMORED_START.test(canonical) ||
         (canonical !== value && scrub(canonical) !== canonical)
       ) {
@@ -274,4 +310,184 @@ export function createTimelineScrubber(
       return fallback(marker, limit);
     }
   };
+}
+
+const BEARER_VALUE = String.raw`\bBearer[ \t]+([A-Za-z0-9._~+/-]{4,}={0,2})`;
+const ASSIGNMENT_LABEL = String.raw`\b(?:[a-z0-9]+[-_])*(?:key|token|secret|password)\b["']?[ \t]*[:=][ \t]*["']?`;
+const PROSE_VALUES = [
+  new RegExp(BEARER_VALUE, "giu"),
+  new RegExp(ASSIGNMENT_LABEL + String.raw`([a-z0-9+/_-]{24,}={0,2})`, "giu"),
+];
+const ARMORED_END = /-{3,}\s*END\b[^\r\n]*?-{3,}/giu;
+const ARMORED_PREFIX = "-----BEGIN";
+const OPEN_VALUE = new RegExp(
+  String.raw`(?:\bBearer[ \t]+` + "|" + ASSIGNMENT_LABEL + String.raw`)[A-Za-z0-9._~+/=-]*$`,
+  "iu",
+);
+const URL_BODY = String.raw`(?:[/\\]{2}|(?:%2f|%5c){2})[^\s"'<>]*`;
+const PROSE_URL = new RegExp(URL_BODY, "giu");
+const OPEN_URL = new RegExp(`${URL_BODY}$`, "iu");
+const URL_QUERY_VALUE = /[?&#]([a-z0-9_.~-]+)=([^#&]+)/giu;
+const CREDENTIAL_CHARACTER = /[A-Za-z0-9+/_=.%~:-]/u;
+const TEXT_LOOKAHEAD = 64;
+
+interface SecretPrefix {
+  value: string;
+  fallback: number[];
+}
+
+function secretPrefix(value: string): SecretPrefix {
+  const fallback = [0];
+  let match = 0;
+  for (let index = 1; index < value.length; index += 1) {
+    while (match && value[index] !== value[match]) match = fallback[match - 1]!;
+    if (value[index] === value[match]) match += 1;
+    fallback.push(match);
+  }
+  return { value, fallback };
+}
+
+function pendingSecret(text: string, { value, fallback }: SecretPrefix): number {
+  let match = 0;
+  for (let index = Math.max(0, text.length - value.length + 1); index < text.length; index += 1) {
+    while (match && text[index] !== value[match]) match = fallback[match - 1]!;
+    if (text[index] === value[match]) match += 1;
+  }
+  return text.length - match;
+}
+
+function armoredSpans(text: string): CredentialSpan[] {
+  const spans: CredentialSpan[] = [];
+  const startPattern = new RegExp(ARMORED_START.source, "giu");
+  for (const start of text.matchAll(startPattern)) {
+    ARMORED_END.lastIndex = start.index + start[0].length;
+    const end = ARMORED_END.exec(text);
+    spans.push({ start: start.index, end: end ? end.index + end[0].length : text.length });
+  }
+  return spans;
+}
+
+function patternSpans(text: string, pattern: RegExp, capture = false): CredentialSpan[] {
+  return [...text.matchAll(pattern)].map((match) => {
+    const end = match.index + match[0].length;
+    return { start: end - match[capture ? 1 : 0]!.length, end };
+  });
+}
+
+function urlQuerySpans(text: string): CredentialSpan[] {
+  const spans: CredentialSpan[] = [];
+  for (const url of text.matchAll(PROSE_URL)) {
+    for (const parameter of url[0].matchAll(URL_QUERY_VALUE)) {
+      const label = parameter[1]!.toLowerCase();
+      if (label !== "code" && !SENSITIVE_LABEL.test(label)) continue;
+      const end = url.index + parameter.index + parameter[0].length;
+      spans.push({ start: end - parameter[2]!.length, end });
+    }
+  }
+  return spans;
+}
+
+function redactParts(parts: readonly string[], spans: CredentialSpan[]): string[] {
+  spans.sort((left, right) => left.start - right.start);
+  const merged: CredentialSpan[] = [];
+  for (const span of spans) {
+    const last = merged.at(-1);
+    if (last && span.start < last.end) last.end = Math.max(last.end, span.end);
+    else merged.push({ ...span });
+  }
+  let offset = 0;
+  let match = 0;
+  return parts.map((part) => {
+    let from = offset;
+    let safe = "";
+    const end = offset + part.length;
+    for (let span = merged[match]; span && span.start < end; span = merged[++match]) {
+      if (span.start >= from) safe += part.slice(from - offset, span.start - offset) + "[redacted]";
+      from = span.end;
+      if (from > end) break;
+    }
+    const result = safe + part.slice(from - offset);
+    offset = end;
+    return result;
+  });
+}
+
+/** Replaces credential spans without applying the structured field's label or size rules. */
+export function createTimelineSpanScrubber(scrubValues: readonly string[]) {
+  const known = [...new Set(scrubValues.filter(Boolean))].map(secretPrefix);
+  function spans(text: string): CredentialSpan[] {
+    const assigned = PROSE_VALUES.flatMap((pattern) => patternSpans(text, pattern, true));
+    const result = [
+      ...patternSpans(text, PREFIX_TOKEN),
+      ...patternSpans(text, JWT, true),
+      ...assigned,
+      ...urlUserinfo(text, true),
+      ...urlQuerySpans(text),
+      ...armoredSpans(text),
+    ];
+    for (const match of text.matchAll(ENTROPY_RUN)) {
+      const end = match.index + match[0].length;
+      const value = assigned.find((span) => match.index < span.start && span.start < end);
+      const start = value?.start ?? match.index;
+      if (highEntropy(text.slice(start, end))) result.push({ start, end });
+    }
+    for (const { value } of known) {
+      for (let start = text.indexOf(value); start !== -1; start = text.indexOf(value, start + 1))
+        result.push({ start, end: start + value.length });
+    }
+    return result;
+  }
+
+  function pendingStart(text: string, boundary: boolean): number {
+    let end = boundary ? text.length : Math.max(0, text.length - TEXT_LOOKAHEAD);
+    for (const secret of known) end = Math.min(end, pendingSecret(text, secret));
+    const open = [OPEN_VALUE.exec(text), OPEN_URL.exec(text)];
+    for (const match of open) if (match) end = Math.min(end, match.index);
+
+    const armor = armoredSpans(text).at(-1);
+    if (armor?.end === text.length) end = Math.min(end, armor.start);
+    const armorTail = text.slice(-ARMORED_PREFIX.length).toUpperCase();
+    for (let size = 1; size < ARMORED_PREFIX.length; size += 1) {
+      if (armorTail.endsWith(ARMORED_PREFIX.slice(0, size)))
+        end = Math.min(end, text.length - size);
+    }
+
+    const trailing = /[A-Za-z0-9+/_=.%~:-]+$/u.exec(text);
+    if (trailing) end = Math.min(end, pendingTokenStart(trailing[0], boundary) + trailing.index);
+    if (!boundary) {
+      while (end > 0 && CREDENTIAL_CHARACTER.test(text[end - 1]!)) end -= 1;
+    }
+    if (end > 0 && /[\uD800-\uDBFF]/u.test(text[end - 1]!)) end -= 1;
+    return end;
+  }
+
+  return {
+    redact(text: string): string {
+      return redactParts([text], spans(text))[0]!;
+    },
+    redactParts(parts: readonly string[]): string[] {
+      return redactParts(parts, spans(parts.join("")));
+    },
+    take(text: string, boundary: boolean): { text: string; remaining: string } {
+      const matches = spans(text);
+      let end = pendingStart(text, boundary);
+      matches.sort((left, right) => right.start - left.start);
+      for (const match of matches) {
+        if (match.start < end && match.end > end) end = match.start;
+      }
+      return { text: redactParts([text.slice(0, end)], matches)[0]!, remaining: text.slice(end) };
+    },
+  };
+}
+
+function pendingTokenStart(token: string, boundary: boolean): number {
+  if (!boundary) return 0;
+  if (/^[A-Za-z0-9+/_=-]+$/u.test(token)) return 0;
+  for (const prefix of [...TOKEN_PREFIXES, "eyJ"]) {
+    if (token.includes(prefix)) return 0;
+    for (let size = 1; size < prefix.length; size += 1) {
+      if (token.endsWith(prefix.slice(0, size))) return token.length - size;
+    }
+  }
+  return token.length;
 }

@@ -10,6 +10,7 @@ export class FakeAgents implements AgentConnection, AgentHistory {
   readonly creations: { key: string; options: DaemonCreateAgentOptions }[] = [];
   readonly sends: { agentId: string; messageId: string; text: string }[] = [];
   readonly interrupts: string[] = [];
+  readonly archives: string[] = [];
   readonly watches: string[] = [];
   readonly snapshots = new Map<string, AgentSnapshot>();
   private readonly receipts = new Map<string, AgentSnapshot>();
@@ -59,9 +60,13 @@ export class FakeAgents implements AgentConnection, AgentHistory {
   }
 
   async control(agentId: string, _workspaceId: string, action: "interrupt" | "archive") {
-    if (action !== "interrupt") throw new Error("Unexpected archive");
+    if (action === "archive") throw new Error("Unexpected workspace archive");
     this.interrupts.push(agentId);
     await this.afterInterrupt?.();
+  }
+
+  async archiveAgent(agentId: string) {
+    this.archives.push(agentId);
   }
 
   async restore(): Promise<boolean> {

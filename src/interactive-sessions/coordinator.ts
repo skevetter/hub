@@ -777,19 +777,7 @@ export class InteractiveSessionCoordinator {
     agents: AgentConnection,
   ): Promise<SessionRecord | undefined> {
     if (!session.daemonAgentId) {
-      const { launch } = session;
-      const agent = await agents.create("isession:" + session.id + ":" + session.generation, {
-        provider: launch.provider,
-        cwd: launch.cwd,
-        env: {},
-        title: session.title,
-        background: false,
-        ...(launch.worktree === null ? {} : { worktree: launch.worktree }),
-        ...(launch.model === null ? {} : { model: launch.model }),
-        ...(launch.mode === null ? {} : { mode: launch.mode }),
-        ...(launch.thinkingOptionId === null ? {} : { thinkingOptionId: launch.thinkingOptionId }),
-        providerOptions: launch.providerOptions,
-      });
+      const agent = await this.createSessionAgent(agents, session);
       if (this.agents(worker.daemonId) !== agents) return undefined;
       if (
         !(await this.database.bindInteractiveSessionAgent({
@@ -808,6 +796,26 @@ export class InteractiveSessionCoordinator {
       session = bound;
     }
     return session;
+  }
+
+  private createSessionAgent(agents: AgentConnection, session: SessionRecord, timeoutMs?: number) {
+    const { launch } = session;
+    return agents.create(
+      `isession:${session.id}:${session.generation}`,
+      {
+        provider: launch.provider,
+        cwd: launch.cwd,
+        env: {},
+        title: session.title,
+        background: false,
+        ...(launch.worktree === null ? {} : { worktree: launch.worktree }),
+        ...(launch.model === null ? {} : { model: launch.model }),
+        ...(launch.mode === null ? {} : { mode: launch.mode }),
+        ...(launch.thinkingOptionId === null ? {} : { thinkingOptionId: launch.thinkingOptionId }),
+        providerOptions: launch.providerOptions,
+      },
+      timeoutMs,
+    );
   }
 
   private async dispatchControls(
@@ -959,15 +967,38 @@ export class InteractiveSessionCoordinator {
       }
     } catch (error) {
       if (uncertain(error)) {
-        if (
-          (await this.settle(worker, command, { status: "unknown" })) &&
-          command.attempts < maxDeliveryAttempts
-        )
+        if (!(await this.settle(worker, command, { status: "unknown" }))) return;
+        if (command.attempts < maxDeliveryAttempts)
           this.scheduleDispatch(worker, "control", retryDelay(command));
+        else await this.archiveOrphanedReplacement(worker, agents, session);
       } else {
         await this.settle(worker, command, { status: "failed", failureCode: "launch_failed" });
         await this.transition(worker, session, ["starting"], "failed", "launch_failed");
       }
+    }
+  }
+
+  private async archiveOrphanedReplacement(
+    worker: Worker,
+    agents: AgentConnection,
+    session: SessionRecord,
+  ) {
+    try {
+      if (agents.archiveAgent === undefined || this.agents(worker.daemonId) !== agents) return;
+      const closed = await this.session(worker);
+      if (
+        closed?.state !== "closed" ||
+        closed.generation !== session.generation ||
+        closed.stateReason !== "launch_failed" ||
+        closed.daemonAgentId !== null
+      )
+        return;
+      // The daemon exposes its create receipt through the same keyed, prompt-free request.
+      const agent = await this.createSessionAgent(agents, session, 2_000);
+      if (agent.status === "idle" && !isArchived(agent) && this.agents(worker.daemonId) === agents)
+        await agents.archiveAgent(agent.id, 2_000);
+    } catch (error) {
+      this.reportFailure(error, "archive_orphaned_replacement", worker.scope);
     }
   }
 

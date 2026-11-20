@@ -521,8 +521,10 @@ test("scrubs split secret values in live assistant messages", async () => {
   const f = await fixture();
   const { sessionId } = await f.running();
   const relayed: string[] = [];
+  const tools: string[] = [];
   const unsubscribe = f.bus.subscribe(sessionId, (event) => {
     if (event.kind === "agent" && event.item.kind === "assistant") relayed.push(event.item.text);
+    if (event.kind === "agent" && event.item.kind === "tool") tools.push(event.item.status);
   });
   const chunks = ["See ", "Zq9vW", "3xT7p", "Lm2Kd", "8Rf4Y", " here"];
   for (const [index, text] of chunks.entries()) {
@@ -536,7 +538,7 @@ test("scrubs split secret values in live assistant messages", async () => {
       },
       { seq, epoch: "epoch" },
     );
-    if (index === 2)
+    if (index === 2) {
       f.agents.emit(
         "agent-1",
         {
@@ -546,6 +548,11 @@ test("scrubs split secret values in live assistant messages", async () => {
         },
         { seq: seq + 1, epoch: "epoch" },
       );
+      await vi.waitFor(() => {
+        expect(relayed.join("")).toBe("See ");
+        expect(tools).toEqual(["running"]);
+      });
+    }
   }
   f.agents.emit("agent-1", { type: "turn_completed", provider: "codex" });
   await f.waitState(sessionId, "idle");
@@ -736,12 +743,12 @@ test("five uncertain replacement attempts make the failed launch visible", async
   });
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   try {
+    let replacementResponses = 0;
     f.agents.afterCreate = async () => {
-      throw new DaemonResponseLostError();
+      if (++replacementResponses <= 5) throw new DaemonResponseLostError();
     };
     accepted(await f.coordinator.replaceAgent(f.principal, f.command(sessionId)));
     await vi.advanceTimersByTimeAsync(18_000);
-    expect(f.agents.creations).toHaveLength(6);
     const closed = await f.state(sessionId);
     expect(closed?.closedAt).toBeInstanceOf(Date);
     expect(closed).toMatchObject({
@@ -749,6 +756,12 @@ test("five uncertain replacement attempts make the failed launch visible", async
       stateReason: "launch_failed",
       generation: 2,
     });
+    expect(f.agents.archives).toEqual(["agent-2"]);
+    expect(f.agents.creations).toHaveLength(7);
+    expect(f.agents.creations.slice(1).map(({ key }) => key)).toEqual(
+      Array(6).fill(`isession:${sessionId}:2`),
+    );
+    expect(f.agents.snapshots.size).toBe(2);
   } finally {
     vi.useRealTimers();
   }

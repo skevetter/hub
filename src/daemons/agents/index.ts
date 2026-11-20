@@ -73,6 +73,7 @@ export interface AgentConnection {
     action: "interrupt" | "archive",
     onWritten?: () => void,
   ): Promise<void>;
+  archiveAgent?(agentId: string, timeoutMs?: number): Promise<void>;
   watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void>;
 }
 
@@ -268,6 +269,9 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
       undefined,
       onWritten,
     );
+  }
+  async archiveAgent(agentId: string, timeoutMs?: number): Promise<void> {
+    await this.request({ type: "archive_agent_request", agentId }, timeoutMs);
   }
   async watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void> {
     this.assertOpen();
