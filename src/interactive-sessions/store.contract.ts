@@ -142,6 +142,7 @@ export function interactiveSessionStoreContract(
         delivery: "steer",
         message: "follow-up",
         maxQueued: 100,
+        maxMessagesPerMinute: 600,
         usage: start.usage,
         bodyCutoff: null,
         now,
@@ -155,6 +156,37 @@ export function interactiveSessionStoreContract(
         periodStart,
       );
     }
+
+    it("limits new sends per session and user before charging usage", async () => {
+      const { session } = await started();
+      const input = { ...command(session.id), maxMessagesPerMinute: 2 };
+      assert.equal((await database.acceptInteractiveSessionCommand(input)).status, "accepted");
+      assert.equal((await database.acceptInteractiveSessionCommand(input)).status, "replayed");
+      const next = { ...input, idempotencyKey: randomUUID() };
+      assert.deepEqual(await database.acceptInteractiveSessionCommand(next), {
+        status: "refused",
+        code: "rate_limited",
+      });
+      assert.equal((await usage())?.used, 2);
+      const controller = {
+        organizationId: session.organizationId,
+        userId: session.organizationId + "-controller",
+        role: "member" as const,
+      };
+      assert.equal(
+        (await database.acceptInteractiveSessionCommand({ ...next, principal: controller })).status,
+        "accepted",
+      );
+      assert.equal(
+        (
+          await database.acceptInteractiveSessionCommand({
+            ...next,
+            now: new Date(now.getTime() + 60_000),
+          })
+        ).status,
+        "accepted",
+      );
+    });
 
     it("two starts with one idempotency key create one session and one usage unit", async () => {
       const options = { ...start, maxActivePerDaemon: 1, usage: { periodStart, limit: 1 } };
@@ -647,6 +679,16 @@ export function interactiveSessionStoreContract(
       const retried = await database.claimInteractiveSessionCommand(claim);
       assert.equal(retried?.id, held.id);
       assert.equal(retried.attempts, held.attempts + 1);
+      const replay = await database.acceptInteractiveSessionCommand({
+        ...retry,
+        idempotencyKey: retry.idempotencyKey.toUpperCase(),
+      });
+      assert.equal(replay.status, "replayed");
+      assert.equal(replay.command.id, held.id);
+      assert.deepEqual(
+        await database.acceptInteractiveSessionCommand({ ...retry, commandId: randomUUID() }),
+        { status: "refused", code: "idempotency_conflict" },
+      );
       assert.equal((await usage())?.used, 1);
     });
 

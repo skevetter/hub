@@ -103,6 +103,7 @@ it.each(["off", "count", "on"] as const)("handles old message bodies in %s mode"
     delivery: "queue",
     message: "boundary body",
     maxQueued: 20,
+    maxMessagesPerMinute: 10,
     usage,
     bodyCutoff: null,
     now: cutoff,

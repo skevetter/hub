@@ -8,6 +8,7 @@ import {
   exhaustedControlState,
   finalDeliveryCode,
   retryMessagePatch,
+  sendRateCutoff,
   commandCapability,
   commandHash,
   commandLeaseEligible,
@@ -474,6 +475,12 @@ class MemoryDatabase implements Database {
       const refusal = commandRefusal(session, input);
       if (refusal) return refused(refusal);
       if (input.kind === "message") {
+        const cutoff = sendRateCutoff(input.now);
+        const recent = commands.filter(
+          (entry) =>
+            entry.kind === "message" && entry.authorUserId === userId && entry.createdAt > cutoff,
+        );
+        if (recent.length >= input.maxMessagesPerMinute) return refused("rate_limited");
         if (this.queuedMessageCount(session) >= input.maxQueued) return refused("queue_full");
         if (!(await this.consumeOrganizationUsage(sessionUsage(input.principal, input.usage))))
           return refused("usage_limit");
@@ -822,24 +829,50 @@ class MemoryDatabase implements Database {
     input: Extract<AcceptCommandInput, { kind: "retry" }>,
   ): AcceptCommandResult {
     const { session } = row;
-    if (!this.activeSessionDaemon(session)) return refused("daemon_unavailable");
-    const refusal = commandRefusal(session, input);
-    if (refusal) return refused(refusal);
     const userId = input.principal.userId;
+    const retryKey = input.idempotencyKey.toLowerCase();
+    const requestHash = commandHash(input);
+    const prior = this.interactiveAudit
+      .get(session.id)
+      ?.find(
+        (event) =>
+          event.action === "interactive_session.retry" &&
+          event.actorIdentity === userId &&
+          event.evidence["retryKey"] === retryKey,
+      );
+    if (prior && prior.evidence["requestHash"] !== requestHash)
+      return refused("idempotency_conflict");
+    if (!prior) {
+      if (!this.activeSessionDaemon(session)) return refused("daemon_unavailable");
+      const refusal = commandRefusal(session, input);
+      if (refusal) return refused(refusal);
+    }
     const command = this.interactiveCommands
       .get(session.id)!
       .find(
         (entry) =>
           entry.id === input.commandId.toLowerCase() &&
           entry.authorUserId === userId &&
-          entry.generation === session.generation,
+          entry.generation === input.generation,
       );
-    if (!command || !canRetryMessage(command, input.bodyCutoff)) return refused("not_retryable");
+    if (!command) return refused("not_retryable");
+    if (prior)
+      return {
+        status: "replayed",
+        ...structuredClone({ session, command: replayCommand(command, input.bodyCutoff) }),
+      };
+    if (!canRetryMessage(command, input.bodyCutoff)) return refused("not_retryable");
     if (this.queuedMessageCount(session) >= input.maxQueued) return refused("queue_full");
     Object.assign(command, retryMessagePatch(command, input.now));
     this.appendSessionEvents(row, session, input.now, [deliveryEvent(command)]);
     this.saveSessionAudit(
-      sessionAudit(session, userId, "retry", { commandId: command.id }, input.now),
+      sessionAudit(
+        session,
+        userId,
+        "retry",
+        { commandId: command.id, retryKey, requestHash },
+        input.now,
+      ),
     );
     return { status: "accepted", ...structuredClone({ session: row.session, command }) };
   }

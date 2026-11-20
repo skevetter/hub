@@ -4,6 +4,7 @@ export interface InteractiveSessionSettings {
   enabled: boolean;
   maxActivePerDaemon: number;
   maxQueued: number;
+  maxMessagesPerMinute: number;
 }
 
 export function readInteractiveSessionSettings(
@@ -18,6 +19,12 @@ export function readInteractiveSessionSettings(
     enabled: raw === "true",
     maxActivePerDaemon: readInteger(environment, "PASEO_HUB_SESSION_MAX_ACTIVE_PER_DAEMON", 4, 50),
     maxQueued: readInteger(environment, "PASEO_HUB_SESSION_MAX_QUEUED", 20, 100),
+    maxMessagesPerMinute: readInteger(
+      environment,
+      "PASEO_HUB_SESSION_MAX_MESSAGES_PER_MINUTE",
+      10,
+      600,
+    ),
   };
 }
 

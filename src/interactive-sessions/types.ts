@@ -43,6 +43,7 @@ export type RefusalCode =
   | "daemon_unavailable"
   | "active_limit"
   | "queue_full"
+  | "rate_limited"
   | "stale_generation"
   | "session_closed"
   | "session_failed"

@@ -206,6 +206,7 @@ export class InteractiveSessionCoordinator {
       bodyCutoff: this.bodyCutoff(now),
       kind: "message",
       maxQueued: this.options.settings.maxQueued,
+      maxMessagesPerMinute: this.options.settings.maxMessagesPerMinute,
     });
     return this.outcome(result, "message");
   }

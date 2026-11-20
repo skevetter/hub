@@ -38,6 +38,7 @@ import {
   commandHash,
   commandLeaseEligible,
   commandRefusal,
+  sendRateCutoff,
   deliveryEvent,
   messageEvent,
   messageRecord,
@@ -334,6 +335,18 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       const refusal = commandRefusal(session, input);
       if (refusal) return refused(refusal);
       if (input.kind === "message") {
+        const [recent] = await db
+          .select({ count: count() })
+          .from(commands)
+          .where(
+            and(
+              commandScope(session),
+              eq(commands.kind, "message"),
+              eq(commands.authorUserId, userId),
+              gt(commands.createdAt, sendRateCutoff(input.now)),
+            ),
+          );
+        if (recent!.count >= input.maxMessagesPerMinute) return refused("rate_limited");
         if ((await this.queuedMessageCount(db, session)) >= input.maxQueued)
           return refused("queue_full");
         if (!(await this.reserveUsage(tx, sessionUsage(input.principal, input.usage))))
@@ -857,10 +870,30 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
     session: SessionRecord,
     input: Extract<AcceptCommandInput, { kind: "retry" }>,
   ): Promise<AcceptCommandResult> {
-    if (!(await this.activeSessionDaemon(db, session))) return refused("daemon_unavailable");
-    const refusal = commandRefusal(session, input);
-    if (refusal) return refused(refusal);
     const userId = input.principal.userId;
+    const retryKey = input.idempotencyKey.toLowerCase();
+    const requestHash = commandHash(input);
+    const [prior] = await db
+      .select({ requestHash: sql<string>`${auditEvents.evidence}->>'requestHash'` })
+      .from(auditEvents)
+      .where(
+        and(
+          eq(auditEvents.organizationId, session.organizationId),
+          eq(auditEvents.subjectType, "interactive_session"),
+          eq(auditEvents.subjectId, session.id),
+          eq(auditEvents.actorKind, "user"),
+          eq(auditEvents.actorIdentity, userId),
+          eq(auditEvents.action, "interactive_session.retry"),
+          sql`${auditEvents.evidence}->>'retryKey' = ${retryKey}`,
+        ),
+      )
+      .limit(1);
+    if (prior && prior.requestHash !== requestHash) return refused("idempotency_conflict");
+    if (!prior) {
+      if (!(await this.activeSessionDaemon(db, session))) return refused("daemon_unavailable");
+      const refusal = commandRefusal(session, input);
+      if (refusal) return refused(refusal);
+    }
     const [original] = await db
       .select()
       .from(commands)
@@ -869,17 +902,27 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
           commandScope(session),
           eq(commands.id, input.commandId),
           eq(commands.authorUserId, userId),
-          eq(commands.generation, session.generation),
+          eq(commands.generation, input.generation),
           eq(commands.kind, "message"),
         ),
       )
       .for("update");
-    if (!original || !canRetryMessage(original, input.bodyCutoff)) return refused("not_retryable");
+    if (!original) return refused("not_retryable");
+    if (prior)
+      return { status: "replayed", session, command: replayCommand(original, input.bodyCutoff) };
+    if (!canRetryMessage(original, input.bodyCutoff)) return refused("not_retryable");
     if ((await this.queuedMessageCount(db, session)) >= input.maxQueued)
       return refused("queue_full");
     const command = await this.updateCommand(db, original, retryMessagePatch(original, input.now));
     const stored = await this.append(db, session, input.now, [deliveryEvent(command)]);
-    await this.audit(db, session, userId, "retry", { commandId: command.id }, input.now);
+    await this.audit(
+      db,
+      session,
+      userId,
+      "retry",
+      { commandId: command.id, retryKey, requestHash },
+      input.now,
+    );
     return { status: "accepted", session: stored, command };
   }
 

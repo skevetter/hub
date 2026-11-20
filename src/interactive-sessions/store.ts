@@ -87,6 +87,7 @@ export type AcceptCommandInput = {
       message: string;
       delivery: Delivery;
       maxQueued: number;
+      maxMessagesPerMinute: number;
       usage: UsageReservation;
     }
   | { kind: "retry"; commandId: string; maxQueued: number }
@@ -363,11 +364,14 @@ export function startHash(input: StartSessionInput, participants: readonly Parti
 }
 
 export function commandHash(input: AcceptCommandInput): string {
-  return hashRequest([
-    input.generation,
-    input.kind,
-    input.kind === "message" ? [input.delivery, input.message] : null,
-  ]);
+  const scope = [input.generation, input.kind];
+  if (input.kind === "message") return hashRequest([...scope, [input.delivery, input.message]]);
+  if (input.kind === "retry") return hashRequest([...scope, input.commandId.toLowerCase()]);
+  return hashRequest([...scope, null]);
+}
+
+export function sendRateCutoff(now: Date): Date {
+  return new Date(now.getTime() - 60_000);
 }
 
 function hashRequest(input: unknown[]): string {
