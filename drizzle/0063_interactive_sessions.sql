@@ -97,6 +97,7 @@ CREATE TABLE "interactive_sessions" (
 	"state" text NOT NULL,
 	"state_reason" text,
 	"generation" integer DEFAULT 1 NOT NULL,
+	"turn" integer DEFAULT 0 NOT NULL,
 	"daemon_agent_id" text,
 	"daemon_workspace_id" text,
 	"hub_seq" integer DEFAULT 0 NOT NULL,
@@ -114,6 +115,7 @@ CREATE TABLE "interactive_sessions" (
 	CONSTRAINT "interactive_sessions_closed_check" CHECK (("interactive_sessions"."state" = 'closed') = ("interactive_sessions"."closed_at" is not null))
 );
 --> statement-breakpoint
+CREATE UNIQUE INDEX "interactive_session_commands_id_session_org_unique" ON "interactive_session_commands" USING btree ("id","session_id","organization_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "interactive_session_profiles_id_org_unique" ON "interactive_session_profiles" USING btree ("id","organization_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "interactive_sessions_id_org_unique" ON "interactive_sessions" USING btree ("id","organization_id");--> statement-breakpoint
 ALTER TABLE "interactive_session_commands" ADD CONSTRAINT "interactive_session_commands_organization_id_organization_id_fk" FOREIGN KEY ("organization_id") REFERENCES "public"."organization"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
@@ -121,10 +123,12 @@ ALTER TABLE "interactive_session_commands" ADD CONSTRAINT "interactive_session_c
 ALTER TABLE "interactive_session_commands" ADD CONSTRAINT "interactive_session_commands_session_org_fk" FOREIGN KEY ("session_id","organization_id") REFERENCES "public"."interactive_sessions"("id","organization_id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "interactive_session_events" ADD CONSTRAINT "interactive_session_events_organization_id_organization_id_fk" FOREIGN KEY ("organization_id") REFERENCES "public"."organization"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "interactive_session_events" ADD CONSTRAINT "interactive_session_events_session_org_fk" FOREIGN KEY ("session_id","organization_id") REFERENCES "public"."interactive_sessions"("id","organization_id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "interactive_session_events" ADD CONSTRAINT "interactive_session_events_command_session_org_fk" FOREIGN KEY ("command_id","session_id","organization_id") REFERENCES "public"."interactive_session_commands"("id","session_id","organization_id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "interactive_session_participants" ADD CONSTRAINT "interactive_session_participants_organization_id_organization_id_fk" FOREIGN KEY ("organization_id") REFERENCES "public"."organization"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "interactive_session_participants" ADD CONSTRAINT "interactive_session_participants_user_id_user_id_fk" FOREIGN KEY ("user_id") REFERENCES "public"."user"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "interactive_session_participants" ADD CONSTRAINT "interactive_session_participants_added_by_user_id_user_id_fk" FOREIGN KEY ("added_by_user_id") REFERENCES "public"."user"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "interactive_session_participants" ADD CONSTRAINT "interactive_session_participants_session_org_fk" FOREIGN KEY ("session_id","organization_id") REFERENCES "public"."interactive_sessions"("id","organization_id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "interactive_session_participants" ADD CONSTRAINT "interactive_session_participants_member_org_fk" FOREIGN KEY ("organization_id","user_id") REFERENCES "public"."member"("organization_id","user_id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "interactive_session_profiles" ADD CONSTRAINT "interactive_session_profiles_organization_id_organization_id_fk" FOREIGN KEY ("organization_id") REFERENCES "public"."organization"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "interactive_session_profiles" ADD CONSTRAINT "interactive_session_profiles_created_by_user_id_user_id_fk" FOREIGN KEY ("created_by_user_id") REFERENCES "public"."user"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "interactive_session_profiles" ADD CONSTRAINT "interactive_session_profiles_daemon_org_fk" FOREIGN KEY ("daemon_id","organization_id") REFERENCES "public"."daemons"("id","organization_id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint

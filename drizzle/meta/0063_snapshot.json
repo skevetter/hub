@@ -1,5 +1,5 @@
 {
-  "id": "1be9942b-ce03-4dd4-9569-41d32b515d14",
+  "id": "7cf5046e-12fc-49a4-ae02-6eb059042f22",
   "prevId": "d7bcf476-cf7e-4fd4-8910-c69aec09e605",
   "version": "7",
   "dialect": "postgresql",
@@ -2716,6 +2716,33 @@
         }
       },
       "indexes": {
+        "interactive_session_commands_id_session_org_unique": {
+          "name": "interactive_session_commands_id_session_org_unique",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "session_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "organization_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "interactive_session_commands_ordinal_unique": {
           "name": "interactive_session_commands_ordinal_unique",
           "columns": [
@@ -2925,6 +2952,15 @@
           "columnsTo": ["id", "organization_id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
+        },
+        "interactive_session_events_command_session_org_fk": {
+          "name": "interactive_session_events_command_session_org_fk",
+          "tableFrom": "interactive_session_events",
+          "tableTo": "interactive_session_commands",
+          "columnsFrom": ["command_id", "session_id", "organization_id"],
+          "columnsTo": ["id", "session_id", "organization_id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {
@@ -3046,6 +3082,15 @@
           "tableTo": "interactive_sessions",
           "columnsFrom": ["session_id", "organization_id"],
           "columnsTo": ["id", "organization_id"],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "interactive_session_participants_member_org_fk": {
+          "name": "interactive_session_participants_member_org_fk",
+          "tableFrom": "interactive_session_participants",
+          "tableTo": "member",
+          "columnsFrom": ["organization_id", "user_id"],
+          "columnsTo": ["organization_id", "user_id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -3346,6 +3391,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": 1
+        },
+        "turn": {
+          "name": "turn",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "daemon_agent_id": {
           "name": "daemon_agent_id",

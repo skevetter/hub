@@ -1934,6 +1934,7 @@ export const interactiveSessions = pgTable(
     stateReason:
       text("state_reason").$type<import("../interactive-sessions/types.js").SessionStateReason>(),
     generation: integer().default(1).notNull(),
+    turn: integer().default(0).notNull(),
     daemonAgentId: text("daemon_agent_id"),
     daemonWorkspaceId: text("daemon_workspace_id"),
     hubSeq: integer("hub_seq").default(0).notNull(),
@@ -2010,6 +2011,11 @@ export const interactiveSessionParticipants = pgTable(
       foreignColumns: [interactiveSessions.id, interactiveSessions.organizationId],
       name: "interactive_session_participants_session_org_fk",
     }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.organizationId, table.userId],
+      foreignColumns: [members.organizationId, members.userId],
+      name: "interactive_session_participants_member_org_fk",
+    }).onDelete("cascade"),
     index("interactive_session_participants_org_user_idx").on(table.organizationId, table.userId),
     check(
       "interactive_session_participants_role_check",
@@ -2052,6 +2058,11 @@ export const interactiveSessionCommands = pgTable(
       foreignColumns: [interactiveSessions.id, interactiveSessions.organizationId],
       name: "interactive_session_commands_session_org_fk",
     }).onDelete("cascade"),
+    uniqueIndex("interactive_session_commands_id_session_org_unique").on(
+      table.id,
+      table.sessionId,
+      table.organizationId,
+    ),
     uniqueIndex("interactive_session_commands_ordinal_unique").on(table.sessionId, table.ordinal),
     uniqueIndex("interactive_session_commands_key_unique").on(
       table.sessionId,
@@ -2112,6 +2123,15 @@ export const interactiveSessionEvents = pgTable(
       columns: [table.sessionId, table.organizationId],
       foreignColumns: [interactiveSessions.id, interactiveSessions.organizationId],
       name: "interactive_session_events_session_org_fk",
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.commandId, table.sessionId, table.organizationId],
+      foreignColumns: [
+        interactiveSessionCommands.id,
+        interactiveSessionCommands.sessionId,
+        interactiveSessionCommands.organizationId,
+      ],
+      name: "interactive_session_events_command_session_org_fk",
     }).onDelete("cascade"),
     check(
       "interactive_session_events_kind_check",
