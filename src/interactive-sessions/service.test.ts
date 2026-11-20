@@ -57,6 +57,7 @@ describe("interactive session service", () => {
     state: "running" as const,
     stateReason: null,
     generation: 1,
+    turn: 2,
     daemonAgentId: "private-agent",
     daemonWorkspaceId: "private-workspace",
     hubSeq: 0,
@@ -149,10 +150,13 @@ describe("interactive session service", () => {
     coordinator,
     bus,
     pool,
+    bodyCutoff: () => null,
     connectionForDaemon: () => ({ validateAgentConfiguration: validate }),
   });
   const scope = { organizationSlug: "org", sessionId };
   const control = { ...scope, generation: 1, idempotencyKey: randomUUID() };
+
+  let findSession: MockInstance<typeof database.findInteractiveSession>;
 
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -163,7 +167,9 @@ describe("interactive session service", () => {
       rowCount: users.length,
     });
     save.mockResolvedValue(profile);
-    vi.spyOn(database, "findInteractiveSession").mockResolvedValue({ session, participants });
+    findSession = vi
+      .spyOn(database, "findInteractiveSession")
+      .mockResolvedValue({ session, participants });
     vi.spyOn(database, "findSessionProfile").mockResolvedValue(profile);
     vi.spyOn(database, "findDaemonForOrganization").mockResolvedValue({
       id: daemonId,
@@ -193,6 +199,7 @@ describe("interactive session service", () => {
       message: "not_found",
     });
     const snapshot = await service.snapshot(request("admin"), scope);
+    expect(snapshot.session.turn).toBe(2);
     expect(snapshot.capabilities).toMatchObject({ send: false, stop: true });
     expect(JSON.stringify(snapshot)).not.toMatch(/private-/);
     const admin = request("admin", "https://hub.test");
@@ -205,6 +212,47 @@ describe("interactive session service", () => {
       { organizationId, userId: "admin", role: "admin" },
       expect.objectContaining({ idempotencyKey: control.idempotencyKey }),
     );
+  });
+
+  it("denies a removed starter stop and close while an admin can still stop", async () => {
+    findSession.mockResolvedValue({
+      session,
+      participants: participants.filter(({ userId }) => userId !== session.startedByUserId),
+    });
+
+    const starter = request("controller", "https://hub.test");
+    await expect(service.snapshot(starter, scope)).rejects.toMatchObject({ message: "not_found" });
+    for (const kind of ["stop", "close"] as const) {
+      await expect(service.command(starter, { ...control, kind })).resolves.toEqual({
+        outcome: "refused",
+        code: "not_found",
+      });
+    }
+    expect(coordinator.stop).not.toHaveBeenCalled();
+    expect(coordinator.close).not.toHaveBeenCalled();
+
+    const admin = request("admin", "https://hub.test");
+    await expect(service.command(admin, { ...control, kind: "stop" })).resolves.toEqual(accepted);
+    expect(coordinator.stop).toHaveBeenCalledExactlyOnceWith(
+      { organizationId, userId: "admin", role: "admin" },
+      { sessionId, generation: control.generation, idempotencyKey: control.idempotencyKey },
+    );
+  });
+
+  it("refuses participant management by a starter demoted to viewer", async () => {
+    findSession.mockResolvedValue({
+      session,
+      participants: [{ ...participants[0]!, role: "viewer" }, participants[1]!],
+    });
+    const set = vi.spyOn(database, "setInteractiveSessionParticipant");
+    await expect(
+      service.participants(request("controller", "https://hub.test"), {
+        ...scope,
+        userId: "viewer",
+        role: null,
+      }),
+    ).resolves.toEqual({ outcome: "refused", code: "forbidden" });
+    expect(set).not.toHaveBeenCalled();
   });
 
   it("passes delivery, idempotency keys and replay through the coordinator and checks Origin first", async () => {

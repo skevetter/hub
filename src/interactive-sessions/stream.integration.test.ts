@@ -106,11 +106,13 @@ it("relays and reads assistant text without persisting it in session tables or a
       hasNewer: false,
     })),
   };
+  let bodyCutoff: Date | null = null;
   const service = new InteractiveSessionService({
     database,
     pool: runtime,
     auth,
     bus,
+    bodyCutoff: () => bodyCutoff,
     coordinator: {
       start: async (actor, input) => {
         const result = await database.startInteractiveSession({
@@ -118,6 +120,7 @@ it("relays and reads assistant text without persisting it in session tables or a
           principal: actor,
           usage: { periodStart: now, limit: 10 },
           maxActivePerDaemon: 4,
+          bodyCutoff,
           now,
         });
         if (result.status === "refused") return { outcome: "refused", code: result.code };
@@ -226,6 +229,25 @@ it("relays and reads assistant text without persisting it in session tables or a
     }
     expect(frames).toContain("event: message");
     expect(frames).toContain("event: agent");
+
+    bodyCutoff = new Date(now.getTime() + 1);
+    const expired = await service.snapshot(request, {
+      organizationSlug: organizationId,
+      sessionId,
+    });
+    expect(expired.messages[0]).toMatchObject({
+      commandId: accepted.commandId,
+      text: null,
+      expired: true,
+    });
+    const events = await service.streamEvents(principal, sessionId, 0, 10);
+    const message = events.find((event) => event.kind === "message");
+    if (message === undefined) throw new Error("Missing recorded message event");
+    await expect(service.streamEventData(principal, message)).resolves.toMatchObject({
+      commandId: accepted.commandId,
+      text: null,
+      expired: true,
+    });
 
     const viewerRequest = new Request(request.url + "&after=" + snapshot.hubSeq, {
       headers: { cookie: viewerId },

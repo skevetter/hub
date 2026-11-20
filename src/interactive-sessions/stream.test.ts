@@ -19,7 +19,7 @@ function state(seq: number): SessionEventRecord {
     commandId: null,
     at: now,
     seq,
-    data: { state: "running", stateReason: null, generation: 1 },
+    data: { state: "running", stateReason: null, generation: 1, turn: seq },
   };
 }
 
@@ -104,7 +104,9 @@ describe("interactive session stream", () => {
     rows.push(state(1), state(2), state(3));
     const reader = read(await open("1"));
     bus.publish(sessionId, agent(8));
-    expect(await reader.next()).toContain("id: 2\nevent: state");
+    const replay = await reader.next();
+    expect(replay).toContain("id: 2\nevent: state");
+    expect(replay).toContain('"turn":2');
     expect(await reader.next()).toContain("id: 3\nevent: state");
     expect(await reader.next()).toContain("id: 3:8:" + epoch);
     await reader.cancel();

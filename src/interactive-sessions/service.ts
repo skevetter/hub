@@ -133,7 +133,7 @@ interface ServiceOptions {
     daemonId: string,
   ): Pick<DaemonConnection, "history" | "validateAgentConfiguration"> | undefined;
   scrub?: TimelineScrubber;
-  bodyCutoff?: () => Date | null;
+  bodyCutoff: () => Date | null;
   now?: () => Date;
 }
 
@@ -180,7 +180,7 @@ export class InteractiveSessionService {
       principal.organizationId,
       session.id,
       { beforeOrdinal: null, limit: 50 },
-      this.options.bodyCutoff?.() ?? null,
+      this.options.bodyCutoff(),
     );
     const names = await this.userNames([
       session.startedByUserId,
@@ -418,7 +418,7 @@ export class InteractiveSessionService {
           principal.organizationId,
           event.sessionId,
           { beforeOrdinal: event.data.ordinal + 1, limit: 1 },
-          this.options.bodyCutoff?.() ?? null,
+          this.options.bodyCutoff(),
         );
         if (message?.commandId !== event.commandId) return undefined;
         return this.messageView(message, await this.userNames([message.authorUserId]));
@@ -550,6 +550,7 @@ export class InteractiveSessionService {
       state: session.state,
       stateReason: session.stateReason,
       generation: session.generation,
+      turn: session.turn,
       profile: { id: session.profileId, name: profile?.name ?? session.title },
       daemon: {
         id: session.daemonId,
