@@ -85,7 +85,11 @@ export class FakeAgents implements AgentConnection, AgentHistory {
     return () => listeners.delete(listener);
   }
 
-  emit(agentId: string, event: Extract<AgentEvent, { type: "agent_stream" }>["event"]) {
+  emit(
+    agentId: string,
+    event: Extract<AgentEvent, { type: "agent_stream" }>["event"],
+    cursor?: { seq: number; epoch: string },
+  ) {
     const agent = this.snapshots.get(agentId)!;
     if (
       event.type === "turn_completed" ||
@@ -95,7 +99,13 @@ export class FakeAgents implements AgentConnection, AgentHistory {
       agent.status = "idle";
     if (event.type === "turn_started") agent.status = "running";
     for (const listener of this.listeners.get(agentId) ?? []) {
-      listener({ type: "agent_stream", agentId, event, timestamp: new Date().toISOString() });
+      listener({
+        type: "agent_stream",
+        agentId,
+        event,
+        timestamp: new Date().toISOString(),
+        ...cursor,
+      });
     }
   }
 }
