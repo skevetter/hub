@@ -126,6 +126,14 @@ const ExecutionSessionRequestSchema = z.object({
       background: z.boolean().optional(),
     }),
     z.object({
+      type: z.literal("fetch_agent_timeline_request"),
+      requestId: z.string(),
+      agentId: z.string(),
+      direction: z.enum(["tail", "before", "after"]),
+      cursor: z.object({ epoch: z.string(), seq: z.number() }).optional(),
+      limit: z.number(),
+    }),
+    z.object({
       type: z.literal("fetch_agent_request"),
       requestId: z.string(),
       agentId: z.string(),
@@ -2232,7 +2240,19 @@ interface Enrollment {
   webSocketUrl: string;
   permissions: string[];
 }
+type TestTimelineItem =
+  | { type: "assistant_message"; text: string }
+  | { type: "user_message"; messageId: string; text: string }
+  | { type: "tool_call"; callId: string; name: string; status: "running" | "completed" };
+interface TestTimelineEntry {
+  item: TestTimelineItem;
+  timestamp: string;
+  seqStart: number;
+  seqEnd: number;
+}
+
 export class TestDaemon {
+  private readonly timeline = new Map<string, TestTimelineEntry[]>();
   timelineAgentIds: readonly string[] = [];
   private socket: WebSocket | undefined;
   private permissions: string[] = [];
@@ -2406,6 +2426,7 @@ export class TestDaemon {
       webSocketUrl.toString(),
     );
     for (const [agentId, agent] of this.agents) replacement.agents.set(agentId, agent);
+    for (const [agentId, entries] of this.timeline) replacement.timeline.set(agentId, entries);
     replacement.controls.push(...this.controls);
     replacement.createRequests = this.createRequests;
     replacement.omitSnapshotOnReconnect = this.omitSnapshotOnReconnect;
@@ -2555,6 +2576,25 @@ export class TestDaemon {
       },
     });
   }
+  emitTimeline(agentId: string, item: TestTimelineItem): void {
+    const entries = this.timeline.get(agentId) ?? [];
+    const seq = (entries.at(-1)?.seqEnd ?? 0) + 1;
+    const timestamp = new Date().toISOString();
+    entries.push({ item, timestamp, seqStart: seq, seqEnd: seq });
+    this.timeline.set(agentId, entries);
+    this.send({
+      type: "agent_stream",
+      payload: {
+        timestamp,
+        executionId: this.executionId(agentId),
+        agentId,
+        epoch: "test-epoch",
+        seq,
+        event: { type: "timeline", provider: "opencode", item },
+      },
+    });
+  }
+
   async outputs(agentId: string, content: string): Promise<void> {
     this.send({
       type: "agent_stream",
@@ -2694,6 +2734,10 @@ export class TestDaemon {
       });
       return;
     }
+    if (request.type === "fetch_agent_timeline_request") {
+      this.fetchTimeline(request);
+      return;
+    }
     if (request.type === "fetch_agent_request") {
       this.fetchAgent(request);
       return;
@@ -2792,6 +2836,42 @@ export class TestDaemon {
           ? "fetch_agents_response"
           : "agent.timeline.set_subscription.response",
       payload: { requestId: request.requestId },
+    });
+  }
+
+  private fetchTimeline(
+    request: Extract<FakeAgentRequest, { type: "fetch_agent_timeline_request" }>,
+  ) {
+    const epoch = "test-epoch";
+    const all = this.timeline.get(request.agentId) ?? [];
+    const cursor = request.cursor;
+    const eligible = all.filter(
+      ({ seqEnd }) =>
+        request.direction === "tail" ||
+        cursor === undefined ||
+        (request.direction === "before" ? seqEnd < cursor.seq : seqEnd > cursor.seq),
+    );
+    const entries =
+      request.direction === "after"
+        ? eligible.slice(0, request.limit)
+        : eligible.slice(-request.limit);
+    const position = (entry: TestTimelineEntry | undefined) =>
+      entry === undefined ? null : { epoch, seq: entry.seqEnd };
+    this.send({
+      type: "fetch_agent_timeline_response",
+      payload: {
+        requestId: request.requestId,
+        agentId: request.agentId,
+        epoch,
+        entries,
+        reset: false,
+        staleCursor: cursor !== undefined && cursor.epoch !== epoch,
+        gap: false,
+        startCursor: position(entries[0]),
+        endCursor: position(entries.at(-1)),
+        hasOlder: entries[0] !== undefined && entries[0].seqStart > 1,
+        hasNewer: (entries.at(-1)?.seqEnd ?? 0) < (all.at(-1)?.seqEnd ?? 0),
+      },
     });
   }
 

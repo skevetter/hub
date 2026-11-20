@@ -1,3 +1,4 @@
+import { readInteractiveSessionSettings } from "../../interactive-sessions/settings.js";
 import { readFile, writeFile } from "node:fs/promises";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
@@ -294,6 +295,8 @@ async function main(): Promise<void> {
     billing,
     ...providers,
     publicBaseUrl,
+    databaseQuery: databaseRuntime,
+    interactiveSessions: readInteractiveSessionSettings(process.env),
     completionTokenSecret: requiredEnvironment("PASEO_HUB_AUTH_SECRET"),
     async close() {
       await auth?.close();

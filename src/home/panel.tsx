@@ -23,6 +23,7 @@ import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
 import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "../daemons/handoff.js";
 import { queryState } from "../projects/panel-state.js";
+import { HomeSessionStart } from "../interactive-sessions/ui/new-session.js";
 import { useRouteTenant } from "../projects/context.js";
 import { deriveChecklist, type Checklist, type ChecklistStep } from "./checklist.js";
 import { finishHomeSetup, homeSnapshot, type HomeSnapshot } from "./functions.js";
@@ -46,17 +47,27 @@ export function HomePanel() {
       key={home.data.organization.id}
       data={home.data}
       operator={account.isInstanceOperator}
+      sessionsEnabled={account.features?.interactiveSessions === true}
     />
   );
 }
 
-function HomeView({ data, operator }: { data: HomeSnapshot; operator: boolean }) {
+function HomeView({
+  data,
+  operator,
+  sessionsEnabled,
+}: {
+  data: HomeSnapshot;
+  operator: boolean;
+  sessionsEnabled: boolean;
+}) {
   const [focusOnCompletion, setFocusOnCompletion] = useState(false);
   const base = `/o/${data.organization.slug}`;
   const unroutedCount = data.unrouted.reduce((total, { count }) => total + count, 0);
   return (
     <>
       <PageHeader title="Home" description={HOME_DESCRIPTION} focusOnMount={focusOnCompletion} />
+      {sessionsEnabled ? <HomeSessionStart organizationSlug={data.organization.slug} /> : null}
       {data.checklistCompletedAt === null ? (
         <HomeChecklist
           snapshot={data}

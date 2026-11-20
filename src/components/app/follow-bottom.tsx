@@ -1,7 +1,18 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "../ui/button.js";
 
-export function FollowBottom({ version, children }: { version: number; children: ReactNode }) {
+export function FollowBottom({
+  version,
+  children,
+  label = "Run timeline",
+  maxHeight,
+}: {
+  version: number;
+  children: ReactNode;
+  label?: string;
+  maxHeight?: string;
+}) {
+  const height = useMemo(() => (maxHeight === undefined ? undefined : { maxHeight }), [maxHeight]);
   const viewport = useRef<HTMLDivElement>(null);
   const following = useRef(true);
   const [behind, setBehind] = useState(false);
@@ -27,9 +38,10 @@ export function FollowBottom({ version, children }: { version: number; children:
       <div
         ref={viewport}
         onScroll={scroll}
-        className="max-h-96 overflow-y-auto"
+        className={maxHeight === undefined ? "max-h-96 overflow-y-auto" : "overflow-y-auto"}
+        style={height}
         role="region"
-        aria-label="Run timeline"
+        aria-label={label}
       >
         {children}
       </div>

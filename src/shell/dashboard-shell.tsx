@@ -7,6 +7,7 @@ import {
   Gauge,
   History,
   House,
+  MessagesSquare,
   Settings,
   ShieldCheck,
   SlidersHorizontal,
@@ -283,7 +284,12 @@ function AppSidebar({
         </SidebarMenu>
       </SidebarHeader>
       <SidebarContent>
-        <Destinations instance={instance} organization={organization} project={project} />
+        <Destinations
+          instance={instance}
+          organization={organization}
+          project={project}
+          sessionsEnabled={account.features?.interactiveSessions === true}
+        />
       </SidebarContent>
       <SidebarFooter>
         <SidebarMenu>
@@ -312,10 +318,12 @@ function Destinations({
   instance,
   organization,
   project,
+  sessionsEnabled,
 }: {
   instance: boolean;
   organization: { name: string; slug: string };
   project: { slug: string } | null;
+  sessionsEnabled: boolean;
 }) {
   if (instance) {
     return (
@@ -330,7 +338,10 @@ function Destinations({
     return (
       <NavigationGroup
         label="Organization"
-        items={destinations(`/o/${organization.slug}`, ORGANIZATION_SECTIONS)}
+        items={destinations(
+          `/o/${organization.slug}`,
+          sessionsEnabled ? ORGANIZATION_SECTIONS : ORGANIZATION_SECTIONS_WITHOUT_SESSIONS,
+        )}
       />
     );
   }
@@ -371,12 +382,16 @@ function destinations(base: string, sections: readonly SectionDestination[]): Na
 // behind Settings rather than competing with the surfaces an operator opens daily.
 const ORGANIZATION_SECTIONS: readonly SectionDestination[] = [
   { section: "home", label: "Home", icon: House },
+  { section: "sessions", label: "Sessions", icon: MessagesSquare, subtree: true },
   { section: "triggers", label: "Triggers", icon: Zap, subtree: true },
   { section: "activity", label: "Activity", icon: History },
   { section: "daemons", label: "Daemons", icon: Cpu },
   { section: "connections", label: "Connections", icon: Cable },
   { section: "settings", label: "Settings", icon: Settings, subtree: true },
 ];
+const ORGANIZATION_SECTIONS_WITHOUT_SESSIONS = ORGANIZATION_SECTIONS.filter(
+  ({ section }) => section !== "sessions",
+);
 const PROJECT_SECTIONS: readonly SectionDestination[] = [
   { section: "overview", label: "Overview", icon: Gauge },
   { section: "configuration", label: "Configuration", icon: SlidersHorizontal },

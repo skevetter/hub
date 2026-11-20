@@ -1,3 +1,5 @@
+import { useCallback } from "react";
+import { Button } from "../ui/button.js";
 import { FollowBottom } from "./follow-bottom.js";
 import { EmptyState } from "./empty-state.js";
 import { Spinner } from "./loading.js";
@@ -5,28 +7,13 @@ import { StatusLine } from "./status-line.js";
 import { StatusPill, statusLabel, type StatusTone } from "./status-pill.js";
 import { Skeleton } from "../ui/skeleton.js";
 
-export type DeliveryStatus = "delivered" | "queued" | "not_sent" | "unknown";
-export type ToolStatus = "running" | "completed" | "failed" | "canceled";
+import type { DeliveryStatus, ToolStatus, TranscriptItem } from "./transcript-types.js";
 
-/**
- * `seq` is the daemon's position for the entry. A Hub message the daemon has not yet echoed has
- * none: it is queued, unsent, or of unknown fate, and sits after everything the agent has said.
- */
-export type TranscriptItem = { id: string } & (
-  | {
-      kind: "human";
-      author: string;
-      /** `null` once the body has expired; the entry stays as a place marker. */
-      text: string | null;
-      status: DeliveryStatus;
-      seq: number | null;
-    }
-  | { kind: "assistant"; text: string; truncated: boolean; seq: number }
-  | { kind: "tool"; name: string; status: ToolStatus; seq: number }
-  | { kind: "boundary"; label: string; seq: number }
-);
+export type { DeliveryStatus, ToolStatus, TranscriptItem } from "./transcript-types.js";
 
 const DELIVERY: Record<DeliveryStatus, { tone: StatusTone; label: string }> = {
+  sending: { tone: "neutral", label: "Sending" },
+  failed: { tone: "danger", label: "Failed" },
   delivered: { tone: "success", label: "Delivered" },
   queued: { tone: "neutral", label: "Queued" },
   not_sent: { tone: "danger", label: "Not sent" },
@@ -58,12 +45,16 @@ export function Transcript({
   version,
   working = false,
   announcement = "",
+  onRetry,
+  retryBusy = false,
 }: {
   items: readonly TranscriptItem[];
   /** Moves whenever the feed changes, so a reader at the bottom follows and one above stays put. */
   version: number;
   working?: boolean;
   announcement?: string;
+  onRetry?: ((id: string) => void) | undefined;
+  retryBusy?: boolean;
 }) {
   const ordered = orderTranscript(items);
   return (
@@ -71,11 +62,11 @@ export function Transcript({
       {ordered.length === 0 && !working ? (
         <EmptyState title="No messages yet" description="Messages and agent replies appear here." />
       ) : (
-        <FollowBottom version={version}>
+        <FollowBottom version={version} label="Session transcript" maxHeight="min(55vh, 36rem)">
           <ul className="grid min-w-0 gap-4">
             {ordered.map((item) => (
               <li key={item.id} className="min-w-0">
-                <Entry item={item} />
+                <Entry item={item} onRetry={onRetry} retryBusy={retryBusy} />
               </li>
             ))}
             {working ? (
@@ -92,7 +83,16 @@ export function Transcript({
   );
 }
 
-function Entry({ item }: { item: TranscriptItem }) {
+function Entry({
+  item,
+  onRetry,
+  retryBusy,
+}: {
+  item: TranscriptItem;
+  onRetry: ((id: string) => void) | undefined;
+  retryBusy: boolean;
+}) {
+  const retry = useCallback(() => onRetry?.(item.id), [item.id, onRetry]);
   switch (item.kind) {
     case "human":
       return (
@@ -100,6 +100,17 @@ function Entry({ item }: { item: TranscriptItem }) {
           <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
             <span className="min-w-0 truncate">{item.author}</span>
             <StatusPill tone={DELIVERY[item.status].tone}>{DELIVERY[item.status].label}</StatusPill>
+            {item.retryable && onRetry !== undefined ? (
+              <Button
+                type="button"
+                size="xs"
+                variant="outline"
+                onClick={retry}
+                disabled={retryBusy}
+              >
+                Send again
+              </Button>
+            ) : null}
           </div>
           {item.text === null ? (
             <p className="text-sm text-muted-foreground">Message expired</p>

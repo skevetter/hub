@@ -1,10 +1,12 @@
 import {
   useCallback,
+  useId,
   useRef,
   useState,
   type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 
 import { Button } from "../ui/button.js";
@@ -86,6 +88,11 @@ export function Composer({
   disabledReason,
   error,
   initialDraft = "",
+  messageLabel = "Message",
+  primaryLabel = "Send",
+  placeholder,
+  hint,
+  secondaryAction,
   onSteer,
   onQueue,
   onStop,
@@ -94,14 +101,20 @@ export function Composer({
   /** A send is in flight. */
   busy?: boolean;
   /** The session cannot take messages at all; says why. */
-  disabledReason?: string;
-  error?: string;
+  disabledReason?: string | undefined;
+  error?: string | undefined;
   initialDraft?: string;
+  messageLabel?: string;
+  primaryLabel?: string;
+  placeholder?: string;
+  hint?: string | undefined;
+  secondaryAction?: ReactNode;
   /** In `idle` this is the one Send. */
   onSteer: (text: string) => Promise<boolean>;
   onQueue: (text: string) => Promise<boolean>;
   onStop?: () => void;
 }) {
+  const fieldId = useId();
   const [draft, setDraft] = useState(initialDraft);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const bytes = messageBytes(draft.trim());
@@ -140,7 +153,7 @@ export function Composer({
     },
     [primary.enabled, steer],
   );
-  const description = counterNote(used, disabledReason);
+  const description = counterNote(used, disabledReason) ?? hint;
 
   return (
     <form className="grid min-w-0 gap-3" onSubmit={onSubmit}>
@@ -148,8 +161,8 @@ export function Composer({
         <FailureAlert title="Message not sent" error={error} fallback="Message not sent." />
       )}
       <FormField
-        id="session-message"
-        label="Message"
+        id={fieldId}
+        label={messageLabel}
         {...(description === undefined ? {} : { description })}
         {...(over ? { error: OVER_LIMIT } : {})}
       >
@@ -158,6 +171,7 @@ export function Composer({
             {...control}
             ref={textarea}
             rows={3}
+            placeholder={placeholder}
             value={draft}
             disabled={locked}
             onChange={onChange}
@@ -168,7 +182,7 @@ export function Composer({
       <div className="flex flex-wrap items-center gap-2">
         {actions.mode === "single" ? (
           <Button type="submit" disabled={!actions.send.enabled}>
-            Send
+            {primaryLabel}
           </Button>
         ) : (
           <>
@@ -185,6 +199,7 @@ export function Composer({
             </Button>
           </>
         )}
+        {secondaryAction}
         {onStop === undefined ? null : (
           <Button type="button" variant="outline" onClick={onStop}>
             Stop
