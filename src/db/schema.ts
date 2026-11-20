@@ -1104,6 +1104,7 @@ export const organizations = pgTable("organization", {
   logo: text(),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   metadata: text(),
+  homeChecklistCompletedAt: timestamp("home_checklist_completed_at", { withTimezone: true }),
 });
 
 export const organizationConnectionAttempts = pgTable(

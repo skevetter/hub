@@ -4498,6 +4498,27 @@ class PgDatabase implements Database {
     };
   }
 
+  async getHomeChecklistCompletedAt(organizationId: string): Promise<Date | null> {
+    const result = await this.pool.query<{ home_checklist_completed_at: Date | null }>(
+      "select home_checklist_completed_at from organization where id = $1",
+      [organizationId],
+    );
+    return result.rows[0]?.home_checklist_completed_at ?? null;
+  }
+
+  async completeHomeChecklist(organizationId: string): Promise<Date> {
+    const result = await this.pool.query<{ home_checklist_completed_at: Date }>(
+      `update organization set home_checklist_completed_at = now()
+       where id = $1 and home_checklist_completed_at is null returning home_checklist_completed_at`,
+      [organizationId],
+    );
+    const completedAt =
+      result.rows[0]?.home_checklist_completed_at ??
+      (await this.getHomeChecklistCompletedAt(organizationId));
+    if (completedAt === null) throw new Error("organization is unavailable");
+    return completedAt;
+  }
+
   async organizationConnectionUsage(organizationId: string): Promise<OrganizationConnectionUsage> {
     const github = await query<{
       id: string;

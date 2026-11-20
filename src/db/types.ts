@@ -1767,6 +1767,8 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
     input: RecordConfigurationSyncAttemptInput,
   ): Promise<ConfigurationSyncAttemptRecord>;
   projectConfigurationReadModel(projectId: string): Promise<ProjectConfigurationReadModel>;
+  getHomeChecklistCompletedAt(organizationId: string): Promise<Date | null>;
+  completeHomeChecklist(organizationId: string): Promise<Date>;
   organizationConnectionUsage(organizationId: string): Promise<OrganizationConnectionUsage>;
   listGitHubRepositories(organizationId: string): Promise<GitHubRepositoryRecord[]>;
   findGitHubRepositoryForOrganization(

@@ -1,3 +1,4 @@
+import { ProductRequestError } from "../auth/organization-access.js";
 import type { AuthServer } from "../auth/server.js";
 import type {
   Database,
@@ -7,6 +8,7 @@ import type {
 } from "../db/types.js";
 import { resolveRouteTenant } from "../projects/access.js";
 import { projectTriggerForm } from "../triggers/configuration/editor.js";
+import { deriveChecklist } from "./checklist.js";
 
 /** How far back the overview looks. One week is long enough to hold a first run and short enough that a nudge fades once a trigger listens. */
 export const HOME_WINDOW_DAYS = 7;
@@ -14,6 +16,7 @@ const RUNS_SHOWN = 50;
 
 export interface HomeSnapshot {
   organization: { id: string; name: string; slug: string };
+  checklistCompletedAt: string | null;
   /** Whether any provider app (GitHub, Slack, Discord, Linear) is set up on this Hub at all. */
   appsConfigured: boolean;
   connections: readonly {
@@ -34,11 +37,6 @@ export interface HomeSnapshot {
   windowDays: number;
 }
 
-/**
- * Everything Home derives its checklist and overview from, read from records: nothing here is a
- * stored "onboarding" flag, so the checklist can only say what the organization has actually
- * done, and undoes itself when a daemon is revoked or a connection removed.
- */
 export class HomeDashboard {
   constructor(
     private readonly database: Database,
@@ -55,22 +53,48 @@ export class HomeDashboard {
     const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
       organizationSlug,
     });
-    const organizationId = tenant.organization.id;
+    return this.readSnapshot(tenant.organization);
+  }
+
+  async completeChecklist(request: Request, organizationSlug: string): Promise<string> {
+    if (this.auth.rejectCookieMutation(request) !== undefined)
+      throw new ProductRequestError(400, "invalid_origin");
+    const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+      organizationSlug,
+    });
+    if (!account.isInstanceOperator) throw new ProductRequestError(403, "forbidden");
+
+    const { organization } = tenant;
+    const completedAt = await this.database.getHomeChecklistCompletedAt(organization.id);
+    if (completedAt !== null) return completedAt.toISOString();
+
+    const snapshot = await this.readSnapshot(organization);
+    if (snapshot.checklistCompletedAt !== null) return snapshot.checklistCompletedAt;
+    if (!deriveChecklist(snapshot).complete)
+      throw new ProductRequestError(409, "checklist_incomplete");
+    return (await this.database.completeHomeChecklist(organization.id)).toISOString();
+  }
+
+  private async readSnapshot(organization: HomeSnapshot["organization"]): Promise<HomeSnapshot> {
+    const organizationId = organization.id;
     const since = new Date(this.now().getTime() - HOME_WINDOW_DAYS * 86_400_000);
     const triggers = await this.database.listOrganizationTriggers(organizationId);
-    const [connections, daemons, revisions, runs, unrouted] = await Promise.all([
-      this.database.organizationConnectionUsage(organizationId),
-      this.database.listDaemonsForOrganization(organizationId),
-      Promise.all(
-        triggers.map((trigger) =>
-          this.database.findOrganizationTriggerRevision(trigger.id, trigger.activeRevisionId),
+    const [connections, daemons, revisions, runs, unrouted, checklistCompletedAt] =
+      await Promise.all([
+        this.database.organizationConnectionUsage(organizationId),
+        this.database.listDaemonsForOrganization(organizationId),
+        Promise.all(
+          triggers.map((trigger) =>
+            this.database.findOrganizationTriggerRevision(trigger.id, trigger.activeRevisionId),
+          ),
         ),
-      ),
-      this.database.listOrganizationRunsSince(organizationId, since, RUNS_SHOWN),
-      this.database.countUnroutedProviderEventsSince(organizationId, since),
-    ]);
+        this.database.listOrganizationRunsSince(organizationId, since, RUNS_SHOWN),
+        this.database.countUnroutedProviderEventsSince(organizationId, since),
+        this.database.getHomeChecklistCompletedAt(organizationId),
+      ]);
     return {
-      organization: tenant.organization,
+      organization,
+      checklistCompletedAt: checklistCompletedAt?.toISOString() ?? null,
       appsConfigured: this.providerAppsConfigured(connections),
       connections: [
         ...connections.github.map(({ slug, accountLogin }) => ({

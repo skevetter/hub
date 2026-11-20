@@ -401,6 +401,13 @@ export class OrganizationTriggers {
     await this.yamlEditor().fill(yaml);
   }
 
+  async allowManualActor(actor: string) {
+    await this.switchToYaml();
+    const document = parseDocument(await this.yamlEditor().innerText());
+    document.setIn(["on", "manual.run", "filters", "from_users"], [actor]);
+    await this.replaceYaml(document.toString());
+  }
+
   async exerciseContinuity() {
     await expect(
       this.page.getByRole("radio", { name: "Same conversation", exact: true }),

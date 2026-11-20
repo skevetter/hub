@@ -958,6 +958,7 @@ class MemoryDatabase implements Database {
   private readonly slackConnections = new Map<string, SlackConnectionRecord>();
   private readonly linearConnections = new Map<string, LinearConnectionRecord>();
   private readonly organizationIds: Set<string>;
+  private readonly homeChecklistCompletions = new Map<string, Date>();
 
   constructor(private readonly options: MemoryDatabaseOptions = {}) {
     this.organizationIds = new Set(options.organizationIds);
@@ -4863,6 +4864,16 @@ class MemoryDatabase implements Database {
                 this.githubConfigurationSources.get(projectId)?.automaticDeploymentEnabled ?? false,
             } as const),
     };
+  }
+
+  async getHomeChecklistCompletedAt(organizationId: string): Promise<Date | null> {
+    return this.homeChecklistCompletions.get(organizationId) ?? null;
+  }
+
+  async completeHomeChecklist(organizationId: string): Promise<Date> {
+    const completedAt = this.homeChecklistCompletions.get(organizationId) ?? this.now();
+    this.homeChecklistCompletions.set(organizationId, completedAt);
+    return completedAt;
   }
 
   async organizationConnectionUsage(organizationId: string): Promise<OrganizationConnectionUsage> {

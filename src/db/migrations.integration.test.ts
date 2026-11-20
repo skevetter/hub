@@ -210,17 +210,25 @@ describe("database migration application", () => {
     const receiptMigration = await readFile(
       join(DRIZZLE_MIGRATIONS, "0059_run_payload_expiry_receipts.sql"),
     );
+    const checklistMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0060_home_checklist_completion.sql"),
+    );
     const database = await createDatabase(url);
     try {
       const migrated = await poolQuery<{ hash: string }>(
         url,
         "select hash from drizzle.__drizzle_migrations order by id",
       );
-      assert.equal(migrated.rowCount, baseline.rows.length + 1);
+      assert.equal(migrated.rowCount, baseline.rows.length + 2);
       assert.deepEqual(migrated.rows, [
         ...baseline.rows,
         { hash: createHash("sha256").update(receiptMigration).digest("hex") },
+        { hash: createHash("sha256").update(checklistMigration).digest("hex") },
       ]);
+      assert.deepEqual(
+        (await poolQuery(url, "select home_checklist_completed_at from organization")).rows,
+        [{ home_checklist_completed_at: null }],
+      );
       assert.deepEqual(
         (
           await poolQuery(
@@ -351,6 +359,10 @@ describe("database migration application", () => {
       join(DRIZZLE_MIGRATIONS, "0059_run_payload_expiry_receipts.sql"),
       "utf8",
     );
+    const checklistMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0060_home_checklist_completion.sql"),
+      "utf8",
+    );
     assert.deepEqual((await journal()).rows, [
       ...releasedJournal.rows,
       { hash: createHash("sha256").update(reporterMigration).digest("hex") },
@@ -358,6 +370,7 @@ describe("database migration application", () => {
       { hash: createHash("sha256").update(expiryMigration).digest("hex") },
       { hash: createHash("sha256").update(launchExpiryMigration).digest("hex") },
       { hash: createHash("sha256").update(receiptExpiryMigration).digest("hex") },
+      { hash: createHash("sha256").update(checklistMigration).digest("hex") },
     ]);
     const runs = await poolQuery(
       url,
@@ -427,7 +440,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 60);
+      assert.equal(journal.rowCount, 61);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",

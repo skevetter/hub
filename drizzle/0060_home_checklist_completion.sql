@@ -1,0 +1,1 @@
+ALTER TABLE "organization" ADD COLUMN "home_checklist_completed_at" timestamp with time zone;

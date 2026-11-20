@@ -1,17 +1,18 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop, eslint-plugin-react-perf/jsx-no-new-object-as-prop, eslint-plugin-react-perf/jsx-no-jsx-as-prop -- one screen binds one snapshot; a row's action and status are that row's own slots */
 /* oxlint-disable typescript-eslint/no-unsafe-type-assertion -- generated routes cannot express server-resolved organization URLs */
 import { useSnapshotQuery } from "../queries/index.js";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { Cpu, History, Sparkles } from "lucide-react";
 import { useState, type ReactNode } from "react";
 
 import { useActiveAccount } from "../auth/active-account.js";
-import { CardSkeleton } from "../components/app/card.js";
+import { Card, CardSkeleton } from "../components/app/card.js";
 import { CopyField } from "../components/app/copy-field.js";
 import { Disclosure } from "../components/app/disclosure.js";
 import { EmptyState } from "../components/app/empty-state.js";
-import { WarningAlert } from "../components/app/failure-alert.js";
+import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
 import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RelativeTime } from "../components/app/relative-time.js";
@@ -24,7 +25,7 @@ import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "../daemons/handoff.js
 import { queryState } from "../projects/panel-state.js";
 import { useRouteTenant } from "../projects/context.js";
 import { deriveChecklist, type Checklist, type ChecklistStep } from "./checklist.js";
-import { homeSnapshot, type HomeSnapshot } from "./functions.js";
+import { finishHomeSetup, homeSnapshot, type HomeSnapshot } from "./functions.js";
 
 const HOME_DESCRIPTION = "What to do next, and what has run.";
 const RECENT_RUNS_SHOWN = 5;
@@ -35,27 +36,25 @@ export function HomePanel() {
   const scope = { organizationSlug: tenant.organization.slug };
   const load = useServerFn(homeSnapshot);
   const snapshot = useSnapshotQuery({
-    queryKey: ["home", tenant.account.id, tenant.organization.id],
+    queryKey: ["home", tenant.organization.id, tenant.account.id],
     queryFn: () => load({ data: scope }),
   });
   const home = queryState<HomeSnapshot>(snapshot, "Overview unavailable", <HomeLoading />);
   if (!home.ok) return home.element;
   const data = home.data;
   const base = `/o/${data.organization.slug}`;
-  const checklist = deriveChecklist(data);
   const unroutedCount = data.unrouted.reduce((total, { count }) => total + count, 0);
   return (
     <>
       <PageHeader title="Home" description={HOME_DESCRIPTION} />
-      {/* Completing the last step is what collapses the list: the key remounts it with the
-          collapsed default, and every toggle before or after that is the reader's own. */}
-      <GetStarted
-        key={checklist.complete ? "complete" : "incomplete"}
-        checklist={checklist}
-        snapshot={data}
-        base={base}
-        operator={account.isInstanceOperator}
-      />
+      {data.checklistCompletedAt === null ? (
+        <HomeChecklist
+          key={data.organization.id}
+          snapshot={data}
+          base={base}
+          operator={account.isInstanceOperator}
+        />
+      ) : null}
       {unroutedCount === 0 ? null : (
         <WarningAlert
           standalone
@@ -139,7 +138,11 @@ export function HomePanel() {
         {data.daemons.length === 0 ? (
           <EmptyState
             title="No daemons"
-            description="Hub runs your triggers on machines you own. The checklist above has the command."
+            description={
+              data.checklistCompletedAt === null
+                ? "Hub runs your triggers on machines you own. The checklist above has the command."
+                : "Connect a daemon to run your triggers on a machine you own."
+            }
           />
         ) : (
           <RecordList label="Daemons">
@@ -177,11 +180,76 @@ function HomeLoading() {
   );
 }
 
-/**
- * The four steps between an empty organization and its first run, each with the one thing to do
- * next. Open until the last step is done, collapsed after, and always the reader's to toggle;
- * nothing about it is stored, so revoking the daemon reopens it truthfully.
- */
+function HomeChecklist({
+  snapshot,
+  base,
+  operator,
+}: {
+  snapshot: HomeSnapshot;
+  base: string;
+  operator: boolean;
+}) {
+  const checklist = deriveChecklist(snapshot);
+  if (checklist.complete) {
+    return <FinishSetup organization={snapshot.organization} operator={operator} />;
+  }
+  return <GetStarted checklist={checklist} snapshot={snapshot} base={base} operator={operator} />;
+}
+
+function FinishSetup({
+  organization,
+  operator,
+}: {
+  organization: HomeSnapshot["organization"];
+  operator: boolean;
+}) {
+  const queryClient = useQueryClient();
+  const finish = useServerFn(finishHomeSetup);
+  const completion = useMutation({
+    mutationFn: () => finish({ data: { organizationSlug: organization.slug } }),
+    onSuccess: async (result) => {
+      if (result.status !== "ok") return;
+      const queryKey = ["home", organization.id];
+      await queryClient.cancelQueries({ queryKey });
+      queryClient.setQueriesData<HomeSnapshot>({ queryKey }, (snapshot) =>
+        snapshot === undefined
+          ? undefined
+          : { ...snapshot, checklistCompletedAt: result.data.completedAt },
+      );
+    },
+  });
+  return (
+    <Section>
+      <Card
+        title="You are all set"
+        description={
+          operator ? "All four setup steps are complete." : "An instance operator can finish setup."
+        }
+        action={
+          operator ? (
+            <Button
+              disabled={completion.isPending}
+              aria-busy={completion.isPending}
+              onClick={() => completion.mutate()}
+            >
+              Finish setup
+            </Button>
+          ) : undefined
+        }
+      >
+        {completion.isError || completion.data?.status === "error" ? (
+          <FailureAlert
+            title="Setup could not be finished"
+            error={completion.error ?? completion.data}
+            fallback="Try finishing setup again."
+            focusOnArrival
+          />
+        ) : null}
+      </Card>
+    </Section>
+  );
+}
+
 function GetStarted({
   checklist,
   snapshot,
@@ -193,7 +261,7 @@ function GetStarted({
   base: string;
   operator: boolean;
 }) {
-  const [open, setOpen] = useState(!checklist.complete);
+  const [open, setOpen] = useState(true);
   const progress = `${String(checklist.completed)} of ${String(checklist.steps.length)} done`;
   // The address the reader reached this Hub at is the address their daemon has to be told. Home
   // is a route, so it can be rendered on the server, where there is no window: the command is
@@ -207,9 +275,7 @@ function GetStarted({
         onOpenChange={setOpen}
         title="Get started"
         description="Connect an app and a daemon, create a trigger, and run it."
-        status={
-          <StatusPill tone={checklist.complete ? "success" : "neutral"}>{progress}</StatusPill>
-        }
+        status={<StatusPill tone="neutral">{progress}</StatusPill>}
       >
         <RecordList label="Get started">
           {checklist.steps.map((step) => (

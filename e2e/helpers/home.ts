@@ -43,17 +43,18 @@ export class OrganizationHome {
     await expect(this.page.getByRole("button", { name: /Get started/u })).toContainText(progress);
   }
 
-  /** The list is hidden once every step is done; the header stays, and a click brings it back. */
-  async expectCollapsed() {
-    await expect(this.page.getByRole("list", { name: "Get started" })).toBeHidden();
+  allSet() {
+    return this.page.getByRole("heading", { name: "You are all set", exact: true });
   }
 
-  async toggle() {
-    await this.page.getByRole("button", { name: /Get started/u }).click();
+  finishSetup() {
+    return this.page.getByRole("button", { name: "Finish setup", exact: true });
   }
 
-  async expectExpanded() {
-    await expect(this.page.getByRole("list", { name: "Get started" })).toBeVisible();
+  async expectChecklistHidden() {
+    await expect(this.page.getByRole("button", { name: /Get started/u })).toHaveCount(0);
+    await expect(this.allSet()).toHaveCount(0);
+    await expect(this.finishSetup()).toHaveCount(0);
   }
 
   /** The command a row tells the reader to run, as rendered. */

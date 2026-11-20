@@ -15,7 +15,7 @@ test.describe.configure({ timeout: 180_000 });
 /**
  * The hosted journey the funnel loses people on, step by step: each step is done by the real
  * thing — a provider connection, a daemon over the wire, a saved trigger, a dispatched run — and
- * Home only ever repeats what those records say.
+ * Home reflects those records before the operator finishes setup.
  */
 test("walks a hosted organization from sign-in to its first run", async ({ hub, page }) => {
   await hub.signUpAs("owner", owner);
@@ -85,6 +85,7 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
       thinking: "high",
       prompt: "${{ paseo.prompt }}",
     });
+    await triggers.allowManualActor("phase-two-runner");
     await triggers.save("deploy");
     await home.open();
     await home.expectStep("Create a trigger", "Done");
@@ -93,25 +94,34 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await home.expectProgress("3 of 4 done");
   });
 
-  await test.step("the first run completes the list, which collapses and stays toggleable", async () => {
+  await test.step("the first run makes setup ready for an instance operator to finish", async () => {
     const apiKey = await hub.createRunApiKey("owner");
-    const run = await hub.runManualInput({
-      rawInput: "run it",
-      deliveryKey: "home-first-run",
-      apiKey,
+    const run = await page.request.post(`${hub.primaryApplication().origin}/api/v1/manual-runs`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      data: {
+        projectSlug: "default",
+        trigger: "deploy",
+        deliveryKey: "home-first-run",
+        input: "run it",
+      },
     });
-    expect(run.workflowStatus).toBe("running");
+    await expect(run).toBeOK();
+    expect(await run.json()).toMatchObject({ workflowStatus: "running" });
     await home.open();
-    await home.expectProgress("4 of 4 done");
-    await home.expectCollapsed();
+    await expect(home.allSet()).toBeVisible();
+    await expect(home.finishSetup()).toHaveCount(0);
     await home.expectRuns(1, "0 succeeded · 0 failed");
     await home.expectRecentRun("deploy", "Running");
+
+    await hub.grantOperator("owner");
+    await home.expectOpen();
+    await expect(home.finishSetup()).toBeVisible();
     await home.capture(`${SHOTS}/04-complete.png`);
-    await home.toggle();
-    await home.expectExpanded();
-    await home.expectStep("Run it", "Done");
+    await home.finishSetup().click();
+    await home.expectChecklistHidden();
     await home.reload();
-    await home.expectCollapsed();
+    await home.expectRecentRun("deploy", "Running");
+    await home.expectChecklistHidden();
   });
 });
 
