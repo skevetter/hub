@@ -363,6 +363,80 @@ export function interactiveSessionStoreContract(
       );
     });
 
+    it("a stale idle observation cannot claim a second queued message in the same turn", async () => {
+      const { session } = await started();
+      const scope = { organizationId: session.organizationId, sessionId: session.id };
+      const agent = { ...scope, generation: session.generation, agentId: "agent", now };
+      const claim = { ...scope, lane: "message" as const, leaseMs: 60_000, now };
+      const owner = "first-worker";
+      const settleDelivered = (commandId: string, attempts: number) =>
+        database.settleInteractiveSessionCommand({
+          ...scope,
+          commandId,
+          generation: agent.generation,
+          claimOwner: owner,
+          attempts,
+          status: "delivered",
+          now,
+        });
+
+      assert.ok(await database.bindInteractiveSessionAgent({ ...agent, workspaceId: "workspace" }));
+      const initial = await database.claimInteractiveSessionCommand({
+        ...claim,
+        owner,
+        agentIdle: false,
+      });
+      assert.ok(initial);
+      assert.ok(await settleDelivered(initial.id, initial.attempts));
+      assert.ok(
+        await database.applyInteractiveSessionState({
+          ...agent,
+          from: ["starting"],
+          to: "running",
+        }),
+      );
+
+      for (const message of ["first queued", "second queued"]) {
+        const queued = await database.acceptInteractiveSessionCommand({
+          ...command(session.id),
+          message,
+          delivery: "queue",
+        });
+        assert.equal(queued.status, "accepted");
+      }
+      assert.ok(
+        await database.applyInteractiveSessionState({ ...agent, from: ["running"], to: "idle" }),
+      );
+      const observedIdle =
+        (await database.findInteractiveSession(scope.organizationId, scope.sessionId))?.session
+          .state === "idle";
+      assert.ok(observedIdle);
+      assert.equal(
+        await database.claimInteractiveSessionCommand({ ...claim, owner, agentIdle: false }),
+        undefined,
+      );
+
+      const first = await database.claimInteractiveSessionCommand({
+        ...claim,
+        owner,
+        agentIdle: observedIdle,
+      });
+      assert.equal(first?.body, "first queued");
+      assert.ok(
+        await database.applyInteractiveSessionState({ ...agent, from: ["idle"], to: "running" }),
+      );
+      assert.ok(await settleDelivered(first.id, first.attempts));
+
+      const secondWorker = { ...claim, owner: "second-worker", agentIdle: observedIdle };
+      assert.equal(await database.claimInteractiveSessionCommand(secondWorker), undefined);
+
+      assert.ok(
+        await database.applyInteractiveSessionState({ ...agent, from: ["running"], to: "idle" }),
+      );
+      const second = await database.claimInteractiveSessionCommand(secondWorker);
+      assert.equal(second?.body, "second queued");
+    });
+
     it("stop prevents retries of an in-flight message with an unconfirmed outcome", async () => {
       const { session } = await started();
       const scope = { organizationId: session.organizationId, sessionId: session.id };

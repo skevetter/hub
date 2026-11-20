@@ -102,6 +102,7 @@ interface SessionScope {
 export interface ClaimCommandInput extends SessionScope {
   owner: string;
   leaseMs: number;
+  // A false hint blocks queued claims even when the stored state is idle.
   agentIdle: boolean;
   lane?: "message" | "control";
   bodyCutoff?: Date | null;
@@ -409,6 +410,7 @@ export function newCommand(
 }
 
 export const unsettledStatuses = ["pending", "queued", "dispatching", "unknown"] as const;
+// Cap delivery at five total attempts, including the initial send, to limit resends.
 export const maxDeliveryAttempts = 5;
 
 export function commandRefusal(
@@ -500,13 +502,14 @@ function canDispatchCommand(
 export function commandLeaseEligible(
   command: SessionCommandRecord,
   input: ClaimCommandInput,
+  sessionState: SessionState,
 ): boolean {
   return (
     (command.claimExpiresAt === null || command.claimExpiresAt <= input.now) &&
     (command.status === "pending" ||
       (command.status === "unknown" && command.failureCode !== "delivery_unconfirmed") ||
       command.status === "dispatching" ||
-      (command.status === "queued" && input.agentIdle))
+      (command.status === "queued" && sessionState === "idle" && input.agentIdle))
   );
 }
 

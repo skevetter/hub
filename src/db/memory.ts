@@ -554,7 +554,7 @@ class MemoryDatabase implements Database {
         return undefined;
       let claimed: SessionCommandRecord | undefined;
       for (const command of candidates) {
-        if (!commandLeaseEligible(command, input)) continue;
+        if (!commandLeaseEligible(command, input, session.state)) continue;
         const rights = this.sessionRights(row, command.authorUserId);
         const patch = claimPatch(command, input, rights);
         Object.assign(command, structuredClone(patch));

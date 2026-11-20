@@ -496,7 +496,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         )
       ) {
         for (const command of candidates) {
-          if (!commandLeaseEligible(command, input)) continue;
+          if (!commandLeaseEligible(command, input, session.state)) continue;
           const rights = await this.rights(db, session, command.authorUserId);
           const patch = claimPatch(command, input, rights);
           const updated = await this.updateCommand(db, command, patch);
