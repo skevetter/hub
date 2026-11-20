@@ -1,0 +1,1 @@
+CREATE INDEX "trigger_runs_organization_created_id_idx" ON "trigger_runs" USING btree ("organization_id","created_at" DESC NULLS LAST,"id" DESC NULLS LAST);

@@ -213,17 +213,21 @@ describe("database migration application", () => {
     const checklistMigration = await readFile(
       join(DRIZZLE_MIGRATIONS, "0060_home_checklist_completion.sql"),
     );
+    const activityOrderMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0061_trigger_runs_activity_order.sql"),
+    );
     const database = await createDatabase(url);
     try {
       const migrated = await poolQuery<{ hash: string }>(
         url,
         "select hash from drizzle.__drizzle_migrations order by id",
       );
-      assert.equal(migrated.rowCount, baseline.rows.length + 2);
+      assert.equal(migrated.rowCount, baseline.rows.length + 3);
       assert.deepEqual(migrated.rows, [
         ...baseline.rows,
         { hash: createHash("sha256").update(receiptMigration).digest("hex") },
         { hash: createHash("sha256").update(checklistMigration).digest("hex") },
+        { hash: createHash("sha256").update(activityOrderMigration).digest("hex") },
       ]);
       assert.deepEqual(
         (await poolQuery(url, "select home_checklist_completed_at from organization")).rows,
@@ -363,6 +367,10 @@ describe("database migration application", () => {
       join(DRIZZLE_MIGRATIONS, "0060_home_checklist_completion.sql"),
       "utf8",
     );
+    const activityOrderMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0061_trigger_runs_activity_order.sql"),
+      "utf8",
+    );
     assert.deepEqual((await journal()).rows, [
       ...releasedJournal.rows,
       { hash: createHash("sha256").update(reporterMigration).digest("hex") },
@@ -371,7 +379,17 @@ describe("database migration application", () => {
       { hash: createHash("sha256").update(launchExpiryMigration).digest("hex") },
       { hash: createHash("sha256").update(receiptExpiryMigration).digest("hex") },
       { hash: createHash("sha256").update(checklistMigration).digest("hex") },
+      { hash: createHash("sha256").update(activityOrderMigration).digest("hex") },
     ]);
+    assert.deepEqual(
+      (
+        await poolQuery<{ indexdef: string }>(
+          url,
+          "select indexdef from pg_indexes where indexname = 'trigger_runs_organization_created_id_idx'",
+        )
+      ).rows.length,
+      1,
+    );
     const runs = await poolQuery(
       url,
       "select payload_expired_at, payload_expiry_state, payload_summary from trigger_runs",
@@ -440,7 +458,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 61);
+      assert.equal(journal.rowCount, 62);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",

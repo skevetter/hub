@@ -499,6 +499,11 @@ export const triggerRuns = pgTable(
     ),
     index("trigger_runs_status_deadline_idx").on(table.status, table.deadlineAt),
     index("trigger_runs_project_created_idx").on(table.projectId, table.createdAt.desc()),
+    index("trigger_runs_organization_created_id_idx").on(
+      table.organizationId,
+      table.createdAt.desc(),
+      table.id.desc(),
+    ),
     index("trigger_runs_payload_expiry_idx")
       .on(table.completedAt, table.id)
       .where(

@@ -2574,6 +2574,7 @@ class PgDatabase implements Database {
       scopes.map(({ projectId }) => projectId),
       scopes.map(({ triggerName }) => triggerName ?? null),
     ];
+    // The null ordering matches the index; both columns are not null, so it changes no row order.
     const position = request.position;
     const after = position?.direction === "after";
     const rows = await query<ProjectActivityRunListRow & { page_created_at: string }>(
@@ -2591,7 +2592,8 @@ class PgDatabase implements Database {
               runs.created_at::text as page_created_at
        ${scoped}
        ${position === undefined ? "" : `and (runs.created_at, runs.id) ${after ? ">" : "<"} ($4::timestamptz, $5::uuid)`}
-       order by runs.created_at ${after ? "asc" : "desc"}, runs.id ${after ? "asc" : "desc"}
+       order by runs.created_at ${after ? "asc nulls first" : "desc nulls last"},
+                runs.id ${after ? "asc nulls first" : "desc nulls last"}
        limit $${position === undefined ? 4 : 6}`,
       position === undefined
         ? [...scopeParams, request.limit + 1]
