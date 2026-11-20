@@ -301,6 +301,23 @@ function fixture(database?: Database, drain?: () => Promise<void>) {
 }
 
 describe("run progress reporter", () => {
+  it("posts one stopped update without a failure or a routine duplicate edit", async () => {
+    const f = fixture();
+    const seeded = await f.seed();
+    f.start();
+    await f.clock.advanceTo(0);
+    await f.store.cancelTriggerRun(ORGANIZATION, seeded.run.id);
+    f.bus.publish(seeded.run.id, 1000);
+    await f.clock.advanceTo(180_000);
+    assert.deepEqual(
+      f.provider.requests.map(({ action }) => action),
+      ["create", "edit"],
+    );
+    assert.match(f.provider.requests[1]!.body, /stopped by a person/u);
+    assert.doesNotMatch(f.provider.requests[1]!.body, /Failed|run_failed/u);
+    assert.deepEqual(f.failures, []);
+  });
+
   it("coalesces 50 events, skips an identical body, caps regular edits and bypasses pacing for final", async () => {
     const f = fixture();
     const run = await f.seed();

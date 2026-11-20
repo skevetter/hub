@@ -272,6 +272,10 @@ export function createSlackTriggerProvider(options: {
       await addReaction(options.client, context.target, "white_check_mark");
       return null;
     },
+    async onWorkflowRunCanceled(context, reactionState) {
+      await removeReactionForPhase(options.client, context.target, reactionState);
+      return null;
+    },
     async onAgentExecutionFailed(context, _output, reason, reactionState) {
       await failWithNotice(
         options.client,

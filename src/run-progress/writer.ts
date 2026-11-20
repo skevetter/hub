@@ -779,7 +779,8 @@ export class MessageWriter {
     const { lease } = operation;
     const { database } = this.options;
     // An urgent compensation must not consume the scheduled settle.
-    const settleAt = new Date(now + SETTLE_MS);
+    const settleAt =
+      operation.run.status === "canceled" && !lease.repeatFinal ? null : new Date(now + SETTLE_MS);
     const result = await this.afterSend(lease, {
       ...this.successPatch(operation, now),
       state: "finished",
@@ -787,7 +788,8 @@ export class MessageWriter {
       repeatFinal: false,
     });
     if (result.row === undefined) return result;
-    await database.requestCompensation(lease.organizationId, lease.triggerRunId, settleAt);
+    if (settleAt !== null)
+      await database.requestCompensation(lease.organizationId, lease.triggerRunId, settleAt);
     if (lease.repeatFinal)
       await database.requestCompensation(
         lease.organizationId,

@@ -435,6 +435,13 @@
       "when": 1795156961039,
       "tag": "0061_trigger_runs_activity_order",
       "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1795162909602,
+      "tag": "0062_run_cancellation",
+      "breakpoints": true
     }
   ]
 }

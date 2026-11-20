@@ -6,8 +6,7 @@ import { join } from "node:path";
 import SwaggerParser from "@apidevtools/swagger-parser";
 import { describe, it } from "vitest";
 import { z } from "zod";
-import type { ApiKeyScope } from "../auth/api-key-contract.js";
-import type { OperationAuthenticator } from "../auth/operation-auth.js";
+import type { OperationAuthenticator, OperationScope } from "../auth/operation-auth.js";
 import { DatabaseUnavailableError } from "../db/errors.js";
 import type { PublicOperations } from "../public-operations/index.js";
 import {
@@ -42,6 +41,40 @@ const authorization = {
 };
 
 describe("public API interface", () => {
+  it("routes Stop by run ID and returns 403 when the caller cannot stop it", async () => {
+    const id = randomUUID();
+    const api = createPublicApi(
+      { status: "enabled", authenticator: authenticator() },
+      {
+        ...successfulOperations(),
+        async stopRun(access, runId) {
+          assert.equal(access.organizationId, authorization.organizationId);
+          assert.equal(runId, id);
+          return { status: "forbidden" };
+        },
+      },
+    );
+    const response = await api.handle(request(`/api/v1/runs/${id}/stop`, { contentType: false }));
+    assert.equal(response.status, 403);
+
+    const stopApi = createPublicApi(
+      { status: "enabled", authenticator: authenticator() },
+      {
+        ...successfulOperations(),
+        stopRun: async () => ({ status: "stopped", runId: id, runStatus: "canceled" }),
+      },
+    );
+    const stopped = await stopApi.handle(
+      request(`/api/v1/runs/${id}/stop`, { contentType: false }),
+    );
+    assert.equal(stopped.status, 200);
+    assert.deepEqual(await stopped.json(), {
+      runId: id,
+      status: "canceled",
+      note: "If the daemon was offline, Hub will retry cleanup when it reconnects.",
+    });
+  });
+
   it("rejects an enabled composition without application operations", () => {
     assert.throws(
       () => createPublicApi({ status: "enabled", authenticator: authenticator() }, null),
@@ -336,6 +369,7 @@ describe("generated public OpenAPI", () => {
       "/api/v1/manual-runs",
       "/api/v1/projects",
       "/api/v1/runs/{id}/events",
+      "/api/v1/runs/{id}/stop",
       "/api/v1/setup-resources",
       "/api/v1/triggers",
       "/api/v1/triggers/install",
@@ -361,6 +395,7 @@ describe("generated public OpenAPI", () => {
         "runs:dispatch",
         ["200", "400", "401", "403", "404", "409", "413", "500", "503"],
       ],
+      "/api/v1/runs/{id}/stop": ["runs:stop", ["200", "400", "401", "403", "404", "500", "503"]],
       "/api/v1/hooks/{trigger}": [
         "events:send",
         [
@@ -469,7 +504,7 @@ function authenticator(
 ): OperationAuthenticator {
   return {
     reauthorize: async () => outcome === "authorized",
-    authorize(_request: Request, requiredScope: ApiKeyScope) {
+    authorize(_request: Request, requiredScope: OperationScope) {
       if (outcome === "unavailable") return Promise.reject(new DatabaseUnavailableError());
       if (outcome !== "authorized") return Promise.resolve({ status: outcome });
       return Promise.resolve({

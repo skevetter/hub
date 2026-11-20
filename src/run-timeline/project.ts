@@ -15,12 +15,14 @@ const STEP_STATUSES: Readonly<Record<string, true>> = {
   succeeded: true,
   failed: true,
   timed_out: true,
+  canceled: true,
   skipped: true,
 };
 const RUN_STATUSES: Readonly<Record<string, true>> = {
   succeeded: true,
   failed: true,
   timed_out: true,
+  canceled: true,
 };
 const TOOL_STATUSES: Readonly<Record<string, true>> = {
   completed: true,
@@ -118,6 +120,7 @@ function validStepCounts(steps: TimelineStepCounts | null | undefined): boolean 
     count(steps.failed) &&
     count(steps.timed_out) &&
     count(steps.skipped) &&
+    (steps.canceled === undefined || count(steps.canceled)) &&
     count(steps.not_run) &&
     count(steps.total)
   );
@@ -158,7 +161,8 @@ function runFinished(
     return undefined;
   if (input.failure != null && typeof input.failure !== "string") return undefined;
   const steps = input.steps;
-  const terminal = steps.succeeded + steps.failed + steps.timed_out + steps.skipped;
+  const terminal =
+    steps.succeeded + steps.failed + steps.timed_out + steps.skipped + (steps.canceled ?? 0);
   if (terminal + steps.not_run !== steps.total || input.stepRowsOmitted > terminal)
     return undefined;
   const data: TimelineData = {
@@ -169,6 +173,7 @@ function runFinished(
       failed: steps.failed,
       timed_out: steps.timed_out,
       skipped: steps.skipped,
+      ...(steps.canceled === undefined ? {} : { canceled: steps.canceled }),
       not_run: steps.not_run,
       total: steps.total,
     },

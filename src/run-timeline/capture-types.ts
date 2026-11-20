@@ -16,6 +16,7 @@ export interface TimelineStepCounts {
   failed: number;
   timed_out: number;
   skipped: number;
+  canceled?: number;
   not_run: number;
   total: number;
 }
@@ -28,7 +29,7 @@ export type TimelineProjectionInput =
   | { kind: "step_started"; type: "agent" | "script"; agent?: { provider: string; mode?: string } }
   | {
       kind: "step_finished";
-      status: "succeeded" | "failed" | "timed_out" | "skipped";
+      status: "succeeded" | "failed" | "timed_out" | "skipped" | "canceled";
       durationMs: number;
       exitCode?: number | null;
       completion?: "inferred_from_turn_end";
@@ -36,7 +37,7 @@ export type TimelineProjectionInput =
     }
   | {
       kind: "run_finished";
-      status: "succeeded" | "failed" | "timed_out";
+      status: "succeeded" | "failed" | "timed_out" | "canceled";
       durationMs: number;
       failure?: string | null;
       steps: TimelineStepCounts;

@@ -13,6 +13,7 @@ export const OBSERVED_DATABASE_METHODS = [
   "markWorkflowStepSkipped",
   "failWorkflowRun",
   "succeedTriggerRun",
+  "cancelTriggerRun",
   "recoverWorkflowDeadlines",
 ] as const satisfies readonly (keyof Database)[];
 
@@ -128,6 +129,10 @@ export function createObservedDatabase(
       after(database.failWorkflowRun(...args), (result) => reconcile(scopeFor(result?.run))),
     succeedTriggerRun: (id) =>
       after(database.succeedTriggerRun(id), (result) => reconcile(scopeFor(result?.run))),
+    cancelTriggerRun: (...args) =>
+      after(database.cancelTriggerRun(...args), (result) => {
+        if (result?.transitioned) reconcile(scopeFor(result.run));
+      }),
     recoverWorkflowDeadlines: (now) =>
       after(database.recoverWorkflowDeadlines(now), (recoveries) => {
         for (const recovery of recoveries) {

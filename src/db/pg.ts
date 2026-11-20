@@ -195,7 +195,7 @@ const EXECUTION_RUN_OWNERS = `select run.payload_expiry_state from trigger_runs 
       and run.id::text = execution.launch_intent ->> 'triggerRunId'))
     and run.organization_id = execution.organization_id and run.project_id = execution.project_id)`;
 
-const EXECUTION_INSERT_OWNERS = `select run.payload_expiry_state from trigger_runs run
+const EXECUTION_INSERT_OWNERS = `select run.payload_expiry_state, run.status from trigger_runs run
   where run.id = (select trigger_run_id from workflow_step_runs where id = $15)
     or ($15::uuid is null and $14::jsonb ->> 'kind' = 'launch_machine' and run.id::text = $14::jsonb ->> 'triggerRunId'
       and run.organization_id = $2 and run.project_id = $3)
@@ -452,7 +452,11 @@ class PgDatabase implements Database {
   async findTriggerRunForOrganization(organizationId: string, runId: string) {
     const rows = await query<TriggerRunRow>(
       this.pool,
-      `select * from trigger_runs where organization_id = $1 and id = $2`,
+      `select run.*, receipt.started_by_user_id
+       from trigger_runs run
+       join provider_event_receipts receipt on receipt.id = run.provider_event_receipt_id
+         and receipt.organization_id = run.organization_id
+       where run.organization_id = $1 and run.id = $2`,
       [organizationId, runId],
     );
     return rows.rows[0] === undefined ? undefined : toTriggerRunRecord(rows.rows[0]);
@@ -760,7 +764,7 @@ class PgDatabase implements Database {
                  $17, $18
           from projects
           where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
-            and not exists (select 1 from owners where payload_expiry_state is not null)
+            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
             and exists (
               select 1 from project_configuration_revisions
               where id = $10 and project_id = $3 and organization_id = $2
@@ -848,7 +852,7 @@ class PgDatabase implements Database {
                  $17
           from projects
           where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
-            and not exists (select 1 from owners where payload_expiry_state is not null)
+            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
             and exists (
               select 1 from project_configuration_revisions
               where id = $10 and project_id = $3 and organization_id = $2
@@ -1280,7 +1284,10 @@ class PgDatabase implements Database {
   ) {
     try {
       return await this.pool.transaction(async (client) => {
-        if ((await client.query(OPEN_STEP_RUN, [stepRunId])).rowCount === 0) {
+        const open = await client.query<{ status: TriggerRunRecord["status"] }>(OPEN_STEP_RUN, [
+          stepRunId,
+        ]);
+        if (open.rows[0] === undefined || open.rows[0].status === "canceled") {
           const current = await client.query<WorkflowStepRunRow>(
             `select ${STEP_PAYLOAD_PROJECTION} from workflow_step_runs step
              join trigger_runs run on run.id = step.trigger_run_id where step.id = $1`,
@@ -1401,9 +1408,12 @@ class PgDatabase implements Database {
         const execution = executionRows.rows[0];
         if (execution === undefined)
           throw new Error(`agent execution not found: ${input.executionId}`);
-        if (run.payload_expiry_state != null) {
+        if (run.payload_expiry_state != null || run.status === "canceled") {
           return {
-            execution: toAgentExecutionRecord({ ...execution, payload_hidden: true }),
+            execution: toAgentExecutionRecord({
+              ...execution,
+              payload_hidden: run.payload_expiry_state != null,
+            }),
             transitioned: false,
           };
         }
@@ -1567,6 +1577,58 @@ class PgDatabase implements Database {
        where run.payload_expiry_state is null and (${PENDING_SCRIPT_CLEANUP_SQL})`,
     );
     return rows.rows.map(toWorkflowStepRunRecord);
+  }
+
+  async cancelTriggerRun(organizationId: string, triggerRunId: string) {
+    try {
+      return await this.pool.transaction(async (client) => {
+        const updated = await client.query<TriggerRunRow>(
+          `update trigger_runs set status = 'canceled', completed_at = now(),
+             terminal_notification_pending_at = now(), terminal_notification_lease_expires_at = null
+           where organization_id = $1 and id = $2 and status = 'running' returning *`,
+          [organizationId, triggerRunId],
+        );
+        const run = updated.rows[0];
+        if (run === undefined) {
+          const current = await client.query<TriggerRunRow>(
+            `select * from trigger_runs where organization_id = $1 and id = $2`,
+            [organizationId, triggerRunId],
+          );
+          return current.rows[0] === undefined
+            ? undefined
+            : { run: toTriggerRunRecord(current.rows[0]), transitioned: false, executionIds: [] };
+        }
+        await client.query(
+          `update workflow_step_runs
+           set status = case when status = 'running' then 'canceled' else 'skipped' end,
+               completed_at = $2
+           where trigger_run_id = $1 and status in ('pending', 'running')`,
+          [run.id, run.completed_at],
+        );
+        const executions = await client.query<{ id: string }>(
+          `update agent_executions
+           set status = 'failed', completed_at = $2, idle_deadline_at = null,
+               result = '{"status":"canceled"}',
+               hub_action = case when daemon_id is not null then 'interrupt' end,
+               hub_action_completed_at = null
+           where status in ('spawning', 'running') and id in (
+             select execution_id from trigger_runs run
+             cross join lateral (${runExecutions("run", "execution.id as execution_id")}) linked
+             where run.id = $1
+           )
+           returning id`,
+          [run.id, run.completed_at],
+        );
+        await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [run.id]);
+        return {
+          run: toTriggerRunRecord(run),
+          transitioned: true,
+          executionIds: executions.rows.map(({ id }) => id),
+        };
+      });
+    } catch (error) {
+      throw toDatabaseError(error);
+    }
   }
 
   async succeedTriggerRun(triggerRunId: string) {
@@ -5264,6 +5326,7 @@ export interface ProviderEventReceiptRow extends QueryRow {
 }
 
 interface TriggerRunRow extends QueryRow {
+  started_by_user_id?: string | null;
   payload_expiry_state: TriggerRunRecord["payloadExpiryState"];
   payload_expired_at: Date | null;
   payload_summary: TriggerRunRecord["payloadSummary"];
@@ -5404,6 +5467,7 @@ export function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
 
 function toRunEvidence(row: TriggerRunRow, expired: boolean) {
   return {
+    ...(row.started_by_user_id == null ? {} : { startedByUserId: row.started_by_user_id }),
     payloadExpiredAt: row.payload_expired_at,
     payloadExpiryState: row.payload_expiry_state ?? null,
     payloadSummary: row.payload_summary ?? null,
@@ -6288,7 +6352,7 @@ async function wakeWorkflowRun(
 ): Promise<void> {
   await client.query(
     `insert into workflow_wakeups (trigger_run_id, available_at, lease_expires_at)
-     select id, $2, null from trigger_runs where id = $1 and payload_expiry_state is null for share
+     select id, $2, null from trigger_runs where id = $1 and payload_expiry_state is null and status <> 'canceled' for share
      on conflict (trigger_run_id) do update
      set available_at = least(workflow_wakeups.available_at, excluded.available_at),
          lease_expires_at = null`,
@@ -6297,7 +6361,9 @@ async function wakeWorkflowRun(
 }
 
 function isTerminalWorkflowStepStatus(status: WorkflowStepRunRow["status"]): boolean {
-  return status === "succeeded" || status === "failed" || status === "timed_out";
+  return (
+    status === "succeeded" || status === "failed" || status === "timed_out" || status === "canceled"
+  );
 }
 
 interface GitHubConfigurationTargetRow extends GitHubRepositoryRow {

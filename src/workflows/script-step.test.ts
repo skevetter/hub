@@ -55,7 +55,7 @@ interface Fixture {
   receiptId: string;
 }
 
-async function fixture(document = DOCUMENT): Promise<Fixture> {
+async function fixture(document = DOCUMENT, startedByUserId?: string): Promise<Fixture> {
   const database = createMemoryDatabase({ organizationIds: ["org-1"] });
   const entitlements = new EntitlementsService(database, { seats: async () => 0 });
   await entitlements.stamp("org-1", UNLIMITED_TEMPLATE, { source: "provisioning", planId: null });
@@ -85,6 +85,7 @@ async function fixture(document = DOCUMENT): Promise<Fixture> {
     projectId: project.id,
     deliveryId: randomUUID(),
     source: "manual.run",
+    ...(startedByUserId === undefined ? {} : { startedByUserId }),
     payload: {},
     receivedAt: new Date(),
   });
@@ -831,6 +832,33 @@ describe("script step output and deadlines", () => {
 });
 
 describe("script terminal cleanup", () => {
+  it("lets a starter stop a running script through its watcher and rejects another member", async () => {
+    const context = await fixture(DOCUMENT, "starter");
+    const daemon = new FakeTerminalDaemon();
+    const { handler, engine } = engineFor(context, {
+      scriptRunner: createScriptStepRunner(() => ({ terminals: daemon.client })),
+    });
+    try {
+      await handler(context.trigger);
+      await engine.processAvailable();
+      const run = await onlyRun(context);
+      const scope = { organizationId: run.organizationId, userId: "person" };
+      const denied = await engine.stopRun({ ...scope, role: "member" }, run.id);
+      assert.equal(denied.status, "forbidden");
+      assert.equal((await onlyRun(context)).status, "running");
+      assert.deepEqual(daemon.killAttempts, []);
+      const starter = { ...scope, userId: "starter", role: "member" } as const;
+      const stopped = await engine.stopRun(starter, run.id);
+      assert.deepEqual(stopped, { status: "stopped", runId: run.id, runStatus: "canceled" });
+      assert.equal((await onlyStep(context)).status, "canceled");
+      assert.deepEqual(daemon.killed, ["terminal-1"]);
+      assert.deepEqual(await engine.stopRun(starter, run.id), stopped);
+      assert.deepEqual(daemon.killed, ["terminal-1"]);
+    } finally {
+      await engine.stop();
+    }
+  });
+
   it("records a stop the daemon never confirmed, and the sweep finishes it on reconnect", async () => {
     const context = await fixture();
     const daemon = new FakeTerminalDaemon();

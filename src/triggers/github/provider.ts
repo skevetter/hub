@@ -212,6 +212,14 @@ export function createGitHubTriggerProvider(options: {
     async onAgentExecutionCompleted(triggerContext, _outputContext, _result, reactionState) {
       return reactToLifecycle(options.reactions, triggerContext, "+1", reactionState);
     },
+    async onWorkflowRunCanceled(triggerContext, reactionState) {
+      await deletePreviousReaction(
+        options.reactions,
+        triggerContext,
+        githubReactionId(reactionState),
+      );
+      return null;
+    },
     async onAgentExecutionFailed(triggerContext, _outputContext, reason, reactionState) {
       if (isExecutionLimitDenial(reason) && triggerContext.event.github.item?.number != null) {
         if (options.comments === undefined) throw new Error("GitHub comment client unavailable");

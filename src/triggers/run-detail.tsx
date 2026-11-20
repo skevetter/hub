@@ -1,8 +1,9 @@
 import { useMemo } from "react";
 import { useServerFn } from "@tanstack/react-start";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
-import { FailureAlert, NoticeAlert } from "../components/app/failure-alert.js";
+import { FailureAlert, NoticeAlert, type Failure } from "../components/app/failure-alert.js";
+import { ConfirmAction } from "../components/app/confirm-action.js";
 import { FollowBottom } from "../components/app/follow-bottom.js";
 import { Duration } from "../components/app/duration.js";
 import { PageHeader } from "../components/app/page.js";
@@ -13,9 +14,10 @@ import { SummaryPanel } from "../components/app/summary-panel.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { useRouteTenant } from "../projects/context.js";
 import { useSnapshotQuery } from "../queries/index.js";
-import { runDetailSnapshot } from "./functions.js";
+import { runDetailSnapshot, stopRun } from "./functions.js";
 import type { RunConnection, RunDetailSnapshot, RunEventPage } from "./run-events.js";
 import { RunSteps } from "./run-steps.js";
+import { CANCELED_RUN_NOTE } from "./run-stop.js";
 import { activityCounts, timelineRows, type TimelineRow } from "./run-timeline-view.js";
 import { runDetailKey, useRunEvents } from "./use-run-events.js";
 import { runReadClock, runReadResult } from "./run-read.js";
@@ -90,17 +92,48 @@ function LiveRunDetail({
     initial: detail.timeline,
     initialSequence,
   });
-  return <RunDetailView detail={detail} timeline={state} connection={state.connection} />;
+  const queryClient = useQueryClient();
+  const sendStop = useServerFn(stopRun);
+  const stop = useMutation({
+    mutationFn: () => sendStop({ data: { organizationSlug, runId: detail.run.id } }),
+    onSuccess: async (result) => {
+      if (result.status === "ok")
+        await queryClient.invalidateQueries({
+          queryKey: runDetailKey(organizationSlug, detail.run.id),
+        });
+    },
+  });
+  const stoppedStatus = stop.data?.status === "ok" ? stop.data.data.status : undefined;
+  const timeline = useMemo(
+    () => (stoppedStatus === undefined ? state : { ...state, status: stoppedStatus }),
+    [state, stoppedStatus],
+  );
+  return (
+    <RunDetailView
+      detail={detail}
+      timeline={timeline}
+      connection={state.connection}
+      stopBusy={stop.isPending}
+      onStop={stop.mutate}
+      stopError={stop.data?.status === "error" ? stop.data : stop.error}
+    />
+  );
 }
 
 export function RunDetailView({
   detail,
   timeline = detail.timeline,
   connection = null,
+  stopBusy,
+  onStop,
+  stopError,
 }: {
   detail: RunDetailSnapshot;
   timeline?: RunEventPage;
   connection?: RunConnection;
+  stopBusy?: boolean;
+  onStop?: () => void;
+  stopError?: Failure;
 }) {
   const { run } = detail;
   const events = timeline.expired ? NO_EVENTS : timeline.events;
@@ -120,8 +153,34 @@ export function RunDetailView({
         <PageHeader
           title="Run detail"
           description={`${run.webhookSummary === undefined ? run.provider : "Webhook"} - ${run.configuredTriggerName}`}
-        />
+        >
+          {detail.canStop && !terminal && onStop !== undefined ? (
+            <ConfirmAction
+              label="Stop run"
+              title="Stop this run?"
+              description="Hub will interrupt the active agent or script and skip remaining steps. If its daemon is offline, Hub will retry cleanup when it reconnects."
+              confirmLabel="Stop run"
+              cancelLabel="Keep running"
+              destructive
+              busy={stopBusy ?? false}
+              onConfirm={onStop}
+            />
+          ) : null}
+        </PageHeader>
       </div>
+      {stopError == null ? null : (
+        <FailureAlert
+          standalone
+          title="Stop failed"
+          error={stopError}
+          fallback="Hub couldn't stop this run."
+        />
+      )}
+      {timeline.status === "canceled" ? (
+        <NoticeAlert standalone tone="neutral" title="Stopped by a person">
+          {CANCELED_RUN_NOTE}
+        </NoticeAlert>
+      ) : null}
       {run.payloadExpiredAt == null ? null : (
         <NoticeAlert standalone tone="neutral" title="Run payload expired">
           This run's original event, inputs, prompts, and outputs expired under this Hub's retention

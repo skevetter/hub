@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
-import { getRequest } from "@tanstack/react-start/server";
+import { getRequest, setResponseStatus } from "@tanstack/react-start/server";
 import { z } from "zod";
-import { respondOk, type Result } from "../contract/respond.js";
+import { respondError, respondOk, type Result } from "../contract/respond.js";
 import { respondWithFailure } from "../failures/index.js";
 import { getApplication } from "../server/runtime.js";
 import { ACTIVITY_PAGE_SIZE_MAX } from "./activity-cursor.js";
@@ -26,6 +26,28 @@ export const runDetailSnapshot = createServerFn({ method: "GET" })
     } catch (error) {
       return respondWithFailure(error, triggerContext("run.detail", data.organizationSlug), {
         fallback: "Hub couldn't load this run.",
+      });
+    }
+  });
+
+export const stopRun = createServerFn({ method: "POST" })
+  .validator(runScopeSchema)
+  .handler(async ({ data }): Promise<Result<{ status: string }>> => {
+    try {
+      const dashboard = (await getApplication()).triggerDashboard;
+      if (dashboard == null) throw new Error("trigger dashboard unavailable");
+      const result = await dashboard.stopRun(getRequest(), data.organizationSlug, data.runId);
+      if (result.status === "stopped") return respondOk({ status: result.runStatus });
+      setResponseStatus(result.status === "forbidden" ? 403 : 404);
+      return respondError({
+        message:
+          result.status === "forbidden"
+            ? "You don't have permission to stop this run."
+            : "This run is unavailable.",
+      });
+    } catch (error) {
+      return respondWithFailure(error, triggerContext("run.stop", data.organizationSlug), {
+        fallback: "Hub couldn't stop this run.",
       });
     }
   });

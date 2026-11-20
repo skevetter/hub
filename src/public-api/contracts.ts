@@ -298,7 +298,7 @@ export const DispatchedManualRunSchema = z
     providerEventReceiptId: z.string().uuid(),
     triggerRunId: z.string().uuid(),
     configuredTriggerName: z.string(),
-    workflowStatus: z.enum(["running", "succeeded", "failed", "timed_out"]),
+    workflowStatus: z.enum(["running", "succeeded", "failed", "timed_out", "canceled"]),
   })
   .strict()
   .openapi("DispatchedManualRun", {
@@ -420,3 +420,12 @@ export const EnrollmentTokenSchema = z
   });
 
 export type Problem = z.infer<typeof ProblemSchema>;
+
+export const RunStopPathSchema = z.object({ id: z.string().uuid() });
+export const StoppedRunSchema = z
+  .object({
+    runId: z.string().uuid(),
+    status: z.enum(["running", "succeeded", "failed", "timed_out", "canceled", "rejected"]),
+    note: z.string().optional(),
+  })
+  .strict();

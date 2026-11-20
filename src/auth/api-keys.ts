@@ -42,10 +42,11 @@ export interface CreatedApiKey {
 }
 
 export interface OperationAuthorization {
+  user?: { id: string; role: import("../db/types.js").TenantRouteAccess["membership"]["role"] };
   kind: "apiKey" | "cliCredential";
   credentialId: string;
   organizationId: string;
-  scopes: readonly ApiKeyScope[];
+  scopes: readonly import("./operation-auth.js").OperationScope[];
   actor?: string | null;
   allowedTriggers?: readonly string[] | null;
 }
@@ -85,7 +86,10 @@ export class OrganizationApiKeys {
     this.signing = new WebhookSecretStore(pool, locks, settings);
   }
 
-  async reauthorize(access: OperationAuthorization, requiredScope: ApiKeyScope): Promise<boolean> {
+  async reauthorize(
+    access: OperationAuthorization,
+    requiredScope: import("./operation-auth.js").OperationScope,
+  ): Promise<boolean> {
     if (access.kind !== "apiKey") return false;
     const result = await this.pool.query(
       `select 1 from organization_api_keys
@@ -226,7 +230,7 @@ export class OrganizationApiKeys {
 
   async authorize(
     request: Request,
-    requiredScope: ApiKeyScope,
+    requiredScope: import("./operation-auth.js").OperationScope,
   ): Promise<OperationAuthorizationResult> {
     const token = bearerToken(request.headers.get("authorization"));
     const parsed = token === undefined ? undefined : parseApiKey(token);
@@ -243,7 +247,8 @@ export class OrganizationApiKeys {
     if (row === undefined || row.revoked_at !== null) return { status: "unauthorized" };
     if (!constantTimeSecretMatch(parsed.token, row.verifier)) return { status: "unauthorized" };
     const scopes = apiKeyScopesSchema.parse(row.scopes);
-    if (!scopes.includes(requiredScope)) return { status: "forbidden" };
+    if (requiredScope === "runs:stop" || !scopes.includes(requiredScope))
+      return { status: "forbidden" };
     await this.markUsed(row.id);
     return {
       status: "authorized",

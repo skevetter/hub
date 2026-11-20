@@ -1,6 +1,7 @@
 import type { AuthServer } from "../auth/server.js";
 import { capabilitiesFor } from "../auth/organization-policy.js";
 import type { Database, OrganizationTriggerRecord } from "../db/types.js";
+import { canStopRun, type StopRun } from "./run-stop.js";
 import { resolveRouteTenant } from "../projects/access.js";
 import { ProjectCommandError } from "../projects/command-error.js";
 import { parseCompiledHubConfig } from "../config/compiler.js";
@@ -29,6 +30,7 @@ const DAY_MS = 24 * 60 * 60_000;
 const NOTIFICATION_EVENT = "github.notification";
 
 export interface TriggerDashboardOptions {
+  stopRun?: StopRun;
   /** True when this Hub has a token for the GitHub notification poll. The token never leaves it. */
   githubNotificationsEnabled?: boolean;
   progressMessagesEnabled?: boolean;
@@ -154,12 +156,43 @@ export class TriggerDashboard {
     organizationSlug: string,
     runId: string,
   ): Promise<RunDetailSnapshot | null> {
-    const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+    const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, {
       organizationSlug,
     });
     const run = await this.database.findTriggerRunForOrganization(tenant.organization.id, runId);
     if (run === undefined) return null;
-    return this.runDetailForProject(tenant.organization.id, run.projectId, runId);
+    const detail = await this.runDetailForProject(tenant.organization.id, run.projectId, runId);
+    return detail === null
+      ? null
+      : {
+          ...detail,
+          canStop:
+            this.options.stopRun !== undefined &&
+            detail.timeline.status === "running" &&
+            canStopRun(
+              {
+                organizationId: tenant.organization.id,
+                role: tenant.membership.role,
+                userId: account.account.id,
+              },
+              run,
+            ),
+        };
+  }
+
+  async stopRun(request: Request, organizationSlug: string, runId: string) {
+    const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+      organizationSlug,
+    });
+    if (this.options.stopRun === undefined) throw new Error("run stop is unavailable");
+    return this.options.stopRun(
+      {
+        organizationId: tenant.organization.id,
+        role: tenant.membership.role,
+        userId: account.account.id,
+      },
+      runId,
+    );
   }
 
   private async runDetailForProject(

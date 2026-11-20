@@ -230,7 +230,7 @@ export class RunTimelineRepository {
   ): Promise<void> {
     const count = (
       await transaction.query<{ count: number }>(
-        `select count(*)::integer as count from workflow_step_runs where trigger_run_id = $1 and status in ('succeeded', 'failed', 'timed_out', 'skipped')`,
+        `select count(*)::integer as count from workflow_step_runs where trigger_run_id = $1 and status in ('succeeded', 'failed', 'timed_out', 'skipped', 'canceled')`,
         [runId],
       )
     ).rows[0]!.count;

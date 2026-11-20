@@ -108,7 +108,7 @@ export function scriptTerminalCommand(
 }
 
 export class ScriptRunAborted extends Error {
-  constructor() {
+  constructor(readonly cleanup?: ScriptCleanupTarget | null) {
     super("script run aborted");
     this.name = "ScriptRunAborted";
   }
@@ -150,6 +150,7 @@ export async function runScript(
       ? await stopTerminal(terminals, created.id, scopeOf(), clock, retry, attempts)
       : created.lostCreate !== true ||
         (await stopByName(terminals, target, clock, retry, attempts));
+  if (thrown instanceof ScriptRunAborted) throw new ScriptRunAborted(stopped ? null : target);
   if (thrown !== undefined) throw thrown;
   const result = outcome ?? refused(new Error("script run ended without an outcome"), input.cwd);
   return stopped ? result : { ...result, cleanup: target };

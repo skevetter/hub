@@ -74,6 +74,7 @@ export const providerEventReceipts = pgTable(
     providerConfigurationVersion: integer("provider_configuration_version"),
     source: text().notNull(),
     repo: text(),
+    startedByUserId: text("started_by_user_id"),
     payload: jsonb().notNull(),
     receivedAt: timestamp("received_at", { withTimezone: true }).defaultNow().notNull(),
     droppedReason: text("dropped_reason"),
@@ -458,7 +459,9 @@ export const triggerRuns = pgTable(
     configuredTriggerName: text("configured_trigger_name").notNull(),
     conversation: jsonb().$type<import("../triggers/continuation.js").Conversation>(),
     outcome: text().$type<"accepted" | "rejected">().notNull().default("accepted"),
-    status: text().$type<"running" | "succeeded" | "failed" | "timed_out" | "rejected">().notNull(),
+    status: text()
+      .$type<"running" | "succeeded" | "failed" | "timed_out" | "canceled" | "rejected">()
+      .notNull(),
     prompt: text().notNull(),
     inputs: jsonb().notNull().default({}),
     values: jsonb().notNull().default({}),
@@ -515,7 +518,7 @@ export const triggerRuns = pgTable(
     ),
     check(
       "trigger_runs_status_check",
-      sql`${table.status} in ('running', 'succeeded', 'failed', 'timed_out', 'rejected')`,
+      sql`${table.status} in ('running', 'succeeded', 'failed', 'timed_out', 'canceled', 'rejected')`,
     ),
     check(
       "trigger_runs_payload_expiry_check",
@@ -726,7 +729,9 @@ export const workflowStepRuns = pgTable(
     stepId: text("step_id").notNull(),
     ordinal: integer().notNull(),
     status: text()
-      .$type<"pending" | "running" | "succeeded" | "skipped" | "failed" | "timed_out">()
+      .$type<
+        "pending" | "running" | "succeeded" | "skipped" | "failed" | "timed_out" | "canceled"
+      >()
       .notNull(),
     agentExecutionId: uuid("agent_execution_id"),
     output: jsonb(),
@@ -751,7 +756,7 @@ export const workflowStepRuns = pgTable(
     index("workflow_step_runs_trigger_status_idx").on(table.triggerRunId, table.status),
     check(
       "workflow_step_runs_status_check",
-      sql`${table.status} in ('pending', 'running', 'succeeded', 'skipped', 'failed', 'timed_out')`,
+      sql`${table.status} in ('pending', 'running', 'succeeded', 'skipped', 'failed', 'timed_out', 'canceled')`,
     ),
     check(
       "workflow_step_runs_deadline_kind_check",

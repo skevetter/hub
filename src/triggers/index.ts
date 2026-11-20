@@ -169,6 +169,10 @@ export interface TriggerProvider<
     reason: string,
     reactionState?: TriggerProviderReactionState,
   ): Promise<TriggerProviderReactionResult>;
+  onWorkflowRunCanceled?(
+    triggerContext: TriggerContext,
+    reactionState: TriggerProviderReactionState,
+  ): Promise<TriggerProviderReactionState>;
   onAgentExecutionTerminal?(executionId: string, triggerContext: TriggerContext): Promise<void>;
   onMachineTerminated?(
     triggerContext: TriggerContext,

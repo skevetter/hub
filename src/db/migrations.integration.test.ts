@@ -216,18 +216,22 @@ describe("database migration application", () => {
     const activityOrderMigration = await readFile(
       join(DRIZZLE_MIGRATIONS, "0061_trigger_runs_activity_order.sql"),
     );
+    const runCancellationMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0062_run_cancellation.sql"),
+    );
     const database = await createDatabase(url);
     try {
       const migrated = await poolQuery<{ hash: string }>(
         url,
         "select hash from drizzle.__drizzle_migrations order by id",
       );
-      assert.equal(migrated.rowCount, baseline.rows.length + 3);
+      assert.equal(migrated.rowCount, baseline.rows.length + 4);
       assert.deepEqual(migrated.rows, [
         ...baseline.rows,
         { hash: createHash("sha256").update(receiptMigration).digest("hex") },
         { hash: createHash("sha256").update(checklistMigration).digest("hex") },
         { hash: createHash("sha256").update(activityOrderMigration).digest("hex") },
+        { hash: createHash("sha256").update(runCancellationMigration).digest("hex") },
       ]);
       assert.deepEqual(
         (await poolQuery(url, "select home_checklist_completed_at from organization")).rows,
@@ -266,6 +270,7 @@ describe("database migration application", () => {
         {
           value: {
             ...before.rows[0]?.value,
+            started_by_user_id: null,
             payload_expiry_state: null,
             payload_expired_at: null,
             manual_replay_binding: null,
@@ -371,6 +376,9 @@ describe("database migration application", () => {
       join(DRIZZLE_MIGRATIONS, "0061_trigger_runs_activity_order.sql"),
       "utf8",
     );
+    const runCancellationMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, "0062_run_cancellation.sql"),
+    );
     assert.deepEqual((await journal()).rows, [
       ...releasedJournal.rows,
       { hash: createHash("sha256").update(reporterMigration).digest("hex") },
@@ -380,6 +388,7 @@ describe("database migration application", () => {
       { hash: createHash("sha256").update(receiptExpiryMigration).digest("hex") },
       { hash: createHash("sha256").update(checklistMigration).digest("hex") },
       { hash: createHash("sha256").update(activityOrderMigration).digest("hex") },
+      { hash: createHash("sha256").update(runCancellationMigration).digest("hex") },
     ]);
     assert.deepEqual(
       (
@@ -458,7 +467,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 62);
+      assert.equal(journal.rowCount, 63);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",

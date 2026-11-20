@@ -38,7 +38,7 @@ interface ReconciliationContext {
 
 function terminalStep(
   status: WorkflowStepRunRecord["status"],
-): status is "succeeded" | "failed" | "timed_out" | "skipped" {
+): status is "succeeded" | "failed" | "timed_out" | "skipped" | "canceled" {
   return status !== "pending" && status !== "running";
 }
 
@@ -239,7 +239,7 @@ export class RunTimelineReconciler {
         counts.not_run += 1;
         continue;
       }
-      counts[step.status] += 1;
+      counts[step.status] = (counts[step.status] ?? 0) + 1;
       terminalCount += 1;
       if (!(await this.appendStepEnd(context, step, step.status))) return;
     }
@@ -323,7 +323,7 @@ export class RunTimelineReconciler {
   private async appendStepEnd(
     context: ReconciliationContext,
     step: WorkflowStepRunRecord,
-    status: "succeeded" | "failed" | "timed_out" | "skipped",
+    status: "succeeded" | "failed" | "timed_out" | "skipped" | "canceled",
   ): Promise<boolean> {
     const endedAt = step.completedAt ?? context.run.completedAt ?? context.now;
     const inferred =

@@ -225,7 +225,7 @@ export class ProviderEventAcceptanceRepository {
       }
       await transaction
         .update(schema.providerEventReceipts)
-        .set({ acceptedRoutes: [route] })
+        .set({ acceptedRoutes: [route], startedByUserId: input.startedByUserId })
         .where(writableReceipt(receipt.id, input.organizationId));
       return {
         status: "accepted",

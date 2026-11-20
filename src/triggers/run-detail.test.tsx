@@ -9,7 +9,21 @@ import type { RunDetailSnapshot } from "./run-events.js";
 const render = (detail: RunDetailSnapshot) =>
   renderToStaticMarkup(<RunDetailView detail={detail} />);
 
+const confirmStop = () => undefined;
+
 describe("run timeline UI", () => {
+  it("shows Stop only for people with permission while the run is live", () => {
+    const detail = { ...runDetailFixture, canStop: true };
+    const view = (snapshot: RunDetailSnapshot) =>
+      renderToStaticMarkup(<RunDetailView detail={snapshot} onStop={confirmStop} />);
+    assert.match(view(detail), />Stop run</u);
+    assert.doesNotMatch(view({ ...detail, canStop: false }), />Stop run</u);
+    assert.doesNotMatch(
+      view({ ...detail, timeline: { ...detail.timeline, status: "canceled" } }),
+      />Stop run</u,
+    );
+  });
+
   it("marks expired run content and keeps safe script and progress summaries", () => {
     const expiredAt = "2026-11-17T10:00:00.000Z";
     const script = runDetailFixture.steps[0];

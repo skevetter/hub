@@ -98,6 +98,7 @@ export interface HubRuntimeOptions {
 }
 
 export interface HubRuntime {
+  stopRun: import("./triggers/run-stop.js").StopRun;
   daemonModule: DaemonModule | null;
   connectionForDaemon(daemonId: string): import("./daemons/index.js").DaemonConnection | undefined;
   /** The daemons' own answer about an agent configuration; null without a database. */
@@ -255,6 +256,8 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
           onWorkflowDeadlineExceeded: async (recovery: WorkflowDeadlineRecovery) => {
             await daemonModule.lifecycle.recoverWorkflowDeadlineExecutions(recovery.executionIds);
           },
+          onWorkflowExecutionsTerminal: (executionIds: readonly string[]) =>
+            daemonModule.lifecycle.recoverWorkflowTerminalExecutions(executionIds),
           onWorkflowRunAccepted: (run: AcceptedTriggerRunRecord) =>
             daemonModule.lifecycle.notifyWorkflowRunAccepted(run),
           onWorkflowRunStarted: (run: AcceptedTriggerRunRecord) =>
@@ -276,6 +279,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     daemonModule,
     connectionForDaemon,
     agentValidator,
+    stopRun: (actor, runId) => workflowEngine.stopRun(actor, runId),
     resourceCounts: () => {
       const executionSubscriptions = daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0;
       if (options.runTimeline === undefined) return { executionSubscriptions };
@@ -346,6 +350,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     manualSource,
     storeForProject,
     agentValidator,
+    hub.stopRun,
   );
   const publicApi = createPublicApi(options.publicApi, publicOperations, {
     webhookOptions: options.webhookOptions,
@@ -418,6 +423,7 @@ function createAppPublicOperations(
   manualSource: ReturnType<typeof createManualTriggerSource> | undefined,
   configurationForProject: (projectId: string) => ProjectConfigurationStore,
   daemonAgentValidator: DaemonAgentConfigurationValidator | null,
+  stopRun: HubRuntime["stopRun"],
 ) {
   if (options.database === null || manualSource === undefined || daemonAgentValidator === null) {
     return null;
@@ -426,6 +432,7 @@ function createAppPublicOperations(
   return createPublicOperations(
     createDatabasePublicOperationRepository(database),
     {
+      stopRun,
       triggerForOrganization: (organizationId) => {
         const store = new OrganizationTriggerStore(database, organizationId, daemonAgentValidator);
         return {

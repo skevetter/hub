@@ -142,6 +142,21 @@ async function fixture(
   return { database, connection, sessions, replies, arrival, execution, call };
 }
 
+test("settles a canceled execution whose agent creation never finished", async () => {
+  const f = await fixture();
+  const request = await f.arrival();
+  vi.spyOn(f.connection, "create").mockRejectedValueOnce(new Error("creation failed"));
+  await expect(request.dispatch()).rejects.toThrow("creation failed");
+  const { execution } = await f.database.transitionAgentExecution(request.executionId, "failed", {
+    result: { status: "canceled" },
+  });
+  expect(execution.agentSessionId).not.toBeNull();
+  const control = vi.spyOn(f.connection, "control");
+  await expect(f.sessions.control(execution, f.connection, "interrupt")).resolves.toBe(true);
+  expect(control).not.toHaveBeenCalled();
+  expect(f.connection.deliveries).toEqual([]);
+});
+
 test("same-key arrivals share an agent; an earlier completion cannot archive newer work", async () => {
   const f = await fixture();
   const first = await f.arrival();

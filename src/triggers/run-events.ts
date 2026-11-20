@@ -6,6 +6,7 @@ import type { ProgressMessageState, ProgressProviderName } from "../run-timeline
 export interface RunDetailSnapshot extends Omit<ActivityRunDetail, "steps"> {
   steps: (ActivityRunDetail["steps"][number] & { timelineStepId: string })[];
   timeline: RunEventPage;
+  canStop?: boolean;
   progressMessagesEnabled: boolean;
   progressUnavailable?: boolean;
   progress: {

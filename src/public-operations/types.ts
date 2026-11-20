@@ -1,4 +1,5 @@
-import type { ApiKeyScope } from "../auth/api-key-contract.js";
+import type { OperationAuthorization } from "../auth/api-keys.js";
+import type { StopRun, StopRunResult } from "../triggers/run-stop.js";
 import type { HubBundleFile } from "../config/bundle.js";
 import type {
   BoundWebhookTrigger,
@@ -9,14 +10,7 @@ import type {
 import type { DeploymentProjectResolution } from "../project-deployments/index.js";
 import type { StoredProjectConfiguration } from "../configuration/store.js";
 
-export interface PublicAuthorization {
-  kind: "apiKey" | "cliCredential";
-  credentialId: string;
-  organizationId: string;
-  scopes: readonly ApiKeyScope[];
-  actor?: string | null;
-  allowedTriggers?: readonly string[] | null;
-}
+export type PublicAuthorization = OperationAuthorization;
 
 export interface InstallConfigurationInput {
   projectSlug?: string | undefined;
@@ -107,7 +101,7 @@ export type DispatchManualRunResult =
       providerEventReceiptId: string;
       triggerRunId: string;
       configuredTriggerName: string;
-      workflowStatus: "running" | "succeeded" | "failed" | "timed_out";
+      workflowStatus: import("../db/types.js").AcceptedTriggerRunRecord["status"];
     }
   | { status: "project_not_found" }
   | { status: "actor_forbidden" }
@@ -196,6 +190,10 @@ export type ListTriggersResult =
   | InfrastructureUnavailable;
 
 export interface PublicOperations {
+  stopRun?(
+    authorization: PublicAuthorization,
+    runId: string,
+  ): Promise<StopRunResult | InfrastructureUnavailable>;
   listTriggers(authorization: PublicAuthorization): Promise<ListTriggersResult>;
   validateTrigger(
     authorization: PublicAuthorization,
@@ -273,6 +271,7 @@ export interface PublicOperationRepository {
 }
 
 export interface PublicOperationCapabilities {
+  stopRun?: StopRun;
   triggerForOrganization?(organizationId: string): {
     list(): Promise<readonly PublicTrigger[]>;
     validate(yaml: string): Promise<{ name: string }>;
@@ -303,6 +302,7 @@ export interface PublicOperationCapabilities {
     files: readonly HubBundleFile[],
   ): Promise<{ valid: true } | { valid: false; validationErrors: unknown }>;
   dispatchManualEvent(input: {
+    startedByUserId?: string;
     organizationId: string;
     projectId: string;
     source: "manual.run" | "webhook.received";

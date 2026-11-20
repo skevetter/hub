@@ -1,12 +1,16 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { DatabaseRuntime, QueryHandle, QueryRow } from "../db/runtime/index.js";
-import { API_KEY_SCOPES, type ApiKeyScope } from "./api-key-contract.js";
+import { API_KEY_SCOPES } from "./api-key-contract.js";
+import type { OperationScope } from "./operation-auth.js";
+import type { TenantRouteAccess } from "../db/types.js";
+
 import { ORGANIZATION_ROLES } from "./organization-contract.js";
 import { capabilitiesFor } from "./organization-policy.js";
 import type { OperationAuthorization, OperationAuthorizationResult } from "./api-keys.js";
 
 export const CLI_CREDENTIAL_PREFIX = "paseo_cli_";
 const CLI_CREDENTIAL_PREFIX_LENGTH = 12;
+const CLI_SCOPES = [...API_KEY_SCOPES, "runs:stop"] as const;
 const credentialRoles = ORGANIZATION_ROLES.filter((role) => capabilitiesFor(role).manageResources);
 
 interface CliCredentialRow extends QueryRow {
@@ -20,8 +24,11 @@ interface CliCredentialRow extends QueryRow {
 export class OrganizationCliCredentials {
   constructor(private readonly pool: DatabaseRuntime) {}
 
-  async reauthorize(access: OperationAuthorization, requiredScope: ApiKeyScope): Promise<boolean> {
-    if (access.kind !== "cliCredential" || !API_KEY_SCOPES.includes(requiredScope)) return false;
+  async reauthorize(
+    access: OperationAuthorization,
+    requiredScope: OperationScope,
+  ): Promise<boolean> {
+    if (access.kind !== "cliCredential" || !CLI_SCOPES.includes(requiredScope)) return false;
     const result = await this.pool.query(
       `select 1 from organization_cli_credentials credential
        join member on member.organization_id = credential.organization_id
@@ -35,7 +42,7 @@ export class OrganizationCliCredentials {
 
   async authorize(
     request: Request,
-    requiredScope: ApiKeyScope,
+    requiredScope: OperationScope,
   ): Promise<OperationAuthorizationResult> {
     const token = bearerToken(request.headers.get("authorization"));
     const parsed = token === undefined ? undefined : parseCliCredential(token);
@@ -53,8 +60,11 @@ export class OrganizationCliCredentials {
     ) {
       return { status: "unauthorized" };
     }
-    if (!API_KEY_SCOPES.includes(requiredScope)) return { status: "forbidden" };
-    const used = await this.pool.query(
+    if (!CLI_SCOPES.includes(requiredScope)) return { status: "forbidden" };
+    const used = await this.pool.query<{
+      user_id: string;
+      role: TenantRouteAccess["membership"]["role"];
+    }>(
       `update organization_cli_credentials as credential
        set last_used_at = greatest(coalesce(credential.last_used_at, to_timestamp(0)), now())
        from member
@@ -62,17 +72,19 @@ export class OrganizationCliCredentials {
          and member.organization_id = credential.organization_id
          and member.user_id = credential.created_by_user_id
          and member.role = any($2::text[])
-       returning credential.id`,
+       returning member.user_id, member.role`,
       [row.id, credentialRoles],
     );
-    if (used.rowCount !== 1) return { status: "unauthorized" };
+    const user = used.rows[0];
+    if (user === undefined) return { status: "unauthorized" };
     return {
       status: "authorized",
       access: {
         kind: "cliCredential",
         credentialId: row.id,
         organizationId: row.organization_id,
-        scopes: API_KEY_SCOPES,
+        scopes: CLI_SCOPES,
+        user: { id: user.user_id, role: user.role },
       },
     };
   }

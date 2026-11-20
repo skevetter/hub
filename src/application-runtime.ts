@@ -624,6 +624,7 @@ function triggerDashboardFor(
   return options.database === null || options.auth === null || hub.agentValidator === null
     ? null
     : new TriggerDashboard(options.database, options.auth, hub.agentValidator, {
+        stopRun: hub.stopRun,
         githubNotificationsEnabled: options.githubNotifications !== undefined,
         runProgress: options.runProgress ?? readRunProgressSettings({}),
         ...(reconciler === undefined ? {} : { reconciler }),

@@ -25,6 +25,7 @@ export interface DispatcherOptions {
   workerIntervalMs?: number;
   now?: () => Date;
   onWorkflowDeadlineExceeded?: DurableWorkflowEngineOptions["onWorkflowDeadlineExceeded"];
+  onWorkflowExecutionsTerminal?: DurableWorkflowEngineOptions["onWorkflowExecutionsTerminal"];
   onWorkflowRunAccepted?: DurableWorkflowEngineOptions["onWorkflowRunAccepted"];
   onWorkflowRunStarted?: DurableWorkflowEngineOptions["onWorkflowRunStarted"];
   onWorkflowRunTerminal?: DurableWorkflowEngineOptions["onWorkflowRunTerminal"];
@@ -73,6 +74,9 @@ export function createDispatcherWithEngine(options: DispatcherOptions): {
       ? {}
       : { workerIntervalMs: options.workerIntervalMs }),
     ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.onWorkflowExecutionsTerminal === undefined
+      ? {}
+      : { onWorkflowExecutionsTerminal: options.onWorkflowExecutionsTerminal }),
     ...(options.onWorkflowDeadlineExceeded === undefined
       ? {}
       : { onWorkflowDeadlineExceeded: options.onWorkflowDeadlineExceeded }),

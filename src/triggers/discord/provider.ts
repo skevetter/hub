@@ -237,6 +237,10 @@ export function createDiscordTriggerProvider(options: {
       await react(options.bot, triggerContext.target, "white_check_mark");
       return null;
     },
+    async onWorkflowRunCanceled(triggerContext, reactionState) {
+      await deleteReactionForPhase(options.bot, triggerContext.target, reactionState);
+      return null;
+    },
     async onAgentExecutionFailed(triggerContext, _outputContext, reason, reactionState) {
       await deleteReactionForPhase(options.bot, triggerContext.target, reactionState);
       await react(options.bot, triggerContext.target, "x");

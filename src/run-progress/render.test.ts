@@ -88,6 +88,17 @@ const defaults: ProgressRenderInput = {
 };
 
 describe("progress message vocabulary", () => {
+  it("describes a canceled run as stopped by a person", () => {
+    const body = renderProgress({
+      ...defaults,
+      run: { ...run, status: "canceled", completedAt: finish },
+      steps: [step("skipped", 0)],
+      events: [],
+    });
+    assert.match(body, /stopped by a person/u);
+    assert.doesNotMatch(body, /Failed|run_failed/u);
+  });
+
   it("renders running and permission-wait states from durable events", () => {
     const body = [
       "Paseo run: Running",

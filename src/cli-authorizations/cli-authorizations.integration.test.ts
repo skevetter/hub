@@ -83,6 +83,14 @@ describe("CLI authorization PostgreSQL state machine", () => {
       authorized.status === "authorized" ? authorized.access.organizationId : undefined,
       "org-acme",
     );
+    const stopAccess = await cliCredentials.authorize(
+      new Request("https://hub.test/api/v1/runs/example/stop", {
+        headers: { authorization: `Bearer ${credential}` },
+      }),
+      "runs:stop",
+    );
+    assert.ok(stopAccess.status === "authorized");
+    assert.deepEqual(stopAccess.access.user, { id: "user-owner", role: "owner" });
     const summaries = await cliCredentials.list("org-acme");
     assert.equal(summaries.length, 1);
     assert.equal(await cliCredentials.revoke("org-acme", summaries[0]!.id), true);

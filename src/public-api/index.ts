@@ -8,6 +8,7 @@ import { githubBodyDigest, parseGitHubSignature } from "../auth/webhook-signatur
 import { SigningRequestError, type WebhookSigner } from "../auth/webhook-secret-store.js";
 import type { OperationAuthenticator } from "../auth/operation-auth.js";
 import { isDatabaseUnavailableError } from "../db/errors.js";
+import { CANCELED_RUN_NOTE, type StopRunResult } from "../triggers/run-stop.js";
 import { reportFailure } from "../failures/index.js";
 import { readBoundedRequestBody } from "../http/request-body.js";
 import { hasPostgresText, isPostgresJson } from "../http/json-storage.js";
@@ -39,10 +40,12 @@ import {
   SetupResourcesSchema,
   ValidatedConfigurationSchema,
   ValidatedTriggerSchema,
+  StoppedRunSchema,
 } from "./contracts.js";
 import { publicOpenApiDocument } from "./openapi.js";
 import {
   publicOperation,
+  operationPathMatch,
   publicOperationManifest,
   type PublicOperationId,
   type PublicOperationDefinition,
@@ -62,7 +65,8 @@ type PublicOperationResult =
   | InstallConfigurationResult
   | DispatchManualRunResult
   | ReceiveWebhookResult
-  | IssueEnrollmentTokenResult;
+  | IssueEnrollmentTokenResult
+  | StopRunResult;
 
 export interface PublicApi {
   handle(request: Request): Promise<Response>;
@@ -216,7 +220,9 @@ async function routeRequest(
     return executeSafely(operationId, request, requestId, composition, operations, options);
   }
   const pathname = new URL(request.url).pathname;
-  const routes = publicOperationManifest.filter((route) => route.path === pathname);
+  const routes = publicOperationManifest.filter(
+    (route) => operationPathMatch(route, pathname) !== undefined,
+  );
   if (routes.length === 0) {
     return problem(
       requestId,
@@ -391,6 +397,20 @@ async function execute(
     return deliverWebhook(requestId, operations, options, access, parsed);
   }
   let input: unknown;
+  if (definition.pathSchema !== undefined) {
+    const parsed = definition.pathSchema.safeParse(
+      operationPathMatch(definition, new URL(request.url).pathname),
+    );
+    if (!parsed.success)
+      return problem(
+        requestId,
+        400,
+        "invalid_request",
+        "Invalid run ID",
+        "Use a UUID for the run ID.",
+      );
+    input = parsed.data;
+  }
   if (definition.requestSchema !== undefined) {
     const parsedBody = await readJson(
       request,
@@ -421,11 +441,20 @@ async function execute(
     input = parsed.data;
   }
   const result = await definition.invoke(operations, access, input);
-  if (definition.resultMapping === "triggers") {
+  return mapOperationResult(definition.resultMapping, requestId, result);
+}
+
+function mapOperationResult(
+  mapping: PublicOperationDefinition["resultMapping"],
+  requestId: string,
+  result: PublicOperationResult,
+) {
+  if (mapping === "run-stop") return stopRunResponse(requestId, result);
+  if (mapping === "triggers") {
     if (!isTriggersResult(result)) throw new Error("invalid triggers operation result");
     return triggersResponse(requestId, result);
   }
-  return operationResponse(definition.resultMapping, requestId, result);
+  return operationResponse(mapping, requestId, result);
 }
 
 function checkedWebhookResponse(requestId: string, result: PublicOperationResult): Response {
@@ -434,7 +463,7 @@ function checkedWebhookResponse(requestId: string, result: PublicOperationResult
 }
 
 function operationResponse(
-  mapping: Exclude<PublicOperationDefinition["resultMapping"], "triggers">,
+  mapping: Exclude<PublicOperationDefinition["resultMapping"], "triggers" | "run-stop">,
   requestId: string,
   result: PublicOperationResult,
 ): Response {
@@ -1043,6 +1072,37 @@ async function readJson(
     return { success: true, value: await request.json() };
   } catch {
     return { success: false };
+  }
+}
+
+function stopRunResponse(requestId: string, result: PublicOperationResult): Response {
+  switch (result.status) {
+    case "stopped":
+      return success(requestId, 200, StoppedRunSchema, {
+        runId: result.runId,
+        status: result.runStatus,
+        ...(result.runStatus === "canceled" ? { note: CANCELED_RUN_NOTE } : {}),
+      });
+    case "forbidden":
+      return problem(
+        requestId,
+        403,
+        "forbidden",
+        "Forbidden",
+        "Only the person who started the run or an organization admin can stop it.",
+      );
+    case "run_not_found":
+      return problem(
+        requestId,
+        404,
+        "run_not_found",
+        "Run not found",
+        "The run does not exist in this organization.",
+      );
+    case "infrastructure_unavailable":
+      return infrastructureProblem(requestId);
+    default:
+      throw new Error("invalid run stop result");
   }
 }
 

@@ -215,6 +215,8 @@ for (const definition of publicOperationManifest) {
         },
       },
     };
+  } else if (definition.pathSchema !== undefined) {
+    request = { params: definition.pathSchema };
   } else if (definition.requestSchema !== undefined) {
     request = {
       body: {

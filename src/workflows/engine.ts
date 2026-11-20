@@ -57,6 +57,7 @@ import type { WorktreeTarget } from "../config/index.js";
 import type { Logger } from "pino";
 import type { ScriptStepRunner } from "../daemons/terminals/script.js";
 import { ScriptStepRuntime, type ScriptStepLaunch } from "./script-step.js";
+import { canStopRun, type RunStopActor, type StopRunResult } from "../triggers/run-stop.js";
 import { DEFAULT_SCRIPT_LIMITS, type ScriptLimits } from "./script-limits.js";
 
 const DEFAULT_WAKEUP_LEASE_MS = 30_000;
@@ -97,6 +98,7 @@ export interface DurableWorkflowEngineOptions {
   workerIntervalMs?: number;
   now?: () => Date;
   onWorkflowDeadlineExceeded?: (recovery: WorkflowDeadlineRecovery) => Promise<void>;
+  onWorkflowExecutionsTerminal?: (executionIds: readonly string[]) => Promise<void>;
   onWorkflowRunAccepted?: (run: AcceptedTriggerRunRecord) => Promise<JsonValue | null | void>;
   onProgressRequested?: (run: AcceptedTriggerRunRecord) => void | Promise<void>;
   onWorkflowRunStarted?: (run: AcceptedTriggerRunRecord) => Promise<JsonValue | null | void>;
@@ -186,11 +188,37 @@ export class DurableWorkflowEngine {
     return this.scripts?.sweep(daemonId) ?? Promise.resolve();
   }
 
-  private runInBackground(work: Promise<void>, operation: string): void {
+  private runInBackground(work: Promise<void>, operation: string): Promise<void> {
     const tracked = work
       .catch((error: unknown) => this.report(error, operation))
       .finally(() => this.background.delete(tracked));
     this.background.add(tracked);
+    return tracked;
+  }
+
+  async stopRun(actor: RunStopActor, runId: string): Promise<StopRunResult> {
+    const database = this.options.database;
+    if (database === null) throw new DatabaseUnavailableError();
+    const existing = await database.findTriggerRunForOrganization(actor.organizationId, runId);
+    if (existing === undefined) return { status: "run_not_found" };
+    if (!canStopRun(actor, existing)) return { status: "forbidden" };
+    const cancellation = await database.cancelTriggerRun(actor.organizationId, runId);
+    if (cancellation === undefined) return { status: "run_not_found" };
+    if (cancellation.transitioned) {
+      await this.notifyWorkflowRunTerminal(cancellation.run);
+      await Promise.all([
+        this.runInBackground(
+          this.scripts?.stopRun(runId) ?? Promise.resolve(),
+          "workflow.script.stop",
+        ),
+        this.runInBackground(
+          this.options.onWorkflowExecutionsTerminal?.(cancellation.executionIds) ??
+            Promise.resolve(),
+          "workflow.agent.stop",
+        ),
+      ]);
+    }
+    return { status: "stopped", runId, runStatus: cancellation.run.status };
   }
 
   async enqueue(trigger: DurableProviderEvent): Promise<TriggerDispatchOutcome> {
@@ -942,8 +970,8 @@ export class DurableWorkflowEngine {
       }
       // The database ended the run's steps; a script's terminal on the host is still running.
       if (this.scripts !== undefined) {
-        this.runInBackground(
-          this.scripts.cleanupAfterDeadline(recovery.triggerRunId),
+        void this.runInBackground(
+          this.scripts.cleanupEndedRun(recovery.triggerRunId),
           "workflow.script.deadline-cleanup",
         );
       }

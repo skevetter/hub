@@ -32,6 +32,7 @@ import { retryDiagnostic, retryWithBackoff, type RetryRuntime } from "../db/retr
 import { MAX_EXPLICIT_AGENT_TITLE_CHARS } from "@getpaseo/protocol/agent-title-limits";
 import { reportFailure } from "../failures/index.js";
 import type { TriggerProvider } from "../triggers/index.js";
+import { isCanceledExecution } from "../triggers/run-stop.js";
 import type { ExecutionAuthority } from "../execution-authority/index.js";
 import { OutputExecutorRegistry } from "../execution-capabilities/outputs.js";
 import { FinishCallRegistry } from "../execution-capabilities/finish-calls.js";
@@ -270,6 +271,10 @@ export class DaemonDispatchLifecycle {
     if (run.outcome !== "accepted" || run.status === "running") return null;
     const provider = this.findProviderForTriggerContext(run.triggerContext);
     if (provider === undefined) return run.reactionState;
+    if (run.status === "canceled") {
+      if (provider.onWorkflowRunCanceled === undefined) return run.reactionState;
+      return provider.onWorkflowRunCanceled(run.triggerContext, run.reactionState);
+    }
     if (run.status === "succeeded") {
       return notifyAgentExecutionCompleted({
         provider,
@@ -966,16 +971,27 @@ export class DaemonDispatchLifecycle {
   }
 
   async recoverWorkflowDeadlineExecutions(executionIds: readonly string[]): Promise<void> {
-    for (const executionId of executionIds) {
-      this.clearExecutionDeadline(executionId);
-      this.releaseExecutionResources(executionId);
-      this.startedExecutions.delete(executionId);
-      const execution = await this.options.database.findAgentExecutionById(executionId);
-      if (execution && isTerminalExecutionStatus(execution.status)) {
-        await this.notifyExecutionTerminal(execution);
-      }
-    }
+    for (const executionId of executionIds) await this.releaseWorkflowExecution(executionId);
     await this.recoverPendingHubActions();
+  }
+
+  async recoverWorkflowTerminalExecutions(executionIds: readonly string[]): Promise<void> {
+    await Promise.all(
+      executionIds.map(async (executionId) => {
+        const execution = await this.releaseWorkflowExecution(executionId);
+        if (execution !== undefined) await this.reconcileHubActionSafely(execution);
+      }),
+    );
+  }
+
+  private async releaseWorkflowExecution(executionId: string) {
+    this.clearExecutionDeadline(executionId);
+    this.releaseExecutionResources(executionId);
+    this.startedExecutions.delete(executionId);
+    const execution = await this.options.database.findAgentExecutionById(executionId);
+    if (execution === undefined || !isTerminalExecutionStatus(execution.status)) return undefined;
+    await this.notifyExecutionTerminal(execution);
+    return execution;
   }
 
   recoverDaemon(daemon: DaemonRecord): Promise<void> {
@@ -1152,6 +1168,11 @@ export class DaemonDispatchLifecycle {
     const alreadyStarted = this.startedExecutions.has(executionId);
     this.startedExecutions.add(executionId);
     const transition = await this.options.database.transitionAgentExecution(executionId, "running");
+    if (isCanceledExecution(transition.execution)) {
+      this.releaseExecutionResources(executionId);
+      this.startedExecutions.delete(executionId);
+      return;
+    }
 
     if (alreadyStarted || !transition.transitioned) {
       return;

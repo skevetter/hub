@@ -1,4 +1,5 @@
-import type { ApiKeyScope } from "../auth/api-key-contract.js";
+import type { OperationScope } from "../auth/operation-auth.js";
+import type { StopRunResult } from "../triggers/run-stop.js";
 import type {
   DispatchManualRunResult,
   ReceiveWebhookResult,
@@ -30,6 +31,8 @@ import {
   ValidatedConfigurationSchema,
   TriggerYamlRequestSchema,
   ValidatedTriggerSchema,
+  RunStopPathSchema,
+  StoppedRunSchema,
 } from "./contracts.js";
 
 export type PublicOperationId =
@@ -42,6 +45,7 @@ export type PublicOperationId =
   | "validateConfiguration"
   | "installConfiguration"
   | "dispatchManualRun"
+  | "stopRun"
   | "receiveWebhook"
   | "receiveGitHubWebhook"
   | "issueEnrollmentToken";
@@ -50,7 +54,8 @@ export interface PublicOperationDefinition {
   id: PublicOperationId;
   method: "get" | "post";
   path: string;
-  scope: ApiKeyScope;
+  scope: OperationScope;
+  pathSchema?: typeof RunStopPathSchema;
   requestSchema?:
     | typeof InstallConfigurationRequestSchema
     | typeof DispatchManualRunRequestSchema
@@ -66,7 +71,8 @@ export interface PublicOperationDefinition {
     | typeof SetupResourcesSchema
     | typeof DispatchedManualRunSchema
     | typeof EnrollmentTokenSchema
-    | typeof ReceivedWebhookSchema;
+    | typeof ReceivedWebhookSchema
+    | typeof StoppedRunSchema;
   successStatus: 200 | 201 | 202;
   webhook?: "bearer" | "github_sha256";
   resultMapping:
@@ -79,6 +85,7 @@ export interface PublicOperationDefinition {
     | "validation"
     | "configuration"
     | "manual-run"
+    | "run-stop"
     | "webhook"
     | "enrollment-token";
   summary: string;
@@ -101,6 +108,8 @@ export interface PublicOperationDefinition {
     | DispatchManualRunResult
     | ReceiveWebhookResult
     | IssueEnrollmentTokenResult
+    | StopRunResult
+    | { status: "infrastructure_unavailable" }
   >;
 }
 
@@ -382,6 +391,32 @@ export const publicOperationManifest: readonly PublicOperationDefinition[] = [
       operations.receiveWebhook(authorization, ReceiveGitHubWebhookInputSchema.parse(input)),
   },
   {
+    id: "stopRun",
+    method: "post",
+    path: "/api/v1/runs/{id}/stop",
+    pathSchema: RunStopPathSchema,
+    scope: "runs:stop",
+    successSchema: StoppedRunSchema,
+    successStatus: 200,
+    resultMapping: "run-stop",
+    summary: "Stop a run",
+    description:
+      "Requires an organization CLI login. A run's starter or an organization admin can cancel active work. Hub records cancellation immediately and retries pending cleanup when an offline daemon reconnects. Repeated requests return the current run status.",
+    tag: "Runs",
+    responses: {
+      200: "The current run status.",
+      400: "The run ID is invalid.",
+      401: "The bearer credential is missing, malformed, or revoked.",
+      403: "The credential or user cannot stop this run.",
+      404: "The run does not exist in this organization.",
+      500: "The operation failed unexpectedly.",
+      503: "Hub authentication or storage is unavailable.",
+    },
+    invoke: (operations, authorization, input) =>
+      operations.stopRun?.(authorization, RunStopPathSchema.parse(input).id) ??
+      Promise.resolve({ status: "infrastructure_unavailable" }),
+  },
+  {
     id: "issueEnrollmentToken",
     method: "post",
     path: "/api/v1/daemons/enrollment-tokens",
@@ -402,6 +437,20 @@ export const publicOperationManifest: readonly PublicOperationDefinition[] = [
     invoke: (operations, authorization) => operations.issueEnrollmentToken(authorization),
   },
 ];
+
+export function operationPathMatch(definition: PublicOperationDefinition, pathname: string) {
+  if (definition.pathSchema === undefined) return definition.path === pathname ? {} : undefined;
+  const [prefix, suffix] = definition.path.split("{id}");
+  if (
+    prefix === undefined ||
+    suffix === undefined ||
+    !pathname.startsWith(prefix) ||
+    !pathname.endsWith(suffix)
+  )
+    return undefined;
+  const id = pathname.slice(prefix.length, pathname.length - suffix.length);
+  return id === "" || id.includes("/") ? undefined : { id };
+}
 
 export function publicOperation(id: PublicOperationId): PublicOperationDefinition {
   const definition = publicOperationManifest.find((candidate) => candidate.id === id);

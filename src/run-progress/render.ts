@@ -104,6 +104,8 @@ export function renderProgress(input: ProgressRenderInput): string {
     const finished = run.completedAt ?? started;
     const elapsed = duration(started, finished);
     if (run.status === "succeeded") lines.push(`Paseo run: Succeeded in ${value(elapsed)}`);
+    else if (run.status === "canceled")
+      lines.push(`Paseo run: stopped by a person after ${value(elapsed)}.`);
     else {
       const failure = failurePhrase(run.failureReason, run.status);
       const status = run.status === "timed_out" ? "Timed out" : "Failed";
@@ -116,6 +118,7 @@ export function renderProgress(input: ProgressRenderInput): string {
       ["succeeded", "succeeded"],
       ["failed", "failed"],
       ["timed_out", "timed out"],
+      ["canceled", "stopped"],
       ["skipped", "skipped"],
       ["pending", "not run"],
     ] as const;

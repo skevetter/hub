@@ -194,6 +194,23 @@ export function createPublicOperations(
         return storageUnavailableOrThrow(error);
       }
     },
+    async stopRun(authorization, runId) {
+      if (authorization.kind !== "cliCredential" || authorization.user === undefined)
+        return { status: "forbidden" };
+      if (capabilities.stopRun === undefined) return { status: "infrastructure_unavailable" };
+      try {
+        return await capabilities.stopRun(
+          {
+            organizationId: authorization.organizationId,
+            userId: authorization.user.id,
+            role: authorization.user.role,
+          },
+          runId,
+        );
+      } catch (error) {
+        return storageUnavailableOrThrow(error);
+      }
+    },
     async dispatchManualRun(authorization, input) {
       try {
         const project = await repository.resolveManualRunProject(
@@ -291,7 +308,12 @@ async function prepareManualRun(
   input: DispatchManualRunInput,
 ): Promise<
   | DispatchManualRunResult
-  | { status: "prepared"; payload: ManualRunPayload; trigger: CompiledTrigger }
+  | {
+      status: "prepared";
+      payload: ManualRunPayload;
+      trigger: CompiledTrigger;
+      starter: { startedByUserId?: string };
+    }
 > {
   const identity = resolveManualActor(authorization, input.actor);
   if (identity.status !== "resolved") return identity;
@@ -326,7 +348,11 @@ async function prepareManualRun(
     input: input.input,
     publicDeliveryKey: input.deliveryKey,
   };
-  return { status: "prepared", payload, trigger };
+  const starter =
+    authorization.kind === "cliCredential" && authorization.user !== undefined
+      ? { startedByUserId: authorization.user.id }
+      : {};
+  return { status: "prepared", payload, trigger, starter };
 }
 
 async function dispatchManualRun(
@@ -367,6 +393,7 @@ async function dispatchManualRun(
     const outcome = await capabilities.dispatchManualEvent({
       ...replayTarget,
       organizationId,
+      ...prepared.starter,
       deliveryId,
       receivedAt: new Date(),
       payload: {

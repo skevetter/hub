@@ -80,7 +80,7 @@ export const PROGRESS_UNSETTLED_SQL = `(
 )`;
 
 export const PENDING_SCRIPT_CLEANUP_SQL = `step.agent_execution_id is null
-  and step.status in ('succeeded', 'failed', 'timed_out')
+  and step.status in ('succeeded', 'failed', 'timed_out', 'canceled')
   and ((step.output ->> 'daemon_id') is not null or (step.output -> 'cleanup') is not null)`;
 
 export const SCRIPT_CLEANUP_SQL = `(${PENDING_SCRIPT_CLEANUP_SQL}) or

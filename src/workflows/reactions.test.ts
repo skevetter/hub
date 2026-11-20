@@ -26,6 +26,21 @@ import type { TriggerProvider } from "../triggers/index.js";
 import { createDurableWorkflowHandler } from "./engine.js";
 
 describe("workflow-owned provider reactions", () => {
+  it.each(["connected", "offline"] as const)(
+    "stops a run with a %s daemon and releases execution authority",
+    async (availability) => {
+      const result = await runTwoStepWorkflow(createDiscordReactionFixture(), {
+        outcome: availability === "offline" ? "stop_offline" : "stop",
+      });
+      assert.equal(result.run.status, "canceled");
+      assert.deepEqual(result.steps, ["canceled", "skipped"]);
+      assert.deepEqual(result.controls, ["interrupt"]);
+      assert.equal(result.released.length, 1);
+      assert.equal(result.calls().created.length, 2);
+      assert.deepEqual(result.visible(), []);
+    },
+  );
+
   it("uses one reaction sequence for a two-step Discord workflow", async () => {
     const result = await runTwoStepWorkflow(createDiscordReactionFixture());
 
@@ -225,7 +240,7 @@ function createGitHubReactionFixture() {
   };
 }
 
-type WorkflowOutcome = "step_failure" | "timeout" | "prelaunch_failure";
+type WorkflowOutcome = "step_failure" | "timeout" | "prelaunch_failure" | "stop" | "stop_offline";
 
 interface WorkflowScenarioOptions {
   outcome?: WorkflowOutcome;
@@ -327,6 +342,9 @@ async function runTwoStepWorkflow<
     stepIds: ["first", "second"],
     createdAt: now,
   });
+  const controls: string[] = [];
+  const released: string[] = [];
+  let connected = true;
   const connection: DaemonConnection = {
     agents: {
       create: async (key) => {
@@ -335,7 +353,9 @@ async function runTwoStepWorkflow<
       },
       get: async (id) => ({ id, workspaceId: "workspace", status: "idle" }),
       send: async () => {},
-      control: async () => {},
+      control: async (_agentId, _workspaceId, action) => {
+        controls.push(action);
+      },
       restore: async () => false,
       watch: async () => () => {},
     },
@@ -349,7 +369,18 @@ async function runTwoStepWorkflow<
   };
   const lifecycle = createDaemonDispatchLifecycle({
     database,
-    connectionForDaemon: (daemonId) => (daemonId === TEST_DAEMON_ID ? connection : undefined),
+    connectionForDaemon: (daemonId) =>
+      connected && daemonId === TEST_DAEMON_ID ? connection : undefined,
+    executionAuthority: {
+      materialize: async () => ({ env: {} }),
+      canResume: async () => true,
+      recover: async () => {},
+      onExecutionTerminal: async (id) => {
+        released.push(id);
+      },
+      resourceCounts: () => ({ executionStates: 0, leases: 0, pendingMaterializations: 0 }),
+      stop: async () => {},
+    },
     providers: [input.provider],
     publicBaseUrl: "https://hub.test",
     completionTokenSecret: "reaction-secret",
@@ -362,6 +393,8 @@ async function runTwoStepWorkflow<
       now: () => now,
       leaseMs: 1_000,
       dispatchLaunchMachineIntent: (intent) => lifecycle.handoffLaunchMachineIntent(intent),
+      onWorkflowExecutionsTerminal: (executionIds) =>
+        lifecycle.recoverWorkflowTerminalExecutions(executionIds),
       onWorkflowRunAccepted: (accepted) => lifecycle.notifyWorkflowRunAccepted(accepted),
       onWorkflowRunStarted: (started) => lifecycle.notifyWorkflowRunStarted(started),
       onWorkflowRunTerminal: (terminal) => lifecycle.notifyWorkflowRunTerminal(terminal),
@@ -374,6 +407,24 @@ async function runTwoStepWorkflow<
     await engine.processAvailable();
     if (options.skipAllSteps === true) {
       await waitForTerminalRun(database, run.id);
+    } else if (options.outcome === "stop" || options.outcome === "stop_offline") {
+      const execution = await runningStepExecution(database, run.id, "first");
+      connected = options.outcome === "stop";
+      const actor = { organizationId, userId: "admin", role: "admin" } as const;
+      const stopped = await engine.stopRun(actor, run.id);
+      assert.equal(stopped.status, "stopped");
+      assert.deepEqual(await engine.stopRun(actor, run.id), stopped);
+      assert.equal((await database.findTriggerRunById(run.id))?.status, "canceled");
+      assert.deepEqual(released, [execution.id]);
+      if (!connected) {
+        assert.deepEqual(controls, []);
+        assert.deepEqual(
+          (await database.findPendingHubActions()).map(({ id }) => id),
+          [execution.id],
+        );
+        connected = true;
+        await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
+      }
     } else if (options.outcome === "step_failure") {
       const first = await runningStepExecution(database, run.id, "first");
       assert.ok(first.machineId);
@@ -405,6 +456,9 @@ async function runTwoStepWorkflow<
     if (terminalRun?.outcome !== "accepted") throw new Error("accepted workflow run not found");
     return {
       run: terminalRun,
+      steps: (await database.listWorkflowStepRunsForTriggerRun(run.id)).map(({ status }) => status),
+      controls,
+      released,
       visible: input.visible,
       calls: input.calls,
     };

@@ -110,6 +110,15 @@ export class ScriptStepRuntime {
     await this.sweeping;
   }
 
+  async stopRun(triggerRunId: string): Promise<void> {
+    const active = this.active.get(triggerRunId);
+    if (active !== undefined) {
+      active.controller.abort();
+      await active.done;
+    }
+    await this.cleanupEndedRun(triggerRunId);
+  }
+
   /** Starts the script and returns once it is running. `deferred` means try again later. */
   async start(
     launch: ScriptStepLaunch,
@@ -239,7 +248,7 @@ export class ScriptStepRuntime {
    * Deadline recovery ended these runs' steps in the database without touching the host. Stop
    * the terminals of their script steps, unless a live watcher is doing it already.
    */
-  async cleanupAfterDeadline(triggerRunId: string): Promise<void> {
+  async cleanupEndedRun(triggerRunId: string): Promise<void> {
     if (this.isActive(triggerRunId)) return;
     const steps = await this.options.database.listWorkflowStepRunsForTriggerRun(triggerRunId);
     for (const step of steps) await this.settleEndedStep(step);
@@ -356,6 +365,10 @@ export class ScriptStepRuntime {
     signal: AbortSignal,
   ): Promise<void> {
     const { run, step, stepRun, daemonId } = launch;
+    const current = await this.persist(() =>
+      this.options.database.findWorkflowStepRunById(stepRun.id),
+    );
+    if (current?.status !== "running" || signal.aborted) return;
     let result;
     try {
       result = await this.options.runner!.run(daemonId, {
@@ -381,8 +394,19 @@ export class ScriptStepRuntime {
         },
       });
     } catch (error) {
-      // Shutdown: the terminal was stopped and the step stays running for recovery to fail.
-      if (error instanceof ScriptRunAborted) return;
+      if (error instanceof ScriptRunAborted) {
+        const ended = await this.options.database.findWorkflowStepRunById(stepRun.id);
+        if (ended?.status === "canceled" && error.cleanup !== undefined) {
+          const cleanup = error.cleanup;
+          await this.persist(() =>
+            this.options.database.setWorkflowScriptStepOutput(stepRun.id, {
+              ...EMPTY_RESULT,
+              ...(cleanup === null ? {} : { cleanup: cleanupRecord(daemonId, cleanup) }),
+            }),
+          );
+        }
+        return;
+      }
       this.options.report(error, "workflow.script.run", {
         triggerRunId: run.id,
         stepId: step.id,
@@ -427,14 +451,16 @@ export class ScriptStepRuntime {
     failureReason: string | undefined,
     output: ScriptStepResult,
   ): Promise<void> {
-    await this.persist(() =>
-      this.options.database.updateWorkflowScriptStep(stepRunId, {
+    await this.persist(async () => {
+      const step = await this.options.database.updateWorkflowScriptStep(stepRunId, {
         status,
         output,
         ...(failureReason === undefined ? {} : { failureReason }),
         at: this.options.now(),
-      }),
-    );
+      });
+      if (step?.status === "canceled")
+        await this.options.database.setWorkflowScriptStepOutput(stepRunId, output);
+    });
   }
 
   /** The JSON for HUB_EVENT_JSON: the same context an agent prompt gets for `paseo.context`. */

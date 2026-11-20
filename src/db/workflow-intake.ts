@@ -55,6 +55,7 @@ export async function acceptWorkflowRun(client: QueryHandle, input: CreateAccept
   const inserted = await client.query<{
     id: string;
     outcome: string;
+    status: string;
     payload_expiry_state: string | null;
   }>(
     `insert into trigger_runs
@@ -86,6 +87,7 @@ export async function acceptWorkflowRun(client: QueryHandle, input: CreateAccept
     const existing = await client.query<{
       id: string;
       outcome: string;
+      status: string;
       payload_expiry_state: string | null;
     }>(
       `select * from trigger_runs
@@ -103,7 +105,8 @@ export async function acceptWorkflowRun(client: QueryHandle, input: CreateAccept
   }
   if (run === undefined) throw new Error("trigger run insert returned no row");
   if (run.outcome !== "accepted") throw new Error("trigger branch outcome conflict");
-  if (run.payload_expiry_state !== null) return { id: run.id, created };
+  if (run.payload_expiry_state !== null || run.status === "canceled")
+    return { id: run.id, created };
   for (const [ordinal, stepId] of input.stepIds.entries()) {
     await client.query(
       `insert into workflow_step_runs

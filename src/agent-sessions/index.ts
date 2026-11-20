@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isCanceledExecution } from "../triggers/run-stop.js";
 import { temporaryCredentialFact } from "./credentials.js";
 import type { Database, AgentExecutionRecord } from "../db/types.js";
 import {
@@ -43,8 +44,7 @@ export class AgentSessions {
     unsubscribe: () => void;
     action: "created" | "continued" | "restored";
   }> {
-    const incoming = await this.database.findAgentExecutionById(input.executionId);
-    if (!incoming || !isActive(incoming)) throw new AgentSessionError("execution_terminal");
+    await this.requireActiveExecution(input.executionId);
     const policy = input.intent.continuation;
     const startupTimeoutMs = input.intent.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
     const continuationKey = policy?.key ?? null;
@@ -77,6 +77,7 @@ export class AgentSessions {
         ? await input.createOptions()
         : undefined;
     const dispatched = await this.database.withAdvisoryLock(`agent-session:${lockId}`, async () => {
+      await this.requireActiveExecution(input.executionId);
       const tools = executionToolDefinitions(
         input.intent.outputSchema,
         this.outputs.materialize(input.intent.allowOutputs, input.intent.outputContext),
@@ -170,6 +171,13 @@ export class AgentSessions {
     return dispatched ?? this.dispatch(input);
   }
 
+  private async requireActiveExecution(executionId: string) {
+    const execution = await this.database.findAgentExecutionById(executionId);
+    if (execution === undefined || !isActive(execution))
+      throw new AgentSessionError("execution_terminal");
+    return execution;
+  }
+
   private async deliver(
     input: {
       executionId: string;
@@ -183,8 +191,7 @@ export class AgentSessions {
   ): Promise<() => void> {
     const unsubscribe = await input.connection.watch(agentId, input.onEvent);
     try {
-      const execution = await this.database.findAgentExecutionById(input.executionId);
-      if (!execution || !isActive(execution)) throw new AgentSessionError("execution_terminal");
+      const execution = await this.requireActiveExecution(input.executionId);
       if (execution.deadlineAt !== null && execution.deadlineAt.getTime() <= this.now()) {
         throw new AgentSessionError("execution_deadline_exceeded");
       }
@@ -209,17 +216,27 @@ export class AgentSessions {
     connection: AgentConnection,
     action: "interrupt" | "archive",
   ): Promise<boolean> {
-    if (!execution.agentSessionId) return true;
+    const canceled = isCanceledExecution(execution);
+    if (!execution.agentSessionId) {
+      if (action === "interrupt" && canceled && execution.daemonAgentId !== null) {
+        const agent = await connection.get(execution.daemonAgentId);
+        await connection.control(agent.id, agent.workspaceId, action);
+      }
+      return true;
+    }
     const id = execution.agentSessionId;
     const session = await this.database.findAgentSession(id);
-    if (!session?.agentId || !session.workspaceId) return false;
-    const { agentId, workspaceId } = session;
+    if (session === undefined) return canceled;
+    if (!canceled && (!session.agentId || !session.workspaceId)) return false;
     return this.database.withAdvisoryLock(sessionLock(session), async () => {
+      // Agent creation holds the same lock. If it never finished, it could not send a prompt.
+      const target = canceled ? await this.database.findAgentSession(id) : session;
+      if (!target?.agentId || !target.workspaceId) return canceled;
       const executions = await this.database.listAgentSessionExecutions(id);
       // A completed arrival cannot stop work belonging to a newer arrival.
       if (executions.some((item) => item.status === "spawning" || item.status === "running"))
         return true;
-      await connection.control(agentId, workspaceId, action);
+      await connection.control(target.agentId, target.workspaceId, action);
       return true;
     });
   }

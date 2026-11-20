@@ -38,6 +38,7 @@ export interface ManualReceiptReplayTarget {
 }
 
 export interface ProviderEventReceiptRecord {
+  startedByUserId?: string;
   id: string;
   organizationId: string;
   provider:
@@ -723,6 +724,7 @@ export interface BoundWebhookTrigger {
 }
 
 export interface PersistManualEventInput extends InsertProviderEventInput {
+  startedByUserId?: string;
   boundWebhookTrigger?: BoundWebhookTrigger;
   publicTriggerName?: string;
   organizationId: string;
@@ -795,6 +797,7 @@ export interface InsertAgentExecutionInput {
 }
 
 interface TriggerRunEvidence {
+  startedByUserId?: string;
   payloadExpiredAt?: Date | null;
   payloadSummary?: RunPayloadSummary | null;
   payloadExpiryState?: "expiring" | "expired" | null;
@@ -815,7 +818,7 @@ interface TriggerRunEvidence {
 
 export interface AcceptedTriggerRunRecord extends TriggerRunEvidence {
   outcome: "accepted";
-  status: "running" | "succeeded" | "failed" | "timed_out";
+  status: "running" | "succeeded" | "failed" | "timed_out" | "canceled";
   deadlineAt: Date;
   deadlineKind: WorkflowDeadlineKind | null;
   failureReason: string | null;
@@ -880,7 +883,7 @@ export interface WorkflowStepRunRecord {
   triggerRunId: string;
   stepId: string;
   ordinal: number;
-  status: "pending" | "running" | "succeeded" | "skipped" | "failed" | "timed_out";
+  status: "pending" | "running" | "succeeded" | "skipped" | "failed" | "timed_out" | "canceled";
   agentExecutionId: string | null;
   output: unknown;
   failureReason: string | null;
@@ -1459,6 +1462,10 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
    * like a script's is never returned.
    */
   listWorkflowScriptStepsPendingCleanup(): Promise<WorkflowStepRunRecord[]>;
+  cancelTriggerRun(
+    organizationId: string,
+    triggerRunId: string,
+  ): Promise<(TransitionTriggerRunResult & { executionIds: string[] }) | undefined>;
   succeedTriggerRun(triggerRunId: string): Promise<TransitionTriggerRunResult | undefined>;
   failWorkflowRun(
     triggerRunId: string,
