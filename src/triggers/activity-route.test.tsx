@@ -94,6 +94,8 @@ describe("organization activity routes", () => {
             receivedAt: "2026-01-01T00:02:00.000Z",
           },
         ],
+        nextCursor: "older-cursor",
+        previousCursor: null,
       };
       const listing = await renderRoute("/o/acme%20team/activity");
       assert.match(listing, /href="\/o\/acme%20team\/activity\/run%2Fone"/u);
@@ -108,9 +110,46 @@ describe("organization activity routes", () => {
       assert.match(listing, /lucide-terminal/u);
       assert.ok(
         state.queryKeys.some(
-          (key) => JSON.stringify(key) === JSON.stringify(["triggers", "acme team"]),
+          (key) => JSON.stringify(key) === JSON.stringify(["activity", "acme team", null]),
         ),
       );
+
+      assert.match(listing, /aria-label="Activity pages"/u);
+      assert.match(listing, /1 to 3/u);
+      assert.match(
+        listing,
+        /href="\/o\/acme%20team\/activity\?cursor=older-cursor&(amp;)?page=2"[^>]*>Older/u,
+      );
+      assert.match(listing, /<button[^>]*disabled[^>]*>Newer/u);
+
+      state.snapshot = {
+        activity: [
+          {
+            id: "late-run",
+            triggerName: "Late",
+            repo: null,
+            provider: "manual",
+            source: "manual.run",
+            status: "succeeded",
+            receivedAt: "2025-12-31T00:00:00.000Z",
+          },
+        ],
+        nextCursor: null,
+        previousCursor: "newer-cursor",
+      };
+      const second = await renderRoute("/o/acme%20team/activity?cursor=older-cursor&page=2");
+      assert.ok(
+        state.queryKeys.some(
+          (key) =>
+            JSON.stringify(key) === JSON.stringify(["activity", "acme team", "older-cursor"]),
+        ),
+      );
+      assert.match(second, /26 to 26/u);
+      assert.match(second, /href="\/o\/acme%20team\/activity"[^>]*>Newer/u);
+      assert.match(second, /<button[^>]*disabled[^>]*>Older/u);
+
+      state.snapshot = { activity: [], nextCursor: null, previousCursor: null };
+      assert.doesNotMatch(await renderRoute("/o/acme%20team/activity"), /Activity pages/u);
 
       state.snapshot = null;
       const missing = await renderRoute("/o/acme%20team/activity/missing-run");

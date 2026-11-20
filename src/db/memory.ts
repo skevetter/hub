@@ -146,6 +146,9 @@ import type {
   ReconcileOrganizationBillingInput,
   UpdateLinearConnectionTokensInput,
   LinearConnectionRefreshOperation,
+  ActivityRunPageRecord,
+  ActivityRunPageRequest,
+  ActivityRunScope,
 } from "./types.js";
 import {
   clearOverrideKey,
@@ -3618,26 +3621,78 @@ class MemoryDatabase implements Database {
     limit: number,
   ): Promise<ProjectActivityRunListRecord[]> {
     return (await this.listTriggerRunsForProject(projectId, limit)).flatMap((run) => {
-      const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
-      if (receipt === undefined) return [];
-      const payload =
-        run.payloadExpiredAt == null && receipt.payloadExpiryState == null ? receipt.payload : null;
-      const actor =
-        receipt.source === "webhook.received" &&
-        payload !== null &&
-        typeof payload === "object" &&
-        "actor" in payload &&
-        typeof payload.actor === "string"
-          ? payload.actor
-          : undefined;
-      return [
-        {
-          run,
-          receipt: toProviderEventReceiptRecordSummary(receipt),
-          ...(actor === undefined ? {} : { webhookActor: actor }),
-        },
-      ];
+      const record = this.activityListRecord(run);
+      return record === undefined ? [] : [record];
     });
+  }
+
+  private activityListRecord(run: TriggerRunRecord): ProjectActivityRunListRecord | undefined {
+    const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
+    if (receipt === undefined) return undefined;
+    const payload =
+      run.payloadExpiredAt == null && receipt.payloadExpiryState == null ? receipt.payload : null;
+    const actor =
+      receipt.source === "webhook.received" &&
+      payload !== null &&
+      typeof payload === "object" &&
+      "actor" in payload &&
+      typeof payload.actor === "string"
+        ? payload.actor
+        : undefined;
+    return {
+      run,
+      receipt: toProviderEventReceiptRecordSummary(receipt),
+      ...(actor === undefined ? {} : { webhookActor: actor }),
+    };
+  }
+
+  async listOrganizationActivityPage(
+    organizationId: string,
+    scopes: readonly ActivityRunScope[],
+    request: ActivityRunPageRequest,
+  ): Promise<ActivityRunPageRecord> {
+    const records = [...this.triggerRuns.values()]
+      .filter(
+        (run) =>
+          run.organizationId === organizationId &&
+          scopes.some(
+            ({ projectId, triggerName }) =>
+              projectId === run.projectId &&
+              (triggerName === undefined || triggerName === run.configuredTriggerName),
+          ),
+      )
+      .flatMap((run) => this.activityListRecord(run) ?? [])
+      .sort((left, right) => newestFirst(left.run, right.run));
+    const bound = request.position;
+    const inRange = records.filter(({ run }) => {
+      if (bound === undefined) return true;
+      const order = newestFirst(run, {
+        createdAt: new Date(bound.key.createdAt),
+        id: bound.key.id,
+      });
+      return bound.direction === "before" ? order > 0 : order < 0;
+    });
+    const page =
+      bound?.direction === "after"
+        ? inRange.slice(Math.max(0, inRange.length - request.limit))
+        : inRange.slice(0, request.limit);
+    const first = page[0]?.run;
+    const last = page.at(-1)?.run;
+    const key = (run: { createdAt: Date; id: string }) => ({
+      createdAt: run.createdAt.toISOString(),
+      id: run.id,
+    });
+    return {
+      records: page,
+      older:
+        last !== undefined && records.some(({ run }) => newestFirst(run, last) > 0)
+          ? key(last)
+          : null,
+      newer:
+        first !== undefined && records.some(({ run }) => newestFirst(run, first) < 0)
+          ? key(first)
+          : null,
+    };
   }
 
   async findProjectActivityRun(projectId: string, runId: string) {
@@ -5607,4 +5662,11 @@ function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
     (execution.hubAction !== null && execution.hubActionCompletedAt === null) ||
     Object.values(execution.outputDeliveryAttempts).some((attempt) => attempt.status === "pending")
   );
+}
+
+function newestFirst(
+  left: { createdAt: Date; id: string },
+  right: { createdAt: Date; id: string },
+): number {
+  return right.createdAt.getTime() - left.createdAt.getTime() || right.id.localeCompare(left.id);
 }

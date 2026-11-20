@@ -93,7 +93,10 @@ describe("trigger dashboard read model", () => {
     });
     // The run is months old, so the 24 hour summary is empty.
     assert.deepEqual(after.triggers[0]?.recentRuns, { total: 0, succeeded: 0, failed: 0 });
-    assert.equal("webhookSummary" in after.activity[0]!, false);
+    assert.equal(
+      "webhookSummary" in (await dashboard.activityPage(request, "acme", {})).activity[0]!,
+      false,
+    );
   });
 
   it("summarizes the trigger's runs from the last 24 hours, one failure among many", async () => {
@@ -207,8 +210,8 @@ describe("trigger dashboard read model", () => {
     const dashboard = new TriggerDashboard(database, accountAuth(), acceptingAgentValidator(), {
       now: () => NOW,
     });
-    const snapshot = await dashboard.snapshot(request(), "acme");
-    const activity = snapshot.activity[0];
+    const page = await dashboard.activityPage(request(), "acme", {});
+    const activity = page.activity[0];
     assert.ok(activity);
     assert.equal(activity.provider, "manual");
     assert.equal(activity.source, "webhook.received");
@@ -218,7 +221,7 @@ describe("trigger dashboard read model", () => {
     assert.equal(JSON.stringify(activity).includes("private tail"), false);
     assert.equal(JSON.stringify(activity).includes("raw-payload-only"), false);
     assert.equal("rawPayload" in activity, false);
-    assert.deepEqual((await dashboard.snapshot(request(), "other")).activity, []);
+    assert.deepEqual((await dashboard.activityPage(request(), "other", {})).activity, []);
   });
 });
 

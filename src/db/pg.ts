@@ -169,6 +169,9 @@ import type {
   SyncBillingPlanInput,
   OrganizationBillingCustomerRecord,
   ReconcileOrganizationBillingInput,
+  ActivityRunPageRecord,
+  ActivityRunPageRequest,
+  ActivityRunScope,
 } from "./types.js";
 
 const STEP_PAYLOAD_PROJECTION = `step.id, step.trigger_run_id, step.step_id, step.ordinal, step.status,
@@ -2549,6 +2552,75 @@ class PgDatabase implements Database {
       [projectId, limit],
     );
     return rows.rows.map((row) => this.toProjectActivityRunList(row));
+  }
+
+  async listOrganizationActivityPage(
+    organizationId: string,
+    scopes: readonly ActivityRunScope[],
+    request: ActivityRunPageRequest,
+  ): Promise<ActivityRunPageRecord> {
+    if (scopes.length === 0) return { records: [], older: null, newer: null };
+    const scoped = `from trigger_runs runs
+       join provider_event_receipts receipts
+         on receipts.id = runs.provider_event_receipt_id
+        and receipts.organization_id = runs.organization_id
+       where runs.organization_id = $1
+         and exists (
+           select 1 from unnest($2::uuid[], $3::text[]) as scope(project_id, trigger_name)
+           where scope.project_id = runs.project_id
+             and (scope.trigger_name is null or scope.trigger_name = runs.configured_trigger_name))`;
+    const scopeParams = [
+      organizationId,
+      scopes.map(({ projectId }) => projectId),
+      scopes.map(({ triggerName }) => triggerName ?? null),
+    ];
+    const position = request.position;
+    const after = position?.direction === "after";
+    const rows = await query<ProjectActivityRunListRow & { page_created_at: string }>(
+      this.pool,
+      `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
+              receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
+              receipts.provider_configuration_version, receipts.source, receipts.repo,
+              receipts.received_at, receipts.dropped_reason,
+              receipts.payload_expiry_state as receipt_payload_expiry_state,
+              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null
+                     and receipts.source = 'webhook.received'
+                     and jsonb_typeof(receipts.payload->'actor') = 'string'
+                then receipts.payload->>'actor'
+              end as webhook_actor,
+              runs.created_at::text as page_created_at
+       ${scoped}
+       ${position === undefined ? "" : `and (runs.created_at, runs.id) ${after ? ">" : "<"} ($4::timestamptz, $5::uuid)`}
+       order by runs.created_at ${after ? "asc" : "desc"}, runs.id ${after ? "asc" : "desc"}
+       limit $${position === undefined ? 4 : 6}`,
+      position === undefined
+        ? [...scopeParams, request.limit + 1]
+        : [...scopeParams, position.key.createdAt, position.key.id, request.limit + 1],
+    );
+    const more = rows.rows.length > request.limit;
+    const page = rows.rows.slice(0, request.limit);
+    if (after) page.reverse();
+    const first = page[0];
+    const last = page.at(-1);
+    // The side a cursor came from is probed, not assumed: its rows may since have been deleted.
+    const exists = async (row: typeof first, newer: boolean) => {
+      if (row === undefined) return false;
+      const found = await query(
+        this.pool,
+        `select 1 ${scoped} and (runs.created_at, runs.id) ${newer ? ">" : "<"} ($4::timestamptz, $5::uuid) limit 1`,
+        [...scopeParams, row.page_created_at, row.id],
+      );
+      return found.rows.length > 0;
+    };
+    const hasNewer = after ? more : position !== undefined && (await exists(first, true));
+    const hasOlder = after ? await exists(last, false) : more;
+    const keyOf = (row: typeof first) =>
+      row === undefined ? null : { createdAt: row.page_created_at, id: row.id };
+    return {
+      records: page.map((row) => this.toProjectActivityRunList(row)),
+      older: hasOlder ? keyOf(last) : null,
+      newer: hasNewer ? keyOf(first) : null,
+    };
   }
 
   async findProjectActivityRun(projectId: string, runId: string) {

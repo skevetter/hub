@@ -8,6 +8,12 @@ import type { DaemonAgentConfigurationValidator } from "../configuration/store.j
 import { projectTriggerForm } from "./configuration/editor.js";
 import { OrganizationTriggerStore } from "./store.js";
 import { notificationStatusView, type NotificationStatusView } from "./notification-status.js";
+import {
+  ACTIVITY_PAGE_SIZE,
+  ACTIVITY_PAGE_SIZE_MAX,
+  decodeActivityCursor,
+  encodeActivityCursor,
+} from "./activity-cursor.js";
 import { summarizeRecentRuns, type RecentRuns } from "./recent-runs.js";
 import { summarizeTrigger } from "../projects/activity-summary.js";
 import { activityRunDetailView, readActivityExecutions } from "../projects/activity-run-view.js";
@@ -15,7 +21,7 @@ import { isRunTimelineExpired, retentionCutoff } from "../run-timeline/retention
 import { timelineStepId } from "../run-timeline/data.js";
 import type { RunTimelineReconciler } from "../run-timeline/reconcile.js";
 import type { RunProgressSettings } from "../run-progress/settings.js";
-import type { TriggerRunRecord } from "../db/types.js";
+import type { ProjectActivityRunListRecord, TriggerRunRecord } from "../db/types.js";
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
 import type { RunTimelineState } from "../run-timeline/store.js";
 
@@ -89,14 +95,10 @@ export class TriggerDashboard {
     const perTrigger = await Promise.all(
       triggers.map((trigger) => this.activityForTrigger(trigger)),
     );
-    const activity = perTrigger
-      .flat()
-      .sort((left, right) => right.receivedAt.localeCompare(left.receivedAt))
-      .slice(0, 100);
     const now = (this.options.now ?? (() => new Date()))();
     const triggerViews = await Promise.all(
       triggers.map((trigger, index) => {
-        // The summary uses the trigger's own newest runs, not the page-wide list cut to 100.
+        // The summary uses the trigger's own newest runs.
         const own = perTrigger[index] ?? [];
         const latest = own.reduce<(typeof own)[number] | undefined>(
           (found, run) => (found === undefined || run.receivedAt > found.receivedAt ? run : found),
@@ -112,7 +114,6 @@ export class TriggerDashboard {
       progressMessagesEnabled: this.progressMessagesEnabled,
       triggers: triggerViews,
       ...(notifications === undefined ? {} : { notifications }),
-      activity,
       // Only a daemon that can run agents is a target; one enrolled without `hub.execute` would
       // be refused at save, and Home says how to grant it.
       daemons: daemons
@@ -280,7 +281,7 @@ export class TriggerDashboard {
     };
   }
 
-  private async activityForTrigger(trigger: OrganizationTriggerRecord) {
+  private async triggerScopes(trigger: OrganizationTriggerRecord) {
     const migrationRevision = await this.database.findOrganizationTriggerMigrationRevision(
       trigger.id,
     );
@@ -290,6 +291,11 @@ export class TriggerDashboard {
       migrationRevision === undefined
         ? undefined
         : parseCompiledHubConfig(migrationRevision.normalizedConfiguration).triggers[0]?.name;
+    return { legacyProjectId, legacyTriggerName };
+  }
+
+  private async activityForTrigger(trigger: OrganizationTriggerRecord) {
+    const { legacyProjectId, legacyTriggerName } = await this.triggerScopes(trigger);
     const [current, historical] = await Promise.all([
       this.database.listProjectActivityRuns(trigger.runtimeProjectId, 100),
       legacyProjectId === undefined
@@ -302,35 +308,66 @@ export class TriggerDashboard {
           current.some((candidate) => candidate.run.id === run.id) ||
           run.configuredTriggerName === legacyTriggerName,
       )
-      .map(({ run, receipt, webhookActor }) =>
-        Object.assign(
-          {
-            id: run.id,
-            triggerId: trigger.id,
-            triggerName: trigger.name,
-            provider: receipt.provider,
-            source: receipt.source,
-            repo:
-              run.payloadExpiredAt == null
-                ? receipt.repo
-                : (run.payloadSummary?.repository ?? null),
-            payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
-            status: run.status,
-            receivedAt: receipt.receivedAt.toISOString(),
-          },
-          run.payloadExpiredAt == null &&
-            receipt.payloadExpiryState == null &&
-            receipt.source === "webhook.received"
-            ? {
-                webhookSummary: summarizeTrigger(receipt.source, {
-                  actor: webhookActor,
-                  input: run.prompt,
-                  trigger: run.configuredTriggerName,
-                }),
-              }
-            : {},
-        ),
+      .map((entry) => activityRow(trigger, entry));
+  }
+
+  /** One newest-first page of every trigger's runs, with opaque cursors to the pages either side. */
+  async activityPage(
+    request: Request,
+    organizationSlug: string,
+    input: { limit?: number; cursor?: string },
+  ) {
+    const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+      organizationSlug,
+    });
+    const limit = Math.min(input.limit ?? ACTIVITY_PAGE_SIZE, ACTIVITY_PAGE_SIZE_MAX);
+    const triggers = await new OrganizationTriggerStore(
+      this.database,
+      tenant.organization.id,
+      this.agentValidator,
+    ).list();
+    const scoped = await Promise.all(
+      triggers.map(async (trigger) => {
+        const { legacyProjectId, legacyTriggerName } = await this.triggerScopes(trigger);
+        return { trigger, legacyProjectId, legacyTriggerName };
+      }),
+    );
+    const scopes = scoped.flatMap(({ trigger, legacyProjectId, legacyTriggerName }) => [
+      { projectId: trigger.runtimeProjectId },
+      ...(legacyProjectId === undefined || legacyTriggerName === undefined
+        ? []
+        : [
+            {
+              projectId: legacyProjectId,
+              triggerName: legacyTriggerName,
+            },
+          ]),
+    ]);
+    const read = (position: ReturnType<typeof decodeActivityCursor>) =>
+      this.database.listOrganizationActivityPage(tenant.organization.id, scopes, {
+        limit,
+        ...(position === undefined ? {} : { position }),
+      });
+    const requested = decodeActivityCursor(input.cursor);
+    let page = await read(requested);
+    // A page emptied by deletions would strand the reader without controls.
+    if (page.records.length === 0 && requested !== undefined) page = await read(undefined);
+    const rows = page.records.flatMap((entry) => {
+      const owner = scoped.find(
+        ({ trigger, legacyProjectId, legacyTriggerName }) =>
+          trigger.runtimeProjectId === entry.run.projectId ||
+          (legacyProjectId === entry.run.projectId &&
+            legacyTriggerName === entry.run.configuredTriggerName),
       );
+      return owner === undefined ? [] : [activityRow(owner.trigger, entry)];
+    });
+    return {
+      organization: tenant.organization,
+      activity: rows,
+      limit,
+      nextCursor: page.older === null ? null : encodeActivityCursor("before", page.older),
+      previousCursor: page.newer === null ? null : encodeActivityCursor("after", page.newer),
+    };
   }
 
   async save(
@@ -354,6 +391,36 @@ export class TriggerDashboard {
       userId: account.account.id,
     });
   }
+}
+
+function activityRow(
+  trigger: OrganizationTriggerRecord,
+  { run, receipt, webhookActor }: ProjectActivityRunListRecord,
+) {
+  return Object.assign(
+    {
+      id: run.id,
+      triggerId: trigger.id,
+      triggerName: trigger.name,
+      provider: receipt.provider,
+      source: receipt.source,
+      repo: run.payloadExpiredAt == null ? receipt.repo : (run.payloadSummary?.repository ?? null),
+      payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
+      status: run.status,
+      receivedAt: receipt.receivedAt.toISOString(),
+    },
+    run.payloadExpiredAt == null &&
+      receipt.payloadExpiryState == null &&
+      receipt.source === "webhook.received"
+      ? {
+          webhookSummary: summarizeTrigger(receipt.source, {
+            actor: webhookActor,
+            input: run.prompt,
+            trigger: run.configuredTriggerName,
+          }),
+        }
+      : {},
+  );
 }
 
 async function triggerView(

@@ -4,6 +4,7 @@ import { z } from "zod";
 import { respondOk, type Result } from "../contract/respond.js";
 import { respondWithFailure } from "../failures/index.js";
 import { getApplication } from "../server/runtime.js";
+import { ACTIVITY_PAGE_SIZE_MAX } from "./activity-cursor.js";
 import type { TriggerDashboard } from "./dashboard.js";
 
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
@@ -59,6 +60,30 @@ export const triggerSnapshot = createServerFn({ method: "GET" })
     }
   });
 
+const activityPageSchema = scopeSchema.extend({
+  limit: z.number().int().min(1).max(ACTIVITY_PAGE_SIZE_MAX).optional(),
+  cursor: z.string().max(512).optional(),
+});
+
+export const triggerActivityPage = createServerFn({ method: "GET" })
+  .validator(activityPageSchema)
+  .handler(async ({ data }): Promise<Result<TriggerActivityPage>> => {
+    try {
+      const dashboard = (await getApplication()).triggerDashboard;
+      if (dashboard == null) throw new Error("trigger dashboard unavailable");
+      return respondOk(
+        await dashboard.activityPage(getRequest(), data.organizationSlug, {
+          ...(data.limit === undefined ? {} : { limit: data.limit }),
+          ...(data.cursor === undefined ? {} : { cursor: data.cursor }),
+        }),
+      );
+    } catch (error) {
+      return respondWithFailure(error, triggerContext("activity.list", data.organizationSlug), {
+        fallback: "Hub couldn't load trigger activity.",
+      });
+    }
+  });
+
 export const saveTrigger = createServerFn({ method: "POST" })
   .validator(saveSchema)
   .handler(async ({ data }): Promise<Result<{ state: "complete" }>> => {
@@ -81,6 +106,7 @@ export const saveTrigger = createServerFn({ method: "POST" })
   });
 
 export type TriggerSnapshot = Awaited<ReturnType<TriggerDashboard["snapshot"]>>;
+export type TriggerActivityPage = Awaited<ReturnType<TriggerDashboard["activityPage"]>>;
 
 function triggerContext(operation: string, organizationSlug: string) {
   return { operation, component: "triggers", organizationSlug } as const;

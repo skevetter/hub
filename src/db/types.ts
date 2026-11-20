@@ -848,6 +848,32 @@ export interface ProjectActivityRunListRecord {
   webhookActor?: string;
 }
 
+/** Where a run list reads from; `triggerName` narrows a project shared with other triggers. */
+export interface ActivityRunScope {
+  projectId: string;
+  triggerName?: string;
+}
+
+/** Position of a run in newest-first order. `createdAt` is the store's own text, so no precision is lost. */
+export interface ActivityRunKey {
+  createdAt: string;
+  id: string;
+}
+
+export interface ActivityRunPageRequest {
+  limit: number;
+  /** `before` reads older than the key, `after` reads newer. No position reads the newest page. */
+  position?: { direction: "before" | "after"; key: ActivityRunKey };
+}
+
+export interface ActivityRunPageRecord {
+  records: ProjectActivityRunListRecord[];
+  /** Key of the last record when older runs exist. */
+  older: ActivityRunKey | null;
+  /** Key of the first record when newer runs exist. */
+  newer: ActivityRunKey | null;
+}
+
 export interface WorkflowStepRunRecord {
   payloadSummary?: StepPayloadSummary | null;
   id: string;
@@ -1343,6 +1369,11 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
     projectId: string,
     limit: number,
   ): Promise<ProjectActivityRunListRecord[]>;
+  listOrganizationActivityPage(
+    organizationId: string,
+    scopes: readonly ActivityRunScope[],
+    request: ActivityRunPageRequest,
+  ): Promise<ActivityRunPageRecord>;
   findProjectActivityRun(
     projectId: string,
     runId: string,

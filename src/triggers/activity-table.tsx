@@ -3,7 +3,7 @@ import { RelativeTime } from "../components/app/relative-time.js";
 import { StatusPill, statusLabel } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
-import type { TriggerSnapshot } from "./functions.js";
+import type { TriggerActivityPage } from "./functions.js";
 
 export const ACTIVITY_COLUMNS = [
   { header: "Trigger", fill: true },
@@ -18,7 +18,7 @@ export function TriggerActivityTable({
   activity,
   organizationSlug,
 }: {
-  activity: TriggerSnapshot["activity"];
+  activity: TriggerActivityPage["activity"];
   organizationSlug: string;
 }) {
   return (
