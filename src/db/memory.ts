@@ -608,10 +608,16 @@ class MemoryDatabase implements Database {
           claimed = command;
           break;
         }
-        nextSession = exhaustedControlState(session, command);
+        nextSession = exhaustedControlState(session, command, input.now);
         if (nextSession !== session) {
-          drafts.push(stateEvent(nextSession, "stop_unconfirmed"));
-
+          drafts.push(
+            stateEvent(
+              nextSession,
+              nextSession.state === "running" ? "stop_unconfirmed" : nextSession.stateReason,
+            ),
+          );
+          if (nextSession.state === "closed")
+            drafts.push(...this.supersedeInteractiveCommands(nextSession, "close", input.now));
           break;
         }
       }
@@ -643,11 +649,15 @@ class MemoryDatabase implements Database {
       );
       const next =
         input.status === "unknown" || input.status === "failed"
-          ? exhaustedControlState(row.session, command)
+          ? exhaustedControlState(row.session, command, input.now)
           : row.session;
       const drafts = [deliveryEvent(command)];
       if (next !== row.session) {
-        drafts.push(stateEvent(next, "stop_unconfirmed"));
+        drafts.push(
+          stateEvent(next, next.state === "running" ? "stop_unconfirmed" : next.stateReason),
+        );
+        if (next.state === "closed")
+          drafts.push(...this.supersedeInteractiveCommands(next, "close", input.now));
       }
       this.appendSessionEvents(row, next, input.now, drafts);
       return true;

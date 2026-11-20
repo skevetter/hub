@@ -637,6 +637,7 @@ export function finalDeliveryCode(
 export function exhaustedControlState(
   session: SessionRecord,
   command: SessionCommandRecord,
+  now: Date,
 ): SessionRecord {
   if (
     command.kind === "stop" &&
@@ -646,6 +647,9 @@ export function exhaustedControlState(
       command.failureCode === "delivery_unconfirmed")
   )
     return { ...session, state: "running", stateReason: null };
+  if (command.attempts < maxDeliveryAttempts) return session;
+  if (command.kind === "replace" && session.state === "starting" && command.status === "unknown")
+    return { ...session, state: "closed", stateReason: "launch_failed", closedAt: now };
   return session;
 }
 

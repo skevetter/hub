@@ -514,10 +514,16 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
             claimed = updated;
             break;
           }
-          nextSession = exhaustedControlState(session, updated);
+          nextSession = exhaustedControlState(session, updated, input.now);
           if (nextSession !== session) {
-            drafts.push(stateEvent(nextSession, "stop_unconfirmed"));
-
+            drafts.push(
+              stateEvent(
+                nextSession,
+                nextSession.state === "running" ? "stop_unconfirmed" : nextSession.stateReason,
+              ),
+            );
+            if (nextSession.state === "closed")
+              drafts.push(...(await this.supersede(db, nextSession, "close", input.now)));
             break;
           }
         }
@@ -554,11 +560,15 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       );
       const next =
         input.status === "unknown" || input.status === "failed"
-          ? exhaustedControlState(session, updated)
+          ? exhaustedControlState(session, updated, input.now)
           : session;
       const drafts = [deliveryEvent(updated)];
       if (next !== session) {
-        drafts.push(stateEvent(next, "stop_unconfirmed"));
+        drafts.push(
+          stateEvent(next, next.state === "running" ? "stop_unconfirmed" : next.stateReason),
+        );
+        if (next.state === "closed")
+          drafts.push(...(await this.supersede(db, next, "close", input.now)));
       }
       await this.append(db, next, input.now, drafts);
       return true;

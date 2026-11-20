@@ -710,6 +710,48 @@ export function interactiveSessionStoreContract(
       );
     });
 
+    it("exhausting an uncertain replacement closes the session with a durable reason", async () => {
+      const { scope, claim, observation } = await storeRunning();
+      assert.ok(
+        await database.applyInteractiveSessionState({
+          ...observation,
+          turn: 1,
+          from: ["running"],
+          to: "failed",
+          reason: "agent_missing",
+        }),
+      );
+      assert.equal(
+        (
+          await database.acceptInteractiveSessionCommand({
+            ...command(scope.sessionId),
+            kind: "replace",
+          })
+        ).status,
+        "accepted",
+      );
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        const held = await database.claimInteractiveSessionCommand({ ...claim, lane: "control" });
+        assert.ok(held);
+        assert.equal(held.attempts, attempt);
+        assert.ok(
+          await database.settleInteractiveSessionCommand({
+            ...scope,
+            commandId: held.id,
+            claimOwner: claim.owner,
+            generation: held.generation,
+            attempts: held.attempts,
+            status: "unknown",
+            now,
+          }),
+        );
+      }
+      const current = await database.findInteractiveSession(scope.organizationId, scope.sessionId);
+      assert.equal(current?.session.state, "closed");
+      assert.equal(current.session.stateReason, "launch_failed");
+      assert.deepEqual(current.session.closedAt, now);
+    });
+
     async function startAsMember() {
       const principal = {
         ...start.principal,
