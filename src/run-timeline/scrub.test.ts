@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
 import { createTimelineScrubber as createCurrentScrubber } from "./scrub.js";
@@ -256,6 +258,68 @@ it("matches the build 17 stored-text scrubber on 512 seeded inputs and multiple 
   for (const options of [undefined, { scrubValues: [PAYLOAD, SHORT_SECRET, "[redacte"] }]) {
     const scrub = createTimelineScrubber(options);
     for (const input of inputs) for (const budget of budgets) scrub(input, budget);
+  }
+});
+
+it("keeps the production scrubber byte-for-byte at build 17", () => {
+  const fixture = readFileSync(
+    new URL("./test-utils/build17-scrubber.ts", import.meta.url),
+    "utf8",
+  );
+  const original = fixture
+    .slice(fixture.indexOf("\n") + 1)
+    .replace('from "../../logger.js"', 'from "../logger.js"')
+    .replace('from "../capture-types.js"', 'from "./capture-types.js"');
+  const current = readFileSync(new URL("./scrub.ts", import.meta.url));
+  expect(createHash("sha256").update(current).digest("hex")).toBe(
+    createHash("sha256").update(original).digest("hex"),
+  );
+});
+
+it("matches build 17 across the URL-only review corpus", () => {
+  const pieces = [
+    "a",
+    "b",
+    "x",
+    "1",
+    ":",
+    "@",
+    "%40",
+    "%2f",
+    "%5c",
+    "/",
+    "\\",
+    "?",
+    "#",
+    " ",
+    "\t",
+    "\n",
+    "%",
+    "4",
+    "0",
+    "+",
+    ".",
+  ];
+  const inventories = [
+    [],
+    ["Zq9vW3xT7pLm2Kd8"],
+    ["Zq9vW3xT7pLm2Kd8", "abc", "user"],
+    ["@@"],
+    ["%40"],
+  ];
+  const budgets = [0, 2, 3, 16, 64, 256, 8192, 100000, NaN];
+  const scrubbers = inventories.map((scrubValues) => createTimelineScrubber({ scrubValues }));
+  for (const value of ["a%40:x@y", "build%40:me@home", "v1%40:a@b"])
+    expect(scrubbers[0]!(value, 256)).toBe(value);
+  for (let seed of [1, 2, 3]) {
+    const random = () => (seed = (seed * 1103515245 + 12345) >>> 0) / 2 ** 32;
+    for (let index = 0; index < 2000; index += 1) {
+      const input = Array.from(
+        { length: 1 + Math.floor(random() * 14) },
+        () => pieces[Math.floor(random() * pieces.length)],
+      ).join("");
+      for (const scrub of scrubbers) for (const budget of budgets) scrub(input, budget);
+    }
   }
 });
 

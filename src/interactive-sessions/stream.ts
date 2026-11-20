@@ -142,13 +142,19 @@ function decrement(counts: Map<string, number>, key: string): void {
 
 function parseCursor(raw: string | null): SessionStreamCursor | undefined {
   if (raw === null) return { hubSeq: 0, agent: null };
-  const match = /^([0-9]+)(?::([0-9]+):(.{1,200}))?(?![\s\S])/u.exec(raw);
+  const match = /^([0-9]+)(?::([0-9]+)(?:\.([0-9]+))?:(.{1,200}))?(?![\s\S])/u.exec(raw);
   if (match === null) return undefined;
   const hubSeq = Number(match[1]);
   if (!Number.isSafeInteger(hubSeq)) return undefined;
   const seq = Number(match[2]);
-  const epoch = match[3];
+  const epoch = match[4];
   if (epoch === undefined) return { hubSeq, agent: null };
   if (!Number.isSafeInteger(seq) || !validAgentEpoch(epoch)) return undefined;
-  return { hubSeq, agent: { seq, epoch } };
+  const chunkOffset = match[3] === undefined ? undefined : Number(match[3]);
+  if (
+    chunkOffset !== undefined &&
+    (!Number.isSafeInteger(chunkOffset) || chunkOffset < 1 || chunkOffset > 65536)
+  )
+    return undefined;
+  return { hubSeq, agent: { seq, epoch, ...(chunkOffset === undefined ? {} : { chunkOffset }) } };
 }

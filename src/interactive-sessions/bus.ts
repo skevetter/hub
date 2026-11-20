@@ -1,4 +1,9 @@
-import type { SessionEventRecord, TranscriptItem } from "./types.js";
+import {
+  compareAgentPosition,
+  type AgentPosition,
+  type SessionEventRecord,
+  type TranscriptItem,
+} from "./types.js";
 
 export type SessionNotification =
   | { kind: "hub"; event: SessionEventRecord }
@@ -15,7 +20,7 @@ interface AgentBuffer {
   epoch: string;
   items: { item: TranscriptItem; bytes: number }[];
   bytes: number;
-  evictedThrough: number;
+  evictedThrough: AgentPosition;
   eviction: NodeJS.Timeout | undefined;
 }
 
@@ -72,18 +77,19 @@ export class SessionEventBus {
   readAgentItems(
     sessionId: string,
     epoch: string,
-    afterSeq: number,
+    after: AgentPosition,
   ):
     | { status: "available"; items: TranscriptItem[] }
     | { status: "unavailable"; reason: "epoch_changed" | "behind" } {
     const buffer = this.agentBuffers.get(sessionId);
     if (!buffer) return { status: "unavailable", reason: "behind" };
     if (buffer.epoch !== epoch) return { status: "unavailable", reason: "epoch_changed" };
-    if (afterSeq < buffer.evictedThrough) return { status: "unavailable", reason: "behind" };
+    if (compareAgentPosition(after, buffer.evictedThrough) < 0)
+      return { status: "unavailable", reason: "behind" };
     return {
       status: "available",
       items: buffer.items
-        .filter(({ item }) => item.seq > afterSeq)
+        .filter(({ item }) => compareAgentPosition(item, after) > 0)
         .map(({ item }) => structuredClone(item)),
     };
   }
@@ -101,20 +107,27 @@ export class SessionEventBus {
         epoch,
         items: [],
         bytes: 0,
-        evictedThrough: item.seq - 1,
+        evictedThrough:
+          item.kind === "assistant" && item.chunkStart !== undefined
+            ? { seq: item.seq, chunkOffset: item.chunkStart }
+            : { seq: item.seq - 1 },
         eviction: buffer?.eviction,
       };
       this.agentBuffers.set(sessionId, buffer);
     }
     const last = buffer.items.at(-1);
-    if (item.seq <= (last?.item.seq ?? buffer.evictedThrough)) return;
+    if (compareAgentPosition(item, last?.item ?? buffer.evictedThrough) <= 0) return;
     const bytes = Buffer.byteLength(JSON.stringify(item));
     buffer.items.push({ item: structuredClone(item), bytes });
     buffer.bytes += bytes;
     while (buffer.items.length > MAX_AGENT_ITEMS || buffer.bytes > MAX_AGENT_BYTES) {
       const removed = buffer.items.shift()!;
       buffer.bytes -= removed.bytes;
-      buffer.evictedThrough = removed.item.seq;
+      const offset = removed.item.kind === "assistant" ? removed.item.chunkOffset : undefined;
+      buffer.evictedThrough = {
+        seq: removed.item.seq,
+        ...(offset === undefined ? {} : { chunkOffset: offset }),
+      };
     }
   }
 }

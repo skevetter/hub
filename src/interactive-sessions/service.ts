@@ -34,6 +34,7 @@ interface Scope {
 export interface AgentCursor {
   epoch: string;
   seq: number;
+  chunkOffset?: number;
 }
 export interface ListInput {
   organizationSlug: string;
@@ -451,6 +452,8 @@ export class InteractiveSessionService {
     | { epoch: string; items: TranscriptItem[]; hasNewer: boolean }
   > {
     const { session } = await this.requireSession(principal, sessionId);
+    // The daemon only accepts whole-chunk cursors. An evicted partial frame needs a history reload.
+    if (cursor.chunkOffset !== undefined) return { gap: "behind" };
     const page = await this.agentHistory(session, { direction: "after", cursor, limit: 100 });
     if ("unavailable" in page)
       return { gap: page.unavailable === "daemon_offline" ? "daemon_disconnected" : "behind" };

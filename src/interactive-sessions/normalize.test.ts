@@ -110,6 +110,23 @@ test("the live transcript keeps up to 64 KiB of an assistant message and marks t
 });
 
 const credentialShapes: [string, string, string?][] = [
+  [
+    "encoded at in URL userinfo",
+    "postgres://app:Pr0d%40Secret2026@db/hub",
+    "postgres://[redacted]db/hub",
+  ],
+  [
+    "encoded slash in URL userinfo",
+    "postgres://app:Pr0d%2FSecret2026@db/hub",
+    "postgres://[redacted]db/hub",
+  ],
+  [
+    "literal at in URL userinfo",
+    "postgres://app:Pr0d@Secret2026@db/hub",
+    "postgres://[redacted]db/hub",
+  ],
+  ["URL userinfo without password", "postgres://app@db/hub", "postgres://[redacted]db/hub"],
+  ["at in URL path or query", "https://hub.test/a@b?view=u@v", "https://hub.test/a@b?view=u@v"],
   ["Anthropic", "sk-ant-api03-ExampleSomeValue123456"],
   ["OpenAI", "sk-proj-ExampleSomeValue123456"],
   ["AWS", "AKIAIOSFODNN7EXAMPLE"],
@@ -195,7 +212,13 @@ test("relays text progressively and emits both tool states before the turn compl
   expect(complete.at(-1)).toMatchObject({ item: { kind: "tool", status: "completed" } });
   expect(
     [...rendered, ...running, ...complete].map((entry) => ("item" in entry ? entry.item.seq : -1)),
-  ).toEqual([1, 2, 3, 4]);
+  ).toEqual([1, 1, 2, 2, 3, 4]);
+  expect(rendered[0]).toMatchObject({
+    item: { seq: 1, chunkOffset: expect.any(Number) as unknown },
+  });
+  expect(rendered[1]).toMatchObject({
+    item: { seq: 1, chunkStart: expect.any(Number) as unknown },
+  });
 });
 
 test("holds split credentials when another assistant message interleaves", () => {
@@ -225,3 +248,166 @@ function timeline(seq: number, item: { type: string } & Record<string, unknown>)
     event: { type: "timeline" as const, provider: "codex", item },
   };
 }
+
+test.each([12, 150])(
+  "keeps daemon chunk ownership for a viewer joining mid-turn with %i character chunks",
+  (size) => {
+    const live = new LiveSessionTranscript(normalizer);
+    const text = Array.from({ length: 60 }, (_, index) => `word${index}`).join(" ") + ".";
+    const parts = text.match(new RegExp(`.{1,${size}}`, "gu"))!;
+    const frames = parts.flatMap((part, index) =>
+      live.accept(
+        timeline(index + 1, { type: "assistant_message", text: part, messageId: "reply" }),
+      ),
+    );
+    frames.push(...live.finish());
+    for (let after = 1; after < parts.length; after += 1) {
+      const history = normalizer.history({
+        item: { type: "assistant_message", text: parts.slice(0, after).join("") },
+        timestamp: at,
+        seqStart: 1,
+        seqEnd: after,
+      });
+      if (history?.kind !== "assistant") throw new Error("Expected assistant history");
+      const suffix = frames.flatMap((entry) =>
+        "item" in entry && entry.item.kind === "assistant" && entry.item.seq > after
+          ? [entry.item.text]
+          : [],
+      );
+      expect(history.text + suffix.join("")).toBe(text);
+    }
+  },
+);
+
+test.each([
+  "Running the tests",
+  "Opened the PR at https://github.com/org/repo/pull/12",
+  "Editing src/interactive-sessions/normalize.ts",
+  "Set password=hunter2",
+])("flushes %s before a tool starts without a gap", (text) => {
+  const live = new LiveSessionTranscript(normalizer);
+  const reply = live.accept(timeline(1, { type: "assistant_message", text, messageId: "reply" }));
+  const tool = live.accept(timeline(2, { type: "tool_call", name: "shell", status: "running" }));
+  const finish = live.finish();
+  expect(
+    [...reply, ...tool]
+      .flatMap((entry) =>
+        "item" in entry && entry.item.kind === "assistant" ? [entry.item.text] : [],
+      )
+      .join(""),
+  ).toBe(text);
+  expect(tool.at(-1)).toMatchObject({ item: { kind: "tool" } });
+  expect(finish).toEqual([]);
+});
+
+test("does not hold more than 65 plain characters from a single long daemon chunk", () => {
+  const live = new LiveSessionTranscript(normalizer);
+  const text = "x".repeat(4096);
+  const frames = live.accept(timeline(1, { type: "assistant_message", text, messageId: "reply" }));
+  expect(
+    frames
+      .flatMap((entry) =>
+        "item" in entry && entry.item.kind === "assistant" ? [entry.item.text] : [],
+      )
+      .join("").length,
+  ).toBeGreaterThanOrEqual(text.length - 65);
+});
+
+test.each([
+  ["an exact known value", ["fixture-secret"], "See fi", "xture-secret here."],
+  [
+    "an armored opener",
+    [],
+    "See -----BE",
+    "GIN PRIVATE KEY-----\nfixture material\n-----END PRIVATE KEY----- here.",
+  ],
+] as const)("keeps %s private across an intervening tool row", (_case, known, prefix, suffix) => {
+  const live = new LiveSessionTranscript(new SessionTranscriptNormalizer(known));
+  const frames = [
+    ...live.accept(timeline(1, { type: "assistant_message", text: prefix, messageId: "reply" })),
+    ...live.accept(timeline(2, { type: "tool_call", name: "shell", status: "running" })),
+    ...live.accept(timeline(3, { type: "assistant_message", text: suffix, messageId: "reply" })),
+    ...live.finish(),
+  ];
+  expect(
+    frames
+      .flatMap((entry) =>
+        "item" in entry && entry.item.kind === "assistant" ? [entry.item.text] : [],
+      )
+      .join(""),
+  ).toBe("See [redacted] here.");
+  expect(frames).toContainEqual(
+    expect.objectContaining({ item: expect.objectContaining({ kind: "tool", seq: 2 }) as unknown }),
+  );
+});
+
+function armoredInput(size: number) {
+  const line = "---BEGIN x\n";
+  return line.repeat(Math.ceil(size / line.length)).slice(0, size);
+}
+
+function assistantHistory(text: string) {
+  return normalizer.historyEntries([
+    {
+      item: { type: "assistant_message", text, messageId: "reply" },
+      timestamp: at,
+      seqStart: 1,
+      seqEnd: 1,
+    },
+  ])[0];
+}
+
+test("cuts the review's 330 KB of unterminated headers before redacting history", () => {
+  const start = performance.now();
+  expect(assistantHistory(armoredInput(330_000))).toMatchObject({
+    kind: "assistant",
+    truncated: true,
+    text: "[redacted]",
+  });
+  expect(performance.now() - start).toBeLessThan(100);
+});
+
+test("processes the review's 64 KiB of unterminated headers in 200 character chunks", () => {
+  const live = new LiveSessionTranscript(normalizer);
+  const text = armoredInput(65_536);
+  const start = performance.now();
+  const frames = text
+    .match(/[\s\S]{1,200}/gu)!
+    .flatMap((part, index) =>
+      live.accept(
+        timeline(index + 1, { type: "assistant_message", text: part, messageId: "reply" }),
+      ),
+    );
+  frames.push(...live.finish());
+  expect(
+    frames
+      .flatMap((entry) =>
+        "item" in entry && entry.item.kind === "assistant" ? [entry.item.text] : [],
+      )
+      .join(""),
+  ).toBe("[redacted]");
+  expect(performance.now() - start).toBeLessThan(100);
+});
+
+test("redacts 64 KiB of repeated armor headers in history without exceeding the budget", () => {
+  const start = performance.now();
+  expect(assistantHistory(armoredInput(65_536))).toMatchObject({
+    kind: "assistant",
+    truncated: false,
+    text: "[redacted]",
+  });
+  expect(performance.now() - start).toBeLessThan(75);
+});
+
+test("bounds work on megabyte armor and URL inputs", () => {
+  const start = performance.now();
+  for (const text of [
+    armoredInput(1_048_576),
+    "@".repeat(1_048_576),
+    "%2f".repeat(349_526),
+    "a:".repeat(524_288),
+  ]) {
+    expect(assistantHistory(text)).toMatchObject({ kind: "assistant", truncated: true });
+  }
+  expect(performance.now() - start).toBeLessThan(1_000);
+});

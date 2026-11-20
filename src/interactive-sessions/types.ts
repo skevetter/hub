@@ -225,6 +225,8 @@ export type TranscriptItem =
   | {
       kind: "assistant";
       seq: number;
+      chunkOffset?: number;
+      chunkStart?: number;
       turnId?: string;
       text: string;
       truncated: boolean;
@@ -239,3 +241,14 @@ export type TranscriptItem =
       at: string;
     }
   | { kind: "human"; seq: number; commandId: string | null; at: string };
+
+export interface AgentPosition {
+  seq: number;
+  chunkOffset?: number;
+}
+
+export function compareAgentPosition(left: AgentPosition, right: AgentPosition): number {
+  if (left.seq !== right.seq) return left.seq - right.seq;
+  if (left.chunkOffset === right.chunkOffset) return 0;
+  return (left.chunkOffset ?? Infinity) < (right.chunkOffset ?? Infinity) ? -1 : 1;
+}

@@ -1,11 +1,13 @@
 import type { AgentEvent, AgentTimelinePage } from "../daemons/agents/index.js";
 import type { TimelineScrubber } from "../run-timeline/capture-types.js";
-import { createTimelineScrubber, createTimelineSpanScrubber } from "../run-timeline/scrub.js";
+import { createTimelineScrubber } from "../run-timeline/scrub.js";
+import { createSessionRedactor } from "./redact.js";
 import { readTimelineScrubValues } from "../run-timeline/secrets.js";
 import type { TranscriptItem } from "./types.js";
 
 const MAX_ASSISTANT_BYTES = 64 * 1024;
 const MAX_LIVE_MESSAGES = 64;
+const TEXT_LOOKAHEAD = 64;
 const TOOL_NAME = /^[A-Za-z0-9_.:/ -]{1,64}(?![\s\S])/u;
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu;
 
@@ -30,18 +32,13 @@ type HistoryItem = TranscriptItem & { seqStart: number; seqEnd: number };
 type DaemonHistoryEntry = AgentTimelinePage["entries"][number];
 
 export class SessionTranscriptNormalizer {
-  readonly inputLimit: number;
-  private readonly prose: ReturnType<typeof createTimelineSpanScrubber>;
+  private readonly prose: ReturnType<typeof createSessionRedactor>;
 
   constructor(
     knownValues: readonly string[] = readTimelineScrubValues(process.env),
     private readonly scrub: TimelineScrubber = createTimelineScrubber({ scrubValues: knownValues }),
   ) {
-    this.prose = createTimelineSpanScrubber(knownValues);
-    // Inspect text beyond the visible boundary before deciding whether a match crosses it.
-    this.inputLimit =
-      MAX_ASSISTANT_BYTES +
-      knownValues.reduce((longest, value) => Math.max(longest, value.length), 512);
+    this.prose = createSessionRedactor(knownValues);
   }
 
   stream(event: AgentEvent): TranscriptItem | undefined {
@@ -71,11 +68,25 @@ export class SessionTranscriptNormalizer {
     }
     const assistantItems = new Map<DaemonHistoryEntry, HistoryItem | undefined>();
     for (const parts of groups.values()) {
-      const safe = this.prose.redactParts(parts.map(({ text }) => text));
+      let remaining = MAX_ASSISTANT_BYTES;
+      let overflowAt = -1;
+      const bounded = parts.map(({ text }, index) => {
+        if (overflowAt !== -1) return "";
+        const part = limitText(text, remaining);
+        remaining -= part.bytes;
+        if (part.truncated) overflowAt = index;
+        return part.text;
+      });
+      const safe = this.prose.redact(bounded, overflowAt !== -1);
       let limit = MAX_ASSISTANT_BYTES;
       let truncated = false;
       for (const [index, { entry }] of parts.entries()) {
-        const item = this.assistantDelta(safe[index]!, historyPosition(entry), limit, false);
+        const item = this.assistantDelta(
+          safe[index]!,
+          historyPosition(entry),
+          limit,
+          index === overflowAt,
+        );
         const visible = !truncated && (item.text.length > 0 || item.truncated);
         assistantItems.set(
           entry,
@@ -92,15 +103,13 @@ export class SessionTranscriptNormalizer {
   }
 
   assistant(value: string, position: Position): AssistantItem {
-    return this.assistantDelta(this.prose.redact(value), position, MAX_ASSISTANT_BYTES, false);
+    const input = limitText(value, MAX_ASSISTANT_BYTES);
+    const safe = this.prose.redact([input.text], input.truncated)[0]!;
+    return this.assistantDelta(safe, position, MAX_ASSISTANT_BYTES, input.truncated);
   }
 
-  takeAssistant(value: string, boundary: boolean) {
-    return this.prose.take(value, boundary);
-  }
-
-  finishAssistant(value: string): string {
-    return this.prose.redact(value);
+  openAssistant() {
+    return this.prose.open();
   }
 
   assistantDelta(
@@ -109,14 +118,12 @@ export class SessionTranscriptNormalizer {
     limit: number,
     overflow: boolean,
   ): AssistantItem {
-    const bytes = Buffer.from(value);
-    let end = Math.min(bytes.length, limit);
-    while (end > 0 && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+    const cut = limitText(value, limit);
     return {
       kind: "assistant",
       ...this.safePosition(position),
-      text: bytes.subarray(0, end).toString("utf8"),
-      truncated: overflow || bytes.length > limit,
+      text: cut.text,
+      truncated: overflow || cut.truncated,
     };
   }
 
@@ -171,12 +178,35 @@ function assistantIdentity(turnId: string | undefined, messageId: string | undef
   return JSON.stringify([turnId, messageId]);
 }
 
-interface BufferedAssistant {
-  identity: string;
+// Slice the UTF-16 input first so the byte count never scans the discarded suffix.
+function limitText(
+  value: string,
+  limit: number,
+): { text: string; bytes: number; truncated: boolean } {
+  let text = value.slice(0, limit);
+  if (text.length < value.length && /[\uD800-\uDBFF]/u.test(text.at(-1) ?? ""))
+    text = text.slice(0, -1);
+  const bytes = Buffer.byteLength(text);
+  if (bytes <= limit) return { text, bytes, truncated: text.length < value.length };
+  const buffer = Buffer.from(text);
+  let end = limit;
+  while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end -= 1;
+  return { text: buffer.subarray(0, end).toString("utf8"), bytes: end, truncated: true };
+}
+
+interface PendingChunk {
   position: Position;
   text: string;
-  bytes: number;
+  offset: number;
   overflow: boolean;
+}
+
+interface BufferedAssistant {
+  chunks: PendingChunk[];
+  turnId: string | undefined;
+  redact: ReturnType<SessionTranscriptNormalizer["openAssistant"]>;
+  inputBytes: number;
+  outputBytes: number;
   truncated: boolean;
 }
 
@@ -187,12 +217,11 @@ interface TranscriptFrame {
 export type RelayedTranscript = TranscriptFrame | { gap: "behind" | "epoch_changed" };
 
 export class LiveSessionTranscript {
-  private current: BufferedAssistant | undefined;
+  private current: string | undefined;
   private readonly messages = new Map<string, BufferedAssistant>();
   private saturated = false;
   private epoch: string | undefined;
   private seenSeq = -1;
-  private emittedSeq = -1;
 
   constructor(private readonly normalizer: SessionTranscriptNormalizer) {}
 
@@ -206,9 +235,7 @@ export class LiveSessionTranscript {
     if (item.type !== "assistant_message" || typeof item.text !== "string") {
       const frame = this.normalizer.stream(event);
       if (frame) {
-        const current = this.current;
-        if (current) this.release(current, current.position, true, output);
-        this.emittedSeq = frame.seq;
+        this.flushCurrent(output, false);
         output.push({ epoch: event.epoch, item: frame });
       }
       return output;
@@ -217,8 +244,7 @@ export class LiveSessionTranscript {
     if (this.saturated) return output;
     const position = streamPosition(event, event.seq);
     const identity = assistantIdentity(position.turnId, item.messageId);
-    if (this.current && this.current.identity !== identity)
-      this.release(this.current, this.current.position, true, output);
+    if (this.current !== identity) this.flushCurrent(output, false);
     const prior = this.messages.get(identity);
     if (!prior && this.messages.size >= MAX_LIVE_MESSAGES) {
       this.clearMessages();
@@ -226,27 +252,22 @@ export class LiveSessionTranscript {
       output.push({ gap: "behind" });
       return output;
     }
-    const current = prior ?? {
-      identity,
-      position,
-      text: "",
-      bytes: 0,
-      overflow: false,
+    const message = prior ?? {
+      chunks: [],
+      turnId: position.turnId,
+      redact: this.normalizer.openAssistant(),
+      inputBytes: 0,
+      outputBytes: 0,
       truncated: false,
     };
-    const previous = current.position;
-    this.current = current;
-    if (!prior) this.messages.set(identity, current);
-    current.position = position;
-    if (current.truncated) return output;
-
-    const remaining = this.normalizer.inputLimit - current.text.length;
-    if (!current.overflow) {
-      current.text += item.text.slice(0, remaining);
-      current.overflow = item.text.length > remaining;
-    }
-    // Reserve the newest daemon sequence for the withheld tail at a tool or turn boundary.
-    if (previous.seq < position.seq) this.release(current, previous, false, output);
+    this.current = identity;
+    this.messages.set(identity, message);
+    if (message.truncated) return output;
+    const raw = limitText(item.text, MAX_ASSISTANT_BYTES - message.inputBytes);
+    message.inputBytes += raw.bytes;
+    if (raw.text.length > 0 || raw.truncated)
+      message.chunks.push({ position, text: raw.text, offset: 0, overflow: raw.truncated });
+    this.release(message, raw.truncated, false, output);
     return output;
   }
 
@@ -256,7 +277,6 @@ export class LiveSessionTranscript {
     this.epoch = epoch;
     this.clearMessages();
     this.seenSeq = -1;
-    this.emittedSeq = -1;
     return gap;
   }
 
@@ -266,54 +286,80 @@ export class LiveSessionTranscript {
     this.saturated = false;
   }
 
-  private release(
-    current: BufferedAssistant,
-    position: Position,
-    boundary: boolean,
-    output: RelayedTranscript[],
-  ): void {
-    if (current.truncated || position.seq <= this.emittedSeq) return;
-    const safe = this.normalizer.takeAssistant(current.text, boundary);
-    current.text = safe.remaining;
-    if (safe.text.length !== 0) this.emit(current, position, safe.text, false, output);
+  private flushCurrent(output: RelayedTranscript[], final: boolean): void {
+    if (this.current === undefined) return;
+    const message = this.messages.get(this.current);
+    if (message) this.release(message, true, final, output);
+    this.current = undefined;
   }
 
-  private emit(
-    current: BufferedAssistant,
-    position: Position,
-    text: string,
-    overflow: boolean,
+  private release(
+    message: BufferedAssistant,
+    boundary: boolean,
+    final: boolean,
     output: RelayedTranscript[],
   ): void {
-    const item = this.normalizer.assistantDelta(
-      text,
-      position,
-      MAX_ASSISTANT_BYTES - current.bytes,
-      overflow,
+    if (message.truncated || message.chunks.length === 0) return;
+    const source = message.chunks.map(({ text }) => text).join("");
+    let end = boundary ? source.length : Math.max(0, source.length - TEXT_LOOKAHEAD);
+    if (!boundary && /[\uD800-\uDBFF]/u.test(source[end - 1] ?? "")) end -= 1;
+    if (end === 0 && !boundary) return;
+
+    const parts = takeChunks(message, end, boundary);
+    const safe = message.redact(
+      source,
+      parts.map(({ text }) => text),
+      end,
+      boundary,
+      final,
     );
-    if (item.text.length === 0 && !item.truncated) return;
-    current.bytes += Buffer.byteLength(item.text);
-    current.truncated = item.truncated;
-    this.emittedSeq = position.seq;
-    output.push({ epoch: this.epoch!, item });
+    for (const [index, part] of parts.entries()) {
+      const item = this.normalizer.assistantDelta(
+        safe[index]!,
+        part.chunk.position,
+        MAX_ASSISTANT_BYTES - message.outputBytes,
+        part.chunk.overflow && part.done,
+      );
+      message.outputBytes += Buffer.byteLength(item.text);
+      message.truncated = item.truncated;
+      if (item.text.length > 0 || item.truncated || (part.done && part.previousOffset > 0)) {
+        if (!part.done && !item.truncated) item.chunkOffset = part.chunk.offset;
+        if (part.previousOffset > 0) item.chunkStart = part.previousOffset;
+        output.push({ epoch: this.epoch!, item });
+      }
+      if (item.truncated) {
+        message.chunks.length = 0;
+        break;
+      }
+    }
   }
 
   finish(turnId?: string): RelayedTranscript[] {
     const output: RelayedTranscript[] = [];
     this.saturated = false;
-    const messages = [...this.messages.values()].sort((a, b) => a.position.seq - b.position.seq);
-    let behind = false;
-    for (const message of messages) {
-      const { position, text, truncated, overflow, identity } = message;
-      if (turnId !== undefined && position.turnId !== undefined && position.turnId !== turnId)
-        continue;
+    for (const [identity, message] of this.messages) {
+      const owner = message.turnId;
+      if (owner !== undefined && turnId !== undefined && owner !== turnId) continue;
+      this.release(message, true, true, output);
       this.messages.delete(identity);
-      if (this.current === message) this.current = undefined;
-      if (truncated || (text.length === 0 && !overflow)) continue;
-      if (position.seq <= this.emittedSeq) behind = true;
-      else this.emit(message, position, this.normalizer.finishAssistant(text), overflow, output);
+      if (this.current === identity) this.current = undefined;
     }
-    if (behind) output.push({ gap: "behind" });
     return output;
   }
+}
+
+function takeChunks(message: BufferedAssistant, take: number, boundary: boolean) {
+  const result: { chunk: PendingChunk; previousOffset: number; text: string; done: boolean }[] = [];
+  for (const chunk of message.chunks) {
+    if (take === 0 && !(boundary && chunk.text.length === 0)) break;
+    const consumed = Math.min(take, chunk.text.length);
+    const done = consumed === chunk.text.length;
+    const text = chunk.text.slice(0, consumed);
+    result.push({ chunk, previousOffset: chunk.offset, text, done });
+    chunk.offset += consumed;
+    chunk.text = chunk.text.slice(consumed);
+    take -= consumed;
+  }
+  message.chunks.splice(0, result.filter(({ done }) => done).length);
+  return result;
 }

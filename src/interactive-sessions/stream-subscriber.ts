@@ -1,7 +1,12 @@
 import type { RunProgressSettings } from "../run-progress/settings.js";
 import type { SessionEventBus, SessionNotification } from "./bus.js";
 import { SessionReadError, type AgentCursor, type InteractiveSessionService } from "./service.js";
-import type { SessionEventRecord, SessionPrincipal, TranscriptItem } from "./types.js";
+import {
+  compareAgentPosition,
+  type SessionEventRecord,
+  type SessionPrincipal,
+  type TranscriptItem,
+} from "./types.js";
 
 export type SessionStreamSource = Pick<
   InteractiveSessionService,
@@ -331,7 +336,7 @@ export class SessionStreamSubscriber {
     while (this.authorization) await this.authorization;
     if (this.closed) return;
     const { bus, sessionId, service } = this.options;
-    const buffered = bus.readAgentItems(sessionId, cursor.epoch, cursor.seq);
+    const buffered = bus.readAgentItems(sessionId, cursor.epoch, cursor);
     if (buffered.status === "available") {
       this.setCatchUp(cursor.epoch, buffered.items);
       return;
@@ -392,11 +397,12 @@ export class SessionStreamSubscriber {
         this.pendingAgent = event;
         return this.send(this.frameAtCursor("gap", { reason: "epoch_changed" }));
       }
-      if (item.seq <= this.agent.seq) return false;
+      if (compareAgentPosition(item, this.agent) <= 0) return false;
     }
-    if (!this.send(frame("agent", item, cursorId(this.hubSeq, { seq: item.seq, epoch }))))
-      return false;
-    this.agent = { epoch, seq: item.seq };
+    const chunkOffset = item.kind === "assistant" ? item.chunkOffset : undefined;
+    const cursor = { seq: item.seq, epoch, ...(chunkOffset === undefined ? {} : { chunkOffset }) };
+    if (!this.send(frame("agent", item, cursorId(this.hubSeq, cursor)))) return false;
+    this.agent = cursor;
     return true;
   }
 
@@ -427,5 +433,7 @@ export function validAgentEpoch(epoch: string): boolean {
 }
 
 function cursorId(hubSeq: number, agent: AgentCursor | null): string {
-  return agent ? `${hubSeq}:${agent.seq}:${agent.epoch}` : String(hubSeq);
+  if (!agent) return String(hubSeq);
+  const offset = agent.chunkOffset === undefined ? "" : `.${agent.chunkOffset}`;
+  return `${hubSeq}:${agent.seq}${offset}:${agent.epoch}`;
 }

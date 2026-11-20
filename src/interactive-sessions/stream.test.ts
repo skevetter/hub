@@ -99,6 +99,30 @@ function read(response: Response) {
 }
 
 describe("interactive session stream", () => {
+  it("replays the remaining text of a daemon chunk after a partial live cursor", async () => {
+    const { bus, open, source } = setup();
+    const first = read(await open());
+    const frame = agent(4, epoch, "prefix");
+    bus.publish(sessionId, { ...frame, item: { ...frame.item, chunkOffset: 6 } });
+    expect(await first.next()).toContain(`id: 0:4.6:${epoch}`);
+    await first.cancel();
+    const suffix = agent(4, epoch, " suffix");
+    bus.publish(sessionId, { ...suffix, item: { ...suffix.item, chunkStart: 6 } });
+    const resumed = read(
+      await open(
+        "0",
+        "viewer",
+        new Request("https://hub.test/events?organization=org", {
+          headers: { cookie: "viewer", "last-event-id": `0:4.6:${epoch}` },
+        }),
+      ),
+    );
+    const remainder = await resumed.next();
+    expect(remainder).toContain(`id: 0:4:${epoch}`);
+    expect(remainder).toContain('"text":" suffix"');
+    expect(source.streamCatchUp).not.toHaveBeenCalled();
+    await resumed.cancel();
+  });
   it("replays durable Hub events after the cursor before relaying buffered live items", async () => {
     const { bus, rows, open } = setup();
     rows.push(state(1), state(2), state(3));
