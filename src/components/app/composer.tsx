@@ -20,7 +20,7 @@ const COUNTER_FROM = 1024;
 
 const ENCODER = new TextEncoder();
 
-const PERMISSION_REASON =
+const STEER_PERMISSION_MESSAGE =
   "The agent is waiting for a permission answer, so Steer now is unavailable. Queue still works.";
 const STEER_NOTE =
   "Steer now sends at once. If the agent cannot take it mid-step, it may restart the step.";
@@ -63,7 +63,7 @@ export function composerActions(
   if (agentState === "idle") return { mode: "single", send: gate(blocked) };
   return {
     mode: "split",
-    steer: gate(agentState === "waiting_permission" && !busy ? PERMISSION_REASON : blocked),
+    steer: gate(agentState === "waiting_permission" && !busy ? STEER_PERMISSION_MESSAGE : blocked),
     queue: gate(blocked),
   };
 }
@@ -193,7 +193,7 @@ export function Composer({
       </div>
       {actions.mode === "split" ? (
         <p className="text-xs text-muted-foreground">
-          {agentState === "waiting_permission" ? PERMISSION_REASON : STEER_NOTE}
+          {agentState === "waiting_permission" ? STEER_PERMISSION_MESSAGE : STEER_NOTE}
         </p>
       ) : null}
     </form>
