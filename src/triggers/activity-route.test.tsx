@@ -144,7 +144,7 @@ describe("organization activity routes", () => {
         nextCursor: null,
         previousCursor: "newer-cursor",
       };
-      const second = await renderRoute("/o/acme%20team/activity?cursor=older-cursor&page=2");
+      const second = await renderRoute("/o/acme%20team/activity?cursor=older-cursor");
       assert.ok(
         state.queryKeys.some(
           (key) =>
@@ -154,7 +154,7 @@ describe("organization activity routes", () => {
       assert.equal(state.intervals.at(-1), undefined);
       assert.doesNotMatch(second, /out of date/u);
       state.refreshFailure = { message: "Hub is down" };
-      const stale = await renderRoute("/o/acme%20team/activity?cursor=older-cursor&page=2");
+      const stale = await renderRoute("/o/acme%20team/activity?cursor=older-cursor");
       assert.match(stale, /Activity may be out of date/u);
       assert.match(stale, /Hub is down/u);
       state.refreshFailure = null;
