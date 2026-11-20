@@ -1,6 +1,22 @@
 import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
-import { createTimelineScrubber } from "./scrub.js";
+import { createTimelineScrubber as createCurrentScrubber } from "./scrub.js";
+import { createTimelineScrubber as createBuild17Scrubber } from "./test-utils/build17-scrubber.js";
+
+// Compare the exact inputs, secret inventories and byte budgets in the existing contracts.
+const createTimelineScrubber: typeof createCurrentScrubber = (options) => {
+  const current = createCurrentScrubber(options);
+  const build17 = createBuild17Scrubber(options);
+  return (input, maxBytes) => {
+    const actual = current(input, maxBytes);
+    const expected = build17(input, maxBytes);
+    if (actual !== expected)
+      expect(actual, `Build 17 mismatch for ${JSON.stringify(input)} at ${maxBytes} bytes`).toBe(
+        expected,
+      );
+    return actual;
+  };
+};
 
 const PAYLOAD = ["aBcD0192", "EfGh3456", "IjKl7890", "MnOpQrSt", "UvWxYz"].join("");
 const PREFIXES = [
@@ -200,6 +216,48 @@ function context(seed: number): string {
     }).join(" ") + " "
   );
 }
+
+function generatedBuild17Inputs(): string[] {
+  const hexDigits = "0123456789abcdef".split("");
+  return Array.from({ length: 64 }, (_, seed) => {
+    let state = seed + 1;
+    const pick = <T>(values: readonly T[]): T => {
+      state = (Math.imul(1664525, state) + 1013904223) >>> 0;
+      return values[(state >>> 16) % values.length]!;
+    };
+    const prose = context(seed * 19);
+    const account = `u${seed}`;
+    const host = `host-${seed}.example.test`;
+    const scheme = pick(["https", "postgres", "redis", "mongodb+srv", "custom"]);
+    const path = pick(["/db", "/path@name", "/dash?page=2", "/folder%2fitem"]);
+    const fixture = `${SHORT_SECRET.slice(seed % 5)}${seed}`;
+    const slashes = ["/", "\\", "%2f", "%2F", "%5c", "%5C"];
+    const hexLength = pick([16, 32, 40, 64, 128]);
+    const hex = Array.from({ length: hexLength }, () => pick(hexDigits)).join("");
+    const armor = pick(["PRIVATE KEY", "CERTIFICATE", "PGP MESSAGE", "OPENSSH PRIVATE KEY"]);
+    const invisible = pick(["\u0000", "\u200b", "\u2060", "\u034f", "\ufe0f", "\t", "\n"]);
+    return [
+      `${prose}${pick(["build completed", "ordinary output", "version available", "branch ready"])} ${seed}`,
+      `${prose}${scheme}://${host}${path}`,
+      `${scheme}://${account}:${fixture}${pick(["@", "%40", "@inside@"])}${host}${path}`,
+      `${scheme}${pick([":", "%3a"])}${pick(slashes)}${pick(slashes)}${account}:${fixture}${pick(["@", "%40", "%4\n0"])}${host}${path}`,
+      `${pick(["eyJ", "eyj", "aeyJ", " eyJ"])}${fixture}${pick([".", "..", "-.w."])}${hex.slice(0, 10)}`,
+      `${pick(["", prose, "id="])}${hex}`,
+      `${prose}${pick(["-----BEGIN", "---  begin", "-----BEGIX"])} ${armor}-----\n${fixture}\n${pick(["", `-----END ${armor}-----`])}`,
+      `${prose}${fixture.slice(0, 5)}${invisible}${fixture.slice(5)}${invisible}${hex.slice(0, 12)}`,
+    ];
+  }).flat();
+}
+
+it("matches the build 17 stored-text scrubber on 512 seeded inputs and multiple byte budgets", () => {
+  const inputs = generatedBuild17Inputs();
+  expect(new Set(inputs).size).toBe(512);
+  const budgets = [0, 1, 2, 3, 7, 8, 16, 63, 240, 8192, Infinity, -1, 2.5, NaN];
+  for (const options of [undefined, { scrubValues: [PAYLOAD, SHORT_SECRET, "[redacte"] }]) {
+    const scrub = createTimelineScrubber(options);
+    for (const input of inputs) for (const budget of budgets) scrub(input, budget);
+  }
+});
 
 describe("stored-text privacy contract: whole fields redact on sensitive labels or userinfo; known normalized secrets lose every 8-code-unit fragment across cuts; arbitrary unlabeled base64/hex secrets and unknown unlabeled passwords are explicit non-guarantees", () => {
   it("states limits: arbitrary unlabeled base64/hex secrets, unknown unlabeled passwords and personal data are not guaranteed; benign sensitive-label mentions intentionally redact whole fields", () => {
@@ -583,7 +641,9 @@ describe("stored-text privacy contract: whole fields redact on sensitive labels 
   });
 
   it("keeps median warmed adversarial 8 KiB calls below 20 ms without quadratic regex retries", () => {
-    const scrub = createTimelineScrubber({ scrubValues: [PAYLOAD] });
+    const options = { scrubValues: [PAYLOAD] };
+    const check = createTimelineScrubber(options);
+    const scrub = createCurrentScrubber(options);
     const adversarial = [
       "-".repeat(8192),
       "-".repeat(4096) + " ".repeat(4096),
@@ -604,6 +664,7 @@ describe("stored-text privacy contract: whole fields redact on sensitive labels 
       'Authorization: Token "' + '\\" '.repeat(2723),
     ];
     for (const value of adversarial) {
+      check(value, 240);
       for (let warmup = 0; warmup < 50; warmup += 1) scrub(value, 240);
       const elapsed: number[] = [];
       for (let sample = 0; sample < 25; sample += 1) {
