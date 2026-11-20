@@ -102,7 +102,7 @@ export type ProfileView = Omit<SessionProfileSettings, "providerOptions"> & {
 };
 
 type TranscriptEntry = TranscriptItem & { seqStart: number; seqEnd: number };
-type HistoryUnavailable = "daemon_offline" | "agent_missing" | "no_agent";
+type HistoryUnavailable = "daemon_offline" | "agent_missing" | "no_agent" | "history_unavailable";
 export type HistoryPage =
   | {
       entries: TranscriptEntry[];
@@ -219,7 +219,7 @@ export class InteractiveSessionService {
       throw new SessionReadError("not_found");
     if ("unavailable" in page) return page;
     return {
-      entries: this.projectHistory(page),
+      entries: this.transcript.historyEntries(page.entries),
       epoch: page.epoch,
       startCursor: page.startCursor,
       endCursor: page.endCursor,
@@ -447,15 +447,29 @@ export class InteractiveSessionService {
     sessionId: string,
     cursor: AgentCursor,
   ): Promise<
-    | { gap: "daemon_disconnected" | "epoch_changed" }
+    | { gap: "daemon_disconnected" | "epoch_changed" | "behind" }
     | { epoch: string; items: TranscriptItem[]; hasNewer: boolean }
   > {
     const { session } = await this.requireSession(principal, sessionId);
     const page = await this.agentHistory(session, { direction: "after", cursor, limit: 100 });
-    if ("unavailable" in page) return { gap: "daemon_disconnected" as const };
+    if ("unavailable" in page)
+      return { gap: page.unavailable === "daemon_offline" ? "daemon_disconnected" : "behind" };
     if (page.reset || page.staleCursor || page.gap || page.epoch !== cursor.epoch)
       return { gap: "epoch_changed" as const };
-    return { epoch: page.epoch, items: this.projectHistory(page), hasNewer: page.hasNewer };
+    // The daemon can return a full projected message that straddles a live text delta.
+    // The client needs a fresh history page to place it without duplicating the prefix.
+    if (
+      page.entries.some(
+        ({ item, seqStart, seqEnd }) =>
+          item.type === "assistant_message" && seqStart <= cursor.seq && seqEnd > cursor.seq,
+      )
+    )
+      return { gap: "behind" };
+    return {
+      epoch: page.epoch,
+      items: this.transcript.historyEntries(page.entries),
+      hasNewer: page.hasNewer,
+    };
   }
 
   private async principal(request: Request, organizationSlug: string): Promise<BrowserAccess> {
@@ -701,26 +715,20 @@ export class InteractiveSessionService {
     if (session.daemonAgentId === null) return { unavailable: "no_agent" };
     if (session.stateReason === "agent_missing") return { unavailable: "agent_missing" };
     const connection = this.options.connectionForDaemon(session.daemonId);
-    if (connection?.history === undefined) return { unavailable: "daemon_offline" };
+    if (connection === undefined) return { unavailable: "daemon_offline" };
+    if (connection.history === undefined) return { unavailable: "history_unavailable" };
     try {
       return await connection.history.timeline(session.daemonAgentId, query);
     } catch (error) {
+      if (!this.options.connectionForDaemon(session.daemonId))
+        return { unavailable: "daemon_offline" };
       return {
         unavailable:
           error instanceof DaemonAgentError &&
           (error.code === "agent_not_found" || error.code === "agent_missing")
             ? "agent_missing"
-            : "daemon_offline",
+            : "history_unavailable",
       };
     }
-  }
-
-  private projectHistory(page: AgentTimelinePage): TranscriptEntry[] {
-    const entries: TranscriptEntry[] = [];
-    for (const entry of page.entries) {
-      const projected = this.transcript.history(entry);
-      if (projected) entries.push(projected);
-    }
-    return entries;
   }
 }

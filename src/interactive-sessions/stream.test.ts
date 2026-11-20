@@ -141,6 +141,59 @@ describe("interactive session stream", () => {
     await resumed.cancel();
   });
 
+  it.each([
+    ["agent", "0:3:" + epoch],
+    ["Hub after agent", "1:3:" + epoch],
+    ["connection", "0:3:" + epoch],
+    ["disconnect gap", "0:3:" + epoch],
+    ["epoch gap", "0"],
+    ["Hub before agent", "1"],
+  ])("replays missed agent items or sends a gap after a %s frame", async (last, expectedId) => {
+    const { bus, open, rows } = setup();
+    const first = read(await open());
+    let frame: string | null = null;
+    if (last !== "Hub before agent") {
+      bus.publish(sessionId, agent(3));
+      frame = await first.next();
+    }
+    if (last.startsWith("Hub")) {
+      const event = state(1);
+      rows.push(event);
+      bus.publish(sessionId, { kind: "hub", event });
+    }
+    if (last === "connection") bus.publish(sessionId, { kind: "connection", online: false });
+    if (last === "disconnect gap")
+      bus.publish(sessionId, { kind: "gap", reason: "daemon_disconnected" });
+    if (last === "epoch gap") bus.publish(sessionId, { kind: "gap", reason: "epoch_changed" });
+    if (last !== "agent") frame = await first.next();
+    const lastId = frame?.match(/^id: ([^\n]+)/u)?.[1];
+    expect(lastId).toBe(expectedId);
+    await first.cancel();
+
+    const currentEpoch = last === "epoch gap" ? "next-epoch" : epoch;
+    bus.publish(sessionId, agent(5, currentEpoch));
+    bus.publish(sessionId, agent(6, currentEpoch));
+    const resumed = read(
+      await open(
+        "0",
+        "viewer",
+        new Request("https://hub.test/events?organization=org", {
+          headers: { cookie: "viewer", "last-event-id": lastId! },
+        }),
+      ),
+    );
+    bus.publish(sessionId, agent(7, currentEpoch));
+    const replay = await resumed.next();
+    if (expectedId.includes(":")) {
+      expect(replay).toContain(`:5:${currentEpoch}\nevent: agent`);
+      expect(await resumed.next()).toContain(`:6:${currentEpoch}\nevent: agent`);
+    } else {
+      expect(replay).toContain('event: gap\ndata: {"reason":"behind"}');
+    }
+    expect(await resumed.next()).toContain(`:7:${currentEpoch}\nevent: agent`);
+    await resumed.cancel();
+  });
+
   it("emits a gap before switching epoch and discards late items from the prior epoch", async () => {
     const { bus, open } = setup();
     const reader = read(await open());
@@ -153,6 +206,14 @@ describe("interactive session stream", () => {
     expect(await reader.next()).toContain("id: 0:1:new-epoch");
     expect(await reader.next()).toContain("id: 0:2:new-epoch");
     await reader.cancel();
+  });
+
+  it("includes the current cursor in shutdown even before the first agent or Hub item", async () => {
+    const { open, stream } = setup();
+    const reader = read(await open());
+    await stream.beginShutdown();
+    expect(await reader.next()).toContain("id: 0\nevent: shutdown");
+    expect(await reader.next()).toBeNull();
   });
 
   it("ends a removed viewer within one second and discards pending transcript frames", async () => {
@@ -220,6 +281,7 @@ describe("interactive session stream", () => {
     );
     const reader = read(response);
     expect(await reader.next()).toContain("id: 2\nevent: state");
+    expect(await reader.next()).toContain("event: gap");
     bus.publish(sessionId, agent(1, "bad\nevent: injection"));
     bus.publish(sessionId, agent(2));
     expect(await reader.next()).toContain("id: 2:2:");

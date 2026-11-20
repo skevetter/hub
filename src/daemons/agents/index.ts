@@ -223,12 +223,15 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
     return SnapshotSchema.parse(response["agent"]);
   }
   async timeline(agentId: string, query: AgentTimelineQuery): Promise<AgentTimelinePage> {
-    const response = await this.request({
-      ...query,
-      type: "fetch_agent_timeline_request",
-      agentId,
-      projection: "projected",
-    });
+    const response = await this.request(
+      {
+        ...query,
+        type: "fetch_agent_timeline_request",
+        agentId,
+        projection: "projected",
+      },
+      3_000,
+    );
     return TimelinePageSchema.parse(response);
   }
   async send(agentId: string, messageId: string, text: string, timeoutMs?: number): Promise<void> {

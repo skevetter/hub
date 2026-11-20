@@ -8,11 +8,12 @@ profile's settings and sends the messages participants enter. The daemon needs t
 
 Set these variables on the Hub process and restart it.
 
-| Setting                                   | Default | Accepted values                                                         |
-| ----------------------------------------- | ------- | ----------------------------------------------------------------------- |
-| `PASEO_HUB_INTERACTIVE_SESSIONS`          | `false` | `true` or `false`.                                                      |
-| `PASEO_HUB_SESSION_MAX_ACTIVE_PER_DAEMON` | `4`     | Whole numbers from 1 to 50. Counts sessions that have yet to be closed. |
-| `PASEO_HUB_SESSION_MAX_QUEUED`            | `20`    | Whole numbers from 1 to 100. Caps unsettled messages per session.       |
+| Setting                                     | Default | Accepted values                                                                                             |
+| ------------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------- |
+| `PASEO_HUB_INTERACTIVE_SESSIONS`            | `false` | `true` or `false`.                                                                                          |
+| `PASEO_HUB_SESSION_MAX_ACTIVE_PER_DAEMON`   | `4`     | Whole numbers from 1 to 50. Counts sessions that have yet to be closed.                                     |
+| `PASEO_HUB_SESSION_MAX_QUEUED`              | `20`    | Whole numbers from 1 to 100. Caps unsettled messages per session.                                           |
+| `PASEO_HUB_SESSION_MAX_MESSAGES_PER_MINUTE` | `10`    | Whole numbers from 1 to 600. Counts new messages from each person in each session over the previous minute. |
 
 Hub rejects invalid values on startup. With sessions disabled, Hub skips session recovery and
 daemon watches, and session requests return `not_found`.
@@ -21,6 +22,20 @@ A participant with control can steer the current turn or queue a message for the
 turn. A steer can overtake queued messages. Stop interrupts the active turn and discards unsent
 messages. When the daemon reconnects after a disconnect or Hub restart, Hub re-watches the
 recorded agent and resumes eligible pending work. Close leaves the daemon workspace available.
+
+Run interactive sessions on a single Hub process. Database claims and daemon request receipts
+protect command delivery across processes, but each daemon socket and live transcript watch has
+one local owner. With two Hubs, the owner may miss a wakeup or relay text briefly after the other
+process accepts a close.
+
+Changing session participants triggers an immediate stream access check. When someone loses
+organization membership outside the session, an open stream can take up to 60 seconds to recheck
+that membership. New requests check current membership.
+
+PostgreSQL times command leases using its own clock. Retry backoff uses elapsed time on Hub.
+The Hub clock supplies message timestamps, rate windows and retention cutoffs. A clock jump
+forward can expire and permanently remove bodies early when expiry is on. Message order follows
+the stored ordinal.
 
 ## Message retention
 

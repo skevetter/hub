@@ -28,6 +28,7 @@ interface SubscriberOptions {
   sessionId: string;
   principal: SessionPrincipal;
   cursor: SessionStreamCursor;
+  resumeWithoutAgent: boolean;
   service: SessionStreamSource;
   bus: SessionEventBus;
   settings: SessionStreamSettings;
@@ -78,6 +79,7 @@ export class SessionStreamSubscriber {
     this.hubSeq = options.cursor.hubSeq;
     this.catchUp = options.cursor.agent;
     this.agent = options.cursor.agent;
+    if (options.resumeWithoutAgent) this.setCatchUpGap("behind");
     this.body = new ReadableStream(
       {
         start: (controller) => {
@@ -112,7 +114,7 @@ export class SessionStreamSubscriber {
   }
 
   shutdown(reconnectMs = 5000): void {
-    this.end(frame("shutdown", { reconnectMs }));
+    this.end(this.frameAtCursor("shutdown", { reconnectMs }));
   }
 
   end(terminal?: string): void {
@@ -139,7 +141,7 @@ export class SessionStreamSubscriber {
   }
 
   private fail(code: CloseCode): void {
-    this.end(frame("error", { code }));
+    this.end(this.frameAtCursor("error", { code }));
   }
 
   private receive(notification: SessionNotification): void {
@@ -287,7 +289,7 @@ export class SessionStreamSubscriber {
         return;
       }
       this.options.reportFailure(error);
-      this.end(frame("resync", {}));
+      this.end(this.frameAtCursor("resync", {}));
     }
   }
 
@@ -297,7 +299,7 @@ export class SessionStreamSubscriber {
     const rows = await service.streamEvents(this.principal, sessionId, this.hubSeq, MAX_REPLAY + 1);
     if (this.closed) return;
     if (rows.length > MAX_REPLAY) {
-      this.end(frame("resync", {}));
+      this.end(this.frameAtCursor("resync", {}));
       return;
     }
     this.hubRows = rows;
@@ -364,15 +366,17 @@ export class SessionStreamSubscriber {
       case "agent":
         return this.sendAgent(event);
       case "connection":
-        return this.send(frame("connection", { daemon: event.online ? "online" : "offline" }));
+        return this.send(
+          this.frameAtCursor("connection", { daemon: event.online ? "online" : "offline" }),
+        );
       case "gap":
         if (event.reason === "epoch_changed" && this.agent !== null) {
           this.retiredEpochs.add(this.agent.epoch);
           this.agent = null;
         }
-        return this.send(frame("gap", { reason: event.reason }));
+        return this.send(this.frameAtCursor("gap", { reason: event.reason }));
       default:
-        this.end(frame("resync", {}));
+        this.end(this.frameAtCursor("resync", {}));
         return true;
     }
   }
@@ -386,7 +390,7 @@ export class SessionStreamSubscriber {
         this.retiredEpochs.add(this.agent.epoch);
         this.agent = null;
         this.pendingAgent = event;
-        return this.send(frame("gap", { reason: "epoch_changed" }));
+        return this.send(this.frameAtCursor("gap", { reason: "epoch_changed" }));
       }
       if (item.seq <= this.agent.seq) return false;
     }
@@ -394,6 +398,10 @@ export class SessionStreamSubscriber {
       return false;
     this.agent = { epoch, seq: item.seq };
     return true;
+  }
+
+  private frameAtCursor(event: string, data: unknown): string {
+    return frame(event, data, cursorId(this.hubSeq, this.agent));
   }
 
   private send(value: string): boolean {

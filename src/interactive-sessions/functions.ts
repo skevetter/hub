@@ -21,7 +21,10 @@ const slug = z.string().trim().min(1).max(100);
 const id = z.uuid().transform((value) => value.toLowerCase());
 const role = z.enum(["controller", "viewer"]);
 const userId = z.string().min(1).max(100);
-const message = z.string().min(1);
+const message = z
+  .string()
+  .min(1)
+  .max(16 * 1024);
 const scope = z.object({ organizationSlug: slug });
 const session = scope.extend({ sessionId: id });
 const control = session.extend({ generation: z.number().int().positive(), idempotencyKey: id });

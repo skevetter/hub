@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import type { AuthServer } from "../auth/server.js";
-import type { AgentHistory } from "../daemons/agents/index.js";
+import { DaemonAgentError, type AgentHistory } from "../daemons/agents/index.js";
 import type { QueryHandle } from "../db/runtime/index.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { SessionEventBus } from "./bus.js";
@@ -246,6 +246,112 @@ describe("interactive session service", () => {
       },
     ]);
     expect("items" in catchUp && catchUp.items).toEqual("entries" in history && history.entries);
+  });
+
+  it("reports unavailable history when the connected daemon lacks timeline fetch", async () => {
+    timeline.mockRejectedValue(new DaemonAgentError("unsupported request", "unknown_request"));
+    expect(
+      await service.history(request("controller"), { ...scope, before: null, limit: 20 }),
+    ).toMatchObject({ unavailable: "history_unavailable" });
+    expect(
+      await service.streamCatchUp(
+        { organizationId, userId: "controller", role: "member" },
+        sessionId,
+        { epoch: "epoch", seq: 1 },
+      ),
+    ).toEqual({ gap: "behind" });
+  });
+
+  it("redacts a known value across history rows with a tool between them", async () => {
+    const timestamp = now.toISOString();
+    timeline.mockResolvedValue({
+      epoch: "epoch",
+      reset: false,
+      staleCursor: false,
+      gap: false,
+      startCursor: { epoch: "epoch", seq: 1 },
+      endCursor: { epoch: "epoch", seq: 3 },
+      hasOlder: false,
+      hasNewer: false,
+      entries: [
+        {
+          item: {
+            type: "assistant_message",
+            messageId: "reply",
+            text: "See " + historySecret.slice(0, 7),
+          },
+          timestamp,
+          seqStart: 1,
+          seqEnd: 1,
+          turnId: "turn",
+        },
+        {
+          item: {
+            type: "tool_call",
+            callId: "call",
+            name: "shell",
+            status: "completed",
+            error: null,
+            detail: { type: "unknown", input: null, output: null },
+          },
+          timestamp,
+          seqStart: 2,
+          seqEnd: 2,
+          turnId: "turn",
+        },
+        {
+          item: {
+            type: "assistant_message",
+            messageId: "reply",
+            text: historySecret.slice(7) + " here.",
+          },
+          timestamp,
+          seqStart: 3,
+          seqEnd: 3,
+          turnId: "turn",
+        },
+      ],
+    });
+    const page = await service.history(request("controller"), {
+      ...scope,
+      before: null,
+      limit: 20,
+    });
+    expect(page).toMatchObject({
+      entries: [
+        { kind: "assistant", text: "See [redacted]", seq: 1 },
+        { kind: "tool", status: "completed", seq: 2 },
+        { kind: "assistant", text: " here.", seq: 3 },
+      ],
+    });
+  });
+
+  it("signals a gap when persisted history overlaps a progressive assistant cursor", async () => {
+    timeline.mockResolvedValue({
+      epoch: "epoch",
+      reset: false,
+      staleCursor: false,
+      gap: false,
+      startCursor: { epoch: "epoch", seq: 4 },
+      endCursor: { epoch: "epoch", seq: 5 },
+      hasOlder: true,
+      hasNewer: false,
+      entries: [
+        {
+          item: { type: "assistant_message", text: "The entire response." },
+          timestamp: now.toISOString(),
+          seqStart: 1,
+          seqEnd: 5,
+        },
+      ],
+    });
+    expect(
+      await service.streamCatchUp(
+        { organizationId, userId: "controller", role: "member" },
+        sessionId,
+        { epoch: "epoch", seq: 3 },
+      ),
+    ).toEqual({ gap: "behind" });
   });
 
   it("shows Stop attention from the latest state event in snapshot and list", async () => {

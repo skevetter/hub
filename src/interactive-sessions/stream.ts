@@ -73,9 +73,8 @@ export class InteractiveSessionStream {
     try {
       const principal = await service.authorizeStream(request, organizationSlug, id);
       if (typeof principal === "string") return fail(principal);
-      const cursor = parseCursor(
-        request.headers.get("last-event-id") ?? url.searchParams.get("after"),
-      );
+      const lastEventId = request.headers.get("last-event-id");
+      const cursor = parseCursor(lastEventId ?? url.searchParams.get("after"));
       if (cursor === undefined) return fail("invalid_request");
       if (this.closing) return fail("shutting_down");
       const { userId, organizationId } = principal;
@@ -96,6 +95,7 @@ export class InteractiveSessionStream {
         organizationSlug,
         principal,
         cursor,
+        resumeWithoutAgent: cursor.agent === null && (lastEventId !== null || cursor.hubSeq > 0),
         release: () => {
           this.subscribers.delete(subscriber);
           decrement(this.users, userId);
