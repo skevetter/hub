@@ -143,6 +143,42 @@ test("hides Sessions navigation and routes when the flag is off", async ({ hub, 
 test.describe("interactive sessions", () => {
   test.use({ interactiveSessions: true });
 
+  test("a profile loads providers for a new working directory", async ({ hub, page }) => {
+    const app = await setup(hub);
+    const daemon = await enroll(hub, owner.email);
+    const directory = "/workspace/cold";
+    const requestedDirectories: (string | undefined)[] = [];
+    daemon.providerSnapshotEntries = (cwd) => {
+      requestedDirectories.push(cwd);
+      return [
+        {
+          provider: "codex",
+          label: "Codex",
+          status: requestedDirectories.length === 1 ? "loading" : "ready",
+          enabled: true,
+        },
+      ];
+    };
+    try {
+      await page.goto(app.origin + app.base + "/sessions/profiles");
+      await page.getByRole("button", { name: "Create a profile" }).click();
+      const dialog = page.getByRole("dialog");
+      await dialog.getByRole("combobox", { name: "Daemon", exact: true }).click();
+      await page.getByRole("option", { name: "devbox", exact: true }).click();
+      const cwd = dialog.getByRole("textbox", { name: "Working directory" });
+      await cwd.fill(directory);
+      await expect.poll(() => requestedDirectories.length).toBe(1);
+      await expect(dialog.getByText("Loading provider settings...")).toBeVisible();
+      await expect(dialog.getByText("No providers available")).toHaveCount(0);
+      await chooseProfileOption(page, "Provider", "Codex");
+      await expect(cwd).toHaveValue(directory);
+      await expect(dialog.getByText("Loading provider settings...")).toHaveCount(0);
+      expect(requestedDirectories).toEqual([directory, directory]);
+    } finally {
+      await daemon.disconnect();
+    }
+  });
+
   test("an admin creates a profile and starts a session while members cannot manage profiles", async ({
     browser,
     hub,

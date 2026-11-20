@@ -8,6 +8,7 @@ import { FailureAlert, WarningAlert } from "../../components/app/failure-alert.j
 import { FormDialog } from "../../components/app/form-dialog.js";
 import { FormField } from "../../components/app/form-field.js";
 import { LoadingLine } from "../../components/app/loading.js";
+import { Button } from "../../components/ui/button.js";
 import {
   Select,
   SelectContent,
@@ -15,8 +16,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../../components/ui/select.js";
+import type { Result } from "../../contract/respond.js";
 import { daemonList, daemonProviderSnapshot } from "../../daemons/functions.js";
-import type { HubProviderSnapshot } from "../../hub/protocol.js";
+import type { HubProviderSnapshot, HubProviderSnapshotEntry } from "../../hub/protocol.js";
 import { useSnapshotQuery } from "../../queries/index.js";
 import type { ProfileView } from "../functions.js";
 
@@ -27,6 +29,8 @@ export interface ProfileFormData extends Omit<ProfileView, "daemonSlug" | "id" |
 
 const EMPTY_SETTINGS = { provider: "", model: "", mode: "", thinking: "", acknowledged: false };
 const EMPTY_OPTIONS: readonly [] = [];
+const PROVIDER_POLL_INTERVAL_MS = 2000;
+const PROVIDER_POLL_TIMEOUT_MS = 30_000;
 
 export function SessionProfileForm({
   organizationSlug,
@@ -205,9 +209,23 @@ function useProfileDaemon(organizationSlug: string, daemonId: string, directory:
   const available = options.some(({ value }) => value === daemonId);
   const enabled = available && catalogCwd !== "" && catalogCwd === directory;
   const query = useSnapshotQuery({
-    queryKey: ["session-profile-catalog", organizationSlug, accountId, daemonId, catalogCwd],
+    queryKey: [
+      "session-profile-catalog",
+      organizationSlug,
+      accountId,
+      daemonId,
+      enabled ? catalogCwd : "",
+    ],
     enabled,
-    queryFn: () => loadProviders({ data: { organizationSlug, daemonId, cwd: catalogCwd } }),
+    queryFn: ({ signal }) =>
+      loadProfileCatalog(
+        (readSignal) =>
+          loadProviders({
+            data: { organizationSlug, daemonId, cwd: catalogCwd },
+            signal: readSignal,
+          }),
+        signal,
+      ),
   });
   return {
     options,
@@ -215,6 +233,58 @@ function useProfileDaemon(organizationSlug: string, daemonId: string, directory:
     daemons,
     catalog: { ...query, enabled, data: enabled ? query.data : undefined },
   };
+}
+
+function isReadyProvider({ status, enabled }: HubProviderSnapshotEntry): boolean {
+  return status === "ready" && enabled;
+}
+
+function isLoadingCatalog({ entries }: HubProviderSnapshot): boolean {
+  return entries.some(({ status }) => status === "loading") && !entries.some(isReadyProvider);
+}
+
+async function loadProfileCatalog(
+  read: (signal: AbortSignal) => Promise<Result<HubProviderSnapshot>>,
+  signal: AbortSignal,
+): Promise<Result<HubProviderSnapshot>> {
+  const initial = await read(signal);
+  if (initial.status !== "ok" || !isLoadingCatalog(initial.data)) return initial;
+
+  const deadline = new AbortController();
+  const timeout = setTimeout(() => deadline.abort(), PROVIDER_POLL_TIMEOUT_MS);
+  const pollSignal = AbortSignal.any([signal, deadline.signal]);
+  try {
+    let snapshot = initial;
+    while (isLoadingCatalog(snapshot.data)) {
+      await waitForProviderPoll(pollSignal);
+      pollSignal.throwIfAborted();
+      const result = await read(pollSignal);
+      if (result.status === "error") return result;
+      snapshot = result;
+    }
+    return snapshot;
+  } catch (error) {
+    signal.throwIfAborted();
+    if (deadline.signal.aborted) return initial;
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function waitForProviderPoll(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted();
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, PROVIDER_POLL_INTERVAL_MS);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function DaemonField({
@@ -296,10 +366,7 @@ function useProfileAgent(profile: ProfileView | null, catalog: HubProviderSnapsh
     acknowledged: profile?.fullAccessAcknowledged ?? false,
   });
   const available = useMemo(
-    () =>
-      (catalog?.entries ?? EMPTY_OPTIONS).filter(
-        ({ status, enabled }) => status === "ready" && enabled,
-      ),
+    () => (catalog?.entries ?? EMPTY_OPTIONS).filter(isReadyProvider),
     [catalog],
   );
   const providers = useMemo(
@@ -440,6 +507,16 @@ function CatalogStatus({
   catalog: ReturnType<typeof useProfileDaemon>["catalog"];
   hasProviders: boolean;
 }) {
+  const { refetch } = catalog;
+  const retry = useCallback(() => refetch(), [refetch]);
+  const retryAction = useMemo(
+    () => (
+      <Button type="button" size="sm" variant="outline" onClick={retry}>
+        Retry
+      </Button>
+    ),
+    [retry],
+  );
   if (!catalog.enabled) return null;
   if (catalog.isFetching) return <LoadingLine>Loading provider settings...</LoadingLine>;
   if (catalog.status === "error") {
@@ -453,8 +530,9 @@ function CatalogStatus({
     );
   }
   if (!hasProviders) {
+    const timedOut = catalog.data !== undefined && isLoadingCatalog(catalog.data);
     return (
-      <WarningAlert title="No providers available">
+      <WarningAlert title="No providers available" action={timedOut ? retryAction : undefined}>
         Check the providers configured on the daemon.
       </WarningAlert>
     );

@@ -300,12 +300,14 @@ export class HubHarness {
   async connectDaemon(
     token?: string,
     permissions: readonly string[] = ["hub.execute"],
+    providerSnapshotEntries?: TestDaemon["providerSnapshotEntries"],
   ): Promise<string> {
     const issued =
       token === undefined ? await this.issueEnrollment() : { status: 201 as const, token };
     if (issued.status !== 201 || !("token" in issued))
       throw new Error("Enrollment token was not issued");
     this.connectedDaemon = TestDaemon.create(this.origin);
+    this.connectedDaemon.providerSnapshotEntries = providerSnapshotEntries;
     const daemon = await this.connectedDaemon.enroll(issued.token, undefined, permissions);
     await this.connectedDaemon.connect(daemon);
     await this.observeConnectedPresence(daemon.daemonId);
@@ -2259,7 +2261,10 @@ export class TestDaemon {
   timelineAgentIds: readonly string[] = [];
   private socket: WebSocket | undefined;
   private permissions: string[] = [];
-  providerSnapshotEntries: HubProviderSnapshot["entries"] | undefined;
+  providerSnapshotEntries:
+    | HubProviderSnapshot["entries"]
+    | ((cwd: string | undefined) => HubProviderSnapshot["entries"])
+    | undefined;
   private readonly agents = new Map<string, Record<string, unknown>>();
   private createRequests = 0;
   private includeBackground = false;
@@ -2737,12 +2742,13 @@ export class TestDaemon {
     if (!envelope.success) return;
     const request = envelope.data.message;
     if (request.type === "get_providers_snapshot_request") {
+      const entries = this.providerSnapshotEntries;
       this.send({
         type: "get_providers_snapshot_response",
         payload: {
           requestId: request.requestId,
           cwd: request.cwd,
-          entries: this.providerSnapshotEntries ?? [],
+          entries: typeof entries === "function" ? entries(request.cwd) : (entries ?? []),
           generatedAt: new Date().toISOString(),
         },
       });

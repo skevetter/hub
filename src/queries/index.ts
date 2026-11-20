@@ -1,4 +1,4 @@
-import { useQuery, type QueryKey } from "@tanstack/react-query";
+import { useQuery, type QueryFunctionContext, type QueryKey } from "@tanstack/react-query";
 import { useCallback } from "react";
 import type { Result } from "../contract/respond.js";
 
@@ -18,7 +18,7 @@ class SnapshotFailure extends Error {}
  */
 export function useSnapshotQuery<T>(options: {
   queryKey: QueryKey;
-  queryFn: () => Promise<Result<T>>;
+  queryFn: (context: QueryFunctionContext) => Promise<Result<T>>;
   enabled?: boolean;
   refetchInterval?: number;
 }): Snapshot<T> & {
@@ -29,8 +29,8 @@ export function useSnapshotQuery<T>(options: {
 } {
   const query = useQuery({
     ...options,
-    queryFn: async () => {
-      const result = await options.queryFn();
+    queryFn: async (context) => {
+      const result = await options.queryFn(context);
       if (result.status === "error") throw new SnapshotFailure(result.error.message);
       return result.data;
     },
