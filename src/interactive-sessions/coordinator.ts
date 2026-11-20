@@ -775,9 +775,11 @@ export class InteractiveSessionCoordinator {
     worker: Worker,
     session: SessionRecord,
     agents: AgentConnection,
+    onCreated?: (agent: AgentSnapshot) => void,
   ): Promise<SessionRecord | undefined> {
     if (!session.daemonAgentId) {
       const agent = await this.createSessionAgent(agents, session);
+      onCreated?.(agent);
       if (this.agents(worker.daemonId) !== agents) return undefined;
       if (
         !(await this.database.bindInteractiveSessionAgent({
@@ -798,24 +800,20 @@ export class InteractiveSessionCoordinator {
     return session;
   }
 
-  private createSessionAgent(agents: AgentConnection, session: SessionRecord, timeoutMs?: number) {
+  private createSessionAgent(agents: AgentConnection, session: SessionRecord) {
     const { launch } = session;
-    return agents.create(
-      `isession:${session.id}:${session.generation}`,
-      {
-        provider: launch.provider,
-        cwd: launch.cwd,
-        env: {},
-        title: session.title,
-        background: false,
-        ...(launch.worktree === null ? {} : { worktree: launch.worktree }),
-        ...(launch.model === null ? {} : { model: launch.model }),
-        ...(launch.mode === null ? {} : { mode: launch.mode }),
-        ...(launch.thinkingOptionId === null ? {} : { thinkingOptionId: launch.thinkingOptionId }),
-        providerOptions: launch.providerOptions,
-      },
-      timeoutMs,
-    );
+    return agents.create(`isession:${session.id}:${session.generation}`, {
+      provider: launch.provider,
+      cwd: launch.cwd,
+      env: {},
+      title: session.title,
+      background: false,
+      ...(launch.worktree === null ? {} : { worktree: launch.worktree }),
+      ...(launch.model === null ? {} : { model: launch.model }),
+      ...(launch.mode === null ? {} : { mode: launch.mode }),
+      ...(launch.thinkingOptionId === null ? {} : { thinkingOptionId: launch.thinkingOptionId }),
+      providerOptions: launch.providerOptions,
+    });
   }
 
   private async dispatchControls(
@@ -953,8 +951,11 @@ export class InteractiveSessionCoordinator {
     session: SessionRecord,
     command: SessionCommandRecord,
   ): Promise<void> {
+    let created: AgentSnapshot | undefined;
     try {
-      const bound = await this.ensureAgent(worker, session, agents);
+      const bound = await this.ensureAgent(worker, session, agents, (agent) => {
+        created = agent;
+      });
       if (!bound) throw new DaemonResponseLostError();
       try {
         await this.watch(worker, bound, agents);
@@ -970,7 +971,7 @@ export class InteractiveSessionCoordinator {
         if (!(await this.settle(worker, command, { status: "unknown" }))) return;
         if (command.attempts < maxDeliveryAttempts)
           this.scheduleDispatch(worker, "control", retryDelay(command));
-        else await this.archiveOrphanedReplacement(worker, agents, session);
+        else await this.archiveOrphanedReplacement(worker, agents, session, created);
       } else {
         await this.settle(worker, command, { status: "failed", failureCode: "launch_failed" });
         await this.transition(worker, session, ["starting"], "failed", "launch_failed");
@@ -982,8 +983,14 @@ export class InteractiveSessionCoordinator {
     worker: Worker,
     agents: AgentConnection,
     session: SessionRecord,
+    agent: AgentSnapshot | undefined,
   ) {
     try {
+      if (!agent)
+        throw new DaemonAgentError(
+          "Replacement create receipt unavailable",
+          "agent_create_receipt_unavailable",
+        );
       if (agents.archiveAgent === undefined || this.agents(worker.daemonId) !== agents) return;
       const closed = await this.session(worker);
       if (
@@ -993,8 +1000,6 @@ export class InteractiveSessionCoordinator {
         closed.daemonAgentId !== null
       )
         return;
-      // The daemon exposes its create receipt through the same keyed, prompt-free request.
-      const agent = await this.createSessionAgent(agents, session, 2_000);
       if (agent.status === "idle" && !isArchived(agent) && this.agents(worker.daemonId) === agents)
         await agents.archiveAgent(agent.id, 2_000);
     } catch (error) {

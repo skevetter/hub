@@ -726,7 +726,7 @@ test("restart also recovers a pending Stop on an offline daemon", async () => {
   }
 });
 
-test("five uncertain replacement attempts make the failed launch visible", async () => {
+test("five uncertain replacement attempts close without creating an agent for cleanup", async () => {
   const f = await fixture();
   const { sessionId } = await f.running();
   const current = (await f.state(sessionId))!;
@@ -744,9 +744,11 @@ test("five uncertain replacement attempts make the failed launch visible", async
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   try {
     let replacementResponses = 0;
-    f.agents.afterCreate = async () => {
+    const create = f.agents.create.bind(f.agents);
+    const attempts = vi.spyOn(f.agents, "create").mockImplementation(async (key, options) => {
       if (++replacementResponses <= 5) throw new DaemonResponseLostError();
-    };
+      return create(key, options);
+    });
     accepted(await f.coordinator.replaceAgent(f.principal, f.command(sessionId)));
     await vi.advanceTimersByTimeAsync(18_000);
     const closed = await f.state(sessionId);
@@ -756,12 +758,14 @@ test("five uncertain replacement attempts make the failed launch visible", async
       stateReason: "launch_failed",
       generation: 2,
     });
-    expect(f.agents.archives).toEqual(["agent-2"]);
-    expect(f.agents.creations).toHaveLength(7);
-    expect(f.agents.creations.slice(1).map(({ key }) => key)).toEqual(
-      Array(6).fill(`isession:${sessionId}:2`),
-    );
-    expect(f.agents.snapshots.size).toBe(2);
+    expect(attempts).toHaveBeenCalledTimes(5);
+    expect(f.agents.archives).toEqual([]);
+    expect(f.agents.snapshots.size).toBe(1);
+    expect(f.reportFailure.mock.calls).toContainEqual([
+      expect.objectContaining({ code: "agent_create_receipt_unavailable" }),
+      "interactive_session.archive_orphaned_replacement",
+      expect.anything(),
+    ]);
   } finally {
     vi.useRealTimers();
   }
