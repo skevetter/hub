@@ -7,9 +7,9 @@ import type { QueryHandle } from "../db/runtime/index.js";
 import type { Database } from "../db/types.js";
 import { isTenantRouteNotFoundError, resolveRouteTenant } from "../projects/access.js";
 import type { TimelineScrubber } from "../run-timeline/capture-types.js";
-import { createTimelineScrubber } from "../run-timeline/scrub.js";
 import { capabilities } from "./access.js";
 import type { SessionEventBus } from "./bus.js";
+import { SessionTranscriptNormalizer } from "./normalize.js";
 import { commandCapability, profileValidation, validMessage } from "./store.js";
 import type {
   CommandStatus,
@@ -70,6 +70,7 @@ export interface SendCommand extends ControlCommand {
 export type CommandInput = { organizationSlug: string } & (
   | ({ kind: "start" } & StartCommand)
   | ({ kind: "send" } & SendCommand)
+  | ({ kind: "retry"; commandId: string } & ControlCommand)
   | ({ kind: "stop" | "close" | "replace" } & ControlCommand)
 );
 
@@ -118,6 +119,10 @@ export type SessionListPage = Awaited<ReturnType<InteractiveSessionService["list
 export interface SessionCoordinator {
   start(principal: SessionPrincipal, input: StartCommand): Promise<CommandOutcome>;
   send(principal: SessionPrincipal, input: SendCommand): Promise<CommandOutcome>;
+  retry(
+    principal: SessionPrincipal,
+    input: ControlCommand & { commandId: string },
+  ): Promise<CommandOutcome>;
   stop(principal: SessionPrincipal, input: ControlCommand): Promise<CommandOutcome>;
   close(principal: SessionPrincipal, input: ControlCommand): Promise<CommandOutcome>;
   replaceAgent(principal: SessionPrincipal, input: ControlCommand): Promise<CommandOutcome>;
@@ -133,6 +138,7 @@ interface ServiceOptions {
     daemonId: string,
   ): Pick<DaemonConnection, "history" | "validateAgentConfiguration"> | undefined;
   scrub?: TimelineScrubber;
+  scrubValues?: readonly string[];
   bodyCutoff: () => Date | null;
   now?: () => Date;
 }
@@ -145,8 +151,6 @@ interface ParticipantView {
 type SessionAccess = SessionWithParticipants & { rights: ReturnType<typeof capabilities> };
 type BrowserAccess = SessionPrincipal | "unauthorized" | "not_found";
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu;
-const TOOL_NAME = /^[A-Za-z0-9_.:/ -]{1,64}(?![\s\S])/u;
-const MAX_ASSISTANT_BYTES = 64 * 1024;
 
 export class SessionReadError extends Error {
   constructor(readonly code: "not_found" | "invalid_request") {
@@ -165,11 +169,11 @@ export function isSessionId(value: string): boolean {
 
 export class InteractiveSessionService {
   private readonly now: () => Date;
-  private readonly scrub: TimelineScrubber;
+  private readonly transcript: SessionTranscriptNormalizer;
 
   constructor(private readonly options: ServiceOptions) {
     this.now = options.now ?? (() => new Date());
-    this.scrub = options.scrub ?? createTimelineScrubber();
+    this.transcript = new SessionTranscriptNormalizer(options.scrubValues, options.scrub);
   }
 
   async snapshot(request: Request, input: Scope) {
@@ -182,13 +186,16 @@ export class InteractiveSessionService {
       { beforeOrdinal: null, limit: 50 },
       this.options.bodyCutoff(),
     );
-    const names = await this.userNames([
-      session.startedByUserId,
-      ...access.participants.map(({ userId }) => userId),
-      ...messages.map(({ authorUserId }) => authorUserId),
+    const [names, attention] = await Promise.all([
+      this.userNames([
+        session.startedByUserId,
+        ...access.participants.map(({ userId }) => userId),
+        ...messages.map(({ authorUserId }) => authorUserId),
+      ]),
+      this.unconfirmedStops(principal.organizationId, [session]),
     ]);
     return {
-      session: await this.sessionView(session, names),
+      session: await this.sessionView(session, names, attention.has(session.id)),
       ...this.accessView(access, names),
       messages: messages.toReversed().map((message) => this.messageView(message, names)),
       hubSeq: session.hubSeq,
@@ -231,9 +238,14 @@ export class InteractiveSessionService {
         limit: 25,
       },
     );
-    const names = await this.userNames(page.sessions.map(({ startedByUserId }) => startedByUserId));
+    const [names, attention] = await Promise.all([
+      this.userNames(page.sessions.map(({ startedByUserId }) => startedByUserId)),
+      this.unconfirmedStops(principal.organizationId, page.sessions),
+    ]);
     return {
-      sessions: await Promise.all(page.sessions.map((session) => this.sessionView(session, names))),
+      sessions: await Promise.all(
+        page.sessions.map((session) => this.sessionView(session, names, attention.has(session.id))),
+      ),
       nextCursor:
         page.nextCursor === null
           ? null
@@ -276,6 +288,8 @@ export class InteractiveSessionService {
         delivery: input.delivery,
       });
     }
+    if (input.kind === "retry")
+      return coordinator.retry(principal, { ...control, commandId: input.commandId });
     if (input.kind === "replace") return coordinator.replaceAgent(principal, control);
     return coordinator[input.kind](principal, control);
   }
@@ -536,7 +550,35 @@ export class InteractiveSessionService {
     };
   }
 
-  private async sessionView(session: SessionRecord, names: Map<string, string>) {
+  private async unconfirmedStops(
+    organizationId: string,
+    sessions: readonly SessionRecord[],
+  ): Promise<Set<string>> {
+    const running = sessions.filter(
+      (session) => session.state === "running" && session.stateReason === null,
+    );
+    if (running.length === 0) return new Set();
+    const { rows } = await this.options.pool.query<{ id: string }>(
+      `select input.id
+         from unnest($2::uuid[], $3::integer[]) as input(id, seq)
+         join lateral (
+           select event.data ->> 'stateReason' as reason
+           from interactive_session_events event
+           where event.organization_id = $1 and event.session_id = input.id
+             and event.kind = 'state' and event.seq <= input.seq
+           order by event.seq desc
+           limit 1
+         ) latest on latest.reason = 'stop_unconfirmed'`,
+      [organizationId, running.map(({ id }) => id), running.map(({ hubSeq }) => hubSeq)],
+    );
+    return new Set(rows.map(({ id }) => id));
+  }
+
+  private async sessionView(
+    session: SessionRecord,
+    names: Map<string, string>,
+    stopUnconfirmed: boolean,
+  ) {
     const { database } = this.options;
     const [profile, daemon] = await Promise.all([
       database.findSessionProfile(session.organizationId, session.profileId),
@@ -548,7 +590,7 @@ export class InteractiveSessionService {
       id: session.id,
       title: session.title,
       state: session.state,
-      stateReason: session.stateReason,
+      stateReason: stopUnconfirmed ? ("stop_unconfirmed" as const) : session.stateReason,
       generation: session.generation,
       turn: session.turn,
       profile: { id: session.profileId, name: profile?.name ?? session.title },
@@ -574,8 +616,17 @@ export class InteractiveSessionService {
   }
 
   private messageView(message: SessionMessageRecord, names: Map<string, string>) {
-    const { commandId, ordinal, authorUserId, delivery, status, body, expired, createdAt } =
-      message;
+    const {
+      commandId,
+      ordinal,
+      authorUserId,
+      delivery,
+      status,
+      body,
+      expired,
+      createdAt,
+      retryable,
+    } = message;
     return {
       commandId,
       ordinal,
@@ -583,6 +634,7 @@ export class InteractiveSessionService {
       status,
       text: body,
       expired,
+      retryable,
       createdAt: createdAt.toISOString(),
       authorName: (authorUserId === null ? undefined : names.get(authorUserId)) ?? "Unknown user",
     };
@@ -665,37 +717,9 @@ export class InteractiveSessionService {
 
   private projectHistory(page: AgentTimelinePage): TranscriptEntry[] {
     const entries: TranscriptEntry[] = [];
-    for (const { item, seqStart, seqEnd, turnId, timestamp } of page.entries) {
-      const meta = { seq: seqEnd, seqStart, seqEnd, at: timestamp, ...(turnId ? { turnId } : {}) };
-      switch (item.type) {
-        case "assistant_message": {
-          const text = this.scrub(item.text, MAX_ASSISTANT_BYTES);
-          entries.push({
-            ...meta,
-            kind: "assistant",
-            text,
-            truncated: Buffer.byteLength(item.text) > MAX_ASSISTANT_BYTES,
-          });
-          break;
-        }
-        case "tool_call": {
-          const name = this.scrub(item.name, 64);
-          entries.push({
-            ...meta,
-            kind: "tool",
-            name: TOOL_NAME.test(name) ? name : "unnamed",
-            status: item.status,
-          });
-          break;
-        }
-        case "user_message": {
-          const commandId = [item.messageId, item.clientMessageId].find(
-            (id) => id !== undefined && isSessionId(id),
-          );
-          entries.push({ ...meta, kind: "human", commandId: commandId ?? null });
-          break;
-        }
-      }
+    for (const entry of page.entries) {
+      const projected = this.transcript.history(entry);
+      if (projected) entries.push(projected);
     }
     return entries;
   }

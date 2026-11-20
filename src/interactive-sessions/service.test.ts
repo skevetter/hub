@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import type { AuthServer } from "../auth/server.js";
+import type { AgentHistory } from "../daemons/agents/index.js";
 import type { QueryHandle } from "../db/runtime/index.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { SessionEventBus } from "./bus.js";
@@ -115,7 +116,10 @@ describe("interactive session service", () => {
     stop: vi.fn(),
     close: vi.fn(),
     replaceAgent: vi.fn(),
+    retry: vi.fn(),
   };
+  const timeline = vi.fn<AgentHistory["timeline"]>();
+  const historySecret = "test-history-secret";
   const validate = vi.fn(async () => ({ valid: true as const }));
   const bus = new SessionEventBus();
   const saveInput = {
@@ -151,7 +155,8 @@ describe("interactive session service", () => {
     bus,
     pool,
     bodyCutoff: () => null,
-    connectionForDaemon: () => ({ validateAgentConfiguration: validate }),
+    connectionForDaemon: () => ({ validateAgentConfiguration: validate, history: { timeline } }),
+    scrubValues: [historySecret],
   });
   const scope = { organizationSlug: "org", sessionId };
   const control = { ...scope, generation: 1, idempotencyKey: randomUUID() };
@@ -192,6 +197,107 @@ describe("interactive session service", () => {
     coordinator.stop.mockResolvedValue(accepted);
     coordinator.send.mockResolvedValue({ ...accepted, replayed: true });
     coordinator.start.mockResolvedValue(accepted);
+  });
+
+  it("normalizes history and cursor catch-up through the same prose projection", async () => {
+    const at = now.toISOString();
+    timeline.mockResolvedValue({
+      epoch: "epoch",
+      reset: false,
+      staleCursor: false,
+      gap: false,
+      startCursor: { epoch: "epoch", seq: 1 },
+      endCursor: { epoch: "epoch", seq: 4 },
+      hasOlder: false,
+      hasNewer: false,
+      entries: [
+        {
+          item: {
+            type: "assistant_message",
+            text: "All tests passed. The design doc: " + historySecret,
+          },
+          timestamp: at,
+          seqStart: 1,
+          seqEnd: 4,
+          turnId: "turn",
+        },
+      ],
+    });
+    const history = await service.history(request("controller"), {
+      ...scope,
+      before: null,
+      limit: 20,
+    });
+    const catchUp = await service.streamCatchUp(
+      { organizationId, userId: "controller", role: "member" },
+      sessionId,
+      { epoch: "epoch", seq: 0 },
+    );
+    expect("entries" in history && history.entries).toEqual([
+      {
+        kind: "assistant",
+        text: "All tests passed. The design doc: [redacted]",
+        seq: 4,
+        seqStart: 1,
+        seqEnd: 4,
+        turnId: "turn",
+        at,
+        truncated: false,
+      },
+    ]);
+    expect("items" in catchUp && catchUp.items).toEqual("entries" in history && history.entries);
+  });
+
+  it("shows Stop attention from the latest state event in snapshot and list", async () => {
+    const attention = { ...session, hubSeq: 12 };
+    findSession.mockResolvedValue({ session: attention, participants });
+    vi.spyOn(database, "listInteractiveSessions").mockResolvedValue({
+      sessions: [attention],
+      nextCursor: null,
+    });
+    const names = {
+      rows: users.map(({ userId }) => ({ id: userId, name: userId })),
+      rowCount: users.length,
+    };
+    query.mockImplementation(async (statement) =>
+      statement.includes("interactive_session_events")
+        ? { rows: [{ id: sessionId }], rowCount: 1 }
+        : names,
+    );
+    const snapshot = await service.snapshot(request("controller"), scope);
+    expect(snapshot.session).toMatchObject({ state: "running", stateReason: "stop_unconfirmed" });
+    const page = await service.list(request("controller"), {
+      organizationSlug: "org",
+      cursor: null,
+      filter: "active",
+    });
+    expect(page.sessions[0]?.stateReason).toBe("stop_unconfirmed");
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("event.seq <= input.seq"), [
+      organizationId,
+      [sessionId],
+      [12],
+    ]);
+  });
+
+  it("routes manual retries by the stored command ID and enforces send rights", async () => {
+    coordinator.retry.mockResolvedValue(accepted);
+    const input = { ...control, kind: "retry" as const, commandId: accepted.commandId };
+    await expect(service.command(request("viewer", "https://hub.test"), input)).resolves.toEqual({
+      outcome: "refused",
+      code: "forbidden",
+    });
+    await expect(
+      service.command(request("controller", "https://hub.test"), input),
+    ).resolves.toEqual(accepted);
+    expect(coordinator.retry).toHaveBeenCalledWith(
+      { organizationId, userId: "controller", role: "member" },
+      {
+        sessionId,
+        generation: input.generation,
+        idempotencyKey: input.idempotencyKey,
+        commandId: input.commandId,
+      },
+    );
   });
 
   it("hides a session from a non-participating member and permits an admin to view and stop but not send", async () => {

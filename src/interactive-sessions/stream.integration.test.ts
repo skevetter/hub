@@ -136,6 +136,7 @@ it("relays and reads assistant text without persisting it in session tables or a
       stop: vi.fn(),
       close: vi.fn(),
       replaceAgent: vi.fn(),
+      retry: vi.fn(),
     },
     connectionForDaemon: () => ({
       history,
@@ -274,6 +275,78 @@ it("relays and reads assistant text without persisting it in session tables or a
     } finally {
       await viewer.cancel();
     }
+
+    const controlScope = { organizationId, sessionId };
+    const observation = { ...controlScope, generation: 1, agentId: "test-agent", now };
+    expect(
+      await database.applyInteractiveSessionState({
+        ...observation,
+        turn: 0,
+        from: ["starting"],
+        to: "running",
+      }),
+    ).toBeDefined();
+    expect(
+      (
+        await database.acceptInteractiveSessionCommand({
+          principal,
+          sessionId,
+          generation: 1,
+          kind: "stop",
+          idempotencyKey: randomUUID(),
+          bodyCutoff: null,
+          now,
+        })
+      ).status,
+    ).toBe("accepted");
+    const claim = await database.claimInteractiveSessionCommand({
+      ...controlScope,
+      lane: "control",
+      owner: "test-worker",
+      leaseMs: 60_000,
+      agentIdle: false,
+      bodyCutoff: null,
+      now,
+    });
+    if (!claim) throw new Error("Missing stop claim");
+    expect(
+      await database.settleInteractiveSessionCommand({
+        ...controlScope,
+        commandId: claim.id,
+        generation: claim.generation,
+        claimOwner: "test-worker",
+        attempts: claim.attempts,
+        status: "unknown",
+        failureCode: "delivery_unconfirmed",
+        now,
+      }),
+    ).toBe(true);
+    const attention = await service.snapshot(request, {
+      organizationSlug: organizationId,
+      sessionId,
+    });
+    expect(attention.session).toMatchObject({ state: "running", stateReason: "stop_unconfirmed" });
+    expect(
+      await database.applyInteractiveSessionState({
+        ...observation,
+        turn: 1,
+        from: ["running"],
+        to: "idle",
+      }),
+    ).toBeDefined();
+    expect(
+      await database.applyInteractiveSessionState({
+        ...observation,
+        turn: 1,
+        from: ["idle"],
+        to: "running",
+      }),
+    ).toBeDefined();
+    const nextTurn = await service.snapshot(request, {
+      organizationSlug: organizationId,
+      sessionId,
+    });
+    expect(nextTurn.session).toMatchObject({ state: "running", stateReason: null });
 
     const { rows } = await runtime.query<{ tablename: string }>(
       "select tablename from pg_tables where schemaname = current_schema() and tablename ~ '^interactive_session(s|_)' union all select 'audit_events'",

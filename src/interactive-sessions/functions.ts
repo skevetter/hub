@@ -121,6 +121,14 @@ export const sendSessionMessage = createServerFn({ method: "POST" })
     ),
   );
 
+export const retrySessionMessage = createServerFn({ method: "POST" })
+  .validator(control.extend({ commandId: id }))
+  .handler(({ data }) =>
+    respond("interactiveSession.retry", data.organizationSlug, (service, request) =>
+      service.command(request, { ...data, kind: "retry" }),
+    ),
+  );
+
 export const stopSession = createServerFn({ method: "POST" })
   .validator(control)
   .handler(({ data }) =>

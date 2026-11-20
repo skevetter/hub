@@ -317,7 +317,9 @@ export class SessionStreamSubscriber {
       if (this.closed) return false;
       if (version !== this.accessVersion) continue;
       this.hubSeq = event.seq;
-      return data !== undefined && this.send(frame(event.kind, data, String(event.seq)));
+      return (
+        data !== undefined && this.send(frame(event.kind, data, cursorId(event.seq, this.agent)))
+      );
     }
     return false;
   }
@@ -388,7 +390,8 @@ export class SessionStreamSubscriber {
       }
       if (item.seq <= this.agent.seq) return false;
     }
-    if (!this.send(frame("agent", item, `${this.hubSeq}:${item.seq}:${epoch}`))) return false;
+    if (!this.send(frame("agent", item, cursorId(this.hubSeq, { seq: item.seq, epoch }))))
+      return false;
     this.agent = { epoch, seq: item.seq };
     return true;
   }
@@ -413,4 +416,8 @@ function frame(event: string, data: unknown, id?: string): string {
 
 export function validAgentEpoch(epoch: string): boolean {
   return epoch.length > 0 && epoch.length <= 200 && !/\p{Cc}/u.test(epoch);
+}
+
+function cursorId(hubSeq: number, agent: AgentCursor | null): string {
+  return agent ? `${hubSeq}:${agent.seq}:${agent.epoch}` : String(hubSeq);
 }

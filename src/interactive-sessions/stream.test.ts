@@ -102,12 +102,12 @@ describe("interactive session stream", () => {
   it("replays durable Hub events after the cursor before relaying buffered live items", async () => {
     const { bus, rows, open } = setup();
     rows.push(state(1), state(2), state(3));
-    const reader = read(await open("1"));
+    const reader = read(await open("1:7:" + epoch));
     bus.publish(sessionId, agent(8));
     const replay = await reader.next();
-    expect(replay).toContain("id: 2\nevent: state");
+    expect(replay).toContain("id: 2:7:" + epoch + "\nevent: state");
     expect(replay).toContain('"turn":2');
-    expect(await reader.next()).toContain("id: 3\nevent: state");
+    expect(await reader.next()).toContain("id: 3:7:" + epoch + "\nevent: state");
     expect(await reader.next()).toContain("id: 3:8:" + epoch);
     await reader.cancel();
   });
@@ -122,10 +122,23 @@ describe("interactive session stream", () => {
     expect(await reader.next()).toContain("id: 0:4:" + epoch);
     rows.push(state(1));
     bus.publish(sessionId, { kind: "hub", event: rows[0]! });
-    expect(await reader.next()).toContain("id: 1\nevent: state");
-    bus.publish(sessionId, agent(5));
-    expect(await reader.next()).toContain("id: 1:5:" + epoch);
+    const frame = await reader.next();
+    expect(frame).toContain("id: 1:4:" + epoch + "\nevent: state");
     await reader.cancel();
+    bus.publish(sessionId, agent(5));
+    const lastEventId = frame?.match(/^id: ([^\n]+)/u)?.[1];
+    expect(lastEventId).toBeDefined();
+    const resumed = read(
+      await open(
+        "0",
+        "viewer",
+        new Request("https://hub.test/events?organization=org", {
+          headers: { cookie: "viewer", "last-event-id": lastEventId! },
+        }),
+      ),
+    );
+    expect(await resumed.next()).toContain("id: 1:5:" + epoch);
+    await resumed.cancel();
   });
 
   it("emits a gap before switching epoch and discards late items from the prior epoch", async () => {
