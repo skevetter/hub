@@ -198,6 +198,66 @@ for (const scenario of [
   });
 }
 
+test("keeps named manual callers when saving and previews the audience dropped by a schedule", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  const triggers = new OrganizationTriggers(page);
+  await triggers.open();
+  await triggers.startNew();
+  await triggers.configureManual({
+    name: "manual-release",
+    daemon,
+    cwd: "/workspace/acme",
+    agent: "opencode/gateway/vendor/model-v1",
+    mode: "full-access",
+    thinking: "low",
+    prompt: "Private instructions for the release.",
+  });
+  await page.getByRole("radio", { name: "Specific people" }).check();
+  await page.getByLabel("Caller names").fill("alice, bob");
+  const summary = `When a manual or webhook request arrives from alice or bob, run opencode/gateway/vendor/model-v1 on host ${daemon}.`;
+  await expect(page.getByText(summary, { exact: true })).toBeVisible();
+  await triggers.save("manual-release");
+  await expect(page.getByRole("row").filter({ hasText: "manual-release" })).toContainText(summary);
+
+  await triggers.openTrigger("manual-release");
+  await expect(page.getByLabel("Caller names")).toHaveValue("alice, bob");
+  await page.getByLabel("Working directory").fill("/workspace/next");
+  await triggers.save("manual-release");
+  await triggers.openTrigger("manual-release");
+  await expect(page.getByLabel("Caller names")).toHaveValue("alice, bob");
+
+  const event = page.getByRole("combobox", { name: "When this happens" });
+  await event.press("Enter");
+  await page.getByPlaceholder("Select an event\u2026").fill("schedule.tick");
+  await page.keyboard.press("Enter");
+  const preview = page.getByRole("alert").filter({ hasText: "Switch to Schedule?" });
+  await expect(preview).toContainText("Audience");
+  await expect(event).toHaveAttribute("data-value", "manual.run");
+  await expect(event).toBeFocused();
+  await page.keyboard.press("Tab");
+  const keepEvent = page.getByRole("button", { name: "Keep current event" });
+  await expect(keepEvent).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(preview).toBeHidden();
+  await expect(event).toBeFocused();
+  await expect(page.getByLabel("Caller names")).toHaveValue("alice, bob");
+
+  await event.press("Enter");
+  await page.getByPlaceholder("Select an event\u2026").fill("schedule.tick");
+  await page.keyboard.press("Enter");
+  await page.getByRole("button", { name: "Change event", exact: true }).press("Enter");
+  await expect(event).toHaveAttribute("data-value", "schedule.tick");
+  await expect(page.getByRole("heading", { name: "Who can invoke it" })).toBeHidden();
+  await triggers.switchToYaml();
+  await triggers.expectYamlContains("schedule.tick:", "/workspace/next");
+  await expect(page.getByRole("textbox", { name: "Trigger YAML" })).not.toContainText("from_users");
+});
+
 function advancedTriggerYaml(daemon: string) {
   return `# survives form edits
 name: slack-help

@@ -6,13 +6,22 @@ import {
 } from "../schedule/recurrence.js";
 import { ContinuationSchema } from "../continuation.js";
 import { hasProgressDestination, PROGRESS_DESTINATION_REQUIRED } from "../progress-events.js";
-import { parseDocument, stringify, type Document } from "yaml";
+import {
+  isCollection,
+  isMap,
+  isNode,
+  isScalar,
+  parseDocument,
+  stringify,
+  type Document,
+} from "yaml";
 import { z } from "zod";
 import {
   DEFAULT_SCRIPT_MAX_RUNTIME,
   IDENTIFIER,
   isScriptRun,
   TriggerDocumentSchema,
+  TriggerFilterSchema,
   type TriggerAgentRun,
   type TriggerDocument,
   type TriggerScriptRun,
@@ -24,6 +33,7 @@ import {
   SCRIPT_NOTIFICATION_REASONS,
   type EditorEvent,
   type QualifierValues,
+  type QualifierDefinition,
   type QualifierKey,
 } from "./events.js";
 
@@ -39,6 +49,7 @@ export interface TriggerFormValue {
   connection: string;
   allowedUsers: string;
   qualifiers: QualifierValues;
+  advancedFilters?: string[];
   recurrence?: Recurrence;
   daemon: string;
   cwd: string;
@@ -81,16 +92,25 @@ export function projectTriggerForm(yaml: string): TriggerFormProjection {
   if (!isEditorEvent(event)) {
     return { status: "yaml_only", reason: `The form does not support the ${event} event.` };
   }
+  const ownedKeys = eventFilterKeys(event);
+  const advancedFilters = [
+    ...Object.keys(definition.filters ?? {}),
+    ...parsed.unknownFilters,
+  ].filter((key) => !ownedKeys.has(key));
+  const advanced = advancedFilters.length === 0 ? {} : { advancedFilters };
   const run = trigger.run;
   if (isScriptRun(run)) {
-    return { status: "editable", value: toScriptFormValue(trigger, run, event, definition) };
+    return {
+      status: "editable",
+      value: { ...toScriptFormValue(trigger, run, event, definition), ...advanced },
+    };
   }
   if ("choices" in run.agent) {
     return { status: "yaml_only", reason: "Agent choices can only be edited in YAML." };
   }
   return {
     status: "editable",
-    value: toFormValue(trigger, run, event, definition, run.agent),
+    value: { ...toFormValue(trigger, run, event, definition, run.agent), ...advanced },
   };
 }
 
@@ -107,7 +127,7 @@ function toBaseFormValue(
       : { progressMessage: trigger.progress_message }),
     event,
     connection: definition.connection ?? "",
-    allowedUsers: definition.filters?.from_users?.join(", ") ?? "*",
+    allowedUsers: definition.filters?.from_users?.join(", ") ?? defaultAudience(event),
     qualifiers: readQualifiers(event, definition.filters),
     recurrence: definition.recurrence ?? DEFAULT_RECURRENCE,
   };
@@ -188,35 +208,7 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
   setIfChanged(document, ["name"], value.name);
   setIfChanged(document, ["enabled"], value.enabled);
 
-  const previousEvent = projection.value.event;
-  if (previousEvent !== value.event) {
-    const definition = document.getIn(["on", previousEvent], true);
-    document.deleteIn(["on", previousEvent]);
-    document.setIn(["on", value.event], definition ?? {});
-  }
-  if (eventDefinition(value.event).origin === "hub") {
-    deleteIfPresent(document, ["on", value.event, "connection"]);
-    deleteIfPresent(document, ["on", value.event, "filters", "from_users"]);
-  } else {
-    setIfChanged(document, ["on", value.event, "connection"], value.connection);
-    setIfChanged(document, ["on", value.event, "filters", "from_users"], users(value.allowedUsers));
-  }
-
-  setOptional(
-    document,
-    ["on", value.event, "recurrence"],
-    value.event === "schedule.tick" ? (value.recurrence ?? DEFAULT_RECURRENCE) : undefined,
-  );
-  if (value.event === "schedule.tick") deleteIfPresent(document, ["on", value.event, "filters"]);
-  const qualifiers = authoredQualifiers(value);
-  const ownedKeys = new Set(
-    [...eventDefinition(previousEvent).qualifiers, ...eventDefinition(value.event).qualifiers].map(
-      (qualifier) => qualifier.key,
-    ),
-  );
-  for (const key of ownedKeys) {
-    setOptional(document, ["on", value.event, "filters", key], qualifiers[key]);
-  }
+  patchEvent(document, projection.value, value);
 
   setIfChanged(document, ["run", "target", "daemon"], value.daemon);
   setIfChanged(document, ["run", "target", "cwd"], value.cwd);
@@ -258,6 +250,64 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
   return document.toString({ lineWidth: 0 });
 }
 
+function patchEvent(document: Document, previous: TriggerFormValue, next: TriggerFormValue) {
+  const changed = previous.event !== next.event;
+  if (changed) renameEvent(document, previous.event, next.event);
+
+  const eventPath = ["on", next.event];
+  if (eventDefinition(next.event).origin === "hub") {
+    if (changed) deleteIfPresent(document, [...eventPath, "connection"]);
+  } else if (changed || previous.connection !== next.connection) {
+    setIfChanged(document, [...eventPath, "connection"], next.connection);
+  }
+  if (changed || !sameValue(previous.recurrence, next.recurrence)) {
+    setOptional(
+      document,
+      [...eventPath, "recurrence"],
+      next.event === "schedule.tick" ? (next.recurrence ?? DEFAULT_RECURRENCE) : undefined,
+    );
+  }
+  const filterPath = [...eventPath, "filters"];
+  if (next.event === "schedule.tick") deleteIfPresent(document, filterPath);
+  else patchEventFilters(document, filterPath, previous, next);
+}
+
+function renameEvent(document: Document, previous: EditorEvent, next: EditorEvent): void {
+  const events = document.getIn(["on"], true);
+  if (!isMap(events)) throw new Error("Expected an event mapping.");
+  const entry = events.items.find(({ key }) => isScalar(key) && key.value === previous);
+  if (!isScalar(entry?.key)) throw new Error("Expected an event name.");
+  entry.key.value = next;
+}
+
+function patchEventFilters(
+  document: Document,
+  path: string[],
+  previous: TriggerFormValue,
+  next: TriggerFormValue,
+): void {
+  const after = eventDefinition(next.event);
+  const sameProvider = eventDefinition(previous.event).provider === after.provider;
+  for (const key of previous.advancedFilters ?? []) {
+    if (previous.event !== next.event || next.advancedFilters?.length === 0) {
+      deleteIfPresent(document, [...path, key]);
+    }
+  }
+  const owned = eventFilterKeys(next.event);
+  for (const key of eventFilterKeys(previous.event)) {
+    if (!owned.has(key) || !sameProvider) deleteIfPresent(document, [...path, key]);
+  }
+  if (needsActorFilter(next) && (!sameProvider || previous.allowedUsers !== next.allowedUsers)) {
+    setOptional(document, [...path, "from_users"], authoredAudience(next));
+  }
+  for (const qualifier of after.qualifiers) {
+    const draft = next.qualifiers[qualifier.key];
+    if (!sameProvider || previous.qualifiers[qualifier.key] !== draft) {
+      setOptional(document, [...path, qualifier.key], authoredQualifier(qualifier, draft));
+    }
+  }
+}
+
 export type TriggerYamlResult =
   | { status: "ok"; yaml: string }
   | { status: "incomplete"; reason: string };
@@ -275,10 +325,7 @@ export function mergeTriggerForm(yaml: string, value: TriggerFormValue): Trigger
   try {
     return {
       status: "ok",
-      yaml:
-        projectTriggerForm(yaml).status === "editable"
-          ? patchTriggerYaml(yaml, value)
-          : createTriggerYaml(value),
+      yaml: yaml.trim() === "" ? createTriggerYaml(value) : patchTriggerYaml(yaml, value),
     };
   } catch (cause) {
     return { status: "incomplete", reason: incompleteReason(cause) };
@@ -344,19 +391,41 @@ export function createTriggerYaml(value: TriggerFormValue): string {
 function formEventDefinition(value: TriggerFormValue): TriggerDocument["on"][string] {
   if (value.event === "schedule.tick")
     return { recurrence: value.recurrence ?? DEFAULT_RECURRENCE };
-  if (eventDefinition(value.event).origin === "hub") {
-    const filters = authoredQualifiers(value);
-    return Object.keys(filters).length === 0 ? {} : { filters };
-  }
+  const definition = eventDefinition(value.event);
+  const filters = Object.fromEntries(
+    definition.qualifiers.flatMap((qualifier) => {
+      const selection = authoredQualifier(qualifier, value.qualifiers[qualifier.key]);
+      return selection === undefined ? [] : [[qualifier.key, selection]];
+    }),
+  );
+  const audience = authoredAudience(value);
+  if (audience !== undefined) filters["from_users"] = audience;
   return {
-    connection: value.connection,
-    filters: { from_users: users(value.allowedUsers), ...authoredQualifiers(value) },
+    ...(definition.origin === "provider" ? { connection: value.connection } : {}),
+    ...(Object.keys(filters).length === 0 ? {} : { filters }),
   };
 }
 
-/** Who may start the run is named by an actor allowlist for events that come from a provider. */
 export function needsActorFilter(value: Pick<TriggerFormValue, "event">): boolean {
-  return eventDefinition(value.event).origin === "provider";
+  return eventDefinition(value.event).audience !== "none";
+}
+
+function defaultAudience(event: EditorEvent): string {
+  return eventDefinition(event).audience === "wildcard" ? "*" : "";
+}
+
+function authoredAudience(value: TriggerFormValue): string[] | undefined {
+  if (!needsActorFilter(value)) return undefined;
+  const names = commaSeparated(value.allowedUsers);
+  if (value.event === "manual.run" && names.length === 1 && names[0] === "*") return undefined;
+  return names.length === 0 ? undefined : names;
+}
+
+function eventFilterKeys(event: EditorEvent): Set<string> {
+  return new Set([
+    ...eventDefinition(event).qualifiers.map(({ key }) => key),
+    ...(needsActorFilter({ event }) ? ["from_users"] : []),
+  ]);
 }
 
 function workingDirectoryErrors(value: TriggerFormValue): TriggerFieldErrors {
@@ -431,12 +500,7 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   }
   Object.assign(errors, progressMessageErrors(value));
   if (needsActorFilter(value)) Object.assign(errors, actorErrors(value));
-  for (const qualifier of eventDefinition(value.event).qualifiers) {
-    const selection = value.qualifiers[qualifier.key];
-    if (qualifier.required && (selection === undefined || selection.trim().length === 0)) {
-      errors[`qualifiers.${qualifier.key}`] = `${qualifier.label} is required.`;
-    }
-  }
+  Object.assign(errors, qualifierErrors(value));
   Object.assign(errors, scriptEventErrors(value));
   Object.assign(errors, recurrenceErrors(value));
   if (value.daemon.trim().length === 0) errors.daemon = "Daemon is required.";
@@ -458,6 +522,19 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   return errors;
 }
 
+function qualifierErrors(value: TriggerFormValue): TriggerFieldErrors {
+  const errors: TriggerFieldErrors = {};
+  for (const qualifier of eventDefinition(value.event).qualifiers) {
+    const selection = value.qualifiers[qualifier.key];
+    const error =
+      qualifier.required && (selection === undefined || selection.trim().length === 0)
+        ? `${qualifier.label} is required.`
+        : refused(() => authoredQualifier(qualifier, selection));
+    if (error !== undefined) errors[`qualifiers.${qualifier.key}`] = error;
+  }
+  return errors;
+}
+
 function scriptErrors(value: TriggerFormValue): TriggerFieldErrors {
   if (value.script.trim().length === 0) return { script: "Script is required." };
   if (value.script.includes("${{")) {
@@ -476,8 +553,14 @@ function actorErrors(value: TriggerFormValue): TriggerFieldErrors {
       ? { allowedUsers: "Name the people allowed to start a script. It cannot run for everyone." }
       : {};
   }
-  return value.allowedUsers.trim().length === 0
-    ? { allowedUsers: "Name at least one user ID, or let everyone trigger it." }
+  const audience = eventDefinition(value.event).audience;
+  if (audience === "wildcard") {
+    return named.length === 0
+      ? { allowedUsers: "Name at least one caller, or let everyone trigger it." }
+      : {};
+  }
+  return named.includes("*") || (audience === "named" && named.length === 0)
+    ? { allowedUsers: "Enter specific Linear user IDs." }
     : {};
 }
 
@@ -550,17 +633,46 @@ export function splitAgentId(value: string): { provider: string; model?: string 
   return { provider, model };
 }
 
+const EditorEventFiltersSchema = z.looseObject({
+  on: z.record(
+    z.string(),
+    z.looseObject({ filters: z.record(z.string(), z.unknown()).optional() }),
+  ),
+});
+
 function parseEditorDocument(
   yaml: string,
-): { success: true; data: TriggerDocument } | { success: false; error: string } {
+):
+  | { success: true; data: TriggerDocument; unknownFilters: string[] }
+  | { success: false; error: string } {
   const document = parseDocument(yaml, { compat: ["timestamp"] });
   if (document.errors.length > 0) return { success: false, error: document.errors[0]!.message };
-  const parsed = TriggerDocumentSchema.safeParse(document.toJS());
-  if (!parsed.success) {
-    const issue = parsed.error.issues[0]!;
-    return { success: false, error: `${issue.path.join(".") || "YAML"}: ${issue.message}` };
+  const raw: unknown = document.toJS();
+  const parsed = TriggerDocumentSchema.safeParse(raw);
+  if (parsed.success) return { success: true, data: parsed.data, unknownFilters: [] };
+
+  // The editor can preserve unrecognized filter nodes without extending the saved schema.
+  const shape = EditorEventFiltersSchema.safeParse(raw);
+  const events = shape.success ? Object.entries(shape.data.on) : [];
+  if (shape.success && events.length === 1) {
+    const [event, definition] = events[0]!;
+    const entries = Object.entries(definition.filters ?? {});
+    const unknownFilters = entries
+      .filter(([key]) => !Object.hasOwn(TriggerFilterSchema.shape, key))
+      .map(([key]) => key);
+    if (unknownFilters.length > 0) {
+      const filters = Object.fromEntries(
+        entries.filter(([key]) => Object.hasOwn(TriggerFilterSchema.shape, key)),
+      );
+      const projected = TriggerDocumentSchema.safeParse({
+        ...shape.data,
+        on: { [event]: { ...definition, filters } },
+      });
+      if (projected.success) return { success: true, data: projected.data, unknownFilters };
+    }
   }
-  return { success: true, data: parsed.data };
+  const issue = parsed.error.issues[0]!;
+  return { success: false, error: `${issue.path.join(".") || "YAML"}: ${issue.message}` };
 }
 
 function assertDocument(document: Document): void {
@@ -568,7 +680,21 @@ function assertDocument(document: Document): void {
 }
 
 function setIfChanged(document: Document, path: readonly string[], value: unknown): void {
-  if (JSON.stringify(document.getIn(path)) !== JSON.stringify(value)) document.setIn(path, value);
+  const node = document.getIn(path, true);
+  const current: unknown = isNode(node) ? node.toJS(document) : node;
+  if (sameValue(current, value)) return;
+  if (isCollection(node) && typeof value === "object" && value !== null) {
+    const replacement = document.createNode(value);
+    if (isCollection(replacement)) {
+      if (node.comment !== undefined) replacement.comment = node.comment;
+      if (node.commentBefore !== undefined) replacement.commentBefore = node.commentBefore;
+      if (node.spaceBefore !== undefined) replacement.spaceBefore = node.spaceBefore;
+      if (node.flow !== undefined) replacement.flow = node.flow;
+      document.setIn(path, replacement);
+      return;
+    }
+  }
+  document.setIn(path, value);
 }
 
 function setOptional(document: Document, path: readonly string[], value: unknown): void {
@@ -581,12 +707,11 @@ function deleteIfPresent(document: Document, path: readonly string[]): void {
 }
 
 function sameFormValue(left: TriggerFormValue, right: TriggerFormValue): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return sameValue(left, right);
 }
 
-function users(value: string): string[] {
-  const values = commaSeparated(value);
-  return values.length === 0 ? ["*"] : values;
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function commaSeparated(value: string): string[] {
@@ -603,6 +728,7 @@ function blankToUndefined(value: string): string | undefined {
 
 /** Provider-bound state and qualifier compatibility belong to the form model. */
 export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent): TriggerFormValue {
+  if (value.event === event) return value;
   const previous = eventDefinition(value.event);
   const next = eventDefinition(event);
   const sameProvider = previous.provider === next.provider;
@@ -611,7 +737,10 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
     for (const qualifier of next.qualifiers) {
       if (
         previous.qualifiers.some(
-          (candidate) => candidate.key === qualifier.key && candidate.kind === qualifier.kind,
+          (candidate) =>
+            candidate.key === qualifier.key &&
+            candidate.kind === qualifier.kind &&
+            candidate.label === qualifier.label,
         )
       ) {
         const selection = value.qualifiers[qualifier.key];
@@ -619,15 +748,49 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
       }
     }
   }
-  return {
+  const namedAudience = value.allowedUsers !== "" && value.allowedUsers !== "*";
+  const nextAudience = namedAudience ? "" : defaultAudience(event);
+  const result = {
     ...value,
     event,
     qualifiers,
+    allowedUsers: sameProvider ? value.allowedUsers : nextAudience,
     connection: sameProvider ? value.connection : "",
+    ...(event === "schedule.tick" ? {} : { recurrence: DEFAULT_RECURRENCE }),
+
     ...(value.progressMessage === true && !hasProgressDestination(event)
       ? { progressMessage: false }
       : {}),
   };
+  if (value.advancedFilters !== undefined) result.advancedFilters = [];
+  return result;
+}
+
+export function droppedTriggerRules(previous: TriggerFormValue, next: TriggerFormValue): string[] {
+  if (previous.event === next.event) return [];
+  const before = eventDefinition(previous.event);
+  const after = eventDefinition(next.event);
+  const sameProvider = before.provider === after.provider;
+  const dropped = before.qualifiers
+    .filter(
+      ({ key }) => previous.qualifiers[key] !== undefined && next.qualifiers[key] === undefined,
+    )
+    .map(({ label }) => label);
+  dropped.push(...(previous.advancedFilters ?? []));
+  if (!sameProvider && previous.connection !== "") dropped.push("Connection");
+  if (
+    !sameProvider &&
+    needsActorFilter(previous) &&
+    previous.allowedUsers !== "" &&
+    previous.allowedUsers !== "*"
+  ) {
+    dropped.push("Audience");
+  }
+  if (previous.event === "schedule.tick" && next.event !== previous.event) dropped.push("Schedule");
+  if (previous.progressMessage === true && next.progressMessage === false) {
+    dropped.push("Live progress messages");
+  }
+  return dropped;
 }
 
 /**
@@ -666,19 +829,37 @@ function readQualifiers(
   const values: QualifierValues = {};
   for (const qualifier of eventDefinition(event).qualifiers) {
     const value = filters?.[qualifier.key];
-    if (value !== undefined) values[qualifier.key] = value;
+    if (Array.isArray(value)) values[qualifier.key] = value.join("\n");
+    else if (typeof value === "string") values[qualifier.key] = value;
+    else if (value !== undefined) values[qualifier.key] = JSON.stringify(value, null, 2);
   }
   return values;
 }
 
-function authoredQualifiers(value: TriggerFormValue): QualifierValues {
-  const filters: QualifierValues = {};
-  for (const qualifier of eventDefinition(value.event).qualifiers) {
-    const selection = value.qualifiers[qualifier.key];
-    if (selection !== undefined && selection.trim() !== "")
-      filters[qualifier.key] = selection.trim();
+function authoredQualifier(qualifier: QualifierDefinition, value: string | undefined) {
+  if (value === undefined || value === "") return undefined;
+  if (qualifier.kind === "list") {
+    const entries = value.split("\n").filter((entry) => entry.trim() !== "");
+    return entries.length === 0 ? undefined : entries;
   }
-  return filters;
+  if (qualifier.kind === "inputs") {
+    if (value.trim() === "") return undefined;
+    try {
+      return TriggerFilterSchema.shape.inputs.unwrap().parse(JSON.parse(value));
+    } catch {
+      throw new Error(
+        "Input matches must be a JSON object with string, number, or boolean values.",
+      );
+    }
+  }
+  if (
+    qualifier.key === "pattern" ||
+    qualifier.key === "contains" ||
+    qualifier.key === "exclude_contains"
+  ) {
+    return value;
+  }
+  return blankToUndefined(value);
 }
 
 function formContinuation(value: TriggerFormValue) {

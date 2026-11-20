@@ -97,6 +97,10 @@ export class OrganizationTriggers {
       "",
     );
     await this.selectOption("When this happens", "slack.mention");
+    await expect(
+      this.page.getByRole("alert").filter({ hasText: "Changing the event" }),
+    ).toContainText("Added label");
+    await this.page.getByRole("button", { name: "Change event", exact: true }).click();
     await expect(this.page.getByLabel("Added label", { exact: true })).toBeHidden();
     await this.selectOption("When this happens", "github.pull_request_label_added");
     await expect(this.page.getByLabel("Added label", { exact: true })).toHaveValue("");
@@ -117,8 +121,6 @@ export class OrganizationTriggers {
   }) {
     await this.page.getByLabel("Trigger name").fill(input.name);
     await this.selectOption("When this happens", "slack.mention");
-    // An event that arrives on a connection is an event someone sends, so the step asking who
-    // may send it joins the run; a manual run has no audience and no step.
     await expect(this.page.getByRole("heading", { name: "Who can invoke it" })).toBeVisible();
     await this.selectOption("Connection", input.connection);
     await this.page.getByRole("radio", { name: "Specific people" }).click();
@@ -160,6 +162,8 @@ export class OrganizationTriggers {
   }) {
     await this.page.getByLabel("Trigger name").fill(input.name);
     await this.selectOption("When this happens", "manual.run");
+    const confirm = this.page.getByRole("button", { name: "Change event", exact: true });
+    if (await confirm.isVisible()) await confirm.click();
     await this.selectOption("Run on daemon", input.daemon);
     await this.page.getByLabel("Working directory").fill(input.cwd);
     await this.selectAgent(input.agent);

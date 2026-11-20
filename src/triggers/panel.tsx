@@ -33,6 +33,7 @@ import type { Result } from "../contract/respond.js";
 import {
   describeTriggerEvent,
   changeTriggerEvent,
+  droppedTriggerRules,
   mergeTriggerForm,
   needsActorFilter,
   projectTriggerForm,
@@ -40,6 +41,7 @@ import {
   type TriggerFieldErrors,
   type TriggerFormValue,
 } from "./configuration/editor.js";
+import { describeTriggerYaml, triggerEventClause } from "./configuration/describe.js";
 import { saveTrigger, triggerSnapshot, type TriggerSnapshot } from "./functions.js";
 import { daemonProviderSnapshot } from "../daemons/functions.js";
 import type { HubProviderSnapshotEntry } from "../hub/protocol.js";
@@ -173,7 +175,7 @@ export function TriggersPanel() {
                         {trigger.name}
                       </Link>
                     }
-                    secondary={triggerSecondaryLine(trigger)}
+                    secondary={describeTriggerYaml(trigger.yaml) ?? triggerSecondaryLine(trigger)}
                   />
                 </span>
               </DataCell>
@@ -367,7 +369,7 @@ function TriggerEditor({
           label: editor.form.enabled ? "Enabled" : "Disabled",
           tone: editor.form.enabled ? "success" : "neutral",
         }}
-        description={TRIGGER_EDITOR_DESCRIPTION}
+        description={editor.description}
       />
       <div className="grid gap-6">
         <TriggerCompatibilityAlert
@@ -504,6 +506,17 @@ function useTriggerEditorState(
     () => (mode === "form" ? mergeTriggerForm(yaml, form) : projectTriggerForm(yaml)),
     [mode, yaml, form],
   );
+  const description = useMemo(() => {
+    if (legacy) return TRIGGER_EDITOR_DESCRIPTION;
+    if (mode === "yaml") return describeTriggerYaml(yaml) ?? TRIGGER_EDITOR_DESCRIPTION;
+    if (other.status === "ok") {
+      const summary = describeTriggerYaml(other.yaml);
+      if (summary !== undefined) return summary;
+    }
+    const target = form.daemon === "" ? "the selected host" : `host ${form.daemon}`;
+    const action = form.action === "script" ? "a script" : form.agent || "the selected agent";
+    return `When ${triggerEventClause(form.event)}, run ${action} on ${target}.`;
+  }, [form, legacy, mode, other, yaml]);
   const blocked = other.status === "ok" || other.status === "editable" ? undefined : other.reason;
   // Nothing is marked wrong until the reader asks for something the form cannot do yet: a blank
   // new trigger is not a page of errors, it is a page nobody has filled in. Once they have asked,
@@ -532,6 +545,7 @@ function useTriggerEditorState(
     mode,
     yaml,
     form,
+    description,
     errors: refused ? errors : NO_FIELD_ERRORS,
     // Legacy workflows are explained by their own alert; repeating the schema error underneath it
     // would say the same thing twice in less useful words.
@@ -651,6 +665,125 @@ export function ProgressMessageField({
   );
 }
 
+function TriggerEventCard({
+  form,
+  errors,
+  connections,
+  progressMessagesEnabled,
+  onChange,
+}: {
+  form: TriggerFormValue;
+  errors: TriggerFieldErrors;
+  connections: TriggerSnapshot["connections"];
+  progressMessagesEnabled: boolean;
+  onChange: (value: TriggerFormValue) => void;
+}) {
+  const { provider, origin } = eventDefinition(form.event);
+  const connectionOptions = connections
+    .filter((connection) => connection.provider === provider)
+    .map((connection) => ({ value: connection.slug, label: connection.label }));
+  const [pendingEvent, setPendingEvent] = useState<TriggerFormValue["event"]>();
+  const proposedEvent =
+    pendingEvent === undefined ? undefined : changeTriggerEvent(form, pendingEvent);
+  const droppedRules = proposedEvent === undefined ? [] : droppedTriggerRules(form, proposedEvent);
+  const selectEvent = (event: TriggerFormValue["event"]) => {
+    const next = changeTriggerEvent(form, event);
+    if (droppedTriggerRules(form, next).length === 0) {
+      setPendingEvent(undefined);
+      onChange(next);
+    } else {
+      setPendingEvent(event);
+    }
+  };
+  const closePreview = () => {
+    setPendingEvent(undefined);
+    document.getElementById("trigger-event")?.focus();
+  };
+  return (
+    <Card title={EDITOR_STEPS.event.title} description={EDITOR_STEPS.event.description}>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <FormField id="trigger-event" label="When this happens">
+          {(control) => (
+            <Combobox
+              {...control}
+              value={form.event}
+              options={EVENT_OPTIONS}
+              placeholder="Select an event"
+              empty="No events found."
+              onChange={(option) => selectEvent(parseEditorEvent(option.value))}
+            />
+          )}
+        </FormField>
+        {origin === "hub" ? null : (
+          <FormField
+            id="trigger-connection"
+            label="Connection"
+            description="The organization connection that receives the event."
+            required
+            {...fieldError(errors, "connection")}
+          >
+            {(control) => (
+              <Combobox
+                {...control}
+                required
+                value={form.connection}
+                options={connectionOptions}
+                placeholder="Select a connection"
+                empty="No connections found."
+                onChange={(option) => onChange({ ...form, connection: option.value })}
+              />
+            )}
+          </FormField>
+        )}
+      </div>
+      {proposedEvent === undefined ? null : (
+        <>
+          <WarningAlert title={`Switch to ${eventDefinition(proposedEvent.event).label}?`}>
+            <p>Changing the event removes these rules from the draft.</p>
+            <ul className="list-disc pl-4">
+              {droppedRules.map((rule) => (
+                <li key={rule}>{rule}</li>
+              ))}
+            </ul>
+          </WarningAlert>
+          <FormActions>
+            <Button type="button" variant="ghost" onClick={closePreview}>
+              Keep current event
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                closePreview();
+                onChange(proposedEvent);
+              }}
+            >
+              Change event
+            </Button>
+          </FormActions>
+        </>
+      )}
+      {form.advancedFilters === undefined || form.advancedFilters.length === 0 ? null : (
+        <WarningAlert title="Advanced filters">
+          <p>Open YAML to edit these filters. Form edits preserve them.</p>
+          <ul className="list-disc pl-4">
+            {form.advancedFilters.map((key) => (
+              <li key={key}>{key}</li>
+            ))}
+          </ul>
+        </WarningAlert>
+      )}
+      <EventFields value={form} errors={errors} onChange={onChange} />
+      <ProgressMessageField
+        event={form.event}
+        checked={form.progressMessage === true}
+        hubEnabled={progressMessagesEnabled}
+        onChange={(progressMessage) => onChange({ ...form, progressMessage })}
+      />
+    </Card>
+  );
+}
+
 function TriggerForm({
   form,
   errors,
@@ -665,15 +798,9 @@ function TriggerForm({
   snapshot: TriggerSnapshot;
   onChange: (value: TriggerFormValue) => void;
 }) {
-  const { provider } = eventDefinition(form.event);
-  const connections = snapshot.connections.filter((connection) => connection.provider === provider);
   const githubConnections = snapshot.connections.filter(
     (connection) => connection.provider === "github",
   );
-  const connectionOptions = connections.map((connection) => ({
-    value: connection.slug,
-    label: connection.label,
-  }));
   const daemonOptions = snapshot.daemons.map((daemon) => ({
     value: daemon.slug,
     label: daemon.slug,
@@ -736,58 +863,14 @@ function TriggerForm({
         />
       </Card>
 
-      {/*
-        The four decisions a trigger is made of, in the order the run makes them: what arrives,
-        who may send it, where it lands, what runs there. A step whose decision does not exist —
-        a manual run has no audience — is not rendered, and `Steps` renumbers the rest.
-      */}
       <Steps>
-        <Card title={EDITOR_STEPS.event.title} description={EDITOR_STEPS.event.description}>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <FormField id="trigger-event" label="When this happens">
-              {(control) => (
-                <Combobox
-                  {...control}
-                  value={form.event}
-                  options={EVENT_OPTIONS}
-                  placeholder="Select an event"
-                  empty="No events found."
-                  onChange={(option) =>
-                    onChange(changeTriggerEvent(form, parseEditorEvent(option.value)))
-                  }
-                />
-              )}
-            </FormField>
-            {eventDefinition(form.event).origin === "hub" ? null : (
-              <FormField
-                id="trigger-connection"
-                label="Connection"
-                description="The organization connection that receives the event."
-                required
-                {...fieldError(errors, "connection")}
-              >
-                {(control) => (
-                  <Combobox
-                    {...control}
-                    required
-                    value={form.connection}
-                    options={connectionOptions}
-                    placeholder="Select a connection"
-                    empty="No connections found."
-                    onChange={(option) => update("connection", option.value)}
-                  />
-                )}
-              </FormField>
-            )}
-          </div>
-          <EventFields value={form} errors={errors} onChange={onChange} />
-          <ProgressMessageField
-            event={form.event}
-            checked={form.progressMessage === true}
-            hubEnabled={snapshot.progressMessagesEnabled}
-            onChange={(checked) => update("progressMessage", checked)}
-          />
-        </Card>
+        <TriggerEventCard
+          form={form}
+          errors={errors}
+          connections={snapshot.connections}
+          progressMessagesEnabled={snapshot.progressMessagesEnabled}
+          onChange={onChange}
+        />
 
         {needsActorFilter(form) ? (
           <AccessCard form={form} errors={errors} onChange={onChange} />
@@ -1058,7 +1141,6 @@ function TriggerForm({
   );
 }
 
-/** Who may start the run: everyone the connection can see, or a named list. A script needs names. */
 function AccessCard({
   form,
   errors,
@@ -1069,14 +1151,19 @@ function AccessCard({
   onChange: (value: TriggerFormValue) => void;
 }) {
   const script = form.action === "script";
-  const everyone = form.allowedUsers.trim() === "*";
+  const { audience } = eventDefinition(form.event);
+  const manual = form.event === "manual.run";
+  const chooseAudience = !script && audience === "wildcard";
+  const everyone = chooseAudience && form.allowedUsers.trim() === "*";
+  let description: string = EDITOR_STEPS.access.description;
+  if (script) description = SCRIPT_ACCESS_DESCRIPTION;
+  else if (manual) description = "Choose who can start this trigger manually or by webhook.";
+  else if (audience === "optional")
+    description = "Restrict which Linear users can start the run, or leave the list empty.";
   return (
-    <Card
-      title={EDITOR_STEPS.access.title}
-      description={script ? SCRIPT_ACCESS_DESCRIPTION : EDITOR_STEPS.access.description}
-    >
+    <Card title={EDITOR_STEPS.access.title} description={description}>
       <div className="grid gap-4 sm:grid-cols-2">
-        {script ? null : (
+        {chooseAudience ? (
           <FormField id="trigger-audience" label="Audience">
             {() => (
               <SegmentedControl
@@ -1089,21 +1176,21 @@ function AccessCard({
               />
             )}
           </FormField>
-        )}
-        {everyone && !script ? null : (
+        ) : null}
+        {everyone ? null : (
           <FormField
             id="trigger-allowed-users"
-            label="User IDs"
+            label={manual ? "Caller names" : "User IDs"}
             description={
-              script
-                ? "Comma-separated user IDs. A script cannot run for everyone."
+              manual
+                ? "Comma-separated caller names. Use the actor bound to each webhook key or supplied by a manual caller."
                 : "Comma-separated provider user IDs."
             }
             kind="text"
             name="allowedUsers"
             value={form.allowedUsers}
             onChange={(value) => onChange({ ...form, allowedUsers: value })}
-            required
+            required={script || audience !== "optional"}
             {...fieldError(errors, "allowedUsers")}
           />
         )}
@@ -1163,7 +1250,7 @@ const EDITOR_STEPS = {
   },
   access: {
     title: "Who can invoke it",
-    description: "Everyone the connection can see, or a named list.",
+    description: "Choose which senders can start the run.",
   },
   target: {
     title: "Where it runs",

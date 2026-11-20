@@ -273,16 +273,15 @@ export const TriggerDocumentSchema = z
         });
       }
       notificationIssues(definition, event, context);
-      if (!isEditorEvent(event)) continue;
-      for (const qualifier of eventDefinition(event).qualifiers) {
-        const value = definition.filters?.[qualifier.key];
-        if (qualifier.required && (value === undefined || value.trim().length === 0)) {
-          context.addIssue({
-            code: z.ZodIssueCode.custom,
-            path: ["on", event, "filters", qualifier.key],
-            message: `${qualifier.label} is required.`,
-          });
-        }
+      const addedLabel = isEditorEvent(event)
+        ? eventDefinition(event).qualifiers.find(({ key }) => key === "label")
+        : undefined;
+      if (addedLabel?.required && !definition.filters?.label?.trim()) {
+        context.addIssue({
+          code: "custom",
+          path: ["on", event, "filters", "label"],
+          message: `${addedLabel.label} is required.`,
+        });
       }
     }
     if (Object.keys(trigger.on).length === 0) {

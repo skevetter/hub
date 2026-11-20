@@ -7,6 +7,8 @@ import {
   changeTriggerEvent,
   createTriggerYaml,
   describeTriggerEvent,
+  droppedTriggerRules,
+  needsActorFilter,
   mergeTriggerForm,
   patchTriggerYaml,
   projectTriggerForm,
@@ -67,6 +69,43 @@ run:
 `;
 
 describe("trigger form YAML bridge", () => {
+  test("editing a manual trigger preserves its named sender restriction", () => {
+    const original = `name: answer
+on:
+  manual.run:
+    filters:
+      from_users: [alice, bob] # named webhook callers
+run:
+  target: { daemon: office, cwd: /workspace }
+  agent: { provider: codex, mode: safe }
+  prompt: Handle it.
+`;
+    const projection = projectTriggerForm(original);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    const saved = mergeTriggerForm(original, { ...projection.value, cwd: "/new-workspace" });
+    if (saved.status !== "ok") throw new Error(saved.reason);
+    const trigger = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
+    expect(trigger.on["manual.run"]?.filters?.from_users).toEqual(["alice", "bob"]);
+    expect(saved.yaml).toContain("# named webhook callers");
+    expect(trigger.run.target.cwd).toBe("/new-workspace");
+  });
+
+  test("preserves YAML aliases and their comments during an unrelated form edit", () => {
+    const yaml = ADVANCED.replace('from_users: ["*"]', 'from_users: &audience ["*"]').replace(
+      "sandbox_mode: workspace-write",
+      "audience: *audience # preserve alias",
+    );
+    const projection = projectTriggerForm(yaml);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    const saved = patchTriggerYaml(yaml, { ...projection.value, cwd: "/other" });
+    expect(saved).toContain("from_users: &audience");
+    expect(
+      TriggerDocumentSchema.parse(parseDocument(saved).toJS()).on["slack.mention"]?.filters
+        ?.from_users,
+    ).toEqual(["*"]);
+    expect(saved).toContain("audience: *audience # preserve alias");
+  });
+
   test("returns the original YAML byte-for-byte when the form did not change", () => {
     const projection = projectTriggerForm(ADVANCED);
     expect(projection.status).toBe("editable");
@@ -442,8 +481,11 @@ test("round trips the added label separately from existing item labels", () => {
   const projection = projectTriggerForm(yaml);
   expect(projection.status).toBe("editable");
   if (projection.status !== "editable") throw new Error("not editable");
-  expect(projection.value.qualifiers.label).toBe("ready");
-  const patched = patchTriggerYaml(yaml, { ...projection.value, qualifiers: { label: "review" } });
+  expect(projection.value.qualifiers).toMatchObject({ label: "ready", labels: "bug" });
+  const patched = patchTriggerYaml(yaml, {
+    ...projection.value,
+    qualifiers: { ...projection.value.qualifiers, label: "review" },
+  });
   expect(
     TriggerDocumentSchema.parse(parseDocument(patched).toJS()).on["github.pull_request_label_added"]
       ?.filters,
@@ -570,4 +612,172 @@ test("a trigger row names the event kind before what narrows it", () => {
     kind: "Manual run",
   });
   expect(describeTriggerEvent(null, "github.push")).toEqual({ kind: "GitHub push" });
+});
+
+test("creates and edits the audience of a manual webhook trigger", () => {
+  const projection = projectTriggerForm(ADVANCED);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const manual = {
+    ...changeTriggerEvent(projection.value, "manual.run"),
+    allowedUsers: "alice, bob",
+  };
+  expect(needsActorFilter(manual)).toBe(true);
+  const yaml = createTriggerYaml(manual);
+  expect(TriggerDocumentSchema.parse(parseDocument(yaml).toJS()).on["manual.run"]).toEqual({
+    filters: { from_users: ["alice", "bob"] },
+  });
+  const opened = patchTriggerYaml(yaml, { ...manual, allowedUsers: "*" });
+  expect(parseDocument(opened).hasIn(["on", "manual.run", "filters", "from_users"])).toBe(false);
+  expect(triggerFormErrors({ ...manual, allowedUsers: ", ," }).allowedUsers).toBeDefined();
+});
+
+test.each(["schedule.tick", "github.notification"] as const)(
+  "%s cannot pick up a stale audience, on creation or edit",
+  (event) => {
+    const projection = projectTriggerForm(ADVANCED);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    const previous = { ...projection.value, allowedUsers: "alice" };
+    const next = changeTriggerEvent(previous, event);
+    expect(needsActorFilter(next)).toBe(false);
+    expect(droppedTriggerRules(previous, next)).toContain("Audience");
+    for (const yaml of [
+      createTriggerYaml({ ...next, allowedUsers: "alice" }),
+      patchTriggerYaml(ADVANCED, { ...next, allowedUsers: "alice" }),
+    ]) {
+      const definition = TriggerDocumentSchema.parse(parseDocument(yaml).toJS()).on[event];
+      expect(definition?.filters?.from_users).toBeUndefined();
+      expect(definition?.connection).toBeUndefined();
+    }
+  },
+);
+
+test("round trips GitHub repository, label names, and literal text filters", () => {
+  const yaml = ADVANCED.replace("slack.mention", "github.issue_comment_created").replace(
+    "channels: [engineering]",
+    'repo: acme/web # keep this scope\n      labels: ["one,two", bug] # keep this list\n      pattern: "/run " # keep exact trailing space\n      contains: deploy\n      exclude_contains: skip',
+  );
+  const projection = projectTriggerForm(yaml);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  expect(projection.value.qualifiers).toEqual({
+    repo: "acme/web",
+    labels: "one,two\nbug",
+    pattern: "/run ",
+    contains: "deploy",
+    exclude_contains: "skip",
+  });
+  const patched = patchTriggerYaml(yaml, {
+    ...projection.value,
+    qualifiers: { ...projection.value.qualifiers, labels: "one,two\nurgent" },
+  });
+  expect(patched).toContain("# keep this scope");
+  expect(patched).toContain("# keep this list");
+  expect(patched).toContain("# keep exact trailing space");
+  expect(
+    TriggerDocumentSchema.parse(parseDocument(patched).toJS()).on["github.issue_comment_created"]
+      ?.filters,
+  ).toEqual({
+    from_users: ["*"],
+    repo: "acme/web",
+    labels: ["one,two", "urgent"],
+    pattern: "/run ",
+    contains: "deploy",
+    exclude_contains: "skip",
+  });
+});
+
+const LINEAR_FILTERS = ADVANCED.replace(
+  "slack.mention:",
+  "linear.comment_created: # keep event comment",
+)
+  .replace('from_users: ["*"]', "from_users: [alice, bob] # keep audience")
+  .replace(
+    "channels: [engineering]",
+    `# keep this filter comment
+      project: project-a
+      states: [started, ready]
+      assignees: [sam]
+      labels: [label-a]
+      exclude_labels: [hold, waiting]
+      pattern: /run
+      contains: deploy
+      inputs: { urgency: normal }
+      channels: [unused] # outside this event's form`,
+  );
+
+test("retains advanced and unknown filter keys and their comments on ordinary form edits", () => {
+  const yaml = LINEAR_FILTERS.replace("channels: [unused]", "future_filter: { value: 5 }");
+  const projection = projectTriggerForm(yaml);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  expect(projection.value.advancedFilters).toEqual(["future_filter"]);
+  const saved = mergeTriggerForm(yaml, {
+    ...projection.value,
+    qualifiers: { ...projection.value.qualifiers, exclude_labels: "hold\nblocked" },
+  });
+  if (saved.status !== "ok") throw new Error(saved.reason);
+  expect(saved.yaml).toContain("future_filter: { value: 5 } # outside this event's form");
+  expect(saved.yaml).toContain("# keep this filter comment");
+  expect(TriggerDocumentSchema.safeParse(parseDocument(saved.yaml).toJS()).success).toBe(false);
+  const edited = projectTriggerForm(saved.yaml);
+  if (edited.status !== "editable") throw new Error(edited.reason);
+  expect(edited.value.qualifiers.exclude_labels).toBe("hold\nblocked");
+});
+
+test("a same-provider change previews dropped rules and keeps compatible Linear rules", () => {
+  const projection = projectTriggerForm(LINEAR_FILTERS);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const next = changeTriggerEvent(projection.value, "linear.issue_assigned");
+  expect(droppedTriggerRules(projection.value, next)).toEqual([
+    "Comment starts with",
+    "Comment contains",
+    "channels",
+  ]);
+  const saved = patchTriggerYaml(LINEAR_FILTERS, next);
+  expect(saved).toContain("# keep event comment");
+  expect(saved).toContain("# keep audience");
+  const value = TriggerDocumentSchema.parse(parseDocument(saved).toJS());
+  expect(value.on).toEqual({
+    "linear.issue_assigned": {
+      connection: "company",
+      filters: {
+        from_users: ["alice", "bob"],
+        project: "project-a",
+        states: ["started", "ready"],
+        assignees: ["sam"],
+        labels: ["label-a"],
+        exclude_labels: ["hold", "waiting"],
+        inputs: { urgency: "normal" },
+      },
+    },
+  });
+
+  const back = changeTriggerEvent(next, "linear.comment_created");
+  expect(
+    TriggerDocumentSchema.parse(parseDocument(patchTriggerYaml(LINEAR_FILTERS, back)).toJS()).on[
+      "linear.comment_created"
+    ]?.filters,
+  ).toEqual(value.on["linear.issue_assigned"]?.filters);
+});
+
+test("keeps a Linear scope trigger's implicit audience while editing its filters", () => {
+  const yaml = LINEAR_FILTERS.replace(
+    "linear.comment_created:",
+    "linear.issue_entered_scope:",
+  ).replace("      from_users: [alice, bob] # keep audience\n", "");
+  const projection = projectTriggerForm(yaml);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  expect(projection.value.allowedUsers).toBe("");
+  const saved = patchTriggerYaml(yaml, {
+    ...projection.value,
+    qualifiers: { ...projection.value.qualifiers, project: "other-project" },
+  });
+  expect(
+    parseDocument(saved).hasIn(["on", "linear.issue_entered_scope", "filters", "from_users"]),
+  ).toBe(false);
+});
+
+test("an existing non-projectable document cannot be replaced by a fresh form document", () => {
+  const projection = projectTriggerForm(ADVANCED);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  const invalid = ADVANCED.replace("name: answer", "name: [");
+  expect(mergeTriggerForm(invalid, projection.value).status).toBe("incomplete");
 });
