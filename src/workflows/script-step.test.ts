@@ -849,7 +849,12 @@ describe("script terminal cleanup", () => {
       assert.deepEqual(daemon.killAttempts, []);
       const starter = { ...scope, userId: "starter", role: "member" } as const;
       const stopped = await engine.stopRun(starter, run.id);
-      assert.deepEqual(stopped, { status: "stopped", runId: run.id, runStatus: "canceled" });
+      assert.deepEqual(stopped, {
+        status: "stopped",
+        runId: run.id,
+        runStatus: "canceled",
+        cleanupState: "confirmed",
+      });
       assert.equal((await onlyStep(context)).status, "canceled");
       assert.deepEqual(daemon.killed, ["terminal-1"]);
       assert.deepEqual(await engine.stopRun(starter, run.id), stopped);

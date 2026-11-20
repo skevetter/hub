@@ -8,35 +8,52 @@ an API key, can be stopped by an admin or owner. Plain members cannot currently
 start a run as a recorded starter because starting through the CLI requires
 an admin or owner.
 
-Hub marks the run canceled immediately, skips steps that have not started, and
-interrupts any active agent or script. If the daemon is offline, Hub records the
-stop immediately and retries pending cleanup on reconnect. A canceled run
-remains subject to the run payload retention policy once cleanup and reporting
-settle.
+Hub marks the run canceled immediately and skips steps that have not started.
+It requests an interrupt for active agent work and uses the script cleanup path
+for active script work. The run's stopped notification is sent once.
 
-Stop interrupts the agent's current work. Every other run that still has active
-work attached to that agent follows the normal agent-interrupted failure path.
-Runs between steps continue through normal scheduling and can use the same
-session for their next step.
-The confirmation shows how many other runs have attached work and asks you
-to review the impact again if that count changes.
+An interrupt addresses the agent and can stop its current work. When the daemon
+acknowledges the interrupt, other runs with work still attached to that agent
+follow the normal agent-interrupted failure path. Runs between steps can use
+the same session for their next step. The confirmation shows how many other
+runs have attached work. If that number changes before submission, Hub asks
+you to confirm the updated impact.
 
-Hub records which executions were attached at the first interrupt attempt. If
-the acknowledgement is lost, Hub checks the daemon's state before retrying.
-It leaves the action pending when the daemon state is unavailable. If the agent
-has stopped or another execution has joined, Hub settles the pending action
-without sending another interrupt. A delayed first attempt also skips the
-interrupt if it would affect executions that attached after Stop was accepted.
+Hub records the start of an interrupt attempt before sending it. If the daemon
+is offline or Hub knows the frame never went out, the attempt remains pending
+and can send on reconnect. A temporarily unavailable agent lookup also leaves
+it pending. Each attempt can send one cancel frame. If Hub cannot confirm
+delivery after the send began, it records that outcome and does not resend.
+A delayed first send also settles as unconfirmed if a new execution attached
+outside the confirmed scope.
 
+Activity shows the cleanup state. For an unconfirmed interrupt or a missing
+target, an authorized person can select **Stop again** to confirm a new
+interrupt. The new attempt addresses the original agent's current work. The
+run stays canceled and Hub keeps the original stopped notification. The
+button is available until payload retention starts or another attempt is in
+progress.
+
+- `confirmed` means Hub has a daemon acknowledgement for the cleanup.
+- `waiting_for_daemon` means cleanup is pending. The daemon may be offline, its
+  response may be unavailable, or cleanup may still be in progress.
+- `delivery_unconfirmed` means Hub could not confirm the interrupt. The
+  original work may still be running. Pending agent interrupts also settle
+  in this state when recovery finds them at least 24 hours old.
+- `target_gone` means the agent no longer exists or its daemon was revoked.
+- `not_needed` means there was no daemon cleanup for this Stop.
+
+Settled agent interrupts no longer block payload expiry. Other retention
+requirements, including reporting and any pending script cleanup, still apply.
 Stop can win after the last step succeeds if the workflow itself is still running.
 
 The public endpoint is `POST /api/v1/runs/{id}/stop`. It requires a bearer
-credential from an organization CLI login and has no request body. An authorized
-call returns HTTP 200 with the run ID and current status, including when the run
-already finished. A canceled response includes a note only while cleanup is
-pending.
-A caller without stop permission receives HTTP 403. A run
-outside the credential's organization returns HTTP 404.
+credential from an organization CLI login and has no request body. An
+authorized call returns HTTP 200 with the run ID, current status and
+`cleanupState`, even for a finished run. A pending response also includes a
+note. Repeating the HTTP request returns current state. Use Activity to
+confirm a new interrupt for a canceled run. A caller without stop permission
+receives HTTP 403. An out-of-organization run returns HTTP 404.
 
 ## Roll back to build 17
 

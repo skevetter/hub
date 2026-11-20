@@ -163,9 +163,8 @@ export class TriggerDashboard {
     if (run === undefined) return null;
     const detail = await this.runDetailForProject(tenant.organization.id, run.projectId, runId);
     if (detail === null) return null;
-    const canStop =
+    const canAuthorizeStop =
       this.options.stopRun !== undefined &&
-      detail.timeline.status === "running" &&
       canStopRun(
         {
           organizationId: tenant.organization.id,
@@ -175,9 +174,12 @@ export class TriggerDashboard {
         run,
       );
     const stopDetails =
-      canStop || detail.run.status === "canceled"
+      (canAuthorizeStop && detail.timeline.status === "running") || detail.run.status === "canceled"
         ? await this.database.readRunStopDetails(tenant.organization.id, runId)
         : undefined;
+    const canStop =
+      canAuthorizeStop &&
+      (detail.timeline.status === "running" || stopDetails?.retryAttemptId != null);
     return { ...detail, canStop, ...(stopDetails === undefined ? {} : { stopDetails }) };
   }
 
@@ -186,6 +188,7 @@ export class TriggerDashboard {
     organizationSlug: string,
     runId: string,
     confirmedPeerCount: number,
+    retryAttemptId?: string,
   ) {
     const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, {
       organizationSlug,
@@ -199,6 +202,7 @@ export class TriggerDashboard {
       },
       runId,
       confirmedPeerCount,
+      retryAttemptId,
     );
   }
 

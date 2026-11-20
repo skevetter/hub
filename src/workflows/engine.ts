@@ -98,7 +98,10 @@ export interface DurableWorkflowEngineOptions {
   workerIntervalMs?: number;
   now?: () => Date;
   onWorkflowDeadlineExceeded?: (recovery: WorkflowDeadlineRecovery) => Promise<void>;
-  onWorkflowExecutionsTerminal?: (executionIds: readonly string[]) => Promise<void>;
+  onWorkflowExecutionsTerminal?: (
+    executionIds: readonly string[],
+    retryStop?: boolean,
+  ) => Promise<void>;
   onWorkflowRunAccepted?: (run: AcceptedTriggerRunRecord) => Promise<JsonValue | null | void>;
   onProgressRequested?: (run: AcceptedTriggerRunRecord) => void | Promise<void>;
   onWorkflowRunStarted?: (run: AcceptedTriggerRunRecord) => Promise<JsonValue | null | void>;
@@ -200,6 +203,7 @@ export class DurableWorkflowEngine {
     actor: RunStopActor,
     runId: string,
     confirmedPeerCount?: number,
+    retryAttemptId?: string,
   ): Promise<StopRunResult> {
     const database = this.options.database;
     if (database === null) throw new DatabaseUnavailableError();
@@ -211,6 +215,7 @@ export class DurableWorkflowEngine {
       runId,
       actor.userId,
       confirmedPeerCount,
+      retryAttemptId,
     );
     if (cancellation === undefined) return { status: "run_not_found" };
     if (cancellation.conflict !== undefined)
@@ -228,6 +233,12 @@ export class DurableWorkflowEngine {
           "workflow.agent.stop",
         ),
       ]);
+    } else if (cancellation.executionIds.length > 0) {
+      await this.runInBackground(
+        this.options.onWorkflowExecutionsTerminal?.(cancellation.executionIds, true) ??
+          Promise.resolve(),
+        "workflow.agent.stop",
+      );
     }
     const runStatus = cancellation.run.status;
     const details =
@@ -238,7 +249,7 @@ export class DurableWorkflowEngine {
       status: "stopped",
       runId,
       runStatus,
-      ...(details?.cleanupPending ? { cleanupPending: true } : {}),
+      cleanupState: details?.cleanupState ?? "not_needed",
     };
   }
 

@@ -154,8 +154,8 @@ test("settles a canceled execution whose agent creation never finished", async (
   expect(execution.agentSessionId).not.toBeNull();
   const control = vi.spyOn(f.connection, "control");
   await expect(
-    f.sessions.interruptStoppedExecution(execution, f.connection, "stop", { approvedPeerIds: [] }),
-  ).resolves.toEqual([]);
+    f.sessions.interruptStoppedExecution(execution, f.connection, "stop", []),
+  ).resolves.toBe("target_gone");
   expect(control).not.toHaveBeenCalled();
   expect(f.connection.deliveries).toEqual([]);
 });

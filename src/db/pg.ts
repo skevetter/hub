@@ -190,15 +190,24 @@ const OPEN_STEP_RUN = `select run.id, run.status from trigger_runs run join work
 
 const RUN_STOP_OWNED = runExecutions(
   "run",
-  "execution.id, execution.organization_id, execution.project_id, execution.agent_session_id, execution.status, execution.hub_action, execution.hub_action_completed_at",
+  `execution.id, execution.organization_id, execution.project_id, execution.agent_session_id, execution.status,
+    execution.hub_action, execution.hub_action_completed_at,
+    (execution.result->>'status' = 'canceled' or execution.hub_action_acknowledgements ? 'stop_interrupt') as stopped,
+    execution.hub_action_acknowledgements->'stop_interrupt' as stop_state`,
 );
 
+const RUN_STOP_RETRYABLE = `stopped and hub_action = 'interrupt' and hub_action_completed_at is not null
+  and coalesce(stop_state->>'outcome', 'delivery_unconfirmed') in ('delivery_unconfirmed', 'target_gone')`;
+const RUN_STOP_ATTEMPT = "coalesce(stop_state->>'attemptId', id::text)";
+const RUN_STOP_PENDING = `
+  exists (select 1 from workflow_step_runs step where step.trigger_run_id = run.id and (${SCRIPT_CLEANUP_SQL}))
+  or exists (select 1 from owned where hub_action is not null and hub_action_completed_at is null)`;
 const RUN_STOP_PEERS = `
   select distinct peer.id, coalesce(step.trigger_run_id::text, peer.launch_run_id::text, peer.id::text) as run_id
-  from owned join agent_executions peer on peer.agent_session_id = owned.agent_session_id
+  from targets join agent_executions peer on peer.agent_session_id = targets.agent_session_id
   left join workflow_step_runs step on step.id = peer.workflow_step_run_id
-  where owned.status in ('spawning', 'running') and peer.status in ('spawning', 'running')
-    and peer.organization_id = owned.organization_id and peer.project_id = owned.project_id
+  where peer.status in ('spawning', 'running')
+    and peer.organization_id = targets.organization_id and peer.project_id = targets.project_id
     and not exists (select 1 from owned other where other.id = peer.id)`;
 
 const EXECUTION_RUN_OWNERS = `select run.payload_expiry_state from trigger_runs run
@@ -1600,15 +1609,24 @@ class PgDatabase implements Database {
   async readRunStopDetails(organizationId: string, triggerRunId: string) {
     const result = await query<{
       stoppedByName: string | null;
-      cleanupPending: boolean;
+      cleanupState: import("../triggers/run-stop.js").StopCleanupState;
+      retryAttemptId: string | null;
       otherAttachedRunCount: number;
     }>(
       this.pool,
       `
       with target as (
-        select id, project_id, organization_id, status from trigger_runs where organization_id = $1 and id = $2
+        select id, project_id, organization_id, status, payload_expiry_state
+        from trigger_runs where organization_id = $1 and id = $2
       ), owned as materialized (
         select linked.* from target run cross join lateral (${RUN_STOP_OWNED}) linked
+      ), retry as (
+        select max(${RUN_STOP_ATTEMPT}) as attempt_id from owned where ${RUN_STOP_RETRYABLE}
+      ), targets as (
+        select owned.* from owned
+        where ((select status from target) = 'running' and status in ('spawning', 'running'))
+           or ((select status from target) = 'canceled' and ${RUN_STOP_RETRYABLE}
+             and ${RUN_STOP_ATTEMPT} = (select attempt_id from retry))
       ), peers as (${RUN_STOP_PEERS})
       select
         (select account.name from audit_events event join "user" account on account.id = event.actor_identity
@@ -1616,10 +1634,19 @@ class PgDatabase implements Database {
            and event.subject_type = 'trigger_run' and event.subject_id = run.id::text
            and event.action = 'run.canceled' and event.actor_kind = 'user'
          order by event.created_at desc limit 1) as "stoppedByName",
-        (run.status = 'canceled' and (
-          exists (select 1 from workflow_step_runs step where step.trigger_run_id = run.id and (${SCRIPT_CLEANUP_SQL}))
-          or exists (select 1 from owned where hub_action is not null and hub_action_completed_at is null)
-        )) as "cleanupPending",
+        case when run.status <> 'canceled' then 'not_needed'
+          when (${RUN_STOP_PENDING}) then 'waiting_for_daemon'
+          when exists (select 1 from owned where ${RUN_STOP_RETRYABLE}
+                       and coalesce(stop_state->>'outcome', 'delivery_unconfirmed') = 'delivery_unconfirmed')
+            then 'delivery_unconfirmed'
+          when exists (select 1 from owned where ${RUN_STOP_RETRYABLE}) then 'target_gone'
+          when exists (select 1 from owned where stopped and stop_state->>'outcome' = 'confirmed')
+            or exists (select 1 from workflow_step_runs step where step.trigger_run_id = run.id
+                       and step.status = 'canceled' and step.output ? 'exit_code')
+            then 'confirmed'
+          else 'not_needed' end as "cleanupState",
+        case when run.status = 'canceled' and run.payload_expiry_state is null and not (${RUN_STOP_PENDING})
+          then (select attempt_id from retry) end as "retryAttemptId",
         (select count(distinct run_id)::int from peers) as "otherAttachedRunCount"
       from target run`,
       [organizationId, triggerRunId],
@@ -1632,6 +1659,7 @@ class PgDatabase implements Database {
     triggerRunId: string,
     stoppedByUserId?: string,
     confirmedPeerCount?: number,
+    retryAttemptId?: string,
   ) {
     try {
       return await this.pool.transaction(async (client) => {
@@ -1641,34 +1669,63 @@ class PgDatabase implements Database {
         );
         const current = locked.rows[0];
         if (current === undefined) return undefined;
-        if (current.status !== "running")
-          return { run: toTriggerRunRecord(current), transitioned: false, executionIds: [] };
+        const runRecord = toTriggerRunRecord(current);
+        const noop = { run: runRecord, transitioned: false, executionIds: [] };
+        const retrying = current.status === "canceled" && retryAttemptId !== undefined;
+        if (!retrying && (current.status !== "running" || retryAttemptId !== undefined))
+          return noop;
+        const ownedQuery = `select linked.* from trigger_runs run cross join lateral (${RUN_STOP_OWNED}) linked
+          where run.id = $1`;
+        const targets = retrying
+          ? `${RUN_STOP_RETRYABLE} and ${RUN_STOP_ATTEMPT} = $2`
+          : "status in ('spawning', 'running')";
+        const scopeParams = retrying ? [triggerRunId, retryAttemptId] : [triggerRunId];
+        if (retrying) {
+          if (current.payload_expiry_state !== null || confirmedPeerCount === undefined)
+            return noop;
+          const retry = await client.query<{ attempt_id: string | null; pending: boolean }>(
+            `with owned as materialized (${ownedQuery})
+             select (select max(${RUN_STOP_ATTEMPT}) from owned where ${RUN_STOP_RETRYABLE}) as attempt_id,
+                    (${RUN_STOP_PENDING}) as pending
+             from trigger_runs run where run.id = $1`,
+            [triggerRunId],
+          );
+          if (retry.rows[0]?.attempt_id !== retryAttemptId || retry.rows[0].pending) return noop;
+        }
         // Attaching an execution takes a foreign-key lock on its session row.
         await client.query(
-          `select session.id from agent_sessions session
-           where session.id in (
-             select owned.agent_session_id from trigger_runs run
-             cross join lateral (${RUN_STOP_OWNED}) owned
-             where run.id = $1 and owned.status in ('spawning', 'running')
-           )
+          `with owned as materialized (${ownedQuery})
+           select session.id from agent_sessions session
+           where session.id in (select agent_session_id from owned where ${targets})
            order by session.id for update`,
-          [triggerRunId],
+          scopeParams,
         );
         const peers = await client.query<{ id: string; run_id: string }>(
-          `with owned as materialized (
-             select linked.* from trigger_runs run cross join lateral (${RUN_STOP_OWNED}) linked
-             where run.id = $1
-           ) ${RUN_STOP_PEERS}`,
-          [triggerRunId],
+          `with owned as materialized (${ownedQuery}), targets as (select * from owned where ${targets})
+           ${RUN_STOP_PEERS}`,
+          scopeParams,
         );
         const peerCount = new Set(peers.rows.map(({ run_id }) => run_id)).size;
         if (confirmedPeerCount !== undefined && confirmedPeerCount !== peerCount)
-          return {
-            run: toTriggerRunRecord(current),
-            transitioned: false,
-            executionIds: [],
-            conflict: peerCount,
-          };
+          return { ...noop, conflict: peerCount };
+        const attemptId = randomUUID();
+        const approvedPeers = JSON.stringify(peers.rows.map(({ id }) => id));
+        if (retrying) {
+          const retried = await client.query<{ id: string }>(
+            `with owned as materialized (${ownedQuery})
+             update agent_executions set hub_action_completed_at = null,
+               hub_action_acknowledgements = jsonb_set(
+                 coalesce(hub_action_acknowledgements, '{}'::jsonb)
+                   - 'stop_interrupt_claim' - 'stop_interrupt_checked_at',
+                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
+                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
+                 || jsonb_build_object('stop_interrupt_generation', $4::text)
+             where id in (select id from owned where ${targets})
+             returning id`,
+            [triggerRunId, retryAttemptId, approvedPeers, attemptId],
+          );
+          return { ...noop, executionIds: retried.rows.map(({ id }) => id) };
+        }
         const updated = await client.query<TriggerRunRow>(
           `update trigger_runs set status = 'canceled', completed_at = now(),
              terminal_notification_pending_at = now(), terminal_notification_lease_expires_at = null
@@ -1691,18 +1748,15 @@ class PgDatabase implements Database {
                hub_action_completed_at = null,
                hub_action_acknowledgements = jsonb_set(
                  coalesce(hub_action_acknowledgements, '{}'::jsonb),
-                 '{stop_interrupt}', $3::jsonb)
+                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
+                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
            where status in ('spawning', 'running') and id in (
              select execution_id from trigger_runs run
              cross join lateral (${runExecutions("run", "execution.id as execution_id")}) linked
              where run.id = $1
            )
            returning id`,
-          [
-            run.id,
-            run.completed_at,
-            JSON.stringify({ approvedPeerIds: peers.rows.map(({ id }) => id) }),
-          ],
+          [run.id, run.completed_at, approvedPeers, attemptId],
         );
         await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [run.id]);
         if (stoppedByUserId !== undefined) {
@@ -2454,12 +2508,16 @@ class PgDatabase implements Database {
   }
 
   async revokeDaemon(id: string): Promise<boolean> {
-    const rows = await query(
-      this.pool,
-      `update daemons set status = 'revoked', presence = 'offline', disconnected_at = now() where id = $1 and status = 'active' returning id`,
-      [id],
-    );
-    return rows.rowCount === 1;
+    return this.pool.transaction(async (client) => {
+      const rows = await client.query(
+        `update daemons set status = 'revoked', presence = 'offline', disconnected_at = now()
+         where id = $1 and status = 'active' returning id`,
+        [id],
+      );
+      if (rows.rowCount !== 1) return false;
+      await postgresStopInterrupts(client).revoke(id);
+      return true;
+    });
   }
 
   async attachAgentToExecution(
@@ -3133,16 +3191,27 @@ class PgDatabase implements Database {
     }
   }
 
-  async findPendingHubActions(daemonId?: string): Promise<AgentExecutionRecord[]> {
+  async findPendingHubActions(
+    daemonId?: string,
+    scope?: import("./types.js").PendingHubActionScope,
+  ) {
     try {
       const rows = await query<AgentExecutionRow>(
         this.pool,
-        `select * from agent_executions
-         where hub_action is not null
-           and hub_action_completed_at is null
-           and ($1::uuid is null or daemon_id = $1)
-         order by completed_at asc`,
-        [daemonId ?? null],
+        `with pending as (
+           select *, coalesce(hub_action = 'interrupt' and result->>'status' = 'canceled', false) as is_stop
+           from agent_executions where hub_action is not null and hub_action_completed_at is null
+             and ($1::uuid is null or daemon_id = $1)
+         )
+         select * from pending where ($2::boolean is null or is_stop = $2)
+         order by (hub_action_acknowledgements->>'stop_interrupt_checked_at')::timestamptz nulls first,
+                  completed_at, id
+         limit $3`,
+        [
+          daemonId ?? null,
+          scope === undefined ? null : scope.kind === "stop",
+          scope?.kind === "stop" ? scope.limit : null,
+        ],
       );
       return rows.rows.map(toAgentExecutionRecord);
     } catch (error) {

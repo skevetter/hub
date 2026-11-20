@@ -222,6 +222,8 @@ export interface AgentExecutionHubFinishExecutionAcknowledgement {
   observedAt: Date;
 }
 
+export type PendingHubActionScope = { kind: "ordinary" } | { kind: "stop"; limit: number };
+
 export interface AgentExecutionHubAcknowledgements {
   terminalAt: Date | null;
   idleAt: Date | null;
@@ -1472,6 +1474,7 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
     triggerRunId: string,
     stoppedByUserId?: string,
     confirmedPeerCount?: number,
+    retryAttemptId?: string,
   ): Promise<
     (TransitionTriggerRunResult & { executionIds: string[]; conflict?: number }) | undefined
   >;
@@ -1664,7 +1667,10 @@ export interface Database extends RunTimelineStore, RunPayloadRetentionStore {
   ): Promise<AgentExecutionRecord>;
   findRunningAgentExecutionsForMachine(machineId: string): Promise<AgentExecutionRecord[]>;
   findPendingAgentExecutions(): Promise<AgentExecutionRecord[]>;
-  findPendingHubActions(daemonId?: string): Promise<AgentExecutionRecord[]>;
+  findPendingHubActions(
+    daemonId?: string,
+    scope?: PendingHubActionScope,
+  ): Promise<AgentExecutionRecord[]>;
   markAgentExecutionHubActionReady(
     executionId: string,
     observedAt?: Date,

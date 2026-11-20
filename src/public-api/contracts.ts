@@ -1,3 +1,4 @@
+import { stopCleanupStates } from "../triggers/run-stop.js";
 import { extendZodWithOpenApi } from "@asteasolutions/zod-to-openapi";
 import { z } from "zod";
 import {
@@ -426,6 +427,7 @@ export const StoppedRunSchema = z
   .object({
     runId: z.string().uuid(),
     status: z.enum(["running", "succeeded", "failed", "timed_out", "canceled", "rejected"]),
+    cleanupState: z.enum(stopCleanupStates),
     note: z.string().optional(),
   })
   .strict();

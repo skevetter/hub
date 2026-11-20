@@ -32,7 +32,12 @@ export const runDetailSnapshot = createServerFn({ method: "GET" })
   });
 
 export const stopRun = createServerFn({ method: "POST" })
-  .validator(runScopeSchema.extend({ confirmedPeerCount: z.number().int().nonnegative() }))
+  .validator(
+    runScopeSchema.extend({
+      confirmedPeerCount: z.number().int().nonnegative(),
+      retryAttemptId: z.string().uuid().optional(),
+    }),
+  )
   .handler(async ({ data }): Promise<Result<BrowserStopResult>> => {
     try {
       const dashboard = (await getApplication()).triggerDashboard;
@@ -42,6 +47,7 @@ export const stopRun = createServerFn({ method: "POST" })
         data.organizationSlug,
         data.runId,
         data.confirmedPeerCount,
+        data.retryAttemptId,
       );
       if (result.status === "stopped") return respondOk(result);
       if (result.status === "conflict") {

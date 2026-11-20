@@ -24,17 +24,22 @@ describe("run timeline UI", () => {
     );
   });
 
-  it("shows the stopping person's name and hides the cleanup note once settled", () => {
+  it("shows the stopping person's name and the current cleanup outcome", () => {
     const detail: RunDetailSnapshot = {
       ...runDetailFixture,
       timeline: { ...runDetailFixture.timeline, status: "canceled" },
-      stopDetails: { stoppedByName: "Avery", cleanupPending: true, otherAttachedRunCount: 0 },
+      stopDetails: {
+        stoppedByName: "Avery",
+        cleanupState: "waiting_for_daemon",
+        retryAttemptId: null,
+        otherAttachedRunCount: 0,
+      },
     };
     assert.match(render(detail), /Stopped by Avery/u);
-    assert.match(render(detail), /retry cleanup when it reconnects/u);
-    assert.doesNotMatch(
-      render({ ...detail, stopDetails: { ...detail.stopDetails!, cleanupPending: false } }),
-      /retry cleanup when it reconnects/u,
+    assert.match(render(detail), /waiting for the daemon/u);
+    assert.match(
+      render({ ...detail, stopDetails: { ...detail.stopDetails!, cleanupState: "confirmed" } }),
+      /daemon confirmed cleanup/u,
     );
   });
 

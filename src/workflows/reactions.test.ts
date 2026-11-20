@@ -33,7 +33,7 @@ import type { TriggerProvider } from "../triggers/index.js";
 import { createDurableWorkflowHandler, type DurableWorkflowEngine } from "./engine.js";
 
 describe("workflow-owned provider reactions", () => {
-  it.each(["new-arrival", "same-work", "parallel", "parallel-lost"] as const)(
+  it.each(["new-arrival", "human-retry", "parallel", "parallel-lost"] as const)(
     "fences wire interrupt recovery (%s)",
     async (retry) => {
       await runTwoStepWorkflow(createDiscordReactionFixture(), { shared: true, retry });
@@ -278,7 +278,7 @@ interface WorkflowScenarioOptions {
   outcome?: WorkflowOutcome;
   skipAllSteps?: boolean;
   shared?: boolean;
-  retry?: "new-arrival" | "same-work" | "parallel" | "parallel-lost";
+  retry?: "new-arrival" | "human-retry" | "parallel" | "parallel-lost";
 }
 
 async function runTwoStepWorkflow<
@@ -433,8 +433,8 @@ async function runTwoStepWorkflow<
       now: () => now,
       leaseMs: 1_000,
       dispatchLaunchMachineIntent: (intent) => lifecycle.handoffLaunchMachineIntent(intent),
-      onWorkflowExecutionsTerminal: (executionIds) =>
-        lifecycle.recoverWorkflowTerminalExecutions(executionIds),
+      onWorkflowExecutionsTerminal: (executionIds, retryStop) =>
+        lifecycle.recoverWorkflowTerminalExecutions(executionIds, retryStop),
       onWorkflowRunAccepted: (accepted) => lifecycle.notifyWorkflowRunAccepted(accepted),
       onWorkflowRunStarted: (started) => lifecycle.notifyWorkflowRunStarted(started),
       onWorkflowRunTerminal: (terminal) => lifecycle.notifyWorkflowRunTerminal(terminal),
@@ -626,8 +626,8 @@ async function exerciseWireRetry({
   await engine.stopRun(actor, run.id);
   assert.equal((await database.findTriggerRunById(run.id))?.status, "canceled");
   assert.equal(
-    (await database.readRunStopDetails(run.organizationId, run.id))?.cleanupPending,
-    true,
+    (await database.readRunStopDetails(run.organizationId, run.id))?.cleanupState,
+    parallel ? "waiting_for_daemon" : "delivery_unconfirmed",
   );
   if (parallel) {
     link.connected = true;
@@ -653,18 +653,13 @@ async function exerciseWireRetry({
       assert.deepEqual(controls, ["interrupt"]);
       assert.equal((await database.findTriggerRunById(newer.id))?.status, "running");
     } else {
-      const reads = wire.agent.reads;
-      wire.agent.unavailable = true;
       await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
-      assert.equal(wire.agent.reads, reads + 1);
       assert.deepEqual(controls, ["interrupt"]);
-      assert.equal(
-        (await database.readRunStopDetails(run.organizationId, run.id))?.cleanupPending,
-        true,
-      );
-      wire.agent.unavailable = false;
-      await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
-      assert.equal(wire.agent.reads, reads + 2);
+      assert.equal((await database.findTriggerRunById(peer.id))?.status, "running");
+      const details = await database.readRunStopDetails(run.organizationId, run.id);
+      assert.equal(details?.cleanupState, "delivery_unconfirmed");
+      assert.ok(details.retryAttemptId);
+      await engine.stopRun(actor, run.id, details.otherAttachedRunCount, details.retryAttemptId);
       assert.deepEqual(controls, ["interrupt", "interrupt"]);
       assert.equal((await database.findTriggerRunById(peer.id))?.status, "failed");
     }
@@ -711,9 +706,9 @@ async function exerciseParallelRecovery({
   claims.mockRestore();
   assert.deepEqual(controls, ["interrupt"]);
   if (loseAck) {
-    assert.equal((await database.findPendingHubActions(TEST_DAEMON_ID)).length, 1);
+    assert.deepEqual(await database.findPendingHubActions(TEST_DAEMON_ID), []);
     await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
-    assert.deepEqual(controls, ["interrupt", "interrupt"]);
+    assert.deepEqual(controls, ["interrupt"]);
   }
 }
 
@@ -758,7 +753,10 @@ async function exerciseStop({
   if (peer === undefined) assert.deepEqual(released, [execution.id]);
   if (offline) {
     assert.deepEqual(controls, []);
-    assert.equal((await database.readRunStopDetails(organizationId, run.id))?.cleanupPending, true);
+    assert.equal(
+      (await database.readRunStopDetails(organizationId, run.id))?.cleanupState,
+      "waiting_for_daemon",
+    );
     assert.deepEqual(
       (await database.findPendingHubActions()).map(({ id }) => id),
       [execution.id],
@@ -766,8 +764,8 @@ async function exerciseStop({
     link.connected = true;
     await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
     assert.equal(
-      (await database.readRunStopDetails(organizationId, run.id))?.cleanupPending,
-      false,
+      (await database.readRunStopDetails(organizationId, run.id))?.cleanupState,
+      "confirmed",
     );
   }
   if (peer !== undefined) await assertSharedInterrupt(database, lifecycle, peer.id, controls);

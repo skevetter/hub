@@ -83,28 +83,28 @@ describe("PostgreSQL run cancellation", () => {
     );
     assert.equal(granted.filter(Boolean).length, 1);
     const winner = granted[0] === undefined ? 1 : 0;
-    const state = {
-      approvedPeerIds: [],
-      target: { agentId: "agent", attachmentFingerprint: "target", peerIds: [] },
-    };
-    assert.equal(await stores[1 - winner]!.save(id, String(1 - winner), state), false);
-    assert.equal(await stores[winner].save(id, String(winner), state), true);
+    assert.equal(await stores[1 - winner]!.start(id, String(1 - winner)), false);
+    assert.equal(await stores[winner].start(id, String(winner)), true);
+    assert.equal(await stores[winner].start(id, String(winner)), false);
     await pg.runtime.query(
       `update agent_executions set hub_action_acknowledgements =
         jsonb_set(hub_action_acknowledgements, '{stop_interrupt_claim,until}', to_jsonb(clock_timestamp() - interval '1 second'))
        where id = $1`,
       [id],
     );
-    assert.deepEqual(await stores[1 - winner]!.claim(id, "takeover", String(winner)), { state });
-    await stores[winner].complete(id, String(winner));
+    const takeover = await stores[1 - winner]!.claim(id, "takeover", String(winner));
+    assert.ok(takeover?.state?.startedAt);
+    assert.ok(Math.abs(Date.now() - Date.parse(takeover.state.startedAt)) < 5_000);
+    assert.equal(await stores[1 - winner]!.start(id, "takeover"), false);
+    await stores[winner].complete(id, String(winner), "confirmed");
     assert.equal((await pg.database.findAgentExecutionById(id))?.hubActionCompletedAt, null);
     await stores[1 - winner]!.release(id, "takeover");
     assert.equal(await stores[winner].claim(id, "stale", "takeover"), undefined);
     const execution = await pg.database.findAgentExecutionById(id);
     const generation = execution?.hubActionAcknowledgements.stopInterruptGeneration;
     assert.equal(generation, "takeover:released");
-    assert.deepEqual(await stores[winner].claim(id, "retry", generation), { state });
-    await stores[winner].complete(id, "retry");
+    assert.deepEqual(await stores[winner].claim(id, "retry", generation), takeover);
+    await stores[winner].complete(id, "retry", "delivery_unconfirmed");
     assert.equal(await stores[winner].claim(id, "later", "retry"), undefined);
   });
 
@@ -149,14 +149,14 @@ describe("PostgreSQL run cancellation", () => {
         ?.disposition;
     assert.equal(await disposition(), "cleanup_blocked");
     assert.equal(
-      (await pg.database.readRunStopDetails(run.organizationId, run.id))?.cleanupPending,
-      true,
+      (await pg.database.readRunStopDetails(run.organizationId, run.id))?.cleanupState,
+      "waiting_for_daemon",
     );
     assert.equal((await pg.database.listWorkflowScriptStepsPendingCleanup()).length, 1);
     await pg.database.setWorkflowScriptStepOutput(step.id, null);
     assert.equal(
-      (await pg.database.readRunStopDetails(run.organizationId, run.id))?.cleanupPending,
-      false,
+      (await pg.database.readRunStopDetails(run.organizationId, run.id))?.cleanupState,
+      "not_needed",
     );
     assert.equal(await disposition(), "notification_pending");
     const now = new Date(cutoff.getTime() + 1000);

@@ -256,8 +256,8 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
           onWorkflowDeadlineExceeded: async (recovery: WorkflowDeadlineRecovery) => {
             await daemonModule.lifecycle.recoverWorkflowDeadlineExecutions(recovery.executionIds);
           },
-          onWorkflowExecutionsTerminal: (executionIds: readonly string[]) =>
-            daemonModule.lifecycle.recoverWorkflowTerminalExecutions(executionIds),
+          onWorkflowExecutionsTerminal: (executionIds: readonly string[], retryStop?: boolean) =>
+            daemonModule.lifecycle.recoverWorkflowTerminalExecutions(executionIds, retryStop),
           onWorkflowRunAccepted: (run: AcceptedTriggerRunRecord) =>
             daemonModule.lifecycle.notifyWorkflowRunAccepted(run),
           onWorkflowRunStarted: (run: AcceptedTriggerRunRecord) =>
@@ -279,8 +279,8 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     daemonModule,
     connectionForDaemon,
     agentValidator,
-    stopRun: (actor, runId, confirmedPeerCount) =>
-      workflowEngine.stopRun(actor, runId, confirmedPeerCount),
+    stopRun: (actor, runId, confirmedPeerCount, retryAttemptId) =>
+      workflowEngine.stopRun(actor, runId, confirmedPeerCount, retryAttemptId),
     resourceCounts: () => {
       const executionSubscriptions = daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0;
       if (options.runTimeline === undefined) return { executionSubscriptions };
@@ -309,6 +309,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
         daemonModule?.lifecycle.recoverAgentExecutionDeadlines(),
         daemonModule?.lifecycle.recoverPendingHubActions(),
       ]);
+      daemonModule?.lifecycle.startStopInterruptRecovery();
       workflowEngine.start();
       activeSources = [
         ...(manualSource === undefined ? [] : [manualSource]),

@@ -1,3 +1,4 @@
+import { STOP_RECOVERY_BATCH_SIZE } from "../db/stop-interrupt.js";
 import type { RunTimeline } from "../run-timeline/index.js";
 import { DaemonAgentError } from "./agents/index.js";
 import { AgentSessions, AgentSessionError } from "../agent-sessions/index.js";
@@ -95,6 +96,8 @@ export interface ExecutionDeadlineClock {
   schedule(callback: () => Promise<void>, delayMs: number): () => void;
 }
 
+const STOP_RECOVERY_INTERVAL_MS = 60_000;
+
 const systemExecutionDeadlineClock: ExecutionDeadlineClock = {
   now: Date.now,
   schedule(callback, delayMs) {
@@ -174,6 +177,8 @@ export class DaemonDispatchLifecycle {
   private readonly turnEndTimers = new Map<string, () => void>();
   private readonly turnEndRuns = new Set<Promise<void>>();
   private stopping = false;
+  private stopRecoveryTimer: (() => void) | undefined;
+  private stopRecoveryRun: Promise<void> | undefined;
   readonly finishCalls: FinishCallRegistry;
 
   constructor(private readonly options: DaemonDispatchLifecycleOptions) {
@@ -188,8 +193,27 @@ export class DaemonDispatchLifecycle {
     return this.executionSubscriptions.size;
   }
 
+  startStopInterruptRecovery(): void {
+    if (this.stopping || this.stopRecoveryTimer !== undefined || this.stopRecoveryRun !== undefined)
+      return;
+    this.stopRecoveryTimer = this.scheduleDeadline(async () => {
+      this.stopRecoveryTimer = undefined;
+      this.stopRecoveryRun = this.recoverStopInterrupts().catch((error: unknown) =>
+        this.report(error, "daemon.execution.stop-recovery", {}),
+      );
+      try {
+        await this.stopRecoveryRun;
+      } finally {
+        this.stopRecoveryRun = undefined;
+        this.startStopInterruptRecovery();
+      }
+    }, STOP_RECOVERY_INTERVAL_MS);
+  }
+
   async stop(): Promise<void> {
     this.stopping = true;
+    this.stopRecoveryTimer?.();
+    this.stopRecoveryTimer = undefined;
     for (const unsubscribe of this.executionSubscriptions.values()) unsubscribe();
     this.executionSubscriptions.clear();
     for (const clear of this.deadlineTimersByExecution.values()) clear();
@@ -199,6 +223,7 @@ export class DaemonDispatchLifecycle {
     this.turnEnds.clear();
     this.startedExecutions.clear();
     await Promise.allSettled([
+      this.stopRecoveryRun,
       ...this.daemonRecoveries,
       ...this.reconcilingHubActions.values(),
       ...this.pendingStreamHandlersByExecution.values(),
@@ -952,7 +977,9 @@ export class DaemonDispatchLifecycle {
   }
 
   async recoverPendingHubActions(daemonId?: string): Promise<void> {
-    const executions = await this.options.database.findPendingHubActions(daemonId);
+    const executions = await this.options.database.findPendingHubActions(daemonId, {
+      kind: "ordinary",
+    });
     for (const execution of executions) {
       if (
         execution.hubAction !== "archive" ||
@@ -968,6 +995,19 @@ export class DaemonDispatchLifecycle {
       }
     }
     await Promise.all(executions.map((execution) => this.reconcileHubActionSafely(execution)));
+    await this.recoverStopInterrupts(daemonId);
+  }
+
+  private async recoverStopInterrupts(daemonId?: string): Promise<void> {
+    if (this.stopping) return;
+    const stops = await this.options.database.findPendingHubActions(daemonId, {
+      kind: "stop",
+      limit: STOP_RECOVERY_BATCH_SIZE,
+    });
+    for (const execution of stops) {
+      if (this.stopping) return;
+      await this.reconcileHubActionSafely(execution);
+    }
   }
 
   async recoverWorkflowDeadlineExecutions(executionIds: readonly string[]): Promise<void> {
@@ -975,10 +1015,15 @@ export class DaemonDispatchLifecycle {
     await this.recoverPendingHubActions();
   }
 
-  async recoverWorkflowTerminalExecutions(executionIds: readonly string[]): Promise<void> {
+  async recoverWorkflowTerminalExecutions(
+    executionIds: readonly string[],
+    retryStop = false,
+  ): Promise<void> {
     await Promise.all(
       executionIds.map(async (executionId) => {
-        const execution = await this.releaseWorkflowExecution(executionId);
+        const execution = await (retryStop
+          ? this.options.database.findAgentExecutionById(executionId)
+          : this.releaseWorkflowExecution(executionId));
         if (execution !== undefined) await this.reconcileHubActionSafely(execution);
       }),
     );
@@ -1410,14 +1455,14 @@ export class DaemonDispatchLifecycle {
     const daemonId = execution.daemonId;
     if (action === null || daemonId === null) return;
     const connection = this.options.connectionForDaemon(daemonId);
-    if (connection === undefined) return;
     if (action === "interrupt" && isCanceledExecution(execution)) {
       // Keep the generation observed by this recovery so a queued contender cannot
       // claim a new attempt after another worker releases the row.
       const generation = candidate.hubActionAcknowledgements.stopInterruptGeneration ?? null;
-      await this.sendStopInterrupt(execution, connection.agents, generation);
+      await this.sendStopInterrupt(execution, daemonId, connection?.agents, generation);
       return;
     }
+    if (connection === undefined) return;
     const settled = await withHubActionTimeout(
       this.sessionOwner().control(execution, connection.agents, action),
       this.dispatchTimeoutMs,
@@ -1428,32 +1473,54 @@ export class DaemonDispatchLifecycle {
 
   private async sendStopInterrupt(
     execution: AgentExecutionRecord,
-    agents: DaemonConnection["agents"],
+    daemonId: string,
+    agents: DaemonConnection["agents"] | undefined,
     generation: string | null,
   ) {
-    const { stopInterrupts } = this.options.database;
+    const database = this.options.database;
+    const store = database.stopInterrupts;
     const token = randomUUID();
-    const claimed = await stopInterrupts.claim(execution.id, token, generation);
+    const claimed = await store.claim(execution.id, token, generation);
     if (claimed === undefined) return;
     try {
+      const daemon = await database.findDaemonById(daemonId);
+      if (daemon?.status === "revoked") {
+        await store.complete(execution.id, token, "target_gone");
+        return;
+      }
+      const { state } = claimed;
+      if (
+        claimed.expired ||
+        state === null ||
+        ((state.startedAt !== undefined || state.target !== undefined) &&
+          state.acknowledgedPeerIds === undefined)
+      ) {
+        await store.complete(execution.id, token, "delivery_unconfirmed");
+        return;
+      }
       const interrupted =
-        claimed.state === null
-          ? []
+        state.acknowledgedPeerIds ??
+        (agents === undefined
+          ? undefined
           : await this.sessionOwner().interruptStoppedExecution(
               execution,
               agents,
               token,
-              claimed.state,
-            );
+              state.approvedPeerIds,
+            ));
       if (interrupted === undefined) return;
+      if (typeof interrupted === "string") {
+        await store.complete(execution.id, token, interrupted);
+        return;
+      }
       await Promise.all(
         interrupted.map((id) =>
           this.failAgentExecution(id, "agent_interrupted", { alreadyInterrupted: true }),
         ),
       );
-      await stopInterrupts.complete(execution.id, token);
+      await store.complete(execution.id, token, "confirmed");
     } finally {
-      await stopInterrupts.release(execution.id, token);
+      await store.release(execution.id, token);
     }
   }
 

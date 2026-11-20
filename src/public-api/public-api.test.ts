@@ -65,7 +65,7 @@ describe("public API interface", () => {
           status: "stopped",
           runId: id,
           runStatus: "canceled",
-          cleanupPending: true,
+          cleanupState: "waiting_for_daemon",
         }),
       },
     );
@@ -76,7 +76,8 @@ describe("public API interface", () => {
     assert.deepEqual(await stopped.json(), {
       runId: id,
       status: "canceled",
-      note: "If the daemon was offline, Hub will retry cleanup when it reconnects.",
+      cleanupState: "waiting_for_daemon",
+      note: "Hub is waiting for the daemon to finish cleanup.",
     });
   });
 

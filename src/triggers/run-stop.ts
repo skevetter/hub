@@ -1,7 +1,26 @@
 import type { AgentExecutionRecord, TenantRouteAccess, TriggerRunRecord } from "../db/types.js";
 
-export const CANCELED_RUN_NOTE =
-  "If the daemon was offline, Hub will retry cleanup when it reconnects.";
+export const stopCleanupStates = [
+  "confirmed",
+  "waiting_for_daemon",
+  "delivery_unconfirmed",
+  "target_gone",
+  "not_needed",
+] as const;
+export type StopCleanupState = (typeof stopCleanupStates)[number];
+
+export const stopCleanupNotes: Record<StopCleanupState, string | null> = {
+  confirmed: "The daemon confirmed cleanup.",
+  waiting_for_daemon: "Hub is waiting for the daemon to finish cleanup.",
+  delivery_unconfirmed: "Hub could not confirm interrupt delivery.",
+  target_gone: "The target agent or daemon is no longer available.",
+  not_needed: "No daemon cleanup was needed.",
+};
+
+export interface StopConfirmation {
+  confirmedPeerCount: number;
+  retryAttemptId?: string;
+}
 
 export interface RunStopActor {
   organizationId: string;
@@ -11,7 +30,8 @@ export interface RunStopActor {
 
 export interface RunStopDetails {
   stoppedByName: string | null;
-  cleanupPending: boolean;
+  cleanupState: StopCleanupState;
+  retryAttemptId: string | null;
   otherAttachedRunCount: number;
 }
 
@@ -21,7 +41,7 @@ export type StopRunResult =
       status: "stopped";
       runId: string;
       runStatus: TriggerRunRecord["status"];
-      cleanupPending?: boolean;
+      cleanupState: StopCleanupState;
     }
   | { status: "forbidden" | "run_not_found" };
 
@@ -31,6 +51,7 @@ export type StopRun = (
   actor: RunStopActor,
   runId: string,
   confirmedPeerCount?: number,
+  retryAttemptId?: string,
 ) => Promise<StopRunResult>;
 
 export function canStopRun(actor: RunStopActor, run: TriggerRunRecord): boolean {

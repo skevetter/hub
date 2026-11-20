@@ -8,7 +8,7 @@ import { githubBodyDigest, parseGitHubSignature } from "../auth/webhook-signatur
 import { SigningRequestError, type WebhookSigner } from "../auth/webhook-secret-store.js";
 import type { OperationAuthenticator } from "../auth/operation-auth.js";
 import { isDatabaseUnavailableError } from "../db/errors.js";
-import { CANCELED_RUN_NOTE, type StopRunResult } from "../triggers/run-stop.js";
+import { stopCleanupNotes, type StopRunResult } from "../triggers/run-stop.js";
 import { reportFailure } from "../failures/index.js";
 import { readBoundedRequestBody } from "../http/request-body.js";
 import { hasPostgresText, isPostgresJson } from "../http/json-storage.js";
@@ -1081,7 +1081,10 @@ function stopRunResponse(requestId: string, result: PublicOperationResult): Resp
       return success(requestId, 200, StoppedRunSchema, {
         runId: result.runId,
         status: result.runStatus,
-        ...(result.cleanupPending === true ? { note: CANCELED_RUN_NOTE } : {}),
+        cleanupState: result.cleanupState,
+        ...(result.cleanupState === "waiting_for_daemon"
+          ? { note: stopCleanupNotes.waiting_for_daemon }
+          : {}),
       });
     case "forbidden":
       return problem(

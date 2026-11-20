@@ -42,6 +42,8 @@ const ResultSchema = z
   .passthrough();
 
 export class DaemonAgentError extends Error {}
+export class DaemonAgentMissingError extends DaemonAgentError {}
+export class DaemonFrameNotSentError extends DaemonResponseLostError {}
 
 /** The ordinary daemon protocol. This channel knows nothing about Hub executions or triggers. */
 export class DaemonAgents implements AgentConnection {
@@ -162,7 +164,7 @@ export class DaemonAgents implements AgentConnection {
   async get(agentId: string): Promise<AgentSnapshot> {
     const response = await this.request({ type: "fetch_agent_request", agentId });
     if (response["agent"] === null)
-      throw new DaemonAgentError(
+      throw new DaemonAgentMissingError(
         "Continuation agent was deleted; use a new key or choose a new agent",
       );
     return SnapshotSchema.parse(response["agent"]);
@@ -254,7 +256,7 @@ export class DaemonAgents implements AgentConnection {
     for (const listener of this.listeners.get(agentId) ?? []) listener(event);
   }
   private assertOpen(): void {
-    if (this.closed) throw new DaemonResponseLostError();
+    if (this.closed) throw new DaemonFrameNotSentError();
   }
   private async request(
     message: Record<string, unknown>,

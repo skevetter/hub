@@ -1,4 +1,4 @@
-import { DaemonAgents } from "./agents/index.js";
+import { DaemonAgents, DaemonFrameNotSentError } from "./agents/index.js";
 import { DaemonTerminals } from "./terminals/index.js";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
@@ -91,7 +91,10 @@ export class ActiveDaemonRegistry {
     if (previous) this.rejectGeneration(daemon.id, previous.generation);
     const active: ActiveSocket = {
       agents: new DaemonAgents(
-        (frame) => socket.send(frame),
+        (frame) => {
+          if (socket.readyState !== WebSocket.OPEN) throw new DaemonFrameNotSentError();
+          socket.send(frame);
+        },
         () => this.clock.nowDate(),
         (error, operation) => this.report(error, operation, daemon.id),
       ),

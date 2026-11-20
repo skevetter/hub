@@ -401,10 +401,10 @@ export const publicOperationManifest: readonly PublicOperationDefinition[] = [
     resultMapping: "run-stop",
     summary: "Stop a run",
     description:
-      "Requires an organization CLI login. A run's starter or an organization admin can cancel active work. Stop interrupts the agent's current work. Any other run with work attached to that agent follows normal agent-interrupted failure handling if it is still active. Runs between steps can keep using the session. Hub records cancellation immediately and retries pending cleanup when an offline daemon reconnects. Repeated requests return the current run status.",
+      "Requires an organization CLI login. A run's starter or an organization admin can cancel a run. Hub records cancellation immediately and requests cleanup for active work. An acknowledged agent interrupt can fail other runs with work attached to that agent. A request known to be unsent can wait for reconnect. Hub sends at most one cancel frame per attempt. Repeated requests return the current run and cleanup states. A new attempt on a canceled run requires confirmation in Activity.",
     tag: "Runs",
     responses: {
-      200: "The current run status.",
+      200: "The current run status and cleanup state.",
       400: "The run ID is invalid.",
       401: "The bearer credential is missing, malformed, or revoked.",
       403: "The credential or user cannot stop this run.",
