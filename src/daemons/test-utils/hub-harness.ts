@@ -13,7 +13,9 @@ import { createFetchServer } from "../../http/node-server.js";
 import { createServerShutdown } from "../../server-shutdown.js";
 import { startApplication, stopApplication } from "../../server/runtime.js";
 import {
+  GetProvidersSnapshotRequestSchema,
   HubExecutionAgentValidateRequestSchema,
+  type HubProviderSnapshot,
   type HubExecutionControlAction,
   type HubExecutionAgentSnapshot,
 } from "../../hub/protocol.js";
@@ -109,6 +111,7 @@ const LegacyEnrollmentSchema = z.object({
 const ExecutionSessionRequestSchema = z.object({
   type: z.literal("session"),
   message: z.discriminatedUnion("type", [
+    GetProvidersSnapshotRequestSchema,
     HubExecutionAgentValidateRequestSchema,
     z.object({
       type: z.literal("create_agent_request"),
@@ -2256,6 +2259,7 @@ export class TestDaemon {
   timelineAgentIds: readonly string[] = [];
   private socket: WebSocket | undefined;
   private permissions: string[] = [];
+  providerSnapshotEntries: HubProviderSnapshot["entries"] | undefined;
   private readonly agents = new Map<string, Record<string, unknown>>();
   private createRequests = 0;
   private includeBackground = false;
@@ -2719,7 +2723,12 @@ export class TestDaemon {
           status: "server_info",
           serverId: this.daemonId,
           permissions: this.permissions,
-          features: { hubAgentRpc: true, agentRequestReceipts: true, backgroundWorkspaces: true },
+          features: {
+            hubAgentRpc: true,
+            agentRequestReceipts: true,
+            backgroundWorkspaces: true,
+            providersSnapshot: this.providerSnapshotEntries !== undefined,
+          },
         },
       });
       return;
@@ -2727,6 +2736,18 @@ export class TestDaemon {
     const envelope = ExecutionSessionRequestSchema.safeParse(value);
     if (!envelope.success) return;
     const request = envelope.data.message;
+    if (request.type === "get_providers_snapshot_request") {
+      this.send({
+        type: "get_providers_snapshot_response",
+        payload: {
+          requestId: request.requestId,
+          cwd: request.cwd,
+          entries: this.providerSnapshotEntries ?? [],
+          generatedAt: new Date().toISOString(),
+        },
+      });
+      return;
+    }
     if (request.type === "hub.execution.agent.validate.request") {
       this.send({
         type: "hub.execution.agent.validate.response",

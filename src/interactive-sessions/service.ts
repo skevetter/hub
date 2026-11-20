@@ -315,14 +315,18 @@ export class InteractiveSessionService {
     return { outcome: "accepted", sessionId };
   }
 
-  async profiles(request: Request, organizationSlug: string): Promise<ProfileView[]> {
+  async profiles(
+    request: Request,
+    organizationSlug: string,
+    manage = false,
+  ): Promise<ProfileView[]> {
     const principal = await this.requirePrincipal(request, organizationSlug);
+    const canManage = capabilitiesFor(principal.role).manageResources;
+    if (manage && !canManage) throw new SessionReadError("not_found");
     const profiles = await this.options.database.listSessionProfiles(principal.organizationId);
     return Promise.all(
       profiles
-        .filter(
-          ({ status }) => status === "active" || capabilitiesFor(principal.role).manageResources,
-        )
+        .filter(({ status }) => status === "active" || canManage)
         .map(async (profile) => {
           const daemon = await this.options.database.findDaemonForOrganization(
             principal.organizationId,

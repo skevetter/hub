@@ -35,6 +35,11 @@ const viewer = {
   email: "session-viewer@example.com",
   password: "session-viewer-password",
 };
+const admin = {
+  name: "Session Admin",
+  email: "session-admin@example.com",
+  password: "session-admin-password",
+};
 const organization = "Acme Sessions";
 const prompt = "Inspect the login flow";
 
@@ -48,22 +53,57 @@ async function setup(hub: PaseoHub) {
   return { origin: app.origin, base: `/o/${slug}` };
 }
 
-async function enroll(hub: PaseoHub) {
+async function enroll(hub: PaseoHub, profileAdmin?: string) {
   const app = hub.primaryApplication();
   const token = randomUUID();
+  const credentialId = profileAdmin === undefined ? null : randomUUID();
+  if (profileAdmin !== undefined) {
+    await app.query(
+      `insert into organization_cli_credentials (id, organization_id, prefix, verifier, created_by_user_id)
+       select $1, organization.id, $2, $2, "user".id from organization, "user"
+       where organization.name = $3 and "user".email = $4`,
+      [credentialId, randomUUID(), organization, profileAdmin],
+    );
+  }
   await app.query(
-    `insert into daemon_enrollment_tokens (id, verifier, organization_id, expires_at)
-     select $1, $2, id, now() + interval '10 minutes' from organization where name = $3`,
-    [randomUUID(), createHash("sha256").update(token).digest("base64url"), organization],
+    `insert into daemon_enrollment_tokens (id, verifier, organization_id, expires_at, issued_by_cli_credential_id)
+     select $1, $2, id, now() + interval '10 minutes', $4 from organization where name = $3`,
+    [
+      randomUUID(),
+      createHash("sha256").update(token).digest("base64url"),
+      organization,
+      credentialId,
+    ],
   );
   const daemon = TestDaemon.create(app.origin);
+  if (profileAdmin !== undefined) {
+    daemon.providerSnapshotEntries = [
+      {
+        provider: "omp",
+        label: "OMP",
+        status: "ready",
+        enabled: true,
+        defaultModeId: "full",
+        modes: [{ id: "full", label: "Full" }],
+        models: [
+          {
+            provider: "omp",
+            id: "test-model",
+            label: "Test model",
+            thinkingOptions: [{ id: "high", label: "High" }],
+          },
+        ],
+      },
+    ];
+  }
   await daemon.connect(await daemon.enroll(token, "devbox"));
-  await app.query(
-    `insert into interactive_session_profiles (id, organization_id, name, daemon_id, cwd, provider, status)
+  if (profileAdmin === undefined)
+    await app.query(
+      `insert into interactive_session_profiles (id, organization_id, name, daemon_id, cwd, provider, status)
      select $1, id, 'Web on devbox', $2, '/workspace/web', 'opencode', 'active'
      from organization where name = $3`,
-    [randomUUID(), daemon.daemonId, organization],
-  );
+      [randomUUID(), daemon.daemonId, organization],
+    );
   return daemon;
 }
 
@@ -95,10 +135,113 @@ test("hides Sessions navigation and routes when the flag is off", async ({ hub, 
   await expect(page.getByRole("heading", { name: "Start a session" })).toHaveCount(0);
   await page.goto(app.origin + app.base + "/sessions");
   await expect(page.getByRole("heading", { name: "Sessions unavailable" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Profiles", exact: true })).toHaveCount(0);
+  await page.goto(app.origin + app.base + "/sessions/profiles");
+  await expect(page.getByRole("heading", { name: "Sessions unavailable" })).toBeVisible();
 });
 
 test.describe("interactive sessions", () => {
   test.use({ interactiveSessions: true });
+
+  test("an admin creates a profile and starts a session while members cannot manage profiles", async ({
+    browser,
+    hub,
+    page,
+  }) => {
+    const app = await setup(hub);
+    await hub.joinInvitationAs(
+      "admin",
+      admin,
+      await hub.inviteMember("owner", admin.email, "admin"),
+    );
+    const adminContext = browser.contexts().find((context) => context !== page.context());
+    const adminPage = adminContext?.pages()[0];
+    if (adminPage === undefined) throw new Error("Admin page unavailable");
+    await hub.addNewMember("owner", "viewer", viewer);
+    const memberPage = browser
+      .contexts()
+      .find((context) => context !== page.context() && context !== adminContext)
+      ?.pages()[0];
+    if (memberPage === undefined) throw new Error("Member page unavailable");
+    const daemon = await enroll(hub, admin.email);
+    const sessions = app.origin + app.base + "/sessions";
+    const profiles = sessions + "/profiles";
+    try {
+      await memberPage.goto(sessions);
+      await expect(
+        memberPage.getByRole("heading", { name: "Sessions", exact: true }),
+      ).toBeVisible();
+      await expect(memberPage.getByRole("link", { name: "Profiles", exact: true })).toHaveCount(0);
+      await memberPage.goto(profiles);
+      await expect(memberPage.getByRole("heading", { name: "Sessions unavailable" })).toBeVisible();
+
+      await adminPage.setViewportSize({ width: 390, height: 900 });
+      await adminPage.goto(sessions);
+      await adminPage.getByRole("link", { name: "Profiles", exact: true }).click();
+      await expect(adminPage.getByText("No session profiles yet")).toBeVisible();
+      await adminPage.getByRole("button", { name: "Create a profile" }).click();
+      const dialog = adminPage.getByRole("dialog");
+      await dialog.getByRole("textbox", { name: "Name", exact: true }).fill("Web on devbox");
+      await dialog.getByRole("combobox", { name: "Daemon", exact: true }).click();
+      await adminPage.getByRole("option", { name: "devbox", exact: true }).click();
+      await dialog.getByRole("textbox", { name: "Working directory" }).fill("/workspace/web");
+      await dialog.getByRole("checkbox", { name: "Use a new branch per session" }).check();
+      await dialog.getByRole("textbox", { name: "Base branch" }).fill("main");
+      await chooseProfileOption(adminPage, "Provider", "OMP");
+      await chooseProfileOption(adminPage, "Model", "Test model");
+      await chooseProfileOption(adminPage, "Thinking", "High");
+      await expect(dialog.getByRole("combobox", { name: "Mode", exact: true })).toHaveText(
+        "Select a mode",
+      );
+      await chooseProfileOption(adminPage, "Mode", "Full");
+      const acknowledge = dialog.getByRole("checkbox", { name: "Run every tool without asking" });
+      await expect(acknowledge).not.toBeChecked();
+      for (const width of [390, 1280]) {
+        await adminPage.setViewportSize({ width, height: 1100 });
+        await expect.poll(() => horizontalOverflow(dialog)).toBe(0);
+        await expect.poll(() => verticalOverflow(dialog)).toBe(0);
+        await expect.poll(() => elementWidth(dialog)).toBeLessThanOrEqual(448);
+        await dialog.evaluate((node) => node.scrollTo(0, 0));
+        await capture(adminPage, "profile-form", width);
+      }
+      await adminPage.setViewportSize({ width: 390, height: 900 });
+      await dialog.getByRole("button", { name: "Create profile" }).click();
+      await expect(dialog).toBeVisible();
+      await expect(acknowledge).toBeFocused();
+      await acknowledge.check();
+      await dialog.getByRole("button", { name: "Create profile" }).click();
+      const profile = adminPage.getByRole("row").filter({ hasText: "Web on devbox" });
+      await expect(profile).toContainText("Enabled");
+      for (const width of [390, 1280]) {
+        await adminPage.setViewportSize({ width, height: 900 });
+        await capture(adminPage, "profiles", width);
+      }
+      await expect(profile).toContainText("/workspace/web");
+      await expect(profile).toContainText("omp / test-model");
+      const actions = adminPage.getByRole("button", { name: "Actions for Web on devbox" });
+      await actions.click();
+      await adminPage.getByRole("menuitem", { name: "Disable", exact: true }).click();
+      await expect(profile).toContainText("Disabled");
+      await actions.click();
+      await adminPage.getByRole("menuitem", { name: "Enable", exact: true }).click();
+      await expect(profile).toContainText("Enabled");
+      await actions.click();
+      await adminPage.getByRole("menuitem", { name: "Edit", exact: true }).click();
+      await expect(dialog.getByRole("textbox", { name: "Base branch" })).toHaveValue("main");
+      await dialog
+        .getByRole("textbox", { name: "Name", exact: true })
+        .fill("Web on devbox updated");
+      await expect(dialog.getByRole("combobox", { name: "Provider", exact: true })).toBeEnabled();
+      await dialog.getByRole("button", { name: "Save changes" }).click();
+      await expect(profile).toContainText("Web on devbox updated");
+      await start(adminPage, app);
+      expect(daemon.createdAgent()["provider"]).toBe("omp");
+      expect(daemon.createdAgent()["modeId"]).toBe("full");
+      expect(daemon.createdAgent()["worktree"]).toBeDefined();
+    } finally {
+      await daemon.disconnect();
+    }
+  });
 
   test("a viewer sees live assistant text and no composer", async ({ browser, hub, page }) => {
     const app = await setup(hub);
@@ -371,6 +514,19 @@ function instrumentSessionStream() {
 
 function horizontalOverflow(locator: Locator) {
   return locator.evaluate((element) => element.scrollWidth - element.clientWidth);
+}
+
+function verticalOverflow(locator: Locator) {
+  return locator.evaluate((element) => element.scrollHeight - element.clientHeight);
+}
+
+function elementWidth(locator: Locator) {
+  return locator.evaluate((element) => element.getBoundingClientRect().width);
+}
+
+async function chooseProfileOption(page: Page, field: string, option: string) {
+  await page.getByRole("dialog").getByRole("combobox", { name: field, exact: true }).click();
+  await page.getByRole("option", { name: option, exact: true }).click();
 }
 
 async function expectPageWidth(page: Page, width: number) {

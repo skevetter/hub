@@ -1,6 +1,7 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useMemo, useState } from "react";
+import { useActiveAccount } from "../../auth/active-account.js";
 import {
   DataCell,
   DataRow,
@@ -55,6 +56,8 @@ export function SessionListPanel({
   result: Awaited<ReturnType<typeof listInteractiveSessions>>;
 }) {
   const navigate = useNavigate();
+  const account = useActiveAccount();
+  const params = useMemo(() => ({ organizationSlug }), [organizationSlug]);
   const changeFilter = useCallback(
     (value: string) => {
       void navigate({
@@ -71,6 +74,13 @@ export function SessionListPanel({
   return (
     <>
       <PageHeader title="Sessions" description={DESCRIPTION}>
+        {account.features?.interactiveSessions === true && account.capabilities.manageResources ? (
+          <Button asChild variant="outline">
+            <Link to="/o/$organizationSlug/sessions/profiles" params={params}>
+              Profiles
+            </Link>
+          </Button>
+        ) : null}
         <NewSessionLink organizationSlug={organizationSlug} />
       </PageHeader>
       <Section>

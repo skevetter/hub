@@ -39,6 +39,8 @@ export function NewSessionPanel({
   organizationSlug: string;
   profiles: Awaited<ReturnType<typeof listSessionProfiles>>;
 }) {
+  const account = useActiveAccount();
+  const params = useMemo(() => ({ organizationSlug }), [organizationSlug]);
   const active = useMemo(
     () =>
       profiles.status === "ok" && Array.isArray(profiles.data)
@@ -54,11 +56,23 @@ export function NewSessionPanel({
     return <SessionsUnavailable />;
   let body = <SessionLoadFailure title="Session profiles unavailable" error={profiles} />;
   if (active?.length === 0) {
+    const canManage =
+      account.features?.interactiveSessions === true && account.capabilities.manageResources;
     body = (
       <EmptyState
         title="No active session profiles"
-        description="Ask an organization admin to create a session profile."
-      />
+        {...(canManage
+          ? {}
+          : { description: "Ask an organization admin to create a session profile." })}
+      >
+        {canManage ? (
+          <Button asChild>
+            <Link to="/o/$organizationSlug/sessions/profiles" params={params}>
+              Create a profile
+            </Link>
+          </Button>
+        ) : null}
+      </EmptyState>
     );
   } else if (active !== undefined) {
     body = <CreateSessionForm organizationSlug={organizationSlug} profiles={active} />;

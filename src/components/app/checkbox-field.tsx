@@ -19,6 +19,7 @@ export function CheckboxField({
   value,
   checked,
   defaultChecked,
+  required,
   disabled,
   onChange,
 }: {
@@ -30,6 +31,7 @@ export function CheckboxField({
   value?: string;
   checked?: boolean;
   defaultChecked?: boolean;
+  required?: boolean;
   disabled?: boolean;
   onChange?: (checked: boolean) => void;
 }) {
@@ -45,6 +47,7 @@ export function CheckboxField({
         {...(value === undefined ? {} : { value })}
         {...(checked === undefined ? {} : { checked })}
         {...(defaultChecked === undefined ? {} : { defaultChecked })}
+        {...(required === undefined ? {} : { required })}
         {...(disabled === undefined ? {} : { disabled })}
         {...(onChange === undefined ? {} : { onChange: emit })}
       />

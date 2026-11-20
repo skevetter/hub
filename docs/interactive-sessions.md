@@ -18,6 +18,24 @@ Set these variables on the Hub process and restart it.
 Hub rejects invalid values on startup. With sessions disabled, Hub skips session recovery and
 daemon watches, and session requests return `not_found`.
 
+## Create a session profile
+
+As an organization owner or admin, open **Sessions**, select **Profiles**, then choose
+**Create a profile**. Name the profile, select a connected daemon with `hub.execute`, and enter
+an absolute working directory on that daemon. Admins use daemons enrolled with their own Paseo
+CLI credentials.
+
+Choose a provider and its settings from the daemon's catalog. For OMP, choose the mode
+explicitly. If you choose full access, check **Run every tool without asking** to confirm.
+If each session needs its own branch, select **Use a new branch per session** and optionally
+enter a base branch. Select **Create profile** to make it available in **New session**.
+
+Use the profile's row menu to edit, disable, or re-enable it. Disabling a profile prevents new
+sessions from using it. Admins can change profiles they created. Owners can change any profile.
+The daemon must be connected when you save a change.
+
+## Work in a session
+
 A participant with control can steer the current turn or queue a message for the next idle
 turn. A steer can overtake queued messages. Stop interrupts the active turn and discards unsent
 messages. When the daemon reconnects after a disconnect or Hub restart, Hub re-watches the

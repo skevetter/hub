@@ -6,18 +6,27 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { routeTree } from "../../routeTree.gen.js";
 import { Route as RootRoute } from "../../routes/__root.js";
 import { Route as ShellRoute } from "../../routes/_shell.js";
+import { profileSaveMessage } from "./session-profiles.js";
 
 const state = vi.hoisted(() => ({
   list: vi.fn(),
   read: vi.fn(),
+  profiles: vi.fn(),
+  role: "owner",
+  enabled: true,
 }));
 
 vi.mock("../functions.js", () => ({
   listInteractiveSessions: state.list,
   readInteractiveSession: state.read,
+  listSessionProfiles: state.profiles,
+  saveSessionProfile: vi.fn(),
 }));
 vi.mock("../../auth/active-account.js", () => ({
-  useActiveAccount: () => ({ features: { interactiveSessions: true } }),
+  useActiveAccount: () => ({
+    features: state.enabled ? { interactiveSessions: true } : undefined,
+    capabilities: { manageResources: state.role !== "member" },
+  }),
 }));
 
 const rootComponent = RootRoute.options.component;
@@ -29,6 +38,17 @@ beforeEach(() => {
   RootRoute.options.notFoundComponent = () => <p>Unknown route</p>;
   state.list.mockResolvedValue({ status: "ok", data: { sessions: [], nextCursor: null } });
   state.read.mockResolvedValue({ status: "ok", data: { outcome: "refused", code: "not_found" } });
+  state.profiles.mockReset().mockImplementation(({ data }: { data: { manage?: boolean } }) =>
+    Promise.resolve({
+      status: "ok",
+      data:
+        !state.enabled || (data.manage === true && state.role === "member")
+          ? { outcome: "refused", code: "not_found" }
+          : [],
+    }),
+  );
+  state.role = "owner";
+  state.enabled = true;
 });
 afterEach(() => {
   if (rootComponent === undefined) delete RootRoute.options.component;
@@ -87,4 +107,62 @@ it("uses the same unavailable detail state for a missing or unshared session", a
   const html = await renderRoute("/o/acme/sessions/00000000-0000-4000-8000-000000000001");
   expect(html).toContain("Session unavailable");
   expect(html).toContain("Back to sessions");
+});
+
+it.each(["owner", "admin"])(
+  "shows profile management and the empty state to an %s",
+  async (role) => {
+    state.role = role;
+    expect(await renderRoute("/o/acme/sessions")).toContain('href="/o/acme/sessions/profiles"');
+    expect(await renderRoute("/o/acme/sessions/new")).toContain('href="/o/acme/sessions/profiles"');
+    const html = await renderRoute("/o/acme/sessions/profiles");
+    expect(html).toContain("No session profiles yet");
+    expect(html).toContain("Create a profile");
+    expect(state.profiles).toHaveBeenCalledWith({
+      data: { organizationSlug: "acme", manage: true },
+    });
+  },
+);
+
+it("keeps profile management out of the member routes", async () => {
+  state.role = "member";
+  expect(await renderRoute("/o/acme/sessions")).not.toContain('href="/o/acme/sessions/profiles"');
+  expect(await renderRoute("/o/acme/sessions/new")).toContain(
+    "Ask an organization admin to create a session profile.",
+  );
+  const html = await renderRoute("/o/acme/sessions/profiles");
+  expect(html).toContain("Sessions unavailable");
+  expect(html).not.toContain("Create a profile");
+});
+
+it("shows no profile management with sessions disabled", async () => {
+  state.enabled = false;
+  expect(await renderRoute("/o/acme/sessions")).not.toContain('href="/o/acme/sessions/profiles"');
+  const html = await renderRoute("/o/acme/sessions/profiles");
+  expect(html).toContain("Sessions unavailable");
+  expect(html).not.toContain("Create a profile");
+});
+
+it("shows loading and a retryable profiles error", async () => {
+  expect(await renderRoute("/o/acme/sessions/profiles", true)).toContain(
+    "Loading session profiles",
+  );
+  state.profiles.mockResolvedValue({
+    status: "error",
+    error: { message: "Profiles could not load." },
+  });
+  const html = await renderRoute("/o/acme/sessions/profiles");
+  expect(html).toContain("Profiles could not load.");
+  expect(html).toContain("Try again");
+});
+
+it.each([
+  ["profile_changed", "This profile changed. Reload the page and try again."],
+  ["version_conflict", "This profile changed. Reload the page and try again."],
+  ["name_taken", "A profile with this name already exists."],
+  ["daemon_unavailable", "The daemon is unavailable. Try again when it reconnects."],
+  ["invalid_mode", "The daemon did not accept these provider settings."],
+  ["invalid_profile", "Check the profile name and enter an absolute directory on the daemon."],
+])("explains the %s save refusal", (code, message) => {
+  expect(profileSaveMessage(code)).toBe(message);
 });

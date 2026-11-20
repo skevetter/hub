@@ -165,10 +165,10 @@ export const setSessionParticipant = createServerFn({ method: "POST" })
   );
 
 export const listSessionProfiles = createServerFn({ method: "GET" })
-  .validator(scope)
+  .validator(scope.extend({ manage: z.boolean().optional() }))
   .handler(({ data }) =>
     respond("interactiveSession.profiles", data.organizationSlug, (service, request) =>
-      service.profiles(request, data.organizationSlug),
+      service.profiles(request, data.organizationSlug, data.manage),
     ),
   );
 

@@ -61,6 +61,7 @@ import { Route as ShellOOrganizationSlugSettingsUsageRouteImport } from './route
 import { Route as ShellOOrganizationSlugSettingsTeamRouteImport } from './routes/_shell/o/$organizationSlug/settings/team'
 import { Route as ShellOOrganizationSlugSettingsBillingRouteImport } from './routes/_shell/o/$organizationSlug/settings/billing'
 import { Route as ShellOOrganizationSlugSettingsApiKeysRouteImport } from './routes/_shell/o/$organizationSlug/settings/api-keys'
+import { Route as ShellOOrganizationSlugSessionsProfilesRouteImport } from './routes/_shell/o/$organizationSlug/sessions/profiles'
 import { Route as ShellOOrganizationSlugSessionsNewRouteImport } from './routes/_shell/o/$organizationSlug/sessions/new'
 import { Route as ShellOOrganizationSlugSessionsSessionIdRouteImport } from './routes/_shell/o/$organizationSlug/sessions/$sessionId'
 import { Route as ShellOOrganizationSlugActivityRunIdRouteImport } from './routes/_shell/o/$organizationSlug/activity/$runId'
@@ -352,6 +353,12 @@ const ShellOOrganizationSlugSettingsApiKeysRoute =
     path: '/api-keys',
     getParentRoute: () => ShellOOrganizationSlugSettingsRoute,
   } as any)
+const ShellOOrganizationSlugSessionsProfilesRoute =
+  ShellOOrganizationSlugSessionsProfilesRouteImport.update({
+    id: '/profiles',
+    path: '/profiles',
+    getParentRoute: () => ShellOOrganizationSlugSessionsRoute,
+  } as any)
 const ShellOOrganizationSlugSessionsNewRoute =
   ShellOOrganizationSlugSessionsNewRouteImport.update({
     id: '/new',
@@ -415,6 +422,7 @@ export interface FileRoutesByFullPath {
   '/o/$organizationSlug/activity/$runId': typeof ShellOOrganizationSlugActivityRunIdRoute
   '/o/$organizationSlug/sessions/$sessionId': typeof ShellOOrganizationSlugSessionsSessionIdRoute
   '/o/$organizationSlug/sessions/new': typeof ShellOOrganizationSlugSessionsNewRoute
+  '/o/$organizationSlug/sessions/profiles': typeof ShellOOrganizationSlugSessionsProfilesRoute
   '/o/$organizationSlug/settings/api-keys': typeof ShellOOrganizationSlugSettingsApiKeysRoute
   '/o/$organizationSlug/settings/billing': typeof ShellOOrganizationSlugSettingsBillingRoute
   '/o/$organizationSlug/settings/team': typeof ShellOOrganizationSlugSettingsTeamRoute
@@ -467,6 +475,7 @@ export interface FileRoutesByTo {
   '/o/$organizationSlug/activity/$runId': typeof ShellOOrganizationSlugActivityRunIdRoute
   '/o/$organizationSlug/sessions/$sessionId': typeof ShellOOrganizationSlugSessionsSessionIdRoute
   '/o/$organizationSlug/sessions/new': typeof ShellOOrganizationSlugSessionsNewRoute
+  '/o/$organizationSlug/sessions/profiles': typeof ShellOOrganizationSlugSessionsProfilesRoute
   '/o/$organizationSlug/settings/api-keys': typeof ShellOOrganizationSlugSettingsApiKeysRoute
   '/o/$organizationSlug/settings/billing': typeof ShellOOrganizationSlugSettingsBillingRoute
   '/o/$organizationSlug/settings/team': typeof ShellOOrganizationSlugSettingsTeamRoute
@@ -525,6 +534,7 @@ export interface FileRoutesById {
   '/_shell/o/$organizationSlug/activity/$runId': typeof ShellOOrganizationSlugActivityRunIdRoute
   '/_shell/o/$organizationSlug/sessions/$sessionId': typeof ShellOOrganizationSlugSessionsSessionIdRoute
   '/_shell/o/$organizationSlug/sessions/new': typeof ShellOOrganizationSlugSessionsNewRoute
+  '/_shell/o/$organizationSlug/sessions/profiles': typeof ShellOOrganizationSlugSessionsProfilesRoute
   '/_shell/o/$organizationSlug/settings/api-keys': typeof ShellOOrganizationSlugSettingsApiKeysRoute
   '/_shell/o/$organizationSlug/settings/billing': typeof ShellOOrganizationSlugSettingsBillingRoute
   '/_shell/o/$organizationSlug/settings/team': typeof ShellOOrganizationSlugSettingsTeamRoute
@@ -583,6 +593,7 @@ export interface FileRouteTypes {
     | '/o/$organizationSlug/activity/$runId'
     | '/o/$organizationSlug/sessions/$sessionId'
     | '/o/$organizationSlug/sessions/new'
+    | '/o/$organizationSlug/sessions/profiles'
     | '/o/$organizationSlug/settings/api-keys'
     | '/o/$organizationSlug/settings/billing'
     | '/o/$organizationSlug/settings/team'
@@ -635,6 +646,7 @@ export interface FileRouteTypes {
     | '/o/$organizationSlug/activity/$runId'
     | '/o/$organizationSlug/sessions/$sessionId'
     | '/o/$organizationSlug/sessions/new'
+    | '/o/$organizationSlug/sessions/profiles'
     | '/o/$organizationSlug/settings/api-keys'
     | '/o/$organizationSlug/settings/billing'
     | '/o/$organizationSlug/settings/team'
@@ -692,6 +704,7 @@ export interface FileRouteTypes {
     | '/_shell/o/$organizationSlug/activity/$runId'
     | '/_shell/o/$organizationSlug/sessions/$sessionId'
     | '/_shell/o/$organizationSlug/sessions/new'
+    | '/_shell/o/$organizationSlug/sessions/profiles'
     | '/_shell/o/$organizationSlug/settings/api-keys'
     | '/_shell/o/$organizationSlug/settings/billing'
     | '/_shell/o/$organizationSlug/settings/team'
@@ -1103,6 +1116,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ShellOOrganizationSlugSettingsApiKeysRouteImport
       parentRoute: typeof ShellOOrganizationSlugSettingsRoute
     }
+    '/_shell/o/$organizationSlug/sessions/profiles': {
+      id: '/_shell/o/$organizationSlug/sessions/profiles'
+      path: '/profiles'
+      fullPath: '/o/$organizationSlug/sessions/profiles'
+      preLoaderRoute: typeof ShellOOrganizationSlugSessionsProfilesRouteImport
+      parentRoute: typeof ShellOOrganizationSlugSessionsRoute
+    }
     '/_shell/o/$organizationSlug/sessions/new': {
       id: '/_shell/o/$organizationSlug/sessions/new'
       path: '/new'
@@ -1148,6 +1168,7 @@ const ShellOOrganizationSlugActivityRouteWithChildren =
 interface ShellOOrganizationSlugSessionsRouteChildren {
   ShellOOrganizationSlugSessionsSessionIdRoute: typeof ShellOOrganizationSlugSessionsSessionIdRoute
   ShellOOrganizationSlugSessionsNewRoute: typeof ShellOOrganizationSlugSessionsNewRoute
+  ShellOOrganizationSlugSessionsProfilesRoute: typeof ShellOOrganizationSlugSessionsProfilesRoute
   ShellOOrganizationSlugSessionsIndexRoute: typeof ShellOOrganizationSlugSessionsIndexRoute
 }
 
@@ -1157,6 +1178,8 @@ const ShellOOrganizationSlugSessionsRouteChildren: ShellOOrganizationSlugSession
       ShellOOrganizationSlugSessionsSessionIdRoute,
     ShellOOrganizationSlugSessionsNewRoute:
       ShellOOrganizationSlugSessionsNewRoute,
+    ShellOOrganizationSlugSessionsProfilesRoute:
+      ShellOOrganizationSlugSessionsProfilesRoute,
     ShellOOrganizationSlugSessionsIndexRoute:
       ShellOOrganizationSlugSessionsIndexRoute,
   }
