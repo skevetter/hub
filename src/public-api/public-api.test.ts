@@ -81,6 +81,33 @@ describe("public API interface", () => {
     });
   });
 
+  it("reports a coalesced stop as confirmed with a coverage note", async () => {
+    const runId = "00000000-0000-4000-8000-000000000001";
+    const api = createPublicApi(
+      { status: "enabled", authenticator: authenticator() },
+      {
+        ...successfulOperations(),
+        stopRun: async () => ({
+          status: "stopped",
+          runId,
+          runStatus: "canceled",
+          cleanupState: "confirmed",
+          coalesced: true,
+        }),
+      },
+    );
+    const response = await api.handle(
+      request(`/api/v1/runs/${runId}/stop`, { contentType: false }),
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      runId,
+      status: "canceled",
+      cleanupState: "confirmed",
+      note: "Another Stop covered this run with the same interrupt.",
+    });
+  });
+
   it("rejects an enabled composition without application operations", () => {
     assert.throws(
       () => createPublicApi({ status: "enabled", authenticator: authenticator() }, null),

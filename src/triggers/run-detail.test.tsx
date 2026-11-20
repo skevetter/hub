@@ -31,6 +31,7 @@ describe("run timeline UI", () => {
       stopDetails: {
         stoppedByName: "Avery",
         cleanupState: "waiting_for_daemon",
+        coalesced: false,
         retryAttemptId: null,
         otherAttachedRunCount: 0,
       },
@@ -40,6 +41,13 @@ describe("run timeline UI", () => {
     assert.match(
       render({ ...detail, stopDetails: { ...detail.stopDetails!, cleanupState: "confirmed" } }),
       /daemon confirmed cleanup/u,
+    );
+    assert.match(
+      render({
+        ...detail,
+        stopDetails: { ...detail.stopDetails!, cleanupState: "confirmed", coalesced: true },
+      }),
+      /Another Stop covered this run/u,
     );
   });
 

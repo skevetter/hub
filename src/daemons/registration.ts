@@ -76,8 +76,9 @@ export class DaemonRegistration {
       daemonId,
     );
     if (daemon === undefined) return unavailableDaemon();
-    await this.options.database.revokeDaemon(daemon.id);
-    await this.options.activeDaemons.revoke(daemon);
+    await this.options.activeDaemons.revoke(daemon, () =>
+      this.options.database.revokeDaemon(daemon.id),
+    );
     return new Response(null, { status: 204 });
   }
 
@@ -189,8 +190,7 @@ export async function revokeDaemon(
 ): Promise<Response> {
   const daemon = await authenticatedDaemon(request, id, database);
   if (daemon instanceof Response) return daemon;
-  await database.revokeDaemon(id);
-  await registry.revoke(daemon);
+  await registry.revoke(daemon, () => database.revokeDaemon(id));
   return new Response(null, { status: 204 });
 }
 

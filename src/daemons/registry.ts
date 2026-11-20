@@ -212,12 +212,22 @@ export class ActiveDaemonRegistry {
     if (active) active.daemon = daemon;
   }
 
-  async revoke(daemon: DaemonRecord): Promise<void> {
-    try {
-      await Promise.all(Array.from(this.revokedHandlers, async (handler) => handler(daemon)));
-    } finally {
-      this.active.get(daemon.id)?.socket.close(4403, "revoked");
-    }
+  async revoke(daemon: DaemonRecord, persistRevocation: () => Promise<boolean>): Promise<void> {
+    const previous = this.active.get(daemon.id);
+    this.closeRevokedConnection(daemon.id);
+    await persistRevocation();
+    // A reconnect could have been admitted while the revocation was being persisted.
+    if (this.active.get(daemon.id) !== previous) this.closeRevokedConnection(daemon.id);
+    await Promise.all(Array.from(this.revokedHandlers, async (handler) => handler(daemon)));
+  }
+
+  private closeRevokedConnection(daemonId: string): void {
+    const active = this.active.get(daemonId);
+    if (active === undefined) return;
+    active.ready = false;
+    active.agents.close();
+    active.terminals.close();
+    active.socket.close(4403, "revoked");
   }
 
   async stop(): Promise<void> {

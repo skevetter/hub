@@ -26,7 +26,7 @@ export interface TimelinePostgresHarness {
   runtime: DatabaseRuntime;
   database: Database;
   createRun(): Promise<AcceptedTriggerRunRecord>;
-  connect(hooks?: TimelineQueryHooks): Promise<TimelinePostgresConnection>;
+  connect(hooks?: TimelineQueryHooks, maxConnections?: number): Promise<TimelinePostgresConnection>;
   waitForLockOrRead(pid: number, wasRead?: () => boolean): Promise<"blocked" | "read">;
   close(): Promise<void>;
 }
@@ -112,8 +112,10 @@ export async function createTimelinePostgresHarness(): Promise<TimelinePostgresH
           })
         ).run;
       },
-      async connect(hooks: TimelineQueryHooks = {}) {
-        const bundle = await postgresDatabaseRuntime(container.getConnectionUri(), { max: 1 });
+      async connect(hooks: TimelineQueryHooks = {}, maxConnections = 1) {
+        const bundle = await postgresDatabaseRuntime(container.getConnectionUri(), {
+          max: maxConnections,
+        });
         connections.push(bundle.runtime);
         const { rows } = await bundle.runtime.query<{ pid: number }>(
           "select pg_backend_pid() as pid",

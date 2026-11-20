@@ -17,6 +17,8 @@ export const stopCleanupNotes: Record<StopCleanupState, string | null> = {
   not_needed: "No daemon cleanup was needed.",
 };
 
+export const stopCoalescedNote = "Another Stop covered this run with the same interrupt.";
+
 export interface StopConfirmation {
   confirmedPeerCount: number;
   retryAttemptId?: string;
@@ -31,6 +33,7 @@ export interface RunStopActor {
 export interface RunStopDetails {
   stoppedByName: string | null;
   cleanupState: StopCleanupState;
+  coalesced: boolean;
   retryAttemptId: string | null;
   otherAttachedRunCount: number;
 }
@@ -42,6 +45,7 @@ export type StopRunResult =
       runId: string;
       runStatus: TriggerRunRecord["status"];
       cleanupState: StopCleanupState;
+      coalesced?: true;
     }
   | { status: "forbidden" | "run_not_found" };
 

@@ -1,4 +1,4 @@
-import { STOP_RECOVERY_BATCH_SIZE } from "../db/stop-interrupt.js";
+import { STOP_RECOVERY_BATCH_SIZE, stopInterruptMayHaveSent } from "../db/stop-interrupt.js";
 import type { RunTimeline } from "../run-timeline/index.js";
 import { DaemonAgentError } from "./agents/index.js";
 import { AgentSessions, AgentSessionError } from "../agent-sessions/index.js";
@@ -1483,36 +1483,31 @@ export class DaemonDispatchLifecycle {
     const claimed = await store.claim(execution.id, token, generation);
     if (claimed === undefined) return;
     try {
-      const daemon = await database.findDaemonById(daemonId);
-      if (daemon?.status === "revoked") {
-        await store.complete(execution.id, token, "target_gone");
-        return;
-      }
       const { state } = claimed;
-      if (
-        claimed.expired ||
-        state === null ||
-        ((state.startedAt !== undefined || state.target !== undefined) &&
-          state.acknowledgedPeerIds === undefined)
-      ) {
-        await store.complete(execution.id, token, "delivery_unconfirmed");
-        return;
+      let interrupted = state?.acknowledgedPeerIds;
+      if (interrupted === undefined) {
+        const daemon = await database.findDaemonById(daemonId);
+        if (daemon?.status === "revoked" && !stopInterruptMayHaveSent(state)) {
+          await store.complete(execution.id, token, "target_gone");
+          return;
+        }
+        if (claimed.expired || state === null || stopInterruptMayHaveSent(state)) {
+          await store.complete(execution.id, token, "delivery_unconfirmed");
+          return;
+        }
+        const outcome = await this.sessionOwner().interruptStoppedExecution(
+          execution,
+          agents,
+          token,
+          state.approvedPeerIds,
+        );
+        if (typeof outcome === "string") {
+          await store.complete(execution.id, token, outcome);
+          return;
+        }
+        interrupted = outcome;
       }
-      const interrupted =
-        state.acknowledgedPeerIds ??
-        (agents === undefined
-          ? undefined
-          : await this.sessionOwner().interruptStoppedExecution(
-              execution,
-              agents,
-              token,
-              state.approvedPeerIds,
-            ));
       if (interrupted === undefined) return;
-      if (typeof interrupted === "string") {
-        await store.complete(execution.id, token, interrupted);
-        return;
-      }
       await Promise.all(
         interrupted.map((id) =>
           this.failAgentExecution(id, "agent_interrupted", { alreadyInterrupted: true }),

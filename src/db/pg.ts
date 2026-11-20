@@ -1610,6 +1610,7 @@ class PgDatabase implements Database {
     const result = await query<{
       stoppedByName: string | null;
       cleanupState: import("../triggers/run-stop.js").StopCleanupState;
+      coalesced: boolean;
       retryAttemptId: string | null;
       otherAttachedRunCount: number;
     }>(
@@ -1640,11 +1641,12 @@ class PgDatabase implements Database {
                        and coalesce(stop_state->>'outcome', 'delivery_unconfirmed') = 'delivery_unconfirmed')
             then 'delivery_unconfirmed'
           when exists (select 1 from owned where ${RUN_STOP_RETRYABLE}) then 'target_gone'
-          when exists (select 1 from owned where stopped and stop_state->>'outcome' = 'confirmed')
+          when exists (select 1 from owned where stopped and stop_state->>'outcome' in ('confirmed', 'coalesced'))
             or exists (select 1 from workflow_step_runs step where step.trigger_run_id = run.id
                        and step.status = 'canceled' and step.output ? 'exit_code')
             then 'confirmed'
           else 'not_needed' end as "cleanupState",
+        exists (select 1 from owned where stopped and stop_state->>'outcome' = 'coalesced') as "coalesced",
         case when run.status = 'canceled' and run.payload_expiry_state is null and not (${RUN_STOP_PENDING})
           then (select attempt_id from retry) end as "retryAttemptId",
         (select count(distinct run_id)::int from peers) as "otherAttachedRunCount"

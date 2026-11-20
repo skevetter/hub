@@ -15,6 +15,7 @@ import {
 import {
   STOP_INTERRUPT_LEASE_MS,
   STOP_INTERRUPT_MAX_AGE_MS,
+  stopInterruptMayHaveSent,
   type StopInterruptState,
   type StopInterruptStore,
 } from "./stop-interrupt.js";
@@ -918,6 +919,7 @@ class MemoryDatabase implements Database {
   private readonly stopInterruptStates = new Map<string, StopInterruptState>();
   private readonly stopInterruptClaims = new Map<string, { token: string; until: number }>();
   private readonly stopInterruptCheckedAt = new Map<string, number>();
+  private readonly stopInterruptWrites = new Map<string, { agentId: string; startedAt: number }>();
 
   readonly stopInterrupts: StopInterruptStore = {
     claim: async (id, token, generation) => {
@@ -939,7 +941,29 @@ class MemoryDatabase implements Database {
         expired: this.stopInterruptExpired(execution, now),
       };
     },
-    start: async (id, token) => {
+    coverage: async (id, agentId) => {
+      const current = this.agentExecutions.get(id);
+      const requestedAt = this.stopInterruptStates.get(id)?.requestedAt;
+      if (current === undefined || requestedAt === undefined) return undefined;
+      const acceptedAt = Date.parse(requestedAt);
+      let uncertain = false;
+      for (const prior of this.agentExecutions.values()) {
+        if (prior.id === id || prior.daemonId !== current.daemonId) continue;
+        const write = this.stopInterruptWrites.get(prior.id);
+        if (write?.agentId === agentId && write.startedAt >= acceptedAt) return "coalesced";
+        const attempt = this.stopInterruptStates.get(prior.id);
+        if (
+          (attempt?.startedAgentId ?? prior.daemonAgentId) === agentId &&
+          attempt?.startedAt !== undefined &&
+          Date.parse(attempt.startedAt) >= acceptedAt
+        ) {
+          if (attempt.acknowledgedPeerIds !== undefined) return "coalesced";
+          uncertain = true;
+        }
+      }
+      return uncertain ? "delivery_unconfirmed" : undefined;
+    },
+    start: async (id, token, agentId) => {
       const claim = this.stopInterruptClaims.get(id);
       const execution = this.agentExecutions.get(id);
       const state = this.stopInterruptStates.get(id);
@@ -955,18 +979,25 @@ class MemoryDatabase implements Database {
       )
         return false;
       state.startedAt = new Date(now).toISOString();
+      if (agentId !== undefined) state.startedAgentId = agentId;
       claim.until = now + STOP_INTERRUPT_LEASE_MS;
       return true;
     },
+    recordWrite: async (id, token) => {
+      if (this.stopInterruptClaims.get(id)?.token === token) this.rememberStopWrite(id);
+    },
     resetUnsent: async (id, token) => {
       const state = this.stopInterruptStates.get(id);
-      if (this.stopInterruptClaims.get(id)?.token === token && state !== undefined)
+      if (this.stopInterruptClaims.get(id)?.token === token && state !== undefined) {
         delete state.startedAt;
+        delete state.startedAgentId;
+      }
     },
     acknowledge: async (id, token, peers) => {
       const state = this.stopInterruptStates.get(id);
       if (this.stopInterruptClaims.get(id)?.token !== token || state === undefined) return false;
       state.acknowledgedPeerIds = peers;
+      this.rememberStopWrite(id);
       return true;
     },
     complete: async (id, token, outcome) => {
@@ -994,15 +1025,24 @@ class MemoryDatabase implements Database {
           !isCanceledExecution(execution)
         )
           continue;
+        const state = this.stopInterruptStates.get(execution.id);
+        if (state?.acknowledgedPeerIds !== undefined) continue;
         this.stopInterruptStates.set(execution.id, {
-          ...(this.stopInterruptStates.get(execution.id) ?? { approvedPeerIds: [] }),
-          outcome: "target_gone",
+          ...(state ?? { approvedPeerIds: [] }),
+          outcome: stopInterruptMayHaveSent(state) ? "delivery_unconfirmed" : "target_gone",
         });
         this.stopInterruptClaims.delete(execution.id);
         await this.completeHubAction(execution.id, "interrupt");
       }
     },
   };
+
+  private rememberStopWrite(id: string): void {
+    const state = this.stopInterruptStates.get(id);
+    const agentId = state?.startedAgentId ?? this.agentExecutions.get(id)?.daemonAgentId;
+    if (agentId == null || state?.startedAt === undefined) return;
+    this.stopInterruptWrites.set(id, { agentId, startedAt: Date.parse(state.startedAt) });
+  }
 
   private stopInterruptExpired(execution: AgentExecutionRecord, now: number) {
     const requestedAt = this.stopInterruptStates.get(execution.id)?.requestedAt;
@@ -2585,6 +2625,7 @@ class MemoryDatabase implements Database {
       else if (outcomes.has("target_gone")) cleanupState = "target_gone";
       else if (
         outcomes.has("confirmed") ||
+        outcomes.has("coalesced") ||
         steps.some(
           (step) =>
             step.status === "canceled" &&
@@ -2598,6 +2639,7 @@ class MemoryDatabase implements Database {
     return {
       stoppedByName: null,
       cleanupState,
+      coalesced: outcomes.has("coalesced"),
       retryAttemptId: pending || run.payloadExpiredAt != null ? null : retryAttemptId,
       otherAttachedRunCount: this.countStopPeerRuns(this.stopPeers(owned, targets)),
     };
@@ -2637,8 +2679,9 @@ class MemoryDatabase implements Database {
     )
       return false;
     const state = this.stopInterruptStates.get(execution.id);
+    const outcome = state?.outcome ?? "delivery_unconfirmed";
     return (
-      (state?.outcome ?? "delivery_unconfirmed") !== "confirmed" &&
+      (outcome === "delivery_unconfirmed" || outcome === "target_gone") &&
       (attemptId === undefined || (state?.attemptId ?? execution.id) === attemptId)
     );
   }

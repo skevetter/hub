@@ -101,18 +101,33 @@ describe("Stop interrupt delivery over the daemon wire", () => {
   }, 120_000);
   afterAll(async () => pg?.close(), 120_000);
 
-  async function seed() {
+  async function seed({
+    stop = true,
+    sessionId = null,
+  }: {
+    stop?: boolean;
+    sessionId?: string | null;
+  } = {}) {
     const run = await pg.createRun();
     const [step] = await pg.database.listWorkflowStepRunsForTriggerRun(run.id);
     assert.ok(step);
     const id = randomUUID();
     await pg.runtime.query(
       `insert into agent_executions
-        (id, organization_id, project_id, configuration_revision_id, workflow_step_run_id, daemon_id, daemon_agent_id, status)
-        values ($1,$2,$3,$4,$5,$6,'agent','running')`,
-      [id, run.organizationId, run.projectId, run.configurationRevisionId, step.id, TEST_DAEMON_ID],
+        (id, organization_id, project_id, configuration_revision_id, workflow_step_run_id, daemon_id, daemon_agent_id, status, agent_session_id)
+        values ($1,$2,$3,$4,$5,$6,'agent','running',$7)`,
+      [
+        id,
+        run.organizationId,
+        run.projectId,
+        run.configurationRevisionId,
+        step.id,
+        TEST_DAEMON_ID,
+        sessionId,
+      ],
     );
-    await pg.database.cancelTriggerRun(run.organizationId, run.id);
+    const cancel = () => pg.database.cancelTriggerRun(run.organizationId, run.id);
+    if (stop) await cancel();
     await pg.runtime.query(
       "update trigger_runs set terminal_notification_delivered_at = now() where id=$1",
       [run.id],
@@ -122,7 +137,7 @@ describe("Stop interrupt delivery over the daemon wire", () => {
       (
         await scanRunPayloads(pg.runtime, null, new Date(Date.now() + 90 * 86_400_000), 100, false)
       ).find((candidate) => candidate.id === run.id)?.disposition;
-    return { run, id, details, eligibility };
+    return { run, id, details, eligibility, cancel };
   }
 
   it("never resends to a newer daemon-side turn after a lost acknowledgement", async () => {
@@ -346,10 +361,129 @@ describe("Stop interrupt delivery over the daemon wire", () => {
     }
   });
 
-  it("settles canceled work on daemon revocation and releases retention", async () => {
-    const { details, eligibility } = await seed();
-    await pg.database.revokeDaemon(TEST_DAEMON_ID);
-    assert.equal((await details())?.cleanupState, "target_gone");
-    assert.equal(await eligibility(), "eligible");
+  for (const scenario of ["overlap", "after-write", "lost-ack"] as const) {
+    it(`handles two Stops on a shared agent (${scenario})`, async () => {
+      const first = await seed({ stop: false });
+      const sessionId = randomUUID();
+      await pg.runtime.query(
+        `insert into agent_sessions (id, organization_id, project_id, data) values ($1,$2,$3,$4)`,
+        [
+          sessionId,
+          first.run.organizationId,
+          first.run.projectId,
+          {
+            id: sessionId,
+            organizationId: first.run.organizationId,
+            projectId: first.run.projectId,
+            continuationKey: null,
+            agentId: "agent",
+            workspaceId: "workspace",
+            daemonId: TEST_DAEMON_ID,
+          },
+        ],
+      );
+      await pg.runtime.query("update agent_executions set agent_session_id=$2 where id=$1", [
+        first.id,
+        sessionId,
+      ]);
+      const second = await seed({ stop: false, sessionId });
+      const original = daemonWire();
+      const newer = daemonWire();
+      newer.daemon.turn = "later-native-work";
+      original.daemon.acknowledgement = "hold";
+      let connection = original.connection;
+      const lifecycle = worker(pg.database, () => connection);
+      try {
+        await first.cancel();
+        if (scenario !== "after-write") await second.cancel();
+        const sending = lifecycle.recoverWorkflowTerminalExecutions([first.id]);
+        await original.first;
+        if (scenario === "after-write") await second.cancel();
+        connection = newer.connection;
+        const queued = lifecycle.recoverWorkflowTerminalExecutions([second.id]);
+        if (scenario === "lost-ack") original.adapter.close();
+        else original.daemon.reply();
+        await Promise.all([sending, queued]);
+        assert.deepEqual(original.frames, ["original"]);
+        assert.deepEqual(newer.frames, scenario === "after-write" ? ["later-native-work"] : []);
+        assert.equal(
+          (await first.details())?.cleanupState,
+          scenario === "lost-ack" ? "delivery_unconfirmed" : "confirmed",
+        );
+        assert.equal((await second.details())?.cleanupState, "confirmed");
+        assert.equal((await second.details())?.coalesced, scenario !== "after-write");
+      } finally {
+        original.adapter.close();
+        newer.adapter.close();
+        await lifecycle.stop();
+        await pg.database.completeHubAction(first.id, "interrupt");
+        await pg.database.completeHubAction(second.id, "interrupt");
+      }
+    });
+  }
+
+  it("reconciles durably acknowledged peers after the 24 hour cutoff", async () => {
+    const stopped = await seed();
+    const peer = await seed({ stop: false });
+    const wire = daemonWire();
+    const lifecycle = worker(pg.database, () => wire.connection);
+    const store = pg.database.stopInterrupts;
+    try {
+      assert.ok(await store.claim(stopped.id, "previous", null));
+      assert.equal(await store.start(stopped.id, "previous"), true);
+      assert.equal(await store.acknowledge(stopped.id, "previous", [peer.id]), true);
+      await pg.runtime.query(
+        `update agent_executions set hub_action_acknowledgements = jsonb_set(
+           hub_action_acknowledgements, '{stop_interrupt,requestedAt}', to_jsonb(clock_timestamp() - interval '25 hours'))
+         where id=$1`,
+        [stopped.id],
+      );
+      await store.release(stopped.id, "previous");
+      await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
+      assert.deepEqual(wire.frames, []);
+      assert.equal((await stopped.details())?.cleanupState, "confirmed");
+      assert.equal((await stopped.details())?.retryAttemptId, null);
+      const peerRun = await pg.database.findTriggerRunById(peer.run.id);
+      assert.equal(peerRun?.status, "failed");
+      assert.equal(peerRun?.outcome === "accepted" && peerRun.failureReason, "agent_interrupted");
+    } finally {
+      await lifecycle.stop();
+      await pg.database.completeHubAction(stopped.id, "interrupt");
+    }
+  });
+
+  it("settles revocation as unconfirmed after the send marker and as gone before it", async () => {
+    const { id, details } = await seed();
+    const unsent = await seed();
+    const committed = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const contender = await pg.connect(
+      {
+        afterQuery: async (sql) => {
+          if (!sql.includes("'startedAt', clock_timestamp()")) return;
+          committed.resolve();
+          await resume.promise;
+        },
+      },
+      4,
+    );
+    const wire = daemonWire();
+    const lifecycle = worker(contender.database, () => wire.connection);
+    try {
+      const recovery = lifecycle.recoverWorkflowTerminalExecutions([id]);
+      await committed.promise;
+      assert.deepEqual(wire.frames, []);
+      await pg.database.revokeDaemon(TEST_DAEMON_ID);
+      assert.equal((await details())?.cleanupState, "delivery_unconfirmed");
+      assert.equal((await unsent.details())?.cleanupState, "target_gone");
+      assert.equal(await unsent.eligibility(), "eligible");
+      resume.resolve();
+      await recovery;
+      assert.equal((await details())?.cleanupState, "delivery_unconfirmed");
+    } finally {
+      resume.resolve();
+      wire.adapter.close();
+      await lifecycle.stop();
+    }
   });
 });

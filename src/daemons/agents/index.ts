@@ -26,7 +26,12 @@ export interface AgentConnection {
   get(agentId: string): Promise<AgentSnapshot>;
   send(agentId: string, messageId: string, text: string, timeoutMs?: number): Promise<void>;
   restore(workspaceId: string, timeoutMs?: number): Promise<boolean>;
-  control(agentId: string, workspaceId: string, action: "interrupt" | "archive"): Promise<void>;
+  control(
+    agentId: string,
+    workspaceId: string,
+    action: "interrupt" | "archive",
+    onWritten?: () => void,
+  ): Promise<void>;
   watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void>;
 }
 
@@ -198,11 +203,14 @@ export class DaemonAgents implements AgentConnection {
     agentId: string,
     workspaceId: string,
     action: "interrupt" | "archive",
+    onWritten?: () => void,
   ): Promise<void> {
     await this.request(
       action === "archive"
         ? { type: "archive_workspace_request", workspaceId }
         : { type: "cancel_agent_request", agentId },
+      undefined,
+      onWritten,
     );
   }
   async watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void> {
@@ -261,6 +269,7 @@ export class DaemonAgents implements AgentConnection {
   private async request(
     message: Record<string, unknown>,
     timeoutMs = 30_000,
+    onWritten?: () => void,
   ): Promise<Record<string, unknown>> {
     this.assertOpen();
     if (!this.supported) throw new DaemonAgentError("Update the Paseo daemon to run Hub agents");
@@ -271,6 +280,7 @@ export class DaemonAgents implements AgentConnection {
         this.pending.set(requestId, { resolve, reject });
         timeout = setTimeout(() => reject(new DaemonResponseLostError()), timeoutMs);
         this.sendFrame(JSON.stringify({ type: "session", message: { ...message, requestId } }));
+        onWritten?.();
       });
       const parsed = ResultSchema.parse(result);
       if (parsed.error || parsed.accepted === false)

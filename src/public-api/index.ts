@@ -8,7 +8,7 @@ import { githubBodyDigest, parseGitHubSignature } from "../auth/webhook-signatur
 import { SigningRequestError, type WebhookSigner } from "../auth/webhook-secret-store.js";
 import type { OperationAuthenticator } from "../auth/operation-auth.js";
 import { isDatabaseUnavailableError } from "../db/errors.js";
-import { stopCleanupNotes, type StopRunResult } from "../triggers/run-stop.js";
+import { stopCleanupNotes, stopCoalescedNote, type StopRunResult } from "../triggers/run-stop.js";
 import { reportFailure } from "../failures/index.js";
 import { readBoundedRequestBody } from "../http/request-body.js";
 import { hasPostgresText, isPostgresJson } from "../http/json-storage.js";
@@ -1077,15 +1077,17 @@ async function readJson(
 
 function stopRunResponse(requestId: string, result: PublicOperationResult): Response {
   switch (result.status) {
-    case "stopped":
+    case "stopped": {
+      let note =
+        result.cleanupState === "waiting_for_daemon" ? stopCleanupNotes.waiting_for_daemon : null;
+      if (result.coalesced) note = stopCoalescedNote;
       return success(requestId, 200, StoppedRunSchema, {
         runId: result.runId,
         status: result.runStatus,
         cleanupState: result.cleanupState,
-        ...(result.cleanupState === "waiting_for_daemon"
-          ? { note: stopCleanupNotes.waiting_for_daemon }
-          : {}),
+        ...(note === null ? {} : { note }),
       });
+    }
     case "forbidden":
       return problem(
         requestId,

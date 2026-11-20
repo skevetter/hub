@@ -1,3 +1,4 @@
+import type { StopInterruptCoverage } from "../db/stop-interrupt.js";
 import { createHash } from "node:crypto";
 import { DaemonAgentMissingError, DaemonFrameNotSentError } from "../daemons/agents/index.js";
 import { temporaryCredentialFact } from "./credentials.js";
@@ -230,10 +231,10 @@ export class AgentSessions {
 
   async interruptStoppedExecution(
     execution: AgentExecutionRecord,
-    connection: AgentConnection,
+    connection: AgentConnection | undefined,
     token: string,
     approvedPeerIds: readonly string[],
-  ): Promise<"target_gone" | "delivery_unconfirmed" | string[] | undefined> {
+  ): Promise<"target_gone" | StopInterruptCoverage | string[] | undefined> {
     const id = execution.agentSessionId;
     const session = id === null ? undefined : await this.database.findAgentSession(id);
     const lock =
@@ -250,32 +251,51 @@ export class AgentSessions {
         return undefined;
       const refreshed = id === null ? undefined : await this.database.findAgentSession(id);
       const agentId = current.daemonAgentId ?? refreshed?.agentId;
-      if (agentId == null) return "target_gone";
+      if (agentId == null) return connection === undefined ? undefined : "target_gone";
+      const store = this.database.stopInterrupts;
+      const covered = await store.coverage(execution.id, agentId);
+      if (covered !== undefined) return covered;
+      if (connection === undefined) return undefined;
+
       const arrivals = id === null ? [] : await this.database.listAgentSessionExecutions(id);
       const peerIds = arrivals.filter(isActive).map((arrival) => arrival.id);
       if (peerIds.some((peer) => !approvedPeerIds.includes(peer))) return "delivery_unconfirmed";
 
-      let agent;
-      try {
-        agent = await connection.get(agentId);
-      } catch (error) {
-        if (error instanceof DaemonAgentMissingError) return "target_gone";
-        throw error;
-      }
-      if (agent.id !== agentId) return "target_gone";
-      const store = this.database.stopInterrupts;
-      if (!(await store.start(execution.id, token))) return undefined;
-      try {
-        await connection.control(agentId, agent.workspaceId, "interrupt");
-      } catch (error) {
-        if (error instanceof DaemonFrameNotSentError) {
-          await store.resetUnsent(execution.id, token);
-          return undefined;
-        }
-        return "delivery_unconfirmed";
-      }
-      return (await store.acknowledge(execution.id, token, peerIds)) ? peerIds : undefined;
+      return this.sendStopInterruptFrame(execution.id, agentId, connection, token, peerIds);
     });
+  }
+
+  private async sendStopInterruptFrame(
+    executionId: string,
+    agentId: string,
+    connection: AgentConnection,
+    token: string,
+    peerIds: string[],
+  ): Promise<"target_gone" | "delivery_unconfirmed" | string[] | undefined> {
+    const store = this.database.stopInterrupts;
+    let agent;
+    try {
+      agent = await connection.get(agentId);
+    } catch (error) {
+      if (error instanceof DaemonAgentMissingError) return "target_gone";
+      throw error;
+    }
+    if (agent.id !== agentId) return "target_gone";
+    if (!(await store.start(executionId, token, agentId))) return undefined;
+    let written = false;
+    try {
+      await connection.control(agentId, agent.workspaceId, "interrupt", () => {
+        written = true;
+      });
+    } catch (error) {
+      if (error instanceof DaemonFrameNotSentError) {
+        await store.resetUnsent(executionId, token);
+        return undefined;
+      }
+      if (written) await store.recordWrite(executionId, token);
+      return "delivery_unconfirmed";
+    }
+    return (await store.acknowledge(executionId, token, peerIds)) ? peerIds : undefined;
   }
 
   async releaseAuthority(

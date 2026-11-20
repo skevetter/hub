@@ -17,7 +17,12 @@ import { useSnapshotQuery } from "../queries/index.js";
 import { runDetailSnapshot, stopRun } from "./functions.js";
 import type { RunConnection, RunDetailSnapshot, RunEventPage } from "./run-events.js";
 import { RunSteps } from "./run-steps.js";
-import { stopCleanupNotes, type BrowserStopResult, type StopConfirmation } from "./run-stop.js";
+import {
+  stopCleanupNotes,
+  stopCoalescedNote,
+  type BrowserStopResult,
+  type StopConfirmation,
+} from "./run-stop.js";
 import { activityCounts, timelineRows, type TimelineRow } from "./run-timeline-view.js";
 import { pollRunDetail } from "./run-event-subscription.js";
 import { runDetailKey, useRunEvents } from "./use-run-events.js";
@@ -358,7 +363,7 @@ function stopDescription(
   const peers =
     peerCount === 0
       ? undefined
-      : `${peerCount} other ${peerCount === 1 ? "run has" : "runs have"} work attached to this agent. If the daemon confirms the interrupt, those runs can fail.`;
+      : `${peerCount} other ${peerCount === 1 ? "run has" : "runs have"} work attached to this agent. If the daemon confirms the interrupt, those runs can fail. Overlapping Stops may share one interrupt.`;
   return [
     message,
     previous,
@@ -371,13 +376,15 @@ function stopDescription(
 }
 
 function CanceledRunNotice({ details }: { details: RunDetailSnapshot["stopDetails"] }) {
+  let note = details === undefined ? null : stopCleanupNotes[details.cleanupState];
+  if (details?.cleanupState === "confirmed" && details.coalesced) note = stopCoalescedNote;
   return (
     <NoticeAlert
       standalone
       tone="neutral"
       title={`Stopped by ${details?.stoppedByName || "a person"}`}
     >
-      {details === undefined ? null : stopCleanupNotes[details.cleanupState]}
+      {note}
     </NoticeAlert>
   );
 }

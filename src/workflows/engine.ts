@@ -250,6 +250,9 @@ export class DurableWorkflowEngine {
       runId,
       runStatus,
       cleanupState: details?.cleanupState ?? "not_needed",
+      ...(details?.cleanupState === "confirmed" && details.coalesced
+        ? { coalesced: true as const }
+        : {}),
     };
   }
 
