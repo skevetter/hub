@@ -1,6 +1,8 @@
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Locks } from "./runtime/locks/index.js";
 import type { DatabaseRuntime, DrizzleHandle, TransactionHandle } from "./runtime/index.js";
+import { parseCompiledHubConfig } from "../config/compiler.js";
+import { linearRoutesForConnection, linearTriggerRoutesLock } from "./linear-trigger-routes.js";
 import { slugify } from "../slug.js";
 import {
   ConnectionAccessDeniedError,
@@ -376,6 +378,10 @@ export class ConnectionRepository {
         );
       }
       await lockExternal(this.locks, runtimeTransaction, "linear", input.linearOrganizationId);
+      await this.locks.withTxLock(
+        runtimeTransaction,
+        linearTriggerRoutesLock(attempt.organizationId),
+      );
       const [existing] = await transaction
         .select({
           id: schema.linearConnections.id,
@@ -387,41 +393,45 @@ export class ConnectionRepository {
       if (existing !== undefined && existing.organizationId !== attempt.organizationId) {
         throw new ConnectionConflictError();
       }
-      if (existing === undefined) {
-        await transaction.insert(schema.linearConnections).values({
-          organizationId: attempt.organizationId,
-          providerApplicationId: input.providerApplicationId,
-          linearOrganizationId: input.linearOrganizationId,
-          linearOrganizationName: input.linearOrganizationName,
-          slug: await uniqueConnectionSlug(
-            transaction,
-            attempt.organizationId,
-            "linear",
-            input.linearOrganizationName,
-          ),
-          appUserId: input.appUserId,
-          accessToken: input.accessToken,
-          refreshToken: input.refreshToken ?? null,
-          accessTokenExpiresAt: input.accessTokenExpiresAt ?? null,
-          scopes: input.scopes,
-          connectedByUserId: attempt.userId,
-        });
-      } else {
-        await transaction
-          .update(schema.linearConnections)
-          .set({
-            providerApplicationId: input.providerApplicationId,
-            linearOrganizationName: input.linearOrganizationName,
-            appUserId: input.appUserId,
-            accessToken: input.accessToken,
-            refreshToken: input.refreshToken ?? null,
-            accessTokenExpiresAt: input.accessTokenExpiresAt ?? null,
-            scopes: input.scopes,
-            connectedByUserId: attempt.userId,
-            updatedAt: sql`clock_timestamp()`,
-          })
-          .where(eq(schema.linearConnections.id, existing.id));
-      }
+      const [connection] =
+        existing === undefined
+          ? await transaction
+              .insert(schema.linearConnections)
+              .values({
+                organizationId: attempt.organizationId,
+                providerApplicationId: input.providerApplicationId,
+                linearOrganizationId: input.linearOrganizationId,
+                linearOrganizationName: input.linearOrganizationName,
+                slug: await uniqueConnectionSlug(
+                  transaction,
+                  attempt.organizationId,
+                  "linear",
+                  input.linearOrganizationName,
+                ),
+                appUserId: input.appUserId,
+                accessToken: input.accessToken,
+                refreshToken: input.refreshToken ?? null,
+                accessTokenExpiresAt: input.accessTokenExpiresAt ?? null,
+                scopes: input.scopes,
+                connectedByUserId: attempt.userId,
+              })
+              .returning({ id: schema.linearConnections.id })
+          : await transaction
+              .update(schema.linearConnections)
+              .set({
+                providerApplicationId: input.providerApplicationId,
+                linearOrganizationName: input.linearOrganizationName,
+                appUserId: input.appUserId,
+                accessToken: input.accessToken,
+                refreshToken: input.refreshToken ?? null,
+                accessTokenExpiresAt: input.accessTokenExpiresAt ?? null,
+                scopes: input.scopes,
+                connectedByUserId: attempt.userId,
+                updatedAt: sql`clock_timestamp()`,
+              })
+              .where(eq(schema.linearConnections.id, existing.id))
+              .returning({ id: schema.linearConnections.id });
+      if (connection === undefined) throw new Error("Linear connection unavailable");
       if (providerConfiguration !== undefined) {
         const [stored] = await transaction
           .select({ version: schema.runtimeProviderConfiguration.version })
@@ -463,6 +473,7 @@ export class ConnectionRepository {
           attempt.configurationVersion,
         );
       }
+      await addLinearTriggerRoutes(runtimeTransaction, attempt.organizationId, connection.id);
       await consumeLockedAttempt(transaction, attempt.id);
     });
   }
@@ -623,6 +634,10 @@ export class ConnectionRepository {
         } as const;
       }
       if (provider === "linear") {
+        await this.locks.withTxLock(
+          runtimeTransaction,
+          linearTriggerRoutesLock(access.organizationId),
+        );
         const [connection] = await transaction
           .select({
             linearOrganizationId: schema.linearConnections.linearOrganizationId,
@@ -639,7 +654,22 @@ export class ConnectionRepository {
         if (connection === undefined) throw new ConnectionAccessDeniedError();
         await transaction
           .delete(schema.projectTriggerRoutes)
-          .where(eq(schema.projectTriggerRoutes.connectionId, connectionId));
+          .where(
+            and(
+              eq(schema.projectTriggerRoutes.organizationId, access.organizationId),
+              eq(schema.projectTriggerRoutes.provider, "linear"),
+              eq(schema.projectTriggerRoutes.connectionId, connectionId),
+            ),
+          );
+        await transaction
+          .delete(schema.organizationTriggerRoutes)
+          .where(
+            and(
+              eq(schema.organizationTriggerRoutes.organizationId, access.organizationId),
+              eq(schema.organizationTriggerRoutes.provider, "linear"),
+              eq(schema.organizationTriggerRoutes.connectionId, connectionId),
+            ),
+          );
         await transaction
           .delete(schema.linearConnections)
           .where(eq(schema.linearConnections.id, connectionId));
@@ -759,6 +789,77 @@ export class ConnectionRepository {
     await this.database
       .delete(schema.discordConnections)
       .where(eq(schema.discordConnections.guildId, guildId));
+  }
+}
+
+async function addLinearTriggerRoutes(
+  transaction: TransactionHandle,
+  organizationId: string,
+  connectionId: string,
+): Promise<void> {
+  const { rows: triggers } = await transaction.query<{
+    trigger_id: string;
+    trigger_revision_id: string;
+    project_id: string;
+    project_revision_id: string;
+    normalized_configuration: unknown;
+  }>(
+    `select t.id as trigger_id, r.id as trigger_revision_id, p.id as project_id,
+            p.active_configuration_revision_id as project_revision_id, r.normalized_configuration
+     from organization_triggers t
+     join organization_trigger_revisions r
+       on r.id = t.active_revision_id and r.trigger_id = t.id and r.organization_id = t.organization_id
+     join projects p
+       on p.id = t.runtime_project_id and p.organization_id = t.organization_id
+     where t.organization_id = $1 and t.enabled and p.status = 'active'
+       and p.active_configuration_revision_id is not null
+       and jsonb_path_exists(r.normalized_configuration, '$.triggers[*].on ? (@ starts with "linear.")')`,
+    [organizationId],
+  );
+  // Wildcard resource IDs are NULL, so the route indexes alone allow duplicates.
+  // The organization lock serializes this check with other connection writes and trigger saves.
+  for (const trigger of triggers) {
+    const configuration = parseCompiledHubConfig(trigger.normalized_configuration);
+    for (const route of linearRoutesForConnection(configuration, connectionId)) {
+      await transaction.query(
+        `insert into organization_trigger_routes
+           (organization_id, trigger_id, trigger_revision_id, provider, connection_id, resource_id, configured_event_name)
+         select $1, $2, $3, 'linear', $4, $5, $6
+         where not exists (
+           select 1 from organization_trigger_routes
+           where organization_id = $1 and trigger_id = $2 and trigger_revision_id = $3
+             and provider = 'linear' and connection_id = $4
+             and resource_id is not distinct from $5 and configured_event_name = $6
+         )`,
+        [
+          organizationId,
+          trigger.trigger_id,
+          trigger.trigger_revision_id,
+          connectionId,
+          route.resourceId,
+          route.configuredEventName,
+        ],
+      );
+      await transaction.query(
+        `insert into project_trigger_routes
+           (organization_id, project_id, configuration_revision_id, provider, connection_id, resource_id, trigger_name)
+         select $1, $2, $3, 'linear', $4, $5, $6
+         where not exists (
+           select 1 from project_trigger_routes
+           where organization_id = $1 and project_id = $2 and configuration_revision_id = $3
+             and provider = 'linear' and connection_id = $4
+             and resource_id is not distinct from $5 and trigger_name = $6
+         )`,
+        [
+          organizationId,
+          trigger.project_id,
+          trigger.project_revision_id,
+          connectionId,
+          route.resourceId,
+          route.triggerName,
+        ],
+      );
+    }
   }
 }
 
