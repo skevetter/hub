@@ -102,8 +102,9 @@ function promptForEvent(event: NormalizedLinearEvent): string {
 
 export function linearInvocationUsesAppUser(event: NormalizedLinearEvent): boolean {
   return (
-    event.type === "comment" ||
-    (event.issue.delegateId != null && Object.hasOwn(event.updatedFrom, "delegateId"))
+    event.type === "issue" &&
+    event.issue.delegateId != null &&
+    Object.hasOwn(event.updatedFrom, "delegateId")
   );
 }
 

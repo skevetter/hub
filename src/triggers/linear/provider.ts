@@ -90,7 +90,7 @@ export function createLinearTriggerProvider(options: {
     event: NormalizedLinearEvent,
     trigger: Pick<ExternalTrigger, "connectionId" | "organizationId">,
   ): Promise<string | undefined> => {
-    if (!linearInvocationUsesAppUser(event)) return undefined;
+    if (event.type !== "comment" && !linearInvocationUsesAppUser(event)) return undefined;
     const connection = await options.connectionForLinearOrganization?.(event.organizationId);
     return connection?.id === trigger.connectionId &&
       connection?.organizationId === trigger.organizationId
