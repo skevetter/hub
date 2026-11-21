@@ -101,15 +101,16 @@ describe("trigger acceptance persistence", () => {
     if (receipt.status !== "accepted") throw new Error("expected accepted receipt");
 
     assert.deepEqual(
-      await database.listUnroutedProviderEventsForOrganization("drop-reason-org"),
+      (await database.listDroppedEventPage("drop-reason-org", { limit: 15 })).records,
       [],
     );
     await database.markProviderEventDropped(
       receipt.event.providerEventReceiptId,
       "trigger_filters_rejected",
     );
-    const [unrouted] = await database.listUnroutedProviderEventsForOrganization("drop-reason-org");
-    assert.equal(unrouted?.droppedReason, "trigger_filters_rejected");
+    const [unrouted] = (await database.listDroppedEventPage("drop-reason-org", { limit: 15 }))
+      .records;
+    assert.equal(unrouted?.reason, "trigger_filters_rejected");
     assert.equal("payload" in (unrouted ?? {}), false);
     await database.close();
   }, 120_000);

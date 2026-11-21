@@ -5,6 +5,7 @@ import { dashboardWithRuns } from "../test-utils/activity-dashboard.js";
 import {
   activityCursorScope,
   decodeActivityCursor,
+  droppedActivityCursorScope,
   encodeActivityCursor,
 } from "./activity-cursor.js";
 import { activitySearchSchema } from "./activity-query.js";
@@ -46,6 +47,77 @@ describe("activity search", () => {
         size: 15,
       },
     );
+  });
+});
+
+describe("dropped activity pages", () => {
+  it("binds cursors to organization, view, size and all filters", () => {
+    const key = { createdAt: "2026-01-01T00:00:00.456789Z", id: crypto.randomUUID() };
+    const filters = {
+      provider: "linear",
+      source: "linear.comment",
+      reason: "no_project_route",
+      range: "7d",
+    } as const;
+    const droppedScope = droppedActivityCursorScope("org-1", 15, filters);
+    const cursor = encodeActivityCursor("before", key, droppedScope, 15);
+    assert.deepEqual(decodeActivityCursor(cursor, droppedScope), {
+      direction: "before",
+      key,
+      offset: 15,
+    });
+    for (const wrong of [
+      droppedActivityCursorScope("org-2", 15, filters),
+      droppedActivityCursorScope("org-1", 25, filters),
+      droppedActivityCursorScope("org-1", 15, { ...filters, provider: "github" }),
+      droppedActivityCursorScope("org-1", 15, { ...filters, source: "linear.issue" }),
+      droppedActivityCursorScope("org-1", 15, { ...filters, reason: "routing" }),
+      droppedActivityCursorScope("org-1", 15, { ...filters, range: "30d" }),
+      activityCursorScope("org-1", 15, filters),
+    ]) {
+      assert.equal(decodeActivityCursor(cursor, wrong), undefined);
+    }
+    const forged = Buffer.from(
+      JSON.stringify(["before", key.createdAt, key.id, droppedScope, 1_000_001]),
+    ).toString("base64url");
+    assert.deepEqual(decodeActivityCursor(forged, droppedScope), { direction: "before", key });
+  });
+
+  it("enforces organization membership and falls back when a cursor is stale", async () => {
+    const { database, dashboard, request, trigger } = await dashboardWithRuns(0);
+    for (let index = 0; index < 20; index += 1) {
+      const result = await database.persistManualEvent({
+        organizationId: "org-1",
+        projectId: trigger.runtimeProjectId,
+        deliveryId: `dropped-${index}`,
+        source: "manual.run",
+        payload: {},
+        receivedAt: new Date(),
+      });
+      assert.equal(result.status, "accepted");
+      await database.markProviderEventDropped(
+        result.event.providerEventReceiptId,
+        "trigger_filters_rejected",
+      );
+    }
+    const newest = await dashboard.droppedActivityPage(request, "acme", { provider: "manual" });
+    assert.equal(newest.events.length, 15);
+    assert.ok(newest.nextCursor);
+    const older = await dashboard.droppedActivityPage(request, "acme", {
+      provider: "manual",
+      cursor: newest.nextCursor,
+    });
+    assert.equal(older.events.length, 5);
+    assert.equal(older.startOffset, 15);
+    const filtered = await dashboard.droppedActivityPage(request, "acme", {
+      reason: "trigger_filters_rejected",
+      cursor: newest.nextCursor,
+    });
+    assert.deepEqual(filtered.events, newest.events);
+    assert.equal(filtered.previousCursor, null);
+    await assert.rejects(dashboard.droppedActivityPage(request, "inaccessible", {}), {
+      name: "TenantRouteNotFoundError",
+    });
   });
 });
 

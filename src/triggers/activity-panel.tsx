@@ -12,6 +12,8 @@ import {
 } from "../components/app/list-filters.js";
 import { DEFAULT_PAGE_SIZE, type PageSize } from "../components/app/page-size.js";
 import { LIST_RESULT_ACTION } from "../components/app/list-result-announcement.js";
+import { SegmentedControl } from "../components/app/segmented-control.js";
+import { DroppedActivityPanel } from "./dropped-activity-panel.js";
 import { PageHeader } from "../components/app/page.js";
 import { statusLabel } from "../components/app/status-pill.js";
 import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
@@ -34,6 +36,10 @@ const route = getRouteApi("/_shell/o/$organizationSlug/activity/");
 const HEADING_ID = "activity-title";
 const FILTERS_ID = "activity-filters";
 const LIVE_REFRESH_MS = 5_000;
+const ACTIVITY_VIEWS = [
+  { value: "runs", label: "Runs" },
+  { value: "dropped", label: "Dropped" },
+] as const;
 const ACTIVITY_DESCRIPTION = "Agent runs launched by organization triggers.";
 const NO_FILTERED_RUNS = "No runs match these filters";
 const STATUS_OPTIONS = ACTIVITY_STATUSES.map((value) => ({ value, label: statusLabel(value) }));
@@ -47,6 +53,41 @@ const PROVIDER_OPTIONS = LIST_PROVIDERS.map((value) => ({
 }));
 
 export function TriggerActivityPanel() {
+  const search = route.useSearch();
+  const navigate = route.useNavigate();
+  const dropped = search.view === "dropped";
+  const changeView = useCallback(
+    (view: string) => {
+      const next = view === "dropped" ? "dropped" : undefined;
+      if (search.view === next) return;
+      void navigate({
+        search: ({ size }) => ({ view: next, size }),
+        state: LIST_RESULT_ACTION,
+      });
+    },
+    [navigate, search.view],
+  );
+  return (
+    <>
+      <PageHeader
+        id={HEADING_ID}
+        title="Activity"
+        description={dropped ? "Provider events Hub received and dropped." : ACTIVITY_DESCRIPTION}
+      />
+      <div className="mb-3">
+        <SegmentedControl
+          label="Activity view"
+          options={ACTIVITY_VIEWS}
+          value={dropped ? "dropped" : "runs"}
+          onChange={changeView}
+        />
+      </div>
+      {dropped ? <DroppedActivityPanel headingId={HEADING_ID} /> : <RunsActivityPanel />}
+    </>
+  );
+}
+
+function RunsActivityPanel() {
   const tenant = useRouteTenant();
   const load = useServerFn(triggerActivityPage);
   const search = route.useSearch();
@@ -108,12 +149,7 @@ export function TriggerActivityPanel() {
     [clear, filtered],
   );
   if (snapshot.status === "pending") {
-    return (
-      <>
-        <PageHeader id={HEADING_ID} title="Activity" description={ACTIVITY_DESCRIPTION} />
-        <DataTableSkeleton label="Trigger activity" columns={ACTIVITY_COLUMNS} />
-      </>
-    );
+    return <DataTableSkeleton label="Trigger activity" columns={ACTIVITY_COLUMNS} />;
   }
   if (snapshot.status === "error") {
     return (
@@ -137,7 +173,6 @@ export function TriggerActivityPanel() {
   );
   return (
     <>
-      <PageHeader id={HEADING_ID} title="Activity" description={ACTIVITY_DESCRIPTION} />
       {snapshot.refreshFailure === null ? null : (
         <FailureAlert
           title="Activity may be out of date"

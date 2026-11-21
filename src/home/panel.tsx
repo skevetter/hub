@@ -25,6 +25,9 @@ import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "../daemons/handoff.js
 import { queryState } from "../projects/panel-state.js";
 import { HomeSessionStart } from "../interactive-sessions/ui/new-session.js";
 import { useRouteTenant } from "../projects/context.js";
+import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
+import { DROP_REASON_GROUPS, type DropReasonGroup } from "../triggers/drop-reason.js";
+import { LIST_PROVIDER_LABELS } from "../triggers/list-providers.js";
 import { deriveChecklist, type Checklist, type ChecklistStep } from "./checklist.js";
 import { finishHomeSetup, homeSnapshot, type HomeSnapshot } from "./functions.js";
 
@@ -63,7 +66,6 @@ function HomeView({
 }) {
   const [focusOnCompletion, setFocusOnCompletion] = useState(false);
   const base = `/o/${data.organization.slug}`;
-  const unroutedCount = data.unrouted.reduce((total, { count }) => total + count, 0);
   return (
     <>
       <PageHeader title="Home" description={HOME_DESCRIPTION} focusOnMount={focusOnCompletion} />
@@ -76,19 +78,7 @@ function HomeView({
           onFinished={() => setFocusOnCompletion(true)}
         />
       ) : null}
-      {unroutedCount === 0 ? null : (
-        <WarningAlert
-          standalone
-          title="Events are arriving with no trigger listening"
-          action={
-            <Button asChild variant="outline" size="sm">
-              <Link to={`${base}/triggers/new` as never}>Create a trigger</Link>
-            </Button>
-          }
-        >
-          <p>{unroutedSentence(data.unrouted, data.windowDays)}</p>
-        </WarningAlert>
-      )}
+      <DroppedEventNotices data={data} />
       <Section title="Overview" description={`The last ${String(data.windowDays)} days.`}>
         <StatGrid>
           <StatTile
@@ -507,20 +497,48 @@ export function runHint(triggers: HomeSnapshot["triggers"]): string {
   return [...hints].join(" ");
 }
 
-function unroutedSentence(unrouted: HomeSnapshot["unrouted"], windowDays: number): string {
-  const total = unrouted.reduce((sum, { count }) => sum + count, 0);
-  const sources = unrouted
-    .map(({ provider, count }) => `${String(count)} from ${providerName(provider)}`)
-    .join(", ");
-  return `${String(total)} ${total === 1 ? "event" : "events"} in the last ${String(windowDays)} days were dropped because no trigger handles them: ${sources}.`;
-}
+const DROP_NOTICE_TITLES: Record<DropReasonGroup, string> = {
+  routing: "Events arrived without a route or matching trigger",
+  trigger_filters_rejected: "Trigger filters rejected events",
+  configuration_unavailable: "Events arrived while configuration was unavailable",
+  unsupported_event: "Linear sent unsupported events",
+  other: "Hub dropped other events",
+};
 
-function providerName(provider: HomeSnapshot["unrouted"][number]["provider"]): string {
-  if (provider === "github") return "GitHub";
-  if (provider === "slack") return "Slack";
-  if (provider === "discord") return "Discord";
-  if (provider === "linear") return "Linear";
-  return statusLabel(provider);
+function DroppedEventNotices({ data }: { data: HomeSnapshot }) {
+  const capped =
+    data.dropped.reduce((total, { count }) => total + count, 0) >= RECENT_DROP_COUNT_LIMIT;
+  return DROP_REASON_GROUPS.map((reason) => {
+    const group = data.dropped.filter((count) => count.reason === reason);
+    if (group.length === 0) return null;
+    const total = group.reduce((sum, { count }) => sum + count, 0);
+    const sources = group
+      .map(({ provider, count }) => `${String(count)} from ${LIST_PROVIDER_LABELS[provider]}`)
+      .join(", ");
+    return (
+      <WarningAlert
+        key={reason}
+        standalone
+        title={DROP_NOTICE_TITLES[reason]}
+        action={
+          <Button asChild variant="outline" size="sm">
+            <Link
+              to="/o/$organizationSlug/activity"
+              params={{ organizationSlug: data.organization.slug }}
+              search={{ view: "dropped", reason, range: "7d" }}
+            >
+              View dropped events
+            </Link>
+          </Button>
+        }
+      >
+        <p>
+          {capped ? "At least " : ""}
+          {total} {total === 1 ? "event" : "events"} in the last {data.windowDays} days ({sources}).
+        </p>
+      </WarningAlert>
+    );
+  });
 }
 
 function runOutcomes(runs: HomeSnapshot["runs"]): string {

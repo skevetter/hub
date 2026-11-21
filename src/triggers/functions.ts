@@ -6,7 +6,7 @@ import { respondWithFailure } from "../failures/index.js";
 import type { BrowserStopResult } from "./run-stop.js";
 import { getApplication } from "../server/runtime.js";
 import { PAGE_SIZES } from "../components/app/page-size.js";
-import { activityFiltersSchema } from "./activity-query.js";
+import { activityFiltersSchema, droppedActivityFiltersSchema } from "./activity-query.js";
 import { triggerSearchSchema } from "./trigger-query.js";
 import type { TriggerDashboard } from "./dashboard.js";
 
@@ -151,6 +151,29 @@ export const triggerActivityPage = createServerFn({ method: "GET" })
     },
   );
 
+export const droppedActivityPage = createServerFn({ method: "GET" })
+  .validator(
+    scopeSchema.extend(droppedActivityFiltersSchema.shape).extend({
+      limit: z.number().int().min(1).max(PAGE_SIZES[3]).optional(),
+      cursor: z.string().optional(),
+    }),
+  )
+  .handler(
+    async ({ data: { organizationSlug, ...input } }): Promise<Result<DroppedActivityPage>> => {
+      try {
+        const dashboard = (await getApplication()).triggerDashboard;
+        if (dashboard == null) throw new Error("trigger dashboard unavailable");
+        return respondOk(
+          await dashboard.droppedActivityPage(getRequest(), organizationSlug, input),
+        );
+      } catch (error) {
+        return respondWithFailure(error, triggerContext("activity.dropped", organizationSlug), {
+          fallback: "Hub couldn't load dropped events.",
+        });
+      }
+    },
+  );
+
 export const saveTrigger = createServerFn({ method: "POST" })
   .validator(saveSchema)
   .handler(async ({ data }): Promise<Result<{ state: "complete" }>> => {
@@ -174,6 +197,7 @@ export const saveTrigger = createServerFn({ method: "POST" })
 
 export type TriggerSnapshot = Awaited<ReturnType<TriggerDashboard["snapshot"]>>;
 export type TriggerListPage = Awaited<ReturnType<TriggerDashboard["triggerPage"]>>;
+export type DroppedActivityPage = Awaited<ReturnType<TriggerDashboard["droppedActivityPage"]>>;
 export type TriggerActivityPage = Awaited<ReturnType<TriggerDashboard["activityPage"]>>;
 
 function triggerContext(operation: string, organizationSlug: string) {

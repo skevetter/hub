@@ -1,9 +1,15 @@
 import { isExactSyncReceipt } from "../run-payload-retention/auxiliary-receipt-proof.js";
+import {
+  UNSUPPORTED_LINEAR_RATE_LIMITED,
+  readUnsupportedLinearBudget,
+  recordUnsupportedLinearAdmission,
+  unsupportedLinearWindow,
+} from "./unsupported-linear.js";
 import type { Locks } from "./runtime/locks/index.js";
 import { and, eq, getTableColumns, isNull, or, lte, sql, isNotNull } from "drizzle-orm";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { ManualRunRejected } from "../triggers/manual/provider.js";
-import type { DatabaseRuntime, DrizzleHandle } from "./runtime/index.js";
+import type { DatabaseRuntime, DrizzleHandle, TransactionHandle } from "./runtime/index.js";
 import * as schema from "./schema.js";
 import { ConnectionRepository, replaceGitHubRepositories } from "./connections.js";
 import {
@@ -42,6 +48,7 @@ export class ProviderEventAcceptanceRepository {
     private readonly runtime: DatabaseRuntime,
     private readonly locks: Locks,
     private readonly connections: ConnectionRepository,
+    private readonly unsupportedLinearReceiptsPerHour: number,
   ) {
     this.database = runtime.drizzle();
   }
@@ -90,10 +97,15 @@ export class ProviderEventAcceptanceRepository {
     resourceId: number | string | undefined,
     input: ProviderEventEvidence,
   ): Promise<ProviderEventAcceptance> {
-    return this.database.transaction(async (transaction) => {
+    return this.runtime.transaction(async (runtimeTransaction) => {
+      const transaction = runtimeTransaction.drizzle();
       const connection = await findConnection(transaction, provider, externalId);
       if (connection === undefined) {
         return { status: "dropped", receiptId: input.deliveryId, reason: `${provider}_unbound` };
+      }
+
+      if (provider === "linear" && input.dropReason === "unsupported_event") {
+        return this.acceptUnsupportedLinear(runtimeTransaction, connection, input);
       }
 
       const existing = await findReceipt(transaction, input, connection.organizationId);
@@ -193,6 +205,41 @@ export class ProviderEventAcceptanceRepository {
         receiptId: receipt.id,
       };
     });
+  }
+
+  private async acceptUnsupportedLinear(
+    runtimeTransaction: TransactionHandle,
+    { organizationId, id: connectionId }: { organizationId: string; id: string },
+    input: ProviderEventEvidence,
+  ): Promise<ProviderEventAcceptance> {
+    await this.locks.withTxLock(
+      runtimeTransaction,
+      JSON.stringify(["unsupported-linear", organizationId]),
+    );
+    const transaction = runtimeTransaction.drizzle();
+    const existing = await findReceipt(transaction, input, organizationId);
+    if (existing !== undefined) return replayProviderReceipt(existing);
+
+    const previous = await readUnsupportedLinearBudget(runtimeTransaction, organizationId);
+    const window = unsupportedLinearWindow(input.receivedAt, previous);
+    if (window.written >= this.unsupportedLinearReceiptsPerHour) {
+      return {
+        status: "dropped",
+        receiptId: input.deliveryId,
+        reason: UNSUPPORTED_LINEAR_RATE_LIMITED,
+      };
+    }
+    const receipt = await claimProviderReceipt(transaction, {
+      organizationId,
+      provider: "linear",
+      connectionId,
+      resourceId: null,
+      input,
+      preRoutingDrop: "unsupported_event",
+    });
+    if (!receipt.inserted) return replayProviderReceipt(receipt.existing);
+    await recordUnsupportedLinearAdmission(runtimeTransaction, organizationId, window, previous);
+    return { status: "dropped", receiptId: receipt.id, reason: "unsupported_event" };
   }
 
   persistManual(input: PersistManualEventInput): Promise<ManualEventPersistence> {

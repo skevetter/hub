@@ -153,6 +153,7 @@ import type {
   ManualEventPersistence,
   ManualReceiptReplayTarget,
   ProviderEventAcceptance,
+  ProviderEventEvidence,
   CreateProjectInput,
   InsertProjectConfigurationRevisionInput,
   InsertAttachmentInput,
@@ -168,7 +169,7 @@ import type {
   GitHubRepositorySnapshot,
   OrganizationConnectionUsage,
   OrganizationRunRecord,
-  UnroutedProviderEventCount,
+  DroppedEventPageRequest,
   ProjectTriggerRoute,
   MigrateProjectTriggersInput,
   OrganizationTriggerRecord,
@@ -217,11 +218,25 @@ import {
   entitlementOverridesSchema,
   mergeOverrides,
 } from "../entitlements/catalog.js";
+import {
+  droppedEventProvider,
+  groupDropCounts,
+  RECENT_DROP_COUNT_LIMIT,
+} from "./dropped-events.js";
+import {
+  DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR,
+  UNSUPPORTED_LINEAR_RATE_LIMITED,
+  UNSUPPORTED_LINEAR_RECEIPT_LIMIT,
+  unsupportedLinearWindow,
+  type UnsupportedLinearWindow,
+} from "./unsupported-linear.js";
 import { activityTimestampMicros, compareRunsNewestFirst } from "./activity-key.js";
 import { hasTriggerEvent, triggerProviderEvent } from "./trigger-list.js";
 import { toProviderEventReceiptRecordSummary } from "./mappers.js";
 import {
-  isProviderEventDropReasonCode,
+  displayedDropReason,
+  GITHUB_LIFECYCLE_RECEIPT,
+  ROUTING_DROP_REASONS,
   type ProviderEventDropReasonCode,
 } from "../triggers/drop-reason.js";
 import {
@@ -250,6 +265,11 @@ import type {
 
 const OUTPUT_ATTEMPT_LEASE_MS = 5 * 60_000;
 
+type UnsupportedLinearReceiptKey = Pick<
+  ProviderEventReceiptRecord,
+  "id" | "receivedAt" | "deliveryId" | "signatureHash"
+>;
+
 export interface MemoryDatabaseOptions {
   schedules?: import("../triggers/schedule/index.js").ScheduleStore;
   githubNotifications?: import("../triggers/github-notifications/index.js").GitHubNotificationStore;
@@ -265,6 +285,8 @@ export interface MemoryDatabaseOptions {
   }[];
   now?: () => Date;
   slackConnections?: readonly SlackConnectionRecord[];
+  linearConnections?: readonly LinearConnectionRecord[];
+  unsupportedLinearReceiptsPerHour?: number;
   githubConnections?: readonly GitHubConnectionRecord[];
   githubSyncOwner?: GitHubInstallationSyncOwner;
 }
@@ -1823,6 +1845,13 @@ class MemoryDatabase implements Database {
   private readonly githubConnections = new Map<number, GitHubConnectionRecord>();
   private readonly discordConnections = new Map<string, DiscordConnectionRecord>();
   private readonly slackConnections = new Map<string, SlackConnectionRecord>();
+  private readonly unsupportedLinearBudgets = new Map<
+    string,
+    {
+      window: UnsupportedLinearWindow;
+      receipts: Map<string, UnsupportedLinearReceiptKey>;
+    }
+  >();
   private readonly linearConnections = new Map<string, LinearConnectionRecord>();
   private readonly organizationIds: Set<string>;
   private readonly homeChecklistCompletions = new Map<string, Date>();
@@ -1836,6 +1865,9 @@ class MemoryDatabase implements Database {
       this.githubConnections.set(connection.installationId, connection);
     for (const connection of options.slackConnections ?? []) {
       this.slackConnections.set(connection.teamId, connection);
+    }
+    for (const connection of options.linearConnections ?? []) {
+      this.linearConnections.set(connection.linearOrganizationId, connection);
     }
   }
 
@@ -6241,26 +6273,6 @@ class MemoryDatabase implements Database {
     });
   }
 
-  async listUnroutedProviderEventsForOrganization(organizationId: string) {
-    const routedReceiptIds = new Set(
-      [...this.triggerRuns.values()].map((run) => run.providerEventReceiptId),
-    );
-    return [...this.providerEventReceipts.values()]
-      .filter(
-        (receipt) =>
-          receipt.organizationId === organizationId &&
-          receipt.droppedReason !== null &&
-          isProviderEventDropReasonCode(receipt.droppedReason) &&
-          !routedReceiptIds.has(receipt.id),
-      )
-      .sort(
-        (left, right) =>
-          right.receivedAt.getTime() - left.receivedAt.getTime() || right.id.localeCompare(left.id),
-      )
-      .slice(0, 50)
-      .map(toProviderEventReceiptRecordSummary);
-  }
-
   async listOrganizationRunsSince(
     organizationId: string,
     since: Date,
@@ -6304,31 +6316,104 @@ class MemoryDatabase implements Database {
       });
   }
 
-  async countUnroutedProviderEventsSince(
-    organizationId: string,
-    since: Date,
-  ): Promise<UnroutedProviderEventCount[]> {
-    const routedReceiptIds = new Set(
-      [...this.triggerRuns.values()].map((run) => run.providerEventReceiptId),
-    );
-    const counts = new Map<ProviderEventReceiptRecord["provider"], number>();
-    for (const receipt of this.providerEventReceipts.values()) {
-      if (
-        receipt.organizationId !== organizationId ||
-        receipt.receivedAt < since ||
-        routedReceiptIds.has(receipt.id) ||
-        (receipt.droppedReason !== "no_project_route" &&
-          receipt.droppedReason !== "no_trigger_for_source")
-      ) {
-        continue;
-      }
-      counts.set(receipt.provider, (counts.get(receipt.provider) ?? 0) + 1);
-    }
-    return [...counts.entries()]
-      .map(([provider, count]) => ({ provider, count }))
-      .sort(
-        (left, right) => right.count - left.count || left.provider.localeCompare(right.provider),
+  private droppedReceipts(organizationId: string) {
+    return [...this.providerEventReceipts.values()]
+      .flatMap((receipt) =>
+        receipt.organizationId === organizationId &&
+        receipt.droppedReason !== null &&
+        !this.triggerRunIdsByProviderEventReceipt.has(receipt.id)
+          ? [{ ...receipt, droppedReason: receipt.droppedReason }]
+          : [],
+      )
+      .sort((a, b) => compareRunsNewestFirst(receiptOrder(a), receiptOrder(b)));
+  }
+
+  async listDroppedEventPage(organizationId: string, request: DroppedEventPageRequest) {
+    const { limit, provider, source, reason, receivedSince, position } = request;
+    const records = this.droppedReceipts(organizationId).filter((receipt) => {
+      const displayed = displayedDropReason(receipt.droppedReason);
+      return (
+        (provider === undefined || provider === droppedEventProvider(receipt)) &&
+        (source === undefined || source === receipt.source) &&
+        (receivedSince === undefined || receipt.receivedAt >= receivedSince) &&
+        (reason === undefined ||
+          reason === displayed ||
+          (reason === "routing" && ROUTING_DROP_REASONS.some((code) => code === displayed)))
       );
+    });
+    const micros =
+      position === undefined ? undefined : activityTimestampMicros(position.key.createdAt);
+    const inRange = records.filter((receipt) => {
+      if (position === undefined || micros === undefined) return true;
+      const order = compareRunsNewestFirst(receiptOrder(receipt), { micros, id: position.key.id });
+      return position.direction === "before" ? order > 0 : order < 0;
+    });
+    const page = position?.direction === "after" ? inRange.slice(-limit) : inRange.slice(0, limit);
+    const first = page[0];
+    const last = page.at(-1);
+    const key = (receipt: ProviderEventReceiptRecord) => ({
+      createdAt: receipt.receivedAt.toISOString(),
+      id: receipt.id,
+    });
+    return {
+      records: page.map((receipt) => ({
+        id: receipt.id,
+        provider: droppedEventProvider(receipt),
+        source: receipt.source,
+        receivedAt: receipt.receivedAt.toISOString(),
+        workspaceOrRepo: receipt.repo ?? this.droppedReceiptWorkspace(receipt),
+        reason: displayedDropReason(receipt.droppedReason),
+        triggerId: this.droppedReceiptTrigger(receipt),
+      })),
+      newer: first !== undefined && records[0] !== first ? key(first) : null,
+      older: last !== undefined && records.at(-1) !== last ? key(last) : null,
+    };
+  }
+
+  private droppedReceiptTrigger(receipt: ProviderEventReceiptRecord): string | null {
+    if (receipt.droppedReason !== "trigger_filters_rejected" || receipt.provider !== "manual")
+      return null;
+    const bound = receipt.manualReplayBinding?.triggerId;
+    if (bound != null) return bound;
+    const [route, other] = receipt.acceptedRoutes ?? [];
+    if (route === undefined || other !== undefined) return null;
+    const triggers = [...this.organizationTriggers.values()].filter(
+      (trigger) =>
+        trigger.organizationId === receipt.organizationId &&
+        trigger.format === "single_run" &&
+        trigger.runtimeProjectId === route.projectId,
+    );
+    return triggers.length === 1 ? (triggers[0]?.id ?? null) : null;
+  }
+
+  private droppedReceiptWorkspace(receipt: ProviderEventReceiptRecord): string | null {
+    const stores = {
+      linear: this.linearConnections,
+      slack: this.slackConnections,
+      discord: this.discordConnections,
+    };
+    const { provider } = receipt;
+    if (provider !== "linear" && provider !== "slack" && provider !== "discord") return null;
+    const connections: Iterable<{ id: string; organizationId: string; slug: string }> =
+      stores[provider].values();
+    return (
+      Array.from(connections).find(
+        ({ id, organizationId }) =>
+          id === receipt.connectionId && organizationId === receipt.organizationId,
+      )?.slug ?? null
+    );
+  }
+
+  async countRecentDroppedEvents(organizationId: string, since: Date) {
+    return groupDropCounts(
+      this.droppedReceipts(organizationId)
+        .filter(
+          ({ receivedAt, droppedReason }) =>
+            receivedAt >= since && droppedReason !== GITHUB_LIFECYCLE_RECEIPT,
+        )
+        .slice(0, RECENT_DROP_COUNT_LIMIT)
+        .map(({ provider, droppedReason }) => ({ provider, reason: droppedReason, count: 1 })),
+    );
   }
 
   async isOrganizationMember(): Promise<boolean> {
@@ -6577,9 +6662,13 @@ class MemoryDatabase implements Database {
         reason: reason ?? "provider_unbound",
       };
     }
+    const provider = providerForInput(input);
+    if (provider === "linear" && reason === "unsupported_event") {
+      return this.acceptUnsupportedLinearReceipt(input, organizationId, connectionId);
+    }
     const receipt = this.insertProviderEventReceipt({
       organizationId,
-      provider: providerForInput(input),
+      provider,
       connectionId,
       resourceId,
       input,
@@ -6596,7 +6685,6 @@ class MemoryDatabase implements Database {
         reason,
       };
     }
-    const provider = providerForInput(input);
     const routes = Array.from(this.projectTriggerRoutes.entries()).flatMap(
       ([projectId, candidates]) => {
         const project = this.projects.get(projectId);
@@ -6722,6 +6810,66 @@ class MemoryDatabase implements Database {
       this.providerEventReceiptIdsBySignature.set(receipt.signatureHash, receipt.id);
     }
     return receipt;
+  }
+
+  private acceptUnsupportedLinearReceipt(
+    input: ProviderEventEvidence,
+    organizationId: string,
+    connectionId: string,
+  ): ProviderEventAcceptance {
+    const previous = this.unsupportedLinearBudgets.get(organizationId);
+    const window = unsupportedLinearWindow(input.receivedAt, previous?.window);
+    const limit =
+      this.options.unsupportedLinearReceiptsPerHour ?? DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR;
+    if (window.written >= limit) {
+      return {
+        status: "dropped",
+        receiptId: input.deliveryId,
+        reason: UNSUPPORTED_LINEAR_RATE_LIMITED,
+      };
+    }
+    const receipt = this.insertProviderEventReceipt({
+      provider: "linear",
+      organizationId,
+      connectionId,
+      resourceId: null,
+      input,
+    });
+    this.providerEventReceipts.set(receipt.id, { ...receipt, preRoutingDrop: "unsupported_event" });
+    const receipts = previous?.receipts ?? new Map<string, UnsupportedLinearReceiptKey>();
+    const { id, receivedAt, deliveryId, signatureHash } = receipt;
+    receipts.set(id, { id, receivedAt, deliveryId, signatureHash });
+    this.unsupportedLinearBudgets.set(organizationId, {
+      window: { hour: window.hour, written: window.written + 1 },
+      receipts,
+    });
+    if (receipts.size > UNSUPPORTED_LINEAR_RECEIPT_LIMIT) {
+      this.pruneUnsupportedLinearReceipt(organizationId, receipts);
+    }
+    return { status: "dropped", receiptId: receipt.id, reason: "unsupported_event" };
+  }
+
+  private pruneUnsupportedLinearReceipt(
+    organizationId: string,
+    receipts: Map<string, UnsupportedLinearReceiptKey>,
+  ) {
+    let oldest: UnsupportedLinearReceiptKey | undefined;
+    for (const receipt of receipts.values()) {
+      if (
+        oldest === undefined ||
+        compareRunsNewestFirst(receiptOrder(receipt), receiptOrder(oldest)) > 0
+      ) {
+        oldest = receipt;
+      }
+    }
+    if (oldest === undefined) return;
+    receipts.delete(oldest.id);
+    this.providerEventReceipts.delete(oldest.id);
+    this.providerEventReceiptIdsByDelivery.delete(
+      triggerDeliveryKey(organizationId, oldest.deliveryId),
+    );
+    if (oldest.signatureHash !== null)
+      this.providerEventReceiptIdsBySignature.delete(oldest.signatureHash);
   }
 
   private readMachine(id: string): MachineRecord {
@@ -6945,6 +7093,10 @@ function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
 
 // Milliseconds only, unlike PostgreSQL. The packaged embedded database runs the SQL path; this
 // store is for tests.
+function receiptOrder(receipt: Pick<ProviderEventReceiptRecord, "receivedAt" | "id">) {
+  return { micros: BigInt(receipt.receivedAt.getTime()) * 1000n, id: receipt.id };
+}
+
 function runOrder(run: { createdAt: Date; id: string }) {
   return { micros: BigInt(run.createdAt.getTime()) * 1000n, id: run.id };
 }

@@ -22,7 +22,13 @@ export type {
 import type { JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import type { InvocationRejection } from "../triggers/invocation.js";
-import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
+import type {
+  DisplayedDropReason,
+  DropReasonFilter,
+  DropReasonGroup,
+  ProviderEventDropReasonCode,
+  ReceiptReasonCode,
+} from "../triggers/drop-reason.js";
 import type { ListProvider } from "../triggers/list-providers.js";
 import type {
   EntitlementPatch,
@@ -107,8 +113,8 @@ export interface OrganizationRunRecord {
   agent: { provider: string; model: string | null } | null;
 }
 
-/** How many events a provider delivered that no trigger was listening for. */
-export interface UnroutedProviderEventCount {
+export interface DroppedProviderEventCount {
+  reason: DropReasonGroup;
   provider: ProviderEventReceiptRecord["provider"];
   count: number;
 }
@@ -717,7 +723,7 @@ export interface ProviderEventEvidence {
   repo?: string | null;
   payload: unknown;
   receivedAt: Date;
-  dropReason?: string;
+  dropReason?: ReceiptReasonCode;
 }
 
 export interface AcceptGitHubEventInput extends ProviderEventEvidence {
@@ -899,6 +905,29 @@ export interface ActivityRunPageRecord {
   older: ActivityRunKey | null;
   /** Key of the first record when newer runs exist. */
   newer: ActivityRunKey | null;
+}
+
+export interface DroppedEventRow {
+  id: string;
+  receivedAt: string;
+  provider: ListProvider;
+  source: string;
+  workspaceOrRepo: string | null;
+  reason: DisplayedDropReason;
+  triggerId: string | null;
+}
+
+export interface DroppedEventPageRequest extends Pick<
+  ActivityRunPageRequest,
+  "provider" | "position" | "limit"
+> {
+  source?: string;
+  reason?: DropReasonFilter;
+  receivedSince?: Date;
+}
+
+export interface DroppedEventPageRecord extends Pick<ActivityRunPageRecord, "older" | "newer"> {
+  records: DroppedEventRow[];
 }
 
 export interface WorkflowStepRunRecord {
@@ -1869,24 +1898,20 @@ export interface Database
     connectionId: string,
     repositoryId: number,
   ): Promise<GitHubConfigurationTarget[]>;
-  listUnroutedProviderEventsForOrganization(
-    organizationId: string,
-  ): Promise<ProviderEventReceiptSummary[]>;
   /** Newest first, every run the organization's triggers started at or after `since`. */
   listOrganizationRunsSince(
     organizationId: string,
     since: Date,
     limit: number,
   ): Promise<OrganizationRunRecord[]>;
-  /**
-   * Events received at or after `since` that were dropped because no trigger listens for them
-   * (`no_project_route`, `no_trigger_for_source`), counted per provider. A filter that declined
-   * an event is a trigger listening, so those drops are not counted.
-   */
-  countUnroutedProviderEventsSince(
+  listDroppedEventPage(
+    organizationId: string,
+    request: DroppedEventPageRequest,
+  ): Promise<DroppedEventPageRecord>;
+  countRecentDroppedEvents(
     organizationId: string,
     since: Date,
-  ): Promise<UnroutedProviderEventCount[]>;
+  ): Promise<DroppedProviderEventCount[]>;
   isOrganizationMember(userId: string, organizationId: string): Promise<boolean>;
   startConnectionAttempt(input: StartConnectionAttemptInput): Promise<void>;
   findConnectionAttemptConfiguration(

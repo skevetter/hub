@@ -1,3 +1,5 @@
+import { UNSUPPORTED_LINEAR_RECEIPT_PREDICATE } from "./unsupported-linear.js";
+import { otherDropPredicate, routingDropPredicate } from "./dropped-events.js";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
@@ -38,7 +40,8 @@ export type ReceiptPayloadExpiryState = "expiring" | "expired";
 export type ReceiptPreRoutingDrop =
   | "no_project_route"
   | "no_trigger_for_source"
-  | "configuration_unavailable";
+  | "configuration_unavailable"
+  | "unsupported_event";
 
 export interface ManualReceiptReplayBinding {
   projectId: string;
@@ -53,6 +56,15 @@ export type MachineSource =
 
 export const machineStatus = pgEnum("machine_status", MACHINE_STATUSES);
 export const agentExecutionStatus = pgEnum("agent_execution_status", AGENT_EXECUTION_STATUSES);
+
+export const unsupportedLinearReceiptBudgets = pgTable("unsupported_linear_receipt_budgets", {
+  organizationId: text("organization_id")
+    .primaryKey()
+    .references(() => organizations.id, { onDelete: "cascade" }),
+  hour: integer().notNull(),
+  written: integer().notNull(),
+  retainedUpperBound: integer("retained_upper_bound").notNull(),
+});
 
 export const providerEventReceipts = pgTable(
   "provider_event_receipts",
@@ -107,6 +119,48 @@ export const providerEventReceipts = pgTable(
       table.organizationId,
       table.receivedAt.desc(),
     ),
+    index("provider_event_receipts_org_unsupported_linear_idx")
+      .on(table.organizationId, table.receivedAt.desc().nullsFirst(), table.id.desc().nullsFirst())
+      .where(sql.raw(UNSUPPORTED_LINEAR_RECEIPT_PREDICATE)),
+    index("provider_event_receipts_org_dropped_order_idx")
+      .on(
+        table.organizationId,
+        table.receivedAt.desc().nullsFirst(),
+        table.id.desc().nullsFirst(),
+        table.provider,
+        table.droppedReason,
+      )
+      .where(sql`${table.droppedReason} is not null`),
+    index("provider_event_receipts_org_dropped_provider_idx")
+      .on(
+        table.organizationId,
+        table.provider,
+        table.receivedAt.desc().nullsFirst(),
+        table.id.desc().nullsFirst(),
+      )
+      .where(sql`${table.droppedReason} is not null`),
+    index("provider_event_receipts_org_dropped_source_idx")
+      .on(
+        table.organizationId,
+        table.source,
+        table.receivedAt.desc().nullsFirst(),
+        table.id.desc().nullsFirst(),
+      )
+      .where(sql`${table.droppedReason} is not null`),
+    index("provider_event_receipts_org_dropped_reason_idx")
+      .on(
+        table.organizationId,
+        table.droppedReason,
+        table.receivedAt.desc().nullsFirst(),
+        table.id.desc().nullsFirst(),
+      )
+      .where(sql`${table.droppedReason} is not null`),
+    index("provider_event_receipts_org_dropped_routing_idx")
+      .on(table.organizationId, table.receivedAt.desc().nullsFirst(), table.id.desc().nullsFirst())
+      .where(sql.raw(routingDropPredicate("dropped_reason"))),
+    index("provider_event_receipts_org_dropped_other_idx")
+      .on(table.organizationId, table.receivedAt.desc().nullsFirst(), table.id.desc().nullsFirst())
+      .where(sql.raw(otherDropPredicate("dropped_reason"))),
     index("provider_event_receipts_org_webhook_idx")
       .on(table.organizationId, table.id)
       .where(sql`${table.provider} = 'manual' and ${table.source} = 'webhook.received'`),
@@ -128,7 +182,8 @@ export const providerEventReceipts = pgTable(
     ),
     check(
       "provider_event_receipts_pre_routing_drop_check",
-      sql`${table.preRoutingDrop} is null or (${table.preRoutingDrop} in ('no_project_route', 'no_trigger_for_source', 'configuration_unavailable')
+      sql`${table.preRoutingDrop} is null or (${table.preRoutingDrop} in ('no_project_route', 'no_trigger_for_source', 'configuration_unavailable', 'unsupported_event')
+        and (${table.preRoutingDrop} <> 'unsupported_event' or ${table.provider} = 'linear')
         and ${table.preRoutingDrop} is not distinct from ${table.droppedReason} and ${table.acceptedRoutes} is null)`,
     ),
   ],

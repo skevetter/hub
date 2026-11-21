@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { activityTimestampMicros } from "../db/activity-key.js";
 import type { ActivityRunKey, ActivityRunPageRequest } from "../db/types.js";
-import type { ActivityFilters } from "./activity-query.js";
+import type { ActivityFilters, DroppedActivityFilters } from "./activity-query.js";
 
 type Position = NonNullable<ActivityRunPageRequest["position"]>;
 type ActivityCursor = Position & { offset?: number };
@@ -18,6 +18,16 @@ export function activityCursorScope(
 ): string {
   return createHash("sha256")
     .update(JSON.stringify([organizationId, limit, status, trigger, provider, range]))
+    .digest("base64url");
+}
+
+export function droppedActivityCursorScope(
+  organizationId: string,
+  limit: number,
+  { provider, source, reason, range }: DroppedActivityFilters,
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify(["dropped", organizationId, limit, provider, source, reason, range]))
     .digest("base64url");
 }
 

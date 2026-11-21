@@ -60,6 +60,8 @@ export async function dashboardWithRuns(count: number) {
   };
   await addRuns(count);
   return {
+    database,
+    trigger,
     addRuns,
     dashboard: new TriggerDashboard(database, accountAuth(), acceptingAgentValidator()),
     request: new Request("https://hub.test/o/acme/activity"),

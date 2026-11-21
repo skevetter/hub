@@ -244,17 +244,11 @@ describe("project dashboard activity read models", () => {
     const organization = await dashboard.organizationSnapshot(request, {
       organizationSlug: "acme",
     });
-    const unroutedEvent = organization.unroutedEvents[0];
-    assert.ok(unroutedEvent);
-    assert.equal(unroutedEvent.deliveryId, "dashboard-unrouted-large-payload");
-    assert.equal(unroutedEvent.status, "dropped");
-    assert.equal(unroutedEvent.providerEventReceiptId, unroutedEvent.id);
-    assert.equal(
-      unroutedEvent.failureReason,
-      "The event did not pass the configured trigger filters.",
+    assert.equal("unroutedEvents" in organization, false);
+    assert.doesNotMatch(
+      JSON.stringify(organization),
+      /dashboard-unrouted-large-payload|unrouted-unrouted/u,
     );
-    assert.equal(JSON.stringify(unroutedEvent).includes("unrouted-unrouted"), false);
-    assert.equal("rawPayload" in unroutedEvent, false);
   });
 
   it("projects bounded webhook display data without adding receipt payloads to activity lists", async () => {

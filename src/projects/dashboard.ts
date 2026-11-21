@@ -1,13 +1,8 @@
 import type { AuthServer } from "../auth/server.js";
 import { capabilitiesFor } from "../auth/organization-policy.js";
 import { revisionBundleFiles } from "../configuration/store.js";
-import type {
-  Database,
-  ProjectActivityRunListRecord,
-  ProviderEventReceiptSummary,
-} from "../db/types.js";
+import type { Database, ProjectActivityRunListRecord } from "../db/types.js";
 import { formatInvocationRejection } from "../triggers/invocation.js";
-import { providerEventDropReasonSummary } from "../triggers/drop-reason.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { resolveRouteTenant } from "./access.js";
@@ -49,10 +44,9 @@ export class ProjectDashboard {
 
   async organizationSnapshot(request: Request, scope: ProjectRouteScope) {
     const { account, tenant } = await this.resolve(request, organizationScope(scope));
-    const [projects, connections, unroutedEvents, daemons] = await Promise.all([
+    const [projects, connections, daemons] = await Promise.all([
       this.database.listProjectsForOrganization(tenant.organization.id),
       this.database.organizationConnectionUsage(tenant.organization.id),
-      this.database.listUnroutedProviderEventsForOrganization(tenant.organization.id),
       this.database.listDaemonsForOrganization(tenant.organization.id),
     ]);
     return {
@@ -62,7 +56,6 @@ export class ProjectDashboard {
       capabilities: capabilitiesFor(tenant.membership.role),
       projects: projects.map(projectView),
       connections: connectionUsageView(connections),
-      unroutedEvents: unroutedEvents.map(unroutedEventView),
       daemons: daemons.map(daemonView),
     };
   }
@@ -339,33 +332,5 @@ function activityRunListView(activity: ProjectActivityRunListRecord) {
     deadlineKind: run.deadlineKind,
     failureReason: displayFailureReason(run.failureReason),
     rejectionReason: null,
-  };
-}
-
-function unroutedEventView(receipt: ProviderEventReceiptSummary) {
-  return {
-    id: receipt.id,
-    providerEventReceiptId: receipt.id,
-    provider: receipt.provider,
-    deliveryId: receipt.deliveryId,
-    source: receipt.source,
-    repo: receipt.repo,
-    receivedAt: receipt.receivedAt.toISOString(),
-    configuredTriggerName: null,
-    prompt: null,
-    inputs: {},
-    values: {},
-    triggerContext: {},
-    outputContext: {},
-    createdAt: receipt.receivedAt.toISOString(),
-    completedAt: null,
-    outcome: "dropped" as const,
-    status: "dropped" as const,
-    deadlineAt: null,
-    deadlineKind: null,
-    failureReason:
-      receipt.droppedReason === null ? null : providerEventDropReasonSummary(receipt.droppedReason),
-    rejectionReason: null,
-    steps: [],
   };
 }

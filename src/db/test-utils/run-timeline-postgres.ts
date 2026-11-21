@@ -12,7 +12,7 @@ import type { AcceptedTriggerRunRecord, Database } from "../types.js";
 export const TIMELINE_ORGANIZATION = "pooled-timeline-organization";
 
 export interface TimelineQueryHooks {
-  beforeQuery?: (sql: string) => Promise<void>;
+  beforeQuery?: (sql: string, params: readonly unknown[]) => Promise<void>;
   afterQuery?: (sql: string) => Promise<void>;
 }
 
@@ -26,7 +26,11 @@ export interface TimelinePostgresHarness {
   runtime: DatabaseRuntime;
   database: Database;
   createRun(): Promise<AcceptedTriggerRunRecord>;
-  connect(hooks?: TimelineQueryHooks, maxConnections?: number): Promise<TimelinePostgresConnection>;
+  connect(
+    hooks?: TimelineQueryHooks,
+    maxConnections?: number,
+    unsupportedLinearReceiptsPerHour?: number,
+  ): Promise<TimelinePostgresConnection>;
   waitForLockOrRead(pid: number, wasRead?: () => boolean): Promise<"blocked" | "read">;
   close(): Promise<void>;
 }
@@ -37,7 +41,7 @@ function observedRuntime(runtime: DatabaseRuntime, hooks: TimelineQueryHooks): D
     sql: string,
     params: readonly unknown[] = [],
   ): Promise<QueryResult<Row>> {
-    await hooks.beforeQuery?.(sql);
+    await hooks.beforeQuery?.(sql, params);
     const result = await target.query<Row>(sql, params);
     await hooks.afterQuery?.(sql);
     return result;
@@ -112,7 +116,11 @@ export async function createTimelinePostgresHarness(): Promise<TimelinePostgresH
           })
         ).run;
       },
-      async connect(hooks: TimelineQueryHooks = {}, maxConnections = 1) {
+      async connect(
+        hooks: TimelineQueryHooks = {},
+        maxConnections = 1,
+        unsupportedLinearReceiptsPerHour?: number,
+      ) {
         const bundle = await postgresDatabaseRuntime(container.getConnectionUri(), {
           max: maxConnections,
         });
@@ -121,7 +129,11 @@ export async function createTimelinePostgresHarness(): Promise<TimelinePostgresH
           "select pg_backend_pid() as pid",
         );
         const runtime = observedRuntime(bundle.runtime, hooks);
-        return { runtime, pid: rows[0]!.pid, database: createDatabase(runtime, bundle.locks) };
+        return {
+          runtime,
+          pid: rows[0]!.pid,
+          database: createDatabase(runtime, bundle.locks, unsupportedLinearReceiptsPerHour),
+        };
       },
       async waitForLockOrRead(pid: number, wasRead: () => boolean = () => false) {
         const deadline = performance.now() + 2000;

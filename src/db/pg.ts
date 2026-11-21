@@ -55,6 +55,8 @@ import { randomUUID } from "node:crypto";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import { parseInvocationInputs, parseInvocationRejection } from "../triggers/invocation.js";
+import { DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR } from "./unsupported-linear.js";
+import { countRecentDroppedEvents, readDroppedEventPage } from "./dropped-events.js";
 import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
 import {
   clearOverrideKey,
@@ -98,9 +100,8 @@ import type {
   TransitionAgentExecutionResult,
   ProviderEventReceiptRecord,
   ProviderEventReplayMetadata,
-  ProviderEventReceiptSummary,
   OrganizationRunRecord,
-  UnroutedProviderEventCount,
+  DroppedEventPageRequest,
   EnrollDaemonInput,
   EnrollmentTokenRecord,
   DaemonRecord,
@@ -351,8 +352,12 @@ function transitionWithTerminalRun(
     : { ...transition, terminalRun: run };
 }
 
-export function createDatabase(runtime: DatabaseRuntime, locks: Locks): Database {
-  return new PgDatabase(runtime, locks);
+export function createDatabase(
+  runtime: DatabaseRuntime,
+  locks: Locks,
+  unsupportedLinearReceiptsPerHour = DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR,
+): Database {
+  return new PgDatabase(runtime, locks, unsupportedLinearReceiptsPerHour);
 }
 
 class PgDatabase implements Database {
@@ -563,6 +568,7 @@ class PgDatabase implements Database {
   constructor(
     private readonly pool: DatabaseRuntime,
     private readonly locks: Locks,
+    unsupportedLinearReceiptsPerHour: number,
   ) {
     this.schedules = new ScheduleRepository(this.pool);
     this.timeline = new RunTimelineRepository(this.pool, locks);
@@ -578,6 +584,7 @@ class PgDatabase implements Database {
       this.pool,
       locks,
       this.connections,
+      unsupportedLinearReceiptsPerHour,
     );
   }
 
@@ -5189,33 +5196,6 @@ class PgDatabase implements Database {
     );
   }
 
-  async listUnroutedProviderEventsForOrganization(
-    organizationId: string,
-  ): Promise<ProviderEventReceiptSummary[]> {
-    const rows = await query<ProviderEventReceiptRow>(
-      this.pool,
-      `select receipts.id, receipts.organization_id, receipts.provider, receipts.connection_id,
-              receipts.resource_id, receipts.delivery_id, receipts.signature_hash, receipts.source,
-              receipts.repo, receipts.received_at, receipts.dropped_reason, receipts.payload_expiry_state
-       from provider_event_receipts receipts
-       where receipts.organization_id = $1
-         and receipts.dropped_reason in (
-           'no_project_route',
-           'no_trigger_for_source',
-           'trigger_filters_rejected',
-           'configuration_unavailable'
-         )
-         and not exists (
-           select 1 from trigger_runs runs
-           where runs.provider_event_receipt_id = receipts.id
-         )
-       order by receipts.received_at desc, receipts.id desc
-       limit 50`,
-      [organizationId],
-    );
-    return rows.rows.map(toProviderEventReceiptSummary);
-  }
-
   async listOrganizationRunsSince(
     organizationId: string,
     since: Date,
@@ -5257,26 +5237,12 @@ class PgDatabase implements Database {
     }));
   }
 
-  async countUnroutedProviderEventsSince(
-    organizationId: string,
-    since: Date,
-  ): Promise<UnroutedProviderEventCount[]> {
-    const rows = await query<{ provider: ProviderEventReceiptRecord["provider"]; count: number }>(
-      this.pool,
-      `select receipts.provider, count(*)::int as count
-       from provider_event_receipts receipts
-       where receipts.organization_id = $1
-         and receipts.received_at >= $2
-         and receipts.dropped_reason in ('no_project_route', 'no_trigger_for_source')
-         and not exists (
-           select 1 from trigger_runs runs
-           where runs.provider_event_receipt_id = receipts.id
-         )
-       group by receipts.provider
-       order by count desc, receipts.provider`,
-      [organizationId, since],
-    );
-    return rows.rows.map((row) => ({ provider: row.provider, count: row.count }));
+  listDroppedEventPage(organizationId: string, request: DroppedEventPageRequest) {
+    return readDroppedEventPage(this.pool, organizationId, request);
+  }
+
+  countRecentDroppedEvents(organizationId: string, since: Date) {
+    return countRecentDroppedEvents(this.pool, organizationId, since);
   }
 
   async isOrganizationMember(userId: string, organizationId: string): Promise<boolean> {

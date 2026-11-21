@@ -432,8 +432,12 @@ describe("embedded authenticated webhook intake", () => {
         await hub.database.listTriggerRunsForProject(trigger.runtimeProjectId, 10),
         [],
       );
-      const receipts = await hub.database.listUnroutedProviderEventsForOrganization("webhook-a");
-      assert.equal(receipts[0]?.droppedReason, "trigger_filters_rejected");
+      const { records } = await hub.database.listDroppedEventPage("webhook-a", {
+        limit: 15,
+        provider: "webhook",
+      });
+      assert.equal(records[0]?.reason, "trigger_filters_rejected");
+      assert.equal(records[0]?.triggerId, trigger.id);
     } finally {
       await hub.close();
     }

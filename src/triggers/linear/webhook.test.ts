@@ -24,39 +24,65 @@ describe("Linear webhook", () => {
     assert.equal(verifyLinearWebhookTimestamp({ webhookTimestamp: "not-a-time" }, NOW), false);
   });
 
-  it.each(["created", "prompted"])(
-    "acknowledges and ignores an AgentSessionEvent %s delivery",
-    async (action) => {
-      const endpoint = createLinearWebhookSource({
-        signingSecret: SECRET,
-        now: () => NOW,
-        resolveIssue: async () => {
-          throw new Error("agent sessions must not hydrate issues");
+  it.each([
+    ["AgentSessionEvent", "created", "agent_session"],
+    ["AgentSessionEvent", "prompted", "agent_session"],
+    ["Issue", "unexpected", "issue"],
+    ["Comment", "create", "comment"],
+    ["ProjectUpdate", "create", "project_update"],
+  ])("records a bounded receipt for an unreadable %s %s delivery", async (type, action, slug) => {
+    const inputs: unknown[] = [];
+    const endpoint = createLinearWebhookSource({
+      signingSecret: SECRET,
+      now: () => NOW,
+      resolveIssue: async () => {
+        throw new Error("unsupported events must not hydrate issues");
+      },
+      accept: async (input) => {
+        inputs.push(input);
+        return { status: "dropped", receiptId: "receipt", reason: "unsupported_event" };
+      },
+    });
+    await endpoint.start(async () => {
+      throw new Error("unsupported events must not dispatch");
+    });
+    const response = await endpoint.handle(
+      request(
+        {
+          type,
+          action,
+          organizationId: "linear-org",
+          webhookTimestamp: NOW,
+          data: { body: "PRIVATE-EVENT-BODY" },
         },
-        accept: async () => {
-          throw new Error("agent sessions must not create receipts");
-        },
-      });
-      await endpoint.start(async () => {
-        throw new Error("agent sessions must not dispatch");
-      });
-      const response = await endpoint.handle(
-        request(
-          {
-            type: "AgentSessionEvent",
-            action,
-            organizationId: "linear-org",
-            webhookTimestamp: NOW,
-            agentSession: { id: "session", issue: { id: "issue" } },
-          },
-          "AgentSessionEvent",
-        ),
-      );
-      assert.equal(response.status, 200);
-      assert.equal(await response.text(), "OK");
-      await endpoint.stop();
-    },
-  );
+        type,
+      ),
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(inputs, [
+      {
+        linearOrganizationId: "linear-org",
+        deliveryId: "delivery-1",
+        signatureHash: createHash("sha256")
+          .update(
+            sign(
+              JSON.stringify({
+                type,
+                action,
+                organizationId: "linear-org",
+                webhookTimestamp: NOW,
+                data: { body: "PRIVATE-EVENT-BODY" },
+              }),
+            ),
+          )
+          .digest("hex"),
+        source: `linear.${slug}`,
+        payload: { type: slug, action },
+        receivedAt: new Date(NOW),
+        dropReason: "unsupported_event",
+      },
+    ]);
+  });
 
   it.each([
     {

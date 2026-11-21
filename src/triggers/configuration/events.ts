@@ -62,6 +62,7 @@ interface EventDefinition {
   origin: "hub" | "provider";
   audience: "wildcard" | "named" | "optional" | "none";
   qualifiers: readonly QualifierDefinition[];
+  receiptSource?: string;
 }
 
 function text(key: QualifierKey, label: string, description: string): QualifierDefinition {
@@ -86,12 +87,14 @@ function event(
   label: string,
   qualifiers: readonly QualifierDefinition[],
   audience: EventDefinition["audience"],
+  receiptSource?: string,
 ): EventDefinition {
   return {
     provider,
     label,
     qualifiers,
     audience,
+    ...(receiptSource === undefined ? {} : { receiptSource }),
     origin:
       provider === "manual" || provider === "schedule" || provider === "github_notification"
         ? "hub"
@@ -152,6 +155,7 @@ function linear(label: string, kind: "scope" | "assignment" | "comment") {
       INPUTS,
     ],
     kind === "scope" ? "optional" : "named",
+    kind === "comment" ? "linear.comment" : "linear.issue",
   );
 }
 
@@ -227,7 +231,7 @@ const EVENTS = {
     "none",
   ),
   "schedule.tick": event("schedule", "Schedule", [], "none"),
-  "manual.run": event("manual", "Manual run", [INPUTS], "wildcard"),
+  "manual.run": event("manual", "Manual run", [INPUTS], "wildcard", "webhook.received"),
 };
 
 export type EditorEvent = keyof typeof EVENTS;
@@ -235,6 +239,13 @@ export const EDITOR_EVENTS = Object.keys(EVENTS).filter(isEditorEvent);
 
 export function isEditorEvent(value: string): value is EditorEvent {
   return Object.hasOwn(EVENTS, value);
+}
+
+export function isTriggerableReceiptSource(source: string): boolean {
+  return (
+    isEditorEvent(source) ||
+    EDITOR_EVENTS.some((eventId) => EVENTS[eventId].receiptSource === source)
+  );
 }
 
 export function parseEditorEvent(value: string): EditorEvent {

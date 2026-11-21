@@ -33,6 +33,7 @@ vi.mock("../projects/context.js", async (importOriginal) => ({
 vi.mock("./functions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof Functions>()),
   triggerActivityPage: () => Promise.resolve({ status: "ok", data: state.snapshot }),
+  droppedActivityPage: () => Promise.resolve({ status: "ok", data: state.snapshot }),
 }));
 
 vi.mock("../queries/index.js", async (importOriginal) => ({
@@ -186,6 +187,24 @@ describe("organization activity routes", () => {
         await renderRoute("/o/acme%20team/activity?status=failed"),
         /Activity unavailable/u,
       );
+      state.failed = false;
+
+      state.snapshot = { events: [], nextCursor: null, previousCursor: null };
+      const droppedPath = "/o/acme%20team/activity?view=dropped";
+      assert.match(await renderRoute(droppedPath), /No dropped events/u);
+      assert.equal(state.intervals.at(-1), 5000);
+      const droppedFiltered = await renderRoute(
+        `${droppedPath}&provider=linear&source=linear.comment&reason=unsupported_event&range=24h`,
+      );
+      assert.match(droppedFiltered, /No dropped events match these filters/u);
+      assert.match(droppedFiltered, /value="linear.comment"/u);
+      assert.match(droppedFiltered, /option value="unsupported_event" selected/u);
+      assert.match(droppedFiltered, /Clear filters/u);
+      state.snapshot = { events: [], nextCursor: null, previousCursor: "newer-cursor" };
+      await renderRoute(`${droppedPath}&cursor=older-cursor`);
+      assert.equal(state.intervals.at(-1), undefined);
+      state.failed = true;
+      assert.match(await renderRoute(droppedPath), /Dropped events unavailable/u);
       state.failed = false;
 
       state.snapshot = null;
