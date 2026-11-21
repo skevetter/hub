@@ -29,9 +29,11 @@ const GITHUB_OWNER = { providerApplicationId: "42", configurationVersion: 0 };
 
 const LEGACY_MIGRATIONS = join(process.cwd(), "src/db/migrations");
 const DRIZZLE_MIGRATIONS = join(process.cwd(), "drizzle");
+const TRIGGER_NAME_ORDER_MIGRATION = "0064_organization_trigger_name_order";
 const migrationJournalSchema = z.object({
   entries: z.array(
     z.object({
+      idx: z.number().int(),
       tag: z.string(),
       when: z.number(),
     }),
@@ -47,6 +49,79 @@ describe("database migration application", () => {
 
   afterAll(async () => {
     await postgres.stop();
+  }, 120_000);
+
+  it("upgrades populated build 20 trigger rows from 0063 to 0064 exactly once", async () => {
+    const build20Tag = "0063_interactive_sessions";
+    const url = await createHistoricalBaseline({
+      postgres,
+      prefix: "trigger_order_upgrade",
+      through: build20Tag,
+    });
+    const { runtime } = await postgresDatabaseRuntime(url);
+    try {
+      const journal = () =>
+        runtime.query<{ hash: string }>(
+          "select hash from drizzle.__drizzle_migrations order by id",
+        );
+      const triggers = () =>
+        runtime.query("select id, name, active_revision_id from organization_triggers order by id");
+      const index = () =>
+        runtime.query<{ indexdef: string }>(
+          `select indexdef from pg_indexes where schemaname = 'public' and tablename = 'organization_triggers'
+         and indexname = 'organization_triggers_organization_name_c_id_idx'`,
+        );
+      const { entries } = migrationJournalSchema.parse(
+        JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/_journal.json"), "utf8")),
+      );
+      assert.equal(entries.at(-1)?.idx, 64);
+      assert.equal(entries.at(-1)?.tag, TRIGGER_NAME_ORDER_MIGRATION);
+      const baseline = (await journal()).rows;
+      assert.equal(baseline.length, 64);
+      assert.equal(
+        baseline.at(-1)?.hash,
+        createHash("sha256")
+          .update(await readFile(join(DRIZZLE_MIGRATIONS, `${build20Tag}.sql`)))
+          .digest("hex"),
+      );
+      assert.equal((await index()).rowCount, 0);
+      await runtime.query(`
+        insert into organization (id, name, slug) values ('trigger-order', 'Trigger order', 'trigger-order');
+        insert into organization_triggers (organization_id, name, format)
+          values ('trigger-order', 'a_z', 'single_run'), ('trigger-order', 'a-z', 'single_run'),
+                 ('trigger-order', 'inactive', 'single_run');
+        with revisions as (
+          insert into organization_trigger_revisions
+            (trigger_id, organization_id, version, yaml, normalized_configuration, content_hash, source_kind, source_evidence)
+          select id, organization_id, 1, '', '{}', name, 'manual', '{}' from organization_triggers
+            where organization_id = 'trigger-order' and name <> 'inactive'
+          returning id, trigger_id
+        )
+        update organization_triggers t set active_revision_id = r.id from revisions r where t.id = r.trigger_id;
+      `);
+      const before = (await triggers()).rows;
+      assert.equal(before.length, 3);
+      await runtime.migrate();
+      assert.deepEqual((await triggers()).rows, before);
+      const migrated = (await journal()).rows;
+      const nameOrderMigration = await readFile(
+        join(DRIZZLE_MIGRATIONS, `${TRIGGER_NAME_ORDER_MIGRATION}.sql`),
+      );
+      assert.deepEqual(migrated, [
+        ...baseline,
+        { hash: createHash("sha256").update(nameOrderMigration).digest("hex") },
+      ]);
+      const [definition] = (await index()).rows;
+      assert.ok(definition);
+      assert.match(
+        definition.indexdef,
+        /\(organization_id, name COLLATE "C", id\).*active_revision_id IS NOT NULL/u,
+      );
+      await runtime.migrate();
+      assert.deepEqual((await journal()).rows, migrated);
+    } finally {
+      await runtime.close();
+    }
   }, 120_000);
 
   it("preserves populated build 14 options and migrates certain credential facts", async () => {
@@ -222,13 +297,16 @@ describe("database migration application", () => {
     const sessionsMigration = await readFile(
       join(DRIZZLE_MIGRATIONS, "0063_interactive_sessions.sql"),
     );
+    const triggerNameOrderMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, `${TRIGGER_NAME_ORDER_MIGRATION}.sql`),
+    );
     const database = await createDatabase(url);
     try {
       const migrated = await poolQuery<{ hash: string }>(
         url,
         "select hash from drizzle.__drizzle_migrations order by id",
       );
-      assert.equal(migrated.rowCount, baseline.rows.length + 5);
+      assert.equal(migrated.rowCount, baseline.rows.length + 6);
       assert.deepEqual(migrated.rows, [
         ...baseline.rows,
         { hash: createHash("sha256").update(receiptMigration).digest("hex") },
@@ -236,6 +314,7 @@ describe("database migration application", () => {
         { hash: createHash("sha256").update(activityOrderMigration).digest("hex") },
         { hash: createHash("sha256").update(runCancellationMigration).digest("hex") },
         { hash: createHash("sha256").update(sessionsMigration).digest("hex") },
+        { hash: createHash("sha256").update(triggerNameOrderMigration).digest("hex") },
       ]);
       assert.deepEqual(
         (await poolQuery(url, "select home_checklist_completed_at from organization")).rows,
@@ -386,6 +465,9 @@ describe("database migration application", () => {
     const sessionsMigration = await readFile(
       join(DRIZZLE_MIGRATIONS, "0063_interactive_sessions.sql"),
     );
+    const triggerNameOrderMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, `${TRIGGER_NAME_ORDER_MIGRATION}.sql`),
+    );
     assert.deepEqual((await journal()).rows, [
       ...releasedJournal.rows,
       { hash: createHash("sha256").update(reporterMigration).digest("hex") },
@@ -397,6 +479,7 @@ describe("database migration application", () => {
       { hash: createHash("sha256").update(activityOrderMigration).digest("hex") },
       { hash: createHash("sha256").update(runCancellationMigration).digest("hex") },
       { hash: createHash("sha256").update(sessionsMigration).digest("hex") },
+      { hash: createHash("sha256").update(triggerNameOrderMigration).digest("hex") },
     ]);
     assert.deepEqual(
       (
@@ -475,7 +558,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 64);
+      assert.equal(journal.rowCount, 65);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",
