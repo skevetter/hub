@@ -69,6 +69,27 @@ describe("Linear reply writer", () => {
     assert.ok(!writes[0]?.includes(profileUrl), "a profile URL survived the cut");
   });
 
+  it("removes a user tag cut off before its closing bracket", async () => {
+    const { send, writes } = await fixture();
+    await send(`${"a".repeat(3_423)} <user id="${"z".repeat(300)}">`);
+    assert.match(writes[0] ?? "", /\[Reply truncated\]/u);
+    assert.doesNotMatch(writes[0]!, /<user\b/iu);
+  });
+
+  it("still posts a safe prefix when escaping several raw cuts exceeds the size limit", async () => {
+    const { send, delivery, writes } = await fixture();
+    const text = [
+      "Answer.",
+      "![alt][carol] *@alice.smith*".repeat(70),
+      '[t][@\u202eeveryone] \uFF20alice.smith <user id="team-x">'.repeat(40),
+    ].join("\r\n\r\n");
+    await send(text);
+    const result = await delivery();
+    assert.ok(result?.state === "sent" && result.length && result.length <= 3_500);
+    assert.match(writes[0]!, /^Answer\\?\./u);
+    assert.doesNotMatch(writes[0]!, /[@\uFF20]|<user\b/iu);
+  });
+
   it("keeps bare email addresses visible with the mention sign neutralized", async () => {
     const { send, writes } = await fixture();
     await send("Email ops@example.com if the deploy fails.");
@@ -122,7 +143,11 @@ describe("Linear reply writer", () => {
         `case ${index}`,
       );
       const body = writes[0]!;
-      assert.doesNotMatch(body, /[@\uFF20]/u, `raw mention in case ${index}`);
+      assert.doesNotMatch(
+        body,
+        /[@\uFF20]|linear\.app\.?\/acme\/profiles(?:\/|$)/iu,
+        `raw mention or profile URL in case ${index}`,
+      );
       const tree = fromMarkdown(body, { extensions, mdastExtensions });
       const nodes = [...tree.children];
       for (const node of nodes) {
@@ -146,6 +171,28 @@ describe("Linear reply writer", () => {
       assert.equal(tree.children.at(-2)?.type, "paragraph", `notice in case ${index}`);
     }
   }, 60_000);
+
+  it.each([
+    "https://linear.app./acme/profiles/bob",
+    "herehttps://linear.app./acme/profiles/bob",
+    "herehttps://linear.app/acme/profiles/bob",
+    "see linea<b></b>r&period;app/acme/profiles/bob",
+    "see linea<b></b>r.app/acme/profiles/bob",
+    "say &#6<i></i>4;bob",
+  ])("neutralizes mentions in the serialized body for %s", async (text) => {
+    const { send, writes } = await fixture();
+    await send(`Answer. ${text}`);
+    const body = writes[0] ?? "";
+    const paragraph = fromMarkdown(body).children[0];
+    assert.equal(paragraph?.type, "paragraph");
+    assert.equal(paragraph.children.length, 1);
+    const visible = paragraph.children[0];
+    assert.equal(visible?.type, "text");
+    assert.match(visible.value, /^Answer\./u);
+    const forbidden = /linear\.app\.?\/acme\/profiles\/bob|[@\uFF20]|&#64;/iu;
+    assert.doesNotMatch(body, forbidden);
+    assert.doesNotMatch(visible.value, forbidden);
+  });
 
   it("records an unexpected sanitizer exception as an unrenderable reply", async () => {
     const format = vi.spyOn(replyFormat, "formatRunReply").mockImplementationOnce(() => {

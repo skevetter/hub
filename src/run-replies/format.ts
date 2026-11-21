@@ -4,6 +4,7 @@ import { gfmFromMarkdown, gfmToMarkdown } from "mdast-util-gfm";
 import { toMarkdown } from "mdast-util-to-markdown";
 import type { Parents, Root, RootContent } from "mdast";
 import { gfm } from "micromark-extension-gfm";
+import { decodeString } from "micromark-util-decode-string";
 import { createAssistantTextRedactor } from "../assistant-text/redact.js";
 
 export interface FinalReplyAnswer {
@@ -17,13 +18,17 @@ const TRUNCATION = "\n\n[Reply truncated]";
 const TRUNCATED_TEXT_LIMIT = MAX_REPLY_CHARS - TRUNCATION.length;
 const RAW_TRUNCATION_MARGIN = 48;
 const MAX_RENDER_ATTEMPTS = 3;
+const SHORT_PLAIN_PREFIX = 256;
 const MARKDOWN_BUDGET_MS = 50;
 const MAX_MARKDOWN_DELIMITERS = 192;
 const MARKDOWN_DELIMITER = /[[\]()*_~`<>!&\\]+/gu;
-const URL_IN_PROSE = /\b(?:https?:\/\/|www\.|linear\.app\/)[^\s<>()[\]"']+/giu;
+const MARKDOWN_CONTAINER_CHAIN = /(?:(?:[-+*>]|\d{1,9}[.)])[ \t]+){33}/u;
+const URL_IN_PROSE = /(?:https?:\/\/|www\.|(?<![\w-])linear\.app\.?(?=[:/]))[^\s<>()[\]"'`]+/giu;
+const LINEAR_HOST_PATH = /linear\.app\.?(?::\d{1,5})?(\/[^\s<>()[\]"'`\\?#]*)/giu;
 const LINEAR_MENTION_PATH = /\/(?:profiles|users|agents)(?:\/|$)/iu;
 const MENTION_SIGN = /[@\uFF20]|&(?:#0*64|#x0*40|commat);/giu;
-const USER_TAG = /(?:<|&lt;)\/?user\b[^<>]*?(?:>|&gt;)/giu;
+const USER_TAG = /(?:<|&lt;)\/?user\b[^<>\r\n]*?(?:>|&gt;|$)/gimu;
+const HTML_MARKUP = /<!--[\s\S]*?(?:-->|$)|<\/?[a-zA-Z][^<>\r\n]*>/gu;
 
 export function formatRunReply(answer: FinalReplyAnswer, secrets: readonly string[]): string {
   const { text } = answer;
@@ -47,7 +52,11 @@ export function formatRunReply(answer: FinalReplyAnswer, secrets: readonly strin
       (prefix.length * (TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN)) / safe.length,
     );
   }
-  throw new Error("Linear reply exceeds the rendering limit");
+  const [redacted] = redact.redact([text.slice(0, Math.min(limit, SHORT_PLAIN_PREFIX))], true);
+  const safe = renderPlainText(cleanSource(redacted!));
+  if (safe.length > TRUNCATED_TEXT_LIMIT)
+    throw new Error("Linear reply exceeds the rendering limit");
+  return safe === "" ? safe : safe + TRUNCATION;
 }
 
 function clipSource(text: string, limit: number): string {
@@ -74,7 +83,8 @@ function cleanSource(text: string): string {
 
 function renderMarkdown(source: string, deadline: number): string | undefined {
   // Micromark is synchronous. Bound delimiter-heavy input before any parser runs.
-  if (tooManyDelimiters(source) || performance.now() >= deadline) return undefined;
+  if (tooManyDelimiters(source) || MARKDOWN_CONTAINER_CHAIN.test(source)) return undefined;
+  if (performance.now() >= deadline) return undefined;
   const markdown = parseMarkdown(source);
   if (performance.now() >= deadline) return undefined;
   sanitizeMarkdown(markdown);
@@ -82,7 +92,7 @@ function renderMarkdown(source: string, deadline: number): string | undefined {
   const result = toMarkdown(markdown, {
     extensions: [gfmToMarkdown({ tablePipeAlign: false })],
   }).trim();
-  return performance.now() < deadline ? result : undefined;
+  return performance.now() < deadline && hasSafeProse(result) ? result : undefined;
 }
 
 function tooManyDelimiters(source: string): boolean {
@@ -95,10 +105,12 @@ function tooManyDelimiters(source: string): boolean {
 }
 
 function renderPlainText(source: string): string {
-  return neutralizeMentions(source.replace(/<\/?[a-zA-Z][^<>\r\n]*>/gu, ""))
+  const result = neutralizeMentions(source.replace(HTML_MARKUP, ""))
     .replace(/^[ \t]+/gmu, "")
     .replace(/[!-/:-@[-`{-~]/gu, "\\$&")
     .trim();
+  if (!hasSafeProse(result)) throw new Error("Linear reply contains unsafe text after rendering");
+  return result;
 }
 
 function parseMarkdown(source: string): Root {
@@ -159,7 +171,16 @@ function neutralizeMentions(value: string): string {
       const absolute = text.includes("://") ? text : `https://${text}`;
       return safeLink(absolute) ? text : "[Link removed]";
     })
+    .replace(LINEAR_HOST_PATH, (text, path: string) =>
+      isLinearMentionPath(path) ? "[Link removed]" : text,
+    )
     .replace(MENTION_SIGN, "[at]");
+}
+
+function hasSafeProse(serialized: string): boolean {
+  // Serialization can join previously separate text nodes or escape part of a URL.
+  const prose = cleanSource(decodeString(serialized));
+  return neutralizeMentions(prose) === prose;
 }
 
 function safeLink(value: string): boolean {
@@ -169,10 +190,13 @@ function safeLink(value: string): boolean {
     return false;
   const host = url.hostname.replace(/\.$/u, "");
   if (host !== "linear.app" && !host.endsWith(".linear.app")) return true;
+  return !isLinearMentionPath(url.pathname);
+}
+
+function isLinearMentionPath(path: string): boolean {
   try {
-    const path = decodeURIComponent(url.pathname).normalize("NFKC");
-    return !LINEAR_MENTION_PATH.test(path);
+    return LINEAR_MENTION_PATH.test(decodeURIComponent(path).normalize("NFKC"));
   } catch {
-    return false;
+    return true;
   }
 }

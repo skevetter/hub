@@ -25,9 +25,13 @@ it.each(hazards)("bounds Markdown work for repeated %s", (shape) => {
   }
 });
 
-it("renders deeply nested blockquotes as escaped plain text", () => {
-  const body = formatRunReply({ text: `${"> ".repeat(2_000)}Answer @bob`, truncated: false }, []);
-  assert.match(body, /^\\> \\>/u);
+it.each([
+  ["> ", "\\> "],
+  ["- ", "\\- "],
+  ["1. ", "1\\. "],
+])("renders deeply nested %s containers as escaped plain text", (marker, escaped) => {
+  const body = formatRunReply({ text: `${marker.repeat(2_000)}Answer @bob`, truncated: false }, []);
+  assert.ok(body.startsWith(escaped.repeat(2)));
   assert.ok(body.length <= 3_500);
   assert.doesNotMatch(body, /[@\uFF20]/u);
 });
