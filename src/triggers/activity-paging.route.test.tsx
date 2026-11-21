@@ -17,10 +17,13 @@ import { routeTree } from "../routeTree.gen.js";
 import { Route as RootRoute } from "../routes/__root.js";
 import { Route as ShellRoute } from "../routes/_shell.js";
 import { dashboardWithRuns } from "../test-utils/activity-dashboard.js";
+import type { ActivityFilters } from "./activity-query.js";
+
+type ActivityRequest = ActivityFilters & { limit: number; cursor?: string | undefined };
 
 const state = vi.hoisted(() => ({
-  serve: null as null | ((cursor: string | undefined) => Promise<unknown>),
-  requests: [] as (string | undefined)[],
+  serve: null as null | ((input: ActivityRequest) => Promise<unknown>),
+  requests: [] as ActivityRequest[],
 }));
 
 vi.mock("@tanstack/react-start", async (importOriginal) => ({
@@ -30,14 +33,14 @@ vi.mock("@tanstack/react-start", async (importOriginal) => ({
 
 vi.mock("../projects/context.js", async (importOriginal) => ({
   ...(await importOriginal<typeof ProjectContext>()),
-  useRouteTenant: () => ({ organization: { slug: "acme" } }),
+  useRouteTenant: () => ({ account: { id: "account-1" }, organization: { slug: "acme" } }),
 }));
 
 vi.mock("./functions.js", async (importOriginal) => ({
   ...(await importOriginal<typeof Functions>()),
-  triggerActivityPage: async ({ data }: { data: { cursor?: string } }) => {
-    state.requests.push(data.cursor);
-    return respondOk(await state.serve!(data.cursor));
+  triggerActivityPage: async ({ data }: { data: ActivityRequest }) => {
+    state.requests.push(data);
+    return respondOk(await state.serve!(data));
   },
 }));
 
@@ -70,11 +73,7 @@ describe("activity paging through the router", () => {
   async function setup() {
     const fixture = await dashboardWithRuns(TOTAL);
     const request = new Request("https://hub.test/o/acme/activity");
-    state.serve = (cursor) =>
-      fixture.dashboard.activityPage(request, "acme", {
-        limit: 25,
-        ...(cursor === undefined ? {} : { cursor }),
-      });
+    state.serve = (input) => fixture.dashboard.activityPage(request, "acme", input);
     return { ...fixture, request };
   }
 
@@ -108,25 +107,25 @@ describe("activity paging through the router", () => {
     new RegExp(`href="([^"]+)"[^>]*>${label}</a>`, "u").exec(html)?.[1]?.replaceAll("&amp;", "&");
   const runIds = (html: string) =>
     [...html.matchAll(/\/activity\/([0-9a-f-]{36})"/gu)].map((match) => match[1]);
-  const summary = (html: string) => /Showing[^<]*/u.exec(html)?.[0];
+  const summary = (html: string) => />(\d+ to \d+)</u.exec(html)?.[1];
 
   it("follows Older and Newer across the whole list", async () => {
     const { dashboard, request } = await setup();
     const everything = (await dashboard.activityPage(request, "acme", { limit: 100 })).activity.map(
       ({ id }) => id,
     );
-    const { follow, render } = await open("/o/acme/activity");
+    const { follow, render } = await open("/o/acme/activity?size=25");
     const first = render();
-    assert.equal(summary(first), "Showing the newest 25 runs");
+    assert.equal(summary(first), "1 to 25");
     assert.deepEqual(runIds(first), everything.slice(0, 25));
     assert.match(first, /<button[^>]*disabled[^>]*>Newer/u);
 
     const second = await follow("Older");
-    assert.equal(summary(second), "Showing 25 runs");
+    assert.equal(summary(second), "26 to 50");
     assert.deepEqual(runIds(second), everything.slice(25, 50));
 
     const third = await follow("Older");
-    assert.equal(summary(third), "Showing 10 runs");
+    assert.equal(summary(third), "51 to 60");
     assert.deepEqual(runIds(third), everything.slice(50));
     assert.match(third, /<button[^>]*disabled[^>]*>Older/u);
 
@@ -140,19 +139,19 @@ describe("activity paging through the router", () => {
     const before = (await dashboard.activityPage(request, "acme", { limit: 100 })).activity.map(
       ({ id }) => id,
     );
-    const { follow, router } = await open("/o/acme/activity");
+    const { follow, router } = await open("/o/acme/activity?size=25");
     const second = await follow("Older");
     assert.deepEqual(runIds(second), before.slice(25, 50));
 
     await addRuns(5);
     const newer = await follow("Newer");
     assert.deepEqual(runIds(newer), before.slice(0, 25));
-    assert.equal(summary(newer), "Showing 25 runs");
+    assert.equal(summary(newer), "6 to 30");
     assert.equal(router.state.location.search.cursor !== undefined, true);
 
     const live = await follow("Newer");
-    assert.equal(summary(live), "Showing the newest 25 runs");
-    assert.deepEqual({ ...router.state.location.search }, {});
+    assert.equal(summary(live), "1 to 25");
+    assert.deepEqual({ ...router.state.location.search }, { size: 25 });
   });
 
   it("shows the same rows when a page address is reloaded", async () => {
@@ -161,7 +160,7 @@ describe("activity paging through the router", () => {
     const second = await follow("Older");
     const reloaded = await open(router.state.location.href);
     assert.deepEqual(runIds(reloaded.render()), runIds(second));
-    assert.equal(summary(reloaded.render()), "Showing 25 runs");
+    assert.equal(summary(reloaded.render()), "16 to 30");
   });
 
   it("drops a cursor the server could not use and returns to the live first page", async () => {
@@ -179,8 +178,25 @@ describe("activity paging through the router", () => {
       const { router, render } = await open(`/o/acme/activity?cursor=${cursor}`);
       assert.deepEqual({ ...router.state.location.search }, {}, cursor);
       assert.deepEqual(runIds(render()), newest);
-      assert.equal(summary(render()), "Showing the newest 25 runs");
+      assert.equal(summary(render()), "1 to 15");
     }
+  });
+
+  it("preserves filters and size when paging and removes an incompatible cursor", async () => {
+    await setup();
+    const { follow, router, render } = await open("/o/acme/activity?status=running&size=25");
+    assert.equal(runIds(render()).length, 25);
+    assert.equal(summary(await follow("Older")), "26 to 50");
+    const { cursor } = router.state.location.search;
+    assert.deepEqual({ ...router.state.location.search }, { status: "running", size: 25, cursor });
+    const changed = await open(
+      `/o/acme/activity?status=running&provider=manual&size=25&cursor=${cursor}`,
+    );
+    assert.equal(summary(changed.render()), "1 to 25");
+    assert.deepEqual(
+      { ...changed.router.state.location.search },
+      { status: "running", provider: "manual", size: 25 },
+    );
   });
 
   it("ignores a page number in the address", async () => {
@@ -209,7 +225,7 @@ describe("activity paging through the router", () => {
     const during = render();
     assert.match(during, /<nav[^>]*aria-busy="true"/u);
     assert.match(during, /aria-disabled="true"[^>]*>Older/u);
-    assert.equal(summary(during), "Showing the newest 25 runs");
+    assert.equal(summary(during), "1 to 15");
     release();
     await pending;
     assert.match(render(), /<nav[^>]*aria-busy="false"/u);

@@ -4723,10 +4723,13 @@ class MemoryDatabase implements Database {
     scopes: readonly ActivityRunScope[],
     request: ActivityRunPageRequest,
   ): Promise<ActivityRunPageRecord> {
+    const { createdSince, provider, status } = request;
     const records = [...this.triggerRuns.values()]
       .filter(
         (run) =>
           run.organizationId === organizationId &&
+          (status === undefined || run.status === status) &&
+          (createdSince === undefined || run.createdAt >= createdSince) &&
           scopes.some(
             ({ projectId, triggerName }) =>
               projectId === run.projectId &&
@@ -4734,6 +4737,16 @@ class MemoryDatabase implements Database {
           ),
       )
       .flatMap((run) => this.activityListRecord(run) ?? [])
+      .filter(({ receipt }) => {
+        const sourceProvider =
+          receipt.provider === "manual" && receipt.source === "webhook.received"
+            ? "webhook"
+            : receipt.provider;
+        return (
+          receipt.organizationId === organizationId &&
+          (provider === undefined || sourceProvider === provider)
+        );
+      })
       .sort((left, right) => compareRunsNewestFirst(runOrder(left.run), runOrder(right.run)));
     const bound = request.position;
     const boundMicros =
@@ -4752,22 +4765,21 @@ class MemoryDatabase implements Database {
         : inRange.slice(0, request.limit);
     const first = page[0]?.run;
     const last = page.at(-1)?.run;
+    const newerCount =
+      first === undefined ? 0 : records.findIndex(({ run }) => run.id === first.id);
     const key = (run: { createdAt: Date; id: string }) => ({
       createdAt: run.createdAt.toISOString(),
       id: run.id,
     });
     return {
       records: page,
+      newerCount,
       older:
         last !== undefined &&
         records.some(({ run }) => compareRunsNewestFirst(runOrder(run), runOrder(last)) > 0)
           ? key(last)
           : null,
-      newer:
-        first !== undefined &&
-        records.some(({ run }) => compareRunsNewestFirst(runOrder(run), runOrder(first)) < 0)
-          ? key(first)
-          : null,
+      newer: first !== undefined && newerCount > 0 ? key(first) : null,
     };
   }
 

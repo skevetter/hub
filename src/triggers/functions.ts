@@ -5,7 +5,8 @@ import { respondError, respondOk, type Result } from "../contract/respond.js";
 import { respondWithFailure } from "../failures/index.js";
 import type { BrowserStopResult } from "./run-stop.js";
 import { getApplication } from "../server/runtime.js";
-import { ACTIVITY_PAGE_SIZE_MAX } from "./activity-cursor.js";
+import { PAGE_SIZES } from "../components/app/page-size.js";
+import { activityFiltersSchema } from "./activity-query.js";
 import type { TriggerDashboard } from "./dashboard.js";
 
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
@@ -98,29 +99,26 @@ export const triggerSnapshot = createServerFn({ method: "GET" })
     }
   });
 
-const activityPageSchema = scopeSchema.extend({
-  limit: z.number().int().min(1).max(ACTIVITY_PAGE_SIZE_MAX).optional(),
+const activityPageSchema = scopeSchema.extend(activityFiltersSchema.shape).extend({
+  limit: z.number().int().min(1).max(PAGE_SIZES[3]).optional(),
   cursor: z.string().optional(),
 });
 
 export const triggerActivityPage = createServerFn({ method: "GET" })
   .validator(activityPageSchema)
-  .handler(async ({ data }): Promise<Result<TriggerActivityPage>> => {
-    try {
-      const dashboard = (await getApplication()).triggerDashboard;
-      if (dashboard == null) throw new Error("trigger dashboard unavailable");
-      return respondOk(
-        await dashboard.activityPage(getRequest(), data.organizationSlug, {
-          ...(data.limit === undefined ? {} : { limit: data.limit }),
-          ...(data.cursor === undefined ? {} : { cursor: data.cursor }),
-        }),
-      );
-    } catch (error) {
-      return respondWithFailure(error, triggerContext("activity.list", data.organizationSlug), {
-        fallback: "Hub couldn't load trigger activity.",
-      });
-    }
-  });
+  .handler(
+    async ({ data: { organizationSlug, ...input } }): Promise<Result<TriggerActivityPage>> => {
+      try {
+        const dashboard = (await getApplication()).triggerDashboard;
+        if (dashboard == null) throw new Error("trigger dashboard unavailable");
+        return respondOk(await dashboard.activityPage(getRequest(), organizationSlug, input));
+      } catch (error) {
+        return respondWithFailure(error, triggerContext("activity.list", organizationSlug), {
+          fallback: "Hub couldn't load trigger activity.",
+        });
+      }
+    },
+  );
 
 export const saveTrigger = createServerFn({ method: "POST" })
   .validator(saveSchema)

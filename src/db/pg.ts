@@ -2815,7 +2815,12 @@ class PgDatabase implements Database {
     scopes: readonly ActivityRunScope[],
     request: ActivityRunPageRequest,
   ): Promise<ActivityRunPageRecord> {
-    if (scopes.length === 0) return { records: [], older: null, newer: null };
+    if (scopes.length === 0) return { records: [], newerCount: 0, older: null, newer: null };
+    const scopeParams: unknown[] = [
+      organizationId,
+      scopes.map(({ projectId }) => projectId),
+      scopes.map(({ triggerName }) => triggerName ?? null),
+    ];
     const scoped = `from trigger_runs runs
        join provider_event_receipts receipts
          on receipts.id = runs.provider_event_receipt_id
@@ -2824,12 +2829,9 @@ class PgDatabase implements Database {
          and exists (
            select 1 from unnest($2::uuid[], $3::text[]) as scope(project_id, trigger_name)
            where scope.project_id = runs.project_id
-             and (scope.trigger_name is null or scope.trigger_name = runs.configured_trigger_name))`;
-    const scopeParams = [
-      organizationId,
-      scopes.map(({ projectId }) => projectId),
-      scopes.map(({ triggerName }) => triggerName ?? null),
-    ];
+             and (scope.trigger_name is null or scope.trigger_name = runs.configured_trigger_name))
+       ${activityRunFilterSql(request, scopeParams)}`;
+    const boundary = `($${scopeParams.length + 1}::timestamptz, $${scopeParams.length + 2}::uuid)`;
     // The null ordering matches the index; both columns are not null, so it changes no row order.
     const position = request.position;
     const after = position?.direction === "after";
@@ -2847,10 +2849,10 @@ class PgDatabase implements Database {
               end as webhook_actor,
               runs.created_at::text as page_created_at
        ${scoped}
-       ${position === undefined ? "" : `and (runs.created_at, runs.id) ${after ? ">" : "<"} ($4::timestamptz, $5::uuid)`}
+       ${position === undefined ? "" : `and (runs.created_at, runs.id) ${after ? ">" : "<"} ${boundary}`}
        order by runs.created_at ${after ? "asc nulls first" : "desc nulls last"},
                 runs.id ${after ? "asc nulls first" : "desc nulls last"}
-       limit $${position === undefined ? 4 : 6}`,
+       limit $${scopeParams.length + (position === undefined ? 1 : 3)}`,
       position === undefined
         ? [...scopeParams, request.limit + 1]
         : [...scopeParams, position.key.createdAt, position.key.id, request.limit + 1],
@@ -2860,24 +2862,36 @@ class PgDatabase implements Database {
     if (after) page.reverse();
     const first = page[0];
     const last = page.at(-1);
-    // The side a cursor came from is probed, not assumed: its rows may since have been deleted.
-    const exists = async (row: typeof first, newer: boolean) => {
-      if (row === undefined) return false;
-      const found = await query(
-        this.pool,
-        `select 1 ${scoped} and (runs.created_at, runs.id) ${newer ? ">" : "<"} ($4::timestamptz, $5::uuid) limit 1`,
-        [...scopeParams, row.page_created_at, row.id],
-      );
-      return found.rows.length > 0;
-    };
-    const hasNewer = after ? more : position !== undefined && (await exists(first, true));
-    const hasOlder = after ? await exists(last, false) : more;
+    // A keyset stays adjacent after inserts, so the display range comes from the current key.
+    const newerCount =
+      first === undefined || position === undefined || (after && !more)
+        ? 0
+        : Number(
+            (
+              await query<{ count: string }>(
+                this.pool,
+                `select count(*) ${scoped} and (runs.created_at, runs.id) > ${boundary}`,
+                [...scopeParams, first.page_created_at, first.id],
+              )
+            ).rows[0]?.count ?? 0,
+          );
+    const hasOlder = after
+      ? last !== undefined &&
+        (
+          await query(
+            this.pool,
+            `select 1 ${scoped} and (runs.created_at, runs.id) < ${boundary} limit 1`,
+            [...scopeParams, last.page_created_at, last.id],
+          )
+        ).rows.length > 0
+      : more;
     const keyOf = (row: typeof first) =>
       row === undefined ? null : { createdAt: row.page_created_at, id: row.id };
     return {
       records: page.map((row) => this.toProjectActivityRunList(row)),
+      newerCount,
       older: hasOlder ? keyOf(last) : null,
-      newer: hasNewer ? keyOf(first) : null,
+      newer: newerCount > 0 ? keyOf(first) : null,
     };
   }
 
@@ -5629,6 +5643,25 @@ interface WorkflowWakeupRow extends QueryRow {
   trigger_run_id: string;
   available_at: Date;
   lease_expires_at: Date | null;
+}
+
+function activityRunFilterSql(request: ActivityRunPageRequest, params: unknown[]): string {
+  const filters: string[] = [];
+  if (request.status !== undefined) {
+    filters.push(`and runs.status = $${params.push(request.status)}`);
+  }
+  if (request.createdSince !== undefined) {
+    filters.push(
+      `and runs.created_at >= $${params.push(request.createdSince.toISOString())}::timestamptz`,
+    );
+  }
+  if (request.provider === "webhook") {
+    filters.push("and receipts.provider = 'manual' and receipts.source = 'webhook.received'");
+  } else if (request.provider !== undefined) {
+    filters.push(`and receipts.provider = $${params.push(request.provider)}`);
+    if (request.provider === "manual") filters.push("and receipts.source <> 'webhook.received'");
+  }
+  return filters.join("\n       ");
 }
 
 export function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {

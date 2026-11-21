@@ -29,8 +29,7 @@ export async function dashboardWithRuns(count: number) {
   assert.ok(revision);
   let created = 0;
   const addRuns = async (extra: number) => {
-    // Later runs must be newer by the clock, or ties would reorder them among the earlier ones.
-    await new Promise((resolve) => setTimeout(resolve, 3));
+    const createdAt = new Date(Date.now() + created);
     for (let index = 0; index < extra; index += 1) {
       const receipt = await database.persistManualEvent({
         organizationId: "org-1",
@@ -38,7 +37,7 @@ export async function dashboardWithRuns(count: number) {
         deliveryId: `activity-page-${created}`,
         source: "manual.run",
         payload: {},
-        receivedAt: new Date(),
+        receivedAt: createdAt,
       });
       assert.equal(receipt.status, "accepted");
       if (receipt.status !== "accepted") throw new Error("receipt was not accepted");
@@ -53,6 +52,7 @@ export async function dashboardWithRuns(count: number) {
         triggerContext: {},
         outputContext: {},
         deadlineAt: new Date(Date.now() + 3_600_000),
+        createdAt,
         stepIds: ["run"],
       });
       created += 1;

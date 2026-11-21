@@ -10,11 +10,12 @@ import { projectTriggerForm } from "./configuration/editor.js";
 import { OrganizationTriggerStore } from "./store.js";
 import { notificationStatusView, type NotificationStatusView } from "./notification-status.js";
 import {
-  ACTIVITY_PAGE_SIZE,
-  ACTIVITY_PAGE_SIZE_MAX,
+  activityCursorScope,
   decodeActivityCursor,
   encodeActivityCursor,
 } from "./activity-cursor.js";
+import type { ActivityFilters } from "./activity-query.js";
+import { DEFAULT_PAGE_SIZE, PAGE_SIZES } from "../components/app/page-size.js";
 import { summarizeRecentRuns, type RecentRuns } from "./recent-runs.js";
 import { summarizeTrigger } from "../projects/activity-summary.js";
 import { activityRunDetailView, readActivityExecutions } from "../projects/activity-run-view.js";
@@ -27,6 +28,7 @@ import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
 import type { RunTimelineState } from "../run-timeline/store.js";
 
 const DAY_MS = 24 * 60 * 60_000;
+const ACTIVITY_RANGE_DAYS = { "24h": 1, "7d": 7, "30d": 30 } as const;
 const NOTIFICATION_EVENT = "github.notification";
 
 export interface TriggerDashboardOptions {
@@ -359,22 +361,24 @@ export class TriggerDashboard {
   async activityPage(
     request: Request,
     organizationSlug: string,
-    input: { limit?: number; cursor?: string },
+    input: ActivityFilters & { limit?: number | undefined; cursor?: string | undefined },
   ) {
     const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
       organizationSlug,
     });
-    const limit = Math.min(input.limit ?? ACTIVITY_PAGE_SIZE, ACTIVITY_PAGE_SIZE_MAX);
+    const limit = Math.min(input.limit ?? DEFAULT_PAGE_SIZE, PAGE_SIZES[3]);
     const triggers = await new OrganizationTriggerStore(
       this.database,
       tenant.organization.id,
       this.agentValidator,
     ).list();
     const scoped = await Promise.all(
-      triggers.map(async (trigger) => {
-        const { legacyProjectId, legacyTriggerName } = await this.triggerScopes(trigger);
-        return { trigger, legacyProjectId, legacyTriggerName };
-      }),
+      triggers
+        .filter(({ id }) => input.trigger === undefined || id === input.trigger)
+        .map(async (trigger) => {
+          const { legacyProjectId, legacyTriggerName } = await this.triggerScopes(trigger);
+          return { trigger, legacyProjectId, legacyTriggerName };
+        }),
     );
     const scopes = scoped.flatMap(({ trigger, legacyProjectId, legacyTriggerName }) => [
       { projectId: trigger.runtimeProjectId },
@@ -387,12 +391,23 @@ export class TriggerDashboard {
             },
           ]),
     ]);
+    const { status, provider, range } = input;
+    const createdSince =
+      range === undefined
+        ? undefined
+        : new Date(
+            (this.options.now?.() ?? new Date()).getTime() - ACTIVITY_RANGE_DAYS[range] * DAY_MS,
+          );
     const read = (position: ReturnType<typeof decodeActivityCursor>) =>
       this.database.listOrganizationActivityPage(tenant.organization.id, scopes, {
         limit,
+        ...(status === undefined ? {} : { status }),
+        ...(provider === undefined ? {} : { provider }),
+        ...(createdSince === undefined ? {} : { createdSince }),
         ...(position === undefined ? {} : { position }),
       });
-    const requested = decodeActivityCursor(input.cursor);
+    const cursorScope = activityCursorScope(tenant.organization.id, limit, input);
+    const requested = decodeActivityCursor(input.cursor, cursorScope);
     let page = await read(requested);
     // A page emptied by deletions would strand the reader without controls.
     if (page.records.length === 0 && requested !== undefined) page = await read(undefined);
@@ -408,9 +423,13 @@ export class TriggerDashboard {
     return {
       organization: tenant.organization,
       activity: rows,
+      triggers: triggers.map(({ id, name }) => ({ id, name })),
       limit,
-      nextCursor: page.older === null ? null : encodeActivityCursor("before", page.older),
-      previousCursor: page.newer === null ? null : encodeActivityCursor("after", page.newer),
+      newerCount: page.newerCount,
+      nextCursor:
+        page.older === null ? null : encodeActivityCursor("before", page.older, cursorScope),
+      previousCursor:
+        page.newer === null ? null : encodeActivityCursor("after", page.newer, cursorScope),
     };
   }
 

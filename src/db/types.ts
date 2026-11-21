@@ -23,6 +23,7 @@ import type { JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import type { InvocationRejection } from "../triggers/invocation.js";
 import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
+import type { ListProvider } from "../triggers/list-providers.js";
 import type {
   EntitlementPatch,
   EntitlementTemplate,
@@ -869,12 +870,16 @@ export interface ActivityRunKey {
 
 export interface ActivityRunPageRequest {
   limit: number;
+  status?: TriggerRunRecord["status"];
+  provider?: ListProvider;
+  createdSince?: Date;
   /** `before` reads older than the key, `after` reads newer. No position reads the newest page. */
   position?: { direction: "before" | "after"; key: ActivityRunKey };
 }
 
 export interface ActivityRunPageRecord {
   records: ProjectActivityRunListRecord[];
+  newerCount: number;
   /** Key of the last record when older runs exist. */
   older: ActivityRunKey | null;
   /** Key of the first record when newer runs exist. */

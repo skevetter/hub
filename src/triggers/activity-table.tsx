@@ -4,11 +4,12 @@ import { StatusPill, statusLabel } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import type { TriggerActivityPage } from "./functions.js";
+import type { ComponentProps } from "react";
 
 export const ACTIVITY_COLUMNS = [
   { header: "Trigger", fill: true },
-  { header: "Provider" },
-  { header: "Source" },
+  { header: "Provider", className: "hidden sm:table-cell" },
+  { header: "Source", fill: true, className: "hidden sm:table-cell" },
   { header: "Status" },
   { header: "Received" },
 ];
@@ -17,16 +18,18 @@ const EMPTY_ACTIVITY = { title: "No activity" };
 export function TriggerActivityTable({
   activity,
   organizationSlug,
+  empty = EMPTY_ACTIVITY,
 }: {
   activity: TriggerActivityPage["activity"];
   organizationSlug: string;
+  empty?: ComponentProps<typeof DataTable>["empty"] | undefined;
 }) {
   return (
     <DataTable
       label="Trigger activity"
       columns={ACTIVITY_COLUMNS}
       isEmpty={activity.length === 0}
-      empty={EMPTY_ACTIVITY}
+      empty={empty}
     >
       {activity.map((run) => (
         <DataRow key={run.id}>

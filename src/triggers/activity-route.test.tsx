@@ -13,10 +13,11 @@ import { Route as RootRoute } from "../routes/__root.js";
 import { Route as ShellRoute } from "../routes/_shell.js";
 
 const state = vi.hoisted(() => ({
-  snapshot: null as unknown,
+  snapshot: null as Record<string, unknown> | null,
   queryKeys: [] as unknown[],
   intervals: [] as (number | undefined)[],
   refreshFailure: null as { message: string | null } | null,
+  failed: false,
 }));
 
 vi.mock("@tanstack/react-start", async (importOriginal) => ({
@@ -26,7 +27,7 @@ vi.mock("@tanstack/react-start", async (importOriginal) => ({
 
 vi.mock("../projects/context.js", async (importOriginal) => ({
   ...(await importOriginal<typeof ProjectContext>()),
-  useRouteTenant: () => ({ organization: { slug: "acme team" } }),
+  useRouteTenant: () => ({ account: { id: "account-1" }, organization: { slug: "acme team" } }),
 }));
 
 vi.mock("./functions.js", async (importOriginal) => ({
@@ -46,7 +47,10 @@ vi.mock("../queries/index.js", async (importOriginal) => ({
     state.intervals.push(options.refetchInterval);
     state.queryKeys.push(queryKey);
     const data =
-      queryKey[0] === "run-detail" ? { sequence: 1, value: state.snapshot } : state.snapshot;
+      queryKey[0] === "run-detail"
+        ? { sequence: 1, value: state.snapshot }
+        : { triggers: [], newerCount: 0, ...state.snapshot };
+    if (state.failed) return { status: "error", error: "Fixture unavailable" };
     return { status: "success", data, refetch: () => {}, refreshFailure: state.refreshFailure };
   },
 }));
@@ -125,7 +129,9 @@ describe("organization activity routes", () => {
       assert.match(listing, /lucide-terminal/u);
       assert.ok(
         state.queryKeys.some(
-          (key) => JSON.stringify(key) === JSON.stringify(["activity", "acme team", null]),
+          (key) =>
+            JSON.stringify(key) ===
+            JSON.stringify(["activity", "acme team", { organizationSlug: "acme team", limit: 15 }]),
         ),
       );
 
@@ -148,7 +154,12 @@ describe("organization activity routes", () => {
       assert.ok(
         state.queryKeys.some(
           (key) =>
-            JSON.stringify(key) === JSON.stringify(["activity", "acme team", "older-cursor"]),
+            JSON.stringify(key) ===
+            JSON.stringify([
+              "activity",
+              "acme team",
+              { organizationSlug: "acme team", cursor: "older-cursor", limit: 15 },
+            ]),
         ),
       );
       assert.equal(state.intervals.at(-1), undefined);
@@ -164,7 +175,18 @@ describe("organization activity routes", () => {
       assert.equal(state.intervals.at(-1), 5000);
 
       state.snapshot = { activity: [], nextCursor: null, previousCursor: null };
-      assert.doesNotMatch(await renderRoute("/o/acme%20team/activity"), /Activity pages/u);
+      assert.match(await renderRoute("/o/acme%20team/activity"), /No activity/u);
+      const filtered = await renderRoute("/o/acme%20team/activity?status=failed&size=25");
+      assert.match(filtered, /No runs match these filters/u);
+      assert.match(filtered, /Clear filters/u);
+      assert.match(filtered, /Rows per page/u);
+
+      state.failed = true;
+      assert.match(
+        await renderRoute("/o/acme%20team/activity?status=failed"),
+        /Activity unavailable/u,
+      );
+      state.failed = false;
 
       state.snapshot = null;
       const missing = await renderRoute("/o/acme%20team/activity/missing-run");
@@ -179,6 +201,7 @@ describe("organization activity routes", () => {
         ),
       );
     } finally {
+      state.failed = false;
       if (rootComponent === undefined) delete RootRoute.options.component;
       else RootRoute.options.component = rootComponent;
       if (shellComponent === undefined) delete ShellRoute.options.component;
