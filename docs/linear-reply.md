@@ -37,6 +37,11 @@ It adopts a matching comment and records unconfirmed delivery if it cannot
 verify the comment. Repair only reads from Linear. A restart that loses the
 in-memory answer before any send records a refusal.
 
+When Linear confirms a rate limit before the create ran, Hub can retry once
+with the same UUID within the delivery deadline. It waits for Linear's retry
+delay and checks the target again first. A confirmed rejection appears on the
+run with Linear's refusal reason.
+
 ## Loop protection and limits
 
 Hub ignores comments from the connected Paseo app when matching triggers.

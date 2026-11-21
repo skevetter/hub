@@ -1,7 +1,7 @@
 import type { ProgressCredentialCooldown } from "../run-timeline/store.js";
 import type { CredentialLocator, ProgressCall } from "./types.js";
 
-const MAX_RETRY_AFTER = 900_000;
+export const MAX_RETRY_AFTER = 900_000;
 export const CREDENTIAL_CIRCUIT_MS = 600_000;
 const MAX_IN_FLIGHT = 4;
 const WRITE_SPACING_MS = 1_000;

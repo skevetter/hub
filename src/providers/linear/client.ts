@@ -16,6 +16,7 @@ const LINEAR_ACCESS_TOKEN_REFRESH_SKEW_MS = 60_000;
 const LINEAR_RESPONSE_BODY_LIMIT_BYTES = 1024 * 1024;
 const LINEAR_RESPONSE_BODY_TIMEOUT_MS = 5_000;
 const LINEAR_HEADER_FAILURE_STATUSES = new Set([401, 403, 404]);
+export const DEFAULT_LINEAR_RETRY_AFTER_MS = 30_000;
 
 const LinearTokenResponseSchema = z
   .object({
@@ -101,6 +102,18 @@ const CommentCreateResponseSchema = z.object({
   }),
 });
 
+const CommentCreateRejectionSchema = z.object({
+  data: z.null(),
+  errors: z
+    .array(
+      z.object({
+        path: z.tuple([z.literal("commentCreate")]),
+        extensions: z.object({ code: z.string().optional(), type: z.string().optional() }),
+      }),
+    )
+    .nonempty(),
+});
+
 const CommentResponseSchema = z.object({
   data: z.object({
     comment: z
@@ -129,6 +142,7 @@ export class LinearApiError extends Error {
     readonly retryAfterMs?: number,
     readonly rateLimitBeforeExecution = false,
     readonly graphqlCodes: readonly string[] = [],
+    readonly graphqlRejected = false,
   ) {
     super(message);
     this.name = "LinearApiError";
@@ -816,11 +830,19 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
     rateLimited !== undefined || response.status === 429
       ? linearRetryAfterMs(response.headers, now().getTime())
       : undefined;
+  const beforeExecution =
+    !hasResponseField(result, "data") &&
+    !rawErrors.some((entry) => hasResponseField(entry, "path"));
   const rateLimitBeforeExecution =
     rateLimited !== undefined &&
     (response.status === 400 || response.status === 429) &&
-    !hasResponseField(result, "data") &&
-    !rawErrors.some((entry) => hasResponseField(entry, "path"));
+    beforeExecution;
+  const graphqlRejected =
+    (beforeExecution &&
+      errors.length > 0 &&
+      errors.length === rawErrors.length &&
+      errors.every(({ message }) => Boolean(message))) ||
+    rejectedCommentCreate(response.status, result);
   throw new LinearApiError(
     response.ok
       ? `Linear GraphQL ${error?.message ?? "response contained errors"}`
@@ -830,6 +852,20 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
     delay,
     rateLimitBeforeExecution,
     codes,
+    graphqlRejected,
+  );
+}
+
+function rejectedCommentCreate(status: number, result: unknown): boolean {
+  // The non-null mutation field bubbles a root error up to null data.
+  const rejected = CommentCreateRejectionSchema.safeParse(result);
+  return (
+    rejected.success &&
+    rejected.data.errors.every(
+      ({ extensions }) =>
+        extensions.type === "invalid input" ||
+        (status === 429 && extensions.code?.toUpperCase() === "RATELIMITED"),
+    )
   );
 }
 

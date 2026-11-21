@@ -61,6 +61,8 @@ export function fakeLinearReplies(organizationId: string, database: Database) {
   ]);
   const calls: string[] = [];
   const writes: string[] = [];
+  const creates: { id: string; body: string }[] = [];
+  const createResponses: Response[] = [];
   let loseResponse = false;
   const client = createLinearApiClient({
     connectionForLinearOrganization,
@@ -77,7 +79,12 @@ export function fakeLinearReplies(organizationId: string, database: Database) {
         const { id, issueId, body } = variables;
         if (id === undefined || issueId === undefined || body === undefined)
           throw new Error("reply mutation must use a reserved UUID");
+        if (!query.includes("id: $id, doNotSubscribeToIssue: true"))
+          throw new Error("reply mutation must use the reserved UUID and skip subscription");
         calls.push("create");
+        creates.push({ id, body });
+        const rejected = createResponses.shift();
+        if (rejected !== undefined) return rejected;
         writes.push(body);
         comments.set(id, {
           id,
@@ -104,6 +111,8 @@ export function fakeLinearReplies(organizationId: string, database: Database) {
     comments,
     calls,
     writes,
+    creates,
+    createResponses,
     loseCreateResponse() {
       loseResponse = true;
     },

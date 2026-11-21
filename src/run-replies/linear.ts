@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { AcceptedTriggerRunRecord, Database, LinearConnectionRecord } from "../db/types.js";
 import {
+  DEFAULT_LINEAR_RETRY_AFTER_MS,
   LinearApiError,
   LinearCredentialError,
   authorizeLinearCommentConnection,
@@ -9,6 +10,7 @@ import {
   type LinearApiClient,
   type LinearCommentWriteOptions,
 } from "../providers/linear/client.js";
+import { MAX_RETRY_AFTER } from "../run-progress/backoff.js";
 import { LinearOutputContextSchema } from "../triggers/linear/provider.js";
 import { formatRunReply, type FinalReplyAnswer } from "./format.js";
 import { hasLinearRunReplyMarker, linearRunReplyMarker } from "./marker.js";
@@ -81,7 +83,11 @@ export class LinearRunReplyWriter {
     });
     if (reservation !== "reserved") return;
 
-    const created = await this.create(target, delivery.commentId, body);
+    const firstAttempt = await this.create(target, delivery.commentId, body);
+    const created =
+      typeof firstAttempt === "number"
+        ? await this.retryCreate(target, delivery, body, firstAttempt)
+        : firstAttempt;
     if (created !== undefined)
       await runReplies.finish({ ...key, from: "sending", failure: created });
   }
@@ -104,7 +110,11 @@ export class LinearRunReplyWriter {
     });
   }
 
-  private async create(target: ReplyTarget, commentId: string, body: string) {
+  private async create(
+    target: ReplyTarget,
+    commentId: string,
+    body: string,
+  ): Promise<RunReplyFailure | null | undefined | number> {
     const { linearOrganizationId, issueId, authorization } = target;
     try {
       const created = await this.options.client.createComment(
@@ -116,12 +126,40 @@ export class LinearRunReplyWriter {
       if (error instanceof LinearCredentialError) return credentialFailure(error);
       if (error instanceof LinearApiError) {
         if (error.status === 404) return "target_mismatch";
-        if ([401, 403].includes(error.status) || error.rateLimitBeforeExecution)
-          return "provider_rejected";
+        if ([401, 403].includes(error.status)) return "provider_rejected";
+        if (error.rateLimitBeforeExecution)
+          return error.retryAfterMs ?? DEFAULT_LINEAR_RETRY_AFTER_MS;
+        if (error.graphqlRejected) {
+          return error.status === 429 || error.graphqlCodes.includes("RATELIMITED")
+            ? "provider_rate_limited"
+            : "provider_rejected";
+        }
       }
       // A transport or response error can follow a committed comment.
       return undefined;
     }
+  }
+
+  private async retryCreate(
+    target: ReplyTarget,
+    { organizationId, runId, commentId }: RunReplyRecord,
+    body: string,
+    afterMs: number,
+  ) {
+    const { signal } = target.authorization;
+    try {
+      await waitForRetry(afterMs, signal);
+      const run = await this.options.database.findTriggerRunForOrganization(organizationId, runId);
+      if (run?.outcome !== "accepted" || run.payloadExpiryState != null) return "target_mismatch";
+      if (run.status !== "succeeded") return "run_unsuccessful";
+      if (!(await this.verifyTarget(target))) return "target_mismatch";
+      signal.throwIfAborted();
+    } catch (error) {
+      if (signal.aborted) return "provider_rate_limited";
+      return error instanceof LinearCredentialError ? credentialFailure(error) : "target_mismatch";
+    }
+    const result = await this.create(target, commentId, body);
+    return typeof result === "number" ? "provider_rate_limited" : result;
   }
 
   private async findPostedReply(
@@ -274,4 +312,18 @@ function credentialFailure(error: LinearCredentialError): RunReplyFailure {
 
 function hash(text: string) {
   return createHash("sha256").update(text).digest("hex");
+}
+
+async function waitForRetry(afterMs: number, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const timer = setTimeout(resolve, Math.min(afterMs, MAX_RETRY_AFTER));
+  const abort = () => reject(signal.reason);
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    await promise;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", abort);
+  }
 }

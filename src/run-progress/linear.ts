@@ -1,5 +1,6 @@
 import type { Database, LinearConnectionRecord } from "../db/types.js";
 import {
+  DEFAULT_LINEAR_RETRY_AFTER_MS,
   LinearApiError,
   LinearCredentialError,
   LinearTransportError,
@@ -176,7 +177,7 @@ function mapWriteError(error: unknown): ProgressCall {
 function rateLimited(error: LinearApiError): ProgressCall {
   return {
     status: "retry",
-    afterMs: error.retryAfterMs ?? 30_000,
+    afterMs: error.retryAfterMs ?? DEFAULT_LINEAR_RETRY_AFTER_MS,
     notCreated: error.rateLimitBeforeExecution,
   };
 }

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import { LinearRunReplyWriter } from "./linear.js";
 import { fakeLinearReplies, replyEvidence } from "./test-utils/linear.js";
@@ -45,7 +45,8 @@ async function fixture(options: { differentTarget?: boolean; canceled?: boolean 
   const key = { organizationId: run.organizationId, runId: run.id };
   return {
     ...fake,
-    send: (text: string) => writer.post(finishedRun, { text, truncated: false }, 60, signal),
+    send: (text: string, abort = signal) =>
+      writer.post(finishedRun, { text, truncated: false }, 60, abort),
     delivery: () => database.runReplies.find(key),
     async repair() {
       const delivery = await database.runReplies.find(key);
@@ -199,6 +200,137 @@ ${"line from the answer\n".repeat(250)}`;
     await send("![image](https://example.com/pic.png)");
     assert.deepEqual(calls, []);
     assert.equal((await delivery())?.failure, "empty_answer");
+  });
+
+  it.each([200, 400])(
+    "records HTTP %i GraphQL request validation as a rejection",
+    async (status) => {
+      const { send, writes, delivery, createResponses } = await fixture();
+      createResponses.push(
+        Response.json(
+          {
+            errors: [
+              { message: "Invalid input", extensions: { code: "GRAPHQL_VALIDATION_FAILED" } },
+            ],
+          },
+          { status },
+        ),
+      );
+      await send("Answer.");
+      assert.equal(writes.length, 0);
+      const result = await delivery();
+      assert.equal(result?.state, "refused");
+      assert.equal(result.failure, "provider_rejected");
+    },
+  );
+
+  const rateLimit = { message: "Try again later", extensions: { code: "RATELIMITED" } };
+
+  it("uses Retry-After before retrying a rejected create with the same reserved UUID", async () => {
+    vi.useFakeTimers();
+    try {
+      const { send, creates, writes, delivery, createResponses } = await fixture();
+      createResponses.push(
+        Response.json({ errors: [rateLimit] }, { status: 429, headers: { "retry-after": "2" } }),
+      );
+      const posting = send("Answer.");
+      await vi.advanceTimersByTimeAsync(1_999);
+      assert.equal(creates.length, 1);
+      assert.equal(writes.length, 0);
+      await vi.advanceTimersByTimeAsync(1);
+      await posting;
+      assert.equal(creates.length, 2);
+      assert.deepEqual(creates[0], creates[1]);
+      assert.equal(writes.length, 1);
+      const result = await delivery();
+      assert.equal(result?.state, "sent");
+      assert.equal(result.commentId, creates[0]?.id);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["retry rejected", "retry canceled"])(
+    "records a rate limit when the %s",
+    async (outcome) => {
+      vi.useFakeTimers();
+      try {
+        const { send, creates, writes, delivery, createResponses } = await fixture();
+        const response = () => Response.json({ errors: [rateLimit] }, { status: 429 });
+        createResponses.push(response(), response());
+        const abort = new AbortController();
+        const posting = send("Answer.", abort.signal);
+        await vi.advanceTimersByTimeAsync(29_999);
+        assert.equal(creates.length, 1);
+        if (outcome === "retry canceled") abort.abort();
+        await vi.advanceTimersByTimeAsync(1);
+        await posting;
+        assert.equal(creates.length, outcome === "retry canceled" ? 1 : 2);
+        assert.equal(writes.length, 0);
+        const result = await delivery();
+        assert.equal(result?.state, "refused");
+        assert.equal(result.failure, "provider_rate_limited");
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("records a structured HTTP 429 rejecting the commentCreate field as a refusal", async () => {
+    const { send, creates, delivery, createResponses } = await fixture();
+    createResponses.push(
+      Response.json(
+        {
+          data: null,
+          errors: [{ ...rateLimit, path: ["commentCreate"] }],
+        },
+        { status: 429 },
+      ),
+    );
+    await send("Answer.");
+    assert.equal(creates.length, 1);
+    const result = await delivery();
+    assert.equal(result?.state, "refused");
+    assert.equal(result.failure, "provider_rate_limited");
+  });
+
+  it("records Linear's invalid input error on commentCreate as a refusal", async () => {
+    const { send, creates, delivery, createResponses } = await fixture();
+    createResponses.push(
+      Response.json({
+        data: null,
+        errors: [
+          {
+            message: "Invalid comment input",
+            path: ["commentCreate"],
+            extensions: { type: "invalid input" },
+          },
+        ],
+      }),
+    );
+    await send("Answer.");
+    assert.equal(creates.length, 1);
+    const result = await delivery();
+    assert.equal(result?.state, "refused");
+    assert.equal(result.failure, "provider_rejected");
+  });
+
+  it("leaves HTTP 429 after a possibly successful create for repair without a second create", async () => {
+    const reply = await fixture();
+    reply.createResponses.push(
+      Response.json(
+        {
+          data: null,
+          errors: [{ ...rateLimit, path: ["commentCreate", "comment"] }],
+        },
+        { status: 429 },
+      ),
+    );
+    await reply.send("Answer.");
+    assert.equal((await reply.delivery())?.state, "sending");
+    await reply.repair();
+    assert.equal(reply.creates.length, 1);
+    assert.equal((await reply.delivery())?.failure, "delivery_unconfirmed");
   });
 
   it("refuses a canceled run and inconsistent destination before provider access", async () => {

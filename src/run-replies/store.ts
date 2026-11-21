@@ -12,6 +12,7 @@ export const replyFailureLabels = {
   scope_missing: "The Linear connection cannot create comments.",
   body_contains_secret: "The reply could not be sent safely.",
   rate_limited: "This organization reached the reply limit for the last hour.",
+  provider_rate_limited: "Linear rate-limited the comment.",
   provider_rejected: "Linear declined the comment.",
   delivery_unconfirmed: "Hub could not confirm whether Linear received the comment.",
 } as const;
