@@ -115,6 +115,50 @@ test("Trigger filters and page survive opening and saving the editor", async ({ 
   await expect(created).toBeVisible();
 });
 
+test("emptying the name search restores the trigger list", async ({ hub, page }) => {
+  await hub.signUpAs("owner", {
+    name: "Search Owner",
+    email: "trigger-search@example.com",
+    password: "trigger-owner-password",
+  });
+  await hub.createOrganization("owner", "Acme");
+  for (const name of ["sample", "other"]) {
+    await hub.seedLegacyTrigger("owner", name, `name: ${name}\non: manual.run\n`);
+  }
+  await new OrganizationTriggers(page).open();
+  const rows = page.getByRole("table", { name: "Triggers" }).locator("tbody tr");
+  const search = page.getByRole("textbox", { name: "Search triggers" });
+  const filter = /[?&]q=/u;
+  await expect(rows).toHaveCount(2);
+  await page.getByRole("combobox", { name: "State" }).selectOption("enabled");
+  await expect(page).toHaveURL(/[?&]state=enabled/u);
+
+  for (const method of ["Enter", "Search button", "Backspace then Enter"]) {
+    await test.step(method, async () => {
+      await search.fill("sample");
+      await search.press("Enter");
+      await expect(page).toHaveURL(/[?&]q=sample/u);
+      await expect(rows).toHaveCount(1);
+
+      if (method === "Backspace then Enter") {
+        await search.press("ControlOrMeta+a");
+        await search.press("Backspace");
+      } else {
+        await search.fill("");
+      }
+      await expect(search).toHaveValue("");
+      if (method === "Search button") {
+        await page.getByRole("button", { name: "Search", exact: true }).click();
+      } else {
+        await search.press("Enter");
+      }
+      await expect(page).not.toHaveURL(filter);
+      await expect(page).toHaveURL(/[?&]state=enabled/u);
+      await expect(rows).toHaveCount(2);
+    });
+  }
+});
+
 test("remembered size stays silent on reload and when opening either list from the sidebar", async ({
   hub,
   page,

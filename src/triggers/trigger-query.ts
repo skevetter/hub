@@ -22,7 +22,7 @@ function searchText(value: unknown): unknown {
 export const triggerSearchSchema = z.object({
   state: z.enum(["enabled", "disabled"]).optional().catch(undefined),
   provider: z.enum(LIST_PROVIDERS).optional().catch(undefined),
-  q: z.preprocess(searchText, triggerNameSearch).optional().catch(undefined),
+  q: z.preprocess(searchText, triggerNameSearch.optional()).catch(undefined),
   size: z.unknown().transform(parsePageSize).optional(),
   cursor: z.string().min(1).optional().catch(undefined),
 });

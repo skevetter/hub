@@ -37,6 +37,10 @@ vi.mock("../queries/index.js", async (original) => ({
 }));
 
 describe("trigger list search", () => {
+  it("accepts an explicitly cleared name filter", () => {
+    assert.equal(triggerSearchSchema.parse({ q: undefined }).q, undefined);
+  });
+
   it("normalizes filters and bounds literal search text", () => {
     const search = triggerSearchSchema.parse({
       q: "  SAMPLE_%! ",
