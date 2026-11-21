@@ -7,6 +7,7 @@ export const LINEAR_REQUIRED_SCOPES = [
   "app:assignable",
   "app:mentionable",
 ] as const;
+const LINEAR_REQUESTED_SCOPES = [...LINEAR_REQUIRED_SCOPES, "write"] as const;
 
 /** Keep an issue description plus its preceding discussion within one bounded context window. */
 export const LINEAR_ISSUE_CONTEXT_LIMIT = 50;
@@ -270,7 +271,7 @@ export function createLinearConnectionClient(options: {
         client_id: options.clientId,
         redirect_uri: redirectUri,
         response_type: "code",
-        scope: LINEAR_REQUIRED_SCOPES.join(","),
+        scope: LINEAR_REQUESTED_SCOPES.join(","),
         state,
         actor: "app",
         prompt: "consent",

@@ -17,6 +17,7 @@ import type {
 import { BrowserGitHubConfiguration } from "../e2e/harness/browser-providers.js";
 import { createGitHubRegistration } from "../providers/github/index.js";
 import { createDiscordRegistration } from "../providers/discord/index.js";
+import { createLinearRegistration } from "../providers/linear/index.js";
 import type { ProviderRegistration } from "../providers/registration.js";
 import { MemoryDiscordBotClient } from "../triggers/discord/memory-bot.js";
 
@@ -151,6 +152,78 @@ describe("provider connection facades PostgreSQL authority", () => {
       github: { status: "unbound" },
       discord: { status: "unbound" },
     });
+  });
+
+  it("requests Linear write access and stores the grants from each authorization", async () => {
+    await pool.query(
+      `insert into runtime_provider_activation
+         (provider, provider_application_id, configuration_version)
+       values ('linear', 'linear-client', 0)`,
+    );
+    const requiredScopes = ["app:assignable", "app:mentionable", "comments:create", "read"];
+    let grantedScopes = requiredScopes;
+    const origin = "https://hub.example.test";
+    const linear = createLinearRegistration({
+      database,
+      auth,
+      applicationBaseUrl: origin,
+      publicBaseUrl: origin,
+      configuration: {
+        clientId: "linear-client",
+        clientSecret: "fake-client-secret",
+        webhookSecret: TEST_WEBHOOK_SECRET,
+      },
+      fetch: async (url) => {
+        if (url === "https://api.linear.app/oauth/token") {
+          return Response.json({
+            access_token: "fake-access-token",
+            scope: grantedScopes.join(","),
+          });
+        }
+        assert.equal(url, "https://api.linear.app/graphql");
+        return Response.json({
+          data: { viewer: { id: "app-user", organization: { id: "linear-org", name: "Acme" } } },
+        });
+      },
+    });
+    const fixture = { ...connections, registrations: [linear] };
+
+    async function authorize() {
+      const response = await connectionAction(
+        fixture,
+        request("/start", "POST"),
+        "linear",
+        "start",
+      );
+      assert.equal(response.status, 200);
+      const body: unknown = await response.json();
+      assert(isUrlBody(body));
+      const { searchParams } = new URL(body.url);
+      assert.deepEqual(searchParams.get("scope")?.split(",").sort(), [...requiredScopes, "write"]);
+      const state = searchParams.get("state");
+      assert(state !== null);
+      const callback = new URL("/api/integrations/linear/callback", origin);
+      callback.searchParams.set("state", state);
+      callback.searchParams.set("code", "fake-code");
+      assert.equal(
+        result(await connectionAction(fixture, new Request(callback), "linear", "callback")),
+        "linear_connected",
+      );
+      const connection = await database.findLinearConnection("linear-org");
+      assert(connection !== undefined);
+      assert.deepEqual(connection.scopes, grantedScopes);
+      assert.deepEqual(
+        linear.connection.status({ github: [], discord: [], slack: [], linear: [connection] }),
+        { status: "connected" },
+      );
+      return connection.id;
+    }
+
+    const id = await authorize();
+    grantedScopes = [...requiredScopes, "write"];
+    assert.equal(await authorize(), id);
+    grantedScopes = requiredScopes;
+    assert.equal(await authorize(), id);
   });
 
   it("fails closed for role changes, expiry, active-organization changes, and cross-tenant conflicts", async () => {

@@ -663,7 +663,8 @@ export const LINEAR_GUIDE: ProviderGuide = {
     connect: "Connect a Linear workspace",
     connectAgain: "Connect another workspace",
   },
-  saveHint: "Linear asks an administrator to authorize the app before anything is saved.",
+  saveHint:
+    "Linear asks an administrator to authorize the app before anything is saved. Hub requests write access to update the run progress comment.",
   requiresHttps: true,
   httpsRequirement: (origin) =>
     `Linear webhooks need HTTPS, and Hub is at ${origin}. Reopen Hub at its public HTTPS address to set up Linear.`,

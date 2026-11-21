@@ -2,11 +2,13 @@
 
 ## Installation and reauthorization
 
-Hub installs its OAuth application with `actor=app`. It requests `read`, `comments:create`, `app:assignable` and `app:mentionable`. The agent scopes allow the installed app user to appear in delegation and mention pickers. Hub does not request `write` or `admin`.
+Hub installs its OAuth application with `actor=app`. It requests `read`, `comments:create`, `app:assignable`, `app:mentionable` and `write` on new authorizations and reconnects. The agent scopes allow the installed app user to appear in delegation and mention pickers. Hub uses `write` to update the run progress comment.
 
 Every authorization URL includes `prompt=consent`. Linear documents this parameter as showing the consent screen even when scopes were already granted, so an administrator can choose another workspace. See [OAuth authentication](https://linear.app/developers/oauth-2-0-authentication) and [agent scopes](https://linear.app/developers/agents).
 
-Existing connection records retain their stored scopes. No database migration or automatic scope grant occurs. A connection missing any required scope needs reauthorization, even if its token can still refresh. The Connections page shows "Linear reauthorization required". The Apps inventory shows that action is needed. Reconnect each workspace to grant the new scopes. Until then, webhook events are acknowledged and durably dropped with `configuration_unavailable`. Reconnecting does not replay those dropped deliveries.
+Connections with the four required scopes can keep running workflows. To enable progress comments on an existing connection, reconnect the workspace and grant `write`.
+
+A connection missing any of the other four scopes needs reauthorization, even if its token can still refresh. The Connections page shows "Linear reauthorization required". The Apps inventory shows that action is needed. Until the required scopes are granted, webhook events are acknowledged and durably dropped with `configuration_unavailable`. Reconnecting does not replay those dropped deliveries.
 
 ## Delegation and assigned triggers
 

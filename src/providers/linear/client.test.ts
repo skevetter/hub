@@ -51,7 +51,7 @@ describe("Linear connection client", () => {
     );
     assert.equal(
       authorization.searchParams.get("scope"),
-      "read,comments:create,app:assignable,app:mentionable",
+      "read,comments:create,app:assignable,app:mentionable,write",
     );
     assert.equal(authorization.searchParams.get("actor"), "app");
     assert.equal(authorization.searchParams.get("state"), "state-value");
@@ -69,7 +69,7 @@ describe("Linear connection client", () => {
     assert.match(requests[0]?.body ?? "", /code=code-value/u);
   });
 
-  it("keeps requested scopes when Linear omits them during authorization", async () => {
+  it("falls back to required scopes when Linear omits them during authorization", async () => {
     const client = createLinearConnectionClient({
       clientId: "client-id",
       clientSecret: "client-secret",
