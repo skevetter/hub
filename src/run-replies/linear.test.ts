@@ -57,6 +57,89 @@ async function fixture(options: { differentTarget?: boolean; canceled?: boolean 
 }
 
 describe("Linear reply writer", () => {
+  const profileUrl = "https://linear.app/acme/profiles/bob";
+
+  it("does not turn a clipped link destination into a Linear profile link", async () => {
+    const { send, writes, delivery } = await fixture();
+    await send(
+      `${"a".repeat(3_400)} [x](<https://example.com/a b ${profileUrl} ${"z".repeat(200)}>)`,
+    );
+    assert.equal((await delivery())?.state, "sent");
+    assert.ok(!writes[0]?.includes(profileUrl), "a profile URL survived the cut");
+  });
+
+  it("keeps part of a long opening code fence and posts metadata outside it", async () => {
+    const { send, writes } = await fixture();
+    await send(`\`\`\`log\n${"One line from the log.\n".repeat(300)}\`\`\``);
+    const markdown = fromMarkdown(writes[0] ?? "");
+    const code = markdown.children[0];
+    assert.equal(code?.type, "code");
+    assert.match(code.value, /One line from the log\./u);
+    assert.deepEqual(
+      markdown.children.slice(1).map(({ type }) => type),
+      ["paragraph", "paragraph"],
+    );
+  });
+
+  it("posts safe Markdown across 2,048 generated documents cut around Markdown constructs", async () => {
+    const user = "&#64;bob";
+    const atoms = [
+      `[x](<https://example.com/a b ${profileUrl} ${"z".repeat(200)}>)`,
+      `[${user}](${profileUrl})`,
+      `[link](https://example.com "${profileUrl} ${user}")`,
+      `[name][${user}]\n\n[${user}]: ${profileUrl}`,
+      `[${user}][]\n\n[${user}]: https://example.com`,
+      `[side note][^${user}]\n\n[^${user}]: ${profileUrl}`,
+      `![@bob](${profileUrl})`,
+      `<${profileUrl}>`,
+      `<!-- ${profileUrl} ${user} -->`,
+      `&lt;user id=bob&gt; @bob ${profileUrl}`,
+      `\`\`\`ts ${user}\n${profileUrl}\n\`\`\``,
+      `\`${profileUrl} ${user}\``,
+      `| Name | URL |\n| --- | --- |\n| ${user} | ${profileUrl} |`,
+      `> **${user}** ~~${profileUrl}~~`,
+      `- ${user}\n  - ${profileUrl}`,
+      `# ${user} ${profileUrl}`,
+    ];
+    const extensions = [gfm()];
+    const mdastExtensions = [gfmFromMarkdown()];
+    for (let index = 0; index < 2_048; index += 1) {
+      const atom = atoms[index % atoms.length]!;
+      const pad = 3_290 + ((index * 1_831) % 221);
+      const separator = index % 3 === 0 ? " " : "\n\n";
+      const { send, writes, delivery } = await fixture();
+      await send(`${"a".repeat(pad)}${separator}${atom}\n\n${"tail ".repeat(80)}`);
+      const result = await delivery();
+      assert.ok(
+        result?.state === "sent" && result.length && result.length <= 3_500,
+        `case ${index}`,
+      );
+      const body = writes[0]!;
+      assert.doesNotMatch(body, /[@\uFF20]/u, `raw mention in case ${index}`);
+      const tree = fromMarkdown(body, { extensions, mdastExtensions });
+      const nodes = [...tree.children];
+      for (const node of nodes) {
+        if ("children" in node) nodes.push(...node.children);
+        if ("value" in node) {
+          assert.doesNotMatch(
+            node.value,
+            /[@\uFF20]|linear\.app\/acme\/profiles(?:\/|$)/iu,
+            `case ${index}`,
+          );
+        }
+        if (node.type === "link") {
+          assert.doesNotMatch(
+            node.url,
+            /^https?:\/\/linear\.app\/acme\/profiles(?:\/|$)/iu,
+            `case ${index}`,
+          );
+        }
+      }
+      assert.equal(tree.children.at(-1)?.type, "paragraph", `marker in case ${index}`);
+      assert.equal(tree.children.at(-2)?.type, "paragraph", `notice in case ${index}`);
+    }
+  }, 60_000);
+
   it("posts one marked, sanitized and truncated answer with only comments:create", async () => {
     const { send, writes, delivery } = await fixture();
     const text = `Hello @teammate, &#64;paseo and https://linear.app/team/profiles/alex.

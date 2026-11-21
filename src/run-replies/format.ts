@@ -13,37 +13,59 @@ export interface FinalReplyAnswer {
 const MAX_REPLY_CHARS = 3_500;
 export const MAX_REPLY_INPUT_CHARS = 16_384;
 const TRUNCATION = "\n\n[Reply truncated]";
+const TRUNCATED_TEXT_LIMIT = MAX_REPLY_CHARS - TRUNCATION.length;
+const RAW_TRUNCATION_MARGIN = 48;
+const MAX_RENDER_ATTEMPTS = 3;
 const URL_IN_PROSE = /\b(?:https?:\/\/|www\.|linear\.app\/)[^\s<>()[\]"']+/giu;
 const LINEAR_MENTION_PATH = /\/(?:profiles|users|agents)(?:\/|$)/iu;
 const MENTION_SIGN = /[@\uFF20]|&(?:#0*64|#x0*40|commat);/giu;
 const USER_TAG = /(?:<|&lt;)\/?user\b[^<>]*?(?:>|&gt;)/giu;
 
 export function formatRunReply(answer: FinalReplyAnswer, secrets: readonly string[]): string {
-  const bounded = answer.text.slice(0, MAX_REPLY_INPUT_CHARS);
-  const truncated = answer.truncated || bounded.length < answer.text.length;
-  const [redacted] = createAssistantTextRedactor(secrets).redact([bounded], truncated);
-  const source = redacted!
+  const { text } = answer;
+  const redact = createAssistantTextRedactor(secrets);
+  let truncated = answer.truncated || text.length > MAX_REPLY_CHARS;
+  let limit = truncated ? TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN : MAX_REPLY_CHARS;
+  for (let attempt = 0; attempt < MAX_RENDER_ATTEMPTS; attempt += 1) {
+    const prefix = text.length <= limit ? text : clipSource(text, limit);
+    const [redacted] = redact.redact([prefix], truncated);
+    const safe = renderMarkdown(redacted!);
+    if (safe === "") return safe;
+    if (!truncated && safe.length <= MAX_REPLY_CHARS) return safe;
+    if (safe.length <= TRUNCATED_TEXT_LIMIT) return safe + TRUNCATION;
+    truncated = true;
+    limit = Math.floor(
+      (prefix.length * (TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN)) / safe.length,
+    );
+  }
+  throw new Error("Linear reply exceeds the rendering limit");
+}
+
+function clipSource(text: string, limit: number): string {
+  const line = Math.max(text.lastIndexOf("\n", limit - 1), text.lastIndexOf("\r", limit - 1));
+  if (line >= limit - 240 && line > 0) return text.slice(0, line);
+  const prefix = text.slice(0, limit).replace(/[\uD800-\uDBFF]$/u, "");
+  const tail = prefix.slice(line + 1);
+  if (/^ {0,3}`{3,}/u.test(tail)) return prefix;
+  let opening: RegExpExecArray | undefined;
+  for (const run of tail.matchAll(/\\[^\r\n]|`+/gu)) {
+    if (!run[0].startsWith("`")) continue;
+    if (opening === undefined) opening = run;
+    else if (opening[0].length === run[0].length) opening = undefined;
+  }
+  return opening === undefined ? prefix : prefix.slice(0, line + 1 + opening.index);
+}
+
+function renderMarkdown(redacted: string): string {
+  const source = redacted
     .replaceAll("\0", "")
     .replace(/\p{Cf}/gu, "")
     .replace(/[\uD800-\uDFFF]/gu, "\uFFFD");
   const markdown = parseMarkdown(source);
   sanitizeMarkdown(markdown);
-  const safe = toMarkdown(markdown, {
+  return toMarkdown(markdown, {
     extensions: [gfmToMarkdown({ tablePipeAlign: false })],
   }).trim();
-  if (safe === "" || (!truncated && safe.length <= MAX_REPLY_CHARS)) return safe;
-  const limit = MAX_REPLY_CHARS - TRUNCATION.length;
-  if (safe.length <= limit) return safe + TRUNCATION;
-  const prefix = safe.slice(0, limit);
-  const paragraph = prefix.lastIndexOf("\n\n");
-  const line = prefix.lastIndexOf("\n");
-  const boundary = paragraph > prefix.length - 300 ? paragraph : line;
-  const end = intactBoundary(parseMarkdown(safe), boundary > 0 ? boundary : limit);
-  const clipped = safe
-    .slice(0, end)
-    .replace(/[\uD800-\uDBFF]$/u, "")
-    .trimEnd();
-  return clipped === "" ? TRUNCATION.trimStart() : clipped + TRUNCATION;
 }
 
 function parseMarkdown(source: string): Root {
@@ -51,18 +73,6 @@ function parseMarkdown(source: string): Root {
     extensions: [gfm()],
     mdastExtensions: [gfmFromMarkdown()],
   });
-}
-
-function intactBoundary(parent: Parents, end: number): number {
-  for (const node of parent.children) {
-    const { start, end: finish } = node.position ?? {};
-    if (start?.offset === undefined || finish?.offset === undefined) continue;
-    if (start.offset >= end || finish.offset <= end) continue;
-    if (node.type === "code" || node.type === "inlineCode" || node.type === "tableRow")
-      return start.offset;
-    if ("children" in node) return intactBoundary(node, end);
-  }
-  return end;
 }
 
 function sanitizeMarkdown(markdown: Root): void {
