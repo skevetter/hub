@@ -128,7 +128,7 @@ describe.each([
     }
   }, 120_000);
 
-  it("uses current connections when the binding commits during trigger validation", async () => {
+  it("uses current connections when the binding commits after validation and before persistence", async () => {
     const fixture = await createFixture();
     const { database } = fixture;
     const continueSave = Promise.withResolvers<void>();
@@ -139,18 +139,23 @@ describe.each([
         organizationId,
         acceptingAgentValidator(),
       );
-      const usageRead = Promise.withResolvers<void>();
-      const readUsage = database.organizationConnectionUsage.bind(database);
-      vi.spyOn(database, "organizationConnectionUsage").mockImplementationOnce(async (id) => {
-        const usage = await readUsage(id);
-        usageRead.resolve();
+      const reachedWrite =
+        Promise.withResolvers<Parameters<Database["saveOrganizationTrigger"]>[0]>();
+      const persist = database.saveOrganizationTrigger.bind(database);
+      vi.spyOn(database, "saveOrganizationTrigger").mockImplementationOnce(async (input) => {
+        reachedWrite.resolve(input);
         await continueSave.promise;
-        return usage;
+        return persist(input);
       });
       const save = store.save({ yaml: triggerYaml("concurrent-save"), userId: null });
       try {
-        await Promise.race([usageRead.promise, save.then(() => assert.fail("usage was not read"))]);
+        const ready = await Promise.race([
+          reachedWrite.promise,
+          save.then(() => assert.fail("save did not reach the persistence boundary")),
+        ]);
+        assert.deepEqual(ready.routes, []);
         const connection = await fixture.connect("workspace-one");
+        assert.deepEqual(await store.list(), []);
         continueSave.resolve();
         const trigger = await save;
         await assertRouted(database, connection, [trigger.runtimeProjectId]);
