@@ -5,13 +5,14 @@ import {
   TIMELINE_ORGANIZATION as organizationId,
   type TimelinePostgresHarness,
 } from "./test-utils/run-timeline-postgres.js";
-import type { ActivityRunPageRecord } from "./types.js";
+import type { ActivityRunPageRequest } from "./types.js";
 
 const INDEX = "trigger_runs_organization_created_id_idx";
 
 interface PlanNode {
   "Node Type": string;
   "Index Name"?: string;
+  "Relation Name"?: string;
   Plans?: PlanNode[];
 }
 
@@ -22,7 +23,6 @@ function nodes(node: PlanNode): PlanNode[] {
 describe("organization activity page plans", () => {
   let harness: TimelinePostgresHarness;
   let projectIds: string[] = [];
-  const captured: { sql: string; params: unknown[] }[] = [];
 
   beforeAll(async () => {
     harness = await createTimelinePostgresHarness();
@@ -77,6 +77,14 @@ describe("organization activity page plans", () => {
     }
     await harness.runtime.query("analyze trigger_runs");
     await harness.runtime.query("analyze provider_event_receipts");
+  }, 180_000);
+
+  afterAll(async () => {
+    await harness.close();
+  });
+
+  it("serves every Activity page read and adjacent probe from the organization index without a sort or sequential scan", async () => {
+    const captured: { sql: string; params: unknown[] }[] = [];
     const connection = await harness.connect();
     const run = connection.runtime.query.bind(connection.runtime);
     connection.runtime.query = (sql, params) => {
@@ -87,39 +95,68 @@ describe("organization activity page plans", () => {
       ...projectIds.slice(0, 5).map((projectId) => ({ projectId })),
       ...projectIds.slice(5).map((projectId) => ({ projectId, triggerName: "selected" })),
     ];
-    const read = (
-      position?: Parameters<typeof connection.database.listOrganizationActivityPage>[2]["position"],
-    ) =>
+    const read = (position?: ActivityRunPageRequest["position"]) =>
       connection.database.listOrganizationActivityPage(organizationId, scopes, {
         limit: 25,
         ...(position === undefined ? {} : { position }),
       });
-    const first: ActivityRunPageRecord = await read();
-    const second = await read({ direction: "before", key: first.older! });
-    await read({ direction: "after", key: second.newer! });
-  }, 180_000);
 
-  afterAll(async () => {
-    await harness.close();
-  });
-
-  it("serves the newest, older and newer page reads from the organization index without a sort", async () => {
-    const pages = captured.filter(({ sql }) => /order by runs\.created_at/u.test(sql));
-    assert.equal(pages.length, 3);
-    for (const { sql, params } of pages) {
-      const plan = await harness.runtime.query<{ "QUERY PLAN": [{ Plan: PlanNode }] }>(
-        `explain (format json) ${sql}`,
-        params,
-      );
-      const used = nodes(plan.rows[0]!["QUERY PLAN"][0].Plan);
-      assert.ok(
-        used.some((node) => node["Index Name"] === INDEX),
-        `expected ${INDEX} in ${JSON.stringify(used.map((node) => node["Node Type"]))}`,
-      );
-      assert.ok(
-        used.every((node) => node["Node Type"] !== "Sort"),
-        "the page read should come ordered from the index",
-      );
+    async function expectPlans(...expected: [kind: string, pattern: RegExp][]) {
+      const statements = captured.splice(0);
+      assert.equal(statements.length, expected.length, expected.map(([kind]) => kind).join(", "));
+      for (const [index, [kind, pattern]] of expected.entries()) {
+        const { sql, params } = statements[index]!;
+        assert.match(sql, pattern, `${kind}: unexpected SQL`);
+        const { rows } = await harness.runtime.query<{ "QUERY PLAN": [{ Plan: PlanNode }] }>(
+          `explain (format json) ${sql}`,
+          params,
+        );
+        const used = nodes(rows[0]!["QUERY PLAN"][0].Plan);
+        for (const node of used) {
+          const type = node["Node Type"];
+          const relation = node["Relation Name"];
+          assert.ok(!type.endsWith("Sort"), `${kind}: unexpected ${type} node`);
+          assert.ok(
+            type !== "Seq Scan" ||
+              (relation !== "trigger_runs" && relation !== "provider_event_receipts"),
+            `${kind}: unexpected sequential scan of ${relation}`,
+          );
+        }
+        assert.ok(
+          used.some(
+            (node) =>
+              node["Index Name"] === INDEX &&
+              (node["Node Type"] === "Index Scan" || node["Node Type"] === "Index Only Scan"),
+          ),
+          `${kind}: expected an ordered scan using ${INDEX}`,
+        );
+      }
     }
-  });
+
+    const first = await read();
+    await expectPlans([
+      "newest page read",
+      /^select runs\.\*,[\s\S]*order by runs\.created_at desc/u,
+    ]);
+    assert.ok(first.older);
+
+    const second = await read({ direction: "before", key: first.older });
+    await expectPlans(
+      ["older page read", /^select runs\.\*,[\s\S]*and \(runs\.created_at, runs\.id\) </u],
+      [
+        "newer availability probe",
+        /^select 1\b[\s\S]*and \(runs\.created_at, runs\.id\) >[\s\S]*limit 1$/u,
+      ],
+    );
+    assert.ok(second.newer);
+
+    await read({ direction: "after", key: second.newer });
+    await expectPlans(
+      ["newer page read", /^select runs\.\*,[\s\S]*and \(runs\.created_at, runs\.id\) >/u],
+      [
+        "older availability probe",
+        /^select 1\b[\s\S]*and \(runs\.created_at, runs\.id\) <[\s\S]*limit 1$/u,
+      ],
+    );
+  }, 30_000);
 });
