@@ -10,6 +10,7 @@ import { enrollTestDaemon, TEST_DAEMON_ID } from "../../test-utils/project-confi
 import { createLogger } from "../../logger.js";
 import { FailureLogStream } from "../../test-utils/failure-logs.js";
 import { OutputExecutorRegistry } from "../../execution-capabilities/outputs.js";
+import type { FinalReplyAnswer } from "../../run-replies/format.js";
 import {
   createDaemonDispatchLifecycle,
   type DaemonDispatchLifecycle,
@@ -62,6 +63,11 @@ export interface TurnEndFixtureOptions {
   /** Run the execution as a workflow step, so the step output can be read back. */
   workflow?: boolean;
   completeOnTurnEnd?: boolean;
+  onRunReplyAnswer?: (
+    scope: { runId: string; organizationId: string },
+    executionId: string,
+    answer: FinalReplyAnswer | null,
+  ) => void;
   autoArchive?: boolean;
   outputSchema?: JsonValue;
   requiredOutput?: boolean;
@@ -141,6 +147,9 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
     executionCapabilities,
     ...(options.timeline === undefined ? {} : { timeline: options.timeline }),
     ...(options.providers === undefined ? {} : { providers: options.providers }),
+    ...(options.onRunReplyAnswer === undefined
+      ? {}
+      : { onRunReplyAnswer: options.onRunReplyAnswer }),
     connectionForDaemon: () => ({
       agents,
       getProviderSnapshot: async () => {
@@ -178,6 +187,7 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
         inputs: {},
         triggerContext: options.triggerContext ?? {},
         outputContext: options.outputContext ?? {},
+        ...(options.onRunReplyAnswer === undefined ? {} : { replyMessage: true }),
         deadlineAt: new Date(clock.now() + 2 * 60 * 60_000),
         stepIds: ["step"],
       })
@@ -209,6 +219,7 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
       autoArchive: options.autoArchive === true,
       background: false,
       ...(options.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
+      ...(options.onRunReplyAnswer === undefined ? {} : { replyMessage: true }),
       ...(options.outputSchema === undefined ? {} : { outputSchema: options.outputSchema }),
       ...(options.continuationKey === undefined
         ? {}

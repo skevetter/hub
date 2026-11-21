@@ -10,12 +10,8 @@ import {
   type LinearCommentWriteOptions,
 } from "../providers/linear/client.js";
 import { LinearOutputContextSchema } from "../triggers/linear/provider.js";
-import {
-  formatRunReply,
-  hasLinearRunReplyMarker,
-  linearRunReplyMarker,
-  type FinalReplyAnswer,
-} from "./format.js";
+import { formatRunReply, type FinalReplyAnswer } from "./format.js";
+import { hasLinearRunReplyMarker, linearRunReplyMarker } from "./marker.js";
 import type { RunReplyFailure, RunReplyRecord } from "./store.js";
 
 const sourceSchema = z.object({

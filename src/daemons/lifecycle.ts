@@ -59,7 +59,8 @@ import type { JsonValue } from "../config/compiler.js";
 import { compileJsonSchema, formatJsonSchemaErrors } from "../workflows/json-schema.js";
 import type { Logger } from "pino";
 import { isHubFinishExecutionToolName } from "../hub/protocol.js";
-import { TURN_END_COMPLETION, TURN_END_SETTLE_MS, TurnEndTracker } from "./turn-end.js";
+import { inferredTurnEndResult, TURN_END_SETTLE_MS, TurnEndTracker } from "./turn-end.js";
+import { RunReplyCapture, type OnRunReplyAnswer } from "./reply-capture.js";
 
 export interface DaemonDispatchResult {
   execution: AgentExecutionRecord;
@@ -116,6 +117,7 @@ export interface DaemonDispatchLifecycleOptions {
   providers?: readonly TriggerProvider[];
   executionAuthority?: ExecutionAuthority;
   timeline?: RunTimeline;
+  onRunReplyAnswer?: OnRunReplyAnswer;
   /** Shared with the MCP handler, which records each finish_execution call by its execution. */
   finishCalls?: FinishCallRegistry;
   publicBaseUrl?: string;
@@ -176,6 +178,7 @@ export class DaemonDispatchLifecycle {
   private readonly turnEnds = new Map<string, TurnEndTracker>();
   private readonly turnEndTimers = new Map<string, () => void>();
   private readonly turnEndRuns = new Set<Promise<void>>();
+  private readonly replyCapture: RunReplyCapture | undefined;
   private stopping = false;
   private stopRecoveryTimer: (() => void) | undefined;
   private stopRecoveryRun: Promise<void> | undefined;
@@ -187,6 +190,13 @@ export class DaemonDispatchLifecycle {
     this.providersByName = new Map(
       (options.providers ?? []).map((provider) => [provider.name, provider]),
     );
+    if (options.onRunReplyAnswer !== undefined) {
+      this.replyCapture = new RunReplyCapture(
+        options.onRunReplyAnswer,
+        (executionId) => this.unsubscribeExecution(executionId),
+        (callback, delay) => this.scheduleDeadline(callback, delay),
+      );
+    }
   }
 
   activeExecutionObservationCount(): number {
@@ -221,6 +231,7 @@ export class DaemonDispatchLifecycle {
     for (const clear of this.turnEndTimers.values()) clear();
     this.turnEndTimers.clear();
     this.turnEnds.clear();
+    this.replyCapture?.stop();
     this.startedExecutions.clear();
     await Promise.allSettled([
       this.stopRecoveryRun,
@@ -948,6 +959,7 @@ export class DaemonDispatchLifecycle {
       validateStructuredOutput(currentExecution.launchIntent.outputSchema, input.output);
     }
     this.clearExecutionDeadline(input.executionId);
+    this.replyCapture?.noteExplicitFinish(input.executionId);
     const execution = await this.completeAgentExecution(input.executionId, {
       completedByAgent: true,
       ...(options.deferHubAction === undefined ? {} : { deferHubAction: options.deferHubAction }),
@@ -1245,15 +1257,10 @@ export class DaemonDispatchLifecycle {
       existing.launchIntent?.outputSchema === undefined || options.output === undefined
         ? undefined
         : jsonValue(options.output);
-    const inferred =
-      options.turnEnd === undefined
-        ? undefined
-        : {
-            status: "succeeded" as const,
-            completion: TURN_END_COMPLETION,
-            ...(options.turnEnd === null ? {} : { output: options.turnEnd.text }),
-            ...(options.turnEnd?.truncated === true ? { outputTruncated: true } : {}),
-          };
+    const inferred = inferredTurnEndResult(
+      options.turnEnd,
+      existing.launchIntent?.replyMessage !== true,
+    );
     const transition = await this.transitionTerminalAgentExecution(
       executionId,
       "succeeded",
@@ -1282,6 +1289,8 @@ export class DaemonDispatchLifecycle {
     this.finishCalls.release(executionId);
 
     const { execution } = transition;
+    if (this.replyCapture?.has(executionId) === true)
+      await this.completeRunReplyCapture(execution, options.completedByAgent === true);
     const deferArchiveAcknowledgement =
       options.deferHubAction === true && execution.hubAction === "archive";
     if (!deferArchiveAcknowledgement) this.releaseExecutionResources(executionId);
@@ -1736,6 +1745,12 @@ export class DaemonDispatchLifecycle {
         connection: connection.agents,
         beforePromptSend: () => {
           this.watchForTurnEnd(input.executionId, input.intent);
+          if (input.intent.replyMessage === true) {
+            this.replyCapture?.begin(input.executionId, {
+              organizationId: input.intent.organizationId,
+              runId: input.intent.triggerRunId,
+            });
+          }
           try {
             this.options.timeline?.begin(input.executionId, {
               organizationId: input.intent.organizationId,
@@ -1769,6 +1784,7 @@ export class DaemonDispatchLifecycle {
   }
 
   private observeSessionEvent(executionId: string, daemonId: string, event: AgentEvent): void {
+    this.replyCapture?.observe(executionId, event);
     const turnEnd = this.turnEnds.get(executionId);
     if (turnEnd !== undefined) this.observeTurnEnd(executionId, turnEnd, event);
     const normalized =
@@ -1854,7 +1870,17 @@ export class DaemonDispatchLifecycle {
   /** Starts following turn ends for an opted-in execution; events before this are not counted. */
   private watchForTurnEnd(executionId: string, intent: LaunchMachineIntent): void {
     this.clearTurnEnd(executionId);
-    if (intent.completeOnTurnEnd === true) this.turnEnds.set(executionId, new TurnEndTracker());
+    if (intent.completeOnTurnEnd === true)
+      this.turnEnds.set(executionId, new TurnEndTracker(intent.replyMessage !== true));
+  }
+
+  private async completeRunReplyCapture(execution: AgentExecutionRecord, explicit: boolean) {
+    try {
+      if (!this.stopping && !(await this.hasOtherActiveSessionExecution(execution)))
+        this.replyCapture?.complete(execution.id, explicit);
+    } catch (error) {
+      this.report(error, "daemon.execution.reply-capture", { executionId: execution.id });
+    }
   }
 
   private clearTurnEnd(executionId: string): void {
@@ -2006,10 +2032,14 @@ export class DaemonDispatchLifecycle {
     } catch (error) {
       this.report(error, "run.timeline.capture", { executionId });
     }
-    this.executionSubscriptions.get(executionId)?.();
-    this.executionSubscriptions.delete(executionId);
+    if (this.replyCapture?.release(executionId) !== false) this.unsubscribeExecution(executionId);
     this.clearTurnEnd(executionId);
     this.finishCalls.release(executionId);
+  }
+
+  private unsubscribeExecution(executionId: string): void {
+    this.executionSubscriptions.get(executionId)?.();
+    this.executionSubscriptions.delete(executionId);
   }
 
   private async expireExecutionAtCurrentDeadline(

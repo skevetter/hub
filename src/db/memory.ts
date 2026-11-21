@@ -357,8 +357,12 @@ class MemoryDatabase implements Database {
     recoverable: async (cutoff) => {
       const due = [...this.replyDeliveries.values()].flatMap((row) => {
         if (row.state !== "pending" && row.state !== "sending") return [];
-        const at = row.attemptedAt ?? this.triggerRuns.get(row.runId)?.completedAt;
-        return at != null && at <= cutoff ? [{ at, row }] : [];
+        const run = this.triggerRuns.get(row.runId);
+        const at = row.attemptedAt ?? run?.completedAt;
+        const endedWithoutSuccess =
+          row.state === "pending" &&
+          (run?.status === "failed" || run?.status === "timed_out" || run?.status === "canceled");
+        return at != null && (at <= cutoff || endedWithoutSuccess) ? [{ at, row }] : [];
       });
       return structuredClone(
         due

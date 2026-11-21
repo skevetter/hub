@@ -1314,6 +1314,7 @@ function buildStepIntent(
       autoArchive: step.autoArchive,
       background: step.background,
       ...(step.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
+      ...(trigger.replyMessage === true ? { replyMessage: true } : {}),
       triggerContext: run.triggerContext,
       outputContext: run.outputContext,
       configurationRevisionId: run.configurationRevisionId,

@@ -40,6 +40,7 @@ export interface LaunchMachineIntent {
   background: boolean;
   /** Complete the execution when the agent's turn ends without finish_execution. */
   completeOnTurnEnd?: boolean;
+  replyMessage?: true;
   triggerContext: unknown;
   outputContext: unknown;
   outputSchema?: JsonValue;
@@ -69,6 +70,7 @@ export function buildLaunchMachineIntent(input: {
   background: boolean;
   /** Complete the execution when the agent's turn ends without finish_execution. */
   completeOnTurnEnd?: boolean;
+  replyMessage?: true;
   triggerContext: unknown;
   outputContext: unknown;
   hubConfig: unknown;
@@ -93,6 +95,7 @@ export function buildLaunchMachineIntent(input: {
     autoArchive: input.autoArchive,
     background: input.background,
     ...(input.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
+    ...(input.replyMessage === true ? { replyMessage: true } : {}),
     triggerContext: input.triggerContext,
     outputContext: input.outputContext,
     configurationRevisionId: input.configurationRevisionId,

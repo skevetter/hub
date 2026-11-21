@@ -9,6 +9,7 @@ import type {
   AttachmentResolver,
 } from "../attachments/capabilities.js";
 import type { ProgressProvider } from "../run-progress/types.js";
+import type { LinearRunReplyWriter } from "../run-replies/linear.js";
 import type { SlackDeliveryStatus } from "../triggers/slack/source/index.js";
 
 export interface TriggerProviderResources {
@@ -79,5 +80,6 @@ export interface ProviderRegistration {
   requests: readonly ProviderRequestRegistration[];
   attachment?: ProviderAttachmentRegistration;
   progressProvider?: ProgressProvider | undefined;
+  linearRunReplyWriter?: LinearRunReplyWriter | undefined;
   slackDelivery?: { status(): SlackDeliveryStatus; retry(): Promise<void> };
 }

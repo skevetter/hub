@@ -69,7 +69,7 @@ export function postgresRunReplies(runtime: DatabaseRuntime, locks: Locks): RunR
         `select ${projection}
          from run_reply_deliveries reply join trigger_runs run on run.id = reply.trigger_run_id
          where (reply.state = 'sending' and reply.attempted_at <= $1)
-           or (reply.state = 'pending' and run.completed_at <= $1)
+           or (reply.state = 'pending' and (run.completed_at <= $1 or run.status in ('failed', 'timed_out', 'canceled')))
          order by coalesce(reply.attempted_at, run.completed_at), reply.trigger_run_id limit 50`,
         [cutoff],
       );

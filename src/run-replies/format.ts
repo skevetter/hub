@@ -73,12 +73,3 @@ function safeLink(value: string): boolean {
     return false;
   }
 }
-
-export function linearRunReplyMarker(commentId: string): string {
-  return `Paseo reply ${commentId}`;
-}
-
-export function hasLinearRunReplyMarker(body: string, commentId: string): boolean {
-  const marker = linearRunReplyMarker(commentId);
-  return body.split("\n").some((line) => line.trim() === marker);
-}

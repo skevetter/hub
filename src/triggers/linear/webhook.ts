@@ -7,6 +7,7 @@ import type { ProviderEventDropReasonCode } from "../drop-reason.js";
 import type { TriggerHandler, TriggerSource } from "../index.js";
 import { eventIssueId, eventProjectId, normalizeLinearEvent } from "./events.js";
 import { isLinearAppComment } from "./match.js";
+import { hasLinearRunReplyMarker } from "../../run-replies/marker.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
 
 const MAX_WEBHOOK_BYTES = 1_048_576;
@@ -125,7 +126,8 @@ async function handoffLinearEvent(
     linearOrganizationId = event.organizationId;
     if (
       event.type === "comment" &&
-      isLinearAppComment(event, await options.findAppUserId?.(linearOrganizationId))
+      (hasLinearRunReplyMarker(event.comment.body, event.comment.id) ||
+        isLinearAppComment(event, await options.findAppUserId?.(linearOrganizationId)))
     ) {
       return new Response("OK", { status: 200 });
     }

@@ -7,6 +7,7 @@ import {
   type LinearIssueComment,
 } from "../../providers/linear/client.js";
 import { reportFailure } from "../../failures/index.js";
+import { hasLinearRunReplyMarker } from "../../run-replies/marker.js";
 import type { ExternalTrigger, TriggerProvider, TriggerProviderMatch } from "../index.js";
 import { NormalizedLinearEventSchema, type NormalizedLinearEvent } from "./events.js";
 import {
@@ -172,6 +173,7 @@ export function createLinearTriggerProvider(options: {
           isBeforeLinearTrigger(comment, locator.before.created_at),
         );
         const messages = causalComments
+          .filter((comment) => !hasLinearRunReplyMarker(comment.body, comment.id))
           .sort(compareLinearCommentOrder)
           .slice(-LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT)
           .map(commentMessage);

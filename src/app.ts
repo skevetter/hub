@@ -93,6 +93,7 @@ export interface HubRuntimeOptions {
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
   onProgressRequested?: DurableWorkflowEngineOptions["onProgressRequested"];
+  onRunReplyAnswer?: NonNullable<DaemonDispatchLifecycleOptions["onRunReplyAnswer"]>;
   runTimeline?: RunTimeline;
   runTimelineReconciler?: RunTimelineReconciler;
   runStream?: RunStream;
@@ -589,6 +590,9 @@ function createAppDaemonModule(
     connectionForDaemon: options.daemonConnectionForId ?? ((id) => daemons?.connection(id)),
     executionCapabilities: outputRegistry,
     ...(options.runTimeline === undefined ? {} : { timeline: options.runTimeline }),
+    ...(options.onRunReplyAnswer === undefined
+      ? {}
+      : { onRunReplyAnswer: options.onRunReplyAnswer }),
     ...(options.completionTokenSecret === undefined
       ? {}
       : { completionTokenSecret: options.completionTokenSecret }),
