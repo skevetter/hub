@@ -1,3 +1,5 @@
+import { isTriggerableReceiptSource } from "./configuration/events.js";
+
 export const PROVIDER_EVENT_DROP_REASON_CODES = [
   "no_project_route",
   "no_trigger_for_source",
@@ -104,5 +106,9 @@ export function providerEventDropReasonHint(
   source: string,
   workspace: string | null,
 ): Hint {
-  return HINTS[reason](source, workspace === null ? "" : ` in ${workspace}`);
+  const hint = HINTS[reason](source, workspace === null ? "" : ` in ${workspace}`);
+  if (hint.action === "create" && !isTriggerableReceiptSource(source)) {
+    return { text: "Hub has no trigger for this event type." };
+  }
+  return hint;
 }

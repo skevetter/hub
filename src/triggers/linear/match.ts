@@ -9,6 +9,7 @@ import type {
   NormalizedLinearIssueEvent,
 } from "./events.js";
 
+import { eventDefinition, isEditorEvent } from "../configuration/events.js";
 import { matchesInputFilters, parseInvocation, type InvocationParseResult } from "../invocation.js";
 
 type MatchedTriggerDefinition = Pick<CompiledTrigger, "name" | "on" | "filters">;
@@ -81,11 +82,11 @@ export function hasLinearSourceTrigger(
   triggers: readonly { on: string }[],
   source: string,
 ): boolean {
-  return triggers.some((trigger) =>
-    source === "linear.issue"
-      ? trigger.on === "linear.issue_entered_scope" || trigger.on === "linear.issue_assigned"
-      : source === "linear.comment" && trigger.on === "linear.comment_created",
-  );
+  return triggers.some(({ on }) => {
+    if (!isEditorEvent(on)) return false;
+    const definition = eventDefinition(on);
+    return definition.provider === "linear" && definition.receiptSource === source;
+  });
 }
 
 function promptForEvent(event: NormalizedLinearEvent): string {
