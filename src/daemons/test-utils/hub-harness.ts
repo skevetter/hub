@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
 import type { Server } from "node:http";
-import { createServer } from "node:net";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { createStartHandler, defaultStreamHandler } from "@tanstack/react-start/server";
 import { createPostgresQueryRuntime } from "../../db/test-utils/runtime.js";
@@ -1794,8 +1794,30 @@ export class HubHarness {
   }
 
   private async startApp(): Promise<void> {
-    const port = await availablePort();
-    this.origin = `http://127.0.0.1:${port}`;
+    const server = createFetchServer(createStartHandler(defaultStreamHandler), {
+      handleUpgrade: (request, socket, head) => {
+        if (this.hub?.handleUpgrade) void this.hub.handleUpgrade(request, socket, head);
+        else socket.destroy();
+      },
+    });
+    const listening = once(server, "listening");
+    server.listen(0, "127.0.0.1");
+    await listening;
+    this.server = server;
+    const deadline = Promise.withResolvers<boolean>();
+    const shutdown = createServerShutdown(server, () => stopApplication(), {
+      graceMs: 5_000,
+      hardExitMs: 10_000,
+      exit: (code) => {
+        if (code !== 0)
+          deadline.reject(new Error("Hub harness shutdown exceeded its deadline or failed"));
+      },
+    });
+    this.shutdownServer = () => Promise.race([shutdown(), deadline.promise]);
+
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    this.origin = `http://127.0.0.1:${address.port}`;
     this.executionAuthority = this.createExecutionAuthority();
     const registry = new OutputExecutorRegistry();
     registry.register({
@@ -1872,23 +1894,7 @@ export class HubHarness {
       providerRequest: () => Promise.resolve(new Response("Not Found", { status: 404 })),
       stop: () => hub.stop(),
     }));
-    const server = createFetchServer(createStartHandler(defaultStreamHandler), {
-      handleUpgrade: (request, socket, head) => void hub?.handleUpgrade?.(request, socket, head),
-    });
-    server.listen(port, "127.0.0.1");
-    await new Promise<void>((resolve) => server.once("listening", resolve));
     this.hub = hub;
-    this.server = server;
-    const deadline = Promise.withResolvers<boolean>();
-    const shutdown = createServerShutdown(server, () => stopApplication(), {
-      graceMs: 5_000,
-      hardExitMs: 10_000,
-      exit: (code) => {
-        if (code !== 0)
-          deadline.reject(new Error("Hub harness shutdown exceeded its deadline or failed"));
-      },
-    });
-    this.shutdownServer = () => Promise.race([shutdown(), deadline.promise]);
   }
 
   private createExecutionAuthority(): ExecutionAuthority {
@@ -3053,15 +3059,6 @@ function readText(data: RawData): string {
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString();
   return data.toString();
 }
-async function availablePort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("Could not reserve port");
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return address.port;
-}
-
 function machineHeaders(auth: "valid" | "missing" | "wrong"): Record<string, string> {
   if (auth === "valid") return { authorization: `Bearer ${HUB_API_KEY}` };
   if (auth === "wrong") return { authorization: "Bearer paseo_pk_wrong" };
