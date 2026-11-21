@@ -69,6 +69,12 @@ describe("Linear reply writer", () => {
     assert.ok(!writes[0]?.includes(profileUrl), "a profile URL survived the cut");
   });
 
+  it("keeps bare email addresses visible with the mention sign neutralized", async () => {
+    const { send, writes } = await fixture();
+    await send("Email ops@example.com if the deploy fails.");
+    assert.match(writes[0] ?? "", /Email ops\\?\[at\]example\.com if the deploy fails\./u);
+  });
+
   it("keeps part of a long opening code fence and posts metadata outside it", async () => {
     const { send, writes } = await fixture();
     await send(`\`\`\`log\n${"One line from the log.\n".repeat(300)}\`\`\``);

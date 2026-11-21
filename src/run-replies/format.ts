@@ -115,6 +115,16 @@ function sanitizeMarkdown(markdown: Root): void {
   for (const parent of pending) {
     for (let index = parent.children.length - 1; index >= 0; index -= 1) {
       const node = parent.children[index]!;
+      if (node.type === "link" && node.url.startsWith("mailto:") && node.children.length === 1) {
+        const label = node.children[0];
+        if (label?.type === "text") {
+          parent.children.splice(index, 1, {
+            type: "text",
+            value: neutralizeMentions(label.value),
+          });
+          continue;
+        }
+      }
       if (removeNode(node)) {
         parent.children.splice(index, 1);
         continue;
