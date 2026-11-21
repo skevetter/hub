@@ -30,7 +30,7 @@ const GITHUB_OWNER = { providerApplicationId: "42", configurationVersion: 0 };
 const LEGACY_MIGRATIONS = join(process.cwd(), "src/db/migrations");
 const DRIZZLE_MIGRATIONS = join(process.cwd(), "drizzle");
 const TRIGGER_NAME_ORDER_MIGRATION = "0064_organization_trigger_name_order";
-const DROPPED_EVENT_ACTIVITY_MIGRATION = "0067_dropped_event_activity";
+const DROPPED_EVENT_ACTIVITY_MIGRATION = "0066_dropped_event_activity";
 const ACTIVITY_WEBHOOK_LOOKUP_MIGRATION = "0065_activity_webhook_receipt_lookup";
 const migrationJournalSchema = z.object({
   entries: z.array(
@@ -84,7 +84,7 @@ describe("database migration application", () => {
         [
           [64, TRIGGER_NAME_ORDER_MIGRATION],
           [65, ACTIVITY_WEBHOOK_LOOKUP_MIGRATION],
-          [67, DROPPED_EVENT_ACTIVITY_MIGRATION],
+          [66, DROPPED_EVENT_ACTIVITY_MIGRATION],
         ],
       );
       const baseline = (await journal()).rows;
