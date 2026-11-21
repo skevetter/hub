@@ -54,6 +54,26 @@ describe("Linear reply writer", () => {
 
 [ordinary link](https://example.com/docs) ![image](https://example.com/pic.png) <img src="https://example.com/pic.png">
 
+Thanks [team][@bob], [@bob][], and [normal][docs].
+
+[@bob]: https://example.com "@title https://linear.app/team/profiles/title"
+[docs]: https://example.com/reference "Ordinary title"
+[@everyone]: https://example.com
+
+A footnote[^@bob] and an [inline title](https://example.com "@inline").
+
+[^@bob]: Footnote @author and https://linear.app/team/profiles/footnote.
+
+![alt @image](https://example.com/image) ![alt @reference][docs]
+
+<https://linear.app/team/profiles/autolink> <name@example.com>
+
+&lt;user id="encoded-id"&gt; <!-- @comment <user id="html-id"> -->
+
+\`\`\`@language https://linear.app/team/profiles/meta
+Code @example
+\`\`\`
+
 fake-client-secret
 
 ${"line from the answer\n".repeat(250)}`;
@@ -67,7 +87,49 @@ ${"line from the answer\n".repeat(250)}`;
     assert.ok(body.includes(result.commentId));
     assert.match(body, /line from the answer\n\n\[Reply truncated\]/u);
     assert.match(body, /\[ordinary link\]\(https:\/\/example.com\/docs\)/u);
-    assert.doesNotMatch(body, /@|profiles\/alex|pic\.png|<img|fake-client-secret/u);
+    const reference = /\[normal\]\[([^\]]+)\]/u.exec(body);
+    assert.ok(reference?.[1]);
+    assert.ok(body.includes(`[${reference[1]}]: https://example.com/reference "Ordinary title"`));
+    assert.match(body, /Footnote/u);
+    assert.doesNotMatch(
+      body,
+      /@|\/profiles\/|pic\.png|<img|encoded-id|html-id|fake-client-secret/u,
+    );
+  });
+
+  const markdownShapes = [
+    (mention: string) => `Prose **${mention}** and \`${mention}\`.`,
+    (mention: string) => `[teammate][${mention}]\n\n[${mention}]: https://example.com`,
+    (mention: string) => `[${mention}][]\n\n[${mention}]: https://example.com`,
+    (mention: string) => `Text[^${mention}]\n\n[^${mention}]: ${mention}`,
+    (mention: string) =>
+      `[link](https://example.com "${mention}") ![${mention}](https://example.com/image)`,
+    (mention: string) => `<!-- ${mention} -->\n\n<${mention}>`,
+    (mention: string) => `\`\`\`${mention}\n${mention}\n\`\`\``,
+    (mention: string) => `| Header |\n| ------ |\n| ${mention} |`,
+  ];
+
+  it("neutralizes generated mention forms across Markdown shapes in the posted body", async () => {
+    for (let index = 0; index < markdownShapes.length; index += 1) {
+      const shape = markdownShapes[index]!;
+      const samples = [
+        `@user-${index}`,
+        `\uFF20user-${index}`,
+        `&#x40;user-${index}`,
+        `https://linear.app/team/profiles/user-${index}`,
+        `https://linear.app/team/%75sers/user-${index}`,
+        `https://linear.app/team/agents/user-${index}`,
+      ];
+      const { send, writes } = await fixture();
+      await send(["Safe answer.", ...samples.map(shape)].join("\n\n"));
+      assert.equal(writes.length, 1, `Markdown shape ${index}`);
+      assert.match(writes[0]!, /Safe answer\./u);
+      assert.doesNotMatch(
+        writes[0]!,
+        /[@\uFF20]|&#(?:0*64|x0*40);|linear\.app\/[^\s]*\/(?:profiles|users|%75sers|agents)\//iu,
+        `Markdown shape ${index}`,
+      );
+    }
   });
 
   it("records an empty sanitized answer without making a request", async () => {
