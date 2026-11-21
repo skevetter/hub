@@ -330,6 +330,7 @@ describe("Linear registration", () => {
         throw new Error("under-scoped token must not hydrate");
       },
       readIssueComments: async () => ({ comments: [], complete: true }),
+      readComment: async () => null,
       createComment: async () => "comment-id",
       updateComment: async () => {},
     };

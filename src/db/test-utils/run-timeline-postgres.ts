@@ -30,7 +30,9 @@ export interface TimelinePostgresHarness {
   runtime: DatabaseRuntime;
   database: Database;
   createRun(
-    input?: Pick<CreateAcceptedTriggerRunInput, "replyMessage">,
+    input?: Partial<
+      Pick<CreateAcceptedTriggerRunInput, "replyMessage" | "triggerContext" | "outputContext">
+    >,
   ): Promise<AcceptedTriggerRunRecord>;
   connect(hooks?: TimelineQueryHooks, maxConnections?: number): Promise<TimelinePostgresConnection>;
   waitForLockOrRead(pid: number, wasRead?: () => boolean): Promise<"blocked" | "read">;

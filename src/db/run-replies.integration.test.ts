@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, it } from "vitest";
 import { createMemoryDatabase } from "./memory.js";
+import { LinearRunReplyWriter } from "../run-replies/linear.js";
+import { fakeLinearReplies, replyEvidence } from "../run-replies/test-utils/linear.js";
 import {
   createTimelinePostgresHarness,
   TIMELINE_ORGANIZATION,
@@ -20,7 +22,8 @@ describe.each(["memory", "postgres"])("run reply admissions (%s)", (driver) => {
   }, 120_000);
 
   async function createRun(replyMessage = true) {
-    if (harness) return harness.createRun(replyMessage ? { replyMessage } : {});
+    if (harness)
+      return harness.createRun({ ...replyEvidence, ...(replyMessage ? { replyMessage } : {}) });
     return (
       await memory.createAcceptedTriggerRun({
         organizationId: TIMELINE_ORGANIZATION,
@@ -30,8 +33,7 @@ describe.each(["memory", "postgres"])("run reply admissions (%s)", (driver) => {
         configuredTriggerName: "reply",
         prompt: "",
         inputs: {},
-        triggerContext: {},
-        outputContext: {},
+        ...replyEvidence,
         deadlineAt: new Date(Date.now() + 5_000),
         stepIds: ["work"],
         ...(replyMessage ? { replyMessage } : {}),
@@ -111,4 +113,46 @@ describe.each(["memory", "postgres"])("run reply admissions (%s)", (driver) => {
       "rate_limited",
     );
   });
+
+  it.each([true, false])(
+    "repairs without another create after a lost response (marker retained: %s)",
+    async (retainMarker) => {
+      const database = harness?.database ?? memory;
+      const run = await createRun();
+      const fake = fakeLinearReplies(run.organizationId, database);
+      fake.loseCreateResponse();
+      const options = {
+        client: fake.client,
+        connectionForLinearOrganization: fake.connectionForLinearOrganization,
+        clientSecret: "fake-client-secret",
+        providerApplicationId: "app",
+      };
+      const terminal = await database.succeedTriggerRun(run.id);
+      assert.equal(terminal?.run.outcome, "accepted");
+      if (terminal?.run.outcome !== "accepted") throw new Error("expected accepted run");
+      const key = { organizationId: run.organizationId, runId: run.id };
+      const answer = { text: "Example final answer.", truncated: false };
+      const signal = new AbortController().signal;
+      await new LinearRunReplyWriter({ ...options, database }).post(
+        terminal.run,
+        answer,
+        60,
+        signal,
+      );
+
+      const restarted = (await harness?.connect())?.database ?? memory;
+      const record = await restarted.runReplies.find(key);
+      assert.equal(record?.state, "sending");
+      assert.doesNotMatch(JSON.stringify(record), /Example final answer/u);
+      if (!retainMarker)
+        fake.comments.get(record.commentId)!.body = "A comment without the marker.";
+      const recoveredWriter = new LinearRunReplyWriter({ ...options, database: restarted });
+      await recoveredWriter.repair(terminal.run, record, signal);
+      await recoveredWriter.post(terminal.run, answer, 60, signal);
+      assert.equal(fake.calls.filter((call) => call === "create").length, 1);
+      const result = await restarted.runReplies.find(key);
+      assert.equal(result?.state, retainMarker ? "sent" : "refused");
+      assert.equal(result?.failure, retainMarker ? null : "delivery_unconfirmed");
+    },
+  );
 });

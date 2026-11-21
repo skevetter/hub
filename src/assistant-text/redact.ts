@@ -351,7 +351,7 @@ function project(parts: readonly string[], spans: readonly Span[]): string[] {
   });
 }
 
-export function createSessionRedactor(values: readonly string[]) {
+export function createAssistantTextRedactor(values: readonly string[]) {
   const known = [...new Set(values.filter(Boolean))].map(prepareSecret);
   function inspect(
     text: string,
