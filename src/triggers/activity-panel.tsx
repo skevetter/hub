@@ -4,7 +4,12 @@ import { useSnapshotQuery } from "../queries/index.js";
 import { useServerFn } from "@tanstack/react-start";
 import { DataTableSkeleton } from "../components/app/data-table.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
-import { ClearListFilters, ListFilters, ListFilterSelect } from "../components/app/list-filters.js";
+import {
+  ClearListFilters,
+  ListFilters,
+  ListFilterSelect,
+  type ListFilterOption,
+} from "../components/app/list-filters.js";
 import { DEFAULT_PAGE_SIZE, type PageSize } from "../components/app/page-size.js";
 import { PageHeader } from "../components/app/page.js";
 import { statusLabel } from "../components/app/status-pill.js";
@@ -29,6 +34,7 @@ const HEADING_ID = "activity-title";
 const FILTERS_ID = "activity-filters";
 const LIVE_REFRESH_MS = 5_000;
 const ACTIVITY_DESCRIPTION = "Agent runs launched by organization triggers.";
+const NO_FILTERED_RUNS = "No runs match these filters";
 const STATUS_OPTIONS = ACTIVITY_STATUSES.map((value) => ({ value, label: statusLabel(value) }));
 const RANGE_OPTIONS = ACTIVITY_RANGES.map((value) => ({
   value,
@@ -95,7 +101,7 @@ export function TriggerActivityPanel() {
     return <ClearListFilters target={target} focusId={FILTERS_ID} />;
   }, [organizationSlug, size]);
   const empty = useMemo(
-    () => (filtered ? { title: "No runs match these filters", action: clear } : undefined),
+    () => (filtered ? { title: NO_FILTERED_RUNS, action: clear } : undefined),
     [clear, filtered],
   );
   if (snapshot.status === "pending") {
@@ -119,10 +125,13 @@ export function TriggerActivityPanel() {
   const newer =
     previousCursor === null ? null : pageTarget(organizationSlug, search, previousCursor);
   const older = nextCursor === null ? null : pageTarget(organizationSlug, search, nextCursor);
-  const summary =
-    activity.length === 0 || startOffset === null
-      ? `${activity.length} ${activity.length === 1 ? "run" : "runs"}`
-      : `${startOffset + 1} to ${startOffset + activity.length}`;
+  const { summary, announcement } = activityPageFeedback(
+    search,
+    activity.length,
+    startOffset,
+    filtered,
+    triggerOptions,
+  );
   return (
     <>
       <PageHeader id={HEADING_ID} title="Activity" description={ACTIVITY_DESCRIPTION} />
@@ -176,12 +185,42 @@ export function TriggerActivityPanel() {
         position={cursor ?? ""}
         fallbackFocusId={HEADING_ID}
         summary={summary}
+        announcement={announcement}
         newer={newer}
         older={older}
         pageSize={sizeControl}
       />
     </>
   );
+}
+
+function activityPageFeedback(
+  search: ActivitySearch,
+  runCount: number,
+  startOffset: number | null,
+  filtered: boolean,
+  triggerOptions: readonly ListFilterOption[],
+) {
+  const { status, provider, trigger, range, size } = search;
+  const count = `${runCount} ${runCount === 1 ? "run" : "runs"}`;
+  const rows =
+    runCount === 0 || startOffset === null
+      ? undefined
+      : `${startOffset + 1} to ${startOffset + runCount}`;
+  const announcement = [
+    filtered && runCount === 0 ? NO_FILTERED_RUNS : count,
+    rows === undefined ? undefined : `Rows ${rows}`,
+    `Rows per page ${size ?? DEFAULT_PAGE_SIZE}`,
+    status === undefined ? undefined : `Status ${statusLabel(status)}`,
+    provider === undefined ? undefined : `Provider ${LIST_PROVIDER_LABELS[provider]}`,
+    trigger === undefined
+      ? undefined
+      : `Trigger ${triggerOptions.find(({ value }) => value === trigger)?.label ?? "unavailable"}`,
+    range === undefined ? undefined : ACTIVITY_RANGE_LABELS[range],
+  ]
+    .filter((detail) => detail !== undefined)
+    .join(". ");
+  return { summary: rows ?? count, announcement };
 }
 
 /** Newer follows the server's reverse cursor, so rows inserted since are not skipped. */

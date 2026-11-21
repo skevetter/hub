@@ -39,6 +39,7 @@ test("Activity pages and filters stay in the URL at desktop and phone widths", a
   const rows = table.locator("tbody tr");
   const pager = page.getByRole("navigation", { name: "Activity pages" });
   const size = pager.getByRole("combobox", { name: "Rows per page" });
+  const announcement = pager.getByRole("status");
   const filters = page.getByRole("group", { name: "Filters", exact: true });
   await expect(rows).toHaveCount(15);
   await expect(pager).toContainText("1 to 15");
@@ -49,6 +50,8 @@ test("Activity pages and filters stay in the URL at desktop and phone widths", a
 
   await page.getByRole("combobox", { name: "Status" }).selectOption("succeeded");
   await expect(page).toHaveURL(/[?&]status=succeeded/u);
+  await expect.soft(announcement).toHaveAttribute("aria-live", "polite", { timeout: 1000 });
+  await expect.soft(announcement).toContainText("Status Succeeded", { timeout: 1000 });
   await pager.getByRole("link", { name: "Older" }).click();
   await expect(pager).toContainText("16 to 30");
   await expect(page).toHaveURL(/[?&]cursor=/u);
@@ -61,12 +64,14 @@ test("Activity pages and filters stay in the URL at desktop and phone widths", a
   await expect(rows).toHaveCount(25);
   await expect(pager).toContainText("1 to 25");
   await expect(page).toHaveURL(/[?&]size=25/u);
+  await expect.soft(announcement).toContainText("25 runs", { timeout: 1000 });
   expect(new URL(page.url()).searchParams.get("cursor")).toBeNull();
 
   await page.getByRole("combobox", { name: "Status" }).selectOption("failed");
   await expect(page).toHaveURL(/[?&]status=failed/u);
   await page.getByRole("combobox", { name: "Time range" }).selectOption("24h");
   await expect(page.getByText("No runs match these filters", { exact: true })).toBeVisible();
+  await expect.soft(announcement).toContainText("No runs match these filters", { timeout: 1000 });
   await page.getByRole("link", { name: "Clear filters" }).press("Enter");
   await expect(rows).toHaveCount(25);
   await expect(page).toHaveURL(/\/activity\?size=25$/u);

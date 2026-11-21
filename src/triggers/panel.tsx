@@ -35,7 +35,7 @@ import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
 import { Pagination } from "../components/app/pagination.js";
 import { Steps } from "../components/app/steps.js";
 import { SegmentedControl, type SegmentedOption } from "../components/app/segmented-control.js";
-import { StatusPill } from "../components/app/status-pill.js";
+import { StatusPill, statusLabel } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
 import { Button } from "../components/ui/button.js";
@@ -123,6 +123,7 @@ const TRIGGERS_DESCRIPTION = "Launch agents on your compute when organization ev
 const TRIGGER_EDITOR_DESCRIPTION = "One event launches one agent on your compute.";
 const LIST_HEADING_ID = "triggers-title";
 const LIST_FILTERS_ID = "triggers-filters";
+const NO_FILTERED_TRIGGERS = "No triggers match these filters";
 const triggerListRoute = getRouteApi("/_shell/o/$organizationSlug/triggers/");
 const triggerEditorRoute = getRouteApi("/_shell/o/$organizationSlug/triggers/$triggerId");
 const PROVIDER_OPTIONS = LIST_PROVIDERS.map((value) => ({
@@ -170,6 +171,13 @@ export function TriggersPanel() {
   });
   const filtered =
     search.state !== undefined || search.provider !== undefined || search.q !== undefined;
+  const summary = `${data.triggers.length} ${data.triggers.length === 1 ? "trigger" : "triggers"}`;
+  const size = search.size ?? DEFAULT_PAGE_SIZE;
+  const announcement = triggerListAnnouncement(
+    search,
+    size,
+    filtered && data.triggers.length === 0 ? NO_FILTERED_TRIGGERS : summary,
+  );
   const clear = (
     <ClearListFilters
       target={triggerPageTarget(organizationSlug, { size: search.size })}
@@ -223,7 +231,7 @@ export function TriggersPanel() {
             isEmpty={data.triggers.length === 0}
             empty={
               filtered
-                ? { title: "No triggers match these filters", action: clear }
+                ? { title: NO_FILTERED_TRIGGERS, action: clear }
                 : {
                     title: "No triggers",
                     description: "Connect a provider and daemon, then create your first trigger.",
@@ -289,7 +297,8 @@ export function TriggersPanel() {
             label="Trigger pages"
             position={search.cursor ?? ""}
             fallbackFocusId={LIST_HEADING_ID}
-            summary={`${data.triggers.length} ${data.triggers.length === 1 ? "trigger" : "triggers"}`}
+            summary={summary}
+            announcement={announcement}
             newer={
               data.previousCursor === null
                 ? null
@@ -301,7 +310,7 @@ export function TriggersPanel() {
                 : triggerPageTarget(organizationSlug, search, data.nextCursor)
             }
             pageSize={{
-              value: search.size ?? DEFAULT_PAGE_SIZE,
+              value: size,
               accountId: tenant.account.id,
               onChange: changeSize,
             }}
@@ -312,6 +321,22 @@ export function TriggersPanel() {
       </div>
     </>
   );
+}
+
+function triggerListAnnouncement(
+  { state, provider, q }: TriggerSearch,
+  size: PageSize,
+  summary: string,
+) {
+  return [
+    summary,
+    `Rows per page ${size}`,
+    state === undefined ? undefined : `State ${statusLabel(state)}`,
+    provider === undefined ? undefined : `Provider ${LIST_PROVIDER_LABELS[provider]}`,
+    q === undefined ? undefined : `Name contains ${q}`,
+  ]
+    .filter((detail) => detail !== undefined)
+    .join(". ");
 }
 
 function triggerPageTarget(organizationSlug: string, search: TriggerSearch, cursor?: string) {

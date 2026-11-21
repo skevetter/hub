@@ -24,6 +24,7 @@ test("Trigger filters and page survive opening and saving the editor", async ({ 
   const rows = table.locator("tbody tr");
   const pager = page.getByRole("navigation", { name: "Trigger pages" });
   const size = pager.getByRole("combobox", { name: "Rows per page" });
+  const announcement = pager.getByRole("status");
   const filters = page.getByRole("group", { name: "Filters", exact: true });
   await expect(rows).toHaveCount(15);
   await expect(size).toHaveValue("15");
@@ -33,11 +34,16 @@ test("Trigger filters and page survive opening and saving the editor", async ({ 
   await size.selectOption("25");
   await expect(rows).toHaveCount(20);
   await expect(page).toHaveURL(/[?&]size=25/u);
+  await expect.soft(announcement).toHaveAttribute("aria-live", "polite", { timeout: 1000 });
+  await expect.soft(announcement).toContainText("20 triggers", { timeout: 1000 });
   await size.selectOption("15");
   await expect(rows).toHaveCount(15);
 
   await page.getByRole("combobox", { name: "State" }).selectOption("disabled");
   await expect(page.getByText("No triggers match these filters", { exact: true })).toBeVisible();
+  await expect
+    .soft(announcement)
+    .toContainText("No triggers match these filters", { timeout: 1000 });
   await page.getByRole("link", { name: "Clear filters" }).press("Enter");
   await expect(rows).toHaveCount(15);
   await expect.soft(filters).toBeFocused({ timeout: 1000 });
@@ -45,6 +51,7 @@ test("Trigger filters and page survive opening and saving the editor", async ({ 
   await search.fill("SAMPLE");
   await search.press("Enter");
   await expect(page).toHaveURL(/[?&]q=sample/u);
+  await expect.soft(announcement).toContainText("Name contains sample", { timeout: 1000 });
   await pager.getByRole("link", { name: "Next" }).click();
   await expect(rows).toHaveCount(4);
   await expect(page).toHaveURL(/[?&]cursor=/u);

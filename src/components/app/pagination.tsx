@@ -28,6 +28,7 @@ export function Pagination({
   position,
   fallbackFocusId,
   summary,
+  announcement = summary,
   newer,
   older,
   pageSize,
@@ -40,6 +41,7 @@ export function Pagination({
   /** The element that takes focus when the control the reader pressed no longer exists. */
   fallbackFocusId: string;
   summary: string;
+  announcement?: string;
   newer: PaginationTarget | null;
   older: PaginationTarget | null;
   pageSize?: PageSizeControl;
@@ -63,6 +65,9 @@ export function Pagination({
       className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-3"
     >
       <span className="mr-auto text-xs text-muted-foreground">{summary}</span>
+      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </span>
       {pageSize === undefined ? null : <RowsPerPage {...pageSize} busy={busy} />}
       <div className="flex gap-2">
         <PageLink target={newer} busy={busy}>
