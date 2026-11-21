@@ -121,6 +121,24 @@ async function testFilters(database: Database) {
   );
 }
 
+async function assertRunReceiptIsNotDropped(database: Database, receiptId: string) {
+  assert.equal((await database.findTriggerRunsByProviderEventReceiptId(receiptId)).length, 1);
+  // Another route in the same fan-out can drop the shared receipt after a run starts.
+  await database.markProviderEventDropped(receiptId, "no_trigger_for_source", organizationId);
+  const page = await database.listDroppedEventPage(organizationId, {
+    limit: 15,
+    provider: "manual",
+  });
+  const counts = await database.countRecentDroppedEvents(organizationId, new Date(0));
+  assert.deepEqual(
+    {
+      events: page.records.map(({ id }) => id),
+      counts: counts.filter(({ provider }) => provider === "manual"),
+    },
+    { events: [], counts: [] },
+  );
+}
+
 describe("memory dropped event pages", () => {
   const database = createMemoryDatabase({
     organizationIds: [organizationId, other],
@@ -134,6 +152,46 @@ describe("memory dropped event pages", () => {
     walk(database, limit),
   );
   it("combines filters and isolates receipt metadata", () => testFilters(database));
+  it("excludes a shared receipt when one fan-out branch starts a run", async () => {
+    const project = await database.createProject({
+      organizationId,
+      name: "Fan-out branch",
+      slug: "fan-out-branch",
+      createdByUserId: null,
+    });
+    const revision = await database.insertProjectConfigurationRevision({
+      projectId: project.id,
+      sourceKind: "manual",
+      sourceEvidence: { kind: "test" },
+      normalizedConfiguration: { environments: [], triggers: [] },
+      contentHash: "fan-out-test",
+    });
+    await database.activateProjectConfigurationRevision(project.id, revision.id, []);
+    const result = await database.persistManualEvent({
+      organizationId,
+      projectId: project.id,
+      deliveryId: "fan-out-delivery",
+      source: "manual.run",
+      payload: {},
+      receivedAt,
+    });
+    assert.equal(result.status, "accepted");
+    await database.createAcceptedTriggerRun({
+      organizationId,
+      projectId: project.id,
+      configurationRevisionId: revision.id,
+      providerEventReceiptId: result.event.providerEventReceiptId,
+      configuredTriggerName: "fan-out",
+      prompt: "",
+      inputs: {},
+      values: {},
+      triggerContext: {},
+      outputContext: {},
+      deadlineAt: new Date(receivedAt.getTime() + 3600000),
+      stepIds: ["work"],
+    });
+    await assertRunReceiptIsNotDropped(database, result.event.providerEventReceiptId);
+  });
   it("resolves a Linear workspace and expires a verified unsupported receipt", async () => {
     const store = createMemoryDatabase({
       organizationIds: [organizationId],
@@ -200,6 +258,10 @@ describe("PostgreSQL dropped event pages", () => {
     walk(harness.database, limit),
   );
   it("combines filters and isolates receipt metadata", () => testFilters(harness.database));
+  it("excludes a shared receipt when one fan-out branch starts a run", async () => {
+    const run = await harness.createRun();
+    await assertRunReceiptIsNotDropped(harness.database, run.providerEventReceiptId);
+  });
   it("keeps 5,000 unsupported Linear receipts per organization and deduplicates signed deliveries", async () => {
     await harness.runtime.query(
       `
@@ -306,6 +368,21 @@ describe("PostgreSQL dropped event pages", () => {
     `,
       [organizationId, other],
     );
+    await harness.createRun();
+    await harness.runtime.query(
+      `insert into trigger_runs
+         (organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
+          configured_trigger_name, status, prompt, deadline_at)
+       select receipt.organization_id, fixture.project_id, fixture.configuration_revision_id,
+              receipt.id, 'plan-run', 'succeeded', '', receipt.received_at
+       from provider_event_receipts receipt
+       cross join (select project_id, configuration_revision_id from trigger_runs limit 1) fixture
+       where receipt.organization_id = $1 and receipt.delivery_id like 'plan-%'
+         and receipt.dropped_reason is null
+       limit 800`,
+      [organizationId],
+    );
+    await harness.runtime.query("analyze trigger_runs");
     await harness.runtime.query("analyze provider_event_receipts");
     const captured: { sql: string; params: readonly unknown[] }[] = [];
     const connection = await harness.connect();
@@ -340,6 +417,8 @@ describe("PostgreSQL dropped event pages", () => {
     });
     await read({ provider: "linear", source: "linear.unseen" });
     await read({ provider: "linear" });
+    await read({ provider: "linear", reason: "trigger_filters_rejected" });
+    await read({ provider: "linear", receivedSince: new Date("2026-06-01T00:03:00Z") });
     const emptyProviderQuery = captured.length;
     assert.deepEqual((await read({ provider: "github" })).records, []);
     await read({ reason: "configuration_unavailable" });
@@ -352,7 +431,7 @@ describe("PostgreSQL dropped event pages", () => {
     assert.deepEqual(counts, [
       { provider: "linear", reason: "trigger_filters_rejected", count: 2500 },
     ]);
-    assert.equal(captured.length, 17);
+    assert.equal(captured.length, 19);
 
     const plans: string[] = [];
     for (const [index, { sql, params }] of captured.entries()) {
@@ -366,7 +445,10 @@ describe("PostgreSQL dropped event pages", () => {
       plans.push(plan);
     }
     for (const [index, plan] of plans.entries()) {
-      assert.doesNotMatch(plan, /Incremental Sort|Seq Scan on provider_event_receipts/u);
+      assert.doesNotMatch(
+        plan,
+        /Incremental Sort|Seq Scan on (?:provider_event_receipts|trigger_runs)/u,
+      );
       if (index === emptyProviderQuery && plan.includes("Sort Key")) {
         // PostgreSQL may choose the older provider index and sort its empty result.
         assert.match(plan, /Sort .*actual time=[^\n]*rows=0 loops=1/u);
@@ -374,7 +456,7 @@ describe("PostgreSQL dropped event pages", () => {
         assert.doesNotMatch(plan, /Rows Removed by Filter/u);
         continue;
       }
-      assert.doesNotMatch(plan, /Sort Key/u);
+      assert.doesNotMatch(plan, /Sort Key: (?:receipt\.|provider_event_receipts\.)/u);
       assert.match(
         plan,
         /provider_event_receipts_org_dropped_(order|source|provider|reason|routing|other)_idx/u,

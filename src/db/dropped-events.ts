@@ -31,12 +31,21 @@ export function otherDropPredicate(column: "dropped_reason" | "receipt.dropped_r
   return `${column} not in (${RECEIPT_REASON_CODES.map((reason) => `'${reason}'`).join(", ")})`;
 }
 
+// Keep the receipt order with an indexed existence probe, including for sparse filters.
+const NO_RECEIPT_RUNS = `not exists (
+  select 1 from trigger_runs runs where runs.provider_event_receipt_id = receipt.id offset 0
+)`;
+
 function receiptPageFilters(
   { provider, reason, receivedSince, source }: DroppedEventPageRequest,
   params: unknown[],
 ) {
   const bind = (value: unknown) => `$${params.push(value)}`;
-  const filters = ["receipt.organization_id = $1", "receipt.dropped_reason is not null"];
+  const filters = [
+    "receipt.organization_id = $1",
+    "receipt.dropped_reason is not null",
+    NO_RECEIPT_RUNS,
+  ];
   if (provider === "webhook") {
     filters.push("receipt.provider = 'manual' and receipt.source = 'webhook.received'");
   } else if (provider !== undefined) {
@@ -170,8 +179,9 @@ export async function countRecentDroppedEvents(
   const { rows } = await database.query<{ provider: Provider; reason: string; count: number }>(
     `select provider, dropped_reason as reason, count(*)::int as count
      from (
-       select provider, dropped_reason from provider_event_receipts
+       select provider, dropped_reason from provider_event_receipts receipt
        where organization_id = $1 and received_at >= $2 and dropped_reason is not null and dropped_reason <> $4
+         and ${NO_RECEIPT_RUNS}
        order by received_at desc nulls first, id desc nulls first limit $3
      ) recent
      group by provider, dropped_reason`,

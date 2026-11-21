@@ -6296,7 +6296,9 @@ class MemoryDatabase implements Database {
   private droppedReceipts(organizationId: string) {
     return [...this.providerEventReceipts.values()]
       .flatMap((receipt) =>
-        receipt.organizationId === organizationId && receipt.droppedReason !== null
+        receipt.organizationId === organizationId &&
+        receipt.droppedReason !== null &&
+        !this.triggerRunIdsByProviderEventReceipt.has(receipt.id)
           ? [{ ...receipt, droppedReason: receipt.droppedReason }]
           : [],
       )
