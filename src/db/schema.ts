@@ -727,6 +727,50 @@ export const runProgressMessages = pgTable(
     index("run_progress_messages_sweep_idx").on(table.state, table.leaseExpiresAt),
   ],
 );
+export const runReplyDeliveries = pgTable(
+  "run_reply_deliveries",
+  {
+    triggerRunId: uuid("trigger_run_id").primaryKey(),
+    organizationId: text("organization_id").notNull(),
+    commentId: uuid("comment_id").notNull().defaultRandom().unique(),
+    state: text()
+      .$type<import("../run-replies/store.js").RunReplyRecord["state"]>()
+      .notNull()
+      .default("pending"),
+    length: integer(),
+    contentHash: text("content_hash"),
+    bindingHash: text("binding_hash"),
+    attemptedAt: timestamp("attempted_at", { withTimezone: true }),
+    failure: text().$type<import("../run-replies/store.js").RunReplyFailure>(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.triggerRunId, table.organizationId],
+      foreignColumns: [triggerRuns.id, triggerRuns.organizationId],
+      name: "run_reply_deliveries_run_organization_fk",
+    }).onDelete("cascade"),
+    check(
+      "run_reply_deliveries_state_check",
+      sql`(${table.state} in ('pending', 'sending', 'sent') and ${table.failure} is null)
+          or (${table.state} = 'refused' and ${table.failure} is not null)`,
+    ),
+    check(
+      "run_reply_deliveries_attempt_check",
+      sql`(${table.attemptedAt} is null and ${table.state} in ('pending','refused')
+              and ${table.length} is null and ${table.contentHash} is null and ${table.bindingHash} is null)
+          or (${table.attemptedAt} is not null and ${table.state} in ('sending','sent','refused')
+              and ${table.length} is not null and ${table.length} between 1 and 3500
+              and ${table.contentHash} is not null and ${table.bindingHash} is not null)`,
+    ),
+    index("run_reply_deliveries_organization_attempt_idx")
+      .on(table.organizationId, table.attemptedAt)
+      .where(sql`${table.attemptedAt} is not null`),
+    index("run_reply_deliveries_repair_idx")
+      .on(table.state, table.attemptedAt)
+      .where(sql`${table.state} in ('pending', 'sending')`),
+  ],
+);
+
 export const workflowStepRuns = pgTable(
   "workflow_step_runs",
   {

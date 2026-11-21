@@ -927,6 +927,7 @@ export interface WorkflowWakeupRecord {
 }
 
 export interface CreateAcceptedTriggerRunInput {
+  replyMessage?: true;
   conversation?: import("../triggers/continuation.js").Conversation | null;
   id?: string;
   organizationId: string;
@@ -1501,6 +1502,7 @@ export interface Database
     (TransitionTriggerRunResult & { executionIds: string[]; conflict?: number }) | undefined
   >;
   readonly stopInterrupts: import("./stop-interrupt.js").StopInterruptStore;
+  readonly runReplies: import("../run-replies/store.js").RunReplyStore;
   succeedTriggerRun(triggerRunId: string): Promise<TransitionTriggerRunResult | undefined>;
   failWorkflowRun(
     triggerRunId: string,

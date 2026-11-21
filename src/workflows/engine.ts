@@ -349,6 +349,7 @@ export class DurableWorkflowEngine {
             inputs: acceptedMatch.invocation.inputs,
             triggerContext: acceptedMatch.triggerContext,
             outputContext: acceptedMatch.outputContext,
+            ...(compiledTrigger.replyMessage === true ? { replyMessage: true } : {}),
             conversation: acceptedMatch.conversation,
             deadlineAt: runDeadline,
             stepIds: compiledTrigger.steps.map((step) => step.id),
