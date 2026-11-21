@@ -6,6 +6,7 @@ import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import { it } from "vitest";
 import { formatRunReply } from "./format.js";
+import { realisticAnswers } from "./test-utils/answers.js";
 
 const hazards = ["[a](", "[^a]", "*a_"];
 
@@ -29,14 +30,10 @@ it.each(hazards)("bounds Markdown work for repeated %s", (shape) => {
   }
 });
 
-it.each([
-  ["> ", "\\> "],
-  ["- ", "\\- "],
-  ["1. ", "1\\. "],
-])("renders deeply nested %s containers as escaped plain text", (marker, escaped) => {
+it.each(["> ", "- ", "1. "])("renders deeply nested %s containers within the limits", (marker) => {
   const body = formatRunReply({ text: `${marker.repeat(2_000)}Answer @bob`, truncated: false }, []);
-  assert.ok(body.startsWith(escaped.repeat(2)));
   assert.ok(body.length <= 3_500);
+  assert.ok(body.length > 0);
   assert.doesNotMatch(body, /[@\uFF20]/u);
 });
 
@@ -166,4 +163,98 @@ it("leaves no autolink to a profile or mention across 3,600 generated documents"
       }
     }
   }
+});
+
+function contentOf(markdown: string): string {
+  const parts: string[] = [];
+  const walk = (node: Root | RootContent) => {
+    if (node.type === "text" || node.type === "inlineCode" || node.type === "code")
+      parts.push(node.value);
+    if ("children" in node) for (const child of node.children) walk(child);
+    if (node.type !== "text" && node.type !== "inlineCode") parts.push("\n");
+  };
+  walk(fromMarkdown(markdown, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] }));
+  return parts.join(" ").replace(/\s+/gu, " ").trim();
+}
+
+it("keeps Markdown and every non-mention word of 80 realistic answers", () => {
+  const answers = realisticAnswers(80);
+  assert.equal(answers.length, 80);
+  for (const [index, text] of answers.entries()) {
+    const reasons: string[] = [];
+    const body = formatRunReply({ text, truncated: false }, [], {
+      onFallback: (reason) => reasons.push(reason),
+    });
+    assert.deepEqual(reasons, [], `answer ${index} (${text.length} chars) took the fallback`);
+    assert.equal(
+      contentOf(body),
+      contentOf(text).replaceAll("@", "[at]"),
+      `answer ${index} lost content`,
+    );
+  }
+});
+
+it("keeps an ordinary 2,136-character answer as Markdown", () => {
+  const unit =
+    "### `src/retry.ts`\n\n```ts\nexport async function retry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {\n" +
+    "  for (let i = 0; i < attempts; i++) {\n    try {\n      return await fn();\n    } catch (error) {\n" +
+    '      if (i === attempts - 1) throw error;\n    }\n  }\n  throw new Error("unreachable");\n}\n```\n\n' +
+    "- Wraps `fn` and retries **3** times.\n- Rethrows the last `error`.\n- See [retry docs](https://example.com/retry).\n\n";
+  const text = `I added a retry helper and used it in the reply writer.\n\n${unit.repeat(5)}`;
+  const body = formatRunReply({ text, truncated: false }, []);
+  assert.ok(body.includes("```ts"));
+  assert.ok(body.includes("retry<T>(fn: () => Promise<T>"));
+  assert.ok(body.includes("\n    try {"));
+});
+
+it("keeps fences, generics, indentation and list markers when it falls back", () => {
+  const text = [
+    "Result for @bob:",
+    "",
+    "```ts @team",
+    "export function pick<T>(items: T[], at = 0): T {",
+    "  return items[at]; // ping @bob",
+    "}",
+    "```",
+    "",
+    "- first *item*",
+    "  - nested [link](https://example.com)",
+    "2. second",
+    "",
+    "Plain line with <T> and a_b.",
+  ].join("\n");
+  const reasons: string[] = [];
+  const body = formatRunReply({ text, truncated: false }, [], {
+    now: plainClock(),
+    onFallback: (reason) => reasons.push(reason),
+  });
+  assert.deepEqual(reasons, ["budget"]);
+  assert.ok(
+    body.includes("```ts\nexport function pick<T>(items: T[], at = 0): T {\n  return items["),
+  );
+  assert.ok(body.includes("\n```\n"));
+  assert.doesNotMatch(body, /@/u);
+  assert.ok(body.includes("\n- first \\*item\\*\n  - nested \\[link\\]"));
+  assert.ok(body.includes("\n2. second"));
+  assert.ok(body.includes("Plain line with \\<T\\> and a\\_b\\."));
+  assert.match(body, /^Result for \\\[at\\\]bob\\:/u);
+});
+
+it.each([
+  ["a run of openers", "[".repeat(300)],
+  ["unmatched parentheses", "[a](".repeat(700)],
+  ["unmatched emphasis", "*a_".repeat(600)],
+  ["footnote labels", "[^a]".repeat(150)],
+  ["table cells", `a|b\n-|-\n${"|".repeat(700)}`],
+])("takes the fallback for %s", (_name, text) => {
+  const reasons: string[] = [];
+  formatRunReply({ text, truncated: false }, [], { onFallback: (reason) => reasons.push(reason) });
+  assert.deepEqual(reasons, ["structure"]);
+});
+
+it("keeps an entity inside fallback code from decoding into a mention", () => {
+  const text = "```\nping &amp;#64;bob and pro&#102;iles\n```";
+  const body = formatRunReply({ text, truncated: false }, [], { now: plainClock() });
+  assert.ok(body.startsWith("```\nping "));
+  assert.doesNotMatch(body, /@/u);
 });

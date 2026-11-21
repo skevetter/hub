@@ -20,8 +20,14 @@ const RAW_TRUNCATION_MARGIN = 48;
 const MAX_RENDER_ATTEMPTS = 3;
 const SHORT_PLAIN_PREFIX = 256;
 const MARKDOWN_BUDGET_MS = 150;
-const MAX_MARKDOWN_DELIMITERS = 192;
-const MARKDOWN_DELIMITER = /[[\]()*_~`<>!&\\]+/gu;
+const MAX_OPENER_RUN = 200;
+const MAX_UNMATCHED_BRACKETS = 600;
+const MAX_EMPHASIS_CHARS = 1_000;
+const MAX_FOOTNOTE_LABELS = 100;
+const MAX_TABLE_ROWS = 250;
+const MAX_PIPES = 600;
+const MAX_LIST_INDENT = 12;
+const OPENER_RUN = new RegExp(`([[(*_~<])\\1{${MAX_OPENER_RUN - 1}}`, "u");
 const MARKDOWN_CONTAINER_CHAIN = /(?:(?:[-+*>]|\d{1,9}[.)])[ \t]+){33}/u;
 const URL_START = /https?:\/\/|www\.|(?<![\w-])linear\.app\.?(?=[:/])/giu;
 const URL_RUN = /[^\s<>()[\]"'`]*/uy;
@@ -29,7 +35,6 @@ const LINEAR_HOST_PATH = /linear\.app\.?(?::\d{1,5})?(\/[^\s<>()[\]"'`\\?#]*)/gi
 const LINEAR_MENTION_PATH = /\/(?:profiles|users|agents)(?:\/|$)/iu;
 const MENTION_SIGN = /[@\uFF20]|&(?:#0*64|#x0*40|commat);/giu;
 const USER_TAG = /(?:<|&lt;)\/?user\b[^<>\r\n]*?(?:>|&gt;|$)/gimu;
-const HTML_MARKUP = /<!--[\s\S]*?(?:-->|$)|<\/?[a-zA-Z][^<>\r\n]*>/gu;
 
 export interface FormatOptions {
   now?: () => number;
@@ -64,8 +69,17 @@ export function formatRunReply(
     plainText = markdown === undefined;
     const safe = markdown ?? renderPlainText(source);
     if (safe === "") return safe;
-    if (!truncated && safe.length <= MAX_REPLY_CHARS) return safe;
-    if (safe.length <= TRUNCATED_TEXT_LIMIT) return safe + TRUNCATION;
+    const whole = !truncated && safe.length <= MAX_REPLY_CHARS;
+    if (whole || safe.length <= TRUNCATED_TEXT_LIMIT) {
+      // Parsing is superlinear on escape-heavy text, so only the reply that will post is checked.
+      if (hasUnsafeNode(safe)) {
+        if (plainText) throw new Error("Linear reply contains an unsafe link after rendering");
+        plainText = true;
+        report("structure");
+        continue;
+      }
+      return whole ? safe : safe + TRUNCATION;
+    }
     truncated = true;
     limit = Math.floor(
       (prefix.length * (TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN)) / safe.length,
@@ -76,6 +90,7 @@ export function formatRunReply(
   const safe = renderPlainText(cleanSource(redacted!));
   if (safe.length > TRUNCATED_TEXT_LIMIT)
     throw new Error("Linear reply exceeds the rendering limit");
+  if (hasUnsafeNode(safe)) throw new Error("Linear reply contains an unsafe link after rendering");
   return safe === "" ? safe : safe + TRUNCATION;
 }
 
@@ -108,7 +123,7 @@ function renderMarkdown(
   report: (reason: "structure" | "budget") => void,
 ): string | undefined {
   // Micromark is synchronous. Bound delimiter-heavy input before any parser runs.
-  if (tooManyDelimiters(source) || MARKDOWN_CONTAINER_CHAIN.test(source)) {
+  if (!boundedStructure(source) || MARKDOWN_CONTAINER_CHAIN.test(source)) {
     report("structure");
     return undefined;
   }
@@ -126,29 +141,118 @@ function renderMarkdown(
     extensions: [gfmToMarkdown({ tablePipeAlign: false })],
   }).trim();
   if (late()) return undefined;
-  if (hasSafeProse(result) && !hasUnsafeNode(result)) return result;
+  if (hasSafeProse(result)) return result;
   report("structure");
   return undefined;
 }
 
-function tooManyDelimiters(source: string): boolean {
-  let count = 0;
-  for (const run of source.matchAll(MARKDOWN_DELIMITER)) {
-    count += run[0].length;
-    if (count > MAX_MARKDOWN_DELIMITERS) return true;
+// Limits on the shapes that make micromark slow, not on punctuation in general: ordinary
+// answers are full of brackets, parentheses and underscores.
+function boundedStructure(source: string): boolean {
+  if (OPENER_RUN.test(source)) return false;
+  let square = 0;
+  let round = 0;
+  let emphasis = 0;
+  let footnotes = 0;
+  let rows = 0;
+  let pipes = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    switch (source[index]) {
+      case "[":
+        square += 1;
+        if (source[index + 1] === "^") footnotes += 1;
+        break;
+      case "]":
+        square = Math.max(0, square - 1);
+        break;
+      case "(":
+        round += 1;
+        break;
+      case ")":
+        round = Math.max(0, round - 1);
+        break;
+      case "*":
+      case "_":
+        emphasis += 1;
+        break;
+      case "|":
+        pipes += 1;
+        if (index === 0 || source[index - 1] === "\n") rows += 1;
+        break;
+    }
   }
-  return false;
+  return (
+    square <= MAX_UNMATCHED_BRACKETS &&
+    round <= MAX_UNMATCHED_BRACKETS &&
+    emphasis <= MAX_EMPHASIS_CHARS &&
+    footnotes <= MAX_FOOTNOTE_LABELS &&
+    rows <= MAX_TABLE_ROWS &&
+    pipes <= MAX_PIPES
+  );
 }
 
+// Keeps fenced code verbatim and the line structure of the rest, and escapes inline Markdown
+// outside fences. Only mention and link text is rewritten.
 function renderPlainText(source: string): string {
-  const result = neutralizeMentions(source.replace(HTML_MARKUP, ""))
-    .replace(/^[ \t]+/gmu, "")
-    .replace(/[!-/:-@[-`{-~]/gu, "\\$&")
-    .trim();
+  const out: string[] = [];
+  let fence: { char: string; size: number; info: string } | undefined;
+  let code: string[] = [];
+  let inList = false;
+  const flush = () => {
+    if (fence === undefined) return;
+    const longest = Math.max(
+      0,
+      ...[...code.join("\n").matchAll(/`+/gu)].map((run) => run[0].length),
+    );
+    const ticks = "`".repeat(Math.max(3, longest + 1));
+    out.push(ticks + fence.info, ...code, ticks);
+    fence = undefined;
+    code = [];
+  };
+  for (const line of source.split(/\r\n|\r|\n/u)) {
+    if (fence !== undefined) {
+      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/u.exec(line);
+      if (close && close[1]![0] === fence.char && close[1]!.length >= fence.size) flush();
+      else code.push(neutralizeCode(line));
+      continue;
+    }
+    const open = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+    if (open && !(open[1]![0] === "`" && open[2]!.includes("`"))) {
+      const info = /^[\w+#.-]{1,20}/u.exec(open[2]!.trim())?.[0] ?? "";
+      fence = { char: open[1]![0]!, size: open[1]!.length, info };
+      continue;
+    }
+    const item = /^( *)([-*+]|\d{1,9}[.)])( +)(.*)$/u.exec(line);
+    const indent = /^ */u.exec(line)![0].length;
+    if (item) {
+      inList = true;
+      const kept = Math.min(item[1]!.length, MAX_LIST_INDENT);
+      out.push(`${" ".repeat(kept)}${item[2]} ${escapeInline(item[4]!)}`);
+    } else if (line.trim() === "") {
+      out.push("");
+    } else {
+      // Deep indentation outside a list would become code, where escapes show as backslashes.
+      const kept = inList && indent >= 4 ? Math.min(indent, MAX_LIST_INDENT) : 0;
+      if (indent === 0) inList = false;
+      out.push(" ".repeat(kept) + escapeInline(line.trim()));
+    }
+  }
+  flush();
+  const result = out.join("\n").trim();
   if (!hasSafeProse(result)) throw new Error("Linear reply contains unsafe text after rendering");
-  if (hasUnsafeNode(result))
-    throw new Error("Linear reply contains an unsafe link after rendering");
   return result;
+}
+
+// Code is not decoded by Markdown, but the final check reads the whole reply once decoded, so an
+// entity that would decode into a mention keeps its ampersand literal.
+function neutralizeCode(line: string): string {
+  const value = neutralizeMentions(line);
+  const decoded = cleanSource(decodeString(value));
+  return neutralizeMentions(decoded) === decoded ? value : value.replaceAll("&", "&amp;");
+}
+
+function escapeInline(text: string): string {
+  return neutralizeMentions(text).replace(/[!-/:-@[-`{-~]/gu, "\\$&");
 }
 
 // Escaping can expose a link the source did not have, so the final text is parsed again and
