@@ -49,7 +49,7 @@ vi.mock("../queries/index.js", async (importOriginal) => ({
     const data =
       queryKey[0] === "run-detail"
         ? { sequence: 1, value: state.snapshot }
-        : { triggers: [], newerCount: 0, ...state.snapshot };
+        : { triggers: [], startOffset: 0, ...state.snapshot };
     if (state.failed) return { status: "error", error: "Fixture unavailable" };
     return { status: "success", data, refetch: () => {}, refreshFailure: state.refreshFailure };
   },

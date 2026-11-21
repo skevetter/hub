@@ -472,7 +472,9 @@ export class TriggerDashboard {
         ...(status === undefined ? {} : { status }),
         ...(provider === undefined ? {} : { provider }),
         ...(createdSince === undefined ? {} : { createdSince }),
-        ...(position === undefined ? {} : { position }),
+        ...(position === undefined
+          ? {}
+          : { position: { direction: position.direction, key: position.key } }),
       });
     const cursorScope = activityCursorScope(tenant.organization.id, limit, input);
     const requested = decodeActivityCursor(input.cursor, cursorScope);
@@ -488,16 +490,24 @@ export class TriggerDashboard {
       );
       return owner === undefined ? [] : [activityRow(owner.trigger, entry)];
     });
+    // Only the newest page has a known rank after insertions ahead of a reverse cursor.
+    const startOffset = page.newer === null ? 0 : requested?.offset || null;
+    const nextOffset = startOffset === null ? undefined : startOffset + rows.length;
+    const previousOffset = startOffset === null ? undefined : Math.max(0, startOffset - limit);
     return {
       organization: tenant.organization,
       activity: rows,
       triggers: triggers.map(({ id, name }) => ({ id, name })),
       limit,
-      newerCount: page.newerCount,
+      startOffset,
       nextCursor:
-        page.older === null ? null : encodeActivityCursor("before", page.older, cursorScope),
+        page.older === null
+          ? null
+          : encodeActivityCursor("before", page.older, cursorScope, nextOffset),
       previousCursor:
-        page.newer === null ? null : encodeActivityCursor("after", page.newer, cursorScope),
+        page.newer === null
+          ? null
+          : encodeActivityCursor("after", page.newer, cursorScope, previousOffset),
     };
   }
 

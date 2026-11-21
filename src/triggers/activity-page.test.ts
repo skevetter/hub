@@ -103,7 +103,7 @@ describe("trigger activity pages", () => {
     const ids = (page: Awaited<ReturnType<typeof read>>) => page.activity.map(({ id }) => id);
     let page = await read();
     for (;;) {
-      assert.equal(page.newerCount, pages.length * limit);
+      assert.equal(page.startOffset, pages.length * limit);
       pages.push(ids(page));
       if (page.nextCursor === null) break;
       page = await read(page.nextCursor);
@@ -300,5 +300,35 @@ describe("trigger activity pages", () => {
       key,
     });
     assert.equal(decodeActivityCursor(undefined, scope(3)), undefined);
+  });
+
+  it("uses cursor offsets for display only and tolerates older or malformed offsets", async () => {
+    const { dashboard, request } = await dashboardWithRuns(40);
+    const first = await dashboard.activityPage(request, "acme", { limit: 15 });
+    const firstKey = decodeActivityCursor(first.nextCursor!, scope(15))!.key;
+    const prefix = ["before", firstKey.createdAt, firstKey.id, scope(15)];
+    const list = async (offset?: unknown) => {
+      const value = offset === undefined ? prefix : [...prefix, offset];
+      const cursor = Buffer.from(JSON.stringify(value)).toString("base64url");
+      return dashboard.activityPage(request, "acme", { limit: 15, cursor });
+    };
+    const second = await list(15);
+    assert.equal(second.startOffset, 15);
+    assert.notEqual(second.activity[0]?.id, first.activity[0]?.id);
+    const forged = await list(26000);
+    assert.equal(forged.startOffset, 26000);
+    assert.deepEqual(forged.activity, second.activity);
+    for (const offset of [undefined, -1, 0, 1.5, "15", Number.MAX_SAFE_INTEGER, {}]) {
+      const page = await list(offset);
+      assert.equal(page.startOffset, null);
+      assert.deepEqual(page.activity, second.activity);
+      assert.ok(page.previousCursor);
+      const back = await dashboard.activityPage(request, "acme", {
+        limit: 15,
+        cursor: page.previousCursor,
+      });
+      assert.equal(back.startOffset, 0);
+      assert.deepEqual(back.activity, first.activity);
+    }
   });
 });

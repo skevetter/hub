@@ -895,7 +895,6 @@ export interface ActivityRunPageRequest {
 
 export interface ActivityRunPageRecord {
   records: ProjectActivityRunListRecord[];
-  newerCount: number;
   /** Key of the last record when older runs exist. */
   older: ActivityRunKey | null;
   /** Key of the first record when newer runs exist. */

@@ -2818,7 +2818,7 @@ class PgDatabase implements Database {
     scopes: readonly ActivityRunScope[],
     request: ActivityRunPageRequest,
   ): Promise<ActivityRunPageRecord> {
-    if (scopes.length === 0) return { records: [], newerCount: 0, older: null, newer: null };
+    if (scopes.length === 0) return { records: [], older: null, newer: null };
     const scopeParams: unknown[] = [
       organizationId,
       scopes.map(({ projectId }) => projectId),
@@ -2865,36 +2865,28 @@ class PgDatabase implements Database {
     if (after) page.reverse();
     const first = page[0];
     const last = page.at(-1);
-    // A keyset stays adjacent after inserts, so the display range comes from the current key.
-    const newerCount =
-      first === undefined || position === undefined || (after && !more)
-        ? 0
-        : Number(
-            (
-              await query<{ count: string }>(
-                this.pool,
-                `select count(*) ${scoped} and (runs.created_at, runs.id) > ${boundary}`,
-                [...scopeParams, first.page_created_at, first.id],
-              )
-            ).rows[0]?.count ?? 0,
-          );
-    const hasOlder = after
-      ? last !== undefined &&
+    const adjacent = async (row: typeof first, comparison: "<" | ">") => {
+      if (row === undefined) return false;
+      const order = comparison === "<" ? "desc nulls last" : "asc nulls first";
+      return (
         (
           await query(
             this.pool,
-            `select 1 ${scoped} and (runs.created_at, runs.id) < ${boundary} limit 1`,
-            [...scopeParams, last.page_created_at, last.id],
+            `select 1 ${scoped} and (runs.created_at, runs.id) ${comparison} ${boundary}
+             order by runs.created_at ${order}, runs.id ${order} limit 1`,
+            [...scopeParams, row.page_created_at, row.id],
           )
         ).rows.length > 0
-      : more;
+      );
+    };
+    const hasOlder = after ? await adjacent(last, "<") : more;
+    const hasNewer = after ? more : position !== undefined && (await adjacent(first, ">"));
     const keyOf = (row: typeof first) =>
       row === undefined ? null : { createdAt: row.page_created_at, id: row.id };
     return {
       records: page.map((row) => this.toProjectActivityRunList(row)),
-      newerCount,
       older: hasOlder ? keyOf(last) : null,
-      newer: newerCount > 0 ? keyOf(first) : null,
+      newer: hasNewer ? keyOf(first) : null,
     };
   }
 

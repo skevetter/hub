@@ -4,8 +4,10 @@ import type { ActivityRunKey, ActivityRunPageRequest } from "../db/types.js";
 import type { ActivityFilters } from "./activity-query.js";
 
 type Position = NonNullable<ActivityRunPageRequest["position"]>;
+type ActivityCursor = Position & { offset?: number };
 
 const CURSOR_MAX = 512;
+const MAX_DISPLAY_OFFSET = 1_000_000;
 const BASE64URL = /^[A-Za-z0-9_-]+$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
@@ -23,17 +25,29 @@ export function encodeActivityCursor(
   direction: Position["direction"],
   key: ActivityRunKey,
   scope: string,
+  offset?: number,
 ): string {
-  return Buffer.from(JSON.stringify([direction, key.createdAt, key.id, scope])).toString(
-    "base64url",
-  );
+  const display = displayOffset(offset);
+  const fields = [direction, key.createdAt, key.id, scope];
+  return Buffer.from(
+    JSON.stringify(display === undefined ? fields : [...fields, display]),
+  ).toString("base64url");
+}
+
+function displayOffset(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= MAX_DISPLAY_OFFSET
+    ? value
+    : undefined;
 }
 
 /** A cursor the reader cannot trust is no position: the page falls back to the newest runs. */
 export function decodeActivityCursor(
   cursor: string | undefined,
   scope: string,
-): Position | undefined {
+): ActivityCursor | undefined {
   if (cursor === undefined || cursor.length > CURSOR_MAX || !BASE64URL.test(cursor)) {
     return undefined;
   }
@@ -42,8 +56,8 @@ export function decodeActivityCursor(
     const bytes = Buffer.from(cursor, "base64url");
     if (bytes.toString("base64url") !== cursor) return undefined;
     const parsed: unknown = JSON.parse(bytes.toString("utf8"));
-    if (!Array.isArray(parsed) || parsed.length !== 4) return undefined;
-    const [direction, createdAt, id, cursorScope] = parsed as unknown[];
+    if (!Array.isArray(parsed) || (parsed.length !== 4 && parsed.length !== 5)) return undefined;
+    const [direction, createdAt, id, cursorScope, rawOffset] = parsed as unknown[];
     if (
       cursorScope !== scope ||
       (direction !== "before" && direction !== "after") ||
@@ -54,7 +68,8 @@ export function decodeActivityCursor(
     ) {
       return undefined;
     }
-    return { direction, key: { createdAt, id } };
+    const offset = displayOffset(rawOffset);
+    return { direction, key: { createdAt, id }, ...(offset === undefined ? {} : { offset }) };
   } catch {
     return undefined;
   }

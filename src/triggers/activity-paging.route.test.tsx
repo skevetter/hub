@@ -146,7 +146,8 @@ describe("activity paging through the router", () => {
     await addRuns(5);
     const newer = await follow("Newer");
     assert.deepEqual(runIds(newer), before.slice(0, 25));
-    assert.equal(summary(newer), "6 to 30");
+    assert.equal(summary(newer), undefined);
+    assert.match(newer, />25 runs</u);
     assert.equal(router.state.location.search.cursor !== undefined, true);
 
     const live = await follow("Newer");

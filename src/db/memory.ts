@@ -4774,21 +4774,18 @@ class MemoryDatabase implements Database {
         : inRange.slice(0, request.limit);
     const first = page[0]?.run;
     const last = page.at(-1)?.run;
-    const newerCount =
-      first === undefined ? 0 : records.findIndex(({ run }) => run.id === first.id);
     const key = (run: { createdAt: Date; id: string }) => ({
       createdAt: run.createdAt.toISOString(),
       id: run.id,
     });
     return {
       records: page,
-      newerCount,
       older:
         last !== undefined &&
         records.some(({ run }) => compareRunsNewestFirst(runOrder(run), runOrder(last)) > 0)
           ? key(last)
           : null,
-      newer: first !== undefined && newerCount > 0 ? key(first) : null,
+      newer: first !== undefined && records[0] !== page[0] ? key(first) : null,
     };
   }
 

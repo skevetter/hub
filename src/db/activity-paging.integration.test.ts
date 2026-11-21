@@ -118,7 +118,6 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
     const ids = () => page.records.map(({ run }) => run.id);
     for (;;) {
       assert.deepEqual(ids(), all.slice(offset, offset + limit));
-      assert.equal(page.newerCount, offset);
       if (page.older === null) break;
       offset += limit;
       page = await read({ direction: "before", key: page.older });
@@ -127,7 +126,6 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
     while (page.newer !== null) {
       page = await read({ direction: "after", key: page.newer });
       offset -= limit;
-      assert.equal(page.newerCount, offset);
       assert.deepEqual(ids(), all.slice(offset, offset + limit));
     }
     assert.equal(offset, 0);
@@ -177,6 +175,45 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
           });
           await explain(`${sample.label} Newer`, observed.mock.calls[0]);
         }
+        const {
+          rows: [deep],
+        } = await runtime.query<{ id: string; createdAt: string }>(
+          `select id, created_at::text as "createdAt" from trigger_runs
+           where organization_id = $1 and project_id = any($2::uuid[])
+           order by created_at desc, id desc offset 11000 limit 1`,
+          [ORGANIZATION, scopes.slice(0, 4).map(({ projectId }) => projectId)],
+        );
+        assert.ok(deep);
+        const captures = [];
+        observed.mockClear();
+        await database.listOrganizationActivityPage(ORGANIZATION, scopes, { limit: 15 });
+        captures.push({ label: "review default first", calls: [...observed.mock.calls] });
+        for (const direction of ["before", "after"] as const) {
+          observed.mockClear();
+          await database.listOrganizationActivityPage(ORGANIZATION, scopes, {
+            limit: 15,
+            position: { direction, key: deep },
+          });
+          captures.push({
+            label: `review default deep ${direction}`,
+            calls: [...observed.mock.calls],
+          });
+        }
+        for (const { label, calls } of captures) {
+          for (const [index, call] of calls.entries()) {
+            await explain(`${label} ${index}`, call);
+          }
+        }
+        assert.deepEqual(
+          captures.map(({ calls }) => calls.length),
+          [1, 2, 2],
+        );
+        for (const { label, calls } of captures) {
+          assert.ok(
+            calls.every(([sql]) => !/\bcount\s*\(/iu.test(sql)),
+            label,
+          );
+        }
       } finally {
         observed.mockRestore();
       }
@@ -198,7 +235,7 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
         `${plan}\n`,
       );
     }
-    if (!label.startsWith("default")) return;
+    if (!label.startsWith("default") && !label.startsWith("review default")) return;
     assert.match(
       plan,
       /Index Scan (?:Backward )?using trigger_runs_organization_created_id_idx/u,

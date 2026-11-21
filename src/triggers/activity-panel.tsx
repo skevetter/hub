@@ -119,10 +119,14 @@ export function TriggerActivityPanel() {
       />
     );
   }
-  const { activity, nextCursor, previousCursor, newerCount } = snapshot.data;
+  const { activity, nextCursor, previousCursor, startOffset } = snapshot.data;
   const newer =
     previousCursor === null ? null : pageTarget(organizationSlug, search, previousCursor);
   const older = nextCursor === null ? null : pageTarget(organizationSlug, search, nextCursor);
+  const summary =
+    activity.length === 0 || startOffset === null
+      ? `${activity.length} ${activity.length === 1 ? "run" : "runs"}`
+      : `${startOffset + 1} to ${startOffset + activity.length}`;
   return (
     <>
       <PageHeader id={HEADING_ID} title="Activity" description={ACTIVITY_DESCRIPTION} />
@@ -175,9 +179,7 @@ export function TriggerActivityPanel() {
         label="Activity pages"
         position={cursor ?? ""}
         fallbackFocusId={HEADING_ID}
-        summary={
-          activity.length === 0 ? "0 runs" : `${newerCount + 1} to ${newerCount + activity.length}`
-        }
+        summary={summary}
         newer={newer}
         older={older}
         pageSize={sizeControl}
