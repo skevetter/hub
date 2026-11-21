@@ -24,6 +24,7 @@ test("Trigger filters and page survive opening and saving the editor", async ({ 
   const rows = table.locator("tbody tr");
   const pager = page.getByRole("navigation", { name: "Trigger pages" });
   const size = pager.getByRole("combobox", { name: "Rows per page" });
+  const filters = page.getByRole("group", { name: "Filters", exact: true });
   await expect(rows).toHaveCount(15);
   await expect(size).toHaveValue("15");
   const shots = process.env["HUB_PAGING_SCREEN_DIR"];
@@ -36,9 +37,10 @@ test("Trigger filters and page survive opening and saving the editor", async ({ 
   await expect(rows).toHaveCount(15);
 
   await page.getByRole("combobox", { name: "State" }).selectOption("disabled");
-  await expect(page.getByText("No triggers match these filters")).toBeVisible();
-  await page.getByRole("link", { name: "Clear filters" }).click();
+  await expect(page.getByText("No triggers match these filters", { exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Clear filters" }).press("Enter");
   await expect(rows).toHaveCount(15);
+  await expect.soft(filters).toBeFocused({ timeout: 1000 });
   const search = page.getByRole("textbox", { name: "Search triggers" });
   await search.fill("SAMPLE");
   await search.press("Enter");

@@ -28,7 +28,7 @@ import { Disclosure } from "../components/app/disclosure.js";
 import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
 import { FormActions } from "../components/app/form-actions.js";
 import { FieldSkeleton, FormField } from "../components/app/form-field.js";
-import { ListFilters, ListFilterSelect } from "../components/app/list-filters.js";
+import { ClearListFilters, ListFilters, ListFilterSelect } from "../components/app/list-filters.js";
 import { LoadingLine, Spinner } from "../components/app/loading.js";
 import { DEFAULT_PAGE_SIZE, type PageSize } from "../components/app/page-size.js";
 import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
@@ -122,6 +122,7 @@ const EVENT_OPTIONS: readonly ComboboxOption[] = EDITOR_EVENTS.map((value) => {
 const TRIGGERS_DESCRIPTION = "Launch agents on your compute when organization events arrive.";
 const TRIGGER_EDITOR_DESCRIPTION = "One event launches one agent on your compute.";
 const LIST_HEADING_ID = "triggers-title";
+const LIST_FILTERS_ID = "triggers-filters";
 const triggerListRoute = getRouteApi("/_shell/o/$organizationSlug/triggers/");
 const triggerEditorRoute = getRouteApi("/_shell/o/$organizationSlug/triggers/$triggerId");
 const PROVIDER_OPTIONS = LIST_PROVIDERS.map((value) => ({
@@ -170,9 +171,10 @@ export function TriggersPanel() {
   const filtered =
     search.state !== undefined || search.provider !== undefined || search.q !== undefined;
   const clear = (
-    <Button variant="outline" size="sm" asChild>
-      <Link {...triggerPageTarget(organizationSlug, { size: search.size })}>Clear filters</Link>
-    </Button>
+    <ClearListFilters
+      target={triggerPageTarget(organizationSlug, { size: search.size })}
+      focusId={LIST_FILTERS_ID}
+    />
   );
   return (
     <>
@@ -342,7 +344,7 @@ function TriggerListFilters({ search, children }: { search: TriggerSearch; child
     setFilter("q", name);
   };
   return (
-    <ListFilters>
+    <ListFilters id={LIST_FILTERS_ID}>
       <form className="flex min-w-0 items-end gap-2" onSubmit={submit}>
         <FormField
           id={nameId}

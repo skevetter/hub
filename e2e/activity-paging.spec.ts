@@ -39,6 +39,7 @@ test("Activity pages and filters stay in the URL at desktop and phone widths", a
   const rows = table.locator("tbody tr");
   const pager = page.getByRole("navigation", { name: "Activity pages" });
   const size = pager.getByRole("combobox", { name: "Rows per page" });
+  const filters = page.getByRole("group", { name: "Filters", exact: true });
   await expect(rows).toHaveCount(15);
   await expect(pager).toContainText("1 to 15");
   await expect(size).toHaveValue("15");
@@ -65,10 +66,11 @@ test("Activity pages and filters stay in the URL at desktop and phone widths", a
   await page.getByRole("combobox", { name: "Status" }).selectOption("failed");
   await expect(page).toHaveURL(/[?&]status=failed/u);
   await page.getByRole("combobox", { name: "Time range" }).selectOption("24h");
-  await expect(page.getByText("No runs match these filters")).toBeVisible();
-  await page.getByRole("link", { name: "Clear filters" }).click();
+  await expect(page.getByText("No runs match these filters", { exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Clear filters" }).press("Enter");
   await expect(rows).toHaveCount(25);
   await expect(page).toHaveURL(/\/activity\?size=25$/u);
+  await expect.soft(filters).toBeFocused({ timeout: 1000 });
 
   const plainUrl = new URL(page.url());
   plainUrl.search = "";

@@ -1,14 +1,57 @@
-import { useId, type ChangeEventHandler, type ReactNode } from "react";
+import { Link } from "@tanstack/react-router";
+import {
+  useCallback,
+  useId,
+  type ChangeEventHandler,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
+import { Button } from "../ui/button.js";
+import type { PaginationTarget } from "./pagination.js";
 
-export function ListFilters({ children }: { children: ReactNode }) {
+export function ListFilters({ id, children }: { id: string; children: ReactNode }) {
   return (
     <div
+      id={id}
       role="group"
       aria-label="Filters"
+      tabIndex={-1}
       className="mb-3 flex flex-wrap items-end gap-x-3 gap-y-2"
     >
       {children}
     </div>
+  );
+}
+
+export function ClearListFilters({
+  target,
+  focusId,
+}: {
+  target: PaginationTarget;
+  focusId: string;
+}) {
+  const moveFocus = useCallback(
+    (event: MouseEvent<HTMLAnchorElement>) => {
+      if (
+        event.defaultPrevented ||
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey
+      )
+        return;
+      // The Clear filters link can unmount when the next results arrive.
+      document.getElementById(focusId)?.focus();
+    },
+    [focusId],
+  );
+  return (
+    <Button variant="outline" size="sm" asChild>
+      <Link {...target} onClick={moveFocus}>
+        Clear filters
+      </Link>
+    </Button>
   );
 }
 

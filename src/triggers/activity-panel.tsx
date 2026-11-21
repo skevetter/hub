@@ -1,15 +1,14 @@
-import { getRouteApi, Link } from "@tanstack/react-router";
+import { getRouteApi } from "@tanstack/react-router";
 import { useCallback, useMemo, type ChangeEvent } from "react";
 import { useSnapshotQuery } from "../queries/index.js";
 import { useServerFn } from "@tanstack/react-start";
 import { DataTableSkeleton } from "../components/app/data-table.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
-import { ListFilters, ListFilterSelect } from "../components/app/list-filters.js";
+import { ClearListFilters, ListFilters, ListFilterSelect } from "../components/app/list-filters.js";
 import { DEFAULT_PAGE_SIZE, type PageSize } from "../components/app/page-size.js";
 import { PageHeader } from "../components/app/page.js";
 import { statusLabel } from "../components/app/status-pill.js";
 import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
-import { Button } from "../components/ui/button.js";
 import { useRouteTenant } from "../projects/context.js";
 import { Pagination, type PaginationTarget } from "../components/app/pagination.js";
 import {
@@ -27,6 +26,7 @@ import { LIST_PROVIDERS, LIST_PROVIDER_LABELS } from "./list-providers.js";
 
 const route = getRouteApi("/_shell/o/$organizationSlug/activity/");
 const HEADING_ID = "activity-title";
+const FILTERS_ID = "activity-filters";
 const LIVE_REFRESH_MS = 5_000;
 const ACTIVITY_DESCRIPTION = "Agent runs launched by organization triggers.";
 const STATUS_OPTIONS = ACTIVITY_STATUSES.map((value) => ({ value, label: statusLabel(value) }));
@@ -91,12 +91,8 @@ export function TriggerActivityPanel() {
     search.range !== undefined ||
     search.trigger !== undefined;
   const clear = useMemo(() => {
-    const to = pageTarget(organizationSlug, { size }, undefined);
-    return (
-      <Button variant="outline" size="sm" asChild>
-        <Link {...to}>Clear filters</Link>
-      </Button>
-    );
+    const target = pageTarget(organizationSlug, { size }, undefined);
+    return <ClearListFilters target={target} focusId={FILTERS_ID} />;
   }, [organizationSlug, size]);
   const empty = useMemo(
     () => (filtered ? { title: "No runs match these filters", action: clear } : undefined),
@@ -139,7 +135,7 @@ export function TriggerActivityPanel() {
           standalone
         />
       )}
-      <ListFilters>
+      <ListFilters id={FILTERS_ID}>
         <ListFilterSelect
           name="status"
           label="Status"
