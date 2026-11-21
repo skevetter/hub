@@ -19,7 +19,7 @@ const TRUNCATED_TEXT_LIMIT = MAX_REPLY_CHARS - TRUNCATION.length;
 const RAW_TRUNCATION_MARGIN = 48;
 const MAX_RENDER_ATTEMPTS = 3;
 const SHORT_PLAIN_PREFIX = 256;
-const MARKDOWN_BUDGET_MS = 50;
+const MARKDOWN_BUDGET_MS = 150;
 const MAX_MARKDOWN_DELIMITERS = 192;
 const MARKDOWN_DELIMITER = /[[\]()*_~`<>!&\\]+/gu;
 const MARKDOWN_CONTAINER_CHAIN = /(?:(?:[-+*>]|\d{1,9}[.)])[ \t]+){33}/u;
@@ -30,9 +30,25 @@ const MENTION_SIGN = /[@\uFF20]|&(?:#0*64|#x0*40|commat);/giu;
 const USER_TAG = /(?:<|&lt;)\/?user\b[^<>\r\n]*?(?:>|&gt;|$)/gimu;
 const HTML_MARKUP = /<!--[\s\S]*?(?:-->|$)|<\/?[a-zA-Z][^<>\r\n]*>/gu;
 
-export function formatRunReply(answer: FinalReplyAnswer, secrets: readonly string[]): string {
+export interface FormatOptions {
+  now?: () => number;
+  // Called once per reply that took the plain-text path. Carries no content.
+  onFallback?: (reason: "structure" | "budget") => void;
+}
+
+export function formatRunReply(
+  answer: FinalReplyAnswer,
+  secrets: readonly string[],
+  options: FormatOptions = {},
+): string {
   const { text } = answer;
-  const deadline = performance.now() + MARKDOWN_BUDGET_MS;
+  const now = options.now ?? (() => performance.now());
+  const deadline = now() + MARKDOWN_BUDGET_MS;
+  let reported = false;
+  const report = (reason: "structure" | "budget") => {
+    if (!reported) options.onFallback?.(reason);
+    reported = true;
+  };
   const redact = createAssistantTextRedactor(secrets);
   let truncated = answer.truncated || text.length > MAX_REPLY_CHARS;
   let limit = truncated ? TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN : MAX_REPLY_CHARS;
@@ -41,7 +57,9 @@ export function formatRunReply(answer: FinalReplyAnswer, secrets: readonly strin
     const prefix = text.length <= limit ? text : clipSource(text, limit);
     const [redacted] = redact.redact([prefix], truncated);
     const source = cleanSource(redacted!);
-    const markdown: string | undefined = plainText ? undefined : renderMarkdown(source, deadline);
+    const markdown: string | undefined = plainText
+      ? undefined
+      : renderMarkdown(source, deadline, now, report);
     plainText = markdown === undefined;
     const safe = markdown ?? renderPlainText(source);
     if (safe === "") return safe;
@@ -52,6 +70,7 @@ export function formatRunReply(answer: FinalReplyAnswer, secrets: readonly strin
       (prefix.length * (TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN)) / safe.length,
     );
   }
+  report("structure");
   const [redacted] = redact.redact([text.slice(0, Math.min(limit, SHORT_PLAIN_PREFIX))], true);
   const safe = renderPlainText(cleanSource(redacted!));
   if (safe.length > TRUNCATED_TEXT_LIMIT)
@@ -81,18 +100,34 @@ function cleanSource(text: string): string {
     .replace(/[\uD800-\uDFFF]/gu, "\uFFFD");
 }
 
-function renderMarkdown(source: string, deadline: number): string | undefined {
+function renderMarkdown(
+  source: string,
+  deadline: number,
+  now: () => number,
+  report: (reason: "structure" | "budget") => void,
+): string | undefined {
   // Micromark is synchronous. Bound delimiter-heavy input before any parser runs.
-  if (tooManyDelimiters(source) || MARKDOWN_CONTAINER_CHAIN.test(source)) return undefined;
-  if (performance.now() >= deadline) return undefined;
+  if (tooManyDelimiters(source) || MARKDOWN_CONTAINER_CHAIN.test(source)) {
+    report("structure");
+    return undefined;
+  }
+  const late = () => {
+    if (now() < deadline) return false;
+    report("budget");
+    return true;
+  };
+  if (late()) return undefined;
   const markdown = parseMarkdown(source);
-  if (performance.now() >= deadline) return undefined;
+  if (late()) return undefined;
   sanitizeMarkdown(markdown);
-  if (performance.now() >= deadline) return undefined;
+  if (late()) return undefined;
   const result = toMarkdown(markdown, {
     extensions: [gfmToMarkdown({ tablePipeAlign: false })],
   }).trim();
-  return performance.now() < deadline && hasSafeProse(result) ? result : undefined;
+  if (late()) return undefined;
+  if (hasSafeProse(result)) return result;
+  report("structure");
+  return undefined;
 }
 
 function tooManyDelimiters(source: string): boolean {

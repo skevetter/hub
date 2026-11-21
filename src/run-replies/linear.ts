@@ -10,6 +10,7 @@ import {
   type LinearApiClient,
   type LinearCommentWriteOptions,
 } from "../providers/linear/client.js";
+import { logger } from "../logger.js";
 import { MAX_RETRY_AFTER } from "../run-progress/backoff.js";
 import { LinearOutputContextSchema } from "../triggers/linear/provider.js";
 import { formatRunReply, type FinalReplyAnswer } from "./format.js";
@@ -63,12 +64,20 @@ export class LinearRunReplyWriter {
     const delivery = await runReplies.find(key);
     if (delivery?.state !== "pending" || run.status === "running") return;
     if (run.status !== "succeeded") {
-      await runReplies.finish({ ...key, from: "pending", failure: "run_unsuccessful" });
+      await runReplies.finish({
+        ...key,
+        from: "pending",
+        failure: "run_unsuccessful",
+      });
       return;
     }
     const prepared = await this.prepare(run, answer, signal);
     if (typeof prepared === "string") {
-      await runReplies.finish({ ...key, from: "pending", failure: prepared });
+      await runReplies.finish({
+        ...key,
+        from: "pending",
+        failure: prepared,
+      });
       return;
     }
     const { target, text } = prepared;
@@ -89,7 +98,11 @@ export class LinearRunReplyWriter {
         ? await this.retryCreate(target, delivery, body, firstAttempt)
         : firstAttempt;
     if (created !== undefined)
-      await runReplies.finish({ ...key, from: "sending", failure: created });
+      await runReplies.finish({
+        ...key,
+        from: "sending",
+        failure: created,
+      });
   }
 
   async repair(run: AcceptedTriggerRunRecord, delivery: RunReplyRecord, signal: AbortSignal) {
@@ -211,7 +224,10 @@ export class LinearRunReplyWriter {
     ].filter(Boolean);
     let text: string;
     try {
-      text = formatRunReply(answer, secrets);
+      text = formatRunReply(answer, secrets, {
+        onFallback: (reason) =>
+          logger.debug({ runId: run.id, reason }, "Linear reply rendered as plain text"),
+      });
     } catch {
       return "reply_unrenderable";
     }
@@ -271,7 +287,11 @@ export class LinearRunReplyWriter {
       issueId,
       sourceComment,
       connection,
-      authorization: { binding, requiredScope: "comments:create", signal },
+      authorization: {
+        binding,
+        requiredScope: "comments:create",
+        signal,
+      },
       bindingHash: hash(JSON.stringify([binding, issueId, sourceComment?.id])),
     };
   }

@@ -35,3 +35,44 @@ it.each([
   assert.ok(body.length <= 3_500);
   assert.doesNotMatch(body, /[@\uFF20]/u);
 });
+
+const table = `| File | Change |\n| --- | --- |\n${"| src/a.ts | Added guard |\n".repeat(120)}`;
+
+it("renders Markdown whenever the clock stays inside the budget", () => {
+  const reasons: string[] = [];
+  const body = formatRunReply({ text: table, truncated: false }, [], {
+    now: () => 0,
+    onFallback: (reason) => reasons.push(reason),
+  });
+  assert.match(body, /^\| File \| Change \|/u);
+  assert.deepEqual(reasons, []);
+});
+
+it.each([2, 3, 4, 5])(
+  "falls back and reports it when the clock passes the budget at read %i",
+  (read) => {
+    let reads = 0;
+    const reasons: string[] = [];
+    const body = formatRunReply({ text: `${table}\nAnswer @bob`, truncated: false }, [], {
+      now: () => (++reads >= read ? 10_000 : 0),
+      onFallback: (reason) => reasons.push(reason),
+    });
+    assert.deepEqual(reasons, ["budget"]);
+    assert.doesNotMatch(body, /@/u);
+    assert.match(body, /\\\|/u);
+  },
+);
+
+it.each([
+  ["pipe table", (n: number) => "|".repeat(n)],
+  ["pipe rows", (n: number) => "|a|b|\n".repeat(Math.ceil(n / 6))],
+  ["setext flood", (n: number) => "a\n---\n".repeat(Math.ceil(n / 6))],
+])("stays under 100 ms warm for a %s", (_name, build) => {
+  for (const length of [16_384, 1_048_576]) {
+    const text = build(length).slice(0, length);
+    formatRunReply({ text, truncated: false }, []);
+    const started = performance.now();
+    formatRunReply({ text, truncated: false }, []);
+    assert.ok(performance.now() - started < 100);
+  }
+});
