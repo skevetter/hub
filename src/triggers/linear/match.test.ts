@@ -2,9 +2,25 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { compileHubConfig } from "../../config/index.js";
 import type { NormalizedLinearCommentEvent, NormalizedLinearIssueEvent } from "./events.js";
-import { matchLinearTriggers, readLinearCommentInvocationParserMessage } from "./match.js";
+import {
+  isPaseoAppAuthor,
+  matchLinearTriggers,
+  readLinearCommentInvocationParserMessage,
+} from "./match.js";
 
 describe("Linear trigger matching", () => {
+  it("identifies comments authored by the connected Paseo app", () => {
+    const connection = { appUserId: "installed-app" };
+    const actor = { id: connection.appUserId };
+    const event = { ...commentEvent(), actor };
+
+    assert.equal(isPaseoAppAuthor(event, connection), true);
+    assert.equal(isPaseoAppAuthor(commentEvent(), connection), false);
+    assert.equal(isPaseoAppAuthor({ ...event, actor: null }, connection), false);
+    assert.equal(isPaseoAppAuthor(event, undefined), false);
+    assert.equal(isPaseoAppAuthor({ ...issue({ action: "update" }), actor }, connection), false);
+  });
+
   it("ignores the installed app's reply with or without a named audience", () => {
     const event = {
       ...commentEvent(),

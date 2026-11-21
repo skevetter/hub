@@ -6,7 +6,7 @@ import { logProviderEventIntake } from "../audit.js";
 import type { ProviderEventDropReasonCode } from "../drop-reason.js";
 import type { TriggerHandler, TriggerSource } from "../index.js";
 import { eventIssueId, eventProjectId, normalizeLinearEvent } from "./events.js";
-import { isLinearAppComment } from "./match.js";
+import { isPaseoAppAuthor } from "./match.js";
 import { hasLinearRunReplyMarker } from "../../run-replies/marker.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
 
@@ -127,7 +127,9 @@ async function handoffLinearEvent(
     if (
       event.type === "comment" &&
       (hasLinearRunReplyMarker(event.comment.body, event.comment.id) ||
-        isLinearAppComment(event, await options.findAppUserId?.(linearOrganizationId)))
+        isPaseoAppAuthor(event, {
+          appUserId: await options.findAppUserId?.(linearOrganizationId),
+        }))
     ) {
       return new Response("OK", { status: 200 });
     }

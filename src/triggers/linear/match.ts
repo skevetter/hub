@@ -70,7 +70,7 @@ export function matchLinearTriggers(
   connectionId?: string | null,
   appUserId?: string,
 ): MatchedLinearTrigger[] {
-  if (isLinearAppComment(event, appUserId)) return [];
+  if (isPaseoAppAuthor(event, { appUserId })) return [];
   return config.triggers.flatMap((trigger) => {
     if (!matchesLinearEvent(trigger.on, event, appUserId)) return [];
     if (!matchesTriggerFilter(trigger, event, connectionId)) return [];
@@ -78,8 +78,13 @@ export function matchLinearTriggers(
   });
 }
 
-export function isLinearAppComment(event: NormalizedLinearEvent, appUserId?: string): boolean {
-  return event.type === "comment" && appUserId !== undefined && event.actor?.id === appUserId;
+export function isPaseoAppAuthor(
+  event: NormalizedLinearEvent,
+  connection: { appUserId: string | undefined } | undefined,
+): boolean {
+  return (
+    event.type === "comment" && event.actor !== null && event.actor.id === connection?.appUserId
+  );
 }
 
 export function hasLinearSourceTrigger(
