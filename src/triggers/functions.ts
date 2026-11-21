@@ -7,6 +7,7 @@ import type { BrowserStopResult } from "./run-stop.js";
 import { getApplication } from "../server/runtime.js";
 import { PAGE_SIZES } from "../components/app/page-size.js";
 import { activityFiltersSchema } from "./activity-query.js";
+import { triggerSearchSchema } from "./trigger-query.js";
 import type { TriggerDashboard } from "./dashboard.js";
 
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
@@ -99,6 +100,36 @@ export const triggerSnapshot = createServerFn({ method: "GET" })
     }
   });
 
+export const triggerListPage = createServerFn({ method: "GET" })
+  .validator(scopeSchema.extend(triggerSearchSchema.shape))
+  .handler(async ({ data: { organizationSlug, ...search } }): Promise<Result<TriggerListPage>> => {
+    try {
+      const dashboard = (await getApplication()).triggerDashboard;
+      if (dashboard == null) throw new Error("trigger dashboard unavailable");
+      return respondOk(await dashboard.triggerPage(getRequest(), organizationSlug, search));
+    } catch (error) {
+      return respondWithFailure(error, triggerContext("trigger.list", organizationSlug), {
+        fallback: "Hub couldn't load this organization's triggers. Reload the page.",
+      });
+    }
+  });
+
+export const triggerEditorSnapshot = createServerFn({ method: "GET" })
+  .validator(scopeSchema.extend({ triggerId: z.string() }))
+  .handler(async ({ data }): Promise<Result<TriggerSnapshot>> => {
+    try {
+      const dashboard = (await getApplication()).triggerDashboard;
+      if (dashboard == null) throw new Error("trigger dashboard unavailable");
+      return respondOk(
+        await dashboard.editorSnapshot(getRequest(), data.organizationSlug, data.triggerId),
+      );
+    } catch (error) {
+      return respondWithFailure(error, triggerContext("trigger.editor", data.organizationSlug), {
+        fallback: "Hub couldn't load this trigger. Reload the page.",
+      });
+    }
+  });
+
 const activityPageSchema = scopeSchema.extend(activityFiltersSchema.shape).extend({
   limit: z.number().int().min(1).max(PAGE_SIZES[3]).optional(),
   cursor: z.string().optional(),
@@ -142,6 +173,7 @@ export const saveTrigger = createServerFn({ method: "POST" })
   });
 
 export type TriggerSnapshot = Awaited<ReturnType<TriggerDashboard["snapshot"]>>;
+export type TriggerListPage = Awaited<ReturnType<TriggerDashboard["triggerPage"]>>;
 export type TriggerActivityPage = Awaited<ReturnType<TriggerDashboard["activityPage"]>>;
 
 function triggerContext(operation: string, organizationSlug: string) {

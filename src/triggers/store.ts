@@ -49,6 +49,10 @@ export class OrganizationTriggerStore {
     return this.database.listOrganizationTriggers(this.organizationId);
   }
 
+  find(triggerId: string): Promise<OrganizationTriggerRecord | undefined> {
+    return this.database.findOrganizationTrigger(this.organizationId, triggerId);
+  }
+
   async activeRevision(
     trigger: OrganizationTriggerRecord,
   ): Promise<OrganizationTriggerRevisionRecord> {
@@ -118,7 +122,7 @@ export class OrganizationTriggerStore {
 
   private async activeYaml(triggerId: string | undefined): Promise<string | undefined> {
     if (triggerId === undefined) return undefined;
-    const trigger = (await this.list()).find(({ id }) => id === triggerId);
+    const trigger = await this.find(triggerId);
     if (trigger === undefined) return undefined;
     return (await this.activeRevision(trigger)).yaml;
   }

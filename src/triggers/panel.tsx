@@ -2,10 +2,21 @@
 /* oxlint-disable typescript-eslint/no-unsafe-type-assertion -- generated routes cannot express server-resolved organization URLs */
 import { useSnapshotQuery } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { getRouteApi, Link } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { ArrowLeft, Braces, FileText, LockKeyhole, Plus } from "lucide-react";
-import { useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { parseDocument } from "yaml";
 
 import { Card } from "../components/app/card.js";
@@ -17,12 +28,16 @@ import { Disclosure } from "../components/app/disclosure.js";
 import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
 import { FormActions } from "../components/app/form-actions.js";
 import { FieldSkeleton, FormField } from "../components/app/form-field.js";
+import { ListFilters, ListFilterSelect } from "../components/app/list-filters.js";
 import { LoadingLine, Spinner } from "../components/app/loading.js";
+import { DEFAULT_PAGE_SIZE, type PageSize } from "../components/app/page-size.js";
 import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
+import { Pagination } from "../components/app/pagination.js";
 import { Steps } from "../components/app/steps.js";
 import { SegmentedControl, type SegmentedOption } from "../components/app/segmented-control.js";
 import { StatusPill } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
+import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
 import { Button } from "../components/ui/button.js";
 import { Textarea } from "../components/ui/textarea.js";
 import { SiteHeaderActions } from "../shell/site-header-actions.js";
@@ -44,7 +59,12 @@ import {
   type TriggerFormValue,
 } from "./configuration/editor.js";
 import { describeTriggerYaml, triggerEventClause } from "./configuration/describe.js";
-import { saveTrigger, triggerSnapshot, type TriggerSnapshot } from "./functions.js";
+import {
+  saveTrigger,
+  triggerEditorSnapshot,
+  triggerListPage,
+  type TriggerSnapshot,
+} from "./functions.js";
 import { daemonProviderSnapshot } from "../daemons/functions.js";
 import type { HubProviderSnapshotEntry } from "../hub/protocol.js";
 import { EventFields } from "./event-fields.js";
@@ -56,6 +76,13 @@ import { WebhookCard } from "./webhook-card.js";
 import { IDENTIFIER, TriggerDocumentSchema, TriggerFilterSchema } from "./configuration/schema.js";
 import { webhookSettings } from "../webhooks/functions.js";
 import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
+import { LIST_PROVIDERS, LIST_PROVIDER_LABELS } from "./list-providers.js";
+import {
+  TRIGGER_NAME_SEARCH_MAX,
+  triggerPageKey,
+  triggerSearchSchema,
+  type TriggerSearch,
+} from "./trigger-query.js";
 import {
   selectedProviderModel,
   unattendedAgentOptions,
@@ -94,12 +121,35 @@ const EVENT_OPTIONS: readonly ComboboxOption[] = EDITOR_EVENTS.map((value) => {
 
 const TRIGGERS_DESCRIPTION = "Launch agents on your compute when organization events arrive.";
 const TRIGGER_EDITOR_DESCRIPTION = "One event launches one agent on your compute.";
+const LIST_HEADING_ID = "triggers-title";
+const triggerListRoute = getRouteApi("/_shell/o/$organizationSlug/triggers/");
+const triggerEditorRoute = getRouteApi("/_shell/o/$organizationSlug/triggers/$triggerId");
+const PROVIDER_OPTIONS = LIST_PROVIDERS.map((value) => ({
+  value,
+  label: LIST_PROVIDER_LABELS[value],
+}));
+const STATE_OPTIONS = [
+  { value: "enabled", label: "Enabled" },
+  { value: "disabled", label: "Disabled" },
+];
 
 export function TriggersPanel() {
   const tenant = useRouteTenant();
-  const scope = { organizationSlug: tenant.organization.slug };
-  const snapshot = useTriggerSnapshot(scope.organizationSlug);
-  const navigate = useNavigate();
+  const organizationSlug = tenant.organization.slug;
+  const search = triggerListRoute.useSearch();
+  const navigate = triggerListRoute.useNavigate();
+  const load = useServerFn(triggerListPage);
+  const snapshot = useSnapshotQuery({
+    queryKey: triggerPageKey(organizationSlug, search),
+    queryFn: () => load({ data: { organizationSlug, ...search } }),
+  });
+  const changeSize = useCallback(
+    (size: PageSize, replace = false) => {
+      void navigate({ search: (previous) => ({ ...previous, size, cursor: undefined }), replace });
+    },
+    [navigate],
+  );
+  usePageSizePreference(search.size, tenant.account.id, changeSize);
   if (snapshot.status === "pending") {
     return (
       <>
@@ -112,14 +162,24 @@ export function TriggersPanel() {
     return <TriggerLoadError error={snapshot.error} />;
   }
   const data = snapshot.data;
-  const triggerPath = (triggerId: string) =>
-    `/o/${scope.organizationSlug}/triggers/${triggerId}` as never;
+  const editor = (triggerId: string) => ({
+    to: "/o/$organizationSlug/triggers/$triggerId" as const,
+    params: { organizationSlug, triggerId },
+    search,
+  });
+  const filtered =
+    search.state !== undefined || search.provider !== undefined || search.q !== undefined;
+  const clear = (
+    <Button variant="outline" size="sm" asChild>
+      <Link {...triggerPageTarget(organizationSlug, { size: search.size })}>Clear filters</Link>
+    </Button>
+  );
   return (
     <>
-      <PageHeader title="Triggers" description={TRIGGERS_DESCRIPTION}>
+      <PageHeader id={LIST_HEADING_ID} title="Triggers" description={TRIGGERS_DESCRIPTION}>
         {data.canManage ? (
           <Button asChild>
-            <Link to={triggerPath("new")}>
+            <Link {...editor("new")}>
               <Plus aria-hidden="true" /> New trigger
             </Link>
           </Button>
@@ -131,7 +191,9 @@ export function TriggersPanel() {
             title="Add a daemon first"
             action={
               <Button asChild variant="outline" size="sm">
-                <Link to={`/o/${scope.organizationSlug}/daemons` as never}>Go to Daemons</Link>
+                <Link to="/o/$organizationSlug/daemons" params={{ organizationSlug }}>
+                  Go to Daemons
+                </Link>
               </Button>
             }
           >
@@ -141,72 +203,178 @@ export function TriggersPanel() {
         {data.notifications === undefined ? null : (
           <NotificationStatusCard status={data.notifications} />
         )}
-        <DataTable
-          label="Triggers"
-          columns={TRIGGER_COLUMNS}
-          isEmpty={data.triggers.length === 0}
-          empty={{
-            title: "No triggers",
-            description: "Connect a provider and daemon, then create your first trigger.",
-          }}
-        >
-          {data.triggers.map((trigger) => (
-            <DataRow
-              key={trigger.id}
-              onSelect={() => {
-                void navigate({ to: triggerPath(trigger.id) });
-              }}
-            >
-              <DataCell>
-                <span className="flex items-center gap-3">
-                  <span
-                    className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-muted text-foreground"
-                    role="img"
-                    aria-label={`${trigger.provider} provider`}
-                  >
-                    <ProviderGlyph provider={trigger.provider} />
+        {snapshot.refreshFailure === null ? null : (
+          <FailureAlert
+            title="Triggers may be out of date"
+            error={snapshot.refreshFailure.message}
+            fallback="Hub couldn't refresh this organization's triggers."
+            onRetry={snapshot.refetch}
+          />
+        )}
+        <div>
+          <TriggerListFilters search={search}>
+            {filtered && data.triggers.length > 0 ? clear : null}
+          </TriggerListFilters>
+          <DataTable
+            label="Triggers"
+            columns={TRIGGER_COLUMNS}
+            isEmpty={data.triggers.length === 0}
+            empty={
+              filtered
+                ? { title: "No triggers match these filters", action: clear }
+                : {
+                    title: "No triggers",
+                    description: "Connect a provider and daemon, then create your first trigger.",
+                  }
+            }
+          >
+            {data.triggers.map((trigger) => (
+              <DataRow
+                key={trigger.id}
+                onSelect={() => {
+                  void navigate(editor(trigger.id));
+                }}
+              >
+                <DataCell>
+                  <span className="flex items-center gap-3">
+                    <span
+                      className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-muted text-foreground"
+                      role="img"
+                      aria-label={`${trigger.provider} provider`}
+                    >
+                      <ProviderGlyph provider={trigger.provider} />
+                    </span>
+                    <TwoLine
+                      primary={
+                        <Link
+                          {...editor(trigger.id)}
+                          title={trigger.name}
+                          className="hover:underline"
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          {trigger.name}
+                        </Link>
+                      }
+                      secondary={describeTriggerYaml(trigger.yaml) ?? triggerSecondaryLine(trigger)}
+                    />
                   </span>
-                  <TwoLine
-                    primary={
-                      <Link
-                        to={triggerPath(trigger.id)}
-                        title={trigger.name}
-                        className="hover:underline"
-                        onClick={(event) => event.stopPropagation()}
-                      >
-                        {trigger.name}
-                      </Link>
-                    }
-                    secondary={describeTriggerYaml(trigger.yaml) ?? triggerSecondaryLine(trigger)}
+                </DataCell>
+                <DataCell>
+                  <TriggerEvent trigger={trigger} />
+                </DataCell>
+                <DataCell>
+                  {trigger.draft === null ? (
+                    <span className="text-muted-foreground">Advanced configuration</span>
+                  ) : (
+                    <TwoLine path primary={trigger.draft.daemon} secondary={trigger.draft.cwd} />
+                  )}
+                </DataCell>
+                <DataCell>
+                  <LastTriggered
+                    lastTriggered={trigger.lastTriggered}
+                    recentRuns={trigger.recentRuns}
                   />
-                </span>
-              </DataCell>
-              <DataCell>
-                <TriggerEvent trigger={trigger} />
-              </DataCell>
-              <DataCell>
-                {trigger.draft === null ? (
-                  <span className="text-muted-foreground">Advanced configuration</span>
-                ) : (
-                  <TwoLine path primary={trigger.draft.daemon} secondary={trigger.draft.cwd} />
-                )}
-              </DataCell>
-              <DataCell>
-                <LastTriggered
-                  lastTriggered={trigger.lastTriggered}
-                  recentRuns={trigger.recentRuns}
-                />
-              </DataCell>
-              <DataCell>
-                <StatusPill tone={trigger.enabled ? "success" : "neutral"}>
-                  {trigger.enabled ? "Enabled" : "Disabled"}
-                </StatusPill>
-              </DataCell>
-            </DataRow>
-          ))}
-        </DataTable>
+                </DataCell>
+                <DataCell>
+                  <StatusPill tone={trigger.enabled ? "success" : "neutral"}>
+                    {trigger.enabled ? "Enabled" : "Disabled"}
+                  </StatusPill>
+                </DataCell>
+              </DataRow>
+            ))}
+          </DataTable>
+          <Pagination
+            label="Trigger pages"
+            position={search.cursor ?? ""}
+            fallbackFocusId={LIST_HEADING_ID}
+            summary={`${data.triggers.length} ${data.triggers.length === 1 ? "trigger" : "triggers"}`}
+            newer={
+              data.previousCursor === null
+                ? null
+                : triggerPageTarget(organizationSlug, search, data.previousCursor)
+            }
+            older={
+              data.nextCursor === null
+                ? null
+                : triggerPageTarget(organizationSlug, search, data.nextCursor)
+            }
+            pageSize={{
+              value: search.size ?? DEFAULT_PAGE_SIZE,
+              accountId: tenant.account.id,
+              onChange: changeSize,
+            }}
+            previousLabel="Previous"
+            nextLabel="Next"
+          />
+        </div>
       </div>
     </>
+  );
+}
+
+function triggerPageTarget(organizationSlug: string, search: TriggerSearch, cursor?: string) {
+  return {
+    to: "/o/$organizationSlug/triggers" as const,
+    params: { organizationSlug },
+    search: { ...search, cursor },
+  };
+}
+
+function TriggerListFilters({ search, children }: { search: TriggerSearch; children: ReactNode }) {
+  const navigate = triggerListRoute.useNavigate();
+  const [name, setName] = useState(search.q ?? "");
+  const nameId = useId();
+  useEffect(() => setName(search.q ?? ""), [search.q]);
+  const setFilter = (filter: string, value: string) => {
+    void navigate({
+      search: (previous) =>
+        triggerSearchSchema.parse({
+          ...previous,
+          [filter]: value || undefined,
+          cursor: undefined,
+        }),
+    });
+  };
+  const change = ({ currentTarget }: ChangeEvent<HTMLSelectElement>) =>
+    setFilter(currentTarget.name, currentTarget.value);
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setFilter("q", name);
+  };
+  return (
+    <ListFilters>
+      <form className="flex min-w-0 items-end gap-2" onSubmit={submit}>
+        <FormField
+          id={nameId}
+          name="q"
+          kind="text"
+          label="Search triggers"
+          value={name}
+          maxLength={TRIGGER_NAME_SEARCH_MAX}
+          onChange={setName}
+        />
+        <Button type="submit" variant="outline">
+          Search
+        </Button>
+      </form>
+      <ListFilterSelect
+        name="state"
+        label="State"
+        allLabel="All states"
+        options={STATE_OPTIONS}
+        value={search.state}
+        onChange={change}
+      />
+      <ListFilterSelect
+        name="provider"
+        label="Provider"
+        allLabel="All providers"
+        options={PROVIDER_OPTIONS}
+        value={search.provider}
+        onChange={change}
+      />
+      {children}
+    </ListFilters>
   );
 }
 
@@ -218,8 +386,14 @@ function TriggerEvent({ trigger }: { trigger: BrowserTrigger }) {
 export function TriggerEditorPanel({ triggerId }: { triggerId: string }) {
   const tenant = useRouteTenant();
   const organizationSlug = tenant.organization.slug;
-  const snapshot = useTriggerSnapshot(organizationSlug);
-  const navigate = useNavigate();
+  const search = triggerEditorRoute.useSearch();
+  const load = useServerFn(triggerEditorSnapshot);
+  const snapshot = useSnapshotQuery({
+    queryKey: ["triggers", organizationSlug, "editor", triggerId],
+    queryFn: () => load({ data: { organizationSlug, triggerId } }),
+  });
+  const navigate = triggerEditorRoute.useNavigate();
+  const listTarget = triggerPageTarget(organizationSlug, search, search.cursor);
   const queryClient = useQueryClient();
   const saveCommand = useServerFn(saveTrigger) as (input: {
     data: { organizationSlug: string; triggerId?: string; yaml: string };
@@ -229,7 +403,7 @@ export function TriggerEditorPanel({ triggerId }: { triggerId: string }) {
     onSuccess: async (result) => {
       if (result.status !== "ok") return;
       await queryClient.invalidateQueries({ queryKey: ["triggers", organizationSlug] });
-      await navigate({ to: `/o/${organizationSlug}/triggers` as never });
+      await navigate(listTarget);
     },
   });
   if (snapshot.status === "pending") return <TriggerEditorSkeleton />;
@@ -248,7 +422,7 @@ export function TriggerEditorPanel({ triggerId }: { triggerId: string }) {
     );
   }
   const returnToList = () => {
-    void navigate({ to: `/o/${organizationSlug}/triggers` as never });
+    void navigate(listTarget);
   };
   return (
     <TriggerEditor
@@ -269,14 +443,6 @@ export function TriggerEditorPanel({ triggerId }: { triggerId: string }) {
       }
     />
   );
-}
-
-function useTriggerSnapshot(organizationSlug: string) {
-  const load = useServerFn(triggerSnapshot);
-  return useSnapshotQuery({
-    queryKey: ["triggers", organizationSlug],
-    queryFn: () => load({ data: { organizationSlug } }),
-  });
 }
 
 function TriggerLoadError({ error }: { error: string | null }) {

@@ -31,6 +31,8 @@ export function Pagination({
   newer,
   older,
   pageSize,
+  previousLabel = "Newer",
+  nextLabel = "Older",
 }: {
   label: string;
   /** Changes whenever the reader moves. */
@@ -41,6 +43,8 @@ export function Pagination({
   newer: PaginationTarget | null;
   older: PaginationTarget | null;
   pageSize?: PageSizeControl;
+  previousLabel?: string;
+  nextLabel?: string;
 }) {
   const busy = useRouterState({ select: (state) => state.isLoading });
   const moved = useRef(position);
@@ -62,10 +66,10 @@ export function Pagination({
       {pageSize === undefined ? null : <RowsPerPage {...pageSize} busy={busy} />}
       <div className="flex gap-2">
         <PageLink target={newer} busy={busy}>
-          Newer
+          {previousLabel}
         </PageLink>
         <PageLink target={older} busy={busy}>
-          Older
+          {nextLabel}
         </PageLink>
       </div>
     </nav>

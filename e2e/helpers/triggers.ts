@@ -17,7 +17,7 @@ export class OrganizationTriggers {
 
   async startNew() {
     await this.page.getByRole("link", { name: "New trigger" }).click();
-    await expect(this.page).toHaveURL(/\/triggers\/new$/u);
+    await expect(this.page).toHaveURL(({ pathname }) => pathname.endsWith("/triggers/new"));
     await expect(this.page.getByRole("heading", { name: "New trigger", level: 1 })).toBeVisible();
     await expect(this.page.getByRole("heading", { name: "The event" })).toBeVisible();
     await expect(this.page.getByRole("heading", { name: "Where it runs" })).toBeVisible();
@@ -436,7 +436,7 @@ export class OrganizationTriggers {
 
   async openTrigger(name: string) {
     await this.page.getByRole("link", { name, exact: true }).click();
-    await expect(this.page).toHaveURL(/\/triggers\/[^/]+$/u);
+    await expect(this.page).toHaveURL(({ pathname }) => /\/triggers\/[^/]+$/u.test(pathname));
     await expect(this.page.getByRole("heading", { name, level: 1 })).toBeVisible();
   }
 

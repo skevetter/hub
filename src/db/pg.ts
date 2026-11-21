@@ -75,6 +75,7 @@ import {
 import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
 import type { DatabaseRuntime, QueryHandle, QueryRow } from "./runtime/index.js";
 import type { Locks } from "./runtime/locks/index.js";
+import { triggerProviderEvent } from "./trigger-list.js";
 import type {
   AgentExecutionOutputAttempt,
   AgentExecutionRecord,
@@ -175,6 +176,8 @@ import type {
   ActivityRunPageRecord,
   ActivityRunPageRequest,
   ActivityRunScope,
+  TriggerListPage,
+  TriggerListRequest,
 } from "./types.js";
 
 const STEP_PAYLOAD_PROJECTION = `step.id, step.trigger_run_id, step.step_id, step.ordinal, step.status,
@@ -4077,6 +4080,73 @@ class PgDatabase implements Database {
     return rows.rows.map(toOrganizationTriggerRecord);
   }
 
+  async listOrganizationTriggerPage(
+    organizationId: string,
+    request: TriggerListRequest,
+  ): Promise<TriggerListPage> {
+    const params: unknown[] = [organizationId];
+    const conditions = organizationTriggerPageFilters(request, params);
+    const scoped = `from organization_triggers t
+      where t.organization_id = $1 and t.active_revision_id is not null ${conditions}`;
+    const position = request.position;
+    const previous = position?.direction === "previous";
+    const key = `(t.name, t.id)`;
+    const boundary = `($${params.length + 1}::text, $${params.length + 2}::uuid)`;
+    const order = previous ? "desc" : "asc";
+    const values =
+      position === undefined ? params : [...params, position.key.name, position.key.id];
+    const { rows } = await query<OrganizationTriggerRow>(
+      this.pool,
+      `select t.* ${scoped}
+       ${position === undefined ? "" : `and ${key} ${previous ? "<" : ">"} ${boundary}`}
+       order by t.name ${order}, t.id ${order} limit $${values.length + 1}`,
+      [...values, request.limit + 1],
+    );
+    const more = rows.length > request.limit;
+    const page = rows.slice(0, request.limit);
+    if (previous) page.reverse();
+    const first = page[0];
+    const last = page.at(-1);
+    const adjacent = async (record: OrganizationTriggerRow | undefined, operator: "<" | ">") =>
+      record !== undefined &&
+      (
+        await query(this.pool, `select 1 ${scoped} and ${key} ${operator} ${boundary} limit 1`, [
+          ...params,
+          record.name,
+          record.id,
+        ])
+      ).rows.length > 0;
+    const hasPrevious = previous ? more : position !== undefined && (await adjacent(first, "<"));
+    const hasNext = previous ? await adjacent(last, ">") : more;
+    return {
+      records: page.map(toOrganizationTriggerRecord),
+      previous: hasPrevious && first !== undefined ? { id: first.id, name: first.name } : null,
+      next: hasNext && last !== undefined ? { id: last.id, name: last.name } : null,
+    };
+  }
+
+  async findOrganizationTrigger(
+    organizationId: string,
+    triggerId: string,
+  ): Promise<OrganizationTriggerRecord | undefined> {
+    const { rows } = await query<OrganizationTriggerRow>(
+      this.pool,
+      `select * from organization_triggers where organization_id = $1 and id = $2 and active_revision_id is not null`,
+      [organizationId, triggerId],
+    );
+    return rows[0] === undefined ? undefined : toOrganizationTriggerRecord(rows[0]);
+  }
+
+  async hasOrganizationTriggerEvent(organizationId: string, event: string): Promise<boolean> {
+    const { rows } = await query(
+      this.pool,
+      `select 1 from organization_triggers t where t.organization_id = $1 and
+       ${organizationTriggerHasEventSql("definition->>'on' = $2")} limit 1`,
+      [organizationId, event],
+    );
+    return rows.length > 0;
+  }
+
   async findOrganizationTriggerRevision(
     triggerId: string,
     revisionId: string,
@@ -5643,6 +5713,33 @@ interface WorkflowWakeupRow extends QueryRow {
   trigger_run_id: string;
   available_at: Date;
   lease_expires_at: Date | null;
+}
+
+function organizationTriggerPageFilters(request: TriggerListRequest, params: unknown[]): string {
+  const filters: string[] = [];
+  if (request.enabled !== undefined)
+    filters.push(`and t.enabled = $${params.push(request.enabled)}`);
+  if (request.nameContains !== undefined) {
+    const substring = `%${request.nameContains.replaceAll(/[!%_]/gu, "!$&")}%`;
+    filters.push(`and t.name ilike $${params.push(substring)} escape '!'`);
+  }
+  if (request.provider !== undefined) {
+    const event = triggerProviderEvent(request.provider);
+    const match = `$${params.push(event)}::text`;
+    const comparison = event.endsWith(".")
+      ? `left(definition->>'on', length(${match})) = ${match}`
+      : `definition->>'on' = ${match}`;
+    filters.push(`and ${organizationTriggerHasEventSql(comparison)}`);
+  }
+  return filters.join("\n       ");
+}
+
+function organizationTriggerHasEventSql(comparison: string): string {
+  return `exists (
+    select 1 from organization_trigger_revisions revision
+    cross join lateral jsonb_array_elements(revision.normalized_configuration->'triggers') definition
+    where revision.id = t.active_revision_id and revision.organization_id = t.organization_id
+      and revision.trigger_id = t.id and ${comparison})`;
 }
 
 function activityRunFilterSql(request: ActivityRunPageRequest, params: unknown[]): string {

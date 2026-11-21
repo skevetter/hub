@@ -203,6 +203,9 @@ import type {
   ActivityRunPageRecord,
   ActivityRunPageRequest,
   ActivityRunScope,
+  TriggerListKey,
+  TriggerListPage,
+  TriggerListRequest,
 } from "./types.js";
 import {
   clearOverrideKey,
@@ -210,6 +213,7 @@ import {
   mergeOverrides,
 } from "../entitlements/catalog.js";
 import { activityTimestampMicros, compareRunsNewestFirst } from "./activity-key.js";
+import { hasTriggerEvent, triggerProviderEvent } from "./trigger-list.js";
 import { toProviderEventReceiptRecordSummary } from "./mappers.js";
 import {
   isProviderEventDropReasonCode,
@@ -258,6 +262,11 @@ export interface MemoryDatabaseOptions {
   slackConnections?: readonly SlackConnectionRecord[];
   githubConnections?: readonly GitHubConnectionRecord[];
   githubSyncOwner?: GitHubInstallationSyncOwner;
+}
+
+function compareTriggerListKeys(left: TriggerListKey, right: TriggerListKey): number {
+  if (left.name !== right.name) return left.name < right.name ? -1 : 1;
+  return left.id.localeCompare(right.id);
 }
 
 function usageKey(organizationId: string, meter: string, periodStart: Date): string {
@@ -5596,6 +5605,67 @@ class MemoryDatabase implements Database {
   async listOrganizationTriggers(organizationId: string): Promise<OrganizationTriggerRecord[]> {
     return Array.from(this.organizationTriggers.values()).filter(
       (trigger) => trigger.organizationId === organizationId,
+    );
+  }
+
+  async listOrganizationTriggerPage(
+    organizationId: string,
+    request: TriggerListRequest,
+  ): Promise<TriggerListPage> {
+    const { enabled, nameContains, provider, position, limit } = request;
+    const event = provider === undefined ? undefined : triggerProviderEvent(provider);
+    const match = (source: string) =>
+      event?.endsWith(".") === true ? source.startsWith(event) : source === event;
+    const records = (await this.listOrganizationTriggers(organizationId))
+      .filter(
+        (trigger) =>
+          (enabled === undefined || trigger.enabled === enabled) &&
+          (nameContains === undefined ||
+            trigger.name.toLowerCase().includes(nameContains.toLowerCase())) &&
+          (event === undefined ||
+            hasTriggerEvent(
+              this.organizationTriggerRevisions.get(trigger.activeRevisionId)
+                ?.normalizedConfiguration,
+              match,
+            )),
+      )
+      .sort(compareTriggerListKeys);
+    const bounded =
+      position === undefined
+        ? records
+        : records.filter((trigger) => {
+            const order = compareTriggerListKeys(trigger, position.key);
+            return position.direction === "next" ? order > 0 : order < 0;
+          });
+    const page =
+      position?.direction === "previous" ? bounded.slice(-limit) : bounded.slice(0, limit);
+    const first = page[0];
+    const last = page.at(-1);
+    const index = first === undefined ? -1 : records.indexOf(first);
+    return {
+      records: page,
+      next:
+        last !== undefined && index + page.length < records.length
+          ? { id: last.id, name: last.name }
+          : null,
+      previous: first !== undefined && index > 0 ? { id: first.id, name: first.name } : null,
+    };
+  }
+
+  async findOrganizationTrigger(
+    organizationId: string,
+    triggerId: string,
+  ): Promise<OrganizationTriggerRecord | undefined> {
+    const trigger = this.organizationTriggers.get(triggerId.toLowerCase());
+    return trigger?.organizationId === organizationId ? trigger : undefined;
+  }
+
+  async hasOrganizationTriggerEvent(organizationId: string, event: string): Promise<boolean> {
+    return (await this.listOrganizationTriggers(organizationId)).some((trigger) =>
+      hasTriggerEvent(
+        this.organizationTriggerRevisions.get(trigger.activeRevisionId)?.normalizedConfiguration,
+        (source) => source === event,
+      ),
     );
   }
 

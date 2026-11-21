@@ -15,6 +15,8 @@ import {
   encodeActivityCursor,
 } from "./activity-cursor.js";
 import type { ActivityFilters } from "./activity-query.js";
+import { decodeTriggerCursor, encodeTriggerCursor, triggerCursorScope } from "./trigger-cursor.js";
+import { triggerSearchSchema, type TriggerSearch } from "./trigger-query.js";
 import { DEFAULT_PAGE_SIZE, PAGE_SIZES } from "../components/app/page-size.js";
 import { summarizeRecentRuns, type RecentRuns } from "./recent-runs.js";
 import { summarizeTrigger } from "../projects/activity-summary.js";
@@ -26,10 +28,14 @@ import type { RunProgressSettings } from "../run-progress/settings.js";
 import type { ProjectActivityRunListRecord, TriggerRunRecord } from "../db/types.js";
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
 import type { RunTimelineState } from "../run-timeline/store.js";
+import { z } from "zod";
 
 const DAY_MS = 24 * 60 * 60_000;
 const ACTIVITY_RANGE_DAYS = { "24h": 1, "7d": 7, "30d": 30 } as const;
 const NOTIFICATION_EVENT = "github.notification";
+const triggerIdSchema = z.uuid();
+
+type DashboardTenant = Awaited<ReturnType<typeof resolveRouteTenant>>["tenant"];
 
 export interface TriggerDashboardOptions {
   stopRun?: StopRun;
@@ -62,9 +68,9 @@ export class TriggerDashboard {
   /** Only an organization that uses the event sees the poll's health. */
   private async notificationStatus(
     organizationId: string,
-    triggers: readonly { event: string }[],
+    configured: boolean,
   ): Promise<NotificationStatusView | undefined> {
-    if (!triggers.some(({ event }) => event === NOTIFICATION_EVENT)) return undefined;
+    if (!configured) return undefined;
     const now = (this.options.now ?? (() => new Date()))();
     const store = this.database.githubNotifications;
     const [status, delivered24h] = await Promise.all([
@@ -91,27 +97,89 @@ export class TriggerDashboard {
       tenant.organization.id,
       this.agentValidator,
     );
-    const [triggers, daemons, connections] = await Promise.all([
-      store.list(),
+    return this.snapshotData(tenant, store, await store.list(), { includeActivity: true });
+  }
+
+  async editorSnapshot(request: Request, organizationSlug: string, triggerId: string) {
+    const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+      organizationSlug,
+    });
+    const store = new OrganizationTriggerStore(
+      this.database,
+      tenant.organization.id,
+      this.agentValidator,
+    );
+    const trigger = triggerIdSchema.safeParse(triggerId).success
+      ? await store.find(triggerId)
+      : undefined;
+    return this.snapshotData(tenant, store, trigger === undefined ? [] : [trigger], {
+      includeActivity: false,
+      hasNotifications: false,
+    });
+  }
+
+  async triggerPage(request: Request, organizationSlug: string, input: TriggerSearch) {
+    const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+      organizationSlug,
+    });
+    const organizationId = tenant.organization.id;
+    const store = new OrganizationTriggerStore(this.database, organizationId, this.agentValidator);
+    const search = triggerSearchSchema.parse(input);
+    const { state, provider, q, cursor } = search;
+    const limit = search.size ?? DEFAULT_PAGE_SIZE;
+    const scope = triggerCursorScope(organizationId, limit, search);
+    const read = (position: ReturnType<typeof decodeTriggerCursor>) =>
+      this.database.listOrganizationTriggerPage(organizationId, {
+        limit,
+        ...(state === undefined ? {} : { enabled: state === "enabled" }),
+        ...(provider === undefined ? {} : { provider }),
+        ...(q === undefined ? {} : { nameContains: q }),
+        ...(position === undefined ? {} : { position }),
+      });
+    const position = decodeTriggerCursor(cursor, scope);
+    const [requested, hasNotifications] = await Promise.all([
+      read(position),
+      this.database.hasOrganizationTriggerEvent(organizationId, NOTIFICATION_EVENT),
+    ]);
+    const page =
+      requested.records.length === 0 && position !== undefined ? await read(undefined) : requested;
+    return {
+      ...(await this.snapshotData(tenant, store, page.records, {
+        includeActivity: true,
+        hasNotifications,
+      })),
+      nextCursor: page.next === null ? null : encodeTriggerCursor("next", page.next, scope),
+      previousCursor:
+        page.previous === null ? null : encodeTriggerCursor("previous", page.previous, scope),
+    };
+  }
+
+  private async snapshotData(
+    tenant: DashboardTenant,
+    store: OrganizationTriggerStore,
+    triggers: readonly OrganizationTriggerRecord[],
+    { includeActivity, hasNotifications }: { includeActivity: boolean; hasNotifications?: boolean },
+  ) {
+    const now = this.options.now?.() ?? new Date();
+    const [daemons, connections, triggerViews] = await Promise.all([
       this.database.listDaemonsForOrganization(tenant.organization.id),
       this.database.organizationConnectionUsage(tenant.organization.id),
+      Promise.all(
+        triggers.map(async (trigger) => {
+          const own = includeActivity ? await this.activityForTrigger(trigger) : [];
+          const latest = own.reduce<(typeof own)[number] | undefined>(
+            (found, run) =>
+              found === undefined || run.receivedAt > found.receivedAt ? run : found,
+            undefined,
+          );
+          return triggerView(store, trigger, latest, summarizeRecentRuns(own, now));
+        }),
+      ),
     ]);
-    const perTrigger = await Promise.all(
-      triggers.map((trigger) => this.activityForTrigger(trigger)),
+    const notifications = await this.notificationStatus(
+      tenant.organization.id,
+      hasNotifications ?? triggerViews.some(({ event }) => event === NOTIFICATION_EVENT),
     );
-    const now = (this.options.now ?? (() => new Date()))();
-    const triggerViews = await Promise.all(
-      triggers.map((trigger, index) => {
-        // The summary uses the trigger's own newest runs.
-        const own = perTrigger[index] ?? [];
-        const latest = own.reduce<(typeof own)[number] | undefined>(
-          (found, run) => (found === undefined || run.receivedAt > found.receivedAt ? run : found),
-          undefined,
-        );
-        return triggerView(store, trigger, latest, summarizeRecentRuns(own, now));
-      }),
-    );
-    const notifications = await this.notificationStatus(tenant.organization.id, triggerViews);
     return {
       organization: tenant.organization,
       canManage: capabilitiesFor(tenant.membership.role).manageResources,

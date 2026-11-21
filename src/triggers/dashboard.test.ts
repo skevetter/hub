@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 import type { AuthServer } from "../auth/server.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
@@ -10,6 +10,52 @@ import { TriggerDashboard } from "./dashboard.js";
 import { OrganizationTriggerStore } from "./store.js";
 
 describe("trigger dashboard read model", () => {
+  it("reads run summaries only for the visible filtered trigger page", async () => {
+    const database = createMemoryDatabase({ memberships: [MEMBERSHIP] });
+    await enrollTestDaemon(database, "org-1");
+    const validator = acceptingAgentValidator();
+    const store = new OrganizationTriggerStore(database, "org-1", validator);
+    const dashboard = new TriggerDashboard(database, accountAuth(), validator);
+    const request = new Request("https://hub.test/o/acme/triggers");
+    for (let index = 19; index >= 0; index -= 1) {
+      const name = `manual-task-${String(index).padStart(2, "0")}`;
+      await store.save({ yaml: triggerYaml.replace("manual-task", name), userId: "user-1" });
+    }
+    const runs = vi.spyOn(database, "listProjectActivityRuns");
+    const filters = { q: "task", provider: "webhook" } as const;
+    const first = await dashboard.triggerPage(request, "acme", filters);
+    assert.equal(first.triggers.length, 15);
+    assert.equal(first.triggers[0]?.name, "manual-task-00");
+    assert.equal(runs.mock.calls.length, 15);
+    assert.ok(first.nextCursor);
+    const second = await dashboard.triggerPage(request, "acme", {
+      ...filters,
+      cursor: first.nextCursor,
+    });
+    assert.equal(second.triggers.length, 5);
+    assert.equal(second.triggers[0]?.name, "manual-task-15");
+    assert.equal(runs.mock.calls.length, 20);
+    const stale = await dashboard.triggerPage(request, "acme", {
+      ...filters,
+      state: "enabled",
+      cursor: first.nextCursor,
+    });
+    assert.deepEqual(
+      stale.triggers.map(({ id }) => id),
+      first.triggers.map(({ id }) => id),
+    );
+    assert.equal(stale.previousCursor, null);
+    const [trigger] = first.triggers;
+    assert.ok(trigger);
+    runs.mockClear();
+    const editor = await dashboard.editorSnapshot(request, "acme", trigger.id);
+    assert.deepEqual(
+      editor.triggers.map(({ id }) => id),
+      [trigger.id],
+    );
+    assert.equal(runs.mock.calls.length, 0);
+    assert.equal((await dashboard.snapshot(request, "acme")).triggers.length, 20);
+  });
   it.each([undefined, "false", "true"])(
     "exposes the configured progress message switch (%s)",
     async (flag) => {

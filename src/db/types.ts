@@ -429,6 +429,22 @@ export interface OrganizationTriggerRevisionRecord {
   createdAt: Date;
 }
 
+export type TriggerListKey = Pick<OrganizationTriggerRecord, "name" | "id">;
+
+export interface TriggerListRequest {
+  limit: number;
+  nameContains?: string;
+  enabled?: boolean;
+  provider?: ListProvider;
+  position?: { direction: "next" | "previous"; key: TriggerListKey };
+}
+
+export interface TriggerListPage {
+  records: OrganizationTriggerRecord[];
+  next: TriggerListKey | null;
+  previous: TriggerListKey | null;
+}
+
 export interface PendingProjectTriggerMigration {
   project: ProjectRecord;
   revision: ProjectConfigurationRevisionRecord;
@@ -1765,6 +1781,15 @@ export interface Database
   listPendingProjectTriggerMigrations(): Promise<PendingProjectTriggerMigration[]>;
   migrateProjectTriggers(input: MigrateProjectTriggersInput): Promise<OrganizationTriggerRecord[]>;
   listOrganizationTriggers(organizationId: string): Promise<OrganizationTriggerRecord[]>;
+  listOrganizationTriggerPage(
+    organizationId: string,
+    request: TriggerListRequest,
+  ): Promise<TriggerListPage>;
+  findOrganizationTrigger(
+    organizationId: string,
+    triggerId: string,
+  ): Promise<OrganizationTriggerRecord | undefined>;
+  hasOrganizationTriggerEvent(organizationId: string, event: string): Promise<boolean>;
   findOrganizationTriggerRevision(
     triggerId: string,
     revisionId: string,
