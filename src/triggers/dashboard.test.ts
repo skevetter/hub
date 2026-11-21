@@ -267,6 +267,14 @@ describe("trigger dashboard read model", () => {
     assert.equal(JSON.stringify(activity).includes("private tail"), false);
     assert.equal(JSON.stringify(activity).includes("raw-payload-only"), false);
     assert.equal("rawPayload" in activity, false);
+    assert.deepEqual(
+      (await dashboard.activityPage(request(), "acme", { provider: "webhook" })).activity,
+      [activity],
+    );
+    assert.deepEqual(
+      (await dashboard.activityPage(request(), "acme", { provider: "manual" })).activity,
+      [],
+    );
     assert.deepEqual((await dashboard.activityPage(request(), "other", {})).activity, []);
   });
 });

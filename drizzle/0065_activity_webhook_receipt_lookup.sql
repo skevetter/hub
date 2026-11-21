@@ -1,0 +1,1 @@
+CREATE INDEX "provider_event_receipts_org_webhook_idx" ON "provider_event_receipts" USING btree ("organization_id","id") WHERE "provider_event_receipts"."provider" = 'manual' and "provider_event_receipts"."source" = 'webhook.received';

@@ -132,6 +132,34 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
   });
 
   if (engine === "postgres") {
+    it("keeps Webhook page and probe plans indexed with and without matching receipts", async () => {
+      const {
+        rows: [deep],
+      } = await runtime.query<{ id: string; createdAt: string }>(
+        `select id, created_at::text as "createdAt" from trigger_runs
+         where organization_id = $1 and project_id = any($2::uuid[])
+         order by created_at desc, id desc offset 11000 limit 1`,
+        [ORGANIZATION, scopes.slice(0, 4).map(({ projectId }) => projectId)],
+      );
+      assert.ok(deep);
+      const { rows: displaced } = await runtime.query<{ id: string }>(
+        `update provider_event_receipts set source = 'manual.run'
+         where provider = 'manual' and source = 'webhook.received' returning id`,
+      );
+      assert.ok(displaced.length > 0);
+      try {
+        await runtime.query("analyze provider_event_receipts");
+        await explainWebhookPages("absent", deep);
+      } finally {
+        await runtime.query(
+          "update provider_event_receipts set source = 'webhook.received' where id = any($1::uuid[])",
+          [displaced.map(({ id }) => id)],
+        );
+        await runtime.query("analyze provider_event_receipts");
+      }
+      await explainWebhookPages("present", deep);
+    });
+
     it("checks the plans for default and filtered page reads over 27,000 runs", async () => {
       const { rows } = await runtime.query<{ runs: number }>(
         "select count(*)::int as runs from trigger_runs",
@@ -220,6 +248,47 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
     });
   }
 
+  async function explainWebhookPages(
+    fixture: "present" | "absent",
+    deep: { id: string; createdAt: string },
+  ) {
+    const observed = vi.spyOn(runtime, "query");
+    try {
+      const directions = [undefined, "before", "after"] as const;
+      for (const direction of directions) {
+        observed.mockClear();
+        const page = await database.listOrganizationActivityPage(ORGANIZATION, scopes, {
+          limit: 15,
+          provider: "webhook",
+          ...(direction === undefined ? {} : { position: { direction, key: deep } }),
+        });
+        assert.equal(page.records.length, fixture === "present" ? 15 : 0);
+        assert.ok(
+          page.records.every(
+            ({ receipt }) =>
+              receipt.organizationId === ORGANIZATION &&
+              receipt.provider === "manual" &&
+              receipt.source === "webhook.received",
+          ),
+        );
+        const calls = [...observed.mock.calls];
+        assert.equal(calls.length, fixture === "present" && direction !== undefined ? 2 : 1);
+        for (const [index, call] of calls.entries()) {
+          const label = `review 2 webhook ${fixture} ${direction ?? "first"} ${index}`;
+          const plan = await explain(label, call);
+          assert.doesNotMatch(plan, /Seq Scan on (?:trigger_runs|provider_event_receipts)/u, label);
+          assert.match(
+            plan,
+            /Index (?:Only )?Scan using provider_event_receipts_org_webhook_idx[^\n]*\n\s+Index Cond: [^\n]*organization_id/u,
+            label,
+          );
+        }
+      }
+    } finally {
+      observed.mockRestore();
+    }
+  }
+
   async function explain(label: string, call: Parameters<DatabaseRuntime["query"]> | undefined) {
     assert.ok(call);
     const [sql, params] = call;
@@ -235,17 +304,19 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
         `${plan}\n`,
       );
     }
-    if (!label.startsWith("default") && !label.startsWith("review default")) return;
-    assert.match(
-      plan,
-      /Index Scan (?:Backward )?using trigger_runs_organization_created_id_idx/u,
-      label,
-    );
-    assert.doesNotMatch(
-      plan,
-      /Seq Scan on (?:trigger_runs|provider_event_receipts)|->\s+Sort\s/u,
-      label,
-    );
+    if (label.startsWith("default") || label.startsWith("review default")) {
+      assert.match(
+        plan,
+        /Index Scan (?:Backward )?using trigger_runs_organization_created_id_idx/u,
+        label,
+      );
+      assert.doesNotMatch(
+        plan,
+        /Seq Scan on (?:trigger_runs|provider_event_receipts)|->\s+Sort\s/u,
+        label,
+      );
+    }
+    return plan;
   }
 });
 

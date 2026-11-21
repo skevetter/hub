@@ -107,6 +107,9 @@ export const providerEventReceipts = pgTable(
       table.organizationId,
       table.receivedAt.desc(),
     ),
+    index("provider_event_receipts_org_webhook_idx")
+      .on(table.organizationId, table.id)
+      .where(sql`${table.provider} = 'manual' and ${table.source} = 'webhook.received'`),
     index("provider_event_receipts_resource_idx").on(
       table.organizationId,
       table.provider,
