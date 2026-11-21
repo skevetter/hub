@@ -268,6 +268,28 @@ ${ADVANCED}`;
     expect(parseDocument(patchTriggerYaml(yaml, form)).has("progress_message")).toBe(false);
   });
 
+  test("edits the Linear reply opt-in and clears it when leaving Linear", () => {
+    const yaml = ADVANCED.replace("slack.mention", "linear.comment_created").replace(
+      'from_users: ["*"]\n      channels: [engineering]',
+      "from_users: [operator]",
+    );
+    const projection = projectTriggerForm(yaml);
+    if (projection.status !== "editable") throw new Error(projection.reason);
+    const enabled = { ...projection.value, replyMessage: true };
+    const patched = patchTriggerYaml(yaml, enabled);
+    expect(parseTriggerDocument(patched)).toMatchObject({ reply_message: true });
+    expect(parseTriggerDocument(createTriggerYaml(enabled))).toMatchObject({ reply_message: true });
+    const next = { ...changeTriggerEvent(enabled, "manual.run"), allowedUsers: "*" };
+    expect(droppedTriggerRules(enabled, next)).toContain("Agent reply");
+    expect(parseTriggerDocument(patchTriggerYaml(patched, next))).not.toHaveProperty(
+      "reply_message",
+    );
+    const invalid = { ...next, replyMessage: true };
+    expect(triggerFormErrors(invalid)).toMatchObject({
+      replyMessage: "reply_message requires a Linear event.",
+    });
+  });
+
   test("writes complete_on_turn_end only when the box is ticked", () => {
     const form = {
       name: "answer",

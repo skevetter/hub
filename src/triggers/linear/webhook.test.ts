@@ -12,6 +12,35 @@ const SECRET = "linear-webhook-secret";
 const NOW = 1_700_000_000_000;
 
 describe("Linear webhook", () => {
+  it("acknowledges an app-authored reply before hydrating or retaining the comment", async () => {
+    const options = {
+      signingSecret: SECRET,
+      now: () => NOW,
+      findAppUserId: async () => "installed-app",
+      resolveIssue: async () => {
+        throw new Error("an app reply must not hydrate the issue");
+      },
+      accept: async () => {
+        throw new Error("an app reply must not create a receipt");
+      },
+    };
+    const endpoint = createLinearWebhookSource(options);
+    const response = await endpoint.handle(
+      request(
+        {
+          type: "Comment",
+          action: "create",
+          organizationId: "linear-org",
+          webhookTimestamp: NOW,
+          actor: { id: "installed-app" },
+          data: { id: "reply-comment", issueId: "issue", body: "Answer from the app" },
+        },
+        "Comment",
+      ),
+    );
+    assert.equal(response.status, 200);
+  });
+
   it("verifies the exact raw body and its signed replay timestamp", () => {
     const body = new TextEncoder().encode('{"title":"héllo"}');
     const signature = sign(body);

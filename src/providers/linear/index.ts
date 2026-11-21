@@ -125,6 +125,12 @@ export function createLinearRegistration(
       ? {}
       : {
           findMarkedReceipt: database.findMarkedLinearReceipt.bind(database),
+          findAppUserId: async (linearOrganizationId) => {
+            const connection = await connectionForLinearOrganization(linearOrganizationId);
+            return connection?.providerApplicationId === configuration.clientId
+              ? connection.appUserId
+              : undefined;
+          },
           canHydrateIssue: async (linearOrganizationId) => {
             const connection = await database.findLinearConnection(linearOrganizationId);
             return connection !== undefined && !linearConnectionRequiresReauthorization(connection);

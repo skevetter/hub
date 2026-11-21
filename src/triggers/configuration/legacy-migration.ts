@@ -144,6 +144,7 @@ function singleRunDocument(
       ? {}
       : { max_runtime: duration(trigger.maxRuntimeMs) }),
     ...(trigger.progressMessage === true ? { progress_message: true } : {}),
+    ...(trigger.replyMessage === true ? { reply_message: true } : {}),
     run: {
       continuation: { mode: "new" },
       target: {

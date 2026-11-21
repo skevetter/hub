@@ -5,6 +5,18 @@ import type { NormalizedLinearCommentEvent, NormalizedLinearIssueEvent } from ".
 import { matchLinearTriggers, readLinearCommentInvocationParserMessage } from "./match.js";
 
 describe("Linear trigger matching", () => {
+  it("ignores the installed app's reply with or without a named audience", () => {
+    const event = {
+      ...commentEvent(),
+      actor: { id: "installed-app" },
+    };
+    const triggers = [
+      { name: "named", on: "linear.comment_created", filters: { from_users: ["installed-app"] } },
+      { name: "unrestricted", on: "linear.comment_created" },
+    ];
+    assert.deepEqual(matchLinearTriggers({ triggers }, event, undefined, "installed-app"), []);
+  });
+
   it("starts a project scout exactly when an issue enters its eligible scope", () => {
     const config = configuration();
     const entered = issue({ action: "update", updatedFrom: { stateId: "backlog" } });

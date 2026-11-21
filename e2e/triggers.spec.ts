@@ -9,6 +9,23 @@ const owner = {
   password: "trigger-owner-password",
 };
 
+test("offers the agent reply toggle only for a Linear trigger", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const triggers = new OrganizationTriggers(page);
+  await triggers.open();
+  await triggers.startNew();
+
+  const reply = page.getByRole("checkbox", { name: "Post the agent's reply" });
+  await expect(reply).toHaveCount(0);
+  await page.getByRole("combobox", { name: "When this happens" }).click();
+  await page.getByRole("option", { name: /linear\.comment_created/u }).click();
+  await expect(reply).toBeVisible();
+  await expect(reply).not.toBeChecked();
+  await reply.check();
+  await expect(reply).toBeChecked();
+});
+
 test("requires daemon setup before trigger configuration", async ({ hub, page }) => {
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");

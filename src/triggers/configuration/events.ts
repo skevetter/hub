@@ -1,6 +1,24 @@
 export const NOTIFICATION_FROM_USERS_MESSAGE =
   "github.notification has no commenter or author, so it does not accept from_users.";
 
+export const REPLY_DESTINATION_REQUIRED = "reply_message requires a Linear event.";
+export const REPLY_AUDIENCE_REQUIRED =
+  "reply_message requires named Linear users in filters.from_users.";
+
+export function hasReplyDestination(eventName: string): boolean {
+  return isEditorEvent(eventName) && eventDefinition(eventName).provider === "linear";
+}
+
+export function replyMessageError(
+  eventName: string,
+  users: readonly string[] | undefined,
+): string | undefined {
+  if (!hasReplyDestination(eventName)) return REPLY_DESTINATION_REQUIRED;
+  if (!users?.length || users.some((user) => user.trim() === "" || user.trim() === "*"))
+    return REPLY_AUDIENCE_REQUIRED;
+  return undefined;
+}
+
 /** The filters the notification poll can evaluate. Anything else would be ignored silently. */
 export const NOTIFICATION_FILTER_KEYS = ["repo", "reason", "contains", "pattern"] as const;
 

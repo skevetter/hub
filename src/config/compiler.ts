@@ -2,6 +2,7 @@ import {
   eventDefinition,
   isEditorEvent,
   NOTIFICATION_FROM_USERS_MESSAGE,
+  replyMessageError,
   SCRIPT_NOTIFICATION_REASONS,
 } from "../triggers/configuration/events.js";
 import { ContinuationSchema } from "../triggers/continuation.js";
@@ -247,6 +248,7 @@ const AuthoredTriggerSchema = z
     on: z.string().min(1),
     max_runtime: z.string().min(1),
     progress_message: z.boolean().optional(),
+    reply_message: z.boolean().optional(),
     steps: z.array(StepSchema).min(1),
     inputs: z.record(z.string(), AuthoredInputSchema).optional(),
     values: z.record(z.string(), z.string().min(1)).optional(),
@@ -378,6 +380,7 @@ export interface CompiledTrigger {
   on: string;
   maxRuntimeMs: number;
   progressMessage?: true | undefined;
+  replyMessage?: true | undefined;
   steps: CompiledSteps;
   inputs: Readonly<Record<string, CompiledInput>>;
   values: Readonly<Record<string, Expression>>;
@@ -535,6 +538,7 @@ const CompiledTriggerSchema: z.ZodType<CompiledTrigger> = z
     on: z.string().regex(EVENT_NAME),
     maxRuntimeMs: z.number().int().positive().max(MAX_DURATION_MS),
     progressMessage: z.literal(true).optional(),
+    replyMessage: z.literal(true).optional(),
     steps: z.array(CompiledStepSchema),
     inputs: z.record(z.string(), CompiledInputSchema),
     values: z.record(z.string(), z.custom<Expression>(isExpression)),
@@ -640,6 +644,11 @@ function compileTrigger(
       PROGRESS_DESTINATION_REQUIRED,
     );
   }
+  if (trigger.reply_message === true) {
+    const error = replyMessageError(trigger.on, trigger.filters?.from_users);
+    if (error !== undefined)
+      throw new HubConfigurationCompilationError([...triggerPath, "reply_message"], error);
+  }
   const inputs = compileAt([...triggerPath, "inputs"], () => compileInputs(trigger));
   compileAt([...triggerPath, "filters"], () => validateInputFilters(trigger, inputs));
   compileAt([...triggerPath, "steps"], () =>
@@ -657,6 +666,7 @@ function compileTrigger(
       parseDurationMs(trigger.max_runtime, `trigger ${trigger.name} max_runtime`),
     ),
     ...(trigger.progress_message === true ? { progressMessage: true as const } : {}),
+    ...(trigger.reply_message === true ? { replyMessage: true as const } : {}),
     steps,
     inputs,
     values,

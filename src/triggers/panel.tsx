@@ -76,7 +76,12 @@ import { hasProgressDestination } from "./progress-events.js";
 import { WebhookCard } from "./webhook-card.js";
 import { IDENTIFIER, TriggerDocumentSchema, TriggerFilterSchema } from "./configuration/schema.js";
 import { webhookSettings } from "../webhooks/functions.js";
-import { EDITOR_EVENTS, eventDefinition, parseEditorEvent } from "./configuration/events.js";
+import {
+  EDITOR_EVENTS,
+  eventDefinition,
+  hasReplyDestination,
+  parseEditorEvent,
+} from "./configuration/events.js";
 import { LIST_PROVIDERS, LIST_PROVIDER_LABELS } from "./list-providers.js";
 import {
   TRIGGER_NAME_SEARCH_MAX,
@@ -1003,6 +1008,19 @@ function TriggerEventCard({
         {...sharedYamlField(form, "progressMessage")}
         onChange={(progressMessage) => onChange({ ...form, progressMessage })}
       />
+      {hasReplyDestination(form.event) ? (
+        <CheckboxField
+          id="trigger-reply-message"
+          label="Post the agent's reply"
+          description={
+            errors.replyMessage ??
+            "After a successful run, the Paseo app posts the final answer on the source Linear issue."
+          }
+          checked={form.replyMessage === true}
+          {...sharedYamlField(form, "replyMessage")}
+          onChange={(replyMessage) => onChange({ ...form, replyMessage })}
+        />
+      ) : null}
     </Card>
   );
 }

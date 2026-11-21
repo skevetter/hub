@@ -36,7 +36,9 @@ import {
 
 import {
   eventDefinition,
+  hasReplyDestination,
   isEditorEvent,
+  replyMessageError,
   SCRIPT_NOTIFICATION_REASONS,
   type EditorEvent,
   type QualifierValues,
@@ -52,6 +54,7 @@ export interface TriggerFormValue {
   name: string;
   enabled: boolean;
   progressMessage?: boolean;
+  replyMessage?: boolean;
   event: EditorEvent;
   connection: string;
   allowedUsers: string;
@@ -152,6 +155,7 @@ function sharedTriggerFields(source: Document, event: EditorEvent): TriggerFormF
     ["name", "name"],
     ["enabled", "enabled"],
     ["progressMessage", "progress_message"],
+    ["replyMessage", "reply_message"],
     ["event", "on"],
     ["connection", ...eventPath, "connection"],
     ["allowedUsers", ...eventPath, "filters", "from_users"],
@@ -199,6 +203,7 @@ function toBaseFormValue(
     ...(trigger.progress_message === undefined
       ? {}
       : { progressMessage: trigger.progress_message }),
+    ...(trigger.reply_message === undefined ? {} : { replyMessage: trigger.reply_message }),
     event,
     connection: definition.connection ?? "",
     allowedUsers: definition.filters?.from_users?.join(", ") ?? defaultAudience(event),
@@ -276,17 +281,19 @@ export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string 
   if (projection.status !== "editable") throw new Error(projection.reason);
   const previous = projection.value;
   const unchanged = sameFormValue(previous, value);
-  if (unchanged && value.progressMessage !== false) return yaml;
+  if (unchanged && value.progressMessage !== false && value.replyMessage !== false) return yaml;
   if (!unchanged) validateFormValue(value);
 
   const document = parseDocument(yaml, { compat: ["timestamp"] });
   assertDocument(document);
-  const progressPath = ["progress_message"];
-  const progressLinked =
-    previous.sharedFields?.includes("progressMessage") ||
-    isAlias(document.getIn(progressPath, true));
-  if (!progressLinked || previous.progressMessage !== value.progressMessage) {
-    setOptional(document, progressPath, value.progressMessage === true ? true : undefined);
+  for (const [field, key] of [
+    ["progressMessage", "progress_message"],
+    ["replyMessage", "reply_message"],
+  ] as const) {
+    const path = [key];
+    const linked = previous.sharedFields?.includes(field) || isAlias(document.getIn(path, true));
+    if (!linked || previous[field] !== value[field])
+      setOptional(document, path, value[field] === true ? true : undefined);
   }
   if (unchanged) return document.toString({ lineWidth: 0 });
   if (previous.name !== value.name) setIfChanged(document, ["name"], value.name);
@@ -490,6 +497,7 @@ export function createTriggerYaml(value: TriggerFormValue): string {
     enabled: value.enabled,
     on: { [value.event]: formEventDefinition(value) },
     ...(value.progressMessage === true ? { progress_message: true } : {}),
+    ...(value.replyMessage === true ? { reply_message: true } : {}),
   };
   if (value.action === "script") {
     return stringify(
@@ -652,6 +660,10 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
     if (value.connection.trim().length === 0) errors.connection = "Connection is required.";
   }
   Object.assign(errors, progressMessageErrors(value));
+  if (value.replyMessage === true) {
+    const error = replyMessageError(value.event, commaSeparated(value.allowedUsers));
+    if (error !== undefined) errors.replyMessage = error;
+  }
   if (needsActorFilter(value)) Object.assign(errors, actorErrors(value));
   Object.assign(errors, qualifierErrors(value));
   Object.assign(errors, scriptEventErrors(value));
@@ -1008,6 +1020,7 @@ export function changeTriggerEvent(value: TriggerFormValue, event: EditorEvent):
     ...(value.progressMessage === true && !hasProgressDestination(event)
       ? { progressMessage: false }
       : {}),
+    ...(value.replyMessage === true && !hasReplyDestination(event) ? { replyMessage: false } : {}),
   };
   if (value.advancedFilters !== undefined) result.advancedFilters = [];
   delete result.manualNoCallers;
@@ -1041,6 +1054,7 @@ export function droppedTriggerRules(previous: TriggerFormValue, next: TriggerFor
   if (previous.progressMessage === true && next.progressMessage === false) {
     dropped.push("Live progress messages");
   }
+  if (previous.replyMessage === true && next.replyMessage === false) dropped.push("Agent reply");
   return dropped;
 }
 

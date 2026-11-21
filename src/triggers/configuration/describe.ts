@@ -75,7 +75,11 @@ export function describeTrigger(document: TriggerDocument, literal: Literal = ()
     : "the configured host";
   const action = describeAction(run, literal);
   const excluded = blocked.length === 0 ? "" : `, while ${lowerFirst(joinClauses(blocked))}`;
-  return `${joinClauses(eligible)}, run ${action} on ${host}${excluded}.`;
+  const reply =
+    document.reply_message === true && literal(["reply_message"])
+      ? " Post the agent's final reply on the source Linear issue after a successful run."
+      : "";
+  return `${joinClauses(eligible)}, run ${action} on ${host}${excluded}.${reply}`;
 }
 
 function lowerFirst(value: string): string {
