@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
+import type { Root, RootContent } from "mdast";
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { gfm } from "micromark-extension-gfm";
 import { it } from "vitest";
 import { formatRunReply } from "./format.js";
 
@@ -74,5 +78,92 @@ it.each([
     const started = performance.now();
     formatRunReply({ text, truncated: false }, []);
     assert.ok(performance.now() - started < 100);
+  }
+});
+
+function mentionLinks(markdown: string): string[] {
+  const found: string[] = [];
+  const pending: Array<Root | RootContent> = [
+    fromMarkdown(markdown, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] }),
+  ];
+  for (const node of pending) {
+    if (node.type === "link" || node.type === "definition") {
+      const url = URL.parse(node.url);
+      const host = url?.hostname.replace(/\.$/u, "") ?? "";
+      const path = decodeURIComponent(url?.pathname ?? "").normalize("NFKC");
+      const linear = host === "linear.app" || host.endsWith(".linear.app");
+      if (
+        (linear && /\/(?:profiles|users|agents)(?:\/|$)/iu.test(path)) ||
+        /[@\uFF20]/u.test(node.url)
+      )
+        found.push(node.url);
+    }
+    if ("children" in node) pending.push(...node.children);
+  }
+  return found;
+}
+
+// Reads 0, then past the budget: the reply takes the plain-text path.
+function plainClock() {
+  let reads = 0;
+  return () => (++reads > 1 ? 10_000 : 0);
+}
+
+it.each(["www.linear%2Eapp", "www.\uFF4C\uFF49\uFF4E\uFF45\uFF41\uFF52\uFF0E\uFF41\uFF50\uFF50"])(
+  "plain text does not expose a profile link behind a word-adjacent scheme (%s)",
+  (host) => {
+    const text = `Seehttps://example.com/?u=${host}/acme/profiles/bob now.`;
+    for (const clock of [{ now: plainClock() }, {}]) {
+      const body = formatRunReply({ text, truncated: false }, [], clock);
+      assert.deepEqual(mentionLinks(body), []);
+      assert.match(body, /now/u);
+    }
+  },
+);
+
+function random(seed: number) {
+  return () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+it("leaves no autolink to a profile or mention across 3,600 generated documents", () => {
+  const hosts = [
+    "linear.app",
+    "www.linear.app",
+    "www.linear%2Eapp",
+    "www.linear.app.",
+    "www.\uFF4C\uFF49\uFF4E\uFF45\uFF41\uFF52\uFF0E\uFF41\uFF50\uFF50",
+    "www.linear&#46;app",
+    "WWW.LINEAR.APP",
+    "www.xn--linear-app",
+  ];
+  const paths = ["/acme/profiles/bob", "/a/users/b", "/a/agents/c", "/acme/%70rofiles/bob"];
+  const lead = ["", "See", "x", "(", "<", "[a](", "[t]: ", "u=", "&amp;", "\\", " "];
+  const wrap = [
+    (u: string) => u,
+    (u: string) => `https://example.com/?u=${u}`,
+    (u: string) => `<${u}>`,
+    (u: string) => `[x](${u})`,
+    (u: string) => `[x]: ${u}`,
+    (u: string) => `\`${u}\``,
+    (u: string) => `*${u}*`,
+    (u: string) => `| ${u} |`,
+    (u: string) => `ops@${u}`,
+  ];
+  for (const seed of [4101, 4202, 4303]) {
+    const next = random(seed);
+    const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+    for (let index = 0; index < 1_200; index += 1) {
+      const url = `${pick(["https://", "http://", "", "www."])}${pick(hosts)}${pick(paths)}`;
+      const text = `${pick(lead)}${pick(wrap)(url)} ${pick(wrap)(url)}${"`x` ".repeat(Math.floor(next() * 120))}\n\nend`;
+      for (const clock of [{ now: plainClock() }, {}]) {
+        const body = formatRunReply({ text, truncated: next() < 0.2 }, [], clock);
+        assert.deepEqual(mentionLinks(body), [], JSON.stringify({ seed, index, text, body }));
+      }
+    }
   }
 });

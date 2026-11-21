@@ -23,7 +23,8 @@ const MARKDOWN_BUDGET_MS = 150;
 const MAX_MARKDOWN_DELIMITERS = 192;
 const MARKDOWN_DELIMITER = /[[\]()*_~`<>!&\\]+/gu;
 const MARKDOWN_CONTAINER_CHAIN = /(?:(?:[-+*>]|\d{1,9}[.)])[ \t]+){33}/u;
-const URL_IN_PROSE = /(?:https?:\/\/|www\.|(?<![\w-])linear\.app\.?(?=[:/]))[^\s<>()[\]"'`]+/giu;
+const URL_START = /https?:\/\/|www\.|(?<![\w-])linear\.app\.?(?=[:/])/giu;
+const URL_RUN = /[^\s<>()[\]"'`]*/uy;
 const LINEAR_HOST_PATH = /linear\.app\.?(?::\d{1,5})?(\/[^\s<>()[\]"'`\\?#]*)/giu;
 const LINEAR_MENTION_PATH = /\/(?:profiles|users|agents)(?:\/|$)/iu;
 const MENTION_SIGN = /[@\uFF20]|&(?:#0*64|#x0*40|commat);/giu;
@@ -125,7 +126,7 @@ function renderMarkdown(
     extensions: [gfmToMarkdown({ tablePipeAlign: false })],
   }).trim();
   if (late()) return undefined;
-  if (hasSafeProse(result)) return result;
+  if (hasSafeProse(result) && !hasUnsafeNode(result)) return result;
   report("structure");
   return undefined;
 }
@@ -145,7 +146,21 @@ function renderPlainText(source: string): string {
     .replace(/[!-/:-@[-`{-~]/gu, "\\$&")
     .trim();
   if (!hasSafeProse(result)) throw new Error("Linear reply contains unsafe text after rendering");
+  if (hasUnsafeNode(result))
+    throw new Error("Linear reply contains an unsafe link after rendering");
   return result;
+}
+
+// Escaping can expose a link the source did not have, so the final text is parsed again and
+// every link, image and HTML node GFM would build is checked. Failing closed beats guessing a
+// repair: autolink literals carry no source position.
+function hasUnsafeNode(text: string): boolean {
+  const pending: Array<Root | RootContent> = [parseMarkdown(text)];
+  for (const node of pending) {
+    if (node.type !== "root" && removeNode(node)) return true;
+    if ("children" in node) pending.push(...node.children);
+  }
+  return false;
 }
 
 function parseMarkdown(source: string): Root {
@@ -199,13 +214,33 @@ function removeNode(node: RootContent): boolean {
   return (node.type === "link" || node.type === "definition") && !safeLink(node.url);
 }
 
+// GFM links a "www." or scheme at any punctuation boundary, including inside a longer URL that
+// starts after a word character, so every start is checked and not only the outer match.
+function removeUnsafeUrls(value: string): string {
+  const unsafe: [number, number][] = [];
+  for (const start of value.matchAll(URL_START)) {
+    URL_RUN.lastIndex = start.index;
+    const run = URL_RUN.exec(value)![0];
+    const absolute = run.includes("://") ? run : `https://${run}`;
+    if (!safeLink(absolute)) unsafe.push([start.index, start.index + run.length]);
+  }
+  let result = "";
+  let done = 0;
+  for (const [from, to] of unsafe) {
+    if (to <= done) continue;
+    result += value.slice(done, Math.max(from, done)) + "[Link removed]";
+    done = to;
+  }
+  return result + value.slice(done);
+}
+
 function neutralizeMentions(value: string): string {
-  return value
-    .replace(USER_TAG, "")
-    .replace(URL_IN_PROSE, (text) => {
-      const absolute = text.includes("://") ? text : `https://${text}`;
-      return safeLink(absolute) ? text : "[Link removed]";
-    })
+  let stripped = value;
+  for (let previous = ""; previous !== stripped; ) {
+    previous = stripped;
+    stripped = stripped.replace(USER_TAG, "");
+  }
+  return removeUnsafeUrls(stripped)
     .replace(LINEAR_HOST_PATH, (text, path: string) =>
       isLinearMentionPath(path) ? "[Link removed]" : text,
     )
