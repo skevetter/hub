@@ -15,7 +15,6 @@ import type {
 } from "./types.js";
 
 export const RECENT_DROP_COUNT_LIMIT = 2_500;
-export const UNSUPPORTED_LINEAR_RECEIPT_LIMIT = 5_000;
 
 type Provider = ProviderEventReceiptRecord["provider"];
 type ReceiptIdentity = Pick<ProviderEventReceiptRecord, "provider" | "source">;

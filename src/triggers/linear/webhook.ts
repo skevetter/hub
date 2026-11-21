@@ -1,3 +1,4 @@
+import { UNSUPPORTED_LINEAR_RATE_LIMITED } from "../../db/unsupported-linear.js";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { ZodError } from "zod";
 import type { ProviderEventAcceptance } from "../../db/types.js";
@@ -203,7 +204,7 @@ async function acceptUnsupportedLinearEvent(
       : (kind ?? "unknown");
   const action = eventIdentifier(envelope["action"]);
   const source = `linear.${type}`;
-  await options.accept({
+  const acceptance = await options.accept({
     linearOrganizationId,
     deliveryId: verified.deliveryId,
     signatureHash: verified.signatureHash,
@@ -212,6 +213,9 @@ async function acceptUnsupportedLinearEvent(
     receivedAt: verified.receivedAt,
     dropReason: "unsupported_event",
   });
+  if (acceptance.status === "dropped" && acceptance.reason === UNSUPPORTED_LINEAR_RATE_LIMITED) {
+    logger.debug("unsupported Linear receipt write rate exceeded");
+  }
   return new Response("OK", { status: 200 });
 }
 

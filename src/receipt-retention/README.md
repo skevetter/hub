@@ -16,7 +16,7 @@ and internal markers for handled events such as `github_lifecycle` stay too. Del
 their payload, history, and delivery/signature deduplication; a subsequent delivery is evaluated
 against the current configuration.
 
-Hub also keeps at most 5,000 unsupported Linear receipts per organization, evicting the oldest receipt when a new delivery exceeds that cap.
+Hub also keeps at most 5,000 unsupported Linear receipts per organization, evicting the oldest receipt when a new delivery exceeds that cap. Unsupported Linear deliveries also share a [per-organization write budget](../../docs/linear-agents.md#agent-session-limits).
 
 The first sweep starts asynchronously at startup. Each query examines at most 500 receipt IDs,
 using the existing primary key to advance even through pages containing only retained receipts.

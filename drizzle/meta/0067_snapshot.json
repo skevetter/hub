@@ -6630,6 +6630,34 @@
           "method": "btree",
           "with": {}
         },
+        "provider_event_receipts_org_unsupported_linear_idx": {
+          "name": "provider_event_receipts_org_unsupported_linear_idx",
+          "columns": [
+            {
+              "expression": "organization_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "received_at",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "first"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": false,
+              "nulls": "first"
+            }
+          ],
+          "isUnique": false,
+          "where": "provider = 'linear' and dropped_reason = 'unsupported_event'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "provider_event_receipts_org_dropped_order_idx": {
           "name": "provider_event_receipts_org_dropped_order_idx",
           "columns": [
@@ -8394,6 +8422,53 @@
           "columnsFrom": ["active_run_id"],
           "columnsTo": ["id"],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.unsupported_linear_receipt_budgets": {
+      "name": "unsupported_linear_receipt_budgets",
+      "schema": "",
+      "columns": {
+        "organization_id": {
+          "name": "organization_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "hour": {
+          "name": "hour",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "written": {
+          "name": "written",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "retained_upper_bound": {
+          "name": "retained_upper_bound",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "unsupported_linear_receipt_budgets_organization_id_organization_id_fk": {
+          "name": "unsupported_linear_receipt_budgets_organization_id_organization_id_fk",
+          "tableFrom": "unsupported_linear_receipt_budgets",
+          "tableTo": "organization",
+          "columnsFrom": ["organization_id"],
+          "columnsTo": ["id"],
+          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },

@@ -51,6 +51,7 @@ import { randomUUID } from "node:crypto";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import { parseInvocationInputs, parseInvocationRejection } from "../triggers/invocation.js";
+import { DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR } from "./unsupported-linear.js";
 import { countRecentDroppedEvents, readDroppedEventPage } from "./dropped-events.js";
 import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
 import {
@@ -347,8 +348,12 @@ function transitionWithTerminalRun(
     : { ...transition, terminalRun: run };
 }
 
-export function createDatabase(runtime: DatabaseRuntime, locks: Locks): Database {
-  return new PgDatabase(runtime, locks);
+export function createDatabase(
+  runtime: DatabaseRuntime,
+  locks: Locks,
+  unsupportedLinearReceiptsPerHour = DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR,
+): Database {
+  return new PgDatabase(runtime, locks, unsupportedLinearReceiptsPerHour);
 }
 
 class PgDatabase implements Database {
@@ -559,6 +564,7 @@ class PgDatabase implements Database {
   constructor(
     private readonly pool: DatabaseRuntime,
     private readonly locks: Locks,
+    unsupportedLinearReceiptsPerHour: number,
   ) {
     this.schedules = new ScheduleRepository(this.pool);
     this.timeline = new RunTimelineRepository(this.pool, locks);
@@ -574,6 +580,7 @@ class PgDatabase implements Database {
       this.pool,
       locks,
       this.connections,
+      unsupportedLinearReceiptsPerHour,
     );
   }
 

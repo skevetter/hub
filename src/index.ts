@@ -1,3 +1,4 @@
+import { readUnsupportedLinearReceiptRate } from "./db/unsupported-linear.js";
 import { readRunPayloadRetentionSettings } from "./run-payload-retention/settings.js";
 import { randomBytes } from "node:crypto";
 import { validateHeaderName, type IncomingMessage } from "node:http";
@@ -283,11 +284,13 @@ function createProductionAuthServer(
 async function createDatabaseHandle(): Promise<DatabaseRuntimeBundle & { database: Database }> {
   // Read before connecting so a bad value stops startup with its own message.
   const poolOptions = readDatabasePoolOptions(process.env);
+  const unsupportedLinearReceiptsPerHour = readUnsupportedLinearReceiptRate(process.env);
   const databaseUrl = process.env["DATABASE_URL"];
   if (databaseUrl !== undefined && databaseUrl.length > 0) {
     return initializeDatabaseRuntime(
       () => postgresDatabaseRuntime(databaseUrl, poolOptions),
       "database runtime ready: postgres",
+      unsupportedLinearReceiptsPerHour,
     );
   }
 
@@ -295,19 +298,24 @@ async function createDatabaseHandle(): Promise<DatabaseRuntimeBundle & { databas
   return initializeDatabaseRuntime(
     () => embeddedDatabaseRuntime(dataDirectory),
     `database runtime ready: embedded (${dataDirectory})`,
+    unsupportedLinearReceiptsPerHour,
   );
 }
 
 async function initializeDatabaseRuntime(
   createRuntime: () => Promise<DatabaseRuntimeBundle>,
   readyMessage: string,
+  unsupportedLinearReceiptsPerHour: number,
 ): Promise<DatabaseRuntimeBundle & { database: Database }> {
   let bundle: DatabaseRuntimeBundle | undefined;
   try {
     bundle = await createRuntime();
     await bundle.runtime.migrate();
     logger.info(readyMessage);
-    return { ...bundle, database: createDatabase(bundle.runtime, bundle.locks) };
+    return {
+      ...bundle,
+      database: createDatabase(bundle.runtime, bundle.locks, unsupportedLinearReceiptsPerHour),
+    };
   } catch (error) {
     if (bundle !== undefined) {
       try {

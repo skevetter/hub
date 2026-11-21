@@ -23,3 +23,9 @@ Delegation uses the existing issue source, receipt and run identity. A repeated 
 Hub records verified `AgentSessionEvent` deliveries from connected Linear workspaces as unsupported in Activity > Dropped and acknowledges them with HTTP 200. This applies to mentions and delegation sessions. These deliveries start no runs and post no activities. Mentions can start runs through a configured Linear comment trigger when the event passes its filters.
 
 Agent sessions and activities are not implemented. If agent session webhooks are enabled, Linear can show the agent as not responding because Hub does not send the initial activity. Do not treat mentionability or delegation support as agent session support. This change adds no calls that post to Linear.
+
+Hub admits at most 600 new unsupported receipts per Hub organization in each UTC clock hour.
+Set `PASEO_HUB_LINEAR_UNSUPPORTED_RECEIPTS_PER_HOUR` to a whole number from 1 to 600 to lower
+the budget. Retrying an already retained delivery uses no additional budget. Hub acknowledges
+excess deliveries with HTTP 200, skips receipt storage, and emits a debug log with no delivery
+metadata. The budget is shared across Hub processes and survives restarts.

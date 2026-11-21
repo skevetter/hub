@@ -148,6 +148,7 @@ import type {
   ManualEventPersistence,
   ManualReceiptReplayTarget,
   ProviderEventAcceptance,
+  ProviderEventEvidence,
   CreateProjectInput,
   InsertProjectConfigurationRevisionInput,
   InsertAttachmentInput,
@@ -216,8 +217,14 @@ import {
   droppedEventProvider,
   groupDropCounts,
   RECENT_DROP_COUNT_LIMIT,
-  UNSUPPORTED_LINEAR_RECEIPT_LIMIT,
 } from "./dropped-events.js";
+import {
+  DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR,
+  UNSUPPORTED_LINEAR_RATE_LIMITED,
+  UNSUPPORTED_LINEAR_RECEIPT_LIMIT,
+  unsupportedLinearWindow,
+  type UnsupportedLinearWindow,
+} from "./unsupported-linear.js";
 import { activityTimestampMicros, compareRunsNewestFirst } from "./activity-key.js";
 import { hasTriggerEvent, triggerProviderEvent } from "./trigger-list.js";
 import { toProviderEventReceiptRecordSummary } from "./mappers.js";
@@ -253,6 +260,11 @@ import type {
 
 const OUTPUT_ATTEMPT_LEASE_MS = 5 * 60_000;
 
+type UnsupportedLinearReceiptKey = Pick<
+  ProviderEventReceiptRecord,
+  "id" | "receivedAt" | "deliveryId" | "signatureHash"
+>;
+
 export interface MemoryDatabaseOptions {
   schedules?: import("../triggers/schedule/index.js").ScheduleStore;
   githubNotifications?: import("../triggers/github-notifications/index.js").GitHubNotificationStore;
@@ -269,6 +281,7 @@ export interface MemoryDatabaseOptions {
   now?: () => Date;
   slackConnections?: readonly SlackConnectionRecord[];
   linearConnections?: readonly LinearConnectionRecord[];
+  unsupportedLinearReceiptsPerHour?: number;
   githubConnections?: readonly GitHubConnectionRecord[];
   githubSyncOwner?: GitHubInstallationSyncOwner;
 }
@@ -1823,6 +1836,13 @@ class MemoryDatabase implements Database {
   private readonly githubConnections = new Map<number, GitHubConnectionRecord>();
   private readonly discordConnections = new Map<string, DiscordConnectionRecord>();
   private readonly slackConnections = new Map<string, SlackConnectionRecord>();
+  private readonly unsupportedLinearBudgets = new Map<
+    string,
+    {
+      window: UnsupportedLinearWindow;
+      receipts: Map<string, UnsupportedLinearReceiptKey>;
+    }
+  >();
   private readonly linearConnections = new Map<string, LinearConnectionRecord>();
   private readonly organizationIds: Set<string>;
   private readonly homeChecklistCompletions = new Map<string, Date>();
@@ -6545,9 +6565,13 @@ class MemoryDatabase implements Database {
         reason: reason ?? "provider_unbound",
       };
     }
+    const provider = providerForInput(input);
+    if (provider === "linear" && reason === "unsupported_event") {
+      return this.acceptUnsupportedLinearReceipt(input, organizationId, connectionId);
+    }
     const receipt = this.insertProviderEventReceipt({
       organizationId,
-      provider: providerForInput(input),
+      provider,
       connectionId,
       resourceId,
       input,
@@ -6558,16 +6582,12 @@ class MemoryDatabase implements Database {
         droppedReason: reason,
         preRoutingDrop: preRoutingDropEvidence(reason),
       });
-      if (receipt.provider === "linear" && reason === "unsupported_event") {
-        this.pruneUnsupportedLinearReceipts(organizationId);
-      }
       return {
         status: "dropped",
         receiptId: receipt.id,
         reason,
       };
     }
-    const provider = providerForInput(input);
     const routes = Array.from(this.projectTriggerRoutes.entries()).flatMap(
       ([projectId, candidates]) => {
         const project = this.projects.get(projectId);
@@ -6695,17 +6715,49 @@ class MemoryDatabase implements Database {
     return receipt;
   }
 
-  private pruneUnsupportedLinearReceipts(organizationId: string) {
-    let count = 0;
-    let oldest: ProviderEventReceiptRecord | undefined;
-    for (const receipt of this.providerEventReceipts.values()) {
-      if (
-        receipt.organizationId !== organizationId ||
-        receipt.provider !== "linear" ||
-        receipt.droppedReason !== "unsupported_event"
-      )
-        continue;
-      count += 1;
+  private acceptUnsupportedLinearReceipt(
+    input: ProviderEventEvidence,
+    organizationId: string,
+    connectionId: string,
+  ): ProviderEventAcceptance {
+    const previous = this.unsupportedLinearBudgets.get(organizationId);
+    const window = unsupportedLinearWindow(input.receivedAt, previous?.window);
+    const limit =
+      this.options.unsupportedLinearReceiptsPerHour ?? DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR;
+    if (window.written >= limit) {
+      return {
+        status: "dropped",
+        receiptId: input.deliveryId,
+        reason: UNSUPPORTED_LINEAR_RATE_LIMITED,
+      };
+    }
+    const receipt = this.insertProviderEventReceipt({
+      provider: "linear",
+      organizationId,
+      connectionId,
+      resourceId: null,
+      input,
+    });
+    this.providerEventReceipts.set(receipt.id, { ...receipt, preRoutingDrop: "unsupported_event" });
+    const receipts = previous?.receipts ?? new Map<string, UnsupportedLinearReceiptKey>();
+    const { id, receivedAt, deliveryId, signatureHash } = receipt;
+    receipts.set(id, { id, receivedAt, deliveryId, signatureHash });
+    this.unsupportedLinearBudgets.set(organizationId, {
+      window: { hour: window.hour, written: window.written + 1 },
+      receipts,
+    });
+    if (receipts.size > UNSUPPORTED_LINEAR_RECEIPT_LIMIT) {
+      this.pruneUnsupportedLinearReceipt(organizationId, receipts);
+    }
+    return { status: "dropped", receiptId: receipt.id, reason: "unsupported_event" };
+  }
+
+  private pruneUnsupportedLinearReceipt(
+    organizationId: string,
+    receipts: Map<string, UnsupportedLinearReceiptKey>,
+  ) {
+    let oldest: UnsupportedLinearReceiptKey | undefined;
+    for (const receipt of receipts.values()) {
       if (
         oldest === undefined ||
         compareRunsNewestFirst(receiptOrder(receipt), receiptOrder(oldest)) > 0
@@ -6713,7 +6765,8 @@ class MemoryDatabase implements Database {
         oldest = receipt;
       }
     }
-    if (count <= UNSUPPORTED_LINEAR_RECEIPT_LIMIT || oldest === undefined) return;
+    if (oldest === undefined) return;
+    receipts.delete(oldest.id);
     this.providerEventReceipts.delete(oldest.id);
     this.providerEventReceiptIdsByDelivery.delete(
       triggerDeliveryKey(organizationId, oldest.deliveryId),

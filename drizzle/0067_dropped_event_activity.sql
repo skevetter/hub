@@ -1,4 +1,13 @@
+CREATE TABLE "unsupported_linear_receipt_budgets" (
+	"organization_id" text PRIMARY KEY NOT NULL,
+	"hour" integer NOT NULL,
+	"written" integer NOT NULL,
+	"retained_upper_bound" integer NOT NULL
+);
+--> statement-breakpoint
 ALTER TABLE "provider_event_receipts" DROP CONSTRAINT "provider_event_receipts_pre_routing_drop_check";--> statement-breakpoint
+ALTER TABLE "unsupported_linear_receipt_budgets" ADD CONSTRAINT "unsupported_linear_receipt_budgets_organization_id_organization_id_fk" FOREIGN KEY ("organization_id") REFERENCES "public"."organization"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+CREATE INDEX "provider_event_receipts_org_unsupported_linear_idx" ON "provider_event_receipts" USING btree ("organization_id","received_at" DESC NULLS FIRST,"id" DESC NULLS FIRST) WHERE provider = 'linear' and dropped_reason = 'unsupported_event';--> statement-breakpoint
 CREATE INDEX "provider_event_receipts_org_dropped_order_idx" ON "provider_event_receipts" USING btree ("organization_id","received_at" DESC NULLS FIRST,"id" DESC NULLS FIRST,"provider","dropped_reason") WHERE "provider_event_receipts"."dropped_reason" is not null;--> statement-breakpoint
 CREATE INDEX "provider_event_receipts_org_dropped_provider_idx" ON "provider_event_receipts" USING btree ("organization_id","provider","received_at" DESC NULLS FIRST,"id" DESC NULLS FIRST) WHERE "provider_event_receipts"."dropped_reason" is not null;--> statement-breakpoint
 CREATE INDEX "provider_event_receipts_org_dropped_source_idx" ON "provider_event_receipts" USING btree ("organization_id","source","received_at" DESC NULLS FIRST,"id" DESC NULLS FIRST) WHERE "provider_event_receipts"."dropped_reason" is not null;--> statement-breakpoint
