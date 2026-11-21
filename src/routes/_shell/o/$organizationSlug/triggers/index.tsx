@@ -15,11 +15,12 @@ export const Route = createFileRoute("/_shell/o/$organizationSlug/triggers/")({
       to: "/o/$organizationSlug/triggers",
       params,
       search: normalized,
+      state: location.state,
       replace: true,
     });
   },
   loaderDeps: ({ search }) => triggerSearchSchema.parse(search),
-  loader: async ({ context, deps, params }) => {
+  loader: async ({ context, deps, params, location }) => {
     const organizationSlug = params.organizationSlug;
     const result = await triggerListPage({ data: { organizationSlug, ...deps } });
     if (result.status !== "ok") return;
@@ -29,6 +30,7 @@ export const Route = createFileRoute("/_shell/o/$organizationSlug/triggers/")({
         to: "/o/$organizationSlug/triggers",
         params,
         search: { ...deps, cursor: undefined },
+        state: location.state,
         replace: true,
       });
     }

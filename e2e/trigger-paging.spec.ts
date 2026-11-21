@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { expect } from "@playwright/test";
 import { test } from "./app.js";
+import { projectApp } from "./helpers/projects/index.js";
 import { OrganizationTriggers } from "./helpers/triggers.js";
 
 test("Trigger filters and page survive opening and saving the editor", async ({ hub, page }) => {
@@ -112,4 +113,36 @@ test("Trigger filters and page survive opening and saving the editor", async ({ 
   await expect(page).toHaveURL(/[?&]provider=webhook/u);
   await expect(rows).toHaveCount(1);
   await expect(created).toBeVisible();
+});
+
+test("remembered size stays silent on reload and when opening either list from the sidebar", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", {
+    name: "Paging Owner",
+    email: "remembered-paging@example.com",
+    password: "trigger-owner-password",
+  });
+  await hub.createOrganization("owner", "Acme");
+  const navigation = projectApp(page).navigation;
+  await navigation.openOrganizationSection("Triggers");
+  const triggerPager = page.getByRole("navigation", { name: "Trigger pages" });
+  await triggerPager.getByRole("combobox", { name: "Rows per page" }).selectOption("25");
+  await expect(triggerPager.getByRole("status")).toContainText("Rows per page 25");
+
+  for (const [section, pagerLabel] of [
+    ["Triggers", "Trigger pages"],
+    ["Activity", "Activity pages"],
+  ] as const) {
+    await navigation.openOrganizationSection("Home");
+    await navigation.openOrganizationSection(section);
+    const pager = page.getByRole("navigation", { name: pagerLabel });
+    await expect(page).toHaveURL(/[?&]size=25/u);
+    await expect(pager.getByRole("combobox", { name: "Rows per page" })).toHaveValue("25");
+    await expect.soft(pager.getByRole("status")).toBeEmpty();
+    await page.reload();
+    await expect(pager.getByRole("combobox", { name: "Rows per page" })).toHaveValue("25");
+    await expect.soft(pager.getByRole("status")).toBeEmpty();
+  }
 });

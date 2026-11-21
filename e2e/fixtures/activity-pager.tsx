@@ -53,7 +53,6 @@ function Fixture() {
         fallbackFocusId="activity-title"
         summary={`${count} visible`}
         announcement={count === 1 ? "1 run" : `${count} runs`}
-        announceOnNavigation
         newer={null}
         older={null}
       />

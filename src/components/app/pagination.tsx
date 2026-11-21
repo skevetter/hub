@@ -30,7 +30,6 @@ export function Pagination({
   fallbackFocusId,
   summary,
   announcement = summary,
-  announceOnNavigation = false,
   newer,
   older,
   pageSize,
@@ -44,7 +43,6 @@ export function Pagination({
   fallbackFocusId: string;
   summary: string;
   announcement?: string;
-  announceOnNavigation?: boolean;
   newer: PaginationTarget | null;
   older: PaginationTarget | null;
   pageSize?: PageSizeControl;
@@ -71,7 +69,7 @@ export function Pagination({
     >
       <span className="mr-auto text-xs text-muted-foreground">{summary}</span>
       <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {announceOnNavigation ? liveContent : announcement}
+        {liveContent}
       </span>
       {pageSize === undefined ? null : <RowsPerPage {...pageSize} busy={busy} />}
       <div className="flex gap-2">

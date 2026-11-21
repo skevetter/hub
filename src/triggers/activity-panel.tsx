@@ -58,7 +58,7 @@ export function TriggerActivityPanel() {
     (next: PageSize, replace = false) => {
       void navigate({
         search: (previous) => ({ ...previous, size: next, cursor: undefined }),
-        state: LIST_RESULT_ACTION,
+        state: replace ? {} : LIST_RESULT_ACTION,
         replace,
       });
     },
@@ -189,7 +189,6 @@ export function TriggerActivityPanel() {
         fallbackFocusId={HEADING_ID}
         summary={summary}
         announcement={announcement}
-        announceOnNavigation
         newer={newer}
         older={older}
         pageSize={sizeControl}

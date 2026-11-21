@@ -29,6 +29,7 @@ import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
 import { FormActions } from "../components/app/form-actions.js";
 import { FieldSkeleton, FormField } from "../components/app/form-field.js";
 import { ClearListFilters, ListFilters, ListFilterSelect } from "../components/app/list-filters.js";
+import { LIST_RESULT_ACTION } from "../components/app/list-result-announcement.js";
 import { LoadingLine, Spinner } from "../components/app/loading.js";
 import { DEFAULT_PAGE_SIZE, type PageSize } from "../components/app/page-size.js";
 import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
@@ -147,7 +148,11 @@ export function TriggersPanel() {
   });
   const changeSize = useCallback(
     (size: PageSize, replace = false) => {
-      void navigate({ search: (previous) => ({ ...previous, size, cursor: undefined }), replace });
+      void navigate({
+        search: (previous) => ({ ...previous, size, cursor: undefined }),
+        state: replace ? {} : LIST_RESULT_ACTION,
+        replace,
+      });
     },
     [navigate],
   );
@@ -354,6 +359,7 @@ function TriggerListFilters({ search, children }: { search: TriggerSearch; child
   useEffect(() => setName(search.q ?? ""), [search.q]);
   const setFilter = (filter: string, value: string) => {
     void navigate({
+      state: LIST_RESULT_ACTION,
       search: (previous) =>
         triggerSearchSchema.parse({
           ...previous,
