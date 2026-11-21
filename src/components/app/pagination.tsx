@@ -1,11 +1,18 @@
 import { Link, useRouterState } from "@tanstack/react-router";
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useId, useRef, type ChangeEvent } from "react";
 import type { LinkProps } from "@tanstack/react-router";
 
 import { Button } from "../ui/button.js";
+import { PAGE_SIZES, parsePageSize, rememberPageSize, type PageSize } from "./page-size.js";
 
 /** Where a control leads. Absent means there is no page that way, and the control is disabled. */
 export type PaginationTarget = Pick<LinkProps, "to" | "search" | "params">;
+
+interface PageSizeControl {
+  value: PageSize;
+  accountId: string;
+  onChange: (size: PageSize) => void;
+}
 
 /**
  * Newer and Older controls under a list read by keyset: the reader moves one page at a time and
@@ -23,6 +30,7 @@ export function Pagination({
   summary,
   newer,
   older,
+  pageSize,
 }: {
   label: string;
   /** Changes whenever the reader moves. */
@@ -32,6 +40,7 @@ export function Pagination({
   summary: string;
   newer: PaginationTarget | null;
   older: PaginationTarget | null;
+  pageSize?: PageSizeControl;
 }) {
   const busy = useRouterState({ select: (state) => state.isLoading });
   const moved = useRef(position);
@@ -47,9 +56,10 @@ export function Pagination({
     <nav
       aria-label={label}
       aria-busy={busy}
-      className="flex items-center justify-between gap-3 pt-3"
+      className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-3"
     >
-      <span className="text-xs text-muted-foreground">{summary}</span>
+      <span className="mr-auto text-xs text-muted-foreground">{summary}</span>
+      {pageSize === undefined ? null : <RowsPerPage {...pageSize} busy={busy} />}
       <div className="flex gap-2">
         <PageLink target={newer} busy={busy}>
           Newer
@@ -59,6 +69,38 @@ export function Pagination({
         </PageLink>
       </div>
     </nav>
+  );
+}
+
+function RowsPerPage({ value, accountId, onChange, busy }: PageSizeControl & { busy: boolean }) {
+  const id = useId();
+  const select = useCallback(
+    (event: ChangeEvent<HTMLSelectElement>) => {
+      if (busy) return;
+      const size = parsePageSize(event.currentTarget.value);
+      if (size === undefined || size === value) return;
+      rememberPageSize(accountId, size);
+      onChange(size);
+    },
+    [accountId, busy, onChange, value],
+  );
+  return (
+    <div className="flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground">
+      <label htmlFor={id}>Rows per page</label>
+      <select
+        id={id}
+        className="h-7 rounded-md border border-input bg-background px-2.5 text-foreground"
+        value={value}
+        onChange={select}
+        aria-disabled={busy}
+      >
+        {PAGE_SIZES.map((size) => (
+          <option key={size} value={size}>
+            {size}
+          </option>
+        ))}
+      </select>
+    </div>
   );
 }
 
