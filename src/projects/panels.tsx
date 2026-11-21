@@ -230,6 +230,12 @@ function ProviderConnections({
     <Card
       icon={<ProviderGlyph provider={provider} />}
       title={label}
+      {...(provider === "linear" && connections.length > 0 && canManage
+        ? {
+            description:
+              "Linear events dropped because no route matched stay dropped after reconnecting.",
+          }
+        : {})}
       {...(action === undefined ? {} : { action })}
     >
       {connections.length === 0 ? null : (

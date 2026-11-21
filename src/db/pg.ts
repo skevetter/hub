@@ -1,3 +1,7 @@
+import {
+  linearTriggerRoutesLock,
+  organizationTriggerRoutesForSave,
+} from "./linear-trigger-routes.js";
 import { InteractiveSessionRepository } from "../interactive-sessions/postgres-store.js";
 import { expireReceiptPayload, scanReceiptPayloads } from "./receipt-payload-retention.js";
 import {
@@ -4175,6 +4179,25 @@ class PgDatabase implements Database {
     input: SaveOrganizationTriggerInput,
   ): Promise<OrganizationTriggerRecord> {
     return this.pool.transaction(async (client) => {
+      // Validation resolves routes before this transaction, while connections can change concurrently.
+      await this.locks.withTxLock(client, linearTriggerRoutesLock(input.organizationId));
+      const configuration = parseCompiledHubConfig(input.normalizedConfiguration);
+      const linearConnections =
+        input.enabled && configuration.triggers.some(({ on }) => on.startsWith("linear."))
+          ? (
+              await client.query<{ id: string }>(
+                "select id from linear_connections where organization_id = $1",
+                [input.organizationId],
+              )
+            ).rows
+          : [];
+      const routes = input.enabled
+        ? organizationTriggerRoutesForSave(
+            configuration,
+            input.routes,
+            linearConnections.map(({ id }) => id),
+          )
+        : [];
       let trigger: OrganizationTriggerRow;
       if (input.triggerId === undefined) {
         const runtimeProjectRows = await client.query<ProjectRow>(
@@ -4236,7 +4259,7 @@ class PgDatabase implements Database {
       await client.query(`delete from organization_trigger_routes where trigger_id = $1`, [
         trigger.id,
       ]);
-      for (const route of input.routes) {
+      for (const route of routes) {
         await client.query(
           `insert into organization_trigger_routes (
              organization_id, trigger_id, trigger_revision_id, provider,
@@ -4278,8 +4301,7 @@ class PgDatabase implements Database {
       await client.query(`delete from project_trigger_routes where project_id = $1`, [
         trigger.runtime_project_id,
       ]);
-      const configuration = parseCompiledHubConfig(input.normalizedConfiguration);
-      for (const route of input.routes) {
+      for (const route of routes) {
         const configuredTriggerName =
           configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
           configuration.triggers[0]?.name ??

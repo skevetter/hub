@@ -10,6 +10,8 @@ Connections with the four required scopes can keep running workflows. To enable 
 
 A connection missing any of the other four scopes needs reauthorization, even if its token can still refresh. The Connections page shows "Linear reauthorization required". The Apps inventory shows that action is needed. Until the required scopes are granted, webhook events are acknowledged and durably dropped with `configuration_unavailable`. Reconnecting does not replay those dropped deliveries.
 
+Connecting or reconnecting a workspace adds missing routes for eligible enabled triggers. Linear events dropped because no route matched stay dropped after reconnecting. Hub records those drops as `no_project_route`.
+
 ## Delegation and assigned triggers
 
 Linear delegates work to an app by setting the issue's `delegate`, not its human `assignee`. Hub's existing `linear.issue_assigned` trigger accepts an Issue update when `updatedFrom` contains a delegate change and the new delegate is the app user stored on that workspace's Hub connection. Removing the delegate, selecting another app or receiving an unrelated edit does not trigger this path. A stale update that names the same previous and current delegate does not trigger it either.

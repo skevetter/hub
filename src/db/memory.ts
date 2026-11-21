@@ -1,3 +1,8 @@
+import {
+  linearRoutesForConnection,
+  linearTriggerRoutesLock,
+  organizationTriggerRoutesForSave,
+} from "./linear-trigger-routes.js";
 import { isCanceledExecution, type StopCleanupState } from "../triggers/run-stop.js";
 import type { AcceptCommandInput, AcceptCommandResult } from "../interactive-sessions/store.js";
 import { capabilities } from "../interactive-sessions/access.js";
@@ -303,7 +308,11 @@ const interactiveSessionLock = "isession-memory";
 
 export function createMemoryDatabase(
   options: MemoryDatabaseOptions = {},
-): Database & Pick<MemoryDatabase, "listInteractiveSessionAuditEvents"> {
+): Database &
+  Pick<
+    MemoryDatabase,
+    "listInteractiveSessionAuditEvents" | "setLinearConnection" | "removeLinearConnection"
+  > {
   return new MemoryDatabase(options);
 }
 
@@ -5688,6 +5697,21 @@ class MemoryDatabase implements Database {
   async saveOrganizationTrigger(
     input: SaveOrganizationTriggerInput,
   ): Promise<OrganizationTriggerRecord> {
+    return this.withAdvisoryLock(linearTriggerRoutesLock(input.organizationId), () =>
+      this.saveOrganizationTriggerWithCurrentRoutes(input),
+    );
+  }
+
+  private async saveOrganizationTriggerWithCurrentRoutes(
+    input: SaveOrganizationTriggerInput,
+  ): Promise<OrganizationTriggerRecord> {
+    const configuration = parseCompiledHubConfig(input.normalizedConfiguration);
+    const linearConnectionIds = [...this.linearConnections.values()]
+      .filter(({ organizationId }) => organizationId === input.organizationId)
+      .map(({ id }) => id);
+    const routes = input.enabled
+      ? organizationTriggerRoutesForSave(configuration, input.routes, linearConnectionIds)
+      : [];
     const existing =
       input.triggerId === undefined ? undefined : this.organizationTriggers.get(input.triggerId);
     if (existing !== undefined && existing.organizationId !== input.organizationId) {
@@ -5746,7 +5770,7 @@ class MemoryDatabase implements Database {
     };
     this.organizationTriggerRevisions.set(revision.id, revision);
     this.organizationTriggers.set(trigger.id, trigger);
-    this.organizationTriggerRoutes.set(trigger.id, [...input.routes]);
+    this.organizationTriggerRoutes.set(trigger.id, routes);
     const runtimeRevision = await this.insertProjectConfigurationRevision({
       projectId: runtimeProjectId,
       sourceKind: input.sourceKind,
@@ -5756,11 +5780,10 @@ class MemoryDatabase implements Database {
       contentHash: input.contentHash,
       createdByUserId: input.createdByUserId,
     });
-    const configuration = parseCompiledHubConfig(input.normalizedConfiguration);
     await this.activateProjectConfigurationRevision(
       runtimeProjectId,
       runtimeRevision.id,
-      input.routes.map((route) => ({
+      routes.map((route) => ({
         provider: route.provider,
         connectionId: route.connectionId,
         resourceId: route.resourceId,
@@ -6346,6 +6369,78 @@ class MemoryDatabase implements Database {
 
   completeSlackProviderApplication(_input: CompleteSlackProviderApplicationInput): Promise<void> {
     return connectionPersistenceUnavailable();
+  }
+
+  // Memory fixtures supply verified bindings. OAuth attempt persistence belongs to PostgreSQL.
+  async setLinearConnection(connection: LinearConnectionRecord): Promise<void> {
+    await this.withAdvisoryLock(linearTriggerRoutesLock(connection.organizationId), async () => {
+      const existing = this.linearConnections.get(connection.linearOrganizationId);
+      if (
+        existing !== undefined &&
+        (existing.id !== connection.id || existing.organizationId !== connection.organizationId)
+      ) {
+        throw new Error("Linear workspace already bound");
+      }
+      const additions = [...this.organizationTriggers.values()].flatMap((trigger) => {
+        if (!trigger.enabled || trigger.organizationId !== connection.organizationId) return [];
+        const project = this.projects.get(trigger.runtimeProjectId);
+        const revision = this.organizationTriggerRevisions.get(trigger.activeRevisionId);
+        if (
+          project?.status !== "active" ||
+          project.activeConfigurationRevisionId === null ||
+          revision === undefined
+        )
+          return [];
+        const configuration = parseCompiledHubConfig(revision.normalizedConfiguration);
+        const routes = linearRoutesForConnection(configuration, connection.id);
+        return routes.length === 0 ? [] : [{ trigger, routes }];
+      });
+      this.linearConnections.set(connection.linearOrganizationId, connection);
+      for (const { trigger, routes } of additions) {
+        const organizationRoutes = this.organizationTriggerRoutes.get(trigger.id) ?? [];
+        const projectRoutes = this.projectTriggerRoutes.get(trigger.runtimeProjectId) ?? [];
+        for (const route of routes) {
+          const sameBinding = (candidate: OrganizationTriggerRoute | ProjectTriggerRoute) =>
+            candidate.provider === "linear" &&
+            candidate.connectionId === route.connectionId &&
+            candidate.resourceId === route.resourceId;
+          if (
+            !organizationRoutes.some(
+              (row) => sameBinding(row) && row.configuredEventName === route.configuredEventName,
+            )
+          )
+            organizationRoutes.push(route);
+          if (
+            !projectRoutes.some((row) => sameBinding(row) && row.triggerName === route.triggerName)
+          )
+            projectRoutes.push(route);
+        }
+        this.organizationTriggerRoutes.set(trigger.id, organizationRoutes);
+        this.projectTriggerRoutes.set(trigger.runtimeProjectId, projectRoutes);
+      }
+    });
+  }
+
+  async removeLinearConnection(organizationId: string, connectionId: string): Promise<void> {
+    await this.withAdvisoryLock(linearTriggerRoutesLock(organizationId), async () => {
+      const connection = [...this.linearConnections.values()].find(
+        (row) => row.id === connectionId && row.organizationId === organizationId,
+      );
+      if (connection === undefined) return;
+      const keep = (route: OrganizationTriggerRoute | ProjectTriggerRoute) =>
+        route.provider !== "linear" || route.connectionId !== connectionId;
+      for (const [id, routes] of this.organizationTriggerRoutes) {
+        if (this.organizationTriggers.get(id)?.organizationId === organizationId) {
+          this.organizationTriggerRoutes.set(id, routes.filter(keep));
+        }
+      }
+      for (const [id, routes] of this.projectTriggerRoutes) {
+        if (this.projects.get(id)?.organizationId === organizationId) {
+          this.projectTriggerRoutes.set(id, routes.filter(keep));
+        }
+      }
+      this.linearConnections.delete(connection.linearOrganizationId);
+    });
   }
 
   bindLinearConnection(_input: BindLinearConnectionInput): Promise<void> {
