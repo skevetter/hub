@@ -21,13 +21,14 @@ export const Route = createFileRoute("/_shell/o/$organizationSlug/activity/")({
       to: "/o/$organizationSlug/activity",
       params: { organizationSlug: params.organizationSlug },
       search: normalized,
+      state: location.state,
       replace: true,
     });
   },
   loaderDeps: ({ search }) => activitySearchSchema.parse(search),
   // The page is read before the route changes, so the panel never swaps to a skeleton mid-paging
   // and a cursor the server could not use is dropped from the address instead of kept stale.
-  loader: async ({ context, deps, params }) => {
+  loader: async ({ context, deps, params, location }) => {
     const result = await triggerActivityPage({
       data: activityPageRequest(params.organizationSlug, deps),
     });
@@ -38,6 +39,7 @@ export const Route = createFileRoute("/_shell/o/$organizationSlug/activity/")({
         to: "/o/$organizationSlug/activity",
         params: { organizationSlug: params.organizationSlug },
         search: { ...deps, cursor: undefined },
+        state: location.state,
         replace: true,
       });
     }

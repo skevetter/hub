@@ -1,9 +1,10 @@
 import { Link, useRouterState } from "@tanstack/react-router";
-import { useCallback, useEffect, useId, useRef, type ChangeEvent } from "react";
+import { useCallback, useEffect, useId, useRef, type ChangeEvent, type MouseEvent } from "react";
 import type { LinkProps } from "@tanstack/react-router";
 
 import { Button } from "../ui/button.js";
 import { PAGE_SIZES, parsePageSize, rememberPageSize, type PageSize } from "./page-size.js";
+import { LIST_RESULT_ACTION, useListResultAnnouncement } from "./list-result-announcement.js";
 
 /** Where a control leads. Absent means there is no page that way, and the control is disabled. */
 export type PaginationTarget = Pick<LinkProps, "to" | "search" | "params">;
@@ -29,6 +30,7 @@ export function Pagination({
   fallbackFocusId,
   summary,
   announcement = summary,
+  announceOnNavigation = false,
   newer,
   older,
   pageSize,
@@ -42,6 +44,7 @@ export function Pagination({
   fallbackFocusId: string;
   summary: string;
   announcement?: string;
+  announceOnNavigation?: boolean;
   newer: PaginationTarget | null;
   older: PaginationTarget | null;
   pageSize?: PageSizeControl;
@@ -49,6 +52,8 @@ export function Pagination({
   nextLabel?: string;
 }) {
   const busy = useRouterState({ select: (state) => state.isLoading });
+  const message = useListResultAnnouncement(announcement);
+  const liveContent = message === null ? null : <span key={message.key}>{message.text}</span>;
   const moved = useRef(position);
   useEffect(() => {
     if (moved.current === position) return;
@@ -66,7 +71,7 @@ export function Pagination({
     >
       <span className="mr-auto text-xs text-muted-foreground">{summary}</span>
       <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {announcement}
+        {announceOnNavigation ? liveContent : announcement}
       </span>
       {pageSize === undefined ? null : <RowsPerPage {...pageSize} busy={busy} />}
       <div className="flex gap-2">
@@ -122,6 +127,12 @@ function PageLink({
   busy: boolean;
   children: string;
 }) {
+  const preventWhileBusy = useCallback(
+    (event: MouseEvent<HTMLAnchorElement>) => {
+      if (busy) event.preventDefault();
+    },
+    [busy],
+  );
   if (target === null) {
     return (
       <Button variant="outline" size="sm" disabled>
@@ -131,8 +142,7 @@ function PageLink({
   }
   return (
     <Button variant="outline" size="sm" asChild>
-      {/* oxlint-disable-next-line eslint-plugin-react-perf/jsx-no-new-function-as-prop -- a busy link must not start a second read */}
-      <Link {...target} aria-disabled={busy} onClick={(event) => busy && event.preventDefault()}>
+      <Link {...target} state={LIST_RESULT_ACTION} aria-disabled={busy} onClick={preventWhileBusy}>
         {children}
       </Link>
     </Button>

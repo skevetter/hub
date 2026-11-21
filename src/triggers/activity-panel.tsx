@@ -11,6 +11,7 @@ import {
   type ListFilterOption,
 } from "../components/app/list-filters.js";
 import { DEFAULT_PAGE_SIZE, type PageSize } from "../components/app/page-size.js";
+import { LIST_RESULT_ACTION } from "../components/app/list-result-announcement.js";
 import { PageHeader } from "../components/app/page.js";
 import { statusLabel } from "../components/app/status-pill.js";
 import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
@@ -57,6 +58,7 @@ export function TriggerActivityPanel() {
     (next: PageSize, replace = false) => {
       void navigate({
         search: (previous) => ({ ...previous, size: next, cursor: undefined }),
+        state: LIST_RESULT_ACTION,
         replace,
       });
     },
@@ -70,6 +72,7 @@ export function TriggerActivityPanel() {
   const changeFilter = useCallback(
     ({ currentTarget: { name, value } }: ChangeEvent<HTMLSelectElement>) => {
       void navigate({
+        state: LIST_RESULT_ACTION,
         search: (previous) =>
           activitySearchSchema.parse({
             ...previous,
@@ -186,6 +189,7 @@ export function TriggerActivityPanel() {
         fallbackFocusId={HEADING_ID}
         summary={summary}
         announcement={announcement}
+        announceOnNavigation
         newer={newer}
         older={older}
         pageSize={sizeControl}

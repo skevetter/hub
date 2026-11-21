@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from "react";
 import { Button } from "../ui/button.js";
+import { LIST_RESULT_ACTION } from "./list-result-announcement.js";
 import type { PaginationTarget } from "./pagination.js";
 
 export function ListFilters({ id, children }: { id: string; children: ReactNode }) {
@@ -48,7 +49,7 @@ export function ClearListFilters({
   );
   return (
     <Button variant="outline" size="sm" asChild>
-      <Link {...target} onClick={moveFocus}>
+      <Link {...target} state={LIST_RESULT_ACTION} onClick={moveFocus}>
         Clear filters
       </Link>
     </Button>
