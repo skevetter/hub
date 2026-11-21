@@ -26,19 +26,43 @@ export function formatRunReply(answer: FinalReplyAnswer, secrets: readonly strin
     .replaceAll("\0", "")
     .replace(/\p{Cf}/gu, "")
     .replace(/[\uD800-\uDFFF]/gu, "\uFFFD");
-  const markdown = fromMarkdown(source, {
-    extensions: [gfm()],
-    mdastExtensions: [gfmFromMarkdown()],
-  });
+  const markdown = parseMarkdown(source);
   sanitizeMarkdown(markdown);
-  const safe = toMarkdown(markdown, { extensions: [gfmToMarkdown()] }).trim();
+  const safe = toMarkdown(markdown, {
+    extensions: [gfmToMarkdown({ tablePipeAlign: false })],
+  }).trim();
   if (safe === "" || (!truncated && safe.length <= MAX_REPLY_CHARS)) return safe;
-  const prefix = safe.slice(0, MAX_REPLY_CHARS - TRUNCATION.length);
+  const limit = MAX_REPLY_CHARS - TRUNCATION.length;
+  if (safe.length <= limit) return safe + TRUNCATION;
+  const prefix = safe.slice(0, limit);
   const paragraph = prefix.lastIndexOf("\n\n");
   const line = prefix.lastIndexOf("\n");
   const boundary = paragraph > prefix.length - 300 ? paragraph : line;
-  const clipped = boundary > 0 && prefix.length < safe.length ? prefix.slice(0, boundary) : prefix;
-  return clipped.replace(/[\uD800-\uDBFF]$/u, "").trimEnd() + TRUNCATION;
+  const end = intactBoundary(parseMarkdown(safe), boundary > 0 ? boundary : limit);
+  const clipped = safe
+    .slice(0, end)
+    .replace(/[\uD800-\uDBFF]$/u, "")
+    .trimEnd();
+  return clipped === "" ? TRUNCATION.trimStart() : clipped + TRUNCATION;
+}
+
+function parseMarkdown(source: string): Root {
+  return fromMarkdown(source, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  });
+}
+
+function intactBoundary(parent: Parents, end: number): number {
+  for (const node of parent.children) {
+    const { start, end: finish } = node.position ?? {};
+    if (start?.offset === undefined || finish?.offset === undefined) continue;
+    if (start.offset >= end || finish.offset <= end) continue;
+    if (node.type === "code" || node.type === "inlineCode" || node.type === "tableRow")
+      return start.offset;
+    if ("children" in node) return intactBoundary(node, end);
+  }
+  return end;
 }
 
 function sanitizeMarkdown(markdown: Root): void {

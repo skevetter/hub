@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmFromMarkdown } from "mdast-util-gfm";
+import { gfm } from "micromark-extension-gfm";
 import { describe, it } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import { LinearRunReplyWriter } from "./linear.js";
@@ -44,6 +47,11 @@ async function fixture(options: { differentTarget?: boolean; canceled?: boolean 
     ...fake,
     send: (text: string) => writer.post(finishedRun, { text, truncated: false }, 60, signal),
     delivery: () => database.runReplies.find(key),
+    async repair() {
+      const delivery = await database.runReplies.find(key);
+      assert.equal(delivery?.state, "sending");
+      await writer.repair(finishedRun, delivery, signal);
+    },
   };
 }
 
@@ -131,6 +139,60 @@ ${"line from the answer\n".repeat(250)}`;
       );
     }
   });
+
+  it.each([
+    {
+      structure: "code fence",
+      text: `Answer.\n\n\`\`\`ts\n${"const answer = 1;\n".repeat(280)}\`\`\``,
+    },
+    {
+      structure: "table row",
+      text: `Answer.\n\n| Key | Value |\n| --- | --- |\n${"| item | complete |\n".repeat(230)}`,
+    },
+    {
+      structure: "inline code",
+      text: `Answer. \`${"long command ".repeat(340)}\``,
+    },
+  ])(
+    "keeps delivery metadata outside a truncated $structure and repairs the delivery",
+    async ({ structure, text }) => {
+      const reply = await fixture();
+      const { send, writes, delivery } = reply;
+      reply.loseCreateResponse();
+      await send(text);
+      assert.equal(writes.length, 1);
+      const result = await delivery();
+      assert.ok(result?.length && result.length <= 3_500);
+      const body = writes[0]!;
+      const markdown = fromMarkdown(body, {
+        extensions: [gfm()],
+        mdastExtensions: [gfmFromMarkdown()],
+      });
+      for (const [index, label] of [
+        "[Reply truncated]",
+        `Paseo reply ${result.commentId}`,
+      ].entries()) {
+        const paragraph = markdown.children.at(index - 2);
+        assert.equal(paragraph?.type, "paragraph");
+        assert.deepEqual(
+          paragraph.children.map((node) => (node.type === "text" ? node.value : null)),
+          [label],
+        );
+      }
+      if (structure === "inline code") assert.match(body, /^Answer\.\n\n/u);
+      if (structure === "table row") {
+        const table = markdown.children.find((node) => node.type === "table");
+        assert.ok(table && table.children.length > 1);
+        for (const row of table.children.slice(1)) {
+          const value = row.children[1]?.children[0];
+          assert.ok(value?.type === "text" && value.value === "complete");
+        }
+      }
+      await reply.repair();
+      assert.equal((await delivery())?.state, "sent");
+      assert.equal(writes.length, 1);
+    },
+  );
 
   it("records an empty sanitized answer without making a request", async () => {
     const { send, calls, delivery } = await fixture();
