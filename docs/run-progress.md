@@ -55,6 +55,12 @@ A connection rebind can commit after the final database lookup takes its snapsho
 the HTTP request is sent. In that window, a comment mutation can use the previous binding's
 token. The Linear organization ID still identifies the same workspace.
 
+Set `reply_message: true` on a Linear trigger with a named audience to have the Paseo app post
+the agent's final answer after a successful run. Hub retains only delivery metadata. Replies
+use `comments:create`, are limited to one per run and default to 60 attempts per organization per
+hour. Paseo app comments cannot start comment triggers. Clear the editor checkbox or remove
+`reply_message` to turn replies off. See [Linear run replies](linear-reply.md).
+
 ## GitHub
 
 GitHub progress uses one conversation comment on the source issue or pull request. For GitHub

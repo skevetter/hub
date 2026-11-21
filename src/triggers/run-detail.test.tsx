@@ -12,6 +12,18 @@ const render = (detail: RunDetailSnapshot) =>
 const confirmStop = async () => undefined;
 
 describe("run timeline UI", () => {
+  it("shows the stored reply refusal even when the run timeline is off", () => {
+    const detail = {
+      ...runDetailFixture,
+      timeline: { ...emptyTimeline, status: "succeeded", timelineEnabled: false },
+      reply: { state: "refused", failure: "rate_limited" } as const,
+    };
+    assert.match(
+      render(detail),
+      /Reply not posted: This organization reached the reply limit for the last hour\./u,
+    );
+  });
+
   it("shows Stop only for people with permission while the run is live", () => {
     const detail = { ...runDetailFixture, canStop: true };
     const view = (snapshot: RunDetailSnapshot) =>

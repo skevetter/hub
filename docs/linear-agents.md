@@ -22,4 +22,10 @@ Delegation uses the existing issue source, receipt and run identity. A repeated 
 
 Hub acknowledges verified `AgentSessionEvent` deliveries with HTTP 200 and a debug log. It does not create a receipt, start a run or post an activity for those deliveries. This applies to mentions as well as delegation sessions. Mentions can start runs only through the existing allowlisted comment trigger and its text filters.
 
-Agent sessions and activities are not implemented. If agent session webhooks are enabled, Linear can show the agent as not responding because Hub does not send the initial activity. Do not treat mentionability or delegation support as agent session support. This change adds no calls that post to Linear.
+Agent sessions and activities are not implemented. If agent session webhooks are enabled, Linear can show the agent as not responding because Hub does not send the initial activity. Do not treat mentionability or delegation support as agent session support.
+
+Enable **Post the agent's reply** or set `reply_message: true` on a Linear trigger with a named
+audience to post the final answer as a Paseo app issue comment after a successful run. Hub retains
+only delivery metadata and ignores its own comments when matching triggers. Replies are limited to
+one per run and default to 60 delivery attempts per organization per hour. Clear the checkbox or
+remove the YAML setting to turn replies off. See [Linear run replies](linear-reply.md).
