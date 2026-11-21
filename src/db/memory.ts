@@ -265,8 +265,10 @@ export interface MemoryDatabaseOptions {
 }
 
 function compareTriggerListKeys(left: TriggerListKey, right: TriggerListKey): number {
-  if (left.name !== right.name) return left.name < right.name ? -1 : 1;
-  return left.id.localeCompare(right.id);
+  if (left.name !== right.name)
+    return Buffer.compare(Buffer.from(left.name), Buffer.from(right.name));
+  if (left.id === right.id) return 0;
+  return left.id < right.id ? -1 : 1;
 }
 
 function usageKey(organizationId: string, meter: string, periodStart: Date): string {
@@ -5600,9 +5602,9 @@ class MemoryDatabase implements Database {
   }
 
   async listOrganizationTriggers(organizationId: string): Promise<OrganizationTriggerRecord[]> {
-    return Array.from(this.organizationTriggers.values()).filter(
-      (trigger) => trigger.organizationId === organizationId,
-    );
+    return Array.from(this.organizationTriggers.values())
+      .filter((trigger) => trigger.organizationId === organizationId)
+      .sort(compareTriggerListKeys);
   }
 
   async listOrganizationTriggerPage(
@@ -5613,20 +5615,18 @@ class MemoryDatabase implements Database {
     const event = provider === undefined ? undefined : triggerProviderEvent(provider);
     const match = (source: string) =>
       event?.endsWith(".") === true ? source.startsWith(event) : source === event;
-    const records = (await this.listOrganizationTriggers(organizationId))
-      .filter(
-        (trigger) =>
-          (enabled === undefined || trigger.enabled === enabled) &&
-          (nameContains === undefined ||
-            trigger.name.toLowerCase().includes(nameContains.toLowerCase())) &&
-          (event === undefined ||
-            hasTriggerEvent(
-              this.organizationTriggerRevisions.get(trigger.activeRevisionId)
-                ?.normalizedConfiguration,
-              match,
-            )),
-      )
-      .sort(compareTriggerListKeys);
+    const records = (await this.listOrganizationTriggers(organizationId)).filter(
+      (trigger) =>
+        (enabled === undefined || trigger.enabled === enabled) &&
+        (nameContains === undefined ||
+          trigger.name.toLowerCase().includes(nameContains.toLowerCase())) &&
+        (event === undefined ||
+          hasTriggerEvent(
+            this.organizationTriggerRevisions.get(trigger.activeRevisionId)
+              ?.normalizedConfiguration,
+            match,
+          )),
+    );
     const bounded =
       position === undefined
         ? records

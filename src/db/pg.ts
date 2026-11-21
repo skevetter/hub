@@ -4066,7 +4066,7 @@ class PgDatabase implements Database {
       this.pool,
       `select * from organization_triggers
        where organization_id = $1 and active_revision_id is not null
-       order by name, id`,
+       order by name collate "C", id`,
       [organizationId],
     );
     return rows.rows.map(toOrganizationTriggerRecord);
@@ -4082,8 +4082,9 @@ class PgDatabase implements Database {
       where t.organization_id = $1 and t.active_revision_id is not null ${conditions}`;
     const position = request.position;
     const previous = position?.direction === "previous";
-    const key = `(t.name, t.id)`;
-    const boundary = `($${params.length + 1}::text, $${params.length + 2}::uuid)`;
+    const name = `t.name collate "C"`;
+    const key = `(${name}, t.id)`;
+    const boundary = `($${params.length + 1}::text collate "C", $${params.length + 2}::uuid)`;
     const order = previous ? "desc" : "asc";
     const values =
       position === undefined ? params : [...params, position.key.name, position.key.id];
@@ -4091,7 +4092,7 @@ class PgDatabase implements Database {
       this.pool,
       `select t.* ${scoped}
        ${position === undefined ? "" : `and ${key} ${previous ? "<" : ">"} ${boundary}`}
-       order by t.name ${order}, t.id ${order} limit $${values.length + 1}`,
+       order by ${name} ${order}, t.id ${order} limit $${values.length + 1}`,
       [...values, request.limit + 1],
     );
     const more = rows.length > request.limit;
@@ -4099,15 +4100,17 @@ class PgDatabase implements Database {
     if (previous) page.reverse();
     const first = page[0];
     const last = page.at(-1);
-    const adjacent = async (record: OrganizationTriggerRow | undefined, operator: "<" | ">") =>
-      record !== undefined &&
-      (
-        await query(this.pool, `select 1 ${scoped} and ${key} ${operator} ${boundary} limit 1`, [
-          ...params,
-          record.name,
-          record.id,
-        ])
-      ).rows.length > 0;
+    const adjacent = async (record: OrganizationTriggerRow | undefined, operator: "<" | ">") => {
+      if (record === undefined) return false;
+      const direction = operator === "<" ? "desc" : "asc";
+      const adjacentRows = await query(
+        this.pool,
+        `select 1 ${scoped} and ${key} ${operator} ${boundary}
+         order by ${name} ${direction}, t.id ${direction} limit 1`,
+        [...params, record.name, record.id],
+      );
+      return adjacentRows.rows.length > 0;
+    };
     const hasPrevious = previous ? more : position !== undefined && (await adjacent(first, "<"));
     const hasNext = previous ? await adjacent(last, ">") : more;
     return {

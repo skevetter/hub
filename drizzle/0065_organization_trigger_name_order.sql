@@ -1,0 +1,1 @@
+CREATE INDEX "organization_triggers_organization_name_c_id_idx" ON "organization_triggers" USING btree ("organization_id","name" collate "C","id") WHERE "organization_triggers"."active_revision_id" is not null;

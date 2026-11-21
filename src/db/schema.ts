@@ -327,6 +327,9 @@ export const organizationTriggers = pgTable(
       table.organizationId,
       table.updatedAt.desc(),
     ),
+    index("organization_triggers_organization_name_c_id_idx")
+      .on(table.organizationId, sql`${table.name} collate "C"`, table.id)
+      .where(sql`${table.activeRevisionId} is not null`),
     check(
       "organization_triggers_format_check",
       sql`${table.format} in ('single_run', 'legacy_multistep')`,

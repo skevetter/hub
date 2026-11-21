@@ -16,6 +16,7 @@ import type { Database, OrganizationTriggerRecord, TriggerListRequest } from "./
 
 const ORGANIZATION = "trigger-page-org";
 const OTHER_ORGANIZATION = "trigger-page-foreign";
+const COLLATION_ORGANIZATION = "trigger-page-collation";
 const EVENTS = [
   "manual.run",
   "github.push",
@@ -53,7 +54,9 @@ describe.each(["postgres", "pglite", "memory"] as const)("trigger list pages on 
 
   beforeAll(async () => {
     if (engine === "postgres") {
-      const container = await new PostgreSqlContainer("postgres:17-alpine").start();
+      const container = await new PostgreSqlContainer("postgres:17")
+        .withEnvironment({ POSTGRES_INITDB_ARGS: "--locale=en_US.utf8" })
+        .start();
       cleanup = async () => {
         await container.stop();
       };
@@ -126,6 +129,56 @@ describe.each(["postgres", "pglite", "memory"] as const)("trigger list pages on 
     assert.equal(
       await database.hasOrganizationTriggerEvent(OTHER_ORGANIZATION, "github.notification"),
       false,
+    );
+  });
+
+  it("orders punctuation and digits identically when walking both keyset directions", async () => {
+    if (engine === "postgres") {
+      const locale = await runtime?.query<{ datcollate: string }>(
+        "select datcollate from pg_database where datname = current_database()",
+      );
+      assert.equal(locale?.rows[0]?.datcollate, "en_US.utf8");
+    }
+    await runtime?.query(
+      "insert into organization (id, name, slug) values ($1, 'Collation fixture', 'collation')",
+      [COLLATION_ORGANIZATION],
+    );
+    const expected = ["a--z", "a-b", "a-c", "a0", "a_-", "a_a", "a_b", "ab", "b"];
+    for (const name of expected.toReversed()) {
+      await createTrigger(database, COLLATION_ORGANIZATION, name, true, ["manual.run"]);
+    }
+    const read = (position?: TriggerListRequest["position"]) =>
+      database.listOrganizationTriggerPage(COLLATION_ORGANIZATION, {
+        limit: 3,
+        ...(position === undefined ? {} : { position }),
+      });
+    const first = await read();
+    assert.ok(first.next);
+    const second = await read({ direction: "next", key: first.next });
+    assert.ok(second.next);
+    const last = await read({ direction: "next", key: second.next });
+    assert.equal(last.next, null);
+    assert.deepEqual(
+      [...first.records, ...second.records, ...last.records].map(({ name }) => name),
+      expected,
+    );
+    assert.ok(last.previous);
+    const back = await read({ direction: "previous", key: last.previous });
+    assert.deepEqual(
+      back.records.map(({ name }) => name),
+      expected.slice(3, 6),
+    );
+    assert.ok(back.previous);
+    const start = await read({ direction: "previous", key: back.previous });
+    assert.deepEqual(
+      start.records.map(({ name }) => name),
+      expected.slice(0, 3),
+    );
+    assert.equal(start.previous, null);
+    const unpaged = await database.listOrganizationTriggers(COLLATION_ORGANIZATION);
+    assert.deepEqual(
+      unpaged.map(({ name }) => name),
+      expected,
     );
   });
 
