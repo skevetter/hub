@@ -4,8 +4,10 @@ import {
   activityPageKey,
   activityPageRequest,
   activitySearchSchema,
+  droppedActivityPageKey,
+  droppedActivityPageRequest,
 } from "../../../../../triggers/activity-query.js";
-import { triggerActivityPage } from "../../../../../triggers/functions.js";
+import { droppedActivityPage, triggerActivityPage } from "../../../../../triggers/functions.js";
 
 export const Route = createFileRoute("/_shell/o/$organizationSlug/activity/")({
   validateSearch: activitySearchSchema,
@@ -29,11 +31,16 @@ export const Route = createFileRoute("/_shell/o/$organizationSlug/activity/")({
   // The page is read before the route changes, so the panel never swaps to a skeleton mid-paging
   // and a cursor the server could not use is dropped from the address instead of kept stale.
   loader: async ({ context, deps, params, location }) => {
-    const result = await triggerActivityPage({
-      data: activityPageRequest(params.organizationSlug, deps),
-    });
+    const { organizationSlug } = params;
+    const dropped = deps.view === "dropped";
+    const result = dropped
+      ? await droppedActivityPage({ data: droppedActivityPageRequest(organizationSlug, deps) })
+      : await triggerActivityPage({ data: activityPageRequest(organizationSlug, deps) });
     if (result.status !== "ok") return;
-    context.queryClient.setQueryData(activityPageKey(params.organizationSlug, deps), result.data);
+    const key = dropped
+      ? droppedActivityPageKey(organizationSlug, deps)
+      : activityPageKey(organizationSlug, deps);
+    context.queryClient.setQueryData(key, result.data);
     if (deps.cursor !== undefined && result.data.previousCursor === null) {
       throw redirect({
         to: "/o/$organizationSlug/activity",

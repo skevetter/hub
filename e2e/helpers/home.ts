@@ -69,7 +69,7 @@ export class OrganizationHome {
   nudge(): Locator {
     return this.page
       .getByRole("alert")
-      .filter({ hasText: "Events are arriving with no trigger listening" });
+      .filter({ hasText: "Events arrived without a route or matching trigger" });
   }
 
   async expectNoNudge() {
@@ -77,7 +77,13 @@ export class OrganizationHome {
   }
 
   async followNudge() {
-    await this.nudge().getByRole("link", { name: "Create a trigger", exact: true }).click();
+    await this.nudge().getByRole("link", { name: "View dropped events", exact: true }).click();
+    await expect(this.page).toHaveURL(/[?&]reason=routing/u);
+    await this.page
+      .getByRole("table", { name: "Dropped events" })
+      .getByRole("link", { name: "Create one", exact: true })
+      .first()
+      .click();
     await expect(this.page).toHaveURL(/\/triggers\/new$/u);
   }
 

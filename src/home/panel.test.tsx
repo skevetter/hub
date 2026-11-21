@@ -46,7 +46,7 @@ const ready: HomeSnapshot = {
       agent: null,
     },
   ],
-  unrouted: [],
+  dropped: [],
   windowDays: 7,
 };
 

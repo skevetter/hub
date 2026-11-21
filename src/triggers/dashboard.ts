@@ -12,9 +12,10 @@ import { notificationStatusView, type NotificationStatusView } from "./notificat
 import {
   activityCursorScope,
   decodeActivityCursor,
+  droppedActivityCursorScope,
   encodeActivityCursor,
 } from "./activity-cursor.js";
-import type { ActivityFilters } from "./activity-query.js";
+import type { ActivityFilters, DroppedActivityFilters } from "./activity-query.js";
 import { decodeTriggerCursor, encodeTriggerCursor, triggerCursorScope } from "./trigger-cursor.js";
 import { triggerSearchSchema, type TriggerSearch } from "./trigger-query.js";
 import { DEFAULT_PAGE_SIZE, PAGE_SIZES } from "../components/app/page-size.js";
@@ -423,6 +424,63 @@ export class TriggerDashboard {
           run.configuredTriggerName === legacyTriggerName,
       )
       .map((entry) => activityRow(trigger, entry));
+  }
+
+  async droppedActivityPage(
+    request: Request,
+    organizationSlug: string,
+    input: DroppedActivityFilters & { limit?: number | undefined; cursor?: string | undefined },
+  ) {
+    const { tenant } = await resolveRouteTenant(this.auth, this.database, request, {
+      organizationSlug,
+    });
+    const organizationId = tenant.organization.id;
+    const limit = Math.min(input.limit ?? DEFAULT_PAGE_SIZE, PAGE_SIZES[3]);
+    const { provider, source, reason, range } = input;
+    const receivedSince =
+      range === undefined
+        ? undefined
+        : new Date(
+            (this.options.now?.() ?? new Date()).getTime() - ACTIVITY_RANGE_DAYS[range] * DAY_MS,
+          );
+    const scope = droppedActivityCursorScope(organizationId, limit, input);
+    const requested = decodeActivityCursor(input.cursor, scope);
+    const read = (position?: ReturnType<typeof decodeActivityCursor>) =>
+      this.database.listDroppedEventPage(organizationId, {
+        limit,
+        ...(provider === undefined ? {} : { provider }),
+        ...(source === undefined ? {} : { source }),
+        ...(reason === undefined ? {} : { reason }),
+        ...(receivedSince === undefined ? {} : { receivedSince }),
+        ...(position === undefined
+          ? {}
+          : { position: { direction: position.direction, key: position.key } }),
+      });
+    let page = await read(requested);
+    if (page.records.length === 0 && requested !== undefined) page = await read();
+    const startOffset = page.newer === null ? 0 : requested?.offset || null;
+    return {
+      events: page.records,
+      startOffset,
+      nextCursor:
+        page.older === null
+          ? null
+          : encodeActivityCursor(
+              "before",
+              page.older,
+              scope,
+              startOffset === null ? undefined : startOffset + page.records.length,
+            ),
+      previousCursor:
+        page.newer === null
+          ? null
+          : encodeActivityCursor(
+              "after",
+              page.newer,
+              scope,
+              startOffset === null ? undefined : Math.max(0, startOffset - limit),
+            ),
+    };
   }
 
   /** One newest-first page of every trigger's runs, with opaque cursors to the pages either side. */

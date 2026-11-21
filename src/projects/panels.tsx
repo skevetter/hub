@@ -34,7 +34,6 @@ import {
   type ConnectionStatus,
 } from "../connections/functions.js";
 import { useRouteTenant } from "./context.js";
-import type { ProjectDashboard } from "./dashboard.js";
 import {
   CommandError,
   invalidateOrganization,
@@ -195,12 +194,18 @@ export function OrganizationConnectionsPanel() {
           ))
         )}
       </Section>
-      <Section
-        title="Known unrouted events"
-        description="Events received for this organization that were not routed to a workflow."
-      >
-        <ActivityTable activity={data.unroutedEvents} label="Unrouted events" showReason />
-      </Section>
+      <p className="text-muted-foreground">
+        To see why events were dropped,{" "}
+        <Link
+          className="text-link hover:underline"
+          to="/o/$organizationSlug/activity"
+          params={scope}
+          search={{ view: "dropped" }}
+        >
+          view dropped events in Activity
+        </Link>
+        .
+      </p>
     </>
   );
 }
@@ -472,15 +477,10 @@ function ActivityTable({
   activity,
   label,
   detailBasePath,
-  showReason = false,
 }: {
-  activity: ReadonlyArray<
-    | ProjectSnapshot["activity"][number]
-    | Awaited<ReturnType<ProjectDashboard["organizationSnapshot"]>>["unroutedEvents"][number]
-  >;
+  activity: ReadonlyArray<ProjectSnapshot["activity"][number]>;
   label: string;
   detailBasePath?: string;
-  showReason?: boolean;
 }) {
   return (
     <DataTable
@@ -490,22 +490,19 @@ function ActivityTable({
         { header: "Provider" },
         { header: "Source" },
         { header: "Status" },
-        ...(showReason ? [{ header: "Reason", fill: true }] : []),
         { header: "Received" },
       ]}
       isEmpty={activity.length === 0}
       empty={{ title: "No activity" }}
     >
       {activity.map((event) => {
-        const status = "status" in event ? event.status : "dropped";
+        const { status } = event;
         return (
           <DataRow key={event.id}>
             <DataCell>
               <TwoLine
                 primary={
-                  detailBasePath &&
-                  "configuredTriggerName" in event &&
-                  event.configuredTriggerName !== null ? (
+                  detailBasePath && event.configuredTriggerName !== null ? (
                     <Button variant="link" asChild>
                       <Link to={`${detailBasePath}/${event.id}` as never}>
                         {event.configuredTriggerName}
@@ -533,7 +530,6 @@ function ActivityTable({
             <DataCell>
               <StatusPill tone={executionTone(status)}>{statusLabel(status)}</StatusPill>
             </DataCell>
-            {showReason ? <DataCell>{event.failureReason ?? "Unknown reason"}</DataCell> : null}
             <DataCell muted>
               <RelativeTime value={event.receivedAt} />
             </DataCell>

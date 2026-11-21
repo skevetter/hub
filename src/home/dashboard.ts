@@ -4,7 +4,7 @@ import type {
   Database,
   OrganizationConnectionUsage,
   OrganizationRunRecord,
-  UnroutedProviderEventCount,
+  DroppedProviderEventCount,
 } from "../db/types.js";
 import { resolveRouteTenant } from "../projects/access.js";
 import { projectTriggerForm } from "../triggers/configuration/editor.js";
@@ -33,7 +33,7 @@ export interface HomeSnapshot {
   }[];
   triggers: readonly { id: string; name: string; event: string; enabled: boolean }[];
   runs: readonly (Omit<OrganizationRunRecord, "receivedAt"> & { receivedAt: string })[];
-  unrouted: readonly UnroutedProviderEventCount[];
+  dropped: readonly DroppedProviderEventCount[];
   windowDays: number;
 }
 
@@ -79,7 +79,7 @@ export class HomeDashboard {
     const organizationId = organization.id;
     const since = new Date(this.now().getTime() - HOME_WINDOW_DAYS * 86_400_000);
     const triggers = await this.database.listOrganizationTriggers(organizationId);
-    const [connections, daemons, revisions, runs, unrouted, checklistCompletedAt] =
+    const [connections, daemons, revisions, runs, dropped, checklistCompletedAt] =
       await Promise.all([
         this.database.organizationConnectionUsage(organizationId),
         this.database.listDaemonsForOrganization(organizationId),
@@ -89,7 +89,7 @@ export class HomeDashboard {
           ),
         ),
         this.database.listOrganizationRunsSince(organizationId, since, RUNS_SHOWN),
-        this.database.countUnroutedProviderEventsSince(organizationId, since),
+        this.database.countRecentDroppedEvents(organizationId, since),
         this.database.getHomeChecklistCompletedAt(organizationId),
       ]);
     return {
@@ -141,7 +141,7 @@ export class HomeDashboard {
         receivedAt: run.receivedAt.toISOString(),
         agent: run.agent,
       })),
-      unrouted,
+      dropped,
       windowDays: HOME_WINDOW_DAYS,
     };
   }

@@ -1,3 +1,4 @@
+import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import type { AuthServer } from "../auth/server.js";
@@ -33,7 +34,7 @@ describe("home read model", () => {
     assert.deepEqual(snapshot.daemons, []);
     assert.deepEqual(snapshot.triggers, []);
     assert.deepEqual(snapshot.runs, []);
-    assert.deepEqual(snapshot.unrouted, []);
+    assert.deepEqual(snapshot.dropped, []);
     assert.equal(snapshot.windowDays, 7);
   });
 
@@ -124,12 +125,11 @@ describe("home read model", () => {
     );
   });
 
-  it("counts provider events dropped for want of a trigger, per provider, inside the window", async () => {
+  it("counts dropped receipts by reason group and provider inside the window", async () => {
     const database = memberDatabase();
     await dropSlackEvent(database, "recent-1", new Date("2026-09-20T12:00:00.000Z"));
     await dropSlackEvent(database, "recent-2", new Date("2026-09-21T09:00:00.000Z"));
     await dropSlackEvent(database, "stale", new Date("2026-09-01T12:00:00.000Z"));
-    // A filter rejection is a trigger listening and declining, so it is not a missing trigger.
     await dropSlackEvent(
       database,
       "filtered",
@@ -144,7 +144,10 @@ describe("home read model", () => {
       () => NOW,
     ).snapshot(request, "acme");
 
-    assert.deepEqual(snapshot.unrouted, [{ provider: "slack", count: 2 }]);
+    assert.deepEqual(snapshot.dropped, [
+      { provider: "slack", reason: "routing", count: 2 },
+      { provider: "slack", reason: "trigger_filters_rejected", count: 1 },
+    ]);
   });
 
   it("asks the provider registrations whether any app is configured, with the organization's bindings", async () => {
@@ -308,7 +311,7 @@ async function dropSlackEvent(
   database: Database,
   deliveryId: string,
   receivedAt: Date,
-  reason = "no_project_route",
+  reason: ProviderEventDropReasonCode = "no_project_route",
 ): Promise<void> {
   const accepted = await database.acceptSlackEvent({
     teamId: "T-ACME",

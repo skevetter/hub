@@ -30,6 +30,7 @@ const GITHUB_OWNER = { providerApplicationId: "42", configurationVersion: 0 };
 const LEGACY_MIGRATIONS = join(process.cwd(), "src/db/migrations");
 const DRIZZLE_MIGRATIONS = join(process.cwd(), "drizzle");
 const TRIGGER_NAME_ORDER_MIGRATION = "0064_organization_trigger_name_order";
+const DROPPED_EVENT_ACTIVITY_MIGRATION = "0067_dropped_event_activity";
 const ACTIVITY_WEBHOOK_LOOKUP_MIGRATION = "0065_activity_webhook_receipt_lookup";
 const migrationJournalSchema = z.object({
   entries: z.array(
@@ -52,7 +53,7 @@ describe("database migration application", () => {
     await postgres.stop();
   }, 120_000);
 
-  it("upgrades populated build 20 trigger rows through 0064 and 0065 exactly once", async () => {
+  it("upgrades populated build 20 trigger rows through the trigger and dropped-event indexes exactly once", async () => {
     const build20Tag = "0063_interactive_sessions";
     const url = await createHistoricalBaseline({
       postgres,
@@ -73,6 +74,7 @@ describe("database migration application", () => {
           [name],
         );
       const triggerIndex = "organization_triggers_organization_name_c_id_idx";
+      const droppedIndex = "provider_event_receipts_org_dropped_order_idx";
       const webhookIndex = "provider_event_receipts_org_webhook_idx";
       const { entries } = migrationJournalSchema.parse(
         JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/_journal.json"), "utf8")),
@@ -82,6 +84,7 @@ describe("database migration application", () => {
         [
           [64, TRIGGER_NAME_ORDER_MIGRATION],
           [65, ACTIVITY_WEBHOOK_LOOKUP_MIGRATION],
+          [67, DROPPED_EVENT_ACTIVITY_MIGRATION],
         ],
       );
       const baseline = (await journal()).rows;
@@ -94,6 +97,7 @@ describe("database migration application", () => {
       );
       assert.equal((await index(triggerIndex)).rowCount, 0);
       assert.equal((await index(webhookIndex)).rowCount, 0);
+      assert.equal((await index(droppedIndex)).rowCount, 0);
       await runtime.query(`
         insert into organization (id, name, slug) values ('trigger-order', 'Trigger order', 'trigger-order');
         insert into organization_triggers (organization_id, name, format)
@@ -119,10 +123,14 @@ describe("database migration application", () => {
       const webhookLookupMigration = await readFile(
         join(DRIZZLE_MIGRATIONS, `${ACTIVITY_WEBHOOK_LOOKUP_MIGRATION}.sql`),
       );
+      const droppedEventActivityMigration = await readFile(
+        join(DRIZZLE_MIGRATIONS, `${DROPPED_EVENT_ACTIVITY_MIGRATION}.sql`),
+      );
       assert.deepEqual(migrated, [
         ...baseline,
         { hash: createHash("sha256").update(nameOrderMigration).digest("hex") },
         { hash: createHash("sha256").update(webhookLookupMigration).digest("hex") },
+        { hash: createHash("sha256").update(droppedEventActivityMigration).digest("hex") },
       ]);
       const [definition] = (await index(triggerIndex)).rows;
       assert.ok(definition);
@@ -135,6 +143,12 @@ describe("database migration application", () => {
       assert.match(
         webhookDefinition.indexdef,
         /\(organization_id, id\).*provider = 'manual'.*source = 'webhook.received'/u,
+      );
+      const [droppedDefinition] = (await index(droppedIndex)).rows;
+      assert.ok(droppedDefinition);
+      assert.match(
+        droppedDefinition.indexdef,
+        /\(organization_id, received_at DESC, id DESC, provider, dropped_reason\).*dropped_reason IS NOT NULL/u,
       );
       await runtime.migrate();
       assert.deepEqual((await journal()).rows, migrated);
@@ -322,13 +336,16 @@ describe("database migration application", () => {
     const webhookLookupMigration = await readFile(
       join(DRIZZLE_MIGRATIONS, `${ACTIVITY_WEBHOOK_LOOKUP_MIGRATION}.sql`),
     );
+    const droppedEventActivityMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, `${DROPPED_EVENT_ACTIVITY_MIGRATION}.sql`),
+    );
     const database = await createDatabase(url);
     try {
       const migrated = await poolQuery<{ hash: string }>(
         url,
         "select hash from drizzle.__drizzle_migrations order by id",
       );
-      assert.equal(migrated.rowCount, baseline.rows.length + 7);
+      assert.equal(migrated.rowCount, baseline.rows.length + 8);
       assert.deepEqual(migrated.rows, [
         ...baseline.rows,
         { hash: createHash("sha256").update(receiptMigration).digest("hex") },
@@ -338,6 +355,7 @@ describe("database migration application", () => {
         { hash: createHash("sha256").update(sessionsMigration).digest("hex") },
         { hash: createHash("sha256").update(triggerNameOrderMigration).digest("hex") },
         { hash: createHash("sha256").update(webhookLookupMigration).digest("hex") },
+        { hash: createHash("sha256").update(droppedEventActivityMigration).digest("hex") },
       ]);
       assert.deepEqual(
         (await poolQuery(url, "select home_checklist_completed_at from organization")).rows,
@@ -494,6 +512,9 @@ describe("database migration application", () => {
     const webhookLookupMigration = await readFile(
       join(DRIZZLE_MIGRATIONS, `${ACTIVITY_WEBHOOK_LOOKUP_MIGRATION}.sql`),
     );
+    const droppedEventActivityMigration = await readFile(
+      join(DRIZZLE_MIGRATIONS, `${DROPPED_EVENT_ACTIVITY_MIGRATION}.sql`),
+    );
     assert.deepEqual((await journal()).rows, [
       ...releasedJournal.rows,
       { hash: createHash("sha256").update(reporterMigration).digest("hex") },
@@ -507,6 +528,7 @@ describe("database migration application", () => {
       { hash: createHash("sha256").update(sessionsMigration).digest("hex") },
       { hash: createHash("sha256").update(triggerNameOrderMigration).digest("hex") },
       { hash: createHash("sha256").update(webhookLookupMigration).digest("hex") },
+      { hash: createHash("sha256").update(droppedEventActivityMigration).digest("hex") },
     ]);
     assert.deepEqual(
       (
@@ -585,7 +607,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 66);
+      assert.equal(journal.rowCount, 67);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",
@@ -1856,9 +1878,10 @@ describe("database migration application", () => {
       });
 
       assert.equal(result.status, "dropped");
+      const receiptId = result.receiptId;
       assert.equal(
-        (await database.listUnroutedProviderEventsForOrganization("organization-a")).some(
-          (event) => event.deliveryId === "unrouted-activity-receipt",
+        (await database.listDroppedEventPage("organization-a", { limit: 15 })).records.some(
+          (event) => event.id === receiptId && event.reason === "no_project_route",
         ),
         true,
       );
