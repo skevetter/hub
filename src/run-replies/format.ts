@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown, gfmToMarkdown } from "mdast-util-gfm";
 import { toMarkdown } from "mdast-util-to-markdown";
@@ -16,6 +17,9 @@ const TRUNCATION = "\n\n[Reply truncated]";
 const TRUNCATED_TEXT_LIMIT = MAX_REPLY_CHARS - TRUNCATION.length;
 const RAW_TRUNCATION_MARGIN = 48;
 const MAX_RENDER_ATTEMPTS = 3;
+const MARKDOWN_BUDGET_MS = 50;
+const MAX_MARKDOWN_DELIMITERS = 192;
+const MARKDOWN_DELIMITER = /[[\]()*_~`<>!&\\]+/gu;
 const URL_IN_PROSE = /\b(?:https?:\/\/|www\.|linear\.app\/)[^\s<>()[\]"']+/giu;
 const LINEAR_MENTION_PATH = /\/(?:profiles|users|agents)(?:\/|$)/iu;
 const MENTION_SIGN = /[@\uFF20]|&(?:#0*64|#x0*40|commat);/giu;
@@ -23,13 +27,18 @@ const USER_TAG = /(?:<|&lt;)\/?user\b[^<>]*?(?:>|&gt;)/giu;
 
 export function formatRunReply(answer: FinalReplyAnswer, secrets: readonly string[]): string {
   const { text } = answer;
+  const deadline = performance.now() + MARKDOWN_BUDGET_MS;
   const redact = createAssistantTextRedactor(secrets);
   let truncated = answer.truncated || text.length > MAX_REPLY_CHARS;
   let limit = truncated ? TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN : MAX_REPLY_CHARS;
+  let plainText = false;
   for (let attempt = 0; attempt < MAX_RENDER_ATTEMPTS; attempt += 1) {
     const prefix = text.length <= limit ? text : clipSource(text, limit);
     const [redacted] = redact.redact([prefix], truncated);
-    const safe = renderMarkdown(redacted!);
+    const source = cleanSource(redacted!);
+    const markdown: string | undefined = plainText ? undefined : renderMarkdown(source, deadline);
+    plainText = markdown === undefined;
+    const safe = markdown ?? renderPlainText(source);
     if (safe === "") return safe;
     if (!truncated && safe.length <= MAX_REPLY_CHARS) return safe;
     if (safe.length <= TRUNCATED_TEXT_LIMIT) return safe + TRUNCATION;
@@ -56,16 +65,40 @@ function clipSource(text: string, limit: number): string {
   return opening === undefined ? prefix : prefix.slice(0, line + 1 + opening.index);
 }
 
-function renderMarkdown(redacted: string): string {
-  const source = redacted
+function cleanSource(text: string): string {
+  return text
     .replaceAll("\0", "")
     .replace(/\p{Cf}/gu, "")
     .replace(/[\uD800-\uDFFF]/gu, "\uFFFD");
+}
+
+function renderMarkdown(source: string, deadline: number): string | undefined {
+  // Micromark is synchronous. Bound delimiter-heavy input before any parser runs.
+  if (tooManyDelimiters(source) || performance.now() >= deadline) return undefined;
   const markdown = parseMarkdown(source);
+  if (performance.now() >= deadline) return undefined;
   sanitizeMarkdown(markdown);
-  return toMarkdown(markdown, {
+  if (performance.now() >= deadline) return undefined;
+  const result = toMarkdown(markdown, {
     extensions: [gfmToMarkdown({ tablePipeAlign: false })],
   }).trim();
+  return performance.now() < deadline ? result : undefined;
+}
+
+function tooManyDelimiters(source: string): boolean {
+  let count = 0;
+  for (const run of source.matchAll(MARKDOWN_DELIMITER)) {
+    count += run[0].length;
+    if (count > MAX_MARKDOWN_DELIMITERS) return true;
+  }
+  return false;
+}
+
+function renderPlainText(source: string): string {
+  return neutralizeMentions(source.replace(/<\/?[a-zA-Z][^<>\r\n]*>/gu, ""))
+    .replace(/^[ \t]+/gmu, "")
+    .replace(/[!-/:-@[-`{-~]/gu, "\\$&")
+    .trim();
 }
 
 function parseMarkdown(source: string): Root {

@@ -213,7 +213,7 @@ export class LinearRunReplyWriter {
     try {
       text = formatRunReply(answer, secrets);
     } catch {
-      return "body_contains_secret";
+      return "reply_unrenderable";
     }
     if (text === "") return "empty_answer";
     if (secrets.some((secret) => text.includes(secret))) return "body_contains_secret";

@@ -5,6 +5,7 @@ import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import { describe, it, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
+import * as replyFormat from "./format.js";
 import { LinearRunReplyWriter } from "./linear.js";
 import { fakeLinearReplies, replyEvidence } from "./test-utils/linear.js";
 
@@ -140,6 +141,21 @@ describe("Linear reply writer", () => {
     }
   }, 60_000);
 
+  it("records an unexpected sanitizer exception as an unrenderable reply", async () => {
+    const format = vi.spyOn(replyFormat, "formatRunReply").mockImplementationOnce(() => {
+      throw new RangeError("simulated Markdown stack overflow");
+    });
+    try {
+      const { send, calls, delivery } = await fixture();
+      await send("Answer.");
+      assert.deepEqual(calls, []);
+      const result = await delivery();
+      assert.equal(result?.state, "refused");
+      assert.equal(result.failure, "reply_unrenderable");
+    } finally {
+      format.mockRestore();
+    }
+  });
   it("posts one marked, sanitized and truncated answer with only comments:create", async () => {
     const { send, writes, delivery } = await fixture();
     const text = `Hello @teammate, &#64;paseo and https://linear.app/team/profiles/alex.

@@ -11,6 +11,7 @@ export const replyFailureLabels = {
   connection_unavailable: "The original Linear connection is unavailable.",
   scope_missing: "The Linear connection cannot create comments.",
   body_contains_secret: "The reply could not be sent safely.",
+  reply_unrenderable: "Hub could not render the reply.",
   rate_limited: "This organization reached the reply limit for the last hour.",
   provider_rate_limited: "Linear rate-limited the comment.",
   provider_rejected: "Linear declined the comment.",
