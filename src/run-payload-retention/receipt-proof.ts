@@ -106,6 +106,12 @@ export function isLifecycleReceipt(
   );
 }
 
+const STOPS_BEFORE_ROUTING = new Set<string | null>([
+  "configuration_unavailable",
+  "no_project_route",
+  "unsupported_event",
+]);
+
 export function proveReceipt(
   receipt: ReceiptProofEvidence,
   branches: readonly ReceiptProofBranch[],
@@ -133,11 +139,7 @@ export function proveReceipt(
     new Set(routes.map((route) => route.projectId)).size !== routes.length
   )
     return { disposition: "fan_out_unresolved" };
-  if (
-    receipt.droppedReason === "configuration_unavailable" ||
-    receipt.droppedReason === "no_project_route"
-  )
-    return { disposition: "drop_unproven" };
+  if (STOPS_BEFORE_ROUTING.has(receipt.droppedReason)) return { disposition: "drop_unproven" };
   try {
     return proveRouted(receipt, branches, routes, revisionById);
   } catch {
@@ -168,7 +170,11 @@ function knownSource(receipt: ReceiptProofEvidence) {
     case "github":
       return receipt.source.startsWith("github.");
     case "linear":
-      return receipt.source === "linear.issue" || receipt.source === "linear.comment";
+      return (
+        receipt.source === "linear.issue" ||
+        receipt.source === "linear.comment" ||
+        (receipt.droppedReason === "unsupported_event" && receipt.source.startsWith("linear."))
+      );
     case "manual":
       return receipt.source === "manual.run" || receipt.source === "webhook.received";
     case "schedule":

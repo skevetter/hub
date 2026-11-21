@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { appendFile } from "node:fs/promises";
+import { createLinearWebhookSource } from "../triggers/linear/webhook.js";
 import { describe, beforeAll, afterAll, it } from "vitest";
 import { createMemoryDatabase } from "./memory.js";
 import {
@@ -132,6 +134,44 @@ describe("memory dropped event pages", () => {
     walk(database, limit),
   );
   it("combines filters and isolates receipt metadata", () => testFilters(database));
+  it("resolves a Linear workspace and expires a verified unsupported receipt", async () => {
+    const store = createMemoryDatabase({
+      organizationIds: [organizationId],
+      linearConnections: [
+        {
+          id: "30000000-0000-4000-8000-000000000011",
+          organizationId,
+          slug: "memory-linear",
+          providerApplicationId: null,
+          linearOrganizationId: "linear-memory",
+          linearOrganizationName: "Memory workspace",
+          appUserId: "app",
+          accessToken: "fixture",
+          refreshToken: null,
+          accessTokenExpiresAt: null,
+          scopes: [],
+        },
+      ],
+    });
+    const result = await store.acceptLinearEvent({
+      linearOrganizationId: "linear-memory",
+      deliveryId: "memory-unsupported",
+      source: "linear.agent_session",
+      payload: { type: "agent_session", action: "created" },
+      receivedAt,
+      dropReason: "unsupported_event",
+    });
+    assert.equal(result.status, "dropped");
+    const after = new Date(receivedAt.getTime() + 1);
+    assert.deepEqual(await store.expireReceiptPayload(result.receiptId, after, after), {
+      status: "expired",
+    });
+    const { records } = await store.listDroppedEventPage(organizationId, {
+      limit: 15,
+      reason: "unsupported_event",
+    });
+    assert.equal(records[0]?.workspaceOrRepo, "memory-linear");
+  });
 });
 
 describe("PostgreSQL dropped event pages", () => {
@@ -160,6 +200,98 @@ describe("PostgreSQL dropped event pages", () => {
     walk(harness.database, limit),
   );
   it("combines filters and isolates receipt metadata", () => testFilters(harness.database));
+  it("keeps 5,000 unsupported Linear receipts per organization and deduplicates signed deliveries", async () => {
+    await harness.runtime.query(
+      `
+      insert into linear_connections
+        (id, organization_id, linear_organization_id, slug, linear_organization_name, app_user_id, access_token)
+      values ('30000000-0000-4000-8000-000000000011', $1, 'linear-main', 'main-linear', 'Main', 'app', 'fixture'),
+             ('30000000-0000-4000-8000-000000000012', $2, 'linear-other', 'other-linear', 'Other', 'app', 'fixture')
+    `,
+      [organizationId, other],
+    );
+    const secret = "linear-webhook-test";
+    const now = receivedAt.getTime();
+    const endpoint = createLinearWebhookSource({
+      signingSecret: secret,
+      now: () => now,
+      accept: (input) => harness.database.acceptLinearEvent(input),
+    });
+    async function deliver(delivery: string, linearOrganizationId: string, action = "created") {
+      const body = JSON.stringify({
+        type: "AgentSessionEvent",
+        action,
+        organizationId: linearOrganizationId,
+        webhookTimestamp: now,
+        data: { private: "PRIVATE-LINEAR-BODY" },
+      });
+      const response = await endpoint.handle(
+        new Request("https://hub.test/api/integrations/linear/events", {
+          method: "POST",
+          headers: {
+            "linear-delivery": delivery,
+            "linear-event": "AgentSessionEvent",
+            "linear-signature": createHmac("sha256", secret).update(body).digest("hex"),
+          },
+          body,
+        }),
+      );
+      assert.equal(response.status, 200);
+    }
+    await deliver("other-unsupported", "linear-other");
+    await harness.runtime.query(
+      `
+      insert into provider_event_receipts
+        (organization_id, provider, delivery_id, source, payload, received_at, dropped_reason)
+      select $1, 'linear', 'overflow-' || n, 'linear.agent_session', '{}',
+             timestamptz '2026-01-01' + n * interval '1 second', 'unsupported_event'
+      from generate_series(1, 4999) n
+    `,
+      [organizationId],
+    );
+    await Promise.all([
+      deliver("new-unsupported", "linear-main"),
+      deliver("another-unsupported", "linear-main", "prompted"),
+    ]);
+    await deliver("new-unsupported", "linear-main", "revised");
+    const { rows } = await harness.runtime.query<{
+      count: number;
+      oldest: boolean;
+      duplicates: number;
+      other: number;
+      sanitized: boolean;
+    }>(
+      `
+      select count(*) filter (where organization_id = $1)::int as count,
+             bool_or(delivery_id = 'overflow-1') as oldest,
+             count(*) filter (where delivery_id = 'new-unsupported')::int as duplicates,
+             count(*) filter (where organization_id = $2)::int as other,
+             bool_or(delivery_id = 'new-unsupported' and payload = '{"type":"agent_session","action":"created"}') as sanitized
+      from provider_event_receipts where dropped_reason = 'unsupported_event'
+    `,
+      [organizationId, other],
+    );
+    assert.deepEqual(rows, [
+      { count: 5000, oldest: false, duplicates: 1, other: 1, sanitized: true },
+    ]);
+    const [linear] = (
+      await harness.database.listDroppedEventPage(organizationId, {
+        limit: 15,
+        provider: "linear",
+        reason: "unsupported_event",
+      })
+    ).records;
+    assert.equal(linear?.workspaceOrRepo, "main-linear");
+    assert.ok(linear);
+    const after = new Date(now + 1);
+    assert.deepEqual(await harness.database.expireReceiptPayload(linear.id, after, after), {
+      status: "expired",
+    });
+    const expired = await harness.database.findProviderEventReplayMetadata(organizationId, {
+      id: linear.id,
+    });
+    assert.equal(expired?.payloadExpiryState, "expired");
+  });
   it("uses an ordered index for newest and cursor pages at 27,000 receipts", async () => {
     await harness.runtime.query(
       `

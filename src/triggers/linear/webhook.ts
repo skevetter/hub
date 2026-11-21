@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { ZodError } from "zod";
 import type { ProviderEventAcceptance } from "../../db/types.js";
 import { readBoundedRequestBody } from "../../http/request-body.js";
 import { logger } from "../../logger.js";
@@ -115,10 +116,19 @@ async function handoffLinearEvent(
 ): Promise<Response> {
   let linearOrganizationId: string | undefined;
   try {
-    let event = normalizeLinearEvent(verified.payload, verified.eventName);
+    let event = normalizeDelivery(verified);
     if (event === undefined) {
-      logger.debug({ deliveryId: verified.deliveryId }, "ignoring unsupported Linear event");
-      return new Response("OK", { status: 200 });
+      const envelope = isRecord(verified.payload) ? verified.payload : {};
+      const organizationId = envelope["organizationId"];
+      if (
+        typeof organizationId !== "string" ||
+        organizationId.length === 0 ||
+        organizationId.length > 255 ||
+        organizationId.includes("\u0000")
+      )
+        return new Response("OK", { status: 200 });
+      linearOrganizationId = organizationId;
+      return await acceptUnsupportedLinearEvent(verified, organizationId, options);
     }
     linearOrganizationId = event.organizationId;
     if (await findMarkedReceipt(options, verified, linearOrganizationId))
@@ -135,13 +145,10 @@ async function handoffLinearEvent(
         linearOrganizationId: event.organizationId,
         issueId: eventIssueId(event),
       });
-      event = normalizeLinearEvent(verified.payload, verified.eventName, issue);
+      event = normalizeDelivery(verified, issue);
     }
     if (event === undefined) {
-      if (await findMarkedReceipt(options, verified, linearOrganizationId))
-        return new Response("OK", { status: 200 });
-      logger.warn({ deliveryId: verified.deliveryId }, "Linear event issue hydration was invalid");
-      return Response.json({ error: "invalid_linear_event" }, { status: 400 });
+      return await acceptUnsupportedLinearEvent(verified, linearOrganizationId, options);
     }
     return await acceptAndDispatchLinearEvent(
       event,
@@ -159,6 +166,53 @@ async function handoffLinearEvent(
     logger.error({ err: error, deliveryId: verified.deliveryId }, "Linear event handoff failed");
     return Response.json({ error: "event_handoff_unavailable" }, { status: 503 });
   }
+}
+
+function normalizeDelivery(verified: VerifiedLinearRequest, issue?: LinearIssueDetails) {
+  const envelope = isRecord(verified.payload) ? verified.payload : {};
+  if (
+    eventIdentifier(envelope["type"]) === "agent_session_event" ||
+    eventIdentifier(verified.eventName) === "agent_session_event"
+  )
+    return undefined;
+  try {
+    return normalizeLinearEvent(verified.payload, verified.eventName, issue);
+  } catch (error) {
+    if (error instanceof ZodError) return undefined;
+    throw error;
+  }
+}
+
+function eventIdentifier(value: unknown): string | undefined {
+  if (typeof value !== "string" || !/^[A-Za-z][A-Za-z0-9_-]{0,39}$/u.test(value)) return undefined;
+  return value.replace(/([a-z0-9])([A-Z])/gu, "$1_$2").toLowerCase();
+}
+
+async function acceptUnsupportedLinearEvent(
+  verified: VerifiedLinearRequest,
+  linearOrganizationId: string,
+  options: LinearWebhookSourceOptions,
+): Promise<Response> {
+  if (await findMarkedReceipt(options, verified, linearOrganizationId))
+    return new Response("OK", { status: 200 });
+  const envelope = isRecord(verified.payload) ? verified.payload : {};
+  const kind = eventIdentifier(envelope["type"]);
+  const type =
+    kind === "agent_session_event" || eventIdentifier(verified.eventName) === "agent_session_event"
+      ? "agent_session"
+      : (kind ?? "unknown");
+  const action = eventIdentifier(envelope["action"]);
+  const source = `linear.${type}`;
+  await options.accept({
+    linearOrganizationId,
+    deliveryId: verified.deliveryId,
+    signatureHash: verified.signatureHash,
+    source,
+    payload: action === undefined ? { type } : { type, action },
+    receivedAt: verified.receivedAt,
+    dropReason: "unsupported_event",
+  });
+  return new Response("OK", { status: 200 });
 }
 
 async function findMarkedReceipt(

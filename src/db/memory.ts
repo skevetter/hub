@@ -216,6 +216,7 @@ import {
   droppedEventProvider,
   groupDropCounts,
   RECENT_DROP_COUNT_LIMIT,
+  UNSUPPORTED_LINEAR_RECEIPT_LIMIT,
 } from "./dropped-events.js";
 import { activityTimestampMicros, compareRunsNewestFirst } from "./activity-key.js";
 import { hasTriggerEvent, triggerProviderEvent } from "./trigger-list.js";
@@ -267,6 +268,7 @@ export interface MemoryDatabaseOptions {
   }[];
   now?: () => Date;
   slackConnections?: readonly SlackConnectionRecord[];
+  linearConnections?: readonly LinearConnectionRecord[];
   githubConnections?: readonly GitHubConnectionRecord[];
   githubSyncOwner?: GitHubInstallationSyncOwner;
 }
@@ -1834,6 +1836,9 @@ class MemoryDatabase implements Database {
       this.githubConnections.set(connection.installationId, connection);
     for (const connection of options.slackConnections ?? []) {
       this.slackConnections.set(connection.teamId, connection);
+    }
+    for (const connection of options.linearConnections ?? []) {
+      this.linearConnections.set(connection.linearOrganizationId, connection);
     }
   }
 
@@ -6553,6 +6558,9 @@ class MemoryDatabase implements Database {
         droppedReason: reason,
         preRoutingDrop: preRoutingDropEvidence(reason),
       });
+      if (receipt.provider === "linear" && reason === "unsupported_event") {
+        this.pruneUnsupportedLinearReceipts(organizationId);
+      }
       return {
         status: "dropped",
         receiptId: receipt.id,
@@ -6685,6 +6693,33 @@ class MemoryDatabase implements Database {
       this.providerEventReceiptIdsBySignature.set(receipt.signatureHash, receipt.id);
     }
     return receipt;
+  }
+
+  private pruneUnsupportedLinearReceipts(organizationId: string) {
+    let count = 0;
+    let oldest: ProviderEventReceiptRecord | undefined;
+    for (const receipt of this.providerEventReceipts.values()) {
+      if (
+        receipt.organizationId !== organizationId ||
+        receipt.provider !== "linear" ||
+        receipt.droppedReason !== "unsupported_event"
+      )
+        continue;
+      count += 1;
+      if (
+        oldest === undefined ||
+        compareRunsNewestFirst(receiptOrder(receipt), receiptOrder(oldest)) > 0
+      ) {
+        oldest = receipt;
+      }
+    }
+    if (count <= UNSUPPORTED_LINEAR_RECEIPT_LIMIT || oldest === undefined) return;
+    this.providerEventReceipts.delete(oldest.id);
+    this.providerEventReceiptIdsByDelivery.delete(
+      triggerDeliveryKey(organizationId, oldest.deliveryId),
+    );
+    if (oldest.signatureHash !== null)
+      this.providerEventReceiptIdsBySignature.delete(oldest.signatureHash);
   }
 
   private readMachine(id: string): MachineRecord {

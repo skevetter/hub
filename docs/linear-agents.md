@@ -20,6 +20,6 @@ Delegation uses the existing issue source, receipt and run identity. A repeated 
 
 ## Agent session limits
 
-Hub acknowledges verified `AgentSessionEvent` deliveries with HTTP 200 and a debug log. It does not create a receipt, start a run or post an activity for those deliveries. This applies to mentions as well as delegation sessions. Mentions can start runs only through the existing allowlisted comment trigger and its text filters.
+Hub records verified `AgentSessionEvent` deliveries from connected Linear workspaces as unsupported in Activity > Dropped and acknowledges them with HTTP 200. This applies to mentions and delegation sessions. These deliveries start no runs and post no activities. Mentions can start runs through a configured Linear comment trigger when the event passes its filters.
 
 Agent sessions and activities are not implemented. If agent session webhooks are enabled, Linear can show the agent as not responding because Hub does not send the initial activity. Do not treat mentionability or delegation support as agent session support. This change adds no calls that post to Linear.

@@ -21,7 +21,9 @@ export function parseManualReceiptReplayBinding(value: unknown): ManualReceiptRe
 }
 
 export function preRoutingDropEvidence(reason: string | undefined): ReceiptPreRoutingDrop | null {
-  return reason === "no_trigger_for_source" || reason === "configuration_unavailable"
+  return reason === "no_trigger_for_source" ||
+    reason === "configuration_unavailable" ||
+    reason === "unsupported_event"
     ? reason
     : null;
 }
