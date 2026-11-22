@@ -40,8 +40,6 @@ export function resetQueriesOnReaderChange(
   let reader: string | null | undefined;
   queryClient.getQueryCache().subscribe((event) => {
     if (event.type !== "updated" || !matchQuery(accountQuery, event.query)) return;
-    // The server also reports schema failures through the query's error channel.
-    if (event.action.type === "error" && reader !== undefined) leaveReader(queryClient);
     if (event.action.type !== "success") return;
     const { success, data } = accountStateSchema.safeParse(event.action.data);
     if (!success) {
