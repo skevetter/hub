@@ -98,7 +98,9 @@ describe("transcript entries", () => {
     assert.match(markup, /data-entry="assistant" class="[^"]*justify-items-start/u);
     const tool = markup.match(/<p data-entry="tool"[^>]*>.*?<\/p>/u)?.[0] ?? "";
     assert.match(tool, /Completed/u);
-    assert.doesNotMatch(tool, /rounded-sm/u);
+    assert.match(tool, /rounded-sm[^"]*bg-success-surface/u);
+    const failed = render([{ id: "failed", kind: "tool", name: "run", status: "failed", seq: 1 }]);
+    assert.match(failed, /bg-danger-surface text-danger/u);
   });
 
   it("shows a boundary note for a gap or an offline daemon", () => {
