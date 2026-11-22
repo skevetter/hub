@@ -235,7 +235,7 @@ ${run}`;
   });
 
   it("makes a copied comment match the real GitHub matcher and links to scoped triggers", async () => {
-    const database = memberDatabase();
+    const database = memberDatabase({ github: true });
     const agent = triggerYaml.slice(triggerYaml.indexOf("run:\n"));
     const connections = [
       { provider: "github" as const, slug: "fixture", label: "Fixture", needsAuthorization: false },
@@ -466,9 +466,10 @@ async function withSessions({
 }
 
 function memberDatabase({
+  github = false,
   slack = true,
   slackScopes = ["app_mentions:read"],
-}: { slack?: boolean; slackScopes?: string[] } = {}): Database {
+}: { github?: boolean; slack?: boolean; slackScopes?: string[] } = {}): Database {
   return createMemoryDatabase({
     now: () => NOW,
     memberships: [
@@ -481,6 +482,21 @@ function memberDatabase({
         role: "owner",
       },
     ],
+    githubConnections: github
+      ? [
+          {
+            id: "github-1",
+            organizationId: "org-1",
+            slug: "fixture",
+            installationId: 42,
+            accountId: "7",
+            accountLogin: "Fixture",
+            accountType: "Organization",
+            status: "active",
+            providerApplicationId: null,
+          },
+        ]
+      : [],
     slackConnections: slack
       ? [
           {
