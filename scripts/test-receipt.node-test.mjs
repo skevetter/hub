@@ -346,6 +346,68 @@ test("an interrupted receipt waits for the command and removes its temp director
   }
 });
 
+test("TERM after staging a receipt prevents its publication", async (t) => {
+  const { directory, head } = await gitFixture(t);
+  const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
+  const receiptDir = join(await realpath(directory), ".test-receipts");
+  const marker = join(receiptDir, "staged");
+  const preload = join(receiptDir, "pause-write.mjs");
+  await mkdir(receiptDir);
+  await writeFile(
+    preload,
+    `
+    import { once } from "node:events";
+    import { writeFileSync } from "node:fs";
+    import fs from "node:fs/promises";
+    import { syncBuiltinESMExports } from "node:module";
+    const writeFile = fs.writeFile;
+    fs.writeFile = async (path, ...args) => {
+      await writeFile(path, ...args);
+      if (path !== ${JSON.stringify(join(receiptDir, `${head}.tmp-`))} + process.pid) return;
+      const keepAlive = setInterval(() => {}, 1000);
+      const signal = once(process, "SIGTERM");
+      writeFileSync(${JSON.stringify(marker)}, path);
+      try { await signal; } finally { clearInterval(keepAlive); }
+    };
+    syncBuiltinESMExports();
+    `,
+  );
+
+  const caller = spawn(
+    process.execPath,
+    ["--import", preload, runner, "--root", directory, "--", process.execPath, "-e", ""],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  const exited = once(caller, "close");
+  let output = "";
+  caller.stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+  caller.stderr.on("data", (chunk) => {
+    output += chunk;
+  });
+  try {
+    let pending = "";
+    for (let attempt = 0; !pending && attempt < 200 && caller.exitCode === null; attempt++) {
+      pending = await readFile(marker, "utf8").catch(() => "");
+      if (!pending) await delay(20);
+    }
+    assert.ok(pending, output || "receipt did not reach the pending write");
+    const result = once(caller, "exit", { signal: AbortSignal.timeout(4000) });
+    caller.kill("SIGTERM");
+    assert.deepEqual(await result, [1, null]);
+    await exited;
+    assert.match(output, /INTERRUPTED: SIGTERM/u);
+    assert.doesNotMatch(output, /^Wrote /mu);
+    await assert.rejects(verifyReceipt(directory, head), /No test receipt exists/u);
+    await assert.rejects(readFile(pending), { code: "ENOENT" });
+    await assert.rejects(readFile(join(receiptDir, `${head}.lock`)), { code: "ENOENT" });
+  } finally {
+    if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+    await exited;
+  }
+});
+
 test("a dead receipt writer's lock is reclaimed on the next recording", async (t) => {
   const { directory, head } = await gitFixture(t);
   const receiptDir = join(directory, ".test-receipts");
