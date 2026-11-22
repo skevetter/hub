@@ -23,7 +23,7 @@ import {
 } from "./functions.js";
 import type { Result } from "../contract/respond.js";
 import { DAEMON_MUTATION_KEY } from "../auth/tenant-mutation.js";
-import { DaemonDevice, DaemonResults } from "./daemon-list.js";
+import { ConnectAnotherDaemon, DaemonDevice, DaemonResults } from "./daemon-list.js";
 import {
   filterDaemons,
   type DaemonFilterStatus,
@@ -241,6 +241,7 @@ function DaemonsContent({
           />
         ))}
       </DaemonResults>
+      {daemons.length > 0 && canManage ? <ConnectAnotherDaemon /> : null}
     </>
   );
 }
@@ -270,15 +271,13 @@ function DaemonFilters({
           {...(onSearch === undefined ? {} : { onChange: onSearch })}
         />
       </div>
-      <div className="motion-reduce:[&_button]:transition-none">
-        <SegmentedControl
-          label="Daemon status"
-          description="Daemon status"
-          value={filters.status}
-          options={disabled ? DISABLED_FILTER_OPTIONS : FILTER_OPTIONS}
-          onChange={onStatusChange}
-        />
-      </div>
+      <SegmentedControl
+        label="Daemon status"
+        description="Daemon status"
+        value={filters.status}
+        options={disabled ? DISABLED_FILTER_OPTIONS : FILTER_OPTIONS}
+        onChange={onStatusChange}
+      />
     </ListFilters>
   );
 }

@@ -1,6 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import { BookOpen } from "lucide-react";
 import { Fragment, useMemo, type ReactNode } from "react";
+import { Card } from "../components/app/card.js";
 import { CopyField } from "../components/app/copy-field.js";
 import { DeviceCard } from "../components/app/device-card.js";
 import { EmptyState } from "../components/app/empty-state.js";
@@ -71,6 +72,20 @@ function ConnectDaemonHint() {
         </a>
       </Button>
     </>
+  );
+}
+
+/** The way to add a machine stays on the page after the first one has connected. */
+export function ConnectAnotherDaemon() {
+  return (
+    <Card
+      title="Connect another daemon"
+      description="Run this on the machine you want to add, then approve it in the browser."
+    >
+      <div className="grid max-w-sm gap-3">
+        <ConnectDaemonHint />
+      </div>
+    </Card>
   );
 }
 
@@ -166,6 +181,7 @@ function DaemonPermissions({ daemon }: { daemon: BrowserDaemon }) {
         label="Grant command"
         copyLabel="Copy grant command"
         value={GRANT_EXECUTE_COMMAND}
+        prose
       />
     </div>
   );
