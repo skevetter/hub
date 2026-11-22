@@ -170,13 +170,14 @@ function ConnectionsContent() {
   const { revocation, snapshotProgress, statusProgress, paused } = useConnectionReadProgress(keys);
   const disconnect = useConnectionRevocation(scope, keys);
   const mutationPending = useIsMutating({ mutationKey: CONNECTION_MUTATION_KEY }) > 0;
-  const failure = connectionReadFailure(snapshot, statusQuery, revocation !== undefined && paused);
-  const ready = snapshot.status === "success" && statusQuery.status === "success";
-  const { retry, retryState, retryPending, focusRetryButton, resetRetry } = useConnectionRetry(
-    keys,
-    ready,
-    failure,
+  const readFailure = connectionReadFailure(
+    snapshot,
+    statusQuery,
+    revocation !== undefined && paused,
   );
+  const ready = snapshot.status === "success" && statusQuery.status === "success";
+  const { retry, retryState, retryPending, focusRetryButton, resetRetry, failure } =
+    useConnectionRetry(keys, ready, readFailure, paused);
   const start = connect.mutate;
   const revoke = disconnect.mutate;
   const connectProvider = useCallback(
@@ -328,13 +329,13 @@ type ConnectionRead = Pick<
   "status" | "error" | "refreshFailure"
 >;
 
+const OFFLINE_FAILURE = {
+  title: "Connections unavailable",
+  message: "Reconnect to the network and try again.",
+};
+
 function connectionReadFailure(snapshot: ConnectionRead, status: ConnectionRead, offline: boolean) {
-  if (offline) {
-    return {
-      title: "Connections unavailable",
-      message: "Reconnect to the network and try again.",
-    };
-  }
+  if (offline) return OFFLINE_FAILURE;
   const failure = (read: ConnectionRead) =>
     read.status === "error" ? { message: read.error } : read.refreshFailure;
   const snapshotFailure = failure(snapshot);
@@ -347,7 +348,8 @@ function connectionReadFailure(snapshot: ConnectionRead, status: ConnectionRead,
 function useConnectionRetry(
   keys: ConnectionQueryKeys,
   ready: boolean,
-  failure: ReturnType<typeof connectionReadFailure>,
+  readFailure: ReturnType<typeof connectionReadFailure>,
+  paused: boolean,
 ) {
   const queryClient = useQueryClient();
   const [retryState, setRetryState] = useState<"idle" | "pending" | "complete">("idle");
@@ -366,6 +368,11 @@ function useConnectionRetry(
     restoreRetryFocus.current = false;
     button.focus();
   }, []);
+  const retryPaused =
+    paused &&
+    retryState !== "idle" &&
+    (retryState === "pending" || !ready || readFailure !== undefined);
+  const failure = retryPaused ? OFFLINE_FAILURE : readFailure;
   const retrySucceeded = retryState === "complete" && failure === undefined && ready;
   useEffect(() => {
     if (!retrySucceeded || !restoreRetryFocus.current) return;
@@ -373,8 +380,10 @@ function useConnectionRetry(
     document.getElementById(HEADING_ID)?.focus();
   }, [retrySucceeded]);
   const retryPending =
-    retryState !== "idle" && (retryState === "pending" || (!ready && failure === undefined));
-  return { retry, retryState, retryPending, focusRetryButton, resetRetry };
+    !retryPaused &&
+    retryState !== "idle" &&
+    (retryState === "pending" || (!ready && failure === undefined));
+  return { retry, retryState, retryPending, focusRetryButton, resetRetry, failure };
 }
 
 interface RevokeInput {
