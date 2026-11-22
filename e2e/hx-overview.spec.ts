@@ -28,6 +28,28 @@ const owner = {
 
 test.describe.configure({ timeout: 180_000 });
 
+test("Home restores keyboard focus after a retry", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  let failHome = true;
+  await page.route("**/_serverFn/**", async (route) => {
+    const response = await route.fetch();
+    const body = await response.text();
+    if (failHome && body.includes("runCounts")) {
+      await route.fulfill({ status: 500, body: "Home test failure" });
+    } else {
+      await route.fulfill({ response, body });
+    }
+  });
+  await page.reload();
+  const retry = page.getByRole("button", { name: "Try again" });
+  await expect(retry).toBeVisible();
+  failHome = false;
+  await retry.press("Enter");
+  await expect(page.getByText("Runs, 24 hours", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeFocused();
+});
+
 test("reads Home as figures, a checklist the member can put away, and prompts to try", async ({
   hub,
   page,
@@ -94,8 +116,12 @@ test("reads Home as figures, a checklist the member can put away, and prompts to
   await test.step("a connection that needs authorization is the one alert, with its way out", async () => {
     await hub.seedSlackConnection("owner", "slack", "Acme");
     await page.getByRole("link", { name: "Home", exact: true }).click();
-    const alert = page.getByRole("alert").filter({ hasText: "Slack needs authorization" });
+    const alert = page
+      .locator('[data-slot="alert"]')
+      .filter({ hasText: "Slack needs authorization" });
     await expect(alert).toContainText("Hub cannot use Acme");
+    expect(await alert.getAttribute("role")).toBeNull();
+    expect(await alert.getAttribute("aria-live")).toBeNull();
     await alert.getByRole("link", { name: "Open connections", exact: true }).click();
     await expect(page).toHaveURL(/\/connections$/u);
   });

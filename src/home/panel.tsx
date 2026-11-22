@@ -5,7 +5,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { MessagesSquare } from "lucide-react";
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useActiveAccount } from "../auth/active-account.js";
 import { Card, CardSkeleton } from "../components/app/card.js";
@@ -48,6 +48,7 @@ import { memberFlagKey, useMemberFlag } from "./member-preference.js";
 import { thingsToTry, type TrySurfaceKey } from "./things-to-try.js";
 
 const HOME_DESCRIPTION = "What is running, what needs you, and what to try next.";
+const HOME_HEADING_ID = "home-heading";
 const RECENT_RUNS_SHOWN = 5;
 
 export function HomePanel() {
@@ -76,14 +77,26 @@ function HomeView({
   operator,
   sessionsEnabled,
 }: {
-  snapshot: Snapshot<HomeSnapshot> & { refetch: () => void };
+  snapshot: Snapshot<HomeSnapshot> & { refetch: () => void; isFetching: boolean };
   accountId: string;
   operator: boolean;
   sessionsEnabled: boolean;
 }) {
   const [focusOnCompletion, setFocusOnCompletion] = useState(false);
+  const retryRequested = useRef(false);
+  const { isFetching, status } = snapshot;
+  useEffect(() => {
+    if (!retryRequested.current || isFetching) return;
+    retryRequested.current = false;
+    if (status === "success") document.getElementById(HOME_HEADING_ID)?.focus();
+  }, [isFetching, status]);
   const header = (
-    <PageHeader title="Home" description={HOME_DESCRIPTION} focusOnMount={focusOnCompletion} />
+    <PageHeader
+      id={HOME_HEADING_ID}
+      title="Home"
+      description={HOME_DESCRIPTION}
+      focusOnMount={focusOnCompletion}
+    />
   );
   if (snapshot.status === "pending") {
     return (
@@ -101,7 +114,10 @@ function HomeView({
           title="Home unavailable"
           error={snapshot.error}
           fallback="Hub could not load this organization's activity and setup."
-          onRetry={snapshot.refetch}
+          onRetry={() => {
+            retryRequested.current = true;
+            snapshot.refetch();
+          }}
         />
       </>
     );
@@ -250,6 +266,7 @@ function NeedsAttention({ data, base }: { data: HomeSnapshot; base: string }) {
         return (
           <WarningAlert
             key={provider}
+            passive
             standalone
             title={`${PROVIDER_NAMES[provider]} needs authorization`}
             action={
@@ -267,6 +284,7 @@ function NeedsAttention({ data, base }: { data: HomeSnapshot; base: string }) {
       })}
       {daemons === undefined ? null : (
         <WarningAlert
+          passive
           standalone
           title={daemons.title}
           action={
@@ -791,6 +809,7 @@ function DroppedEventNotices({ data }: { data: HomeSnapshot }) {
     return (
       <WarningAlert
         key={reason}
+        passive
         standalone
         title={DROP_NOTICE_TITLES[reason]}
         action={
