@@ -317,7 +317,7 @@ function daemonAttention(data: HomeSnapshot): { title: string; message: string }
   }
   const names = able.map(({ slug }) => slug).join(", ");
   return {
-    title: able.length === 1 ? "Your daemon is offline" : "Every daemon is offline",
+    title: "No daemon that may run agents is connected.",
     message: `${names} ${able.length === 1 ? "is" : "are"} not connected. Triggers and sessions wait until ${able.length === 1 ? "it reconnects" : "one reconnects"}.`,
   };
 }
