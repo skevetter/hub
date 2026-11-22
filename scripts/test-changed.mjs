@@ -333,13 +333,14 @@ async function main(signal) {
 
   let lock;
   const supervisor = supervise(signal, () => lock);
+  const checks = ["route tree"];
+  let completed;
   let temp;
   try {
     lock = await takeFullSuiteLock();
     temp = await mkdtemp(join(tmpdir(), "hub-changed-"));
     const env = { ...process.env, HUB_VITEST_CACHE_DIR: join(temp, "vite") };
     await checkRouteTree(supervisor, root, temp, env);
-    const checks = ["route tree"];
     const present = new Set();
     for (const path of changes) {
       if (await exists(join(root, path))) present.add(path);
@@ -377,28 +378,24 @@ async function main(signal) {
       });
       if (result !== 0) return result;
       const { selectedFiles, counts } = JSON.parse(await readFile(metrics, "utf8"));
-      await publishTestMetrics([{ files: selectedFiles, counts }], checks, root);
-      return 0;
+      completed = { files: selectedFiles, counts };
+    } else {
+      const direct = await selectedVitest(
+        supervisor,
+        root,
+        ["run", ...[...plan.tests.keys()].map((path) => join(root, path))],
+        join(temp, "direct.json"),
+        env,
+      );
+      printTests(direct, (path) => plan.tests.get(path) ?? "Vitest path match");
+      const files = direct.files.map(({ path }) => path);
+      const reported = new Set(files);
+      const missing = [...plan.tests.keys()].filter((path) => !reported.has(path));
+      if (missing.length)
+        throw new Error(`Vitest did not report these selected files: ${missing.join(", ")}`);
+      if (direct.code !== 0) return direct.code;
+      completed = { files, counts: direct.counts };
     }
-    const direct = await selectedVitest(
-      supervisor,
-      root,
-      ["run", ...[...plan.tests.keys()].map((path) => join(root, path))],
-      join(temp, "direct.json"),
-      env,
-    );
-    printTests(direct, (path) => plan.tests.get(path) ?? "Vitest path match");
-    const reported = new Set(direct.files.map(({ path }) => path));
-    const missing = [...plan.tests.keys()].filter((path) => !reported.has(path));
-    if (missing.length)
-      throw new Error(`Vitest did not report these selected files: ${missing.join(", ")}`);
-    if (direct.code !== 0) return direct.code;
-    await publishTestMetrics(
-      [{ files: direct.files.map(({ path }) => path), counts: direct.counts }],
-      checks,
-      root,
-    );
-    return 0;
   } finally {
     try {
       if (temp) await rm(temp, { recursive: true });
@@ -406,6 +403,8 @@ async function main(signal) {
       lock?.release();
     }
   }
+  publishTestMetrics([completed], checks, root, signal);
+  return 0;
 }
 
 if (isEntrypoint(import.meta.url)) {
