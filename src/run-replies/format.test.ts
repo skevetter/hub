@@ -342,3 +342,22 @@ it("keeps a realistic nested list as Markdown", () => {
   formatRunReply({ text, truncated: false }, [], { onFallback: (reason) => reasons.push(reason) });
   assert.deepEqual(reasons, []);
 });
+
+it.each([
+  "~~![x](https://e.com/i.png)~~",
+  "**<b></b>**",
+  "*<img src=x>*",
+  "[![x](https://e.com/i.png)](https://e.com)",
+])("does not leave an empty marker run behind after removing the content of %j", (inline) => {
+  const body = formatRunReply(
+    { text: `before ${inline}\n\n${inline}\n\nafter`, truncated: false },
+    [],
+  );
+  assert.doesNotMatch(body, /^[~*_`]{3,}$/mu);
+  assert.match(body, /after$/u);
+  const tree = fromMarkdown(`${body}\n\nPaseo reply marker`, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  });
+  assert.equal(tree.children.at(-1)?.type, "paragraph");
+});

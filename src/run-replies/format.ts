@@ -383,6 +383,16 @@ function sanitizeMarkdown(markdown: Root): void {
       }
       if ("children" in node) pending.push(node);
     }
+  } // Removing an image or tag can leave an empty "~~~~" or "****", which re-parses as a fence or a
+  // thematic break. Children come after their parents in the list, so walk it backwards.
+  for (const parent of pending.toReversed()) {
+    parent.children = parent.children.filter(
+      (child) =>
+        !(
+          (child.type === "delete" || child.type === "emphasis" || child.type === "strong") &&
+          child.children.length === 0
+        ),
+    );
   }
 }
 
