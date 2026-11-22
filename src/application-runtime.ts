@@ -792,8 +792,12 @@ function homeDashboardFor(
   if (options.database === null || options.auth === null) return null;
   // The same registrations `connectionStatus` answers from: a provider whose status is anything
   // but "not configured" has an app behind it.
-  return new HomeDashboard(options.database, options.auth, (bindings) =>
-    [...connections.values()].some((connection) => isConfigured(connection.status(bindings))),
+  return new HomeDashboard(
+    options.database,
+    options.auth,
+    (bindings) =>
+      [...connections.values()].some((connection) => isConfigured(connection.status(bindings))),
+    { interactiveSessions: options.interactiveSessions?.enabled === true },
   );
 }
 
