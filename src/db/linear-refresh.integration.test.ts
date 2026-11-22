@@ -141,6 +141,18 @@ describe("Linear token refresh persistence", () => {
       ]);
       const connection = await database.findLinearConnection(LINEAR_ORGANIZATION_ID);
       assert.ok(connection);
+      await waiter.runtime.query("set default_transaction_isolation = 'repeatable read'");
+      const ordinaryDatabase = createDatabase(waiter.runtime, waiter.locks);
+      await ordinaryDatabase.withLinearConnectionRefresh(
+        LINEAR_ORGANIZATION_ID,
+        async (_connection, _update, query) => {
+          assert.ok(query);
+          const { rows } = await query.query<{ transaction_isolation: string }>(
+            "show transaction_isolation",
+          );
+          assert.equal(rows[0]?.transaction_isolation, "repeatable read");
+        },
+      );
       const { profile } = await prepareProfile(database, {
         organizationId: START_ACCESS.organizationId,
         userId: START_ACCESS.userId,

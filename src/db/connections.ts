@@ -498,6 +498,10 @@ export class ConnectionRepository {
     operation: LinearConnectionRefreshOperation<T>,
   ): Promise<T> {
     return this.runtime.transaction(async (runtimeTransaction) => {
+      // The advisory lock can establish the snapshot before it finishes waiting.
+      if (operation.requireReadCommitted) {
+        await runtimeTransaction.query("set transaction isolation level read committed");
+      }
       const transaction = runtimeTransaction.drizzle();
       // This is intentionally the same transaction-scoped identity lock as OAuth rebind. In
       // particular, do not use the session-lock API here: the re-read and write below must share

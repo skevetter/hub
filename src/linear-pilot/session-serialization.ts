@@ -8,6 +8,7 @@ type Installation = Pick<
 export function createPilotSessionSerialization() {
   const tails = new Map<string, Promise<void>>();
 
+  // The callback must not re-enter this key.
   return async function withSession<T>(
     authority: Installation,
     origin: Pick<PilotNativeOrigin, "nativeSessionId">,

@@ -581,6 +581,7 @@ async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgre
       expect(reservation).toHaveBeenCalledTimes(1);
 
       if (scenario === "stop-race") {
+        const priorActivities = publication.slice();
         const stopFinished = Promise.withResolvers<void>();
         const releasePublication = Promise.withResolvers<void>();
         let publicationTask: Promise<void> | undefined;
@@ -638,19 +639,16 @@ async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgre
           ]);
           expect(finished).toBe("Stop settled");
           expect(agents.interrupts).toEqual([]);
-          await vi.waitFor(
-            () =>
-              expect(publication[3]).toEqual({
-                id: pilotActivityIds(nativeSessionId, followUpId).stop,
-                type: "error",
-                body: "Stop requested; I could not confirm it stopped",
-              }),
-            { timeout: 5_000 },
-          );
-          await pilot.stop();
-          expect(publicationTask).toBeDefined();
+          await vi.waitFor(() => expect(publicationTask).toBeDefined(), { timeout: 5_000 });
           await publicationTask;
-          expect(publication).toHaveLength(4);
+          expect(publication).toEqual([
+            ...priorActivities,
+            {
+              id: pilotActivityIds(nativeSessionId, followUpId).stop,
+              type: "error",
+              body: "Stop requested; I could not confirm it stopped",
+            },
+          ]);
 
           let drained = false;
           const shutdown = coordinator.stopAccepting().then(() => {

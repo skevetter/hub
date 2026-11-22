@@ -647,11 +647,14 @@ export interface UpdateLinearConnectionTokensInput {
 
 export type LinearConnectionTokenUpdate = Omit<UpdateLinearConnectionTokensInput, "connectionId">;
 
-export type LinearConnectionRefreshOperation<T> = (
-  connection: LinearConnectionRecord | undefined,
-  updateTokens: (input: LinearConnectionTokenUpdate) => Promise<void>,
-  query?: QueryHandle,
-) => Promise<T>;
+export interface LinearConnectionRefreshOperation<T> {
+  (
+    connection: LinearConnectionRecord | undefined,
+    updateTokens: (input: LinearConnectionTokenUpdate) => Promise<void>,
+    query?: QueryHandle,
+  ): Promise<T>;
+  requireReadCommitted?: true;
+}
 
 export type DisconnectConnectionResult =
   | { provider: "github" }

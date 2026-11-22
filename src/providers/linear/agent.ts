@@ -5,7 +5,7 @@ import {
   type PilotHistoryScope,
 } from "../../linear-pilot/history-read.js";
 import type { QueryHandle } from "../../db/runtime/index.js";
-import type { LinearConnectionRecord } from "../../db/types.js";
+import type { LinearConnectionRecord, LinearConnectionRefreshOperation } from "../../db/types.js";
 import {
   hasRequiredLinearScopes,
   hasUsableLinearAccessToken,
@@ -257,29 +257,28 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
     if (!hasUsableLinearAccessToken(initial, now())) {
       // Keep the ordinary authorizer outside the lease so it cannot wait for its own connection.
       await authorize();
-      await options.withLinearConnectionRefresh(
-        binding.linearOrganizationId,
-        async (row, update, query) => {
+      const refresh: LinearConnectionRefreshOperation<void> = async (row, update, query) => {
+        checkSignal();
+        const current = checkConnection(row);
+        checkPayloadCredentials(serializedInput, current);
+        if (hasUsableLinearAccessToken(current, now())) return;
+        const { refreshToken } = current;
+        if (refreshToken === null) throw new LinearAgentError("reauthorize");
+        if (options.authorizeRefresh !== undefined) {
+          if (query === undefined) throw new LinearAgentError("policy_required");
+          const authorized = await options.authorizeRefresh(query, binding, operation, signal);
           checkSignal();
-          const current = checkConnection(row);
-          checkPayloadCredentials(serializedInput, current);
-          if (hasUsableLinearAccessToken(current, now())) return;
-          const { refreshToken } = current;
-          if (refreshToken === null) throw new LinearAgentError("reauthorize");
-          if (options.authorizeRefresh !== undefined) {
-            if (query === undefined) throw new LinearAgentError("policy_required");
-            const authorized = await options.authorizeRefresh(query, binding, operation, signal);
-            checkSignal();
-            if (authorized !== true) throw new LinearAgentError("policy_required");
-          }
-          const refreshed = await providerRequest(
-            () => options.connectionClient.refresh(refreshToken, signal),
-            signal,
-          );
-          // A successful refresh can rotate the token even when a caller cancels.
-          await update(refreshed);
-        },
-      );
+          if (authorized !== true) throw new LinearAgentError("policy_required");
+        }
+        const refreshed = await providerRequest(
+          () => options.connectionClient.refresh(refreshToken, signal),
+          signal,
+        );
+        // A successful refresh can rotate the token even when a caller cancels.
+        await update(refreshed);
+      };
+      if (options.authorizeRefresh !== undefined) refresh.requireReadCommitted = true;
+      await options.withLinearConnectionRefresh(binding.linearOrganizationId, refresh);
     }
 
     await authorize();

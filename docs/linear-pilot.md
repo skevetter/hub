@@ -24,6 +24,19 @@ The signed event must prove who initiated the session. Hub uses the existing
 [Linear reply sanitizer](linear-reply.md) for the final answer from the proven
 turn.
 
+## Isolation assumption
+
+The pilot assumes Read Committed, the PostgreSQL default and the production
+setting. The refresh lease sets it explicitly.
+
+If the isolation setting changes, harden these two sites.
+
+1. Retirement owner read after the session row lock.
+   [postgres-store.ts:651](../src/interactive-sessions/postgres-store.ts#L651)
+2. Reservation owner and capacity reads after the advisory locks.
+   [postgres-store.ts:215](../src/interactive-sessions/postgres-store.ts#L215),
+   [postgres-store.ts:805](../src/interactive-sessions/postgres-store.ts#L805)
+
 ## Follow-up messages
 
 Reply in the same Linear panel after the prior answer. Hub starts a fresh
