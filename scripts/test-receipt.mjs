@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants, createReadStream, realpathSync, writeFileSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, open, rename, rm, writeFile } from "node:fs/promises";
+import { constants, createReadStream, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { copyFile, mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -249,19 +249,20 @@ export async function recordTestRun(directory, command, { stdio = "inherit", sig
           throw error;
       },
     );
-    if (signal?.aborted) {
-      code = 1;
-      entry.exitCode = code;
-      if (commands.length === previous.length) return { code, path: null };
-    }
+    if (signal?.aborted) return { code: 1, path: null };
+    await rm(temp, { recursive: true });
+    temp = undefined;
     commands.push(entry);
     const payload = { version: 4, head, tree, cleanTree: true, commands };
     const data = { ...payload, sha256: receiptHash(payload) };
+    let published = false;
     try {
       await writeFile(pending, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-      await rename(pending, destination);
+      if (signal?.aborted) return { code: 1, path: null };
+      renameSync(pending, destination);
+      published = true;
     } finally {
-      await rm(pending, { force: true });
+      if (!published) await rm(pending, { force: true });
     }
     if (metricsError) throw metricsError;
     return { code, path: destination };
