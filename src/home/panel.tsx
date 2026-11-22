@@ -338,19 +338,21 @@ function ThingsToTry({ snapshot, base }: { snapshot: HomeSnapshot; base: string 
             </Button>
           )}
         </div>
-        <ul aria-label={`${surface.label} examples`} className="grid gap-4">
-          {surface.examples.map((example) => (
-            <li key={example.title} className="grid min-w-0 gap-1.5">
-              <CopyField
-                prose
-                label={example.title}
-                value={example.prompt}
-                copyLabel={`Copy the prompt: ${example.title}`}
-              />
-              <p className="text-xs text-muted-foreground">{example.description}</p>
-            </li>
-          ))}
-        </ul>
+        {surface.examples.length === 0 ? null : (
+          <ul aria-label={`${surface.label} examples`} className="grid gap-4">
+            {surface.examples.map((example) => (
+              <li key={example.title} className="grid min-w-0 gap-1.5">
+                <CopyField
+                  prose
+                  label={example.title}
+                  value={example.prompt}
+                  copyLabel={`Copy the prompt: ${example.title}`}
+                />
+                <p className="text-xs text-muted-foreground">{example.description}</p>
+              </li>
+            ))}
+          </ul>
+        )}
       </Card>
     </Section>
   );
