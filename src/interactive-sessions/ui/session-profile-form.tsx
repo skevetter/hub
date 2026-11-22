@@ -111,7 +111,6 @@ export function SessionProfileForm({
           <FormField
             id={fieldId + "-name"}
             label="Name"
-            description="People pick this when they start a session."
             kind="text"
             name="name"
             required
@@ -314,13 +313,7 @@ function DaemonField({
   const { daemons, options } = daemon;
   return (
     <>
-      <FormField
-        id={id}
-        label="Daemon"
-        description="The connected machine that runs the agent."
-        required
-        disabled={disabled}
-      >
+      <FormField id={id} label="Daemon" required disabled={disabled}>
         {(control) => (
           <Combobox
             {...control}
@@ -465,42 +458,44 @@ function AgentFields({
   return (
     <>
       <CatalogStatus catalog={catalog} hasProviders={providers.length > 0} />
-      <ProfileSelect
-        id={fieldId + "-provider"}
-        label="Provider"
-        options={providers}
-        value={settings.provider}
-        onChange={agent.changeProvider}
-        disabled={busy || providers.length === 0}
-        required
-      />
-      <ProfileSelect
-        id={fieldId + "-model"}
-        label="Model"
-        options={models}
-        value={settings.model}
-        onChange={agent.changeModel}
-        disabled={disabled}
-      />
-      <ProfileSelect
-        id={fieldId + "-mode"}
-        label="Mode"
-        description="Controls the agent's permission mode."
-        options={modes}
-        value={settings.mode}
-        onChange={agent.changeMode}
-        disabled={disabled}
-        required={agent.explicitMode}
-      />
-      <ProfileSelect
-        id={fieldId + "-thinking"}
-        label="Thinking"
-        description="Choose a thinking setting if the model supports one."
-        options={thinking}
-        value={settings.thinking}
-        onChange={agent.changeThinking}
-        disabled={disabled}
-      />
+      <div className="grid min-w-0 grid-cols-2 gap-4">
+        <ProfileSelect
+          id={fieldId + "-provider"}
+          label="Provider"
+          options={providers}
+          value={settings.provider}
+          onChange={agent.changeProvider}
+          disabled={busy || providers.length === 0}
+          required
+        />
+        <ProfileSelect
+          id={fieldId + "-model"}
+          label="Model"
+          options={models}
+          value={settings.model}
+          onChange={agent.changeModel}
+          disabled={disabled}
+        />
+        <ProfileSelect
+          id={fieldId + "-mode"}
+          label="Mode"
+          description="Controls the agent's permission mode."
+          options={modes}
+          value={settings.mode}
+          onChange={agent.changeMode}
+          disabled={disabled}
+          required={agent.explicitMode}
+        />
+        <ProfileSelect
+          id={fieldId + "-thinking"}
+          label="Thinking"
+          description="Choose a thinking setting if the model supports one."
+          options={thinking}
+          value={settings.thinking}
+          onChange={agent.changeThinking}
+          disabled={disabled}
+        />
+      </div>
       {settings.mode === "full" ? (
         <>
           <WarningAlert title="Full access">
