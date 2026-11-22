@@ -59,6 +59,7 @@ export function FailureAlert({
   details,
   onRetry,
   focusOnArrival = false,
+  passive = false,
   standalone = false,
 }: {
   title: string;
@@ -77,6 +78,7 @@ export function FailureAlert({
    * no name.
    */
   focusOnArrival?: boolean;
+  passive?: boolean;
   /** Set when the alert stands in a page stack rather than inside a form, dialog, or section. */
   standalone?: boolean;
 }) {
@@ -89,6 +91,7 @@ export function FailureAlert({
     <Alert
       ref={alert}
       variant="destructive"
+      role={passive ? undefined : "alert"}
       icon={WARNING_GLYPH}
       title={title}
       className={standaloneClass(standalone)}

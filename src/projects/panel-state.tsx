@@ -2,7 +2,7 @@
 import { useSnapshotQuery, type Snapshot } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import type { ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { FailureAlert } from "../components/app/failure-alert.js";
 import { PanelSkeleton } from "../components/app/loading.js";
 import type { Result } from "../contract/respond.js";
@@ -19,19 +19,18 @@ import { organizationSnapshot, projectSnapshot } from "./functions.js";
 export type OrganizationSnapshot = Awaited<ReturnType<ProjectDashboard["organizationSnapshot"]>>;
 export type ProjectSnapshot = Awaited<ReturnType<ProjectDashboard["projectSnapshot"]>>;
 
-export function useOrganizationSnapshot(pending?: ReactNode) {
+export function useOrganizationSnapshot() {
   const tenant = useRouteTenant();
   const load = useServerFn(organizationSnapshot);
+  const queryKey = useMemo(
+    () => ["organization", tenant.account.id, tenant.organization.id],
+    [tenant.account.id, tenant.organization.id],
+  );
   const query = useSnapshotQuery({
-    queryKey: ["organization", tenant.account.id, tenant.organization.id],
+    queryKey,
     queryFn: () => load({ data: { organizationSlug: tenant.organization.slug } }),
   });
-  return {
-    ...queryState<OrganizationSnapshot>(query, "Organization unavailable", pending),
-    status: query.status,
-    error: query.error,
-    refetch: query.refetch,
-  };
+  return { ...query, queryKey };
 }
 
 export function useProjectSnapshot() {
