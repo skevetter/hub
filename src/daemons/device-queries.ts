@@ -1,11 +1,11 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { listSessionProfiles } from "../interactive-sessions/functions.js";
 import { useSnapshotQuery } from "../queries/index.js";
 import { deviceProviders, deviceStatus, profilesByDaemon } from "./device-details.js";
 import { daemonProviderSnapshot, type BrowserDaemon } from "./functions.js";
-import type { ProviderReadLimiter } from "./provider-read-limiter.js";
+import { ProviderReadTimeout, type ProviderReadLimiter } from "./provider-read-limiter.js";
 
 const PROVIDER_POLL_INTERVAL_MS = 2_000;
 const MAX_PROVIDER_READS = 16;
@@ -19,7 +19,7 @@ export function useDeviceProviders(
 ) {
   const read = useServerFn(daemonProviderSnapshot);
   const connected = deviceStatus(daemon) === "connected";
-  const query = useQuery({
+  const query = useQuery<ReturnType<typeof deviceProviders>>({
     queryKey: [
       "daemon-device-providers",
       accountId,
@@ -27,10 +27,14 @@ export function useDeviceProviders(
       daemon.id,
       daemon.connectedAt,
     ],
-    enabled: connected,
+    enabled: ({ state }) => connected && !(state.error instanceof ProviderReadTimeout),
+    retry: (failures, error) => !(error instanceof ProviderReadTimeout) && failures < 3,
     queryFn: ({ signal }) =>
-      schedule(signal, async () => {
-        const result = await read({ data: { organizationSlug, daemonId: daemon.id }, signal });
+      schedule(signal, async (requestSignal) => {
+        const result = await read({
+          data: { organizationSlug, daemonId: daemon.id },
+          signal: requestSignal,
+        });
         if (result.status === "error") throw new Error(result.error.message);
         return deviceProviders(result.data.entries);
       }),
@@ -41,16 +45,23 @@ export function useDeviceProviders(
         ? PROVIDER_POLL_INTERVAL_MS
         : false,
   });
-  const { data, isPending } = query;
+  const { data, error, isFetching, isPending, refetch } = query;
+  const retry = useCallback(() => {
+    void refetch({ cancelRefetch: false });
+  }, [refetch]);
   return useMemo(() => {
     if (!connected || isPending) return undefined;
+    if (error instanceof ProviderReadTimeout) {
+      if (isFetching) return undefined;
+      return { labels: NO_LABELS, message: error.message, onRetry: retry };
+    }
     if (data === undefined)
       return { labels: NO_LABELS, message: "Provider information is unavailable." };
     return {
       labels: data.labels,
       message: data.discovering ? "The daemon is still checking for providers." : null,
     };
-  }, [connected, data, isPending]);
+  }, [connected, data, error, isFetching, isPending, retry]);
 }
 
 export function useDeviceProfiles(enabled: boolean, accountId: string, organizationSlug: string) {
