@@ -129,7 +129,12 @@ function ProfileTable({
     [busy, create],
   );
   const empty = useMemo(
-    () => ({ title: "No session profiles yet", action: createButton }),
+    () => ({
+      title: "No session profiles yet",
+      description:
+        "A profile sets the daemon, folder and agent a session uses. Create one so people can start sessions.",
+      action: createButton,
+    }),
     [createButton],
   );
 
@@ -196,7 +201,7 @@ function ProfileRow({
           {profile.name}
         </span>
         <div className="lg:hidden">
-          <TwoLine primary={profile.name} secondary={daemon} />
+          <TwoLine primary={profile.name} secondary={`${profile.provider} on ${daemon}`} />
         </div>
       </DataCell>
       <DataCell>{daemon}</DataCell>
