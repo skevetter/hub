@@ -222,15 +222,18 @@ ${run}`;
       snapshot.triggers.find(({ name }) => name === "agent-reply"),
       {
         event: "github.issue_comment_created",
-        hasReplyOutput: true,
+        commentEvents: [
+          {
+            on: "github.issue_comment_created",
+            hasReplyOutput: true,
+            commentPrefix: null,
+          },
+        ],
       },
     );
-    assert.equal(
-      Object.hasOwn(
-        snapshot.triggers.find(({ name }) => name === "script-no-reply") ?? {},
-        "hasReplyOutput",
-      ),
-      false,
+    assert.deepEqual(
+      snapshot.triggers.find(({ name }) => name === "script-no-reply")?.commentEvents,
+      [{ on: "github.issue_comment_created", hasReplyOutput: false, commentPrefix: null }],
     );
   });
 
