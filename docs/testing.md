@@ -27,9 +27,11 @@ Each shard gets its own temporary directory, application data and Vite cache. Mi
 using the caller's installed tools so child commands such as `python3` can start with the same
 toolchain.
 
-After a sharded failure or interruption, `npm run test:parallel -- --rerun-failed` runs the
-recorded failed and unfinished files in one process. Interrupted runs show how many files did not
-report in a separate line. A failure that passes on rerun can be sensitive to machine load.
+After a sharded failure or interruption, `npm run test:parallel -- --rerun-failed` runs every
+file from the affected shards in one process. A passing rerun requires a zero exit and a complete
+passing report for those files. Run the parallel suite again if the retry list came from an older
+runner. Interrupted runs show how many files did not report in a separate line. A failure that
+passes on rerun can be sensitive to machine load.
 
 The test commands and runtime-file map generator print the target root, branch, HEAD, worktree
 status, current directory and planned action. Calling a script by path from a different Git

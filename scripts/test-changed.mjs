@@ -392,7 +392,8 @@ async function main(signal) {
       });
       if (result !== 0) return result;
       const fullRun = await readTestMetrics(metrics, root, head);
-      if (!fullRun) throw new Error("The parallel runner did not publish test metrics.");
+      if (!fullRun?.selectedFiles.length)
+        throw new Error("The parallel runner did not publish metrics for any test files.");
       completed = { files: fullRun.selectedFiles, counts: fullRun.counts };
     } else {
       const direct = await selectedVitest(
@@ -403,14 +404,14 @@ async function main(signal) {
         env,
       );
       printTests(direct, (path) => plan.tests.get(path) ?? "Vitest path match");
-      const files = direct.files.map(({ path }) => path);
-      const reported = new Set(files);
-      const missing = [...plan.tests.keys()].filter((path) => !reported.has(path));
-      if (missing.length)
-        throw new Error(`Vitest did not report these selected files: ${missing.join(", ")}`);
-      if (direct.code !== 0) return direct.code;
-      completed = { files, counts: direct.counts };
+      code = direct.code;
+      completed = { files: direct.files.map(({ path }) => path), counts: direct.counts };
     }
+    const reported = new Set(completed.files);
+    const missing = [...plan.tests.keys()].filter((path) => !reported.has(path));
+    if (missing.length)
+      throw new Error(`Vitest did not report these selected files: ${missing.join(", ")}`);
+    if (code !== 0) return code;
   } finally {
     try {
       if (temp) await rm(temp, { recursive: true });
