@@ -1,5 +1,9 @@
 import ts from "typescript";
-import { generateRuntimeMap, readRuntimeInputs } from "./generate-test-runtime-files.mjs";
+import {
+  formatRuntimeMap,
+  generateRuntimeMap,
+  readRuntimeInputs,
+} from "./generate-test-runtime-files.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
@@ -8,6 +12,7 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { git } from "./test-context.mjs";
 import { combinePaths, resolveBase, selectTests } from "./test-changed.mjs";
@@ -84,8 +89,13 @@ test("runtime SQL selects the migration tests outside the touched folder", () =>
   }
 });
 
-test("the checked-in map covers Vitest runtime reads", () => {
+test("the checked-in map covers Vitest runtime reads", async () => {
   assert.deepEqual(generateRuntimeMap(), runtimeFiles);
+  const root = fileURLToPath(new URL("../", import.meta.url));
+  assert.equal(
+    formatRuntimeMap(root, generateRuntimeMap(root)),
+    await readFile(join(root, "scripts/test-runtime-files.json"), "utf8"),
+  );
   assert.throws(
     () =>
       readRuntimeInputs(

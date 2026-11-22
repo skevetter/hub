@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join, posix } from "node:path";
@@ -166,13 +167,26 @@ export function generateRuntimeMap(directory = root) {
   );
 }
 
+// Format with the repository's oxfmt so a regenerated map passes format:check unchanged.
+export function formatRuntimeMap(directory, map) {
+  const result = spawnSync(
+    join(directory, "node_modules/.bin/oxfmt"),
+    ["--stdin-filepath=scripts/test-runtime-files.json"],
+    { cwd: directory, input: JSON.stringify(map), encoding: "utf8" },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0)
+    throw new Error(`oxfmt could not format the runtime map: ${result.stderr}`);
+  return result.stdout;
+}
+
 if (isEntrypoint(import.meta.url)) {
   try {
     const { values } = parseArgs({ options: { root: { type: "string" } } });
     const directory = repositoryFor(import.meta.url, values.root);
     printRunContext(directory, "generate scripts/test-runtime-files.json");
     const output = join(directory, "scripts/test-runtime-files.json");
-    writeFileSync(output, `${JSON.stringify(generateRuntimeMap(directory), null, 2)}\n`);
+    writeFileSync(output, formatRuntimeMap(directory, generateRuntimeMap(directory)));
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;
