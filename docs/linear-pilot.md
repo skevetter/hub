@@ -29,13 +29,19 @@ turn.
 The pilot assumes Read Committed, the PostgreSQL default and the production
 setting. The refresh lease sets it explicitly.
 
-If the isolation setting changes, harden these two sites.
+If the isolation setting changes, harden these three sites.
 
 1. Retirement owner read after the session row lock.
    [postgres-store.ts:651](../src/interactive-sessions/postgres-store.ts#L651)
 2. Reservation owner and capacity reads after the advisory locks.
    [postgres-store.ts:215](../src/interactive-sessions/postgres-store.ts#L215),
    [postgres-store.ts:805](../src/interactive-sessions/postgres-store.ts#L805)
+3. Binding admission and advance run `sessionHasBinding` after `lockMutation`.
+   A Repeatable Read snapshot taken before the lock wait could miss a binding
+   the lock holder just wrote.
+   [binding.ts:348](../src/linear-pilot/binding.ts#L348),
+   [binding.ts:401](../src/linear-pilot/binding.ts#L401),
+   [binding.ts:424](../src/linear-pilot/binding.ts#L424)
 
 ## Follow-up messages
 

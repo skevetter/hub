@@ -174,6 +174,7 @@ async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgre
       reportFailure: pilotFailure,
     });
     const agents = new FakeAgents();
+    const reportCoordinatorFailure = vi.fn();
     const coordinator = new InteractiveSessionCoordinator({
       database,
       entitlements: {
@@ -185,7 +186,8 @@ async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgre
       bus: new SessionEventBus(),
       settings: { ...readInteractiveSessionSettings({}), enabled: true },
       instanceId: randomUUID(),
-      reportFailure: vi.fn(),
+      reportFailure: reportCoordinatorFailure,
+      ...(scenario === "stop-race" ? { shutdownTimeoutMs: 1_000 } : {}),
       linearPilot: pilot.sessionHooks,
     });
     pilot.attachCoordinator(coordinator);
@@ -659,6 +661,11 @@ async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgre
           expect(drained).toBe(false);
           releasePublication.resolve();
           await shutdown;
+          expect(reportCoordinatorFailure).not.toHaveBeenCalledWith(
+            expect.objectContaining({ message: "Session coordinator shutdown deadline expired" }),
+            "interactive_session.shutdown",
+            expect.anything(),
+          );
         } finally {
           clearTimeout(deadline);
           releasePublication.resolve();
