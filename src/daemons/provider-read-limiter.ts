@@ -1,6 +1,16 @@
 const MAX_CONCURRENT_PROVIDER_READS = 4;
+const PROVIDER_READ_DEADLINE_MS = 15_000;
 
-export type ProviderReadLimiter = <T>(signal: AbortSignal, read: () => Promise<T>) => Promise<T>;
+export class ProviderReadTimeout extends Error {
+  constructor() {
+    super("This daemon did not answer.");
+  }
+}
+
+export type ProviderReadLimiter = <T>(
+  signal: AbortSignal,
+  read: (signal: AbortSignal) => Promise<T>,
+) => Promise<T>;
 
 export function createProviderReadLimiter(): ProviderReadLimiter {
   const queue = new Set<() => void>();
@@ -29,14 +39,25 @@ export function createProviderReadLimiter(): ProviderReadLimiter {
 
       function start() {
         signal.removeEventListener("abort", cancel);
-        // An aborted request still occupies a slot until its transport settles.
-        void Promise.resolve()
-          .then(() => {
-            signal.throwIfAborted();
-            return read();
-          })
+        const deadline = new AbortController();
+        const requestSignal = AbortSignal.any([signal, deadline.signal]);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, rejectTimeout) => {
+          timer = setTimeout(() => {
+            const error = new ProviderReadTimeout();
+            rejectTimeout(error);
+            deadline.abort(error);
+          }, PROVIDER_READ_DEADLINE_MS);
+        });
+        const response = Promise.resolve().then(() => {
+          requestSignal.throwIfAborted();
+          return read(requestSignal);
+        });
+        // A transport that ignores abort cannot keep a slot beyond the deadline.
+        void Promise.race([response, timeout])
           .then(resolve, reject)
           .finally(() => {
+            clearTimeout(timer);
             running--;
             dispatch();
           });

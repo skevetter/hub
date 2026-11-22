@@ -448,3 +448,60 @@ test("withholds cached daemon data while the route tenant still belongs to the p
   await expect(profile).toHaveCount(0);
   await expect(actions(daemons, "shared-device")).toHaveCount(0);
 });
+
+test("lets a fifth provider read start after four deadlines and retries only on request", async ({
+  hub,
+  page,
+}) => {
+  test.setTimeout(90_000);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const responsive = await hub.connectProviderDaemon("owner", "Acme");
+  const ids: string[] = [];
+  for (let index = 0; index < 4; index++) {
+    ids.push(await hub.seedDaemonSlug("owner", `aaa-stalled-${index}`));
+  }
+  await hub
+    .primaryApplication()
+    .query(
+      "update daemons set presence = 'connected', connected_at = now() where slug like 'aaa-stalled-%'",
+      [],
+    );
+
+  await page.clock.install();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const requests: string[] = [];
+  await page.route("**/_serverFn/**", async (route) => {
+    const url = decodeURIComponent(route.request().url());
+    const id = ids.find((candidate) => url.includes(candidate));
+    if (id === undefined) return route.continue();
+    const first = !requests.includes(id);
+    requests.push(id);
+    if (!first) return route.abort();
+    await held;
+    await route.abort();
+  });
+  const daemons = new OrganizationDaemons(page);
+  try {
+    await daemons.open();
+    const online = daemons.device(responsive);
+    await expect(online.getByText("Loading providers...")).toBeVisible();
+    await expect.poll(() => requests.length).toBe(4);
+    await page.clock.fastForward(15_100);
+    await expect.soft(online.getByText(/OpenCode.*Codex|Codex.*OpenCode/u)).toBeVisible({
+      timeout: 5_000,
+    });
+    const timedOut = daemons.device("aaa-stalled-0");
+    await expect(timedOut.getByText("This daemon did not answer.")).toBeVisible({
+      timeout: 1_000,
+    });
+    expect(requests).toHaveLength(4);
+    await timedOut.getByRole("button", { name: "Try again", exact: true }).click();
+    await expect.poll(() => requests.filter((id) => id === ids[0]).length).toBe(2);
+  } finally {
+    release();
+  }
+});
