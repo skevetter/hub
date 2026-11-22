@@ -127,7 +127,8 @@ async function readJson(path) {
   }
 }
 
-export async function publishTestMetrics(results, checks = [], directory = process.cwd()) {
+export function publishTestMetrics(results, checks = [], directory = process.cwd(), signal) {
+  signal?.throwIfAborted();
   const report = process.env[reportVariable];
   if (!report) return;
   const root = realpathSync(directory);
@@ -137,9 +138,9 @@ export async function publishTestMetrics(results, checks = [], directory = proce
   for (const result of results) {
     for (const key of Object.keys(counts)) counts[key] += result.counts[key];
   }
-  await writeFile(report, JSON.stringify({ root, head, selectedFiles, counts, checks }), {
-    flag: "wx",
-  });
+  const data = JSON.stringify({ root, head, selectedFiles, counts, checks });
+  signal?.throwIfAborted();
+  writeFileSync(report, data, { flag: "wx" });
 }
 
 function validateMetrics(metrics, testedRoot, testedHead) {

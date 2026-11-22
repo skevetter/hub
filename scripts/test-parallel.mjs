@@ -318,7 +318,7 @@ async function readFailedFiles(failedFileList, files) {
   return failed;
 }
 
-async function main() {
+async function main(signal) {
   const { values } = parseArgs({
     options: { root: { type: "string" }, "rerun-failed": { type: "boolean" } },
   });
@@ -336,9 +336,7 @@ async function main() {
     throw new Error("TEST_SHARDS must be a positive integer.");
   }
   let lock;
-  const { signal, close } = watchTestSignals();
   let runDirectory;
-  let exitCode = 1;
   try {
     lock = await takeFullSuiteLock();
     runDirectory = await mkdtemp(join(tmpdir(), "hub-tests-"));
@@ -360,6 +358,12 @@ async function main() {
       throw new Error("Vitest did not discover a unique set of test files.");
     }
     const runs = [];
+    const publishSuccess = async () => {
+      signal.throwIfAborted();
+      await rm(runDirectory, { recursive: true });
+      runDirectory = undefined;
+      publishTestMetrics(runs, [], root, signal);
+    };
     const execute = async (name, selected) => {
       const result = await executeFiles(
         root,
@@ -377,10 +381,7 @@ async function main() {
         await readFailedFiles(failedFileList, files),
         async (name, selected) => {
           const result = await execute(name, selected);
-          if (result.exitCode === 0 && !signal.aborted) {
-            await publishTestMetrics(runs, [], root);
-            await rm(runDirectory, { recursive: true });
-          }
+          if (result.exitCode === 0 && !signal.aborted) await publishSuccess();
           return result;
         },
         console.log,
@@ -394,44 +395,37 @@ async function main() {
     const result = await runShards(groups, {
       execute,
       print: console.log,
-      signal: signal,
+      signal,
     });
-    exitCode = signal.aborted ? 1 : result.exitCode;
     console.log(
       `Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`,
     );
     if (result.failedFiles.length) await writeJson(failedFileList, result.failedFiles);
-    if (exitCode === 0) {
+    if (result.exitCode === 0 && !signal.aborted) {
       await updateTimingCache(parallelCache, runDirectory, groups.length);
-      await publishTestMetrics(runs, [], root);
-    } else {
-      console.log(`Run logs: ${runDirectory}`);
+      await publishSuccess();
     }
-    return exitCode;
-  } catch (error) {
-    if (signal.aborted) console.log(`INTERRUPTED: ${signal.reason}`);
-    throw error;
+    return result.exitCode;
   } finally {
-    try {
-      if (exitCode === 0 && runDirectory) await rm(runDirectory, { recursive: true });
-    } finally {
-      try {
-        lock?.release();
-      } finally {
-        close();
-      }
-    }
+    if (runDirectory && !values["rerun-failed"]) console.log(`Run logs: ${runDirectory}`);
+    lock?.release();
   }
 }
 
 if (isEntrypoint(import.meta.url)) {
-  main().then(
-    (exitCode) => {
-      process.exitCode = exitCode;
-    },
-    (error) => {
-      if (error instanceof Error) console.error(error.message);
-      process.exitCode = 1;
-    },
-  );
+  const { signal, close } = watchTestSignals();
+  main(signal)
+    .then(
+      (code) => {
+        process.exitCode = signal.aborted ? 1 : code;
+      },
+      (error) => {
+        if (error !== signal.reason && error instanceof Error) console.error(error.message);
+        process.exitCode = 1;
+      },
+    )
+    .finally(() => {
+      if (signal.aborted) console.log(`INTERRUPTED: ${signal.reason}`);
+      close();
+    });
 }
