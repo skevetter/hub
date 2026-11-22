@@ -238,11 +238,16 @@ test("keeps the initial failure passive and announces the result of retrying", a
   const retry = page.getByRole("button", { name: "Try again" });
   await expect(retry).toBeVisible();
   await expect(page.getByRole("main").getByRole("alert")).toHaveCount(0);
-  await retry.click();
+  await tabThrough(page, [retry]);
+  await page.keyboard.press("Enter");
+  const loading = page.getByRole("region", { name: "Loading connections" });
+  await expect(loading).toBeFocused();
   await expect(page.getByRole("main").getByRole("alert")).toContainText("unavailable");
+  await expect(retry).toBeFocused();
   refresh.release();
-  await retry.click();
+  await page.keyboard.press("Enter");
   await expect(connections.card("GitHub")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Connections", level: 1 })).toBeFocused();
   await expect(page.getByRole("status").filter({ hasText: "Connections loaded." })).toBeVisible();
 });
 

@@ -6,7 +6,15 @@ import {
 } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { useActiveAccount } from "../auth/active-account.js";
 import { CONNECTION_MUTATION_KEY } from "../auth/tenant-mutation.js";
 import { Card, CardSkeleton } from "../components/app/card.js";
@@ -46,6 +54,7 @@ import {
 import { useConnectionReturn } from "./result.js";
 import type { ProviderConnectionStatus } from "./status.js";
 
+const HEADING_ID = "connections-heading";
 const GRID_COLUMNS = "sm:grid-cols-2";
 const ACCESS_FORMAT = new Intl.ListFormat("en");
 
@@ -91,13 +100,24 @@ const ACTION_VERBS = {
   suspended: "Reconnect",
 };
 
-function ConnectionsLoading() {
-  return (
+function ConnectionsLoading({ focus = false }: { focus?: boolean }) {
+  const region = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (focus) region.current?.focus();
+  }, [focus]);
+  const skeletons = (
     <Section className={GRID_COLUMNS}>
       {PROVIDER_CARDS.map(({ provider }) => (
         <CardSkeleton key={provider} />
       ))}
     </Section>
+  );
+  return focus ? (
+    <div ref={region} role="region" aria-label="Loading connections" tabIndex={-1}>
+      {skeletons}
+    </div>
+  ) : (
+    skeletons
   );
 }
 
@@ -106,6 +126,7 @@ export function OrganizationConnectionsPanel() {
   return (
     <>
       <PageHeader
+        id={HEADING_ID}
         title="Connections"
         description="These services let Hub receive events and post replies for your organization."
       />
@@ -174,23 +195,37 @@ function ConnectionsContent() {
     ],
     [connect.data, connect.isError, disconnect.data, disconnect.isError],
   );
+  const restoreRetryFocus = useRef(false);
   const retry = useCallback(() => {
+    restoreRetryFocus.current = true;
     setRetryState("pending");
     void Promise.all([
       queryClient.refetchQueries({ queryKey: snapshot.queryKey, exact: true }),
       queryClient.refetchQueries({ queryKey: statusKey, exact: true }),
     ]).then(() => setRetryState("complete"));
   }, [queryClient, snapshot.queryKey, statusKey]);
-  if (retryState === "pending") {
+  const failure = connectionReadFailure(snapshot, statusQuery, refresh);
+  const ready = snapshot.status === "success" && statusQuery.status === "success";
+  const focusRetryButton = useCallback((button: HTMLButtonElement | null) => {
+    if (button === null || !restoreRetryFocus.current) return;
+    restoreRetryFocus.current = false;
+    button.focus();
+  }, []);
+  const retrySucceeded = retryState === "complete" && failure === undefined && ready;
+  useEffect(() => {
+    if (!retrySucceeded || !restoreRetryFocus.current) return;
+    restoreRetryFocus.current = false;
+    document.getElementById(HEADING_ID)?.focus();
+  }, [retrySucceeded]);
+
+  if (retryState !== "idle" && (retryState === "pending" || (!ready && failure === undefined))) {
     return (
       <>
         <StatusLine>{null}</StatusLine>
-        {loading}
+        <ConnectionsLoading focus />
       </>
     );
   }
-
-  const failure = connectionReadFailure(snapshot, statusQuery, refresh);
   if (failure !== undefined) {
     return (
       <FailureAlert
@@ -199,10 +234,11 @@ function ConnectionsContent() {
         fallback={`${failure.title}.`}
         passive={retryState === "idle" && revocation === undefined}
         onRetry={retry}
+        retryRef={focusRetryButton}
       />
     );
   }
-  if (snapshot.status !== "success" || statusQuery.status !== "success") return loading;
+  if (!ready) return loading;
 
   const data = snapshot.data;
   const canManage = data.capabilities.manageResources;
