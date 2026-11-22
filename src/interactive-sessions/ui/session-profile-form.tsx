@@ -8,6 +8,7 @@ import { FailureAlert, WarningAlert } from "../../components/app/failure-alert.j
 import { FormDialog } from "../../components/app/form-dialog.js";
 import { FormField } from "../../components/app/form-field.js";
 import { LoadingLine } from "../../components/app/loading.js";
+import { Section } from "../../components/app/section.js";
 import { Button } from "../../components/ui/button.js";
 import {
   Select,
@@ -105,36 +106,44 @@ export function SessionProfileForm({
       busy={busy}
       onSubmit={submit}
     >
-      <FormField
-        id={fieldId + "-name"}
-        label="Name"
-        description="People pick this when they start a session."
-        kind="text"
-        name="name"
-        required
-        maxLength={80}
-        defaultValue={profile?.name ?? ""}
-      />
-      <DaemonField
-        id={fieldId + "-daemon"}
-        value={daemonId}
-        daemon={daemon}
-        onChange={chooseDaemon}
-        disabled={busy}
-      />
-      <FormField
-        id={fieldId + "-cwd"}
-        label="Working directory"
-        description="An absolute folder on the daemon. The agent starts here."
-        kind="text"
-        name="cwd"
-        required
-        maxLength={1024}
-        value={cwd}
-        onChange={setCwd}
-      />
-      <WorktreeFields profile={profile} />
-      <AgentFields agent={agent} catalog={daemon.catalog} busy={busy} />
+      <Section title="Where it runs">
+        <div className="grid gap-4">
+          <FormField
+            id={fieldId + "-name"}
+            label="Name"
+            description="People pick this when they start a session."
+            kind="text"
+            name="name"
+            required
+            maxLength={80}
+            defaultValue={profile?.name ?? ""}
+          />
+          <DaemonField
+            id={fieldId + "-daemon"}
+            value={daemonId}
+            daemon={daemon}
+            onChange={chooseDaemon}
+            disabled={busy}
+          />
+          <FormField
+            id={fieldId + "-cwd"}
+            label="Working directory"
+            description="An absolute folder on the daemon. The agent starts here."
+            kind="text"
+            name="cwd"
+            required
+            maxLength={1024}
+            value={cwd}
+            onChange={setCwd}
+          />
+          <WorktreeFields profile={profile} />
+        </div>
+      </Section>
+      <Section title="Agent settings">
+        <div className="grid gap-4">
+          <AgentFields agent={agent} catalog={daemon.catalog} busy={busy} />
+        </div>
+      </Section>
       {error === undefined ? null : (
         <FailureAlert
           title="Could not save profile"
@@ -305,7 +314,13 @@ function DaemonField({
   const { daemons, options } = daemon;
   return (
     <>
-      <FormField id={id} label="Daemon" required disabled={disabled}>
+      <FormField
+        id={id}
+        label="Daemon"
+        description="The connected machine that runs the agent."
+        required
+        disabled={disabled}
+      >
         {(control) => (
           <Combobox
             {...control}
@@ -470,6 +485,7 @@ function AgentFields({
       <ProfileSelect
         id={fieldId + "-mode"}
         label="Mode"
+        description="Controls the agent's permission mode."
         options={modes}
         value={settings.mode}
         onChange={agent.changeMode}
@@ -479,6 +495,7 @@ function AgentFields({
       <ProfileSelect
         id={fieldId + "-thinking"}
         label="Thinking"
+        description="Choose a thinking setting if the model supports one."
         options={thinking}
         value={settings.thinking}
         onChange={agent.changeThinking}
@@ -545,6 +562,7 @@ function CatalogStatus({
 function ProfileSelect({
   id,
   label,
+  description,
   options,
   value,
   onChange,
@@ -553,6 +571,7 @@ function ProfileSelect({
 }: {
   id: string;
   label: string;
+  description?: string;
   options: readonly { id: string; label: string }[];
   value: string;
   onChange: (value: string) => void;
@@ -566,7 +585,13 @@ function ProfileSelect({
     [onChange],
   );
   return (
-    <FormField id={id} label={label} required={required} disabled={disabled}>
+    <FormField
+      id={id}
+      label={label}
+      {...(description === undefined ? {} : { description })}
+      required={required}
+      disabled={disabled}
+    >
       {(control) => (
         <Select value={selection} onValueChange={select} disabled={disabled} required={required}>
           <SelectTrigger {...control}>
