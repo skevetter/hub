@@ -1,6 +1,7 @@
 import type { AuthServer } from "../auth/server.js";
 import { capabilitiesFor } from "../auth/organization-policy.js";
 import { revisionBundleFiles } from "../configuration/store.js";
+import { grantedConnectionAccess, readConnectionDrops } from "../connections/read-model.js";
 import type { Database, ProjectActivityRunListRecord } from "../db/types.js";
 import { formatInvocationRejection } from "../triggers/invocation.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
@@ -44,10 +45,11 @@ export class ProjectDashboard {
 
   async organizationSnapshot(request: Request, scope: ProjectRouteScope) {
     const { account, tenant } = await this.resolve(request, organizationScope(scope));
-    const [projects, connections, daemons] = await Promise.all([
+    const [projects, connections, daemons, connectionDrops] = await Promise.all([
       this.database.listProjectsForOrganization(tenant.organization.id),
       this.database.organizationConnectionUsage(tenant.organization.id),
       this.database.listDaemonsForOrganization(tenant.organization.id),
+      readConnectionDrops(this.database, tenant.organization.id),
     ]);
     return {
       account: account.account,
@@ -57,6 +59,7 @@ export class ProjectDashboard {
       projects: projects.map(projectView),
       connections: connectionUsageView(connections),
       daemons: daemons.map(daemonView),
+      ...connectionDrops,
     };
   }
 
@@ -241,6 +244,7 @@ function connectionUsageView(
       teamId: connection.teamId,
       teamName: connection.teamName,
       requiresReauthorization: !hasRequiredSlackScopes(connection.scopes),
+      grantedAccess: grantedConnectionAccess("slack", connection.scopes),
     })),
     linear: connections.linear.map((connection) => ({
       id: connection.id,
@@ -248,6 +252,7 @@ function connectionUsageView(
       linearOrganizationId: connection.linearOrganizationId,
       linearOrganizationName: connection.linearOrganizationName,
       requiresReauthorization: linearConnectionRequiresReauthorization(connection),
+      grantedAccess: grantedConnectionAccess("linear", connection.scopes),
     })),
   };
 }

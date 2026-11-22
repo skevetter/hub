@@ -30,7 +30,7 @@ for (const width of [1280, 390]) {
       [ownerEmail],
     );
     await page.setViewportSize({ width, height: 900 });
-    const { navigation } = projectApp(page);
+    const { navigation, connections } = projectApp(page);
     const openSection = (section: "Activity" | "Home" | "Connections") =>
       width === 390
         ? navigation.openMobileOrganizationSection(section)
@@ -96,8 +96,16 @@ for (const width of [1280, 390]) {
     await expect(rows).toHaveCount(1);
 
     await openSection("Connections");
-    await page.getByRole("link", { name: "View dropped events in Activity" }).click();
-    await expect(page).toHaveURL(/\/activity\?view=dropped$/u);
+    await connections
+      .card("GitHub")
+      .getByRole("link", { name: "21 dropped events in the last 7 days" })
+      .click();
+    await expect(page).toHaveURL(/\/activity\?/u);
+    expect(Object.fromEntries(new URL(page.url()).searchParams)).toMatchObject({
+      view: "dropped",
+      range: "7d",
+      provider: "github",
+    });
     await expect(rows).toHaveCount(15);
     await view.getByRole("radio", { name: "Runs" }).click();
     await expect(page).toHaveURL(/\/activity$/u);
