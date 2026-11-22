@@ -4,6 +4,7 @@
     "src/run-stream/bundle-lifecycle.integration.test.ts",
     "src/run-stream/methods.built-server.integration.test.ts"
   ],
+  "docs/linear-pilot.md": ["src/linear-pilot/manual-close.integration.test.ts"],
   "docs/public-api.md": ["src/run-stream/built-server.integration.test.ts"],
   "docs/webhook-rollback.sql": ["src/auth/webhook-rollback.test.ts"],
   "docs/webhooks.md": ["src/public-api/webhook-docs.test.ts"],
