@@ -2,7 +2,7 @@ import { generateRuntimeMap, readRuntimeInputs } from "./generate-test-runtime-f
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { combinePaths, selectTests } from "./test-changed.mjs";
+import { combinePaths, resolveBase, selectTests } from "./test-changed.mjs";
 
 test("combines tracked and untracked paths without splitting names on whitespace", () => {
   assert.deepEqual(
@@ -118,4 +118,39 @@ test("coverage of the whole suite via the module graph is handed to the full run
   const plan = selectTests([path], discovered, new Set([path]), false, { graphFiles: discovered });
   assert.equal(plan.fullSuiteReason, "selection covers every Vitest file");
   assert.deepEqual([...plan.tests.keys()], discovered);
+});
+
+test("default base prefers origin main, local main, and the configured upstream in order", () => {
+  const bases = new Map([
+    ["origin/main", "remote-main"],
+    ["main", "local-main"],
+    ["fork/topic", "upstream"],
+  ]);
+  const git = (args) => (args[0] === "merge-base" ? (bases.get(args[2]) ?? null) : "fork/topic");
+  assert.equal(resolveBase(undefined, git).tree, "remote-main");
+  bases.delete("origin/main");
+  assert.equal(resolveBase(undefined, git).tree, "local-main");
+  bases.delete("main");
+  assert.equal(resolveBase(undefined, git).tree, "upstream");
+});
+
+test("default base uses the previous release in numeric version order", () => {
+  const refs = [
+    "refs/heads/release/notifications-9",
+    "refs/remotes/origin/release/notifications-10",
+    "refs/heads/release/notifications-22",
+    "refs/heads/release/notifications-23",
+  ];
+  const git = ([method, , ref]) => {
+    if (method === "symbolic-ref") return "release/notifications-22";
+    if (method === "for-each-ref") return refs.join("\n");
+    if (method === "merge-base" && refs.includes(ref)) return ref;
+    return null;
+  };
+  assert.equal(resolveBase(undefined, git).tree, refs[1]);
+  const explicit = resolveBase("HEAD", (args) => {
+    assert.deepEqual(args, ["rev-parse", "--verify", "--end-of-options", "HEAD^{tree}"]);
+    return "explicit-tree";
+  });
+  assert.deepEqual(explicit, { display: "HEAD", tree: "explicit-tree", kind: "tree" });
 });
