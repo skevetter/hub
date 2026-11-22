@@ -51,12 +51,16 @@ function printRun(print, name, files, result) {
   for (const file of result.failedFiles) print(`  ${name}: ${file}`);
 }
 
-export async function runShards(groups, { execute, print }) {
+function printInterrupted(print, signal, count) {
+  if (signal?.aborted) print(`INTERRUPTED: ${count} files did not report`);
+}
+
+export async function runShards(groups, { execute, print, signal }) {
   const outcomes = await Promise.allSettled(
     groups.map(async (files, index) => {
       const name = `Shard ${index + 1}`;
       let result = await execute(name, files);
-      if (result.exitCode !== 0 && !result.failedFiles.length) {
+      if (result.exitCode !== 0 && !result.failedFiles.length && !signal?.aborted) {
         result = {
           ...result,
           failedFiles: files,
@@ -69,37 +73,42 @@ export async function runShards(groups, { execute, print }) {
   );
   const total = { files: groups.flat().length, passed: 0, failed: 0, skipped: 0 };
   const failedFiles = [];
-  let exitCode = 0;
+  let interruptedFiles = 0;
+  let exitCode = Number(Boolean(signal?.aborted));
   for (const [index, outcome] of outcomes.entries()) {
     if (outcome.status === "rejected") {
       exitCode = 1;
       const files = groups[index];
       failedFiles.push(...files);
-      total.failed += files.length;
+      if (signal?.aborted && outcome.reason === signal.reason) interruptedFiles += files.length;
+      else total.failed += files.length;
       print(
-        `Shard ${index + 1}: FAIL. Runner error (${outcome.reason?.code ?? "unknown"}). Files without a result: ${files.join(", ")}`,
+        `Shard ${index + 1}: FAIL. Runner stopped (${outcome.reason?.code ?? outcome.reason}). Files without a result: ${files.join(", ")}`,
       );
       continue;
     }
     const result = outcome.value;
     if (result.exitCode !== 0) exitCode = 1;
     failedFiles.push(...result.failedFiles);
+    interruptedFiles += result.interruptedFiles ?? 0;
     for (const key of ["passed", "failed", "skipped"]) total[key] += result.counts[key];
   }
   print(
     `Total: ${total.files} files, ${total.passed} passed, ${total.failed} failed, ${total.skipped} skipped`,
   );
 
+  printInterrupted(print, signal, interruptedFiles);
   if (failedFiles.length) {
     print("Run npm run test:parallel -- --rerun-failed to recheck failed files serially.");
   }
   return { exitCode, failedFiles };
 }
 
-export async function rerunFiles(files, execute, print) {
+export async function rerunFiles(files, execute, print, signal) {
   const result = await execute("Serial rerun", files);
   printRun(print, "Serial rerun", files, result);
-  return result.exitCode;
+  printInterrupted(print, signal, result.interruptedFiles ?? 0);
+  return signal?.aborted ? 1 : result.exitCode;
 }
 
 async function readCachedResults(directory) {
@@ -215,7 +224,8 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
       exitCode: 1,
       durationMs,
       failedFiles: files,
-      counts: { passed: 0, failed: files.length, skipped: 0 },
+      interruptedFiles: signal.aborted ? files.length : 0,
+      counts: { passed: 0, failed: signal.aborted ? 0 : files.length, skipped: 0 },
       diagnostic: `Vitest exited without a readable JSON report (exit ${run.exitCode}, ${run.processError ?? "no signal"}). Files without a result: ${files.join(", ")}. See ${log}`,
     };
   }
@@ -248,16 +258,18 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
   if (extra.length) diagnostics.push(`Unexpected files in report: ${extra.join(", ")}`);
   if (exitCode) diagnostics.push(`See ${log} and ${reportPath}`);
   const failures = [...new Set([...failedFiles, ...missing])];
-  if (exitCode && !failures.length) failures.push(...files);
+  if (exitCode && !failures.length && !signal.aborted) failures.push(...files);
   return {
     exitCode,
     durationMs,
     failedFiles: failures,
+    interruptedFiles: signal.aborted ? missing.length : 0,
     counts: {
       passed: report.numPassedTests,
-      failed:
-        Math.max(report.numFailedTests, failedFiles.length) +
-        (failures.length - failedFiles.length),
+      failed: signal.aborted
+        ? report.numFailedTests
+        : Math.max(report.numFailedTests, failedFiles.length) +
+          (failures.length - failedFiles.length),
       skipped: report.testResults
         .flatMap(({ assertionResults }) => assertionResults ?? [])
         .filter(({ status }) => status === "skipped" || status === "todo").length,
@@ -383,7 +395,11 @@ async function main() {
     const groups = partitionFiles(await weighFiles(root, cacheRoot, files), count);
     const startedAt = performance.now();
     console.log(`Running ${files.length} Vitest files across ${groups.length} shards.`);
-    const result = await runShards(groups, { execute, print: console.log });
+    const result = await runShards(groups, {
+      execute,
+      print: console.log,
+      signal: controller.signal,
+    });
     exitCode = controller.signal.aborted ? 1 : result.exitCode;
     console.log(
       `Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`,
@@ -396,6 +412,9 @@ async function main() {
       console.log(`Run logs: ${runDirectory}`);
     }
     return exitCode;
+  } catch (error) {
+    if (controller.signal.aborted) console.log(`INTERRUPTED: ${controller.signal.reason}`);
+    throw error;
   } finally {
     try {
       if (exitCode === 0 && runDirectory) await rm(runDirectory, { recursive: true });
