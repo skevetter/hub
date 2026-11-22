@@ -83,7 +83,8 @@ evidence and recompute the hashes. Record fresh evidence for receipts from older
 
 The generated runtime-file map also selects tests that read checked-in fixtures, SQL, and docs.
 When tests add a file read, regenerate the map with
-`node scripts/generate-test-runtime-files.mjs` and commit the JSON. The script tests check that the
+`node scripts/generate-test-runtime-files.mjs` and commit the JSON. The generator formats it
+with the repository's oxfmt. The script tests check that the
 map matches the current reads. Resolve new dynamic paths in the generator when static analysis
 cannot determine their directory.
 
