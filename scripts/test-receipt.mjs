@@ -1,6 +1,13 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants, createReadStream, realpathSync, renameSync, writeFileSync } from "node:fs";
+import {
+  constants,
+  createReadStream,
+  lstatSync,
+  realpathSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { copyFile, mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -98,9 +105,12 @@ async function checkReceipt(receipt, { head, tree }, directory, root) {
   for (const entry of receipt.commands) {
     if (entry.head !== head || entry.tree !== tree)
       throw new Error("A receipt entry has a different commit or tree.");
+    if (entry.root !== root)
+      throw new Error(`A receipt entry ran in a different worktree than ${root}.`);
+    if (entry.inProgress === true) continue;
     const testedRoot =
       entry.testedRoot === null && entry.counts === null ? entry.root : entry.testedRoot;
-    if (entry.root !== root || testedRoot !== root)
+    if (testedRoot !== root)
       throw new Error(`A receipt entry ran in a different worktree than ${root}.`);
     if (
       !/^[a-f0-9]{64}$/u.test(entry.logSha256 ?? "") ||
@@ -166,9 +176,25 @@ function validateMetrics(metrics, testedRoot, testedHead) {
   }
 }
 
+async function replaceReceipt(destination, pending, { head, tree }, commands, signal) {
+  const payload = { version: 4, head, tree, cleanTree: true, commands };
+  const data = { ...payload, sha256: receiptHash(payload) };
+  let published = false;
+  try {
+    await writeFile(pending, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+    if (signal?.aborted) return false;
+    renameSync(pending, destination);
+    published = true;
+    return true;
+  } finally {
+    if (!published) await rm(pending, { force: true });
+  }
+}
+
 export async function recordTestRun(directory, command, { stdio = "inherit", signal } = {}) {
   if (!command.length) throw new Error("A test command is required.");
   const { root, branch, head, tree } = cleanHead(directory);
+  const commit = { head, tree };
   const checkUnchanged = () => {
     const current = cleanHead(directory);
     if (current.head !== head || current.branch !== branch)
@@ -181,12 +207,23 @@ export async function recordTestRun(directory, command, { stdio = "inherit", sig
   const lock = await takeTestLock(join(receiptDir, `${head}.lock`), "receipt");
   let temp;
   try {
+    const existing = await readJson(destination);
+    if (existing) await checkReceipt(existing, commit, receiptDir, root);
+    const previous = existing?.commands ?? [];
+    const commands = previous.filter(
+      (item) => JSON.stringify(item.command) !== JSON.stringify(command),
+    );
+    const repeat = commands.length !== previous.length;
+    const startedAt = new Date().toISOString();
+    if (repeat) {
+      const inProgress = { root, head, tree, command, startedAt, inProgress: true };
+      await replaceReceipt(destination, pending, commit, [...commands, inProgress]);
+    }
     signal?.throwIfAborted();
     checkUnchanged();
     temp = await mkdtemp(join(tmpdir(), "hub-receipt-"));
     const report = join(temp, "metrics.json");
     const started = performance.now();
-    const startedAt = new Date().toISOString();
     const logFile = join(temp, "command.log");
     const log = await open(logFile, "wx", 0o600);
     let code;
@@ -230,13 +267,7 @@ export async function recordTestRun(directory, command, { stdio = "inherit", sig
       logSha256: await fileHash(logFile),
     };
     if (code === 0) checkUnchanged();
-    const existing = await readJson(destination);
-    if (existing) await checkReceipt(existing, { head, tree }, receiptDir, root);
-    const previous = existing?.commands ?? [];
-    const commands = previous.filter(
-      (item) => JSON.stringify(item.command) !== JSON.stringify(command),
-    );
-    if (code !== 0 && commands.length === previous.length) {
+    if (code !== 0 && !repeat) {
       if (metricsError) throw metricsError;
       return { code, path: null };
     }
@@ -253,18 +284,14 @@ export async function recordTestRun(directory, command, { stdio = "inherit", sig
     if (signal?.aborted) return { code: 1, path: null };
     await rm(temp, { recursive: true });
     temp = undefined;
-    commands.push(entry);
-    const payload = { version: 4, head, tree, cleanTree: true, commands };
-    const data = { ...payload, sha256: receiptHash(payload) };
-    let published = false;
-    try {
-      await writeFile(pending, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
-      if (signal?.aborted) return { code: 1, path: null };
-      renameSync(pending, destination);
-      published = true;
-    } finally {
-      if (!published) await rm(pending, { force: true });
-    }
+    const published = await replaceReceipt(
+      destination,
+      pending,
+      commit,
+      [...commands, entry],
+      signal,
+    );
+    if (!published) return { code: 1, path: null };
     if (metricsError) throw metricsError;
     return { code, path: destination };
   } finally {
@@ -280,14 +307,27 @@ export async function verifyReceipt(directory, sha) {
   if (!/^[a-f0-9]{7,64}$/iu.test(sha ?? "")) throw new Error("--verify requires a Git commit SHA.");
   const commit = revision(directory, sha);
   const receiptDir = join(directory, ".test-receipts");
-  const receipt = await readJson(join(receiptDir, `${commit.head}.json`));
+  const path = join(receiptDir, `${commit.head}.json`);
+  const initial = lstatSync(path, { throwIfNoEntry: false });
+  const receipt = await readJson(path);
   if (!receipt) throw new Error(`No test receipt exists for ${commit.head}.`);
   await checkReceipt(receipt, commit, receiptDir, realpathSync(directory));
-  const failure = receipt.commands.find((entry) => (entry.exitCode ?? 0) !== 0);
-  if (failure) {
-    const command = failure.command.map((part) => JSON.stringify(part)).join(" ");
-    throw new Error(`The latest run of ${command} failed with exit code ${failure.exitCode}.`);
+  const incomplete = receipt.commands.find(
+    (entry) => entry.inProgress === true || (entry.exitCode ?? 0) !== 0,
+  );
+  if (incomplete) {
+    const command = incomplete.command.map((part) => JSON.stringify(part)).join(" ");
+    if (incomplete.inProgress === true)
+      throw new Error(`The latest run of ${command} did not record a completed result.`);
+    throw new Error(`The latest run of ${command} failed with exit code ${incomplete.exitCode}.`);
   }
+  if (lstatSync(join(receiptDir, `${commit.head}.lock`), { throwIfNoEntry: false }))
+    throw new Error(
+      "A test receipt writer lock exists. Retry verification after recording completes.",
+    );
+  const current = lstatSync(path, { throwIfNoEntry: false });
+  if (!initial || !current || current.dev !== initial.dev || current.ino !== initial.ino)
+    throw new Error("The test receipt changed during verification. Retry verification.");
   return receipt;
 }
 
@@ -302,6 +342,7 @@ async function main(args, signal) {
     if (delimiter !== -1) throw new Error("Use --verify <sha> or -- <command> [arguments].");
     printRunContext(root, `verify the test receipt for ${values.verify}`);
     const receipt = await verifyReceipt(root, values.verify);
+    signal.throwIfAborted();
     console.log(`Green test evidence for ${receipt.head} from a clean tree`);
     for (const entry of receipt.commands) {
       const time = (entry.durationMs / 1000).toFixed(2);

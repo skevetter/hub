@@ -70,9 +70,11 @@ mise exec node@24.22.0 -- npm run test:receipt -- --verify "$(git rev-parse HEAD
 ```
 
 The ignored `.test-receipts/<sha>.json` file records commands, their outcomes, worktree roots,
-branches and commits, elapsed times, and any test selections and counts. A failed repeat replaces
-the earlier result for the same command and commit. `--verify` rejects a receipt with a failed
-result.
+branches and commits, elapsed times, and any test selections and counts. A repeat replaces the
+earlier result for the same command and commit with an in-progress entry before starting the
+command. A completed failure replaces that entry with the failure. An interruption or crash
+leaves the command unverified. `--verify` requires completed passing results and checks that
+no receipt writer holds the lock.
 
 The test runners report the worktree and commit they tested. Recording rejects metrics for a
 different worktree or commit and requires a clean checkout. For explicit commands without metrics,

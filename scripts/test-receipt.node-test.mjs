@@ -135,6 +135,66 @@ test("a failed repeat replaces the green result for the same command and commit"
   assert.equal(run("--verify", head).status, 0);
 });
 
+test("a repeat invalidates its prior pass before the child runs, including if the writer dies", async (t) => {
+  for (const signal of ["SIGTERM", "SIGKILL"]) {
+    await t.test(signal, async (t) => {
+      const { directory, head } = await gitFixture(t);
+      const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
+      const receiptDir = join(directory, ".test-receipts");
+      const temp = join(receiptDir, "tmp");
+      const mode = join(receiptDir, "mode");
+      const marker = join(receiptDir, "ready");
+      await mkdir(temp, { recursive: true });
+      const script = `
+        const fs = require("node:fs");
+        if (fs.readFileSync(process.argv[1], "utf8") === "wait") {
+          fs.writeFileSync(process.argv[2], String(process.pid));
+          setInterval(() => {}, 1000);
+        }
+      `;
+      const command = [process.execPath, "-e", script, mode, marker];
+      await writeFile(mode, "pass");
+      await recordTestRun(directory, command, { stdio: "ignore" });
+      await verifyReceipt(directory, head);
+
+      await writeFile(mode, "wait");
+      const caller = spawn(process.execPath, [runner, "--root", directory, "--", ...command], {
+        env: { ...process.env, TMPDIR: temp },
+        stdio: "ignore",
+      });
+      const exited = once(caller, "exit");
+      let worker;
+      try {
+        for (let attempt = 0; !worker && attempt < 200 && caller.exitCode === null; attempt++) {
+          worker = Number(await readFile(marker, "utf8").catch(() => ""));
+          if (!worker) await delay(20);
+        }
+        assert.ok(worker, "repeat command did not start");
+        await assert.rejects(verifyReceipt(directory, head), /did not record a completed result/u);
+        caller.kill(signal);
+        const result = await once(caller, "exit", { signal: AbortSignal.timeout(4000) });
+        assert.deepEqual(result, signal === "SIGKILL" ? [null, "SIGKILL"] : [1, null]);
+        await assert.rejects(verifyReceipt(directory, head), /did not record a completed result/u);
+        if (signal === "SIGTERM") {
+          await writeFile(mode, "pass");
+          await recordTestRun(directory, command, { stdio: "ignore" });
+          await verifyReceipt(directory, head);
+        }
+      } finally {
+        if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+        if (worker) {
+          try {
+            process.kill(-worker, "SIGKILL");
+          } catch (error) {
+            if (error.code !== "ESRCH") throw error;
+          }
+        }
+        await exited;
+      }
+    });
+  }
+});
+
 test("a successful process cannot record a report containing failed tests", async (t) => {
   const { directory, head } = await gitFixture(t);
   const command = [
