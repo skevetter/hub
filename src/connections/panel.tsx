@@ -581,6 +581,9 @@ function ProviderConnections({
         <ConnectionRow
           key={connection.id}
           connection={connection}
+          includeExternalId={connections.some(
+            (other) => other.id !== connection.id && other.name === connection.name,
+          )}
           provider={provider}
           canManage={canManage}
           busy={busy}
@@ -594,6 +597,7 @@ function ProviderConnections({
 
 function ConnectionRow({
   connection,
+  includeExternalId,
   provider,
   canManage,
   busy,
@@ -601,6 +605,7 @@ function ConnectionRow({
   onRevoke,
 }: {
   connection: ConnectionRecord;
+  includeExternalId: boolean;
   provider: ConnectionProvider;
   canManage: boolean;
   busy: boolean;
@@ -608,6 +613,10 @@ function ConnectionRow({
   onRevoke: (provider: ConnectionProvider, row: ConnectionRecord) => void;
 }) {
   const { name, externalId, grantedAccess } = connection;
+  const actionsLabel = includeExternalId
+    ? `Actions for ${name}, ${externalId}`
+    : `Actions for ${name}`;
+  const revokeTitle = includeExternalId ? `Revoke ${name} (${externalId})?` : `Revoke ${name}?`;
   const detail = removing ? "Being removed" : connection.attention;
   const confirmRevoke = useCallback(
     () => onRevoke(provider, connection),
@@ -616,12 +625,12 @@ function ConnectionRow({
   const actions = useMemo(
     () =>
       canManage && !removing ? (
-        <RowActions label={`Actions for ${name}`}>
+        <RowActions label={actionsLabel}>
           <ConfirmMenuItem
             busy={busy}
             destructive
             label="Revoke"
-            title={`Revoke ${name}?`}
+            title={revokeTitle}
             description="Projects using this credential will stop receiving new events."
             confirmLabel="Revoke connection"
             cancelLabel="Cancel"
@@ -629,7 +638,7 @@ function ConnectionRow({
           />
         </RowActions>
       ) : undefined,
-    [busy, canManage, confirmRevoke, name, removing],
+    [actionsLabel, busy, canManage, confirmRevoke, removing, revokeTitle],
   );
   return (
     <RecordRow actions={actions} busy={removing}>
