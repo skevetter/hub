@@ -33,9 +33,9 @@ mise exec node@24.22.0 -- npm run test:changed
 mise exec node@24.22.0 -- npm run test:changed -- --base origin/main --safe
 ```
 
-The default base is the merge base with the local release branch or its existing remote-tracking ref,
-then the origin default branch. `--base` selects a different local Git ref. Staged, unstaged, and
-untracked changes are included.
+The command tries the merge base with `origin/main`, local `main`, the configured upstream, then
+the previous release branch in numeric version order. `--base` accepts an explicit local Git ref.
+Staged, unstaged, and untracked changes are included.
 
 The command runs changed test files and uses Vitest's static import graph to find related tests. It
 also checks the generated route tree and runs the typography policy. Changes under `drizzle/` run
