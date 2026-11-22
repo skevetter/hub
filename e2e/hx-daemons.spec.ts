@@ -1,5 +1,5 @@
 import { AxeBuilder } from "@axe-core/playwright";
-import { expect } from "@playwright/test";
+import { expect, type Browser, type BrowserContext, type Page } from "@playwright/test";
 import { test as browserTest } from "./app.js";
 import { OrganizationDaemons, seedDaemonProfile } from "./helpers/hx-daemons.js";
 
@@ -102,3 +102,113 @@ test("shows daemon devices and supports keyboard filters at phone width", async 
   await expect(page.getByRole("heading", { name: "Session profiles", level: 1 })).toBeVisible();
   await expect(page.getByRole("row").filter({ hasText: profile })).toBeVisible();
 });
+
+const member = {
+  name: "Device Member",
+  email: "device-member@example.com",
+  password: "device-member-password",
+};
+
+function profileRead(url: URL) {
+  return (
+    url.pathname.includes("/_serverFn/") &&
+    url.searchParams.get("payload")?.includes('"manage"') === true
+  );
+}
+
+test("uses the permissions for the organization in the Daemons URL", async ({
+  hub,
+  browser,
+  page,
+}) => {
+  test.setTimeout(90_000);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const target = new URL("daemons", page.url()).href;
+  await hub.seedConnectedOnlyDaemon("owner", "acme-device");
+  const existingContexts = new Set(browser.contexts());
+  await hub.addNewMember("owner", "member", member);
+  await hub.createAnotherOrganization("member", "Studio");
+  const memberPage = newMemberPage(browser, existingContexts);
+  await expect(memberPage).toHaveURL(/\/o\/studio-[^/]+\/home$/u);
+  await memberPage.setViewportSize({ width: 390, height: 900 });
+  let reads = 0;
+  await memberPage.route(profileRead, async (route) => {
+    reads++;
+    await route.continue();
+  });
+
+  await memberPage.goto(target);
+  const device = new OrganizationDaemons(memberPage).device("acme-device");
+  await expect(device).toBeVisible();
+  await expect(device.getByRole("button", { name: "Actions for acme-device" })).toHaveCount(0);
+  await expect.soft(device.getByText("Session profiles", { exact: true })).toHaveCount(0);
+  expect(reads).toBe(0);
+});
+
+test("hides cached management profiles after the daemon list confirms demotion", async ({
+  hub,
+  browser,
+  page,
+}) => {
+  test.setTimeout(90_000);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const target = new URL("daemons", page.url()).href;
+  await hub.seedDaemonSlug("owner", "acme-device");
+  const name = "Disabled build profile";
+  await seedDaemonProfile(hub.primaryApplication(), "Acme", "acme-device", name);
+  await hub
+    .primaryApplication()
+    .query("update interactive_session_profiles set status = 'disabled' where name = $1", [name]);
+  const existingContexts = new Set(browser.contexts());
+  await hub.addNewMember("owner", "member", member);
+  await hub.changeMemberRole("owner", member.name, "admin");
+  await hub.createAnotherOrganization("member", "Studio");
+  const memberPage = newMemberPage(browser, existingContexts);
+  await expect(memberPage).toHaveURL(/\/o\/studio-[^/]+\/home$/u);
+  await memberPage.goto(target);
+  const daemons = new OrganizationDaemons(memberPage);
+  const device = daemons.device("acme-device");
+  const profile = device.getByRole("link", { name, exact: true });
+  await expect(profile).toBeVisible();
+  await memberPage.getByRole("link", { name: "Home", exact: true }).click();
+  await expect(memberPage).toHaveURL(new URL("home", target).href);
+  await hub.changeMemberRole("owner", member.name, "member");
+
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await memberPage.route(profileRead, async (route) => {
+    await held;
+    await route.continue();
+  });
+  try {
+    await daemons.open();
+    await expect(device).toBeVisible();
+    await expect(device.getByRole("button", { name: "Actions for acme-device" })).toHaveCount(0);
+    await expect.soft(profile).toHaveCount(0, { timeout: 1_000 });
+    await expect(device.getByText("Session profiles", { exact: true })).toHaveCount(0);
+
+    await memberPage.getByRole("link", { name: "Home", exact: true }).click();
+    await expect(memberPage).toHaveURL(new URL("home", target).href);
+    await hub.changeMemberRole("owner", member.name, "admin");
+    await daemons.open();
+    await expect(device.getByRole("button", { name: "Actions for acme-device" })).toBeVisible();
+    await expect(device.getByText("Loading session profiles...")).toBeVisible();
+    await expect(profile).toHaveCount(0);
+  } finally {
+    release();
+  }
+  await expect(profile).toBeVisible();
+});
+
+function newMemberPage(browser: Browser, existingContexts: ReadonlySet<BrowserContext>) {
+  const page = browser
+    .contexts()
+    .find((context) => !existingContexts.has(context))
+    ?.pages()[0];
+  if (page === undefined) throw new Error("Missing member page");
+  return page;
+}
