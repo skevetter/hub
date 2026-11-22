@@ -58,6 +58,11 @@ match them to a trigger. The change is intentional loop protection. Tests in
 Hub organization in a rolling hour. The database enforces the cap across
 Hub processes.
 
+Hub delivers replies and repairs uncertain ones from one background cycle. The cycle
+runs every 2 seconds while a captured answer waits, and a new answer never delays a
+cycle that is already scheduled. With nothing waiting it runs every 30 seconds, so an
+idle Hub makes at most 2 database queries per minute for replies.
+
 ## Troubleshooting and turning replies off
 
 The Activity run detail shows **Reply not posted** with the reason when Hub
