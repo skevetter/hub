@@ -3,6 +3,10 @@ import { expect, type Page } from "@playwright/test";
 export class ProjectConnections {
   constructor(private readonly page: Page) {}
 
+  card(provider: string) {
+    return this.page.getByRole("region", { name: provider, exact: true });
+  }
+
   async connectGitHub() {
     await this.page.getByRole("button", { name: "Connect GitHub" }).click();
     await expect(this.page.getByRole("heading", { name: "Connections", level: 1 })).toBeVisible();
