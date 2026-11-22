@@ -17,6 +17,18 @@ export const testSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
 export const fullSuiteLockPath = process.env.HUB_TEST_FULLSUITE_LOCK || "/tmp/hub-fullsuite.lock";
 const gracePeriod = 5000;
 
+export function watchTestSignals() {
+  const controller = new AbortController();
+  const interrupt = (signal) => controller.abort(signal);
+  for (const signal of testSignals) process.on(signal, interrupt);
+  return {
+    signal: controller.signal,
+    close() {
+      for (const signal of testSignals) process.off(signal, interrupt);
+    },
+  };
+}
+
 function ps(args) {
   const result = spawnSync("ps", args, {
     encoding: "utf8",
@@ -136,7 +148,11 @@ export function fullSuiteLockHeld(path = fullSuiteLockPath) {
   return current.owner.groups.some((group) => groupAlive(group.pid));
 }
 
-export async function takeFullSuiteLock(path = fullSuiteLockPath, print = console.log) {
+export function takeFullSuiteLock(path = fullSuiteLockPath, print = console.log) {
+  return takeTestLock(path, "full-suite", print);
+}
+
+export async function takeTestLock(path, label, print = console.log) {
   const owner = {
     pid: process.pid,
     startTime: startTime(process.pid),
@@ -144,7 +160,7 @@ export async function takeFullSuiteLock(path = fullSuiteLockPath, print = consol
     groups: [],
   };
   if (!owner.startTime) throw new Error("Could not determine the test runner's start time.");
-  const busy = () => new Error(`The full-suite lock is held at ${path}.`);
+  const busy = () => new Error(`The ${label} lock is held at ${path}.`);
   while (true) {
     try {
       publish(path, owner);
@@ -157,12 +173,12 @@ export async function takeFullSuiteLock(path = fullSuiteLockPath, print = consol
     if (!current.owner || !stale(current.owner)) throw busy();
 
     // Serialize reclamation of this inode. A competing owner may publish after unlink.
-    const claim = await takeFullSuiteLock(`${path}.reclaim-${current.dev}-${current.ino}`, print);
+    const claim = await takeTestLock(`${path}.reclaim-${current.dev}-${current.ino}`, label, print);
     try {
       const observed = snapshot(path);
       if (!observed || observed.dev !== current.dev || observed.ino !== current.ino) continue;
       await Promise.all(observed.owner.groups.map(retireGroup));
-      print(`Reclaiming stale full-suite lock at ${path} from PID ${observed.owner.pid}.`);
+      print(`Reclaiming stale ${label} lock at ${path} from PID ${observed.owner.pid}.`);
       unlinkSync(path);
     } finally {
       claim.release();
@@ -183,7 +199,7 @@ export async function takeFullSuiteLock(path = fullSuiteLockPath, print = consol
       if (owner.groups.length)
         throw new Error("Test process groups remain registered. The lock stays in place.");
       if (snapshot(path)?.owner?.token !== owner.token)
-        throw new Error("The full-suite lock changed owners.");
+        throw new Error(`The ${label} lock changed owners.`);
       unlinkSync(path);
     },
   };
@@ -223,17 +239,26 @@ export async function runWorkerGroup(args, { cwd, env, log, lock, signal, graceM
     stdio: ["pipe", log.fd, log.fd],
   });
   child.stdin.on("error", () => {});
-  let spawnError;
-  const closed = new Promise((settle) => {
-    child.on("error", (error) => {
-      spawnError = error.code ?? "spawn error";
+  try {
+    const { exitCode, childSignal, error } = await waitForTestGroup(child, {
+      signal,
+      lock,
+      graceMs,
+      start: () => child.stdin.write("start\n"),
     });
-    child.on("close", (code, childSignal) =>
-      settle({
-        exitCode: code ?? 1,
-        processError: spawnError ?? childSignal,
-      }),
-    );
+    return { exitCode, processError: error ? (error.code ?? "spawn error") : childSignal };
+  } finally {
+    child.stdin.destroy();
+  }
+}
+
+export async function waitForTestGroup(child, { signal, lock, graceMs = gracePeriod, start }) {
+  const closed = new Promise((settle) => {
+    let error;
+    child.once("error", (cause) => {
+      error = cause;
+    });
+    child.once("close", (code, childSignal) => settle({ exitCode: code ?? 1, childSignal, error }));
   });
   if (!child.pid) return closed;
   let stopping;
@@ -243,21 +268,24 @@ export async function runWorkerGroup(args, { cwd, env, log, lock, signal, graceM
     stopping ??= stopGroup(child.pid, reason, graceMs);
     interrupted.resolve(stopping.then(() => closed));
   };
-  signal.addEventListener("abort", interrupt, { once: true });
+  signal?.addEventListener("abort", interrupt, { once: true });
   let registered = false;
   try {
-    lock?.track(child.pid);
-    registered = Boolean(lock);
-    child.stdin.write("start\n");
+    if (signal?.aborted) interrupt();
+    else {
+      lock?.track(child.pid);
+      registered = Boolean(lock);
+      start?.();
+    }
     return await Promise.race([closed, interrupted.promise]);
   } finally {
-    child.stdin.destroy();
     try {
-      await (stopping ?? stopGroup(child.pid, "SIGTERM", graceMs));
+      stopping ??= stopGroup(child.pid, "SIGTERM", graceMs);
+      await stopping;
       await closed;
       if (registered) lock.forget(child.pid);
     } finally {
-      signal.removeEventListener("abort", interrupt);
+      signal?.removeEventListener("abort", interrupt);
     }
   }
 }
