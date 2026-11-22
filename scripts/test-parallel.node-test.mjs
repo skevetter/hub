@@ -66,7 +66,7 @@ test("cached Hub timings balance two shards and only pin files above the ideal",
   assert.equal(partitionFiles(alsoHeavy, 2)[0][0], "known.test.ts");
 });
 
-test("failure reporting keeps shard numbers and reruns only failed files in one process", async () => {
+test("failure reporting keeps shard numbers and reruns failed shards in one process", async () => {
   const calls = [];
   const output = [];
   let active = 0;
@@ -92,7 +92,7 @@ test("failure reporting keeps shard numbers and reruns only failed files in one 
     execute,
     print: (line) => output.push(line),
   });
-  assert.deepEqual(result, { exitCode: 1, failedFiles: ["b.test.ts"] });
+  assert.deepEqual(result, { exitCode: 1, failedFiles: ["b.test.ts", "c.test.ts"] });
   assert.match(output.join("\n"), /npm run test:parallel -- --rerun-failed/u);
   const serialExit = await rerunFiles(result.failedFiles, execute, (line) => output.push(line));
 
@@ -100,7 +100,7 @@ test("failure reporting keeps shard numbers and reruns only failed files in one 
   assert.deepEqual(calls, [
     ["Shard 1", ["a.test.ts"]],
     ["Shard 2", ["b.test.ts", "c.test.ts"]],
-    ["Serial rerun", ["b.test.ts"]],
+    ["Serial rerun", ["b.test.ts", "c.test.ts"]],
   ]);
   assert.equal(serialExit, 0);
   assert.match(output.join("\n"), /Shard 2: FAIL.*\n.*b\.test\.ts/u);
@@ -188,7 +188,7 @@ test("a worker that exits mid-run lists every missing file for serial rerun", as
       executeFiles(process.cwd(), name, selected, directory, new AbortController().signal, invoke),
     print: (line) => output.push(line),
   });
-  assert.deepEqual(result, { exitCode: 1, failedFiles: ["lost.test.ts", "later.test.ts"] });
+  assert.deepEqual(result, { exitCode: 1, failedFiles: files });
   assert.match(output.join("\n"), /Shard 1:.*SIGKILL/u);
   assert.match(output.join("\n"), /Total: 3 files, 2 passed, 2 failed, 0 skipped/u);
 });
@@ -438,7 +438,7 @@ test("reruns see a lock as held only while its owner or recorded groups run", as
   assert.equal(fullSuiteLockHeld(path), false);
 });
 
-async function parallelFixture(t, run) {
+async function parallelFixture(t, run, files = ["selected.test.ts"]) {
   const root = await mkdtemp(join(tmpdir(), "hub-parallel-test-"));
   t.after(() => rm(root, { recursive: true }));
   const git = (...args) => execFileSync("git", ["-C", root, ...args]);
@@ -458,11 +458,11 @@ async function parallelFixture(t, run) {
     "-m",
     "Initialize fixture",
   );
-  await writeFile(join(root, "selected.test.ts"), "");
+  for (const file of files) await writeFile(join(root, file), "");
   const cache = join(root, "node_modules/.vite/vitest/test-parallel");
   await mkdir(cache, { recursive: true });
   await mkdir(join(root, "node_modules/vitest"));
-  await writeFile(join(cache, "failed.json"), '["selected.test.ts"]');
+  await writeFile(join(cache, "failed.json"), JSON.stringify({ version: 1, files }));
   await writeFile(
     join(root, "node_modules/vitest/vitest.mjs"),
     `
@@ -470,10 +470,11 @@ async function parallelFixture(t, run) {
     import { join } from "node:path";
     import { setTimeout as delay } from "node:timers/promises";
     const root = process.cwd();
-    const file = join(root, "selected.test.ts");
+    const files = ${JSON.stringify(files)}.map((file) => join(root, file));
+    const [file] = files;
     const output = (prefix) => process.argv.find((arg) => arg.startsWith(prefix)).slice(prefix.length);
     if (process.argv[2] === "list") {
-      writeFileSync(output("--json="), JSON.stringify([{ file }]));
+      writeFileSync(output("--json="), JSON.stringify(files.map((file) => ({ file }))));
     } else {
       const report = { success: true, numPassedTests: 1, numFailedTests: 0, numTotalTests: 1,
         testResults: [{ name: file, status: "passed", assertionResults: [{ status: "passed" }] }] };
@@ -747,5 +748,74 @@ test("parallel testing cannot publish metrics after HEAD changes during the run"
   });
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stderr, /HEAD changed while the test runner was active/u);
+  await assert.rejects(readFile(metrics), { code: "ENOENT" });
+});
+
+test("serial reruns keep all files from a failed shard and require complete passing results", async (t) => {
+  const files = ["a.test.ts", "b.test.ts"];
+  const { root, args, options } = await parallelFixture(
+    t,
+    `
+    const mode = process.env.FIXTURE_RUN_MODE;
+    const selected = process.argv.slice(5);
+    const b = files[1];
+    const reported = mode === "missing" ? selected.filter((file) => file !== b) : selected;
+    report.testResults = reported.map((name) => {
+      const status = mode === "initial" && name === files[0] ? "failed" : "passed";
+      const assertion = mode === "passing" && name === b ? "skipped" : status;
+      return { name, status, assertionResults: [{ status: assertion }] };
+    });
+    report.numTotalTests = reported.length;
+    report.numFailedTests = report.testResults.filter(({ status }) => status === "failed").length;
+    report.numPassedTests = report.testResults.flatMap(({ assertionResults }) => assertionResults)
+      .filter(({ status }) => status === "passed").length;
+    report.success = report.numFailedTests === 0;
+    if (mode === "initial" || (mode === "process-fails" && selected.includes(b))) process.exitCode = 1;
+    writeFileSync(reportPath, JSON.stringify(report));
+    `,
+    files,
+  );
+  const metrics = join(root, "metrics.json");
+  const run = (mode, ...flags) =>
+    spawnSync(process.execPath, [...args, ...flags], {
+      ...options,
+      env: {
+        ...options.env,
+        TEST_SHARDS: "1",
+        FIXTURE_RUN_MODE: mode,
+        HUB_TEST_RUN_REPORT: metrics,
+      },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+  assert.equal(run("initial").status, 1);
+  const processFailure = run("process-fails", "--rerun-failed");
+  assert.equal(processFailure.status, 1, processFailure.stdout);
+  assert.match(processFailure.stdout, /Vitest process failed \(exit 1,/u);
+  assert.doesNotMatch(processFailure.stdout, /Serial rerun: PASS/u);
+  await assert.rejects(readFile(metrics), { code: "ENOENT" });
+
+  const incomplete = run("missing", "--rerun-failed");
+  assert.equal(incomplete.status, 1, incomplete.stdout);
+  assert.match(incomplete.stdout, /Files without a result: b\.test\.ts/u);
+  assert.doesNotMatch(incomplete.stdout, /Serial rerun: PASS/u);
+  await assert.rejects(readFile(metrics), { code: "ENOENT" });
+
+  const passing = run("passing", "--rerun-failed");
+  assert.equal(passing.status, 0, passing.stderr);
+  assert.match(passing.stdout, /Serial rerun: PASS/u);
+  const saved = JSON.parse(await readFile(metrics, "utf8"));
+  assert.deepEqual(saved.selectedFiles, files);
+  assert.deepEqual(saved.counts, { passed: 1, failed: 0, skipped: 1 });
+
+  await rm(metrics);
+  await writeFile(
+    join(root, "node_modules/.vite/vitest/test-parallel/failed.json"),
+    '["a.test.ts"]',
+  );
+  const legacy = run("passing", "--rerun-failed");
+  assert.equal(legacy.status, 1);
+  assert.match(legacy.stderr, /failed-file list uses an unsupported format/u);
   await assert.rejects(readFile(metrics), { code: "ENOENT" });
 });

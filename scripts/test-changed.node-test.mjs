@@ -638,3 +638,62 @@ test("changed testing refuses full-suite metrics for a different commit", async 
   assert.equal(passing.status, 0, passing.stderr);
   assert.equal(JSON.parse(await readFile(metrics, "utf8")).head, head);
 });
+
+test("changed testing rejects missing files in both direct runs and full-suite handoffs", async (t) => {
+  const { root } = await changedFixture(t, {
+    "node_modules/vitest/node.js": `
+      import { join } from "node:path";
+      export const createVitest = () => ({
+        projects: [], close() {},
+        globTestSpecifications: () => ["src/typography-policy.test.ts", "src/omitted.test.ts", "src/unrelated.test.ts"]
+          .map((file) => ({ moduleId: join(process.cwd(), file) })),
+      });
+    `,
+    "node_modules/vitest/vitest.mjs": `
+      import { writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      if (process.argv[2] === "run") {
+        const output = process.argv.find((arg) => arg.startsWith("--outputFile=")).slice(13);
+        writeFileSync(output, JSON.stringify({
+          success: true, numPassedTests: 1, numFailedTests: 0, numTotalTests: 1,
+          testResults: [{ name: join(process.cwd(), "src/typography-policy.test.ts"),
+            status: "passed", assertionResults: [{ status: "passed" }] }],
+        }));
+      }
+    `,
+    "scripts/test-parallel.mjs": `
+      import { execFileSync } from "node:child_process";
+      import { writeFileSync } from "node:fs";
+      writeFileSync(process.env.HUB_TEST_RUN_REPORT, JSON.stringify({
+        root: process.cwd(), head: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+        selectedFiles: ["src/typography-policy.test.ts"],
+        counts: { passed: 1, failed: 0, skipped: 0 }, checks: [],
+      }));
+    `,
+  });
+  const metrics = join(root, "status-metrics.json");
+  for (const changed of ["src/omitted.test.ts", "vitest.config.ts"]) {
+    await writeFile(join(root, changed), "");
+    const result = spawnSync(
+      process.execPath,
+      [join(root, "scripts/test-changed.mjs"), "--base", "HEAD"],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          TMPDIR: root,
+          HUB_TEST_FULLSUITE_LOCK: join(root, "status-lock"),
+          HUB_TEST_RUN_REPORT: metrics,
+        },
+        encoding: "utf8",
+        timeout: 5000,
+      },
+    );
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(
+      result.stderr,
+      /Vitest did not report these selected files: src\/omitted\.test\.ts/u,
+    );
+    await assert.rejects(readFile(metrics), { code: "ENOENT" });
+  }
+});
