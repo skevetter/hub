@@ -8,7 +8,7 @@ const nothing: ChecklistFacts = {
   daemons: [],
   triggers: [],
   runs: [],
-  sessions: null,
+  sessionStarted: null,
 };
 
 function states(facts: ChecklistFacts) {
@@ -66,7 +66,7 @@ describe("the onboarding checklist", () => {
       connections: [{ provider: "slack", slug: "acme", label: "Acme", needsAuthorization: false }],
       daemons: [{ id: "2", slug: "devbox", presence: "connected", canExecute: true }],
       triggers: [{ id: "t", name: "slack-help", event: "slack.mention", enabled: true }],
-      sessions: null,
+      sessionStarted: null,
       runs: [
         {
           id: "r",
@@ -91,15 +91,14 @@ describe("the onboarding checklist", () => {
   });
 
   it("leads with the daemon and adds the two session steps when sessions are on", () => {
-    const sessions = { open: 0, openCapped: false, started: false };
-    const checklist = deriveChecklist({ ...nothing, sessions }, 0);
+    const checklist = deriveChecklist({ ...nothing, sessionStarted: false }, 0);
     assert.deepEqual(
       checklist.steps.map(({ key }) => key),
       ["daemon", "profile", "session", "app", "trigger", "run"],
     );
     assert.equal(checklist.complete, false);
 
-    const underway = deriveChecklist({ ...nothing, sessions: { ...sessions, started: true } }, 1);
+    const underway = deriveChecklist({ ...nothing, sessionStarted: true }, 1);
     assert.deepEqual(
       underway.steps.filter(({ state }) => state === "done").map(({ key }) => key),
       ["profile", "session"],

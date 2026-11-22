@@ -90,7 +90,7 @@ const SESSION_EXAMPLES: readonly TryExample[] = [
  * session profile. Sessions are left out entirely while the feature is off.
  */
 export function thingsToTry(
-  snapshot: Pick<HomeSnapshot, "connections" | "triggers" | "sessions">,
+  snapshot: Pick<HomeSnapshot, "connections" | "triggers" | "sessionStarted">,
   profiles: ProfileAvailability = null,
   canManageProfiles = false,
 ): TrySurface[] {
@@ -98,8 +98,7 @@ export function thingsToTry(
     appSurface(snapshot, "linear", "Linear"),
     appSurface(snapshot, "github", "GitHub"),
   ];
-  const { sessions } = snapshot;
-  if (sessions !== null && profiles !== null) {
+  if (snapshot.sessionStarted !== null && profiles !== null) {
     surfaces.push({
       key: "sessions",
       label: "Sessions",

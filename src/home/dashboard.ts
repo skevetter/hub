@@ -17,7 +17,7 @@ import { projectTriggerForm } from "../triggers/configuration/editor.js";
 import { matchGitHubInvocations } from "../triggers/github/match.js";
 import { matchLinearInvocations } from "../triggers/linear/match.js";
 import { incompleteSetupStepTitles, SETUP_INCOMPLETE } from "./checklist.js";
-import { HOME_MONTH_DAYS, HOME_OPEN_SESSIONS_LIMIT } from "./limits.js";
+import { HOME_MONTH_DAYS } from "./limits.js";
 import { commentExamples, isTryCommentEvent } from "./things-to-try.js";
 
 /** How far back the overview looks. One week is long enough to hold a first run and short enough that a nudge fades once a trigger listens. */
@@ -29,15 +29,6 @@ export interface RunTally {
   total: number;
   succeeded: number;
   failed: number;
-}
-
-/** The reader's own session facts; absent when the feature is off. */
-export interface HomeSessions {
-  /** Open sessions the reader started or participates in, up to the Home limit. */
-  open: number;
-  openCapped: boolean;
-  /** Whether the reader started or participates in any session, open or closed. */
-  started: boolean;
 }
 
 export interface HomeSnapshot {
@@ -74,7 +65,8 @@ export interface HomeSnapshot {
   runs: readonly (Omit<OrganizationRunRecord, "receivedAt"> & { receivedAt: string })[];
   /** Every run in the last 24 hours and the last `HOME_MONTH_DAYS` days, not only the ones listed. */
   runCounts: { day: RunTally; month: RunTally };
-  sessions: HomeSessions | null;
+  /** Whether the reader started or joined a session. Null means Sessions is off. */
+  sessionStarted: boolean | null;
   dropped: readonly DroppedProviderEventCount[];
   windowDays: number;
 }
@@ -148,7 +140,7 @@ export class HomeDashboard {
       runs,
       dayRuns,
       monthRuns,
-      sessions,
+      sessionStarted,
       dropped,
       checklistCompletedAt,
     ] = await Promise.all([
@@ -169,7 +161,9 @@ export class HomeDashboard {
             organizationId,
             new Date(now - HOME_MONTH_DAYS * DAY_MS),
           ),
-      reader === null ? null : this.readSessions(reader),
+      reader !== null && this.options.interactiveSessions === true
+        ? this.database.hasOwnInteractiveSession(reader)
+        : null,
       this.database.countRecentDroppedEvents(organizationId, since),
       this.database.getHomeChecklistCompletedAt(organizationId),
     ]);
@@ -228,15 +222,10 @@ export class HomeDashboard {
         payloadExpiredAt: run.payloadExpiredAt ?? null,
       })),
       runCounts: { day: tally(dayRuns), month: tally(monthRuns) },
-      sessions,
+      sessionStarted,
       dropped,
       windowDays: HOME_WINDOW_DAYS,
     };
-  }
-
-  private async readSessions(reader: SessionPrincipal): Promise<HomeSessions | null> {
-    if (this.options.interactiveSessions !== true) return null;
-    return this.database.countOwnInteractiveSessions(reader, HOME_OPEN_SESSIONS_LIMIT);
   }
 }
 
