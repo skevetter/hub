@@ -1,3 +1,4 @@
+import ts from "typescript";
 import { generateRuntimeMap, readRuntimeInputs } from "./generate-test-runtime-files.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 import assert from "node:assert/strict";
@@ -81,6 +82,7 @@ test("the checked-in map covers Vitest runtime reads", () => {
   assert.throws(
     () =>
       readRuntimeInputs(
+        ts,
         "src/new.test.ts",
         `
     import { readdir as inspect } from "node:fs/promises";
@@ -91,6 +93,7 @@ test("the checked-in map covers Vitest runtime reads", () => {
   );
   assert.deepEqual(
     readRuntimeInputs(
+      ts,
       "src/new.test.ts",
       `
     import { readdir as inspect } from "node:fs/promises";

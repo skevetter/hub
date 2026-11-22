@@ -1,31 +1,30 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants, createReadStream, existsSync, realpathSync, writeFileSync } from "node:fs";
+import { constants, createReadStream, writeFileSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
+import {
+  isEntrypoint,
+  printRunContext,
+  readRepository,
+  repositoryFor,
+  requireGit,
+} from "./test-context.mjs";
 
-const root = fileURLToPath(new URL("../", import.meta.url));
 const reportVariable = "HUB_TEST_RUN_REPORT";
 
-function git(directory, args) {
-  const result = spawnSync("git", ["-C", directory, ...args], { encoding: "utf8" });
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`Git could not complete ${args[0]}.`);
-  return result.stdout;
-}
-
 function cleanHead(directory) {
-  if (git(directory, ["status", "--porcelain=v1", "--untracked-files=all", "-z"])) {
-    throw new Error("Test receipts require a clean Git worktree.");
-  }
-  return revision(directory, "HEAD");
+  const repo = readRepository(directory);
+  if (repo.dirty) throw new Error("Test receipts require a clean Git worktree.");
+  return { ...repo, ...revision(directory, repo.head) };
 }
 
 function revision(directory, ref) {
-  const head = git(directory, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
-  const tree = git(directory, ["rev-parse", "--verify", `${head}^{tree}`]).trim();
+  const head = requireGit(directory, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
+  const tree = requireGit(directory, ["rev-parse", "--verify", `${head}^{tree}`]).trim();
   return { head, tree };
 }
 
@@ -90,7 +89,7 @@ function logPath(directory, hash) {
 }
 
 async function checkReceipt(receipt, { head, tree }, directory) {
-  if (receipt.version !== 2 || receipt.cleanTree !== true || !Array.isArray(receipt.commands)) {
+  if (receipt.version !== 3 || receipt.cleanTree !== true || !Array.isArray(receipt.commands)) {
     throw new Error("Unsupported or invalid test receipt. Record fresh evidence.");
   }
   const { sha256, ...payload } = receipt;
@@ -150,7 +149,12 @@ function validateMetrics(metrics) {
 
 export async function recordTestRun(directory, command, { stdio = "inherit" } = {}) {
   if (!command.length) throw new Error("A test command is required.");
-  const { head, tree } = cleanHead(directory);
+  const { root, branch, head, tree } = cleanHead(directory);
+  const checkUnchanged = () => {
+    const current = cleanHead(directory);
+    if (current.head !== head || current.branch !== branch)
+      throw new Error("HEAD or branch changed while the command ran.");
+  };
   const temp = await mkdtemp(join(tmpdir(), "hub-receipt-"));
   try {
     const report = join(temp, "metrics.json");
@@ -167,10 +171,12 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
     const completedAt = new Date().toISOString();
     const durationMs = Math.round(performance.now() - started);
     if (code !== 0) return { code, path: null };
-    if (cleanHead(directory).head !== head) throw new Error("HEAD changed while the command ran.");
+    checkUnchanged();
     const metrics = await readJson(report);
     validateMetrics(metrics);
     const entry = {
+      root,
+      branch,
       head,
       tree,
       command,
@@ -192,8 +198,7 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
     const lockPath = join(receiptDir, `${head}.lock`);
     const lock = await open(lockPath, "wx", 0o600);
     try {
-      if (cleanHead(directory).head !== head)
-        throw new Error("HEAD changed before the receipt was written.");
+      checkUnchanged();
       const existing = await readJson(destination);
       if (existing) await checkReceipt(existing, { head, tree }, receiptDir);
       await mkdir(join(receiptDir, "logs"), { recursive: true, mode: 0o700 });
@@ -210,7 +215,7 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
         (item) => JSON.stringify(item.command) !== JSON.stringify(command),
       );
       commands.push(entry);
-      const payload = { version: 2, head, tree, cleanTree: true, commands };
+      const payload = { version: 3, head, tree, cleanTree: true, commands };
       const data = { ...payload, sha256: receiptHash(payload) };
       await writeFile(pending, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await rename(pending, destination);
@@ -239,8 +244,16 @@ export async function verifyReceipt(directory, sha) {
 }
 
 async function main(args) {
-  if (args[0] === "--verify" && args.length === 2) {
-    const receipt = await verifyReceipt(root, args[1]);
+  const delimiter = args.indexOf("--");
+  const { values } = parseArgs({
+    args: delimiter === -1 ? args : args.slice(0, delimiter),
+    options: { root: { type: "string" }, verify: { type: "string" } },
+  });
+  const root = repositoryFor(import.meta.url, values.root);
+  if (values.verify !== undefined) {
+    if (delimiter !== -1) throw new Error("Use --verify <sha> or -- <command> [arguments].");
+    printRunContext(root, `verify the test receipt for ${values.verify}`);
+    const receipt = await verifyReceipt(root, values.verify);
     console.log(`Green test evidence for ${receipt.head} from a clean tree`);
     for (const entry of receipt.commands) {
       const time = (entry.durationMs / 1000).toFixed(2);
@@ -255,18 +268,22 @@ async function main(args) {
     return 0;
   }
   const command =
-    args.length === 0 ? ["npm", "run", "test:changed"] : args[0] === "--" ? args.slice(1) : [];
+    delimiter === -1
+      ? [
+          process.execPath,
+          fileURLToPath(new URL("./test-changed.mjs", import.meta.url)),
+          "--root",
+          root,
+        ]
+      : args.slice(delimiter + 1);
   if (!command.length) throw new Error("Use --verify <sha> or -- <command> [arguments].");
+  printRunContext(root, `record ${command.map((part) => JSON.stringify(part)).join(" ")}`);
   const result = await recordTestRun(root, command);
   if (result.path) console.log(`Wrote ${result.path}.`);
   return result.code;
 }
 
-if (
-  process.argv[1] &&
-  existsSync(process.argv[1]) &&
-  fileURLToPath(import.meta.url) === realpathSync(process.argv[1])
-) {
+if (isEntrypoint(import.meta.url)) {
   main(process.argv.slice(2)).then(
     (code) => {
       process.exitCode = code;

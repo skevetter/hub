@@ -1,5 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { spawn } from "node:child_process";
 import {
   access,
   cp,
@@ -11,34 +10,23 @@ import {
   stat,
   symlink,
 } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, posix, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import { generateRuntimeMap } from "./generate-test-runtime-files.mjs";
+import { git, isEntrypoint, printRunContext, repositoryFor, requireGit } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
 import { fullSuiteLockPath } from "./test-worker-group.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 
-const root = fileURLToPath(new URL("../", import.meta.url));
-const vitest = join(root, "node_modules", "vitest", "vitest.mjs");
 const routeTree = "src/routeTree.gen.ts";
 const typography = "src/typography-policy.test.ts";
 const migrationTests = ["src/db/migrations.test.ts", "src/db/migrations.integration.test.ts"];
 const sourceExtensions = /\.(?:[cm]?[jt]sx?|json|css)$/u;
 const fullSuiteInputs =
   /^(?:package(?:-lock)?\.json|(?:vite|vitest)(?:\.config|\.workspace)\.[cm]?[jt]s)$/u;
-
-function git(args) {
-  const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf8" });
-  if (result.error) throw result.error;
-  return result.status === 0 ? result.stdout : null;
-}
-
-function requireGit(args) {
-  const output = git(args);
-  if (output === null) throw new Error(`Git could not complete ${args[0]}.`);
-  return output;
-}
 
 const releaseRef = /^(?:(?:refs\/heads|refs\/remotes\/[^/]+)\/)?release\/(.+)$/u;
 const versionOrder = (a, b) => a.localeCompare(b, "en", { numeric: true });
@@ -64,7 +52,7 @@ function previousReleaseRefs(gitCommand) {
     .map(({ ref }) => ref);
 }
 
-export function resolveBase(base, gitCommand = git) {
+export function resolveBase(base, gitCommand) {
   if (base !== undefined) {
     const tree = gitCommand(["rev-parse", "--verify", "--end-of-options", `${base}^{tree}`]);
     if (tree === null) throw new Error("Could not resolve --base to a Git tree.");
@@ -109,7 +97,7 @@ export function selectTests(
   discovered,
   present,
   safe,
-  { setupFiles = [], graphFiles = [] } = {},
+  { setupFiles = [], graphFiles = [], fixtures = runtimeFiles } = {},
 ) {
   const migrationChanged = changes.some((path) => path.startsWith("drizzle/"));
   const scriptsChanged = changes.some(
@@ -133,7 +121,7 @@ export function selectTests(
   }
 
   const available = new Set(discovered);
-  for (const [input, readers] of Object.entries(runtimeFiles)) {
+  for (const [input, readers] of Object.entries(fixtures)) {
     const changed = changes.find((path) =>
       input.endsWith("/") ? path.startsWith(input) : path === input,
     );
@@ -192,7 +180,7 @@ async function exists(path) {
   }
 }
 
-function run(command, args, { cwd = root, env = process.env, stdio = "inherit" } = {}) {
+function run(command, args, { cwd, env = process.env, stdio = "inherit" }) {
   return new Promise((settle, reject) => {
     const child = spawn(command, args, { cwd, env, stdio });
     child.on("error", reject);
@@ -200,8 +188,11 @@ function run(command, args, { cwd = root, env = process.env, stdio = "inherit" }
   });
 }
 
-function runVitest(args, options) {
-  return run(process.execPath, [vitest, ...args], options);
+function runVitest(root, args, options) {
+  return run(process.execPath, [join(root, "node_modules/vitest/vitest.mjs"), ...args], {
+    cwd: root,
+    ...options,
+  });
 }
 
 async function checkRouteTree(rootDir, temp, env) {
@@ -219,6 +210,7 @@ async function checkRouteTree(rootDir, temp, env) {
     symlink(join(rootDir, "node_modules"), join(snapshot, "node_modules"), "junction"),
   ]);
   const code = await runVitest(
+    rootDir,
     [
       "list",
       "--root",
@@ -237,8 +229,13 @@ async function checkRouteTree(rootDir, temp, env) {
   console.log(`Route tree guard passed for ${routeTree}.`);
 }
 
-async function resolveTestPlan(changes, present, safe, temp) {
-  const { createVitest } = await import("vitest/node");
+async function resolveTestPlan(root, changes, present, safe, temp) {
+  const require = createRequire(join(root, "package.json"));
+  const { createVitest } = await import(pathToFileURL(require.resolve("vitest/node")).href);
+  const mapPath = join(root, "scripts/test-runtime-files.json");
+  const fixtures = (await exists(mapPath))
+    ? JSON.parse(await readFile(mapPath, "utf8"))
+    : generateRuntimeMap(root);
   const ctx = await createVitest(
     "test",
     { root, run: true, watch: false },
@@ -250,13 +247,14 @@ async function resolveTestPlan(changes, present, safe, temp) {
     const setupFiles = ctx.projects.flatMap(({ config }) =>
       [...config.setupFiles, ...config.globalSetup].map((file) => repoPath(root, file)),
     );
-    const plan = selectTests(changes, discovered, present, safe, { setupFiles });
+    const plan = selectTests(changes, discovered, present, safe, { setupFiles, fixtures });
     if (plan.fullSuiteReason || !plan.related.length) return plan;
     // Use the same graph query as Vitest related, then run only the resolved files.
     ctx.config.related = plan.related.map((path) => join(root, path));
     const graph = await ctx.getRelevantTestSpecifications();
     return selectTests(changes, discovered, present, safe, {
       setupFiles,
+      fixtures,
       graphFiles: graph.map(({ moduleId }) => repoPath(root, moduleId)),
     });
   } finally {
@@ -274,8 +272,10 @@ async function requireFullSuiteIdle() {
   throw new Error(`The full-suite lock is held at ${fullSuiteLockPath}.`);
 }
 
-async function selectedVitest(args, reportPath, env) {
-  const code = await runVitest([...args, "--reporter=json", `--outputFile=${reportPath}`], { env });
+async function selectedVitest(root, args, reportPath, env) {
+  const code = await runVitest(root, [...args, "--reporter=json", `--outputFile=${reportPath}`], {
+    env,
+  });
   try {
     const report = JSON.parse(await readFile(reportPath, "utf8"));
     return {
@@ -305,12 +305,14 @@ function printTests(result, reason) {
 
 async function main() {
   const { values } = parseArgs({
-    options: { base: { type: "string" }, safe: { type: "boolean" } },
+    options: { base: { type: "string" }, safe: { type: "boolean" }, root: { type: "string" } },
   });
-  const base = resolveBase(values.base);
+  const root = repositoryFor(import.meta.url, values.root);
+  printRunContext(root, `run Vitest files affected by changes${values.safe ? " with --safe" : ""}`);
+  const base = resolveBase(values.base, (args) => git(root, args));
   const changes = combinePaths(
-    requireGit(["diff", "--no-renames", "--name-only", "-z", base.tree, "--"]),
-    requireGit(["ls-files", "--others", "--exclude-standard", "-z"]),
+    requireGit(root, ["diff", "--no-renames", "--name-only", "-z", base.tree, "--"]),
+    requireGit(root, ["ls-files", "--others", "--exclude-standard", "-z"]),
   );
   console.log(`Changed paths from ${base.display} (Git ${base.kind} ${base.tree})`);
   for (const path of changes) console.log(`  ${path}`);
@@ -324,7 +326,7 @@ async function main() {
     for (const path of changes) {
       if (await exists(join(root, path))) present.add(path);
     }
-    const plan = await resolveTestPlan(changes, present, values.safe, temp);
+    const plan = await resolveTestPlan(root, changes, present, values.safe, temp);
     if (plan.fullSuiteReason) {
       console.log(
         `FULL VITEST SUITE selected for ${plan.fullSuiteReason}. Handing off to the parallel runner with the full-suite lock.`,
@@ -336,18 +338,20 @@ async function main() {
     let code = 0;
     if (plan.migrationChanged) {
       console.log("Running npm run db:check for drizzle changes.");
-      code |= await run("npm", ["run", "db:check"]);
+      code |= await run("npm", ["run", "db:check"], { cwd: root });
       checks.push("npm run db:check");
     }
     if (plan.scriptsChanged) {
       console.log("Running npm run test:scripts for package or runner changes.");
-      code |= await run("npm", ["run", "test:scripts"]);
+      code |= await run("npm", ["run", "test:scripts"], { cwd: root });
       checks.push("npm run test:scripts");
     }
     if (code !== 0) return 1;
     if (plan.fullSuiteReason) {
       const metrics = join(temp, "full-metrics.json");
-      const result = await run(process.execPath, [join(root, "scripts/test-parallel.mjs")], {
+      const runner = fileURLToPath(new URL("./test-parallel.mjs", import.meta.url));
+      const result = await run(process.execPath, [runner, "--root", root], {
+        cwd: root,
         env: { ...env, HUB_TEST_RUN_REPORT: metrics },
       });
       if (result !== 0) return result;
@@ -356,6 +360,7 @@ async function main() {
       return 0;
     }
     const direct = await selectedVitest(
+      root,
       ["run", ...[...plan.tests.keys()].map((path) => join(root, path))],
       join(temp, "direct.json"),
       env,
@@ -376,11 +381,7 @@ async function main() {
   }
 }
 
-if (
-  process.argv[1] &&
-  existsSync(process.argv[1]) &&
-  fileURLToPath(import.meta.url) === realpathSync(process.argv[1])
-) {
+if (isEntrypoint(import.meta.url)) {
   main().then(
     (code) => {
       process.exitCode = code;

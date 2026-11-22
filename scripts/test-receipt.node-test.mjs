@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { recordTestRun, verifyReceipt } from "./test-receipt.mjs";
 
@@ -55,6 +56,9 @@ test("records command, selected files and counts on a clean commit", async (t) =
   const saved = await verifyReceipt(directory, head.slice(0, 12));
   assert.deepEqual(JSON.parse(await readFile(first.path, "utf8")), saved);
   assert.equal(saved.head, head);
+  assert.equal(saved.commands[0].head, head);
+  assert.equal(saved.commands[0].root, await realpath(directory));
+  assert.equal(saved.commands[0].branch, gitBranch(directory));
   assert.equal(saved.cleanTree, true);
   assert.equal(saved.commands.length, 2);
   assert.deepEqual(saved.commands[0].command, command);
@@ -146,4 +150,34 @@ test("rejects edited commands, copied commits, and modified log files", async (t
 
   await writeFile(join(directory, ".test-receipts", "logs", `${entry.logSha256}.log`), "edited");
   await assert.rejects(verifyReceipt(directory, head), /log hash/u);
+});
+
+function gitBranch(directory) {
+  return execFileSync("git", ["-C", directory, "branch", "--show-current"], {
+    encoding: "utf8",
+  }).trim();
+}
+
+test("CLI refuses a different checkout and records evidence in an explicit root", async (t) => {
+  const { directory, head } = await gitFixture(t);
+  const { directory: target, head: targetHead } = await gitFixture(t);
+  const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
+  const run = (...args) =>
+    spawnSync(process.execPath, [runner, ...args], { cwd: directory, encoding: "utf8" });
+  const refused = run("--verify", head);
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /different Git worktree.*--root/su);
+
+  const allowed = run("--root", target, "--", process.execPath, "-p", "process.cwd()");
+  assert.equal(allowed.status, 0, allowed.stderr);
+  const root = await realpath(target);
+  assert.ok(allowed.stdout.includes(`Repository: ${root}`));
+  assert.ok(allowed.stdout.includes(`Branch: ${gitBranch(root)}`));
+  assert.ok(allowed.stdout.includes(`HEAD: ${targetHead}`));
+  assert.ok(allowed.stdout.includes(`CWD: ${await realpath(directory)}`));
+  assert.match(allowed.stdout, /Worktree: clean/u);
+  assert.match(allowed.stdout, /Run: .*process.cwd/u);
+  const saved = await verifyReceipt(root, targetHead);
+  assert.equal(saved.commands[0].root, root);
+  assert.equal(saved.commands[0].branch, gitBranch(root));
 });
