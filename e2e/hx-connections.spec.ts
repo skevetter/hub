@@ -115,6 +115,9 @@ for (const fail of [false, true]) {
       if (!fail) {
         const row = github.getByRole("listitem");
         await expect(page.getByText("GitHub disconnected.")).toHaveCount(0);
+        await expect(github.getByText("Updating", { exact: true })).toBeVisible();
+        await expect(github.getByText("Connected", { exact: true })).toHaveCount(0);
+        await expect(github.getByRole("button", { name: "Connect GitHub" })).toBeDisabled();
         await expect(row).toContainText("Being removed");
         await expect(row).toHaveAttribute("aria-busy", "true");
         await expect(row.getByRole("button")).toHaveCount(0);
@@ -140,6 +143,41 @@ for (const fail of [false, true]) {
     ).toBeVisible();
   });
 }
+
+test("withholds stale connection details when the revoke refresh pauses offline", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.connectGitHub("owner");
+  const github = projectApp(page).connections.card("GitHub");
+  await expect(github.getByText("Connected", { exact: true })).toBeVisible();
+  await page.route("**/_serverFn/**", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    await page.evaluate(() => window.dispatchEvent(new Event("offline")));
+    await route.fulfill({ response });
+  });
+
+  try {
+    await github.getByRole("button", { name: "Actions for acme-inc" }).click();
+    await page.getByRole("menuitem", { name: "Revoke" }).click();
+    await page.getByRole("button", { name: "Revoke connection" }).click();
+    await expect(page.getByRole("alert")).toContainText("Connections unavailable");
+    await expect(github).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Try again" })).toBeVisible();
+    await expect(page.getByText("GitHub disconnected.")).toHaveCount(0);
+  } finally {
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  }
+
+  await expect(github.getByText("Not set up", { exact: true })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "GitHub disconnected." })).toBeVisible();
+});
 
 test("keeps the initial failure passive and announces the result of retrying", async ({
   hub,
