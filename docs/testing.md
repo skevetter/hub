@@ -30,8 +30,9 @@ toolchain.
 After a sharded failure or interruption, `npm run test:parallel -- --rerun-failed` runs every
 file from the affected shards in one process. A passing rerun requires a zero exit and a complete
 passing report for those files. Run the parallel suite again if the retry list came from an older
-runner. Interrupted runs show how many files did not report in a separate line. A failure that
-passes on rerun can be sensitive to machine load.
+runner. The summary counts files without results separately from failed tests. On failure, the
+shard's `vitest.log` includes Vitest's own diagnostics and `results.json` contains the test report
+if Vitest could write it. A failure that passes on rerun can be sensitive to machine load.
 
 The test commands and runtime-file map generator print the target root, branch, HEAD, worktree
 status, current directory and planned action. Calling a script by path from a different Git

@@ -108,7 +108,7 @@ test("failure reporting keeps shard numbers and reruns failed shards in one proc
   assert.match(output.join("\n"), /Serial rerun: PASS/u);
 });
 
-test("a process failure with no named failed files offers to rerun the incomplete shard", async () => {
+test("a process failure with no named failed files offers a rerun without inflating failures", async () => {
   const output = [];
   const result = await runShards([["a.test.ts"]], {
     execute: async () => ({
@@ -116,14 +116,14 @@ test("a process failure with no named failed files offers to rerun the incomplet
       counts: { passed: 0, failed: 0, skipped: 0 },
       failedFiles: [],
       exitCode: 1,
-      diagnostic: "Vitest exited before writing a JSON report",
+      diagnostic: "Vitest failed after writing a complete JSON report",
     }),
     print: (line) => output.push(line),
   });
 
   assert.deepEqual(result, { exitCode: 1, failedFiles: ["a.test.ts"] });
-  assert.match(output.join("\n"), /Shard 1: FAIL.*\n.*Vitest exited before writing a JSON report/u);
-  assert.match(output.join("\n"), /Total: 1 files, 0 passed, 1 failed/u);
+  assert.match(output.join("\n"), /Shard 1: FAIL.*\n.*Vitest failed after writing/u);
+  assert.match(output.join("\n"), /Total: 1 files, 0 passed, 0 failed/u);
   assert.match(output.join("\n"), /--rerun-failed/u);
 });
 
@@ -161,9 +161,10 @@ test("a worker that exits mid-run lists every missing file for serial rerun", as
   const directory = await mkdtemp(join(tmpdir(), "hub-fake-shard-"));
   t.after(() => rm(directory, { recursive: true }));
   const output = [];
-  const invoke = async ([, , outputArg, completed, pending], shardDir) => {
+  const invoke = async (args, shardDir) => {
     await mkdir(shardDir);
-    const file = outputArg.slice("--outputFile=".length);
+    const file = args.find((arg) => arg.startsWith("--outputFile=")).slice("--outputFile=".length);
+    const [completed, pending, placeholder] = args.filter((arg) => arg.endsWith(".test.ts"));
     const report = {
       success: true,
       numTotalTests: 3,
@@ -172,6 +173,7 @@ test("a worker that exits mid-run lists every missing file for serial rerun", as
       testResults: [
         { name: completed, status: "passed", assertionResults: [{ status: "passed" }] },
         { name: pending, status: "passed", assertionResults: [{ status: "pending" }] },
+        { name: placeholder, status: "passed", assertionResults: [] },
       ],
     };
     const worker = spawnSync(process.execPath, [
@@ -182,7 +184,7 @@ test("a worker that exits mid-run lists every missing file for serial rerun", as
     ]);
     return { exitCode: worker.status ?? 1, processError: worker.signal };
   };
-  const files = ["done.test.ts", "lost.test.ts", "later.test.ts"];
+  const files = ["done.test.ts", "lost.test.ts", "placeholder.test.ts", "later.test.ts"];
   const result = await runShards([files], {
     execute: (name, selected) =>
       executeFiles(process.cwd(), name, selected, directory, new AbortController().signal, invoke),
@@ -190,7 +192,14 @@ test("a worker that exits mid-run lists every missing file for serial rerun", as
   });
   assert.deepEqual(result, { exitCode: 1, failedFiles: files });
   assert.match(output.join("\n"), /Shard 1:.*SIGKILL/u);
-  assert.match(output.join("\n"), /Total: 3 files, 2 passed, 2 failed, 0 skipped/u);
+  assert.match(
+    output.join("\n"),
+    /Shard 1: FAIL.*, 2 passed, 0 failed, 0 skipped, 3 files without a result/u,
+  );
+  assert.match(
+    output.join("\n"),
+    /Total: 4 files, 2 passed, 0 failed, 0 skipped, 3 files without a result/u,
+  );
 });
 
 test("takes over a stale full-suite lock and refuses a live owner", async (t) => {
@@ -726,6 +735,23 @@ test("parallel testing rejects failed JSON assertions even when Vitest exits zer
   await assert.rejects(readFile(metrics), { code: "ENOENT" });
 });
 
+test("a failed shard keeps Vitest's human-readable errors alongside the JSON report", async (t) => {
+  const { root, args, options } = await parallelFixture(
+    t,
+    `
+    writeFileSync(reportPath, JSON.stringify(report));
+    if (process.argv.includes("--reporter=default")) console.error("Unhandled Error: Worker exited unexpectedly");
+    process.exitCode = 1;
+    `,
+  );
+  const result = spawnSync(process.execPath, args, { ...options, encoding: "utf8", timeout: 5000 });
+  assert.equal(result.status, 1, result.stderr);
+  const log = result.stdout.match(/See (.+?\/vitest\.log) and/u)?.[1];
+  assert.ok(log, result.stdout);
+  assert.ok(log.startsWith(root));
+  assert.match(await readFile(log, "utf8"), /Unhandled Error: Worker exited unexpectedly/u);
+});
+
 test("parallel testing cannot publish metrics after HEAD changes during the run", async (t) => {
   const { root, args, options } = await parallelFixture(
     t,
@@ -757,7 +783,7 @@ test("serial reruns keep all files from a failed shard and require complete pass
     t,
     `
     const mode = process.env.FIXTURE_RUN_MODE;
-    const selected = process.argv.slice(5);
+    const selected = process.argv.filter((arg) => files.includes(arg));
     const b = files[1];
     const reported = mode === "missing" ? selected.filter((file) => file !== b) : selected;
     report.testResults = reported.map((name) => {
