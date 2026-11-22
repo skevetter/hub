@@ -51,8 +51,9 @@ If the isolation setting changes, harden these three sites.
 
 Use the owner's Mac daemon for the pilot profile and dedicate it to the pilot.
 Set `PASEO_HUB_SESSION_MAX_ACTIVE_PER_DAEMON` and the profile's `maxActive` to
-the planned thread count. For acceptance, use 12 for both and start at most 12
-Linear threads.
+the planned thread count before the first thread. For acceptance, use 12 for
+both and start at most 12 Linear threads. Saving the profile later can strand
+existing threads with `profile_changed`.
 
 A native session uses capacity until a follow-up in the same thread retires
 it. A failed or canceled turn, a sealed turn that lost proof, a pilot profile
@@ -66,7 +67,8 @@ The list query takes the pilot profile UUID as `$1` and shows open native
 sessions and their current pilot binding.
 
 ```sql
-SELECT s.id, s.state, s.generation, s.created_at AS started_at, b.native_session_id
+SELECT s.id, s.state, s.generation, s.created_at AS started_at, b.native_session_id,
+       s.daemon_id, s.daemon_agent_id
 FROM interactive_sessions AS s
 LEFT JOIN surface_bindings AS b
   ON b.session_id = s.id AND b.organization_id = s.organization_id
@@ -75,9 +77,11 @@ WHERE s.profile_id = $1::uuid AND s.origin = 'linear' AND s.state <> 'closed'
 ORDER BY s.created_at, s.id;
 ```
 
-Take a backup first. Stop the agent through Paseo if it is still running, then
-stop Hub before updating its database. Closing the Hub row releases capacity
-and retires its binding. Later prompts in that Linear thread are fenced.
+A session in `starting` can still launch an agent until Hub is stopped. Take a
+backup first, stop Hub, and wait for in-flight dispatch to settle. Re-run the
+list query. Use the listed daemon and agent IDs to confirm in Paseo that the
+agent has no running turn. If it does, stop it directly in Paseo and confirm
+the turn has ended before closing the session.
 
 Run the following statement as a single transaction. Bind the listed session
 UUID as `$1` and the pilot profile UUID as `$2`. It locks the exact open Linear
@@ -135,6 +139,11 @@ In `psql`, prepend `PREPARE pilot_list(uuid) AS` or
 `EXECUTE pilot_list('profile UUID')` or
 `EXECUTE pilot_close('session UUID', 'profile UUID')` with the actual UUIDs.
 
+Start Hub after the close transaction commits. Closing the row releases
+capacity and retires its binding. Later prompts in that thread are fenced. A
+pending first command stays unsettled under the closed row, and dispatch
+skips it.
+
 ## Follow-up messages
 
 Reply in the same Linear panel after the prior answer. Hub starts a fresh
@@ -165,6 +174,7 @@ blocked. Hub does not retry the interrupt automatically.
 
 A sealed turn has lost proof of the active turn and leaves the daemon agent
 running. Stop that agent directly through Paseo.
+Duplicate detection checks the most recent 1024 distinct assistant block IDs per turn.
 
 The daemon accepts an agent ID for an interrupt. A person driving the same agent
 directly through Paseo on the daemon can start a turn between Hub's check and

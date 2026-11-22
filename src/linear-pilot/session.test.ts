@@ -46,9 +46,9 @@ function ownedTurn() {
 
 const completion = stream({ type: "turn_completed", provider: "codex" });
 
-test("retains proof across 70 distinct assistant blocks", () => {
+test.each([70, 1500])("retains proof across %i distinct assistant blocks", (blocks) => {
   const turn = ownedTurn();
-  for (let index = 1; index <= 70; index++) {
+  for (let index = 1; index <= blocks; index++) {
     expect(
       turn.accept(
         row(
@@ -64,9 +64,9 @@ test("retains proof across 70 distinct assistant blocks", () => {
   }
   expect(turn.accept(completion)).toMatchObject({
     status: "completed",
-    seq: 71,
-    messageId: "block-70",
-    answer: { text: "Answer 70", truncated: false },
+    seq: blocks + 1,
+    messageId: `block-${blocks}`,
+    answer: { text: `Answer ${blocks}`, truncated: false },
   });
 });
 
@@ -85,9 +85,9 @@ test("a reused assistant block loses proof when it is current or immediately pre
   }
 });
 
-test("tracks only the current and previous assistant block ids", () => {
+test("an older assistant block cannot reopen within the duplicate window", () => {
   const turn = ownedTurn();
-  for (const [index, messageId] of ["first", "second", "third", "first"].entries()) {
+  for (const [index, messageId] of ["first", "second", "third"].entries()) {
     expect(
       turn.accept(
         row(
@@ -101,11 +101,33 @@ test("tracks only the current and previous assistant block ids", () => {
       ),
     ).toBeUndefined();
   }
-  expect(turn.accept(completion)).toMatchObject({
-    status: "completed",
-    answer: { text: "Answer 3", truncated: false },
-  });
+  expect(
+    turn.accept(row({ type: "assistant_message", messageId: "first", text: "Reused" }, 5)),
+  ).toMatchObject({ status: "unconfirmed" });
+  expect(turn.accept(completion)).toBeUndefined();
+  expect(turn.turnEnded).toBe(false);
 });
+
+test.each([
+  { intervening: 1023, expected: { status: "unconfirmed" } },
+  { intervening: 1024, expected: { status: "completed", answer: { text: "Reused" } } },
+  { intervening: 1025, expected: { status: "completed", answer: { text: "Reused" } } },
+])(
+  "applies the FIFO bound with $intervening intervening block ids",
+  ({ intervening, expected }) => {
+    const turn = ownedTurn();
+    turn.accept(row({ type: "assistant_message", messageId: "first", text: "Initial" }, 2));
+    for (let index = 0; index < intervening; index++) {
+      turn.accept(
+        row({ type: "assistant_message", messageId: `block-${index}`, text: "Other" }, index + 3),
+      );
+    }
+    const reuse = turn.accept(
+      row({ type: "assistant_message", messageId: "first", text: "Reused" }, intervening + 3),
+    );
+    expect(reuse ?? turn.accept(completion)).toMatchObject(expected);
+  },
+);
 
 test("the exact terminal turn selects only its final assistant block", () => {
   const turn = ownedTurn();
