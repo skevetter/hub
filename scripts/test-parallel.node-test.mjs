@@ -300,3 +300,48 @@ test("a symlinked runner path still executes the CLI", async (t) => {
   assert.match(result.stdout, /Repository: .+/u);
   assert.match(result.stderr, /TEST_SHARDS must be a positive integer/u);
 });
+
+test("an interrupt reports incomplete files separately from failed assertions", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hub-interrupted-shard-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const root = process.cwd();
+  const controller = new AbortController();
+  const output = [];
+  const files = ["failed.test.ts", "pending.test.ts", "missing.test.ts"];
+  const invoke = async (args, shard) => {
+    await mkdir(shard);
+    const report = args.find((arg) => arg.startsWith("--outputFile=")).split("=")[1];
+    await writeFile(
+      report,
+      JSON.stringify({
+        success: false,
+        numPassedTests: 0,
+        numFailedTests: 1,
+        testResults: [
+          {
+            name: join(root, files[0]),
+            status: "failed",
+            assertionResults: [{ status: "failed" }],
+          },
+          {
+            name: join(root, files[1]),
+            status: "passed",
+            assertionResults: [{ status: "pending" }],
+          },
+        ],
+      }),
+    );
+    controller.abort("SIGTERM");
+    return { exitCode: 1, processError: "SIGTERM" };
+  };
+
+  const result = await runShards([files], {
+    execute: (name, selected) =>
+      executeFiles(root, name, selected, directory, controller.signal, invoke),
+    print: (line) => output.push(line),
+    signal: controller.signal,
+  });
+  assert.deepEqual(result, { exitCode: 1, failedFiles: files });
+  assert.match(output.join("\n"), /Total: 3 files, 0 passed, 1 failed, 0 skipped/u);
+  assert.match(output.join("\n"), /^INTERRUPTED: 2 files did not report$/mu);
+});
