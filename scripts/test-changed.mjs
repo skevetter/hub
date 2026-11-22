@@ -16,6 +16,7 @@ import { join, posix, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { publishTestMetrics } from "./test-receipt.mjs";
+import { fullSuiteLockPath } from "./test-worker-group.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -24,6 +25,8 @@ const routeTree = "src/routeTree.gen.ts";
 const typography = "src/typography-policy.test.ts";
 const migrationTests = ["src/db/migrations.test.ts", "src/db/migrations.integration.test.ts"];
 const sourceExtensions = /\.(?:[cm]?[jt]sx?|json|css)$/u;
+const fullSuiteInputs =
+  /^(?:package(?:-lock)?\.json|(?:vite|vitest)(?:\.config|\.workspace)\.[cm]?[jt]s)$/u;
 
 function git(args) {
   const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf8" });
@@ -63,9 +66,30 @@ function repoPath(directory, path) {
   return relative(directory, path).split(sep).join("/");
 }
 
-export function selectTests(changes, discovered, present, safe) {
-  const tests = new Map([[typography, "typography policy guard"]]);
+export function selectTests(
+  changes,
+  discovered,
+  present,
+  safe,
+  { setupFiles = [], graphFiles = [] } = {},
+) {
   const migrationChanged = changes.some((path) => path.startsWith("drizzle/"));
+  const scriptsChanged = changes.some(
+    (path) => path.startsWith("scripts/") || path === "package.json",
+  );
+  const fullSuiteReason = changes.find(
+    (path) => fullSuiteInputs.test(path) || setupFiles.includes(path),
+  );
+  if (fullSuiteReason) {
+    return {
+      tests: new Map(discovered.map((path) => [path, `whole suite for ${fullSuiteReason}`])),
+      related: [],
+      migrationChanged,
+      scriptsChanged,
+      fullSuiteReason,
+    };
+  }
+  const tests = new Map([[typography, "typography policy guard"]]);
   if (migrationChanged) {
     for (const path of migrationTests) tests.set(path, "migration guard for drizzle changes");
   }
@@ -106,11 +130,18 @@ export function selectTests(changes, discovered, present, safe) {
       }
     }
   }
+  for (const path of graphFiles) {
+    if (available.has(path) && !tests.has(path)) tests.set(path, "module graph");
+  }
   return {
     tests,
     related,
     migrationChanged,
-    scriptsChanged: changes.some((path) => path.startsWith("scripts/") || path === "package.json"),
+    scriptsChanged,
+    fullSuiteReason:
+      discovered.length > 0 && discovered.every((path) => tests.has(path))
+        ? "selection covers every Vitest file"
+        : undefined,
   };
 }
 
@@ -168,16 +199,45 @@ async function checkRouteTree(rootDir, temp, env) {
   console.log(`Route tree guard passed for ${routeTree}.`);
 }
 
-async function selectedVitest(args, reportPath, env, allowEmpty = false) {
-  const code = await runVitest(
-    [
-      ...args,
-      "--reporter=json",
-      `--outputFile=${reportPath}`,
-      ...(allowEmpty ? ["--passWithNoTests"] : []),
-    ],
-    { env },
+async function resolveTestPlan(changes, present, safe, temp) {
+  const { createVitest } = await import("vitest/node");
+  const ctx = await createVitest(
+    "test",
+    { root, run: true, watch: false },
+    { cacheDir: join(temp, "graph") },
   );
+  try {
+    const specs = await ctx.globTestSpecifications();
+    const discovered = [...new Set(specs.map(({ moduleId }) => repoPath(root, moduleId)))];
+    const setupFiles = ctx.projects.flatMap(({ config }) =>
+      [...config.setupFiles, ...config.globalSetup].map((file) => repoPath(root, file)),
+    );
+    const plan = selectTests(changes, discovered, present, safe, { setupFiles });
+    if (plan.fullSuiteReason || !plan.related.length) return plan;
+    // Use the same graph query as Vitest related, then run only the resolved files.
+    ctx.config.related = plan.related.map((path) => join(root, path));
+    const graph = await ctx.getRelevantTestSpecifications();
+    return selectTests(changes, discovered, present, safe, {
+      setupFiles,
+      graphFiles: graph.map(({ moduleId }) => repoPath(root, moduleId)),
+    });
+  } finally {
+    await ctx.close();
+  }
+}
+
+async function requireFullSuiteIdle() {
+  try {
+    await access(fullSuiteLockPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error(`The full-suite lock is held at ${fullSuiteLockPath}.`);
+}
+
+async function selectedVitest(args, reportPath, env) {
+  const code = await runVitest([...args, "--reporter=json", `--outputFile=${reportPath}`], { env });
   try {
     const report = JSON.parse(await readFile(reportPath, "utf8"));
     return {
@@ -193,15 +253,11 @@ async function selectedVitest(args, reportPath, env, allowEmpty = false) {
       })),
     };
   } catch (error) {
-    if (allowEmpty && code === 0 && error.code === "ENOENT") {
-      return { code, counts: { passed: 0, failed: 0, skipped: 0 }, files: [] };
-    }
     throw new Error("Vitest exited without a readable test report.", { cause: error });
   }
 }
 
 function printTests(result, reason) {
-  if (result.files.length === 0) console.log("No Vitest files matched the module graph.");
   for (const { path, failed } of result.files) {
     console.log(`  ${path} (${reason(path)}${failed ? ", FAILED" : ""})`);
   }
@@ -221,37 +277,22 @@ async function main() {
   console.log(`Changed paths from ${base.display} (${base.tree})`);
   for (const path of changes) console.log(`  ${path}`);
 
-  if (
-    await access("/tmp/hub-fullsuite.lock").then(
-      () => true,
-      (error) => {
-        if (error.code === "ENOENT") return false;
-        throw error;
-      },
-    )
-  ) {
-    throw new Error("The full-suite lock is held at /tmp/hub-fullsuite.lock.");
-  }
   const temp = await mkdtemp(join(tmpdir(), "hub-changed-"));
   const env = { ...process.env, HUB_VITEST_CACHE_DIR: join(temp, "vite") };
   try {
     await checkRouteTree(root, temp, env);
     const checks = ["route tree"];
-    const listing = join(temp, "all-tests.json");
-    const discover = await runVitest(["list", "--filesOnly", `--json=${listing}`], { env });
-    if (discover !== 0) throw new Error("Vitest file discovery failed.");
-    const discovered = JSON.parse(await readFile(listing, "utf8")).map(({ file }) =>
-      repoPath(root, file),
-    );
     const present = new Set();
     for (const path of changes) {
       if (await exists(join(root, path))) present.add(path);
     }
-    const plan = selectTests(changes, discovered, present, values.safe);
-    if (plan.tests.size === discovered.length) {
-      throw new Error(
-        "The selected folders cover the full suite. Run npm run test:parallel in an exclusive window.",
+    const plan = await resolveTestPlan(changes, present, values.safe, temp);
+    if (plan.fullSuiteReason) {
+      console.log(
+        `FULL VITEST SUITE selected for ${plan.fullSuiteReason}. Handing off to the parallel runner with the full-suite lock.`,
       );
+    } else {
+      await requireFullSuiteIdle();
     }
 
     let code = 0;
@@ -265,39 +306,30 @@ async function main() {
       code |= await run("npm", ["run", "test:scripts"]);
       checks.push("npm run test:scripts");
     }
+    if (code !== 0) return 1;
+    if (plan.fullSuiteReason) {
+      const metrics = join(temp, "full-metrics.json");
+      const result = await run(process.execPath, [join(root, "scripts/test-parallel.mjs")], {
+        env: { ...env, HUB_TEST_RUN_REPORT: metrics },
+      });
+      if (result !== 0) return result;
+      const { selectedFiles, counts } = JSON.parse(await readFile(metrics, "utf8"));
+      await publishTestMetrics([{ files: selectedFiles, counts }], checks);
+      return 0;
+    }
     const direct = await selectedVitest(
       ["run", ...[...plan.tests.keys()].map((path) => join(root, path))],
       join(temp, "direct.json"),
       env,
     );
     printTests(direct, (path) => plan.tests.get(path) ?? "Vitest path match");
-    code |= direct.code;
     const reported = new Set(direct.files.map(({ path }) => path));
     const missing = [...plan.tests.keys()].filter((path) => !reported.has(path));
     if (missing.length)
       throw new Error(`Vitest did not report these selected files: ${missing.join(", ")}`);
-    const runs = [direct];
-    if (plan.related.length) {
-      console.log("Selecting related tests via the Vitest module graph for these paths");
-      for (const path of plan.related) console.log(`  ${path}`);
-      const related = await selectedVitest(
-        [
-          "related",
-          "--run",
-          ...plan.related.map((path) => join(root, path)),
-          ...[...plan.tests.keys()].map((path) => `--exclude=${path}`),
-        ],
-        join(temp, "related.json"),
-        env,
-        true,
-      );
-      printTests(related, () => "module graph");
-      code |= related.code;
-      runs.push(related);
-    }
-    if (code !== 0) return 1;
+    if (direct.code !== 0) return direct.code;
     await publishTestMetrics(
-      runs.map(({ files, counts }) => ({ files: files.map(({ path }) => path), counts })),
+      [{ files: direct.files.map(({ path }) => path), counts: direct.counts }],
       checks,
     );
     return 0;
