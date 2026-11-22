@@ -38,7 +38,7 @@ function database() {
 afterEach(() => vi.restoreAllMocks());
 
 describe("organization connection snapshot", () => {
-  it("reads the last seven days for each provider in the resolved organization", async () => {
+  it("reads the seven-day view with a ten-minute margin for each provider in the resolved organization", async () => {
     const db = database();
     vi.spyOn(Date, "now").mockReturnValue(now.getTime());
     const read = vi.spyOn(db, "readDroppedEventPresence");
@@ -49,7 +49,7 @@ describe("organization connection snapshot", () => {
 
     expect(read).toHaveBeenCalledTimes(4);
     for (const provider of ["linear", "github", "slack", "discord"]) {
-      expect(read).toHaveBeenCalledWith("org-1", provider, new Date("2026-11-14T12:00:00Z"));
+      expect(read).toHaveBeenCalledWith("org-1", provider, new Date("2026-11-14T12:10:00Z"));
     }
   });
 

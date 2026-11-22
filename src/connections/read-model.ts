@@ -1,9 +1,10 @@
 import type { Database } from "../db/types.js";
 
-const WEEK_MS = 7 * 86_400_000;
+// Leave time to open Activity before a reported drop can age out of its seven-day view.
+const CONNECTION_DROP_WINDOW_MS = 7 * 86_400_000 - 10 * 60_000;
 
 export async function readConnectionDrops(database: Database, organizationId: string) {
-  const since = new Date(Date.now() - WEEK_MS);
+  const since = new Date(Date.now() - CONNECTION_DROP_WINDOW_MS);
   const [linear, github, slack, discord] = await Promise.all([
     database.readDroppedEventPresence(organizationId, "linear", since),
     database.readDroppedEventPresence(organizationId, "github", since),
