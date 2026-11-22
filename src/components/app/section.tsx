@@ -32,7 +32,11 @@ export function Section({
               <p className="text-sm text-muted-foreground">{description}</p>
             )}
           </div>
-          {action === undefined ? null : <div className="shrink-0">{action}</div>}
+          {action === undefined ? null : (
+            <div className="shrink-0 [&>a]:inline-flex [&>a]:min-h-6 [&>a]:items-center">
+              {action}
+            </div>
+          )}
         </div>
       )}
       {children}
