@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants, createReadStream, realpathSync, writeFileSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, open, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ import {
   repositoryFor,
   requireGit,
 } from "./test-context.mjs";
+import { takeTestLock, waitForTestGroup, watchTestSignals } from "./test-worker-group.mjs";
 
 const reportVariable = "HUB_TEST_RUN_REPORT";
 
@@ -28,39 +29,36 @@ function revision(directory, ref) {
   return { head, tree };
 }
 
-function execute(args, cwd, report, log, stdio) {
+async function execute(args, cwd, report, log, { stdio, signal, lock }) {
+  signal?.throwIfAborted();
   const [command, ...rest] = args;
-  return new Promise((settle, reject) => {
-    const child = spawn(command, rest, {
-      cwd,
-      env: { ...process.env, [reportVariable]: report },
-      stdio: [stdio, "pipe", "pipe"],
-    });
-    let logError;
-    for (const [stream, output] of [
-      [child.stdout, process.stdout],
-      [child.stderr, process.stderr],
-    ]) {
-      stream.on("data", (chunk) => {
-        try {
-          if (!logError) writeFileSync(log.fd, chunk);
-        } catch (error) {
-          logError = error;
-        }
-        if (stdio === "inherit" && !output.write(chunk)) {
-          stream.pause();
-          output.once("drain", () => stream.resume());
-        }
-      });
-    }
-    child.on("error", (error) => {
-      logError = error;
-    });
-    child.on("close", (code) => {
-      if (logError) reject(logError);
-      else settle(code ?? 1);
-    });
+  const child = spawn(command, rest, {
+    cwd,
+    env: { ...process.env, [reportVariable]: report },
+    stdio: [stdio, "pipe", "pipe"],
+    detached: true,
   });
+  let logError;
+  for (const [stream, output] of [
+    [child.stdout, process.stdout],
+    [child.stderr, process.stderr],
+  ]) {
+    stream.on("data", (chunk) => {
+      try {
+        if (!logError) writeFileSync(log.fd, chunk);
+      } catch (error) {
+        logError = error;
+      }
+      if (stdio === "inherit" && !output.write(chunk)) {
+        stream.pause();
+        output.once("drain", () => stream.resume());
+      }
+    });
+  }
+  // A wrapped runner can be waiting for its own detached groups to stop.
+  const { exitCode, error } = await waitForTestGroup(child, { signal, lock, graceMs: 20_000 });
+  if (error || logError) throw error ?? logError;
+  return signal?.aborted ? 1 : exitCode;
 }
 
 function canonicalJson(value) {
@@ -112,11 +110,18 @@ async function checkReceipt(receipt, { head, tree }, directory, root) {
 }
 
 async function readJson(path) {
+  let file;
   try {
-    return JSON.parse(await readFile(path, "utf8"));
+    file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
   } catch (error) {
     if (error.code === "ENOENT") return null;
     throw error;
+  }
+  try {
+    if (!(await file.stat()).isFile()) throw new Error(`Expected a regular file at ${path}.`);
+    return JSON.parse(await file.readFile("utf8"));
+  } finally {
+    await file.close();
   }
 }
 
@@ -155,7 +160,7 @@ function validateMetrics(metrics) {
   }
 }
 
-export async function recordTestRun(directory, command, { stdio = "inherit" } = {}) {
+export async function recordTestRun(directory, command, { stdio = "inherit", signal } = {}) {
   if (!command.length) throw new Error("A test command is required.");
   const { root, branch, head, tree } = cleanHead(directory);
   const checkUnchanged = () => {
@@ -163,8 +168,16 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
     if (current.head !== head || current.branch !== branch)
       throw new Error("HEAD or branch changed while the command ran.");
   };
-  const temp = await mkdtemp(join(tmpdir(), "hub-receipt-"));
+  const receiptDir = join(directory, ".test-receipts");
+  await mkdir(receiptDir, { recursive: true });
+  const destination = join(receiptDir, `${head}.json`);
+  const pending = join(receiptDir, `${head}.tmp-${process.pid}`);
+  const lock = await takeTestLock(join(receiptDir, `${head}.lock`), "receipt");
+  let temp;
   try {
+    signal?.throwIfAborted();
+    checkUnchanged();
+    temp = await mkdtemp(join(tmpdir(), "hub-receipt-"));
     const report = join(temp, "metrics.json");
     const started = performance.now();
     const startedAt = new Date().toISOString();
@@ -172,13 +185,13 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
     const log = await open(logFile, "wx", 0o600);
     let code;
     try {
-      code = await execute(command, directory, report, log, stdio);
+      code = await execute(command, directory, report, log, { stdio, signal, lock });
     } finally {
       await log.close();
     }
     const completedAt = new Date().toISOString();
     const durationMs = Math.round(performance.now() - started);
-    checkUnchanged();
+    if (code === 0) checkUnchanged();
     const metrics = code === 0 ? await readJson(report) : null;
     validateMetrics(metrics);
     if (metrics && (metrics.root !== root || metrics.head !== head)) {
@@ -205,47 +218,45 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
         (await readJson(join(directory, "node_modules/vitest/package.json")))?.version ?? null,
       logSha256: await fileHash(logFile),
     };
-    const receiptDir = join(directory, ".test-receipts");
-    await mkdir(receiptDir, { recursive: true });
-    const destination = join(receiptDir, `${head}.json`);
-    const pending = join(receiptDir, `${head}.tmp-${process.pid}`);
-    const lockPath = join(receiptDir, `${head}.lock`);
-    const lock = await open(lockPath, "wx", 0o600);
+    if (code === 0) checkUnchanged();
+    const existing = await readJson(destination);
+    if (existing) await checkReceipt(existing, { head, tree }, receiptDir, root);
+    const previous = existing?.commands ?? [];
+    const commands = previous.filter(
+      (item) => JSON.stringify(item.command) !== JSON.stringify(command),
+    );
+    if (code !== 0 && commands.length === previous.length) return { code, path: null };
+    await mkdir(join(receiptDir, "logs"), { recursive: true, mode: 0o700 });
+    await copyFile(logFile, logPath(receiptDir, entry.logSha256), constants.COPYFILE_EXCL).catch(
+      async (error) => {
+        if (
+          error.code !== "EEXIST" ||
+          (await fileHash(logPath(receiptDir, entry.logSha256))) !== entry.logSha256
+        )
+          throw error;
+      },
+    );
+    if (signal?.aborted) {
+      code = 1;
+      entry.exitCode = code;
+      if (commands.length === previous.length) return { code, path: null };
+    }
+    commands.push(entry);
+    const payload = { version: 4, head, tree, cleanTree: true, commands };
+    const data = { ...payload, sha256: receiptHash(payload) };
     try {
-      checkUnchanged();
-      const existing = await readJson(destination);
-      if (existing) await checkReceipt(existing, { head, tree }, receiptDir, root);
-      const previous = existing?.commands ?? [];
-      const commands = previous.filter(
-        (item) => JSON.stringify(item.command) !== JSON.stringify(command),
-      );
-      if (code !== 0 && commands.length === previous.length) return { code, path: null };
-      await mkdir(join(receiptDir, "logs"), { recursive: true, mode: 0o700 });
-      await copyFile(logFile, logPath(receiptDir, entry.logSha256), constants.COPYFILE_EXCL).catch(
-        async (error) => {
-          if (
-            error.code !== "EEXIST" ||
-            (await fileHash(logPath(receiptDir, entry.logSha256))) !== entry.logSha256
-          )
-            throw error;
-        },
-      );
-      commands.push(entry);
-      const payload = { version: 4, head, tree, cleanTree: true, commands };
-      const data = { ...payload, sha256: receiptHash(payload) };
       await writeFile(pending, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await rename(pending, destination);
     } finally {
-      try {
-        await rm(pending, { force: true });
-      } finally {
-        await lock.close();
-        await rm(lockPath);
-      }
+      await rm(pending, { force: true });
     }
     return { code, path: destination };
   } finally {
-    await rm(temp, { recursive: true });
+    try {
+      if (temp) await rm(temp, { recursive: true });
+    } finally {
+      lock.release();
+    }
   }
 }
 
@@ -264,7 +275,7 @@ export async function verifyReceipt(directory, sha) {
   return receipt;
 }
 
-async function main(args) {
+async function main(args, signal) {
   const delimiter = args.indexOf("--");
   const { values } = parseArgs({
     args: delimiter === -1 ? args : args.slice(0, delimiter),
@@ -299,19 +310,25 @@ async function main(args) {
       : args.slice(delimiter + 1);
   if (!command.length) throw new Error("Use --verify <sha> or -- <command> [arguments].");
   printRunContext(root, `record ${command.map((part) => JSON.stringify(part)).join(" ")}`);
-  const result = await recordTestRun(root, command);
+  const result = await recordTestRun(root, command, { signal });
   if (result.path) console.log(`Wrote ${result.path}.`);
   return result.code;
 }
 
 if (isEntrypoint(import.meta.url)) {
-  main(process.argv.slice(2)).then(
-    (code) => {
-      process.exitCode = code;
-    },
-    (error) => {
-      console.error(error.message);
-      process.exitCode = 1;
-    },
-  );
+  const { signal, close } = watchTestSignals();
+  main(process.argv.slice(2), signal)
+    .then(
+      (code) => {
+        process.exitCode = signal.aborted ? 1 : code;
+      },
+      (error) => {
+        if (error !== signal.reason) console.error(error.message);
+        process.exitCode = 1;
+      },
+    )
+    .finally(() => {
+      if (signal.aborted) console.log(`INTERRUPTED: ${signal.reason}`);
+      close();
+    });
 }

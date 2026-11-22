@@ -8,7 +8,7 @@ import { parseArgs } from "node:util";
 import { generateRuntimeMap } from "./generate-test-runtime-files.mjs";
 import { git, isEntrypoint, printRunContext, repositoryFor, requireGit } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
-import { takeFullSuiteLock, stopGroup, testSignals } from "./test-worker-group.mjs";
+import { takeFullSuiteLock, waitForTestGroup, watchTestSignals } from "./test-worker-group.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 
 const routeTree = "src/routeTree.gen.ts";
@@ -183,75 +183,24 @@ async function exists(path) {
   }
 }
 
-class Interrupted extends Error {
-  constructor(signal) {
-    super(`INTERRUPTED: ${signal}`);
-    this.signal = signal;
-  }
-}
-
-// Every child gets its own process group so a signal to this script reaches the whole tree.
-function supervise(getLock) {
-  const groups = new Set();
-  let received;
-  const forward = (signal) => {
-    received ??= signal;
-    for (const pid of groups) {
-      try {
-        process.kill(-pid, signal);
-      } catch (error) {
-        if (error.code !== "ESRCH") throw error;
-      }
-    }
-  };
-  for (const signal of testSignals) process.on(signal, forward);
-  const check = () => {
-    if (received) throw new Interrupted(received);
-  };
+function supervise(signal, getLock) {
   return {
-    check,
-    run(command, args, { cwd, env = process.env }) {
-      check();
-      return new Promise((settle, reject) => {
-        const child = spawn(command, args, {
-          cwd,
-          env,
-          stdio: ["ignore", "inherit", "inherit"],
-          detached: true,
-        });
-        let childError;
-        const lock = getLock();
-        let registered = false;
-        if (child.pid) groups.add(child.pid);
-        child.on("error", (error) => {
-          childError = error;
-        });
-        child.on("close", async (code) => {
-          try {
-            // Descendants can outlive the leader.
-            if (child.pid && (lock || received)) await stopGroup(child.pid, received ?? "SIGTERM");
-            if (registered) lock.forget(child.pid);
-          } catch (error) {
-            childError ??= error;
-          }
-          groups.delete(child.pid);
-          if (childError) reject(childError);
-          else if (received) reject(new Interrupted(received));
-          else settle(code ?? 1);
-        });
-        if (child.pid && lock) {
-          try {
-            lock.track(child.pid);
-            registered = true;
-          } catch (error) {
-            childError = error;
-            void stopGroup(child.pid, "SIGTERM").catch(reject);
-          }
-        }
+    async run(command, args, { cwd, env = process.env, graceMs = 3000 }) {
+      signal.throwIfAborted();
+      const child = spawn(command, args, {
+        cwd,
+        env,
+        stdio: ["ignore", "inherit", "inherit"],
+        detached: true,
       });
-    },
-    close() {
-      for (const signal of testSignals) process.off(signal, forward);
+      const { exitCode, error } = await waitForTestGroup(child, {
+        signal,
+        lock: getLock(),
+        graceMs,
+      });
+      if (error) throw error;
+      signal.throwIfAborted();
+      return exitCode;
     },
   };
 }
@@ -367,7 +316,7 @@ function printTests(result, reason) {
   console.log(`  ${passed} passed, ${failed} failed, ${skipped} skipped`);
 }
 
-async function main() {
+async function main(signal) {
   const { values } = parseArgs({
     options: { base: { type: "string" }, safe: { type: "boolean" }, root: { type: "string" } },
   });
@@ -383,7 +332,7 @@ async function main() {
   for (const path of changes) console.log(`  ${path}`);
 
   let lock;
-  const supervisor = supervise(() => lock);
+  const supervisor = supervise(signal, () => lock);
   let temp;
   try {
     lock = await takeFullSuiteLock();
@@ -396,7 +345,7 @@ async function main() {
       if (await exists(join(root, path))) present.add(path);
     }
     const plan = await resolveTestPlan(root, changes, present, values.safe, temp);
-    supervisor.check();
+    signal.throwIfAborted();
     if (plan.fullSuiteReason) {
       console.log(
         `FULL VITEST SUITE selected for ${plan.fullSuiteReason}. Handing off to the parallel runner with the full-suite lock.`,
@@ -423,6 +372,8 @@ async function main() {
       const result = await supervisor.run(process.execPath, [runner, "--root", root], {
         cwd: root,
         env: { ...env, HUB_TEST_RUN_REPORT: metrics },
+        // Let the parallel runner finish stopping its detached shards.
+        graceMs: 12_000,
       });
       if (result !== 0) return result;
       const { selectedFiles, counts } = JSON.parse(await readFile(metrics, "utf8"));
@@ -448,31 +399,29 @@ async function main() {
       root,
     );
     return 0;
-  } catch (error) {
-    if (!(error instanceof Interrupted)) throw error;
-    console.log(error.message);
-    return 1;
   } finally {
     try {
       if (temp) await rm(temp, { recursive: true });
     } finally {
-      try {
-        lock?.release();
-      } finally {
-        supervisor.close();
-      }
+      lock?.release();
     }
   }
 }
 
 if (isEntrypoint(import.meta.url)) {
-  main().then(
-    (code) => {
-      process.exitCode = code;
-    },
-    (error) => {
-      console.error(error.message);
-      process.exitCode = 1;
-    },
-  );
+  const { signal, close } = watchTestSignals();
+  main(signal)
+    .then(
+      (code) => {
+        process.exitCode = signal.aborted ? 1 : code;
+      },
+      (error) => {
+        if (error !== signal.reason) console.error(error.message);
+        process.exitCode = 1;
+      },
+    )
+    .finally(() => {
+      if (signal.aborted) console.log(`INTERRUPTED: ${signal.reason}`);
+      close();
+    });
 }
