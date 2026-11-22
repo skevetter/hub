@@ -12,7 +12,7 @@ import { resolveRouteTenant } from "../projects/access.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { projectTriggerForm } from "../triggers/configuration/editor.js";
-import { deriveChecklist } from "./checklist.js";
+import { canFinishSetup } from "./checklist.js";
 import { HOME_MONTH_DAYS, HOME_OPEN_SESSIONS_LIMIT } from "./limits.js";
 
 /** How far back the overview looks. One week is long enough to hold a first run and short enough that a nudge fades once a trigger listens. */
@@ -26,14 +26,14 @@ export interface RunTally {
   failed: number;
 }
 
-/** What the reader can see of interactive sessions; absent when the feature is off. */
+/** Session profiles and the reader's own sessions; absent when the feature is off. */
 export interface HomeSessions {
   /** Profiles a session can start from. */
   profiles: number;
-  /** Sessions the reader takes part in that are not closed. */
+  /** Open sessions the reader started or participates in, up to the Home limit. */
   open: number;
   openCapped: boolean;
-  /** Whether the reader has ever taken part in a session, open or not. */
+  /** Whether the reader started or participates in any session, open or closed. */
   started: boolean;
 }
 
@@ -106,16 +106,15 @@ export class HomeDashboard {
     const completedAt = await this.database.getHomeChecklistCompletedAt(organization.id);
     if (completedAt !== null) return completedAt.toISOString();
 
-    const snapshot = await this.readSnapshot(organization, readerOf(tenant, account.account.id));
+    const snapshot = await this.readSnapshot(organization, null);
     if (snapshot.checklistCompletedAt !== null) return snapshot.checklistCompletedAt;
-    if (!deriveChecklist(snapshot).complete)
-      throw new ProductRequestError(409, "checklist_incomplete");
+    if (!canFinishSetup(snapshot)) throw new ProductRequestError(409, "checklist_incomplete");
     return (await this.database.completeHomeChecklist(organization.id)).toISOString();
   }
 
   private async readSnapshot(
     organization: HomeSnapshot["organization"],
-    reader: SessionPrincipal,
+    reader: SessionPrincipal | null,
   ): Promise<HomeSnapshot> {
     const organizationId = organization.id;
     const now = this.now().getTime();
@@ -145,7 +144,7 @@ export class HomeDashboard {
         organizationId,
         new Date(now - HOME_MONTH_DAYS * DAY_MS),
       ),
-      this.readSessions(reader),
+      reader === null ? null : this.readSessions(reader),
       this.database.countRecentDroppedEvents(organizationId, since),
       this.database.getHomeChecklistCompletedAt(organizationId),
     ]);
@@ -209,34 +208,15 @@ export class HomeDashboard {
     };
   }
 
-  /**
-   * Sessions are visible to their participants only, so these are the reader's own numbers. The
-   * second list is asked only when nothing is open: an open session already proves one exists.
-   */
   private async readSessions(reader: SessionPrincipal): Promise<HomeSessions | null> {
     if (this.options.interactiveSessions !== true) return null;
-    const [profiles, open] = await Promise.all([
+    const [profiles, own] = await Promise.all([
       this.database.listSessionProfiles(reader.organizationId),
-      this.database.listInteractiveSessions(reader.organizationId, reader, {
-        filter: "active",
-        cursor: null,
-        limit: HOME_OPEN_SESSIONS_LIMIT,
-      }),
+      this.database.countOwnInteractiveSessions(reader, HOME_OPEN_SESSIONS_LIMIT),
     ]);
-    const started =
-      open.sessions.length > 0 ||
-      (
-        await this.database.listInteractiveSessions(reader.organizationId, reader, {
-          filter: "all",
-          cursor: null,
-          limit: 1,
-        })
-      ).sessions.length > 0;
     return {
       profiles: profiles.filter(({ status }) => status === "active").length,
-      open: open.sessions.length,
-      openCapped: open.nextCursor !== null,
-      started,
+      ...own,
     };
   }
 }

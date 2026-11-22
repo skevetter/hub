@@ -37,6 +37,7 @@ import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
 import { DROP_REASON_GROUPS, type DropReasonGroup } from "../triggers/drop-reason.js";
 import { LIST_PROVIDER_LABELS } from "../triggers/list-providers.js";
 import {
+  canFinishSetup,
   deriveChecklist,
   type Checklist as ChecklistState,
   type ChecklistStep,
@@ -349,6 +350,7 @@ function HomeChecklist({
 }) {
   const { organization } = snapshot;
   const checklist = deriveChecklist(snapshot);
+  const setupReady = canFinishSetup(snapshot);
   const queryClient = useQueryClient();
   const finish = useServerFn(finishHomeSetup);
   const completion = useMutation({
@@ -378,13 +380,13 @@ function HomeChecklist({
           focusOnArrival
         />
       ) : null}
-      {checklist.complete ? (
+      {setupReady ? (
         <Card
-          title="You are all set"
+          title={checklist.complete ? "You are all set" : "Organization setup"}
           description={
             operator
-              ? "Every setup step is complete. Finishing hides this card for the whole organization."
-              : "Every setup step is complete. An instance operator can finish setup."
+              ? "Finishing setup hides Getting started for the whole organization."
+              : "An instance operator can finish setup."
           }
           action={
             operator ? (
@@ -398,7 +400,8 @@ function HomeChecklist({
             ) : undefined
           }
         />
-      ) : (
+      ) : null}
+      {!checklist.complete ? (
         <GetStarted
           checklist={checklist}
           snapshot={snapshot}
@@ -406,7 +409,7 @@ function HomeChecklist({
           accountId={accountId}
           operator={operator}
         />
-      )}
+      ) : null}
     </Section>
   );
 }
@@ -560,7 +563,10 @@ function sessionStep(
     const open = sessions?.open ?? 0;
     return {
       title,
-      hint: open === 0 ? "You have talked to an agent here." : `${String(open)} open now`,
+      hint:
+        open === 0
+          ? "You started or joined a session."
+          : `${String(open)}${sessions?.openCapped === true ? "+" : ""} open now`,
       status: DONE,
     };
   }

@@ -380,6 +380,8 @@ class PgDatabase implements Database {
     this.interactiveSessions.acceptInteractiveSessionCommand(...args);
   listInteractiveSessions: Database["listInteractiveSessions"] = (...args) =>
     this.interactiveSessions.listInteractiveSessions(...args);
+  countOwnInteractiveSessions: Database["countOwnInteractiveSessions"] = (...args) =>
+    this.interactiveSessions.countOwnInteractiveSessions(...args);
   findInteractiveSession: Database["findInteractiveSession"] = (...args) =>
     this.interactiveSessions.findInteractiveSession(...args);
   listInteractiveSessionMessages: Database["listInteractiveSessionMessages"] = (...args) =>

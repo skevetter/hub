@@ -100,6 +100,12 @@ export interface SessionPageInput {
   limit: number;
 }
 
+export interface OwnSessionFacts {
+  open: number;
+  openCapped: boolean;
+  started: boolean;
+}
+
 interface SessionScope {
   organizationId: string;
   sessionId: string;
@@ -180,6 +186,10 @@ export interface InteractiveSessionStore {
     viewer: SessionPrincipal,
     page: SessionPageInput,
   ): Promise<SessionListPage>;
+  countOwnInteractiveSessions(
+    viewer: SessionPrincipal,
+    openLimit: number,
+  ): Promise<OwnSessionFacts>;
   findInteractiveSession(
     organizationId: string,
     sessionId: string,
