@@ -10,6 +10,7 @@ import { FormField } from "../components/app/form-field.js";
 import { changePassword, signOut } from "./functions.js";
 import type { Result } from "../contract/respond.js";
 import type { AccountState } from "./organization-contract.js";
+import { leaveReader } from "./reader-cache.js";
 
 type EmptyResult = Result<Record<string, never>>;
 
@@ -32,7 +33,9 @@ export function PasswordChangeEntry({
     mutationFn: useServerFn(signOut) as (
       input: Parameters<typeof signOut>[0],
     ) => Promise<EmptyResult>,
-    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["account"] }),
+    onSuccess: (result) => {
+      if (result.status === "ok") leaveReader(queryClient);
+    },
   });
   const submit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
@@ -62,21 +65,47 @@ export function PasswordChangeEntry({
     leave.mutate({});
   }, [leave]);
   return (
+    <PasswordChangeForm
+      email={account.email}
+      message={message}
+      busy={busy}
+      onSubmit={submit}
+      onSignOut={signOutAccount}
+    />
+  );
+}
+
+interface PasswordChangeFormProps {
+  email: string;
+  message: string | undefined;
+  busy: boolean;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSignOut: () => void;
+}
+
+function PasswordChangeForm({
+  email,
+  message,
+  busy,
+  onSubmit,
+  onSignOut,
+}: PasswordChangeFormProps) {
+  return (
     <AuthLayout>
       <AuthCard
         titleId="password-change-heading"
         title="Choose a new password"
         description="Your temporary password must be replaced before you can continue."
       >
-        <p className="text-sm text-muted-foreground">Signed in as {account.email}</p>
+        <p className="text-sm text-muted-foreground">Signed in as {email}</p>
         <ErrorSummary message={message} />
         <AuthForm
           label="Choose a new password"
           busy={busy}
           submitLabel="Save password"
-          onSubmit={submit}
+          onSubmit={onSubmit}
           secondaryLabel="Sign out"
-          onSecondary={signOutAccount}
+          onSecondary={onSignOut}
         >
           <FormField
             label="Current password"
