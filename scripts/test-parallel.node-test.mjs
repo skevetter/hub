@@ -475,7 +475,7 @@ async function parallelFixture(t, run) {
     if (process.argv[2] === "list") {
       writeFileSync(output("--json="), JSON.stringify([{ file }]));
     } else {
-      const report = { success: true, numPassedTests: 1, numFailedTests: 0,
+      const report = { success: true, numPassedTests: 1, numFailedTests: 0, numTotalTests: 1,
         testResults: [{ name: file, status: "passed", assertionResults: [{ status: "passed" }] }] };
       const reportPath = output("--outputFile=");
       ${run}
@@ -701,4 +701,26 @@ test("parallel shards and serial reruns fail when a passing worker leaves backgr
       }
     });
   }
+});
+
+test("parallel testing rejects failed JSON assertions even when Vitest exits zero", async (t) => {
+  const { root, args, options } = await parallelFixture(
+    t,
+    `
+    report.numFailedTests = 1;
+    report.testResults[0].status = "failed";
+    report.testResults[0].assertionResults.push({ status: "failed" });
+    writeFileSync(reportPath, JSON.stringify(report));
+  `,
+  );
+  const metrics = join(root, "metrics.json");
+  const result = spawnSync(process.execPath, args, {
+    ...options,
+    env: { ...options.env, HUB_TEST_RUN_REPORT: metrics },
+    encoding: "utf8",
+    timeout: 5000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stdout, /Shard 1: FAIL/u);
+  await assert.rejects(readFile(metrics), { code: "ENOENT" });
 });
