@@ -21,7 +21,7 @@ export const homeSnapshot = createServerFn({ method: "GET" })
       return respondWithFailure(
         error,
         { operation: "home.snapshot", component: "home", organizationSlug: data.organizationSlug },
-        { fallback: "Hub couldn't load this organization's overview. Reload the page." },
+        { fallback: "Hub could not load this organization's activity and setup." },
       );
     }
   });
