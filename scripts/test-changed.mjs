@@ -65,9 +65,21 @@ export function resolveBase(base, gitCommand) {
     kind: "commit",
     reason,
   });
+  const upstream = gitCommand([
+    "rev-parse",
+    "--abbrev-ref",
+    "--symbolic-full-name",
+    "@{upstream}",
+  ])?.trim();
+  // Fewest commits to HEAD wins. Ties keep this order: releases by version, upstream, origin/main.
+  const candidates = [
+    ...releaseRefs(gitCommand).map((ref) => ({ ref, reason: "closest release branch" })),
+    ...(upstream ? [{ ref: upstream, reason: "configured upstream" }] : []),
+    { ref: "origin/main", reason: "origin/main" },
+  ];
   const distances = new Map();
   let closest;
-  for (const ref of releaseRefs(gitCommand)) {
+  for (const { ref, reason } of candidates) {
     const commit = mergeBase(ref);
     if (!commit) continue;
     if (!distances.has(commit)) {
@@ -76,24 +88,12 @@ export function resolveBase(base, gitCommand) {
       distances.set(commit, Number(count));
     }
     const distance = distances.get(commit);
-    if (!closest || distance < closest.distance) closest = { ref, commit, distance };
+    if (!closest || distance < closest.distance) closest = { ref, commit, distance, reason };
   }
   if (closest) {
-    const { ref, commit, distance } = closest;
-    return fromRef(ref, commit, `closest release branch (${distance} commits to HEAD)`);
+    const { ref, commit, distance, reason } = closest;
+    return fromRef(ref, commit, `${reason}, ${distance} commits to HEAD`);
   }
-  const upstream = gitCommand([
-    "rev-parse",
-    "--abbrev-ref",
-    "--symbolic-full-name",
-    "@{upstream}",
-  ])?.trim();
-  if (upstream) {
-    const commit = mergeBase(upstream);
-    if (commit) return fromRef(upstream, commit, "configured upstream");
-  }
-  const main = mergeBase("origin/main");
-  if (main) return fromRef("origin/main", main, "no release merge base or upstream");
   throw new Error("No local merge base found. Pass --base with a Git commit or branch.");
 }
 

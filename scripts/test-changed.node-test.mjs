@@ -238,6 +238,30 @@ async function changedFixture(t, scripts) {
   return fixture;
 }
 
+test("a closer upstream or origin/main beats an older release fork point", async (t) => {
+  const { run, commit, find } = await releaseFixture(t);
+  const forkPoint = commit("main before the release");
+  run("switch", "--quiet", "-c", "release/notifications-1");
+  commit("release change");
+  run("switch", "--quiet", "main");
+  commit("main after the release");
+  const latest = commit("latest main");
+  run("update-ref", "refs/remotes/origin/main", latest);
+  run("switch", "--quiet", "-c", "feature");
+  commit("feature change");
+  assert.equal(find().tree, latest);
+  assert.match(find().display, /origin\/main/u);
+  assert.match(find().reason, /1 commits to HEAD/u);
+
+  run("branch", "--set-upstream-to=main");
+  assert.equal(find().tree, latest);
+  assert.match(find().reason, /configured upstream/u);
+
+  run("update-ref", "refs/remotes/origin/main", forkPoint);
+  run("branch", "--unset-upstream");
+  assert.match(find().display, /release\/notifications-1/u);
+});
+
 test("test-changed forwards TERM, INT and HUP and waits for the full-suite child", async (t) => {
   const { root } = await changedFixture(t, {
     "scripts/test-parallel.mjs": `
