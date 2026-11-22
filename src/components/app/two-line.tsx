@@ -4,8 +4,8 @@ import { cn } from "../../lib/utils.js";
 
 /**
  * The one way a record shows two facts: what it is, over the quieter fact that identifies it.
- * Emphasis here is colour and size, never weight, and both lines truncate rather than wrap so
- * a table row keeps its height whatever the data is. A line only truncates when whatever holds
+ * Emphasis here is colour and size, never weight. Both lines truncate to keep table rows the
+ * same height. Record lists let their primary label wrap. A line only truncates when whatever holds
  * it is narrower than the line: on its own it is as wide as its longer line, so a table column
  * sized to its content shows all of it. A string line carries itself as its title, so a value
  * that was cut is one hover away.
@@ -30,7 +30,10 @@ export function TwoLine({
     // In a filling cell the record also takes the row it sits in, beside a glyph or not, so its
     // secondary line has the whole column to give way in rather than the primary line's width.
     <span className="flex min-w-0 flex-col gap-0.5 in-data-[slot=fill-cell]:grow">
-      <span className="truncate text-sm" title={titleOf(primary)}>
+      <span
+        className="truncate text-sm in-data-[slot=record-row]:wrap-anywhere in-data-[slot=record-row]:whitespace-normal"
+        title={titleOf(primary)}
+      >
         {primary}
       </span>
       {secondary === undefined ? null : (
