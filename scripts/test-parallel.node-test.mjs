@@ -577,7 +577,7 @@ test("TERM after the serial worker exits cannot turn its report into a pass", as
   }
 });
 
-test("TERM during shard timing-cache reads prevents successful suite metrics", async (t) => {
+test("TERM during shard timing-cache reads preserves the prior successful cache", async (t) => {
   const { root, lock, args, options } = await parallelFixture(
     t,
     `
@@ -591,6 +591,9 @@ test("TERM during shard timing-cache reads prevents successful suite metrics", a
   const preload = join(root, "pause-timings.mjs");
   const marker = join(root, "reading-timings");
   const metrics = join(root, "metrics.json");
+  const cache = join(root, "node_modules/.vite/vitest/test-parallel/results.json");
+  const previous = JSON.stringify({ version: "previous-success", results: [] });
+  await writeFile(cache, previous);
   await writeFile(
     preload,
     `
@@ -639,6 +642,7 @@ test("TERM during shard timing-cache reads prevents successful suite metrics", a
     assert.match(output, /Shard 1: PASS/u);
     assert.match(output, /INTERRUPTED: SIGTERM/u);
     await assert.rejects(readFile(metrics), { code: "ENOENT" });
+    assert.equal(await readFile(cache, "utf8"), previous);
     await assert.rejects(readFile(lock), { code: "ENOENT" });
   } finally {
     if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
@@ -653,6 +657,7 @@ test("TERM during shard timing-cache reads prevents successful suite metrics", a
   });
   assert.equal(passing.status, 0, passing.stderr);
   const saved = JSON.parse(await readFile(metrics, "utf8"));
+  assert.equal(JSON.parse(await readFile(cache, "utf8")).version, "fixture");
   assert.deepEqual(saved.selectedFiles, ["selected.test.ts"]);
   assert.deepEqual(saved.counts, { passed: 1, failed: 0, skipped: 0 });
 });

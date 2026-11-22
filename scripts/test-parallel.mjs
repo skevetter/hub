@@ -1,14 +1,5 @@
-import {
-  mkdir,
-  mkdtemp,
-  open,
-  readFile,
-  readdir,
-  rename,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdir, mkdtemp, open, readFile, readdir, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
@@ -282,7 +273,7 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
   };
 }
 
-async function updateTimingCache(parallelCache, runDirectory, count) {
+async function collectTimings(runDirectory, count) {
   const caches = (
     await Promise.all(
       Array.from({ length: count }, (_, index) =>
@@ -291,17 +282,18 @@ async function updateTimingCache(parallelCache, runDirectory, count) {
     )
   ).flat();
   if (caches.length === 0) return;
-  await writeJson(join(parallelCache, "results.json"), {
-    version: caches[0].version,
-    results: caches.flatMap((cache) => cache.results),
-  });
+  return { version: caches[0].version, results: caches.flatMap((cache) => cache.results) };
 }
 
-async function writeJson(target, data) {
-  await mkdir(dirname(target), { recursive: true });
+function writeJson(target, data) {
+  mkdirSync(dirname(target), { recursive: true });
   const pending = `${target}.${process.pid}`;
-  await writeFile(pending, JSON.stringify(data), { flag: "wx", mode: 0o600 });
-  await rename(pending, target);
+  try {
+    writeFileSync(pending, JSON.stringify(data), { flag: "wx", mode: 0o600 });
+    renameSync(pending, target);
+  } finally {
+    rmSync(pending, { force: true });
+  }
 }
 
 async function readFailedFiles(failedFileList, files) {
@@ -362,11 +354,21 @@ async function main(signal) {
       throw new Error("Vitest did not discover a unique set of test files.");
     }
     const runs = [];
-    const publishSuccess = async () => {
+    const publishSuccess = async (timings) => {
       signal.throwIfAborted();
       await rm(runDirectory, { recursive: true });
       runDirectory = undefined;
+      signal.throwIfAborted();
+      lock.release();
+      lock = undefined;
       publishTestMetrics(runs, [], root, signal);
+      if (timings) {
+        try {
+          writeJson(join(parallelCache, "results.json"), timings);
+        } catch (error) {
+          console.warn(`Could not update the Vitest timing cache: ${error.message}`);
+        }
+      }
     };
     const execute = async (name, selected) => {
       const result = await executeFiles(
@@ -404,10 +406,10 @@ async function main(signal) {
     console.log(
       `Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`,
     );
-    if (result.failedFiles.length) await writeJson(failedFileList, result.failedFiles);
+    if (result.failedFiles.length) writeJson(failedFileList, result.failedFiles);
     if (result.exitCode === 0 && !signal.aborted) {
-      await updateTimingCache(parallelCache, runDirectory, groups.length);
-      await publishSuccess();
+      const timings = await collectTimings(runDirectory, groups.length);
+      await publishSuccess(timings);
     }
     return result.exitCode;
   } finally {
