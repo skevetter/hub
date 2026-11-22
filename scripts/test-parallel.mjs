@@ -19,6 +19,7 @@ import {
   fullSuiteLockPath as lockPath,
   runWorkerGroup,
   takeFullSuiteLock,
+  testSignals,
 } from "./test-worker-group.mjs";
 
 export function partitionFiles(files, count) {
@@ -320,25 +321,24 @@ async function main() {
   }
   const busy = `The full-suite lock is held at ${lockPath}.`;
   let lock;
-  if (values["rerun-failed"]) {
-    await access(lockPath).then(
-      () => {
-        throw new Error(busy);
-      },
-      (error) => {
-        if (error.code !== "ENOENT") throw error;
-      },
-    );
-  } else {
-    lock = await takeFullSuiteLock();
-  }
   const controller = new AbortController();
   const interrupt = (signal) => controller.abort(signal);
-  process.on("SIGINT", interrupt);
-  process.on("SIGTERM", interrupt);
+  for (const signal of testSignals) process.on(signal, interrupt);
   let runDirectory;
   let exitCode = 1;
   try {
+    if (values["rerun-failed"]) {
+      await access(lockPath).then(
+        () => {
+          throw new Error(busy);
+        },
+        (error) => {
+          if (error.code !== "ENOENT") throw error;
+        },
+      );
+    } else {
+      lock = await takeFullSuiteLock();
+    }
     runDirectory = await mkdtemp(join(tmpdir(), "hub-tests-"));
     const discovery = join(runDirectory, "discovery");
     const listing = join(discovery, "files.json");
@@ -401,8 +401,7 @@ async function main() {
       if (exitCode === 0 && runDirectory) await rm(runDirectory, { recursive: true });
     } finally {
       lock?.release();
-      process.removeListener("SIGINT", interrupt);
-      process.removeListener("SIGTERM", interrupt);
+      for (const signal of testSignals) process.off(signal, interrupt);
     }
   }
 }

@@ -18,7 +18,7 @@ import { parseArgs } from "node:util";
 import { generateRuntimeMap } from "./generate-test-runtime-files.mjs";
 import { git, isEntrypoint, printRunContext, repositoryFor, requireGit } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
-import { fullSuiteLockPath } from "./test-worker-group.mjs";
+import { fullSuiteLockPath, testSignals } from "./test-worker-group.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 
 const routeTree = "src/routeTree.gen.ts";
@@ -193,11 +193,28 @@ async function exists(path) {
   }
 }
 
-function run(command, args, { cwd, env = process.env, stdio = "inherit" }) {
+function run(command, args, { cwd, env = process.env, supervise = false }) {
   return new Promise((settle, reject) => {
-    const child = spawn(command, args, { cwd, env, stdio });
-    child.on("error", reject);
-    child.on("close", (code) => settle(code ?? 1));
+    const child = spawn(command, args, { cwd, env, stdio: "inherit", detached: supervise });
+    let interrupted = false;
+    let childError;
+    const forward = (signal) => {
+      interrupted = true;
+      try {
+        process.kill(-child.pid, signal);
+      } catch (error) {
+        if (error.code !== "ESRCH") childError = error;
+      }
+    };
+    if (supervise && child.pid) for (const signal of testSignals) process.on(signal, forward);
+    child.on("error", (error) => {
+      childError = error;
+    });
+    child.on("close", (code) => {
+      if (supervise) for (const signal of testSignals) process.off(signal, forward);
+      if (childError) reject(childError);
+      else settle(interrupted ? 1 : (code ?? 1));
+    });
   });
 }
 
@@ -367,6 +384,7 @@ async function main() {
       const result = await run(process.execPath, [runner, "--root", root], {
         cwd: root,
         env: { ...env, HUB_TEST_RUN_REPORT: metrics },
+        supervise: true,
       });
       if (result !== 0) return result;
       const { selectedFiles, counts } = JSON.parse(await readFile(metrics, "utf8"));
