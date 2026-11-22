@@ -150,6 +150,7 @@ it.each(["owner", "admin"])(
     expect(await renderRoute("/o/acme/sessions/new")).toContain('href="/o/acme/sessions/profiles"');
     const html = await renderRoute("/o/acme/sessions/profiles");
     expect(html).toContain("No session profiles yet");
+    expect(html).toContain("sets the daemon, folder and agent a session uses");
     expect(html).toContain("Create a profile");
     expect(state.profiles).toHaveBeenCalledWith({
       data: { organizationSlug: "acme", manage: true },

@@ -108,6 +108,7 @@ export function SessionProfileForm({
       <FormField
         id={fieldId + "-name"}
         label="Name"
+        description="People pick this when they start a session."
         kind="text"
         name="name"
         required
@@ -124,6 +125,7 @@ export function SessionProfileForm({
       <FormField
         id={fieldId + "-cwd"}
         label="Working directory"
+        description="An absolute folder on the daemon. The agent starts here."
         kind="text"
         name="cwd"
         required
