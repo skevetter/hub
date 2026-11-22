@@ -6538,10 +6538,23 @@ class MemoryDatabase implements Database {
       if (recent.length >= limit) break;
       recent.push(run);
     }
+    if (recent.length === 0) return [];
+
+    const firstAgentSteps = new Map<string, WorkflowStepRunRecord | undefined>(
+      recent.map(({ id }) => [id, undefined]),
+    );
+    for (const step of this.workflowStepRuns.values()) {
+      if (step.agentExecutionId === null || !firstAgentSteps.has(step.triggerRunId)) continue;
+      const first = firstAgentSteps.get(step.triggerRunId);
+      if (first === undefined || step.ordinal < first.ordinal) {
+        firstAgentSteps.set(step.triggerRunId, step);
+      }
+    }
+
     return recent.flatMap((run) => {
       const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
       if (receipt === undefined) return [];
-      const step = this.listSteps(run.id).find((candidate) => candidate.agentExecutionId !== null);
+      const step = firstAgentSteps.get(run.id);
       const execution =
         step?.agentExecutionId == null
           ? undefined
