@@ -1,5 +1,6 @@
 import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { describe, it } from "vitest";
 import type { AuthServer } from "../auth/server.js";
 import { createMemoryDatabase } from "../db/memory.js";
@@ -15,6 +16,7 @@ import {
 import { OrganizationTriggerStore } from "../triggers/store.js";
 import { SLACK_REQUIRED_BOT_SCOPES } from "../providers/slack/client.js";
 import { HomeDashboard } from "./dashboard.js";
+import { HOME_OPEN_SESSIONS_LIMIT } from "./limits.js";
 
 const NOW = new Date("2026-09-21T12:00:00.000Z");
 const APPS_CONFIGURED = () => true;
@@ -184,11 +186,9 @@ describe("home read model", () => {
   });
 
   it("counts the reader's open sessions and the active profiles when sessions are on", async () => {
-    const asked: unknown[] = [];
-    const database = withSessions(memberDatabase(), {
+    const database = await withSessions({
       profiles: ["active", "active", "disabled"],
       open: 2,
-      asked,
     });
     const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
       now: () => NOW,
@@ -201,34 +201,24 @@ describe("home read model", () => {
       openCapped: false,
       started: true,
     });
-    assert.deepEqual(asked[0], {
-      organizationId: "org-1",
-      principal: { organizationId: "org-1", userId: "user-1", role: "owner" },
-      filter: "active",
-    });
   });
 
-  it("caps the open session count and asks once more only to learn whether any session exists", async () => {
+  it("caps the open count and keeps the session step done with only closed sessions", async () => {
     const capped = await new HomeDashboard(
-      withSessions(memberDatabase(), { profiles: ["active"], open: 80, asked: [] }),
+      await withSessions({ profiles: ["active"], open: HOME_OPEN_SESSIONS_LIMIT + 1 }),
       accountAuth(),
       APPS_CONFIGURED,
       { now: () => NOW, interactiveSessions: true },
     ).snapshot(request, "acme");
     assert.deepEqual(capped.sessions, { profiles: 1, open: 50, openCapped: true, started: true });
 
-    const asked: { filter?: string }[] = [];
     const none = await new HomeDashboard(
-      withSessions(memberDatabase(), { profiles: [], open: 0, closed: 1, asked }),
+      await withSessions({ profiles: ["active"], open: 0, closed: 1 }),
       accountAuth(),
       APPS_CONFIGURED,
       { now: () => NOW, interactiveSessions: true },
     ).snapshot(request, "acme");
-    assert.deepEqual(none.sessions, { profiles: 0, open: 0, openCapped: false, started: true });
-    assert.deepEqual(
-      asked.map(({ filter }) => filter),
-      ["active", "all"],
-    );
+    assert.deepEqual(none.sessions, { profiles: 1, open: 0, openCapped: false, started: true });
   });
 
   it("asks the provider registrations whether any app is configured, with the organization's bindings", async () => {
@@ -251,41 +241,72 @@ describe("home read model", () => {
 
 const CONNECTED_ONLY_DAEMON_ID = "20000000-0000-4000-8000-000000000002";
 
-/**
- * The memory database with canned session reads. Seeding a real session needs a daemon, a
- * profile and a coordinator; the read model only asks two questions of the store.
- */
-function withSessions(
-  database: Database,
-  canned: {
-    profiles: readonly ("active" | "disabled")[];
-    open: number;
-    closed?: number;
-    asked: unknown[];
-  },
-): Database {
-  const sessions = (count: number) => Array.from({ length: count }, (_, index) => ({ id: index }));
-  const reads: Record<string, unknown> = {
-    listSessionProfiles: () => Promise.resolve(canned.profiles.map((status) => ({ status }))),
-    listInteractiveSessions: (
-      organizationId: string,
-      principal: unknown,
-      page: { filter: "active" | "all"; limit: number },
-    ) => {
-      canned.asked.push({ organizationId, principal, filter: page.filter });
-      const total = canned.open + (page.filter === "all" ? (canned.closed ?? 0) : 0);
-      return Promise.resolve({
-        sessions: sessions(Math.min(total, page.limit)),
-        nextCursor: total > page.limit ? {} : null,
+async function withSessions({
+  profiles,
+  open,
+  closed = 0,
+}: {
+  profiles: readonly ("active" | "disabled")[];
+  open: number;
+  closed?: number;
+}): Promise<Database> {
+  const database = memberDatabase();
+  const principal = { organizationId: "org-1", userId: "user-1", role: "owner" } as const;
+  await enrollTestDaemon(database, principal.organizationId);
+  await database.setDaemonPresence(TEST_DAEMON_ID, "connected");
+  const savedProfiles = await Promise.all(
+    profiles.map(async (status, index) => {
+      const profile = await database.saveSessionProfile({
+        principal,
+        id: null,
+        version: null,
+        daemonId: TEST_DAEMON_ID,
+        name: `Profile ${String(index + 1)}`,
+        cwd: "/repo",
+        worktree: null,
+        provider: "codex",
+        providerOptions: {},
+        model: null,
+        mode: null,
+        thinkingOptionId: null,
+        fullAccessAcknowledged: false,
+        status,
+        now: NOW,
       });
-    },
-  };
-  return new Proxy(database, {
-    get: (target, property): unknown =>
-      typeof property === "string" && property in reads
-        ? reads[property]
-        : Reflect.get(target, property, target),
-  });
+      if (typeof profile === "string") throw new Error(profile);
+      return profile;
+    }),
+  );
+  const profile = savedProfiles.find(({ status }) => status === "active");
+  assert.ok(profile);
+  for (let index = 0; index < open + closed; index += 1) {
+    const started = await database.startInteractiveSession({
+      principal,
+      profileId: profile.id,
+      profileVersion: profile.version,
+      idempotencyKey: randomUUID(),
+      message: "hello",
+      participants: [],
+      usage: { periodStart: NOW, limit: open + closed },
+      maxActivePerDaemon: open + closed,
+      bodyCutoff: null,
+      now: NOW,
+    });
+    assert.equal(started.status, "created");
+    if (index >= open) {
+      const result = await database.acceptInteractiveSessionCommand({
+        principal,
+        sessionId: started.session.id,
+        generation: started.session.generation,
+        idempotencyKey: randomUUID(),
+        kind: "close",
+        bodyCutoff: null,
+        now: NOW,
+      });
+      assert.equal(result.status, "accepted");
+    }
+  }
+  return database;
 }
 
 function memberDatabase({
