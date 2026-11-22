@@ -1,6 +1,6 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop, eslint-plugin-react-perf/jsx-no-new-object-as-prop, eslint-plugin-react-perf/jsx-no-jsx-as-prop -- one screen binds one snapshot; a row's action and status are that row's own slots */
 /* oxlint-disable typescript-eslint/no-unsafe-type-assertion -- generated routes cannot express server-resolved organization URLs */
-import { useSnapshotQuery } from "../queries/index.js";
+import { useSnapshotQuery, type Snapshot } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
@@ -19,7 +19,7 @@ import { CopyField } from "../components/app/copy-field.js";
 import { Disclosure } from "../components/app/disclosure.js";
 import { EmptyState } from "../components/app/empty-state.js";
 import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
-import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
+import { PageHeader } from "../components/app/page.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
@@ -30,7 +30,6 @@ import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "../daemons/handoff.js";
-import { queryState } from "../projects/panel-state.js";
 import { HomeSessionStart } from "../interactive-sessions/ui/new-session.js";
 import { useRouteTenant } from "../projects/context.js";
 import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
@@ -60,12 +59,10 @@ export function HomePanel() {
     queryKey: ["home", tenant.organization.id, tenant.account.id],
     queryFn: () => load({ data: scope }),
   });
-  const home = queryState<HomeSnapshot>(snapshot, "Overview unavailable", <HomeLoading />);
-  if (!home.ok) return home.element;
   return (
     <HomeView
-      key={home.data.organization.id}
-      data={home.data}
+      key={tenant.organization.id}
+      snapshot={snapshot}
       accountId={tenant.account.id}
       operator={account.isInstanceOperator}
       sessionsEnabled={account.features?.interactiveSessions === true}
@@ -74,21 +71,46 @@ export function HomePanel() {
 }
 
 function HomeView({
-  data,
+  snapshot,
   accountId,
   operator,
   sessionsEnabled,
 }: {
-  data: HomeSnapshot;
+  snapshot: Snapshot<HomeSnapshot> & { refetch: () => void };
   accountId: string;
   operator: boolean;
   sessionsEnabled: boolean;
 }) {
   const [focusOnCompletion, setFocusOnCompletion] = useState(false);
+  const header = (
+    <PageHeader title="Home" description={HOME_DESCRIPTION} focusOnMount={focusOnCompletion} />
+  );
+  if (snapshot.status === "pending") {
+    return (
+      <>
+        {header}
+        <HomeLoading />
+      </>
+    );
+  }
+  if (snapshot.status === "error") {
+    return (
+      <>
+        {header}
+        <FailureAlert
+          title="Home unavailable"
+          error={snapshot.error}
+          fallback="Hub could not load this organization's activity and setup."
+          onRetry={snapshot.refetch}
+        />
+      </>
+    );
+  }
+  const { data } = snapshot;
   const base = `/o/${data.organization.slug}`;
   return (
     <>
-      <PageHeader title="Home" description={HOME_DESCRIPTION} focusOnMount={focusOnCompletion} />
+      {header}
       <NeedsAttention data={data} base={base} />
       <Section>
         <HomeTiles data={data} />
@@ -188,8 +210,7 @@ function HomeTiles({ data }: { data: HomeSnapshot }) {
 
 function HomeLoading() {
   return (
-    <div aria-busy="true" aria-label="Loading overview">
-      <PageHeaderSkeleton description={HOME_DESCRIPTION} />
+    <div aria-busy="true" aria-label="Loading Home">
       <div className="grid gap-8">
         <StatGrid columns={4}>
           <StatTileSkeleton />
