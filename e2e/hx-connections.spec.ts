@@ -106,6 +106,7 @@ test.describe("Slack authorization", () => {
     const slack = connections.card("Slack");
     await expect(slack.getByText("Needs authorization", { exact: true })).toHaveCount(1);
     await expect(slack.getByRole("listitem")).toContainText("Acme Slack");
+    await expect(slack.getByRole("listitem")).toContainText("Workspace needs authorization");
     await expect(slack.getByRole("listitem")).toContainText("read app mentions");
     await expect(slack.getByRole("listitem")).toContainText("post messages");
     await tabThrough(page, [slack.getByRole("button", { name: "Reauthorize Slack" })]);
