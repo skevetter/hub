@@ -86,6 +86,38 @@ it("shows a Sessions empty state with a scoped start link", async () => {
   expect(html).toContain('href="/o/acme/sessions/new"');
 });
 
+it("explains a session and keeps one New session control when the list is empty", async () => {
+  for (const search of ["", "?filter=all"]) {
+    const html = await renderRoute(`/o/acme/sessions${search}`);
+    expect(html).toContain("live conversation with an agent");
+    expect(html.match(/href="\/o\/acme\/sessions\/new"/g)).toHaveLength(1);
+  }
+});
+
+it("keeps the header New session control when sessions exist", async () => {
+  state.list.mockResolvedValue({
+    status: "ok",
+    data: {
+      sessions: [
+        {
+          id: "00000000-0000-4000-8000-000000000002",
+          title: "Web workspace",
+          state: "running",
+          stateReason: null,
+          daemon: { slug: "devbox" },
+          startedBy: { name: "Ada Park" },
+          lastActivityAt: new Date().toISOString(),
+        },
+      ],
+      nextCursor: null,
+    },
+  });
+  const html = await renderRoute("/o/acme/sessions");
+  expect(html.match(/href="\/o\/acme\/sessions\/new"/g)).toHaveLength(1);
+  expect(html).toContain("Web workspace");
+  expect(html).toContain("Ada Park on devbox");
+});
+
 it("shows the list and detail loading states", async () => {
   expect(await renderRoute("/o/acme/sessions", true)).toContain("Loading sessions");
   expect(

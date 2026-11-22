@@ -29,7 +29,6 @@ const DESCRIPTION = "Conversations with agents running on your daemons.";
 const COLUMNS = [
   { header: "Session", fill: true },
   { header: "State" },
-  { header: "Daemon", className: "hidden sm:table-cell" },
   { header: "Last activity", className: "hidden md:table-cell" },
 ];
 const FILTERS = [
@@ -71,6 +70,9 @@ export function SessionListPanel({
 
   if (result.status === "ok" && "outcome" in result.data && result.data.code === "not_found")
     return <SessionsUnavailable />;
+  // The empty state carries the one New session action; a second filled button would compete.
+  const hasRows =
+    result.status === "ok" && !("outcome" in result.data) && result.data.sessions.length > 0;
   return (
     <>
       <PageHeader title="Sessions" description={DESCRIPTION}>
@@ -81,7 +83,7 @@ export function SessionListPanel({
             </Link>
           </Button>
         ) : null}
-        <NewSessionLink organizationSlug={organizationSlug} />
+        {hasRows ? <NewSessionLink organizationSlug={organizationSlug} /> : null}
       </PageHeader>
       <Section>
         <SegmentedControl
@@ -144,12 +146,10 @@ function SessionTable({
     () => ({
       title: "No sessions yet",
       description:
-        filter === "active"
-          ? "Active sessions appear here."
-          : "Start a conversation with an agent on your daemon.",
+        "A session is a live conversation with an agent on one of your daemons, started from a session profile.",
       action: <NewSessionLink organizationSlug={organizationSlug} />,
     }),
-    [filter, organizationSlug],
+    [organizationSlug],
   );
 
   return (
@@ -198,16 +198,17 @@ function SessionRow({
     [params, session.title],
   );
   const status = sessionStatus(session);
+  const byline =
+    session.startedBy === null || session.startedBy === undefined
+      ? `On ${session.daemon.slug}`
+      : `${session.startedBy.name} on ${session.daemon.slug}`;
   return (
     <DataRow onSelect={open}>
       <DataCell>
-        <TwoLine primary={title} secondary={session.startedBy?.name} />
+        <TwoLine primary={title} secondary={byline} />
       </DataCell>
       <DataCell>
         <StatusPill tone={status.tone}>{status.label}</StatusPill>
-      </DataCell>
-      <DataCell>
-        <span className="font-mono">{session.daemon.slug}</span>
       </DataCell>
       <DataCell muted>
         <RelativeTime value={session.lastActivityAt} />
