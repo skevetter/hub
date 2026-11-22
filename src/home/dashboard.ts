@@ -1,5 +1,6 @@
 import { ProductRequestError } from "../auth/organization-access.js";
 import type { AuthServer } from "../auth/server.js";
+import { isScriptStep, parseCompiledHubConfig } from "../config/compiler.js";
 import type { SessionPrincipal } from "../interactive-sessions/types.js";
 import type {
   Database,
@@ -7,6 +8,7 @@ import type {
   OrganizationRunCount,
   OrganizationRunRecord,
   DroppedProviderEventCount,
+  OrganizationTriggerRevisionRecord,
 } from "../db/types.js";
 import { resolveRouteTenant } from "../projects/access.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
@@ -14,6 +16,7 @@ import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { projectTriggerForm } from "../triggers/configuration/editor.js";
 import { canFinishSetup } from "./checklist.js";
 import { HOME_MONTH_DAYS, HOME_OPEN_SESSIONS_LIMIT } from "./limits.js";
+import { isTryCommentEvent } from "./things-to-try.js";
 
 /** How far back the overview looks. One week is long enough to hold a first run and short enough that a nudge fades once a trigger listens. */
 export const HOME_WINDOW_DAYS = 7;
@@ -56,7 +59,13 @@ export interface HomeSnapshot {
     /** Enrolled with `hub.execute`; without it Hub can see the daemon but launch nothing on it. */
     canExecute: boolean;
   }[];
-  triggers: readonly { id: string; name: string; event: string; enabled: boolean }[];
+  triggers: readonly {
+    id: string;
+    name: string;
+    event: string;
+    enabled: boolean;
+    hasReplyOutput?: boolean;
+  }[];
   runs: readonly (Omit<OrganizationRunRecord, "receivedAt"> & { receivedAt: string })[];
   /** Every run in the last 24 hours and the last `HOME_MONTH_DAYS` days, not only the ones listed. */
   runCounts: { day: RunTally; month: RunTally };
@@ -186,12 +195,12 @@ export class HomeDashboard {
           presence,
           canExecute: permissions.includes("hub.execute"),
         })),
-      triggers: triggers.map((trigger, index) => ({
-        id: trigger.id,
-        name: trigger.name,
-        event: triggerEvent(revisions[index]?.yaml),
-        enabled: trigger.enabled,
-      })),
+      triggers: triggers.map((trigger, index) =>
+        Object.assign(
+          { id: trigger.id, name: trigger.name, enabled: trigger.enabled },
+          triggerFacts(revisions[index], trigger.format),
+        ),
+      ),
       runs: runs.map((run) => ({
         id: run.id,
         triggerName: run.triggerName,
@@ -240,9 +249,25 @@ function tally(counts: readonly OrganizationRunCount[]): RunTally {
   return result;
 }
 
-/** The one event a self-contained trigger listens for; a legacy document has none to name. */
-function triggerEvent(yaml: string | undefined): string {
-  if (yaml === undefined) return "manual.run";
-  const projection = projectTriggerForm(yaml);
-  return projection.status === "editable" ? projection.value.event : "manual.run";
+function triggerFacts(
+  revision: OrganizationTriggerRevisionRecord | undefined,
+  format: "single_run" | "legacy_multistep",
+): Pick<HomeSnapshot["triggers"][number], "event" | "hasReplyOutput"> {
+  if (revision === undefined) return { event: "manual.run" };
+  const projection = projectTriggerForm(revision.yaml);
+  const primaryEvent = projection.status === "editable" ? projection.value.event : undefined;
+  if (primaryEvent !== undefined && !isTryCommentEvent(primaryEvent))
+    return { event: primaryEvent };
+  if (primaryEvent === undefined && format === "legacy_multistep") return { event: "manual.run" };
+
+  const { triggers } = parseCompiledHubConfig(revision.normalizedConfiguration);
+  const comment = triggers.find(({ on }) =>
+    primaryEvent === undefined ? isTryCommentEvent(on) : on === primaryEvent,
+  );
+  const event = comment?.on ?? primaryEvent ?? "manual.run";
+  const replyType = `${event.split(".", 1)[0]}.reply`;
+  const hasReplyOutput = comment?.steps.some(
+    (step) => !isScriptStep(step) && step.allowOutputs.some(({ type }) => type === replyType),
+  );
+  return hasReplyOutput === true ? { event, hasReplyOutput } : { event };
 }

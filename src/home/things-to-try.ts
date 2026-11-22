@@ -41,7 +41,7 @@ const LINEAR_EXAMPLES: readonly TryExample[] = [
   },
 ];
 
-const GITHUB_EXAMPLES: readonly TryExample[] = [
+const GITHUB_PULL_REQUEST_EXAMPLES: readonly TryExample[] = [
   {
     title: "Review a pull request",
     description: "Reads the diff and comments with what it found.",
@@ -49,16 +49,16 @@ const GITHUB_EXAMPLES: readonly TryExample[] = [
       "Review this pull request for bugs and missing tests, and comment with what you found, most serious first.",
   },
   {
-    title: "Triage an issue",
-    description: "Finds the code an issue is about and proposes a fix.",
+    title: "Summarize the changes",
+    description: "Summarizes the diff for a reviewer.",
     prompt:
-      "Read this issue, find the code it is about, and comment with the likely cause and a proposed fix.",
+      "Read the pull request diff and comment with what changed and how a reviewer can verify it.",
   },
   {
-    title: "Fix failing checks",
-    description: "Works out why checks fail and pushes a fix to the branch.",
+    title: "Investigate failing checks",
+    description: "Finds the cause of a failed check and proposes a fix.",
     prompt:
-      "Find out why the checks on this pull request fail, fix them, and push the fix to this branch.",
+      "Find out why the checks on this pull request fail and comment with the cause and a proposed fix.",
   },
 ];
 
@@ -92,14 +92,8 @@ export function thingsToTry(
   snapshot: Pick<HomeSnapshot, "connections" | "triggers" | "sessions">,
 ): TrySurface[] {
   const surfaces: TrySurface[] = [
-    appSurface(snapshot, "linear", "Linear", LINEAR_EXAMPLES, "Comment on an issue"),
-    appSurface(
-      snapshot,
-      "github",
-      "GitHub",
-      GITHUB_EXAMPLES,
-      "Comment on an issue or pull request",
-    ),
+    appSurface(snapshot, "linear", "Linear"),
+    appSurface(snapshot, "github", "GitHub"),
   ];
   const { sessions } = snapshot;
   if (sessions !== null) {
@@ -124,43 +118,72 @@ function appSurface(
   snapshot: Pick<HomeSnapshot, "connections" | "triggers">,
   provider: "linear" | "github",
   label: string,
-  examples: readonly TryExample[],
-  action: string,
 ): TrySurface {
   const connected = snapshot.connections.filter((connection) => connection.provider === provider);
+  const examples = provider === "linear" ? LINEAR_EXAMPLES : GITHUB_PULL_REQUEST_EXAMPLES;
   if (connected.length === 0) {
     return {
       key: provider,
       label,
-      where: `${label} is not connected yet. Connect it, then create a trigger that listens to it.`,
+      where: `${label} is not connected yet. Connect it, then create a comment trigger with a reply output.`,
       next: { label: `Connect ${label}`, path: "connections" },
       examples,
     };
   }
-  const listening = snapshot.triggers.filter(
-    ({ enabled, event }) => enabled && listensTo(event, provider),
-  );
-  const names = connected.map((connection) => connection.label).join(", ");
-  if (listening.length === 0) {
+  const healthy = connected.filter(({ needsAuthorization }) => !needsAuthorization);
+  if (healthy.length === 0) {
     return {
       key: provider,
       label,
-      where: `${names} is connected, but no enabled trigger listens to ${label} yet. Create one, then send a prompt.`,
+      where: `${label} needs authorization before a comment can start a trigger.`,
+      next: { label: "Open connections", path: "connections" },
+      examples,
+    };
+  }
+  const listening = snapshot.triggers.flatMap((trigger) => {
+    const comment = COMMENT_EVENTS.get(trigger.event);
+    return trigger.enabled && comment !== undefined && trigger.event.startsWith(`${provider}.`)
+      ? [{ trigger, comment }]
+      : [];
+  });
+  const matching = listening.find(({ trigger }) => trigger.hasReplyOutput) ?? listening[0];
+  if (matching === undefined) {
+    const name = healthy[0]?.label;
+    return {
+      key: provider,
+      label,
+      where: `${name ?? label} is connected. Create a comment trigger with a reply output to use these prompts.`,
       next: { label: "New trigger", path: "triggers/new" },
       examples,
     };
   }
+  const { trigger, comment } = matching;
+  const targetExamples = comment.pullRequest ? GITHUB_PULL_REQUEST_EXAMPLES : LINEAR_EXAMPLES;
+  const location = healthy.length === 1 ? ` in ${healthy[0]?.label ?? label}` : "";
   return {
     key: provider,
     label,
-    where: `${action} in ${names} with one of these. ${listening
-      .map(({ name }) => name)
-      .join(", ")} decides which events start an agent.`,
-    examples,
+    where:
+      trigger.hasReplyOutput === true
+        ? `${comment.action}${location} with one of these. ${trigger.name} decides which comments start an agent.`
+        : `${trigger.name} needs a reply output for the answer to appear on the ${comment.pullRequest ? "pull request" : "issue"}.`,
+    examples: targetExamples,
   };
 }
 
-/** GitHub notifications are a personal inbox, not something a comment in a repository reaches. */
-function listensTo(event: string, provider: "linear" | "github"): boolean {
-  return event.startsWith(`${provider}.`) && event !== "github.notification";
+const ISSUE_COMMENT = { action: "Comment on an issue", pullRequest: false } as const;
+const PULL_REQUEST_COMMENT = { action: "Comment on a pull request", pullRequest: true } as const;
+const COMMENT_EVENTS = new Map<string, { action: string; pullRequest: boolean }>([
+  ["linear.comment_created", ISSUE_COMMENT],
+  ["github.issue_comment_created", ISSUE_COMMENT],
+  ["github.pull_request_comment_created", PULL_REQUEST_COMMENT],
+  ["github.issue_comment", PULL_REQUEST_COMMENT],
+  [
+    "github.pull_request_review_comment",
+    { action: "Leave an inline review comment on a pull request", pullRequest: true },
+  ],
+]);
+
+export function isTryCommentEvent(event: string): boolean {
+  return COMMENT_EVENTS.has(event);
 }
