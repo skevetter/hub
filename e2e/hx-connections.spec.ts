@@ -179,6 +179,39 @@ test("withholds stale connection details when the revoke refresh pauses offline"
   await expect(page.getByRole("status").filter({ hasText: "GitHub disconnected." })).toBeVisible();
 });
 
+test("names the removed installation when another GitHub connection remains", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.connectGitHub("owner");
+  await hub.primaryApplication().query(
+    `insert into github_connections
+       (organization_id, installation_id, provider_application_id, slug, account_id,
+        account_login, account_type, status)
+     select organization_id, 84, provider_application_id, 'beta-inc', '84',
+            'beta-inc', account_type, 'active'
+     from github_connections where account_login = 'acme-inc'`,
+    [],
+  );
+  await page.reload();
+  const github = projectApp(page).connections.card("GitHub");
+  await expect(github.getByRole("listitem")).toHaveCount(2);
+
+  await github.getByRole("button", { name: "Actions for acme-inc" }).click();
+  await page.getByRole("menuitem", { name: "Revoke" }).click();
+  await page.getByRole("button", { name: "Revoke connection" }).click();
+
+  await expect(github.getByRole("listitem")).toHaveCount(1);
+  await expect(github.getByRole("listitem")).toContainText("beta-inc");
+  await expect(github.getByText("Connected", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("status").filter({ hasText: "acme-inc disconnected." }),
+  ).toBeVisible();
+  await expect(page.getByText("GitHub disconnected.")).toHaveCount(0);
+});
+
 test("keeps the initial failure passive and announces the result of retrying", async ({
   hub,
   page,
