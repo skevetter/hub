@@ -1,6 +1,7 @@
 import { Check, Copy } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 
+import { cn } from "../../lib/utils.js";
 import { Button } from "../ui/button.js";
 import { Field, FieldDescription, FieldLabel } from "../ui/field.js";
 
@@ -133,12 +134,15 @@ export function CopyField({
   value,
   copyLabel,
   focusOnMount = false,
+  prose = false,
 }: {
   label: string;
   value: string;
   /** The copy button's accessible name, when "Copy <label>" is not what it should say. */
   copyLabel?: string;
   focusOnMount?: boolean;
+  /** The value is a sentence, not an identifier, so it wraps between words instead of anywhere. */
+  prose?: boolean;
 }) {
   const { state, copy, announcement } = useCopy(label, value);
   const id = useId();
@@ -188,7 +192,14 @@ export function CopyField({
             className="min-w-0 flex-1 bg-transparent font-mono text-xs outline-none"
           />
         ) : (
-          <span ref={text} id={id} className="min-w-0 flex-1 font-mono text-xs break-all">
+          <span
+            ref={text}
+            id={id}
+            className={cn(
+              "min-w-0 flex-1 font-mono text-xs",
+              prose ? "wrap-anywhere" : "break-all",
+            )}
+          >
             {value}
           </span>
         )}
