@@ -39,7 +39,8 @@ export function TwoLine({
       <Primary
         className={cn(
           overflow,
-          "text-sm in-data-[slot=record-row]:wrap-anywhere in-data-[slot=record-row]:whitespace-normal",
+          !heading && "text-sm",
+          "in-data-[slot=record-row]:wrap-anywhere in-data-[slot=record-row]:whitespace-normal",
         )}
         title={titleOf(primary)}
       >

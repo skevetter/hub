@@ -17,6 +17,9 @@ it("shows a device identity, state, last-seen time, facts, and actions", () => {
       actions={actions}
     />,
   );
+  const heading = /<h2[^>]*>/u.exec(markup)?.[0];
+  assert.ok(heading);
+  assert.doesNotMatch(heading, /\btext-(?:xs|sm|base|lg|xl|\d+xl)\b/u);
   assert.match(markup, /<h2[^>]*>[\s\S]*build-studio/u);
   assert.match(markup, /font-mono[^>]*>4e0b6391-8ff2-4c7e-b94c-f0ba48e4a11a/u);
   assert.match(markup, /Connected/u);
