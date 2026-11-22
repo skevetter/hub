@@ -15,9 +15,10 @@ export function useDeviceProviders(
   daemon: BrowserDaemon,
   accountId: string,
   organizationSlug: string,
-  schedule: ProviderReadLimiter,
+  limiter: ProviderReadLimiter,
 ) {
   const read = useServerFn(daemonProviderSnapshot);
+  const queryClient = useQueryClient();
   const connected = deviceStatus(daemon) === "connected";
   const query = useQuery<ReturnType<typeof deviceProviders>>({
     queryKey: [
@@ -29,15 +30,22 @@ export function useDeviceProviders(
     ],
     enabled: ({ state }) => connected && !(state.error instanceof ProviderReadTimeout),
     retry: (failures, error) => !(error instanceof ProviderReadTimeout) && failures < 3,
-    queryFn: ({ signal }) =>
-      schedule(signal, async (requestSignal) => {
-        const result = await read({
-          data: { organizationSlug, daemonId: daemon.id },
-          signal: requestSignal,
-        });
-        if (result.status === "error") throw new Error(result.error.message);
-        return deviceProviders(result.data.entries);
-      }),
+    queryFn: ({ signal, queryKey }) =>
+      limiter.schedule(
+        daemon.id,
+        signal,
+        async (requestSignal) => {
+          const result = await read({
+            data: { organizationSlug, daemonId: daemon.id },
+            signal: requestSignal,
+          });
+          if (result.status === "error") throw new Error(result.error.message);
+          return deviceProviders(result.data.entries);
+        },
+        () => {
+          void queryClient.cancelQueries({ queryKey, exact: true });
+        },
+      ),
     refetchInterval: ({ state }) =>
       state.status === "success" &&
       state.data?.discovering === true &&
