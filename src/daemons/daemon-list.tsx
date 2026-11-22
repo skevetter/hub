@@ -1,6 +1,14 @@
 import { Link } from "@tanstack/react-router";
 import { BookOpen } from "lucide-react";
-import { Fragment, useMemo, type ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
 import { Card } from "../components/app/card.js";
 import { CopyField } from "../components/app/copy-field.js";
 import { DeviceCard } from "../components/app/device-card.js";
@@ -21,7 +29,7 @@ interface DeviceProfiles {
 interface DeviceProviders {
   labels: readonly string[];
   message: string | null;
-  onRetry?: () => void;
+  onRetry?: () => Promise<void>;
 }
 
 export function DaemonResults({
@@ -139,19 +147,59 @@ function ProviderNames({
   status: ReturnType<typeof deviceStatus>;
   providers: DeviceProviders | undefined;
 }) {
+  const line = useRef<HTMLDivElement>(null);
+  const [announceRetry, setAnnounceRetry] = useState(false);
+  const retry = status === "connected" ? providers?.onRetry : undefined;
+  const requestRetry = useCallback(
+    (event: MouseEvent<HTMLButtonElement>) => {
+      const target = line.current;
+      if (retry === undefined || target === null) return;
+      if (document.activeElement === event.currentTarget) target.focus();
+      setAnnounceRetry(true);
+      void retry().then(() => {
+        if (document.activeElement !== target) return undefined;
+        const controls = target
+          .closest("li")
+          ?.querySelectorAll<HTMLElement>("button:not(:disabled), a[href]");
+        const next = Array.from(controls ?? []).find((control) => !target.contains(control));
+        next?.focus();
+        return undefined;
+      });
+    },
+    [retry],
+  );
+
+  const value = providerValue(status, providers);
+  return (
+    <div
+      ref={line}
+      role="group"
+      aria-label="Providers"
+      aria-live={announceRetry ? "polite" : undefined}
+      tabIndex={-1}
+    >
+      {retry === undefined ? (
+        value
+      ) : (
+        <div className="flex flex-wrap items-center gap-2">
+          {value}
+          <Button type="button" variant="outline" size="xs" onClick={requestRetry}>
+            Try again
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function providerValue(
+  status: ReturnType<typeof deviceStatus>,
+  providers: DeviceProviders | undefined,
+) {
   if (status === "revoked") return <Quiet>Provider information is unavailable.</Quiet>;
   if (status === "offline")
     return <Quiet>Providers are available when this daemon connects.</Quiet>;
   if (providers === undefined) return <Quiet>Loading providers...</Quiet>;
-  if (providers.onRetry !== undefined)
-    return (
-      <div className="flex flex-wrap items-center gap-2">
-        <Quiet>{providers.message}</Quiet>
-        <Button type="button" variant="outline" size="xs" onClick={providers.onRetry}>
-          Try again
-        </Button>
-      </div>
-    );
   if (providers.labels.length > 0) return providers.labels.join(", ");
   return <Quiet>{providers.message ?? "No providers available."}</Quiet>;
 }
