@@ -58,6 +58,13 @@ async function fixture(options: { differentTarget?: boolean; canceled?: boolean 
 }
 
 describe("Linear reply writer", () => {
+  it("posts a reply whose answer ends with a deep container chain", async () => {
+    const test = await fixture();
+    await test.send(`The deploy is fixed.\n\n${"- >".repeat(400)} q`);
+    assert.equal((await test.delivery())?.failure ?? null, null);
+    assert.equal(test.writes.length, 1);
+  });
+
   const profileUrl = "https://linear.app/acme/profiles/bob";
 
   it("does not turn a clipped link destination into a Linear profile link", async () => {

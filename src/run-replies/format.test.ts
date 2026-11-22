@@ -258,3 +258,76 @@ it("keeps an entity inside fallback code from decoding into a mention", () => {
   assert.ok(body.startsWith("```\nping "));
   assert.doesNotMatch(body, /@/u);
 });
+
+// Container markers with no space between them escape a space-only chain check.
+const chains = ["- >", ">- ", "+ >", ">", "> -", "1.>", "-\t>"];
+
+it.each(chains)("degrades a 400-deep %j chain instead of throwing", (unit) => {
+  const text = `Summary of the fix.\n\n${unit.repeat(400)} q`;
+  const body = formatRunReply({ text, truncated: false }, []);
+  assert.match(body, /Summary of the fix/u);
+});
+
+it.each(chains)("renders a stacked %j chain in under 100 ms warm", (unit) => {
+  const text = unit.repeat(16_384).slice(0, 16_384);
+  formatRunReply({ text, truncated: false }, []);
+  const started = performance.now();
+  formatRunReply({ text, truncated: false }, []);
+  assert.ok(performance.now() - started < 100);
+});
+
+it("falls back to plain text when the Markdown step throws", () => {
+  const reasons: string[] = [];
+  const body = formatRunReply({ text: "- > ".repeat(60), truncated: false }, [], {
+    now: () => 0,
+    onFallback: (reason) => reasons.push(reason),
+  });
+  assert.deepEqual(reasons, ["structure"]);
+  assert.ok(body.length > 0);
+});
+
+it("always renders 2,000 generated stacked-container documents safely and fast", () => {
+  const next = random(7_001);
+  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+  const markers = [
+    ">",
+    "> ",
+    "- ",
+    "+ ",
+    "* ",
+    "1. ",
+    "2) ",
+    "\t",
+    " ",
+    "  ",
+    ">>",
+    "-",
+    "- >",
+    ">- ",
+  ];
+  const tails = [
+    "q",
+    "@bob",
+    "see https://linear.app/acme/profiles/bob",
+    "| a | b |\n> | - | - |\n> | @x | www.linear%2Eapp/a/users/b |",
+    "`code <T>`",
+    "[x](https://linear.app/a/agents/c)",
+  ];
+  for (let index = 0; index < 2_000; index += 1) {
+    const lines: string[] = [];
+    const lineCount = 1 + Math.floor(next() * 6);
+    for (let line = 0; line < lineCount; line += 1) {
+      const unit = Array.from({ length: 1 + Math.floor(next() * 3) }, () => pick(markers)).join("");
+      lines.push(unit.repeat(1 + Math.floor(next() * 700)) + pick(tails));
+    }
+    const text = `Fixed it.\n\n${lines.join("\n")}`;
+    const started = performance.now();
+    const body = formatRunReply({ text, truncated: next() < 0.2 }, []);
+    const elapsed = performance.now() - started;
+    const context = JSON.stringify({ index, text: text.slice(0, 200) });
+    assert.ok(elapsed < 100 || index < 20, `${elapsed.toFixed(0)} ms ${context}`);
+    assert.ok(body.length > 0 && body.length <= 3_500, context);
+    assert.deepEqual(mentionLinks(body), [], context);
+    assert.doesNotMatch(body, /[@\uFF20]/u, context);
+  }
+});

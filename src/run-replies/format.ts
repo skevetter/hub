@@ -28,7 +28,7 @@ const MAX_TABLE_ROWS = 250;
 const MAX_PIPES = 600;
 const MAX_LIST_INDENT = 12;
 const OPENER_RUN = new RegExp(`([[(*_~<])\\1{${MAX_OPENER_RUN - 1}}`, "u");
-const MARKDOWN_CONTAINER_CHAIN = /(?:(?:[-+*>]|\d{1,9}[.)])[ \t]+){33}/u;
+const MAX_CONTAINER_DEPTH = 32;
 const URL_START = /https?:\/\/|www\.|(?<![\w-])linear\.app\.?(?=[:/])/giu;
 const URL_RUN = /[^\s<>()[\]"'`]*/uy;
 const LINEAR_HOST_PATH = /linear\.app\.?(?::\d{1,5})?(\/[^\s<>()[\]"'`\\?#]*)/giu;
@@ -123,7 +123,7 @@ function renderMarkdown(
   report: (reason: "structure" | "budget") => void,
 ): string | undefined {
   // Micromark is synchronous. Bound delimiter-heavy input before any parser runs.
-  if (!boundedStructure(source) || MARKDOWN_CONTAINER_CHAIN.test(source)) {
+  if (!boundedStructure(source) || containerDepth(source) > MAX_CONTAINER_DEPTH) {
     report("structure");
     return undefined;
   }
@@ -133,17 +133,57 @@ function renderMarkdown(
     return true;
   };
   if (late()) return undefined;
-  const markdown = parseMarkdown(source);
-  if (late()) return undefined;
-  sanitizeMarkdown(markdown);
-  if (late()) return undefined;
-  const result = toMarkdown(markdown, {
-    extensions: [gfmToMarkdown({ tablePipeAlign: false })],
-  }).trim();
-  if (late()) return undefined;
-  if (hasSafeProse(result)) return result;
+  try {
+    const markdown = parseMarkdown(source);
+    if (late()) return undefined;
+    sanitizeMarkdown(markdown);
+    if (late()) return undefined;
+    const result = toMarkdown(markdown, {
+      extensions: [gfmToMarkdown({ tablePipeAlign: false })],
+    }).trim();
+    if (late()) return undefined;
+    if (hasSafeProse(result)) return result;
+  } catch {
+    // A parser limit such as stack depth: the plain-text path is linear.
+  }
   report("structure");
   return undefined;
+}
+
+// Most container markers on one line, with or without a space between them. micromark nests
+// one container per marker and recurses on it, so depth is capped before parsing.
+function containerDepth(source: string): number {
+  let deepest = 0;
+  for (const line of source.split(/\r\n|\r|\n/u)) {
+    let depth = 0;
+    let index = 0;
+    while (index < line.length) {
+      const char = line[index]!;
+      if (char === " " || char === "\t") {
+        index += 1;
+        continue;
+      }
+      let length = 0;
+      if (char === ">") length = 1;
+      else if (char === "-" || char === "+" || char === "*") length = markerEnds(line, index + 1);
+      else if (char >= "0" && char <= "9") {
+        let digits = index;
+        while (line[digits]! >= "0" && line[digits]! <= "9") digits += 1;
+        if (digits - index <= 9 && (line[digits] === "." || line[digits] === ")"))
+          length = markerEnds(line, digits + 1) === 0 ? 0 : digits + 1 - index;
+      }
+      if (length === 0) break;
+      depth += 1;
+      index += length;
+    }
+    deepest = Math.max(deepest, depth);
+  }
+  return deepest;
+}
+
+// A list marker needs a space, a tab or the end of the line after it.
+function markerEnds(line: string, next: number): number {
+  return next >= line.length || line[next] === " " || line[next] === "\t" ? 1 : 0;
 }
 
 // Limits on the shapes that make micromark slow, not on punctuation in general: ordinary
@@ -259,12 +299,16 @@ function escapeInline(text: string): string {
 // every link, image and HTML node GFM would build is checked. Failing closed beats guessing a
 // repair: autolink literals carry no source position.
 function hasUnsafeNode(text: string): boolean {
-  const pending: Array<Root | RootContent> = [parseMarkdown(text)];
-  for (const node of pending) {
-    if (node.type !== "root" && removeNode(node)) return true;
-    if ("children" in node) pending.push(...node.children);
+  try {
+    const pending: Array<Root | RootContent> = [parseMarkdown(text)];
+    for (const node of pending) {
+      if (node.type !== "root" && removeNode(node)) return true;
+      if ("children" in node) pending.push(...node.children);
+    }
+    return false;
+  } catch {
+    return true;
   }
-  return false;
 }
 
 function parseMarkdown(source: string): Root {
