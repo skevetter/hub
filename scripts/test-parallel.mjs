@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import { publishTestMetrics } from "./test-receipt.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const vitest = join(root, "node_modules/vitest/vitest.mjs");
@@ -337,10 +338,15 @@ async function main() {
     if (files.length === 0 || new Set(files).size !== files.length) {
       throw new Error("Vitest did not discover a unique set of test files.");
     }
-    const execute = (name, selected) =>
-      executeFiles(name, selected, runDirectory, controller.signal);
+    const runs = [];
+    const execute = async (name, selected) => {
+      const result = await executeFiles(name, selected, runDirectory, controller.signal);
+      runs.push({ files: selected, counts: result.counts });
+      return result;
+    };
     if (values["rerun-failed"]) {
       exitCode = await rerunFiles(await readFailedFiles(files), execute, console.log);
+      if (exitCode === 0) await publishTestMetrics(runs);
       return exitCode;
     }
     await rm(failedFileList, { force: true });
@@ -353,8 +359,12 @@ async function main() {
       `Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`,
     );
     if (result.failedFiles.length) await writeJson(failedFileList, result.failedFiles);
-    if (exitCode === 0) await updateTimingCache(runDirectory, groups.length);
-    else console.log(`Run logs: ${runDirectory}`);
+    if (exitCode === 0) {
+      await updateTimingCache(runDirectory, groups.length);
+      await publishTestMetrics(runs);
+    } else {
+      console.log(`Run logs: ${runDirectory}`);
+    }
     return exitCode;
   } finally {
     try {

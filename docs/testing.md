@@ -42,3 +42,18 @@ the migration tests and `npm run db:check`.
 Dynamic imports and files read at runtime, including SQL and documentation, can be absent from the
 module graph. `--safe` adds tests from touched source folders. Root configuration changes and edits
 with no relevant tests may need a targeted test or a full run. Check the printed selection.
+
+## Record test evidence
+
+Run receipt commands from a clean commit. The default command is `npm run test:changed`. Pass a
+command explicitly to record a different test or check.
+
+```sh
+mise exec node@24.22.0 -- npm run test:receipt
+mise exec node@24.22.0 -- npm run test:receipt -- -- npm run typecheck
+mise exec node@24.22.0 -- npm run test:receipt -- --verify "$(git rev-parse HEAD)"
+```
+
+The ignored `.test-receipts/<sha>.json` file records green commands, their elapsed times, and any
+file selections and counts reported by the test runner. A failed command or a dirty checkout cannot
+add evidence. Reviewers can use the receipt for that exact SHA and run checks missing from it.
