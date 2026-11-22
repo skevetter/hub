@@ -2,8 +2,7 @@ import type { HomeSnapshot } from "./dashboard.js";
 
 /**
  * What the reader has to do next, derived from what the organization has. Every state is a fact
- * about records — a connection row, a daemon and its permissions, a trigger, a run — so the list
- * cannot get ahead of the organization and cannot be dismissed into a lie.
+ * about a connection, daemon, trigger, run or session.
  */
 export type ChecklistStep =
   | {
@@ -20,7 +19,7 @@ export type ChecklistStep =
   | { key: "run"; state: "done" | "pending" }
   /** A session profile exists: the daemon, folder and agent a session starts from. */
   | { key: "profile"; state: "done" | "pending" }
-  /** The reader has taken part in a session. */
+  /** The reader started or participates in a session. */
   | { key: "session"; state: "done" | "pending" };
 
 export interface Checklist {
@@ -39,9 +38,22 @@ function appState(snapshot: ChecklistFacts): Extract<ChecklistStep, { key: "app"
   return snapshot.appsConfigured ? "pending" : "setup";
 }
 
-function daemonState(snapshot: ChecklistFacts): Extract<ChecklistStep, { key: "daemon" }>["state"] {
+function daemonState(
+  snapshot: Pick<ChecklistFacts, "daemons">,
+): Extract<ChecklistStep, { key: "daemon" }>["state"] {
   if (snapshot.daemons.some((daemon) => daemon.canExecute)) return "done";
   return snapshot.daemons.length > 0 ? "cannotRun" : "pending";
+}
+
+export function canFinishSetup(
+  snapshot: Pick<ChecklistFacts, "connections" | "daemons" | "triggers" | "runs">,
+): boolean {
+  return (
+    snapshot.connections.length > 0 &&
+    daemonState(snapshot) === "done" &&
+    snapshot.triggers.length > 0 &&
+    snapshot.runs.length > 0
+  );
 }
 
 /**

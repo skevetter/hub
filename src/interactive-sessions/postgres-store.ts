@@ -444,6 +444,47 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
     });
   }
 
+  countOwnInteractiveSessions(viewer: SessionPrincipal, openLimit: number) {
+    return this.runtime.transaction(async (tx) => {
+      const db = tx.drizzle();
+      const { organizationId, userId } = viewer;
+      if (!(await this.role(db, organizationId, userId))) {
+        return { open: 0, openCapped: false, started: false };
+      }
+      const own = and(
+        eq(sessions.organizationId, organizationId),
+        or(
+          eq(sessions.startedByUserId, userId),
+          exists(
+            db
+              .select({ id: participants.sessionId })
+              .from(participants)
+              .where(
+                and(
+                  eq(participants.organizationId, organizationId),
+                  eq(participants.sessionId, sessions.id),
+                  eq(participants.userId, userId),
+                ),
+              ),
+          ),
+        ),
+      );
+      const open = await db
+        .select({ id: sessions.id })
+        .from(sessions)
+        .where(and(own, ne(sessions.state, "closed")))
+        .limit(openLimit + 1);
+      const started =
+        open.length > 0 ||
+        (await db.select({ id: sessions.id }).from(sessions).where(own).limit(1)).length > 0;
+      return {
+        open: Math.min(open.length, openLimit),
+        openCapped: open.length > openLimit,
+        started,
+      };
+    });
+  }
+
   async listInteractiveSessionMessages(
     organizationId: string,
     sessionId: string,

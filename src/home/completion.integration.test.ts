@@ -65,6 +65,82 @@ describe("organization checklist completion", () => {
     );
   });
 
+  it("counts only the reader's sessions even when the reader can see the whole organization", async () => {
+    const { database, organizationId, ownerId, memberId } = fixture;
+    const memberDashboard = fixture.sessionsDashboard(memberId);
+    const ownerDashboard = fixture.sessionsDashboard(ownerId);
+    const session = await fixture.startSession();
+
+    const owner = await ownerDashboard.snapshot(fixture.post(), fixture.slug);
+    const member = await memberDashboard.snapshot(fixture.post(), fixture.slug);
+    assert.deepEqual(owner.sessions, { profiles: 1, open: 0, openCapped: false, started: false });
+    assert.deepEqual(member.sessions, { profiles: 1, open: 1, openCapped: false, started: true });
+    assert.deepEqual(
+      deriveChecklist(owner).steps.find(({ key }) => key === "session"),
+      {
+        key: "session",
+        state: "pending",
+      },
+    );
+    assert.equal(
+      await database.setInteractiveSessionParticipant({
+        principal: { organizationId, userId: memberId, role: "member" },
+        sessionId: session.id,
+        userId: ownerId,
+        role: "controller",
+        now: new Date(),
+      }),
+      "set",
+    );
+    assert.deepEqual((await ownerDashboard.snapshot(fixture.post(), fixture.slug)).sessions, {
+      profiles: 1,
+      open: 1,
+      openCapped: false,
+      started: true,
+    });
+    assert.equal(
+      (
+        await database.acceptInteractiveSessionCommand({
+          principal: { organizationId, userId: memberId, role: "member" },
+          sessionId: session.id,
+          generation: session.generation,
+          idempotencyKey: randomUUID(),
+          kind: "close",
+          now: new Date(),
+          bodyCutoff: null,
+        })
+      ).status,
+      "accepted",
+    );
+    assert.deepEqual((await memberDashboard.snapshot(fixture.post(), fixture.slug)).sessions, {
+      profiles: 1,
+      open: 0,
+      openCapped: false,
+      started: true,
+    });
+  });
+
+  it("lets an owner and a member who are instance operators finish setup for the same organization", async () => {
+    await fixture.recordRun();
+    for (const userId of [fixture.ownerId, fixture.memberId]) {
+      const dashboard = fixture.sessionsDashboard(userId);
+      const before = await dashboard.snapshot(fixture.post(), fixture.slug);
+      assert.equal(before.checklistCompletedAt, null);
+      assert.deepEqual(before.sessions, {
+        profiles: 0,
+        open: 0,
+        openCapped: false,
+        started: false,
+      });
+      const completedAt = await dashboard.completeChecklist(fixture.post(), fixture.slug);
+      assert.equal((await fixture.snapshot()).checklistCompletedAt, completedAt);
+      await fixture.runtime.query(
+        "update organization set home_checklist_completed_at = null where id = $1",
+        [fixture.organizationId],
+      );
+    }
+  });
+
   it("requires an Origin header even when the Referer matches, including on replay", async () => {
     await fixture.recordRun();
     const refererOnly = fixture.post();
@@ -186,6 +262,16 @@ async function startInstance() {
     const path = `${ORIGIN}/o/${slug}/home`;
     const request = new Request(path, { headers: { cookie } });
     const account = await auth.resolveAccount(request);
+    const ownerId = account.account.id;
+    const memberId = "home-member";
+    await runtime.query('insert into "user" (id, name, email) values ($1, $1, $2)', [
+      memberId,
+      "member@example.test",
+    ]);
+    await runtime.query(
+      "insert into member (id, organization_id, user_id, role) values ($1, $2, $1, 'member')",
+      [memberId, organizationId],
+    );
     const dashboard = new HomeDashboard(database, auth, () => true);
     const post = (origin = ORIGIN) =>
       new Request(path, { method: "POST", headers: { cookie, origin } });
@@ -198,7 +284,62 @@ async function startInstance() {
       post,
       runtime,
       close,
+      ownerId,
+      memberId,
       snapshot: () => dashboard.snapshot(request, slug),
+      sessionsDashboard(userId: string) {
+        return new HomeDashboard(
+          database,
+          {
+            ...auth,
+            resolveAccount: async () => ({
+              ...account,
+              account: { ...account.account, id: userId },
+            }),
+          },
+          () => true,
+          { interactiveSessions: true },
+        );
+      },
+      async startSession() {
+        await enrollTestDaemon(database, organizationId);
+        const daemon = await database.listDaemonsForOrganization(organizationId);
+        assert.ok(daemon[0]);
+        await database.setDaemonPresence(daemon[0].id, "connected");
+        const now = new Date();
+        const profile = await database.saveSessionProfile({
+          principal: { organizationId, userId: ownerId, role: "owner" },
+          id: null,
+          version: null,
+          daemonId: daemon[0].id,
+          name: "Home profile",
+          cwd: "/repo",
+          worktree: null,
+          provider: "codex",
+          providerOptions: {},
+          model: null,
+          mode: null,
+          thinkingOptionId: null,
+          fullAccessAcknowledged: false,
+          status: "active",
+          now,
+        });
+        if (typeof profile === "string") throw new Error(profile);
+        const result = await database.startInteractiveSession({
+          principal: { organizationId, userId: memberId, role: "member" },
+          profileId: profile.id,
+          profileVersion: profile.version,
+          idempotencyKey: randomUUID(),
+          message: "hello",
+          participants: [],
+          usage: { periodStart: now, limit: 10 },
+          maxActivePerDaemon: 4,
+          bodyCutoff: null,
+          now,
+        });
+        assert.equal(result.status, "created");
+        return result.session;
+      },
       async recordRun() {
         await runtime.query(
           `insert into slack_connections

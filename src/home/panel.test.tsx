@@ -98,6 +98,15 @@ describe("Home checklist", () => {
     assert.doesNotMatch(markup, /Finish setup/u);
   });
 
+  it("offers Finish setup alongside unfinished personal steps when sessions are on", () => {
+    const markup = renderHome({
+      ...ready,
+      sessions: { profiles: 0, open: 0, openCapped: false, started: false },
+    });
+    assert.match(markup, /<button[^>]*>Finish setup<\/button>/u);
+    assert.match(markup, /Start a session<span class="sr-only"> To do<\/span>/u);
+  });
+
   it("hides the checklist for members even when a derived step regresses", () => {
     const markup = renderHome(
       {
