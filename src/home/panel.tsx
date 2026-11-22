@@ -89,7 +89,7 @@ function HomeView({
     return (
       <>
         {header}
-        <HomeLoading />
+        <HomeLoading sessionsEnabled={sessionsEnabled} />
       </>
     );
   }
@@ -208,15 +208,15 @@ function HomeTiles({ data }: { data: HomeSnapshot }) {
   );
 }
 
-function HomeLoading() {
+function HomeLoading({ sessionsEnabled }: { sessionsEnabled: boolean }) {
+  const columns = sessionsEnabled ? 5 : 4;
   return (
     <div aria-busy="true" aria-label="Loading Home">
       <div className="grid gap-8">
-        <StatGrid columns={4}>
-          <StatTileSkeleton />
-          <StatTileSkeleton />
-          <StatTileSkeleton />
-          <StatTileSkeleton />
+        <StatGrid columns={columns}>
+          {Array.from({ length: columns }, (_, position) => (
+            <StatTileSkeleton key={position} />
+          ))}
         </StatGrid>
         <CardSkeleton lines={4} />
         <CardSkeleton lines={3} />
