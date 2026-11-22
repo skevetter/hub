@@ -98,7 +98,7 @@ for (const width of [1280, 390]) {
     await openSection("Connections");
     await connections
       .card("GitHub")
-      .getByRole("link", { name: "21 dropped events in the last 7 days" })
+      .getByRole("link", { name: "Dropped events in the last 7 days" })
       .click();
     await expect(page).toHaveURL(/\/activity\?/u);
     expect(Object.fromEntries(new URL(page.url()).searchParams)).toMatchObject({

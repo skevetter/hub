@@ -120,6 +120,8 @@ export interface OrganizationRunCount {
   count: number;
 }
 
+export type DroppedEventPresence = "some" | "none" | "unknown";
+
 export interface DroppedProviderEventCount {
   reason: DropReasonGroup;
   provider: ProviderEventReceiptRecord["provider"];
@@ -1923,6 +1925,11 @@ export interface Database
     organizationId: string,
     request: DroppedEventPageRequest,
   ): Promise<DroppedEventPageRecord>;
+  readDroppedEventPresence(
+    organizationId: string,
+    provider: ConnectionProvider,
+    receivedSince: Date,
+  ): Promise<DroppedEventPresence>;
   countRecentDroppedEvents(
     organizationId: string,
     since: Date,
