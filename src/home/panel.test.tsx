@@ -40,7 +40,7 @@ vi.mock("../auth/active-account.js", () => ({
   }),
 }));
 vi.mock("../queries/index.js", () => ({
-  useSnapshotQuery: () => ({ ...view.snapshot, refetch: view.refetch }),
+  useSnapshotQuery: () => ({ ...view.snapshot, refetch: view.refetch, isFetching: false }),
 }));
 vi.mock("../interactive-sessions/ui/new-session.js", () => ({ HomeSessionStart: () => null }));
 vi.mock("../components/app/failure-alert.js", async (importOriginal) => {
@@ -230,6 +230,9 @@ describe("Home needs attention", () => {
       connections: [{ provider: "slack", slug: "slack", label: "Acme", needsAuthorization: true }],
     });
     assert.match(markup, /Slack needs authorization/u);
+    const warning = /<div data-slot="alert"[^>]*>/u.exec(markup)?.[0];
+    assert.ok(warning);
+    assert.doesNotMatch(warning, /role="alert"|aria-live=/u);
     assert.match(markup, /Hub cannot use Acme until/u);
     assert.match(markup, /<a href="\/o\/acme\/connections">Open connections<\/a>/u);
   });
