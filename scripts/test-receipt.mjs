@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { constants, createReadStream, writeFileSync } from "node:fs";
+import { constants, createReadStream, realpathSync, writeFileSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -88,8 +88,8 @@ function logPath(directory, hash) {
   return join(directory, "logs", `${hash}.log`);
 }
 
-async function checkReceipt(receipt, { head, tree }, directory) {
-  if (receipt.version !== 3 || receipt.cleanTree !== true || !Array.isArray(receipt.commands)) {
+async function checkReceipt(receipt, { head, tree }, directory, root) {
+  if (receipt.version !== 4 || receipt.cleanTree !== true || !Array.isArray(receipt.commands)) {
     throw new Error("Unsupported or invalid test receipt. Record fresh evidence.");
   }
   const { sha256, ...payload } = receipt;
@@ -100,6 +100,8 @@ async function checkReceipt(receipt, { head, tree }, directory) {
   for (const entry of receipt.commands) {
     if (entry.head !== head || entry.tree !== tree)
       throw new Error("A receipt entry has a different commit or tree.");
+    if (entry.root !== root || (entry.testedRoot !== null && entry.testedRoot !== root))
+      throw new Error(`A receipt entry ran in a different worktree than ${root}.`);
     if (
       !/^[a-f0-9]{64}$/u.test(entry.logSha256 ?? "") ||
       (await fileHash(logPath(directory, entry.logSha256)).catch(() => null)) !== entry.logSha256
@@ -118,24 +120,30 @@ async function readJson(path) {
   }
 }
 
-export async function publishTestMetrics(results, checks = []) {
+export async function publishTestMetrics(results, checks = [], directory = process.cwd()) {
   const report = process.env[reportVariable];
   if (!report) return;
+  const root = realpathSync(directory);
+  const head = requireGit(root, ["rev-parse", "--verify", "HEAD"]).trim();
   const selectedFiles = [...new Set(results.flatMap(({ files }) => files))].sort();
   const counts = { passed: 0, failed: 0, skipped: 0 };
   for (const result of results) {
     for (const key of Object.keys(counts)) counts[key] += result.counts[key];
   }
-  await writeFile(report, JSON.stringify({ selectedFiles, counts, checks }), { flag: "wx" });
+  await writeFile(report, JSON.stringify({ root, head, selectedFiles, counts, checks }), {
+    flag: "wx",
+  });
 }
 
 function validateMetrics(metrics) {
   if (!metrics) return;
-  const { selectedFiles, counts, checks } = metrics;
+  const { root, head, selectedFiles, counts, checks } = metrics;
   const strings = (items) =>
     Array.isArray(items) && items.every((value) => typeof value === "string");
   const count = (value) => Number.isSafeInteger(value) && value >= 0;
   if (
+    typeof root !== "string" ||
+    typeof head !== "string" ||
     !strings(selectedFiles) ||
     !strings(checks) ||
     !counts ||
@@ -174,8 +182,14 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
     checkUnchanged();
     const metrics = await readJson(report);
     validateMetrics(metrics);
+    if (metrics && (metrics.root !== root || metrics.head !== head)) {
+      throw new Error(
+        `The command tested ${metrics.root} at ${metrics.head}, not ${root} at ${head}.`,
+      );
+    }
     const entry = {
       root,
+      testedRoot: metrics?.root ?? null,
       branch,
       head,
       tree,
@@ -200,7 +214,7 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
     try {
       checkUnchanged();
       const existing = await readJson(destination);
-      if (existing) await checkReceipt(existing, { head, tree }, receiptDir);
+      if (existing) await checkReceipt(existing, { head, tree }, receiptDir, root);
       await mkdir(join(receiptDir, "logs"), { recursive: true, mode: 0o700 });
       await copyFile(logFile, logPath(receiptDir, entry.logSha256), constants.COPYFILE_EXCL).catch(
         async (error) => {
@@ -215,7 +229,7 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
         (item) => JSON.stringify(item.command) !== JSON.stringify(command),
       );
       commands.push(entry);
-      const payload = { version: 3, head, tree, cleanTree: true, commands };
+      const payload = { version: 4, head, tree, cleanTree: true, commands };
       const data = { ...payload, sha256: receiptHash(payload) };
       await writeFile(pending, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await rename(pending, destination);
@@ -239,7 +253,7 @@ export async function verifyReceipt(directory, sha) {
   const receiptDir = join(directory, ".test-receipts");
   const receipt = await readJson(join(receiptDir, `${commit.head}.json`));
   if (!receipt) throw new Error(`No test receipt exists for ${commit.head}.`);
-  await checkReceipt(receipt, commit, receiptDir);
+  await checkReceipt(receipt, commit, receiptDir, realpathSync(directory));
   return receipt;
 }
 

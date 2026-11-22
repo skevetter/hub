@@ -432,7 +432,7 @@ async function main() {
       });
       if (result !== 0) return result;
       const { selectedFiles, counts } = JSON.parse(await readFile(metrics, "utf8"));
-      await publishTestMetrics([{ files: selectedFiles, counts }], checks);
+      await publishTestMetrics([{ files: selectedFiles, counts }], checks, root);
       return 0;
     }
     const direct = await selectedVitest(
@@ -451,6 +451,7 @@ async function main() {
     await publishTestMetrics(
       [{ files: direct.files.map(({ path }) => path), counts: direct.counts }],
       checks,
+      root,
     );
     return 0;
   } catch (error) {

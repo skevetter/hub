@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,6 +58,7 @@ test("records command, selected files and counts on a clean commit", async (t) =
   assert.equal(saved.head, head);
   assert.equal(saved.commands[0].head, head);
   assert.equal(saved.commands[0].root, await realpath(directory));
+  assert.equal(saved.commands[0].testedRoot, await realpath(directory));
   assert.equal(saved.commands[0].branch, gitBranch(directory));
   assert.equal(saved.cleanTree, true);
   assert.equal(saved.commands.length, 2);
@@ -180,4 +181,30 @@ test("CLI refuses a different checkout and records evidence in an explicit root"
   const saved = await verifyReceipt(root, targetHead);
   assert.equal(saved.commands[0].root, root);
   assert.equal(saved.commands[0].branch, gitBranch(root));
+});
+
+test("receipts bind evidence to the worktree the tests ran in", async (t) => {
+  const { directory, head, git } = await gitFixture(t);
+  const other = await gitFixture(t);
+  const publish = (target) => [
+    process.execPath,
+    "--input-type=module",
+    "-e",
+    `import { publishTestMetrics } from ${JSON.stringify(new URL("./test-receipt.mjs", import.meta.url).href)};
+     await publishTestMetrics([{ files: ["a.test.ts"], counts: { passed: 1, failed: 0, skipped: 0 } }], [], ${JSON.stringify(target)});`,
+  ];
+  await assert.rejects(
+    recordTestRun(directory, publish(other.directory), { stdio: "ignore" }),
+    /The command tested .* not /u,
+  );
+  await assert.rejects(verifyReceipt(directory, head), /No test receipt exists/u);
+
+  await recordTestRun(directory, publish(directory), { stdio: "ignore" });
+  const clone = await mkdtemp(join(tmpdir(), "hub-receipt-clone-"));
+  t.after(() => rm(clone, { recursive: true }));
+  execFileSync("git", ["clone", "--quiet", directory, clone]);
+  assert.equal(git("rev-parse", "HEAD"), head);
+  await cp(join(directory, ".test-receipts"), join(clone, ".test-receipts"), { recursive: true });
+  await assert.rejects(verifyReceipt(clone, head), /different worktree/u);
+  await verifyReceipt(directory, head);
 });
