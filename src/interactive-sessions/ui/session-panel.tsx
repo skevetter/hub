@@ -40,7 +40,11 @@ export function SessionDetailLoading() {
   return (
     <div aria-busy="true" aria-label="Loading session">
       <PageHeaderSkeleton />
-      <TranscriptSkeleton />
+      <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,17rem)]">
+        <Card>
+          <TranscriptSkeleton />
+        </Card>
+      </div>
     </div>
   );
 }
