@@ -35,8 +35,33 @@ describe("things to try", () => {
     assert.match(surface?.where ?? "", /not connected yet/u);
   });
 
+  it("asks only for a connection when a comment trigger already exists", () => {
+    const trigger = {
+      id: "t",
+      name: "review",
+      enabled: true,
+      event: "github.pull_request_comment_created",
+      commentEvents: [
+        {
+          on: "github.pull_request_comment_created",
+          hasReplyOutput: true,
+          commentPrefix: "/paseo",
+        },
+      ],
+    };
+    const surface = thingsToTry({ ...nothing, triggers: [trigger] })[1];
+    assert.deepEqual(surface?.next, { label: "Connect GitHub", path: "connections" });
+    assert.doesNotMatch(surface?.where ?? "", /create a comment trigger/iu);
+  });
+
   it("sends the reader to create a trigger when nothing enabled listens to the app", () => {
-    const paused = { id: "t", name: "triage", event: "linear.comment_created", enabled: false };
+    const paused = {
+      id: "t",
+      name: "triage",
+      event: "linear.comment_created",
+      enabled: false,
+      commentEvents: [{ on: "linear.comment_created", hasReplyOutput: true, commentPrefix: null }],
+    };
     const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers: [paused] });
     assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new" });
     assert.match(surface?.where ?? "", /Acme is connected/u);
@@ -49,8 +74,9 @@ describe("things to try", () => {
       name: "triage",
       event: "github.issue_comment_created",
       enabled: true,
-      hasReplyOutput: true,
-      commentPrefix: "",
+      commentEvents: [
+        { on: "github.issue_comment_created", hasReplyOutput: true, commentPrefix: "" },
+      ],
     };
     const surface = thingsToTry({ ...nothing, connections: [github], triggers: [trigger] })[1];
     assert.equal(surface?.next, undefined);
@@ -67,14 +93,16 @@ describe("things to try", () => {
 
   it("requires the reply output on the trigger that listens to comments", () => {
     const triggers = [
-      { id: "t", name: "triage", event: "linear.comment_created", enabled: true },
       {
-        id: "assign",
-        name: "assign",
-        event: "linear.issue_assigned",
+        id: "t",
+        name: "triage",
+        event: "linear.comment_created",
         enabled: true,
-        hasReplyOutput: true,
+        commentEvents: [
+          { on: "linear.comment_created", hasReplyOutput: false, commentPrefix: null },
+        ],
       },
+      { id: "assign", name: "assign", event: "linear.issue_assigned", enabled: true },
     ];
     const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers });
     assert.match(surface?.where ?? "", /triage needs a reply output/u);
@@ -88,8 +116,9 @@ describe("things to try", () => {
       name: "checks",
       event: "github.pull_request_comment_created",
       enabled: true,
-      hasReplyOutput: true,
-      commentPrefix: "",
+      commentEvents: [
+        { on: "github.pull_request_comment_created", hasReplyOutput: true, commentPrefix: "" },
+      ],
     };
     const surface = thingsToTry({
       ...nothing,
@@ -112,8 +141,9 @@ describe("things to try", () => {
       name: "triage",
       event: "github.issue_comment_created",
       enabled: true,
-      hasReplyOutput: true,
-      commentPrefix: "",
+      commentEvents: [
+        { on: "github.issue_comment_created", hasReplyOutput: true, commentPrefix: "" },
+      ],
     };
     const surface = thingsToTry({
       ...nothing,

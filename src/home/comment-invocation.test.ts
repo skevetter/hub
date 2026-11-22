@@ -3,6 +3,7 @@ import { it, vi } from "vitest";
 import type { AuthServer } from "../auth/server.js";
 import { parseCompiledHubConfig } from "../config/compiler.js";
 import { createMemoryDatabase } from "../db/memory.js";
+import { LINEAR_REQUIRED_SCOPES } from "../providers/linear/client.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
 import { matchGitHubInvocations } from "../triggers/github/match.js";
@@ -26,9 +27,11 @@ it.each([
   ["plain prefix", 'filters: { from_users: ["*"], pattern: "/paseo" }', "", true],
   ["no text filters", 'filters: { from_users: ["*"] }', "", true],
   ["no filters", "", "", false],
+  ["Linear before GitHub", 'filters: { from_users: ["*"], pattern: "/paseo" }', "", true, "first"],
+  ["GitHub before Linear", 'filters: { from_users: ["*"], pattern: "/paseo" }', "", true, "last"],
 ] as const)(
   "checks every offered comment against the real invocation for %s",
-  async (kind, filters, inputs, ready) => {
+  async (kind, filters, inputs, ready, linearPlacement?) => {
     const organizationId = "org-1";
     const userId = "user-1";
     const connectionId = "github-1";
@@ -41,6 +44,21 @@ it.each([
           organizationSlug: "acme",
           membershipId: "membership-1",
           role: "owner",
+        },
+      ],
+      linearConnections: [
+        {
+          id: "linear",
+          organizationId,
+          slug: "linear",
+          providerApplicationId: null,
+          linearOrganizationId: "linear-org",
+          linearOrganizationName: "Acme Linear",
+          appUserId: "linear-app",
+          accessToken: "fixture-only",
+          refreshToken: null,
+          accessTokenExpiresAt: null,
+          scopes: [...LINEAR_REQUIRED_SCOPES],
         },
       ],
       githubConnections: [
@@ -59,10 +77,20 @@ it.each([
     });
     await enrollTestDaemon(db, organizationId);
     const store = new OrganizationTriggerStore(db, organizationId, acceptingAgentValidator());
+    const github = `  github.pull_request_comment_created: ${filters === "" ? "{}" : `\n    ${filters}`}`;
+    const linear =
+      '  linear.comment_created:\n    filters: { from_users: ["linear-person"], pattern: "/linear" }';
+    const events = [
+      linearPlacement === "first" && linear,
+      github,
+      linearPlacement === "last" && linear,
+    ]
+      .filter(Boolean)
+      .join("\n");
     const yaml = `
 name: review
 on:
-  github.pull_request_comment_created: ${filters === "" ? "{}" : `\n    ${filters}`}
+${events}
 ${inputs}
 run:
   target: { daemon: ${TEST_DAEMON_SLUG}, cwd: /repo }
@@ -130,6 +158,13 @@ run:
       const result = match(prompt);
       assert.ok(Array.isArray(result), JSON.stringify({ prompt, result }));
       assert.equal(result[0]?.invocation.status, "accepted", JSON.stringify({ prompt, result }));
+    }
+    if (linearPlacement !== undefined) {
+      assert.match(surface.where, /Comment on a pull request .* review is configured to run/u);
+      const linearSurface = thingsToTry(snapshot).find(({ key }) => key === "linear");
+      assert.equal(linearSurface?.where, "review only starts for comments that match its filters.");
+      assert.equal(linearSurface.next?.path, `triggers/${trigger.id}`);
+      assert.equal(linearSurface.examples.length, 0);
     }
     if (ready) {
       assert.equal(surface.examples.length, 3);

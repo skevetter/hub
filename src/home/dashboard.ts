@@ -64,9 +64,12 @@ export interface HomeSnapshot {
     name: string;
     event: string;
     enabled: boolean;
-    hasReplyOutput?: boolean;
-    /** Text to put before an example. Null means the reader must evaluate the filters. */
-    commentPrefix?: string | null;
+    commentEvents?: readonly {
+      on: string;
+      hasReplyOutput: boolean;
+      /** Text before an example. Null means the reader must evaluate the filters. */
+      commentPrefix: string | null;
+    }[];
   }[];
   runs: readonly (Omit<OrganizationRunRecord, "receivedAt"> & { receivedAt: string })[];
   /** Every run in the last 24 hours and the last `HOME_MONTH_DAYS` days, not only the ones listed. */
@@ -253,26 +256,33 @@ function triggerFacts(
   revision: OrganizationTriggerRevisionRecord | undefined,
   format: "single_run" | "legacy_multistep",
   connections: OrganizationConnectionUsage,
-): Pick<HomeSnapshot["triggers"][number], "event" | "hasReplyOutput" | "commentPrefix"> {
+): Pick<HomeSnapshot["triggers"][number], "event" | "commentEvents"> {
   if (revision === undefined) return { event: "" };
   const projection = projectTriggerForm(revision.yaml);
   const primaryEvent = projection.status === "editable" ? projection.value.event : undefined;
+  // A form-owned event is the whole configuration, and needs no comment projection here.
   if (primaryEvent !== undefined && !isTryCommentEvent(primaryEvent))
     return { event: primaryEvent };
-  if (primaryEvent === undefined && format === "legacy_multistep") return { event: "" };
 
   const { triggers } = parseCompiledHubConfig(revision.normalizedConfiguration);
-  const comment = triggers.find(({ on }) =>
-    primaryEvent === undefined ? isTryCommentEvent(on) : on === primaryEvent,
-  );
-  const event = comment?.on ?? primaryEvent ?? triggers[0]?.on ?? "";
-  const replyType = `${event.split(".", 1)[0]}.reply`;
-  const hasReplyOutput = comment?.steps.some(
-    (step) => !isScriptStep(step) && step.allowOutputs.some(({ type }) => type === replyType),
-  );
-  return comment !== undefined && hasReplyOutput
-    ? { event, hasReplyOutput, commentPrefix: acceptedCommentPrefix(comment, connections) }
-    : { event };
+  const comments = triggers.filter(({ on }) => isTryCommentEvent(on));
+  const event =
+    primaryEvent ??
+    (format === "legacy_multistep" ? "" : (comments[0]?.on ?? triggers[0]?.on ?? ""));
+  if (comments.length === 0) return { event };
+
+  const commentEvents = comments.map((comment) => {
+    const replyType = `${comment.on.split(".", 1)[0]}.reply`;
+    const hasReplyOutput = comment.steps.some(
+      (step) => !isScriptStep(step) && step.allowOutputs.some(({ type }) => type === replyType),
+    );
+    return {
+      on: comment.on,
+      hasReplyOutput,
+      commentPrefix: hasReplyOutput ? acceptedCommentPrefix(comment, connections) : null,
+    };
+  });
+  return { event, commentEvents };
 }
 
 function acceptedCommentPrefix(
