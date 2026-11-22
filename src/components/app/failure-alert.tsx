@@ -1,5 +1,5 @@
 import { CircleCheck, Info, TriangleAlert } from "lucide-react";
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode, type Ref } from "react";
 
 import type { Result } from "../../contract/respond.js";
 import { Alert } from "../ui/alert.js";
@@ -58,6 +58,7 @@ export function FailureAlert({
   fallback,
   details,
   onRetry,
+  retryRef,
   focusOnArrival = false,
   passive = false,
   standalone = false,
@@ -69,6 +70,7 @@ export function FailureAlert({
   /** Everything the one-line message cannot carry, e.g. the list of values that were refused. */
   details?: ReactNode;
   onRetry?: () => void;
+  retryRef?: Ref<HTMLButtonElement>;
   /**
    * Take the keyboard every time this alert arrives, including when it arrives carrying a
    * different failure than the one already on screen. Submitting disables the form, which blurs
@@ -100,7 +102,7 @@ export function FailureAlert({
       <p>{message}</p>
       {details}
       {onRetry === undefined ? null : (
-        <Button type="button" size="sm" variant="outline" onClick={onRetry}>
+        <Button ref={retryRef} type="button" size="sm" variant="outline" onClick={onRetry}>
           Try again
         </Button>
       )}
