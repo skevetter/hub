@@ -248,7 +248,7 @@ function HomeTiles({ data }: { data: HomeSnapshot }) {
 
 function HomeLoading() {
   return (
-    <div aria-busy="true" aria-label="Loading Home">
+    <div role="group" aria-busy="true" aria-label="Loading Home">
       <div className="grid gap-8">
         <StatGrid columns={4}>
           {Array.from({ length: 4 }, (_, position) => (
