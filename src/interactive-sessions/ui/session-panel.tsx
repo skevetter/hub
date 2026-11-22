@@ -218,7 +218,12 @@ function SessionConversation({ stream, snapshot, organizationSlug }: SessionView
           retryBusy={busy}
         />
       </Card>
-      {composer}
+      {composer === null ? null : (
+        // Docked on phones so the box stays reachable under a long transcript.
+        <div className="sticky bottom-0 z-10 -mx-4 border-t bg-background px-4 py-3 md:static md:mx-0 md:border-0 md:bg-transparent md:p-0">
+          {composer}
+        </div>
+      )}
     </div>
   );
 }

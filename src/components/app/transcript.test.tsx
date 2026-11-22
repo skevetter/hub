@@ -92,6 +92,15 @@ describe("transcript entries", () => {
     assert.match(markup, /Completed/u);
   });
 
+  it("tells people from the agent by alignment and shows a tool as one quiet line", () => {
+    const markup = render(MESSAGES);
+    assert.match(markup, /data-entry="human" class="[^"]*justify-items-end/u);
+    assert.match(markup, /data-entry="assistant" class="[^"]*justify-items-start/u);
+    const tool = markup.match(/<p data-entry="tool"[^>]*>.*?<\/p>/u)?.[0] ?? "";
+    assert.match(tool, /Completed/u);
+    assert.doesNotMatch(tool, /rounded-sm/u);
+  });
+
   it("shows a boundary note for a gap or an offline daemon", () => {
     const markup = render([{ id: "i9", kind: "boundary", label: "Daemon offline", seq: 1 }]);
     assert.match(markup, /Daemon offline/u);
