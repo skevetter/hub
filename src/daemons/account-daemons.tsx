@@ -30,6 +30,7 @@ import {
   type DeviceProfileName,
 } from "./device-details.js";
 import { useDeviceProfiles, useDeviceProviders } from "./device-queries.js";
+import { createProviderReadLimiter, type ProviderReadLimiter } from "./provider-read-limiter.js";
 import { daemonsQueryKey, refreshDaemons } from "./status.js";
 
 const DAEMONS_DESCRIPTION = "See the machines that run your agents and what Hub can do on them.";
@@ -174,6 +175,7 @@ function DaemonsContent({
   showProfiles: boolean;
 }) {
   const searchId = useId();
+  const [limitProviderReads] = useState(createProviderReadLimiter);
   const [filters, setFilters] = useState<DaemonsFilters>(INITIAL_FILTERS);
   const [announcement, setAnnouncement] = useState<{ count: number; revision: number }>();
   const { daemons, canManage } = snapshot;
@@ -234,6 +236,7 @@ function DaemonsContent({
               accountId={accountId}
               organizationSlug={organizationSlug}
               profiles={profiles}
+              limitProviderReads={limitProviderReads}
               canManage={canManage}
               busy={busy}
               onRename={onRename}
@@ -303,6 +306,7 @@ function ConnectedDaemonDevice({
   accountId,
   organizationSlug,
   profiles,
+  limitProviderReads,
   canManage,
   busy,
   onRename,
@@ -312,9 +316,10 @@ function ConnectedDaemonDevice({
   accountId: string;
   organizationSlug: string;
   profiles: ReturnType<typeof useDeviceProfiles>;
+  limitProviderReads: ProviderReadLimiter;
   canManage: boolean;
 }) {
-  const providers = useDeviceProviders(daemon, accountId, organizationSlug);
+  const providers = useDeviceProviders(daemon, accountId, organizationSlug, limitProviderReads);
   const deviceProfiles = useMemo(
     () =>
       profiles === undefined

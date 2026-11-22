@@ -204,6 +204,54 @@ test("hides cached management profiles after the daemon list confirms demotion",
   await expect(profile).toBeVisible();
 });
 
+test("limits outstanding provider requests to four in list order", async ({ hub, page }) => {
+  test.setTimeout(90_000);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const ids = new Map<string, string>();
+  for (let index = 0; index < 24; index++) {
+    const slug = `fleet-device-${index}`;
+    ids.set(slug, await hub.seedDaemonSlug("owner", slug));
+  }
+  await hub
+    .primaryApplication()
+    .query(
+      "update daemons set presence = 'connected', connected_at = now() where slug like 'fleet-device-%'",
+      [],
+    );
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let fifth!: () => void;
+  const overLimit = new Promise<boolean>((resolve) => {
+    fifth = () => resolve(true);
+  });
+  const requests: string[] = [];
+  await page.route("**/_serverFn/**", async (route) => {
+    const url = decodeURIComponent(route.request().url());
+    const id = [...ids.values()].find((candidate) => url.includes(candidate));
+    if (id === undefined) return route.continue();
+    requests.push(id);
+    if (requests.length === 5) fifth();
+    await held;
+    return route.abort();
+  });
+  try {
+    const daemons = new OrganizationDaemons(page);
+    await daemons.open();
+    await expect(daemons.list().getByRole("listitem")).toHaveCount(24);
+    const headings = await daemons.list().getByRole("heading").allTextContents();
+    await expect.poll(() => requests.length).toBeGreaterThanOrEqual(4);
+    const observed = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000));
+    expect(await Promise.race([overLimit, observed])).toBe(false);
+    expect(requests).toHaveLength(4);
+    expect(new Set(requests)).toEqual(new Set(headings.slice(0, 4).map((name) => ids.get(name))));
+  } finally {
+    release();
+  }
+});
+
 function newMemberPage(browser: Browser, existingContexts: ReadonlySet<BrowserContext>) {
   const page = browser
     .contexts()

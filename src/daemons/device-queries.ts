@@ -5,6 +5,7 @@ import { listSessionProfiles } from "../interactive-sessions/functions.js";
 import { useSnapshotQuery } from "../queries/index.js";
 import { deviceProviders, deviceStatus, profilesByDaemon } from "./device-details.js";
 import { daemonProviderSnapshot, type BrowserDaemon } from "./functions.js";
+import type { ProviderReadLimiter } from "./provider-read-limiter.js";
 
 const PROVIDER_POLL_INTERVAL_MS = 2_000;
 const MAX_PROVIDER_READS = 16;
@@ -14,6 +15,7 @@ export function useDeviceProviders(
   daemon: BrowserDaemon,
   accountId: string,
   organizationSlug: string,
+  schedule: ProviderReadLimiter,
 ) {
   const read = useServerFn(daemonProviderSnapshot);
   const connected = deviceStatus(daemon) === "connected";
@@ -26,11 +28,12 @@ export function useDeviceProviders(
       daemon.connectedAt,
     ],
     enabled: connected,
-    queryFn: async ({ signal }) => {
-      const result = await read({ data: { organizationSlug, daemonId: daemon.id }, signal });
-      if (result.status === "error") throw new Error(result.error.message);
-      return deviceProviders(result.data.entries);
-    },
+    queryFn: ({ signal }) =>
+      schedule(signal, async () => {
+        const result = await read({ data: { organizationSlug, daemonId: daemon.id }, signal });
+        if (result.status === "error") throw new Error(result.error.message);
+        return deviceProviders(result.data.entries);
+      }),
     refetchInterval: ({ state }) =>
       state.status === "success" &&
       state.data?.discovering === true &&
