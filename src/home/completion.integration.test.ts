@@ -70,7 +70,7 @@ describe("organization checklist completion", () => {
     );
   });
 
-  it("counts only the reader's sessions even when the reader can see the whole organization", async () => {
+  it("reports only the reader's sessions even when the reader can see the whole organization", async () => {
     const { database, organizationId, ownerId, memberId } = fixture;
     const memberDashboard = fixture.sessionsDashboard(memberId);
     const ownerDashboard = fixture.sessionsDashboard(ownerId);
@@ -78,8 +78,8 @@ describe("organization checklist completion", () => {
 
     const owner = await ownerDashboard.snapshot(fixture.post(), fixture.slug);
     const member = await memberDashboard.snapshot(fixture.post(), fixture.slug);
-    assert.deepEqual(owner.sessions, { open: 0, openCapped: false, started: false });
-    assert.deepEqual(member.sessions, { open: 1, openCapped: false, started: true });
+    assert.equal(owner.sessionStarted, false);
+    assert.equal(member.sessionStarted, true);
     assert.deepEqual(
       deriveChecklist(owner).steps.find(({ key }) => key === "session"),
       {
@@ -97,11 +97,10 @@ describe("organization checklist completion", () => {
       }),
       "set",
     );
-    assert.deepEqual((await ownerDashboard.snapshot(fixture.post(), fixture.slug)).sessions, {
-      open: 1,
-      openCapped: false,
-      started: true,
-    });
+    assert.equal(
+      (await ownerDashboard.snapshot(fixture.post(), fixture.slug)).sessionStarted,
+      true,
+    );
     assert.equal(
       (
         await database.acceptInteractiveSessionCommand({
@@ -116,11 +115,10 @@ describe("organization checklist completion", () => {
       ).status,
       "accepted",
     );
-    assert.deepEqual((await memberDashboard.snapshot(fixture.post(), fixture.slug)).sessions, {
-      open: 0,
-      openCapped: false,
-      started: true,
-    });
+    assert.equal(
+      (await memberDashboard.snapshot(fixture.post(), fixture.slug)).sessionStarted,
+      true,
+    );
   });
 
   it("lets an owner and a member who are instance operators finish setup for the same organization", async () => {
@@ -129,11 +127,7 @@ describe("organization checklist completion", () => {
       const dashboard = fixture.sessionsDashboard(userId);
       const before = await dashboard.snapshot(fixture.post(), fixture.slug);
       assert.equal(before.checklistCompletedAt, null);
-      assert.deepEqual(before.sessions, {
-        open: 0,
-        openCapped: false,
-        started: false,
-      });
+      assert.equal(before.sessionStarted, false);
       const completedAt = await dashboard.completeChecklist(fixture.post(), fixture.slug);
       assert.equal((await fixture.snapshot()).checklistCompletedAt, completedAt);
       await fixture.runtime.query(

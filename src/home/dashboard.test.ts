@@ -18,7 +18,6 @@ import { compileTriggerDocument } from "../triggers/configuration/index.js";
 import { matchTriggers } from "../triggers/github/match.js";
 import { SLACK_REQUIRED_BOT_SCOPES } from "../providers/slack/client.js";
 import { HomeDashboard } from "./dashboard.js";
-import { HOME_OPEN_SESSIONS_LIMIT } from "./limits.js";
 import { thingsToTry } from "./things-to-try.js";
 
 const NOW = new Date("2026-09-21T12:00:00.000Z");
@@ -336,46 +335,23 @@ ${agent}`;
       now: () => NOW,
     }).snapshot(request, "acme");
 
-    assert.equal(snapshot.sessions, null);
+    assert.equal(snapshot.sessionStarted, null);
   });
 
-  it("counts the reader's open sessions when sessions are on", async () => {
-    const database = await withSessions({
-      profiles: ["active", "active", "disabled"],
-      open: 2,
-    });
-    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+  it("reports that the reader has not started a session when no session exists", async () => {
+    const snapshot = await new HomeDashboard(memberDatabase(), accountAuth(), APPS_CONFIGURED, {
       now: () => NOW,
       interactiveSessions: true,
     }).snapshot(request, "acme");
-
-    assert.deepEqual(snapshot.sessions, {
-      open: 2,
-      openCapped: false,
-      started: true,
-    });
+    assert.equal(snapshot.sessionStarted, false);
   });
 
-  it("caps the open count and keeps the session step done with only closed sessions", async () => {
-    const capped = await new HomeDashboard(
-      await withSessions({ profiles: ["active"], open: HOME_OPEN_SESSIONS_LIMIT + 1 }),
-      accountAuth(),
-      APPS_CONFIGURED,
-      { now: () => NOW, interactiveSessions: true },
-    ).snapshot(request, "acme");
-    assert.deepEqual(capped.sessions, {
-      open: HOME_OPEN_SESSIONS_LIMIT,
-      openCapped: true,
-      started: true,
+  it.each([false, true])("reports the reader started a session (closed: %s)", async (closed) => {
+    const dashboard = new HomeDashboard(await withSession(closed), accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+      interactiveSessions: true,
     });
-
-    const none = await new HomeDashboard(
-      await withSessions({ profiles: ["active"], open: 0, closed: 1 }),
-      accountAuth(),
-      APPS_CONFIGURED,
-      { now: () => NOW, interactiveSessions: true },
-    ).snapshot(request, "acme");
-    assert.deepEqual(none.sessions, { open: 0, openCapped: false, started: true });
+    assert.equal((await dashboard.snapshot(request, "acme")).sessionStarted, true);
   });
 
   it("asks the provider registrations whether any app is configured, with the organization's bindings", async () => {
@@ -398,70 +374,53 @@ ${agent}`;
 
 const CONNECTED_ONLY_DAEMON_ID = "20000000-0000-4000-8000-000000000002";
 
-async function withSessions({
-  profiles,
-  open,
-  closed = 0,
-}: {
-  profiles: readonly ("active" | "disabled")[];
-  open: number;
-  closed?: number;
-}): Promise<Database> {
+async function withSession(closed: boolean): Promise<Database> {
   const database = memberDatabase();
   const principal = { organizationId: "org-1", userId: "user-1", role: "owner" } as const;
   await enrollTestDaemon(database, principal.organizationId);
   await database.setDaemonPresence(TEST_DAEMON_ID, "connected");
-  const savedProfiles = await Promise.all(
-    profiles.map(async (status, index) => {
-      const profile = await database.saveSessionProfile({
-        principal,
-        id: null,
-        version: null,
-        daemonId: TEST_DAEMON_ID,
-        name: `Profile ${String(index + 1)}`,
-        cwd: "/repo",
-        worktree: null,
-        provider: "codex",
-        providerOptions: {},
-        model: null,
-        mode: null,
-        thinkingOptionId: null,
-        fullAccessAcknowledged: false,
-        status,
-        now: NOW,
-      });
-      if (typeof profile === "string") throw new Error(profile);
-      return profile;
-    }),
-  );
-  const profile = savedProfiles.find(({ status }) => status === "active");
-  assert.ok(profile);
-  for (let index = 0; index < open + closed; index += 1) {
-    const started = await database.startInteractiveSession({
+  const profile = await database.saveSessionProfile({
+    principal,
+    id: null,
+    version: null,
+    daemonId: TEST_DAEMON_ID,
+    name: "Profile",
+    cwd: "/repo",
+    worktree: null,
+    provider: "codex",
+    providerOptions: {},
+    model: null,
+    mode: null,
+    thinkingOptionId: null,
+    fullAccessAcknowledged: false,
+    status: "active",
+    now: NOW,
+  });
+  if (typeof profile === "string") throw new Error(profile);
+  const started = await database.startInteractiveSession({
+    principal,
+    profileId: profile.id,
+    profileVersion: profile.version,
+    idempotencyKey: randomUUID(),
+    message: "hello",
+    participants: [],
+    usage: { periodStart: NOW, limit: 1 },
+    maxActivePerDaemon: 1,
+    bodyCutoff: null,
+    now: NOW,
+  });
+  assert.equal(started.status, "created");
+  if (closed) {
+    const result = await database.acceptInteractiveSessionCommand({
       principal,
-      profileId: profile.id,
-      profileVersion: profile.version,
+      sessionId: started.session.id,
+      generation: started.session.generation,
       idempotencyKey: randomUUID(),
-      message: "hello",
-      participants: [],
-      usage: { periodStart: NOW, limit: open + closed },
-      maxActivePerDaemon: open + closed,
+      kind: "close",
       bodyCutoff: null,
       now: NOW,
     });
-    assert.equal(started.status, "created");
-    if (index >= open) {
-      const result = await database.acceptInteractiveSessionCommand({
-        principal,
-        sessionId: started.session.id,
-        generation: started.session.generation,
-        idempotencyKey: randomUUID(),
-        kind: "close",
-        bodyCutoff: null,
-        now: NOW,
-      });
-      assert.equal(result.status, "accepted");
-    }
+    assert.equal(result.status, "accepted");
   }
   return database;
 }

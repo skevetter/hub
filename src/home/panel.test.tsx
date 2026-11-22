@@ -100,7 +100,7 @@ const ready: HomeSnapshot = {
     day: { total: 3, succeeded: 2, failed: 1 },
     month: { total: 41, succeeded: 30, failed: 9 },
   },
-  sessions: null,
+  sessionStarted: null,
   dropped: [],
   windowDays: 7,
 };
@@ -128,7 +128,7 @@ function renderHome(snapshot: HomeSnapshot, operator = true, profiles: ProfileAv
   return renderHomeQuery(
     { status: "success", data: snapshot, error: null },
     operator,
-    snapshot.sessions !== null,
+    snapshot.sessionStarted !== null,
   );
 }
 
@@ -168,7 +168,7 @@ describe("Home query states", () => {
 
   it.each([
     [false, 4],
-    [true, 5],
+    [true, 4],
   ] as const)(
     "renders the tile count when the session feature is %s",
     (sessionsEnabled, columns) => {
@@ -200,7 +200,7 @@ describe("Home checklist", () => {
   it("offers Finish setup alongside unfinished personal steps when sessions are on", () => {
     const markup = renderHome({
       ...ready,
-      sessions: { open: 0, openCapped: false, started: false },
+      sessionStarted: false,
     });
     assert.match(markup, /<button[^>]*>Finish setup<\/button>/u);
     assert.match(markup, /Start a session<span class="sr-only"> To do<\/span>/u);
@@ -238,17 +238,26 @@ describe("Home figures", () => {
     assert.match(tile(markup, "Active triggers"), /1\s+1 paused/u);
   });
 
-  it("shows the reader's open sessions only while sessions are on", () => {
+  it("shows the same four organization figures with sessions on or off", () => {
     assert.doesNotMatch(renderHome(ready), /Open sessions/u);
     const markup = renderHome(
       {
         ...ready,
-        sessions: { open: 200, openCapped: true, started: true },
+        sessionStarted: true,
       },
       true,
-      1,
+      0,
     );
-    assert.match(tile(markup, "Open sessions"), /200\+\s+1 active profile/u);
+    assert.doesNotMatch(markup, /Open sessions|open now/u);
+    for (const name of [
+      "Runs, 24 hours",
+      "Runs, 30 days",
+      "Active triggers",
+      "Daemons connected",
+    ]) {
+      assert.equal(tile(markup, name), tile(renderHome(ready), name));
+    }
+    assert.match(markup, /You started or joined a session/u);
   });
 });
 
@@ -319,7 +328,7 @@ describe("Home getting started", () => {
     const markup = renderHome(
       {
         ...fresh,
-        sessions: { open: 0, openCapped: false, started: false },
+        sessionStarted: false,
       },
       true,
       1,
@@ -331,7 +340,7 @@ describe("Home getting started", () => {
   });
 
   it("shows a checking profile step and omits it when profile access is refused", () => {
-    const data = { ...fresh, sessions: { open: 0, openCapped: false, started: false } };
+    const data = { ...fresh, sessionStarted: false };
     const checking = renderHome(data, true, "checking");
     assert.match(checking, /Create a session profile<span class="sr-only"> Checking profiles/u);
     assert.doesNotMatch(checking, /Create a session profile<span class="sr-only"> To do/u);
@@ -366,7 +375,7 @@ describe("Home things to try", () => {
     assert.doesNotMatch(renderHome(fresh), />Sessions<\/button>/u);
     const markup = renderHome({
       ...fresh,
-      sessions: { open: 0, openCapped: false, started: false },
+      sessionStarted: false,
     });
     assert.match(markup, /Sessions<\/button>/u);
   });
