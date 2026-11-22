@@ -146,7 +146,10 @@ function appSurface(
       ? [{ trigger, comment }]
       : [];
   });
-  const matching = listening.find(({ trigger }) => trigger.hasReplyOutput) ?? listening[0];
+  const matching =
+    listening.find(({ trigger }) => trigger.hasReplyOutput && trigger.commentPrefix !== null) ??
+    listening.find(({ trigger }) => trigger.hasReplyOutput) ??
+    listening[0];
   if (matching === undefined) {
     const name = healthy[0]?.label;
     return {
@@ -158,6 +161,16 @@ function appSurface(
     };
   }
   const { trigger, comment } = matching;
+  const { commentPrefix } = trigger;
+  if (commentPrefix === null) {
+    return {
+      key: provider,
+      label,
+      where: `${trigger.name} only starts for comments that match its filters.`,
+      next: { label: "Open trigger", path: `triggers/${trigger.id}` },
+      examples: [],
+    };
+  }
   const targetExamples = comment.pullRequest ? GITHUB_PULL_REQUEST_EXAMPLES : LINEAR_EXAMPLES;
   const location = healthy.length === 1 ? ` in ${healthy[0]?.label ?? label}` : "";
   return {
@@ -167,7 +180,14 @@ function appSurface(
       trigger.hasReplyOutput === true
         ? `${comment.action}${location} with one of these. ${trigger.name} decides which comments start an agent.`
         : `${trigger.name} needs a reply output for the answer to appear on the ${comment.pullRequest ? "pull request" : "issue"}.`,
-    examples: targetExamples,
+    examples:
+      commentPrefix === undefined
+        ? targetExamples
+        : targetExamples.map(({ title, description, prompt }) => ({
+            title,
+            description,
+            prompt: `${commentPrefix} ${prompt}`,
+          })),
   };
 }
 

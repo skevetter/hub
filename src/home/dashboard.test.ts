@@ -15,9 +15,11 @@ import {
 } from "../test-utils/project-configuration.js";
 import { OrganizationTriggerStore } from "../triggers/store.js";
 import { compileTriggerDocument } from "../triggers/configuration/index.js";
+import { matchTriggers } from "../triggers/github/match.js";
 import { SLACK_REQUIRED_BOT_SCOPES } from "../providers/slack/client.js";
 import { HomeDashboard } from "./dashboard.js";
 import { HOME_OPEN_SESSIONS_LIMIT } from "./limits.js";
+import { thingsToTry } from "./things-to-try.js";
 
 const NOW = new Date("2026-09-21T12:00:00.000Z");
 const APPS_CONFIGURED = () => true;
@@ -230,6 +232,100 @@ ${run}`;
       ),
       false,
     );
+  });
+
+  it("makes a copied comment match the real GitHub matcher and links to scoped triggers", async () => {
+    const database = memberDatabase();
+    const agent = triggerYaml.slice(triggerYaml.indexOf("run:\n"));
+    const connections = [
+      { provider: "github" as const, slug: "fixture", label: "Fixture", needsAuthorization: false },
+      {
+        provider: "linear" as const,
+        slug: "linear",
+        label: "Linear Fixture",
+        needsAuthorization: false,
+      },
+    ];
+    const dashboard = new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    });
+    for (const [name, event, filters] of [
+      [
+        "review",
+        "github.pull_request_comment_created",
+        'from_users: ["*"], pattern: "/paseo", contains: "@hub"',
+      ],
+      [
+        "team-review",
+        "github.pull_request_comment_created",
+        'from_users: ["octocat"], labels: ["review"]',
+      ],
+      ["linear-comment", "linear.comment_created", 'from_users: ["operator"], pattern: "/paseo"'],
+    ]) {
+      const yaml = `name: ${name}
+on:
+  ${event}:
+    filters: { ${filters} }
+${agent}`;
+      const compiled = compileTriggerDocument(yaml);
+      const saved = await database.saveOrganizationTrigger({
+        organizationId: "org-1",
+        name: compiled.authored.name,
+        enabled: true,
+        format: "single_run",
+        yaml,
+        normalizedConfiguration: {
+          environments: [compiled.environment],
+          triggers: compiled.events,
+        },
+        contentHash: compiled.authoredHash,
+        sourceKind: "manual",
+        sourceEvidence: {},
+        createdByUserId: "user-1",
+        routes: [],
+      });
+      const snapshot = await dashboard.snapshot(request, "acme");
+      const surface = thingsToTry({
+        ...snapshot,
+        connections,
+        triggers: snapshot.triggers.filter(({ id }) => id === saved.id),
+      }).find(({ key }) => key === (name === "linear-comment" ? "linear" : "github"));
+      assert.ok(surface);
+      if (name === "review") {
+        const body = surface.examples[0]?.prompt;
+        assert.ok(body);
+        assert.equal(
+          matchTriggers(
+            { triggers: compiled.events },
+            {
+              id: "delivery-1",
+              type: "issue_comment",
+              repo: "fixture/repo",
+              repositoryId: 7,
+              installationId: 42,
+              createdAt: NOW.toISOString(),
+              payload: {
+                action: "created",
+                issue: {
+                  number: 12,
+                  title: "Fixture change",
+                  user: { login: "author" },
+                  pull_request: {},
+                },
+                comment: { id: 123, body, user: { login: "octocat" } },
+                sender: { login: "octocat" },
+              },
+            },
+          ).length,
+          1,
+          body,
+        );
+      } else {
+        assert.match(surface.where, /only starts for comments that match its filters/u);
+        assert.equal(surface.next?.path, `triggers/${saved.id}`);
+        assert.deepEqual(surface.examples, []);
+      }
+    }
   });
 
   it("reports no session facts while interactive sessions are off", async () => {
