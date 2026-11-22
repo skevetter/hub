@@ -3569,14 +3569,17 @@ class HubUser {
     await this.refreshOrganizationSection("Daemons");
     const daemon = this.daemonRow(displayName);
     await expect(daemon.getByText(displayName, { exact: true })).toBeVisible();
-    await expect(daemon.getByText(daemonId.slice(0, 8), { exact: true })).toBeVisible();
+    await expect(daemon.getByText(daemonId, { exact: true })).toBeVisible();
     await expect(daemon.getByText(state, { exact: true })).toBeVisible();
     // Timestamps read as "3m ago"; the absolute instant is the tooltip `RelativeTime` puts on it.
     await expect(daemon.locator("time").first()).toHaveAttribute("title", /\w{3} \d{1,2}, \d{4}/u);
   }
 
   private daemonRow(displayName: string): Locator {
-    return this.page.getByRole("row").filter({ hasText: displayName });
+    return this.page
+      .getByRole("list", { name: "Daemons", exact: true })
+      .getByRole("listitem")
+      .filter({ has: this.page.getByRole("heading", { name: displayName, exact: true }) });
   }
 
   private async openDaemonRename(displayName: string): Promise<Locator> {
@@ -3745,7 +3748,7 @@ class HubUser {
 
   async expectDaemonReadOnly(displayName: string): Promise<void> {
     await this.openOrganizationSection("Daemons");
-    const daemon = this.page.getByRole("row").filter({ hasText: displayName });
+    const daemon = this.daemonRow(displayName);
     await expect(daemon.getByText(displayName, { exact: true })).toBeVisible();
     await expect(daemon.getByRole("button", { name: `Actions for ${displayName}` })).toHaveCount(0);
   }
