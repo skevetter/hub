@@ -294,7 +294,7 @@ function daemonAttention(data: HomeSnapshot): { title: string; message: string }
     return {
       title: "No daemon may run agents",
       message:
-        "Every enrolled daemon is connected only. Triggers and sessions cannot start an agent until one is allowed to run Hub automations.",
+        "No enrolled daemon may run agents yet. Triggers and sessions cannot start an agent until one is allowed to run Hub automations.",
     };
   }
   const names = able.map(({ slug }) => slug).join(", ");
@@ -614,10 +614,18 @@ function appStep(
   operator: boolean,
 ): StepPresentation {
   const title = "Connect an app";
+  const unauthorized = snapshot.connections.filter(({ needsAuthorization }) => needsAuthorization);
+  const names = unauthorized.map(({ label }) => label).join(", ");
+  const authorizationHint =
+    names === "" ? "" : `${names} ${unauthorized.length === 1 ? "needs" : "need"} authorization.`;
   if (state === "done") {
+    const connected = snapshot.connections
+      .filter(({ needsAuthorization }) => !needsAuthorization)
+      .map(({ label }) => label)
+      .join(", ");
     return {
       title,
-      hint: snapshot.connections.map(({ label }) => label).join(", "),
+      hint: authorizationHint === "" ? connected : `${connected} connected. ${authorizationHint}`,
       status: DONE,
     };
   }
@@ -641,7 +649,7 @@ function appStep(
   }
   return {
     title,
-    hint: "Linear, GitHub, Slack, or Discord: the place events come from.",
+    hint: authorizationHint || "Linear, GitHub, Slack, or Discord: the place events come from.",
     status: TO_DO,
     action: (
       <Button asChild variant="outline" size="sm">
@@ -765,7 +773,7 @@ const DROP_NOTICE_TITLES: Record<DropReasonGroup, string> = {
   trigger_filters_rejected: "Trigger filters rejected events",
   configuration_unavailable: "Events arrived while configuration was unavailable",
   unsupported_event: "Linear sent unsupported events",
-  other: "Hub dropped other events",
+  other: "Hub dropped events for other reasons",
 };
 
 function DroppedEventNotices({ data }: { data: HomeSnapshot }) {
