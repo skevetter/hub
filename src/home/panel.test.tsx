@@ -163,7 +163,7 @@ describe("Home query states", () => {
   it("keeps the Home heading and names its loading state", () => {
     const markup = renderHomeQuery({ status: "pending", data: undefined, error: null });
     assert.match(markup, /<h1[^>]*>Home<\/h1>/u);
-    assert.match(markup, /aria-label="Loading Home"/u);
+    assert.match(markup, /role="group"[^>]*aria-busy="true"[^>]*aria-label="Loading Home"/u);
   });
 
   it.each([

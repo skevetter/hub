@@ -78,7 +78,7 @@ for (const width of [390, 1280])
       container
         .locator("div.grid-cols-2 > section")
         .evaluateAll((tiles) => tiles.map((tile) => tile.getBoundingClientRect().height));
-    const loading = page.getByLabel("Loading Home");
+    const loading = page.getByRole("group", { name: "Loading Home" });
     let loadingHeights: number[];
     try {
       await expect(loading).toBeVisible();
