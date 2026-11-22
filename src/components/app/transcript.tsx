@@ -1,5 +1,4 @@
 import { useCallback } from "react";
-import { cn } from "../../lib/utils.js";
 import { Button } from "../ui/button.js";
 import { FollowBottom } from "./follow-bottom.js";
 import { EmptyState } from "./empty-state.js";
@@ -19,6 +18,13 @@ const DELIVERY: Record<DeliveryStatus, { tone: StatusTone; label: string }> = {
   queued: { tone: "neutral", label: "Queued" },
   not_sent: { tone: "danger", label: "Not sent" },
   unknown: { tone: "warning", label: "Delivery unknown" },
+};
+
+const TOOL_TONE: Record<ToolStatus, StatusTone> = {
+  running: "neutral",
+  completed: "success",
+  failed: "danger",
+  canceled: "warning",
 };
 
 /** Anchored entries by daemon position, then every unanchored Hub message in arrival order. */
@@ -129,15 +135,12 @@ function Entry({
       return (
         <p
           data-entry="tool"
-          className={cn(
-            "flex min-w-0 items-center gap-2 text-xs",
-            item.status === "failed" ? "text-destructive" : "text-muted-foreground",
-          )}
+          className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground"
         >
           <span className="min-w-0 truncate font-mono" title={item.name}>
             {item.name}
           </span>
-          <span className="shrink-0">{statusLabel(item.status)}</span>
+          <StatusPill tone={TOOL_TONE[item.status]}>{statusLabel(item.status)}</StatusPill>
         </p>
       );
     default:
