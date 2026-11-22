@@ -318,3 +318,21 @@ test("a dead receipt writer's lock is reclaimed on the next recording", async (t
   await verifyReceipt(directory, head);
   await assert.rejects(readFile(lock), { code: "ENOENT" });
 });
+
+test("an explicit command without metrics reports an unconfirmed tested root", async (t) => {
+  const { directory, head } = await gitFixture(t);
+  const other = await gitFixture(t);
+  const script = join(other.directory, "check.mjs");
+  await writeFile(script, "");
+  const { path } = await recordTestRun(directory, [process.execPath, script], { stdio: "ignore" });
+  const entry = JSON.parse(await readFile(path, "utf8")).commands[0];
+  assert.equal(entry.testedRoot, await realpath(directory));
+  assert.equal(entry.counts, null);
+
+  const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
+  const result = spawnSync(process.execPath, [runner, "--root", directory, "--verify", head], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^    Tested root was not confirmed by metrics\.$/mu);
+});
