@@ -12,6 +12,7 @@ import { EmptyState } from "../../components/app/empty-state.js";
 import { FormField, type FieldControl } from "../../components/app/form-field.js";
 import { PageHeader, PageHeaderSkeleton } from "../../components/app/page.js";
 import { Section } from "../../components/app/section.js";
+import { SummaryPanel } from "../../components/app/summary-panel.js";
 import { Button } from "../../components/ui/button.js";
 import { useSnapshotQuery } from "../../queries/index.js";
 import { listSessionProfiles, startInteractiveSession, type ProfileView } from "../functions.js";
@@ -142,6 +143,13 @@ function CreateSessionForm({
   const inFlight = useRef(false);
   const profile =
     profiles.find(({ id }) => id === profileId) ?? (profileId === "" ? profiles[0] : undefined);
+  const settings = useMemo(
+    () => [
+      { label: "Model", value: profile?.model ?? "Provider default" },
+      { label: "Mode", value: profile?.mode ?? "Provider default" },
+    ],
+    [profile],
+  );
   const members = useMemo(
     () =>
       account.organization.slug === organizationSlug
@@ -235,6 +243,9 @@ function CreateSessionForm({
         compact={compact}
         disabled={busy}
       />
+      {compact || profile === undefined ? null : (
+        <SummaryPanel inline label="Agent settings" rows={settings} />
+      )}
       {profile?.mode === "full" ? (
         <WarningAlert title="Full access">
           This agent runs tools without asking. Controllers can use it to run commands on the

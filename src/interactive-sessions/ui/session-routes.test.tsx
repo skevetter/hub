@@ -22,11 +22,15 @@ vi.mock("../functions.js", () => ({
   readInteractiveSession: state.read,
   listSessionProfiles: state.profiles,
   saveSessionProfile: vi.fn(),
+  startInteractiveSession: vi.fn(),
 }));
 vi.mock("../../auth/active-account.js", () => ({
   useActiveAccount: () => ({
     features: state.enabled ? { interactiveSessions: true } : undefined,
     capabilities: { manageResources: state.role !== "member" },
+    account: { id: "account" },
+    organization: { slug: "acme" },
+    team: { members: [] },
   }),
 }));
 
@@ -212,3 +216,32 @@ it("points a member with no profile at an admin", async () => {
   expect(html).toContain("No active session profiles");
   expect(html).toContain("Ask an organization admin to create a session profile.");
 });
+
+it.each([
+  [null, null, "Provider default", "Provider default"],
+  ["model-one", "ask", "model-one", "ask"],
+])(
+  "shows a member the selected profile model and mode",
+  async (model, mode, expectedModel, expectedMode) => {
+    state.role = "member";
+    state.profiles.mockResolvedValue({
+      status: "ok",
+      data: [
+        {
+          id: "profile",
+          version: 1,
+          name: "Work",
+          daemonSlug: "devbox",
+          cwd: "/work",
+          provider: "opencode",
+          status: "active",
+          model,
+          mode,
+        },
+      ],
+    });
+    const html = await renderRoute("/o/acme/sessions/new");
+    expect(html).toMatch(new RegExp(`<dt[^>]*>Model</dt><dd[^>]*>${expectedModel}</dd>`));
+    expect(html).toMatch(new RegExp(`<dt[^>]*>Mode</dt><dd[^>]*>${expectedMode}</dd>`));
+  },
+);
