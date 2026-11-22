@@ -1,7 +1,7 @@
 import { useSnapshotQuery } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useId, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { useActiveAccount } from "../auth/active-account.js";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
 import { DeviceCardSkeleton } from "../components/app/device-card.js";
@@ -211,6 +211,21 @@ function DaemonsContent({
     accountId,
     organizationSlug,
   );
+  const lastRestored = useRef<CompletedDaemonAction>(undefined);
+  useEffect(() => {
+    if (completedAction === undefined || busy || completedAction === lastRestored.current)
+      return undefined;
+    // Let the dialog finish its own close and focus restoration before moving focus.
+    const restore = window.setTimeout(() => {
+      const trigger = document
+        .getElementById(daemonActionsId(completedAction.daemonId))
+        ?.querySelector("button");
+      (trigger ?? document.getElementById(searchId))?.focus();
+      lastRestored.current = completedAction;
+    });
+    return () => window.clearTimeout(restore);
+  }, [busy, completedAction, searchId]);
+
   const apply = useCallback((next: DaemonsFilters) => {
     setFilters(next);
     setHasFiltered(true);
@@ -368,6 +383,10 @@ function ConnectedDaemonDevice({
   );
 }
 
+function daemonActionsId(daemonId: string) {
+  return `daemon-actions-${daemonId}`;
+}
+
 function DaemonRowActions({
   daemon,
   busy,
@@ -375,31 +394,30 @@ function DaemonRowActions({
   onRevoke,
 }: DaemonActions & { daemon: BrowserDaemon }) {
   const [renaming, setRenaming] = useState(false);
-  const requestRename = useCallback((event: Event) => {
-    event.preventDefault();
-    setRenaming(true);
-  }, []);
+  const requestRename = useCallback(() => setRenaming(true), []);
   const revoke = useCallback(() => onRevoke(daemon.id), [daemon.id, onRevoke]);
 
   return (
     <>
-      <RowActions label={`Actions for ${daemon.slug}`}>
-        <DropdownMenuItem disabled={busy} onSelect={requestRename}>
-          Rename
-        </DropdownMenuItem>
-        {daemon.status === "revoked" ? null : (
-          <ConfirmMenuItem
-            busy={busy}
-            destructive
-            label="Revoke"
-            title={`Revoke ${daemon.slug}?`}
-            description="The daemon will disconnect and its credential cannot reconnect."
-            cancelLabel="Cancel"
-            confirmLabel="Revoke daemon"
-            onConfirm={revoke}
-          />
-        )}
-      </RowActions>
+      <div id={daemonActionsId(daemon.id)}>
+        <RowActions label={`Actions for ${daemon.slug}`}>
+          <DropdownMenuItem disabled={busy} onSelect={requestRename}>
+            Rename
+          </DropdownMenuItem>
+          {daemon.status === "revoked" ? null : (
+            <ConfirmMenuItem
+              busy={busy}
+              destructive
+              label="Revoke"
+              title={`Revoke ${daemon.slug}?`}
+              description="The daemon will disconnect and its credential cannot reconnect."
+              cancelLabel="Cancel"
+              confirmLabel="Revoke daemon"
+              onConfirm={revoke}
+            />
+          )}
+        </RowActions>
+      </div>
       <RenameDaemonDialog
         daemon={daemon}
         busy={busy}
