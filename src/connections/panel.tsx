@@ -40,6 +40,7 @@ import {
   connectionProviderName,
   connectionReturnCopy,
   type ConnectionProvider,
+  type ConnectionReturn,
   type ConnectionReturnCopy,
 } from "./result-contract.js";
 import { useConnectionReturn } from "./result.js";
@@ -210,13 +211,13 @@ function ConnectionsContent() {
   const connections = connectionRows(data.connections, pending?.data, pending?.row);
   const suspendedGitHub = data.connections.github.some(({ status }) => status === "suspended");
   const result = reconciledRevocation(connections, revocation, refresh);
-  const banner = result ?? returned;
+  const banner = revokeBannerCopy(result, returned, connections);
   return (
     <>
       {retryState === "complete" && result === undefined ? (
         <StatusLine>Connections loaded.</StatusLine>
       ) : null}
-      {banner === undefined ? null : <ConnectionReturnBanner copy={connectionReturnCopy(banner)} />}
+      {banner === undefined ? null : <ConnectionReturnBanner copy={banner} />}
       <CommandError mutations={mutations} />
       <Section className={GRID_COLUMNS}>
         {PROVIDER_CARDS.map(({ provider, label, icon, description, droppedSearch }) => {
@@ -434,6 +435,18 @@ function reconciledRevocation(
   if (connections[revocation.provider].some(({ id }) => id === revocation.connectionId))
     return undefined;
   return revocation;
+}
+
+function revokeBannerCopy(
+  result: Revocation | undefined,
+  returned: ConnectionReturn | undefined,
+  connections: Record<ConnectionProvider, ConnectionRecord[]>,
+): ConnectionReturnCopy | undefined {
+  if (result !== undefined && connections[result.provider].length > 0) {
+    return { tone: "success", message: `${result.row.name} disconnected.` };
+  }
+  const outcome = result ?? returned;
+  return outcome === undefined ? undefined : connectionReturnCopy(outcome);
 }
 
 /** A card with no action still says what has to happen before there is one. */
