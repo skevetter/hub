@@ -1,6 +1,6 @@
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, readdir, rm, stat } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { availableParallelism, homedir, loadavg, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
 import {
@@ -51,37 +51,65 @@ function printInterrupted(print, signal, count) {
   if (signal?.aborted) print(`INTERRUPTED: ${count} files did not report`);
 }
 
-export async function runShards(groups, { execute, print, signal }) {
-  const outcomes = await Promise.allSettled(
-    groups.map(async (files, index) => {
-      const name = `Shard ${index + 1}`;
-      const result = await execute(name, files);
-      printRun(print, name, files, result);
-      return result;
-    }),
+function readMachineLoad() {
+  return { averages: loadavg(), cores: availableParallelism() };
+}
+
+function printMachineLoad(print, phase, { averages, cores }) {
+  const formatted = averages.map((load) => load.toFixed(2)).join(", ");
+  print(`Machine load at ${phase} (1, 5, 15 min): ${formatted}; available cores: ${cores}`);
+}
+
+export async function runShards(groups, { execute, print, signal, readLoad = readMachineLoad }) {
+  const start = readLoad();
+  printMachineLoad(print, "start", start);
+  if (start.averages[0] > start.cores) {
+    print("WARNING: Machine load exceeds available cores. Timings and timeouts may be unreliable.");
+  }
+  try {
+    const outcomes = await Promise.allSettled(
+      groups.map(async (files, index) => {
+        const name = `Shard ${index + 1}`;
+        const result = await execute(name, files);
+        printRun(print, name, files, result);
+        return result;
+      }),
+    );
+    return summarizeShards(groups, outcomes, { print, signal });
+  } finally {
+    printMachineLoad(print, "end", readLoad());
+  }
+}
+
+function rejectedShard(reason, files, index, { print, signal }) {
+  const interrupted = signal?.aborted && reason === signal.reason;
+  print(
+    `Shard ${index + 1}: FAIL. Runner stopped (${reason?.code ?? reason}). Files without a result: ${files.join(", ")}`,
   );
+  return {
+    exitCode: 1,
+    incompleteFiles: files.length,
+    interruptedFiles: interrupted ? files.length : 0,
+    counts: { passed: 0, failed: 0, skipped: 0 },
+  };
+}
+
+function summarizeShards(groups, outcomes, { print, signal }) {
   const total = { files: groups.flat().length, passed: 0, failed: 0, skipped: 0 };
   const failedFiles = [];
   let incompleteFiles = 0;
   let interruptedFiles = 0;
   let exitCode = Number(Boolean(signal?.aborted));
   for (const [index, outcome] of outcomes.entries()) {
-    if (outcome.status === "rejected") {
-      exitCode = 1;
-      const files = groups[index];
-      failedFiles.push(...files);
-      incompleteFiles += files.length;
-      if (signal?.aborted && outcome.reason === signal.reason) interruptedFiles += files.length;
-      print(
-        `Shard ${index + 1}: FAIL. Runner stopped (${outcome.reason?.code ?? outcome.reason}). Files without a result: ${files.join(", ")}`,
-      );
-      continue;
-    }
-    const result = outcome.value;
+    const files = groups[index];
+    const result =
+      outcome.status === "rejected"
+        ? rejectedShard(outcome.reason, files, index, { print, signal })
+        : outcome.value;
     if (result.exitCode !== 0) {
       exitCode = 1;
       // The report cannot always attribute a process failure to an individual file.
-      failedFiles.push(...groups[index]);
+      failedFiles.push(...files);
     }
     incompleteFiles += result.incompleteFiles ?? 0;
     interruptedFiles += result.interruptedFiles ?? 0;
@@ -186,7 +214,7 @@ export function shardEnvironment(directory, parent = process.env) {
   return env;
 }
 
-export async function invokeVitest(root, args, directory, signal, lock) {
+export async function invokeVitest(args, { root, directory, signal, lock }) {
   await mkdir(directory);
   const log = await open(join(directory, "vitest.log"), "w", 0o600);
   try {
@@ -202,7 +230,29 @@ export async function invokeVitest(root, args, directory, signal, lock) {
   }
 }
 
-export async function executeFiles(root, name, files, runDirectory, signal, invoke) {
+async function readVitestReport(reportPath) {
+  try {
+    const report = JSON.parse(await readFile(reportPath, "utf8"));
+    return Array.isArray(report?.testResults) ? report : null;
+  } catch (error) {
+    if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+    return null;
+  }
+}
+
+function unreportedRun({ run, files, durationMs, signal, log }) {
+  return {
+    exitCode: 1,
+    durationMs,
+    failedFiles: files,
+    incompleteFiles: files.length,
+    interruptedFiles: signal.aborted ? files.length : 0,
+    counts: { passed: 0, failed: 0, skipped: 0 },
+    diagnostic: `Vitest exited without a readable JSON report (exit ${run.exitCode}, ${run.processError ?? "no signal"}). Files without a result: ${files.join(", ")}. See ${log}`,
+  };
+}
+
+export async function executeFiles({ root, name, files, runDirectory, signal, invoke }) {
   const directory = join(runDirectory, name.toLowerCase().replaceAll(" ", "-"));
   const reportPath = join(directory, "results.json");
   const startedAt = performance.now();
@@ -219,43 +269,34 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
   );
   const durationMs = performance.now() - startedAt;
   const log = join(directory, "vitest.log");
-  let report;
-  try {
-    report = JSON.parse(await readFile(reportPath, "utf8"));
-    if (!Array.isArray(report?.testResults)) throw new SyntaxError("missing testResults");
-  } catch (error) {
-    if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
-    return {
-      exitCode: 1,
-      durationMs,
-      failedFiles: files,
-      incompleteFiles: files.length,
-      interruptedFiles: signal.aborted ? files.length : 0,
-      counts: { passed: 0, failed: 0, skipped: 0 },
-      diagnostic: `Vitest exited without a readable JSON report (exit ${run.exitCode}, ${run.processError ?? "no signal"}). Files without a result: ${files.join(", ")}. See ${log}`,
-    };
-  }
-  const reported = new Set(report.testResults.map(({ name }) => relative(root, name)));
+  const report = await readVitestReport(reportPath);
+  if (!report) return unreportedRun({ run, files, durationMs, signal, log });
+  return summarizeReport(report, { root, files, run, durationMs, signal, log, reportPath });
+}
+
+function compareReportFiles(testResults, { root, files, processExit }) {
+  const reported = new Set(testResults.map(({ name }) => relative(root, name)));
   const expected = new Set(files);
   const unfinished = new Set(
-    report.testResults
+    testResults
       .filter(
         ({ status, assertionResults }) =>
           status !== "failed" &&
           (assertionResults?.some((test) => test.status === "pending") ||
-            (run.exitCode && !assertionResults?.length)),
+            (processExit && !assertionResults?.length)),
       )
       .map(({ name }) => relative(root, name)),
   );
   const missing = files.filter((file) => !reported.has(file) || unfinished.has(file));
   const extra = [...reported].filter((file) => !expected.has(file));
-  const failedFiles = report.testResults
+  const failedFiles = testResults
     .filter(({ status }) => status === "failed")
     .map(({ name }) => relative(root, name))
     .filter((file) => expected.has(file));
-  const passed = passedVitestReport(report);
-  const exitCode =
-    run.exitCode || Number(!passed || signal.aborted || missing.length > 0 || extra.length > 0);
+  return { missing, extra, failedFiles };
+}
+
+function reportDiagnostic({ passed, run, signal, missing, extra, exitCode, log, reportPath }) {
   const diagnostics = [];
   if (!passed && !run.exitCode && !signal.aborted)
     diagnostics.push("Vitest JSON report did not show a completed passing run.");
@@ -266,6 +307,18 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
   if (missing.length) diagnostics.push(`Files without a result: ${missing.join(", ")}`);
   if (extra.length) diagnostics.push(`Unexpected files in report: ${extra.join(", ")}`);
   if (exitCode) diagnostics.push(`See ${log} and ${reportPath}`);
+  return diagnostics.join("\n  ");
+}
+
+function summarizeReport(report, { root, files, run, durationMs, signal, log, reportPath }) {
+  const { missing, extra, failedFiles } = compareReportFiles(report.testResults, {
+    root,
+    files,
+    processExit: run.exitCode,
+  });
+  const passed = passedVitestReport(report);
+  const exitCode =
+    run.exitCode || Number(!passed || signal.aborted || missing.length > 0 || extra.length > 0);
   return {
     exitCode,
     durationMs,
@@ -279,7 +332,16 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
         .flatMap(({ assertionResults }) => assertionResults ?? [])
         .filter(({ status }) => status === "skipped" || status === "todo").length,
     },
-    diagnostic: diagnostics.join("\n  "),
+    diagnostic: reportDiagnostic({
+      passed,
+      run,
+      signal,
+      missing,
+      extra,
+      exitCode,
+      log,
+      reportPath,
+    }),
   };
 }
 
@@ -326,6 +388,80 @@ async function readFailedFiles(failedFileList, files) {
   return failed;
 }
 
+async function discoverFiles(root, runDirectory, invoke) {
+  const discovery = join(runDirectory, "discovery");
+  const listing = join(discovery, "files.json");
+  const found = await invoke(["list", "--filesOnly", `--json=${listing}`], discovery);
+  if (found.exitCode) {
+    const reason = found.processError ?? `exit ${found.exitCode}`;
+    throw new Error(
+      `Vitest file discovery failed (${reason}). See ${join(discovery, "vitest.log")}`,
+    );
+  }
+  const files = JSON.parse(await readFile(listing, "utf8")).map(({ file }) => relative(root, file));
+  if (files.length === 0 || new Set(files).size !== files.length) {
+    throw new Error("Vitest did not discover a unique set of test files.");
+  }
+  return files;
+}
+
+function saveTimings(parallelCache, timings) {
+  if (!timings) return;
+  try {
+    writeJson(join(parallelCache, "results.json"), timings);
+  } catch (error) {
+    console.warn(`Could not update the Vitest timing cache: ${error.message}`);
+  }
+}
+
+async function runSerialRetry(files, { execute, signal, publishSuccess }) {
+  return rerunFiles(
+    files,
+    async (name, selected) => {
+      const result = await execute(name, selected);
+      if (result.exitCode === 0 && !signal.aborted) await publishSuccess();
+      return result;
+    },
+    console.log,
+    signal,
+  );
+}
+
+async function runFullSuite({
+  root,
+  cacheRoot,
+  files,
+  count,
+  failedFileList,
+  runDirectory,
+  execute,
+  signal,
+  publishSuccess,
+}) {
+  await rm(failedFileList, { force: true });
+  const groups = partitionFiles(await weighFiles(root, cacheRoot, files), count);
+  const startedAt = performance.now();
+  console.log(`Running ${files.length} Vitest files across ${groups.length} shards.`);
+  const result = await runShards(groups, { execute, print: console.log, signal });
+  console.log(`Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`);
+  if (result.failedFiles.length)
+    writeJson(failedFileList, { version: failedListVersion, files: result.failedFiles });
+  if (result.exitCode === 0 && !signal.aborted) {
+    const timings = await collectTimings(runDirectory, groups.length);
+    await publishSuccess(timings);
+  }
+  return result.exitCode;
+}
+
+function requestedShardCount() {
+  const requested = process.env.TEST_SHARDS ?? "4";
+  const count = Number(requested);
+  if (!/^\d+$/u.test(requested) || !Number.isSafeInteger(count) || count < 1) {
+    throw new Error("TEST_SHARDS must be a positive integer.");
+  }
+  return count;
+}
+
 async function main(signal) {
   const { values } = parseArgs({
     options: { root: { type: "string" }, "rerun-failed": { type: "boolean" } },
@@ -338,37 +474,14 @@ async function main(signal) {
   const cacheRoot = join(root, "node_modules/.vite/vitest");
   const parallelCache = join(cacheRoot, "test-parallel");
   const failedFileList = join(parallelCache, "failed.json");
-  const requested = process.env.TEST_SHARDS ?? "4";
-  const count = Number(requested);
-  if (!/^\d+$/u.test(requested) || !Number.isSafeInteger(count) || count < 1) {
-    throw new Error("TEST_SHARDS must be a positive integer.");
-  }
+  const count = requestedShardCount();
   let lock;
   let runDirectory;
   try {
     lock = await takeFullSuiteLock();
     runDirectory = await mkdtemp(join(tmpdir(), "hub-tests-"));
-    const discovery = join(runDirectory, "discovery");
-    const listing = join(discovery, "files.json");
-    const found = await invokeVitest(
-      root,
-      ["list", "--filesOnly", `--json=${listing}`],
-      discovery,
-      signal,
-      lock,
-    );
-    if (found.exitCode) {
-      const reason = found.processError ?? `exit ${found.exitCode}`;
-      throw new Error(
-        `Vitest file discovery failed (${reason}). See ${join(discovery, "vitest.log")}`,
-      );
-    }
-    const files = JSON.parse(await readFile(listing, "utf8")).map(({ file }) =>
-      relative(root, file),
-    );
-    if (files.length === 0 || new Set(files).size !== files.length) {
-      throw new Error("Vitest did not discover a unique set of test files.");
-    }
+    const invoke = (args, directory) => invokeVitest(args, { root, directory, signal, lock });
+    const files = await discoverFiles(root, runDirectory, invoke);
     const runs = [];
     const publishSuccess = async (timings) => {
       signal.throwIfAborted();
@@ -378,57 +491,28 @@ async function main(signal) {
       lock.release();
       lock = undefined;
       publishTestMetrics(runs, [], root, { signal, expectedHead: head });
-      if (timings) {
-        try {
-          writeJson(join(parallelCache, "results.json"), timings);
-        } catch (error) {
-          console.warn(`Could not update the Vitest timing cache: ${error.message}`);
-        }
-      }
+      saveTimings(parallelCache, timings);
     };
-    const execute = async (name, selected) => {
-      const result = await executeFiles(
-        root,
-        name,
-        selected,
-        runDirectory,
-        signal,
-        (args, directory, signal) => invokeVitest(root, args, directory, signal, lock),
-      );
-      runs.push({ files: selected, counts: result.counts });
+    const execute = async (name, files) => {
+      const result = await executeFiles({ root, name, files, runDirectory, signal, invoke });
+      runs.push({ files, counts: result.counts });
       return result;
     };
     if (values["rerun-failed"]) {
-      return await rerunFiles(
-        await readFailedFiles(failedFileList, files),
-        async (name, selected) => {
-          const result = await execute(name, selected);
-          if (result.exitCode === 0 && !signal.aborted) await publishSuccess();
-          return result;
-        },
-        console.log,
-        signal,
-      );
+      const failed = await readFailedFiles(failedFileList, files);
+      return await runSerialRetry(failed, { execute, signal, publishSuccess });
     }
-    await rm(failedFileList, { force: true });
-    const groups = partitionFiles(await weighFiles(root, cacheRoot, files), count);
-    const startedAt = performance.now();
-    console.log(`Running ${files.length} Vitest files across ${groups.length} shards.`);
-    const result = await runShards(groups, {
+    return await runFullSuite({
+      root,
+      cacheRoot,
+      files,
+      count,
+      failedFileList,
+      runDirectory,
       execute,
-      print: console.log,
       signal,
+      publishSuccess,
     });
-    console.log(
-      `Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`,
-    );
-    if (result.failedFiles.length)
-      writeJson(failedFileList, { version: failedListVersion, files: result.failedFiles });
-    if (result.exitCode === 0 && !signal.aborted) {
-      const timings = await collectTimings(runDirectory, groups.length);
-      await publishSuccess(timings);
-    }
-    return result.exitCode;
   } finally {
     if (runDirectory && !values["rerun-failed"]) console.log(`Run logs: ${runDirectory}`);
     lock?.release();

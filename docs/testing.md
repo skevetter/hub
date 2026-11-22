@@ -17,6 +17,7 @@ four processes, wait for other test runs to finish and run the parallel command.
 A file gets its own shard when its cached duration exceeds the ideal time per shard. The runner
 assigns the remaining files longest first to the lightest shard. It prefers timings from the last
 completed parallel run over timings that may come from a filtered run.
+Full sharded runs print load averages and available cores at the start and end, and warn if the starting one-minute load exceeds the available cores.
 
 ```sh
 mise exec node@24.22.0 -- npm run test:scripts
