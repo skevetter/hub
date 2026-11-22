@@ -1,80 +1,46 @@
 import { useSnapshotQuery } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { BookOpen } from "lucide-react";
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useId, useMemo, useState, type FormEvent } from "react";
+import { useActiveAccount } from "../auth/active-account.js";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
-import { CopyField } from "../components/app/copy-field.js";
-import {
-  DataCell,
-  DataRow,
-  DataTable,
-  DataTableSkeleton,
-  type DataColumn,
-} from "../components/app/data-table.js";
+import { DeviceCardSkeleton } from "../components/app/device-card.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
 import { FormDialog } from "../components/app/form-dialog.js";
 import { FormField } from "../components/app/form-field.js";
+import { ListFilters } from "../components/app/list-filters.js";
 import { PageHeader } from "../components/app/page.js";
-import { RelativeTime } from "../components/app/relative-time.js";
 import { RowActions } from "../components/app/row-actions.js";
-import { StatusPill } from "../components/app/status-pill.js";
-import { TwoLine } from "../components/app/two-line.js";
-import { Button } from "../components/ui/button.js";
+import { SegmentedControl } from "../components/app/segmented-control.js";
 import { DropdownMenuItem } from "../components/ui/dropdown-menu.js";
 import {
   daemonList,
   renameDaemon,
   revokeDaemon,
   type BrowserDaemon,
+  type BrowserDaemonList,
   type DaemonCommand,
 } from "./functions.js";
 import type { Result } from "../contract/respond.js";
 import { DAEMON_MUTATION_KEY } from "../auth/tenant-mutation.js";
-import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "./handoff.js";
+import { DaemonDevice, DaemonResults } from "./daemon-list.js";
+import {
+  filterDaemons,
+  type DaemonFilterStatus,
+  type DeviceProfileName,
+} from "./device-details.js";
+import { useDeviceProfiles, useDeviceProviders } from "./device-queries.js";
 import { daemonsQueryKey, refreshDaemons } from "./status.js";
 
-const DAEMON_COLUMNS: readonly DataColumn[] = [
-  { header: "Slug", fill: true },
-  { header: "ID" },
-  { header: "Status" },
-  { header: "Access", fill: true },
-  { header: "Last seen" },
-  { header: "Registered" },
-  { header: "", align: "end" },
+const DAEMONS_DESCRIPTION = "See the machines that run your agents and what Hub can do on them.";
+const FILTER_OPTIONS = [
+  { value: "all", label: "All" },
+  { value: "connected", label: "Connected" },
+  { value: "offline", label: "Offline" },
 ];
-const DAEMONS_DESCRIPTION = "Stable daemon identities registered to this organization.";
-const DAEMON_DOCS_URL = "https://paseo.sh/docs/hub/daemons";
-const DAEMONS_EMPTY = {
-  title: "No daemons connected",
-  description:
-    "Hub runs your workflows on machines you own. Log in from the machine where your code lives and the CLI offers to connect it.",
-  action: <ConnectDaemonHint />,
-} as const;
-
-/**
- * The same handoff the operator saw during setup, for the operator who skipped it: the exact
- * command with this Hub's address already in it, and the page that explains the rest.
- */
-function ConnectDaemonHint() {
-  // The address the operator reached this Hub at is the address their daemon has to be told.
-  // An empty table is only reached after a client-side query settles, so there is no server
-  // render standing between this and a window.
-  const origin = typeof window === "undefined" ? undefined : window.location.origin;
-  return (
-    <>
-      {origin === undefined ? null : (
-        <CopyField label="Command" value={daemonLoginCommand(origin)} />
-      )}
-      <Button asChild variant="outline" size="sm">
-        <a href={DAEMON_DOCS_URL} target="_blank" rel="noreferrer">
-          <BookOpen aria-hidden="true" />
-          How to connect a daemon
-        </a>
-      </Button>
-    </>
-  );
-}
+const DISABLED_FILTER_OPTIONS = FILTER_OPTIONS.map((option) => ({ ...option, disabled: true }));
+const INITIAL_FILTERS = { search: "", status: "all" } as const;
+const EMPTY_PROFILE_NAMES: readonly DeviceProfileName[] = [];
 
 export function DaemonsPanel({
   accountId,
@@ -85,6 +51,9 @@ export function DaemonsPanel({
   organizationId: string;
   organizationSlug: string;
 }) {
+  const account = useActiveAccount();
+  const showProfiles =
+    account.features?.interactiveSessions === true && account.capabilities.manageResources;
   const queryClient = useQueryClient();
   const queryKey = daemonsQueryKey(accountId, organizationId);
   const loadDaemons = useServerFn(daemonList);
@@ -142,17 +111,6 @@ export function DaemonsPanel({
     (daemonId: string) => revoke.mutate({ data: { organizationSlug, daemonId } }),
     [organizationSlug, revoke],
   );
-  if (snapshot.status === "pending") return <DaemonLoading />;
-  if (snapshot.status === "error") {
-    return (
-      <FailureAlert
-        title="Daemons unavailable"
-        error={snapshot.error}
-        fallback="Hub did not receive the daemon list. Check your connection and reload the page."
-      />
-    );
-  }
-  const daemons = snapshot.data;
   const revokeFailed = revoke.isError || revoke.data?.status === "error";
   const busy = rename.isPending || revoke.isPending;
   return (
@@ -166,40 +124,231 @@ export function DaemonsPanel({
           fallback="Hub did not receive the daemon revocation result. Check your connection and reload its current status."
         />
       ) : null}
-      <DataTable
-        label="Daemons"
-        columns={DAEMON_COLUMNS}
-        isEmpty={daemons.daemons.length === 0}
-        empty={DAEMONS_EMPTY}
-      >
-        {daemons.daemons.map((daemon) => (
-          <DaemonRow
-            key={daemon.id}
-            daemon={daemon}
-            canManage={daemons.canManage}
-            busy={busy}
-            onRename={renameSelected}
-            onRevoke={revokeSelected}
-          />
-        ))}
-      </DataTable>
+      {snapshot.status === "pending" ? <DaemonsLoading showProfiles={showProfiles} /> : null}
+      {snapshot.status === "error" ? (
+        <FailureAlert
+          title="Daemons unavailable"
+          error={snapshot.error}
+          fallback="Hub did not receive the daemon list. Check your connection and try again."
+          onRetry={snapshot.refetch}
+        />
+      ) : null}
+      {snapshot.status === "success" ? (
+        <DaemonsContent
+          key={`${accountId}:${organizationId}`}
+          snapshot={snapshot.data}
+          accountId={accountId}
+          organizationSlug={organizationSlug}
+          showProfiles={showProfiles}
+          busy={busy}
+          onRename={renameSelected}
+          onRevoke={revokeSelected}
+        />
+      ) : null}
     </>
   );
 }
 
-function DaemonRow({
+interface DaemonActions {
+  busy: boolean;
+  onRename: (daemonId: string, slug: string) => Promise<string | undefined>;
+  onRevoke: (daemonId: string) => void;
+}
+
+interface DaemonsFilters {
+  search: string;
+  status: DaemonFilterStatus;
+}
+
+function DaemonsContent({
+  snapshot,
+  accountId,
+  organizationSlug,
+  showProfiles,
+  busy,
+  onRename,
+  onRevoke,
+}: DaemonActions & {
+  snapshot: BrowserDaemonList;
+  accountId: string;
+  organizationSlug: string;
+  showProfiles: boolean;
+}) {
+  const searchId = useId();
+  const [filters, setFilters] = useState<DaemonsFilters>(INITIAL_FILTERS);
+  const [announcement, setAnnouncement] = useState<{ count: number; revision: number }>();
+  const { daemons, canManage } = snapshot;
+  const matches = filterDaemons(daemons, filters.search, filters.status);
+  const profiles = useDeviceProfiles(
+    showProfiles && daemons.length > 0,
+    accountId,
+    organizationSlug,
+  );
+  const apply = useCallback(
+    (next: DaemonsFilters) => {
+      const count = filterDaemons(daemons, next.search, next.status).length;
+      setFilters(next);
+      setAnnouncement((previous) => ({ count, revision: (previous?.revision ?? 0) + 1 }));
+    },
+    [daemons],
+  );
+  const search = useCallback(
+    (value: string) => apply({ ...filters, search: value }),
+    [apply, filters],
+  );
+  const changeStatus = useCallback(
+    (value: string) => {
+      if (value === "all" || value === "connected" || value === "offline") {
+        apply({ ...filters, status: value });
+      }
+    },
+    [apply, filters],
+  );
+  const clear = useCallback(() => {
+    document.getElementById(searchId)?.focus();
+    apply(INITIAL_FILTERS);
+  }, [apply, searchId]);
+
+  return (
+    <>
+      {daemons.length === 0 ? null : (
+        <DaemonFilters
+          searchId={searchId}
+          filters={filters}
+          onSearch={search}
+          onStatusChange={changeStatus}
+        />
+      )}
+      <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {announcement === undefined ? null : (
+          <span key={announcement.revision}>
+            {announcement.count} {announcement.count === 1 ? "daemon" : "daemons"} shown
+          </span>
+        )}
+      </span>
+      <DaemonResults hasDaemons={daemons.length > 0} onClear={clear}>
+        {matches.map((daemon) => (
+          <ConnectedDaemonDevice
+            key={daemon.id}
+            daemon={daemon}
+            accountId={accountId}
+            organizationSlug={organizationSlug}
+            profiles={profiles}
+            canManage={canManage}
+            busy={busy}
+            onRename={onRename}
+            onRevoke={onRevoke}
+          />
+        ))}
+      </DaemonResults>
+    </>
+  );
+}
+
+function DaemonFilters({
+  filters,
+  searchId,
+  onSearch,
+  onStatusChange = ignoreFilter,
+}: {
+  filters: DaemonsFilters;
+  searchId: string;
+  onSearch?: (value: string) => void;
+  onStatusChange?: (value: string) => void;
+}) {
+  const disabled = onSearch === undefined;
+  return (
+    <ListFilters id={`${searchId}-filters`}>
+      <div className="min-w-0 flex-1 basis-48 sm:max-w-xs">
+        <FormField
+          id={searchId}
+          label="Search daemons"
+          name="daemon-search"
+          kind="text"
+          value={filters.search}
+          disabled={disabled}
+          {...(onSearch === undefined ? {} : { onChange: onSearch })}
+        />
+      </div>
+      <div className="motion-reduce:[&_button]:transition-none">
+        <SegmentedControl
+          label="Daemon status"
+          description="Daemon status"
+          value={filters.status}
+          options={disabled ? DISABLED_FILTER_OPTIONS : FILTER_OPTIONS}
+          onChange={onStatusChange}
+        />
+      </div>
+    </ListFilters>
+  );
+}
+
+function ignoreFilter() {}
+
+function DaemonsLoading({ showProfiles }: { showProfiles: boolean }) {
+  const searchId = useId();
+  return (
+    <div aria-busy="true" aria-label="Loading daemons">
+      <DaemonFilters filters={INITIAL_FILTERS} searchId={searchId} />
+      <div className="grid gap-3">
+        <DeviceCardSkeleton detailCount={showProfiles ? 3 : 2} />
+        <DeviceCardSkeleton detailCount={showProfiles ? 3 : 2} />
+      </div>
+    </div>
+  );
+}
+
+function ConnectedDaemonDevice({
   daemon,
+  accountId,
+  organizationSlug,
+  profiles,
   canManage,
   busy,
   onRename,
   onRevoke,
-}: {
+}: DaemonActions & {
   daemon: BrowserDaemon;
+  accountId: string;
+  organizationSlug: string;
+  profiles: ReturnType<typeof useDeviceProfiles>;
   canManage: boolean;
-  busy: boolean;
-  onRename: (daemonId: string, slug: string) => Promise<string | undefined>;
-  onRevoke: (daemonId: string) => void;
 }) {
+  const providers = useDeviceProviders(daemon, accountId, organizationSlug);
+  const deviceProfiles = useMemo(
+    () =>
+      profiles === undefined
+        ? undefined
+        : {
+            names: profiles.byDaemon?.get(daemon.id) ?? EMPTY_PROFILE_NAMES,
+            message: profiles.message,
+          },
+    [daemon.id, profiles],
+  );
+  const actions = useMemo(
+    () =>
+      canManage ? (
+        <DaemonRowActions daemon={daemon} busy={busy} onRename={onRename} onRevoke={onRevoke} />
+      ) : null,
+    [busy, canManage, daemon, onRename, onRevoke],
+  );
+  return (
+    <DaemonDevice
+      daemon={daemon}
+      organizationSlug={organizationSlug}
+      providers={providers}
+      profiles={deviceProfiles}
+      actions={actions}
+    />
+  );
+}
+
+function DaemonRowActions({
+  daemon,
+  busy,
+  onRename,
+  onRevoke,
+}: DaemonActions & { daemon: BrowserDaemon }) {
   const [renaming, setRenaming] = useState(false);
   const requestRename = useCallback((event: Event) => {
     event.preventDefault();
@@ -208,60 +357,32 @@ function DaemonRow({
   const revoke = useCallback(() => onRevoke(daemon.id), [daemon.id, onRevoke]);
 
   return (
-    <DataRow>
-      <DataCell>
-        <TwoLine primary={daemon.slug} />
-      </DataCell>
-      <DataCell muted>
-        <span className="font-mono text-xs">{daemon.id.slice(0, 8)}</span>
-      </DataCell>
-      <DataCell>
-        <DaemonStatus daemon={daemon} />
-      </DataCell>
-      <DataCell muted>
-        {daemon.permissions.includes("hub.execute") ? (
-          "Hub automations"
-        ) : (
-          <TwoLine primary="Connected only" secondary={GRANT_EXECUTE_COMMAND} mono />
+    <>
+      <RowActions label={`Actions for ${daemon.slug}`}>
+        <DropdownMenuItem disabled={busy} onSelect={requestRename}>
+          Rename
+        </DropdownMenuItem>
+        {daemon.status === "revoked" ? null : (
+          <ConfirmMenuItem
+            busy={busy}
+            destructive
+            label="Revoke"
+            title={`Revoke ${daemon.slug}?`}
+            description="The daemon will disconnect and its credential cannot reconnect."
+            cancelLabel="Cancel"
+            confirmLabel="Revoke daemon"
+            onConfirm={revoke}
+          />
         )}
-      </DataCell>
-      <DataCell muted>
-        <RelativeTime value={daemon.lastSeenAt} />
-      </DataCell>
-      <DataCell muted>
-        <RelativeTime value={daemon.registeredAt} />
-      </DataCell>
-      <DataCell>
-        {canManage ? (
-          <>
-            <RowActions label={`Actions for ${daemon.slug}`}>
-              <DropdownMenuItem disabled={busy} onSelect={requestRename}>
-                Rename
-              </DropdownMenuItem>
-              {daemon.status === "revoked" ? null : (
-                <ConfirmMenuItem
-                  busy={busy}
-                  destructive
-                  label="Revoke"
-                  title={`Revoke ${daemon.slug}?`}
-                  description="The daemon will disconnect and its credential cannot reconnect."
-                  cancelLabel="Cancel"
-                  confirmLabel="Revoke daemon"
-                  onConfirm={revoke}
-                />
-              )}
-            </RowActions>
-            <RenameDaemonDialog
-              daemon={daemon}
-              busy={busy}
-              onRename={onRename}
-              open={renaming}
-              onOpenChange={setRenaming}
-            />
-          </>
-        ) : null}
-      </DataCell>
-    </DataRow>
+      </RowActions>
+      <RenameDaemonDialog
+        daemon={daemon}
+        busy={busy}
+        onRename={onRename}
+        open={renaming}
+        onOpenChange={setRenaming}
+      />
+    </>
   );
 }
 
@@ -325,20 +446,5 @@ function RenameDaemonDialog({
         {...(error === undefined ? {} : { error })}
       />
     </FormDialog>
-  );
-}
-
-function DaemonStatus({ daemon }: { daemon: BrowserDaemon }) {
-  if (daemon.status === "revoked") return <StatusPill tone="danger">Revoked</StatusPill>;
-  if (daemon.presence === "connected") return <StatusPill tone="success">Connected</StatusPill>;
-  return <StatusPill tone="neutral">Offline</StatusPill>;
-}
-
-function DaemonLoading() {
-  return (
-    <>
-      <PageHeader id="daemons-heading" title="Daemons" description={DAEMONS_DESCRIPTION} />
-      <DataTableSkeleton label="Daemons" columns={DAEMON_COLUMNS} />
-    </>
   );
 }
