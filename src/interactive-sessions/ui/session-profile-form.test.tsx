@@ -119,7 +119,7 @@ it("groups profile settings and explains the controls", () => {
   const html = renderForm();
   expect(html).toContain(">Where it runs</h2>");
   expect(html).toContain(">Agent settings</h2>");
-  expect(html).toContain("The connected machine that runs the agent.");
+  expect(html).toContain("An absolute folder on the daemon. The agent starts here.");
   expect(html).toContain("Controls the agent&#x27;s permission mode.");
   expect(html).toContain("Choose a thinking setting if the model supports one.");
 });
