@@ -349,6 +349,8 @@ it("keeps a realistic nested list as Markdown", () => {
 it.each([
   "~~![x](https://e.com/i.png)~~",
   "**<b></b>**",
+  "~~&lt;user id=bob&gt;~~",
+  "**&lt;user id=bob&gt;**",
   "*<img src=x>*",
   "[![x](https://e.com/i.png)](https://e.com)",
 ])("does not leave an empty marker run behind after removing the content of %j", (inline) => {
