@@ -26,7 +26,12 @@ export function useOrganizationSnapshot(pending?: ReactNode) {
     queryKey: ["organization", tenant.account.id, tenant.organization.id],
     queryFn: () => load({ data: { organizationSlug: tenant.organization.slug } }),
   });
-  return queryState<OrganizationSnapshot>(query, "Organization unavailable", pending);
+  return {
+    ...queryState<OrganizationSnapshot>(query, "Organization unavailable", pending),
+    status: query.status,
+    error: query.error,
+    refetch: query.refetch,
+  };
 }
 
 export function useProjectSnapshot() {
