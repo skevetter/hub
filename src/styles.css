@@ -225,4 +225,20 @@
     background-color: var(--primary);
     color: var(--primary-foreground);
   }
+
+  /*
+   * A reader who asked the system for less motion gets none from Hub: state still changes, it
+   * just arrives instead of travelling. One rule here rather than a variant on every control,
+   * so a new transition cannot forget it.
+   */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
 }
