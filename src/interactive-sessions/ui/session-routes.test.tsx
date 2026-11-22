@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { routeTree } from "../../routeTree.gen.js";
 import { Route as RootRoute } from "../../routes/__root.js";
 import { Route as ShellRoute } from "../../routes/_shell.js";
+import { profileSentence } from "./new-session.js";
 import { profileSaveMessage } from "./session-profiles.js";
 
 const state = vi.hoisted(() => ({
@@ -197,4 +198,16 @@ it.each([
   ["invalid_profile", "Check the profile name and enter an absolute directory on the daemon."],
 ])("explains the %s save refusal", (code, message) => {
   expect(profileSaveMessage(code)).toBe(message);
+});
+
+it("says which daemon, folder and harness a profile uses", () => {
+  const profile = { daemonSlug: "devbox", cwd: "/workspace/web", provider: "opencode" };
+  expect(profileSentence(profile)).toBe("Runs opencode on devbox in /workspace/web.");
+});
+
+it("points a member with no profile at an admin", async () => {
+  state.role = "member";
+  const html = await renderRoute("/o/acme/sessions/new");
+  expect(html).toContain("No active session profiles");
+  expect(html).toContain("Ask an organization admin to create a session profile.");
 });
