@@ -116,7 +116,7 @@ async function readJson(path) {
   try {
     file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
   } catch (error) {
-    if (error.code === "ENOENT") return null;
+    if (error.code === "ENOENT") return undefined;
     throw error;
   }
   try {
@@ -142,9 +142,9 @@ export async function publishTestMetrics(results, checks = [], directory = proce
   });
 }
 
-function validateMetrics(metrics) {
-  if (!metrics) return;
-  const { root, head, selectedFiles, counts, checks } = metrics;
+function validateMetrics(metrics, testedRoot, testedHead) {
+  if (metrics === undefined) return;
+  const { root, head, selectedFiles, counts, checks } = metrics ?? {};
   const strings = (items) =>
     Array.isArray(items) && items.every((value) => typeof value === "string");
   const count = (value) => Number.isSafeInteger(value) && value >= 0;
@@ -159,6 +159,9 @@ function validateMetrics(metrics) {
     counts.failed !== 0
   ) {
     throw new Error("The command produced invalid or failing test metrics.");
+  }
+  if (root !== testedRoot || head !== testedHead) {
+    throw new Error(`The command tested ${root} at ${head}, not ${testedRoot} at ${testedHead}.`);
   }
 }
 
@@ -193,13 +196,18 @@ export async function recordTestRun(directory, command, { stdio = "inherit", sig
     }
     const completedAt = new Date().toISOString();
     const durationMs = Math.round(performance.now() - started);
-    if (code === 0) checkUnchanged();
-    const metrics = code === 0 ? await readJson(report) : null;
-    validateMetrics(metrics);
-    if (metrics && (metrics.root !== root || metrics.head !== head)) {
-      throw new Error(
-        `The command tested ${metrics.root} at ${metrics.head}, not ${root} at ${head}.`,
-      );
+    let metrics;
+    let metricsError;
+    if (code === 0) {
+      checkUnchanged();
+      try {
+        const reported = await readJson(report);
+        validateMetrics(reported, root, head);
+        metrics = reported;
+      } catch (error) {
+        code = 1;
+        metricsError = error;
+      }
     }
     const entry = {
       root,
@@ -227,7 +235,10 @@ export async function recordTestRun(directory, command, { stdio = "inherit", sig
     const commands = previous.filter(
       (item) => JSON.stringify(item.command) !== JSON.stringify(command),
     );
-    if (code !== 0 && commands.length === previous.length) return { code, path: null };
+    if (code !== 0 && commands.length === previous.length) {
+      if (metricsError) throw metricsError;
+      return { code, path: null };
+    }
     await mkdir(join(receiptDir, "logs"), { recursive: true, mode: 0o700 });
     await copyFile(logFile, logPath(receiptDir, entry.logSha256), constants.COPYFILE_EXCL).catch(
       async (error) => {
@@ -252,6 +263,7 @@ export async function recordTestRun(directory, command, { stdio = "inherit", sig
     } finally {
       await rm(pending, { force: true });
     }
+    if (metricsError) throw metricsError;
     return { code, path: destination };
   } finally {
     try {
