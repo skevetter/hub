@@ -85,7 +85,29 @@ describe("verifyLinearPilotIntake created", () => {
     );
   });
 
-  it("refuses delegation and any session whose linked comment or issue is missing or inconsistent", () => {
+  it("requires readback for a comment-less owner start and refuses other creators", () => {
+    const s = ["agentSession"];
+    for (const absent of [undefined, null]) {
+      let payload = createdPayload();
+      for (const key of ["comment", "commentId", "sourceCommentId"]) {
+        payload = mutate(payload, [...s, key], absent);
+      }
+      expect(accepted(payload)).toMatchObject({ kind: "created", pendingDelegation: true });
+      expect(accepted(payload)).not.toHaveProperty("message");
+      for (const key of ["comment", "commentId", "sourceCommentId"]) {
+        expect(refused(mutate(payload, [...s, key], "present"))).toBe("origin_unproven");
+      }
+      const other = mutate(payload, [...s, "creatorId"], "other-human");
+      expect(precheckLinearPilotScope({ config: PILOT_CONFIG, payload: other })).toEqual({
+        ok: false,
+        reason: "not_owner",
+      });
+      expect(refused(other)).toBe("not_owner");
+      expect(refused(mutate(payload, [...s, "issue"], absent))).toBe("malformed");
+    }
+  });
+
+  it("refuses a session whose linked comment or issue is missing or inconsistent", () => {
     const s = ["agentSession"];
     expect(refused(mutate(createdPayload(), [...s, "commentId"], null))).toBe("origin_unproven");
     expect(refused(mutate(createdPayload(), [...s, "comment"], null))).toBe("origin_unproven");

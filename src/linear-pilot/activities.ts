@@ -8,13 +8,15 @@ import {
 import type { LinearConnectionBinding } from "../providers/linear/client.js";
 import { formatRunReply, type FinalReplyAnswer } from "../run-replies/format.js";
 
-const ACK_MS = 10_000;
+export const PILOT_ACK_MS = 10_000;
 const TERMINAL_MS = 16_000;
 const CLAIM_MS = 60_000;
 const MAX_CLAIMS = 2_048;
 const ACK_BODY = "Paseo Hub received your request.";
 const NO_ANSWER_BODY = "Work finished. No answer was posted.";
 const ERROR_BODY = "Paseo Hub could not complete this request.";
+const DELEGATION_ERROR_BODY =
+  "Paseo could not confirm who started this. Mention @paseo in a comment instead.";
 const STOP_BODY = "Stopped.";
 const STOP_UNCONFIRMED_BODY = "Stop requested; I could not confirm it stopped";
 const BUSY_BODY = "Still working on the previous message; reply when I have answered.";
@@ -55,7 +57,7 @@ type PilotClient = Pick<
   "createActivity" | "isActivityConfirmed"
 >;
 type BodyContent = Extract<LinearAgentActivityContent, { body: string }>;
-type Purpose = "ack" | "terminal" | "stop" | "busy";
+type Purpose = "ack" | "terminal" | "stop" | "busy" | "delegationRefused";
 
 interface ActivityOptions {
   /** Return L1 bound to this event's exact installation and current operation authorization. */
@@ -63,19 +65,45 @@ interface ActivityOptions {
   now?: () => number;
 }
 
+function activityTiming(purpose: Purpose, receivedAt: number, started: number) {
+  const ack = purpose === "ack";
+  const initial = ack || purpose === "delegationRefused";
+  return { ack, initial, deadline: initial ? receivedAt + PILOT_ACK_MS : started + TERMINAL_MS };
+}
+
+function expiredInitialWrite(deadline: number, receivedAt: number, started: number) {
+  return !Number.isFinite(deadline) || receivedAt > started || started >= deadline;
+}
+
+type WriteDelegationRefusal = (
+  event: LinearPilotAcceptedEvent,
+  attempt: "first-attempt",
+  purpose: "delegationRefused",
+  kind: "error",
+  prepareBody: () => string,
+) => Promise<LinearPilotWriteDisposition>;
+
+function delegationRefusalWriter(write: WriteDelegationRefusal) {
+  return function refuseDelegation(event: LinearPilotAcceptedEvent) {
+    if (event.kind !== "created" || event.interactionId !== event.nativeSessionId)
+      return Promise.resolve({ disposition: "denied" } as const);
+    return write(event, "first-attempt", "delegationRefused", "error", () => DELEGATION_ERROR_BODY);
+  };
+}
+
+function claim(claims: Map<string, number>, slot: string, started: number) {
+  for (const [key, expires] of claims) {
+    if (expires > started) break;
+    claims.delete(key);
+  }
+  if (claims.has(slot)) return "already-claimed" as const;
+  if (claims.size >= MAX_CLAIMS) return "capacity" as const;
+  claims.set(slot, started + CLAIM_MS);
+  return undefined;
+}
+
 export function createLinearPilotActivities({ clientFor, now = Date.now }: ActivityOptions) {
   const claims = new Map<string, number>();
-
-  function claim(slot: string, started: number) {
-    for (const [key, expires] of claims) {
-      if (expires > started) break;
-      claims.delete(key);
-    }
-    if (claims.has(slot)) return "already-claimed" as const;
-    if (claims.size >= MAX_CLAIMS) return "capacity" as const;
-    claims.set(slot, started + CLAIM_MS);
-    return undefined;
-  }
 
   async function write(
     event: LinearPilotAcceptedEvent,
@@ -98,18 +126,16 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
     if (signal?.aborted) return { disposition: "cancelled" };
 
     const started = now();
-    const ack = purpose === "ack";
-    const deadline = ack ? event.receivedAt + ACK_MS : started + TERMINAL_MS;
-    if (ack && (!Number.isFinite(deadline) || event.receivedAt > started || started >= deadline)) {
+    const { ack, initial, deadline } = activityTiming(purpose, event.receivedAt, started);
+    if (initial && expiredInitialWrite(deadline, event.receivedAt, started))
       return { disposition: "expired" };
-    }
     const { nativeSessionId: sessionId, interactionId } = event;
     const providerSignal = purpose === "busy" ? { signal: "continue" as const } : undefined;
     const activityId = stableActivityId(sessionId, purpose, interactionId);
     if (attempt === "first-attempt") {
       // A prompt gets one terminal output, including when it arrives during another turn.
       const slot = JSON.stringify([sessionId, ack ? null : interactionId]);
-      const refused = claim(slot, started);
+      const refused = claim(claims, slot, started);
       if (refused) return { disposition: refused, activityId };
     } else if (attempt !== "readback-only") {
       return { disposition: "denied" };
@@ -119,7 +145,7 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
     const callSignal = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
     const interrupted = () => {
       if (timeout.signal.aborted || now() >= deadline) {
-        return { disposition: ack ? "expired" : "unconfirmed", activityId } as const;
+        return { disposition: initial ? "expired" : "unconfirmed", activityId } as const;
       }
       if (callSignal.aborted) return { disposition: "cancelled", activityId } as const;
       return undefined;
@@ -223,6 +249,7 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
         return Promise.resolve({ disposition: "denied" });
       return write(event, attempt, "terminal", "error", () => ERROR_BODY, signal);
     },
+    refuseDelegation: delegationRefusalWriter(write),
     busy(
       event: LinearPilotAcceptedEvent,
       attempt: LinearPilotActivityAttempt,

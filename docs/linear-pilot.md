@@ -20,13 +20,27 @@ be a current owner of the Hub organization.
 
 Without the pilot setting, Hub acknowledges native session events using the
 existing drop path. The pilot accepts only the configured workspace and human.
-The signed event must prove who initiated the session. Hub uses the existing
+Hub verifies who initiated the session and uses the existing
 [Linear reply sanitizer](linear-reply.md) for the final answer from the proven
 turn.
 
 Admitted pilot messages appear under **Other** in Dropped events with the
 reason `linear_pilot_admitted`. Deploy outside active turns. Hub drops an
 owner message delivered during shutdown with HTTP 200, so Linear does not retry.
+
+## Start by delegation
+
+Delegate or assign an issue to Paseo to start a session without a comment. Hub
+checks that the configured human made the change up to 120 seconds before the
+session was created and that Paseo is still the delegate or assignee. Changes
+from bots and automatic triage do not qualify.
+Hub assumes `history(first: 20, orderBy: createdAt)` returns the newest entries
+first. Confirm that order in the first live delegation test.
+
+The first prompt is `Work on <identifier>: <title>`, a blank line, and the issue
+description. Hub refuses prompts that exceed the existing message limits.
+If Hub cannot confirm who started the session, it asks the configured human
+to mention `@paseo` in a comment instead.
 
 ## Isolation assumption
 

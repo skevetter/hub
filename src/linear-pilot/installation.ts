@@ -2,6 +2,7 @@ import type { QueryHandle } from "../db/runtime/index.js";
 import { surfaceUuid } from "../surfaces/store.js";
 import type { PilotConnection } from "./binding.js";
 import type { LinearPilotConfig } from "./config.js";
+import { logPilotRefusal, pilotDeliveryMetadata } from "./diagnostics.js";
 import {
   precheckLinearPilotScope,
   verifyLinearPilotIntake,
@@ -56,16 +57,21 @@ export async function qualifyLinearPilotDelivery(
   oauthClientId: string,
   payload: unknown,
 ) {
-  if (!precheckLinearPilotScope({ config, payload }).ok) return undefined;
+  const refuse = (reason: string) => {
+    logPilotRefusal(reason, pilotDeliveryMetadata(payload));
+    return undefined;
+  };
+  const precheck = precheckLinearPilotScope({ config, payload });
+  if (!precheck.ok) return refuse(precheck.reason);
   const installation = await resolveLinearPilotInstallation(database, config, oauthClientId);
-  if (installation === undefined) return undefined;
+  if (installation === undefined) return refuse("installation_unavailable");
   const verified = verifyLinearPilotIntake({ config, installation, payload });
-  if (!verified.ok) return undefined;
+  if (!verified.ok) return refuse(verified.reason);
   const { event } = verified;
   const { activityId, nativeSessionId, teamId } = event;
-  if (!teamId || !surfaceUuid(nativeSessionId)) return undefined;
+  if (!teamId || !surfaceUuid(nativeSessionId)) return refuse("malformed");
   if (event.kind !== "created" && (activityId === undefined || !surfaceUuid(activityId))) {
-    return undefined;
+    return refuse("malformed");
   }
   return {
     installation,

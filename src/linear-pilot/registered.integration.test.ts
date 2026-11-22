@@ -19,6 +19,7 @@ import { SessionEventBus } from "../interactive-sessions/bus.js";
 import { InteractiveSessionCoordinator } from "../interactive-sessions/coordinator.js";
 import { readInteractiveSessionSettings } from "../interactive-sessions/settings.js";
 import { FakeAgents } from "../interactive-sessions/test-utils/fake-agents.js";
+import { logger } from "../logger.js";
 import { createLinearRegistration } from "../providers/linear/index.js";
 import { prepareProfile, surfaceTenant } from "../surfaces/store.contract.js";
 import { pilotActivityIds } from "./activities.js";
@@ -90,11 +91,228 @@ async function registeredDatabase(backend: "embedded" | "postgres") {
   }
 }
 
+type Publication = Array<{ id: string; type: string; body: string; signal?: string }>;
+interface Endpoint {
+  handle(request: Request): Promise<Response> | Response;
+}
+
+async function deliver(endpoint: Endpoint, payload: JsonObject) {
+  assert.equal((await endpoint.handle(signedDelivery(payload))).status, 200);
+}
+
+function removeSignedComment(payload: JsonObject, session: JsonObject, delegation: boolean) {
+  if (!delegation) return;
+  session["comment"] = null;
+  session["commentId"] = null;
+  session["sourceCommentId"] = null;
+  payload["promptContext"] = "not first-turn context";
+}
+
+function delegationResult(input: {
+  request: z.infer<typeof graphQLRequest>;
+  nativeSessionId: string;
+  issueId: string;
+  at: (second: number) => string;
+  appUserId: string;
+  workspaceId: string;
+  humanId: string;
+  teamId: JsonObject[string] | undefined;
+  fail: boolean;
+}) {
+  const { request, nativeSessionId, issueId, at, appUserId, workspaceId, humanId, teamId, fail } =
+    input;
+  assert.match(request.query, /history\(first: 20, orderBy: createdAt\)/u);
+  assert.deepEqual(request.variables, { sessionId: nativeSessionId });
+  if (fail)
+    return Response.json({
+      errors: [
+        {
+          message: "Origin read unavailable",
+          extensions: { type: "unavailable", code: "unavailable" },
+        },
+      ],
+    });
+  const human = { id: humanId };
+  const app = { id: appUserId };
+  return Response.json({
+    data: {
+      agentSession: {
+        id: nativeSessionId,
+        createdAt: at(0),
+        appUser: app,
+        creator: human,
+        comment: null,
+        sourceComment: null,
+        issue: {
+          id: issueId,
+          identifier: "TEST-1",
+          title: "Check delegation",
+          description: "Use this description.",
+          team: { id: teamId, organization: { id: workspaceId } },
+          delegate: app,
+          assignee: null,
+          history: {
+            nodes: [
+              {
+                createdAt: at(-1),
+                actor: human,
+                botActor: null,
+                toDelegate: app,
+                toAssignee: null,
+                triageResponsibilityAutoAssigned: null,
+              },
+            ],
+          },
+        },
+      },
+    },
+  });
+}
+
+function activityResult(
+  activity: NonNullable<z.infer<typeof graphQLRequest>["variables"]["input"]>,
+  appUserId: string,
+  publication: Publication,
+) {
+  const signal = activity.signal === undefined ? {} : { signal: activity.signal };
+  publication.push({ id: activity.id, ...activity.content, ...signal });
+  return Response.json({
+    data: {
+      agentActivityCreate: {
+        success: true,
+        agentActivity: {
+          id: activity.id,
+          agentSession: { id: activity.agentSessionId },
+          user: { id: appUserId },
+          ...signal,
+        },
+      },
+    },
+  });
+}
+
+async function assertDeclinesOutsideScope(input: {
+  payload: JsonObject;
+  session: JsonObject;
+  endpoint: Endpoint;
+  runtime: DatabaseRuntime;
+  database: ReturnType<typeof createDatabase>;
+  provider: ReturnType<typeof vi.fn<typeof fetch>>;
+  agents: FakeAgents;
+  outside: ReturnType<typeof surfaceTenant>;
+  delegation: boolean;
+}) {
+  const { payload, session, endpoint, runtime, database, provider, agents, outside, delegation } =
+    input;
+  const wrongWorkspace = {
+    ...payload,
+    organizationId: outside.connection.linearOrganizationId,
+  };
+  const credentialLookup = vi.spyOn(database, "findLinearConnection");
+  assert.equal((await endpoint.handle(signedDelivery(wrongWorkspace))).status, 200);
+  expect(credentialLookup).not.toHaveBeenCalled();
+  assert.equal(provider.mock.calls.length, 0);
+  assert.equal(agents.creations.length, 0);
+  const {
+    rows: [declined],
+  } = await runtime.query(
+    "select payload, dropped_reason from provider_event_receipts where organization_id = $1",
+    [outside.organizationId],
+  );
+  expect(declined).toMatchObject({
+    payload: { type: "agent_session", action: "created" },
+    dropped_reason: "unsupported_event",
+  });
+  if (delegation) {
+    const otherCreator = { ...payload, agentSession: { ...session, creatorId: randomUUID() } };
+    assert.equal((await endpoint.handle(signedDelivery(otherCreator))).status, 200);
+    expect(credentialLookup).not.toHaveBeenCalled();
+    expect(provider).not.toHaveBeenCalled();
+  }
+}
+
+async function assertDelegationRefusal(input: {
+  endpoint: Endpoint;
+  payload: JsonObject;
+  runtime: DatabaseRuntime;
+  organizationId: string;
+  nativeSessionId: string;
+  publication: Publication;
+  agents: FakeAgents;
+  legacy: () => Promise<void>;
+  originReads: () => number;
+}) {
+  const {
+    endpoint,
+    payload,
+    runtime,
+    organizationId,
+    nativeSessionId,
+    publication,
+    agents,
+    legacy,
+    originReads,
+  } = input;
+  const info = vi.spyOn(logger, "info");
+  try {
+    await deliver(endpoint, payload);
+    await vi.waitFor(() => expect(publication).toHaveLength(1));
+    expect(publication[0]?.id).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(publication[0]).toMatchObject({
+      type: "error",
+      body: "Paseo could not confirm who started this. Mention @paseo in a comment instead.",
+    });
+    expect(info).toHaveBeenCalledWith(
+      {
+        reason: "origin_unproven",
+        action: "created",
+        nativeSessionId,
+        linearErrorText: "Linear GraphQL Origin read unavailable",
+        linearErrorType: "unavailable",
+        linearErrorKinds: ["UNAVAILABLE"],
+      },
+      "Linear pilot refused delivery",
+    );
+    await deliver(endpoint, payload);
+    await vi.waitFor(() =>
+      expect(info).toHaveBeenCalledWith(
+        { reason: "duplicate", action: "created", nativeSessionId },
+        "Linear pilot refused delivery",
+      ),
+    );
+    const { rows } = await runtime.query(
+      "select 1 from interactive_sessions where organization_id = $1",
+      [organizationId],
+    );
+    expect(rows).toEqual([]);
+    expect(publication).toHaveLength(1);
+    expect(originReads()).toBe(1);
+    expect(agents.creations).toEqual([]);
+    expect(legacy).not.toHaveBeenCalled();
+  } finally {
+    info.mockRestore();
+  }
+}
+
+function registeredBackend(scenario: string) {
+  return scenario === "postgres" ? "postgres" : "embedded";
+}
+
+function coordinatorOptions(scenario: string) {
+  return scenario === "stop-race" ? { shutdownTimeoutMs: 1_000 } : {};
+}
+
 async function exerciseRegisteredPilot(
-  scenario: "stop" | "stop-race" | "postgres" | "start-refusal",
+  scenario:
+    | "stop"
+    | "stop-race"
+    | "postgres"
+    | "start-refusal"
+    | "delegation"
+    | "delegation-refusal",
   terminalFailure?: "failed" | "canceled" | "unconfirmed",
 ) {
-  const backend = scenario === "postgres" ? "postgres" : "embedded";
+  const backend = registeredBackend(scenario);
   const { runtime, locks, cleanup } = await registeredDatabase(backend);
   try {
     await runtime.migrate();
@@ -191,7 +409,7 @@ async function exerciseRegisteredPilot(
       settings: { ...readInteractiveSessionSettings({}), enabled: true },
       instanceId: randomUUID(),
       reportFailure: reportCoordinatorFailure,
-      ...(scenario === "stop-race" ? { shutdownTimeoutMs: 1_000 } : {}),
+      ...coordinatorOptions(scenario),
       linearPilot: pilot.sessionHooks,
     });
     pilot.attachCoordinator(coordinator);
@@ -204,7 +422,8 @@ async function exerciseRegisteredPilot(
       const followUpAt = at(3);
       const freshTurnAt = at(4);
       const historyReads: string[] = [];
-      const publication: Array<{ id: string; type: string; body: string; signal?: string }> = [];
+      let originReads = 0;
+      const publication: Publication = [];
       const appId = connection.providerApplicationId;
       assert(appId);
       const payload = createdPayload();
@@ -220,6 +439,8 @@ async function exerciseRegisteredPilot(
       objectAt(session, "comment")["userId"] = config.allowedHumanId;
       const issueId = session["issueId"];
       assert(typeof issueId === "string");
+      const delegation = scenario.startsWith("delegation");
+      removeSignedComment(payload, session, delegation);
 
       function prompted(id: string, createdAt: string, body: string | null): JsonObject {
         return {
@@ -296,6 +517,20 @@ async function exerciseRegisteredPilot(
             },
           });
         }
+        if (request.query.includes("PaseoPilotDelegationOrigin")) {
+          originReads++;
+          return delegationResult({
+            request,
+            nativeSessionId,
+            issueId,
+            at,
+            appUserId: connection.appUserId,
+            workspaceId: config.linearOrganizationId,
+            humanId: config.allowedHumanId,
+            teamId: objectAt(session, "issue")["teamId"],
+            fail: scenario === "delegation-refusal",
+          });
+        }
         if (request.query.includes("PaseoPilotPrompt")) {
           assert.match(request.query, /first: 1,/u);
           assert.match(request.query, /agentSessionId: \{ eq: \$sessionId \}/u);
@@ -331,21 +566,7 @@ async function exerciseRegisteredPilot(
         const activity = request.variables.input;
         assert(activity);
         assert.equal(activity.agentSessionId, nativeSessionId);
-        const signal = activity.signal === undefined ? {} : { signal: activity.signal };
-        publication.push({ id: activity.id, ...activity.content, ...signal });
-        return Response.json({
-          data: {
-            agentActivityCreate: {
-              success: true,
-              agentActivity: {
-                id: activity.id,
-                agentSession: { id: nativeSessionId },
-                user: { id: connection.appUserId },
-                ...signal,
-              },
-            },
-          },
-        });
+        return activityResult(activity, connection.appUserId, publication);
       });
       const registration = createLinearRegistration({
         database,
@@ -361,24 +582,16 @@ async function exerciseRegisteredPilot(
       const endpoint = registration.requests.find(({ name }) => name === "linear.events");
       assert(endpoint);
 
-      const wrongWorkspace = {
-        ...payload,
-        organizationId: outside.connection.linearOrganizationId,
-      };
-      const credentialLookup = vi.spyOn(database, "findLinearConnection");
-      assert.equal((await endpoint.handle(signedDelivery(wrongWorkspace))).status, 200);
-      expect(credentialLookup).not.toHaveBeenCalled();
-      assert.equal(provider.mock.calls.length, 0);
-      assert.equal(agents.creations.length, 0);
-      const {
-        rows: [declined],
-      } = await runtime.query(
-        "select payload, dropped_reason from provider_event_receipts where organization_id = $1",
-        [outside.organizationId],
-      );
-      expect(declined).toMatchObject({
-        payload: { type: "agent_session", action: "created" },
-        dropped_reason: "unsupported_event",
+      await assertDeclinesOutsideScope({
+        payload,
+        session,
+        endpoint,
+        runtime,
+        database,
+        provider,
+        agents,
+        outside,
+        delegation,
       });
 
       const watch = agents.watch.bind(agents);
@@ -428,6 +641,20 @@ async function exerciseRegisteredPilot(
         );
         expect(provider).not.toHaveBeenCalled();
         expect(agents.sends).toEqual([]);
+        return;
+      }
+      if (scenario === "delegation-refusal") {
+        await assertDelegationRefusal({
+          endpoint,
+          payload,
+          runtime,
+          organizationId,
+          nativeSessionId,
+          publication,
+          agents,
+          legacy,
+          originReads: () => originReads,
+        });
         return;
       }
       const began = performance.now();
@@ -551,6 +778,13 @@ async function exerciseRegisteredPilot(
         expect(publication.map(({ type }) => type)).toEqual(["thought", "response"]),
       );
       assert.match(publication[1]?.body ?? "", /Synthetic final answer/u);
+      if (scenario === "delegation") {
+        expect(send.text).toBe("Work on TEST-1: Check delegation\n\nUse this description.");
+        expect(originReads).toBe(1);
+        expect(agents.sends).toHaveLength(1);
+        expect(legacy).not.toHaveBeenCalled();
+        return;
+      }
       assert.equal((await endpoint.handle(signedDelivery(payload))).status, 200);
 
       const legacyAdmission = vi.spyOn(database, "acceptLinearEvent");
@@ -853,5 +1087,17 @@ test(
 test(
   "reports only the fixed start refusal code and native session id",
   () => exerciseRegisteredPilot("start-refusal"),
+  120_000,
+);
+
+test(
+  "a proven owner delegation acknowledges, starts a turn and publishes its answer",
+  () => exerciseRegisteredPilot("delegation"),
+  120_000,
+);
+
+test(
+  "a failed delegation read posts one fixed error and creates no Hub session",
+  () => exerciseRegisteredPilot("delegation-refusal"),
   120_000,
 );

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DELEGATION_HISTORY_LIMIT, delegationReadback } from "../../linear-pilot/delegation.js";
 import {
   readPilotPriorPage,
   readPilotPromptPage,
@@ -148,7 +149,11 @@ export class LinearAgentError extends Error {
 export type LinearAgentOperation =
   | { kind: "viewer" }
   | { kind: "createActivity" | "readActivity"; sessionId: string }
-  | { kind: "readPilotPrompt" | "readPilotHistory"; sessionId: string; issueId: string }
+  | {
+      kind: "readPilotPrompt" | "readPilotHistory" | "readDelegationOrigin";
+      sessionId: string;
+      issueId: string;
+    }
   | { kind: "addHubUrl"; sessionId: string; url: string }
   | { kind: "readEligibleUsers"; teamId: string }
   | { kind: "moveIssueToStarted"; teamId: string; issueId: string };
@@ -160,7 +165,7 @@ type LinearAgentClientOptions = Pick<
   binding: LinearConnectionBinding;
   hubBaseUrl: string;
   fetch: typeof fetch;
-  /** Enables pilot history reads and response signals. */
+  /** Enables pilot origin and history reads and response signals. */
   pilotOperations?: true;
   /** Resolve current policy and authority for this exact operation. Setup reads need an explicit policy too. */
   authorize(
@@ -183,6 +188,59 @@ type Send = <T>(
   data: z.ZodType<T>,
   diagnostics?: DiagnosticInputs,
 ) => Promise<T>;
+
+const delegationOriginQuery = `query PaseoPilotDelegationOrigin($sessionId: String!) {
+  agentSession(id: $sessionId) {
+    id createdAt appUser { id } creator { id } comment { id } sourceComment { id }
+    issue {
+      id identifier title description team { id organization { id } }
+      delegate { id } assignee { id }
+      history(first: ${DELEGATION_HISTORY_LIMIT}, orderBy: createdAt) {
+        nodes {
+          createdAt actor { id } botActor { id } toDelegate { id } toAssignee { id }
+          triageResponsibilityAutoAssigned
+        }
+      }
+    }
+  }
+}`;
+
+type RunDelegationRead = (
+  operation: LinearAgentOperation,
+  variables: { sessionId: string },
+  signal: AbortSignal,
+  perform: (
+    send: Send,
+    viewer: z.infer<typeof user>,
+    checkCurrent: () => Promise<void>,
+  ) => Promise<z.infer<typeof delegationReadback>>,
+) => Promise<z.infer<typeof delegationReadback>>;
+
+async function fetchDelegationOrigin(
+  send: Send,
+  checkCurrent: () => Promise<void>,
+  variables: { sessionId: string },
+) {
+  const result = await send(delegationOriginQuery, variables, delegationReadback);
+  await checkCurrent();
+  return result;
+}
+
+function delegationOriginReader(
+  run: RunDelegationRead,
+  requireScope: (input: PilotHistoryScope) => PilotHistoryScope,
+) {
+  return async function readDelegationOrigin(input: PilotHistoryScope, signal: AbortSignal) {
+    const { sessionId, issueId } = requireScope(input);
+    const variables = { sessionId };
+    return run(
+      { kind: "readDelegationOrigin", sessionId, issueId },
+      variables,
+      signal,
+      (send, _viewer, checkCurrent) => fetchDelegationOrigin(send, checkCurrent, variables),
+    );
+  };
+}
 
 export function createLinearAgentClient(options: LinearAgentClientOptions) {
   const binding = Object.freeze({ ...options.binding });
@@ -342,8 +400,8 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
     }
     return perform(send, viewer, checkCurrent);
   }
-
   return {
+    readDelegationOrigin: delegationOriginReader(run, requireHistoryScope),
     async readPilotPrompt(
       input: PilotHistoryScope,
       expected: z.input<typeof historyPrompt>,

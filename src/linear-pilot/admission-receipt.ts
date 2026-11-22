@@ -13,12 +13,12 @@ type LinearPilotReceipt = {
   profileVersion: number;
   nativeSessionId: string;
   receivedAt: Date;
-} & ({ kind: "created" } | { kind: "prompted" | "stop"; activityId: string });
+} & (
+  | { kind: "created"; delegationRefused?: true }
+  | { kind: "prompted" | "stop"; activityId: string }
+);
 
-export async function recordLinearPilotAdmission(
-  database: QueryHandle,
-  receipt: LinearPilotReceipt,
-): Promise<boolean> {
+function receiptId(receipt: LinearPilotReceipt): string {
   const interaction = receipt.kind === "created" ? ["created"] : ["activity", receipt.activityId];
   const digest = createHash("sha256")
     .update(
@@ -31,13 +31,30 @@ export async function recordLinearPilotAdmission(
       ]),
     )
     .digest("hex");
+  return `linear-pilot:${digest}`;
+}
+
+export async function hasLinearPilotReceipt(database: QueryHandle, receipt: LinearPilotReceipt) {
+  const result = await database.query(
+    `select 1 from provider_event_receipts
+     where organization_id = $1 and provider = 'linear' and delivery_id = $2`,
+    [receipt.organizationId, receiptId(receipt)],
+  );
+  return result.rows.length !== 0;
+}
+
+export async function recordLinearPilotAdmission(
+  database: QueryHandle,
+  receipt: LinearPilotReceipt,
+): Promise<boolean> {
+  const refused = receipt.kind === "created" && receipt.delegationRefused;
   const result = await database.query(
     `insert into provider_event_receipts
        (organization_id, provider, connection_id, delivery_id, provider_application_id, source,
         payload, received_at, dropped_reason)
      select connection.organization_id, 'linear', connection.id, $1,
             connection.provider_application_id, 'linear.agent_session', $2::jsonb, $3,
-            'linear_pilot_admitted'
+            $13
      from linear_connections connection
      join interactive_session_profiles profile on profile.organization_id = connection.organization_id
      join member owner on owner.organization_id = profile.organization_id
@@ -49,7 +66,7 @@ export async function recordLinearPilotAdmission(
        and profile.access = 'private' and owner.user_id = $12
      on conflict do nothing`,
     [
-      `linear-pilot:${digest}`,
+      receiptId(receipt),
       JSON.stringify({ type: "agent_session", action: receipt.kind }),
       receipt.receivedAt,
       receipt.organizationId,
@@ -61,6 +78,7 @@ export async function recordLinearPilotAdmission(
       receipt.profileId,
       receipt.profileVersion,
       receipt.ownerUserId,
+      refused ? "origin_unproven" : "linear_pilot_admitted",
     ],
   );
   return result.rowCount === 1;

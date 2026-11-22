@@ -33,6 +33,7 @@ export interface LinearPilotEvent {
   teamId?: string;
   activityId?: string;
   message?: string;
+  pendingDelegation?: true;
   /**
    * Stop only. Epoch ms of the signed `agentActivity.createdAt`, present only when that field is
    * a strict UTC ISO-8601 timestamp. Absent means the time evidence is unusable: the caller must
@@ -196,17 +197,38 @@ function readCreated(scope: Scope): LinearPilotIntakeResult {
   if (creator !== undefined && creator !== null) {
     if (id(field(plain(creator) ?? {}, "id")) !== humanId) return refuse("session_mismatch");
   }
-  // A creator can be an automation-substituted assignee. Only a signed comment authored by the
-  // same human, on the same issue and linked from the session, shows a person started this.
-  const comment = plain(field(session, "comment"));
-  const commentId = id(field(session, "commentId"));
-  if (comment === undefined || commentId === undefined) return refuse("origin_unproven");
+  return readCreatedOrigin(scope, humanId);
+}
+
+function readCreatedOrigin(scope: Scope, humanId: string): LinearPilotIntakeResult {
+  const { session } = scope;
+  const rawComment = field(session, "comment");
+  const rawCommentId = field(session, "commentId");
   const source = field(session, "sourceCommentId");
+  // A creator can be an automation-substituted assignee. Without a comment, history must prove origin.
+  if (rawComment == null && rawCommentId == null && source == null) {
+    return accept(scope, "created", humanId, { pendingDelegation: true });
+  }
+  return readCreatedComment(scope, humanId, { rawComment, rawCommentId, source });
+}
+
+function readCreatedComment(
+  scope: Scope,
+  humanId: string,
+  {
+    rawComment,
+    rawCommentId,
+    source,
+  }: { rawComment: unknown; rawCommentId: unknown; source: unknown },
+): LinearPilotIntakeResult {
+  const comment = plain(rawComment);
+  const commentId = id(rawCommentId);
+  if (comment === undefined || commentId === undefined) return refuse("origin_unproven");
   if (
     id(field(comment, "id")) !== commentId ||
     id(field(comment, "issueId")) !== scope.issueId ||
     id(field(comment, "userId")) !== humanId ||
-    (source !== undefined && source !== null && source !== commentId)
+    (source != null && source !== commentId)
   ) {
     return refuse("origin_unproven");
   }
@@ -288,7 +310,12 @@ function accept(
   scope: Scope,
   kind: LinearPilotEvent["kind"],
   humanId: string,
-  extra: { activityId?: string; message?: string; stopCreatedAtMs?: number | undefined },
+  {
+    stopCreatedAtMs,
+    ...extra
+  }: Pick<LinearPilotEvent, "activityId" | "message" | "pendingDelegation"> & {
+    stopCreatedAtMs?: number | undefined;
+  },
 ): LinearPilotIntakeResult {
   const event: LinearPilotEvent = {
     kind,
@@ -298,11 +325,10 @@ function accept(
     nativeSessionId: scope.sessionId,
     humanId,
     issueId: scope.issueId,
+    ...extra,
   };
   if (scope.teamId !== undefined) event.teamId = scope.teamId;
-  if (extra.activityId !== undefined) event.activityId = extra.activityId;
-  if (extra.message !== undefined) event.message = extra.message;
-  if (extra.stopCreatedAtMs !== undefined) event.stopCreatedAtMs = extra.stopCreatedAtMs;
+  if (stopCreatedAtMs !== undefined) event.stopCreatedAtMs = stopCreatedAtMs;
   return { ok: true, event };
 }
 
