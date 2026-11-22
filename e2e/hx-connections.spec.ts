@@ -33,7 +33,7 @@ test("shows the four cards and opens provider-filtered dropped events from the k
     const card = connections.card(provider);
     await expect(card.getByText("Not set up", { exact: true })).toHaveCount(1);
   }
-  await expect(main.getByRole("link", { name: /dropped events/u })).toHaveCount(0);
+  await expect(main.getByRole("link", { name: /dropped events/iu })).toHaveCount(0);
   await tabThrough(page, [
     github.getByRole("button", { name: "Connect GitHub" }),
     discord.getByRole("button", { name: "Connect Discord" }),
@@ -63,7 +63,7 @@ test("shows the four cards and opens provider-filtered dropped events from the k
   await expect(github.getByRole("listitem")).toContainText("installation 42");
   await expect(discord.getByText("Connected", { exact: true })).toHaveCount(1);
   await expect(discord.getByRole("listitem")).toContainText("Acme Guild");
-  const dropped = github.getByRole("link", { name: "2 dropped events in the last 7 days" });
+  const dropped = github.getByRole("link", { name: "Dropped events in the last 7 days" });
   await expect(dropped).toBeVisible();
   await captureWidths(page, "mixed");
 

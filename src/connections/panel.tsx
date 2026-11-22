@@ -227,12 +227,15 @@ function ConnectionsContent() {
                   onRevoke={revokeConnection}
                 />
               ) : null}
-              {provider === "linear" && canManage && connections.linear.length > 0 ? (
+              {provider === "linear" &&
+              dropped === "some" &&
+              canManage &&
+              connections.linear.length > 0 ? (
                 <p className="text-xs text-muted-foreground">
                   Linear events dropped because no route matched stay dropped after reconnecting.
                 </p>
               ) : null}
-              {dropped > 0 ? (
+              {dropped !== "none" ? (
                 <div>
                   <Link
                     className="text-link underline underline-offset-2"
@@ -240,8 +243,9 @@ function ConnectionsContent() {
                     params={scope}
                     search={droppedSearch}
                   >
-                    {data.droppedConnectionEventsCapped ? "At least " : ""}
-                    {dropped} dropped {dropped === 1 ? "event" : "events"} in the last 7 days
+                    {dropped === "some"
+                      ? "Dropped events in the last 7 days"
+                      : "Check dropped events in Activity"}
                   </Link>
                 </div>
               ) : null}

@@ -58,7 +58,11 @@ import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import { parseInvocationInputs, parseInvocationRejection } from "../triggers/invocation.js";
 import { DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR } from "./unsupported-linear.js";
-import { countRecentDroppedEvents, readDroppedEventPage } from "./dropped-events.js";
+import {
+  countRecentDroppedEvents,
+  readDroppedEventPage,
+  readDroppedEventPresence,
+} from "./dropped-events.js";
 import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
 import {
   clearOverrideKey,
@@ -5287,6 +5291,10 @@ class PgDatabase implements Database {
 
   listDroppedEventPage(organizationId: string, request: DroppedEventPageRequest) {
     return readDroppedEventPage(this.pool, organizationId, request);
+  }
+
+  readDroppedEventPresence(organizationId: string, provider: ConnectionProvider, since: Date) {
+    return readDroppedEventPresence(this.pool, organizationId, provider, since);
   }
 
   countRecentDroppedEvents(organizationId: string, since: Date) {

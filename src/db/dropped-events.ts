@@ -8,13 +8,16 @@ import {
 import type { ListProvider } from "../triggers/list-providers.js";
 import type { QueryHandle } from "./runtime/index.js";
 import type {
+  ConnectionProvider,
   DroppedEventPageRecord,
   DroppedEventPageRequest,
+  DroppedEventPresence,
   DroppedProviderEventCount,
   ProviderEventReceiptRecord,
 } from "./types.js";
 
 export const RECENT_DROP_COUNT_LIMIT = 2_500;
+export const DROPPED_EVENT_CANDIDATE_LIMIT = 200;
 
 type Provider = ProviderEventReceiptRecord["provider"];
 type ReceiptIdentity = Pick<ProviderEventReceiptRecord, "provider" | "source">;
@@ -36,16 +39,12 @@ const NO_RECEIPT_RUNS = `not exists (
   select 1 from trigger_runs runs where runs.provider_event_receipt_id = receipt.id offset 0
 )`;
 
-function receiptPageFilters(
-  { provider, reason, receivedSince, source }: DroppedEventPageRequest,
+function droppedReceiptFilters(
+  { provider, reason, receivedSince, source }: Omit<DroppedEventPageRequest, "limit">,
   params: unknown[],
 ) {
   const bind = (value: unknown) => `$${params.push(value)}`;
-  const filters = [
-    "receipt.organization_id = $1",
-    "receipt.dropped_reason is not null",
-    NO_RECEIPT_RUNS,
-  ];
+  const filters = ["receipt.organization_id = $1", "receipt.dropped_reason is not null"];
   if (provider === "webhook") {
     filters.push("receipt.provider = 'manual' and receipt.source = 'webhook.received'");
   } else if (provider !== undefined) {
@@ -71,7 +70,8 @@ export async function readDroppedEventPage(
 ): Promise<DroppedEventPageRecord> {
   const { limit, position } = request;
   const params: unknown[] = [organizationId];
-  const scoped = `from provider_event_receipts receipt where ${receiptPageFilters(request, params)}`;
+  const scoped = `from provider_event_receipts receipt
+    where ${droppedReceiptFilters(request, params)} and ${NO_RECEIPT_RUNS}`;
   const boundary = `($${params.length + 1}::timestamptz, $${params.length + 2}::uuid)`;
   const after = position?.direction === "after";
   // Both keys are non-null. Preserve the exact order with the dropped-receipt indexes.
@@ -150,6 +150,32 @@ export async function readDroppedEventPage(
         ? keyOf(first)
         : null,
   };
+}
+
+export async function readDroppedEventPresence(
+  database: QueryHandle,
+  organizationId: string,
+  provider: ConnectionProvider,
+  receivedSince: Date,
+): Promise<DroppedEventPresence> {
+  const params: unknown[] = [organizationId];
+  const filters = droppedReceiptFilters({ provider, receivedSince }, params);
+  const limit = `$${params.push(DROPPED_EVENT_CANDIDATE_LIMIT)}`;
+  // Materialize the ordered index slice before probing for runs.
+  const { rows } = await database.query<{ presence: DroppedEventPresence }>(
+    `with candidates as materialized (
+       select receipt.id from provider_event_receipts receipt where ${filters}
+       order by receipt.received_at desc nulls first, receipt.id desc nulls first
+       limit ${limit}
+     )
+     select case
+       when exists (select 1 from candidates receipt where ${NO_RECEIPT_RUNS}) then 'some'
+       when (select count(*) from candidates) = ${limit} then 'unknown'
+       else 'none'
+     end as presence`,
+    params,
+  );
+  return rows[0]?.presence ?? "unknown";
 }
 
 export function groupDropCounts(
