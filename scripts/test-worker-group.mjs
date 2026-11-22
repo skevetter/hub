@@ -16,6 +16,7 @@ import { setTimeout as delay } from "node:timers/promises";
 export const testSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
 export const fullSuiteLockPath = process.env.HUB_TEST_FULLSUITE_LOCK || "/tmp/hub-fullsuite.lock";
 const gracePeriod = 5000;
+const exitGraceMs = 200;
 
 export function watchTestSignals() {
   const controller = new AbortController();
@@ -253,20 +254,23 @@ export async function runWorkerGroup(args, { cwd, env, log, lock, signal, graceM
 }
 
 export async function waitForTestGroup(child, { signal, lock, graceMs = gracePeriod, start }) {
-  const closed = new Promise((settle) => {
-    let error;
-    child.once("error", (cause) => {
-      error = cause;
-    });
-    child.once("close", (code, childSignal) => settle({ exitCode: code ?? 1, childSignal, error }));
+  const exited = new Promise((settle) => {
+    child.once("error", (error) => settle({ exitCode: 1, childSignal: null, error }));
+    child.once("exit", (code, childSignal) => settle({ exitCode: code ?? 1, childSignal }));
   });
-  if (!child.pid) return closed;
+  const closed = new Promise((settle) => child.once("close", settle));
+  if (!child.pid) {
+    await closed;
+    return exited;
+  }
+  // Descendants can keep the output pipes open after the leader exits.
+  const drainOutput = () => Promise.race([closed, delay(exitGraceMs, undefined, { ref: false })]);
   let stopping;
   const interrupted = Promise.withResolvers();
   const interrupt = () => {
     const reason = testSignals.includes(signal.reason) ? signal.reason : "SIGTERM";
     stopping ??= stopGroup(child.pid, reason, graceMs);
-    interrupted.resolve(stopping.then(() => closed));
+    interrupted.resolve(stopping.then(() => exited));
   };
   signal?.addEventListener("abort", interrupt, { once: true });
   let registered = false;
@@ -277,14 +281,18 @@ export async function waitForTestGroup(child, { signal, lock, graceMs = gracePer
       registered = Boolean(lock);
       start?.();
     }
-    return await Promise.race([closed, interrupted.promise]);
+    const result = await Promise.race([exited, interrupted.promise]);
+    await drainOutput();
+    return result;
   } finally {
     try {
-      stopping ??= stopGroup(child.pid, "SIGTERM", graceMs);
+      stopping ??= stopGroup(child.pid, "SIGTERM", exitGraceMs);
       await stopping;
-      await closed;
+      await drainOutput();
       if (registered) lock.forget(child.pid);
     } finally {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
       signal?.removeEventListener("abort", interrupt);
     }
   }

@@ -352,7 +352,8 @@ test("TERM after staging a receipt prevents its publication", async (t) => {
   const receiptDir = join(await realpath(directory), ".test-receipts");
   const marker = join(receiptDir, "staged");
   const preload = join(receiptDir, "pause-write.mjs");
-  await mkdir(receiptDir);
+  const temp = join(receiptDir, "tmp");
+  await mkdir(temp, { recursive: true });
   await writeFile(
     preload,
     `
@@ -376,7 +377,7 @@ test("TERM after staging a receipt prevents its publication", async (t) => {
   const caller = spawn(
     process.execPath,
     ["--import", preload, runner, "--root", directory, "--", process.execPath, "-e", ""],
-    { stdio: ["ignore", "pipe", "pipe"] },
+    { env: { ...process.env, TMPDIR: temp }, stdio: ["ignore", "pipe", "pipe"] },
   );
   const exited = once(caller, "close");
   let output = "";
@@ -402,8 +403,81 @@ test("TERM after staging a receipt prevents its publication", async (t) => {
     await assert.rejects(verifyReceipt(directory, head), /No test receipt exists/u);
     await assert.rejects(readFile(pending), { code: "ENOENT" });
     await assert.rejects(readFile(join(receiptDir, `${head}.lock`)), { code: "ENOENT" });
+    assert.deepEqual(await readdir(temp), []);
   } finally {
     if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+    await exited;
+  }
+});
+
+test("a receipt sweeps descendants holding the command's output pipes after the leader exits", async (t) => {
+  const { directory, head } = await gitFixture(t);
+  const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
+  const receiptDir = join(directory, ".test-receipts");
+  const marker = join(receiptDir, "descendant");
+  const temp = join(receiptDir, "tmp");
+  await mkdir(temp, { recursive: true });
+  const descendant = `
+    const { writeFileSync } = require("node:fs");
+    const marker = process.argv[1];
+    const timer = setInterval(() => {}, 1000);
+    process.on("SIGTERM", () => {
+      writeFileSync(marker + "-stopped", "SIGTERM");
+      clearInterval(timer);
+    });
+    writeFileSync(marker, String(process.pid));
+  `;
+  const leader = `
+    import { spawn } from "node:child_process";
+    import { existsSync } from "node:fs";
+    import { setTimeout as delay } from "node:timers/promises";
+    const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}, process.argv[1]],
+      { stdio: ["ignore", "inherit", "inherit"] });
+    child.unref();
+    while (!existsSync(process.argv[1])) await delay(10);
+    console.log("leader is exiting");
+  `;
+  const caller = spawn(
+    process.execPath,
+    [
+      runner,
+      "--root",
+      directory,
+      "--",
+      process.execPath,
+      "--input-type=module",
+      "-e",
+      leader,
+      marker,
+    ],
+    { env: { ...process.env, TMPDIR: temp }, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  const exited = once(caller, "close");
+  let output = "";
+  caller.stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+  caller.stderr.on("data", (chunk) => {
+    output += chunk;
+  });
+  try {
+    assert.deepEqual(await once(caller, "exit", { signal: AbortSignal.timeout(4000) }), [0, null]);
+    await exited;
+    assert.match(output, /^leader is exiting$/mu);
+    assert.equal(await readFile(marker + "-stopped", "utf8"), "SIGTERM");
+    await assert.rejects(readFile(join(receiptDir, `${head}.lock`)), { code: "ENOENT" });
+    assert.deepEqual(await readdir(temp), []);
+    await verifyReceipt(directory, head);
+  } finally {
+    if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+    const pid = Number(await readFile(marker, "utf8").catch(() => ""));
+    if (pid) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
     await exited;
   }
 });
