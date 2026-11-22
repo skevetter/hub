@@ -78,8 +78,8 @@ describe("organization checklist completion", () => {
 
     const owner = await ownerDashboard.snapshot(fixture.post(), fixture.slug);
     const member = await memberDashboard.snapshot(fixture.post(), fixture.slug);
-    assert.deepEqual(owner.sessions, { profiles: 1, open: 0, openCapped: false, started: false });
-    assert.deepEqual(member.sessions, { profiles: 1, open: 1, openCapped: false, started: true });
+    assert.deepEqual(owner.sessions, { open: 0, openCapped: false, started: false });
+    assert.deepEqual(member.sessions, { open: 1, openCapped: false, started: true });
     assert.deepEqual(
       deriveChecklist(owner).steps.find(({ key }) => key === "session"),
       {
@@ -98,7 +98,6 @@ describe("organization checklist completion", () => {
       "set",
     );
     assert.deepEqual((await ownerDashboard.snapshot(fixture.post(), fixture.slug)).sessions, {
-      profiles: 1,
       open: 1,
       openCapped: false,
       started: true,
@@ -118,7 +117,6 @@ describe("organization checklist completion", () => {
       "accepted",
     );
     assert.deepEqual((await memberDashboard.snapshot(fixture.post(), fixture.slug)).sessions, {
-      profiles: 1,
       open: 0,
       openCapped: false,
       started: true,
@@ -132,7 +130,6 @@ describe("organization checklist completion", () => {
       const before = await dashboard.snapshot(fixture.post(), fixture.slug);
       assert.equal(before.checklistCompletedAt, null);
       assert.deepEqual(before.sessions, {
-        profiles: 0,
         open: 0,
         openCapped: false,
         started: false,

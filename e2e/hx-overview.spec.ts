@@ -82,6 +82,43 @@ test("Home reserves the loaded tile heights on a 390 px viewport", async ({ hub,
   expect(await dimensions(page.locator("main"))).toEqual(loadingHeights);
 });
 
+test("Home gets the profile step and session form from one fetch", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const slug = await hub.connectProviderDaemon("owner", "Acme");
+  await hub.primaryApplication().query(
+    `insert into interactive_session_profiles (id, organization_id, name, daemon_id, cwd, provider, status)
+     select gen_random_uuid(), organization_id, 'Shared Home profile', id, '/workspace', 'codex', 'active'
+     from daemons where slug = $1`,
+    [slug],
+  );
+  let releaseProfiles = () => {};
+  const heldProfiles = new Promise<void>((resolve) => {
+    releaseProfiles = resolve;
+  });
+  let profileRequests = 0;
+  await page.route("**/_serverFn/**", async (route) => {
+    const response = await route.fetch();
+    const body = await response.text();
+    if (body.includes("Shared Home profile")) {
+      profileRequests += 1;
+      await heldProfiles;
+    }
+    await route.fulfill({ response, body });
+  });
+  await page.reload();
+  const row = page.getByRole("listitem").filter({ hasText: "Create a session profile" });
+  try {
+    await expect(row).toContainText("Checking profiles");
+    await expect(row).not.toContainText("To do");
+  } finally {
+    releaseProfiles();
+  }
+  await expect(row).toContainText("Done");
+  await expect(page.getByRole("heading", { name: "Start a session" })).toBeVisible();
+  expect(profileRequests).toBe(1);
+});
+
 test("reads Home as figures, a checklist the member can put away, and prompts to try", async ({
   hub,
   page,

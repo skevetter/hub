@@ -7,6 +7,7 @@ import { describe, it, vi } from "vitest";
 import type * as Alerts from "../components/app/failure-alert.js";
 import type { Snapshot } from "../queries/index.js";
 import type { HomeSnapshot } from "./dashboard.js";
+import type { ProfileAvailability } from "./checklist.js";
 import { HomePanel, runHint } from "./panel.js";
 
 const view = vi.hoisted(
@@ -14,11 +15,13 @@ const view = vi.hoisted(
     snapshot?: Snapshot<HomeSnapshot>;
     operator: boolean;
     sessionsEnabled: boolean;
+    profiles: ProfileAvailability;
     onRetry?: () => void;
     refetch: ReturnType<typeof vi.fn>;
   } => ({
     operator: true,
     sessionsEnabled: false,
+    profiles: 0,
     refetch: vi.fn(),
   }),
 );
@@ -31,18 +34,39 @@ vi.mock("@tanstack/react-router", () => ({
   Link: ({ to, children }: { to: string; children: ReactNode }) => <a href={to}>{children}</a>,
 }));
 vi.mock("../projects/context.js", () => ({
-  useRouteTenant: () => ({ account: { id: "user" }, organization: { id: "org", slug: "acme" } }),
+  useRouteTenant: () => ({
+    account: { id: "user" },
+    organization: { id: "org", slug: "acme" },
+    capabilities: { manageResources: true },
+  }),
 }));
 vi.mock("../auth/active-account.js", () => ({
   useActiveAccount: () => ({
+    account: { id: "user" },
     isInstanceOperator: view.operator,
     features: view.sessionsEnabled ? { interactiveSessions: true } : undefined,
   }),
 }));
 vi.mock("../queries/index.js", () => ({
-  useSnapshotQuery: () => ({ ...view.snapshot, refetch: view.refetch, isFetching: false }),
+  useSnapshotQuery: ({ queryKey }: { queryKey: readonly string[] }) => {
+    if (queryKey[0] !== "session-profiles") {
+      return { ...view.snapshot, refetch: view.refetch, isFetching: false };
+    }
+    if (view.profiles === "checking") return { status: "pending" };
+    if (view.profiles === "unavailable") return { status: "error" };
+    return {
+      status: "success",
+      data:
+        view.profiles === null
+          ? { outcome: "refused", code: "not_found" }
+          : Array.from({ length: view.profiles }, () => ({ status: "active" })),
+    };
+  },
 }));
-vi.mock("../interactive-sessions/ui/new-session.js", () => ({ HomeSessionStart: () => null }));
+vi.mock("../interactive-sessions/ui/new-session.js", () => ({
+  HomeSessionStart: () => null,
+  sessionProfileQueryOptions: () => ({ queryKey: ["session-profiles"] }),
+}));
 vi.mock("../components/app/failure-alert.js", async (importOriginal) => {
   const alerts = await importOriginal<typeof Alerts>();
   return {
@@ -99,8 +123,13 @@ function tile(markup: string, label: string): string {
   return markup.slice(start, markup.indexOf("</section>", start)).replaceAll(/<[^>]+>/gu, " ");
 }
 
-function renderHome(snapshot: HomeSnapshot, operator = true) {
-  return renderHomeQuery({ status: "success", data: snapshot, error: null }, operator);
+function renderHome(snapshot: HomeSnapshot, operator = true, profiles: ProfileAvailability = 0) {
+  view.profiles = profiles;
+  return renderHomeQuery(
+    { status: "success", data: snapshot, error: null },
+    operator,
+    snapshot.sessions !== null,
+  );
 }
 
 function renderHomeQuery(
@@ -171,7 +200,7 @@ describe("Home checklist", () => {
   it("offers Finish setup alongside unfinished personal steps when sessions are on", () => {
     const markup = renderHome({
       ...ready,
-      sessions: { profiles: 0, open: 0, openCapped: false, started: false },
+      sessions: { open: 0, openCapped: false, started: false },
     });
     assert.match(markup, /<button[^>]*>Finish setup<\/button>/u);
     assert.match(markup, /Start a session<span class="sr-only"> To do<\/span>/u);
@@ -211,11 +240,15 @@ describe("Home figures", () => {
 
   it("shows the reader's open sessions only while sessions are on", () => {
     assert.doesNotMatch(renderHome(ready), /Open sessions/u);
-    const markup = renderHome({
-      ...ready,
-      sessions: { profiles: 1, open: 50, openCapped: true, started: true },
-    });
-    assert.match(tile(markup, "Open sessions"), /50\+\s+1 profile/u);
+    const markup = renderHome(
+      {
+        ...ready,
+        sessions: { open: 200, openCapped: true, started: true },
+      },
+      true,
+      1,
+    );
+    assert.match(tile(markup, "Open sessions"), /200\+\s+1 active profile/u);
   });
 });
 
@@ -283,14 +316,27 @@ describe("Home getting started", () => {
   });
 
   it("adds the session steps, with their links, while sessions are on", () => {
-    const markup = renderHome({
-      ...fresh,
-      sessions: { profiles: 1, open: 0, openCapped: false, started: false },
-    });
+    const markup = renderHome(
+      {
+        ...fresh,
+        sessions: { open: 0, openCapped: false, started: false },
+      },
+      true,
+      1,
+    );
     assert.match(markup, /1 of 6 done/u);
     assert.match(markup, /Create a session profile<span class="sr-only"> Done<\/span>/u);
     assert.match(markup, /Start a session<span class="sr-only"> To do<\/span>/u);
     assert.match(markup, /<a href="\/o\/acme\/sessions\/new">New session<\/a>/u);
+  });
+
+  it("shows a checking profile step and omits it when profile access is refused", () => {
+    const data = { ...fresh, sessions: { open: 0, openCapped: false, started: false } };
+    const checking = renderHome(data, true, "checking");
+    assert.match(checking, /Create a session profile<span class="sr-only"> Checking profiles/u);
+    assert.doesNotMatch(checking, /Create a session profile<span class="sr-only"> To do/u);
+    const refused = renderHome(data, true, null);
+    assert.doesNotMatch(refused, /Create a session profile|>Sessions<\/button>/u);
   });
 
   it("names a connection that needs authorization alongside a healthy connection", () => {
@@ -320,7 +366,7 @@ describe("Home things to try", () => {
     assert.doesNotMatch(renderHome(fresh), />Sessions<\/button>/u);
     const markup = renderHome({
       ...fresh,
-      sessions: { profiles: 0, open: 0, openCapped: false, started: false },
+      sessions: { open: 0, openCapped: false, started: false },
     });
     assert.match(markup, /Sessions<\/button>/u);
   });
