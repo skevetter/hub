@@ -75,3 +75,7 @@ keeps the lock while any workers remain. A new full run reports and reclaims a s
 checking its workers. For manual recovery, inspect the lock with `cat /tmp/hub-fullsuite.lock` and
 check its PID and process groups with `ps -axo pid,pgid,lstart,stat,command`. Run
 `unlink /tmp/hub-fullsuite.lock` only after confirming that its owner and worker groups have exited.
+
+Package, Vitest config and setup changes select the full Vitest suite. When a selection covers
+every Vitest file, the command prints a full-suite banner and hands off to the parallel runner,
+which takes the full-suite lock.
