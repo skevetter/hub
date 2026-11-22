@@ -68,3 +68,10 @@ When tests add a file read, regenerate the map with
 `node scripts/generate-test-runtime-files.mjs` and commit the JSON. The script tests check that the
 map matches the current reads. Resolve new dynamic paths in the generator when static analysis
 cannot determine their directory.
+
+The parallel runner records its PID, start time and worker groups in the full-suite lock on macOS
+and Linux. On interrupt it gives each group five seconds to stop, sends SIGKILL if needed, and
+keeps the lock while any workers remain. A new full run reports and reclaims a stale lock after
+checking its workers. For manual recovery, inspect the lock with `cat /tmp/hub-fullsuite.lock` and
+check its PID and process groups with `ps -axo pid,pgid,lstart,stat,command`. Run
+`unlink /tmp/hub-fullsuite.lock` only after confirming that its owner and worker groups have exited.
