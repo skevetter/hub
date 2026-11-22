@@ -145,6 +145,7 @@ export function WarningAlert({
   title,
   action,
   standalone = false,
+  passive = false,
   children,
 }: {
   title?: string;
@@ -152,11 +153,14 @@ export function WarningAlert({
   action?: ReactNode;
   /** Set when the alert stands in a page stack rather than inside a form, dialog, or section. */
   standalone?: boolean;
+  /** Set for warnings derived from the page snapshot. */
+  passive?: boolean;
   children: ReactNode;
 }) {
   return (
     <Alert
       variant="warning"
+      role={passive ? undefined : "alert"}
       icon={WARNING_GLYPH}
       className={standaloneClass(standalone)}
       {...(title === undefined ? {} : { title })}
