@@ -115,6 +115,15 @@ function catalogQuery() {
   return query;
 }
 
+it("groups profile settings and explains the controls", () => {
+  const html = renderForm();
+  expect(html).toContain(">Where it runs</h2>");
+  expect(html).toContain(">Agent settings</h2>");
+  expect(html).toContain("The connected machine that runs the agent.");
+  expect(html).toContain("Controls the agent&#x27;s permission mode.");
+  expect(html).toContain("Choose a thinking setting if the model supports one.");
+});
+
 async function awaitRead(count: number) {
   expect(loadProviders).toHaveBeenCalledTimes(count);
   await loadProviders.mock.results[count - 1]?.value;
