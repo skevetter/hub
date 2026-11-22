@@ -111,7 +111,8 @@ which takes the full-suite lock. `test:changed` starts each child command in its
 group. It forwards SIGINT, SIGTERM and SIGHUP to the group. Selected-test groups get three seconds
 to stop before it sends SIGKILL. The parallel runner gets time to stop its own shards. The
 receipt wrapper also forwards these signals and waits for its command to stop. Both commands
-remove their temporary files and exit 1 with an `INTERRUPTED` line. All three runners fail if
-they have to stop background children after a command exits successfully.
+remove their temporary files and exit 1 with an `INTERRUPTED` line. After a successful command
+exits, all three runners give background children up to two seconds to finish on their own.
+The run fails if the runner still has to stop them.
 
 Set `HUB_TEST_FULLSUITE_LOCK` to use a different lock path, for example in a scratch checkout.

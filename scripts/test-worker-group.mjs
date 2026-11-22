@@ -17,6 +17,7 @@ export const testSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
 export const fullSuiteLockPath = process.env.HUB_TEST_FULLSUITE_LOCK || "/tmp/hub-fullsuite.lock";
 const gracePeriod = 5000;
 const exitGraceMs = 200;
+const backgroundGraceMs = 2000;
 
 export function watchTestSignals() {
   const controller = new AbortController();
@@ -64,10 +65,10 @@ function signalGroup(pid, signal) {
   }
 }
 
-async function waitForGroup(pid, duration) {
+async function waitForGroup(pid, duration, signal) {
   const deadline = performance.now() + duration;
   while (groupAlive(pid)) {
-    if (performance.now() >= deadline) return false;
+    if (signal?.aborted || performance.now() >= deadline) return false;
     await delay(50);
   }
   return true;
@@ -278,6 +279,7 @@ export async function waitForTestGroup(child, { signal, lock, graceMs = gracePer
   let registered = false;
   let result;
   let stoppedBackground = false;
+  let groupExited = false;
   try {
     if (signal?.aborted) interrupt();
     else {
@@ -286,11 +288,15 @@ export async function waitForTestGroup(child, { signal, lock, graceMs = gracePer
       start?.();
     }
     result = await Promise.race([exited, interrupted.promise]);
-    await drainOutput();
+    if (result.exitCode === 0 && !signal?.aborted) {
+      groupExited = await waitForGroup(child.pid, backgroundGraceMs, signal);
+    } else {
+      await drainOutput();
+    }
   } finally {
     try {
       if (stopping) await stopping;
-      else {
+      else if (!groupExited) {
         stopping = stopGroup(child.pid, "SIGTERM", exitGraceMs);
         stoppedBackground = await stopping;
       }
