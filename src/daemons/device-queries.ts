@@ -54,8 +54,8 @@ export function useDeviceProviders(
         : false,
   });
   const { data, error, isFetching, isPending, refetch } = query;
-  const retry = useCallback(() => {
-    void refetch({ cancelRefetch: false });
+  const retry = useCallback(async () => {
+    await refetch({ cancelRefetch: false });
   }, [refetch]);
   return useMemo(() => {
     if (!connected || isPending) return undefined;
