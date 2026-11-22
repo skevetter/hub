@@ -87,7 +87,7 @@ function ConnectionsLoading() {
   return (
     <Section className={GRID_COLUMNS}>
       {PROVIDER_CARDS.map(({ provider }) => (
-        <CardSkeleton key={provider} animated={false} />
+        <CardSkeleton key={provider} />
       ))}
     </Section>
   );
@@ -245,6 +245,12 @@ function ConnectionsContent() {
                   </Link>
                 </div>
               ) : null}
+              <ConnectionHint
+                label={label}
+                status={status}
+                canManage={canManage}
+                isInstanceOperator={isInstanceOperator}
+              />
               {canManage ? (
                 <ConnectionAction
                   label={label}
@@ -261,6 +267,36 @@ function ConnectionsContent() {
       </Section>
     </>
   );
+}
+
+/** A card with no action still says what has to happen before there is one. */
+function ConnectionHint({
+  label,
+  status,
+  canManage,
+  isInstanceOperator,
+}: {
+  label: string;
+  status: ProviderStatus;
+  canManage: boolean;
+  isInstanceOperator: boolean;
+}) {
+  if (status === "notConfigured") {
+    return (
+      <p className="text-sm text-muted-foreground">
+        This Hub has no {label} app yet.
+        {isInstanceOperator ? null : " An instance operator sets one up before anyone can connect."}
+      </p>
+    );
+  }
+  if (status === "disconnected" && !canManage) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        Someone who manages this organization can connect {label}.
+      </p>
+    );
+  }
+  return null;
 }
 
 function ConnectionAction({
@@ -283,7 +319,7 @@ function ConnectionAction({
     if (!isInstanceOperator) return null;
     return (
       <div>
-        <Button variant="outline" size="sm" className="motion-reduce:transition-none" asChild>
+        <Button variant="outline" size="sm" asChild>
           <Link to="/apps">Set up the {label} app</Link>
         </Button>
       </div>
@@ -291,13 +327,7 @@ function ConnectionAction({
   }
   return (
     <div>
-      <Button
-        disabled={busy}
-        variant="outline"
-        size="sm"
-        className="motion-reduce:transition-none"
-        onClick={handleConnect}
-      >
+      <Button disabled={busy} variant="outline" size="sm" onClick={handleConnect}>
         {ACTION_VERBS[status]} {label}
       </Button>
     </div>
