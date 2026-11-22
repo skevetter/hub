@@ -15,6 +15,7 @@ export function TwoLine({
   secondary,
   mono = false,
   path = false,
+  heading = false,
 }: {
   primary: ReactNode;
   secondary?: ReactNode;
@@ -25,17 +26,25 @@ export function TwoLine({
    * so it gives way from the start and keeps its end.
    */
   path?: boolean;
+  /** Give a card a heading and let its identity wrap on a narrow screen. */
+  heading?: boolean;
 }) {
+  const Frame = heading ? "div" : "span";
+  const Primary = heading ? "h2" : "span";
+  const overflow = heading ? "break-words" : "truncate";
   return (
     // In a filling cell the record also takes the row it sits in, beside a glyph or not, so its
     // secondary line has the whole column to give way in rather than the primary line's width.
-    <span className="flex min-w-0 flex-col gap-0.5 in-data-[slot=fill-cell]:grow">
-      <span
-        className="truncate text-sm in-data-[slot=record-row]:wrap-anywhere in-data-[slot=record-row]:whitespace-normal"
+    <Frame className="flex min-w-0 flex-col gap-0.5 in-data-[slot=fill-cell]:grow">
+      <Primary
+        className={cn(
+          overflow,
+          "text-sm in-data-[slot=record-row]:wrap-anywhere in-data-[slot=record-row]:whitespace-normal",
+        )}
         title={titleOf(primary)}
       >
         {primary}
-      </span>
+      </Primary>
       {secondary === undefined ? null : (
         <span
           className={cn(
@@ -43,7 +52,8 @@ export function TwoLine({
             // line takes whatever that leaves: a model under a name, a path under a daemon, a
             // connection under an event. Otherwise one long path would claim the width a
             // neighbouring column needs for the fact a reader is scanning for.
-            "truncate text-xs text-muted-foreground in-data-[slot=fill-cell]:w-0 in-data-[slot=fill-cell]:min-w-full",
+            overflow,
+            "text-xs text-muted-foreground in-data-[slot=fill-cell]:w-0 in-data-[slot=fill-cell]:min-w-full",
             (mono || path) && "font-mono",
             path && "text-left",
           )}
@@ -55,7 +65,7 @@ export function TwoLine({
           {path ? <bdi dir="ltr">{secondary}</bdi> : secondary}
         </span>
       )}
-    </span>
+    </Frame>
   );
 }
 
