@@ -23,8 +23,18 @@ mise exec node@24.22.0 -- npm run test:scripts
 mise exec node@24.22.0 -- npm run test:parallel
 ```
 
-After a sharded failure, `npm run test:parallel -- --rerun-failed` runs the recorded failed files in
-one process. A failure that passes on rerun can be sensitive to machine load.
+Each shard gets its own temporary directory, application data and Vite cache. Mise shims keep
+using the caller's installed tools so child commands such as `python3` can start with the same
+toolchain.
+
+After a sharded failure or interruption, `npm run test:parallel -- --rerun-failed` runs the
+recorded failed and unfinished files in one process. Interrupted runs show how many files did not
+report in a separate line. A failure that passes on rerun can be sensitive to machine load.
+
+The test commands and runtime-file map generator print the target root, branch, HEAD, worktree
+status, current directory and planned action. Calling a script by path from a different Git
+worktree requires `--root <path>` to identify the worktree to test. The runners use that
+worktree's dependencies and Vitest configuration.
 
 ## Run tests affected by a change
 
@@ -33,9 +43,11 @@ mise exec node@24.22.0 -- npm run test:changed
 mise exec node@24.22.0 -- npm run test:changed -- --base origin/main --safe
 ```
 
-The command tries the merge base with `origin/main`, local `main`, the configured upstream, then
-the previous release branch in numeric version order. `--base` accepts an explicit local Git ref.
-Staged, unstaged, and untracked changes are included.
+The command picks the local or remote release branch whose merge base has the fewest commits to
+HEAD. The highest version wins ties. A checkout on a release branch considers earlier versions
+in its release series. If no release has a merge base, the command tries the configured upstream
+then `origin/main`. It prints the selected base and reason. `--base` accepts an explicit local
+Git ref. Staged, unstaged, and untracked changes are included.
 
 The command runs changed test files and uses Vitest's static import graph to find related tests. It
 also checks the generated route tree and runs the typography policy. Changes under `drizzle/` run
@@ -47,8 +59,9 @@ with no relevant tests may need a targeted test or a full run. Check the printed
 
 ## Record test evidence
 
-Run receipt commands from a clean commit. The default command is `npm run test:changed`. Pass a
-command explicitly to record a different test or check.
+Run receipt commands from a clean commit. The default runs the changed-test runner in the
+selected worktree with the same base-selection rules. Pass a command explicitly to record a
+different test or check.
 
 ```sh
 mise exec node@24.22.0 -- npm run test:receipt
@@ -56,8 +69,9 @@ mise exec node@24.22.0 -- npm run test:receipt -- -- npm run typecheck
 mise exec node@24.22.0 -- npm run test:receipt -- --verify "$(git rev-parse HEAD)"
 ```
 
-The ignored `.test-receipts/<sha>.json` file records green commands, their elapsed times, and any
-file selections and counts reported by the test runner. A failed command or a dirty checkout cannot
+The ignored `.test-receipts/<sha>.json` file records green commands, their worktree roots,
+branches and commits, their elapsed times, and any file selections and counts reported by the
+test runner. A failed command or a dirty checkout cannot
 add evidence. Reviewers can use the receipt for that exact SHA and run checks missing from it.
 
 Receipts bind each command to the commit and tree and hash the canonical JSON and command logs with
@@ -80,4 +94,5 @@ check its PID and process groups with `ps -axo pid,pgid,lstart,stat,command`. Ru
 
 Package, Vitest config and setup changes select the full Vitest suite. When a selection covers
 every Vitest file, the command prints a full-suite banner and hands off to the parallel runner,
-which takes the full-suite lock.
+which takes the full-suite lock. During that handoff, `test:changed` forwards SIGINT, SIGTERM
+and SIGHUP to the parallel runner's process group and waits for it to exit.
