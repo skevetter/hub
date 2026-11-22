@@ -39,6 +39,7 @@ import { ActiveAccountProvider } from "../auth/active-account.js";
 import type { Result } from "../contract/respond.js";
 import { ACCOUNT_MUTATION_KEY, useAccountMutationError } from "../auth/account-mutation.js";
 import { useTenantContextMutationPending } from "../auth/tenant-mutation.js";
+import { leaveReader } from "../auth/reader-cache.js";
 import {
   RouteTenantProvider,
   useOptionalRouteTenant,
@@ -68,6 +69,17 @@ type CreateOrganizationCommandResult = Result<{
 }>;
 
 export function DashboardShell({ account }: { account: ActiveAccount }) {
+  const actions = useDashboardAccountActions();
+  return (
+    <SidebarProvider>
+      <RouteTenantProvider>
+        <DashboardContent account={account} {...actions} />
+      </RouteTenantProvider>
+    </SidebarProvider>
+  );
+}
+
+function useDashboardAccountActions() {
   const createOrganizationCommand = useAccountCommand(
     useServerFn(createOrganization) as (
       input: Parameters<typeof createOrganization>[0],
@@ -77,6 +89,7 @@ export function DashboardShell({ account }: { account: ActiveAccount }) {
     useServerFn(signOut) as (
       input: Parameters<typeof signOut>[0],
     ) => Promise<Result<Record<string, never>>>,
+    { signsOut: true },
   );
   const selectOrganizationCommand = useAccountCommand(
     useServerFn(selectOrganization) as (
@@ -97,7 +110,9 @@ export function DashboardShell({ account }: { account: ActiveAccount }) {
     mutationFn: ({ input }: { input: Parameters<typeof selectOrganization>[0]; slug: string }) =>
       selectOrganizationCommand(input),
     onSuccess: (result, variables) => {
-      if (result.status === "ok") window.location.assign(`/o/${variables.slug}/home`);
+      if (result.status === "ok" && result.data.state === "complete") {
+        window.location.assign(`/o/${variables.slug}/home`);
+      }
     },
   });
   const leave = useMutation({
@@ -114,21 +129,14 @@ export function DashboardShell({ account }: { account: ActiveAccount }) {
     [select],
   );
   const leaveAccount = useCallback(() => leave.mutate({}), [leave]);
-  return (
-    <SidebarProvider>
-      <RouteTenantProvider>
-        <DashboardContent
-          account={account}
-          busy={tenantContextMutationsPending}
-          transitioning={tenantContextTransitioning}
-          error={failed}
-          onCreateOrganization={createAccount}
-          onSelectOrganization={selectAccount}
-          onSignOut={leaveAccount}
-        />
-      </RouteTenantProvider>
-    </SidebarProvider>
-  );
+  return {
+    busy: tenantContextMutationsPending,
+    transitioning: tenantContextTransitioning,
+    error: failed,
+    onCreateOrganization: createAccount,
+    onSelectOrganization: selectAccount,
+    onSignOut: leaveAccount,
+  };
 }
 
 function DashboardContent({
@@ -187,17 +195,18 @@ function DashboardContent({
 
 function useAccountCommand<TInput, TResult extends Result<unknown>>(
   command: (input: TInput) => Promise<TResult>,
+  { signsOut = false }: { signsOut?: boolean } = {},
 ): (input: TInput) => Promise<TResult> {
   const queryClient = useQueryClient();
   return useCallback(
     async (input: TInput) => {
       const result = await command(input);
-      if (result.status === "ok") {
-        await queryClient.invalidateQueries({ queryKey: ["account"] });
-      }
+      if (result.status !== "ok") return result;
+      if (signsOut) leaveReader(queryClient);
+      else await queryClient.invalidateQueries({ queryKey: ["account"] });
       return result;
     },
-    [command, queryClient],
+    [command, queryClient, signsOut],
   );
 }
 

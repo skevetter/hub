@@ -1,6 +1,6 @@
 import { useSnapshotQuery } from "../queries/index.js";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useState } from "react";
+import { useCallback, useState, useSyncExternalStore } from "react";
 import { accountState } from "./functions.js";
 import { DaemonHandoffEntry } from "../daemons/handoff.js";
 import { AccountEntry, InvitationEntry, OrganizationGate } from "./account-entry.js";
@@ -10,8 +10,16 @@ import { InstanceSetupEntry } from "./instance-setup-entry.js";
 import { AppSetupEntry } from "../provider-applications/panel.js";
 import { PasswordChangeEntry } from "./password-change.js";
 import { EmailVerificationResult, PasswordResetEntry } from "./account-recovery.js";
+import type { AccountState } from "./organization-contract.js";
+import { readerChange } from "./reader-cache.js";
 
 export function AccountApp() {
+  const reloading = useSyncExternalStore(
+    readerChange.subscribe,
+    readerChange.getSnapshot,
+    readerChange.getSnapshot,
+  );
+  if (reloading) return <LoadingEntry />;
   const authCallback = readAuthCallback();
   if (authCallback !== undefined) return <AuthCallbackEntry callback={authCallback} />;
   return <AccountApplication />;
@@ -19,14 +27,6 @@ export function AccountApp() {
 
 function AccountApplication() {
   const loadAccount = useServerFn(accountState);
-  /**
-   * The first-run phase between finishing app setup and the dashboard. A phase, not a gate: app
-   * onboarding is already complete on the server, so this tab is the only thing that remembers
-   * it, the CLI's own tab reaches its authorization page, and a reload lands on the dashboard.
-   */
-  const [handoff, setHandoff] = useState(false);
-  const enterHandoff = useCallback(() => setHandoff(true), []);
-  const leaveHandoff = useCallback(() => setHandoff(false), []);
   const search =
     typeof window === "undefined" ? undefined : new URLSearchParams(window.location.search);
   const invitation = search?.get("invitation") ?? undefined;
@@ -45,7 +45,14 @@ function AccountApplication() {
       />
     );
   }
-  const state = account.data;
+  return <ResolvedAccount state={account.data} />;
+}
+
+function ResolvedAccount({ state }: { state: AccountState }) {
+  // App onboarding is complete on the server before the tab-only handoff starts.
+  const [handoff, setHandoff] = useState(false);
+  const enterHandoff = useCallback(() => setHandoff(true), []);
+  const leaveHandoff = useCallback(() => setHandoff(false), []);
   if (handoff && (state.status === "appSetupRequired" || state.status === "active")) {
     return (
       <DaemonHandoffEntry
@@ -62,6 +69,14 @@ function AccountApplication() {
   if (state.status === "appSetupRequired") {
     return <AppSetupEntry organizationId={state.organization.id} onLeft={enterHandoff} />;
   }
+  return <OrganizationEntry state={state} />;
+}
+
+function OrganizationEntry({
+  state,
+}: {
+  state: Extract<AccountState, { status: "signedOut" | "organizationRequired" | "active" }>;
+}) {
   if (state.invitationUnavailable === true) {
     return <UnavailableInvitation message="This invitation is unavailable." />;
   }
@@ -70,7 +85,7 @@ function AccountApplication() {
     return <InvitationEntry account={state} invitation={state.invitation} />;
   }
   if (state.status === "organizationRequired") return <OrganizationGate account={state} />;
-  return <DashboardShell key={state.account.id} account={state} />;
+  return <DashboardShell account={state} />;
 }
 
 type AuthCallback =
