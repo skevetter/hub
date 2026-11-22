@@ -904,3 +904,35 @@ function parseLinearScopes(scope: string | undefined): string[] {
     ),
   ].sort();
 }
+
+export { hasUsableLinearAccessToken };
+
+export async function requestLinearAgentGraphql(
+  request: typeof fetch,
+  accessToken: string,
+  query: string,
+  variables: Record<string, unknown>,
+  signal: AbortSignal,
+  now: () => Date,
+): Promise<unknown> {
+  const response = await linearRequest(request, "https://api.linear.app/graphql", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+    redirect: "error",
+    signal,
+  });
+  if (
+    !response.ok &&
+    (response.status >= 500 || LINEAR_HEADER_FAILURE_STATUSES.has(response.status))
+  ) {
+    discardResponseBody(response);
+    throw new LinearApiError(`Linear GraphQL HTTP ${response.status}`, response.status);
+  }
+  const result = await readApiResponseJson(response, signal);
+  checkGraphqlResponse(response, result, now);
+  return result;
+}
