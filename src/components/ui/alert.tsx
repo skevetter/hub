@@ -89,7 +89,7 @@ function AlertDescription({ className, ...props }: React.ComponentProps<"div">) 
   return (
     <div
       data-slot="alert-description"
-      className={cn("grid min-w-0 justify-items-start gap-2 text-current", className)}
+      className={cn("grid min-w-0 justify-items-start gap-2 wrap-anywhere text-current", className)}
       {...props}
     />
   );
