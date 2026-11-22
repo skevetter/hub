@@ -1,6 +1,6 @@
 import { ProductRequestError } from "../auth/organization-access.js";
 import type { AuthServer } from "../auth/server.js";
-import { isScriptStep, parseCompiledHubConfig } from "../config/compiler.js";
+import { isScriptStep, parseCompiledHubConfig, type CompiledTrigger } from "../config/compiler.js";
 import type { SessionPrincipal } from "../interactive-sessions/types.js";
 import type {
   Database,
@@ -65,6 +65,8 @@ export interface HomeSnapshot {
     event: string;
     enabled: boolean;
     hasReplyOutput?: boolean;
+    /** Text to put before an example. Null means the reader must evaluate the filters. */
+    commentPrefix?: string | null;
   }[];
   runs: readonly (Omit<OrganizationRunRecord, "receivedAt"> & { receivedAt: string })[];
   /** Every run in the last 24 hours and the last `HOME_MONTH_DAYS` days, not only the ones listed. */
@@ -198,7 +200,7 @@ export class HomeDashboard {
       triggers: triggers.map((trigger, index) =>
         Object.assign(
           { id: trigger.id, name: trigger.name, enabled: trigger.enabled },
-          triggerFacts(revisions[index], trigger.format),
+          triggerFacts(revisions[index], trigger.format, connections.github),
         ),
       ),
       runs: runs.map((run) => ({
@@ -252,7 +254,8 @@ function tally(counts: readonly OrganizationRunCount[]): RunTally {
 function triggerFacts(
   revision: OrganizationTriggerRevisionRecord | undefined,
   format: "single_run" | "legacy_multistep",
-): Pick<HomeSnapshot["triggers"][number], "event" | "hasReplyOutput"> {
+  githubConnections: OrganizationConnectionUsage["github"],
+): Pick<HomeSnapshot["triggers"][number], "event" | "hasReplyOutput" | "commentPrefix"> {
   if (revision === undefined) return { event: "manual.run" };
   const projection = projectTriggerForm(revision.yaml);
   const primaryEvent = projection.status === "editable" ? projection.value.event : undefined;
@@ -269,5 +272,47 @@ function triggerFacts(
   const hasReplyOutput = comment?.steps.some(
     (step) => !isScriptStep(step) && step.allowOutputs.some(({ type }) => type === replyType),
   );
-  return hasReplyOutput === true ? { event, hasReplyOutput } : { event };
+  if (comment === undefined) return { event };
+  const prefix = commentPrefix(comment, githubConnections);
+  return {
+    event,
+    ...(hasReplyOutput === true ? { hasReplyOutput } : {}),
+    ...(prefix === undefined ? {} : { commentPrefix: prefix }),
+  };
+}
+
+function commentPrefix(
+  trigger: CompiledTrigger,
+  connections: OrganizationConnectionUsage["github"],
+): string | null | undefined {
+  const filters = trigger.filters;
+  // Linear matches specific actor IDs and has no wildcard audience.
+  if (!trigger.on.startsWith("github.") || filters === undefined) return null;
+  const {
+    pattern = "",
+    contains = "",
+    from_users,
+    connection,
+    connectionId,
+    ...constraints
+  } = filters;
+  if (
+    from_users?.includes("*") !== true ||
+    Object.values(constraints).some((value) => value !== undefined) ||
+    Object.values(trigger.inputs).some(({ required }) => required)
+  ) {
+    return null;
+  }
+  if (connection !== undefined || connectionId !== undefined) {
+    const healthy = connections.filter(({ status }) => status !== "suspended");
+    const [only] = healthy;
+    if (
+      healthy.length !== 1 ||
+      (connection !== undefined && only?.slug !== connection) ||
+      (connectionId !== undefined && only?.id !== connectionId)
+    )
+      return null;
+  }
+  const text = [pattern, pattern.includes(contains) ? "" : contains].filter(Boolean).join(" ");
+  return text === "" ? undefined : text;
 }
