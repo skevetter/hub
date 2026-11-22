@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "vitest";
+import { afterEach, describe, it, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import { turnEndFixture } from "../daemons/test-utils/turn-end-fixture.js";
 import { TURN_END_SETTLE_MS } from "../daemons/turn-end.js";
@@ -57,4 +57,47 @@ describe("run reply reporting", () => {
       }
     },
   );
+
+  describe("polling", () => {
+    afterEach(() => vi.useRealTimers());
+
+    function countingReporter() {
+      const database = createMemoryDatabase();
+      let queries = 0;
+      const recoverable = database.runReplies.recoverable.bind(database.runReplies);
+      database.runReplies.recoverable = (before) => {
+        queries += 1;
+        return recoverable(before);
+      };
+      const find = database.findTriggerRunForOrganization.bind(database);
+      database.findTriggerRunForOrganization = (...args) => {
+        queries += 1;
+        return find(...args);
+      };
+      const reporter = new RunReplyReporter({ database, writer: () => undefined, perHour: 60 });
+      return { reporter, queries: () => queries };
+    }
+
+    it("barely queries the database while nothing is waiting", async () => {
+      vi.useFakeTimers();
+      const { reporter, queries } = countingReporter();
+      reporter.start();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await reporter.stop();
+      assert.ok(queries() <= 2, `${queries()} queries in an idle minute`);
+    });
+
+    it("polls every 2 seconds while a captured answer waits and returns to idle after", async () => {
+      vi.useFakeTimers();
+      const { reporter, queries } = countingReporter();
+      reporter.start();
+      reporter.capture({ organizationId: "org", runId: "missing-run" }, "execution", null);
+      await vi.advanceTimersByTimeAsync(2_000);
+      assert.ok(queries() >= 1);
+      const settled = queries();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await reporter.stop();
+      assert.ok(queries() - settled <= 3, `${queries() - settled} queries after settling`);
+    });
+  });
 });

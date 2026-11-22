@@ -5,6 +5,8 @@ import type { LinearRunReplyWriter } from "./linear.js";
 import type { RunReplyRecord, RunReplyScope } from "./store.js";
 
 const POLL_MS = 2_000;
+// Recovery only handles rows older than the grace period, so idle checks can be rare.
+const IDLE_POLL_MS = 30_000;
 const RECOVERY_GRACE_MS = 120_000;
 const MISSING_PROVIDER_GRACE_MS = 600_000;
 const PROVIDER_TIMEOUT_MS = 15_000;
@@ -24,7 +26,8 @@ interface CapturedRun {
 export class RunReplyReporter {
   private readonly captured = new Map<string, CapturedRun>();
   private readonly shutdown = new AbortController();
-  private timer: ReturnType<typeof setInterval> | undefined;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private started = false;
   private processing: Promise<void> | undefined;
 
   constructor(private readonly options: ReporterOptions) {}
@@ -37,15 +40,26 @@ export class RunReplyReporter {
       this.captured.set(scope.runId, captured);
     }
     captured.answers.set(executionId, answer);
+    this.schedule(POLL_MS);
   };
 
   start(): void {
-    if (this.timer !== undefined || this.shutdown.signal.aborted) return;
-    this.timer = setInterval(() => {
-      void this.processAvailable().catch(() => {
-        if (!this.shutdown.signal.aborted) this.options.onFailure?.();
-      });
-    }, POLL_MS).unref();
+    if (this.started || this.shutdown.signal.aborted) return;
+    this.started = true;
+    this.schedule(IDLE_POLL_MS);
+  }
+
+  // A captured answer needs the fast cadence; with none waiting a slow check is enough.
+  private schedule(delay: number): void {
+    if (!this.started || this.shutdown.signal.aborted) return;
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => {
+      void this.processAvailable()
+        .catch(() => {
+          if (!this.shutdown.signal.aborted) this.options.onFailure?.();
+        })
+        .finally(() => this.schedule(this.captured.size > 0 ? POLL_MS : IDLE_POLL_MS));
+    }, delay).unref();
   }
 
   processAvailable(): Promise<void> {
@@ -56,7 +70,7 @@ export class RunReplyReporter {
   }
 
   async stop(): Promise<void> {
-    clearInterval(this.timer);
+    clearTimeout(this.timer);
     this.shutdown.abort();
     this.captured.clear();
     await this.processing?.catch(() => undefined);
