@@ -115,6 +115,11 @@ export interface OrganizationRunRecord {
   agent: { provider: string; model: string | null } | null;
 }
 
+export interface OrganizationRunCount {
+  status: TriggerRunRecord["status"];
+  count: number;
+}
+
 export interface DroppedProviderEventCount {
   reason: DropReasonGroup;
   provider: ProviderEventReceiptRecord["provider"];
@@ -1912,6 +1917,8 @@ export interface Database
     since: Date,
     limit: number,
   ): Promise<OrganizationRunRecord[]>;
+  /** How many runs the organization's triggers started at or after `since`, by status. */
+  countOrganizationRunsSince(organizationId: string, since: Date): Promise<OrganizationRunCount[]>;
   listDroppedEventPage(
     organizationId: string,
     request: DroppedEventPageRequest,
