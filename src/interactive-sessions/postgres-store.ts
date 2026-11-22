@@ -437,42 +437,55 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
     { organizationId, userId }: SessionPrincipal,
     openLimit: number,
   ) {
-    const read = (limit: number, openOnly: boolean) =>
-      this.runtime.query<{ id: string }>(
-        `select id from (
-           (select id from interactive_sessions
-             where organization_id = $1 and started_by_user_id = $2
-             ${openOnly ? "and state <> 'closed'" : ""}
-             limit $3)
-           union
-           (select p.session_id as id from interactive_session_participants p
-             where p.organization_id = $1 and p.user_id = $2
-             ${
-               openOnly
-                 ? `and exists (
-                      select 1 from interactive_sessions s
-                       where s.organization_id = p.organization_id and s.id = p.session_id
-                         and s.state <> 'closed'
-                       offset 0
-                    )`
-                 : ""
-             }
-             limit $3)
-         ) owned
-         where exists (
-           select 1 from member
-            where organization_id = $1 and user_id = $2
-              and role in ('owner', 'admin', 'member')
-         )
-         limit $3`,
-        [organizationId, userId, limit],
-      );
-
-    const { rows: open } = await read(openLimit + 1, true);
+    const { rows: open } = await this.runtime.query<{ own: boolean }>(
+      `with candidates as materialized (
+         select s.id, s.started_by_user_id
+         from daemons d
+         cross join lateral (
+           select id, started_by_user_id
+           from interactive_sessions
+           where daemon_id = d.id and organization_id = $1 and state <> 'closed'
+           offset 0
+         ) s
+         where d.organization_id = $1
+           and exists (
+             select 1 from member
+             where organization_id = $1 and user_id = $2 and role in ('owner', 'admin', 'member')
+           )
+         limit $3
+       )
+       select coalesce(s.started_by_user_id = $2, false) or exists (
+         select 1 from interactive_session_participants p
+         where p.session_id = s.id and p.organization_id = $1 and p.user_id = $2
+         offset 0
+       ) as own
+       from candidates s`,
+      [organizationId, userId, openLimit + 1],
+    );
+    const own = open.filter((row) => row.own).length;
+    const started =
+      own > 0 ||
+      (
+        await this.runtime.query<{ id: string }>(
+          `select id from (
+             (select id from interactive_sessions
+               where organization_id = $1 and started_by_user_id = $2 limit 1)
+             union all
+             (select session_id as id from interactive_session_participants
+               where organization_id = $1 and user_id = $2 limit 1)
+           ) owned
+           where exists (
+             select 1 from member
+             where organization_id = $1 and user_id = $2 and role in ('owner', 'admin', 'member')
+           )
+           limit 1`,
+          [organizationId, userId],
+        )
+      ).rows.length > 0;
     return {
-      open: Math.min(open.length, openLimit),
+      open: Math.min(own, openLimit),
       openCapped: open.length > openLimit,
-      started: open.length > 0 || (await read(1, false)).rows.length > 0,
+      started,
     };
   }
 

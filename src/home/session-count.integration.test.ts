@@ -175,7 +175,8 @@ it("keeps both stores in parity and reads PGlite session history through the rea
         returning id, organization_id
         )
         insert into interactive_session_participants (organization_id, session_id, user_id, role)
-        select organization_id, id, 'member', 'controller' from added`,
+        select organization_id, id, users.user_id, users.role from added
+        cross join (values ('member', 'controller'), ('viewer', 'viewer')) users(user_id, role)`,
         [org],
       );
     }
@@ -199,14 +200,48 @@ it("keeps both stores in parity and reads PGlite session history through the rea
       );
       const plan = rows.map((row) => row["QUERY PLAN"]).join("\n");
       if (process.env["HUB_HOME_SESSION_EXPLAIN"] === "1") process.stdout.write(`${plan}\n\n`);
-      assert.match(plan, /interactive_sessions_start_key_unique/u);
-      assert.match(plan, /interactive_session_participants_org_user_idx/u);
+      if (sql.includes("with candidates")) {
+        assert.match(plan, /interactive_sessions_open_daemon_idx/u);
+      } else {
+        assert.match(plan, /interactive_sessions_start_key_unique/u);
+        assert.match(plan, /interactive_session_participants_org_user_idx/u);
+      }
       assert.doesNotMatch(plan, /Seq Scan on interactive_session/u);
       for (const [, removed] of plan.matchAll(/Rows Removed by Filter: (\d+)/gu)) {
         assert.ok(Number(removed) < 10, plan);
       }
     }
     assert.ok(calls.every(([sql]) => !/for\s+share/iu.test(sql)));
+
+    const archiveQuery = vi.spyOn(runtime, "query");
+    assert.deepEqual(await pg.countOwnInteractiveSessions(member("viewer"), 200), {
+      open: 3,
+      openCapped: false,
+      started: true,
+    });
+    const [openRead] = archiveQuery.mock.calls;
+    archiveQuery.mockRestore();
+    assert.ok(openRead);
+    const [sql, params] = openRead;
+    const { rows } = await runtime.query<{ "QUERY PLAN": string }>(
+      `explain (analyze, buffers, format text) ${sql}`,
+      params,
+    );
+    const plan = rows.map((row) => row["QUERY PLAN"]).join("\n");
+    if (process.env["HUB_HOME_SESSION_EXPLAIN"] === "1") process.stdout.write(`${plan}\n\n`);
+    for (const [, removed] of plan.matchAll(/Rows Removed by Filter: (\d+)/gu)) {
+      assert.ok(Number(removed) < 10, plan);
+    }
+    const hits = /Buffers: shared hit=(\d+)/u.exec(plan)?.[1];
+    assert.ok(hits !== undefined && Number(hits) < 100, plan);
+    assert.match(plan, /interactive_sessions_open_daemon_idx/u);
+    for (const db of [memory, pg]) {
+      assert.deepEqual(await db.countOwnInteractiveSessions(member("owner"), 2), {
+        open: 0,
+        openCapped: true,
+        started: false,
+      });
+    }
   } finally {
     await pg.close();
     await rm(data, { recursive: true, force: true });
