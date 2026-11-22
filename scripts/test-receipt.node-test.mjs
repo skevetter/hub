@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { recordTestRun, verifyReceipt } from "./test-receipt.mjs";
@@ -240,4 +242,79 @@ test("receipts bind evidence to the worktree the tests ran in", async (t) => {
   await cp(join(directory, ".test-receipts"), join(clone, ".test-receipts"), { recursive: true });
   await assert.rejects(verifyReceipt(clone, head), /different worktree/u);
   await verifyReceipt(directory, head);
+});
+
+test("an interrupted receipt waits for the command and removes its temp directory and lock", async (t) => {
+  const { directory, head } = await gitFixture(t);
+  const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
+  const receiptDir = join(directory, ".test-receipts");
+  const marker = join(receiptDir, "ready");
+  const temp = join(receiptDir, "tmp");
+  await mkdir(temp, { recursive: true });
+  const script = `
+    const { writeFileSync } = require("node:fs");
+    const marker = process.argv[1];
+    const timer = setInterval(() => {}, 1000);
+    process.on("SIGTERM", () => setTimeout(() => {
+      writeFileSync(marker + "-signal", "SIGTERM");
+      clearInterval(timer);
+    }, 150));
+    writeFileSync(marker, String(process.pid));
+  `;
+  const caller = spawn(
+    process.execPath,
+    [runner, "--root", directory, "--", process.execPath, "-e", script, marker],
+    { env: { ...process.env, TMPDIR: temp }, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  const exited = once(caller, "close");
+  let output = "";
+  for (const stream of [caller.stdout, caller.stderr]) {
+    stream.on("data", (chunk) => {
+      output += chunk;
+    });
+  }
+  let worker;
+  try {
+    for (let attempts = 0; !worker && attempts < 200; attempts++) {
+      worker = Number(await readFile(marker, "utf8").catch(() => ""));
+      if (!worker) await delay(20);
+    }
+    assert.ok(worker, output || "receipt command did not start");
+    const lock = join(receiptDir, `${head}.lock`);
+    const owner = JSON.parse(await readFile(lock, "utf8"));
+    assert.equal(owner.pid, caller.pid);
+    assert.equal(owner.groups[0].pid, worker);
+    caller.kill("SIGTERM");
+    assert.deepEqual(await once(caller, "exit", { signal: AbortSignal.timeout(4000) }), [1, null]);
+    await exited;
+    assert.match(output, /INTERRUPTED: SIGTERM/u);
+    assert.equal(await readFile(marker + "-signal", "utf8"), "SIGTERM");
+    assert.deepEqual(await readdir(temp), []);
+    assert.throws(() => process.kill(-worker, 0), { code: "ESRCH" });
+    await assert.rejects(readFile(lock), { code: "ENOENT" });
+  } finally {
+    if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+    if (worker) {
+      try {
+        process.kill(worker, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+    await exited;
+  }
+});
+
+test("a dead receipt writer's lock is reclaimed on the next recording", async (t) => {
+  const { directory, head } = await gitFixture(t);
+  const receiptDir = join(directory, ".test-receipts");
+  const lock = join(receiptDir, `${head}.lock`);
+  await mkdir(receiptDir);
+  const writer = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await once(writer, "exit");
+  await writeFile(lock, JSON.stringify({ pid: writer.pid, groups: [] }));
+  const result = await recordTestRun(directory, [process.execPath, "-e", ""], { stdio: "ignore" });
+  assert.equal(result.code, 0);
+  await verifyReceipt(directory, head);
+  await assert.rejects(readFile(lock), { code: "ENOENT" });
 });

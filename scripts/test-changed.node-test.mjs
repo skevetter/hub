@@ -343,7 +343,10 @@ test("test-changed stops the selected Vitest run with its descendants and remove
       import { spawn } from "node:child_process";
       import { writeFileSync } from "node:fs";
       if (process.argv[2] === "list") process.exit(0);
-      const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      const stubborn = process.env.STATUS_STUBBORN === "1";
+      if (stubborn) process.on("SIGINT", () => writeFileSync(process.env.STATUS_FILE + "-signal", "SIGINT"));
+      const script = "setInterval(() => {}, 1000)" + (stubborn ? "; process.on('SIGINT', () => {})" : "");
+      const sleeper = spawn(process.execPath, ["-e", script], { stdio: "ignore" });
       writeFileSync(process.env.STATUS_FILE, JSON.stringify({ leader: process.pid, sleeper: sleeper.pid }));
       setInterval(() => {}, 1000);
     `,
@@ -357,7 +360,7 @@ test("test-changed stops the selected Vitest run with its descendants and remove
       throw error;
     }
   };
-  for (const signal of ["SIGTERM", "SIGHUP"]) {
+  for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"]) {
     const marker = join(root, `status-${signal}`);
     const temp = join(root, `status-tmp-${signal}`);
     await mkdir(temp);
@@ -370,6 +373,7 @@ test("test-changed stops the selected Vitest run with its descendants and remove
           ...process.env,
           STATUS_FILE: marker,
           TMPDIR: temp,
+          STATUS_STUBBORN: signal === "SIGINT" ? "1" : "0",
           HUB_TEST_FULLSUITE_LOCK: join(root, "status-lock"),
         },
         stdio: ["ignore", "pipe", "pipe"],
@@ -391,7 +395,10 @@ test("test-changed stops the selected Vitest run with its descendants and remove
       const lock = join(root, "status-lock");
       assert.equal(JSON.parse(await readFile(lock, "utf8")).pid, caller.pid);
       caller.kill(signal);
-      const [code, terminatedBy] = await exited;
+      const [code, terminatedBy] = await once(caller, "exit", {
+        signal: AbortSignal.timeout(5500),
+      });
+      if (signal === "SIGINT") assert.equal(await readFile(marker + "-signal", "utf8"), signal);
       await assert.rejects(readFile(lock), { code: "ENOENT" });
       assert.equal(terminatedBy, null);
       assert.equal(code, 1);
