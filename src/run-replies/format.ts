@@ -28,7 +28,9 @@ const MAX_TABLE_ROWS = 250;
 const MAX_PIPES = 600;
 const MAX_LIST_INDENT = 12;
 const OPENER_RUN = new RegExp(`([[(*_~<])\\1{${MAX_OPENER_RUN - 1}}`, "u");
-const MAX_CONTAINER_DEPTH = 32;
+const MAX_CONTAINER_DEPTH = 24;
+const DEEP_LINE_DEPTH = 8;
+const MAX_DEEP_LINES = 200;
 const URL_START = /https?:\/\/|www\.|(?<![\w-])linear\.app\.?(?=[:/])/giu;
 const URL_RUN = /[^\s<>()[\]"'`]*/uy;
 const LINEAR_HOST_PATH = /linear\.app\.?(?::\d{1,5})?(\/[^\s<>()[\]"'`\\?#]*)/giu;
@@ -126,7 +128,7 @@ function renderMarkdown(
   report: (reason: "structure" | "budget") => void,
 ): string | undefined {
   // Micromark is synchronous. Bound delimiter-heavy input before any parser runs.
-  if (!boundedStructure(source) || containerDepth(source) > MAX_CONTAINER_DEPTH) {
+  if (!boundedStructure(source) || nestingTooDeep(source)) {
     report("structure");
     return undefined;
   }
@@ -153,35 +155,58 @@ function renderMarkdown(
   return undefined;
 }
 
-// Most container markers on one line, with or without a space between them. micromark nests
-// one container per marker and recurses on it, so depth is capped before parsing.
-function containerDepth(source: string): number {
-  let deepest = 0;
+// Estimated container depth of every line outside a fence: its leading markers, with or without
+// a space between them, plus one level per 2 columns of indentation (a tab is 4 columns). micromark
+// nests one container per level and recurses on it, so an answer whose lines run deep, on one line
+// or carried across lines by indentation, goes to the plain path. The decision depends on the
+// text alone, never on timing.
+function nestingTooDeep(source: string): boolean {
+  let fence: string | undefined;
+  let deepLines = 0;
   for (const line of source.split(/\r\n|\r|\n/u)) {
-    let depth = 0;
-    let index = 0;
-    while (index < line.length) {
-      const char = line[index]!;
-      if (char === " " || char === "\t") {
-        index += 1;
-        continue;
-      }
-      let length = 0;
-      if (char === ">") length = 1;
-      else if (char === "-" || char === "+" || char === "*") length = markerEnds(line, index + 1);
-      else if (char >= "0" && char <= "9") {
-        let digits = index;
-        while (line[digits]! >= "0" && line[digits]! <= "9") digits += 1;
-        if (digits - index <= 9 && (line[digits] === "." || line[digits] === ")"))
-          length = markerEnds(line, digits + 1) === 0 ? 0 : digits + 1 - index;
-      }
-      if (length === 0) break;
-      depth += 1;
-      index += length;
+    const marks = /^ {0,3}(`{3,}|~{3,})/u.exec(line);
+    if (fence !== undefined) {
+      if (marks?.[1]![0] === fence) fence = undefined;
+      continue;
     }
-    deepest = Math.max(deepest, depth);
+    if (marks) {
+      fence = marks[1]![0];
+      continue;
+    }
+    let columns = 0;
+    let index = 0;
+    for (; line[index] === " " || line[index] === "\t"; index += 1)
+      columns += line[index] === "\t" ? 4 - (columns % 4) : 1;
+    const depth = Math.floor(columns / 2) + markerCount(line, index);
+    if (depth > MAX_CONTAINER_DEPTH) return true;
+    if (depth > DEEP_LINE_DEPTH && (deepLines += 1) > MAX_DEEP_LINES) return true;
   }
-  return deepest;
+  return false;
+}
+
+function markerCount(line: string, from: number): number {
+  let depth = 0;
+  let index = from;
+  while (index < line.length) {
+    const char = line[index]!;
+    if (char === " " || char === "\t") {
+      index += 1;
+      continue;
+    }
+    let length = 0;
+    if (char === ">") length = 1;
+    else if (char === "-" || char === "+" || char === "*") length = markerEnds(line, index + 1);
+    else if (char >= "0" && char <= "9") {
+      let digits = index;
+      while (line[digits]! >= "0" && line[digits]! <= "9") digits += 1;
+      if (digits - index <= 9 && (line[digits] === "." || line[digits] === ")"))
+        length = markerEnds(line, digits + 1) === 0 ? 0 : digits + 1 - index;
+    }
+    if (length === 0) break;
+    depth += 1;
+    index += length;
+  }
+  return depth;
 }
 
 // A list marker needs a space, a tab or the end of the line after it.

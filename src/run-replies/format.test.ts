@@ -6,6 +6,12 @@ import { gfm } from "micromark-extension-gfm";
 import { describe, it } from "vitest";
 import { formatRunReply } from "./format.js";
 import { realisticAnswers } from "./test-utils/answers.js";
+import {
+  checkNestedDocuments,
+  checkStackedDocuments,
+  mentionLinks,
+  random,
+} from "./test-utils/nesting.js";
 
 const hazards = ["[a](", "[^a]", "*a_"];
 
@@ -67,28 +73,6 @@ it.each([
   }
 });
 
-function mentionLinks(markdown: string): string[] {
-  const found: string[] = [];
-  const pending: Array<Root | RootContent> = [
-    fromMarkdown(markdown, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] }),
-  ];
-  for (const node of pending) {
-    if (node.type === "link" || node.type === "definition") {
-      const url = URL.parse(node.url);
-      const host = url?.hostname.replace(/\.$/u, "") ?? "";
-      const path = decodeURIComponent(url?.pathname ?? "").normalize("NFKC");
-      const linear = host === "linear.app" || host.endsWith(".linear.app");
-      if (
-        (linear && /\/(?:profiles|users|agents)(?:\/|$)/iu.test(path)) ||
-        /[@\uFF20]/u.test(node.url)
-      )
-        found.push(node.url);
-    }
-    if ("children" in node) pending.push(...node.children);
-  }
-  return found;
-}
-
 // Reads 0, then past the budget: the reply takes the plain-text path.
 function plainClock() {
   let reads = 0;
@@ -106,15 +90,6 @@ it.each(["www.linear%2Eapp", "www.\uFF4C\uFF49\uFF4E\uFF45\uFF41\uFF52\uFF0E\uFF
     }
   },
 );
-
-function random(seed: number) {
-  return () => {
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 it("leaves no autolink to a profile or mention across 3,600 generated documents", () => {
   const hosts = [
@@ -272,47 +247,12 @@ it("falls back to plain text when the Markdown step throws", () => {
   assert.ok(body.length > 0);
 });
 
-it("always renders 2,000 generated stacked-container documents safely", () => {
-  const next = random(7_001);
-  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
-  const markers = [
-    ">",
-    "> ",
-    "- ",
-    "+ ",
-    "* ",
-    "1. ",
-    "2) ",
-    "\t",
-    " ",
-    "  ",
-    ">>",
-    "-",
-    "- >",
-    ">- ",
-  ];
-  const tails = [
-    "q",
-    "@bob",
-    "see https://linear.app/acme/profiles/bob",
-    "| a | b |\n> | - | - |\n> | @x | www.linear%2Eapp/a/users/b |",
-    "`code <T>`",
-    "[x](https://linear.app/a/agents/c)",
-  ];
-  for (let index = 0; index < 2_000; index += 1) {
-    const lines: string[] = [];
-    const lineCount = 1 + Math.floor(next() * 6);
-    for (let line = 0; line < lineCount; line += 1) {
-      const unit = Array.from({ length: 1 + Math.floor(next() * 3) }, () => pick(markers)).join("");
-      lines.push(unit.repeat(1 + Math.floor(next() * 700)) + pick(tails));
-    }
-    const text = `Fixed it.\n\n${lines.join("\n")}`;
-    const body = formatRunReply({ text, truncated: next() < 0.2 }, []);
-    const context = JSON.stringify({ index, text: text.slice(0, 200) });
-    assert.ok(body.length > 0 && body.length <= 3_500, context);
-    assert.deepEqual(mentionLinks(body), [], context);
-    assert.doesNotMatch(body, /[@\uFF20]/u, context);
-  }
+it("renders generated stacked-container documents safely", () => {
+  checkStackedDocuments({ seed: 7_001, count: 400 });
+});
+
+it("renders generated cross-line nesting the same way on every call", () => {
+  checkNestedDocuments({ seed: 8_001, count: 400 });
 });
 
 it.each([
@@ -355,4 +295,50 @@ describe("long URLs keep their visible text", () => {
       assert.match(post(text), new RegExp(`Fixed in ${label} and tested\\.`, "u"), text);
     }
   });
+});
+
+// Each line indents into the deepest item of the line above and opens 32 more items, so no line
+// has more than 32 markers while the nesting reaches hundreds of levels.
+function indentedChain(unit: string, columns: number): string {
+  let text = "";
+  let column = 0;
+  for (;;) {
+    const line = `${unit.repeat(column / columns)}${"- ".repeat(32)}x\n`;
+    if (text.length + line.length > 3_300) return text;
+    text += line;
+    column += 64;
+  }
+}
+
+it.each([
+  ["tabs", "\t", 4],
+  ["spaces", "  ", 2],
+])("sends nesting carried across lines by %s to plain text every time", (_name, unit, columns) => {
+  const text = indentedChain(unit, columns);
+  const outcomes = new Set<string>();
+  for (let call = 0; call < 5; call += 1) {
+    const reasons: string[] = [];
+    formatRunReply({ text, truncated: false }, [], {
+      onFallback: (reason) => reasons.push(reason),
+    });
+    outcomes.add(reasons.join());
+  }
+  assert.deepEqual([...outcomes], ["structure"]);
+});
+
+it("keeps a realistic nested list as Markdown", () => {
+  const text = [
+    "- one",
+    "  - two",
+    "    - three",
+    "      - four",
+    "        1. five",
+    "           - six",
+    "```ts",
+    "                        deeply.indented(code);",
+    "```",
+  ].join("\n");
+  const reasons: string[] = [];
+  formatRunReply({ text, truncated: false }, [], { onFallback: (reason) => reasons.push(reason) });
+  assert.deepEqual(reasons, []);
 });
