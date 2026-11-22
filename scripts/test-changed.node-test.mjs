@@ -295,7 +295,11 @@ test("test-changed forwards TERM, INT and HUP and waits for the full-suite child
       [join(root, "scripts/test-changed.mjs"), "--base", "HEAD"],
       {
         cwd: root,
-        env: { ...process.env, STATUS_FILE: marker },
+        env: {
+          ...process.env,
+          STATUS_FILE: marker,
+          HUB_TEST_FULLSUITE_LOCK: join(root, "status-lock"),
+        },
         stdio: ["ignore", "ignore", "pipe"],
       },
     );
@@ -384,8 +388,11 @@ test("test-changed stops the selected Vitest run with its descendants and remove
         started = await readFile(marker, "utf8").then(JSON.parse, () => undefined);
       }
       assert.ok(started, output || "Selected Vitest child did not start");
+      const lock = join(root, "status-lock");
+      assert.equal(JSON.parse(await readFile(lock, "utf8")).pid, caller.pid);
       caller.kill(signal);
       const [code, terminatedBy] = await exited;
+      await assert.rejects(readFile(lock), { code: "ENOENT" });
       assert.equal(terminatedBy, null);
       assert.equal(code, 1);
       assert.match(output, new RegExp(`INTERRUPTED: ${signal}`, "u"));
