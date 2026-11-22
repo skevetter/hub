@@ -16,12 +16,15 @@ export function SummaryPanel({
   label,
   rows,
   className,
+  inline = false,
 }: {
   /** Identifies which summary this is, e.g. "GitHub app". */
   label: string;
   rows: readonly SummaryRow[];
   /** Placement in a parent grid only. Never used to change how the panel looks. */
   className?: string;
+  /** Use inside an already bordered card. */
+  inline?: boolean;
 }) {
   return (
     <dl
@@ -34,12 +37,17 @@ export function SummaryPanel({
       // The tracks are fitted rather than fixed at two: a panel of one fact filled half a box
       // and left the other half empty, and a panel of three left a hole under the third.
       className={cn(
-        "grid gap-px overflow-hidden rounded-xl border bg-border sm:grid-cols-[repeat(auto-fit,minmax(16rem,1fr))]",
+        inline
+          ? "grid min-w-0 gap-x-6 gap-y-3 border-t pt-4 sm:grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))]"
+          : "grid gap-px overflow-hidden rounded-xl border bg-border sm:grid-cols-[repeat(auto-fit,minmax(16rem,1fr))]",
         className,
       )}
     >
       {rows.map((row) => (
-        <div key={row.label} className="grid content-start gap-1 bg-card px-4 py-3">
+        <div
+          key={row.label}
+          className={cn("grid content-start gap-1", inline ? "min-w-0" : "bg-card px-4 py-3")}
+        >
           <dt className="text-xs text-muted-foreground">{row.label}</dt>
           <dd className="min-w-0 text-sm break-words">{row.value}</dd>
         </div>
