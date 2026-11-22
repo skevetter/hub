@@ -12,7 +12,6 @@ const ACK_MS = 10_000;
 const TERMINAL_MS = 16_000;
 const CLAIM_MS = 60_000;
 const MAX_CLAIMS = 2_048;
-const URL_NAMESPACE = Buffer.from("6ba7b8119dad11d180b400c04fd430c8", "hex");
 const ACK_BODY = "Paseo Hub received your request.";
 const NO_ANSWER_BODY = "Work finished. No answer was posted.";
 const ERROR_BODY = "Paseo Hub could not complete this request.";
@@ -260,9 +259,9 @@ export function pilotActivityIds(nativeSessionId: string, promptActivityId: stri
 
 function stableActivityId(sessionId: string, purpose: Purpose, interactionId: string): string {
   const identity = JSON.stringify([sessionId, purpose, purpose === "ack" ? null : interactionId]);
-  const name = `https://paseo.sh/id/linear-pilot/${encodeURIComponent(identity)}`;
-  const bytes = createHash("sha1").update(URL_NAMESPACE).update(name).digest();
-  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  const name = `https://paseo.sh/id/linear-pilot/v4/${encodeURIComponent(identity)}`;
+  const bytes = createHash("sha256").update(name).digest();
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
   bytes[8] = (bytes[8]! & 0x3f) | 0x80;
   const hex = bytes.toString("hex", 0, 16);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;

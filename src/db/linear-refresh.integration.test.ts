@@ -199,7 +199,7 @@ describe("Linear token refresh persistence", () => {
       const options = {
         binding: linearAgentBinding(connection),
         hubBaseUrl,
-        activityIdVersion: 5 as const,
+        pilotOperations: true as const,
         authorize: () => authorize(waiter.runtime),
         authorizeRefresh: authorityBackend,
         connectionForLinearOrganization: waiterDatabase.findLinearConnection.bind(waiterDatabase),

@@ -74,49 +74,43 @@ const contentTypename = {
 const continueSignal = z.literal("continue").optional();
 const returnedSignal = z.literal("continue").nullable().optional();
 
-function activitySchemas(activityId: z.ZodUUID) {
-  const activity = ref.extend({
-    id: activityId,
-    agentSession: ref,
-    user: ref,
-    signal: returnedSignal,
-  });
-  return {
-    activityInput: z.strictObject({
-      sessionId: id,
-      activityId,
-      content: activityContentSchema,
-      ephemeral: z.boolean().optional(),
-      signal: continueSignal,
+const activityIdSchema = z.uuidv4();
+const activity = ref.extend({
+  id: activityIdSchema,
+  agentSession: ref,
+  user: ref,
+  signal: returnedSignal,
+});
+const activityInput = z.strictObject({
+  sessionId: id,
+  activityId: activityIdSchema,
+  content: activityContentSchema,
+  ephemeral: z.boolean().optional(),
+  signal: continueSignal,
+});
+const readbackInput = z.strictObject({
+  sessionId: id,
+  activityId: activityIdSchema,
+  kind: activityKind,
+  signal: continueSignal,
+});
+const createResult = z.object({
+  agentActivityCreate: z.object({ success: z.boolean(), agentActivity: activity }),
+});
+const readbackResult = z.object({
+  agentSession: sessionOwner.extend({
+    activities: z.object({
+      nodes: z
+        .array(
+          activity.extend({
+            content: z.object({ __typename: z.string(), type: activityKind }),
+          }),
+        )
+        .max(1),
+      pageInfo: pageFlags,
     }),
-    readbackInput: z.strictObject({
-      sessionId: id,
-      activityId,
-      kind: activityKind,
-      signal: continueSignal,
-    }),
-    createResult: z.object({
-      agentActivityCreate: z.object({ success: z.boolean(), agentActivity: activity }),
-    }),
-    readbackResult: z.object({
-      agentSession: sessionOwner.extend({
-        activities: z.object({
-          nodes: z
-            .array(
-              activity.extend({
-                content: z.object({ __typename: z.string(), type: activityKind }),
-              }),
-            )
-            .max(1),
-          pageInfo: pageFlags,
-        }),
-      }),
-    }),
-  };
-}
-
-const v4ActivitySchemas = activitySchemas(z.uuidv4());
-const v5ActivitySchemas = activitySchemas(z.uuid({ version: "v5" }));
+  }),
+});
 
 const errorMessages = {
   invalid_input: "Invalid Linear agent operation input",
@@ -133,10 +127,17 @@ const errorMessages = {
   cancelled: "Linear agent operation was cancelled or timed out",
 } as const;
 
+export interface LinearAgentErrorDetails {
+  linearErrorType?: string;
+  linearErrorKinds?: readonly string[];
+  linearErrorText?: string;
+}
+
 export class LinearAgentError extends Error {
   constructor(
     readonly code: keyof typeof errorMessages,
     readonly status?: number,
+    readonly details?: LinearAgentErrorDetails,
   ) {
     super(errorMessages[code]);
     this.name = "LinearAgentError";
@@ -158,8 +159,8 @@ type LinearAgentClientOptions = Pick<
   binding: LinearConnectionBinding;
   hubBaseUrl: string;
   fetch: typeof fetch;
-  /** Pilot-only opt-in. Activity IDs default to UUIDv4. */
-  activityIdVersion?: 5;
+  /** Enables pilot history reads and response signals. */
+  pilotOperations?: true;
   /** Resolve current policy and authority for this exact operation. Setup reads need an explicit policy too. */
   authorize(
     binding: Readonly<LinearConnectionBinding>,
@@ -185,15 +186,11 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
   const binding = Object.freeze({ ...options.binding });
   const hubOrigin = new URL(options.hubBaseUrl).origin;
   const now = options.now ?? (() => new Date());
-  const useV5ActivityIds = options.activityIdVersion === 5;
-  const { activityInput, readbackInput, createResult, readbackResult } = useV5ActivityIds
-    ? v5ActivitySchemas
-    : v4ActivitySchemas;
 
   function requireHistoryScope(input: PilotHistoryScope) {
     const scope = parse(historyScope, input, "invalid_input");
     if (
-      !useV5ActivityIds ||
+      !options.pilotOperations ||
       scope.appUserId !== binding.appUserId ||
       scope.allowedHumanProviderUserId === binding.appUserId
     ) {
@@ -273,6 +270,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         const refreshed = await providerRequest(
           () => options.connectionClient.refresh(refreshToken, signal),
           signal,
+          options.pilotOperations ? { connections: [initial, current] } : undefined,
         );
         // A successful refresh can rotate the token even when a caller cancels.
         await update(refreshed);
@@ -316,6 +314,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
             now,
           ),
         signal,
+        options.pilotOperations ? { connections: [initial, connection], variables } : undefined,
       );
       checkSignal();
       return parse(
@@ -383,7 +382,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
       if (ephemeral === true && content.type !== "thought" && content.type !== "action") {
         throw new LinearAgentError("invalid_input");
       }
-      if (expectedSignal && (!useV5ActivityIds || content.type !== "response")) {
+      if (expectedSignal && (!options.pilotOperations || content.type !== "response")) {
         throw new LinearAgentError("invalid_input");
       }
       const variables = {
@@ -426,7 +425,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         kind,
         signal: expectedSignal,
       } = parse(readbackInput, input, "invalid_input");
-      if (expectedSignal && (!useV5ActivityIds || kind !== "response")) {
+      if (expectedSignal && (!options.pilotOperations || kind !== "response")) {
         throw new LinearAgentError("invalid_input");
       }
       const variables = { sessionId, activityId };
@@ -711,7 +710,49 @@ function safeDisplayName({
     );
 }
 
-async function providerRequest<T>(request: () => Promise<T>, signal: AbortSignal): Promise<T> {
+interface ProviderDiagnostics {
+  connections: readonly LinearConnectionRecord[];
+  variables?: Record<string, unknown>;
+}
+
+function safeProviderDetails(
+  error: LinearApiError,
+  { connections, variables }: ProviderDiagnostics,
+): LinearAgentErrorDetails {
+  const values = connections.flatMap(({ accessToken, refreshToken }) =>
+    refreshToken === null ? [accessToken] : [accessToken, refreshToken],
+  );
+  // GraphQL errors can echo input values, including activity content.
+  JSON.stringify(variables, (_key, value: unknown) => {
+    if (typeof value === "string") values.push(value);
+    return value;
+  });
+  const scrubValues = [
+    ...new Set(
+      values.filter(Boolean).flatMap((value) => [value, JSON.stringify(value).slice(1, -1)]),
+    ),
+  ].sort((left, right) => right.length - left.length);
+  const clean = (text: string) => {
+    for (const value of scrubValues) text = text.replaceAll(value, "[Redacted]");
+    return text
+      .replace(/[\p{Cc}\p{Cf}\s]+/gu, " ")
+      .trim()
+      .slice(0, 300);
+  };
+  return {
+    ...(error.graphqlErrorType === undefined
+      ? {}
+      : { linearErrorType: clean(error.graphqlErrorType) }),
+    linearErrorKinds: error.graphqlCodes.map(clean),
+    linearErrorText: clean(error.message),
+  };
+}
+
+async function providerRequest<T>(
+  request: () => Promise<T>,
+  signal: AbortSignal,
+  diagnostics?: ProviderDiagnostics,
+): Promise<T> {
   try {
     return await request();
   } catch (error) {
@@ -719,9 +760,11 @@ async function providerRequest<T>(request: () => Promise<T>, signal: AbortSignal
     if (error instanceof LinearCredentialError && error.code === "reauthorize") {
       throw new LinearAgentError("reauthorize");
     }
+    if (!(error instanceof LinearApiError)) throw new LinearAgentError("request_failed");
     throw new LinearAgentError(
       "request_failed",
-      error instanceof LinearApiError ? error.status : undefined,
+      error.status,
+      diagnostics && safeProviderDetails(error, diagnostics),
     );
   }
 }

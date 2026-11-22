@@ -280,7 +280,7 @@ function linearPilotWebhookOptions(
     activityClient: (authority) =>
       createLinearAgentClient({
         ...authority,
-        activityIdVersion: 5,
+        pilotOperations: true,
         hubBaseUrl: publicBaseUrl,
         fetch: options.fetch ?? fetch,
         connectionForLinearOrganization,

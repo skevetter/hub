@@ -41,7 +41,9 @@ const ViewerResponseSchema = z.object({
 const GraphqlErrorsSchema = z.object({ errors: z.array(z.unknown()) });
 const GraphqlErrorSchema = z.object({
   message: z.string().optional(),
-  extensions: z.object({ code: z.string().optional() }).optional(),
+  extensions: z
+    .object({ code: z.string().optional(), type: z.string().optional().catch(undefined) })
+    .optional(),
 });
 
 const IssueResponseSchema = z.object({
@@ -143,6 +145,7 @@ export class LinearApiError extends Error {
     readonly rateLimitBeforeExecution = false,
     readonly graphqlCodes: readonly string[] = [],
     readonly graphqlRejected = false,
+    readonly graphqlErrorType?: string,
   ) {
     super(message);
     this.name = "LinearApiError";
@@ -811,14 +814,22 @@ async function readResponseBody(
   }
 }
 
+function parseGraphqlErrors(rawErrors: unknown[]) {
+  let firstErrorType: string | undefined;
+  const errors = rawErrors.flatMap((value, index) => {
+    const parsed = GraphqlErrorSchema.safeParse(value);
+    if (!parsed.success) return [];
+    if (index === 0) firstErrorType = parsed.data.extensions?.type;
+    return [parsed.data];
+  });
+  return { errors, firstErrorType };
+}
+
 function checkGraphqlResponse(response: Response, result: unknown, now: () => Date): void {
   const envelope = GraphqlErrorsSchema.safeParse(result);
   if (response.ok && !envelope.success) return;
   const rawErrors = envelope.success ? envelope.data.errors : [];
-  const errors = rawErrors.flatMap((value) => {
-    const parsed = GraphqlErrorSchema.safeParse(value);
-    return parsed.success ? [parsed.data] : [];
-  });
+  const { errors, firstErrorType } = parseGraphqlErrors(rawErrors);
   const rateLimited = errors.find(
     ({ extensions }) => extensions?.code?.toUpperCase() === "RATELIMITED",
   );
@@ -853,6 +864,7 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
     rateLimitBeforeExecution,
     codes,
     graphqlRejected,
+    firstErrorType,
   );
 }
 

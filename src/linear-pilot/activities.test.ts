@@ -110,16 +110,30 @@ describe("pilot activities", () => {
     },
   );
 
-  it("uses RFC UUIDv5 vectors with session and exact interaction scope", async () => {
+  it("uses deterministic UUIDv4 vectors with session and exact interaction scope", async () => {
     const w = fixture();
     const ack = await w.acknowledge(created, "first-attempt");
     const terminal = await w.error(prompted, "first-attempt");
     const stopped = await w.newWriter().stop(stop, "readback-only", "confirmed");
-    // Independently generated with Python's uuid.uuid5(uuid.NAMESPACE_URL, name).
-    expect(ack.activityId).toBe("bc3df002-8eba-517f-8202-a571fcd5daf5");
-    expect(terminal.activityId).toBe("b488aa2b-430b-5971-9e6f-b6e036932a4a");
-    expect(stopped.activityId).toBe("165d3656-fad9-5934-9b2a-98a436f598c9");
+    expect(ack.activityId).toBe("e27e05f1-2df9-48d9-bcd1-f62989048b85");
+    expect(terminal.activityId).toBe("3a50c1da-e094-4d87-8ecc-184ee3ce95e7");
+    expect(stopped.activityId).toBe("d02058c6-64cc-4aca-8619-7a715e355129");
     const ids = pilotActivityIds(prompted.nativeSessionId, prompted.interactionId);
+    expect(ids.busy).toBe("36555de3-d9cc-4d56-902e-f2e55a307275");
+    const all = [ack.activityId, ...Object.values(ids)];
+    expect(new Set(all).size).toBe(4);
+    for (const id of all) expect(id).toMatch(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab]/u);
+    const otherIds = pilotActivityIds(prompted.nativeSessionId, "prompt-2");
+    expect(otherIds.busy).not.toBe(ids.busy);
+    expect(otherIds.response).not.toBe(ids.response);
+    expect(otherIds.stop).not.toBe(ids.stop);
+    expect(
+      (
+        await w
+          .newWriter()
+          .acknowledge({ ...created, interactionId: "other-initial" }, "readback-only")
+      ).activityId,
+    ).toBe(ack.activityId);
     expect(ids.response).toBe(terminal.activityId);
     expect(ids.stop).toBe(stopped.activityId);
     const alternate = await w.newWriter().respond(prompted, "readback-only", undefined, []);
@@ -209,8 +223,8 @@ describe("pilot activities", () => {
     expect(w.createActivity).toHaveBeenCalledTimes(1);
   });
 
-  it("passes one UUIDv5 to L1 for append and exact readback under current installation authority", async () => {
-    const expected = "bc3df002-8eba-517f-8202-a571fcd5daf5";
+  it("passes one UUIDv4 to L1 for append and exact readback under current installation authority", async () => {
+    const expected = "e27e05f1-2df9-48d9-bcd1-f62989048b85";
     const sessionId = created.nativeSessionId;
     const provider = linearAgentFixture((operation, call) => {
       if (operation === "PaseoAgentActivityCreate") {
@@ -259,7 +273,7 @@ describe("pilot activities", () => {
         ...provider.options,
         binding: event.binding,
         authorize: isAuthorized,
-        activityIdVersion: 5 as const,
+        pilotOperations: true as const,
       };
       return createLinearAgentClient(options);
     };
@@ -288,7 +302,7 @@ describe("pilot activities", () => {
           ...provider.options,
           binding: event.binding,
           authorize: async () => provider.calls.length === 0,
-          activityIdVersion: 5 as const,
+          pilotOperations: true as const,
         };
         return createLinearAgentClient(options);
       },
@@ -320,7 +334,7 @@ describe("pilot activities", () => {
     const active = w.respond(prompted, "first-attempt", answer, []);
     const busy = await w.busy(busyPrompt, "first-attempt");
     expect(busy.disposition).toBe("confirmed");
-    expect(busy.activityId).toBe("3893b8f7-810b-5fdc-8830-6e0f80f2fa7c");
+    expect(busy.activityId).toBe("ba530874-8c8c-4481-9042-e51d86eebf69");
     expect(busy.activityId).toBe(
       pilotActivityIds(busyPrompt.nativeSessionId, busyPrompt.interactionId).busy,
     );

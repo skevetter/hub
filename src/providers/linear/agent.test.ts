@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { it } from "vitest";
-import { createLinearAgentClient } from "./agent.js";
+import { createLinearAgentClient, LinearAgentError } from "./agent.js";
 import {
   activityId,
   appViewer,
@@ -84,13 +84,55 @@ it("GraphQL errors or success false never acknowledge delivery", async () => {
   for (const payload of payloads) {
     const fixture = linearAgentFixture(() => payload);
     await assert.rejects(client(fixture).createActivity(activity), (error: unknown) => {
-      assert.ok(error instanceof Error);
+      assert.ok(error instanceof LinearAgentError);
       assert.doesNotMatch(String(error), /private/u);
       assert.equal(error.cause, undefined);
+      assert.equal(error.details, undefined);
       return true;
     });
     assert.equal(fixture.calls.filter(({ query }) => query.startsWith("mutation")).length, 1);
   }
+});
+
+it("pilot GraphQL failures preserve bounded diagnostics without credentials or activity text", async () => {
+  const body = "private activity\nbody";
+  const fixture = linearAgentFixture(() => ({
+    errors: [
+      {
+        message: ` Invalid\t activity\u0000\u001b\r\n ${fixture.a.accessToken} ${
+          fixture.a.refreshToken
+        } fake-rotated-access fake-rotated-refresh ${JSON.stringify(body)} ${"x".repeat(500)}`,
+        extensions: { type: "invalid input", code: "bad_user_input" },
+      },
+      { message: "Other failure", extensions: { type: "other", code: "other" } },
+    ],
+  }));
+  fixture.connections.set(fixture.a.linearOrganizationId, {
+    ...fixture.a,
+    accessTokenExpiresAt: new Date(0),
+  });
+  const pilot = createLinearAgentClient({
+    ...fixture.options,
+    binding: linearAgentBinding(fixture.a),
+    pilotOperations: true,
+  });
+
+  await assert.rejects(
+    pilot.createActivity({ ...activity, content: { type: "thought", body } }),
+    (error: unknown) => {
+      assert.ok(error instanceof LinearAgentError);
+      assert.equal(error.code, "request_failed");
+      assert.equal(error.status, 200);
+      assert.equal(error.message, "Linear agent provider request failed");
+      const prefix = `Linear GraphQL Invalid activity ${"[Redacted] ".repeat(4)}"[Redacted]" `;
+      assert.deepEqual(error.details, {
+        linearErrorType: "invalid input",
+        linearErrorKinds: ["BAD_USER_INPUT", "OTHER"],
+        linearErrorText: `${prefix}${"x".repeat(300 - prefix.length)}`,
+      });
+      return true;
+    },
+  );
 });
 
 it("a wrong workspace app actor or missing pilot scope sends no operation", async () => {
@@ -174,7 +216,8 @@ it("activity readback is bounded to the exact native session", async () => {
   assert.equal(failed.calls.length, 2);
 });
 
-const pilotActivityId = "bc3df002-8eba-517f-8202-a571fcd5daf5";
+const pilotActivityId = "e27e05f1-2df9-48d9-bcd1-f62989048b85";
+const nonV4ActivityId = "bc3df002-8eba-517f-8202-a571fcd5daf5";
 const pilotActivity = { ...activity, activityId: pilotActivityId };
 const pilotReadback = { sessionId, activityId: pilotActivityId, kind: "thought" } as const;
 
@@ -206,7 +249,7 @@ it("pilot history reads only a verified prompt and a bounded preceding page thro
     },
   }));
   const options = { ...fixture.options, binding: linearAgentBinding(fixture.a) };
-  const pilot = createLinearAgentClient({ ...options, activityIdVersion: 5 });
+  const pilot = createLinearAgentClient({ ...options, pilotOperations: true });
   const scope = {
     sessionId,
     issueId: issue.id,
@@ -238,7 +281,7 @@ it("pilot history reads only a verified prompt and a bounded preceding page thro
   assert.equal(fixture.lookups.length, previousLookups);
 });
 
-it("pilot UUIDv5 round-trips through create and exact readback", async () => {
+it("pilot UUIDv4 round-trips through create and exact readback", async () => {
   let resultId = pilotActivityId;
   const fixture = linearAgentFixture((operation, call) => {
     if (operation === "PaseoAgentActivityCreate") {
@@ -269,32 +312,47 @@ it("pilot UUIDv5 round-trips through create and exact readback", async () => {
   const options = {
     ...fixture.options,
     binding: linearAgentBinding(fixture.a),
-    activityIdVersion: 5 as const,
+    pilotOperations: true as const,
   };
   const pilot = createLinearAgentClient(options);
   assert.equal(await pilot.createActivity(pilotActivity), pilotActivityId);
   assert.equal(await pilot.isActivityConfirmed(pilotReadback), true);
   resultId = activityId;
-  await assert.rejects(pilot.createActivity(pilotActivity), { code: "invalid_response" });
+  await assert.rejects(pilot.createActivity(pilotActivity), { code: "mutation_unconfirmed" });
   assert.equal(await pilot.isActivityConfirmed(pilotReadback), false);
   const calls = fixture.calls.length;
-  await assert.rejects(pilot.createActivity(activity), { code: "invalid_input" });
-  await assert.rejects(pilot.isActivityConfirmed({ ...pilotReadback, activityId }), {
+  await assert.rejects(pilot.createActivity({ ...activity, activityId: nonV4ActivityId }), {
     code: "invalid_input",
   });
+  await assert.rejects(
+    pilot.isActivityConfirmed({ ...pilotReadback, activityId: nonV4ActivityId }),
+    {
+      code: "invalid_input",
+    },
+  );
   assert.equal(fixture.calls.length, calls);
 });
 
 it("pilot UUIDv5 is refused by the default client before authority lookup or transport", async () => {
   const fixture = linearAgentFixture();
   const defaultClient = client(fixture);
-  await assert.rejects(defaultClient.createActivity(pilotActivity), { code: "invalid_input" });
-  await assert.rejects(defaultClient.isActivityConfirmed(pilotReadback), { code: "invalid_input" });
+  await assert.rejects(
+    defaultClient.createActivity({ ...pilotActivity, activityId: nonV4ActivityId }),
+    {
+      code: "invalid_input",
+    },
+  );
+  await assert.rejects(
+    defaultClient.isActivityConfirmed({ ...pilotReadback, activityId: nonV4ActivityId }),
+    {
+      code: "invalid_input",
+    },
+  );
   assert.deepEqual(fixture.lookups, []);
   assert.deepEqual(fixture.calls, []);
 });
 
-it("pilot UUIDv5 busy response requires the continue signal in mutation and exact readback", async () => {
+it("pilot busy response requires the continue signal in mutation and exact readback", async () => {
   const content = { type: "response", body: "The earlier turn is still running." } as const;
   const request = { ...pilotActivity, content, signal: "continue" } as const;
   const readback = { ...pilotReadback, kind: "response", signal: "continue" } as const;
@@ -332,7 +390,7 @@ it("pilot UUIDv5 busy response requires the continue signal in mutation and exac
     };
   });
   const opts = { ...fixture.options, binding: linearAgentBinding(fixture.a) };
-  const pilot = createLinearAgentClient({ ...opts, activityIdVersion: 5 });
+  const pilot = createLinearAgentClient({ ...opts, pilotOperations: true });
   assert.equal(await pilot.createActivity(request), pilotActivityId);
   assert.equal(await pilot.isActivityConfirmed(readback), true);
   returnedSignal = null;
@@ -653,7 +711,7 @@ it("refuses a pilot refresh when the lease omits its transaction query handle", 
   const api = createLinearAgentClient({
     ...fixture.options,
     binding: linearAgentBinding(fixture.a),
-    activityIdVersion: 5,
+    pilotOperations: true,
     authorizeRefresh: async () => {
       checkedAuthority = true;
       return true;

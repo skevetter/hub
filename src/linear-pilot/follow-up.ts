@@ -3,7 +3,11 @@ import { z } from "zod";
 import { DaemonResponseLostError } from "../daemons/protocol.js";
 import { DatabaseUnavailableError } from "../db/errors.js";
 import type { RefusalCode } from "../interactive-sessions/types.js";
-import { LinearAgentError, type LinearAgentOperation } from "../providers/linear/agent.js";
+import {
+  LinearAgentError,
+  type LinearAgentErrorDetails,
+  type LinearAgentOperation,
+} from "../providers/linear/agent.js";
 import { surfaceRevision, type BindingKey } from "../surfaces/store.js";
 import type { PilotRefusal } from "./binding.js";
 import {
@@ -67,7 +71,7 @@ interface FreshTurn {
 type StopOutcome = "stopped" | "duplicate" | "ignored" | "unconfirmed";
 type FollowUpOutcome = StopOutcome | "started" | "busy";
 
-export interface PilotFailure {
+export interface PilotFailure extends LinearAgentErrorDetails {
   sessionId: string;
   failureCode:
     | LinearAgentError["code"]
@@ -88,12 +92,13 @@ export interface PilotFailure {
 
 export function pilotExceptionFields(
   error: unknown,
-): Pick<PilotFailure, "failureCode" | "httpStatus"> {
+): Pick<PilotFailure, "failureCode" | "httpStatus"> & LinearAgentErrorDetails {
   return {
     failureCode: pilotExceptionCode(error),
     ...(error instanceof LinearAgentError && error.status !== undefined
       ? { httpStatus: error.status }
       : {}),
+    ...(error instanceof LinearAgentError ? error.details : undefined),
   };
 }
 

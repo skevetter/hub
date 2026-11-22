@@ -171,7 +171,15 @@ describe("Linear pilot follow-up admission", () => {
   it.each([
     { error: new TypeError("private-token-canary private-body-canary"), code: "TypeError" },
     { error: new LinearAgentError("policy_required"), code: "policy_required" },
-    { error: new LinearAgentError("request_failed", 503), code: "request_failed", status: 503 },
+    {
+      error: new LinearAgentError("request_failed", 200, {
+        linearErrorType: "invalid input",
+        linearErrorKinds: ["BAD_USER_INPUT"],
+        linearErrorText: "Linear GraphQL invalid activity ID",
+      }),
+      code: "request_failed",
+      status: 200,
+    },
     { error: "private-token-canary private-body-canary", code: "unknown_error" },
   ])("logs safe diagnostics for $code", async ({ error, code, status }) => {
     const f = fixture();
@@ -186,11 +194,13 @@ describe("Linear pilot follow-up admission", () => {
     const handle = createPilotFollowUp({ ...f.options, reportFailure });
 
     expect(await handle(scope, delivered)).toBe("unconfirmed");
+    const details = error instanceof LinearAgentError ? error.details : undefined;
     expect(reportFailure).toHaveBeenCalledExactlyOnceWith({
       sessionId: scope.nativeSessionId,
       failureCode: code,
       operation: "prompted",
       ...(status === undefined ? {} : { httpStatus: status }),
+      ...details,
     });
     expect(records).toHaveLength(1);
     expect(records[0]).toContain(`"failureCode":"${code}"`);
@@ -200,6 +210,7 @@ describe("Linear pilot follow-up admission", () => {
     } else {
       expect(records[0]).toContain(`"httpStatus":${status}`);
     }
+    if (details) expect(JSON.parse(records[0]!)).toMatchObject(details);
     expect(records[0]).not.toMatch(/private-(token|body|name)-canary/u);
   });
 });
