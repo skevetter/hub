@@ -53,9 +53,5 @@ export function DeviceCard({
 }
 
 export function DeviceCardSkeleton({ detailCount }: { detailCount: number }) {
-  return (
-    <div className="min-w-0 motion-reduce:[&_[data-slot=skeleton]]:animate-none">
-      <CardSkeleton lines={detailCount + 3} />
-    </div>
-  );
+  return <CardSkeleton lines={detailCount + 3} />;
 }

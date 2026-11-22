@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, it, vi } from "vitest";
-import { DaemonDevice, DaemonResults } from "./daemon-list.js";
+import { ConnectAnotherDaemon, DaemonDevice, DaemonResults } from "./daemon-list.js";
 import type { BrowserDaemon } from "./functions.js";
 
 vi.mock("@tanstack/react-router", () => ({
@@ -67,6 +67,21 @@ it("offers the grant command for a connected-only daemon while providers load", 
   assert.match(markup, /Connected only: Hub cannot start agents here/u);
   assert.match(markup, /paseo hub permissions grant hub\.execute/u);
   assert.match(markup, /aria-label="Copy grant command"/u);
+});
+
+it("wraps the grant command between words so no word is cut in a narrow column", () => {
+  const markup = renderToStaticMarkup(
+    <DaemonDevice daemon={connectedOnly} organizationSlug="acme" />,
+  );
+  assert.match(markup, /class="[^"]*wrap-anywhere[^"]*">paseo hub permissions grant/u);
+});
+
+it("keeps the login command reachable once a daemon is connected", () => {
+  vi.stubGlobal("window", { location: { origin: "https://hub.example.test" } });
+  const markup = renderToStaticMarkup(<ConnectAnotherDaemon />);
+  assert.match(markup, /<h2[^>]*>Connect another daemon<\/h2>/u);
+  assert.match(markup, /paseo hub login https:\/\/hub\.example\.test/u);
+  assert.match(markup, /https:\/\/paseo\.sh\/docs\/hub\/daemons/u);
 });
 
 it("offers the host-specific login command and docs when no daemons exist", () => {
