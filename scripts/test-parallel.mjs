@@ -33,11 +33,15 @@ export function partitionFiles(files, count) {
   return [...pinned.map(({ path }) => [path]), ...shards.map((shard) => shard.files)];
 }
 
+function incompleteSummary(count) {
+  return count ? `, ${count} files without a result` : "";
+}
+
 function printRun(print, name, files, result) {
   const { passed, failed, skipped } = result.counts;
   const seconds = (result.durationMs / 1000).toFixed(2);
   print(
-    `${name}: ${result.exitCode === 0 ? "PASS" : "FAIL"} in ${seconds}s, ${files.length} files, ${passed} passed, ${failed} failed, ${skipped} skipped`,
+    `${name}: ${result.exitCode === 0 ? "PASS" : "FAIL"} in ${seconds}s, ${files.length} files, ${passed} passed, ${failed} failed, ${skipped} skipped${incompleteSummary(result.incompleteFiles)}`,
   );
   if (result.diagnostic) print(`  ${name}: ${result.diagnostic}`);
   for (const file of result.failedFiles) print(`  ${name}: ${file}`);
@@ -51,20 +55,14 @@ export async function runShards(groups, { execute, print, signal }) {
   const outcomes = await Promise.allSettled(
     groups.map(async (files, index) => {
       const name = `Shard ${index + 1}`;
-      let result = await execute(name, files);
-      if (result.exitCode !== 0 && !result.failedFiles.length && !signal?.aborted) {
-        result = {
-          ...result,
-          failedFiles: files,
-          counts: { ...result.counts, failed: Math.max(files.length, result.counts.failed) },
-        };
-      }
+      const result = await execute(name, files);
       printRun(print, name, files, result);
       return result;
     }),
   );
   const total = { files: groups.flat().length, passed: 0, failed: 0, skipped: 0 };
   const failedFiles = [];
+  let incompleteFiles = 0;
   let interruptedFiles = 0;
   let exitCode = Number(Boolean(signal?.aborted));
   for (const [index, outcome] of outcomes.entries()) {
@@ -72,8 +70,8 @@ export async function runShards(groups, { execute, print, signal }) {
       exitCode = 1;
       const files = groups[index];
       failedFiles.push(...files);
+      incompleteFiles += files.length;
       if (signal?.aborted && outcome.reason === signal.reason) interruptedFiles += files.length;
-      else total.failed += files.length;
       print(
         `Shard ${index + 1}: FAIL. Runner stopped (${outcome.reason?.code ?? outcome.reason}). Files without a result: ${files.join(", ")}`,
       );
@@ -85,11 +83,12 @@ export async function runShards(groups, { execute, print, signal }) {
       // The report cannot always attribute a process failure to an individual file.
       failedFiles.push(...groups[index]);
     }
+    incompleteFiles += result.incompleteFiles ?? 0;
     interruptedFiles += result.interruptedFiles ?? 0;
     for (const key of ["passed", "failed", "skipped"]) total[key] += result.counts[key];
   }
   print(
-    `Total: ${total.files} files, ${total.passed} passed, ${total.failed} failed, ${total.skipped} skipped`,
+    `Total: ${total.files} files, ${total.passed} passed, ${total.failed} failed, ${total.skipped} skipped${incompleteSummary(incompleteFiles)}`,
   );
 
   printInterrupted(print, signal, interruptedFiles);
@@ -211,6 +210,7 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
     [
       "run",
       "--reporter=json",
+      "--reporter=default",
       `--outputFile=${reportPath}`,
       ...files.map((file) => join(root, file)),
     ],
@@ -229,8 +229,9 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
       exitCode: 1,
       durationMs,
       failedFiles: files,
+      incompleteFiles: files.length,
       interruptedFiles: signal.aborted ? files.length : 0,
-      counts: { passed: 0, failed: signal.aborted ? 0 : files.length, skipped: 0 },
+      counts: { passed: 0, failed: 0, skipped: 0 },
       diagnostic: `Vitest exited without a readable JSON report (exit ${run.exitCode}, ${run.processError ?? "no signal"}). Files without a result: ${files.join(", ")}. See ${log}`,
     };
   }
@@ -265,19 +266,15 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
   if (missing.length) diagnostics.push(`Files without a result: ${missing.join(", ")}`);
   if (extra.length) diagnostics.push(`Unexpected files in report: ${extra.join(", ")}`);
   if (exitCode) diagnostics.push(`See ${log} and ${reportPath}`);
-  const failures = [...new Set([...failedFiles, ...missing])];
-  if (exitCode && !failures.length && !signal.aborted) failures.push(...files);
   return {
     exitCode,
     durationMs,
-    failedFiles: failures,
+    failedFiles,
+    incompleteFiles: missing.length,
     interruptedFiles: signal.aborted ? missing.length : 0,
     counts: {
       passed: report.numPassedTests,
-      failed: signal.aborted
-        ? report.numFailedTests
-        : Math.max(report.numFailedTests, failedFiles.length) +
-          (failures.length - failedFiles.length),
+      failed: report.numFailedTests,
       skipped: report.testResults
         .flatMap(({ assertionResults }) => assertionResults ?? [])
         .filter(({ status }) => status === "skipped" || status === "todo").length,
