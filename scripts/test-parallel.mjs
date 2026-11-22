@@ -323,7 +323,7 @@ async function main(signal) {
     options: { root: { type: "string" }, "rerun-failed": { type: "boolean" } },
   });
   const root = repositoryFor(import.meta.url, values.root);
-  printRunContext(
+  const { head } = printRunContext(
     root,
     values["rerun-failed"] ? "rerun failed Vitest files" : "run the sharded Vitest suite",
   );
@@ -369,7 +369,7 @@ async function main(signal) {
       signal.throwIfAborted();
       lock.release();
       lock = undefined;
-      publishTestMetrics(runs, [], root, signal);
+      publishTestMetrics(runs, [], root, { signal, expectedHead: head });
       if (timings) {
         try {
           writeJson(join(parallelCache, "results.json"), timings);

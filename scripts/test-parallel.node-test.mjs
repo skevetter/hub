@@ -724,3 +724,28 @@ test("parallel testing rejects failed JSON assertions even when Vitest exits zer
   assert.match(result.stdout, /Shard 1: FAIL/u);
   await assert.rejects(readFile(metrics), { code: "ENOENT" });
 });
+
+test("parallel testing cannot publish metrics after HEAD changes during the run", async (t) => {
+  const { root, args, options } = await parallelFixture(
+    t,
+    `
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("git", [
+      "-c", "user.name=Test", "-c", "user.email=test@example.test",
+      "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+      "commit", "--allow-empty", "--quiet", "-m", "Change fixture HEAD",
+    ]);
+    writeFileSync(reportPath, JSON.stringify(report));
+  `,
+  );
+  const metrics = join(root, "metrics.json");
+  const result = spawnSync(process.execPath, args, {
+    ...options,
+    env: { ...options.env, HUB_TEST_RUN_REPORT: metrics },
+    encoding: "utf8",
+    timeout: 5000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /HEAD changed while the test runner was active/u);
+  await assert.rejects(readFile(metrics), { code: "ENOENT" });
+});

@@ -14,7 +14,7 @@ import {
   repositoryFor,
   requireGit,
 } from "./test-context.mjs";
-import { publishTestMetrics } from "./test-receipt.mjs";
+import { publishTestMetrics, readTestMetrics } from "./test-receipt.mjs";
 import { takeFullSuiteLock, waitForTestGroup, watchTestSignals } from "./test-worker-group.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 
@@ -332,7 +332,10 @@ async function main(signal) {
     options: { base: { type: "string" }, safe: { type: "boolean" }, root: { type: "string" } },
   });
   const root = repositoryFor(import.meta.url, values.root);
-  printRunContext(root, `run Vitest files affected by changes${values.safe ? " with --safe" : ""}`);
+  const { head } = printRunContext(
+    root,
+    `run Vitest files affected by changes${values.safe ? " with --safe" : ""}`,
+  );
   const base = resolveBase(values.base, (args) => git(root, args));
   const changes = combinePaths(
     requireGit(root, ["diff", "--no-renames", "--name-only", "-z", base.tree, "--"]),
@@ -388,8 +391,9 @@ async function main(signal) {
         graceMs: 12_000,
       });
       if (result !== 0) return result;
-      const { selectedFiles, counts } = JSON.parse(await readFile(metrics, "utf8"));
-      completed = { files: selectedFiles, counts };
+      const fullRun = await readTestMetrics(metrics, root, head);
+      if (!fullRun) throw new Error("The parallel runner did not publish test metrics.");
+      completed = { files: fullRun.selectedFiles, counts: fullRun.counts };
     } else {
       const direct = await selectedVitest(
         supervisor,
@@ -414,7 +418,7 @@ async function main(signal) {
       lock?.release();
     }
   }
-  publishTestMetrics([completed], checks, root, signal);
+  publishTestMetrics([completed], checks, root, { signal, expectedHead: head });
   return 0;
 }
 

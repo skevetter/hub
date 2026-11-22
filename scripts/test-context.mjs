@@ -50,6 +50,7 @@ export function printRunContext(root, action) {
   console.log(`Worktree: ${repo.dirty ? "dirty" : "clean"}`);
   console.log(`CWD: ${realpathSync(process.cwd())}`);
   console.log(`Run: ${action}`);
+  return repo;
 }
 
 export function passedVitestReport(report) {
