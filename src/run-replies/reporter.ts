@@ -27,6 +27,7 @@ export class RunReplyReporter {
   private readonly captured = new Map<string, CapturedRun>();
   private readonly shutdown = new AbortController();
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private wakeAt = Infinity;
   private started = false;
   private processing: Promise<void> | undefined;
 
@@ -46,14 +47,20 @@ export class RunReplyReporter {
   start(): void {
     if (this.started || this.shutdown.signal.aborted) return;
     this.started = true;
-    this.schedule(IDLE_POLL_MS);
+    this.schedule(POLL_MS);
   }
 
+  // A pending wake is never pushed back, so a steady stream of captures cannot starve a cycle.
   // A captured answer needs the fast cadence; with none waiting a slow check is enough.
   private schedule(delay: number): void {
     if (!this.started || this.shutdown.signal.aborted) return;
+    const due = Date.now() + delay;
+    if (this.timer !== undefined && this.wakeAt <= due) return;
     clearTimeout(this.timer);
+    this.wakeAt = due;
     this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.wakeAt = Infinity;
       void this.processAvailable()
         .catch(() => {
           if (!this.shutdown.signal.aborted) this.options.onFailure?.();
