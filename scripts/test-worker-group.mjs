@@ -57,8 +57,10 @@ function groupAlive(pid) {
 function signalGroup(pid, signal) {
   try {
     process.kill(-pid, signal);
+    return true;
   } catch (error) {
     if (error.code !== "ESRCH") throw error;
+    return false;
   }
 }
 
@@ -72,15 +74,15 @@ async function waitForGroup(pid, duration) {
 }
 
 export async function stopGroup(pid, signal, graceMs = gracePeriod) {
-  if (!groupAlive(pid)) return;
-  signalGroup(pid, signal);
-  if (await waitForGroup(pid, graceMs)) return;
+  if (!groupAlive(pid) || !signalGroup(pid, signal)) return false;
+  if (await waitForGroup(pid, graceMs)) return true;
   signalGroup(pid, "SIGKILL");
   if (!(await waitForGroup(pid, gracePeriod))) {
     throw new Error(
       `Test process group ${pid} is still running after SIGKILL. The lock stays in place.`,
     );
   }
+  return true;
 }
 
 function snapshot(path) {
@@ -247,7 +249,7 @@ export async function runWorkerGroup(args, { cwd, env, log, lock, signal, graceM
       graceMs,
       start: () => child.stdin.write("start\n"),
     });
-    return { exitCode, processError: error ? (error.code ?? "spawn error") : childSignal };
+    return { exitCode, processError: error ? (error.code ?? error.message) : childSignal };
   } finally {
     child.stdin.destroy();
   }
@@ -274,6 +276,8 @@ export async function waitForTestGroup(child, { signal, lock, graceMs = gracePer
   };
   signal?.addEventListener("abort", interrupt, { once: true });
   let registered = false;
+  let result;
+  let stoppedBackground = false;
   try {
     if (signal?.aborted) interrupt();
     else {
@@ -281,13 +285,15 @@ export async function waitForTestGroup(child, { signal, lock, graceMs = gracePer
       registered = Boolean(lock);
       start?.();
     }
-    const result = await Promise.race([exited, interrupted.promise]);
+    result = await Promise.race([exited, interrupted.promise]);
     await drainOutput();
-    return result;
   } finally {
     try {
-      stopping ??= stopGroup(child.pid, "SIGTERM", exitGraceMs);
-      await stopping;
+      if (stopping) await stopping;
+      else {
+        stopping = stopGroup(child.pid, "SIGTERM", exitGraceMs);
+        stoppedBackground = await stopping;
+      }
       await drainOutput();
       if (registered) lock.forget(child.pid);
     } finally {
@@ -296,4 +302,12 @@ export async function waitForTestGroup(child, { signal, lock, graceMs = gracePer
       signal?.removeEventListener("abort", interrupt);
     }
   }
+  if (result.exitCode === 0 && stoppedBackground) {
+    return {
+      ...result,
+      exitCode: 1,
+      error: new Error("Background children were still running after the command exited."),
+    };
+  }
+  return result;
 }

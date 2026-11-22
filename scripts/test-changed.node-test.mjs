@@ -508,3 +508,59 @@ test("TERM during changed-runner cleanup prevents successful metrics", async (t)
   assert.deepEqual(saved.selectedFiles, ["src/typography-policy.test.ts"]);
   assert.deepEqual(saved.counts, { passed: 1, failed: 0, skipped: 0 });
 });
+
+test("the changed runner fails if a passing worker leaves background children", async (t) => {
+  const { root } = await changedFixture(t, {
+    "node_modules/vitest/vitest.mjs": `
+      import { spawn } from "node:child_process";
+      import { writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      if (process.argv[2] === "run") {
+        const path = process.argv.find((arg) => arg.startsWith("--outputFile=")).slice(13);
+        writeFileSync(path, JSON.stringify({
+          success: true, numPassedTests: 1, numFailedTests: 0, numTotalTests: 1,
+          testResults: [{ name: join(process.cwd(), "src/typography-policy.test.ts"),
+            status: "passed", assertionResults: [{ status: "passed" }] }],
+        }));
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3500)"],
+          { stdio: ["ignore", "inherit", "inherit"] });
+        writeFileSync("status-descendant", String(child.pid));
+        child.unref();
+      }
+    `,
+  });
+  const metrics = join(root, "status-metrics.json");
+  const lock = join(root, "status-lock");
+  const temp = join(root, "status-tmp");
+  await mkdir(temp);
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [join(root, "scripts/test-changed.mjs"), "--base", "HEAD"],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          TMPDIR: temp,
+          HUB_TEST_FULLSUITE_LOCK: lock,
+          HUB_TEST_RUN_REPORT: metrics,
+        },
+        encoding: "utf8",
+        timeout: 5000,
+      },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /background children were still running/iu);
+    await assert.rejects(readFile(metrics), { code: "ENOENT" });
+    await assert.rejects(readFile(lock), { code: "ENOENT" });
+  } finally {
+    const pid = Number(await readFile(join(root, "status-descendant"), "utf8").catch(() => ""));
+    if (pid) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+  }
+});
