@@ -174,6 +174,190 @@ it("activity readback is bounded to the exact native session", async () => {
   assert.equal(failed.calls.length, 2);
 });
 
+const pilotActivityId = "bc3df002-8eba-517f-8202-a571fcd5daf5";
+const pilotActivity = { ...activity, activityId: pilotActivityId };
+const pilotReadback = { sessionId, activityId: pilotActivityId, kind: "thought" } as const;
+
+it("pilot history reads only a verified prompt and a bounded preceding page through L1", async () => {
+  const createdAt = "2026-01-01T00:00:06.000Z";
+  const owner = { id: "pilot-owner" };
+  const appUser = { id: "app-user-a" };
+  const issue = { id: "active-issue" };
+  const prompt = {
+    id: activityId,
+    createdAt,
+    agentSession: { id: sessionId },
+    user: owner,
+    promptAuthor: owner,
+    signal: null,
+    content: { __typename: "AgentActivityPromptContent", type: "prompt", body: "Owner prompt" },
+  };
+  const fixture = linearAgentFixture((operation) => ({
+    data: {
+      agentSession: {
+        id: sessionId,
+        appUser,
+        issue,
+        activities: {
+          nodes: operation === "PaseoPilotPrompt" ? [prompt] : [],
+          pageInfo: completePage,
+        },
+      },
+    },
+  }));
+  const options = { ...fixture.options, binding: linearAgentBinding(fixture.a) };
+  const pilot = createLinearAgentClient({ ...options, activityIdVersion: 5 });
+  const scope = {
+    sessionId,
+    issueId: issue.id,
+    appUserId: appUser.id,
+    allowedHumanProviderUserId: owner.id,
+  };
+  const anchor = { activityId, body: prompt.content.body };
+
+  await assert.rejects(createLinearAgentClient(options).readPilotPrompt(scope, anchor), {
+    code: "invalid_input",
+  });
+  assert.equal(fixture.lookups.length, 0);
+  assert.equal(
+    (await pilot.readPilotPrompt(scope, anchor))?.activities.nodes[0]?.content.body,
+    anchor.body,
+  );
+  assert.deepEqual(fixture.calls.at(-1)?.variables, { sessionId, activityId });
+  assert.equal(
+    await pilot.readPilotPrompt({ ...scope, issueId: "other-issue" }, anchor),
+    undefined,
+  );
+  assert.equal((await pilot.readPilotHistory(scope, createdAt))?.activities.nodes.length, 0);
+  assert.deepEqual(fixture.calls.at(-1)?.variables, { sessionId, before: createdAt });
+  assert.match(fixture.calls.at(-1)?.query ?? "", /first: 24/u);
+
+  fixture.approved.delete(fixture.a.id);
+  const previousLookups = fixture.lookups.length;
+  await assert.rejects(pilot.readPilotHistory(scope, createdAt), { code: "policy_required" });
+  assert.equal(fixture.lookups.length, previousLookups);
+});
+
+it("pilot UUIDv5 round-trips through create and exact readback", async () => {
+  let resultId = pilotActivityId;
+  const fixture = linearAgentFixture((operation, call) => {
+    if (operation === "PaseoAgentActivityCreate") {
+      assert.deepEqual(call.variables, {
+        input: { agentSessionId: sessionId, id: pilotActivityId, content: thought },
+      });
+      return activityResult("app-user-a", true, resultId);
+    }
+    assert.equal(operation, "PaseoAgentActivityReadback");
+    assert.deepEqual(call.variables, { sessionId, activityId: pilotActivityId });
+    const appUser = { id: "app-user-a" };
+    const row = {
+      id: resultId,
+      agentSession: { id: sessionId },
+      user: appUser,
+      content: { __typename: "AgentActivityThoughtContent", type: "thought" },
+    };
+    return {
+      data: {
+        agentSession: {
+          id: sessionId,
+          appUser,
+          activities: { nodes: [row], pageInfo: completePage },
+        },
+      },
+    };
+  });
+  const options = {
+    ...fixture.options,
+    binding: linearAgentBinding(fixture.a),
+    activityIdVersion: 5 as const,
+  };
+  const pilot = createLinearAgentClient(options);
+  assert.equal(await pilot.createActivity(pilotActivity), pilotActivityId);
+  assert.equal(await pilot.isActivityConfirmed(pilotReadback), true);
+  resultId = activityId;
+  await assert.rejects(pilot.createActivity(pilotActivity), { code: "invalid_response" });
+  assert.equal(await pilot.isActivityConfirmed(pilotReadback), false);
+  const calls = fixture.calls.length;
+  await assert.rejects(pilot.createActivity(activity), { code: "invalid_input" });
+  await assert.rejects(pilot.isActivityConfirmed({ ...pilotReadback, activityId }), {
+    code: "invalid_input",
+  });
+  assert.equal(fixture.calls.length, calls);
+});
+
+it("pilot UUIDv5 is refused by the default client before authority lookup or transport", async () => {
+  const fixture = linearAgentFixture();
+  const defaultClient = client(fixture);
+  await assert.rejects(defaultClient.createActivity(pilotActivity), { code: "invalid_input" });
+  await assert.rejects(defaultClient.isActivityConfirmed(pilotReadback), { code: "invalid_input" });
+  assert.deepEqual(fixture.lookups, []);
+  assert.deepEqual(fixture.calls, []);
+});
+
+it("pilot UUIDv5 busy response requires the continue signal in mutation and exact readback", async () => {
+  const content = { type: "response", body: "The earlier turn is still running." } as const;
+  const request = { ...pilotActivity, content, signal: "continue" } as const;
+  const readback = { ...pilotReadback, kind: "response", signal: "continue" } as const;
+  let returnedSignal: "continue" | "stop" | null = "continue";
+  const appUser = { id: "app-user-a" };
+  const fixture = linearAgentFixture((operation, call) => {
+    assert.match(call.query, /\bsignal\b/u);
+    const row = {
+      id: pilotActivityId,
+      agentSession: { id: sessionId },
+      user: appUser,
+      signal: returnedSignal,
+    };
+    if (operation === "PaseoAgentActivityCreate") {
+      assert.deepEqual(call.variables, {
+        input: { agentSessionId: sessionId, id: pilotActivityId, content, signal: "continue" },
+      });
+      return { data: { agentActivityCreate: { success: true, agentActivity: row } } };
+    }
+    assert.equal(operation, "PaseoAgentActivityReadback");
+    assert.deepEqual(call.variables, { sessionId, activityId: pilotActivityId });
+    return {
+      data: {
+        agentSession: {
+          id: sessionId,
+          appUser,
+          activities: {
+            nodes: [
+              { ...row, content: { __typename: "AgentActivityResponseContent", type: "response" } },
+            ],
+            pageInfo: completePage,
+          },
+        },
+      },
+    };
+  });
+  const opts = { ...fixture.options, binding: linearAgentBinding(fixture.a) };
+  const pilot = createLinearAgentClient({ ...opts, activityIdVersion: 5 });
+  assert.equal(await pilot.createActivity(request), pilotActivityId);
+  assert.equal(await pilot.isActivityConfirmed(readback), true);
+  returnedSignal = null;
+  await assert.rejects(pilot.createActivity(request), { code: "mutation_unconfirmed" });
+  assert.equal(await pilot.isActivityConfirmed(readback), false);
+  returnedSignal = "stop";
+  assert.equal(await pilot.isActivityConfirmed(readback), false);
+
+  const calls = fixture.calls.length;
+  const defaultClient = createLinearAgentClient(opts);
+  await assert.rejects(defaultClient.createActivity({ ...request, activityId }), {
+    code: "invalid_input",
+  });
+  await assert.rejects(defaultClient.isActivityConfirmed({ ...readback, activityId }), {
+    code: "invalid_input",
+  });
+  await assert.rejects(pilot.createActivity({ ...request, content: thought }), {
+    code: "invalid_input",
+  });
+  await assert.rejects(pilot.isActivityConfirmed({ ...readback, kind: "thought" }), {
+    code: "invalid_input",
+  });
+  assert.equal(fixture.calls.length, calls);
+});
+
 it("addition of the authenticated Hub URL does not overwrite existing URLs", async () => {
   const links = [{ label: "Existing", url: "https://example.test/existing" }];
   const fixture = linearAgentFixture((operation, call) => {

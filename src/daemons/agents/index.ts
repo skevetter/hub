@@ -47,7 +47,7 @@ const TimelinePageSchema = FetchAgentTimelineResponseMessageSchema.shape.payload
 export type AgentSnapshot = z.infer<typeof SnapshotSchema>;
 export type AgentEvent =
   | { type: "agent_update" | "agent_snapshot"; agent: AgentSnapshot; timestamp: string }
-  | ({ type: "agent_stream" } & z.infer<typeof StreamSchema>);
+  | ({ type: "agent_stream"; wireTimestamp?: string } & z.infer<typeof StreamSchema>);
 type AgentTimelineCursor = z.infer<typeof AgentTimelineCursorSchema>;
 interface AgentTimelineQuery {
   direction: "tail" | "before" | "after";
@@ -74,7 +74,11 @@ export interface AgentConnection {
     onWritten?: () => void,
   ): Promise<void>;
   archiveAgent?(agentId: string, timeoutMs?: number): Promise<void>;
-  watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void>;
+  watch(
+    agentId: string,
+    listener: (event: AgentEvent) => void,
+    authorize?: () => Promise<boolean>,
+  ): Promise<() => void>;
 }
 
 const EnvelopeSchema = z.object({
@@ -154,6 +158,9 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
         this.emit(stream.data.agentId, {
           type,
           ...stream.data,
+          ...(stream.data.event.type === "turn_started"
+            ? { wireTimestamp: stream.data.timestamp }
+            : {}),
           timestamp: this.now().toISOString(),
         });
       return true;
@@ -276,8 +283,13 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
   async archiveAgent(agentId: string, timeoutMs?: number): Promise<void> {
     await this.request({ type: "archive_agent_request", agentId }, timeoutMs);
   }
-  async watch(agentId: string, listener: (event: AgentEvent) => void): Promise<() => void> {
+  async watch(
+    agentId: string,
+    listener: (event: AgentEvent) => void,
+    authorize?: () => Promise<boolean>,
+  ): Promise<() => void> {
     this.assertOpen();
+    if (authorize && !(await authorize())) throw new DaemonFrameNotSentError();
     const listeners = this.listeners.get(agentId) ?? new Set();
     listeners.add(listener);
     this.listeners.set(agentId, listeners);
@@ -290,6 +302,7 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
         });
         this.assertOpen();
         this.observing = true;
+        if (authorize && !(await authorize())) throw new DaemonFrameNotSentError();
       }
       await this.request({
         type: "agent.timeline.set_subscription.request",
@@ -297,6 +310,7 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
       });
       // Subscribe before reading so a state change after the snapshot is still observed.
       // Fetch individually: the directory is paginated and later watches share its subscription.
+      if (authorize && !(await authorize())) throw new DaemonFrameNotSentError();
       try {
         const response = await this.request({ type: "fetch_agent_request", agentId });
         this.assertOpen();

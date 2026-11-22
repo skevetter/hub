@@ -47,6 +47,28 @@ it.each([
   }
 });
 
+it.each([
+  { configuration: "{invalid", error: "PASEO_HUB_LINEAR_PILOT" },
+  {
+    configuration: JSON.stringify({
+      hubOrganizationId: "synthetic-hub-org",
+      linearOrganizationId: "synthetic-linear-workspace",
+      allowedHumanId: "synthetic-owner",
+      profileId: "32624952-2c32-4b06-92a4-fc6e6c9f224d",
+    }),
+    error: "PASEO_HUB_INTERACTIVE_SESSIONS",
+  },
+])("refuses invalid Linear pilot startup before opening the database ($error)", async (input) => {
+  vi.stubEnv("DATABASE_URL", "postgres://postgres@127.0.0.1:1/postgres");
+  vi.stubEnv("PASEO_HUB_LINEAR_PILOT", input.configuration);
+  vi.stubEnv("PASEO_HUB_INTERACTIVE_SESSIONS", "false");
+  try {
+    await expect(startProductionRuntime()).rejects.toThrow(input.error);
+  } finally {
+    await stopApplication().catch(() => undefined);
+  }
+});
+
 it("keeps the disabled runtime off the daemon and refuses its stream", async () => {
   const begin = vi.spyOn(InteractiveSessionCoordinator.prototype, "begin");
   const recover = vi.spyOn(InteractiveSessionCoordinator.prototype, "recoverDaemon");

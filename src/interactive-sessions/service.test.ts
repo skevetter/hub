@@ -199,6 +199,60 @@ describe("interactive session service", () => {
     coordinator.start.mockResolvedValue(accepted);
   });
 
+  it("keeps native transcripts private and denies browser mutations even to the owner", async () => {
+    const native = {
+      ...session,
+      origin: "linear" as const,
+      startedByUserId: "owner",
+      requesterIdentityId: randomUUID(),
+    };
+    findSession.mockResolvedValue({
+      session: native,
+      participants: [...participants, { ...participants[0]!, userId: "owner" }],
+    });
+    await expect(service.snapshot(request("admin"), scope)).rejects.toMatchObject({
+      code: "not_found",
+    });
+    await expect(
+      service.history(request("controller"), { ...scope, before: null, limit: 20 }),
+    ).rejects.toMatchObject({ code: "not_found" });
+    await expect(service.authorizeStream(request("viewer"), "org", sessionId)).resolves.toBe(
+      "not_found",
+    );
+    const browserOwner = request("owner", "https://hub.test");
+    await expect(service.snapshot(request("owner"), scope)).resolves.toMatchObject({
+      capabilities: {
+        send: false,
+        stop: false,
+        close: false,
+        replaceAgent: false,
+        manageParticipants: false,
+      },
+    });
+    for (const kind of ["stop", "close", "replace"] as const) {
+      await expect(service.command(browserOwner, { ...control, kind })).resolves.toEqual({
+        outcome: "refused",
+        code: "forbidden",
+      });
+    }
+    await expect(
+      service.command(browserOwner, {
+        ...control,
+        kind: "send",
+        delivery: "steer",
+        message: "Browser-only message",
+      }),
+    ).resolves.toEqual({ outcome: "refused", code: "forbidden" });
+    await expect(
+      service.participants(browserOwner, { ...scope, userId: "admin", role: "controller" }),
+    ).resolves.toEqual({ outcome: "refused", code: "forbidden" });
+    expect(coordinator.send).not.toHaveBeenCalled();
+    expect(coordinator.stop).not.toHaveBeenCalled();
+    expect(coordinator.close).not.toHaveBeenCalled();
+    expect(coordinator.replaceAgent).not.toHaveBeenCalled();
+    expect(timeline).not.toHaveBeenCalled();
+  });
+
   it("normalizes history and cursor catch-up through the same prose projection", async () => {
     const at = now.toISOString();
     timeline.mockResolvedValue({

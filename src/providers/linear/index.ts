@@ -26,7 +26,11 @@ import { LinearRunReplyWriter } from "../../run-replies/linear.js";
 import { readTimelineScrubValues } from "../../run-timeline/secrets.js";
 import { createLinearTriggerProvider } from "../../triggers/linear/provider.js";
 import { createLinearReplyExecutor } from "../../triggers/linear/reply.js";
-import { createLinearWebhookSource } from "../../triggers/linear/webhook.js";
+import {
+  createLinearWebhookSource,
+  type LinearWebhookSourceOptions,
+} from "../../triggers/linear/webhook.js";
+import { createLinearAgentClient } from "./agent.js";
 import type { ProviderConnectionRegistration, ProviderRegistration } from "../registration.js";
 import {
   createLinearApiClient,
@@ -43,6 +47,29 @@ export interface LinearRegistrationConfiguration {
   webhookSecret: string;
 }
 
+type PilotClientAuthority = Pick<
+  Parameters<typeof createLinearAgentClient>[0],
+  "binding" | "authorize"
+>;
+
+interface LinearPilotProvider {
+  oauthClientId: string;
+  activityClient(authority: PilotClientAuthority): ReturnType<typeof createLinearAgentClient>;
+}
+
+export interface LinearPilotRegistration {
+  offer(
+    event: Parameters<NonNullable<LinearWebhookSourceOptions["offerVerifiedLinearPilotEvent"]>>[0],
+    provider: LinearPilotProvider,
+  ): boolean | Promise<boolean>;
+  suppressComment?(
+    event: Parameters<
+      NonNullable<LinearWebhookSourceOptions["suppressVerifiedLinearPilotComment"]>
+    >[0],
+    provider: LinearPilotProvider,
+  ): boolean | Promise<boolean>;
+}
+
 export interface CreateLinearRegistrationOptions {
   database: Database | null;
   auth: AuthServer | null;
@@ -52,6 +79,7 @@ export interface CreateLinearRegistrationOptions {
   configuration?: LinearRegistrationConfiguration | null;
   connectionClient?: LinearConnectionClient;
   apiClient?: LinearApiClient;
+  linearPilot?: LinearPilotRegistration;
   fetch?: typeof fetch;
   configurationVersion?: number;
   expectedConfigurationVersion?: number;
@@ -82,16 +110,18 @@ export function createLinearRegistration(
   options: CreateLinearRegistrationOptions,
 ): ProviderRegistration {
   const configuration = options.configuration ?? null;
-  if (configuration === null || options.publicBaseUrl === undefined) {
+  const publicBaseUrl = options.publicBaseUrl;
+  if (configuration === null || publicBaseUrl === undefined) {
     return emptyLinearRegistration(options);
   }
+  const fetchOption = options.fetch === undefined ? {} : { fetch: options.fetch };
   const connectionClient =
     options.connectionClient ??
     createLinearConnectionClient({
       clientId: configuration.clientId,
       clientSecret: configuration.clientSecret,
-      publicBaseUrl: options.publicBaseUrl,
-      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+      publicBaseUrl,
+      ...fetchOption,
     });
   const database = options.database;
   const connectionForLinearOrganization = (linearOrganizationId: string) =>
@@ -104,7 +134,7 @@ export function createLinearRegistration(
           connectionForLinearOrganization,
           withLinearConnectionRefresh: database.withLinearConnectionRefresh.bind(database),
           connectionClient,
-          ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+          ...fetchOption,
         }));
   const accept =
     database === null
@@ -122,6 +152,13 @@ export function createLinearRegistration(
           });
   const webhook = createLinearWebhookSource({
     signingSecret: configuration.webhookSecret,
+    ...linearPilotWebhookOptions(
+      options,
+      configuration.clientId,
+      publicBaseUrl,
+      connectionClient,
+      connectionForLinearOrganization,
+    ),
     accept,
     ...(database === null
       ? {}
@@ -162,7 +199,7 @@ export function createLinearRegistration(
             database,
             auth: options.auth,
             applicationBaseUrl: options.applicationBaseUrl,
-            callbackOrigin: options.publicBaseUrl,
+            callbackOrigin: publicBaseUrl,
             configurationVersion: options.configurationVersion ?? 0,
             configuration,
             expectedConfigurationVersion: options.expectedConfigurationVersion,
@@ -174,7 +211,7 @@ export function createLinearRegistration(
   return {
     configurationSnapshot: {
       version: options.configurationVersion ?? 0,
-      callbackOrigin: options.publicBaseUrl,
+      callbackOrigin: publicBaseUrl,
     },
     connection,
     ...(api === undefined
@@ -224,6 +261,42 @@ export function createLinearRegistration(
             },
           ],
     requests: [{ name: "linear.events", handle: (request) => webhook.handle(request) }],
+  };
+}
+
+function linearPilotWebhookOptions(
+  options: Pick<CreateLinearRegistrationOptions, "database" | "linearPilot" | "fetch">,
+  clientId: string,
+  publicBaseUrl: string,
+  connectionClient: LinearConnectionClient,
+  connectionForLinearOrganization: Database["findLinearConnection"],
+): Pick<
+  LinearWebhookSourceOptions,
+  "offerVerifiedLinearPilotEvent" | "suppressVerifiedLinearPilotComment"
+> {
+  const { database, linearPilot: pilot } = options;
+  if (pilot === undefined || database === null) return {};
+  const provider: LinearPilotProvider = {
+    oauthClientId: clientId,
+    activityClient: (authority) =>
+      createLinearAgentClient({
+        ...authority,
+        activityIdVersion: 5,
+        hubBaseUrl: publicBaseUrl,
+        fetch: options.fetch ?? fetch,
+        connectionForLinearOrganization,
+        withLinearConnectionRefresh: database.withLinearConnectionRefresh.bind(database),
+        connectionClient,
+      }),
+  };
+  return {
+    offerVerifiedLinearPilotEvent: (event) => pilot.offer(event, provider),
+    ...(pilot.suppressComment === undefined
+      ? {}
+      : {
+          suppressVerifiedLinearPilotComment: (event) =>
+            pilot.suppressComment?.(event, provider) ?? false,
+        }),
   };
 }
 

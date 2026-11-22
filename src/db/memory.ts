@@ -12,6 +12,7 @@ import {
   advanceForCommand,
   claimPatch,
   canRetryMessage,
+  closeLinearPilotSession,
   exhaustedControlState,
   finalDeliveryCode,
   retryMessagePatch,
@@ -23,6 +24,7 @@ import {
   deliveryEvent,
   messageEvent,
   messageRecord,
+  matchesLinearPilotRetirement,
   newCommand,
   newSession,
   observedSessionTransition,
@@ -38,12 +40,17 @@ import {
   sessionUsage,
   settlePatch,
   startHash,
+  canStartSessionAs,
   startParticipants,
   stateEvent,
   unsettledStatuses,
   validMessage,
 } from "../interactive-sessions/store.js";
-import type { SessionEventDraft, StartSessionInput } from "../interactive-sessions/store.js";
+import type {
+  RetireLinearPilotSessionInput,
+  SessionEventDraft,
+  StartSessionInput,
+} from "../interactive-sessions/store.js";
 import type {
   SessionAuditRecord,
   SessionCommandRecord,
@@ -507,8 +514,9 @@ class MemoryDatabase implements Database {
   startInteractiveSession: Database["startInteractiveSession"] = (input) =>
     this.withAdvisoryLock(interactiveSessionLock, async () => {
       const { organizationId, userId } = input.principal;
-      if (!this.sessionMemberRole(organizationId, userId)) return refused("forbidden");
+      const currentRole = this.sessionMemberRole(organizationId, userId);
       const requester = input.nativeRequester;
+      if (!canStartSessionAs(input, currentRole)) return refused("forbidden");
       if (
         requester &&
         !this.surfaces.isCurrentRequester(
@@ -835,7 +843,10 @@ class MemoryDatabase implements Database {
       const row = this.scopedInteractiveSession(input.organizationId, input.sessionId);
       if (!row) return undefined;
       const { session } = row;
-      const next = observedSessionTransition(session, input);
+      const next =
+        input.to === "closed"
+          ? this.retireLinearPilotSession(session, input)
+          : observedSessionTransition(session, input);
       if (!next) return undefined;
       if (
         next.state !== session.state ||
@@ -843,12 +854,31 @@ class MemoryDatabase implements Database {
         next.turn !== session.turn
       ) {
         const drafts = [stateEvent(next)];
-        if (input.reason === "daemon_revoked")
+        if (input.to !== "closed" && input.reason === "daemon_revoked")
           drafts.push(...this.supersedeInteractiveCommands(session, "close", input.now));
         this.appendSessionEvents(row, next, input.now, drafts);
       }
       return structuredClone(row.session);
     });
+
+  private retireLinearPilotSession(session: SessionRecord, input: RetireLinearPilotSessionInput) {
+    const { organizationId, ownerUserId, workspaceId, profileId } = input;
+    if (
+      !matchesLinearPilotRetirement(session, input) ||
+      this.sessionMemberRole(organizationId, ownerUserId) !== "owner" ||
+      !this.surfaces.isCurrentRequester(
+        { organizationId, workspaceId, userId: ownerUserId },
+        session.requesterIdentityId,
+      )
+    )
+      return undefined;
+    return closeLinearPilotSession(
+      session,
+      input,
+      this.sessionProfiles.get(profileId),
+      this.interactiveCommands.get(session.id)?.[0],
+    );
+  }
 
   setInteractiveSessionParticipant: Database["setInteractiveSessionParticipant"] = (input) =>
     this.withAdvisoryLock(interactiveSessionLock, async () => {

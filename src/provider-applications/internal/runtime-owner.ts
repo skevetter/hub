@@ -7,7 +7,10 @@ import { logger } from "../../logger.js";
 import { reportFailure } from "../../failures/index.js";
 import { createDiscordRegistration } from "../../providers/discord/index.js";
 import { createGitHubRegistration } from "../../providers/github/index.js";
-import { createLinearRegistration } from "../../providers/linear/index.js";
+import {
+  createLinearRegistration,
+  type LinearPilotRegistration,
+} from "../../providers/linear/index.js";
 import type {
   ProviderRegistration,
   TriggerProviderResources,
@@ -62,12 +65,26 @@ type LinearInstallationHandler = Parameters<
   NonNullable<ProviderRuntimeOwner["onLinearInstallation"]>
 >[0];
 
+interface RegistrationActivation {
+  expectedConfigurationVersion: number | undefined;
+  activateConfiguration: boolean;
+}
+
+function registrationActivationOptions(activation?: RegistrationActivation) {
+  const expectedConfigurationVersion = activation?.expectedConfigurationVersion;
+  return {
+    ...(expectedConfigurationVersion === undefined ? {} : { expectedConfigurationVersion }),
+    activateConfiguration: activation?.activateConfiguration ?? false,
+  };
+}
+
 interface DynamicProviderRuntimeOptions {
   database: Database;
   auth: AuthServer;
   applicationBaseUrl: string;
   fetch?: typeof fetch;
   runProgress?: RunProgressSettings;
+  linearPilot?: LinearPilotRegistration;
   registrationFactory?: (input: {
     provider: Provider;
     configuration: ProviderApplicationConfiguration;
@@ -208,10 +225,7 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
     configuration: ProviderApplicationConfiguration,
     callbackOrigin: string,
     configurationVersion: number,
-    activation?: {
-      expectedConfigurationVersion: number | undefined;
-      activateConfiguration: boolean;
-    },
+    activation?: RegistrationActivation,
   ): ProviderRegistration {
     if (this.options.registrationFactory !== undefined) {
       return this.options.registrationFactory(
@@ -245,10 +259,7 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
       return createSlackRegistration({
         ...shared,
         configuration,
-        ...(activation?.expectedConfigurationVersion === undefined
-          ? {}
-          : { expectedConfigurationVersion: activation.expectedConfigurationVersion }),
-        activateConfiguration: activation?.activateConfiguration ?? false,
+        ...registrationActivationOptions(activation),
         onVerifiedInstallation: (input) => this.handleSlackInstallation(input),
       });
     }
@@ -266,10 +277,10 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
       return createLinearRegistration({
         ...shared,
         configuration,
-        ...(activation?.expectedConfigurationVersion === undefined
+        ...(this.options.linearPilot === undefined
           ? {}
-          : { expectedConfigurationVersion: activation.expectedConfigurationVersion }),
-        activateConfiguration: activation?.activateConfiguration ?? false,
+          : { linearPilot: this.options.linearPilot }),
+        ...registrationActivationOptions(activation),
         onVerifiedInstallation: (input) => this.handleLinearInstallation(input),
       });
     }
@@ -281,12 +292,7 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
     configuration: ProviderApplicationConfiguration,
     callbackOrigin: string,
     configurationVersion: number,
-    activation:
-      | {
-          expectedConfigurationVersion: number | undefined;
-          activateConfiguration: boolean;
-        }
-      | undefined,
+    activation: RegistrationActivation | undefined,
   ): Parameters<NonNullable<DynamicProviderRuntimeOptions["registrationFactory"]>>[0] {
     return {
       provider,

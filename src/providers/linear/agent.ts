@@ -1,4 +1,9 @@
 import { z } from "zod";
+import {
+  readPilotPriorPage,
+  readPilotPromptPage,
+  type PilotHistoryScope,
+} from "../../linear-pilot/history-read.js";
 import type { LinearConnectionRecord } from "../../db/types.js";
 import {
   hasRequiredLinearScopes,
@@ -30,8 +35,15 @@ const state = ref.extend({ type: z.string(), archivedAt: z.string().nullable(), 
 const sessionOwner = ref.extend({ appUser: ref });
 
 const activityKind = z.enum(["thought", "action", "elicitation", "response", "error"]);
-const activityIdSchema = z.uuidv4();
 const body = z.string().min(1).max(20_000);
+const historyScope = z.strictObject({
+  sessionId: id,
+  issueId: id,
+  appUserId: id,
+  allowedHumanProviderUserId: id,
+});
+const historyPrompt = z.strictObject({ activityId: z.uuid(), body });
+const historyAnchorTime = z.iso.datetime({ offset: true });
 const activityContentSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("thought"), body }),
   z.strictObject({
@@ -44,17 +56,6 @@ const activityContentSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("response"), body }),
   z.strictObject({ type: z.literal("error"), body }),
 ]);
-const activityInput = z.strictObject({
-  sessionId: id,
-  activityId: activityIdSchema,
-  content: activityContentSchema,
-  ephemeral: z.boolean().optional(),
-});
-const readbackInput = z.strictObject({
-  sessionId: id,
-  activityId: activityIdSchema,
-  kind: activityKind,
-});
 const linkInput = z.strictObject({ sessionId: id, url: z.url().max(2048) });
 const membersInput = z.strictObject({ teamId: id, after: cursor.optional() });
 const beginInput = z.strictObject({ teamId: id, issueId: id });
@@ -69,20 +70,52 @@ const contentTypename = {
   error: "AgentActivityErrorContent",
 } satisfies Record<z.infer<typeof activityKind>, string>;
 
-const readbackSession = sessionOwner.extend({
-  activities: z.object({
-    nodes: z
-      .array(
-        ref.extend({
-          agentSession: ref,
-          user: ref,
-          content: z.object({ __typename: z.string(), type: activityKind }),
+const continueSignal = z.literal("continue").optional();
+const returnedSignal = z.literal("continue").nullable().optional();
+
+function activitySchemas(activityId: z.ZodUUID) {
+  const activity = ref.extend({
+    id: activityId,
+    agentSession: ref,
+    user: ref,
+    signal: returnedSignal,
+  });
+  return {
+    activityInput: z.strictObject({
+      sessionId: id,
+      activityId,
+      content: activityContentSchema,
+      ephemeral: z.boolean().optional(),
+      signal: continueSignal,
+    }),
+    readbackInput: z.strictObject({
+      sessionId: id,
+      activityId,
+      kind: activityKind,
+      signal: continueSignal,
+    }),
+    createResult: z.object({
+      agentActivityCreate: z.object({ success: z.boolean(), agentActivity: activity }),
+    }),
+    readbackResult: z.object({
+      agentSession: sessionOwner.extend({
+        activities: z.object({
+          nodes: z
+            .array(
+              activity.extend({
+                content: z.object({ __typename: z.string(), type: activityKind }),
+              }),
+            )
+            .max(1),
+          pageInfo: pageFlags,
         }),
-      )
-      .max(1),
-    pageInfo: pageFlags,
-  }),
-});
+      }),
+    }),
+  };
+}
+
+const v4ActivitySchemas = activitySchemas(z.uuidv4());
+const v5ActivitySchemas = activitySchemas(z.uuid({ version: "v5" }));
 
 const errorMessages = {
   invalid_input: "Invalid Linear agent operation input",
@@ -112,6 +145,7 @@ export class LinearAgentError extends Error {
 export type LinearAgentOperation =
   | { kind: "viewer" }
   | { kind: "createActivity" | "readActivity"; sessionId: string }
+  | { kind: "readPilotPrompt" | "readPilotHistory"; sessionId: string; issueId: string }
   | { kind: "addHubUrl"; sessionId: string; url: string }
   | { kind: "readEligibleUsers"; teamId: string }
   | { kind: "moveIssueToStarted"; teamId: string; issueId: string };
@@ -123,6 +157,8 @@ type LinearAgentClientOptions = Pick<
   binding: LinearConnectionBinding;
   hubBaseUrl: string;
   fetch: typeof fetch;
+  /** Pilot-only opt-in. Activity IDs default to UUIDv4. */
+  activityIdVersion?: 5;
   /** Resolve current policy and authority for this exact operation. Setup reads need an explicit policy too. */
   authorize(
     binding: Readonly<LinearConnectionBinding>,
@@ -141,6 +177,22 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
   const binding = Object.freeze({ ...options.binding });
   const hubOrigin = new URL(options.hubBaseUrl).origin;
   const now = options.now ?? (() => new Date());
+  const useV5ActivityIds = options.activityIdVersion === 5;
+  const { activityInput, readbackInput, createResult, readbackResult } = useV5ActivityIds
+    ? v5ActivitySchemas
+    : v4ActivitySchemas;
+
+  function requireHistoryScope(input: PilotHistoryScope) {
+    const scope = parse(historyScope, input, "invalid_input");
+    if (
+      !useV5ActivityIds ||
+      scope.appUserId !== binding.appUserId ||
+      scope.allowedHumanProviderUserId === binding.appUserId
+    ) {
+      throw new LinearAgentError("invalid_input");
+    }
+    return scope;
+  }
 
   function checkConnection(connection: LinearConnectionRecord | undefined): LinearConnectionRecord {
     if (connection === undefined) throw new LinearAgentError("connection_unavailable");
@@ -276,6 +328,34 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
   }
 
   return {
+    async readPilotPrompt(
+      input: PilotHistoryScope,
+      expected: z.input<typeof historyPrompt>,
+      signal?: AbortSignal,
+    ) {
+      const scope = requireHistoryScope(input);
+      const prompt = parse(historyPrompt, expected, "invalid_input");
+      const { sessionId, issueId } = scope;
+      return run(
+        { kind: "readPilotPrompt", sessionId, issueId },
+        { sessionId, activityId: prompt.activityId },
+        signal,
+        (send) => readPilotPromptPage(send, scope, prompt),
+      );
+    },
+
+    async readPilotHistory(input: PilotHistoryScope, before: string, signal?: AbortSignal) {
+      const scope = requireHistoryScope(input);
+      const anchor = parse(historyAnchorTime, before, "invalid_input");
+      const { sessionId, issueId } = scope;
+      return run(
+        { kind: "readPilotHistory", sessionId, issueId },
+        { sessionId, before: anchor },
+        signal,
+        (send) => readPilotPriorPage(send, scope, anchor),
+      );
+    },
+
     async createActivity(
       input: z.input<typeof activityInput>,
       signal?: AbortSignal,
@@ -285,8 +365,12 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         activityId: expectedId,
         content,
         ephemeral,
+        signal: expectedSignal,
       } = parse(activityInput, input, "invalid_input");
       if (ephemeral === true && content.type !== "thought" && content.type !== "action") {
+        throw new LinearAgentError("invalid_input");
+      }
+      if (expectedSignal && (!useV5ActivityIds || content.type !== "response")) {
         throw new LinearAgentError("invalid_input");
       }
       const variables = {
@@ -295,27 +379,24 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
           id: expectedId,
           content,
           ...(ephemeral === undefined ? {} : { ephemeral }),
+          ...(expectedSignal ? { signal: expectedSignal } : {}),
         },
       };
       const operation = { kind: "createActivity", sessionId } as const;
       return run(operation, variables, signal, async (send, viewer) => {
         const { agentActivityCreate: result } = await send(
           `mutation PaseoAgentActivityCreate($input: AgentActivityCreateInput!) {
-            agentActivityCreate(input: $input) { success agentActivity { id agentSession { id } user { id } } }
+            agentActivityCreate(input: $input) { success agentActivity { id agentSession { id } user { id }${expectedSignal ? " signal" : ""} } }
           }`,
           variables,
-          z.object({
-            agentActivityCreate: z.object({
-              success: z.boolean(),
-              agentActivity: ref.extend({ agentSession: ref, user: ref }),
-            }),
-          }),
+          createResult,
         );
         requireMutation(
           result.success &&
             result.agentActivity.id === expectedId &&
             result.agentActivity.agentSession.id === sessionId &&
-            result.agentActivity.user.id === viewer.id,
+            result.agentActivity.user.id === viewer.id &&
+            (expectedSignal === undefined || result.agentActivity.signal === expectedSignal),
         );
         return result.agentActivity.id;
       });
@@ -326,7 +407,15 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
       input: z.input<typeof readbackInput>,
       signal?: AbortSignal,
     ): Promise<boolean> {
-      const { sessionId, activityId, kind } = parse(readbackInput, input, "invalid_input");
+      const {
+        sessionId,
+        activityId,
+        kind,
+        signal: expectedSignal,
+      } = parse(readbackInput, input, "invalid_input");
+      if (expectedSignal && (!useV5ActivityIds || kind !== "response")) {
+        throw new LinearAgentError("invalid_input");
+      }
       const variables = { sessionId, activityId };
       try {
         return await run(
@@ -340,7 +429,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
                 id appUser { id }
                 activities(first: 1, filter: { id: { eq: $activityId } }) {
                   nodes {
-                    id agentSession { id } user { id }
+                    id agentSession { id } user { id }${expectedSignal ? " signal" : ""}
                     content {
                       __typename
                       ... on AgentActivityThoughtContent { type }
@@ -355,7 +444,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
               }
             }`,
               variables,
-              z.object({ agentSession: readbackSession }),
+              readbackResult,
             );
             const {
               nodes: [row],
@@ -372,7 +461,8 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
               row.agentSession.id === sessionId &&
               row.user.id === viewer.id &&
               row.content.type === kind &&
-              row.content.__typename === contentTypename[kind]
+              row.content.__typename === contentTypename[kind] &&
+              (expectedSignal === undefined || row.signal === expectedSignal)
             );
           },
         );

@@ -49,6 +49,7 @@ export interface StartSessionInput {
   profileId: string;
   profileVersion: number;
   nativeRequester?: { identityId: string; workspaceId: string };
+  requireNativeOwner?: true;
   idempotencyKey: string;
   message: string;
   participants: readonly Participant[];
@@ -137,7 +138,7 @@ export interface BindSessionAgentInput extends SessionScope {
   now: Date;
 }
 
-export interface ApplySessionStateInput extends SessionScope {
+export interface ObservedSessionStateInput extends SessionScope {
   generation: number;
   // Use the turn associated with the observation, even if a later turn is already running.
   turn: number;
@@ -149,6 +150,20 @@ export interface ApplySessionStateInput extends SessionScope {
   reason?: SessionStateReason;
   now: Date;
 }
+
+export interface RetireLinearPilotSessionInput extends SessionScope {
+  to: "closed";
+  ownerUserId: string;
+  workspaceId: string;
+  profileId: string;
+  commandId: string;
+  generation: number;
+  turn: number;
+  agentId: string;
+  now: Date;
+}
+
+export type ApplySessionStateInput = ObservedSessionStateInput | RetireLinearPilotSessionInput;
 
 export interface SetParticipantInput {
   principal: SessionPrincipal;
@@ -381,6 +396,16 @@ export function startParticipants(input: StartSessionInput): Participant[] {
     .map(([userId, role]) => ({ userId, role }));
 }
 
+export function canStartSessionAs(
+  input: Pick<StartSessionInput, "nativeRequester" | "requireNativeOwner">,
+  currentRole: SessionPrincipal["role"] | undefined,
+): boolean {
+  return (
+    currentRole !== undefined &&
+    (!input.requireNativeOwner || (currentRole === "owner" && input.nativeRequester !== undefined))
+  );
+}
+
 export function startHash(input: StartSessionInput, participants: readonly Participant[]): string {
   const request: unknown[] = [
     input.profileId.toLowerCase(),
@@ -390,7 +415,7 @@ export function startHash(input: StartSessionInput, participants: readonly Parti
   ];
   if (input.nativeRequester) {
     request.push([
-      "linear",
+      input.requireNativeOwner ? "linear-pilot-owner" : "linear",
       input.nativeRequester.workspaceId,
       input.nativeRequester.identityId.toLowerCase(),
     ]);
@@ -555,7 +580,7 @@ export function advanceForCommand(
 
 export function observedSessionTransition(
   session: SessionRecord,
-  input: ApplySessionStateInput,
+  input: ObservedSessionStateInput,
 ): SessionRecord | undefined {
   if (
     session.generation !== input.generation ||
@@ -573,6 +598,58 @@ export function observedSessionTransition(
     state: input.to,
     stateReason: input.reason ?? null,
     turn: session.turn + Number(newTurn),
+  };
+}
+
+export function matchesLinearPilotRetirement(
+  session: SessionRecord,
+  input: Omit<RetireLinearPilotSessionInput, "to" | "now">,
+): session is SessionRecord & { requesterIdentityId: string } {
+  return (
+    session.organizationId === input.organizationId &&
+    session.id === input.sessionId &&
+    session.origin === "linear" &&
+    Boolean(session.requesterIdentityId) &&
+    session.state === "idle" &&
+    session.profileId === input.profileId &&
+    session.startedByUserId === input.ownerUserId &&
+    session.generation === input.generation &&
+    session.turn === input.turn &&
+    session.daemonAgentId === input.agentId
+  );
+}
+
+type LinearPilotRetirementCommand = Pick<
+  SessionCommandRecord,
+  "id" | "ordinal" | "kind" | "status" | "authorUserId" | "generation"
+>;
+
+export function closeLinearPilotSession(
+  session: SessionRecord,
+  input: RetireLinearPilotSessionInput,
+  profile: SessionProfileRecord | undefined,
+  command: LinearPilotRetirementCommand | undefined,
+): SessionRecord | undefined {
+  if (
+    profile?.id !== input.profileId ||
+    profile.organizationId !== input.organizationId ||
+    profile.status !== "active" ||
+    profile.access !== "private" ||
+    profile.createdByUserId !== input.ownerUserId ||
+    command?.id !== input.commandId ||
+    command.ordinal !== 1 ||
+    command.kind !== "message" ||
+    command.status !== "delivered" ||
+    command.authorUserId !== input.ownerUserId ||
+    command.generation !== input.generation
+  )
+    return undefined;
+  return {
+    ...session,
+    state: "closed",
+    stateReason: null,
+    closedAt: input.now,
+    closedByUserId: null,
   };
 }
 

@@ -2,7 +2,10 @@ import type { SessionParticipantRecord, SessionPrincipal, SessionRecord } from "
 
 export function capabilities(
   principal: SessionPrincipal,
-  session: Pick<SessionRecord, "organizationId" | "startedByUserId">,
+  session: Pick<
+    SessionRecord,
+    "organizationId" | "startedByUserId" | "origin" | "requesterIdentityId"
+  >,
   participants: readonly Pick<SessionParticipantRecord, "userId" | "role">[],
 ) {
   const sameOrganization = principal.organizationId === session.organizationId;
@@ -12,6 +15,17 @@ export function capabilities(
     : undefined;
   const controller = participant?.role === "controller";
   const starter = participant !== undefined && principal.userId === session.startedByUserId;
+  if (session.origin === "linear") {
+    const owner = starter && principal.role === "owner" && Boolean(session.requesterIdentityId);
+    return {
+      view: owner,
+      send: owner && controller,
+      stop: false,
+      close: false,
+      replaceAgent: false,
+      manageParticipants: false,
+    };
+  }
 
   return {
     view: manager || participant !== undefined,

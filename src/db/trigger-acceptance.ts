@@ -74,7 +74,7 @@ export class ProviderEventAcceptanceRepository {
     deliveryId: string,
     signatureHash: string,
   ): Promise<boolean> {
-    const connection = await findConnection(this.database, "linear", linearOrganizationId);
+    const connection = await findLinearReceiptConnection(this.database, linearOrganizationId);
     if (connection === undefined) return false;
     const receipts = schema.providerEventReceipts;
     const [receipt] = await this.database
@@ -99,7 +99,10 @@ export class ProviderEventAcceptanceRepository {
   ): Promise<ProviderEventAcceptance> {
     return this.runtime.transaction(async (runtimeTransaction) => {
       const transaction = runtimeTransaction.drizzle();
-      const connection = await findConnection(transaction, provider, externalId);
+      const connection =
+        provider === "linear" && input.dropReason === "unsupported_event"
+          ? await findLinearReceiptConnection(transaction, String(externalId))
+          : await findConnection(transaction, provider, externalId);
       if (connection === undefined) {
         return { status: "dropped", receiptId: input.deliveryId, reason: `${provider}_unbound` };
       }
@@ -828,6 +831,18 @@ function selectFirstRoutePerProject<Route extends { projectId: string }>(
     if (!selected.has(route.projectId)) selected.set(route.projectId, route);
   }
   return [...selected.values()];
+}
+
+async function findLinearReceiptConnection(database: DrizzleHandle, workspaceId: string) {
+  const [row] = await database
+    .select({
+      id: schema.linearConnections.id,
+      organizationId: schema.linearConnections.organizationId,
+    })
+    .from(schema.linearConnections)
+    .where(eq(schema.linearConnections.linearOrganizationId, workspaceId))
+    .limit(1);
+  return row;
 }
 
 async function findConnection(

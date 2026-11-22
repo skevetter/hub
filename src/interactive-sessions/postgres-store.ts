@@ -11,6 +11,7 @@ import {
   inArray,
   lt,
   ne,
+  or,
   sql,
 } from "drizzle-orm";
 import type { Locks } from "../db/runtime/locks/index.js";
@@ -37,6 +38,7 @@ import {
   advanceForCommand,
   claimPatch,
   canRetryMessage,
+  closeLinearPilotSession,
   exhaustedControlState,
   finalDeliveryCode,
   retryMessagePatch,
@@ -48,6 +50,7 @@ import {
   deliveryEvent,
   messageEvent,
   messageRecord,
+  matchesLinearPilotRetirement,
   newCommand,
   newSession,
   observedSessionTransition,
@@ -63,6 +66,7 @@ import {
   sessionUsage,
   settlePatch,
   startHash,
+  canStartSessionAs,
   startParticipants,
   stateEvent,
   unsettledStatuses,
@@ -75,6 +79,7 @@ import type {
   BindSessionAgentInput,
   ClaimCommandInput,
   InteractiveSessionStore,
+  RetireLinearPilotSessionInput,
   SaveSessionProfileInput,
   SaveSessionProfileResult,
   SessionEventDraft,
@@ -207,8 +212,9 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         tx,
         "isession-start:" + JSON.stringify([organizationId, userId, key]),
       );
-      if (!(await this.role(db, organizationId, userId))) return refused("forbidden");
+      const currentRole = await this.role(db, organizationId, userId);
       const requester = input.nativeRequester;
+      if (!canStartSessionAs(input, currentRole)) return refused("forbidden");
       if (
         requester &&
         !(await isCurrentSurfaceRequester(
@@ -385,6 +391,18 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       const db = tx.drizzle();
       const role = await this.role(db, organizationId, viewer.userId);
       if (!role) return sessionPage([], page.limit);
+      const participates = exists(
+        db
+          .select({ userId: participants.userId })
+          .from(participants)
+          .where(
+            and(
+              eq(participants.organizationId, organizationId),
+              eq(participants.sessionId, sessions.id),
+              eq(participants.userId, viewer.userId),
+            ),
+          ),
+      );
       const rows = await db
         .select()
         .from(sessions)
@@ -395,20 +413,16 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
             page.cursor
               ? sql`(${sessions.lastActivityAt}, ${sessions.id}) < (${page.cursor.lastActivityAt.toISOString()}::timestamptz, ${page.cursor.id}::uuid)`
               : undefined,
-            role === "member"
-              ? exists(
-                  db
-                    .select({ userId: participants.userId })
-                    .from(participants)
-                    .where(
-                      and(
-                        eq(participants.organizationId, organizationId),
-                        eq(participants.sessionId, sessions.id),
-                        eq(participants.userId, viewer.userId),
-                      ),
-                    ),
-                )
-              : undefined,
+            or(
+              and(eq(sessions.origin, "web"), role === "member" ? participates : undefined),
+              role === "owner"
+                ? and(
+                    eq(sessions.origin, "linear"),
+                    eq(sessions.startedByUserId, viewer.userId),
+                    participates,
+                  )
+                : undefined,
+            ),
           ),
         )
         .orderBy(desc(sessions.lastActivityAt), desc(sessions.id))
@@ -610,6 +624,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       const db = tx.drizzle();
       const session = await this.lockSession(db, input.organizationId, input.sessionId);
       if (!session) return undefined;
+      if (input.to === "closed") return this.retireLinearPilotSession(db, session, input);
       const next = observedSessionTransition(session, input);
       if (!next) return undefined;
       if (
@@ -623,6 +638,44 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         drafts.push(...(await this.supersede(db, session, "close", input.now)));
       return this.append(db, next, input.now, drafts);
     });
+  }
+
+  private async retireLinearPilotSession(
+    db: DrizzleHandle,
+    session: SessionRecord,
+    input: RetireLinearPilotSessionInput,
+  ): Promise<SessionRecord | undefined> {
+    const { organizationId, ownerUserId, workspaceId, profileId } = input;
+    if (
+      !matchesLinearPilotRetirement(session, input) ||
+      (await this.role(db, organizationId, ownerUserId)) !== "owner" ||
+      !(await isCurrentSurfaceRequester(
+        db,
+        { organizationId, workspaceId, userId: ownerUserId },
+        session.requesterIdentityId,
+      ))
+    )
+      return undefined;
+
+    const [profile] = await db
+      .select()
+      .from(profiles)
+      .where(and(eq(profiles.organizationId, organizationId), eq(profiles.id, profileId)))
+      .for("share");
+    const [command] = await db
+      .select({
+        id: commands.id,
+        ordinal: commands.ordinal,
+        kind: commands.kind,
+        status: commands.status,
+        authorUserId: commands.authorUserId,
+        generation: commands.generation,
+      })
+      .from(commands)
+      .where(and(commandScope(session), eq(commands.ordinal, 1)))
+      .for("share");
+    const next = closeLinearPilotSession(session, input, profile, command);
+    return next ? this.append(db, next, input.now, [stateEvent(next)]) : undefined;
   }
 
   setInteractiveSessionParticipant(input: SetParticipantInput): Promise<SetParticipantResult> {

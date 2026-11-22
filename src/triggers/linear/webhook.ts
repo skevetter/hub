@@ -7,7 +7,12 @@ import { logger } from "../../logger.js";
 import { logProviderEventIntake } from "../audit.js";
 import type { ProviderEventDropReasonCode } from "../drop-reason.js";
 import type { TriggerHandler, TriggerSource } from "../index.js";
-import { eventIssueId, eventProjectId, normalizeLinearEvent } from "./events.js";
+import {
+  eventIssueId,
+  eventProjectId,
+  normalizeLinearEvent,
+  type NormalizedLinearCommentEvent,
+} from "./events.js";
 import { isPaseoAppAuthor } from "./match.js";
 import { hasLinearRunReplyMarker } from "../../run-replies/marker.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
@@ -18,6 +23,12 @@ const MAX_TIMESTAMP_SKEW_MS = 60_000;
 export interface LinearWebhookSourceOptions {
   signingSecret: string;
   now?: () => number;
+  offerVerifiedLinearPilotEvent?(
+    input: Readonly<VerifiedLinearRequest>,
+  ): boolean | Promise<boolean>;
+  suppressVerifiedLinearPilotComment?(
+    event: NormalizedLinearCommentEvent,
+  ): boolean | Promise<boolean>;
   canHydrateIssue?(linearOrganizationId: string): Promise<boolean>;
   findAppUserId?(linearOrganizationId: string): Promise<string | undefined>;
   findMarkedReceipt?(
@@ -120,7 +131,7 @@ async function handoffLinearEvent(
 ): Promise<Response> {
   let linearOrganizationId: string | undefined;
   try {
-    let event = normalizeDelivery(verified);
+    const event = normalizeDelivery(verified);
     if (event === undefined) {
       const envelope = isRecord(verified.payload) ? verified.payload : {};
       const organizationId = envelope["organizationId"];
@@ -132,44 +143,18 @@ async function handoffLinearEvent(
       )
         return new Response("OK", { status: 200 });
       linearOrganizationId = organizationId;
+      if (
+        eventIdentifier(envelope["type"]) === "agent_session_event" &&
+        (verified.eventName === null ||
+          eventIdentifier(verified.eventName) === "agent_session_event") &&
+        (await options.offerVerifiedLinearPilotEvent?.(verified)) === true
+      ) {
+        return new Response("OK", { status: 200 });
+      }
       return await acceptUnsupportedLinearEvent(verified, organizationId, options);
     }
     linearOrganizationId = event.organizationId;
-    if (
-      event.type === "comment" &&
-      (hasLinearRunReplyMarker(event.comment.body, event.comment.id) ||
-        isPaseoAppAuthor(event, {
-          appUserId: await options.findAppUserId?.(linearOrganizationId),
-        }))
-    ) {
-      return new Response("OK", { status: 200 });
-    }
-    if (await findMarkedReceipt(options, verified, linearOrganizationId))
-      return new Response("OK", { status: 200 });
-    if (eventProjectId(event) === undefined && options.resolveIssue !== undefined) {
-      const source = linearEventSource(event);
-      if (
-        options.canHydrateIssue !== undefined &&
-        !(await options.canHydrateIssue(event.organizationId))
-      ) {
-        return await acceptAndDispatchLinearEvent(event, source, verified, handlers, options, true);
-      }
-      const issue = await options.resolveIssue({
-        linearOrganizationId: event.organizationId,
-        issueId: eventIssueId(event),
-      });
-      event = normalizeDelivery(verified, issue);
-    }
-    if (event === undefined) {
-      return await acceptUnsupportedLinearEvent(verified, linearOrganizationId, options);
-    }
-    return await acceptAndDispatchLinearEvent(
-      event,
-      linearEventSource(event),
-      verified,
-      handlers,
-      options,
-    );
+    return await handoffNormalizedLinearEvent(event, verified, handlers, options);
   } catch (error) {
     if (
       linearOrganizationId !== undefined &&
@@ -179,6 +164,60 @@ async function handoffLinearEvent(
     logger.error({ err: error, deliveryId: verified.deliveryId }, "Linear event handoff failed");
     return Response.json({ error: "event_handoff_unavailable" }, { status: 503 });
   }
+}
+
+async function handoffNormalizedLinearEvent(
+  normalized: NonNullable<ReturnType<typeof normalizeDelivery>>,
+  verified: VerifiedLinearRequest,
+  handlers: Set<TriggerHandler>,
+  options: LinearWebhookSourceOptions,
+): Promise<Response> {
+  const linearOrganizationId = normalized.organizationId;
+  let event: ReturnType<typeof normalizeDelivery> = normalized;
+  if (
+    event.type === "comment" &&
+    event.action === "create" &&
+    isRecord(verified.payload) &&
+    eventIdentifier(verified.payload["type"]) === "comment" &&
+    (await options.suppressVerifiedLinearPilotComment?.(event)) === true
+  ) {
+    return new Response("OK", { status: 200 });
+  }
+  if (
+    event.type === "comment" &&
+    (hasLinearRunReplyMarker(event.comment.body, event.comment.id) ||
+      isPaseoAppAuthor(event, {
+        appUserId: await options.findAppUserId?.(linearOrganizationId),
+      }))
+  ) {
+    return new Response("OK", { status: 200 });
+  }
+  if (await findMarkedReceipt(options, verified, linearOrganizationId))
+    return new Response("OK", { status: 200 });
+  if (eventProjectId(event) === undefined && options.resolveIssue !== undefined) {
+    const source = linearEventSource(event);
+    if (
+      options.canHydrateIssue !== undefined &&
+      !(await options.canHydrateIssue(event.organizationId))
+    ) {
+      return await acceptAndDispatchLinearEvent(event, source, verified, handlers, options, true);
+    }
+    const issue = await options.resolveIssue({
+      linearOrganizationId: event.organizationId,
+      issueId: eventIssueId(event),
+    });
+    event = normalizeDelivery(verified, issue);
+  }
+  if (event === undefined) {
+    return await acceptUnsupportedLinearEvent(verified, linearOrganizationId, options);
+  }
+  return await acceptAndDispatchLinearEvent(
+    event,
+    linearEventSource(event),
+    verified,
+    handlers,
+    options,
+  );
 }
 
 function normalizeDelivery(verified: VerifiedLinearRequest, issue?: LinearIssueDetails) {

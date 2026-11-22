@@ -535,6 +535,7 @@ export class InteractiveSessionService {
     );
     if (row === undefined) return undefined;
     const rights = capabilities(principal, row.session, row.participants);
+    if (row.session.origin === "linear") rights.send = false;
     return rights.view ? { ...row, rights } : undefined;
   }
 

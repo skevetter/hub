@@ -72,6 +72,7 @@ import type { InteractiveSessionSettings } from "./interactive-sessions/settings
 import { InteractiveSessionStream } from "./interactive-sessions/stream.js";
 import { RunReplyReporter } from "./run-replies/reporter.js";
 import { readRunReplyLimit } from "./run-replies/settings.js";
+import type { createLinearPilotRuntime } from "./linear-pilot/runtime.js";
 
 export interface ApplicationCompositionOptions {
   database: Database | null;
@@ -93,6 +94,7 @@ export interface ApplicationCompositionOptions {
   runProgress?: RunProgressSettings;
   runReplyLimit?: number;
   interactiveSessions?: InteractiveSessionSettings;
+  linearPilot?: ReturnType<typeof createLinearPilotRuntime>;
   runPayloadRetention?: RunPayloadRetentionSettings;
   progressProviders?: readonly ProgressProvider[];
   timelineScrubValues?: readonly string[];
@@ -557,9 +559,12 @@ function createInteractiveSessionsRuntime(
   options: ApplicationCompositionOptions,
   connectionForDaemon: HubRuntime["connectionForDaemon"],
 ) {
-  const { database, databaseQuery, auth, entitlements, runPayloadRetention } = options;
+  const { database, databaseQuery, auth, entitlements, runPayloadRetention, linearPilot } = options;
   const settings = options.interactiveSessions;
-  if (settings?.enabled !== true || database === null || auth === null) return null;
+  if (settings?.enabled !== true || database === null || auth === null) {
+    if (linearPilot) throw new Error("The Linear pilot requires interactive sessions.");
+    return null;
+  }
   if (databaseQuery === undefined || entitlements === null) {
     throw new Error("Interactive sessions require a database query handle and entitlements.");
   }
@@ -583,12 +588,14 @@ function createInteractiveSessionsRuntime(
     scrubValues,
     instanceId: randomUUID(),
     bodyCutoff,
+    ...(linearPilot === undefined ? {} : { linearPilot: linearPilot.sessionHooks }),
     reportFailure: (error, operation) =>
       logger.warn(
         { operation, ...failureFields(error) },
         "interactive session coordinator operation failed",
       ),
   });
+  linearPilot?.attachCoordinator(coordinator);
   const service = new InteractiveSessionService({
     database,
     pool: databaseQuery,
@@ -611,6 +618,7 @@ function createInteractiveSessionsRuntime(
     hubOptions: { interactiveSessions: coordinator },
     browser: { service, stream },
     ownStream(ownership: CompositionResources) {
+      if (linearPilot) ownership.own(() => linearPilot.stop(), "composition.linear_pilot");
       ownership.own(() => stream.beginShutdown(), "composition.interactive_sessions.stream");
     },
     startRetention(ownership: CompositionResources) {

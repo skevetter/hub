@@ -68,6 +68,8 @@ import { readWebhookOptions } from "./webhook-config.js";
 import { readRunProgressSettings } from "./run-progress/settings.js";
 import { readRunReplyLimit } from "./run-replies/settings.js";
 import { readInteractiveSessionSettings } from "./interactive-sessions/settings.js";
+import { linearPilotConfigFromEnv } from "./linear-pilot/config.js";
+import { createLinearPilotRuntime } from "./linear-pilot/runtime.js";
 import { readTimelineScrubValues } from "./run-timeline/secrets.js";
 import {
   createServerShutdown,
@@ -112,6 +114,11 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     const runProgress = readRunProgressSettings(process.env);
     const runReplyLimit = readRunReplyLimit(process.env);
     const interactiveSessions = readInteractiveSessionSettings(process.env);
+    const pilotConfig = linearPilotConfigFromEnv(process.env);
+    if (pilotConfig.status === "invalid")
+      throw new Error(`PASEO_HUB_LINEAR_PILOT is invalid: ${pilotConfig.reason}`);
+    if (pilotConfig.status === "enabled" && !interactiveSessions.enabled)
+      throw new Error("PASEO_HUB_LINEAR_PILOT requires PASEO_HUB_INTERACTIVE_SESSIONS=true");
     const runPayloadRetention = readRunPayloadRetentionSettings(
       process.env,
       runProgress.retentionDays,
@@ -165,6 +172,21 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     resources.own(() => auth.close(), "composition.auth");
     await auth.initialize?.();
     const providerEnvironment = await readProviderApplicationEnvironment(process.env);
+    const timelineScrubValues = readTimelineScrubValues(
+      process.env,
+      Object.values(providerEnvironment),
+    );
+    const linearPilot =
+      pilotConfig.status === "enabled"
+        ? createLinearPilotRuntime({
+            config: pilotConfig.config,
+            database,
+            runtime,
+            locks,
+            scrubValues: timelineScrubValues,
+            reportFailure: () => logger.warn("Linear pilot delivery failed"),
+          })
+        : undefined;
     const providerStore = createProviderApplicationStore(runtime, locks, database);
     const providerVerifier = createProviderApplicationVerifier();
     const providerInventory = createProviderApplicationInventory(runtime);
@@ -173,6 +195,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       auth,
       applicationBaseUrl: identity.appUrl,
       runProgress,
+      ...(linearPilot === undefined ? {} : { linearPilot: linearPilot.registration }),
     });
     const providerApplications = createProviderApplications({
       auth,
@@ -221,7 +244,8 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       runReplyLimit,
       interactiveSessions,
       runPayloadRetention,
-      timelineScrubValues: readTimelineScrubValues(process.env, Object.values(providerEnvironment)),
+      timelineScrubValues,
+      ...(linearPilot === undefined ? {} : { linearPilot }),
       ...(githubNotifications === undefined ? {} : { githubNotifications }),
       close: () => resources.close(),
     });
