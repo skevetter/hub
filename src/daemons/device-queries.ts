@@ -1,6 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { listSessionProfiles } from "../interactive-sessions/functions.js";
 import { useSnapshotQuery } from "../queries/index.js";
 import { deviceProviders, deviceStatus, profilesByDaemon } from "./device-details.js";
@@ -52,8 +52,16 @@ export function useDeviceProviders(
 
 export function useDeviceProfiles(enabled: boolean, accountId: string, organizationSlug: string) {
   const read = useServerFn(listSessionProfiles);
+  const queryClient = useQueryClient();
+  const queryKey = useMemo(
+    () => ["daemon-device-profiles", accountId, organizationSlug],
+    [accountId, organizationSlug],
+  );
+  useEffect(() => {
+    if (!enabled) queryClient.removeQueries({ queryKey, exact: true });
+  }, [enabled, queryClient, queryKey]);
   const { data, status } = useSnapshotQuery({
-    queryKey: ["daemon-device-profiles", accountId, organizationSlug],
+    queryKey,
     enabled,
     queryFn: ({ signal }) => read({ data: { organizationSlug, manage: true }, signal }),
   });
