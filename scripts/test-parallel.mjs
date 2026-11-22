@@ -1,5 +1,4 @@
 import {
-  access,
   mkdir,
   mkdtemp,
   open,
@@ -16,6 +15,7 @@ import { parseArgs } from "node:util";
 import { isEntrypoint, printRunContext, repositoryFor } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
 import {
+  fullSuiteLockHeld,
   fullSuiteLockPath as lockPath,
   runWorkerGroup,
   takeFullSuiteLock,
@@ -347,14 +347,7 @@ async function main() {
   let exitCode = 1;
   try {
     if (values["rerun-failed"]) {
-      await access(lockPath).then(
-        () => {
-          throw new Error(busy);
-        },
-        (error) => {
-          if (error.code !== "ENOENT") throw error;
-        },
-      );
+      if (fullSuiteLockHeld()) throw new Error(busy);
     } else {
       lock = await takeFullSuiteLock();
     }
