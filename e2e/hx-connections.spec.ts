@@ -301,6 +301,37 @@ test("keeps the initial failure passive and announces the result of retrying", a
   await expect(page.getByRole("status").filter({ hasText: "Connections loaded." })).toBeVisible();
 });
 
+test("focuses Try again when a first-load retry pauses offline", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const { navigation, connections } = projectApp(page);
+  const statusRead = findConnectionRead(page, "canManage");
+  await navigation.openOrganizationSection("Connections");
+  await expect(connections.card("GitHub")).toBeVisible();
+  const statusPath = new URL((await statusRead).url()).pathname;
+  await page.route(
+    (url) => url.pathname === statusPath,
+    (route) => route.abort(),
+  );
+  await page.reload();
+  const retry = page.getByRole("button", { name: "Try again" });
+  await expect(retry).toBeVisible();
+  await expect(page.getByRole("main").getByRole("alert")).toHaveCount(0);
+
+  await page.evaluate(() => window.dispatchEvent(new Event("offline")));
+  try {
+    await tabThrough(page, [retry]);
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("main").getByRole("alert")).toContainText(
+      "Reconnect to the network",
+    );
+    await expect(retry).toBeFocused();
+    await expect(connections.card("GitHub")).toHaveCount(0);
+  } finally {
+    await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  }
+});
+
 test("labels the controls with guild IDs when two Discord connections share a name", async ({
   hub,
   page,
