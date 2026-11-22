@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 
 import { cn } from "../../lib/utils.js";
 
@@ -22,12 +22,18 @@ export function Section({
   /** Placement in a parent grid only. Never used to change how the section looks. */
   className?: string;
 }) {
+  const titleId = useId();
   return (
-    <section className={cn("mb-8 grid min-w-0 gap-3 last:mb-0", className)}>
+    <section
+      aria-labelledby={title === undefined ? undefined : titleId}
+      className={cn("mb-8 grid min-w-0 gap-3 last:mb-0", className)}
+    >
       {title === undefined ? null : (
         <div className="flex min-w-0 items-start justify-between gap-4">
           <div className="grid min-w-0 gap-1">
-            <h2 className="text-sm text-foreground">{title}</h2>
+            <h2 id={titleId} className="text-sm text-foreground">
+              {title}
+            </h2>
             {description === undefined ? null : (
               <p className="text-sm text-muted-foreground">{description}</p>
             )}
