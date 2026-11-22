@@ -6,6 +6,7 @@ dist/
 .typecheck/
 playwright-report/
 test-results/
+.test-receipts/
 e2e/screenshots/
 node_modules/
 AGENTS.override.md

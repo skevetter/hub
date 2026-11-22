@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join, posix, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { publishTestMetrics } from "./test-receipt.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const vitest = join(root, "node_modules", "vitest", "vitest.mjs");
@@ -223,6 +224,7 @@ async function main() {
   const env = { ...process.env, HUB_VITEST_CACHE_DIR: join(temp, "vite") };
   try {
     await checkRouteTree(root, temp, env);
+    const checks = ["route tree"];
     const listing = join(temp, "all-tests.json");
     const discover = await runVitest(["list", "--filesOnly", `--json=${listing}`], { env });
     if (discover !== 0) throw new Error("Vitest file discovery failed.");
@@ -244,10 +246,12 @@ async function main() {
     if (plan.migrationChanged) {
       console.log("Running npm run db:check for drizzle changes.");
       code |= await run("npm", ["run", "db:check"]);
+      checks.push("npm run db:check");
     }
     if (plan.scriptsChanged) {
       console.log("Running npm run test:scripts for package or runner changes.");
       code |= await run("npm", ["run", "test:scripts"]);
+      checks.push("npm run test:scripts");
     }
     const direct = await selectedVitest(
       ["run", ...[...plan.tests.keys()].map((path) => join(root, path))],
@@ -256,6 +260,11 @@ async function main() {
     );
     printTests(direct, (path) => plan.tests.get(path) ?? "Vitest path match");
     code |= direct.code;
+    const reported = new Set(direct.files.map(({ path }) => path));
+    const missing = [...plan.tests.keys()].filter((path) => !reported.has(path));
+    if (missing.length)
+      throw new Error(`Vitest did not report these selected files: ${missing.join(", ")}`);
+    const runs = [direct];
     if (plan.related.length) {
       console.log("Selecting related tests via the Vitest module graph for these paths");
       for (const path of plan.related) console.log(`  ${path}`);
@@ -272,8 +281,14 @@ async function main() {
       );
       printTests(related, () => "module graph");
       code |= related.code;
+      runs.push(related);
     }
-    return code === 0 ? 0 : 1;
+    if (code !== 0) return 1;
+    await publishTestMetrics(
+      runs.map(({ files, counts }) => ({ files: files.map(({ path }) => path), counts })),
+      checks,
+    );
+    return 0;
   } finally {
     await rm(temp, { recursive: true });
   }
