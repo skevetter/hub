@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AuthServer } from "../auth/server.js";
-import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { ProjectDashboard } from "../projects/dashboard.js";
 
@@ -39,41 +38,45 @@ function database() {
 afterEach(() => vi.restoreAllMocks());
 
 describe("organization connection snapshot", () => {
-  it("counts dropped events across reasons by card provider for the last seven days", async () => {
+  it("reads the last seven days for each provider in the resolved organization", async () => {
     const db = database();
     vi.spyOn(Date, "now").mockReturnValue(now.getTime());
-    const count = vi.spyOn(db, "countRecentDroppedEvents").mockResolvedValue([
-      { provider: "slack", reason: "routing", count: 2 },
-      { provider: "slack", reason: "trigger_filters_rejected", count: 3 },
-      { provider: "github", reason: "routing", count: 1 },
-      { provider: "manual", reason: "routing", count: 9 },
-    ]);
+    const read = vi.spyOn(db, "readDroppedEventPresence");
 
-    const snapshot = await new ProjectDashboard(db, auth).organizationSnapshot(request, {
+    await new ProjectDashboard(db, auth).organizationSnapshot(request, {
       organizationSlug: "acme",
     });
 
-    expect(count).toHaveBeenCalledExactlyOnceWith("org-1", new Date("2026-11-14T12:00:00Z"));
-    expect(snapshot).toMatchObject({
-      droppedConnectionEvents: { linear: 0, github: 1, slack: 5, discord: 0 },
-      droppedConnectionEventsCapped: false,
-    });
+    expect(read).toHaveBeenCalledTimes(4);
+    for (const provider of ["linear", "github", "slack", "discord"]) {
+      expect(read).toHaveBeenCalledWith("org-1", provider, new Date("2026-11-14T12:00:00Z"));
+    }
   });
 
-  it("marks counts as lower bounds when the shared receipt limit is reached", async () => {
+  it("preserves each provider's presence or uncertainty in the snapshot", async () => {
     const db = database();
-    vi.spyOn(db, "countRecentDroppedEvents").mockResolvedValue([
-      { provider: "discord", reason: "routing", count: 1 },
-      { provider: "manual", reason: "routing", count: RECENT_DROP_COUNT_LIMIT - 1 },
-    ]);
+    vi.spyOn(db, "readDroppedEventPresence").mockImplementation(
+      async (_organizationId, provider) => {
+        switch (provider) {
+          case "github":
+            return "some";
+          case "slack":
+            return "unknown";
+          default:
+            return "none";
+        }
+      },
+    );
 
     const snapshot = await new ProjectDashboard(db, auth).organizationSnapshot(request, {
       organizationSlug: "acme",
     });
 
-    expect(snapshot).toMatchObject({
-      droppedConnectionEvents: { linear: 0, github: 0, slack: 0, discord: 1 },
-      droppedConnectionEventsCapped: true,
+    expect(snapshot.droppedConnectionEvents).toEqual({
+      linear: "none",
+      github: "some",
+      slack: "unknown",
+      discord: "none",
     });
   });
 
