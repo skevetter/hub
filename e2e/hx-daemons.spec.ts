@@ -557,3 +557,58 @@ test("saves Rename from the slug field and its next tab stop", async ({ hub, pag
   await expect(daemons.device("third-device-name")).toBeVisible({ timeout: 2_000 });
   await expect(dialog).toBeHidden();
 });
+
+test("keeps keyboard focus on the device while retrying its providers", async ({ hub, page }) => {
+  test.setTimeout(90_000);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const name = await hub.connectProviderDaemon("owner", "Acme");
+  await page.clock.install();
+  let releaseFirst!: () => void;
+  const first = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let releaseRetry!: () => void;
+  const pendingRetry = new Promise<void>((resolve) => {
+    releaseRetry = resolve;
+  });
+  let requests = 0;
+  await page.route(
+    (url) =>
+      url.pathname.includes("/_serverFn/") &&
+      url.searchParams.get("payload")?.includes('"daemonId"') === true,
+    async (route) => {
+      requests++;
+      if (requests === 1) {
+        await first;
+        await route.abort();
+        return;
+      }
+      await pendingRetry;
+      await route.continue();
+    },
+  );
+  const daemons = new OrganizationDaemons(page);
+  try {
+    await daemons.open();
+    await expect.poll(() => requests).toBe(1);
+    await page.clock.fastForward(15_100);
+    const card = daemons.device(name);
+    const retry = card.getByRole("button", { name: "Try again", exact: true });
+    await retry.focus();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => requests).toBe(2);
+    await expect(card.getByText("Loading providers...")).toBeVisible();
+    await expect.soft
+      .poll(() => card.evaluate((element) => element.contains(document.activeElement)), {
+        timeout: 1_000,
+      })
+      .toBe(true);
+    releaseRetry();
+    await expect(card.getByText(/OpenCode.*Codex|Codex.*OpenCode/u)).toBeVisible();
+    await expect(actions(daemons, name)).toBeFocused({ timeout: 2_000 });
+  } finally {
+    releaseFirst();
+    releaseRetry();
+  }
+});
