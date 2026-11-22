@@ -33,6 +33,8 @@ const TRIGGER_NAME_ORDER_MIGRATION = "0064_organization_trigger_name_order";
 const DROPPED_EVENT_ACTIVITY_MIGRATION = "0066_dropped_event_activity";
 const ACTIVITY_WEBHOOK_LOOKUP_MIGRATION = "0065_activity_webhook_receipt_lookup";
 const LINEAR_RUN_REPLIES_MIGRATION = "0067_linear_run_replies";
+const SURFACE_PERSISTENCE_MIGRATION = "0068_surface_persistence";
+const LINEAR_RUN_REPLIES_WHEN = 1795305193694;
 const migrationJournalSchema = z.object({
   entries: z.array(
     z.object({
@@ -41,6 +43,37 @@ const migrationJournalSchema = z.object({
       when: z.number(),
     }),
   ),
+});
+
+it("places surface persistence at journal index 68 after the accepted reply migration", async () => {
+  const { entries } = await readMigrationJournal();
+  const reply = entries[67];
+  const surface = entries[68];
+  assert.deepEqual(reply, {
+    idx: 67,
+    tag: LINEAR_RUN_REPLIES_MIGRATION,
+    when: LINEAR_RUN_REPLIES_WHEN,
+  });
+  assert.ok(surface);
+  assert.equal(surface.idx, 68);
+  assert.equal(surface.tag, SURFACE_PERSISTENCE_MIGRATION);
+  for (const [index, entry] of entries.entries()) {
+    const previous = entries[index - 1];
+    if (previous !== undefined) {
+      assert.ok(entry.when > previous.when, `${entry.tag} must follow ${previous.tag} in time`);
+    }
+  }
+});
+
+it("chains the surface persistence snapshot to the accepted reply snapshot", async () => {
+  const snapshotSchema = z.object({ id: z.string().uuid(), prevId: z.string().uuid() });
+  const reply = snapshotSchema.parse(
+    JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/0067_snapshot.json"), "utf8")),
+  );
+  const surface = snapshotSchema.parse(
+    JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/0068_snapshot.json"), "utf8")),
+  );
+  assert.equal(surface.prevId, reply.id);
 });
 
 describe("database migration application", () => {
@@ -77,9 +110,7 @@ describe("database migration application", () => {
       const triggerIndex = "organization_triggers_organization_name_c_id_idx";
       const droppedIndex = "provider_event_receipts_org_dropped_order_idx";
       const webhookIndex = "provider_event_receipts_org_webhook_idx";
-      const { entries } = migrationJournalSchema.parse(
-        JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/_journal.json"), "utf8")),
-      );
+      const { entries } = await readMigrationJournal();
       assert.deepEqual(
         entries.slice(64).map(({ idx, tag }) => [idx, tag]),
         [
@@ -87,6 +118,7 @@ describe("database migration application", () => {
           [65, ACTIVITY_WEBHOOK_LOOKUP_MIGRATION],
           [66, DROPPED_EVENT_ACTIVITY_MIGRATION],
           [67, LINEAR_RUN_REPLIES_MIGRATION],
+          [68, SURFACE_PERSISTENCE_MIGRATION],
         ],
       );
       const baseline = (await journal()).rows;
@@ -137,6 +169,7 @@ describe("database migration application", () => {
         { hash: createHash("sha256").update(webhookLookupMigration).digest("hex") },
         { hash: createHash("sha256").update(droppedEventActivityMigration).digest("hex") },
         { hash: createHash("sha256").update(replyMigration).digest("hex") },
+        { hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION) },
       ]);
       const [definition] = (await index(triggerIndex)).rows;
       assert.ok(definition);
@@ -158,6 +191,135 @@ describe("database migration application", () => {
       );
       await runtime.migrate();
       assert.deepEqual((await journal()).rows, migrated);
+    } finally {
+      await runtime.close();
+    }
+  }, 120_000);
+
+  it("upgrades preexisting session rows from 0067 and supports legacy profile and session writes", async () => {
+    const url = await createHistoricalBaseline({
+      postgres,
+      prefix: "surface_persistence_upgrade",
+      through: LINEAR_RUN_REPLIES_MIGRATION,
+    });
+    const { runtime } = await postgresDatabaseRuntime(url);
+    const machineId = randomUUID();
+    const daemonId = randomUUID();
+    const profileId = randomUUID();
+    const sessionId = randomUUID();
+    const organizationId = "old-session-org";
+    const journal = () =>
+      runtime.query<{ hash: string; created_at: string }>(
+        "select hash, created_at::text from drizzle.__drizzle_migrations order by id",
+      );
+    const insertProfile = (id: string, name: string) =>
+      runtime.query(
+        `insert into interactive_session_profiles
+          (id, organization_id, daemon_id, name, cwd, provider, status)
+         values ($1, $2, $3, $4, '/repo', 'codex', 'active')`,
+        [id, organizationId, daemonId, name],
+      );
+    const insertSession = (id: string, profile: string) =>
+      runtime.query(
+        `insert into interactive_sessions
+          (id, organization_id, daemon_id, profile_id, profile_version, launch, title, state,
+           start_idempotency_key, start_request_hash)
+         values ($1, $2, $3, $4, 1, '{}', 'Legacy session', 'starting', $5, 'old-hash')`,
+        [id, organizationId, daemonId, profile, randomUUID()],
+      );
+    try {
+      await runtime.query("insert into organization (id, name, slug) values ($1, $1, $1)", [
+        organizationId,
+      ]);
+      await runtime.query(
+        "insert into machines (id, org_id, source, status) values ($1, $2, '{}', 'alive')",
+        [machineId, organizationId],
+      );
+      await runtime.query(
+        `insert into daemons
+           (id, idempotency_key, enrollment_verifier, slug, machine_id, organization_id, server_id,
+            daemon_public_key, credential_verifier, scopes, status)
+         values ($1, 'test-idempotency', 'test-enrollment', 'test-daemon', $2, $3, 'test-server', 'test-key',
+                 'test-verifier', '["hub.execution.*"]', 'active')`,
+        [daemonId, machineId, organizationId],
+      );
+      await insertProfile(profileId, "Old profile");
+      await insertSession(sessionId, profileId);
+      const baseline = (await journal()).rows;
+      assert.equal(baseline.length, 68);
+      assert.deepEqual(baseline.at(-1), {
+        hash: await migrationHash(LINEAR_RUN_REPLIES_MIGRATION),
+        created_at: String(LINEAR_RUN_REPLIES_WHEN),
+      });
+      const surface = (await readMigrationJournal()).entries[68];
+      assert.equal(surface?.tag, SURFACE_PERSISTENCE_MIGRATION);
+      const upgraded = [
+        ...baseline,
+        {
+          hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION),
+          created_at: String(surface.when),
+        },
+      ];
+      await runtime.migrate();
+      assert.deepEqual((await journal()).rows, upgraded);
+      await runtime.migrate();
+      assert.deepEqual((await journal()).rows, upgraded);
+
+      const legacyWriterProfileId = randomUUID();
+      const legacyWriterSessionId = randomUUID();
+      await insertProfile(legacyWriterProfileId, "Older code profile");
+      await insertSession(legacyWriterSessionId, legacyWriterProfileId);
+      await runtime.query(
+        "update interactive_session_profiles set name = 'Updated profile' where id = $1",
+        [profileId],
+      );
+      assert.deepEqual(
+        (
+          await runtime.query(
+            `select id, name, access, max_active, linear_template
+             from interactive_session_profiles order by (id = $1) desc`,
+            [profileId],
+          )
+        ).rows,
+        [
+          { id: profileId, name: "Updated profile" },
+          { id: legacyWriterProfileId, name: "Older code profile" },
+        ].map(({ id, name }) => ({
+          id,
+          name,
+          access: "private",
+          max_active: 4,
+          linear_template: null,
+        })),
+      );
+      assert.deepEqual(
+        (
+          await runtime.query(
+            `select id, profile_id, profile_version, origin, requester_identity_id
+             from interactive_sessions order by (id = $1) desc`,
+            [sessionId],
+          )
+        ).rows,
+        [
+          { id: sessionId, profile_id: profileId },
+          { id: legacyWriterSessionId, profile_id: legacyWriterProfileId },
+        ].map(({ id, profile_id }) => ({
+          id,
+          profile_id,
+          profile_version: 1,
+          origin: "web",
+          requester_identity_id: null,
+        })),
+      );
+      assert.deepEqual(
+        (
+          await runtime.query(`select
+          (select count(*)::int from member_identities) as identities,
+          (select count(*)::int from surface_policies) as policies,
+          (select count(*)::int from surface_bindings) as bindings`)
+        ).rows,
+        [{ identities: 0, policies: 0, bindings: 0 }],
+      );
     } finally {
       await runtime.close();
     }
@@ -354,7 +516,7 @@ describe("database migration application", () => {
         url,
         "select hash from drizzle.__drizzle_migrations order by id",
       );
-      assert.equal(migrated.rowCount, baseline.rows.length + 9);
+      assert.equal(migrated.rowCount, baseline.rows.length + 10);
       assert.deepEqual(migrated.rows, [
         ...baseline.rows,
         { hash: createHash("sha256").update(receiptMigration).digest("hex") },
@@ -366,6 +528,7 @@ describe("database migration application", () => {
         { hash: createHash("sha256").update(webhookLookupMigration).digest("hex") },
         { hash: createHash("sha256").update(droppedEventActivityMigration).digest("hex") },
         { hash: createHash("sha256").update(replyMigration).digest("hex") },
+        { hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION) },
       ]);
       assert.deepEqual(
         (await poolQuery(url, "select home_checklist_completed_at from organization")).rows,
@@ -543,6 +706,7 @@ describe("database migration application", () => {
       { hash: createHash("sha256").update(webhookLookupMigration).digest("hex") },
       { hash: createHash("sha256").update(droppedEventActivityMigration).digest("hex") },
       { hash: createHash("sha256").update(replyMigration).digest("hex") },
+      { hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION) },
     ]);
     assert.deepEqual(
       (
@@ -621,7 +785,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 68);
+      assert.equal(journal.rowCount, 69);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",
@@ -1094,9 +1258,7 @@ describe("database migration application", () => {
     const after = await durableSnapshot(fixture.url);
 
     assert.deepEqual(after, before);
-    const journal = migrationJournalSchema.parse(
-      JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/_journal.json"), "utf8")),
-    );
+    const journal = await readMigrationJournal();
     assert.deepEqual(await historicalShape(fixture.url), {
       authTables: 7,
       drizzleMigrations: journal.entries.length,
@@ -2591,10 +2753,19 @@ async function createHistoricalBaseline(options: HistoricalBaselineOptions): Pro
   return baseline.url;
 }
 
-async function applyHistoricalMigrations(url: string, through: string): Promise<void> {
-  const journal = migrationJournalSchema.parse(
+async function readMigrationJournal() {
+  return migrationJournalSchema.parse(
     JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/_journal.json"), "utf8")),
   );
+}
+
+async function migrationHash(tag: string): Promise<string> {
+  const sql = await readFile(join(DRIZZLE_MIGRATIONS, `${tag}.sql`));
+  return createHash("sha256").update(sql).digest("hex");
+}
+
+async function applyHistoricalMigrations(url: string, through: string): Promise<void> {
+  const journal = await readMigrationJournal();
   const migrations: typeof journal.entries = [];
   for (const entry of journal.entries) {
     migrations.push(entry);

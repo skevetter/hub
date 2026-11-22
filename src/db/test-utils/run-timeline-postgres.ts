@@ -43,7 +43,10 @@ export interface TimelinePostgresHarness {
   close(): Promise<void>;
 }
 
-function observedRuntime(runtime: DatabaseRuntime, hooks: TimelineQueryHooks): DatabaseRuntime {
+export function observedRuntime(
+  runtime: DatabaseRuntime,
+  hooks: TimelineQueryHooks,
+): DatabaseRuntime {
   async function query<Row extends QueryRow>(
     target: QueryHandle,
     sql: string,

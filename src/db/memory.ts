@@ -1,3 +1,4 @@
+import { MemorySurfaceStore } from "../surfaces/memory-store.js";
 import {
   linearRoutesForConnection,
   linearTriggerRoutesLock,
@@ -42,12 +43,12 @@ import {
   unsettledStatuses,
   validMessage,
 } from "../interactive-sessions/store.js";
-import type { SessionEventDraft } from "../interactive-sessions/store.js";
+import type { SessionEventDraft, StartSessionInput } from "../interactive-sessions/store.js";
 import type {
   SessionAuditRecord,
   SessionCommandRecord,
   SessionEventRecord,
-  SessionProfileRecord,
+  StoredSessionProfile,
   SessionRecord,
   SessionWithParticipants,
 } from "../interactive-sessions/types.js";
@@ -334,7 +335,10 @@ export function createMemoryDatabase(
 ): Database &
   Pick<
     MemoryDatabase,
-    "listInteractiveSessionAuditEvents" | "setLinearConnection" | "removeLinearConnection"
+    | "listInteractiveSessionAuditEvents"
+    | "setLinearConnection"
+    | "removeLinearConnection"
+    | "removeMemoryMember"
   > {
   return new MemoryDatabase(options);
 }
@@ -408,7 +412,35 @@ class MemoryDatabase implements Database {
     const row = this.replyDeliveries.get(runId);
     return row?.organizationId === organizationId ? row : undefined;
   }
-  private readonly sessionProfiles = new Map<string, SessionProfileRecord>();
+
+  private readonly surfaces = new MemorySurfaceStore({
+    connection: (workspaceId) => this.linearConnections.get(workspaceId),
+    isMember: (organizationId, userId) =>
+      this.sessionMemberRole(organizationId, userId) !== undefined,
+    profile: (id) => this.sessionProfiles.get(id.toLowerCase()),
+    session: (organizationId, id) => this.scopedInteractiveSession(organizationId, id)?.session,
+  });
+  createSurfaceIdentity: Database["createSurfaceIdentity"] = (...args) =>
+    this.surfaces.createSurfaceIdentity(...args);
+  findSurfaceIdentity: Database["findSurfaceIdentity"] = (...args) =>
+    this.surfaces.findSurfaceIdentity(...args);
+  listSurfaceIdentities: Database["listSurfaceIdentities"] = (...args) =>
+    this.surfaces.listSurfaceIdentities(...args);
+  removeSurfaceIdentity: Database["removeSurfaceIdentity"] = (...args) =>
+    this.withAdvisoryLock(interactiveSessionLock, () =>
+      this.surfaces.removeSurfaceIdentity(...args),
+    );
+  findSurfacePolicy: Database["findSurfacePolicy"] = (...args) =>
+    this.surfaces.findSurfacePolicy(...args);
+  saveSurfacePolicy: Database["saveSurfacePolicy"] = (...args) =>
+    this.surfaces.saveSurfacePolicy(...args);
+  findSurfaceBinding: Database["findSurfaceBinding"] = (...args) =>
+    this.surfaces.findSurfaceBinding(...args);
+  findSurfaceBindingGeneration: Database["findSurfaceBindingGeneration"] = (...args) =>
+    this.surfaces.findSurfaceBindingGeneration(...args);
+  supersedeSurfaceBinding: Database["supersedeSurfaceBinding"] = (...args) =>
+    this.surfaces.supersedeSurfaceBinding(...args);
+  private readonly sessionProfiles = new Map<string, StoredSessionProfile>();
   private readonly interactiveSessions = new Map<string, SessionWithParticipants>();
   private readonly interactiveCommands = new Map<string, SessionCommandRecord[]>();
   private readonly interactiveEvents = new Map<string, SessionEventRecord[]>();
@@ -444,7 +476,7 @@ class MemoryDatabase implements Database {
     this.withAdvisoryLock(interactiveSessionLock, async () => {
       const { organizationId, userId } = input.principal;
       const settings = profileSettings(input);
-      const invalid = profileValidation(settings);
+      const invalid = profileValidation(input);
       if (invalid) return invalid;
       const role = this.sessionMemberRole(organizationId, userId);
       if (!role || role === "member") return "forbidden";
@@ -476,6 +508,15 @@ class MemoryDatabase implements Database {
     this.withAdvisoryLock(interactiveSessionLock, async () => {
       const { organizationId, userId } = input.principal;
       if (!this.sessionMemberRole(organizationId, userId)) return refused("forbidden");
+      const requester = input.nativeRequester;
+      if (
+        requester &&
+        !this.surfaces.isCurrentRequester(
+          { organizationId, workspaceId: requester.workspaceId, userId },
+          requester.identityId,
+        )
+      )
+        return refused("forbidden");
       const people = startParticipants(input);
       const hash = startHash(input, people);
       const prior = [...this.interactiveSessions.values()].find(
@@ -504,21 +545,9 @@ class MemoryDatabase implements Database {
       if (profile?.organizationId !== organizationId || profile.status !== "active")
         return refused("profile_unavailable");
       if (profile.version !== input.profileVersion) return refused("profile_changed");
-      const daemon = await this.findDaemonForOrganization(organizationId, profile.daemonId);
-      if (
-        daemon?.status !== "active" ||
-        daemon.presence !== "connected" ||
-        !daemon.permissions.includes("hub.execute")
-      ) {
-        return refused("daemon_unavailable");
-      }
-      const active = [...this.interactiveSessions.values()].filter(
-        ({ session }) =>
-          session.organizationId === organizationId &&
-          session.daemonId === profile.daemonId &&
-          session.state !== "closed",
-      );
-      if (active.length >= input.maxActivePerDaemon) return refused("active_limit");
+      if (requester && profile.createdByUserId !== userId) return refused("forbidden");
+      const capacity = await this.startCapacity(profile, input);
+      if (capacity) return refused(capacity);
       if (!people.every((person) => this.sessionMemberRole(organizationId, person.userId)))
         return refused("invalid_participant");
       if (!(await this.consumeOrganizationUsage(sessionUsage(input.principal, input.usage))))
@@ -905,6 +934,39 @@ class MemoryDatabase implements Database {
       return batch.length;
     });
 
+  private async startCapacity(
+    profile: StoredSessionProfile,
+    input: StartSessionInput,
+  ): Promise<"daemon_unavailable" | "active_limit" | undefined> {
+    const { organizationId } = input.principal;
+    const daemon = await this.findDaemonForOrganization(organizationId, profile.daemonId);
+    if (
+      daemon?.status !== "active" ||
+      daemon.presence !== "connected" ||
+      !daemon.permissions.includes("hub.execute")
+    ) {
+      return "daemon_unavailable";
+    }
+    const active = [...this.interactiveSessions.values()].filter(
+      ({ session }) =>
+        session.organizationId === organizationId &&
+        session.daemonId === profile.daemonId &&
+        session.state !== "closed",
+    );
+    if (active.length >= input.maxActivePerDaemon) return "active_limit";
+    if (
+      input.nativeRequester &&
+      [...this.interactiveSessions.values()].filter(
+        ({ session }) =>
+          session.organizationId === organizationId &&
+          session.profileId === profile.id &&
+          session.state !== "closed",
+      ).length >= profile.maxActive
+    )
+      return "active_limit";
+    return undefined;
+  }
+
   private scopedInteractiveSession(organizationId: string, id: string) {
     const row = this.interactiveSessions.get(id.toLowerCase());
     return row?.session.organizationId === organizationId ? row : undefined;
@@ -921,7 +983,7 @@ class MemoryDatabase implements Database {
   }
 
   private sessionMemberRole(organizationId: string, userId: string) {
-    return this.options.memberships?.find(
+    return this.memberships.find(
       (member) => member.organizationId === organizationId && member.userId === userId,
     )?.role;
   }
@@ -1923,12 +1985,14 @@ class MemoryDatabase implements Database {
   >();
   private readonly linearConnections = new Map<string, LinearConnectionRecord>();
   private readonly organizationIds: Set<string>;
+  private readonly memberships: NonNullable<MemoryDatabaseOptions["memberships"]>[number][];
   private readonly homeChecklistCompletions = new Map<string, Date>();
 
   constructor(private readonly options: MemoryDatabaseOptions = {}) {
+    this.memberships = [...(options.memberships ?? [])];
     this.organizationIds = new Set([
       ...(options.organizationIds ?? []),
-      ...(options.memberships ?? []).map(({ organizationId }) => organizationId),
+      ...this.memberships.map(({ organizationId }) => organizationId),
     ]);
     for (const connection of options.githubConnections ?? [])
       this.githubConnections.set(connection.installationId, connection);
@@ -5989,7 +6053,7 @@ class MemoryDatabase implements Database {
    * organizations only through those, so the operator picker reads the same source. */
   private operatorOrganizations(): OperatorOrganizationRecord[] {
     const seen = new Map<string, OperatorOrganizationRecord>();
-    for (const membership of this.options.memberships ?? []) {
+    for (const membership of this.memberships) {
       seen.set(membership.organizationId, {
         id: membership.organizationId,
         name: membership.organizationName,
@@ -6004,7 +6068,7 @@ class MemoryDatabase implements Database {
     organizationSlug: string,
     projectSlug?: string,
   ): Promise<TenantRouteAccess | undefined> {
-    const membership = this.options.memberships?.find(
+    const membership = this.memberships.find(
       (candidate) => candidate.userId === userId && candidate.organizationSlug === organizationSlug,
     );
     if (membership === undefined) return undefined;
@@ -6540,7 +6604,7 @@ class MemoryDatabase implements Database {
 
   // Memory fixtures supply verified bindings. OAuth attempt persistence belongs to PostgreSQL.
   async setLinearConnection(connection: LinearConnectionRecord): Promise<void> {
-    await this.withAdvisoryLock(linearTriggerRoutesLock(connection.organizationId), async () => {
+    await this.withLinearConnectionChange(connection.organizationId, async () => {
       const existing = this.linearConnections.get(connection.linearOrganizationId);
       if (
         existing !== undefined &&
@@ -6588,8 +6652,19 @@ class MemoryDatabase implements Database {
     });
   }
 
+  removeMemoryMember(organizationId: string, userId: string): Promise<void> {
+    return this.withAdvisoryLock(interactiveSessionLock, async () => {
+      const index = this.memberships.findIndex(
+        (row) => row.organizationId === organizationId && row.userId === userId,
+      );
+      if (index < 0) return;
+      this.memberships.splice(index, 1);
+      this.surfaces.dropMember(organizationId, userId);
+    });
+  }
+
   async removeLinearConnection(organizationId: string, connectionId: string): Promise<void> {
-    await this.withAdvisoryLock(linearTriggerRoutesLock(organizationId), async () => {
+    await this.withLinearConnectionChange(organizationId, async () => {
       const connection = [...this.linearConnections.values()].find(
         (row) => row.id === connectionId && row.organizationId === organizationId,
       );
@@ -6607,7 +6682,14 @@ class MemoryDatabase implements Database {
         }
       }
       this.linearConnections.delete(connection.linearOrganizationId);
+      this.surfaces.dropConnection(connection);
     });
+  }
+
+  private withLinearConnectionChange(organizationId: string, change: () => Promise<void>) {
+    return this.withAdvisoryLock(linearTriggerRoutesLock(organizationId), () =>
+      this.withAdvisoryLock(interactiveSessionLock, change),
+    );
   }
 
   bindLinearConnection(_input: BindLinearConnectionInput): Promise<void> {

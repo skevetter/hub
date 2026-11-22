@@ -1,3 +1,4 @@
+import { isCurrentSurfaceRequester } from "../surfaces/postgres-store.js";
 import {
   and,
   asc,
@@ -13,7 +14,12 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Locks } from "../db/runtime/locks/index.js";
-import type { DatabaseRuntime, DrizzleHandle, QueryHandle } from "../db/runtime/index.js";
+import type {
+  DatabaseRuntime,
+  DrizzleHandle,
+  QueryHandle,
+  TransactionHandle,
+} from "../db/runtime/index.js";
 import {
   auditEvents,
   daemons,
@@ -85,6 +91,7 @@ import type {
   SessionEventRecord,
   SessionParticipantRecord,
   SessionPrincipal,
+  StoredSessionProfile,
   SessionRecord,
 } from "./types.js";
 
@@ -123,7 +130,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       const db = tx.drizzle();
       const { organizationId, userId } = input.principal;
       const settings = profileSettings(input);
-      const invalid = profileValidation(settings);
+      const invalid = profileValidation(input);
       if (invalid) return invalid;
       const role = await this.role(db, organizationId, userId);
       if (role === undefined || role === "member") return "forbidden";
@@ -170,7 +177,13 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       if (current) {
         const [saved] = await db
           .update(profiles)
-          .set({ ...settings, version: current.version + 1, updatedAt: input.now })
+          .set({
+            ...settings,
+            maxActive: input.maxActive,
+            linearTemplate: input.linearTemplate,
+            version: current.version + 1,
+            updatedAt: input.now,
+          })
           .where(and(eq(profiles.organizationId, organizationId), eq(profiles.id, current.id)))
           .returning();
         return saved!;
@@ -195,6 +208,16 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         "isession-start:" + JSON.stringify([organizationId, userId, key]),
       );
       if (!(await this.role(db, organizationId, userId))) return refused("forbidden");
+      const requester = input.nativeRequester;
+      if (
+        requester &&
+        !(await isCurrentSurfaceRequester(
+          db,
+          { organizationId, workspaceId: requester.workspaceId, userId },
+          requester.identityId,
+        ))
+      )
+        return refused("forbidden");
       const [prior] = await db
         .select()
         .from(sessions)
@@ -227,35 +250,9 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         .for("share");
       if (profile?.status !== "active") return refused("profile_unavailable");
       if (profile.version !== input.profileVersion) return refused("profile_changed");
-      await this.locks.withTxLock(tx, "isession-daemon:" + profile.daemonId);
-      const [daemon] = await db
-        .select({
-          status: daemons.status,
-          presence: daemons.presence,
-          permissions: daemons.permissions,
-        })
-        .from(daemons)
-        .where(and(eq(daemons.organizationId, organizationId), eq(daemons.id, profile.daemonId)))
-        .for("share");
-      if (
-        daemon?.status !== "active" ||
-        daemon.presence !== "connected" ||
-        !daemon.permissions.includes("hub.execute")
-      ) {
-        return refused("daemon_unavailable");
-      }
-
-      const [active] = await db
-        .select({ count: count() })
-        .from(sessions)
-        .where(
-          and(
-            eq(sessions.organizationId, organizationId),
-            eq(sessions.daemonId, profile.daemonId),
-            ne(sessions.state, "closed"),
-          ),
-        );
-      if (active!.count >= input.maxActivePerDaemon) return refused("active_limit");
+      if (requester && profile.createdByUserId !== userId) return refused("forbidden");
+      const capacity = await this.startCapacity(tx, profile, input);
+      if (capacity) return refused(capacity);
       const people = await db
         .select({ userId: members.userId })
         .from(members)
@@ -507,7 +504,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         .for("update");
       const leaseNow = await leaseTime(tx);
       const drafts: SessionEventDraft[] = [];
-      let nextSession = session;
+      let nextSession: SessionRecord = session;
       let claimed: SessionCommandRecord | undefined;
       if (
         !candidates.some(
@@ -725,6 +722,58 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       [cutoff, limit, now],
     );
     return result.rowCount;
+  }
+
+  private async startCapacity(
+    tx: TransactionHandle,
+    profile: StoredSessionProfile,
+    input: StartSessionInput,
+  ): Promise<"daemon_unavailable" | "active_limit" | undefined> {
+    const { organizationId } = input.principal;
+    const db = tx.drizzle();
+    await this.locks.withTxLock(tx, "isession-daemon:" + profile.daemonId);
+    const [daemon] = await db
+      .select({
+        status: daemons.status,
+        presence: daemons.presence,
+        permissions: daemons.permissions,
+      })
+      .from(daemons)
+      .where(and(eq(daemons.organizationId, organizationId), eq(daemons.id, profile.daemonId)))
+      .for("share");
+    if (
+      daemon?.status !== "active" ||
+      daemon.presence !== "connected" ||
+      !daemon.permissions.includes("hub.execute")
+    ) {
+      return "daemon_unavailable";
+    }
+
+    const [active] = await db
+      .select({ count: count() })
+      .from(sessions)
+      .where(
+        and(
+          eq(sessions.organizationId, organizationId),
+          eq(sessions.daemonId, profile.daemonId),
+          ne(sessions.state, "closed"),
+        ),
+      );
+    if (active!.count >= input.maxActivePerDaemon) return "active_limit";
+    if (input.nativeRequester) {
+      const [profileActive] = await db
+        .select({ count: count() })
+        .from(sessions)
+        .where(
+          and(
+            eq(sessions.organizationId, organizationId),
+            eq(sessions.profileId, profile.id),
+            ne(sessions.state, "closed"),
+          ),
+        );
+      if (profileActive!.count >= profile.maxActive) return "active_limit";
+    }
+    return undefined;
   }
 
   private async lockProfile(db: DrizzleHandle, organizationId: string, profileId: string) {

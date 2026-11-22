@@ -1968,6 +1968,9 @@ export const interactiveSessionProfiles = pgTable(
       .default({})
       .notNull(),
     fullAccessAcknowledged: boolean("full_access_acknowledged").default(false).notNull(),
+    access: text().$type<"private">().default("private").notNull(),
+    maxActive: integer("max_active").default(4).notNull(),
+    linearTemplate: text("linear_template"),
     status: text()
       .$type<import("../interactive-sessions/types.js").SessionProfileStatus>()
       .notNull(),
@@ -2017,6 +2020,11 @@ export const interactiveSessionProfiles = pgTable(
       (${table.mode} is not null and (${table.mode} <> 'full' or ${table.fullAccessAcknowledged}))`,
     ),
     check(
+      "interactive_session_profiles_surface_check",
+      sql`${table.access} = 'private' and ${table.maxActive} between 1 and 16
+        and (${table.linearTemplate} is null or octet_length(${table.linearTemplate}) between 1 and 16384)`,
+    ),
+    check(
       "interactive_session_profiles_status_check",
       sql`${table.status} in ('active', 'disabled') and ${table.version} > 0`,
     ),
@@ -2032,6 +2040,9 @@ export const interactiveSessions = pgTable(
       .references(() => organizations.id, { onDelete: "cascade" }),
     profileId: uuid("profile_id").notNull(),
     profileVersion: integer("profile_version").notNull(),
+    origin: text().$type<"web" | "linear">().default("web").notNull(),
+    // Keep the requester's identity evidence after membership removal.
+    requesterIdentityId: uuid("requester_identity_id"),
     launch: jsonb().$type<import("../interactive-sessions/types.js").SessionLaunch>().notNull(),
     daemonId: uuid("daemon_id").notNull(),
     title: text().notNull(),
@@ -2070,6 +2081,14 @@ export const interactiveSessions = pgTable(
     index("interactive_sessions_open_daemon_idx")
       .on(table.daemonId)
       .where(sql`${table.state} <> 'closed'`),
+    index("interactive_sessions_open_profile_idx")
+      .on(table.organizationId, table.profileId)
+      .where(sql`${table.state} <> 'closed'`),
+    check(
+      "interactive_sessions_origin_check",
+      sql`(${table.origin} = 'web' and ${table.requesterIdentityId} is null)
+        or (${table.origin} = 'linear' and ${table.requesterIdentityId} is not null)`,
+    ),
     foreignKey({
       columns: [table.profileId, table.organizationId],
       foreignColumns: [interactiveSessionProfiles.id, interactiveSessionProfiles.organizationId],
@@ -2244,4 +2263,143 @@ export const interactiveSessionEvents = pgTable(
     ),
     check("interactive_session_events_data_check", sql`octet_length(${table.data}::text) <= 1024`),
   ],
+);
+
+export const memberIdentities = pgTable(
+  "member_identities",
+  {
+    id: uuid().defaultRandom().primaryKey(),
+    organizationId: text("organization_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    providerUserId: text("provider_user_id").notNull(),
+    userId: text("user_id").notNull(),
+    label: text().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex("member_identities_workspace_user_unique").on(
+      table.organizationId,
+      table.workspaceId,
+      table.providerUserId,
+    ),
+    index("member_identities_member_idx").on(table.organizationId, table.userId),
+    foreignKey({
+      columns: [table.organizationId, table.userId],
+      foreignColumns: [members.organizationId, members.userId],
+      name: "member_identities_member_org_fk",
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.organizationId, table.workspaceId],
+      foreignColumns: [linearConnections.organizationId, linearConnections.linearOrganizationId],
+      name: "member_identities_workspace_org_fk",
+    }).onDelete("cascade"),
+    check("member_identities_label_check", sql`char_length(${table.label}) between 1 and 256`),
+  ],
+);
+
+export const surfacePolicies = pgTable(
+  "surface_policies",
+  {
+    connectionId: uuid("connection_id").primaryKey(),
+    organizationId: text("organization_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    applicationId: text("application_id").notNull(),
+    appUserId: text("app_user_id").notNull(),
+    enabled: boolean().default(false).notNull(),
+    revision: integer().default(1).notNull(),
+    profileId: uuid("profile_id").notNull(),
+    profileVersion: integer("profile_version").notNull(),
+    scope: jsonb().$type<import("../surfaces/store.js").SurfacePolicy["scope"]>().notNull(),
+    publishAnswers: boolean("publish_answers").default(false).notNull(),
+    moveOnBegin: text("move_on_begin")
+      .$type<import("../surfaces/store.js").SurfacePolicy["moveOnBegin"]>()
+      .default("unchanged")
+      .notNull(),
+    moveOnFinish: text("move_on_finish").$type<"unchanged">().default("unchanged").notNull(),
+    verifiedAppHandle: text("verified_app_handle"),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    foreignKey({
+      columns: [table.connectionId, table.organizationId],
+      foreignColumns: [linearConnections.id, linearConnections.organizationId],
+      name: "surface_policies_connection_org_fk",
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.profileId, table.organizationId],
+      foreignColumns: [interactiveSessionProfiles.id, interactiveSessionProfiles.organizationId],
+      name: "surface_policies_profile_org_fk",
+    }).onDelete("cascade"),
+    index("surface_policies_profile_org_idx").on(table.profileId, table.organizationId),
+    check(
+      "surface_policies_revision_check",
+      sql`${table.revision} > 0 and ${table.profileVersion} > 0`,
+    ),
+    check(
+      "surface_policies_scope_check",
+      sql`coalesce(jsonb_typeof(${table.scope}->'teamIds') = 'array', false)`,
+    ),
+    check(
+      "surface_policies_handle_check",
+      sql`
+      (${table.verifiedAppHandle} is null and not ${table.enabled})
+      or (char_length(${table.verifiedAppHandle}) between 1 and 256
+        and ${table.verifiedAppHandle} = btrim(${table.verifiedAppHandle})
+        and ${table.verifiedAppHandle} !~ '[[:cntrl:]]'
+        and ${table.verifiedAppHandle} is not null)
+    `,
+    ),
+    check(
+      "surface_policies_issue_state_check",
+      sql`
+      ${table.moveOnBegin} in ('unchanged', 'started') and ${table.moveOnFinish} = 'unchanged'
+    `,
+    ),
+  ],
+);
+
+export const surfaceBindings = pgTable(
+  "surface_bindings",
+  {
+    id: uuid().defaultRandom().primaryKey(),
+    organizationId: text("organization_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    applicationId: text("application_id").notNull(),
+    appUserId: text("app_user_id").notNull(),
+    nativeSessionId: text("native_session_id").notNull(),
+    // Preserve connection evidence after disconnect so a retry cannot reset the generation.
+    connectionId: uuid("connection_id").notNull(),
+    issueId: text("issue_id").notNull(),
+    teamId: text("team_id").notNull(),
+    sessionId: uuid("session_id").notNull(),
+    policyRevision: integer("policy_revision").notNull(),
+    generation: integer().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    supersededAt: timestamp("superseded_at", { withTimezone: true }),
+  },
+  (table) => {
+    const key = [
+      table.workspaceId,
+      table.applicationId,
+      table.appUserId,
+      table.nativeSessionId,
+    ] as const;
+    return [
+      uniqueIndex("surface_bindings_current_unique")
+        .on(...key)
+        .where(sql`${table.supersededAt} is null`),
+      uniqueIndex("surface_bindings_generation_unique").on(...key, table.generation),
+      uniqueIndex("surface_bindings_id_org_unique").on(table.id, table.organizationId),
+      index("surface_bindings_session_org_idx").on(table.sessionId, table.organizationId),
+      foreignKey({
+        columns: [table.sessionId, table.organizationId],
+        foreignColumns: [interactiveSessions.id, interactiveSessions.organizationId],
+        name: "surface_bindings_session_org_fk",
+      }).onDelete("cascade"),
+      check(
+        "surface_bindings_revisions_check",
+        sql`${table.generation} > 0 and ${table.policyRevision} > 0`,
+      ),
+    ];
+  },
 );

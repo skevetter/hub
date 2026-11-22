@@ -82,7 +82,14 @@ export interface SessionProfileSettings extends Omit<SessionLaunch, "worktree"> 
   status: SessionProfileStatus;
 }
 
-export interface SessionProfileRecord extends SessionProfileSettings {
+interface SessionProfileSurfaceSettings {
+  access: "private";
+  maxActive: number;
+  linearTemplate: string | null;
+}
+
+export interface SessionProfileRecord
+  extends SessionProfileSettings, Partial<SessionProfileSurfaceSettings> {
   id: string;
   organizationId: string;
   version: number;
@@ -91,7 +98,14 @@ export interface SessionProfileRecord extends SessionProfileSettings {
   updatedAt: Date;
 }
 
-export interface SessionRecord {
+export type StoredSessionProfile = SessionProfileRecord & SessionProfileSurfaceSettings;
+
+interface SessionOrigin {
+  origin: "web" | "linear";
+  requesterIdentityId: string | null;
+}
+
+export interface SessionRecord extends Partial<SessionOrigin> {
   id: string;
   organizationId: string;
   profileId: string;
@@ -116,6 +130,8 @@ export interface SessionRecord {
   closedAt: Date | null;
   closedByUserId: string | null;
 }
+
+export type StoredSession = SessionRecord & SessionOrigin;
 
 export interface SessionParticipantRecord {
   organizationId: string;

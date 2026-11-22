@@ -24,12 +24,16 @@ import type {
   SessionState,
   SessionStateReason,
   SessionWithParticipants,
+  StoredSession,
+  StoredSessionProfile,
 } from "./types.js";
 
 export interface SaveSessionProfileInput extends SessionProfileSettings {
   principal: SessionPrincipal;
   id: string | null;
   version: number | null;
+  maxActive?: number;
+  linearTemplate?: string | null;
   now: Date;
 }
 
@@ -44,6 +48,7 @@ export interface StartSessionInput {
   principal: SessionPrincipal;
   profileId: string;
   profileVersion: number;
+  nativeRequester?: { identityId: string; workspaceId: string };
   idempotencyKey: string;
   message: string;
   participants: readonly Participant[];
@@ -256,7 +261,7 @@ export function profileSettings(input: SaveSessionProfileInput): SessionProfileS
 }
 
 export function profileValidation(
-  settings: SessionProfileSettings,
+  settings: SessionProfileSettings & Pick<SaveSessionProfileInput, "maxActive" | "linearTemplate">,
 ): "invalid_mode" | "invalid_profile" | undefined {
   if (
     settings.provider === "omp" &&
@@ -271,7 +276,8 @@ export function profileValidation(
     !(posix.isAbsolute(settings.cwd) || /^(?:[A-Za-z]:[\\/]|\\\\)/u.test(settings.cwd)) ||
     Buffer.byteLength(settings.cwd) > 1024 ||
     jsonbTextSize(settings.providerOptions) > 4096 ||
-    settings.cwd.includes("\0")
+    settings.cwd.includes("\0") ||
+    !validSurfaceProfileSettings(settings)
   )
     return "invalid_profile";
   return undefined;
@@ -310,6 +316,20 @@ function jsonbTextSize(value: JsonValue): number {
   return sign + 1 - power + digits;
 }
 
+function validSurfaceProfileSettings(
+  input: Pick<SaveSessionProfileInput, "maxActive" | "linearTemplate">,
+): boolean {
+  const { maxActive, linearTemplate } = input;
+  return (
+    (maxActive === undefined ||
+      (Number.isInteger(maxActive) && maxActive >= 1 && maxActive <= 16)) &&
+    (linearTemplate == null ||
+      (linearTemplate.length > 0 &&
+        Buffer.byteLength(linearTemplate) <= 16384 &&
+        !linearTemplate.includes("\0")))
+  );
+}
+
 export function profileVersionMatches(
   input: SaveSessionProfileInput,
   current: SessionProfileRecord | undefined,
@@ -323,13 +343,20 @@ export function profileVersionMatches(
 export function profileRecord(
   input: SaveSessionProfileInput,
   settings: SessionProfileSettings,
-  current?: SessionProfileRecord,
-): SessionProfileRecord {
+  current?: StoredSessionProfile,
+): StoredSessionProfile {
+  const fields = {
+    ...settings,
+    access: "private" as const,
+    maxActive: input.maxActive ?? current?.maxActive ?? 4,
+    linearTemplate:
+      input.linearTemplate === undefined ? (current?.linearTemplate ?? null) : input.linearTemplate,
+  };
   if (current) {
-    return { ...current, ...settings, version: current.version + 1, updatedAt: input.now };
+    return { ...current, ...fields, version: current.version + 1, updatedAt: input.now };
   }
   return {
-    ...settings,
+    ...fields,
     id: randomUUID(),
     organizationId: input.principal.organizationId,
     createdByUserId: input.principal.userId,
@@ -355,12 +382,20 @@ export function startParticipants(input: StartSessionInput): Participant[] {
 }
 
 export function startHash(input: StartSessionInput, participants: readonly Participant[]): string {
-  return hashRequest([
+  const request: unknown[] = [
     input.profileId.toLowerCase(),
     input.profileVersion,
     input.message,
     participants.map(({ userId, role }) => [userId, role]),
-  ]);
+  ];
+  if (input.nativeRequester) {
+    request.push([
+      "linear",
+      input.nativeRequester.workspaceId,
+      input.nativeRequester.identityId.toLowerCase(),
+    ]);
+  }
+  return hashRequest(request);
 }
 
 export function commandHash(input: AcceptCommandInput): string {
@@ -382,13 +417,15 @@ export function newSession(
   input: StartSessionInput,
   profile: SessionProfileRecord,
   requestHash: string,
-): SessionRecord {
+): StoredSession {
   const id = randomUUID();
   return {
     id,
     organizationId: input.principal.organizationId,
     profileId: profile.id,
     profileVersion: profile.version,
+    origin: input.nativeRequester ? "linear" : "web",
+    requesterIdentityId: input.nativeRequester?.identityId.toLowerCase() ?? null,
     daemonId: profile.daemonId,
     title: profile.name,
     launch: {

@@ -1,3 +1,4 @@
+import { SurfaceRepository } from "../surfaces/postgres-store.js";
 import {
   linearTriggerRoutesLock,
   organizationTriggerRoutesForSave,
@@ -367,6 +368,25 @@ class PgDatabase implements Database {
     return postgresStopInterrupts(this.pool);
   }
   private readonly interactiveSessions: InteractiveSessionRepository;
+  private readonly surfaces: SurfaceRepository;
+  createSurfaceIdentity: Database["createSurfaceIdentity"] = (...args) =>
+    this.surfaces.createSurfaceIdentity(...args);
+  findSurfaceIdentity: Database["findSurfaceIdentity"] = (...args) =>
+    this.surfaces.findSurfaceIdentity(...args);
+  listSurfaceIdentities: Database["listSurfaceIdentities"] = (...args) =>
+    this.surfaces.listSurfaceIdentities(...args);
+  removeSurfaceIdentity: Database["removeSurfaceIdentity"] = (...args) =>
+    this.surfaces.removeSurfaceIdentity(...args);
+  findSurfacePolicy: Database["findSurfacePolicy"] = (...args) =>
+    this.surfaces.findSurfacePolicy(...args);
+  saveSurfacePolicy: Database["saveSurfacePolicy"] = (...args) =>
+    this.surfaces.saveSurfacePolicy(...args);
+  findSurfaceBinding: Database["findSurfaceBinding"] = (...args) =>
+    this.surfaces.findSurfaceBinding(...args);
+  findSurfaceBindingGeneration: Database["findSurfaceBindingGeneration"] = (...args) =>
+    this.surfaces.findSurfaceBindingGeneration(...args);
+  supersedeSurfaceBinding: Database["supersedeSurfaceBinding"] = (...args) =>
+    this.surfaces.supersedeSurfaceBinding(...args);
   listSessionProfiles: Database["listSessionProfiles"] = (...args) =>
     this.interactiveSessions.listSessionProfiles(...args);
   findSessionProfile: Database["findSessionProfile"] = (...args) =>
@@ -575,6 +595,7 @@ class PgDatabase implements Database {
     this.runReplies = postgresRunReplies(this.pool, locks);
     this.schedules = new ScheduleRepository(this.pool);
     this.timeline = new RunTimelineRepository(this.pool, locks);
+    this.surfaces = new SurfaceRepository(this.pool, locks);
     this.interactiveSessions = new InteractiveSessionRepository(
       this.pool,
       locks,
