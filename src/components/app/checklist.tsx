@@ -80,7 +80,7 @@ export function ChecklistItem({
             {title}
             {state === "attention" ? (
               <span className="text-warning">
-                {" · "}
+                {" \u00b7 "}
                 {stateLabel}
               </span>
             ) : (

@@ -670,7 +670,7 @@ function daemonStep(
     const connected = able.filter(({ presence }) => presence === "connected").length;
     return {
       title,
-      hint: `${able.map(({ slug }) => slug).join(", ")} · ${String(connected)} of ${String(able.length)} connected`,
+      hint: `${able.map(({ slug }) => slug).join(", ")} \u00b7 ${String(connected)} of ${String(able.length)} connected`,
       status: DONE,
     };
   }
