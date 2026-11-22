@@ -14,7 +14,7 @@ import {
 import { setTimeout as delay } from "node:timers/promises";
 
 export const testSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
-export const fullSuiteLockPath = "/tmp/hub-fullsuite.lock";
+export const fullSuiteLockPath = process.env.HUB_TEST_FULLSUITE_LOCK || "/tmp/hub-fullsuite.lock";
 const gracePeriod = 5000;
 
 function ps(args) {
@@ -58,7 +58,7 @@ async function waitForGroup(pid, duration) {
   return true;
 }
 
-async function stopGroup(pid, signal, graceMs = gracePeriod) {
+export async function stopGroup(pid, signal, graceMs = gracePeriod) {
   if (!groupAlive(pid)) return;
   signalGroup(pid, signal);
   if (await waitForGroup(pid, graceMs)) return;
