@@ -4,7 +4,7 @@ import { once } from "node:events";
 
 import { constants, existsSync } from "node:fs";
 
-import { mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -127,6 +127,31 @@ test("a process failure with no named failed files offers a rerun without inflat
   assert.match(output.join("\n"), /--rerun-failed/u);
 });
 
+test("shards report load before and after execution and warn only at the start", async () => {
+  const output = [];
+  const samples = [
+    { averages: [5.125, 2, 3.256], cores: 4 },
+    { averages: [6, 3.5, 2], cores: 4 },
+  ];
+  await runShards([["a.test.ts"]], {
+    readLoad: () => samples.shift(),
+    print: (line) => output.push(line),
+    execute: async () => ({
+      durationMs: 100,
+      counts: { passed: 1, failed: 0, skipped: 0 },
+      failedFiles: [],
+      exitCode: 0,
+    }),
+  });
+  assert.deepEqual(output, [
+    "Machine load at start (1, 5, 15 min): 5.13, 2.00, 3.26; available cores: 4",
+    "WARNING: Machine load exceeds available cores. Timings and timeouts may be unreliable.",
+    "Shard 1: PASS in 0.10s, 1 files, 1 passed, 0 failed, 0 skipped",
+    "Total: 1 files, 1 passed, 0 failed, 0 skipped",
+    "Machine load at end (1, 5, 15 min): 6.00, 3.50, 2.00; available cores: 4",
+  ]);
+});
+
 test("a shard runner error does not release the caller before sibling shards finish", async () => {
   const sibling = Promise.withResolvers();
   const outcome = runShards([["a.test.ts"], ["b.test.ts"]], {
@@ -187,7 +212,14 @@ test("a worker that exits mid-run lists every missing file for serial rerun", as
   const files = ["done.test.ts", "lost.test.ts", "placeholder.test.ts", "later.test.ts"];
   const result = await runShards([files], {
     execute: (name, selected) =>
-      executeFiles(process.cwd(), name, selected, directory, new AbortController().signal, invoke),
+      executeFiles({
+        root: process.cwd(),
+        name,
+        files: selected,
+        runDirectory: directory,
+        signal: new AbortController().signal,
+        invoke,
+      }),
     print: (line) => output.push(line),
   });
   assert.deepEqual(result, { exitCode: 1, failedFiles: files });
@@ -200,6 +232,55 @@ test("a worker that exits mid-run lists every missing file for serial rerun", as
     output.join("\n"),
     /Total: 4 files, 2 passed, 0 failed, 0 skipped, 3 files without a result/u,
   );
+});
+
+test("a zero exit still fails for missing, empty, or unexpected reports", async (t) => {
+  const runDirectory = await mkdtemp(join(tmpdir(), "hub-incomplete-report-"));
+  t.after(() => rm(runDirectory, { recursive: true }));
+  const root = process.cwd();
+  const files = ["expected.test.ts"];
+  const extra = {
+    name: join(root, "extra.test.ts"),
+    status: "passed",
+    assertionResults: [{ status: "passed" }],
+  };
+  const cases = [
+    { name: "Missing", diagnostic: /without a readable JSON report/u },
+    { name: "Empty", testResults: [], diagnostic: /Files without a result: expected.test.ts/u },
+    {
+      name: "Unexpected",
+      testResults: [extra],
+      diagnostic: /Unexpected files in report: extra.test.ts/u,
+    },
+  ];
+  for (const { name, testResults, diagnostic } of cases) {
+    const result = await executeFiles({
+      root,
+      name,
+      files,
+      runDirectory,
+      signal: new AbortController().signal,
+      invoke: async (_, directory) => {
+        await mkdir(directory);
+        if (testResults) {
+          await writeFile(
+            join(directory, "results.json"),
+            JSON.stringify({
+              success: true,
+              numTotalTests: testResults.length,
+              numPassedTests: testResults.length,
+              numFailedTests: 0,
+              testResults,
+            }),
+          );
+        }
+        return { exitCode: 0 };
+      },
+    });
+    assert.equal(result.exitCode, 1, name);
+    assert.equal(result.incompleteFiles, 1, name);
+    assert.match(result.diagnostic, diagnostic, name);
+  }
 });
 
 test("takes over a stale full-suite lock and refuses a live owner", async (t) => {
@@ -354,7 +435,14 @@ test("an interrupt reports incomplete files separately from failed assertions", 
 
   const result = await runShards([files], {
     execute: (name, selected) =>
-      executeFiles(root, name, selected, directory, controller.signal, invoke),
+      executeFiles({
+        root,
+        name,
+        files: selected,
+        runDirectory: directory,
+        signal: controller.signal,
+        invoke,
+      }),
     print: (line) => output.push(line),
     signal: controller.signal,
   });
@@ -405,7 +493,11 @@ test("a launched shard receives the isolated data paths and caller's Mise instal
   );
 
   const shard = join(directory, "shard");
-  const result = await invokeVitest(directory, [], shard, new AbortController().signal);
+  const result = await invokeVitest([], {
+    root: directory,
+    directory: shard,
+    signal: new AbortController().signal,
+  });
   assert.equal(result.exitCode, 0);
   assert.deepEqual(JSON.parse(await readFile(join(shard, "vitest.log"), "utf8")), {
     MISE_DATA_DIR: shardEnvironment(shard).MISE_DATA_DIR,
@@ -748,7 +840,7 @@ test("a failed shard keeps Vitest's human-readable errors alongside the JSON rep
   assert.equal(result.status, 1, result.stderr);
   const log = result.stdout.match(/See (.+?\/vitest\.log) and/u)?.[1];
   assert.ok(log, result.stdout);
-  assert.ok(log.startsWith(root));
+  assert.ok((await realpath(log)).startsWith(`${await realpath(root)}/`), log);
   assert.match(await readFile(log, "utf8"), /Unhandled Error: Worker exited unexpectedly/u);
 });
 
