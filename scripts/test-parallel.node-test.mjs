@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+
+import { existsSync } from "node:fs";
+
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import { executeFiles, partitionFiles, rerunFiles, runShards } from "./test-parallel.mjs";
+import { runWorkerGroup, takeFullSuiteLock } from "./test-worker-group.mjs";
 
 test("partition puts each file in one shard and balances cached durations", () => {
   const files = [
@@ -158,4 +163,106 @@ test("a worker that exits mid-run lists every missing file for serial rerun", as
   assert.deepEqual(result, { exitCode: 1, failedFiles: ["lost.test.ts", "later.test.ts"] });
   assert.match(output.join("\n"), /Shard 1:.*SIGKILL/u);
   assert.match(output.join("\n"), /Total: 3 files, 2 passed, 2 failed, 0 skipped/u);
+});
+
+test("takes over a stale full-suite lock and refuses a live owner", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hub-fake-lock-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const path = join(directory, "lock");
+  const messages = [];
+  await writeFile(path, JSON.stringify({ pid: process.pid, startTime: "old start", groups: [] }));
+  const lock = await takeFullSuiteLock(path, (line) => messages.push(line));
+  try {
+    assert.match(messages.join("\n"), /stale full-suite lock/u);
+    const owner = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(owner.pid, process.pid);
+    assert.notEqual(owner.startTime, "old start");
+    await assert.rejects(takeFullSuiteLock(path), /lock is held/u);
+  } finally {
+    await lock.release();
+  }
+  await assert.rejects(readFile(path), { code: "ENOENT" });
+});
+
+test("waits for a worker group on abort and escalates when a descendant ignores TERM", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX process groups");
+  const directory = await mkdtemp(join(tmpdir(), "hub-fake-group-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const path = join(directory, "lock");
+  const ready = join(directory, "worker-ready");
+  const log = await open(join(directory, "worker.log"), "w");
+  const lock = await takeFullSuiteLock(path);
+  const controller = new AbortController();
+  const worker = runWorkerGroup(
+    [
+      "-e",
+      `
+    const { spawn } = require("node:child_process");
+    spawn(process.execPath, ["-e", \`
+      process.on("SIGTERM", () => {});
+      require("node:fs").writeFileSync(process.argv[1], String(process.pid));
+      setInterval(() => {}, 1000);
+    \`, process.argv[1]], {stdio:"inherit"});
+    setInterval(() => {}, 1000);
+  `,
+      ready,
+    ],
+    { cwd: directory, env: process.env, log, lock, signal: controller.signal, graceMs: 100 },
+  );
+  try {
+    await waitFor(() => existsSync(ready), "fake child did not start");
+    assert.equal(JSON.parse(await readFile(path, "utf8")).groups.length, 1);
+    controller.abort("SIGTERM");
+    const result = await worker;
+    assert.notEqual(result.exitCode, 0);
+    assert.equal(JSON.parse(await readFile(path, "utf8")).groups.length, 0);
+  } finally {
+    controller.abort("SIGTERM");
+    await worker.catch(() => undefined);
+    await log.close();
+    await lock.release();
+  }
+});
+
+async function waitFor(predicate, message) {
+  for (let i = 0; i < 200; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(message);
+}
+
+test("recovers a killed runner's lock after its recorded group exits", async (t) => {
+  if (process.platform === "win32") return t.skip("POSIX process groups");
+  const directory = await mkdtemp(join(tmpdir(), "hub-killed-lock-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const path = join(directory, "lock");
+  const ready = join(directory, "worker-ready");
+  const code = `
+    import { open } from "node:fs/promises";
+    import { takeFullSuiteLock, runWorkerGroup } from ${JSON.stringify(new URL("./test-worker-group.mjs", import.meta.url).href)};
+    const [path, ready] = process.argv.slice(1);
+    const lock = await takeFullSuiteLock(path);
+    const log = await open(path + ".log", "w");
+    await runWorkerGroup(
+      ["-e", "require('node:fs').writeFileSync(process.argv[1], 'ready'); setInterval(() => {}, 1000)", ready],
+      { cwd: process.cwd(), env: process.env, log, lock, signal: new AbortController().signal },
+    );
+  `;
+  const owner = spawn(process.execPath, ["--input-type=module", "-e", code, "--", path, ready], {
+    cwd: directory,
+    stdio: "ignore",
+  });
+  const exited = once(owner, "exit");
+  try {
+    await waitFor(() => existsSync(ready), "fake runner did not start");
+  } finally {
+    owner.kill("SIGKILL");
+    await exited;
+  }
+  const messages = [];
+  const replacement = await takeFullSuiteLock(path, (message) => messages.push(message));
+  assert.match(messages.join("\n"), /stale full-suite lock/u);
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")).groups, []);
+  replacement.release();
 });
