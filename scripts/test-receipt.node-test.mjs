@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { cp, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -98,6 +98,39 @@ test("a failed command does not write green evidence", async (t) => {
   );
   await assert.rejects(verifyReceipt(directory, head), /No test receipt exists/u);
   await assert.rejects(verifyReceipt(directory, "../../etc/passwd"), /requires a Git commit SHA/u);
+});
+
+test("a failed repeat replaces the green result for the same command and commit", async (t) => {
+  const { directory, head } = await gitFixture(t);
+  const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
+  const receiptDir = join(directory, ".test-receipts");
+  const resultFile = join(receiptDir, "result");
+  const command = [
+    process.execPath,
+    "-e",
+    "process.exit(Number(require('node:fs').readFileSync(process.argv[1], 'utf8')))",
+    resultFile,
+  ];
+  const run = (...args) =>
+    spawnSync(process.execPath, [runner, "--root", directory, ...args], { encoding: "utf8" });
+  await mkdir(receiptDir);
+  await writeFile(resultFile, "0");
+  assert.equal(run("--", ...command).status, 0);
+  assert.equal(run("--verify", head).status, 0);
+
+  await writeFile(resultFile, "7");
+  assert.equal(run("--", ...command).status, 7);
+  const failed = run("--verify", head);
+  assert.equal(failed.status, 1);
+  assert.doesNotMatch(failed.stdout, /Green test evidence/u);
+  assert.match(failed.stderr, /exit code 7/u);
+  const receipt = JSON.parse(await readFile(join(receiptDir, `${head}.json`), "utf8"));
+  assert.equal(receipt.commands.length, 1);
+  assert.equal(receipt.commands[0].exitCode, 7);
+
+  await writeFile(resultFile, "0");
+  assert.equal(run("--", ...command).status, 0);
+  assert.equal(run("--verify", head).status, 0);
 });
 
 test("a successful process cannot record a report containing failed tests", async (t) => {
