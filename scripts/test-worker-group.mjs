@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 
+export const testSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
 export const fullSuiteLockPath = "/tmp/hub-fullsuite.lock";
 const gracePeriod = 5000;
 
@@ -230,7 +231,7 @@ export async function runWorkerGroup(args, { cwd, env, log, lock, signal, graceM
   let stopping;
   const interrupted = Promise.withResolvers();
   const interrupt = () => {
-    const reason = signal.reason === "SIGINT" ? "SIGINT" : "SIGTERM";
+    const reason = testSignals.includes(signal.reason) ? signal.reason : "SIGTERM";
     stopping ??= stopGroup(child.pid, reason, graceMs);
     interrupted.resolve(stopping.then(() => closed));
   };

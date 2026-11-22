@@ -2,11 +2,13 @@ import ts from "typescript";
 import { generateRuntimeMap, readRuntimeInputs } from "./generate-test-runtime-files.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { git } from "./test-context.mjs";
 import { combinePaths, resolveBase, selectTests } from "./test-changed.mjs";
 
@@ -156,7 +158,7 @@ async function releaseFixture(t) {
   };
   const main = commit("main");
   run("update-ref", "refs/remotes/origin/main", main);
-  return { run, commit, main, find: (base) => resolveBase(base, (args) => git(root, args)) };
+  return { root, run, commit, main, find: (base) => resolveBase(base, (args) => git(root, args)) };
 }
 
 test("the closest release merge base wins, with the highest version breaking ties", async (t) => {
@@ -196,4 +198,94 @@ test("the upstream precedes origin/main when no release has a merge base", async
   assert.match(find().display, /origin\/main/u);
   assert.equal(find("HEAD").tree, run("rev-parse", "HEAD^{tree}"));
   assert.throws(() => find("missing"), /Could not resolve --base/u);
+});
+
+test("test-changed forwards TERM, INT and HUP and waits for the full-suite child", async (t) => {
+  const { root, run } = await releaseFixture(t);
+  for (const directory of ["scripts", "src/routes", "node_modules/vitest"])
+    await mkdir(join(root, directory), { recursive: true });
+  for (const file of [
+    "test-changed.mjs",
+    "test-context.mjs",
+    "test-receipt.mjs",
+    "test-worker-group.mjs",
+    "generate-test-runtime-files.mjs",
+  ])
+    await cp(new URL(`./${file}`, import.meta.url), join(root, "scripts", file));
+
+  for (const [path, contents] of Object.entries({
+    ".gitignore": "node_modules/\nstatus-*\n",
+    "scripts/test-runtime-files.json": "{}",
+    "src/routeTree.gen.ts": "",
+    "src/router.tsx": "",
+    "src/start.ts": "",
+    "src/start-server.ts": "",
+    "src/typography-policy.test.ts": "",
+    "node_modules/vitest/package.json": JSON.stringify({
+      type: "module",
+      exports: { "./node": "./node.js" },
+    }),
+    "node_modules/vitest/vitest.mjs": "",
+    "node_modules/vitest/node.js": `export const createVitest = () => ({
+      projects: [], globTestSpecifications: () => [], close() {},
+    })`,
+    "scripts/test-parallel.mjs": `
+      import { writeFileSync } from "node:fs";
+      const interval = setInterval(() => {}, 100);
+      for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+        process.on(signal, () => setTimeout(() => {
+          writeFileSync(process.env.STATUS_FILE, signal);
+          clearInterval(interval);
+        }, 120));
+      }
+      writeFileSync(process.env.STATUS_FILE, String(process.pid));
+    `,
+  }))
+    await writeFile(join(root, path), contents);
+  run("add", ".");
+  run("commit", "--quiet", "-m", "Fixture scripts");
+  await writeFile(join(root, "vitest.config.ts"), "");
+
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    const marker = join(root, `status-${signal}`);
+    const caller = spawn(
+      process.execPath,
+      [join(root, "scripts/test-changed.mjs"), "--base", "HEAD"],
+      {
+        cwd: root,
+        env: { ...process.env, STATUS_FILE: marker },
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+    const exited = once(caller, "exit");
+    let stderr = "";
+    caller.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    let childPid;
+    try {
+      for (let attempts = 0; !childPid && attempts < 400 && caller.exitCode === null; attempts++) {
+        await delay(25);
+        childPid = Number(await readFile(marker, "utf8").catch(() => ""));
+      }
+      assert.ok(childPid, stderr || "Full-suite child did not start");
+      assert.notEqual(childPid, caller.pid);
+      caller.kill(signal);
+      const [code, terminatedBy] = await exited;
+      assert.equal(await readFile(marker, "utf8"), signal);
+      assert.equal(terminatedBy, null);
+      assert.throws(() => process.kill(-childPid, 0), { code: "ESRCH" });
+      assert.equal(code, 1);
+    } finally {
+      if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+      if (childPid && (await readFile(marker, "utf8")) === String(childPid)) {
+        try {
+          process.kill(childPid, "SIGKILL");
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+      }
+      await exited;
+    }
+  }
 });
