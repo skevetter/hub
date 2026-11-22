@@ -4,9 +4,10 @@ import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import { describe, it } from "vitest";
-import { formatRunReply } from "./format.js";
+import { formatRunReply, nestingTooDeep } from "./format.js";
 import { realisticAnswers } from "./test-utils/answers.js";
 import {
+  checkFenceTrickDocuments,
   checkNestedDocuments,
   checkStackedDocuments,
   mentionLinks,
@@ -91,7 +92,9 @@ it.each(["www.linear%2Eapp", "www.\uFF4C\uFF49\uFF4E\uFF45\uFF41\uFF52\uFF0E\uFF
   },
 );
 
-it("leaves no autolink to a profile or mention across 3,600 generated documents", () => {
+// 3,600 documents with HUB_REPLY_FUZZ=1; the default run keeps it short so a loaded host finishes.
+it("leaves no autolink to a profile or mention across generated documents", () => {
+  const perSeed = process.env["HUB_REPLY_FUZZ"] === "1" ? 1_200 : 200;
   const hosts = [
     "linear.app",
     "www.linear.app",
@@ -118,7 +121,7 @@ it("leaves no autolink to a profile or mention across 3,600 generated documents"
   for (const seed of [4101, 4202, 4303]) {
     const next = random(seed);
     const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
-    for (let index = 0; index < 1_200; index += 1) {
+    for (let index = 0; index < perSeed; index += 1) {
       const url = `${pick(["https://", "http://", "", "www."])}${pick(hosts)}${pick(paths)}`;
       const text = `${pick(lead)}${pick(wrap)(url)} ${pick(wrap)(url)}${"`x` ".repeat(Math.floor(next() * 120))}\n\nend`;
       for (const clock of [{ now: plainClock() }, {}]) {
@@ -360,4 +363,54 @@ it.each([
     mdastExtensions: [gfmFromMarkdown()],
   });
   assert.equal(tree.children.at(-1)?.type, "paragraph");
+});
+
+describe("nesting the estimate must see", () => {
+  const fakeFence = `\`\`\`x\`\n${"- >".repeat(1_130)}\n`;
+  const quoteTabs = ((): string => {
+    let text = "";
+    for (let line = 0; ; line += 1) {
+      const next = `>\t${"\t".repeat(Math.floor((46 * line) / 4))}${"- ".repeat(23)}x\n`;
+      if (text.length + next.length > 3_400) return text;
+      text += next;
+    }
+  })();
+
+  it.each([
+    ["a backtick opener with a backtick in its info string", fakeFence],
+    ["a quote prefix before the indentation", quoteTabs],
+    [
+      "a chain after a tilde fence that backticks did not close and tildes did",
+      `~~~
+\`\`\`
+~~~
+${"- >".repeat(1_130)}
+`,
+    ],
+    ["markers after tabs after markers", `${"-\t>\t".repeat(600)}x`],
+  ])("sends %s to plain text before parsing", (_name, text) => {
+    assert.equal(nestingTooDeep(text), true);
+  });
+
+  it.each([
+    ["a real backtick fence", "```ts\n    - > - > - > - >\n```\n- one\n  - two"],
+    ["a real tilde fence", "~~~\n    - > - > - > - >\n~~~\n- one"],
+    ["an indented real fence", "   ```\n\t\t\t\t\t\t\t\t- >\n   ```"],
+    ["a longer closing fence", "```\n\t\t\t\t- >\n`````\ntext"],
+  ])("still skips lines inside %s", (_name, text) => {
+    assert.equal(nestingTooDeep(text), false);
+  });
+
+  it("sends a fenced document over the container weight cap to plain text", () => {
+    const code = "\t\t\t\t\t\t\t\t\t\tx\n".repeat(300);
+    assert.equal(nestingTooDeep(`\`\`\`\n${code}\`\`\``), true);
+  });
+
+  it("keeps every realistic answer far below the weight cap", () => {
+    for (const text of realisticAnswers(200)) assert.equal(nestingTooDeep(text), false);
+  });
+
+  it("renders generated fence tricks the same way every call", () => {
+    checkFenceTrickDocuments({ seed: 9_001, count: 400 });
+  });
 });

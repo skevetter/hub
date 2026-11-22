@@ -115,25 +115,66 @@ export function checkNestedDocuments({ seed, count, timing = false }: DocumentRu
     }
     const text = `Fixed it.\n\n${lines.join("\n")}`;
     const context = JSON.stringify({ index, perLine, step, unit, marker });
-    const reasons = new Set<string>();
-    const bodies = new Set<string>();
-    let slowest = 0;
-    for (let call = 0; call < 3; call += 1) {
-      let reason = "markdown";
-      const started = performance.now();
-      bodies.add(
-        formatRunReply({ text, truncated: false }, [], {
-          onFallback: (value) => {
-            reason = value;
-          },
-        }),
-      );
-      if (call > 0) slowest = Math.max(slowest, performance.now() - started);
-      reasons.add(reason);
-    }
-    assert.equal(reasons.size, 1, `${context} chose ${[...reasons].join(" and ")}`);
-    assert.equal(bodies.size, 1, context);
-    if (timing && index >= 5) assert.ok(slowest < 100, `${context} took ${slowest.toFixed(0)} ms`);
-    safeBody(text, false, context);
+    checkOne(text, context, timing);
   }
+}
+
+// Lines that look like fences to a loose reader but are not, plus real ones, mixed with markers
+// that carry nesting across lines.
+export function checkFenceTrickDocuments({ seed, count, timing = false }: DocumentRun): void {
+  const next = random(seed);
+  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+  const fences = [
+    "```x`",
+    "``` `",
+    "~~~",
+    "~~~~ a",
+    "   ```",
+    "    ```",
+    "```",
+    "``",
+    "```\t`",
+    "~~~x`",
+  ];
+  const markers = ["- >", ">- ", "> ", "- ", "1. ", ">\t", "-\t", "+ >", ">"];
+  for (let index = 0; index < count; index += 1) {
+    const lines: string[] = [];
+    let size = 0;
+    const unit = pick(markers);
+    const tabs = Math.floor(next() * 12);
+    for (let line = 0; size < 3_300 && line < 300; line += 1) {
+      const text =
+        next() < 0.15
+          ? pick(fences)
+          : `${pick(["", "\t", "  "]).repeat(line * tabs)}${unit.repeat(1 + Math.floor(next() * 40))}${pick(tails)}`;
+      lines.push(text);
+      size += text.length + 1;
+    }
+    const text = `Fixed it.\n\n${lines.join("\n")}`;
+    checkOne(text, `fence trick ${JSON.stringify({ index, unit, tabs })}`, timing);
+  }
+}
+
+// The same path and body on three calls, a warm render in time, and a safe reply.
+function checkOne(text: string, context: string, timing: boolean): void {
+  const reasons = new Set<string>();
+  const bodies = new Set<string>();
+  let slowest = 0;
+  for (let call = 0; call < 3; call += 1) {
+    let reason = "markdown";
+    const started = performance.now();
+    bodies.add(
+      formatRunReply({ text, truncated: false }, [], {
+        onFallback: (value) => {
+          reason = value;
+        },
+      }),
+    );
+    if (call > 0) slowest = Math.max(slowest, performance.now() - started);
+    reasons.add(reason);
+  }
+  assert.equal(reasons.size, 1, `${context} chose ${[...reasons].join(" and ")}`);
+  assert.equal(bodies.size, 1, context);
+  if (timing) assert.ok(slowest < 100, `${context} took ${slowest.toFixed(0)} ms`);
+  safeBody(text, false, context);
 }

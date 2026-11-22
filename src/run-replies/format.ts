@@ -31,6 +31,8 @@ const OPENER_RUN = new RegExp(`([[(*_~<])\\1{${MAX_OPENER_RUN - 1}}`, "u");
 const MAX_CONTAINER_DEPTH = 24;
 const DEEP_LINE_DEPTH = 8;
 const MAX_DEEP_LINES = 200;
+// Ten times the most any of 500 realistic answers reaches (604), rounded up.
+const MAX_CONTAINER_WEIGHT = 6_500;
 const URL_START = /https?:\/\/|www\.|(?<![\w-])linear\.app\.?(?=[:/])/giu;
 const URL_RUN = /[^\s<>()[\]"'`]*/uy;
 const LINEAR_HOST_PATH = /linear\.app\.?(?::\d{1,5})?(\/[^\s<>()[\]"'`\\?#]*)/giu;
@@ -155,58 +157,86 @@ function renderMarkdown(
   return undefined;
 }
 
-// Estimated container depth of every line outside a fence: its leading markers, with or without
-// a space between them, plus one level per 2 columns of indentation (a tab is 4 columns). micromark
-// nests one container per level and recurses on it, so an answer whose lines run deep, on one line
-// or carried across lines by indentation, goes to the plain path. The decision depends on the
-// text alone, never on timing.
-function nestingTooDeep(source: string): boolean {
-  let fence: string | undefined;
+// Estimated container depth of every line outside a fence: its markers, with or without a space
+// between them, plus one level per 2 columns of indentation after the mandatory single space of a
+// marker (a tab is up to 4 columns, and indentation counts after every marker, not only before the
+// first). micromark nests one container per level and recurses on it, so an answer whose lines
+// run deep, on one line or carried across lines, goes to the plain path. A second bound counts
+// marker characters and indentation in the first 40 columns of every line, fences or not, so a
+// fence trick cannot hide a deep document. The decision depends on the text only, never on timing.
+export function nestingTooDeep(source: string): boolean {
+  let fence: { char: string; size: number } | undefined;
   let deepLines = 0;
+  let weight = 0;
   for (const line of source.split(/\r\n|\r|\n/u)) {
-    const marks = /^ {0,3}(`{3,}|~{3,})/u.exec(line);
+    weight += containerWeight(line);
+    if (weight > MAX_CONTAINER_WEIGHT) return true;
+    const marks = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
     if (fence !== undefined) {
-      if (marks?.[1]![0] === fence) fence = undefined;
+      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/u.exec(line);
+      if (close && close[1]![0] === fence.char && close[1]!.length >= fence.size) fence = undefined;
       continue;
     }
-    if (marks) {
-      fence = marks[1]![0];
+    // An info string after a backtick fence cannot hold a backtick.
+    if (marks && !(marks[1]![0] === "`" && marks[2]!.includes("`"))) {
+      fence = { char: marks[1]![0]!, size: marks[1]!.length };
       continue;
     }
-    let columns = 0;
-    let index = 0;
-    for (; line[index] === " " || line[index] === "\t"; index += 1)
-      columns += line[index] === "\t" ? 4 - (columns % 4) : 1;
-    const depth = Math.floor(columns / 2) + markerCount(line, index);
+    const depth = lineDepth(line);
     if (depth > MAX_CONTAINER_DEPTH) return true;
     if (depth > DEEP_LINE_DEPTH && (deepLines += 1) > MAX_DEEP_LINES) return true;
   }
   return false;
 }
 
-function markerCount(line: string, from: number): number {
-  let depth = 0;
-  let index = from;
+function containerWeight(line: string): number {
+  let weight = 0;
+  let column = 0;
+  for (let index = 0; index < line.length && column < 40; index += 1) {
+    const char = line[index]!;
+    if (char === "\t") {
+      weight += 4 - (column % 4);
+      column += 4 - (column % 4);
+      continue;
+    }
+    column += 1;
+    if (char === " " || char === ">" || char === "-" || char === "+" || char === "*") weight += 1;
+  }
+  return weight;
+}
+
+function lineDepth(line: string): number {
+  let markers = 0;
+  let spaces = 0;
+  let column = 0;
+  let index = 0;
   while (index < line.length) {
     const char = line[index]!;
     if (char === " " || char === "\t") {
+      const width = char === "\t" ? 4 - (column % 4) : 1;
+      column += width;
+      spaces += width;
       index += 1;
       continue;
     }
-    let length = 0;
-    if (char === ">") length = 1;
-    else if (char === "-" || char === "+" || char === "*") length = markerEnds(line, index + 1);
-    else if (char >= "0" && char <= "9") {
-      let digits = index;
-      while (line[digits]! >= "0" && line[digits]! <= "9") digits += 1;
-      if (digits - index <= 9 && (line[digits] === "." || line[digits] === ")"))
-        length = markerEnds(line, digits + 1) === 0 ? 0 : digits + 1 - index;
-    }
+    const length = markerLength(line, index);
     if (length === 0) break;
-    depth += 1;
+    markers += 1;
+    column += length;
     index += length;
   }
-  return depth;
+  return markers + Math.floor(Math.max(0, spaces - markers) / 2);
+}
+
+function markerLength(line: string, index: number): number {
+  const char = line[index]!;
+  if (char === ">") return 1;
+  if (char === "-" || char === "+" || char === "*") return markerEnds(line, index + 1);
+  if (char < "0" || char > "9") return 0;
+  let digits = index;
+  while (line[digits]! >= "0" && line[digits]! <= "9") digits += 1;
+  if (digits - index > 9 || (line[digits] !== "." && line[digits] !== ")")) return 0;
+  return markerEnds(line, digits + 1) === 0 ? 0 : digits + 1 - index;
 }
 
 // A list marker needs a space, a tab or the end of the line after it.
