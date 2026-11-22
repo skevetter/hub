@@ -281,10 +281,13 @@ test.describe("interactive sessions", () => {
 
   test("a viewer sees live assistant text and no composer", async ({ browser, hub, page }) => {
     const app = await setup(hub);
+    // An earlier journey can leave its extra context open, signed in to a Hub that has stopped,
+    // so the viewer is the context this journey adds, not the first one that is not the owner's.
+    const earlier = new Set(browser.contexts());
     await hub.addNewMember("owner", "viewer", viewer);
     const viewerPage = browser
       .contexts()
-      .find((context) => context !== page.context())
+      .find((context) => !earlier.has(context))
       ?.pages()[0];
     if (viewerPage === undefined) throw new Error("Viewer page unavailable");
     const daemon = await enroll(hub);
