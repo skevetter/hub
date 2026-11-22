@@ -1,5 +1,6 @@
 import { expect } from "@playwright/test";
 import { test as browserTest } from "./app.js";
+import { OrganizationTriggers } from "./helpers/triggers.js";
 
 const test = browserTest.extend<{ sessionRuntime: void }>({
   sessionRuntime: [
@@ -82,6 +83,47 @@ test("Home reserves the loaded tile heights on a 390 px viewport", async ({ hub,
   expect(await dimensions(page.locator("main"))).toEqual(loadingHeights);
 });
 
+test("Home wraps a long scoped trigger name at 390 px", async ({ hub, page }) => {
+  const name = "w".repeat(60);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.connectGitHub("owner");
+  const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  const triggers = new OrganizationTriggers(page);
+  await triggers.open();
+  await triggers.startNew();
+  await triggers.configureManual({
+    name,
+    daemon,
+    cwd: "/workspace",
+    agent: "codex/gpt-5.4",
+    mode: "full-access",
+    thinking: "high",
+    prompt: "Review this.",
+  });
+  await triggers.switchToYaml();
+  await triggers.replaceYaml(`
+name: ${name}
+on:
+  github.pull_request_comment_created:
+    filters: { from_users: ["octocat"] }
+run:
+  target: { daemon: ${daemon}, cwd: /workspace }
+  agent: { provider: codex, model: gpt-5.4, mode: full-access }
+  prompt: Review this.
+`);
+  await triggers.save(name);
+  await page.getByRole("link", { name: "Home", exact: true }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole("radio", { name: "GitHub" }).click();
+  await expect(
+    page.getByText(`${name} only starts for comments that match its filters.`),
+  ).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+  await page.getByRole("link", { name: "Open trigger" }).click();
+  await expect(page.getByRole("heading", { name, level: 1 })).toBeVisible();
+});
+
 test("Home gets the profile step and session form from one fetch", async ({ hub, page }) => {
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
@@ -147,7 +189,7 @@ test("reads Home as figures, a checklist the member can put away, and prompts to
     await expect(
       page.getByRole("progressbar", { name: "Getting started progress" }),
     ).toHaveAttribute("aria-valuetext", "0 of 6 done");
-    await expect(steps.getByRole("listitem").first()).toContainText("Connect a daemon");
+    await expect(steps.getByRole("listitem").first()).toContainText("Enroll a daemon");
     await expect(steps.getByRole("link", { name: "Create a profile", exact: true })).toBeVisible();
   });
 
@@ -188,7 +230,7 @@ test("reads Home as figures, a checklist the member can put away, and prompts to
     const alert = page
       .locator('[data-slot="alert"]')
       .filter({ hasText: "Slack needs authorization" });
-    await expect(alert).toContainText("Hub cannot use Acme");
+    await expect(alert).toContainText("Review authorization for Acme");
     expect(await alert.getAttribute("role")).toBeNull();
     expect(await alert.getAttribute("aria-live")).toBeNull();
     await alert.getByRole("link", { name: "Open connections", exact: true }).click();

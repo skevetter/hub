@@ -151,7 +151,7 @@ function appSurface(
     return {
       key: provider,
       label,
-      where: `${label} needs authorization before a comment can start a trigger.`,
+      where: `${label} needs authorization. Review its connections before trying these prompts.`,
       next: { label: "Open connections", path: "connections" },
       examples,
     };
@@ -173,7 +173,7 @@ function appSurface(
     return {
       key: provider,
       label,
-      where: `${name ?? label} is connected. Create a comment trigger with a reply output to use these prompts.`,
+      where: `${name ?? label} is connected. Create a comment trigger and configure its filters and reply output.`,
       next: { label: "New trigger", path: "triggers/new" },
       examples,
     };

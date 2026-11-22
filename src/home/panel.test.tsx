@@ -266,7 +266,7 @@ describe("Home needs attention", () => {
     const warning = /<div data-slot="alert"[^>]*>/u.exec(markup)?.[0];
     assert.ok(warning);
     assert.doesNotMatch(warning, /role="alert"|aria-live=/u);
-    assert.match(markup, /Hub cannot use Acme until/u);
+    assert.match(markup, /Review authorization for Acme/u);
     assert.match(markup, /<a href="\/o\/acme\/connections">Open connections<\/a>/u);
   });
 
@@ -373,6 +373,19 @@ describe("Home things to try", () => {
 });
 
 describe("manual trigger run hint", () => {
+  it("does not tell the reader to fire a paused trigger or send an unrelated provider event", () => {
+    assert.match(
+      runHint([{ id: "paused", name: "run", event: "manual.run", enabled: false }]),
+      /Enable a trigger/u,
+    );
+    assert.doesNotMatch(
+      runHint([
+        { id: "review", name: "review", event: "github.pull_request_synchronized", enabled: true },
+      ]),
+      /[Cc]omment on an issue/u,
+    );
+  });
+
   it("names the webhook and manual dispatch endpoints", () => {
     const hint = runHint([
       { id: "manual", name: "build-finished", event: "manual.run", enabled: true },
