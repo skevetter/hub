@@ -194,10 +194,10 @@ function ConnectionsContent() {
     [scope, start],
   );
   const revokeConnection = useCallback(
-    (provider: ConnectionProvider, row: ConnectionRecord) => {
+    (provider: ConnectionProvider, connectionId: string, label: string) => {
       resetRetry();
       setReturned(undefined);
-      revoke({ data: { ...scope, provider, connectionId: row.id }, row });
+      revoke({ data: { ...scope, provider, connectionId }, label });
     },
     [resetRetry, revoke, scope, setReturned],
   );
@@ -388,12 +388,12 @@ function useConnectionRetry(
 
 interface RevokeInput {
   data: Parameters<typeof disconnectConnection>[0]["data"];
-  row: ConnectionRecord;
+  label: string;
 }
 
 interface RevocationResult {
   provider: ConnectionProvider;
-  row: ConnectionRecord;
+  label: string;
   result: ConnectionDisconnectResult;
 }
 
@@ -448,7 +448,7 @@ function reconciledRevocation(
     return undefined;
   const { provider, connectionId } = target.data;
   if (connections[provider].some(({ id }) => id === connectionId)) return undefined;
-  return { provider, row: target.row, result: disconnect.data.data.result };
+  return { provider, label: target.label, result: disconnect.data.data.result };
 }
 
 function revokeBannerCopy(
@@ -457,7 +457,7 @@ function revokeBannerCopy(
   connections: Record<ConnectionProvider, ConnectionRecord[]>,
 ): ConnectionReturnCopy | undefined {
   if (result !== undefined && connections[result.provider].length > 0) {
-    return { tone: "success", message: `${result.row.name} disconnected.` };
+    return { tone: "success", message: `${result.label} disconnected.` };
   }
   const outcome = result ?? returned;
   return outcome === undefined ? undefined : connectionReturnCopy(outcome);
@@ -551,7 +551,7 @@ function ProviderConnections({
   removingId: string | undefined;
   canManage: boolean;
   busy: boolean;
-  onRevoke: (provider: ConnectionProvider, row: ConnectionRecord) => void;
+  onRevoke: (provider: ConnectionProvider, connectionId: string, label: string) => void;
 }) {
   return (
     <RecordList label={`${label} connections`}>
@@ -588,17 +588,17 @@ function ConnectionRow({
   canManage: boolean;
   busy: boolean;
   removing: boolean;
-  onRevoke: (provider: ConnectionProvider, row: ConnectionRecord) => void;
+  onRevoke: (provider: ConnectionProvider, connectionId: string, label: string) => void;
 }) {
   const { name, externalId, grantedAccess } = connection;
   const actionsLabel = includeExternalId
     ? `Actions for ${name}, ${externalId}`
     : `Actions for ${name}`;
-  const revokeTitle = includeExternalId ? `Revoke ${name} (${externalId})?` : `Revoke ${name}?`;
+  const confirmationLabel = includeExternalId ? `${name} (${externalId})` : name;
   const detail = removing ? "Being removed" : connection.attention;
   const confirmRevoke = useCallback(
-    () => onRevoke(provider, connection),
-    [onRevoke, provider, connection],
+    () => onRevoke(provider, connection.id, confirmationLabel),
+    [onRevoke, provider, connection.id, confirmationLabel],
   );
   const actions = useMemo(
     () =>
@@ -608,7 +608,7 @@ function ConnectionRow({
             busy={busy}
             destructive
             label="Revoke"
-            title={revokeTitle}
+            title={`Revoke ${confirmationLabel}?`}
             description="Projects using this credential will stop receiving new events."
             confirmLabel="Revoke connection"
             cancelLabel="Cancel"
@@ -616,7 +616,7 @@ function ConnectionRow({
           />
         </RowActions>
       ) : undefined,
-    [actionsLabel, busy, canManage, confirmRevoke, removing, revokeTitle],
+    [actionsLabel, busy, canManage, confirmationLabel, confirmRevoke, removing],
   );
   return (
     <RecordRow actions={actions} busy={removing}>
