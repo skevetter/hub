@@ -240,10 +240,15 @@ describe("Home needs attention", () => {
   it("warns that work is waiting when every daemon that may run agents is offline", () => {
     const markup = renderHome({
       ...ready,
-      daemons: [{ id: "daemon", slug: "devbox", presence: "offline", canExecute: true }],
+      daemons: [
+        { id: "daemon", slug: "devbox", presence: "offline", canExecute: true },
+        { id: "daemon-2", slug: "builder", presence: "offline", canExecute: true },
+        { id: "daemon-3", slug: "laptop", presence: "connected", canExecute: false },
+      ],
     });
-    assert.match(markup, /Your daemon is offline/u);
-    assert.match(markup, /devbox is not connected/u);
+    assert.match(markup, /No daemon that may run agents is connected\./u);
+    assert.match(markup, /devbox, builder are not connected/u);
+    assert.match(tile(markup, "Daemons connected"), /1\s+3 enrolled/u);
     assert.match(markup, /<a href="\/o\/acme\/daemons">View daemons<\/a>/u);
   });
 
@@ -264,7 +269,7 @@ describe("Home needs attention", () => {
       triggers: [],
       daemons: [{ id: "daemon", slug: "devbox", presence: "offline", canExecute: true }],
     });
-    assert.doesNotMatch(markup, /is offline/u);
+    assert.doesNotMatch(markup, /No daemon that may run agents is connected/u);
   });
 });
 
