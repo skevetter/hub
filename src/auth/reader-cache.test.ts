@@ -95,8 +95,8 @@ test("fails closed on malformed account data after the first valid read", async 
   expect(reload).toHaveBeenCalledTimes(1);
 });
 
-test("fails closed when the server rejects an account read after the reader is known", async () => {
-  const { client, reload } = await setup();
+test("keeps the page and cached queries when a known reader's account refetch fails", async () => {
+  const { client, readerChange, reload } = await setup();
   client.setQueryData(accountKey, reader("alice"));
   client.setQueryData(tenantKey, "Acme");
   const error = new Error("Account read failed");
@@ -105,7 +105,11 @@ test("fails closed when the server rejects an account read after the reader is k
     client.fetchQuery({ queryKey: accountKey, queryFn: () => Promise.reject(error) }),
   ).rejects.toBe(error);
 
-  expect(reload).toHaveBeenCalledTimes(1);
+  expect(client.getQueryState(accountKey)?.status).toBe("error");
+  expect(client.getQueryData(accountKey)).toEqual(reader("alice"));
+  expect(client.getQueryData(tenantKey)).toBe("Acme");
+  expect(readerChange.getSnapshot()).toBe(false);
+  expect(reload).not.toHaveBeenCalled();
 });
 
 test("sign-out reloads without waiting for an account read", async () => {
