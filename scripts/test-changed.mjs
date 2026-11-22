@@ -16,6 +16,7 @@ import { join, posix, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { publishTestMetrics } from "./test-receipt.mjs";
+import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const vitest = join(root, "node_modules", "vitest", "vitest.mjs");
@@ -67,6 +68,17 @@ export function selectTests(changes, discovered, present, safe) {
   const migrationChanged = changes.some((path) => path.startsWith("drizzle/"));
   if (migrationChanged) {
     for (const path of migrationTests) tests.set(path, "migration guard for drizzle changes");
+  }
+
+  const available = new Set(discovered);
+  for (const [input, readers] of Object.entries(runtimeFiles)) {
+    const changed = changes.find((path) =>
+      input.endsWith("/") ? path.startsWith(input) : path === input,
+    );
+    if (!changed) continue;
+    for (const reader of readers) {
+      if (available.has(reader) && !tests.has(reader)) tests.set(reader, `runtime file ${changed}`);
+    }
   }
 
   const changedPaths = new Set(changes);

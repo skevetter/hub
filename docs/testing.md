@@ -62,3 +62,9 @@ Receipts bind each command to the commit and tree and hash the canonical JSON an
 SHA-256. Verification needs both the JSON and its files under `.test-receipts/logs/`. This detects
 accidental edits, sloppy tampering, and copies between commits. A determined forger can rewrite the
 evidence and recompute the hashes. Record fresh evidence for receipts from older versions.
+
+The generated runtime-file map also selects tests that read checked-in fixtures, SQL, and docs.
+When tests add a file read, regenerate the map with
+`node scripts/generate-test-runtime-files.mjs` and commit the JSON. The script tests check that the
+map matches the current reads. Resolve new dynamic paths in the generator when static analysis
+cannot determine their directory.
