@@ -21,6 +21,8 @@ import { ListFilters } from "../components/app/list-filters.js";
 import { PageHeader } from "../components/app/page.js";
 import { RowActions } from "../components/app/row-actions.js";
 import { SegmentedControl } from "../components/app/segmented-control.js";
+import { Button } from "../components/ui/button.js";
+import { DialogClose } from "../components/ui/dialog.js";
 import { DropdownMenuItem } from "../components/ui/dropdown-menu.js";
 import {
   daemonList,
@@ -256,10 +258,7 @@ function DaemonsContent({
       return undefined;
     // Let the dialog finish its own close and focus restoration before moving focus.
     const restore = window.setTimeout(() => {
-      const trigger = document
-        .getElementById(daemonActionsId(completedAction.daemonId))
-        ?.querySelector("button");
-      (trigger ?? document.getElementById(searchId))?.focus();
+      focusDaemonActions(searchId, completedAction.daemonId);
       lastRestored.current = completedAction;
     });
     return () => window.clearTimeout(restore);
@@ -307,6 +306,7 @@ function DaemonsContent({
             <ConnectedDaemonDevice
               key={daemon.id}
               daemon={daemon}
+              searchId={searchId}
               accountId={accountId}
               organizationSlug={organizationSlug}
               profiles={profiles}
@@ -377,6 +377,7 @@ function DaemonsLoading({ showProfiles }: { showProfiles: boolean }) {
 
 function ConnectedDaemonDevice({
   daemon,
+  searchId,
   accountId,
   organizationSlug,
   profiles,
@@ -387,6 +388,7 @@ function ConnectedDaemonDevice({
   onRevoke,
 }: DaemonActions & {
   daemon: BrowserDaemon;
+  searchId: string;
   accountId: string;
   organizationSlug: string;
   profiles: ReturnType<typeof useDeviceProfiles>;
@@ -407,9 +409,15 @@ function ConnectedDaemonDevice({
   const actions = useMemo(
     () =>
       canManage ? (
-        <DaemonRowActions daemon={daemon} busy={busy} onRename={onRename} onRevoke={onRevoke} />
+        <DaemonRowActions
+          daemon={daemon}
+          searchId={searchId}
+          busy={busy}
+          onRename={onRename}
+          onRevoke={onRevoke}
+        />
       ) : null,
-    [busy, canManage, daemon, onRename, onRevoke],
+    [busy, canManage, daemon, onRename, onRevoke, searchId],
   );
   return (
     <DaemonDevice
@@ -422,23 +430,31 @@ function ConnectedDaemonDevice({
   );
 }
 
-function daemonActionsId(daemonId: string) {
-  return `daemon-actions-${daemonId}`;
+function daemonActionsId(searchId: string, daemonId: string) {
+  return `${searchId}-actions-${daemonId}`;
+}
+
+function focusDaemonActions(searchId: string, daemonId: string) {
+  const trigger = document
+    .getElementById(daemonActionsId(searchId, daemonId))
+    ?.querySelector("button");
+  (trigger ?? document.getElementById(searchId))?.focus();
 }
 
 function DaemonRowActions({
   daemon,
+  searchId,
   busy,
   onRename,
   onRevoke,
-}: DaemonActions & { daemon: BrowserDaemon }) {
+}: DaemonActions & { daemon: BrowserDaemon; searchId: string }) {
   const [renaming, setRenaming] = useState(false);
   const requestRename = useCallback(() => setRenaming(true), []);
   const revoke = useCallback(() => onRevoke(daemon.id), [daemon.id, onRevoke]);
 
   return (
     <>
-      <div id={daemonActionsId(daemon.id)}>
+      <div id={daemonActionsId(searchId, daemon.id)}>
         <RowActions label={`Actions for ${daemon.slug}`}>
           <DropdownMenuItem disabled={busy} onSelect={requestRename}>
             Rename
@@ -459,6 +475,7 @@ function DaemonRowActions({
       </div>
       <RenameDaemonDialog
         daemon={daemon}
+        searchId={searchId}
         busy={busy}
         onRename={onRename}
         open={renaming}
@@ -470,18 +487,30 @@ function DaemonRowActions({
 
 function RenameDaemonDialog({
   daemon,
+  searchId,
   busy,
   onRename,
   open,
   onOpenChange,
 }: {
   daemon: BrowserDaemon;
+  searchId: string;
   busy: boolean;
   onRename: (daemonId: string, slug: string) => Promise<string | undefined>;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const [error, setError] = useState<string>();
+  const renamed = useRef(false);
+  useEffect(() => {
+    if (!open) return undefined;
+    renamed.current = false;
+    return () => {
+      if (!renamed.current) {
+        window.setTimeout(() => focusDaemonActions(searchId, daemon.id));
+      }
+    };
+  }, [daemon.id, open, searchId]);
   const changeOpen = useCallback(
     (nextOpen: boolean) => {
       if (!nextOpen) setError(undefined);
@@ -493,7 +522,10 @@ function RenameDaemonDialog({
     async (slug: string) => {
       const failure = await onRename(daemon.id, slug);
       setError(failure);
-      if (failure === undefined) changeOpen(false);
+      if (failure === undefined) {
+        renamed.current = true;
+        changeOpen(false);
+      }
     },
     [changeOpen, daemon.id, onRename],
   );
@@ -527,6 +559,11 @@ function RenameDaemonDialog({
         required
         {...(error === undefined ? {} : { error })}
       />
+      <DialogClose asChild>
+        <Button type="button" variant="outline" className="sm:self-end">
+          Cancel
+        </Button>
+      </DialogClose>
     </FormDialog>
   );
 }
