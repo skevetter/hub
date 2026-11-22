@@ -55,13 +55,31 @@ function readMachineLoad() {
   return { averages: loadavg(), cores: availableParallelism() };
 }
 
+export function planShards(override, readLoad = readMachineLoad) {
+  const start = readLoad();
+  const { averages, cores } = start;
+  const count = override ?? Math.min(6, Math.max(1, Math.round(cores / 3)));
+  const reason =
+    override === undefined ? `${cores} cores / 3, rounded and clamped to 1-6` : "TEST_SHARDS";
+  const multiplier = Math.min(4, Math.max(1, averages[0] / cores));
+  // Match vitest.config.ts and Vitest's Node hook and teardown defaults.
+  const timeoutFlags = [
+    `--testTimeout=${Math.round(30_000 * multiplier)}`,
+    `--hookTimeout=${Math.round(10_000 * multiplier)}`,
+    `--teardownTimeout=${Math.round(10_000 * multiplier)}`,
+  ];
+  return { count, reason, start, multiplier, timeoutFlags };
+}
+
 function printMachineLoad(print, phase, { averages, cores }) {
   const formatted = averages.map((load) => load.toFixed(2)).join(", ");
   print(`Machine load at ${phase} (1, 5, 15 min): ${formatted}; available cores: ${cores}`);
 }
 
-export async function runShards(groups, { execute, print, signal, readLoad = readMachineLoad }) {
-  const start = readLoad();
+export async function runShards(
+  groups,
+  { execute, print, signal, readLoad = readMachineLoad, start = readLoad() },
+) {
   printMachineLoad(print, "start", start);
   if (start.averages[0] > start.cores) {
     print("WARNING: Machine load exceeds available cores. Timings and timeouts may be unreliable.");
@@ -252,7 +270,15 @@ function unreportedRun({ run, files, durationMs, signal, log }) {
   };
 }
 
-export async function executeFiles({ root, name, files, runDirectory, signal, invoke }) {
+export async function executeFiles({
+  root,
+  name,
+  files,
+  runDirectory,
+  signal,
+  invoke,
+  timeoutFlags = [],
+}) {
   const directory = join(runDirectory, name.toLowerCase().replaceAll(" ", "-"));
   const reportPath = join(directory, "results.json");
   const startedAt = performance.now();
@@ -262,6 +288,7 @@ export async function executeFiles({ root, name, files, runDirectory, signal, in
       "--reporter=json",
       "--reporter=default",
       `--outputFile=${reportPath}`,
+      ...timeoutFlags,
       ...files.map((file) => join(root, file)),
     ],
     directory,
@@ -431,7 +458,7 @@ async function runFullSuite({
   root,
   cacheRoot,
   files,
-  count,
+  shardOverride,
   failedFileList,
   runDirectory,
   execute,
@@ -439,10 +466,20 @@ async function runFullSuite({
   publishSuccess,
 }) {
   await rm(failedFileList, { force: true });
-  const groups = partitionFiles(await weighFiles(root, cacheRoot, files), count);
+  const weighted = await weighFiles(root, cacheRoot, files);
+  const { count, reason, start, multiplier, timeoutFlags } = planShards(shardOverride);
+  const groups = partitionFiles(weighted, count);
   const startedAt = performance.now();
-  console.log(`Running ${files.length} Vitest files across ${groups.length} shards.`);
-  const result = await runShards(groups, { execute, print: console.log, signal });
+  console.log(
+    `Running ${files.length} Vitest files across ${groups.length} shards (${count} requested: ${reason}).`,
+  );
+  console.log(`Vitest shard timeouts (${multiplier.toFixed(2)}x, ms): ${timeoutFlags.join(" ")}`);
+  const result = await runShards(groups, {
+    execute: (name, selected) => execute(name, selected, timeoutFlags),
+    print: console.log,
+    signal,
+    start,
+  });
   console.log(`Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`);
   if (result.failedFiles.length)
     writeJson(failedFileList, { version: failedListVersion, files: result.failedFiles });
@@ -453,8 +490,8 @@ async function runFullSuite({
   return result.exitCode;
 }
 
-function requestedShardCount() {
-  const requested = process.env.TEST_SHARDS ?? "4";
+function parseShardOverride(requested) {
+  if (requested === undefined) return undefined;
   const count = Number(requested);
   if (!/^\d+$/u.test(requested) || !Number.isSafeInteger(count) || count < 1) {
     throw new Error("TEST_SHARDS must be a positive integer.");
@@ -474,7 +511,7 @@ async function main(signal) {
   const cacheRoot = join(root, "node_modules/.vite/vitest");
   const parallelCache = join(cacheRoot, "test-parallel");
   const failedFileList = join(parallelCache, "failed.json");
-  const count = requestedShardCount();
+  const shardOverride = parseShardOverride(process.env.TEST_SHARDS);
   let lock;
   let runDirectory;
   try {
@@ -493,8 +530,9 @@ async function main(signal) {
       publishTestMetrics(runs, [], root, { signal, expectedHead: head });
       saveTimings(parallelCache, timings);
     };
-    const execute = async (name, files) => {
-      const result = await executeFiles({ root, name, files, runDirectory, signal, invoke });
+    const execution = { root, runDirectory, signal, invoke };
+    const execute = async (name, files, timeoutFlags) => {
+      const result = await executeFiles({ ...execution, name, files, timeoutFlags });
       runs.push({ files, counts: result.counts });
       return result;
     };
@@ -506,7 +544,7 @@ async function main(signal) {
       root,
       cacheRoot,
       files,
-      count,
+      shardOverride,
       failedFileList,
       runDirectory,
       execute,
