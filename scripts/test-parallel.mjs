@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import {
+  access,
   mkdir,
   mkdtemp,
   open,
@@ -20,21 +21,28 @@ const vitest = join(root, "node_modules/vitest/vitest.mjs");
 const cacheRoot = join(root, "node_modules/.vite/vitest");
 const parallelCache = join(cacheRoot, "test-parallel");
 const failedFileList = join(parallelCache, "failed.json");
+const daemonSuite = join("src", "daemons", "daemons.test.ts");
 const lockPath =
   process.platform === "win32" ? join(tmpdir(), "hub-fullsuite.lock") : "/tmp/hub-fullsuite.lock";
 
 export function partitionFiles(files, count) {
-  const shards = Array.from({ length: Math.min(count, files.length) }, () => ({
+  const isolateDaemon = count > 1 && files.some((file) => file.path === daemonSuite);
+  const firstShard = isolateDaemon ? [[daemonSuite]] : [];
+  const sharedFiles = isolateDaemon ? files.filter((file) => file.path !== daemonSuite) : files;
+  const shardCount = Math.min(count - firstShard.length, sharedFiles.length);
+  const shards = Array.from({ length: shardCount }, () => ({
     files: [],
     weight: 0,
   }));
-  const sorted = [...files].sort((a, b) => b.weight - a.weight || a.path.localeCompare(b.path));
+  const sorted = [...sharedFiles].sort(
+    (a, b) => b.weight - a.weight || a.path.localeCompare(b.path),
+  );
   for (const file of sorted) {
     const lightest = shards.reduce((first, next) => (next.weight < first.weight ? next : first));
     lightest.files.push(file.path);
     lightest.weight += file.weight;
   }
-  return shards.map((shard) => shard.files);
+  return [...firstShard, ...shards.map((shard) => shard.files)];
 }
 
 function printRun(print, name, files, result) {
@@ -288,10 +296,23 @@ async function main() {
   if (!/^\d+$/u.test(requested) || !Number.isSafeInteger(count) || count < 1) {
     throw new Error("TEST_SHARDS must be a positive integer.");
   }
-  const lock = await open(lockPath, "wx", 0o600).catch((error) => {
-    if (error.code === "EEXIST") throw new Error(`The full-suite lock is held at ${lockPath}.`);
-    throw error;
-  });
+  const busy = `The full-suite lock is held at ${lockPath}.`;
+  let lock;
+  if (values["rerun-failed"]) {
+    await access(lockPath).then(
+      () => {
+        throw new Error(busy);
+      },
+      (error) => {
+        if (error.code !== "ENOENT") throw error;
+      },
+    );
+  } else {
+    lock = await open(lockPath, "wx", 0o600).catch((error) => {
+      if (error.code === "EEXIST") throw new Error(busy);
+      throw error;
+    });
+  }
   const controller = new AbortController();
   const interrupt = () => controller.abort();
   process.on("SIGINT", interrupt);
@@ -299,7 +320,7 @@ async function main() {
   let runDirectory;
   let exitCode = 1;
   try {
-    await lock.writeFile(`${process.pid}\n`);
+    await lock?.writeFile(`${process.pid}\n`);
     runDirectory = await mkdtemp(join(tmpdir(), "hub-tests-"));
     const discovery = join(runDirectory, "discovery");
     const listing = join(discovery, "files.json");
@@ -339,8 +360,10 @@ async function main() {
     try {
       if (exitCode === 0 && runDirectory) await rm(runDirectory, { recursive: true });
     } finally {
-      await lock.close();
-      await rm(lockPath);
+      if (lock) {
+        await lock.close();
+        await rm(lockPath);
+      }
       process.removeListener("SIGINT", interrupt);
       process.removeListener("SIGTERM", interrupt);
     }
