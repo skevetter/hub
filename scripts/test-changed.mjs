@@ -40,22 +40,60 @@ function requireGit(args) {
   return output;
 }
 
-function resolveBase(base) {
+const releaseRef = /^(?:(?:refs\/heads|refs\/remotes\/[^/]+)\/)?release\/(.+)$/u;
+const versionOrder = (a, b) => a.localeCompare(b, "en", { numeric: true });
+
+function previousReleaseRefs(gitCommand) {
+  const current = gitCommand(["symbolic-ref", "--quiet", "--short", "HEAD"])
+    ?.trim()
+    .match(releaseRef)?.[1];
+  const family = (name) => name.split(/\d/u, 1)[0];
+  const refs =
+    gitCommand(["for-each-ref", "--format=%(refname)", "refs/heads/release", "refs/remotes"]) ?? "";
+  return refs
+    .trim()
+    .split("\n")
+    .map((ref) => ({ ref, version: ref.match(releaseRef)?.[1] }))
+    .filter(
+      ({ version }) =>
+        version &&
+        /\d/u.test(version) &&
+        (!current || (family(version) === family(current) && versionOrder(version, current) < 0)),
+    )
+    .sort((a, b) => versionOrder(b.version, a.version) || a.ref.localeCompare(b.ref))
+    .map(({ ref }) => ref);
+}
+
+export function resolveBase(base, gitCommand = git) {
   if (base !== undefined) {
-    const tree = git(["rev-parse", "--verify", "--end-of-options", `${base}^{tree}`]);
+    const tree = gitCommand(["rev-parse", "--verify", "--end-of-options", `${base}^{tree}`]);
     if (tree === null) throw new Error("Could not resolve --base to a Git tree.");
-    return { display: base, tree: tree.trim() };
+    return { display: base, tree: tree.trim(), kind: "tree" };
   }
-  for (const ref of [
-    "release/notifications-22",
-    "origin/release/notifications-22",
-    "origin/HEAD",
-    "origin/main",
-  ]) {
-    const commit = git(["merge-base", "HEAD", ref]);
-    if (commit !== null) return { display: `merge base with ${ref}`, tree: commit.trim() };
+  const mergeBase = (ref) => {
+    const commit = gitCommand(["merge-base", "HEAD", ref]);
+    if (commit !== null)
+      return { display: `merge base with ${ref}`, tree: commit.trim(), kind: "commit" };
+  };
+  for (const ref of ["origin/main", "main"]) {
+    const found = mergeBase(ref);
+    if (found) return found;
   }
-  throw new Error("No local base ref found. Pass --base with a Git commit or branch.");
+  const upstream = gitCommand([
+    "rev-parse",
+    "--abbrev-ref",
+    "--symbolic-full-name",
+    "@{upstream}",
+  ])?.trim();
+  if (upstream) {
+    const found = mergeBase(upstream);
+    if (found) return found;
+  }
+  for (const ref of previousReleaseRefs(gitCommand)) {
+    const found = mergeBase(ref);
+    if (found) return found;
+  }
+  throw new Error("No local merge base found. Pass --base with a Git commit or branch.");
 }
 
 export function combinePaths(diff, untracked) {
@@ -274,7 +312,7 @@ async function main() {
     requireGit(["diff", "--no-renames", "--name-only", "-z", base.tree, "--"]),
     requireGit(["ls-files", "--others", "--exclude-standard", "-z"]),
   );
-  console.log(`Changed paths from ${base.display} (${base.tree})`);
+  console.log(`Changed paths from ${base.display} (Git ${base.kind} ${base.tree})`);
   for (const path of changes) console.log(`  ${path}`);
 
   const temp = await mkdtemp(join(tmpdir(), "hub-changed-"));
