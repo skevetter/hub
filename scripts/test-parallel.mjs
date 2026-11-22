@@ -349,8 +349,12 @@ async function main(signal) {
       signal,
       lock,
     );
-    if (found.exitCode)
-      throw new Error(`Vitest file discovery failed. See ${join(discovery, "vitest.log")}`);
+    if (found.exitCode) {
+      const reason = found.processError ?? `exit ${found.exitCode}`;
+      throw new Error(
+        `Vitest file discovery failed (${reason}). See ${join(discovery, "vitest.log")}`,
+      );
+    }
     const files = JSON.parse(await readFile(listing, "utf8")).map(({ file }) =>
       relative(root, file),
     );
