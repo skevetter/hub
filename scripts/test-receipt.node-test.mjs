@@ -470,7 +470,7 @@ test("TERM after staging a receipt prevents its publication", async (t) => {
   }
 });
 
-test("a receipt sweeps descendants holding the command's output pipes after the leader exits", async (t) => {
+test("a receipt fails when it must sweep descendants holding its output pipes", async (t) => {
   const { directory, head } = await gitFixture(t);
   const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
   const receiptDir = join(directory, ".test-receipts");
@@ -521,13 +521,14 @@ test("a receipt sweeps descendants holding the command's output pipes after the 
     output += chunk;
   });
   try {
-    assert.deepEqual(await once(caller, "exit", { signal: AbortSignal.timeout(4000) }), [0, null]);
+    assert.deepEqual(await once(caller, "exit", { signal: AbortSignal.timeout(4000) }), [1, null]);
     await exited;
     assert.match(output, /^leader is exiting$/mu);
+    assert.match(output, /background children were still running/iu);
     assert.equal(await readFile(marker + "-stopped", "utf8"), "SIGTERM");
     await assert.rejects(readFile(join(receiptDir, `${head}.lock`)), { code: "ENOENT" });
     assert.deepEqual(await readdir(temp), []);
-    await verifyReceipt(directory, head);
+    await assert.rejects(verifyReceipt(directory, head), /No test receipt exists/u);
   } finally {
     if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
     const pid = Number(await readFile(marker, "utf8").catch(() => ""));

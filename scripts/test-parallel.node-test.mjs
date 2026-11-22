@@ -656,3 +656,44 @@ test("TERM during shard timing-cache reads prevents successful suite metrics", a
   assert.deepEqual(saved.selectedFiles, ["selected.test.ts"]);
   assert.deepEqual(saved.counts, { passed: 1, failed: 0, skipped: 0 });
 });
+
+test("parallel shards and serial reruns fail when a passing worker leaves background children", async (t) => {
+  for (const flags of [[], ["--rerun-failed"]]) {
+    await t.test(flags[0] ?? "full suite", async (t) => {
+      const { root, lock, args, options } = await parallelFixture(
+        t,
+        `
+        const { spawn } = await import("node:child_process");
+        writeFileSync(reportPath, JSON.stringify(report));
+        const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3500)"],
+          { stdio: ["ignore", "inherit", "inherit"] });
+        writeFileSync(join(root, "descendant"), String(child.pid));
+        child.unref();
+      `,
+      );
+      const metrics = join(root, "metrics.json");
+      try {
+        const result = spawnSync(process.execPath, [...args, ...flags], {
+          ...options,
+          env: { ...options.env, HUB_TEST_RUN_REPORT: metrics },
+          encoding: "utf8",
+          timeout: 5000,
+        });
+        assert.equal(result.status, 1);
+        assert.match(result.stdout, /background children were still running/iu);
+        assert.doesNotMatch(result.stdout, /: PASS/u);
+        await assert.rejects(readFile(metrics), { code: "ENOENT" });
+        await assert.rejects(readFile(lock), { code: "ENOENT" });
+      } finally {
+        const pid = Number(await readFile(join(root, "descendant"), "utf8").catch(() => ""));
+        if (pid) {
+          try {
+            process.kill(pid, "SIGKILL");
+          } catch (error) {
+            if (error.code !== "ESRCH") throw error;
+          }
+        }
+      }
+    });
+  }
+});
