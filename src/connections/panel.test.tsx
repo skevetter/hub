@@ -168,6 +168,26 @@ describe("Connections cards", () => {
     expect(markup).not.toMatch(/<button|Set up the .* app/u);
   });
 
+  it("says why a provider with no instance app cannot be connected yet", () => {
+    const rendered = card(renderPanel(), "Linear");
+    expect(rendered).toContain("This Hub has no Linear app yet.");
+    expect(rendered).toContain("An instance operator sets one up before anyone can connect.");
+    const operator = card(renderPanel({ operator: true }), "Linear");
+    expect(operator).toContain("This Hub has no Linear app yet.");
+    expect(operator).not.toContain("An instance operator sets one up");
+  });
+
+  it("tells a member without management rights who can connect a configured provider", () => {
+    const markup = renderPanel({
+      manage: false,
+      status: { ...noApps, canManage: false, discord: { status: "disconnected" } },
+    });
+    expect(card(markup, "Discord")).toContain(
+      "Someone who manages this organization can connect Discord.",
+    );
+    expect(card(markup, "Discord")).not.toContain("<button");
+  });
+
   it("keeps four loading boxes", () => {
     const markup = renderPanel({ pending: true });
     expect(markup.match(/aria-busy="true"/gu)).toHaveLength(4);
