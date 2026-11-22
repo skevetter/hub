@@ -385,3 +385,66 @@ async function revokeDevice(page: Page, daemons: OrganizationDaemons, name: stri
   await page.getByRole("menuitem", { name: "Revoke", exact: true }).press("Enter");
   await page.getByRole("button", { name: "Revoke daemon", exact: true }).press("Enter");
 }
+
+test("withholds cached daemon data while the route tenant still belongs to the prior account", async ({
+  hub,
+  page,
+}) => {
+  test.setTimeout(90_000);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.seedDaemonSlug("owner", "shared-device");
+  const name = "Owner's session profile";
+  await seedDaemonProfile(hub.primaryApplication(), "Acme", "shared-device", name);
+  await hub.addNewMember("owner", "member", member);
+  const daemons = new OrganizationDaemons(page);
+  await daemons.open();
+  const profile = daemons.device("shared-device").getByRole("link", { name, exact: true });
+  await expect(profile).toBeVisible();
+  await hub.signOut("owner");
+
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let organizationReads = 0;
+  await page.route("**/_serverFn/**", async (route) => {
+    const request = route.request();
+    if (request.method() === "POST") {
+      const response = await route.fetch();
+      // Choose the fixture organization before the sign-in response triggers the account read.
+      // The organization chooser reloads the page and would discard the cache under test.
+      await hub.primaryApplication().query(
+        `update session set active_organization_id = member.organization_id
+         from "user" join member on member.user_id = "user".id
+         join organization on organization.id = member.organization_id
+         where session.user_id = "user".id and session.active_organization_id is null
+         and "user".email = $1 and organization.name = 'Acme'`,
+        [member.email],
+      );
+      await route.fulfill({ response });
+      return;
+    }
+    if (new URL(request.url()).searchParams.get("payload")?.includes('"organizationSlug"')) {
+      organizationReads++;
+      await held;
+    }
+    await route.continue();
+  });
+  try {
+    const form = page.getByRole("form", { name: "Sign in" });
+    await form.getByLabel("Email").fill(member.email);
+    await form.getByLabel("Password").fill(member.password);
+    await form.getByRole("button", { name: "Sign in", exact: true }).click();
+    await expect(page.getByRole("button", { name: member.email, exact: true })).toBeVisible();
+    await expect.poll(() => organizationReads).toBeGreaterThan(0);
+    await expect.soft(profile).toHaveCount(0, { timeout: 1_000 });
+    await expect.soft(actions(daemons, "shared-device")).toHaveCount(0, { timeout: 1_000 });
+    await expect(page.getByLabel("Loading daemons")).toBeVisible({ timeout: 1_000 });
+  } finally {
+    release();
+  }
+  await expect(daemons.device("shared-device")).toBeVisible();
+  await expect(profile).toHaveCount(0);
+  await expect(actions(daemons, "shared-device")).toHaveCount(0);
+});

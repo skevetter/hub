@@ -49,17 +49,43 @@ interface CompletedDaemonAction {
   daemonId: string;
 }
 
-export function DaemonsPanel({
-  accountId,
-  organizationId,
-  organizationSlug,
-}: {
+interface DaemonsScope {
   accountId: string;
   organizationId: string;
   organizationSlug: string;
-}) {
-  const account = useActiveAccount();
-  const showProfiles = account.features?.interactiveSessions === true;
+}
+
+export function DaemonsPanel({
+  accountId: tenantAccountId,
+  organizationId,
+  organizationSlug,
+}: DaemonsScope) {
+  const { account, features } = useActiveAccount();
+  const showProfiles = features?.interactiveSessions === true;
+  return (
+    <>
+      <PageHeader id="daemons-heading" title="Daemons" description={DAEMONS_DESCRIPTION} />
+      {tenantAccountId === account.id ? (
+        <AccountDaemons
+          key={`${account.id}:${organizationId}`}
+          accountId={account.id}
+          organizationId={organizationId}
+          organizationSlug={organizationSlug}
+          showProfiles={showProfiles}
+        />
+      ) : (
+        <DaemonsLoading showProfiles={showProfiles} />
+      )}
+    </>
+  );
+}
+
+function AccountDaemons({
+  accountId,
+  organizationId,
+  organizationSlug,
+  showProfiles,
+}: DaemonsScope & { showProfiles: boolean }) {
   const queryClient = useQueryClient();
   const queryKey = daemonsQueryKey(accountId, organizationId);
   const loadDaemons = useServerFn(daemonList);
@@ -133,7 +159,6 @@ export function DaemonsPanel({
   const busy = rename.isPending || revoke.isPending;
   return (
     <>
-      <PageHeader id="daemons-heading" title="Daemons" description={DAEMONS_DESCRIPTION} />
       {revokeFailed ? (
         <FailureAlert
           standalone
@@ -153,7 +178,6 @@ export function DaemonsPanel({
       ) : null}
       {snapshot.status === "success" ? (
         <DaemonsContent
-          key={`${accountId}:${organizationId}`}
           snapshot={snapshot.data}
           accountId={accountId}
           organizationSlug={organizationSlug}
