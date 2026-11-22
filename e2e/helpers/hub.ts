@@ -4963,8 +4963,10 @@ class HubUser {
       await expect(this.page.getByRole("region", { name: "Loading account context" })).toHaveCount(
         0,
       );
-      await expect(github.getByText("Being removed", { exact: true })).toBeVisible();
-      await expect(trigger).toHaveCount(0);
+      const githubCard = this.page.getByRole("region", { name: "GitHub", exact: true });
+      await expect(github).toHaveCount(0);
+      await expect(githubCard.getByText("Updating", { exact: true })).toBeVisible();
+      await expect(githubCard.getByRole("button", { name: "Connect GitHub" })).toBeDisabled();
       await switcher.click();
       const menu = this.page.getByRole("menu");
       await expect(menu).toBeVisible();
