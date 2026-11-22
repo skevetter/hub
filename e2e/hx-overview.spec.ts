@@ -83,11 +83,12 @@ for (const width of [390, 1280])
     try {
       await expect(loading).toBeVisible();
       loadingHeights = await dimensions(loading);
-      expect(loadingHeights).toHaveLength(5);
+      expect(loadingHeights).toHaveLength(4);
     } finally {
       releaseSnapshot();
     }
-    await expect(page.getByText("Open sessions", { exact: true })).toBeVisible();
+    await expect(page.getByText("Daemons connected", { exact: true })).toBeVisible();
+    await expect(page.getByText("Open sessions", { exact: true })).toHaveCount(0);
     expect(await dimensions(page.locator("main"))).toEqual(loadingHeights);
   });
 
@@ -260,7 +261,6 @@ test("reads Home as figures, a checklist the member can put away, and prompts to
       "Runs, 30 days",
       "Active triggers",
       "Daemons connected",
-      "Open sessions",
     ]) {
       await expect(page.getByText(label, { exact: true })).toBeVisible();
     }

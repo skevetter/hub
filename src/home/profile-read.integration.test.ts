@@ -47,13 +47,12 @@ it("Home reads profile availability without loading an unbounded list of full pr
     const list = vi.spyOn(db, "listSessionProfiles");
     const dashboard = new HomeDashboard(db, auth, () => true, { interactiveSessions: true });
     const snapshot = await dashboard.snapshot(new Request("https://hub.test/o/acme/home"), "acme");
-    assert.ok(snapshot.sessions);
+    assert.equal(snapshot.sessionStarted, false);
     assert.equal(
       list.mock.calls.length,
       0,
       "the Home snapshot must leave profiles to the client query",
     );
-    assert.equal(Object.hasOwn(snapshot.sessions, "profiles"), false);
   } finally {
     await db.close();
     await rm(directory, { recursive: true, force: true });

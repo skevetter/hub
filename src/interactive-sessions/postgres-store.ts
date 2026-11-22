@@ -433,60 +433,23 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
     });
   }
 
-  async countOwnInteractiveSessions(
-    { organizationId, userId }: SessionPrincipal,
-    openLimit: number,
-  ) {
-    const { rows: open } = await this.runtime.query<{ own: boolean }>(
-      `with candidates as materialized (
-         select s.id, s.started_by_user_id
-         from daemons d
-         cross join lateral (
-           select id, started_by_user_id
-           from interactive_sessions
-           where daemon_id = d.id and organization_id = $1 and state <> 'closed'
-           offset 0
-         ) s
-         where d.organization_id = $1
-           and exists (
-             select 1 from member
-             where organization_id = $1 and user_id = $2 and role in ('owner', 'admin', 'member')
-           )
-         limit $3
+  async hasOwnInteractiveSession({ organizationId, userId }: SessionPrincipal): Promise<boolean> {
+    const { rows } = await this.runtime.query(
+      `select 1 from (
+         (select 1 from interactive_sessions
+           where organization_id = $1 and started_by_user_id = $2 limit 1)
+         union all
+         (select 1 from interactive_session_participants
+           where organization_id = $1 and user_id = $2 limit 1)
+       ) owned
+       where exists (
+         select 1 from member
+         where organization_id = $1 and user_id = $2 and role in ('owner', 'admin', 'member')
        )
-       select coalesce(s.started_by_user_id = $2, false) or exists (
-         select 1 from interactive_session_participants p
-         where p.session_id = s.id and p.organization_id = $1 and p.user_id = $2
-         offset 0
-       ) as own
-       from candidates s`,
-      [organizationId, userId, openLimit + 1],
+       limit 1`,
+      [organizationId, userId],
     );
-    const own = open.filter((row) => row.own).length;
-    const started =
-      own > 0 ||
-      (
-        await this.runtime.query<{ id: string }>(
-          `select id from (
-             (select id from interactive_sessions
-               where organization_id = $1 and started_by_user_id = $2 limit 1)
-             union all
-             (select session_id as id from interactive_session_participants
-               where organization_id = $1 and user_id = $2 limit 1)
-           ) owned
-           where exists (
-             select 1 from member
-             where organization_id = $1 and user_id = $2 and role in ('owner', 'admin', 'member')
-           )
-           limit 1`,
-          [organizationId, userId],
-        )
-      ).rows.length > 0;
-    return {
-      open: Math.min(own, openLimit),
-      openCapped: open.length > openLimit,
-      started,
-    };
+    return rows.length > 0;
   }
 
   async listInteractiveSessionMessages(

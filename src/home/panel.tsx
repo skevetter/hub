@@ -66,9 +66,10 @@ export function HomePanel() {
     queryKey: ["home", tenant.organization.id, tenant.account.id],
     queryFn: () => load({ data: scope }),
   });
-  const sessionsEnabled = account.features?.interactiveSessions === true;
   const profilesEnabled =
-    sessionsEnabled && snapshot.status === "success" && snapshot.data.sessions !== null;
+    account.features?.interactiveSessions === true &&
+    snapshot.status === "success" &&
+    snapshot.data.sessionStarted !== null;
   const list = useServerFn(listSessionProfiles);
   const profiles = useSnapshotQuery({
     ...sessionProfileQueryOptions(tenant.organization.slug, account.account.id, list),
@@ -88,7 +89,6 @@ export function HomePanel() {
       snapshot={snapshot}
       accountId={tenant.account.id}
       operator={account.isInstanceOperator}
-      sessionsEnabled={sessionsEnabled}
       profiles={profileCount}
       canManageProfiles={tenant.capabilities.manageResources}
     />
@@ -99,14 +99,12 @@ function HomeView({
   snapshot,
   accountId,
   operator,
-  sessionsEnabled,
   profiles,
   canManageProfiles,
 }: {
   snapshot: Snapshot<HomeSnapshot> & { refetch: () => void; isFetching: boolean };
   accountId: string;
   operator: boolean;
-  sessionsEnabled: boolean;
   profiles: ProfileAvailability;
   canManageProfiles: boolean;
 }) {
@@ -130,7 +128,7 @@ function HomeView({
     return (
       <>
         {header}
-        <HomeLoading sessionsEnabled={sessionsEnabled} />
+        <HomeLoading />
       </>
     );
   }
@@ -157,7 +155,7 @@ function HomeView({
       {header}
       <NeedsAttention data={data} base={base} profiles={profiles} />
       <Section>
-        <HomeTiles data={data} profiles={profiles} />
+        <HomeTiles data={data} />
       </Section>
       {data.checklistCompletedAt === null ? (
         <HomeChecklist
@@ -218,13 +216,12 @@ function HomeView({
 
 /**
  * The figures a reader checks first. Runs are counted over rolling windows because the server
- * does not know the reader's midnight; sessions are the reader's own, and absent while off.
+ * does not know the reader's midnight.
  */
-function HomeTiles({ data, profiles }: { data: HomeSnapshot; profiles: ProfileAvailability }) {
-  const { sessions } = data;
+function HomeTiles({ data }: { data: HomeSnapshot }) {
   const enabled = data.triggers.filter((trigger) => trigger.enabled).length;
   return (
-    <StatGrid columns={sessions === null ? 4 : 5}>
+    <StatGrid columns={4}>
       <StatTile
         label="Runs, 24 hours"
         value={String(data.runCounts.day.total)}
@@ -245,24 +242,16 @@ function HomeTiles({ data, profiles }: { data: HomeSnapshot; profiles: ProfileAv
         value={String(data.daemons.filter(({ presence }) => presence === "connected").length)}
         detail={daemonDetail(data.daemons)}
       />
-      {sessions === null ? null : (
-        <StatTile
-          label="Open sessions"
-          value={`${String(sessions.open)}${sessions.openCapped ? "+" : ""}`}
-          {...(typeof profiles === "number" ? { detail: profileLabel(profiles) } : {})}
-        />
-      )}
     </StatGrid>
   );
 }
 
-function HomeLoading({ sessionsEnabled }: { sessionsEnabled: boolean }) {
-  const columns = sessionsEnabled ? 5 : 4;
+function HomeLoading() {
   return (
     <div aria-busy="true" aria-label="Loading Home">
       <div className="grid gap-8">
-        <StatGrid columns={columns}>
-          {Array.from({ length: columns }, (_, position) => (
+        <StatGrid columns={4}>
+          {Array.from({ length: 4 }, (_, position) => (
             <StatTileSkeleton key={position} />
           ))}
         </StatGrid>
@@ -550,7 +539,7 @@ function GetStarted({
       onOpenChange={setOpen}
       title="Getting started"
       description={
-        snapshot.sessions === null
+        snapshot.sessionStarted === null
           ? "Connect an app and a daemon, create a trigger, and run it."
           : "Connect a daemon, talk to an agent on it, then let events start one."
       }
@@ -636,7 +625,7 @@ function stepPresentation(
   if (step.key === "daemon") return daemonStep(step.state, snapshot, context.origin);
   if (step.key === "trigger") return triggerStep(step.state, snapshot, context.base);
   if (step.key === "profile") return profileStep(step.state, context);
-  if (step.key === "session") return sessionStep(step.state, snapshot, context);
+  if (step.key === "session") return sessionStep(step.state, context);
   return runStep(step.state, snapshot, context.base);
 }
 
@@ -678,24 +667,9 @@ function profileLabel(count: number): string {
   return count === 1 ? "1 active profile" : `${String(count)} active profiles`;
 }
 
-function sessionStep(
-  state: "done" | "pending",
-  snapshot: HomeSnapshot,
-  { base, profiles }: StepContext,
-): StepPresentation {
+function sessionStep(state: "done" | "pending", { base, profiles }: StepContext): StepPresentation {
   const title = "Start a session";
-  const sessions = snapshot.sessions;
-  if (state === "done") {
-    const open = sessions?.open ?? 0;
-    return {
-      title,
-      hint:
-        open === 0
-          ? "You started or joined a session."
-          : `${String(open)}${sessions?.openCapped === true ? "+" : ""} open now`,
-      status: DONE,
-    };
-  }
+  if (state === "done") return { title, hint: "You started or joined a session.", status: DONE };
   return {
     title,
     hint: "Choose an active profile and send a first message.",
