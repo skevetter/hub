@@ -309,6 +309,55 @@ test("restores focus to the actions button or search after a keyboard mutation",
   await expect(daemons.search()).toBeFocused({ timeout: 1_000 });
 });
 
+test("keeps loading and offline card heights close at both viewport widths", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.seedConnectedOnlyDaemon("owner", "offline-device");
+
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(
+    (url) =>
+      url.pathname.includes("/_serverFn/") &&
+      url.searchParams.get("payload")?.includes('"organizationSlug"') === true,
+    async (route) => {
+      await held;
+      await route.continue();
+    },
+  );
+  const daemons = new OrganizationDaemons(page);
+  const loading = page.locator('[aria-label="Loading daemons"] [aria-busy="true"]').first();
+  const widths = [390, 1280];
+  const loadingHeights = [];
+  try {
+    await daemons.open();
+    for (const width of widths) {
+      await page.setViewportSize({ width, height: 900 });
+      await expect(loading).toBeVisible();
+      loadingHeights.push((await loading.boundingBox())?.height ?? 0);
+    }
+  } finally {
+    release();
+  }
+  const card = daemons.device("offline-device");
+  await expect(card.getByText("No profiles use this daemon.")).toBeVisible();
+  for (const [index, width] of widths.entries()) {
+    await page.setViewportSize({ width, height: 900 });
+    const settledHeight = (await card.boundingBox())?.height ?? 0;
+    const loadingHeight = loadingHeights[index] ?? 0;
+    expect(loadingHeight).toBeGreaterThan(0);
+    expect(settledHeight).toBeGreaterThan(0);
+    expect
+      .soft(Math.abs(settledHeight - loadingHeight), `height difference at ${width}px`)
+      .toBeLessThanOrEqual(64);
+  }
+});
+
 function newMemberPage(browser: Browser, existingContexts: ReadonlySet<BrowserContext>) {
   const page = browser
     .contexts()
