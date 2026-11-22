@@ -1,7 +1,12 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueryClient,
+  type QueryClient,
+  type QueryKey,
+} from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useActiveAccount } from "../auth/active-account.js";
 import { CONNECTION_MUTATION_KEY } from "../auth/tenant-mutation.js";
 import { Card, CardSkeleton } from "../components/app/card.js";
@@ -68,6 +73,7 @@ const PROVIDER_CARDS = [
 
 type ProviderStatus = ProviderConnectionStatus["status"];
 
+const UPDATING = <StatusPill tone="neutral">Updating</StatusPill>;
 const NOT_SET_UP = <StatusPill tone="neutral">Not set up</StatusPill>;
 const NEEDS_AUTHORIZATION = <StatusPill tone="warning">Needs authorization</StatusPill>;
 const STATE_PILLS: Record<ProviderStatus, ReactNode> = {
@@ -130,23 +136,12 @@ function ConnectionsContent() {
     mutationKey: CONNECTION_MUTATION_KEY,
     mutationFn: useServerFn(startConnection),
   });
-  const disconnect = useMutation({
-    mutationKey: CONNECTION_MUTATION_KEY,
-    mutationFn: useServerFn(disconnectConnection) as (
-      input: Parameters<typeof disconnectConnection>[0],
-    ) => Promise<Result<{ result: ConnectionDisconnectResult }>>,
-    onMutate: ({ data: { provider, connectionId } }) =>
-      snapshot.status === "success"
-        ? connectionRows(snapshot.data.connections)[provider].find(({ id }) => id === connectionId)
-        : undefined,
-    onSuccess: async (response) => {
-      if (response.status !== "ok") return;
-      await Promise.all([
-        invalidateOrganization(queryClient, scope.organizationSlug),
-        queryClient.invalidateQueries({ queryKey: statusKey, exact: true }),
-      ]);
-    },
-  });
+  const { disconnect, revocation, snapshotProgress, statusProgress, resetRevocation } =
+    useConnectionRevocation(scope, snapshot.queryKey, statusKey);
+  const refresh = refreshProgress(revocation, snapshotProgress, statusProgress, [
+    snapshot.data,
+    statusQuery.data,
+  ]);
   const start = connect.mutate;
   const revoke = disconnect.mutate;
   const connectProvider = useCallback(
@@ -163,12 +158,13 @@ function ConnectionsContent() {
     [scope, start],
   );
   const revokeConnection = useCallback(
-    (provider: ConnectionProvider, connectionId: string) => {
+    (provider: ConnectionProvider, row: ConnectionRecord) => {
       setRetryState("idle");
       setReturned(undefined);
-      revoke({ data: { ...scope, provider, connectionId } });
+      resetRevocation();
+      revoke({ data: { ...scope, provider, connectionId: row.id }, row });
     },
-    [revoke, scope, setReturned],
+    [resetRevocation, revoke, scope, setReturned],
   );
   const mutations = useMemo(
     () => [
@@ -193,15 +189,14 @@ function ConnectionsContent() {
     );
   }
 
-  const failure = connectionReadFailure(snapshot, statusQuery);
-  const revokeResult = disconnect.data?.status === "ok" ? disconnect.data.data.result : undefined;
-  if (failure !== undefined && !disconnect.isPending) {
+  const failure = connectionReadFailure(snapshot, statusQuery, refresh);
+  if (failure !== undefined) {
     return (
       <FailureAlert
         title={failure.title}
         error={failure.message}
         fallback={`${failure.title}.`}
-        passive={retryState === "idle" && revokeResult === undefined}
+        passive={retryState === "idle" && revocation === undefined}
         onRetry={retry}
       />
     );
@@ -210,16 +205,11 @@ function ConnectionsContent() {
 
   const data = snapshot.data;
   const canManage = data.capabilities.manageResources;
-  const busy = connect.isPending || disconnect.isPending;
-  const pending = disconnect.isPending ? disconnect.variables?.data : undefined;
-  const connections = connectionRows(data.connections, pending, disconnect.context);
+  const pending = pendingRemoval(disconnect, refresh);
+  const busy = connect.isPending || disconnect.isPending || pending !== undefined;
+  const connections = connectionRows(data.connections, pending?.data, pending?.row);
   const suspendedGitHub = data.connections.github.some(({ status }) => status === "suspended");
-  const result = reconciledRevocation(
-    connections,
-    disconnect.variables?.data,
-    revokeResult,
-    snapshot.isFetching || statusQuery.isFetching,
-  );
+  const result = reconciledRevocation(connections, revocation, refresh);
   const banner = result ?? returned;
   return (
     <>
@@ -235,6 +225,9 @@ function ConnectionsContent() {
             provider === "github" && reported !== "notConfigured" && suspendedGitHub
               ? "suspended"
               : reported;
+          const updating = refresh === "pending" && revocation?.provider === provider;
+          const removingId =
+            pending?.data.provider === provider ? pending.data.connectionId : undefined;
           const dropped = data.droppedConnectionEvents[provider];
           return (
             <Card
@@ -243,14 +236,14 @@ function ConnectionsContent() {
               icon={icon}
               title={label}
               description={description}
-              status={STATE_PILLS[status]}
+              status={updating ? UPDATING : STATE_PILLS[status]}
             >
               {connections[provider].length > 0 ? (
                 <ProviderConnections
                   label={label}
                   provider={provider}
                   connections={connections[provider]}
-                  removingId={pending?.provider === provider ? pending.connectionId : undefined}
+                  removingId={removingId}
                   canManage={canManage}
                   busy={busy}
                   onRevoke={revokeConnection}
@@ -278,17 +271,19 @@ function ConnectionsContent() {
                   </Link>
                 </div>
               ) : null}
-              <ConnectionHint
-                label={label}
-                status={status}
-                canManage={canManage}
-                isInstanceOperator={isInstanceOperator}
-              />
+              {updating ? null : (
+                <ConnectionHint
+                  label={label}
+                  status={status}
+                  canManage={canManage}
+                  isInstanceOperator={isInstanceOperator}
+                />
+              )}
               {canManage ? (
                 <ConnectionAction
                   label={label}
                   provider={provider}
-                  status={status}
+                  status={updating ? "disconnected" : status}
                   isInstanceOperator={isInstanceOperator}
                   busy={busy}
                   onConnect={connectProvider}
@@ -307,7 +302,17 @@ type ConnectionRead = Pick<
   "status" | "error" | "refreshFailure"
 >;
 
-function connectionReadFailure(snapshot: ConnectionRead, status: ConnectionRead) {
+function connectionReadFailure(
+  snapshot: ConnectionRead,
+  status: ConnectionRead,
+  refresh: RevocationRefresh,
+) {
+  if (refresh === "paused") {
+    return {
+      title: "Connections unavailable",
+      message: "Reconnect to the network and try again.",
+    };
+  }
   const failure = (read: ConnectionRead) =>
     read.status === "error" ? { message: read.error } : read.refreshFailure;
   const snapshotFailure = failure(snapshot);
@@ -322,15 +327,113 @@ interface ConnectionIdentity {
   connectionId: string;
 }
 
+interface RevokeInput {
+  data: Parameters<typeof disconnectConnection>[0]["data"];
+  row: ConnectionRecord;
+}
+
+interface Revocation extends ConnectionIdentity {
+  row: ConnectionRecord;
+  result: ConnectionDisconnectResult;
+  snapshotVersion: number;
+  statusVersion: number;
+}
+
+type RevocationRefresh = "idle" | "pending" | "paused" | "fresh";
+
+function useConnectionRevocation(
+  scope: { organizationSlug: string },
+  snapshotKey: QueryKey,
+  statusKey: QueryKey,
+) {
+  const queryClient = useQueryClient();
+  const snapshot = useReadProgress(queryClient, snapshotKey);
+  const status = useReadProgress(queryClient, statusKey);
+  const [revocation, setRevocation] = useState<Revocation>();
+  const resetRevocation = useCallback(() => setRevocation(undefined), []);
+  const sendDisconnect = useServerFn(disconnectConnection) as (
+    input: Parameters<typeof disconnectConnection>[0],
+  ) => Promise<Result<{ result: ConnectionDisconnectResult }>>;
+  const disconnect = useMutation({
+    mutationKey: CONNECTION_MUTATION_KEY,
+    mutationFn: ({ data }: RevokeInput) => sendDisconnect({ data }),
+    onSuccess: async (response, { data, row }) => {
+      if (response.status !== "ok") return;
+      setRevocation({
+        provider: data.provider,
+        connectionId: data.connectionId,
+        row,
+        result: response.data.result,
+        snapshotVersion: queryClient.getQueryState(snapshotKey)?.dataUpdateCount ?? 0,
+        statusVersion: queryClient.getQueryState(statusKey)?.dataUpdateCount ?? 0,
+      });
+      await Promise.all([
+        invalidateOrganization(queryClient, scope.organizationSlug),
+        queryClient.invalidateQueries({ queryKey: statusKey, exact: true }),
+      ]);
+    },
+  });
+  return {
+    disconnect,
+    revocation,
+    snapshotProgress: snapshot,
+    statusProgress: status,
+    resetRevocation,
+  };
+}
+
+function useReadProgress(queryClient: QueryClient, queryKey: QueryKey) {
+  const read = useCallback(() => queryClient.getQueryState(queryKey), [queryClient, queryKey]);
+  const subscribe = useCallback(
+    (onChange: () => void) => queryClient.getQueryCache().subscribe(onChange),
+    [queryClient],
+  );
+  return useSyncExternalStore(subscribe, read, read);
+}
+
+type ReadProgress = ReturnType<typeof useReadProgress>;
+
+function refreshProgress(
+  revocation: Revocation | undefined,
+  snapshot: ReadProgress,
+  status: ReadProgress,
+  [snapshotData, statusData]: [unknown, unknown],
+): RevocationRefresh {
+  if (revocation === undefined) return "idle";
+  if (
+    readIsFresh(snapshot, revocation.snapshotVersion, snapshotData) &&
+    readIsFresh(status, revocation.statusVersion, statusData)
+  ) {
+    return "fresh";
+  }
+  if (snapshot?.fetchStatus === "paused" || status?.fetchStatus === "paused") return "paused";
+  return "pending";
+}
+
+function readIsFresh(read: ReadProgress, version: number, displayed: unknown) {
+  // The cache can update before the snapshot observer passes the new data to the panel.
+  return read !== undefined && read.dataUpdateCount > version && read.data === displayed;
+}
+
+function pendingRemoval(
+  disconnect: ReturnType<typeof useConnectionRevocation>["disconnect"],
+  refresh: RevocationRefresh,
+) {
+  if (refresh === "pending" || (refresh === "idle" && disconnect.isPending)) {
+    return disconnect.variables;
+  }
+  return undefined;
+}
+
 function reconciledRevocation(
   connections: Record<ConnectionProvider, ConnectionRecord[]>,
-  revoked: ConnectionIdentity | undefined,
-  result: ConnectionDisconnectResult | undefined,
-  isFetching: boolean,
+  revocation: Revocation | undefined,
+  refresh: RevocationRefresh,
 ) {
-  if (revoked === undefined || result === undefined || isFetching) return undefined;
-  if (connections[revoked.provider].some(({ id }) => id === revoked.connectionId)) return undefined;
-  return { provider: revoked.provider, result };
+  if (revocation === undefined || refresh !== "fresh") return undefined;
+  if (connections[revocation.provider].some(({ id }) => id === revocation.connectionId))
+    return undefined;
+  return revocation;
 }
 
 /** A card with no action still says what has to happen before there is one. */
@@ -421,7 +524,7 @@ function ProviderConnections({
   removingId: string | undefined;
   canManage: boolean;
   busy: boolean;
-  onRevoke: (provider: ConnectionProvider, connectionId: string) => void;
+  onRevoke: (provider: ConnectionProvider, row: ConnectionRecord) => void;
 }) {
   return (
     <RecordList label={`${label} connections`}>
@@ -453,11 +556,14 @@ function ConnectionRow({
   canManage: boolean;
   busy: boolean;
   removing: boolean;
-  onRevoke: (provider: ConnectionProvider, connectionId: string) => void;
+  onRevoke: (provider: ConnectionProvider, row: ConnectionRecord) => void;
 }) {
-  const { id, name, externalId, grantedAccess } = connection;
+  const { name, externalId, grantedAccess } = connection;
   const detail = removing ? "Being removed" : connection.attention;
-  const confirmRevoke = useCallback(() => onRevoke(provider, id), [onRevoke, provider, id]);
+  const confirmRevoke = useCallback(
+    () => onRevoke(provider, connection),
+    [onRevoke, provider, connection],
+  );
   const actions = useMemo(
     () =>
       canManage && !removing ? (
