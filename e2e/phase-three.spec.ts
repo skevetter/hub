@@ -1,4 +1,7 @@
+import { AxeBuilder } from "@axe-core/playwright";
+import { expect, type Page } from "@playwright/test";
 import { test } from "./app.js";
+import { projectApp } from "./helpers/projects/index.js";
 
 const alice = {
   name: "Alice",
@@ -23,7 +26,7 @@ test("connects verified providers per organization and disconnects through confi
   await hub.expectConnectedProviders("alice", {
     github: "acme-inc",
     installationId: "42",
-    discord: "acme-guild-discord",
+    discord: "Acme Guild",
     guildId: "100",
   });
 
@@ -31,7 +34,7 @@ test("connects verified providers per organization and disconnects through confi
   await hub.expectMemberConnectedProviders("bob", {
     github: "acme-inc",
     installationId: "42",
-    discord: "acme-guild-discord",
+    discord: "Acme Guild",
     guildId: "100",
   });
   await hub.expectMemberConnectionMutationDenied("bob");
@@ -43,7 +46,7 @@ test("connects verified providers per organization and disconnects through confi
   await hub.expectConnectedProviders("alice", {
     github: "orbit-inc",
     installationId: "84",
-    discord: "orbit-guild-discord",
+    discord: "Orbit Guild",
     guildId: "200",
   });
   await hub.proveTenantProviderDispatch("alice");
@@ -52,7 +55,7 @@ test("connects verified providers per organization and disconnects through confi
   await hub.expectConnectedProviders("alice", {
     github: "acme-inc",
     installationId: "42",
-    discord: "acme-guild-discord",
+    discord: "Acme Guild",
     guildId: "100",
   });
   await hub.disconnectProviders("alice");
@@ -69,11 +72,21 @@ test("locks organization switching while a provider disconnect is pending", asyn
   await hub.proveConnectionDisconnectLocksOrganizationSwitch("alice", "Orbit");
 });
 
-test("shows provider readiness as not configured without credentials", async ({ hub }) => {
-  await hub.proveProviderNotConfigured({
-    name: "Unconfigured Owner",
-    email: "unconfigured@example.com",
-    password: "unconfigured-phase-three-password",
+test.describe("without provider credentials", () => {
+  test.use({ providerScenario: "not-configured" });
+
+  test("shows the four provider states and hides instance setup from the organization owner", async ({
+    hub,
+    page,
+  }) => {
+    await hub.signUpAs("alice", alice);
+    await hub.createOrganization("alice", "Unconfigured");
+    await projectApp(page).navigation.openOrganizationSection("Connections");
+    const main = page.getByRole("main");
+    await expect(main.getByText("Not set up", { exact: true })).toHaveCount(4);
+    await expect(main.getByRole("button", { name: /Connect|Revoke/u })).toHaveCount(0);
+    await expect(main.getByRole("link", { name: /Set up the/u })).toHaveCount(0);
+    await expectAccessible(page);
   });
 });
 
@@ -130,9 +143,28 @@ test("locks account context while provider starts are pending", async ({ hub }) 
   });
 });
 
-test("shows a suspended GitHub connection", async ({ hub }) => {
+test("shows a suspended GitHub connection", async ({ hub, page }) => {
   await hub.signUpAs("alice", alice);
   await hub.createOrganization("alice", "Connection states");
   await hub.seedSuspendedGitHubConnection("Connection states");
-  await hub.expectSuspendedGitHubConnection("alice");
+  const { navigation, connections } = projectApp(page);
+  await navigation.openOrganizationSection("Connections");
+  const github = connections.card("GitHub");
+  await expect(github.getByText("Needs authorization", { exact: true })).toBeVisible();
+  await expect(github.getByRole("button", { name: "Reconnect GitHub" })).toBeVisible();
+  await github.getByRole("button", { name: /^Actions for /u }).click();
+  await page.getByRole("menuitem", { name: "Revoke" }).click();
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Revoke connection" }).click();
+  await expect(github.getByRole("listitem")).toHaveCount(0);
+  await expect(github.getByText("Not set up", { exact: true })).toBeVisible();
+  await expectAccessible(page);
 });
+
+async function expectAccessible(page: Page) {
+  const accessibility = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    .analyze();
+  expect(accessibility.violations).toEqual([]);
+}
