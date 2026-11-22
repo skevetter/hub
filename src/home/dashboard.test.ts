@@ -14,6 +14,7 @@ import {
   TEST_DAEMON_SLUG,
 } from "../test-utils/project-configuration.js";
 import { OrganizationTriggerStore } from "../triggers/store.js";
+import { compileTriggerDocument } from "../triggers/configuration/index.js";
 import { SLACK_REQUIRED_BOT_SCOPES } from "../providers/slack/client.js";
 import { HomeDashboard } from "./dashboard.js";
 import { HOME_OPEN_SESSIONS_LIMIT } from "./limits.js";
@@ -174,6 +175,60 @@ describe("home read model", () => {
     assert.deepEqual(
       snapshot.connections.map(({ needsAuthorization }) => needsAuthorization),
       [false],
+    );
+  });
+
+  it("reports a reply output only when the stored trigger event grants it", async () => {
+    const database = memberDatabase();
+    for (const [name, run] of [
+      ["agent-reply", triggerYaml.slice(triggerYaml.indexOf("run:\n"))],
+      [
+        "script-no-reply",
+        `run:
+  target: { daemon: ${TEST_DAEMON_SLUG}, cwd: /workspace }
+  script: echo hello
+`,
+      ],
+    ] as const) {
+      const yaml = `name: ${name}
+on:
+  github.issue_comment_created:
+    filters: { from_users: [octocat] }
+${run}`;
+      const compiled = compileTriggerDocument(yaml);
+      await database.saveOrganizationTrigger({
+        organizationId: "org-1",
+        name,
+        enabled: true,
+        format: "single_run",
+        yaml,
+        normalizedConfiguration: {
+          environments: [compiled.environment],
+          triggers: compiled.events,
+        },
+        contentHash: compiled.authoredHash,
+        sourceKind: "manual",
+        sourceEvidence: {},
+        createdByUserId: "user-1",
+        routes: [],
+      });
+    }
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
+    assert.partialDeepStrictEqual(
+      snapshot.triggers.find(({ name }) => name === "agent-reply"),
+      {
+        event: "github.issue_comment_created",
+        hasReplyOutput: true,
+      },
+    );
+    assert.equal(
+      Object.hasOwn(
+        snapshot.triggers.find(({ name }) => name === "script-no-reply") ?? {},
+        "hasReplyOutput",
+      ),
+      false,
     );
   });
 
