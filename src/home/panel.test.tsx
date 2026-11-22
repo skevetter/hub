@@ -4,12 +4,24 @@ import type * as ReactStart from "@tanstack/react-start";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it, vi } from "vitest";
+import type * as Alerts from "../components/app/failure-alert.js";
+import type { Snapshot } from "../queries/index.js";
 import type { HomeSnapshot } from "./dashboard.js";
 import { HomePanel, runHint } from "./panel.js";
 
-const view = vi.hoisted((): { snapshot?: HomeSnapshot; operator: boolean } => ({
-  operator: true,
-}));
+const view = vi.hoisted(
+  (): {
+    snapshot?: Snapshot<HomeSnapshot>;
+    operator: boolean;
+    sessionsEnabled: boolean;
+    onRetry?: () => void;
+    refetch: ReturnType<typeof vi.fn>;
+  } => ({
+    operator: true,
+    sessionsEnabled: false,
+    refetch: vi.fn(),
+  }),
+);
 
 vi.mock("@tanstack/react-start", async (importOriginal) => ({
   ...(await importOriginal<typeof ReactStart>()),
@@ -22,12 +34,25 @@ vi.mock("../projects/context.js", () => ({
   useRouteTenant: () => ({ account: { id: "user" }, organization: { id: "org", slug: "acme" } }),
 }));
 vi.mock("../auth/active-account.js", () => ({
-  useActiveAccount: () => ({ isInstanceOperator: view.operator }),
+  useActiveAccount: () => ({
+    isInstanceOperator: view.operator,
+    features: view.sessionsEnabled ? { interactiveSessions: true } : undefined,
+  }),
 }));
 vi.mock("../queries/index.js", () => ({
-  useSnapshotQuery: () => ({ status: "success", data: view.snapshot }),
+  useSnapshotQuery: () => ({ ...view.snapshot, refetch: view.refetch }),
 }));
 vi.mock("../interactive-sessions/ui/new-session.js", () => ({ HomeSessionStart: () => null }));
+vi.mock("../components/app/failure-alert.js", async (importOriginal) => {
+  const alerts = await importOriginal<typeof Alerts>();
+  return {
+    ...alerts,
+    FailureAlert: (props: Parameters<typeof alerts.FailureAlert>[0]) => {
+      if (props.onRetry !== undefined) view.onRetry = props.onRetry;
+      return <alerts.FailureAlert {...props} />;
+    },
+  };
+});
 
 const ready: HomeSnapshot = {
   organization: { id: "org", name: "Acme", slug: "acme" },
@@ -75,14 +100,43 @@ function tile(markup: string, label: string): string {
 }
 
 function renderHome(snapshot: HomeSnapshot, operator = true) {
+  return renderHomeQuery({ status: "success", data: snapshot, error: null }, operator);
+}
+
+function renderHomeQuery(
+  snapshot: Snapshot<HomeSnapshot>,
+  operator = true,
+  sessionsEnabled = false,
+) {
   view.snapshot = snapshot;
   view.operator = operator;
+  view.sessionsEnabled = sessionsEnabled;
   return renderToStaticMarkup(
     <QueryClientProvider client={new QueryClient()}>
       <HomePanel />
     </QueryClientProvider>,
   );
 }
+
+describe("Home query states", () => {
+  it("keeps the heading and offers a retry after a failed read", () => {
+    const markup = renderHomeQuery({ status: "error", data: undefined, error: null });
+    assert.match(markup, /<h1[^>]*>Home<\/h1>/u);
+    assert.match(markup, /role="alert"[\s\S]*Home unavailable/u);
+    assert.match(markup, /<p>Hub could not load this organization/u);
+    assert.match(markup, /<button[^>]*>Try again<\/button>/u);
+    assert.doesNotMatch(markup, /Overview/u);
+    assert.ok(view.onRetry);
+    view.onRetry();
+    assert.equal(view.refetch.mock.calls.length, 1);
+  });
+
+  it("keeps the Home heading and names its loading state", () => {
+    const markup = renderHomeQuery({ status: "pending", data: undefined, error: null });
+    assert.match(markup, /<h1[^>]*>Home<\/h1>/u);
+    assert.match(markup, /aria-label="Loading Home"/u);
+  });
+});
 
 describe("Home checklist", () => {
   it("shows one Finish setup button after all four steps for an operator", () => {
