@@ -3,6 +3,7 @@ import type * as ReactStart from "@tanstack/react-start";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
+import type { DroppedEventPresence } from "../db/types.js";
 import { OrganizationConnectionsPanel } from "../projects/panels.js";
 import type { ConnectionStatus } from "./functions.js";
 
@@ -70,12 +71,14 @@ function renderPanel({
   status = noApps,
   records = empty,
   pending = false,
+  linearDrops = "some",
 }: {
   manage?: boolean;
   operator?: boolean;
   status?: ConnectionStatus;
   records?: typeof connections;
   pending?: boolean;
+  linearDrops?: DroppedEventPresence;
 } = {}) {
   view.operator = operator;
   view.status = status;
@@ -84,7 +87,12 @@ function renderPanel({
     : {
         capabilities: { manageResources: manage },
         connections: records,
-        droppedConnectionEvents: { linear: 2, github: 0, slack: 0, discord: 0 },
+        droppedConnectionEvents: {
+          linear: linearDrops,
+          github: "none",
+          slack: "unknown",
+          discord: "none",
+        },
       };
   return renderToStaticMarkup(
     <QueryClientProvider client={new QueryClient()}>
@@ -111,7 +119,7 @@ describe("Connections cards", () => {
     expect(rendered).toMatch(/font-mono[^>]*>installation 123</u);
     expect(rendered).toContain("Connect GitHub");
     expect(rendered).toContain("Actions for acme");
-    expect(rendered).not.toContain("dropped events in the last 7 days");
+    expect(rendered).not.toContain("Dropped events in the last 7 days");
   });
 
   it("shows reauthorization, named workspace, access and filtered dropped events on Linear", () => {
@@ -125,9 +133,21 @@ describe("Connections cards", () => {
     expect(rendered).toContain("Reauthorize Linear");
     expect(rendered).toContain("read workspace data");
     expect(rendered).toContain("post comments");
-    expect(rendered).toContain("2 dropped events in the last 7 days");
+    expect(rendered).toContain("Dropped events in the last 7 days");
     expect(rendered).toMatch(/href="[^"]*view=dropped&amp;range=7d&amp;provider=linear"/u);
     expect(rendered).toContain("stay dropped after reconnecting");
+  });
+
+  it("omits dropped-event copy when the linked view is empty", () => {
+    const rendered = card(renderPanel({ records: connections, linearDrops: "none" }), "Linear");
+    expect(rendered).not.toMatch(/dropped/iu);
+  });
+
+  it("links to Activity without claiming drops when the bounded read is inconclusive", () => {
+    const rendered = card(renderPanel(), "Slack");
+    expect(rendered).toContain("Check dropped events in Activity");
+    expect(rendered).not.toContain("Dropped events in the last 7 days");
+    expect(rendered).toMatch(/href="[^"]*view=dropped&amp;range=7d&amp;provider=slack"/u);
   });
 
   it("shows a suspended installation as needing authorization with a Reconnect action", () => {

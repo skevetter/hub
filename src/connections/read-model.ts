@@ -1,28 +1,16 @@
-import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
-import type { Database, DroppedProviderEventCount } from "../db/types.js";
+import type { Database } from "../db/types.js";
 
 const WEEK_MS = 7 * 86_400_000;
 
 export async function readConnectionDrops(database: Database, organizationId: string) {
-  const groups = await database.countRecentDroppedEvents(
-    organizationId,
-    new Date(Date.now() - WEEK_MS),
-  );
-  const counts = new Map<DroppedProviderEventCount["provider"], number>();
-  let total = 0;
-  for (const { provider, count } of groups) {
-    counts.set(provider, (counts.get(provider) ?? 0) + count);
-    total += count;
-  }
-  return {
-    droppedConnectionEvents: {
-      linear: counts.get("linear") ?? 0,
-      github: counts.get("github") ?? 0,
-      slack: counts.get("slack") ?? 0,
-      discord: counts.get("discord") ?? 0,
-    },
-    droppedConnectionEventsCapped: total >= RECENT_DROP_COUNT_LIMIT,
-  };
+  const since = new Date(Date.now() - WEEK_MS);
+  const [linear, github, slack, discord] = await Promise.all([
+    database.readDroppedEventPresence(organizationId, "linear", since),
+    database.readDroppedEventPresence(organizationId, "github", since),
+    database.readDroppedEventPresence(organizationId, "slack", since),
+    database.readDroppedEventPresence(organizationId, "discord", since),
+  ]);
+  return { droppedConnectionEvents: { linear, github, slack, discord } };
 }
 
 const ACCESS_LABELS = {

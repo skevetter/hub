@@ -172,6 +172,7 @@ import type {
   OrganizationRunCount,
   OrganizationRunRecord,
   DroppedEventPageRequest,
+  DroppedEventPresence,
   ProjectTriggerRoute,
   MigrateProjectTriggersInput,
   OrganizationTriggerRecord,
@@ -221,6 +222,7 @@ import {
   mergeOverrides,
 } from "../entitlements/catalog.js";
 import {
+  DROPPED_EVENT_CANDIDATE_LIMIT,
   droppedEventProvider,
   groupDropCounts,
   RECENT_DROP_COUNT_LIMIT,
@@ -6563,6 +6565,27 @@ class MemoryDatabase implements Database {
           id === receipt.connectionId && organizationId === receipt.organizationId,
       )?.slug ?? null
     );
+  }
+
+  async readDroppedEventPresence(
+    organizationId: string,
+    provider: ConnectionProvider,
+    since: Date,
+  ): Promise<DroppedEventPresence> {
+    const candidates = [...this.providerEventReceipts.values()]
+      .filter(
+        (receipt) =>
+          receipt.organizationId === organizationId &&
+          receipt.provider === provider &&
+          receipt.receivedAt >= since &&
+          receipt.droppedReason !== null,
+      )
+      .sort((a, b) => compareRunsNewestFirst(receiptOrder(a), receiptOrder(b)))
+      .slice(0, DROPPED_EVENT_CANDIDATE_LIMIT);
+    if (candidates.some(({ id }) => !this.triggerRunIdsByProviderEventReceipt.has(id))) {
+      return "some";
+    }
+    return candidates.length === DROPPED_EVENT_CANDIDATE_LIMIT ? "unknown" : "none";
   }
 
   async countRecentDroppedEvents(organizationId: string, since: Date) {
