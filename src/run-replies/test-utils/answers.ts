@@ -28,6 +28,8 @@ const blocks: Array<(n: number) => string> = [
     `\`\`\`diff\n--- a/src/config${n}.ts\n+++ b/src/config${n}.ts\n@@ -${n},3 +${n},4 @@\n-const limit = 10;\n+const limit = Number(process.env.LIMIT ?? 10);\n+export const names: Array<string | null> = [];\n\`\`\`\n`,
   (n) =>
     `\`\`\`tsx\nexport function Row${n}({ items }: { items: Array<{ id: string; label: string }> }) {\n  return (\n    <ul>\n      {items.map((item) => (\n        <li key={item.id}>{item.label}</li>\n      ))}\n    </ul>\n  );\n}\n\`\`\`\n`,
+  (n) =>
+    `Tracked in [issue ${n} on Linear](https://linear.app/acme/issue/ENG-${n}/fix-login-redirect-loop?comment=xyz). CI: [run ${n}](https://github.com/getpaseo/hub/actions/runs/19283746${n}/job/54839201).\n`,
 ];
 
 const intros = [

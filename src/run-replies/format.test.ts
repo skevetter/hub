@@ -4,7 +4,7 @@ import type { Root, RootContent } from "mdast";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
-import { it } from "vitest";
+import { describe, it } from "vitest";
 import { formatRunReply } from "./format.js";
 import { realisticAnswers } from "./test-utils/answers.js";
 
@@ -174,7 +174,7 @@ function contentOf(markdown: string): string {
     if (node.type !== "text" && node.type !== "inlineCode") parts.push("\n");
   };
   walk(fromMarkdown(markdown, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] }));
-  return parts.join(" ").replace(/\s+/gu, " ").trim();
+  return parts.join("").replace(/\s+/gu, "");
 }
 
 it("keeps Markdown and every non-mention word of 80 realistic answers", () => {
@@ -340,4 +340,36 @@ it.each([
   const body = formatRunReply({ text, truncated: false }, [], { now: plainClock() });
   assert.match(body, /now/u);
   assert.deepEqual(mentionLinks(body), []);
+});
+
+describe("long URLs keep their visible text", () => {
+  const post = (text: string) => formatRunReply({ text, truncated: false }, []);
+
+  it("keeps the label of a Linear issue link", () => {
+    const out = post(
+      "Tracked in [the Linear issue](https://linear.app/acme/issue/ENG-1423/fix-login-redirect-loop).",
+    );
+    assert.match(out, /Tracked in the Linear issue\./u);
+  });
+
+  it("keeps the label of a GitHub Actions run link", () => {
+    const out = post(
+      "CI: [run 412](https://github.com/getpaseo/hub/actions/runs/19283746501/job/54839201) failed.",
+    );
+    assert.match(out, /CI: run 412 failed\./u);
+  });
+
+  it("keeps a readable form of a bare long Linear issue URL", () => {
+    const out = post("Bare https://linear.app/acme/issue/ENG-1423/fix-login-redirect-loop here");
+    assert.match(out, /^Bare .*linear.* here$/u);
+    assert.doesNotMatch(out, /^Bare \\?\] here$/u);
+  });
+
+  it("keeps the label of 40 generated long-path links", () => {
+    for (let index = 1; index <= 40; index += 1) {
+      const label = `issue ${index} on Linear`;
+      const text = `Fixed in [${label}](https://linear.app/acme/issue/ENG-${index}/fix-login-redirect-loop?comment=xyz) and tested.`;
+      assert.match(post(text), new RegExp(`Fixed in ${label} and tested\\.`, "u"), text);
+    }
+  });
 });

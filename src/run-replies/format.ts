@@ -310,7 +310,7 @@ function hasUnsafeNode(text: string): boolean {
   try {
     const pending: Array<Root | RootContent> = [parseMarkdown(text)];
     for (const node of pending) {
-      if (node.type !== "root" && removeNode(node)) return true;
+      if (node.type !== "root" && removeNode(node, true)) return true;
       if ("children" in node) pending.push(...node.children);
     }
     return false;
@@ -333,15 +333,11 @@ function sanitizeMarkdown(markdown: Root): void {
   for (const parent of pending) {
     for (let index = parent.children.length - 1; index >= 0; index -= 1) {
       const node = parent.children[index]!;
-      if (node.type === "link" && node.url.startsWith("mailto:") && node.children.length === 1) {
-        const label = node.children[0];
-        if (label?.type === "text") {
-          parent.children.splice(index, 1, {
-            type: "text",
-            value: neutralizeMentions(label.value),
-          });
-          continue;
-        }
+      if (node.type === "link" && (!safeLink(node.url) || node.url.includes("[redacted]"))) {
+        // Keep the label; a redacted or unsafe destination is not worth the whole sentence.
+        parent.children.splice(index, 1, ...node.children);
+        index += node.children.length;
+        continue;
       }
       if (removeNode(node)) {
         parent.children.splice(index, 1);
@@ -365,9 +361,11 @@ function sanitizeMarkdown(markdown: Root): void {
   }
 }
 
-function removeNode(node: RootContent): boolean {
+function removeNode(node: RootContent, tolerateUnparseable = false): boolean {
   if (node.type === "image" || node.type === "imageReference" || node.type === "html") return true;
-  return (node.type === "link" || node.type === "definition") && !safeLink(node.url);
+  return (
+    (node.type === "link" || node.type === "definition") && !safeLink(node.url, tolerateUnparseable)
+  );
 }
 
 // GFM links a "www." or scheme at any punctuation boundary, including inside a longer URL that
@@ -409,14 +407,23 @@ function hasSafeProse(serialized: string): boolean {
   return neutralizeMentions(prose) === prose;
 }
 
-function safeLink(value: string): boolean {
+function safeLink(value: string, tolerateUnparseable = false): boolean {
   if (value.replace(MENTION_SIGN, "") !== value) return false;
   const url = URL.parse(value);
-  if (url === null || !["https:", "http:"].includes(url.protocol) || url.username || url.password)
-    return false;
+  // A destination no URL parser accepts cannot be a profile link unless it spells one out.
+  if (url === null) return tolerateUnparseable && !spellsMentionLink(value);
+  if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) return false;
   const host = url.hostname.replace(/\.$/u, "");
   if (host !== "linear.app" && !host.endsWith(".linear.app")) return true;
   return !isLinearMentionPath(url.pathname);
+}
+
+function spellsMentionLink(value: string): boolean {
+  let text = cleanSource(decodeString(value));
+  try {
+    text = decodeURIComponent(text);
+  } catch {}
+  return /linear\.app.*\/(?:profiles|users|agents)(?:\/|$)/iu.test(text.normalize("NFKC"));
 }
 
 function isLinearMentionPath(path: string): boolean {
