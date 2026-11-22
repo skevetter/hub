@@ -30,7 +30,7 @@ export class OrganizationHome {
 
   step(title: ChecklistStepTitle): Locator {
     return this.page
-      .getByRole("list", { name: "Get started" })
+      .getByRole("list", { name: "Getting started" })
       .getByRole("listitem")
       .filter({ hasText: title });
   }
@@ -40,7 +40,9 @@ export class OrganizationHome {
   }
 
   async expectProgress(progress: string) {
-    await expect(this.page.getByRole("button", { name: /Get started/u })).toContainText(progress);
+    await expect(this.page.getByRole("button", { name: /Getting started/u })).toContainText(
+      progress,
+    );
   }
 
   allSet() {
@@ -52,7 +54,7 @@ export class OrganizationHome {
   }
 
   async expectChecklistHidden() {
-    await expect(this.page.getByRole("button", { name: /Get started/u })).toHaveCount(0);
+    await expect(this.page.getByRole("button", { name: /Getting started/u })).toHaveCount(0);
     await expect(this.allSet()).toHaveCount(0);
     await expect(this.finishSetup()).toHaveCount(0);
   }
@@ -88,7 +90,7 @@ export class OrganizationHome {
   }
 
   async expectRuns(count: number, outcomes: string) {
-    const tile = this.page.getByText("Runs", { exact: true }).locator("..").locator("..");
+    const tile = this.page.getByText("Runs, 24 hours", { exact: true }).locator("..").locator("..");
     await expect(tile).toContainText(String(count));
     await expect(tile).toContainText(outcomes);
   }

@@ -8,6 +8,7 @@ const nothing: ChecklistFacts = {
   daemons: [],
   triggers: [],
   runs: [],
+  sessions: null,
 };
 
 function states(facts: ChecklistFacts) {
@@ -32,7 +33,9 @@ describe("the onboarding checklist", () => {
   it("marks the app step done by a connection, whatever the app situation", () => {
     const snapshot = {
       ...nothing,
-      connections: [{ provider: "github" as const, slug: "acme", label: "acme" }],
+      connections: [
+        { provider: "github" as const, slug: "acme", label: "acme", needsAuthorization: false },
+      ],
     };
     assert.equal(states(snapshot)[0], "done");
     assert.equal(states({ ...snapshot, appsConfigured: false })[0], "done");
@@ -48,9 +51,10 @@ describe("the onboarding checklist", () => {
   it("completes and counts once a trigger exists and has run", () => {
     const checklist = deriveChecklist({
       appsConfigured: true,
-      connections: [{ provider: "slack", slug: "acme", label: "Acme" }],
+      connections: [{ provider: "slack", slug: "acme", label: "Acme", needsAuthorization: false }],
       daemons: [{ id: "2", slug: "devbox", presence: "connected", canExecute: true }],
       triggers: [{ id: "t", name: "slack-help", event: "slack.mention", enabled: true }],
+      sessions: null,
       runs: [
         {
           id: "r",
@@ -65,5 +69,32 @@ describe("the onboarding checklist", () => {
     });
     assert.equal(checklist.completed, 4);
     assert.equal(checklist.complete, true);
+  });
+
+  it("keeps the four automation steps, in order, while sessions are off", () => {
+    assert.deepEqual(
+      deriveChecklist(nothing).steps.map(({ key }) => key),
+      ["app", "daemon", "trigger", "run"],
+    );
+  });
+
+  it("leads with the daemon and adds the two session steps when sessions are on", () => {
+    const sessions = { profiles: 0, open: 0, openCapped: false, started: false };
+    const checklist = deriveChecklist({ ...nothing, sessions });
+    assert.deepEqual(
+      checklist.steps.map(({ key }) => key),
+      ["daemon", "profile", "session", "app", "trigger", "run"],
+    );
+    assert.equal(checklist.complete, false);
+
+    const underway = deriveChecklist({
+      ...nothing,
+      sessions: { ...sessions, profiles: 1, started: true },
+    });
+    assert.deepEqual(
+      underway.steps.filter(({ state }) => state === "done").map(({ key }) => key),
+      ["profile", "session"],
+    );
+    assert.equal(underway.completed, 2);
   });
 });

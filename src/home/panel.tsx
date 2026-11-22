@@ -4,11 +4,17 @@ import { useSnapshotQuery } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { Cpu, History, Sparkles } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { MessagesSquare } from "lucide-react";
+import { useMemo, useState, type ReactNode } from "react";
 
 import { useActiveAccount } from "../auth/active-account.js";
 import { Card, CardSkeleton } from "../components/app/card.js";
+import {
+  Checklist,
+  ChecklistItem,
+  ChecklistProgress,
+  type ChecklistItemState,
+} from "../components/app/checklist.js";
 import { CopyField } from "../components/app/copy-field.js";
 import { Disclosure } from "../components/app/disclosure.js";
 import { EmptyState } from "../components/app/empty-state.js";
@@ -17,10 +23,12 @@ import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
-import { StatGrid, StatTile } from "../components/app/stat-tile.js";
+import { SegmentedControl } from "../components/app/segmented-control.js";
+import { StatGrid, StatTile, StatTileSkeleton } from "../components/app/stat-tile.js";
 import { StatusPill, statusLabel, type StatusTone } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
+import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "../daemons/handoff.js";
 import { queryState } from "../projects/panel-state.js";
 import { HomeSessionStart } from "../interactive-sessions/ui/new-session.js";
@@ -28,10 +36,18 @@ import { useRouteTenant } from "../projects/context.js";
 import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
 import { DROP_REASON_GROUPS, type DropReasonGroup } from "../triggers/drop-reason.js";
 import { LIST_PROVIDER_LABELS } from "../triggers/list-providers.js";
-import { deriveChecklist, type Checklist, type ChecklistStep } from "./checklist.js";
+import {
+  deriveChecklist,
+  type Checklist as ChecklistState,
+  type ChecklistStep,
+} from "./checklist.js";
+import type { RunTally } from "./dashboard.js";
 import { finishHomeSetup, homeSnapshot, type HomeSnapshot } from "./functions.js";
+import { HOME_MONTH_DAYS } from "./limits.js";
+import { memberFlagKey, useMemberFlag } from "./member-preference.js";
+import { thingsToTry, type TrySurfaceKey } from "./things-to-try.js";
 
-const HOME_DESCRIPTION = "What to do next, and what has run.";
+const HOME_DESCRIPTION = "What is running, what needs you, and what to try next.";
 const RECENT_RUNS_SHOWN = 5;
 
 export function HomePanel() {
@@ -49,6 +65,7 @@ export function HomePanel() {
     <HomeView
       key={home.data.organization.id}
       data={home.data}
+      accountId={tenant.account.id}
       operator={account.isInstanceOperator}
       sessionsEnabled={account.features?.interactiveSessions === true}
     />
@@ -57,10 +74,12 @@ export function HomePanel() {
 
 function HomeView({
   data,
+  accountId,
   operator,
   sessionsEnabled,
 }: {
   data: HomeSnapshot;
+  accountId: string;
   operator: boolean;
   sessionsEnabled: boolean;
 }) {
@@ -69,40 +88,24 @@ function HomeView({
   return (
     <>
       <PageHeader title="Home" description={HOME_DESCRIPTION} focusOnMount={focusOnCompletion} />
-      {sessionsEnabled ? <HomeSessionStart organizationSlug={data.organization.slug} /> : null}
+      <NeedsAttention data={data} base={base} />
+      <Section>
+        <HomeTiles data={data} />
+      </Section>
       {data.checklistCompletedAt === null ? (
         <HomeChecklist
           snapshot={data}
           base={base}
+          accountId={accountId}
           operator={operator}
           onFinished={() => setFocusOnCompletion(true)}
         />
       ) : null}
-      <DroppedEventNotices data={data} />
-      <Section title="Overview" description={`The last ${String(data.windowDays)} days.`}>
-        <StatGrid>
-          <StatTile
-            label="Runs"
-            icon={History}
-            value={String(data.runs.length)}
-            detail={runOutcomes(data.runs)}
-          />
-          <StatTile
-            label="Daemons connected"
-            icon={Cpu}
-            value={String(data.daemons.filter(({ presence }) => presence === "connected").length)}
-            detail={daemonDetail(data.daemons)}
-          />
-          <StatTile
-            label="Agents used"
-            icon={Sparkles}
-            value={String(agentsUsed(data.runs).length)}
-            detail={agentDetail(agentsUsed(data.runs))}
-          />
-        </StatGrid>
-      </Section>
+      {sessionsEnabled ? <HomeSessionStart organizationSlug={data.organization.slug} /> : null}
+      <ThingsToTry snapshot={data} base={base} />
       <Section
         title="Recent runs"
+        description={`The last ${String(data.windowDays)} days.`}
         action={
           <Button variant="link" asChild>
             <Link to={`${base}/activity` as never}>View all</Link>
@@ -138,44 +141,47 @@ function HomeView({
           </RecordList>
         )}
       </Section>
-      <Section
-        title="Daemons"
-        action={
-          <Button variant="link" asChild>
-            <Link to={`${base}/daemons` as never}>Manage</Link>
-          </Button>
-        }
-      >
-        {data.daemons.length === 0 ? (
-          <EmptyState
-            title="No daemons"
-            description={
-              data.checklistCompletedAt === null
-                ? "Hub runs your triggers on machines you own. The checklist above has the command."
-                : "Connect a daemon to run your triggers on a machine you own."
-            }
-          />
-        ) : (
-          <RecordList label="Daemons">
-            {data.daemons.map((daemon) => (
-              <RecordRow
-                key={daemon.id}
-                status={
-                  <StatusPill tone={daemon.presence === "connected" ? "success" : "neutral"}>
-                    {daemon.presence === "connected" ? "Connected" : "Offline"}
-                  </StatusPill>
-                }
-              >
-                <TwoLine
-                  primary={daemon.slug}
-                  secondary={daemon.canExecute ? "Hub automations" : "Connected only"}
-                />
-              </RecordRow>
-            ))}
-          </RecordList>
-        )}
-      </Section>
     </>
+  );
+}
+
+/**
+ * The figures a reader checks first. Runs are counted over rolling windows because the server
+ * does not know the reader's midnight; sessions are the reader's own, and absent while off.
+ */
+function HomeTiles({ data }: { data: HomeSnapshot }) {
+  const { sessions } = data;
+  const enabled = data.triggers.filter((trigger) => trigger.enabled).length;
+  return (
+    <StatGrid columns={sessions === null ? 4 : 5}>
+      <StatTile
+        label="Runs, 24 hours"
+        value={String(data.runCounts.day.total)}
+        detail={runOutcomes(data.runCounts.day)}
+      />
+      <StatTile
+        label={`Runs, ${String(HOME_MONTH_DAYS)} days`}
+        value={String(data.runCounts.month.total)}
+        detail={runOutcomes(data.runCounts.month)}
+      />
+      <StatTile
+        label="Active triggers"
+        value={String(enabled)}
+        detail={triggerDetail(data.triggers.length, enabled)}
+      />
+      <StatTile
+        label="Daemons connected"
+        value={String(data.daemons.filter(({ presence }) => presence === "connected").length)}
+        detail={daemonDetail(data.daemons)}
+      />
+      {sessions === null ? null : (
+        <StatTile
+          label="Open sessions"
+          value={`${String(sessions.open)}${sessions.openCapped ? "+" : ""}`}
+          detail={sessions.profiles === 1 ? "1 profile" : `${String(sessions.profiles)} profiles`}
+        />
+      )}
+    </StatGrid>
   );
 }
 
@@ -183,22 +189,161 @@ function HomeLoading() {
   return (
     <div aria-busy="true" aria-label="Loading overview">
       <PageHeaderSkeleton description={HOME_DESCRIPTION} />
-      <div className="grid gap-6">
+      <div className="grid gap-8">
+        <StatGrid columns={4}>
+          <StatTileSkeleton />
+          <StatTileSkeleton />
+          <StatTileSkeleton />
+          <StatTileSkeleton />
+        </StatGrid>
         <CardSkeleton lines={4} />
-        <CardSkeleton lines={2} />
+        <CardSkeleton lines={3} />
       </div>
     </div>
+  );
+}
+
+const PROVIDER_NAMES = { github: "GitHub", slack: "Slack", discord: "Discord", linear: "Linear" };
+
+/**
+ * Only what the reader has to act on, each with the one place to act. Nothing here is a state
+ * report: a daemon that is offline while nothing depends on it is not a problem.
+ */
+function NeedsAttention({ data, base }: { data: HomeSnapshot; base: string }) {
+  const providers = [
+    ...new Set(
+      data.connections
+        .filter(({ needsAuthorization }) => needsAuthorization)
+        .map(({ provider }) => provider),
+    ),
+  ];
+  const daemons = daemonAttention(data);
+  return (
+    <>
+      {providers.map((provider) => {
+        const names = data.connections
+          .filter((connection) => connection.provider === provider && connection.needsAuthorization)
+          .map(({ label }) => label)
+          .join(", ");
+        return (
+          <WarningAlert
+            key={provider}
+            standalone
+            title={`${PROVIDER_NAMES[provider]} needs authorization`}
+            action={
+              <Button asChild variant="outline" size="sm">
+                <Link to={`${base}/connections` as never}>Open connections</Link>
+              </Button>
+            }
+          >
+            <p>
+              Hub cannot use {names} until an organization owner authorizes it again. Events from it
+              are not handled in the meantime.
+            </p>
+          </WarningAlert>
+        );
+      })}
+      {daemons === undefined ? null : (
+        <WarningAlert
+          standalone
+          title={daemons.title}
+          action={
+            <Button asChild variant="outline" size="sm">
+              <Link to={`${base}/daemons` as never}>View daemons</Link>
+            </Button>
+          }
+        >
+          <p>{daemons.message}</p>
+        </WarningAlert>
+      )}
+      <DroppedEventNotices data={data} />
+    </>
+  );
+}
+
+/** Work is waiting on a daemon only when something would use one: a trigger or a profile. */
+function daemonAttention(data: HomeSnapshot): { title: string; message: string } | undefined {
+  const waiting =
+    data.triggers.some(({ enabled }) => enabled) || (data.sessions?.profiles ?? 0) > 0;
+  if (!waiting || data.daemons.length === 0) return undefined;
+  const able = data.daemons.filter(({ canExecute }) => canExecute);
+  if (able.some(({ presence }) => presence === "connected")) return undefined;
+  if (able.length === 0) {
+    return {
+      title: "No daemon may run agents",
+      message:
+        "Every enrolled daemon is connected only. Triggers and sessions cannot start an agent until one is allowed to run Hub automations.",
+    };
+  }
+  const names = able.map(({ slug }) => slug).join(", ");
+  return {
+    title: able.length === 1 ? "Your daemon is offline" : "Every daemon is offline",
+    message: `${names} ${able.length === 1 ? "is" : "are"} not connected. Triggers and sessions wait until ${able.length === 1 ? "it reconnects" : "one reconnects"}.`,
+  };
+}
+
+function ThingsToTry({ snapshot, base }: { snapshot: HomeSnapshot; base: string }) {
+  const surfaces = useMemo(() => thingsToTry(snapshot), [snapshot]);
+  const [selected, setSelected] = useState<TrySurfaceKey>("linear");
+  const surface = surfaces.find(({ key }) => key === selected) ?? surfaces[0];
+  const options = useMemo(
+    () =>
+      surfaces.map(({ key, label }) => ({
+        value: key,
+        label,
+        icon: key === "sessions" ? MessagesSquare : <ProviderGlyph provider={key} />,
+      })),
+    [surfaces],
+  );
+  if (surface === undefined) return null;
+  return (
+    <Section>
+      <Card
+        title="Things to try"
+        description="Pick an example, copy the prompt, and send it where your team works."
+      >
+        <SegmentedControl
+          label="Where to try it"
+          value={surface.key}
+          options={options}
+          onChange={(value) => setSelected(value as TrySurfaceKey)}
+        />
+        <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          <p className="min-w-0 flex-1 basis-64 text-sm text-muted-foreground">{surface.where}</p>
+          {surface.next === undefined ? null : (
+            <Button asChild variant="outline" size="sm">
+              <Link to={`${base}/${surface.next.path}` as never}>{surface.next.label}</Link>
+            </Button>
+          )}
+        </div>
+        <ul aria-label={`${surface.label} examples`} className="grid gap-4">
+          {surface.examples.map((example) => (
+            <li key={example.title} className="grid min-w-0 gap-1.5">
+              <CopyField
+                prose
+                label={example.title}
+                value={example.prompt}
+                copyLabel={`Copy the prompt: ${example.title}`}
+              />
+              <p className="text-xs text-muted-foreground">{example.description}</p>
+            </li>
+          ))}
+        </ul>
+      </Card>
+    </Section>
   );
 }
 
 function HomeChecklist({
   snapshot,
   base,
+  accountId,
   operator,
   onFinished,
 }: {
   snapshot: HomeSnapshot;
   base: string;
+  accountId: string;
   operator: boolean;
   onFinished: () => void;
 }) {
@@ -238,8 +383,8 @@ function HomeChecklist({
           title="You are all set"
           description={
             operator
-              ? "All four setup steps are complete."
-              : "An instance operator can finish setup."
+              ? "Every setup step is complete. Finishing hides this card for the whole organization."
+              : "Every setup step is complete. An instance operator can finish setup."
           }
           action={
             operator ? (
@@ -254,7 +399,13 @@ function HomeChecklist({
           }
         />
       ) : (
-        <GetStarted checklist={checklist} snapshot={snapshot} base={base} operator={operator} />
+        <GetStarted
+          checklist={checklist}
+          snapshot={snapshot}
+          base={base}
+          accountId={accountId}
+          operator={operator}
+        />
       )}
     </Section>
   );
@@ -264,14 +415,20 @@ function GetStarted({
   checklist,
   snapshot,
   base,
+  accountId,
   operator,
 }: {
-  checklist: Checklist;
+  checklist: ChecklistState;
   snapshot: HomeSnapshot;
   base: string;
+  accountId: string;
   operator: boolean;
 }) {
-  const [open, setOpen] = useState(true);
+  // Minimizing is the member's own choice, so it is remembered for them and nobody else.
+  const [open, setOpen] = useMemberFlag(
+    memberFlagKey("getting-started-open", snapshot.organization.id, accountId),
+    true,
+  );
   const progress = `${String(checklist.completed)} of ${String(checklist.steps.length)} done`;
   // The address the reader reached this Hub at is the address their daemon has to be told. Home
   // is a route, so it can be rendered on the server, where there is no window: the command is
@@ -282,18 +439,29 @@ function GetStarted({
       id="get-started"
       open={open}
       onOpenChange={setOpen}
-      title="Get started"
-      description="Connect an app and a daemon, create a trigger, and run it."
+      title="Getting started"
+      description={
+        snapshot.sessions === null
+          ? "Connect an app and a daemon, create a trigger, and run it."
+          : "Connect a daemon, talk to an agent on it, then let events start one."
+      }
       status={<StatusPill tone="neutral">{progress}</StatusPill>}
     >
-      <RecordList label="Get started">
-        {checklist.steps.map((step) => (
-          <StepRow
-            key={step.key}
-            {...stepPresentation(step, snapshot, { base, operator, origin })}
-          />
-        ))}
-      </RecordList>
+      <div className="grid gap-4">
+        <ChecklistProgress
+          label="Getting started progress"
+          done={checklist.completed}
+          total={checklist.steps.length}
+        />
+        <Checklist label="Getting started">
+          {checklist.steps.map((step) => (
+            <StepRow
+              key={step.key}
+              {...stepPresentation(step, snapshot, { base, operator, origin })}
+            />
+          ))}
+        </Checklist>
+      </div>
     </Disclosure>
   );
 }
@@ -308,17 +476,26 @@ interface StepPresentation {
   command?: { label: string; value: string };
 }
 
+const STEP_STATES: Record<StatusTone, ChecklistItemState> = {
+  success: "done",
+  neutral: "todo",
+  warning: "attention",
+  danger: "attention",
+};
+
 function StepRow({ title, hint, status, action, command }: StepPresentation) {
   return (
-    <RecordRow
-      status={<StatusPill tone={status.tone}>{status.label}</StatusPill>}
-      {...(action === undefined ? {} : { actions: action })}
+    <ChecklistItem
+      state={STEP_STATES[status.tone]}
+      stateLabel={status.label}
+      title={title}
+      hint={hint}
+      {...(action === undefined ? {} : { action })}
     >
-      <div className="grid min-w-0 gap-2">
-        <TwoLine primary={title} secondary={hint} />
-        {command === undefined ? null : <CopyField label={command.label} value={command.value} />}
-      </div>
-    </RecordRow>
+      {command === undefined ? undefined : (
+        <CopyField label={command.label} value={command.value} />
+      )}
+    </ChecklistItem>
   );
 }
 
@@ -341,7 +518,66 @@ function stepPresentation(
   if (step.key === "app") return appStep(step.state, snapshot, context.base, context.operator);
   if (step.key === "daemon") return daemonStep(step.state, snapshot, context.origin);
   if (step.key === "trigger") return triggerStep(step.state, snapshot, context.base);
+  if (step.key === "profile") return profileStep(step.state, snapshot, context.base);
+  if (step.key === "session") return sessionStep(step.state, snapshot, context.base);
   return runStep(step.state, snapshot, context.base);
+}
+
+function profileStep(
+  state: "done" | "pending",
+  snapshot: HomeSnapshot,
+  base: string,
+): StepPresentation {
+  const title = "Create a session profile";
+  const profiles = snapshot.sessions?.profiles ?? 0;
+  if (state === "done") {
+    return {
+      title,
+      hint: profiles === 1 ? "1 profile" : `${String(profiles)} profiles`,
+      status: DONE,
+    };
+  }
+  return {
+    title,
+    hint: "A profile is the daemon, folder and agent a session starts from.",
+    status: TO_DO,
+    action: (
+      <Button asChild variant="outline" size="sm">
+        <Link to={`${base}/sessions/profiles` as never}>Create a profile</Link>
+      </Button>
+    ),
+  };
+}
+
+function sessionStep(
+  state: "done" | "pending",
+  snapshot: HomeSnapshot,
+  base: string,
+): StepPresentation {
+  const title = "Start a session";
+  const sessions = snapshot.sessions;
+  if (state === "done") {
+    const open = sessions?.open ?? 0;
+    return {
+      title,
+      hint: open === 0 ? "You have talked to an agent here." : `${String(open)} open now`,
+      status: DONE,
+    };
+  }
+  return {
+    title,
+    hint: "Send a first message and watch the agent work on your daemon.",
+    status: TO_DO,
+    ...((sessions?.profiles ?? 0) > 0
+      ? {
+          action: (
+            <Button asChild variant="outline" size="sm">
+              <Link to={`${base}/sessions/new` as never}>New session</Link>
+            </Button>
+          ),
+        }
+      : {}),
+  };
 }
 
 function appStep(
@@ -362,8 +598,8 @@ function appStep(
     return {
       title,
       hint: operator
-        ? "This Hub has no GitHub, Slack, or Discord app yet. Set one up first."
-        : "This Hub has no GitHub, Slack, or Discord app yet. Ask whoever runs it to set one up.",
+        ? "This Hub has no Linear, GitHub, Slack, or Discord app yet. Set one up first."
+        : "This Hub has no Linear, GitHub, Slack, or Discord app yet. Ask whoever runs it to set one up.",
       status: { label: "Needs setup", tone: "warning" },
       ...(operator
         ? {
@@ -378,7 +614,7 @@ function appStep(
   }
   return {
     title,
-    hint: "GitHub, Slack, or Discord: the place events come from.",
+    hint: "Linear, GitHub, Slack, or Discord: the place events come from.",
     status: TO_DO,
     action: (
       <Button asChild variant="outline" size="sm">
@@ -541,12 +777,8 @@ function DroppedEventNotices({ data }: { data: HomeSnapshot }) {
   });
 }
 
-function runOutcomes(runs: HomeSnapshot["runs"]): string {
-  const succeeded = runs.filter(({ status }) => status === "succeeded").length;
-  const failed = runs.filter(
-    ({ status }) => status === "failed" || status === "timed_out" || status === "rejected",
-  ).length;
-  return `${String(succeeded)} succeeded · ${String(failed)} failed`;
+function runOutcomes({ succeeded, failed }: RunTally): string {
+  return `${String(succeeded)} succeeded \u00b7 ${String(failed)} failed`;
 }
 
 function runTone(status: HomeSnapshot["runs"][number]["status"]): StatusTone {
@@ -555,25 +787,13 @@ function runTone(status: HomeSnapshot["runs"][number]["status"]): StatusTone {
   return "neutral";
 }
 
+function triggerDetail(total: number, enabled: number): string {
+  if (total === 0) return "None yet";
+  const paused = total - enabled;
+  return paused === 0 ? "None paused" : `${String(paused)} paused`;
+}
+
 function daemonDetail(daemons: HomeSnapshot["daemons"]): string {
   const cannot = daemons.filter(({ canExecute }) => !canExecute).length;
-  return `${String(daemons.length)} enrolled${cannot === 0 ? "" : ` · ${String(cannot)} cannot run agents`}`;
-}
-
-function agentsUsed(runs: HomeSnapshot["runs"]): string[] {
-  return [
-    ...new Set(
-      runs.flatMap(({ agent }) =>
-        agent === null
-          ? []
-          : [agent.model === null ? agent.provider : `${agent.provider}/${agent.model}`],
-      ),
-    ),
-  ];
-}
-
-function agentDetail(agents: readonly string[]): string {
-  if (agents.length === 0) return "None yet";
-  const shown = agents.slice(0, 3).join(", ");
-  return agents.length > 3 ? `${shown} and ${String(agents.length - 3)} more` : shown;
+  return `${String(daemons.length)} enrolled${cannot === 0 ? "" : ` \u00b7 ${String(cannot)} cannot run agents`}`;
 }

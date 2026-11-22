@@ -13,6 +13,7 @@ import {
   TEST_DAEMON_SLUG,
 } from "../test-utils/project-configuration.js";
 import { OrganizationTriggerStore } from "../triggers/store.js";
+import { SLACK_REQUIRED_BOT_SCOPES } from "../providers/slack/client.js";
 import { HomeDashboard } from "./dashboard.js";
 
 const NOW = new Date("2026-09-21T12:00:00.000Z");
@@ -22,12 +23,9 @@ const request = new Request("https://hub.test/o/acme/home");
 describe("home read model", () => {
   it("describes a fresh organization as nothing connected and nothing run", async () => {
     const database = memberDatabase({ slack: false });
-    const snapshot = await new HomeDashboard(
-      database,
-      accountAuth(),
-      APPS_CONFIGURED,
-      () => NOW,
-    ).snapshot(request, "acme");
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
 
     assert.equal(snapshot.appsConfigured, true);
     assert.deepEqual(snapshot.connections, []);
@@ -51,15 +49,12 @@ describe("home read model", () => {
     await recordRun(database, trigger.runtimeProjectId, "first", "succeeded", 120_000);
     await recordRun(database, trigger.runtimeProjectId, "second", "failed", 60_000);
 
-    const snapshot = await new HomeDashboard(
-      database,
-      accountAuth(),
-      APPS_CONFIGURED,
-      () => NOW,
-    ).snapshot(request, "acme");
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
 
     assert.deepEqual(snapshot.connections, [
-      { provider: "slack", slug: "acme-slack", label: "Acme Slack" },
+      { provider: "slack", slug: "acme-slack", label: "Acme Slack", needsAuthorization: true },
     ]);
     assert.deepEqual(snapshot.daemons, [
       { id: TEST_DAEMON_ID, slug: TEST_DAEMON_SLUG, presence: "connected", canExecute: true },
@@ -112,12 +107,9 @@ describe("home read model", () => {
       "schedule.tick",
     );
 
-    const snapshot = await new HomeDashboard(
-      database,
-      accountAuth(),
-      APPS_CONFIGURED,
-      () => NOW,
-    ).snapshot(request, "acme");
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
 
     assert.deepEqual(
       snapshot.runs.map(({ triggerName }) => triggerName),
@@ -137,17 +129,106 @@ describe("home read model", () => {
       "trigger_filters_rejected",
     );
 
-    const snapshot = await new HomeDashboard(
-      database,
-      accountAuth(),
-      APPS_CONFIGURED,
-      () => NOW,
-    ).snapshot(request, "acme");
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
 
     assert.deepEqual(snapshot.dropped, [
       { provider: "slack", reason: "routing", count: 2 },
       { provider: "slack", reason: "trigger_filters_rejected", count: 1 },
     ]);
+  });
+
+  it("counts runs started in the last 24 hours and the last 30 days by outcome", async () => {
+    const database = memberDatabase();
+    await enrollTestDaemon(database, "org-1");
+    const trigger = await new OrganizationTriggerStore(
+      database,
+      "org-1",
+      acceptingAgentValidator(),
+    ).save({ yaml: triggerYaml, userId: "user-1" });
+    const hour = 3_600_000;
+    await recordRun(database, trigger.runtimeProjectId, "hour", "succeeded", hour);
+    await recordRun(database, trigger.runtimeProjectId, "two-hours", "failed", 2 * hour);
+    await recordRun(database, trigger.runtimeProjectId, "three-days", "succeeded", 72 * hour);
+    await recordRun(database, trigger.runtimeProjectId, "forty-days", "succeeded", 960 * hour);
+
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
+
+    assert.deepEqual(snapshot.runCounts, {
+      day: { total: 2, succeeded: 1, failed: 1 },
+      month: { total: 3, succeeded: 2, failed: 1 },
+    });
+  });
+
+  it("does not flag a connection whose grant covers what Hub needs", async () => {
+    const database = memberDatabase({ slackScopes: [...SLACK_REQUIRED_BOT_SCOPES] });
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
+
+    assert.deepEqual(
+      snapshot.connections.map(({ needsAuthorization }) => needsAuthorization),
+      [false],
+    );
+  });
+
+  it("reports no session facts while interactive sessions are off", async () => {
+    const snapshot = await new HomeDashboard(memberDatabase(), accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
+
+    assert.equal(snapshot.sessions, null);
+  });
+
+  it("counts the reader's open sessions and the active profiles when sessions are on", async () => {
+    const asked: unknown[] = [];
+    const database = withSessions(memberDatabase(), {
+      profiles: ["active", "active", "disabled"],
+      open: 2,
+      asked,
+    });
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+      interactiveSessions: true,
+    }).snapshot(request, "acme");
+
+    assert.deepEqual(snapshot.sessions, {
+      profiles: 2,
+      open: 2,
+      openCapped: false,
+      started: true,
+    });
+    assert.deepEqual(asked[0], {
+      organizationId: "org-1",
+      principal: { organizationId: "org-1", userId: "user-1", role: "owner" },
+      filter: "active",
+    });
+  });
+
+  it("caps the open session count and asks once more only to learn whether any session exists", async () => {
+    const capped = await new HomeDashboard(
+      withSessions(memberDatabase(), { profiles: ["active"], open: 80, asked: [] }),
+      accountAuth(),
+      APPS_CONFIGURED,
+      { now: () => NOW, interactiveSessions: true },
+    ).snapshot(request, "acme");
+    assert.deepEqual(capped.sessions, { profiles: 1, open: 50, openCapped: true, started: true });
+
+    const asked: { filter?: string }[] = [];
+    const none = await new HomeDashboard(
+      withSessions(memberDatabase(), { profiles: [], open: 0, closed: 1, asked }),
+      accountAuth(),
+      APPS_CONFIGURED,
+      { now: () => NOW, interactiveSessions: true },
+    ).snapshot(request, "acme");
+    assert.deepEqual(none.sessions, { profiles: 0, open: 0, openCapped: false, started: true });
+    assert.deepEqual(
+      asked.map(({ filter }) => filter),
+      ["active", "all"],
+    );
   });
 
   it("asks the provider registrations whether any app is configured, with the organization's bindings", async () => {
@@ -160,7 +241,7 @@ describe("home read model", () => {
         seen.push(bindings.slack.map(({ slug }) => slug));
         return false;
       },
-      () => NOW,
+      { now: () => NOW },
     ).snapshot(request, "acme");
 
     assert.equal(snapshot.appsConfigured, false);
@@ -170,7 +251,47 @@ describe("home read model", () => {
 
 const CONNECTED_ONLY_DAEMON_ID = "20000000-0000-4000-8000-000000000002";
 
-function memberDatabase({ slack = true }: { slack?: boolean } = {}): Database {
+/**
+ * The memory database with canned session reads. Seeding a real session needs a daemon, a
+ * profile and a coordinator; the read model only asks two questions of the store.
+ */
+function withSessions(
+  database: Database,
+  canned: {
+    profiles: readonly ("active" | "disabled")[];
+    open: number;
+    closed?: number;
+    asked: unknown[];
+  },
+): Database {
+  const sessions = (count: number) => Array.from({ length: count }, (_, index) => ({ id: index }));
+  const reads: Record<string, unknown> = {
+    listSessionProfiles: () => Promise.resolve(canned.profiles.map((status) => ({ status }))),
+    listInteractiveSessions: (
+      organizationId: string,
+      principal: unknown,
+      page: { filter: "active" | "all"; limit: number },
+    ) => {
+      canned.asked.push({ organizationId, principal, filter: page.filter });
+      const total = canned.open + (page.filter === "all" ? (canned.closed ?? 0) : 0);
+      return Promise.resolve({
+        sessions: sessions(Math.min(total, page.limit)),
+        nextCursor: total > page.limit ? {} : null,
+      });
+    },
+  };
+  return new Proxy(database, {
+    get: (target, property): unknown =>
+      typeof property === "string" && property in reads
+        ? reads[property]
+        : Reflect.get(target, property, target),
+  });
+}
+
+function memberDatabase({
+  slack = true,
+  slackScopes = ["app_mentions:read"],
+}: { slack?: boolean; slackScopes?: string[] } = {}): Database {
   return createMemoryDatabase({
     now: () => NOW,
     memberships: [
@@ -193,7 +314,7 @@ function memberDatabase({ slack = true }: { slack?: boolean } = {}): Database {
             teamName: "Acme Slack",
             botUserId: "UBOT",
             botAccessToken: "token",
-            scopes: ["app_mentions:read"],
+            scopes: slackScopes,
             providerApplicationId: null,
           },
         ]

@@ -46,7 +46,7 @@ export const finishHomeSetupRequest = createServerOnlyFn(
           authentication: "Sign in again to finish setup.",
           forbidden: "Only an instance operator can finish setup.",
           notFound: "Organization unavailable.",
-          conflict: "Complete all four checklist steps before finishing setup.",
+          conflict: "Complete every checklist step before finishing setup.",
           validation: "Reload Home and try again.",
         },
       );
