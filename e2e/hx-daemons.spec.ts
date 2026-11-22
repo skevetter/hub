@@ -252,6 +252,32 @@ test("limits outstanding provider requests to four in list order", async ({ hub,
   }
 });
 
+test("announces result counts after rename and revoke change the filtered list", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.seedDaemonSlug("owner", "old-device-name");
+  const daemons = new OrganizationDaemons(page);
+  await daemons.open();
+  const announcement = page.getByRole("status").filter({ hasText: /daemon.*shown/u });
+  await expect(announcement).toHaveCount(0);
+  await daemons.search().fill("old-device-name");
+  await expect(announcement).toHaveText("1 daemon shown");
+
+  await renameDevice(page, daemons, "old-device-name", "new-device-name");
+  await expect(page.getByText("No daemons match", { exact: true })).toBeVisible();
+  await expect.soft(announcement).toHaveText("0 daemons shown", { timeout: 1_000 });
+
+  await page.getByRole("button", { name: "Clear filters", exact: true }).click();
+  await page.getByRole("radio", { name: "Offline", exact: true }).click();
+  await expect(announcement).toHaveText("1 daemon shown");
+  await revokeDevice(page, daemons, "new-device-name");
+  await expect(page.getByText("No daemons match", { exact: true })).toBeVisible();
+  await expect(announcement).toHaveText("0 daemons shown", { timeout: 1_000 });
+});
+
 function newMemberPage(browser: Browser, existingContexts: ReadonlySet<BrowserContext>) {
   const page = browser
     .contexts()
@@ -259,4 +285,23 @@ function newMemberPage(browser: Browser, existingContexts: ReadonlySet<BrowserCo
     ?.pages()[0];
   if (page === undefined) throw new Error("Missing member page");
   return page;
+}
+
+function actions(daemons: OrganizationDaemons, name: string) {
+  return daemons.device(name).getByRole("button", { name: `Actions for ${name}`, exact: true });
+}
+
+async function renameDevice(page: Page, daemons: OrganizationDaemons, from: string, to: string) {
+  await actions(daemons, from).press("Enter");
+  await page.getByRole("menuitem", { name: "Rename", exact: true }).press("Enter");
+  const form = page.getByRole("form", { name: `Rename ${from}` });
+  await form.getByLabel("Daemon slug").fill(to);
+  await form.getByRole("button", { name: "Rename", exact: true }).press("Enter");
+  await expect(form).toHaveCount(0);
+}
+
+async function revokeDevice(page: Page, daemons: OrganizationDaemons, name: string) {
+  await actions(daemons, name).press("Enter");
+  await page.getByRole("menuitem", { name: "Revoke", exact: true }).press("Enter");
+  await page.getByRole("button", { name: "Revoke daemon", exact: true }).press("Enter");
 }
