@@ -331,3 +331,13 @@ it("always renders 2,000 generated stacked-container documents safely and fast",
     assert.doesNotMatch(body, /[@\uFF20]/u, context);
   }
 });
+
+it.each([
+  "see https://e.com[^x] now",
+  "see www.example.com[^y] now",
+  "[a](https://e.com[^team-x) now",
+])("posts plain text when GFM builds an unparseable autolink from %j", (text) => {
+  const body = formatRunReply({ text, truncated: false }, [], { now: plainClock() });
+  assert.match(body, /now/u);
+  assert.deepEqual(mentionLinks(body), []);
+});

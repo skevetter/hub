@@ -59,6 +59,7 @@ export function formatRunReply(
   let truncated = answer.truncated || text.length > MAX_REPLY_CHARS;
   let limit = truncated ? TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN : MAX_REPLY_CHARS;
   let plainText = false;
+  let defang = false;
   for (let attempt = 0; attempt < MAX_RENDER_ATTEMPTS; attempt += 1) {
     const prefix = text.length <= limit ? text : clipSource(text, limit);
     const [redacted] = redact.redact([prefix], truncated);
@@ -67,13 +68,15 @@ export function formatRunReply(
       ? undefined
       : renderMarkdown(source, deadline, now, report);
     plainText = markdown === undefined;
-    const safe = markdown ?? renderPlainText(source);
+    const safe = markdown ?? renderPlainText(source, defang);
     if (safe === "") return safe;
     const whole = !truncated && safe.length <= MAX_REPLY_CHARS;
     if (whole || safe.length <= TRUNCATED_TEXT_LIMIT) {
       // Parsing is superlinear on escape-heavy text, so only the reply that will post is checked.
       if (hasUnsafeNode(safe)) {
-        if (plainText) throw new Error("Linear reply contains an unsafe link after rendering");
+        if (plainText && defang)
+          throw new Error("Linear reply contains an unsafe link after rendering");
+        defang = plainText;
         plainText = true;
         report("structure");
         continue;
@@ -87,7 +90,7 @@ export function formatRunReply(
   }
   report("structure");
   const [redacted] = redact.redact([text.slice(0, Math.min(limit, SHORT_PLAIN_PREFIX))], true);
-  const safe = renderPlainText(cleanSource(redacted!));
+  const safe = renderPlainText(cleanSource(redacted!), true);
   if (safe.length > TRUNCATED_TEXT_LIMIT)
     throw new Error("Linear reply exceeds the rendering limit");
   if (hasUnsafeNode(safe)) throw new Error("Linear reply contains an unsafe link after rendering");
@@ -233,7 +236,7 @@ function boundedStructure(source: string): boolean {
 
 // Keeps fenced code verbatim and the line structure of the rest, and escapes inline Markdown
 // outside fences. Only mention and link text is rewritten.
-function renderPlainText(source: string): string {
+function renderPlainText(source: string, defang = false): string {
   const out: string[] = [];
   let fence: { char: string; size: number; info: string } | undefined;
   let code: string[] = [];
@@ -267,14 +270,14 @@ function renderPlainText(source: string): string {
     if (item) {
       inList = true;
       const kept = Math.min(item[1]!.length, MAX_LIST_INDENT);
-      out.push(`${" ".repeat(kept)}${item[2]} ${escapeInline(item[4]!)}`);
+      out.push(`${" ".repeat(kept)}${item[2]} ${escapeInline(item[4]!, defang)}`);
     } else if (line.trim() === "") {
       out.push("");
     } else {
       // Deep indentation outside a list would become code, where escapes show as backslashes.
       const kept = inList && indent >= 4 ? Math.min(indent, MAX_LIST_INDENT) : 0;
       if (indent === 0) inList = false;
-      out.push(" ".repeat(kept) + escapeInline(line.trim()));
+      out.push(" ".repeat(kept) + escapeInline(line.trim(), defang));
     }
   }
   flush();
@@ -291,8 +294,13 @@ function neutralizeCode(line: string): string {
   return neutralizeMentions(decoded) === decoded ? value : value.replaceAll("&", "&amp;");
 }
 
-function escapeInline(text: string): string {
-  return neutralizeMentions(text).replace(/[!-/:-@[-`{-~]/gu, "\\$&");
+// GFM links "https://" and "www." in decoded text even when every character is escaped. A zero
+// width space after the scheme, or between "www" and its dot, stops the autolink from forming
+// when the checks cannot parse the URL it would build.
+function escapeInline(text: string, defang: boolean): string {
+  const neutral = neutralizeMentions(text);
+  const spaced = defang ? neutral.replace(/https?:\/\/|www(?=\.)/giu, "$&\u200B") : neutral;
+  return spaced.replace(/[!-/:-@[-`{-~]/gu, "\\$&");
 }
 
 // Escaping can expose a link the source did not have, so the final text is parsed again and
