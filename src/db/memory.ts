@@ -177,6 +177,7 @@ import type {
   GitHubRepositoryRecord,
   GitHubRepositorySnapshot,
   OrganizationConnectionUsage,
+  OrganizationRunCount,
   OrganizationRunRecord,
   DroppedEventPageRequest,
   ProjectTriggerRoute,
@@ -6447,6 +6448,18 @@ class MemoryDatabase implements Database {
             },
           ];
     });
+  }
+
+  async countOrganizationRunsSince(
+    organizationId: string,
+    since: Date,
+  ): Promise<OrganizationRunCount[]> {
+    const counts = new Map<OrganizationRunCount["status"], number>();
+    for (const run of this.triggerRuns.values()) {
+      if (run.organizationId !== organizationId || run.createdAt < since) continue;
+      counts.set(run.status, (counts.get(run.status) ?? 0) + 1);
+    }
+    return [...counts].map(([status, count]) => ({ status, count }));
   }
 
   async listOrganizationRunsSince(
