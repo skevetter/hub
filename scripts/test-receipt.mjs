@@ -98,7 +98,9 @@ async function checkReceipt(receipt, { head, tree }, directory, root) {
   for (const entry of receipt.commands) {
     if (entry.head !== head || entry.tree !== tree)
       throw new Error("A receipt entry has a different commit or tree.");
-    if (entry.root !== root || (entry.testedRoot !== null && entry.testedRoot !== root))
+    const testedRoot =
+      entry.testedRoot === null && entry.counts === null ? entry.root : entry.testedRoot;
+    if (entry.root !== root || testedRoot !== root)
       throw new Error(`A receipt entry ran in a different worktree than ${root}.`);
     if (
       !/^[a-f0-9]{64}$/u.test(entry.logSha256 ?? "") ||
@@ -201,7 +203,7 @@ export async function recordTestRun(directory, command, { stdio = "inherit", sig
     }
     const entry = {
       root,
-      testedRoot: metrics?.root ?? null,
+      testedRoot: metrics?.root ?? root,
       branch,
       head,
       tree,
@@ -293,6 +295,8 @@ async function main(args, signal) {
       if (entry.counts) {
         const { passed, failed, skipped } = entry.counts;
         console.log(`    ${passed} passed, ${failed} failed, ${skipped} skipped`);
+      } else {
+        console.log("    Tested root was not confirmed by metrics.");
       }
       for (const file of entry.selectedFiles) console.log(`    ${file}`);
       for (const check of entry.checks) console.log(`    ${check}`);
