@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { AxeBuilder } from "@axe-core/playwright";
 import { expect, type Locator, type Page } from "@playwright/test";
 import { test } from "./app.js";
+import { holdConnectionRefresh } from "./helpers/projects/connections.js";
 import { projectApp } from "./helpers/projects/index.js";
 
 test.describe.configure({ timeout: 90_000 });
@@ -87,6 +88,91 @@ test("shows the four cards and opens provider-filtered dropped events from the k
   });
   const table = main.getByRole("table", { name: "Dropped events" });
   await expect(table.locator("tbody tr")).toHaveCount(2);
+});
+
+for (const fail of [false, true]) {
+  test(`reconciles a revoked installation when the refresh ${fail ? "fails" : "succeeds"}`, async ({
+    hub,
+    page,
+  }) => {
+    await hub.signUpAs("owner", owner);
+    await hub.createOrganization("owner", "Acme");
+    await hub.connectGitHub("owner");
+    const github = projectApp(page).connections.card("GitHub");
+    await expect(github.getByText("Connected", { exact: true })).toBeVisible();
+
+    const refresh = await holdConnectionRefresh(page);
+    const revokeResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" && response.url().includes("/_serverFn/"),
+    );
+    try {
+      await github.getByRole("button", { name: "Actions for acme-inc" }).click();
+      await page.getByRole("menuitem", { name: "Revoke" }).click();
+      await page.getByRole("button", { name: "Revoke connection" }).click();
+      expect((await revokeResponse).ok()).toBe(true);
+      await refresh.started;
+      if (!fail) {
+        const row = github.getByRole("listitem");
+        await expect(page.getByText("GitHub disconnected.")).toHaveCount(0);
+        await expect(row).toContainText("Being removed");
+        await expect(row).toHaveAttribute("aria-busy", "true");
+        await expect(row.getByRole("button")).toHaveCount(0);
+      }
+    } finally {
+      refresh.release(fail);
+    }
+
+    if (fail) {
+      await expect(page.getByRole("alert")).toContainText(
+        /(?:Organization|Connections) unavailable/u,
+      );
+      await expect(github).toHaveCount(0);
+      await expect(page.getByText("GitHub disconnected.")).toHaveCount(0);
+      refresh.release();
+      await page.getByRole("button", { name: "Try again" }).click();
+    }
+
+    await expect(github.getByText("Not set up", { exact: true })).toBeVisible();
+    await expect(github.getByRole("listitem")).toHaveCount(0);
+    await expect(
+      page.getByRole("status").filter({ hasText: "GitHub disconnected." }),
+    ).toBeVisible();
+  });
+}
+
+test("keeps the initial failure passive and announces the result of retrying", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const { navigation, connections } = projectApp(page);
+  const statusRead = page.waitForResponse(async (response) => {
+    if (
+      response.request().method() !== "GET" ||
+      !response.ok() ||
+      !response.url().includes("/_serverFn/")
+    ) {
+      return false;
+    }
+    return (await response.text()).includes('"canManage"');
+  });
+  await navigation.openOrganizationSection("Connections");
+  await expect(connections.card("GitHub")).toBeVisible();
+  const statusPath = new URL((await statusRead).url()).pathname;
+  const refresh = await holdConnectionRefresh(page, statusPath);
+  refresh.release(true);
+  await page.reload();
+  const retry = page.getByRole("button", { name: "Try again" });
+  await expect(retry).toBeVisible();
+  await expect(page.getByRole("main").getByRole("alert")).toHaveCount(0);
+  await retry.click();
+  await expect(page.getByRole("main").getByRole("alert")).toContainText("unavailable");
+  refresh.release();
+  await retry.click();
+  await expect(connections.card("GitHub")).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Connections loaded." })).toBeVisible();
 });
 
 test.describe("Slack authorization", () => {

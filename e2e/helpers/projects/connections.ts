@@ -15,3 +15,37 @@ export class ProjectConnections {
     ).toContainText(/acme-inc.*installation/u);
   }
 }
+
+export async function holdConnectionRefresh(page: Page, readPath?: string) {
+  const serverFunctions = "**/_serverFn/**";
+  let notifyRefresh = () => {};
+  const started = new Promise<void>((resolve) => {
+    notifyRefresh = resolve;
+  });
+  let releaseReads = () => {};
+  const released = new Promise<void>((resolve) => {
+    releaseReads = resolve;
+  });
+  let failReads = false;
+  await page.route(serverFunctions, async (route) => {
+    const request = route.request();
+    if (
+      request.method() !== "GET" ||
+      (readPath !== undefined && new URL(request.url()).pathname !== readPath)
+    ) {
+      await route.continue();
+      return;
+    }
+    notifyRefresh();
+    await released;
+    if (failReads) await route.abort();
+    else await route.continue();
+  });
+  return {
+    started,
+    release(fail = false) {
+      failReads = fail;
+      releaseReads();
+    },
+  };
+}
