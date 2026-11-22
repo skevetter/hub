@@ -21,8 +21,6 @@ import { ListFilters } from "../components/app/list-filters.js";
 import { PageHeader } from "../components/app/page.js";
 import { RowActions } from "../components/app/row-actions.js";
 import { SegmentedControl } from "../components/app/segmented-control.js";
-import { Button } from "../components/ui/button.js";
-import { DialogClose } from "../components/ui/dialog.js";
 import { DropdownMenuItem } from "../components/ui/dropdown-menu.js";
 import {
   daemonList,
@@ -559,11 +557,6 @@ function RenameDaemonDialog({
         required
         {...(error === undefined ? {} : { error })}
       />
-      <DialogClose asChild>
-        <Button type="button" variant="outline" className="sm:self-end">
-          Cancel
-        </Button>
-      </DialogClose>
     </FormDialog>
   );
 }

@@ -528,13 +528,32 @@ test("returns focus to the device actions when Rename is dismissed", async ({ hu
   await dialog.getByRole("button", { name: "Close", exact: true }).press("Enter");
   await expect(dialog).toBeHidden();
   await expect.soft(trigger).toBeFocused({ timeout: 1_000 });
+});
 
-  await trigger.press("Enter");
+test("saves Rename from the slug field and its next tab stop", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.seedDaemonSlug("owner", "first-device-name");
+  const daemons = new OrganizationDaemons(page);
+  await daemons.open();
+  const dialog = page.getByRole("dialog", { name: "Rename daemon" });
+  const slug = dialog.getByLabel("Daemon slug");
+
+  await actions(daemons, "first-device-name").press("Enter");
   await page.getByRole("menuitem", { name: "Rename", exact: true }).press("Enter");
-  await slug.fill("");
-  await dialog.getByRole("button", { name: "Cancel", exact: true }).press("Enter", {
+  await slug.fill("second-device-name");
+  await slug.press("Enter");
+  await expect(daemons.device("second-device-name")).toBeVisible();
+  await expect(dialog).toBeHidden();
+
+  await actions(daemons, "second-device-name").press("Enter");
+  await page.getByRole("menuitem", { name: "Rename", exact: true }).press("Enter");
+  await slug.fill("third-device-name");
+  await page.keyboard.press("Tab");
+  await expect.soft(dialog.getByRole("button", { name: "Rename", exact: true })).toBeFocused({
     timeout: 1_000,
   });
+  await page.keyboard.press("Enter");
+  await expect(daemons.device("third-device-name")).toBeVisible({ timeout: 2_000 });
   await expect(dialog).toBeHidden();
-  await expect(trigger).toBeFocused();
 });
