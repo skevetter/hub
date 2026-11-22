@@ -51,37 +51,40 @@ test("Home restores keyboard focus after a retry", async ({ hub, page }) => {
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeFocused();
 });
 
-test("Home reserves the loaded tile heights on a 390 px viewport", async ({ hub, page }) => {
-  await hub.signUpAs("owner", owner);
-  await hub.createOrganization("owner", "Acme");
-  await page.setViewportSize({ width: 390, height: 844 });
-  let releaseSnapshot = () => {};
-  const heldSnapshot = new Promise<void>((resolve) => {
-    releaseSnapshot = resolve;
+for (const width of [390, 1280])
+  test(`Home reserves the loaded tile heights at ${String(width)} px`, async ({ hub, page }) => {
+    await hub.signUpAs("owner", owner);
+    await hub.createOrganization("owner", "Acme");
+    await hub.connectProviderDaemon("owner", "Acme");
+    await hub.seedConnectedOnlyDaemon("owner", "laptop");
+    await page.setViewportSize({ width, height: 844 });
+    let releaseSnapshot = () => {};
+    const heldSnapshot = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    await page.route("**/_serverFn/**", async (route) => {
+      const response = await route.fetch();
+      const body = await response.text();
+      if (body.includes("runCounts")) await heldSnapshot;
+      await route.fulfill({ response, body });
+    });
+    await page.reload();
+    const dimensions = (container: ReturnType<typeof page.locator>) =>
+      container
+        .locator("div.grid-cols-2 > section")
+        .evaluateAll((tiles) => tiles.map((tile) => tile.getBoundingClientRect().height));
+    const loading = page.getByLabel("Loading Home");
+    let loadingHeights: number[];
+    try {
+      await expect(loading).toBeVisible();
+      loadingHeights = await dimensions(loading);
+      expect(loadingHeights).toHaveLength(5);
+    } finally {
+      releaseSnapshot();
+    }
+    await expect(page.getByText("Open sessions", { exact: true })).toBeVisible();
+    expect(await dimensions(page.locator("main"))).toEqual(loadingHeights);
   });
-  await page.route("**/_serverFn/**", async (route) => {
-    const response = await route.fetch();
-    const body = await response.text();
-    if (body.includes("runCounts")) await heldSnapshot;
-    await route.fulfill({ response, body });
-  });
-  await page.reload();
-  const dimensions = (container: ReturnType<typeof page.locator>) =>
-    container
-      .locator("div.grid-cols-2 > section")
-      .evaluateAll((tiles) => tiles.map((tile) => tile.getBoundingClientRect().height));
-  const loading = page.getByLabel("Loading Home");
-  let loadingHeights: number[];
-  try {
-    await expect(loading).toBeVisible();
-    loadingHeights = await dimensions(loading);
-    expect(loadingHeights).toHaveLength(5);
-  } finally {
-    releaseSnapshot();
-  }
-  await expect(page.getByText("Open sessions", { exact: true })).toBeVisible();
-  expect(await dimensions(page.locator("main"))).toEqual(loadingHeights);
-});
 
 test("Home wraps a long scoped trigger name at 390 px", async ({ hub, page }) => {
   const name = "w".repeat(60);

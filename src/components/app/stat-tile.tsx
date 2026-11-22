@@ -49,7 +49,7 @@ function StatTileLayout({
           <div className="min-h-6 text-2xl leading-none tabular-nums">
             {placeholder ? <Skeleton className="h-6 w-10" /> : value}
           </div>
-          <div className="min-h-5 text-xs text-muted-foreground max-sm:min-h-8">
+          <div className="min-h-8 text-xs text-muted-foreground">
             {placeholder ? <Skeleton className="h-5 w-20 max-w-full" /> : detail}
           </div>
         </div>
