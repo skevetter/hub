@@ -141,7 +141,7 @@ function appSurface(
     return {
       key: provider,
       label,
-      where: `${label} is not connected yet. Connect it, then create a comment trigger with a reply output.`,
+      where: `${label} is not connected yet. Connect it to continue setup.`,
       next: { label: `Connect ${label}`, path: "connections" },
       examples,
     };
@@ -157,16 +157,17 @@ function appSurface(
     };
   }
   const listening = snapshot.triggers.flatMap((trigger) => {
-    const comment = COMMENT_EVENTS.get(trigger.event);
-    return trigger.enabled && comment !== undefined && trigger.event.startsWith(`${provider}.`)
-      ? [{ trigger, comment }]
-      : [];
+    if (!trigger.enabled) return [];
+    return (trigger.commentEvents ?? []).flatMap((event) => {
+      const comment = COMMENT_EVENTS.get(event.on);
+      return comment !== undefined && event.on.startsWith(`${provider}.`)
+        ? [{ trigger, event, comment }]
+        : [];
+    });
   });
   const matching =
-    listening.find(
-      ({ trigger }) => trigger.hasReplyOutput && typeof trigger.commentPrefix === "string",
-    ) ??
-    listening.find(({ trigger }) => trigger.hasReplyOutput) ??
+    listening.find(({ event }) => event.hasReplyOutput && event.commentPrefix !== null) ??
+    listening.find(({ event }) => event.hasReplyOutput) ??
     listening[0];
   if (matching === undefined) {
     const name = healthy[0]?.label;
@@ -178,9 +179,9 @@ function appSurface(
       examples,
     };
   }
-  const { trigger, comment } = matching;
-  const { commentPrefix } = trigger;
-  if (trigger.hasReplyOutput === true && typeof commentPrefix !== "string") {
+  const { trigger, event, comment } = matching;
+  const { commentPrefix, hasReplyOutput } = event;
+  if (hasReplyOutput && commentPrefix === null) {
     return {
       key: provider,
       label,
@@ -193,12 +194,10 @@ function appSurface(
   return {
     key: provider,
     label,
-    where:
-      trigger.hasReplyOutput === true
-        ? `${comment.action}${location} with one of these where ${trigger.name} is configured to run.`
-        : `${trigger.name} needs a reply output for the answer to appear on the ${comment.pullRequest ? "pull request" : "issue"}.`,
-    examples:
-      typeof commentPrefix === "string" ? commentExamples(trigger.event, commentPrefix) : [],
+    where: hasReplyOutput
+      ? `${comment.action}${location} with one of these where ${trigger.name} is configured to run.`
+      : `${trigger.name} needs a reply output for the answer to appear on the ${comment.pullRequest ? "pull request" : "issue"}.`,
+    examples: commentPrefix === null ? [] : commentExamples(event.on, commentPrefix),
   };
 }
 
