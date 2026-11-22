@@ -18,6 +18,14 @@ const ERROR_BODY = "Paseo Hub could not complete this request.";
 const STOP_BODY = "Stopped.";
 const STOP_UNCONFIRMED_BODY = "Stop requested; I could not confirm it stopped";
 const BUSY_BODY = "Still working on the previous message; reply when I have answered.";
+const publicBodies = new Set([
+  ACK_BODY,
+  ERROR_BODY,
+  STOP_BODY,
+  STOP_UNCONFIRMED_BODY,
+  BUSY_BODY,
+  NO_ANSWER_BODY,
+]);
 const recognizedCredentials = createAssistantTextRedactor([]);
 
 export interface LinearPilotAcceptedEvent {
@@ -133,6 +141,7 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
                 sessionId,
                 activityId,
                 content: { type: kind, body },
+                ...(publicBodies.has(body) ? { publicBody: true } : {}),
                 ...(ack ? { ephemeral: false } : {}),
                 ...providerSignal,
               },

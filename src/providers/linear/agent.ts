@@ -87,6 +87,7 @@ const activityInput = z.strictObject({
   content: activityContentSchema,
   ephemeral: z.boolean().optional(),
   signal: continueSignal,
+  publicBody: z.literal(true).optional(),
 });
 const readbackInput = z.strictObject({
   sessionId: id,
@@ -180,6 +181,7 @@ type Send = <T>(
   query: string,
   variables: Record<string, unknown>,
   data: z.ZodType<T>,
+  diagnostics?: DiagnosticInputs,
 ) => Promise<T>;
 
 export function createLinearAgentClient(options: LinearAgentClientOptions) {
@@ -298,7 +300,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
       }
     }
 
-    const send: Send = async (query, variables, schema) => {
+    const send: Send = async (query, variables, schema, diagnostics = { variables }) => {
       await checkCurrent();
       const serialized = JSON.stringify(variables);
       checkPayloadCredentials(serialized, initial);
@@ -314,7 +316,9 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
             now,
           ),
         signal,
-        options.pilotOperations ? { connections: [initial, connection], variables } : undefined,
+        options.pilotOperations
+          ? { connections: [initial, connection], ...diagnostics }
+          : undefined,
       );
       checkSignal();
       return parse(
@@ -378,6 +382,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         content,
         ephemeral,
         signal: expectedSignal,
+        publicBody,
       } = parse(activityInput, input, "invalid_input");
       if (ephemeral === true && content.type !== "thought" && content.type !== "action") {
         throw new LinearAgentError("invalid_input");
@@ -394,6 +399,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
           ...(expectedSignal ? { signal: expectedSignal } : {}),
         },
       };
+      const { type: _type, ...activityText } = content;
       const operation = { kind: "createActivity", sessionId } as const;
       return run(operation, variables, signal, async (send, viewer) => {
         const { agentActivityCreate: result } = await send(
@@ -402,6 +408,10 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
           }`,
           variables,
           createResult,
+          {
+            variables: { sessionId, activityId: expectedId, ...activityText },
+            omitErrorText: publicBody !== true,
+          },
         );
         requireMutation(
           result.success &&
@@ -710,14 +720,18 @@ function safeDisplayName({
     );
 }
 
-interface ProviderDiagnostics {
-  connections: readonly LinearConnectionRecord[];
+interface DiagnosticInputs {
   variables?: Record<string, unknown>;
+  omitErrorText?: boolean;
+}
+
+interface ProviderDiagnostics extends DiagnosticInputs {
+  connections: readonly LinearConnectionRecord[];
 }
 
 function safeProviderDetails(
   error: LinearApiError,
-  { connections, variables }: ProviderDiagnostics,
+  { connections, variables, omitErrorText }: ProviderDiagnostics,
 ): LinearAgentErrorDetails {
   const values = connections.flatMap(({ accessToken, refreshToken }) =>
     refreshToken === null ? [accessToken] : [accessToken, refreshToken],
@@ -744,7 +758,7 @@ function safeProviderDetails(
       ? {}
       : { linearErrorType: clean(error.graphqlErrorType) }),
     linearErrorKinds: error.graphqlCodes.map(clean),
-    linearErrorText: clean(error.message),
+    ...(omitErrorText ? {} : { linearErrorText: clean(error.message) }),
   };
 }
 

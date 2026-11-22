@@ -815,21 +815,17 @@ async function readResponseBody(
 }
 
 function parseGraphqlErrors(rawErrors: unknown[]) {
-  let firstErrorType: string | undefined;
-  const errors = rawErrors.flatMap((value, index) => {
+  return rawErrors.flatMap((value) => {
     const parsed = GraphqlErrorSchema.safeParse(value);
-    if (!parsed.success) return [];
-    if (index === 0) firstErrorType = parsed.data.extensions?.type;
-    return [parsed.data];
+    return parsed.success ? [parsed.data] : [];
   });
-  return { errors, firstErrorType };
 }
 
 function checkGraphqlResponse(response: Response, result: unknown, now: () => Date): void {
   const envelope = GraphqlErrorsSchema.safeParse(result);
   if (response.ok && !envelope.success) return;
   const rawErrors = envelope.success ? envelope.data.errors : [];
-  const { errors, firstErrorType } = parseGraphqlErrors(rawErrors);
+  const errors = parseGraphqlErrors(rawErrors);
   const rateLimited = errors.find(
     ({ extensions }) => extensions?.code?.toUpperCase() === "RATELIMITED",
   );
@@ -837,6 +833,7 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
     extensions?.code === undefined ? [] : [extensions.code.toUpperCase()],
   );
   const error = rateLimited ?? errors[0];
+  const { code, type } = error?.extensions ?? {};
   const delay =
     rateLimited !== undefined || response.status === 429
       ? linearRetryAfterMs(response.headers, now().getTime())
@@ -859,12 +856,12 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
       ? `Linear GraphQL ${error?.message ?? "response contained errors"}`
       : `Linear GraphQL HTTP ${response.status}`,
     response.status,
-    error?.extensions?.code,
+    code,
     delay,
     rateLimitBeforeExecution,
     codes,
     graphqlRejected,
-    firstErrorType,
+    type,
   );
 }
 

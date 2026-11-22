@@ -92,6 +92,11 @@ describe("pilot activities", () => {
       w.createActivity.mockRejectedValueOnce(new LinearAgentError("mutation_unconfirmed"));
       const missed = await run(w, "first-attempt");
       expect(missed.disposition).toBe("unconfirmed");
+      if (testCase.name === "response") {
+        expect(w.createActivity.mock.calls[0]?.[0]).not.toHaveProperty("publicBody");
+      } else {
+        expect(w.createActivity.mock.calls[0]?.[0]).toHaveProperty("publicBody", true);
+      }
       expect(w.isActivityConfirmed).toHaveBeenCalledWith(
         {
           sessionId: created.nativeSessionId,
@@ -392,6 +397,7 @@ describe("pilot activities", () => {
     );
     expect(w.createActivity.mock.calls[1]?.[0]).toMatchObject({
       content: { type: "response", body: "Work finished. No answer was posted." },
+      publicBody: true,
     });
   });
 
