@@ -100,7 +100,7 @@ export function Combobox<T extends ComboboxOption>({
           {...(describedBy === undefined ? {} : { "aria-describedby": describedBy })}
           disabled={disabled}
           data-value={value}
-          className="w-full min-w-0 justify-between"
+          className="h-auto min-h-8 w-full min-w-0 justify-between py-1 text-left whitespace-normal"
         >
           <span
             className={cn(
@@ -111,7 +111,9 @@ export function Combobox<T extends ComboboxOption>({
             )}
           >
             {comboboxSelection(options, value)?.icon}
-            <span className="truncate">{comboboxLabel(options, value, placeholder, loading)}</span>
+            <span className="wrap-anywhere">
+              {comboboxLabel(options, value, placeholder, loading)}
+            </span>
           </span>
           {loading ? (
             <Spinner className="opacity-50" />
@@ -149,12 +151,10 @@ export function Combobox<T extends ComboboxOption>({
                     />
                     {option.icon}
                     {renderOption === undefined ? (
-                      <span className="grid min-w-0 gap-0.5">
-                        <span className="truncate">{option.label}</span>
+                      <span className="grid min-w-0 gap-0.5 wrap-anywhere">
+                        <span>{option.label}</span>
                         {option.detail === undefined ? null : (
-                          <span className="truncate text-xs text-muted-foreground">
-                            {option.detail}
-                          </span>
+                          <span className="text-xs text-muted-foreground">{option.detail}</span>
                         )}
                       </span>
                     ) : (
