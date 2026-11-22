@@ -14,13 +14,7 @@ import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
 import { isEntrypoint, printRunContext, repositoryFor } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
-import {
-  fullSuiteLockHeld,
-  fullSuiteLockPath as lockPath,
-  runWorkerGroup,
-  takeFullSuiteLock,
-  testSignals,
-} from "./test-worker-group.mjs";
+import { runWorkerGroup, takeFullSuiteLock, testSignals } from "./test-worker-group.mjs";
 
 export function partitionFiles(files, count) {
   const shardCount = Math.min(count, files.length);
@@ -338,7 +332,6 @@ async function main() {
   if (!/^\d+$/u.test(requested) || !Number.isSafeInteger(count) || count < 1) {
     throw new Error("TEST_SHARDS must be a positive integer.");
   }
-  const busy = `The full-suite lock is held at ${lockPath}.`;
   let lock;
   const controller = new AbortController();
   const interrupt = (signal) => controller.abort(signal);
@@ -346,11 +339,7 @@ async function main() {
   let runDirectory;
   let exitCode = 1;
   try {
-    if (values["rerun-failed"]) {
-      if (fullSuiteLockHeld()) throw new Error(busy);
-    } else {
-      lock = await takeFullSuiteLock();
-    }
+    lock = await takeFullSuiteLock();
     runDirectory = await mkdtemp(join(tmpdir(), "hub-tests-"));
     const discovery = join(runDirectory, "discovery");
     const listing = join(discovery, "files.json");

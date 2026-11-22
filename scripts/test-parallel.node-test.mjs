@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 
 import { existsSync } from "node:fs";
@@ -435,4 +435,88 @@ test("reruns see a lock as held only while its owner or recorded groups run", as
   worker.kill("SIGKILL");
   await once(worker, "exit");
   assert.equal(fullSuiteLockHeld(path), false);
+});
+
+async function serialFixture(t, run) {
+  const root = await mkdtemp(join(tmpdir(), "hub-serial-test-"));
+  t.after(() => rm(root, { recursive: true }));
+  const git = (...args) => execFileSync("git", ["-C", root, ...args]);
+  git("init", "--quiet");
+  git(
+    "-c",
+    "user.name=Serial Test",
+    "-c",
+    "user.email=test@example.test",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "commit",
+    "--quiet",
+    "--allow-empty",
+    "-m",
+    "Initialize fixture",
+  );
+  const cache = join(root, "node_modules/.vite/vitest/test-parallel");
+  await mkdir(cache, { recursive: true });
+  await mkdir(join(root, "node_modules/vitest"));
+  await writeFile(join(cache, "failed.json"), '["selected.test.ts"]');
+  await writeFile(
+    join(root, "node_modules/vitest/vitest.mjs"),
+    `
+    import { existsSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    import { setTimeout as delay } from "node:timers/promises";
+    const root = process.cwd();
+    const file = join(root, "selected.test.ts");
+    const output = (prefix) => process.argv.find((arg) => arg.startsWith(prefix)).slice(prefix.length);
+    if (process.argv[2] === "list") {
+      writeFileSync(output("--json="), JSON.stringify([{ file }]));
+    } else {
+      const report = { success: true, numPassedTests: 1, numFailedTests: 0,
+        testResults: [{ name: file, status: "passed", assertionResults: [{ status: "passed" }] }] };
+      const reportPath = output("--outputFile=");
+      ${run}
+    }
+  `,
+  );
+  const runner = fileURLToPath(new URL("./test-parallel.mjs", import.meta.url));
+  const lock = join(root, "suite.lock");
+  const args = [runner, "--root", root];
+  const options = {
+    cwd: root,
+    env: { ...process.env, TMPDIR: root, HUB_TEST_FULLSUITE_LOCK: lock },
+  };
+  return { root, lock, args, options };
+}
+
+test("a serial rerun owns the full-suite lock until its worker exits", async (t) => {
+  const { root, lock, args, options } = await serialFixture(
+    t,
+    `
+    writeFileSync(join(root, "ready"), "");
+    while (!existsSync(join(root, "release"))) await delay(10);
+    writeFileSync(reportPath, JSON.stringify(report));
+  `,
+  );
+  const caller = spawn(process.execPath, [...args, "--rerun-failed"], {
+    ...options,
+    stdio: "ignore",
+  });
+  const exited = once(caller, "exit");
+  try {
+    await waitFor(() => existsSync(join(root, "ready")), "serial worker did not start");
+    assert.equal(JSON.parse(await readFile(lock, "utf8")).pid, caller.pid);
+    const contender = spawnSync(process.execPath, args, {
+      ...options,
+      encoding: "utf8",
+      timeout: 1000,
+    });
+    assert.equal(contender.status, 1);
+    assert.match(contender.stderr, /The full-suite lock is held/u);
+  } finally {
+    await writeFile(join(root, "release"), "");
+    assert.deepEqual(await exited, [0, null]);
+  }
+  await assert.rejects(readFile(lock), { code: "ENOENT" });
 });

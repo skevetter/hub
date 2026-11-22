@@ -90,9 +90,9 @@ cannot determine their directory.
 
 The parallel runner records its PID, start time and worker groups in the full-suite lock on macOS
 and Linux. On interrupt it gives each group five seconds to stop, sends SIGKILL if needed, and
-keeps the lock while any workers remain. A new full run reports and reclaims a stale lock after
-checking its workers. `--rerun-failed` and `test:changed` treat the lock as free once its owner
-and recorded worker groups have exited. For manual recovery, inspect the lock with `cat /tmp/hub-fullsuite.lock` and
+keeps the lock while any workers remain. Full runs and serial runs from `--rerun-failed` or
+`test:changed` hold the same lock. Each checks the recorded workers before reclaiming a stale lock.
+For manual recovery, inspect the lock with `cat /tmp/hub-fullsuite.lock` and
 check its PID and process groups with `ps -axo pid,pgid,lstart,stat,command`. Run
 `unlink /tmp/hub-fullsuite.lock` only after confirming that its owner and worker groups have exited.
 

@@ -8,12 +8,7 @@ import { parseArgs } from "node:util";
 import { generateRuntimeMap } from "./generate-test-runtime-files.mjs";
 import { git, isEntrypoint, printRunContext, repositoryFor, requireGit } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
-import {
-  fullSuiteLockHeld,
-  fullSuiteLockPath,
-  stopGroup,
-  testSignals,
-} from "./test-worker-group.mjs";
+import { takeFullSuiteLock, stopGroup, testSignals } from "./test-worker-group.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 
 const routeTree = "src/routeTree.gen.ts";
@@ -196,7 +191,7 @@ class Interrupted extends Error {
 }
 
 // Every child gets its own process group so a signal to this script reaches the whole tree.
-function supervise() {
+function supervise(getLock) {
   const groups = new Set();
   let received;
   const forward = (signal) => {
@@ -225,14 +220,17 @@ function supervise() {
           detached: true,
         });
         let childError;
+        const lock = getLock();
+        let registered = false;
         if (child.pid) groups.add(child.pid);
         child.on("error", (error) => {
           childError = error;
         });
         child.on("close", async (code) => {
           try {
-            // Descendants can outlive the leader; sweep the group before reporting.
-            if (received && child.pid) await stopGroup(child.pid, received);
+            // Descendants can outlive the leader.
+            if (child.pid && (lock || received)) await stopGroup(child.pid, received ?? "SIGTERM");
+            if (registered) lock.forget(child.pid);
           } catch (error) {
             childError ??= error;
           }
@@ -241,6 +239,15 @@ function supervise() {
           else if (received) reject(new Interrupted(received));
           else settle(code ?? 1);
         });
+        if (child.pid && lock) {
+          try {
+            lock.track(child.pid);
+            registered = true;
+          } catch (error) {
+            childError = error;
+            void stopGroup(child.pid, "SIGTERM").catch(reject);
+          }
+        }
       });
     },
     close() {
@@ -324,10 +331,6 @@ async function resolveTestPlan(root, changes, present, safe, temp) {
   }
 }
 
-function requireFullSuiteIdle() {
-  if (fullSuiteLockHeld()) throw new Error(`The full-suite lock is held at ${fullSuiteLockPath}.`);
-}
-
 async function selectedVitest(supervisor, root, args, reportPath, env) {
   const code = await runVitest(
     supervisor,
@@ -379,9 +382,11 @@ async function main() {
   console.log(`Changed paths from ${base.display} (Git ${base.kind} ${base.tree})`);
   for (const path of changes) console.log(`  ${path}`);
 
-  const supervisor = supervise();
+  let lock;
+  const supervisor = supervise(() => lock);
   let temp;
   try {
+    lock = await takeFullSuiteLock();
     temp = await mkdtemp(join(tmpdir(), "hub-changed-"));
     const env = { ...process.env, HUB_VITEST_CACHE_DIR: join(temp, "vite") };
     await checkRouteTree(supervisor, root, temp, env);
@@ -396,8 +401,6 @@ async function main() {
       console.log(
         `FULL VITEST SUITE selected for ${plan.fullSuiteReason}. Handing off to the parallel runner with the full-suite lock.`,
       );
-    } else {
-      requireFullSuiteIdle();
     }
 
     let code = 0;
@@ -415,6 +418,8 @@ async function main() {
     if (plan.fullSuiteReason) {
       const metrics = join(temp, "full-metrics.json");
       const runner = fileURLToPath(new URL("./test-parallel.mjs", import.meta.url));
+      lock.release();
+      lock = undefined;
       const result = await supervisor.run(process.execPath, [runner, "--root", root], {
         cwd: root,
         env: { ...env, HUB_TEST_RUN_REPORT: metrics },
@@ -451,7 +456,11 @@ async function main() {
     try {
       if (temp) await rm(temp, { recursive: true });
     } finally {
-      supervisor.close();
+      try {
+        lock?.release();
+      } finally {
+        supervisor.close();
+      }
     }
   }
 }
