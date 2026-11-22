@@ -1,7 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useMemo, type ReactNode } from "react";
+import { useCallback, useMemo, useState, type ReactNode } from "react";
 import { useActiveAccount } from "../auth/active-account.js";
 import { CONNECTION_MUTATION_KEY } from "../auth/tenant-mutation.js";
 import { Card, CardSkeleton } from "../components/app/card.js";
@@ -11,6 +11,7 @@ import { PageHeader } from "../components/app/page.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RowActions } from "../components/app/row-actions.js";
 import { Section } from "../components/app/section.js";
+import { StatusLine } from "../components/app/status-line.js";
 import { StatusPill } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
@@ -94,13 +95,14 @@ function ConnectionsLoading() {
 }
 
 export function OrganizationConnectionsPanel() {
+  const { account, organization } = useRouteTenant();
   return (
     <>
       <PageHeader
         title="Connections"
         description="These services let Hub receive events and post replies for your organization."
       />
-      <ConnectionsContent />
+      <ConnectionsContent key={JSON.stringify([account.id, organization.id])} />
     </>
   );
 }
@@ -112,14 +114,18 @@ function ConnectionsContent() {
   const organizationSlug = tenant.organization.slug;
   const scope = useMemo(() => ({ organizationSlug }), [organizationSlug]);
   const loading = <ConnectionsLoading />;
-  const snapshot = useOrganizationSnapshot(loading);
+  const snapshot = useOrganizationSnapshot();
   const loadStatus = useServerFn(connectionStatus);
-  const statusKey = ["connection-status", tenant.account.id, tenant.organization.id];
+  const statusKey = useMemo(
+    () => ["connection-status", tenant.account.id, tenant.organization.id],
+    [tenant.account.id, tenant.organization.id],
+  );
   const statusQuery = useSnapshotQuery({
     queryKey: statusKey,
     queryFn: () => loadStatus({ data: scope }),
   });
   const [returned, setReturned] = useConnectionReturn();
+  const [retryState, setRetryState] = useState<"idle" | "pending" | "complete">("idle");
   const connect = useMutation({
     mutationKey: CONNECTION_MUTATION_KEY,
     mutationFn: useServerFn(startConnection),
@@ -129,12 +135,15 @@ function ConnectionsContent() {
     mutationFn: useServerFn(disconnectConnection) as (
       input: Parameters<typeof disconnectConnection>[0],
     ) => Promise<Result<{ result: ConnectionDisconnectResult }>>,
-    onSuccess: async (response, variables) => {
+    onMutate: ({ data: { provider, connectionId } }) =>
+      snapshot.status === "success"
+        ? connectionRows(snapshot.data.connections)[provider].find(({ id }) => id === connectionId)
+        : undefined,
+    onSuccess: async (response) => {
       if (response.status !== "ok") return;
-      setReturned({ provider: variables.data.provider, result: response.data.result });
       await Promise.all([
         invalidateOrganization(queryClient, scope.organizationSlug),
-        queryClient.invalidateQueries({ queryKey: statusKey }),
+        queryClient.invalidateQueries({ queryKey: statusKey, exact: true }),
       ]);
     },
   });
@@ -155,9 +164,11 @@ function ConnectionsContent() {
   );
   const revokeConnection = useCallback(
     (provider: ConnectionProvider, connectionId: string) => {
+      setRetryState("idle");
+      setReturned(undefined);
       revoke({ data: { ...scope, provider, connectionId } });
     },
-    [revoke, scope],
+    [revoke, scope, setReturned],
   );
   const mutations = useMemo(
     () => [
@@ -166,39 +177,56 @@ function ConnectionsContent() {
     ],
     [connect.data, connect.isError, disconnect.data, disconnect.isError],
   );
-  if (snapshot.status === "error") {
+  const retry = useCallback(() => {
+    setRetryState("pending");
+    void Promise.all([
+      queryClient.refetchQueries({ queryKey: snapshot.queryKey, exact: true }),
+      queryClient.refetchQueries({ queryKey: statusKey, exact: true }),
+    ]).then(() => setRetryState("complete"));
+  }, [queryClient, snapshot.queryKey, statusKey]);
+  if (retryState === "pending") {
+    return (
+      <>
+        <StatusLine>{null}</StatusLine>
+        {loading}
+      </>
+    );
+  }
+
+  const failure = connectionReadFailure(snapshot, statusQuery);
+  const revokeResult = disconnect.data?.status === "ok" ? disconnect.data.data.result : undefined;
+  if (failure !== undefined && !disconnect.isPending) {
     return (
       <FailureAlert
-        title="Organization unavailable"
-        error={snapshot.error}
-        fallback="Organization unavailable."
-        onRetry={snapshot.refetch}
+        title={failure.title}
+        error={failure.message}
+        fallback={`${failure.title}.`}
+        passive={retryState === "idle" && revokeResult === undefined}
+        onRetry={retry}
       />
     );
   }
-  if (!snapshot.ok) return snapshot.element;
-  if (statusQuery.status === "pending") return loading;
-  if (statusQuery.status === "error") {
-    return (
-      <FailureAlert
-        title="Connections unavailable"
-        error={statusQuery.error}
-        fallback="Connections unavailable."
-        onRetry={statusQuery.refetch}
-      />
-    );
-  }
+  if (snapshot.status !== "success" || statusQuery.status !== "success") return loading;
 
   const data = snapshot.data;
   const canManage = data.capabilities.manageResources;
   const busy = connect.isPending || disconnect.isPending;
-  const connections = connectionRows(data.connections);
+  const pending = disconnect.isPending ? disconnect.variables?.data : undefined;
+  const connections = connectionRows(data.connections, pending, disconnect.context);
   const suspendedGitHub = data.connections.github.some(({ status }) => status === "suspended");
+  const result = reconciledRevocation(
+    connections,
+    disconnect.variables?.data,
+    revokeResult,
+    snapshot.isFetching || statusQuery.isFetching,
+  );
+  const banner = result ?? returned;
   return (
     <>
-      {returned === undefined ? null : (
-        <ConnectionReturnBanner copy={connectionReturnCopy(returned)} />
-      )}
+      {retryState === "complete" && result === undefined ? (
+        <StatusLine>Connections loaded.</StatusLine>
+      ) : null}
+      {banner === undefined ? null : <ConnectionReturnBanner copy={connectionReturnCopy(banner)} />}
       <CommandError mutations={mutations} />
       <Section className={GRID_COLUMNS}>
         {PROVIDER_CARDS.map(({ provider, label, icon, description, droppedSearch }) => {
@@ -222,6 +250,7 @@ function ConnectionsContent() {
                   label={label}
                   provider={provider}
                   connections={connections[provider]}
+                  removingId={pending?.provider === provider ? pending.connectionId : undefined}
                   canManage={canManage}
                   busy={busy}
                   onRevoke={revokeConnection}
@@ -271,6 +300,37 @@ function ConnectionsContent() {
       </Section>
     </>
   );
+}
+
+type ConnectionRead = Pick<
+  ReturnType<typeof useOrganizationSnapshot>,
+  "status" | "error" | "refreshFailure"
+>;
+
+function connectionReadFailure(snapshot: ConnectionRead, status: ConnectionRead) {
+  const failure = (read: ConnectionRead) =>
+    read.status === "error" ? { message: read.error } : read.refreshFailure;
+  const snapshotFailure = failure(snapshot);
+  if (snapshotFailure != null) return { title: "Organization unavailable", ...snapshotFailure };
+  const statusFailure = failure(status);
+  if (statusFailure != null) return { title: "Connections unavailable", ...statusFailure };
+  return undefined;
+}
+
+interface ConnectionIdentity {
+  provider: ConnectionProvider;
+  connectionId: string;
+}
+
+function reconciledRevocation(
+  connections: Record<ConnectionProvider, ConnectionRecord[]>,
+  revoked: ConnectionIdentity | undefined,
+  result: ConnectionDisconnectResult | undefined,
+  isFetching: boolean,
+) {
+  if (revoked === undefined || result === undefined || isFetching) return undefined;
+  if (connections[revoked.provider].some(({ id }) => id === revoked.connectionId)) return undefined;
+  return { provider: revoked.provider, result };
 }
 
 /** A card with no action still says what has to happen before there is one. */
@@ -350,6 +410,7 @@ function ProviderConnections({
   label,
   provider,
   connections,
+  removingId,
   canManage,
   busy,
   onRevoke,
@@ -357,6 +418,7 @@ function ProviderConnections({
   label: string;
   provider: ConnectionProvider;
   connections: readonly ConnectionRecord[];
+  removingId: string | undefined;
   canManage: boolean;
   busy: boolean;
   onRevoke: (provider: ConnectionProvider, connectionId: string) => void;
@@ -370,6 +432,7 @@ function ProviderConnections({
           provider={provider}
           canManage={canManage}
           busy={busy}
+          removing={connection.id === removingId}
           onRevoke={onRevoke}
         />
       ))}
@@ -382,19 +445,22 @@ function ConnectionRow({
   provider,
   canManage,
   busy,
+  removing,
   onRevoke,
 }: {
   connection: ConnectionRecord;
   provider: ConnectionProvider;
   canManage: boolean;
   busy: boolean;
+  removing: boolean;
   onRevoke: (provider: ConnectionProvider, connectionId: string) => void;
 }) {
   const { id, name, externalId, grantedAccess } = connection;
+  const detail = removing ? "Being removed" : connection.attention;
   const confirmRevoke = useCallback(() => onRevoke(provider, id), [onRevoke, provider, id]);
   const actions = useMemo(
     () =>
-      canManage ? (
+      canManage && !removing ? (
         <RowActions label={`Actions for ${name}`}>
           <ConfirmMenuItem
             busy={busy}
@@ -408,14 +474,12 @@ function ConnectionRow({
           />
         </RowActions>
       ) : undefined,
-    [busy, canManage, confirmRevoke, name],
+    [busy, canManage, confirmRevoke, name, removing],
   );
   return (
-    <RecordRow actions={actions}>
+    <RecordRow actions={actions} busy={removing}>
       <TwoLine primary={name} secondary={externalId} mono />
-      {connection.attention === undefined ? null : (
-        <p className="mt-1 text-xs text-muted-foreground">{connection.attention}</p>
-      )}
+      {detail === undefined ? null : <p className="mt-1 text-xs text-muted-foreground">{detail}</p>}
       {grantedAccess !== undefined && grantedAccess.length > 0 ? (
         <p className="mt-1 text-xs text-muted-foreground">
           Granted permission to {ACCESS_FORMAT.format(grantedAccess)}.
@@ -427,8 +491,10 @@ function ConnectionRow({
 
 function connectionRows(
   connections: OrganizationSnapshot["connections"],
+  pending?: ConnectionIdentity,
+  removing?: ConnectionRecord,
 ): Record<ConnectionProvider, ConnectionRecord[]> {
-  return {
+  const rows: Record<ConnectionProvider, ConnectionRecord[]> = {
     linear: connections.linear.map((connection) => ({
       id: connection.id,
       name: connection.linearOrganizationName,
@@ -455,6 +521,14 @@ function connectionRows(
       externalId: `guild ${connection.guildId}`,
     })),
   };
+  if (
+    pending !== undefined &&
+    removing !== undefined &&
+    !rows[pending.provider].some(({ id }) => id === removing.id)
+  ) {
+    rows[pending.provider].push(removing);
+  }
+  return rows;
 }
 
 function ConnectionReturnBanner({ copy }: { copy: ConnectionReturnCopy }): ReactNode {

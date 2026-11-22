@@ -24,6 +24,7 @@ export function RecordRow({
   children,
   status,
   actions,
+  busy,
 }: {
   /** The identity of the record, normally a `TwoLine`. */
   children: ReactNode;
@@ -31,10 +32,12 @@ export function RecordRow({
   status?: ReactNode;
   /** Its actions, always behind a `RowActions` kebab. */
   actions?: ReactNode;
+  busy?: boolean;
 }) {
   return (
     <li
       data-slot="record-row"
+      aria-busy={busy || undefined}
       className="flex min-w-0 items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
     >
       <div className="min-w-0">{children}</div>
