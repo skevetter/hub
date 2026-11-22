@@ -76,10 +76,12 @@ command. A completed failure replaces that entry with the failure. An interrupti
 leaves the command unverified. `--verify` requires completed passing results and checks that
 no receipt writer holds the lock.
 
-The test runners report the worktree and commit they tested. Recording rejects metrics for a
-different worktree or commit and requires a clean checkout. For explicit commands without metrics,
-the receipt uses the recording worktree as the tested root. `--verify` reports that metrics did
-not confirm that root. Verification requires the worktree where the receipt was recorded.
+The test runners report their starting worktree and commit and check HEAD again before publishing
+metrics. The changed runner also checks the worktree and commit reported by the parallel runner.
+Recording requires a clean checkout and matching metrics when a command emits them. For explicit
+commands without metrics, the receipt uses the recording worktree as the tested root. `--verify`
+reports that metrics did not confirm that root. Verification requires the worktree where the
+receipt was recorded.
 
 Receipts bind each command to the commit and tree and hash the canonical JSON and command logs with
 SHA-256. Verification needs both the JSON and its files under `.test-receipts/logs/`. This detects
