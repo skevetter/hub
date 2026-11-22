@@ -6,7 +6,7 @@ import {
 } from "./generate-test-runtime-files.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -413,4 +413,98 @@ test("test-changed stops the selected Vitest run with its descendants and remove
       await exited;
     }
   }
+});
+
+test("TERM during changed-runner cleanup prevents successful metrics", async (t) => {
+  const { root } = await changedFixture(t, {
+    "node_modules/vitest/vitest.mjs": `
+      import { writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      if (process.argv[2] === "run") {
+        const output = process.argv.find((arg) => arg.startsWith("--outputFile=")).slice(13);
+        writeFileSync(output, JSON.stringify({
+          numPassedTests: 1, numFailedTests: 0, numTotalTests: 1,
+          testResults: [{ name: join(process.cwd(), "src/typography-policy.test.ts"), status: "passed" }],
+        }));
+      }
+    `,
+  });
+  const marker = join(root, "status-cleanup");
+  const preload = join(root, "status-pause-cleanup.mjs");
+  const metrics = join(root, "status-metrics.json");
+  const lock = join(root, "status-lock");
+  const temp = join(root, "status-tmp");
+  await mkdir(temp);
+  await writeFile(
+    preload,
+    `
+    import { once } from "node:events";
+    import { writeFileSync } from "node:fs";
+    import fs from "node:fs/promises";
+    import { syncBuiltinESMExports } from "node:module";
+    import { basename } from "node:path";
+    const rm = fs.rm;
+    fs.rm = async (path, ...args) => {
+      await rm(path, ...args);
+      if (!basename(path).startsWith("hub-changed-")) return;
+      const keepAlive = setInterval(() => {}, 1000);
+      const signal = once(process, "SIGTERM");
+      writeFileSync(${JSON.stringify(marker)}, "ready");
+      try { await signal; } finally { clearInterval(keepAlive); }
+    };
+    syncBuiltinESMExports();
+    `,
+  );
+
+  const args = [join(root, "scripts/test-changed.mjs"), "--base", "HEAD"];
+  const env = {
+    ...process.env,
+    TMPDIR: temp,
+    HUB_TEST_FULLSUITE_LOCK: lock,
+    HUB_TEST_RUN_REPORT: metrics,
+  };
+  const caller = spawn(process.execPath, ["--import", preload, ...args], {
+    cwd: root,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const exited = once(caller, "close");
+  let output = "";
+  caller.stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+  caller.stderr.on("data", (chunk) => {
+    output += chunk;
+  });
+  try {
+    let ready = "";
+    for (let attempt = 0; !ready && attempt < 200 && caller.exitCode === null; attempt++) {
+      ready = await readFile(marker, "utf8").catch(() => "");
+      if (!ready) await delay(20);
+    }
+    assert.equal(ready, "ready", output);
+    const result = once(caller, "exit", { signal: AbortSignal.timeout(4000) });
+    caller.kill("SIGTERM");
+    assert.deepEqual(await result, [1, null]);
+    await exited;
+    assert.match(output, /1 passed, 0 failed/u);
+    assert.match(output, /INTERRUPTED: SIGTERM/u);
+    await assert.rejects(readFile(metrics), { code: "ENOENT" });
+    await assert.rejects(readFile(lock), { code: "ENOENT" });
+    assert.deepEqual(await readdir(temp), []);
+  } finally {
+    if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+    await exited;
+  }
+
+  const passing = spawnSync(process.execPath, args, {
+    cwd: root,
+    env,
+    encoding: "utf8",
+    timeout: 4000,
+  });
+  assert.equal(passing.status, 0, passing.stderr);
+  const saved = JSON.parse(await readFile(metrics, "utf8"));
+  assert.deepEqual(saved.selectedFiles, ["src/typography-policy.test.ts"]);
+  assert.deepEqual(saved.counts, { passed: 1, failed: 0, skipped: 0 });
 });
