@@ -278,6 +278,37 @@ test("announces result counts after rename and revoke change the filtered list",
   await expect(announcement).toHaveText("0 daemons shown", { timeout: 1_000 });
 });
 
+test("restores focus to the actions button or search after a keyboard mutation", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.seedDaemonSlug("owner", "old-device-name");
+  await hub.seedDaemonSlug("owner", "second-device");
+  const daemons = new OrganizationDaemons(page);
+  await daemons.open();
+  await page.setViewportSize({ width: 390, height: 900 });
+
+  await renameDevice(page, daemons, "old-device-name", "renamed-device");
+  await expect.soft(actions(daemons, "renamed-device")).toBeFocused({ timeout: 1_000 });
+  await daemons.search().fill("renamed-device");
+  await renameDevice(page, daemons, "renamed-device", "new-device-name");
+  await expect(page.getByText("No daemons match", { exact: true })).toBeVisible();
+  await expect.soft(daemons.search()).toBeFocused({ timeout: 1_000 });
+
+  await page.getByRole("button", { name: "Clear filters", exact: true }).click();
+  await revokeDevice(page, daemons, "new-device-name");
+  await expect(
+    daemons.device("new-device-name").getByText("Revoked", { exact: true }),
+  ).toBeVisible();
+  await expect.soft(actions(daemons, "new-device-name")).toBeFocused({ timeout: 1_000 });
+  await page.getByRole("radio", { name: "Offline", exact: true }).click();
+  await revokeDevice(page, daemons, "second-device");
+  await expect(page.getByText("No daemons match", { exact: true })).toBeVisible();
+  await expect(daemons.search()).toBeFocused({ timeout: 1_000 });
+});
+
 function newMemberPage(browser: Browser, existingContexts: ReadonlySet<BrowserContext>) {
   const page = browser
     .contexts()
