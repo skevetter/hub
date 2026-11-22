@@ -3,7 +3,7 @@ import { z } from "zod";
 import { DaemonResponseLostError } from "../daemons/protocol.js";
 import { DatabaseUnavailableError } from "../db/errors.js";
 import type { RefusalCode } from "../interactive-sessions/types.js";
-import { LinearAgentError } from "../providers/linear/agent.js";
+import { LinearAgentError, type LinearAgentOperation } from "../providers/linear/agent.js";
 import { surfaceRevision, type BindingKey } from "../surfaces/store.js";
 import type { PilotRefusal } from "./binding.js";
 import {
@@ -69,7 +69,7 @@ type FollowUpOutcome = StopOutcome | "started" | "busy";
 
 export interface PilotFailure {
   sessionId: string;
-  code:
+  failureCode:
     | LinearAgentError["code"]
     | RefusalCode
     | PilotRefusal
@@ -82,9 +82,22 @@ export interface PilotFailure {
     | "SyntaxError"
     | "Error"
     | "unknown_error";
+  httpStatus?: number;
+  operation?: LinearAgentOperation["kind"] | "created" | "prompted" | "stop";
 }
 
-export function pilotExceptionCode(error: unknown): PilotFailure["code"] {
+export function pilotExceptionFields(
+  error: unknown,
+): Pick<PilotFailure, "failureCode" | "httpStatus"> {
+  return {
+    failureCode: pilotExceptionCode(error),
+    ...(error instanceof LinearAgentError && error.status !== undefined
+      ? { httpStatus: error.status }
+      : {}),
+  };
+}
+
+function pilotExceptionCode(error: unknown): PilotFailure["failureCode"] {
   if (error instanceof LinearAgentError) return error.code;
   if (error instanceof DaemonResponseLostError) return "DaemonResponseLostError";
   if (error instanceof DatabaseUnavailableError) return "DatabaseUnavailableError";
@@ -165,7 +178,8 @@ export function createPilotFollowUp(options: PilotFollowUpOptions) {
       // A failed or uncertain attempt cannot be retried with its original claim.
       options.reportFailure?.({
         sessionId: scope.nativeSessionId,
-        code: pilotExceptionCode(error),
+        ...pilotExceptionFields(error),
+        operation: isStop ? "stop" : "prompted",
       });
       return "unconfirmed";
     }

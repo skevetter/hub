@@ -20,7 +20,7 @@ import { classifyLinearPilotCompanionComment } from "./intake.js";
 import { adaptSignedPilotFollowUp } from "./follow-up-event.js";
 import {
   createPilotFollowUp,
-  pilotExceptionCode,
+  pilotExceptionFields,
   type PilotConversation,
   type PilotFailure,
   type PilotTurn,
@@ -139,8 +139,8 @@ export function createLinearPilotRuntime(options: Options) {
     const { message, nativeSessionId } = event;
     if (!message || !validMessage(message)) return;
     const { authority, origin, principal } = eventScope(qualified);
-    const report = (code: PilotFailure["code"]) =>
-      reportFailure({ sessionId: nativeSessionId, code });
+    const report = (failureCode: PilotFailure["failureCode"]) =>
+      reportFailure({ sessionId: nativeSessionId, failureCode, operation: event.kind });
     await withSession(authority, origin, async () => {
       const now = new Date();
       if (!accepting || now.getTime() - receivedAt.getTime() >= 10_000) return;
@@ -239,14 +239,20 @@ export function createLinearPilotRuntime(options: Options) {
     return createLinearPilotActivities({
       clientFor(activity) {
         const client = clientFor(grant, activity);
-        const trace = <T>(request: Promise<T>) =>
+        const trace = <T>(operation: "createActivity" | "readActivity", request: Promise<T>) =>
           request.catch((error: unknown) => {
-            reportFailure({ sessionId: activity.nativeSessionId, code: pilotExceptionCode(error) });
+            reportFailure({
+              sessionId: activity.nativeSessionId,
+              ...pilotExceptionFields(error),
+              operation,
+            });
             throw error;
           });
         return {
-          createActivity: (input, signal) => trace(client.createActivity(input, signal)),
-          isActivityConfirmed: (input, signal) => trace(client.isActivityConfirmed(input, signal)),
+          createActivity: (input, signal) =>
+            trace("createActivity", client.createActivity(input, signal)),
+          isActivityConfirmed: (input, signal) =>
+            trace("readActivity", client.isActivityConfirmed(input, signal)),
         };
       },
     });
@@ -261,7 +267,11 @@ export function createLinearPilotRuntime(options: Options) {
   ): Promise<BoundLiveSession | undefined> {
     const found = await bindings.find(authority, origin);
     if (found.status === "refused") {
-      reportFailure({ sessionId: origin.nativeSessionId, code: found.reason });
+      reportFailure({
+        sessionId: origin.nativeSessionId,
+        failureCode: found.reason,
+        operation: qualified.event.kind,
+      });
     }
     if (found.status !== "bound") return undefined;
     const { binding } = found;
@@ -330,8 +340,8 @@ export function createLinearPilotRuntime(options: Options) {
       allowedHumanProviderUserId: config.allowedHumanId,
     };
     let current: BoundLiveSession | undefined;
-    const report = (code: PilotFailure["code"]) =>
-      reportFailure({ sessionId: origin.nativeSessionId, code });
+    const report = (failureCode: PilotFailure["failureCode"]) =>
+      reportFailure({ sessionId: origin.nativeSessionId, failureCode, operation: kind });
     const run = createPilotFollowUp({
       withSession: (_scope, operation) => withSession(authority, origin, operation),
       activityIds: pilotActivityIds,
@@ -598,7 +608,8 @@ export function createLinearPilotRuntime(options: Options) {
         .catch((error: unknown) =>
           reportFailure({
             sessionId: qualified.event.nativeSessionId,
-            code: pilotExceptionCode(error),
+            ...pilotExceptionFields(error),
+            operation: qualified.event.kind,
           }),
         )
         .finally(() => jobs.delete(job));

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { createLogger } from "../logger.js";
 import { LinearAgentError } from "../providers/linear/agent.js";
 import {
   createPilotFollowUp,
@@ -170,21 +171,35 @@ describe("Linear pilot follow-up admission", () => {
   it.each([
     { error: new TypeError("private-token-canary private-body-canary"), code: "TypeError" },
     { error: new LinearAgentError("policy_required"), code: "policy_required" },
+    { error: new LinearAgentError("request_failed", 503), code: "request_failed", status: 503 },
     { error: "private-token-canary private-body-canary", code: "unknown_error" },
-  ])("reports only the fixed $code and native session id", async ({ error, code }) => {
+  ])("logs safe diagnostics for $code", async ({ error, code, status }) => {
     const f = fixture();
     if (error instanceof Error) {
       error.name = "private-name-canary";
       error.message = "private-token-canary private-body-canary";
     }
     f.options.reserve.mockRejectedValueOnce(error);
-    const reportFailure = vi.fn();
+    const records: string[] = [];
+    const logger = createLogger({ write: (record) => records.push(record) });
+    const reportFailure = vi.fn((failure) => logger.warn(failure, "Linear pilot delivery failed"));
     const handle = createPilotFollowUp({ ...f.options, reportFailure });
 
     expect(await handle(scope, delivered)).toBe("unconfirmed");
     expect(reportFailure).toHaveBeenCalledExactlyOnceWith({
       sessionId: scope.nativeSessionId,
-      code,
+      failureCode: code,
+      operation: "prompted",
+      ...(status === undefined ? {} : { httpStatus: status }),
     });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toContain(`"failureCode":"${code}"`);
+    expect(records[0]).toContain('"operation":"prompted"');
+    if (status === undefined) {
+      expect(records[0]).not.toContain('"httpStatus"');
+    } else {
+      expect(records[0]).toContain(`"httpStatus":${status}`);
+    }
+    expect(records[0]).not.toMatch(/private-(token|body|name)-canary/u);
   });
 });

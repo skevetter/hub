@@ -421,7 +421,8 @@ async function exerciseRegisteredPilot(
           () =>
             expect(pilotFailure).toHaveBeenCalledExactlyOnceWith({
               sessionId: nativeSessionId,
-              code: "active_limit",
+              failureCode: "active_limit",
+              operation: "created",
             }),
           { timeout: 2_000 },
         );
