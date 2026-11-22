@@ -136,6 +136,22 @@ describe("Home query states", () => {
     assert.match(markup, /<h1[^>]*>Home<\/h1>/u);
     assert.match(markup, /aria-label="Loading Home"/u);
   });
+
+  it.each([
+    [false, 4],
+    [true, 5],
+  ] as const)(
+    "renders the tile count when the session feature is %s",
+    (sessionsEnabled, columns) => {
+      const markup = renderHomeQuery(
+        { status: "pending", data: undefined, error: null },
+        true,
+        sessionsEnabled,
+      );
+      const tiles = markup.split('class="grid gap-4 grid-cols-2')[1]?.split("<div aria-busy")[0];
+      assert.equal(tiles?.match(/<section\b/gu)?.length, columns);
+    },
+  );
 });
 
 describe("Home checklist", () => {
