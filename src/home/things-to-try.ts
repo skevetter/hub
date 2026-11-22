@@ -1,4 +1,5 @@
 import type { HomeSnapshot } from "./dashboard.js";
+import type { ProfileAvailability } from "./checklist.js";
 
 export type TrySurfaceKey = "linear" | "github" | "sessions";
 
@@ -90,28 +91,43 @@ const SESSION_EXAMPLES: readonly TryExample[] = [
  */
 export function thingsToTry(
   snapshot: Pick<HomeSnapshot, "connections" | "triggers" | "sessions">,
+  profiles: ProfileAvailability = null,
+  canManageProfiles = false,
 ): TrySurface[] {
   const surfaces: TrySurface[] = [
     appSurface(snapshot, "linear", "Linear"),
     appSurface(snapshot, "github", "GitHub"),
   ];
   const { sessions } = snapshot;
-  if (sessions !== null) {
+  if (sessions !== null && profiles !== null) {
     surfaces.push({
       key: "sessions",
       label: "Sessions",
-      where:
-        sessions.profiles === 0
-          ? "A session starts from a profile: the daemon, folder and agent it uses. Create one first."
-          : "Start a session and send one of these as the first message. The agent works on your daemon.",
-      next:
-        sessions.profiles === 0
-          ? { label: "Create a profile", path: "sessions/profiles" }
-          : { label: "New session", path: "sessions/new" },
+      ...sessionGuidance(profiles, canManageProfiles),
       examples: SESSION_EXAMPLES,
     });
   }
   return surfaces;
+}
+
+function sessionGuidance(
+  profiles: NonNullable<ProfileAvailability>,
+  canManage: boolean,
+): Pick<TrySurface, "where" | "next"> {
+  if (profiles === "checking") return { where: "Checking session profiles." };
+  if (profiles === "unavailable") return { where: "Session profiles could not be loaded." };
+  if (profiles > 0) {
+    return {
+      where: "Choose an active profile and send one of these as the first message.",
+      next: { label: "New session", path: "sessions/new" },
+    };
+  }
+  return canManage
+    ? {
+        where: "Create a session profile to choose the daemon, folder and agent.",
+        next: { label: "Create a profile", path: "sessions/profiles" },
+      }
+    : { where: "Ask an organization admin to create a session profile." };
 }
 
 function appSurface(

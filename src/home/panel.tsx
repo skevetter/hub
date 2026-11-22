@@ -30,7 +30,11 @@ import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "../daemons/handoff.js";
-import { HomeSessionStart } from "../interactive-sessions/ui/new-session.js";
+import { listSessionProfiles } from "../interactive-sessions/functions.js";
+import {
+  HomeSessionStart,
+  sessionProfileQueryOptions,
+} from "../interactive-sessions/ui/new-session.js";
 import { useRouteTenant } from "../projects/context.js";
 import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
 import { DROP_REASON_GROUPS, type DropReasonGroup } from "../triggers/drop-reason.js";
@@ -40,6 +44,7 @@ import {
   deriveChecklist,
   type Checklist as ChecklistState,
   type ChecklistStep,
+  type ProfileAvailability,
 } from "./checklist.js";
 import type { RunTally } from "./dashboard.js";
 import { finishHomeSetup, homeSnapshot, type HomeSnapshot } from "./functions.js";
@@ -60,13 +65,31 @@ export function HomePanel() {
     queryKey: ["home", tenant.organization.id, tenant.account.id],
     queryFn: () => load({ data: scope }),
   });
+  const sessionsEnabled = account.features?.interactiveSessions === true;
+  const profilesEnabled =
+    sessionsEnabled && snapshot.status === "success" && snapshot.data.sessions !== null;
+  const list = useServerFn(listSessionProfiles);
+  const profiles = useSnapshotQuery({
+    ...sessionProfileQueryOptions(tenant.organization.slug, account.account.id, list),
+    enabled: profilesEnabled,
+  });
+  const profileCount = useMemo<ProfileAvailability>(() => {
+    if (!profilesEnabled) return null;
+    if (profiles.status === "pending") return "checking";
+    if (profiles.status === "error") return "unavailable";
+    return Array.isArray(profiles.data)
+      ? profiles.data.filter(({ status }) => status === "active").length
+      : null;
+  }, [profiles.data, profiles.status, profilesEnabled]);
   return (
     <HomeView
       key={tenant.organization.id}
       snapshot={snapshot}
       accountId={tenant.account.id}
       operator={account.isInstanceOperator}
-      sessionsEnabled={account.features?.interactiveSessions === true}
+      sessionsEnabled={sessionsEnabled}
+      profiles={profileCount}
+      canManageProfiles={tenant.capabilities.manageResources}
     />
   );
 }
@@ -76,11 +99,15 @@ function HomeView({
   accountId,
   operator,
   sessionsEnabled,
+  profiles,
+  canManageProfiles,
 }: {
   snapshot: Snapshot<HomeSnapshot> & { refetch: () => void; isFetching: boolean };
   accountId: string;
   operator: boolean;
   sessionsEnabled: boolean;
+  profiles: ProfileAvailability;
+  canManageProfiles: boolean;
 }) {
   const [focusOnCompletion, setFocusOnCompletion] = useState(false);
   const retryRequested = useRef(false);
@@ -127,9 +154,9 @@ function HomeView({
   return (
     <>
       {header}
-      <NeedsAttention data={data} base={base} />
+      <NeedsAttention data={data} base={base} profiles={profiles} />
       <Section>
-        <HomeTiles data={data} />
+        <HomeTiles data={data} profiles={profiles} />
       </Section>
       {data.checklistCompletedAt === null ? (
         <HomeChecklist
@@ -137,11 +164,18 @@ function HomeView({
           base={base}
           accountId={accountId}
           operator={operator}
+          profiles={profiles}
+          canManageProfiles={canManageProfiles}
           onFinished={() => setFocusOnCompletion(true)}
         />
       ) : null}
-      {sessionsEnabled ? <HomeSessionStart organizationSlug={data.organization.slug} /> : null}
-      <ThingsToTry snapshot={data} base={base} />
+      {profiles === null ? null : <HomeSessionStart organizationSlug={data.organization.slug} />}
+      <ThingsToTry
+        snapshot={data}
+        base={base}
+        profiles={profiles}
+        canManageProfiles={canManageProfiles}
+      />
       <Section
         title="Recent runs"
         description={`The last ${String(data.windowDays)} days.`}
@@ -188,7 +222,7 @@ function HomeView({
  * The figures a reader checks first. Runs are counted over rolling windows because the server
  * does not know the reader's midnight; sessions are the reader's own, and absent while off.
  */
-function HomeTiles({ data }: { data: HomeSnapshot }) {
+function HomeTiles({ data, profiles }: { data: HomeSnapshot; profiles: ProfileAvailability }) {
   const { sessions } = data;
   const enabled = data.triggers.filter((trigger) => trigger.enabled).length;
   return (
@@ -217,7 +251,7 @@ function HomeTiles({ data }: { data: HomeSnapshot }) {
         <StatTile
           label="Open sessions"
           value={`${String(sessions.open)}${sessions.openCapped ? "+" : ""}`}
-          detail={sessions.profiles === 1 ? "1 profile" : `${String(sessions.profiles)} profiles`}
+          {...(typeof profiles === "number" ? { detail: profileLabel(profiles) } : {})}
         />
       )}
     </StatGrid>
@@ -247,7 +281,15 @@ const PROVIDER_NAMES = { github: "GitHub", slack: "Slack", discord: "Discord", l
  * Only what the reader has to act on, each with the one place to act. Nothing here is a state
  * report: a daemon that is offline while nothing depends on it is not a problem.
  */
-function NeedsAttention({ data, base }: { data: HomeSnapshot; base: string }) {
+function NeedsAttention({
+  data,
+  base,
+  profiles,
+}: {
+  data: HomeSnapshot;
+  base: string;
+  profiles: ProfileAvailability;
+}) {
   const providers = [
     ...new Set(
       data.connections
@@ -255,7 +297,7 @@ function NeedsAttention({ data, base }: { data: HomeSnapshot; base: string }) {
         .map(({ provider }) => provider),
     ),
   ];
-  const daemons = daemonAttention(data);
+  const daemons = daemonAttention(data, profiles);
   return (
     <>
       {providers.map((provider) => {
@@ -302,9 +344,12 @@ function NeedsAttention({ data, base }: { data: HomeSnapshot; base: string }) {
 }
 
 /** Work is waiting on a daemon only when something would use one: a trigger or a profile. */
-function daemonAttention(data: HomeSnapshot): { title: string; message: string } | undefined {
+function daemonAttention(
+  data: HomeSnapshot,
+  profiles: ProfileAvailability,
+): { title: string; message: string } | undefined {
   const waiting =
-    data.triggers.some(({ enabled }) => enabled) || (data.sessions?.profiles ?? 0) > 0;
+    data.triggers.some(({ enabled }) => enabled) || (typeof profiles === "number" && profiles > 0);
   if (!waiting || data.daemons.length === 0) return undefined;
   const able = data.daemons.filter(({ canExecute }) => canExecute);
   if (able.some(({ presence }) => presence === "connected")) return undefined;
@@ -322,8 +367,21 @@ function daemonAttention(data: HomeSnapshot): { title: string; message: string }
   };
 }
 
-function ThingsToTry({ snapshot, base }: { snapshot: HomeSnapshot; base: string }) {
-  const surfaces = useMemo(() => thingsToTry(snapshot), [snapshot]);
+function ThingsToTry({
+  snapshot,
+  base,
+  profiles,
+  canManageProfiles,
+}: {
+  snapshot: HomeSnapshot;
+  base: string;
+  profiles: ProfileAvailability;
+  canManageProfiles: boolean;
+}) {
+  const surfaces = useMemo(
+    () => thingsToTry(snapshot, profiles, canManageProfiles),
+    [snapshot, profiles, canManageProfiles],
+  );
   const [selected, setSelected] = useState<TrySurfaceKey>("linear");
   const surface = surfaces.find(({ key }) => key === selected) ?? surfaces[0];
   const options = useMemo(
@@ -381,16 +439,20 @@ function HomeChecklist({
   base,
   accountId,
   operator,
+  profiles,
+  canManageProfiles,
   onFinished,
 }: {
   snapshot: HomeSnapshot;
   base: string;
   accountId: string;
   operator: boolean;
+  profiles: ProfileAvailability;
+  canManageProfiles: boolean;
   onFinished: () => void;
 }) {
   const { organization } = snapshot;
-  const checklist = deriveChecklist(snapshot);
+  const checklist = deriveChecklist(snapshot, profiles);
   const setupReady = canFinishSetup(snapshot);
   const queryClient = useQueryClient();
   const finish = useServerFn(finishHomeSetup);
@@ -449,6 +511,8 @@ function HomeChecklist({
           base={base}
           accountId={accountId}
           operator={operator}
+          profiles={profiles}
+          canManageProfiles={canManageProfiles}
         />
       ) : null}
     </Section>
@@ -461,12 +525,16 @@ function GetStarted({
   base,
   accountId,
   operator,
+  profiles,
+  canManageProfiles,
 }: {
   checklist: ChecklistState;
   snapshot: HomeSnapshot;
   base: string;
   accountId: string;
   operator: boolean;
+  profiles: ProfileAvailability;
+  canManageProfiles: boolean;
 }) {
   // Minimizing is the member's own choice, so it is remembered for them and nobody else.
   const [open, setOpen] = useMemberFlag(
@@ -501,7 +569,13 @@ function GetStarted({
           {checklist.steps.map((step) => (
             <StepRow
               key={step.key}
-              {...stepPresentation(step, snapshot, { base, operator, origin })}
+              {...stepPresentation(step, snapshot, {
+                base,
+                operator,
+                origin,
+                profiles,
+                canManageProfiles,
+              })}
             />
           ))}
         </Checklist>
@@ -550,6 +624,8 @@ const TO_DO = { label: "To do", tone: "neutral" } as const;
 interface StepContext {
   base: string;
   operator: boolean;
+  profiles: ProfileAvailability;
+  canManageProfiles: boolean;
   /** This Hub's address as the browser sees it; absent in a server render. */
   origin: string | undefined;
 }
@@ -562,41 +638,53 @@ function stepPresentation(
   if (step.key === "app") return appStep(step.state, snapshot, context.base, context.operator);
   if (step.key === "daemon") return daemonStep(step.state, snapshot, context.origin);
   if (step.key === "trigger") return triggerStep(step.state, snapshot, context.base);
-  if (step.key === "profile") return profileStep(step.state, snapshot, context.base);
-  if (step.key === "session") return sessionStep(step.state, snapshot, context.base);
+  if (step.key === "profile") return profileStep(step.state, context);
+  if (step.key === "session") return sessionStep(step.state, snapshot, context);
   return runStep(step.state, snapshot, context.base);
 }
 
 function profileStep(
-  state: "done" | "pending",
-  snapshot: HomeSnapshot,
-  base: string,
+  state: Extract<ChecklistStep, { key: "profile" }>["state"],
+  { base, profiles, canManageProfiles }: StepContext,
 ): StepPresentation {
   const title = "Create a session profile";
-  const profiles = snapshot.sessions?.profiles ?? 0;
-  if (state === "done") {
+  if (state === "done" && typeof profiles === "number") {
     return {
       title,
-      hint: profiles === 1 ? "1 profile" : `${String(profiles)} profiles`,
+      hint: profileLabel(profiles),
       status: DONE,
     };
   }
+  if (state === "checking" || state === "unavailable") {
+    const label = state === "checking" ? "Checking profiles" : "Profile availability unknown";
+    return { title, hint: label, status: { label, tone: "neutral" } };
+  }
   return {
     title,
-    hint: "A profile is the daemon, folder and agent a session starts from.",
+    hint: canManageProfiles
+      ? "A profile is the daemon, folder and agent a session starts from."
+      : "Ask an organization admin to create a session profile.",
     status: TO_DO,
-    action: (
-      <Button asChild variant="outline" size="sm">
-        <Link to={`${base}/sessions/profiles` as never}>Create a profile</Link>
-      </Button>
-    ),
+    ...(canManageProfiles
+      ? {
+          action: (
+            <Button asChild variant="outline" size="sm">
+              <Link to={`${base}/sessions/profiles` as never}>Create a profile</Link>
+            </Button>
+          ),
+        }
+      : {}),
   };
+}
+
+function profileLabel(count: number): string {
+  return count === 1 ? "1 active profile" : `${String(count)} active profiles`;
 }
 
 function sessionStep(
   state: "done" | "pending",
   snapshot: HomeSnapshot,
-  base: string,
+  { base, profiles }: StepContext,
 ): StepPresentation {
   const title = "Start a session";
   const sessions = snapshot.sessions;
@@ -613,9 +701,9 @@ function sessionStep(
   }
   return {
     title,
-    hint: "Send a first message and watch the agent work on your daemon.",
+    hint: "Choose an active profile and send a first message.",
     status: TO_DO,
-    ...((sessions?.profiles ?? 0) > 0
+    ...(typeof profiles === "number" && profiles > 0
       ? {
           action: (
             <Button asChild variant="outline" size="sm">

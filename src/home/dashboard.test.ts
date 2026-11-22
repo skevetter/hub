@@ -336,7 +336,7 @@ ${agent}`;
     assert.equal(snapshot.sessions, null);
   });
 
-  it("counts the reader's open sessions and the active profiles when sessions are on", async () => {
+  it("counts the reader's open sessions when sessions are on", async () => {
     const database = await withSessions({
       profiles: ["active", "active", "disabled"],
       open: 2,
@@ -347,7 +347,6 @@ ${agent}`;
     }).snapshot(request, "acme");
 
     assert.deepEqual(snapshot.sessions, {
-      profiles: 2,
       open: 2,
       openCapped: false,
       started: true,
@@ -362,7 +361,6 @@ ${agent}`;
       { now: () => NOW, interactiveSessions: true },
     ).snapshot(request, "acme");
     assert.deepEqual(capped.sessions, {
-      profiles: 1,
       open: HOME_OPEN_SESSIONS_LIMIT,
       openCapped: true,
       started: true,
@@ -374,7 +372,7 @@ ${agent}`;
       APPS_CONFIGURED,
       { now: () => NOW, interactiveSessions: true },
     ).snapshot(request, "acme");
-    assert.deepEqual(none.sessions, { profiles: 1, open: 0, openCapped: false, started: true });
+    assert.deepEqual(none.sessions, { open: 0, openCapped: false, started: true });
   });
 
   it("asks the provider registrations whether any app is configured, with the organization's bindings", async () => {
