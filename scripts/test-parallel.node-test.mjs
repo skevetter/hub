@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 
-import { existsSync } from "node:fs";
+import { constants, existsSync } from "node:fs";
 
 import { mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   executeFiles,
@@ -464,7 +465,7 @@ async function serialFixture(t, run) {
   await writeFile(
     join(root, "node_modules/vitest/vitest.mjs"),
     `
-    import { existsSync, writeFileSync } from "node:fs";
+    import { existsSync, renameSync, writeFileSync } from "node:fs";
     import { join } from "node:path";
     import { setTimeout as delay } from "node:timers/promises";
     const root = process.cwd();
@@ -485,7 +486,7 @@ async function serialFixture(t, run) {
   const args = [runner, "--root", root];
   const options = {
     cwd: root,
-    env: { ...process.env, TMPDIR: root, HUB_TEST_FULLSUITE_LOCK: lock },
+    env: { ...process.env, TMPDIR: root, HUB_TEST_FULLSUITE_LOCK: lock, HUB_TEST_RUN_REPORT: "" },
   };
   return { root, lock, args, options };
 }
@@ -519,4 +520,58 @@ test("a serial rerun owns the full-suite lock until its worker exits", async (t)
     assert.deepEqual(await exited, [0, null]);
   }
   await assert.rejects(readFile(lock), { code: "ENOENT" });
+});
+
+test("TERM after the serial worker exits cannot turn its report into a pass", async (t) => {
+  const { root, lock, args, options } = await serialFixture(
+    t,
+    `
+    const { execFileSync } = await import("node:child_process");
+    execFileSync("mkfifo", [reportPath]);
+    writeFileSync(join(root, "report.partial"), JSON.stringify({ reportPath, report }));
+    renameSync(join(root, "report.partial"), join(root, "report.json"));
+  `,
+  );
+  const marker = join(root, "report.json");
+  const caller = spawn(process.execPath, [...args, "--rerun-failed"], {
+    ...options,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  for (const stream of [caller.stdout, caller.stderr]) {
+    stream.on("data", (chunk) => {
+      output += chunk;
+    });
+  }
+  const exited = once(caller, "close");
+  const result = once(caller, "exit", { signal: AbortSignal.timeout(8000) });
+  result.catch(() => {});
+  let writer;
+  try {
+    await waitFor(() => existsSync(marker), "serial worker did not create its report pipe");
+    const { reportPath, report } = JSON.parse(await readFile(marker, "utf8"));
+    for (let attempt = 0; !writer && attempt < 300; attempt++) {
+      try {
+        writer = await open(reportPath, constants.O_WRONLY | constants.O_NONBLOCK);
+      } catch (error) {
+        if (error.code !== "ENXIO") throw error;
+        await delay(10);
+      }
+    }
+    assert.ok(writer, output || "serial runner did not open the report pipe");
+    caller.kill("SIGTERM");
+    await delay(100);
+    await writer.writeFile(JSON.stringify(report));
+    await writer.close();
+    writer = undefined;
+    assert.deepEqual(await result, [1, null]);
+    await exited;
+    assert.match(output, /INTERRUPTED/u);
+    assert.doesNotMatch(output, /Serial rerun: PASS/u);
+    await assert.rejects(readFile(lock), { code: "ENOENT" });
+  } finally {
+    if (writer) await writer.close();
+    if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+    await exited;
+  }
 });
