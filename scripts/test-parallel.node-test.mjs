@@ -438,8 +438,8 @@ test("reruns see a lock as held only while its owner or recorded groups run", as
   assert.equal(fullSuiteLockHeld(path), false);
 });
 
-async function serialFixture(t, run) {
-  const root = await mkdtemp(join(tmpdir(), "hub-serial-test-"));
+async function parallelFixture(t, run) {
+  const root = await mkdtemp(join(tmpdir(), "hub-parallel-test-"));
   t.after(() => rm(root, { recursive: true }));
   const git = (...args) => execFileSync("git", ["-C", root, ...args]);
   git("init", "--quiet");
@@ -458,6 +458,7 @@ async function serialFixture(t, run) {
     "-m",
     "Initialize fixture",
   );
+  await writeFile(join(root, "selected.test.ts"), "");
   const cache = join(root, "node_modules/.vite/vitest/test-parallel");
   await mkdir(cache, { recursive: true });
   await mkdir(join(root, "node_modules/vitest"));
@@ -492,7 +493,7 @@ async function serialFixture(t, run) {
 }
 
 test("a serial rerun owns the full-suite lock until its worker exits", async (t) => {
-  const { root, lock, args, options } = await serialFixture(
+  const { root, lock, args, options } = await parallelFixture(
     t,
     `
     writeFileSync(join(root, "ready"), "");
@@ -523,7 +524,7 @@ test("a serial rerun owns the full-suite lock until its worker exits", async (t)
 });
 
 test("TERM after the serial worker exits cannot turn its report into a pass", async (t) => {
-  const { root, lock, args, options } = await serialFixture(
+  const { root, lock, args, options } = await parallelFixture(
     t,
     `
     const { execFileSync } = await import("node:child_process");
@@ -574,4 +575,84 @@ test("TERM after the serial worker exits cannot turn its report into a pass", as
     if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
     await exited;
   }
+});
+
+test("TERM during shard timing-cache reads prevents successful suite metrics", async (t) => {
+  const { root, lock, args, options } = await parallelFixture(
+    t,
+    `
+    const { mkdirSync } = await import("node:fs");
+    const cache = join(process.env.HUB_VITEST_CACHE_DIR, "vitest/fixture");
+    mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, "results.json"), JSON.stringify({ version: "fixture", results: [] }));
+    writeFileSync(reportPath, JSON.stringify(report));
+    `,
+  );
+  const preload = join(root, "pause-timings.mjs");
+  const marker = join(root, "reading-timings");
+  const metrics = join(root, "metrics.json");
+  await writeFile(
+    preload,
+    `
+    import { once } from "node:events";
+    import { writeFileSync } from "node:fs";
+    import fs from "node:fs/promises";
+    import { syncBuiltinESMExports } from "node:module";
+    const readFile = fs.readFile;
+    fs.readFile = async (path, ...args) => {
+      const data = await readFile(path, ...args);
+      if (String(path).endsWith("/vite/vitest/fixture/results.json")) {
+        const keepAlive = setInterval(() => {}, 1000);
+        const signal = once(process, "SIGTERM");
+        writeFileSync(${JSON.stringify(marker)}, "");
+        try { await signal; } finally { clearInterval(keepAlive); }
+      }
+      return data;
+    };
+    syncBuiltinESMExports();
+    `,
+  );
+
+  const env = { ...options.env, TEST_SHARDS: "1", HUB_TEST_RUN_REPORT: metrics };
+  const caller = spawn(process.execPath, ["--import", preload, ...args], {
+    ...options,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const exited = once(caller, "close");
+  let output = "";
+  for (const stream of [caller.stdout, caller.stderr]) {
+    stream.on("data", (chunk) => {
+      output += chunk;
+    });
+  }
+  try {
+    await waitFor(
+      () => existsSync(marker) || caller.exitCode !== null,
+      "timing cache was not read",
+    );
+    assert.ok(existsSync(marker), output);
+    const result = once(caller, "exit", { signal: AbortSignal.timeout(4000) });
+    caller.kill("SIGTERM");
+    assert.deepEqual(await result, [1, null]);
+    await exited;
+    assert.match(output, /Shard 1: PASS/u);
+    assert.match(output, /INTERRUPTED: SIGTERM/u);
+    await assert.rejects(readFile(metrics), { code: "ENOENT" });
+    await assert.rejects(readFile(lock), { code: "ENOENT" });
+  } finally {
+    if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+    await exited;
+  }
+
+  const passing = spawnSync(process.execPath, args, {
+    ...options,
+    env,
+    encoding: "utf8",
+    timeout: 4000,
+  });
+  assert.equal(passing.status, 0, passing.stderr);
+  const saved = JSON.parse(await readFile(metrics, "utf8"));
+  assert.deepEqual(saved.selectedFiles, ["selected.test.ts"]);
+  assert.deepEqual(saved.counts, { passed: 1, failed: 0, skipped: 0 });
 });
