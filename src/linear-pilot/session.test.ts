@@ -46,6 +46,67 @@ function ownedTurn() {
 
 const completion = stream({ type: "turn_completed", provider: "codex" });
 
+test("retains proof across 70 distinct assistant blocks", () => {
+  const turn = ownedTurn();
+  for (let index = 1; index <= 70; index++) {
+    expect(
+      turn.accept(
+        row(
+          {
+            type: "assistant_message",
+            messageId: `block-${index}`,
+            text: `Answer ${index}`,
+          },
+          index + 1,
+        ),
+      ),
+    ).toBeUndefined();
+  }
+  expect(turn.accept(completion)).toMatchObject({
+    status: "completed",
+    seq: 71,
+    messageId: "block-70",
+    answer: { text: "Answer 70", truncated: false },
+  });
+});
+
+test("a reused assistant block loses proof when it is current or immediately previous", () => {
+  const first = { type: "assistant_message", messageId: "first", text: "Do not use" } as const;
+  for (const between of [
+    { type: "tool_call", name: "read", result: "Tool boundary" },
+    { type: "assistant_message", messageId: "second", text: "Other answer" },
+  ] as const) {
+    const turn = ownedTurn();
+    turn.accept(row(first, 2));
+    turn.accept(row(between, 3));
+    expect(turn.accept(row(first, 4))).toMatchObject({ status: "unconfirmed" });
+    expect(turn.target).toBeUndefined();
+    expect(turn.turnEnded).toBe(false);
+  }
+});
+
+test("tracks only the current and previous assistant block ids", () => {
+  const turn = ownedTurn();
+  for (const [index, messageId] of ["first", "second", "third", "first"].entries()) {
+    expect(
+      turn.accept(
+        row(
+          {
+            type: "assistant_message",
+            messageId,
+            text: `Answer ${index}`,
+          },
+          index + 2,
+        ),
+      ),
+    ).toBeUndefined();
+  }
+  expect(turn.accept(completion)).toMatchObject({
+    status: "completed",
+    answer: { text: "Answer 3", truncated: false },
+  });
+});
+
 test("the exact terminal turn selects only its final assistant block", () => {
   const turn = ownedTurn();
   turn.accept(

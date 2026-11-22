@@ -78,7 +78,6 @@ export interface LinearPilotSessionHooks {
 
 type Stream = Extract<AgentEvent, { type: "agent_stream" }>;
 
-const MAX_ASSISTANT_BLOCKS = 64;
 const instant = z.iso.datetime({ offset: true });
 
 export function matchesLinearPilotStop(target: LinearPilotTarget, request: LinearPilotStopRequest) {
@@ -102,7 +101,8 @@ export class LinearPilotTurn {
   private active: LinearPilotTarget | undefined;
   private seq = 0;
   private messageId: string | undefined;
-  private readonly assistantBlocks = new Set<string>();
+  private previousMessageId: string | undefined;
+  private messageEnded = false;
   private text = "";
   private truncated = false;
   private sealed = false;
@@ -172,23 +172,28 @@ export class LinearPilotTurn {
       return this.loseProof();
     this.seq = seq;
     if (item.type === "user_message") return this.loseProof();
-    if (item.type === "tool_call") this.clearAnswer();
-    if (item.type === "assistant_message") {
-      if (!item.messageId || typeof item.text !== "string") return this.loseProof();
-      if (this.messageId !== item.messageId) {
-        if (
-          this.assistantBlocks.size >= MAX_ASSISTANT_BLOCKS ||
-          this.assistantBlocks.has(item.messageId)
-        )
-          return this.loseProof();
-        this.clearAnswer();
-        this.assistantBlocks.add(item.messageId);
-        this.messageId = item.messageId;
-      }
-      const remaining = MAX_REPLY_INPUT_CHARS - this.text.length;
-      this.text += item.text.slice(0, remaining);
-      this.truncated ||= item.text.length > remaining;
+    if (item.type === "tool_call") {
+      this.messageEnded = true;
+      this.clearAnswer();
     }
+    if (item.type === "assistant_message")
+      return this.acceptAssistantBlock(item.messageId, item.text);
+    return undefined;
+  }
+
+  private acceptAssistantBlock(messageId: string | undefined, text: string | undefined) {
+    if (!messageId || typeof text !== "string") return this.loseProof();
+    if (messageId === this.previousMessageId || (this.messageEnded && messageId === this.messageId))
+      return this.loseProof();
+    if (this.messageId !== messageId) {
+      this.clearAnswer();
+      this.previousMessageId = this.messageId;
+      this.messageId = messageId;
+      this.messageEnded = false;
+    }
+    const remaining = MAX_REPLY_INPUT_CHARS - this.text.length;
+    this.text += text.slice(0, remaining);
+    this.truncated ||= text.length > remaining;
     return undefined;
   }
 
@@ -224,7 +229,6 @@ export class LinearPilotTurn {
   }
 
   private clearAnswer(): void {
-    this.messageId = undefined;
     this.text = "";
     this.truncated = false;
   }

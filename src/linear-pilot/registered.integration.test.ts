@@ -23,6 +23,7 @@ import { createLinearRegistration } from "../providers/linear/index.js";
 import { prepareProfile, surfaceTenant } from "../surfaces/store.contract.js";
 import { pilotActivityIds } from "./activities.js";
 import { createLinearPilotRuntime } from "./runtime.js";
+import type { LinearPilotTerminal } from "./session.js";
 import { createdPayload, objectAt, type JsonObject } from "./test-utils/intake-fixtures.js";
 
 const secret = "synthetic-linear-signature";
@@ -89,7 +90,10 @@ async function registeredDatabase(backend: "embedded" | "postgres") {
   }
 }
 
-async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgres") {
+async function exerciseRegisteredPilot(
+  scenario: "stop" | "stop-race" | "postgres" | "start-refusal",
+  terminalFailure?: "failed" | "canceled" | "unconfirmed",
+) {
   const backend = scenario === "postgres" ? "postgres" : "embedded";
   const { runtime, locks, cleanup } = await registeredDatabase(backend);
   try {
@@ -406,6 +410,25 @@ async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgre
         );
         initialOutcome = "sent";
       };
+      if (scenario === "start-refusal") {
+        vi.spyOn(coordinator, "startLinearPilot").mockResolvedValue({
+          outcome: "refused",
+          code: "active_limit",
+        });
+        objectAt(session, "comment")["body"] = "@paseo private-body-canary";
+        assert.equal((await endpoint.handle(signedDelivery(payload))).status, 200);
+        await vi.waitFor(
+          () =>
+            expect(pilotFailure).toHaveBeenCalledExactlyOnceWith({
+              sessionId: nativeSessionId,
+              code: "active_limit",
+            }),
+          { timeout: 2_000 },
+        );
+        expect(provider).not.toHaveBeenCalled();
+        expect(agents.sends).toEqual([]);
+        return;
+      }
       const began = performance.now();
       assert.equal((await endpoint.handle(signedDelivery(payload))).status, 200);
       assert(performance.now() - began < 5_000);
@@ -449,6 +472,69 @@ async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgre
       }
       const send = agents.sends.at(-1);
       assert(send);
+      if (scenario === "stop" && terminalFailure) {
+        const before = publication.slice();
+        const onTerminal = pilot.sessionHooks.onTerminal.bind(pilot.sessionHooks);
+        let publicationResult: { terminal: LinearPilotTerminal; done: Promise<void> } | undefined;
+        vi.spyOn(pilot.sessionHooks, "onTerminal").mockImplementation((terminal) => {
+          const done = Promise.resolve(onTerminal(terminal));
+          publicationResult = { terminal, done };
+          return done;
+        });
+        const emit = {
+          failed: () =>
+            agents.emit(send.agentId, {
+              type: "turn_failed",
+              provider: "codex",
+              turnId: "turn-1",
+              error: "private daemon error",
+            }),
+          canceled: () =>
+            agents.emit(send.agentId, {
+              type: "turn_canceled",
+              provider: "codex",
+              turnId: "turn-1",
+              reason: "interrupted",
+            }),
+          unconfirmed: () =>
+            agents.emit(
+              send.agentId,
+              {
+                type: "timeline",
+                provider: "codex",
+                turnId: "turn-1",
+                item: {
+                  type: "assistant_message",
+                  messageId: "gap",
+                  text: "private assistant text",
+                },
+              },
+              { epoch: "turn-1", seq: 3 },
+            ),
+        };
+        emit[terminalFailure]();
+        const first = await vi.waitFor(
+          () => {
+            assert.ok(publicationResult);
+            return publicationResult;
+          },
+          { timeout: 5_000 },
+        );
+        await first.done;
+        expect(first.terminal.status).toBe(terminalFailure);
+        const expected = [
+          ...before,
+          {
+            id: pilotActivityIds(nativeSessionId, nativeSessionId).response,
+            type: "error",
+            body: "Paseo Hub could not complete this request.",
+          },
+        ];
+        expect(publication).toEqual(expected);
+        await onTerminal(first.terminal);
+        expect(publication).toEqual(expected);
+        return;
+      }
       agents.emit(
         send.agentId,
         {
@@ -614,11 +700,13 @@ async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgre
             },
             { epoch: "turn-2", seq: 2 },
           );
-          agents.emit(fresh.agentId, {
-            type: "turn_completed",
-            provider: "codex",
-            turnId: "turn-2",
-          });
+          const terminal = { provider: "codex", turnId: "turn-2" } as const;
+          agents.emit(
+            fresh.agentId,
+            terminalFailure
+              ? { ...terminal, type: "turn_failed", error: "private daemon error" }
+              : { ...terminal, type: "turn_completed" },
+          );
           try {
             return await stopCurrent(input);
           } finally {
@@ -746,5 +834,23 @@ test(
 test(
   "registered Stop settles when the exact active turn completes just before coordinator enqueue",
   () => exerciseRegisteredPilot("stop-race"),
+  120_000,
+);
+
+test.each(["failed", "canceled", "unconfirmed"] as const)(
+  "publishes one fixed terminal error for %s and ignores a replay",
+  (status) => exerciseRegisteredPilot("stop", status),
+  120_000,
+);
+
+test(
+  "registered Stop publishes only its own error when a failure races coordinator enqueue",
+  () => exerciseRegisteredPilot("stop-race", "failed"),
+  120_000,
+);
+
+test(
+  "reports only the fixed start refusal code and native session id",
+  () => exerciseRegisteredPilot("start-refusal"),
   120_000,
 );

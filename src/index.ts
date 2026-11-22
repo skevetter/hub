@@ -184,7 +184,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
             runtime,
             locks,
             scrubValues: timelineScrubValues,
-            reportFailure: () => logger.warn("Linear pilot delivery failed"),
+            reportFailure: (failure) => logger.warn(failure, "Linear pilot delivery failed"),
           })
         : undefined;
     const providerStore = createProviderApplicationStore(runtime, locks, database);

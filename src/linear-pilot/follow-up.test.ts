@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { LinearAgentError } from "../providers/linear/agent.js";
 import {
   createPilotFollowUp,
   type PilotFollowUpOptions,
@@ -164,5 +165,26 @@ describe("Linear pilot follow-up admission", () => {
     f.dispatchInitial.mockRejectedValueOnce(new Error("send result lost"));
     expect(await f.handle(scope, delivered)).toBe("unconfirmed");
     expect(f.dispatchInitial).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { error: new TypeError("private-token-canary private-body-canary"), code: "TypeError" },
+    { error: new LinearAgentError("policy_required"), code: "policy_required" },
+    { error: "private-token-canary private-body-canary", code: "unknown_error" },
+  ])("reports only the fixed $code and native session id", async ({ error, code }) => {
+    const f = fixture();
+    if (error instanceof Error) {
+      error.name = "private-name-canary";
+      error.message = "private-token-canary private-body-canary";
+    }
+    f.options.reserve.mockRejectedValueOnce(error);
+    const reportFailure = vi.fn();
+    const handle = createPilotFollowUp({ ...f.options, reportFailure });
+
+    expect(await handle(scope, delivered)).toBe("unconfirmed");
+    expect(reportFailure).toHaveBeenCalledExactlyOnceWith({
+      sessionId: scope.nativeSessionId,
+      code,
+    });
   });
 });

@@ -24,6 +24,10 @@ The signed event must prove who initiated the session. Hub uses the existing
 [Linear reply sanitizer](linear-reply.md) for the final answer from the proven
 turn.
 
+Admitted pilot messages appear under **Other** in Dropped events with the
+reason `linear_pilot_admitted`. Deploy outside active turns. Hub drops an
+owner message delivered during shutdown with HTTP 200, so Linear does not retry.
+
 ## Isolation assumption
 
 The pilot assumes Read Committed, the PostgreSQL default and the production
@@ -42,6 +46,94 @@ If the isolation setting changes, harden these three sites.
    [binding.ts:348](../src/linear-pilot/binding.ts#L348),
    [binding.ts:401](../src/linear-pilot/binding.ts#L401),
    [binding.ts:424](../src/linear-pilot/binding.ts#L424)
+
+## Rollout conditions
+
+Use the owner's Mac daemon for the pilot profile and dedicate it to the pilot.
+Set `PASEO_HUB_SESSION_MAX_ACTIVE_PER_DAEMON` and the profile's `maxActive` to
+the planned thread count. For acceptance, use 12 for both and start at most 12
+Linear threads.
+
+A native session uses capacity until a follow-up in the same thread retires
+it. A failed or canceled turn, a sealed turn that lost proof, a pilot profile
+edit, or a Hub restart during a turn can leave the session open without an
+automatic retirement path. Hub offers no Close or Stop control for native
+sessions in the pilot.
+
+## Manual close procedure
+
+The list query takes the pilot profile UUID as `$1` and shows open native
+sessions and their current pilot binding.
+
+```sql
+SELECT s.id, s.state, s.generation, s.created_at AS started_at, b.native_session_id
+FROM interactive_sessions AS s
+LEFT JOIN surface_bindings AS b
+  ON b.session_id = s.id AND b.organization_id = s.organization_id
+  AND b.policy_revision = 2147483647 AND b.superseded_at IS NULL
+WHERE s.profile_id = $1::uuid AND s.origin = 'linear' AND s.state <> 'closed'
+ORDER BY s.created_at, s.id;
+```
+
+Take a backup first. Stop the agent through Paseo if it is still running, then
+stop Hub before updating its database. Closing the Hub row releases capacity
+and retires its binding. Later prompts in that Linear thread are fenced.
+
+Run the following statement as a single transaction. Bind the listed session
+UUID as `$1` and the pilot profile UUID as `$2`. It locks the exact open Linear
+session and records the closed state using the same fields and event as
+automatic retirement. Counts of zero mean the guards found nothing to close.
+
+```sql
+WITH target AS (
+  SELECT s.id, s.organization_id, statement_timestamp() AS closed_at
+  FROM interactive_sessions AS s
+  WHERE s.id = $1::uuid AND s.profile_id = $2::uuid
+    AND s.origin = 'linear' AND s.state <> 'closed' AND s.closed_at IS NULL
+    AND s.requester_identity_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM surface_bindings AS b
+      WHERE b.session_id = s.id AND b.organization_id = s.organization_id
+        AND b.superseded_at IS NULL AND b.policy_revision <> 2147483647
+    )
+  FOR UPDATE OF s
+), closed AS (
+  UPDATE interactive_sessions AS s
+  SET state = 'closed',
+      state_reason = NULL,
+      closed_at = target.closed_at,
+      closed_by_user_id = NULL,
+      hub_seq = s.hub_seq + 1,
+      last_activity_at = greatest(s.last_activity_at, target.closed_at),
+      updated_at = greatest(s.updated_at, target.closed_at)
+  FROM target
+  WHERE s.id = target.id AND s.organization_id = target.organization_id
+  RETURNING s.id, s.organization_id, s.hub_seq, s.closed_at, s.generation, s.turn
+), retired AS (
+  UPDATE surface_bindings AS b
+  SET superseded_at = closed.closed_at
+  FROM closed
+  WHERE b.session_id = closed.id AND b.organization_id = closed.organization_id
+    AND b.policy_revision = 2147483647 AND b.superseded_at IS NULL
+  RETURNING b.id
+), state_event AS (
+  INSERT INTO interactive_session_events (session_id, organization_id, seq, kind, data, at)
+  SELECT id, organization_id, hub_seq, 'state',
+         jsonb_build_object('state', 'closed', 'stateReason', NULL,
+                            'generation', generation, 'turn', turn),
+         closed_at
+  FROM closed
+  RETURNING session_id
+)
+SELECT (SELECT count(*)::int FROM closed) AS sessions_closed,
+       (SELECT count(*)::int FROM retired) AS bindings_retired,
+       (SELECT count(*)::int FROM state_event) AS events_written;
+```
+
+In `psql`, prepend `PREPARE pilot_list(uuid) AS` or
+`PREPARE pilot_close(uuid, uuid) AS` to the corresponding statement. Use
+`EXECUTE pilot_list('profile UUID')` or
+`EXECUTE pilot_close('session UUID', 'profile UUID')` with the actual UUIDs.
 
 ## Follow-up messages
 
@@ -70,6 +162,9 @@ is known. It posts `Stopped.` only after observing that the targeted turn
 ended or was canceled. If it cannot confirm the outcome, it posts
 `Stop requested; I could not confirm it stopped` and leaves further sends
 blocked. Hub does not retry the interrupt automatically.
+
+A sealed turn has lost proof of the active turn and leaves the daemon agent
+running. Stop that agent directly through Paseo.
 
 The daemon accepts an agent ID for an interrupt. A person driving the same agent
 directly through Paseo on the daemon can start a turn between Hub's check and

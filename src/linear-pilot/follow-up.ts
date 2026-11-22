@@ -1,6 +1,11 @@
 import { validMessage } from "../interactive-sessions/store.js";
 import { z } from "zod";
+import { DaemonResponseLostError } from "../daemons/protocol.js";
+import { DatabaseUnavailableError } from "../db/errors.js";
+import type { RefusalCode } from "../interactive-sessions/types.js";
+import { LinearAgentError } from "../providers/linear/agent.js";
 import { surfaceRevision, type BindingKey } from "../surfaces/store.js";
+import type { PilotRefusal } from "./binding.js";
 import {
   composePilotPrompt,
   PILOT_HISTORY_PAGE_SIZE,
@@ -62,6 +67,33 @@ interface FreshTurn {
 type StopOutcome = "stopped" | "duplicate" | "ignored" | "unconfirmed";
 type FollowUpOutcome = StopOutcome | "started" | "busy";
 
+export interface PilotFailure {
+  sessionId: string;
+  code:
+    | LinearAgentError["code"]
+    | RefusalCode
+    | PilotRefusal
+    | "retirement_refused"
+    | "unconfirmed"
+    | "DaemonResponseLostError"
+    | "DatabaseUnavailableError"
+    | "TypeError"
+    | "RangeError"
+    | "SyntaxError"
+    | "Error"
+    | "unknown_error";
+}
+
+export function pilotExceptionCode(error: unknown): PilotFailure["code"] {
+  if (error instanceof LinearAgentError) return error.code;
+  if (error instanceof DaemonResponseLostError) return "DaemonResponseLostError";
+  if (error instanceof DatabaseUnavailableError) return "DatabaseUnavailableError";
+  if (error instanceof TypeError) return "TypeError";
+  if (error instanceof RangeError) return "RangeError";
+  if (error instanceof SyntaxError) return "SyntaxError";
+  return error instanceof Error ? "Error" : "unknown_error";
+}
+
 export interface PilotFollowUpOptions {
   /** Serialize this native session with competing admissions, binding changes and Stop. */
   withSession<T>(scope: PilotConversation, run: () => Promise<T>): Promise<T>;
@@ -88,6 +120,7 @@ export interface PilotFollowUpOptions {
   reserve(input: Admission): Promise<FreshTurn | undefined>;
   /** Recheck and interrupt the exact active agent and daemon turn once. Fence on unknown result. */
   stopCurrent(input: Admission & { requestedAt: string }): Promise<StopOutcome>;
+  reportFailure?(failure: PilotFailure): void;
 }
 
 export function createPilotFollowUp(options: PilotFollowUpOptions) {
@@ -128,8 +161,12 @@ export function createPilotFollowUp(options: PilotFollowUpOptions) {
           return (await options.appendBusy(admission)) ? "busy" : "unconfirmed";
         return startFreshFollowUp(options, admission, body);
       });
-    } catch {
+    } catch (error) {
       // A failed or uncertain attempt cannot be retried with its original claim.
+      options.reportFailure?.({
+        sessionId: scope.nativeSessionId,
+        code: pilotExceptionCode(error),
+      });
       return "unconfirmed";
     }
   };

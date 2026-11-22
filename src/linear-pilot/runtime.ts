@@ -18,7 +18,13 @@ import type { LinearPilotConfig } from "./config.js";
 import { qualifyLinearPilotDelivery, resolveLinearPilotInstallation } from "./installation.js";
 import { classifyLinearPilotCompanionComment } from "./intake.js";
 import { adaptSignedPilotFollowUp } from "./follow-up-event.js";
-import { createPilotFollowUp, type PilotConversation, type PilotTurn } from "./follow-up.js";
+import {
+  createPilotFollowUp,
+  pilotExceptionCode,
+  type PilotConversation,
+  type PilotFailure,
+  type PilotTurn,
+} from "./follow-up.js";
 import type { PilotHistoryScope } from "./history-read.js";
 import { createPilotSessionSerialization } from "./session-serialization.js";
 import type { LinearPilotSessionHooks } from "./session.js";
@@ -37,7 +43,7 @@ interface Options {
   runtime: DatabaseRuntime;
   locks: Locks;
   scrubValues?: readonly string[];
-  reportFailure?(): void;
+  reportFailure?(failure: PilotFailure): void;
 }
 
 interface Active extends PilotTurnGrant {
@@ -76,6 +82,12 @@ export function createLinearPilotRuntime(options: Options) {
   const jobs = new Set<Promise<void>>();
   let coordinator: InteractiveSessionCoordinator | undefined;
   let accepting = true;
+
+  function reportFailure(failure: PilotFailure): void {
+    try {
+      options.reportFailure?.(failure);
+    } catch {}
+  }
 
   function eventScope({ event, installation }: Qualified) {
     const authority: PilotAuthority = {
@@ -127,10 +139,14 @@ export function createLinearPilotRuntime(options: Options) {
     const { message, nativeSessionId } = event;
     if (!message || !validMessage(message)) return;
     const { authority, origin, principal } = eventScope(qualified);
+    const report = (code: PilotFailure["code"]) =>
+      reportFailure({ sessionId: nativeSessionId, code });
     await withSession(authority, origin, async () => {
       const now = new Date();
       if (!accepting || now.getTime() - receivedAt.getTime() >= 10_000) return;
-      if ((await bindings.find(authority, origin)).status !== "none") return;
+      const prior = await bindings.find(authority, origin);
+      if (prior.status === "refused") return report(prior.reason);
+      if (prior.status !== "none") return;
       const admitted = await recordLinearPilotAdmission(runtime, {
         ...installation,
         profileId: config.profileId,
@@ -141,7 +157,7 @@ export function createLinearPilotRuntime(options: Options) {
       });
       if (!admitted) return;
       const identity = await bindings.mapIdentity(authority, "Linear pilot owner", now);
-      if (identity.status === "refused") return;
+      if (identity.status === "refused") return report(identity.reason);
       pending.set(nativeSessionId, { installation, identityId: identity.identity.id });
       try {
         const start = await sessions.startLinearPilot(principal, {
@@ -154,12 +170,14 @@ export function createLinearPilotRuntime(options: Options) {
             workspaceId: installation.workspaceId,
           },
         });
-        if (start.outcome !== "accepted" || start.replayed) return;
+        if (start.outcome === "refused") return report(start.code);
+        if (start.replayed) return;
         const binding = await bindings.admit(authority, {
           ...origin,
           sessionId: start.sessionId,
           now,
         });
+        if (binding.status === "refused") return report(binding.reason);
         if (binding.status !== "created") return;
         const activity = acceptedActivity(qualified, "created", nativeSessionId, receivedAt);
         const grant: Active = {
@@ -218,7 +236,20 @@ export function createLinearPilotRuntime(options: Options) {
   }
 
   function writerFor(grant: Active) {
-    return createLinearPilotActivities({ clientFor: (activity) => clientFor(grant, activity) });
+    return createLinearPilotActivities({
+      clientFor(activity) {
+        const client = clientFor(grant, activity);
+        const trace = <T>(request: Promise<T>) =>
+          request.catch((error: unknown) => {
+            reportFailure({ sessionId: activity.nativeSessionId, code: pilotExceptionCode(error) });
+            throw error;
+          });
+        return {
+          createActivity: (input, signal) => trace(client.createActivity(input, signal)),
+          isActivityConfirmed: (input, signal) => trace(client.isActivityConfirmed(input, signal)),
+        };
+      },
+    });
   }
 
   async function boundLiveSession(
@@ -229,6 +260,9 @@ export function createLinearPilotRuntime(options: Options) {
     origin: PilotNativeOrigin,
   ): Promise<BoundLiveSession | undefined> {
     const found = await bindings.find(authority, origin);
+    if (found.status === "refused") {
+      reportFailure({ sessionId: origin.nativeSessionId, code: found.reason });
+    }
     if (found.status !== "bound") return undefined;
     const { binding } = found;
     const stored = await database.findInteractiveSession(
@@ -296,9 +330,12 @@ export function createLinearPilotRuntime(options: Options) {
       allowedHumanProviderUserId: config.allowedHumanId,
     };
     let current: BoundLiveSession | undefined;
+    const report = (code: PilotFailure["code"]) =>
+      reportFailure({ sessionId: origin.nativeSessionId, code });
     const run = createPilotFollowUp({
       withSession: (_scope, operation) => withSession(authority, origin, operation),
       activityIds: pilotActivityIds,
+      reportFailure,
       current: async (): Promise<PilotTurn | undefined> => {
         if (!accepting) return undefined;
         current = await boundLiveSession(qualified, provider, receivedAt, authority, origin);
@@ -385,7 +422,10 @@ export function createLinearPilotRuntime(options: Options) {
             agentId: daemonAgentId,
             expectedBindingGeneration: binding.generation,
           });
-          if (!retired) return undefined;
+          if (!retired) {
+            report("retirement_refused");
+            return undefined;
+          }
         } finally {
           active.delete(session.id);
         }
@@ -397,7 +437,11 @@ export function createLinearPilotRuntime(options: Options) {
             idempotencyKey: activityId,
             nativeRequester: { identityId: requesterIdentityId, workspaceId: scope.workspaceId },
           });
-          if (start.outcome !== "accepted" || start.replayed) return undefined;
+          if (start.outcome === "refused") {
+            report(start.code);
+            return undefined;
+          }
+          if (start.replayed) return undefined;
           const switched = await bindings.advance(authority, {
             ...origin,
             nextSessionId: start.sessionId,
@@ -412,6 +456,7 @@ export function createLinearPilotRuntime(options: Options) {
               firstCommandId: grant.commandId,
             },
           });
+          if (switched.status === "refused") report(switched.reason);
           if (switched.status !== "advanced") return undefined;
           active.set(start.sessionId, {
             authority,
@@ -428,7 +473,10 @@ export function createLinearPilotRuntime(options: Options) {
             generation: switched.binding.generation,
             dispatchInitial: async (message) => {
               const outcome = await start.dispatch(message);
-              if (outcome !== "started") active.delete(start.sessionId);
+              if (outcome !== "started") {
+                active.delete(start.sessionId);
+                report(outcome);
+              }
               return outcome;
             },
           };
@@ -524,6 +572,8 @@ export function createLinearPilotRuntime(options: Options) {
               terminal.answer,
               options.scrubValues ?? [],
             );
+          } else {
+            await writer.error(grant.activity, "first-attempt");
           }
         } finally {
           active.delete(grant.sessionId);
@@ -545,7 +595,12 @@ export function createLinearPilotRuntime(options: Options) {
       if (!accepting || !qualified) return false;
       const dispatch = qualified.event.kind === "created" ? dispatchCreated : dispatchFollowUp;
       const job = dispatch(qualified, provider, input.receivedAt, sessions)
-        .catch(() => options.reportFailure?.())
+        .catch((error: unknown) =>
+          reportFailure({
+            sessionId: qualified.event.nativeSessionId,
+            code: pilotExceptionCode(error),
+          }),
+        )
         .finally(() => jobs.delete(job));
       jobs.add(job);
       return true;
