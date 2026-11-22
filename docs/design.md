@@ -52,7 +52,7 @@ as the link and focus hue.
 | `destructive`             | `#e8837a`             | Destructive button fill and error text.                                                                                                          |
 
 Status tones (`success`, `warning`, `danger`, `neutral`) and their `-surface` pairs are unchanged and
-are only ever read through `StatusPill`.
+are only ever read through `StatusPill` and the state marks of `Checklist`.
 
 Light values mirror Linear's light ramp in the same file. The app currently renders dark only; keep the
 light column correct anyway so a toggle is a one-line change.
@@ -134,7 +134,8 @@ missing app component.
 | `RecordList`, `RecordRow`                                               | List a card's own few records, with no header row to repeat the card's subject.     |
 | `TwoLine`                                                               | Show a primary fact over a muted secondary one, in a cell or a row.                 |
 | `SummaryPanel`                                                          | Show labelled facts as a description list.                                          |
-| `StatTile`, `StatGrid`                                                  | Show a figure with a label.                                                         |
+| `StatTile`, `StatGrid`, `StatTileSkeleton`                              | Show a figure with a label. Four or five tiles sit two across on a phone.           |
+| `Checklist`, `ChecklistItem`, `ChecklistProgress`                       | Show steps toward a goal: a state mark, what to do, and one action per step.        |
 | `StatusPill`                                                            | Show state. Never `Badge`, never a coloured span.                                   |
 | `EmptyState`                                                            | Say there is nothing here and what to do about it.                                  |
 | `FormField`, `FieldSkeleton`                                            | Label a control, with optional description and error. Wraps any control.            |
@@ -173,6 +174,10 @@ Rules for the roster:
   it itself. Inside a form, a dialog, or a section, leave it off — the container's gap already
   spaces it.
 - Every skeleton lives next to the component it mirrors and shares its box.
+- An alert's control sits at the far edge from `sm` up and takes its own row under the message on
+  a phone. A value in a `CopyField` breaks anywhere; pass `prose` when the value is a sentence.
+- Motion is colour and background only, and `src/styles.css` switches all of it off under
+  `prefers-reduced-motion`. No component carries its own reduced-motion variant.
 - Every component has one visual result. If a caller passes `className` to change how it looks, the
   component is missing a prop or the caller is wrong. `className` is for placement in a grid only.
 - Delete what nothing imports. Dead primitives in `ui` are deleted, not kept for later.
