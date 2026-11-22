@@ -14,7 +14,7 @@ import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
 import { isEntrypoint, printRunContext, repositoryFor } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
-import { runWorkerGroup, takeFullSuiteLock, testSignals } from "./test-worker-group.mjs";
+import { runWorkerGroup, takeFullSuiteLock, watchTestSignals } from "./test-worker-group.mjs";
 
 export function partitionFiles(files, count) {
   const shardCount = Math.min(count, files.length);
@@ -100,9 +100,12 @@ export async function runShards(groups, { execute, print, signal }) {
 
 export async function rerunFiles(files, execute, print, signal) {
   const result = await execute("Serial rerun", files);
+  if (signal?.aborted) {
+    printInterrupted(print, signal, result.interruptedFiles ?? 0);
+    return 1;
+  }
   printRun(print, "Serial rerun", files, result);
-  printInterrupted(print, signal, result.interruptedFiles ?? 0);
-  return signal?.aborted ? 1 : result.exitCode;
+  return result.exitCode;
 }
 
 async function readCachedResults(directory) {
@@ -333,9 +336,7 @@ async function main() {
     throw new Error("TEST_SHARDS must be a positive integer.");
   }
   let lock;
-  const controller = new AbortController();
-  const interrupt = (signal) => controller.abort(signal);
-  for (const signal of testSignals) process.on(signal, interrupt);
+  const { signal, close } = watchTestSignals();
   let runDirectory;
   let exitCode = 1;
   try {
@@ -347,7 +348,7 @@ async function main() {
       root,
       ["list", "--filesOnly", `--json=${listing}`],
       discovery,
-      controller.signal,
+      signal,
       lock,
     );
     if (found.exitCode)
@@ -365,20 +366,26 @@ async function main() {
         name,
         selected,
         runDirectory,
-        controller.signal,
+        signal,
         (args, directory, signal) => invokeVitest(root, args, directory, signal, lock),
       );
       runs.push({ files: selected, counts: result.counts });
       return result;
     };
     if (values["rerun-failed"]) {
-      exitCode = await rerunFiles(
+      return await rerunFiles(
         await readFailedFiles(failedFileList, files),
-        execute,
+        async (name, selected) => {
+          const result = await execute(name, selected);
+          if (result.exitCode === 0 && !signal.aborted) {
+            await publishTestMetrics(runs, [], root);
+            await rm(runDirectory, { recursive: true });
+          }
+          return result;
+        },
         console.log,
+        signal,
       );
-      if (exitCode === 0) await publishTestMetrics(runs, [], root);
-      return exitCode;
     }
     await rm(failedFileList, { force: true });
     const groups = partitionFiles(await weighFiles(root, cacheRoot, files), count);
@@ -387,9 +394,9 @@ async function main() {
     const result = await runShards(groups, {
       execute,
       print: console.log,
-      signal: controller.signal,
+      signal: signal,
     });
-    exitCode = controller.signal.aborted ? 1 : result.exitCode;
+    exitCode = signal.aborted ? 1 : result.exitCode;
     console.log(
       `Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`,
     );
@@ -402,14 +409,17 @@ async function main() {
     }
     return exitCode;
   } catch (error) {
-    if (controller.signal.aborted) console.log(`INTERRUPTED: ${controller.signal.reason}`);
+    if (signal.aborted) console.log(`INTERRUPTED: ${signal.reason}`);
     throw error;
   } finally {
     try {
       if (exitCode === 0 && runDirectory) await rm(runDirectory, { recursive: true });
     } finally {
-      lock?.release();
-      for (const signal of testSignals) process.off(signal, interrupt);
+      try {
+        lock?.release();
+      } finally {
+        close();
+      }
     }
   }
 }
@@ -420,7 +430,7 @@ if (isEntrypoint(import.meta.url)) {
       process.exitCode = exitCode;
     },
     (error) => {
-      console.error(error.message);
+      if (error instanceof Error) console.error(error.message);
       process.exitCode = 1;
     },
   );
