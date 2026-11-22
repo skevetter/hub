@@ -63,6 +63,21 @@ runs every 2 seconds while a captured answer waits, and a new answer never delay
 cycle that is already scheduled. With nothing waiting it runs every 30 seconds, so an
 idle Hub makes at most 2 database queries per minute for replies.
 
+## Acceptance limits
+
+For any answer, including adversarial input:
+
+- The reply always posts, as Markdown or as plain text. It is never lost because the
+  Markdown step fails.
+- No resolvable mention or profile link survives, and no known secret appears verbatim.
+- The final body is at most 3,500 characters.
+- Rendering takes under 300 ms in the worst case and under 30 ms for typical answers.
+
+Which path an answer takes depends on its text alone. Deeply nested or marker-heavy
+text goes to plain text before any parsing. The 150 ms render budget is only a last
+safety net, and Hub logs a debug line when it fires. The cap of 60 replies per hour per
+organization bounds the total CPU an adversary can spend.
+
 ## Troubleshooting and turning replies off
 
 The Activity run detail shows **Reply not posted** with the reason when Hub
