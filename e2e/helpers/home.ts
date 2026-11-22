@@ -2,9 +2,9 @@ import { expect, type Locator, type Page } from "@playwright/test";
 
 export type ChecklistStepTitle =
   | "Connect an app"
-  | "Connect a daemon"
+  | "Enroll a daemon"
   | "Create a trigger"
-  | "Run it";
+  | "Record a run";
 
 /**
  * The organization landing: the checklist and the overview under it. Rows are addressed by the

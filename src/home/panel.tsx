@@ -186,10 +186,7 @@ function HomeView({
         }
       >
         {data.runs.length === 0 ? (
-          <EmptyState
-            title="No runs yet"
-            description="Runs appear here as soon as a trigger launches an agent."
-          />
+          <EmptyState title="No recent runs" />
         ) : (
           <RecordList label="Recent runs">
             {data.runs.slice(0, RECENT_RUNS_SHOWN).map((run) => (
@@ -317,10 +314,7 @@ function NeedsAttention({
               </Button>
             }
           >
-            <p>
-              Hub cannot use {names} until an organization owner authorizes it again. Events from it
-              are not handled in the meantime.
-            </p>
+            <p>Review authorization for {names} in Connections.</p>
           </WarningAlert>
         );
       })}
@@ -363,7 +357,7 @@ function daemonAttention(
   const names = able.map(({ slug }) => slug).join(", ");
   return {
     title: "No daemon that may run agents is connected.",
-    message: `${names} ${able.length === 1 ? "is" : "are"} not connected. Triggers and sessions wait until ${able.length === 1 ? "it reconnects" : "one reconnects"}.`,
+    message: `${names} ${able.length === 1 ? "is" : "are"} not connected. Reconnect a daemon to run work configured for it.`,
   };
 }
 
@@ -398,7 +392,7 @@ function ThingsToTry({
     <Section>
       <Card
         title="Things to try"
-        description="Pick an example, copy the prompt, and send it where your team works."
+        description="Explore example prompts and see what each surface needs."
       >
         <SegmentedControl
           label="Where to try it"
@@ -407,7 +401,9 @@ function ThingsToTry({
           onChange={(value) => setSelected(value as TrySurfaceKey)}
         />
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-4 gap-y-2">
-          <p className="min-w-0 flex-1 basis-64 text-sm text-muted-foreground">{surface.where}</p>
+          <p className="min-w-0 flex-1 basis-64 wrap-anywhere text-sm text-muted-foreground">
+            {surface.where}
+          </p>
           {surface.next === undefined ? null : (
             <Button asChild variant="outline" size="sm">
               <Link to={`${base}/${surface.next.path}` as never}>{surface.next.label}</Link>
@@ -772,7 +768,7 @@ function daemonStep(
   snapshot: HomeSnapshot,
   origin: string | undefined,
 ): StepPresentation {
-  const title = "Connect a daemon";
+  const title = "Enroll a daemon";
   if (state === "done") {
     const able = snapshot.daemons.filter(({ canExecute }) => canExecute);
     const connected = able.filter(({ presence }) => presence === "connected").length;
@@ -785,7 +781,7 @@ function daemonStep(
   if (state === "cannotRun") {
     return {
       title,
-      hint: `${snapshot.daemons.map(({ slug }) => slug).join(", ")} is connected but was not allowed to run Hub automations. Run this on it:`,
+      hint: "Allow Hub automations on an enrolled daemon by running this command there:",
       status: { label: "Cannot run agents", tone: "warning" },
       command: { label: "Grant command", value: GRANT_EXECUTE_COMMAND },
     };
@@ -815,7 +811,7 @@ function triggerStep(
   }
   return {
     title,
-    hint: "Decide which event launches which agent, and where.",
+    hint: "Choose an event and configure the work Hub runs when it matches.",
     status: TO_DO,
     action: (
       <Button asChild variant="outline" size="sm">
@@ -830,14 +826,14 @@ function runStep(
   snapshot: HomeSnapshot,
   base: string,
 ): StepPresentation {
-  const title = "Run it";
+  const title = "Record a run";
   const latest = snapshot.runs[0];
   if (state === "done" && latest !== undefined) {
     return {
       title,
       hint: (
         <>
-          {latest.triggerName} ran <RelativeTime value={latest.receivedAt} />
+          {latest.triggerName} received an event <RelativeTime value={latest.receivedAt} />
         </>
       ),
       status: DONE,
@@ -851,26 +847,23 @@ function runStep(
   return { title, hint: runHint(snapshot.triggers), status: TO_DO };
 }
 
-/** How to make a trigger fire, said for the events the organization actually listens to. */
+/** Suggest an action supported by the enabled events without assuming their filters. */
 export function runHint(triggers: HomeSnapshot["triggers"]): string {
-  if (triggers.length === 0) return "Once a trigger exists, fire its event.";
+  const activeTriggers = triggers.filter(({ enabled }) => enabled);
+  if (activeTriggers.length === 0) {
+    return triggers.length === 0 ? "Create and enable a trigger first." : "Enable a trigger first.";
+  }
+
   const hints = new Set<string>();
-  for (const { event } of triggers) {
-    const provider = event === "github.notification" ? "github_notification" : event.split(".")[0];
-    if (provider === "slack" || provider === "discord") {
-      hints.add("Mention the bot in a channel it can see.");
-    } else if (provider === "github") {
-      hints.add("Open or comment on an issue or pull request in a connected repository.");
-    } else if (provider === "linear") {
-      hints.add("Update an issue in the connected Linear workspace.");
-    } else if (provider === "schedule") {
-      hints.add("It runs on its schedule.");
-    } else if (provider === "github_notification") {
-      hints.add("Receive a GitHub notification that matches its filters.");
-    } else {
+  for (const { event } of activeTriggers) {
+    if (event === "manual.run") {
       hints.add(
-        "Send an event with an API key: POST /api/v1/hooks/{trigger} or POST /api/v1/manual-runs.",
+        "Check the trigger's allowed callers and inputs. Send an event with an API key to POST /api/v1/hooks/{trigger} or POST /api/v1/manual-runs.",
       );
+    } else if (event === "schedule.tick") {
+      hints.add("Check the trigger's schedule for when it can run.");
+    } else {
+      hints.add("Send an event that matches an enabled trigger's settings.");
     }
   }
   return [...hints].join(" ");
