@@ -10,7 +10,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
 import { isEntrypoint, printRunContext, repositoryFor } from "./test-context.mjs";
@@ -170,11 +170,12 @@ async function weighFiles(root, cacheRoot, paths) {
   }));
 }
 
-async function invokeVitest(root, args, directory, signal, lock) {
-  await mkdir(directory);
-  const log = await open(join(directory, "vitest.log"), "w", 0o600);
+export function shardEnvironment(directory, parent = process.env) {
+  const miseDataHome = parent.XDG_DATA_HOME || join(parent.HOME || homedir(), ".local", "share");
   const env = {
-    ...process.env,
+    ...parent,
+    // Mise shims need the caller's installed tools after XDG_DATA_HOME changes.
+    MISE_DATA_DIR: parent.MISE_DATA_DIR ?? join(miseDataHome, "mise"),
     TMPDIR: directory,
     TMP: directory,
     TEMP: directory,
@@ -185,10 +186,16 @@ async function invokeVitest(root, args, directory, signal, lock) {
     TESTCONTAINERS_RYUK_TEST_LABEL: "true",
   };
   delete env.TESTCONTAINERS_RYUK_PORT;
+  return env;
+}
+
+export async function invokeVitest(root, args, directory, signal, lock) {
+  await mkdir(directory);
+  const log = await open(join(directory, "vitest.log"), "w", 0o600);
   try {
     return await runWorkerGroup([join(root, "node_modules/vitest/vitest.mjs"), ...args], {
       cwd: root,
-      env,
+      env: shardEnvironment(directory),
       log,
       lock,
       signal,

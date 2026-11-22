@@ -10,7 +10,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { executeFiles, partitionFiles, rerunFiles, runShards } from "./test-parallel.mjs";
+import {
+  executeFiles,
+  invokeVitest,
+  partitionFiles,
+  rerunFiles,
+  runShards,
+  shardEnvironment,
+} from "./test-parallel.mjs";
 import { runWorkerGroup, takeFullSuiteLock } from "./test-worker-group.mjs";
 
 test("partition puts each file in one shard and balances cached durations", () => {
@@ -344,4 +351,55 @@ test("an interrupt reports incomplete files separately from failed assertions", 
   assert.deepEqual(result, { exitCode: 1, failedFiles: files });
   assert.match(output.join("\n"), /Total: 3 files, 0 passed, 1 failed, 0 skipped/u);
   assert.match(output.join("\n"), /^INTERRUPTED: 2 files did not report$/mu);
+});
+
+test("each shard isolates application data while keeping Mise's existing tool directory", () => {
+  const parent = {
+    HOME: "/home/tester",
+    XDG_DATA_HOME: "/custom/data",
+    PATH: "/tools/bin:/usr/bin",
+    TESTCONTAINERS_RYUK_PORT: "1234",
+  };
+  const first = shardEnvironment("/tmp/first", parent);
+  const second = shardEnvironment("/tmp/second", parent);
+  assert.equal(first.XDG_DATA_HOME, "/tmp/first/data");
+  assert.equal(second.XDG_DATA_HOME, "/tmp/second/data");
+  assert.equal(first.TMPDIR, "/tmp/first");
+  assert.equal(second.TMPDIR, "/tmp/second");
+  assert.equal(first.HUB_VITEST_CACHE_DIR, "/tmp/first/vite");
+  assert.equal(first.PASEO_HUB_DATA_DIR, "/tmp/first/embedded");
+  assert.equal(first.TESTCONTAINERS_RYUK_PORT, undefined);
+  assert.equal(first.PATH, parent.PATH);
+  assert.equal(first.MISE_DATA_DIR, "/custom/data/mise");
+  assert.equal(second.MISE_DATA_DIR, first.MISE_DATA_DIR);
+  assert.equal(
+    shardEnvironment("/tmp/first", { HOME: "/home/tester" }).MISE_DATA_DIR,
+    "/home/tester/.local/share/mise",
+  );
+  assert.equal(
+    shardEnvironment("/tmp/first", { ...parent, MISE_DATA_DIR: "/custom/mise" }).MISE_DATA_DIR,
+    "/custom/mise",
+  );
+});
+
+test("a launched shard receives the isolated data paths and caller's Mise install", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hub-worker-env-"));
+  t.after(() => rm(directory, { recursive: true }));
+  await mkdir(join(directory, "node_modules/vitest"), { recursive: true });
+  await writeFile(
+    join(directory, "node_modules/vitest/vitest.mjs"),
+    `
+    const { MISE_DATA_DIR, TMPDIR, XDG_DATA_HOME } = process.env;
+    console.log(JSON.stringify({ MISE_DATA_DIR, TMPDIR, XDG_DATA_HOME }));
+  `,
+  );
+
+  const shard = join(directory, "shard");
+  const result = await invokeVitest(directory, [], shard, new AbortController().signal);
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(JSON.parse(await readFile(join(shard, "vitest.log"), "utf8")), {
+    MISE_DATA_DIR: shardEnvironment(shard).MISE_DATA_DIR,
+    TMPDIR: shard,
+    XDG_DATA_HOME: join(shard, "data"),
+  });
 });
