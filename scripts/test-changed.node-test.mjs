@@ -2,7 +2,12 @@ import ts from "typescript";
 import { generateRuntimeMap, readRuntimeInputs } from "./generate-test-runtime-files.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
+import { git } from "./test-context.mjs";
 import { combinePaths, resolveBase, selectTests } from "./test-changed.mjs";
 
 test("combines tracked and untracked paths without splitting names on whitespace", () => {
@@ -123,37 +128,72 @@ test("coverage of the whole suite via the module graph is handed to the full run
   assert.deepEqual([...plan.tests.keys()], discovered);
 });
 
-test("default base prefers origin main, local main, and the configured upstream in order", () => {
-  const bases = new Map([
-    ["origin/main", "remote-main"],
-    ["main", "local-main"],
-    ["fork/topic", "upstream"],
-  ]);
-  const git = (args) => (args[0] === "merge-base" ? (bases.get(args[2]) ?? null) : "fork/topic");
-  assert.equal(resolveBase(undefined, git).tree, "remote-main");
-  bases.delete("origin/main");
-  assert.equal(resolveBase(undefined, git).tree, "local-main");
-  bases.delete("main");
-  assert.equal(resolveBase(undefined, git).tree, "upstream");
+async function releaseFixture(t) {
+  const root = await mkdtemp(join(tmpdir(), "hub-test-base-"));
+  t.after(() => rm(root, { recursive: true }));
+  const run = (...args) =>
+    execFileSync(
+      "git",
+      [
+        "-C",
+        root,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.test",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        `core.hooksPath=${join(root, "no-hooks")}`,
+        ...args,
+      ],
+      { encoding: "utf8" },
+    ).trim();
+  run("init", "--quiet", "--initial-branch=main");
+  const commit = (name) => {
+    run("commit", "--quiet", "--allow-empty", "-m", name);
+    return run("rev-parse", "HEAD");
+  };
+  const main = commit("main");
+  run("update-ref", "refs/remotes/origin/main", main);
+  return { run, commit, main, find: (base) => resolveBase(base, (args) => git(root, args)) };
+}
+
+test("the closest release merge base wins, with the highest version breaking ties", async (t) => {
+  const { run, commit, main, find } = await releaseFixture(t);
+  run("branch", "release/notifications-90", main);
+  run("switch", "--quiet", "-c", "release/notifications-21");
+  const older = commit("older release");
+  run("switch", "--quiet", "-c", "release/notifications-22");
+  const branchPoint = commit("release branch point");
+  run("update-ref", "refs/remotes/origin/release/notifications-23", branchPoint);
+  run("switch", "--quiet", "-c", "feature");
+  commit("feature change");
+  run("switch", "--quiet", "release/notifications-22");
+  commit("release branch continued");
+  run("switch", "--quiet", "feature");
+  assert.equal(find().tree, branchPoint);
+  assert.match(find().display, /origin\/release\/notifications-23/u);
+  assert.match(find().reason, /closest release.*1 commit/u);
+
+  run("update-ref", "-d", "refs/remotes/origin/release/notifications-23");
+  assert.equal(find().tree, branchPoint);
+  run("switch", "--quiet", "release/notifications-22");
+  assert.equal(find().tree, older);
 });
 
-test("default base uses the previous release in numeric version order", () => {
-  const refs = [
-    "refs/heads/release/notifications-9",
-    "refs/remotes/origin/release/notifications-10",
-    "refs/heads/release/notifications-22",
-    "refs/heads/release/notifications-23",
-  ];
-  const git = ([method, , ref]) => {
-    if (method === "symbolic-ref") return "release/notifications-22";
-    if (method === "for-each-ref") return refs.join("\n");
-    if (method === "merge-base" && refs.includes(ref)) return ref;
-    return null;
-  };
-  assert.equal(resolveBase(undefined, git).tree, refs[1]);
-  const explicit = resolveBase("HEAD", (args) => {
-    assert.deepEqual(args, ["rev-parse", "--verify", "--end-of-options", "HEAD^{tree}"]);
-    return "explicit-tree";
-  });
-  assert.deepEqual(explicit, { display: "HEAD", tree: "explicit-tree", kind: "tree" });
+test("the upstream precedes origin/main when no release has a merge base", async (t) => {
+  const { run, commit, main, find } = await releaseFixture(t);
+  run("switch", "--quiet", "-c", "upstream");
+  const upstream = commit("upstream change");
+  run("switch", "--quiet", "-c", "feature");
+  commit("feature change");
+  run("branch", "--set-upstream-to=upstream");
+  assert.equal(find().tree, upstream);
+  assert.match(find().reason, /upstream/u);
+  run("branch", "--unset-upstream");
+  assert.equal(find().tree, main);
+  assert.match(find().display, /origin\/main/u);
+  assert.equal(find("HEAD").tree, run("rev-parse", "HEAD^{tree}"));
+  assert.throws(() => find("missing"), /Could not resolve --base/u);
 });

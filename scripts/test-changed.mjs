@@ -31,7 +31,7 @@ const fullSuiteInputs =
 const releaseRef = /^(?:(?:refs\/heads|refs\/remotes\/[^/]+)\/)?release\/(.+)$/u;
 const versionOrder = (a, b) => a.localeCompare(b, "en", { numeric: true });
 
-function previousReleaseRefs(gitCommand) {
+function releaseRefs(gitCommand) {
   const current = gitCommand(["symbolic-ref", "--quiet", "--short", "HEAD"])
     ?.trim()
     .match(releaseRef)?.[1];
@@ -58,14 +58,29 @@ export function resolveBase(base, gitCommand) {
     if (tree === null) throw new Error("Could not resolve --base to a Git tree.");
     return { display: base, tree: tree.trim(), kind: "tree" };
   }
-  const mergeBase = (ref) => {
-    const commit = gitCommand(["merge-base", "HEAD", ref]);
-    if (commit !== null)
-      return { display: `merge base with ${ref}`, tree: commit.trim(), kind: "commit" };
-  };
-  for (const ref of ["origin/main", "main"]) {
-    const found = mergeBase(ref);
-    if (found) return found;
+  const mergeBase = (ref) => gitCommand(["merge-base", "HEAD", ref])?.trim();
+  const fromRef = (ref, tree, reason) => ({
+    display: `merge base with ${ref.replace(/^refs\/(?:heads|remotes)\//u, "")}`,
+    tree,
+    kind: "commit",
+    reason,
+  });
+  const distances = new Map();
+  let closest;
+  for (const ref of releaseRefs(gitCommand)) {
+    const commit = mergeBase(ref);
+    if (!commit) continue;
+    if (!distances.has(commit)) {
+      const count = gitCommand(["rev-list", "--count", `${commit}..HEAD`])?.trim();
+      if (count === undefined) continue;
+      distances.set(commit, Number(count));
+    }
+    const distance = distances.get(commit);
+    if (!closest || distance < closest.distance) closest = { ref, commit, distance };
+  }
+  if (closest) {
+    const { ref, commit, distance } = closest;
+    return fromRef(ref, commit, `closest release branch (${distance} commits to HEAD)`);
   }
   const upstream = gitCommand([
     "rev-parse",
@@ -74,13 +89,11 @@ export function resolveBase(base, gitCommand) {
     "@{upstream}",
   ])?.trim();
   if (upstream) {
-    const found = mergeBase(upstream);
-    if (found) return found;
+    const commit = mergeBase(upstream);
+    if (commit) return fromRef(upstream, commit, "configured upstream");
   }
-  for (const ref of previousReleaseRefs(gitCommand)) {
-    const found = mergeBase(ref);
-    if (found) return found;
-  }
+  const main = mergeBase("origin/main");
+  if (main) return fromRef("origin/main", main, "no release merge base or upstream");
   throw new Error("No local merge base found. Pass --base with a Git commit or branch.");
 }
 
@@ -314,6 +327,7 @@ async function main() {
     requireGit(root, ["diff", "--no-renames", "--name-only", "-z", base.tree, "--"]),
     requireGit(root, ["ls-files", "--others", "--exclude-standard", "-z"]),
   );
+  console.log(`Base: ${base.display} (${base.reason ?? "explicit --base"})`);
   console.log(`Changed paths from ${base.display} (Git ${base.kind} ${base.tree})`);
   for (const path of changes) console.log(`  ${path}`);
 
