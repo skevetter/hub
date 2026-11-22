@@ -1,7 +1,16 @@
 import { useSnapshotQuery } from "../queries/index.js";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import { useActiveAccount } from "../auth/active-account.js";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
 import { DeviceCardSkeleton } from "../components/app/device-card.js";
@@ -25,6 +34,7 @@ import type { Result } from "../contract/respond.js";
 import { DAEMON_MUTATION_KEY } from "../auth/tenant-mutation.js";
 import { ConnectAnotherDaemon, DaemonDevice, DaemonResults } from "./daemon-list.js";
 import {
+  deviceStatus,
   filterDaemons,
   type DaemonFilterStatus,
   type DeviceProfileName,
@@ -225,11 +235,16 @@ function DaemonsContent({
   completedAction: CompletedDaemonAction | undefined;
 }) {
   const searchId = useId();
-  const [limitProviderReads] = useState(createProviderReadLimiter);
+  const [providerReads] = useState(createProviderReadLimiter);
   const [filters, setFilters] = useState<DaemonsFilters>(INITIAL_FILTERS);
   const [hasFiltered, setHasFiltered] = useState(false);
   const { daemons, canManage } = snapshot;
   const matches = filterDaemons(daemons, filters.search, filters.status);
+  useLayoutEffect(() => {
+    providerReads.reconcile(
+      matches.filter((daemon) => deviceStatus(daemon) === "connected").map(({ id }) => id),
+    );
+  }, [matches, providerReads]);
   const profiles = useDeviceProfiles(
     showProfiles && canManage && daemons.length > 0,
     accountId,
@@ -295,7 +310,7 @@ function DaemonsContent({
               accountId={accountId}
               organizationSlug={organizationSlug}
               profiles={profiles}
-              limitProviderReads={limitProviderReads}
+              providerReads={providerReads}
               canManage={canManage}
               busy={busy}
               onRename={onRename}
@@ -365,7 +380,7 @@ function ConnectedDaemonDevice({
   accountId,
   organizationSlug,
   profiles,
-  limitProviderReads,
+  providerReads,
   canManage,
   busy,
   onRename,
@@ -375,10 +390,10 @@ function ConnectedDaemonDevice({
   accountId: string;
   organizationSlug: string;
   profiles: ReturnType<typeof useDeviceProfiles>;
-  limitProviderReads: ProviderReadLimiter;
+  providerReads: ProviderReadLimiter;
   canManage: boolean;
 }) {
-  const providers = useDeviceProviders(daemon, accountId, organizationSlug, limitProviderReads);
+  const providers = useDeviceProviders(daemon, accountId, organizationSlug, providerReads);
   const deviceProfiles = useMemo(
     () =>
       profiles === undefined
