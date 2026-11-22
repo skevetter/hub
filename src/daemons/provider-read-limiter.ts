@@ -1,52 +1,87 @@
 const MAX_CONCURRENT_PROVIDER_READS = 4;
 const PROVIDER_READ_DEADLINE_MS = 15_000;
 
+interface QueuedRead {
+  daemonId: string;
+  start: () => void;
+  drop: () => void;
+}
+
 export class ProviderReadTimeout extends Error {
   constructor() {
     super("This daemon did not answer.");
   }
 }
 
-export type ProviderReadLimiter = <T>(
-  signal: AbortSignal,
-  read: (signal: AbortSignal) => Promise<T>,
-) => Promise<T>;
+export type ProviderReadLimiter = ReturnType<typeof createProviderReadLimiter>;
 
-export function createProviderReadLimiter(): ProviderReadLimiter {
-  const queue = new Set<() => void>();
+export function createProviderReadLimiter() {
+  const queue = new Set<QueuedRead>();
+  let order = new Map<string, number>();
   let running = 0;
 
   function dispatch() {
     if (running === MAX_CONCURRENT_PROVIDER_READS) return;
-    const start = queue.values().next().value;
-    if (start === undefined) return;
-    queue.delete(start);
+    let next: QueuedRead | undefined;
+    let nextRank = Infinity;
+    for (const read of queue) {
+      const rank = order.get(read.daemonId);
+      if (rank !== undefined && rank < nextRank) {
+        next = read;
+        nextRank = rank;
+      }
+    }
+    if (next === undefined) return;
+    queue.delete(next);
     running++;
-    start();
+    next.start();
   }
 
-  return (signal, read) =>
-    new Promise((resolve, reject) => {
+  function reconcile(daemonIds: readonly string[]) {
+    order = new Map(daemonIds.map((id, index) => [id, index]));
+    for (const read of queue) {
+      if (!order.has(read.daemonId)) read.drop();
+    }
+  }
+
+  function schedule<T>(
+    daemonId: string,
+    signal: AbortSignal,
+    read: (signal: AbortSignal) => Promise<T>,
+    cancelQuery?: () => void,
+  ) {
+    return new Promise<T>((resolve, reject) => {
       if (signal.aborted) {
         reject(signal.reason);
         return;
       }
 
+      const controller = new AbortController();
+      const requestSignal = AbortSignal.any([signal, controller.signal]);
+      const queued = { daemonId, start, drop };
+
       function cancel() {
-        queue.delete(start);
+        queue.delete(queued);
         reject(signal.reason);
+      }
+
+      function drop() {
+        const error = new DOMException("Daemon left the provider read queue.", "AbortError");
+        signal.removeEventListener("abort", cancel);
+        queue.delete(queued);
+        controller.abort(error);
+        cancelQuery?.();
+        reject(error);
       }
 
       function start() {
         signal.removeEventListener("abort", cancel);
-        const deadline = new AbortController();
-        const requestSignal = AbortSignal.any([signal, deadline.signal]);
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeout = new Promise<never>((_, rejectTimeout) => {
           timer = setTimeout(() => {
             const error = new ProviderReadTimeout();
             rejectTimeout(error);
-            deadline.abort(error);
+            controller.abort(error);
           }, PROVIDER_READ_DEADLINE_MS);
         });
         const response = Promise.resolve().then(() => {
@@ -63,8 +98,15 @@ export function createProviderReadLimiter(): ProviderReadLimiter {
           });
       }
 
-      queue.add(start);
+      if (!order.has(daemonId)) {
+        drop();
+        return;
+      }
+      queue.add(queued);
       signal.addEventListener("abort", cancel, { once: true });
       dispatch();
     });
+  }
+
+  return { schedule, reconcile };
 }
