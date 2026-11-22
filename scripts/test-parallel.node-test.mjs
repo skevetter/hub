@@ -27,15 +27,34 @@ test("partition puts each file in one shard and balances cached durations", () =
   assert.deepEqual(partitionFiles(files.slice(0, 1), 4), [["small.test.ts"]]);
 });
 
-test("the daemon suite owns the first shard even with a small timing estimate", () => {
+test("cached Hub timings balance two shards and only pin files above the ideal", () => {
   const daemon = join("src", "daemons", "daemons.test.ts");
+  const measured = [111.79, 81.26, 58.85, 51.13, 32.84, 31.4];
+  const remaining = 978.6 - measured.reduce((sum, duration) => sum + duration, 0);
   const files = [
+    { path: daemon, weight: 13.5 },
+    ...measured.map((weight, index) => ({ path: `slow-${index}.test.ts`, weight })),
+    ...Array.from({ length: 328 }, (_, index) => ({
+      path: `regular-${index}.test.ts`,
+      weight: remaining / 328,
+    })),
+  ];
+  const weights = new Map(files.map(({ path, weight }) => [path, weight]));
+  const groups = partitionFiles(files, 2);
+  assert.equal(groups.flat().length, 335);
+  assert.ok(groups.every((group) => group.length > 1));
+  assert.ok(groups.every((group) => group.reduce((sum, path) => sum + weights.get(path), 0) < 500));
+
+  const heavy = [
+    { path: daemon, weight: 633.82 },
     { path: "slow.test.ts", weight: 90 },
-    { path: daemon, weight: 10 },
     { path: "medium.test.ts", weight: 50 },
   ];
-  assert.deepEqual(partitionFiles(files, 2), [[daemon], ["slow.test.ts", "medium.test.ts"]]);
-  assert.deepEqual(partitionFiles(files, 1), [["slow.test.ts", "medium.test.ts", daemon]]);
+  assert.deepEqual(partitionFiles(heavy, 2), [[daemon], ["slow.test.ts", "medium.test.ts"]]);
+  assert.deepEqual(partitionFiles(heavy, 1), [[daemon, "slow.test.ts", "medium.test.ts"]]);
+  const estimated = [{ ...heavy[0], cached: false }, ...heavy.slice(1)];
+  const alsoHeavy = [...estimated, { path: "known.test.ts", weight: 900 }];
+  assert.equal(partitionFiles(alsoHeavy, 2)[0][0], "known.test.ts");
 });
 
 test("failure reporting keeps shard numbers and reruns only failed files in one process", async () => {

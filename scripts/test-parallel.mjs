@@ -26,26 +26,24 @@ const vitest = join(root, "node_modules/vitest/vitest.mjs");
 const cacheRoot = join(root, "node_modules/.vite/vitest");
 const parallelCache = join(cacheRoot, "test-parallel");
 const failedFileList = join(parallelCache, "failed.json");
-const daemonSuite = join("src", "daemons", "daemons.test.ts");
 
 export function partitionFiles(files, count) {
-  const isolateDaemon = count > 1 && files.some((file) => file.path === daemonSuite);
-  const firstShard = isolateDaemon ? [[daemonSuite]] : [];
-  const sharedFiles = isolateDaemon ? files.filter((file) => file.path !== daemonSuite) : files;
-  const shardCount = Math.min(count - firstShard.length, sharedFiles.length);
-  const shards = Array.from({ length: shardCount }, () => ({
+  const shardCount = Math.min(count, files.length);
+  const ideal = files.reduce((sum, file) => sum + file.weight, 0) / shardCount;
+  const sorted = [...files].sort((a, b) => b.weight - a.weight || a.path.localeCompare(b.path));
+  const pinned = sorted.filter((file) => file.cached !== false && file.weight > ideal);
+  const pinnedPaths = new Set(pinned.map((file) => file.path));
+  const shards = Array.from({ length: shardCount - pinned.length }, () => ({
     files: [],
     weight: 0,
   }));
-  const sorted = [...sharedFiles].sort(
-    (a, b) => b.weight - a.weight || a.path.localeCompare(b.path),
-  );
   for (const file of sorted) {
+    if (pinnedPaths.has(file.path)) continue;
     const lightest = shards.reduce((first, next) => (next.weight < first.weight ? next : first));
     lightest.files.push(file.path);
     lightest.weight += file.weight;
   }
-  return [...firstShard, ...shards.map((shard) => shard.files)];
+  return [...pinned.map(({ path }) => [path]), ...shards.map((shard) => shard.files)];
 }
 
 function printRun(print, name, files, result) {
@@ -125,7 +123,7 @@ async function readCachedResults(directory) {
         try {
           const info = await stat(path);
           const cache = JSON.parse(await readFile(path, "utf8"));
-          return { cache, modifiedAt: info.mtimeMs };
+          return { cache, modifiedAt: info.mtimeMs, full: entry.name === "test-parallel" };
         } catch (error) {
           if (error.code === "ENOENT" || error instanceof SyntaxError) return null;
           throw error;
@@ -134,7 +132,7 @@ async function readCachedResults(directory) {
   );
   return caches
     .filter(Boolean)
-    .sort((a, b) => a.modifiedAt - b.modifiedAt)
+    .sort((a, b) => Number(a.full) - Number(b.full) || a.modifiedAt - b.modifiedAt)
     .map(({ cache }) => cache)
     .filter((cache) => Array.isArray(cache?.results));
 }
@@ -164,6 +162,7 @@ async function weighFiles(paths) {
   return files.map(({ path, size, duration }) => ({
     path,
     weight: duration ?? size * millisecondsPerByte,
+    cached: duration !== undefined,
   }));
 }
 
