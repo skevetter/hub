@@ -26,6 +26,7 @@ import type { AccountState } from "./organization-contract.js";
 import type { Result } from "../contract/respond.js";
 import { ACCOUNT_MUTATION_KEY, useAccountMutationError } from "./account-mutation.js";
 import { ForgotPasswordEntry, VerificationPendingEntry } from "./account-recovery.js";
+import { leaveReader } from "./reader-cache.js";
 
 type EmptyResult = Result<Record<string, never>>;
 type AuthenticationResult = Result<{ state: "complete" | "verificationRequired" }>;
@@ -34,6 +35,19 @@ type AccountCommandResult = Result<{
 }>;
 
 type OrganizationAccount = Extract<AccountState, { status: "organizationRequired" | "active" }>;
+
+function useLeaveAccount() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ACCOUNT_MUTATION_KEY,
+    mutationFn: useServerFn(signOut) as (
+      input: Parameters<typeof signOut>[0],
+    ) => Promise<EmptyResult>,
+    onSuccess: (result) => {
+      if (result.status === "ok") leaveReader(queryClient);
+    },
+  });
+}
 
 /**
  * Sign in and sign up are the same decision seen from two sides, so only one is on
@@ -278,15 +292,7 @@ export function InvitationEntry({
     ) => Promise<AccountCommandResult>,
     onSuccess: handleResult,
   });
-  const leave = useMutation({
-    mutationKey: ACCOUNT_MUTATION_KEY,
-    mutationFn: useServerFn(signOut) as (
-      input: Parameters<typeof signOut>[0],
-    ) => Promise<EmptyResult>,
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["account"] });
-    },
-  });
+  const leave = useLeaveAccount();
   const busy = accept.isPending || leave.isPending;
   const submit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
@@ -327,6 +333,10 @@ export function OrganizationGate({
 }: {
   account: AccountState & { status: "organizationRequired" };
 }) {
+  return <OrganizationGateForm account={account} {...useOrganizationCommands()} />;
+}
+
+function useOrganizationCommands() {
   const [creating, setCreating] = useState(false);
   const create = useCallback(() => setCreating(true), []);
   const queryClient = useQueryClient();
@@ -346,15 +356,7 @@ export function OrganizationGate({
     ) => Promise<AccountCommandResult>,
     onSuccess: handleCompletion,
   });
-  const leave = useMutation({
-    mutationKey: ACCOUNT_MUTATION_KEY,
-    mutationFn: useServerFn(signOut) as (
-      input: Parameters<typeof signOut>[0],
-    ) => Promise<EmptyResult>,
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ["account"] });
-    },
-  });
+  const leave = useLeaveAccount();
   const busy = select.isPending || createOrganizationMutation.isPending || leave.isPending;
   const message = useAccountMutationError();
   const selectSubmit = useCallback(
@@ -377,7 +379,33 @@ export function OrganizationGate({
     [createOrganizationMutation],
   );
   const signOutAccount = useCallback(() => leave.mutate({}), [leave]);
+  return {
+    busy,
+    message,
+    creating,
+    setCreating,
+    create,
+    selectSubmit,
+    createSubmit,
+    signOutAccount,
+  };
+}
 
+type OrganizationGateFormProps = ReturnType<typeof useOrganizationCommands> & {
+  account: Extract<AccountState, { status: "organizationRequired" }>;
+};
+
+function OrganizationGateForm({
+  account,
+  busy,
+  message,
+  creating,
+  setCreating,
+  create,
+  selectSubmit,
+  createSubmit,
+  signOutAccount,
+}: OrganizationGateFormProps) {
   return (
     <AuthLayout width="md">
       <AuthCard
@@ -387,31 +415,11 @@ export function OrganizationGate({
         description={`Signed in as ${account.account.email}`}
       >
         <ErrorSummary message={message} />
-        {account.memberships.length > 0 && (
-          <ul aria-label="Organizations" className="grid gap-2">
-            {account.memberships.map((membership) => (
-              <li key={membership.id}>
-                <form method="post" onSubmit={selectSubmit}>
-                  <Input type="hidden" name="organizationId" value={membership.id} />
-                  <button
-                    type="submit"
-                    disabled={busy}
-                    className="flex w-full items-center gap-3 rounded-md border px-3 py-2.5 text-left transition-colors duration-150 hover:bg-accent disabled:opacity-50"
-                  >
-                    <span className="min-w-0 flex-1">
-                      <TwoLine primary={membership.name} secondary={membership.role} />
-                    </span>
-                    <ChevronRight
-                      aria-hidden="true"
-                      className="size-4 shrink-0 text-muted-foreground"
-                    />
-                    <span className="sr-only">Choose</span>
-                  </button>
-                </form>
-              </li>
-            ))}
-          </ul>
-        )}
+        <OrganizationChoices
+          memberships={account.memberships}
+          busy={busy}
+          onSubmit={selectSubmit}
+        />
         {account.canCreateOrganization ? null : (
           <p className="text-sm text-muted-foreground">Ask an organization owner to invite you.</p>
         )}
@@ -448,6 +456,40 @@ export function OrganizationGate({
   );
 }
 
+function OrganizationChoices({
+  memberships,
+  busy,
+  onSubmit,
+}: {
+  memberships: OrganizationAccount["memberships"];
+  busy: boolean;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  if (memberships.length === 0) return null;
+  return (
+    <ul aria-label="Organizations" className="grid gap-2">
+      {memberships.map((membership) => (
+        <li key={membership.id}>
+          <form method="post" onSubmit={onSubmit}>
+            <Input type="hidden" name="organizationId" value={membership.id} />
+            <button
+              type="submit"
+              disabled={busy}
+              className="flex w-full items-center gap-3 rounded-md border px-3 py-2.5 text-left transition-colors duration-150 hover:bg-accent disabled:opacity-50"
+            >
+              <span className="min-w-0 flex-1">
+                <TwoLine primary={membership.name} secondary={membership.role} />
+              </span>
+              <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+              <span className="sr-only">Choose</span>
+            </button>
+          </form>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function useAccountCommandResult(
   queryClient: ReturnType<typeof useQueryClient>,
   options: { clearInvitation?: boolean } = {},
@@ -465,6 +507,8 @@ function useAccountCommandResult(
             url,
           );
         }
+        leaveReader(queryClient);
+        return;
       }
       if (clearInvitation && result.data.state === "complete") {
         window.history.replaceState({}, "", "/");
