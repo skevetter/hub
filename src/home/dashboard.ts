@@ -31,10 +31,8 @@ export interface RunTally {
   failed: number;
 }
 
-/** Session profiles and the reader's own sessions; absent when the feature is off. */
+/** The reader's own session facts; absent when the feature is off. */
 export interface HomeSessions {
-  /** Profiles a session can start from. */
-  profiles: number;
   /** Open sessions the reader started or participates in, up to the Home limit. */
   open: number;
   openCapped: boolean;
@@ -227,14 +225,7 @@ export class HomeDashboard {
 
   private async readSessions(reader: SessionPrincipal): Promise<HomeSessions | null> {
     if (this.options.interactiveSessions !== true) return null;
-    const [profiles, own] = await Promise.all([
-      this.database.listSessionProfiles(reader.organizationId),
-      this.database.countOwnInteractiveSessions(reader, HOME_OPEN_SESSIONS_LIMIT),
-    ]);
-    return {
-      profiles: profiles.filter(({ status }) => status === "active").length,
-      ...own,
-    };
+    return this.database.countOwnInteractiveSessions(reader, HOME_OPEN_SESSIONS_LIMIT);
   }
 }
 
