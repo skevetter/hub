@@ -101,7 +101,7 @@ describe("organization checklist completion", () => {
     const { post, slug, runtime } = fixture;
     assert.deepEqual(await finish(post(), slug), {
       status: "error",
-      error: { message: "Complete all four checklist steps before finishing setup." },
+      error: { message: "Complete every checklist step before finishing setup." },
     });
     await fixture.recordRun();
     await runtime.query(
