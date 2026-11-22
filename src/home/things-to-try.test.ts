@@ -40,11 +40,85 @@ describe("things to try", () => {
   });
 
   it("names the workspace and the trigger once both exist, and asks for nothing more", () => {
-    const trigger = { id: "t", name: "triage", event: "linear.comment_created", enabled: true };
+    const trigger = {
+      id: "t",
+      name: "triage",
+      event: "linear.comment_created",
+      enabled: true,
+      hasReplyOutput: true,
+    };
     const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers: [trigger] });
     assert.equal(surface?.next, undefined);
     assert.match(surface?.where ?? "", /Comment on an issue in Acme/u);
     assert.match(surface?.where ?? "", /triage decides/u);
+  });
+
+  it("does not ask for a comment when the only enabled trigger listens for assignments", () => {
+    const trigger = { id: "t", name: "on-assign", event: "linear.issue_assigned", enabled: true };
+    const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers: [trigger] });
+    assert.doesNotMatch(surface?.where ?? "", /Comment on an issue/u);
+    assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new" });
+  });
+
+  it("requires the reply output on the trigger that listens to comments", () => {
+    const triggers = [
+      { id: "t", name: "triage", event: "linear.comment_created", enabled: true },
+      {
+        id: "assign",
+        name: "assign",
+        event: "linear.issue_assigned",
+        enabled: true,
+        hasReplyOutput: true,
+      },
+    ];
+    const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers });
+    assert.match(surface?.where ?? "", /triage needs a reply output/u);
+    assert.doesNotMatch(surface?.where ?? "", /Comment on an issue/u);
+  });
+
+  it("offers pull request prompts for a pull request comment trigger without promising a push", () => {
+    const github = { ...linear, provider: "github" as const };
+    const trigger = {
+      id: "t",
+      name: "checks",
+      event: "github.pull_request_comment_created",
+      enabled: true,
+      hasReplyOutput: true,
+    };
+    const surface = thingsToTry({
+      ...nothing,
+      connections: [github],
+      triggers: [trigger],
+    })[1];
+    assert.match(surface?.where ?? "", /Comment on a pull request in Acme/u);
+    assert.equal(surface?.examples.length, 3);
+    assert.doesNotMatch(surface?.examples.map(({ prompt }) => prompt).join(" ") ?? "", /push/u);
+    assert.match(
+      surface?.examples.map(({ prompt }) => prompt).join(" ") ?? "",
+      /checks.*cause.*proposed fix/u,
+    );
+  });
+
+  it("offers issue prompts for a GitHub issue comment trigger", () => {
+    const github = { ...linear, provider: "github" as const };
+    const trigger = {
+      id: "t",
+      name: "triage",
+      event: "github.issue_comment_created",
+      enabled: true,
+      hasReplyOutput: true,
+    };
+    const surface = thingsToTry({
+      ...nothing,
+      connections: [github],
+      triggers: [trigger],
+    })[1];
+    assert.match(surface?.where ?? "", /Comment on an issue in Acme/u);
+    assert.equal(surface?.examples.length, 3);
+    assert.doesNotMatch(
+      surface?.examples.map(({ prompt }) => prompt).join(" ") ?? "",
+      /pull request/u,
+    );
   });
 
   it("does not count a GitHub notification trigger as listening to repository comments", () => {
