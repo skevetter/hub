@@ -14,9 +14,11 @@ import { resolveRouteTenant } from "../projects/access.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { projectTriggerForm } from "../triggers/configuration/editor.js";
+import { matchGitHubInvocations } from "../triggers/github/match.js";
+import { matchLinearInvocations } from "../triggers/linear/match.js";
 import { canFinishSetup } from "./checklist.js";
 import { HOME_MONTH_DAYS, HOME_OPEN_SESSIONS_LIMIT } from "./limits.js";
-import { isTryCommentEvent } from "./things-to-try.js";
+import { commentExamples, isTryCommentEvent } from "./things-to-try.js";
 
 /** How far back the overview looks. One week is long enough to hold a first run and short enough that a nudge fades once a trigger listens. */
 export const HOME_WINDOW_DAYS = 7;
@@ -204,7 +206,7 @@ export class HomeDashboard {
       triggers: triggers.map((trigger, index) =>
         Object.assign(
           { id: trigger.id, name: trigger.name, enabled: trigger.enabled },
-          triggerFacts(revisions[index], trigger.format, connections.github),
+          triggerFacts(revisions[index], trigger.format, connections),
         ),
       ),
       runs: runs.map((run) => ({
@@ -258,7 +260,7 @@ function tally(counts: readonly OrganizationRunCount[]): RunTally {
 function triggerFacts(
   revision: OrganizationTriggerRevisionRecord | undefined,
   format: "single_run" | "legacy_multistep",
-  githubConnections: OrganizationConnectionUsage["github"],
+  connections: OrganizationConnectionUsage,
 ): Pick<HomeSnapshot["triggers"][number], "event" | "hasReplyOutput" | "commentPrefix"> {
   if (revision === undefined) return { event: "manual.run" };
   const projection = projectTriggerForm(revision.yaml);
@@ -276,47 +278,87 @@ function triggerFacts(
   const hasReplyOutput = comment?.steps.some(
     (step) => !isScriptStep(step) && step.allowOutputs.some(({ type }) => type === replyType),
   );
-  if (comment === undefined) return { event };
-  const prefix = commentPrefix(comment, githubConnections);
-  return {
-    event,
-    ...(hasReplyOutput === true ? { hasReplyOutput } : {}),
-    ...(prefix === undefined ? {} : { commentPrefix: prefix }),
-  };
+  return comment !== undefined && hasReplyOutput
+    ? { event, hasReplyOutput, commentPrefix: acceptedCommentPrefix(comment, connections) }
+    : { event };
 }
 
-function commentPrefix(
+function acceptedCommentPrefix(
   trigger: CompiledTrigger,
-  connections: OrganizationConnectionUsage["github"],
-): string | null | undefined {
-  const filters = trigger.filters;
-  // Linear matches specific actor IDs and has no wildcard audience.
-  if (!trigger.on.startsWith("github.") || filters === undefined) return null;
-  const {
-    pattern = "",
-    contains = "",
-    from_users,
-    connection,
-    connectionId,
-    ...constraints
-  } = filters;
-  if (
-    from_users?.includes("*") !== true ||
-    Object.values(constraints).some((value) => value !== undefined) ||
-    Object.values(trigger.inputs).some(({ required }) => required)
-  ) {
-    return null;
-  }
-  if (connection !== undefined || connectionId !== undefined) {
-    const healthy = connections.filter(({ status }) => status !== "suspended");
-    const [only] = healthy;
-    if (
-      healthy.length !== 1 ||
-      (connection !== undefined && only?.slug !== connection) ||
-      (connectionId !== undefined && only?.id !== connectionId)
-    )
-      return null;
-  }
-  const text = [pattern, pattern.includes(contains) ? "" : contains].filter(Boolean).join(" ");
-  return text === "" ? undefined : text;
+  connections: OrganizationConnectionUsage,
+): string | null {
+  const { pattern = "", contains = "" } = trigger.filters ?? {};
+  const prefix = [pattern, pattern.includes(contains) ? "" : contains].filter(Boolean).join(" ");
+  const configuration = { triggers: [trigger] };
+  const examples = commentExamples(trigger.on, prefix);
+
+  // Preview a comment with no claim about the reader's provider identity or the target's scope.
+  const results = examples.map(({ prompt }) => {
+    if (trigger.on === "linear.comment_created") {
+      const healthy = connections.linear.filter(
+        (connection) => !linearConnectionRequiresReauthorization(connection),
+      );
+      return (
+        healthy.length > 0 &&
+        healthy.every((connection) =>
+          matchLinearInvocations(
+            configuration,
+            {
+              type: "comment",
+              action: "create",
+              id: "home-preview",
+              organizationId: connection.linearOrganizationId,
+              actor: null,
+              comment: { id: "home-preview", body: prompt, issueId: "home-preview" },
+              issue: {
+                id: "home-preview",
+                title: "",
+                description: null,
+                projectId: null,
+                stateId: null,
+                assigneeId: null,
+                labelIds: [],
+              },
+            },
+            connection.id,
+            connection.appUserId,
+          ).some(({ invocation }) => invocation.status === "accepted"),
+        )
+      );
+    }
+
+    const healthy = connections.github.filter(({ status }) => status !== "suspended");
+    const type =
+      trigger.on === "github.pull_request_review_comment"
+        ? "pull_request_review_comment"
+        : "issue_comment";
+    return (
+      healthy.length > 0 &&
+      healthy.every((connection) => {
+        const matches = matchGitHubInvocations(
+          configuration,
+          {
+            id: "home-preview",
+            type,
+            repo: "",
+            repositoryId: 0,
+            installationId: connection.installationId,
+            createdAt: "",
+            payload: {
+              action: "created",
+              comment: { body: prompt },
+              issue: trigger.on === "github.issue_comment_created" ? {} : { pull_request: {} },
+            },
+          },
+          { source: `github.${type}`, connectionId: connection.id },
+        );
+        return (
+          typeof matches !== "string" &&
+          matches.some(({ invocation }) => invocation.status === "accepted")
+        );
+      })
+    );
+  });
+
+  return results.length > 0 && results.every(Boolean) ? prefix : null;
 }

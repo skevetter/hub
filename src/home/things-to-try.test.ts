@@ -40,17 +40,19 @@ describe("things to try", () => {
   });
 
   it("names the workspace and the trigger once both exist, and asks for nothing more", () => {
+    const github = { ...linear, provider: "github" as const };
     const trigger = {
       id: "t",
       name: "triage",
-      event: "linear.comment_created",
+      event: "github.issue_comment_created",
       enabled: true,
       hasReplyOutput: true,
+      commentPrefix: "",
     };
-    const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers: [trigger] });
+    const surface = thingsToTry({ ...nothing, connections: [github], triggers: [trigger] })[1];
     assert.equal(surface?.next, undefined);
     assert.match(surface?.where ?? "", /Comment on an issue in Acme/u);
-    assert.match(surface?.where ?? "", /triage decides/u);
+    assert.match(surface?.where ?? "", /where triage is configured to run/u);
   });
 
   it("does not ask for a comment when the only enabled trigger listens for assignments", () => {
@@ -84,6 +86,7 @@ describe("things to try", () => {
       event: "github.pull_request_comment_created",
       enabled: true,
       hasReplyOutput: true,
+      commentPrefix: "",
     };
     const surface = thingsToTry({
       ...nothing,
@@ -107,6 +110,7 @@ describe("things to try", () => {
       event: "github.issue_comment_created",
       enabled: true,
       hasReplyOutput: true,
+      commentPrefix: "",
     };
     const surface = thingsToTry({
       ...nothing,
