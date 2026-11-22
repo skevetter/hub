@@ -150,11 +150,15 @@ export class HomeDashboard {
         ),
       ),
       this.database.listOrganizationRunsSince(organizationId, since, RUNS_SHOWN),
-      this.database.countOrganizationRunsSince(organizationId, new Date(now - DAY_MS)),
-      this.database.countOrganizationRunsSince(
-        organizationId,
-        new Date(now - HOME_MONTH_DAYS * DAY_MS),
-      ),
+      reader === null
+        ? []
+        : this.database.countOrganizationRunsSince(organizationId, new Date(now - DAY_MS)),
+      reader === null
+        ? []
+        : this.database.countOrganizationRunsSince(
+            organizationId,
+            new Date(now - HOME_MONTH_DAYS * DAY_MS),
+          ),
       reader === null ? null : this.readSessions(reader),
       this.database.countRecentDroppedEvents(organizationId, since),
       this.database.getHomeChecklistCompletedAt(organizationId),

@@ -702,21 +702,22 @@ class MemoryDatabase implements Database {
       return { open: 0, openCapped: false, started: false };
     }
     let open = 0;
+    let examined = 0;
     let started = false;
     for (const { session, participants } of this.interactiveSessionsByOrganization.get(
       organizationId,
     ) ?? []) {
-      if (
-        session.startedByUserId !== userId &&
-        !participants.some((person) => person.userId === userId)
-      ) {
-        continue;
+      const own =
+        session.startedByUserId === userId ||
+        participants.some((person) => person.userId === userId);
+      started ||= own;
+      if (examined <= openLimit && session.state !== "closed") {
+        examined += 1;
+        if (own) open += 1;
       }
-      started = true;
-      if (session.state !== "closed") open += 1;
-      if (open > openLimit) break;
+      if (examined > openLimit && started) break;
     }
-    return { open: Math.min(open, openLimit), openCapped: open > openLimit, started };
+    return { open: Math.min(open, openLimit), openCapped: examined > openLimit, started };
   };
 
   findInteractiveSession: Database["findInteractiveSession"] = async (organizationId, sessionId) =>
@@ -1988,6 +1989,7 @@ class MemoryDatabase implements Database {
   }
 
   private readonly triggerRuns = new Map<string, TriggerRunRecord>();
+  private readonly organizationRunOrder = new Map<string, { id: string; createdAt: number }[]>();
   private readonly runTimelineStates = new Map<string, RunTimelineState>();
   private readonly runTimelineEvents = new Map<string, RunTimelineEvent[]>();
   private readonly runTimelineDedupe = new Map<string, Map<string, number>>();
@@ -2767,7 +2769,7 @@ class MemoryDatabase implements Database {
       createdAt: now,
       completedAt: null,
     };
-    this.triggerRuns.set(run.id, run);
+    this.addOrganizationRun(run);
     if (input.replyMessage === true) {
       this.replyDeliveries.set(run.id, {
         organizationId: run.organizationId,
@@ -2857,7 +2859,7 @@ class MemoryDatabase implements Database {
       createdAt: now,
       completedAt: now,
     };
-    this.triggerRuns.set(run.id, run);
+    this.addOrganizationRun(run);
     triggerRuns.set(input.configuredTriggerName, run.id);
     projectRuns.set(input.projectId, triggerRuns);
     this.triggerRunIdsByProviderEventReceipt.set(input.providerEventReceiptId, projectRuns);
@@ -6482,13 +6484,45 @@ class MemoryDatabase implements Database {
     });
   }
 
+  private addOrganizationRun(run: TriggerRunRecord) {
+    this.triggerRuns.set(run.id, run);
+    const order = this.organizationRunOrder.get(run.organizationId) ?? [];
+    const createdAt = run.createdAt.getTime();
+    let low = 0;
+    let high = order.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      const entry = order[middle]!;
+      if (
+        entry.createdAt < createdAt ||
+        (entry.createdAt === createdAt && entry.id.localeCompare(run.id) < 0)
+      ) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    order.splice(low, 0, { id: run.id, createdAt });
+    this.organizationRunOrder.set(run.organizationId, order);
+  }
+
+  private *organizationRunsSince(organizationId: string, since: Date) {
+    const order = this.organizationRunOrder.get(organizationId);
+    if (order === undefined) return;
+    for (let index = order.length - 1; index >= 0; index -= 1) {
+      const entry = order[index]!;
+      if (entry.createdAt < since.getTime()) break;
+      const run = this.triggerRuns.get(entry.id);
+      if (run !== undefined) yield run;
+    }
+  }
+
   async countOrganizationRunsSince(
     organizationId: string,
     since: Date,
   ): Promise<OrganizationRunCount[]> {
     const counts = new Map<OrganizationRunCount["status"], number>();
-    for (const run of this.triggerRuns.values()) {
-      if (run.organizationId !== organizationId || run.createdAt < since) continue;
+    for (const run of this.organizationRunsSince(organizationId, since)) {
       counts.set(run.status, (counts.get(run.status) ?? 0) + 1);
     }
     return [...counts].map(([status, count]) => ({ status, count }));
@@ -6499,42 +6533,38 @@ class MemoryDatabase implements Database {
     since: Date,
     limit: number,
   ): Promise<OrganizationRunRecord[]> {
-    return [...this.triggerRuns.values()]
-      .filter((run) => run.organizationId === organizationId && run.createdAt >= since)
-      .sort(
-        (left, right) =>
-          right.createdAt.getTime() - left.createdAt.getTime() || right.id.localeCompare(left.id),
-      )
-      .slice(0, limit)
-      .flatMap((run) => {
-        const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
-        if (receipt === undefined) return [];
-        const step = this.listSteps(run.id).find(
-          (candidate) => candidate.agentExecutionId !== null,
-        );
-        const execution =
-          step?.agentExecutionId == null
-            ? undefined
-            : this.agentExecutions.get(step.agentExecutionId);
-        const trigger = Array.from(this.organizationTriggers.values()).find(
-          ({ runtimeProjectId }) => runtimeProjectId === run.projectId,
-        );
-        return [
-          {
-            id: run.id,
-            triggerName: trigger?.name ?? run.configuredTriggerName,
-            provider: receipt.provider,
-            source: receipt.source,
-            status: run.status,
-            receivedAt: receipt.receivedAt,
-            agent:
-              run.payloadExpiredAt == null
-                ? launchedAgent(execution?.launchIntent?.agent)
-                : (launchedAgent(step?.payloadSummary) ?? launchedAgent(execution?.launchAgent)),
-            payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
-          },
-        ];
-      });
+    const recent: TriggerRunRecord[] = [];
+    for (const run of this.organizationRunsSince(organizationId, since)) {
+      if (recent.length >= limit) break;
+      recent.push(run);
+    }
+    return recent.flatMap((run) => {
+      const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
+      if (receipt === undefined) return [];
+      const step = this.listSteps(run.id).find((candidate) => candidate.agentExecutionId !== null);
+      const execution =
+        step?.agentExecutionId == null
+          ? undefined
+          : this.agentExecutions.get(step.agentExecutionId);
+      const trigger = Array.from(this.organizationTriggers.values()).find(
+        ({ runtimeProjectId }) => runtimeProjectId === run.projectId,
+      );
+      return [
+        {
+          id: run.id,
+          triggerName: trigger?.name ?? run.configuredTriggerName,
+          provider: receipt.provider,
+          source: receipt.source,
+          status: run.status,
+          receivedAt: receipt.receivedAt,
+          agent:
+            run.payloadExpiredAt == null
+              ? launchedAgent(execution?.launchIntent?.agent)
+              : (launchedAgent(step?.payloadSummary) ?? launchedAgent(execution?.launchAgent)),
+          payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
+        },
+      ];
+    });
   }
 
   private droppedReceipts(organizationId: string) {

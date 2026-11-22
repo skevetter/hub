@@ -361,7 +361,12 @@ ${agent}`;
       APPS_CONFIGURED,
       { now: () => NOW, interactiveSessions: true },
     ).snapshot(request, "acme");
-    assert.deepEqual(capped.sessions, { profiles: 1, open: 50, openCapped: true, started: true });
+    assert.deepEqual(capped.sessions, {
+      profiles: 1,
+      open: HOME_OPEN_SESSIONS_LIMIT,
+      openCapped: true,
+      started: true,
+    });
 
     const none = await new HomeDashboard(
       await withSessions({ profiles: ["active"], open: 0, closed: 1 }),
