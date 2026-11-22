@@ -133,6 +133,15 @@ test("Sessions screens fit a phone and can be captured with fake data", async ({
     await expect(page.getByText(reply, { exact: true })).toBeVisible();
     await expect(page.getByText("read_file", { exact: true })).toBeVisible();
     await capture(page, "session-detail");
+    const lastMessage = page.getByText(reply, { exact: true });
+    await lastMessage.scrollIntoViewIfNeeded();
+    const messageBox = await lastMessage.boundingBox();
+    const composer = page.getByRole("textbox", { name: "Message", exact: true });
+    const composerBox = await composer.boundingBox();
+    expect(messageBox).not.toBeNull();
+    expect(composerBox).not.toBeNull();
+    expect(messageBox!.y + messageBox!.height).toBeLessThanOrEqual(composerBox!.y);
+    await expect(page.getByRole("button", { name: "Steer now" })).toBeInViewport();
 
     await page.goto(url + "?filter=all");
     for (const path of [running, closed]) {
