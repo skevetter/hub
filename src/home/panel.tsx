@@ -37,6 +37,7 @@ import {
 } from "../interactive-sessions/ui/new-session.js";
 import { useRouteTenant } from "../projects/context.js";
 import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
+import { EDITOR_EVENTS, eventDefinition, isEditorEvent } from "../triggers/configuration/events.js";
 import { DROP_REASON_GROUPS, type DropReasonGroup } from "../triggers/drop-reason.js";
 import { LIST_PROVIDER_LABELS } from "../triggers/list-providers.js";
 import {
@@ -199,7 +200,9 @@ function HomeView({
                   primary={run.triggerName}
                   secondary={
                     <>
-                      {run.payloadExpiredAt == null ? run.source : "Run payload expired"}
+                      {run.payloadExpiredAt == null
+                        ? runSourceLabel(run.source)
+                        : "Run payload expired"}
                       {" \u00b7 "}
                       <RelativeTime value={run.receivedAt} />
                     </>
@@ -887,6 +890,14 @@ function DroppedEventNotices({ data }: { data: HomeSnapshot }) {
       </WarningAlert>
     );
   });
+}
+
+function runSourceLabel(source: string): string {
+  if (isEditorEvent(source)) return eventDefinition(source).label;
+  // An issue receipt can match either of the Linear issue events.
+  if (source === "linear.issue") return "Linear issue event";
+  const event = EDITOR_EVENTS.find((id) => eventDefinition(id).receiptSource === source);
+  return event === undefined ? source : eventDefinition(event).label;
 }
 
 function runOutcomes({ succeeded, failed }: RunTally): string {

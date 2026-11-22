@@ -261,6 +261,23 @@ describe("Home figures", () => {
   });
 });
 
+describe("Home recent runs", () => {
+  it.each([
+    ["manual.run", "Manual run"],
+    ["webhook.received", "Manual run"],
+    ["github.issue_created", "GitHub issue created"],
+    ["linear.comment", "Linear comment created"],
+    ["linear.issue", "Linear issue event"],
+    ["external.unknown", "external.unknown"],
+  ])("labels the source %s as %s", (source, label) => {
+    const run = ready.runs[0];
+    assert.ok(run);
+    const markup = renderHome({ ...ready, runs: [{ ...run, source }] });
+    const list = markup.slice(markup.indexOf('aria-label="Recent runs"'));
+    assert.equal(/>([^<>]+) \u00b7 <time\b/u.exec(list)?.[1], label);
+  });
+});
+
 describe("Home needs attention", () => {
   it("stays silent when nothing needs the reader", () => {
     assert.doesNotMatch(renderHome(ready), /role="alert"/u);
