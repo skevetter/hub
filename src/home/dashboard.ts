@@ -215,6 +215,7 @@ export class HomeDashboard {
         status: run.status,
         receivedAt: run.receivedAt.toISOString(),
         agent: run.agent,
+        payloadExpiredAt: run.payloadExpiredAt ?? null,
       })),
       runCounts: { day: tally(dayRuns), month: tally(monthRuns) },
       sessions,
@@ -253,18 +254,18 @@ function triggerFacts(
   format: "single_run" | "legacy_multistep",
   connections: OrganizationConnectionUsage,
 ): Pick<HomeSnapshot["triggers"][number], "event" | "hasReplyOutput" | "commentPrefix"> {
-  if (revision === undefined) return { event: "manual.run" };
+  if (revision === undefined) return { event: "" };
   const projection = projectTriggerForm(revision.yaml);
   const primaryEvent = projection.status === "editable" ? projection.value.event : undefined;
   if (primaryEvent !== undefined && !isTryCommentEvent(primaryEvent))
     return { event: primaryEvent };
-  if (primaryEvent === undefined && format === "legacy_multistep") return { event: "manual.run" };
+  if (primaryEvent === undefined && format === "legacy_multistep") return { event: "" };
 
   const { triggers } = parseCompiledHubConfig(revision.normalizedConfiguration);
   const comment = triggers.find(({ on }) =>
     primaryEvent === undefined ? isTryCommentEvent(on) : on === primaryEvent,
   );
-  const event = comment?.on ?? primaryEvent ?? "manual.run";
+  const event = comment?.on ?? primaryEvent ?? triggers[0]?.on ?? "";
   const replyType = `${event.split(".", 1)[0]}.reply`;
   const hasReplyOutput = comment?.steps.some(
     (step) => !isScriptStep(step) && step.allowOutputs.some(({ type }) => type === replyType),

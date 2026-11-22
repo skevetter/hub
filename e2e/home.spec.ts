@@ -27,12 +27,12 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await home.expectOpen();
     await home.expectProgress("0 of 4 done");
     await home.expectStep("Connect an app", "To do");
-    await home.expectStep("Connect a daemon", "To do");
-    await expect(home.command("Connect a daemon")).toHaveText(
+    await home.expectStep("Enroll a daemon", "To do");
+    await expect(home.command("Enroll a daemon")).toHaveText(
       `paseo hub login ${hub.primaryApplication().origin}`,
     );
     await home.expectStep("Create a trigger", "To do");
-    await home.expectStep("Run it", "To do");
+    await home.expectStep("Record a run", "To do");
     await home.expectNoNudge();
     await home.expectRuns(0, "0 succeeded · 0 failed");
     await home.capture(`${SHOTS}/01-fresh.png`);
@@ -49,8 +49,8 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
   await test.step("a daemon enrolled without execute permission is connected but cannot run agents", async () => {
     await hub.seedConnectedOnlyDaemon("owner", "laptop");
     await home.reload();
-    await home.expectStep("Connect a daemon", "Cannot run agents");
-    await expect(home.command("Connect a daemon")).toHaveText(
+    await home.expectStep("Enroll a daemon", "Cannot run agents");
+    await expect(home.command("Enroll a daemon")).toHaveText(
       "paseo hub permissions grant hub.execute",
     );
     await home.capture(`${SHOTS}/02-cannot-run.png`);
@@ -60,7 +60,7 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
   await test.step("a daemon that can run agents completes the second step", async () => {
     daemon = await hub.connectProviderDaemon("owner", "Acme");
     await home.reload();
-    await home.expectStep("Connect a daemon", "Done");
+    await home.expectStep("Enroll a daemon", "Done");
     await home.expectProgress("2 of 4 done");
   });
 
@@ -89,8 +89,8 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await triggers.save("deploy");
     await home.open();
     await home.expectStep("Create a trigger", "Done");
-    await home.expectStep("Run it", "To do");
-    await home.expectStep("Run it", "POST /api/v1/manual-runs");
+    await home.expectStep("Record a run", "To do");
+    await home.expectStep("Record a run", "POST /api/v1/manual-runs");
     await home.expectProgress("3 of 4 done");
   });
 
@@ -165,7 +165,7 @@ test("returns to the checklist when the last run ages out before Finish setup", 
   await expect(alert).toContainText("Complete every checklist step before finishing setup.");
   await expect(home.allSet()).toHaveCount(0);
   await home.expectProgress("2 of 4 done");
-  await home.expectStep("Run it", "To do");
+  await home.expectStep("Record a run", "To do");
   await expect(alert).toBeFocused();
 });
 
