@@ -100,3 +100,22 @@ test("the checked-in map covers Vitest runtime reads", () => {
     ["new-fixtures/"],
   );
 });
+
+test("configuration and resolved setup changes select the full suite explicitly", () => {
+  const setup = "src/support/global-setup.ts";
+  const discovered = ["src/typography-policy.test.ts", "src/unit.test.ts"];
+  for (const path of ["package.json", "vitest.config.ts", setup]) {
+    const plan = selectTests([path], discovered, new Set([path]), false, { setupFiles: [setup] });
+    assert.equal(plan.fullSuiteReason, path);
+    assert.deepEqual([...plan.tests.keys()], discovered);
+    assert.deepEqual(plan.related, []);
+  }
+});
+
+test("coverage of the whole suite via the module graph is handed to the full runner", () => {
+  const path = "src/widely-used.ts";
+  const discovered = ["src/typography-policy.test.ts", "src/unit.test.ts"];
+  const plan = selectTests([path], discovered, new Set([path]), false, { graphFiles: discovered });
+  assert.equal(plan.fullSuiteReason, "selection covers every Vitest file");
+  assert.deepEqual([...plan.tests.keys()], discovered);
+});
