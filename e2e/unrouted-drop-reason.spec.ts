@@ -87,7 +87,9 @@ for (const width of [1280, 390]) {
     await expect(page).toHaveURL(/\/triggers\/new$/u);
 
     await openSection("Home");
-    const rejected = page.getByRole("alert").filter({ hasText: "Trigger filters rejected events" });
+    const rejected = page
+      .locator('[data-slot="alert"]')
+      .filter({ hasText: "Trigger filters rejected events" });
     await rejected.getByRole("link", { name: "View dropped events" }).click();
     await expect(page).toHaveURL(/[?&]reason=trigger_filters_rejected/u);
     await expect(page).toHaveURL(/[?&]range=7d/u);
