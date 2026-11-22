@@ -197,6 +197,8 @@ function indexActivityIds(
   const exactByPrompt = new Map<string, string>();
   const expectedResponses = new Set<string>();
   if (idsFor) {
+    // The initial turn uses the native session ID as its interaction key.
+    controlIds.add(idsFor(scope.nativeSessionId).stop);
     for (const row of rows) {
       if (row.content.type !== "prompt" || !hasOwner(scope, row)) continue;
       const ids = idsFor(row.id);

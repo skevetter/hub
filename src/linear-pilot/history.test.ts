@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { validMessage } from "../interactive-sessions/store.js";
+import { pilotActivityIds } from "./activities.js";
 import { composePilotPrompt, verifyPilotPrompt } from "./history.js";
 import {
   activity,
@@ -9,6 +10,7 @@ import {
   conversation,
   current,
   currentRow,
+  fixturePromptId,
   initialRows,
   type FixtureActivity,
 } from "./test-fixtures.js";
@@ -149,6 +151,57 @@ describe("Linear pilot history", () => {
     expect(history[1]?.owner).toContain("[redacted]");
     expect(history[1]?.owner).not.toContain("private suffix");
     expect(prompt?.match(/<linear-history-v1>/gu)).toHaveLength(1);
+  });
+
+  it("uses the initial Stop as immediate proof and keeps it out of later history", () => {
+    const nativeSessionId = fixturePromptId(99);
+    const scope = { ...conversation, nativeSessionId };
+    const idsFor = (interactionId: string) => pilotActivityIds(nativeSessionId, interactionId);
+    const page = (rows: FixtureActivity[]) => ({
+      ...activityPage(rows.map((row) => ({ ...row, agentSession: { id: nativeSessionId } }))),
+      id: nativeSessionId,
+    });
+    const initialPrompt = activity(fixturePromptId(1), 1, "prompt", "Initial question");
+    const initialStop = activity(idsFor(nativeSessionId).stop, 2, "response", "Stopped.");
+    const successor = { activityId: fixturePromptId(3), body: "Later question" };
+    const successorPrompt = activity(successor.activityId, 3, "prompt", successor.body);
+    const successorAnswer = activity(
+      idsFor(successor.activityId).response,
+      4,
+      "response",
+      "Later answer",
+    );
+
+    const immediate = verifyPilotPrompt(scope, successor, page([successorPrompt]));
+    assert.ok(immediate);
+    const stopProof = {
+      confirmedResponseId: initialStop.id,
+      omitResponseId: initialStop.id,
+      secrets: [],
+      idsFor,
+    };
+    expect(
+      composePilotPrompt(scope, successor, immediate, page([initialPrompt]), stopProof),
+    ).toBeUndefined();
+    const immediatePrompt = composePilotPrompt(
+      scope,
+      successor,
+      immediate,
+      page([initialStop, initialPrompt]),
+      stopProof,
+    );
+    expect(sections(immediatePrompt)).toMatchObject({ owner: successor.body, history: [] });
+
+    const verified = verifyPilotPrompt(scope, current, page([currentRow]));
+    assert.ok(verified);
+    const prompt = composePilotPrompt(
+      scope,
+      current,
+      verified,
+      page([successorAnswer, successorPrompt, initialStop, initialPrompt]),
+      { confirmedResponseId: successorAnswer.id, secrets: [], idsFor },
+    );
+    expect(sections(prompt).history).toEqual([{ owner: successor.body, app: "Later answer" }]);
   });
 
   it("fails closed on wrong page scope, row shape, duplicate rows and excess rows", () => {

@@ -47,9 +47,8 @@ export interface LinearRegistrationConfiguration {
   webhookSecret: string;
 }
 
-type PilotClientAuthority = Pick<
-  Parameters<typeof createLinearAgentClient>[0],
-  "binding" | "authorize"
+type PilotClientAuthority = Required<
+  Pick<Parameters<typeof createLinearAgentClient>[0], "binding" | "authorize" | "authorizeRefresh">
 >;
 
 interface LinearPilotProvider {

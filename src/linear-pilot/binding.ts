@@ -121,7 +121,11 @@ export type PilotConnectionResult = { status: "resolved"; connection: PilotConne
 export interface PilotBindingStore {
   resolveConnection(authority: PilotAuthority): Promise<PilotConnectionResult>;
   mapIdentity(authority: PilotAuthority, label: string, now: Date): Promise<PilotIdentityResult>;
-  find(authority: PilotAuthority, origin: PilotNativeOrigin): Promise<PilotFindResult>;
+  find(
+    authority: PilotAuthority,
+    origin: PilotNativeOrigin,
+    query?: QueryHandle,
+  ): Promise<PilotFindResult>;
   admit(authority: PilotAuthority, input: PilotAdmitInput): Promise<PilotAdmitResult>;
   advance(authority: PilotAuthority, input: PilotAdvanceInput): Promise<PilotAdvanceResult>;
 }
@@ -300,23 +304,24 @@ export class PilotBindings implements PilotBindingStore {
     );
   };
 
-  find: PilotBindingStore["find"] = async (authority, origin) => {
+  find: PilotBindingStore["find"] = async (authority, origin, query) => {
     if (!validPilotAuthority(authority) || !validOrigin(authority, origin))
       return refuse("invalid_input");
     if (origin.actorProviderUserId !== authority.humanProviderUserId)
       return refuse("actor_mismatch");
     if (!authority.teamIds.includes(origin.teamId)) return refuse("team_out_of_scope");
-    return this.runtime.transaction(async (tx) => {
+    const read = async (tx: QueryHandle): Promise<PilotFindResult> => {
       const rows = await nativeRows(tx, authority, origin, false);
       const owner = await authorizeOwner(tx, authority, false);
       if (owner.status === "refused") return owner;
-      if (rows.length === 0) return { status: "none" } as const;
+      if (rows.length === 0) return { status: "none" };
       const row = currentPilotRow(rows, authority, origin);
       if ("status" in row) return row;
       const session = await authorizeSession(tx, authority, owner, row.sessionId, false);
       if ("status" in session) return session;
-      return { status: "bound", binding: row } as const;
-    });
+      return { status: "bound", binding: row };
+    };
+    return query === undefined ? this.runtime.transaction(read) : read(query);
   };
 
   admit: PilotBindingStore["admit"] = async (authority, input) => {

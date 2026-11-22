@@ -3,10 +3,18 @@ import { createHmac, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setImmediate } from "node:timers/promises";
+import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { expect, test, vi } from "vitest";
 import { z } from "zod";
 import { createDatabase } from "../db/pg.js";
-import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
+import {
+  embeddedDatabaseRuntime,
+  postgresDatabaseRuntime,
+  readDatabasePoolOptions,
+  type DatabaseRuntime,
+} from "../db/runtime/index.js";
+import { observedRuntime } from "../db/test-utils/run-timeline-postgres.js";
 import { SessionEventBus } from "../interactive-sessions/bus.js";
 import { InteractiveSessionCoordinator } from "../interactive-sessions/coordinator.js";
 import { readInteractiveSessionSettings } from "../interactive-sessions/settings.js";
@@ -47,9 +55,43 @@ function signedDelivery(payload: ReturnType<typeof createdPayload>): Request {
   });
 }
 
-test("the registered Linear pilot publishes the first answer, advances a capacity-one profile and stops only the fresh turn", async () => {
+async function registeredDatabase(backend: "embedded" | "postgres") {
+  if (backend === "postgres") {
+    const container = await new PostgreSqlContainer("postgres:17-alpine")
+      .withStartupTimeout(20_000)
+      .start();
+    try {
+      const bundle = await postgresDatabaseRuntime(
+        container.getConnectionUri(),
+        readDatabasePoolOptions({
+          PASEO_HUB_DATABASE_POOL_MAX: "1",
+          PASEO_HUB_DATABASE_ACQUIRE_TIMEOUT_MS: "1000",
+        }),
+      );
+      return {
+        ...bundle,
+        cleanup: async () => {
+          await container.stop({ timeout: 2_000 });
+        },
+      };
+    } catch (error) {
+      await container.stop({ timeout: 2_000 });
+      throw error;
+    }
+  }
   const dir = await mkdtemp(join(tmpdir(), "hub-pilot-registered-"));
-  const { runtime, locks } = await embeddedDatabaseRuntime(dir);
+  const cleanup = () => rm(dir, { recursive: true, force: true });
+  try {
+    return { ...(await embeddedDatabaseRuntime(dir)), cleanup };
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
+}
+
+async function exerciseRegisteredPilot(scenario: "stop" | "stop-race" | "postgres") {
+  const backend = scenario === "postgres" ? "postgres" : "embedded";
+  const { runtime, locks, cleanup } = await registeredDatabase(backend);
   try {
     await runtime.migrate();
     const tenant = surfaceTenant();
@@ -100,7 +142,37 @@ test("the registered Linear pilot publishes the first answer, advances a capacit
       allowedHumanId: randomUUID(),
       profileId: profile.id,
     };
-    const pilot = createLinearPilotRuntime({ config, database, runtime, locks });
+    let initialOutcome: "failed" | "sent" | undefined;
+    const pilotFailure = vi.fn(() => {
+      initialOutcome = "failed";
+    });
+    const transactionFailures: string[] = [];
+    let bindingLookups = 0;
+    const observed = observedRuntime(runtime, {
+      async afterQuery(sql) {
+        if (sql.includes("from surface_bindings b") && sql.includes("order by b.generation")) {
+          bindingLookups++;
+        }
+      },
+    });
+    const pilotRuntime: DatabaseRuntime = {
+      ...observed,
+      async transaction(operation) {
+        try {
+          return await observed.transaction(operation);
+        } catch (error) {
+          transactionFailures.push(error instanceof Error ? error.message : String(error));
+          throw error;
+        }
+      },
+    };
+    const pilot = createLinearPilotRuntime({
+      config,
+      database,
+      runtime: backend === "postgres" ? pilotRuntime : runtime,
+      locks,
+      reportFailure: pilotFailure,
+    });
     const agents = new FakeAgents();
     const coordinator = new InteractiveSessionCoordinator({
       database,
@@ -330,10 +402,19 @@ test("the registered Linear pilot publishes the first answer, advances a capacit
           },
           { epoch: turnId, seq: 1 },
         );
+        initialOutcome = "sent";
       };
       const began = performance.now();
       assert.equal((await endpoint.handle(signedDelivery(payload))).status, 200);
       assert(performance.now() - began < 5_000);
+      if (backend === "postgres") {
+        await vi.waitFor(() => expect(initialOutcome).toBeDefined(), { timeout: 5_000 });
+        assert.equal(
+          initialOutcome,
+          "sent",
+          `Signed webhook returned 200, job failures=${pilotFailure.mock.calls.length}, binding lookups=${bindingLookups}, ACKs=${publication.length}, sends=${agents.sends.length}, transaction errors=${transactionFailures.join(", ")}`,
+        );
+      }
       await vi.waitFor(
         async () => {
           const {
@@ -347,6 +428,23 @@ test("the registered Linear pilot publishes the first answer, advances a capacit
         { timeout: 10_000 },
       );
 
+      if (backend === "postgres") {
+        const { rows: bindings } = await runtime.query(
+          "select 1 from surface_bindings where native_session_id = $1 and superseded_at is null",
+          [nativeSessionId],
+        );
+        expect(bindings).toHaveLength(1);
+        expect(bindingLookups).toBeGreaterThan(0);
+        expect(publication.map(({ type, body }) => ({ type, body }))).toEqual([
+          { type: "thought", body: "Paseo Hub received your request." },
+        ]);
+        expect(agents.creations).toHaveLength(1);
+        expect(agents.sends).toHaveLength(1);
+        expect(pilotFailure).not.toHaveBeenCalled();
+        expect(transactionFailures).toEqual([]);
+        expect(legacy).not.toHaveBeenCalled();
+        return;
+      }
       const send = agents.sends.at(-1);
       assert(send);
       agents.emit(
@@ -482,6 +580,96 @@ test("the registered Linear pilot publishes the first answer, advances a capacit
       expect(agents.sends).toHaveLength(2);
       expect(reservation).toHaveBeenCalledTimes(1);
 
+      if (scenario === "stop-race") {
+        const stopFinished = Promise.withResolvers<void>();
+        const releasePublication = Promise.withResolvers<void>();
+        let publicationTask: Promise<void> | undefined;
+        const onTerminal = pilot.sessionHooks.onTerminal.bind(pilot.sessionHooks);
+        vi.spyOn(pilot.sessionHooks, "onTerminal").mockImplementation(async (terminal) => {
+          const task = Promise.resolve(onTerminal(terminal));
+          publicationTask = task;
+          // Let the old lane unwind on failure while still joining the real callback.
+          await Promise.race([
+            task.then(() => releasePublication.promise),
+            releasePublication.promise,
+          ]);
+        });
+
+        const stopCurrent = coordinator.stopLinearPilot.bind(coordinator);
+        vi.spyOn(coordinator, "stopLinearPilot").mockImplementation(async (input) => {
+          agents.emit(
+            fresh.agentId,
+            {
+              type: "timeline",
+              provider: "codex",
+              turnId: "turn-2",
+              item: {
+                type: "assistant_message",
+                text: "Exact final answer",
+                messageId: "answer-2",
+              },
+            },
+            { epoch: "turn-2", seq: 2 },
+          );
+          agents.emit(fresh.agentId, {
+            type: "turn_completed",
+            provider: "codex",
+            turnId: "turn-2",
+          });
+          try {
+            return await stopCurrent(input);
+          } finally {
+            stopFinished.resolve();
+          }
+        });
+
+        let deadline: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const stop = prompted(randomUUID(), at(6), null);
+          assert.equal((await endpoint.handle(signedDelivery(stop))).status, 200);
+          const finished = await Promise.race([
+            stopFinished.promise.then(() => "Stop settled"),
+            new Promise<string>((resolve) => {
+              deadline = setTimeout(
+                () => resolve("Stop timed out behind terminal publication"),
+                5_000,
+              );
+            }),
+          ]);
+          expect(finished).toBe("Stop settled");
+          expect(agents.interrupts).toEqual([]);
+          await vi.waitFor(
+            () =>
+              expect(publication[3]).toEqual({
+                id: pilotActivityIds(nativeSessionId, followUpId).stop,
+                type: "error",
+                body: "Stop requested; I could not confirm it stopped",
+              }),
+            { timeout: 5_000 },
+          );
+          await pilot.stop();
+          expect(publicationTask).toBeDefined();
+          await publicationTask;
+          expect(publication).toHaveLength(4);
+
+          let drained = false;
+          const shutdown = coordinator.stopAccepting().then(() => {
+            drained = true;
+            return undefined;
+          });
+          await setImmediate();
+          expect(drained).toBe(false);
+          releasePublication.resolve();
+          await shutdown;
+        } finally {
+          clearTimeout(deadline);
+          releasePublication.resolve();
+          await pilot.stop();
+          await publicationTask;
+        }
+        return;
+      }
+
       const interrupt = agents.control.bind(agents);
       agents.connection.agents.control = async (id, workspace, action, onWritten) => {
         onWritten?.();
@@ -530,7 +718,28 @@ test("the registered Linear pilot publishes the first answer, advances a capacit
       await coordinator.stopAccepting();
     }
   } finally {
-    await runtime.close();
-    await rm(dir, { recursive: true, force: true });
+    try {
+      await runtime.close();
+    } finally {
+      await cleanup();
+    }
   }
-}, 120_000);
+}
+
+test(
+  "the registered Linear pilot publishes the first answer, advances a capacity-one profile and stops only the fresh turn",
+  () => exerciseRegisteredPilot("stop"),
+  120_000,
+);
+
+test(
+  "the registered Linear pilot acknowledges and sends one owner start with a one-connection PostgreSQL pool",
+  () => exerciseRegisteredPilot("postgres"),
+  45_000,
+);
+
+test(
+  "registered Stop settles when the exact active turn completes just before coordinator enqueue",
+  () => exerciseRegisteredPilot("stop-race"),
+  120_000,
+);

@@ -509,21 +509,25 @@ export class ConnectionRepository {
         .where(eq(schema.linearConnections.linearOrganizationId, linearOrganizationId))
         .for("update");
       const connection = row === undefined ? undefined : linearConnection(row);
-      return operation(connection, async (input) => {
-        if (connection === undefined) throw new Error("Linear connection unavailable");
-        await transaction
-          .update(schema.linearConnections)
-          .set({
-            accessToken: input.accessToken,
-            ...(input.refreshToken === undefined ? {} : { refreshToken: input.refreshToken }),
-            ...(input.accessTokenExpiresAt === undefined
-              ? {}
-              : { accessTokenExpiresAt: input.accessTokenExpiresAt }),
-            ...(input.scopes === undefined ? {} : { scopes: input.scopes }),
-            updatedAt: sql`clock_timestamp()`,
-          })
-          .where(eq(schema.linearConnections.id, connection.id));
-      });
+      return operation(
+        connection,
+        async (input) => {
+          if (connection === undefined) throw new Error("Linear connection unavailable");
+          await transaction
+            .update(schema.linearConnections)
+            .set({
+              accessToken: input.accessToken,
+              ...(input.refreshToken === undefined ? {} : { refreshToken: input.refreshToken }),
+              ...(input.accessTokenExpiresAt === undefined
+                ? {}
+                : { accessTokenExpiresAt: input.accessTokenExpiresAt }),
+              ...(input.scopes === undefined ? {} : { scopes: input.scopes }),
+              updatedAt: sql`clock_timestamp()`,
+            })
+            .where(eq(schema.linearConnections.id, connection.id));
+        },
+        runtimeTransaction,
+      );
     });
   }
 

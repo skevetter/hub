@@ -4,6 +4,7 @@ import {
   readPilotPromptPage,
   type PilotHistoryScope,
 } from "../../linear-pilot/history-read.js";
+import type { QueryHandle } from "../../db/runtime/index.js";
 import type { LinearConnectionRecord } from "../../db/types.js";
 import {
   hasRequiredLinearScopes,
@@ -165,6 +166,13 @@ type LinearAgentClientOptions = Pick<
     operation: Readonly<LinearAgentOperation>,
     signal: AbortSignal,
   ): Promise<boolean | undefined>;
+  /** Pilot authority must be checked on the lease's connection after it acquires the lock. */
+  authorizeRefresh?(
+    query: QueryHandle,
+    binding: Readonly<LinearConnectionBinding>,
+    operation: Readonly<LinearAgentOperation>,
+    signal: AbortSignal,
+  ): Promise<boolean | undefined>;
 };
 
 type Send = <T>(
@@ -247,17 +255,23 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
     const serializedInput = JSON.stringify(inputVariables);
     checkPayloadCredentials(serializedInput, initial);
     if (!hasUsableLinearAccessToken(initial, now())) {
-      // Policy reads may need a pool connection. The refresh lease already holds one.
+      // Keep the ordinary authorizer outside the lease so it cannot wait for its own connection.
       await authorize();
       await options.withLinearConnectionRefresh(
         binding.linearOrganizationId,
-        async (row, update) => {
+        async (row, update, query) => {
           checkSignal();
           const current = checkConnection(row);
           checkPayloadCredentials(serializedInput, current);
           if (hasUsableLinearAccessToken(current, now())) return;
           const { refreshToken } = current;
           if (refreshToken === null) throw new LinearAgentError("reauthorize");
+          if (options.authorizeRefresh !== undefined) {
+            if (query === undefined) throw new LinearAgentError("policy_required");
+            const authorized = await options.authorizeRefresh(query, binding, operation, signal);
+            checkSignal();
+            if (authorized !== true) throw new LinearAgentError("policy_required");
+          }
           const refreshed = await providerRequest(
             () => options.connectionClient.refresh(refreshToken, signal),
             signal,

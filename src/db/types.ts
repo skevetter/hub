@@ -1,3 +1,4 @@
+import type { QueryHandle } from "./runtime/index.js";
 import type { SurfaceStore } from "../surfaces/store.js";
 import type { InteractiveSessionStore } from "../interactive-sessions/store.js";
 import type { RunPayloadRetentionStore } from "../run-payload-retention/store.js";
@@ -649,6 +650,7 @@ export type LinearConnectionTokenUpdate = Omit<UpdateLinearConnectionTokensInput
 export type LinearConnectionRefreshOperation<T> = (
   connection: LinearConnectionRecord | undefined,
   updateTokens: (input: LinearConnectionTokenUpdate) => Promise<void>,
+  query?: QueryHandle,
 ) => Promise<T>;
 
 export type DisconnectConnectionResult =
@@ -1934,6 +1936,7 @@ export interface Database
    * Runs a Linear refresh decision under the same transaction-scoped external-connection lock
    * used by OAuth rebind. The connection re-read and any token update use that transaction, so a
    * stale refresh cannot overwrite a concurrent reauthorization or consume a rotating token twice.
+   * PostgreSQL supplies the transaction query handle to callback authorization checks.
    */
   withLinearConnectionRefresh<T>(
     linearOrganizationId: string,

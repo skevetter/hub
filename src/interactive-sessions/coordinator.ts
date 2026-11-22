@@ -1636,7 +1636,12 @@ export class InteractiveSessionCoordinator {
         !worker.pilotStopRequested
       ) {
         this.dropWatch(worker);
-        await this.options.linearPilot?.onTerminal(terminal);
+        // The Stop job can hold the session lock while it waits for this lane.
+        void this.track(
+          Promise.resolve().then(() => this.options.linearPilot?.onTerminal(terminal)),
+          "linear_pilot_terminal",
+          worker.scope,
+        );
       }
     });
   }

@@ -643,6 +643,28 @@ it("checks policy outside the refresh transaction so a single database connectio
   assert.equal(fixture.refreshTokens.length, 1);
 });
 
+it("refuses a pilot refresh when the lease omits its transaction query handle", async () => {
+  const fixture = linearAgentFixture();
+  fixture.connections.set(fixture.a.linearOrganizationId, {
+    ...fixture.a,
+    accessTokenExpiresAt: new Date(0),
+  });
+  let checkedAuthority = false;
+  const api = createLinearAgentClient({
+    ...fixture.options,
+    binding: linearAgentBinding(fixture.a),
+    activityIdVersion: 5,
+    authorizeRefresh: async () => {
+      checkedAuthority = true;
+      return true;
+    },
+  });
+  await assert.rejects(api.readAppViewer(), { code: "policy_required" });
+  assert.equal(checkedAuthority, false);
+  assert.equal(fixture.refreshTokens.length, 0);
+  assert.equal(fixture.calls.length, 0);
+});
+
 const generatedActivityShapes = [
   { content: thought, ephemeral: true },
   { content: { type: "action", action: "Read", parameter: "Example" }, ephemeral: false },

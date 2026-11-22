@@ -1,9 +1,10 @@
 import type { Database } from "../db/types.js";
-import type { DatabaseRuntime } from "../db/runtime/index.js";
+import type { DatabaseRuntime, QueryHandle } from "../db/runtime/index.js";
 import type { Locks } from "../db/runtime/locks/index.js";
 import { validMessage } from "../interactive-sessions/store.js";
 import type { InteractiveSessionCoordinator } from "../interactive-sessions/coordinator.js";
 import type { SessionRecord } from "../interactive-sessions/types.js";
+import type { LinearAgentOperation } from "../providers/linear/agent.js";
 import type { LinearPilotRegistration } from "../providers/linear/index.js";
 import type { SurfaceBinding } from "../surfaces/store.js";
 import {
@@ -19,8 +20,13 @@ import { classifyLinearPilotCompanionComment } from "./intake.js";
 import { adaptSignedPilotFollowUp } from "./follow-up-event.js";
 import { createPilotFollowUp, type PilotConversation, type PilotTurn } from "./follow-up.js";
 import type { PilotHistoryScope } from "./history-read.js";
+import { createPilotSessionSerialization } from "./session-serialization.js";
 import type { LinearPilotSessionHooks } from "./session.js";
-import { authorizeBoundPilotTurn, type PilotTurnGrant } from "./turn-authority.js";
+import {
+  authorizeBoundPilotTurn,
+  authorizePilotTurnRefresh,
+  type PilotTurnGrant,
+} from "./turn-authority.js";
 
 type Qualified = NonNullable<Awaited<ReturnType<typeof qualifyLinearPilotDelivery>>>;
 type Provider = Parameters<LinearPilotRegistration["offer"]>[1];
@@ -61,6 +67,7 @@ function connectionBinding(
 export function createLinearPilotRuntime(options: Options) {
   const { config, database, runtime, locks } = options;
   const bindings = new PilotBindings(runtime, locks, database);
+  const withSession = createPilotSessionSerialization();
   const pending = new Map<
     string,
     { installation: Qualified["installation"]; identityId: string }
@@ -69,23 +76,6 @@ export function createLinearPilotRuntime(options: Options) {
   const jobs = new Set<Promise<void>>();
   let coordinator: InteractiveSessionCoordinator | undefined;
   let accepting = true;
-
-  function withSession<T>(
-    authority: PilotAuthority,
-    origin: PilotNativeOrigin,
-    run: () => Promise<T>,
-  ) {
-    return locks.withLock(
-      `linear-pilot-session:${JSON.stringify([
-        authority.organizationId,
-        authority.workspaceId,
-        authority.applicationId,
-        authority.appUserId,
-        origin.nativeSessionId,
-      ])}`,
-      run,
-    );
-  }
 
   function eventScope({ event, installation }: Qualified) {
     const authority: PilotAuthority = {
@@ -201,17 +191,16 @@ export function createLinearPilotRuntime(options: Options) {
   }
 
   function clientFor(grant: Active, activity = grant.activity) {
+    const permitsOperation = (operation: Readonly<LinearAgentOperation>) =>
+      accepting &&
+      "sessionId" in operation &&
+      operation.sessionId === activity.nativeSessionId &&
+      (!("issueId" in operation) || operation.issueId === grant.origin.issueId) &&
+      operation.kind !== "addHubUrl";
     return grant.provider.activityClient({
       binding: activity.binding,
       authorize: async (_binding, operation) => {
-        if (
-          !accepting ||
-          !("sessionId" in operation) ||
-          operation.sessionId !== activity.nativeSessionId
-        )
-          return false;
-        if ("issueId" in operation && operation.issueId !== grant.origin.issueId) return false;
-        if (operation.kind === "addHubUrl") return false;
+        if (!permitsOperation(operation)) return false;
         const found = await database.findInteractiveSession(
           grant.authority.organizationId,
           grant.sessionId,
@@ -221,6 +210,10 @@ export function createLinearPilotRuntime(options: Options) {
           (await authorizeBoundPilotTurn(bindings.find, grant, found.session, grant.commandId))
         );
       },
+      authorizeRefresh: async (query, _binding, operation) =>
+        permitsOperation(operation) &&
+        (await authorizePilotTurnRefresh(query, bindings.find, grant)) &&
+        accepting,
     });
   }
 
@@ -571,22 +564,25 @@ export function createLinearPilotRuntime(options: Options) {
             provider.oauthClientId,
           );
           if (!installation) return undefined;
+          const authorizeViewer = async (query: QueryHandle, operation: LinearAgentOperation) => {
+            if (!accepting || operation.kind !== "viewer") return false;
+            const current = await resolveLinearPilotInstallation(
+              query,
+              config,
+              provider.oauthClientId,
+            );
+            return (
+              accepting &&
+              current?.connectionId === installation.connectionId &&
+              current.appUserId === installation.appUserId &&
+              current.ownerUserId === installation.ownerUserId &&
+              current.profileVersion === installation.profileVersion
+            );
+          };
           const client = provider.activityClient({
             binding: connectionBinding(installation),
-            authorize: async (_binding, operation) => {
-              if (!accepting || operation.kind !== "viewer") return false;
-              const current = await resolveLinearPilotInstallation(
-                runtime,
-                config,
-                provider.oauthClientId,
-              );
-              return (
-                current?.connectionId === installation.connectionId &&
-                current.appUserId === installation.appUserId &&
-                current.ownerUserId === installation.ownerUserId &&
-                current.profileVersion === installation.profileVersion
-              );
-            },
+            authorize: (_binding, operation) => authorizeViewer(runtime, operation),
+            authorizeRefresh: (query, _binding, operation) => authorizeViewer(query, operation),
           });
           try {
             return (await client.readAppViewer(AbortSignal.timeout(2_000))).handle;

@@ -36,6 +36,13 @@ While a turn is running, Hub replies `Still working on the previous message;
 reply when I have answered.` The reply starts no new agent. A pending permission
 stays pending until a person resolves it.
 
+Run one Hub process for the pilot. It serializes work for each native session
+locally. A second process can receive signed deliveries and read current session
+state. PostgreSQL receipts deduplicate the same interaction, and the retirement
+and binding comparisons allow only one advance of the prior turn. A Stop sent
+to another process can remain unapplied. The interrupt requires the process
+holding the live coordinator watch.
+
 ## Stop an active turn
 
 Hub checks the active turn and sends one interrupt while it holds the pilot
