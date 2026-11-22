@@ -43,13 +43,17 @@ test("Home restores keyboard focus after a retry", async ({ hub, page }) => {
       await route.fulfill({ response, body });
     }
   });
-  await page.reload();
-  const retry = page.getByRole("button", { name: "Try again" });
-  await expect(retry).toBeVisible();
-  failHome = false;
-  await retry.press("Enter");
-  await expect(page.getByText("Runs, 24 hours", { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeFocused();
+  try {
+    await page.reload();
+    const retry = page.getByRole("button", { name: "Try again" });
+    await expect(retry).toBeVisible();
+    failHome = false;
+    await retry.press("Enter");
+    await expect(page.getByText("Runs, 24 hours", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeFocused();
+  } finally {
+    await page.unrouteAll({ behavior: "wait" });
+  }
 });
 
 for (const width of [390, 1280])
@@ -87,12 +91,24 @@ for (const width of [390, 1280])
     expect(await dimensions(page.locator("main"))).toEqual(loadingHeights);
   });
 
-test("Home wraps a long scoped trigger name at 390 px", async ({ hub, page }) => {
+test("Home wraps long record names at 390 px", async ({ hub, page }) => {
   const name = "w".repeat(60);
+  const connection = "C".repeat(60);
+  const daemonName = "d".repeat(60);
+  const organization = "O".repeat(60);
+  const profile = "P".repeat(60);
   await hub.signUpAs("owner", owner);
-  await hub.createOrganization("owner", "Acme");
+  await hub.createOrganization("owner", organization);
   await hub.connectGitHub("owner");
-  const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  const daemon = await hub.connectProviderDaemon("owner", organization);
+  await hub.seedSlackConnection("owner", "slack", connection);
+  const daemonId = await hub.seedDaemonSlug("owner", daemonName);
+  await hub
+    .primaryApplication()
+    .query("update daemons set scopes = $1::jsonb where id = $2", [
+      JSON.stringify(["hub.execute"]),
+      daemonId,
+    ]);
   const triggers = new OrganizationTriggers(page);
   await triggers.open();
   await triggers.startNew();
@@ -117,12 +133,38 @@ run:
   prompt: Review this.
 `);
   await triggers.save(name);
+  await hub.seedTriggerRun(name, { minutesAgo: 1, status: "succeeded" });
+  await hub.primaryApplication().query(
+    `insert into interactive_session_profiles (id, organization_id, name, daemon_id, cwd, provider, status)
+     select gen_random_uuid(), organization_id, $1, id, '/workspace', 'codex', 'active'
+     from daemons where slug = $2`,
+    [profile, daemon],
+  );
   await page.getByRole("link", { name: "Home", exact: true }).click();
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole("radio", { name: "GitHub" }).click();
   await expect(
     page.getByText(`${name} only starts for comments that match its filters.`),
   ).toBeVisible();
+  await expect(
+    page.getByText(`Review authorization for ${connection} in Connections.`),
+  ).toBeVisible();
+  const home = new OrganizationHome(page);
+  await home.expectStep("Enroll a daemon", daemonName);
+  await home.expectStep("Create a trigger", name);
+  await home.expectRecentRun(name, "Succeeded");
+  const runName = page.getByRole("list", { name: "Recent runs" }).getByText(name, { exact: true });
+  expect(
+    await runName.evaluate(
+      (element) => element.clientHeight > parseFloat(getComputedStyle(element).lineHeight),
+    ),
+  ).toBe(true);
+  const profilePicker = page.getByRole("combobox", { name: "Profile" });
+  await expect(profilePicker).toContainText(profile);
+  expect(
+    await profilePicker.evaluate((element) => element.getBoundingClientRect().height),
+  ).toBeGreaterThan(32);
+  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText(organization);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
   await page.getByRole("link", { name: "Open trigger" }).click();
   await expect(page.getByRole("heading", { name, level: 1 })).toBeVisible();
