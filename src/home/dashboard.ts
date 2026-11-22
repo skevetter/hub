@@ -16,7 +16,7 @@ import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { projectTriggerForm } from "../triggers/configuration/editor.js";
 import { matchGitHubInvocations } from "../triggers/github/match.js";
 import { matchLinearInvocations } from "../triggers/linear/match.js";
-import { canFinishSetup } from "./checklist.js";
+import { incompleteSetupStepTitles, SETUP_INCOMPLETE } from "./checklist.js";
 import { HOME_MONTH_DAYS, HOME_OPEN_SESSIONS_LIMIT } from "./limits.js";
 import { commentExamples, isTryCommentEvent } from "./things-to-try.js";
 
@@ -85,6 +85,12 @@ export interface HomeDashboardOptions {
   interactiveSessions?: boolean;
 }
 
+class HomeSetupIncompleteError extends ProductRequestError {
+  constructor(readonly stepTitles: readonly string[]) {
+    super(409, SETUP_INCOMPLETE);
+  }
+}
+
 export class HomeDashboard {
   constructor(
     private readonly database: Database,
@@ -122,7 +128,8 @@ export class HomeDashboard {
 
     const snapshot = await this.readSnapshot(organization, null);
     if (snapshot.checklistCompletedAt !== null) return snapshot.checklistCompletedAt;
-    if (!canFinishSetup(snapshot)) throw new ProductRequestError(409, "checklist_incomplete");
+    const incomplete = incompleteSetupStepTitles(snapshot);
+    if (incomplete.length > 0) throw new HomeSetupIncompleteError(incomplete);
     return (await this.database.completeHomeChecklist(organization.id)).toISOString();
   }
 

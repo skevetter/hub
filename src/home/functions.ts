@@ -4,6 +4,7 @@ import { z } from "zod";
 import { respondOk, type Result } from "../contract/respond.js";
 import { respondWithFailure } from "../failures/index.js";
 import { getApplication } from "../server/runtime.js";
+import { SETUP_INCOMPLETE, SETUP_STEP_TITLES } from "./checklist.js";
 import type { HomeSnapshot } from "./dashboard.js";
 
 export type { HomeSnapshot } from "./dashboard.js";
@@ -30,6 +31,16 @@ export const finishHomeSetup = createServerFn({ method: "POST" })
   .validator(scopeSchema)
   .handler(({ data }) => finishHomeSetupRequest(getRequest(), data.organizationSlug));
 
+function setupConflictSteps(error: unknown): string[] {
+  // The application and the server function can load different copies of the error class.
+  if (!(error instanceof Error) || error.message !== SETUP_INCOMPLETE || !("stepTitles" in error))
+    return [];
+  const { stepTitles } = error;
+  return Array.isArray(stepTitles)
+    ? Object.values(SETUP_STEP_TITLES).filter((title) => stepTitles.includes(title))
+    : [];
+}
+
 export const finishHomeSetupRequest = createServerOnlyFn(
   async (request: Request, organizationSlug: string): Promise<Result<{ completedAt: string }>> => {
     try {
@@ -38,6 +49,8 @@ export const finishHomeSetupRequest = createServerOnlyFn(
       const completedAt = await dashboard.completeChecklist(request, organizationSlug);
       return respondOk({ completedAt });
     } catch (error) {
+      const remaining = setupConflictSteps(error);
+      const step = remaining.length === 1 ? "step" : "steps";
       return respondWithFailure(
         error,
         { operation: "home.finish_setup", component: "home", organizationSlug },
@@ -46,7 +59,11 @@ export const finishHomeSetupRequest = createServerOnlyFn(
           authentication: "Sign in again to finish setup.",
           forbidden: "Only an instance operator can finish setup.",
           notFound: "Organization unavailable.",
-          conflict: "Complete every checklist step before finishing setup.",
+          ...(remaining.length === 0
+            ? {}
+            : {
+                conflict: `Complete the remaining organization ${step} to finish setup. ${remaining.join(", ")}.`,
+              }),
           validation: "Reload Home and try again.",
         },
       );
