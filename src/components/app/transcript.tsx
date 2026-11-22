@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import { cn } from "../../lib/utils.js";
 import { Button } from "../ui/button.js";
 import { FollowBottom } from "./follow-bottom.js";
 import { EmptyState } from "./empty-state.js";
@@ -18,13 +19,6 @@ const DELIVERY: Record<DeliveryStatus, { tone: StatusTone; label: string }> = {
   queued: { tone: "neutral", label: "Queued" },
   not_sent: { tone: "danger", label: "Not sent" },
   unknown: { tone: "warning", label: "Delivery unknown" },
-};
-
-const TOOL_TONE: Record<ToolStatus, StatusTone> = {
-  running: "neutral",
-  completed: "success",
-  failed: "danger",
-  canceled: "warning",
 };
 
 /** Anchored entries by daemon position, then every unanchored Hub message in arrival order. */
@@ -96,8 +90,8 @@ function Entry({
   switch (item.kind) {
     case "human":
       return (
-        <div className="grid min-w-0 gap-1">
-          <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+        <div data-entry="human" className="grid min-w-0 justify-items-end gap-1">
+          <div className="flex min-w-0 max-w-full items-center justify-end gap-2 text-xs text-muted-foreground">
             <span className="min-w-0 truncate">{item.author}</span>
             <StatusPill tone={DELIVERY[item.status].tone}>{DELIVERY[item.status].label}</StatusPill>
             {item.retryable && onRetry !== undefined ? (
@@ -115,7 +109,7 @@ function Entry({
           {item.text === null ? (
             <p className="text-sm text-muted-foreground">Message expired</p>
           ) : (
-            <p className="min-w-0 text-sm whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]">
+            <p className="max-w-xl min-w-0 rounded-xl bg-muted px-3 py-2 text-sm whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]">
               {item.text}
             </p>
           )}
@@ -123,7 +117,7 @@ function Entry({
       );
     case "assistant":
       return (
-        <div className="grid min-w-0 gap-1">
+        <div data-entry="assistant" className="grid min-w-0 justify-items-start gap-1">
           <p className="text-xs text-muted-foreground">Agent</p>
           <p className="min-w-0 text-sm whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]">
             {item.text}
@@ -133,12 +127,18 @@ function Entry({
       );
     case "tool":
       return (
-        <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+        <p
+          data-entry="tool"
+          className={cn(
+            "flex min-w-0 items-center gap-2 text-xs",
+            item.status === "failed" ? "text-destructive" : "text-muted-foreground",
+          )}
+        >
           <span className="min-w-0 truncate font-mono" title={item.name}>
             {item.name}
           </span>
-          <StatusPill tone={TOOL_TONE[item.status]}>{statusLabel(item.status)}</StatusPill>
-        </div>
+          <span className="shrink-0">{statusLabel(item.status)}</span>
+        </p>
       );
     default:
       return (
