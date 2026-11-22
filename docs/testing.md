@@ -43,11 +43,11 @@ mise exec node@24.22.0 -- npm run test:changed
 mise exec node@24.22.0 -- npm run test:changed -- --base origin/main --safe
 ```
 
-The command picks the local or remote release branch whose merge base has the fewest commits to
-HEAD. The highest version wins ties. A checkout on a release branch considers earlier versions
-in its release series. If no release has a merge base, the command tries the configured upstream
-then `origin/main`. It prints the selected base and reason. `--base` accepts an explicit local
-Git ref. Staged, unstaged, and untracked changes are included.
+The command compares the merge bases of HEAD with each local or remote release branch, the
+configured upstream and `origin/main`, and picks the one with the fewest commits to HEAD. Ties go
+to the highest release version, then the upstream, then `origin/main`. A checkout on a release
+branch considers earlier versions in its release series. It prints the selected base and reason.
+`--base` accepts an explicit local Git ref. Staged, unstaged, and untracked changes are included.
 
 The command runs changed test files and uses Vitest's static import graph to find related tests. It
 also checks the generated route tree and runs the typography policy. Changes under `drizzle/` run
