@@ -137,12 +137,22 @@ async function readJson(path) {
   }
 }
 
-export function publishTestMetrics(results, checks = [], directory = process.cwd(), signal) {
+export function publishTestMetrics(
+  results,
+  checks = [],
+  directory = process.cwd(),
+  { signal, expectedHead } = {},
+) {
   signal?.throwIfAborted();
   const report = process.env[reportVariable];
-  if (!report) return;
+  if (!report && expectedHead === undefined) return;
   const root = realpathSync(directory);
   const head = requireGit(root, ["rev-parse", "--verify", "HEAD"]).trim();
+  if (expectedHead !== undefined && head !== expectedHead)
+    throw new Error(
+      `HEAD changed while the test runner was active (started at ${expectedHead}, now ${head}).`,
+    );
+  if (!report) return;
   const selectedFiles = [...new Set(results.flatMap(({ files }) => files))].sort();
   const counts = { passed: 0, failed: 0, skipped: 0 };
   for (const result of results) {
@@ -153,8 +163,9 @@ export function publishTestMetrics(results, checks = [], directory = process.cwd
   writeFileSync(report, data, { flag: "wx" });
 }
 
-function validateMetrics(metrics, testedRoot, testedHead) {
-  if (metrics === undefined) return;
+export async function readTestMetrics(path, testedRoot, testedHead) {
+  const metrics = await readJson(path);
+  if (metrics === undefined) return undefined;
   const { root, head, selectedFiles, counts, checks } = metrics ?? {};
   const strings = (items) =>
     Array.isArray(items) && items.every((value) => typeof value === "string");
@@ -174,6 +185,7 @@ function validateMetrics(metrics, testedRoot, testedHead) {
   if (root !== testedRoot || head !== testedHead) {
     throw new Error(`The command tested ${root} at ${head}, not ${testedRoot} at ${testedHead}.`);
   }
+  return metrics;
 }
 
 async function replaceReceipt(destination, pending, { head, tree }, commands, signal) {
@@ -239,9 +251,7 @@ export async function recordTestRun(directory, command, { stdio = "inherit", sig
     if (code === 0) {
       checkUnchanged();
       try {
-        const reported = await readJson(report);
-        validateMetrics(reported, root, head);
-        metrics = reported;
+        metrics = await readTestMetrics(report, root, head);
       } catch (error) {
         code = 1;
         metricsError = error;

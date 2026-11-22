@@ -601,3 +601,40 @@ test("changed testing rejects failed JSON assertions even when Vitest exits zero
   assert.match(result.stderr, /Vitest JSON report did not show a completed passing run/u);
   await assert.rejects(readFile(metrics), { code: "ENOENT" });
 });
+
+test("changed testing refuses full-suite metrics for a different commit", async (t) => {
+  const { root, run } = await changedFixture(t, {
+    "scripts/test-parallel.mjs": `
+      import { realpathSync, writeFileSync } from "node:fs";
+      writeFileSync(process.env.HUB_TEST_RUN_REPORT, JSON.stringify({
+        root: realpathSync(process.cwd()), head: process.env.FIXTURE_TESTED_HEAD,
+        selectedFiles: ["src/typography-policy.test.ts"],
+        counts: { passed: 1, failed: 0, skipped: 0 }, checks: [],
+      }));
+    `,
+  });
+  await writeFile(join(root, "vitest.config.ts"), "");
+  const metrics = join(root, "status-metrics.json");
+  const runWithHead = (head) =>
+    spawnSync(process.execPath, [join(root, "scripts/test-changed.mjs"), "--base", "HEAD"], {
+      cwd: root,
+      env: {
+        ...process.env,
+        TMPDIR: root,
+        HUB_TEST_FULLSUITE_LOCK: join(root, "status-lock"),
+        HUB_TEST_RUN_REPORT: metrics,
+        FIXTURE_TESTED_HEAD: head,
+      },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+  const result = runWithHead("0".repeat(40));
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /The command tested .* at 0000000000/u);
+  await assert.rejects(readFile(metrics), { code: "ENOENT" });
+
+  const head = run("rev-parse", "HEAD");
+  const passing = runWithHead(head);
+  assert.equal(passing.status, 0, passing.stderr);
+  assert.equal(JSON.parse(await readFile(metrics, "utf8")).head, head);
+});
