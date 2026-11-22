@@ -3,6 +3,7 @@ import {
   organizationTriggerRoutesForSave,
 } from "./linear-trigger-routes.js";
 import { InteractiveSessionRepository } from "../interactive-sessions/postgres-store.js";
+import { postgresRunReplies } from "./run-replies.js";
 import { expireReceiptPayload, scanReceiptPayloads } from "./receipt-payload-retention.js";
 import {
   expireGitHubSyncPayload,
@@ -361,6 +362,7 @@ export function createDatabase(
 }
 
 class PgDatabase implements Database {
+  readonly runReplies: Database["runReplies"];
   get stopInterrupts() {
     return postgresStopInterrupts(this.pool);
   }
@@ -570,6 +572,7 @@ class PgDatabase implements Database {
     private readonly locks: Locks,
     unsupportedLinearReceiptsPerHour: number,
   ) {
+    this.runReplies = postgresRunReplies(this.pool, locks);
     this.schedules = new ScheduleRepository(this.pool);
     this.timeline = new RunTimelineRepository(this.pool, locks);
     this.interactiveSessions = new InteractiveSessionRepository(
@@ -994,6 +997,12 @@ class PgDatabase implements Database {
         if ("receiptReplay" in admission && replay === "acknowledge") return admission;
         const id =
           "receiptReplay" in admission ? requiredExistingRun(admission.runId) : admission.id;
+        if (admission.created && input.replyMessage === true) {
+          await client.query(
+            "insert into run_reply_deliveries (trigger_run_id, organization_id) values ($1, $2)",
+            [id, input.organizationId],
+          );
+        }
         const selected = await client.query<TriggerRunRow>(
           "select * from trigger_runs where id = $1",
           [id],

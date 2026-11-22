@@ -7,6 +7,7 @@ import {
   isEditorEvent,
   NOTIFICATION_FILTER_KEYS,
   NOTIFICATION_FROM_USERS_MESSAGE,
+  replyMessageError,
 } from "./events.js";
 import { AuthoredGitHubAuthoritySchema } from "../../config/github-authority.js";
 
@@ -227,6 +228,7 @@ export const TriggerDocumentSchema = z
     /** A distinct whole-trigger deadline; new one-run triggers normally omit it. */
     max_runtime: z.string().min(1).optional(),
     progress_message: z.boolean().optional(),
+    reply_message: z.boolean().optional(),
     run: TriggerRunSchema,
   })
   .strict()
@@ -240,6 +242,13 @@ export const TriggerDocumentSchema = z
         path: ["progress_message"],
         message: PROGRESS_DESTINATION_REQUIRED,
       });
+    }
+    if (trigger.reply_message === true) {
+      for (const [event, definition] of Object.entries(trigger.on)) {
+        const error = replyMessageError(event, definition.filters?.from_users);
+        if (error !== undefined)
+          context.addIssue({ code: "custom", path: ["reply_message"], message: error });
+      }
     }
   })
   .superRefine((trigger, context) => {

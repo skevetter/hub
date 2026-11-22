@@ -12,6 +12,20 @@ export const MAX_TURN_END_OUTPUT_CHARS = 16_000;
 /** Recorded in the result so an inferred completion can be told from an explicit finish. */
 export const TURN_END_COMPLETION = "inferred_from_turn_end";
 
+export function inferredTurnEndResult(
+  output: { text: string; truncated: boolean } | null | undefined,
+  retainOutput: boolean,
+) {
+  if (output === undefined) return undefined;
+  const result = { status: "succeeded" as const, completion: TURN_END_COMPLETION };
+  if (output === null || !retainOutput) return result;
+  return {
+    ...result,
+    output: output.text,
+    ...(output.truncated ? { outputTruncated: true } : {}),
+  };
+}
+
 export type TurnEndVerdict =
   /** The agent ended a turn normally. Start the settle timer. */
   | "finished"
@@ -34,6 +48,8 @@ export class TurnEndTracker {
   private messageId: string | undefined;
   private text = "";
 
+  constructor(private readonly captureOutput = true) {}
+
   observe(event: AgentEvent): TurnEndVerdict {
     // Snapshots describe state from before the prompt. Status updates are not trusted either way:
     // Hub asks the daemon for the agent's status when the settle timer fires.
@@ -51,7 +67,7 @@ export class TurnEndTracker {
       case "timeline": {
         const item = stream.item;
         if (item.type === "assistant_message" && typeof item.text === "string") {
-          this.append(item.messageId, item.text);
+          if (this.captureOutput) this.append(item.messageId, item.text);
           return this.interrupt(false);
         }
         // Reasoning sits beside the answer. Anything else is work, so earlier text is not final.

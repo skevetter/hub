@@ -4,6 +4,7 @@ import {
   organizationTriggerRoutesForSave,
 } from "./linear-trigger-routes.js";
 import { isCanceledExecution, type StopCleanupState } from "../triggers/run-stop.js";
+import type { RunReplyRecord, RunReplyScope } from "../run-replies/store.js";
 import type { AcceptCommandInput, AcceptCommandResult } from "../interactive-sessions/store.js";
 import { capabilities } from "../interactive-sessions/access.js";
 import {
@@ -339,6 +340,74 @@ export function createMemoryDatabase(
 }
 
 class MemoryDatabase implements Database {
+  private readonly replyDeliveries = new Map<string, RunReplyRecord>();
+  readonly runReplies: Database["runReplies"] = {
+    find: async (scope) => structuredClone(this.runReply(scope)),
+    reserve: async (input) => {
+      const reply = this.runReply(input);
+      const run = this.triggerRuns.get(input.runId);
+      if (reply === undefined || run?.status !== "succeeded" || run.payloadExpiryState != null)
+        return "run_unavailable";
+      if (reply.state !== "pending") return "already_handled";
+      const now = this.options.now?.() ?? new Date();
+      const cutoff = now.getTime() - 3_600_000;
+      const attempts = [...this.replyDeliveries.values()].filter(
+        (row) =>
+          row.organizationId === input.organizationId &&
+          row.attemptedAt !== null &&
+          row.attemptedAt.getTime() > cutoff,
+      );
+      if (attempts.length >= input.perHour) {
+        this.replyDeliveries.set(input.runId, {
+          ...reply,
+          state: "refused",
+          failure: "rate_limited",
+        });
+        return "rate_limited";
+      }
+      this.replyDeliveries.set(input.runId, {
+        ...reply,
+        state: "sending",
+        length: input.length,
+        hash: input.hash,
+        bindingHash: input.bindingHash,
+        attemptedAt: now,
+      });
+      return "reserved";
+    },
+    finish: async (input) => {
+      const reply = this.runReply(input);
+      if (reply?.state !== input.from) return false;
+      this.replyDeliveries.set(input.runId, {
+        ...reply,
+        state: input.failure === null ? "sent" : "refused",
+        failure: input.failure,
+      });
+      return true;
+    },
+    recoverable: async (cutoff) => {
+      const due = [...this.replyDeliveries.values()].flatMap((row) => {
+        if (row.state !== "pending" && row.state !== "sending") return [];
+        const run = this.triggerRuns.get(row.runId);
+        const at = row.attemptedAt ?? run?.completedAt;
+        const endedWithoutSuccess =
+          row.state === "pending" &&
+          (run?.status === "failed" || run?.status === "timed_out" || run?.status === "canceled");
+        return at != null && (at <= cutoff || endedWithoutSuccess) ? [{ at, row }] : [];
+      });
+      return structuredClone(
+        due
+          .sort((a, b) => a.at.getTime() - b.at.getTime() || a.row.runId.localeCompare(b.row.runId))
+          .slice(0, 50)
+          .map(({ row }) => row),
+      );
+    },
+  };
+
+  private runReply({ organizationId, runId }: RunReplyScope) {
+    const row = this.replyDeliveries.get(runId);
+    return row?.organizationId === organizationId ? row : undefined;
+  }
   private readonly sessionProfiles = new Map<string, SessionProfileRecord>();
   private readonly interactiveSessions = new Map<string, SessionWithParticipants>();
   private readonly interactiveCommands = new Map<string, SessionCommandRecord[]>();
@@ -2572,6 +2641,19 @@ class MemoryDatabase implements Database {
       completedAt: null,
     };
     this.triggerRuns.set(run.id, run);
+    if (input.replyMessage === true) {
+      this.replyDeliveries.set(run.id, {
+        organizationId: run.organizationId,
+        runId: run.id,
+        commentId: randomUUID(),
+        state: "pending",
+        length: null,
+        hash: null,
+        bindingHash: null,
+        attemptedAt: null,
+        failure: null,
+      });
+    }
     triggerRuns.set(input.configuredTriggerName, run.id);
     projectRuns.set(input.projectId, triggerRuns);
     this.triggerRunIdsByProviderEventReceipt.set(input.providerEventReceiptId, projectRuns);

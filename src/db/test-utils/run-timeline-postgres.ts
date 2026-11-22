@@ -7,7 +7,11 @@ import { postgresDatabaseRuntime } from "../runtime/index.js";
 import type { DatabaseRuntime, QueryHandle, QueryResult, QueryRow } from "../runtime/index.js";
 import { createPostgresTestRuntime } from "./runtime.js";
 import type { AppendRunTimelineEventInput } from "../../run-timeline/store.js";
-import type { AcceptedTriggerRunRecord, Database } from "../types.js";
+import type {
+  AcceptedTriggerRunRecord,
+  CreateAcceptedTriggerRunInput,
+  Database,
+} from "../types.js";
 
 export const TIMELINE_ORGANIZATION = "pooled-timeline-organization";
 
@@ -25,7 +29,11 @@ export interface TimelinePostgresConnection {
 export interface TimelinePostgresHarness {
   runtime: DatabaseRuntime;
   database: Database;
-  createRun(): Promise<AcceptedTriggerRunRecord>;
+  createRun(
+    input?: Partial<
+      Pick<CreateAcceptedTriggerRunInput, "replyMessage" | "triggerContext" | "outputContext">
+    >,
+  ): Promise<AcceptedTriggerRunRecord>;
   connect(
     hooks?: TimelineQueryHooks,
     maxConnections?: number,
@@ -81,7 +89,7 @@ export async function createTimelinePostgresHarness(): Promise<TimelinePostgresH
     return {
       runtime: root.runtime,
       database: root.database,
-      async createRun() {
+      async createRun(input = {}) {
         const revision = await root.database.insertProjectConfigurationRevision({
           projectId: project.id,
           sourceKind: "manual",
@@ -113,6 +121,7 @@ export async function createTimelinePostgresHarness(): Promise<TimelinePostgresH
             outputContext: {},
             deadlineAt: new Date(Date.now() + 3600000),
             stepIds: ["work"],
+            ...input,
           })
         ).run;
       },

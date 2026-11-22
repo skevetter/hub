@@ -27,6 +27,7 @@ import { activityCounts, timelineRows, type TimelineRow } from "./run-timeline-v
 import { pollRunDetail } from "./run-event-subscription.js";
 import { runDetailKey, useRunEvents } from "./use-run-events.js";
 import { runReadClock, runReadResult } from "./run-read.js";
+import { replyFailureLabels } from "../run-replies/store.js";
 
 const TIMELINE_COLUMNS = [
   { header: "Time" },
@@ -101,12 +102,15 @@ function LiveRunDetail({
   const queryClient = useQueryClient();
   const runId = detail.run.id;
   const cleanupPending = detail.stopDetails?.cleanupState === "waiting_for_daemon";
+  const replyPending =
+    state.status !== "running" &&
+    (detail.reply?.state === "pending" || detail.reply?.state === "sending");
   useEffect(() => {
-    if (!cleanupPending) return undefined;
+    if (!cleanupPending && !replyPending) return undefined;
     return pollRunDetail(() => {
       void queryClient.invalidateQueries({ queryKey: runDetailKey(organizationSlug, runId) });
     });
-  }, [cleanupPending, organizationSlug, queryClient, runId]);
+  }, [cleanupPending, organizationSlug, queryClient, replyPending, runId]);
   const sendStop = useServerFn(stopRun);
   const load = useServerFn(runDetailSnapshot);
   const stop = useMutation({
@@ -468,6 +472,14 @@ function runSummaryRows(
           </a>
         ),
     },
+    ...(detail.reply === undefined
+      ? []
+      : [
+          {
+            label: "Agent reply",
+            value: replyLabel(detail.reply),
+          },
+        ]),
     ...(run.webhookSummary?.prompt === undefined
       ? []
       : [{ label: "Message", value: run.webhookSummary.prompt }]),
@@ -478,6 +490,12 @@ function runSummaryRows(
       : [{ label: "Completed", value: <RelativeTime value={completedAt} /> }]),
     ...(run.failureReason === null ? [] : [{ label: "Failure reason", value: run.failureReason }]),
   ];
+}
+
+function replyLabel(reply: NonNullable<RunDetailSnapshot["reply"]>): string {
+  if (reply.failure !== null) return `Reply not posted: ${replyFailureLabels[reply.failure]}`;
+  if (reply.state === "sent") return "Posted to Linear";
+  return "Waiting for reply delivery";
 }
 
 function timelineNotice(timeline: RunEventPage) {

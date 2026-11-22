@@ -60,6 +60,7 @@ export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
       on: event,
       max_runtime: authored.max_runtime ?? run.max_runtime,
       ...(authored.progress_message === true ? { progress_message: true } : {}),
+      ...(authored.reply_message === true ? { reply_message: true } : {}),
       filters: authoredFilters(event, definition),
       steps: [isScriptRun(run) ? scriptStep(run) : agentStep(run)],
     };
@@ -176,6 +177,7 @@ function authoredFilters(
 export function serializeTriggerDocument(trigger: TriggerDocument): string {
   const exported = { ...trigger };
   if (exported.progress_message !== true) delete exported.progress_message;
+  if (exported.reply_message !== true) delete exported.reply_message;
   return dump(exported, { noRefs: true, lineWidth: -1, sortKeys: false });
 }
 

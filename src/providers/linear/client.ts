@@ -16,6 +16,7 @@ const LINEAR_ACCESS_TOKEN_REFRESH_SKEW_MS = 60_000;
 const LINEAR_RESPONSE_BODY_LIMIT_BYTES = 1024 * 1024;
 const LINEAR_RESPONSE_BODY_TIMEOUT_MS = 5_000;
 const LINEAR_HEADER_FAILURE_STATUSES = new Set([401, 403, 404]);
+export const DEFAULT_LINEAR_RETRY_AFTER_MS = 30_000;
 
 const LinearTokenResponseSchema = z
   .object({
@@ -101,6 +102,32 @@ const CommentCreateResponseSchema = z.object({
   }),
 });
 
+const CommentCreateRejectionSchema = z.object({
+  data: z.null(),
+  errors: z
+    .array(
+      z.object({
+        path: z.tuple([z.literal("commentCreate")]),
+        extensions: z.object({ code: z.string().optional(), type: z.string().optional() }),
+      }),
+    )
+    .nonempty(),
+});
+
+const CommentResponseSchema = z.object({
+  data: z.object({
+    comment: z
+      .object({
+        id: z.string(),
+        body: z.string(),
+        archivedAt: z.string().nullable(),
+        issue: z.object({ id: z.string() }).nullable(),
+        user: z.object({ id: z.string() }).nullable(),
+      })
+      .nullable(),
+  }),
+});
+
 const CommentUpdateResponseSchema = z.object({
   data: z.object({
     commentUpdate: z.object({ success: z.literal(true) }),
@@ -115,6 +142,7 @@ export class LinearApiError extends Error {
     readonly retryAfterMs?: number,
     readonly rateLimitBeforeExecution = false,
     readonly graphqlCodes: readonly string[] = [],
+    readonly graphqlRejected = false,
   ) {
     super(message);
     this.name = "LinearApiError";
@@ -131,7 +159,7 @@ export class LinearTransportError extends Error {
 const credentialErrorMessages = {
   connection_unavailable: "Linear connection unavailable",
   connection_not_owned: "Linear connection belongs to another Hub organization",
-  scope_missing: "Linear progress connection lacks the write scope",
+  scope_missing: "Linear connection lacks the required comment scope",
   reauthorize: "Linear connection requires reauthorization",
   body_contains_secret: "Linear progress body contains the access token",
 } as const;
@@ -192,17 +220,24 @@ export interface LinearIssueCommentHistory {
 }
 
 export interface LinearApiClient {
-  readIssue(input: {
-    linearOrganizationId: string;
-    issueId: string;
-  }): Promise<LinearIssueDetails | undefined>;
+  readIssue(
+    input: {
+      linearOrganizationId: string;
+      issueId: string;
+    },
+    options?: LinearCommentWriteOptions,
+  ): Promise<LinearIssueDetails | undefined>;
+  readComment(
+    input: { linearOrganizationId: string; commentId: string },
+    options: LinearCommentWriteOptions,
+  ): Promise<z.infer<typeof CommentResponseSchema>["data"]["comment"]>;
   readIssueComments(input: {
     linearOrganizationId: string;
     issueId: string;
     beforeCreatedAt: string;
   }): Promise<LinearIssueCommentHistory>;
   createComment(
-    input: { linearOrganizationId: string; issueId: string; body: string },
+    input: { linearOrganizationId: string; issueId: string; body: string; commentId?: string },
     options?: LinearCommentWriteOptions,
   ): Promise<string>;
   updateComment(
@@ -211,14 +246,45 @@ export interface LinearApiClient {
   ): Promise<void>;
 }
 
-type LinearConnectionBinding = Pick<
+export type LinearConnectionBinding = Pick<
   LinearConnectionRecord,
   "id" | "organizationId" | "linearOrganizationId" | "providerApplicationId" | "appUserId"
 >;
 
-interface LinearCommentWriteOptions {
+export type LinearCommentScope = "write" | "comments:create";
+
+export interface LinearCommentWriteOptions {
   binding: LinearConnectionBinding;
   signal: AbortSignal;
+  requiredScope?: LinearCommentScope;
+}
+
+export function linearConnectionBinding(
+  connection: LinearConnectionRecord,
+): LinearConnectionBinding {
+  const { id, organizationId, linearOrganizationId, providerApplicationId, appUserId } = connection;
+  return { id, organizationId, linearOrganizationId, providerApplicationId, appUserId };
+}
+
+export async function authorizeLinearCommentConnection(
+  lookup: Database["findLinearConnection"],
+  linearOrganizationId: string,
+  organizationId: string,
+  requiredScope: LinearCommentScope,
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const connection = await lookup(linearOrganizationId);
+  signal.throwIfAborted();
+  if (connection === undefined) return { unavailable: "connection_unavailable" } as const;
+  if (connection.linearOrganizationId !== linearOrganizationId)
+    return { refused: "target_mismatch" } as const;
+  if (connection.organizationId !== organizationId)
+    return { refused: "connection_not_owned" } as const;
+  if (!connection.scopes.includes(requiredScope)) return { unavailable: "scope_missing" } as const;
+  if (linearConnectionRequiresReauthorization(connection))
+    return { unavailable: "reauthorize" } as const;
+  return { connection };
 }
 
 interface GraphqlPayload {
@@ -369,7 +435,8 @@ export function createLinearApiClient(options: {
       connection.appUserId !== binding.appUserId
     )
       throw new LinearCredentialError("connection_not_owned");
-    if (!connection.scopes.includes("write")) throw new LinearCredentialError("scope_missing");
+    if (!connection.scopes.includes(write.requiredScope ?? "write"))
+      throw new LinearCredentialError("scope_missing");
     if (linearConnectionRequiresReauthorization(connection, now()))
       throw new LinearCredentialError("reauthorize");
   };
@@ -450,10 +517,14 @@ export function createLinearApiClient(options: {
   };
 
   return {
-    async readIssue(input) {
+    async readIssue(input, write) {
+      const { accessToken } = await connectionForToken(input.linearOrganizationId, write);
       const result = IssueResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoIssue($id: String!) {
+        await graphql(
+          request,
+          accessToken,
+          {
+            query: `query PaseoIssue($id: String!) {
             issue(id: $id) {
               id identifier title description url
               project { id }
@@ -462,8 +533,10 @@ export function createLinearApiClient(options: {
               labels { nodes { id } }
             }
           }`,
-          variables: { id: input.issueId },
-        }),
+            variables: { id: input.issueId },
+          },
+          { signal: write?.signal },
+        ),
       );
       const issue = result.data.issue;
       return issue === null
@@ -479,6 +552,23 @@ export function createLinearApiClient(options: {
             assigneeId: issue.assignee?.id ?? null,
             labelIds: issue.labels.nodes.map(({ id }) => id),
           };
+    },
+    async readComment({ linearOrganizationId, commentId }, write) {
+      const { accessToken } = await connectionForToken(linearOrganizationId, write);
+      const result = CommentResponseSchema.parse(
+        await graphql(
+          request,
+          accessToken,
+          {
+            query: `query PaseoReadComment($id: String!) {
+            comment(id: $id) { id body archivedAt issue { id } user { id } }
+          }`,
+            variables: { id: commentId },
+          },
+          { signal: write.signal },
+        ),
+      );
+      return result.data.comment;
     },
     async readIssueComments(input) {
       const result = IssueCommentHistoryResponseSchema.parse(
@@ -521,17 +611,25 @@ export function createLinearApiClient(options: {
       };
     },
     async createComment(input, write) {
+      const { issueId, body, commentId } = input;
+      const payload =
+        commentId === undefined
+          ? {
+              query: `mutation PaseoComment($issueId: String!, $body: String!) {
+              commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
+            }`,
+              variables: { issueId, body },
+            }
+          : {
+              query: `mutation PaseoRunReply($issueId: String!, $body: String!, $id: String!) {
+              commentCreate(input: { issueId: $issueId, body: $body, id: $id, doNotSubscribeToIssue: true }) {
+                success comment { id }
+              }
+            }`,
+              variables: { issueId, body, id: commentId },
+            };
       const result = CommentCreateResponseSchema.parse(
-        await commentMutation(
-          input,
-          {
-            query: `mutation PaseoComment($issueId: String!, $body: String!) {
-            commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
-          }`,
-            variables: { issueId: input.issueId, body: input.body },
-          },
-          write,
-        ),
+        await commentMutation(input, payload, write),
       );
       return result.data.commentCreate.comment.id;
     },
@@ -732,11 +830,19 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
     rateLimited !== undefined || response.status === 429
       ? linearRetryAfterMs(response.headers, now().getTime())
       : undefined;
+  const beforeExecution =
+    !hasResponseField(result, "data") &&
+    !rawErrors.some((entry) => hasResponseField(entry, "path"));
   const rateLimitBeforeExecution =
     rateLimited !== undefined &&
     (response.status === 400 || response.status === 429) &&
-    !hasResponseField(result, "data") &&
-    !rawErrors.some((entry) => hasResponseField(entry, "path"));
+    beforeExecution;
+  const graphqlRejected =
+    (beforeExecution &&
+      errors.length > 0 &&
+      errors.length === rawErrors.length &&
+      errors.every(({ message }) => Boolean(message))) ||
+    rejectedCommentCreate(response.status, result);
   throw new LinearApiError(
     response.ok
       ? `Linear GraphQL ${error?.message ?? "response contained errors"}`
@@ -746,6 +852,20 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
     delay,
     rateLimitBeforeExecution,
     codes,
+    graphqlRejected,
+  );
+}
+
+function rejectedCommentCreate(status: number, result: unknown): boolean {
+  // The non-null mutation field bubbles a root error up to null data.
+  const rejected = CommentCreateRejectionSchema.safeParse(result);
+  return (
+    rejected.success &&
+    rejected.data.errors.every(
+      ({ extensions }) =>
+        extensions.type === "invalid input" ||
+        (status === 429 && extensions.code?.toUpperCase() === "RATELIMITED"),
+    )
   );
 }
 

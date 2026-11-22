@@ -1,9 +1,11 @@
 import type { Database, LinearConnectionRecord } from "../db/types.js";
 import {
+  DEFAULT_LINEAR_RETRY_AFTER_MS,
   LinearApiError,
   LinearCredentialError,
   LinearTransportError,
-  linearConnectionRequiresReauthorization,
+  authorizeLinearCommentConnection,
+  linearConnectionBinding,
   type LinearApiClient,
 } from "../providers/linear/client.js";
 import { LinearOutputContextSchema } from "../triggers/linear/provider.js";
@@ -31,11 +33,9 @@ export function createLinearProgressProvider(options: LinearProgressOptions): Pr
     const authorization = authorized.get(locator);
     authorized.delete(locator);
     if (authorization === undefined) throw new LinearCredentialError("connection_not_owned");
-    const { id, organizationId, linearOrganizationId, providerApplicationId, appUserId } =
-      authorization.connection;
     return {
       issueId: authorization.issueId,
-      binding: { id, organizationId, linearOrganizationId, providerApplicationId, appUserId },
+      binding: linearConnectionBinding(authorization.connection),
       signal,
     };
   };
@@ -62,17 +62,15 @@ export function createLinearProgressProvider(options: LinearProgressOptions): Pr
       signal.throwIfAborted();
       if (!context.success || context.data.linearOrganizationId !== locator.linearOrganizationId)
         return { refused: "target_mismatch" };
-      const connection = await connectionForLinearOrganization(locator.linearOrganizationId);
-      signal.throwIfAborted();
-      if (connection === undefined) return { unavailable: "connection_unavailable" };
-      if (connection.linearOrganizationId !== context.data.linearOrganizationId)
-        return { refused: "target_mismatch" };
-      if (connection.organizationId !== run.organizationId)
-        return { refused: "connection_not_owned" };
-      if (!connection.scopes.includes("write")) return { unavailable: "scope_missing" };
-      if (linearConnectionRequiresReauthorization(connection))
-        return { unavailable: "reauthorize" };
-      authorized.set(locator, { connection, issueId: context.data.issueId });
+      const authority = await authorizeLinearCommentConnection(
+        connectionForLinearOrganization,
+        locator.linearOrganizationId,
+        run.organizationId,
+        "write",
+        signal,
+      );
+      if (!("connection" in authority)) return authority;
+      authorized.set(locator, { connection: authority.connection, issueId: context.data.issueId });
       return "ok";
     },
     secrets(locator, signal) {
@@ -179,7 +177,7 @@ function mapWriteError(error: unknown): ProgressCall {
 function rateLimited(error: LinearApiError): ProgressCall {
   return {
     status: "retry",
-    afterMs: error.retryAfterMs ?? 30_000,
+    afterMs: error.retryAfterMs ?? DEFAULT_LINEAR_RETRY_AFTER_MS,
     notCreated: error.rateLimitBeforeExecution,
   };
 }

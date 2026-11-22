@@ -70,6 +70,8 @@ import {
 import { InteractiveSessionService } from "./interactive-sessions/service.js";
 import type { InteractiveSessionSettings } from "./interactive-sessions/settings.js";
 import { InteractiveSessionStream } from "./interactive-sessions/stream.js";
+import { RunReplyReporter } from "./run-replies/reporter.js";
+import { readRunReplyLimit } from "./run-replies/settings.js";
 
 export interface ApplicationCompositionOptions {
   database: Database | null;
@@ -89,6 +91,7 @@ export interface ApplicationCompositionOptions {
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
   runProgress?: RunProgressSettings;
+  runReplyLimit?: number;
   interactiveSessions?: InteractiveSessionSettings;
   runPayloadRetention?: RunPayloadRetentionSettings;
   progressProviders?: readonly ProgressProvider[];
@@ -134,11 +137,13 @@ async function createOwnedApplicationRuntime(
   }
 
   const progress = createProgressReporter(options, timelineRuntime.timelineBus, ownership);
+  const replyOptions = createRunReplyReporter(options, ownership);
   const interactiveSessions = createInteractiveSessionsRuntime(options, (daemonId) =>
     application.hub.connectionForDaemon(daemonId),
   );
   const application: HubApplication = createHubApplication({
     ...progress.hubOptions,
+    ...replyOptions,
     ...timelineRuntime,
     ...streamOptions,
     ...interactiveSessions?.hubOptions,
@@ -408,6 +413,26 @@ async function createOwnedApplicationRuntime(
       requests.get(name)?.(request) ?? Promise.resolve(new Response("Not Found", { status: 404 })),
     stop: () => ownership.close(),
   };
+}
+
+function createRunReplyReporter(
+  options: ApplicationCompositionOptions,
+  ownership: CompositionResources,
+): Pick<HubRuntimeOptions, "onRunReplyAnswer"> {
+  const { database } = options;
+  if (database === null) return {};
+  const linear = options.registrations?.find(
+    (registration) => registration.connection.name === "linear",
+  );
+  const reporter = new RunReplyReporter({
+    database,
+    writer: () => linear?.linearRunReplyWriter,
+    perHour: options.runReplyLimit ?? readRunReplyLimit({}),
+    onFailure: () => logger.warn("run reply delivery cycle failed"),
+  });
+  ownership.own(() => reporter.stop(), "composition.run_replies");
+  reporter.start();
+  return { onRunReplyAnswer: reporter.capture };
 }
 
 function createProgressReporter(

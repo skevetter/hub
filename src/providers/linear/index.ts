@@ -22,6 +22,8 @@ import type {
 import { outputContextProvider, replyOutputTool } from "../../execution-capabilities/outputs.js";
 import { logger } from "../../logger.js";
 import { createLinearProgressProvider } from "../../run-progress/linear.js";
+import { LinearRunReplyWriter } from "../../run-replies/linear.js";
+import { readTimelineScrubValues } from "../../run-timeline/secrets.js";
 import { createLinearTriggerProvider } from "../../triggers/linear/provider.js";
 import { createLinearReplyExecutor } from "../../triggers/linear/reply.js";
 import { createLinearWebhookSource } from "../../triggers/linear/webhook.js";
@@ -125,6 +127,12 @@ export function createLinearRegistration(
       ? {}
       : {
           findMarkedReceipt: database.findMarkedLinearReceipt.bind(database),
+          findAppUserId: async (linearOrganizationId) => {
+            const connection = await connectionForLinearOrganization(linearOrganizationId);
+            return connection?.providerApplicationId === configuration.clientId
+              ? connection.appUserId
+              : undefined;
+          },
           canHydrateIssue: async (linearOrganizationId) => {
             const connection = await database.findLinearConnection(linearOrganizationId);
             return connection !== undefined && !linearConnectionRequiresReauthorization(connection);
@@ -172,6 +180,14 @@ export function createLinearRegistration(
     ...(api === undefined
       ? {}
       : {
+          linearRunReplyWriter: new LinearRunReplyWriter({
+            client: api,
+            database,
+            connectionForLinearOrganization,
+            clientSecret: configuration.clientSecret,
+            providerApplicationId: configuration.clientId,
+            secrets: readTimelineScrubValues(options.environment ?? process.env, [configuration]),
+          }),
           progressProvider: createLinearProgressProvider({
             client: api,
             connectionForLinearOrganization,

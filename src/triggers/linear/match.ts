@@ -71,11 +71,21 @@ export function matchLinearTriggers(
   connectionId?: string | null,
   appUserId?: string,
 ): MatchedLinearTrigger[] {
+  if (isPaseoAppAuthor(event, { appUserId })) return [];
   return config.triggers.flatMap((trigger) => {
     if (!matchesLinearEvent(trigger.on, event, appUserId)) return [];
     if (!matchesTriggerFilter(trigger, event, connectionId)) return [];
     return [{ event, trigger }];
   });
+}
+
+export function isPaseoAppAuthor(
+  event: NormalizedLinearEvent,
+  connection: { appUserId: string | undefined } | undefined,
+): boolean {
+  return (
+    event.type === "comment" && event.actor !== null && event.actor.id === connection?.appUserId
+  );
 }
 
 export function hasLinearSourceTrigger(

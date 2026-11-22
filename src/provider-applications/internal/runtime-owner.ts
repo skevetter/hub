@@ -398,6 +398,9 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
       get progressProvider() {
         return slot.active?.registration.progressProvider;
       },
+      get linearRunReplyWriter() {
+        return slot.active?.registration.linearRunReplyWriter;
+      },
       triggerProviders: [
         (resources) => {
           slot.triggerResources = resources;

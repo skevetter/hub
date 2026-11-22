@@ -66,6 +66,7 @@ import {
 } from "./auth/webhook-signatures.js";
 import { readWebhookOptions } from "./webhook-config.js";
 import { readRunProgressSettings } from "./run-progress/settings.js";
+import { readRunReplyLimit } from "./run-replies/settings.js";
 import { readInteractiveSessionSettings } from "./interactive-sessions/settings.js";
 import { readTimelineScrubValues } from "./run-timeline/secrets.js";
 import {
@@ -109,6 +110,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     const webhookOptions = readWebhookOptions(process.env);
     const webhookSigning = readWebhookSigningSettings(process.env);
     const runProgress = readRunProgressSettings(process.env);
+    const runReplyLimit = readRunReplyLimit(process.env);
     const interactiveSessions = readInteractiveSessionSettings(process.env);
     const runPayloadRetention = readRunPayloadRetentionSettings(
       process.env,
@@ -216,6 +218,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       scriptLimits,
       webhookOptions,
       runProgress,
+      runReplyLimit,
       interactiveSessions,
       runPayloadRetention,
       timelineScrubValues: readTimelineScrubValues(process.env, Object.values(providerEnvironment)),

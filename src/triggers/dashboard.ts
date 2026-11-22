@@ -287,9 +287,12 @@ export class TriggerDashboard {
     );
     if (read === undefined || read.activity.run.organizationId !== organizationId) return null;
     const { activity, executions } = read;
-    const [timeline, progress] = await Promise.all([
+    const [timeline, progress, reply] = await Promise.all([
       this.timelinePage(organizationId, activity.run, 0),
       this.database.findRunProgressMessage(organizationId, runId),
+      activity.receipt.provider === "linear"
+        ? this.database.runReplies.find({ organizationId, runId })
+        : undefined,
     ]);
     if (activity.run.payloadExpiredAt == null) {
       const current = await this.database.findTriggerRunForOrganization(organizationId, runId);
@@ -306,6 +309,7 @@ export class TriggerDashboard {
       timeline,
       progressMessagesEnabled: this.progressMessagesEnabled,
       progressUnavailable: progress === undefined && timeline.expired,
+      ...(reply === undefined ? {} : { reply: { state: reply.state, failure: reply.failure } }),
       progress:
         progress === undefined || activity.run.payloadExpiredAt != null
           ? null

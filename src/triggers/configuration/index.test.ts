@@ -4,7 +4,7 @@ import { DEFAULT_RECURRENCE } from "../schedule/recurrence.js";
 import assert from "node:assert/strict";
 import { parseProjectConfiguration } from "../../configuration/store.js";
 import type { ProjectConfigurationRevisionRecord } from "../../db/types.js";
-import { describe, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   compileTriggerDocument,
   parseTriggerDocument,
@@ -146,6 +146,55 @@ ${trigger.replace(
         .progress_message,
       false,
     );
+  });
+});
+
+describe("Linear reply opt-in", () => {
+  const yaml = `name: answer
+on:
+  linear.comment_created:
+    connection: linear
+    filters:
+      from_users: [operator]
+run:
+  target: { daemon: devbox, cwd: /workspace }
+  agent: { provider: claude }
+  max_runtime: 1h
+  idle_timeout: 10m
+  prompt: Answer the question.
+`;
+
+  it("keeps the opt-in through document export and compiled parsing", () => {
+    const authored = compileTriggerDocument(`reply_message: true\n${yaml}`);
+    const compiled = parseCompiledHubConfig({
+      environments: [authored.environment],
+      triggers: authored.events,
+    });
+    expect(compiled.triggers).toMatchObject([{ replyMessage: true }]);
+    expect(
+      compileTriggerDocument(serializeTriggerDocument(authored.authored)).events,
+    ).toMatchObject([{ replyMessage: true }]);
+    expect(compileTriggerDocument(yaml).events[0]).not.toHaveProperty("replyMessage");
+    expect(compileTriggerDocument(`reply_message: false\n${yaml}`).events[0]).not.toHaveProperty(
+      "replyMessage",
+    );
+  });
+
+  it("refuses events outside Linear and a missing or open Linear audience", () => {
+    assert.throws(
+      () =>
+        compileTriggerDocument(
+          `reply_message: true\n${yaml.replace("linear.comment_created", "slack.mention")}`,
+        ),
+      /reply_message.*requires a Linear event/u,
+    );
+    for (const audience of ["[]", '["*"]']) {
+      assert.throws(
+        () =>
+          compileTriggerDocument(`reply_message: true\n${yaml.replace("[operator]", audience)}`),
+        /reply_message.*from_users/u,
+      );
+    }
   });
 });
 

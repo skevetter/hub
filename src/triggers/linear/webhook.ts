@@ -8,6 +8,8 @@ import { logProviderEventIntake } from "../audit.js";
 import type { ProviderEventDropReasonCode } from "../drop-reason.js";
 import type { TriggerHandler, TriggerSource } from "../index.js";
 import { eventIssueId, eventProjectId, normalizeLinearEvent } from "./events.js";
+import { isPaseoAppAuthor } from "./match.js";
+import { hasLinearRunReplyMarker } from "../../run-replies/marker.js";
 import type { LinearIssueDetails } from "../../providers/linear/client.js";
 
 const MAX_WEBHOOK_BYTES = 1_048_576;
@@ -17,6 +19,7 @@ export interface LinearWebhookSourceOptions {
   signingSecret: string;
   now?: () => number;
   canHydrateIssue?(linearOrganizationId: string): Promise<boolean>;
+  findAppUserId?(linearOrganizationId: string): Promise<string | undefined>;
   findMarkedReceipt?(
     linearOrganizationId: string,
     deliveryId: string,
@@ -132,6 +135,15 @@ async function handoffLinearEvent(
       return await acceptUnsupportedLinearEvent(verified, organizationId, options);
     }
     linearOrganizationId = event.organizationId;
+    if (
+      event.type === "comment" &&
+      (hasLinearRunReplyMarker(event.comment.body, event.comment.id) ||
+        isPaseoAppAuthor(event, {
+          appUserId: await options.findAppUserId?.(linearOrganizationId),
+        }))
+    ) {
+      return new Response("OK", { status: 200 });
+    }
     if (await findMarkedReceipt(options, verified, linearOrganizationId))
       return new Response("OK", { status: 200 });
     if (eventProjectId(event) === undefined && options.resolveIssue !== undefined) {

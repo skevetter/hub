@@ -1,7 +1,7 @@
 import type { AgentEvent, AgentTimelinePage } from "../daemons/agents/index.js";
 import type { TimelineScrubber } from "../run-timeline/capture-types.js";
 import { createTimelineScrubber } from "../run-timeline/scrub.js";
-import { createSessionRedactor } from "./redact.js";
+import { createAssistantTextRedactor } from "../assistant-text/redact.js";
 import { readTimelineScrubValues } from "../run-timeline/secrets.js";
 import type { TranscriptItem } from "./types.js";
 
@@ -32,13 +32,13 @@ type HistoryItem = TranscriptItem & { seqStart: number; seqEnd: number };
 type DaemonHistoryEntry = AgentTimelinePage["entries"][number];
 
 export class SessionTranscriptNormalizer {
-  private readonly prose: ReturnType<typeof createSessionRedactor>;
+  private readonly prose: ReturnType<typeof createAssistantTextRedactor>;
 
   constructor(
     knownValues: readonly string[] = readTimelineScrubValues(process.env),
     private readonly scrub: TimelineScrubber = createTimelineScrubber({ scrubValues: knownValues }),
   ) {
-    this.prose = createSessionRedactor(knownValues);
+    this.prose = createAssistantTextRedactor(knownValues);
   }
 
   stream(event: AgentEvent): TranscriptItem | undefined {

@@ -18,6 +18,7 @@ import type {
 } from "./protocol.js";
 import type { Logger } from "pino";
 import type { OutputExecutorRegistry } from "../execution-capabilities/outputs.js";
+import type { OnRunReplyAnswer } from "./reply-capture.js";
 
 export type {
   DaemonAgentStreamEvent,
@@ -41,6 +42,7 @@ export interface DaemonModuleOptions {
   providers?: readonly TriggerProvider[];
   executionAuthority?: ExecutionAuthority;
   timeline?: RunTimeline;
+  onRunReplyAnswer?: OnRunReplyAnswer;
   connectionForDaemon(daemonId: string): DaemonConnection | undefined;
   publicBaseUrl?: string;
   completionTokenSecret?: string;
@@ -59,6 +61,9 @@ export function createDaemonModule(options: DaemonModuleOptions): DaemonModule {
       database: options.database,
       connectionForDaemon: (daemonId) => options.connectionForDaemon(daemonId),
       ...(options.timeline === undefined ? {} : { timeline: options.timeline }),
+      ...(options.onRunReplyAnswer === undefined
+        ? {}
+        : { onRunReplyAnswer: options.onRunReplyAnswer }),
       ...(options.executionCapabilities === undefined
         ? {}
         : { executionCapabilities: options.executionCapabilities }),
