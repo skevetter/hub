@@ -470,6 +470,87 @@ test("TERM after staging a receipt prevents its publication", async (t) => {
   }
 });
 
+test("a quiet helper can finish cleanup after its command exits", async (t) => {
+  const { directory, head } = await gitFixture(t);
+  const receiptDir = join(directory, ".test-receipts");
+  await mkdir(receiptDir);
+  const ready = join(receiptDir, "ready");
+  const exiting = join(receiptDir, "leader-exiting");
+  const completed = join(receiptDir, "cleanup-completed");
+  const timing = join(receiptDir, "cleanup-delay");
+  await writeFile(timing, "150");
+  const helper = `
+    const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+    const [ready, exiting, completed, timing] = process.argv.slice(1);
+    const poll = setInterval(() => {
+      if (!existsSync(exiting)) return;
+      clearInterval(poll);
+      setTimeout(() => writeFileSync(completed, "done"), Number(readFileSync(timing, "utf8")));
+    }, 10);
+    writeFileSync(ready, "");
+  `;
+  const leader = `
+    import { spawn } from "node:child_process";
+    import { existsSync, writeFileSync } from "node:fs";
+    import { setTimeout as delay } from "node:timers/promises";
+    const paths = process.argv.slice(1);
+    const child = spawn(process.execPath, ["-e", ${JSON.stringify(helper)}, ...paths],
+      { stdio: "ignore" });
+    child.unref();
+    while (!existsSync(paths[0])) await delay(10);
+    writeFileSync(paths[1], String(process.pid));
+  `;
+  const command = [
+    process.execPath,
+    "--input-type=module",
+    "-e",
+    leader,
+    ready,
+    exiting,
+    completed,
+    timing,
+  ];
+  const result = await recordTestRun(directory, command, {
+    stdio: "ignore",
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(result.code, 0);
+  assert.equal(await readFile(completed, "utf8"), "done");
+  await verifyReceipt(directory, head);
+
+  for (const path of [ready, exiting, completed]) await rm(path);
+  await writeFile(timing, "3500");
+  const controller = new AbortController();
+  const repeat = recordTestRun(directory, command, {
+    stdio: "ignore",
+    signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+  });
+  repeat.catch(() => {});
+  try {
+    let leaderExited = false;
+    for (let attempts = 0; !leaderExited && attempts < 150; attempts++) {
+      const pid = Number(await readFile(exiting, "utf8").catch(() => ""));
+      if (pid) {
+        try {
+          process.kill(pid, 0);
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+          leaderExited = true;
+        }
+      }
+      if (!leaderExited) await delay(10);
+    }
+    assert.ok(leaderExited, "the repeat leader did not exit");
+    controller.abort("SIGTERM");
+    assert.deepEqual(await repeat, { code: 1, path: null });
+    await assert.rejects(readFile(completed), { code: "ENOENT" });
+    await assert.rejects(verifyReceipt(directory, head), /did not record a completed result/u);
+  } finally {
+    controller.abort("SIGTERM");
+    await repeat.catch(() => {});
+  }
+});
+
 test("a receipt fails when it must sweep descendants holding its output pipes", async (t) => {
   const { directory, head } = await gitFixture(t);
   const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
@@ -482,19 +563,20 @@ test("a receipt fails when it must sweep descendants holding its output pipes", 
     const marker = process.argv[1];
     const timer = setInterval(() => {}, 1000);
     process.on("SIGTERM", () => {
-      writeFileSync(marker + "-stopped", "SIGTERM");
+      writeFileSync(marker + "-stopped", String(Date.now()));
       clearInterval(timer);
     });
     writeFileSync(marker, String(process.pid));
   `;
   const leader = `
     import { spawn } from "node:child_process";
-    import { existsSync } from "node:fs";
+    import { existsSync, writeFileSync } from "node:fs";
     import { setTimeout as delay } from "node:timers/promises";
     const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}, process.argv[1]],
       { stdio: ["ignore", "inherit", "inherit"] });
     child.unref();
     while (!existsSync(process.argv[1])) await delay(10);
+    writeFileSync(process.argv[1] + "-leader", String(Date.now()));
     console.log("leader is exiting");
   `;
   const caller = spawn(
@@ -521,11 +603,13 @@ test("a receipt fails when it must sweep descendants holding its output pipes", 
     output += chunk;
   });
   try {
-    assert.deepEqual(await once(caller, "exit", { signal: AbortSignal.timeout(4000) }), [1, null]);
+    assert.deepEqual(await once(caller, "exit", { signal: AbortSignal.timeout(6000) }), [1, null]);
     await exited;
     assert.match(output, /^leader is exiting$/mu);
     assert.match(output, /background children were still running/iu);
-    assert.equal(await readFile(marker + "-stopped", "utf8"), "SIGTERM");
+    const stoppedAt = Number(await readFile(marker + "-stopped", "utf8"));
+    const exitedAt = Number(await readFile(marker + "-leader", "utf8"));
+    assert.ok(stoppedAt - exitedAt >= 1900, "the helper was stopped before the grace period");
     await assert.rejects(readFile(join(receiptDir, `${head}.lock`)), { code: "ENOENT" });
     assert.deepEqual(await readdir(temp), []);
     await assert.rejects(verifyReceipt(directory, head), /No test receipt exists/u);
