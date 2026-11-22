@@ -8,7 +8,12 @@ import { OrganizationConnectionsPanel } from "../projects/panels.js";
 import type { ConnectionStatus } from "./functions.js";
 
 const view = vi.hoisted(
-  (): { snapshot?: unknown; status?: ConnectionStatus; operator?: boolean } => ({}),
+  (): {
+    snapshot?: unknown;
+    status?: ConnectionStatus;
+    operator?: boolean;
+    failure?: "snapshot" | "status" | undefined;
+  } => ({}),
 );
 
 vi.mock("@tanstack/react-start", async (importOriginal) => ({
@@ -34,7 +39,11 @@ vi.mock("../auth/active-account.js", () => ({
 }));
 vi.mock("../queries/index.js", () => ({
   useSnapshotQuery: ({ queryKey }: { queryKey: readonly unknown[] }) => {
-    const data = queryKey[0] === "connection-status" ? view.status : view.snapshot;
+    const isStatus = queryKey[0] === "connection-status";
+    if (view.failure === (isStatus ? "status" : "snapshot")) {
+      return { status: "error", error: "Fixture read failed." };
+    }
+    const data = isStatus ? view.status : view.snapshot;
     return data === undefined ? { status: "pending" } : { status: "success", data };
   },
 }));
@@ -72,6 +81,7 @@ function renderPanel({
   records = empty,
   pending = false,
   linearDrops = "some",
+  failure,
 }: {
   manage?: boolean;
   operator?: boolean;
@@ -79,8 +89,10 @@ function renderPanel({
   records?: typeof connections;
   pending?: boolean;
   linearDrops?: DroppedEventPresence;
+  failure?: "snapshot" | "status";
 } = {}) {
   view.operator = operator;
+  view.failure = failure;
   view.status = status;
   view.snapshot = pending
     ? undefined
@@ -228,6 +240,15 @@ describe("Connections cards", () => {
     expect(rendered).toContain("Someone who manages this organization must reauthorize Linear.");
     expect(rendered).not.toContain("<button");
   });
+
+  it.each(["snapshot", "status"] as const)(
+    "renders the initial %s failure passively",
+    (failure) => {
+      const markup = renderPanel({ failure });
+      expect(markup).toContain("Fixture read failed.");
+      expect(markup).not.toContain('role="alert"');
+    },
+  );
 
   it("keeps four loading boxes", () => {
     const markup = renderPanel({ pending: true });
