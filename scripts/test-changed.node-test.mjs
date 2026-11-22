@@ -1,3 +1,5 @@
+import { generateRuntimeMap, readRuntimeInputs } from "./generate-test-runtime-files.mjs";
+import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { combinePaths, selectTests } from "./test-changed.mjs";
@@ -63,4 +65,38 @@ test("safe mode includes sibling tests for dynamically loaded files", () => {
   assert.equal(plan.tests.get("src/auth/session.test.ts"), "safe mode for src/auth");
   assert.deepEqual(plan.related, ["src/config/loader.ts"]);
   assert.equal(plan.migrationChanged, false);
+});
+
+test("runtime SQL selects the migration tests outside the touched folder", () => {
+  const sql = "src/db/migrations/0001_machine_model.sql";
+  const readers = ["src/db/migrations.test.ts", "src/db/migrations.integration.test.ts"];
+  for (const safe of [false, true]) {
+    const plan = selectTests([sql], readers, new Set([sql]), safe);
+    for (const reader of readers) assert.match(plan.tests.get(reader), /runtime file/u);
+  }
+});
+
+test("the checked-in map covers Vitest runtime reads", () => {
+  assert.deepEqual(generateRuntimeMap(), runtimeFiles);
+  assert.throws(
+    () =>
+      readRuntimeInputs(
+        "src/new.test.ts",
+        `
+    import { readdir as inspect } from "node:fs/promises";
+    await inspect(environmentPath);
+  `,
+      ),
+    /Unmapped runtime read/u,
+  );
+  assert.deepEqual(
+    readRuntimeInputs(
+      "src/new.test.ts",
+      `
+    import { readdir as inspect } from "node:fs/promises";
+    await inspect(new URL("../new-fixtures/", import.meta.url));
+  `,
+    ),
+    ["new-fixtures/"],
+  );
 });
