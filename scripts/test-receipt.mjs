@@ -178,9 +178,8 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
     }
     const completedAt = new Date().toISOString();
     const durationMs = Math.round(performance.now() - started);
-    if (code !== 0) return { code, path: null };
     checkUnchanged();
-    const metrics = await readJson(report);
+    const metrics = code === 0 ? await readJson(report) : null;
     validateMetrics(metrics);
     if (metrics && (metrics.root !== root || metrics.head !== head)) {
       throw new Error(
@@ -194,6 +193,7 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
       head,
       tree,
       command,
+      exitCode: code,
       selectedFiles: [...(metrics?.selectedFiles ?? [])].sort(),
       counts: metrics?.counts ?? null,
       checks: metrics?.checks ?? [],
@@ -215,6 +215,11 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
       checkUnchanged();
       const existing = await readJson(destination);
       if (existing) await checkReceipt(existing, { head, tree }, receiptDir, root);
+      const previous = existing?.commands ?? [];
+      const commands = previous.filter(
+        (item) => JSON.stringify(item.command) !== JSON.stringify(command),
+      );
+      if (code !== 0 && commands.length === previous.length) return { code, path: null };
       await mkdir(join(receiptDir, "logs"), { recursive: true, mode: 0o700 });
       await copyFile(logFile, logPath(receiptDir, entry.logSha256), constants.COPYFILE_EXCL).catch(
         async (error) => {
@@ -224,9 +229,6 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
           )
             throw error;
         },
-      );
-      const commands = (existing?.commands ?? []).filter(
-        (item) => JSON.stringify(item.command) !== JSON.stringify(command),
       );
       commands.push(entry);
       const payload = { version: 4, head, tree, cleanTree: true, commands };
@@ -254,6 +256,11 @@ export async function verifyReceipt(directory, sha) {
   const receipt = await readJson(join(receiptDir, `${commit.head}.json`));
   if (!receipt) throw new Error(`No test receipt exists for ${commit.head}.`);
   await checkReceipt(receipt, commit, receiptDir, realpathSync(directory));
+  const failure = receipt.commands.find((entry) => (entry.exitCode ?? 0) !== 0);
+  if (failure) {
+    const command = failure.command.map((part) => JSON.stringify(part)).join(" ");
+    throw new Error(`The latest run of ${command} failed with exit code ${failure.exitCode}.`);
+  }
   return receipt;
 }
 
