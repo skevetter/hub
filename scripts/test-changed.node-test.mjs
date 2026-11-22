@@ -423,8 +423,9 @@ test("TERM during changed-runner cleanup prevents successful metrics", async (t)
       if (process.argv[2] === "run") {
         const output = process.argv.find((arg) => arg.startsWith("--outputFile=")).slice(13);
         writeFileSync(output, JSON.stringify({
-          numPassedTests: 1, numFailedTests: 0, numTotalTests: 1,
-          testResults: [{ name: join(process.cwd(), "src/typography-policy.test.ts"), status: "passed" }],
+          success: true, numPassedTests: 1, numFailedTests: 0, numTotalTests: 1,
+          testResults: [{ name: join(process.cwd(), "src/typography-policy.test.ts"),
+            status: "passed", assertionResults: [{ status: "passed" }] }],
         }));
       }
     `,
@@ -563,4 +564,40 @@ test("the changed runner fails if a passing worker leaves background children", 
       }
     }
   }
+});
+
+test("changed testing rejects failed JSON assertions even when Vitest exits zero", async (t) => {
+  const { root } = await changedFixture(t, {
+    "node_modules/vitest/vitest.mjs": `
+      import { writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      if (process.argv[2] === "run") {
+        const output = process.argv.find((arg) => arg.startsWith("--outputFile=")).slice(13);
+        writeFileSync(output, JSON.stringify({
+          success: false, numPassedTests: 0, numFailedTests: 1, numTotalTests: 1,
+          testResults: [{ name: join(process.cwd(), "src/typography-policy.test.ts"),
+            status: "failed", assertionResults: [{ status: "failed" }] }],
+        }));
+      }
+    `,
+  });
+  const metrics = join(root, "status-metrics.json");
+  const result = spawnSync(
+    process.execPath,
+    [join(root, "scripts/test-changed.mjs"), "--base", "HEAD"],
+    {
+      cwd: root,
+      env: {
+        ...process.env,
+        TMPDIR: root,
+        HUB_TEST_FULLSUITE_LOCK: join(root, "status-lock"),
+        HUB_TEST_RUN_REPORT: metrics,
+      },
+      encoding: "utf8",
+      timeout: 5000,
+    },
+  );
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /Vitest JSON report did not show a completed passing run/u);
+  await assert.rejects(readFile(metrics), { code: "ENOENT" });
 });

@@ -52,6 +52,27 @@ export function printRunContext(root, action) {
   console.log(`Run: ${action}`);
 }
 
+export function passedVitestReport(report) {
+  if (
+    report.success !== true ||
+    report.numFailedTests !== 0 ||
+    (report.numFailedTestSuites ?? 0) !== 0
+  )
+    return false;
+
+  let passed = 0;
+  let total = 0;
+  for (const file of report.testResults) {
+    if (file?.status !== "passed" || !Array.isArray(file.assertionResults)) return false;
+    for (const assertion of file.assertionResults) {
+      total++;
+      if (assertion?.status === "passed") passed++;
+      else if (assertion?.status !== "skipped" && assertion?.status !== "todo") return false;
+    }
+  }
+  return report.numPassedTests === passed && report.numTotalTests === total;
+}
+
 export function isEntrypoint(url) {
   const entry = process.argv[1];
   return entry && existsSync(entry) && realpathSync(entry) === realpathSync(fileURLToPath(url));
