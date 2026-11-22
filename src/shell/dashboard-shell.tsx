@@ -55,6 +55,7 @@ import {
   type RouteTenant,
 } from "./switchers.js";
 import { SiteHeader } from "./site-header.js";
+import { CONTENT_ID, SkipLink } from "./skip-link.js";
 import { SiteHeaderActionsProvider } from "./site-header-actions.js";
 
 type ActiveAccount = ActiveAccountState;
@@ -151,6 +152,7 @@ function DashboardContent({
   const instance = useInstanceScope(account.isInstanceOperator);
   return (
     <>
+      <SkipLink />
       <AppSidebar
         account={account}
         tenant={tenant}
@@ -167,7 +169,11 @@ function DashboardContent({
             {...(instance || tenant?.project == null ? {} : { project: tenant.project.name })}
           />
           {/* The app's one content inset. Screens never pad themselves. */}
-          <div className="flex flex-1 flex-col p-4 md:p-8">
+          <div
+            id={CONTENT_ID}
+            tabIndex={-1}
+            className="flex flex-1 flex-col p-4 outline-none md:p-8"
+          >
             <Page>
               <ErrorSummary message={error} />
               <PageContent account={account} tenant={tenant} transitioning={transitioning} />
@@ -342,6 +348,7 @@ function Destinations({
           `/o/${organization.slug}`,
           sessionsEnabled ? ORGANIZATION_SECTIONS : ORGANIZATION_SECTIONS_WITHOUT_SESSIONS,
         )}
+        administration={destinations(`/o/${organization.slug}`, ORGANIZATION_ADMINISTRATION)}
       />
     );
   }
@@ -379,7 +386,8 @@ function destinations(base: string, sections: readonly SectionDestination[]): Na
 
 // Where you are, then work, then administration. Home is the landing and says what to do next;
 // Team, API keys, Usage, and Billing are configured once and read occasionally, so they sit
-// behind Settings rather than competing with the surfaces an operator opens daily.
+// behind Settings rather than competing with the surfaces an operator opens daily, and Settings
+// itself sits under a rule: it is where the organization is changed, not where work is done.
 const ORGANIZATION_SECTIONS: readonly SectionDestination[] = [
   { section: "home", label: "Home", icon: House },
   { section: "sessions", label: "Sessions", icon: MessagesSquare, subtree: true },
@@ -387,6 +395,8 @@ const ORGANIZATION_SECTIONS: readonly SectionDestination[] = [
   { section: "activity", label: "Activity", icon: History },
   { section: "daemons", label: "Daemons", icon: Cpu },
   { section: "connections", label: "Connections", icon: Cable },
+];
+const ORGANIZATION_ADMINISTRATION: readonly SectionDestination[] = [
   { section: "settings", label: "Settings", icon: Settings, subtree: true },
 ];
 const ORGANIZATION_SECTIONS_WITHOUT_SESSIONS = ORGANIZATION_SECTIONS.filter(

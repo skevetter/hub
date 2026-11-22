@@ -31,11 +31,14 @@ export function NavigationGroup({
   label,
   back,
   items,
+  administration,
 }: {
   /** Names the level, e.g. "Organization". Becomes the landmark's accessible name. */
   label: string;
   back?: NavigationItem;
   items: readonly NavigationItem[];
+  /** Destinations that change the level rather than work in it, set apart under a rule. */
+  administration?: readonly NavigationItem[];
 }) {
   return (
     <nav aria-label={label}>
@@ -57,6 +60,18 @@ export function NavigationGroup({
             ))}
           </SidebarMenu>
         </SidebarGroupContent>
+        {administration === undefined || administration.length === 0 ? null : (
+          <>
+            <SidebarSeparator className="my-2" />
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {administration.map((item) => (
+                  <NavItem key={item.to} item={item} />
+                ))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </>
+        )}
       </SidebarGroup>
     </nav>
   );
