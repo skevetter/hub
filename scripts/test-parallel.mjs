@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import {
   access,
   mkdir,
@@ -16,6 +15,11 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { publishTestMetrics } from "./test-receipt.mjs";
+import {
+  fullSuiteLockPath as lockPath,
+  runWorkerGroup,
+  takeFullSuiteLock,
+} from "./test-worker-group.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const vitest = join(root, "node_modules/vitest/vitest.mjs");
@@ -23,8 +27,6 @@ const cacheRoot = join(root, "node_modules/.vite/vitest");
 const parallelCache = join(cacheRoot, "test-parallel");
 const failedFileList = join(parallelCache, "failed.json");
 const daemonSuite = join("src", "daemons", "daemons.test.ts");
-const lockPath =
-  process.platform === "win32" ? join(tmpdir(), "hub-fullsuite.lock") : "/tmp/hub-fullsuite.lock";
 
 export function partitionFiles(files, count) {
   const isolateDaemon = count > 1 && files.some((file) => file.path === daemonSuite);
@@ -165,7 +167,7 @@ async function weighFiles(paths) {
   }));
 }
 
-async function invokeVitest(args, directory, signal) {
+async function invokeVitest(args, directory, signal, lock) {
   await mkdir(directory);
   const log = await open(join(directory, "vitest.log"), "w", 0o600);
   const env = {
@@ -181,30 +183,7 @@ async function invokeVitest(args, directory, signal) {
   };
   delete env.TESTCONTAINERS_RYUK_PORT;
   try {
-    signal.throwIfAborted();
-    const child = spawn(process.execPath, [vitest, ...args], {
-      cwd: root,
-      env,
-      stdio: ["ignore", log.fd, log.fd],
-    });
-    const interrupt = () => child.kill("SIGINT");
-    signal.addEventListener("abort", interrupt, { once: true });
-    try {
-      return await new Promise((settle) => {
-        let error;
-        child.on("error", (cause) => {
-          error = cause.code ?? "spawn error";
-        });
-        child.on("close", (exitCode, childSignal) =>
-          settle({
-            exitCode: exitCode ?? 1,
-            processError: error ?? childSignal,
-          }),
-        );
-      });
-    } finally {
-      signal.removeEventListener("abort", interrupt);
-    }
+    return await runWorkerGroup([vitest, ...args], { cwd: root, env, log, lock, signal });
   } finally {
     await log.close();
   }
@@ -342,19 +321,15 @@ async function main() {
       },
     );
   } else {
-    lock = await open(lockPath, "wx", 0o600).catch((error) => {
-      if (error.code === "EEXIST") throw new Error(busy);
-      throw error;
-    });
+    lock = await takeFullSuiteLock();
   }
   const controller = new AbortController();
-  const interrupt = () => controller.abort();
+  const interrupt = (signal) => controller.abort(signal);
   process.on("SIGINT", interrupt);
   process.on("SIGTERM", interrupt);
   let runDirectory;
   let exitCode = 1;
   try {
-    await lock?.writeFile(`${process.pid}\n`);
     runDirectory = await mkdtemp(join(tmpdir(), "hub-tests-"));
     const discovery = join(runDirectory, "discovery");
     const listing = join(discovery, "files.json");
@@ -362,6 +337,7 @@ async function main() {
       ["list", "--filesOnly", `--json=${listing}`],
       discovery,
       controller.signal,
+      lock,
     );
     if (found.exitCode)
       throw new Error(`Vitest file discovery failed. See ${join(discovery, "vitest.log")}`);
@@ -373,7 +349,13 @@ async function main() {
     }
     const runs = [];
     const execute = async (name, selected) => {
-      const result = await executeFiles(name, selected, runDirectory, controller.signal);
+      const result = await executeFiles(
+        name,
+        selected,
+        runDirectory,
+        controller.signal,
+        (args, directory, signal) => invokeVitest(args, directory, signal, lock),
+      );
       runs.push({ files: selected, counts: result.counts });
       return result;
     };
@@ -403,10 +385,7 @@ async function main() {
     try {
       if (exitCode === 0 && runDirectory) await rm(runDirectory, { recursive: true });
     } finally {
-      if (lock) {
-        await lock.close();
-        await rm(lockPath);
-      }
+      lock?.release();
       process.removeListener("SIGINT", interrupt);
       process.removeListener("SIGTERM", interrupt);
     }
