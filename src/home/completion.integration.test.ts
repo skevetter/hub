@@ -9,6 +9,7 @@ import { createAuthServer } from "../auth/server.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { createDatabase } from "../db/pg.js";
 import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
+import { SLACK_REQUIRED_BOT_SCOPES } from "../providers/slack/client.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
 import { OrganizationTriggerStore } from "../triggers/store.js";
@@ -45,7 +46,7 @@ describe("organization checklist completion", () => {
   });
 
   it("exposes the four steps until completion and keeps it after a connection is removed", async () => {
-    await fixture.recordRun();
+    await fixture.recordRun({ authorizedConnection: true });
     const ready = await fixture.snapshot();
     assert.equal(deriveChecklist(ready).complete, true);
     assert.equal(ready.checklistCompletedAt, null);
@@ -340,12 +341,12 @@ async function startInstance() {
         assert.equal(result.status, "created");
         return result.session;
       },
-      async recordRun() {
+      async recordRun({ authorizedConnection = false } = {}) {
         await runtime.query(
           `insert into slack_connections
-             (organization_id, team_id, slug, team_name, bot_user_id, bot_access_token)
-           values ($1, 'fixture-team', 'fixture', 'Fixture', 'fixture-bot', 'fixture-token')`,
-          [organizationId],
+             (organization_id, team_id, slug, team_name, bot_user_id, bot_access_token, scopes)
+           values ($1, 'fixture-team', 'fixture', 'Fixture', 'fixture-bot', 'fixture-token', $2::jsonb)`,
+          [organizationId, JSON.stringify(authorizedConnection ? SLACK_REQUIRED_BOT_SCOPES : [])],
         );
         await enrollTestDaemon(database, organizationId);
         const trigger = await new OrganizationTriggerStore(

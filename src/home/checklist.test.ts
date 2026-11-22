@@ -41,6 +41,18 @@ describe("the onboarding checklist", () => {
     assert.equal(states({ ...snapshot, appsConfigured: false })[0], "done");
   });
 
+  it("keeps the app step unfinished when every connection requires authorization", () => {
+    assert.notEqual(
+      states({
+        ...nothing,
+        connections: [
+          { provider: "github", slug: "acme", label: "Acme", needsAuthorization: true },
+        ],
+      })[0],
+      "done",
+    );
+  });
+
   it("tells a daemon that cannot run agents apart from no daemon at all", () => {
     const laptop = { id: "1", slug: "laptop", presence: "connected" as const, canExecute: false };
     const devbox = { id: "2", slug: "devbox", presence: "offline" as const, canExecute: true };

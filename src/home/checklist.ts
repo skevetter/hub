@@ -34,7 +34,8 @@ export type ChecklistFacts = Pick<
 >;
 
 function appState(snapshot: ChecklistFacts): Extract<ChecklistStep, { key: "app" }>["state"] {
-  if (snapshot.connections.length > 0) return "done";
+  if (snapshot.connections.some(({ needsAuthorization }) => !needsAuthorization)) return "done";
+  if (snapshot.connections.length > 0) return "pending";
   return snapshot.appsConfigured ? "pending" : "setup";
 }
 

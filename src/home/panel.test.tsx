@@ -228,6 +228,17 @@ describe("Home needs attention", () => {
     assert.match(markup, /<a href="\/o\/acme\/daemons">View daemons<\/a>/u);
   });
 
+  it("says when no enrolled daemon may run agents and names the other dropped events", () => {
+    const markup = renderHome({
+      ...ready,
+      daemons: [{ id: "daemon", slug: "laptop", presence: "connected", canExecute: false }],
+      dropped: [{ provider: "github", reason: "other", count: 1 }],
+    });
+    assert.match(markup, /No enrolled daemon may run agents yet\./u);
+    assert.match(markup, /until one is allowed to run Hub automations/u);
+    assert.match(markup, /Hub dropped events for other reasons/u);
+  });
+
   it("does not warn about an offline daemon nothing depends on", () => {
     const markup = renderHome({
       ...ready,
@@ -256,6 +267,18 @@ describe("Home getting started", () => {
     assert.match(markup, /Create a session profile<span class="sr-only"> Done<\/span>/u);
     assert.match(markup, /Start a session<span class="sr-only"> To do<\/span>/u);
     assert.match(markup, /<a href="\/o\/acme\/sessions\/new">New session<\/a>/u);
+  });
+
+  it("names a connection that needs authorization alongside a healthy connection", () => {
+    const markup = renderHome({
+      ...fresh,
+      connections: [
+        ...ready.connections,
+        { provider: "slack", slug: "expired", label: "Expired", needsAuthorization: true },
+      ],
+    });
+    assert.match(markup, /Connect an app<span class="sr-only"> Done<\/span>/u);
+    assert.match(markup, /Expired needs authorization\./u);
   });
 });
 
