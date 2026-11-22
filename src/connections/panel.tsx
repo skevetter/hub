@@ -293,14 +293,14 @@ function ConnectionHint({
       </p>
     );
   }
-  if (status === "disconnected" && !canManage) {
-    return (
-      <p className="text-sm text-muted-foreground">
-        Someone who manages this organization can connect {label}.
-      </p>
-    );
-  }
-  return null;
+  if (canManage || status === "connected") return null;
+  return (
+    <p className="text-sm text-muted-foreground">
+      {status === "disconnected"
+        ? `Someone who manages this organization can connect ${label}.`
+        : `Someone who manages this organization must ${ACTION_VERBS[status].toLowerCase()} ${label}.`}
+    </p>
+  );
 }
 
 function ConnectionAction({
@@ -343,6 +343,7 @@ interface ConnectionRecord {
   name: string;
   externalId: string;
   grantedAccess?: readonly string[];
+  attention?: string | undefined;
 }
 
 function ProviderConnections({
@@ -412,6 +413,9 @@ function ConnectionRow({
   return (
     <RecordRow actions={actions}>
       <TwoLine primary={name} secondary={externalId} mono />
+      {connection.attention === undefined ? null : (
+        <p className="mt-1 text-xs text-muted-foreground">{connection.attention}</p>
+      )}
       {grantedAccess !== undefined && grantedAccess.length > 0 ? (
         <p className="mt-1 text-xs text-muted-foreground">
           Granted permission to {ACCESS_FORMAT.format(grantedAccess)}.
@@ -430,17 +434,20 @@ function connectionRows(
       name: connection.linearOrganizationName,
       externalId: `workspace ${connection.linearOrganizationId}`,
       grantedAccess: connection.grantedAccess,
+      attention: connection.requiresReauthorization ? "Workspace needs authorization" : undefined,
     })),
     github: connections.github.map((connection) => ({
       id: connection.id,
       name: connection.accountLogin,
       externalId: `installation ${connection.installationId}`,
+      attention: connection.status === "suspended" ? "Suspended on GitHub" : undefined,
     })),
     slack: connections.slack.map((connection) => ({
       id: connection.id,
       name: connection.teamName,
       externalId: `workspace ${connection.teamId}`,
       grantedAccess: connection.grantedAccess,
+      attention: connection.requiresReauthorization ? "Workspace needs authorization" : undefined,
     })),
     discord: connections.discord.map((connection) => ({
       id: connection.id,

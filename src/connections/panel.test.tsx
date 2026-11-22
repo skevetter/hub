@@ -152,12 +152,22 @@ describe("Connections cards", () => {
 
   it("shows a suspended installation as needing authorization with a Reconnect action", () => {
     const markup = renderPanel({
-      records: { ...connections, github: [{ ...github, status: "suspended" }] },
+      records: {
+        ...connections,
+        github: [
+          github,
+          { ...github, id: "github-2", accountLogin: "suspended-acme", status: "suspended" },
+        ],
+      },
       status: { ...noApps, github: { status: "suspended" } },
     });
     const rendered = card(markup, "GitHub");
     expect(rendered.match(/>Needs authorization</gu)).toHaveLength(1);
     expect(rendered).toContain("Reconnect GitHub");
+    const rows = rendered.match(/<li\b.*?<\/li>/gu);
+    expect(rows).toHaveLength(2);
+    expect(rows?.[0]).not.toContain("Suspended on GitHub");
+    expect(rows?.[1]).toContain("Suspended on GitHub");
   });
 
   it("offers a manager Connect for a configured app while hiding instance setup", () => {
@@ -206,6 +216,17 @@ describe("Connections cards", () => {
       "Someone who manages this organization can connect Discord.",
     );
     expect(card(markup, "Discord")).not.toContain("<button");
+  });
+
+  it("tells a member who must reauthorize the affected workspace", () => {
+    const markup = renderPanel({
+      manage: false,
+      records: connections,
+      status: { ...noApps, canManage: false, linear: { status: "requiresReauthorization" } },
+    });
+    const rendered = card(markup, "Linear");
+    expect(rendered).toContain("Someone who manages this organization must reauthorize Linear.");
+    expect(rendered).not.toContain("<button");
   });
 
   it("keeps four loading boxes", () => {
