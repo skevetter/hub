@@ -52,8 +52,7 @@ export function DaemonsPanel({
   organizationSlug: string;
 }) {
   const account = useActiveAccount();
-  const showProfiles =
-    account.features?.interactiveSessions === true && account.capabilities.manageResources;
+  const showProfiles = account.features?.interactiveSessions === true;
   const queryClient = useQueryClient();
   const queryKey = daemonsQueryKey(accountId, organizationId);
   const loadDaemons = useServerFn(daemonList);
@@ -180,7 +179,7 @@ function DaemonsContent({
   const { daemons, canManage } = snapshot;
   const matches = filterDaemons(daemons, filters.search, filters.status);
   const profiles = useDeviceProfiles(
-    showProfiles && daemons.length > 0,
+    showProfiles && canManage && daemons.length > 0,
     accountId,
     organizationSlug,
   );
