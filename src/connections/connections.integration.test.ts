@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { afterEach, beforeEach, describe, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, it } from "vitest";
 import type { DatabaseRuntime, QueryHandle } from "../db/runtime/index.js";
 import { createPostgresQueryRuntime } from "../db/test-utils/runtime.js";
 import { createDatabase, createPostgresPool } from "../db/test-utils/runtime.js";
+import { isolatedPostgresDatabase } from "../db/test-utils/isolated-postgres.js";
 import type { Database } from "../db/types.js";
 import type { AuthServer } from "../auth/server.js";
 import type { OrganizationAccessValue } from "../auth/organization-access.js";
@@ -31,6 +32,13 @@ interface ProviderFixture {
 
 describe("provider connection facades PostgreSQL authority", () => {
   let postgres: StartedPostgreSqlContainer;
+  let databaseUrl: string;
+  let opened:
+    | (ReturnType<typeof isolatedPostgresDatabase> & {
+        database?: Database;
+        pool?: DatabaseRuntime;
+      })
+    | undefined;
   let pool: DatabaseRuntime;
   let database: Database;
   let auth: ConnectionAuth;
@@ -39,10 +47,19 @@ describe("provider connection facades PostgreSQL authority", () => {
   let connections: ProviderFixture;
   let githubRepositories: TestGitHubRepositories;
 
-  beforeEach(async () => {
+  beforeAll(async () => {
     postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
-    database = await createDatabase(postgres.getConnectionUri());
-    pool = await createPostgresPool(postgres.getConnectionUri());
+  }, 120_000);
+
+  afterAll(async () => {
+    await postgres?.stop();
+  }, 120_000);
+
+  beforeEach(async () => {
+    opened = isolatedPostgresDatabase(postgres.getConnectionUri());
+    databaseUrl = opened.url;
+    database = opened.database = await createDatabase(databaseUrl);
+    pool = opened.pool = await createPostgresPool(databaseUrl);
     await seedAccount(pool, "acme", "owner");
     await pool.query(
       `insert into runtime_provider_activation
@@ -63,9 +80,18 @@ describe("provider connection facades PostgreSQL authority", () => {
   }, 120_000);
 
   afterEach(async () => {
-    await pool?.close();
-    await database?.close();
-    await postgres?.stop();
+    const fixture = opened;
+    opened = undefined;
+    if (!fixture) return;
+    try {
+      try {
+        await fixture.pool?.close();
+      } finally {
+        await fixture.database?.close();
+      }
+    } finally {
+      await fixture.drop();
+    }
   }, 120_000);
 
   it("binds verified providers once and disconnects only the active organization", async () => {
@@ -308,7 +334,7 @@ describe("provider connection facades PostgreSQL authority", () => {
 
     assert.equal(
       await rejectCallbackAfterExpiryWhileLocked(
-        postgres.getConnectionUri(),
+        databaseUrl,
         {
           text: `update organization_connection_attempts
                  set expires_at = clock_timestamp() + interval '1 second'
@@ -334,7 +360,7 @@ describe("provider connection facades PostgreSQL authority", () => {
     const sessionAttemptId = await attemptIdForState(pool, sessionSetup.state);
     assert.equal(
       await rejectCallbackAfterExpiryWhileLocked(
-        postgres.getConnectionUri(),
+        databaseUrl,
         {
           text: `update session
                  set expires_at = clock_timestamp() + interval '1 second'

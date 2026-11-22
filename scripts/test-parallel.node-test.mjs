@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { partitionFiles, rerunFiles, runShards } from "./test-parallel.mjs";
@@ -16,6 +17,17 @@ test("partition puts each file in one shard and balances cached durations", () =
     ["medium.test.ts", "other.test.ts", "fast.test.ts"],
   ]);
   assert.deepEqual(partitionFiles(files.slice(0, 1), 4), [["small.test.ts"]]);
+});
+
+test("the daemon suite owns the first shard even with a small timing estimate", () => {
+  const daemon = join("src", "daemons", "daemons.test.ts");
+  const files = [
+    { path: "slow.test.ts", weight: 90 },
+    { path: daemon, weight: 10 },
+    { path: "medium.test.ts", weight: 50 },
+  ];
+  assert.deepEqual(partitionFiles(files, 2), [[daemon], ["slow.test.ts", "medium.test.ts"]]);
+  assert.deepEqual(partitionFiles(files, 1), [["slow.test.ts", "medium.test.ts", daemon]]);
 });
 
 test("failure reporting keeps shard numbers and reruns only failed files in one process", async () => {
