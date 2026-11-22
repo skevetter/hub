@@ -113,14 +113,12 @@ for (const fail of [false, true]) {
       expect((await revokeResponse).ok()).toBe(true);
       await refresh.started;
       if (!fail) {
-        const row = github.getByRole("listitem");
         await expect(page.getByText("GitHub disconnected.")).toHaveCount(0);
         await expect(github.getByText("Updating", { exact: true })).toBeVisible();
         await expect(github.getByText("Connected", { exact: true })).toHaveCount(0);
         await expect(github.getByRole("button", { name: "Connect GitHub" })).toBeDisabled();
-        await expect(row).toContainText("Being removed");
-        await expect(row).toHaveAttribute("aria-busy", "true");
-        await expect(row.getByRole("button")).toHaveCount(0);
+        await expect(github.getByRole("listitem")).toHaveCount(0);
+        await expect(github.getByRole("button", { name: "Actions for acme-inc" })).toHaveCount(0);
       }
     } finally {
       refresh.release(fail);
@@ -143,6 +141,67 @@ for (const fail of [false, true]) {
     ).toBeVisible();
   });
 }
+
+test("keeps a revoked row out of the cache when returning to Connections", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.connectGitHub("owner");
+  const { navigation, connections } = projectApp(page);
+  const github = connections.card("GitHub");
+  const statusRead = findConnectionRead(page, "canManage");
+  const snapshotRead = findConnectionRead(page, "droppedConnectionEvents");
+  await page.reload();
+  const paths = new Set(
+    (await Promise.all([statusRead, snapshotRead])).map(
+      (response) => new URL(response.url()).pathname,
+    ),
+  );
+  expect(paths.size).toBe(2);
+  await expect(github.getByText("Connected", { exact: true })).toBeVisible();
+
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(
+    (url) => paths.has(url.pathname),
+    async (route) => {
+      await held;
+      await route.continue();
+    },
+  );
+  try {
+    await github.getByRole("button", { name: "Actions for acme-inc" }).click();
+    await page.getByRole("menuitem", { name: "Revoke" }).click();
+    await page.getByRole("button", { name: "Revoke connection" }).click();
+    await expect(github.getByText("Updating", { exact: true })).toBeVisible();
+    expect(
+      await hub
+        .primaryApplication()
+        .query("select id from github_connections where account_login = 'acme-inc'"),
+    ).toEqual([]);
+
+    await navigation.openOrganizationSection("Activity");
+    await expect(page.getByRole("heading", { name: "Activity", level: 1 })).toBeVisible();
+    await navigation.openOrganizationSection("Connections");
+
+    await expect(github.getByText("Updating", { exact: true })).toBeVisible();
+    await expect(github.getByText("Connected", { exact: true })).toHaveCount(0);
+    await expect(github.getByRole("listitem")).toHaveCount(0);
+    await expect(github.getByRole("button", { name: "Actions for acme-inc" })).toHaveCount(0);
+    await expect(github.getByRole("button", { name: "Connect GitHub" })).toBeDisabled();
+  } finally {
+    release();
+  }
+
+  await expect(github.getByText("Not set up", { exact: true })).toBeVisible();
+  await expect(github.getByRole("button", { name: "Connect GitHub" })).toBeEnabled();
+  await expect(github.getByRole("listitem")).toHaveCount(0);
+  await expect(page.getByText("GitHub disconnected.")).toHaveCount(0);
+});
 
 test("withholds stale connection details when the revoke refresh pauses offline", async ({
   hub,
@@ -219,16 +278,7 @@ test("keeps the initial failure passive and announces the result of retrying", a
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
   const { navigation, connections } = projectApp(page);
-  const statusRead = page.waitForResponse(async (response) => {
-    if (
-      response.request().method() !== "GET" ||
-      !response.ok() ||
-      !response.url().includes("/_serverFn/")
-    ) {
-      return false;
-    }
-    return (await response.text()).includes('"canManage"');
-  });
+  const statusRead = findConnectionRead(page, "canManage");
   await navigation.openOrganizationSection("Connections");
   await expect(connections.card("GitHub")).toBeVisible();
   const statusPath = new URL((await statusRead).url()).pathname;
@@ -325,6 +375,17 @@ test("lets an instance operator reach every app setup link from the keyboard", a
     await session.close();
   }
 });
+
+function findConnectionRead(page: Page, field: string) {
+  return page.waitForResponse(async (response) => {
+    return (
+      response.request().method() === "GET" &&
+      response.ok() &&
+      response.url().includes("/_serverFn/") &&
+      (await response.text()).includes(JSON.stringify(field))
+    );
+  });
+}
 
 async function tabThrough(page: Page, controls: Locator[]) {
   expect(controls.length).toBeGreaterThan(0);
