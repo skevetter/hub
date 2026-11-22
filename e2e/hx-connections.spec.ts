@@ -332,7 +332,7 @@ test("focuses Try again when a first-load retry pauses offline", async ({ hub, p
   }
 });
 
-test("labels the controls with guild IDs when two Discord connections share a name", async ({
+test("labels the controls and announcement when two Discord connections share a name", async ({
   hub,
   page,
 }) => {
@@ -359,6 +359,17 @@ test("labels the controls with guild IDs when two Discord connections share a na
     await expect(dialog).toBeVisible();
     await dialog.getByRole("button", { name: "Cancel" }).click();
   }
+
+  await discord.getByRole("button", { name: "Actions for Engineering, guild 100" }).click();
+  await page.getByRole("menuitem", { name: "Revoke" }).click();
+  await page
+    .getByRole("alertdialog", { name: "Revoke Engineering (guild 100)?" })
+    .getByRole("button", { name: "Revoke connection" })
+    .click();
+  await expect(discord.getByRole("listitem")).toHaveCount(1);
+  await expect(discord.getByRole("listitem")).toContainText("guild 200");
+  const announcement = page.getByRole("status").filter({ hasText: "Engineering" });
+  await expect(announcement).toHaveText("Engineering (guild 100) disconnected.");
 });
 
 test.describe("Slack authorization", () => {
