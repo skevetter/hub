@@ -505,3 +505,36 @@ test("lets a fifth provider read start after four deadlines and retries only on 
     release();
   }
 });
+
+test("returns focus to the device actions when Rename is dismissed", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.seedDaemonSlug("owner", "rename-device");
+  const daemons = new OrganizationDaemons(page);
+  await daemons.open();
+  const trigger = actions(daemons, "rename-device");
+  const dialog = page.getByRole("dialog", { name: "Rename daemon" });
+
+  await trigger.press("Enter");
+  await page.getByRole("menuitem", { name: "Rename", exact: true }).press("Enter");
+  const slug = dialog.getByLabel("Daemon slug");
+  await expect(slug).toBeFocused();
+  await slug.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect.soft(trigger).toBeFocused({ timeout: 1_000 });
+
+  await trigger.press("Enter");
+  await page.getByRole("menuitem", { name: "Rename", exact: true }).press("Enter");
+  await dialog.getByRole("button", { name: "Close", exact: true }).press("Enter");
+  await expect(dialog).toBeHidden();
+  await expect.soft(trigger).toBeFocused({ timeout: 1_000 });
+
+  await trigger.press("Enter");
+  await page.getByRole("menuitem", { name: "Rename", exact: true }).press("Enter");
+  await slug.fill("");
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).press("Enter", {
+    timeout: 1_000,
+  });
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+});
