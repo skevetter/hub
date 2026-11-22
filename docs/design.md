@@ -128,7 +128,7 @@ missing app component.
 | ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `Page`, `PageHeader`, `PageHeaderSkeleton`                              | Lay out a screen: the column, the one `h1`, its description, status, and actions.   |
 | `Section`                                                               | Group content under a quiet heading with an optional trailing action.               |
-| `Card`, `CardSkeleton`                                                  | Put content in a bordered surface. Icon, title, description, and action optional.   |
+| `Card`, `CardSkeleton`                                                  | A bordered surface for content. Icon, title, status, description, action optional.  |
 | `Steps`                                                                 | Number a run of cards in order and join them with a rail.                           |
 | `DeviceCard`, `DeviceCardSkeleton`                                      | Show a machine: name, identifier, one state pill, last seen, and its facts.         |
 | `DataTable`, `DataRow`, `DataCell`, `DataTableSkeleton`                 | List records at page level, in columns.                                             |
