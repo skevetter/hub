@@ -15,6 +15,7 @@ import {
   executeFiles,
   invokeVitest,
   partitionFiles,
+  planShards,
   rerunFiles,
   runShards,
   shardEnvironment,
@@ -34,6 +35,40 @@ test("partition puts each file in one shard and balances cached durations", () =
     ["medium.test.ts", "other.test.ts", "fast.test.ts"],
   ]);
   assert.deepEqual(partitionFiles(files.slice(0, 1), 4), [["small.test.ts"]]);
+});
+
+test("the shard plan rounds and clamps the core count without using load", () => {
+  for (const [cores, count] of [
+    [1, 1],
+    [8, 3],
+    [12, 4],
+    [48, 6],
+  ]) {
+    const readLoad = () => ({ averages: [150, 0, 0], cores });
+    assert.equal(planShards(undefined, readLoad).count, count);
+  }
+  const override = planShards(8, () => ({ averages: [150, 0, 0], cores: 12 }));
+  assert.equal(override.count, 8);
+  assert.equal(override.reason, "TEST_SHARDS");
+});
+
+test("the shard plan scales all three timeouts from the one-minute load", () => {
+  const cases = [
+    [2, 1, 30_000, 10_000],
+    [18, 1.5, 45_000, 15_000],
+    [150, 4, 120_000, 40_000],
+  ];
+  for (const [load, multiplier, testTimeout, otherTimeout] of cases) {
+    const readLoad = () => ({ averages: [load, 900, 900], cores: 12 });
+    const plan = planShards(undefined, readLoad);
+    assert.equal(plan.multiplier, multiplier);
+    assert.equal(plan.count, 4);
+    assert.deepEqual(plan.timeoutFlags, [
+      `--testTimeout=${testTimeout}`,
+      `--hookTimeout=${otherTimeout}`,
+      `--teardownTimeout=${otherTimeout}`,
+    ]);
+  }
 });
 
 test("cached Hub timings balance two shards and only pin files above the ideal", () => {
@@ -614,10 +649,13 @@ test("a serial rerun owns the full-suite lock until its worker exits", async (t)
     const contender = spawnSync(process.execPath, args, {
       ...options,
       encoding: "utf8",
-      timeout: 1000,
+      timeout: 30_000,
+      killSignal: "SIGKILL",
     });
-    assert.equal(contender.status, 1);
-    assert.match(contender.stderr, /The full-suite lock is held/u);
+    const details = `contender exit code=${contender.status}, signal=${contender.signal}, error=${contender.error?.message ?? "none"}; stderr: ${contender.stderr}`;
+    assert.equal(contender.error, undefined, details);
+    assert.deepEqual([contender.status, contender.signal], [1, null], details);
+    assert.match(contender.stderr, /The full-suite lock is held/u, details);
   } finally {
     await writeFile(join(root, "release"), "");
     assert.deepEqual(await exited, [0, null]);
@@ -832,16 +870,29 @@ test("a failed shard keeps Vitest's human-readable errors alongside the JSON rep
     t,
     `
     writeFileSync(reportPath, JSON.stringify(report));
+    console.log(process.argv.filter((arg) => /^--(test|hook|teardown)Timeout=/u.test(arg)).join(" "));
     if (process.argv.includes("--reporter=default")) console.error("Unhandled Error: Worker exited unexpectedly");
     process.exitCode = 1;
     `,
   );
-  const result = spawnSync(process.execPath, args, { ...options, encoding: "utf8", timeout: 5000 });
+  const result = spawnSync(process.execPath, args, {
+    ...options,
+    env: { ...options.env, TEST_SHARDS: "2" },
+    encoding: "utf8",
+    timeout: 5000,
+  });
   assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stdout, /across 1 shards \(2 requested: TEST_SHARDS\)/u);
+  const timeouts = result.stdout.match(
+    /^Vitest shard timeouts \([\d.]+x, ms\): (--testTimeout=\d+ --hookTimeout=\d+ --teardownTimeout=\d+)$/mu,
+  )?.[1];
+  assert.ok(timeouts, result.stdout);
   const log = result.stdout.match(/See (.+?\/vitest\.log) and/u)?.[1];
   assert.ok(log, result.stdout);
   assert.ok((await realpath(log)).startsWith(`${await realpath(root)}/`), log);
-  assert.match(await readFile(log, "utf8"), /Unhandled Error: Worker exited unexpectedly/u);
+  const logContents = await readFile(log, "utf8");
+  assert.ok(logContents.split("\n").includes(timeouts), logContents);
+  assert.match(logContents, /Unhandled Error: Worker exited unexpectedly/u);
 });
 
 test("parallel testing cannot publish metrics after HEAD changes during the run", async (t) => {

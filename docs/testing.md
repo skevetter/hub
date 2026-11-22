@@ -11,13 +11,17 @@ mise exec node@24.22.0 -- npm run build
 mise exec node@24.22.0 -- npm test
 ```
 
-`npm test` runs the Node script tests and then the serial Vitest suite. To run the Vitest suite in
-four processes, wait for other test runs to finish and run the parallel command. It holds
-`/tmp/hub-fullsuite.lock` for the run. Set `TEST_SHARDS` to choose the number of processes.
+`npm test` runs the Node script tests and then the serial Vitest suite. The parallel command holds
+`/tmp/hub-fullsuite.lock` for the run.
 A file gets its own shard when its cached duration exceeds the ideal time per shard. The runner
 assigns the remaining files longest first to the lightest shard. It prefers timings from the last
 completed parallel run over timings that may come from a filtered run.
-Full sharded runs print load averages and available cores at the start and end, and warn if the starting one-minute load exceeds the available cores.
+
+The parallel runner divides available cores by three, rounds to the nearest integer, and clamps
+the default shard count to 1 through 6. Set `TEST_SHARDS` to override it. Load does not reduce the
+shard count. Full sharded runs print the load and core count at the start and end, and warn when
+the starting one-minute load exceeds the core count. The starting load divided by the core count
+scales the Vitest test, hook, and teardown timeouts by 1x to 4x. Serial reruns keep the usual timeouts.
 
 ```sh
 mise exec node@24.22.0 -- npm run test:scripts
