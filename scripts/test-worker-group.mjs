@@ -128,6 +128,14 @@ async function retireGroup(group) {
   }
 }
 
+// A lock is free when its owner has exited and none of its recorded groups still run.
+export function fullSuiteLockHeld(path = fullSuiteLockPath) {
+  const current = snapshot(path);
+  if (!current) return false;
+  if (!current.owner || !stale(current.owner)) return true;
+  return current.owner.groups.some((group) => groupAlive(group.pid));
+}
+
 export async function takeFullSuiteLock(path = fullSuiteLockPath, print = console.log) {
   const owner = {
     pid: process.pid,
