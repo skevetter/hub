@@ -72,18 +72,7 @@ it("agrees with Activity when GitHub has both a route drop and a connection upda
 
 it("bounds the candidate and run-probe reads when 4,000 lifecycle receipts are excluded", async () => {
   await seed("github", 4_000, 1, "github_lifecycle");
-  await harness.createRun();
-  await harness.runtime.query(
-    `insert into trigger_runs
-       (organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
-        configured_trigger_name, status, prompt, deadline_at)
-     select receipt.organization_id, fixture.project_id, fixture.configuration_revision_id,
-            receipt.id, 'fixture', 'succeeded', '', receipt.received_at
-     from provider_event_receipts receipt
-     cross join (select project_id, configuration_revision_id from trigger_runs limit 1) fixture
-     where receipt.organization_id = $1 and receipt.provider = 'github'`,
-    [organizationId],
-  );
+  await linkGitHubReceiptsToRuns();
   await harness.runtime.query("analyze provider_event_receipts");
   await harness.runtime.query("analyze trigger_runs");
   const { result, plans } = await observeConnectionDrops("4,000 excluded lifecycle receipts");
@@ -106,6 +95,81 @@ it("bounds the candidate and run-probe reads when 4,000 lifecycle receipts are e
     discord: "none",
   });
 });
+
+it("keeps the ordered candidate lookup within the index budget on 50,000 receipts", async () => {
+  await seed("github", 201, 1, "no_project_route");
+  await seed("slack", 201, 1, "no_project_route");
+  const since = new Date(Date.now() - 7 * 86_400_000);
+  await harness.runtime.query("vacuum full analyze provider_event_receipts");
+  const small = await explainGitHubPresence("402 recent receipts", since);
+  expect(small.plan).toMatch(/Limit .* rows=1 loops=1/u);
+
+  await harness.runtime.query(
+    `insert into organization (id, name, slug)
+     select 'drop-plan-' || n, 'Drop plan ' || n, 'drop-plan-' || n
+     from generate_series(0, 7) n`,
+  );
+  await harness.runtime.query(
+    `insert into provider_event_receipts
+       (organization_id, provider, delivery_id, source, payload, received_at, dropped_reason)
+     select 'drop-plan-' || (n % 8), (array['github', 'linear', 'slack', 'discord'])[1 + (n / 8) % 4],
+            'drop-plan-' || n, 'fixture.event', '{}',
+            now() - (n % 9) * interval '1 day', 'no_project_route'
+     from generate_series(1, 50_000) n`,
+  );
+  await seed("github", 600, 2, "github_lifecycle");
+  await linkGitHubReceiptsToRuns();
+  await harness.runtime.query("analyze provider_event_receipts");
+  await harness.runtime.query("analyze trigger_runs");
+  const large = await explainGitHubPresence("51,003 receipts across nine organizations", since);
+  expect(large.result).toBe("unknown");
+  expect(large.plan).toMatch(
+    /Index(?: Only)? Scan using provider_event_receipts_org_dropped_provider_idx .* rows=200 loops=1/u,
+  );
+  expect(large.plan).toMatch(/Index Only Scan using trigger_runs_.* loops=200/u);
+  expect(large.plan).not.toMatch(/Seq Scan on provider_event_receipts|-> +Sort/u);
+  expect(large.statement).toMatch(
+    /order by receipt\.organization_id, receipt\.provider,\s+receipt\.received_at desc nulls first, receipt\.id desc nulls first\s+limit 200/u,
+  );
+});
+
+async function linkGitHubReceiptsToRuns() {
+  await harness.createRun();
+  await harness.runtime.query(
+    `insert into trigger_runs
+       (organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
+        configured_trigger_name, status, prompt, deadline_at)
+     select receipt.organization_id, fixture.project_id, fixture.configuration_revision_id,
+            receipt.id, 'fixture', 'succeeded', '', receipt.received_at
+     from provider_event_receipts receipt
+     cross join (select project_id, configuration_revision_id from trigger_runs limit 1) fixture
+     where receipt.organization_id = $1 and receipt.provider = 'github'`,
+    [organizationId],
+  );
+}
+
+async function explainGitHubPresence(label: string, since: Date) {
+  let statement = "";
+  let plan = "";
+  const connection = await harness.connect({
+    async beforeQuery(sql, params) {
+      statement = sql;
+      const { rows } = await harness.runtime.query<{ "QUERY PLAN": string }>(
+        `explain (analyze, buffers) ${sql}`,
+        params,
+      );
+      plan = rows.map((row) => row["QUERY PLAN"]).join("\n");
+    },
+  });
+  const result = await connection.database.readDroppedEventPresence(
+    organizationId,
+    "github",
+    since,
+  );
+  const planFile = process.env["HUB_CONNECTION_DROP_PLANS"];
+  if (planFile !== undefined) await appendFile(planFile, `\n${label}\n${plan}\n`);
+  return { statement, plan, result };
+}
 
 async function observeConnectionDrops(label: string) {
   const plans = new Map<unknown, string>();
