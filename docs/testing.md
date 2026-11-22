@@ -14,7 +14,9 @@ mise exec node@24.22.0 -- npm test
 `npm test` runs the Node script tests and then the serial Vitest suite. To run the Vitest suite in
 four processes, wait for other test runs to finish and run the parallel command. It holds
 `/tmp/hub-fullsuite.lock` for the run. Set `TEST_SHARDS` to choose the number of processes.
-The daemon suite takes the first shard when at least two are available.
+A file gets its own shard when its cached duration exceeds the ideal time per shard. The runner
+assigns the remaining files longest first to the lightest shard. It prefers timings from the last
+completed parallel run over timings that may come from a filtered run.
 
 ```sh
 mise exec node@24.22.0 -- npm run test:scripts
