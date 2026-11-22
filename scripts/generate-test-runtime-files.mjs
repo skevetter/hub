@@ -1,10 +1,11 @@
 import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join, posix } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import ts from "typescript";
+import { parseArgs } from "node:util";
+import { isEntrypoint, printRunContext, repositoryFor } from "./test-context.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
-const output = join(root, "scripts/test-runtime-files.json");
 const testFile = /\.(?:test|spec)\.[cm]?[jt]sx?$/u;
 const sourceFile = /\.[cm]?[jt]sx?$/u;
 const readMethods = /^(?:readFile|readdir|opendir|readlink|glob)(?:Sync)?$|^createReadStream$/u;
@@ -27,12 +28,12 @@ const dynamicInputs = {
   "src/typography-policy.test.ts": { directory: ["src/"], path: ["src/"] },
 };
 
-function walk(node, visit) {
+function walk(ts, node, visit) {
   visit(node);
-  ts.forEachChild(node, (child) => walk(child, visit));
+  ts.forEachChild(node, (child) => walk(ts, child, visit));
 }
 
-function staticPath(node, file, bindings, seen = new Set()) {
+function staticPath(ts, node, file, bindings, seen = new Set()) {
   if (!node) return undefined;
   if (node.getText() === "import.meta.url") return `/${file}`;
 
@@ -41,11 +42,11 @@ function staticPath(node, file, bindings, seen = new Set()) {
     if (node.text === "__dirname") return posix.dirname(`/${file}`);
     if (node.text === "__filename") return `/${file}`;
     if (seen.has(node.text)) return undefined;
-    return staticPath(bindings.get(node.text), file, bindings, new Set([...seen, node.text]));
+    return staticPath(ts, bindings.get(node.text), file, bindings, new Set([...seen, node.text]));
   }
   if (ts.isNewExpression(node) && node.expression.getText() === "URL") {
     const [path, base] = node.arguments ?? [];
-    const value = staticPath(path, file, bindings, seen);
+    const value = staticPath(ts, path, file, bindings, seen);
     if (value !== undefined && base?.getText() === "import.meta.url") {
       return fileURLToPath(new URL(value, pathToFileURL(`/${file}`)));
     }
@@ -53,7 +54,7 @@ function staticPath(node, file, bindings, seen = new Set()) {
   if (!ts.isCallExpression(node)) return undefined;
   const method = node.expression.getText();
   if (method === "process.cwd") return "/";
-  const parts = node.arguments.map((arg) => staticPath(arg, file, bindings, seen));
+  const parts = node.arguments.map((arg) => staticPath(ts, arg, file, bindings, seen));
   if (method === "fileURLToPath") return parts[0];
   if (method === "dirname" && parts[0] !== undefined) return posix.dirname(parts[0]);
   if (!["join", "resolve"].includes(method) || parts[0] === undefined) return undefined;
@@ -62,7 +63,7 @@ function staticPath(node, file, bindings, seen = new Set()) {
   return `${posix[method]("/", ...parts.slice(0, unknown)).replace(/\/$/u, "")}/`;
 }
 
-export function readRuntimeInputs(file, source, directory = root) {
+export function readRuntimeInputs(ts, file, source, directory = root) {
   const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
   const bindings = new Map();
   const readers = new Map();
@@ -87,13 +88,13 @@ export function readRuntimeInputs(file, source, directory = root) {
     }
   }
   if (!readers.size && !fsNamespaces.size) return [];
-  walk(ast, (node) => {
+  walk(ts, ast, (node) => {
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
       bindings.set(node.name.text, node.initializer);
     }
   });
   const inputs = new Set();
-  walk(ast, (node) => {
+  walk(ts, ast, (node) => {
     if (!ts.isCallExpression(node)) return;
     const name = node.expression.getText();
     const [namespace, ...properties] = name.split(".");
@@ -101,7 +102,7 @@ export function readRuntimeInputs(file, source, directory = root) {
       readers.get(name) ?? (fsNamespaces.has(namespace) ? properties.at(-1) : undefined);
     if (!method || !readMethods.test(method)) return;
     const arg = node.arguments[0];
-    const value = staticPath(arg, file, bindings);
+    const value = staticPath(ts, arg, file, bindings);
     if (value === undefined) {
       const fallback = dynamicInputs[file]?.[arg?.getText()];
       if (!fallback) throw new Error(`Unmapped runtime read in ${file}: ${node.getText()}`);
@@ -123,6 +124,7 @@ export function readRuntimeInputs(file, source, directory = root) {
 }
 
 export function generateRuntimeMap(directory = root) {
+  const ts = createRequire(join(directory, "package.json"))("typescript");
   const files = readdirSync(join(directory, "src"), { recursive: true })
     .map((name) => `src/${name.split("\\").join("/")}`)
     .filter((name) => sourceFile.test(name));
@@ -132,7 +134,7 @@ export function generateRuntimeMap(directory = root) {
   for (const file of files) {
     const source = readFileSync(join(directory, file), "utf8");
     if (testFile.test(file) || file.includes("/test-utils/")) {
-      inputs.set(file, readRuntimeInputs(file, source, directory));
+      inputs.set(file, readRuntimeInputs(ts, file, source, directory));
     }
     for (const { fileName } of ts.preProcessFile(source, true, true).importedFiles) {
       if (!fileName.startsWith(".")) continue;
@@ -164,4 +166,15 @@ export function generateRuntimeMap(directory = root) {
   );
 }
 
-if (import.meta.main) writeFileSync(output, `${JSON.stringify(generateRuntimeMap(), null, 2)}\n`);
+if (isEntrypoint(import.meta.url)) {
+  try {
+    const { values } = parseArgs({ options: { root: { type: "string" } } });
+    const directory = repositoryFor(import.meta.url, values.root);
+    printRunContext(directory, "generate scripts/test-runtime-files.json");
+    const output = join(directory, "scripts/test-runtime-files.json");
+    writeFileSync(output, `${JSON.stringify(generateRuntimeMap(directory), null, 2)}\n`);
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+}

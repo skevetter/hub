@@ -4,9 +4,10 @@ import { once } from "node:events";
 
 import { existsSync } from "node:fs";
 
-import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import { executeFiles, partitionFiles, rerunFiles, runShards } from "./test-parallel.mjs";
@@ -176,7 +177,7 @@ test("a worker that exits mid-run lists every missing file for serial rerun", as
   const files = ["done.test.ts", "lost.test.ts", "later.test.ts"];
   const result = await runShards([files], {
     execute: (name, selected) =>
-      executeFiles(name, selected, directory, new AbortController().signal, invoke),
+      executeFiles(process.cwd(), name, selected, directory, new AbortController().signal, invoke),
     print: (line) => output.push(line),
   });
   assert.deepEqual(result, { exitCode: 1, failedFiles: ["lost.test.ts", "later.test.ts"] });
@@ -284,4 +285,18 @@ test("recovers a killed runner's lock after its recorded group exits", async (t)
   assert.match(messages.join("\n"), /stale full-suite lock/u);
   assert.deepEqual(JSON.parse(await readFile(path, "utf8")).groups, []);
   replacement.release();
+});
+
+test("a symlinked runner path still executes the CLI", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hub-shard-symlink-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const runner = fileURLToPath(new URL("./test-parallel.mjs", import.meta.url));
+  await symlink(dirname(runner), join(directory, "scripts"), "dir");
+  const result = spawnSync(process.execPath, [join(directory, "scripts/test-parallel.mjs")], {
+    env: { ...process.env, TEST_SHARDS: "invalid" },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /Repository: .+/u);
+  assert.match(result.stderr, /TEST_SHARDS must be a positive integer/u);
 });

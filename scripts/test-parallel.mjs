@@ -11,21 +11,15 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
+import { isEntrypoint, printRunContext, repositoryFor } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
 import {
   fullSuiteLockPath as lockPath,
   runWorkerGroup,
   takeFullSuiteLock,
 } from "./test-worker-group.mjs";
-
-const root = fileURLToPath(new URL("../", import.meta.url));
-const vitest = join(root, "node_modules/vitest/vitest.mjs");
-const cacheRoot = join(root, "node_modules/.vite/vitest");
-const parallelCache = join(cacheRoot, "test-parallel");
-const failedFileList = join(parallelCache, "failed.json");
 
 export function partitionFiles(files, count) {
   const shardCount = Math.min(count, files.length);
@@ -137,7 +131,7 @@ async function readCachedResults(directory) {
     .filter((cache) => Array.isArray(cache?.results));
 }
 
-async function weighFiles(paths) {
+async function weighFiles(root, cacheRoot, paths) {
   const cached = new Map();
   for (const cache of await readCachedResults(cacheRoot)) {
     for (const [key, result] of cache.results) {
@@ -166,7 +160,7 @@ async function weighFiles(paths) {
   }));
 }
 
-async function invokeVitest(args, directory, signal, lock) {
+async function invokeVitest(root, args, directory, signal, lock) {
   await mkdir(directory);
   const log = await open(join(directory, "vitest.log"), "w", 0o600);
   const env = {
@@ -182,13 +176,19 @@ async function invokeVitest(args, directory, signal, lock) {
   };
   delete env.TESTCONTAINERS_RYUK_PORT;
   try {
-    return await runWorkerGroup([vitest, ...args], { cwd: root, env, log, lock, signal });
+    return await runWorkerGroup([join(root, "node_modules/vitest/vitest.mjs"), ...args], {
+      cwd: root,
+      env,
+      log,
+      lock,
+      signal,
+    });
   } finally {
     await log.close();
   }
 }
 
-export async function executeFiles(name, files, runDirectory, signal, invoke = invokeVitest) {
+export async function executeFiles(root, name, files, runDirectory, signal, invoke) {
   const directory = join(runDirectory, name.toLowerCase().replaceAll(" ", "-"));
   const reportPath = join(directory, "results.json");
   const startedAt = performance.now();
@@ -265,7 +265,7 @@ export async function executeFiles(name, files, runDirectory, signal, invoke = i
   };
 }
 
-async function updateTimingCache(runDirectory, count) {
+async function updateTimingCache(parallelCache, runDirectory, count) {
   const caches = (
     await Promise.all(
       Array.from({ length: count }, (_, index) =>
@@ -287,7 +287,7 @@ async function writeJson(target, data) {
   await rename(pending, target);
 }
 
-async function readFailedFiles(files) {
+async function readFailedFiles(failedFileList, files) {
   const recorded = await readFile(failedFileList, "utf8").catch((error) => {
     if (error.code === "ENOENT") return "[]";
     throw error;
@@ -302,7 +302,17 @@ async function readFailedFiles(files) {
 }
 
 async function main() {
-  const { values } = parseArgs({ options: { "rerun-failed": { type: "boolean" } } });
+  const { values } = parseArgs({
+    options: { root: { type: "string" }, "rerun-failed": { type: "boolean" } },
+  });
+  const root = repositoryFor(import.meta.url, values.root);
+  printRunContext(
+    root,
+    values["rerun-failed"] ? "rerun failed Vitest files" : "run the sharded Vitest suite",
+  );
+  const cacheRoot = join(root, "node_modules/.vite/vitest");
+  const parallelCache = join(cacheRoot, "test-parallel");
+  const failedFileList = join(parallelCache, "failed.json");
   const requested = process.env.TEST_SHARDS ?? "4";
   const count = Number(requested);
   if (!/^\d+$/u.test(requested) || !Number.isSafeInteger(count) || count < 1) {
@@ -333,6 +343,7 @@ async function main() {
     const discovery = join(runDirectory, "discovery");
     const listing = join(discovery, "files.json");
     const found = await invokeVitest(
+      root,
       ["list", "--filesOnly", `--json=${listing}`],
       discovery,
       controller.signal,
@@ -349,22 +360,27 @@ async function main() {
     const runs = [];
     const execute = async (name, selected) => {
       const result = await executeFiles(
+        root,
         name,
         selected,
         runDirectory,
         controller.signal,
-        (args, directory, signal) => invokeVitest(args, directory, signal, lock),
+        (args, directory, signal) => invokeVitest(root, args, directory, signal, lock),
       );
       runs.push({ files: selected, counts: result.counts });
       return result;
     };
     if (values["rerun-failed"]) {
-      exitCode = await rerunFiles(await readFailedFiles(files), execute, console.log);
+      exitCode = await rerunFiles(
+        await readFailedFiles(failedFileList, files),
+        execute,
+        console.log,
+      );
       if (exitCode === 0) await publishTestMetrics(runs);
       return exitCode;
     }
     await rm(failedFileList, { force: true });
-    const groups = partitionFiles(await weighFiles(files), count);
+    const groups = partitionFiles(await weighFiles(root, cacheRoot, files), count);
     const startedAt = performance.now();
     console.log(`Running ${files.length} Vitest files across ${groups.length} shards.`);
     const result = await runShards(groups, { execute, print: console.log });
@@ -374,7 +390,7 @@ async function main() {
     );
     if (result.failedFiles.length) await writeJson(failedFileList, result.failedFiles);
     if (exitCode === 0) {
-      await updateTimingCache(runDirectory, groups.length);
+      await updateTimingCache(parallelCache, runDirectory, groups.length);
       await publishTestMetrics(runs);
     } else {
       console.log(`Run logs: ${runDirectory}`);
@@ -391,7 +407,7 @@ async function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+if (isEntrypoint(import.meta.url)) {
   main().then(
     (exitCode) => {
       process.exitCode = exitCode;
