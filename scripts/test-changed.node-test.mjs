@@ -4,7 +4,7 @@ import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -200,8 +200,9 @@ test("the upstream precedes origin/main when no release has a merge base", async
   assert.throws(() => find("missing"), /Could not resolve --base/u);
 });
 
-test("test-changed forwards TERM, INT and HUP and waits for the full-suite child", async (t) => {
-  const { root, run } = await releaseFixture(t);
+async function changedFixture(t, scripts) {
+  const fixture = await releaseFixture(t);
+  const { root, run } = fixture;
   for (const directory of ["scripts", "src/routes", "node_modules/vitest"])
     await mkdir(join(root, directory), { recursive: true });
   for (const file of [
@@ -229,6 +230,16 @@ test("test-changed forwards TERM, INT and HUP and waits for the full-suite child
     "node_modules/vitest/node.js": `export const createVitest = () => ({
       projects: [], globTestSpecifications: () => [], close() {},
     })`,
+    ...scripts,
+  }))
+    await writeFile(join(root, path), contents);
+  run("add", ".");
+  run("commit", "--quiet", "-m", "Fixture scripts");
+  return fixture;
+}
+
+test("test-changed forwards TERM, INT and HUP and waits for the full-suite child", async (t) => {
+  const { root } = await changedFixture(t, {
     "scripts/test-parallel.mjs": `
       import { writeFileSync } from "node:fs";
       const interval = setInterval(() => {}, 100);
@@ -240,10 +251,7 @@ test("test-changed forwards TERM, INT and HUP and waits for the full-suite child
       }
       writeFileSync(process.env.STATUS_FILE, String(process.pid));
     `,
-  }))
-    await writeFile(join(root, path), contents);
-  run("add", ".");
-  run("commit", "--quiet", "-m", "Fixture scripts");
+  });
   await writeFile(join(root, "vitest.config.ts"), "");
 
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
@@ -285,6 +293,75 @@ test("test-changed forwards TERM, INT and HUP and waits for the full-suite child
           if (error.code !== "ESRCH") throw error;
         }
       }
+      await exited;
+    }
+  }
+});
+
+test("test-changed stops the selected Vitest run with its descendants and removes its temp files", async (t) => {
+  const { root } = await changedFixture(t, {
+    // Route listing succeeds; a run starts a grandchild and waits to be stopped.
+    "node_modules/vitest/vitest.mjs": `
+      import { spawn } from "node:child_process";
+      import { writeFileSync } from "node:fs";
+      if (process.argv[2] === "list") process.exit(0);
+      const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      writeFileSync(process.env.STATUS_FILE, JSON.stringify({ leader: process.pid, sleeper: sleeper.pid }));
+      setInterval(() => {}, 1000);
+    `,
+  });
+  const gone = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      if (error.code === "ESRCH") return true;
+      throw error;
+    }
+  };
+  for (const signal of ["SIGTERM", "SIGHUP"]) {
+    const marker = join(root, `status-${signal}`);
+    const temp = join(root, `status-tmp-${signal}`);
+    await mkdir(temp);
+    const caller = spawn(
+      process.execPath,
+      [join(root, "scripts/test-changed.mjs"), "--base", "HEAD"],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          STATUS_FILE: marker,
+          TMPDIR: temp,
+          HUB_TEST_FULLSUITE_LOCK: join(root, "status-lock"),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const exited = once(caller, "exit");
+    let output = "";
+    for (const stream of [caller.stdout, caller.stderr])
+      stream.on("data", (chunk) => {
+        output += chunk;
+      });
+    let started;
+    try {
+      for (let attempts = 0; !started && attempts < 400 && caller.exitCode === null; attempts++) {
+        await delay(25);
+        started = await readFile(marker, "utf8").then(JSON.parse, () => undefined);
+      }
+      assert.ok(started, output || "Selected Vitest child did not start");
+      caller.kill(signal);
+      const [code, terminatedBy] = await exited;
+      assert.equal(terminatedBy, null);
+      assert.equal(code, 1);
+      assert.match(output, new RegExp(`INTERRUPTED: ${signal}`, "u"));
+      assert.throws(() => process.kill(-started.leader, 0), { code: "ESRCH" });
+      assert.ok(gone(started.sleeper), "the grandchild survived");
+      assert.deepEqual(await readdir(temp), []);
+    } finally {
+      if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
+      for (const pid of [started?.leader, started?.sleeper])
+        if (pid && !gone(pid)) process.kill(pid, "SIGKILL");
       await exited;
     }
   }

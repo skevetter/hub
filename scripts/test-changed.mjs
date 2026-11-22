@@ -18,7 +18,7 @@ import { parseArgs } from "node:util";
 import { generateRuntimeMap } from "./generate-test-runtime-files.mjs";
 import { git, isEntrypoint, printRunContext, repositoryFor, requireGit } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
-import { fullSuiteLockPath, testSignals } from "./test-worker-group.mjs";
+import { fullSuiteLockPath, stopGroup, testSignals } from "./test-worker-group.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 
 const routeTree = "src/routeTree.gen.ts";
@@ -193,39 +193,75 @@ async function exists(path) {
   }
 }
 
-function run(command, args, { cwd, env = process.env, supervise = false }) {
-  return new Promise((settle, reject) => {
-    const child = spawn(command, args, { cwd, env, stdio: "inherit", detached: supervise });
-    let interrupted = false;
-    let childError;
-    const forward = (signal) => {
-      interrupted = true;
-      try {
-        process.kill(-child.pid, signal);
-      } catch (error) {
-        if (error.code !== "ESRCH") childError = error;
-      }
-    };
-    if (supervise && child.pid) for (const signal of testSignals) process.on(signal, forward);
-    child.on("error", (error) => {
-      childError = error;
-    });
-    child.on("close", (code) => {
-      if (supervise) for (const signal of testSignals) process.off(signal, forward);
-      if (childError) reject(childError);
-      else settle(interrupted ? 1 : (code ?? 1));
-    });
-  });
+class Interrupted extends Error {
+  constructor(signal) {
+    super(`INTERRUPTED: ${signal}`);
+    this.signal = signal;
+  }
 }
 
-function runVitest(root, args, options) {
-  return run(process.execPath, [join(root, "node_modules/vitest/vitest.mjs"), ...args], {
+// Every child gets its own process group so a signal to this script reaches the whole tree.
+function supervise() {
+  const groups = new Set();
+  let received;
+  const forward = (signal) => {
+    received ??= signal;
+    for (const pid of groups) {
+      try {
+        process.kill(-pid, signal);
+      } catch (error) {
+        if (error.code !== "ESRCH") throw error;
+      }
+    }
+  };
+  for (const signal of testSignals) process.on(signal, forward);
+  const check = () => {
+    if (received) throw new Interrupted(received);
+  };
+  return {
+    check,
+    run(command, args, { cwd, env = process.env }) {
+      check();
+      return new Promise((settle, reject) => {
+        const child = spawn(command, args, {
+          cwd,
+          env,
+          stdio: ["ignore", "inherit", "inherit"],
+          detached: true,
+        });
+        let childError;
+        if (child.pid) groups.add(child.pid);
+        child.on("error", (error) => {
+          childError = error;
+        });
+        child.on("close", async (code) => {
+          try {
+            // Descendants can outlive the leader; sweep the group before reporting.
+            if (received && child.pid) await stopGroup(child.pid, received);
+          } catch (error) {
+            childError ??= error;
+          }
+          groups.delete(child.pid);
+          if (childError) reject(childError);
+          else if (received) reject(new Interrupted(received));
+          else settle(code ?? 1);
+        });
+      });
+    },
+    close() {
+      for (const signal of testSignals) process.off(signal, forward);
+    },
+  };
+}
+
+function runVitest(supervisor, root, args, options) {
+  return supervisor.run(process.execPath, [join(root, "node_modules/vitest/vitest.mjs"), ...args], {
     cwd: root,
     ...options,
   });
 }
 
-async function checkRouteTree(rootDir, temp, env) {
+async function checkRouteTree(supervisor, rootDir, temp, env) {
   const snapshot = join(await realpath(temp), "routes");
   const source = join(snapshot, "src");
   await mkdir(source, { recursive: true });
@@ -240,6 +276,7 @@ async function checkRouteTree(rootDir, temp, env) {
     symlink(join(rootDir, "node_modules"), join(snapshot, "node_modules"), "junction"),
   ]);
   const code = await runVitest(
+    supervisor,
     rootDir,
     [
       "list",
@@ -302,10 +339,15 @@ async function requireFullSuiteIdle() {
   throw new Error(`The full-suite lock is held at ${fullSuiteLockPath}.`);
 }
 
-async function selectedVitest(root, args, reportPath, env) {
-  const code = await runVitest(root, [...args, "--reporter=json", `--outputFile=${reportPath}`], {
-    env,
-  });
+async function selectedVitest(supervisor, root, args, reportPath, env) {
+  const code = await runVitest(
+    supervisor,
+    root,
+    [...args, "--reporter=json", `--outputFile=${reportPath}`],
+    {
+      env,
+    },
+  );
   try {
     const report = JSON.parse(await readFile(reportPath, "utf8"));
     return {
@@ -348,16 +390,19 @@ async function main() {
   console.log(`Changed paths from ${base.display} (Git ${base.kind} ${base.tree})`);
   for (const path of changes) console.log(`  ${path}`);
 
-  const temp = await mkdtemp(join(tmpdir(), "hub-changed-"));
-  const env = { ...process.env, HUB_VITEST_CACHE_DIR: join(temp, "vite") };
+  const supervisor = supervise();
+  let temp;
   try {
-    await checkRouteTree(root, temp, env);
+    temp = await mkdtemp(join(tmpdir(), "hub-changed-"));
+    const env = { ...process.env, HUB_VITEST_CACHE_DIR: join(temp, "vite") };
+    await checkRouteTree(supervisor, root, temp, env);
     const checks = ["route tree"];
     const present = new Set();
     for (const path of changes) {
       if (await exists(join(root, path))) present.add(path);
     }
     const plan = await resolveTestPlan(root, changes, present, values.safe, temp);
+    supervisor.check();
     if (plan.fullSuiteReason) {
       console.log(
         `FULL VITEST SUITE selected for ${plan.fullSuiteReason}. Handing off to the parallel runner with the full-suite lock.`,
@@ -369,22 +414,21 @@ async function main() {
     let code = 0;
     if (plan.migrationChanged) {
       console.log("Running npm run db:check for drizzle changes.");
-      code |= await run("npm", ["run", "db:check"], { cwd: root });
+      code |= await supervisor.run("npm", ["run", "db:check"], { cwd: root });
       checks.push("npm run db:check");
     }
     if (plan.scriptsChanged) {
       console.log("Running npm run test:scripts for package or runner changes.");
-      code |= await run("npm", ["run", "test:scripts"], { cwd: root });
+      code |= await supervisor.run("npm", ["run", "test:scripts"], { cwd: root });
       checks.push("npm run test:scripts");
     }
     if (code !== 0) return 1;
     if (plan.fullSuiteReason) {
       const metrics = join(temp, "full-metrics.json");
       const runner = fileURLToPath(new URL("./test-parallel.mjs", import.meta.url));
-      const result = await run(process.execPath, [runner, "--root", root], {
+      const result = await supervisor.run(process.execPath, [runner, "--root", root], {
         cwd: root,
         env: { ...env, HUB_TEST_RUN_REPORT: metrics },
-        supervise: true,
       });
       if (result !== 0) return result;
       const { selectedFiles, counts } = JSON.parse(await readFile(metrics, "utf8"));
@@ -392,6 +436,7 @@ async function main() {
       return 0;
     }
     const direct = await selectedVitest(
+      supervisor,
       root,
       ["run", ...[...plan.tests.keys()].map((path) => join(root, path))],
       join(temp, "direct.json"),
@@ -408,8 +453,16 @@ async function main() {
       checks,
     );
     return 0;
+  } catch (error) {
+    if (!(error instanceof Interrupted)) throw error;
+    console.log(error.message);
+    return 1;
   } finally {
-    await rm(temp, { recursive: true });
+    try {
+      if (temp) await rm(temp, { recursive: true });
+    } finally {
+      supervisor.close();
+    }
   }
 }
 
