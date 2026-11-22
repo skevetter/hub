@@ -52,15 +52,22 @@ function printRun(print, name, files, result) {
   print(
     `${name}: ${result.exitCode === 0 ? "PASS" : "FAIL"} in ${seconds}s, ${files.length} files, ${passed} passed, ${failed} failed, ${skipped} skipped`,
   );
-  for (const file of result.failedFiles) print(`  ${name}: ${file}`);
   if (result.diagnostic) print(`  ${name}: ${result.diagnostic}`);
+  for (const file of result.failedFiles) print(`  ${name}: ${file}`);
 }
 
 export async function runShards(groups, { execute, print }) {
   const outcomes = await Promise.allSettled(
     groups.map(async (files, index) => {
       const name = `Shard ${index + 1}`;
-      const result = await execute(name, files);
+      let result = await execute(name, files);
+      if (result.exitCode !== 0 && !result.failedFiles.length) {
+        result = {
+          ...result,
+          failedFiles: files,
+          counts: { ...result.counts, failed: Math.max(files.length, result.counts.failed) },
+        };
+      }
       printRun(print, name, files, result);
       return result;
     }),
@@ -71,7 +78,12 @@ export async function runShards(groups, { execute, print }) {
   for (const [index, outcome] of outcomes.entries()) {
     if (outcome.status === "rejected") {
       exitCode = 1;
-      print(`Shard ${index + 1}: FAIL. Runner error (${outcome.reason?.code ?? "unknown"}).`);
+      const files = groups[index];
+      failedFiles.push(...files);
+      total.failed += files.length;
+      print(
+        `Shard ${index + 1}: FAIL. Runner error (${outcome.reason?.code ?? "unknown"}). Files without a result: ${files.join(", ")}`,
+      );
       continue;
     }
     const result = outcome.value;
@@ -198,11 +210,11 @@ async function invokeVitest(args, directory, signal) {
   }
 }
 
-async function executeFiles(name, files, runDirectory, signal) {
+export async function executeFiles(name, files, runDirectory, signal, invoke = invokeVitest) {
   const directory = join(runDirectory, name.toLowerCase().replaceAll(" ", "-"));
   const reportPath = join(directory, "results.json");
   const startedAt = performance.now();
-  const run = await invokeVitest(
+  const run = await invoke(
     [
       "run",
       "--reporter=json",
@@ -217,19 +229,30 @@ async function executeFiles(name, files, runDirectory, signal) {
   let report;
   try {
     report = JSON.parse(await readFile(reportPath, "utf8"));
+    if (!Array.isArray(report?.testResults)) throw new SyntaxError("missing testResults");
   } catch (error) {
     if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
     return {
       exitCode: 1,
       durationMs,
-      failedFiles: [],
-      counts: { passed: 0, failed: 0, skipped: 0 },
-      diagnostic: `Vitest exited without a readable JSON report (${run.processError ?? run.exitCode}). See ${log}`,
+      failedFiles: files,
+      counts: { passed: 0, failed: files.length, skipped: 0 },
+      diagnostic: `Vitest exited without a readable JSON report (exit ${run.exitCode}, ${run.processError ?? "no signal"}). Files without a result: ${files.join(", ")}. See ${log}`,
     };
   }
   const reported = new Set(report.testResults.map(({ name }) => relative(root, name)));
   const expected = new Set(files);
-  const missing = files.filter((file) => !reported.has(file));
+  const unfinished = new Set(
+    report.testResults
+      .filter(
+        ({ status, assertionResults }) =>
+          status !== "failed" &&
+          (assertionResults?.some((test) => test.status === "pending") ||
+            (run.exitCode && !assertionResults?.length)),
+      )
+      .map(({ name }) => relative(root, name)),
+  );
+  const missing = files.filter((file) => !reported.has(file) || unfinished.has(file));
   const extra = [...reported].filter((file) => !expected.has(file));
   const failedFiles = report.testResults
     .filter(({ status }) => status === "failed")
@@ -238,17 +261,27 @@ async function executeFiles(name, files, runDirectory, signal) {
   const exitCode =
     run.exitCode || Number(!report.success || missing.length > 0 || extra.length > 0);
   const diagnostics = [];
-  if (missing.length) diagnostics.push(`Files missing from report: ${missing.join(", ")}`);
+  if (run.exitCode)
+    diagnostics.push(
+      `Vitest process failed (exit ${run.exitCode}, ${run.processError ?? "no signal"}).`,
+    );
+  if (missing.length) diagnostics.push(`Files without a result: ${missing.join(", ")}`);
   if (extra.length) diagnostics.push(`Unexpected files in report: ${extra.join(", ")}`);
   if (exitCode) diagnostics.push(`See ${log} and ${reportPath}`);
+  const failures = [...new Set([...failedFiles, ...missing])];
+  if (exitCode && !failures.length) failures.push(...files);
   return {
     exitCode,
     durationMs,
-    failedFiles,
+    failedFiles: failures,
     counts: {
       passed: report.numPassedTests,
-      failed: report.numFailedTests,
-      skipped: report.numTotalTests - report.numPassedTests - report.numFailedTests,
+      failed:
+        Math.max(report.numFailedTests, failedFiles.length) +
+        (failures.length - failedFiles.length),
+      skipped: report.testResults
+        .flatMap(({ assertionResults }) => assertionResults ?? [])
+        .filter(({ status }) => status === "skipped" || status === "todo").length,
     },
     diagnostic: diagnostics.join("\n  "),
   };
