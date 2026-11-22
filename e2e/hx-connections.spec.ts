@@ -251,6 +251,35 @@ test("keeps the initial failure passive and announces the result of retrying", a
   await expect(page.getByRole("status").filter({ hasText: "Connections loaded." })).toBeVisible();
 });
 
+test("labels the controls with guild IDs when two Discord connections share a name", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const { navigation, connections } = projectApp(page);
+  await hub.primaryApplication().query(
+    `insert into discord_connections (organization_id, guild_id, slug, guild_name)
+     select id, guild_id, 'engineering-' || guild_id, 'Engineering'
+     from organization cross join (values ('100'), ('200')) as guilds(guild_id)
+     where name = 'Acme'`,
+    [],
+  );
+  await navigation.openOrganizationSection("Connections");
+
+  const discord = connections.card("Discord");
+  await expect(discord.getByRole("listitem")).toHaveCount(2);
+  for (const id of ["100", "200"]) {
+    const actions = discord.getByRole("button", { name: `Actions for Engineering, guild ${id}` });
+    await expect(actions).toBeVisible();
+    await actions.click();
+    await page.getByRole("menuitem", { name: "Revoke" }).click();
+    const dialog = page.getByRole("alertdialog", { name: `Revoke Engineering (guild ${id})?` });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+  }
+});
+
 test.describe("Slack authorization", () => {
   test.use({ providerScenario: "slack-only" });
 
