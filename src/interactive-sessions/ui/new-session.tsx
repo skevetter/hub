@@ -12,7 +12,6 @@ import { EmptyState } from "../../components/app/empty-state.js";
 import { FormField, type FieldControl } from "../../components/app/form-field.js";
 import { PageHeader, PageHeaderSkeleton } from "../../components/app/page.js";
 import { Section } from "../../components/app/section.js";
-import { SummaryPanel } from "../../components/app/summary-panel.js";
 import { Button } from "../../components/ui/button.js";
 import { useSnapshotQuery } from "../../queries/index.js";
 import { listSessionProfiles, startInteractiveSession, type ProfileView } from "../functions.js";
@@ -226,16 +225,16 @@ function CreateSessionForm({
     [navigate, organizationSlug, participants, profile, start],
   );
 
-  return (
-    <div className={compact ? "grid min-w-0 gap-4" : "grid min-w-0 max-w-2xl gap-6"}>
+  const form = (
+    <div className="grid min-w-0 gap-4">
       <ProfilesPicker
+        profile={profile}
         profiles={profiles}
         value={profileId || profile?.id || ""}
         onChange={select}
         compact={compact}
         disabled={busy}
       />
-      {compact || profile === undefined ? null : <ProfileSummary profile={profile} />}
       {profile?.mode === "full" ? (
         <WarningAlert title="Full access">
           This agent runs tools without asking. Controllers can use it to run commands on the
@@ -279,15 +278,23 @@ function CreateSessionForm({
       />
     </div>
   );
+  return compact ? form : <Card>{form}</Card>;
+}
+
+export function profileSentence(profile: Pick<ProfileView, "daemonSlug" | "cwd" | "provider">) {
+  const where = profile.daemonSlug ?? "an unavailable daemon";
+  return `Runs ${profile.provider} on ${where} in ${profile.cwd}.`;
 }
 
 function ProfilesPicker({
+  profile,
   profiles,
   value,
   onChange,
   compact,
   disabled,
 }: {
+  profile: ProfileView | undefined;
   profiles: readonly ProfileView[];
   value: string;
   onChange: (option: { value: string }) => void;
@@ -321,33 +328,10 @@ function ProfilesPicker({
     <FormField
       id={id}
       label="Profile"
-      {...(compact
-        ? {}
-        : {
-            description:
-              "A profile fixes the daemon, directory, harness, model and mode. An admin sets these up.",
-          })}
+      {...(compact || profile === undefined ? {} : { description: profileSentence(profile) })}
       disabled={disabled}
     >
       {picker}
     </FormField>
-  );
-}
-
-function ProfileSummary({ profile }: { profile: ProfileView }) {
-  const rows = useMemo(
-    () => [
-      { label: "Daemon", value: profile.daemonSlug ?? "Unavailable" },
-      { label: "Directory", value: <span className="font-mono">{profile.cwd}</span> },
-      { label: "Harness", value: profile.provider },
-      { label: "Model", value: profile.model ?? "Provider default" },
-      { label: "Mode", value: profile.mode ?? "Provider default" },
-    ],
-    [profile],
-  );
-  return (
-    <Section title="This session will use">
-      <SummaryPanel label="Session configuration" rows={rows} />
-    </Section>
   );
 }
