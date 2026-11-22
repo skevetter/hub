@@ -147,7 +147,9 @@ function appSurface(
       : [];
   });
   const matching =
-    listening.find(({ trigger }) => trigger.hasReplyOutput && trigger.commentPrefix !== null) ??
+    listening.find(
+      ({ trigger }) => trigger.hasReplyOutput && typeof trigger.commentPrefix === "string",
+    ) ??
     listening.find(({ trigger }) => trigger.hasReplyOutput) ??
     listening[0];
   if (matching === undefined) {
@@ -162,7 +164,7 @@ function appSurface(
   }
   const { trigger, comment } = matching;
   const { commentPrefix } = trigger;
-  if (commentPrefix === null) {
+  if (trigger.hasReplyOutput === true && typeof commentPrefix !== "string") {
     return {
       key: provider,
       label,
@@ -171,23 +173,16 @@ function appSurface(
       examples: [],
     };
   }
-  const targetExamples = comment.pullRequest ? GITHUB_PULL_REQUEST_EXAMPLES : LINEAR_EXAMPLES;
   const location = healthy.length === 1 ? ` in ${healthy[0]?.label ?? label}` : "";
   return {
     key: provider,
     label,
     where:
       trigger.hasReplyOutput === true
-        ? `${comment.action}${location} with one of these. ${trigger.name} decides which comments start an agent.`
+        ? `${comment.action}${location} with one of these where ${trigger.name} is configured to run.`
         : `${trigger.name} needs a reply output for the answer to appear on the ${comment.pullRequest ? "pull request" : "issue"}.`,
     examples:
-      commentPrefix === undefined
-        ? targetExamples
-        : targetExamples.map(({ title, description, prompt }) => ({
-            title,
-            description,
-            prompt: `${commentPrefix} ${prompt}`,
-          })),
+      typeof commentPrefix === "string" ? commentExamples(trigger.event, commentPrefix) : [],
   };
 }
 
@@ -206,4 +201,18 @@ const COMMENT_EVENTS = new Map<string, { action: string; pullRequest: boolean }>
 
 export function isTryCommentEvent(event: string): boolean {
   return COMMENT_EVENTS.has(event);
+}
+
+export function commentExamples(event: string, prefix: string): readonly TryExample[] {
+  const examples =
+    COMMENT_EVENTS.get(event)?.pullRequest === true
+      ? GITHUB_PULL_REQUEST_EXAMPLES
+      : LINEAR_EXAMPLES;
+  return prefix === ""
+    ? examples
+    : examples.map(({ title, description, prompt }) => ({
+        title,
+        description,
+        prompt: `${prefix} ${prompt}`,
+      }));
 }
