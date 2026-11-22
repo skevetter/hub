@@ -4,7 +4,6 @@ import { once } from "node:events";
 import type { Server } from "node:http";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { createStartHandler, defaultStreamHandler } from "@tanstack/react-start/server";
-import { createPostgresQueryRuntime } from "../../db/test-utils/runtime.js";
 import { dump } from "js-yaml";
 import { WebSocket, type RawData } from "ws";
 import { z } from "zod";
@@ -23,7 +22,8 @@ import {
   deriveAgentExecutionCompletionToken,
   hashAgentExecutionCompletionToken,
 } from "../../agent-executions/completion-token.js";
-import { createDatabase } from "../../db/test-utils/runtime.js";
+import { createDatabase, testDatabaseRuntime } from "../../db/test-utils/runtime.js";
+import { isolatedPostgresDatabase } from "../../db/test-utils/isolated-postgres.js";
 import type { ApiKeyScope } from "../../auth/api-key-contract.js";
 import type { OperationAuthenticator } from "../../auth/operation-auth.js";
 import type {
@@ -181,6 +181,7 @@ type FakeAgentRequest = z.infer<typeof ExecutionSessionRequestSchema>["message"]
 
 export class HubHarness {
   private postgres: StartedPostgreSqlContainer | undefined;
+  private isolatedDatabase: ReturnType<typeof isolatedPostgresDatabase> | undefined;
   private database: Database | undefined;
   private readonly entitlements = createUnlimitedEntitlementsService();
   private server: Server | undefined;
@@ -255,10 +256,10 @@ export class HubHarness {
   private authorityMintPermanentlyUnresolved = false;
   private executionAuthority!: ExecutionAuthority;
 
-  static async start(): Promise<HubHarness> {
+  static async start(postgres?: StartedPostgreSqlContainer): Promise<HubHarness> {
     const harness = new HubHarness();
     try {
-      await harness.startResources();
+      await harness.startResources(postgres);
       return harness;
     } catch (error) {
       await harness.stop();
@@ -353,9 +354,8 @@ export class HubHarness {
   }
 
   async seedSlackWorkspace(teamId: string, slug = "paseo"): Promise<string> {
-    if (this.postgres === undefined) throw new Error("Postgres is unavailable");
     const id = "00000000-0000-4000-8000-0000000000c1";
-    const client = await createPostgresQueryRuntime(this.postgres.getConnectionUri());
+    const client = testDatabaseRuntime(this.requireDatabase());
 
     await client.query(
       `insert into slack_connections
@@ -364,14 +364,12 @@ export class HubHarness {
        on conflict (team_id) do nothing`,
       [id, HUB_ORGANIZATION_ID, teamId, slug, JSON.stringify(["app_mentions:read", "chat:write"])],
     );
-    await client.close();
     return id;
   }
 
   async seedCurrentProjectResources(): Promise<string> {
     const slackId = await this.seedSlackWorkspace("paseo");
-    if (this.postgres === undefined) throw new Error("Postgres is unavailable");
-    const client = await createPostgresQueryRuntime(this.postgres.getConnectionUri());
+    const client = testDatabaseRuntime(this.requireDatabase());
 
     const githubId = "00000000-0000-4000-8000-0000000000c2";
     await client.query(
@@ -397,7 +395,6 @@ export class HubHarness {
        on conflict (connection_id, repository_id) do nothing`,
       [HUB_ORGANIZATION_ID, githubId],
     );
-    await client.close();
     return slackId;
   }
 
@@ -1358,6 +1355,10 @@ export class HubHarness {
       await this.database.close();
       this.database = undefined;
     }
+    if (this.isolatedDatabase) {
+      await this.isolatedDatabase.drop();
+      this.isolatedDatabase = undefined;
+    }
     if (this.postgres) {
       await this.postgres.stop();
       this.postgres = undefined;
@@ -1706,10 +1707,17 @@ export class HubHarness {
     return { first, second };
   }
 
-  private async startResources(): Promise<void> {
-    this.postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
-    this.database = await createDatabase(this.postgres.getConnectionUri());
-    const client = await createPostgresQueryRuntime(this.postgres.getConnectionUri());
+  private async startResources(postgres?: StartedPostgreSqlContainer): Promise<void> {
+    let databaseUrl: string;
+    if (postgres) {
+      this.isolatedDatabase = isolatedPostgresDatabase(postgres.getConnectionUri());
+      databaseUrl = this.isolatedDatabase.url;
+    } else {
+      this.postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
+      databaseUrl = this.postgres.getConnectionUri();
+    }
+    this.database = await createDatabase(databaseUrl);
+    const client = testDatabaseRuntime(this.database);
 
     await client.query(
       `insert into organization (id, name, slug) values ('org_1', 'Hub harness', 'hub-harness')`,
@@ -1741,7 +1749,6 @@ export class HubHarness {
        values ($1, $2, 'Default', $3, $4)`,
       [HUB_PROJECT_ID, HUB_ORGANIZATION_ID, HUB_PROJECT_SLUG, HUB_USER_ID],
     );
-    await client.close();
     const store = new ProjectConfigurationStore(this.database, HUB_PROJECT_ID);
     await this.database.issueEnrollmentToken({
       id: "00000000-0000-4000-8000-0000000000ee",
