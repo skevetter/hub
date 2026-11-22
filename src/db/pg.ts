@@ -101,6 +101,7 @@ import type {
   TransitionAgentExecutionResult,
   ProviderEventReceiptRecord,
   ProviderEventReplayMetadata,
+  OrganizationRunCount,
   OrganizationRunRecord,
   DroppedEventPageRequest,
   EnrollDaemonInput,
@@ -5244,6 +5245,21 @@ class PgDatabase implements Database {
       agent: launchedAgent(row.agent),
       payloadExpiredAt: row.payload_expired_at?.toISOString() ?? null,
     }));
+  }
+
+  async countOrganizationRunsSince(
+    organizationId: string,
+    since: Date,
+  ): Promise<OrganizationRunCount[]> {
+    const rows = await query<{ status: OrganizationRunCount["status"]; count: number }>(
+      this.pool,
+      `select status, count(*)::int as count
+       from trigger_runs
+       where organization_id = $1 and created_at >= $2
+       group by status`,
+      [organizationId, since],
+    );
+    return rows.rows.map(({ status, count }) => ({ status, count }));
   }
 
   listDroppedEventPage(organizationId: string, request: DroppedEventPageRequest) {
