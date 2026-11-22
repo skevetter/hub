@@ -61,3 +61,41 @@ it("holds an aborted in-flight slot until its read settles", async () => {
   await Promise.all([...running, next]);
   expect(nextStarted).toBe(true);
 });
+
+it("aborts and releases unresponsive reads at 15 seconds and accepts an explicit retry", async () => {
+  vi.useFakeTimers();
+  try {
+    const schedule = createProviderReadLimiter();
+    const work = Promise.withResolvers<void>();
+    const signals: AbortSignal[] = [];
+    const pending = Promise.allSettled(
+      Array.from({ length: 4 }, () =>
+        schedule(new AbortController().signal, (...args: AbortSignal[]) => {
+          signals.push(...args);
+          return work.promise;
+        }),
+      ),
+    );
+    const online = vi.fn(async () => "ready");
+    const queued = schedule(new AbortController().signal, online);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(online).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(online).toHaveBeenCalledTimes(1);
+    expect(signals).toHaveLength(4);
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    for (const result of await pending) {
+      expect(result).toMatchObject({
+        status: "rejected",
+        reason: { message: "This daemon did not answer." },
+      });
+    }
+    await expect(queued).resolves.toBe("ready");
+    const retry = vi.fn(async () => "retried");
+    await expect(schedule(new AbortController().signal, retry)).resolves.toBe("retried");
+    expect(retry).toHaveBeenCalledTimes(1);
+    work.resolve();
+  } finally {
+    vi.useRealTimers();
+  }
+});

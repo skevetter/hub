@@ -21,6 +21,7 @@ interface DeviceProfiles {
 interface DeviceProviders {
   labels: readonly string[];
   message: string | null;
+  onRetry?: () => void;
 }
 
 export function DaemonResults({
@@ -142,6 +143,15 @@ function ProviderNames({
   if (status === "offline")
     return <Quiet>Providers are available when this daemon connects.</Quiet>;
   if (providers === undefined) return <Quiet>Loading providers...</Quiet>;
+  if (providers.onRetry !== undefined)
+    return (
+      <div className="flex flex-wrap items-center gap-2">
+        <Quiet>{providers.message}</Quiet>
+        <Button type="button" variant="outline" size="xs" onClick={providers.onRetry}>
+          Try again
+        </Button>
+      </div>
+    );
   if (providers.labels.length > 0) return providers.labels.join(", ");
   return <Quiet>{providers.message ?? "No providers available."}</Quiet>;
 }
