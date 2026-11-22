@@ -226,22 +226,24 @@ function DaemonsContent({
           </span>
         )}
       </span>
-      <DaemonResults hasDaemons={daemons.length > 0} onClear={clear}>
-        {matches.map((daemon) => (
-          <ConnectedDaemonDevice
-            key={daemon.id}
-            daemon={daemon}
-            accountId={accountId}
-            organizationSlug={organizationSlug}
-            profiles={profiles}
-            canManage={canManage}
-            busy={busy}
-            onRename={onRename}
-            onRevoke={onRevoke}
-          />
-        ))}
-      </DaemonResults>
-      {daemons.length > 0 && canManage ? <ConnectAnotherDaemon /> : null}
+      <div className="grid min-w-0 gap-6">
+        <DaemonResults hasDaemons={daemons.length > 0} onClear={clear}>
+          {matches.map((daemon) => (
+            <ConnectedDaemonDevice
+              key={daemon.id}
+              daemon={daemon}
+              accountId={accountId}
+              organizationSlug={organizationSlug}
+              profiles={profiles}
+              canManage={canManage}
+              busy={busy}
+              onRename={onRename}
+              onRevoke={onRevoke}
+            />
+          ))}
+        </DaemonResults>
+        {daemons.length > 0 && canManage ? <ConnectAnotherDaemon /> : null}
+      </div>
     </>
   );
 }
