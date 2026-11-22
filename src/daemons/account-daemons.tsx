@@ -43,6 +43,12 @@ const DISABLED_FILTER_OPTIONS = FILTER_OPTIONS.map((option) => ({ ...option, dis
 const INITIAL_FILTERS = { search: "", status: "all" } as const;
 const EMPTY_PROFILE_NAMES: readonly DeviceProfileName[] = [];
 
+interface CompletedDaemonAction {
+  accountId: string;
+  organizationSlug: string;
+  daemonId: string;
+}
+
 export function DaemonsPanel({
   accountId,
   organizationId,
@@ -61,35 +67,47 @@ export function DaemonsPanel({
     queryKey,
     queryFn: () => loadDaemons({ data: { organizationSlug } }),
   });
+  const [completedAction, setCompletedAction] = useState<CompletedDaemonAction>();
+  const refreshAfterAction = useCallback(
+    async (
+      result: Result<DaemonCommand>,
+      {
+        data,
+      }: {
+        data: {
+          organizationSlug: string;
+          daemonId: string;
+        };
+      },
+    ) => {
+      if (result.status !== "ok") return;
+      if (result.data.state === "complete") {
+        await refreshDaemons(queryClient, accountId, organizationId);
+        setCompletedAction({
+          accountId,
+          organizationSlug: data.organizationSlug,
+          daemonId: data.daemonId,
+        });
+        return;
+      }
+      queryClient.removeQueries({ queryKey: daemonsQueryKey(accountId, organizationId) });
+      await queryClient.invalidateQueries({ queryKey: ["account"] });
+    },
+    [accountId, organizationId, queryClient],
+  );
   const rename = useMutation({
     mutationKey: DAEMON_MUTATION_KEY,
     mutationFn: useServerFn(renameDaemon) as (
       input: Parameters<typeof renameDaemon>[0],
     ) => Promise<Result<DaemonCommand>>,
-    onSuccess: async (result) => {
-      if (result.status !== "ok") return;
-      if (result.data.state === "complete") {
-        await refreshDaemons(queryClient, accountId, organizationId);
-        return;
-      }
-      queryClient.removeQueries({ queryKey });
-      await queryClient.invalidateQueries({ queryKey: ["account"] });
-    },
+    onSuccess: refreshAfterAction,
   });
   const revoke = useMutation({
     mutationKey: DAEMON_MUTATION_KEY,
     mutationFn: useServerFn(revokeDaemon) as (
       input: Parameters<typeof revokeDaemon>[0],
     ) => Promise<Result<DaemonCommand>>,
-    onSuccess: async (result) => {
-      if (result.status !== "ok") return;
-      if (result.data.state === "complete") {
-        await refreshDaemons(queryClient, accountId, organizationId);
-        return;
-      }
-      queryClient.removeQueries({ queryKey });
-      await queryClient.invalidateQueries({ queryKey: ["account"] });
-    },
+    onSuccess: refreshAfterAction,
   });
   const renameSelected = useCallback(
     async (daemonId: string, slug: string) => {
@@ -140,6 +158,12 @@ export function DaemonsPanel({
           accountId={accountId}
           organizationSlug={organizationSlug}
           showProfiles={showProfiles}
+          completedAction={
+            completedAction?.accountId === accountId &&
+            completedAction.organizationSlug === organizationSlug
+              ? completedAction
+              : undefined
+          }
           busy={busy}
           onRename={renameSelected}
           onRevoke={revokeSelected}
@@ -165,6 +189,7 @@ function DaemonsContent({
   accountId,
   organizationSlug,
   showProfiles,
+  completedAction,
   busy,
   onRename,
   onRevoke,
@@ -173,11 +198,12 @@ function DaemonsContent({
   accountId: string;
   organizationSlug: string;
   showProfiles: boolean;
+  completedAction: CompletedDaemonAction | undefined;
 }) {
   const searchId = useId();
   const [limitProviderReads] = useState(createProviderReadLimiter);
   const [filters, setFilters] = useState<DaemonsFilters>(INITIAL_FILTERS);
-  const [announcement, setAnnouncement] = useState<{ count: number; revision: number }>();
+  const [hasFiltered, setHasFiltered] = useState(false);
   const { daemons, canManage } = snapshot;
   const matches = filterDaemons(daemons, filters.search, filters.status);
   const profiles = useDeviceProfiles(
@@ -185,14 +211,10 @@ function DaemonsContent({
     accountId,
     organizationSlug,
   );
-  const apply = useCallback(
-    (next: DaemonsFilters) => {
-      const count = filterDaemons(daemons, next.search, next.status).length;
-      setFilters(next);
-      setAnnouncement((previous) => ({ count, revision: (previous?.revision ?? 0) + 1 }));
-    },
-    [daemons],
-  );
+  const apply = useCallback((next: DaemonsFilters) => {
+    setFilters(next);
+    setHasFiltered(true);
+  }, []);
   const search = useCallback(
     (value: string) => apply({ ...filters, search: value }),
     [apply, filters],
@@ -221,11 +243,9 @@ function DaemonsContent({
         />
       )}
       <span className="sr-only" role="status" aria-live="polite" aria-atomic="true">
-        {announcement === undefined ? null : (
-          <span key={announcement.revision}>
-            {announcement.count} {announcement.count === 1 ? "daemon" : "daemons"} shown
-          </span>
-        )}
+        {hasFiltered || completedAction !== undefined
+          ? `${matches.length} ${matches.length === 1 ? "daemon" : "daemons"} shown`
+          : null}
       </span>
       <div className="grid min-w-0 gap-6">
         <DaemonResults hasDaemons={daemons.length > 0} onClear={clear}>
