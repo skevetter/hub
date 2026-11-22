@@ -3,7 +3,12 @@ import { mkdir, mkdtemp, open, readFile, readdir, rm, stat } from "node:fs/promi
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
-import { isEntrypoint, printRunContext, repositoryFor } from "./test-context.mjs";
+import {
+  isEntrypoint,
+  passedVitestReport,
+  printRunContext,
+  repositoryFor,
+} from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
 import { runWorkerGroup, takeFullSuiteLock, watchTestSignals } from "./test-worker-group.mjs";
 
@@ -242,9 +247,12 @@ export async function executeFiles(root, name, files, runDirectory, signal, invo
     .filter(({ status }) => status === "failed")
     .map(({ name }) => relative(root, name))
     .filter((file) => expected.has(file));
+  const passed = passedVitestReport(report);
   const exitCode =
-    run.exitCode || Number(!report.success || missing.length > 0 || extra.length > 0);
+    run.exitCode || Number(!passed || signal.aborted || missing.length > 0 || extra.length > 0);
   const diagnostics = [];
+  if (!passed && !run.exitCode && !signal.aborted)
+    diagnostics.push("Vitest JSON report did not show a completed passing run.");
   if (run.exitCode)
     diagnostics.push(
       `Vitest process failed (exit ${run.exitCode}, ${run.processError ?? "no signal"}).`,

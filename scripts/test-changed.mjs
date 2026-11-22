@@ -6,7 +6,14 @@ import { join, posix, relative, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { generateRuntimeMap } from "./generate-test-runtime-files.mjs";
-import { git, isEntrypoint, printRunContext, repositoryFor, requireGit } from "./test-context.mjs";
+import {
+  git,
+  isEntrypoint,
+  passedVitestReport,
+  printRunContext,
+  repositoryFor,
+  requireGit,
+} from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
 import { takeFullSuiteLock, waitForTestGroup, watchTestSignals } from "./test-worker-group.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
@@ -289,23 +296,27 @@ async function selectedVitest(supervisor, root, args, reportPath, env) {
       env,
     },
   );
+  let report;
   try {
-    const report = JSON.parse(await readFile(reportPath, "utf8"));
-    return {
-      code,
-      counts: {
-        passed: report.numPassedTests,
-        failed: report.numFailedTests,
-        skipped: report.numTotalTests - report.numPassedTests - report.numFailedTests,
-      },
-      files: report.testResults.map((result) => ({
-        path: repoPath(root, result.name),
-        failed: result.status === "failed",
-      })),
-    };
+    report = JSON.parse(await readFile(reportPath, "utf8"));
+    if (!Array.isArray(report?.testResults)) throw new SyntaxError("missing testResults");
   } catch (error) {
     throw new Error("Vitest exited without a readable test report.", { cause: error });
   }
+  if (code === 0 && !passedVitestReport(report))
+    throw new Error("Vitest JSON report did not show a completed passing run.");
+  return {
+    code,
+    counts: {
+      passed: report.numPassedTests,
+      failed: report.numFailedTests,
+      skipped: report.numTotalTests - report.numPassedTests - report.numFailedTests,
+    },
+    files: report.testResults.map((result) => ({
+      path: repoPath(root, result.name),
+      failed: result.status === "failed",
+    })),
+  };
 }
 
 function printTests(result, reason) {
