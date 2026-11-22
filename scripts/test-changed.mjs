@@ -1,15 +1,5 @@
 import { spawn } from "node:child_process";
-import {
-  access,
-  cp,
-  mkdir,
-  mkdtemp,
-  readFile,
-  realpath,
-  rm,
-  stat,
-  symlink,
-} from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, posix, relative, sep } from "node:path";
@@ -18,7 +8,12 @@ import { parseArgs } from "node:util";
 import { generateRuntimeMap } from "./generate-test-runtime-files.mjs";
 import { git, isEntrypoint, printRunContext, repositoryFor, requireGit } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
-import { fullSuiteLockPath, stopGroup, testSignals } from "./test-worker-group.mjs";
+import {
+  fullSuiteLockHeld,
+  fullSuiteLockPath,
+  stopGroup,
+  testSignals,
+} from "./test-worker-group.mjs";
 import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 
 const routeTree = "src/routeTree.gen.ts";
@@ -329,14 +324,8 @@ async function resolveTestPlan(root, changes, present, safe, temp) {
   }
 }
 
-async function requireFullSuiteIdle() {
-  try {
-    await access(fullSuiteLockPath);
-  } catch (error) {
-    if (error.code === "ENOENT") return;
-    throw error;
-  }
-  throw new Error(`The full-suite lock is held at ${fullSuiteLockPath}.`);
+function requireFullSuiteIdle() {
+  if (fullSuiteLockHeld()) throw new Error(`The full-suite lock is held at ${fullSuiteLockPath}.`);
 }
 
 async function selectedVitest(supervisor, root, args, reportPath, env) {
@@ -408,7 +397,7 @@ async function main() {
         `FULL VITEST SUITE selected for ${plan.fullSuiteReason}. Handing off to the parallel runner with the full-suite lock.`,
       );
     } else {
-      await requireFullSuiteIdle();
+      requireFullSuiteIdle();
     }
 
     let code = 0;

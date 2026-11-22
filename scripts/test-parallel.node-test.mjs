@@ -18,7 +18,7 @@ import {
   runShards,
   shardEnvironment,
 } from "./test-parallel.mjs";
-import { runWorkerGroup, takeFullSuiteLock } from "./test-worker-group.mjs";
+import { fullSuiteLockHeld, runWorkerGroup, takeFullSuiteLock } from "./test-worker-group.mjs";
 
 test("partition puts each file in one shard and balances cached durations", () => {
   const files = [
@@ -402,4 +402,37 @@ test("a launched shard receives the isolated data paths and caller's Mise instal
     TMPDIR: shard,
     XDG_DATA_HOME: join(shard, "data"),
   });
+});
+
+test("reruns see a lock as held only while its owner or recorded groups run", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hub-held-lock-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const path = join(directory, "lock");
+  assert.equal(fullSuiteLockHeld(path), false);
+
+  const lock = await takeFullSuiteLock(path, () => {});
+  assert.equal(fullSuiteLockHeld(path), true);
+  lock.release();
+
+  const exited = spawn(process.execPath, ["-e", ""]);
+  await once(exited, "exit");
+  const owner = { pid: exited.pid, startTime: "Thu Jan  1 00:00:00 1970", groups: [] };
+  await writeFile(path, JSON.stringify(owner));
+  assert.equal(fullSuiteLockHeld(path), false);
+
+  const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    detached: true,
+    stdio: "ignore",
+  });
+  t.after(() => {
+    if (worker.exitCode === null) worker.kill("SIGKILL");
+  });
+  await writeFile(
+    path,
+    JSON.stringify({ ...owner, groups: [{ pid: worker.pid, startTime: "unknown" }] }),
+  );
+  assert.equal(fullSuiteLockHeld(path), true);
+  worker.kill("SIGKILL");
+  await once(worker, "exit");
+  assert.equal(fullSuiteLockHeld(path), false);
 });
