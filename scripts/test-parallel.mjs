@@ -12,6 +12,8 @@ import {
 import { publishTestMetrics } from "./test-receipt.mjs";
 import { runWorkerGroup, takeFullSuiteLock, watchTestSignals } from "./test-worker-group.mjs";
 
+const failedListVersion = 1;
+
 export function partitionFiles(files, count) {
   const shardCount = Math.min(count, files.length);
   const ideal = files.reduce((sum, file) => sum + file.weight, 0) / shardCount;
@@ -78,8 +80,11 @@ export async function runShards(groups, { execute, print, signal }) {
       continue;
     }
     const result = outcome.value;
-    if (result.exitCode !== 0) exitCode = 1;
-    failedFiles.push(...result.failedFiles);
+    if (result.exitCode !== 0) {
+      exitCode = 1;
+      // The report cannot always attribute a process failure to an individual file.
+      failedFiles.push(...groups[index]);
+    }
     interruptedFiles += result.interruptedFiles ?? 0;
     for (const key of ["passed", "failed", "skipped"]) total[key] += result.counts[key];
   }
@@ -306,10 +311,16 @@ function writeJson(target, data) {
 
 async function readFailedFiles(failedFileList, files) {
   const recorded = await readFile(failedFileList, "utf8").catch((error) => {
-    if (error.code === "ENOENT") return "[]";
+    if (error.code === "ENOENT") return null;
     throw error;
   });
-  const failed = JSON.parse(recorded);
+  if (recorded === null) throw new Error("The last parallel run recorded no failed files.");
+  const failure = JSON.parse(recorded);
+  if (failure?.version !== failedListVersion || !Array.isArray(failure.files))
+    throw new Error(
+      "The failed-file list uses an unsupported format. Run the parallel suite again.",
+    );
+  const failed = failure.files;
   if (failed.length === 0) throw new Error("The last parallel run recorded no failed files.");
   const discovered = new Set(files);
   if (failed.some((file) => !discovered.has(file))) {
@@ -414,7 +425,8 @@ async function main(signal) {
     console.log(
       `Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`,
     );
-    if (result.failedFiles.length) writeJson(failedFileList, result.failedFiles);
+    if (result.failedFiles.length)
+      writeJson(failedFileList, { version: failedListVersion, files: result.failedFiles });
     if (result.exitCode === 0 && !signal.aborted) {
       const timings = await collectTimings(runDirectory, groups.length);
       await publishSuccess(timings);
