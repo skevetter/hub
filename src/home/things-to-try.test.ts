@@ -18,10 +18,13 @@ describe("things to try", () => {
       ["linear", "github"],
     );
     assert.deepEqual(
-      thingsToTry({
-        ...nothing,
-        sessions: { profiles: 0, open: 0, openCapped: false, started: false },
-      }).map(({ key }) => key),
+      thingsToTry(
+        {
+          ...nothing,
+          sessions: { open: 0, openCapped: false, started: false },
+        },
+        0,
+      ).map(({ key }) => key),
       ["linear", "github", "sessions"],
     );
   });
@@ -133,20 +136,20 @@ describe("things to try", () => {
   });
 
   it("points a session at a profile first, then at a new session", () => {
-    const sessions = { profiles: 0, open: 0, openCapped: false, started: false };
-    assert.deepEqual(thingsToTry({ ...nothing, sessions })[2]?.next, {
+    const sessions = { open: 0, openCapped: false, started: false };
+    assert.deepEqual(thingsToTry({ ...nothing, sessions }, 0, true)[2]?.next, {
       label: "Create a profile",
       path: "sessions/profiles",
     });
-    assert.deepEqual(thingsToTry({ ...nothing, sessions: { ...sessions, profiles: 2 } })[2]?.next, {
+    assert.deepEqual(thingsToTry({ ...nothing, sessions }, 2)[2]?.next, {
       label: "New session",
       path: "sessions/new",
     });
   });
 
   it("gives every surface three prompts that need nothing filled in", () => {
-    const sessions = { profiles: 1, open: 0, openCapped: false, started: false };
-    for (const surface of thingsToTry({ ...nothing, sessions })) {
+    const sessions = { open: 0, openCapped: false, started: false };
+    for (const surface of thingsToTry({ ...nothing, sessions }, 1)) {
       assert.equal(surface.examples.length, 3);
       for (const { prompt } of surface.examples) assert.doesNotMatch(prompt, /[<>{}[\]]/u);
     }

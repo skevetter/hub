@@ -18,7 +18,7 @@ export type ChecklistStep =
   | { key: "trigger"; state: "done" | "pending" }
   | { key: "run"; state: "done" | "pending" }
   /** A session profile exists: the daemon, folder and agent a session starts from. */
-  | { key: "profile"; state: "done" | "pending" }
+  | { key: "profile"; state: "done" | "pending" | "checking" | "unavailable" }
   /** The reader started or participates in a session. */
   | { key: "session"; state: "done" | "pending" };
 
@@ -27,6 +27,8 @@ export interface Checklist {
   completed: number;
   complete: boolean;
 }
+
+export type ProfileAvailability = number | "checking" | "unavailable" | null;
 
 export type ChecklistFacts = Pick<
   HomeSnapshot,
@@ -62,7 +64,10 @@ export function canFinishSetup(
  * because a session needs nothing else, and the session steps come before the app: talking to an
  * agent is the shortest way to see Hub work.
  */
-export function deriveChecklist(snapshot: ChecklistFacts): Checklist {
+export function deriveChecklist(
+  snapshot: ChecklistFacts,
+  profiles: ProfileAvailability = null,
+): Checklist {
   const app: ChecklistStep = { key: "app", state: appState(snapshot) };
   const daemon: ChecklistStep = { key: "daemon", state: daemonState(snapshot) };
   const automation: ChecklistStep[] = [
@@ -70,12 +75,17 @@ export function deriveChecklist(snapshot: ChecklistFacts): Checklist {
     { key: "run", state: snapshot.runs.length > 0 ? "done" : "pending" },
   ];
   const { sessions } = snapshot;
+  const profile: ChecklistStep[] = [];
+  if (profiles !== null) {
+    const counted = profiles === 0 ? "pending" : "done";
+    profile.push({ key: "profile", state: typeof profiles === "number" ? counted : profiles });
+  }
   const steps: ChecklistStep[] =
     sessions === null
       ? [app, daemon, ...automation]
       : [
           daemon,
-          { key: "profile", state: sessions.profiles > 0 ? "done" : "pending" },
+          ...profile,
           { key: "session", state: sessions.started ? "done" : "pending" },
           app,
           ...automation,

@@ -85,13 +85,21 @@ export function NewSessionPanel({
   );
 }
 
+export function sessionProfileQueryOptions(
+  organizationSlug: string,
+  accountId: string,
+  list: (input: { data: { organizationSlug: string } }) => ReturnType<typeof listSessionProfiles>,
+) {
+  return {
+    queryKey: ["session-profiles", organizationSlug, accountId],
+    queryFn: () => list({ data: { organizationSlug } }),
+  };
+}
+
 export function HomeSessionStart({ organizationSlug }: { organizationSlug: string }) {
   const list = useServerFn(listSessionProfiles);
   const accountId = useActiveAccount().account.id;
-  const profiles = useSnapshotQuery({
-    queryKey: ["session-profiles", organizationSlug, accountId],
-    queryFn: () => list({ data: { organizationSlug } }),
-  });
+  const profiles = useSnapshotQuery(sessionProfileQueryOptions(organizationSlug, accountId, list));
   const active = useMemo(
     () =>
       Array.isArray(profiles.data) ? profiles.data.filter(({ status }) => status === "active") : [],
