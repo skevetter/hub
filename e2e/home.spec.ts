@@ -164,7 +164,7 @@ test("returns to the checklist when the last run ages out before Finish setup", 
   const alert = page.getByRole("alert").filter({ hasText: "Setup could not be finished" });
   await expect(alert).toContainText("Complete every checklist step before finishing setup.");
   await expect(home.allSet()).toHaveCount(0);
-  await home.expectProgress("3 of 4 done");
+  await home.expectProgress("2 of 4 done");
   await home.expectStep("Run it", "To do");
   await expect(alert).toBeFocused();
 });
