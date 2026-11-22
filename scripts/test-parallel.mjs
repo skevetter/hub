@@ -395,7 +395,7 @@ async function main() {
         execute,
         console.log,
       );
-      if (exitCode === 0) await publishTestMetrics(runs);
+      if (exitCode === 0) await publishTestMetrics(runs, [], root);
       return exitCode;
     }
     await rm(failedFileList, { force: true });
@@ -414,7 +414,7 @@ async function main() {
     if (result.failedFiles.length) await writeJson(failedFileList, result.failedFiles);
     if (exitCode === 0) {
       await updateTimingCache(parallelCache, runDirectory, groups.length);
-      await publishTestMetrics(runs);
+      await publishTestMetrics(runs, [], root);
     } else {
       console.log(`Run logs: ${runDirectory}`);
     }
