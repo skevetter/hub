@@ -4005,6 +4005,8 @@ class HubUser {
     const organization = this.page.getByRole("button", { name: "Organization" });
 
     await this.page.keyboard.press("Tab");
+    await expect(this.page.getByRole("link", { name: "Skip to content" })).toBeFocused();
+    await this.page.keyboard.press("Tab");
     await expect(organization).toBeFocused();
     await this.tabThroughOrganizationDestinations();
     await this.tabThroughSidebarFooter();
@@ -4033,6 +4035,8 @@ class HubUser {
     const invite = this.page.getByRole("button", { name: "Invite member" });
     await expect(invite).toBeVisible();
 
+    await this.page.keyboard.press("Tab");
+    await expect(this.page.getByRole("link", { name: "Skip to content" })).toBeFocused();
     await this.page.keyboard.press("Tab");
     await expect(organization).toBeFocused();
     await this.tabThroughOrganizationDestinations();
@@ -4072,6 +4076,8 @@ class HubUser {
     await this.page.goto(this.origin);
     await expect(this.page.getByRole("heading", { name: "Home" })).toBeVisible();
     const trigger = this.page.getByRole("button", { name: "Toggle Sidebar" });
+    await this.page.keyboard.press("Tab");
+    await expect(this.page.getByRole("link", { name: "Skip to content" })).toBeFocused();
     await this.page.keyboard.press("Tab");
     await expect(trigger).toBeFocused();
     await this.page.keyboard.press("Enter");
