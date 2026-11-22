@@ -70,7 +70,7 @@ export class OrganizationHome {
 
   nudge(): Locator {
     return this.page
-      .getByRole("alert")
+      .locator('[data-slot="alert"]')
       .filter({ hasText: "Events arrived without a route or matching trigger" });
   }
 
