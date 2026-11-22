@@ -1,0 +1,76 @@
+import assert from "node:assert/strict";
+import { describe, it } from "vitest";
+
+import { thingsToTry } from "./things-to-try.js";
+
+const nothing = { connections: [], triggers: [], sessions: null };
+const linear = {
+  provider: "linear" as const,
+  slug: "acme",
+  label: "Acme",
+  needsAuthorization: false,
+};
+
+describe("things to try", () => {
+  it("offers Linear and GitHub, and sessions only while the feature is on", () => {
+    assert.deepEqual(
+      thingsToTry(nothing).map(({ key }) => key),
+      ["linear", "github"],
+    );
+    assert.deepEqual(
+      thingsToTry({
+        ...nothing,
+        sessions: { profiles: 0, open: 0, openCapped: false, started: false },
+      }).map(({ key }) => key),
+      ["linear", "github", "sessions"],
+    );
+  });
+
+  it("sends the reader to connect an app that is not connected", () => {
+    const [surface] = thingsToTry(nothing);
+    assert.deepEqual(surface?.next, { label: "Connect Linear", path: "connections" });
+    assert.match(surface?.where ?? "", /not connected yet/u);
+  });
+
+  it("sends the reader to create a trigger when nothing enabled listens to the app", () => {
+    const paused = { id: "t", name: "triage", event: "linear.comment_created", enabled: false };
+    const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers: [paused] });
+    assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new" });
+    assert.match(surface?.where ?? "", /Acme is connected/u);
+  });
+
+  it("names the workspace and the trigger once both exist, and asks for nothing more", () => {
+    const trigger = { id: "t", name: "triage", event: "linear.comment_created", enabled: true };
+    const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers: [trigger] });
+    assert.equal(surface?.next, undefined);
+    assert.match(surface?.where ?? "", /Comment on an issue in Acme/u);
+    assert.match(surface?.where ?? "", /triage decides/u);
+  });
+
+  it("does not count a GitHub notification trigger as listening to repository comments", () => {
+    const github = { ...linear, provider: "github" as const };
+    const inbox = { id: "t", name: "inbox", event: "github.notification", enabled: true };
+    const surface = thingsToTry({ ...nothing, connections: [github], triggers: [inbox] })[1];
+    assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new" });
+  });
+
+  it("points a session at a profile first, then at a new session", () => {
+    const sessions = { profiles: 0, open: 0, openCapped: false, started: false };
+    assert.deepEqual(thingsToTry({ ...nothing, sessions })[2]?.next, {
+      label: "Create a profile",
+      path: "sessions/profiles",
+    });
+    assert.deepEqual(thingsToTry({ ...nothing, sessions: { ...sessions, profiles: 2 } })[2]?.next, {
+      label: "New session",
+      path: "sessions/new",
+    });
+  });
+
+  it("gives every surface three prompts that need nothing filled in", () => {
+    const sessions = { profiles: 1, open: 0, openCapped: false, started: false };
+    for (const surface of thingsToTry({ ...nothing, sessions })) {
+      assert.equal(surface.examples.length, 3);
+      for (const { prompt } of surface.examples) assert.doesNotMatch(prompt, /[<>{}[\]]/u);
+    }
+  });
+});

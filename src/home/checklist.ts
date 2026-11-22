@@ -17,7 +17,11 @@ export type ChecklistStep =
       state: "done" | "pending" | "cannotRun";
     }
   | { key: "trigger"; state: "done" | "pending" }
-  | { key: "run"; state: "done" | "pending" };
+  | { key: "run"; state: "done" | "pending" }
+  /** A session profile exists: the daemon, folder and agent a session starts from. */
+  | { key: "profile"; state: "done" | "pending" }
+  /** The reader has taken part in a session. */
+  | { key: "session"; state: "done" | "pending" };
 
 export interface Checklist {
   steps: readonly ChecklistStep[];
@@ -27,7 +31,7 @@ export interface Checklist {
 
 export type ChecklistFacts = Pick<
   HomeSnapshot,
-  "appsConfigured" | "connections" | "daemons" | "triggers" | "runs"
+  "appsConfigured" | "connections" | "daemons" | "triggers" | "runs" | "sessions"
 >;
 
 function appState(snapshot: ChecklistFacts): Extract<ChecklistStep, { key: "app" }>["state"] {
@@ -40,13 +44,29 @@ function daemonState(snapshot: ChecklistFacts): Extract<ChecklistStep, { key: "d
   return snapshot.daemons.length > 0 ? "cannotRun" : "pending";
 }
 
+/**
+ * With sessions off the list is the four automation steps. With sessions on the daemon leads,
+ * because a session needs nothing else, and the session steps come before the app: talking to an
+ * agent is the shortest way to see Hub work.
+ */
 export function deriveChecklist(snapshot: ChecklistFacts): Checklist {
-  const steps: ChecklistStep[] = [
-    { key: "app", state: appState(snapshot) },
-    { key: "daemon", state: daemonState(snapshot) },
+  const app: ChecklistStep = { key: "app", state: appState(snapshot) };
+  const daemon: ChecklistStep = { key: "daemon", state: daemonState(snapshot) };
+  const automation: ChecklistStep[] = [
     { key: "trigger", state: snapshot.triggers.length > 0 ? "done" : "pending" },
     { key: "run", state: snapshot.runs.length > 0 ? "done" : "pending" },
   ];
+  const { sessions } = snapshot;
+  const steps: ChecklistStep[] =
+    sessions === null
+      ? [app, daemon, ...automation]
+      : [
+          daemon,
+          { key: "profile", state: sessions.profiles > 0 ? "done" : "pending" },
+          { key: "session", state: sessions.started ? "done" : "pending" },
+          app,
+          ...automation,
+        ];
   const completed = steps.filter((step) => step.state === "done").length;
   return { steps, completed, complete: completed === steps.length };
 }
