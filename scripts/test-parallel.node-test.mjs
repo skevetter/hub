@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { partitionFiles, rerunFiles, runShards } from "./test-parallel.mjs";
+import { executeFiles, partitionFiles, rerunFiles, runShards } from "./test-parallel.mjs";
 
 test("partition puts each file in one shard and balances cached durations", () => {
   const files = [
@@ -72,7 +75,7 @@ test("failure reporting keeps shard numbers and reruns only failed files in one 
   assert.match(output.join("\n"), /Serial rerun: PASS/u);
 });
 
-test("a process failure with no named failed files has no serial rerun", async () => {
+test("a process failure with no named failed files offers to rerun the incomplete shard", async () => {
   const output = [];
   const result = await runShards([["a.test.ts"]], {
     execute: async () => ({
@@ -85,9 +88,10 @@ test("a process failure with no named failed files has no serial rerun", async (
     print: (line) => output.push(line),
   });
 
-  assert.deepEqual(result, { exitCode: 1, failedFiles: [] });
+  assert.deepEqual(result, { exitCode: 1, failedFiles: ["a.test.ts"] });
   assert.match(output.join("\n"), /Shard 1: FAIL.*\n.*Vitest exited before writing a JSON report/u);
-  assert.doesNotMatch(output.join("\n"), /--rerun-failed/u);
+  assert.match(output.join("\n"), /Total: 1 files, 0 passed, 1 failed/u);
+  assert.match(output.join("\n"), /--rerun-failed/u);
 });
 
 test("a shard runner error does not release the caller before sibling shards finish", async () => {
@@ -117,5 +121,41 @@ test("a shard runner error does not release the caller before sibling shards fin
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(finished, false);
   sibling.resolve();
-  assert.deepEqual(await outcome, { exitCode: 1, failedFiles: [] });
+  assert.deepEqual(await outcome, { exitCode: 1, failedFiles: ["a.test.ts"] });
+});
+
+test("a worker that exits mid-run lists every missing file for serial rerun", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hub-fake-shard-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const output = [];
+  const invoke = async ([, , outputArg, completed, pending], shardDir) => {
+    await mkdir(shardDir);
+    const file = outputArg.slice("--outputFile=".length);
+    const report = {
+      success: true,
+      numTotalTests: 3,
+      numPassedTests: 2,
+      numFailedTests: 0,
+      testResults: [
+        { name: completed, status: "passed", assertionResults: [{ status: "passed" }] },
+        { name: pending, status: "passed", assertionResults: [{ status: "pending" }] },
+      ],
+    };
+    const worker = spawnSync(process.execPath, [
+      "-e",
+      "require('node:fs').writeFileSync(process.argv[1], process.argv[2]); process.kill(process.pid, 'SIGKILL')",
+      file,
+      JSON.stringify(report),
+    ]);
+    return { exitCode: worker.status ?? 1, processError: worker.signal };
+  };
+  const files = ["done.test.ts", "lost.test.ts", "later.test.ts"];
+  const result = await runShards([files], {
+    execute: (name, selected) =>
+      executeFiles(name, selected, directory, new AbortController().signal, invoke),
+    print: (line) => output.push(line),
+  });
+  assert.deepEqual(result, { exitCode: 1, failedFiles: ["lost.test.ts", "later.test.ts"] });
+  assert.match(output.join("\n"), /Shard 1:.*SIGKILL/u);
+  assert.match(output.join("\n"), /Total: 3 files, 2 passed, 2 failed, 0 skipped/u);
 });
