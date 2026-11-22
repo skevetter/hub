@@ -143,6 +143,25 @@ describe("organization checklist completion", () => {
     }
   });
 
+  it("names only the expired run when both optional session steps are open", async () => {
+    const { ownerId, post, slug, runtime } = fixture;
+    const dashboard = fixture.sessionsDashboard(ownerId);
+    app.homeDashboard = dashboard;
+    await fixture.recordRun({ authorizedConnection: true });
+    const before = await dashboard.snapshot(post(), slug);
+    const open = deriveChecklist(before, 0).steps.filter(({ state }) => state !== "done");
+    assert.deepEqual(
+      open.map(({ key }) => key),
+      ["profile", "session"],
+    );
+
+    await runtime.query("update trigger_runs set created_at = now() - interval '8 days'");
+    assert.deepEqual(await finish(post(), slug), {
+      status: "error",
+      error: { message: "Complete the remaining organization step to finish setup. Record a run." },
+    });
+  });
+
   it("requires an Origin header even when the Referer matches, including on replay", async () => {
     await fixture.recordRun();
     const refererOnly = fixture.post();
@@ -179,7 +198,10 @@ describe("organization checklist completion", () => {
     const { post, slug, runtime } = fixture;
     assert.deepEqual(await finish(post(), slug), {
       status: "error",
-      error: { message: "Complete every checklist step before finishing setup." },
+      error: {
+        message:
+          "Complete the remaining organization steps to finish setup. Connect an app, Enroll a daemon, Create a trigger, Record a run.",
+      },
     });
     await fixture.recordRun();
     await runtime.query(

@@ -1,5 +1,6 @@
 import { expect } from "@playwright/test";
 import { test as browserTest } from "./app.js";
+import { OrganizationHome } from "./helpers/home.js";
 import { OrganizationTriggers } from "./helpers/triggers.js";
 
 const test = browserTest.extend<{ sessionRuntime: void }>({
@@ -125,6 +126,45 @@ run:
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
   await page.getByRole("link", { name: "Open trigger" }).click();
   await expect(page.getByRole("heading", { name, level: 1 })).toBeVisible();
+});
+
+test("Home names the expired run as the only remaining setup step", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.connectGitHub("owner");
+  const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  const triggers = new OrganizationTriggers(page);
+  await triggers.open();
+  await triggers.startNew();
+  await triggers.configureManual({
+    name: "deploy",
+    daemon,
+    cwd: "/workspace",
+    agent: "codex/gpt-5.4",
+    mode: "full-access",
+    thinking: "high",
+    prompt: "Run it.",
+  });
+  await triggers.save("deploy");
+  await hub.seedTriggerRun("deploy", { minutesAgo: 1, status: "succeeded" });
+  await hub.grantOperator("owner");
+  const home = new OrganizationHome(page);
+  await home.open();
+  const checklist = page.getByRole("list", { name: "Getting started" });
+  for (const title of ["Create a session profile", "Start a session"]) {
+    await expect(checklist.getByRole("listitem").filter({ hasText: title })).toContainText("To do");
+  }
+
+  await hub
+    .primaryApplication()
+    .query("update trigger_runs set created_at = now() - interval '8 days'");
+  await expect(home.finishSetup()).toBeVisible();
+  await home.finishSetup().press("Enter");
+  const alert = page.getByRole("alert").filter({ hasText: "Setup could not be finished" });
+  await expect(alert).toContainText(
+    "Complete the remaining organization step to finish setup. Record a run.",
+  );
+  await expect(alert).toBeFocused();
 });
 
 test("Home gets the profile step and session form from one fetch", async ({ hub, page }) => {

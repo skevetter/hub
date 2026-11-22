@@ -42,6 +42,7 @@ import { LIST_PROVIDER_LABELS } from "../triggers/list-providers.js";
 import {
   canFinishSetup,
   deriveChecklist,
+  SETUP_STEP_TITLES,
   type Checklist as ChecklistState,
   type ChecklistStep,
   type ProfileAvailability,
@@ -717,7 +718,7 @@ function appStep(
   base: string,
   operator: boolean,
 ): StepPresentation {
-  const title = "Connect an app";
+  const title = SETUP_STEP_TITLES.app;
   const unauthorized = snapshot.connections.filter(({ needsAuthorization }) => needsAuthorization);
   const names = unauthorized.map(({ label }) => label).join(", ");
   const authorizationHint =
@@ -768,7 +769,7 @@ function daemonStep(
   snapshot: HomeSnapshot,
   origin: string | undefined,
 ): StepPresentation {
-  const title = "Enroll a daemon";
+  const title = SETUP_STEP_TITLES.daemon;
   if (state === "done") {
     const able = snapshot.daemons.filter(({ canExecute }) => canExecute);
     const connected = able.filter(({ presence }) => presence === "connected").length;
@@ -801,7 +802,7 @@ function triggerStep(
   snapshot: HomeSnapshot,
   base: string,
 ): StepPresentation {
-  const title = "Create a trigger";
+  const title = SETUP_STEP_TITLES.trigger;
   if (state === "done") {
     return {
       title,
@@ -826,7 +827,7 @@ function runStep(
   snapshot: HomeSnapshot,
   base: string,
 ): StepPresentation {
-  const title = "Record a run";
+  const title = SETUP_STEP_TITLES.run;
   const latest = snapshot.runs[0];
   if (state === "done" && latest !== undefined) {
     return {

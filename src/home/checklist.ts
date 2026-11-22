@@ -48,15 +48,29 @@ function daemonState(
   return snapshot.daemons.length > 0 ? "cannotRun" : "pending";
 }
 
-export function canFinishSetup(
-  snapshot: Pick<ChecklistFacts, "connections" | "daemons" | "triggers" | "runs">,
-): boolean {
-  return (
-    snapshot.connections.length > 0 &&
-    daemonState(snapshot) === "done" &&
-    snapshot.triggers.length > 0 &&
-    snapshot.runs.length > 0
-  );
+export const SETUP_INCOMPLETE = "checklist_incomplete";
+
+export const SETUP_STEP_TITLES = {
+  app: "Connect an app",
+  daemon: "Enroll a daemon",
+  trigger: "Create a trigger",
+  run: "Record a run",
+} as const;
+
+type SetupFacts = Pick<ChecklistFacts, "connections" | "daemons" | "triggers" | "runs">;
+
+export function incompleteSetupStepTitles(snapshot: SetupFacts): readonly string[] {
+  const steps = [
+    { title: SETUP_STEP_TITLES.app, done: snapshot.connections.length > 0 },
+    { title: SETUP_STEP_TITLES.daemon, done: daemonState(snapshot) === "done" },
+    { title: SETUP_STEP_TITLES.trigger, done: snapshot.triggers.length > 0 },
+    { title: SETUP_STEP_TITLES.run, done: snapshot.runs.length > 0 },
+  ];
+  return steps.filter(({ done }) => !done).map(({ title }) => title);
+}
+
+export function canFinishSetup(snapshot: SetupFacts): boolean {
+  return incompleteSetupStepTitles(snapshot).length === 0;
 }
 
 /**
