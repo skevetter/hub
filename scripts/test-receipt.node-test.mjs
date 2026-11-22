@@ -31,7 +31,7 @@ async function gitFixture(t) {
   await writeFile(join(directory, ".gitignore"), ".test-receipts/\n");
   git("add", ".gitignore");
   git("commit", "--quiet", "-m", "Initialize fixture");
-  return { directory, head: git("rev-parse", "HEAD") };
+  return { directory, git, head: git("rev-parse", "HEAD") };
 }
 
 test("records command, selected files and counts on a clean commit", async (t) => {
@@ -107,4 +107,43 @@ test("a successful process cannot record a report containing failed tests", asyn
     /failing test metrics/u,
   );
   await assert.rejects(verifyReceipt(directory, head), /No test receipt exists/u);
+});
+
+test("rejects edited commands, copied commits, and modified log files", async (t) => {
+  const { directory, head, git } = await gitFixture(t);
+  const { path } = await recordTestRun(
+    directory,
+    [process.execPath, "-e", "console.log('output')"],
+    {
+      stdio: "ignore",
+    },
+  );
+  const original = JSON.parse(await readFile(path, "utf8"));
+  const entry = original.commands[0];
+  const forged = structuredClone(original);
+  forged.commands.push({
+    ...entry,
+    command: ["npm", "run", "test:parallel"],
+    counts: { passed: 4470, failed: 0, skipped: 22 },
+  });
+  await writeFile(path, JSON.stringify(forged));
+  await assert.rejects(verifyReceipt(directory, head), /integrity hash/u);
+  await writeFile(path, JSON.stringify(original));
+  assert.equal(original.tree, git("rev-parse", "HEAD^{tree}"));
+  assert.equal(entry.tree, original.tree);
+  assert.equal(entry.head, head);
+  assert.ok(entry.startedAt <= entry.completedAt);
+  assert.equal(entry.nodeVersion, process.version);
+  assert.equal(entry.vitestVersion, null);
+
+  git("commit", "--allow-empty", "--quiet", "-m", "Same tree");
+  const other = git("rev-parse", "HEAD");
+  await writeFile(
+    join(directory, ".test-receipts", `${other}.json`),
+    JSON.stringify({ ...original, head: other }),
+  );
+  await assert.rejects(verifyReceipt(directory, other), /commit|integrity/u);
+
+  await writeFile(join(directory, ".test-receipts", "logs", `${entry.logSha256}.log`), "edited");
+  await assert.rejects(verifyReceipt(directory, head), /log hash/u);
 });

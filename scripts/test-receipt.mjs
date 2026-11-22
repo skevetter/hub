@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { constants, createReadStream, existsSync, realpathSync, writeFileSync } from "node:fs";
+import { copyFile, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,20 +20,94 @@ function cleanHead(directory) {
   if (git(directory, ["status", "--porcelain=v1", "--untracked-files=all", "-z"])) {
     throw new Error("Test receipts require a clean Git worktree.");
   }
-  return git(directory, ["rev-parse", "--verify", "HEAD"]).trim();
+  return revision(directory, "HEAD");
 }
 
-function execute(args, cwd, report, stdio) {
+function revision(directory, ref) {
+  const head = git(directory, ["rev-parse", "--verify", `${ref}^{commit}`]).trim();
+  const tree = git(directory, ["rev-parse", "--verify", `${head}^{tree}`]).trim();
+  return { head, tree };
+}
+
+function execute(args, cwd, report, log, stdio) {
   const [command, ...rest] = args;
   return new Promise((settle, reject) => {
     const child = spawn(command, rest, {
       cwd,
       env: { ...process.env, [reportVariable]: report },
-      stdio,
+      stdio: [stdio, "pipe", "pipe"],
     });
-    child.on("error", reject);
-    child.on("close", (code) => settle(code ?? 1));
+    let logError;
+    for (const [stream, output] of [
+      [child.stdout, process.stdout],
+      [child.stderr, process.stderr],
+    ]) {
+      stream.on("data", (chunk) => {
+        try {
+          if (!logError) writeFileSync(log.fd, chunk);
+        } catch (error) {
+          logError = error;
+        }
+        if (stdio === "inherit" && !output.write(chunk)) {
+          stream.pause();
+          output.once("drain", () => stream.resume());
+        }
+      });
+    }
+    child.on("error", (error) => {
+      logError = error;
+    });
+    child.on("close", (code) => {
+      if (logError) reject(logError);
+      else settle(code ?? 1);
+    });
   });
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function receiptHash(payload) {
+  return createHash("sha256").update(canonicalJson(payload)).digest("hex");
+}
+
+async function fileHash(path) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+function logPath(directory, hash) {
+  return join(directory, "logs", `${hash}.log`);
+}
+
+async function checkReceipt(receipt, { head, tree }, directory) {
+  if (receipt.version !== 2 || receipt.cleanTree !== true || !Array.isArray(receipt.commands)) {
+    throw new Error("Unsupported or invalid test receipt. Record fresh evidence.");
+  }
+  const { sha256, ...payload } = receipt;
+  if (receipt.head !== head || receipt.tree !== tree) {
+    throw new Error("The test receipt does not match the requested commit and tree.");
+  }
+  if (receiptHash(payload) !== sha256) throw new Error("Test receipt integrity hash differs.");
+  for (const entry of receipt.commands) {
+    if (entry.head !== head || entry.tree !== tree)
+      throw new Error("A receipt entry has a different commit or tree.");
+    if (
+      !/^[a-f0-9]{64}$/u.test(entry.logSha256 ?? "") ||
+      (await fileHash(logPath(directory, entry.logSha256)).catch(() => null)) !== entry.logSha256
+    ) {
+      throw new Error("A test receipt log is missing or its log hash differs.");
+    }
+  }
 }
 
 async function readJson(path) {
@@ -75,24 +150,40 @@ function validateMetrics(metrics) {
 
 export async function recordTestRun(directory, command, { stdio = "inherit" } = {}) {
   if (!command.length) throw new Error("A test command is required.");
-  const head = cleanHead(directory);
+  const { head, tree } = cleanHead(directory);
   const temp = await mkdtemp(join(tmpdir(), "hub-receipt-"));
   try {
     const report = join(temp, "metrics.json");
     const started = performance.now();
-    const code = await execute(command, directory, report, stdio);
+    const startedAt = new Date().toISOString();
+    const logFile = join(temp, "command.log");
+    const log = await open(logFile, "wx", 0o600);
+    let code;
+    try {
+      code = await execute(command, directory, report, log, stdio);
+    } finally {
+      await log.close();
+    }
+    const completedAt = new Date().toISOString();
     const durationMs = Math.round(performance.now() - started);
     if (code !== 0) return { code, path: null };
-    if (cleanHead(directory) !== head) throw new Error("HEAD changed while the command ran.");
+    if (cleanHead(directory).head !== head) throw new Error("HEAD changed while the command ran.");
     const metrics = await readJson(report);
     validateMetrics(metrics);
     const entry = {
+      head,
+      tree,
       command,
-      selectedFiles: metrics?.selectedFiles ?? [],
+      selectedFiles: [...(metrics?.selectedFiles ?? [])].sort(),
       counts: metrics?.counts ?? null,
       checks: metrics?.checks ?? [],
       durationMs,
-      completedAt: new Date().toISOString(),
+      startedAt,
+      completedAt,
+      nodeVersion: process.version,
+      vitestVersion:
+        (await readJson(join(directory, "node_modules/vitest/package.json")))?.version ?? null,
+      logSha256: await fileHash(logFile),
     };
     const receiptDir = join(directory, ".test-receipts");
     await mkdir(receiptDir, { recursive: true });
@@ -101,17 +192,26 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
     const lockPath = join(receiptDir, `${head}.lock`);
     const lock = await open(lockPath, "wx", 0o600);
     try {
-      if (cleanHead(directory) !== head)
+      if (cleanHead(directory).head !== head)
         throw new Error("HEAD changed before the receipt was written.");
       const existing = await readJson(destination);
-      if (existing && (existing.head !== head || existing.cleanTree !== true)) {
-        throw new Error("The existing test receipt has invalid commit metadata.");
-      }
+      if (existing) await checkReceipt(existing, { head, tree }, receiptDir);
+      await mkdir(join(receiptDir, "logs"), { recursive: true, mode: 0o700 });
+      await copyFile(logFile, logPath(receiptDir, entry.logSha256), constants.COPYFILE_EXCL).catch(
+        async (error) => {
+          if (
+            error.code !== "EEXIST" ||
+            (await fileHash(logPath(receiptDir, entry.logSha256))) !== entry.logSha256
+          )
+            throw error;
+        },
+      );
       const commands = (existing?.commands ?? []).filter(
         (item) => JSON.stringify(item.command) !== JSON.stringify(command),
       );
       commands.push(entry);
-      const data = { version: 1, head, cleanTree: true, commands };
+      const payload = { version: 2, head, tree, cleanTree: true, commands };
+      const data = { ...payload, sha256: receiptHash(payload) };
       await writeFile(pending, `${JSON.stringify(data, null, 2)}\n`, { flag: "wx", mode: 0o600 });
       await rename(pending, destination);
     } finally {
@@ -130,12 +230,11 @@ export async function recordTestRun(directory, command, { stdio = "inherit" } = 
 
 export async function verifyReceipt(directory, sha) {
   if (!/^[a-f0-9]{7,64}$/iu.test(sha ?? "")) throw new Error("--verify requires a Git commit SHA.");
-  const head = git(directory, ["rev-parse", "--verify", `${sha}^{commit}`]).trim();
-  const receipt = await readJson(join(directory, ".test-receipts", `${head}.json`));
-  if (!receipt) throw new Error(`No test receipt exists for ${head}.`);
-  if (receipt.head !== head || receipt.cleanTree !== true) {
-    throw new Error("The test receipt does not match the requested commit.");
-  }
+  const commit = revision(directory, sha);
+  const receiptDir = join(directory, ".test-receipts");
+  const receipt = await readJson(join(receiptDir, `${commit.head}.json`));
+  if (!receipt) throw new Error(`No test receipt exists for ${commit.head}.`);
+  await checkReceipt(receipt, commit, receiptDir);
   return receipt;
 }
 
