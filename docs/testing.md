@@ -71,8 +71,10 @@ mise exec node@24.22.0 -- npm run test:receipt -- --verify "$(git rev-parse HEAD
 
 The ignored `.test-receipts/<sha>.json` file records green commands, their worktree roots,
 branches and commits, their elapsed times, and any file selections and counts reported by the
-test runner. A failed command or a dirty checkout cannot
-add evidence. Reviewers can use the receipt for that exact SHA and run checks missing from it.
+test runner. The test runners also report the worktree and commit they tested. A command that
+tested a different worktree or commit, a failed command, or a dirty checkout cannot add evidence.
+`--verify` rejects entries recorded or tested in another worktree. Reviewers can use the receipt
+for that exact SHA and run checks missing from it.
 
 Receipts bind each command to the commit and tree and hash the canonical JSON and command logs with
 SHA-256. Verification needs both the JSON and its files under `.test-receipts/logs/`. This detects
