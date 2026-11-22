@@ -4963,9 +4963,8 @@ class HubUser {
       await expect(this.page.getByRole("region", { name: "Loading account context" })).toHaveCount(
         0,
       );
-      await trigger.click();
-      await expect(this.page.getByRole("menuitem", { name: "Revoke" })).toBeDisabled();
-      await this.page.keyboard.press("Escape");
+      await expect(github.getByText("Being removed", { exact: true })).toBeVisible();
+      await expect(trigger).toHaveCount(0);
       await switcher.click();
       const menu = this.page.getByRole("menu");
       await expect(menu).toBeVisible();
