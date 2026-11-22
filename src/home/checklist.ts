@@ -32,7 +32,7 @@ export type ProfileAvailability = number | "checking" | "unavailable" | null;
 
 export type ChecklistFacts = Pick<
   HomeSnapshot,
-  "appsConfigured" | "connections" | "daemons" | "triggers" | "runs" | "sessions"
+  "appsConfigured" | "connections" | "daemons" | "triggers" | "runs" | "sessionStarted"
 >;
 
 function appState(snapshot: ChecklistFacts): Extract<ChecklistStep, { key: "app" }>["state"] {
@@ -88,19 +88,19 @@ export function deriveChecklist(
     { key: "trigger", state: snapshot.triggers.length > 0 ? "done" : "pending" },
     { key: "run", state: snapshot.runs.length > 0 ? "done" : "pending" },
   ];
-  const { sessions } = snapshot;
+  const { sessionStarted } = snapshot;
   const profile: ChecklistStep[] = [];
   if (profiles !== null) {
     const counted = profiles === 0 ? "pending" : "done";
     profile.push({ key: "profile", state: typeof profiles === "number" ? counted : profiles });
   }
   const steps: ChecklistStep[] =
-    sessions === null
+    sessionStarted === null
       ? [app, daemon, ...automation]
       : [
           daemon,
           ...profile,
-          { key: "session", state: sessions.started ? "done" : "pending" },
+          { key: "session", state: sessionStarted ? "done" : "pending" },
           app,
           ...automation,
         ];

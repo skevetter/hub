@@ -694,30 +694,21 @@ class MemoryDatabase implements Database {
     return structuredClone(sessionPage(rows, page.limit));
   };
 
-  countOwnInteractiveSessions: Database["countOwnInteractiveSessions"] = async (
-    { organizationId, userId },
-    openLimit,
-  ) => {
-    if (!this.sessionMemberRole(organizationId, userId)) {
-      return { open: 0, openCapped: false, started: false };
-    }
-    let open = 0;
-    let examined = 0;
-    let started = false;
+  hasOwnInteractiveSession: Database["hasOwnInteractiveSession"] = async ({
+    organizationId,
+    userId,
+  }) => {
+    if (!this.sessionMemberRole(organizationId, userId)) return false;
     for (const { session, participants } of this.interactiveSessionsByOrganization.get(
       organizationId,
     ) ?? []) {
-      const own =
+      if (
         session.startedByUserId === userId ||
-        participants.some((person) => person.userId === userId);
-      started ||= own;
-      if (examined <= openLimit && session.state !== "closed") {
-        examined += 1;
-        if (own) open += 1;
-      }
-      if (examined > openLimit && started) break;
+        participants.some((person) => person.userId === userId)
+      )
+        return true;
     }
-    return { open: Math.min(open, openLimit), openCapped: examined > openLimit, started };
+    return false;
   };
 
   findInteractiveSession: Database["findInteractiveSession"] = async (organizationId, sessionId) =>
