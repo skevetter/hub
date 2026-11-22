@@ -47,6 +47,13 @@ run with Linear's refusal reason.
 Hub ignores comments from the connected Paseo app when matching triggers.
 It drops app replies before recording the webhook body and omits marked replies
 when it loads earlier comments for a later run.
+
+This applies to every Linear comment webhook, with or without `reply_message`.
+Hub looks up the connection's app user for each comment event. A comment written by
+that user, or any comment that carries a `Paseo reply <id>` line, returns 200
+and stores no receipt. Build 21 stored a receipt for these comments and could
+match them to a trigger. The change is intentional loop protection. Tests in
+`src/triggers/linear/webhook.test.ts` cover both cases.
 `PASEO_HUB_LINEAR_REPLIES_PER_HOUR` defaults to 60 delivery attempts per
 Hub organization in a rolling hour. The database enforces the cap across
 Hub processes.

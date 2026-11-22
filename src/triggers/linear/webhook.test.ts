@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { describe, it } from "vitest";
 import type { DurableProviderEvent, ProviderEventAcceptance } from "../../db/types.js";
 import {
@@ -34,6 +34,39 @@ describe("Linear webhook", () => {
           webhookTimestamp: NOW,
           actor: { id: "installed-app" },
           data: { id: "reply-comment", issueId: "issue", body: "Answer from the app" },
+        },
+        "Comment",
+      ),
+    );
+    assert.equal(response.status, 200);
+  });
+
+  it("acknowledges a comment carrying a Paseo reply line without a receipt", async () => {
+    const commentId = randomUUID();
+    const endpoint = createLinearWebhookSource({
+      signingSecret: SECRET,
+      now: () => NOW,
+      findAppUserId: async () => "installed-app",
+      resolveIssue: async () => {
+        throw new Error("a marked reply must not hydrate the issue");
+      },
+      accept: async () => {
+        throw new Error("a marked reply must not create a receipt");
+      },
+    });
+    const response = await endpoint.handle(
+      request(
+        {
+          type: "Comment",
+          action: "create",
+          organizationId: "linear-org",
+          webhookTimestamp: NOW,
+          actor: { id: "someone-else" },
+          data: {
+            id: commentId,
+            issueId: "issue",
+            body: `Quoted answer\n\nPaseo reply ${commentId}`,
+          },
         },
         "Comment",
       ),
