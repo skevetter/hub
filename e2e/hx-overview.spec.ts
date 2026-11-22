@@ -154,6 +154,7 @@ run:
   await home.expectStep("Enroll a daemon", daemonName);
   await home.expectStep("Create a trigger", name);
   await home.expectRecentRun(name, "Succeeded");
+  await expect(page.getByRole("list", { name: "Recent runs" })).toContainText("Manual run");
   const runName = page.getByRole("list", { name: "Recent runs" }).getByText(name, { exact: true });
   expect(
     await runName.evaluate(
