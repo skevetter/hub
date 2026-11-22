@@ -42,13 +42,17 @@ const NO_RECEIPT_RUNS = `not exists (
 function droppedReceiptFilters(
   { provider, reason, receivedSince, source }: Omit<DroppedEventPageRequest, "limit">,
   params: unknown[],
+  scopeParameter = (parameter: string) => parameter,
 ) {
   const bind = (value: unknown) => `$${params.push(value)}`;
-  const filters = ["receipt.organization_id = $1", "receipt.dropped_reason is not null"];
+  const filters = [
+    `receipt.organization_id = ${scopeParameter("$1")}`,
+    "receipt.dropped_reason is not null",
+  ];
   if (provider === "webhook") {
     filters.push("receipt.provider = 'manual' and receipt.source = 'webhook.received'");
   } else if (provider !== undefined) {
-    filters.push(`receipt.provider = ${bind(provider)}`);
+    filters.push(`receipt.provider = ${scopeParameter(bind(provider))}`);
     if (provider === "manual") filters.push("receipt.source <> 'webhook.received'");
   }
   if (source !== undefined) filters.push(`receipt.source = ${bind(source)}`);
@@ -159,18 +163,23 @@ export async function readDroppedEventPresence(
   receivedSince: Date,
 ): Promise<DroppedEventPresence> {
   const params: unknown[] = [organizationId];
-  const filters = droppedReceiptFilters({ provider, receivedSince }, params);
-  const limit = `$${params.push(DROPPED_EVENT_CANDIDATE_LIMIT)}`;
-  // Materialize the ordered index slice before probing for runs.
+  // Plan the ordered lookup with runtime scope keys so sparse tenant statistics
+  // do not bias the candidate limit toward a bitmap scan and sort.
+  const filters = droppedReceiptFilters(
+    { provider, receivedSince },
+    params,
+    (parameter) => `(select ${parameter}::text)`,
+  );
   const { rows } = await database.query<{ presence: DroppedEventPresence }>(
     `with candidates as materialized (
        select receipt.id from provider_event_receipts receipt where ${filters}
-       order by receipt.received_at desc nulls first, receipt.id desc nulls first
-       limit ${limit}
+       order by receipt.organization_id, receipt.provider,
+                receipt.received_at desc nulls first, receipt.id desc nulls first
+       limit ${DROPPED_EVENT_CANDIDATE_LIMIT}
      )
      select case
        when exists (select 1 from candidates receipt where ${NO_RECEIPT_RUNS}) then 'some'
-       when (select count(*) from candidates) = ${limit} then 'unknown'
+       when (select count(*) from candidates) = ${DROPPED_EVENT_CANDIDATE_LIMIT} then 'unknown'
        else 'none'
      end as presence`,
     params,
