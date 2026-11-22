@@ -149,6 +149,47 @@ test("a successful process cannot record a report containing failed tests", asyn
   await assert.rejects(verifyReceipt(directory, head), /No test receipt exists/u);
 });
 
+test("invalid metrics replace an earlier pass for the same command and commit", async (t) => {
+  const { directory, head } = await gitFixture(t);
+  const runner = fileURLToPath(new URL("./test-receipt.mjs", import.meta.url));
+  const receiptDir = join(directory, ".test-receipts");
+  const input = join(receiptDir, "metrics.json");
+  const command = [
+    process.execPath,
+    "-e",
+    `const fs = require("node:fs");
+     fs.copyFileSync(process.argv[1], process.env.HUB_TEST_RUN_REPORT);`,
+    input,
+  ];
+  const run = (...args) =>
+    spawnSync(process.execPath, [runner, "--root", directory, ...args], { encoding: "utf8" });
+  const passing = {
+    root: await realpath(directory),
+    head,
+    selectedFiles: ["a.test.ts"],
+    counts: { passed: 1, failed: 0, skipped: 0 },
+    checks: [],
+  };
+  await mkdir(receiptDir);
+  for (const invalid of [{ ...passing, counts: { ...passing.counts, failed: 1 } }, null]) {
+    await writeFile(input, JSON.stringify(passing));
+    assert.equal(run("--", ...command).status, 0);
+    assert.equal(run("--verify", head).status, 0);
+
+    await writeFile(input, JSON.stringify(invalid));
+    const rejected = run("--", ...command);
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /invalid or failing test metrics/u);
+    const verified = run("--verify", head);
+    assert.equal(verified.status, 1);
+    assert.doesNotMatch(verified.stdout, /Green test evidence/u);
+    assert.match(verified.stderr, /exit code 1/u);
+    const receipt = JSON.parse(await readFile(join(receiptDir, `${head}.json`), "utf8"));
+    assert.equal(receipt.commands.length, 1);
+    assert.equal(receipt.commands[0].exitCode, 1);
+  }
+});
+
 test("rejects edited commands, copied commits, and modified log files", async (t) => {
   const { directory, head, git } = await gitFixture(t);
   const { path } = await recordTestRun(
