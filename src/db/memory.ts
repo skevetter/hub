@@ -450,6 +450,7 @@ class MemoryDatabase implements Database {
     this.surfaces.supersedeSurfaceBinding(...args);
   private readonly sessionProfiles = new Map<string, StoredSessionProfile>();
   private readonly interactiveSessions = new Map<string, SessionWithParticipants>();
+  private readonly interactiveSessionsByOrganization = new Map<string, SessionWithParticipants[]>();
   private readonly interactiveCommands = new Map<string, SessionCommandRecord[]>();
   private readonly interactiveEvents = new Map<string, SessionEventRecord[]>();
   private readonly interactiveAudit = new Map<string, SessionAuditRecord[]>();
@@ -575,6 +576,12 @@ class MemoryDatabase implements Database {
         })),
       };
       this.interactiveSessions.set(session.id, row);
+      const organizationSessions = this.interactiveSessionsByOrganization.get(organizationId);
+      if (organizationSessions === undefined) {
+        this.interactiveSessionsByOrganization.set(organizationId, [row]);
+      } else {
+        organizationSessions.push(row);
+      }
       this.interactiveCommands.set(session.id, [structuredClone(command)]);
       this.interactiveEvents.set(session.id, []);
       this.appendSessionEvents(row, session, input.now, [
@@ -696,8 +703,9 @@ class MemoryDatabase implements Database {
     }
     let open = 0;
     let started = false;
-    for (const { session, participants } of this.interactiveSessions.values()) {
-      if (session.organizationId !== organizationId) continue;
+    for (const { session, participants } of this.interactiveSessionsByOrganization.get(
+      organizationId,
+    ) ?? []) {
       if (
         session.startedByUserId !== userId &&
         !participants.some((person) => person.userId === userId)
