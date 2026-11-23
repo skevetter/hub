@@ -48,13 +48,20 @@ import { ExecutionMeter } from "../entitlements/ui/index.js";
 import { NavigationGroup, type NavigationItem } from "./navigation-group.js";
 import { SidebarIdentity } from "./sidebar-switcher.js";
 import { AccountMenu, OrganizationSwitcher, type RouteTenant } from "./switchers.js";
+import { PhoneHeader, PhoneNavigation } from "./phone-navigation.js";
 import { SiteHeader } from "./site-header.js";
 import { CONTENT_ID, SkipLink } from "./skip-link.js";
 import { SiteHeaderActionsProvider } from "./site-header-actions.js";
 
 type ActiveAccount = ActiveAccountState;
-const SIDEBAR_STYLE: CSSProperties & { "--sidebar-width": string } = {
+const SIDEBAR_STYLE: CSSProperties & {
+  "--sidebar-width": string;
+  "--shell-bottom-safe-area": string;
+  "--shell-bottom-bar": string;
+} = {
   "--sidebar-width": "14.5rem",
+  "--shell-bottom-safe-area": "env(safe-area-inset-bottom)",
+  "--shell-bottom-bar": "calc(var(--spacing) * 14 + var(--shell-bottom-safe-area))",
 };
 type AccountCommandResult = Result<{
   state: "sessionExpired" | "organizationRequired" | "complete";
@@ -131,41 +138,31 @@ function useDashboardAccountActions() {
   };
 }
 
-function DashboardContent({
-  account,
-  busy,
-  transitioning,
-  error,
-  onCreateOrganization,
-  onSelectOrganization,
-  onSignOut,
-}: {
-  account: ActiveAccount;
-  busy: boolean;
-  transitioning: boolean;
-  error: string | undefined;
-  onCreateOrganization: (name: string) => void;
-  onSelectOrganization: (organizationId: string, slug: string) => void;
-  onSignOut: () => void;
-}) {
+type DashboardContentProps = { account: ActiveAccount } & ReturnType<
+  typeof useDashboardAccountActions
+>;
+
+function DashboardContent(props: DashboardContentProps) {
+  const { account, error, transitioning } = props;
   const tenant = useOptionalRouteTenant() ?? undefined;
   const instance = useInstanceScope(account.isInstanceOperator);
+  const organization = tenant?.organization ?? account.organization;
+  const mainItems = organizationMainItems(
+    organization.slug,
+    account.features?.interactiveSessions === true,
+  );
+  const sidebar = (
+    <DashboardSidebar {...props} tenant={tenant} instance={instance} mainItems={mainItems} />
+  );
   return (
     <>
       <SkipLink />
-      <AppSidebar
-        account={account}
-        tenant={tenant}
-        instance={instance}
-        busy={busy}
-        onCreateOrganization={onCreateOrganization}
-        onSelectOrganization={onSelectOrganization}
-        onSignOut={onSignOut}
-      />
+      <Sidebar collapsible="icon">{sidebar}</Sidebar>
       <SiteHeaderActionsProvider>
-        <SidebarInset>
+        <SidebarInset className="pb-[var(--shell-bottom-bar)] md:pb-0">
+          <PhoneHeader />
           <SiteHeader
-            scope={instance ? "Instance" : (tenant?.organization.name ?? account.organization.name)}
+            scope={instance ? "Instance" : organization.name}
             {...(instance || tenant?.project == null ? {} : { project: tenant.project.name })}
           />
           {/* The app's one content inset. Screens never pad themselves. */}
@@ -181,6 +178,7 @@ function DashboardContent({
           </div>
         </SidebarInset>
       </SiteHeaderActionsProvider>
+      <PhoneNavigation items={mainItems.slice(0, 3)}>{sidebar}</PhoneNavigation>
     </>
   );
 }
@@ -244,7 +242,7 @@ function PageContent({
   );
 }
 
-function AppSidebar({
+function DashboardSidebar({
   account,
   tenant,
   instance,
@@ -252,18 +250,18 @@ function AppSidebar({
   onCreateOrganization,
   onSelectOrganization,
   onSignOut,
-}: {
-  account: ActiveAccount;
+  mainItems,
+}: Pick<
+  DashboardContentProps,
+  "account" | "busy" | "onCreateOrganization" | "onSelectOrganization" | "onSignOut"
+> & {
   tenant: RouteTenant | undefined;
   instance: boolean;
-  busy: boolean;
-  onCreateOrganization: (name: string) => void;
-  onSelectOrganization: (organizationId: string, slug: string) => void;
-  onSignOut: () => void;
+  mainItems: readonly NavigationItem[];
 }) {
   const organization = tenant?.organization ?? account.organization;
   return (
-    <Sidebar collapsible="icon">
+    <>
       <SidebarHeader>
         <SidebarMenu>
           <SidebarMenuItem>
@@ -290,6 +288,7 @@ function AppSidebar({
         <Destinations
           instance={instance}
           organization={organization}
+          mainItems={mainItems}
           sessionsEnabled={account.features?.interactiveSessions === true}
         />
       </SidebarContent>
@@ -299,7 +298,7 @@ function AppSidebar({
         busy={busy}
         onSignOut={onSignOut}
       />
-    </Sidebar>
+    </>
   );
 }
 
@@ -337,10 +336,12 @@ function AccountFooter({
 function Destinations({
   instance,
   organization,
+  mainItems,
   sessionsEnabled,
 }: {
   instance: boolean;
   organization: { name: string; slug: string };
+  mainItems: readonly NavigationItem[];
   sessionsEnabled: boolean;
 }) {
   if (instance) {
@@ -355,16 +356,20 @@ function Destinations({
   return (
     <NavigationGroup
       label="Organization"
-      items={destinations(
-        `/o/${organization.slug}`,
-        sessionsEnabled ? ORGANIZATION_SECTIONS : ORGANIZATION_SECTIONS_WITHOUT_SESSIONS,
-      )}
+      items={mainItems}
       setup={destinations(
         `/o/${organization.slug}`,
         sessionsEnabled ? SETUP_SECTIONS : SETUP_SECTIONS_WITHOUT_SESSIONS,
       )}
       administration={destinations(`/o/${organization.slug}`, ORGANIZATION_ADMINISTRATION)}
     />
+  );
+}
+
+function organizationMainItems(slug: string, sessionsEnabled: boolean) {
+  return destinations(
+    `/o/${slug}`,
+    sessionsEnabled ? ORGANIZATION_SECTIONS : ORGANIZATION_SECTIONS_WITHOUT_SESSIONS,
   );
 }
 

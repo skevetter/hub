@@ -10,14 +10,12 @@ import { cn } from "../../lib/utils.js";
 import { Button } from "./button.js";
 import { Input } from "./input.js";
 import { Separator } from "./separator.js";
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "./sheet.js";
 import { Skeleton } from "./skeleton.js";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./tooltip.js";
 
 const SIDEBAR_COOKIE_NAME = "sidebar_state";
 const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
 const SIDEBAR_WIDTH = "14.5rem";
-const SIDEBAR_WIDTH_MOBILE = "18rem";
 const SIDEBAR_WIDTH_ICON = "3rem";
 const SIDEBAR_KEYBOARD_SHORTCUT = "b";
 
@@ -26,8 +24,6 @@ interface SidebarStyle extends React.CSSProperties {
   "--sidebar-width-icon"?: string;
   "--skeleton-width"?: string;
 }
-
-const MOBILE_SIDEBAR_STYLE: SidebarStyle = { "--sidebar-width": SIDEBAR_WIDTH_MOBILE };
 
 interface SidebarContextProps {
   state: "expanded" | "collapsed";
@@ -121,14 +117,16 @@ function useSidebarProviderState({
   );
 
   const toggleSidebar = React.useCallback(() => {
-    return isMobile
-      ? setOpenMobile((mobileOpen) => !mobileOpen)
-      : setOpen((desktopOpen) => !desktopOpen);
-  }, [isMobile, setOpen, setOpenMobile]);
+    if (!isMobile) setOpen((desktopOpen) => !desktopOpen);
+  }, [isMobile, setOpen]);
 
   React.useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === SIDEBAR_KEYBOARD_SHORTCUT && (event.metaKey || event.ctrlKey)) {
+      if (
+        !isMobile &&
+        event.key === SIDEBAR_KEYBOARD_SHORTCUT &&
+        (event.metaKey || event.ctrlKey)
+      ) {
         event.preventDefault();
         toggleSidebar();
       }
@@ -136,7 +134,7 @@ function useSidebarProviderState({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [toggleSidebar]);
+  }, [isMobile, toggleSidebar]);
 
   const state = open ? "expanded" : "collapsed";
 
@@ -167,8 +165,6 @@ function Sidebar({
   variant?: "sidebar" | "floating" | "inset";
   collapsible?: "offcanvas" | "icon" | "none";
 }) {
-  const { isMobile, openMobile, setOpenMobile } = useSidebar();
-
   if (collapsible === "none") {
     return (
       <div
@@ -181,27 +177,6 @@ function Sidebar({
       >
         {children}
       </div>
-    );
-  }
-
-  if (isMobile) {
-    return (
-      <Sheet open={openMobile} onOpenChange={setOpenMobile} {...props}>
-        <SheetContent
-          data-sidebar="sidebar"
-          data-slot="sidebar"
-          data-mobile="true"
-          className="w-(--sidebar-width) bg-sidebar p-0 text-sidebar-foreground [&>button]:hidden"
-          style={MOBILE_SIDEBAR_STYLE}
-          side={side}
-        >
-          <SheetHeader className="sr-only">
-            <SheetTitle>Sidebar</SheetTitle>
-            <SheetDescription>Displays the mobile sidebar.</SheetDescription>
-          </SheetHeader>
-          <div className="flex h-full w-full flex-col">{children}</div>
-        </SheetContent>
-      </Sheet>
     );
   }
 

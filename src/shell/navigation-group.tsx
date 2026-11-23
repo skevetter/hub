@@ -3,6 +3,7 @@ import { Link } from "@tanstack/react-router";
 import type { LucideIcon } from "lucide-react";
 import { useCallback } from "react";
 
+import { cn } from "../lib/utils.js";
 import { usePresentedDestination } from "../navigation/index.js";
 import {
   SidebarGroup,
@@ -100,7 +101,10 @@ function SetupGroup({ items }: { items: readonly NavigationItem[] }) {
  * Navigation stays inside the running app. A plain anchor reloads the document, which
  * throws away the resolved account and repaints the pre-auth shell on every hop.
  */
-function NavItem({ item }: { item: NavigationItem }) {
+export const PHONE_TAB_CLASS =
+  "flex min-h-11 flex-col items-center justify-center gap-1 text-xs focus-visible:outline-rail-foreground focus-visible:-outline-offset-2";
+
+export function NavItem({ item, phoneTab = false }: { item: NavigationItem; phoneTab?: boolean }) {
   const { to, label, icon: Icon, subtree = false } = item;
   const active = usePresentedDestination(to, subtree);
   const { isMobile, setOpenMobile } = useSidebar();
@@ -110,6 +114,28 @@ function NavItem({ item }: { item: NavigationItem }) {
     if (isMobile) setOpenMobile(false);
   }, [isMobile, setOpenMobile]);
 
+  const link = (
+    <Link
+      to={to as never}
+      aria-current={active ? "page" : undefined}
+      onClick={navigate}
+      className={
+        phoneTab
+          ? cn(
+              PHONE_TAB_CLASS,
+              active
+                ? "bg-live font-strong text-live-foreground"
+                : "text-rail-muted hover:bg-rail-accent",
+            )
+          : undefined
+      }
+    >
+      <Icon aria-hidden="true" className={phoneTab ? "size-4" : undefined} />
+      <span>{label}</span>
+    </Link>
+  );
+  if (phoneTab) return link;
+
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
@@ -118,10 +144,7 @@ function NavItem({ item }: { item: NavigationItem }) {
         tooltip={label}
         className="h-9 rounded-sm text-rail-muted hover:bg-sidebar-accent hover:text-sidebar-foreground data-[active=true]:bg-sidebar-primary data-[active=true]:text-sidebar-primary-foreground data-[active=true]:font-strong"
       >
-        <Link to={to as never} aria-current={active ? "page" : undefined} onClick={navigate}>
-          <Icon aria-hidden="true" />
-          <span>{label}</span>
-        </Link>
+        {link}
       </SidebarMenuButton>
     </SidebarMenuItem>
   );
