@@ -559,7 +559,7 @@ export class InteractiveSessionCoordinator {
   ): Promise<LinearPilotStop> {
     if (worker.pilotStopRequested) return unconfirmedStop();
     const held = await this.stoppablePilotTurn(worker, input);
-    if (!held) return unconfirmedStop();
+    if (!held || !stopTurnHeld(worker, held)) return unconfirmedStop();
     const { commandId, expectedBindingGeneration } = input;
     worker.pilotStopRequested = true;
     const stopping = await this.transition(worker, held.session, {
