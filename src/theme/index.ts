@@ -10,6 +10,12 @@ import {
 
 export { cycleTheme, parseThemeChoice, type ThemeChoice } from "./preference.js";
 
+export const THEME_OPTIONS = [
+  { value: "system", label: "System" },
+  { value: "light", label: "Light" },
+  { value: "dark", label: "Dark" },
+] as const;
+
 export const InitialThemeContext = createContext<ThemeChoice>("system");
 
 const SYSTEM_DARK = "system-dark";

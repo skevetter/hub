@@ -13,6 +13,7 @@ import {
 import { useSidebar } from "../components/ui/sidebar.js";
 import { cn } from "../lib/utils.js";
 import { usePageContext } from "../navigation/index.js";
+import { CommandSearchButton } from "./command-menu.js";
 import { NavItem, PHONE_TAB_CLASS, type NavigationItem } from "./navigation-group.js";
 
 export function PhoneHeader() {
@@ -25,6 +26,7 @@ export function PhoneHeader() {
         className="size-5 shrink-0 rounded-sm bg-rail-foreground"
       />
       <span className="truncate text-sm font-strong">{breadcrumbs.at(-1) ?? "Paseo Hub"}</span>
+      <CommandSearchButton phone />
     </header>
   );
 }

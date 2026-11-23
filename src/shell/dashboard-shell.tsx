@@ -1,9 +1,9 @@
 /* oxlint-disable typescript-eslint/no-unsafe-type-assertion -- dynamic tenant URLs are assembled from server-resolved route metadata */
 import { Cable, Cpu, History, House, MessagesSquare, Settings, Users, Zap } from "lucide-react";
-import { Outlet } from "@tanstack/react-router";
+import { Outlet, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, type CSSProperties } from "react";
+import { useCallback, useMemo, type CSSProperties } from "react";
 import { usePageContext } from "../navigation/index.js";
 import { Page } from "../components/app/page.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
@@ -35,6 +35,7 @@ import { SidebarHelp } from "../auth/sidebar-help.js";
 import { ExecutionMeter } from "../entitlements/ui/index.js";
 import { NavigationGroup, type NavigationItem } from "./navigation-group.js";
 import { AccountMenu, OrganizationSwitcher, type RouteTenant } from "./switchers.js";
+import { CommandMenuProvider, CommandSearchButton } from "./command-menu.js";
 import { PhoneHeader, PhoneNavigation } from "./phone-navigation.js";
 import { SiteHeader } from "./site-header.js";
 import { CONTENT_ID, SkipLink } from "./skip-link.js";
@@ -70,6 +71,7 @@ export function DashboardShell({ account }: { account: ActiveAccount }) {
 }
 
 function useDashboardAccountActions() {
+  const navigate = useNavigate();
   const createOrganizationCommand = useAccountCommand(
     useServerFn(createOrganization) as (
       input: Parameters<typeof createOrganization>[0],
@@ -95,9 +97,12 @@ function useDashboardAccountActions() {
     mutationKey: ACCOUNT_MUTATION_KEY,
     mutationFn: ({ input }: { input: Parameters<typeof selectOrganization>[0]; slug: string }) =>
       selectOrganizationCommand(input),
-    onSuccess: (result, variables) => {
+    onSuccess: async (result, variables) => {
       if (result.status === "ok" && result.data.state === "complete") {
-        window.location.assign(`/o/${variables.slug}/home`);
+        await navigate({
+          to: "/o/$organizationSlug/home",
+          params: { organizationSlug: variables.slug },
+        });
       }
     },
   });
@@ -133,13 +138,28 @@ function DashboardContent(props: DashboardContentProps) {
   const { account, error, transitioning } = props;
   const tenant = useOptionalRouteTenant() ?? undefined;
   const organization = tenant?.organization ?? account.organization;
-  const mainItems = organizationMainItems(
+  const navigation = organizationNavigation(
     organization.slug,
     account.features?.interactiveSessions === true,
   );
-  const sidebar = <DashboardSidebar {...props} tenant={tenant} mainItems={mainItems} />;
+  const sidebar = <DashboardSidebar {...props} tenant={tenant} navigation={navigation} />;
+  const settings = useMemo(
+    () => ({
+      slug: organization.slug,
+      manageResources: tenant?.capabilities.manageResources ?? account.capabilities.manageResources,
+      isInstanceOperator: account.isInstanceOperator,
+    }),
+    [organization.slug, tenant, account],
+  );
+
   return (
-    <>
+    <CommandMenuProvider
+      navigation={navigation}
+      settings={settings}
+      memberships={account.memberships}
+      busy={props.busy}
+      onSelectOrganization={props.onSelectOrganization}
+    >
       <SkipLink />
       <Sidebar collapsible="icon">{sidebar}</Sidebar>
       <SiteHeaderActionsProvider>
@@ -162,8 +182,8 @@ function DashboardContent(props: DashboardContentProps) {
           </div>
         </SidebarInset>
       </SiteHeaderActionsProvider>
-      <PhoneNavigation items={mainItems.slice(0, 3)}>{sidebar}</PhoneNavigation>
-    </>
+      <PhoneNavigation items={navigation.items.slice(0, 3)}>{sidebar}</PhoneNavigation>
+    </CommandMenuProvider>
   );
 }
 
@@ -233,13 +253,13 @@ function DashboardSidebar({
   onCreateOrganization,
   onSelectOrganization,
   onSignOut,
-  mainItems,
+  navigation,
 }: Pick<
   DashboardContentProps,
   "account" | "busy" | "onCreateOrganization" | "onSelectOrganization" | "onSignOut"
 > & {
   tenant: RouteTenant | undefined;
-  mainItems: readonly NavigationItem[];
+  navigation: ReturnType<typeof organizationNavigation>;
 }) {
   const organization = tenant?.organization ?? account.organization;
   return (
@@ -256,14 +276,13 @@ function DashboardSidebar({
               onSelectOrganization={onSelectOrganization}
             />
           </SidebarMenuItem>
+          <SidebarMenuItem className="hidden md:list-item">
+            <CommandSearchButton />
+          </SidebarMenuItem>
         </SidebarMenu>
       </SidebarHeader>
       <SidebarContent>
-        <Destinations
-          organization={organization}
-          mainItems={mainItems}
-          sessionsEnabled={account.features?.interactiveSessions === true}
-        />
+        <NavigationGroup label="Organization" {...navigation} />
       </SidebarContent>
       <AccountFooter
         account={account}
@@ -304,34 +323,16 @@ function AccountFooter({
   );
 }
 
-/** The innermost level's destinations, and only those. Each group owns its own way back out. */
-function Destinations({
-  organization,
-  mainItems,
-  sessionsEnabled,
-}: {
-  organization: { name: string; slug: string };
-  mainItems: readonly NavigationItem[];
-  sessionsEnabled: boolean;
-}) {
-  return (
-    <NavigationGroup
-      label="Organization"
-      items={mainItems}
-      setup={destinations(
-        `/o/${organization.slug}`,
-        sessionsEnabled ? SETUP_SECTIONS : SETUP_SECTIONS_WITHOUT_SESSIONS,
-      )}
-      administration={destinations(`/o/${organization.slug}`, ORGANIZATION_ADMINISTRATION)}
-    />
-  );
-}
-
-function organizationMainItems(slug: string, sessionsEnabled: boolean) {
-  return destinations(
-    `/o/${slug}`,
-    sessionsEnabled ? ORGANIZATION_SECTIONS : ORGANIZATION_SECTIONS_WITHOUT_SESSIONS,
-  );
+function organizationNavigation(slug: string, sessionsEnabled: boolean) {
+  const base = `/o/${slug}`;
+  return {
+    items: destinations(
+      base,
+      sessionsEnabled ? ORGANIZATION_SECTIONS : ORGANIZATION_SECTIONS_WITHOUT_SESSIONS,
+    ),
+    setup: destinations(base, sessionsEnabled ? SETUP_SECTIONS : SETUP_SECTIONS_WITHOUT_SESSIONS),
+    administration: destinations(base, ORGANIZATION_ADMINISTRATION),
+  };
 }
 
 interface SectionDestination {

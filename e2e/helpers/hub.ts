@@ -4012,6 +4012,8 @@ class HubUser {
     await expect(this.page.getByRole("link", { name: "Skip to content" })).toBeFocused();
     await this.page.keyboard.press("Tab");
     await expect(organization).toBeFocused();
+    await this.page.keyboard.press("Tab");
+    await expect(this.page.getByRole("button", { name: "Search", exact: true })).toBeFocused();
     await this.tabThroughOrganizationDestinations();
     await this.tabThroughSidebarFooter();
 
