@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { ambientFiles, lintGroup, parseArgs, selectDiagnostics } from "./lint-strict.mjs";
+import {
+  ambientFiles,
+  lintGroup,
+  parseArgs,
+  partlyStaged,
+  selectDiagnostics,
+} from "./lint-strict.mjs";
 
-test("reads a base and file list", () => {
-  assert.deepEqual(parseArgs(["--base", "fork-1", "src/a.ts", "--", "src/b.tsx"]), {
+test("reads a base, the staged flag and a file list", () => {
+  assert.deepEqual(parseArgs(["--base", "fork-1", "--staged", "src/a.ts", "--", "src/b.tsx"]), {
     base: "fork-1",
+    staged: true,
     files: ["src/a.ts", "src/b.tsx"],
   });
 });
@@ -33,6 +40,21 @@ test("keeps diagnostics for the changed files only", () => {
   assert.deepEqual(selectDiagnostics(output, ["src/a.ts"]), [
     "src/a.ts:1:1: too complex [Error/eslint(complexity)]",
   ]);
+});
+
+test("ignores lines that only name a changed file", () => {
+  const output = [
+    "src/a.ts",
+    "src/a.ts: note",
+    "src/a:b.ts:3:4: msg [Error/eslint(complexity)]",
+  ].join("\n");
+  assert.deepEqual(selectDiagnostics(output, ["src/a.ts", "src/a:b.ts"]), [
+    "src/a:b.ts:3:4: msg [Error/eslint(complexity)]",
+  ]);
+});
+
+test("reports target files that still have unstaged edits", () => {
+  assert.deepEqual(partlyStaged(["src/a.ts", "src/b.ts"], ["src/b.ts", "README.md"]), ["src/b.ts"]);
 });
 
 test("finds module augmentations that the type program needs", () => {

@@ -51,6 +51,16 @@ test("flags positional const arrays over the limit", () => {
   assert.equal(lint("export function f(a: number) { return [a, a, a, a] as const; }").length, 1);
 });
 
+test("flags readonly tuples over the limit", () => {
+  assert.equal(
+    lint("export function f(): readonly [1, 2, 3, 4] { return [1, 2, 3, 4]; }").length,
+    1,
+  );
+  const source =
+    "export async function f(): Promise<readonly [1, 2, 3, 4]> { return [1, 2, 3, 4]; }";
+  assert.equal(lint(source).length, 1);
+});
+
 test("allows three values", () => {
   assert.deepEqual(lint("export function f(): [number, number, number] { return [1, 2, 3]; }"), []);
 });
