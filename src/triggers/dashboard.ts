@@ -235,13 +235,19 @@ export class TriggerDashboard {
     return { ...detail, canStop, ...(stopDetails === undefined ? {} : { stopDetails }) };
   }
 
-  async stopRun(
-    request: Request,
-    organizationSlug: string,
-    runId: string,
-    confirmedPeerCount: number,
-    retryAttemptId?: string,
-  ) {
+  async stopRun({
+    request,
+    organizationSlug,
+    runId,
+    confirmedPeerCount,
+    retryAttemptId,
+  }: {
+    request: Request;
+    organizationSlug: string;
+    runId: string;
+    confirmedPeerCount: number;
+    retryAttemptId?: string | undefined;
+  }) {
     const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, {
       organizationSlug,
     });
