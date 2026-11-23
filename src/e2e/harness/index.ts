@@ -258,7 +258,7 @@ export class HubE2E {
     ];
     const dryRun = await source
       .runFrom([...common, "--dry-run"], projectRoot)
-      .catch(async (error) => {
+      .catch(async (error: unknown) => {
         const diagnostic = await fetch(
           `${this.requireProxy().origin}/api/v1/configurations/validate`,
           {
@@ -1277,7 +1277,7 @@ export class HubE2E {
       failures,
     );
     const sourceStartedAt = performance.now();
-    const sourceEvidence = await this.source?.stop().catch((error) => {
+    const sourceEvidence = await this.source?.stop().catch((error: unknown) => {
       failures.push(error);
       return undefined;
     });
@@ -1296,7 +1296,9 @@ export class HubE2E {
     await this.attempt(() => this.pool?.close(), failures);
     await this.attempt(() => this.postgres?.stop(), failures);
     if (this.root)
-      await rm(this.root, { recursive: true, force: true }).catch((error) => failures.push(error));
+      await rm(this.root, { recursive: true, force: true }).catch((error: unknown) =>
+        failures.push(error),
+      );
     const leakedProcesses = [...ownedProcesses].filter(isProcessAlive);
     const evidence = {
       durationMs: Math.round(performance.now() - startedAt),
