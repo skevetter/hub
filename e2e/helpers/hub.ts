@@ -728,6 +728,7 @@ export class PaseoHub {
     deliveryKey: string;
     trigger?: string;
     apiKey?: string;
+    actor?: string;
   }): Promise<{
     status: number;
     error?: string;
@@ -745,7 +746,7 @@ export class PaseoHub {
       data: {
         projectSlug: "default",
         trigger: input.trigger ?? "deploy",
-        actor: "alice",
+        actor: input.actor ?? "alice",
         deliveryKey: input.deliveryKey,
         input: input.rawInput,
       },
