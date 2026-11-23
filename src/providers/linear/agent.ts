@@ -146,6 +146,7 @@ export class LinearAgentError extends Error {
 
 export type LinearAgentOperation =
   | { kind: "viewer" }
+  | { kind: "readNonOwnerOrigin"; sessionId: string }
   | { kind: "createActivity" | "readActivity"; sessionId: string }
   | {
       kind: "readPilotPrompt" | "readPilotHistory" | "readDelegationOrigin";
@@ -461,12 +462,47 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
   const run = agentRunner(options, api);
   return {
     ...historyMethods(run, api.requireHistoryScope),
+    ...nonOwnerMethods(run, options.pilotOperations),
     ...activityCreateMethods(run, options.pilotOperations),
     ...activityReadMethods(run, options.pilotOperations),
     ...linkMethods(run, hubOrigin),
     ...viewerMethods(run),
     ...eligibleMethods(run),
     ...startMethods(run),
+  };
+}
+
+const nonOwnerOriginQuery = `query PaseoPilotNonOwnerOrigin($sessionId: String!) {
+  agentSession(id: $sessionId) {
+    id creator { id app active guest } comment { id user { id } botActor { id } }
+  }
+}`;
+
+const nonOwnerOrigin = z.object({
+  agentSession: ref
+    .extend({
+      creator: ref.extend({ app: z.boolean(), active: z.boolean(), guest: z.boolean() }).nullable(),
+      comment: ref.extend({ user: ref.nullable(), botActor: ref.nullable() }).nullable(),
+    })
+    .nullable(),
+});
+
+function nonOwnerMethods(run: AgentRun, pilotOperations: true | undefined) {
+  return {
+    async readNonOwnerOrigin(sessionId: string, signal: AbortSignal) {
+      if (!pilotOperations) throw new LinearAgentError("invalid_input");
+      const variables = { sessionId: parse(id, sessionId, "invalid_input") };
+      return run(
+        { kind: "readNonOwnerOrigin", sessionId },
+        variables,
+        signal,
+        async (send, _viewer, checkCurrent) => {
+          const data = await send(nonOwnerOriginQuery, variables, nonOwnerOrigin);
+          await checkCurrent();
+          return data.agentSession;
+        },
+      );
+    },
   };
 }
 

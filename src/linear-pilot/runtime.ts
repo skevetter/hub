@@ -31,6 +31,7 @@ import {
   type PilotTurn,
 } from "./follow-up.js";
 import type { PilotHistoryScope } from "./history-read.js";
+import { createNonOwnerOrigin } from "./origin-non-owner.js";
 import { createPilotSessionSerialization } from "./session-serialization.js";
 import type { LinearPilotSessionHooks } from "./session.js";
 import {
@@ -574,7 +575,8 @@ function clientFor(state: RuntimeState, grant: Active, activity = grant.activity
     operation.sessionId === activity.nativeSessionId &&
     (!("issueId" in operation) || operation.issueId === grant.origin.issueId) &&
     operation.kind !== "addHubUrl" &&
-    operation.kind !== "readDelegationOrigin";
+    operation.kind !== "readDelegationOrigin" &&
+    operation.kind !== "readNonOwnerOrigin";
   return grant.provider.activityClient({
     binding: activity.binding,
     authorize: async (_binding, operation) => {
@@ -937,17 +939,46 @@ async function readCompanionHandle(state: RuntimeState, provider: Provider) {
   }
 }
 
+function trackJob(
+  state: RuntimeState,
+  work: Promise<void>,
+  metadata: Pick<PilotFailure, "sessionId" | "operation">,
+) {
+  const job = work
+    .catch((error: unknown) =>
+      reportRuntimeFailure(state, {
+        ...metadata,
+        ...pilotExceptionFields(error),
+      }),
+    )
+    .finally(() => state.jobs.delete(job));
+  state.jobs.add(job);
+}
+
 function configureRegistration(state: RuntimeState): LinearPilotRegistration {
   const {
-    jobs,
     options: { config, runtime },
   } = state;
+  const nonOwner = createNonOwnerOrigin({
+    config,
+    database: runtime,
+    locks: state.options.locks,
+    accepting: () => state.accepting,
+  });
   return {
     async offer(input, provider) {
       const sessions = state.coordinator;
       if (!state.accepting || !sessions) {
         logPilotRefusal("not_accepting", pilotDeliveryMetadata(input.payload));
         return false;
+      }
+      const refusal = await nonOwner.qualify(input, provider);
+      if (state.accepting && refusal) {
+        trackJob(state, nonOwner.reply(refusal), {
+          sessionId: refusal.mention.nativeSessionId,
+          operation: "created",
+        });
+        return true;
       }
       const qualified = await qualifyLinearPilotDelivery(
         runtime,
@@ -957,16 +988,14 @@ function configureRegistration(state: RuntimeState): LinearPilotRegistration {
       );
       if (!state.accepting || !qualified) return false;
       const dispatch = qualified.event.kind === "created" ? dispatchCreated : dispatchFollowUp;
-      const job = dispatch(state, { qualified, provider, receivedAt: input.receivedAt, sessions })
-        .catch((error: unknown) =>
-          reportRuntimeFailure(state, {
-            sessionId: qualified.event.nativeSessionId,
-            ...pilotExceptionFields(error),
-            operation: qualified.event.kind,
-          }),
-        )
-        .finally(() => jobs.delete(job));
-      jobs.add(job);
+      trackJob(
+        state,
+        dispatch(state, { qualified, provider, receivedAt: input.receivedAt, sessions }),
+        {
+          sessionId: qualified.event.nativeSessionId,
+          operation: qualified.event.kind,
+        },
+      );
       return true;
     },
     async suppressComment(event, provider) {

@@ -66,9 +66,19 @@ export type LinearPilotRefusal =
   | "unqualified_content"
   | "oversized";
 
+export interface NonOwnerMention {
+  actorId: string;
+  nativeSessionId: string;
+  commentId: string;
+}
+
 export type LinearPilotIntakeResult =
   | { readonly ok: true; readonly event: LinearPilotEvent }
-  | { readonly ok: false; readonly reason: LinearPilotRefusal };
+  | {
+      readonly ok: false;
+      readonly reason: LinearPilotRefusal;
+      readonly nonOwnerMention?: NonOwnerMention;
+    };
 
 type Record_ = Readonly<Record<string, unknown>>;
 
@@ -199,13 +209,40 @@ function readCreated(scope: Scope): LinearPilotIntakeResult {
   const { session } = scope;
   const humanId = id(field(session, "creatorId"));
   if (humanId === undefined) return refuse("missing_creator");
-  if (!isOwner(scope, humanId)) return refuse("not_owner");
+  if (!isOwner(scope, humanId)) return refuseNonOwnerCreated(scope, humanId);
   if (scope.teamId === undefined) return refuse("malformed");
   const creator = field(session, "creator");
   if (creator !== undefined && creator !== null) {
     if (id(field(plain(creator) ?? {}, "id")) !== humanId) return refuse("session_mismatch");
   }
   return readCreatedOrigin(scope, humanId);
+}
+
+function refuseNonOwnerCreated(scope: Scope, actorId: string): LinearPilotIntakeResult {
+  const { session, installation, teamId } = scope;
+  if (actorId === installation.appUserId || teamId === undefined) return refuse("not_owner");
+  const comment = plain(field(session, "comment"));
+  if (comment === undefined || field(comment, "userId") !== actorId) return refuse("not_owner");
+  const commentId = id(field(session, "commentId"));
+  if (
+    commentId === undefined ||
+    field(comment, "id") !== commentId ||
+    field(comment, "issueId") !== scope.issueId
+  )
+    return refuse("not_owner");
+  return {
+    ok: false,
+    reason: "not_owner",
+    nonOwnerMention: { actorId, nativeSessionId: scope.sessionId, commentId },
+  };
+}
+
+export function mayVerifyNonOwnerMention(config: LinearPilotConfig, payload: unknown) {
+  if (!isPlainRecord(payload) || field(payload, "action") !== "created") return false;
+  const session = field(payload, "agentSession");
+  if (!isPlainRecord(session)) return false;
+  const creatorId = id(field(session, "creatorId"));
+  return creatorId !== undefined && creatorId !== config.allowedHumanId;
 }
 
 function readCreatedOrigin(scope: Scope, humanId: string): LinearPilotIntakeResult {
