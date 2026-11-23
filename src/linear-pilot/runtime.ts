@@ -34,6 +34,7 @@ import type { PilotHistoryScope } from "./history-read.js";
 import { awaitDelegationOwner, confirmDelegationOwner } from "./origin-confirmation.js";
 import { createNonOwnerOrigin } from "./origin-non-owner.js";
 import { createPilotSessionSerialization } from "./session-serialization.js";
+import { createLinearPilotToolStepHook, type ToolStepHook } from "./tool-steps.js";
 import type { LinearPilotSessionHooks } from "./session.js";
 import {
   authorizeBoundPilotTurn,
@@ -202,6 +203,7 @@ interface FollowUpActions {
   pending: PendingStarts;
   accepting(): boolean;
   activity(kind: "prompted" | "stop", interactionId: string): LinearPilotAcceptedEvent;
+  closeToolSteps(activity: LinearPilotAcceptedEvent): void;
   writerFor: CreatedDependencies["writerFor"];
   report: (failureCode: PilotFailure["failureCode"]) => void;
 }
@@ -332,6 +334,7 @@ async function stopFollowUpTurn(
   if (!prior || !turn.agentId || !turn.daemonTurnId || !actions.accepting()) return "ignored";
   const { session, grant } = prior;
   grant.stopping = true;
+  actions.closeToolSteps(grant.activity);
   try {
     const stopped = await actions.sessions.stopLinearPilot({
       organizationId: session.organizationId,
@@ -459,6 +462,7 @@ interface RuntimeState {
   jobs: Set<Promise<void>>;
   accepting: boolean;
   coordinator?: InteractiveSessionCoordinator;
+  toolSteps?: ReturnType<typeof createLinearPilotToolStepHook>;
 }
 
 interface RuntimeDelivery {
@@ -750,6 +754,7 @@ function followUpActions(
     accepting: () => state.accepting,
     activity: (activityKind, id) =>
       acceptedActivity(config, qualified, { kind: activityKind, interactionId: id, receivedAt }),
+    closeToolSteps: (activity) => state.toolSteps?.close(activity),
     writerFor: (grant) => runtimeWriter(state, grant),
     report,
   };
@@ -939,7 +944,16 @@ function configureSessionHooks(state: RuntimeState): LinearPilotSessionHooks {
         }
       });
     },
+    ...(state.toolSteps === undefined ? {} : { toolSteps: state.toolSteps }),
   };
+}
+
+function resolveToolStepTurn(state: RuntimeState, scope: Parameters<ToolStepHook>[0]) {
+  const grant = state.active.get(scope.sessionId);
+  if (!state.accepting || !grant || grant.stopping) return undefined;
+  if (grant.commandId !== scope.commandId) return undefined;
+  if (grant.authority.organizationId !== scope.organizationId) return undefined;
+  return { event: grant.activity, clientFor: () => clientFor(state, grant) };
 }
 
 async function readCompanionHandle(state: RuntimeState, provider: Provider) {
@@ -1062,6 +1076,12 @@ export function createLinearPilotRuntime(options: Options) {
     jobs,
     accepting: true,
   };
+  if (options.config.toolSteps === true) {
+    state.toolSteps = createLinearPilotToolStepHook({
+      resolve: (scope) => resolveToolStepTurn(state, scope),
+      scrubValues: options.scrubValues,
+    });
+  }
   return {
     sessionHooks: configureSessionHooks(state),
     registration: configureRegistration(state),
