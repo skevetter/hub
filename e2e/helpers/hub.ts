@@ -112,15 +112,25 @@ export interface Account {
 
 const INTERACTIVE_ORGANIZATION_NAME = "Paseo Hub";
 
-/** The flat organization sidebar entries, in rendered order. */
-const ORGANIZATION_DESTINATIONS = [
-  "Home",
-  "Triggers",
-  "Activity",
-  "Daemons",
-  "Connections",
-  "Settings",
-] as const;
+async function organizationDestinations(navigation: Locator): Promise<readonly string[]> {
+  const links = navigation.getByRole("link");
+  await expect(navigation.getByRole("link", { name: "Settings", exact: true })).toBeVisible();
+  const sessionsEnabled =
+    (await navigation.getByRole("link", { name: "Sessions", exact: true }).count()) > 0;
+  const destinations = [
+    "Home",
+    "Activity",
+    ...(sessionsEnabled ? ["Sessions"] : []),
+    "Triggers",
+    "Daemons",
+    "Connections",
+    ...(sessionsEnabled ? ["Profiles"] : []),
+    "Settings",
+  ];
+  await expect(links).toHaveText(destinations);
+  return destinations;
+}
+
 /** Instance surfaces sit outside `/o/`, so the path is what says the sidebar is in instance scope. */
 const INSTANCE_ROUTES: readonly string[] = ["/apps", "/operator"];
 const ORGANIZATION_SETTINGS_SECTIONS: readonly OrganizationSettingsSection[] = [
@@ -2784,11 +2794,7 @@ class HubUser {
     await this.completeFirstRunClaimWithKeyboard(account, armAccountSetupFailure);
     await this.page.setViewportSize({ width: 1280, height: 800 });
     await expect(this.page.getByText(account.email, { exact: true })).toBeVisible();
-    // Keyboard control survives both the mobile onboarding arrival and the resize: closing the
-    // drawer restores its trigger, and that same control remains focused in the desktop header.
-    await expect(
-      this.page.getByRole("main").getByRole("button", { name: "Toggle Sidebar" }),
-    ).toBeFocused();
+    await expect(this.mobileNavigation()).toBeHidden();
 
     // Setup provisioned a working organization, not just a row: organization Home renders.
     await this.navigation.expectBreadcrumb(INTERACTIVE_ORGANIZATION_NAME, "Home");
@@ -3826,16 +3832,13 @@ class HubUser {
 
   async navigateToDaemonsFromMobileSidebar(): Promise<void> {
     await this.page.goto(this.origin);
-    const trigger = this.page.getByRole("button", { name: "Toggle Sidebar" });
-    await trigger.focus();
-    await this.page.keyboard.press("Enter");
-    const sidebar = this.page.getByRole("dialog", { name: "Sidebar" });
-    await expect(sidebar).toBeVisible();
-    const daemons = sidebar.getByRole("link", { name: "Daemons", exact: true });
+    await this.moreTrigger().press("Enter");
+    const sheet = this.moreSheet();
+    const daemons = sheet.getByRole("link", { name: "Daemons", exact: true });
     await daemons.focus();
     await this.page.keyboard.press("Enter");
     await expect(this.page).toHaveURL(/\/o\/[^/]+\/daemons$/u);
-    await expect(sidebar).toBeHidden();
+    await expect(sheet).toBeHidden();
     await expect(this.page.getByRole("heading", { name: "Daemons", exact: true })).toBeVisible();
     await expect(this.page.getByText("No daemons connected", { exact: true })).toBeVisible();
     await expect(
@@ -3981,26 +3984,23 @@ class HubUser {
   }
 
   async expectActiveOrganization(name: string): Promise<void> {
-    const drawer = this.page.getByRole("dialog", { name: "Sidebar" });
-    const mobile = (this.page.viewportSize()?.width ?? 1280) < 768;
+    const sheet = this.moreSheet();
+    const mobile = (this.page.viewportSize()?.width ?? 1280) < 860;
     if (!mobile) {
       await expect(
         this.page.getByRole("button", { name: "Organization", exact: true }),
       ).toContainText(name);
       return;
     }
-    const drawerWasOpen = await drawer.isVisible().catch(() => false);
-    if (!drawerWasOpen) {
-      const toggle = this.page.getByRole("main").getByRole("button", { name: "Toggle Sidebar" });
-      await expect(toggle).toBeVisible();
-      await toggle.click();
-    }
-    await expect(drawer.getByRole("button", { name: "Organization", exact: true })).toContainText(
+    const sheetWasOpen = await sheet.isVisible();
+    if (!sheetWasOpen) await this.moreTrigger().click();
+    await expect(sheet.getByRole("button", { name: "Organization", exact: true })).toContainText(
       name,
     );
-    if (!drawerWasOpen) {
+    if (!sheetWasOpen) {
       await this.page.keyboard.press("Escape");
-      await expect(drawer).toBeHidden();
+      await expect(sheet).toBeHidden();
+      await expect(this.moreTrigger()).toBeFocused();
     }
   }
 
@@ -4080,44 +4080,35 @@ class HubUser {
 
   async navigateToTeamFromMobileSidebar(): Promise<void> {
     await this.page.goto(this.origin);
-    await expect(this.page.getByRole("heading", { name: "Home" })).toBeVisible();
-    const trigger = this.page.getByRole("button", { name: "Toggle Sidebar" });
+    const more = this.moreTrigger();
     await this.page.keyboard.press("Tab");
     await expect(this.page.getByRole("link", { name: "Skip to content" })).toBeFocused();
-    await this.page.keyboard.press("Tab");
-    await expect(trigger).toBeFocused();
-    await this.page.keyboard.press("Enter");
-    const sidebar = this.page.getByRole("dialog", { name: "Sidebar" });
-    await expect(sidebar).toBeVisible();
-    const organization = sidebar.getByRole("button", { name: "Organization" });
-    const settings = sidebar.getByRole("link", { name: "Settings", exact: true });
+
+    await more.press("Enter");
+    const sheet = this.moreSheet();
+    const organization = sheet.getByRole("button", { name: "Organization" });
     await expect(organization).toBeFocused();
     await expectAccessible(this.page);
     await this.page.keyboard.press("Escape");
-    await expect(sidebar).toBeHidden();
-    await expect(trigger).toBeFocused();
+    await expect(sheet).toBeHidden();
+    await expect(more).toBeFocused();
+
     await this.page.keyboard.press("Enter");
-    await expect(sidebar).toBeVisible();
     await expect(organization).toBeFocused();
-    // Forward through the destinations in their rendered order rather than relying on the
-    // focus trap wrapping backwards: the drawer now ends on the account menu, not on Settings.
-    for (const destination of ORGANIZATION_DESTINATIONS) {
-      await this.page.keyboard.press("Tab");
-      await expect(sidebar.getByRole("link", { name: destination, exact: true })).toBeFocused();
-    }
-    await expect(settings).toBeFocused();
+    const navigation = sheet.getByRole("navigation", { name: "Organization", exact: true });
+    await this.tabThroughOrganizationDestinations(navigation);
     await this.page.keyboard.press("Enter");
-    // Settings lands on Team, the one section every role can read.
     await expect(this.page).toHaveURL(/\/o\/[^/]+\/settings\/team$/u);
-    await expect(sidebar).toBeHidden();
+    await expect(sheet).toBeHidden();
     await expect(this.page.getByRole("heading", { name: "Team", exact: true })).toBeVisible();
   }
 
-  /** Tabs from the organization switcher through the sidebar's destinations, asserting order. */
-  private async tabThroughOrganizationDestinations(): Promise<void> {
-    for (const destination of ORGANIZATION_DESTINATIONS) {
+  private async tabThroughOrganizationDestinations(
+    navigation = this.page.getByRole("navigation", { name: "Organization", exact: true }),
+  ): Promise<void> {
+    for (const destination of await organizationDestinations(navigation)) {
       await this.page.keyboard.press("Tab");
-      await expect(this.page.getByRole("link", { name: destination, exact: true })).toBeFocused();
+      await expect(navigation.getByRole("link", { name: destination, exact: true })).toBeFocused();
     }
   }
 
@@ -4135,12 +4126,8 @@ class HubUser {
 
   async navigateToConnectionsFromMobileSidebar(): Promise<void> {
     await this.page.goto(this.origin);
-    const trigger = this.page.getByRole("button", { name: "Toggle Sidebar" });
-    await trigger.click();
-    const sidebar = this.page.getByRole("dialog", { name: "Sidebar" });
-    await sidebar.getByRole("link", { name: "Connections", exact: true }).click();
+    await this.openMobileOrganizationSection("Connections");
     await expect(this.page).toHaveURL(/\/o\/[^/]+\/connections$/u);
-    await expect(sidebar).toBeHidden();
     await this.expectConnectionContents();
   }
 
@@ -5262,28 +5249,51 @@ class HubUser {
     await form.getByRole("button", { name: "Create organization" }).click();
   }
 
-  /**
-   * Reaches an organization surface by whichever route the information architecture puts it on:
-   * Projects, Daemons, and Connections are sidebar entries, the administration sections are tabs
-   * under Settings. Callers name the destination, not the path to it.
-   */
+  private mobileNavigation(): Locator {
+    return this.page.getByRole("navigation", { name: "Quick navigation" });
+  }
+
+  private moreTrigger(): Locator {
+    return this.mobileNavigation().getByRole("button", { name: "More", exact: true });
+  }
+
+  private moreSheet(): Locator {
+    return this.page.getByRole("dialog", { name: "More", exact: true });
+  }
+
+  private async openMobileOrganizationSection(name: OrganizationSection): Promise<void> {
+    const quickLink = this.mobileNavigation().getByRole("link", { name, exact: true });
+    if (await quickLink.isVisible()) {
+      await quickLink.click();
+      return;
+    }
+    await this.moreTrigger().click();
+    const sheet = this.moreSheet();
+    const navigation = sheet.getByRole("navigation", { name: "Organization", exact: true });
+    await navigation.getByRole("link", { name, exact: true }).click();
+    await expect(sheet).toBeHidden();
+  }
+
   private async openOrganizationSection(
     name: OrganizationSection | OrganizationSettingsSection,
   ): Promise<void> {
     const settings = ORGANIZATION_SETTINGS_SECTIONS.includes(name as OrganizationSettingsSection);
     await this.returnToOrganizationScope();
-    const mobile = await this.page
-      .getByRole("button", { name: "Toggle Sidebar" })
-      .isVisible()
-      .catch(() => false);
-    if (settings) {
-      const section = name as OrganizationSettingsSection;
-      if (mobile) await this.navigation.openMobileOrganizationSettings(section);
-      else await this.navigation.openOrganizationSettings(section);
+    const mobile = await this.mobileNavigation().isVisible();
+    if (mobile) {
+      await this.openMobileOrganizationSection(
+        settings ? "Settings" : (name as OrganizationSection),
+      );
+      if (settings) {
+        await this.page
+          .getByRole("navigation", { name: "Organization settings" })
+          .getByRole("link", { name, exact: true })
+          .click();
+      }
+    } else if (settings) {
+      await this.navigation.openOrganizationSettings(name as OrganizationSettingsSection);
     } else {
-      const section = name as OrganizationSection;
-      if (mobile) await this.navigation.openMobileOrganizationSection(section);
-      else await this.navigation.openOrganizationSection(section);
+      await this.navigation.openOrganizationSection(name as OrganizationSection);
     }
     await expect(this.page.getByRole("heading", { name, exact: true, level: 1 })).toBeVisible();
   }
@@ -5297,8 +5307,8 @@ class HubUser {
     const pathname = new URL(this.page.url()).pathname;
     const instance = INSTANCE_ROUTES.includes(pathname);
     if (!instance && !/\/projects\/[^/]+\//u.test(pathname)) return;
-    const mobileSidebar = this.page.getByRole("button", { name: "Toggle Sidebar" });
-    if (await mobileSidebar.isVisible().catch(() => false)) await mobileSidebar.click();
+    const more = this.moreTrigger();
+    if (await more.isVisible()) await more.click();
     if (instance) await this.navigation.leaveInstance();
     else await this.navigation.leaveProject();
     await expect(this.page.getByRole("heading", { name: "Home" })).toBeVisible();
