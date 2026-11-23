@@ -51,7 +51,10 @@ export function parseLinearPilotConfig(raw: string | undefined): LinearPilotConf
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return invalid("not_a_record");
   }
-  const record = new Map<string, unknown>(Object.entries(parsed));
+  return parseRecord(raw, new Map<string, unknown>(Object.entries(parsed)));
+}
+
+function parseRecord(raw: string, record: ReadonlyMap<string, unknown>): LinearPilotConfigResult {
   if ([...record.keys()].some((key) => !KEYS.some((known) => known === key))) {
     return invalid("unknown_key");
   }

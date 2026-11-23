@@ -55,22 +55,42 @@ function toolEvent(
   scrub: TimelineScrubber,
 ): ProjectedTimelineEvent | undefined {
   if (item.type !== "tool_call") return undefined;
-  const finished = typeof item.status === "string" && Object.hasOwn(TOOL_STATUSES, item.status);
-  if (!finished && item.status !== "running") return undefined;
-  const hasCallId = typeof item.callId === "string" && item.callId.length > 0;
-  if (!finished && !hasCallId) return undefined;
+  const { status, callId } = item;
+  if (typeof status !== "string") return undefined;
+  const finished = Object.hasOwn(TOOL_STATUSES, status);
+  const hasCallId = typeof callId === "string" && callId.length > 0;
+  if (!finished && (status !== "running" || !hasCallId)) return undefined;
   const tool = toolName(item.name, scrub);
   const data: TimelineData = { tool, category: toolCategory(tool) };
-  if (hasCallId) {
-    const callId = item.callId!;
-    const safe = scrub(callId, 64);
-    data["callId"] =
-      IDENTIFIER.test(callId) && safe === callId
-        ? callId
-        : createHash("sha256").update(callId).digest("hex").slice(0, 16);
-  }
-  if (finished) data["status"] = item.status!;
+  if (hasCallId) data["callId"] = projectCallId(callId, scrub);
+  if (finished) data["status"] = status;
   return { kind: finished ? "tool_finished" : "tool_started", data };
+}
+
+function projectCallId(callId: string, scrub: TimelineScrubber) {
+  const safe = scrub(callId, 64);
+  return IDENTIFIER.test(callId) && safe === callId
+    ? callId
+    : createHash("sha256").update(callId).digest("hex").slice(0, 16);
+}
+
+function turnFailure(
+  kind: "turn_failed" | "turn_canceled",
+  value: unknown,
+  scrub: TimelineScrubber,
+): ProjectedTimelineEvent | undefined {
+  if (typeof value !== "string") return undefined;
+  return kind === "turn_failed"
+    ? { kind, data: { error: scrub(value, 240) } }
+    : { kind, data: { reason: scrub(value, 120) } };
+}
+
+function permissionRequested(candidate: unknown, scrub: TimelineScrubber): ProjectedTimelineEvent {
+  const safe = typeof candidate === "string" ? scrub(candidate, 64) : undefined;
+  return {
+    kind: "permission_requested",
+    data: safe !== undefined && TOOL_NAME.test(safe) ? { tool: safe } : {},
+  };
 }
 
 function agentEvent(
@@ -85,19 +105,11 @@ function agentEvent(
     case "turn_completed":
       return { kind: "turn_ended", data: {} };
     case "turn_failed":
-      if (typeof event.error !== "string") return undefined;
-      return { kind: "turn_failed", data: { error: scrub(event.error, 240) } };
+      return turnFailure(event.type, event.error, scrub);
     case "turn_canceled":
-      if (typeof event.reason !== "string") return undefined;
-      return { kind: "turn_canceled", data: { reason: scrub(event.reason, 120) } };
-    case "permission_requested": {
-      const candidate = event.request["toolName"];
-      const safe = typeof candidate === "string" ? scrub(candidate, 64) : undefined;
-      return {
-        kind: "permission_requested",
-        data: safe !== undefined && TOOL_NAME.test(safe) ? { tool: safe } : {},
-      };
-    }
+      return turnFailure(event.type, event.reason, scrub);
+    case "permission_requested":
+      return permissionRequested(event.request["toolName"], scrub);
     case "permission_resolved":
       return { kind: "permission_resolved", data: {} };
     case "attention_required":
@@ -126,6 +138,14 @@ function validStepCounts(steps: TimelineStepCounts | null | undefined): boolean 
   );
 }
 
+function validStepResult(input: Extract<TimelineProjectionInput, { kind: "step_finished" }>) {
+  return (
+    (input.completion === undefined || input.completion === "inferred_from_turn_end") &&
+    (input.exitCode == null || (count(input.exitCode) && input.exitCode <= 255)) &&
+    (input.failure == null || typeof input.failure === "string")
+  );
+}
+
 function stepFinished(
   input: Extract<TimelineProjectionInput, { kind: "step_finished" }>,
   scrub: TimelineScrubber,
@@ -136,10 +156,7 @@ function stepFinished(
     !duration(input.durationMs)
   )
     return undefined;
-  if (input.completion !== undefined && input.completion !== "inferred_from_turn_end")
-    return undefined;
-  if (input.exitCode != null && (!count(input.exitCode) || input.exitCode > 255)) return undefined;
-  if (input.failure != null && typeof input.failure !== "string") return undefined;
+  if (!validStepResult(input)) return undefined;
   const data: TimelineData = { status: input.status, durationMs: input.durationMs };
   if (input.exitCode !== undefined) data["exitCode"] = input.exitCode;
   if (input.completion !== undefined) data["completion"] = input.completion;
@@ -147,18 +164,20 @@ function stepFinished(
   return { kind: "step_finished", data };
 }
 
+function validRunHeader(input: Extract<TimelineProjectionInput, { kind: "run_finished" }>) {
+  return (
+    typeof input.status === "string" &&
+    Object.hasOwn(RUN_STATUSES, input.status) &&
+    duration(input.durationMs) &&
+    count(input.stepRowsOmitted)
+  );
+}
+
 function runFinished(
   input: Extract<TimelineProjectionInput, { kind: "run_finished" }>,
   scrub: TimelineScrubber,
 ): ProjectedTimelineEvent | undefined {
-  if (
-    typeof input.status !== "string" ||
-    !Object.hasOwn(RUN_STATUSES, input.status) ||
-    !duration(input.durationMs) ||
-    !count(input.stepRowsOmitted) ||
-    !validStepCounts(input.steps)
-  )
-    return undefined;
+  if (!validRunHeader(input) || !validStepCounts(input.steps)) return undefined;
   if (input.failure != null && typeof input.failure !== "string") return undefined;
   const steps = input.steps;
   const terminal =
@@ -183,6 +202,20 @@ function runFinished(
   return { kind: "run_finished", data };
 }
 
+function stepStarted(
+  input: Extract<TimelineProjectionInput, { kind: "step_started" }>,
+  scrub: TimelineScrubber,
+): ProjectedTimelineEvent | undefined {
+  if (input.type !== "agent" && input.type !== "script") return undefined;
+  const data: TimelineData = { type: input.type };
+  if (input.type === "agent" && input.agent !== undefined) {
+    const agent: TimelineData = { provider: identifier(input.agent.provider, scrub) };
+    if (input.agent.mode !== undefined) agent["mode"] = identifier(input.agent.mode, scrub);
+    data["agent"] = agent;
+  }
+  return { kind: "step_started", data };
+}
+
 export function projectTimelineEvent(
   input: TimelineProjectionInput,
   scrub: TimelineScrubber,
@@ -196,16 +229,8 @@ export function projectTimelineEvent(
         kind: "run_started",
         data: { trigger: scrub(input.trigger, 120), steps: input.steps },
       };
-    case "step_started": {
-      if (input.type !== "agent" && input.type !== "script") return undefined;
-      const data: TimelineData = { type: input.type };
-      if (input.type === "agent" && input.agent !== undefined) {
-        const agent: TimelineData = { provider: identifier(input.agent.provider, scrub) };
-        if (input.agent.mode !== undefined) agent["mode"] = identifier(input.agent.mode, scrub);
-        data["agent"] = agent;
-      }
-      return { kind: "step_started", data };
-    }
+    case "step_started":
+      return stepStarted(input, scrub);
     case "step_finished":
       return stepFinished(input, scrub);
     case "run_finished":

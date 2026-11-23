@@ -119,114 +119,229 @@ function claim(claims: Map<string, number>, slot: string, started: number) {
   return undefined;
 }
 
-export function createLinearPilotActivities({ clientFor, now = Date.now }: ActivityOptions) {
+interface WriteActivity extends ActivitySlot {
+  event: LinearPilotAcceptedEvent;
+  attempt: LinearPilotActivityAttempt;
+  signal: AbortSignal | undefined;
+}
+
+interface ActivitySlot {
+  purpose: Purpose;
+  kind: BodyContent["type"];
+  prepareBody: () => string | undefined;
+}
+
+interface Delivery {
+  sessionId: string;
+  activityId: string;
+  ack: boolean;
+  providerSignal: { signal: "continue" } | undefined;
+  callSignal: AbortSignal;
+  interrupted: () => LinearPilotWriteDisposition | undefined;
+}
+
+type Write = (input: WriteActivity) => Promise<LinearPilotWriteDisposition>;
+
+function validWrite({ event, kind }: WriteActivity) {
+  return (
+    event.decision === "accepted" &&
+    validId(event.nativeSessionId) &&
+    validId(event.interactionId) &&
+    (kind !== "error" || isAllowedHuman(event))
+  );
+}
+
+function claimWrite(input: WriteActivity, claims: Map<string, number>, started: number) {
+  if (input.attempt === "readback-only") return undefined;
+  if (input.attempt !== "first-attempt") return "denied";
+  const { event, purpose } = input;
+  // A prompt gets one terminal output, including when it arrives during another turn.
+  const slot = JSON.stringify([
+    event.nativeSessionId,
+    purpose === "ack" ? null : event.interactionId,
+  ]);
+  return claim(claims, slot, started);
+}
+
+async function mutate(client: PilotClient, content: BodyContent, delivery: Delivery) {
+  const { sessionId, activityId, interrupted, callSignal, ack, providerSignal } = delivery;
+  try {
+    const writtenId = await client.createActivity(
+      { sessionId, activityId, content, ...(ack ? { ephemeral: false } : {}), ...providerSignal },
+      callSignal,
+    );
+    return (
+      interrupted() ??
+      (writtenId === activityId
+        ? ({ disposition: "confirmed", activityId, via: "mutation" } as const)
+        : undefined)
+    );
+  } catch (error) {
+    return (
+      interrupted() ??
+      (isDenied(error) ? ({ disposition: "denied", activityId } as const) : undefined)
+    );
+  }
+}
+
+async function readActivity(client: PilotClient, kind: BodyContent["type"], delivery: Delivery) {
+  const { sessionId, activityId, interrupted, callSignal, providerSignal } = delivery;
+  const beforeReadback = interrupted();
+  if (beforeReadback) return beforeReadback;
+  const found = await client.isActivityConfirmed(
+    { sessionId, activityId, kind, ...providerSignal },
+    callSignal,
+  );
+  return (
+    interrupted() ??
+    (found
+      ? ({ disposition: "confirmed", activityId, via: "readback" } as const)
+      : ({ disposition: "unconfirmed", activityId } as const))
+  );
+}
+
+async function deliver(
+  input: WriteActivity,
+  delivery: Delivery,
+  clientFor: ActivityOptions["clientFor"],
+): Promise<LinearPilotWriteDisposition> {
+  const { interrupted, activityId } = delivery;
+  const { attempt, prepareBody, event, kind } = input;
+  try {
+    const body = attempt === "first-attempt" ? prepareBody() : undefined;
+    if (attempt === "first-attempt" && body === undefined)
+      return { disposition: "denied", activityId };
+    const beforeClient = interrupted();
+    if (beforeClient) return beforeClient;
+    const client = clientFor(event);
+    if (body !== undefined) {
+      const result = await mutate(client, { type: kind, body }, delivery);
+      if (result) return result;
+    }
+    return await readActivity(client, kind, delivery);
+  } catch (error) {
+    return interrupted() ?? { disposition: isDenied(error) ? "denied" : "unconfirmed", activityId };
+  }
+}
+
+interface WriteTiming {
+  ack: boolean;
+  initial: boolean;
+  deadline: number;
+}
+
+async function deliverBeforeDeadline(
+  input: WriteActivity,
+  timing: WriteTiming,
+  activityId: string,
+  options: Required<ActivityOptions>,
+) {
+  const { signal, purpose, event } = input;
+  const { ack, initial, deadline } = timing;
+  const { clientFor, now } = options;
+  const timeout = new AbortController();
+  const callSignal = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
+  const interrupted = () => {
+    if (timeout.signal.aborted || now() >= deadline) {
+      return { disposition: initial ? "expired" : "unconfirmed", activityId } as const;
+    }
+    return callSignal.aborted ? ({ disposition: "cancelled", activityId } as const) : undefined;
+  };
+  const delivery = {
+    sessionId: event.nativeSessionId,
+    activityId,
+    ack,
+    callSignal,
+    interrupted,
+    providerSignal: purpose === "busy" ? { signal: "continue" as const } : undefined,
+  };
+  const completion = Promise.withResolvers<LinearPilotWriteDisposition>();
+  const onAbort = () =>
+    completion.resolve(interrupted() ?? { disposition: "cancelled", activityId });
+  callSignal.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(() => timeout.abort(), Math.max(0, deadline - now()));
+  try {
+    return await Promise.race([deliver(input, delivery, clientFor), completion.promise]);
+  } finally {
+    clearTimeout(timer);
+    callSignal.removeEventListener("abort", onAbort);
+  }
+}
+
+function makeWriter(options: Required<ActivityOptions>): Write {
   const claims = new Map<string, number>();
-  async function write(
+  return async (input) => {
+    const { event, purpose, signal } = input;
+    if (!validWrite(input)) return { disposition: "denied" };
+    if (signal?.aborted) return { disposition: "cancelled" };
+    const started = options.now();
+    const timing = activityTiming(purpose, event.receivedAt, started);
+    if (timing.initial && expiredInitialWrite(timing.deadline, event.receivedAt, started))
+      return { disposition: "expired" };
+    const activityId = stableActivityId(event.nativeSessionId, purpose, event.interactionId);
+    const refused = claimWrite(input, claims, started);
+    if (refused === "denied") return { disposition: refused };
+    if (refused) return { disposition: refused, activityId };
+    return deliverBeforeDeadline(input, timing, activityId, options);
+  };
+}
+
+function respondWith(write: Write) {
+  return function respond(
     event: LinearPilotAcceptedEvent,
     attempt: LinearPilotActivityAttempt,
-    purpose: Purpose,
-    kind: BodyContent["type"],
-    prepareBody: () => string | undefined,
+    answer: FinalReplyAnswer | undefined,
+    ...[secrets, signal]: [secrets: readonly string[], signal?: AbortSignal]
+  ): Promise<LinearPilotWriteDisposition> {
+    if (event.kind !== "created" && event.kind !== "prompted")
+      return Promise.resolve({ disposition: "denied" } as const);
+    return write({
+      event,
+      attempt,
+      purpose: "terminal",
+      kind: "response",
+      signal,
+      prepareBody: () => safeReply(event.publishAnswer ? answer : undefined, secrets),
+    });
+  };
+}
+
+function stopWith(write: Write) {
+  return function stop(
+    event: LinearPilotAcceptedEvent,
+    attempt: LinearPilotActivityAttempt,
+    outcome: "confirmed" | "unconfirmed",
     signal?: AbortSignal,
   ): Promise<LinearPilotWriteDisposition> {
-    if (
-      event.decision !== "accepted" ||
-      !validId(event.nativeSessionId) ||
-      !validId(event.interactionId)
-    ) {
-      return { disposition: "denied" };
-    }
-    if (kind === "error" && !isAllowedHuman(event)) {
-      return { disposition: "denied" };
-    }
-    if (signal?.aborted) return { disposition: "cancelled" };
+    if (event.kind !== "stop" || (outcome !== "confirmed" && outcome !== "unconfirmed"))
+      return Promise.resolve({ disposition: "denied" } as const);
+    const confirmed = outcome === "confirmed";
+    return write({
+      event,
+      attempt,
+      purpose: "stop",
+      signal,
+      kind: confirmed ? "response" : "error",
+      prepareBody: () => (confirmed ? STOP_BODY : STOP_UNCONFIRMED_BODY),
+    });
+  };
+}
 
-    const started = now();
-    const { ack, initial, deadline } = activityTiming(purpose, event.receivedAt, started);
-    if (initial && expiredInitialWrite(deadline, event.receivedAt, started))
-      return { disposition: "expired" };
-    const { nativeSessionId: sessionId, interactionId } = event;
-    const providerSignal = purpose === "busy" ? { signal: "continue" as const } : undefined;
-    const activityId = stableActivityId(sessionId, purpose, interactionId);
-    if (attempt === "first-attempt") {
-      // A prompt gets one terminal output, including when it arrives during another turn.
-      const slot = JSON.stringify([sessionId, ack ? null : interactionId]);
-      const refused = claim(claims, slot, started);
-      if (refused) return { disposition: refused, activityId };
-    } else if (attempt !== "readback-only") {
-      return { disposition: "denied" };
-    }
+function refuseWith(write: Write) {
+  return delegationRefusalWriter((event) =>
+    write({
+      event,
+      attempt: "first-attempt",
+      purpose: "delegationRefused",
+      kind: "error",
+      prepareBody: () => DELEGATION_ERROR_BODY,
+      signal: undefined,
+    }),
+  );
+}
 
-    const timeout = new AbortController();
-    const callSignal = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
-    const interrupted = () => {
-      if (timeout.signal.aborted || now() >= deadline) {
-        return { disposition: initial ? "expired" : "unconfirmed", activityId } as const;
-      }
-      if (callSignal.aborted) return { disposition: "cancelled", activityId } as const;
-      return undefined;
-    };
-
-    async function deliver(): Promise<LinearPilotWriteDisposition> {
-      try {
-        const body = attempt === "first-attempt" ? prepareBody() : undefined;
-        if (attempt === "first-attempt" && body === undefined) {
-          return { disposition: "denied", activityId };
-        }
-        const beforeClient = interrupted();
-        if (beforeClient) return beforeClient;
-        const client = clientFor(event);
-        if (body !== undefined) {
-          try {
-            const writtenId = await client.createActivity(
-              {
-                sessionId,
-                activityId,
-                content: { type: kind, body },
-                ...(ack ? { ephemeral: false } : {}),
-                ...providerSignal,
-              },
-              callSignal,
-            );
-            const stopped = interrupted();
-            if (stopped) return stopped;
-            if (writtenId === activityId)
-              return { disposition: "confirmed", activityId, via: "mutation" };
-          } catch (error) {
-            const stopped = interrupted();
-            if (stopped) return stopped;
-            if (isDenied(error)) return { disposition: "denied", activityId };
-          }
-        }
-        const beforeReadback = interrupted();
-        if (beforeReadback) return beforeReadback;
-        const found = await client.isActivityConfirmed(
-          { sessionId, activityId, kind, ...providerSignal },
-          callSignal,
-        );
-        const stopped = interrupted();
-        if (stopped) return stopped;
-        if (found) return { disposition: "confirmed", activityId, via: "readback" };
-      } catch (error) {
-        const stopped = interrupted();
-        if (stopped) return stopped;
-        if (isDenied(error)) return { disposition: "denied", activityId };
-      }
-      return { disposition: "unconfirmed", activityId };
-    }
-
-    const completion = Promise.withResolvers<LinearPilotWriteDisposition>();
-    const onAbort = () =>
-      completion.resolve(interrupted() ?? { disposition: "cancelled", activityId });
-    callSignal.addEventListener("abort", onAbort, { once: true });
-    const timer = setTimeout(() => timeout.abort(), Math.max(0, deadline - now()));
-    try {
-      return await Promise.race([deliver(), completion.promise]);
-    } finally {
-      clearTimeout(timer);
-      callSignal.removeEventListener("abort", onAbort);
-    }
-  }
+export function createLinearPilotActivities({ clientFor, now = Date.now }: ActivityOptions) {
+  const write = makeWriter({ clientFor, now });
   return {
     acknowledge(
       event: LinearPilotAcceptedEvent,
@@ -234,26 +349,16 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
       signal?: AbortSignal,
     ): Promise<LinearPilotWriteDisposition> {
       if (event.kind !== "created") return Promise.resolve({ disposition: "denied" });
-      return write(event, attempt, "ack", "thought", () => ACK_BODY, signal);
-    },
-    respond(
-      event: LinearPilotAcceptedEvent,
-      attempt: LinearPilotActivityAttempt,
-      answer: FinalReplyAnswer | undefined,
-      secrets: readonly string[],
-      signal?: AbortSignal,
-    ): Promise<LinearPilotWriteDisposition> {
-      if (event.kind !== "created" && event.kind !== "prompted")
-        return Promise.resolve({ disposition: "denied" });
-      return write(
+      return write({
         event,
         attempt,
-        "terminal",
-        "response",
-        () => safeReply(event.publishAnswer ? answer : undefined, secrets),
+        purpose: "ack",
+        kind: "thought",
+        prepareBody: () => ACK_BODY,
         signal,
-      );
+      });
     },
+    respond: respondWith(write),
     error(
       event: LinearPilotAcceptedEvent,
       attempt: LinearPilotActivityAttempt,
@@ -261,11 +366,16 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
       failure: keyof typeof errorBodies = "terminal",
     ): Promise<LinearPilotWriteDisposition> {
       if (event.kind === "stop") return Promise.resolve({ disposition: "denied" });
-      return write(event, attempt, "terminal", "error", () => errorBodies[failure], signal);
+      return write({
+        event,
+        attempt,
+        purpose: "terminal",
+        kind: "error",
+        prepareBody: () => errorBodies[failure],
+        signal,
+      });
     },
-    refuseDelegation: delegationRefusalWriter((event) =>
-      write(event, "first-attempt", "delegationRefused", "error", () => DELEGATION_ERROR_BODY),
-    ),
+    refuseDelegation: refuseWith(write),
     busy(
       event: LinearPilotAcceptedEvent,
       attempt: LinearPilotActivityAttempt,
@@ -273,20 +383,16 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
     ): Promise<LinearPilotWriteDisposition> {
       if (event.kind !== "prompted" || !isAllowedHuman(event))
         return Promise.resolve({ disposition: "denied" });
-      return write(event, attempt, "busy", "response", () => BUSY_BODY, signal);
+      return write({
+        event,
+        attempt,
+        purpose: "busy",
+        kind: "response",
+        prepareBody: () => BUSY_BODY,
+        signal,
+      });
     },
-    stop(
-      event: LinearPilotAcceptedEvent,
-      attempt: LinearPilotActivityAttempt,
-      outcome: "confirmed" | "unconfirmed",
-      signal?: AbortSignal,
-    ): Promise<LinearPilotWriteDisposition> {
-      if (event.kind !== "stop" || (outcome !== "confirmed" && outcome !== "unconfirmed"))
-        return Promise.resolve({ disposition: "denied" });
-      return outcome === "confirmed"
-        ? write(event, attempt, "stop", "response", () => STOP_BODY, signal)
-        : write(event, attempt, "stop", "error", () => STOP_UNCONFIRMED_BODY, signal);
-    },
+    stop: stopWith(write),
   };
 }
 
@@ -313,8 +419,8 @@ function stableActivityId(sessionId: string, purpose: Purpose, interactionId: st
   const identity = JSON.stringify([sessionId, purpose, purpose === "ack" ? null : interactionId]);
   const name = `https://paseo.sh/id/linear-pilot/v4/${encodeURIComponent(identity)}`;
   const bytes = createHash("sha256").update(name).digest();
-  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
-  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  bytes[6] = (bytes.readUInt8(6) & 0x0f) | 0x40;
+  bytes[8] = (bytes.readUInt8(8) & 0x3f) | 0x80;
   const hex = bytes.toString("hex", 0, 16);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
@@ -339,21 +445,19 @@ function safeReply(answer: FinalReplyAnswer | undefined, secrets: readonly strin
   return includesKnown(NO_ANSWER_BODY) ? undefined : NO_ANSWER_BODY;
 }
 
+const DENIED_CODES = new Set([
+  "invalid_input",
+  "policy_required",
+  "connection_not_owned",
+  "connection_unavailable",
+  "connection_changed",
+  "scope_missing",
+  "reauthorize",
+  "credential_in_payload",
+]);
+
 function isDenied(error: unknown): boolean {
   if (!(error instanceof LinearAgentError)) return false;
-  switch (error.code) {
-    case "invalid_input":
-    case "policy_required":
-    case "connection_not_owned":
-    case "connection_unavailable":
-    case "connection_changed":
-    case "scope_missing":
-    case "reauthorize":
-    case "credential_in_payload":
-      return true;
-    case "request_failed":
-      return error.status === 401 || error.status === 403 || error.status === 404;
-    default:
-      return false;
-  }
+  if (error.code !== "request_failed") return DENIED_CODES.has(error.code);
+  return error.status === 401 || error.status === 403 || error.status === 404;
 }
