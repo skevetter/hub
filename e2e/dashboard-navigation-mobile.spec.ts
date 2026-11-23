@@ -89,6 +89,8 @@ test("phone navigation uses the rail outline in both themes", async ({ hub, page
     name: "Organization",
   });
   const railOutline = "rgb(247, 247, 244)";
+  // The current tab sits on the live fill, so its outline takes live-foreground instead.
+  const currentOutline = { light: "rgb(255, 255, 255)", dark: "rgb(17, 17, 17)" };
 
   for (const theme of ["light", "dark"] as const) {
     await page.emulateMedia({ colorScheme: theme });
@@ -97,13 +99,17 @@ test("phone navigation uses the rail outline in both themes", async ({ hub, page
     await page.keyboard.press("Tab");
     for (const control of [
       page.getByRole("button", { name: "Search", exact: true }),
-      quick.getByRole("link", { name: "Home" }),
+      quick.getByRole("link", { name: "Activity" }),
       more,
     ]) {
       await control.focus();
       await expect(control).toHaveCSS("outline-color", railOutline);
       await expect(control).toHaveCSS("outline-width", "2px");
     }
+    const current = quick.getByRole("link", { name: "Home" });
+    await expect(current).toHaveAttribute("aria-current", "page");
+    await current.focus();
+    await expect(current).toHaveCSS("outline-color", currentOutline[theme]);
     await more.press("Enter");
     await expect(organization).toBeFocused();
     await expect(organization).toHaveCSS("outline-color", railOutline);
