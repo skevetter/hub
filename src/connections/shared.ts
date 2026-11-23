@@ -53,9 +53,11 @@ export async function manageConnectionAccess(
 
 function tenantReturnRoute(slug: string, requested: string | null): string {
   if (requested === null || !ALLOWED_RETURN_ROUTES.has(requested)) {
-    return `/o/${slug}/connections`;
+    return `/o/${encodeURIComponent(slug)}/connections`;
   }
-  return requested === "/apps" ? `/o/${slug}/settings/instance/apps` : requested;
+  return requested === "/apps"
+    ? `/o/${encodeURIComponent(slug)}/settings/instance/apps`
+    : requested;
 }
 
 export function connectionAccess(
