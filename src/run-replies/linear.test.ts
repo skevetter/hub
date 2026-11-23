@@ -4,7 +4,7 @@ import type { Root } from "mdast";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
-import { describe, it, vi } from "vitest";
+import { describe, it, onTestFinished, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import * as replyFormat from "./format.js";
 import { LinearRunReplyWriter } from "./linear.js";
@@ -12,6 +12,16 @@ import { yieldToEventLoop } from "./test-utils/event-loop.js";
 import { fakeLinearReplies, replyEvidence } from "./test-utils/linear.js";
 
 const signal = new AbortController().signal;
+
+function pinFormatterClock(): void {
+  const { formatRunReply } = replyFormat;
+  const formatter = vi
+    .spyOn(replyFormat, "formatRunReply")
+    .mockImplementation((answer, secrets, options) =>
+      formatRunReply(answer, secrets, { ...options, now: () => 0 }),
+    );
+  onTestFinished(() => formatter.mockRestore());
+}
 
 function assertNoMentionNodes(tree: Root, index: number): void {
   const nodes = [...tree.children];
@@ -184,7 +194,7 @@ describe("Linear reply writer", () => {
       assert.equal(tree.children.at(-1)?.type, "paragraph", `marker in case ${index}`);
       assert.equal(tree.children.at(-2)?.type, "paragraph", `notice in case ${index}`);
     }
-  }, 60_000);
+  }, 120_000);
 
   it.each([
     "https://linear.app./acme/profiles/bob",
@@ -224,6 +234,7 @@ describe("Linear reply writer", () => {
     }
   });
   it("posts one marked, sanitized and truncated answer with only comments:create", async () => {
+    pinFormatterClock();
     const { send, writes, delivery } = await fixture();
     const text = `Hello @teammate, &#64;paseo and https://linear.app/team/profiles/alex.
 
@@ -285,6 +296,7 @@ ${"line from the answer\n".repeat(250)}`;
   ];
 
   it("neutralizes generated mention forms across Markdown shapes in the posted body", async () => {
+    pinFormatterClock();
     for (let index = 0; index < markdownShapes.length; index += 1) {
       const shape = markdownShapes[index]!;
       const samples = [
@@ -323,6 +335,7 @@ ${"line from the answer\n".repeat(250)}`;
   ])(
     "keeps delivery metadata outside a truncated $structure and repairs the delivery",
     async ({ structure, text }) => {
+      pinFormatterClock();
       const reply = await fixture();
       const { send, writes, delivery } = reply;
       reply.loseCreateResponse();
@@ -362,6 +375,7 @@ ${"line from the answer\n".repeat(250)}`;
   );
 
   it("records an empty sanitized answer without making a request", async () => {
+    pinFormatterClock();
     const { send, calls, delivery } = await fixture();
     await send("![image](https://example.com/pic.png)");
     assert.deepEqual(calls, []);

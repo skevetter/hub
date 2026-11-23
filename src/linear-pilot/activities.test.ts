@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { performance } from "node:perf_hooks";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createLinearAgentClient, LinearAgentError } from "../providers/linear/agent.js";
 import {
   completePage,
@@ -357,6 +358,8 @@ describe("pilot activities", () => {
   });
 
   it("uses P12 Markdown and credential sanitization verbatim, and keeps disabled answers private", async () => {
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    onTestFinished(() => clock.mockRestore());
     const w = fixture();
     const secrets = ["hardwired.test.credential"];
     const raw = {
