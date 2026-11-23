@@ -41,6 +41,7 @@ export interface LinearPilotEvent {
   activityId?: string;
   message?: string;
   pendingDelegation?: true;
+  confirmationCandidate?: true;
   delegationFallback?: DelegationFallback;
   /**
    * Stop only. Epoch ms of the signed `agentActivity.createdAt`, present only when that field is
@@ -66,9 +67,19 @@ export type LinearPilotRefusal =
   | "unqualified_content"
   | "oversized";
 
+export interface NonOwnerMention {
+  actorId: string;
+  nativeSessionId: string;
+  commentId: string;
+}
+
 export type LinearPilotIntakeResult =
   | { readonly ok: true; readonly event: LinearPilotEvent }
-  | { readonly ok: false; readonly reason: LinearPilotRefusal };
+  | {
+      readonly ok: false;
+      readonly reason: LinearPilotRefusal;
+      readonly nonOwnerMention?: NonOwnerMention;
+    };
 
 type Record_ = Readonly<Record<string, unknown>>;
 
@@ -199,7 +210,7 @@ function readCreated(scope: Scope): LinearPilotIntakeResult {
   const { session } = scope;
   const humanId = id(field(session, "creatorId"));
   if (humanId === undefined) return refuse("missing_creator");
-  if (!isOwner(scope, humanId)) return refuse("not_owner");
+  if (!isOwner(scope, humanId)) return refuseNonOwnerCreated(scope, humanId);
   if (scope.teamId === undefined) return refuse("malformed");
   const creator = field(session, "creator");
   if (creator !== undefined && creator !== null) {
@@ -208,14 +219,44 @@ function readCreated(scope: Scope): LinearPilotIntakeResult {
   return readCreatedOrigin(scope, humanId);
 }
 
+function refuseNonOwnerCreated(scope: Scope, actorId: string): LinearPilotIntakeResult {
+  const { session, installation, teamId } = scope;
+  if (actorId === installation.appUserId || teamId === undefined) return refuse("not_owner");
+  const comment = plain(field(session, "comment"));
+  if (comment === undefined || field(comment, "userId") !== actorId) return refuse("not_owner");
+  const commentId = id(field(session, "commentId"));
+  if (
+    commentId === undefined ||
+    field(comment, "id") !== commentId ||
+    field(comment, "issueId") !== scope.issueId
+  )
+    return refuse("not_owner");
+  return {
+    ok: false,
+    reason: "not_owner",
+    nonOwnerMention: { actorId, nativeSessionId: scope.sessionId, commentId },
+  };
+}
+
+export function mayVerifyNonOwnerMention(config: LinearPilotConfig, payload: unknown) {
+  if (!isPlainRecord(payload) || field(payload, "action") !== "created") return false;
+  const session = field(payload, "agentSession");
+  if (!isPlainRecord(session)) return false;
+  const creatorId = id(field(session, "creatorId"));
+  return creatorId !== undefined && creatorId !== config.allowedHumanId;
+}
+
 function readCreatedOrigin(scope: Scope, humanId: string): LinearPilotIntakeResult {
   const { session } = scope;
   const rawComment = field(session, "comment");
   const rawCommentId = field(session, "commentId");
   const source = field(session, "sourceCommentId");
-  // A creator can be an automation-substituted assignee. Without a comment, history must prove origin.
+  // Linear may report an automation-substituted assignee as the creator.
   if (rawComment == null && rawCommentId == null && source == null) {
-    return accept(scope, "created", humanId, { pendingDelegation: true });
+    return accept(scope, "created", humanId, {
+      pendingDelegation: true,
+      confirmationCandidate: true,
+    });
   }
   return readCreatedComment(scope, humanId, { rawComment, rawCommentId, source });
 }
@@ -229,9 +270,14 @@ function readCreatedComment(
     source,
   }: { rawComment: unknown; rawCommentId: unknown; source: unknown },
 ): LinearPilotIntakeResult {
-  const fallback = (delegationFallback: DelegationFallback) =>
-    accept(scope, "created", humanId, { pendingDelegation: true, delegationFallback });
   const comment = plain(rawComment);
+  const candidate = confirmationCandidate(rawComment, comment, source);
+  const fallback = (delegationFallback: DelegationFallback) =>
+    accept(scope, "created", humanId, {
+      pendingDelegation: true,
+      delegationFallback,
+      ...candidate,
+    });
   if (comment === undefined) return fallback("comment_missing");
   const author = field(comment, "userId");
   if (author != null && author !== humanId) return refuse("origin_unproven");
@@ -242,6 +288,17 @@ function readCreatedComment(
   if (author == null) return fallback("comment_author_missing");
   if (source != null && source !== commentId) return fallback("source_mismatch");
   return acceptCreatedComment(scope, humanId, comment);
+}
+
+function confirmationCandidate(
+  rawComment: unknown,
+  comment: Record_ | undefined,
+  source: unknown,
+): Pick<LinearPilotEvent, "confirmationCandidate"> {
+  return source == null &&
+    (rawComment == null || (comment !== undefined && field(comment, "userId") == null))
+    ? { confirmationCandidate: true }
+    : {};
 }
 
 function acceptCreatedComment(
@@ -269,6 +326,14 @@ function readPrompted(scope: Scope): LinearPilotIntakeResult {
     return refuse("activity_mismatch");
   }
   if (!isOwner(scope, humanId)) return refuse("not_owner");
+  return readOwnedActivity(scope, activity, { humanId, activityId });
+}
+
+function readOwnedActivity(
+  scope: Scope,
+  activity: Record_,
+  { humanId, activityId }: { humanId: string; activityId: string },
+): LinearPilotIntakeResult {
   const signal = field(activity, "signal");
   // Stop is decided before any body requirement: it must work with absent or odd content.
   if (signal === "stop") {
@@ -332,7 +397,7 @@ function accept(
     ...extra
   }: Pick<
     LinearPilotEvent,
-    "activityId" | "message" | "pendingDelegation" | "delegationFallback"
+    "activityId" | "message" | "pendingDelegation" | "delegationFallback" | "confirmationCandidate"
   > & {
     stopCreatedAtMs?: number | undefined;
   },
@@ -417,6 +482,10 @@ export async function classifyLinearPilotCompanionComment(input: {
   }
   const handle = normalizeHandle(await input.resolveHandle());
   if (handle === undefined) return { suppress: false, reason: "handle_unusable" };
+  return classifyPilotHandle(body, handle);
+}
+
+function classifyPilotHandle(body: string, handle: string): LinearPilotCompanionDecision {
   const token = new RegExp(`@${escapeRegExp(handle)}`, "giu");
   // Cheap raw pass first: most comments never name the app, and the parser is the costly step.
   if (!hasHandleToken(body, token)) return { suppress: false, reason: "no_handle" };

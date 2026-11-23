@@ -146,9 +146,15 @@ export class LinearAgentError extends Error {
 
 export type LinearAgentOperation =
   | { kind: "viewer" }
+  | { kind: "readNonOwnerOrigin"; sessionId: string }
   | { kind: "createActivity" | "readActivity"; sessionId: string }
   | {
-      kind: "readPilotPrompt" | "readPilotHistory" | "readDelegationOrigin";
+      kind:
+        | "readPilotPrompt"
+        | "readPilotHistory"
+        | "readDelegationOrigin"
+        | "readDelegationConfirmation"
+        | "readDelegationIssue";
       sessionId: string;
       issueId: string;
     }
@@ -239,9 +245,8 @@ function delegationOriginReader(
   };
 }
 
-export function createLinearAgentClient(options: LinearAgentClientOptions) {
+function agentConnection(options: LinearAgentClientOptions) {
   const binding = Object.freeze({ ...options.binding });
-  const hubOrigin = new URL(options.hubBaseUrl).origin;
   const now = options.now ?? (() => new Date());
 
   function requireHistoryScope(input: PilotHistoryScope) {
@@ -259,9 +264,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
   function checkConnection(connection: LinearConnectionRecord | undefined): LinearConnectionRecord {
     if (connection === undefined) throw new LinearAgentError("connection_unavailable");
     if (
-      !binding.providerApplicationId ||
-      !binding.appUserId ||
-      !binding.linearOrganizationId ||
+      !hasBoundInstallation(binding) ||
       connection.id !== binding.id ||
       connection.organizationId !== binding.organizationId ||
       connection.providerApplicationId !== binding.providerApplicationId ||
@@ -277,7 +280,126 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
 
   const readConnection = async () =>
     checkConnection(await options.connectionForLinearOrganization(binding.linearOrganizationId));
+  return { binding, now, requireHistoryScope, checkConnection, readConnection };
+}
 
+function hasBoundInstallation(binding: LinearConnectionBinding) {
+  return Boolean(
+    binding.providerApplicationId && binding.appUserId && binding.linearOrganizationId,
+  );
+}
+
+type AgentConnection = ReturnType<typeof agentConnection>;
+
+async function refreshIfNeeded(
+  options: LinearAgentClientOptions,
+  api: AgentConnection,
+  input: {
+    authorize: () => Promise<void>;
+    checkSignal: () => void;
+    serializedInput: string;
+    signal: AbortSignal;
+    operation: LinearAgentOperation;
+  },
+) {
+  const { binding, now, checkConnection } = api;
+  const { authorize, checkSignal, serializedInput, signal, operation } = input;
+  // Keep the ordinary authorizer outside the lease so it cannot wait for its own connection.
+  await authorize();
+  const refresh: LinearConnectionRefreshOperation<void> = async (row, update, query) => {
+    checkSignal();
+    const current = checkConnection(row);
+    checkPayloadCredentials(serializedInput, current);
+    if (hasUsableLinearAccessToken(current, now())) return;
+    const { refreshToken } = current;
+    if (refreshToken === null) throw new LinearAgentError("reauthorize");
+    if (options.authorizeRefresh !== undefined) {
+      if (query === undefined) throw new LinearAgentError("policy_required");
+      const authorized = await options.authorizeRefresh(query, binding, operation, signal);
+      checkSignal();
+      if (authorized !== true) throw new LinearAgentError("policy_required");
+    }
+    const refreshed = await providerRequest(
+      () => options.connectionClient.refresh(refreshToken, signal),
+      signal,
+      options.pilotOperations,
+    );
+    // A successful refresh can rotate the token even when a caller cancels.
+    await update(refreshed);
+  };
+  if (options.authorizeRefresh !== undefined) refresh.requireReadCommitted = true;
+  await options.withLinearConnectionRefresh(binding.linearOrganizationId, refresh);
+}
+
+function agentTransport(
+  options: LinearAgentClientOptions,
+  api: AgentConnection,
+  input: {
+    initial: LinearConnectionRecord;
+    connection: LinearConnectionRecord;
+    authorize: () => Promise<void>;
+    checkSignal: () => void;
+    signal: AbortSignal;
+  },
+) {
+  const { now, readConnection } = api;
+  const { initial, connection, authorize, checkSignal, signal } = input;
+  async function checkCurrent() {
+    await authorize();
+    const current = await readConnection();
+    await authorize();
+    if (
+      !hasUsableLinearAccessToken(current, now()) ||
+      current.accessToken !== connection.accessToken ||
+      current.refreshToken !== connection.refreshToken
+    ) {
+      throw new LinearAgentError("connection_changed");
+    }
+  }
+
+  const send: Send = async (query, variables, schema) => {
+    await checkCurrent();
+    const serialized = JSON.stringify(variables);
+    checkPayloadCredentials(serialized, initial);
+    checkPayloadCredentials(serialized, connection);
+    const response = await providerRequest(
+      () =>
+        requestLinearAgentGraphql(
+          options.fetch,
+          connection.accessToken,
+          query,
+          variables,
+          signal,
+          now,
+        ),
+      signal,
+      options.pilotOperations,
+    );
+    checkSignal();
+    return parse(
+      z.object({ data: schema, errors: z.never().optional() }),
+      response,
+      "invalid_response",
+    ).data;
+  };
+
+  return { send, checkCurrent };
+}
+
+async function readBoundViewer(send: Send, binding: LinearConnectionBinding) {
+  const { viewer } = await send(
+    `query PaseoAgentViewer { viewer { id organization { id } active app displayName name } }`,
+    {},
+    z.object({ viewer: user }),
+  );
+  if (!viewer.active || !viewer.app || !matchesActor(binding, viewer.id, viewer.organization.id)) {
+    throw new LinearAgentError("connection_not_owned");
+  }
+  return viewer;
+}
+
+function agentRunner(options: LinearAgentClientOptions, api: AgentConnection) {
+  const { binding, now, readConnection } = api;
   async function run<T>(
     operation: LinearAgentOperation,
     inputVariables: Record<string, unknown>,
@@ -309,31 +431,13 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
     const serializedInput = JSON.stringify(inputVariables);
     checkPayloadCredentials(serializedInput, initial);
     if (!hasUsableLinearAccessToken(initial, now())) {
-      // Keep the ordinary authorizer outside the lease so it cannot wait for its own connection.
-      await authorize();
-      const refresh: LinearConnectionRefreshOperation<void> = async (row, update, query) => {
-        checkSignal();
-        const current = checkConnection(row);
-        checkPayloadCredentials(serializedInput, current);
-        if (hasUsableLinearAccessToken(current, now())) return;
-        const { refreshToken } = current;
-        if (refreshToken === null) throw new LinearAgentError("reauthorize");
-        if (options.authorizeRefresh !== undefined) {
-          if (query === undefined) throw new LinearAgentError("policy_required");
-          const authorized = await options.authorizeRefresh(query, binding, operation, signal);
-          checkSignal();
-          if (authorized !== true) throw new LinearAgentError("policy_required");
-        }
-        const refreshed = await providerRequest(
-          () => options.connectionClient.refresh(refreshToken, signal),
-          signal,
-          options.pilotOperations,
-        );
-        // A successful refresh can rotate the token even when a caller cancels.
-        await update(refreshed);
-      };
-      if (options.authorizeRefresh !== undefined) refresh.requireReadCommitted = true;
-      await options.withLinearConnectionRefresh(binding.linearOrganizationId, refresh);
+      await refreshIfNeeded(options, api, {
+        authorize,
+        checkSignal,
+        serializedInput,
+        signal,
+        operation,
+      });
     }
 
     await authorize();
@@ -342,59 +446,145 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
     checkSignal();
     checkPayloadCredentials(serializedInput, connection);
 
-    async function checkCurrent() {
-      await authorize();
-      const current = await readConnection();
-      await authorize();
-      if (
-        !hasUsableLinearAccessToken(current, now()) ||
-        current.accessToken !== connection.accessToken ||
-        current.refreshToken !== connection.refreshToken
-      ) {
-        throw new LinearAgentError("connection_changed");
-      }
-    }
-
-    const send: Send = async (query, variables, schema) => {
-      await checkCurrent();
-      const serialized = JSON.stringify(variables);
-      checkPayloadCredentials(serialized, initial);
-      checkPayloadCredentials(serialized, connection);
-      const response = await providerRequest(
-        () =>
-          requestLinearAgentGraphql(
-            options.fetch,
-            connection.accessToken,
-            query,
-            variables,
-            signal,
-            now,
-          ),
-        signal,
-        options.pilotOperations,
-      );
-      checkSignal();
-      return parse(
-        z.object({ data: schema, errors: z.never().optional() }),
-        response,
-        "invalid_response",
-      ).data;
-    };
-
-    const { viewer } = await send(
-      `query PaseoAgentViewer { viewer { id organization { id } active app displayName name } }`,
-      {},
-      z.object({ viewer: user }),
-    );
-    if (
-      !viewer.active ||
-      !viewer.app ||
-      !matchesActor(binding, viewer.id, viewer.organization.id)
-    ) {
-      throw new LinearAgentError("connection_not_owned");
-    }
+    const { send, checkCurrent } = agentTransport(options, api, {
+      initial,
+      connection,
+      authorize,
+      checkSignal,
+      signal,
+    });
+    const viewer = await readBoundViewer(send, binding);
     return perform(send, viewer, checkCurrent);
   }
+  return run;
+}
+
+type AgentRun = ReturnType<typeof agentRunner>;
+
+export function createLinearAgentClient(options: LinearAgentClientOptions) {
+  const api = agentConnection(options);
+  const hubOrigin = new URL(options.hubBaseUrl).origin;
+  const run = agentRunner(options, api);
+  return {
+    ...historyMethods(run, api.requireHistoryScope),
+    ...nonOwnerMethods(run, options.pilotOperations),
+    ...confirmationMethods(run, api.requireHistoryScope),
+    ...activityCreateMethods(run, options.pilotOperations),
+    ...activityReadMethods(run, options.pilotOperations),
+    ...linkMethods(run, hubOrigin),
+    ...viewerMethods(run),
+    ...eligibleMethods(run),
+    ...startMethods(run),
+  };
+}
+
+const nonOwnerOriginQuery = `query PaseoPilotNonOwnerOrigin($sessionId: String!) {
+  agentSession(id: $sessionId) {
+    id creator { id app active guest } comment { id user { id } botActor { id } }
+  }
+}`;
+
+const nonOwnerOrigin = z.object({
+  agentSession: ref
+    .extend({
+      creator: ref.extend({ app: z.boolean(), active: z.boolean(), guest: z.boolean() }).nullable(),
+      comment: ref.extend({ user: ref.nullable(), botActor: ref.nullable() }).nullable(),
+    })
+    .nullable(),
+});
+
+function nonOwnerMethods(run: AgentRun, pilotOperations: true | undefined) {
+  return {
+    async readNonOwnerOrigin(sessionId: string, signal: AbortSignal) {
+      if (!pilotOperations) throw new LinearAgentError("invalid_input");
+      const variables = { sessionId: parse(id, sessionId, "invalid_input") };
+      return run(
+        { kind: "readNonOwnerOrigin", sessionId },
+        variables,
+        signal,
+        async (send, _viewer, checkCurrent) => {
+          const data = await send(nonOwnerOriginQuery, variables, nonOwnerOrigin);
+          await checkCurrent();
+          return data.agentSession;
+        },
+      );
+    },
+  };
+}
+
+const confirmationQuery = `query PaseoPilotDelegationConfirmation($sessionId: String!) {
+  agentSession(id: $sessionId) {
+    id appUser { id } creator { id } comment { user { id } } sourceComment { id }
+    issue { id identifier title team { id organization { id } } delegate { id } assignee { id } }
+  }
+}`;
+
+const delegationIssueQuery = `query PaseoPilotDelegationIssue($issueId: String!) {
+  issue(id: $issueId) { id identifier title description delegate { id } team { id organization { id } } }
+}`;
+
+const promptIssue = ref.extend({
+  identifier: id,
+  title: z.string().min(1),
+  team: workspaceRef,
+});
+const confirmationReadback = z.object({
+  agentSession: ref
+    .extend({
+      appUser: ref,
+      creator: ref.nullable(),
+      comment: z.object({ user: ref.nullable() }).nullable(),
+      sourceComment: ref.nullable(),
+      issue: promptIssue.extend({ delegate: ref.nullable(), assignee: ref.nullable() }).nullable(),
+    })
+    .nullable(),
+});
+const delegationIssueReadback = z.object({
+  issue: promptIssue
+    .extend({ description: z.string().nullable(), delegate: ref.nullable() })
+    .nullable(),
+});
+
+function confirmationMethods(
+  run: AgentRun,
+  requireScope: ReturnType<typeof agentConnection>["requireHistoryScope"],
+) {
+  return {
+    async readDelegationConfirmation(input: PilotHistoryScope, signal: AbortSignal) {
+      const { sessionId, issueId } = requireScope(input);
+      const variables = { sessionId };
+      return run(
+        { kind: "readDelegationConfirmation", sessionId, issueId },
+        variables,
+        signal,
+        async (send, _viewer, checkCurrent) => {
+          const data = await send(confirmationQuery, variables, confirmationReadback);
+          await checkCurrent();
+          return data.agentSession;
+        },
+      );
+    },
+    async readDelegationIssue(input: PilotHistoryScope, signal: AbortSignal) {
+      const { sessionId, issueId } = requireScope(input);
+      const variables = { issueId };
+      return run(
+        { kind: "readDelegationIssue", sessionId, issueId },
+        variables,
+        signal,
+        async (send, _viewer, checkCurrent) => {
+          const data = await send(delegationIssueQuery, variables, delegationIssueReadback);
+          await checkCurrent();
+          return data.issue;
+        },
+      );
+    },
+  };
+}
+
+function historyMethods(
+  run: AgentRun,
+  requireHistoryScope: ReturnType<typeof agentConnection>["requireHistoryScope"],
+) {
   return {
     readDelegationOrigin: delegationOriginReader(run, requireHistoryScope),
     async readPilotPrompt(
@@ -424,7 +614,11 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         (send) => readPilotPriorPage(send, scope, anchor),
       );
     },
+  };
+}
 
+function activityCreateMethods(run: AgentRun, pilotOperations: true | undefined) {
+  return {
     async createActivity(
       input: z.input<typeof activityInput>,
       signal?: AbortSignal,
@@ -439,7 +633,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
       if (ephemeral === true && content.type !== "thought" && content.type !== "action") {
         throw new LinearAgentError("invalid_input");
       }
-      if (expectedSignal && (!options.pilotOperations || content.type !== "response")) {
+      if (expectedSignal && (!pilotOperations || content.type !== "response")) {
         throw new LinearAgentError("invalid_input");
       }
       const variables = {
@@ -470,7 +664,11 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         return result.agentActivity.id;
       });
     },
+  };
+}
 
+function activityReadMethods(run: AgentRun, pilotOperations: true | undefined) {
+  return {
     /** False means unconfirmed. Even a complete empty page cannot authorize an append. */
     async isActivityConfirmed(
       input: z.input<typeof readbackInput>,
@@ -483,7 +681,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         kind,
         signal: expectedSignal,
       } = parse(readbackInput, input, "invalid_input");
-      if (expectedSignal && (!options.pilotOperations || kind !== "response")) {
+      if (expectedSignal && (!pilotOperations || kind !== "response")) {
         throw new LinearAgentError("invalid_input");
       }
       const variables = { sessionId, activityId };
@@ -506,15 +704,14 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
             return (
               agentSession.id === sessionId &&
               agentSession.appUser.id === viewer.id &&
-              !pageInfo.hasNextPage &&
-              !pageInfo.hasPreviousPage &&
-              row !== undefined &&
-              row.id === activityId &&
-              row.agentSession.id === sessionId &&
-              row.user.id === viewer.id &&
-              row.content.type === kind &&
-              row.content.__typename === contentTypename[kind] &&
-              (expectedSignal === undefined || row.signal === expectedSignal)
+              hasCompleteActivityPage(pageInfo) &&
+              matchesActivityRow(row, {
+                sessionId,
+                activityId,
+                kind,
+                expectedSignal,
+                viewerId: viewer.id,
+              })
             );
           },
         );
@@ -527,7 +724,33 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         return false;
       }
     },
+  };
+}
 
+function hasCompleteActivityPage(pageInfo: z.infer<typeof pageFlags>) {
+  return !pageInfo.hasNextPage && !pageInfo.hasPreviousPage;
+}
+
+function matchesActivityRow(
+  row: z.infer<typeof readbackResult>["agentSession"]["activities"]["nodes"][number] | undefined,
+  expected: z.infer<typeof readbackInput> & {
+    expectedSignal?: "continue" | undefined;
+    viewerId: string;
+  },
+) {
+  return (
+    row !== undefined &&
+    row.id === expected.activityId &&
+    row.agentSession.id === expected.sessionId &&
+    row.user.id === expected.viewerId &&
+    row.content.type === expected.kind &&
+    row.content.__typename === contentTypename[expected.kind] &&
+    (expected.expectedSignal === undefined || row.signal === expected.expectedSignal)
+  );
+}
+
+function linkMethods(run: AgentRun, hubOrigin: string) {
+  return {
     async addHubUrl(input: z.input<typeof linkInput>, signal?: AbortSignal): Promise<void> {
       const { sessionId, url } = parse(linkInput, input, "invalid_input");
       const target = new URL(url);
@@ -568,7 +791,11 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         },
       );
     },
+  };
+}
 
+function viewerMethods(run: AgentRun) {
+  return {
     async readAppViewer(signal?: AbortSignal) {
       return run({ kind: "viewer" }, {}, signal, async (_send, viewer, checkCurrent) => {
         const handle = safeDisplayName(viewer);
@@ -577,7 +804,11 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         return { appUserId: viewer.id, linearOrganizationId: viewer.organization.id, handle };
       });
     },
+  };
+}
 
+function eligibleMethods(run: AgentRun) {
+  return {
     async readEligibleUsers(input: z.input<typeof membersInput>, signal?: AbortSignal) {
       const variables = parse(membersInput, input, "invalid_input");
       const { teamId, after } = variables;
@@ -613,36 +844,38 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
           if (pageInfo.hasNextPage && (nextCursor === null || nextCursor === after)) {
             throw new LinearAgentError("invalid_response");
           }
-          const users = new Map<string, { id: string; displayName: string }>();
-          for (const candidate of nodes) {
-            const displayName = safeDisplayName(candidate);
-            if (
-              candidate.active &&
-              !candidate.app &&
-              candidate.id !== viewer.id &&
-              candidate.organization.id === viewer.organization.id &&
-              displayName !== undefined
-            ) {
-              users.set(candidate.id, { id: candidate.id, displayName });
-            }
-          }
+          const users = eligibleUsers(nodes, viewer);
           await checkCurrent();
           return { users: [...users.values()], nextCursor };
         },
       );
     },
+  };
+}
 
-    /** The authority check must establish a qualified human delegation before this method runs. */
-    async moveIssueToStarted(
-      input: z.input<typeof beginInput>,
-      signal?: AbortSignal,
-    ): Promise<string | undefined> {
-      const variables = parse(beginInput, input, "invalid_input");
-      const { teamId, issueId } = variables;
-      const operation = { kind: "moveIssueToStarted", teamId, issueId } as const;
-      return run(operation, variables, signal, async (send, viewer) => {
-        const { team, issue } = await send(
-          `query PaseoAgentIssueStartContext($teamId: String!, $issueId: String!) {
+function eligibleUsers(
+  nodes: z.infer<typeof user>[],
+  { id: viewerId, organization: { id: organizationId } }: z.infer<typeof user>,
+) {
+  const users = new Map<string, { id: string; displayName: string }>();
+  for (const candidate of nodes) {
+    const displayName = safeDisplayName(candidate);
+    if (
+      candidate.active &&
+      !candidate.app &&
+      candidate.id !== viewerId &&
+      candidate.organization.id === organizationId &&
+      displayName !== undefined
+    ) {
+      users.set(candidate.id, { id: candidate.id, displayName });
+    }
+  }
+  return users;
+}
+
+function readStartContext(send: Send, variables: z.infer<typeof beginInput>) {
+  return send(
+    `query PaseoAgentIssueStartContext($teamId: String!, $issueId: String!) {
             team(id: $teamId) {
               id organization { id }
               states(first: ${pageSize}, includeArchived: false) {
@@ -655,57 +888,97 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
               state { id type archivedAt team { id } }
             }
           }`,
-          variables,
-          z.object({
-            team: workspaceRef.extend({
-              states: z.object({
-                nodes: z.array(state.extend({ position: z.number() })).max(pageSize),
-                pageInfo: pageFlags,
-              }),
-            }),
-            issue: ref.extend({ team: workspaceRef, delegate: ref.nullable(), state }),
-          }),
-        );
-        const organizationId = viewer.organization.id;
-        if (
-          issue.id !== issueId ||
-          !matchesTeam(issue.team, teamId, organizationId) ||
-          !matchesTeam(team, teamId, organizationId) ||
-          issue.delegate?.id !== viewer.id ||
-          issue.state.team.id !== teamId ||
-          issue.state.archivedAt !== null ||
-          !["triage", "backlog", "unstarted"].includes(issue.state.type) ||
-          team.states.pageInfo.hasNextPage ||
-          team.states.pageInfo.hasPreviousPage ||
-          team.states.nodes.some((candidate) => candidate.team.id !== teamId)
-        ) {
-          return undefined;
-        }
-        const destination = team.states.nodes
-          .filter((candidate) => candidate.type === "started" && candidate.archivedAt === null)
-          .sort(
-            (left, right) => left.position - right.position || left.id.localeCompare(right.id),
-          )[0];
-        if (destination === undefined || destination.id === issue.state.id) return undefined;
-        const { issueUpdate: result } = await send(
-          `mutation PaseoAgentIssueStart($issueId: String!, $input: IssueUpdateInput!) {
+    variables,
+    z.object({
+      team: workspaceRef.extend({
+        states: z.object({
+          nodes: z.array(state.extend({ position: z.number() })).max(pageSize),
+          pageInfo: pageFlags,
+        }),
+      }),
+      issue: ref.extend({ team: workspaceRef, delegate: ref.nullable(), state }),
+    }),
+  );
+}
+
+type StartContext = Awaited<ReturnType<typeof readStartContext>>;
+
+function canStartIssue(
+  { issue, team }: StartContext,
+  { issueId, teamId }: z.infer<typeof beginInput>,
+  viewer: z.infer<typeof user>,
+) {
+  const organizationId = viewer.organization.id;
+  return !(
+    issue.id !== issueId ||
+    !matchesTeam(issue.team, teamId, organizationId) ||
+    !matchesTeam(team, teamId, organizationId) ||
+    issue.delegate?.id !== viewer.id ||
+    issue.state.team.id !== teamId ||
+    issue.state.archivedAt !== null ||
+    !["triage", "backlog", "unstarted"].includes(issue.state.type)
+  );
+}
+
+function startedDestination({ team, issue }: StartContext, teamId: string) {
+  if (
+    !hasCompleteActivityPage(team.states.pageInfo) ||
+    team.states.nodes.some((candidate) => candidate.team.id !== teamId)
+  ) {
+    return undefined;
+  }
+  const destination = team.states.nodes
+    .filter((candidate) => candidate.type === "started" && candidate.archivedAt === null)
+    .sort((left, right) => left.position - right.position || left.id.localeCompare(right.id))[0];
+  if (destination === undefined || destination.id === issue.state.id) return undefined;
+  return destination;
+}
+
+async function moveToDestination(
+  send: Send,
+  variables: z.infer<typeof beginInput>,
+  organizationId: string,
+  destinationId: string,
+) {
+  const { issueId, teamId } = variables;
+  const { issueUpdate: result } = await send(
+    `mutation PaseoAgentIssueStart($issueId: String!, $input: IssueUpdateInput!) {
             issueUpdate(id: $issueId, input: $input) { success issue { id state { id } team { id organization { id } } } }
           }`,
-          { issueId, input: { stateId: destination.id } },
-          z.object({
-            issueUpdate: z.object({
-              success: z.boolean(),
-              issue: ref.extend({ state: ref, team: workspaceRef }).nullable(),
-            }),
-          }),
+    { issueId, input: { stateId: destinationId } },
+    z.object({
+      issueUpdate: z.object({
+        success: z.boolean(),
+        issue: ref.extend({ state: ref, team: workspaceRef }).nullable(),
+      }),
+    }),
+  );
+  requireMutation(
+    result.success &&
+      result.issue?.id === issueId &&
+      result.issue.state.id === destinationId &&
+      matchesTeam(result.issue.team, teamId, organizationId),
+  );
+  return destinationId;
+}
+
+function startMethods(run: AgentRun) {
+  return {
+    /** The authority check must establish a qualified human delegation before this method runs. */
+    async moveIssueToStarted(
+      input: z.input<typeof beginInput>,
+      signal?: AbortSignal,
+    ): Promise<string | undefined> {
+      const variables = parse(beginInput, input, "invalid_input");
+      const { teamId, issueId } = variables;
+      const operation = { kind: "moveIssueToStarted", teamId, issueId } as const;
+      return run(operation, variables, signal, async (send, viewer) => {
+        const context = await readStartContext(send, variables);
+        if (!canStartIssue(context, variables, viewer)) return undefined;
+        const destination = startedDestination(context, teamId);
+        return (
+          destination && moveToDestination(send, variables, viewer.organization.id, destination.id)
         );
-        requireMutation(
-          result.success &&
-            result.issue?.id === issueId &&
-            result.issue.state.id === destination.id &&
-            matchesTeam(result.issue.team, teamId, organizationId),
-        );
-        return destination.id;
       });
     },
   };
