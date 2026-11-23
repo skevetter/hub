@@ -34,6 +34,7 @@ import { Route as ApiBillingPlansRouteImport } from './routes/api/billing/plans'
 import { Route as ApiAuthSplatRouteImport } from './routes/api/auth/$'
 import { Route as AgentSessionsSessionIdMcpRouteImport } from './routes/agent-sessions/$sessionId/mcp'
 import { Route as AgentExecutionsExecutionIdMcpRouteImport } from './routes/agent-executions/$executionId/mcp'
+import { Route as ShellOOrganizationSlugIndexRouteImport } from './routes/_shell/o/$organizationSlug/index'
 import { Route as ApiV1CliAuthorizationsPollRouteImport } from './routes/api/v1/cli-authorizations/poll'
 import { Route as ApiIntegrationsSlackEventsRouteImport } from './routes/api/integrations/slack/events'
 import { Route as ApiIntegrationsSlackCallbackRouteImport } from './routes/api/integrations/slack/callback'
@@ -191,6 +192,12 @@ const AgentExecutionsExecutionIdMcpRoute =
     id: '/agent-executions/$executionId/mcp',
     path: '/agent-executions/$executionId/mcp',
     getParentRoute: () => rootRouteImport,
+  } as any)
+const ShellOOrganizationSlugIndexRoute =
+  ShellOOrganizationSlugIndexRouteImport.update({
+    id: '/o/$organizationSlug/',
+    path: '/o/$organizationSlug/',
+    getParentRoute: () => ShellRoute,
   } as any)
 const ApiV1CliAuthorizationsPollRoute =
   ApiV1CliAuthorizationsPollRouteImport.update({
@@ -419,6 +426,7 @@ export interface FileRoutesByFullPath {
   '/api/integrations/slack/callback': typeof ApiIntegrationsSlackCallbackRoute
   '/api/integrations/slack/events': typeof ApiIntegrationsSlackEventsRoute
   '/api/v1/cli-authorizations/poll': typeof ApiV1CliAuthorizationsPollRoute
+  '/o/$organizationSlug/': typeof ShellOOrganizationSlugIndexRoute
   '/o/$organizationSlug/activity/$runId': typeof ShellOOrganizationSlugActivityRunIdRoute
   '/o/$organizationSlug/sessions/$sessionId': typeof ShellOOrganizationSlugSessionsSessionIdRoute
   '/o/$organizationSlug/sessions/new': typeof ShellOOrganizationSlugSessionsNewRoute
@@ -472,6 +480,7 @@ export interface FileRoutesByTo {
   '/api/integrations/slack/callback': typeof ApiIntegrationsSlackCallbackRoute
   '/api/integrations/slack/events': typeof ApiIntegrationsSlackEventsRoute
   '/api/v1/cli-authorizations/poll': typeof ApiV1CliAuthorizationsPollRoute
+  '/o/$organizationSlug': typeof ShellOOrganizationSlugIndexRoute
   '/o/$organizationSlug/activity/$runId': typeof ShellOOrganizationSlugActivityRunIdRoute
   '/o/$organizationSlug/sessions/$sessionId': typeof ShellOOrganizationSlugSessionsSessionIdRoute
   '/o/$organizationSlug/sessions/new': typeof ShellOOrganizationSlugSessionsNewRoute
@@ -531,6 +540,7 @@ export interface FileRoutesById {
   '/api/integrations/slack/callback': typeof ApiIntegrationsSlackCallbackRoute
   '/api/integrations/slack/events': typeof ApiIntegrationsSlackEventsRoute
   '/api/v1/cli-authorizations/poll': typeof ApiV1CliAuthorizationsPollRoute
+  '/_shell/o/$organizationSlug/': typeof ShellOOrganizationSlugIndexRoute
   '/_shell/o/$organizationSlug/activity/$runId': typeof ShellOOrganizationSlugActivityRunIdRoute
   '/_shell/o/$organizationSlug/sessions/$sessionId': typeof ShellOOrganizationSlugSessionsSessionIdRoute
   '/_shell/o/$organizationSlug/sessions/new': typeof ShellOOrganizationSlugSessionsNewRoute
@@ -590,6 +600,7 @@ export interface FileRouteTypes {
     | '/api/integrations/slack/callback'
     | '/api/integrations/slack/events'
     | '/api/v1/cli-authorizations/poll'
+    | '/o/$organizationSlug/'
     | '/o/$organizationSlug/activity/$runId'
     | '/o/$organizationSlug/sessions/$sessionId'
     | '/o/$organizationSlug/sessions/new'
@@ -643,6 +654,7 @@ export interface FileRouteTypes {
     | '/api/integrations/slack/callback'
     | '/api/integrations/slack/events'
     | '/api/v1/cli-authorizations/poll'
+    | '/o/$organizationSlug'
     | '/o/$organizationSlug/activity/$runId'
     | '/o/$organizationSlug/sessions/$sessionId'
     | '/o/$organizationSlug/sessions/new'
@@ -701,6 +713,7 @@ export interface FileRouteTypes {
     | '/api/integrations/slack/callback'
     | '/api/integrations/slack/events'
     | '/api/v1/cli-authorizations/poll'
+    | '/_shell/o/$organizationSlug/'
     | '/_shell/o/$organizationSlug/activity/$runId'
     | '/_shell/o/$organizationSlug/sessions/$sessionId'
     | '/_shell/o/$organizationSlug/sessions/new'
@@ -926,6 +939,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/agent-executions/$executionId/mcp'
       preLoaderRoute: typeof AgentExecutionsExecutionIdMcpRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/_shell/o/$organizationSlug/': {
+      id: '/_shell/o/$organizationSlug/'
+      path: '/o/$organizationSlug'
+      fullPath: '/o/$organizationSlug/'
+      preLoaderRoute: typeof ShellOOrganizationSlugIndexRouteImport
+      parentRoute: typeof ShellRoute
     }
     '/api/v1/cli-authorizations/poll': {
       id: '/api/v1/cli-authorizations/poll'
@@ -1248,6 +1268,7 @@ interface ShellRouteChildren {
   ShellOOrganizationSlugSessionsRoute: typeof ShellOOrganizationSlugSessionsRouteWithChildren
   ShellOOrganizationSlugSettingsRoute: typeof ShellOOrganizationSlugSettingsRouteWithChildren
   ShellOOrganizationSlugTriggersRoute: typeof ShellOOrganizationSlugTriggersRouteWithChildren
+  ShellOOrganizationSlugIndexRoute: typeof ShellOOrganizationSlugIndexRoute
 }
 
 const ShellRouteChildren: ShellRouteChildren = {
@@ -1269,6 +1290,7 @@ const ShellRouteChildren: ShellRouteChildren = {
     ShellOOrganizationSlugSettingsRouteWithChildren,
   ShellOOrganizationSlugTriggersRoute:
     ShellOOrganizationSlugTriggersRouteWithChildren,
+  ShellOOrganizationSlugIndexRoute: ShellOOrganizationSlugIndexRoute,
 }
 
 const ShellRouteWithChildren = ShellRoute._addFileChildren(ShellRouteChildren)
