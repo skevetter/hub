@@ -41,6 +41,7 @@ export interface LinearPilotEvent {
   activityId?: string;
   message?: string;
   pendingDelegation?: true;
+  confirmationCandidate?: true;
   delegationFallback?: DelegationFallback;
   /**
    * Stop only. Epoch ms of the signed `agentActivity.createdAt`, present only when that field is
@@ -250,9 +251,12 @@ function readCreatedOrigin(scope: Scope, humanId: string): LinearPilotIntakeResu
   const rawComment = field(session, "comment");
   const rawCommentId = field(session, "commentId");
   const source = field(session, "sourceCommentId");
-  // A creator can be an automation-substituted assignee. Without a comment, history must prove origin.
+  // Linear may report an automation-substituted assignee as the creator.
   if (rawComment == null && rawCommentId == null && source == null) {
-    return accept(scope, "created", humanId, { pendingDelegation: true });
+    return accept(scope, "created", humanId, {
+      pendingDelegation: true,
+      confirmationCandidate: true,
+    });
   }
   return readCreatedComment(scope, humanId, { rawComment, rawCommentId, source });
 }
@@ -266,9 +270,14 @@ function readCreatedComment(
     source,
   }: { rawComment: unknown; rawCommentId: unknown; source: unknown },
 ): LinearPilotIntakeResult {
-  const fallback = (delegationFallback: DelegationFallback) =>
-    accept(scope, "created", humanId, { pendingDelegation: true, delegationFallback });
   const comment = plain(rawComment);
+  const candidate = confirmationCandidate(rawComment, comment, source);
+  const fallback = (delegationFallback: DelegationFallback) =>
+    accept(scope, "created", humanId, {
+      pendingDelegation: true,
+      delegationFallback,
+      ...candidate,
+    });
   if (comment === undefined) return fallback("comment_missing");
   const author = field(comment, "userId");
   if (author != null && author !== humanId) return refuse("origin_unproven");
@@ -279,6 +288,17 @@ function readCreatedComment(
   if (author == null) return fallback("comment_author_missing");
   if (source != null && source !== commentId) return fallback("source_mismatch");
   return acceptCreatedComment(scope, humanId, comment);
+}
+
+function confirmationCandidate(
+  rawComment: unknown,
+  comment: Record_ | undefined,
+  source: unknown,
+): Pick<LinearPilotEvent, "confirmationCandidate"> {
+  return source == null &&
+    (rawComment == null || (comment !== undefined && field(comment, "userId") == null))
+    ? { confirmationCandidate: true }
+    : {};
 }
 
 function acceptCreatedComment(
@@ -377,7 +397,7 @@ function accept(
     ...extra
   }: Pick<
     LinearPilotEvent,
-    "activityId" | "message" | "pendingDelegation" | "delegationFallback"
+    "activityId" | "message" | "pendingDelegation" | "delegationFallback" | "confirmationCandidate"
   > & {
     stopCreatedAtMs?: number | undefined;
   },

@@ -4,13 +4,20 @@ import type { LinearAgentOperation, createLinearAgentClient } from "../providers
 import type { LinearConnectionBinding } from "../providers/linear/client.js";
 import type { LinearPilotRegistration } from "../providers/linear/index.js";
 
+const DELEGATION_REFUSED_BODY =
+  "Paseo could not confirm who started this. Mention @paseo in a comment instead.";
+const EXPIRED_BODY = "This start request expired. Mention @paseo in a comment instead.";
+
 const NOT_OWNER_BODY = "Paseo only works for the workspace owner in this pilot.";
 
 type Provider = Parameters<LinearPilotRegistration["offer"]>[1];
 type Client = ReturnType<typeof createLinearAgentClient>;
 
-export function originActivityId(sessionId: string, purpose: "not_owner"): string {
-  const identity = JSON.stringify([sessionId, purpose, "created"]);
+type OriginPurpose = "not_owner" | "awaiting_owner" | "owner_expired" | "delegationRefused";
+
+export function originActivityId(sessionId: string, purpose: OriginPurpose): string {
+  const interactionId = purpose === "delegationRefused" ? sessionId : "created";
+  const identity = JSON.stringify([sessionId, purpose, interactionId]);
   const name = `https://paseo.sh/id/linear-pilot/v4/${encodeURIComponent(identity)}`;
   const bytes = createHash("sha256").update(name).digest();
   bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
@@ -53,11 +60,30 @@ export async function readOriginWithin<T>(
   }
 }
 
+function boundedTitle(title: string) {
+  return title
+    .replace(/[`<>[\]!|]/gu, "")
+    .slice(0, 120)
+    .replace(/[\uD800-\uDBFF]$/u, "");
+}
+
 export function createOriginActivities(
   client: Pick<Client, "createActivity">,
   expectedBinding: LinearConnectionBinding,
 ) {
   let notOwnerClaimed = false;
+  async function write(
+    sessionId: string,
+    purpose: OriginPurpose,
+    type: "elicitation" | "response" | "error",
+    body: string,
+  ) {
+    await client.createActivity({
+      sessionId,
+      activityId: originActivityId(sessionId, purpose),
+      content: { type, body },
+    });
+  }
   return {
     async notOwner({
       binding,
@@ -71,11 +97,24 @@ export function createOriginActivities(
       if (binding !== expectedBinding || binding.providerApplicationId !== applicationId) return;
       if (notOwnerClaimed) return;
       notOwnerClaimed = true;
-      await client.createActivity({
-        sessionId: nativeSessionId,
-        activityId: originActivityId(nativeSessionId, "not_owner"),
-        content: { type: "response", body: NOT_OWNER_BODY },
-      });
+      await write(nativeSessionId, "not_owner", "response", NOT_OWNER_BODY);
+    },
+    awaitingOwner(
+      nativeSessionId: string,
+      { identifier, title }: { identifier: string; title: string },
+    ) {
+      return write(
+        nativeSessionId,
+        "awaiting_owner",
+        "elicitation",
+        `Reply here to start work on ${identifier}: ${boundedTitle(title)}.`,
+      );
+    },
+    delegationRefused(nativeSessionId: string) {
+      return write(nativeSessionId, "delegationRefused", "error", DELEGATION_REFUSED_BODY);
+    },
+    expired(nativeSessionId: string) {
+      return write(nativeSessionId, "owner_expired", "error", EXPIRED_BODY);
     },
   };
 }

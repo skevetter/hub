@@ -11,10 +11,10 @@ interface DeliveryMetadata {
 
 export function logPilotScopeRefusal(reason: string, metadata: DeliveryMetadata): undefined {
   if (reason === "workspace_mismatch" || reason === "not_owner") {
-    logger.debug({ ...metadata, reason }, "Linear pilot refused delivery");
+    logger.debug({ ...metadata, reason, stage: "intake" }, "Linear pilot refused delivery");
     return undefined;
   }
-  return logPilotRefusal(reason, metadata);
+  return logPilotRefusal(reason, metadata, { stage: "intake" });
 }
 
 export function pilotDeliveryMetadata(payload: unknown): DeliveryMetadata {
@@ -33,7 +33,7 @@ export function logPilotRefusal(
   reason: string,
   metadata: DeliveryMetadata,
   diagnostics?: LinearAgentErrorDetails & {
-    stage?: DelegationProofStage;
+    stage?: DelegationProofStage | "intake" | "issue_readback" | "signed_origin";
     linearAgentCode?: LinearAgentError["code"];
   },
 ): undefined {

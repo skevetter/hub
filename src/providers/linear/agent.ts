@@ -149,7 +149,12 @@ export type LinearAgentOperation =
   | { kind: "readNonOwnerOrigin"; sessionId: string }
   | { kind: "createActivity" | "readActivity"; sessionId: string }
   | {
-      kind: "readPilotPrompt" | "readPilotHistory" | "readDelegationOrigin";
+      kind:
+        | "readPilotPrompt"
+        | "readPilotHistory"
+        | "readDelegationOrigin"
+        | "readDelegationConfirmation"
+        | "readDelegationIssue";
       sessionId: string;
       issueId: string;
     }
@@ -463,6 +468,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
   return {
     ...historyMethods(run, api.requireHistoryScope),
     ...nonOwnerMethods(run, options.pilotOperations),
+    ...confirmationMethods(run, api.requireHistoryScope),
     ...activityCreateMethods(run, options.pilotOperations),
     ...activityReadMethods(run, options.pilotOperations),
     ...linkMethods(run, hubOrigin),
@@ -500,6 +506,73 @@ function nonOwnerMethods(run: AgentRun, pilotOperations: true | undefined) {
           const data = await send(nonOwnerOriginQuery, variables, nonOwnerOrigin);
           await checkCurrent();
           return data.agentSession;
+        },
+      );
+    },
+  };
+}
+
+const confirmationQuery = `query PaseoPilotDelegationConfirmation($sessionId: String!) {
+  agentSession(id: $sessionId) {
+    id appUser { id } creator { id } comment { user { id } } sourceComment { id }
+    issue { id identifier title team { id organization { id } } delegate { id } assignee { id } }
+  }
+}`;
+
+const delegationIssueQuery = `query PaseoPilotDelegationIssue($issueId: String!) {
+  issue(id: $issueId) { id identifier title description team { id organization { id } } }
+}`;
+
+const promptIssue = ref.extend({
+  identifier: id,
+  title: z.string().min(1),
+  team: workspaceRef,
+});
+const confirmationReadback = z.object({
+  agentSession: ref
+    .extend({
+      appUser: ref,
+      creator: ref.nullable(),
+      comment: z.object({ user: ref.nullable() }).nullable(),
+      sourceComment: ref.nullable(),
+      issue: promptIssue.extend({ delegate: ref.nullable(), assignee: ref.nullable() }).nullable(),
+    })
+    .nullable(),
+});
+const delegationIssueReadback = z.object({
+  issue: promptIssue.extend({ description: z.string().nullable() }).nullable(),
+});
+
+function confirmationMethods(
+  run: AgentRun,
+  requireScope: ReturnType<typeof agentConnection>["requireHistoryScope"],
+) {
+  return {
+    async readDelegationConfirmation(input: PilotHistoryScope, signal: AbortSignal) {
+      const { sessionId, issueId } = requireScope(input);
+      const variables = { sessionId };
+      return run(
+        { kind: "readDelegationConfirmation", sessionId, issueId },
+        variables,
+        signal,
+        async (send, _viewer, checkCurrent) => {
+          const data = await send(confirmationQuery, variables, confirmationReadback);
+          await checkCurrent();
+          return data.agentSession;
+        },
+      );
+    },
+    async readDelegationIssue(input: PilotHistoryScope, signal: AbortSignal) {
+      const { sessionId, issueId } = requireScope(input);
+      const variables = { issueId };
+      return run(
+        { kind: "readDelegationIssue", sessionId, issueId },
+        variables,
+        signal,
+        async (send, _viewer, checkCurrent) => {
+          const data = await send(delegationIssueQuery, variables, delegationIssueReadback);
+          await checkCurrent();
+          return data.issue;
         },
       );
     },

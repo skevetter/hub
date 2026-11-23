@@ -31,6 +31,7 @@ import {
   type PilotTurn,
 } from "./follow-up.js";
 import type { PilotHistoryScope } from "./history-read.js";
+import { awaitDelegationOwner, confirmDelegationOwner } from "./origin-confirmation.js";
 import { createNonOwnerOrigin } from "./origin-non-owner.js";
 import { createPilotSessionSerialization } from "./session-serialization.js";
 import type { LinearPilotSessionHooks } from "./session.js";
@@ -517,50 +518,80 @@ function acceptedActivity(
   };
 }
 
-async function dispatchCreated(
-  state: RuntimeState,
-  { qualified, provider, receivedAt, sessions }: RuntimeDelivery,
-) {
-  const { bindings, withSession } = state;
+function originContext(state: RuntimeState, { qualified, provider, receivedAt }: RuntimeDelivery) {
   const { config, runtime } = state.options;
-  const { event } = qualified;
-  const { nativeSessionId } = event;
-  const scope = eventScope(config, qualified);
-  const refusal = (reason: string) => logPilotRefusal(reason, createdMetadata(nativeSessionId));
-  const report = (failureCode: PilotFailure["failureCode"]) =>
-    reportRuntimeFailure(state, { sessionId: nativeSessionId, failureCode, operation: "created" });
-  const context = {
+  return {
     qualified,
     provider,
     config,
     database: runtime,
+    receivedAt,
     deadline: receivedAt.getTime() + PILOT_ACK_MS,
     accepting: () => state.accepting,
   };
-  const activity = acceptedActivity(config, qualified, {
+}
+
+function startInitialDelivery(
+  state: RuntimeState,
+  { qualified, provider, receivedAt, sessions }: RuntimeDelivery,
+  scope: CreatedScope,
+  message: string,
+) {
+  const activity = acceptedActivity(state.options.config, qualified, {
     kind: "created",
-    interactionId: nativeSessionId,
+    interactionId: qualified.event.nativeSessionId,
     receivedAt,
   });
+  return startCreated(
+    { message, qualified, scope, activity, provider, sessions },
+    {
+      bindings: state.bindings,
+      pending: state.pending,
+      active: state.active,
+      writerFor: (grant) => runtimeWriter(state, grant),
+      reportFailure: (failure) => reportRuntimeFailure(state, failure),
+      accepting: () => state.accepting,
+    },
+  );
+}
+
+async function dispatchCreated(state: RuntimeState, delivery: RuntimeDelivery) {
+  const { bindings, withSession } = state;
+  const { qualified, receivedAt } = delivery;
+  const { event } = qualified;
+  const { nativeSessionId } = event;
+  const scope = eventScope(state.options.config, qualified);
+  const refusal = (reason: string) => logPilotRefusal(reason, createdMetadata(nativeSessionId));
+  const context = originContext(state, delivery);
 
   await withSession(scope.authority, scope.origin, async () => {
     if (!canAcknowledge(context)) return refusal("ack_window_closed");
     const prior = await bindings.find(scope.authority, scope.origin);
-    if (prior.status === "refused") return report(prior.reason);
+    if (prior.status === "refused")
+      return reportRuntimeFailure(state, {
+        sessionId: nativeSessionId,
+        failureCode: prior.reason,
+        operation: "created",
+      });
     if (prior.status !== "none") return refusal("duplicate");
-    const message = await prepareCreated(context, receivedAt, activity);
-    if (message !== undefined)
-      await startCreated(
-        { message, qualified, scope, activity, provider, sessions },
-        {
-          bindings,
-          pending: state.pending,
-          active: state.active,
-          writerFor: (grant) => runtimeWriter(state, grant),
-          reportFailure: (failure) => reportRuntimeFailure(state, failure),
-          accepting: context.accepting,
-        },
-      );
+    if (event.pendingDelegation) return awaitDelegationOwner(context);
+    const message = await prepareCreated(context, receivedAt);
+    if (message !== undefined) await startInitialDelivery(state, delivery, scope, message);
+  });
+}
+
+async function dispatchDelegationConfirmation(state: RuntimeState, delivery: RuntimeDelivery) {
+  const scope = eventScope(state.options.config, delivery.qualified);
+  const { authority, origin } = scope;
+  const context = originContext(state, delivery);
+  return state.withSession(authority, origin, async () => {
+    const decision = await confirmDelegationOwner(context, async () => {
+      const prior = await state.bindings.find(authority, origin);
+      return prior.status !== "none";
+    });
+    if (decision.handled && decision.message !== undefined && canAcknowledge(context))
+      await startInitialDelivery(state, delivery, scope, decision.message);
+    return decision.handled;
   });
 }
 
@@ -576,7 +607,9 @@ function clientFor(state: RuntimeState, grant: Active, activity = grant.activity
     (!("issueId" in operation) || operation.issueId === grant.origin.issueId) &&
     operation.kind !== "addHubUrl" &&
     operation.kind !== "readDelegationOrigin" &&
-    operation.kind !== "readNonOwnerOrigin";
+    operation.kind !== "readNonOwnerOrigin" &&
+    operation.kind !== "readDelegationConfirmation" &&
+    operation.kind !== "readDelegationIssue";
   return grant.provider.activityClient({
     binding: activity.binding,
     authorize: async (_binding, operation) => {
@@ -671,6 +704,7 @@ async function dispatchFollowUp(state: RuntimeState, delivery: RuntimeDelivery) 
   const { event, installation } = qualified;
   const { kind } = event;
   if (kind === "created") return;
+  if (kind === "prompted" && (await dispatchDelegationConfirmation(state, delivery))) return;
   const signed = adaptSignedPilotFollowUp(event, installation);
   if (!signed)
     return reportFollowUpOutcome({

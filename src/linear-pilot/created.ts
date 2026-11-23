@@ -38,11 +38,7 @@ export function canAcknowledge(context: Pick<CreatedContext, "accepting" | "dead
   return context.accepting() && Date.now() < context.deadline;
 }
 
-export async function prepareCreated(
-  context: CreatedContext,
-  receivedAt: Date,
-  activity: LinearPilotAcceptedEvent,
-) {
+export async function prepareCreated(context: CreatedContext, receivedAt: Date) {
   const {
     qualified: { event, installation },
     config,
@@ -57,7 +53,6 @@ export async function prepareCreated(
     nativeSessionId: event.nativeSessionId,
     receivedAt,
   };
-  if (event.pendingDelegation) return readDelegation(context, receipt, activity);
   const { message } = event;
   if (message === undefined) return undefined;
   if (!validMessage(message)) return logPilotRefusal("unqualified_content", metadata);
@@ -122,7 +117,7 @@ function failedReadback(error: unknown) {
   };
 }
 
-async function readDelegation(
+export async function readDelegation(
   context: CreatedContext,
   receipt: CreatedReceipt,
   activity: LinearPilotAcceptedEvent,
