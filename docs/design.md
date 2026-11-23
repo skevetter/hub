@@ -11,7 +11,7 @@ Decided by the owner on 2026-11-23:
 3. Main navigation is Home, Activity, Sessions, Triggers. A Setup group holds Daemons, Connections, Profiles. Settings comes last, with an Instance section that only instance operators see. Activity lists runs; sessions keep their own list.
 4. Archivo and JetBrains Mono are self-hosted variable fonts (`@fontsource-variable/archivo`, `@fontsource-variable/jetbrains-mono`, OFL-1.1).
 
-Migration: tokens, faces, weights and corners apply everywhere now. A component in the roster marked with a later step keeps its current layout until that step rebuilds it. New screens use the target components as they land.
+Migration: tokens, faces, weights and corners apply everywhere now. A component in the roster marked with a later step keeps its current layout until that step rebuilds it. New screens use the target components as they land. The triggers editor and the auth entry screens keep their larger corner classes until steps 5 and 10; the radius tokens draw them at 2 px and the policy test lists them.
 
 Open:
 

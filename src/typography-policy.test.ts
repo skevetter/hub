@@ -34,6 +34,18 @@ interface Rule {
 const tsx = new Set([".tsx"]);
 const code = new Set([".ts", ".tsx"]);
 
+/*
+ * Screens whose old corners stay until their redesign step rebuilds them, so the step that owns a
+ * screen pays its strict-lint debt instead of a token migration. The radius tokens draw 2 px
+ * meanwhile. An entry that no longer needs the exemption fails the scan, so the list only shrinks.
+ */
+const legacyCorners = new Map([
+  ["auth/account-entry.tsx", "step 10, first run and auth"],
+  ["triggers/panel.tsx", "step 5, triggers"],
+]);
+const cornerRule = "corner rounder than the scale";
+const cornerPattern = /\brounded-(?:md|lg|xl|2xl|3xl)\b/g;
+
 const forbidden: Rule[] = [
   { rule: "letter-spacing utility", pattern: /\btracking-/g, extensions: code },
   { rule: "uppercase", pattern: /\buppercase\b/g },
@@ -50,7 +62,7 @@ const forbidden: Rule[] = [
   { rule: "bold element", pattern: /<(?:strong|b)[\s>]/g },
   { rule: "hex colour", pattern: /#[0-9a-f]{3,8}\b/gi, extensions: tsx },
   { rule: "removed token", pattern: /extra-muted-foreground/g },
-  { rule: "corner rounder than the scale", pattern: /\brounded-(?:md|lg|xl|2xl|3xl)\b/g },
+  { rule: cornerRule, pattern: cornerPattern },
   {
     rule: "shadow on flat content",
     pattern: /(?<![\w-])shadow-(?!floating\b|none\b)[\w-]+/g,
@@ -91,6 +103,10 @@ function sourceFiles(directory: string): string[] {
   });
 }
 
+function hasMatch(pattern: RegExp, name: string): boolean {
+  return [...readFileSync(join(sourceRoot, name), "utf8").matchAll(pattern)].length > 0;
+}
+
 const ownedBy = (name: string, owners: string[]) => owners.some((owner) => name.startsWith(owner));
 
 function weightViolations(name: string, source: string): string[] {
@@ -104,6 +120,7 @@ function weightViolations(name: string, source: string): string[] {
 function ruleViolations(name: string, source: string, extension: string): string[] {
   return forbidden.flatMap(({ rule, pattern, extensions }) => {
     if (extensions && !extensions.has(extension)) return [];
+    if (rule === cornerRule && legacyCorners.has(name)) return [];
     return [...source.matchAll(pattern)].map((match) => `${name}: ${rule} (${match[0].trim()})`);
   });
 }
@@ -227,6 +244,11 @@ describe("design contract", () => {
       ),
     );
     assert.deepEqual(violations, []);
+  });
+
+  it("keeps legacy corners only where they still exist", () => {
+    const stale = [...legacyCorners.keys()].filter((name) => !hasMatch(cornerPattern, name));
+    assert.deepEqual(stale, []);
   });
 
   it("defines every token in both themes, at AA", () => {

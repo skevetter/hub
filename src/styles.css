@@ -160,7 +160,14 @@
   --font-weight-normal: 400;
   --font-weight-strong: 600;
 
+  /*
+   * Larger corners collapse to the scale so screens not yet rebuilt still draw 2 px. The policy
+   * test lists those screens and refuses new ones.
+   */
   --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-xl: 2px;
 }
 
 @theme inline {
