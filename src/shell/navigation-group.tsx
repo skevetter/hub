@@ -107,7 +107,7 @@ export function NavItem({ item, phoneTab = false }: { item: NavigationItem; phon
           ? cn(
               PHONE_TAB_CLASS,
               active
-                ? "bg-live font-strong text-live-foreground"
+                ? "bg-live font-strong text-live-foreground focus-visible:outline-live-foreground"
                 : "text-rail-muted hover:bg-rail-accent",
             )
           : undefined
