@@ -10,10 +10,17 @@ function promiseTypeArgument(typeNode) {
   return (typeNode.typeArguments ?? typeNode.typeParameters)?.params[0];
 }
 
+function unwrapType(typeNode) {
+  if (typeNode.type === "TSTypeOperator" && typeNode.operator === "readonly") {
+    return typeNode.typeAnnotation;
+  }
+  return promiseTypeArgument(typeNode);
+}
+
 function tupleLength(typeNode) {
   if (!typeNode) return 0;
   if (typeNode.type === "TSTupleType") return typeNode.elementTypes.length;
-  return tupleLength(promiseTypeArgument(typeNode));
+  return tupleLength(unwrapType(typeNode));
 }
 
 function constArrayLength(expression) {
