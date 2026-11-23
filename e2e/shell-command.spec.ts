@@ -46,3 +46,25 @@ test("the command menu navigates, switches organization, and applies theme witho
   await expect(search).toBeFocused();
   expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentStart);
 });
+
+test("the account menu offers System, Light, and Dark", async ({ hub, page, context }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await page.emulateMedia({ colorScheme: "dark" });
+  const account = page.getByRole("button", { name: owner.email });
+  const menu = page.getByRole("menu");
+  const html = page.locator("html");
+
+  await account.click();
+  await expect(menu.getByRole("menuitemradio", { checked: true })).toHaveText("System");
+  await expect(menu.getByRole("menuitemradio")).toHaveText(["System", "Light", "Dark"]);
+  await menu.getByRole("menuitemradio", { name: "Light" }).click();
+  await expect(html).toHaveClass(/\blight\b/u);
+  expect((await context.cookies()).find(({ name }) => name === "theme")?.value).toBe("light");
+
+  await account.click();
+  await expect(menu.getByRole("menuitemradio", { checked: true })).toHaveText("Light");
+  await menu.getByRole("menuitemradio", { name: "System" }).click();
+  await expect(html).toHaveClass(/\bdark\b/u);
+  expect((await context.cookies()).find(({ name }) => name === "theme")?.value).toBe("system");
+});

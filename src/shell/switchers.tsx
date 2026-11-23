@@ -3,6 +3,7 @@ import { useCallback, useState, type ComponentProps } from "react";
 
 import { FormDialog } from "../components/app/form-dialog.js";
 import { FormField } from "../components/app/form-field.js";
+import { ThemeSwitch } from "../components/app/theme-switch.js";
 import {
   DropdownMenuItem,
   DropdownMenuLabel,
@@ -187,6 +188,8 @@ export function AccountMenu({
       primary={name}
       secondary={email}
     >
+      <ThemeSwitch />
+      <DropdownMenuSeparator />
       <DropdownMenuItem disabled={busy} onSelect={onSignOut}>
         <LogOut aria-hidden="true" />
         Sign out
