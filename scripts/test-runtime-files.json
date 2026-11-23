@@ -1,0 +1,49 @@
+{
+  ".output/server/": [
+    "src/run-stream/built-server.integration.test.ts",
+    "src/run-stream/bundle-lifecycle.integration.test.ts",
+    "src/run-stream/methods.built-server.integration.test.ts"
+  ],
+  "docs/linear-pilot.md": ["src/linear-pilot/manual-close.integration.test.ts"],
+  "docs/public-api.md": ["src/run-stream/built-server.integration.test.ts"],
+  "docs/webhook-rollback.sql": ["src/auth/webhook-rollback.test.ts"],
+  "docs/webhooks.md": ["src/public-api/webhook-docs.test.ts"],
+  "drizzle/": ["src/db/migrations.integration.test.ts", "src/db/migrations.test.ts"],
+  "e2e/apps-mobile.spec.ts": ["src/provider-applications/evidence-contract.test.ts"],
+  "e2e/apps.spec.ts": ["src/provider-applications/evidence-contract.test.ts"],
+  "examples/single-repo-team-bot/": ["src/config/public-examples.test.ts"],
+  "src/": [
+    "src/run-timeline/failures.test.ts",
+    "src/run-timeline/secrets.test.ts",
+    "src/typography-policy.test.ts"
+  ],
+  "src/config/fixtures/current-project/": [
+    "src/config/current-project-fixture.test.ts",
+    "src/daemons/daemons.test.ts",
+    "src/e2e/hub-foundation.e2e.test.ts",
+    "src/e2e/hub-real-agent.e2e.test.ts",
+    "src/triggers/configuration/legacy-migration.matrix.test.ts",
+    "src/workflows/engine.test.ts"
+  ],
+  "src/config/fixtures/current-project/.paseo/workflows/": [
+    "src/config/current-project-fixture.test.ts",
+    "src/daemons/daemons.test.ts",
+    "src/e2e/hub-foundation.e2e.test.ts",
+    "src/e2e/hub-real-agent.e2e.test.ts",
+    "src/workflows/engine.test.ts"
+  ],
+  "src/config/fixtures/current-project/.paseo/workflows/partials/": [
+    "src/config/current-project-fixture.test.ts",
+    "src/daemons/daemons.test.ts",
+    "src/e2e/hub-foundation.e2e.test.ts",
+    "src/e2e/hub-real-agent.e2e.test.ts",
+    "src/workflows/engine.test.ts"
+  ],
+  "src/config/index.ts": ["src/config/runtime-source.test.ts"],
+  "src/db/memory.ts": ["src/run-timeline/status-paths.test.ts"],
+  "src/db/migrations/": ["src/db/migrations.integration.test.ts", "src/db/migrations.test.ts"],
+  "src/db/pg.ts": ["src/run-timeline/status-paths.test.ts"],
+  "src/run-timeline/scrub.ts": ["src/run-timeline/scrub.test.ts"],
+  "src/run-timeline/test-utils/build17-scrubber.ts": ["src/run-timeline/scrub.test.ts"],
+  "src/styles.css": ["src/motion-policy.test.ts"]
+}

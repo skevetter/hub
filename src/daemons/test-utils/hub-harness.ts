@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
 import type { Server } from "node:http";
-import { createServer } from "node:net";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { createStartHandler, defaultStreamHandler } from "@tanstack/react-start/server";
-import { createPostgresQueryRuntime } from "../../db/test-utils/runtime.js";
 import { dump } from "js-yaml";
 import { WebSocket, type RawData } from "ws";
 import { z } from "zod";
@@ -23,7 +22,8 @@ import {
   deriveAgentExecutionCompletionToken,
   hashAgentExecutionCompletionToken,
 } from "../../agent-executions/completion-token.js";
-import { createDatabase } from "../../db/test-utils/runtime.js";
+import { createDatabase, testDatabaseRuntime } from "../../db/test-utils/runtime.js";
+import { isolatedPostgresDatabase } from "../../db/test-utils/isolated-postgres.js";
 import type { ApiKeyScope } from "../../auth/api-key-contract.js";
 import type { OperationAuthenticator } from "../../auth/operation-auth.js";
 import type {
@@ -121,9 +121,9 @@ const ExecutionSessionRequestSchema = z.object({
         .object({
           provider: z.string(),
           cwd: z.string(),
-          mcpServers: z.record(z.string(), z.object({ url: z.string() }).passthrough()).optional(),
+          mcpServers: z.record(z.string(), z.object({ url: z.string() }).loose()).optional(),
         })
-        .passthrough(),
+        .loose(),
       env: z.record(z.string(), z.string()).optional(),
       worktree: z.unknown().optional(),
       background: z.boolean().optional(),
@@ -181,6 +181,7 @@ type FakeAgentRequest = z.infer<typeof ExecutionSessionRequestSchema>["message"]
 
 export class HubHarness {
   private postgres: StartedPostgreSqlContainer | undefined;
+  private isolatedDatabase: ReturnType<typeof isolatedPostgresDatabase> | undefined;
   private database: Database | undefined;
   private readonly entitlements = createUnlimitedEntitlementsService();
   private server: Server | undefined;
@@ -255,10 +256,10 @@ export class HubHarness {
   private authorityMintPermanentlyUnresolved = false;
   private executionAuthority!: ExecutionAuthority;
 
-  static async start(): Promise<HubHarness> {
+  static async start(postgres?: StartedPostgreSqlContainer): Promise<HubHarness> {
     const harness = new HubHarness();
     try {
-      await harness.startResources();
+      await harness.startResources(postgres);
       return harness;
     } catch (error) {
       await harness.stop();
@@ -353,9 +354,8 @@ export class HubHarness {
   }
 
   async seedSlackWorkspace(teamId: string, slug = "paseo"): Promise<string> {
-    if (this.postgres === undefined) throw new Error("Postgres is unavailable");
     const id = "00000000-0000-4000-8000-0000000000c1";
-    const client = await createPostgresQueryRuntime(this.postgres.getConnectionUri());
+    const client = testDatabaseRuntime(this.requireDatabase());
 
     await client.query(
       `insert into slack_connections
@@ -364,14 +364,12 @@ export class HubHarness {
        on conflict (team_id) do nothing`,
       [id, HUB_ORGANIZATION_ID, teamId, slug, JSON.stringify(["app_mentions:read", "chat:write"])],
     );
-    await client.close();
     return id;
   }
 
   async seedCurrentProjectResources(): Promise<string> {
     const slackId = await this.seedSlackWorkspace("paseo");
-    if (this.postgres === undefined) throw new Error("Postgres is unavailable");
-    const client = await createPostgresQueryRuntime(this.postgres.getConnectionUri());
+    const client = testDatabaseRuntime(this.requireDatabase());
 
     const githubId = "00000000-0000-4000-8000-0000000000c2";
     await client.query(
@@ -397,7 +395,6 @@ export class HubHarness {
        on conflict (connection_id, repository_id) do nothing`,
       [HUB_ORGANIZATION_ID, githubId],
     );
-    await client.close();
     return slackId;
   }
 
@@ -657,9 +654,11 @@ export class HubHarness {
         this.attachDispatchRun(Object.assign({}, intent, overrides), providerEventReceiptId),
       ),
     );
+    const [firstIntent] = intents;
+    assert.ok(firstIntent);
     const daemon = await database.findDaemonForOrganization(
-      intents[0]!.organizationId,
-      intents[0]!.environment.daemonId,
+      firstIntent.organizationId,
+      firstIntent.environment.daemonId,
     );
     if (daemon === undefined) throw new Error("Daemon is unavailable");
     const executions = [];
@@ -883,6 +882,9 @@ export class HubHarness {
   }
   async waitForControlAction(action: HubExecutionControlAction): Promise<void> {
     await waitFor(async () => this.controlActions().includes(action));
+  }
+  async waitForTimelineSubscription(agentId: string): Promise<void> {
+    await waitFor(async () => this.requireDaemon().timelineAgentIds.includes(agentId));
   }
   originUrl(): string {
     return this.origin;
@@ -1144,7 +1146,9 @@ export class HubHarness {
       const deadline = (await this.execution(executionId)).idleDeadlineAt;
       return deadline !== null && deadline.getTime() !== previousDeadline?.getTime();
     });
-    return (await this.execution(executionId)).idleDeadlineAt!;
+    const deadline = (await this.execution(executionId)).idleDeadlineAt;
+    assert.ok(deadline);
+    return deadline;
   }
 
   async agentBecomesRunning(executionId: string, agentId: string): Promise<void> {
@@ -1310,7 +1314,7 @@ export class HubHarness {
                 description: z.string(),
                 inputSchema: z.unknown(),
               })
-              .passthrough(),
+              .loose(),
           ),
         }),
       })
@@ -1357,6 +1361,10 @@ export class HubHarness {
     if (this.database) {
       await this.database.close();
       this.database = undefined;
+    }
+    if (this.isolatedDatabase) {
+      await this.isolatedDatabase.drop();
+      this.isolatedDatabase = undefined;
     }
     if (this.postgres) {
       await this.postgres.stop();
@@ -1437,7 +1445,7 @@ export class HubHarness {
         code: z.string().optional(),
         issues: z.unknown().optional(),
       })
-      .passthrough()
+      .loose()
       .parse(await response.json());
     const validationErrors =
       body.versionId === undefined
@@ -1621,6 +1629,10 @@ export class HubHarness {
         input: { service: input.service ?? "api" },
       }),
     });
+    return this.readManualResponse(response);
+  }
+
+  private async readManualResponse(response: Response) {
     if (response.status >= 500)
       throw new Error("manual run was interrupted by application restart");
     const body = z
@@ -1632,7 +1644,7 @@ export class HubHarness {
         error: z.string().optional(),
         code: z.string().optional(),
       })
-      .passthrough()
+      .loose()
       .parse(await response.json());
     const errorCode = body.error ?? body.code;
     return {
@@ -1665,7 +1677,7 @@ export class HubHarness {
     });
     const body = z
       .object({ triggerRunId: z.string().optional() })
-      .passthrough()
+      .loose()
       .parse(await response.json());
     return {
       status: response.status,
@@ -1706,10 +1718,24 @@ export class HubHarness {
     return { first, second };
   }
 
-  private async startResources(): Promise<void> {
-    this.postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
-    this.database = await createDatabase(this.postgres.getConnectionUri());
-    const client = await createPostgresQueryRuntime(this.postgres.getConnectionUri());
+  private async startResources(postgres?: StartedPostgreSqlContainer): Promise<void> {
+    let databaseUrl: string;
+    if (postgres) {
+      this.isolatedDatabase = isolatedPostgresDatabase(postgres.getConnectionUri());
+      databaseUrl = this.isolatedDatabase.url;
+    } else {
+      this.postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
+      databaseUrl = this.postgres.getConnectionUri();
+    }
+    this.database = await createDatabase(databaseUrl);
+    await this.seedProject(this.database);
+    await this.seedDaemon(this.database);
+    await this.seedConfiguration(this.database);
+    await this.startApp();
+  }
+
+  private async seedProject(database: Database): Promise<void> {
+    const client = testDatabaseRuntime(database);
 
     await client.query(
       `insert into organization (id, name, slug) values ('org_1', 'Hub harness', 'hub-harness')`,
@@ -1741,9 +1767,10 @@ export class HubHarness {
        values ($1, $2, 'Default', $3, $4)`,
       [HUB_PROJECT_ID, HUB_ORGANIZATION_ID, HUB_PROJECT_SLUG, HUB_USER_ID],
     );
-    await client.close();
-    const store = new ProjectConfigurationStore(this.database, HUB_PROJECT_ID);
-    await this.database.issueEnrollmentToken({
+  }
+
+  private async seedDaemon(database: Database): Promise<void> {
+    await database.issueEnrollmentToken({
       id: "00000000-0000-4000-8000-0000000000ee",
       verifier: "seed-daemon-token",
       organizationId: HUB_ORGANIZATION_ID,
@@ -1751,7 +1778,7 @@ export class HubHarness {
       expiresAt: new Date(Date.now() + ENROLLMENT_LIFETIME_MS),
       consumedAt: null,
     });
-    await this.database.enrollDaemon({
+    await database.enrollDaemon({
       tokenVerifier: "seed-daemon-token",
       daemonId: "00000000-0000-4000-8000-0000000000dd",
       idempotencyKey: "seed-daemon-idempotency",
@@ -1761,6 +1788,10 @@ export class HubHarness {
       permissions: ["hub.execute"],
       now: new Date(),
     });
+  }
+
+  private async seedConfiguration(database: Database): Promise<void> {
+    const store = new ProjectConfigurationStore(database, HUB_PROJECT_ID);
     const config = await store.insertManualBundleRevision({
       files: configurationBundleFixture(
         dump({
@@ -1790,13 +1821,45 @@ export class HubHarness {
     });
     await store.activate(config.id);
     this.configurationRevisionId = config.id;
-    await this.startApp();
   }
 
   private async startApp(): Promise<void> {
-    const port = await availablePort();
-    this.origin = `http://127.0.0.1:${port}`;
+    await this.startServer();
     this.executionAuthority = this.createExecutionAuthority();
+    const application = this.createApplication();
+    await application.hub.start();
+    await this.registerApplication(application);
+    this.hub = application.hub;
+  }
+
+  private async startServer(): Promise<void> {
+    const server = createFetchServer(createStartHandler(defaultStreamHandler), {
+      handleUpgrade: (request, socket, head) => {
+        if (this.hub?.handleUpgrade) void this.hub.handleUpgrade(request, socket, head);
+        else socket.destroy();
+      },
+    });
+    const listening = once(server, "listening");
+    server.listen(0, "127.0.0.1");
+    await listening;
+    this.server = server;
+    const deadline = Promise.withResolvers<boolean>();
+    const shutdown = createServerShutdown(server, () => stopApplication(), {
+      graceMs: 5_000,
+      hardExitMs: 10_000,
+      exit: (code) => {
+        if (code !== 0)
+          deadline.reject(new Error("Hub harness shutdown exceeded its deadline or failed"));
+      },
+    });
+    this.shutdownServer = () => Promise.race([shutdown(), deadline.promise]);
+
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    this.origin = `http://127.0.0.1:${address.port}`;
+  }
+
+  private createApplication() {
     const registry = new OutputExecutorRegistry();
     registry.register({
       type: "discord.reply",
@@ -1810,7 +1873,7 @@ export class HubHarness {
       available: outputContextProvider("slack"),
       execute: async () => undefined,
     });
-    const application = createHubApplication({
+    return createHubApplication({
       database: this.databaseForApplication(),
       entitlements: this.entitlements,
       providers: [this.recordingProvider()],
@@ -1835,8 +1898,12 @@ export class HubHarness {
       executionAuthority: this.executionAuthority,
       dispatchTimeoutMs: 30_000,
     });
+  }
+
+  private async registerApplication(
+    application: ReturnType<typeof createHubApplication>,
+  ): Promise<void> {
     const hub = application.hub;
-    await hub.start();
     await startApplication(() => ({
       hub,
       operations: application.operations,
@@ -1872,23 +1939,6 @@ export class HubHarness {
       providerRequest: () => Promise.resolve(new Response("Not Found", { status: 404 })),
       stop: () => hub.stop(),
     }));
-    const server = createFetchServer(createStartHandler(defaultStreamHandler), {
-      handleUpgrade: (request, socket, head) => void hub?.handleUpgrade?.(request, socket, head),
-    });
-    server.listen(port, "127.0.0.1");
-    await new Promise<void>((resolve) => server.once("listening", resolve));
-    this.hub = hub;
-    this.server = server;
-    const deadline = Promise.withResolvers<boolean>();
-    const shutdown = createServerShutdown(server, () => stopApplication(), {
-      graceMs: 5_000,
-      hardExitMs: 10_000,
-      exit: (code) => {
-        if (code !== 0)
-          deadline.reject(new Error("Hub harness shutdown exceeded its deadline or failed"));
-      },
-    });
-    this.shutdownServer = () => Promise.race([shutdown(), deadline.promise]);
   }
 
   private createExecutionAuthority(): ExecutionAuthority {
@@ -2293,12 +2343,12 @@ export class TestDaemon {
     this.resolveSpawn = resolve;
   });
   private readonly idempotencyKey = randomUUID();
+  private webSocketUrl: string | undefined;
   private constructor(
     private readonly origin: string,
     readonly daemonId: string,
     readonly slug: string,
     private readonly credential: string,
-    private readonly webSocketUrl?: string,
   ) {}
   static create(origin: string): TestDaemon {
     const id = randomUUID();
@@ -2328,7 +2378,7 @@ export class TestDaemon {
     if (response.status !== 200) throw new Error(`Enrollment failed: ${response.status}`);
     const enrollment = EnrollmentSchema.parse(await response.json());
     this.permissions = [...enrollment.permissions];
-    Object.assign(this, { webSocketUrl: enrollment.webSocketUrl });
+    this.webSocketUrl = enrollment.webSocketUrl;
     return enrollment;
   }
   async enrollmentStatus(token: string): Promise<number> {
@@ -2384,7 +2434,7 @@ export class TestDaemon {
     return response.status;
   }
   async connect(enrollment: Enrollment): Promise<void> {
-    Object.assign(this, { webSocketUrl: enrollment.webSocketUrl });
+    this.webSocketUrl = enrollment.webSocketUrl;
     await this.connectExisting();
   }
   async connectExisting(): Promise<void> {
@@ -2405,10 +2455,11 @@ export class TestDaemon {
     });
   }
   async reconnectStatus(credential: "valid" | "invalid"): Promise<number> {
-    if (!this.webSocketUrl) throw new Error("Daemon has no socket URL");
+    const webSocketUrl = this.webSocketUrl;
+    if (!webSocketUrl) throw new Error("Daemon has no socket URL");
     const secret = credential === "valid" ? this.credential : "invalid";
     return new Promise((resolve, reject) => {
-      const socket = new WebSocket(this.webSocketUrl!, {
+      const socket = new WebSocket(webSocketUrl, {
         headers: {
           authorization: `Bearer ${secret}`,
           "x-paseo-daemon-id": this.daemonId,
@@ -2427,13 +2478,8 @@ export class TestDaemon {
   replacement(origin = this.origin): TestDaemon {
     const webSocketUrl = new URL("/api/daemons/socket", origin);
     webSocketUrl.protocol = "ws:";
-    const replacement = new TestDaemon(
-      origin,
-      this.daemonId,
-      this.slug,
-      this.credential,
-      webSocketUrl.toString(),
-    );
+    const replacement = new TestDaemon(origin, this.daemonId, this.slug, this.credential);
+    replacement.webSocketUrl = webSocketUrl.toString();
     for (const [agentId, agent] of this.agents) replacement.agents.set(agentId, agent);
     for (const [agentId, entries] of this.timeline) replacement.timeline.set(agentId, entries);
     replacement.controls.push(...this.controls);
@@ -2761,47 +2807,62 @@ export class TestDaemon {
       });
       return;
     }
-    if (request.type === "fetch_agent_timeline_request") {
-      this.fetchTimeline(request);
-      return;
+    this.handleAgentRequest(request);
+  }
+
+  private handleAgentRequest(
+    request: Exclude<
+      FakeAgentRequest,
+      { type: "get_providers_snapshot_request" | "hub.execution.agent.validate.request" }
+    >,
+  ): void {
+    switch (request.type) {
+      case "fetch_agent_timeline_request":
+        this.fetchTimeline(request);
+        return;
+      case "fetch_agent_request":
+        this.fetchAgent(request);
+        return;
+      case "workspace.title.set.request":
+        this.titleWorkspace(request);
+        return;
+      case "fetch_agents_request":
+      case "agent.timeline.set_subscription.request":
+        this.subscribe(request);
+        return;
+      case "send_agent_message_request":
+        this.sendAgentMessage(request);
+        return;
+      case "cancel_agent_request":
+      case "archive_workspace_request":
+        this.controlAgent(request);
+        return;
+      case "create_agent_request":
+        this.createAgent(request);
+        return;
     }
-    if (request.type === "fetch_agent_request") {
-      this.fetchAgent(request);
-      return;
-    }
-    if (request.type === "workspace.title.set.request") {
-      this.titleWorkspace(request);
-      return;
-    }
-    if (
-      request.type === "fetch_agents_request" ||
-      request.type === "agent.timeline.set_subscription.request"
-    ) {
-      this.subscribe(request);
-      return;
-    }
-    if (request.type === "send_agent_message_request") {
-      this.sendAgentMessage(request);
-      return;
-    }
-    if (request.type === "cancel_agent_request" || request.type === "archive_workspace_request") {
-      const agentId =
-        request.type === "cancel_agent_request"
-          ? request.agentId
-          : request.workspaceId.slice("workspace-".length);
-      const executionId = this.executionId(agentId);
-      const action = request.type === "cancel_agent_request" ? "interrupt" : "archive";
-      const control = { requestId: request.requestId, executionId, action } as const;
-      this.controls.push(action);
-      this.controlActionsByExecution.set(executionId, action);
-      const pending = this.pendingControlActions.get(executionId);
-      this.pendingControlActions.delete(executionId);
-      pending?.(action);
-      if (this.holdControlAck) this.heldControls.set(executionId, control);
-      else this.acknowledgeControl(control);
-      return;
-    }
-    this.createAgent(request);
+  }
+
+  private controlAgent(
+    request: Extract<
+      FakeAgentRequest,
+      { type: "cancel_agent_request" | "archive_workspace_request" }
+    >,
+  ): void {
+    const agentId =
+      request.type === "cancel_agent_request"
+        ? request.agentId
+        : request.workspaceId.slice("workspace-".length);
+    const executionId = this.executionId(agentId);
+    const action = request.type === "cancel_agent_request" ? "interrupt" : "archive";
+    const control = { requestId: request.requestId, executionId, action } as const;
+    this.controls.push(action);
+    this.controlActionsByExecution.set(executionId, action);
+    const pending = this.pendingControlActions.get(executionId);
+    this.pendingControlActions.delete(executionId);
+    pending?.(action);
+    if (this.holdControlAck) this.heldControls.set(executionId, control);
+    else this.acknowledgeControl(control);
   }
 
   private sendAgentMessage(
@@ -2819,11 +2880,7 @@ export class TestDaemon {
 
   private createAgent(request: Extract<FakeAgentRequest, { type: "create_agent_request" }>) {
     const hubMcp = request.config.mcpServers?.["hub"];
-    const interactive =
-      request.config.mcpServers === undefined &&
-      /^isession:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}:[1-9][0-9]*$/u.test(
-        request.idempotencyKey,
-      );
+    const interactive = isInteractiveAgentRequest(request);
     // The real daemon does not require Hub MCP to create an interactive agent.
     const executionId = interactive
       ? request.idempotencyKey
@@ -3053,13 +3110,15 @@ function readText(data: RawData): string {
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString();
   return data.toString();
 }
-async function availablePort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("Could not reserve port");
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-  return address.port;
+function isInteractiveAgentRequest(
+  request: Extract<FakeAgentRequest, { type: "create_agent_request" }>,
+): boolean {
+  return (
+    request.config.mcpServers === undefined &&
+    /^isession:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}:[1-9][0-9]*$/u.test(
+      request.idempotencyKey,
+    )
+  );
 }
 
 function machineHeaders(auth: "valid" | "missing" | "wrong"): Record<string, string> {

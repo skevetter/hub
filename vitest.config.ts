@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 
 export default defineConfig({
+  ...(process.env["HUB_VITEST_CACHE_DIR"] && { cacheDir: process.env["HUB_VITEST_CACHE_DIR"] }),
   plugins: [tanstackStart({ server: { entry: "./start-server.ts" } }), react()],
   test: {
     environment: "node",
