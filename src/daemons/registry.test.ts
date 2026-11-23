@@ -18,7 +18,7 @@ function rawDataToText(data: RawData): string {
   return data.toString();
 }
 
-describe("daemon socket shutdown deadline", () => {
+describe("daemon socket deadlines", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
@@ -216,6 +216,116 @@ describe("daemon socket shutdown deadline", () => {
     await vi.advanceTimersByTimeAsync(1000);
     assert.equal(terminate.mock.calls.length, 0);
     assert.equal(stream.records().length, 0);
+  });
+
+  function setupProviderRead() {
+    vi.useFakeTimers();
+    const { registry, daemon, socket } = setup(true);
+    const send = vi.spyOn(socket, "send");
+    const receive = (message: unknown) => {
+      socket.emit("message", Buffer.from(JSON.stringify({ type: "session", message })));
+    };
+    receive({
+      type: "status",
+      payload: {
+        status: "server_info",
+        serverId: daemon.serverId,
+        permissions: daemon.permissions,
+        features: { providersSnapshot: true },
+      },
+    });
+    const connection = registry.connection(daemon.id);
+    assert(connection);
+    const requestId = () => {
+      const sent = send.mock.calls.at(-1)?.[0];
+      assert(typeof sent === "string");
+      return z.object({ message: z.object({ requestId: z.string() }) }).parse(JSON.parse(sent))
+        .message.requestId;
+    };
+    return {
+      registry,
+      socket,
+      connection,
+      requestId,
+      receive,
+      isPending: (id: string) => registry["pendingByDaemon"].get(daemon.id)?.has(id) ?? false,
+    };
+  }
+
+  it.each(["getProviderSnapshot", "refreshProviderSnapshot"] as const)(
+    "removes %s after 20 seconds without an answer",
+    async (method) => {
+      const { connection, requestId, isPending } = setupProviderRead();
+      const rejected = assert.rejects(connection[method]({}), {
+        message: "daemon_provider_timeout",
+      });
+      const id = requestId();
+
+      await vi.advanceTimersByTimeAsync(19_999);
+      assert.equal(isPending(id), true);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await rejected;
+      assert.equal(isPending(id), false);
+      assert.equal(vi.getTimerCount(), 0);
+    },
+  );
+
+  it("clears the provider deadline when a snapshot arrives in time", async () => {
+    const { connection, requestId, receive } = setupProviderRead();
+    const snapshot = connection.getProviderSnapshot({});
+    await vi.advanceTimersByTimeAsync(19_999);
+    const payload = { requestId: requestId(), entries: [], generatedAt: new Date().toISOString() };
+    receive({ type: "get_providers_snapshot_response", payload });
+
+    assert.deepEqual(await snapshot, payload);
+    assert.equal(vi.getTimerCount(), 0);
+  });
+
+  it("ignores a late snapshot answer while a retry is pending", async () => {
+    const { connection, requestId, receive, isPending } = setupProviderRead();
+    const rejected = assert.rejects(connection.getProviderSnapshot({}), {
+      message: "daemon_provider_timeout",
+    });
+    const expiredId = requestId();
+    await vi.advanceTimersByTimeAsync(20_000);
+    await rejected;
+
+    const retry = connection.getProviderSnapshot({});
+    const payload = { requestId: requestId(), entries: [], generatedAt: new Date().toISOString() };
+    receive({
+      type: "get_providers_snapshot_response",
+      payload: { ...payload, requestId: expiredId },
+    });
+    assert.equal(isPending(expiredId), false);
+    assert.equal(isPending(payload.requestId), true);
+    assert.equal(vi.getTimerCount(), 1);
+
+    receive({ type: "get_providers_snapshot_response", payload });
+    assert.deepEqual(await retry, payload);
+  });
+
+  it("clears the provider deadline on an RPC error", async () => {
+    const { connection, requestId, receive } = setupProviderRead();
+    const rejected = assert.rejects(connection.refreshProviderSnapshot({}), {
+      message: "refresh failed",
+    });
+    receive({ type: "rpc_error", payload: { requestId: requestId(), error: "refresh failed" } });
+
+    await rejected;
+    assert.equal(vi.getTimerCount(), 0);
+  });
+
+  it.each(["disconnect", "stop"] as const)("clears the provider deadline on %s", async (event) => {
+    const { connection, registry, socket } = setupProviderRead();
+    const rejected = assert.rejects(connection.getProviderSnapshot({}), {
+      message: "daemon disconnected",
+    });
+    if (event === "disconnect") socket.emit("close", 1000, Buffer.alloc(0));
+    else await registry.stop();
+
+    await rejected;
+    assert.equal(vi.getTimerCount(), 0);
   });
 });
 

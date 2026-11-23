@@ -64,6 +64,7 @@ export type DaemonSessionProtocol = "legacy" | "session-v1";
 
 const DAEMON_SESSION_PROTOCOL_HEADER = "x-paseo-session-protocol";
 const DAEMON_SESSION_PROTOCOL_VERSION = "1";
+const PROVIDER_REQUEST_DEADLINE_MS = 20_000;
 
 type DaemonConnectedHandler = (daemon: DaemonRecord) => void | Promise<void>;
 type DaemonDisconnectedHandler = (daemon: DaemonRecord) => void;
@@ -308,15 +309,10 @@ export class ActiveDaemonRegistry {
       requestId,
       cwd: options.cwd,
     });
-    return new Promise((resolve, reject) => {
-      this.pendingFor(daemonId).set(requestId, {
-        kind: "provider-snapshot",
-        generation: active.generation,
-        resolve,
-        reject,
-      });
-      active.socket.send(JSON.stringify({ type: "session", message: request }));
-    });
+    return this.sendProviderRequest<HubProviderSnapshot>(active, request, (settle) => ({
+      kind: "provider-snapshot",
+      ...settle,
+    }));
   }
 
   private refreshProviderSnapshot(
@@ -331,15 +327,55 @@ export class ActiveDaemonRegistry {
       cwd: options.cwd,
       providers: options.providers,
     });
-    return new Promise((resolve, reject) => {
-      this.pendingFor(daemonId).set(requestId, {
-        kind: "provider-refresh",
+    return this.sendProviderRequest<void>(active, request, (settle) => ({
+      kind: "provider-refresh",
+      ...settle,
+    }));
+  }
+
+  private sendProviderRequest<T>(
+    active: ActiveSocket,
+    request:
+      | z.infer<typeof GetProvidersSnapshotRequestSchema>
+      | z.infer<typeof RefreshProvidersSnapshotRequestSchema>,
+    createPending: (settle: {
+      generation: number;
+      resolve: (value: T) => void;
+      reject: (error: Error) => void;
+    }) => PendingProviderSnapshotRequest | PendingProviderRefreshRequest,
+  ): Promise<T> {
+    const { promise, resolve, reject } = Promise.withResolvers<T>();
+    const { requestId } = request;
+    const requests = this.pendingFor(active.daemon.id);
+    const timer = setTimeout(
+      () => fail(new Error("daemon_provider_timeout")),
+      PROVIDER_REQUEST_DEADLINE_MS,
+    );
+    function cleanup() {
+      clearTimeout(timer);
+      requests.delete(requestId);
+    }
+    function fail(error: unknown) {
+      cleanup();
+      reject(error);
+    }
+    requests.set(
+      requestId,
+      createPending({
         generation: active.generation,
-        resolve,
-        reject,
-      });
+        resolve: (value) => {
+          cleanup();
+          resolve(value);
+        },
+        reject: fail,
+      }),
+    );
+    try {
       active.socket.send(JSON.stringify({ type: "session", message: request }));
-    });
+    } catch (error) {
+      fail(error);
+    }
+    return promise;
   }
 
   private requireProviderSnapshotConnection(daemonId: string): ActiveSocket {
@@ -487,7 +523,6 @@ export class ActiveDaemonRegistry {
     ) {
       return;
     }
-    requests.delete(response.payload.requestId);
     pending.resolve(response.payload);
   }
 
@@ -504,7 +539,6 @@ export class ActiveDaemonRegistry {
     ) {
       return;
     }
-    requests.delete(response.payload.requestId);
     if (!response.payload.acknowledged) {
       pending.reject(new Error("daemon provider refresh was not acknowledged"));
       return;
