@@ -54,16 +54,18 @@ test("the shard plan rounds and clamps the core count without using load", () =>
   assert.equal(override.reason, "TEST_SHARDS");
 });
 
-test("the shard plan scales all three timeouts from the one-minute load", () => {
+test("the shard plan scales all three timeouts from the higher one- or five-minute load", () => {
   const cases = [
-    [2, 1, 30_000, 10_000],
-    [18, 1.5, 45_000, 15_000],
-    [150, 4, 120_000, 40_000],
+    [2, 3, 5, 1, 30_000, 10_000],
+    [11.91, 20.4, 5, 1.7, 51_000, 17_000],
+    [18, 2, 1, 1.5, 45_000, 15_000],
+    [150, 2, 1, 4, 120_000, 40_000],
   ];
-  for (const [load, multiplier, testTimeout, otherTimeout] of cases) {
-    const readLoad = () => ({ averages: [load, 900, 900], cores: 12 });
+  for (const [load1, load5, minutes, multiplier, testTimeout, otherTimeout] of cases) {
+    const readLoad = () => ({ averages: [load1, load5, 900], cores: 12 });
     const plan = planShards(undefined, readLoad);
     assert.equal(plan.multiplier, multiplier);
+    assert.deepEqual(plan.timeoutLoad, { minutes, average: Math.max(load1, load5) });
     assert.equal(plan.count, 4);
     assert.deepEqual(plan.timeoutFlags, [
       `--testTimeout=${testTimeout}`,
@@ -1013,7 +1015,7 @@ test("a failed shard keeps Vitest's human-readable errors alongside the JSON rep
   assert.equal(result.status, 1, result.stderr);
   assert.match(result.stdout, /across 1 shards \(2 requested: TEST_SHARDS\)/u);
   const timeouts = result.stdout.match(
-    /^Vitest shard timeouts \([\d.]+x, ms\): (--testTimeout=\d+ --hookTimeout=\d+ --teardownTimeout=\d+)$/mu,
+    /^Vitest shard timeouts \([\d.]+x from [15]-min load [\d.]+, ms\): (--testTimeout=\d+ --hookTimeout=\d+ --teardownTimeout=\d+)$/mu,
   )?.[1];
   assert.ok(timeouts, result.stdout);
   const log = result.stdout.match(/See (.+?\/vitest\.log) and/u)?.[1];
