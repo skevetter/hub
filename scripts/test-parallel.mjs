@@ -1,5 +1,5 @@
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, open, readFile, readdir, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, stat } from "node:fs/promises";
 import { availableParallelism, homedir, loadavg, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
@@ -10,6 +10,8 @@ import {
   repositoryFor,
 } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
+import baselineTimings from "./test-timings.json" with { type: "json" };
+import { timingEntries } from "./generate-test-timings.mjs";
 import { runWorkerGroup, takeFullSuiteLock, watchTestSignals } from "./test-worker-group.mjs";
 
 const failedListVersion = 1;
@@ -154,45 +156,30 @@ export async function rerunFiles(files, execute, print, signal) {
   return result.exitCode;
 }
 
-async function readCachedResults(directory) {
-  let entries;
+async function readFullTimings(cacheRoot) {
   try {
-    entries = await readdir(directory, { withFileTypes: true });
+    const cache = JSON.parse(await readFile(join(cacheRoot, "test-parallel/results.json"), "utf8"));
+    return cache?.results?.length && Array.isArray(cache.results) ? cache.results : null;
   } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    return [];
+    if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+    return null;
   }
-  const caches = await Promise.all(
-    entries
-      .filter((entry) => entry.isDirectory())
-      .map(async (entry) => {
-        const path = join(directory, entry.name, "results.json");
-        try {
-          const info = await stat(path);
-          const cache = JSON.parse(await readFile(path, "utf8"));
-          return { cache, modifiedAt: info.mtimeMs, full: entry.name === "test-parallel" };
-        } catch (error) {
-          if (error.code === "ENOENT" || error instanceof SyntaxError) return null;
-          throw error;
-        }
-      }),
-  );
-  return caches
-    .filter(Boolean)
-    .sort((a, b) => Number(a.full) - Number(b.full) || a.modifiedAt - b.modifiedAt)
-    .map(({ cache }) => cache)
-    .filter((cache) => Array.isArray(cache?.results));
 }
 
-async function weighFiles(root, cacheRoot, paths) {
+async function loadTimings(cacheRoot) {
+  const full = await readFullTimings(cacheRoot);
+  if (!full) return new Map(Object.entries(baselineTimings));
   const cached = new Map();
-  for (const cache of await readCachedResults(cacheRoot)) {
-    for (const [key, result] of cache.results) {
-      if (Number.isFinite(result?.duration) && result.duration > 0) {
-        cached.set(key.slice(key.indexOf(":") + 1), result.duration);
-      }
+  for (const [key, result] of full) {
+    if (Number.isFinite(result?.duration) && result.duration >= 0) {
+      cached.set(key.slice(key.indexOf(":") + 1), result.duration);
     }
   }
+  return cached;
+}
+
+export async function weighFiles(root, cacheRoot, paths) {
+  const cached = await loadTimings(cacheRoot);
   const files = await Promise.all(
     paths.map(async (path) => ({
       path,
@@ -208,9 +195,17 @@ async function weighFiles(root, cacheRoot, paths) {
         known.reduce((sum, file) => sum + file.size, 0);
   return files.map(({ path, size, duration }) => ({
     path,
-    weight: duration ?? size * millisecondsPerByte,
+    weight: Math.max(1, duration ?? size * millisecondsPerByte),
     cached: duration !== undefined,
   }));
+}
+
+export function shardEstimates(groups, weighted) {
+  const weights = new Map(weighted.map(({ path, weight }) => [path, weight]));
+  return groups.map((files, index) => {
+    const seconds = files.reduce((sum, file) => sum + weights.get(file), 0) / 1000;
+    return `Shard ${index + 1} estimate: ${seconds.toFixed(2)}s (${files.length} files)`;
+  });
 }
 
 export function shardEnvironment(directory, parent = process.env) {
@@ -278,6 +273,7 @@ export async function executeFiles({
   signal,
   invoke,
   timeoutFlags = [],
+  collectTiming = false,
 }) {
   const directory = join(runDirectory, name.toLowerCase().replaceAll(" ", "-"));
   const reportPath = join(directory, "results.json");
@@ -298,7 +294,33 @@ export async function executeFiles({
   const log = join(directory, "vitest.log");
   const report = await readVitestReport(reportPath);
   if (!report) return unreportedRun({ run, files, durationMs, signal, log });
-  return summarizeReport(report, { root, files, run, durationMs, signal, log, reportPath });
+  const result = summarizeReport(report, { root, files, run, durationMs, signal, log, reportPath });
+  if (collectTiming && !signal.aborted) {
+    result.timings = await completedTimings(report, { root, files, run, log });
+  }
+  return result;
+}
+
+function reportHasEveryFile(testResults, root, files) {
+  const reported = new Set(testResults.map(({ name }) => relative(root, name)));
+  return testResults.length === files.length && files.every((file) => reported.has(file));
+}
+
+async function normalShardExit(report, run, log) {
+  if (run.processError) return false;
+  if (run.exitCode === 0) return passedVitestReport(report);
+  if (run.exitCode !== 1 || !report.testResults.some(({ status }) => status === "failed"))
+    return false;
+  // Vitest's JSON reporter omits unhandled errors, including fork crashes.
+  const output = await readFile(log, "utf8");
+  return !/Vitest caught \d+ unhandled errors? during the test run/u.test(output);
+}
+
+async function completedTimings(report, { root, files, run, log }) {
+  if (!reportHasEveryFile(report.testResults, root, files)) return [];
+  const timings = timingEntries(report, root);
+  if (!timings || !(await normalShardExit(report, run, log))) return [];
+  return timings;
 }
 
 function compareReportFiles(testResults, { root, files, processExit }) {
@@ -372,18 +394,6 @@ function summarizeReport(report, { root, files, run, durationMs, signal, log, re
   };
 }
 
-async function collectTimings(runDirectory, count) {
-  const caches = (
-    await Promise.all(
-      Array.from({ length: count }, (_, index) =>
-        readCachedResults(join(runDirectory, `shard-${index + 1}`, "vite/vitest")),
-      ),
-    )
-  ).flat();
-  if (caches.length === 0) return;
-  return { version: caches[0].version, results: caches.flatMap((cache) => cache.results) };
-}
-
 function writeJson(target, data) {
   mkdirSync(dirname(target), { recursive: true });
   const pending = `${target}.${process.pid}`;
@@ -432,10 +442,10 @@ async function discoverFiles(root, runDirectory, invoke) {
   return files;
 }
 
-function saveTimings(parallelCache, timings) {
-  if (!timings) return;
+function saveTimings(cacheRoot, timings) {
   try {
-    writeJson(join(parallelCache, "results.json"), timings);
+    const results = timings.map(([file, duration]) => [file, { duration }]);
+    writeJson(join(cacheRoot, "test-parallel/results.json"), { version: 1, results });
   } catch (error) {
     console.warn(`Could not update the Vitest timing cache: ${error.message}`);
   }
@@ -460,7 +470,6 @@ async function runFullSuite({
   files,
   shardOverride,
   failedFileList,
-  runDirectory,
   execute,
   signal,
   publishSuccess,
@@ -473,9 +482,15 @@ async function runFullSuite({
   console.log(
     `Running ${files.length} Vitest files across ${groups.length} shards (${count} requested: ${reason}).`,
   );
+  for (const line of shardEstimates(groups, weighted)) console.log(line);
   console.log(`Vitest shard timeouts (${multiplier.toFixed(2)}x, ms): ${timeoutFlags.join(" ")}`);
+  const timings = [];
   const result = await runShards(groups, {
-    execute: (name, selected) => execute(name, selected, timeoutFlags),
+    execute: async (name, selected) => {
+      const shard = await execute(name, selected, { timeoutFlags, collectTiming: true });
+      timings.push(...(shard.timings ?? []));
+      return shard;
+    },
     print: console.log,
     signal,
     start,
@@ -483,10 +498,8 @@ async function runFullSuite({
   console.log(`Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`);
   if (result.failedFiles.length)
     writeJson(failedFileList, { version: failedListVersion, files: result.failedFiles });
-  if (result.exitCode === 0 && !signal.aborted) {
-    const timings = await collectTimings(runDirectory, groups.length);
-    await publishSuccess(timings);
-  }
+  if (result.exitCode === 0 && !signal.aborted) await publishSuccess();
+  if (!signal.aborted && timings.length === files.length) saveTimings(cacheRoot, timings);
   return result.exitCode;
 }
 
@@ -520,19 +533,16 @@ async function main(signal) {
     const invoke = (args, directory) => invokeVitest(args, { root, directory, signal, lock });
     const files = await discoverFiles(root, runDirectory, invoke);
     const runs = [];
-    const publishSuccess = async (timings) => {
+    const publishSuccess = async () => {
       signal.throwIfAborted();
       await rm(runDirectory, { recursive: true });
       runDirectory = undefined;
       signal.throwIfAborted();
-      lock.release();
-      lock = undefined;
       publishTestMetrics(runs, [], root, { signal, expectedHead: head });
-      saveTimings(parallelCache, timings);
     };
     const execution = { root, runDirectory, signal, invoke };
-    const execute = async (name, files, timeoutFlags) => {
-      const result = await executeFiles({ ...execution, name, files, timeoutFlags });
+    const execute = async (name, files, options) => {
+      const result = await executeFiles({ ...execution, name, files, ...options });
       runs.push({ files, counts: result.counts });
       return result;
     };
@@ -546,7 +556,6 @@ async function main(signal) {
       files,
       shardOverride,
       failedFileList,
-      runDirectory,
       execute,
       signal,
       publishSuccess,

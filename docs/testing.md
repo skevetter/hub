@@ -14,8 +14,15 @@ mise exec node@24.22.0 -- npm test
 `npm test` runs the Node script tests and then the serial Vitest suite. The parallel command holds
 `/tmp/hub-fullsuite.lock` for the run.
 A file gets its own shard when its cached duration exceeds the ideal time per shard. The runner
-assigns the remaining files longest first to the lightest shard. It prefers timings from the last
-completed parallel run over timings that may come from a filtered run.
+assigns the remaining files longest first to the lightest shard and prints each estimated total.
+The runner uses timings from the last complete parallel run, or `scripts/test-timings.json` when
+that cache is missing. It estimates unknown files by size and ignores filtered caches. A full
+run saves timings when every shard reports a result for every selected file, even if tests fail.
+Interruptions, crashes, and reports with missing, pending, or empty results leave the cache alone.
+
+To refresh the baseline from complete shard JSON reports, run
+`mise exec node@24.22.0 -- node scripts/generate-test-timings.mjs <run-directory>`.
+The generator accepts live `shard-N/results.json` files or archived `shard-N.json` files.
 
 The parallel runner divides available cores by three, rounds to the nearest integer, and clamps
 the default shard count to 1 through 6. Set `TEST_SHARDS` to override it. Load does not reduce the
