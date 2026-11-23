@@ -4652,10 +4652,7 @@ class MemoryDatabase implements Database {
     credential: { id: string; prefix: string; verifier: string };
   }): Promise<CliAuthorizationPollResult> {
     const now = this.options.now?.() ?? new Date();
-    const authorization = this.cliAuthorizations.get(input.deviceVerifier);
-    if (authorization !== undefined && authorization.expiresAt <= now) {
-      authorization.status = "expired";
-    }
+    const authorization = this.getCliAuthorizationForPoll(input.deviceVerifier, now);
     if (authorization === undefined || authorization.status === "expired") {
       return {
         status: "expired",
@@ -4668,6 +4665,27 @@ class MemoryDatabase implements Database {
         intervalSeconds: authorization.pollIntervalSeconds,
       };
     }
+    return this.pollActiveCliAuthorization(authorization, input, now);
+  }
+
+  // Approval sets the organization alongside the status.
+  private getCliAuthorizationForPoll(
+    deviceVerifier: string,
+    now: Date,
+  ): MemoryCliAuthorizationForPoll | undefined;
+  private getCliAuthorizationForPoll(deviceVerifier: string, now: Date) {
+    const authorization = this.cliAuthorizations.get(deviceVerifier);
+    if (authorization !== undefined && authorization.expiresAt <= now) {
+      authorization.status = "expired";
+    }
+    return authorization;
+  }
+
+  private pollActiveCliAuthorization(
+    authorization: MemoryCliAuthorizationForPoll,
+    input: Parameters<Database["pollCliAuthorization"]>[0],
+    now: Date,
+  ): CliAuthorizationPollResult {
     if (authorization.nextPollAt > now) {
       authorization.pollIntervalSeconds += 5;
       authorization.nextPollAt = new Date(
@@ -4679,13 +4697,14 @@ class MemoryDatabase implements Database {
       };
     }
     authorization.nextPollAt = new Date(now.getTime() + authorization.pollIntervalSeconds * 1_000);
+    const record: MemoryCliAuthorization = authorization;
     if (authorization.status === "approved") {
-      authorization.credential = input.credential;
-      authorization.status = "disclosed";
+      record.credential = input.credential;
+      record.status = "disclosed";
       return {
         status: "authorized",
         intervalSeconds: authorization.pollIntervalSeconds,
-        organizationId: authorization.approvedOrganizationId!,
+        organizationId: authorization.approvedOrganizationId,
       };
     }
     return {
@@ -7254,6 +7273,10 @@ interface MemoryCliAuthorization extends CliAuthorizationRecord {
   nextPollAt: Date;
   credential: { id: string; prefix: string; verifier: string } | null;
 }
+
+type MemoryCliAuthorizationForPoll =
+  | (MemoryCliAuthorization & { status: "approved"; approvedOrganizationId: string })
+  | (MemoryCliAuthorization & { status: Exclude<MemoryCliAuthorization["status"], "approved"> });
 
 function workflowDeadlineKind(
   execution: AgentExecutionRecord | undefined,
