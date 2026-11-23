@@ -852,7 +852,7 @@ test("timings are saved only when every shard finished, even if assertions faile
     result.name = files.find((name) => process.argv.includes(name));
     const mode = process.env.FIXTURE_RUN_MODE;
     if (result.name === files[0]) {
-      if (["failed", "fork-crash", "signal"].includes(mode)) {
+      if (["failed", "fork-crash", "signal", "missing-log"].includes(mode)) {
         result.status = "failed";
         result.assertionResults[0].status = "failed";
         report.numPassedTests = 0;
@@ -860,12 +860,19 @@ test("timings are saved only when every shard finished, even if assertions faile
         report.success = false;
         process.exitCode = 1;
       }
-      if (mode === "fork-crash") console.error("Vitest caught 1 unhandled error during the test run.");
+      if (mode === "fork-crash") {
+        console.error("x".repeat(65_530));
+        console.error("Vitest caught 1 unhandled error during the test run.");
+      }
       if (mode === "pending") result.assertionResults[0].status = "pending";
       if (mode === "empty") result.assertionResults = [];
       if (mode === "missing") report.testResults = [];
     }
     writeFileSync(reportPath, JSON.stringify(report));
+    if (result.name === files[0] && mode.startsWith("missing-log")) {
+      const { unlinkSync } = await import("node:fs");
+      unlinkSync(join(process.env.TMPDIR, "vitest.log"));
+    }
     if (result.name === files[0] && mode === "signal") process.kill(process.pid, "SIGKILL");
     `,
     ["a.test.ts", "b.test.ts"],
@@ -878,7 +885,17 @@ test("timings are saved only when every shard finished, even if assertions faile
       ["b.test.ts", { duration: 750 }],
     ],
   });
-  for (const mode of ["failed", "fork-crash", "signal", "pending", "empty", "missing"]) {
+  const modes = [
+    "failed",
+    "fork-crash",
+    "signal",
+    "pending",
+    "empty",
+    "missing",
+    "missing-log",
+    "missing-log-pass",
+  ];
+  for (const mode of modes) {
     await writeFile(cache, previous);
     const run = spawnSync(process.execPath, args, {
       ...options,
@@ -886,9 +903,22 @@ test("timings are saved only when every shard finished, even if assertions faile
       encoding: "utf8",
       timeout: 15_000,
     });
-    assert.equal(run.status, 1, `${mode}: ${run.error ?? run.stderr}`);
+    assert.equal(
+      run.status,
+      mode === "missing-log-pass" ? 0 : 1,
+      `${mode}: ${run.error ?? run.stderr}`,
+    );
     assert.match(run.stdout, /Shard 1 estimate: 1\.35s \(1 files\)/u);
     assert.match(run.stdout, /Shard 2 estimate: 0\.75s \(1 files\)/u);
+    if (mode === "missing-log") {
+      assert.match(run.stdout, /Shard 1: FAIL.*, 0 passed, 1 failed, 0 skipped/u);
+      assert.match(run.stdout, /Shard 1: Vitest process failed \(exit 1, no signal\)/u);
+      assert.match(run.stdout, /Total: 2 files, 1 passed, 1 failed, 0 skipped$/mu);
+      assert.doesNotMatch(run.stdout, /Runner stopped/u);
+    }
+    if (mode === "missing-log-pass") {
+      assert.match(run.stdout, /Total: 2 files, 2 passed, 0 failed, 0 skipped$/mu);
+    }
     const saved = await readFile(cache, "utf8");
     if (mode === "failed") {
       assert.deepEqual(Object.fromEntries(JSON.parse(saved).results), {
@@ -994,7 +1024,7 @@ test("a failed shard keeps Vitest's human-readable errors alongside the JSON rep
   assert.match(logContents, /Unhandled Error: Worker exited unexpectedly/u);
 });
 
-test("parallel testing cannot publish metrics after HEAD changes during the run", async (t) => {
+test("a HEAD change prevents timing promotion whether tests passed or failed", async (t) => {
   const { root, args, options } = await parallelFixture(
     t,
     `
@@ -1004,19 +1034,40 @@ test("parallel testing cannot publish metrics after HEAD changes during the run"
       "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
       "commit", "--allow-empty", "--quiet", "-m", "Change fixture HEAD",
     ]);
+    if (process.env.FIXTURE_RUN_MODE === "failed") {
+      report.testResults[0].status = "failed";
+      report.testResults[0].assertionResults[0].status = "failed";
+      report.numPassedTests = 0;
+      report.numFailedTests = 1;
+      report.success = false;
+      process.exitCode = 1;
+    }
     writeFileSync(reportPath, JSON.stringify(report));
   `,
   );
   const metrics = join(root, "metrics.json");
-  const result = spawnSync(process.execPath, args, {
-    ...options,
-    env: { ...options.env, HUB_TEST_RUN_REPORT: metrics },
-    encoding: "utf8",
-    timeout: 5000,
-  });
-  assert.equal(result.status, 1, result.stderr);
-  assert.match(result.stderr, /HEAD changed while the test runner was active/u);
-  await assert.rejects(readFile(metrics), { code: "ENOENT" });
+  const cache = join(root, "node_modules/.vite/vitest/test-parallel/results.json");
+  const previous = Buffer.from(
+    '{"version":1,"results":[["selected.test.ts",{"duration":1350}]]}\n',
+  );
+  await writeFile(cache, previous);
+  for (const mode of ["passed", "failed"]) {
+    const result = spawnSync(process.execPath, args, {
+      ...options,
+      env: { ...options.env, FIXTURE_RUN_MODE: mode, HUB_TEST_RUN_REPORT: metrics },
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Skipping Vitest timing cache update: HEAD changed/u);
+    if (mode === "passed") {
+      assert.match(result.stderr, /HEAD changed while the test runner was active/u);
+    } else {
+      assert.match(result.stdout, /Shard 1: FAIL.*, 0 passed, 1 failed, 0 skipped/u);
+    }
+    assert.deepEqual(await readFile(cache), previous, mode);
+    await assert.rejects(readFile(metrics), { code: "ENOENT" });
+  }
 });
 
 test("serial reruns keep all files from a failed shard and require complete passing results", async (t) => {
