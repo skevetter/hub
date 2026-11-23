@@ -13,11 +13,11 @@ import type { TriggerDashboard } from "./dashboard.js";
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
 const scopeSchema = z.object({ organizationSlug: z.string().trim().min(1).max(100) });
 const saveSchema = scopeSchema.extend({
-  triggerId: z.string().uuid().optional(),
+  triggerId: z.uuid().optional(),
   yaml: z.string().min(1),
 });
 
-const runScopeSchema = scopeSchema.extend({ runId: z.string().uuid() });
+const runScopeSchema = scopeSchema.extend({ runId: z.uuid() });
 
 export const runDetailSnapshot = createServerFn({ method: "GET" })
   .validator(runScopeSchema)
@@ -37,20 +37,20 @@ export const stopRun = createServerFn({ method: "POST" })
   .validator(
     runScopeSchema.extend({
       confirmedPeerCount: z.number().int().nonnegative(),
-      retryAttemptId: z.string().uuid().optional(),
+      retryAttemptId: z.uuid().optional(),
     }),
   )
   .handler(async ({ data }): Promise<Result<BrowserStopResult>> => {
     try {
       const dashboard = (await getApplication()).triggerDashboard;
       if (dashboard == null) throw new Error("trigger dashboard unavailable");
-      const result = await dashboard.stopRun(
-        getRequest(),
-        data.organizationSlug,
-        data.runId,
-        data.confirmedPeerCount,
-        data.retryAttemptId,
-      );
+      const result = await dashboard.stopRun({
+        request: getRequest(),
+        organizationSlug: data.organizationSlug,
+        runId: data.runId,
+        confirmedPeerCount: data.confirmedPeerCount,
+        retryAttemptId: data.retryAttemptId,
+      });
       if (result.status === "stopped") return respondOk(result);
       if (result.status === "conflict") {
         setResponseStatus(409);

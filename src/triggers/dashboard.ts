@@ -1,6 +1,13 @@
 import type { AuthServer } from "../auth/server.js";
 import { capabilitiesFor } from "../auth/organization-policy.js";
-import type { Database, OrganizationTriggerRecord } from "../db/types.js";
+import type {
+  ActivityRunKey,
+  Database,
+  OrganizationConnectionUsage,
+  OrganizationTriggerRecord,
+  ProjectActivityRunListRecord,
+  TriggerRunRecord,
+} from "../db/types.js";
 import { canStopRun, type StopRun } from "./run-stop.js";
 import { resolveRouteTenant } from "../projects/access.js";
 import { ProjectCommandError } from "../projects/command-error.js";
@@ -26,7 +33,6 @@ import { isRunTimelineExpired, retentionCutoff } from "../run-timeline/retention
 import { timelineStepId } from "../run-timeline/data.js";
 import type { RunTimelineReconciler } from "../run-timeline/reconcile.js";
 import type { RunProgressSettings } from "../run-progress/settings.js";
-import type { ProjectActivityRunListRecord, TriggerRunRecord } from "../db/types.js";
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
 import type { RunTimelineState } from "../run-timeline/store.js";
 import { z } from "zod";
@@ -37,6 +43,7 @@ const NOTIFICATION_EVENT = "github.notification";
 const triggerIdSchema = z.uuid();
 
 type DashboardTenant = Awaited<ReturnType<typeof resolveRouteTenant>>["tenant"];
+type ActivityCursor = ReturnType<typeof decodeActivityCursor>;
 
 export interface TriggerDashboardOptions {
   stopRun?: StopRun;
@@ -194,32 +201,7 @@ export class TriggerDashboard {
           ({ status, permissions }) => status === "active" && permissions.includes("hub.execute"),
         )
         .map(({ id, slug, presence }) => ({ id, slug, presence })),
-      connections: [
-        ...connections.slack.map(({ id, slug, teamName }) => ({
-          id,
-          slug,
-          provider: "slack" as const,
-          label: teamName,
-        })),
-        ...connections.discord.map(({ id, slug, guildName }) => ({
-          id,
-          slug,
-          provider: "discord" as const,
-          label: guildName,
-        })),
-        ...connections.github.map(({ id, slug, accountLogin }) => ({
-          id,
-          slug,
-          provider: "github" as const,
-          label: accountLogin,
-        })),
-        ...connections.linear.map(({ id, slug, linearOrganizationName }) => ({
-          id,
-          slug,
-          provider: "linear" as const,
-          label: linearOrganizationName,
-        })),
-      ],
+      connections: connectionViews(connections),
     };
   }
   async runDetail(
@@ -244,23 +226,28 @@ export class TriggerDashboard {
         },
         run,
       );
-    const stopDetails =
-      (canAuthorizeStop && detail.timeline.status === "running") || detail.run.status === "canceled"
-        ? await this.database.readRunStopDetails(tenant.organization.id, runId)
-        : undefined;
+    const stopDetails = shouldReadStopDetails(detail, canAuthorizeStop)
+      ? await this.database.readRunStopDetails(tenant.organization.id, runId)
+      : undefined;
     const canStop =
       canAuthorizeStop &&
       (detail.timeline.status === "running" || stopDetails?.retryAttemptId != null);
     return { ...detail, canStop, ...(stopDetails === undefined ? {} : { stopDetails }) };
   }
 
-  async stopRun(
-    request: Request,
-    organizationSlug: string,
-    runId: string,
-    confirmedPeerCount: number,
-    retryAttemptId?: string,
-  ) {
+  async stopRun({
+    request,
+    organizationSlug,
+    runId,
+    confirmedPeerCount,
+    retryAttemptId,
+  }: {
+    request: Request;
+    organizationSlug: string;
+    runId: string;
+    confirmedPeerCount: number;
+    retryAttemptId?: string | undefined;
+  }) {
     const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, {
       organizationSlug,
     });
@@ -310,10 +297,7 @@ export class TriggerDashboard {
       progressMessagesEnabled: this.progressMessagesEnabled,
       progressUnavailable: progress === undefined && timeline.expired,
       ...(reply === undefined ? {} : { reply: { state: reply.state, failure: reply.failure } }),
-      progress:
-        progress === undefined || activity.run.payloadExpiredAt != null
-          ? null
-          : { state: progress.state, provider: progress.provider, failure: progress.failure },
+      progress: runProgressView(progress, activity.run),
     };
   }
 
@@ -345,31 +329,11 @@ export class TriggerDashboard {
     const retentionDays = settings.retentionDays;
     const cutoff = retentionCutoff((this.options.now ?? (() => new Date()))(), retentionDays);
     let state = await this.database.readRunTimelineState(organizationId, run.id);
-    let expired = isRunTimelineExpired(
-      {
-        completedAt: run.completedAt,
-        expiredAt: state?.expiredAt ?? null,
-        payloadExpiredAt: run.payloadExpiredAt,
-      },
-      cutoff,
-    );
-    if (
-      !expired &&
-      settings.runTimelineEnabled &&
-      run.outcome === "accepted" &&
-      run.status !== "running" &&
-      state?.sealedSeq == null
-    ) {
+    let expired = timelineExpired(run, state, cutoff);
+    if (!expired && settings.runTimelineEnabled && shouldReconcileTimeline(run, state)) {
       await this.options.reconciler?.reconcileBeforeTerminal(organizationId, run.id);
       state = await this.database.readRunTimelineState(organizationId, run.id);
-      expired = isRunTimelineExpired(
-        {
-          completedAt: run.completedAt,
-          expiredAt: state?.expiredAt ?? null,
-          payloadExpiredAt: run.payloadExpiredAt,
-        },
-        cutoff,
-      );
+      expired = timelineExpired(run, state, cutoff);
     }
     const events = expired
       ? []
@@ -381,23 +345,7 @@ export class TriggerDashboard {
       const current = await this.database.findTriggerRunForOrganization(organizationId, run.id);
       expired = current?.payloadExpiredAt != null;
     }
-    return {
-      events: (expired ? [] : events).map(({ seq, kind, at, stepId, data }) => ({
-        seq,
-        kind,
-        at: at.toISOString(),
-        stepId,
-        data,
-      })),
-      status: run.status,
-      ...timelineSummary(state),
-      expired,
-      timelineEnabled: settings.runTimelineEnabled,
-      timelineUnavailable:
-        !settings.runTimelineEnabled && state === undefined && events.length === 0,
-      streamEnabled: settings.runStreamEnabled,
-      retentionDays,
-    };
+    return timelinePageView(run.status, settings, state, { events, expired, retentionDays });
   }
 
   private async triggerScopes(trigger: OrganizationTriggerRecord) {
@@ -441,15 +389,10 @@ export class TriggerDashboard {
     const organizationId = tenant.organization.id;
     const limit = Math.min(input.limit ?? DEFAULT_PAGE_SIZE, PAGE_SIZES[3]);
     const { provider, source, reason, range } = input;
-    const receivedSince =
-      range === undefined
-        ? undefined
-        : new Date(
-            (this.options.now?.() ?? new Date()).getTime() - ACTIVITY_RANGE_DAYS[range] * DAY_MS,
-          );
+    const receivedSince = this.activitySince(range);
     const scope = droppedActivityCursorScope(organizationId, limit, input);
     const requested = decodeActivityCursor(input.cursor, scope);
-    const read = (position?: ReturnType<typeof decodeActivityCursor>) =>
+    const read = (position?: ActivityCursor) =>
       this.database.listDroppedEventPage(organizationId, {
         limit,
         ...(provider === undefined ? {} : { provider }),
@@ -462,29 +405,17 @@ export class TriggerDashboard {
       });
     let page = await read(requested);
     if (page.records.length === 0 && requested !== undefined) page = await read();
-    const startOffset = page.newer === null ? 0 : requested?.offset || null;
     return {
       events: page.records,
-      startOffset,
-      nextCursor:
-        page.older === null
-          ? null
-          : encodeActivityCursor(
-              "before",
-              page.older,
-              scope,
-              startOffset === null ? undefined : startOffset + page.records.length,
-            ),
-      previousCursor:
-        page.newer === null
-          ? null
-          : encodeActivityCursor(
-              "after",
-              page.newer,
-              scope,
-              startOffset === null ? undefined : Math.max(0, startOffset - limit),
-            ),
+      ...activityPageCursors(page, { scope, requested, limit, rowCount: page.records.length }),
     };
+  }
+
+  private activitySince(range: ActivityFilters["range"]) {
+    if (range === undefined) return undefined;
+    return new Date(
+      (this.options.now?.() ?? new Date()).getTime() - ACTIVITY_RANGE_DAYS[range] * DAY_MS,
+    );
   }
 
   /** One newest-first page of every trigger's runs, with opaque cursors to the pages either side. */
@@ -502,33 +433,11 @@ export class TriggerDashboard {
       tenant.organization.id,
       this.agentValidator,
     ).list();
-    const scoped = await Promise.all(
-      triggers
-        .filter(({ id }) => input.trigger === undefined || id === input.trigger)
-        .map(async (trigger) => {
-          const { legacyProjectId, legacyTriggerName } = await this.triggerScopes(trigger);
-          return { trigger, legacyProjectId, legacyTriggerName };
-        }),
-    );
-    const scopes = scoped.flatMap(({ trigger, legacyProjectId, legacyTriggerName }) => [
-      { projectId: trigger.runtimeProjectId },
-      ...(legacyProjectId === undefined || legacyTriggerName === undefined
-        ? []
-        : [
-            {
-              projectId: legacyProjectId,
-              triggerName: legacyTriggerName,
-            },
-          ]),
-    ]);
+    const scoped = await this.scopedTriggers(triggers, input.trigger);
+    const scopes = scoped.flatMap(activityRunScopes);
     const { status, provider, range } = input;
-    const createdSince =
-      range === undefined
-        ? undefined
-        : new Date(
-            (this.options.now?.() ?? new Date()).getTime() - ACTIVITY_RANGE_DAYS[range] * DAY_MS,
-          );
-    const read = (position: ReturnType<typeof decodeActivityCursor>) =>
+    const createdSince = this.activitySince(range);
+    const read = (position: ActivityCursor) =>
       this.database.listOrganizationActivityPage(tenant.organization.id, scopes, {
         limit,
         ...(status === undefined ? {} : { status }),
@@ -552,25 +461,24 @@ export class TriggerDashboard {
       );
       return owner === undefined ? [] : [activityRow(owner.trigger, entry)];
     });
-    // Only the newest page has a known rank after insertions ahead of a reverse cursor.
-    const startOffset = page.newer === null ? 0 : requested?.offset || null;
-    const nextOffset = startOffset === null ? undefined : startOffset + rows.length;
-    const previousOffset = startOffset === null ? undefined : Math.max(0, startOffset - limit);
     return {
       organization: tenant.organization,
       activity: rows,
       triggers: triggers.map(({ id, name }) => ({ id, name })),
       limit,
-      startOffset,
-      nextCursor:
-        page.older === null
-          ? null
-          : encodeActivityCursor("before", page.older, cursorScope, nextOffset),
-      previousCursor:
-        page.newer === null
-          ? null
-          : encodeActivityCursor("after", page.newer, cursorScope, previousOffset),
+      ...activityPageCursors(page, { scope: cursorScope, requested, limit, rowCount: rows.length }),
     };
+  }
+
+  private scopedTriggers(triggers: readonly OrganizationTriggerRecord[], triggerId?: string) {
+    return Promise.all(
+      triggers
+        .filter(({ id }) => triggerId === undefined || id === triggerId)
+        .map(async (trigger) => {
+          const { legacyProjectId, legacyTriggerName } = await this.triggerScopes(trigger);
+          return { trigger, legacyProjectId, legacyTriggerName };
+        }),
+    );
   }
 
   async save(
@@ -594,6 +502,137 @@ export class TriggerDashboard {
       userId: account.account.id,
     });
   }
+}
+
+function connectionViews(connections: OrganizationConnectionUsage) {
+  return [
+    ...connections.slack.map(({ id, slug, teamName }) => ({
+      id,
+      slug,
+      provider: "slack" as const,
+      label: teamName,
+    })),
+    ...connections.discord.map(({ id, slug, guildName }) => ({
+      id,
+      slug,
+      provider: "discord" as const,
+      label: guildName,
+    })),
+    ...connections.github.map(({ id, slug, accountLogin }) => ({
+      id,
+      slug,
+      provider: "github" as const,
+      label: accountLogin,
+    })),
+    ...connections.linear.map(({ id, slug, linearOrganizationName }) => ({
+      id,
+      slug,
+      provider: "linear" as const,
+      label: linearOrganizationName,
+    })),
+  ];
+}
+
+function shouldReadStopDetails(detail: RunDetailSnapshot, canAuthorizeStop: boolean) {
+  return (
+    (canAuthorizeStop && detail.timeline.status === "running") || detail.run.status === "canceled"
+  );
+}
+
+function runProgressView(
+  progress: Awaited<ReturnType<Database["findRunProgressMessage"]>>,
+  run: TriggerRunRecord,
+) {
+  return progress === undefined || run.payloadExpiredAt != null
+    ? null
+    : { state: progress.state, provider: progress.provider, failure: progress.failure };
+}
+
+function timelineExpired(run: TriggerRunRecord, state: RunTimelineState | undefined, cutoff: Date) {
+  return isRunTimelineExpired(
+    {
+      completedAt: run.completedAt,
+      expiredAt: state?.expiredAt ?? null,
+      payloadExpiredAt: run.payloadExpiredAt,
+    },
+    cutoff,
+  );
+}
+
+function shouldReconcileTimeline(run: TriggerRunRecord, state: RunTimelineState | undefined) {
+  return run.outcome === "accepted" && run.status !== "running" && state?.sealedSeq == null;
+}
+
+function timelinePageView(
+  status: TriggerRunRecord["status"],
+  settings: NonNullable<TriggerDashboardOptions["runProgress"]>,
+  state: RunTimelineState | undefined,
+  {
+    events,
+    expired,
+    retentionDays,
+  }: {
+    events: Awaited<ReturnType<Database["listRunTimelineEvents"]>>;
+    expired: boolean;
+    retentionDays: number;
+  },
+): RunEventPage {
+  return {
+    events: (expired ? [] : events).map(({ seq, kind, at, stepId, data }) => ({
+      seq,
+      kind,
+      at: at.toISOString(),
+      stepId,
+      data,
+    })),
+    status,
+    ...timelineSummary(state),
+    expired,
+    timelineEnabled: settings.runTimelineEnabled,
+    timelineUnavailable: !settings.runTimelineEnabled && state === undefined && events.length === 0,
+    streamEnabled: settings.runStreamEnabled,
+    retentionDays,
+  };
+}
+
+function activityRunScopes({
+  trigger,
+  legacyProjectId,
+  legacyTriggerName,
+}: {
+  trigger: OrganizationTriggerRecord;
+  legacyProjectId: string | undefined;
+  legacyTriggerName: string | undefined;
+}) {
+  const runtime = { projectId: trigger.runtimeProjectId };
+  if (legacyProjectId === undefined || legacyTriggerName === undefined) return [runtime];
+  return [runtime, { projectId: legacyProjectId, triggerName: legacyTriggerName }];
+}
+
+function activityPageCursors(
+  { older, newer }: { older: ActivityRunKey | null; newer: ActivityRunKey | null },
+  {
+    scope,
+    requested,
+    limit,
+    rowCount,
+  }: {
+    scope: string;
+    requested: ActivityCursor;
+    limit: number;
+    rowCount: number;
+  },
+) {
+  // Only the newest page has a known rank after insertions ahead of a reverse cursor.
+  const startOffset = newer === null ? 0 : requested?.offset || null;
+  const nextOffset = startOffset === null ? undefined : startOffset + rowCount;
+  const previousOffset = startOffset === null ? undefined : Math.max(0, startOffset - limit);
+  return {
+    startOffset,
+    nextCursor: older === null ? null : encodeActivityCursor("before", older, scope, nextOffset),
+    previousCursor:
+      newer === null ? null : encodeActivityCursor("after", newer, scope, previousOffset),
+  };
 }
 
 function activityRow(
