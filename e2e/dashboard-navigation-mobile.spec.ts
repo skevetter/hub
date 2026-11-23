@@ -109,3 +109,31 @@ test("phone navigation uses the rail outline in both themes", async ({ hub, page
     await expect(organization).toHaveCSS("outline-color", railOutline);
   }
 });
+
+test("switching organization closes More and returns focus to its trigger", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await expect(page).toHaveURL(/\/o\/[^/]+\/home$/u);
+  const acmeHome = page.url();
+  const more = page
+    .getByRole("navigation", { name: "Quick navigation" })
+    .getByRole("button", { name: "More", exact: true });
+  const sheet = page.getByRole("dialog", { name: "More" });
+  const organization = sheet.getByRole("button", { name: "Organization" });
+  await more.click();
+  await hub.createAnotherOrganization("owner", "Orbit");
+  await expect(sheet).toBeHidden();
+
+  await more.press("Enter");
+  await expect(organization).toBeFocused();
+  await expect(organization).toContainText("Orbit");
+  await organization.press("Enter");
+  await page.getByRole("menuitem", { name: "Acme", exact: true }).press("Enter");
+  await expect(sheet).toBeHidden();
+  await expect(page).toHaveURL(acmeHome);
+  await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
+  await expect(more).toBeFocused();
+});

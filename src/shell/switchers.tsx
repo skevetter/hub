@@ -9,6 +9,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "../components/ui/dropdown-menu.js";
+import { useSidebar } from "../components/ui/sidebar.js";
 import { formValue } from "../auth/account-actions.js";
 import type { ActiveAccountState } from "../auth/organization-contract.js";
 import type { useOptionalRouteTenant } from "../projects/context.js";
@@ -46,6 +47,7 @@ export function OrganizationSwitcher({
 }) {
   const { creating, setCreating, requestCreate, create } =
     useOrganizationCreation(onCreateOrganization);
+  const selectOrganization = useOrganizationSelection(onSelectOrganization);
 
   return (
     <>
@@ -64,7 +66,7 @@ export function OrganizationSwitcher({
             slug={membership.slug}
             selected={membership.id === organization.id}
             busy={busy}
-            onSelect={onSelectOrganization}
+            onSelect={selectOrganization}
           />
         ))}
         {account.canCreateOrganization ? (
@@ -84,6 +86,17 @@ export function OrganizationSwitcher({
         onSubmit={create}
       />
     </>
+  );
+}
+
+function useOrganizationSelection(onSelect: (organizationId: string, slug: string) => void) {
+  const { isMobile, setOpenMobile } = useSidebar();
+  return useCallback(
+    (organizationId: string, slug: string) => {
+      if (isMobile) setOpenMobile(false);
+      onSelect(organizationId, slug);
+    },
+    [isMobile, onSelect, setOpenMobile],
   );
 }
 
