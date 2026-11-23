@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setImmediate as nextTurn, setTimeout as wait } from "node:timers/promises";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { afterEach, describe, it, vi } from "vitest";
 import { createDaemonDispatchLifecycle } from "../daemons/lifecycle.js";
@@ -34,6 +34,32 @@ const REFERENCE = {
   credential: { kind: "linear-organization", linearOrganizationId: "fake" },
   commentId: "comment",
 } satisfies StoredRef;
+
+function trackDatabaseWork() {
+  const pending = new Set<Promise<unknown>>();
+  function track(database: Database): Database {
+    return new Proxy(database, {
+      get(target, key) {
+        const method: unknown = Reflect.get(target, key);
+        if (typeof method !== "function") return method;
+        return (...args: unknown[]) => {
+          const work = Promise.resolve(Reflect.apply(method, target, args));
+          pending.add(work);
+          return work.finally(() => pending.delete(work));
+        };
+      },
+    });
+  }
+  async function drain(): Promise<void> {
+    // Follow work started by query continuations without waiting for the held provider.
+    await nextTurn();
+    while (pending.size > 0) {
+      await Promise.allSettled(pending);
+      await nextTurn();
+    }
+  }
+  return { track, drain };
+}
 
 class FakeClock implements ProgressClock {
   private readonly epoch = Date.now();
@@ -1048,17 +1074,19 @@ describe("progress scheduling", () => {
       "insert into organization (id, name, slug) values ($1, 'Progress', 'progress')",
       [ORGANIZATION],
     );
-    const f = fixture(first.database, () => wait(25));
+    const { track, drain } = trackDatabaseWork();
+    const f = fixture(track(first.database), drain);
     const run = await f.seed();
     const otherBus = new RunTimelineBus();
     f.start();
-    f.start(120, otherBus, second.database);
+    f.start(120, otherBus, track(second.database));
     await f.clock.advanceTo(0);
     assert.deepEqual(
       f.provider.requests.map(({ action }) => action),
       ["create"],
     );
     const blocked = Promise.withResolvers<void>();
+    cleanup.push(() => blocked.resolve());
     f.provider.onWrite = async (request, land) => {
       if (request.body.includes("Running")) await blocked.promise;
       return land();

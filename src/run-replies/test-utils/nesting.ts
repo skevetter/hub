@@ -179,6 +179,7 @@ function checkOne(text: string, context: string, timing: boolean): void {
     const started = performance.now();
     bodies.add(
       formatRunReply({ text, truncated: false }, [], {
+        ...(timing ? {} : { now: () => 0 }),
         onFallback: (value) => {
           reason = value;
         },

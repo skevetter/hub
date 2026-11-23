@@ -881,6 +881,9 @@ export class HubHarness {
   async waitForControlAction(action: HubExecutionControlAction): Promise<void> {
     await waitFor(async () => this.controlActions().includes(action));
   }
+  async waitForTimelineSubscription(agentId: string): Promise<void> {
+    await waitFor(async () => this.requireDaemon().timelineAgentIds.includes(agentId));
+  }
   originUrl(): string {
     return this.origin;
   }

@@ -1362,9 +1362,10 @@ describe("daemon enrollment and execution", () => {
     assert.equal((await hub.execution(result.execution.id)).hubActionReadyAt, null);
 
     await hub.reconnectDaemon();
+    await hub.waitForTimelineSubscription(result.agentId);
     await hub.runtimeResources({ executionSubscriptions: 1 });
     await hub.completeCurrentTurn(result.agentId);
-    await hub.pendingControlAction(result.execution.id);
+    await hub.waitForControlAction("archive");
     await hub.completePendingCleanup();
     const execution = await hub.execution(result.execution.id);
     assert.deepEqual(hub.controlActions(), ["archive"]);
