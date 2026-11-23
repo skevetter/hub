@@ -215,6 +215,7 @@ const contrastPairs: [string, string, number][] = [
   ["--rail-foreground", "--rail", 4.5],
   ["--rail-muted", "--rail", 4.5],
   ["--rail-foreground", "--rail-accent", 4.5],
+  ["--sidebar-ring", "--rail", 3],
   ["--input", "--background", 3],
 ];
 
