@@ -118,6 +118,18 @@ export function proveReceipt(
   revisionById: RevisionLookup,
   cutoff: Date,
 ): ReceiptProof {
+  const earlyBlocker = receiptBlocker(receipt, cutoff);
+  if (earlyBlocker !== undefined) return earlyBlocker;
+  if (receipt.hasCapability) return { disposition: "live_execution" };
+  const blocker = finalRunBlocker(receipt.organizationId, branches);
+  if (blocker !== undefined) return blocker;
+  if (receipt.payloadExpiryState === "expiring")
+    return { disposition: validStagedReceipt(receipt) ? "expiring" : "drop_unproven" };
+  if (receipt.acceptedRoutes === null) return proveUnrouted(receipt, branches);
+  return provePinnedReceipt(receipt, branches, revisionById);
+}
+
+function receiptBlocker(receipt: ReceiptProofEvidence, cutoff: Date): BlockedReceipt | undefined {
   if (isLifecycleReceipt(receipt) || receipt.hasLifecycleWork)
     return { disposition: "lifecycle_pending" };
   if (receipt.payloadExpiryState !== "expiring" && receipt.receivedAt >= cutoff)
@@ -126,13 +138,14 @@ export function proveReceipt(
     return { disposition: "push_sync_unproven" };
   if (receipt.provider === "slack" || receipt.provider === "discord")
     return { disposition: "match_evidence_missing" };
-  if (!knownSource(receipt)) return { disposition: "unknown_shape" };
-  if (receipt.hasCapability) return { disposition: "live_execution" };
-  const blocker = finalRunBlocker(receipt.organizationId, branches);
-  if (blocker !== undefined) return blocker;
-  if (receipt.payloadExpiryState === "expiring")
-    return { disposition: validStagedReceipt(receipt) ? "expiring" : "drop_unproven" };
-  if (receipt.acceptedRoutes === null) return proveUnrouted(receipt, branches);
+  return knownSource(receipt) ? undefined : { disposition: "unknown_shape" };
+}
+
+function provePinnedReceipt(
+  receipt: ReceiptProofEvidence,
+  branches: readonly ReceiptProofBranch[],
+  revisionById: RevisionLookup,
+): ReceiptProof {
   const routes = parsePinnedRoutes(receipt.acceptedRoutes);
   if (
     routes === undefined ||
@@ -170,20 +183,26 @@ function knownSource(receipt: ReceiptProofEvidence) {
     case "github":
       return receipt.source.startsWith("github.");
     case "linear":
-      return (
-        receipt.source === "linear.issue" ||
-        receipt.source === "linear.comment" ||
-        (receipt.droppedReason === "unsupported_event" && receipt.source.startsWith("linear."))
-      );
+      return knownLinearSource(receipt);
     case "manual":
       return receipt.source === "manual.run" || receipt.source === "webhook.received";
     case "schedule":
       return receipt.source === "schedule.tick";
     case "github_notification":
       return receipt.source === "github.notification";
+    case "discord":
+    case "slack":
     default:
       return false;
   }
+}
+
+function knownLinearSource(receipt: ReceiptProofEvidence): boolean {
+  return (
+    receipt.source === "linear.issue" ||
+    receipt.source === "linear.comment" ||
+    (receipt.droppedReason === "unsupported_event" && receipt.source.startsWith("linear."))
+  );
 }
 
 function proveUnrouted(
@@ -238,13 +257,17 @@ function readRoutedEvidence(
     case "github":
     case "linear":
       return providerEvidence(receipt, routes, revisionById);
-    case "manual":
-      return routes.length === 1
-        ? manualEvidence(receipt, routes[0]!, revisionById(routes[0]!.configurationRevisionId))
-        : { disposition: "fan_out_unresolved" };
+    case "manual": {
+      if (routes.length !== 1) return { disposition: "fan_out_unresolved" };
+      const route = routes[0];
+      if (route === undefined) return { disposition: "fan_out_unresolved" };
+      return manualEvidence(receipt, route, revisionById(route.configurationRevisionId));
+    }
     case "schedule":
     case "github_notification":
       return transactionalEvidence(receipt, routes, revisionById);
+    case "discord":
+    case "slack":
     default:
       return { disposition: "unknown_shape" };
   }
@@ -269,20 +292,9 @@ function providerEvidence(
       receipt.organizationId,
       route,
     );
-    if (
-      config === undefined ||
-      receipt.connectionId === null ||
-      route.connectionId !== receipt.connectionId ||
-      (route.resourceId !== null && route.resourceId !== receipt.resourceId)
-    )
+    if (config === undefined || !matchesReceiptRoute(receipt, route))
       return { disposition: "fan_out_unresolved" };
-    if (
-      parsed.provider === "linear" &&
-      parsed.event.issue === null &&
-      hasLinearSourceTrigger(config.triggers, receipt.source)
-    )
-      return { disposition: "match_evidence_missing" };
-    const matches = matchPinnedProviderInvocations(config, parsed, receipt.source, route);
+    const matches = matchReceiptInvocations(config, parsed, receipt.source, route);
     if (matches === undefined) return { disposition: "match_evidence_missing" };
     expected.push(
       ...matches.map(({ triggerName, invocation }) =>
@@ -291,6 +303,29 @@ function providerEvidence(
     );
   }
   return { expected, binding: null };
+}
+
+function matchesReceiptRoute(receipt: ReceiptProofEvidence, route: PinnedRoute): boolean {
+  return (
+    receipt.connectionId !== null &&
+    route.connectionId === receipt.connectionId &&
+    (route.resourceId === null || route.resourceId === receipt.resourceId)
+  );
+}
+
+function matchReceiptInvocations(
+  config: CompiledHubConfig,
+  parsed: PinnedProviderEvent,
+  source: string,
+  route: PinnedRoute,
+) {
+  if (
+    parsed.provider === "linear" &&
+    parsed.event.issue === null &&
+    hasLinearSourceTrigger(config.triggers, source)
+  )
+    return undefined;
+  return matchPinnedProviderInvocations(config, parsed, source, route);
 }
 
 function providerEventBlocker(
@@ -308,12 +343,18 @@ function providerEventBlocker(
     event.id !== receipt.deliveryId ||
     String(event.repositoryId) !== receipt.resourceId ||
     event.repo !== receipt.repo ||
-    classified.semanticEvent === undefined ||
-    classified.item?.number == null ||
-    classified.item.number < 1
+    !hasGitHubItemEvidence(classified)
   )
     return { disposition: "drop_unproven" };
   return undefined;
+}
+
+function hasGitHubItemEvidence(classified: ReturnType<typeof classifyGitHubEvent>): boolean {
+  return !(
+    classified.semanticEvent === undefined ||
+    classified.item?.number == null ||
+    classified.item.number < 1
+  );
 }
 
 function manualEvidence(
@@ -397,12 +438,7 @@ function manualBinding(
   sourceEvidence: unknown,
   payload: ManualRunPayload,
 ): ManualReceiptReplayBinding | null {
-  if (
-    (payload.source !== undefined && payload.source !== receipt.source) ||
-    (payload.expectedVersionId !== undefined &&
-      payload.expectedVersionId !== route.configurationRevisionId)
-  )
-    return null;
+  if (!matchesManualRoute(receipt, route, payload)) return null;
   const binding = {
     projectId: route.projectId,
     configurationRevisionId: route.configurationRevisionId,
@@ -426,16 +462,42 @@ function manualBinding(
     )
   )
     return binding;
-  const digest = SIGNED_DELIVERY_KEY.exec(payload.publicDeliveryKey)?.[1];
+  const triggerId = signedWebhookTriggerId(
+    receipt,
+    sourceEvidence,
+    payload.publicDeliveryKey,
+    payload.authenticatedBy.credentialId,
+  );
+  return triggerId === null ? null : { ...binding, triggerId };
+}
+
+function matchesManualRoute(
+  receipt: ReceiptProofEvidence,
+  route: PinnedRoute,
+  payload: ManualRunPayload,
+): boolean {
+  return (
+    (payload.source === undefined || payload.source === receipt.source) &&
+    (payload.expectedVersionId === undefined ||
+      payload.expectedVersionId === route.configurationRevisionId)
+  );
+}
+
+function signedWebhookTriggerId(
+  receipt: ReceiptProofEvidence,
+  sourceEvidence: unknown,
+  publicDeliveryKey: string,
+  credentialId: string,
+): string | null {
+  const digest = SIGNED_DELIVERY_KEY.exec(publicDeliveryKey)?.[1];
   const signer = TriggerEvidence.safeParse(sourceEvidence);
   if (
     digest === undefined ||
     !signer.success ||
-    receipt.deliveryId !==
-      signedWebhookDeliveryId(receipt.organizationId, payload.authenticatedBy.credentialId, digest)
+    receipt.deliveryId !== signedWebhookDeliveryId(receipt.organizationId, credentialId, digest)
   )
     return null;
-  return { ...binding, triggerId: signer.data.triggerId };
+  return signer.data.triggerId;
 }
 
 function transactionalTrigger(
@@ -453,24 +515,36 @@ function transactionalTrigger(
     return undefined;
   const trigger = config.triggers.find((candidate) => candidate.on === receipt.source);
   if (trigger === undefined) return undefined;
-  if (receipt.provider === "schedule") {
-    const event = SchedulePayload.safeParse(receipt.payload);
-    const evidence = TriggerEvidence.safeParse(sourceEvidence);
-    if (!event.success || !evidence.success) return undefined;
-    const { trigger_id, scheduled_at } = event.data.schedule;
-    return trigger_id === evidence.data.triggerId &&
-      receipt.deliveryId === `schedule:${trigger_id}:${new Date(scheduled_at).toISOString()}`
-      ? trigger.name
-      : undefined;
-  }
+  const matches =
+    receipt.provider === "schedule"
+      ? matchesScheduleReceipt(receipt, sourceEvidence)
+      : matchesNotificationReceipt(receipt, trigger.filters);
+  return matches ? trigger.name : undefined;
+}
+
+function matchesScheduleReceipt(receipt: ReceiptProofEvidence, sourceEvidence: unknown): boolean {
+  const event = SchedulePayload.safeParse(receipt.payload);
+  const evidence = TriggerEvidence.safeParse(sourceEvidence);
+  if (!event.success || !evidence.success) return false;
+  const { trigger_id, scheduled_at } = event.data.schedule;
+  return (
+    trigger_id === evidence.data.triggerId &&
+    receipt.deliveryId === `schedule:${trigger_id}:${new Date(scheduled_at).toISOString()}`
+  );
+}
+
+function matchesNotificationReceipt(
+  receipt: ReceiptProofEvidence,
+  filters: Parameters<typeof matchesNotification>[1],
+): boolean {
   const event = NotificationEvent.safeParse(receipt.payload);
-  if (!event.success) return undefined;
+  if (!event.success) return false;
   const payload = event.data.github_notification;
-  return receipt.deliveryId === notificationDeliveryId(payload) &&
+  return (
+    receipt.deliveryId === notificationDeliveryId(payload) &&
     receipt.repo === payload.repo &&
-    matchesNotification(payload, trigger.filters)
-    ? trigger.name
-    : undefined;
+    matchesNotification(payload, filters)
+  );
 }
 
 function validStagedReceipt(receipt: ReceiptProofEvidence): boolean {

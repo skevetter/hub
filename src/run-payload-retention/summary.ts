@@ -91,19 +91,21 @@ function providerLink(
     return id === null ? null : `https://linear.app/issue/${id}`;
   }
   if (repo === null) return null;
-  if (receipt.provider === "github_notification") {
-    const notification = field(event, "github_notification");
-    const number = positiveId(field(notification, "number"));
-    const type = field(notification, "subject_type");
-    if (number === null || (type !== "PullRequest" && type !== "Issue")) return null;
-    return `https://github.com/${repo}/${type === "PullRequest" ? "pull" : "issues"}/${number}`;
-  }
+  if (receipt.provider === "github_notification") return githubNotificationLink(event, repo);
   if (receipt.provider !== "github") return null;
   const github = field(event, "github");
   const number = positiveId(field(field(github, "item"), "number"));
   if (number === null) return `https://github.com/${repo}`;
   const pull = field(field(github, "item"), "type") === "pull_request";
   return `https://github.com/${repo}/${pull ? "pull" : "issues"}/${number}`;
+}
+
+function githubNotificationLink(event: unknown, repo: string): string | null {
+  const notification = field(event, "github_notification");
+  const number = positiveId(field(notification, "number"));
+  const type = field(notification, "subject_type");
+  if (number === null || (type !== "PullRequest" && type !== "Issue")) return null;
+  return `https://github.com/${repo}/${type === "PullRequest" ? "pull" : "issues"}/${number}`;
 }
 
 function progressSummary(
@@ -116,16 +118,7 @@ function progressSummary(
     };
   }
   if (message.provider === "github") {
-    const ref = message.externalRef;
-    const repo = repositoryName(field(ref, "repository"));
-    const issue = positiveId(field(ref, "issueNumber"));
-    const comment = positiveId(field(ref, "commentId"));
-    if (repo !== null && issue !== null && comment !== null) {
-      return {
-        status: "posted",
-        link: `https://github.com/${repo}/issues/${issue}#issuecomment-${comment}`,
-      };
-    }
+    return { status: "posted", link: githubProgressLink(message.externalRef) };
   }
   if (message.provider === "linear") {
     const issue = uuid(field(message.externalRef, "issueId"));
@@ -135,6 +128,15 @@ function progressSummary(
     }
   }
   return { status: "posted", link: null };
+}
+
+function githubProgressLink(ref: unknown): string | null {
+  const repo = repositoryName(field(ref, "repository"));
+  const issue = positiveId(field(ref, "issueNumber"));
+  const comment = positiveId(field(ref, "commentId"));
+  return repo !== null && issue !== null && comment !== null
+    ? `https://github.com/${repo}/issues/${issue}#issuecomment-${comment}`
+    : null;
 }
 
 export function summarizeRunPayload(
