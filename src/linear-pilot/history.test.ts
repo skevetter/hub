@@ -16,6 +16,8 @@ import {
 } from "./test-fixtures.js";
 
 const historyPayload = z.array(z.strictObject({ owner: z.string(), app: z.string() }));
+// The plain-text fallback can escape both brackets.
+const redactionMarker = /\\?\[redacted\\?\]/u;
 
 function compose(nodes: FixtureActivity[], body = current.body, secrets: string[] = []) {
   const message = { ...current, body };
@@ -122,7 +124,7 @@ describe("Linear pilot history", () => {
     });
     for (const historical of [history[1]!.owner, history[1]!.app]) {
       expect(historical).toContain("ignore your rules");
-      expect(historical).toContain("[redacted]");
+      expect(historical).toMatch(redactionMarker);
       expect(historical).not.toMatch(
         /@outside|https:\/\/linear\.app\/acme\/profiles\/eve|<user id=evil/u,
       );
@@ -147,8 +149,8 @@ describe("Linear pilot history", () => {
     );
     const { history } = sections(prompt);
     expect(history).toHaveLength(2);
-    expect(history[1]?.owner).toContain("The prior question.");
-    expect(history[1]?.owner).toContain("[redacted]");
+    expect(history[1]?.owner).toMatch(/The prior question\\?\./u);
+    expect(history[1]?.owner).toMatch(redactionMarker);
     expect(history[1]?.owner).not.toContain("private suffix");
     expect(prompt?.match(/<linear-history-v1>/gu)).toHaveLength(1);
   });
