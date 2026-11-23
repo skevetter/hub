@@ -67,6 +67,14 @@ interface SweepPage {
   nextCursor: string | null;
 }
 
+interface ApplyPageOptions {
+  cutoff: Date;
+  now: Date;
+  countAt: Date;
+  countOnly: boolean;
+  shouldStop: () => boolean;
+}
+
 function sweepPage(candidates: SweepCandidate[], limit: number): SweepPage {
   return {
     candidates,
@@ -151,16 +159,76 @@ export class RunPayloadRetention {
   }
 
   async runBatch(now = new Date(), shouldStop = () => false) {
+    const { cutoff, countAt, countOnly, stages } = this.prepareSweep(now);
+    const limit = Math.min(PAGE_SIZE, this.settings.maxRunsPerPass);
+    if (this.settings.mode === "off") return this.finishSweep(this.sweepReport(true));
+    for (let stage = stages[0]; stage !== undefined; stage = stages[0]) {
+      if (shouldStop()) return this.sweepReport(false);
+      const page = await this.scanStage(stage, cutoff, limit, countOnly);
+      const result = await this.processPage(stage, page, {
+        cutoff,
+        now,
+        countAt,
+        countOnly,
+        shouldStop,
+      });
+      if (result === "paused") return this.sweepReport(false);
+      if (result === "capped") return this.finishSweep(this.sweepReport(true));
+      if (this.advancePage(stage, page)) return this.sweepReport(false);
+      if (!this.beginIntactReceiptScan(stage)) stages.shift();
+    }
+    return this.finishSweep(this.sweepReport(true));
+  }
+
+  private prepareSweep(now: Date) {
     this.now ??= now;
     const cutoff = (this.cutoff ??= retentionCutoff(this.now, this.settings.retentionDays));
     const countOnly = this.settings.mode !== "on";
-    const limit = Math.min(PAGE_SIZE, this.settings.maxRunsPerPass);
     this.stages ??= [
       ...APPLY_STAGES.slice(this.stageOffset),
       ...APPLY_STAGES.slice(0, this.stageOffset),
       ...(countOnly ? ["machine" as const] : []),
     ];
-    const report = (complete: boolean) => ({
+    return { cutoff, countAt: this.now, countOnly, stages: this.stages };
+  }
+
+  private async processPage(
+    stage: Stage,
+    page: SweepPage,
+    { cutoff, now, countAt, countOnly, shouldStop }: ApplyPageOptions,
+  ): Promise<"paused" | "capped" | "scanned"> {
+    for (const candidate of page.candidates) {
+      if (shouldStop() || !(await this.processCandidate(candidate, cutoff, now, countAt)))
+        return "paused";
+      this.cursor = candidate.id;
+      if (!countOnly && stage !== "machine" && this.applyLimitReached()) {
+        this.stageOffset = (APPLY_STAGES.indexOf(stage) + 1) % APPLY_STAGES.length;
+        return "capped";
+      }
+    }
+    return "scanned";
+  }
+
+  private applyLimitReached(): boolean {
+    return (
+      this.credentialFactsBackfilled +
+        this.expired +
+        this.launchIntentsExpired +
+        this.sessionsReduced +
+        this.receiptWork >=
+      this.settings.maxRunsPerPass
+    );
+  }
+
+  private advancePage(stage: Stage, page: SweepPage): boolean {
+    const stageCapped =
+      stage === "credentials" && this.credentialFactsBackfilled >= this.settings.maxRunsPerPass;
+    this.cursor = stageCapped ? null : page.nextCursor;
+    return this.cursor !== null;
+  }
+
+  private sweepReport(complete: boolean) {
+    return {
       complete,
       counts: this.counts,
       auxiliaryCounts: this.auxiliaryCounts,
@@ -170,39 +238,7 @@ export class RunPayloadRetention {
       credentialFactsBackfilled: this.credentialFactsBackfilled,
       launchIntentsExpired: this.launchIntentsExpired,
       sessionsReduced: this.sessionsReduced,
-    });
-    if (this.settings.mode === "off") return this.finishSweep(report(true));
-    for (let stage = this.stages[0]; stage !== undefined; stage = this.stages[0]) {
-      if (shouldStop()) return report(false);
-      const page = await this.scanStage(stage, cutoff, limit, countOnly);
-      for (const candidate of page.candidates) {
-        if (shouldStop()) return report(false);
-        if (!(await this.processCandidate(candidate, cutoff, now, this.now))) return report(false);
-        this.cursor = candidate.id;
-        if (
-          !countOnly &&
-          stage !== "machine" &&
-          this.credentialFactsBackfilled +
-            this.expired +
-            this.launchIntentsExpired +
-            this.sessionsReduced +
-            this.receiptWork >=
-            this.settings.maxRunsPerPass
-        ) {
-          this.stageOffset = (APPLY_STAGES.indexOf(stage) + 1) % APPLY_STAGES.length;
-          return this.finishSweep(report(true));
-        }
-      }
-      const stageCapped =
-        stage === "credentials" && this.credentialFactsBackfilled >= this.settings.maxRunsPerPass;
-      if (page.nextCursor !== null && !stageCapped) {
-        this.cursor = page.nextCursor;
-        return report(false);
-      }
-      this.cursor = null;
-      if (!this.beginIntactReceiptScan(stage)) this.stages.shift();
-    }
-    return this.finishSweep(report(true));
+    };
   }
 
   private beginIntactReceiptScan(stage: Stage): boolean {
@@ -237,21 +273,7 @@ export class RunPayloadRetention {
       );
     }
     if (stage === "receipt") {
-      const page = await this.store.scanReceiptPayloads(
-        this.cursor,
-        cutoff,
-        limit,
-        this.receiptState,
-      );
-      return {
-        candidates: page.candidates.map(({ id, disposition, ageFrom }) => ({
-          id,
-          disposition,
-          ageFrom,
-          kind: stage,
-        })),
-        nextCursor: page.nextCursor,
-      };
+      return this.scanReceipts(cutoff, limit);
     }
     if (stage === "installationSync") {
       const page = await this.store.scanGitHubSyncPayloads(this.cursor, cutoff, limit);
@@ -283,6 +305,24 @@ export class RunPayloadRetention {
       page.map(({ id, disposition, ageFrom }) => ({ id, disposition, ageFrom, kind: stage })),
       limit,
     );
+  }
+
+  private async scanReceipts(cutoff: Date, limit: number): Promise<SweepPage> {
+    const page = await this.store.scanReceiptPayloads(
+      this.cursor,
+      cutoff,
+      limit,
+      this.receiptState,
+    );
+    return {
+      candidates: page.candidates.map(({ id, disposition, ageFrom }) => ({
+        id,
+        disposition,
+        ageFrom,
+        kind: "receipt",
+      })),
+      nextCursor: page.nextCursor,
+    };
   }
 
   private async processCandidate(
@@ -332,17 +372,21 @@ export class RunPayloadRetention {
       this.recordReceiptOperation(kind, result);
     }
     if (kind === "installationSync") {
-      const result = await this.store.expireGitHubSyncPayload(id, cutoff, now);
-      this.recordReceiptOperation(kind, result);
-      const hasCopy =
-        result.status === "expired" ? result.receiptCopy : candidate.receiptCopyAgeFrom !== null;
-      if (hasCopy) this.recordReceiptResult("lifecycleAuditCopy", result);
+      await this.applySyncCandidate(candidate, cutoff, now);
     }
     if (kind === "cursorDiagnostic") {
       const result = await this.store.expireGitHubCursorDiagnostic(id, cutoff, now);
       this.recordReceiptOperation(kind, result);
     }
     return true;
+  }
+
+  private async applySyncCandidate(candidate: SyncExpiryCandidate, cutoff: Date, now: Date) {
+    const result = await this.store.expireGitHubSyncPayload(candidate.id, cutoff, now);
+    this.recordReceiptOperation("installationSync", result);
+    const hasCopy =
+      result.status === "expired" ? result.receiptCopy : candidate.receiptCopyAgeFrom !== null;
+    if (hasCopy) this.recordReceiptResult("lifecycleAuditCopy", result);
   }
 
   private recordReceiptOperation(stage: ReceiptStage, result: ReceiptApplyResult): void {

@@ -63,16 +63,7 @@ export function expectedFanout(
   receipt: FanoutReceipt,
   revisionById: (id: string) => FanoutRevision | undefined,
 ): ExpectedFanout | undefined {
-  if (!usesPinnedFanout(receipt.provider)) {
-    const parsed = z.array(routeKey).safeParse(receipt.acceptedRoutes ?? []);
-    return parsed.success
-      ? parsed.data.map(({ projectId, configurationRevisionId }) => ({
-          projectId,
-          configurationRevisionId,
-          names: null,
-        }))
-      : undefined;
-  }
+  if (!usesPinnedFanout(receipt.provider)) return unpinnedFanout(receipt.acceptedRoutes);
   if (receipt.provider === "slack" || receipt.provider === "discord") return undefined;
   const routes = readPinnedRoutes(receipt);
   if (routes === undefined) return undefined;
@@ -100,6 +91,17 @@ export function expectedFanout(
     return undefined;
   }
   return expected;
+}
+
+function unpinnedFanout(acceptedRoutes: unknown): ExpectedFanout | undefined {
+  const parsed = z.array(routeKey).safeParse(acceptedRoutes ?? []);
+  return parsed.success
+    ? parsed.data.map(({ projectId, configurationRevisionId }) => ({
+        projectId,
+        configurationRevisionId,
+        names: null,
+      }))
+    : undefined;
 }
 
 export function pinnedConfiguration(

@@ -44,11 +44,13 @@ export type SyncReceiptEvidence = Pick<
   | "payloadExpiryState"
 > & { acceptedRoutes: unknown };
 
+type SyncIdentity = Pick<
+  GitHubSyncPayloadEvidence,
+  "providerApplicationId" | "connectionId" | "deliveryId" | "signatureHash" | "source"
+>;
+
 export function isExactSyncReceipt(
-  sync: Pick<
-    GitHubSyncPayloadEvidence,
-    "providerApplicationId" | "connectionId" | "deliveryId" | "signatureHash" | "source"
-  >,
+  sync: SyncIdentity,
   receipt: SyncReceiptEvidence,
   organizationId: string,
 ): boolean {
@@ -58,20 +60,28 @@ export function isExactSyncReceipt(
     sync.connectionId !== null &&
     receipt.connectionId === sync.connectionId &&
     receipt.resourceId === null &&
-    sync.providerApplicationId !== null &&
-    receipt.providerApplicationId === sync.providerApplicationId &&
-    receipt.source === sync.source &&
-    receipt.deliveryId === sync.deliveryId &&
-    sync.signatureHash !== null &&
-    receipt.signatureHash === sync.signatureHash &&
+    matchesSyncIdentity(sync, receipt) &&
     receipt.acceptedRoutes === null &&
     receipt.payloadExpiryState == null
   );
 }
 
+function matchesSyncIdentity(sync: SyncIdentity, receipt: SyncReceiptEvidence): boolean {
+  return (
+    sync.providerApplicationId !== null &&
+    receipt.providerApplicationId === sync.providerApplicationId &&
+    receipt.source === sync.source &&
+    receipt.deliveryId === sync.deliveryId &&
+    sync.signatureHash !== null &&
+    receipt.signatureHash === sync.signatureHash
+  );
+}
+
+type ReferencedSyncReceipt = SyncReceiptEvidence & { hasReferences: boolean };
+
 export function syncPayloadDisposition(
   sync: GitHubSyncPayloadEvidence,
-  receipt: (SyncReceiptEvidence & { hasReferences: boolean }) | undefined,
+  receipt: ReferencedSyncReceipt | undefined,
   hasAnyCopy: boolean,
   cutoff: Date,
 ): SyncPayloadDisposition {
@@ -81,6 +91,15 @@ export function syncPayloadDisposition(
   const link = readSyncAuditLink(sync.auditLink);
   if (link?.kind === "none")
     return sync.connectionId === null && !hasAnyCopy ? "eligible" : "audit_link_unproven";
+  return linkedSyncDisposition(sync, receipt, link, cutoff);
+}
+
+function linkedSyncDisposition(
+  sync: GitHubSyncPayloadEvidence,
+  receipt: ReferencedSyncReceipt | undefined,
+  link: ReturnType<typeof readSyncAuditLink>,
+  cutoff: Date,
+): SyncPayloadDisposition {
   if (
     link?.kind !== "receipt" ||
     receipt?.id !== link.receiptId ||
