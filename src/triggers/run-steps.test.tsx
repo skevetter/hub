@@ -14,6 +14,7 @@ const detail: RunDetail = {
     repo: "owner/repo",
     receivedAt: "2026-01-01T00:00:00.000Z",
     configuredTriggerName: "Deploy",
+    prompt: null,
     createdAt: "2026-01-01T00:01:00.000Z",
     completedAt: "2026-01-01T00:02:00.000Z",
     outcome: "accepted",

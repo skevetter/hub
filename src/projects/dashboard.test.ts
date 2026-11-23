@@ -192,13 +192,13 @@ describe("project dashboard activity read models", () => {
     });
     assert.ok(organizationDetail);
     assert.equal(organizationDetail.run.id, run.run.id);
+    assert.equal(organizationDetail.run.prompt, "run");
     for (const key of [
       "rawPayload",
       "triggerContext",
       "outputContext",
       "inputs",
       "values",
-      "prompt",
       "deliveryId",
       "providerEventReceiptId",
     ]) {
@@ -324,6 +324,7 @@ describe("project dashboard activity read models", () => {
       runId: run.id,
     });
     assert.ok(detail);
+    assert.equal(detail.run.prompt, null);
     for (const activity of [list.activity[0]!, detail.run, legacyDetail.activity]) {
       assert.equal(activity.provider, "manual");
       assert.equal(activity.source, "webhook.received");

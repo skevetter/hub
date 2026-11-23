@@ -34,6 +34,7 @@ export interface ActivityRunDetail {
     repo: string | null;
     receivedAt: string;
     configuredTriggerName: string;
+    prompt: string | null;
     payloadExpiredAt?: string | null;
     payloadSummary?: RunPayloadSummary | null;
     createdAt: string;
@@ -102,18 +103,12 @@ export function activityRunDetailView(
 ): ActivityRunDetail {
   const { run, receipt, steps } = activity;
   const expired = run.payloadExpiredAt != null;
-  const receiptHidden = expired || receipt.payloadExpiryState != null;
   return {
     run: {
       id: run.id,
       provider: receipt.provider,
       source: receipt.source,
-      ...(!receiptHidden && receipt.source === "webhook.received"
-        ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
-        : {}),
-      repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
-      payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
-      payloadSummary: run.payloadSummary ?? null,
+      ...detailRunPayload(run, receipt, expired),
       receivedAt: receipt.receivedAt.toISOString(),
       configuredTriggerName: run.configuredTriggerName,
       createdAt: run.createdAt.toISOString(),
@@ -146,6 +141,28 @@ export function activityRunDetailView(
       };
     }),
   };
+}
+
+function detailRunPayload(
+  run: TriggerRunRecord,
+  receipt: ProviderEventReceiptRecord,
+  expired: boolean,
+) {
+  const receiptHidden = expired || receipt.payloadExpiryState != null;
+  return {
+    ...(!receiptHidden && receipt.source === "webhook.received"
+      ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
+      : {}),
+    repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
+    payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
+    payloadSummary: run.payloadSummary ?? null,
+    prompt: detailPrompt(run.prompt, receipt.source, receiptHidden),
+  };
+}
+
+function detailPrompt(prompt: string, source: string, receiptHidden: boolean): string | null {
+  if (receiptHidden || source === "webhook.received" || prompt === "") return null;
+  return prompt;
 }
 
 export function activityRunView(
