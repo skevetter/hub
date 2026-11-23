@@ -15,7 +15,7 @@ import {
 import { Outlet } from "@tanstack/react-router";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback } from "react";
+import { useCallback, type CSSProperties } from "react";
 import { usePageContext } from "../navigation/index.js";
 import { Page } from "../components/app/page.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
@@ -53,6 +53,9 @@ import { CONTENT_ID, SkipLink } from "./skip-link.js";
 import { SiteHeaderActionsProvider } from "./site-header-actions.js";
 
 type ActiveAccount = ActiveAccountState;
+const SIDEBAR_STYLE: CSSProperties & { "--sidebar-width": string } = {
+  "--sidebar-width": "14.5rem",
+};
 type AccountCommandResult = Result<{
   state: "sessionExpired" | "organizationRequired" | "complete";
 }>;
@@ -64,7 +67,7 @@ type CreateOrganizationCommandResult = Result<{
 export function DashboardShell({ account }: { account: ActiveAccount }) {
   const actions = useDashboardAccountActions();
   return (
-    <SidebarProvider>
+    <SidebarProvider style={SIDEBAR_STYLE}>
       <RouteTenantProvider>
         <DashboardContent account={account} {...actions} />
       </RouteTenantProvider>

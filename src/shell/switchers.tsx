@@ -1,6 +1,6 @@
 import { Check, LogOut, Plus, ShieldCheck } from "lucide-react";
 import { Link } from "@tanstack/react-router";
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useState, type ComponentProps } from "react";
 
 import { FormDialog } from "../components/app/form-dialog.js";
 import { FormField } from "../components/app/form-field.js";
@@ -20,6 +20,7 @@ export type RouteTenant = NonNullable<ReturnType<typeof useOptionalRouteTenant>>
 
 /** Where the instance surfaces begin, for the one link into them that is not in a nav group. */
 const INSTANCE_ENTRY = "/apps";
+type OrganizationSubmit = ComponentProps<typeof FormDialog>["onSubmit"];
 
 const ROLE_LABELS: Record<string, string> = {
   owner: "Owner",
@@ -46,19 +47,8 @@ export function OrganizationSwitcher({
   onCreateOrganization: (name: string) => void;
   onSelectOrganization: (organizationId: string, slug: string) => void;
 }) {
-  const [creating, setCreating] = useState(false);
-  const requestCreate = useCallback((event: Event) => {
-    event.preventDefault();
-    setCreating(true);
-  }, []);
-  const create = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      onCreateOrganization(formValue(new FormData(event.currentTarget), "name"));
-      setCreating(false);
-    },
-    [onCreateOrganization],
-  );
+  const { creating, setCreating, requestCreate, create } =
+    useOrganizationCreation(onCreateOrganization);
 
   return (
     <>
@@ -90,24 +80,62 @@ export function OrganizationSwitcher({
           </>
         ) : null}
       </SidebarSwitcher>
-      <FormDialog
+      <CreateOrganizationDialog
         open={creating}
         onOpenChange={setCreating}
-        title="New organization"
-        label="Create organization"
-        submitLabel="Create organization"
         busy={busy}
         onSubmit={create}
-      >
-        <FormField
-          id="new-organization-name"
-          label="Organization name"
-          kind="text"
-          name="name"
-          required
-        />
-      </FormDialog>
+      />
     </>
+  );
+}
+
+function useOrganizationCreation(onCreateOrganization: (name: string) => void) {
+  const [creating, setCreating] = useState(false);
+  const requestCreate = useCallback((event: Event) => {
+    event.preventDefault();
+    setCreating(true);
+  }, []);
+  const create: OrganizationSubmit = useCallback(
+    (event) => {
+      event.preventDefault();
+      onCreateOrganization(formValue(new FormData(event.currentTarget), "name"));
+      setCreating(false);
+    },
+    [onCreateOrganization],
+  );
+  return { creating, setCreating, requestCreate, create };
+}
+
+function CreateOrganizationDialog({
+  open,
+  onOpenChange,
+  busy,
+  onSubmit,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  busy: boolean;
+  onSubmit: OrganizationSubmit;
+}) {
+  return (
+    <FormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="New organization"
+      label="Create organization"
+      submitLabel="Create organization"
+      busy={busy}
+      onSubmit={onSubmit}
+    >
+      <FormField
+        id="new-organization-name"
+        label="Organization name"
+        kind="text"
+        name="name"
+        required
+      />
+    </FormDialog>
   );
 }
 

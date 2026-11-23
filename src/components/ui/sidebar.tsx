@@ -63,6 +63,44 @@ function SidebarProvider({
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
 }) {
+  const contextValue = useSidebarProviderState({ defaultOpen, openProp, setOpenProp });
+  const sidebarStyle = React.useMemo<SidebarStyle>(
+    () => ({
+      "--sidebar-width": SIDEBAR_WIDTH,
+      "--sidebar-width-icon": SIDEBAR_WIDTH_ICON,
+      ...style,
+    }),
+    [style],
+  );
+
+  return (
+    <SidebarContext.Provider value={contextValue}>
+      <TooltipProvider delayDuration={0}>
+        <div
+          data-slot="sidebar-wrapper"
+          style={sidebarStyle}
+          className={cn(
+            "group/sidebar-wrapper flex min-h-svh w-full has-data-[variant=inset]:bg-sidebar",
+            className,
+          )}
+          {...props}
+        >
+          {children}
+        </div>
+      </TooltipProvider>
+    </SidebarContext.Provider>
+  );
+}
+
+function useSidebarProviderState({
+  defaultOpen,
+  openProp,
+  setOpenProp,
+}: {
+  defaultOpen: boolean;
+  openProp: boolean | undefined;
+  setOpenProp: ((open: boolean) => void) | undefined;
+}) {
   const isMobile = useIsMobile();
   const [openMobile, setOpenMobile] = React.useState(false);
 
@@ -114,32 +152,7 @@ function SidebarProvider({
     }),
     [state, open, setOpen, isMobile, openMobile, setOpenMobile, toggleSidebar],
   );
-  const sidebarStyle = React.useMemo<SidebarStyle>(
-    () => ({
-      "--sidebar-width": SIDEBAR_WIDTH,
-      "--sidebar-width-icon": SIDEBAR_WIDTH_ICON,
-      ...style,
-    }),
-    [style],
-  );
-
-  return (
-    <SidebarContext.Provider value={contextValue}>
-      <TooltipProvider delayDuration={0}>
-        <div
-          data-slot="sidebar-wrapper"
-          style={sidebarStyle}
-          className={cn(
-            "group/sidebar-wrapper flex min-h-svh w-full has-data-[variant=inset]:bg-sidebar",
-            className,
-          )}
-          {...props}
-        >
-          {children}
-        </div>
-      </TooltipProvider>
-    </SidebarContext.Provider>
-  );
+  return contextValue;
 }
 
 function Sidebar({
@@ -154,7 +167,7 @@ function Sidebar({
   variant?: "sidebar" | "floating" | "inset";
   collapsible?: "offcanvas" | "icon" | "none";
 }) {
-  const { isMobile, state, openMobile, setOpenMobile } = useSidebar();
+  const { isMobile, openMobile, setOpenMobile } = useSidebar();
 
   if (collapsible === "none") {
     return (
@@ -192,6 +205,32 @@ function Sidebar({
     );
   }
 
+  return (
+    <DesktopSidebar
+      side={side}
+      variant={variant}
+      collapsible={collapsible}
+      className={className}
+      {...props}
+    >
+      {children}
+    </DesktopSidebar>
+  );
+}
+
+function DesktopSidebar({
+  side,
+  variant,
+  collapsible,
+  className,
+  children,
+  ...props
+}: React.ComponentProps<"div"> & {
+  side: "left" | "right";
+  variant: "sidebar" | "floating" | "inset";
+  collapsible: "offcanvas" | "icon";
+}) {
+  const { state } = useSidebar();
   return (
     <div
       className="group peer hidden text-sidebar-foreground md:block"

@@ -63,18 +63,7 @@ export function NavigationGroup({
             ))}
           </SidebarMenu>
         </SidebarGroupContent>
-        {setup === undefined || setup.length === 0 ? null : (
-          <>
-            <SidebarGroupLabel className="text-rail-muted">Setup</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {setup.map((item) => (
-                  <NavItem key={item.to} item={item} />
-                ))}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </>
-        )}
+        {setup === undefined || setup.length === 0 ? null : <SetupGroup items={setup} />}
         {administration === undefined || administration.length === 0 ? null : (
           <>
             <SidebarSeparator className="my-2" />
@@ -89,6 +78,21 @@ export function NavigationGroup({
         )}
       </SidebarGroup>
     </nav>
+  );
+}
+
+function SetupGroup({ items }: { items: readonly NavigationItem[] }) {
+  return (
+    <>
+      <SidebarGroupLabel className="text-rail-muted">Setup</SidebarGroupLabel>
+      <SidebarGroupContent>
+        <SidebarMenu>
+          {items.map((item) => (
+            <NavItem key={item.to} item={item} />
+          ))}
+        </SidebarMenu>
+      </SidebarGroupContent>
+    </>
   );
 }
 
@@ -108,7 +112,12 @@ function NavItem({ item }: { item: NavigationItem }) {
 
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton asChild isActive={active} tooltip={label}>
+      <SidebarMenuButton
+        asChild
+        isActive={active}
+        tooltip={label}
+        className="h-9 rounded-sm text-rail-muted hover:bg-sidebar-accent hover:text-sidebar-foreground data-[active=true]:bg-sidebar-primary data-[active=true]:text-sidebar-primary-foreground data-[active=true]:font-strong"
+      >
         <Link to={to as never} aria-current={active ? "page" : undefined} onClick={navigate}>
           <Icon aria-hidden="true" />
           <span>{label}</span>
