@@ -493,7 +493,7 @@ export class ProviderEventAcceptanceRepository {
                 eq(schema.githubInstallationSyncs.id, selected.installationSyncId),
                 eq(schema.githubInstallationSyncs.installationId, selected.installationId),
               ),
-          lte(schema.githubInstallationSyncs.retryAt, new Date()),
+          lte(schema.githubInstallationSyncs.retryAt, sql`statement_timestamp()`),
           isNull(schema.githubInstallationSyncs.payloadExpiredAt),
           or(
             eq(schema.githubInstallationSyncs.providerApplicationId, owner.providerApplicationId),
