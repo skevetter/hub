@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,12 +22,21 @@ import { FakeAgents } from "../interactive-sessions/test-utils/fake-agents.js";
 import { logger, redact } from "../logger.js";
 import { createLinearRegistration } from "../providers/linear/index.js";
 import { prepareProfile, surfaceTenant } from "../surfaces/store.contract.js";
-import { pilotActivityIds } from "./activities.js";
+import { pilotActivityIds, stableActivityId } from "./activities.js";
 import { createLinearPilotRuntime } from "./runtime.js";
-import type { LinearPilotTerminal } from "./session.js";
+import type { LinearPilotSessionHooks, LinearPilotTerminal } from "./session.js";
 import { createdPayload, objectAt, type JsonObject } from "./test-utils/intake-fixtures.js";
 
 const secret = "synthetic-linear-signature";
+const activityContent = z.discriminatedUnion("type", [
+  z.object({ type: z.enum(["thought", "response", "error"]), body: z.string() }),
+  z.strictObject({
+    type: z.literal("action"),
+    action: z.string(),
+    parameter: z.string(),
+    result: z.string().optional(),
+  }),
+]);
 const graphQLRequest = z.object({
   query: z.string(),
   variables: z.looseObject({
@@ -35,7 +44,7 @@ const graphQLRequest = z.object({
       .object({
         id: z.string(),
         agentSessionId: z.string(),
-        content: z.object({ type: z.string(), body: z.string() }),
+        content: activityContent,
         signal: z.string().optional(),
       })
       .optional(),
@@ -91,7 +100,7 @@ async function registeredDatabase(backend: "embedded" | "postgres") {
   }
 }
 
-type Publication = Array<{ id: string; type: string; body: string; signal?: string }>;
+type Publication = Array<{ id: string; signal?: string } & z.infer<typeof activityContent>>;
 interface Endpoint {
   handle(request: Request): Promise<Response> | Response;
 }
@@ -452,6 +461,119 @@ function coordinatorOptions(scenario: string) {
   return scenario === "stop-race" ? { shutdownTimeoutMs: 1_000 } : {};
 }
 
+type ToolStepsCase = "default" | "publish" | "stop" | "stale";
+
+const toolCallId = "synthetic-read";
+
+function expectedToolActionId(nativeSessionId: string, interactionId: string) {
+  const hash = createHash("sha256").update(toolCallId).digest("hex");
+  return stableActivityId(nativeSessionId, "action", `${interactionId}:${hash}`);
+}
+
+function emitToolStep(agents: FakeAgents, agentId: string, turnId: string) {
+  agents.emit(
+    agentId,
+    {
+      type: "timeline",
+      provider: "codex",
+      turnId,
+      item: {
+        type: "tool_call",
+        callId: toolCallId,
+        name: "read",
+        status: "completed",
+        detail: { type: "read", filePath: "/outside-workspace/private-notes.md" },
+      },
+    },
+    { epoch: turnId, seq: 2 },
+  );
+}
+
+function completePilotTurn(agents: FakeAgents, agentId: string, turnId: string, seq = 2) {
+  agents.emit(
+    agentId,
+    {
+      type: "timeline",
+      provider: "codex",
+      turnId,
+      item: { type: "assistant_message", text: "Synthetic final answer", messageId: "answer" },
+    },
+    { epoch: turnId, seq },
+  );
+  agents.emit(agentId, { type: "turn_completed", provider: "codex", turnId });
+}
+
+function heldAction() {
+  const released = Promise.withResolvers<void>();
+  let pending: AbortSignal | undefined;
+  return {
+    get pending() {
+      return pending;
+    },
+    release: released.resolve,
+    async hold(signal: AbortSignal | null | undefined) {
+      assert(signal);
+      pending = signal;
+      await released.promise;
+      signal.throwIfAborted();
+    },
+  };
+}
+
+function observeToolSteps(hooks: LinearPilotSessionHooks) {
+  assert(hooks.toolSteps);
+  const open = vi.fn(hooks.toolSteps);
+  hooks.toolSteps = open;
+  return open;
+}
+
+async function assertStopClosesToolSteps(input: {
+  agents: FakeAgents;
+  coordinator: InteractiveSessionCoordinator;
+  agentId: string;
+  action: ReturnType<typeof heldAction>;
+  stop: () => Promise<void>;
+  publication: Publication;
+}) {
+  const { agents, coordinator, agentId, action, stop, publication } = input;
+  emitToolStep(agents, agentId, "turn-1");
+  const signal = await vi.waitFor(() => {
+    assert(action.pending);
+    return action.pending;
+  });
+  expect(signal.aborted).toBe(false);
+  let closedBeforeStop: boolean | undefined;
+  const stopCurrent = coordinator.stopLinearPilot.bind(coordinator);
+  const coordinatorStop = vi.spyOn(coordinator, "stopLinearPilot").mockImplementation((request) => {
+    closedBeforeStop = signal.aborted;
+    action.release();
+    return stopCurrent(request);
+  });
+  const control = agents.control.bind(agents);
+  agents.connection.agents.control = async (id, workspace, kind, onWritten) => {
+    onWritten?.();
+    await control(id, workspace, kind);
+  };
+  agents.afterInterrupt = async () => {
+    agents.emit(agentId, {
+      type: "turn_canceled",
+      provider: "codex",
+      turnId: "turn-1",
+      reason: "interrupted",
+    });
+  };
+  await stop();
+  await vi.waitFor(() => expect(coordinatorStop).toHaveBeenCalledTimes(1));
+  expect(closedBeforeStop).toBe(true);
+  await vi.waitFor(() =>
+    expect(publication).toEqual([
+      expect.objectContaining({ type: "thought" }),
+      expect.objectContaining({ type: "response", body: "Stopped." }),
+    ]),
+  );
+  expect(agents.interrupts).toEqual([agentId]);
+}
+
 async function exerciseRegisteredPilot(
   scenario:
     | "stop"
@@ -462,6 +584,7 @@ async function exerciseRegisteredPilot(
     | "delegation-non-owner-comment"
     | RefusalScenario,
   terminalFailure?: "failed" | "canceled" | "unconfirmed",
+  toolStepsCase?: ToolStepsCase,
 ) {
   const backend = registeredBackend(scenario);
   const { runtime, locks, cleanup } = await registeredDatabase(backend);
@@ -514,6 +637,7 @@ async function exerciseRegisteredPilot(
       linearOrganizationId: connection.linearOrganizationId,
       allowedHumanId: randomUUID(),
       profileId: profile.id,
+      ...(toolStepsCase && toolStepsCase !== "default" ? { toolSteps: true } : {}),
     };
     let initialOutcome: "failed" | "sent" | undefined;
     const pilotFailure = vi.fn(() => {
@@ -546,6 +670,10 @@ async function exerciseRegisteredPilot(
       locks,
       reportFailure: pilotFailure,
     });
+    if (toolStepsCase === "default") expect(pilot.sessionHooks.toolSteps).toBeUndefined();
+    const openToolSteps =
+      toolStepsCase === "stale" ? observeToolSteps(pilot.sessionHooks) : undefined;
+    const held = toolStepsCase === "stop" ? heldAction() : undefined;
     const agents = new FakeAgents();
     const reportCoordinatorFailure = vi.fn();
     const coordinator = new InteractiveSessionCoordinator({
@@ -575,6 +703,7 @@ async function exerciseRegisteredPilot(
       const historyReads: string[] = [];
       let originReads = 0;
       const publication: Publication = [];
+      const actionSessions: string[] = [];
       const appId = connection.providerApplicationId;
       assert(appId);
       const payload = createdPayload();
@@ -740,8 +869,18 @@ async function exerciseRegisteredPilot(
         const activity = request.variables.input;
         assert(activity);
         assert.ok([nativeSessionId, reusedSessionId].includes(activity.agentSessionId));
-        return activityResult(activity, connection.appUserId, publication);
+        return publishActivity(activity, init);
       });
+      async function publishActivity(
+        activity: Parameters<typeof activityResult>[0],
+        init: RequestInit | undefined,
+      ) {
+        if (activity.content.type === "action") {
+          actionSessions.push(activity.agentSessionId);
+          await held?.hold(init?.signal);
+        }
+        return activityResult(activity, connection.appUserId, publication);
+      }
       const registration = createLinearRegistration({
         database,
         auth: null,
@@ -873,8 +1012,8 @@ async function exerciseRegisteredPilot(
           );
           expect(bindings).toHaveLength(1);
           expect(bindingLookups).toBeGreaterThan(0);
-          expect(publication.map(({ type, body }) => ({ type, body }))).toEqual([
-            { type: "thought", body: "Paseo Hub received your request." },
+          expect(publication).toEqual([
+            expect.objectContaining({ type: "thought", body: "Paseo Hub received your request." }),
           ]);
           expect(agents.creations).toHaveLength(1);
           expect(agents.sends).toHaveLength(1);
@@ -885,6 +1024,28 @@ async function exerciseRegisteredPilot(
         }
         const send = agents.sends.at(-1);
         assert(send);
+        await exerciseStartedTurn(endpoint, send);
+      }
+
+      async function exerciseStartedTurn(
+        endpoint: Endpoint,
+        send: NonNullable<ReturnType<typeof agents.sends.at>>,
+      ) {
+        if (held) {
+          await assertStopClosesToolSteps({
+            agents,
+            coordinator,
+            agentId: send.agentId,
+            action: held,
+            stop: () => deliver(endpoint, prompted(stopId, at(6), null)),
+            publication,
+          });
+          return;
+        }
+        if (toolStepsCase === "default" || toolStepsCase === "publish") {
+          await assertFirstToolStep(send.agentId, toolStepsCase);
+          return;
+        }
         await exerciseAfterStart(endpoint, send);
       }
 
@@ -955,25 +1116,13 @@ async function exerciseRegisteredPilot(
           expect(publication).toEqual(expected);
           return;
         }
-        agents.emit(
-          send.agentId,
-          {
-            type: "timeline",
-            provider: "codex",
-            turnId: "turn-1",
-            item: {
-              type: "assistant_message",
-              text: "Synthetic final answer",
-              messageId: "answer",
-            },
-          },
-          { epoch: "turn-1", seq: 2 },
-        );
-        agents.emit(send.agentId, { type: "turn_completed", provider: "codex", turnId: "turn-1" });
+        completePilotTurn(agents, send.agentId, "turn-1");
         await vi.waitFor(() =>
           expect(publication.map(({ type }) => type)).toEqual(["thought", "response"]),
         );
-        assert.match(publication[1]?.body ?? "", /Synthetic final answer/u);
+        const firstAnswer = publication[1];
+        assert(firstAnswer?.type === "response");
+        assert.match(firstAnswer.body, /Synthetic final answer/u);
         if (scenario === "delegation") {
           expect(send.text).toBe("Work on TEST-1: Check delegation\n\nUse this description.");
           expect(originReads).toBe(1);
@@ -1082,6 +1231,10 @@ async function exerciseRegisteredPilot(
           },
           { timeout: 5_000 },
         );
+        if (openToolSteps) {
+          await assertStaleToolStep(openToolSteps, send.agentId, fresh.agentId);
+          return;
+        }
         assert.equal((await endpoint.handle(signedDelivery(followUp))).status, 200);
         assert.equal(
           (await endpoint.handle(signedDelivery(prompted(randomUUID(), freshTurnAt, null)))).status,
@@ -1270,7 +1423,57 @@ async function exerciseRegisteredPilot(
         expect(publication).toHaveLength(5);
         expect(legacy).not.toHaveBeenCalled();
       }
+
+      async function assertStaleToolStep(
+        open: ReturnType<typeof observeToolSteps>,
+        staleAgentId: string,
+        freshAgentId: string,
+      ) {
+        const [first, second] = open.mock.calls;
+        assert(first && second);
+        expect(second[0].sessionId).not.toBe(first[0].sessionId);
+        expect(open(first[0])).toBeUndefined();
+        emitToolStep(agents, staleAgentId, "turn-1");
+        emitToolStep(agents, freshAgentId, "turn-2");
+        await vi.waitFor(() =>
+          expect(publication[2]).toMatchObject({
+            type: "action",
+            id: expectedToolActionId(nativeSessionId, followUpId),
+          }),
+        );
+        completePilotTurn(agents, freshAgentId, "turn-2", 3);
+        await vi.waitFor(() =>
+          expect(publication.map(({ type }) => type)).toEqual([
+            "thought",
+            "response",
+            "action",
+            "response",
+          ]),
+        );
+        expect(actionSessions).toEqual([nativeSessionId]);
+      }
+
+      async function assertFirstToolStep(agentId: string, mode: "default" | "publish") {
+        emitToolStep(agents, agentId, "turn-1");
+        if (mode === "publish") {
+          await vi.waitFor(() =>
+            expect(publication[1]).toEqual({
+              id: expectedToolActionId(nativeSessionId, nativeSessionId),
+              type: "action",
+              action: "Read",
+              parameter: "outside workspace",
+            }),
+          );
+        }
+        completePilotTurn(agents, agentId, "turn-1", 3);
+        const expectedTypes =
+          mode === "publish" ? ["thought", "action", "response"] : ["thought", "response"];
+        await vi.waitFor(() => expect(publication.map(({ type }) => type)).toEqual(expectedTypes));
+        expect(publication.at(-1)).toMatchObject({ body: "Synthetic final answer" });
+        expect(actionSessions).toEqual(mode === "publish" ? [nativeSessionId] : []);
+      }
     } finally {
+      held?.release();
       await pilot.stop();
       await coordinator.stopAccepting();
     }
@@ -1282,6 +1485,17 @@ async function exerciseRegisteredPilot(
     }
   }
 }
+
+test.each([
+  { mode: "default", behavior: "does not publish completed tool calls by default" },
+  { mode: "publish", behavior: "publishes one sanitized tool call before the first answer" },
+  { mode: "stop", behavior: "aborts a pending tool step before calling coordinator Stop" },
+  { mode: "stale", behavior: "rejects tool calls from the previous turn after a fresh follow-up" },
+] as const)(
+  "the registered Linear pilot $behavior",
+  ({ mode }) => exerciseRegisteredPilot("stop", undefined, mode),
+  120_000,
+);
 
 test(
   "the registered Linear pilot publishes the first answer, advances a capacity-one profile and stops only the fresh turn",
