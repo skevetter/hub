@@ -5,6 +5,8 @@ import { test as browserTest } from "./app.js";
 import { seedDaemonProfile } from "./helpers/hx-daemons.js";
 import type { PaseoHub } from "./helpers/hub.js";
 
+declare function reportReaderChange(view: string): Promise<void>;
+
 const test = browserTest.extend<{ interactiveSessions: boolean; sessionRuntime: void }>({
   interactiveSessions: [true, { option: true }],
   sessionRuntime: [
@@ -44,23 +46,22 @@ for (const screen of ["list", "detail"] as const) {
     test.setTimeout(90_000);
     await watchSessionTitle(page);
     const { list, detail } = await seedPrivateSession(hub);
+    await hub.signOut("owner");
+    await signInReader(hub, page, owner);
     const url = screen === "list" ? list : detail;
     await page.goto(url);
+    await expect(page.getByRole("button", { name: owner.email, exact: true })).toBeVisible();
     await expect(page.getByText(sessionTitle, { exact: true }).first()).toBeVisible();
     await capture(page, screen, "01-reader-a");
 
-    const initialDocument = await page.evaluate(() => {
-      sessionStorage.setItem("watchPrivateSession", "true");
-      return sessionStorage.getItem("readerDocument");
-    });
-    await expectOldDocumentCleared(page, url, initialDocument);
+    const initialDocument = await expectOldDocumentCleared(page, url);
     await expect(page.getByRole("form", { name: "Sign in" })).toBeVisible();
     await expect(page).toHaveURL(url);
     await expect.poll(() => documentId(page)).not.toBe(initialDocument);
     const signedOutDocument = await documentId(page);
     await capture(page, screen, "02-signed-out");
 
-    await signInMember(hub, page);
+    await signInReader(hub, page, member);
     await expect(page).toHaveURL(url);
     await expect.poll(() => documentId(page)).not.toBe(signedOutDocument);
     await expect(
@@ -74,7 +75,32 @@ for (const screen of ["list", "detail"] as const) {
   });
 }
 
-async function expectOldDocumentCleared(page: Page, url: string, initialDocument: string | null) {
+async function armReaderChange(page: Page) {
+  return page.evaluate((title) => {
+    const id = sessionStorage.getItem("readerDocument");
+    if (id === null) throw new Error("Original reader document ID is missing");
+    sessionStorage.setItem("watchPrivateSession", "true");
+    // Playwright waits for navigation on DOM reads, even while the request is held.
+    const observer = new MutationObserver(() => {
+      const loading = document.querySelector('main[aria-label="Loading Paseo Hub"]');
+      const signedOut = document.querySelector('form[aria-label="Sign in"]');
+      if (loading === null && signedOut === null) return;
+      const view = loading === null ? "Sign in" : "Loading";
+      const privateTitle = document.body.innerText.includes(title) ? "with" : "without";
+      void reportReaderChange(`${view} ${privateTitle} the private title`);
+      observer.disconnect();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    return id;
+  }, sessionTitle);
+}
+
+async function expectOldDocumentCleared(page: Page, url: string) {
+  let oldView: string | undefined;
+  await page.exposeFunction("reportReaderChange", (view: string) => {
+    oldView = view;
+  });
+  const initialDocument = await armReaderChange(page);
   let release = () => {};
   const released = new Promise<void>((resolve) => {
     release = resolve;
@@ -90,14 +116,16 @@ async function expectOldDocumentCleared(page: Page, url: string, initialDocument
   try {
     await page.getByRole("button", { name: owner.email, exact: true }).click();
     await page.getByRole("menuitem", { name: "Sign out" }).click({ noWaitAfter: true });
+    await expect.poll(() => oldView).toBeDefined();
+    expect(oldView, "the original document must show Loading before it is replaced").toBe(
+      "Loading without the private title",
+    );
     await expect.poll(() => navigationHeld).toBe(true);
-    expect(await documentId(page)).toBe(initialDocument);
-    await expect(page.getByRole("main", { name: "Loading Paseo Hub" })).toBeVisible();
-    await expect(page.getByText(sessionTitle, { exact: true })).toHaveCount(0);
   } finally {
     release();
-    await page.unroute(url);
+    if (!page.isClosed()) await page.unrouteAll({ behavior: "ignoreErrors" });
   }
+  return initialDocument;
 }
 
 async function seedPrivateSession(hub: PaseoHub) {
@@ -156,7 +184,7 @@ async function watchSessionTitle(page: Page) {
   }, sessionTitle);
 }
 
-async function signInMember(hub: PaseoHub, page: Page) {
+async function signInReader(hub: PaseoHub, page: Page, account: typeof owner) {
   const serverFunctions = "**/_serverFn/**";
   let signingIn = true;
   await page.route(serverFunctions, async (route) => {
@@ -169,15 +197,16 @@ async function signInMember(hub: PaseoHub, page: Page) {
        from "user" join member on member.user_id = "user".id
        where session.user_id = "user".id and session.active_organization_id is null
        and "user".email = $1`,
-      [member.email],
+      [account.email],
     );
     await route.fulfill({ response });
   });
   const form = page.getByRole("form", { name: "Sign in" });
-  await form.getByLabel("Email").fill(member.email);
-  await form.getByLabel("Password").fill(member.password);
+  await form.getByLabel("Email").fill(account.email);
+  await form.getByLabel("Password").fill(account.password);
   await form.getByRole("button", { name: "Sign in", exact: true }).click();
-  await expect(page.getByRole("button", { name: member.email, exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: account.email, exact: true })).toBeVisible();
+  await page.unroute(serverFunctions);
 }
 
 function documentId(page: Page) {
