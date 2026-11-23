@@ -2980,7 +2980,9 @@ class HubUser {
     });
     await dialog.getByRole("button", { name: "Copy API key" }).click();
     // `CopyField` announces the copy in its own words, the same on every surface that copies.
-    await expect(dialog.getByRole("status")).toHaveText("Copied Generated API key");
+    await expect(
+      dialog.getByRole("status").filter({ hasText: "Copied Generated API key" }),
+    ).toHaveText("Copied Generated API key");
     await expect(this.page.evaluate(() => navigator.clipboard.readText())).resolves.toMatch(
       /^paseo_pk_/u,
     );
