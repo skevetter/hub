@@ -269,6 +269,14 @@ function readPrompted(scope: Scope): LinearPilotIntakeResult {
     return refuse("activity_mismatch");
   }
   if (!isOwner(scope, humanId)) return refuse("not_owner");
+  return readOwnedActivity(scope, activity, { humanId, activityId });
+}
+
+function readOwnedActivity(
+  scope: Scope,
+  activity: Record_,
+  { humanId, activityId }: { humanId: string; activityId: string },
+): LinearPilotIntakeResult {
   const signal = field(activity, "signal");
   // Stop is decided before any body requirement: it must work with absent or odd content.
   if (signal === "stop") {
@@ -417,6 +425,10 @@ export async function classifyLinearPilotCompanionComment(input: {
   }
   const handle = normalizeHandle(await input.resolveHandle());
   if (handle === undefined) return { suppress: false, reason: "handle_unusable" };
+  return classifyPilotHandle(body, handle);
+}
+
+function classifyPilotHandle(body: string, handle: string): LinearPilotCompanionDecision {
   const token = new RegExp(`@${escapeRegExp(handle)}`, "giu");
   // Cheap raw pass first: most comments never name the app, and the parser is the costly step.
   if (!hasHandleToken(body, token)) return { suppress: false, reason: "no_handle" };

@@ -171,9 +171,10 @@ async function finishDelegation(
     case "origin_reused":
       logPilotRefusal(claim, metadata);
       return refuseDelegation(context, activity, { ...matched, refusal: claim });
-    default:
+    case "not_claimed":
       return logPilotRefusal("admission_not_claimed", metadata);
   }
+  return undefined;
 }
 
 async function refuseDelegation(

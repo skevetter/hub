@@ -77,7 +77,7 @@ interface Options {
 
 async function appendFollowUpRefusal(
   { config, runtime }: Options,
-  { installation }: Qualified,
+  { installation }: Pick<Qualified, "installation">,
   provider: Provider,
   activity: LinearPilotAcceptedEvent,
 ) {
@@ -448,329 +448,430 @@ async function acknowledgeCreated(
   });
 }
 
-export function createLinearPilotRuntime(options: Options) {
-  const { config, database, runtime, locks } = options;
-  const bindings = new PilotBindings(runtime, locks, database);
-  const withSession = createPilotSessionSerialization();
-  const pending: PendingStarts = new Map();
-  const active = new Map<string, Active>();
-  const jobs = new Set<Promise<void>>();
-  let coordinator: InteractiveSessionCoordinator | undefined;
-  let accepting = true;
+interface RuntimeState {
+  options: Options;
+  bindings: PilotBindings;
+  withSession: ReturnType<typeof createPilotSessionSerialization>;
+  pending: PendingStarts;
+  active: Map<string, Active>;
+  jobs: Set<Promise<void>>;
+  accepting: boolean;
+  coordinator?: InteractiveSessionCoordinator;
+}
 
-  function reportFailure(failure: PilotFailure): void {
-    logRuntimeFailure(failure);
-    try {
-      options.reportFailure?.(failure);
-    } catch {}
-  }
+interface RuntimeDelivery {
+  qualified: Qualified;
+  provider: Provider;
+  receivedAt: Date;
+  sessions: InteractiveSessionCoordinator;
+}
 
-  function eventScope({ event, installation }: Qualified) {
-    const authority: PilotAuthority = {
-      ...installation,
-      profileId: config.profileId,
-      humanProviderUserId: config.allowedHumanId,
-      teamIds: [event.teamId],
-    };
-    const origin: PilotNativeOrigin = {
-      nativeSessionId: event.nativeSessionId,
-      issueId: event.issueId,
-      teamId: event.teamId,
-      actorProviderUserId: event.humanId,
-    };
-    const principal = {
-      organizationId: installation.organizationId,
-      userId: installation.ownerUserId,
-      role: "owner" as const,
-    };
-    return { authority, origin, principal };
-  }
+function reportRuntimeFailure(state: RuntimeState, failure: PilotFailure): void {
+  logRuntimeFailure(failure);
+  try {
+    state.options.reportFailure?.(failure);
+  } catch {}
+}
 
-  function acceptedActivity(
-    { event, installation }: Qualified,
-    kind: LinearPilotAcceptedEvent["kind"],
-    interactionId: string,
-    receivedAt: Date,
-  ): LinearPilotAcceptedEvent {
-    return {
-      kind,
-      decision: "accepted",
-      binding: connectionBinding(installation),
-      nativeSessionId: event.nativeSessionId,
-      interactionId,
-      receivedAt: receivedAt.getTime(),
-      actorProviderUserId: event.humanId,
-      allowedHumanProviderUserId: config.allowedHumanId,
-      publishAnswer: true,
-    };
-  }
+function eventScope(config: LinearPilotConfig, { event, installation }: Qualified) {
+  const authority: PilotAuthority = {
+    ...installation,
+    profileId: config.profileId,
+    humanProviderUserId: config.allowedHumanId,
+    teamIds: [event.teamId],
+  };
+  const origin: PilotNativeOrigin = {
+    nativeSessionId: event.nativeSessionId,
+    issueId: event.issueId,
+    teamId: event.teamId,
+    actorProviderUserId: event.humanId,
+  };
+  const principal = {
+    organizationId: installation.organizationId,
+    userId: installation.ownerUserId,
+    role: "owner" as const,
+  };
+  return { authority, origin, principal };
+}
 
-  async function dispatchCreated(
-    qualified: Qualified,
-    provider: Provider,
-    receivedAt: Date,
-    sessions: InteractiveSessionCoordinator,
-  ) {
-    const { event } = qualified;
-    const { nativeSessionId } = event;
-    const scope = eventScope(qualified);
-    const refusal = (reason: string) => logPilotRefusal(reason, createdMetadata(nativeSessionId));
-    const report = (failureCode: PilotFailure["failureCode"]) =>
-      reportFailure({ sessionId: nativeSessionId, failureCode, operation: "created" });
-    const context = {
-      qualified,
-      provider,
-      config,
-      database: runtime,
-      deadline: receivedAt.getTime() + PILOT_ACK_MS,
-      accepting: () => accepting,
-    };
-    const activity = acceptedActivity(qualified, "created", nativeSessionId, receivedAt);
+function acceptedActivity(
+  config: LinearPilotConfig,
+  { event, installation }: Qualified,
+  {
+    kind,
+    interactionId,
+    receivedAt,
+  }: { kind: LinearPilotAcceptedEvent["kind"]; interactionId: string; receivedAt: Date },
+): LinearPilotAcceptedEvent {
+  return {
+    kind,
+    decision: "accepted",
+    binding: connectionBinding(installation),
+    nativeSessionId: event.nativeSessionId,
+    interactionId,
+    receivedAt: receivedAt.getTime(),
+    actorProviderUserId: event.humanId,
+    allowedHumanProviderUserId: config.allowedHumanId,
+    publishAnswer: true,
+  };
+}
 
-    await withSession(scope.authority, scope.origin, async () => {
-      if (!canAcknowledge(context)) return refusal("ack_window_closed");
-      const prior = await bindings.find(scope.authority, scope.origin);
-      if (prior.status === "refused") return report(prior.reason);
-      if (prior.status !== "none") return refusal("duplicate");
-      const message = await prepareCreated(context, receivedAt, activity);
-      if (message !== undefined)
-        await startCreated(
-          { message, qualified, scope, activity, provider, sessions },
-          {
-            bindings,
-            pending,
-            active,
-            writerFor,
-            reportFailure,
-            accepting: context.accepting,
-          },
-        );
+async function dispatchCreated(
+  state: RuntimeState,
+  { qualified, provider, receivedAt, sessions }: RuntimeDelivery,
+) {
+  const { bindings, withSession } = state;
+  const { config, runtime } = state.options;
+  const { event } = qualified;
+  const { nativeSessionId } = event;
+  const scope = eventScope(config, qualified);
+  const refusal = (reason: string) => logPilotRefusal(reason, createdMetadata(nativeSessionId));
+  const report = (failureCode: PilotFailure["failureCode"]) =>
+    reportRuntimeFailure(state, { sessionId: nativeSessionId, failureCode, operation: "created" });
+  const context = {
+    qualified,
+    provider,
+    config,
+    database: runtime,
+    deadline: receivedAt.getTime() + PILOT_ACK_MS,
+    accepting: () => state.accepting,
+  };
+  const activity = acceptedActivity(config, qualified, {
+    kind: "created",
+    interactionId: nativeSessionId,
+    receivedAt,
+  });
+
+  await withSession(scope.authority, scope.origin, async () => {
+    if (!canAcknowledge(context)) return refusal("ack_window_closed");
+    const prior = await bindings.find(scope.authority, scope.origin);
+    if (prior.status === "refused") return report(prior.reason);
+    if (prior.status !== "none") return refusal("duplicate");
+    const message = await prepareCreated(context, receivedAt, activity);
+    if (message !== undefined)
+      await startCreated(
+        { message, qualified, scope, activity, provider, sessions },
+        {
+          bindings,
+          pending: state.pending,
+          active: state.active,
+          writerFor: (grant) => runtimeWriter(state, grant),
+          reportFailure: (failure) => reportRuntimeFailure(state, failure),
+          accepting: context.accepting,
+        },
+      );
+  });
+}
+
+function clientFor(state: RuntimeState, grant: Active, activity = grant.activity) {
+  const {
+    bindings,
+    options: { database },
+  } = state;
+  const permitsOperation = (operation: Readonly<LinearAgentOperation>) =>
+    state.accepting &&
+    "sessionId" in operation &&
+    operation.sessionId === activity.nativeSessionId &&
+    (!("issueId" in operation) || operation.issueId === grant.origin.issueId) &&
+    operation.kind !== "addHubUrl" &&
+    operation.kind !== "readDelegationOrigin";
+  return grant.provider.activityClient({
+    binding: activity.binding,
+    authorize: async (_binding, operation) => {
+      if (!permitsOperation(operation)) return false;
+      const found = await database.findInteractiveSession(
+        grant.authority.organizationId,
+        grant.sessionId,
+      );
+      return (
+        found !== undefined &&
+        (await authorizeBoundPilotTurn(bindings.find, grant, found.session, grant.commandId))
+      );
+    },
+    authorizeRefresh: async (query, _binding, operation) =>
+      permitsOperation(operation) &&
+      (await authorizePilotTurnRefresh(query, bindings.find, grant)) &&
+      state.accepting,
+  });
+}
+
+function runtimeWriter(state: RuntimeState, grant: Active) {
+  return createLinearPilotActivities({
+    clientFor(activity) {
+      const client = clientFor(state, grant, activity);
+      return tracePilotActivities(client, (operation, error) =>
+        reportRuntimeFailure(state, {
+          sessionId: activity.nativeSessionId,
+          ...pilotExceptionFields(error),
+          operation,
+        }),
+      );
+    },
+  });
+}
+
+async function boundLiveSession(
+  state: RuntimeState,
+  { qualified, provider, receivedAt }: Omit<RuntimeDelivery, "sessions">,
+  { authority, origin }: CreatedScope,
+): Promise<BoundLiveSession | undefined> {
+  const {
+    bindings,
+    active,
+    options: { config, runtime, database },
+  } = state;
+  const found = await bindings.find(authority, origin);
+  if (found.status === "refused") {
+    reportRuntimeFailure(state, {
+      sessionId: origin.nativeSessionId,
+      failureCode: found.reason,
+      operation: qualified.event.kind,
     });
   }
-
-  function clientFor(grant: Active, activity = grant.activity) {
-    const permitsOperation = (operation: Readonly<LinearAgentOperation>) =>
-      accepting &&
-      "sessionId" in operation &&
-      operation.sessionId === activity.nativeSessionId &&
-      (!("issueId" in operation) || operation.issueId === grant.origin.issueId) &&
-      operation.kind !== "addHubUrl" &&
-      operation.kind !== "readDelegationOrigin";
-    return grant.provider.activityClient({
-      binding: activity.binding,
-      authorize: async (_binding, operation) => {
-        if (!permitsOperation(operation)) return false;
-        const found = await database.findInteractiveSession(
-          grant.authority.organizationId,
-          grant.sessionId,
-        );
-        return (
-          found !== undefined &&
-          (await authorizeBoundPilotTurn(bindings.find, grant, found.session, grant.commandId))
-        );
-      },
-      authorizeRefresh: async (query, _binding, operation) =>
-        permitsOperation(operation) &&
-        (await authorizePilotTurnRefresh(query, bindings.find, grant)) &&
-        accepting,
-    });
-  }
-
-  function writerFor(grant: Active) {
-    return createLinearPilotActivities({
-      clientFor(activity) {
-        const client = clientFor(grant, activity);
-        return tracePilotActivities(client, (operation, error) =>
-          reportFailure({
-            sessionId: activity.nativeSessionId,
-            ...pilotExceptionFields(error),
-            operation,
-          }),
-        );
-      },
-    });
-  }
-
-  async function boundLiveSession(
-    qualified: Qualified,
-    provider: Provider,
-    receivedAt: Date,
-    authority: PilotAuthority,
-    origin: PilotNativeOrigin,
-  ): Promise<BoundLiveSession | undefined> {
-    const found = await bindings.find(authority, origin);
-    if (found.status === "refused") {
-      reportFailure({
-        sessionId: origin.nativeSessionId,
-        failureCode: found.reason,
-        operation: qualified.event.kind,
-      });
-    }
-    if (found.status !== "bound") return undefined;
-    const { binding } = found;
-    const stored = await database.findInteractiveSession(
-      authority.organizationId,
-      binding.sessionId,
-    );
-    if (stored === undefined) return undefined;
-    const { session } = stored;
-    const {
-      rows: [first],
-    } = await runtime.query<{ id: string }>(
-      `select id from interactive_session_commands
+  if (found.status !== "bound") return undefined;
+  const { binding } = found;
+  const stored = await database.findInteractiveSession(authority.organizationId, binding.sessionId);
+  if (stored === undefined) return undefined;
+  const { session } = stored;
+  const {
+    rows: [first],
+  } = await runtime.query<{ id: string }>(
+    `select id from interactive_session_commands
         where organization_id = $1 and session_id = $2 and ordinal = 1
           and generation = $3 and kind = 'message' and status = 'delivered'
           and author_user_id = $4`,
-      [session.organizationId, session.id, session.generation, authority.ownerUserId],
-    );
-    if (!first) return undefined;
-    const live = active.get(session.id);
-    const kind = session.startIdempotencyKey === origin.nativeSessionId ? "created" : "prompted";
-    const grant = live ?? {
-      authority,
-      origin,
-      provider,
-      activity: acceptedActivity(qualified, kind, session.startIdempotencyKey, receivedAt),
-      sessionId: session.id,
-      commandId: first.id,
-      bindingGeneration: binding.generation,
-      profileVersion: session.profileVersion,
-    };
-    if (
-      !(await authorizeBoundPilotTurn(bindings.find, grant, session, first.id, binding.generation))
-    )
-      return undefined;
-    return { binding, session, grant };
-  }
+    [session.organizationId, session.id, session.generation, authority.ownerUserId],
+  );
+  if (!first) return undefined;
+  const live = active.get(session.id);
+  const kind = session.startIdempotencyKey === origin.nativeSessionId ? "created" : "prompted";
+  const grant = live ?? {
+    authority,
+    origin,
+    provider,
+    activity: acceptedActivity(config, qualified, {
+      kind,
+      interactionId: session.startIdempotencyKey,
+      receivedAt,
+    }),
+    sessionId: session.id,
+    commandId: first.id,
+    bindingGeneration: binding.generation,
+    profileVersion: session.profileVersion,
+  };
+  if (!(await authorizeBoundPilotTurn(bindings.find, grant, session, first.id, binding.generation)))
+    return undefined;
+  return { binding, session, grant };
+}
 
-  async function dispatchFollowUp(
-    qualified: Qualified,
-    provider: Provider,
-    receivedAt: Date,
-    sessions: InteractiveSessionCoordinator,
-  ) {
-    const { event, installation } = qualified;
-    const { kind } = event;
-    if (kind === "created") return;
-    const signed = adaptSignedPilotFollowUp(event, installation);
-    if (!signed)
-      return reportFollowUpOutcome({
-        nativeSessionId: event.nativeSessionId,
-        operation: kind,
-        outcome: "ignored",
-        reason: "invalid_event",
-      });
-    const eventContext = eventScope(qualified);
-    const { authority, origin } = eventContext;
-    const scope = followUpScope(qualified, config.allowedHumanId);
-    const history: PilotHistoryScope = {
-      sessionId: origin.nativeSessionId,
-      issueId: origin.issueId,
-      appUserId: authority.appUserId,
-      allowedHumanProviderUserId: config.allowedHumanId,
-    };
-    let current: BoundLiveSession | undefined;
-    const report = (failureCode: PilotFailure["failureCode"]) =>
-      reportFailure({ sessionId: origin.nativeSessionId, failureCode, operation: kind });
-    const actions: FollowUpActions = {
-      scope: eventContext,
-      installation,
-      provider,
-      sessions,
-      bindings,
-      active,
-      pending,
-      accepting: () => accepting,
-      activity: (activityKind, id) => acceptedActivity(qualified, activityKind, id, receivedAt),
-      writerFor,
-      report,
-    };
-    const run = createPilotFollowUp({
-      withSession: (_scope, operation) => withSession(authority, origin, operation),
-      activityIds: pilotActivityIds,
-      reportFailure,
-      reportOutcome: reportFollowUpOutcome,
-      current: async (): Promise<PilotTurn | undefined> => {
-        if (!accepting) return undefined;
-        current = await boundLiveSession(qualified, provider, receivedAt, authority, origin);
-        return (
-          current && projectFollowUpTurn(scope, current, active.get(current.session.id), sessions)
-        );
-      },
-      claim: async ({ activityId }) => {
-        const admitted = await recordLinearPilotAdmission(runtime, {
-          ...installation,
-          profileId: config.profileId,
-          kind,
-          humanId: event.humanId,
-          nativeSessionId: origin.nativeSessionId,
-          activityId,
-          receivedAt,
-        });
-        return admitted ? "claimed" : "duplicate";
-      },
-      appendBusy: async ({ activityId }) => {
-        if (!current) return false;
-        const activity = acceptedActivity(qualified, "prompted", activityId, receivedAt);
-        return (
-          (await writerFor(current.grant).busy(activity, "first-attempt")).disposition ===
-          "confirmed"
-        );
-      },
-      appendRefusal: ({ activityId }) =>
-        appendFollowUpRefusal(
-          options,
-          qualified,
-          provider,
-          acceptedActivity(qualified, "prompted", activityId, receivedAt),
-        ),
-      confirmStop: async (_scope, activityId) =>
-        current !== undefined &&
-        clientFor(current.grant).isActivityConfirmed({
-          sessionId: origin.nativeSessionId,
-          activityId,
-          kind: "response",
-        }),
-      readPrompt: async (_scope, expected) =>
-        current && clientFor(current.grant).readPilotPrompt(history, expected),
-      readHistory: async (_scope, anchor) =>
-        current && clientFor(current.grant).readPilotHistory(history, anchor.createdAt),
-      secrets: async () => options.scrubValues ?? [],
-      reserve: ({ activityId }) => reserveFollowUp(actions, current, activityId),
-      stopCurrent: (request) => stopFollowUpTurn(actions, current, request),
+async function dispatchFollowUp(state: RuntimeState, delivery: RuntimeDelivery) {
+  const { qualified } = delivery;
+  const { event, installation } = qualified;
+  const { kind } = event;
+  if (kind === "created") return;
+  const signed = adaptSignedPilotFollowUp(event, installation);
+  if (!signed)
+    return reportFollowUpOutcome({
+      nativeSessionId: event.nativeSessionId,
+      operation: kind,
+      outcome: "ignored",
+      reason: "invalid_event",
     });
-    await run(scope, signed);
-  }
+  const actions = followUpActions(state, delivery, kind);
+  const scope = followUpScope(qualified, state.options.config.allowedHumanId);
+  const run = createPilotFollowUp(followUpOptions(state, delivery, actions));
+  await run(scope, signed);
+}
 
-  const sessionHooks: LinearPilotSessionHooks = {
-    async authorizeStart(principal, input) {
-      const grant = pending.get(input.idempotencyKey);
-      if (
-        !accepting ||
-        !grant ||
-        principal.organizationId !== config.hubOrganizationId ||
-        principal.userId !== grant.installation.ownerUserId ||
-        principal.role !== "owner" ||
-        input.profileId !== config.profileId ||
-        input.profileVersion !== grant.installation.profileVersion ||
-        input.nativeRequester.identityId !== grant.identityId ||
-        input.nativeRequester.workspaceId !== config.linearOrganizationId
-      )
-        return false;
-      const current = await resolveLinearPilotInstallation(
-        runtime,
-        config,
-        grant.installation.oauthClientId,
-      );
+function followUpActions(
+  state: RuntimeState,
+  { qualified, provider, receivedAt, sessions }: RuntimeDelivery,
+  kind: "prompted" | "stop",
+): FollowUpActions {
+  const {
+    options: { config },
+    active,
+    pending,
+    bindings,
+  } = state;
+  const { installation } = qualified;
+  const eventContext = eventScope(config, qualified);
+  const { origin } = eventContext;
+  const report = (failureCode: PilotFailure["failureCode"]) =>
+    reportRuntimeFailure(state, {
+      sessionId: origin.nativeSessionId,
+      failureCode,
+      operation: kind,
+    });
+  return {
+    scope: eventContext,
+    installation,
+    provider,
+    sessions,
+    bindings,
+    active,
+    pending,
+    accepting: () => state.accepting,
+    activity: (activityKind, id) =>
+      acceptedActivity(config, qualified, { kind: activityKind, interactionId: id, receivedAt }),
+    writerFor: (grant) => runtimeWriter(state, grant),
+    report,
+  };
+}
+
+function followUpOptions(
+  state: RuntimeState,
+  { qualified, provider, receivedAt, sessions }: RuntimeDelivery,
+  actions: FollowUpActions,
+): PilotFollowUpOptions {
+  const {
+    options: { config, runtime },
+    active,
+    withSession,
+  } = state;
+  const { event, installation } = qualified;
+  const { scope: eventContext } = actions;
+  const { authority, origin } = eventContext;
+  const scope = followUpScope(qualified, config.allowedHumanId);
+  const history: PilotHistoryScope = {
+    sessionId: origin.nativeSessionId,
+    issueId: origin.issueId,
+    appUserId: authority.appUserId,
+    allowedHumanProviderUserId: config.allowedHumanId,
+  };
+  let current: BoundLiveSession | undefined;
+  return {
+    withSession: (_scope, operation) => withSession(authority, origin, operation),
+    activityIds: pilotActivityIds,
+    reportFailure: (failure) => reportRuntimeFailure(state, failure),
+    reportOutcome: reportFollowUpOutcome,
+    current: async (): Promise<PilotTurn | undefined> => {
+      if (!state.accepting) return undefined;
+      current = await boundLiveSession(state, { qualified, provider, receivedAt }, eventContext);
       return (
-        current?.connectionId === grant.installation.connectionId &&
-        current.appUserId === grant.installation.appUserId &&
-        current.ownerUserId === principal.userId &&
-        current.profileVersion === input.profileVersion
+        current && projectFollowUpTurn(scope, current, active.get(current.session.id), sessions)
       );
     },
+    claim: async ({ activityId }) => {
+      const admitted = await recordLinearPilotAdmission(runtime, {
+        ...installation,
+        profileId: config.profileId,
+        kind: event.kind === "stop" ? "stop" : "prompted",
+        humanId: event.humanId,
+        nativeSessionId: origin.nativeSessionId,
+        activityId,
+        receivedAt,
+      });
+      return admitted ? "claimed" : "duplicate";
+    },
+    ...followUpResponses(state, actions, () => current, history),
+  };
+}
+
+function followUpResponses(
+  state: RuntimeState,
+  actions: FollowUpActions,
+  getCurrent: () => BoundLiveSession | undefined,
+  history: PilotHistoryScope,
+): Pick<
+  PilotFollowUpOptions,
+  | "appendBusy"
+  | "appendRefusal"
+  | "confirmStop"
+  | "readPrompt"
+  | "readHistory"
+  | "secrets"
+  | "reserve"
+  | "stopCurrent"
+> {
+  const { options } = state;
+  return {
+    appendBusy: async ({ activityId }) => {
+      const current = getCurrent();
+      if (!current) return false;
+      const activity = actions.activity("prompted", activityId);
+      return (
+        (await runtimeWriter(state, current.grant).busy(activity, "first-attempt")).disposition ===
+        "confirmed"
+      );
+    },
+    appendRefusal: ({ activityId }) =>
+      appendFollowUpRefusal(
+        options,
+        { installation: actions.installation },
+        actions.provider,
+        actions.activity("prompted", activityId),
+      ),
+    confirmStop: async (_scope, activityId) => {
+      const current = getCurrent();
+      return (
+        current !== undefined &&
+        clientFor(state, current.grant).isActivityConfirmed({
+          sessionId: history.sessionId,
+          activityId,
+          kind: "response",
+        })
+      );
+    },
+    readPrompt: async (_scope, expected) => {
+      const current = getCurrent();
+      return current && clientFor(state, current.grant).readPilotPrompt(history, expected);
+    },
+    readHistory: async (_scope, anchor) => {
+      const current = getCurrent();
+      return current && clientFor(state, current.grant).readPilotHistory(history, anchor.createdAt);
+    },
+    secrets: async () => options.scrubValues ?? [],
+    reserve: ({ activityId }) => reserveFollowUp(actions, getCurrent(), activityId),
+    stopCurrent: (request) => stopFollowUpTurn(actions, getCurrent(), request),
+  };
+}
+
+type StartArguments = Parameters<LinearPilotSessionHooks["authorizeStart"]>;
+
+function matchesStartGrant(
+  config: LinearPilotConfig,
+  grant: NonNullable<ReturnType<PendingStarts["get"]>>,
+  [principal, input]: StartArguments,
+) {
+  return (
+    principal.organizationId === config.hubOrganizationId &&
+    principal.userId === grant.installation.ownerUserId &&
+    principal.role === "owner" &&
+    input.profileId === config.profileId &&
+    input.profileVersion === grant.installation.profileVersion &&
+    input.nativeRequester.identityId === grant.identityId &&
+    input.nativeRequester.workspaceId === config.linearOrganizationId
+  );
+}
+
+async function authorizePilotStart(state: RuntimeState, ...[principal, input]: StartArguments) {
+  const {
+    pending,
+    options: { config, runtime },
+  } = state;
+  const grant = pending.get(input.idempotencyKey);
+  if (!state.accepting || !grant || !matchesStartGrant(config, grant, [principal, input]))
+    return false;
+  const current = await resolveLinearPilotInstallation(
+    runtime,
+    config,
+    grant.installation.oauthClientId,
+  );
+  return (
+    current?.connectionId === grant.installation.connectionId &&
+    current.appUserId === grant.installation.appUserId &&
+    current.ownerUserId === principal.userId &&
+    current.profileVersion === input.profileVersion
+  );
+}
+
+function configureSessionHooks(state: RuntimeState): LinearPilotSessionHooks {
+  const { bindings, active, withSession, options } = state;
+  return {
+    authorizeStart: (...args) => authorizePilotStart(state, ...args),
     authorize(session, commandId, expectedBindingGeneration?: number) {
-      return accepting
+      return state.accepting
         ? authorizeBoundPilotTurn(
             bindings.find,
             active.get(session.id),
@@ -784,9 +885,9 @@ export function createLinearPilotRuntime(options: Options) {
       const grant = active.get(terminal.sessionId);
       if (!grant || grant.commandId !== terminal.commandId) return;
       await withSession(grant.authority, grant.origin, async () => {
-        if (!accepting || grant.stopping || active.get(grant.sessionId) !== grant) return;
+        if (!state.accepting || grant.stopping || active.get(grant.sessionId) !== grant) return;
         try {
-          const writer = writerFor(grant);
+          const writer = runtimeWriter(state, grant);
           if (terminal.status === "completed") {
             await writer.respond(
               grant.activity,
@@ -803,11 +904,48 @@ export function createLinearPilotRuntime(options: Options) {
       });
     },
   };
+}
 
-  const registration: LinearPilotRegistration = {
+async function readCompanionHandle(state: RuntimeState, provider: Provider) {
+  const { config, runtime } = state.options;
+  const installation = await resolveLinearPilotInstallation(
+    runtime,
+    config,
+    provider.oauthClientId,
+  );
+  if (!installation) return undefined;
+  const authorizeViewer = async (query: QueryHandle, operation: LinearAgentOperation) => {
+    if (!state.accepting || operation.kind !== "viewer") return false;
+    const current = await resolveLinearPilotInstallation(query, config, provider.oauthClientId);
+    return (
+      state.accepting &&
+      current?.connectionId === installation.connectionId &&
+      current.appUserId === installation.appUserId &&
+      current.ownerUserId === installation.ownerUserId &&
+      current.profileVersion === installation.profileVersion
+    );
+  };
+  const client = provider.activityClient({
+    binding: connectionBinding(installation),
+    authorize: (_binding, operation) => authorizeViewer(runtime, operation),
+    authorizeRefresh: (query, _binding, operation) => authorizeViewer(query, operation),
+  });
+  try {
+    return (await client.readAppViewer(AbortSignal.timeout(2_000))).handle;
+  } catch {
+    return undefined;
+  }
+}
+
+function configureRegistration(state: RuntimeState): LinearPilotRegistration {
+  const {
+    jobs,
+    options: { config, runtime },
+  } = state;
+  return {
     async offer(input, provider) {
-      const sessions = coordinator;
-      if (!accepting || !sessions) {
+      const sessions = state.coordinator;
+      if (!state.accepting || !sessions) {
         logPilotRefusal("not_accepting", pilotDeliveryMetadata(input.payload));
         return false;
       }
@@ -817,11 +955,11 @@ export function createLinearPilotRuntime(options: Options) {
         provider.oauthClientId,
         input.payload,
       );
-      if (!accepting || !qualified) return false;
+      if (!state.accepting || !qualified) return false;
       const dispatch = qualified.event.kind === "created" ? dispatchCreated : dispatchFollowUp;
-      const job = dispatch(qualified, provider, input.receivedAt, sessions)
+      const job = dispatch(state, { qualified, provider, receivedAt: input.receivedAt, sessions })
         .catch((error: unknown) =>
-          reportFailure({
+          reportRuntimeFailure(state, {
             sessionId: qualified.event.nativeSessionId,
             ...pilotExceptionFields(error),
             operation: qualified.event.kind,
@@ -832,58 +970,43 @@ export function createLinearPilotRuntime(options: Options) {
       return true;
     },
     async suppressComment(event, provider) {
-      if (!accepting || !coordinator) return false;
+      if (!state.accepting || !state.coordinator) return false;
       const decision = await classifyLinearPilotCompanionComment({
         config,
         workspaceId: event.organizationId,
         authorId: event.actor?.id,
         body: event.comment.body,
-        resolveHandle: async () => {
-          const installation = await resolveLinearPilotInstallation(
-            runtime,
-            config,
-            provider.oauthClientId,
-          );
-          if (!installation) return undefined;
-          const authorizeViewer = async (query: QueryHandle, operation: LinearAgentOperation) => {
-            if (!accepting || operation.kind !== "viewer") return false;
-            const current = await resolveLinearPilotInstallation(
-              query,
-              config,
-              provider.oauthClientId,
-            );
-            return (
-              accepting &&
-              current?.connectionId === installation.connectionId &&
-              current.appUserId === installation.appUserId &&
-              current.ownerUserId === installation.ownerUserId &&
-              current.profileVersion === installation.profileVersion
-            );
-          };
-          const client = provider.activityClient({
-            binding: connectionBinding(installation),
-            authorize: (_binding, operation) => authorizeViewer(runtime, operation),
-            authorizeRefresh: (query, _binding, operation) => authorizeViewer(query, operation),
-          });
-          try {
-            return (await client.readAppViewer(AbortSignal.timeout(2_000))).handle;
-          } catch {
-            return undefined;
-          }
-        },
+        resolveHandle: () => readCompanionHandle(state, provider),
       });
       return decision.suppress || ("ambiguous" in decision && decision.ambiguous);
     },
   };
+}
 
+export function createLinearPilotRuntime(options: Options) {
+  const { database, runtime, locks } = options;
+  const bindings = new PilotBindings(runtime, locks, database);
+  const withSession = createPilotSessionSerialization();
+  const pending: PendingStarts = new Map();
+  const active = new Map<string, Active>();
+  const jobs = new Set<Promise<void>>();
+  const state: RuntimeState = {
+    options,
+    bindings,
+    withSession,
+    pending,
+    active,
+    jobs,
+    accepting: true,
+  };
   return {
-    sessionHooks,
-    registration,
+    sessionHooks: configureSessionHooks(state),
+    registration: configureRegistration(state),
     attachCoordinator(sessions: InteractiveSessionCoordinator) {
-      coordinator = sessions;
+      state.coordinator = sessions;
     },
     async stop() {
-      accepting = false;
+      state.accepting = false;
       await Promise.allSettled(jobs);
     },
   };
