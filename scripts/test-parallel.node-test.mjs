@@ -926,6 +926,10 @@ test("serial reruns keep all files from a failed shard and require complete pass
     t,
     `
     const mode = process.env.FIXTURE_RUN_MODE;
+    if (mode !== "initial") {
+      const { deepEqual } = await import("node:assert/strict");
+      deepEqual(process.argv.filter((arg) => /^--(?:test|hook|teardown)Timeout(?:=|$)/u.test(arg)), []);
+    }
     const selected = process.argv.filter((arg) => files.includes(arg));
     const b = files[1];
     const reported = mode === "missing" ? selected.filter((file) => file !== b) : selected;
@@ -972,7 +976,7 @@ test("serial reruns keep all files from a failed shard and require complete pass
   await assert.rejects(readFile(metrics), { code: "ENOENT" });
 
   const passing = run("passing", "--rerun-failed");
-  assert.equal(passing.status, 0, passing.stderr);
+  assert.equal(passing.status, 0, passing.stderr || passing.stdout);
   assert.match(passing.stdout, /Serial rerun: PASS/u);
   const saved = JSON.parse(await readFile(metrics, "utf8"));
   assert.deepEqual(saved.selectedFiles, files);
