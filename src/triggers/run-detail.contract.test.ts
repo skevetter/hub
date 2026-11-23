@@ -9,11 +9,14 @@ import { createMemoryDatabase } from "../db/memory.js";
 import { createDatabase } from "../db/pg.js";
 import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
 import type { Database } from "../db/types.js";
+import { activityRunDetailView } from "../projects/activity-run-view.js";
 import { readRunProgressSettings } from "../run-progress/settings.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { TriggerDashboard } from "./dashboard.js";
+import type { RunEventPage } from "./run-events.js";
 
 const NOW = new Date("2026-11-16T12:00:00.000Z");
+const PROMPT = `  Review the changes.\n${"x".repeat(120)}\nKeep this last line.  `;
 const memberships = ["one", "two"].map((name) => ({
   userId: "reader",
   organizationId: name,
@@ -85,7 +88,7 @@ for (const backend of ["memory", "embedded"] as const)
       await close?.();
     });
 
-    async function createRun() {
+    async function createRun(source = "manual.run", prompt = PROMPT) {
       const revision = await database.insertProjectConfigurationRevision({
         projectId,
         sourceKind: "manual",
@@ -98,7 +101,7 @@ for (const backend of ["memory", "embedded"] as const)
         organizationId: "one",
         projectId,
         deliveryId: randomUUID(),
-        source: "manual.run",
+        source,
         payload: { private: "not returned" },
         receivedAt: NOW,
       });
@@ -110,7 +113,7 @@ for (const backend of ["memory", "embedded"] as const)
           configurationRevisionId: revision.id,
           providerEventReceiptId: receipt.event.providerEventReceiptId,
           configuredTriggerName: "Review",
-          prompt: "private prompt",
+          prompt,
           inputs: {},
           triggerContext: {},
           outputContext: {},
@@ -120,7 +123,7 @@ for (const backend of ["memory", "embedded"] as const)
       ).run;
     }
 
-    it("returns the same unavailable shape for foreign and unknown runs for detail and polling", async () => {
+    it("returns the exact manual prompt only in authorized detail and keeps raw payload private", async () => {
       const run = await createRun();
       assert.equal(await dashboard.runDetail(request, "two", run.id), null);
       assert.equal(await dashboard.runDetail(request, "two", randomUUID()), null);
@@ -129,12 +132,51 @@ for (const backend of ["memory", "embedded"] as const)
       const detail = await dashboard.runDetail(request, "one", run.id);
       assert.ok(detail);
       assert.equal(detail.run.configuredTriggerName, "Review");
+      assert.equal(detail.run.prompt, PROMPT);
       assert.equal(detail.steps.length, 2);
       assert.equal(detail.progress, null);
       assert.equal(detail.progressMessagesEnabled, false);
+      assert.doesNotMatch(JSON.stringify(detail), /not returned|rawPayload|externalRef/u);
+      const page = await dashboard.runEvents(request, "one", run.id, 0);
+      assert.ok(page);
       assert.doesNotMatch(
-        JSON.stringify(detail),
-        /private prompt|not returned|rawPayload|externalRef/u,
+        JSON.stringify({ timeline: detail.timeline, page }),
+        /prompt|Keep this last line/u,
+      );
+    });
+
+    it.each([
+      { source: "slack.mention", prompt: PROMPT, expected: PROMPT },
+      { source: "webhook.received", prompt: PROMPT, expected: null },
+      { source: "manual.run", prompt: "", expected: null },
+    ])(
+      "returns the allowed prompt for $source without the raw payload",
+      async ({ source, prompt, expected }) => {
+        const run = await createRun(source, prompt);
+        const detail = await dashboard.runDetail(request, "one", run.id);
+        assert.ok(detail);
+        assert.equal(detail.run.source, source);
+        assert.equal(detail.run.prompt, expected);
+        assert.doesNotMatch(JSON.stringify(detail), /not returned|rawPayload/u);
+      },
+    );
+
+    it("hides a retained prompt if the run or receipt payload is unavailable", async () => {
+      const run = await createRun();
+      const activity = await database.findProjectActivityRun(projectId, run.id);
+      assert.ok(activity);
+      assert.equal(activity.run.prompt, PROMPT);
+      assert.equal(
+        activityRunDetailView({ ...activity, run: { ...activity.run, payloadExpiredAt: NOW } }, [])
+          .run.prompt,
+        null,
+      );
+      assert.equal(
+        activityRunDetailView(
+          { ...activity, receipt: { ...activity.receipt, payloadExpiryState: "expiring" } },
+          [],
+        ).run.prompt,
+        null,
       );
     });
 
@@ -174,9 +216,7 @@ for (const backend of ["memory", "embedded"] as const)
         origin: "captured",
       });
       const sealed = await dashboard.runEvents(request, "one", run.id, 103);
-      assert.equal(sealed?.sealedSeq, 104);
-      assert.equal(sealed?.origin, "derived");
-      assert.equal(sealed?.events[0]?.kind, "run_finished");
+      assertSealedPage(sealed);
     });
 
     it("distinguishes unavailable capture-off timelines from retained and reconcilable rows", async () => {
@@ -246,3 +286,9 @@ for (const backend of ["memory", "embedded"] as const)
       assert.equal((await reader.runEvents(request, "one", run.id, 0))?.expired, true);
     });
   });
+
+function assertSealedPage(page: RunEventPage | null) {
+  assert.equal(page?.sealedSeq, 104);
+  assert.equal(page?.origin, "derived");
+  assert.equal(page?.events[0]?.kind, "run_finished");
+}

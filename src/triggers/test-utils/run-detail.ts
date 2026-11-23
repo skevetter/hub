@@ -21,6 +21,7 @@ export const runDetailFixture: RunDetailSnapshot = {
     repo: "example/service",
     receivedAt: "2026-11-16T10:00:00.000Z",
     configuredTriggerName: "Review changes",
+    prompt: null,
     createdAt: "2026-11-16T10:00:00.000Z",
     completedAt: null,
     outcome: "accepted",

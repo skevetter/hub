@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import type { AuthServer } from "../auth/server.js";
 import { createMemoryDatabase } from "../db/memory.js";
+import type { TriggerSummary } from "./activity-summary.js";
 import { ProjectDashboard } from "./dashboard.js";
 
 describe("project dashboard activity read models", () => {
@@ -192,13 +193,13 @@ describe("project dashboard activity read models", () => {
     });
     assert.ok(organizationDetail);
     assert.equal(organizationDetail.run.id, run.run.id);
+    assert.equal(organizationDetail.run.prompt, "run");
     for (const key of [
       "rawPayload",
       "triggerContext",
       "outputContext",
       "inputs",
       "values",
-      "prompt",
       "deliveryId",
       "providerEventReceiptId",
     ]) {
@@ -324,16 +325,11 @@ describe("project dashboard activity read models", () => {
       runId: run.id,
     });
     assert.ok(detail);
+    assert.equal(detail.run.prompt, null);
     for (const activity of [list.activity[0]!, detail.run, legacyDetail.activity]) {
       assert.equal(activity.provider, "manual");
       assert.equal(activity.source, "webhook.received");
-      assert.equal(activity.webhookSummary?.headline, "Webhook from ci-partner");
-      assert.equal(activity.webhookSummary?.actor, "ci-partner");
-      assert.equal(activity.webhookSummary?.triggerName, "build-finished");
-      assert.equal(activity.webhookSummary?.prompt?.length, 120);
-      assert.equal(activity.webhookSummary?.prompt?.slice(0, 119), "x".repeat(119));
-      assert.equal(JSON.stringify(activity.webhookSummary).includes("private tail"), false);
-      assert.equal(JSON.stringify(activity.webhookSummary).includes("raw-payload-only"), false);
+      assertBoundedWebhookSummary(activity.webhookSummary);
     }
     assert.equal(JSON.stringify(detail.run).includes("raw-payload-only"), false);
     assert.equal("rawPayload" in list.activity[0]!, false);
@@ -343,6 +339,16 @@ describe("project dashboard activity read models", () => {
     );
   });
 });
+
+function assertBoundedWebhookSummary(summary: TriggerSummary | undefined) {
+  assert.equal(summary?.headline, "Webhook from ci-partner");
+  assert.equal(summary?.actor, "ci-partner");
+  assert.equal(summary?.triggerName, "build-finished");
+  assert.equal(summary?.prompt?.length, 120);
+  assert.equal(summary?.prompt?.slice(0, 119), "x".repeat(119));
+  assert.equal(JSON.stringify(summary).includes("private tail"), false);
+  assert.equal(JSON.stringify(summary).includes("raw-payload-only"), false);
+}
 
 function accountAuth(): AuthServer {
   return {

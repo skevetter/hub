@@ -34,6 +34,7 @@ export interface ActivityRunDetail {
     repo: string | null;
     receivedAt: string;
     configuredTriggerName: string;
+    prompt: string | null;
     payloadExpiredAt?: string | null;
     payloadSummary?: RunPayloadSummary | null;
     createdAt: string;
@@ -102,18 +103,12 @@ export function activityRunDetailView(
 ): ActivityRunDetail {
   const { run, receipt, steps } = activity;
   const expired = run.payloadExpiredAt != null;
-  const receiptHidden = expired || receipt.payloadExpiryState != null;
   return {
     run: {
       id: run.id,
       provider: receipt.provider,
       source: receipt.source,
-      ...(!receiptHidden && receipt.source === "webhook.received"
-        ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
-        : {}),
-      repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
-      payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
-      payloadSummary: run.payloadSummary ?? null,
+      ...detailRunPayload(run, receipt, expired),
       receivedAt: receipt.receivedAt.toISOString(),
       configuredTriggerName: run.configuredTriggerName,
       createdAt: run.createdAt.toISOString(),
@@ -125,27 +120,65 @@ export function activityRunDetailView(
           ? formatInvocationRejection(run.rejection)
           : displayFailureReason(run.failureReason),
     },
-    steps: steps.map((step, index) => {
-      const execution = executions[index];
-      const completion = executionCompletion(execution, expired);
-      return {
-        id: step.id,
-        stepId: step.stepId,
-        ordinal: step.ordinal,
-        status: step.status,
-        startedAt: step.startedAt?.toISOString() ?? null,
-        completedAt: step.completedAt?.toISOString() ?? null,
-        output: expired ? null : jsonValue(step.output),
-        payloadSummary: expired ? (step.payloadSummary ?? null) : null,
-        outputExpired: expired && (step.payloadSummary?.hadOutput ?? step.startedAt !== null),
-        failureReason: expired
-          ? (step.payloadSummary?.failureCode ?? null)
-          : displayFailureReason(step.failureReason),
-        isAgent: step.agentExecutionId !== null,
-        completion,
-      };
-    }),
+    steps: steps.map((step, index) => activityStepDetailView(step, executions[index], expired)),
   };
+}
+
+function activityStepDetailView(
+  step: WorkflowStepRunRecord,
+  execution: AgentExecutionRecord | undefined,
+  expired: boolean,
+): ActivityRunDetail["steps"][number] {
+  return {
+    id: step.id,
+    stepId: step.stepId,
+    ordinal: step.ordinal,
+    status: step.status,
+    startedAt: isoOrNull(step.startedAt),
+    completedAt: isoOrNull(step.completedAt),
+    output: expired ? null : jsonValue(step.output),
+    payloadSummary: expired ? (step.payloadSummary ?? null) : null,
+    outputExpired: expired && (step.payloadSummary?.hadOutput ?? step.startedAt !== null),
+    failureReason: stepFailureReason(step, expired),
+    isAgent: step.agentExecutionId !== null,
+    completion: executionCompletion(execution, expired),
+  };
+}
+
+function detailRunPayload(
+  run: TriggerRunRecord,
+  receipt: ProviderEventReceiptRecord,
+  expired: boolean,
+) {
+  const receiptHidden = expired || receipt.payloadExpiryState != null;
+  return {
+    ...webhookSummaryView(receipt, receiptHidden),
+    ...runPayloadMetadata(run, receipt, expired),
+    prompt: detailPrompt(run.prompt, receipt.source, receiptHidden),
+  };
+}
+
+function webhookSummaryView(receipt: ProviderEventReceiptRecord, receiptHidden: boolean) {
+  return !receiptHidden && receipt.source === "webhook.received"
+    ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
+    : {};
+}
+
+function runPayloadMetadata(
+  run: TriggerRunRecord,
+  receipt: ProviderEventReceiptRecord,
+  expired: boolean,
+) {
+  return {
+    repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
+    payloadExpiredAt: isoOrNull(run.payloadExpiredAt),
+    payloadSummary: run.payloadSummary ?? null,
+  };
+}
+
+function detailPrompt(prompt: string, source: string, receiptHidden: boolean): string | null {
+  if (receiptHidden || source === "webhook.received" || prompt === "") return null;
+  return prompt;
 }
 
 export function activityRunView(
@@ -161,43 +194,15 @@ export function activityRunView(
     provider: receipt.provider,
     deliveryId: receipt.deliveryId,
     source: receipt.source,
-    ...(!receiptHidden && receipt.source === "webhook.received"
-      ? { webhookSummary: summarizeTrigger(receipt.source, receipt.payload) }
-      : {}),
-    repo: expired ? (run.payloadSummary?.repository ?? null) : receipt.repo,
-    payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
-    payloadSummary: run.payloadSummary ?? null,
+    ...webhookSummaryView(receipt, receiptHidden),
+    ...runPayloadMetadata(run, receipt, expired),
     receivedAt: receipt.receivedAt.toISOString(),
     rawPayload: receiptHidden ? null : jsonValue(receipt.payload),
     configuredTriggerName: run.configuredTriggerName,
-    prompt: expired ? null : run.prompt,
-    inputs: expired ? null : jsonValue(run.inputs),
-    values: expired ? null : jsonValue(run.values),
-    triggerContext: expired ? null : jsonValue(run.triggerContext),
-    outputContext: expired ? null : jsonValue(run.outputContext),
+    ...activityRunContent(run, expired),
     createdAt: run.createdAt.toISOString(),
     completedAt: run.completedAt?.toISOString() ?? null,
-    steps: steps.map((step, index) => ({
-      agentId: executions[index]?.daemonAgentId ?? null,
-      agentSessionId: executions[index]?.agentSessionId ?? null,
-      agentSessionAction: executions[index]?.agentSessionAction ?? null,
-      agentExecutionId: step.agentExecutionId,
-      id: step.id,
-      stepId: step.stepId,
-      ordinal: step.ordinal,
-      status: step.status,
-      deadlineAt: step.deadlineAt?.toISOString() ?? null,
-      idleDeadlineAt: step.idleDeadlineAt?.toISOString() ?? null,
-      deadlineKind: step.deadlineKind,
-      startedAt: step.startedAt?.toISOString() ?? null,
-      output: expired ? null : jsonValue(step.output),
-      payloadSummary: step.payloadSummary,
-      completion: executionCompletion(executions[index], expired),
-      failureReason: expired
-        ? (step.payloadSummary?.failureCode ?? null)
-        : displayFailureReason(step.failureReason),
-      completedAt: step.completedAt?.toISOString() ?? null,
-    })),
+    steps: steps.map((step, index) => activityStepRunView(step, executions[index], expired)),
   };
   if (run.outcome === "rejected")
     return {
@@ -218,6 +223,52 @@ export function activityRunView(
     failureReason: displayFailureReason(run.failureReason),
     rejectionReason: null,
   };
+}
+
+function activityRunContent(run: TriggerRunRecord, expired: boolean) {
+  return {
+    prompt: expired ? null : run.prompt,
+    inputs: expired ? null : jsonValue(run.inputs),
+    values: expired ? null : jsonValue(run.values),
+    triggerContext: expired ? null : jsonValue(run.triggerContext),
+    outputContext: expired ? null : jsonValue(run.outputContext),
+  };
+}
+
+function activityStepRunView(
+  step: WorkflowStepRunRecord,
+  execution: AgentExecutionRecord | undefined,
+  expired: boolean,
+) {
+  return {
+    agentId: execution?.daemonAgentId ?? null,
+    agentSessionId: execution?.agentSessionId ?? null,
+    agentSessionAction: execution?.agentSessionAction ?? null,
+    agentExecutionId: step.agentExecutionId,
+    id: step.id,
+    stepId: step.stepId,
+    ordinal: step.ordinal,
+    status: step.status,
+    deadlineAt: isoOrNull(step.deadlineAt),
+    idleDeadlineAt: isoOrNull(step.idleDeadlineAt),
+    deadlineKind: step.deadlineKind,
+    startedAt: isoOrNull(step.startedAt),
+    output: expired ? null : jsonValue(step.output),
+    payloadSummary: step.payloadSummary,
+    completion: executionCompletion(execution, expired),
+    failureReason: stepFailureReason(step, expired),
+    completedAt: isoOrNull(step.completedAt),
+  };
+}
+
+function stepFailureReason(step: WorkflowStepRunRecord, expired: boolean) {
+  return expired
+    ? (step.payloadSummary?.failureCode ?? null)
+    : displayFailureReason(step.failureReason);
+}
+
+function isoOrNull(value: Date | null | undefined): string | null {
+  return value?.toISOString() ?? null;
 }
 
 function executionCompletion(execution: AgentExecutionRecord | undefined, expired: boolean) {
