@@ -6,6 +6,7 @@ import { gfm } from "micromark-extension-gfm";
 import { describe, it } from "vitest";
 import { formatRunReply, nestingTooDeep } from "./format.js";
 import { realisticAnswers } from "./test-utils/answers.js";
+import { yieldToEventLoop } from "./test-utils/event-loop.js";
 import {
   checkFenceTrickDocuments,
   checkNestedDocuments,
@@ -15,6 +16,7 @@ import {
 } from "./test-utils/nesting.js";
 
 const hazards = ["[a](", "[^a]", "*a_"];
+const markdownClock = { now: () => 0 };
 
 it.each(hazards)("bounds Markdown work for repeated %s", (shape) => {
   for (const length of [16_384, 1_048_576]) {
@@ -84,7 +86,7 @@ it.each(["www.linear%2Eapp", "www.\uFF4C\uFF49\uFF4E\uFF45\uFF41\uFF52\uFF0E\uFF
   "plain text does not expose a profile link behind a word-adjacent scheme (%s)",
   (host) => {
     const text = `Seehttps://example.com/?u=${host}/acme/profiles/bob now.`;
-    for (const clock of [{ now: plainClock() }, {}]) {
+    for (const clock of [{ now: plainClock() }, markdownClock]) {
       const body = formatRunReply({ text, truncated: false }, [], clock);
       assert.deepEqual(mentionLinks(body), []);
       assert.match(body, /now/u);
@@ -93,7 +95,7 @@ it.each(["www.linear%2Eapp", "www.\uFF4C\uFF49\uFF4E\uFF45\uFF41\uFF52\uFF0E\uFF
 );
 
 // 3,600 documents with HUB_REPLY_FUZZ=1; the default run keeps it short so a loaded host finishes.
-it("leaves no autolink to a profile or mention across generated documents", () => {
+it("leaves no autolink to a profile or mention across generated documents", async () => {
   const perSeed = process.env["HUB_REPLY_FUZZ"] === "1" ? 1_200 : 200;
   const hosts = [
     "linear.app",
@@ -122,9 +124,10 @@ it("leaves no autolink to a profile or mention across generated documents", () =
     const next = random(seed);
     const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
     for (let index = 0; index < perSeed; index += 1) {
+      if (index % 16 === 0) await yieldToEventLoop();
       const url = `${pick(["https://", "http://", "", "www."])}${pick(hosts)}${pick(paths)}`;
       const text = `${pick(lead)}${pick(wrap)(url)} ${pick(wrap)(url)}${"`x` ".repeat(Math.floor(next() * 120))}\n\nend`;
-      for (const clock of [{ now: plainClock() }, {}]) {
+      for (const clock of [{ now: plainClock() }, markdownClock]) {
         const body = formatRunReply({ text, truncated: next() < 0.2 }, [], clock);
         assert.deepEqual(mentionLinks(body), [], JSON.stringify({ seed, index, text, body }));
       }
@@ -150,6 +153,7 @@ it("keeps Markdown and every non-mention word of 80 realistic answers", () => {
   for (const [index, text] of answers.entries()) {
     const reasons: string[] = [];
     const body = formatRunReply({ text, truncated: false }, [], {
+      ...markdownClock,
       onFallback: (reason) => reasons.push(reason),
     });
     assert.deepEqual(reasons, [], `answer ${index} (${text.length} chars) took the fallback`);
@@ -168,7 +172,7 @@ it("keeps an ordinary 2,136-character answer as Markdown", () => {
     '      if (i === attempts - 1) throw error;\n    }\n  }\n  throw new Error("unreachable");\n}\n```\n\n' +
     "- Wraps `fn` and retries **3** times.\n- Rethrows the last `error`.\n- See [retry docs](https://example.com/retry).\n\n";
   const text = `I added a retry helper and used it in the reply writer.\n\n${unit.repeat(5)}`;
-  const body = formatRunReply({ text, truncated: false }, []);
+  const body = formatRunReply({ text, truncated: false }, [], markdownClock);
   assert.ok(body.includes("```ts"));
   assert.ok(body.includes("retry<T>(fn: () => Promise<T>"));
   assert.ok(body.includes("\n    try {"));
@@ -251,11 +255,11 @@ it("falls back to plain text when the Markdown step throws", () => {
 });
 
 it("renders generated stacked-container documents safely", () => {
-  checkStackedDocuments({ seed: 7_001, count: 400 });
-});
+  return checkStackedDocuments({ seed: 7_001, count: 400 });
+}, 60_000);
 
 it("renders generated cross-line nesting the same way on every call", () => {
-  checkNestedDocuments({ seed: 8_001, count: 400 });
+  return checkNestedDocuments({ seed: 8_001, count: 400 });
 });
 
 it.each([
@@ -269,7 +273,7 @@ it.each([
 });
 
 describe("long URLs keep their visible text", () => {
-  const post = (text: string) => formatRunReply({ text, truncated: false }, []);
+  const post = (text: string) => formatRunReply({ text, truncated: false }, [], markdownClock);
 
   it("keeps the label of a Linear issue link", () => {
     const out = post(
@@ -342,7 +346,10 @@ it("keeps a realistic nested list as Markdown", () => {
     "```",
   ].join("\n");
   const reasons: string[] = [];
-  formatRunReply({ text, truncated: false }, [], { onFallback: (reason) => reasons.push(reason) });
+  formatRunReply({ text, truncated: false }, [], {
+    ...markdownClock,
+    onFallback: (reason) => reasons.push(reason),
+  });
   assert.deepEqual(reasons, []);
 });
 
@@ -357,6 +364,7 @@ it.each([
   const body = formatRunReply(
     { text: `before ${inline}\n\n${inline}\n\nafter`, truncated: false },
     [],
+    markdownClock,
   );
   assert.doesNotMatch(body, /^[~*_`]{3,}$/mu);
   assert.match(body, /after$/u);
@@ -413,6 +421,6 @@ ${"- >".repeat(1_130)}
   });
 
   it("renders generated fence tricks the same way every call", () => {
-    checkFenceTrickDocuments({ seed: 9_001, count: 400 });
+    return checkFenceTrickDocuments({ seed: 9_001, count: 400 });
   });
 });

@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { afterEach, beforeEach, describe, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, it, vi } from "vitest";
 import type { DatabaseRuntime, QueryHandle } from "../db/runtime/index.js";
-import { createPostgresQueryRuntime } from "../db/test-utils/runtime.js";
-import { createDatabase, createPostgresPool } from "../db/test-utils/runtime.js";
+import {
+  createDatabase,
+  createPostgresPool,
+  createPostgresQueryRuntime,
+} from "../db/test-utils/runtime.js";
+import { isolatedPostgresDatabase } from "../db/test-utils/isolated-postgres.js";
 import type { Database } from "../db/types.js";
 import type { AuthServer } from "../auth/server.js";
 import type { OrganizationAccessValue } from "../auth/organization-access.js";
@@ -31,6 +35,13 @@ interface ProviderFixture {
 
 describe("provider connection facades PostgreSQL authority", () => {
   let postgres: StartedPostgreSqlContainer;
+  let databaseUrl: string;
+  let opened:
+    | (ReturnType<typeof isolatedPostgresDatabase> & {
+        database?: Database;
+        pool?: DatabaseRuntime;
+      })
+    | undefined;
   let pool: DatabaseRuntime;
   let database: Database;
   let auth: ConnectionAuth;
@@ -39,10 +50,19 @@ describe("provider connection facades PostgreSQL authority", () => {
   let connections: ProviderFixture;
   let githubRepositories: TestGitHubRepositories;
 
-  beforeEach(async () => {
+  beforeAll(async () => {
     postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
-    database = await createDatabase(postgres.getConnectionUri());
-    pool = await createPostgresPool(postgres.getConnectionUri());
+  }, 120_000);
+
+  afterAll(async () => {
+    await postgres?.stop();
+  }, 120_000);
+
+  beforeEach(async () => {
+    opened = isolatedPostgresDatabase(postgres.getConnectionUri());
+    databaseUrl = opened.url;
+    database = opened.database = await createDatabase(databaseUrl);
+    pool = opened.pool = await createPostgresPool(databaseUrl);
     await seedAccount(pool, "acme", "owner");
     await pool.query(
       `insert into runtime_provider_activation
@@ -63,9 +83,18 @@ describe("provider connection facades PostgreSQL authority", () => {
   }, 120_000);
 
   afterEach(async () => {
-    await pool?.close();
-    await database?.close();
-    await postgres?.stop();
+    const fixture = opened;
+    opened = undefined;
+    if (!fixture) return;
+    try {
+      try {
+        await fixture.pool?.close();
+      } finally {
+        await fixture.database?.close();
+      }
+    } finally {
+      await fixture.drop();
+    }
   }, 120_000);
 
   it("binds verified providers once and disconnects only the active organization", async () => {
@@ -308,7 +337,7 @@ describe("provider connection facades PostgreSQL authority", () => {
 
     assert.equal(
       await rejectCallbackAfterExpiryWhileLocked(
-        postgres.getConnectionUri(),
+        databaseUrl,
         {
           text: `update organization_connection_attempts
                  set expires_at = clock_timestamp() + interval '1 second'
@@ -334,7 +363,7 @@ describe("provider connection facades PostgreSQL authority", () => {
     const sessionAttemptId = await attemptIdForState(pool, sessionSetup.state);
     assert.equal(
       await rejectCallbackAfterExpiryWhileLocked(
-        postgres.getConnectionUri(),
+        databaseUrl,
         {
           text: `update session
                  set expires_at = clock_timestamp() + interval '1 second'
@@ -460,8 +489,12 @@ describe("provider connection facades PostgreSQL authority", () => {
     const source = connections.registrations.find(
       (candidate) => candidate.connection.name === "github",
     )!.sources[0]!;
-    await source.start(async () => undefined);
-    await source.stop();
+    try {
+      await source.start(async () => undefined);
+      await waitForGitHubLifecycleState(pool, "during-first-connection");
+    } finally {
+      await source.stop();
+    }
     assert.deepEqual(
       (await database.listGitHubRepositories("acme")).map((item) => item.fullName),
       ["acme-inc/new"],
@@ -482,7 +515,7 @@ describe("provider connection facades PostgreSQL authority", () => {
     };
     const callback = githubCallback(connections, state, "reconnect-code");
     await gate.entered;
-    const webhook = deliverGitHubLifecycle(connections, "during-reconnect", 42);
+    const webhook = deliverGitHubLifecycle(connections, "during-reconnect", 42, { pool });
     githubRepositories.selection = [
       { repositoryId: 9003, fullName: "acme-inc/new", defaultBranch: "next" },
     ];
@@ -505,7 +538,7 @@ describe("provider connection facades PostgreSQL authority", () => {
     await githubCallback(connections, userState, "code");
 
     github.identity = { ...github.identity!, status: "suspended" };
-    await deliverGitHubLifecycle(connections, "suspend", 42);
+    await deliverGitHubLifecycle(connections, "suspend", 42, { pool });
     assert.deepEqual(await resolution(connections, "github", "42"), { status: "suspended" });
 
     github.identity = { ...github.identity, status: "active" };
@@ -521,16 +554,16 @@ describe("provider connection facades PostgreSQL authority", () => {
     });
 
     github.identity = { ...github.identity, status: "suspended" };
-    await deliverGitHubLifecycle(connections, "suspend-again", 42);
+    await deliverGitHubLifecycle(connections, "suspend-again", 42, { pool });
     github.identity = { ...github.identity, status: "active" };
-    await deliverGitHubLifecycle(connections, "restore", 42);
+    await deliverGitHubLifecycle(connections, "restore", 42, { pool });
     assert.deepEqual(await resolution(connections, "github", "42"), {
       status: "active",
       organizationId: "acme",
     });
 
     github.identity = undefined;
-    await deliverGitHubLifecycle(connections, "removed", 42);
+    await deliverGitHubLifecycle(connections, "removed", 42, { pool });
     assert.deepEqual(await resolution(connections, "github", "42"), { status: "unbound" });
   });
 
@@ -539,11 +572,12 @@ describe("provider connection facades PostgreSQL authority", () => {
     github.identity = { ...github.identity!, status: "suspended" };
     github.failInstallationReads = 1;
 
-    await deliverGitHubLifecycle(connections, "lifecycle-retry", 42);
+    await deliverGitHubLifecycle(connections, "lifecycle-retry", 42, { pool, state: "retry" });
     await pool.query(
-      `update github_installation_syncs set retry_at = now() where retry_at is not null`,
+      `update github_installation_syncs set retry_at = now()
+       where delivery_id = 'lifecycle-retry' and retry_at is not null`,
     );
-    await deliverGitHubLifecycle(connections, "lifecycle-retry", 42);
+    await deliverGitHubLifecycle(connections, "lifecycle-retry", 42, { pool });
     await deliverGitHubLifecycle(connections, "lifecycle-retry", 42);
 
     assert.equal(github.installationReads, 2);
@@ -1060,6 +1094,7 @@ async function deliverGitHubLifecycle(
   connections: ProviderFixture,
   deliveryId: string,
   installationId: number,
+  completion?: { pool: QueryHandle; state?: "retry" | "settled" },
 ): Promise<void> {
   const body = JSON.stringify({
     action: "suspend",
@@ -1073,24 +1108,54 @@ async function deliverGitHubLifecycle(
   const registration = connections.registrations.find(
     (candidate) => candidate.connection.name === "github",
   );
-  const webhook = registration?.requests.find((candidate) => candidate.name === "webhook");
+  assert(registration !== undefined);
+  const webhook = registration.requests.find((candidate) => candidate.name === "webhook");
+  const source = registration.sources[0];
   assert(webhook !== undefined);
-  const response = await webhook.handle(
-    new Request("https://hub.example.test/webhook", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-github-delivery": deliveryId,
-        "x-github-event": "installation",
-        "x-hub-signature-256": signature,
-      },
-      body,
-    }),
+  assert(source !== undefined);
+  try {
+    const response = await webhook.handle(
+      new Request("https://hub.example.test/webhook", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-github-delivery": deliveryId,
+          "x-github-event": "installation",
+          "x-hub-signature-256": signature,
+        },
+        body,
+      }),
+    );
+    assert.equal(response.status, 200);
+    if (completion !== undefined) {
+      await source.start(async () => undefined);
+      await waitForGitHubLifecycleState(completion.pool, deliveryId, completion.state);
+    }
+  } finally {
+    await source.stop();
+  }
+}
+
+async function waitForGitHubLifecycleState(
+  pool: QueryHandle,
+  deliveryId: string,
+  state: "retry" | "settled" = "settled",
+): Promise<void> {
+  await vi.waitFor(
+    async () => {
+      const { rows } = await pool.query<{ state: string }>(
+        `select case
+           when settled_at is not null then 'settled'
+           when retry_at > statement_timestamp() then 'retry'
+           else 'pending'
+         end as state
+         from github_installation_syncs where delivery_id = $1`,
+        [deliveryId],
+      );
+      assert.equal(rows[0]?.state, state, `GitHub lifecycle delivery ${deliveryId}`);
+    },
+    { timeout: 10_000 },
   );
-  assert.equal(response.status, 200);
-  await connections.registrations
-    .find((candidate) => candidate.connection.name === "github")!
-    .sources[0]!.stop();
 }
 
 function result(response: Response): string | null {
@@ -1144,12 +1209,16 @@ async function resolution(
     slack: [],
     linear: [],
   });
-  assert(status !== null && typeof status === "object" && "status" in status);
+  assertConnectionStatus(status);
   if (status.status === "suspended") return { status: "suspended" as const };
   const binding = provider === "github" ? github : discord;
   return binding === undefined
     ? { status: "unbound" as const }
     : { status: "active" as const, organizationId: binding.organizationId };
+}
+
+function assertConnectionStatus(status: unknown): asserts status is { status: unknown } {
+  assert(status !== null && typeof status === "object" && "status" in status);
 }
 
 async function applyDiscordRemoval(

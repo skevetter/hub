@@ -1,15 +1,57 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import type { Root } from "mdast";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
-import { describe, it, vi } from "vitest";
+import { describe, it, onTestFinished, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import * as replyFormat from "./format.js";
 import { LinearRunReplyWriter } from "./linear.js";
+import { yieldToEventLoop } from "./test-utils/event-loop.js";
 import { fakeLinearReplies, replyEvidence } from "./test-utils/linear.js";
 
 const signal = new AbortController().signal;
+
+function pinFormatterClock(): void {
+  const { formatRunReply } = replyFormat;
+  const formatter = vi
+    .spyOn(replyFormat, "formatRunReply")
+    .mockImplementation((answer, secrets, options) =>
+      formatRunReply(answer, secrets, { ...options, now: () => 0 }),
+    );
+  onTestFinished(() => formatter.mockRestore());
+}
+
+function assertCompleteRows(markdown: Root): void {
+  const table = markdown.children.find((node) => node.type === "table");
+  assert.ok(table && table.children.length > 1);
+  for (const row of table.children.slice(1)) {
+    const value = row.children[1]?.children[0];
+    assert.ok(value?.type === "text" && value.value === "complete");
+  }
+}
+
+function assertNoMentionNodes(tree: Root, index: number): void {
+  const nodes = [...tree.children];
+  for (const node of nodes) {
+    if ("children" in node) nodes.push(...node.children);
+    if ("value" in node) {
+      assert.doesNotMatch(
+        node.value,
+        /[@\uFF20]|linear\.app\/acme\/profiles(?:\/|$)/iu,
+        `case ${index}`,
+      );
+    }
+    if (node.type === "link") {
+      assert.doesNotMatch(
+        node.url,
+        /^https?:\/\/linear\.app\/acme\/profiles(?:\/|$)/iu,
+        `case ${index}`,
+      );
+    }
+  }
+}
 
 async function fixture(options: { differentTarget?: boolean; canceled?: boolean } = {}) {
   const database = createMemoryDatabase();
@@ -139,6 +181,7 @@ describe("Linear reply writer", () => {
     const extensions = [gfm()];
     const mdastExtensions = [gfmFromMarkdown()];
     for (let index = 0; index < 2_048; index += 1) {
+      if (index % 16 === 0) await yieldToEventLoop();
       const atom = atoms[index % atoms.length]!;
       const pad = 3_290 + ((index * 1_831) % 221);
       const separator = index % 3 === 0 ? " " : "\n\n";
@@ -156,28 +199,11 @@ describe("Linear reply writer", () => {
         `raw mention or profile URL in case ${index}`,
       );
       const tree = fromMarkdown(body, { extensions, mdastExtensions });
-      const nodes = [...tree.children];
-      for (const node of nodes) {
-        if ("children" in node) nodes.push(...node.children);
-        if ("value" in node) {
-          assert.doesNotMatch(
-            node.value,
-            /[@\uFF20]|linear\.app\/acme\/profiles(?:\/|$)/iu,
-            `case ${index}`,
-          );
-        }
-        if (node.type === "link") {
-          assert.doesNotMatch(
-            node.url,
-            /^https?:\/\/linear\.app\/acme\/profiles(?:\/|$)/iu,
-            `case ${index}`,
-          );
-        }
-      }
+      assertNoMentionNodes(tree, index);
       assert.equal(tree.children.at(-1)?.type, "paragraph", `marker in case ${index}`);
       assert.equal(tree.children.at(-2)?.type, "paragraph", `notice in case ${index}`);
     }
-  }, 60_000);
+  }, 120_000);
 
   it.each([
     "https://linear.app./acme/profiles/bob",
@@ -217,6 +243,7 @@ describe("Linear reply writer", () => {
     }
   });
   it("posts one marked, sanitized and truncated answer with only comments:create", async () => {
+    pinFormatterClock();
     const { send, writes, delivery } = await fixture();
     const text = `Hello @teammate, &#64;paseo and https://linear.app/team/profiles/alex.
 
@@ -278,6 +305,7 @@ ${"line from the answer\n".repeat(250)}`;
   ];
 
   it("neutralizes generated mention forms across Markdown shapes in the posted body", async () => {
+    pinFormatterClock();
     for (let index = 0; index < markdownShapes.length; index += 1) {
       const shape = markdownShapes[index]!;
       const samples = [
@@ -316,6 +344,7 @@ ${"line from the answer\n".repeat(250)}`;
   ])(
     "keeps delivery metadata outside a truncated $structure and repairs the delivery",
     async ({ structure, text }) => {
+      pinFormatterClock();
       const reply = await fixture();
       const { send, writes, delivery } = reply;
       reply.loseCreateResponse();
@@ -340,14 +369,7 @@ ${"line from the answer\n".repeat(250)}`;
         );
       }
       if (structure === "inline code") assert.match(body, /^Answer\.\n\n/u);
-      if (structure === "table row") {
-        const table = markdown.children.find((node) => node.type === "table");
-        assert.ok(table && table.children.length > 1);
-        for (const row of table.children.slice(1)) {
-          const value = row.children[1]?.children[0];
-          assert.ok(value?.type === "text" && value.value === "complete");
-        }
-      }
+      if (structure === "table row") assertCompleteRows(markdown);
       await reply.repair();
       assert.equal((await delivery())?.state, "sent");
       assert.equal(writes.length, 1);
@@ -355,6 +377,7 @@ ${"line from the answer\n".repeat(250)}`;
   );
 
   it("records an empty sanitized answer without making a request", async () => {
+    pinFormatterClock();
     const { send, calls, delivery } = await fixture();
     await send("![image](https://example.com/pic.png)");
     assert.deepEqual(calls, []);

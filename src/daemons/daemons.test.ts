@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, describe, it } from "vitest";
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, it } from "vitest";
 import { DaemonDispatchFailure } from "./index.js";
 import { DaemonResponseLostError } from "./protocol.js";
 import { ENROLLMENT_LIFETIME_MS } from "./registration.js";
@@ -7,12 +8,19 @@ import { HubHarness } from "./test-utils/hub-harness.js";
 import { currentProjectConfigurationFiles } from "../test-utils/current-project-configuration.js";
 
 describe("daemon enrollment and execution", () => {
+  let postgres: StartedPostgreSqlContainer;
   let hub: HubHarness;
+  beforeAll(async () => {
+    postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
+  }, 120_000);
+  afterAll(async () => {
+    await postgres?.stop();
+  }, 120_000);
   beforeEach(async () => {
-    hub = await HubHarness.start();
+    hub = await HubHarness.start(postgres);
   }, 120_000);
   afterEach(async () => {
-    await hub.stop();
+    await hub?.stop();
   }, 120_000);
 
   it("protects short-lived enrollment issuance and expires unused tokens deterministically", async () => {
@@ -1354,9 +1362,10 @@ describe("daemon enrollment and execution", () => {
     assert.equal((await hub.execution(result.execution.id)).hubActionReadyAt, null);
 
     await hub.reconnectDaemon();
+    await hub.waitForTimelineSubscription(result.agentId);
     await hub.runtimeResources({ executionSubscriptions: 1 });
     await hub.completeCurrentTurn(result.agentId);
-    await hub.pendingControlAction(result.execution.id);
+    await hub.waitForControlAction("archive");
     await hub.completePendingCleanup();
     const execution = await hub.execution(result.execution.id);
     assert.deepEqual(hub.controlActions(), ["archive"]);
@@ -2162,14 +2171,25 @@ describe("daemon enrollment and execution", () => {
     );
     assert.equal(hub.createdAgentCount(), 0);
   });
+});
+
+describe("daemon enrollment and execution", () => {
+  let hub: HubHarness;
+  beforeEach(async () => {
+    hub = await HubHarness.start();
+  }, 120_000);
+  afterEach(async () => {
+    await hub?.stop();
+  }, 120_000);
 
   it("tears down sockets, server, database, and container idempotently", async () => {
     await hub.connectDaemon();
-
     await hub.stop();
     await hub.stop();
   });
+});
 
+describe("daemon enrollment and execution", () => {
   it("rolls back partially acquired startup resources", async () => {
     assert.equal(await HubHarness.startupFailureRollsBack(), true);
   });

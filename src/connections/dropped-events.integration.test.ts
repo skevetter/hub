@@ -109,14 +109,18 @@ it("keeps the ordered candidate lookup within the index budget on 50,000 receipt
      select 'drop-plan-' || n, 'Drop plan ' || n, 'drop-plan-' || n
      from generate_series(0, 7) n`,
   );
-  await harness.runtime.query(
-    `insert into provider_event_receipts
-       (organization_id, provider, delivery_id, source, payload, received_at, dropped_reason)
-     select 'drop-plan-' || (n % 8), (array['github', 'linear', 'slack', 'discord'])[1 + (n / 8) % 4],
-            'drop-plan-' || n, 'fixture.event', '{}',
-            now() - (n % 9) * interval '1 day', 'no_project_route'
-     from generate_series(1, 50_000) n`,
-  );
+  // Batches keep each fixture statement inside the pool's 3 s query deadline on a loaded machine.
+  for (let first = 1; first <= 50_000; first += 5_000) {
+    await harness.runtime.query(
+      `insert into provider_event_receipts
+         (organization_id, provider, delivery_id, source, payload, received_at, dropped_reason)
+       select 'drop-plan-' || (n % 8), (array['github', 'linear', 'slack', 'discord'])[1 + (n / 8) % 4],
+              'drop-plan-' || n, 'fixture.event', '{}',
+              now() - (n % 9) * interval '1 day', 'no_project_route'
+       from generate_series($1::int, $1::int + 4_999) n`,
+      [first],
+    );
+  }
   await seed("github", 600, 2, "github_lifecycle");
   await linkGitHubReceiptsToRuns();
   await harness.runtime.query("analyze provider_event_receipts");

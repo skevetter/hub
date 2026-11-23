@@ -7,6 +7,9 @@ import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import { formatRunReply } from "../format.js";
+import { yieldToEventLoop } from "./event-loop.js";
+
+const documentsPerTurn = 8;
 
 export function mentionLinks(markdown: string): string[] {
   const found: string[] = [];
@@ -14,20 +17,30 @@ export function mentionLinks(markdown: string): string[] {
     fromMarkdown(markdown, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] }),
   ];
   for (const node of pending) {
-    if (node.type === "link" || node.type === "definition") {
-      const url = URL.parse(node.url);
-      const host = url?.hostname.replace(/\.$/u, "") ?? "";
-      const path = decodeURIComponent(url?.pathname ?? "").normalize("NFKC");
-      const linear = host === "linear.app" || host.endsWith(".linear.app");
-      if (
-        (linear && /\/(?:profiles|users|agents)(?:\/|$)/iu.test(path)) ||
-        /[@\uFF20]/u.test(node.url)
-      )
-        found.push(node.url);
+    if ((node.type === "link" || node.type === "definition") && isMentionLink(node.url)) {
+      found.push(node.url);
     }
     if ("children" in node) pending.push(...node.children);
   }
   return found;
+}
+
+function isMentionLink(href: string): boolean {
+  const url = URL.parse(href);
+  const host = url?.hostname.replace(/\.$/u, "") ?? "";
+  const path = decodeURIComponent(url?.pathname ?? "").normalize("NFKC");
+  const linear = host === "linear.app" || host.endsWith(".linear.app");
+  return (linear && /\/(?:profiles|users|agents)(?:\/|$)/iu.test(path)) || /[@\uFF20]/u.test(href);
+}
+
+function seededPick(seed: number) {
+  const next = random(seed);
+  function pick<T>(items: T[]): T {
+    const item = items[Math.floor(next() * items.length)];
+    assert.ok(item !== undefined);
+    return item;
+  }
+  return { next, pick };
 }
 
 export function random(seed: number) {
@@ -62,9 +75,8 @@ function safeBody(text: string, truncated: boolean, context: string): string {
   return body;
 }
 
-export function checkStackedDocuments({ seed, count }: DocumentRun): void {
-  const next = random(seed);
-  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+export async function checkStackedDocuments({ seed, count }: DocumentRun): Promise<void> {
+  const { next, pick } = seededPick(seed);
   const markers = [
     ">",
     "> ",
@@ -82,6 +94,7 @@ export function checkStackedDocuments({ seed, count }: DocumentRun): void {
     ">- ",
   ];
   for (let index = 0; index < count; index += 1) {
+    if (index % documentsPerTurn === 0) await yieldToEventLoop();
     const lines: string[] = [];
     for (let line = 0, lineCount = 1 + Math.floor(next() * 6); line < lineCount; line += 1) {
       const unit = Array.from({ length: 1 + Math.floor(next() * 3) }, () => pick(markers)).join("");
@@ -93,12 +106,16 @@ export function checkStackedDocuments({ seed, count }: DocumentRun): void {
 }
 
 // Nesting carried across lines by indentation (tabs, spaces, mixed) and by markers.
-export function checkNestedDocuments({ seed, count, timing = false }: DocumentRun): void {
-  const next = random(seed);
-  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+export async function checkNestedDocuments({
+  seed,
+  count,
+  timing = false,
+}: DocumentRun): Promise<void> {
+  const { next, pick } = seededPick(seed);
   const markers = ["- ", "* ", "+ ", "1. ", "2) ", "> ", "-\t", ">", "- > "];
   const indents = ["\t", "  ", " ", "    ", "\t  "];
   for (let index = 0; index < count; index += 1) {
+    if (index % documentsPerTurn === 0) await yieldToEventLoop();
     const perLine = 1 + Math.floor(next() * 40);
     const step = 1 + Math.floor(next() * 40);
     const unit = pick(indents);
@@ -121,9 +138,12 @@ export function checkNestedDocuments({ seed, count, timing = false }: DocumentRu
 
 // Lines that look like fences to a loose reader but are not, plus real ones, mixed with markers
 // that carry nesting across lines.
-export function checkFenceTrickDocuments({ seed, count, timing = false }: DocumentRun): void {
-  const next = random(seed);
-  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+export async function checkFenceTrickDocuments({
+  seed,
+  count,
+  timing = false,
+}: DocumentRun): Promise<void> {
+  const { next, pick } = seededPick(seed);
   const fences = [
     "```x`",
     "``` `",
@@ -138,6 +158,7 @@ export function checkFenceTrickDocuments({ seed, count, timing = false }: Docume
   ];
   const markers = ["- >", ">- ", "> ", "- ", "1. ", ">\t", "-\t", "+ >", ">"];
   for (let index = 0; index < count; index += 1) {
+    if (index % documentsPerTurn === 0) await yieldToEventLoop();
     const lines: string[] = [];
     let size = 0;
     const unit = pick(markers);
@@ -165,6 +186,7 @@ function checkOne(text: string, context: string, timing: boolean): void {
     const started = performance.now();
     bodies.add(
       formatRunReply({ text, truncated: false }, [], {
+        ...(timing ? {} : { now: () => 0 }),
         onFallback: (value) => {
           reason = value;
         },
