@@ -39,14 +39,15 @@ import {
   type DaemonConnection,
   type DaemonModule,
 } from "./daemons/index.js";
-import { createDispatcherWithEngine } from "./dispatcher/index.js";
+import { createDispatcherWithEngine, type LaunchMachineIntent } from "./dispatcher/index.js";
 import type { DurableWorkflowEngine, DurableWorkflowEngineOptions } from "./workflows/engine.js";
 import type {
   DaemonDispatchLifecycleOptions,
   ExecutionDeadlineClock,
 } from "./daemons/lifecycle.js";
 import type { TriggerProviderFactory, TriggerProviderResources } from "./providers/registration.js";
-import type { TriggerProvider, TriggerSource } from "./triggers/index.js";
+import type { TriggerHandler, TriggerProvider, TriggerSource } from "./triggers/index.js";
+import type { StopRun } from "./triggers/run-stop.js";
 import {
   createManualTriggerSource,
   dispatchManualTrigger,
@@ -61,7 +62,10 @@ import { runShutdownStage } from "./shutdown-stage.js";
 import { CliAuthorizations } from "./cli-authorizations/index.js";
 import type { BrowserOrganizationAccess } from "./auth/browser-organization-access.js";
 import { createPublicApi, type PublicApi, type PublicApiComposition } from "./public-api/index.js";
-import { createPublicOperations } from "./public-operations/index.js";
+import {
+  createPublicOperations,
+  type PublicOperationCapabilities,
+} from "./public-operations/index.js";
 import { createDatabasePublicOperationRepository } from "./public-operations/database-adapter.js";
 import type { EntitlementsService } from "./entitlements/service.js";
 import type { ExecutionAuthority } from "./execution-authority/index.js";
@@ -101,10 +105,10 @@ export interface HubRuntimeOptions {
 }
 
 export interface HubRuntime {
-  stopRun: import("./triggers/run-stop.js").StopRun;
+  stopRun: StopRun;
   daemonModule: DaemonModule | null;
   interactiveSessions: InteractiveSessionCoordinator | null;
-  connectionForDaemon(daemonId: string): import("./daemons/index.js").DaemonConnection | undefined;
+  connectionForDaemon(daemonId: string): DaemonConnection | undefined;
   /** The daemons' own answer about an agent configuration; null without a database. */
   agentValidator: DaemonAgentConfigurationValidator | null;
   resourceCounts(): {
@@ -156,13 +160,7 @@ export function createHubRuntime(options: HubRuntimeOptions): HubRuntime {
 }
 
 export function createHubApplication(options: HubRuntimeOptions): HubApplication {
-  const daemons =
-    options.database === null
-      ? null
-      : new ActiveDaemonRegistry(options.database, options.daemonClock);
-  const connectionForDaemon = (daemonId: string) =>
-    options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId);
-  const agentValidator = createAgentValidator(daemons, connectionForDaemon);
+  const { daemons, connectionForDaemon, agentValidator } = createDaemonAccess(options);
   const storeForProject = (projectId: string) => {
     if (options.database === null) throw new DatabaseUnavailableError();
     return new ProjectConfigurationStore(options.database, projectId, daemons ?? undefined);
@@ -170,6 +168,74 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
   const manualProvider =
     options.database === null ? undefined : createManualRunProvider(storeForProject);
   const attachments = createAttachmentRegistry(options);
+  const providers = createAppProviders(options, storeForProject, manualProvider, attachments);
+  const outputRegistry = options.outputRegistry ?? new OutputExecutorRegistry();
+  const daemonModule = createAppDaemonModule(options, daemons, providers, outputRegistry);
+  const capabilityServer = createAppExecutionCapabilityServer(
+    options,
+    daemonModule,
+    outputRegistry,
+  );
+  const registration = createAppDaemonRegistration(options, daemons);
+  const cliAuthorizations = createAppCliAuthorizations(options);
+  const triggerSources = createAppTriggerSources(options);
+  const { manualSource } = triggerSources;
+  const { handler: workflowDispatcher, engine: workflowEngine } = createAppDispatcher(
+    options,
+    daemonModule,
+    providers,
+    connectionForDaemon,
+  );
+  const interactiveSessions = connectDaemonLifecycle(
+    daemons,
+    daemonModule,
+    workflowEngine,
+    options.interactiveSessions,
+  );
+  const hub = createAppRuntime(options, {
+    daemons,
+    daemonModule,
+    interactiveSessions,
+    connectionForDaemon,
+    agentValidator,
+    workflowEngine,
+    workflowDispatcher,
+    triggerSources,
+  });
+  const publicApi = createAppPublicApi(options, {
+    manualSource,
+    configurationForProject: storeForProject,
+    daemonAgentValidator: agentValidator,
+    stopRun: hub.stopRun,
+  });
+  const operations = createAppOperations(options, {
+    daemons,
+    cliAuthorizations,
+    registration,
+    capabilityServer,
+    attachments,
+    manualSource,
+  });
+  return { hub, operations, publicApi, configurationForProject: storeForProject };
+}
+
+function createDaemonAccess(options: HubRuntimeOptions) {
+  const daemons =
+    options.database === null
+      ? null
+      : new ActiveDaemonRegistry(options.database, options.daemonClock);
+  const connectionForDaemon = (daemonId: string) =>
+    options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId);
+  const agentValidator = createAgentValidator(daemons, connectionForDaemon);
+  return { daemons, connectionForDaemon, agentValidator };
+}
+
+function createAppProviders(
+  options: HubRuntimeOptions,
+  storeForProject: HubApplication["configurationForProject"],
+  manualProvider: TriggerProvider | undefined,
+  attachments: AttachmentCapabilityRegistry | undefined,
+): TriggerProvider[] {
   const configuredProviders =
     options.database === null
       ? []
@@ -184,53 +250,66 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
             ...(attachments === undefined ? {} : { attachments }),
           }),
         );
-  const providers = [
+  return [
     createScheduleProvider(),
     createGitHubNotificationProvider(),
     manualProvider,
     ...configuredProviders,
     ...(options.providers ?? []),
   ].filter((provider): provider is TriggerProvider => provider !== undefined);
-  const outputRegistry = options.outputRegistry ?? new OutputExecutorRegistry();
-  const daemonModule = createAppDaemonModule(options, daemons, providers, outputRegistry);
-  const capabilityServer = createAppExecutionCapabilityServer(
-    options,
-    daemonModule,
-    outputRegistry,
-  );
-  const registration =
-    options.database === null || daemons === null
-      ? null
-      : new DaemonRegistration({
-          database: options.database,
-          activeDaemons: daemons,
-          ...(options.browserOrganizationAccess === undefined
-            ? {}
-            : { access: options.browserOrganizationAccess }),
-        });
-  const cliAuthorizations =
-    options.database === null
-      ? null
-      : new CliAuthorizations(
-          options.database,
-          options.browserOrganizationAccess,
-          options.publicBaseUrl,
-        );
+}
 
+function createAppDaemonRegistration(
+  options: HubRuntimeOptions,
+  daemons: ActiveDaemonRegistry | null,
+): DaemonRegistration | null {
+  return options.database === null || daemons === null
+    ? null
+    : new DaemonRegistration({
+        database: options.database,
+        activeDaemons: daemons,
+        ...(options.browserOrganizationAccess === undefined
+          ? {}
+          : { access: options.browserOrganizationAccess }),
+      });
+}
+
+function createAppCliAuthorizations(options: HubRuntimeOptions): CliAuthorizations | null {
+  return options.database === null
+    ? null
+    : new CliAuthorizations(
+        options.database,
+        options.browserOrganizationAccess,
+        options.publicBaseUrl,
+      );
+}
+
+type ManualSource = ReturnType<typeof createManualTriggerSource> | undefined;
+
+function createAppTriggerSources(options: HubRuntimeOptions) {
   const scheduleSource = appScheduleSource(options.database);
   const notificationSource = appNotificationSource(options);
   const manualSource =
     options.database === null ? undefined : createManualTriggerSource(options.database);
+  return { scheduleSource, notificationSource, manualSource };
+}
+
+function createAppDispatcher(
+  options: HubRuntimeOptions,
+  daemonModule: DaemonModule | null,
+  providers: readonly TriggerProvider[],
+  connectionForDaemon: HubRuntime["connectionForDaemon"],
+) {
   const durableDispatchHandler =
     options.database === null || daemonModule === null
       ? undefined
-      : (intent: Parameters<DaemonModule["lifecycle"]["handoffLaunchMachineIntent"]>[0]) =>
-          daemonModule.lifecycle.handoffLaunchMachineIntent(intent);
-  const dispatcherOptions = {
+      : (intent: LaunchMachineIntent) => daemonModule.lifecycle.handoffLaunchMachineIntent(intent);
+  const clock = options.executionDeadlineClock;
+  const registry = options.outputRegistry;
+  return createDispatcherWithEngine({
     scriptRunner: createScriptStepRunner(connectionForDaemon),
     scriptLimits: options.scriptLimits,
-    canDispatchToDaemon: (daemonId: string) =>
-      (options.daemonConnectionForId?.(daemonId) ?? daemons?.connection(daemonId)) !== undefined,
+    canDispatchToDaemon: (daemonId) => connectionForDaemon(daemonId) !== undefined,
     database: options.database,
     onProgressRequested: options.onProgressRequested,
     timeline: options.runTimeline,
@@ -240,19 +319,12 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     ...(options.configurationRevisionId === undefined
       ? {}
       : { configurationRevisionId: options.configurationRevisionId }),
-    ...(options.executionDeadlineClock === undefined
-      ? {}
-      : { now: () => new Date(options.executionDeadlineClock!.now()) }),
-    ...(options.outputRegistry === undefined
+    ...(clock === undefined ? {} : { now: () => new Date(clock.now()) }),
+    ...(registry === undefined
       ? {}
       : {
-          validateLaunchMachineIntent: (
-            intent: import("./dispatcher/launch-machine-intent.js").LaunchMachineIntent,
-          ) =>
-            options.outputRegistry!.validateRequiredOutputs(
-              intent.allowOutputs,
-              intent.outputContext,
-            ),
+          validateLaunchMachineIntent: (intent) =>
+            registry.validateRequiredOutputs(intent.allowOutputs, intent.outputContext),
         }),
     ...(daemonModule === null
       ? {}
@@ -269,50 +341,89 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
           onWorkflowRunTerminal: (run: TriggerRunRecord) =>
             daemonModule.lifecycle.notifyWorkflowRunTerminal(run),
         }),
-  };
-  const { handler: workflowDispatcher, engine: workflowEngine } = createDispatcherWithEngine({
-    ...dispatcherOptions,
     ...(durableDispatchHandler === undefined
       ? {}
       : { dispatchLaunchMachineIntent: durableDispatchHandler }),
   });
-  const interactiveSessions = connectDaemonLifecycle(
-    daemons,
-    daemonModule,
-    workflowEngine,
-    options.interactiveSessions,
-  );
-  let activeSources: readonly TriggerSource[] = [];
+}
 
-  const hub: HubRuntime = {
+interface RuntimeLifecycleDependencies {
+  daemons: ActiveDaemonRegistry | null;
+  daemonModule: DaemonModule | null;
+  interactiveSessions: InteractiveSessionCoordinator | null;
+  workflowEngine: DurableWorkflowEngine;
+  workflowDispatcher: TriggerHandler;
+  triggerSources: ReturnType<typeof createAppTriggerSources>;
+}
+
+function createAppRuntime(
+  options: HubRuntimeOptions,
+  dependencies: RuntimeLifecycleDependencies &
+    Pick<HubRuntime, "connectionForDaemon" | "agentValidator">,
+): HubRuntime {
+  const {
+    daemonModule,
+    interactiveSessions,
+    connectionForDaemon,
+    agentValidator,
+    workflowEngine,
+    daemons,
+  } = dependencies;
+  return {
     daemonModule,
     interactiveSessions,
     connectionForDaemon,
     agentValidator,
     stopRun: (actor, runId, confirmedPeerCount, retryAttemptId) =>
       workflowEngine.stopRun(actor, runId, confirmedPeerCount, retryAttemptId),
-    resourceCounts: () => {
-      const executionSubscriptions = daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0;
-      if (options.runTimeline === undefined) return { executionSubscriptions };
-      const accounting = options.runTimeline.accountingStats();
-      return {
-        executionSubscriptions,
-        ...(options.runStream === undefined
-          ? {}
-          : {
-              runStreams: options.runStream.activeStreamCount(),
-              streamNotifiers: options.runStream.notifierCount(),
-            }),
-        timelineQueueDepth: options.runTimeline.depth(),
-        timelineQueueEntries: accounting.queueEntries,
-        timelineAccountingEntries: accounting.retainedEntries,
-        timelineAccountingGiveUps: accounting.giveUps,
-        timelineAccountingDropsAbandoned: accounting.abandonedDrops,
-      };
-    },
+    resourceCounts: () => appResourceCounts(options, daemonModule),
     processWorkflowOutbox: () => workflowEngine.processAvailable(),
     handleUpgrade:
-      options.database === null ? null : createDaemonUpgradeHandler(options.database, daemons!),
+      options.database === null || daemons === null
+        ? null
+        : createDaemonUpgradeHandler(options.database, daemons),
+    ...createRuntimeLifecycle(options, dependencies),
+  };
+}
+
+function appResourceCounts(
+  options: HubRuntimeOptions,
+  daemonModule: DaemonModule | null,
+): ReturnType<HubRuntime["resourceCounts"]> {
+  const executionSubscriptions = daemonModule?.lifecycle.activeExecutionObservationCount() ?? 0;
+  if (options.runTimeline === undefined) return { executionSubscriptions };
+  const accounting = options.runTimeline.accountingStats();
+  return {
+    executionSubscriptions,
+    ...(options.runStream === undefined
+      ? {}
+      : {
+          runStreams: options.runStream.activeStreamCount(),
+          streamNotifiers: options.runStream.notifierCount(),
+        }),
+    timelineQueueDepth: options.runTimeline.depth(),
+    timelineQueueEntries: accounting.queueEntries,
+    timelineAccountingEntries: accounting.retainedEntries,
+    timelineAccountingGiveUps: accounting.giveUps,
+    timelineAccountingDropsAbandoned: accounting.abandonedDrops,
+  };
+}
+
+function createRuntimeLifecycle(
+  options: HubRuntimeOptions,
+  dependencies: RuntimeLifecycleDependencies,
+): Pick<HubRuntime, "start" | "stop"> {
+  const {
+    daemons,
+    daemonModule,
+    interactiveSessions,
+    workflowEngine,
+    workflowDispatcher,
+    triggerSources,
+  } = dependencies;
+  const { manualSource, scheduleSource, notificationSource } = triggerSources;
+  let activeSources: readonly TriggerSource[] = [];
+  return {
     async start(sources = []) {
       await options.executionAuthority?.recover();
       await Promise.all([
@@ -334,13 +445,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       if (options.runStream !== undefined) await options.runStream.beginShutdown();
       try {
         await Promise.all(
-          activeSources.map((source, index) => {
-            let stage = `trigger.source.${index}`;
-            if (source === manualSource) stage = "trigger.manual";
-            else if (source === scheduleSource) stage = "trigger.schedule";
-            else if (source === notificationSource) stage = "trigger.github-notifications";
-            return runShutdownStage(stage, () => source.stop());
-          }),
+          activeSources.map((source, index) => stopTriggerSource(source, index, triggerSources)),
         );
         activeSources = [];
         await Promise.all([
@@ -363,17 +468,41 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
       }
     },
   };
-  const publicOperations = createAppPublicOperations(
-    options,
+}
+
+function stopTriggerSource(
+  source: TriggerSource,
+  index: number,
+  { manualSource, scheduleSource, notificationSource }: ReturnType<typeof createAppTriggerSources>,
+) {
+  let stage = `trigger.source.${index}`;
+  if (source === manualSource) stage = "trigger.manual";
+  else if (source === scheduleSource) stage = "trigger.schedule";
+  else if (source === notificationSource) stage = "trigger.github-notifications";
+  return runShutdownStage(stage, () => source.stop());
+}
+
+interface AppOperationDependencies {
+  daemons: ActiveDaemonRegistry | null;
+  cliAuthorizations: CliAuthorizations | null;
+  registration: DaemonRegistration | null;
+  capabilityServer: ReturnType<typeof createAppExecutionCapabilityServer>;
+  attachments: AttachmentCapabilityRegistry | undefined;
+  manualSource: ManualSource;
+}
+
+function createAppOperations(
+  options: HubRuntimeOptions,
+  {
+    daemons,
+    cliAuthorizations,
+    registration,
+    capabilityServer,
+    attachments,
     manualSource,
-    storeForProject,
-    agentValidator,
-    hub.stopRun,
-  );
-  const publicApi = createPublicApi(options.publicApi, publicOperations, {
-    webhookOptions: options.webhookOptions,
-  });
-  const operations: HubOperations = {
+  }: AppOperationDependencies,
+): HubOperations {
+  return {
     handleDaemonEnrollment: (request) =>
       options.database === null
         ? databaseUnavailable()
@@ -417,7 +546,6 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
         ? databaseUnavailable()
         : handleManualTriggerRequest(request, manualSource, entrypoint),
   };
-  return { hub, operations, publicApi, configurationForProject: storeForProject };
 }
 
 /**
@@ -436,12 +564,31 @@ function createAgentValidator(
   };
 }
 
+interface AppPublicOperationDependencies {
+  manualSource: ManualSource;
+  configurationForProject: HubApplication["configurationForProject"];
+  daemonAgentValidator: DaemonAgentConfigurationValidator | null;
+  stopRun: HubRuntime["stopRun"];
+}
+
+function createAppPublicApi(
+  options: HubRuntimeOptions,
+  dependencies: AppPublicOperationDependencies,
+): PublicApi {
+  const publicOperations = createAppPublicOperations(options, dependencies);
+  return createPublicApi(options.publicApi, publicOperations, {
+    webhookOptions: options.webhookOptions,
+  });
+}
+
 function createAppPublicOperations(
   options: HubRuntimeOptions,
-  manualSource: ReturnType<typeof createManualTriggerSource> | undefined,
-  configurationForProject: (projectId: string) => ProjectConfigurationStore,
-  daemonAgentValidator: DaemonAgentConfigurationValidator | null,
-  stopRun: HubRuntime["stopRun"],
+  {
+    manualSource,
+    configurationForProject,
+    daemonAgentValidator,
+    stopRun,
+  }: AppPublicOperationDependencies,
 ) {
   if (options.database === null || manualSource === undefined || daemonAgentValidator === null) {
     return null;
@@ -451,62 +598,63 @@ function createAppPublicOperations(
     createDatabasePublicOperationRepository(database),
     {
       stopRun,
-      triggerForOrganization: (organizationId) => {
-        const store = new OrganizationTriggerStore(database, organizationId, daemonAgentValidator);
-        return {
-          async list() {
-            return Promise.all(
-              (await store.list()).map(async (trigger) => ({
-                id: trigger.id,
-                name: trigger.name,
-                enabled: trigger.enabled,
-                format: trigger.format,
-                yaml: (await store.activeRevision(trigger)).yaml,
-              })),
-            );
-          },
-          async validate(yaml) {
-            const prepared = await store.validate(yaml);
-            return { name: prepared.compiled.authored.name };
-          },
-          async install(input) {
-            const prepared = await store.validate(input.yaml);
-            const existing = (await store.list()).find(
-              ({ name }) => name === prepared.compiled.authored.name,
-            );
-            const trigger = await store.save({
-              ...(existing === undefined ? {} : { triggerId: existing.id }),
-              yaml: input.yaml,
-              userId: null,
-              sourceEvidence: {
-                kind: input.credentialKind === "apiKey" ? "api-key" : "cli-credential",
-                credentialId: input.credentialId,
-                authoredFormat: "self_contained_trigger_v1",
-              },
-            });
-            const revision = await store.activeRevision(trigger);
-            return {
-              triggerId: trigger.id,
-              name: trigger.name,
-              revisionId: revision.id,
-              version: revision.version,
-            };
-          },
-        };
-      },
+      triggerForOrganization: (organizationId) =>
+        createOrganizationTriggerOperations(
+          new OrganizationTriggerStore(database, organizationId, daemonAgentValidator),
+        ),
       configurationForProject,
       validateBundleForOrganization: (organizationId, files) =>
-        validateHubBundleForOrganization(
-          database,
-          organizationId,
-          files,
-          daemonAgentValidator ?? undefined,
-        ),
+        validateHubBundleForOrganization(database, organizationId, files, daemonAgentValidator),
       dispatchManualEvent: (input) => dispatchManualTrigger(manualSource, input),
     },
     options.daemonClock,
     options.webhookOptions,
   );
+}
+
+function createOrganizationTriggerOperations(
+  store: OrganizationTriggerStore,
+): ReturnType<NonNullable<PublicOperationCapabilities["triggerForOrganization"]>> {
+  return {
+    async list() {
+      return Promise.all(
+        (await store.list()).map(async (trigger) => ({
+          id: trigger.id,
+          name: trigger.name,
+          enabled: trigger.enabled,
+          format: trigger.format,
+          yaml: (await store.activeRevision(trigger)).yaml,
+        })),
+      );
+    },
+    async validate(yaml) {
+      const prepared = await store.validate(yaml);
+      return { name: prepared.compiled.authored.name };
+    },
+    async install(input) {
+      const prepared = await store.validate(input.yaml);
+      const existing = (await store.list()).find(
+        ({ name }) => name === prepared.compiled.authored.name,
+      );
+      const trigger = await store.save({
+        ...(existing === undefined ? {} : { triggerId: existing.id }),
+        yaml: input.yaml,
+        userId: null,
+        sourceEvidence: {
+          kind: input.credentialKind === "apiKey" ? "api-key" : "cli-credential",
+          credentialId: input.credentialId,
+          authoredFormat: "self_contained_trigger_v1",
+        },
+      });
+      const revision = await store.activeRevision(trigger);
+      return {
+        triggerId: trigger.id,
+        name: trigger.name,
+        revisionId: revision.id,
+        version: revision.version,
+      };
+    },
+  };
 }
 
 function createAppExecutionCapabilityServer(
@@ -601,19 +749,19 @@ function createAppDaemonModule(
       ? {}
       : { executionAuthority: options.executionAuthority }),
     ...(options.publicBaseUrl === undefined ? {} : { publicBaseUrl: options.publicBaseUrl }),
-    ...(usesTestTiming
-      ? {
-          test: {
-            ...(options.executionDeadlineClock === undefined
-              ? {}
-              : { deadlineClock: options.executionDeadlineClock }),
-            ...(options.dispatchTimeoutMs === undefined
-              ? {}
-              : { dispatchTimeoutMs: options.dispatchTimeoutMs }),
-          },
-        }
-      : {}),
+    ...(usesTestTiming ? { test: createDaemonTestTiming(options) } : {}),
   });
+}
+
+function createDaemonTestTiming(options: HubRuntimeOptions) {
+  return {
+    ...(options.executionDeadlineClock === undefined
+      ? {}
+      : { deadlineClock: options.executionDeadlineClock }),
+    ...(options.dispatchTimeoutMs === undefined
+      ? {}
+      : { dispatchTimeoutMs: options.dispatchTimeoutMs }),
+  };
 }
 
 function appNotificationSource(options: HubRuntimeOptions): TriggerSource | undefined {
