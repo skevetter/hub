@@ -11,6 +11,6 @@ pre-commit:
       run: npm run lint -- {staged_files}
     - name: lint-strict
       glob: "*.{ts,tsx}"
-      run: npm run lint:strict -- {staged_files}
+      run: npm run lint:strict -- --staged {staged_files}
     - name: typecheck
       run: npm run typecheck
