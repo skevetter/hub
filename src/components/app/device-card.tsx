@@ -15,7 +15,7 @@ const STATUS = {
 
 const IDENTITY = "flex min-w-0 items-start gap-3";
 const STATUS_ROW = "flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground";
-const GLYPH = "size-8 shrink-0 rounded-md";
+const GLYPH = "size-8 shrink-0 rounded-sm";
 
 export function DeviceCard({
   name,

@@ -101,7 +101,7 @@ function SheetTitle({ className, ...props }: React.ComponentProps<typeof SheetPr
   return (
     <SheetPrimitive.Title
       data-slot="sheet-title"
-      className={cn("text-base font-title text-foreground", className)}
+      className={cn("text-base font-strong text-foreground", className)}
       {...props}
     />
   );

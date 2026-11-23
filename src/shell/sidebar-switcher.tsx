@@ -90,7 +90,7 @@ export function SidebarIdentity({
   tone = "primary",
 }: SwitcherFace) {
   return (
-    <div className="flex h-12 w-full items-center gap-2 overflow-hidden rounded-md px-2 text-left text-sm group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!">
+    <div className="flex h-12 w-full items-center gap-2 overflow-hidden rounded-sm px-2 text-left text-sm group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!">
       <Face
         media={media}
         primary={primary}
@@ -117,7 +117,7 @@ function Face({
       {size === "lg" ? (
         <span
           className={cn(
-            "flex aspect-square size-8 shrink-0 items-center justify-center rounded-md text-xs",
+            "flex aspect-square size-8 shrink-0 items-center justify-center rounded-sm text-xs",
             tone === "primary" ? "bg-primary text-primary-foreground" : "bg-sidebar-accent",
           )}
         >

@@ -51,7 +51,7 @@ function Crumb({ context = false, children }: { context?: boolean; children: str
         context && "hidden text-muted-foreground sm:flex",
       )}
     >
-      <span aria-hidden="true" className="text-extra-muted-foreground">
+      <span aria-hidden="true" className="text-muted-foreground">
         /
       </span>
       <span className="truncate">{children}</span>

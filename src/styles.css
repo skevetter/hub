@@ -2,148 +2,164 @@
 
 /*
  * The one place tokens are defined. `docs/design.md` is the contract; this file is its
- * implementation, and `src/typography-policy.test.ts` enforces the parts a regex can see.
+ * implementation, and `src/typography-policy.test.ts` enforces the parts a regex can see,
+ * including that every token below has a value in both themes and that text pairs clear AA.
  *
- * Both ramps are Linear's measured palette: four neutral surfaces above the page, four text
- * steps, two border steps. Nothing here is a hue except `--link` and `--ring`, which stay Paseo
- * green so the product still signs its name somewhere. `--primary` is the one place that hue is
- * a surface rather than text: a dark teal fill under a pale mint label, dark enough that the
- * label clears AA at every size the filled button is drawn.
- *
- * The app renders dark (`<html class="dark">`). The light column is kept correct so switching
- * is a one-line change, not a re-derivation.
+ * Grid: paper and ink, one ink rail, and four state inks that each mean one thing. Colour is
+ * information here; nothing below is decoration.
  */
 
 :root {
-  --background: #ffffff;
-  --foreground: #282a30;
-  --card: #f8f8f8;
-  --card-foreground: #282a30;
-  --popover: #ffffff;
-  --popover-foreground: #282a30;
-  --primary: #1d5c50;
-  --primary-foreground: #eefaf4;
-  --link: #20744a;
-  --secondary: #f0f0f0;
-  --secondary-foreground: #282a30;
-  --muted: #f4f4f4;
-  --muted-foreground: #6f6e77;
-  --extra-muted-foreground: #86848d;
-  --accent: #f0f0f0;
-  --accent-foreground: #282a30;
-  --destructive: #b04138;
+  --background: #f7f7f4;
+  --foreground: #111111;
+  --card: #efefeb;
+  --card-foreground: #111111;
+  --popover: #f7f7f4;
+  --popover-foreground: #111111;
+  --primary: #111111;
+  --primary-foreground: #f7f7f4;
+  --secondary: #efefeb;
+  --secondary-foreground: #111111;
+  --muted: #efefeb;
+  --muted-foreground: #5a5a55;
+  --accent: #e6e6e1;
+  --accent-foreground: #111111;
+  --destructive: #b71d14;
   --destructive-foreground: #ffffff;
-  --border: #e9e8ea;
-  --input: #e4e2e4;
-  --ring: #20744a;
+  --border: #d9d9d4;
+  --input: #8a8a85;
+  --ring: #111111;
+  --link: var(--foreground);
 
   /* The only shadow in the system. Floating layers only: menus, popovers, dialogs, sheets. */
-  --shadow-floating: 0 2px 4px rgb(0 0 0 / 10%);
+  --shadow-floating: 0 8px 24px rgb(17 17 17 / 12%);
 
-  /* Status signals. Pills pair the foreground with the matching 10%-alpha surface. */
-  --success: #166534;
-  --success-surface: rgb(22 101 52 / 10%);
-  --warning: #92400e;
-  --warning-surface: rgb(146 64 14 / 10%);
-  --danger: #991b1b;
-  --danger-surface: rgb(153 27 27 / 10%);
-  --neutral: #52525b;
-  --neutral-surface: rgb(82 82 91 / 10%);
+  /* State inks. A block is the fill under its `-foreground` label; `-text` is the same state as type. */
+  --attention: #d9261c;
+  --attention-foreground: #ffffff;
+  --attention-text: #b71d14;
+  --live: #2340d6;
+  --live-foreground: #ffffff;
+  --live-text: #2340d6;
+  --done: #111111;
+  --done-foreground: #f7f7f4;
+  --done-text: #111111;
+  --off: #d9d9d4;
+  --off-foreground: #111111;
+  --off-text: #5a5a55;
 
-  --chart-1: #20744a;
-  --chart-2: #2563eb;
-  --chart-3: #d97706;
-  --chart-4: #9333ea;
-  --chart-5: #0891b2;
+  /* The rail stays ink in both themes; it is the one committed colour field. */
+  --rail: #111111;
+  --rail-foreground: #f7f7f4;
+  --rail-muted: #a8a8a3;
+  --rail-accent: #262626;
+  --rail-border: #2e2e2e;
 
-  /* The sidebar is the page, not a tinted panel. */
-  --sidebar: var(--background);
-  --sidebar-foreground: var(--foreground);
-  --sidebar-primary: var(--primary);
-  --sidebar-primary-foreground: var(--primary-foreground);
-  --sidebar-accent: var(--accent);
-  --sidebar-accent-foreground: var(--foreground);
-  --sidebar-border: var(--border);
-  --sidebar-ring: var(--ring);
+  /* Status tones read by `StatusPill` and `Checklist` until rows move to `StateBlock`. No amber. */
+  --success: var(--done-text);
+  --warning: var(--attention-text);
+  --danger: var(--attention-text);
+  --neutral: var(--off-text);
+
+  --sidebar: var(--rail);
+  --sidebar-foreground: var(--rail-foreground);
+  --sidebar-primary: var(--live);
+  --sidebar-primary-foreground: var(--live-foreground);
+  --sidebar-accent: var(--rail-accent);
+  --sidebar-accent-foreground: var(--rail-foreground);
+  --sidebar-border: var(--rail-border);
+  --sidebar-ring: var(--rail-foreground);
 }
 
 .dark {
-  --background: #08090a;
-  --foreground: #f7f8f8;
-  --card: #0f1011;
-  --card-foreground: #f7f8f8;
-  --popover: #141516;
-  --popover-foreground: #f7f8f8;
-  --primary: #1b4f4a;
-  --primary-foreground: #bfe6da;
-  --link: #7ccba0;
-  --secondary: #191a1b;
-  --secondary-foreground: #f7f8f8;
-  --muted: #141516;
-  --muted-foreground: #8a8f98;
-  --extra-muted-foreground: #62666d;
-  --accent: #191a1b;
-  --accent-foreground: #f7f8f8;
-  --destructive: #e8837a;
-  --destructive-foreground: #08090a;
-  --border: #23252a;
-  --input: #34343a;
-  --ring: #7ccba0;
+  --background: #111111;
+  --foreground: #ededea;
+  --card: #1a1a1a;
+  --card-foreground: #ededea;
+  --popover: #1a1a1a;
+  --popover-foreground: #ededea;
+  --primary: #ededea;
+  --primary-foreground: #111111;
+  --secondary: #1a1a1a;
+  --secondary-foreground: #ededea;
+  --muted: #1a1a1a;
+  --muted-foreground: #a5a5a0;
+  --accent: #242424;
+  --accent-foreground: #ededea;
+  --destructive: #ff7b70;
+  --destructive-foreground: #111111;
+  --border: #2f2f2c;
+  --input: #6f6f6a;
+  --ring: #ededea;
 
-  --shadow-floating: 0 7px 32px rgb(0 0 0 / 35%);
+  --shadow-floating: 0 8px 32px rgb(0 0 0 / 45%);
 
-  --success: #4ade80;
-  --success-surface: rgb(74 222 128 / 12%);
-  --warning: #fbbf24;
-  --warning-surface: rgb(251 191 36 / 12%);
-  --danger: #fca5a5;
-  --danger-surface: rgb(252 165 165 / 12%);
-  --neutral: #d4d4d8;
-  --neutral-surface: rgb(212 212 216 / 12%);
+  --attention: #ff6b5f;
+  --attention-foreground: #111111;
+  --attention-text: #ff7b70;
+  --live: #8ca0ff;
+  --live-foreground: #111111;
+  --live-text: #93a6ff;
+  --done: #ededea;
+  --done-foreground: #111111;
+  --done-text: #ededea;
+  --off: #2f2f2c;
+  --off-foreground: #ededea;
+  --off-text: #a5a5a0;
 
-  --chart-1: #7ccba0;
-  --chart-2: #6a9de0;
-  --chart-3: #d4a44a;
-  --chart-4: #b07ad0;
-  --chart-5: #4aabb8;
+  --rail: #0a0a0a;
+  --rail-foreground: #f7f7f4;
+  --rail-muted: #a8a8a3;
+  --rail-accent: #1f1f1f;
+  --rail-border: #2e2e2e;
+}
+
+/* Titles and figures step down on phones; the role keeps its name. */
+@media (width < 860px) {
+  :root {
+    --text-xl: 28px;
+    --text-xl--line-height: 32px;
+    --text-3xl: 48px;
+    --text-3xl--line-height: 48px;
+  }
 }
 
 @theme {
-  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Archivo Variable", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
 
   /*
-   * Tailwind's size names remapped to Linear's density. Use the name for the role, not the
-   * pixel: `text-sm` is the UI size and the `<body>` default, `text-xs` is meta, `text-xl` is
-   * the page title. See docs/design.md for the full role table.
+   * Tailwind's size names remapped to the Grid scale. Use the name for the role, not the pixel:
+   * `text-sm` is the UI size, `text-base` is prose and the `<body>` default, `text-xl` is the page
+   * title, `text-2xl` and `text-3xl` are figures. Tracking exists only here, on those sizes.
    */
   --text-xs: 12px;
   --text-xs--line-height: 16px;
-  --text-sm: 13px;
+  --text-sm: 14px;
   --text-sm--line-height: 20px;
   --text-base: 15px;
   --text-base--line-height: 24px;
-  --text-lg: 17px;
+  --text-lg: 20px;
   --text-lg--line-height: 24px;
-  --text-xl: 20px;
-  --text-xl--line-height: 28px;
-  --text-2xl: 24px;
-  --text-2xl--line-height: 32px;
-  --text-3xl: 32px;
-  --text-3xl--line-height: 36px;
+  --text-xl: 32px;
+  --text-xl--line-height: 36px;
+  --text-xl--letter-spacing: -0.015em;
+  --text-2xl: 40px;
+  --text-2xl--line-height: 40px;
+  --text-2xl--letter-spacing: -0.025em;
+  --text-3xl: 56px;
+  --text-3xl--line-height: 56px;
+  --text-3xl--letter-spacing: -0.03em;
 
   /*
-   * One weight. Clearing the namespace deletes every stock weight utility, so the rule cannot
-   * be broken by accident: the only elevated weight left is the title one, and it belongs on
-   * the single title of a surface. See docs/design.md.
+   * Two weights. Clearing the namespace deletes every stock weight utility; the strong weight is
+   * the one elevated step and only components set it. See docs/design.md.
    */
   --font-weight-*: initial;
   --font-weight-normal: 400;
-  --font-weight-title: 500;
+  --font-weight-strong: 600;
 
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
-  --radius-xl: 12px;
+  --radius-sm: 2px;
 }
 
 @theme inline {
@@ -160,7 +176,6 @@
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
-  --color-extra-muted-foreground: var(--extra-muted-foreground);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
@@ -168,19 +183,31 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-attention: var(--attention);
+  --color-attention-foreground: var(--attention-foreground);
+  --color-attention-text: var(--attention-text);
+  --color-live: var(--live);
+  --color-live-foreground: var(--live-foreground);
+  --color-live-text: var(--live-text);
+  --color-done: var(--done);
+  --color-done-foreground: var(--done-foreground);
+  --color-done-text: var(--done-text);
+  --color-off: var(--off);
+  --color-off-foreground: var(--off-foreground);
+  --color-off-text: var(--off-text);
+  --color-rail: var(--rail);
+  --color-rail-foreground: var(--rail-foreground);
+  --color-rail-muted: var(--rail-muted);
+  --color-rail-accent: var(--rail-accent);
+  --color-rail-border: var(--rail-border);
   --color-success: var(--success);
-  --color-success-surface: var(--success-surface);
+  --color-success-surface: color-mix(in srgb, var(--success) 10%, transparent);
   --color-warning: var(--warning);
-  --color-warning-surface: var(--warning-surface);
+  --color-warning-surface: color-mix(in srgb, var(--warning) 10%, transparent);
   --color-danger: var(--danger);
-  --color-danger-surface: var(--danger-surface);
+  --color-danger-surface: color-mix(in srgb, var(--danger) 10%, transparent);
   --color-neutral: var(--neutral);
-  --color-neutral-surface: var(--neutral-surface);
-  --color-chart-1: var(--chart-1);
-  --color-chart-2: var(--chart-2);
-  --color-chart-3: var(--chart-3);
-  --color-chart-4: var(--chart-4);
-  --color-chart-5: var(--chart-5);
+  --color-neutral-surface: color-mix(in srgb, var(--neutral) 10%, transparent);
   --color-sidebar: var(--sidebar);
   --color-sidebar-foreground: var(--sidebar-foreground);
   --color-sidebar-primary: var(--sidebar-primary);
@@ -197,29 +224,35 @@
     @apply border-border;
   }
 
+  html {
+    color-scheme: light;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
   body {
-    @apply bg-background font-sans text-sm text-foreground;
-    /* Linear's glyph alternates: single-storey `a` off, disambiguated `l`. Not spacing. */
-    font-feature-settings: "cv01", "ss03";
+    @apply bg-background font-sans text-base text-foreground;
     font-synthesis-weight: none;
     text-rendering: optimizeLegibility;
   }
 
-  /* The UA default for `th` is bold, and no weight utility survives to override it. */
+  /* The UA default for `th` is bold; a table header that wants weight asks for the strong token. */
   th {
     font-weight: 400;
   }
 
   /* Default focus ring. Composite controls may own focus styling in their primitives. */
   :focus-visible {
-    outline: 1px solid var(--ring);
+    outline: 2px solid var(--ring);
     outline-offset: 2px;
   }
 
   /*
    * One selection colour, for the whole document rather than per control. Selecting is how a
-   * value gets copied when the clipboard is unavailable, and the browser's default is a blue
-   * nobody here chose — on a near-black surface it is the loudest thing on the page.
+   * value gets copied when the clipboard is unavailable, and the browser default is a hue nobody
+   * here chose.
    */
   ::selection {
     background-color: var(--primary);

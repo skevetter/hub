@@ -44,7 +44,7 @@ export function Card({
     <section
       aria-label={label}
       className={cn(
-        "grid min-w-0 gap-4 rounded-xl border bg-card p-6",
+        "grid min-w-0 gap-4 rounded-sm border bg-card p-6",
         status !== undefined && "content-start",
         className,
       )}
@@ -88,7 +88,7 @@ export function Card({
 /** The same box before its contents are known, so nothing moves when they land. */
 export function CardSkeleton({ lines = 3 }: { lines?: number }) {
   return (
-    <div aria-busy="true" className="grid min-w-0 gap-3 rounded-xl border bg-card p-6">
+    <div aria-busy="true" className="grid min-w-0 gap-3 rounded-sm border bg-card p-6">
       {Array.from({ length: lines }, (_, line) => (
         <Skeleton key={line} className={cn("h-4", line === 0 ? "w-40" : "w-full")} />
       ))}

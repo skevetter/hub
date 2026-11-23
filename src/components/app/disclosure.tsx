@@ -46,14 +46,14 @@ export function Disclosure({
     <Collapsible
       open={open}
       onOpenChange={onOpenChange}
-      className="min-w-0 rounded-xl border bg-card"
+      className="min-w-0 rounded-sm border bg-card"
       data-provider={id}
     >
       <CollapsibleTrigger
         id={headerId}
         aria-controls={bodyId}
         className={cn(
-          "grid w-full items-center gap-x-3 gap-y-1 rounded-xl px-4 py-3 text-left sm:flex sm:gap-3",
+          "grid w-full items-center gap-x-3 gap-y-1 rounded-sm px-4 py-3 text-left sm:flex sm:gap-3",
           compact.columns,
           "hover:bg-accent",
         )}

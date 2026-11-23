@@ -107,7 +107,7 @@ export function Combobox<T extends ComboboxOption>({
               "flex min-w-0 items-center gap-2",
               comboboxSelection(options, value) === undefined &&
                 value === "" &&
-                "text-extra-muted-foreground",
+                "text-muted-foreground",
             )}
           >
             {comboboxSelection(options, value)?.icon}
