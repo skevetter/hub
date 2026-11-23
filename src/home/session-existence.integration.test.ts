@@ -112,13 +112,25 @@ it("keeps the reader's existence fact across membership, ownership and closure",
   });
 }, 90_000);
 
+async function insertInBatches(count: number, insert: (size: number) => Promise<unknown>) {
+  const batchSize = 1_000;
+  let slowestMs = 0;
+  for (let remaining = count; remaining > 0; remaining -= batchSize) {
+    const started = performance.now();
+    await insert(Math.min(remaining, batchSize));
+    slowestMs = Math.max(slowestMs, performance.now() - started);
+  }
+  return slowestMs;
+}
+
 it("keeps the PostgreSQL existence plan independent of revoked daemons and other readers' archive", async () => {
   await withStores(async ({ pg, runtime }) => {
     await seed(pg, "fixture", true);
     await seed(pg, "other", true);
     async function insertArchive(org: string, count: number) {
-      await runtime.query(
-        `with added as (
+      const slowestMs = await insertInBatches(count, (size) =>
+        runtime.query(
+          `with added as (
            insert into interactive_sessions
              (id, organization_id, profile_id, profile_version, launch, daemon_id, title, state,
               started_by_user_id, start_idempotency_key, start_request_hash, closed_at)
@@ -131,10 +143,12 @@ it("keeps the PostgreSQL existence plan independent of revoked daemons and other
          insert into interactive_session_participants (organization_id, session_id, user_id, role)
          select organization_id, id, users.user_id, users.role from added
          cross join (values ('member', 'controller'), ('viewer', 'viewer')) users(user_id, role)`,
-        [org, count],
+          [org, size],
+        ),
       );
       await runtime.query("analyze interactive_sessions");
       await runtime.query("analyze interactive_session_participants");
+      return slowestMs;
     }
 
     async function measure() {
@@ -164,12 +178,14 @@ it("keeps the PostgreSQL existence plan independent of revoked daemons and other
     }
 
     // Measure both probes at the same B-tree depth, with the baseline rows in another organization.
-    await insertArchive("other", 30_000);
+    const otherArchiveMs = await insertArchive("other", 30_000);
     const before = await measure();
-    await runtime.query(`
+    const revokedDaemonsMs = await insertInBatches(10_000, (size) =>
+      runtime.query(
+        `
       with enrolled as (
         select gen_random_uuid() as daemon_id, gen_random_uuid() as machine_id
-        from generate_series(1,10000)
+        from generate_series(1, $1)
       ), inserted_machines as (
         insert into machines (id, org_id, source, status)
         select machine_id, 'fixture', jsonb_build_object('kind', 'daemon', 'daemonId', daemon_id), 'alive'
@@ -181,15 +197,20 @@ it("keeps the PostgreSQL existence plan independent of revoked daemons and other
       select e.daemon_id, e.daemon_id::text, 'test', e.daemon_id::text, m.id, 'fixture',
              'test', 'test', 'test', '["hub.execute"]'::jsonb, 'revoked', 'offline', now()
       from enrolled e join inserted_machines m on m.id = e.machine_id
-    `);
+    `,
+        [size],
+      ),
+    );
     await runtime.query("analyze daemons");
     const revoked = await measure();
-    await insertArchive("fixture", 15_000);
+    const fixtureArchiveMs = await insertArchive("fixture", 15_000);
     const archived = await measure();
 
     if (process.env["HUB_HOME_SESSION_EXPLAIN"] === "1") {
+      const slowestMs = Math.max(otherArchiveMs, revokedDaemonsMs, fixtureArchiveMs);
       process.stdout.write(
-        `Home session probe buffers: ${before.buffers}, ${revoked.buffers}, ${archived.buffers}\n` +
+        `Slowest home session seed statement: ${slowestMs.toFixed(1)} ms\n` +
+          `Home session probe buffers: ${before.buffers}, ${revoked.buffers}, ${archived.buffers}\n` +
           archived.plans.join("\n\n") +
           "\n",
       );
