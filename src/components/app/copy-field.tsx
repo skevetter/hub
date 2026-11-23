@@ -119,6 +119,16 @@ export function CodeBlock({ label, children }: { label?: string; children: strin
   );
 }
 
+interface CopyFieldProps {
+  label: string;
+  value: string;
+  /** The copy button's accessible name, when "Copy <label>" is not what it should say. */
+  copyLabel?: string;
+  focusOnMount?: boolean;
+  /** The value is a sentence, not an identifier, so it wraps between words instead of anywhere. */
+  prose?: boolean;
+}
+
 /**
  * A value to copy, its label, and the one control that copies it.
  *
@@ -135,39 +145,10 @@ export function CopyField({
   copyLabel,
   focusOnMount = false,
   prose = false,
-}: {
-  label: string;
-  value: string;
-  /** The copy button's accessible name, when "Copy <label>" is not what it should say. */
-  copyLabel?: string;
-  focusOnMount?: boolean;
-  /** The value is a sentence, not an identifier, so it wraps between words instead of anywhere. */
-  prose?: boolean;
-}) {
+}: CopyFieldProps) {
   const { state, copy, announcement } = useCopy(label, value);
   const id = useId();
-  const text = useRef<HTMLSpanElement>(null);
-  const field = useRef<HTMLInputElement>(null);
-  useEffect(() => {
-    if (!focusOnMount) return;
-    field.current?.focus();
-    field.current?.select();
-  }, [focusOnMount]);
-  // The manual path has to leave the operator something to do: put the whole value in their
-  // selection so the browser's own copy shortcut finishes the job.
-  const select = useCallback(() => {
-    if (field.current !== null) {
-      field.current.select();
-      return;
-    }
-    const node = text.current;
-    if (node === null) return;
-    const range = document.createRange();
-    range.selectNodeContents(node);
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-  }, []);
+  const { text, field, select } = useCopySelection(focusOnMount);
   const onCopy = useCallback(() => {
     copy();
     select();
@@ -215,6 +196,32 @@ export function CopyField({
       <Announcement message={announcement} />
     </Field>
   );
+}
+
+function useCopySelection(focusOnMount: boolean) {
+  const text = useRef<HTMLSpanElement>(null);
+  const field = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!focusOnMount) return;
+    field.current?.focus();
+    field.current?.select();
+  }, [focusOnMount]);
+  // The manual path has to leave the operator something to do: put the whole value in their
+  // selection so the browser's own copy shortcut finishes the job.
+  const select = useCallback(() => {
+    if (field.current !== null) {
+      field.current.select();
+      return;
+    }
+    const node = text.current;
+    if (node === null) return;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  }, []);
+  return { text, field, select };
 }
 
 function selectOnFocus(event: { currentTarget: HTMLInputElement }): void {

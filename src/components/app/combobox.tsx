@@ -1,4 +1,3 @@
-/* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop -- each item's select handler is scoped to the option rendered beside it */
 import { CheckIcon, ChevronsUpDownIcon } from "lucide-react";
 import { useCallback, useId, useState, type ReactNode } from "react";
 
@@ -20,31 +19,7 @@ export interface ComboboxOption {
   disabled?: boolean;
 }
 
-/**
- * Pick one of many, with search. The one dropdown on the dashboard: a model, a repository, an
- * event type. It hands back the whole option rather than its value, so a caller that needs the
- * record behind the choice does not have to look it up again.
- *
- * A value that is no longer among the options is shown, marked unavailable, rather than
- * silently reading as empty — a trigger pointing at a model the daemon stopped offering must
- * say so instead of looking unset.
- */
-export function Combobox<T extends ComboboxOption>({
-  id,
-  label,
-  value,
-  options,
-  onChange,
-  placeholder,
-  searchPlaceholder,
-  loading = false,
-  required = false,
-  disabled = false,
-  renderOption,
-  empty,
-  "aria-invalid": invalid,
-  "aria-describedby": describedBy,
-}: {
+interface ComboboxProps<T extends ComboboxOption> {
   id: string;
   /** The accessible name, when no `FormField` label points at this control. */
   label?: string;
@@ -56,7 +31,7 @@ export function Combobox<T extends ComboboxOption>({
   /**
    * What the search box says. Defaults to the trigger's own placeholder with an ellipsis, which
    * is right when the trigger names the thing; name it separately when the search is doing
-   * something the trigger's words do not describe, e.g. "Search models…".
+   * something the trigger's words do not describe, e.g. "Search models...".
    */
   searchPlaceholder?: string;
   /** The options are still arriving. The list says so rather than saying there are none. */
@@ -73,7 +48,27 @@ export function Combobox<T extends ComboboxOption>({
    */
   "aria-invalid"?: boolean;
   "aria-describedby"?: string;
-}) {
+}
+
+/**
+ * Pick one of many, with search. The one dropdown on the dashboard: a model, a repository, an
+ * event type. It hands back the whole option rather than its value, so a caller that needs the
+ * record behind the choice does not have to look it up again.
+ *
+ * A value that is no longer among the options is shown, marked unavailable, rather than
+ * silently reading as empty — a trigger pointing at a model the daemon stopped offering must
+ * say so instead of looking unset.
+ */
+export function Combobox<T extends ComboboxOption>(props: ComboboxProps<T>) {
+  const {
+    value,
+    options,
+    onChange,
+    placeholder,
+    searchPlaceholder,
+    loading = false,
+    renderOption,
+  } = props;
   const [open, setOpen] = useState(false);
   const listId = useId();
   const choose = useCallback(
@@ -88,86 +83,159 @@ export function Combobox<T extends ComboboxOption>({
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button
-          id={id}
+          id={props.id}
           type="button"
           variant="outline"
           role="combobox"
           aria-expanded={open}
           aria-controls={listId}
-          {...(label === undefined ? {} : { "aria-label": label })}
-          {...(required ? { "aria-required": true } : {})}
-          {...(invalid === undefined ? {} : { "aria-invalid": invalid })}
-          {...(describedBy === undefined ? {} : { "aria-describedby": describedBy })}
-          disabled={disabled}
+          {...comboboxAria(props)}
+          disabled={props.disabled ?? false}
           data-value={value}
           className="h-auto min-h-8 w-full min-w-0 justify-between py-1 text-left whitespace-normal"
         >
-          <span
-            className={cn(
-              "flex min-w-0 items-center gap-2",
-              comboboxSelection(options, value) === undefined &&
-                value === "" &&
-                "text-muted-foreground",
-            )}
-          >
-            {comboboxSelection(options, value)?.icon}
-            <span className="wrap-anywhere">
-              {comboboxLabel(options, value, placeholder, loading)}
-            </span>
-          </span>
-          {loading ? (
-            <Spinner className="opacity-50" />
-          ) : (
-            <ChevronsUpDownIcon aria-hidden="true" className="size-4 shrink-0 opacity-50" />
-          )}
+          <ComboboxTriggerContent
+            options={options}
+            value={value}
+            placeholder={placeholder}
+            loading={loading}
+          />
         </Button>
       </PopoverTrigger>
       <PopoverContent className="w-(--radix-popper-anchor-width) p-0" align="start">
         <Command>
-          <CommandInput placeholder={searchPlaceholder ?? `${placeholder}…`} />
+          <CommandInput placeholder={searchPlaceholder ?? `${placeholder}\u2026`} />
           <CommandList id={listId}>
-            {loading ? (
-              <div className="flex justify-center py-6">
-                <LoadingLine>Loading…</LoadingLine>
-              </div>
-            ) : (
-              <>
-                <CommandEmpty>{empty}</CommandEmpty>
-                {options.map((option) => (
-                  <CommandItem
-                    key={option.value}
-                    // cmdk keys its search on `value`, and an empty string makes it fall back to
-                    // the rendered text. Naming the label keeps an explicit "no choice" option
-                    // searchable while the real value still travels back through `onChange`.
-                    value={option.value === "" ? option.label : option.value}
-                    {...(option.keywords === undefined ? {} : { keywords: [...option.keywords] })}
-                    {...(option.disabled === undefined ? {} : { disabled: option.disabled })}
-                    data-value={option.value}
-                    onSelect={() => choose(option)}
-                  >
-                    <CheckIcon
-                      aria-hidden="true"
-                      className={cn(option.value === value ? "opacity-100" : "opacity-0")}
-                    />
-                    {option.icon}
-                    {renderOption === undefined ? (
-                      <span className="grid min-w-0 gap-0.5 wrap-anywhere">
-                        <span>{option.label}</span>
-                        {option.detail === undefined ? null : (
-                          <span className="text-xs text-muted-foreground">{option.detail}</span>
-                        )}
-                      </span>
-                    ) : (
-                      renderOption(option)
-                    )}
-                  </CommandItem>
-                ))}
-              </>
-            )}
+            <ComboboxOptions
+              options={options}
+              value={value}
+              loading={loading}
+              empty={props.empty}
+              renderOption={renderOption}
+              choose={choose}
+            />
           </CommandList>
         </Command>
       </PopoverContent>
     </Popover>
+  );
+}
+
+function comboboxAria({
+  label,
+  required,
+  "aria-invalid": invalid,
+  "aria-describedby": describedBy,
+}: Pick<
+  ComboboxProps<ComboboxOption>,
+  "label" | "required" | "aria-invalid" | "aria-describedby"
+>) {
+  return {
+    ...(label === undefined ? {} : { "aria-label": label }),
+    ...(required ? { "aria-required": true } : {}),
+    ...(invalid === undefined ? {} : { "aria-invalid": invalid }),
+    ...(describedBy === undefined ? {} : { "aria-describedby": describedBy }),
+  };
+}
+
+function ComboboxTriggerContent({
+  options,
+  value,
+  placeholder,
+  loading,
+}: Pick<ComboboxProps<ComboboxOption>, "options" | "value" | "placeholder"> & {
+  loading: boolean;
+}) {
+  const selected = comboboxSelection(options, value);
+  return (
+    <>
+      <span
+        className={cn(
+          "flex min-w-0 items-center gap-2",
+          selected === undefined && value === "" && "text-muted-foreground",
+        )}
+      >
+        {selected?.icon}
+        <span className="wrap-anywhere">{comboboxLabel(options, value, placeholder, loading)}</span>
+      </span>
+      {loading ? (
+        <Spinner className="opacity-50" />
+      ) : (
+        <ChevronsUpDownIcon aria-hidden="true" className="size-4 shrink-0 opacity-50" />
+      )}
+    </>
+  );
+}
+
+function ComboboxOptions<T extends ComboboxOption>({
+  options,
+  value,
+  empty,
+  loading,
+  renderOption,
+  choose,
+}: Pick<ComboboxProps<T>, "options" | "value" | "empty"> & {
+  loading: boolean;
+  renderOption: ComboboxProps<T>["renderOption"];
+  choose: (option: T) => void;
+}) {
+  if (loading) {
+    return (
+      <div className="flex justify-center py-6">
+        <LoadingLine>{"Loading\u2026"}</LoadingLine>
+      </div>
+    );
+  }
+  return (
+    <>
+      <CommandEmpty>{empty}</CommandEmpty>
+      {options.map((option) => (
+        <ComboboxItem
+          key={option.value}
+          option={option}
+          selected={option.value === value}
+          renderOption={renderOption}
+          choose={choose}
+        />
+      ))}
+    </>
+  );
+}
+
+function ComboboxItem<T extends ComboboxOption>({
+  option,
+  selected,
+  renderOption,
+  choose,
+}: {
+  option: T;
+  selected: boolean;
+  renderOption: ComboboxProps<T>["renderOption"];
+  choose: (option: T) => void;
+}) {
+  const select = useCallback(() => choose(option), [choose, option]);
+  return (
+    <CommandItem
+      // cmdk needs a nonempty search value even for an explicit "no choice" option.
+      value={option.value === "" ? option.label : option.value}
+      {...(option.keywords === undefined ? {} : { keywords: [...option.keywords] })}
+      {...(option.disabled === undefined ? {} : { disabled: option.disabled })}
+      data-value={option.value}
+      onSelect={select}
+    >
+      <CheckIcon aria-hidden="true" className={cn(selected ? "opacity-100" : "opacity-0")} />
+      {option.icon}
+      {renderOption === undefined ? (
+        <span className="grid min-w-0 gap-0.5 wrap-anywhere">
+          <span>{option.label}</span>
+          {option.detail === undefined ? null : (
+            <span className="text-xs text-muted-foreground">{option.detail}</span>
+          )}
+        </span>
+      ) : (
+        renderOption(option)
+      )}
+    </CommandItem>
   );
 }
 

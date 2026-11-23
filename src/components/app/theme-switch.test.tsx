@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, expect, it, vi } from "vitest";
 import { InitialThemeContext } from "../../theme/index.js";
+import type * as SegmentedControlModule from "./segmented-control.js";
 import { ThemeSwitch } from "./theme-switch.js";
 
 const state = vi.hoisted(() => ({
@@ -8,7 +9,7 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("./segmented-control.js", async (importOriginal) => {
-  const original = await importOriginal<typeof import("./segmented-control.js")>();
+  const original = await importOriginal<typeof SegmentedControlModule>();
   return {
     SegmentedControl: (props: Parameters<typeof original.SegmentedControl>[0]) => {
       state.onChange = props.onChange;
