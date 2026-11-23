@@ -882,8 +882,11 @@ function githubAuthorityFake(now: () => number = Date.now) {
 class TestClock implements ExecutionAuthorityClock {
   private current = Date.parse("2026-08-01T00:00:00.000Z");
   private nextId = 0;
-  private timers = new Map<number, { at: number; callback: () => Promise<void>; ref: boolean }>();
-  private scheduleWaiters = new Set<() => void>();
+  private readonly timers = new Map<
+    number,
+    { at: number; callback: () => Promise<void>; ref: boolean }
+  >();
+  private readonly scheduleWaiters = new Set<() => void>();
 
   now(): number {
     return this.current;

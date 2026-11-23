@@ -85,7 +85,8 @@ describe("script actions in a trigger document", () => {
     const compiled = compileTriggerDocument(NOTIFICATION);
     const environment = { ...compiled.environment, daemonId: "daemon-1" };
     const config = { environments: [environment], triggers: compiled.events };
-    const reparsed = parseCompiledHubConfig(JSON.parse(JSON.stringify(config)));
+    const serialized = JSON.stringify(config);
+    const reparsed = parseCompiledHubConfig(JSON.parse(serialized));
     assert.deepEqual(reparsed.triggers, compiled.events);
     const revision: ProjectConfigurationRevisionRecord = {
       id: "revision",

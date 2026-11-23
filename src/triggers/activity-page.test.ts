@@ -126,7 +126,7 @@ describe("trigger activity pages", () => {
     const { dashboard, request } = await dashboardWithRuns(TOTAL);
     const walked: string[][] = [];
     let cursor: string | undefined;
-    let previous: string[] = [];
+    const previous: string[] = [];
     for (;;) {
       const page = await dashboard.activityPage(request, "acme", {
         limit: 3,
