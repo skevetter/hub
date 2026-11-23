@@ -13,7 +13,7 @@ import {
 } from "../invocation.js";
 
 export const ManualRunPayloadSchema = z.object({
-  expectedVersionId: z.string().uuid().optional(),
+  expectedVersionId: z.uuid().optional(),
   trigger: z.string().min(1),
   actor: z.string().min(1),
   input: z.unknown(),
@@ -22,7 +22,7 @@ export const ManualRunPayloadSchema = z.object({
   publicDeliveryKey: z.string().min(1).optional(),
   authenticatedBy: z
     .object({
-      kind: z.enum(["api-key", "cli-credential"]),
+      kind: z.enum(["api-key", "cli-credential", "browser-session"]),
       credentialId: z.string().min(1),
       boundActor: z.string().nullable().optional(),
     })
@@ -141,9 +141,7 @@ export function createManualRunProvider(
       const store = configurationStoreForProject(external.projectId);
       const payload = ManualRunPayloadSchema.parse(external.payload);
       const stored = await store.getRevision(external.configurationRevisionId);
-      if (!stored) {
-        throw new ManualRunRejected("configuration_not_found");
-      }
+      if (!stored) throw new ManualRunRejected("configuration_not_found");
       if (
         payload.expectedVersionId !== undefined &&
         stored.revision.id !== payload.expectedVersionId
@@ -209,14 +207,10 @@ function authorizeManualTrigger(
   retry: ManualRunIdentity | null | undefined,
 ): void {
   if (retry === null) throw new ManualRunRejected("key_actor_required");
-  const identity = retry ?? payload;
-  authorizeManualIdentity(trigger, identity);
-  if (
-    !trigger.filters?.from_users?.includes("*") &&
-    !trigger.filters?.from_users?.includes(payload.actor)
-  ) {
-    throw new ManualRunRejected("actor_forbidden");
-  }
+  authorizeManualIdentity(trigger, retry ?? payload);
+  if (retry === undefined) return;
+  requireManualActorIdentity(payload);
+  requireAllowedManualActor(trigger, payload.actor);
 }
 
 export function authorizeManualIdentity(
@@ -230,9 +224,33 @@ export function authorizeManualIdentity(
   ) {
     throw new ManualRunRejected("key_actor_required");
   }
+  requireManualActorIdentity(identity);
+  requireAllowedManualActor(trigger, identity.actor);
+}
+
+function requireAllowedManualActor(trigger: CompiledTrigger, actor: string): void {
   const users = trigger.filters?.from_users;
-  if (users?.includes("*")) return;
-  if (!users?.includes(identity.actor)) throw new ManualRunRejected("actor_forbidden");
+  if (!users?.includes("*") && !users?.includes(actor)) {
+    throw new ManualRunRejected("actor_forbidden");
+  }
+}
+
+export function isReservedManualActor(actor: string): boolean {
+  return actor.includes("@");
+}
+
+export function isAccountManualIdentity(identity: ManualRunIdentity): boolean {
+  const kind = identity.authenticatedBy?.kind;
+  return kind === "browser-session" || kind === "cli-credential";
+}
+
+function requireManualActorIdentity(identity: ManualRunIdentity): void {
+  if (!isReservedManualActor(identity.actor)) return;
+  const credential = identity.authenticatedBy;
+  if (credential?.kind === "browser-session") return;
+  // Older CLI receipts could carry a caller-supplied actor without a binding.
+  if (credential?.kind === "cli-credential" && credential.boundActor === identity.actor) return;
+  throw new ManualRunRejected("actor_forbidden");
 }
 
 function createManualRunContext(

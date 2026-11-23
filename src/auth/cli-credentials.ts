@@ -3,6 +3,7 @@ import type { DatabaseRuntime, QueryHandle, QueryRow } from "../db/runtime/index
 import { API_KEY_SCOPES } from "./api-key-contract.js";
 import type { OperationScope } from "./operation-auth.js";
 import type { TenantRouteAccess } from "../db/types.js";
+import type { PublicAuthorization } from "../public-operations/types.js";
 
 import { ORGANIZATION_ROLES } from "./organization-contract.js";
 import { capabilitiesFor } from "./organization-policy.js";
@@ -43,7 +44,10 @@ export class OrganizationCliCredentials {
   async authorize(
     request: Request,
     requiredScope: OperationScope,
-  ): Promise<OperationAuthorizationResult> {
+  ): Promise<
+    | Exclude<OperationAuthorizationResult, { status: "authorized" }>
+    | { status: "authorized"; access: PublicAuthorization }
+  > {
     const token = bearerToken(request.headers.get("authorization"));
     const parsed = token === undefined ? undefined : parseCliCredential(token);
     if (parsed === undefined) return { status: "unauthorized" };
@@ -63,16 +67,18 @@ export class OrganizationCliCredentials {
     if (!CLI_SCOPES.includes(requiredScope)) return { status: "forbidden" };
     const used = await this.pool.query<{
       user_id: string;
+      email: string;
+      email_verified: boolean;
       role: TenantRouteAccess["membership"]["role"];
     }>(
       `update organization_cli_credentials as credential
        set last_used_at = greatest(coalesce(credential.last_used_at, to_timestamp(0)), now())
-       from member
+       from member join "user" as account on account.id = member.user_id
        where credential.id = $1 and credential.revoked_at is null
          and member.organization_id = credential.organization_id
          and member.user_id = credential.created_by_user_id
          and member.role = any($2::text[])
-       returning member.user_id, member.role`,
+       returning member.user_id, member.role, account.email, account.email_verified`,
       [row.id, credentialRoles],
     );
     const user = used.rows[0];
@@ -84,7 +90,12 @@ export class OrganizationCliCredentials {
         credentialId: row.id,
         organizationId: row.organization_id,
         scopes: CLI_SCOPES,
-        user: { id: user.user_id, role: user.role },
+        user: {
+          id: user.user_id,
+          email: user.email,
+          emailVerified: user.email_verified,
+          role: user.role,
+        },
       },
     };
   }

@@ -2,6 +2,7 @@ import type { OperationAuthorization } from "../auth/api-keys.js";
 import type { StopRun, StopRunResult } from "../triggers/run-stop.js";
 import type { HubBundleFile } from "../config/bundle.js";
 import type {
+  AcceptedTriggerRunRecord,
   BoundWebhookTrigger,
   ManualReceiptReplayTarget,
   TriggerRunRecord,
@@ -10,7 +11,9 @@ import type {
 import type { DeploymentProjectResolution } from "../project-deployments/index.js";
 import type { StoredProjectConfiguration } from "../configuration/store.js";
 
-export type PublicAuthorization = OperationAuthorization;
+export type PublicAuthorization = OperationAuthorization & {
+  user?: { email?: string; emailVerified?: boolean };
+};
 
 export interface InstallConfigurationInput {
   projectSlug?: string | undefined;
@@ -101,10 +104,10 @@ export type DispatchManualRunResult =
       providerEventReceiptId: string;
       triggerRunId: string;
       configuredTriggerName: string;
-      workflowStatus: import("../db/types.js").AcceptedTriggerRunRecord["status"];
+      workflowStatus: AcceptedTriggerRunRecord["status"];
     }
   | { status: "project_not_found" }
-  | { status: "actor_forbidden" }
+  | { status: "actor_forbidden"; reason?: "unverified_email" }
   | { status: "key_actor_required" }
   | { status: "daemon_offline" }
   | { status: "expected_configuration_not_current" }
@@ -271,6 +274,7 @@ export interface PublicOperationRepository {
 }
 
 export interface PublicOperationCapabilities {
+  verifiedActorEmailRequired?: boolean;
   stopRun?: StopRun;
   triggerForOrganization?(organizationId: string): {
     list(): Promise<readonly PublicTrigger[]>;

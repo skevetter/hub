@@ -1,4 +1,5 @@
 import type { AuthServer } from "../auth/server.js";
+import type { QueryResult } from "../db/runtime/index.js";
 import { capabilitiesFor } from "../auth/organization-policy.js";
 import type {
   ActivityRunKey,
@@ -35,6 +36,8 @@ import type { RunTimelineReconciler } from "../run-timeline/reconcile.js";
 import type { RunProgressSettings } from "../run-progress/settings.js";
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
 import type { RunTimelineState } from "../run-timeline/store.js";
+import type { DispatchResolvedManualRun } from "../public-operations/manual-dispatch.js";
+import type { DispatchManualRunResult } from "../public-operations/types.js";
 import { z } from "zod";
 
 const DAY_MS = 24 * 60 * 60_000;
@@ -45,8 +48,15 @@ const triggerIdSchema = z.uuid();
 type DashboardTenant = Awaited<ReturnType<typeof resolveRouteTenant>>["tenant"];
 type ActivityCursor = ReturnType<typeof decodeActivityCursor>;
 
+interface ActorEmailQuery {
+  query(sql: string, params: readonly unknown[]): Promise<QueryResult<{ email_verified: boolean }>>;
+}
+
 export interface TriggerDashboardOptions {
   stopRun?: StopRun;
+  dispatchManualRun?: DispatchResolvedManualRun;
+  verifiedActorEmailRequired?: boolean;
+  databaseQuery?: ActorEmailQuery | undefined;
   /** True when this Hub has a token for the GitHub notification poll. The token never leaves it. */
   githubNotificationsEnabled?: boolean;
   progressMessagesEnabled?: boolean;
@@ -262,6 +272,50 @@ export class TriggerDashboard {
       confirmedPeerCount,
       retryAttemptId,
     );
+  }
+
+  async runManualTrigger(
+    request: Request,
+    input: { organizationSlug: string; triggerId: string; deliveryKey: string; input?: unknown },
+  ): Promise<DispatchManualRunResult | { status: "forbidden" }> {
+    if (this.auth.rejectCookieMutation(request, { requireOrigin: true }) !== undefined) {
+      return { status: "forbidden" };
+    }
+    const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, input);
+    const organizationId = tenant.organization.id;
+    const trigger = await this.database.findOrganizationTrigger(organizationId, input.triggerId);
+    if (trigger?.enabled !== true) return { status: "trigger_not_found" };
+    if (this.options.dispatchManualRun === undefined)
+      return { status: "infrastructure_unavailable" };
+    const { id, email } = account.account;
+    if (
+      this.options.verifiedActorEmailRequired === true &&
+      !(await this.hasVerifiedActorEmail(id, email))
+    ) {
+      return { status: "actor_forbidden", reason: "unverified_email" };
+    }
+    return this.options.dispatchManualRun({
+      identity: {
+        organizationId,
+        actor: email.toLowerCase(),
+        authenticatedBy: { kind: "browser-session", credentialId: id, boundActor: null },
+        startedByUserId: id,
+      },
+      projectId: trigger.runtimeProjectId,
+      input: {
+        trigger: trigger.name,
+        deliveryKey: input.deliveryKey,
+        input: input.input === undefined ? "" : input.input,
+      },
+    });
+  }
+
+  private async hasVerifiedActorEmail(userId: string, email: string): Promise<boolean> {
+    const result = await this.options.databaseQuery?.query(
+      'select email_verified from "user" where id = $1 and email = $2',
+      [userId, email],
+    );
+    return result?.rows[0]?.email_verified === true;
   }
 
   private async runDetailForProject(

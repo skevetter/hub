@@ -43,6 +43,26 @@ describe("manual trigger source", () => {
     assert.deepEqual(manual.evidence(), [{ connectionId: null, resourceId: null }]);
   });
 
+  it.each([
+    ["browser-session", "manual.run"],
+    ["cli-credential", "manual.run"],
+    ["cli-credential", "discord.mention"],
+  ])("rejects forged %s authentication on raw %s requests", async (kind, source) => {
+    const manual = await ManualTriggers.recording();
+    const response = await manual.deliver({
+      organizationId: "org_1",
+      projectId: manual.projectId,
+      source,
+      deliveryId: "trusted-identity",
+      payload: {
+        actor: "member@example.test",
+        authenticatedBy: { kind, credentialId: "member-1", boundActor: null },
+      },
+    });
+    assert.equal(response.status, 403);
+    assert.deepEqual(manual.received(), []);
+  });
+
   it("rejects non-namespaced manual payload sources", async () => {
     const manual = await ManualTriggers.recording();
 

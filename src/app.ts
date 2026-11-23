@@ -66,6 +66,7 @@ import {
   createPublicOperations,
   type PublicOperationCapabilities,
 } from "./public-operations/index.js";
+import type { DispatchResolvedManualRun } from "./public-operations/manual-dispatch.js";
 import { createDatabasePublicOperationRepository } from "./public-operations/database-adapter.js";
 import type { EntitlementsService } from "./entitlements/service.js";
 import type { ExecutionAuthority } from "./execution-authority/index.js";
@@ -96,6 +97,7 @@ export interface HubRuntimeOptions {
   /** How many script steps may run at once. */
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
+  verifiedActorEmailRequired?: boolean;
   onProgressRequested?: DurableWorkflowEngineOptions["onProgressRequested"];
   onRunReplyAnswer?: NonNullable<DaemonDispatchLifecycleOptions["onRunReplyAnswer"]>;
   runTimeline?: RunTimeline;
@@ -106,6 +108,7 @@ export interface HubRuntimeOptions {
 
 export interface HubRuntime {
   stopRun: StopRun;
+  dispatchManualRun: DispatchResolvedManualRun;
   daemonModule: DaemonModule | null;
   interactiveSessions: InteractiveSessionCoordinator | null;
   connectionForDaemon(daemonId: string): DaemonConnection | undefined;
@@ -192,6 +195,12 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     workflowEngine,
     options.interactiveSessions,
   );
+  const { publicApi, runOperations } = createAppPublicApi(options, {
+    manualSource,
+    configurationForProject: storeForProject,
+    daemonAgentValidator: agentValidator,
+    stopRun: workflowEngine.stopRun.bind(workflowEngine),
+  });
   const hub = createAppRuntime(options, {
     daemons,
     daemonModule,
@@ -201,12 +210,7 @@ export function createHubApplication(options: HubRuntimeOptions): HubApplication
     workflowEngine,
     workflowDispatcher,
     triggerSources,
-  });
-  const publicApi = createAppPublicApi(options, {
-    manualSource,
-    configurationForProject: storeForProject,
-    daemonAgentValidator: agentValidator,
-    stopRun: hub.stopRun,
+    ...runOperations,
   });
   const operations = createAppOperations(options, {
     daemons,
@@ -359,7 +363,7 @@ interface RuntimeLifecycleDependencies {
 function createAppRuntime(
   options: HubRuntimeOptions,
   dependencies: RuntimeLifecycleDependencies &
-    Pick<HubRuntime, "connectionForDaemon" | "agentValidator">,
+    Pick<HubRuntime, "connectionForDaemon" | "agentValidator" | "stopRun" | "dispatchManualRun">,
 ): HubRuntime {
   const {
     daemonModule,
@@ -368,14 +372,16 @@ function createAppRuntime(
     agentValidator,
     workflowEngine,
     daemons,
+    stopRun,
+    dispatchManualRun,
   } = dependencies;
   return {
     daemonModule,
     interactiveSessions,
     connectionForDaemon,
     agentValidator,
-    stopRun: (actor, runId, confirmedPeerCount, retryAttemptId) =>
-      workflowEngine.stopRun(actor, runId, confirmedPeerCount, retryAttemptId),
+    stopRun,
+    dispatchManualRun,
     resourceCounts: () => appResourceCounts(options, daemonModule),
     processWorkflowOutbox: () => workflowEngine.processAvailable(),
     handleUpgrade:
@@ -574,11 +580,20 @@ interface AppPublicOperationDependencies {
 function createAppPublicApi(
   options: HubRuntimeOptions,
   dependencies: AppPublicOperationDependencies,
-): PublicApi {
+): { publicApi: PublicApi; runOperations: Pick<HubRuntime, "stopRun" | "dispatchManualRun"> } {
   const publicOperations = createAppPublicOperations(options, dependencies);
-  return createPublicApi(options.publicApi, publicOperations, {
-    webhookOptions: options.webhookOptions,
-  });
+  return {
+    publicApi: createPublicApi(options.publicApi, publicOperations, {
+      webhookOptions: options.webhookOptions,
+    }),
+    runOperations: {
+      stopRun: dependencies.stopRun,
+      dispatchManualRun: async (request) =>
+        publicOperations?.dispatchResolvedManualRun(request) ?? {
+          status: "infrastructure_unavailable",
+        },
+    },
+  };
 }
 
 function createAppPublicOperations(
@@ -597,6 +612,7 @@ function createAppPublicOperations(
   return createPublicOperations(
     createDatabasePublicOperationRepository(database),
     {
+      verifiedActorEmailRequired: options.verifiedActorEmailRequired === true,
       stopRun,
       triggerForOrganization: (organizationId) =>
         createOrganizationTriggerOperations(

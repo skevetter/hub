@@ -168,11 +168,22 @@ Hub sends each daemon the authored rendered prompt unchanged. Execution tools ar
 
 Daemon environments may author `worktree.newBranch: "trigger-${{ paseo.execution.id }}"` for a stable branch name unique to each agent execution. Hub materializes the execution UUID before persisting or dispatching the launch intent; recovery reuses that fully rendered intent. This is independent of whether a manual, Slack, Discord, GitHub, or Linear trigger selected the reusable environment. No prompt, context, input, value, step output, or provider event namespace is available in environment configuration, and unsupported expressions fail bundle activation at the authored `newBranch` field.
 
-`deliveryKey` is caller-supplied request identity for the existing durable manual-event path. Hub namespaces it by the authenticated organization and resolved project before persistence, so the same caller key can be used independently in different tenants or projects. Existing receipt/run de-duplication applies, but this API does not promise exactly-once execution or guaranteed response replay; retries can still fail or conflict during restart and timing races. A successful representation contains `deliveryKey`, `providerEventReceiptId`, `triggerRunId`, `configuredTriggerName`, and the durable `workflowStatus`.
+`deliveryKey` is caller-supplied request identity for the existing durable manual-event path. Hub namespaces it by the authenticated organization and resolved project before persistence. For CLI credentials, it also namespaces the key by the account's user ID. Existing receipt/run de-duplication applies, but this API does not promise exactly-once execution or guaranteed response replay; retries can still fail or conflict during restart and timing races. A successful representation contains `deliveryKey`, `providerEventReceiptId`, `triggerRunId`, `configuredTriggerName`, and the durable `workflowStatus`.
 
-For manual-runs, `deliveryKey` remains required. A bound API key supplies the actor; omit `actor`
-or send the same value. A different actor returns `403 actor_forbidden`. A legacy key without a
-bound actor must supply `actor` and cannot start script actions (`403 key_actor_required`).
+For manual runs, `deliveryKey` is required. The credential determines the actor:
+
+- A CLI credential uses its account's lowercase email. Omit `actor` or send that exact email.
+  If Hub cannot resolve the credential's account, it returns `403 key_actor_required`.
+- A bound API key uses its configured actor. Omit `actor` or send that exact value.
+- An unbound API key must supply a slug actor. API keys cannot claim an actor containing `@`.
+
+Email entries in `from_users` must be lowercase. With an account mailer configured, sign-in
+requires a verified email, and manual runs using an unverified account return `403 actor_forbidden`.
+Without a mailer, Hub trusts account emails as set up by the operator and does not verify ownership.
+
+A mismatched or forbidden claim returns `403 actor_forbidden` without recording a delivery.
+Script actions require a bound API key. CLI credentials and unbound keys cannot start them.
+
 An object `input` maps its fields to declared typed inputs, and manual context is available through
 `${{ paseo.context }}`. Unknown triggers and projects without an active configuration return `404`.
 Input errors remain `400 invalid_input`, unlike hooks' `422 invalid_input`. Manual filter mismatches

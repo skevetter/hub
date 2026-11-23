@@ -1,11 +1,11 @@
 import { isDatabaseUnavailableError } from "../../db/errors.js";
-import type { Database, DurableProviderEvent } from "../../db/types.js";
+import type { Database, DurableProviderEvent, ManualEventPersistence } from "../../db/types.js";
 import { reportFailure } from "../../failures/index.js";
 import { logger } from "../../logger.js";
 import type { TriggerDispatchOutcome, TriggerHandler, TriggerSource } from "../index.js";
 import { parseManualTriggerPayload } from "./parse.js";
 import type { ManualTriggerInput } from "./schema.js";
-import { ManualRunPayloadSchema } from "./provider.js";
+import { isAccountManualIdentity, ManualRunPayloadSchema } from "./provider.js";
 
 const ReplayIdentitySchema = ManualRunPayloadSchema.pick({ actor: true, authenticatedBy: true });
 
@@ -57,49 +57,13 @@ export async function dispatchManualTrigger(
     resourceId: trigger.resourceId ?? null,
   });
   if (persisted.status === "duplicate") {
-    logger.info(
-      {
-        source: trigger.source,
-        ...(trigger.boundWebhookTrigger === undefined ? { deliveryId: trigger.deliveryId } : {}),
-        receiptId: persisted.providerEventReceiptId,
-        outcome: "duplicate",
-      },
-      "manual event intake completed",
-    );
+    logManualIntake(trigger, persisted.providerEventReceiptId, "duplicate");
     return { providerEventReceiptId: persisted.providerEventReceiptId, replayed: true };
   }
   if (state.handler === undefined) {
-    const dropped = await state.database.markProviderEventDropped(
-      persisted.event.providerEventReceiptId,
-      "configuration_unavailable",
-      persisted.event.organizationId,
-    );
-    if (!dropped)
-      return { providerEventReceiptId: persisted.event.providerEventReceiptId, replayed: true };
-    logger.info(
-      {
-        source: trigger.source,
-        ...(trigger.boundWebhookTrigger === undefined ? { deliveryId: trigger.deliveryId } : {}),
-        receiptId: persisted.event.providerEventReceiptId,
-        outcome: "dropped",
-        reason: "configuration_unavailable",
-      },
-      "manual event intake completed",
-    );
-    return {
-      providerEventReceiptId: persisted.event.providerEventReceiptId,
-      ...(persisted.replayed === true ? { replayed: true } : {}),
-    };
+    return dropManualEvent(state.database, persisted, trigger);
   }
-  logger.info(
-    {
-      source: trigger.source,
-      ...(trigger.boundWebhookTrigger === undefined ? { deliveryId: trigger.deliveryId } : {}),
-      receiptId: persisted.event.providerEventReceiptId,
-      outcome: "accepted",
-    },
-    "manual event intake completed",
-  );
+  logManualIntake(trigger, persisted.event.providerEventReceiptId, "accepted");
   const event =
     persisted.replayed === true
       ? withManualRetryAuthorization(persisted.event, trigger)
@@ -112,6 +76,42 @@ export async function dispatchManualTrigger(
         replayed: true,
       }
     : outcome;
+}
+
+async function dropManualEvent(
+  database: Database,
+  persisted: Extract<ManualEventPersistence, { status: "accepted" }>,
+  trigger: ManualTriggerInput,
+): Promise<TriggerDispatchOutcome> {
+  const { providerEventReceiptId, organizationId } = persisted.event;
+  const dropped = await database.markProviderEventDropped(
+    providerEventReceiptId,
+    "configuration_unavailable",
+    organizationId,
+  );
+  if (!dropped) return { providerEventReceiptId, replayed: true };
+  logManualIntake(trigger, providerEventReceiptId, "dropped");
+  return {
+    providerEventReceiptId,
+    ...(persisted.replayed === true ? { replayed: true } : {}),
+  };
+}
+
+function logManualIntake(
+  trigger: ManualTriggerInput,
+  receiptId: string,
+  outcome: "duplicate" | "dropped" | "accepted",
+): void {
+  logger.info(
+    {
+      source: trigger.source,
+      ...(trigger.boundWebhookTrigger === undefined ? { deliveryId: trigger.deliveryId } : {}),
+      receiptId,
+      outcome,
+      ...(outcome === "dropped" ? { reason: "configuration_unavailable" } : {}),
+    },
+    "manual event intake completed",
+  );
 }
 
 function withManualRetryAuthorization(event: DurableProviderEvent, request: ManualTriggerInput) {
@@ -146,6 +146,9 @@ async function handleManualRequest(request: Request, source: TriggerSource): Pro
   }
 
   const trigger = parsed;
+  if (hasAccountManualIdentity(trigger.payload)) {
+    return Response.json({ error: "actor_forbidden" }, { status: 403 });
+  }
 
   try {
     await dispatchManualTrigger(source, trigger);
@@ -163,4 +166,10 @@ async function handleManualRequest(request: Request, source: TriggerSource): Pro
   }
 
   return Response.json({ status: "accepted", deliveryId: trigger.deliveryId }, { status: 200 });
+}
+
+function hasAccountManualIdentity(payload: unknown): boolean {
+  // A retry can resolve to a receipt with a different source than the incoming request.
+  const identity = ReplayIdentitySchema.safeParse(payload);
+  return identity.success && isAccountManualIdentity(identity.data);
 }
