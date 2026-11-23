@@ -230,8 +230,8 @@ export function validBindingKey(key: BindingKey) {
   return validInstallation(key) && identifier(key.nativeSessionId);
 }
 
-export function nativeBindingValues(key: BindingKey) {
-  return [key.workspaceId, key.applicationId, key.appUserId, key.nativeSessionId] as const;
+export function nativeBindingValues(key: BindingKey): string[] {
+  return [key.workspaceId, key.applicationId, key.appUserId, key.nativeSessionId];
 }
 
 export function validBinding(input: BindingInput) {

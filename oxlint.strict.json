@@ -36,6 +36,12 @@
         "max-lines-per-function": "off",
         "typescript/no-non-null-assertion": "off"
       }
+    },
+    {
+      "files": ["src/run-payload-retention/summary.ts"],
+      "rules": {
+        "max-params": ["error", { "max": 5 }]
+      }
     }
   ]
 }
