@@ -7,8 +7,12 @@ pre-commit:
         - "**/package-lock.json"
       run: npm run format:check:files -- {staged_files}
     - name: lint
-      glob: "*.{js,jsx,ts,tsx}"
-      run: npm run lint -- {staged_files}
+      glob:
+        - "src/*.{js,jsx,ts,tsx,cjs,cts,mts}"
+        - "src/**/*.{js,jsx,ts,tsx,cjs,cts,mts}"
+        - "vite.config.ts"
+        - "drizzle.config.ts"
+      run: npm run lint
     - name: lint-strict
       glob: "*.{ts,tsx}"
       run: npm run lint:strict -- --staged {staged_files}

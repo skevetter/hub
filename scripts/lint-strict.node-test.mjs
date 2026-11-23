@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   ambientFiles,
@@ -71,3 +74,32 @@ test("passes when no listed file is in scope", () => {
   assert.match(result.stdout, /strict lint: 0 file\(s\) from listed files/u);
   assert.match(result.stdout, /strict lint: 0 problem\(s\)/u);
 });
+
+test("keeps the base billing boundary and its composition root exemption", () => {
+  const dir = mkdtempSync(join(tmpdir(), "strict-billing-"));
+  const probe = join(dir, "probe.ts");
+  writeFileSync(probe, 'import { x } from "./billing/index.js";\nexport const y = x;\n');
+  try {
+    const outside = runOxlint([probe]);
+    assert.match(outside, /on 1 file/u);
+    assert.match(outside, /no-restricted-imports/u);
+    const roots = runOxlint([
+      "--tsconfig",
+      "tsconfig.json",
+      "src/index.ts",
+      "src/application-runtime.ts",
+      "src/server/runtime.ts",
+    ]);
+    assert.match(roots, /on 3 files/u);
+    assert.doesNotMatch(roots, /no-restricted-imports/u);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function runOxlint(args) {
+  const result = spawnSync("node_modules/.bin/oxlint", ["-c", "oxlint.strict.json", ...args], {
+    encoding: "utf8",
+  });
+  return `${result.stdout}${result.stderr}`;
+}
