@@ -62,8 +62,8 @@ export function CommandMenuProvider({
           <DialogDescription className="sr-only">
             Search pages, organizations, and themes
           </DialogDescription>
-          <Command>
-            <CommandInput aria-label="Search commands" placeholder="Search commands..." />
+          <Command label="Search commands">
+            <CommandInput placeholder="Search commands..." />
             <MenuCommands {...commands} close={close} />
           </Command>
         </DialogContent>
