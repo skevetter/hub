@@ -122,7 +122,8 @@ it.each([
 it("keeps the private sensitive-label pattern in sync with the pinned scrubber", () => {
   const declaration =
     "const SENSITIVE_LABEL = /pass|pwd|secret|token|key|auth|basic|bearer|cred|session|cookie|sig/iu;";
-  const source = (file: string) => readFileSync(new URL(file, import.meta.url), "utf8");
-  expect(source("../run-timeline/scrub.ts")).toContain(declaration);
-  expect(source("./tool-steps-content.ts")).toContain(declaration);
+  const pinned = readFileSync(new URL("../run-timeline/scrub.ts", import.meta.url), "utf8");
+  const copy = readFileSync(new URL("./tool-steps-content.ts", import.meta.url), "utf8");
+  expect(pinned).toContain(declaration);
+  expect(copy).toContain(declaration);
 });
