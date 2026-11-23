@@ -6,6 +6,7 @@ import { gfm } from "micromark-extension-gfm";
 import { describe, it } from "vitest";
 import { formatRunReply, nestingTooDeep } from "./format.js";
 import { realisticAnswers } from "./test-utils/answers.js";
+import { yieldToEventLoop } from "./test-utils/event-loop.js";
 import {
   checkFenceTrickDocuments,
   checkNestedDocuments,
@@ -93,7 +94,7 @@ it.each(["www.linear%2Eapp", "www.\uFF4C\uFF49\uFF4E\uFF45\uFF41\uFF52\uFF0E\uFF
 );
 
 // 3,600 documents with HUB_REPLY_FUZZ=1; the default run keeps it short so a loaded host finishes.
-it("leaves no autolink to a profile or mention across generated documents", () => {
+it("leaves no autolink to a profile or mention across generated documents", async () => {
   const perSeed = process.env["HUB_REPLY_FUZZ"] === "1" ? 1_200 : 200;
   const hosts = [
     "linear.app",
@@ -122,6 +123,7 @@ it("leaves no autolink to a profile or mention across generated documents", () =
     const next = random(seed);
     const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
     for (let index = 0; index < perSeed; index += 1) {
+      if (index % 16 === 0) await yieldToEventLoop();
       const url = `${pick(["https://", "http://", "", "www."])}${pick(hosts)}${pick(paths)}`;
       const text = `${pick(lead)}${pick(wrap)(url)} ${pick(wrap)(url)}${"`x` ".repeat(Math.floor(next() * 120))}\n\nend`;
       for (const clock of [{ now: plainClock() }, {}]) {
@@ -251,11 +253,11 @@ it("falls back to plain text when the Markdown step throws", () => {
 });
 
 it("renders generated stacked-container documents safely", () => {
-  checkStackedDocuments({ seed: 7_001, count: 400 });
+  return checkStackedDocuments({ seed: 7_001, count: 400 });
 });
 
 it("renders generated cross-line nesting the same way on every call", () => {
-  checkNestedDocuments({ seed: 8_001, count: 400 });
+  return checkNestedDocuments({ seed: 8_001, count: 400 });
 });
 
 it.each([
@@ -413,6 +415,6 @@ ${"- >".repeat(1_130)}
   });
 
   it("renders generated fence tricks the same way every call", () => {
-    checkFenceTrickDocuments({ seed: 9_001, count: 400 });
+    return checkFenceTrickDocuments({ seed: 9_001, count: 400 });
   });
 });

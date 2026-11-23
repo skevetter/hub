@@ -7,6 +7,9 @@ import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import { formatRunReply } from "../format.js";
+import { yieldToEventLoop } from "./event-loop.js";
+
+const documentsPerTurn = 8;
 
 export function mentionLinks(markdown: string): string[] {
   const found: string[] = [];
@@ -62,7 +65,7 @@ function safeBody(text: string, truncated: boolean, context: string): string {
   return body;
 }
 
-export function checkStackedDocuments({ seed, count }: DocumentRun): void {
+export async function checkStackedDocuments({ seed, count }: DocumentRun): Promise<void> {
   const next = random(seed);
   const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
   const markers = [
@@ -82,6 +85,7 @@ export function checkStackedDocuments({ seed, count }: DocumentRun): void {
     ">- ",
   ];
   for (let index = 0; index < count; index += 1) {
+    if (index % documentsPerTurn === 0) await yieldToEventLoop();
     const lines: string[] = [];
     for (let line = 0, lineCount = 1 + Math.floor(next() * 6); line < lineCount; line += 1) {
       const unit = Array.from({ length: 1 + Math.floor(next() * 3) }, () => pick(markers)).join("");
@@ -93,12 +97,17 @@ export function checkStackedDocuments({ seed, count }: DocumentRun): void {
 }
 
 // Nesting carried across lines by indentation (tabs, spaces, mixed) and by markers.
-export function checkNestedDocuments({ seed, count, timing = false }: DocumentRun): void {
+export async function checkNestedDocuments({
+  seed,
+  count,
+  timing = false,
+}: DocumentRun): Promise<void> {
   const next = random(seed);
   const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
   const markers = ["- ", "* ", "+ ", "1. ", "2) ", "> ", "-\t", ">", "- > "];
   const indents = ["\t", "  ", " ", "    ", "\t  "];
   for (let index = 0; index < count; index += 1) {
+    if (index % documentsPerTurn === 0) await yieldToEventLoop();
     const perLine = 1 + Math.floor(next() * 40);
     const step = 1 + Math.floor(next() * 40);
     const unit = pick(indents);
@@ -121,7 +130,11 @@ export function checkNestedDocuments({ seed, count, timing = false }: DocumentRu
 
 // Lines that look like fences to a loose reader but are not, plus real ones, mixed with markers
 // that carry nesting across lines.
-export function checkFenceTrickDocuments({ seed, count, timing = false }: DocumentRun): void {
+export async function checkFenceTrickDocuments({
+  seed,
+  count,
+  timing = false,
+}: DocumentRun): Promise<void> {
   const next = random(seed);
   const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
   const fences = [
@@ -138,6 +151,7 @@ export function checkFenceTrickDocuments({ seed, count, timing = false }: Docume
   ];
   const markers = ["- >", ">- ", "> ", "- ", "1. ", ">\t", "-\t", "+ >", ">"];
   for (let index = 0; index < count; index += 1) {
+    if (index % documentsPerTurn === 0) await yieldToEventLoop();
     const lines: string[] = [];
     let size = 0;
     const unit = pick(markers);

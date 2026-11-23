@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import type { Root } from "mdast";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
@@ -7,9 +8,31 @@ import { describe, it, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import * as replyFormat from "./format.js";
 import { LinearRunReplyWriter } from "./linear.js";
+import { yieldToEventLoop } from "./test-utils/event-loop.js";
 import { fakeLinearReplies, replyEvidence } from "./test-utils/linear.js";
 
 const signal = new AbortController().signal;
+
+function assertNoMentionNodes(tree: Root, index: number): void {
+  const nodes = [...tree.children];
+  for (const node of nodes) {
+    if ("children" in node) nodes.push(...node.children);
+    if ("value" in node) {
+      assert.doesNotMatch(
+        node.value,
+        /[@\uFF20]|linear\.app\/acme\/profiles(?:\/|$)/iu,
+        `case ${index}`,
+      );
+    }
+    if (node.type === "link") {
+      assert.doesNotMatch(
+        node.url,
+        /^https?:\/\/linear\.app\/acme\/profiles(?:\/|$)/iu,
+        `case ${index}`,
+      );
+    }
+  }
+}
 
 async function fixture(options: { differentTarget?: boolean; canceled?: boolean } = {}) {
   const database = createMemoryDatabase();
@@ -139,6 +162,7 @@ describe("Linear reply writer", () => {
     const extensions = [gfm()];
     const mdastExtensions = [gfmFromMarkdown()];
     for (let index = 0; index < 2_048; index += 1) {
+      if (index % 16 === 0) await yieldToEventLoop();
       const atom = atoms[index % atoms.length]!;
       const pad = 3_290 + ((index * 1_831) % 221);
       const separator = index % 3 === 0 ? " " : "\n\n";
@@ -156,24 +180,7 @@ describe("Linear reply writer", () => {
         `raw mention or profile URL in case ${index}`,
       );
       const tree = fromMarkdown(body, { extensions, mdastExtensions });
-      const nodes = [...tree.children];
-      for (const node of nodes) {
-        if ("children" in node) nodes.push(...node.children);
-        if ("value" in node) {
-          assert.doesNotMatch(
-            node.value,
-            /[@\uFF20]|linear\.app\/acme\/profiles(?:\/|$)/iu,
-            `case ${index}`,
-          );
-        }
-        if (node.type === "link") {
-          assert.doesNotMatch(
-            node.url,
-            /^https?:\/\/linear\.app\/acme\/profiles(?:\/|$)/iu,
-            `case ${index}`,
-          );
-        }
-      }
+      assertNoMentionNodes(tree, index);
       assert.equal(tree.children.at(-1)?.type, "paragraph", `marker in case ${index}`);
       assert.equal(tree.children.at(-2)?.type, "paragraph", `notice in case ${index}`);
     }
