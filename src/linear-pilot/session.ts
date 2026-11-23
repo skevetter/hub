@@ -3,6 +3,7 @@ import { surfaceRevision } from "../surfaces/store.js";
 import type { AgentEvent } from "../daemons/agents/index.js";
 import type { StartSessionInput } from "../interactive-sessions/store.js";
 import type { SessionPrincipal, SessionRecord } from "../interactive-sessions/types.js";
+import { logger } from "../logger.js";
 import { MAX_REPLY_INPUT_CHARS, type FinalReplyAnswer } from "../run-replies/format.js";
 
 import type { ToolStepHook, ToolStepTurn } from "./tool-steps.js";
@@ -125,7 +126,7 @@ export class LinearPilotTurn {
   permissionPending = false;
   turnEnded = false;
 
-  private readonly toolSteps: ToolStepTurn | undefined;
+  private toolSteps: ToolStepTurn | undefined;
 
   constructor(
     private readonly scope: TurnScope,
@@ -135,7 +136,13 @@ export class LinearPilotTurn {
   }
 
   closeToolSteps(): void {
-    this.toolSteps?.close();
+    const toolSteps = this.toolSteps;
+    this.toolSteps = undefined;
+    try {
+      toolSteps?.close();
+    } catch {
+      logger.warn("Linear pilot tool step close failed");
+    }
   }
 
   get target(): LinearPilotTarget | undefined {
@@ -216,11 +223,20 @@ export class LinearPilotTurn {
     if (item.type === "tool_call") {
       this.messageEnded = true;
       this.clearAnswer();
-      this.toolSteps?.accept(item);
+      this.acceptToolStep(item);
     }
     if (item.type === "assistant_message")
       return this.acceptAssistantBlock(item.messageId, item.text);
     return undefined;
+  }
+
+  private acceptToolStep(item: TimelineItem): void {
+    try {
+      this.toolSteps?.accept(item);
+    } catch {
+      logger.warn("Linear pilot tool step hook failed");
+      this.closeToolSteps();
+    }
   }
 
   private acceptAssistantBlock(messageId: string | undefined, text: string | undefined) {

@@ -1,6 +1,7 @@
 const WORD = /(?:'[^']*'|"(?:\\[\s\S]|[^"\\])*"|\\[\s\S]|[^\s"'\\;&|>])+/uy;
 const SEPARATOR = /[\s;&|>]+/uy;
 const COMPOUND = /[;|>`]|&&|\$\(/u;
+const LINE_BREAK = /[\r\n]/u;
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z_0-9]*=/u;
 const CLIENT_COMMANDS = "install ci run test build lint exec";
 const SUBCOMMANDS = new Map([
@@ -65,7 +66,8 @@ function shapeCommand(words: string[], compound: boolean): string {
 export function shapeShell(command: string, normalize: (value: string) => string): string {
   const words = shellWords(command);
   if (!words) return "command";
-  return renderWords(words.map(normalize), COMPOUND.test(normalize(command)), normalize);
+  const compound = LINE_BREAK.test(command) || COMPOUND.test(normalize(command));
+  return renderWords(words.map(normalize), compound, normalize);
 }
 
 function renderWords(words: string[], compound: boolean, normalize: (value: string) => string) {

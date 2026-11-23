@@ -16,6 +16,8 @@ const INTERVAL_MS = 1_000;
 const COOLDOWN_MS = 60_000;
 const WRITE_TIMEOUT_MS = 16_000;
 const GAP_BODY = "Some steps not shown.";
+const DETAIL_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,31}$/u;
+const MAX_DETAIL_KEYS = 10;
 const FINISHED = new Set(["completed", "failed", "canceled"]);
 type ActivityInput = Parameters<PilotClient["createActivity"]>[0];
 
@@ -255,7 +257,11 @@ export function createLinearPilotToolStepHook({ resolve, scrubValues, now = Date
         if (logged.has(id)) return;
         logged.add(id);
         logger.debug(
-          { keys: Object.keys(detailRecord(item.detail) ?? {}) },
+          {
+            keys: Object.keys(detailRecord(item.detail) ?? {})
+              .filter((key) => DETAIL_KEY.test(key))
+              .slice(0, MAX_DETAIL_KEYS),
+          },
           "Linear pilot tool detail keys",
         );
       },
@@ -263,6 +269,7 @@ export function createLinearPilotToolStepHook({ resolve, scrubValues, now = Date
       claimGap: (activityId) => claimPilotActivity(gaps, activityId, now()),
       release: () => {
         active.delete(id);
+        logged.delete(id);
       },
     });
     active.set(id, { interactionId: bound.event.interactionId, turn });

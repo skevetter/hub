@@ -167,7 +167,7 @@ it("makes no extra calls when the hook is absent", async () => {
   expect(writes(f)).toEqual([{ type: "response", body: "Finished." }]);
 });
 
-it("does not expose running, invalid, or unproven calls and diagnoses only once per session", async () => {
+it("does not expose running, invalid, or unproven calls and clears the diagnostic on release", async () => {
   const f = fixture();
   const first = begin("session", f.hook);
   first.tool("", { type: "read", filePath: "one" }, "completed");
@@ -186,12 +186,49 @@ it("does not expose running, invalid, or unproven calls and diagnoses only once 
       ),
     ),
   ).toMatchObject({ status: "unconfirmed" });
+  expect(logger.debug).toHaveBeenCalledTimes(1);
   const replay = begin("session", f.hook);
   replay.tool("second-call");
   await vi.advanceTimersByTimeAsync(0);
   expect(writes(f)).toHaveLength(1);
-  expect(logger.debug).toHaveBeenCalledTimes(1);
+  expect(logger.debug).toHaveBeenCalledTimes(2);
 });
+
+it("logs only the first ten valid detail keys and no values", () => {
+  const f = fixture();
+  const pilot = begin("session", f.hook);
+  const maxKey = "a".repeat(32);
+  const keys = [maxKey, "_ok", ...Array.from({ length: 9 }, (_, index) => `field${index}`)];
+  const rawKeys = ["0bad", "bad-key", "bad\n", "x".repeat(33), ...keys];
+  const detail = Object.fromEntries(rawKeys.map((key) => [key, "not logged"]));
+  pilot.tool("running-call", detail, "running");
+  expect(logger.debug).toHaveBeenCalledExactlyOnceWith(
+    { keys: keys.slice(0, 10) },
+    "Linear pilot tool detail keys",
+  );
+});
+
+it.each([false, true])(
+  "keeps the final answer when accepting a tool step throws (close throws: %s)",
+  (closeThrows) => {
+    const accept = vi.fn(() => {
+      throw new Error("untrusted detail");
+    });
+    const close = vi.fn(() => {
+      if (closeThrows) throw new Error("untrusted cleanup");
+    });
+    const pilot = begin("session", () => ({ accept, close }));
+    pilot.tool("broken");
+    pilot.tool("ignored");
+    expect(pilot.complete()).toMatchObject({ status: "completed", answer });
+    expect(accept).toHaveBeenCalledTimes(1);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(logger.warn).mock.calls).toEqual([
+      ["Linear pilot tool step hook failed"],
+      ...(closeThrows ? [["Linear pilot tool step close failed"]] : []),
+    ]);
+  },
+);
 
 it("uses the same deterministic action id and deduplicates replays", async () => {
   const f = fixture();
