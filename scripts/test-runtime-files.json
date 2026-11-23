@@ -44,5 +44,6 @@
   "src/db/migrations/": ["src/db/migrations.integration.test.ts", "src/db/migrations.test.ts"],
   "src/db/pg.ts": ["src/run-timeline/status-paths.test.ts"],
   "src/run-timeline/scrub.ts": ["src/run-timeline/scrub.test.ts"],
-  "src/run-timeline/test-utils/build17-scrubber.ts": ["src/run-timeline/scrub.test.ts"]
+  "src/run-timeline/test-utils/build17-scrubber.ts": ["src/run-timeline/scrub.test.ts"],
+  "src/styles.css": ["src/motion-policy.test.ts"]
 }
