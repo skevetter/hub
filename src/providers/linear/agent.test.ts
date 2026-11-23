@@ -186,7 +186,7 @@ it("pilot logs do not expose private provider messages, types or codes", async (
 
 it("traces the provider type when an activity readback fails closed", async () => {
   const fixture = linearAgentFixture(() => ({
-    errors: [{ message: "Read unavailable", extensions: { type: "internal" } }],
+    errors: [{ message: "Read unavailable", extensions: { type: "internal error" } }],
   }));
   const records: string[] = [];
   const logger = createLogger({ write: (record) => records.push(record) });
@@ -196,7 +196,23 @@ it("traces the provider type when an activity readback fails closed", async () =
   assert.equal(await traced.isActivityConfirmed({ sessionId, activityId, kind: "thought" }), false);
   assert.equal(records.length, 1);
   assert.match(records[0]!, /"operation":"readActivity"/u);
-  assert.match(records[0]!, /"linearErrorType":"internal"/u);
+  assert.match(records[0]!, /"linearErrorType":"internal error"/u);
+});
+
+it("keeps exact SDK error types and maps the old authentication label to other", async () => {
+  const cases = [
+    ["authentication error", "authentication error", "INPUT_ERROR"],
+    ["internal error", "internal error", "GRAPHQL_VALIDATION_FAILED"],
+    ["authentication", "other", "GRAPHQL_PARSE_FAILED"],
+  ] as const;
+  for (const [type, expectedType, code] of cases) {
+    const fixture = linearAgentFixture(() => ({
+      errors: [{ message: "Synthetic failure", extensions: { type, code } }],
+    }));
+    await assert.rejects(pilotClient(fixture).createActivity(activity), {
+      details: { linearErrorType: expectedType, linearErrorKinds: [code] },
+    });
+  }
 });
 
 it("pilot requests without a body classify the selected error type and known codes", async () => {

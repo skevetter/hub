@@ -778,13 +778,22 @@ function activityReadbackQuery(includeSignal: boolean) {
 }
 
 const knownErrorTypes: ReadonlySet<string> = new Set([
-  "authentication",
-  "forbidden",
-  "ratelimited",
+  "feature not accessible",
   "invalid input",
-  "not found",
-  "internal",
+  "ratelimited",
+  "network error",
+  "authentication error",
+  "forbidden",
+  "bootstrap error",
+  "unknown",
+  "internal error",
+  "other",
+  "user error",
+  "graphql error",
+  "lock timeout",
+  "usage limit exceeded",
 ]);
+// Linear does not document error codes, so unlisted codes log as "other".
 const knownErrorCodes: ReadonlySet<string> = new Set([
   "AUTHENTICATION_ERROR",
   "UNAUTHENTICATED",
@@ -793,6 +802,9 @@ const knownErrorCodes: ReadonlySet<string> = new Set([
   "BAD_USER_INPUT",
   "NOT_FOUND",
   "INTERNAL_SERVER_ERROR",
+  "INPUT_ERROR",
+  "GRAPHQL_VALIDATION_FAILED",
+  "GRAPHQL_PARSE_FAILED",
 ]);
 
 function safeProviderDetails(error: LinearApiError): LinearAgentErrorDetails {
