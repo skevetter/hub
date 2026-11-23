@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, it } from "vitest";
 import { embeddedDatabaseRuntime, type DatabaseRuntimeBundle } from "./index.js";
 
@@ -41,7 +40,7 @@ it("rejects a second process using the same embedded data directory", async () =
 
   const result = await openEmbeddedRuntimeInChild(dataDirectory);
 
-  assert.equal(result.exitCode, 23);
+  assert.equal(result.exitCode, 23, `Child stderr:\n${result.stderr}`);
   assert.match(result.stderr, /already in use by another Paseo Hub process/);
   assert.match(result.stderr, /Embedded mode supports one process per data directory/);
 });
@@ -49,7 +48,7 @@ it("rejects a second process using the same embedded data directory", async () =
 async function openEmbeddedRuntimeInChild(
   dataDirectory: string,
 ): Promise<{ exitCode: number | null; stderr: string }> {
-  const runtimeModule = pathToFileURL(join(process.cwd(), "src", "db", "runtime", "index.ts"));
+  const runtimeModule = new URL("./index.ts", import.meta.url);
   const source = `
     const { embeddedDatabaseRuntime } = await import(${JSON.stringify(runtimeModule.href)});
     try {
@@ -57,18 +56,17 @@ async function openEmbeddedRuntimeInChild(
       await bundle.runtime.close();
     } catch (error) {
       console.error(error instanceof Error ? error.message : error);
-      process.exit(23);
+      process.exitCode = 23;
     }
   `;
-  const child = spawn(
-    process.execPath,
-    ["--import", "tsx", "--input-type=module", "--eval", source],
-    {
-      cwd: process.cwd(),
-      env: { ...process.env, PASEO_TEST_DATA_DIR: dataDirectory },
-      stdio: ["ignore", "ignore", "pipe"],
-    },
-  );
+  // A file entry point keeps --input-type out of the logger worker's execArgv.
+  const entry = join(root, "open-embedded-runtime.mjs");
+  await writeFile(entry, source);
+  const child = spawn(process.execPath, ["--import", "tsx", entry], {
+    cwd: process.cwd(),
+    env: { ...process.env, PASEO_TEST_DATA_DIR: dataDirectory },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {
@@ -76,7 +74,7 @@ async function openEmbeddedRuntimeInChild(
   });
   const exitCode = await new Promise<number | null>((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", resolve);
+    child.once("close", resolve);
   });
   return { exitCode, stderr };
 }
