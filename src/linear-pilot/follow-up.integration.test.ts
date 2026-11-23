@@ -66,6 +66,10 @@ async function fixture() {
       receipts.add(activityId);
       return "claimed";
     },
+    async confirmStop(_scope, activityId) {
+      return rows.some(({ id, content }) => id === activityId && content.type === "response");
+    },
+    async appendRefusal() {},
     async readPrompt({ nativeSessionId }, { activityId }) {
       reads.push({ session: nativeSessionId, id: activityId, limit: 1 });
       return activityPage(rows.filter((row) => row.id === activityId));

@@ -70,6 +70,30 @@ interface FreshTurn {
 
 type StopOutcome = "stopped" | "duplicate" | "ignored" | "unconfirmed";
 type FollowUpOutcome = StopOutcome | "started" | "busy";
+interface FollowUpResult {
+  outcome: FollowUpOutcome;
+  reason: FollowUpReason;
+}
+type FollowUpReason =
+  | "invalid_event"
+  | "binding_unavailable"
+  | "receipt_exists"
+  | "claim_unconfirmed"
+  | "stop_settled"
+  | "stop_not_applicable"
+  | "stop_duplicate"
+  | "stop_unconfirmed"
+  | "busy_replied"
+  | "busy_reply_unconfirmed"
+  | "preceding_unavailable"
+  | "prompt_unverified"
+  | "stop_unverified"
+  | "history_unusable"
+  | "reservation_unconfirmed"
+  | "dispatch_unconfirmed"
+  | "exception"
+  | "started";
+type FollowUpOperation = "prompted" | "stop";
 
 export interface PilotFailure extends LinearAgentErrorDetails {
   sessionId: string;
@@ -123,6 +147,8 @@ export interface PilotFollowUpOptions {
   claim(input: Admission): Promise<"claimed" | "duplicate" | "unconfirmed">;
   /** Use the new claim and exact current authority to write the canonical busy response once. */
   appendBusy(input: Admission): Promise<boolean>;
+  appendRefusal(input: Admission): Promise<void>;
+  confirmStop(scope: PilotConversation, activityId: string): Promise<boolean>;
   readPrompt(
     scope: PilotConversation,
     expected: { activityId: string; body: string },
@@ -139,56 +165,131 @@ export interface PilotFollowUpOptions {
   /** Recheck and interrupt the exact active agent and daemon turn once. Fence on unknown result. */
   stopCurrent(input: Admission & { requestedAt: string }): Promise<StopOutcome>;
   reportFailure?(failure: PilotFailure): void;
+  reportOutcome?(
+    result: FollowUpResult & { operation: FollowUpOperation; nativeSessionId: string },
+  ): void;
 }
 
 export function createPilotFollowUp(options: PilotFollowUpOptions) {
   return async (scope: PilotConversation, event: SignedPilotPrompted): Promise<FollowUpOutcome> => {
-    const { body } = event;
-    const activityId = event.activityId.toLowerCase();
-    const isStop = event.signal === "stop";
-    if (
-      event.action !== "prompted" ||
-      (!isStop && event.signal !== null) ||
-      scope.ownerId === scope.appUserId ||
-      event.userId !== scope.ownerId ||
-      !sameConversation(scope, event) ||
-      !activityUuid.safeParse(activityId).success ||
-      (!isStop && (body === null || !validMessage(body) || body.trim() === ""))
-    )
-      return "ignored";
-
-    try {
-      return await options.withSession(scope, async () => {
-        const turn = await options.current(scope);
-        if (
-          !turn ||
-          !sameConversation(scope, turn) ||
-          turn.ownerId !== scope.ownerId ||
-          !surfaceRevision(turn.generation) ||
-          !surfaceRevision(turn.policyRevision) ||
-          turn.state === "fenced"
-        )
-          return "ignored";
-
-        const ids = options.activityIds(scope.nativeSessionId, activityId);
-        const admission = { scope, turn, activityId, ids };
-        const claim = await options.claim(admission);
-        if (claim !== "claimed") return claim;
-        if (isStop) return stopFollowUp(options, admission, event.createdAt);
-        if (turn.state === "busy")
-          return (await options.appendBusy(admission)) ? "busy" : "unconfirmed";
-        return startFreshFollowUp(options, admission, body);
-      });
-    } catch (error) {
-      // A failed or uncertain attempt cannot be retried with its original claim.
-      options.reportFailure?.({
-        sessionId: scope.nativeSessionId,
-        ...pilotExceptionFields(error),
-        operation: isStop ? "stop" : "prompted",
-      });
-      return "unconfirmed";
+    const operation = event.signal === "stop" ? "stop" : "prompted";
+    const result = await runFollowUp(options, scope, event, operation);
+    if (result.outcome !== "started") {
+      options.reportOutcome?.({ ...result, operation, nativeSessionId: scope.nativeSessionId });
     }
+    return result.outcome;
   };
+}
+
+function validFollowUp(scope: PilotConversation, event: SignedPilotPrompted) {
+  const { body, signal } = event;
+  return (
+    event.action === "prompted" &&
+    scope.ownerId !== scope.appUserId &&
+    event.userId === scope.ownerId &&
+    sameConversation(scope, event) &&
+    activityUuid.safeParse(event.activityId.toLowerCase()).success &&
+    (signal === "stop" || (signal === null && nonemptyPrompt(body)))
+  );
+}
+
+function nonemptyPrompt(body: string | null) {
+  return body !== null && validMessage(body) && body.trim() !== "";
+}
+
+function validTurn(scope: PilotConversation, turn: PilotTurn | undefined): turn is PilotTurn {
+  return (
+    turn !== undefined &&
+    sameConversation(scope, turn) &&
+    turn.ownerId === scope.ownerId &&
+    surfaceRevision(turn.generation) &&
+    surfaceRevision(turn.policyRevision) &&
+    turn.state !== "fenced"
+  );
+}
+
+function followUpResult(outcome: FollowUpOutcome, reason: FollowUpReason): FollowUpResult {
+  return { outcome, reason };
+}
+
+function reportFollowUpException(
+  options: PilotFollowUpOptions,
+  scope: PilotConversation,
+  operation: FollowUpOperation,
+  error: unknown,
+) {
+  options.reportFailure?.({
+    sessionId: scope.nativeSessionId,
+    operation,
+    ...pilotExceptionFields(error),
+  });
+}
+
+async function runFollowUp(
+  options: PilotFollowUpOptions,
+  scope: PilotConversation,
+  event: SignedPilotPrompted,
+  operation: FollowUpOperation,
+) {
+  if (!validFollowUp(scope, event)) return followUpResult("ignored", "invalid_event");
+  try {
+    return await options.withSession(scope, async () => {
+      const turn = await options.current(scope);
+      if (!validTurn(scope, turn)) return followUpResult("ignored", "binding_unavailable");
+      const activityId = event.activityId.toLowerCase();
+      const ids = options.activityIds(scope.nativeSessionId, activityId);
+      const admission = { scope, turn, activityId, ids };
+      const claim = await options.claim(admission);
+      if (claim === "duplicate") return followUpResult(claim, "receipt_exists");
+      if (claim === "unconfirmed") return followUpResult(claim, "claim_unconfirmed");
+      if (operation === "stop") {
+        const outcome = await stopFollowUp(options, admission, event.createdAt);
+        return followUpResult(outcome, stopReasons[outcome]);
+      }
+      return runClaimedPrompt(options, admission, event.body);
+    });
+  } catch (error) {
+    reportFollowUpException(options, scope, operation, error);
+    return followUpResult("unconfirmed", "exception");
+  }
+}
+
+const stopReasons = {
+  stopped: "stop_settled",
+  ignored: "stop_not_applicable",
+  duplicate: "stop_duplicate",
+  unconfirmed: "stop_unconfirmed",
+} as const;
+
+async function claimedPromptResult(
+  options: PilotFollowUpOptions,
+  admission: Admission,
+  body: string | null,
+) {
+  try {
+    if (admission.turn.state !== "busy") return await startFreshFollowUp(options, admission, body);
+    return (await options.appendBusy(admission))
+      ? followUpResult("busy", "busy_replied")
+      : followUpResult("unconfirmed", "busy_reply_unconfirmed");
+  } catch (error) {
+    reportFollowUpException(options, admission.scope, "prompted", error);
+    return followUpResult("unconfirmed", "exception");
+  }
+}
+
+async function runClaimedPrompt(
+  options: PilotFollowUpOptions,
+  admission: Admission,
+  body: string | null,
+) {
+  const result = await claimedPromptResult(options, admission, body);
+  if (result.outcome === "started" || result.outcome === "busy") return result;
+  try {
+    await options.appendRefusal(admission);
+  } catch (error) {
+    reportFollowUpException(options, admission.scope, "prompted", error);
+  }
+  return result;
 }
 
 async function stopFollowUp(
@@ -215,32 +316,39 @@ async function startFreshFollowUp(
   options: PilotFollowUpOptions,
   admission: Admission,
   body: string | null,
-): Promise<FollowUpOutcome> {
+): Promise<FollowUpResult> {
   const { scope, turn, activityId } = admission;
-  if (turn.state !== "complete" || !turn.preceding || body === null) return "ignored";
+  if (turn.state !== "complete" || !turn.preceding || body === null)
+    return followUpResult("ignored", "preceding_unavailable");
   const message = { activityId, body };
   const verified = verifyPilotPrompt(scope, message, await options.readPrompt(scope, message));
-  if (!verified) return "ignored";
-  const page = await options.readHistory(scope, verified, PILOT_HISTORY_PAGE_SIZE);
+  if (!verified) return followUpResult("ignored", "prompt_unverified");
   const prior = options.activityIds(scope.nativeSessionId, turn.preceding.activityId);
   const proofIsStop = turn.preceding.kind === "stop";
+  // A queued prompt can predate the Stop response that released it.
+  if (proofIsStop && !(await options.confirmStop(scope, prior.stop)))
+    return followUpResult("ignored", "stop_unverified");
+  const page = await options.readHistory(scope, verified, PILOT_HISTORY_PAGE_SIZE);
   const prompt = composePilotPrompt(scope, message, verified, page, {
-    confirmedResponseId: proofIsStop ? prior.stop : prior.response,
-    ...(proofIsStop ? { omitResponseId: prior.stop } : {}),
+    ...(proofIsStop ? { confirmedStopId: prior.stop } : { confirmedResponseId: prior.response }),
     secrets: await options.secrets(scope),
     idsFor: (id) => options.activityIds(scope.nativeSessionId, id),
   });
-  if (prompt === undefined) return "ignored";
+  if (prompt === undefined) return followUpResult("ignored", "history_unusable");
+  return dispatchFresh(options, admission, prompt);
+}
 
+async function dispatchFresh(options: PilotFollowUpOptions, admission: Admission, prompt: string) {
   const fresh = await options.reserve(admission);
   if (
     !fresh ||
     !fresh.hubSessionId ||
-    fresh.hubSessionId === turn.hubSessionId ||
-    fresh.generation !== turn.generation + 1
+    fresh.hubSessionId === admission.turn.hubSessionId ||
+    fresh.generation !== admission.turn.generation + 1
   )
-    return "unconfirmed";
-  return fresh.dispatchInitial(prompt);
+    return followUpResult("unconfirmed", "reservation_unconfirmed");
+  const outcome = await fresh.dispatchInitial(prompt);
+  return followUpResult(outcome, outcome === "started" ? "started" : "dispatch_unconfirmed");
 }
 
 function sameConversation(

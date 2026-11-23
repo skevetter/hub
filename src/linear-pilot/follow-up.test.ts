@@ -49,6 +49,8 @@ function fixture(state: PilotTurn["state"] = "complete") {
     current: vi.fn<PilotFollowUpOptions["current"]>().mockResolvedValue(turn),
     claim: vi.fn<PilotFollowUpOptions["claim"]>().mockResolvedValue("claimed"),
     appendBusy: vi.fn<PilotFollowUpOptions["appendBusy"]>().mockResolvedValue(true),
+    appendRefusal: vi.fn<PilotFollowUpOptions["appendRefusal"]>().mockResolvedValue(undefined),
+    confirmStop: vi.fn<PilotFollowUpOptions["confirmStop"]>().mockResolvedValue(true),
     readPrompt: vi
       .fn<PilotFollowUpOptions["readPrompt"]>()
       .mockResolvedValue(activityPage([currentRow])),
@@ -60,6 +62,7 @@ function fixture(state: PilotTurn["state"] = "complete") {
       .fn<PilotFollowUpOptions["reserve"]>()
       .mockResolvedValue({ hubSessionId: "fresh-hub-session", generation: 2, dispatchInitial }),
     stopCurrent: vi.fn<PilotFollowUpOptions["stopCurrent"]>().mockResolvedValue("stopped"),
+    reportOutcome: vi.fn<NonNullable<PilotFollowUpOptions["reportOutcome"]>>(),
   } satisfies PilotFollowUpOptions;
   return { options, turn, dispatchInitial, handle: createPilotFollowUp(options) };
 }
@@ -147,6 +150,38 @@ describe("Linear pilot follow-up admission", () => {
     expect(f.dispatchInitial).toHaveBeenCalledExactlyOnceWith(
       expect.stringContaining("initial application response"),
     );
+  });
+
+  it("verifies the exact Stop independently of history cut off at queue creation", async () => {
+    const f = fixture();
+    f.turn.preceding = { activityId: fixturePromptId(1), kind: "stop" };
+    f.options.readHistory.mockResolvedValue(activityPage([]));
+    expect(await f.handle(scope, delivered)).toBe("started");
+    expect(f.options.confirmStop).toHaveBeenCalledExactlyOnceWith(
+      scope,
+      fixtureActivityIds(scope.nativeSessionId, f.turn.preceding.activityId).stop,
+    );
+    expect(f.options.appendRefusal).not.toHaveBeenCalled();
+    expect(f.options.reportOutcome).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing Stop proof and replies only for a newly claimed owner prompt", async () => {
+    const f = fixture();
+    f.turn.preceding = { activityId: fixturePromptId(1), kind: "stop" };
+    f.options.confirmStop.mockResolvedValue(false);
+    f.options.claim.mockResolvedValueOnce("claimed").mockResolvedValue("duplicate");
+    expect(await f.handle(scope, delivered)).toBe("ignored");
+    expect(await f.handle(scope, delivered)).toBe("duplicate");
+    expect(await f.handle(scope, { ...delivered, userId: "foreign-user" })).toBe("ignored");
+    expect(f.options.readHistory).not.toHaveBeenCalled();
+    expect(f.dispatchInitial).not.toHaveBeenCalled();
+    expect(f.options.appendRefusal).toHaveBeenCalledTimes(1);
+    const metadata = { operation: "prompted", nativeSessionId: scope.nativeSessionId };
+    expect(f.options.reportOutcome.mock.calls).toEqual([
+      [{ ...metadata, outcome: "ignored", reason: "stop_unverified" }],
+      [{ ...metadata, outcome: "duplicate", reason: "receipt_exists" }],
+      [{ ...metadata, outcome: "ignored", reason: "invalid_event" }],
+    ]);
   });
 
   it("never starts when reservation or dispatch cannot be proven", async () => {

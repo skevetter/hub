@@ -383,6 +383,41 @@ function registeredBackend(scenario: string) {
   return scenario === "postgres" ? "postgres" : "embedded";
 }
 
+async function assertPromptRefused(
+  endpoint: Endpoint,
+  payload: JsonObject,
+  publication: Publication,
+  expected: { nativeSessionId: string; activityId: string },
+) {
+  const info = vi.spyOn(logger, "info");
+  try {
+    const { nativeSessionId, activityId } = expected;
+    const count = publication.length;
+    await deliver(endpoint, payload);
+    await vi.waitFor(() =>
+      expect(publication[count]).toEqual({
+        id: pilotActivityIds(nativeSessionId, activityId).response,
+        type: "error",
+        body: "Paseo could not continue this conversation. Mention @paseo in a new comment.",
+      }),
+    );
+    expect(info).toHaveBeenCalledWith(
+      { nativeSessionId, operation: "prompted", outcome: "ignored", reason: "prompt_unverified" },
+      "Linear pilot follow-up did not start",
+    );
+    await deliver(endpoint, payload);
+    await vi.waitFor(() =>
+      expect(info).toHaveBeenCalledWith(
+        { nativeSessionId, operation: "prompted", outcome: "duplicate", reason: "receipt_exists" },
+        "Linear pilot follow-up did not start",
+      ),
+    );
+    expect(publication).toHaveLength(count + 1);
+  } finally {
+    info.mockRestore();
+  }
+}
+
 function registeredSessionId(scenario: string) {
   return scenario.startsWith("delegation") ? delegationSessionId : randomUUID();
 }
@@ -582,10 +617,32 @@ async function exerciseRegisteredPilot(
       }
       const earlierPromptId = randomUUID();
       const earlierPrompt = "Synthetic previous question";
+      const queuedId = randomUUID();
+      const refusedId = randomUUID();
+      const queuedBody = "Continue after Stop";
+      const queuedAt = at(5.8);
+      const queuedDeliveryAt = at(7.4);
+      const stopId = randomUUID();
+      function queuedRead(request: z.infer<typeof graphQLRequest>) {
+        if (request.variables["activityId"] === refusedId) return page([]);
+        if (request.variables["activityId"] === queuedId)
+          return page([historyRow(queuedId, queuedAt, "prompt", queuedBody)]);
+        if (request.query.includes("PaseoAgentActivityReadback")) {
+          const id = pilotActivityIds(nativeSessionId, followUpId).stop;
+          assert.deepEqual(request.variables, { sessionId: nativeSessionId, activityId: id });
+          const confirmation = publication[3];
+          assert(confirmation?.type === "response" && confirmation.id === id);
+          return page([historyRow(id, at(6.5), "response", confirmation.body)]);
+        }
+        if (request.variables["before"] !== queuedAt) return undefined;
+        return page([historyRow(followUpId, followUpAt, "prompt", followUpBody)]);
+      }
       const provider = vi.fn<typeof fetch>(async (_input, init) => {
         const body = init?.body;
         assert(typeof body === "string");
         const request = graphQLRequest.parse(JSON.parse(body));
+        const queued = queuedRead(request);
+        if (queued) return queued;
         if (request.query.includes("PaseoAgentViewer")) {
           return Response.json({
             data: {
@@ -1114,7 +1171,7 @@ async function exerciseRegisteredPilot(
         );
         agents.emit(fresh.agentId, { type: "turn_completed", provider: "codex", turnId: "turn-2" });
       };
-      const stop = prompted(randomUUID(), at(6), null);
+      const stop = prompted(stopId, at(6), null);
       assert.equal((await endpoint.handle(signedDelivery(stop))).status, 200);
       await vi.waitFor(
         () =>
@@ -1125,13 +1182,32 @@ async function exerciseRegisteredPilot(
           }),
         { timeout: 5_000 },
       );
+      await assertPromptRefused(
+        endpoint,
+        prompted(refusedId, at(7), "Unverified prompt"),
+        publication,
+        {
+          nativeSessionId,
+          activityId: refusedId,
+        },
+      );
+      expect(agents.sends).toHaveLength(2);
+      await deliver(endpoint, {
+        ...prompted(queuedId, queuedAt, queuedBody),
+        createdAt: queuedDeliveryAt,
+      });
+      await vi.waitFor(() => expect(agents.sends).toHaveLength(3), { timeout: 5_000 });
+      const resumed = agents.sends[2];
+      expect(resumed?.agentId).not.toBe(fresh.agentId);
+      expect(resumed?.text).toContain(queuedBody);
+      expect(resumed?.text).not.toContain("Stopped.");
       await pilot.stop();
       expect(agents.interrupts).toEqual([fresh.agentId]);
       expect(agents.archives).toEqual([]);
-      expect(agents.creations).toHaveLength(2);
-      expect(agents.sends).toHaveLength(2);
+      expect(agents.creations).toHaveLength(3);
+      expect(agents.sends).toHaveLength(3);
       expect(historyReads).toEqual(["anchor", "older"]);
-      expect(publication).toHaveLength(4);
+      expect(publication).toHaveLength(5);
       expect(legacy).not.toHaveBeenCalled();
     } finally {
       await pilot.stop();

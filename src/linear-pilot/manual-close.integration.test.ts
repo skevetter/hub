@@ -200,6 +200,7 @@ it.each(["embedded", "postgres"] as const)(
         ownerId: authority.humanProviderUserId,
       };
       const claim = vi.fn<PilotFollowUpOptions["claim"]>().mockResolvedValue("claimed");
+      const appendRefusal = vi.fn<PilotFollowUpOptions["appendRefusal"]>();
       const followUp = createPilotFollowUp({
         withSession: (_scope, run) => run(),
         activityIds: pilotActivityIds,
@@ -220,7 +221,9 @@ it.each(["embedded", "postgres"] as const)(
           };
         },
         claim,
+        appendRefusal,
         appendBusy: async () => true,
+        confirmStop: async () => false,
         readPrompt: async () => undefined,
         readHistory: async () => undefined,
         secrets: async () => [],
@@ -238,6 +241,7 @@ it.each(["embedded", "postgres"] as const)(
         }),
       ).toBe("ignored");
       expect(claim).not.toHaveBeenCalled();
+      expect(appendRefusal).not.toHaveBeenCalled();
 
       if (backend === "postgres") {
         const commands = [...procedure.matchAll(/`((?:PREPARE|EXECUTE) pilot_[^`]+)`/gu)].map(

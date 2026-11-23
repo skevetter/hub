@@ -60,6 +60,12 @@ const writes = [
     run: (w: Writer, attempt: "first-attempt" | "readback-only") => w.error(prompted, attempt),
   },
   {
+    name: "continuation refusal",
+    kind: "error",
+    run: (w: Writer, attempt: "first-attempt" | "readback-only") =>
+      w.error(prompted, attempt, undefined, "continuation"),
+  },
+  {
     name: "Stop",
     kind: "response",
     run: (w: Writer, attempt: "first-attempt" | "readback-only") =>

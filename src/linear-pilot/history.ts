@@ -282,24 +282,40 @@ function quotedPrefix(text: string, maxBytes: number) {
   return quote(text.slice(0, end) + CLIPPED);
 }
 
+type HistoryProof =
+  | { confirmedResponseId: string; omitResponseId?: string }
+  | { confirmedStopId: string };
+
+function confirmedPreceding(scope: HistoryScope, rows: Activity[], proof: HistoryProof) {
+  if ("confirmedStopId" in proof) return true;
+  return rows.some((row) => row.id === proof.confirmedResponseId && isAppResponse(scope, row));
+}
+
+function verifiedHistory(
+  scope: HistoryScope,
+  current: VerifiedPilotPrompt,
+  page: unknown,
+  proof: HistoryProof,
+) {
+  const rows = readPreceding(scope, current, page);
+  if (!rows || !confirmedPreceding(scope, rows, proof)) return undefined;
+  const omitId = "confirmedStopId" in proof ? proof.confirmedStopId : proof.omitResponseId;
+  return omitId === undefined ? rows : rows.filter((row) => row.id !== omitId);
+}
+
 export function composePilotPrompt(
   scope: HistoryScope,
   message: PilotPrompt,
   current: VerifiedPilotPrompt,
   page: unknown,
-  context: {
-    confirmedResponseId: string;
-    omitResponseId?: string;
+  context: HistoryProof & {
     secrets: readonly string[];
     idsFor?: (activityId: string) => PilotActivityIds;
   },
 ): string | undefined {
   if (current.activityId !== message.activityId || !validMessage(message.body)) return undefined;
-  const preceding = readPreceding(scope, current, page);
-  if (
-    !preceding?.some((row) => row.id === context.confirmedResponseId && isAppResponse(scope, row))
-  )
-    return undefined;
+  const rows = verifiedHistory(scope, current, page, context);
+  if (!rows) return undefined;
   const request = OWNER + quote(message.body);
   let remaining = Math.min(
     MAX_HISTORY_BYTES - HISTORY_FRAME_BYTES,
@@ -307,10 +323,6 @@ export function composePilotPrompt(
   );
   if (remaining < 0) return undefined;
 
-  const rows =
-    context.omitResponseId === undefined
-      ? preceding
-      : preceding.filter((row) => row.id !== context.omitResponseId);
   const exchanges = collectExchanges(scope, rows, context.idsFor);
   const { secrets } = context;
   const redactor = createAssistantTextRedactor(secrets);

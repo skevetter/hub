@@ -15,6 +15,9 @@ const MAX_CLAIMS = 2_048;
 const ACK_BODY = "Paseo Hub received your request.";
 const NO_ANSWER_BODY = "Work finished. No answer was posted.";
 const ERROR_BODY = "Paseo Hub could not complete this request.";
+const CONTINUATION_ERROR_BODY =
+  "Paseo could not continue this conversation. Mention @paseo in a new comment.";
+const errorBodies = { terminal: ERROR_BODY, continuation: CONTINUATION_ERROR_BODY };
 const DELEGATION_ERROR_BODY =
   "Paseo could not confirm who started this. Mention @paseo in a comment instead.";
 const STOP_BODY = "Stopped.";
@@ -23,6 +26,7 @@ const BUSY_BODY = "Still working on the previous message; reply when I have answ
 const publicBodies = new Set([
   ACK_BODY,
   ERROR_BODY,
+  CONTINUATION_ERROR_BODY,
   DELEGATION_ERROR_BODY,
   STOP_BODY,
   STOP_UNCONFIRMED_BODY,
@@ -265,10 +269,10 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
       event: LinearPilotAcceptedEvent,
       attempt: LinearPilotActivityAttempt,
       signal?: AbortSignal,
+      failure: keyof typeof errorBodies = "terminal",
     ): Promise<LinearPilotWriteDisposition> {
-      if (event.kind !== "created" && event.kind !== "prompted")
-        return Promise.resolve({ disposition: "denied" });
-      return write(event, attempt, "terminal", "error", () => ERROR_BODY, signal);
+      if (event.kind === "stop") return Promise.resolve({ disposition: "denied" });
+      return write(event, attempt, "terminal", "error", () => errorBodies[failure], signal);
     },
     refuseDelegation: delegationRefusalWriter((event) =>
       write(event, "first-attempt", "delegationRefused", "error", () => DELEGATION_ERROR_BODY),

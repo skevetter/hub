@@ -3,6 +3,7 @@ import type { DatabaseRuntime, QueryHandle } from "../db/runtime/index.js";
 import type { Locks } from "../db/runtime/locks/index.js";
 import type { InteractiveSessionCoordinator } from "../interactive-sessions/coordinator.js";
 import type { SessionRecord } from "../interactive-sessions/types.js";
+import { logger } from "../logger.js";
 import type { LinearAgentOperation } from "../providers/linear/agent.js";
 import type { LinearPilotRegistration } from "../providers/linear/index.js";
 import type { SurfaceBinding } from "../surfaces/store.js";
@@ -39,9 +40,29 @@ import {
 
 type Qualified = NonNullable<Awaited<ReturnType<typeof qualifyLinearPilotDelivery>>>;
 type Provider = Parameters<LinearPilotRegistration["offer"]>[1];
-function reportFollowUpRefusal(outcome: string, nativeSessionId: string) {
-  if (outcome === "ignored" || outcome === "duplicate" || outcome === "unconfirmed")
-    logPilotRefusal(outcome, { nativeSessionId, action: "prompted" });
+function followUpScope({ event, installation }: Qualified, ownerId: string): PilotConversation {
+  const { organizationId, workspaceId, applicationId, appUserId, connectionId } = installation;
+  const { nativeSessionId, issueId, teamId } = event;
+  return {
+    organizationId,
+    workspaceId,
+    applicationId,
+    appUserId,
+    connectionId,
+    nativeSessionId,
+    issueId,
+    teamId,
+    ownerId,
+  };
+}
+
+function reportFollowUpOutcome(fields: {
+  nativeSessionId: string;
+  operation: "prompted" | "stop";
+  outcome: string;
+  reason: string;
+}) {
+  logger.info(fields, "Linear pilot follow-up did not start");
 }
 
 interface Options {
@@ -51,6 +72,40 @@ interface Options {
   locks: Locks;
   scrubValues?: readonly string[];
   reportFailure?(failure: PilotFailure): void;
+}
+
+async function appendFollowUpRefusal(
+  { config, runtime }: Options,
+  { installation }: Qualified,
+  provider: Provider,
+  activity: LinearPilotAcceptedEvent,
+) {
+  const authorize = async (query: QueryHandle, operation: LinearAgentOperation) => {
+    if (operation.kind !== "createActivity" && operation.kind !== "readActivity") return false;
+    if (operation.sessionId !== activity.nativeSessionId) return false;
+    const current = await resolveLinearPilotInstallation(query, config, provider.oauthClientId);
+    return (
+      current?.connectionId === installation.connectionId &&
+      current.appUserId === installation.appUserId &&
+      current.ownerUserId === installation.ownerUserId &&
+      current.profileVersion === installation.profileVersion
+    );
+  };
+  const client = provider.activityClient({
+    binding: activity.binding,
+    authorize: (_binding, operation) => authorize(runtime, operation),
+    authorizeRefresh: (query, _binding, operation) => authorize(query, operation),
+  });
+  const writer = createLinearPilotActivities({ clientFor: () => client });
+  const written = await writer.error(activity, "first-attempt", undefined, "continuation");
+  if (written.disposition !== "confirmed") {
+    reportFollowUpOutcome({
+      nativeSessionId: activity.nativeSessionId,
+      operation: "prompted",
+      outcome: written.disposition,
+      reason: "refusal_not_confirmed",
+    });
+  }
 }
 
 interface Active extends PilotTurnGrant {
@@ -63,6 +118,48 @@ interface BoundLiveSession {
   binding: SurfaceBinding;
   session: SessionRecord;
   grant: Active;
+}
+
+function followUpTurnState(session: SessionRecord, live: Active | undefined): PilotTurn["state"] {
+  if (live && !live.stopping && ["running", "waiting_permission", "idle"].includes(session.state))
+    return "busy";
+  if (!live && session.state === "idle" && session.daemonAgentId !== null) return "complete";
+  return "fenced";
+}
+
+async function projectFollowUpTurn(
+  scope: PilotConversation,
+  { binding, session, grant }: BoundLiveSession,
+  live: Active | undefined,
+  sessions: InteractiveSessionCoordinator,
+): Promise<PilotTurn> {
+  const target =
+    live &&
+    (await sessions.activeLinearPilotTurn({
+      organizationId: session.organizationId,
+      sessionId: session.id,
+      commandId: grant.commandId,
+    }));
+  const state = followUpTurnState(session, live);
+  return {
+    ...scope,
+    generation: binding.generation,
+    policyRevision: binding.policyRevision,
+    hubSessionId: session.id,
+    profileId: session.profileId,
+    profileVersion: session.profileVersion,
+    state,
+    preceding:
+      state === "complete"
+        ? {
+            activityId: session.startIdempotencyKey,
+            kind: session.stateReason === "stopped_by_person" ? "stop" : "answer",
+          }
+        : null,
+    agentId: target?.agentId ?? session.daemonAgentId,
+    daemonTurnId: target?.daemonTurnId ?? null,
+    ...(target?.startedAt ? { startedAt: target.startedAt } : {}),
+  };
 }
 
 function connectionBinding(
@@ -396,19 +493,15 @@ export function createLinearPilotRuntime(options: Options) {
     const { kind } = event;
     if (kind === "created") return;
     const signed = adaptSignedPilotFollowUp(event, installation);
-    if (!signed) return;
+    if (!signed)
+      return reportFollowUpOutcome({
+        nativeSessionId: event.nativeSessionId,
+        operation: kind,
+        outcome: "ignored",
+        reason: "invalid_event",
+      });
     const { authority, origin, principal } = eventScope(qualified);
-    const scope: PilotConversation = {
-      organizationId: authority.organizationId,
-      workspaceId: authority.workspaceId,
-      applicationId: authority.applicationId,
-      appUserId: authority.appUserId,
-      nativeSessionId: origin.nativeSessionId,
-      connectionId: authority.connectionId,
-      issueId: origin.issueId,
-      teamId: origin.teamId,
-      ownerId: config.allowedHumanId,
-    };
+    const scope = followUpScope(qualified, config.allowedHumanId);
     const history: PilotHistoryScope = {
       sessionId: origin.nativeSessionId,
       issueId: origin.issueId,
@@ -422,47 +515,13 @@ export function createLinearPilotRuntime(options: Options) {
       withSession: (_scope, operation) => withSession(authority, origin, operation),
       activityIds: pilotActivityIds,
       reportFailure,
+      reportOutcome: reportFollowUpOutcome,
       current: async (): Promise<PilotTurn | undefined> => {
         if (!accepting) return undefined;
         current = await boundLiveSession(qualified, provider, receivedAt, authority, origin);
-        if (!current) return undefined;
-        const { binding, session, grant } = current;
-        const live = active.get(session.id);
-        const target =
-          live &&
-          (await sessions.activeLinearPilotTurn({
-            organizationId: session.organizationId,
-            sessionId: session.id,
-            commandId: grant.commandId,
-          }));
-        const busy =
-          live &&
-          !live.stopping &&
-          (session.state === "running" ||
-            session.state === "waiting_permission" ||
-            session.state === "idle");
-        const done = !live && session.state === "idle" && session.daemonAgentId !== null;
-        let state: PilotTurn["state"] = "fenced";
-        if (busy) state = "busy";
-        else if (done) state = "complete";
-        return {
-          ...scope,
-          generation: binding.generation,
-          policyRevision: binding.policyRevision,
-          hubSessionId: session.id,
-          profileId: session.profileId,
-          profileVersion: session.profileVersion,
-          state,
-          preceding: done
-            ? {
-                activityId: session.startIdempotencyKey,
-                kind: session.stateReason === "stopped_by_person" ? "stop" : "answer",
-              }
-            : null,
-          agentId: target?.agentId ?? session.daemonAgentId,
-          daemonTurnId: target?.daemonTurnId ?? null,
-          ...(target?.startedAt ? { startedAt: target.startedAt } : {}),
-        };
+        return (
+          current && projectFollowUpTurn(scope, current, active.get(current.session.id), sessions)
+        );
       },
       claim: async ({ activityId }) => {
         const admitted = await recordLinearPilotAdmission(runtime, {
@@ -484,6 +543,20 @@ export function createLinearPilotRuntime(options: Options) {
           "confirmed"
         );
       },
+      appendRefusal: ({ activityId }) =>
+        appendFollowUpRefusal(
+          options,
+          qualified,
+          provider,
+          acceptedActivity(qualified, "prompted", activityId, receivedAt),
+        ),
+      confirmStop: async (_scope, activityId) =>
+        current !== undefined &&
+        clientFor(current.grant).isActivityConfirmed({
+          sessionId: origin.nativeSessionId,
+          activityId,
+          kind: "response",
+        }),
       readPrompt: async (_scope, expected) =>
         current && clientFor(current.grant).readPilotPrompt(history, expected),
       readHistory: async (_scope, anchor) =>
@@ -603,7 +676,7 @@ export function createLinearPilotRuntime(options: Options) {
         }
       },
     });
-    reportFollowUpRefusal(await run(scope, signed), origin.nativeSessionId);
+    await run(scope, signed);
   }
 
   const sessionHooks: LinearPilotSessionHooks = {
