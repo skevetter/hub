@@ -183,29 +183,14 @@ export class InteractiveSessionCoordinator {
     native?: LinearPilotStart,
   ): Promise<CommandOutcome> {
     if (!this.available()) return { outcome: "refused", code: "not_found" };
-    const profile = await this.database.findSessionProfile(
-      principal.organizationId,
-      input.profileId,
-    );
-    if (profile?.status !== "active") return { outcome: "refused", code: "profile_unavailable" };
-    if (profile.version !== input.profileVersion)
-      return { outcome: "refused", code: "profile_changed" };
-    if (
-      native &&
-      (principal.role !== "owner" ||
-        profile.access !== "private" ||
-        profile.createdByUserId !== principal.userId)
-    )
-      return { outcome: "refused", code: "forbidden" };
+    const found = await this.database.findSessionProfile(principal.organizationId, input.profileId);
+    const checked = checkStartProfile(found, principal, input, native);
+    if ("code" in checked) return { outcome: "refused", code: checked.code };
     const daemon = await this.database.findDaemonForOrganization(
       principal.organizationId,
-      profile.daemonId,
+      checked.profile.daemonId,
     );
-    if (
-      daemon?.status !== "active" ||
-      !daemon.permissions.includes("hub.execute") ||
-      !this.agents(daemon.id)
-    )
+    if (!canExecute(daemon) || !this.agents(daemon.id))
       return { outcome: "refused", code: "daemon_unavailable" };
 
     const usage = await this.options.entitlements.meterReservation(
@@ -231,7 +216,6 @@ export class InteractiveSessionCoordinator {
     });
     return this.outcome(result, "message", !native);
   }
-
   startLinearPilot(principal: SessionPrincipal, input: LinearPilotStart): Promise<CommandOutcome> {
     if (input.message === LINEAR_PILOT_FRESH_BODY)
       return Promise.resolve({ outcome: "refused", code: "invalid_mode" });
@@ -250,14 +234,7 @@ export class InteractiveSessionCoordinator {
     input: LinearPilotRetirement,
   ): Promise<boolean> {
     const hooks = this.options.linearPilot;
-    if (
-      !hooks ||
-      !this.available() ||
-      principal.role !== "owner" ||
-      principal.organizationId !== input.organizationId ||
-      !surfaceRevision(input.expectedBindingGeneration)
-    )
-      return false;
+    if (!hooks || !this.available() || !mayRetirePilot(principal, input)) return false;
     const {
       organizationId,
       sessionId,
@@ -363,28 +340,20 @@ export class InteractiveSessionCoordinator {
   }
 
   async activeLinearPilotTurn(input: LinearPilotCommand): Promise<LinearPilotTarget | undefined> {
-    const worker = this.workers.get(input.sessionId);
-    if (worker?.scope.organizationId !== input.organizationId || worker.pilotStopRequested)
-      return undefined;
-    const watch = worker.watched;
-    const target = watch?.pilotTurn?.target;
-    if (!watch?.pilotDelivered || !target || target.commandId !== input.commandId) return undefined;
+    const worker = ownedPilotWorker(this.workers.get(input.sessionId), input);
+    const held = worker && deliveredPilotTurn(worker, input.commandId);
+    if (!worker || !held) return undefined;
+    const { watch, target } = held;
     const session = await this.session(worker);
     if (
       !session ||
-      session.state !== "running" ||
-      session.generation !== target.generation ||
-      session.turn !== target.hubTurn ||
-      session.daemonAgentId !== target.agentId ||
+      !matchesRunningPilot(session, target) ||
       !(await this.authorizeLinearPilot(session, input.commandId, watch.agents)) ||
-      worker.watched !== watch ||
-      watch.pilotTurn?.target !== target ||
-      worker.pilotStopRequested
+      !pilotTurnUnchanged(worker, watch, target)
     )
       return undefined;
     return target;
   }
-
   private async requestLinearPilotStop(input: LinearPilotStopRequest): Promise<LinearPilotStop> {
     const worker = this.workers.get(input.sessionId);
     if (
@@ -407,25 +376,15 @@ export class InteractiveSessionCoordinator {
 
   async sendLinearPilot(input: LinearPilotCommand): Promise<CommandOutcome> {
     const worker = this.workers.get(input.sessionId);
-    if (
-      !worker ||
-      worker.scope.organizationId !== input.organizationId ||
-      worker.pilotCommandId !== input.commandId
-    )
-      return { outcome: "refused", code: "not_found" };
+    if (!ownsPilotCommand(worker, input)) return { outcome: "refused", code: "not_found" };
     const session = await this.session(worker);
     const agents = this.agents(worker.daemonId);
     if (!session || !agents || !(await this.authorizeLinearPilot(session, input.commandId, agents)))
       return { outcome: "refused", code: "not_found" };
     if (worker.pilotStopRequested || session.state === "stopping")
       return { outcome: "refused", code: "session_stopping" };
-    // The pinned daemon can clear a permission that arrived after Hub's check.
-    return {
-      outcome: "refused",
-      code: worker.watched?.pilotTurn?.permissionPending ? "waiting_permission" : "invalid_mode",
-    };
+    return { outcome: "refused", code: pilotInputRefusal(worker) };
   }
-
   private async authorizeLinearPilot(
     session: SessionRecord,
     commandId: string,
@@ -445,54 +404,53 @@ export class InteractiveSessionCoordinator {
       session.daemonId,
     );
     return (
-      daemon?.status === "active" &&
-      daemon.permissions.includes("hub.execute") &&
+      canExecute(daemon) &&
       (await hooks.authorize(session, commandId, expectedBindingGeneration)) &&
       this.agents(session.daemonId) === agents
     );
   }
 
-  private async claimLinearPilotStart(worker: Worker, commandId: string, fresh: boolean) {
+  private async claimLinearPilotStart(
+    worker: Worker,
+    commandId: string,
+    fresh: boolean,
+  ): Promise<PilotClaim | undefined> {
     const session = await this.session(worker);
     const agents = this.agents(worker.daemonId);
     if (
       !session ||
-      session.state !== "starting" ||
-      session.daemonAgentId !== null ||
-      session.generation !== 1 ||
       !agents ||
+      !isUnstartedPilot(session) ||
       !(await this.authorizeLinearPilot(session, commandId, agents))
     )
       return undefined;
+    const command = await this.claimFirstPilotCommand(worker, session, { commandId, fresh });
+    return command ? { session, agents, command } : undefined;
+  }
+
+  private async claimFirstPilotCommand(
+    worker: Worker,
+    session: SessionRecord,
+    expected: PilotExpectation,
+  ): Promise<SessionCommandRecord | undefined> {
     const [initial] = await this.database.listInteractiveSessionMessages(
       session.organizationId,
       session.id,
       { beforeOrdinal: 2, limit: 1 },
       this.bodyCutoff(this.now()),
     );
-    if (
-      initial?.commandId !== commandId ||
-      initial.status !== "pending" ||
-      (initial.body === LINEAR_PILOT_FRESH_BODY) !== fresh ||
-      worker.pilotStopRequested
-    )
-      return undefined;
-    worker.pilotCommandId = commandId;
+    if (!isPendingFirstMessage(initial, expected) || worker.pilotStopRequested) return undefined;
+    worker.pilotCommandId = expected.commandId;
     const command = await this.claim(worker, "message");
     if (!command) return undefined;
-    if (
-      command.id !== commandId ||
-      command.attempts !== 1 ||
-      command.body === null ||
-      (command.body === LINEAR_PILOT_FRESH_BODY) !== fresh
-    ) {
+    if (!isExpectedPilotCommand(command, expected)) {
       await this.settle(worker, command, {
         status: "unknown",
         failureCode: "delivery_unconfirmed",
       });
       return undefined;
     }
-    return { session, agents, command };
+    return command;
   }
 
   private async launchLinearPilot(
@@ -503,52 +461,14 @@ export class InteractiveSessionCoordinator {
     const fresh = volatilePrompt !== undefined;
     const claimed = await this.claimLinearPilotStart(worker, commandId, fresh);
     if (!claimed) return "unconfirmed";
-    const { session, agents, command } = claimed;
-    const proceeds = async (record: SessionRecord) =>
-      (await this.authorizeLinearPilot(record, commandId, agents)) && !worker.pilotStopRequested;
     try {
-      if (!(await proceeds(session)) || worker.pilotStopRequested) {
-        await this.settle(worker, command, { status: "superseded" });
-        return "unconfirmed";
-      }
-      const bound = await this.ensureAgent(worker, session, agents, undefined, () =>
-        proceeds(session),
+      return await this.deliverLinearPilotStart(
+        { worker, commandId, fresh, volatilePrompt },
+        claimed,
       );
-      if (!bound || !bound.daemonAgentId) throw new DaemonResponseLostError();
-      await this.watch(worker, bound, agents, () => proceeds(bound));
-      const watch = worker.watched;
-      if (
-        !watch ||
-        !(await proceeds(bound)) ||
-        worker.pilotStopRequested ||
-        worker.watched !== watch ||
-        !watch.pilotIdle
-      )
-        throw new DaemonResponseLostError();
-      watch.pilotTurn = new LinearPilotTurn({
-        ...worker.scope,
-        commandId,
-        daemonId: bound.daemonId,
-        agentId: bound.daemonAgentId,
-        generation: bound.generation,
-        hubTurn: bound.turn + 1,
-      });
-      const settlement = await this.deliver(agents, bound.daemonAgentId, command, volatilePrompt);
-      if (settlement.status !== "delivered") {
-        this.dropWatch(worker);
-        await this.settle(
-          worker,
-          command,
-          settlement.status === "unknown"
-            ? { status: "unknown", failureCode: "delivery_unconfirmed" }
-            : settlement,
-        );
-        return "unconfirmed";
-      }
-      return await this.confirmLinearPilotStart(worker, watch, bound, command, fresh);
     } catch (error) {
       this.dropWatch(worker);
-      await this.settle(worker, command, {
+      await this.settle(worker, claimed.command, {
         status: "unknown",
         failureCode: "delivery_unconfirmed",
       });
@@ -556,14 +476,77 @@ export class InteractiveSessionCoordinator {
     }
   }
 
+  private async deliverLinearPilotStart(
+    launch: PilotLaunch,
+    claimed: PilotClaim,
+  ): Promise<LinearPilotFreshDispatch> {
+    const { worker, commandId, fresh, volatilePrompt } = launch;
+    const { session, agents, command } = claimed;
+    const proceeds = async (record: SessionRecord) =>
+      (await this.authorizeLinearPilot(record, commandId, agents)) && !worker.pilotStopRequested;
+    if (!(await proceeds(session)) || worker.pilotStopRequested) {
+      await this.settle(worker, command, { status: "superseded" });
+      return "unconfirmed";
+    }
+    const bound = await this.ensureAgent(worker, session, agents, {
+      authorize: () => proceeds(session),
+    });
+    if (!bound?.daemonAgentId) throw new DaemonResponseLostError();
+    await this.watch(worker, bound, agents, () => proceeds(bound));
+    const watch = worker.watched;
+    if (!watch || !(await proceeds(bound)) || !pilotStartReady(worker, watch))
+      throw new DaemonResponseLostError();
+    watch.pilotTurn = this.openPilotTurn(worker, bound, commandId, bound.daemonAgentId);
+    const settlement = await this.deliver(agents, bound.daemonAgentId, command, volatilePrompt);
+    if (settlement.status !== "delivered") {
+      await this.abandonPilotDelivery(worker, command, settlement);
+      return "unconfirmed";
+    }
+    return this.confirmLinearPilotStart(worker, watch, { bound, command, fresh });
+  }
+
+  private openPilotTurn(
+    worker: Worker,
+    bound: SessionRecord,
+    commandId: string,
+    agentId: string,
+  ): LinearPilotTurn {
+    const toolSteps = this.options.linearPilot?.toolSteps;
+    return new LinearPilotTurn(
+      {
+        ...worker.scope,
+        commandId,
+        daemonId: bound.daemonId,
+        agentId,
+        generation: bound.generation,
+        hubTurn: bound.turn + 1,
+      },
+      toolSteps === undefined ? undefined : { toolSteps, cwd: bound.launch.cwd },
+    );
+  }
+
+  private async abandonPilotDelivery(
+    worker: Worker,
+    command: SessionCommandRecord,
+    settlement: Settlement,
+  ): Promise<void> {
+    this.dropWatch(worker);
+    await this.settle(
+      worker,
+      command,
+      settlement.status === "unknown"
+        ? { status: "unknown", failureCode: "delivery_unconfirmed" }
+        : settlement,
+    );
+  }
+
   private async confirmLinearPilotStart(
     worker: Worker,
     watch: Watch,
-    bound: SessionRecord,
-    command: SessionCommandRecord,
-    fresh: boolean,
+    start: { bound: SessionRecord; command: SessionCommandRecord; fresh: boolean },
   ): Promise<LinearPilotFreshDispatch> {
-    const running = await this.transition(worker, bound, ["starting"], "running");
+    const { bound, command, fresh } = start;
+    const running = await this.transition(worker, bound, { from: ["starting"], to: "running" });
     const confirmed =
       !fresh ||
       (running !== undefined &&
@@ -588,64 +571,55 @@ export class InteractiveSessionCoordinator {
     input: LinearPilotStopRequest,
   ): Promise<LinearPilotStop> {
     if (worker.pilotStopRequested) return unconfirmedStop();
+    const held = await this.stoppablePilotTurn(worker, input);
+    if (!held || !stopTurnHeld(worker, held)) return unconfirmedStop();
     const { commandId, expectedBindingGeneration } = input;
-    const session = await this.session(worker);
-    const watch = worker.watched;
-    const turn = watch?.pilotTurn;
-    if (!watch || !turn) return unconfirmedStop();
-    const target = turn.target;
-    if (
-      !session ||
-      !target ||
-      !matchesLinearPilotStop(target, input) ||
-      session.state !== "running" ||
-      session.turn !== target.hubTurn ||
-      session.generation !== target.generation ||
-      session.daemonAgentId !== target.agentId ||
-      !session.daemonWorkspaceId ||
-      !(await this.authorizeLinearPilot(
-        session,
-        commandId,
-        watch.agents,
-        expectedBindingGeneration,
-      )) ||
-      worker.watched !== watch ||
-      turn.target !== target
-    )
-      return unconfirmedStop();
-    const workspaceId = session.daemonWorkspaceId;
     worker.pilotStopRequested = true;
-    const stopping = await this.transition(worker, session, ["running"], "stopping");
+    const stopping = await this.transition(worker, held.session, {
+      from: ["running"],
+      to: "stopping",
+    });
     if (
       !stopping ||
       !(await this.authorizeLinearPilot(
         stopping,
         commandId,
-        watch.agents,
+        held.watch.agents,
         expectedBindingGeneration,
       )) ||
-      worker.watched !== watch ||
-      turn.target !== target
+      !stopTurnHeld(worker, held)
     )
-      return unconfirmedStop(target);
-    return this.awaitLinearPilotStop(
-      worker,
-      watch,
-      target,
-      workspaceId,
-      stopping,
-      expectedBindingGeneration,
+      return unconfirmedStop(held.target);
+    return this.awaitLinearPilotStop(worker, held, stopping, expectedBindingGeneration);
+  }
+
+  private async stoppablePilotTurn(
+    worker: Worker,
+    input: LinearPilotStopRequest,
+  ): Promise<PilotStopTurn | undefined> {
+    const session = await this.session(worker);
+    const watch = worker.watched;
+    const turn = watch?.pilotTurn;
+    if (!watch || !turn) return undefined;
+    const target = turn.target;
+    if (!target || !stoppableSession(session, target, input)) return undefined;
+    const held = { session, watch, turn, target, workspaceId: session.daemonWorkspaceId };
+    const authorized = await this.authorizeLinearPilot(
+      session,
+      input.commandId,
+      watch.agents,
+      input.expectedBindingGeneration,
     );
+    return authorized && stopTurnHeld(worker, held) ? held : undefined;
   }
 
   private async awaitLinearPilotStop(
     worker: Worker,
-    watch: Watch,
-    target: LinearPilotTarget,
-    workspaceId: string,
+    held: PilotStopTurn,
     stopping: SessionRecord,
     bindingGeneration: number,
   ): Promise<LinearPilotStop> {
+    const { watch, target, workspaceId } = held;
     const result = Promise.withResolvers<boolean>();
     const stop = { written: false, end: result.resolve };
     worker.pilotStop = stop;
@@ -672,7 +646,11 @@ export class InteractiveSessionCoordinator {
           bindingGeneration,
         )) ||
         worker.watched !== watch ||
-        !(await this.transition(worker, stopping, ["stopping"], "idle", "stopped_by_person"))
+        !(await this.transition(worker, stopping, {
+          from: ["stopping"],
+          to: "idle",
+          reason: "stopped_by_person",
+        }))
       )
         return unconfirmedStop(target);
       return { status: "stopped", target, message: "Stopped." };
@@ -681,7 +659,6 @@ export class InteractiveSessionCoordinator {
       delete worker.pilotStop;
     }
   }
-
   send(principal: SessionPrincipal, input: SendCommand): Promise<CommandOutcome> {
     return this.intake(this.acceptMessage(principal, input));
   }
@@ -833,6 +810,13 @@ export class InteractiveSessionCoordinator {
     await this.track(recover, "recover", { daemonId: daemon.id });
   }
 
+  private async observeRecovered(worker: Worker, agents: AgentConnection): Promise<void> {
+    const current = await this.session(worker);
+    if (!hasLiveAgent(current)) return;
+    await this.inspect(worker, current, agents);
+    const observed = await this.session(worker);
+    if (hasLiveAgent(observed)) await this.watch(worker, observed, agents);
+  }
   private async recoverOfflineStops(daemonId: string): Promise<void> {
     for (const session of await this.daemonSessions(daemonId)) {
       if (session.origin !== "linear" && session.state === "stopping" && !this.agents(daemonId))
@@ -847,19 +831,7 @@ export class InteractiveSessionCoordinator {
       const worker = this.worker(session, session.hubSeq);
       this.clearTimers(worker);
       if (session.daemonAgentId) {
-        await this.enqueue(worker, "observation", async () => {
-          const current = await this.session(worker);
-          if (!current?.daemonAgentId || current.state === "closed" || current.state === "failed")
-            return;
-          await this.inspect(worker, current, agents);
-          const observed = await this.session(worker);
-          if (
-            observed?.state !== "failed" &&
-            observed?.state !== "closed" &&
-            observed?.daemonAgentId
-          )
-            await this.watch(worker, observed, agents);
-        });
+        await this.enqueue(worker, "observation", () => this.observeRecovered(worker, agents));
       }
       if (this.agents(daemonId) !== agents) return;
       this.options.bus.publish(session.id, { kind: "connection", online: true });
@@ -906,7 +878,13 @@ export class InteractiveSessionCoordinator {
       await this.enqueue(worker, "observation", async () => {
         let current = await this.session(worker);
         while (current && current.state !== "closed") {
-          if (await this.transition(worker, current, OPEN_STATES, "failed", "daemon_revoked"))
+          if (
+            await this.transition(worker, current, {
+              from: OPEN_STATES,
+              to: "failed",
+              reason: "daemon_revoked",
+            })
+          )
             break;
           current = await this.session(worker);
         }
@@ -1196,37 +1174,10 @@ export class InteractiveSessionCoordinator {
       await this.retryMessage(worker, command);
       return false;
     }
-    let bound: SessionRecord | undefined;
-    try {
-      bound = await this.ensureAgent(worker, session, agents);
-      if (!bound) {
-        await this.retryMessage(worker, command);
-        return false;
-      }
-    } catch (error) {
-      if (uncertain(error)) await this.retryMessage(worker, command);
-      else {
-        await this.settle(worker, command, { status: "failed", failureCode: "launch_failed" });
-        const latest = await this.session(worker);
-        if (latest?.generation === command.generation)
-          await this.transition(worker, latest, ["starting"], "failed", "launch_failed");
-      }
-      return false;
-    }
-    try {
-      await this.watch(worker, bound, agents);
-    } catch (error) {
-      this.reportFailure(error, "watch", worker.scope);
-      await this.retryMessage(worker, command, uncertain(error) ? undefined : "daemon_rejected");
-      return false;
-    }
+    const bound = await this.bindMessageAgent(worker, session, agents, command);
+    if (!bound || !(await this.watchMessageAgent(worker, bound, agents, command))) return false;
     const ready = await this.session(worker);
-    if (
-      !canDispatchMessage(ready) ||
-      !ready.daemonAgentId ||
-      ready.generation !== command.generation ||
-      this.agents(worker.daemonId) !== agents
-    ) {
+    if (!readyToDeliver(ready, command) || this.agents(worker.daemonId) !== agents) {
       await this.retryMessage(worker, command);
       return false;
     }
@@ -1235,7 +1186,67 @@ export class InteractiveSessionCoordinator {
       await this.retryMessage(worker, command);
       return false;
     }
+    await this.settleDelivery(worker, ready, command, settlement);
+    return true;
+  }
 
+  private async bindMessageAgent(
+    worker: Worker,
+    session: SessionRecord,
+    agents: AgentConnection,
+    command: SessionCommandRecord,
+  ): Promise<SessionRecord | undefined> {
+    try {
+      const bound = await this.ensureAgent(worker, session, agents);
+      if (!bound) await this.retryMessage(worker, command);
+      return bound;
+    } catch (error) {
+      await this.failMessageLaunch(worker, command, error);
+      return undefined;
+    }
+  }
+
+  private async failMessageLaunch(
+    worker: Worker,
+    command: SessionCommandRecord,
+    error: unknown,
+  ): Promise<void> {
+    if (uncertain(error)) {
+      await this.retryMessage(worker, command);
+      return;
+    }
+    await this.settle(worker, command, { status: "failed", failureCode: "launch_failed" });
+    const latest = await this.session(worker);
+    if (latest?.generation === command.generation)
+      await this.transition(worker, latest, {
+        from: ["starting"],
+        to: "failed",
+        reason: "launch_failed",
+      });
+  }
+
+  private async watchMessageAgent(
+    worker: Worker,
+    bound: SessionRecord,
+    agents: AgentConnection,
+    command: SessionCommandRecord,
+  ): Promise<boolean> {
+    try {
+      await this.watch(worker, bound, agents);
+      return true;
+    } catch (error) {
+      this.reportFailure(error, "watch", worker.scope);
+      await this.retryMessage(worker, command, uncertain(error) ? undefined : "daemon_rejected");
+      return false;
+    }
+  }
+
+  private async settleDelivery(
+    worker: Worker,
+    ready: SessionRecord,
+    command: SessionCommandRecord,
+    settlement: Settlement,
+  ): Promise<void> {
     const dispatchState = ready.state;
     if (
       settlement.status === "delivered" &&
@@ -1243,13 +1254,11 @@ export class InteractiveSessionCoordinator {
     ) {
       // Hold the claim until the store records the new turn, so another worker cannot drain the queue.
       await this.enqueue(worker, "observation", async () => {
-        await this.transition(worker, ready, [dispatchState], "running");
+        await this.transition(worker, ready, { from: [dispatchState], to: "running" });
       });
     }
     await this.settle(worker, command, settlement);
-    return true;
   }
-
   private async retryMessage(
     worker: Worker,
     command: SessionCommandRecord,
@@ -1295,31 +1304,35 @@ export class InteractiveSessionCoordinator {
     worker: Worker,
     session: SessionRecord,
     agents: AgentConnection,
-    onCreated?: (agent: AgentSnapshot) => void,
-    authorize?: () => Promise<boolean>,
+    hooks: EnsureAgentHooks = {},
   ): Promise<SessionRecord | undefined> {
     if (!session.daemonAgentId) {
       const agent = await this.createSessionAgent(agents, session);
-      onCreated?.(agent);
-      if (authorize && !(await authorize())) return undefined;
+      hooks.onCreated?.(agent);
+      if (hooks.authorize && !(await hooks.authorize())) return undefined;
       if (this.agents(worker.daemonId) !== agents) return undefined;
-      if (
-        !(await this.database.bindInteractiveSessionAgent({
-          ...worker.scope,
-          generation: session.generation,
-          agentId: agent.id,
-          workspaceId: agent.workspaceId,
-          now: this.now(),
-        }))
-      )
-        return undefined;
-      await this.publishEvents(worker);
-      const bound = await this.session(worker);
-      if (!bound || bound.generation !== session.generation || bound.daemonAgentId !== agent.id)
-        return undefined;
-      session = bound;
+      return this.bindCreatedAgent(worker, session, agent);
     }
     return session;
+  }
+  private async bindCreatedAgent(
+    worker: Worker,
+    session: SessionRecord,
+    agent: AgentSnapshot,
+  ): Promise<SessionRecord | undefined> {
+    const bound = await this.database.bindInteractiveSessionAgent({
+      ...worker.scope,
+      generation: session.generation,
+      agentId: agent.id,
+      workspaceId: agent.workspaceId,
+      now: this.now(),
+    });
+    if (!bound) return undefined;
+    await this.publishEvents(worker);
+    const latest = await this.session(worker);
+    if (!latest || latest.generation !== session.generation || latest.daemonAgentId !== agent.id)
+      return undefined;
+    return latest;
   }
 
   private createSessionAgent(agents: AgentConnection, session: SessionRecord) {
@@ -1345,22 +1358,8 @@ export class InteractiveSessionCoordinator {
   ): Promise<void> {
     let session = await this.session(worker);
     if (!session || session.state === "failed" || session.origin === "linear") return;
-    let command = worker.heldStop;
-    if (command && (session.state === "closed" || command.generation !== session.generation)) {
-      worker.heldStop = undefined;
-      command = undefined;
-    }
-    if (!command) {
-      command = await this.claim(worker, "control");
-      await this.publishEvents(worker);
-    }
-    if (!command) {
-      if (worker.closing) {
-        this.clearTimers(worker);
-        this.workers.delete(worker.scope.sessionId);
-      } else if (recovering) this.scheduleDispatch(worker, "control", LEASE_MS, false);
-      return;
-    }
+    const command = await this.nextControl(worker, session, recovering);
+    if (!command) return;
     session = await this.session(worker);
     if (
       !session ||
@@ -1368,7 +1367,44 @@ export class InteractiveSessionCoordinator {
       this.agents(worker.daemonId) !== agents
     )
       return;
+    await this.runControl(worker, { agents, session, command }, recovering);
+  }
 
+  private async nextControl(
+    worker: Worker,
+    session: SessionRecord,
+    recovering: boolean,
+  ): Promise<SessionCommandRecord | undefined> {
+    let command = this.releaseStaleStop(worker, session);
+    if (!command) {
+      command = await this.claim(worker, "control");
+      await this.publishEvents(worker);
+    }
+    if (!command) this.settleIdleControl(worker, recovering);
+    return command;
+  }
+
+  private releaseStaleStop(
+    worker: Worker,
+    session: SessionRecord,
+  ): SessionCommandRecord | undefined {
+    const command = worker.heldStop;
+    if (command && (session.state === "closed" || command.generation !== session.generation)) {
+      worker.heldStop = undefined;
+      return undefined;
+    }
+    return command;
+  }
+
+  private settleIdleControl(worker: Worker, recovering: boolean): void {
+    if (worker.closing) {
+      this.clearTimers(worker);
+      this.workers.delete(worker.scope.sessionId);
+    } else if (recovering) this.scheduleDispatch(worker, "control", LEASE_MS, false);
+  }
+
+  private async runControl(worker: Worker, job: ControlJob, recovering: boolean): Promise<void> {
+    const { agents, session, command } = job;
     switch (command.kind) {
       case "replace":
         await this.dispatchReplacement(worker, agents, session, command);
@@ -1377,11 +1413,12 @@ export class InteractiveSessionCoordinator {
         await this.dispatchClose(worker, agents, session, command);
         break;
       case "stop":
-        await this.dispatchStop(worker, agents, session, command, recovering);
+        await this.dispatchStop(worker, job, recovering);
+        break;
+      case "message":
         break;
     }
   }
-
   private async dispatchClose(
     worker: Worker,
     agents: AgentConnection,
@@ -1407,45 +1444,57 @@ export class InteractiveSessionCoordinator {
     }
   }
 
-  private async dispatchStop(
-    worker: Worker,
-    agents: AgentConnection,
-    session: SessionRecord,
-    command: SessionCommandRecord,
-    recovering: boolean,
-  ): Promise<void> {
+  private async dispatchStop(worker: Worker, job: ControlJob, recovering: boolean): Promise<void> {
+    const { agents, session, command } = job;
     if (session.state === "idle") {
       await this.finishStop(worker, command);
       return;
     }
-    if (session.state !== "stopping" || !session.daemonAgentId || !session.daemonWorkspaceId)
-      return;
+    if (!isStoppingWithAgent(session)) return;
     if (worker.heldStop && !recovering) return;
     worker.heldStop = command;
-    try {
-      if (command.attempts > 1) {
-        await this.inspect(worker, session, agents);
-        if ((await this.session(worker))?.state !== "stopping") return;
-      }
-      await agents.control(session.daemonAgentId, session.daemonWorkspaceId, "interrupt");
-      await this.inspect(worker, session, agents);
-    } catch (error) {
-      const current = await this.session(worker);
-      if (
-        current?.generation === session.generation &&
-        current.turn === session.turn &&
-        current.state === "idle"
-      ) {
-        await this.finishStop(worker, command);
-        return;
-      }
-      await this.deferStop(worker, command, controlFailure(error));
-      return;
-    }
+    if (!(await this.interruptForStop(worker, agents, session, command))) return;
     if ((await this.session(worker))?.state === "idle") await this.finishStop(worker, command);
     else await this.deferStop(worker, command, { status: "unknown" });
   }
 
+  private async interruptForStop(
+    worker: Worker,
+    agents: AgentConnection,
+    session: StoppingSession,
+    command: SessionCommandRecord,
+  ): Promise<boolean> {
+    try {
+      if (command.attempts > 1) {
+        await this.inspect(worker, session, agents);
+        if ((await this.session(worker))?.state !== "stopping") return false;
+      }
+      await agents.control(session.daemonAgentId, session.daemonWorkspaceId, "interrupt");
+      await this.inspect(worker, session, agents);
+      return true;
+    } catch (error) {
+      await this.recoverStopFailure(worker, session, command, error);
+      return false;
+    }
+  }
+
+  private async recoverStopFailure(
+    worker: Worker,
+    session: SessionRecord,
+    command: SessionCommandRecord,
+    error: unknown,
+  ): Promise<void> {
+    const current = await this.session(worker);
+    if (
+      current?.generation === session.generation &&
+      current.turn === session.turn &&
+      current.state === "idle"
+    ) {
+      await this.finishStop(worker, command);
+      return;
+    }
+    await this.deferStop(worker, command, controlFailure(error));
+  }
   private async deferStop(
     worker: Worker,
     command: SessionCommandRecord,
@@ -1475,8 +1524,10 @@ export class InteractiveSessionCoordinator {
   ): Promise<void> {
     let created: AgentSnapshot | undefined;
     try {
-      const bound = await this.ensureAgent(worker, session, agents, (agent) => {
-        created = agent;
+      const bound = await this.ensureAgent(worker, session, agents, {
+        onCreated: (agent) => {
+          created = agent;
+        },
       });
       if (!bound) throw new DaemonResponseLostError();
       try {
@@ -1485,7 +1536,7 @@ export class InteractiveSessionCoordinator {
         this.reportFailure(error, "watch", worker.scope);
       }
       if (await this.settle(worker, command, { status: "done" })) {
-        await this.transition(worker, bound, ["starting"], "idle");
+        await this.transition(worker, bound, { from: ["starting"], to: "idle" });
         void this.dispatch(worker, "message");
       }
     } catch (error) {
@@ -1496,7 +1547,11 @@ export class InteractiveSessionCoordinator {
         else await this.archiveOrphanedReplacement(worker, agents, session, created);
       } else {
         await this.settle(worker, command, { status: "failed", failureCode: "launch_failed" });
-        await this.transition(worker, session, ["starting"], "failed", "launch_failed");
+        await this.transition(worker, session, {
+          from: ["starting"],
+          to: "failed",
+          reason: "launch_failed",
+        });
       }
     }
   }
@@ -1515,13 +1570,7 @@ export class InteractiveSessionCoordinator {
         );
       if (agents.archiveAgent === undefined || this.agents(worker.daemonId) !== agents) return;
       const closed = await this.session(worker);
-      if (
-        closed?.state !== "closed" ||
-        closed.generation !== session.generation ||
-        closed.stateReason !== "launch_failed" ||
-        closed.daemonAgentId !== null
-      )
-        return;
+      if (!isLaunchFailedClose(closed, session)) return;
       if (agent.status === "idle" && !isArchived(agent) && this.agents(worker.daemonId) === agents)
         await agents.archiveAgent(agent.id, 2_000);
     } catch (error) {
@@ -1574,6 +1623,7 @@ export class InteractiveSessionCoordinator {
 
   private dropWatch(worker: Worker): void {
     worker.pilotStop?.end(false);
+    worker.watched?.pilotTurn?.closeToolSteps();
     worker.watched?.unsubscribe?.();
     worker.watched = undefined;
   }
@@ -1581,16 +1631,7 @@ export class InteractiveSessionCoordinator {
   private watchLinearPilot(worker: Worker, watch: Watch, event: AgentEvent): void {
     const turn = watch.pilotTurn;
     if (!turn) {
-      if (event.type === "agent_snapshot" && event.agent.id === watch.session.daemonAgentId)
-        watch.pilotIdle =
-          watch.pilotIdle !== false &&
-          event.agent.status === "idle" &&
-          !isMissingSnapshot(event.agent);
-      else if (
-        event.type === "agent_stream" ||
-        (event.agent.id === watch.session.daemonAgentId && event.agent.status !== "idle")
-      )
-        watch.pilotIdle = false;
+      trackPilotIdle(watch, event);
       return;
     }
     if (event.type !== "agent_stream") return;
@@ -1601,51 +1642,71 @@ export class InteractiveSessionCoordinator {
       stop.end(stop.written && turn.turnEnded);
       return;
     }
-    void this.enqueue(worker, "message", async () => {
-      if (!watch.pilotDelivered || worker.watched !== watch || worker.pilotStopRequested) return;
-      const session = await this.session(worker);
-      if (
-        !session ||
-        session.state !== "running" ||
-        session.turn !== terminal.hubTurn ||
-        session.generation !== terminal.generation ||
-        session.daemonAgentId !== terminal.agentId ||
-        !(await this.authorizeLinearPilot(session, terminal.commandId, watch.agents)) ||
-        worker.watched !== watch
-      )
-        return;
-      const current = turn.turnEnded
-        ? await this.transition(worker, session, ["running"], "idle")
-        : session;
-      if (!current) return;
-      if (terminal.status === "completed") {
-        const safe = this.transcript.assistant(terminal.answer.text, {
-          seq: terminal.seq,
-          at: event.timestamp,
-          turnId: terminal.daemonTurnId,
-        });
-        terminal.answer = {
-          text: safe.text,
-          truncated: safe.truncated || terminal.answer.truncated,
-        };
-      }
-      if (
-        worker.watched === watch &&
-        (await this.authorizeLinearPilot(current, terminal.commandId, watch.agents)) &&
-        worker.watched === watch &&
-        !worker.pilotStopRequested
-      ) {
-        this.dropWatch(worker);
-        // The Stop job can hold the session lock while it waits for this lane.
-        void this.track(
-          Promise.resolve().then(() => this.options.linearPilot?.onTerminal(terminal)),
-          "linear_pilot_terminal",
-          worker.scope,
-        );
-      }
-    });
+    void this.enqueue(worker, "message", () =>
+      this.finishPilotTerminal(worker, watch, { turn, terminal, event }),
+    );
   }
 
+  private async finishPilotTerminal(
+    worker: Worker,
+    watch: Watch,
+    done: PilotTerminal,
+  ): Promise<void> {
+    const { turn, terminal, event } = done;
+    if (!watch.pilotDelivered || worker.watched !== watch || worker.pilotStopRequested) return;
+    const session = await this.session(worker);
+    if (
+      !session ||
+      !matchesRunningPilot(session, terminal) ||
+      !(await this.authorizeLinearPilot(session, terminal.commandId, watch.agents)) ||
+      worker.watched !== watch
+    )
+      return;
+    const current = turn.turnEnded
+      ? await this.transition(worker, session, { from: ["running"], to: "idle" })
+      : session;
+    if (!current) return;
+    this.sanitizeTerminalAnswer(terminal, event);
+    await this.releasePilotTerminal(worker, watch, current, terminal);
+  }
+
+  private sanitizeTerminalAnswer(
+    terminal: PilotTerminal["terminal"],
+    event: PilotTerminal["event"],
+  ): void {
+    if (terminal.status !== "completed") return;
+    const safe = this.transcript.assistant(terminal.answer.text, {
+      seq: terminal.seq,
+      at: event.timestamp,
+      turnId: terminal.daemonTurnId,
+    });
+    terminal.answer = {
+      text: safe.text,
+      truncated: safe.truncated || terminal.answer.truncated,
+    };
+  }
+
+  private async releasePilotTerminal(
+    worker: Worker,
+    watch: Watch,
+    current: SessionRecord,
+    terminal: PilotTerminal["terminal"],
+  ): Promise<void> {
+    if (
+      worker.watched === watch &&
+      (await this.authorizeLinearPilot(current, terminal.commandId, watch.agents)) &&
+      worker.watched === watch &&
+      !worker.pilotStopRequested
+    ) {
+      this.dropWatch(worker);
+      // The Stop job can hold the session lock while it waits for this lane.
+      void this.track(
+        Promise.resolve().then(() => this.options.linearPilot?.onTerminal(terminal)),
+        "linear_pilot_terminal",
+        worker.scope,
+      );
+    }
+  }
   private watchEvent(worker: Worker, watch: Watch, event: AgentEvent): void {
     if (event.type === "agent_stream" && event.agentId !== watch.session.daemonAgentId) return;
     if (watch.session.origin === "linear") {
@@ -1704,35 +1765,33 @@ export class InteractiveSessionCoordinator {
         await this.observeSnapshot(worker, observed, event.agent);
       return;
     }
-    const stream = event.event;
+    await this.observeStream(worker, watch, event);
+  }
+
+  private async observeStream(
+    worker: Worker,
+    watch: Watch,
+    event: Extract<AgentEvent, { type: "agent_stream" }>,
+  ): Promise<void> {
+    const type = event.event.type;
     const turnId = agentTurnId(event);
-    if (stream.type === "turn_started") {
+    if (type === "turn_started") {
       await this.observeTurnStart(worker, watch, turnId);
       return;
     }
-    if (
-      turnId !== undefined &&
-      watch.turnId !== undefined &&
-      (turnId !== watch.turnId || watch.identifiedTurn !== watch.session.turn)
-    )
-      return;
+    if (isStaleTurn(watch, turnId)) return;
+    await this.observeStreamType(worker, watch, type);
+  }
 
+  private async observeStreamType(worker: Worker, watch: Watch, type: string): Promise<void> {
     const current = watch.session;
-    switch (stream.type) {
-      case "turn_completed":
-      case "turn_failed":
-        await this.observeTurnEnd(worker, current, watch.agents);
-        break;
-      case "turn_canceled":
-        await this.observeIdle(worker, current, true);
-        break;
-      case "permission_requested":
-        await this.transition(worker, current, ["running"], "waiting_permission");
-        break;
-      case "permission_resolved":
-        await this.transition(worker, current, ["waiting_permission"], "running");
-        break;
-    }
+    if (type === "turn_completed" || type === "turn_failed")
+      await this.observeTurnEnd(worker, current, watch.agents);
+    else if (type === "turn_canceled") await this.observeIdle(worker, current, true);
+    else if (type === "permission_requested")
+      await this.transition(worker, current, { from: ["running"], to: "waiting_permission" });
+    else if (type === "permission_resolved")
+      await this.transition(worker, current, { from: ["waiting_permission"], to: "running" });
   }
 
   private async observeTurnStart(
@@ -1742,25 +1801,13 @@ export class InteractiveSessionCoordinator {
   ): Promise<void> {
     if (turnId !== undefined && turnId === watch.turnId) return;
     const previous = watch.session;
-    const replacement =
-      turnId !== undefined && watch.turnId !== undefined && watch.identifiedTurn === previous.turn;
-    const changed = await this.transition(
-      worker,
-      previous,
-      replacement ? ["starting", "idle", "running"] : ["starting", "idle"],
-      "running",
-      undefined,
-      replacement,
-    );
-    if (!changed) {
-      const current = await this.session(worker);
-      if (
-        current?.generation === previous.generation &&
-        current.daemonAgentId === previous.daemonAgentId &&
-        current.state === "running"
-      )
-        watch.session = current;
-    }
+    const replacement = isReplacementTurn(watch, turnId);
+    const changed = await this.transition(worker, previous, {
+      from: replacement ? ["starting", "idle", "running"] : ["starting", "idle"],
+      to: "running",
+      beginsTurn: replacement,
+    });
+    if (!changed) adoptRunningSession(watch, previous, await this.session(worker));
     if (turnId !== undefined) {
       watch.turnId = turnId;
       watch.identifiedTurn = watch.session.turn;
@@ -1772,7 +1819,13 @@ export class InteractiveSessionCoordinator {
     current: SessionRecord,
     agents: AgentConnection,
   ): Promise<void> {
-    if (await this.transition(worker, current, ["running", "waiting_permission"], "idle")) return;
+    if (
+      await this.transition(worker, current, {
+        from: ["running", "waiting_permission"],
+        to: "idle",
+      })
+    )
+      return;
     const stopping = await this.session(worker);
     if (
       stopping?.state === "stopping" &&
@@ -1795,7 +1848,11 @@ export class InteractiveSessionCoordinator {
     } catch (error) {
       if (!isMissingAgent(error)) throw error;
       if (this.agents(worker.daemonId) === agents)
-        await this.transition(worker, session, OPEN_STATES, "failed", "agent_missing");
+        await this.transition(worker, session, {
+          from: OPEN_STATES,
+          to: "failed",
+          reason: "agent_missing",
+        });
       return;
     }
     if (this.agents(worker.daemonId) === agents && snapshot.id === session.daemonAgentId)
@@ -1808,13 +1865,20 @@ export class InteractiveSessionCoordinator {
     snapshot: AgentSnapshot,
   ): Promise<void> {
     if (isMissingSnapshot(snapshot)) {
-      await this.transition(worker, session, OPEN_STATES, "failed", "agent_missing");
+      await this.transition(worker, session, {
+        from: OPEN_STATES,
+        to: "failed",
+        reason: "agent_missing",
+      });
     } else if (snapshot.status === "idle") {
       await this.observeIdle(worker, session, true);
     } else if (snapshot.status === "running") {
-      await this.transition(worker, session, ["starting", "idle"], "running");
+      await this.transition(worker, session, { from: ["starting", "idle"], to: "running" });
     } else if (snapshot.status === "error") {
-      await this.transition(worker, session, ["running", "waiting_permission"], "idle");
+      await this.transition(worker, session, {
+        from: ["running", "waiting_permission"],
+        to: "idle",
+      });
     }
   }
 
@@ -1824,31 +1888,27 @@ export class InteractiveSessionCoordinator {
     stopEvidence: boolean,
   ): Promise<void> {
     if (stopEvidence) {
-      const stopped = await this.transition(
-        worker,
-        session,
-        ["stopping"],
-        "idle",
-        "stopped_by_person",
-      );
+      const stopped = await this.transition(worker, session, {
+        from: ["stopping"],
+        to: "idle",
+        reason: "stopped_by_person",
+      });
       if (stopped) {
         this.clearTimer(worker, "control");
         void this.dispatch(worker, "control");
         return;
       }
     }
-    await this.transition(worker, session, ["running", "waiting_permission"], "idle");
+    await this.transition(worker, session, { from: ["running", "waiting_permission"], to: "idle" });
   }
 
   private async transition(
     worker: Worker,
     session: SessionRecord,
-    from: readonly SessionState[],
-    to: ObservedSessionStateInput["to"],
-    reason?: ObservedSessionStateInput["reason"],
-    beginsTurn = false,
+    change: StateChange,
   ): Promise<SessionRecord | undefined> {
     if (this.expired) return undefined;
+    const { from, to, reason, beginsTurn } = change;
     const next = await this.database.applyInteractiveSessionState({
       ...worker.scope,
       generation: session.generation,
@@ -1861,12 +1921,18 @@ export class InteractiveSessionCoordinator {
       ...(beginsTurn ? { beginsTurn: true } : {}),
     });
     if (!next) return undefined;
-    if (
-      worker.watched?.session.generation === next.generation &&
-      worker.watched.session.daemonAgentId === next.daemonAgentId
-    )
-      worker.watched.session = next;
+    syncWatchedSession(worker, next);
     await this.publishEvents(worker);
+    this.afterTransition(worker, session, next, reason);
+    return next;
+  }
+
+  private afterTransition(
+    worker: Worker,
+    session: SessionRecord,
+    next: SessionRecord,
+    reason: StateChange["reason"],
+  ): void {
     if (next.state === "failed") {
       this.dropWatch(worker);
       this.clearTimers(worker);
@@ -1877,10 +1943,8 @@ export class InteractiveSessionCoordinator {
     if (session.state === "waiting_permission" && next.state === "running") {
       void this.dispatch(worker, "message");
     }
-    return next;
   }
 }
-
 function canDispatchMessage(session: SessionRecord | undefined): session is SessionRecord {
   return (
     session !== undefined &&
@@ -1939,4 +2003,262 @@ function endsTurn(type: string): boolean {
 function agentTurnId(event: Extract<AgentEvent, { type: "agent_stream" }>): string | undefined {
   const turnId = event.event["turnId"];
   return typeof turnId === "string" ? turnId : undefined;
+}
+
+type StartProfile = NonNullable<Awaited<ReturnType<Database["findSessionProfile"]>>>;
+type SessionMessage = Awaited<ReturnType<Database["listInteractiveSessionMessages"]>>[number];
+type StoppingSession = SessionRecord & { daemonAgentId: string; daemonWorkspaceId: string };
+type PilotTarget = Pick<LinearPilotTarget, "hubTurn" | "generation" | "agentId">;
+
+interface StateChange {
+  from: readonly SessionState[];
+  to: ObservedSessionStateInput["to"];
+  reason?: ObservedSessionStateInput["reason"];
+  beginsTurn?: boolean;
+}
+
+interface EnsureAgentHooks {
+  onCreated?: (agent: AgentSnapshot) => void;
+  authorize?: () => Promise<boolean>;
+}
+
+interface ControlJob {
+  agents: AgentConnection;
+  session: SessionRecord;
+  command: SessionCommandRecord;
+}
+
+interface PilotClaim {
+  session: SessionRecord;
+  agents: AgentConnection;
+  command: SessionCommandRecord;
+}
+
+interface PilotExpectation {
+  commandId: string;
+  fresh: boolean;
+}
+
+interface PilotLaunch extends PilotExpectation {
+  worker: Worker;
+  volatilePrompt: string | undefined;
+}
+
+interface PilotStopTurn {
+  session: SessionRecord & { daemonWorkspaceId: string };
+  watch: Watch;
+  turn: LinearPilotTurn;
+  target: LinearPilotTarget;
+  workspaceId: string;
+}
+
+interface PilotTerminal {
+  turn: LinearPilotTurn;
+  terminal: NonNullable<ReturnType<LinearPilotTurn["accept"]>>;
+  event: Extract<AgentEvent, { type: "agent_stream" }>;
+}
+
+function checkStartProfile(
+  profile: StartProfile | undefined,
+  principal: SessionPrincipal,
+  input: StartCommand,
+  native: LinearPilotStart | undefined,
+): { code: RefusalCode } | { profile: StartProfile } {
+  if (profile?.status !== "active") return { code: "profile_unavailable" };
+  if (profile.version !== input.profileVersion) return { code: "profile_changed" };
+  if (native && !ownsPrivateProfile(profile, principal)) return { code: "forbidden" };
+  return { profile };
+}
+
+function ownsPrivateProfile(profile: StartProfile, principal: SessionPrincipal): boolean {
+  return (
+    principal.role === "owner" &&
+    profile.access === "private" &&
+    profile.createdByUserId === principal.userId
+  );
+}
+
+function canExecute(daemon: DaemonRecord | null | undefined): daemon is DaemonRecord {
+  return daemon?.status === "active" && daemon.permissions.includes("hub.execute");
+}
+
+function mayRetirePilot(principal: SessionPrincipal, input: LinearPilotRetirement): boolean {
+  return (
+    principal.role === "owner" &&
+    principal.organizationId === input.organizationId &&
+    surfaceRevision(input.expectedBindingGeneration)
+  );
+}
+
+function ownedPilotWorker(worker: Worker | undefined, input: LinearPilotCommand) {
+  const owned = worker?.scope.organizationId === input.organizationId;
+  return owned && !worker.pilotStopRequested ? worker : undefined;
+}
+
+function deliveredPilotTurn(worker: Worker, commandId: string) {
+  const watch = worker.watched;
+  const target = watch?.pilotTurn?.target;
+  if (!watch?.pilotDelivered || !target || target.commandId !== commandId) return undefined;
+  return { watch, target };
+}
+
+function matchesRunningPilot(session: SessionRecord, target: PilotTarget): boolean {
+  return (
+    session.state === "running" &&
+    session.generation === target.generation &&
+    session.turn === target.hubTurn &&
+    session.daemonAgentId === target.agentId
+  );
+}
+
+function pilotTurnUnchanged(worker: Worker, watch: Watch, target: LinearPilotTarget): boolean {
+  return (
+    worker.watched === watch && watch.pilotTurn?.target === target && !worker.pilotStopRequested
+  );
+}
+
+function ownsPilotCommand(worker: Worker | undefined, input: LinearPilotCommand): worker is Worker {
+  return (
+    worker?.scope.organizationId === input.organizationId &&
+    worker.pilotCommandId === input.commandId
+  );
+}
+
+function pilotInputRefusal(worker: Worker): RefusalCode {
+  // The pinned daemon can clear a permission that arrived after Hub's check.
+  return worker.watched?.pilotTurn?.permissionPending ? "waiting_permission" : "invalid_mode";
+}
+
+function isUnstartedPilot(session: SessionRecord): boolean {
+  return session.state === "starting" && session.daemonAgentId === null && session.generation === 1;
+}
+
+function isPendingFirstMessage(
+  initial: SessionMessage | undefined,
+  expected: PilotExpectation,
+): boolean {
+  return (
+    initial?.commandId === expected.commandId &&
+    initial.status === "pending" &&
+    (initial.body === LINEAR_PILOT_FRESH_BODY) === expected.fresh
+  );
+}
+
+function isExpectedPilotCommand(
+  command: SessionCommandRecord,
+  expected: PilotExpectation,
+): boolean {
+  return (
+    command.id === expected.commandId &&
+    command.attempts === 1 &&
+    command.body !== null &&
+    (command.body === LINEAR_PILOT_FRESH_BODY) === expected.fresh
+  );
+}
+
+function pilotStartReady(worker: Worker, watch: Watch): boolean {
+  return !worker.pilotStopRequested && worker.watched === watch && Boolean(watch.pilotIdle);
+}
+
+function stoppableSession(
+  session: SessionRecord | undefined,
+  target: LinearPilotTarget,
+  input: LinearPilotStopRequest,
+): session is SessionRecord & { daemonWorkspaceId: string } {
+  return (
+    session !== undefined &&
+    matchesLinearPilotStop(target, input) &&
+    matchesRunningPilot(session, target) &&
+    Boolean(session.daemonWorkspaceId)
+  );
+}
+
+function stopTurnHeld(
+  worker: Worker,
+  held: Pick<PilotStopTurn, "watch" | "turn" | "target">,
+): boolean {
+  return worker.watched === held.watch && held.turn.target === held.target;
+}
+
+function hasLiveAgent(session: SessionRecord | undefined): session is SessionRecord {
+  return (
+    Boolean(session?.daemonAgentId) && session?.state !== "closed" && session?.state !== "failed"
+  );
+}
+
+function readyToDeliver(
+  session: SessionRecord | undefined,
+  command: SessionCommandRecord,
+): session is SessionRecord & { daemonAgentId: string } {
+  return (
+    canDispatchMessage(session) &&
+    Boolean(session.daemonAgentId) &&
+    session.generation === command.generation
+  );
+}
+
+function isStoppingWithAgent(session: SessionRecord): session is StoppingSession {
+  return (
+    session.state === "stopping" &&
+    Boolean(session.daemonAgentId) &&
+    Boolean(session.daemonWorkspaceId)
+  );
+}
+
+function isLaunchFailedClose(closed: SessionRecord | undefined, session: SessionRecord): boolean {
+  return (
+    closed?.state === "closed" &&
+    closed.generation === session.generation &&
+    closed.stateReason === "launch_failed" &&
+    closed.daemonAgentId === null
+  );
+}
+
+function trackPilotIdle(watch: Watch, event: AgentEvent): void {
+  if (event.type === "agent_snapshot" && event.agent.id === watch.session.daemonAgentId) {
+    watch.pilotIdle =
+      watch.pilotIdle !== false && event.agent.status === "idle" && !isMissingSnapshot(event.agent);
+  } else if (
+    event.type === "agent_stream" ||
+    (event.agent.id === watch.session.daemonAgentId && event.agent.status !== "idle")
+  ) {
+    watch.pilotIdle = false;
+  }
+}
+
+function isStaleTurn(watch: Watch, turnId: string | undefined): boolean {
+  return (
+    turnId !== undefined &&
+    watch.turnId !== undefined &&
+    (turnId !== watch.turnId || watch.identifiedTurn !== watch.session.turn)
+  );
+}
+
+function isReplacementTurn(watch: Watch, turnId: string | undefined): boolean {
+  return (
+    turnId !== undefined &&
+    watch.turnId !== undefined &&
+    watch.identifiedTurn === watch.session.turn
+  );
+}
+
+function adoptRunningSession(
+  watch: Watch,
+  previous: SessionRecord,
+  current: SessionRecord | undefined,
+): void {
+  if (
+    current?.generation === previous.generation &&
+    current.daemonAgentId === previous.daemonAgentId &&
+    current.state === "running"
+  )
+    watch.session = current;
+}
+
+function syncWatchedSession(worker: Worker, next: SessionRecord): void {
+  if (
+    worker.watched?.session.generation === next.generation &&
+    worker.watched.session.daemonAgentId === next.daemonAgentId
+  )
+    worker.watched.session = next;
 }

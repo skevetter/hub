@@ -3,7 +3,10 @@ import { surfaceRevision } from "../surfaces/store.js";
 import type { AgentEvent } from "../daemons/agents/index.js";
 import type { StartSessionInput } from "../interactive-sessions/store.js";
 import type { SessionPrincipal, SessionRecord } from "../interactive-sessions/types.js";
+import { logger } from "../logger.js";
 import { MAX_REPLY_INPUT_CHARS, type FinalReplyAnswer } from "../run-replies/format.js";
+
+import type { ToolStepHook, ToolStepTurn } from "./tool-steps.js";
 
 export type LinearPilotStart = Pick<
   StartSessionInput,
@@ -74,9 +77,17 @@ export interface LinearPilotSessionHooks {
   ): Promise<boolean>;
   onTerminal(terminal: LinearPilotTerminal): void | Promise<void>;
   stopTimeoutMs?: number;
+  toolSteps?: ToolStepHook;
 }
 
 type Stream = Extract<AgentEvent, { type: "agent_stream" }>;
+
+type TimelineItem = Extract<Stream["event"], { type: "timeline" }>["item"];
+interface TimelinePosition {
+  turnId: string | undefined;
+  epoch: string | undefined;
+  seq: number | undefined;
+}
 
 const MAX_ASSISTANT_BLOCK_IDS = 1024;
 const instant = z.iso.datetime({ offset: true });
@@ -96,6 +107,11 @@ export function matchesLinearPilotStop(target: LinearPilotTarget, request: Linea
   return requestedAt.success && Date.parse(requestedAt.data) > Date.parse(target.startedAt);
 }
 
+interface ToolStepOptions {
+  toolSteps?: ToolStepHook;
+  cwd?: string;
+}
+
 export class LinearPilotTurn {
   private turnId: string | undefined;
   private startedAt: string | null = null;
@@ -110,7 +126,24 @@ export class LinearPilotTurn {
   permissionPending = false;
   turnEnded = false;
 
-  constructor(private readonly scope: TurnScope) {}
+  private toolSteps: ToolStepTurn | undefined;
+
+  constructor(
+    private readonly scope: TurnScope,
+    options?: ToolStepOptions,
+  ) {
+    this.toolSteps = options?.toolSteps?.(scope, options.cwd);
+  }
+
+  closeToolSteps(): void {
+    const toolSteps = this.toolSteps;
+    this.toolSteps = undefined;
+    try {
+      toolSteps?.close();
+    } catch {
+      logger.warn("Linear pilot tool step close failed");
+    }
+  }
 
   get target(): LinearPilotTarget | undefined {
     return this.sealed ? undefined : this.active;
@@ -123,18 +156,17 @@ export class LinearPilotTurn {
   accept({ agentId, event, epoch, seq, wireTimestamp }: Stream): LinearPilotTerminal | undefined {
     if (this.sealed || agentId !== this.scope.agentId) return undefined;
     const turnId = typeof event["turnId"] === "string" ? event["turnId"] : undefined;
+    if (event.type === "turn_started") return this.acceptStart(turnId, wireTimestamp);
+    return this.acceptEvent(event, { turnId, epoch, seq });
+  }
+
+  private acceptEvent(
+    event: Exclude<Stream["event"], { type: "turn_started" }>,
+    row: TimelinePosition,
+  ) {
     switch (event.type) {
-      case "turn_started":
-        if (!turnId || (this.turnId && this.turnId !== turnId)) return this.loseProof();
-        if (this.turnId === undefined) {
-          const started = instant.safeParse(wireTimestamp);
-          this.turnId = turnId;
-          this.startedAt =
-            started.success && Number.isFinite(Date.parse(started.data)) ? started.data : null;
-        }
-        return undefined;
       case "timeline":
-        return this.acceptTimeline(event.item, turnId, epoch, seq);
+        return this.acceptTimeline(event.item, row);
       case "permission_requested":
       case "permission_resolved":
         this.permissionPending = event.type === "permission_requested";
@@ -142,33 +174,48 @@ export class LinearPilotTurn {
       case "turn_completed":
       case "turn_failed":
       case "turn_canceled":
-        return this.acceptTerminal(event.type, turnId, epoch, seq);
+        return this.acceptTerminal(event.type, row);
+      case "attention_required":
+      case "thread_started":
       default:
         return undefined;
     }
   }
 
+  private acceptStart(turnId: string | undefined, wireTimestamp: string | undefined) {
+    if (!turnId || (this.turnId && this.turnId !== turnId)) return this.loseProof();
+    if (this.turnId === undefined) {
+      const started = instant.safeParse(wireTimestamp);
+      this.turnId = turnId;
+      this.startedAt =
+        started.success && Number.isFinite(Date.parse(started.data)) ? started.data : null;
+    }
+    return undefined;
+  }
+
+  private acceptInitialRow(item: TimelineItem, row: TimelinePosition) {
+    if (item.type !== "user_message") return undefined;
+    const { turnId, epoch, seq } = row;
+    if (
+      !this.turnId ||
+      turnId !== this.turnId ||
+      !epoch ||
+      seq === undefined ||
+      item["clientMessageId"] !== this.scope.commandId
+    )
+      return this.loseProof();
+    this.active = { ...this.scope, daemonTurnId: turnId, epoch, startedAt: this.startedAt };
+    this.seq = seq;
+    return undefined;
+  }
+
   private acceptTimeline(
-    item: Extract<Stream["event"], { type: "timeline" }>["item"],
-    turnId: string | undefined,
-    epoch: string | undefined,
-    seq: number | undefined,
+    item: TimelineItem,
+    row: TimelinePosition,
   ): LinearPilotTerminal | undefined {
     const active = this.active;
-    if (!active) {
-      if (item.type !== "user_message") return undefined;
-      if (
-        !this.turnId ||
-        turnId !== this.turnId ||
-        !epoch ||
-        seq === undefined ||
-        item["clientMessageId"] !== this.scope.commandId
-      )
-        return this.loseProof();
-      this.active = { ...this.scope, daemonTurnId: turnId, epoch, startedAt: this.startedAt };
-      this.seq = seq;
-      return undefined;
-    }
+    if (!active) return this.acceptInitialRow(item, row);
+    const { turnId, epoch, seq } = row;
     if (epoch !== active.epoch || seq !== this.seq + 1 || turnId !== active.daemonTurnId)
       return this.loseProof();
     this.seq = seq;
@@ -176,10 +223,20 @@ export class LinearPilotTurn {
     if (item.type === "tool_call") {
       this.messageEnded = true;
       this.clearAnswer();
+      this.acceptToolStep(item);
     }
     if (item.type === "assistant_message")
       return this.acceptAssistantBlock(item.messageId, item.text);
     return undefined;
+  }
+
+  private acceptToolStep(item: TimelineItem): void {
+    try {
+      this.toolSteps?.accept(item);
+    } catch {
+      logger.warn("Linear pilot tool step hook failed");
+      this.closeToolSteps();
+    }
   }
 
   private acceptAssistantBlock(messageId: string | undefined, text: string | undefined) {
@@ -203,21 +260,13 @@ export class LinearPilotTurn {
 
   private acceptTerminal(
     type: "turn_completed" | "turn_failed" | "turn_canceled",
-    turnId: string | undefined,
-    epoch: string | undefined,
-    seq: number | undefined,
+    row: TimelinePosition,
   ): LinearPilotTerminal {
     const active = this.active;
-    // The pinned daemon sends epoch and sequence on timeline rows, not terminal frames.
-    if (
-      !active ||
-      turnId !== active.daemonTurnId ||
-      (epoch !== undefined && epoch !== active.epoch) ||
-      (seq !== undefined && seq !== this.seq + 1)
-    )
-      return this.loseProof();
+    if (!active || !this.matchesTerminal(active, row)) return this.loseProof();
     this.turnEnded = true;
     this.sealed = true;
+    this.closeToolSteps();
     const { messageId, text, truncated } = this;
     this.clearAnswer();
     if (type === "turn_failed") return { ...active, status: "failed" };
@@ -232,6 +281,15 @@ export class LinearPilotTurn {
     };
   }
 
+  private matchesTerminal(active: LinearPilotTarget, { turnId, epoch, seq }: TimelinePosition) {
+    // The pinned daemon sends epoch and sequence on timeline rows, not terminal frames.
+    return (
+      turnId === active.daemonTurnId &&
+      (epoch === undefined || epoch === active.epoch) &&
+      (seq === undefined || seq === this.seq + 1)
+    );
+  }
+
   private clearAnswer(): void {
     this.text = "";
     this.truncated = false;
@@ -239,6 +297,7 @@ export class LinearPilotTurn {
 
   private loseProof(): LinearPilotTerminal {
     this.sealed = true;
+    this.closeToolSteps();
     this.clearAnswer();
     return { ...this.scope, status: "unconfirmed" };
   }
