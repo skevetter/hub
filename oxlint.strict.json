@@ -12,13 +12,23 @@
       { "max": 60, "skipBlankLines": true, "skipComments": true }
     ],
     "sonarjs/cognitive-complexity": ["error", 15],
-    "hub-strict/max-return-values": ["error", { "max": 3 }]
+    "hub-strict/max-return-values": ["error", { "max": 3 }],
+    "typescript/switch-exhaustiveness-check": "error",
+    "typescript/only-throw-error": "error",
+    "typescript/return-await": "error",
+    "typescript/no-non-null-assertion": "error",
+    "typescript/no-deprecated": "error",
+    "typescript/consistent-type-imports": "error",
+    "import/no-duplicates": "error",
+    "import/first": "error",
+    "import/no-cycle": "error"
   },
   "overrides": [
     {
       "files": ["**/*.test.ts", "**/*.test.tsx", "src/e2e/**", "src/test-utils/**"],
       "rules": {
-        "max-lines-per-function": "off"
+        "max-lines-per-function": "off",
+        "typescript/no-non-null-assertion": "off"
       }
     }
   ]

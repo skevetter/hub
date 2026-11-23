@@ -34,6 +34,7 @@
     "no-shadow": "error",
     "no-nested-ternary": "error",
     "no-unneeded-ternary": "error",
+    "no-var": "error",
     "complexity": ["error", { "max": 20 }],
     "max-depth": ["error", { "max": 4 }],
     "max-nested-callbacks": ["error", { "max": 3 }],
@@ -44,6 +45,8 @@
     "unicorn/no-useless-fallback-in-spread": "error",
     "unicorn/no-new-array": "error",
     "unicorn/no-empty-file": "error",
+    "unicorn/prefer-node-protocol": "error",
+    "unicorn/throw-new-error": "error",
 
     "promise/always-return": "error",
     "promise/no-multiple-resolved": "error",
@@ -56,6 +59,7 @@
     "react/no-danger": "error",
     "react/self-closing-comp": "error",
     "react/react-in-jsx-scope": "off",
+    "react/jsx-no-constructed-context-values": "error",
 
     "react-perf/jsx-no-new-array-as-prop": "error",
     "react-perf/jsx-no-new-function-as-prop": "error",
@@ -79,6 +83,20 @@
     "typescript/no-unsafe-call": "error",
     "typescript/no-unsafe-member-access": "error",
     "typescript/no-unsafe-return": "error",
+    "typescript/no-unsafe-type-assertion": "error",
+    "typescript/require-array-sort-compare": "error",
+    "typescript/no-unnecessary-boolean-literal-compare": "error",
+    "typescript/no-unnecessary-type-arguments": "error",
+    "typescript/no-unnecessary-template-expression": "error",
+    "typescript/no-unnecessary-type-conversion": "error",
+    "typescript/no-unnecessary-type-parameters": "error",
+    "typescript/consistent-return": "error",
+    "typescript/prefer-includes": "error",
+    "typescript/prefer-find": "error",
+    "typescript/consistent-type-assertions": "error",
+
+    "import/no-self-import": "error",
+    "import/no-mutable-exports": "error",
 
     "import/no-unassigned-import": [
       "error",
