@@ -25,7 +25,13 @@
   },
   "overrides": [
     {
-      "files": ["**/*.test.ts", "**/*.test.tsx", "src/e2e/**", "src/test-utils/**"],
+      "files": [
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "**/*.contract.ts",
+        "src/e2e/**",
+        "src/test-utils/**"
+      ],
       "rules": {
         "max-lines-per-function": "off",
         "typescript/no-non-null-assertion": "off"
