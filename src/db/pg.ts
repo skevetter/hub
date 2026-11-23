@@ -88,7 +88,7 @@ import {
   launchedAgent,
 } from "./mappers.js";
 import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
-import type { DatabaseRuntime, QueryHandle, QueryRow } from "./runtime/index.js";
+import type { DatabaseRuntime, QueryHandle, QueryRow, TransactionHandle } from "./runtime/index.js";
 import type { Locks } from "./runtime/locks/index.js";
 import { triggerProviderEvent } from "./trigger-list.js";
 import type {
@@ -2158,9 +2158,10 @@ class PgDatabase implements Database {
   }
 
   async issueEnrollmentToken(input: EnrollmentTokenRecord): Promise<boolean> {
-    if (input.issuedByCliCredentialId !== undefined && input.issuedByCliCredentialId !== null) {
+    const cliCredentialId = input.issuedByCliCredentialId;
+    if (cliCredentialId !== undefined && cliCredentialId !== null) {
       return this.pool.transaction(async (client) => {
-        await this.locks.withTxLock(client, input.issuedByCliCredentialId!);
+        await this.locks.withTxLock(client, cliCredentialId);
         const credential = await client.query(
           `select id from organization_cli_credentials
            where id = $1 and organization_id = $2 and revoked_at is null for update`,
@@ -2183,7 +2184,8 @@ class PgDatabase implements Database {
         return true;
       });
     }
-    if (input.issuedByApiKeyId === undefined || input.issuedByApiKeyId === null) {
+    const apiKeyId = input.issuedByApiKeyId;
+    if (apiKeyId === undefined || apiKeyId === null) {
       await query(
         this.pool,
         `insert into daemon_enrollment_tokens
@@ -2194,9 +2196,9 @@ class PgDatabase implements Database {
       return true;
     }
 
-    return withApiKeySerialization(input.issuedByApiKeyId, async () => {
+    return withApiKeySerialization(apiKeyId, async () => {
       return this.pool.transaction(async (client) => {
-        await this.locks.withTxLock(client, input.issuedByApiKeyId!);
+        await this.locks.withTxLock(client, apiKeyId);
         const key = await client.query(
           `select id
            from organization_api_keys
@@ -2233,7 +2235,7 @@ class PgDatabase implements Database {
          where status in ('pending', 'approved') and expires_at > now()`,
           [input.fingerprintVerifier],
         );
-        const counts = capacity.rows[0]!;
+        const counts = requireReturnedRow(capacity.rows[0], "CLI authorization capacity counts");
         if (
           counts.fingerprint_count >= input.perFingerprintLimit ||
           counts.global_count >= input.globalLimit
@@ -2256,7 +2258,9 @@ class PgDatabase implements Database {
             input.lifetimeSeconds,
           ],
         );
-        return toCliAuthorization(inserted.rows[0]!);
+        return toCliAuthorization(
+          requireReturnedRow(inserted.rows[0], "inserted CLI authorization"),
+        );
       });
     } catch (error) {
       throw toDatabaseError(error);
@@ -2342,178 +2346,218 @@ class PgDatabase implements Database {
     credential: { id: string; prefix: string; verifier: string };
   }): Promise<CliAuthorizationPollResult> {
     try {
-      return await this.pool.transaction(async (client) => {
-        const selected = await client.query<CliAuthorizationRow>(
-          `select *, now() as database_now
-         from cli_authorizations where device_verifier = $1 for update`,
-          [input.deviceVerifier],
-        );
-        const authorization = selected.rows[0];
-        if (authorization !== undefined && authorization.expires_at <= authorization.database_now) {
-          await client.query(`update cli_authorizations set status = 'expired' where id = $1`, [
-            authorization.id,
-          ]);
-          return {
-            status: "expired",
-            intervalSeconds: authorization.poll_interval_seconds,
-          };
-        }
-        if (authorization === undefined) {
-          return client.rollback({ status: "expired" as const, intervalSeconds: 5 });
-        }
-        if (
-          authorization.status === "denied" ||
-          authorization.status === "expired" ||
-          authorization.status === "disclosed"
-        ) {
-          return {
-            status: authorization.status,
-            intervalSeconds: authorization.poll_interval_seconds,
-          };
-        }
-        if (authorization.next_poll_at > authorization.database_now) {
-          const intervalSeconds = authorization.poll_interval_seconds + 5;
-          await client.query(
-            `update cli_authorizations
-           set poll_interval_seconds = $2::integer,
-               next_poll_at = now() + ($2::integer * interval '1 second')
-           where id = $1`,
-            [authorization.id, intervalSeconds],
-          );
-          return { status: "slow_down", intervalSeconds };
-        }
-        await client.query(
-          `update cli_authorizations
-         set next_poll_at = now() + (poll_interval_seconds * interval '1 second')
-         where id = $1`,
-          [authorization.id],
-        );
-        if (authorization.status === "approved") {
-          await client.query(
-            `insert into organization_cli_credentials
-             (id, organization_id, prefix, verifier, created_by_user_id)
-           values ($1, $2, $3, $4, $5)`,
-            [
-              input.credential.id,
-              authorization.approved_organization_id,
-              input.credential.prefix,
-              input.credential.verifier,
-              authorization.approved_by_user_id,
-            ],
-          );
-          await client.query(
-            `update cli_authorizations set status = 'disclosed', credential_id = $2 where id = $1`,
-            [authorization.id, input.credential.id],
-          );
-          return {
-            status: "authorized",
-            intervalSeconds: authorization.poll_interval_seconds,
-            organizationId: authorization.approved_organization_id!,
-          };
-        }
-        return {
-          status: authorization.status,
-          intervalSeconds: authorization.poll_interval_seconds,
-        };
-      });
+      return await this.pool.transaction((client) =>
+        this.pollCliAuthorizationInTransaction(client, input),
+      );
     } catch (error) {
       throw toDatabaseError(error);
     }
   }
 
+  private async pollCliAuthorizationInTransaction(
+    client: TransactionHandle,
+    input: Parameters<Database["pollCliAuthorization"]>[0],
+  ): Promise<CliAuthorizationPollResult> {
+    const selected = await client.query<CliAuthorizationPollRow>(
+      `select *, now() as database_now
+         from cli_authorizations where device_verifier = $1 for update`,
+      [input.deviceVerifier],
+    );
+    const authorization = selected.rows[0];
+    if (authorization !== undefined && authorization.expires_at <= authorization.database_now) {
+      await client.query(`update cli_authorizations set status = 'expired' where id = $1`, [
+        authorization.id,
+      ]);
+      return {
+        status: "expired",
+        intervalSeconds: authorization.poll_interval_seconds,
+      };
+    }
+    if (authorization === undefined) {
+      return client.rollback({ status: "expired" as const, intervalSeconds: 5 });
+    }
+    if (
+      authorization.status === "denied" ||
+      authorization.status === "expired" ||
+      authorization.status === "disclosed"
+    ) {
+      return {
+        status: authorization.status,
+        intervalSeconds: authorization.poll_interval_seconds,
+      };
+    }
+    if (authorization.next_poll_at > authorization.database_now) {
+      const intervalSeconds = authorization.poll_interval_seconds + 5;
+      await client.query(
+        `update cli_authorizations
+           set poll_interval_seconds = $2::integer,
+               next_poll_at = now() + ($2::integer * interval '1 second')
+           where id = $1`,
+        [authorization.id, intervalSeconds],
+      );
+      return { status: "slow_down", intervalSeconds };
+    }
+    await client.query(
+      `update cli_authorizations
+         set next_poll_at = now() + (poll_interval_seconds * interval '1 second')
+         where id = $1`,
+      [authorization.id],
+    );
+    if (authorization.status === "approved") {
+      return this.discloseCliAuthorization(client, authorization, input);
+    }
+    return {
+      status: authorization.status,
+      intervalSeconds: authorization.poll_interval_seconds,
+    };
+  }
+
+  private async discloseCliAuthorization(
+    client: QueryHandle,
+    authorization: ApprovedCliAuthorizationRow,
+    input: Parameters<Database["pollCliAuthorization"]>[0],
+  ): Promise<CliAuthorizationPollResult> {
+    await client.query(
+      `insert into organization_cli_credentials
+             (id, organization_id, prefix, verifier, created_by_user_id)
+           values ($1, $2, $3, $4, $5)`,
+      [
+        input.credential.id,
+        authorization.approved_organization_id,
+        input.credential.prefix,
+        input.credential.verifier,
+        authorization.approved_by_user_id,
+      ],
+    );
+    await client.query(
+      `update cli_authorizations set status = 'disclosed', credential_id = $2 where id = $1`,
+      [authorization.id, input.credential.id],
+    );
+    return {
+      status: "authorized",
+      intervalSeconds: authorization.poll_interval_seconds,
+      organizationId: authorization.approved_organization_id,
+    };
+  }
+
   async enrollDaemon(input: EnrollDaemonInput) {
-    let requestedSlug: string | undefined;
+    const state: { requestedSlug?: string } = {};
     try {
-      return await this.pool.transaction(async (client) => {
-        const existing = await client.query<DaemonRow>(
-          `select * from daemons where idempotency_key = $1`,
-          [input.idempotencyKey],
-        );
-        if (
-          existing.rows[0] &&
-          existing.rows[0].id === input.daemonId &&
-          existing.rows[0].enrollment_verifier === input.tokenVerifier
-        ) {
-          return toDaemon(existing.rows[0]);
-        }
-        const token = await client.query<{
-          id: string;
-          organization_id: string | null;
-          issued_by_api_key_id: string | null;
-          issued_by_cli_credential_id: string | null;
-        }>(
-          `update daemon_enrollment_tokens
+      return await this.pool.transaction((client) =>
+        this.enrollDaemonInTransaction(client, input, state),
+      );
+    } catch (error) {
+      if (state.requestedSlug !== undefined && isDaemonSlugConflict(error)) {
+        return { status: "slug_conflict" as const, slug: state.requestedSlug };
+      }
+      throw toDatabaseError(error);
+    }
+  }
+
+  private async enrollDaemonInTransaction(
+    client: TransactionHandle,
+    input: EnrollDaemonInput,
+    state: { requestedSlug?: string },
+  ): Promise<DaemonRecord | undefined> {
+    const existing = await client.query<DaemonRow>(
+      `select * from daemons where idempotency_key = $1`,
+      [input.idempotencyKey],
+    );
+    if (
+      existing.rows[0] &&
+      existing.rows[0].id === input.daemonId &&
+      existing.rows[0].enrollment_verifier === input.tokenVerifier
+    ) {
+      return toDaemon(existing.rows[0]);
+    }
+    const token = await client.query<{
+      id: string;
+      organization_id: string | null;
+      issued_by_api_key_id: string | null;
+      issued_by_cli_credential_id: string | null;
+    }>(
+      `update daemon_enrollment_tokens
          set consumed_at = $2
          where verifier = $1 and organization_id is not null and consumed_at is null
            and expires_at > $2
          returning id, organization_id, issued_by_api_key_id, issued_by_cli_credential_id`,
-          [input.tokenVerifier, input.now],
-        );
-        const consumedToken = token.rows[0];
-        if (consumedToken?.organization_id === null || consumedToken === undefined)
-          return client.rollback(undefined);
-        const machine = await client.query<MachineRow>(
-          `insert into machines (org_id, source, status) values ($1, $2, 'alive') returning *`,
-          [consumedToken.organization_id, { kind: "daemon", daemonId: input.daemonId }],
-        );
-        const suggestedSlug = input.suggestedSlug ?? `daemon-${input.daemonId.slice(0, 8)}`;
-        requestedSlug = suggestedSlug;
-        let daemon = await client.query<DaemonRow>(
-          `insert into daemons
+      [input.tokenVerifier, input.now],
+    );
+    const consumedToken = token.rows[0];
+    if (consumedToken?.organization_id === null || consumedToken === undefined)
+      return client.rollback(undefined);
+    const machine = await client.query<MachineRow>(
+      `insert into machines (org_id, source, status) values ($1, $2, 'alive') returning *`,
+      [consumedToken.organization_id, { kind: "daemon", daemonId: input.daemonId }],
+    );
+    const suggestedSlug = input.suggestedSlug ?? `daemon-${input.daemonId.slice(0, 8)}`;
+    state.requestedSlug = suggestedSlug;
+    const enrolledMachine = requireReturnedRow(machine.rows[0], "inserted daemon machine");
+    const options = {
+      input,
+      token: consumedToken,
+      machineId: enrolledMachine.id,
+      slug: suggestedSlug,
+      retry: false,
+    };
+    const daemon = await this.insertEnrolledDaemon(client, options);
+    if (daemon !== undefined) return toDaemon(daemon);
+
+    const uniqueSlug = `${suggestedSlug}-${input.daemonId.slice(0, 8)}`;
+    state.requestedSlug = uniqueSlug;
+    const retried = await this.insertEnrolledDaemon(client, {
+      ...options,
+      slug: uniqueSlug,
+      retry: true,
+    });
+    return toDaemon(requireReturnedRow(retried, "inserted daemon"));
+  }
+
+  private async insertEnrolledDaemon(
+    client: QueryHandle,
+    options: {
+      input: EnrollDaemonInput;
+      token: {
+        organization_id: string | null;
+        issued_by_api_key_id: string | null;
+        issued_by_cli_credential_id: string | null;
+      };
+      machineId: string;
+      slug: string;
+      retry: boolean;
+    },
+  ): Promise<DaemonRow | undefined> {
+    const { input, token, machineId, slug, retry } = options;
+    const daemon = await client.query<DaemonRow>(
+      retry
+        ? `insert into daemons
+             (id, idempotency_key, enrollment_verifier, slug, machine_id, organization_id, server_id,
+              daemon_public_key, credential_verifier, scopes,
+              registered_by_api_key_id, registered_by_cli_credential_id, status)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active') returning *`
+        : `insert into daemons
            (id, idempotency_key, enrollment_verifier, slug, machine_id, organization_id, server_id,
             daemon_public_key, credential_verifier, scopes,
             registered_by_api_key_id, registered_by_cli_credential_id, status)
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active')
          on conflict (organization_id, slug) do nothing
          returning *`,
-          [
-            input.daemonId,
-            input.idempotencyKey,
-            input.tokenVerifier,
-            suggestedSlug,
-            machine.rows[0]!.id,
-            consumedToken.organization_id,
-            input.serverId,
-            input.daemonPublicKey,
-            input.credentialVerifier,
-            JSON.stringify(input.permissions),
-            consumedToken.issued_by_api_key_id,
-            consumedToken.issued_by_cli_credential_id,
-          ],
-        );
-        if (daemon.rows[0] === undefined) {
-          const uniqueSlug = `${suggestedSlug}-${input.daemonId.slice(0, 8)}`;
-          requestedSlug = uniqueSlug;
-          daemon = await client.query<DaemonRow>(
-            `insert into daemons
-             (id, idempotency_key, enrollment_verifier, slug, machine_id, organization_id, server_id,
-              daemon_public_key, credential_verifier, scopes,
-              registered_by_api_key_id, registered_by_cli_credential_id, status)
-           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active') returning *`,
-            [
-              input.daemonId,
-              input.idempotencyKey,
-              input.tokenVerifier,
-              uniqueSlug,
-              machine.rows[0]!.id,
-              consumedToken.organization_id,
-              input.serverId,
-              input.daemonPublicKey,
-              input.credentialVerifier,
-              JSON.stringify(input.permissions),
-              consumedToken.issued_by_api_key_id,
-              consumedToken.issued_by_cli_credential_id,
-            ],
-          );
-        }
-        return toDaemon(daemon.rows[0]!);
-      });
-    } catch (error) {
-      if (requestedSlug !== undefined && isDaemonSlugConflict(error)) {
-        return { status: "slug_conflict" as const, slug: requestedSlug };
-      }
-      throw toDatabaseError(error);
-    }
+      [
+        input.daemonId,
+        input.idempotencyKey,
+        input.tokenVerifier,
+        slug,
+        machineId,
+        token.organization_id,
+        input.serverId,
+        input.daemonPublicKey,
+        input.credentialVerifier,
+        JSON.stringify(input.permissions),
+        token.issued_by_api_key_id,
+        token.issued_by_cli_credential_id,
+      ],
+    );
+    return daemon.rows[0];
   }
 
   async findDaemonBySlugForOrganization(
@@ -4452,13 +4496,13 @@ class PgDatabase implements Database {
         : {
             project: toProjectRecord({
               id: row.project_id,
-              organization_id: row.project_organization_id!,
-              name: row.project_name!,
-              slug: row.project_slug!,
-              status: row.project_status!,
+              organization_id: row.project_organization_id,
+              name: row.project_name,
+              slug: row.project_slug,
+              status: row.project_status,
               created_by_user_id: row.project_created_by_user_id,
-              created_at: row.project_created_at!,
-              updated_at: row.project_updated_at!,
+              created_at: row.project_created_at,
+              updated_at: row.project_updated_at,
               archived_at: row.project_archived_at,
               active_configuration_revision_id: row.project_active_configuration_revision_id,
             }),
@@ -5561,6 +5605,11 @@ async function query<T extends QueryRow = QueryRow>(
   return pool.query<T>(text, values);
 }
 
+function requireReturnedRow<T extends QueryRow>(row: T | undefined, description: string): T {
+  if (row === undefined) throw new Error(`missing ${description}`);
+  return row;
+}
+
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
 }
@@ -6027,6 +6076,16 @@ interface CliAuthorizationRow extends QueryRow {
   expires_at: Date;
   database_now: Date;
 }
+
+// Approval sets the organization, and disclosure requires it for the credential insert.
+type ApprovedCliAuthorizationRow = CliAuthorizationRow & {
+  status: "approved";
+  approved_organization_id: string;
+};
+
+type CliAuthorizationPollRow =
+  | ApprovedCliAuthorizationRow
+  | (CliAuthorizationRow & { status: Exclude<CliAuthorizationRow["status"], "approved"> });
 
 function toDaemon(row: DaemonRow): DaemonRecord {
   return {
@@ -6759,20 +6818,38 @@ function toGitHubRepositoryRecord(row: GitHubRepositoryRow): GitHubRepositoryRec
   };
 }
 
-interface TenantRouteAccessRow extends QueryRow {
+interface TenantRouteAccessBaseRow extends QueryRow {
   organization_id: string;
   organization_name: string;
   organization_slug: string;
   membership_id: string;
   membership_role: "owner" | "admin" | "member";
-  project_id: string | null;
-  project_organization_id: string | null;
-  project_name: string | null;
-  project_slug: string | null;
-  project_status: "active" | "archived" | null;
+}
+
+interface TenantRouteAccessWithoutProject extends TenantRouteAccessBaseRow {
+  project_id: null;
+  project_organization_id: null;
+  project_name: null;
+  project_slug: null;
+  project_status: null;
+  project_created_by_user_id: null;
+  project_created_at: null;
+  project_updated_at: null;
+  project_archived_at: null;
+  project_active_configuration_revision_id: null;
+}
+
+interface TenantRouteAccessWithProject extends TenantRouteAccessBaseRow {
+  project_id: string;
+  project_organization_id: string;
+  project_name: string;
+  project_slug: string;
+  project_status: "active" | "archived";
   project_created_by_user_id: string | null;
-  project_created_at: Date | null;
-  project_updated_at: Date | null;
+  project_created_at: Date;
+  project_updated_at: Date;
   project_archived_at: Date | null;
   project_active_configuration_revision_id: string | null;
 }
+
+type TenantRouteAccessRow = TenantRouteAccessWithoutProject | TenantRouteAccessWithProject;
