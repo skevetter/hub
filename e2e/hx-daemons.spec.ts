@@ -412,8 +412,7 @@ test("withholds cached daemon data while the route tenant still belongs to the p
     const request = route.request();
     if (request.method() === "POST") {
       const response = await route.fetch();
-      // Choose the fixture organization before the sign-in response triggers the account read.
-      // The organization chooser reloads the page and would discard the cache under test.
+      // Stay on the daemon route across sign-in instead of leaving for the organization chooser.
       await hub.primaryApplication().query(
         `update session set active_organization_id = member.organization_id
          from "user" join member on member.user_id = "user".id
@@ -438,9 +437,9 @@ test("withholds cached daemon data while the route tenant still belongs to the p
     await form.getByRole("button", { name: "Sign in", exact: true }).click();
     await expect(page.getByRole("button", { name: member.email, exact: true })).toBeVisible();
     await expect.poll(() => organizationReads).toBeGreaterThan(0);
-    await expect.soft(profile).toHaveCount(0, { timeout: 1_000 });
-    await expect.soft(actions(daemons, "shared-device")).toHaveCount(0, { timeout: 1_000 });
-    await expect(page.getByLabel("Loading daemons")).toBeVisible({ timeout: 1_000 });
+    await expect(profile).toHaveCount(0);
+    await expect(actions(daemons, "shared-device")).toHaveCount(0);
+    await expect(page.getByRole("region", { name: "Loading account context" })).toBeVisible();
   } finally {
     release();
   }
