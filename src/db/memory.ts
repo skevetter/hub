@@ -5,8 +5,14 @@ import {
   organizationTriggerRoutesForSave,
 } from "./linear-trigger-routes.js";
 import { isCanceledExecution, type StopCleanupState } from "../triggers/run-stop.js";
+import type { ScheduleStore } from "../triggers/schedule/index.js";
+import type { GitHubNotificationStore } from "../triggers/github-notifications/index.js";
+import type {
+  ExecutionAuthorityRecord,
+  ExecutionCredentialLease,
+  ExecutionAuthorityStore,
+} from "../execution-authority/index.js";
 import type { RunReplyRecord, RunReplyScope } from "../run-replies/store.js";
-import type { AcceptCommandInput, AcceptCommandResult } from "../interactive-sessions/store.js";
 import { capabilities } from "../interactive-sessions/access.js";
 import {
   advanceForCommand,
@@ -45,11 +51,11 @@ import {
   stateEvent,
   unsettledStatuses,
   validMessage,
-} from "../interactive-sessions/store.js";
-import type {
-  RetireLinearPilotSessionInput,
-  SessionEventDraft,
-  StartSessionInput,
+  type RetireLinearPilotSessionInput,
+  type AcceptCommandInput,
+  type AcceptCommandResult,
+  type SessionEventDraft,
+  type StartSessionInput,
 } from "../interactive-sessions/store.js";
 import type {
   SessionAuditRecord,
@@ -79,9 +85,9 @@ import {
   type StopInterruptState,
   type StopInterruptStore,
 } from "./stop-interrupt.js";
-import type { GitHubSyncAuditLink } from "./schema.js";
+import type { GitHubSyncAuditLink, AgentExecutionStatus, MachineStatus } from "./schema.js";
 import { temporaryCredentialFact } from "../agent-sessions/credentials.js";
-import { sessionLock } from "../agent-sessions/index.js";
+import { sessionLock, type AgentSessionAction } from "../agent-sessions/index.js";
 import type { AgentSessionRecord } from "../agent-sessions/types.js";
 import { coversExpectedFanout, expectedFanout } from "../run-payload-retention/fanout.js";
 import {
@@ -100,7 +106,6 @@ import {
 } from "../run-payload-retention/store.js";
 import { readScriptStepHandle } from "../workflows/script-output.js";
 import { randomUUID } from "node:crypto";
-import type { AgentExecutionStatus, MachineStatus } from "./schema.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
@@ -110,7 +115,7 @@ import {
   preRoutingDropEvidence,
   requireManualReceiptReplayBinding,
 } from "./receipt-replay.js";
-import { launchedAgent } from "./mappers.js";
+import { launchedAgent, toProviderEventReceiptRecordSummary } from "./mappers.js";
 import type {
   AgentExecutionRecord,
   AgentExecutionOutputAttempt,
@@ -223,6 +228,7 @@ import type {
   TriggerListKey,
   TriggerListPage,
   TriggerListRequest,
+  PendingHubActionScope,
 } from "./types.js";
 import {
   clearOverrideKey,
@@ -244,7 +250,6 @@ import {
 } from "./unsupported-linear.js";
 import { activityTimestampMicros, compareRunsNewestFirst } from "./activity-key.js";
 import { hasTriggerEvent, triggerProviderEvent } from "./trigger-list.js";
-import { toProviderEventReceiptRecordSummary } from "./mappers.js";
 import {
   displayedDropReason,
   GITHUB_LIFECYCLE_RECEIPT,
@@ -283,8 +288,8 @@ type UnsupportedLinearReceiptKey = Pick<
 >;
 
 export interface MemoryDatabaseOptions {
-  schedules?: import("../triggers/schedule/index.js").ScheduleStore;
-  githubNotifications?: import("../triggers/github-notifications/index.js").GitHubNotificationStore;
+  schedules?: ScheduleStore;
+  githubNotifications?: GitHubNotificationStore;
   onInsertAgentExecution?: (execution: AgentExecutionRecord) => void;
   organizationIds?: readonly string[];
   memberships?: readonly {
@@ -1760,7 +1765,7 @@ class MemoryDatabase implements Database {
   }
 
   // This test double has no background work. Scheduling tests use the actual embedded/PG runtime.
-  get schedules(): import("../triggers/schedule/index.js").ScheduleStore {
+  get schedules(): ScheduleStore {
     return (
       this.options.schedules ?? {
         async tick() {
@@ -1771,7 +1776,7 @@ class MemoryDatabase implements Database {
   }
   // Like schedules, polling needs real SQL; tests of it use the embedded runtime. This double
   // keeps only the status the Triggers page reads, and no cursor, so it never polls GitHub.
-  get githubNotifications(): import("../triggers/github-notifications/index.js").GitHubNotificationStore {
+  get githubNotifications(): GitHubNotificationStore {
     this.notificationStore ??= this.options.githubNotifications ?? this.memoryNotificationStore();
     return this.notificationStore;
   }
@@ -1789,10 +1794,8 @@ class MemoryDatabase implements Database {
     diagnosticExpiredAt: Date | null;
   };
 
-  private notificationStore:
-    | import("../triggers/github-notifications/index.js").GitHubNotificationStore
-    | undefined;
-  private memoryNotificationStore(): import("../triggers/github-notifications/index.js").GitHubNotificationStore {
+  private notificationStore: GitHubNotificationStore | undefined;
+  private memoryNotificationStore(): GitHubNotificationStore {
     const status = this.notificationStatus;
     return {
       exclusive: (operation) => operation(),
@@ -5232,7 +5235,7 @@ class MemoryDatabase implements Database {
 
   async findPendingHubActions(
     daemonId?: string,
-    scope?: import("./types.js").PendingHubActionScope,
+    scope?: PendingHubActionScope,
   ): Promise<AgentExecutionRecord[]> {
     const pending = Array.from(this.agentExecutions.values()).filter(
       (execution) =>
@@ -5572,15 +5575,9 @@ class MemoryDatabase implements Database {
     return record;
   }
 
-  private readonly authorityRecords = new Map<
-    string,
-    import("../execution-authority/index.js").ExecutionAuthorityRecord
-  >();
-  private readonly authorityLeases = new Map<
-    string,
-    import("../execution-authority/index.js").ExecutionCredentialLease
-  >();
-  readonly executionAuthority: import("../execution-authority/index.js").ExecutionAuthorityStore = {
+  private readonly authorityRecords = new Map<string, ExecutionAuthorityRecord>();
+  private readonly authorityLeases = new Map<string, ExecutionCredentialLease>();
+  readonly executionAuthority: ExecutionAuthorityStore = {
     executions: async () => [...this.authorityRecords.keys()],
     read: async (id) => structuredClone(this.authorityRecords.get(id)),
     commit: async (record) => {
@@ -5605,10 +5602,7 @@ class MemoryDatabase implements Database {
     },
   };
 
-  private readonly agentSessions = new Map<
-    string,
-    import("../agent-sessions/index.js").AgentSessionRecord
-  >();
+  private readonly agentSessions = new Map<string, AgentSessionRecord>();
   private readonly agentSessionCreatedAt = new Map<string, Date>();
   async findAgentSession(id: string) {
     return structuredClone(this.agentSessions.get(id));
@@ -5620,9 +5614,7 @@ class MemoryDatabase implements Database {
       ),
     );
   }
-  async saveAgentSession(
-    session: import("../agent-sessions/index.js").AgentSessionRecord,
-  ): Promise<void> {
+  async saveAgentSession(session: AgentSessionRecord): Promise<void> {
     const current = this.agentSessions.get(session.id);
     if (current === undefined) this.agentSessionCreatedAt.set(session.id, new Date());
     if (current?.optionsReducedAt != null) {
@@ -5636,7 +5628,7 @@ class MemoryDatabase implements Database {
   async attachExecutionToSession(
     executionId: string,
     sessionId: string,
-    action?: import("../agent-sessions/index.js").AgentSessionAction,
+    action?: AgentSessionAction,
   ): Promise<void> {
     const execution = this.agentExecutions.get(executionId);
     const session = this.agentSessions.get(sessionId);
