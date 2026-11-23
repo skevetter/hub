@@ -53,7 +53,8 @@ for (const screen of ["list", "detail"] as const) {
       sessionStorage.setItem("watchPrivateSession", "true");
       return sessionStorage.getItem("readerDocument");
     });
-    await hub.signOut("owner");
+    await expectOldDocumentCleared(page, url, initialDocument);
+    await expect(page.getByRole("form", { name: "Sign in" })).toBeVisible();
     await expect(page).toHaveURL(url);
     await expect.poll(() => documentId(page)).not.toBe(initialDocument);
     const signedOutDocument = await documentId(page);
@@ -71,6 +72,32 @@ for (const screen of ["list", "detail"] as const) {
     expect(await page.evaluate(() => sessionStorage.getItem("privateSessionSeen"))).toBeNull();
     await capture(page, screen, "03-reader-b");
   });
+}
+
+async function expectOldDocumentCleared(page: Page, url: string, initialDocument: string | null) {
+  let release = () => {};
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let navigationHeld = false;
+  await page.route(url, async (route) => {
+    if (route.request().isNavigationRequest()) {
+      navigationHeld = true;
+      await released;
+    }
+    await route.continue();
+  });
+  try {
+    await page.getByRole("button", { name: owner.email, exact: true }).click();
+    await page.getByRole("menuitem", { name: "Sign out" }).click({ noWaitAfter: true });
+    await expect.poll(() => navigationHeld).toBe(true);
+    expect(await documentId(page)).toBe(initialDocument);
+    await expect(page.getByRole("main", { name: "Loading Paseo Hub" })).toBeVisible();
+    await expect(page.getByText(sessionTitle, { exact: true })).toHaveCount(0);
+  } finally {
+    release();
+    await page.unroute(url);
+  }
 }
 
 async function seedPrivateSession(hub: PaseoHub) {
