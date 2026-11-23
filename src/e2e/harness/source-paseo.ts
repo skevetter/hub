@@ -49,7 +49,7 @@ export interface SourcePaseoStopEvidence {
 
 export class SourcePaseo {
   private daemon: ChildProcess | undefined;
-  private cli: ChildProcess | undefined;
+  private readonly cli: ChildProcess | undefined;
   private readonly daemonOutput: string[] = [];
   private readonly ownsRoot: boolean;
   private rememberedAuthority: RememberedAuthority | undefined;

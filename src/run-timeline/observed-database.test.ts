@@ -138,7 +138,7 @@ describe("observed workflow database", () => {
   it("binds untouched methods to their original private-field receiver", async () => {
     const { database } = await fixture();
     class PrivateDatabase {
-      #database = database;
+      readonly #database = database;
       findTriggerRunById(id: string) {
         return this.#database.findTriggerRunById(id);
       }
