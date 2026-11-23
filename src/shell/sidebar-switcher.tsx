@@ -63,7 +63,7 @@ export function SidebarSwitcher({
             tone={tone}
             {...(secondary === undefined ? {} : { secondary })}
           />
-          <ChevronsUpDown aria-hidden="true" className="ml-auto size-4 text-muted-foreground" />
+          <ChevronsUpDown aria-hidden="true" className="ml-auto size-4 text-rail-muted" />
         </SidebarMenuButton>
       </DropdownMenuTrigger>
       <DropdownMenuContent
@@ -118,7 +118,7 @@ function Face({
         <span
           className={cn(
             "flex aspect-square size-8 shrink-0 items-center justify-center rounded-sm text-xs",
-            tone === "primary" ? "bg-primary text-primary-foreground" : "bg-sidebar-accent",
+            tone === "primary" ? "bg-sidebar-foreground text-sidebar" : "bg-sidebar-accent",
           )}
         >
           {media}
@@ -129,7 +129,7 @@ function Face({
       <span className="grid flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
         <span className="truncate text-sm">{primary}</span>
         {secondary === undefined ? null : (
-          <span className="truncate text-xs text-muted-foreground">{secondary}</span>
+          <span className="truncate text-xs text-rail-muted">{secondary}</span>
         )}
       </span>
     </>

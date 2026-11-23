@@ -7,6 +7,7 @@ import { usePresentedDestination } from "../navigation/index.js";
 import {
   SidebarGroup,
   SidebarGroupContent,
+  SidebarGroupLabel,
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
@@ -32,6 +33,7 @@ export function NavigationGroup({
   back,
   items,
   administration,
+  setup,
 }: {
   /** Names the level, e.g. "Organization". Becomes the landmark's accessible name. */
   label: string;
@@ -39,6 +41,7 @@ export function NavigationGroup({
   items: readonly NavigationItem[];
   /** Destinations that change the level rather than work in it, set apart under a rule. */
   administration?: readonly NavigationItem[];
+  setup?: readonly NavigationItem[];
 }) {
   return (
     <nav aria-label={label}>
@@ -60,6 +63,18 @@ export function NavigationGroup({
             ))}
           </SidebarMenu>
         </SidebarGroupContent>
+        {setup === undefined || setup.length === 0 ? null : (
+          <>
+            <SidebarGroupLabel className="text-rail-muted">Setup</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {setup.map((item) => (
+                  <NavItem key={item.to} item={item} />
+                ))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </>
+        )}
         {administration === undefined || administration.length === 0 ? null : (
           <>
             <SidebarSeparator className="my-2" />

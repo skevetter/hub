@@ -125,6 +125,7 @@
 }
 
 @theme {
+  --breakpoint-md: 53.75rem;
   --font-sans: "Archivo Variable", "Helvetica Neue", Arial, sans-serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
 

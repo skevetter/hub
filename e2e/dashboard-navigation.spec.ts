@@ -19,12 +19,17 @@ test("keeps every daily surface at organization scope", async ({ hub, page }) =>
   const organizationSwitcher = page.getByRole("button", { name: "Organization" });
   await expect(organizationNav.getByRole("link")).toHaveText([
     "Home",
-    "Triggers",
     "Activity",
+    "Triggers",
     "Daemons",
     "Connections",
     "Settings",
   ]);
+  await expect(organizationNav.getByText("Setup", { exact: true })).toBeVisible();
+  await expect(organizationNav.getByRole("link", { name: "Home" })).toHaveAttribute(
+    "aria-current",
+    "page",
+  );
   await expect(page.getByRole("navigation", { name: "Project", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Project", exact: true })).toHaveCount(0);
   await expect(organizationSwitcher).toContainText("Acme");

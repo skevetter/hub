@@ -21,8 +21,8 @@ test("shows the flat organization product in the mobile drawer", async ({ hub, p
   const navigation = drawer.getByRole("navigation", { name: "Organization", exact: true });
   await expect(navigation.getByRole("link")).toHaveText([
     "Home",
-    "Triggers",
     "Activity",
+    "Triggers",
     "Daemons",
     "Connections",
     "Settings",

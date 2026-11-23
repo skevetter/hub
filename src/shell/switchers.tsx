@@ -1,10 +1,7 @@
-/* oxlint-disable typescript-eslint/no-unsafe-type-assertion -- dynamic tenant URLs are assembled from server-resolved route metadata */
-import { Check, FolderKanban, LogOut, Plus, ShieldCheck } from "lucide-react";
+import { Check, LogOut, Plus, ShieldCheck } from "lucide-react";
 import { Link } from "@tanstack/react-router";
 import { useCallback, useState, type FormEvent } from "react";
 
-import { usePageContext } from "../navigation/index.js";
-import { PaseoGlyph } from "../components/app/auth-layout.js";
 import { FormDialog } from "../components/app/form-dialog.js";
 import { FormField } from "../components/app/form-field.js";
 import {
@@ -23,9 +20,6 @@ export type RouteTenant = NonNullable<ReturnType<typeof useOptionalRouteTenant>>
 
 /** Where the instance surfaces begin, for the one link into them that is not in a nav group. */
 const INSTANCE_ENTRY = "/apps";
-
-const ORGANIZATION_MARK = <PaseoGlyph />;
-const PROJECT_MARK = <FolderKanban aria-hidden="true" />;
 
 const ROLE_LABELS: Record<string, string> = {
   owner: "Owner",
@@ -70,7 +64,7 @@ export function OrganizationSwitcher({
     <>
       <SidebarSwitcher
         label="Organization"
-        media={ORGANIZATION_MARK}
+        media={organization.name.trim().charAt(0).toUpperCase()}
         primary={organization.name}
         secondary={ROLE_LABELS[role] ?? role}
       >
@@ -146,39 +140,6 @@ function OrganizationItem({
       <span className="truncate">{name}</span>
       {selected ? <Check aria-hidden="true" className="ml-auto" /> : null}
     </DropdownMenuItem>
-  );
-}
-
-/** One line, and no organization on it: the switcher above already says which one. */
-export function ProjectSwitcher({ tenant }: { tenant: RouteTenant }) {
-  const { projectSection: section } = usePageContext();
-  const activeProjects = tenant.projects.filter((project) => project.status === "active");
-  return (
-    <SidebarSwitcher
-      label="Project"
-      size="default"
-      media={PROJECT_MARK}
-      primary={tenant.project?.name ?? "Project"}
-    >
-      <DropdownMenuLabel>Projects</DropdownMenuLabel>
-      {activeProjects.map((project) => (
-        <DropdownMenuItem key={project.id} asChild>
-          <Link
-            to={`/o/${tenant.organization.slug}/projects/${project.slug}/${section}` as never}
-            aria-current={project.id === tenant.project?.id ? "true" : undefined}
-          >
-            <span className="truncate">{project.name}</span>
-            {project.id === tenant.project?.id ? (
-              <Check aria-hidden="true" className="ml-auto" />
-            ) : null}
-          </Link>
-        </DropdownMenuItem>
-      ))}
-      <DropdownMenuSeparator />
-      <DropdownMenuItem asChild>
-        <Link to={`/o/${tenant.organization.slug}/projects` as never}>All projects</Link>
-      </DropdownMenuItem>
-    </SidebarSwitcher>
   );
 }
 

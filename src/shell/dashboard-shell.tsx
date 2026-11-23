@@ -4,13 +4,12 @@ import {
   Blocks,
   Cable,
   Cpu,
-  Gauge,
   History,
   House,
   MessagesSquare,
   Settings,
   ShieldCheck,
-  SlidersHorizontal,
+  Users,
   Zap,
 } from "lucide-react";
 import { Outlet } from "@tanstack/react-router";
@@ -30,7 +29,6 @@ import {
   SidebarMenu,
   SidebarMenuItem,
   SidebarProvider,
-  SidebarRail,
 } from "../components/ui/sidebar.js";
 import type { ActiveAccountState } from "../auth/organization-contract.js";
 import { createOrganization, selectOrganization, signOut } from "../auth/functions.js";
@@ -49,12 +47,7 @@ import { SidebarHelp } from "../auth/sidebar-help.js";
 import { ExecutionMeter } from "../entitlements/ui/index.js";
 import { NavigationGroup, type NavigationItem } from "./navigation-group.js";
 import { SidebarIdentity } from "./sidebar-switcher.js";
-import {
-  AccountMenu,
-  OrganizationSwitcher,
-  ProjectSwitcher,
-  type RouteTenant,
-} from "./switchers.js";
+import { AccountMenu, OrganizationSwitcher, type RouteTenant } from "./switchers.js";
 import { SiteHeader } from "./site-header.js";
 import { CONTENT_ID, SkipLink } from "./skip-link.js";
 import { SiteHeaderActionsProvider } from "./site-header-actions.js";
@@ -265,11 +258,6 @@ function AppSidebar({
   onSelectOrganization: (organizationId: string, slug: string) => void;
   onSignOut: () => void;
 }) {
-  // The sidebar header stacks one switcher per level of where you are: organization, then
-  // project. The body lists destinations for the innermost level only. Anything outside the
-  // organization → project chain — instance, account — enters through the footer account menu.
-  // Location accumulates; destinations swap.
-  const project = tenant?.project ?? null;
   const organization = tenant?.organization ?? account.organization;
   return (
     <Sidebar collapsible="icon">
@@ -293,40 +281,52 @@ function AppSidebar({
               />
             )}
           </SidebarMenuItem>
-          {instance || tenant === undefined || tenant.project === null ? null : (
-            <SidebarMenuItem>
-              <ProjectSwitcher tenant={tenant} />
-            </SidebarMenuItem>
-          )}
         </SidebarMenu>
       </SidebarHeader>
       <SidebarContent>
         <Destinations
           instance={instance}
           organization={organization}
-          project={project}
           sessionsEnabled={account.features?.interactiveSessions === true}
         />
       </SidebarContent>
-      <SidebarFooter>
-        <SidebarMenu>
-          {/* The meter belongs to the organization the URL is in, so it waits for the tenant the
-              switchers above can show from the account alone. */}
-          {instance || tenant === undefined ? null : <ExecutionMeter />}
-          <SidebarHelp />
-          <SidebarMenuItem>
-            <AccountMenu
-              email={account.account.email}
-              name={account.account.name}
-              operator={account.isInstanceOperator}
-              busy={busy}
-              onSignOut={onSignOut}
-            />
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarFooter>
-      <SidebarRail />
+      <AccountFooter
+        account={account}
+        showMeter={!instance && tenant !== undefined}
+        busy={busy}
+        onSignOut={onSignOut}
+      />
     </Sidebar>
+  );
+}
+
+function AccountFooter({
+  account,
+  showMeter,
+  busy,
+  onSignOut,
+}: {
+  account: ActiveAccount;
+  showMeter: boolean;
+  busy: boolean;
+  onSignOut: () => void;
+}) {
+  return (
+    <SidebarFooter>
+      <SidebarMenu>
+        {showMeter ? <ExecutionMeter /> : null}
+        <SidebarHelp />
+        <SidebarMenuItem>
+          <AccountMenu
+            email={account.account.email}
+            name={account.account.name}
+            operator={account.isInstanceOperator}
+            busy={busy}
+            onSignOut={onSignOut}
+          />
+        </SidebarMenuItem>
+      </SidebarMenu>
+    </SidebarFooter>
   );
 }
 
@@ -334,12 +334,10 @@ function AppSidebar({
 function Destinations({
   instance,
   organization,
-  project,
   sessionsEnabled,
 }: {
   instance: boolean;
   organization: { name: string; slug: string };
-  project: { slug: string } | null;
   sessionsEnabled: boolean;
 }) {
   if (instance) {
@@ -351,23 +349,18 @@ function Destinations({
       />
     );
   }
-  if (project === null) {
-    return (
-      <NavigationGroup
-        label="Organization"
-        items={destinations(
-          `/o/${organization.slug}`,
-          sessionsEnabled ? ORGANIZATION_SECTIONS : ORGANIZATION_SECTIONS_WITHOUT_SESSIONS,
-        )}
-        administration={destinations(`/o/${organization.slug}`, ORGANIZATION_ADMINISTRATION)}
-      />
-    );
-  }
   return (
     <NavigationGroup
-      label="Project"
-      back={wayBack(`/o/${organization.slug}/projects`, "All projects")}
-      items={destinations(`/o/${organization.slug}/projects/${project.slug}`, PROJECT_SECTIONS)}
+      label="Organization"
+      items={destinations(
+        `/o/${organization.slug}`,
+        sessionsEnabled ? ORGANIZATION_SECTIONS : ORGANIZATION_SECTIONS_WITHOUT_SESSIONS,
+      )}
+      setup={destinations(
+        `/o/${organization.slug}`,
+        sessionsEnabled ? SETUP_SECTIONS : SETUP_SECTIONS_WITHOUT_SESSIONS,
+      )}
+      administration={destinations(`/o/${organization.slug}`, ORGANIZATION_ADMINISTRATION)}
     />
   );
 }
@@ -401,11 +394,14 @@ function destinations(base: string, sections: readonly SectionDestination[]): Na
 // itself sits under a rule: it is where the organization is changed, not where work is done.
 const ORGANIZATION_SECTIONS: readonly SectionDestination[] = [
   { section: "home", label: "Home", icon: House },
+  { section: "activity", label: "Activity", icon: History },
   { section: "sessions", label: "Sessions", icon: MessagesSquare, subtree: true },
   { section: "triggers", label: "Triggers", icon: Zap, subtree: true },
-  { section: "activity", label: "Activity", icon: History },
+];
+const SETUP_SECTIONS: readonly SectionDestination[] = [
   { section: "daemons", label: "Daemons", icon: Cpu },
   { section: "connections", label: "Connections", icon: Cable },
+  { section: "sessions/profiles", label: "Profiles", icon: Users, subtree: true },
 ];
 const ORGANIZATION_ADMINISTRATION: readonly SectionDestination[] = [
   { section: "settings", label: "Settings", icon: Settings, subtree: true },
@@ -413,12 +409,9 @@ const ORGANIZATION_ADMINISTRATION: readonly SectionDestination[] = [
 const ORGANIZATION_SECTIONS_WITHOUT_SESSIONS = ORGANIZATION_SECTIONS.filter(
   ({ section }) => section !== "sessions",
 );
-const PROJECT_SECTIONS: readonly SectionDestination[] = [
-  { section: "overview", label: "Overview", icon: Gauge },
-  { section: "configuration", label: "Configuration", icon: SlidersHorizontal },
-  { section: "activity", label: "Activity", icon: History },
-  { section: "settings", label: "Settings", icon: Settings },
-];
+const SETUP_SECTIONS_WITHOUT_SESSIONS = SETUP_SECTIONS.filter(
+  ({ section }) => section !== "sessions/profiles",
+);
 // Instance destinations sit outside the organization hierarchy.
 const INSTANCE_DESTINATIONS: readonly NavigationItem[] = [
   { to: "/apps", label: "Apps", icon: Blocks },
