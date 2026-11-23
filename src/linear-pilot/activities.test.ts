@@ -418,40 +418,45 @@ describe("pilot activities", () => {
     let appendAttempts = 0;
     let duplicateSuppressions = 0;
     for (let i = 0; i < 2_000; i++) {
-      const receivedAt = i % 5 ? now : now - 10_000;
-      const knownOwner = i % 7 !== 0;
-      const event = {
-        ...created,
-        nativeSessionId: `generated-session-${i}`,
-        interactionId: `generated-interaction-${i}`,
-        receivedAt,
-        actorProviderUserId: knownOwner ? created.allowedHumanProviderUserId : "non-owner",
-      };
-      const firstAttempt = i % 3 !== 0;
-      const writeError = i % 2 === 0;
-      const run = (
-        writer: Pick<Writer, "error" | "acknowledge">,
-        mode: "first-attempt" | "readback-only",
-      ) => (writeError ? writer.error(event, mode) : writer.acknowledge(event, mode));
-      if (writeError ? !knownOwner : receivedAt !== now) {
-        await run(w, firstAttempt ? "first-attempt" : "readback-only");
-        continue;
-      }
-      eligible++;
-      if (firstAttempt) {
-        appendAttempts++;
-        w.createActivity.mockRejectedValueOnce(new LinearAgentError("mutation_unconfirmed"));
-      }
-      const result = await run(w, firstAttempt ? "first-attempt" : "readback-only");
-      expect(result.disposition).toBe("unconfirmed");
-      if (firstAttempt) {
-        const duplicate = await run(w, "first-attempt");
-        if (duplicate.disposition === "already-claimed") duplicateSuppressions++;
-      }
-      expect(await run(w.newWriter(), "readback-only")).toEqual(result);
+      const outcome = await exerciseDelivery(w, i);
+      eligible += Number(outcome.eligible);
+      appendAttempts += Number(outcome.appendAttempt);
+      duplicateSuppressions += Number(outcome.duplicateSuppressed);
     }
     expect(duplicateSuppressions).toBe(appendAttempts);
     expect(w.createActivity).toHaveBeenCalledTimes(appendAttempts);
     expect(w.isActivityConfirmed).toHaveBeenCalledTimes(eligible * 2);
   });
 });
+
+async function exerciseDelivery(w: ReturnType<typeof fixture>, i: number) {
+  const receivedAt = i % 5 ? now : now - 10_000;
+  const knownOwner = i % 7 !== 0;
+  const event = {
+    ...created,
+    nativeSessionId: `generated-session-${i}`,
+    interactionId: `generated-interaction-${i}`,
+    receivedAt,
+    actorProviderUserId: knownOwner ? created.allowedHumanProviderUserId : "non-owner",
+  };
+  const firstAttempt = i % 3 !== 0;
+  const writeError = i % 2 === 0;
+  const run = (
+    writer: Pick<Writer, "error" | "acknowledge">,
+    mode: "first-attempt" | "readback-only",
+  ) => (writeError ? writer.error(event, mode) : writer.acknowledge(event, mode));
+  const mode = firstAttempt ? "first-attempt" : "readback-only";
+  if (writeError ? !knownOwner : receivedAt !== now) {
+    await run(w, mode);
+    return { eligible: false, appendAttempt: false, duplicateSuppressed: false };
+  }
+  if (firstAttempt) {
+    w.createActivity.mockRejectedValueOnce(new LinearAgentError("mutation_unconfirmed"));
+  }
+  const result = await run(w, mode);
+  expect(result.disposition).toBe("unconfirmed");
+  const duplicateSuppressed =
+    firstAttempt && (await run(w, "first-attempt")).disposition === "already-claimed";
+  expect(await run(w.newWriter(), "readback-only")).toEqual(result);
+  return { eligible: true, appendAttempt: firstAttempt, duplicateSuppressed };
+}

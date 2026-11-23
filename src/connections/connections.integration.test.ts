@@ -3,8 +3,11 @@ import { createHash, createHmac, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, it, vi } from "vitest";
 import type { DatabaseRuntime, QueryHandle } from "../db/runtime/index.js";
-import { createPostgresQueryRuntime } from "../db/test-utils/runtime.js";
-import { createDatabase, createPostgresPool } from "../db/test-utils/runtime.js";
+import {
+  createDatabase,
+  createPostgresPool,
+  createPostgresQueryRuntime,
+} from "../db/test-utils/runtime.js";
 import { isolatedPostgresDatabase } from "../db/test-utils/isolated-postgres.js";
 import type { Database } from "../db/types.js";
 import type { AuthServer } from "../auth/server.js";
@@ -1206,12 +1209,16 @@ async function resolution(
     slack: [],
     linear: [],
   });
-  assert(status !== null && typeof status === "object" && "status" in status);
+  assertConnectionStatus(status);
   if (status.status === "suspended") return { status: "suspended" as const };
   const binding = provider === "github" ? github : discord;
   return binding === undefined
     ? { status: "unbound" as const }
     : { status: "active" as const, organizationId: binding.organizationId };
+}
+
+function assertConnectionStatus(status: unknown): asserts status is { status: unknown } {
+  assert(status !== null && typeof status === "object" && "status" in status);
 }
 
 async function applyDiscordRemoval(

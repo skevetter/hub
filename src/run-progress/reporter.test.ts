@@ -723,17 +723,7 @@ describe("progress repair across writers", () => {
     "exercises the 63-second stall trace with %s",
     async (mode) => {
       const f = fixture();
-      const run = await f.seed({ state: "active" });
-      assert.ok(await run.acquire("crashed"));
-      const staleLands = pausedSend(f);
-      f.start();
-      await f.clock.advanceTo(60_000);
-      assert.equal((await run.read())?.compensationDoneGen, 1);
-      await f.clock.advanceTo(62_000);
-      await run.finish();
-      await f.clock.advanceTo(62_000);
-      assert.match(f.provider.visible.get("comment") ?? "", /Succeeded/u);
-      assert.equal((await run.read())?.compensationRequestedGen, 2);
+      const { run, staleLands } = await finishDuringStall(f);
 
       if (mode === "after settle") {
         await f.clock.advanceTo(183_000);
@@ -779,21 +769,7 @@ describe("progress repair across writers", () => {
         assert.equal((await run.read())?.retryAt?.getTime(), f.clock.now() + 900_000);
       }
 
-      const repairSendAt = rateLimited ? 1_120_000 : 182_000;
-      await f.clock.advanceTo(repairSendAt);
-      assert.equal(f.provider.requests.at(-1)?.time, repairSendAt);
-      await f.clock.advanceTo(repairSendAt + 1_999);
-      assert.equal(f.provider.visible.get("comment"), "stale");
-      const landedAt = repairSendAt + 2_000;
-      await f.clock.advanceTo(landedAt);
-      assert.match(f.provider.visible.get("comment") ?? "", /Succeeded/u);
-      if (rateLimited) {
-        assert.deepEqual(operationStarts, [182_000, 1_102_000]);
-        assert.equal(landedAt - staleTime, 1_059_000);
-        assert.ok(landedAt - staleTime <= 1_070_000);
-      } else {
-        assert.ok(landedAt - staleTime <= 145_000);
-      }
+      await expectStallTraceRepair(f, { rateLimited, operationStarts, staleTime });
       assert.equal((await run.read())?.settleAt, null);
     },
   );
@@ -834,6 +810,50 @@ describe("progress repair across writers", () => {
     assert.ok(f.provider.requests.every(({ body }) => body.includes("Succeeded")));
   });
 });
+
+async function finishDuringStall(f: ReturnType<typeof fixture>) {
+  const run = await f.seed({ state: "active" });
+  assert.ok(await run.acquire("crashed"));
+  const staleLands = pausedSend(f);
+  f.start();
+  await f.clock.advanceTo(60_000);
+  assert.equal((await run.read())?.compensationDoneGen, 1);
+  await f.clock.advanceTo(62_000);
+  await run.finish();
+  await f.clock.advanceTo(62_000);
+  assert.match(f.provider.visible.get("comment") ?? "", /Succeeded/u);
+  assert.equal((await run.read())?.compensationRequestedGen, 2);
+  return { run, staleLands };
+}
+
+async function expectStallTraceRepair(
+  f: ReturnType<typeof fixture>,
+  {
+    rateLimited,
+    operationStarts,
+    staleTime,
+  }: {
+    rateLimited: boolean;
+    operationStarts: number[];
+    staleTime: number;
+  },
+): Promise<void> {
+  const repairSendAt = rateLimited ? 1_120_000 : 182_000;
+  await f.clock.advanceTo(repairSendAt);
+  assert.equal(f.provider.requests.at(-1)?.time, repairSendAt);
+  await f.clock.advanceTo(repairSendAt + 1_999);
+  assert.equal(f.provider.visible.get("comment"), "stale");
+  const landedAt = repairSendAt + 2_000;
+  await f.clock.advanceTo(landedAt);
+  assert.match(f.provider.visible.get("comment") ?? "", /Succeeded/u);
+  if (rateLimited) {
+    assert.deepEqual(operationStarts, [182_000, 1_102_000]);
+    assert.equal(landedAt - staleTime, 1_059_000);
+    assert.ok(landedAt - staleTime <= 1_070_000);
+  } else {
+    assert.ok(landedAt - staleTime <= 145_000);
+  }
+}
 
 describe("reporter lifecycle integration", () => {
   it.each(["throws", "rejects", "hangs", "500"] as const)(
@@ -1190,39 +1210,60 @@ it("shares leases and credential cooldowns with a separate Hub process", async (
   const f = fixture(postgres.database);
 
   for (const exit of ["complete", "crash"] as const) {
-    const run = await f.seed({ state: "active" });
-    const scope = { triggerRunId: run.run.id, organizationId: ORGANIZATION };
-    const child = startExternalWriter(connection, scope, f.clock.now());
-    const body = await externalMessage(child);
-    assert.match(body, /Paseo run: Running/u);
-    const old = await run.read();
-    assert.ok(old?.leaseOwner);
-    const firstRequest = f.provider.requests.length;
-
-    await run.finish();
-    const replacement = f.writer();
-    const blocked = await replacement.write(scope, f.provider);
-    assert.equal(blocked.wakeAt, f.clock.now() + 5_000);
-    assert.equal(f.provider.requests.length, firstRequest);
-    assert.equal((await run.read())?.leaseOwner, old.leaseOwner);
-
-    const exited = once(child, "exit");
-    if (exit === "complete") child.send("land");
-    else child.kill("SIGKILL");
-    assert.deepEqual(await exited, exit === "complete" ? [0, null] : [null, "SIGKILL"]);
-
-    if (exit === "crash") {
-      await f.clock.advanceTo(59_999);
-      assert.equal((await replacement.write(scope, f.provider)).row?.leaseOwner, old.leaseOwner);
-      await f.clock.advanceTo(60_000);
-    }
-    await replacement.write(scope, f.provider);
-    assert.equal(f.provider.requests.length, firstRequest + 1);
-    assert.match(f.provider.requests.at(-1)?.body ?? "", /Paseo run: Succeeded/u);
-    assert.equal((await run.read())?.state, "finished");
-    if (exit === "crash") assert.equal((await run.read())?.compensationRequestedGen, 2);
+    await expectExternalLeaseRecovery(f, connection, exit);
   }
+  await expectExternalCredentialCooldown(f, connection);
+}, 45_000);
 
+async function expectExternalLeaseRecovery(
+  f: ReturnType<typeof fixture>,
+  connection: string,
+  exit: "complete" | "crash",
+): Promise<void> {
+  const run = await f.seed({ state: "active" });
+  const scope = { triggerRunId: run.run.id, organizationId: ORGANIZATION };
+  const child = startExternalWriter(connection, scope, f.clock.now());
+  const body = await externalMessage(child);
+  assert.match(body, /Paseo run: Running/u);
+  const old = await run.read();
+  assert.ok(old?.leaseOwner);
+  const firstRequest = f.provider.requests.length;
+
+  await run.finish();
+  const replacement = f.writer();
+  const blocked = await replacement.write(scope, f.provider);
+  assert.equal(blocked.wakeAt, f.clock.now() + 5_000);
+  assert.equal(f.provider.requests.length, firstRequest);
+  assert.equal((await run.read())?.leaseOwner, old.leaseOwner);
+
+  await exitExternalWriter(child, exit);
+
+  if (exit === "crash") {
+    await f.clock.advanceTo(59_999);
+    assert.equal((await replacement.write(scope, f.provider)).row?.leaseOwner, old.leaseOwner);
+    await f.clock.advanceTo(60_000);
+  }
+  await replacement.write(scope, f.provider);
+  assert.equal(f.provider.requests.length, firstRequest + 1);
+  assert.match(f.provider.requests.at(-1)?.body ?? "", /Paseo run: Succeeded/u);
+  assert.equal((await run.read())?.state, "finished");
+  if (exit === "crash") assert.equal((await run.read())?.compensationRequestedGen, 2);
+}
+
+async function exitExternalWriter(
+  child: ReturnType<typeof startExternalWriter>,
+  exit: "complete" | "crash",
+): Promise<void> {
+  const exited = once(child, "exit");
+  if (exit === "complete") child.send("land");
+  else child.kill("SIGKILL");
+  assert.deepEqual(await exited, exit === "complete" ? [0, null] : [null, "SIGKILL"]);
+}
+
+async function expectExternalCredentialCooldown(
+  f: ReturnType<typeof fixture>,
+  connection: string,
+): Promise<void> {
   const origin = f.clock.monotonic();
   const rateLimited = await f.seed({ state: "active" });
   const sibling = await f.seed({
@@ -1268,7 +1309,7 @@ it("shares leases and credential cooldowns with a separate Hub process", async (
   const exited = once(child, "exit");
   child.send("close");
   assert.deepEqual(await exited, [0, null]);
-}, 45_000);
+}
 
 async function externalMessage(child: ReturnType<typeof startExternalWriter>): Promise<string> {
   const message: unknown[] = await Promise.race([

@@ -23,6 +23,15 @@ function pinFormatterClock(): void {
   onTestFinished(() => formatter.mockRestore());
 }
 
+function assertCompleteRows(markdown: Root): void {
+  const table = markdown.children.find((node) => node.type === "table");
+  assert.ok(table && table.children.length > 1);
+  for (const row of table.children.slice(1)) {
+    const value = row.children[1]?.children[0];
+    assert.ok(value?.type === "text" && value.value === "complete");
+  }
+}
+
 function assertNoMentionNodes(tree: Root, index: number): void {
   const nodes = [...tree.children];
   for (const node of nodes) {
@@ -360,14 +369,7 @@ ${"line from the answer\n".repeat(250)}`;
         );
       }
       if (structure === "inline code") assert.match(body, /^Answer\.\n\n/u);
-      if (structure === "table row") {
-        const table = markdown.children.find((node) => node.type === "table");
-        assert.ok(table && table.children.length > 1);
-        for (const row of table.children.slice(1)) {
-          const value = row.children[1]?.children[0];
-          assert.ok(value?.type === "text" && value.value === "complete");
-        }
-      }
+      if (structure === "table row") assertCompleteRows(markdown);
       await reply.repair();
       assert.equal((await delivery())?.state, "sent");
       assert.equal(writes.length, 1);
