@@ -280,5 +280,8 @@ export function createLinearPilotToolStepHook({ resolve, scrubValues, now = Date
       const current = active.get(event.nativeSessionId);
       if (current?.interactionId === event.interactionId) current.turn.close();
     },
+    closeAll() {
+      for (const { turn } of active.values()) turn.close();
+    },
   });
 }

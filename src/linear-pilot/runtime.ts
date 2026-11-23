@@ -1090,6 +1090,7 @@ export function createLinearPilotRuntime(options: Options) {
     },
     async stop() {
       state.accepting = false;
+      state.toolSteps?.closeAll();
       await Promise.allSettled(jobs);
     },
   };

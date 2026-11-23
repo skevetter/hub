@@ -364,6 +364,28 @@ it.each(["response", "error", "stop"])(
   },
 );
 
+it("closeAll aborts every open turn and drops later calls", async () => {
+  const f = fixture((id) => id);
+  const stuck = Promise.withResolvers<string>();
+  f.createActivity.mockReturnValue(stuck.promise);
+  const first = begin("first", f.hook);
+  const second = begin("second", f.hook);
+  first.tool("in-flight");
+  second.tool("in-flight");
+  first.tool("queued");
+  const signals = f.createActivity.mock.calls.map((call) => call[1]);
+
+  f.hook.closeAll();
+
+  expect(signals).toHaveLength(2);
+  expect(signals.every((signal) => signal?.aborted)).toBe(true);
+  first.tool("after-close");
+  second.tool("after-close");
+  stuck.reject(new LinearAgentError("cancelled"));
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(writes(f)).toHaveLength(2);
+});
+
 it("separates 2,048 held action claims from the terminal claim", async () => {
   const f = fixture((id) => id);
   for (let index = 0; index < 2_048; index++) begin(`session-${index}`, f.hook).tool("call");
