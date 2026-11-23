@@ -11,7 +11,7 @@ import { linearConnectionRequiresReauthorization } from "../providers/linear/cli
 import { ManualRunRejected } from "../triggers/manual/provider.js";
 import type { DatabaseRuntime, DrizzleHandle, TransactionHandle } from "./runtime/index.js";
 import * as schema from "./schema.js";
-import { ConnectionRepository, replaceGitHubRepositories } from "./connections.js";
+import { type ConnectionRepository, replaceGitHubRepositories } from "./connections.js";
 import {
   markedProviderReplay,
   preRoutingDropEvidence,
@@ -23,6 +23,7 @@ import type {
   AcceptGitHubEventInput,
   AcceptLinearEventInput,
   AcceptSlackEventInput,
+  DurableProviderEvent,
   GitHubInstallationSyncOwner,
   GitHubInstallationSyncClaim,
   GitHubLifecycleReceiptClaimInput,
@@ -39,6 +40,15 @@ import type {
 
 type HubDatabase = DrizzleHandle;
 type HubTransaction = DrizzleHandle;
+type RoutedProvider = "github" | "slack" | "discord" | "linear";
+type GitHubSync = typeof schema.githubInstallationSyncs.$inferSelect;
+type GitHubConnection = typeof schema.githubConnections.$inferSelect;
+
+interface ProviderRouteTarget {
+  provider: RoutedProvider;
+  resourceId: number | string | undefined;
+  connection: { organizationId: string; id: string };
+}
 
 const GITHUB_LIFECYCLE = "github_lifecycle";
 
@@ -92,7 +102,7 @@ export class ProviderEventAcceptanceRepository {
   }
 
   private async acceptProvider(
-    provider: "github" | "slack" | "discord" | "linear",
+    provider: RoutedProvider,
     externalId: number | string,
     resourceId: number | string | undefined,
     input: ProviderEventEvidence,
@@ -111,102 +121,7 @@ export class ProviderEventAcceptanceRepository {
         return this.acceptUnsupportedLinear(runtimeTransaction, connection, input);
       }
 
-      const existing = await findReceipt(transaction, input, connection.organizationId);
-      if (existing !== undefined) return replayProviderReceipt(existing);
-
-      const dropReason =
-        input.dropReason ??
-        ((provider === "github" && "status" in connection && connection.status === "suspended") ||
-        (provider === "linear" && linearConnectionUnavailable(connection, input.receivedAt))
-          ? "configuration_unavailable"
-          : undefined);
-      const receipt = await claimProviderReceipt(transaction, {
-        organizationId: connection.organizationId,
-        provider,
-        connectionId: connection.id,
-        resourceId: resourceId === undefined ? null : String(resourceId),
-        input: dropReason === undefined ? input : { ...input, dropReason },
-        preRoutingDrop: preRoutingDropEvidence(dropReason),
-      });
-      if (!receipt.inserted) {
-        return replayProviderReceipt(receipt.existing);
-      }
-      if (dropReason !== undefined) {
-        return { status: "dropped", receiptId: receipt.id, reason: dropReason };
-      }
-
-      const routes = await transaction
-        .select({
-          projectId: schema.projectTriggerRoutes.projectId,
-          revisionId: schema.projectTriggerRoutes.configurationRevisionId,
-          connectionId: schema.projectTriggerRoutes.connectionId,
-          resourceId: schema.projectTriggerRoutes.resourceId,
-        })
-        .from(schema.projectTriggerRoutes)
-        .innerJoin(
-          schema.projects,
-          and(
-            eq(schema.projects.id, schema.projectTriggerRoutes.projectId),
-            eq(schema.projects.organizationId, connection.organizationId),
-            eq(schema.projects.status, "active"),
-            eq(
-              schema.projects.activeConfigurationRevisionId,
-              schema.projectTriggerRoutes.configurationRevisionId,
-            ),
-          ),
-        )
-        .where(
-          and(
-            eq(schema.projectTriggerRoutes.organizationId, connection.organizationId),
-            eq(schema.projectTriggerRoutes.provider, provider),
-            eq(schema.projectTriggerRoutes.connectionId, connection.id),
-            or(
-              isNull(schema.projectTriggerRoutes.resourceId),
-              eq(
-                schema.projectTriggerRoutes.resourceId,
-                resourceId === undefined ? "" : String(resourceId),
-              ),
-            ),
-          ),
-        );
-
-      const selectedRoutes = selectFirstRoutePerProject(routes);
-      if (selectedRoutes.length === 0) {
-        const reason = "no_project_route";
-        await transaction
-          .update(schema.providerEventReceipts)
-          .set({ droppedReason: reason, preRoutingDrop: reason })
-          .where(writableReceipt(receipt.id, connection.organizationId));
-        return { status: "dropped", receiptId: receipt.id, reason };
-      }
-
-      const acceptedRoutes: ProviderEventRouteSnapshot[] = selectedRoutes.map((route) => ({
-        projectId: route.projectId,
-        configurationRevisionId: route.revisionId,
-        connectionId: route.connectionId,
-        resourceId: route.resourceId,
-      }));
-      await transaction
-        .update(schema.providerEventReceipts)
-        .set({ acceptedRoutes })
-        .where(writableReceipt(receipt.id, connection.organizationId));
-
-      return {
-        status: "accepted",
-        events: acceptedRoutes.map((route) => ({
-          providerEventReceiptId: receipt.id,
-          organizationId: connection.organizationId,
-          projectId: route.projectId,
-          configurationRevisionId: route.configurationRevisionId,
-          deliveryId: input.deliveryId,
-          source: input.source,
-          payload: input.payload,
-          receivedAt: input.receivedAt,
-          connectionId: route.connectionId,
-          resourceId: route.resourceId,
-        })),
-        receiptId: receipt.id,
-      };
+      return acceptRoutedProvider(transaction, { provider, resourceId, connection }, input);
     });
   }
 
@@ -257,41 +172,7 @@ export class ProviderEventAcceptanceRepository {
       if (existing !== undefined) return replayManualReceipt(transaction, input, existing);
       const activeRevision = boundRevision ?? (await projectQuery)[0]?.configurationRevisionId;
       if (activeRevision == null) throw new ManualRunRejected("configuration_not_found");
-      const route: ProviderEventRouteSnapshot = {
-        projectId: input.projectId,
-        configurationRevisionId: activeRevision,
-        connectionId: input.connectionId ?? null,
-        resourceId: input.resourceId ?? null,
-      };
-      const receipt = await claimProviderReceipt(transaction, {
-        organizationId: input.organizationId,
-        provider: "manual",
-        connectionId: null,
-        resourceId: null,
-        input,
-      });
-      if (!receipt.inserted) {
-        return replayManualReceipt(transaction, input, receipt.existing);
-      }
-      await transaction
-        .update(schema.providerEventReceipts)
-        .set({ acceptedRoutes: [route], startedByUserId: input.startedByUserId })
-        .where(writableReceipt(receipt.id, input.organizationId));
-      return {
-        status: "accepted",
-        event: {
-          providerEventReceiptId: receipt.id,
-          organizationId: input.organizationId,
-          projectId: input.projectId,
-          configurationRevisionId: route.configurationRevisionId,
-          deliveryId: input.deliveryId,
-          source: input.source,
-          payload: input.payload,
-          receivedAt: input.receivedAt,
-          connectionId: input.connectionId ?? null,
-          resourceId: input.resourceId ?? null,
-        },
-      };
+      return claimManualEvent(transaction, input, activeRevision);
     });
   }
 
@@ -379,92 +260,38 @@ export class ProviderEventAcceptanceRepository {
       );
       const transaction = runtimeTransaction.drizzle();
       if (!(await githubSyncOwnerActive(transaction, owner))) return;
-      const [receipt] = await transaction
-        .select()
-        .from(schema.githubInstallationSyncs)
-        .where(
-          and(
-            eq(schema.githubInstallationSyncs.id, claim.installationSyncId),
-            isNotNull(schema.githubInstallationSyncs.retryAt),
-            isNull(schema.githubInstallationSyncs.payloadExpiredAt),
-          ),
-        )
-        .for("update");
+      const receipt = await lockPendingGitHubSync(transaction, claim.installationSyncId);
       if (
         receipt === undefined ||
         (receipt.providerApplicationId !== null &&
           receipt.providerApplicationId !== owner.providerApplicationId)
       )
         return;
-      const [connection] = await transaction
-        .select()
-        .from(schema.githubConnections)
-        .where(
-          and(
-            eq(schema.githubConnections.installationId, receipt.installationId),
-            receipt.connectionId === null
-              ? undefined
-              : eq(schema.githubConnections.id, receipt.connectionId),
-          ),
-        )
-        .for("update");
+      const connection = await lockGitHubSyncConnection(transaction, receipt);
       if (
         connection !== undefined &&
         connection.providerApplicationId !== owner.providerApplicationId
       )
         return;
       if (connection === undefined) {
-        if (receipt.connectionId !== null) {
-          await settleGitHubSync(transaction, receipt, owner, receipt.connectionId);
-        } else if (receipt.kind === "webhook" && result.status === "absent") {
-          const copies = schema.providerEventReceipts;
-          const [copy] = await transaction
-            .select({ id: copies.id })
-            .from(copies)
-            .where(
-              or(
-                receipt.deliveryId === null ? undefined : eq(copies.deliveryId, receipt.deliveryId),
-                receipt.signatureHash === null
-                  ? undefined
-                  : eq(copies.signatureHash, receipt.signatureHash),
-              ),
-            )
-            .limit(1);
-          await settleGitHubSync(transaction, receipt, owner, null, {
-            kind: copy === undefined ? "none" : "unproven",
-          });
-        }
+        await settleUnboundGitHubSync(transaction, receipt, owner, result);
         return;
       }
 
       const auditLink = await auditGitHubLifecycle(transaction, receipt, connection);
-      if (result.status === "absent") {
-        if (result.removeBinding) {
-          await this.connections.removeGitHubByInstallationInTransaction(
-            transaction,
-            receipt.installationId,
-          );
-        }
-      } else {
-        await transaction
-          .update(schema.githubConnections)
-          .set({
-            accountId: result.identity.accountId,
-            accountLogin: result.identity.accountLogin,
-            accountType: result.identity.accountType,
-            status: result.identity.status,
-            suspendedAt: result.identity.status === "suspended" ? new Date() : null,
-            updatedAt: new Date(),
-          })
-          .where(eq(schema.githubConnections.id, connection.id));
-        await replaceGitHubRepositories(
+      if (result.status === "present") {
+        await updateGitHubInstallation(transaction, connection, result);
+      } else if (result.removeBinding) {
+        await this.connections.removeGitHubByInstallationInTransaction(
           transaction,
-          connection.organizationId,
-          connection.id,
-          result.repositories,
+          receipt.installationId,
         );
       }
-      await settleGitHubSync(transaction, receipt, owner, connection.id, auditLink);
+      await settleGitHubSync(transaction, receipt, {
+        owner,
+        connectionId: connection.id,
+        auditLink,
+      });
     });
   }
 
@@ -493,7 +320,7 @@ export class ProviderEventAcceptanceRepository {
                 eq(schema.githubInstallationSyncs.id, selected.installationSyncId),
                 eq(schema.githubInstallationSyncs.installationId, selected.installationId),
               ),
-          lte(schema.githubInstallationSyncs.retryAt, new Date()),
+          lte(schema.githubInstallationSyncs.retryAt, sql`statement_timestamp()`),
           isNull(schema.githubInstallationSyncs.payloadExpiredAt),
           or(
             eq(schema.githubInstallationSyncs.providerApplicationId, owner.providerApplicationId),
@@ -554,6 +381,135 @@ export class ProviderEventAcceptanceRepository {
   }
 }
 
+function providerDropReason(
+  provider: RoutedProvider,
+  connection: object,
+  input: ProviderEventEvidence,
+) {
+  return (
+    input.dropReason ??
+    ((provider === "github" && "status" in connection && connection.status === "suspended") ||
+    (provider === "linear" && linearConnectionUnavailable(connection, input.receivedAt))
+      ? "configuration_unavailable"
+      : undefined)
+  );
+}
+
+async function acceptRoutedProvider(
+  transaction: HubTransaction,
+  target: ProviderRouteTarget,
+  input: ProviderEventEvidence,
+): Promise<ProviderEventAcceptance> {
+  const { provider, resourceId, connection } = target;
+  const existing = await findReceipt(transaction, input, connection.organizationId);
+  if (existing !== undefined) return replayProviderReceipt(existing);
+
+  const dropReason = providerDropReason(provider, connection, input);
+  const receipt = await claimProviderReceipt(transaction, {
+    organizationId: connection.organizationId,
+    provider,
+    connectionId: connection.id,
+    resourceId: resourceId === undefined ? null : String(resourceId),
+    input: dropReason === undefined ? input : { ...input, dropReason },
+    preRoutingDrop: preRoutingDropEvidence(dropReason),
+  });
+  if (!receipt.inserted) {
+    return replayProviderReceipt(receipt.existing);
+  }
+  if (dropReason !== undefined) {
+    return { status: "dropped", receiptId: receipt.id, reason: dropReason };
+  }
+
+  return recordProviderRoutes(transaction, target, input, receipt.id);
+}
+
+function providerRoutes(
+  transaction: HubTransaction,
+  { provider, resourceId, connection }: ProviderRouteTarget,
+) {
+  return transaction
+    .select({
+      projectId: schema.projectTriggerRoutes.projectId,
+      revisionId: schema.projectTriggerRoutes.configurationRevisionId,
+      connectionId: schema.projectTriggerRoutes.connectionId,
+      resourceId: schema.projectTriggerRoutes.resourceId,
+    })
+    .from(schema.projectTriggerRoutes)
+    .innerJoin(
+      schema.projects,
+      and(
+        eq(schema.projects.id, schema.projectTriggerRoutes.projectId),
+        eq(schema.projects.organizationId, connection.organizationId),
+        eq(schema.projects.status, "active"),
+        eq(
+          schema.projects.activeConfigurationRevisionId,
+          schema.projectTriggerRoutes.configurationRevisionId,
+        ),
+      ),
+    )
+    .where(
+      and(
+        eq(schema.projectTriggerRoutes.organizationId, connection.organizationId),
+        eq(schema.projectTriggerRoutes.provider, provider),
+        eq(schema.projectTriggerRoutes.connectionId, connection.id),
+        or(
+          isNull(schema.projectTriggerRoutes.resourceId),
+          eq(
+            schema.projectTriggerRoutes.resourceId,
+            resourceId === undefined ? "" : String(resourceId),
+          ),
+        ),
+      ),
+    );
+}
+
+async function recordProviderRoutes(
+  transaction: HubTransaction,
+  target: ProviderRouteTarget,
+  input: ProviderEventEvidence,
+  receiptId: string,
+): Promise<ProviderEventAcceptance> {
+  const { organizationId } = target.connection;
+  const routes = await providerRoutes(transaction, target);
+  const selectedRoutes = selectFirstRoutePerProject(routes);
+  if (selectedRoutes.length === 0) {
+    const reason = "no_project_route";
+    await transaction
+      .update(schema.providerEventReceipts)
+      .set({ droppedReason: reason, preRoutingDrop: reason })
+      .where(writableReceipt(receiptId, organizationId));
+    return { status: "dropped", receiptId, reason };
+  }
+
+  const acceptedRoutes: ProviderEventRouteSnapshot[] = selectedRoutes.map((route) => ({
+    projectId: route.projectId,
+    configurationRevisionId: route.revisionId,
+    connectionId: route.connectionId,
+    resourceId: route.resourceId,
+  }));
+  await transaction
+    .update(schema.providerEventReceipts)
+    .set({ acceptedRoutes })
+    .where(writableReceipt(receiptId, organizationId));
+
+  return {
+    status: "accepted",
+    events: acceptedRoutes.map((route) => ({
+      providerEventReceiptId: receiptId,
+      organizationId,
+      projectId: route.projectId,
+      configurationRevisionId: route.configurationRevisionId,
+      deliveryId: input.deliveryId,
+      source: input.source,
+      payload: input.payload,
+      receivedAt: input.receivedAt,
+      connectionId: route.connectionId,
+      resourceId: route.resourceId,
+    })),
+    receiptId,
+  };
+}
+
 function linearConnectionUnavailable(connection: object, receivedAt: Date): boolean {
   if (!("scopes" in connection) || !isStringArray(connection.scopes)) return true;
   if (
@@ -585,7 +541,7 @@ function isStringArray(value: unknown): value is string[] {
 function eventFromReceipt(
   receipt: typeof schema.providerEventReceipts.$inferSelect,
   route: ProviderEventRouteSnapshot,
-): import("./types.js").DurableProviderEvent {
+): DurableProviderEvent {
   return {
     providerEventReceiptId: receipt.id,
     organizationId: receipt.organizationId,
@@ -597,6 +553,48 @@ function eventFromReceipt(
     receivedAt: receipt.receivedAt,
     connectionId: route.connectionId,
     resourceId: route.resourceId,
+  };
+}
+
+async function claimManualEvent(
+  transaction: HubTransaction,
+  input: PersistManualEventInput,
+  activeRevision: string,
+): Promise<ManualEventPersistence> {
+  const route: ProviderEventRouteSnapshot = {
+    projectId: input.projectId,
+    configurationRevisionId: activeRevision,
+    connectionId: input.connectionId ?? null,
+    resourceId: input.resourceId ?? null,
+  };
+  const receipt = await claimProviderReceipt(transaction, {
+    organizationId: input.organizationId,
+    provider: "manual",
+    connectionId: null,
+    resourceId: null,
+    input,
+  });
+  if (!receipt.inserted) {
+    return replayManualReceipt(transaction, input, receipt.existing);
+  }
+  await transaction
+    .update(schema.providerEventReceipts)
+    .set({ acceptedRoutes: [route], startedByUserId: input.startedByUserId })
+    .where(writableReceipt(receipt.id, input.organizationId));
+  return {
+    status: "accepted",
+    event: {
+      providerEventReceiptId: receipt.id,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      configurationRevisionId: route.configurationRevisionId,
+      deliveryId: input.deliveryId,
+      source: input.source,
+      payload: input.payload,
+      receivedAt: input.receivedAt,
+      connectionId: input.connectionId ?? null,
+      resourceId: input.resourceId ?? null,
+    },
   };
 }
 
@@ -642,13 +640,12 @@ async function lockBoundWebhookTarget(
   if (project?.configurationRevisionId !== binding.configurationRevisionId) {
     throw new ManualRunRejected("configuration_not_found");
   }
-  await assertBoundRevision(
-    transaction,
-    input.organizationId,
-    input.projectId,
-    binding.id,
-    binding.configurationRevisionId,
-  );
+  await assertBoundRevision(transaction, {
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+    triggerId: binding.id,
+    revisionId: binding.configurationRevisionId,
+  });
   return binding.configurationRevisionId;
 }
 
@@ -659,21 +656,25 @@ async function assertBoundReceipt(
   triggerId: string,
 ): Promise<void> {
   if (route.projectId !== input.projectId) throw new ManualRunRejected("configuration_not_found");
-  return assertBoundRevision(
-    transaction,
-    input.organizationId,
-    input.projectId,
+  return assertBoundRevision(transaction, {
+    organizationId: input.organizationId,
+    projectId: input.projectId,
     triggerId,
-    route.configurationRevisionId,
-  );
+    revisionId: route.configurationRevisionId,
+  });
 }
 
 async function assertBoundRevision(
   transaction: HubTransaction,
-  organizationId: string,
-  projectId: string,
-  triggerId: string,
-  revisionId: string,
+  {
+    organizationId,
+    projectId,
+    triggerId,
+    revisionId,
+  }: ManualProject & {
+    triggerId: string;
+    revisionId: string;
+  },
 ): Promise<void> {
   const revisions = schema.projectConfigurationRevisions;
   const [revision] = await transaction
@@ -760,13 +761,12 @@ async function validateMarkedManualReceipt(
 ): Promise<void> {
   const binding = requireManualReceiptReplayBinding(receipt, input);
   if (binding.triggerId !== null) {
-    await assertBoundRevision(
-      transaction,
-      input.organizationId,
-      binding.projectId,
-      binding.triggerId,
-      binding.configurationRevisionId,
-    );
+    await assertBoundRevision(transaction, {
+      organizationId: input.organizationId,
+      projectId: binding.projectId,
+      triggerId: binding.triggerId,
+      revisionId: binding.configurationRevisionId,
+    });
   }
 }
 
@@ -847,7 +847,7 @@ async function findLinearReceiptConnection(database: DrizzleHandle, workspaceId:
 
 async function findConnection(
   transaction: HubTransaction,
-  provider: "github" | "slack" | "discord" | "linear",
+  provider: RoutedProvider,
   externalId: number | string,
 ) {
   if (provider === "github") {
@@ -939,10 +939,97 @@ async function claimProviderReceipt(
   return { id: existing.id, inserted: false, existing };
 }
 
+async function lockPendingGitHubSync(transaction: HubTransaction, installationSyncId: string) {
+  const [receipt] = await transaction
+    .select()
+    .from(schema.githubInstallationSyncs)
+    .where(
+      and(
+        eq(schema.githubInstallationSyncs.id, installationSyncId),
+        isNotNull(schema.githubInstallationSyncs.retryAt),
+        isNull(schema.githubInstallationSyncs.payloadExpiredAt),
+      ),
+    )
+    .for("update");
+  return receipt;
+}
+
+async function lockGitHubSyncConnection(transaction: HubTransaction, receipt: GitHubSync) {
+  const [connection] = await transaction
+    .select()
+    .from(schema.githubConnections)
+    .where(
+      and(
+        eq(schema.githubConnections.installationId, receipt.installationId),
+        receipt.connectionId === null
+          ? undefined
+          : eq(schema.githubConnections.id, receipt.connectionId),
+      ),
+    )
+    .for("update");
+  return connection;
+}
+
+async function settleUnboundGitHubSync(
+  transaction: HubTransaction,
+  receipt: GitHubSync,
+  owner: GitHubInstallationSyncOwner,
+  result: GitHubInstallationSyncResult,
+): Promise<void> {
+  if (receipt.connectionId !== null) {
+    await settleGitHubSync(transaction, receipt, { owner, connectionId: receipt.connectionId });
+    return;
+  }
+  if (receipt.kind !== "webhook" || result.status !== "absent") return;
+
+  const copies = schema.providerEventReceipts;
+  const [copy] = await transaction
+    .select({ id: copies.id })
+    .from(copies)
+    .where(
+      or(
+        receipt.deliveryId === null ? undefined : eq(copies.deliveryId, receipt.deliveryId),
+        receipt.signatureHash === null
+          ? undefined
+          : eq(copies.signatureHash, receipt.signatureHash),
+      ),
+    )
+    .limit(1);
+  await settleGitHubSync(transaction, receipt, {
+    owner,
+    connectionId: null,
+    auditLink: { kind: copy === undefined ? "none" : "unproven" },
+  });
+}
+
+async function updateGitHubInstallation(
+  transaction: HubTransaction,
+  connection: GitHubConnection,
+  result: Extract<GitHubInstallationSyncResult, { status: "present" }>,
+): Promise<void> {
+  await transaction
+    .update(schema.githubConnections)
+    .set({
+      accountId: result.identity.accountId,
+      accountLogin: result.identity.accountLogin,
+      accountType: result.identity.accountType,
+      status: result.identity.status,
+      suspendedAt: result.identity.status === "suspended" ? new Date() : null,
+      updatedAt: new Date(),
+    })
+    .where(eq(schema.githubConnections.id, connection.id));
+  await replaceGitHubRepositories(
+    transaction,
+    connection.organizationId,
+    connection.id,
+    result.repositories,
+  );
+}
+
 async function auditGitHubLifecycle(
   transaction: HubTransaction,
-  receipt: typeof schema.githubInstallationSyncs.$inferSelect,
-  connection: typeof schema.githubConnections.$inferSelect,
+  receipt: GitHubSync,
+  connection: GitHubConnection,
 ): Promise<schema.GitHubSyncAuditLink | undefined> {
   if (receipt.kind === "reconcile") return undefined;
   if (
@@ -998,10 +1085,16 @@ async function auditGitHubLifecycle(
 
 async function settleGitHubSync(
   transaction: HubTransaction,
-  sync: typeof schema.githubInstallationSyncs.$inferSelect,
-  owner: GitHubInstallationSyncOwner,
-  connectionId: string | null,
-  auditLink?: schema.GitHubSyncAuditLink,
+  sync: GitHubSync,
+  {
+    owner,
+    connectionId,
+    auditLink,
+  }: {
+    owner: GitHubInstallationSyncOwner;
+    connectionId: string | null;
+    auditLink?: schema.GitHubSyncAuditLink | undefined;
+  },
 ) {
   const syncs = schema.githubInstallationSyncs;
   await transaction
