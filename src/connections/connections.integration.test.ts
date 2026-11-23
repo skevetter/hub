@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, it, vi } from "vitest";
 import type { DatabaseRuntime, QueryHandle } from "../db/runtime/index.js";
 import { createPostgresQueryRuntime } from "../db/test-utils/runtime.js";
 import { createDatabase, createPostgresPool } from "../db/test-utils/runtime.js";
@@ -531,7 +531,7 @@ describe("provider connection facades PostgreSQL authority", () => {
     await githubCallback(connections, userState, "code");
 
     github.identity = { ...github.identity!, status: "suspended" };
-    await deliverGitHubLifecycle(connections, "suspend", 42);
+    await deliverGitHubLifecycle(connections, "suspend", 42, { pool });
     assert.deepEqual(await resolution(connections, "github", "42"), { status: "suspended" });
 
     github.identity = { ...github.identity, status: "active" };
@@ -547,16 +547,16 @@ describe("provider connection facades PostgreSQL authority", () => {
     });
 
     github.identity = { ...github.identity, status: "suspended" };
-    await deliverGitHubLifecycle(connections, "suspend-again", 42);
+    await deliverGitHubLifecycle(connections, "suspend-again", 42, { pool });
     github.identity = { ...github.identity, status: "active" };
-    await deliverGitHubLifecycle(connections, "restore", 42);
+    await deliverGitHubLifecycle(connections, "restore", 42, { pool });
     assert.deepEqual(await resolution(connections, "github", "42"), {
       status: "active",
       organizationId: "acme",
     });
 
     github.identity = undefined;
-    await deliverGitHubLifecycle(connections, "removed", 42);
+    await deliverGitHubLifecycle(connections, "removed", 42, { pool });
     assert.deepEqual(await resolution(connections, "github", "42"), { status: "unbound" });
   });
 
@@ -565,11 +565,12 @@ describe("provider connection facades PostgreSQL authority", () => {
     github.identity = { ...github.identity!, status: "suspended" };
     github.failInstallationReads = 1;
 
-    await deliverGitHubLifecycle(connections, "lifecycle-retry", 42);
+    await deliverGitHubLifecycle(connections, "lifecycle-retry", 42, { pool, state: "retry" });
     await pool.query(
-      `update github_installation_syncs set retry_at = now() where retry_at is not null`,
+      `update github_installation_syncs set retry_at = now()
+       where delivery_id = 'lifecycle-retry' and retry_at is not null`,
     );
-    await deliverGitHubLifecycle(connections, "lifecycle-retry", 42);
+    await deliverGitHubLifecycle(connections, "lifecycle-retry", 42, { pool });
     await deliverGitHubLifecycle(connections, "lifecycle-retry", 42);
 
     assert.equal(github.installationReads, 2);
@@ -1086,6 +1087,7 @@ async function deliverGitHubLifecycle(
   connections: ProviderFixture,
   deliveryId: string,
   installationId: number,
+  completion?: { pool: QueryHandle; state?: "retry" | "settled" },
 ): Promise<void> {
   const body = JSON.stringify({
     action: "suspend",
@@ -1099,24 +1101,54 @@ async function deliverGitHubLifecycle(
   const registration = connections.registrations.find(
     (candidate) => candidate.connection.name === "github",
   );
-  const webhook = registration?.requests.find((candidate) => candidate.name === "webhook");
+  assert(registration !== undefined);
+  const webhook = registration.requests.find((candidate) => candidate.name === "webhook");
+  const source = registration.sources[0];
   assert(webhook !== undefined);
-  const response = await webhook.handle(
-    new Request("https://hub.example.test/webhook", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-github-delivery": deliveryId,
-        "x-github-event": "installation",
-        "x-hub-signature-256": signature,
-      },
-      body,
-    }),
+  assert(source !== undefined);
+  try {
+    const response = await webhook.handle(
+      new Request("https://hub.example.test/webhook", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-github-delivery": deliveryId,
+          "x-github-event": "installation",
+          "x-hub-signature-256": signature,
+        },
+        body,
+      }),
+    );
+    assert.equal(response.status, 200);
+    if (completion !== undefined) {
+      await source.start(async () => undefined);
+      await waitForGitHubLifecycleState(completion.pool, deliveryId, completion.state);
+    }
+  } finally {
+    await source.stop();
+  }
+}
+
+async function waitForGitHubLifecycleState(
+  pool: QueryHandle,
+  deliveryId: string,
+  state: "retry" | "settled" = "settled",
+): Promise<void> {
+  await vi.waitFor(
+    async () => {
+      const { rows } = await pool.query<{ state: string }>(
+        `select case
+           when settled_at is not null then 'settled'
+           when retry_at > statement_timestamp() then 'retry'
+           else 'pending'
+         end as state
+         from github_installation_syncs where delivery_id = $1`,
+        [deliveryId],
+      );
+      assert.equal(rows[0]?.state, state, `GitHub lifecycle delivery ${deliveryId}`);
+    },
+    { timeout: 10_000 },
   );
-  assert.equal(response.status, 200);
-  await connections.registrations
-    .find((candidate) => candidate.connection.name === "github")!
-    .sources[0]!.stop();
 }
 
 function result(response: Response): string | null {
