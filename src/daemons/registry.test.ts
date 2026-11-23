@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { afterEach, beforeEach, describe, it, vi } from "vitest";
 import { WebSocket, type RawData } from "ws";
 import type { DaemonRecord } from "../db/types.js";
+import { classifyFailure } from "../failures/index.js";
 import { HubDaemonHelloSchema } from "../hub/protocol.js";
 import { createLogger } from "../logger.js";
 import { assertOneFailure, FailureLogStream } from "../test-utils/failure-logs.js";
@@ -244,7 +245,9 @@ describe("daemon socket deadlines", () => {
     };
     return {
       registry,
+      daemon,
       socket,
+      send,
       connection,
       requestId,
       receive,
@@ -256,8 +259,11 @@ describe("daemon socket deadlines", () => {
     "removes %s after 20 seconds without an answer",
     async (method) => {
       const { connection, requestId, isPending } = setupProviderRead();
-      const rejected = assert.rejects(connection[method]({}), {
-        message: "daemon_provider_timeout",
+      const rejected = assert.rejects(connection[method]({}), (error: unknown) => {
+        assert(error instanceof Error);
+        assert.equal(error.message, "daemon_provider_timeout");
+        assert.equal(classifyFailure(error), "timeout");
+        return true;
       });
       const id = requestId();
 
@@ -313,6 +319,51 @@ describe("daemon socket deadlines", () => {
     receive({ type: "rpc_error", payload: { requestId: requestId(), error: "refresh failed" } });
 
     await rejected;
+    assert.equal(vi.getTimerCount(), 0);
+  });
+
+  it("clears the provider deadline when a refresh is not acknowledged", async () => {
+    const { connection, requestId, receive, isPending } = setupProviderRead();
+    const rejected = assert.rejects(connection.refreshProviderSnapshot({}), {
+      message: "daemon provider refresh was not acknowledged",
+    });
+    const id = requestId();
+    receive({
+      type: "refresh_providers_snapshot_response",
+      payload: { requestId: id, acknowledged: false },
+    });
+
+    await rejected;
+    assert.equal(isPending(id), false);
+    assert.equal(vi.getTimerCount(), 0);
+  });
+
+  it("removes a pending provider request and clears its deadline when send throws", async () => {
+    const { connection, send, requestId, isPending } = setupProviderRead();
+    const failure = new Error("send failed");
+    send.mockImplementationOnce(() => {
+      throw failure;
+    });
+
+    await assert.rejects(connection.getProviderSnapshot({}), (error) => error === failure);
+    assert.equal(isPending(requestId()), false);
+    assert.equal(vi.getTimerCount(), 0);
+  });
+
+  it("rejects old provider requests and clears their deadlines when a socket is replaced", async () => {
+    const { connection, registry, daemon, requestId, isPending } = setupProviderRead();
+    const disconnected = { message: "daemon disconnected" };
+    const snapshotRejected = assert.rejects(connection.getProviderSnapshot({}), disconnected);
+    const snapshotId = requestId();
+    const refreshRejected = assert.rejects(connection.refreshProviderSnapshot({}), disconnected);
+    const refreshId = requestId();
+    assert.equal(vi.getTimerCount(), 2);
+
+    registry.accept(daemon, unopenedSocket());
+
+    await Promise.all([snapshotRejected, refreshRejected]);
+    assert.equal(isPending(snapshotId), false);
+    assert.equal(isPending(refreshId), false);
     assert.equal(vi.getTimerCount(), 0);
   });
 

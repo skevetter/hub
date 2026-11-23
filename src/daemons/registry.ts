@@ -348,9 +348,10 @@ export class ActiveDaemonRegistry {
     const { requestId } = request;
     const requests = this.pendingFor(active.daemon.id);
     const timer = setTimeout(
-      () => fail(new Error("daemon_provider_timeout")),
+      () => fail(Object.assign(new Error("daemon_provider_timeout"), { code: "timeout" })),
       PROVIDER_REQUEST_DEADLINE_MS,
     );
+    timer.unref?.();
     function cleanup() {
       clearTimeout(timer);
       requests.delete(requestId);
