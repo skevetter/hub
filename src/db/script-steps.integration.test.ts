@@ -106,6 +106,77 @@ async function acceptedRun({ database, projectId }: Harness, stepIds = ["run"]) 
   return { run: created.run, step };
 }
 
+const AGENT_VARIANTS = [
+  {
+    result: { status: "succeeded" },
+    output: { completion: "inferred_from_turn_end", secret: "user output" },
+    completedByAgent: true,
+  },
+  {
+    result: { status: "succeeded", completion: "inferred_from_turn_end", output: "answer" },
+    output: { status: "succeeded", completion: "inferred_from_turn_end", output: "answer" },
+    completedByAgent: false,
+  },
+  {
+    result: { status: "failed" },
+    output: { completion: "inferred_from_turn_end" },
+    completedByAgent: false,
+  },
+  {
+    result: { status: "succeeded" },
+    output: { completion: "inferred_from_turn_end" },
+    completedByAgent: false,
+  },
+];
+
+type AcceptedRun = Awaited<ReturnType<typeof acceptedRun>>["run"];
+
+async function completeAgentVariants(harness: Harness, run: AcceptedRun) {
+  const { database } = harness;
+  const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
+  for (const [index, variant] of AGENT_VARIANTS.entries()) {
+    const step = steps[index]!;
+    const status = index === 2 ? "failed" : "succeeded";
+    const execution = await database.insertAgentExecution({
+      organizationId: "org-1",
+      projectId: harness.projectId,
+      machineId: null,
+      triggerContext: {},
+      outputContext: {},
+      configurationRevisionId: run.configurationRevisionId,
+      workflowStepRunId: step.id,
+    });
+    await database.linkWorkflowStepRunExecution(step.id, execution.id);
+    await database.completeWorkflowAgentExecution({
+      executionId: execution.id,
+      executionStatus: status,
+      stepStatus: status,
+      result: variant.result,
+      stepOutput: variant.output,
+      completedByAgent: variant.completedByAgent,
+    });
+  }
+}
+
+function scriptsAuth(): AuthServer {
+  return {
+    handle: async () => new Response(),
+    resources: async () => {
+      throw new Error("unused");
+    },
+    resolveOrganizationAccess: async () => {
+      throw new Error("unused");
+    },
+    resolveAccount: async () => ({
+      session: { id: "session-1", activeOrganizationId: "org-1" },
+      account: { id: "user-1", name: "User", email: "user@example.test" },
+      isInstanceOperator: false,
+    }),
+    rejectCookieMutation: () => undefined,
+    close: async () => undefined,
+  };
+}
+
 const backends = [
   ["in-memory", memoryHarness],
   ["embedded PostgreSQL", embeddedHarness],
@@ -123,71 +194,12 @@ describe.each(backends)("script step persistence (%s)", (_name, open) => {
         "ended",
         "script",
       ]);
-      const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
-      const variants = [
-        {
-          result: { status: "succeeded" },
-          output: { completion: "inferred_from_turn_end", secret: "user output" },
-          completedByAgent: true,
-        },
-        {
-          result: { status: "succeeded", completion: "inferred_from_turn_end", output: "answer" },
-          output: { status: "succeeded", completion: "inferred_from_turn_end", output: "answer" },
-          completedByAgent: false,
-        },
-        {
-          result: { status: "failed" },
-          output: { completion: "inferred_from_turn_end" },
-          completedByAgent: false,
-        },
-        {
-          result: { status: "succeeded" },
-          output: { completion: "inferred_from_turn_end" },
-          completedByAgent: false,
-        },
-      ];
-      for (const [index, variant] of variants.entries()) {
-        const step = steps[index]!;
-        const execution = await database.insertAgentExecution({
-          organizationId: "org-1",
-          projectId: harness.projectId,
-          machineId: null,
-          triggerContext: {},
-          outputContext: {},
-          configurationRevisionId: run.configurationRevisionId,
-          workflowStepRunId: step.id,
-        });
-        await database.linkWorkflowStepRunExecution(step.id, execution.id);
-        await database.completeWorkflowAgentExecution({
-          executionId: execution.id,
-          executionStatus: index === 2 ? "failed" : "succeeded",
-          stepStatus: index === 2 ? "failed" : "succeeded",
-          result: variant.result,
-          stepOutput: variant.output,
-          completedByAgent: variant.completedByAgent,
-        });
-      }
+      await completeAgentVariants(harness, run);
       database.resolveTenantRouteAccess = async () => ({
         organization: { id: "org-1", name: "Scripts", slug: "s" },
         membership: { id: "membership-1", role: "owner" },
       });
-      const auth: AuthServer = {
-        handle: async () => new Response(),
-        resources: async () => {
-          throw new Error("unused");
-        },
-        resolveOrganizationAccess: async () => {
-          throw new Error("unused");
-        },
-        resolveAccount: async () => ({
-          session: { id: "session-1", activeOrganizationId: "org-1" },
-          account: { id: "user-1", name: "User", email: "user@example.test" },
-          isInstanceOperator: false,
-        }),
-        rejectCookieMutation: () => undefined,
-        close: async () => undefined,
-      };
-      const detail = await new ProjectDashboard(database, auth).activityRunDetail(
+      const detail = await new ProjectDashboard(database, scriptsAuth()).activityRunDetail(
         new Request("https://hub.test/o/s"),
         { organizationSlug: "s", runId: run.id },
       );
@@ -201,6 +213,7 @@ describe.each(backends)("script step persistence (%s)", (_name, open) => {
         "outcome",
         "payloadExpiredAt",
         "payloadSummary",
+        "prompt",
         "provider",
         "receivedAt",
         "repo",
@@ -237,10 +250,10 @@ describe.each(backends)("script step persistence (%s)", (_name, open) => {
           { isAgent: false, completion: null },
         ],
       );
-      assert.deepEqual(detail.steps[0]?.output, variants[0]?.output);
-      assert.deepEqual(detail.steps[1]?.output, variants[1]?.output);
-      assert.deepEqual(detail.steps[2]?.output, variants[2]?.output);
-      assert.deepEqual(detail.steps[3]?.output, variants[3]?.output);
+      assert.deepEqual(detail.steps[0]?.output, AGENT_VARIANTS[0]?.output);
+      assert.deepEqual(detail.steps[1]?.output, AGENT_VARIANTS[1]?.output);
+      assert.deepEqual(detail.steps[2]?.output, AGENT_VARIANTS[2]?.output);
+      assert.deepEqual(detail.steps[3]?.output, AGENT_VARIANTS[3]?.output);
     } finally {
       await harness.close();
     }

@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import type { QueryRow } from "../db/runtime/index.js";
-import { createPostgresQueryRuntime } from "../db/test-utils/runtime.js";
 import { z } from "zod";
-import { createDatabase, createPostgresPool } from "../db/test-utils/runtime.js";
+import {
+  createDatabase,
+  createPostgresPool,
+  createPostgresQueryRuntime,
+} from "../db/test-utils/runtime.js";
 import type { Database } from "../db/types.js";
 import { OrganizationCliCredentials } from "../auth/cli-credentials.js";
 import { CliAuthorizations } from "./index.js";
@@ -90,7 +93,12 @@ describe("CLI authorization PostgreSQL state machine", () => {
       "runs:stop",
     );
     assert.ok(stopAccess.status === "authorized");
-    assert.deepEqual(stopAccess.access.user, { id: "user-owner", role: "owner" });
+    assert.deepEqual(stopAccess.access.user, {
+      id: "user-owner",
+      role: "owner",
+      email: "owner@example.test",
+      emailVerified: false,
+    });
     const summaries = await cliCredentials.list("org-acme");
     assert.equal(summaries.length, 1);
     assert.equal(await cliCredentials.revoke("org-acme", summaries[0]!.id), true);
