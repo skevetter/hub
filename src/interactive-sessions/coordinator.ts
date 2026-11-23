@@ -496,20 +496,33 @@ export class InteractiveSessionCoordinator {
     const watch = worker.watched;
     if (!watch || !(await proceeds(bound)) || !pilotStartReady(worker, watch))
       throw new DaemonResponseLostError();
-    watch.pilotTurn = new LinearPilotTurn({
-      ...worker.scope,
-      commandId,
-      daemonId: bound.daemonId,
-      agentId: bound.daemonAgentId,
-      generation: bound.generation,
-      hubTurn: bound.turn + 1,
-    });
+    watch.pilotTurn = this.openPilotTurn(worker, bound, commandId, bound.daemonAgentId);
     const settlement = await this.deliver(agents, bound.daemonAgentId, command, volatilePrompt);
     if (settlement.status !== "delivered") {
       await this.abandonPilotDelivery(worker, command, settlement);
       return "unconfirmed";
     }
     return this.confirmLinearPilotStart(worker, watch, { bound, command, fresh });
+  }
+
+  private openPilotTurn(
+    worker: Worker,
+    bound: SessionRecord,
+    commandId: string,
+    agentId: string,
+  ): LinearPilotTurn {
+    const toolSteps = this.options.linearPilot?.toolSteps;
+    return new LinearPilotTurn(
+      {
+        ...worker.scope,
+        commandId,
+        daemonId: bound.daemonId,
+        agentId,
+        generation: bound.generation,
+        hubTurn: bound.turn + 1,
+      },
+      toolSteps === undefined ? undefined : { toolSteps, cwd: bound.launch.cwd },
+    );
   }
 
   private async abandonPilotDelivery(
@@ -1610,6 +1623,7 @@ export class InteractiveSessionCoordinator {
 
   private dropWatch(worker: Worker): void {
     worker.pilotStop?.end(false);
+    worker.watched?.pilotTurn?.closeToolSteps();
     worker.watched?.unsubscribe?.();
     worker.watched = undefined;
   }
