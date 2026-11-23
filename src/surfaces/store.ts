@@ -161,9 +161,21 @@ export function validPolicy(input: PolicyInput) {
     surfaceUuid(input.profileId) &&
     surfaceRevision(input.profileVersion) &&
     (input.expectedRevision === null || surfaceRevision(input.expectedRevision)) &&
-    (input.moveOnBegin === undefined ||
-      input.moveOnBegin === "unchanged" ||
-      input.moveOnBegin === "started") &&
+    validPolicyMoveOnBegin(input) &&
+    validPolicyScope(input, teamIds, handle)
+  );
+}
+
+function validPolicyMoveOnBegin(input: PolicyInput) {
+  return (
+    input.moveOnBegin === undefined ||
+    input.moveOnBegin === "unchanged" ||
+    input.moveOnBegin === "started"
+  );
+}
+
+function validPolicyScope(input: PolicyInput, teamIds: readonly string[], handle: string | null) {
+  return (
     teamIds.length <= 200 &&
     teamIds.every(identifier) &&
     new Set(teamIds).size === teamIds.length &&
@@ -181,9 +193,7 @@ export function policyRecord(
   if (
     (current?.revision ?? null) !== input.expectedRevision ||
     !surfaceRevision(revision) ||
-    profile?.organizationId !== input.organizationId ||
-    profile.version !== input.profileVersion ||
-    (input.enabled === true && profile.status !== "active")
+    !profileMatchesPolicy(input, profile)
   )
     return undefined;
   return {
@@ -203,6 +213,17 @@ export function policyRecord(
     verifiedAppHandle: input.verifiedAppHandle ?? null,
     updatedAt: input.now,
   };
+}
+
+function profileMatchesPolicy(
+  input: PolicyInput,
+  profile: StoredSessionProfile | undefined,
+): profile is StoredSessionProfile {
+  return (
+    profile?.organizationId === input.organizationId &&
+    profile.version === input.profileVersion &&
+    (input.enabled !== true || profile.status === "active")
+  );
 }
 
 export function validBindingKey(key: BindingKey) {
@@ -225,24 +246,21 @@ export function validBinding(input: BindingInput) {
   );
 }
 
+type BindingSession = Pick<
+  SessionRecord,
+  "id" | "origin" | "profileId" | "profileVersion" | "state"
+>;
+
 export function bindingRecord(
   input: BindingInput,
   policy: SurfacePolicy | undefined,
-  session:
-    | Pick<SessionRecord, "id" | "origin" | "profileId" | "profileVersion" | "state">
-    | undefined,
+  session: BindingSession | undefined,
   prior: SurfaceBinding | undefined,
 ): Omit<SurfaceBinding, "id"> | undefined {
   const generation = (prior?.generation ?? 0) + 1;
   if (
-    !policy?.enabled ||
-    policy.connectionId !== input.connectionId.toLowerCase() ||
-    policy.revision !== input.policyRevision ||
-    !policy.scope.teamIds.includes(input.teamId) ||
-    session?.origin !== "linear" ||
-    session.state === "closed" ||
-    session.profileId !== policy.profileId ||
-    session.profileVersion !== policy.profileVersion ||
+    !policyAllowsBinding(input, policy) ||
+    !sessionMatchesBindingPolicy(policy, session) ||
     (prior?.generation ?? null) !== input.expectedGeneration ||
     !surfaceRevision(generation) ||
     !bindingCanReplace(input, prior)
@@ -263,6 +281,30 @@ export function bindingRecord(
     createdAt: input.now,
     supersededAt: null,
   };
+}
+
+function policyAllowsBinding(
+  input: BindingInput,
+  policy: SurfacePolicy | undefined,
+): policy is SurfacePolicy {
+  return (
+    !!policy?.enabled &&
+    policy.connectionId === input.connectionId.toLowerCase() &&
+    policy.revision === input.policyRevision &&
+    policy.scope.teamIds.includes(input.teamId)
+  );
+}
+
+function sessionMatchesBindingPolicy(
+  policy: SurfacePolicy,
+  session: BindingSession | undefined,
+): session is BindingSession {
+  return (
+    session?.origin === "linear" &&
+    session.state !== "closed" &&
+    session.profileId === policy.profileId &&
+    session.profileVersion === policy.profileVersion
+  );
 }
 
 function bindingCanReplace(input: BindingInput, prior: SurfaceBinding | undefined) {
