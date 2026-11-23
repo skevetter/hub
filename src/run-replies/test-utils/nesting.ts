@@ -17,20 +17,30 @@ export function mentionLinks(markdown: string): string[] {
     fromMarkdown(markdown, { extensions: [gfm()], mdastExtensions: [gfmFromMarkdown()] }),
   ];
   for (const node of pending) {
-    if (node.type === "link" || node.type === "definition") {
-      const url = URL.parse(node.url);
-      const host = url?.hostname.replace(/\.$/u, "") ?? "";
-      const path = decodeURIComponent(url?.pathname ?? "").normalize("NFKC");
-      const linear = host === "linear.app" || host.endsWith(".linear.app");
-      if (
-        (linear && /\/(?:profiles|users|agents)(?:\/|$)/iu.test(path)) ||
-        /[@\uFF20]/u.test(node.url)
-      )
-        found.push(node.url);
+    if ((node.type === "link" || node.type === "definition") && isMentionLink(node.url)) {
+      found.push(node.url);
     }
     if ("children" in node) pending.push(...node.children);
   }
   return found;
+}
+
+function isMentionLink(href: string): boolean {
+  const url = URL.parse(href);
+  const host = url?.hostname.replace(/\.$/u, "") ?? "";
+  const path = decodeURIComponent(url?.pathname ?? "").normalize("NFKC");
+  const linear = host === "linear.app" || host.endsWith(".linear.app");
+  return (linear && /\/(?:profiles|users|agents)(?:\/|$)/iu.test(path)) || /[@\uFF20]/u.test(href);
+}
+
+function seededPick(seed: number) {
+  const next = random(seed);
+  function pick<T>(items: T[]): T {
+    const item = items[Math.floor(next() * items.length)];
+    assert.ok(item !== undefined);
+    return item;
+  }
+  return { next, pick };
 }
 
 export function random(seed: number) {
@@ -66,8 +76,7 @@ function safeBody(text: string, truncated: boolean, context: string): string {
 }
 
 export async function checkStackedDocuments({ seed, count }: DocumentRun): Promise<void> {
-  const next = random(seed);
-  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+  const { next, pick } = seededPick(seed);
   const markers = [
     ">",
     "> ",
@@ -102,8 +111,7 @@ export async function checkNestedDocuments({
   count,
   timing = false,
 }: DocumentRun): Promise<void> {
-  const next = random(seed);
-  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+  const { next, pick } = seededPick(seed);
   const markers = ["- ", "* ", "+ ", "1. ", "2) ", "> ", "-\t", ">", "- > "];
   const indents = ["\t", "  ", " ", "    ", "\t  "];
   for (let index = 0; index < count; index += 1) {
@@ -135,8 +143,7 @@ export async function checkFenceTrickDocuments({
   count,
   timing = false,
 }: DocumentRun): Promise<void> {
-  const next = random(seed);
-  const pick = <T>(items: T[]) => items[Math.floor(next() * items.length)]!;
+  const { next, pick } = seededPick(seed);
   const fences = [
     "```x`",
     "``` `",
