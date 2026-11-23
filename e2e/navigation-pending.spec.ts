@@ -75,17 +75,33 @@ test("keeps settings tabs aligned through pending navigation and Back", async ({
   await expectSettingsPage(page, "Team");
 });
 
-test("keeps the organization rail while presenting instance settings", async ({ hub, page }) => {
+test("keeps the organization rail through pending instance navigation", async ({ hub, page }) => {
   await openOrganization(hub, page);
   await hub.grantOperator("owner");
   const { navigation } = projectApp(page);
-  await navigation.openInstanceSection("Apps");
+  await navigation.openOrganizationSection("Settings");
+  await expectSettingsPage(page, "Team");
+  const settings = page
+    .getByRole("navigation", { name: "Organization", exact: true })
+    .getByRole("link", { name: "Settings", exact: true });
+  const download = await holdPageScripts(page);
+  try {
+    await openSettingsTab(page, "Instance");
+    await download.requested;
+    await expectSettingsPage(page, "Team");
+    await expect(settings).toHaveAttribute("aria-current", "page");
+    await download.showPendingPage();
+    await expect(settings).toBeVisible();
+    await expect(settings).toHaveAttribute("aria-current", "page");
+    await expect(page.getByRole("button", { name: "Organization", exact: true })).toContainText(
+      "Acme",
+    );
+    await expect(page.getByRole("heading", { name: "Team", level: 1 })).toBeHidden();
+  } finally {
+    await download.release();
+  }
   await navigation.expectBreadcrumb("Acme", "Settings", "Instance", "Apps");
-  await expect(
-    page
-      .getByRole("navigation", { name: "Organization", exact: true })
-      .getByRole("link", { name: "Settings", exact: true }),
-  ).toHaveAttribute("aria-current", "page");
+  await expect(settings).toHaveAttribute("aria-current", "page");
   await expect(page.getByRole("heading", { name: "Apps", level: 1 })).toBeVisible();
   await navigation.leaveInstance();
   await expectOrganizationPage(page, "Home");
