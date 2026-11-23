@@ -245,9 +245,13 @@ it("starts, steers, queues and stops through the real embedded runtime, then re-
       { timeout: 5000 },
     );
     await daemon.completesTurnWithoutFinishTimeline(agentId);
-    await vi.waitFor(() => expect(daemon.createdAgent()["prompt"]).toBe("queued"), {
-      timeout: 5000,
-    });
+    await vi.waitFor(
+      async () => {
+        expect(daemon.createdAgent()["prompt"]).toBe("queued");
+        expect((await snapshot()).session.state).toBe("running");
+      },
+      { timeout: 5000 },
+    );
 
     accepted(
       await service.command(request, { ...command, kind: "stop", idempotencyKey: randomUUID() }),
