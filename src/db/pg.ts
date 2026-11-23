@@ -55,6 +55,9 @@ import {
 } from "./workflow-intake.js";
 import { randomUUID } from "node:crypto";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import type { StopCleanupState } from "../triggers/run-stop.js";
+import type { AgentSessionAction } from "../agent-sessions/index.js";
+import type { Conversation } from "../triggers/continuation.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import { parseInvocationInputs, parseInvocationRejection } from "../triggers/invocation.js";
 import { DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR } from "./unsupported-linear.js";
@@ -190,6 +193,7 @@ import type {
   ActivityRunScope,
   TriggerListPage,
   TriggerListRequest,
+  PendingHubActionScope,
 } from "./types.js";
 
 const STEP_PAYLOAD_PROJECTION = `step.id, step.trigger_run_id, step.step_id, step.ordinal, step.status,
@@ -1701,7 +1705,7 @@ class PgDatabase implements Database {
   async readRunStopDetails(organizationId: string, triggerRunId: string) {
     const result = await query<{
       stoppedByName: string | null;
-      cleanupState: import("../triggers/run-stop.js").StopCleanupState;
+      cleanupState: StopCleanupState;
       coalesced: boolean;
       retryAttemptId: string | null;
       otherAttachedRunCount: number;
@@ -3291,10 +3295,7 @@ class PgDatabase implements Database {
     }
   }
 
-  async findPendingHubActions(
-    daemonId?: string,
-    scope?: import("./types.js").PendingHubActionScope,
-  ) {
+  async findPendingHubActions(daemonId?: string, scope?: PendingHubActionScope) {
     try {
       const rows = await query<AgentExecutionRow>(
         this.pool,
@@ -3409,7 +3410,9 @@ class PgDatabase implements Database {
         ];
       }
       const rows = await query<{ id: string }>(this.pool, statement, parameters);
-      return rows.rows[0] === undefined ? undefined : this.findAgentExecutionById(executionId);
+      return rows.rows[0] === undefined
+        ? undefined
+        : await this.findAgentExecutionById(executionId);
     } catch (error) {
       throw toDatabaseError(error);
     }
@@ -3823,7 +3826,7 @@ class PgDatabase implements Database {
   async attachExecutionToSession(
     executionId: string,
     sessionId: string,
-    action?: import("../agent-sessions/index.js").AgentSessionAction,
+    action?: AgentSessionAction,
   ): Promise<void> {
     const result = await this.pool.query(
       `update agent_executions e set agent_session_id = s.id, agent_session_action = coalesce(e.agent_session_action, $3) from agent_sessions s
@@ -5659,7 +5662,7 @@ interface TriggerRunRow extends QueryRow {
   payload_expired_at: Date | null;
   payload_summary: TriggerRunRecord["payloadSummary"];
   terminal_notification_generation: number;
-  conversation: import("../triggers/continuation.js").Conversation | null;
+  conversation: Conversation | null;
   id: string;
   organization_id: string;
   project_id: string;
@@ -5912,7 +5915,7 @@ export interface AgentExecutionRow extends QueryRow {
   payload_completion?: PayloadCompletion | null;
   payload_hidden?: boolean;
   agent_session_id: string | null;
-  agent_session_action: import("../agent-sessions/index.js").AgentSessionAction | null;
+  agent_session_action: AgentSessionAction | null;
   id: string;
   organization_id: string;
   project_id: string;
