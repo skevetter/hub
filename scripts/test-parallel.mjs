@@ -1,4 +1,4 @@
-import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createReadStream, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, rm, stat } from "node:fs/promises";
 import { availableParallelism, homedir, loadavg, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -8,6 +8,7 @@ import {
   passedVitestReport,
   printRunContext,
   repositoryFor,
+  requireGit,
 } from "./test-context.mjs";
 import { publishTestMetrics } from "./test-receipt.mjs";
 import baselineTimings from "./test-timings.json" with { type: "json" };
@@ -308,12 +309,28 @@ function reportHasEveryFile(testResults, root, files) {
 
 async function normalShardExit(report, run, log) {
   if (run.processError) return false;
-  if (run.exitCode === 0) return passedVitestReport(report);
-  if (run.exitCode !== 1 || !report.testResults.some(({ status }) => status === "failed"))
-    return false;
+  const explainedExit =
+    run.exitCode === 0
+      ? passedVitestReport(report)
+      : run.exitCode === 1 && report.testResults.some(({ status }) => status === "failed");
+  return explainedExit && (await logHasNoUnhandledErrors(log));
+}
+
+async function logHasNoUnhandledErrors(log) {
   // Vitest's JSON reporter omits unhandled errors, including fork crashes.
-  const output = await readFile(log, "utf8");
-  return !/Vitest caught \d+ unhandled errors? during the test run/u.test(output);
+  const marker = /Vitest caught \d+ unhandled errors? during the test run/u;
+  let overlap = "";
+  try {
+    for await (const chunk of createReadStream(log, { encoding: "utf8" })) {
+      const text = overlap + chunk;
+      if (marker.test(text)) return false;
+      // Keep enough text for a marker split across two chunks.
+      overlap = text.slice(-128);
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function completedTimings(report, { root, files, run, log }) {
@@ -442,8 +459,16 @@ async function discoverFiles(root, runDirectory, invoke) {
   return files;
 }
 
-function saveTimings(cacheRoot, timings) {
+function saveTimings(cacheRoot, timings, { root, head, finalized }) {
   try {
+    const currentHead = requireGit(root, ["rev-parse", "--verify", "HEAD"]).trim();
+    if (currentHead !== head) {
+      console.warn(
+        `Skipping Vitest timing cache update: HEAD changed from ${head} to ${currentHead}.`,
+      );
+      return;
+    }
+    if (!finalized) return;
     const results = timings.map(([file, duration]) => [file, { duration }]);
     writeJson(join(cacheRoot, "test-parallel/results.json"), { version: 1, results });
   } catch (error) {
@@ -466,6 +491,7 @@ async function runSerialRetry(files, { execute, signal, publishSuccess }) {
 
 async function runFullSuite({
   root,
+  head,
   cacheRoot,
   files,
   shardOverride,
@@ -498,8 +524,15 @@ async function runFullSuite({
   console.log(`Shard execution wall time: ${((performance.now() - startedAt) / 1000).toFixed(2)}s`);
   if (result.failedFiles.length)
     writeJson(failedFileList, { version: failedListVersion, files: result.failedFiles });
-  if (result.exitCode === 0 && !signal.aborted) await publishSuccess();
-  if (!signal.aborted && timings.length === files.length) saveTimings(cacheRoot, timings);
+  let finalized = false;
+  try {
+    if (result.exitCode === 0 && !signal.aborted) await publishSuccess();
+    finalized = true;
+  } finally {
+    if (!signal.aborted && timings.length === files.length) {
+      saveTimings(cacheRoot, timings, { root, head, finalized });
+    }
+  }
   return result.exitCode;
 }
 
@@ -552,6 +585,7 @@ async function main(signal) {
     }
     return await runFullSuite({
       root,
+      head,
       cacheRoot,
       files,
       shardOverride,
