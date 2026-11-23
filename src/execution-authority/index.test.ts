@@ -1,6 +1,7 @@
 import { createMemoryDatabase } from "../db/memory.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
+import type { ConnectionResolutionContext } from "../config/connections.js";
 import type { CompiledGitHubAuthority } from "../config/github-authority.js";
 import type { CreateExecutionAuthorityOptions, ExecutionAuthorityClock } from "./index.js";
 import { createExecutionAuthority as createProductionExecutionAuthority } from "./index.js";
@@ -669,12 +670,7 @@ describe("Hub execution authority", () => {
       database,
       githubAuthority: mint,
       connectionsForProject:
-        () =>
-        async (
-          slug: string,
-          _value: string,
-          context?: import("../config/connections.js").ConnectionResolutionContext,
-        ) => {
+        () => async (slug: string, _value: string, context?: ConnectionResolutionContext) => {
           if (slug === "leased")
             await context?.registerToken?.({
               provider: "github",

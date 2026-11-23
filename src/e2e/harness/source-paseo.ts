@@ -18,9 +18,9 @@ const cliResultSchema = z.union([
 ]);
 const activeRelationshipSchema = z.object({
   state: z.literal("active"),
-  relationship: z.object({ daemonId: z.string().uuid() }),
+  relationship: z.object({ daemonId: z.uuid() }),
   credential: z.object({ secret: z.string().min(1) }),
-  transport: z.object({ webSocketUrl: z.string().url() }),
+  transport: z.object({ webSocketUrl: z.url() }),
 });
 interface SourcePaseoOptions {
   root?: string;
