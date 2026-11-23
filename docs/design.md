@@ -70,7 +70,7 @@ State inks, used by `StateBlock`, `Figure` tone, `StatusLine` tone and badge cou
 
 Each state has a `-foreground` for the label on its block and a `-text` for the state set as type. There is no amber. Something either needs a person or it does not. Until rows move to `StateBlock`, `StatusPill` and `Checklist` read the old tone names, which now alias the state inks: `success` is done, `warning` and `danger` are attention, `neutral` is off.
 
-Shell, in both themes: `rail` `#111111` (`#0a0a0a` dark), `rail-foreground` `#f7f7f4`, `rail-muted` `#a8a8a3`, `rail-accent` for hover, `rail-border` `#2e2e2e`. The current navigation item is a `live` fill with `live-foreground`. The rail is the one committed colour field; it stays ink in light mode. The `sidebar-*` tokens alias the rail. Keyboard focus on the rail uses `sidebar-ring`, at least 3:1 against `rail` in both themes; on the current item, whose fill is `live`, the outline uses `live-foreground`.
+Shell, in both themes: `rail` `#111111` (`#0a0a0a` dark), `rail-foreground` `#f7f7f4`, `rail-muted` `#a8a8a3`, `rail-accent` for hover, `rail-border` `#2e2e2e`. The current navigation item is a `live` fill with `live-foreground`. The rail is the one committed colour field; it stays ink in light mode. The `sidebar-*` tokens alias the rail. Keyboard focus on the rail uses `sidebar-ring`, at least 3:1 against `rail` in both themes; the phone tab outline is inset, so on the current tab, whose fill is `live`, it uses `live-foreground`.
 
 Charts use `foreground` for bars and `attention` only for a bar that carries a failure. There is no chart palette.
 
