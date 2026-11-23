@@ -9,7 +9,7 @@ import type {
 } from "./capture-types.js";
 import type { TimelineData } from "./store.js";
 
-const TOOL_NAME = /^[A-Za-z0-9_.:/ -]{1,64}(?![\s\S])/u;
+export const TOOL_NAME = /^[A-Za-z0-9_.:/ -]{1,64}(?![\s\S])/u;
 const IDENTIFIER = /^[A-Za-z0-9_.:-]{1,64}(?![\s\S])/u;
 const STEP_STATUSES: Readonly<Record<string, true>> = {
   succeeded: true,
@@ -38,7 +38,7 @@ function duration(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
-function toolName(value: unknown, scrub: TimelineScrubber): string {
+export function toolName(value: unknown, scrub: TimelineScrubber): string {
   if (typeof value !== "string") return "unnamed";
   const safe = scrub(value, 64);
   return TOOL_NAME.test(safe) ? safe : "unnamed";

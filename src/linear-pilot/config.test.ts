@@ -77,6 +77,18 @@ describe("parseLinearPilotConfig", () => {
     expect(upper).toEqual({ status: "enabled", config: VALID });
   });
 
+  it.each([true, false])("accepts optional toolSteps: %s", (toolSteps) => {
+    const config = { ...VALID, toolSteps };
+    expect(parseLinearPilotConfig(JSON.stringify(config))).toEqual({ status: "enabled", config });
+  });
+
+  it("does not accept malformed or repeated toolSteps values", () => {
+    for (const toolSteps of ["true", 0, null, {}])
+      expect(invalid(JSON.stringify({ ...VALID, toolSteps }))).toBe("bad_value");
+    const raw = JSON.stringify({ ...VALID, toolSteps: true });
+    expect(invalid(raw.replace("}", ', "toolSteps" : false}'))).toBe("duplicate_key");
+  });
+
   it("refuses oversized input before parsing", () => {
     expect(invalid(JSON.stringify({ ...VALID, profileId: "p".repeat(2_000) }))).toBe("too_large");
   });

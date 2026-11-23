@@ -5,6 +5,8 @@ import type { StartSessionInput } from "../interactive-sessions/store.js";
 import type { SessionPrincipal, SessionRecord } from "../interactive-sessions/types.js";
 import { MAX_REPLY_INPUT_CHARS, type FinalReplyAnswer } from "../run-replies/format.js";
 
+import type { ToolStepHook, ToolStepTurn } from "./tool-steps.js";
+
 export type LinearPilotStart = Pick<
   StartSessionInput,
   "profileId" | "profileVersion" | "message" | "idempotencyKey"
@@ -74,6 +76,7 @@ export interface LinearPilotSessionHooks {
   ): Promise<boolean>;
   onTerminal(terminal: LinearPilotTerminal): void | Promise<void>;
   stopTimeoutMs?: number;
+  toolSteps?: ToolStepHook;
 }
 
 type Stream = Extract<AgentEvent, { type: "agent_stream" }>;
@@ -103,6 +106,11 @@ export function matchesLinearPilotStop(target: LinearPilotTarget, request: Linea
   return requestedAt.success && Date.parse(requestedAt.data) > Date.parse(target.startedAt);
 }
 
+interface ToolStepOptions {
+  toolSteps?: ToolStepHook;
+  cwd?: string;
+}
+
 export class LinearPilotTurn {
   private turnId: string | undefined;
   private startedAt: string | null = null;
@@ -117,7 +125,18 @@ export class LinearPilotTurn {
   permissionPending = false;
   turnEnded = false;
 
-  constructor(private readonly scope: TurnScope) {}
+  private readonly toolSteps: ToolStepTurn | undefined;
+
+  constructor(
+    private readonly scope: TurnScope,
+    options?: ToolStepOptions,
+  ) {
+    this.toolSteps = options?.toolSteps?.(scope, options.cwd);
+  }
+
+  closeToolSteps(): void {
+    this.toolSteps?.close();
+  }
 
   get target(): LinearPilotTarget | undefined {
     return this.sealed ? undefined : this.active;
@@ -197,6 +216,7 @@ export class LinearPilotTurn {
     if (item.type === "tool_call") {
       this.messageEnded = true;
       this.clearAnswer();
+      this.toolSteps?.accept(item);
     }
     if (item.type === "assistant_message")
       return this.acceptAssistantBlock(item.messageId, item.text);
@@ -230,6 +250,7 @@ export class LinearPilotTurn {
     if (!active || !this.matchesTerminal(active, row)) return this.loseProof();
     this.turnEnded = true;
     this.sealed = true;
+    this.closeToolSteps();
     const { messageId, text, truncated } = this;
     this.clearAnswer();
     if (type === "turn_failed") return { ...active, status: "failed" };
@@ -260,6 +281,7 @@ export class LinearPilotTurn {
 
   private loseProof(): LinearPilotTerminal {
     this.sealed = true;
+    this.closeToolSteps();
     this.clearAnswer();
     return { ...this.scope, status: "unconfirmed" };
   }

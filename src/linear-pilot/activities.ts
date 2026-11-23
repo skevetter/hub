@@ -47,7 +47,7 @@ export type LinearPilotWriteDisposition =
   | { disposition: "unconfirmed" | "already-claimed" | "capacity"; activityId: string }
   | { disposition: "denied" | "cancelled" | "expired"; activityId?: string };
 
-type PilotClient = Pick<
+export type PilotClient = Pick<
   ReturnType<typeof createLinearAgentClient>,
   "createActivity" | "isActivityConfirmed"
 >;
@@ -108,7 +108,7 @@ function delegationRefusalWriter(write: WriteDelegationRefusal) {
   };
 }
 
-function claim(claims: Map<string, number>, slot: string, started: number) {
+export function claimPilotActivity(claims: Map<string, number>, slot: string, started: number) {
   for (const [key, expires] of claims) {
     if (expires > started) break;
     claims.delete(key);
@@ -160,7 +160,7 @@ function claimWrite(input: WriteActivity, claims: Map<string, number>, started: 
     event.nativeSessionId,
     purpose === "ack" ? null : event.interactionId,
   ]);
-  return claim(claims, slot, started);
+  return claimPilotActivity(claims, slot, started);
 }
 
 async function mutate(client: PilotClient, content: BodyContent, delivery: Delivery) {
@@ -415,7 +415,11 @@ export function pilotActivityIds(nativeSessionId: string, promptActivityId: stri
   };
 }
 
-function stableActivityId(sessionId: string, purpose: Purpose, interactionId: string): string {
+export function stableActivityId(
+  sessionId: string,
+  purpose: Purpose | "action" | "action_gap",
+  interactionId: string,
+): string {
   const identity = JSON.stringify([sessionId, purpose, purpose === "ack" ? null : interactionId]);
   const name = `https://paseo.sh/id/linear-pilot/v4/${encodeURIComponent(identity)}`;
   const bytes = createHash("sha256").update(name).digest();

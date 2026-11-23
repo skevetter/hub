@@ -5,6 +5,7 @@ export interface LinearPilotConfig {
   readonly linearOrganizationId: string;
   readonly allowedHumanId: string;
   readonly profileId: string;
+  readonly toolSteps?: boolean;
 }
 
 export type LinearPilotConfigResult =
@@ -24,6 +25,7 @@ export type LinearPilotConfigIssue =
   | "bad_value";
 
 const KEYS = ["hubOrganizationId", "linearOrganizationId", "allowedHumanId", "profileId"] as const;
+const OPTIONAL_KEY = "toolSteps";
 const MAX_RAW_CHARS = 1024;
 export const LINEAR_PILOT_ID = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/u;
 const UUID = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu;
@@ -55,10 +57,29 @@ export function parseLinearPilotConfig(raw: string | undefined): LinearPilotConf
 }
 
 function parseRecord(raw: string, record: ReadonlyMap<string, unknown>): LinearPilotConfigResult {
-  if ([...record.keys()].some((key) => !KEYS.some((known) => known === key))) {
+  if (
+    [...record.keys()].some((key) => key !== OPTIONAL_KEY && !KEYS.some((known) => known === key))
+  ) {
     return invalid("unknown_key");
   }
   if (KEYS.some((key) => !record.has(key))) return invalid("missing_key");
+  const fields = readFields(record);
+  if (fields === undefined) return invalid("bad_value");
+  const toolSteps = record.get(OPTIONAL_KEY);
+  if (toolSteps !== undefined && typeof toolSteps !== "boolean") return invalid("bad_value");
+  // Values hold no quote or backslash, so a key name followed by a colon appearing twice can
+  // only be a duplicate key that JSON.parse would silently resolve to the last one.
+  if (hasDuplicateKeys(raw, record)) return invalid("duplicate_key");
+  return {
+    status: "enabled",
+    config: Object.freeze({
+      ...fields,
+      ...(toolSteps === undefined ? {} : { toolSteps }),
+    }),
+  };
+}
+
+function readFields(record: ReadonlyMap<string, unknown>) {
   const hubOrganizationId = readId(record, "hubOrganizationId");
   const linearOrganizationId = readId(record, "linearOrganizationId");
   const allowedHumanId = readId(record, "allowedHumanId");
@@ -69,17 +90,15 @@ function parseRecord(raw: string, record: ReadonlyMap<string, unknown>): LinearP
     allowedHumanId === undefined ||
     profileId === undefined
   ) {
-    return invalid("bad_value");
+    return undefined;
   }
-  // Values hold no quote or backslash, so a key name followed by a colon appearing twice can
-  // only be a duplicate key that JSON.parse would silently resolve to the last one.
-  if (KEYS.some((key) => [...raw.matchAll(new RegExp(`"${key}"\\s*:`, "gu"))].length !== 1)) {
-    return invalid("duplicate_key");
-  }
-  return {
-    status: "enabled",
-    config: Object.freeze({ hubOrganizationId, linearOrganizationId, allowedHumanId, profileId }),
-  };
+  return { hubOrganizationId, linearOrganizationId, allowedHumanId, profileId };
+}
+
+function hasDuplicateKeys(raw: string, record: ReadonlyMap<string, unknown>) {
+  return [...record.keys()].some(
+    (key) => [...raw.matchAll(new RegExp(`"${key}"\\s*:`, "gu"))].length !== 1,
+  );
 }
 
 export function linearPilotConfigFromEnv(
