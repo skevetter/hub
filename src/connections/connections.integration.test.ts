@@ -486,8 +486,12 @@ describe("provider connection facades PostgreSQL authority", () => {
     const source = connections.registrations.find(
       (candidate) => candidate.connection.name === "github",
     )!.sources[0]!;
-    await source.start(async () => undefined);
-    await source.stop();
+    try {
+      await source.start(async () => undefined);
+      await waitForGitHubLifecycleState(pool, "during-first-connection");
+    } finally {
+      await source.stop();
+    }
     assert.deepEqual(
       (await database.listGitHubRepositories("acme")).map((item) => item.fullName),
       ["acme-inc/new"],
@@ -508,7 +512,7 @@ describe("provider connection facades PostgreSQL authority", () => {
     };
     const callback = githubCallback(connections, state, "reconnect-code");
     await gate.entered;
-    const webhook = deliverGitHubLifecycle(connections, "during-reconnect", 42);
+    const webhook = deliverGitHubLifecycle(connections, "during-reconnect", 42, { pool });
     githubRepositories.selection = [
       { repositoryId: 9003, fullName: "acme-inc/new", defaultBranch: "next" },
     ];
