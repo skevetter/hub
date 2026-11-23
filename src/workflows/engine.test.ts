@@ -1416,7 +1416,7 @@ run:
   );
 
   it("persists step hard and idle deadlines capped by the whole-run deadline", async () => {
-    let now = new Date("2026-08-06T12:00:00.000Z");
+    const now = new Date("2026-08-06T12:00:00.000Z");
     const fixture = await workflowFixture({ rawConfiguration: deadlineConfiguration() });
     const dispatches: string[] = [];
     const { handler, engine } = engineFor(fixture, dispatches, undefined, () => now);
