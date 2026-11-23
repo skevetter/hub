@@ -13,6 +13,7 @@ import { activityRunDetailView } from "../projects/activity-run-view.js";
 import { readRunProgressSettings } from "../run-progress/settings.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { TriggerDashboard } from "./dashboard.js";
+import type { RunEventPage } from "./run-events.js";
 
 const NOW = new Date("2026-11-16T12:00:00.000Z");
 const PROMPT = `  Review the changes.\n${"x".repeat(120)}\nKeep this last line.  `;
@@ -215,9 +216,7 @@ for (const backend of ["memory", "embedded"] as const)
         origin: "captured",
       });
       const sealed = await dashboard.runEvents(request, "one", run.id, 103);
-      assert.equal(sealed?.sealedSeq, 104);
-      assert.equal(sealed?.origin, "derived");
-      assert.equal(sealed?.events[0]?.kind, "run_finished");
+      assertSealedPage(sealed);
     });
 
     it("distinguishes unavailable capture-off timelines from retained and reconcilable rows", async () => {
@@ -287,3 +286,9 @@ for (const backend of ["memory", "embedded"] as const)
       assert.equal((await reader.runEvents(request, "one", run.id, 0))?.expired, true);
     });
   });
+
+function assertSealedPage(page: RunEventPage | null) {
+  assert.equal(page?.sealedSeq, 104);
+  assert.equal(page?.origin, "derived");
+  assert.equal(page?.events[0]?.kind, "run_finished");
+}
