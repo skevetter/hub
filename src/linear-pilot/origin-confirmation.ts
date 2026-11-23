@@ -203,7 +203,7 @@ async function delegationPrompt(context: Context, reply: string) {
   const issue = await readOriginWithin(CONFIRMATION_READ_MS, (signal) =>
     client.readDelegationIssue(historyScope(event), signal),
   );
-  if (!issue || !matchesIssue(issue, event)) {
+  if (!issue || issue.delegate?.id !== event.appUserId || !matchesIssue(issue, event)) {
     logConfirmation(event, "origin_unproven", "issue_readback");
     return undefined;
   }
@@ -241,7 +241,9 @@ async function startConfirmed(
   if (!(await claimConfirmation(database, key, "started", receivedAt))) {
     return logConfirmation(event, "origin_reused");
   }
-  return delegationPrompt(context, reply);
+  const message = await delegationPrompt(context, reply);
+  if (message === undefined) await writer(context).delegationRefused(event.nativeSessionId);
+  return message;
 }
 
 export async function confirmDelegationOwner(

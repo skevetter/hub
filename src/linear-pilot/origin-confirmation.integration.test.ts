@@ -53,7 +53,11 @@ type Scenario =
   | "not delegated"
   | "app only assignee"
   | "source comment present"
-  | "root author mismatch";
+  | "root author mismatch"
+  | "delegate removed"
+  | "delegate changed"
+  | "issue read failure"
+  | "oversized prompt";
 
 function scopeFrom(config: LinearPilotConfig, appUserId: string): ProviderScope {
   return {
@@ -172,6 +176,23 @@ async function confirmationResponse(
   return Response.json({ data: { agentSession: confirmationData(scope, scenario) } });
 }
 
+function replyIssueResponse(scope: ProviderScope, scenario: Scenario) {
+  if (scenario === "issue read failure") {
+    return Response.json({ errors: [{ message: "synthetic issue read failure" }] });
+  }
+  const delegateId = scenario === "delegate changed" ? "other-delegate" : scope.appUserId;
+  return Response.json({
+    data: {
+      issue: {
+        ...issueData(scope),
+        title: "Fresh title",
+        description: scenario === "oversized prompt" ? "x".repeat(20_000) : "Fresh description.",
+        delegate: scenario === "delegate removed" ? null : { id: delegateId },
+      },
+    },
+  });
+}
+
 function originProvider(scope: ProviderScope, scenario: Scenario) {
   const writes: { id: string; type: string; body: string }[] = [];
   const reads: string[] = [];
@@ -199,15 +220,8 @@ function originProvider(scope: ProviderScope, scenario: Scenario) {
     if (query.includes("PaseoPilotDelegationIssue")) {
       reads.push("issue");
       expect(variables["issueId"]).toBe(scope.issueId);
-      return Response.json({
-        data: {
-          issue: {
-            ...issueData(scope),
-            title: "Fresh title",
-            description: "Fresh description.",
-          },
-        },
-      });
+      expect(query).toMatch(/\bdelegate\s*\{\s*id\s*\}/u);
+      return replyIssueResponse(scope, scenario);
     }
     if (/PaseoPilot(?:DelegationOrigin|History)/u.test(query)) reads.push("history");
     assert.match(query, /PaseoAgentActivityCreate/u);
@@ -458,6 +472,7 @@ it("non-owner, app and null actor replies stay silent, and wrong issue, session 
 
 it.each([
   ["after 24 hours", DELEGATION_CONFIRM_TTL_MS + 1, false],
+  ["exactly at 24 hours", DELEGATION_CONFIRM_TTL_MS, true],
   ["one millisecond before 24 hours", DELEGATION_CONFIRM_TTL_MS - 1, true],
 ] as const)(
   "handles a reply %s with a fake clock",
@@ -485,6 +500,57 @@ it.each([
       } finally {
         clock.mockRestore();
       }
+    });
+  },
+  25_000,
+);
+
+it("drops a reply with negative claim age without writing or starting", async () => {
+  await runTest("ok", async (test, endpoint) => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      await elicit(test, endpoint);
+      clock.mockReturnValue(now - 1);
+      const early = prompted(test.scope);
+      objectAt(objectAt(early, "agentActivity"), "content")["body"] = "Too early to start.";
+      await endpoint.deliver(early);
+      clock.mockReturnValue(now);
+      await endpoint.deliver(prompted(test.scope));
+      await vi.waitFor(() => expect(test.agents.sends).toHaveLength(1));
+      expect(test.agents.sends[0]?.text).toBe(
+        "Work on TEST-1: Fresh title\n\nFresh description.\n\n" + startText,
+      );
+      expect(test.reads).toEqual(["confirmation", "issue"]);
+      expect(test.writes.map(({ type }) => type)).toEqual(["elicitation", "thought"]);
+      expect(await test.claims(started)).toBe(1);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+}, 25_000);
+
+it.each([
+  "delegate removed",
+  "delegate changed",
+  "issue read failure",
+  "oversized prompt",
+] as const)(
+  "posts one fixed error and never starts if confirmation fails with %s",
+  async (scenario) => {
+    await runTest(scenario, async (test, endpoint) => {
+      await elicit(test, endpoint);
+      const reply = prompted(test.scope);
+      await endpoint.deliver(reply);
+      await vi.waitFor(() => expect(test.writes).toHaveLength(2));
+      await expectOneShot(endpoint, test.scope, reply);
+      expect(test.writes.map(({ type }) => type)).toEqual(["elicitation", "error"]);
+      expect(test.writes[1]?.body).toBe(
+        "Paseo could not confirm who started this. Mention @paseo in a comment instead.",
+      );
+      expect(test.reads).toEqual(["confirmation", "issue"]);
+      expect(await test.claims(started)).toBe(1);
+      expect(test.agents.creations).toHaveLength(0);
     });
   },
   25_000,

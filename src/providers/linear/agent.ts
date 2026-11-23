@@ -520,7 +520,7 @@ const confirmationQuery = `query PaseoPilotDelegationConfirmation($sessionId: St
 }`;
 
 const delegationIssueQuery = `query PaseoPilotDelegationIssue($issueId: String!) {
-  issue(id: $issueId) { id identifier title description team { id organization { id } } }
+  issue(id: $issueId) { id identifier title description delegate { id } team { id organization { id } } }
 }`;
 
 const promptIssue = ref.extend({
@@ -540,7 +540,9 @@ const confirmationReadback = z.object({
     .nullable(),
 });
 const delegationIssueReadback = z.object({
-  issue: promptIssue.extend({ description: z.string().nullable() }).nullable(),
+  issue: promptIssue
+    .extend({ description: z.string().nullable(), delegate: ref.nullable() })
+    .nullable(),
 });
 
 function confirmationMethods(
