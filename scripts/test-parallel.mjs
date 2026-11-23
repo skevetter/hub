@@ -64,14 +64,17 @@ export function planShards(override, readLoad = readMachineLoad) {
   const count = override ?? Math.min(6, Math.max(1, Math.round(cores / 3)));
   const reason =
     override === undefined ? `${cores} cores / 3, rounded and clamped to 1-6` : "TEST_SHARDS";
-  const multiplier = Math.min(4, Math.max(1, averages[0] / cores));
+  const [load1, load5] = averages;
+  const timeoutLoad =
+    load5 > load1 ? { minutes: 5, average: load5 } : { minutes: 1, average: load1 };
+  const multiplier = Math.min(4, Math.max(1, timeoutLoad.average / cores));
   // Match vitest.config.ts and Vitest's Node hook and teardown defaults.
   const timeoutFlags = [
     `--testTimeout=${Math.round(30_000 * multiplier)}`,
     `--hookTimeout=${Math.round(10_000 * multiplier)}`,
     `--teardownTimeout=${Math.round(10_000 * multiplier)}`,
   ];
-  return { count, reason, start, multiplier, timeoutFlags };
+  return { count, reason, start, multiplier, timeoutFlags, timeoutLoad };
 }
 
 function printMachineLoad(print, phase, { averages, cores }) {
@@ -502,14 +505,16 @@ async function runFullSuite({
 }) {
   await rm(failedFileList, { force: true });
   const weighted = await weighFiles(root, cacheRoot, files);
-  const { count, reason, start, multiplier, timeoutFlags } = planShards(shardOverride);
+  const { count, reason, start, multiplier, timeoutFlags, timeoutLoad } = planShards(shardOverride);
   const groups = partitionFiles(weighted, count);
   const startedAt = performance.now();
   console.log(
     `Running ${files.length} Vitest files across ${groups.length} shards (${count} requested: ${reason}).`,
   );
   for (const line of shardEstimates(groups, weighted)) console.log(line);
-  console.log(`Vitest shard timeouts (${multiplier.toFixed(2)}x, ms): ${timeoutFlags.join(" ")}`);
+  console.log(
+    `Vitest shard timeouts (${multiplier.toFixed(2)}x from ${timeoutLoad.minutes}-min load ${timeoutLoad.average.toFixed(2)}, ms): ${timeoutFlags.join(" ")}`,
+  );
   const timings = [];
   const result = await runShards(groups, {
     execute: async (name, selected) => {

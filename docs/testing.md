@@ -27,8 +27,10 @@ The generator accepts live `shard-N/results.json` files or archived `shard-N.jso
 The parallel runner divides available cores by three, rounds to the nearest integer, and clamps
 the default shard count to 1 through 6. Set `TEST_SHARDS` to override it. Load does not reduce the
 shard count. Full sharded runs print the load and core count at the start and end, and warn when
-the starting one-minute load exceeds the core count. The starting load divided by the core count
-scales the Vitest test, hook, and teardown timeouts by 1x to 4x. Serial reruns keep the usual timeouts.
+the starting one-minute load exceeds the core count. The higher of the starting one-minute and
+five-minute loads, divided by the core count and clamped to 1x through 4x, scales the Vitest test,
+hook, and teardown timeouts. The timeout banner shows which load was used. Serial reruns keep the
+usual timeouts.
 
 ```sh
 mise exec node@24.22.0 -- npm run test:scripts
