@@ -33,11 +33,11 @@ import { UsageDashboard } from "./usage/dashboard.js";
 import { OrganizationResources } from "./organizations/resources.js";
 import { OutputExecutorRegistry } from "./execution-capabilities/outputs.js";
 import type {
+  ProviderConnectionRegistration,
   ProviderIntegrationRegistration,
   ProviderRegistration,
 } from "./providers/registration.js";
-import { createExecutionAuthority } from "./execution-authority/index.js";
-import type { ExecutionAuthority } from "./execution-authority/index.js";
+import { createExecutionAuthority, type ExecutionAuthority } from "./execution-authority/index.js";
 import {
   BillingForbiddenError,
   type ApplicationRuntime,
@@ -50,14 +50,14 @@ import { TriggerDashboard } from "./triggers/dashboard.js";
 import type { ProviderApplications } from "./provider-applications/index.js";
 import { DaemonProviderCatalog } from "./daemons/provider-catalog.js";
 import { HomeDashboard } from "./home/dashboard.js";
-import type { ProviderConnectionRegistration } from "./providers/registration.js";
 import type { ScriptLimits } from "./workflows/script-limits.js";
 import { runShutdownStage } from "./shutdown-stage.js";
-import type { TriggerHandler } from "./triggers/index.js";
+import type { TriggerSource } from "./triggers/index.js";
 import type { WebhookOptions } from "./webhook-config.js";
 import { GitHubProgressProvider } from "./run-progress/github.js";
 import { readRunProgressSettings, type RunProgressSettings } from "./run-progress/settings.js";
 import { ProgressReporter, type ProgressProvider } from "./run-progress/index.js";
+import type { MessageScope } from "./run-progress/writer.js";
 import { TimelineRetention } from "./run-timeline/retention.js";
 import { RunStream } from "./run-stream/index.js";
 import { reportFailure } from "./failures/index.js";
@@ -133,10 +133,7 @@ async function createOwnedApplicationRuntime(
     connectionsForProject,
     integrations,
   );
-  const outputRegistry = new OutputExecutorRegistry();
-  for (const output of registrations.flatMap((registration) => registration.outputs)) {
-    outputRegistry.register(output);
-  }
+  const outputRegistry = createOutputRegistry(registrations);
 
   const progress = createProgressReporter(options, timelineRuntime.timelineBus, ownership);
   const replyOptions = createRunReplyReporter(options, ownership);
@@ -150,6 +147,45 @@ async function createOwnedApplicationRuntime(
     ...streamOptions,
     ...interactiveSessions?.hubOptions,
     entitlements: options.entitlements,
+    ...hubProviderOptions(registrations, executionAuthority),
+    connectionsForProject,
+    ...hubApplicationSettings(options, outputRegistry),
+  });
+  ownership.own(() => application.hub.stop(), "composition.hub");
+  interactiveSessions?.ownStream(ownership);
+  progress.start();
+  await application.hub.start(registrations.flatMap(triggerSourcesFor));
+
+  startRunPayloadRetention(options, ownership);
+  interactiveSessions?.startRetention(ownership);
+
+  return createApplicationSurface({
+    options,
+    ownership,
+    application,
+    timelineRuntime,
+    runStream,
+    interactiveSessions,
+    registrations,
+    connections,
+  });
+}
+
+function createOutputRegistry(
+  registrations: readonly ProviderRegistration[],
+): OutputExecutorRegistry {
+  const outputRegistry = new OutputExecutorRegistry();
+  for (const output of registrations.flatMap((registration) => registration.outputs)) {
+    outputRegistry.register(output);
+  }
+  return outputRegistry;
+}
+
+function hubProviderOptions(
+  registrations: readonly ProviderRegistration[],
+  executionAuthority: ExecutionAuthority | undefined,
+): Pick<HubRuntimeOptions, "providerFactories" | "executionAuthority" | "attachmentResolvers"> {
+  return {
     providerFactories: registrations.flatMap((registration) => registration.triggerProviders),
     ...(executionAuthority === undefined ? {} : { executionAuthority }),
     attachmentResolvers: Object.fromEntries(
@@ -159,13 +195,20 @@ async function createOwnedApplicationRuntime(
           : [[registration.attachment.provider, registration.attachment.resolve] as const],
       ),
     ),
-    connectionsForProject,
+  };
+}
+
+function hubApplicationSettings(
+  options: ApplicationCompositionOptions,
+  outputRegistry: OutputExecutorRegistry,
+) {
+  return {
     ...(options.auth === null ? {} : { browserOrganizationAccess: options.auth }),
     publicApi:
       options.auth?.publicCredentials === undefined
-        ? { status: "unavailable" }
+        ? { status: "unavailable" as const }
         : {
-            status: "enabled",
+            status: "enabled" as const,
             authenticator: options.auth.publicCredentials,
             webhookKeys: options.auth.apiKeys,
           },
@@ -182,25 +225,33 @@ async function createOwnedApplicationRuntime(
       : { githubNotifications: options.githubNotifications }),
     scriptLimits: options.scriptLimits,
     webhookOptions: options.webhookOptions,
-  });
-  ownership.own(() => application.hub.stop(), "composition.hub");
-  interactiveSessions?.ownStream(ownership);
-  progress.start();
-  await application.hub.start(
-    registrations.flatMap((registration) =>
-      registration.sources.map((source, index) => ({
-        start: (handler: TriggerHandler) => source.start(handler),
-        stop: () =>
-          runShutdownStage(`trigger.provider.${registration.connection.name}.${index}`, () =>
-            source.stop(),
-          ),
-      })),
-    ),
-  );
+  };
+}
 
-  startRunPayloadRetention(options, ownership);
-  interactiveSessions?.startRetention(ownership);
+function triggerSourcesFor(registration: ProviderRegistration): TriggerSource[] {
+  return registration.sources.map((source, index) => ({
+    start: (handler) => source.start(handler),
+    stop: () =>
+      runShutdownStage(`trigger.provider.${registration.connection.name}.${index}`, () =>
+        source.stop(),
+      ),
+  }));
+}
 
+interface ApplicationSurfaceOptions {
+  options: ApplicationCompositionOptions;
+  ownership: CompositionResources;
+  application: HubApplication;
+  timelineRuntime: ReturnType<typeof createRunTimelineRuntime>;
+  runStream: RunStream;
+  interactiveSessions: ReturnType<typeof createInteractiveSessionsRuntime>;
+  registrations: readonly ProviderRegistration[];
+  connections: ReadonlyMap<string, ProviderConnectionRegistration>;
+}
+
+function createApplicationSurface(input: ApplicationSurfaceOptions): ApplicationRuntime {
+  const { options, ownership, application, timelineRuntime } = input;
+  const { runStream, interactiveSessions, registrations, connections } = input;
   const resources = options.database === null ? null : new OrganizationResources(options.database);
   const requests = collectProviderRequests(registrations);
   return {
@@ -235,6 +286,27 @@ async function createOwnedApplicationRuntime(
         : options.auth.handle(request);
     },
     browserAccount: (request) => browserAccount(options, request, interactiveSessions !== null),
+    ...emailAuthHandlers(options),
+    ...accountAuthHandlers(options, resources),
+    ...connectionHandlers(options, connections),
+    webhook: (request) =>
+      requests.get("webhook")?.(request) ??
+      Promise.resolve(new Response("Not Found", { status: 404 })),
+    ...billingReadHandlers(options),
+    ...billingManagementHandlers(options),
+    providerRequest: (name, request) =>
+      requests.get(name)?.(request) ?? Promise.resolve(new Response("Not Found", { status: 404 })),
+    stop: () => ownership.close(),
+  };
+}
+
+function emailAuthHandlers(
+  options: ApplicationCompositionOptions,
+): Pick<
+  ApplicationRuntime,
+  "signInEmail" | "signUpEmail" | "sendVerificationEmail" | "requestPasswordReset" | "resetPassword"
+> {
+  return {
     signInEmail(data, headers) {
       if (options.database === null || options.auth?.signInEmail === undefined) {
         return Promise.reject(new Error("auth unavailable"));
@@ -265,6 +337,17 @@ async function createOwnedApplicationRuntime(
       }
       return options.auth.resetPassword(data, headers);
     },
+  };
+}
+
+function accountAuthHandlers(
+  options: ApplicationCompositionOptions,
+  resources: OrganizationResources | null,
+): Pick<
+  ApplicationRuntime,
+  "claimInstance" | "completeAppOnboarding" | "signOut" | "changePassword" | "organizationResources"
+> {
+  return {
     claimInstance(operator, headers) {
       if (options.database === null || options.auth?.claimInstance === undefined) {
         return Promise.reject(new Error("auth unavailable"));
@@ -295,6 +378,14 @@ async function createOwnedApplicationRuntime(
       }
       return options.auth.resources(request, resources);
     },
+  };
+}
+
+function connectionHandlers(
+  options: ApplicationCompositionOptions,
+  connections: ReadonlyMap<string, ProviderConnectionRegistration>,
+): Pick<ApplicationRuntime, "connectionStatus" | "connectionAction"> {
+  return {
     connectionStatus: async (request) => {
       if (options.database === null || options.auth === null) {
         return Response.json({ error: "database_unavailable" }, { status: 503 });
@@ -328,9 +419,16 @@ async function createOwnedApplicationRuntime(
         Promise.resolve(Response.json({ error: "provider_not_configured" }, { status: 409 }))
       );
     },
-    webhook: (request) =>
-      requests.get("webhook")?.(request) ??
-      Promise.resolve(new Response("Not Found", { status: 404 })),
+  };
+}
+
+function billingReadHandlers(
+  options: ApplicationCompositionOptions,
+): Pick<
+  ApplicationRuntime,
+  "billingWebhook" | "billingPlans" | "billingConfigured" | "billingOverview"
+> {
+  return {
     billingWebhook: (request) =>
       options.billing === null
         ? Promise.resolve(new Response("Not Found", { status: 404 }))
@@ -362,6 +460,13 @@ async function createOwnedApplicationRuntime(
         plans,
       };
     },
+  };
+}
+
+function billingManagementHandlers(
+  options: ApplicationCompositionOptions,
+): Pick<ApplicationRuntime, "billingCheckout" | "billingPortal"> {
+  return {
     billingCheckout: async (request, input: BillingCheckoutInput) => {
       const { billing, database } = requireBilling(options);
       const { account, tenant } = await resolveRouteTenant(
@@ -411,9 +516,6 @@ async function createOwnedApplicationRuntime(
       });
       return { url: portal?.url ?? null };
     },
-    providerRequest: (name, request) =>
-      requests.get(name)?.(request) ?? Promise.resolve(new Response("Not Found", { status: 404 })),
-    stop: () => ownership.close(),
   };
 }
 
@@ -445,16 +547,8 @@ function createProgressReporter(
   const { database, runProgress, progressProviders, publicBaseUrl } = options;
   if (database === null || bus === undefined || runProgress?.progressMessagesEnabled !== true)
     return { hubOptions: {}, start: () => undefined };
-  const registered = (options.registrations ?? []).filter(
-    (registration) => "progressProvider" in registration,
-  );
-  const providers = progressProviders ?? [];
-  const githubFallback =
-    runProgress.githubToken !== undefined || options.githubNotifications !== undefined
-      ? new GitHubProgressProvider({ database, settings: runProgress })
-      : undefined;
-  if (registered.length === 0 && providers.length === 0 && githubFallback === undefined)
-    return { hubOptions: {}, start: () => undefined };
+  const providers = activeProgressProviders(options, database, runProgress, progressProviders);
+  if (providers === undefined) return { hubOptions: {}, start: () => undefined };
 
   const reporter = new ProgressReporter({
     database,
@@ -464,39 +558,9 @@ function createProgressReporter(
       maxEdits: runProgress.maxEdits,
       retentionDays: runProgress.retentionDays,
     },
-    // Provider applications can activate or be replaced after Hub starts.
-    providers: () => {
-      const active = [
-        ...providers,
-        ...registered.flatMap(({ progressProvider }) =>
-          progressProvider === undefined ? [] : [progressProvider],
-        ),
-      ];
-      if (githubFallback !== undefined && !active.some(({ name }) => name === "github"))
-        active.push(githubFallback);
-      return active;
-    },
+    providers,
     publicBaseUrl,
-    reportFailure: (code, scope) =>
-      reportFailure(
-        new Error(code),
-        {
-          operation: "run.progress.reporter",
-          component: "run-progress",
-          ...(scope === undefined ? {} : { organizationId: scope.organizationId }),
-        },
-        {
-          ...(code === "scope_missing" ? { kind: "permissionMissing" } : {}),
-          ...(scope === undefined
-            ? {}
-            : {
-                diagnostic: {
-                  triggerRunId: scope.triggerRunId,
-                  ...(code === "scope_missing" ? { reason: code } : {}),
-                },
-              }),
-        },
-      ),
+    reportFailure: reportProgressFailure,
   });
   return {
     hubOptions: { onProgressRequested: (run) => reporter.request(run) },
@@ -505,6 +569,59 @@ function createProgressReporter(
       reporter.start();
     },
   };
+}
+
+function activeProgressProviders(
+  options: ApplicationCompositionOptions,
+  database: Database,
+  runProgress: RunProgressSettings,
+  progressProviders: ApplicationCompositionOptions["progressProviders"],
+): (() => ProgressProvider[]) | undefined {
+  const registered = (options.registrations ?? []).filter(
+    (registration) => "progressProvider" in registration,
+  );
+  const providers = progressProviders ?? [];
+  const githubFallback =
+    runProgress.githubToken !== undefined || options.githubNotifications !== undefined
+      ? new GitHubProgressProvider({ database, settings: runProgress })
+      : undefined;
+  if (registered.length === 0 && providers.length === 0 && githubFallback === undefined)
+    return undefined;
+
+  // Provider applications can activate or be replaced after Hub starts.
+  return () => {
+    const active = [
+      ...providers,
+      ...registered.flatMap(({ progressProvider }) =>
+        progressProvider === undefined ? [] : [progressProvider],
+      ),
+    ];
+    if (githubFallback !== undefined && !active.some(({ name }) => name === "github"))
+      active.push(githubFallback);
+    return active;
+  };
+}
+
+function reportProgressFailure(code: string, scope?: MessageScope): void {
+  reportFailure(
+    new Error(code),
+    {
+      operation: "run.progress.reporter",
+      component: "run-progress",
+      ...(scope === undefined ? {} : { organizationId: scope.organizationId }),
+    },
+    {
+      ...(code === "scope_missing" ? { kind: "permissionMissing" } : {}),
+      ...(scope === undefined
+        ? {}
+        : {
+            diagnostic: {
+              triggerRunId: scope.triggerRunId,
+              ...(code === "scope_missing" ? { reason: code } : {}),
+            },
+          }),
+    },
+  );
 }
 
 function timelineScrubValues(options: ApplicationCompositionOptions): string[] {
@@ -568,6 +685,48 @@ function createInteractiveSessionsRuntime(
   if (databaseQuery === undefined || entitlements === null) {
     throw new Error("Interactive sessions require a database query handle and entitlements.");
   }
+  const { coordinator, service, stream } = createInteractiveSessionServices({
+    options,
+    connectionForDaemon,
+    settings,
+    database,
+    databaseQuery,
+    auth,
+    entitlements,
+    runPayloadRetention,
+    linearPilot,
+  });
+  return {
+    hubOptions: { interactiveSessions: coordinator },
+    browser: { service, stream },
+    ownStream(ownership: CompositionResources) {
+      if (linearPilot) ownership.own(() => linearPilot.stop(), "composition.linear_pilot");
+      ownership.own(() => stream.beginShutdown(), "composition.interactive_sessions.stream");
+    },
+    startRetention(ownership: CompositionResources) {
+      if (runPayloadRetention === undefined || runPayloadRetention.mode === "off") return;
+      const retention = new SessionMessageRetention(database, databaseQuery, runPayloadRetention);
+      ownership.own(() => retention.stop(), "composition.interactive_sessions.retention");
+      retention.start();
+    },
+  };
+}
+
+interface InteractiveSessionServiceOptions {
+  options: ApplicationCompositionOptions;
+  connectionForDaemon: HubRuntime["connectionForDaemon"];
+  settings: InteractiveSessionSettings;
+  database: Database;
+  databaseQuery: QueryHandle;
+  auth: AuthServer;
+  entitlements: EntitlementsService;
+  runPayloadRetention: ApplicationCompositionOptions["runPayloadRetention"];
+  linearPilot: ApplicationCompositionOptions["linearPilot"];
+}
+
+function createInteractiveSessionServices(input: InteractiveSessionServiceOptions) {
+  const { options, connectionForDaemon, settings } = input;
+  const { database, databaseQuery, auth, entitlements, runPayloadRetention, linearPilot } = input;
   const scrubValues = timelineScrubValues(options);
   const scrub = createTimelineScrubber({ scrubValues });
   const failureFields = (error: unknown) => {
@@ -614,20 +773,7 @@ function createInteractiveSessionsRuntime(
     reportFailure: (error, requestId) =>
       logger.warn({ requestId, ...failureFields(error) }, "interactive session stream failed"),
   });
-  return {
-    hubOptions: { interactiveSessions: coordinator },
-    browser: { service, stream },
-    ownStream(ownership: CompositionResources) {
-      if (linearPilot) ownership.own(() => linearPilot.stop(), "composition.linear_pilot");
-      ownership.own(() => stream.beginShutdown(), "composition.interactive_sessions.stream");
-    },
-    startRetention(ownership: CompositionResources) {
-      if (runPayloadRetention === undefined || runPayloadRetention.mode === "off") return;
-      const retention = new SessionMessageRetention(database, databaseQuery, runPayloadRetention);
-      ownership.own(() => retention.stop(), "composition.interactive_sessions.retention");
-      retention.start();
-    },
-  };
+  return { coordinator, service, stream };
 }
 
 function browserAccount(
@@ -695,32 +841,10 @@ function createRunTimelineRuntime(
   const settings = options.runProgress ?? readRunProgressSettings({});
   const database = options.database;
   if (database === null) return { database };
-  const retention = new TimelineRetention(database, {
-    retentionDays: settings.retentionDays,
-    reportFailure: (error) =>
-      reportFailure(error, {
-        operation: "run.timeline.retention",
-        component: "run-progress",
-      }),
-  });
-  ownership.own(() => retention.stop(), "composition.timeline_retention");
-  retention.start();
+  startTimelineRetention(database, settings, ownership);
   if (!settings.runTimelineEnabled) return { database };
   const scrubValues = timelineScrubValues(options);
-  const report = (error: unknown, operation: string, scope?: TimelineRunScope) => {
-    reportFailure(
-      error,
-      {
-        operation,
-        component: "run-progress",
-        ...(scope === undefined ? {} : { organizationId: scope.organizationId }),
-      },
-      {
-        scrubValues,
-        ...(scope === undefined ? {} : { diagnostic: { triggerRunId: scope.triggerRunId } }),
-      },
-    );
-  };
+  const report = timelineFailureReporter(scrubValues);
   const bus = new RunTimelineBus({
     maxSubscriptions: Math.max(1024, settings.streamMaxTotal),
     reportFailure: (error) => report(error, "run.timeline.notify"),
@@ -767,9 +891,43 @@ function createRunTimelineRuntime(
   };
 }
 
+function startTimelineRetention(
+  database: Database,
+  settings: RunProgressSettings,
+  ownership: CompositionResources,
+): void {
+  const retention = new TimelineRetention(database, {
+    retentionDays: settings.retentionDays,
+    reportFailure: (error) =>
+      reportFailure(error, {
+        operation: "run.timeline.retention",
+        component: "run-progress",
+      }),
+  });
+  ownership.own(() => retention.stop(), "composition.timeline_retention");
+  retention.start();
+}
+
+function timelineFailureReporter(scrubValues: string[]) {
+  return (error: unknown, operation: string, scope?: TimelineRunScope) => {
+    reportFailure(
+      error,
+      {
+        operation,
+        component: "run-progress",
+        ...(scope === undefined ? {} : { organizationId: scope.organizationId }),
+      },
+      {
+        scrubValues,
+        ...(scope === undefined ? {} : { diagnostic: { triggerRunId: scope.triggerRunId } }),
+      },
+    );
+  };
+}
+
 function triggerDashboardFor(
   options: ApplicationCompositionOptions,
-  hub: import("./app.js").HubRuntime,
+  hub: HubRuntime,
   reconciler: RunTimelineReconciler | undefined,
 ): TriggerDashboard | null {
   return options.database === null || options.auth === null || hub.agentValidator === null
@@ -811,7 +969,7 @@ function isConfigured(status: unknown): boolean {
 
 function daemonProviderCatalogFor(
   options: ApplicationCompositionOptions,
-  hub: import("./app.js").HubRuntime,
+  hub: HubRuntime,
 ): DaemonProviderCatalog | null {
   if (options.database === null || options.auth === null) return null;
   return new DaemonProviderCatalog(options.database, options.auth, (daemonId) =>
@@ -848,7 +1006,11 @@ function createConnectionsForProject(
     if (candidates.length !== 1) {
       throw new Error(`connection slug is ambiguous: ${connectionSlug}`);
     }
-    const integration = integrations.get(candidates[0]!.provider);
+    const candidate = candidates[0];
+    if (candidate === undefined) {
+      throw new TypeError("Cannot read properties of undefined (reading 'provider')");
+    }
+    const integration = integrations.get(candidate.provider);
     if (integration === undefined) {
       throw new Error(`connection capability is unavailable: ${connectionSlug}`);
     }
