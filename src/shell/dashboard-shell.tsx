@@ -99,11 +99,7 @@ function useDashboardAccountActions() {
   const create = useMutation({
     mutationKey: ACCOUNT_MUTATION_KEY,
     mutationFn: createOrganizationCommand,
-    onSuccess: (result) => {
-      if (result.status === "ok" && result.data.organizationSlug !== undefined) {
-        window.location.assign(`/o/${result.data.organizationSlug}/home`);
-      }
-    },
+    onSuccess: openCreatedOrganization,
   });
   const select = useMutation({
     mutationKey: ACCOUNT_MUTATION_KEY,
@@ -193,7 +189,13 @@ function DashboardContent({
   );
 }
 
-function useAccountCommand<TInput, TResult extends Result<unknown>>(
+function openCreatedOrganization(result: CreateOrganizationCommandResult) {
+  if (result.status !== "ok" || result.data.state !== "complete") return;
+  const { organizationSlug } = result.data;
+  if (organizationSlug !== undefined) window.location.assign(`/o/${organizationSlug}/home`);
+}
+
+function useAccountCommand<TInput, TResult extends Result<{ state?: string }>>(
   command: (input: TInput) => Promise<TResult>,
   { signsOut = false }: { signsOut?: boolean } = {},
 ): (input: TInput) => Promise<TResult> {
@@ -202,7 +204,7 @@ function useAccountCommand<TInput, TResult extends Result<unknown>>(
     async (input: TInput) => {
       const result = await command(input);
       if (result.status !== "ok") return result;
-      if (signsOut) leaveReader(queryClient);
+      if (signsOut || result.data.state === "sessionExpired") leaveReader(queryClient);
       else await queryClient.invalidateQueries({ queryKey: ["account"] });
       return result;
     },
