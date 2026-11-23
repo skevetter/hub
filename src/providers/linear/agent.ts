@@ -88,7 +88,6 @@ const activityInput = z.strictObject({
   content: activityContentSchema,
   ephemeral: z.boolean().optional(),
   signal: continueSignal,
-  publicBody: z.literal(true).optional(),
 });
 const readbackInput = z.strictObject({
   sessionId: id,
@@ -132,7 +131,6 @@ const errorMessages = {
 export interface LinearAgentErrorDetails {
   linearErrorType?: string;
   linearErrorKinds?: readonly string[];
-  linearErrorText?: string;
 }
 
 export class LinearAgentError extends Error {
@@ -186,7 +184,6 @@ type Send = <T>(
   query: string,
   variables: Record<string, unknown>,
   data: z.ZodType<T>,
-  diagnostics?: DiagnosticInputs,
 ) => Promise<T>;
 
 const delegationOriginQuery = `query PaseoPilotDelegationOrigin($sessionId: String!) {
@@ -330,7 +327,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         const refreshed = await providerRequest(
           () => options.connectionClient.refresh(refreshToken, signal),
           signal,
-          options.pilotOperations ? { connections: [initial, current] } : undefined,
+          options.pilotOperations,
         );
         // A successful refresh can rotate the token even when a caller cancels.
         await update(refreshed);
@@ -358,7 +355,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
       }
     }
 
-    const send: Send = async (query, variables, schema, diagnostics = { variables }) => {
+    const send: Send = async (query, variables, schema) => {
       await checkCurrent();
       const serialized = JSON.stringify(variables);
       checkPayloadCredentials(serialized, initial);
@@ -374,9 +371,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
             now,
           ),
         signal,
-        options.pilotOperations
-          ? { connections: [initial, connection], ...diagnostics }
-          : undefined,
+        options.pilotOperations,
       );
       checkSignal();
       return parse(
@@ -440,7 +435,6 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
         content,
         ephemeral,
         signal: expectedSignal,
-        publicBody,
       } = parse(activityInput, input, "invalid_input");
       if (ephemeral === true && content.type !== "thought" && content.type !== "action") {
         throw new LinearAgentError("invalid_input");
@@ -457,7 +451,6 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
           ...(expectedSignal ? { signal: expectedSignal } : {}),
         },
       };
-      const { type: _type, ...activityText } = content;
       const operation = { kind: "createActivity", sessionId } as const;
       return run(operation, variables, signal, async (send, viewer) => {
         const { agentActivityCreate: result } = await send(
@@ -466,10 +459,6 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
           }`,
           variables,
           createResult,
-          {
-            variables: { sessionId, activityId: expectedId, ...activityText },
-            omitErrorText: publicBody !== true,
-          },
         );
         requireMutation(
           result.success &&
@@ -766,15 +755,6 @@ function safeDisplayName({
     );
 }
 
-interface DiagnosticInputs {
-  variables?: Record<string, unknown>;
-  omitErrorText?: boolean;
-}
-
-interface ProviderDiagnostics extends DiagnosticInputs {
-  connections: readonly LinearConnectionRecord[];
-}
-
 function activityReadbackQuery(includeSignal: boolean) {
   return `query PaseoAgentActivityReadback($sessionId: String!, $activityId: ID!) {
               agentSession(id: $sessionId) {
@@ -797,44 +777,40 @@ function activityReadbackQuery(includeSignal: boolean) {
             }`;
 }
 
-function safeProviderDetails(
-  error: LinearApiError,
-  { connections, variables, omitErrorText }: ProviderDiagnostics,
-): LinearAgentErrorDetails {
-  const values = connections.flatMap(({ accessToken, refreshToken }) =>
-    refreshToken === null ? [accessToken] : [accessToken, refreshToken],
-  );
-  // GraphQL errors can echo input values, including activity content.
-  JSON.stringify(variables, (_key, value: unknown) => {
-    if (typeof value === "string") values.push(value);
-    return value;
-  });
-  const scrubValues = [
-    ...new Set(
-      values.filter(Boolean).flatMap((value) => [value, JSON.stringify(value).slice(1, -1)]),
-    ),
-  ].sort((left, right) => right.length - left.length);
-  const clean = (text: string) => {
-    for (const value of scrubValues) text = text.replaceAll(value, "[Redacted]");
-    return text
-      .replace(/[\p{Cc}\p{Cf}\s]+/gu, " ")
-      .trim()
-      .slice(0, 300);
-  };
-  const cleanKind = (kind: string) => (/^[A-Za-z_ ]{1,64}$/u.test(kind) ? kind : clean(kind));
+const knownErrorTypes: ReadonlySet<string> = new Set([
+  "authentication",
+  "forbidden",
+  "ratelimited",
+  "invalid input",
+  "not found",
+  "internal",
+]);
+const knownErrorCodes: ReadonlySet<string> = new Set([
+  "AUTHENTICATION_ERROR",
+  "UNAUTHENTICATED",
+  "FORBIDDEN",
+  "RATELIMITED",
+  "BAD_USER_INPUT",
+  "NOT_FOUND",
+  "INTERNAL_SERVER_ERROR",
+]);
+
+function safeProviderDetails(error: LinearApiError): LinearAgentErrorDetails {
+  const { graphqlErrorType, graphqlCodes } = error;
   return {
-    ...(error.graphqlErrorType === undefined
+    ...(graphqlErrorType === undefined
       ? {}
-      : { linearErrorType: cleanKind(error.graphqlErrorType) }),
-    linearErrorKinds: error.graphqlCodes.map(cleanKind),
-    ...(omitErrorText ? {} : { linearErrorText: clean(error.message) }),
+      : { linearErrorType: knownErrorTypes.has(graphqlErrorType) ? graphqlErrorType : "other" }),
+    linearErrorKinds: [
+      ...new Set(graphqlCodes.map((code) => (knownErrorCodes.has(code) ? code : "other"))),
+    ],
   };
 }
 
 async function providerRequest<T>(
   request: () => Promise<T>,
   signal: AbortSignal,
-  diagnostics?: ProviderDiagnostics,
+  pilotOperations?: true,
 ): Promise<T> {
   try {
     return await request();
@@ -847,7 +823,7 @@ async function providerRequest<T>(
     throw new LinearAgentError(
       "request_failed",
       error.status,
-      diagnostics && safeProviderDetails(error, diagnostics),
+      pilotOperations ? safeProviderDetails(error) : undefined,
     );
   }
 }

@@ -257,9 +257,8 @@ function refusalDetails(scenario: RefusalScenario) {
   if (scenario === "delegation-oversized") return { reason: "oversized" };
   return {
     reason: "origin_unproven",
-    linearErrorText: "Linear GraphQL Origin read unavailable",
-    linearErrorType: "unavailable",
-    linearErrorKinds: ["UNAVAILABLE"],
+    linearErrorType: "other",
+    linearErrorKinds: ["other"],
   };
 }
 

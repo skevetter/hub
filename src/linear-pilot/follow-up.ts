@@ -117,12 +117,15 @@ export interface PilotFailure extends LinearAgentErrorDetails {
 export function pilotExceptionFields(
   error: unknown,
 ): Pick<PilotFailure, "failureCode" | "httpStatus"> & LinearAgentErrorDetails {
+  const { linearErrorType, linearErrorKinds } =
+    (error instanceof LinearAgentError ? error.details : undefined) ?? {};
   return {
     failureCode: pilotExceptionCode(error),
     ...(error instanceof LinearAgentError && error.status !== undefined
       ? { httpStatus: error.status }
       : {}),
-    ...(error instanceof LinearAgentError ? error.details : undefined),
+    ...(linearErrorType === undefined ? {} : { linearErrorType }),
+    ...(linearErrorKinds === undefined ? {} : { linearErrorKinds }),
   };
 }
 
@@ -218,11 +221,15 @@ function reportFollowUpException(
   operation: FollowUpOperation,
   error: unknown,
 ) {
-  options.reportFailure?.({
-    sessionId: scope.nativeSessionId,
-    operation,
-    ...pilotExceptionFields(error),
-  });
+  try {
+    options.reportFailure?.({
+      sessionId: scope.nativeSessionId,
+      operation,
+      ...pilotExceptionFields(error),
+    });
+  } catch {
+    // Reporting must not turn an uncertain dispatch into a pre-dispatch refusal.
+  }
 }
 
 async function runFollowUp(
@@ -283,7 +290,12 @@ async function runClaimedPrompt(
   body: string | null,
 ) {
   const result = await claimedPromptResult(options, admission, body);
-  if (result.outcome === "started" || result.outcome === "busy") return result;
+  if (
+    admission.turn.state === "busy" ||
+    result.outcome === "started" ||
+    result.reason === "dispatch_unconfirmed"
+  )
+    return result;
   try {
     await options.appendRefusal(admission);
   } catch (error) {
@@ -347,8 +359,13 @@ async function dispatchFresh(options: PilotFollowUpOptions, admission: Admission
     fresh.generation !== admission.turn.generation + 1
   )
     return followUpResult("unconfirmed", "reservation_unconfirmed");
-  const outcome = await fresh.dispatchInitial(prompt);
-  return followUpResult(outcome, outcome === "started" ? "started" : "dispatch_unconfirmed");
+  try {
+    const outcome = await fresh.dispatchInitial(prompt);
+    return followUpResult(outcome, outcome === "started" ? "started" : "dispatch_unconfirmed");
+  } catch (error) {
+    reportFollowUpException(options, admission.scope, "prompted", error);
+    return followUpResult("unconfirmed", "dispatch_unconfirmed");
+  }
 }
 
 function sameConversation(

@@ -28,7 +28,6 @@ interface CreatedContext {
   database: QueryHandle;
   deadline: number;
   accepting(): boolean;
-  scrubValues: readonly string[] | undefined;
 }
 
 export function createdMetadata(nativeSessionId: string) {
@@ -145,12 +144,7 @@ async function readDelegation(
     client.readDelegationOrigin(scope, signal),
   ).catch(failedReadback);
   if ("historyEntryId" in proof) return finishDelegation(context, receipt, activity, proof);
-  logPilotRefusal(
-    proof.reason,
-    metadata,
-    "details" in proof ? proof.details : undefined,
-    context.scrubValues,
-  );
+  logPilotRefusal(proof.reason, metadata, "details" in proof ? proof.details : undefined);
   return refuseDelegation(context, activity, { ...receipt, refusal: proof.reason });
 }
 
@@ -200,8 +194,7 @@ async function publishDelegationRefusal(
   const metadata = createdMetadata(activity.nativeSessionId);
   const client = tracePilotActivities(
     delegationClient(context, activity, true),
-    (operation, error) =>
-      logPilotRefusal(operation, metadata, failedReadback(error).details, context.scrubValues),
+    (operation, error) => logPilotRefusal(operation, metadata, failedReadback(error).details),
   );
   await createLinearPilotActivities({ clientFor: () => client }).refuseDelegation(activity);
   return undefined;

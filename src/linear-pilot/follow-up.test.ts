@@ -184,23 +184,45 @@ describe("Linear pilot follow-up admission", () => {
     ]);
   });
 
-  it("never starts when reservation or dispatch cannot be proven", async () => {
+  it("refuses once without sending when reservation fails", async () => {
     const f = fixture();
-    f.options.reserve
-      .mockResolvedValueOnce(undefined)
-      .mockRejectedValueOnce(new Error("write result lost"))
-      .mockResolvedValueOnce({
-        hubSessionId: f.turn.hubSessionId,
-        generation: 2,
-        dispatchInitial: f.dispatchInitial,
-      });
+    f.options.reserve.mockResolvedValueOnce(undefined);
+    f.options.claim.mockResolvedValueOnce("claimed").mockResolvedValue("duplicate");
     expect(await f.handle(scope, delivered)).toBe("unconfirmed");
-    expect(await f.handle(scope, delivered)).toBe("unconfirmed");
+    expect(await f.handle(scope, delivered)).toBe("duplicate");
+    expect(f.options.appendRefusal).toHaveBeenCalledOnce();
+    expect(f.dispatchInitial).not.toHaveBeenCalled();
+    expect(f.options.reportOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: "unconfirmed", reason: "reservation_unconfirmed" }),
+    );
+  });
+
+  it.each(["unconfirmed", "exception"])(
+    "does not refuse an attempted dispatch: %s",
+    async (result) => {
+      const f = fixture();
+      if (result === "exception")
+        f.dispatchInitial.mockRejectedValueOnce(new Error("send result lost"));
+      else f.dispatchInitial.mockResolvedValueOnce("unconfirmed");
+      expect(await f.handle(scope, delivered)).toBe("unconfirmed");
+      expect(f.dispatchInitial).toHaveBeenCalledOnce();
+      expect(f.options.appendRefusal).not.toHaveBeenCalled();
+      expect(f.options.reportOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: "unconfirmed", reason: "dispatch_unconfirmed" }),
+      );
+    },
+  );
+
+  it("refuses an invalid reservation without dispatching it", async () => {
+    const f = fixture();
+    f.options.reserve.mockResolvedValueOnce({
+      hubSessionId: f.turn.hubSessionId,
+      generation: 2,
+      dispatchInitial: f.dispatchInitial,
+    });
     expect(await f.handle(scope, delivered)).toBe("unconfirmed");
     expect(f.dispatchInitial).not.toHaveBeenCalled();
-    f.dispatchInitial.mockRejectedValueOnce(new Error("send result lost"));
-    expect(await f.handle(scope, delivered)).toBe("unconfirmed");
-    expect(f.dispatchInitial).toHaveBeenCalledOnce();
+    expect(f.options.appendRefusal).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -210,7 +232,6 @@ describe("Linear pilot follow-up admission", () => {
       error: new LinearAgentError("request_failed", 200, {
         linearErrorType: "invalid input",
         linearErrorKinds: ["BAD_USER_INPUT"],
-        linearErrorText: "Linear GraphQL invalid activity ID",
       }),
       code: "request_failed",
       status: 200,
@@ -229,6 +250,8 @@ describe("Linear pilot follow-up admission", () => {
     const handle = createPilotFollowUp({ ...f.options, reportFailure });
 
     expect(await handle(scope, delivered)).toBe("unconfirmed");
+    expect(f.options.appendRefusal).toHaveBeenCalledOnce();
+    expect(f.dispatchInitial).not.toHaveBeenCalled();
     const details = error instanceof LinearAgentError ? error.details : undefined;
     expect(reportFailure).toHaveBeenCalledExactlyOnceWith({
       sessionId: scope.nativeSessionId,

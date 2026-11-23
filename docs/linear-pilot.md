@@ -36,8 +36,9 @@ session was created and that Paseo is still the delegate or assignee. Changes
 from bots and automatic triage do not qualify.
 Linear returns history newest first with `first`. Hub reads 20 entries and
 refuses the start if more than 20 changes between delegation and readback
-push the matching entry outside that page. Each history entry can start at
-most one session.
+push the matching entry outside that page. Once Hub claims a history entry,
+it stays consumed even if the start later fails. To recover, delegate again
+to create a new history entry, or explicitly mention `@paseo` in a comment.
 
 The first prompt is `Work on <identifier>: <title>`, a blank line, and the issue
 description. Other members or integrations may have written that text.
@@ -168,6 +169,9 @@ agent and supplies bounded, sanitized history from the conversation. Linear
 is the source for rebuilding the conversation. Hub keeps reconstructed history
 in memory for dispatch. The daemon records the submitted prompt in its own
 timeline and can include it in trace logs.
+
+If Hub cannot confirm whether it dispatched a follow-up, it posts no error
+to Linear. The agent may already be running.
 
 While a turn is running, Hub replies `Still working on the previous message;
 reply when I have answered.` The reply starts no new agent. A pending permission

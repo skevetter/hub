@@ -1,4 +1,4 @@
-import { logger, redact } from "../logger.js";
+import { logger } from "../logger.js";
 import type { LinearAgentErrorDetails } from "../providers/linear/agent.js";
 import { surfaceUuid } from "../surfaces/store.js";
 
@@ -31,19 +31,15 @@ export function logPilotRefusal(
   reason: string,
   metadata: DeliveryMetadata,
   diagnostics?: LinearAgentErrorDetails,
-  scrubValues?: readonly string[],
 ): undefined {
-  const { linearErrorType, linearErrorKinds, linearErrorText } = diagnostics ?? {};
-  const details = redact(
+  const { linearErrorType, linearErrorKinds } = diagnostics ?? {};
+  logger.info(
     {
+      ...metadata,
+      reason,
       ...(linearErrorType === undefined ? {} : { linearErrorType }),
       ...(linearErrorKinds === undefined ? {} : { linearErrorKinds }),
-      ...(linearErrorText === undefined ? {} : { linearErrorText }),
     },
-    scrubValues ? { scrubValues } : {},
-  );
-  logger.info(
-    { ...metadata, reason, ...(typeof details === "object" ? details : {}) },
     "Linear pilot refused delivery",
   );
   return undefined;

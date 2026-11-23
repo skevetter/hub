@@ -27,6 +27,7 @@ import {
   pilotExceptionFields,
   type PilotConversation,
   type PilotFailure,
+  type PilotFollowUpOptions,
   type PilotTurn,
 } from "./follow-up.js";
 import type { PilotHistoryScope } from "./history-read.js";
@@ -189,7 +190,168 @@ interface CreatedDependencies {
   accepting: () => boolean;
 }
 
-function logRuntimeFailure(failure: PilotFailure, scrubValues: Options["scrubValues"]) {
+interface FollowUpActions {
+  scope: CreatedScope;
+  installation: Qualified["installation"];
+  provider: Provider;
+  sessions: InteractiveSessionCoordinator;
+  bindings: Pick<PilotBindings, "advance">;
+  active: Map<string, Active>;
+  pending: PendingStarts;
+  accepting(): boolean;
+  activity(kind: "prompted" | "stop", interactionId: string): LinearPilotAcceptedEvent;
+  writerFor: CreatedDependencies["writerFor"];
+  report: (failureCode: PilotFailure["failureCode"]) => void;
+}
+
+async function retireFollowUp(
+  actions: FollowUpActions,
+  { binding, session, grant }: BoundLiveSession,
+  agentId: string,
+) {
+  const { active, sessions, scope } = actions;
+  active.set(session.id, grant);
+  try {
+    return await sessions.retireLinearPilotTurn(scope.principal, {
+      organizationId: session.organizationId,
+      sessionId: session.id,
+      commandId: grant.commandId,
+      profileId: session.profileId,
+      workspaceId: scope.authority.workspaceId,
+      generation: session.generation,
+      hubTurn: session.turn,
+      agentId,
+      expectedBindingGeneration: binding.generation,
+    });
+  } finally {
+    active.delete(session.id);
+  }
+}
+
+async function reserveFollowUp(
+  actions: FollowUpActions,
+  prior: BoundLiveSession | undefined,
+  activityId: string,
+) {
+  if (!prior || !actions.accepting()) return undefined;
+  const { daemonAgentId, requesterIdentityId } = prior.session;
+  const { pending, report, installation } = actions;
+  if (!daemonAgentId || !requesterIdentityId || pending.has(activityId)) return undefined;
+  if (!(await retireFollowUp(actions, prior, daemonAgentId))) {
+    report("retirement_refused");
+    return undefined;
+  }
+  pending.set(activityId, { installation, identityId: requesterIdentityId });
+  try {
+    return await reserveFreshFollowUp(actions, prior, activityId, {
+      daemonAgentId,
+      requesterIdentityId,
+    });
+  } finally {
+    pending.delete(activityId);
+  }
+}
+
+async function reserveFreshFollowUp(
+  actions: FollowUpActions,
+  { binding, session, grant }: BoundLiveSession,
+  activityId: string,
+  { daemonAgentId, requesterIdentityId }: { daemonAgentId: string; requesterIdentityId: string },
+) {
+  const {
+    scope: { authority, origin, principal },
+    active,
+    sessions,
+    report,
+  } = actions;
+  const start = await sessions.reserveLinearPilotFreshStart(principal, {
+    profileId: session.profileId,
+    profileVersion: session.profileVersion,
+    idempotencyKey: activityId,
+    nativeRequester: { identityId: requesterIdentityId, workspaceId: authority.workspaceId },
+  });
+  if (start.outcome === "refused") {
+    report(start.code);
+    return undefined;
+  }
+  if (start.replayed) return undefined;
+  const switched = await actions.bindings.advance(authority, {
+    ...origin,
+    nextSessionId: start.sessionId,
+    now: new Date(),
+    expected: {
+      bindingId: binding.id,
+      generation: binding.generation,
+      sessionId: binding.sessionId,
+      sessionGeneration: session.generation,
+      turn: session.turn,
+      agentId: daemonAgentId,
+      firstCommandId: grant.commandId,
+    },
+  });
+  if (switched.status === "refused") report(switched.reason);
+  if (switched.status !== "advanced") return undefined;
+  active.set(start.sessionId, {
+    authority,
+    origin,
+    provider: actions.provider,
+    activity: actions.activity("prompted", activityId),
+    sessionId: start.sessionId,
+    commandId: start.commandId,
+    bindingGeneration: switched.binding.generation,
+    profileVersion: session.profileVersion,
+  });
+  return {
+    hubSessionId: start.sessionId,
+    generation: switched.binding.generation,
+    dispatchInitial: (message: string) =>
+      dispatchReservedFollowUp(actions, start.sessionId, () => start.dispatch(message)),
+  };
+}
+
+async function dispatchReservedFollowUp(
+  { active, report }: FollowUpActions,
+  sessionId: string,
+  dispatch: () => Promise<"started" | "unconfirmed">,
+) {
+  const outcome = await dispatch();
+  if (outcome !== "started") {
+    active.delete(sessionId);
+    report(outcome);
+  }
+  return outcome;
+}
+
+async function stopFollowUpTurn(
+  actions: FollowUpActions,
+  prior: BoundLiveSession | undefined,
+  { turn, requestedAt }: Parameters<PilotFollowUpOptions["stopCurrent"]>[0],
+) {
+  if (!prior || !turn.agentId || !turn.daemonTurnId || !actions.accepting()) return "ignored";
+  const { session, grant } = prior;
+  grant.stopping = true;
+  try {
+    const stopped = await actions.sessions.stopLinearPilot({
+      organizationId: session.organizationId,
+      sessionId: session.id,
+      commandId: grant.commandId,
+      expectedAgentId: turn.agentId,
+      expectedDaemonTurnId: turn.daemonTurnId,
+      expectedBindingGeneration: turn.generation,
+      requestedAt,
+    });
+    const activity = actions.activity("stop", session.startIdempotencyKey);
+    const confirmed = stopped.status === "stopped";
+    await actions
+      .writerFor(grant)
+      .stop(activity, "first-attempt", confirmed ? "confirmed" : "unconfirmed");
+    return confirmed ? "stopped" : "unconfirmed";
+  } finally {
+    actions.active.delete(session.id);
+  }
+}
+
+function logRuntimeFailure(failure: PilotFailure) {
   const { sessionId, failureCode, operation } = failure;
   const action = operation === "stop" ? "prompted" : operation;
   logPilotRefusal(
@@ -199,7 +361,6 @@ function logRuntimeFailure(failure: PilotFailure, scrubValues: Options["scrubVal
       ...(action === "created" || action === "prompted" ? { action } : {}),
     },
     failure,
-    scrubValues,
   );
 }
 
@@ -298,7 +459,7 @@ export function createLinearPilotRuntime(options: Options) {
   let accepting = true;
 
   function reportFailure(failure: PilotFailure): void {
-    logRuntimeFailure(failure, options.scrubValues);
+    logRuntimeFailure(failure);
     try {
       options.reportFailure?.(failure);
     } catch {}
@@ -363,7 +524,6 @@ export function createLinearPilotRuntime(options: Options) {
       database: runtime,
       deadline: receivedAt.getTime() + PILOT_ACK_MS,
       accepting: () => accepting,
-      scrubValues: options.scrubValues,
     };
     const activity = acceptedActivity(qualified, "created", nativeSessionId, receivedAt);
 
@@ -500,7 +660,8 @@ export function createLinearPilotRuntime(options: Options) {
         outcome: "ignored",
         reason: "invalid_event",
       });
-    const { authority, origin, principal } = eventScope(qualified);
+    const eventContext = eventScope(qualified);
+    const { authority, origin } = eventContext;
     const scope = followUpScope(qualified, config.allowedHumanId);
     const history: PilotHistoryScope = {
       sessionId: origin.nativeSessionId,
@@ -511,6 +672,19 @@ export function createLinearPilotRuntime(options: Options) {
     let current: BoundLiveSession | undefined;
     const report = (failureCode: PilotFailure["failureCode"]) =>
       reportFailure({ sessionId: origin.nativeSessionId, failureCode, operation: kind });
+    const actions: FollowUpActions = {
+      scope: eventContext,
+      installation,
+      provider,
+      sessions,
+      bindings,
+      active,
+      pending,
+      accepting: () => accepting,
+      activity: (activityKind, id) => acceptedActivity(qualified, activityKind, id, receivedAt),
+      writerFor,
+      report,
+    };
     const run = createPilotFollowUp({
       withSession: (_scope, operation) => withSession(authority, origin, operation),
       activityIds: pilotActivityIds,
@@ -562,119 +736,8 @@ export function createLinearPilotRuntime(options: Options) {
       readHistory: async (_scope, anchor) =>
         current && clientFor(current.grant).readPilotHistory(history, anchor.createdAt),
       secrets: async () => options.scrubValues ?? [],
-      reserve: async ({ activityId }) => {
-        const prior = current;
-        if (!prior || !accepting) return undefined;
-        const { binding, session, grant } = prior;
-        const { daemonAgentId, requesterIdentityId } = session;
-        if (!daemonAgentId || !requesterIdentityId || pending.has(activityId)) return undefined;
-        active.set(session.id, grant);
-        try {
-          const retired = await sessions.retireLinearPilotTurn(principal, {
-            organizationId: session.organizationId,
-            sessionId: session.id,
-            commandId: grant.commandId,
-            profileId: session.profileId,
-            workspaceId: scope.workspaceId,
-            generation: session.generation,
-            hubTurn: session.turn,
-            agentId: daemonAgentId,
-            expectedBindingGeneration: binding.generation,
-          });
-          if (!retired) {
-            report("retirement_refused");
-            return undefined;
-          }
-        } finally {
-          active.delete(session.id);
-        }
-        pending.set(activityId, { installation, identityId: requesterIdentityId });
-        try {
-          const start = await sessions.reserveLinearPilotFreshStart(principal, {
-            profileId: session.profileId,
-            profileVersion: session.profileVersion,
-            idempotencyKey: activityId,
-            nativeRequester: { identityId: requesterIdentityId, workspaceId: scope.workspaceId },
-          });
-          if (start.outcome === "refused") {
-            report(start.code);
-            return undefined;
-          }
-          if (start.replayed) return undefined;
-          const switched = await bindings.advance(authority, {
-            ...origin,
-            nextSessionId: start.sessionId,
-            now: new Date(),
-            expected: {
-              bindingId: binding.id,
-              generation: binding.generation,
-              sessionId: binding.sessionId,
-              sessionGeneration: session.generation,
-              turn: session.turn,
-              agentId: daemonAgentId,
-              firstCommandId: grant.commandId,
-            },
-          });
-          if (switched.status === "refused") report(switched.reason);
-          if (switched.status !== "advanced") return undefined;
-          active.set(start.sessionId, {
-            authority,
-            origin,
-            provider,
-            activity: acceptedActivity(qualified, "prompted", activityId, receivedAt),
-            sessionId: start.sessionId,
-            commandId: start.commandId,
-            bindingGeneration: switched.binding.generation,
-            profileVersion: session.profileVersion,
-          });
-          return {
-            hubSessionId: start.sessionId,
-            generation: switched.binding.generation,
-            dispatchInitial: async (message) => {
-              const outcome = await start.dispatch(message);
-              if (outcome !== "started") {
-                active.delete(start.sessionId);
-                report(outcome);
-              }
-              return outcome;
-            },
-          };
-        } finally {
-          pending.delete(activityId);
-        }
-      },
-      stopCurrent: async ({ turn, requestedAt }) => {
-        const prior = current;
-        if (!prior || !turn.agentId || !turn.daemonTurnId || !accepting) return "ignored";
-        const { session, grant } = prior;
-        grant.stopping = true;
-        try {
-          const stopped = await sessions.stopLinearPilot({
-            organizationId: session.organizationId,
-            sessionId: session.id,
-            commandId: grant.commandId,
-            expectedAgentId: turn.agentId,
-            expectedDaemonTurnId: turn.daemonTurnId,
-            expectedBindingGeneration: turn.generation,
-            requestedAt,
-          });
-          const activity = acceptedActivity(
-            qualified,
-            "stop",
-            session.startIdempotencyKey,
-            receivedAt,
-          );
-          const confirmed = stopped.status === "stopped";
-          await writerFor(grant).stop(
-            activity,
-            "first-attempt",
-            confirmed ? "confirmed" : "unconfirmed",
-          );
-          return confirmed ? "stopped" : "unconfirmed";
-        } finally {
-          active.delete(session.id);
-        }
-      },
+      reserve: ({ activityId }) => reserveFollowUp(actions, current, activityId),
+      stopCurrent: (request) => stopFollowUpTurn(actions, current, request),
     });
     await run(scope, signed);
   }

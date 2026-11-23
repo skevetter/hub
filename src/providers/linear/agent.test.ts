@@ -105,7 +105,7 @@ it("GraphQL errors or success false never acknowledge delivery", async () => {
   }
 });
 
-it("pilot ACK failures preserve public fields and scrub IDs and credentials from bounded text", async () => {
+it("pilot ACK failures keep only known provider labels even after credential rotation", async () => {
   const body = "Paseo Hub received your request.";
   const refreshToken = 'fake-"refresh';
   const fixture = linearAgentFixture((_operation, { variables }) => {
@@ -145,78 +145,48 @@ it("pilot ACK failures preserve public fields and scrub IDs and credentials from
       ...activity,
       content: { type: "thought", body },
       ephemeral: false,
-      publicBody: true,
     }),
     (error: unknown) => {
       assert.ok(error instanceof LinearAgentError);
       assert.equal(error.code, "request_failed");
       assert.equal(error.status, 200);
       assert.equal(error.message, "Linear agent provider request failed");
-      const prefix = `Linear GraphQL thought activities for [Redacted]: ${"[Redacted] ".repeat(5)}"[Redacted]" `;
       assert.deepEqual(error.details, {
         linearErrorType: "invalid input",
-        linearErrorKinds: ["BAD_USER_INPUT", "OTHER"],
-        linearErrorText: `${prefix}${"x".repeat(300 - prefix.length)}`,
+        linearErrorKinds: ["BAD_USER_INPUT", "other"],
       });
       return true;
     },
   );
 });
 
-it("pilot errors log no provider text when a response contains a private answer", async () => {
+it("pilot logs do not expose private provider messages, types or codes", async () => {
   const fixture = linearAgentFixture(() => ({
     errors: [
       {
-        message: "Invalid response: private answer fragment appears on a single line",
-        extensions: { type: "invalid input", code: "bad_user_input" },
+        message: "private message canary",
+        extensions: { type: "private type canary", code: "private code canary" },
       },
+      { message: "second private message", extensions: { code: "another private code" } },
     ],
   }));
-  const pilot = createLinearAgentClient({
-    ...fixture.options,
-    binding: linearAgentBinding(fixture.a),
-    pilotOperations: true,
-  });
   const records: string[] = [];
   const logger = createLogger({ write: (record) => records.push(record) });
-  await assert.rejects(
-    pilot.createActivity({
-      ...activity,
-      content: { type: "response", body: "The private answer\nfragment appears here." },
-    }),
-    (error: unknown) => {
-      assert.ok(error instanceof LinearAgentError);
-      assert.deepEqual(error.details, {
-        linearErrorType: "invalid input",
-        linearErrorKinds: ["BAD_USER_INPUT"],
-      });
-      logger.warn(pilotExceptionFields(error), "Linear pilot delivery failed");
-      return true;
-    },
-  );
+  await assert.rejects(pilotClient(fixture).createActivity(activity), (error: unknown) => {
+    assert.ok(error instanceof LinearAgentError);
+    assert.deepEqual(error.details, { linearErrorType: "other", linearErrorKinds: ["other"] });
+    logger.warn(pilotExceptionFields(error), "Linear pilot delivery failed");
+    return true;
+  });
   assert.equal(records.length, 1);
-  assert.match(records[0]!, /"linearErrorType":"invalid input"/u);
-  assert.match(records[0]!, /"linearErrorKinds":\["BAD_USER_INPUT"\]/u);
-  assert.doesNotMatch(records[0]!, /linearErrorText|private answer fragment/u);
-});
-
-it("allows diagnostic enums even when they contain a private input value", async () => {
-  const fixture = linearAgentFixture(() => ({
-    errors: [{ message: "input", extensions: { type: "invalid input", code: "input_rejected" } }],
-  }));
-  for (const body of ["input", "INPUT"]) {
-    await assert.rejects(
-      pilotClient(fixture).createActivity({ ...activity, content: { type: "response", body } }),
-      {
-        details: { linearErrorType: "invalid input", linearErrorKinds: ["INPUT_REJECTED"] },
-      },
-    );
-  }
+  assert.match(records[0]!, /"linearErrorType":"other"/u);
+  assert.match(records[0]!, /"linearErrorKinds":\["other"\]/u);
+  assert.doesNotMatch(records[0]!, /linearErrorText|private/iu);
 });
 
 it("traces the provider type when an activity readback fails closed", async () => {
   const fixture = linearAgentFixture(() => ({
-    errors: [{ message: "Read unavailable", extensions: { type: "unavailable" } }],
+    errors: [{ message: "Read unavailable", extensions: { type: "internal" } }],
   }));
   const records: string[] = [];
   const logger = createLogger({ write: (record) => records.push(record) });
@@ -226,16 +196,16 @@ it("traces the provider type when an activity readback fails closed", async () =
   assert.equal(await traced.isActivityConfirmed({ sessionId, activityId, kind: "thought" }), false);
   assert.equal(records.length, 1);
   assert.match(records[0]!, /"operation":"readActivity"/u);
-  assert.match(records[0]!, /"linearErrorType":"unavailable"/u);
+  assert.match(records[0]!, /"linearErrorType":"internal"/u);
 });
 
-it("pilot requests without a body keep the selected error type and text with all codes", async () => {
+it("pilot requests without a body classify the selected error type and known codes", async () => {
   const fixture = linearAgentFixture(() => ({
     errors: [
       { message: "Other failure", extensions: { type: "A", code: "other" } },
       {
         message: `Slow down reads for ${sessionId}`,
-        extensions: { type: "B", code: "RATELIMITED" },
+        extensions: { type: "ratelimited", code: "RATELIMITED" },
       },
     ],
   }));
@@ -257,9 +227,8 @@ it("pilot requests without a body keep the selected error type and text with all
     (error: unknown) => {
       assert.ok(error instanceof LinearAgentError);
       assert.deepEqual(error.details, {
-        linearErrorType: "B",
-        linearErrorKinds: ["OTHER", "RATELIMITED"],
-        linearErrorText: "Linear GraphQL Slow down reads for [Redacted]",
+        linearErrorType: "ratelimited",
+        linearErrorKinds: ["other", "RATELIMITED"],
       });
       return true;
     },
