@@ -70,9 +70,9 @@ export class ProjectNavigation {
   async openMobileInstanceSection(account: string, name: InstanceSection) {
     await this.toggleMobileSidebar();
     await this.enterInstanceScope(account);
-    // Leaving for the instance dismisses the drawer, the way a sidebar destination does, so the
+    // Leaving for the instance dismisses the sheet, the way a destination does, so the
     // section has to be picked from a reopened one.
-    await expect(this.page.getByRole("dialog", { name: "Sidebar" })).toBeHidden();
+    await expect(this.page.getByRole("dialog", { name: "More", exact: true })).toBeHidden();
     await this.toggleMobileSidebar();
     await this.instanceNav().getByRole("link", { name, exact: true }).click();
   }
@@ -105,8 +105,13 @@ export class ProjectNavigation {
     return this.page.getByRole("navigation", { name: "Instance", exact: true });
   }
 
+  /** On a phone every destination outside the bottom bar lives in the More sheet. */
   private async toggleMobileSidebar() {
-    await this.page.getByRole("button", { name: "Toggle Sidebar" }).click();
+    await this.page
+      .getByRole("navigation", { name: "Quick navigation" })
+      .getByRole("button", { name: "More", exact: true })
+      .click();
+    await expect(this.page.getByRole("dialog", { name: "More", exact: true })).toBeVisible();
   }
 
   async openMobileProjectSection(name: ProjectSection) {
