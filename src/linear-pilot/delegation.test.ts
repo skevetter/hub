@@ -84,10 +84,44 @@ it("accepts delegation at the inclusive 120-second boundary and assignment at se
   ).resolves.toEqual(prompt);
 });
 
-it.each([human, null])("accepts a generated comment with user %j", async (user) => {
+it("accepts an owner-authored generated comment with proven delegation", async () => {
   await expect(
-    run(async () => evidence({}, { comment: { id: "comment", user } })),
+    run(async () => evidence({}, { comment: { id: "comment", user: human } })),
   ).resolves.toEqual(prompt);
+});
+
+const authorlessComment = { id: "comment", user: null };
+const freshOwnerEntry = history({ createdAt: "2026-11-22T01:01:00.000Z" });
+
+it("accepts an authorless comment with a fresh owner delegation to the app", async () => {
+  await expect(
+    run(async () =>
+      evidence({ history: { nodes: [freshOwnerEntry] } }, { comment: authorlessComment }),
+    ),
+  ).resolves.toEqual(prompt);
+});
+
+it.each<[string, Entry[]]>([
+  ["a history entry older than 120 seconds", [history({ createdAt: "2026-11-22T00:59:59.999Z" })]],
+  ["no history entry", []],
+  ["a fresh history entry by a non-owner", [{ ...freshOwnerEntry, actor: other }]],
+])("refuses an authorless comment with %s", async (_label, nodes) => {
+  const read = vi.fn(async () => evidence({ history: { nodes } }, { comment: authorlessComment }));
+  const proof = run(read);
+  await vi.advanceTimersByTimeAsync(1_000);
+  await expect(proof).resolves.toEqual(refused("no_history_match"));
+  expect(read).toHaveBeenCalledTimes(2);
+});
+
+it("refuses a non-owner readback comment even with a fresh owner delegation to the app", async () => {
+  const read = vi.fn(async () =>
+    evidence(
+      { history: { nodes: [freshOwnerEntry] } },
+      { comment: { id: "comment", user: other } },
+    ),
+  );
+  await expect(run(read)).resolves.toEqual(refused("session_mismatch"));
+  expect(read).toHaveBeenCalledTimes(1);
 });
 
 it("uses the newest qualifying history entry regardless of response order", async () => {
@@ -133,11 +167,6 @@ it.each<[string, DelegationProofStage, Readback]>([
     evidence({ delegate: other, assignee: other }),
   ],
   ["creator mismatch", "session_mismatch", evidence({}, { creator: other })],
-  [
-    "comment by another user",
-    "session_mismatch",
-    evidence({}, { comment: { id: "comment", user: other } }),
-  ],
   [
     "source comment present",
     "session_mismatch",

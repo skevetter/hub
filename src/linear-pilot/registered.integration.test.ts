@@ -255,6 +255,24 @@ function isRefusalScenario(scenario: string): scenario is RefusalScenario {
   return scenario === "delegation-refusal" || scenario === "delegation-oversized";
 }
 
+async function assertNonOwnerCommentRefused(
+  endpoint: Endpoint,
+  payload: JsonObject,
+  nativeSessionId: string,
+) {
+  objectAt(objectAt(payload, "agentSession"), "comment")["userId"] = randomUUID();
+  const info = vi.spyOn(logger, "info");
+  try {
+    await deliver(endpoint, payload);
+    expect(info).toHaveBeenCalledWith(
+      { reason: "origin_unproven", action: "created", nativeSessionId },
+      "Linear pilot refused delivery",
+    );
+  } finally {
+    info.mockRestore();
+  }
+}
+
 function refusalDetails(scenario: RefusalScenario) {
   if (scenario === "delegation-oversized") return { reason: "oversized" };
   return {
@@ -310,7 +328,7 @@ async function assertDelegationRefusal(input: {
     expect(
       info.mock.calls.filter(([, message]) => message === "Linear pilot delegation fallback"),
     ).toEqual([
-      [{ nativeSessionId, stage: "comment_author_mismatch" }, "Linear pilot delegation fallback"],
+      [{ nativeSessionId, stage: "comment_author_missing" }, "Linear pilot delegation fallback"],
     ]);
     await deliver(endpoint, payload);
     await vi.waitFor(() =>
@@ -435,7 +453,14 @@ function coordinatorOptions(scenario: string) {
 }
 
 async function exerciseRegisteredPilot(
-  scenario: "stop" | "stop-race" | "postgres" | "start-refusal" | "delegation" | RefusalScenario,
+  scenario:
+    | "stop"
+    | "stop-race"
+    | "postgres"
+    | "start-refusal"
+    | "delegation"
+    | "delegation-non-owner-comment"
+    | RefusalScenario,
   terminalFailure?: "failed" | "canceled" | "unconfirmed",
 ) {
   const backend = registeredBackend(scenario);
@@ -741,6 +766,14 @@ async function exerciseRegisteredPilot(
         outside,
         delegation,
       });
+
+      if (scenario === "delegation-non-owner-comment") {
+        await assertNonOwnerCommentRefused(endpoint, payload, nativeSessionId);
+        expect(originReads).toBe(0);
+        expect(provider).not.toHaveBeenCalled();
+        expect(agents.creations).toEqual([]);
+        return;
+      }
 
       const watch = agents.watch.bind(agents);
       agents.connection.agents.watch = (agentId, listener) =>
@@ -1269,6 +1302,12 @@ test(
 test(
   "a proven owner delegation acknowledges, starts a turn and publishes its answer",
   () => exerciseRegisteredPilot("delegation"),
+  120_000,
+);
+
+test(
+  "a non-owner comment on an owner-created session is refused before delegation readback",
+  () => exerciseRegisteredPilot("delegation-non-owner-comment"),
   120_000,
 );
 

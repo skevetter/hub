@@ -26,7 +26,7 @@ export type DelegationFallback =
   | "comment_missing"
   | "comment_id_mismatch"
   | "comment_issue_mismatch"
-  | "comment_author_mismatch"
+  | "comment_author_missing"
   | "source_mismatch";
 
 export interface LinearPilotEvent {
@@ -60,6 +60,7 @@ export type LinearPilotRefusal =
   | "session_mismatch"
   | "missing_creator"
   | "not_owner"
+  | "origin_unproven"
   | "activity_mismatch"
   | "unsupported_signal"
   | "unqualified_content"
@@ -232,12 +233,22 @@ function readCreatedComment(
     accept(scope, "created", humanId, { pendingDelegation: true, delegationFallback });
   const comment = plain(rawComment);
   if (comment === undefined) return fallback("comment_missing");
+  const author = field(comment, "userId");
+  if (author != null && author !== humanId) return refuse("origin_unproven");
   const commentId = id(rawCommentId);
   if (commentId === undefined || id(field(comment, "id")) !== commentId)
     return fallback("comment_id_mismatch");
   if (id(field(comment, "issueId")) !== scope.issueId) return fallback("comment_issue_mismatch");
-  if (id(field(comment, "userId")) !== humanId) return fallback("comment_author_mismatch");
+  if (author == null) return fallback("comment_author_missing");
   if (source != null && source !== commentId) return fallback("source_mismatch");
+  return acceptCreatedComment(scope, humanId, comment);
+}
+
+function acceptCreatedComment(
+  scope: Scope,
+  humanId: string,
+  comment: Record_,
+): LinearPilotIntakeResult {
   const message = readText(field(comment, "body"));
   if ("refusal" in message) return refuse(message.refusal);
   return accept(scope, "created", humanId, { message: message.text });

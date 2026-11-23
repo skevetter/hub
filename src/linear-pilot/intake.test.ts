@@ -102,8 +102,8 @@ describe("verifyLinearPilotIntake created", () => {
     [["commentId"], "comment-other", "comment_id_mismatch"],
     [["comment", "issueId"], undefined, "comment_issue_mismatch"],
     [["comment", "issueId"], "issue-other", "comment_issue_mismatch"],
-    [["comment", "userId"], null, "comment_author_mismatch"],
-    [["comment", "userId"], "human-other-0001", "comment_author_mismatch"],
+    [["comment", "userId"], null, "comment_author_missing"],
+    [["comment", "userId"], undefined, "comment_author_missing"],
     [["sourceCommentId"], "comment-other", "source_mismatch"],
   ])("requires readback for unproven owner comment field %j = %j (%s)", (path, value, stage) => {
     const event = accepted(mutate(createdPayload(), ["agentSession", ...path], value));
@@ -113,6 +113,22 @@ describe("verifyLinearPilotIntake created", () => {
       delegationFallback: stage,
     });
     expect(event).not.toHaveProperty("message");
+  });
+
+  it("refuses an owner-created session with a non-owner comment without falling back", () => {
+    const payload = mutate(
+      createdPayload(),
+      ["agentSession", "comment", "userId"],
+      "human-other-0001",
+    );
+    expect(intake(payload)).toEqual({ ok: false, reason: "origin_unproven" });
+    const withoutCommentId = mutate(payload, ["agentSession", "commentId"], undefined);
+    expect(intake(withoutCommentId)).toEqual({ ok: false, reason: "origin_unproven" });
+  });
+
+  it("refuses a present malformed comment author instead of treating it as missing", () => {
+    const payload = mutate(createdPayload(), ["agentSession", "comment", "userId"], 7);
+    expect(intake(payload)).toEqual({ ok: false, reason: "origin_unproven" });
   });
 
   it("refuses a session whose issue is missing or inconsistent", () => {
@@ -397,11 +413,7 @@ describe("verifyLinearPilotIntake scope", () => {
       vi.spyOn(process.stdout, "write"),
       vi.spyOn(process.stderr, "write"),
     ];
-    const body = mutate(
-      createdPayload(),
-      ["agentSession", "comment", "userId"],
-      "human-other-0001",
-    );
+    const body = mutate(createdPayload(), ["agentSession", "comment", "userId"], null);
     const withSecret = mutate(body, ["agentSession", "comment", "body"], "TOP-SECRET-COMMENT");
     const result = intake(withSecret);
     expect(result).toMatchObject({ ok: true, event: { pendingDelegation: true } });
