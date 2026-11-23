@@ -116,6 +116,7 @@ test.describe("metered usage", () => {
         thinking: "high",
         prompt: "${{ paseo.prompt }}",
       });
+      await triggers.allowManualActor("phase-two-runner");
       await triggers.save("deploy");
     });
 
@@ -126,6 +127,7 @@ test.describe("metered usage", () => {
         rawInput: "run it",
         deliveryKey: "slice-3-run-1",
         apiKey: runApiKey,
+        actor: "phase-two-runner",
       });
       expect(first.workflowStatus).toBe("running");
     });
@@ -137,6 +139,7 @@ test.describe("metered usage", () => {
         rawInput: "run it again",
         deliveryKey: "slice-3-run-2",
         apiKey: runApiKey,
+        actor: "phase-two-runner",
       });
       expect(second.status).toBe(200);
       expect(second.triggerRunId).toBeDefined();
