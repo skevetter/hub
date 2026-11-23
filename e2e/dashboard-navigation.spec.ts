@@ -13,8 +13,10 @@ const owner = {
 test("redirects only a reachable organization index to Home", async ({ hub, page }) => {
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
-  await page.goto(new URL("/o/acme", page.url()).href);
-  await expect(page).toHaveURL(/\/o\/acme\/home$/u);
+  await expect(page).toHaveURL(/\/o\/[^/]+\/home$/u);
+  const home = page.url();
+  await page.goto(home.replace(/\/home$/u, ""));
+  await expect(page).toHaveURL(home);
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
 
   await page.goto(new URL("/o/unknown", page.url()).href);
@@ -92,10 +94,12 @@ test("operators enter instance settings without leaving the organization shell",
   const { navigation } = projectApp(page);
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
+  await expect(page).toHaveURL(/\/o\/[^/]+\/home$/u);
+  const home = page.url();
   await hub.grantOperator("owner");
 
   await navigation.openInstanceSection("Operator");
-  await expect(page).toHaveURL(/\/o\/acme\/settings\/instance\/operator$/u);
+  await expect(page).toHaveURL(new URL("settings/instance/operator", home).href);
   await navigation.expectBreadcrumb("Acme", "Settings", "Instance", "Operator");
   await expect(
     page.getByRole("navigation", { name: "Instance settings" }).getByRole("link"),
@@ -107,7 +111,7 @@ test("operators enter instance settings without leaving the organization shell",
   await page.screenshot({ path: `${SHOTS}/07-instance-scope.png`, fullPage: true });
 
   await page.goto(new URL("/apps", page.url()).href);
-  await expect(page).toHaveURL(/\/o\/acme\/settings\/instance\/apps$/u);
+  await expect(page).toHaveURL(new URL("settings/instance/apps", home).href);
   await expect(page.getByRole("heading", { name: "Apps", level: 1 })).toBeVisible();
   await navigation.leaveInstance();
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();

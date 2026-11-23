@@ -4012,8 +4012,7 @@ class HubUser {
     await expect(this.page.getByRole("link", { name: "Skip to content" })).toBeFocused();
     await this.page.keyboard.press("Tab");
     await expect(organization).toBeFocused();
-    await this.page.keyboard.press("Tab");
-    await expect(this.page.getByRole("button", { name: "Search", exact: true })).toBeFocused();
+    await this.tabThroughDesktopSearch();
     await this.tabThroughOrganizationDestinations();
     await this.tabThroughSidebarFooter();
 
@@ -4045,6 +4044,7 @@ class HubUser {
     await expect(this.page.getByRole("link", { name: "Skip to content" })).toBeFocused();
     await this.page.keyboard.press("Tab");
     await expect(organization).toBeFocused();
+    await this.tabThroughDesktopSearch();
     await this.tabThroughOrganizationDestinations();
     await this.tabThroughSidebarFooter();
 
@@ -4102,6 +4102,11 @@ class HubUser {
     await expect(this.page).toHaveURL(/\/o\/[^/]+\/settings\/team$/u);
     await expect(sheet).toBeHidden();
     await expect(this.page.getByRole("heading", { name: "Team", exact: true })).toBeVisible();
+  }
+
+  private async tabThroughDesktopSearch(): Promise<void> {
+    await this.page.keyboard.press("Tab");
+    await expect(this.page.getByRole("button", { name: "Search", exact: true })).toBeFocused();
   }
 
   private async tabThroughOrganizationDestinations(

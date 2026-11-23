@@ -14,7 +14,11 @@ test("the command menu navigates, switches organization, and applies theme witho
 }) => {
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
+  await expect(page).toHaveURL(/\/o\/[^/]+\/home$/u);
+  const activity = new URL("activity", page.url()).href;
   await hub.createAnotherOrganization("owner", "Orbit");
+  await expect(page).toHaveURL(/\/o\/[^/]+\/home$/u);
+  const orbitHome = page.url();
   await hub.chooseOrganization("owner", "Acme");
   const documentStart = await page.evaluate(() => performance.timeOrigin);
   const dialog = page.getByRole("dialog", { name: "Command menu" });
@@ -27,7 +31,7 @@ test("the command menu navigates, switches organization, and applies theme witho
   await expect(dialog.getByRole("option", { name: "Apps", exact: true })).toHaveCount(0);
   await input.fill("Activity");
   await input.press("Enter");
-  await expect(page).toHaveURL(/\/o\/acme\/activity$/u);
+  await expect(page).toHaveURL(activity);
   await expect(dialog).toBeHidden();
   await expect(search).toBeFocused();
 
@@ -41,7 +45,7 @@ test("the command menu navigates, switches organization, and applies theme witho
   await search.click();
   await input.fill("Orbit");
   await input.press("Enter");
-  await expect(page).toHaveURL(/\/o\/orbit\/home$/u);
+  await expect(page).toHaveURL(orbitHome);
   await expect(dialog).toBeHidden();
   await expect(search).toBeFocused();
   expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentStart);
