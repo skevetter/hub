@@ -2,13 +2,14 @@ import { createServerFn } from "@tanstack/react-start";
 import { getRequest, setResponseStatus } from "@tanstack/react-start/server";
 import { z } from "zod";
 import { respondError, respondOk, type Result } from "../contract/respond.js";
-import { respondWithFailure } from "../failures/index.js";
+import { classifyFailure, respondWithFailure } from "../failures/index.js";
 import type { BrowserStopResult } from "./run-stop.js";
 import { getApplication } from "../server/runtime.js";
 import { PAGE_SIZES } from "../components/app/page-size.js";
 import { activityFiltersSchema, droppedActivityFiltersSchema } from "./activity-query.js";
 import { triggerSearchSchema } from "./trigger-query.js";
 import type { TriggerDashboard } from "./dashboard.js";
+import { isTenantRouteNotFoundError } from "../projects/access.js";
 
 import type { RunDetailSnapshot, RunEventPage } from "./run-events.js";
 const scopeSchema = z.object({ organizationSlug: z.string().trim().min(1).max(100) });
@@ -69,6 +70,63 @@ export const stopRun = createServerFn({ method: "POST" })
       });
     }
   });
+
+export const runManualTrigger = createServerFn({ method: "POST" })
+  .validator(
+    scopeSchema.extend({
+      triggerId: z.uuid(),
+      deliveryKey: z.uuid(),
+      input: z.unknown().optional(),
+    }),
+  )
+  .handler(async ({ data }) => {
+    try {
+      const dashboard = (await getApplication()).triggerDashboard;
+      if (dashboard == null) return manualRunError("infrastructure_unavailable");
+      const result = await dashboard.runManualTrigger(getRequest(), data);
+      if (result.status === "dispatched") return respondOk({ runId: result.triggerRunId });
+      return manualRunError(
+        result.status,
+        result.status === "invalid_input" ? result.issues : undefined,
+      );
+    } catch (error) {
+      if (isTenantRouteNotFoundError(error)) return manualRunError("trigger_not_found");
+      const failure = classifyFailure(error);
+      if (failure === "authentication") return manualRunError("unauthenticated");
+      if (failure === "forbidden") return manualRunError("forbidden");
+      setResponseStatus(500);
+      return respondWithFailure(error, triggerContext("run.manual", data.organizationSlug), {
+        fallback: "Hub couldn't start this run.",
+      });
+    }
+  });
+
+const manualRunErrors = {
+  project_not_found: [404, "This trigger is unavailable."],
+  configuration_not_found: [404, "This trigger is unavailable."],
+  trigger_not_found: [404, "This trigger is unavailable."],
+  unauthenticated: [401, "Sign in to start this trigger."],
+  forbidden: [403, "This request cannot start a run."],
+  actor_forbidden: [403, "This trigger doesn't allow your account."],
+  key_actor_required: [403, "This trigger requires an API key with a bound actor."],
+  invalid_input: [422, "Check the trigger inputs and try again."],
+  expected_configuration_not_current: [409, "This trigger changed. Refresh and try again."],
+  dispatch_conflict: [409, "Hub couldn't start this run. Retry the same request."],
+  daemon_offline: [409, "The selected daemon is offline."],
+  infrastructure_unavailable: [503, "Run now is unavailable."],
+} as const;
+
+function manualRunError(
+  code: keyof typeof manualRunErrors,
+  issues?: readonly { path: readonly (string | number)[]; message: string }[],
+) {
+  const [status, message] = manualRunErrors[code];
+  setResponseStatus(status);
+  return {
+    ...respondError({ message }),
+    error: { code, message, ...(issues === undefined ? {} : { issues }) },
+  };
+}
 
 export const runEventsSnapshot = createServerFn({ method: "GET" })
   .validator(runScopeSchema.extend({ after: z.number().int().nonnegative() }))
