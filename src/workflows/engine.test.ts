@@ -1,8 +1,8 @@
-import { agentStep } from "../config/compiler.js";
 import assert from "node:assert/strict";
 import { createHmac, generateKeyPairSync, randomUUID } from "node:crypto";
 import { describe, it, vi } from "vitest";
 import {
+  agentStep,
   compileHubConfig,
   compiledConfigurationHash,
   type CompiledAgent,
@@ -20,7 +20,7 @@ import type {
   ProviderEventReceiptRecord,
   TriggerRunRecord,
 } from "../db/types.js";
-import type { AcceptedTriggerProviderMatch } from "../triggers/index.js";
+import type { AcceptedTriggerProviderMatch, TriggerProvider } from "../triggers/index.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { parseInvocation } from "../triggers/invocation.js";
 import { compileTriggerDocument } from "../triggers/configuration/index.js";
@@ -89,7 +89,7 @@ run:
         ...providerMatch(fixture.configuration, fixture.revisionId),
         name: "slack",
         eventNames: ["slack.mention"] as const,
-      } satisfies import("../triggers/index.js").TriggerProvider;
+      } satisfies TriggerProvider;
       const onProgressRequested = vi.fn((run: TriggerRunRecord) => {
         assert.equal(run.outcome, "accepted");
         return requestProgress();
@@ -221,7 +221,7 @@ run:
             outputContext: { provider: providerName },
           }));
         },
-      } satisfies import("../triggers/index.js").TriggerProvider;
+      } satisfies TriggerProvider;
       const intents: LaunchMachineIntent[] = [];
       const { handler, engine } = createDurableWorkflowHandler({
         database: fixture.database,
@@ -248,36 +248,7 @@ run:
         return intent.environment.worktree.newBranch;
       });
       assert.equal(new Set(branches).size, 2);
-      for (const intent of intents) {
-        const execution = await fixture.database.findAgentExecutionByWorkflowStepRunId(
-          intent.workflowStepRunId!,
-        );
-        assert.ok(execution);
-        assert.equal(intent.background, intent.triggerName === "first");
-        assert.equal(intent.completeOnTurnEnd, intent.triggerName === "first" ? true : undefined);
-        assert.equal("completeOnTurnEnd" in intent, intent.triggerName === "first");
-        assert.equal(
-          execution.launchIntent?.completeOnTurnEnd,
-          intent.triggerName === "first" ? true : undefined,
-        );
-        assert.deepEqual(intent.continuation?.compatibility, {
-          agent: intent.agent,
-          target: fixture.configuration.environments[0],
-          ...(intent.background ? { background: true } : {}),
-          env: {},
-          github: null,
-        });
-        assert.equal(
-          intent.title,
-          intent.triggerName === "first" ? `Intake · ${execution.id}` : undefined,
-        );
-        assert.equal(
-          execution.launchIntent?.environment.worktree?.mode === "branch-off"
-            ? execution.launchIntent.environment.worktree.newBranch
-            : undefined,
-          `trigger-${execution.id}`,
-        );
-      }
+      for (const intent of intents) await assertMaterializedIntent(intent, fixture);
     },
   );
 
@@ -293,7 +264,7 @@ run:
         assert.equal(launch.providerEventReceiptId, fixture.providerEventReceiptId);
         return { manual: { item: { title: "ambient" } } };
       },
-    } satisfies import("../triggers/index.js").TriggerProvider;
+    } satisfies TriggerProvider;
     const { handler, engine } = createDurableWorkflowHandler({
       database: fixture.database,
       entitlements: fixture.entitlements,
@@ -376,8 +347,10 @@ run:
     Reflect.set(authoredStep, "startup_timeout", "3m");
     const fixture = await workflowFixture({ rawConfiguration });
     let dispatched: LaunchMachineIntent | undefined;
-    const { handler, engine } = engineFor(fixture, [], async (intent) => {
-      dispatched = intent;
+    const { handler, engine } = engineFor(fixture, [], {
+      beforeDispatch: async (intent) => {
+        dispatched = intent;
+      },
     });
 
     await handler(fixture.trigger("run"));
@@ -446,8 +419,10 @@ run:
     async (stepStatus, expected) => {
       const fixture = await workflowFixture({ rawConfiguration: deadlineConfiguration() });
       const terminalStatuses: string[] = [];
-      const { handler, engine } = engineFor(fixture, [], undefined, undefined, async (run) => {
-        terminalStatuses.push(run.status);
+      const { handler, engine } = engineFor(fixture, [], {
+        onWorkflowRunTerminal: async (run) => {
+          terminalStatuses.push(run.status);
+        },
       });
       await handler(fixture.trigger("run"));
       await engine.processAvailable();
@@ -507,20 +482,10 @@ run:
           const method = init?.method ?? "GET";
           requests.push(`${method} ${path}`);
           const token = path.endsWith("/access_tokens");
-          let status = 200;
-          if (token) {
-            status = scenario === "missing installation" ? 404 : 201;
-          } else if (method === "DELETE") {
-            status = scenario === "cleanup 500" && unavailable ? 500 : 404;
-          } else if (scenario === "missing comment") {
-            status = 404;
-          } else if (unavailable && scenario === "transport") {
-            throw new TypeError("fetch failed");
-          } else if (unavailable && ["429", "500", "401", "403"].includes(scenario)) {
-            status = Number(scenario);
-          } else {
-            status = 201;
-          }
+          const tokenStatus = scenario === "missing installation" ? 404 : 201;
+          const status = token
+            ? tokenStatus
+            : terminalReactionStatus({ method, scenario, unavailable });
           let body: unknown = { id: 2 };
           if (status >= 400) body = { message: "unavailable" };
           else if (token)
@@ -725,15 +690,11 @@ run:
       initialClaimRelease,
     );
     const delivered: string[] = [];
-    const { handler, engine } = engineFor(
-      { ...fixture, database: controlledDatabase },
-      [],
-      undefined,
-      undefined,
-      async (run) => {
+    const { handler, engine } = engineFor({ ...fixture, database: controlledDatabase }, [], {
+      onWorkflowRunTerminal: async (run) => {
         delivered.push(run.id);
       },
-    );
+    });
 
     await handler(fixture.trigger("run"));
     const processing = engine.processAvailable();
@@ -758,8 +719,10 @@ run:
       releaseTerminalHook = resolve;
     });
     const dispatches: string[] = [];
-    const { handler, engine } = engineFor(fixture, dispatches, undefined, undefined, async () => {
-      await terminalHookStarted;
+    const { handler, engine } = engineFor(fixture, dispatches, {
+      onWorkflowRunTerminal: async () => {
+        await terminalHookStarted;
+      },
     });
 
     try {
@@ -910,8 +873,10 @@ run:
     });
     const dispatches: string[] = [];
     const prompts: string[] = [];
-    const { handler, engine } = engineFor(fixture, dispatches, async (intent) => {
-      prompts.push(intent.prompt);
+    const { handler, engine } = engineFor(fixture, dispatches, {
+      beforeDispatch: async (intent) => {
+        prompts.push(intent.prompt);
+      },
     });
 
     await handler(fixture.trigger("repo=hub request"));
@@ -1022,8 +987,10 @@ run:
       },
     });
     const dispatches: LaunchMachineIntent[] = [];
-    const { handler, engine } = engineFor(fixture, [], async (intent) => {
-      dispatches.push(intent);
+    const { handler, engine } = engineFor(fixture, [], {
+      beforeDispatch: async (intent) => {
+        dispatches.push(intent);
+      },
     });
 
     await handler(fixture.trigger("investigate"));
@@ -1067,8 +1034,10 @@ run:
     const bundle = compileHubBundle(await currentProjectConfigurationFiles());
     const fixture = await workflowFixture({ compiledConfiguration: bundle.configuration });
     const dispatches: LaunchMachineIntent[] = [];
-    const { handler, engine } = engineFor(fixture, [], async (intent) => {
-      dispatches.push(intent);
+    const { handler, engine } = engineFor(fixture, [], {
+      beforeDispatch: async (intent) => {
+        dispatches.push(intent);
+      },
     });
 
     await handler(fixture.trigger("investigate the routing failure"));
@@ -1162,8 +1131,10 @@ run:
   it("does not persist or dispatch skipped-step GitHub authority", async () => {
     const fixture = await workflowFixture({ rawConfiguration: skippedAuthorityConfiguration() });
     const intents: LaunchMachineIntent[] = [];
-    const { handler, engine } = engineFor(fixture, [], async (intent) => {
-      intents.push(intent);
+    const { handler, engine } = engineFor(fixture, [], {
+      beforeDispatch: async (intent) => {
+        intents.push(intent);
+      },
     });
 
     await handler(fixture.trigger("run"));
@@ -1335,12 +1306,14 @@ run:
         result: { status: terminalStatus },
       });
 
-      const restarted = engineFor(fixture, dispatches, async (intent) => {
-        if (intent.prompt !== "Downstream") return;
-        assert.equal(
-          (await fixture.database.findWorkflowStepRunById(firstStep.id))?.status,
-          terminalStatus,
-        );
+      const restarted = engineFor(fixture, dispatches, {
+        beforeDispatch: async (intent) => {
+          if (intent.prompt !== "Downstream") return;
+          assert.equal(
+            (await fixture.database.findWorkflowStepRunById(firstStep.id))?.status,
+            terminalStatus,
+          );
+        },
       });
       await restarted.engine.processAvailable();
       await restarted.engine.processAvailable();
@@ -1419,7 +1392,7 @@ run:
     const now = new Date("2026-08-06T12:00:00.000Z");
     const fixture = await workflowFixture({ rawConfiguration: deadlineConfiguration() });
     const dispatches: string[] = [];
-    const { handler, engine } = engineFor(fixture, dispatches, undefined, () => now);
+    const { handler, engine } = engineFor(fixture, dispatches, { now: () => now });
 
     await handler(fixture.trigger("run"));
     await engine.processAvailable();
@@ -1443,7 +1416,7 @@ run:
       rawConfiguration: deadlineConfiguration({ idleTimeout: "1m" }),
     });
     const dispatches: string[] = [];
-    const { handler, engine } = engineFor(fixture, dispatches, undefined, () => now);
+    const { handler, engine } = engineFor(fixture, dispatches, { now: () => now });
 
     await handler(fixture.trigger("run"));
     await engine.processAvailable();
@@ -1469,7 +1442,7 @@ run:
       rawConfiguration: deadlineConfiguration({ idleTimeout: "1m" }),
     });
     const dispatches: string[] = [];
-    const { handler, engine } = engineFor(fixture, dispatches, undefined, () => now);
+    const { handler, engine } = engineFor(fixture, dispatches, { now: () => now });
 
     await handler(fixture.trigger("run"));
     await engine.processAvailable();
@@ -1492,7 +1465,7 @@ run:
     let now = new Date("2026-08-06T12:00:00.000Z");
     const fixture = await workflowFixture({ rawConfiguration: deadlineConfiguration() });
     const dispatches: string[] = [];
-    const { handler, engine } = engineFor(fixture, dispatches, undefined, () => now);
+    const { handler, engine } = engineFor(fixture, dispatches, { now: () => now });
 
     await handler(fixture.trigger("run"));
     await engine.processAvailable();
@@ -1524,7 +1497,7 @@ run:
     let now = new Date("2026-08-06T12:00:00.000Z");
     const fixture = await workflowFixture({ rawConfiguration: deadlineConfiguration() });
     const dispatches: string[] = [];
-    const { handler, engine } = engineFor(fixture, dispatches, undefined, () => now);
+    const { handler, engine } = engineFor(fixture, dispatches, { now: () => now });
 
     await handler(fixture.trigger("run"));
     await engine.processAvailable();
@@ -1558,7 +1531,7 @@ run:
       rawConfiguration: deadlineConfiguration({ idleTimeout: "1m" }),
     });
     const dispatches: string[] = [];
-    const { handler, engine } = engineFor(fixture, dispatches, undefined, () => now);
+    const { handler, engine } = engineFor(fixture, dispatches, { now: () => now });
 
     await handler(fixture.trigger("run"));
     await engine.processAvailable();
@@ -1776,7 +1749,7 @@ run:
         materializations += 1;
         return { ambient: "once" };
       },
-    } satisfies import("../triggers/index.js").TriggerProvider;
+    } satisfies TriggerProvider;
     const { handler, engine } = createDurableWorkflowHandler({
       database: fixture.database,
       entitlements: fixture.entitlements,
@@ -1849,7 +1822,7 @@ describe("workflow engine transient database failures", () => {
       async materializeContext() {
         return { ambient: "once" };
       },
-    } satisfies import("../triggers/index.js").TriggerProvider;
+    } satisfies TriggerProvider;
     const { handler, engine } = createDurableWorkflowHandler({
       database: faulty.database,
       entitlements: fixture.entitlements,
@@ -2097,13 +2070,47 @@ function partialRuntimeConfiguration(): Record<string, unknown> {
   };
 }
 
+async function assertMaterializedIntent(intent: LaunchMachineIntent, fixture: Fixture) {
+  const execution = await fixture.database.findAgentExecutionByWorkflowStepRunId(
+    intent.workflowStepRunId!,
+  );
+  assert.ok(execution);
+  assert.equal(intent.background, intent.triggerName === "first");
+  assert.equal(intent.completeOnTurnEnd, intent.triggerName === "first" ? true : undefined);
+  assert.equal("completeOnTurnEnd" in intent, intent.triggerName === "first");
+  assert.equal(
+    execution.launchIntent?.completeOnTurnEnd,
+    intent.triggerName === "first" ? true : undefined,
+  );
+  assert.deepEqual(intent.continuation?.compatibility, {
+    agent: intent.agent,
+    target: fixture.configuration.environments[0],
+    ...(intent.background ? { background: true } : {}),
+    env: {},
+    github: null,
+  });
+  assert.equal(
+    intent.title,
+    intent.triggerName === "first" ? `Intake \u00b7 ${execution.id}` : undefined,
+  );
+  assert.equal(
+    execution.launchIntent?.environment.worktree?.mode === "branch-off"
+      ? execution.launchIntent.environment.worktree.newBranch
+      : undefined,
+    `trigger-${execution.id}`,
+  );
+}
+
 function engineFor(
   fixture: Fixture,
   dispatches: string[],
-  beforeDispatch?: (intent: LaunchMachineIntent) => Promise<void>,
-  now?: () => Date,
-  onWorkflowRunTerminal?: (run: TriggerRunRecord) => Promise<void>,
+  options: {
+    beforeDispatch?: (intent: LaunchMachineIntent) => Promise<void>;
+    now?: () => Date;
+    onWorkflowRunTerminal?: (run: TriggerRunRecord) => Promise<void>;
+  } = {},
 ) {
+  const { beforeDispatch, now, onWorkflowRunTerminal } = options;
   return createDurableWorkflowHandler({
     database: fixture.database,
     entitlements: fixture.entitlements,
@@ -2198,6 +2205,18 @@ function contextOnlyConfiguration(): Record<string, unknown> {
     ...configuration,
     triggers: [{ ...trigger, steps: [steps[1]] }],
   };
+}
+
+function terminalReactionStatus(options: {
+  method: string;
+  scenario: string;
+  unavailable: boolean;
+}): number {
+  const { method, scenario, unavailable } = options;
+  if (method === "DELETE") return scenario === "cleanup 500" && unavailable ? 500 : 404;
+  if (scenario === "missing comment") return 404;
+  if (unavailable && scenario === "transport") throw new TypeError("fetch failed");
+  return unavailable && ["429", "500", "401", "403"].includes(scenario) ? Number(scenario) : 201;
 }
 
 function allSkippedConfiguration(): Record<string, unknown> {
@@ -2412,7 +2431,7 @@ function providerMatch(configuration: CompiledHubConfig, revisionId: string) {
         },
       ];
     },
-  } satisfies import("../triggers/index.js").TriggerProvider;
+  } satisfies TriggerProvider;
 }
 
 function baseConfiguration(options: { unavailableValue?: boolean }): Record<string, unknown> {

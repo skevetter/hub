@@ -25,50 +25,38 @@ const PersistedDaemonAgentSchema = z.object({
   id: z.string(),
   lastStatus: z.enum(["error", "initializing", "idle", "running", "closed"]),
   config: z.object({
-    mcpServers: z
-      .record(z.string(), z.object({ url: z.string().optional() }).passthrough())
-      .optional(),
+    mcpServers: z.record(z.string(), z.looseObject({ url: z.string().optional() })).optional(),
   }),
 });
-const CanonicalToolCallSchema = z
-  .object({
-    type: z.literal("tool_call"),
-    name: z.string(),
-    status: z.enum(["running", "completed", "failed", "canceled"]),
-  })
-  .passthrough();
+const CanonicalToolCallSchema = z.looseObject({
+  type: z.literal("tool_call"),
+  name: z.string(),
+  status: z.enum(["running", "completed", "failed", "canceled"]),
+});
 const EffectiveConfigurationSchema = z.object({
   environments: z.array(
-    z
-      .object({
-        name: z.string(),
-        cwd: z.string(),
-        daemonId: z.string().uuid(),
-      })
-      .passthrough(),
+    z.looseObject({
+      name: z.string(),
+      cwd: z.string(),
+      daemonId: z.uuid(),
+    }),
   ),
   triggers: z.array(
-    z
-      .object({
-        name: z.string(),
-        steps: z.array(
-          z
-            .object({
-              environment: z.unknown(),
-              agent: z
-                .object({
-                  selector: z.string().optional(),
-                  choices: z
-                    .record(z.string(), z.object({ options: z.unknown().optional() }).passthrough())
-                    .optional(),
-                })
-                .passthrough(),
-              prompt: z.array(z.unknown()),
-            })
-            .passthrough(),
-        ),
-      })
-      .passthrough(),
+    z.looseObject({
+      name: z.string(),
+      steps: z.array(
+        z.looseObject({
+          environment: z.unknown(),
+          agent: z.looseObject({
+            selector: z.string().optional(),
+            choices: z
+              .record(z.string(), z.looseObject({ options: z.unknown().optional() }))
+              .optional(),
+          }),
+          prompt: z.array(z.unknown()),
+        }),
+      ),
+    }),
   ),
 });
 
@@ -228,19 +216,7 @@ export class HubE2E {
       await writeFile(destination, file.content);
     }
 
-    const daemon = await this.requirePool().query<{ id: string }>(
-      "select id from daemons where presence = 'connected' order by connected_at desc limit 1",
-    );
-    const connectedDaemonId = daemon.rows[0]?.id;
-    if (!connectedDaemonId) {
-      throw new Error("Connected daemon is unavailable for source CLI deployment");
-    }
-    await this.requirePool().query("update daemons set slug = 'local' where id = $1", [
-      connectedDaemonId,
-    ]);
-    await this.requireSource().restart();
-    await this.daemonIsConnected();
-    await this.seedCurrentProjectResources();
+    await this.prepareSourceCliDeployment();
     await this.waitForBundleProviders(sourceFiles);
 
     const revisionsBeforeDryRun = await this.configurationRevisionCount();
@@ -326,6 +302,22 @@ export class HubE2E {
         classifierPartial: classifier.prompt[0],
       },
     };
+  }
+
+  private async prepareSourceCliDeployment(): Promise<void> {
+    const daemon = await this.requirePool().query<{ id: string }>(
+      "select id from daemons where presence = 'connected' order by connected_at desc limit 1",
+    );
+    const connectedDaemonId = daemon.rows[0]?.id;
+    if (!connectedDaemonId) {
+      throw new Error("Connected daemon is unavailable for source CLI deployment");
+    }
+    await this.requirePool().query("update daemons set slug = 'local' where id = $1", [
+      connectedDaemonId,
+    ]);
+    await this.requireSource().restart();
+    await this.daemonIsConnected();
+    await this.seedCurrentProjectResources();
   }
 
   async createUnrelatedLocalAgent(): Promise<string> {
@@ -1307,11 +1299,16 @@ export class HubE2E {
       ownedProcesses: ownedProcessDescriptions,
       leakedProcesses,
     };
+    this.reportShutdown(evidence, failures);
+    return evidence;
+  }
+
+  private reportShutdown(evidence: ShutdownEvidence, failures: unknown[]): void {
+    const { leakedProcesses } = evidence;
     process.stdout.write(`Hub E2E shutdown ${JSON.stringify(evidence)}\n`);
     if (leakedProcesses.length > 0)
       failures.push(new Error(`Hub E2E leaked owned processes: ${leakedProcesses.join(", ")}`));
     if (failures.length > 0) throw new AggregateError(failures, "Hub E2E cleanup failed");
-    return evidence;
   }
 
   private async stopOwnedChild(
