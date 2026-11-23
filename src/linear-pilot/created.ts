@@ -117,7 +117,8 @@ function delegationClient(
 function failedReadback(error: unknown) {
   return {
     reason: "origin_unproven" as const,
-    details: error instanceof LinearAgentError ? error.details : undefined,
+    stage: "readback_failed" as const,
+    ...(error instanceof LinearAgentError ? { ...error.details, linearAgentCode: error.code } : {}),
   };
 }
 
@@ -144,7 +145,7 @@ async function readDelegation(
     client.readDelegationOrigin(scope, signal),
   ).catch(failedReadback);
   if ("historyEntryId" in proof) return finishDelegation(context, receipt, activity, proof);
-  logPilotRefusal(proof.reason, metadata, "details" in proof ? proof.details : undefined);
+  logPilotRefusal(proof.reason, metadata, proof);
   return refuseDelegation(context, activity, { ...receipt, refusal: proof.reason });
 }
 
@@ -194,7 +195,12 @@ async function publishDelegationRefusal(
   const metadata = createdMetadata(activity.nativeSessionId);
   const client = tracePilotActivities(
     delegationClient(context, activity, true),
-    (operation, error) => logPilotRefusal(operation, metadata, failedReadback(error).details),
+    (operation, error) =>
+      logPilotRefusal(
+        operation,
+        metadata,
+        error instanceof LinearAgentError ? error.details : undefined,
+      ),
   );
   await createLinearPilotActivities({ clientFor: () => client }).refuseDelegation(activity);
   return undefined;

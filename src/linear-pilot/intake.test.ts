@@ -5,6 +5,7 @@ import {
   MAX_PILOT_MESSAGE_CHARS,
   precheckLinearPilotScope,
   verifyLinearPilotIntake,
+  type DelegationFallback,
   type LinearPilotIntakeResult,
   type LinearPilotRefusal,
 } from "./intake.js";
@@ -65,23 +66,13 @@ describe("verifyLinearPilotIntake created", () => {
     expect(JSON.stringify(accepted(body))).not.toContain("SECRET-CONTEXT");
   });
 
-  it("refuses a creator substituted by automation: no creator, other creator, or other comment author", () => {
+  it("refuses a missing or non-owner creator even with an unproven comment", () => {
     const session = ["agentSession"];
-    expect(refused(mutate(createdPayload(), [...session, "creatorId"], null))).toBe(
-      "missing_creator",
-    );
-    expect(refused(mutate(createdPayload(), [...session, "creatorId"], undefined))).toBe(
-      "missing_creator",
-    );
-    expect(refused(mutate(createdPayload(), [...session, "creatorId"], "human-other-0001"))).toBe(
+    const payload = mutate(createdPayload(), [...session, "comment", "userId"], null);
+    expect(refused(mutate(payload, [...session, "creatorId"], null))).toBe("missing_creator");
+    expect(refused(mutate(payload, [...session, "creatorId"], undefined))).toBe("missing_creator");
+    expect(refused(mutate(payload, [...session, "creatorId"], "human-other-0001"))).toBe(
       "not_owner",
-    );
-    // The owner is the creator, but the signed comment was written by someone else.
-    expect(
-      refused(mutate(createdPayload(), [...session, "comment", "userId"], "human-other-0001")),
-    ).toBe("origin_unproven");
-    expect(refused(mutate(createdPayload(), [...session, "comment", "userId"], null))).toBe(
-      "origin_unproven",
     );
   });
 
@@ -94,9 +85,7 @@ describe("verifyLinearPilotIntake created", () => {
       }
       expect(accepted(payload)).toMatchObject({ kind: "created", pendingDelegation: true });
       expect(accepted(payload)).not.toHaveProperty("message");
-      for (const key of ["comment", "commentId", "sourceCommentId"]) {
-        expect(refused(mutate(payload, [...s, key], "present"))).toBe("origin_unproven");
-      }
+      expect(accepted(payload)).not.toHaveProperty("delegationFallback");
       const other = mutate(payload, [...s, "creatorId"], "other-human");
       expect(precheckLinearPilotScope({ config: PILOT_CONFIG, payload: other })).toEqual({
         ok: false,
@@ -107,19 +96,27 @@ describe("verifyLinearPilotIntake created", () => {
     }
   });
 
-  it("refuses a session whose linked comment or issue is missing or inconsistent", () => {
+  it.each<[string[], Json | undefined, DelegationFallback]>([
+    [["comment"], null, "comment_missing"],
+    [["commentId"], undefined, "comment_id_mismatch"],
+    [["commentId"], "comment-other", "comment_id_mismatch"],
+    [["comment", "issueId"], undefined, "comment_issue_mismatch"],
+    [["comment", "issueId"], "issue-other", "comment_issue_mismatch"],
+    [["comment", "userId"], null, "comment_author_mismatch"],
+    [["comment", "userId"], "human-other-0001", "comment_author_mismatch"],
+    [["sourceCommentId"], "comment-other", "source_mismatch"],
+  ])("requires readback for unproven owner comment field %j = %j (%s)", (path, value, stage) => {
+    const event = accepted(mutate(createdPayload(), ["agentSession", ...path], value));
+    expect(event).toMatchObject({
+      kind: "created",
+      pendingDelegation: true,
+      delegationFallback: stage,
+    });
+    expect(event).not.toHaveProperty("message");
+  });
+
+  it("refuses a session whose issue is missing or inconsistent", () => {
     const s = ["agentSession"];
-    expect(refused(mutate(createdPayload(), [...s, "commentId"], null))).toBe("origin_unproven");
-    expect(refused(mutate(createdPayload(), [...s, "comment"], null))).toBe("origin_unproven");
-    expect(refused(mutate(createdPayload(), [...s, "commentId"], "comment-other"))).toBe(
-      "origin_unproven",
-    );
-    expect(refused(mutate(createdPayload(), [...s, "comment", "issueId"], "issue-other"))).toBe(
-      "origin_unproven",
-    );
-    expect(refused(mutate(createdPayload(), [...s, "sourceCommentId"], "comment-other"))).toBe(
-      "origin_unproven",
-    );
     expect(refused(mutate(createdPayload(), [...s, "issue", "id"], "issue-other"))).toBe(
       "session_mismatch",
     );
@@ -130,9 +127,9 @@ describe("verifyLinearPilotIntake created", () => {
     );
   });
 
-  it("accepts a source comment only when it is the linked comment", () => {
+  it("uses the linked comment text when its source matches", () => {
     const body = mutate(createdPayload(), ["agentSession", "sourceCommentId"], "comment-5e5e");
-    expect(accepted(body).kind).toBe("created");
+    expect(accepted(body)).toEqual(accepted(createdPayload()));
   });
 
   it("bounds the comment text: empty and over-limit refuse, the limit itself passes", () => {
@@ -392,7 +389,7 @@ describe("verifyLinearPilotIntake scope", () => {
     expect(accepted(poisoned).kind).toBe("created");
   });
 
-  it("never logs or leaks the body, even on refusal", () => {
+  it("never logs or leaks the body on delegation fallback", () => {
     const sinks = [
       vi.spyOn(console, "log"),
       vi.spyOn(console, "error"),
@@ -407,7 +404,7 @@ describe("verifyLinearPilotIntake scope", () => {
     );
     const withSecret = mutate(body, ["agentSession", "comment", "body"], "TOP-SECRET-COMMENT");
     const result = intake(withSecret);
-    expect(result.ok).toBe(false);
+    expect(result).toMatchObject({ ok: true, event: { pendingDelegation: true } });
     expect(JSON.stringify(result)).not.toContain("TOP-SECRET-COMMENT");
     for (const sink of sinks) expect(sink).not.toHaveBeenCalled();
   });
@@ -426,12 +423,6 @@ describe("verifyLinearPilotIntake generated cases", () => {
     { path: ["agentSession", "organizationId"], values: ["org-x", null], applies: ["all"] },
     { path: ["agentSession", "issueId"], values: [null, undefined], applies: ["all"] },
     { path: ["agentSession", "creatorId"], values: ["human-x", null], applies: ["created"] },
-    {
-      path: ["agentSession", "comment", "userId"],
-      values: ["human-x", null],
-      applies: ["created"],
-    },
-    { path: ["agentSession", "commentId"], values: ["comment-x", null], applies: ["created"] },
     { path: ["agentSession", "comment", "body"], values: ["", null, 9], applies: ["created"] },
     { path: ["agentActivity", "userId"], values: ["human-x", null], applies: ["prompted", "stop"] },
     {

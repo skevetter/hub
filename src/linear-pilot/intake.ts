@@ -22,6 +22,13 @@ export interface LinearPilotInstallation {
   readonly oauthClientId: string;
 }
 
+export type DelegationFallback =
+  | "comment_missing"
+  | "comment_id_mismatch"
+  | "comment_issue_mismatch"
+  | "comment_author_mismatch"
+  | "source_mismatch";
+
 export interface LinearPilotEvent {
   kind: "created" | "prompted" | "stop";
   workspaceId: string;
@@ -34,6 +41,7 @@ export interface LinearPilotEvent {
   activityId?: string;
   message?: string;
   pendingDelegation?: true;
+  delegationFallback?: DelegationFallback;
   /**
    * Stop only. Epoch ms of the signed `agentActivity.createdAt`, present only when that field is
    * a strict UTC ISO-8601 timestamp. Absent means the time evidence is unusable: the caller must
@@ -52,7 +60,6 @@ export type LinearPilotRefusal =
   | "session_mismatch"
   | "missing_creator"
   | "not_owner"
-  | "origin_unproven"
   | "activity_mismatch"
   | "unsupported_signal"
   | "unqualified_content"
@@ -221,17 +228,16 @@ function readCreatedComment(
     source,
   }: { rawComment: unknown; rawCommentId: unknown; source: unknown },
 ): LinearPilotIntakeResult {
+  const fallback = (delegationFallback: DelegationFallback) =>
+    accept(scope, "created", humanId, { pendingDelegation: true, delegationFallback });
   const comment = plain(rawComment);
+  if (comment === undefined) return fallback("comment_missing");
   const commentId = id(rawCommentId);
-  if (comment === undefined || commentId === undefined) return refuse("origin_unproven");
-  if (
-    id(field(comment, "id")) !== commentId ||
-    id(field(comment, "issueId")) !== scope.issueId ||
-    id(field(comment, "userId")) !== humanId ||
-    (source != null && source !== commentId)
-  ) {
-    return refuse("origin_unproven");
-  }
+  if (commentId === undefined || id(field(comment, "id")) !== commentId)
+    return fallback("comment_id_mismatch");
+  if (id(field(comment, "issueId")) !== scope.issueId) return fallback("comment_issue_mismatch");
+  if (id(field(comment, "userId")) !== humanId) return fallback("comment_author_mismatch");
+  if (source != null && source !== commentId) return fallback("source_mismatch");
   const message = readText(field(comment, "body"));
   if ("refusal" in message) return refuse(message.refusal);
   return accept(scope, "created", humanId, { message: message.text });
@@ -313,7 +319,10 @@ function accept(
   {
     stopCreatedAtMs,
     ...extra
-  }: Pick<LinearPilotEvent, "activityId" | "message" | "pendingDelegation"> & {
+  }: Pick<
+    LinearPilotEvent,
+    "activityId" | "message" | "pendingDelegation" | "delegationFallback"
+  > & {
     stopCreatedAtMs?: number | undefined;
   },
 ): LinearPilotIntakeResult {

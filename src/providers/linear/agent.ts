@@ -188,7 +188,7 @@ type Send = <T>(
 
 const delegationOriginQuery = `query PaseoPilotDelegationOrigin($sessionId: String!) {
   agentSession(id: $sessionId) {
-    id createdAt appUser { id } creator { id } comment { id } sourceComment { id }
+    id createdAt appUser { id } creator { id } comment { id user { id } } sourceComment { id }
     issue {
       id identifier title description team { id organization { id } }
       delegate { id } assignee { id }

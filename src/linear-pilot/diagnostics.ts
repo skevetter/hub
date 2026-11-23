@@ -1,6 +1,8 @@
 import { logger } from "../logger.js";
-import type { LinearAgentErrorDetails } from "../providers/linear/agent.js";
+import type { LinearAgentError, LinearAgentErrorDetails } from "../providers/linear/agent.js";
 import { surfaceUuid } from "../surfaces/store.js";
+import type { DelegationProofStage } from "./delegation.js";
+import type { DelegationFallback } from "./intake.js";
 
 interface DeliveryMetadata {
   nativeSessionId?: string;
@@ -30,17 +32,30 @@ export function pilotDeliveryMetadata(payload: unknown): DeliveryMetadata {
 export function logPilotRefusal(
   reason: string,
   metadata: DeliveryMetadata,
-  diagnostics?: LinearAgentErrorDetails,
+  diagnostics?: LinearAgentErrorDetails & {
+    stage?: DelegationProofStage;
+    linearAgentCode?: LinearAgentError["code"];
+  },
 ): undefined {
-  const { linearErrorType, linearErrorKinds } = diagnostics ?? {};
+  const { linearErrorType, linearErrorKinds, stage, linearAgentCode } = diagnostics ?? {};
   logger.info(
     {
       ...metadata,
       reason,
+      ...(stage === undefined ? {} : { stage }),
+      ...(linearAgentCode === undefined ? {} : { linearAgentCode }),
       ...(linearErrorType === undefined ? {} : { linearErrorType }),
       ...(linearErrorKinds === undefined ? {} : { linearErrorKinds }),
     },
     "Linear pilot refused delivery",
   );
   return undefined;
+}
+
+export function logDelegationFallback(
+  nativeSessionId: string,
+  stage: DelegationFallback | undefined,
+) {
+  if (stage !== undefined)
+    logger.info({ nativeSessionId, stage }, "Linear pilot delegation fallback");
 }

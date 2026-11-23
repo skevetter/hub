@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { delegationReadback, proveDelegation } from "./delegation.js";
+import { delegationReadback, proveDelegation, type DelegationProofStage } from "./delegation.js";
 import { MAX_PILOT_MESSAGE_CHARS, type LinearPilotEvent } from "./intake.js";
 import type { z } from "zod";
 
@@ -69,7 +69,7 @@ const prompt = {
   message: "Work on TEST-1: Title\n\nDescription.",
   historyEntryId: "history-entry",
 };
-const refused = { reason: "origin_unproven" };
+const refused = (stage: DelegationProofStage) => ({ reason: "origin_unproven", stage });
 const run = (read: (signal: AbortSignal) => Promise<Readback>, remaining = 10_000) =>
   proveDelegation(signed, Date.now() + remaining, read);
 
@@ -82,6 +82,28 @@ it("accepts delegation at the inclusive 120-second boundary and assignment at se
   await expect(
     run(async () => evidence({ delegate: null, assignee: app, history: { nodes: [entry] } })),
   ).resolves.toEqual(prompt);
+});
+
+it.each([human, null])("accepts a generated comment with user %j", async (user) => {
+  await expect(
+    run(async () => evidence({}, { comment: { id: "comment", user } })),
+  ).resolves.toEqual(prompt);
+});
+
+it("uses the newest qualifying history entry regardless of response order", async () => {
+  const nodes = [
+    history(),
+    history({ id: "tied-match", createdAt: "2026-11-22T01:01:00.000001Z" }),
+    history({ id: "newest-match", createdAt: "2026-11-22T01:01:00.000001Z" }),
+    history({ id: "older-match", createdAt: "2026-11-22T01:01:00.000000Z" }),
+    history({ id: "wrong-actor", createdAt: sessionTime, actor: other }),
+  ];
+  for (const order of [nodes, nodes.toReversed()]) {
+    await expect(run(async () => evidence({ history: { nodes: order } }))).resolves.toEqual({
+      ...prompt,
+      historyEntryId: "newest-match",
+    });
+  }
 });
 
 it.each<[string, Partial<Entry>]>([
@@ -100,23 +122,43 @@ it.each<[string, Partial<Entry>]>([
   await vi.advanceTimersByTimeAsync(999);
   expect(read).toHaveBeenCalledTimes(1);
   await vi.advanceTimersByTimeAsync(1);
-  await expect(proof).resolves.toEqual(refused);
+  await expect(proof).resolves.toEqual(refused("no_history_match"));
   expect(read).toHaveBeenCalledTimes(2);
 });
 
-it.each<[string, Readback]>([
-  ["current delegate and assignee both differ", evidence({ delegate: other, assignee: other })],
-  ["creator mismatch", evidence({}, { creator: other })],
-  ["session comment present", evidence({}, { comment: { id: "comment" } })],
-  ["source comment present", evidence({}, { sourceComment: { id: "comment" } })],
-  ["session mismatch", evidence({}, { id: "other-session" })],
-  ["app mismatch", evidence({}, { appUser: other })],
-  ["issue mismatch", evidence({ id: "other-issue" })],
-  ["team mismatch", evidence({ team: { id: "other-team", organization: { id: "workspace" } } })],
-  ["workspace mismatch", evidence({ team: { id: "team", organization: { id: "other" } } })],
-])("refuses %s without a re-read", async (_label, readback) => {
+it.each<[string, DelegationProofStage, Readback]>([
+  [
+    "current delegate and assignee both differ",
+    "issue_mismatch",
+    evidence({ delegate: other, assignee: other }),
+  ],
+  ["creator mismatch", "session_mismatch", evidence({}, { creator: other })],
+  [
+    "comment by another user",
+    "session_mismatch",
+    evidence({}, { comment: { id: "comment", user: other } }),
+  ],
+  [
+    "source comment present",
+    "session_mismatch",
+    evidence({}, { sourceComment: { id: "comment" } }),
+  ],
+  ["session mismatch", "session_mismatch", evidence({}, { id: "other-session" })],
+  ["app mismatch", "session_mismatch", evidence({}, { appUser: other })],
+  ["issue mismatch", "issue_mismatch", evidence({ id: "other-issue" })],
+  [
+    "team mismatch",
+    "issue_mismatch",
+    evidence({ team: { id: "other-team", organization: { id: "workspace" } } }),
+  ],
+  [
+    "workspace mismatch",
+    "issue_mismatch",
+    evidence({ team: { id: "team", organization: { id: "other" } } }),
+  ],
+])("refuses %s as %s without a re-read", async (_label, stage, readback) => {
   const read = vi.fn(async () => readback);
-  await expect(run(read)).resolves.toEqual(refused);
+  await expect(run(read)).resolves.toEqual(refused(stage));
   expect(read).toHaveBeenCalledTimes(1);
 });
 
@@ -150,7 +192,7 @@ it.each([4_000, 500])("aborts an unresponsive proof after %s ms", async (effecti
   const signal = read.mock.calls[0]?.[0];
   expect(signal?.aborted).toBe(false);
   await vi.advanceTimersByTimeAsync(1);
-  await expect(proof).resolves.toEqual(refused);
+  await expect(proof).resolves.toEqual(refused("timeout"));
   expect(signal?.aborted).toBe(true);
   expect(read).toHaveBeenCalledTimes(1);
 });

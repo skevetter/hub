@@ -19,7 +19,7 @@ import { SessionEventBus } from "../interactive-sessions/bus.js";
 import { InteractiveSessionCoordinator } from "../interactive-sessions/coordinator.js";
 import { readInteractiveSessionSettings } from "../interactive-sessions/settings.js";
 import { FakeAgents } from "../interactive-sessions/test-utils/fake-agents.js";
-import { logger } from "../logger.js";
+import { logger, redact } from "../logger.js";
 import { createLinearRegistration } from "../providers/linear/index.js";
 import { prepareProfile, surfaceTenant } from "../surfaces/store.contract.js";
 import { pilotActivityIds } from "./activities.js";
@@ -100,10 +100,11 @@ async function deliver(endpoint: Endpoint, payload: JsonObject) {
   assert.equal((await endpoint.handle(signedDelivery(payload))).status, 200);
 }
 
-function removeSignedComment(payload: JsonObject, session: JsonObject, delegation: boolean) {
+function setDelegationComment(payload: JsonObject, session: JsonObject, delegation: boolean) {
   if (!delegation) return;
-  session["comment"] = null;
-  session["commentId"] = null;
+  const comment = objectAt(session, "comment");
+  comment["body"] = "Synthetic generated comment";
+  comment["userId"] = null;
   session["sourceCommentId"] = null;
   payload["promptContext"] = "not first-turn context";
 }
@@ -135,6 +136,7 @@ function delegationResult(input: {
     teamId,
     scenario,
   } = input;
+  assert.match(request.query, /comment \{ id user \{ id \} \}/u);
   assert.match(request.query, /history\(first: 20, orderBy: createdAt\)/u);
   assert.match(request.query, /nodes\s*\{\s*id createdAt/u);
   const requested = request.variables["sessionId"];
@@ -157,7 +159,7 @@ function delegationResult(input: {
         createdAt: at(0),
         appUser: app,
         creator: human,
-        comment: null,
+        comment: { id: "comment-5e5e", user: human },
         sourceComment: null,
         issue: {
           id: issueId,
@@ -257,6 +259,8 @@ function refusalDetails(scenario: RefusalScenario) {
   if (scenario === "delegation-oversized") return { reason: "oversized" };
   return {
     reason: "origin_unproven",
+    stage: "readback_failed",
+    linearAgentCode: "request_failed",
     linearErrorType: "other",
     linearErrorKinds: ["other"],
   };
@@ -295,14 +299,19 @@ async function assertDelegationRefusal(input: {
       type: "error",
       body: "Paseo could not confirm who started this. Mention @paseo in a comment instead.",
     });
-    expect(info).toHaveBeenCalledWith(
-      {
-        ...refusalDetails(scenario),
-        action: "created",
-        nativeSessionId,
-      },
-      "Linear pilot refused delivery",
-    );
+    const refusalLogs = info.mock.calls
+      .filter(([, message]) => message === "Linear pilot refused delivery")
+      .map(([fields]) => redact(fields));
+    expect(refusalLogs).toContainEqual({
+      ...refusalDetails(scenario),
+      action: "created",
+      nativeSessionId,
+    });
+    expect(
+      info.mock.calls.filter(([, message]) => message === "Linear pilot delegation fallback"),
+    ).toEqual([
+      [{ nativeSessionId, stage: "comment_author_mismatch" }, "Linear pilot delegation fallback"],
+    ]);
     await deliver(endpoint, payload);
     await vi.waitFor(() =>
       expect(info).toHaveBeenCalledWith(
@@ -557,7 +566,7 @@ async function exerciseRegisteredPilot(
       const issueId = session["issueId"];
       assert(typeof issueId === "string");
       const delegation = scenario.startsWith("delegation");
-      removeSignedComment(payload, session, delegation);
+      setDelegationComment(payload, session, delegation);
 
       function prompted(id: string, createdAt: string, body: string | null): JsonObject {
         return {

@@ -23,7 +23,7 @@ export const delegationReadback = z.object({
     createdAt: timestamp,
     appUser: ref,
     creator: ref.nullable(),
-    comment: ref.nullable(),
+    comment: ref.extend({ user: ref.nullable() }).nullable(),
     sourceComment: ref.nullable(),
     issue: ref
       .extend({
@@ -58,18 +58,31 @@ type Issue = NonNullable<Session["issue"]>;
 type MatchedDelegation =
   | { message: string; historyEntryId: string }
   | { reason: "oversized" | "unqualified_content"; historyEntryId: string };
-const unproven = { reason: "origin_unproven" } as const;
-type DelegationVerdict = MatchedDelegation | typeof unproven;
+export type DelegationProofStage =
+  | "session_mismatch"
+  | "issue_mismatch"
+  | "no_history_match"
+  | "timeout"
+  | "readback_failed";
+
+function unproven(stage: DelegationProofStage) {
+  return { reason: "origin_unproven", stage } as const;
+}
+
+const timedOut = unproven("timeout");
+const noHistoryMatch = unproven("no_history_match");
+type DelegationVerdict = MatchedDelegation | ReturnType<typeof unproven>;
 export type DelegationRefusal =
   | Extract<DelegationVerdict, { reason: string }>["reason"]
   | "origin_reused";
 
 function matchesSession(session: Session, signed: LinearPilotEvent) {
+  const commentAuthor = session.comment?.user?.id;
   return (
     session.id === signed.nativeSessionId &&
     session.appUser.id === signed.appUserId &&
     session.creator?.id === signed.humanId &&
-    session.comment === null &&
+    (commentAuthor === undefined || commentAuthor === signed.humanId) &&
     session.sourceComment === null
   );
 }
@@ -109,9 +122,29 @@ function issuePrompt(issue: Issue, historyEntryId: string): MatchedDelegation {
 
 function verify({ agentSession: session }: DelegationReadback, signed: LinearPilotEvent) {
   const { issue } = session;
-  if (!issue || !matchesSession(session, signed) || !matchesIssue(issue, signed)) return unproven;
-  const match = issue.history.nodes.find((entry) => matchesEntry(entry, session.createdAt, signed));
+  if (!matchesSession(session, signed)) return unproven("session_mismatch");
+  if (!issue || !matchesIssue(issue, signed)) return unproven("issue_mismatch");
+  const match = newestMatchingEntry(issue.history.nodes, session.createdAt, signed);
   return match && issuePrompt(issue, match.id);
+}
+
+function newestMatchingEntry(
+  entries: Issue["history"]["nodes"],
+  sessionAt: bigint,
+  signed: LinearPilotEvent,
+) {
+  let newest: (typeof entries)[number] | undefined;
+  for (const entry of entries) {
+    if (!matchesEntry(entry, sessionAt, signed)) continue;
+    if (
+      !newest ||
+      entry.createdAt > newest.createdAt ||
+      (entry.createdAt === newest.createdAt && entry.id < newest.id)
+    ) {
+      newest = entry;
+    }
+  }
+  return newest;
 }
 
 export async function proveDelegation(
@@ -120,27 +153,27 @@ export async function proveDelegation(
   read: (signal: AbortSignal) => Promise<DelegationReadback>,
 ) {
   const deadline = Math.min(ackDeadline, Date.now() + PROOF_BUDGET_MS);
-  if (Date.now() >= deadline) return unproven;
+  if (Date.now() >= deadline) return timedOut;
   const controller = new AbortController();
-  const timeout = Promise.withResolvers<typeof unproven>();
+  const timeout = Promise.withResolvers<typeof timedOut>();
   let recheck: ReturnType<typeof setTimeout> | undefined;
   const timer = setTimeout(() => {
-    timeout.resolve(unproven);
+    timeout.resolve(timedOut);
     controller.abort();
   }, deadline - Date.now());
   async function check() {
     const first = verify(await read(controller.signal), signed);
     if (first) return first;
-    if (Date.now() + HISTORY_RECHECK_MS >= deadline) return unproven;
+    if (Date.now() + HISTORY_RECHECK_MS >= deadline) return noHistoryMatch;
     await new Promise<void>((resolve) => {
       recheck = setTimeout(resolve, HISTORY_RECHECK_MS);
     });
-    if (controller.signal.aborted || Date.now() >= deadline) return unproven;
-    return verify(await read(controller.signal), signed) ?? unproven;
+    if (controller.signal.aborted || Date.now() >= deadline) return timedOut;
+    return verify(await read(controller.signal), signed) ?? noHistoryMatch;
   }
   try {
     const verdict = await Promise.race([timeout.promise, check()]);
-    return Date.now() >= deadline ? unproven : verdict;
+    return Date.now() >= deadline ? timedOut : verdict;
   } finally {
     clearTimeout(timer);
     clearTimeout(recheck);

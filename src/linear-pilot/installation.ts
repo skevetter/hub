@@ -2,7 +2,11 @@ import type { QueryHandle } from "../db/runtime/index.js";
 import { surfaceUuid } from "../surfaces/store.js";
 import type { PilotConnection } from "./binding.js";
 import type { LinearPilotConfig } from "./config.js";
-import { logPilotScopeRefusal, pilotDeliveryMetadata } from "./diagnostics.js";
+import {
+  logDelegationFallback,
+  logPilotScopeRefusal,
+  pilotDeliveryMetadata,
+} from "./diagnostics.js";
 import {
   precheckLinearPilotScope,
   verifyLinearPilotIntake,
@@ -65,17 +69,19 @@ export async function qualifyLinearPilotDelivery(
   const verified = verifyLinearPilotIntake({ config, installation, payload });
   if (!verified.ok) return refuse(verified.reason);
   const { event } = verified;
-  const { activityId, nativeSessionId, teamId } = event;
+  const { activityId, delegationFallback, nativeSessionId, teamId } = event;
   if (!teamId || !surfaceUuid(nativeSessionId)) return refuse("malformed");
   if (event.kind !== "created" && (activityId === undefined || !surfaceUuid(activityId))) {
     return refuse("malformed");
   }
+  const normalizedSessionId = nativeSessionId.toLowerCase();
+  logDelegationFallback(normalizedSessionId, delegationFallback);
   return {
     installation,
     event: {
       ...event,
       teamId,
-      nativeSessionId: nativeSessionId.toLowerCase(),
+      nativeSessionId: normalizedSessionId,
       ...(activityId === undefined ? {} : { activityId: activityId.toLowerCase() }),
     },
   };
