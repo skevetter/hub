@@ -4080,6 +4080,7 @@ class HubUser {
 
   async navigateToTeamFromMobileSidebar(): Promise<void> {
     await this.page.goto(this.origin);
+    await expect(this.page.getByRole("heading", { name: "Home" })).toBeVisible();
     const more = this.moreTrigger();
     await this.page.keyboard.press("Tab");
     await expect(this.page.getByRole("link", { name: "Skip to content" })).toBeFocused();

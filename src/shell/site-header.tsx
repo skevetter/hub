@@ -12,7 +12,7 @@ import { SiteHeaderActionsTarget } from "./site-header-actions.js";
 export function SiteHeader({ scope, project }: { scope: string; project?: string }) {
   const { breadcrumbs: trail } = usePageContext();
   return (
-    <header className="hidden shrink-0 items-center gap-2 bg-background px-4 sm:flex md:sticky md:top-0 md:z-10 md:h-12 md:border-b">
+    <header className="sticky top-0 z-10 hidden shrink-0 items-center gap-2 bg-background px-4 max-md:static sm:flex md:h-12 md:border-b">
       <SidebarTrigger className="-ml-1 hidden md:inline-flex" />
       <Separator orientation="vertical" className="mr-1 hidden h-4 md:block" />
       <nav

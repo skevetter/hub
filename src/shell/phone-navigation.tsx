@@ -1,8 +1,9 @@
-import { Ellipsis } from "lucide-react";
+import { Ellipsis, X } from "lucide-react";
 import type { ReactNode } from "react";
 
 import {
   Sheet,
+  SheetClose,
   SheetContent,
   SheetDescription,
   SheetHeader,
@@ -17,7 +18,7 @@ import { NavItem, PHONE_TAB_CLASS, type NavigationItem } from "./navigation-grou
 export function PhoneHeader() {
   const { breadcrumbs } = usePageContext();
   return (
-    <header className="sticky top-0 z-10 flex h-12 shrink-0 items-center gap-3 border-b border-rail-border bg-rail px-4 text-rail-foreground md:hidden">
+    <header className="top-0 z-10 flex h-12 shrink-0 items-center gap-3 border-b border-rail-border bg-rail px-4 text-rail-foreground max-md:sticky md:hidden">
       <span
         role="img"
         aria-label="Paseo"
@@ -51,6 +52,7 @@ export function PhoneNavigation({
         </SheetTrigger>
         <SheetContent
           side="bottom"
+          showCloseButton={false}
           className="max-h-svh gap-0 overflow-y-auto border-rail-border bg-rail text-rail-foreground md:hidden"
           style={SHEET_STYLE}
         >
@@ -59,6 +61,12 @@ export function PhoneNavigation({
             <SheetDescription className="sr-only">Navigation and account</SheetDescription>
           </SheetHeader>
           {children}
+          <SheetClose
+            aria-label="Close"
+            className="absolute top-2 right-2 grid size-11 place-items-center rounded-sm text-rail-muted hover:bg-rail-accent hover:text-rail-foreground focus-visible:outline-rail-foreground"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </SheetClose>
         </SheetContent>
       </Sheet>
     </nav>
