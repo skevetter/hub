@@ -4,7 +4,6 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { completeAppSetup } from "../auth/functions.js";
-import { useActiveAccount } from "../auth/active-account.js";
 import { AuthLayout } from "../components/app/auth-layout.js";
 import { FailureAlert, type Failure } from "../components/app/failure-alert.js";
 import { FormActions } from "../components/app/form-actions.js";
@@ -186,15 +185,14 @@ function ExitFailure({ error, onRetry }: { error: Failure; onRetry: () => void }
 }
 
 /** Instance → Apps. The same sections, later, with no journey wrapped around them. */
-export function AppsPanel() {
-  const account = useActiveAccount();
+export function AppsPanel({ organizationId }: { organizationId: string }) {
   return (
     <>
       <PageHeader
         title="Apps"
         description="The GitHub, Slack, Discord, and Linear apps Hub uses to reach your workspaces."
       />
-      <ProviderApplications surface="apps" organizationId={account.organization.id} />
+      <ProviderApplications surface="apps" organizationId={organizationId} />
     </>
   );
 }

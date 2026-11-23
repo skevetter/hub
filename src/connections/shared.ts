@@ -17,6 +17,7 @@ import {
   connectionReturnUrl,
   type ConnectionProvider,
   type ConnectionResult,
+  type ConnectionReturn,
 } from "./result-contract.js";
 
 export { CONNECTIONS_RETURN_ROUTE } from "./result-contract.js";
@@ -24,10 +25,8 @@ export { CONNECTIONS_RETURN_ROUTE } from "./result-contract.js";
 export const CONNECTION_ATTEMPT_LIFETIME_MINUTES = 10;
 
 /**
- * The only routes a connection may be sent back to besides the organization's own connections
- * page: Hub's two app surfaces. An allowlist rather than a route the caller supplies, because
- * the start request's query is reachable from the browser — an arbitrary `returnRoute` would be
- * an open redirect wearing a Hub URL.
+ * Accept only known surface tokens to prevent open redirects.
+ * Build tenant paths from the resolved organization, not the request.
  */
 const ALLOWED_RETURN_ROUTES = new Set(["/", "/apps"]);
 
@@ -48,11 +47,15 @@ export async function manageConnectionAccess(
   });
   if (tenant.membership.role === "member") throw new ConnectionAccessDeniedError();
   const requested = url.searchParams.get("returnRoute");
-  const returnRoute =
-    requested !== null && ALLOWED_RETURN_ROUTES.has(requested)
-      ? requested
-      : `/o/${tenant.organization.slug}/connections`;
+  const returnRoute = tenantReturnRoute(tenant.organization.slug, requested);
   return { account, tenant, returnRoute };
+}
+
+function tenantReturnRoute(slug: string, requested: string | null): string {
+  if (requested === null || !ALLOWED_RETURN_ROUTES.has(requested)) {
+    return `/o/${slug}/connections`;
+  }
+  return requested === "/apps" ? `/o/${slug}/settings/instance/apps` : requested;
 }
 
 export function connectionAccess(
@@ -88,16 +91,16 @@ export function connectionResult(
   returnRoute: string,
   result: ConnectionResult,
   provider: ConnectionProvider,
-  reference?: string,
 ): Response {
-  return Response.redirect(
-    connectionReturnUrl(publicBaseUrl, returnRoute, {
-      provider,
-      result,
-      ...(reference === undefined ? {} : { reference }),
-    }),
-    303,
-  );
+  return redirectConnectionResult(publicBaseUrl, returnRoute, { provider, result });
+}
+
+function redirectConnectionResult(
+  publicBaseUrl: string,
+  returnRoute: string,
+  value: ConnectionReturn,
+): Response {
+  return Response.redirect(connectionReturnUrl(publicBaseUrl, returnRoute, value), 303);
 }
 
 export async function cancelledConnectionResult(input: {
@@ -172,13 +175,11 @@ export function connectionCallbackFailure(input: {
     { logger: log, kind, diagnostic: callbackEvidence(input.request) },
   );
   const result = connectionCallbackResult(kind);
-  return connectionResult(
-    input.applicationBaseUrl,
-    input.returnRoute,
+  return redirectConnectionResult(input.applicationBaseUrl, input.returnRoute, {
     result,
-    input.provider,
-    result === "connection_unavailable" ? report.requestId : undefined,
-  );
+    provider: input.provider,
+    ...(result === "connection_unavailable" ? { reference: report.requestId } : {}),
+  });
 }
 
 export function connectionActionFailure(

@@ -1,4 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { useActiveAccount } from "../../auth/active-account.js";
 import { AppsPanel } from "../../provider-applications/panel.js";
 import { LegacyInstanceRoute } from "../../shell/legacy-instance-route.js";
 
@@ -8,9 +9,10 @@ export const Route = createFileRoute("/_shell/apps")({
 });
 
 function LegacyApps() {
+  const { organization } = useActiveAccount();
   return (
     <LegacyInstanceRoute to="/o/$organizationSlug/settings/instance/apps">
-      <AppsPanel />
+      <AppsPanel organizationId={organization.id} />
     </LegacyInstanceRoute>
   );
 }
