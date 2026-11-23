@@ -19,7 +19,9 @@ import {
   rerunFiles,
   runShards,
   shardEnvironment,
+  weighFiles,
 } from "./test-parallel.mjs";
+import baselineTimings from "./test-timings.json" with { type: "json" };
 import { fullSuiteLockHeld, runWorkerGroup, takeFullSuiteLock } from "./test-worker-group.mjs";
 
 test("partition puts each file in one shard and balances cached durations", () => {
@@ -99,6 +101,46 @@ test("cached Hub timings balance two shards and only pin files above the ideal",
   const estimated = [{ ...heavy[0], cached: false }, ...heavy.slice(1)];
   const alsoHeavy = [...estimated, { path: "known.test.ts", weight: 900 }];
   assert.equal(partitionFiles(alsoHeavy, 2)[0][0], "known.test.ts");
+});
+
+test("planning uses the baseline on a fresh cache and never reads focused timings", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "hub-planner-"));
+  t.after(() => rm(root, { recursive: true }));
+  const cacheRoot = join(root, "cache");
+  const files = ["src/daemons/daemons.test.ts", "src/app.test.ts", "new.test.ts"];
+  await mkdir(join(root, "src/daemons"), { recursive: true });
+  for (const file of files) await writeFile(join(root, file), "fixture");
+  const readPlan = () => weighFiles(root, cacheRoot, files);
+  const fresh = await readPlan();
+  assert.deepEqual(
+    fresh.slice(0, 2).map(({ weight }) => weight),
+    files.slice(0, 2).map((file) => Math.max(1, baselineTimings[file])),
+  );
+  assert.deepEqual(
+    fresh.map(({ cached }) => cached),
+    [true, true, false],
+  );
+
+  const focused = join(cacheRoot, "focused");
+  await mkdir(focused, { recursive: true });
+  const focusedResults = files.map((file) => [`project:${file}`, { duration: 5_683 }]);
+  await writeFile(join(focused, "results.json"), JSON.stringify({ results: focusedResults }));
+  assert.deepEqual(await readPlan(), fresh);
+
+  const full = join(cacheRoot, "test-parallel");
+  await mkdir(full);
+  await writeFile(
+    join(full, "results.json"),
+    JSON.stringify({ results: [[`project:${files[0]}`, { duration: 12_000 }]] }),
+  );
+  assert.deepEqual(
+    await readPlan(),
+    files.map((path, index) => ({
+      path,
+      weight: 12_000,
+      cached: index === 0,
+    })),
+  );
 });
 
 test("failure reporting keeps shard numbers and reruns failed shards in one process", async () => {
@@ -613,7 +655,8 @@ async function parallelFixture(t, run, files = ["selected.test.ts"]) {
       writeFileSync(output("--json="), JSON.stringify(files.map((file) => ({ file }))));
     } else {
       const report = { success: true, numPassedTests: 1, numFailedTests: 0, numTotalTests: 1,
-        testResults: [{ name: file, status: "passed", assertionResults: [{ status: "passed" }] }] };
+        testResults: [{ name: file, status: "passed", startTime: 1000.1, endTime: 1250.7,
+          assertionResults: [{ status: "passed" }] }] };
       const reportPath = output("--outputFile=");
       ${run}
     }
@@ -717,14 +760,10 @@ test("TERM after the serial worker exits cannot turn its report into a pass", as
   }
 });
 
-test("TERM during shard timing-cache reads preserves the prior successful cache", async (t) => {
+test("TERM during a shard report read preserves the prior timing cache", async (t) => {
   const { root, lock, args, options } = await parallelFixture(
     t,
     `
-    const { mkdirSync } = await import("node:fs");
-    const cache = join(process.env.HUB_VITEST_CACHE_DIR, "vitest/fixture");
-    mkdirSync(cache, { recursive: true });
-    writeFileSync(join(cache, "results.json"), JSON.stringify({ version: "fixture", results: [] }));
     writeFileSync(reportPath, JSON.stringify(report));
     `,
   );
@@ -744,7 +783,7 @@ test("TERM during shard timing-cache reads preserves the prior successful cache"
     const readFile = fs.readFile;
     fs.readFile = async (path, ...args) => {
       const data = await readFile(path, ...args);
-      if (String(path).endsWith("/vite/vitest/fixture/results.json")) {
+      if (String(path).endsWith("/shard-1/results.json")) {
         const keepAlive = setInterval(() => {}, 1000);
         const signal = once(process, "SIGTERM");
         writeFileSync(${JSON.stringify(marker)}, "");
@@ -772,14 +811,14 @@ test("TERM during shard timing-cache reads preserves the prior successful cache"
   try {
     await waitFor(
       () => existsSync(marker) || caller.exitCode !== null,
-      "timing cache was not read",
+      "shard report was not read",
     );
     assert.ok(existsSync(marker), output);
     const result = once(caller, "exit", { signal: AbortSignal.timeout(4000) });
     caller.kill("SIGTERM");
     assert.deepEqual(await result, [1, null]);
     await exited;
-    assert.match(output, /Shard 1: PASS/u);
+    assert.match(output, /Shard 1: FAIL/u);
     assert.match(output, /INTERRUPTED: SIGTERM/u);
     await assert.rejects(readFile(metrics), { code: "ENOENT" });
     assert.equal(await readFile(cache, "utf8"), previous);
@@ -797,9 +836,69 @@ test("TERM during shard timing-cache reads preserves the prior successful cache"
   });
   assert.equal(passing.status, 0, passing.stderr);
   const saved = JSON.parse(await readFile(metrics, "utf8"));
-  assert.equal(JSON.parse(await readFile(cache, "utf8")).version, "fixture");
+  assert.deepEqual(JSON.parse(await readFile(cache, "utf8")), {
+    version: 1,
+    results: [["selected.test.ts", { duration: 251 }]],
+  });
   assert.deepEqual(saved.selectedFiles, ["selected.test.ts"]);
   assert.deepEqual(saved.counts, { passed: 1, failed: 0, skipped: 0 });
+});
+
+test("timings are saved only when every shard finished, even if assertions failed", async (t) => {
+  const { root, args, options } = await parallelFixture(
+    t,
+    `
+    const result = report.testResults[0];
+    result.name = files.find((name) => process.argv.includes(name));
+    const mode = process.env.FIXTURE_RUN_MODE;
+    if (result.name === files[0]) {
+      if (["failed", "fork-crash", "signal"].includes(mode)) {
+        result.status = "failed";
+        result.assertionResults[0].status = "failed";
+        report.numPassedTests = 0;
+        report.numFailedTests = 1;
+        report.success = false;
+        process.exitCode = 1;
+      }
+      if (mode === "fork-crash") console.error("Vitest caught 1 unhandled error during the test run.");
+      if (mode === "pending") result.assertionResults[0].status = "pending";
+      if (mode === "empty") result.assertionResults = [];
+      if (mode === "missing") report.testResults = [];
+    }
+    writeFileSync(reportPath, JSON.stringify(report));
+    if (result.name === files[0] && mode === "signal") process.kill(process.pid, "SIGKILL");
+    `,
+    ["a.test.ts", "b.test.ts"],
+  );
+  const cache = join(root, "node_modules/.vite/vitest/test-parallel/results.json");
+  const previous = JSON.stringify({
+    version: 1,
+    results: [
+      ["a.test.ts", { duration: 1350 }],
+      ["b.test.ts", { duration: 750 }],
+    ],
+  });
+  for (const mode of ["failed", "fork-crash", "signal", "pending", "empty", "missing"]) {
+    await writeFile(cache, previous);
+    const run = spawnSync(process.execPath, args, {
+      ...options,
+      env: { ...options.env, TEST_SHARDS: "2", FIXTURE_RUN_MODE: mode },
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    assert.equal(run.status, 1, `${mode}: ${run.error ?? run.stderr}`);
+    assert.match(run.stdout, /Shard 1 estimate: 1\.35s \(1 files\)/u);
+    assert.match(run.stdout, /Shard 2 estimate: 0\.75s \(1 files\)/u);
+    const saved = await readFile(cache, "utf8");
+    if (mode === "failed") {
+      assert.deepEqual(Object.fromEntries(JSON.parse(saved).results), {
+        "a.test.ts": { duration: 251 },
+        "b.test.ts": { duration: 251 },
+      });
+    } else {
+      assert.equal(saved, previous, mode);
+    }
+  }
 });
 
 test("parallel shards and serial reruns fail when a passing worker leaves background children", async (t) => {
