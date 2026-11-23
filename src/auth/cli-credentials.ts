@@ -68,6 +68,7 @@ export class OrganizationCliCredentials {
     const used = await this.pool.query<{
       user_id: string;
       email: string;
+      email_verified: boolean;
       role: TenantRouteAccess["membership"]["role"];
     }>(
       `update organization_cli_credentials as credential
@@ -77,7 +78,7 @@ export class OrganizationCliCredentials {
          and member.organization_id = credential.organization_id
          and member.user_id = credential.created_by_user_id
          and member.role = any($2::text[])
-       returning member.user_id, member.role, account.email`,
+       returning member.user_id, member.role, account.email, account.email_verified`,
       [row.id, credentialRoles],
     );
     const user = used.rows[0];
@@ -89,7 +90,12 @@ export class OrganizationCliCredentials {
         credentialId: row.id,
         organizationId: row.organization_id,
         scopes: CLI_SCOPES,
-        user: { id: user.user_id, email: user.email, role: user.role },
+        user: {
+          id: user.user_id,
+          email: user.email,
+          emailVerified: user.email_verified,
+          role: user.role,
+        },
       },
     };
   }

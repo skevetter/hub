@@ -77,6 +77,7 @@ import type { createLinearPilotRuntime } from "./linear-pilot/runtime.js";
 export interface ApplicationCompositionOptions {
   database: Database | null;
   databaseQuery?: QueryHandle;
+  verifiedActorEmailRequired?: boolean;
   auth: AuthServer | null;
   /** The composition root's single EntitlementsService; present whenever a database is. */
   entitlements: EntitlementsService | null;
@@ -225,6 +226,7 @@ function hubApplicationSettings(
       : { githubNotifications: options.githubNotifications }),
     scriptLimits: options.scriptLimits,
     webhookOptions: options.webhookOptions,
+    verifiedActorEmailRequired: options.verifiedActorEmailRequired === true,
   };
 }
 
@@ -935,6 +937,8 @@ function triggerDashboardFor(
     : new TriggerDashboard(options.database, options.auth, hub.agentValidator, {
         stopRun: hub.stopRun,
         dispatchManualRun: hub.dispatchManualRun,
+        verifiedActorEmailRequired: options.verifiedActorEmailRequired === true,
+        databaseQuery: options.databaseQuery,
         githubNotificationsEnabled: options.githubNotifications !== undefined,
         runProgress: options.runProgress ?? readRunProgressSettings({}),
         ...(reconciler === undefined ? {} : { reconciler }),

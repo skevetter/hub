@@ -1,4 +1,5 @@
 import type { AuthServer } from "../auth/server.js";
+import type { QueryResult } from "../db/runtime/index.js";
 import { capabilitiesFor } from "../auth/organization-policy.js";
 import type {
   ActivityRunKey,
@@ -47,9 +48,15 @@ const triggerIdSchema = z.uuid();
 type DashboardTenant = Awaited<ReturnType<typeof resolveRouteTenant>>["tenant"];
 type ActivityCursor = ReturnType<typeof decodeActivityCursor>;
 
+interface ActorEmailQuery {
+  query(sql: string, params: readonly unknown[]): Promise<QueryResult<{ email_verified: boolean }>>;
+}
+
 export interface TriggerDashboardOptions {
   stopRun?: StopRun;
   dispatchManualRun?: DispatchResolvedManualRun;
+  verifiedActorEmailRequired?: boolean;
+  databaseQuery?: ActorEmailQuery | undefined;
   /** True when this Hub has a token for the GitHub notification poll. The token never leaves it. */
   githubNotificationsEnabled?: boolean;
   progressMessagesEnabled?: boolean;
@@ -281,6 +288,12 @@ export class TriggerDashboard {
     if (this.options.dispatchManualRun === undefined)
       return { status: "infrastructure_unavailable" };
     const { id, email } = account.account;
+    if (
+      this.options.verifiedActorEmailRequired === true &&
+      !(await this.hasVerifiedActorEmail(id, email))
+    ) {
+      return { status: "actor_forbidden", reason: "unverified_email" };
+    }
     return this.options.dispatchManualRun({
       identity: {
         organizationId,
@@ -295,6 +308,14 @@ export class TriggerDashboard {
         input: input.input === undefined ? "" : input.input,
       },
     });
+  }
+
+  private async hasVerifiedActorEmail(userId: string, email: string): Promise<boolean> {
+    const result = await this.options.databaseQuery?.query(
+      'select email_verified from "user" where id = $1 and email = $2',
+      [userId, email],
+    );
+    return result?.rows[0]?.email_verified === true;
   }
 
   private async runDetailForProject(

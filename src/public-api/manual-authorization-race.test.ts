@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { describe, it, vi } from "vitest";
 import { z } from "zod";
+import { createHubApplication } from "../app.js";
 import { cliCredentialParts, OrganizationCliCredentials } from "../auth/cli-credentials.js";
+import { PublicCredentialAuthenticator } from "../auth/public-credentials.js";
+import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
 import { OrganizationTriggerStore } from "../triggers/store.js";
@@ -46,7 +49,67 @@ function buildManualRequest(baseUrl: string, secret: string, input: ManualReques
 
 const cliEmail = "webhook@example.test";
 
+function applicationForEmailPolicy(
+  hub: Awaited<ReturnType<typeof webhookFixture>>,
+  verifiedActorEmailRequired: boolean,
+) {
+  return createHubApplication({
+    database: hub.database,
+    entitlements: createUnlimitedEntitlementsService(),
+    publicApi: {
+      status: "enabled",
+      authenticator: new PublicCredentialAuthenticator(
+        hub.keys,
+        new OrganizationCliCredentials(hub.runtime),
+      ),
+    },
+    verifiedActorEmailRequired,
+  });
+}
+
 describe("credential actors on the public manual endpoint", () => {
+  it.each([
+    [true, false],
+    [true, true],
+    [false, false],
+    [false, true],
+  ])(
+    "checks CLI email when mail is %s and verification is %s",
+    async (mail, verified) => {
+      const hub = await webhookFixture();
+      const application = applicationForEmailPolicy(hub, mail);
+      try {
+        await hub.runtime.query('update "user" set email_verified = $1 where id = $2', [
+          verified,
+          "webhook-owner",
+        ]);
+        const trigger = await hub.save("cli-email-verification", { actor: cliEmail });
+        const credential = await hub.cliCredential();
+        await application.hub.start();
+        const result = await manualRequest(application.publicApi, credential, {
+          trigger: trigger.name,
+        });
+        const receipts = await hub.runtime.query(
+          "select id from provider_event_receipts where organization_id = $1 and source = 'manual.run'",
+          ["webhook-a"],
+        );
+        if (mail && !verified) {
+          assert.equal(result.status, 403);
+          assert.equal(ProblemSchema.parse(await result.json()).code, "actor_forbidden");
+          assert.deepEqual(receipts.rows, []);
+        } else {
+          assert.equal(result.status, 200);
+          const dispatched = DispatchedManualRunSchema.parse(await result.json());
+          assert.deepEqual(receipts.rows, [{ id: dispatched.providerEventReceiptId }]);
+        }
+      } finally {
+        await application.hub.stop();
+        await hub.close();
+      }
+    },
+    120_000,
+  );
+
   it("uses the lowercase account email for CLI credentials over HTTP", async () => {
     const hub = await webhookFixture();
     try {

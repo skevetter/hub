@@ -97,6 +97,7 @@ export interface HubRuntimeOptions {
   /** How many script steps may run at once. */
   scriptLimits?: ScriptLimits | undefined;
   webhookOptions?: WebhookOptions | undefined;
+  verifiedActorEmailRequired?: boolean;
   onProgressRequested?: DurableWorkflowEngineOptions["onProgressRequested"];
   onRunReplyAnswer?: NonNullable<DaemonDispatchLifecycleOptions["onRunReplyAnswer"]>;
   runTimeline?: RunTimeline;
@@ -611,6 +612,7 @@ function createAppPublicOperations(
   return createPublicOperations(
     createDatabasePublicOperationRepository(database),
     {
+      verifiedActorEmailRequired: options.verifiedActorEmailRequired === true,
       stopRun,
       triggerForOrganization: (organizationId) =>
         createOrganizationTriggerOperations(

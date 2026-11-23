@@ -277,11 +277,15 @@ async function stopRun(
 }
 
 async function dispatchManualRun(
-  { repository, dispatchResolvedManualRun }: OperationContext,
+  { repository, capabilities, dispatchResolvedManualRun }: OperationContext,
   authorization: PublicAuthorization,
   input: Parameters<Operation<"dispatchManualRun">>[1],
 ): ReturnType<Operation<"dispatchManualRun">> {
-  const resolved = resolveManualActor(authorization, input.actor);
+  const resolved = resolveManualActor(
+    authorization,
+    input.actor,
+    capabilities.verifiedActorEmailRequired === true,
+  );
   if (resolved.status !== "resolved") return resolved;
   try {
     const project = await repository.resolveManualRunProject(
@@ -349,6 +353,7 @@ function triggerCapability(capabilities: PublicOperationCapabilities, organizati
 function resolveManualActor(
   authorization: PublicAuthorization,
   claimed: string | undefined,
+  verifiedActorEmailRequired: boolean,
 ):
   | { status: "resolved"; actor: string }
   | Extract<
@@ -356,9 +361,7 @@ function resolveManualActor(
       { status: "actor_forbidden" | "invalid_input" | "key_actor_required" }
     > {
   if (authorization.kind === "cliCredential") {
-    const email = authorization.user?.email;
-    if (!email) return { status: "key_actor_required" };
-    return resolveBoundManualActor(email.toLowerCase(), claimed);
+    return resolveCliManualActor(authorization.user, claimed, verifiedActorEmailRequired);
   }
   if (claimed !== undefined && isReservedManualActor(claimed)) return { status: "actor_forbidden" };
   if (authorization.actor != null) return resolveBoundManualActor(authorization.actor, claimed);
@@ -367,6 +370,18 @@ function resolveManualActor(
     status: "invalid_input",
     issues: [{ path: ["actor"], message: "An actor is required for an unbound credential." }],
   };
+}
+
+function resolveCliManualActor(
+  user: PublicAuthorization["user"],
+  claimed: string | undefined,
+  verifiedActorEmailRequired: boolean,
+) {
+  const email = user?.email;
+  if (!email) return { status: "key_actor_required" } as const;
+  if (verifiedActorEmailRequired && user?.emailVerified !== true)
+    return { status: "actor_forbidden" } as const;
+  return resolveBoundManualActor(email.toLowerCase(), claimed);
 }
 
 function resolveBoundManualActor(actor: string, claimed: string | undefined) {

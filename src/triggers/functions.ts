@@ -85,6 +85,12 @@ export const runManualTrigger = createServerFn({ method: "POST" })
       if (dashboard == null) return manualRunError("infrastructure_unavailable");
       const result = await dashboard.runManualTrigger(getRequest(), data);
       if (result.status === "dispatched") return respondOk({ runId: result.triggerRunId });
+      if (result.status === "actor_forbidden" && result.reason === "unverified_email")
+        return manualRunError(
+          "actor_forbidden",
+          undefined,
+          "Verify your email to run this trigger.",
+        );
       return manualRunError(
         result.status,
         result.status === "invalid_input" ? result.issues : undefined,
@@ -119,8 +125,10 @@ const manualRunErrors = {
 function manualRunError(
   code: keyof typeof manualRunErrors,
   issues?: readonly { path: readonly (string | number)[]; message: string }[],
+  messageOverride?: string,
 ) {
-  const [status, message] = manualRunErrors[code];
+  const [status, defaultMessage] = manualRunErrors[code];
+  const message = messageOverride ?? defaultMessage;
   setResponseStatus(status);
   return {
     ...respondError({ message }),

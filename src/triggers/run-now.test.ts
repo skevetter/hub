@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHubApplication } from "../app.js";
 import type { AuthServer } from "../auth/server.js";
@@ -6,7 +6,7 @@ import { createMemoryDatabase } from "../db/memory.js";
 import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
-import { TriggerDashboard } from "./dashboard.js";
+import { TriggerDashboard, type TriggerDashboardOptions } from "./dashboard.js";
 import { createManualRunProvider } from "./manual/provider.js";
 import { OrganizationTriggerStore } from "./store.js";
 
@@ -111,13 +111,14 @@ describe("Run now", () => {
     await hub.application.hub.stop();
   });
 
-  function useAccount(userId: string, accountEmail: string) {
+  function useAccount(userId: string, accountEmail: string, options?: TriggerDashboardOptions) {
     const triggerDashboard = new TriggerDashboard(
       hub.database,
       accountAuth(userId, accountEmail),
       validator,
       {
         dispatchManualRun: hub.application.hub.dispatchManualRun,
+        ...options,
       },
     );
     getApplication.mockResolvedValue({ triggerDashboard });
@@ -137,6 +138,55 @@ describe("Run now", () => {
       data: { organizationSlug: "acme", triggerId, deliveryKey: randomUUID(), ...data },
     });
   }
+
+  it.each([
+    [true, false],
+    [true, true],
+    [false, false],
+    [false, true],
+  ])("checks browser email when mail is %s and verification is %s", async (mail, verified) => {
+    const query = vi
+      .fn<NonNullable<TriggerDashboardOptions["databaseQuery"]>["query"]>()
+      .mockResolvedValue({
+        rows: [{ email_verified: verified }],
+        rowCount: 1,
+      });
+    useAccount(memberId, email, {
+      verifiedActorEmailRequired: mail,
+      databaseQuery: { query },
+    });
+    const trigger = await save({ actor: email });
+    const deliveryKey = randomUUID();
+    const result = await run(trigger.id, { deliveryKey });
+    const hash = createHash("sha256")
+      .update(
+        [organizationId, trigger.runtimeProjectId, deliveryKey, memberId]
+          .map((part) => JSON.stringify(part))
+          .join(":"),
+      )
+      .digest("base64url");
+    const receipt = await hub.database.findProviderEventReceiptByDeliveryId(
+      `browser-manual-${hash}`,
+      organizationId,
+    );
+    expect(query).toHaveBeenCalledTimes(mail ? 1 : 0);
+    if (mail)
+      expect(query).toHaveBeenCalledWith(expect.stringContaining("email_verified"), [
+        memberId,
+        email,
+      ]);
+    if (mail && !verified) {
+      expect(result).toStrictEqual({
+        status: "error",
+        error: { code: "actor_forbidden", message: "Verify your email to run this trigger." },
+      });
+      expect(setResponseStatus).toHaveBeenCalledWith(403);
+      expect(receipt).toBeUndefined();
+    } else {
+      expect(result).toMatchObject({ status: "ok" });
+      expect(receipt).toBeDefined();
+    }
+  });
 
   it.each([
     ["*", email],

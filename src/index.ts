@@ -140,6 +140,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
     const application = await createApplicationRuntime({
       database,
       databaseQuery: runtime,
+      verifiedActorEmailRequired: access.accountMailer !== undefined,
       auth,
       entitlements: access.entitlements.service,
       billing: access.billing,

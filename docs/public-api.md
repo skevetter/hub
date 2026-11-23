@@ -178,8 +178,8 @@ For manual runs, `deliveryKey` is required. The credential determines the actor:
 - An unbound API key must supply a slug actor. API keys cannot claim an actor containing `@`.
 
 Email entries in `from_users` must be lowercase. With an account mailer configured, sign-in
-requires a verified email. Without a mailer, Hub trusts account emails as set up by the operator
-and does not verify ownership of those addresses.
+requires a verified email, and manual runs using an unverified account return `403 actor_forbidden`.
+Without a mailer, Hub trusts account emails as set up by the operator and does not verify ownership.
 
 A mismatched or forbidden claim returns `403 actor_forbidden` without recording a delivery.
 Script actions require a bound API key. CLI credentials and unbound keys cannot start them.

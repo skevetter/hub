@@ -66,8 +66,9 @@ without starting a run. Trigger names are case sensitive and match `^[a-z][a-z0-
 
 Signed-in organization members can use **Run now** on an enabled `manual.run` trigger. Email
 entries in `from_users` must be lowercase. Use `"*"` to allow any member of the organization.
-With an account mailer configured, sign-in requires a verified email. Without a mailer, Hub trusts
-account emails as set up by the operator and does not verify ownership of those addresses.
+With an account mailer configured, sign-in requires a verified email, and manual runs using an
+unverified account return `403 actor_forbidden`. Without a mailer, Hub trusts account emails as
+set up by the operator and does not verify ownership.
 
 The manual runs API uses the CLI credential's lowercase account email or the bound API key's
 configured actor. Omit `actor` or send the exact value for either credential. An unbound API key
