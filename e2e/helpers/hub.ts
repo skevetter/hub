@@ -131,8 +131,6 @@ async function organizationDestinations(navigation: Locator): Promise<readonly s
   return destinations;
 }
 
-/** Instance surfaces sit outside `/o/`, so the path is what says the sidebar is in instance scope. */
-const INSTANCE_ROUTES: readonly string[] = ["/apps", "/operator"];
 const ORGANIZATION_SETTINGS_SECTIONS: readonly OrganizationSettingsSection[] = [
   "Team",
   "API keys",
@@ -387,7 +385,7 @@ export class PaseoHub {
         await surface.expectManagement();
       },
       navigateToApps: async () => {
-        await new ProjectNavigation(page).openInstanceSection(input.account.email, "Apps");
+        await new ProjectNavigation(page).openInstanceSection("Apps");
         await surface.expectManagement();
       },
       returnFromProvider: async (provider, result) => {
@@ -4161,18 +4159,10 @@ class HubUser {
     await expectAccessible(this.page);
   }
 
-  /**
-   * A non-operator is offered the instance nowhere. It is not in the sidebar body in any scope,
-   * and the account menu it now enters through does not list it either.
-   */
   async expectNoOperatorNav(): Promise<void> {
-    await this.openOrganizationSection("Triggers");
-    await expect(this.page.getByRole("navigation", { name: "Instance" })).toHaveCount(0);
-    await expect(this.page.getByRole("link", { name: "Operator", exact: true })).toHaveCount(0);
-    const menu = await this.navigation.openAccountMenu(this.accountEmail);
-    await expect(menu.getByRole("menuitem", { name: "Instance administration" })).toHaveCount(0);
-    await this.page.keyboard.press("Escape");
-    await expect(menu).toBeHidden();
+    await this.openOrganizationSection("Team");
+    const settings = this.page.getByRole("navigation", { name: "Organization settings" });
+    await expect(settings.getByRole("link", { name: "Instance", exact: true })).toHaveCount(0);
   }
 
   /** A non-operator reaching the operator route is refused server-side, not merely un-navigated to. */
@@ -4182,7 +4172,7 @@ class HubUser {
   }
 
   async openOperatorConsole(): Promise<void> {
-    await this.navigation.openInstanceSection(this.accountEmail, "Operator");
+    await this.navigation.openInstanceSection("Operator");
     await expect(
       this.page.getByRole("heading", { name: "Operator", exact: true, level: 1 }),
     ).toBeVisible();
@@ -5299,19 +5289,12 @@ class HubUser {
     await expect(this.page.getByRole("heading", { name, exact: true, level: 1 })).toBeVisible();
   }
 
-  /**
-   * The sidebar body lists one scope's destinations, so organization destinations are not
-   * reachable from inside a project or from the instance. Take whichever back row the scope
-   * offers, exactly as a user would.
-   */
   private async returnToOrganizationScope(): Promise<void> {
     const pathname = new URL(this.page.url()).pathname;
-    const instance = INSTANCE_ROUTES.includes(pathname);
-    if (!instance && !/\/projects\/[^/]+\//u.test(pathname)) return;
+    if (!/\/projects\/[^/]+\//u.test(pathname)) return;
     const more = this.moreTrigger();
     if (await more.isVisible()) await more.click();
-    if (instance) await this.navigation.leaveInstance();
-    else await this.navigation.leaveProject();
+    await this.navigation.leaveProject();
     await expect(this.page.getByRole("heading", { name: "Home" })).toBeVisible();
   }
 

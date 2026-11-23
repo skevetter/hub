@@ -1,5 +1,4 @@
-import { Check, LogOut, Plus, ShieldCheck } from "lucide-react";
-import { Link } from "@tanstack/react-router";
+import { Check, LogOut, Plus } from "lucide-react";
 import { useCallback, useState, type ComponentProps } from "react";
 
 import { FormDialog } from "../components/app/form-dialog.js";
@@ -9,7 +8,6 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "../components/ui/dropdown-menu.js";
-import { useSidebar } from "../components/ui/sidebar.js";
 import { formValue } from "../auth/account-actions.js";
 import type { ActiveAccountState } from "../auth/organization-contract.js";
 import type { useOptionalRouteTenant } from "../projects/context.js";
@@ -18,8 +16,6 @@ import { SidebarSwitcher } from "./sidebar-switcher.js";
 /** The organization, project, and membership behind the URL, once the shell has resolved it. */
 export type RouteTenant = NonNullable<ReturnType<typeof useOptionalRouteTenant>>;
 
-/** Where the instance surfaces begin, for the one link into them that is not in a nav group. */
-const INSTANCE_ENTRY = "/apps";
 type OrganizationSubmit = ComponentProps<typeof FormDialog>["onSubmit"];
 
 const ROLE_LABELS: Record<string, string> = {
@@ -171,30 +167,17 @@ function OrganizationItem({
   );
 }
 
-/**
- * The account menu carries what belongs to the person rather than to a tenant. Instance
- * administration is one of those: `is_instance_operator` is a property of the user, so no
- * position inside the organization → project sidebar would be true.
- */
 export function AccountMenu({
   email,
   name,
-  operator,
   busy,
   onSignOut,
 }: {
   email: string;
   name: string;
-  operator: boolean;
   busy: boolean;
   onSignOut: () => void;
 }) {
-  const { isMobile, setOpenMobile } = useSidebar();
-  // On compact the menu opens inside the drawer covering the destination, so leaving for the
-  // instance has to dismiss it the way a sidebar destination does.
-  const navigate = useCallback(() => {
-    if (isMobile) setOpenMobile(false);
-  }, [isMobile, setOpenMobile]);
   return (
     <SidebarSwitcher
       label={email}
@@ -204,17 +187,6 @@ export function AccountMenu({
       primary={name}
       secondary={email}
     >
-      {operator ? (
-        <>
-          <DropdownMenuItem asChild>
-            <Link to={INSTANCE_ENTRY} onClick={navigate}>
-              <ShieldCheck aria-hidden="true" />
-              Instance administration
-            </Link>
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-        </>
-      ) : null}
       <DropdownMenuItem disabled={busy} onSelect={onSignOut}>
         <LogOut aria-hidden="true" />
         Sign out

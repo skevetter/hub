@@ -85,54 +85,30 @@ test("groups organization administration under one Settings entry", async ({ hub
   });
 });
 
-test.describe("instance scope", () => {
-  /**
-   * The instance is not a tenant: `is_instance_operator` belongs to the user, so no place in the
-   * organization sidebar would be true. It enters through the account menu, and once
-   * entered it is a scope of its own — its own header, its own destinations, its own way back.
-   */
-  test("enters instance scope from the organization account menu", async ({ hub, page }) => {
-    const app = projectApp(page);
-    await hub.signUpAs("owner", owner);
-    await hub.createOrganization("owner", "Acme");
-    await hub.grantOperator("owner");
+test("operators enter instance settings without leaving the organization shell", async ({
+  hub,
+  page,
+}) => {
+  const { navigation } = projectApp(page);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.grantOperator("owner");
 
-    const instanceNav = page.getByRole("navigation", { name: "Instance", exact: true });
+  await navigation.openInstanceSection("Operator");
+  await expect(page).toHaveURL(/\/o\/acme\/settings\/instance\/operator$/u);
+  await navigation.expectBreadcrumb("Acme", "Settings", "Instance", "Operator");
+  await expect(
+    page.getByRole("navigation", { name: "Instance settings" }).getByRole("link"),
+  ).toHaveText(["Apps", "Operator"]);
+  await expect(page.getByRole("combobox", { name: "Manage organization" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Organization", exact: true })).toContainText(
+    "Acme",
+  );
+  await page.screenshot({ path: `${SHOTS}/07-instance-scope.png`, fullPage: true });
 
-    await test.step("the instance is nowhere in the tenant sidebar", async () => {
-      await expect(instanceNav).toHaveCount(0);
-    });
-
-    await test.step("the account menu carries it, because the operator flag is theirs", async () => {
-      const menu = await app.navigation.openAccountMenu(owner.email);
-      await expect(menu.getByRole("menuitem", { name: "Instance administration" })).toBeVisible();
-      await page.screenshot({ path: `${SHOTS}/06-account-menu-instance.png`, fullPage: true });
-      await page.keyboard.press("Escape");
-    });
-
-    await test.step("instance scope replaces the tenant sidebar entirely", async () => {
-      await app.navigation.openInstanceSection(owner.email, "Operator");
-      await expect(page).toHaveURL(/\/operator$/u);
-      await expect(page.getByRole("navigation", { name: "Organization", exact: true })).toHaveCount(
-        0,
-      );
-      await expect(page.getByRole("navigation", { name: "Project", exact: true })).toHaveCount(0);
-      await expect(page.getByRole("button", { name: "Organization" })).toHaveCount(0);
-      await expect(instanceNav.getByRole("link")).toHaveText(["Back to Acme", "Apps", "Operator"]);
-      await app.navigation.expectBreadcrumb("Instance", "Operator");
-      // Shoot the loaded page, not its skeletons: the organization picker is the panel's own
-      // proof that its data arrived.
-      await expect(page.getByRole("combobox", { name: "Manage organization" })).toBeVisible();
-      await page.screenshot({ path: `${SHOTS}/07-instance-scope.png`, fullPage: true });
-    });
-
-    await test.step("the back row names the organization it returns to", async () => {
-      await app.navigation.leaveInstance();
-      await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
-      await expect(instanceNav).toHaveCount(0);
-      await expect(
-        page.getByRole("navigation", { name: "Organization", exact: true }),
-      ).toBeVisible();
-    });
-  });
+  await page.goto(new URL("/apps", page.url()).href);
+  await expect(page).toHaveURL(/\/o\/acme\/settings\/instance\/apps$/u);
+  await expect(page.getByRole("heading", { name: "Apps", level: 1 })).toBeVisible();
+  await navigation.leaveInstance();
+  await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
 });

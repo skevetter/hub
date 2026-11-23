@@ -57,34 +57,23 @@ export class ProjectNavigation {
       .click();
   }
 
-  /**
-   * Instance administration is outside the organization → project chain, so it is not in the
-   * sidebar body at all: it enters through the footer account menu, which the signed-in email
-   * names. Entering lands on the first instance destination; the section is then picked there.
-   */
-  async openInstanceSection(account: string, name: InstanceSection) {
-    await this.enterInstanceScope(account);
-    await this.instanceNav().getByRole("link", { name, exact: true }).click();
+  async openInstanceSection(name: InstanceSection) {
+    await this.openOrganizationSection("Settings");
+    await this.enterInstanceScope(name);
   }
 
-  async openMobileInstanceSection(account: string, name: InstanceSection) {
-    await this.toggleMobileSidebar();
-    await this.enterInstanceScope(account);
-    // Leaving for the instance dismisses the sheet, the way a destination does, so the
-    // section has to be picked from a reopened one.
-    await expect(this.page.getByRole("dialog", { name: "More", exact: true })).toBeHidden();
-    await this.toggleMobileSidebar();
-    await this.instanceNav().getByRole("link", { name, exact: true }).click();
+  async openMobileInstanceSection(name: InstanceSection) {
+    await this.openMobileOrganizationSection("Settings");
+    await this.enterInstanceScope(name);
   }
 
-  /**
-   * The instance sidebar's way back out. Instance routes carry no tenant, so the row is named
-   * after the organization the account is active in rather than one in the path.
-   */
   async leaveInstance() {
-    await this.instanceNav()
-      .getByRole("link", { name: /^Back to / })
-      .click();
+    const mobile = this.page.getByRole("navigation", { name: "Quick navigation" });
+    if (await mobile.isVisible()) {
+      await mobile.getByRole("link", { name: "Home", exact: true }).click();
+    } else {
+      await this.openOrganizationSection("Home");
+    }
   }
 
   /** The footer account menu — everything that belongs to the person, not to a tenant. */
@@ -95,14 +84,13 @@ export class ProjectNavigation {
     return menu;
   }
 
-  private async enterInstanceScope(account: string) {
-    const menu = await this.openAccountMenu(account);
-    await menu.getByRole("menuitem", { name: "Instance administration" }).click();
-    await expect(this.page).toHaveURL(/\/apps$/u);
-  }
-
-  private instanceNav() {
-    return this.page.getByRole("navigation", { name: "Instance", exact: true });
+  private async enterInstanceScope(name: InstanceSection) {
+    await this.page
+      .getByRole("navigation", { name: "Organization settings" })
+      .getByRole("link", { name: "Instance", exact: true })
+      .click();
+    const instance = this.page.getByRole("navigation", { name: "Instance settings" });
+    if (name !== "Apps") await instance.getByRole("link", { name, exact: true }).click();
   }
 
   /** On a phone every destination outside the bottom bar lives in the More sheet. */

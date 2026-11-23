@@ -24,21 +24,14 @@ export interface NavigationItem {
   subtree?: boolean;
 }
 
-/**
- * The destinations for one level of the app, and only those. A group that is not the outermost
- * level leads with its way back out, set apart by a rule — going up is not a sibling of going
- * across, and putting it in the same list would make it look like one.
- */
 export function NavigationGroup({
   label,
-  back,
   items,
   administration,
   setup,
 }: {
   /** Names the level, e.g. "Organization". Becomes the landmark's accessible name. */
   label: string;
-  back?: NavigationItem;
   items: readonly NavigationItem[];
   /** Destinations that change the level rather than work in it, set apart under a rule. */
   administration?: readonly NavigationItem[];
@@ -47,16 +40,6 @@ export function NavigationGroup({
   return (
     <nav aria-label={label}>
       <SidebarGroup>
-        {back === undefined ? null : (
-          <>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                <NavItem item={back} />
-              </SidebarMenu>
-            </SidebarGroupContent>
-            <SidebarSeparator className="my-2" />
-          </>
-        )}
         <SidebarGroupContent>
           <SidebarMenu>
             {items.map((item) => (

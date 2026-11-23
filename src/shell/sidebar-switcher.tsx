@@ -78,30 +78,6 @@ export function SidebarSwitcher({
   );
 }
 
-/**
- * The same row where there is nothing to switch to. The instance is the deployment: one of it,
- * always, so its header states where you are instead of offering a choice that has one option.
- */
-export function SidebarIdentity({
-  media,
-  primary,
-  secondary,
-  size = "lg",
-  tone = "primary",
-}: SwitcherFace) {
-  return (
-    <div className="flex h-12 w-full items-center gap-2 overflow-hidden rounded-sm px-2 text-left text-sm group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!">
-      <Face
-        media={media}
-        primary={primary}
-        size={size}
-        tone={tone}
-        {...(secondary === undefined ? {} : { secondary })}
-      />
-    </div>
-  );
-}
-
 function Face({
   media,
   primary,

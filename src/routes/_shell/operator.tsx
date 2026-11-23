@@ -1,12 +1,16 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { OperatorEntitlementsPage } from "../../operator/panel.js";
+import { LegacyInstanceRoute } from "../../shell/legacy-instance-route.js";
 
-// Instance-scoped, deliberately outside /o/$organizationSlug — an operator acts across
-// organizations it does not belong to. Server-side authorization is the guard: every operator
-// read and write refuses without the instance-operator flag, so a non-operator reaching this
-// route sees only "You don't have operator access." The nav entry is gated separately as
-// presentation.
 export const Route = createFileRoute("/_shell/operator")({
-  staticData: { breadcrumb: "Operator", instance: true },
-  component: OperatorEntitlementsPage,
+  staticData: { breadcrumb: "Operator" },
+  component: LegacyOperator,
 });
+
+function LegacyOperator() {
+  return (
+    <LegacyInstanceRoute to="/o/$organizationSlug/settings/instance/operator">
+      <OperatorEntitlementsPage />
+    </LegacyInstanceRoute>
+  );
+}

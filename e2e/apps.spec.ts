@@ -819,8 +819,16 @@ test("a member has no Apps surface at all", async ({ hub }) => {
     });
     try {
       await expect(member.page.getByRole("link", { name: "Apps", exact: true })).toHaveCount(0);
+      const organization = new URL(member.page.url()).pathname.replace(/\/home$/u, "");
+      await member.page.goto(`${session.origin}${organization}/settings/team`);
+      const settings = member.page.getByRole("navigation", { name: "Organization settings" });
+      await expect(settings.getByRole("link", { name: "Instance", exact: true })).toHaveCount(0);
+      await member.page.goto(`${session.origin}${organization}/settings/instance/apps`);
+      await expect(member.page.getByRole("alert")).toContainText(
+        "Only an instance operator can view app setup.",
+      );
       await member.page.goto(`${session.origin}/apps`);
-      // The route renders, the capability refuses: no credential status of any kind.
+      await expect(member.page).toHaveURL(`${session.origin}/apps`);
       await expect(
         member.page.getByText("Only an instance operator can view app setup."),
       ).toBeVisible();
