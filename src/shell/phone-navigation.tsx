@@ -55,6 +55,7 @@ export function PhoneNavigation({
         <SheetContent
           side="bottom"
           showCloseButton={false}
+          data-rail-focus
           className="max-h-svh gap-0 overflow-y-auto border-rail-border bg-rail text-rail-foreground md:hidden"
           style={SHEET_STYLE}
         >
@@ -65,7 +66,7 @@ export function PhoneNavigation({
           {children}
           <SheetClose
             aria-label="Close"
-            className="absolute top-2 right-2 grid size-11 place-items-center rounded-sm text-rail-muted hover:bg-rail-accent hover:text-rail-foreground focus-visible:outline-rail-foreground"
+            className="absolute top-2 right-2 grid size-11 place-items-center rounded-sm text-rail-muted hover:bg-rail-accent hover:text-rail-foreground"
           >
             <X aria-hidden="true" className="size-4" />
           </SheetClose>

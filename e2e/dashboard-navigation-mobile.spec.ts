@@ -79,3 +79,33 @@ test("opens instance settings through More on a phone", async ({ hub, page }) =>
   await navigation.leaveInstance();
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
 });
+
+test("phone navigation uses the rail outline in both themes", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const quick = page.getByRole("navigation", { name: "Quick navigation" });
+  const more = quick.getByRole("button", { name: "More", exact: true });
+  const organization = page.getByRole("dialog", { name: "More" }).getByRole("button", {
+    name: "Organization",
+  });
+  const railOutline = "rgb(247, 247, 244)";
+
+  for (const theme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: theme });
+    await page.reload();
+    await expect(page.locator("html")).toHaveClass(new RegExp(`\\b${theme}\\b`, "u"));
+    await page.keyboard.press("Tab");
+    for (const control of [
+      page.getByRole("button", { name: "Search", exact: true }),
+      quick.getByRole("link", { name: "Home" }),
+      more,
+    ]) {
+      await control.focus();
+      await expect(control).toHaveCSS("outline-color", railOutline);
+      await expect(control).toHaveCSS("outline-width", "2px");
+    }
+    await more.press("Enter");
+    await expect(organization).toBeFocused();
+    await expect(organization).toHaveCSS("outline-color", railOutline);
+  }
+});

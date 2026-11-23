@@ -121,7 +121,7 @@ export function CommandSearchButton({ phone = false }: { phone?: boolean }) {
         aria-label="Search"
         aria-haspopup="dialog"
         aria-keyshortcuts="Meta+K Control+K"
-        className="ml-auto grid size-11 shrink-0 place-items-center rounded-sm text-rail-foreground hover:bg-rail-accent focus-visible:outline-rail-foreground"
+        className="ml-auto grid size-11 shrink-0 place-items-center rounded-sm text-rail-foreground hover:bg-rail-accent focus-visible:outline-sidebar-ring"
         onClick={open}
       >
         <Search className="size-4" aria-hidden="true" />

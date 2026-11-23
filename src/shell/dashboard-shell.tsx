@@ -161,7 +161,9 @@ function DashboardContent(props: DashboardContentProps) {
       onSelectOrganization={props.onSelectOrganization}
     >
       <SkipLink />
-      <Sidebar collapsible="icon">{sidebar}</Sidebar>
+      <Sidebar collapsible="icon" data-rail-focus>
+        {sidebar}
+      </Sidebar>
       <SiteHeaderActionsProvider>
         <SidebarInset className="pb-[var(--shell-bottom-bar)] md:pb-0">
           <PhoneHeader />

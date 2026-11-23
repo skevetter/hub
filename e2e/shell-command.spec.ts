@@ -72,3 +72,22 @@ test("the account menu offers System, Light, and Dark", async ({ hub, page, cont
   await expect(html).toHaveClass(/\bdark\b/u);
   expect((await context.cookies()).find(({ name }) => name === "theme")?.value).toBe("system");
 });
+
+test("desktop rail focus uses the light outline in both themes", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const search = page.getByRole("button", { name: "Search", exact: true });
+
+  for (const theme of ["light", "dark"] as const) {
+    await page.emulateMedia({ colorScheme: theme });
+    await page.reload();
+    await expect(page.locator("html")).toHaveClass(new RegExp(`\\b${theme}\\b`, "u"));
+    await expect(search).toBeVisible();
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Tab");
+    await page.keyboard.press("Tab");
+    await expect(search).toBeFocused();
+    await expect(search).toHaveCSS("outline-color", "rgb(247, 247, 244)");
+    await expect(search).toHaveCSS("outline-width", "2px");
+  }
+});

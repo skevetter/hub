@@ -85,7 +85,7 @@ function SetupGroup({ items }: { items: readonly NavigationItem[] }) {
  * throws away the resolved account and repaints the pre-auth shell on every hop.
  */
 export const PHONE_TAB_CLASS =
-  "flex min-h-11 flex-col items-center justify-center gap-1 text-xs focus-visible:outline-rail-foreground focus-visible:-outline-offset-2";
+  "flex min-h-11 flex-col items-center justify-center gap-1 text-xs focus-visible:outline-sidebar-ring focus-visible:-outline-offset-2";
 
 export function NavItem({ item, phoneTab = false }: { item: NavigationItem; phoneTab?: boolean }) {
   const { to, label, icon: Icon, subtree = false } = item;

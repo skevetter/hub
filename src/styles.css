@@ -257,6 +257,10 @@
     outline-offset: 2px;
   }
 
+  [data-rail-focus] :focus-visible {
+    outline-color: var(--sidebar-ring);
+  }
+
   /*
    * One selection colour, for the whole document rather than per control. Selecting is how a
    * value gets copied when the clipboard is unavailable, and the browser default is a hue nobody
