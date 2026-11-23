@@ -7,6 +7,14 @@ interface DeliveryMetadata {
   action?: "created" | "prompted";
 }
 
+export function logPilotScopeRefusal(reason: string, metadata: DeliveryMetadata): undefined {
+  if (reason === "workspace_mismatch" || reason === "not_owner") {
+    logger.debug({ ...metadata, reason }, "Linear pilot refused delivery");
+    return undefined;
+  }
+  return logPilotRefusal(reason, metadata);
+}
+
 export function pilotDeliveryMetadata(payload: unknown): DeliveryMetadata {
   if (typeof payload !== "object" || payload === null) return {};
   const action: unknown = Reflect.get(payload, "action");

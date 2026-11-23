@@ -25,6 +25,7 @@ type Entry = Issue["history"]["nodes"][number];
 
 function history(extra: Partial<Entry> = {}): Entry {
   return {
+    id: "history-entry",
     createdAt: "2026-11-22T01:00:00.000Z",
     actor: human,
     botActor: null,
@@ -64,7 +65,10 @@ function rawEvidence(issue: Partial<Issue>, session: Partial<Session> = {}) {
   };
 }
 
-const prompt = { message: "Work on TEST-1: Title\n\nDescription." };
+const prompt = {
+  message: "Work on TEST-1: Title\n\nDescription.",
+  historyEntryId: "history-entry",
+};
 const refused = { reason: "origin_unproven" };
 const run = (read: (signal: AbortSignal) => Promise<Readback>, remaining = 10_000) =>
   proveDelegation(signed, Date.now() + remaining, read);
@@ -122,7 +126,10 @@ it("refuses malformed GraphQL evidence and over-limit descriptions without trunc
     delegationReadback.safeParse({ agentSession: { ...agentSession, comment: undefined } }).success,
   ).toBe(false);
   const read = vi.fn(async () => evidence({ description: "x".repeat(MAX_PILOT_MESSAGE_CHARS) }));
-  await expect(run(read)).resolves.toEqual({ reason: "oversized" });
+  await expect(run(read)).resolves.toEqual({
+    reason: "oversized",
+    historyEntryId: "history-entry",
+  });
   expect(read).toHaveBeenCalledTimes(1);
 });
 

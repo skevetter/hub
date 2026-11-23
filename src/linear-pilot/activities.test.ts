@@ -84,6 +84,20 @@ afterEach(() => {
 });
 
 describe("pilot activities", () => {
+  it("uses a deterministic public refusal only on the exclusive attempt", async () => {
+    const w = fixture();
+    const event = { ...created, interactionId: created.nativeSessionId };
+    const refusal = await w.refuseDelegation(event);
+    expect(refusal).toMatchObject({ activityId: "b3b15181-944e-4a14-923f-786fb8ec8433" });
+    expect(w.createActivity.mock.calls[0]?.[0]).toMatchObject({
+      publicBody: true,
+      content: {
+        type: "error",
+        body: "Paseo could not confirm who started this. Mention @paseo in a comment instead.",
+      },
+    });
+  });
+
   it.each(writes)(
     "$name reads an uncertain append once; a replay or restart miss cannot append",
     async (testCase) => {

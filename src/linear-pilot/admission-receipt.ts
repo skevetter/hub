@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { QueryHandle } from "../db/runtime/index.js";
+import type { DelegationRefusal } from "./delegation.js";
 
 type LinearPilotReceipt = {
   organizationId: string;
@@ -14,7 +15,7 @@ type LinearPilotReceipt = {
   nativeSessionId: string;
   receivedAt: Date;
 } & (
-  | { kind: "created"; delegationRefused?: true }
+  | { kind: "created"; refusal?: DelegationRefusal; historyEntryId?: string }
   | { kind: "prompted" | "stop"; activityId: string }
 );
 
@@ -43,18 +44,49 @@ export async function hasLinearPilotReceipt(database: QueryHandle, receipt: Line
   return result.rows.length !== 0;
 }
 
-export async function recordLinearPilotAdmission(
+type DelegationClaim = Extract<LinearPilotReceipt, { kind: "created" }> & {
+  historyEntryId: string;
+};
+
+// The receipt PK claims the Linear change, while the delivery key still dedupes the session.
+function delegationClaimId({ workspaceId, appUserId, historyEntryId }: DelegationClaim) {
+  const bytes = createHash("sha256")
+    .update(JSON.stringify(["linear-pilot-delegation", workspaceId, appUserId, historyEntryId]))
+    .digest();
+  bytes[6] = (bytes[6]! & 0x0f) | 0x80;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex", 0, 16);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export async function claimLinearPilotDelegation(database: QueryHandle, receipt: DelegationClaim) {
+  const id = delegationClaimId(receipt);
+  if (await insertPilotReceipt(database, receipt, id)) return "claimed";
+  const result = await database.query(
+    `select 1 from provider_event_receipts
+     where id = $1 and organization_id = $2 and delivery_id <> $3`,
+    [id, receipt.organizationId, receiptId(receipt)],
+  );
+  return result.rows.length === 0 ? "not_claimed" : "origin_reused";
+}
+
+export function recordLinearPilotAdmission(database: QueryHandle, receipt: LinearPilotReceipt) {
+  return insertPilotReceipt(database, receipt, null);
+}
+
+async function insertPilotReceipt(
   database: QueryHandle,
   receipt: LinearPilotReceipt,
+  claimId: string | null,
 ): Promise<boolean> {
-  const refused = receipt.kind === "created" && receipt.delegationRefused;
+  const created = receipt.kind === "created" ? receipt : undefined;
   const result = await database.query(
     `insert into provider_event_receipts
        (organization_id, provider, connection_id, delivery_id, provider_application_id, source,
-        payload, received_at, dropped_reason)
+        payload, received_at, dropped_reason, id)
      select connection.organization_id, 'linear', connection.id, $1,
             connection.provider_application_id, 'linear.agent_session', $2::jsonb, $3,
-            $13
+            $13, coalesce($14::uuid, gen_random_uuid())
      from linear_connections connection
      join interactive_session_profiles profile on profile.organization_id = connection.organization_id
      join member owner on owner.organization_id = profile.organization_id
@@ -67,7 +99,11 @@ export async function recordLinearPilotAdmission(
      on conflict do nothing`,
     [
       receiptId(receipt),
-      JSON.stringify({ type: "agent_session", action: receipt.kind }),
+      JSON.stringify({
+        type: "agent_session",
+        action: receipt.kind,
+        historyEntryId: created?.historyEntryId,
+      }),
       receipt.receivedAt,
       receipt.organizationId,
       receipt.workspaceId,
@@ -78,7 +114,8 @@ export async function recordLinearPilotAdmission(
       receipt.profileId,
       receipt.profileVersion,
       receipt.ownerUserId,
-      refused ? "origin_unproven" : "linear_pilot_admitted",
+      created?.refusal ?? "linear_pilot_admitted",
+      claimId,
     ],
   );
   return result.rowCount === 1;

@@ -2,10 +2,18 @@ import type { QueryHandle } from "../db/runtime/index.js";
 import { validMessage } from "../interactive-sessions/store.js";
 import { LinearAgentError, type LinearAgentOperation } from "../providers/linear/agent.js";
 import type { LinearPilotRegistration } from "../providers/linear/index.js";
-import { createLinearPilotActivities, type LinearPilotAcceptedEvent } from "./activities.js";
-import { hasLinearPilotReceipt, recordLinearPilotAdmission } from "./admission-receipt.js";
+import {
+  createLinearPilotActivities,
+  tracePilotActivities,
+  type LinearPilotAcceptedEvent,
+} from "./activities.js";
+import {
+  claimLinearPilotDelegation,
+  hasLinearPilotReceipt,
+  recordLinearPilotAdmission,
+} from "./admission-receipt.js";
 import type { LinearPilotConfig } from "./config.js";
-import { proveDelegation } from "./delegation.js";
+import { proveDelegation, type DelegationRefusal } from "./delegation.js";
 import { logPilotRefusal } from "./diagnostics.js";
 import { resolveLinearPilotInstallation, type qualifyLinearPilotDelivery } from "./installation.js";
 
@@ -50,9 +58,8 @@ export async function prepareCreated(
     nativeSessionId: event.nativeSessionId,
     receivedAt,
   };
-  const message = event.pendingDelegation
-    ? await readDelegation(context, receipt, activity)
-    : event.message;
+  if (event.pendingDelegation) return readDelegation(context, receipt, activity);
+  const { message } = event;
   if (message === undefined) return undefined;
   if (!validMessage(message)) return logPilotRefusal("unqualified_content", metadata);
   if (!canAcknowledge(context)) return logPilotRefusal("ack_window_closed", metadata);
@@ -87,7 +94,7 @@ function sameInstallation(
 function delegationClient(
   context: CreatedContext,
   activity: LinearPilotAcceptedEvent,
-  mayPostRefusal: () => boolean,
+  mayPostRefusal: boolean,
 ) {
   const {
     qualified: { event, installation },
@@ -96,7 +103,7 @@ function delegationClient(
     database,
   } = context;
   const authorize = async (query: QueryHandle, operation: LinearAgentOperation) => {
-    if (!canAcknowledge(context) || !permitsDelegationOperation(operation, event, mayPostRefusal()))
+    if (!canAcknowledge(context) || !permitsDelegationOperation(operation, event, mayPostRefusal))
       return false;
     const current = await resolveLinearPilotInstallation(query, config, provider.oauthClientId);
     return canAcknowledge(context) && sameInstallation(current, installation);
@@ -124,12 +131,10 @@ async function readDelegation(
     qualified: { event },
     database,
     deadline,
-    scrubValues,
   } = context;
   const metadata = createdMetadata(event.nativeSessionId);
   if (await hasLinearPilotReceipt(database, receipt)) return logPilotRefusal("duplicate", metadata);
-  let mayPostRefusal = false;
-  const client = delegationClient(context, activity, () => mayPostRefusal);
+  const client = delegationClient(context, activity, false);
   const scope = {
     sessionId: event.nativeSessionId,
     issueId: event.issueId,
@@ -139,17 +144,65 @@ async function readDelegation(
   const proof = await proveDelegation(event, deadline, (signal) =>
     client.readDelegationOrigin(scope, signal),
   ).catch(failedReadback);
-  if ("message" in proof) return proof.message;
+  if ("historyEntryId" in proof) return finishDelegation(context, receipt, activity, proof);
   logPilotRefusal(
     proof.reason,
     metadata,
     "details" in proof ? proof.details : undefined,
-    scrubValues,
+    context.scrubValues,
   );
-  if (proof.reason !== "origin_unproven" || !canAcknowledge(context)) return undefined;
-  if (await recordLinearPilotAdmission(database, { ...receipt, delegationRefused: true })) {
-    mayPostRefusal = true;
-    await createLinearPilotActivities({ clientFor: () => client }).refuseDelegation(activity);
+  return refuseDelegation(context, activity, { ...receipt, refusal: proof.reason });
+}
+
+async function finishDelegation(
+  context: CreatedContext,
+  receipt: CreatedReceipt,
+  activity: LinearPilotAcceptedEvent,
+  proof: Extract<Awaited<ReturnType<typeof proveDelegation>>, { historyEntryId: string }>,
+): Promise<string | undefined> {
+  const metadata = createdMetadata(activity.nativeSessionId);
+  if (!canAcknowledge(context)) return logPilotRefusal("ack_window_closed", metadata);
+  const matched = {
+    ...receipt,
+    historyEntryId: proof.historyEntryId,
+    ...("reason" in proof ? { refusal: proof.reason } : {}),
+  };
+  const claim = await claimLinearPilotDelegation(context.database, matched);
+  switch (claim) {
+    case "claimed":
+      if ("message" in proof) return proof.message;
+      logPilotRefusal(proof.reason, metadata);
+      return publishDelegationRefusal(context, activity);
+    case "origin_reused":
+      logPilotRefusal(claim, metadata);
+      return refuseDelegation(context, activity, { ...matched, refusal: claim });
+    default:
+      return logPilotRefusal("admission_not_claimed", metadata);
   }
+}
+
+async function refuseDelegation(
+  context: CreatedContext,
+  activity: LinearPilotAcceptedEvent,
+  receipt: CreatedReceipt & { refusal: DelegationRefusal },
+): Promise<undefined> {
+  if (!context.accepting()) return undefined;
+  if (await recordLinearPilotAdmission(context.database, receipt))
+    await publishDelegationRefusal(context, activity);
+  return undefined;
+}
+
+async function publishDelegationRefusal(
+  context: CreatedContext,
+  activity: LinearPilotAcceptedEvent,
+): Promise<undefined> {
+  if (!canAcknowledge(context)) return undefined;
+  const metadata = createdMetadata(activity.nativeSessionId);
+  const client = tracePilotActivities(
+    delegationClient(context, activity, true),
+    (operation, error) =>
+      logPilotRefusal(operation, metadata, failedReadback(error).details, context.scrubValues),
+  );
+  await createLinearPilotActivities({ clientFor: () => client }).refuseDelegation(activity);
   return undefined;
 }

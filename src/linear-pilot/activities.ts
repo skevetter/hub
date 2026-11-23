@@ -23,6 +23,7 @@ const BUSY_BODY = "Still working on the previous message; reply when I have answ
 const publicBodies = new Set([
   ACK_BODY,
   ERROR_BODY,
+  DELEGATION_ERROR_BODY,
   STOP_BODY,
   STOP_UNCONFIRMED_BODY,
   BUSY_BODY,
@@ -56,6 +57,32 @@ type PilotClient = Pick<
   ReturnType<typeof createLinearAgentClient>,
   "createActivity" | "isActivityConfirmed"
 >;
+type ReportActivityFailure = (operation: "createActivity" | "readActivity", error: unknown) => void;
+
+export function tracePilotActivities(
+  client: PilotClient,
+  report: ReportActivityFailure,
+): PilotClient {
+  return {
+    async createActivity(input, signal) {
+      try {
+        return await client.createActivity(input, signal);
+      } catch (error) {
+        report("createActivity", error);
+        throw error;
+      }
+    },
+    async isActivityConfirmed(input, signal) {
+      const trace = (error: unknown) => report("readActivity", error);
+      try {
+        return await client.isActivityConfirmed(input, signal, trace);
+      } catch (error) {
+        trace(error);
+        throw error;
+      }
+    },
+  };
+}
 type BodyContent = Extract<LinearAgentActivityContent, { body: string }>;
 type Purpose = "ack" | "terminal" | "stop" | "busy" | "delegationRefused";
 
@@ -77,17 +104,13 @@ function expiredInitialWrite(deadline: number, receivedAt: number, started: numb
 
 type WriteDelegationRefusal = (
   event: LinearPilotAcceptedEvent,
-  attempt: "first-attempt",
-  purpose: "delegationRefused",
-  kind: "error",
-  prepareBody: () => string,
 ) => Promise<LinearPilotWriteDisposition>;
 
 function delegationRefusalWriter(write: WriteDelegationRefusal) {
   return function refuseDelegation(event: LinearPilotAcceptedEvent) {
     if (event.kind !== "created" || event.interactionId !== event.nativeSessionId)
       return Promise.resolve({ disposition: "denied" } as const);
-    return write(event, "first-attempt", "delegationRefused", "error", () => DELEGATION_ERROR_BODY);
+    return write(event);
   };
 }
 
@@ -104,7 +127,6 @@ function claim(claims: Map<string, number>, slot: string, started: number) {
 
 export function createLinearPilotActivities({ clientFor, now = Date.now }: ActivityOptions) {
   const claims = new Map<string, number>();
-
   async function write(
     event: LinearPilotAcceptedEvent,
     attempt: LinearPilotActivityAttempt,
@@ -212,7 +234,6 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
       callSignal.removeEventListener("abort", onAbort);
     }
   }
-
   return {
     acknowledge(
       event: LinearPilotAcceptedEvent,
@@ -249,7 +270,9 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
         return Promise.resolve({ disposition: "denied" });
       return write(event, attempt, "terminal", "error", () => ERROR_BODY, signal);
     },
-    refuseDelegation: delegationRefusalWriter(write),
+    refuseDelegation: delegationRefusalWriter((event) =>
+      write(event, "first-attempt", "delegationRefused", "error", () => DELEGATION_ERROR_BODY),
+    ),
     busy(
       event: LinearPilotAcceptedEvent,
       attempt: LinearPilotActivityAttempt,

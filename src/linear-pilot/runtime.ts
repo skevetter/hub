@@ -10,6 +10,7 @@ import {
   createLinearPilotActivities,
   PILOT_ACK_MS,
   pilotActivityIds,
+  tracePilotActivities,
   type LinearPilotAcceptedEvent,
 } from "./activities.js";
 import { recordLinearPilotAdmission } from "./admission-receipt.js";
@@ -322,21 +323,13 @@ export function createLinearPilotRuntime(options: Options) {
     return createLinearPilotActivities({
       clientFor(activity) {
         const client = clientFor(grant, activity);
-        const trace = <T>(operation: "createActivity" | "readActivity", request: Promise<T>) =>
-          request.catch((error: unknown) => {
-            reportFailure({
-              sessionId: activity.nativeSessionId,
-              ...pilotExceptionFields(error),
-              operation,
-            });
-            throw error;
-          });
-        return {
-          createActivity: (input, signal) =>
-            trace("createActivity", client.createActivity(input, signal)),
-          isActivityConfirmed: (input, signal) =>
-            trace("readActivity", client.isActivityConfirmed(input, signal)),
-        };
+        return tracePilotActivities(client, (operation, error) =>
+          reportFailure({
+            sessionId: activity.nativeSessionId,
+            ...pilotExceptionFields(error),
+            operation,
+          }),
+        );
       },
     });
   }

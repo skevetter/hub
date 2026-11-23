@@ -34,13 +34,16 @@ Delegate or assign an issue to Paseo to start a session without a comment. Hub
 checks that the configured human made the change up to 120 seconds before the
 session was created and that Paseo is still the delegate or assignee. Changes
 from bots and automatic triage do not qualify.
-Hub assumes `history(first: 20, orderBy: createdAt)` returns the newest entries
-first. Confirm that order in the first live delegation test.
+Linear returns history newest first with `first`. Hub reads 20 entries and
+refuses the start if more than 20 changes between delegation and readback
+push the matching entry outside that page. Each history entry can start at
+most one session.
 
 The first prompt is `Work on <identifier>: <title>`, a blank line, and the issue
-description. Hub refuses prompts that exceed the existing message limits.
-If Hub cannot confirm who started the session, it asks the configured human
-to mention `@paseo` in a comment instead.
+description. Other members or integrations may have written that text.
+Delegate only issues whose title and description you trust. If the proof or
+prompt is refused, Hub asks the configured human to mention `@paseo` in a
+comment instead.
 
 ## Isolation assumption
 

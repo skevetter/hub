@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { it } from "vitest";
+import { tracePilotActivities } from "../../linear-pilot/activities.js";
 import { pilotExceptionFields } from "../../linear-pilot/follow-up.js";
 import { createLogger } from "../../logger.js";
 import { createLinearAgentClient, LinearAgentError } from "./agent.js";
@@ -31,6 +32,14 @@ function client(fixture: ReturnType<typeof linearAgentFixture>, connection = fix
   return createLinearAgentClient({
     ...fixture.options,
     binding: linearAgentBinding(connection),
+  });
+}
+
+function pilotClient(fixture: ReturnType<typeof linearAgentFixture>) {
+  return createLinearAgentClient({
+    ...fixture.options,
+    binding: linearAgentBinding(fixture.a),
+    pilotOperations: true,
   });
 }
 
@@ -189,6 +198,35 @@ it("pilot errors log no provider text when a response contains a private answer"
   assert.match(records[0]!, /"linearErrorType":"invalid input"/u);
   assert.match(records[0]!, /"linearErrorKinds":\["BAD_USER_INPUT"\]/u);
   assert.doesNotMatch(records[0]!, /linearErrorText|private answer fragment/u);
+});
+
+it("allows diagnostic enums even when they contain a private input value", async () => {
+  const fixture = linearAgentFixture(() => ({
+    errors: [{ message: "input", extensions: { type: "invalid input", code: "input_rejected" } }],
+  }));
+  for (const body of ["input", "INPUT"]) {
+    await assert.rejects(
+      pilotClient(fixture).createActivity({ ...activity, content: { type: "response", body } }),
+      {
+        details: { linearErrorType: "invalid input", linearErrorKinds: ["INPUT_REJECTED"] },
+      },
+    );
+  }
+});
+
+it("traces the provider type when an activity readback fails closed", async () => {
+  const fixture = linearAgentFixture(() => ({
+    errors: [{ message: "Read unavailable", extensions: { type: "unavailable" } }],
+  }));
+  const records: string[] = [];
+  const logger = createLogger({ write: (record) => records.push(record) });
+  const traced = tracePilotActivities(pilotClient(fixture), (operation, error) =>
+    logger.warn({ operation, ...pilotExceptionFields(error) }, "Linear pilot delivery failed"),
+  );
+  assert.equal(await traced.isActivityConfirmed({ sessionId, activityId, kind: "thought" }), false);
+  assert.equal(records.length, 1);
+  assert.match(records[0]!, /"operation":"readActivity"/u);
+  assert.match(records[0]!, /"linearErrorType":"unavailable"/u);
 });
 
 it("pilot requests without a body keep the selected error type and text with all codes", async () => {

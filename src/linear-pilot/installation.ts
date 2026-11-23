@@ -2,7 +2,7 @@ import type { QueryHandle } from "../db/runtime/index.js";
 import { surfaceUuid } from "../surfaces/store.js";
 import type { PilotConnection } from "./binding.js";
 import type { LinearPilotConfig } from "./config.js";
-import { logPilotRefusal, pilotDeliveryMetadata } from "./diagnostics.js";
+import { logPilotScopeRefusal, pilotDeliveryMetadata } from "./diagnostics.js";
 import {
   precheckLinearPilotScope,
   verifyLinearPilotIntake,
@@ -57,10 +57,7 @@ export async function qualifyLinearPilotDelivery(
   oauthClientId: string,
   payload: unknown,
 ) {
-  const refuse = (reason: string) => {
-    logPilotRefusal(reason, pilotDeliveryMetadata(payload));
-    return undefined;
-  };
+  const refuse = (reason: string) => logPilotScopeRefusal(reason, pilotDeliveryMetadata(payload));
   const precheck = precheckLinearPilotScope({ config, payload });
   if (!precheck.ok) return refuse(precheck.reason);
   const installation = await resolveLinearPilotInstallation(database, config, oauthClientId);

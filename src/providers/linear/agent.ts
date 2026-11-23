@@ -197,7 +197,7 @@ const delegationOriginQuery = `query PaseoPilotDelegationOrigin($sessionId: Stri
       delegate { id } assignee { id }
       history(first: ${DELEGATION_HISTORY_LIMIT}, orderBy: createdAt) {
         nodes {
-          createdAt actor { id } botActor { id } toDelegate { id } toAssignee { id }
+          id createdAt actor { id } botActor { id } toDelegate { id } toAssignee { id }
           triageResponsibilityAutoAssigned
         }
       }
@@ -486,6 +486,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
     async isActivityConfirmed(
       input: z.input<typeof readbackInput>,
       signal?: AbortSignal,
+      onFailure?: (error: unknown) => void,
     ): Promise<boolean> {
       const {
         sessionId,
@@ -504,25 +505,7 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
           signal,
           async (send, viewer, checkCurrent) => {
             const { agentSession } = await send(
-              `query PaseoAgentActivityReadback($sessionId: String!, $activityId: ID!) {
-              agentSession(id: $sessionId) {
-                id appUser { id }
-                activities(first: 1, filter: { id: { eq: $activityId } }) {
-                  nodes {
-                    id agentSession { id } user { id }${expectedSignal ? " signal" : ""}
-                    content {
-                      __typename
-                      ... on AgentActivityThoughtContent { type }
-                      ... on AgentActivityActionContent { type }
-                      ... on AgentActivityElicitationContent { type }
-                      ... on AgentActivityResponseContent { type }
-                      ... on AgentActivityErrorContent { type }
-                    }
-                  }
-                  pageInfo { hasNextPage hasPreviousPage }
-                }
-              }
-            }`,
+              activityReadbackQuery(expectedSignal !== undefined),
               variables,
               readbackResult,
             );
@@ -546,7 +529,12 @@ export function createLinearAgentClient(options: LinearAgentClientOptions) {
             );
           },
         );
-      } catch {
+      } catch (error) {
+        try {
+          onFailure?.(error);
+        } catch {
+          // Diagnostics cannot change an unconfirmed readback into a rejection.
+        }
         return false;
       }
     },
@@ -787,6 +775,28 @@ interface ProviderDiagnostics extends DiagnosticInputs {
   connections: readonly LinearConnectionRecord[];
 }
 
+function activityReadbackQuery(includeSignal: boolean) {
+  return `query PaseoAgentActivityReadback($sessionId: String!, $activityId: ID!) {
+              agentSession(id: $sessionId) {
+                id appUser { id }
+                activities(first: 1, filter: { id: { eq: $activityId } }) {
+                  nodes {
+                    id agentSession { id } user { id }${includeSignal ? " signal" : ""}
+                    content {
+                      __typename
+                      ... on AgentActivityThoughtContent { type }
+                      ... on AgentActivityActionContent { type }
+                      ... on AgentActivityElicitationContent { type }
+                      ... on AgentActivityResponseContent { type }
+                      ... on AgentActivityErrorContent { type }
+                    }
+                  }
+                  pageInfo { hasNextPage hasPreviousPage }
+                }
+              }
+            }`;
+}
+
 function safeProviderDetails(
   error: LinearApiError,
   { connections, variables, omitErrorText }: ProviderDiagnostics,
@@ -811,11 +821,12 @@ function safeProviderDetails(
       .trim()
       .slice(0, 300);
   };
+  const cleanKind = (kind: string) => (/^[A-Za-z_ ]{1,64}$/u.test(kind) ? kind : clean(kind));
   return {
     ...(error.graphqlErrorType === undefined
       ? {}
-      : { linearErrorType: clean(error.graphqlErrorType) }),
-    linearErrorKinds: error.graphqlCodes.map(clean),
+      : { linearErrorType: cleanKind(error.graphqlErrorType) }),
+    linearErrorKinds: error.graphqlCodes.map(cleanKind),
     ...(omitErrorText ? {} : { linearErrorText: clean(error.message) }),
   };
 }

@@ -108,6 +108,11 @@ function removeSignedComment(payload: JsonObject, session: JsonObject, delegatio
   payload["promptContext"] = "not first-turn context";
 }
 
+const delegationSessionId = "2138c045-6eb6-4cde-a191-84d4bdee87cd";
+const reusedSessionId = "2138c045-6eb6-4cde-a191-84d4bdee87ce";
+const delegationHistoryId = "2138c045-6eb6-4cde-a191-84d4bdee87cf";
+type RefusalScenario = "delegation-refusal" | "delegation-oversized";
+
 function delegationResult(input: {
   request: z.infer<typeof graphQLRequest>;
   nativeSessionId: string;
@@ -117,13 +122,24 @@ function delegationResult(input: {
   workspaceId: string;
   humanId: string;
   teamId: JsonObject[string] | undefined;
-  fail: boolean;
+  scenario: string;
 }) {
-  const { request, nativeSessionId, issueId, at, appUserId, workspaceId, humanId, teamId, fail } =
-    input;
+  const {
+    request,
+    nativeSessionId,
+    issueId,
+    at,
+    appUserId,
+    workspaceId,
+    humanId,
+    teamId,
+    scenario,
+  } = input;
   assert.match(request.query, /history\(first: 20, orderBy: createdAt\)/u);
-  assert.deepEqual(request.variables, { sessionId: nativeSessionId });
-  if (fail)
+  assert.match(request.query, /nodes\s*\{\s*id createdAt/u);
+  const requested = request.variables["sessionId"];
+  assert.ok(requested === nativeSessionId || requested === reusedSessionId);
+  if (scenario === "delegation-refusal")
     return Response.json({
       errors: [
         {
@@ -137,7 +153,7 @@ function delegationResult(input: {
   return Response.json({
     data: {
       agentSession: {
-        id: nativeSessionId,
+        id: requested,
         createdAt: at(0),
         appUser: app,
         creator: human,
@@ -147,13 +163,15 @@ function delegationResult(input: {
           id: issueId,
           identifier: "TEST-1",
           title: "Check delegation",
-          description: "Use this description.",
+          description:
+            scenario === "delegation-oversized" ? "x".repeat(20_000) : "Use this description.",
           team: { id: teamId, organization: { id: workspaceId } },
           delegate: app,
           assignee: null,
           history: {
             nodes: [
               {
+                id: delegationHistoryId,
                 createdAt: at(-1),
                 actor: human,
                 botActor: null,
@@ -231,6 +249,20 @@ async function assertDeclinesOutsideScope(input: {
   }
 }
 
+function isRefusalScenario(scenario: string): scenario is RefusalScenario {
+  return scenario === "delegation-refusal" || scenario === "delegation-oversized";
+}
+
+function refusalDetails(scenario: RefusalScenario) {
+  if (scenario === "delegation-oversized") return { reason: "oversized" };
+  return {
+    reason: "origin_unproven",
+    linearErrorText: "Linear GraphQL Origin read unavailable",
+    linearErrorType: "unavailable",
+    linearErrorKinds: ["UNAVAILABLE"],
+  };
+}
+
 async function assertDelegationRefusal(input: {
   endpoint: Endpoint;
   payload: JsonObject;
@@ -241,6 +273,7 @@ async function assertDelegationRefusal(input: {
   agents: FakeAgents;
   legacy: () => Promise<void>;
   originReads: () => number;
+  scenario: RefusalScenario;
 }) {
   const {
     endpoint,
@@ -252,24 +285,22 @@ async function assertDelegationRefusal(input: {
     agents,
     legacy,
     originReads,
+    scenario,
   } = input;
   const info = vi.spyOn(logger, "info");
   try {
     await deliver(endpoint, payload);
     await vi.waitFor(() => expect(publication).toHaveLength(1));
-    expect(publication[0]?.id).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(publication[0]?.id).toBe("b3b15181-944e-4a14-923f-786fb8ec8433");
     expect(publication[0]).toMatchObject({
       type: "error",
       body: "Paseo could not confirm who started this. Mention @paseo in a comment instead.",
     });
     expect(info).toHaveBeenCalledWith(
       {
-        reason: "origin_unproven",
+        ...refusalDetails(scenario),
         action: "created",
         nativeSessionId,
-        linearErrorText: "Linear GraphQL Origin read unavailable",
-        linearErrorType: "unavailable",
-        linearErrorKinds: ["UNAVAILABLE"],
       },
       "Linear pilot refused delivery",
     );
@@ -285,6 +316,13 @@ async function assertDelegationRefusal(input: {
       [organizationId],
     );
     expect(rows).toEqual([]);
+    await expectDelegationReceipts(
+      runtime,
+      organizationId,
+      scenario === "delegation-oversized"
+        ? [delegationReceipt("oversized", delegationHistoryId)]
+        : [delegationReceipt("origin_unproven")],
+    );
     expect(publication).toHaveLength(1);
     expect(originReads()).toBe(1);
     expect(agents.creations).toEqual([]);
@@ -294,8 +332,59 @@ async function assertDelegationRefusal(input: {
   }
 }
 
+function delegationReceipt(reason: string, historyEntryId?: string) {
+  return {
+    dropped_reason: reason,
+    payload: {
+      type: "agent_session",
+      action: "created",
+      ...(historyEntryId && { historyEntryId }),
+    },
+  };
+}
+
+async function expectDelegationReceipts(
+  runtime: DatabaseRuntime,
+  organizationId: string,
+  expected: ReturnType<typeof delegationReceipt>[],
+) {
+  const { rows } = await runtime.query(
+    `select dropped_reason, payload from provider_event_receipts
+     where organization_id = $1 and delivery_id like 'linear-pilot:%' order by dropped_reason`,
+    [organizationId],
+  );
+  expect(rows).toEqual(expected);
+}
+
+async function assertDelegationReuse(input: {
+  endpoint: Endpoint;
+  payload: JsonObject;
+  session: JsonObject;
+  runtime: DatabaseRuntime;
+  organizationId: string;
+  publication: Publication;
+  agents: FakeAgents;
+}) {
+  const { endpoint, payload, session, runtime, organizationId, publication, agents } = input;
+  const replay = { ...payload, agentSession: { ...session, id: reusedSessionId } };
+  await deliver(endpoint, replay);
+  await vi.waitFor(() =>
+    expect(publication.map(({ type }) => type)).toEqual(["thought", "response", "error"]),
+  );
+  await expectDelegationReceipts(runtime, organizationId, [
+    delegationReceipt("linear_pilot_admitted", delegationHistoryId),
+    delegationReceipt("origin_reused", delegationHistoryId),
+  ]);
+  expect(agents.creations).toHaveLength(1);
+  expect(agents.sends).toHaveLength(1);
+}
+
 function registeredBackend(scenario: string) {
   return scenario === "postgres" ? "postgres" : "embedded";
+}
+
+function registeredSessionId(scenario: string) {
+  return scenario.startsWith("delegation") ? delegationSessionId : randomUUID();
 }
 
 function coordinatorOptions(scenario: string) {
@@ -303,13 +392,7 @@ function coordinatorOptions(scenario: string) {
 }
 
 async function exerciseRegisteredPilot(
-  scenario:
-    | "stop"
-    | "stop-race"
-    | "postgres"
-    | "start-refusal"
-    | "delegation"
-    | "delegation-refusal",
+  scenario: "stop" | "stop-race" | "postgres" | "start-refusal" | "delegation" | RefusalScenario,
   terminalFailure?: "failed" | "canceled" | "unconfirmed",
 ) {
   const backend = registeredBackend(scenario);
@@ -414,7 +497,7 @@ async function exerciseRegisteredPilot(
     });
     pilot.attachCoordinator(coordinator);
     try {
-      const nativeSessionId = randomUUID();
+      const nativeSessionId = registeredSessionId(scenario);
       const followUpId = randomUUID();
       const followUpBody = "What did the previous turn find?";
       const timelineStart = Date.now() - 60_000;
@@ -528,7 +611,7 @@ async function exerciseRegisteredPilot(
             workspaceId: config.linearOrganizationId,
             humanId: config.allowedHumanId,
             teamId: objectAt(session, "issue")["teamId"],
-            fail: scenario === "delegation-refusal",
+            scenario,
           });
         }
         if (request.query.includes("PaseoPilotPrompt")) {
@@ -565,7 +648,7 @@ async function exerciseRegisteredPilot(
         assert.match(request.query, /PaseoAgentActivityCreate/u);
         const activity = request.variables.input;
         assert(activity);
-        assert.equal(activity.agentSessionId, nativeSessionId);
+        assert.ok([nativeSessionId, reusedSessionId].includes(activity.agentSessionId));
         return activityResult(activity, connection.appUserId, publication);
       });
       const registration = createLinearRegistration({
@@ -643,7 +726,7 @@ async function exerciseRegisteredPilot(
         expect(agents.sends).toEqual([]);
         return;
       }
-      if (scenario === "delegation-refusal") {
+      if (isRefusalScenario(scenario)) {
         await assertDelegationRefusal({
           endpoint,
           payload,
@@ -654,6 +737,7 @@ async function exerciseRegisteredPilot(
           agents,
           legacy,
           originReads: () => originReads,
+          scenario,
         });
         return;
       }
@@ -781,7 +865,15 @@ async function exerciseRegisteredPilot(
       if (scenario === "delegation") {
         expect(send.text).toBe("Work on TEST-1: Check delegation\n\nUse this description.");
         expect(originReads).toBe(1);
-        expect(agents.sends).toHaveLength(1);
+        await assertDelegationReuse({
+          endpoint,
+          payload,
+          session,
+          runtime,
+          organizationId,
+          publication,
+          agents,
+        });
         expect(legacy).not.toHaveBeenCalled();
         return;
       }
@@ -1099,5 +1191,11 @@ test(
 test(
   "a failed delegation read posts one fixed error and creates no Hub session",
   () => exerciseRegisteredPilot("delegation-refusal"),
+  120_000,
+);
+
+test(
+  "an oversized delegation records a refusal and posts one fixed error across replays",
+  () => exerciseRegisteredPilot("delegation-oversized"),
   120_000,
 );

@@ -36,7 +36,7 @@ export const delegationReadback = z.object({
         history: z.object({
           nodes: z
             .array(
-              z.object({
+              ref.extend({
                 createdAt: timestamp,
                 actor: ref.nullable(),
                 botActor: z.object({ id: id.nullable() }).nullable(),
@@ -55,10 +55,14 @@ export const delegationReadback = z.object({
 type DelegationReadback = z.infer<typeof delegationReadback>;
 type Session = DelegationReadback["agentSession"];
 type Issue = NonNullable<Session["issue"]>;
-type DelegationVerdict =
-  | { message: string }
-  | { reason: "origin_unproven" | "oversized" | "unqualified_content" };
+type MatchedDelegation =
+  | { message: string; historyEntryId: string }
+  | { reason: "oversized" | "unqualified_content"; historyEntryId: string };
 const unproven = { reason: "origin_unproven" } as const;
+type DelegationVerdict = MatchedDelegation | typeof unproven;
+export type DelegationRefusal =
+  | Extract<DelegationVerdict, { reason: string }>["reason"]
+  | "origin_reused";
 
 function matchesSession(session: Session, signed: LinearPilotEvent) {
   return (
@@ -95,18 +99,19 @@ function matchesEntry(
   );
 }
 
-function issuePrompt(issue: Issue): DelegationVerdict {
+function issuePrompt(issue: Issue, historyEntryId: string): MatchedDelegation {
   const message = `Work on ${issue.identifier}: ${issue.title}\n\n${issue.description ?? ""}`;
-  if (message.length > MAX_PILOT_MESSAGE_CHARS) return { reason: "oversized" };
-  return validMessage(message) ? { message } : { reason: "unqualified_content" };
+  if (message.length > MAX_PILOT_MESSAGE_CHARS) return { reason: "oversized", historyEntryId };
+  return validMessage(message)
+    ? { message, historyEntryId }
+    : { reason: "unqualified_content", historyEntryId };
 }
 
 function verify({ agentSession: session }: DelegationReadback, signed: LinearPilotEvent) {
   const { issue } = session;
   if (!issue || !matchesSession(session, signed) || !matchesIssue(issue, signed)) return unproven;
-  if (!issue.history.nodes.some((entry) => matchesEntry(entry, session.createdAt, signed)))
-    return undefined;
-  return issuePrompt(issue);
+  const match = issue.history.nodes.find((entry) => matchesEntry(entry, session.createdAt, signed));
+  return match && issuePrompt(issue, match.id);
 }
 
 export async function proveDelegation(
