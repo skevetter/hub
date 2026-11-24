@@ -11,8 +11,7 @@ import { embeddedDatabaseRuntime } from "./runtime/index.js";
 import { scriptTerminalName } from "../workflows/script-output.js";
 import { ScriptStepRuntime } from "../workflows/script-step.js";
 import type { Database } from "./types.js";
-import type { AuthServer } from "../auth/server.js";
-import { ProjectDashboard } from "../projects/dashboard.js";
+import { activityRunDetailView, readActivityExecutions } from "../projects/activity-run-view.js";
 
 const PROJECT_ID = "00000000-0000-4000-8000-000000000001";
 const CONFIGURATION: CompiledHubConfig = {
@@ -158,25 +157,6 @@ async function completeAgentVariants(harness: Harness, run: AcceptedRun) {
   }
 }
 
-function scriptsAuth(): AuthServer {
-  return {
-    handle: async () => new Response(),
-    resources: async () => {
-      throw new Error("unused");
-    },
-    resolveOrganizationAccess: async () => {
-      throw new Error("unused");
-    },
-    resolveAccount: async () => ({
-      session: { id: "session-1", activeOrganizationId: "org-1" },
-      account: { id: "user-1", name: "User", email: "user@example.test" },
-      isInstanceOperator: false,
-    }),
-    rejectCookieMutation: () => undefined,
-    close: async () => undefined,
-  };
-}
-
 const backends = [
   ["in-memory", memoryHarness],
   ["embedded PostgreSQL", embeddedHarness],
@@ -195,15 +175,11 @@ describe.each(backends)("script step persistence (%s)", (_name, open) => {
         "script",
       ]);
       await completeAgentVariants(harness, run);
-      database.resolveTenantRouteAccess = async () => ({
-        organization: { id: "org-1", name: "Scripts", slug: "s" },
-        membership: { id: "membership-1", role: "owner" },
-      });
-      const detail = await new ProjectDashboard(database, scriptsAuth()).activityRunDetail(
-        new Request("https://hub.test/o/s"),
-        { organizationSlug: "s", runId: run.id },
+      const read = await readActivityExecutions(database, () =>
+        database.findOrganizationActivityRun("org-1", run.id),
       );
-      assert.ok(detail);
+      assert.ok(read);
+      const detail = activityRunDetailView(read.activity, read.executions);
       assert.deepEqual(Object.keys(detail.run).sort(), [
         "completedAt",
         "configuredTriggerName",

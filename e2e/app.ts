@@ -146,7 +146,6 @@ class BuiltApplications {
       },
       issueDaemonEnrollment: (verifier: string) =>
         deliverCommand(server, { type: "daemon-enrollment-token", verifier }),
-      failNextProjectRead: () => deliverCommand(server, { type: "fail-next-project-read" }),
       prepareSlackSocketWorkflow: () => deliverCommand(server, { type: "slack-socket-prepare" }),
       deliverSlackSocketMention: (eventId: string) =>
         deliverCommand(server, { type: "slack-socket-deliver", eventId }),

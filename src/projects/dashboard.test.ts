@@ -3,10 +3,11 @@ import { describe, it } from "vitest";
 import type { AuthServer } from "../auth/server.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import type { TriggerSummary } from "./activity-summary.js";
+import { activityRunDetailView, readActivityExecutions } from "./activity-run-view.js";
 import { ProjectDashboard } from "./dashboard.js";
 
-describe("project dashboard activity read models", () => {
-  it("uses canonical Linear health in project and organization snapshots", async () => {
+describe("project dashboard read models", () => {
+  it("uses canonical Linear health in the organization snapshot", async () => {
     const database = createMemoryDatabase({
       memberships: [
         {
@@ -62,29 +63,23 @@ describe("project dashboard activity read models", () => {
 
     const dashboard = new ProjectDashboard(database, accountAuth());
     const request = new Request("https://hub.test/o/acme/projects/hub");
-    const [organization, project] = await Promise.all([
-      dashboard.organizationSnapshot(request, { organizationSlug: "acme" }),
-      dashboard.projectSnapshot(request, {
-        organizationSlug: "acme",
-        projectSlug: "hub",
-      }),
-    ]);
+    const organization = await dashboard.organizationSnapshot(request, {
+      organizationSlug: "acme",
+    });
 
-    for (const snapshot of [organization, project]) {
-      assert.deepEqual(
-        snapshot.connections.linear.map((connection) => ({
-          id: connection.id,
-          requiresReauthorization: connection.requiresReauthorization,
-        })),
-        [
-          { id: "expired", requiresReauthorization: true },
-          { id: "refreshable", requiresReauthorization: false },
-        ],
-      );
-    }
+    assert.deepEqual(
+      organization.connections.linear.map((connection) => ({
+        id: connection.id,
+        requiresReauthorization: connection.requiresReauthorization,
+      })),
+      [
+        { id: "expired", requiresReauthorization: true },
+        { id: "refreshable", requiresReauthorization: false },
+      ],
+    );
   });
 
-  it("omits payload-bearing evidence from lists and retains it in detail", async () => {
+  it("omits payload-bearing evidence from run detail and the organization snapshot", async () => {
     const database = createMemoryDatabase({
       memberships: [
         {
@@ -172,28 +167,13 @@ describe("project dashboard activity read models", () => {
     );
     const dashboard = new ProjectDashboard(database, accountAuth());
     const request = new Request("https://hub.test/o/acme/projects/hub");
-    const list = await dashboard.projectSnapshot(request, {
-      organizationSlug: "acme",
-      projectSlug: "hub",
-    });
-    assert.equal("rawPayload" in list.activity[0]!, false);
-    assert.equal("triggerContext" in list.activity[0]!, false);
-
-    const detail = await dashboard.activityRunSnapshot(request, {
-      organizationSlug: "acme",
-      projectSlug: "hub",
-      runId: run.run.id,
-    });
-    assert.deepEqual(detail.activity.rawPayload, rawPayload);
-    assert.deepEqual(detail.activity.triggerContext, triggerContext);
-
-    const organizationDetail = await dashboard.activityRunDetail(request, {
-      organizationSlug: "acme",
-      runId: run.run.id,
-    });
-    assert.ok(organizationDetail);
-    assert.equal(organizationDetail.run.id, run.run.id);
-    assert.equal(organizationDetail.run.prompt, "run");
+    const read = await readActivityExecutions(database, () =>
+      database.findOrganizationActivityRun("org-1", run.run.id),
+    );
+    assert.ok(read);
+    const detail = activityRunDetailView(read.activity, read.executions);
+    assert.equal(detail.run.id, run.run.id);
+    assert.equal(detail.run.prompt, "run");
     for (const key of [
       "rawPayload",
       "triggerContext",
@@ -203,44 +183,15 @@ describe("project dashboard activity read models", () => {
       "deliveryId",
       "providerEventReceiptId",
     ]) {
-      assert.equal(key in organizationDetail.run, false);
+      assert.equal(key in detail.run, false);
     }
     assert.deepEqual(
-      organizationDetail.steps.map((step) => step.stepId),
+      detail.steps.map((step) => step.stepId),
       ["step"],
     );
-    assert.equal(organizationDetail.steps[0]?.isAgent, false);
-    assert.equal(organizationDetail.steps[0]?.completion, null);
-    assert.equal(organizationDetail.steps[0]?.output, null);
-    assert.equal(
-      await dashboard.activityRunDetail(request, {
-        organizationSlug: "other",
-        runId: run.run.id,
-      }),
-      null,
-    );
-    assert.equal(
-      await dashboard.activityRunDetail(request, {
-        organizationSlug: "acme",
-        runId: "00000000-0000-4000-8000-000000000000",
-      }),
-      null,
-    );
-    await assert.rejects(
-      dashboard.activityRunDetail(request, {
-        organizationSlug: "inaccessible",
-        runId: run.run.id,
-      }),
-      { name: "TenantRouteNotFoundError" },
-    );
-    const anonymous = new ProjectDashboard(database, {
-      ...accountAuth(),
-      resolveAccount: () => Promise.reject(new Error("unauthenticated")),
-    });
-    await assert.rejects(
-      anonymous.activityRunDetail(request, { organizationSlug: "acme", runId: run.run.id }),
-      /unauthenticated/,
-    );
+    assert.equal(detail.steps[0]?.isAgent, false);
+    assert.equal(detail.steps[0]?.completion, null);
+    assert.equal(detail.steps[0]?.output, null);
 
     const organization = await dashboard.organizationSnapshot(request, {
       organizationSlug: "acme",
@@ -309,34 +260,16 @@ describe("project dashboard activity read models", () => {
     const records = await database.listProjectActivityRuns(project.id, 10);
     assert.equal(records[0]?.webhookActor, "ci-partner");
     assert.equal("payload" in records[0].receipt, false);
-    const dashboard = new ProjectDashboard(database, accountAuth());
-    const request = new Request("https://hub.test/o/acme/projects/hub");
-    const list = await dashboard.projectSnapshot(request, {
-      organizationSlug: "acme",
-      projectSlug: "hub",
-    });
-    const detail = await dashboard.activityRunDetail(request, {
-      organizationSlug: "acme",
-      runId: run.id,
-    });
-    const legacyDetail = await dashboard.activityRunSnapshot(request, {
-      organizationSlug: "acme",
-      projectSlug: "hub",
-      runId: run.id,
-    });
-    assert.ok(detail);
-    assert.equal(detail.run.prompt, null);
-    for (const activity of [list.activity[0]!, detail.run, legacyDetail.activity]) {
-      assert.equal(activity.provider, "manual");
-      assert.equal(activity.source, "webhook.received");
-      assertBoundedWebhookSummary(activity.webhookSummary);
-    }
-    assert.equal(JSON.stringify(detail.run).includes("raw-payload-only"), false);
-    assert.equal("rawPayload" in list.activity[0]!, false);
-    assert.equal(
-      await dashboard.activityRunDetail(request, { organizationSlug: "other", runId: run.id }),
-      null,
+    const read = await readActivityExecutions(database, () =>
+      database.findOrganizationActivityRun("org-1", run.id),
     );
+    assert.ok(read);
+    const detail = activityRunDetailView(read.activity, read.executions);
+    assert.equal(detail.run.prompt, null);
+    assert.equal(detail.run.provider, "manual");
+    assert.equal(detail.run.source, "webhook.received");
+    assertBoundedWebhookSummary(detail.run.webhookSummary);
+    assert.equal(JSON.stringify(detail.run).includes("raw-payload-only"), false);
   });
 });
 

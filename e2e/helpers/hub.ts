@@ -59,8 +59,6 @@ export interface BuiltApplication {
   ): Promise<{ url: string; count: number }>;
   /** Records a daemon enrollment token for this instance's organization. */
   issueDaemonEnrollment(verifier: string): Promise<void>;
-  /** Arms one project snapshot read failure inside the disposable built application. */
-  failNextProjectRead(): Promise<void>;
   prepareSlackSocketWorkflow(): Promise<void>;
   deliverSlackSocketMention(eventId: string): Promise<void>;
   slackSocketEvidence(eventId: string): Promise<{ receipts: number; runs: number }>;
