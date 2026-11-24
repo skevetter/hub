@@ -15,24 +15,81 @@ const COMMENTS_PATH = "/repos/example/project/issues/92/comments";
 const RECEIVED_AT = "2026-08-06T11:00:00.987Z";
 
 describe("GitHub execution limit notices", () => {
-  it("posts despite a forged marker on a full page and does not fetch the next page", async () => {
+  it("posts despite a forged marker on every full page and reads exactly three pages", async () => {
     const page = Array.from({ length: 100 }, (_, i) => ({
       id: i + 1,
       body: i === 0 ? MARKER : "unrelated",
       user: { id: i === 0 ? 456 : BOT_ID },
     }));
-    const fixture = billingNoticeFixture(() =>
-      Response.json(page, {
-        headers: { link: `<https://api.github.com${COMMENTS_PATH}?page=2>; rel="next"` },
+    const fixture = billingNoticeFixture(() => Response.json(page));
+
+    await fixture.deliver();
+
+    assert.equal(fixture.posts.length, 1);
+    assert.deepEqual(
+      fixture.lists,
+      [1, 2, 3].map(
+        (n) => `${COMMENTS_PATH}?since=2026-08-06T10%3A50%3A00Z&per_page=100&page=${n}`,
+      ),
+    );
+  });
+
+  it.each([
+    { markerPage: 1, lists: 1 },
+    { markerPage: 2, lists: 2 },
+    { markerPage: 3, lists: 3 },
+  ])("finds the notice on page $markerPage and does not post", async ({ markerPage, lists }) => {
+    const fixture = billingNoticeFixture((url) =>
+      Response.json(pagedComments(Number(url.searchParams.get("page")), markerPage)),
+    );
+
+    await fixture.deliver();
+
+    assert.equal(fixture.lists.length, lists);
+    assert.equal(fixture.posts.length, 0);
+  });
+
+  it("does not read a fourth page and posts when the marker is only there", async () => {
+    const fixture = billingNoticeFixture((url) =>
+      Response.json(pagedComments(Number(url.searchParams.get("page")), 4)),
+    );
+
+    await fixture.deliver();
+
+    assert.equal(fixture.lists.length, 3);
+    assert.equal(fixture.posts.length, 1);
+  });
+
+  it.each([
+    { shortPage: 1, size: 99, lists: 1 },
+    { shortPage: 2, size: 0, lists: 2 },
+    { shortPage: 3, size: 1, lists: 3 },
+  ])("stops at a short page $shortPage and posts", async ({ shortPage, size, lists }) => {
+    const fixture = billingNoticeFixture((url) => {
+      const page = Number(url.searchParams.get("page"));
+      return Response.json(pagedComments(page, 0).slice(0, page === shortPage ? size : 100));
+    });
+
+    await fixture.deliver();
+
+    assert.equal(fixture.lists.length, lists);
+    assert.equal(fixture.posts.length, 1);
+  });
+
+  it("pages by number and ignores a next link to another host or API prefix", async () => {
+    const link =
+      '<https://ghe.example.test/api/v3/repos/example/project/issues/92/comments?page=9>; rel="next"';
+    const fixture = billingNoticeFixture((url) =>
+      Response.json(pagedComments(Number(url.searchParams.get("page")), 0), {
+        headers: { link },
       }),
     );
 
     await fixture.deliver();
 
+    assert.equal(fixture.lists.length, 3);
+    assert.ok(fixture.lists.every((entry) => entry.startsWith(`${COMMENTS_PATH}?`)));
     assert.equal(fixture.posts.length, 1);
-    assert.deepEqual(fixture.lists, [
-      `${COMMENTS_PATH}?since=2026-08-06T10%3A50%3A00Z&per_page=100`,
-    ]);
   });
 
   it.each([
@@ -59,7 +116,7 @@ describe("GitHub execution limit notices", () => {
 
     await fixture.deliver({ receivedAt: "not a date" });
 
-    assert.deepEqual(fixture.lists, [`${COMMENTS_PATH}?per_page=100`]);
+    assert.deepEqual(fixture.lists, [`${COMMENTS_PATH}?per_page=100&page=1`]);
     assert.equal(fixture.posts.length, 0);
   });
 
@@ -102,6 +159,14 @@ describe("GitHub execution limit notices", () => {
     );
   });
 });
+
+function pagedComments(page: number, markerPage: number) {
+  return Array.from({ length: 100 }, (_, i) => ({
+    id: page * 1_000 + i,
+    body: page === markerPage && i === 99 ? MARKER : "unrelated",
+    user: { id: BOT_ID },
+  }));
+}
 
 function filteredCommentPage(url: URL, posts: readonly string[], updatedAt: number): Response {
   const since = url.searchParams.get("since");
