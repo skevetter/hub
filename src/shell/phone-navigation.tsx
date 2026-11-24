@@ -16,7 +16,7 @@ import { usePageContext } from "../navigation/index.js";
 import { CommandSearchButton } from "./command-menu.js";
 import { NavItem, PHONE_TAB_CLASS, type NavigationItem } from "./navigation-group.js";
 
-export function PhoneHeader() {
+export function PhoneHeader({ scope }: { scope: string }) {
   const { breadcrumbs } = usePageContext();
   return (
     <header className="top-0 z-10 flex h-12 shrink-0 items-center gap-3 border-b border-rail-border bg-rail px-4 text-rail-foreground max-md:sticky md:hidden">
@@ -25,7 +25,12 @@ export function PhoneHeader() {
         aria-label="Paseo"
         className="size-5 shrink-0 rounded-sm bg-rail-foreground"
       />
-      <span className="truncate text-sm font-strong">{breadcrumbs.at(-1) ?? "Paseo Hub"}</span>
+      <nav aria-label="Breadcrumb" className="grid min-w-0">
+        <span className="truncate text-xs text-rail-muted">{scope}</span>
+        <span aria-current="page" className="truncate text-sm font-strong">
+          {breadcrumbs.at(-1) ?? "Paseo Hub"}
+        </span>
+      </nav>
       <CommandSearchButton phone />
     </header>
   );

@@ -148,7 +148,10 @@ test("emptying the name search restores the trigger list", async ({ hub, page })
       }
       await expect(search).toHaveValue("");
       if (method === "Search button") {
-        await page.getByRole("button", { name: "Search", exact: true }).click();
+        await page
+          .getByLabel("Filters")
+          .getByRole("button", { name: "Search", exact: true })
+          .click();
       } else {
         await search.press("Enter");
       }

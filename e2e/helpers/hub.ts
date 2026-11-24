@@ -333,8 +333,8 @@ export class PaseoHub {
       await user.completeFirstRunJourney(account, () => application.failNextAccountSetup());
       const logs = plainLogs(application.logs());
       expect(logs).toContain("auth.setup_instance");
-      expect(logs).toMatch(/failureKind:\s*["']?internal/u);
-      expect(logs).toMatch(/err:\s*\{/u);
+      expect(logs).toMatch(/["']?failureKind["']?\s*:\s*["']?internal/u);
+      expect(logs).toMatch(/["']?err["']?\s*:\s*\{/u);
       expect(logs).toMatch(/["']?type["']?\s*:\s*["']?Error/u);
       expect(logs).toMatch(/["']?stack["']?\s*:/u);
       expect(logs).not.toContain("account setup failed");

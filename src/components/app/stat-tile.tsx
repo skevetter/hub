@@ -46,8 +46,8 @@ function StatTileLayout({
           {placeholder ? <Skeleton className="h-5 w-24 max-w-full" /> : label}
         </div>
         <div className="grid content-start gap-1">
-          <div className="min-h-6 text-2xl leading-none tabular-nums">
-            {placeholder ? <Skeleton className="h-6 w-10" /> : value}
+          <div className="min-h-10 text-2xl leading-none tabular-nums">
+            {placeholder ? <Skeleton className="h-10 w-12" /> : value}
           </div>
           <div className="min-h-8 text-xs text-muted-foreground">
             {placeholder ? <Skeleton className="h-5 w-20 max-w-full" /> : detail}

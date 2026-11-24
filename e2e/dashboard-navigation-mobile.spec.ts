@@ -19,10 +19,9 @@ test("shows quick destinations and the full organization navigation under More",
   const quick = page.getByRole("navigation", { name: "Quick navigation" });
   const sheet = page.getByRole("dialog", { name: "More" });
   const more = quick.getByRole("button", { name: "More" });
-  const header = page
-    .getByRole("main")
-    .locator("header")
-    .filter({ has: page.getByRole("img", { name: "Paseo" }) });
+  const location = page.getByRole("navigation", { name: "Breadcrumb" });
+  const header = location.locator('[aria-current="page"]');
+  await expect(location).toContainText("Acme");
   await expect(header).toHaveText("Home");
   await expect(quick.getByRole("link")).toHaveText(["Home", "Activity", "Triggers"]);
   await expect(quick.getByRole("link", { name: "Home" })).toHaveAttribute("aria-current", "page");
