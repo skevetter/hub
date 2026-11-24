@@ -63,6 +63,8 @@ import { DEFAULT_SCRIPT_LIMITS, type ScriptLimits } from "./script-limits.js";
 
 const DEFAULT_WAKEUP_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 250;
+const TRIGGER_CONTEXT_MATERIALIZER_UNAVAILABLE_REASON = "trigger_context_materializer_unavailable";
+const TRIGGER_CONTEXT_UNAVAILABLE_REASON = "trigger_context_unavailable";
 
 type AcceptedWorkflowRun = Extract<
   Awaited<ReturnType<Database["findTriggerRunById"]>>,
@@ -1006,7 +1008,7 @@ export class DurableWorkflowEngine {
     if (!stepUsesTriggerContext(step)) return null;
     const provider = providerForTriggerContext(this.options.providers ?? [], run.triggerContext);
     if (provider?.materializeContext === undefined) {
-      return this.failStepContext(run, step, "trigger_context_materializer_unavailable");
+      return this.failStepContext(run, step, TRIGGER_CONTEXT_MATERIALIZER_UNAVAILABLE_REASON);
     }
     try {
       return asTriggerContextValue(
@@ -1019,7 +1021,7 @@ export class DurableWorkflowEngine {
         }),
       );
     } catch (error) {
-      const reason = error instanceof Error ? error.message : "trigger_context_unavailable";
+      const reason = error instanceof Error ? error.message : TRIGGER_CONTEXT_UNAVAILABLE_REASON;
       this.report(error, "workflow.context.materialize", {
         triggerRunId: run.id,
         stepId: step.id,
