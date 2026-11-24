@@ -11,8 +11,13 @@ mise exec node@24.22.0 -- npm run build
 mise exec node@24.22.0 -- npm test
 ```
 
-`npm test` runs the Node script tests and then the serial Vitest suite. The parallel command holds
-`/tmp/hub-fullsuite.lock` for the run.
+`npm test` runs the Node script tests and then the serial Vitest suite without taking the lock.
+If you need exclusive access for `npm test`, hold the lock by hand as described below.
+
+`npm run test:parallel` (including `--rerun-failed`) and `npm run test:changed` runs that cover the
+whole suite take the full-suite lock and refuse to run when it is held. The lock is the directory
+`/tmp/hub-fullsuite.lock`, with the owner recorded in its `pid` file.
+
 A file gets its own shard when its cached duration exceeds the ideal time per shard. The runner
 assigns the remaining files longest first to the lightest shard and prints each estimated total.
 The runner uses timings from the last complete parallel run, or `scripts/test-timings.json` when
@@ -112,13 +117,22 @@ with the repository's oxfmt. The script tests check that the
 map matches the current reads. Resolve new dynamic paths in the generator when static analysis
 cannot determine their directory.
 
-The parallel runner records its PID, start time and worker groups in the full-suite lock on macOS
-and Linux. On interrupt it gives each group five seconds to stop, sends SIGKILL if needed, and
-keeps the lock while any workers remain. Full runs and serial runs from `--rerun-failed` or
-`test:changed` hold the same lock. Each checks the recorded workers before reclaiming a stale lock.
-For manual recovery, inspect the lock with `cat /tmp/hub-fullsuite.lock` and
-check its PID and process groups with `ps -axo pid,pgid,lstart,stat,command`. Run
-`unlink /tmp/hub-fullsuite.lock` only after confirming that its owner and worker groups have exited.
+The runners record their PID, start time and worker groups in `/tmp/hub-fullsuite.lock/pid` on
+macOS and Linux. On interrupt the parallel runner gives each group five seconds to stop, sends
+SIGKILL if needed, and keeps the lock while any workers remain. The runners check the recorded
+workers before reclaiming a stale lock.
+
+To hold the lock for another command, run `mkdir /tmp/hub-fullsuite.lock` and proceed only if it
+succeeds. In the shell that will hold the lock, run `printf '%s\n' "$$" > /tmp/hub-fullsuite.lock/pid`
+before starting the command. Write the pid of a process that stays alive until the command and its
+workers exit. If that process exits first, the runners treat the lock as stale and reclaim it.
+After the command and its workers exit, run
+`rm /tmp/hub-fullsuite.lock/pid` and then `rmdir /tmp/hub-fullsuite.lock`.
+
+For manual recovery, run `cat /tmp/hub-fullsuite.lock/pid` and check the owner and any listed
+worker groups with `ps -axo pid,pgid,lstart,stat,command`. Remove the `pid` file and then the directory
+only after confirming that the owner and workers have exited. An empty or unreadable `pid` file
+does not make the lock safe to remove.
 
 Package, Vitest config and setup changes select the full Vitest suite. When a selection covers
 every Vitest file, the command prints a full-suite banner and hands off to the parallel runner,
@@ -130,4 +144,4 @@ remove their temporary files and exit 1 with an `INTERRUPTED` line. After a succ
 exits, all three runners give background children up to two seconds to finish on their own.
 The run fails if the runner still has to stop them.
 
-Set `HUB_TEST_FULLSUITE_LOCK` to use a different lock path, for example in a scratch checkout.
+Use `HUB_TEST_FULLSUITE_LOCK` only for tests and scratch checkouts.
