@@ -54,6 +54,7 @@ import {
   type ConnectionReturn,
   type ConnectionReturnCopy,
 } from "./result-contract.js";
+import { confirmOnce } from "./outcome-toast.js";
 import { useConnectionReturn } from "./result.js";
 import {
   cacheAcknowledgedRevocation,
@@ -215,10 +216,12 @@ function useConnectionCommands(queries: ReturnType<typeof useConnectionQueries>)
     ],
     [connect.data, connect.isError, disconnect.data, disconnect.isError],
   );
+  const emitted = useRef<unknown>(undefined);
   return {
     progress,
     retry,
     returned,
+    emitted,
     disconnect,
     mutationPending,
     actions: { connectProvider, revokeConnection, mutations },
@@ -270,7 +273,7 @@ function renderConnections({
   isInstanceOperator: boolean;
   commands: ReturnType<typeof useConnectionCommands>;
 }) {
-  const { disconnect, mutationPending, returned } = commands;
+  const { disconnect, mutationPending, returned, emitted } = commands;
   const { mutations, connectProvider, revokeConnection } = commands.actions;
   const { revocation } = commands.progress;
   const { retryState } = commands.retry;
@@ -298,7 +301,8 @@ function renderConnections({
   return (
     <>
       <ConnectionToast
-        message={banner?.tone === "success" ? banner.message : undefined}
+        {...successToast(banner, result === undefined ? returned : disconnect.submittedAt)}
+        emitted={emitted}
         organizationSlug={scope.organizationSlug}
       />
       {retryState === "complete" && result === undefined ? (
@@ -785,17 +789,30 @@ function ConnectionReturnFailure({
   );
 }
 
-/** A finished connection is a completed action, so it is confirmed rather than left on the page. */
+function successToast(banner: ConnectionReturnCopy | undefined, outcome: unknown) {
+  return banner?.tone === "success" ? { message: banner.message, outcome } : {};
+}
+
+/**
+ * A finished connection is a completed action, so it is confirmed rather than left on the page.
+ * Each outcome is confirmed once: `emitted` outlives this component, which unmounts while a
+ * background read fails, so a recovery or a reworded message never replays it.
+ */
 function ConnectionToast({
   message,
+  outcome,
+  emitted,
   organizationSlug,
 }: {
-  message: string | undefined;
+  message?: string;
+  outcome?: unknown;
+  emitted: { current: unknown };
   organizationSlug: string;
 }) {
   useEffect(() => {
-    if (message === undefined) return;
-    toast({ id: `connection-return:${organizationSlug}`, scope: organizationSlug, title: message });
-  }, [message, organizationSlug]);
+    confirmOnce(emitted, { message, outcome }, (title) =>
+      toast({ id: `connection-return:${organizationSlug}`, scope: organizationSlug, title }),
+    );
+  }, [message, outcome, emitted, organizationSlug]);
   return null;
 }

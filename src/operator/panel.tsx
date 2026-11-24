@@ -322,7 +322,7 @@ function renderExecutionsEntitlement(snapshot: Snapshot, editExecutionsMonthly: 
 function OverLimitBanner({ overages }: { overages: Snapshot["overages"] }) {
   if (overages.length === 0) return null;
   return (
-    <PageAlert role="alert" title="This organization is over its limits">
+    <PageAlert title="This organization is over its limits">
       {overages.map((overage) => (
         <p key={overage.entitlement}>
           {`${overage.current} seats in use, but the effective limit is ${overage.limit}.`}

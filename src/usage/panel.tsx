@@ -120,7 +120,7 @@ const LIMITS_EMPTY = { title: "No limits" };
 function SeatOverLimitBanner({ seats }: { seats: UsageMeasure }) {
   if (!overLimit(seats)) return null;
   return (
-    <PageAlert role="alert" title="You're over your seat limit">
+    <PageAlert title="You're over your seat limit">
       <p>
         You have {seats.used} seats in use, but your limit is {seats.limit}.
       </p>

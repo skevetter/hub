@@ -4679,7 +4679,9 @@ class HubUser {
   /** The banner is found by what it says. Its title is the accessible name of the warning; an
    * `aria-label` repeating it in different words would be a second name for one thing. */
   private overLimitBanner(): Locator {
-    return this.page.getByRole("alert").filter({ hasText: "You're over your seat limit" });
+    return this.page
+      .locator('[data-slot="alert"]')
+      .filter({ hasText: "You're over your seat limit" });
   }
 
   /** Assert the granted / override / effective cells of one entitlement row after a re-stamp — on
