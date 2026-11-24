@@ -51,7 +51,12 @@ import {
   stateEvent,
   unsettledStatuses,
   validMessage,
+  type ClaimCommandInput,
   type RetireLinearPilotSessionInput,
+  type SaveSessionProfileInput,
+  type SaveSessionProfileResult,
+  type SetParticipantInput,
+  type StartSessionResult,
   type AcceptCommandInput,
   type AcceptCommandResult,
   type SessionEventDraft,
@@ -397,6 +402,71 @@ function nextCompensationNotBefore(
       );
 }
 
+function replaySessionCommand(
+  session: SessionRecord,
+  command: SessionCommandRecord,
+  hash: string,
+  input: AcceptCommandInput,
+): AcceptCommandResult {
+  return command.requestHash === hash
+    ? {
+        status: "replayed",
+        ...structuredClone({ session, command: replayCommand(command, input.bodyCutoff) }),
+      }
+    : refused("idempotency_conflict");
+}
+
+function commandLeaseActive(command: SessionCommandRecord, leaseNow: Date) {
+  return (
+    command.status === "dispatching" &&
+    command.claimExpiresAt !== null &&
+    command.claimExpiresAt > leaseNow
+  );
+}
+
+function updateSessionParticipant(
+  row: SessionWithParticipants,
+  input: SetParticipantInput,
+  current: SessionWithParticipants["participants"][number] | undefined,
+  { organizationId, userId }: { organizationId: string; userId: string },
+) {
+  if (input.role === null) {
+    row.participants = row.participants.filter((person) => person.userId !== input.userId);
+  } else if (current) {
+    current.role = input.role;
+    current.addedByUserId = userId;
+  } else {
+    row.participants.push({
+      userId: input.userId,
+      role: input.role,
+      organizationId,
+      sessionId: input.sessionId,
+      addedByUserId: userId,
+      createdAt: new Date(input.now),
+    });
+    row.participants.sort((a, b) => a.userId.localeCompare(b.userId));
+  }
+}
+
+function commandStateEvent(session: SessionRecord) {
+  return stateEvent(
+    session,
+    session.state === "running" ? "stop_unconfirmed" : session.stateReason,
+  );
+}
+
+function replyRunEndedWithoutSuccess(run: TriggerRunRecord | undefined) {
+  return run?.status === "failed" || run?.status === "timed_out" || run?.status === "canceled";
+}
+
+function expiredLaunchRun(run: TriggerRunRecord | undefined, execution: AgentExecutionRecord) {
+  return (
+    run?.organizationId === execution.organizationId &&
+    run.projectId === execution.projectId &&
+    run.payloadExpiryState === "expired"
+  );
+}
+
 const interactiveSessionLock = "isession-memory";
 
 export function createMemoryDatabase(
@@ -463,9 +533,7 @@ class MemoryDatabase implements Database {
         if (row.state !== "pending" && row.state !== "sending") return [];
         const run = this.triggerRuns.get(row.runId);
         const at = row.attemptedAt ?? run?.completedAt;
-        const endedWithoutSuccess =
-          row.state === "pending" &&
-          (run?.status === "failed" || run?.status === "timed_out" || run?.status === "canceled");
+        const endedWithoutSuccess = row.state === "pending" && replyRunEndedWithoutSuccess(run);
         return at != null && (at <= cutoff || endedWithoutSuccess) ? [{ at, row }] : [];
       });
       return structuredClone(
@@ -512,7 +580,10 @@ class MemoryDatabase implements Database {
   private readonly sessionProfiles = new Map<string, StoredSessionProfile>();
   private readonly interactiveSessions = new Map<string, SessionWithParticipants>();
   private readonly interactiveSessionsByOrganization = new Map<string, SessionWithParticipants[]>();
-  private readonly interactiveCommands = new Map<string, SessionCommandRecord[]>();
+  private readonly interactiveCommands = new Map<
+    string,
+    [SessionCommandRecord, ...SessionCommandRecord[]]
+  >();
   private readonly interactiveEvents = new Map<string, SessionEventRecord[]>();
   private readonly interactiveAudit = new Map<string, SessionAuditRecord[]>();
 
@@ -556,23 +627,31 @@ class MemoryDatabase implements Database {
       if (role !== "owner" && this.sessionDaemonEnroller(organizationId, daemon) !== userId) {
         return "forbidden";
       }
-      const current =
-        input.id === null ? undefined : this.sessionProfiles.get(input.id.toLowerCase());
-      if (!profileVersionMatches(input, current)) return "version_conflict";
-      if (current && role !== "owner" && current.createdByUserId !== userId) return "forbidden";
-      if (
-        [...this.sessionProfiles.values()].some(
-          (profile) =>
-            profile.organizationId === organizationId &&
-            profile.name === input.name &&
-            profile.id !== current?.id,
-        )
-      )
-        return "name_taken";
-      const record = profileRecord(input, settings, current);
-      this.sessionProfiles.set(record.id, structuredClone(record));
-      return structuredClone(record);
+      return this.storeSessionProfile(input, settings, { organizationId, userId, role });
     });
+
+  private storeSessionProfile(
+    input: SaveSessionProfileInput,
+    settings: ReturnType<typeof profileSettings>,
+    { organizationId, userId, role }: StartSessionInput["principal"],
+  ): SaveSessionProfileResult {
+    const current =
+      input.id === null ? undefined : this.sessionProfiles.get(input.id.toLowerCase());
+    if (!profileVersionMatches(input, current)) return "version_conflict";
+    if (current && role !== "owner" && current.createdByUserId !== userId) return "forbidden";
+    if (
+      [...this.sessionProfiles.values()].some(
+        (profile) =>
+          profile.organizationId === organizationId &&
+          profile.name === input.name &&
+          profile.id !== current?.id,
+      )
+    )
+      return "name_taken";
+    const record = profileRecord(input, settings, current);
+    this.sessionProfiles.set(record.id, structuredClone(record));
+    return structuredClone(record);
+  }
 
   startInteractiveSession: Database["startInteractiveSession"] = (input) =>
     this.withAdvisoryLock(interactiveSessionLock, async () => {
@@ -596,70 +675,105 @@ class MemoryDatabase implements Database {
           session.startedByUserId === userId &&
           session.startIdempotencyKey === input.idempotencyKey.toLowerCase(),
       );
-      if (prior) {
-        if (!this.sessionRights(prior, userId)?.view) return refused("forbidden");
-        return prior.session.startRequestHash === hash
-          ? {
-              status: "replayed",
-              ...structuredClone({
-                session: prior.session,
-                command: replayCommand(
-                  this.interactiveCommands.get(prior.session.id)![0]!,
-                  input.bodyCutoff,
-                ),
-              }),
-            }
-          : refused("idempotency_conflict");
-      }
-      if (!validMessage(input.message)) return refused("message_too_long");
-      const profile = this.sessionProfiles.get(input.profileId.toLowerCase());
-      if (profile?.organizationId !== organizationId || profile.status !== "active")
-        return refused("profile_unavailable");
-      if (profile.version !== input.profileVersion) return refused("profile_changed");
-      if (requester && profile.createdByUserId !== userId) return refused("forbidden");
+      if (prior) return this.replaySessionStart(prior, userId, hash, input);
+      const profile = this.profileForSessionStart(input, { organizationId, userId, requester });
+      if (typeof profile === "string") return refused(profile);
       const capacity = await this.startCapacity(profile, input);
       if (capacity) return refused(capacity);
       if (!people.every((person) => this.sessionMemberRole(organizationId, person.userId)))
         return refused("invalid_participant");
       if (!(await this.consumeOrganizationUsage(sessionUsage(input.principal, input.usage))))
         return refused("usage_limit");
-      const session = newSession(input, profile, hash);
-      const command = newCommand(session, input, "message", "steer", input.message, hash);
-      const row: SessionWithParticipants = {
-        session,
-        participants: people.map(({ userId: participantId, role }) => ({
-          userId: participantId,
-          role,
-          organizationId,
-          sessionId: session.id,
-          addedByUserId: userId,
-          createdAt: input.now,
-        })),
-      };
-      this.interactiveSessions.set(session.id, row);
-      const organizationSessions = this.interactiveSessionsByOrganization.get(organizationId);
-      if (organizationSessions === undefined) {
-        this.interactiveSessionsByOrganization.set(organizationId, [row]);
-      } else {
-        organizationSessions.push(row);
-      }
-      this.interactiveCommands.set(session.id, [structuredClone(command)]);
-      this.interactiveEvents.set(session.id, []);
-      this.appendSessionEvents(row, session, input.now, [
-        stateEvent(session),
-        messageEvent(command),
-      ]);
-      this.saveSessionAudit(
-        sessionAudit(
-          session,
-          userId,
-          "started",
-          { profileId: profile.id, commandId: command.id },
-          input.now,
-        ),
-      );
-      return { status: "created", ...structuredClone({ session: row.session, command }) };
+      return this.createSessionStart(input, profile, { organizationId, userId, people, hash });
     });
+
+  private replaySessionStart(
+    prior: SessionWithParticipants,
+    userId: string,
+    hash: string,
+    input: StartSessionInput,
+  ): StartSessionResult {
+    if (!this.sessionRights(prior, userId)?.view) return refused("forbidden");
+    return prior.session.startRequestHash === hash
+      ? {
+          status: "replayed",
+          ...structuredClone({
+            session: prior.session,
+            command: replayCommand(
+              this.interactiveCommands.get(prior.session.id)![0],
+              input.bodyCutoff,
+            ),
+          }),
+        }
+      : refused("idempotency_conflict");
+  }
+
+  private profileForSessionStart(
+    input: StartSessionInput,
+    {
+      organizationId,
+      userId,
+      requester,
+    }: { organizationId: string; userId: string; requester: StartSessionInput["nativeRequester"] },
+  ) {
+    if (!validMessage(input.message)) return "message_too_long";
+    const profile = this.sessionProfiles.get(input.profileId.toLowerCase());
+    if (profile?.organizationId !== organizationId || profile.status !== "active")
+      return "profile_unavailable";
+    if (profile.version !== input.profileVersion) return "profile_changed";
+    if (requester && profile.createdByUserId !== userId) return "forbidden";
+    return profile;
+  }
+
+  private createSessionStart(
+    input: StartSessionInput,
+    profile: StoredSessionProfile,
+    {
+      organizationId,
+      userId,
+      people,
+      hash,
+    }: {
+      organizationId: string;
+      userId: string;
+      people: ReturnType<typeof startParticipants>;
+      hash: string;
+    },
+  ): StartSessionResult {
+    const session = newSession(input, profile, hash);
+    const command = newCommand(session, input, "message", "steer", input.message, hash);
+    const row: SessionWithParticipants = {
+      session,
+      participants: people.map(({ userId: participantId, role }) => ({
+        userId: participantId,
+        role,
+        organizationId,
+        sessionId: session.id,
+        addedByUserId: userId,
+        createdAt: input.now,
+      })),
+    };
+    this.interactiveSessions.set(session.id, row);
+    const organizationSessions = this.interactiveSessionsByOrganization.get(organizationId);
+    if (organizationSessions === undefined) {
+      this.interactiveSessionsByOrganization.set(organizationId, [row]);
+    } else {
+      organizationSessions.push(row);
+    }
+    this.interactiveCommands.set(session.id, [structuredClone(command)]);
+    this.interactiveEvents.set(session.id, []);
+    this.appendSessionEvents(row, session, input.now, [stateEvent(session), messageEvent(command)]);
+    this.saveSessionAudit(
+      sessionAudit(
+        session,
+        userId,
+        "started",
+        { profileId: profile.id, commandId: command.id },
+        input.now,
+      ),
+    );
+    return { status: "created", ...structuredClone({ session: row.session, command }) };
+  }
 
   acceptInteractiveSessionCommand: Database["acceptInteractiveSessionCommand"] = (input) =>
     this.withAdvisoryLock(interactiveSessionLock, async () => {
@@ -667,10 +781,8 @@ class MemoryDatabase implements Database {
       const row = this.scopedInteractiveSession(organizationId, input.sessionId);
       if (!row) return refused("not_found");
       const { session } = row;
-      const rights = this.sessionRights(row, userId);
-      const allowed = rights?.[commandCapability[input.kind]];
-      if (!rights?.view && !allowed) return refused("not_found");
-      if (!allowed) return refused("forbidden");
+      const accessRefusal = this.sessionCommandAccessRefusal(row, userId, input);
+      if (accessRefusal) return refused(accessRefusal);
       const commands = this.interactiveCommands.get(session.id)!;
       if (input.kind === "retry") return this.rearmSessionMessage(row, input);
       const hash = commandHash(input);
@@ -679,52 +791,81 @@ class MemoryDatabase implements Database {
           command.authorUserId === userId &&
           command.idempotencyKey === input.idempotencyKey.toLowerCase(),
       );
-      if (prior) {
-        return prior.requestHash === hash
-          ? {
-              status: "replayed",
-              ...structuredClone({ session, command: replayCommand(prior, input.bodyCutoff) }),
-            }
-          : refused("idempotency_conflict");
-      }
-      if (input.kind !== "close" && !this.activeSessionDaemon(session))
-        return refused("daemon_unavailable");
-      const refusal = commandRefusal(session, input);
+      if (prior) return replaySessionCommand(session, prior, hash, input);
+      const refusal = this.sessionCommandRefusal(session, input);
       if (refusal) return refused(refusal);
       if (input.kind === "message") {
-        const cutoff = sendRateCutoff(input.now);
-        const recent = commands.filter(
-          (entry) =>
-            entry.kind === "message" && entry.authorUserId === userId && entry.createdAt > cutoff,
-        );
-        if (recent.length >= input.maxMessagesPerMinute) return refused("rate_limited");
-        if (this.queuedMessageCount(session) >= input.maxQueued) return refused("queue_full");
+        const limits = this.sessionMessageLimit(session, commands, userId, input);
+        if (limits) return refused(limits);
         if (!(await this.consumeOrganizationUsage(sessionUsage(input.principal, input.usage))))
           return refused("usage_limit");
       }
-      const next = advanceForCommand(session, input);
-      const command = newCommand(
-        next,
-        input,
-        input.kind,
-        input.kind === "message" ? input.delivery : null,
-        input.kind === "message" ? input.message : null,
-        hash,
-      );
-      const drafts =
-        input.kind === "message"
-          ? [messageEvent(command)]
-          : [
-              stateEvent(next),
-              ...this.supersedeInteractiveCommands(session, input.kind, input.now),
-            ];
-      commands.push(structuredClone(command));
-      this.appendSessionEvents(row, next, input.now, drafts);
-      this.saveSessionAudit(
-        sessionAudit(session, userId, input.kind, { commandId: command.id }, input.now),
-      );
-      return { status: "accepted", ...structuredClone({ session: row.session, command }) };
+      return this.recordSessionCommand(row, input, { session, commands, userId, hash });
     });
+
+  private sessionCommandAccessRefusal(
+    row: SessionWithParticipants,
+    userId: string,
+    input: AcceptCommandInput,
+  ) {
+    const rights = this.sessionRights(row, userId);
+    const allowed = rights?.[commandCapability[input.kind]];
+    if (!rights?.view && !allowed) return "not_found";
+    if (!allowed) return "forbidden";
+    return undefined;
+  }
+
+  private sessionCommandRefusal(session: SessionRecord, input: AcceptCommandInput) {
+    if (input.kind !== "close" && !this.activeSessionDaemon(session)) return "daemon_unavailable";
+    return commandRefusal(session, input);
+  }
+
+  private sessionMessageLimit(
+    session: SessionRecord,
+    commands: SessionCommandRecord[],
+    userId: string,
+    input: Extract<AcceptCommandInput, { kind: "message" }>,
+  ) {
+    const cutoff = sendRateCutoff(input.now);
+    const recent = commands.filter(
+      (entry) =>
+        entry.kind === "message" && entry.authorUserId === userId && entry.createdAt > cutoff,
+    );
+    if (recent.length >= input.maxMessagesPerMinute) return "rate_limited";
+    if (this.queuedMessageCount(session) >= input.maxQueued) return "queue_full";
+    return undefined;
+  }
+
+  private recordSessionCommand(
+    row: SessionWithParticipants,
+    input: Exclude<AcceptCommandInput, { kind: "retry" }>,
+    {
+      session,
+      commands,
+      userId,
+      hash,
+    }: { session: SessionRecord; commands: SessionCommandRecord[]; userId: string; hash: string },
+  ): AcceptCommandResult {
+    const next = advanceForCommand(session, input);
+    const command = newCommand(
+      next,
+      input,
+      input.kind,
+      input.kind === "message" ? input.delivery : null,
+      input.kind === "message" ? input.message : null,
+      hash,
+    );
+    const drafts =
+      input.kind === "message"
+        ? [messageEvent(command)]
+        : [stateEvent(next), ...this.supersedeInteractiveCommands(session, input.kind, input.now)];
+    commands.push(structuredClone(command));
+    this.appendSessionEvents(row, next, input.now, drafts);
+    this.saveSessionAudit(
+      sessionAudit(session, userId, input.kind, { commandId: command.id }, input.now),
+    );
+    return { status: "accepted", ...structuredClone({ session: row.session, command }) };
+  }
 
   listInteractiveSessions: Database["listInteractiveSessions"] = async (
     organizationId,
@@ -828,43 +969,48 @@ class MemoryDatabase implements Database {
             (input.lane !== "control" || command.kind !== "message") &&
             (session.state !== "closed" || command.kind === "close"),
         );
-      if (
-        candidates.some(
-          (command) =>
-            command.status === "dispatching" &&
-            command.claimExpiresAt !== null &&
-            command.claimExpiresAt > leaseNow,
-        )
-      )
-        return undefined;
-      let nextSession = session;
-      let claimed: SessionCommandRecord | undefined;
-      for (const command of candidates) {
-        if (!commandLeaseEligible(command, input, session.state, leaseNow)) continue;
-        const rights = this.sessionRights(row, command.authorUserId);
-        const patch = claimPatch(command, input, rights, leaseNow);
-        Object.assign(command, structuredClone(patch));
-        drafts.push(deliveryEvent(command));
-        if (command.status === "dispatching") {
-          claimed = command;
-          break;
-        }
-        nextSession = exhaustedControlState(session, command, input.now);
-        if (nextSession !== session) {
-          drafts.push(
-            stateEvent(
-              nextSession,
-              nextSession.state === "running" ? "stop_unconfirmed" : nextSession.stateReason,
-            ),
-          );
-          if (nextSession.state === "closed")
-            drafts.push(...this.supersedeInteractiveCommands(nextSession, "close", input.now));
-          break;
-        }
-      }
+      if (candidates.some((command) => commandLeaseActive(command, leaseNow))) return undefined;
+      const { nextSession, claimed } = this.claimSessionCandidate(row, input, {
+        session,
+        leaseNow,
+        drafts,
+        candidates,
+      });
       if (drafts.length > 0) this.appendSessionEvents(row, nextSession, input.now, drafts);
       return structuredClone(claimed);
     });
+
+  private claimSessionCandidate(
+    row: SessionWithParticipants,
+    input: ClaimCommandInput,
+    {
+      session,
+      leaseNow,
+      drafts,
+      candidates,
+    }: {
+      session: SessionRecord;
+      leaseNow: Date;
+      drafts: SessionEventDraft[];
+      candidates: SessionCommandRecord[];
+    },
+  ) {
+    for (const command of candidates) {
+      if (!commandLeaseEligible(command, input, session.state, leaseNow)) continue;
+      const rights = this.sessionRights(row, command.authorUserId);
+      const patch = claimPatch(command, input, rights, leaseNow);
+      Object.assign(command, structuredClone(patch));
+      drafts.push(deliveryEvent(command));
+      if (command.status === "dispatching") return { nextSession: session, claimed: command };
+      const nextSession = exhaustedControlState(session, command, input.now);
+      if (nextSession === session) continue;
+      drafts.push(commandStateEvent(nextSession));
+      if (nextSession.state === "closed")
+        drafts.push(...this.supersedeInteractiveCommands(nextSession, "close", input.now));
+      return { nextSession, claimed: undefined };
+    }
+    return { nextSession: session, claimed: undefined };
+  }
 
   settleInteractiveSessionCommand: Database["settleInteractiveSessionCommand"] = (input) =>
     this.withAdvisoryLock(interactiveSessionLock, async () => {
@@ -971,40 +1117,13 @@ class MemoryDatabase implements Database {
       const { organizationId, userId } = input.principal;
       const row = this.scopedInteractiveSession(organizationId, input.sessionId);
       if (!row) return "not_found";
-      const rights = this.sessionRights(row, userId);
-      if (!rights?.view) return "not_found";
-      if (!rights.manageParticipants) return "forbidden";
-      if (input.role !== null && !this.sessionMemberRole(organizationId, input.userId))
-        return "not_member";
+      const refusal = this.sessionParticipantRefusal(row, input, { organizationId, userId });
+      if (refusal) return refusal;
       const current = row.participants.find((person) => person.userId === input.userId);
       if ((current?.role ?? null) === input.role) return input.role === null ? "removed" : "set";
-      if (
-        current?.role === "controller" &&
-        input.role !== "controller" &&
-        !row.participants.some(
-          (person) =>
-            person.userId !== input.userId &&
-            person.role === "controller" &&
-            this.sessionMemberRole(organizationId, person.userId),
-        )
-      )
+      if (this.removesLastSessionController(row, input, current, organizationId))
         return "last_controller";
-      if (input.role === null) {
-        row.participants = row.participants.filter((person) => person.userId !== input.userId);
-      } else if (current) {
-        current.role = input.role;
-        current.addedByUserId = userId;
-      } else {
-        row.participants.push({
-          userId: input.userId,
-          role: input.role,
-          organizationId,
-          sessionId: input.sessionId,
-          addedByUserId: userId,
-          createdAt: new Date(input.now),
-        });
-        row.participants.sort((a, b) => a.userId.localeCompare(b.userId));
-      }
+      updateSessionParticipant(row, input, current, { organizationId, userId });
       const data = { userId: input.userId, role: input.role };
       this.appendSessionEvents(row, row.session, input.now, [
         { kind: "participants", commandId: null, data },
@@ -1014,6 +1133,37 @@ class MemoryDatabase implements Database {
       );
       return input.role === null ? "removed" : "set";
     });
+
+  private sessionParticipantRefusal(
+    row: SessionWithParticipants,
+    input: SetParticipantInput,
+    { organizationId, userId }: { organizationId: string; userId: string },
+  ) {
+    const rights = this.sessionRights(row, userId);
+    if (!rights?.view) return "not_found";
+    if (!rights.manageParticipants) return "forbidden";
+    if (input.role !== null && !this.sessionMemberRole(organizationId, input.userId))
+      return "not_member";
+    return undefined;
+  }
+
+  private removesLastSessionController(
+    row: SessionWithParticipants,
+    input: SetParticipantInput,
+    current: SessionWithParticipants["participants"][number] | undefined,
+    organizationId: string,
+  ) {
+    return (
+      current?.role === "controller" &&
+      input.role !== "controller" &&
+      !row.participants.some(
+        (person) =>
+          person.userId !== input.userId &&
+          person.role === "controller" &&
+          this.sessionMemberRole(organizationId, person.userId),
+      )
+    );
+  }
 
   listRecoverableInteractiveSessions: Database["listRecoverableInteractiveSessions"] = async (
     organizationId,
@@ -1121,14 +1271,7 @@ class MemoryDatabase implements Database {
     const userId = input.principal.userId;
     const retryKey = input.idempotencyKey.toLowerCase();
     const requestHash = commandHash(input);
-    const prior = this.interactiveAudit
-      .get(session.id)
-      ?.find(
-        (event) =>
-          event.action === "interactive_session.retry" &&
-          event.actorIdentity === userId &&
-          event.evidence["retryKey"] === retryKey,
-      );
+    const prior = this.priorSessionRetry(session.id, userId, retryKey);
     if (prior && prior.evidence["requestHash"] !== requestHash)
       return refused("idempotency_conflict");
     if (!prior) {
@@ -1166,8 +1309,19 @@ class MemoryDatabase implements Database {
     return { status: "accepted", ...structuredClone({ session: row.session, command }) };
   }
 
+  private priorSessionRetry(sessionId: string, userId: string, retryKey: string) {
+    return this.interactiveAudit
+      .get(sessionId)
+      ?.find(
+        (event) =>
+          event.action === "interactive_session.retry" &&
+          event.actorIdentity === userId &&
+          event.evidence["retryKey"] === retryKey,
+      );
+  }
+
   private queuedMessageCount(session: SessionRecord): number {
-    const commands = this.interactiveCommands.get(session.id)!;
+    const commands = this.interactiveCommands.get(session.id) ?? [];
     const queued = commands.filter(
       (command) =>
         command.generation === session.generation &&
@@ -1345,6 +1499,20 @@ class MemoryDatabase implements Database {
     execution: AgentExecutionRecord,
     cutoff: Date,
   ): AuxiliaryPayloadCandidate & { runId: string | null } {
+    const ids = this.launchIntentRunIds(execution);
+    const [runId = null] = ids;
+    const run = runId === null ? undefined : this.triggerRuns.get(runId);
+    const ageFrom = execution.completedAt ?? execution.startedAt;
+    let disposition: AuxiliaryPayloadCandidate["disposition"] = "eligible";
+    if (execution.hubActionAcknowledgements.finishExecutionCall?.status === "running")
+      disposition = "pending_hub_action";
+    else if (execution.usedTemporaryCredentials == null) disposition = "flag_unknown";
+    else if (this.launchIntentHasLiveOwner(execution, ids, runId, run)) disposition = "live_owner";
+    else if (ageFrom >= cutoff) disposition = "not_old_enough";
+    return { id: execution.id, ageFrom, disposition, runId };
+  }
+
+  private launchIntentRunIds(execution: AgentExecutionRecord) {
     const declared = execution.launchIntent?.triggerRunId ?? null;
     const ids = new Set(
       [...this.workflowStepRuns.values()]
@@ -1355,25 +1523,21 @@ class MemoryDatabase implements Database {
         .map((step) => step.triggerRunId),
     );
     if (declared !== null) ids.add(declared);
-    const [runId = null] = ids;
-    const run = runId === null ? undefined : this.triggerRuns.get(runId);
-    const ageFrom = execution.completedAt ?? execution.startedAt;
-    let disposition: AuxiliaryPayloadCandidate["disposition"] = "eligible";
-    if (execution.hubActionAcknowledgements.finishExecutionCall?.status === "running")
-      disposition = "pending_hub_action";
-    else if (execution.usedTemporaryCredentials == null) disposition = "flag_unknown";
-    else if (
+    return ids;
+  }
+
+  private launchIntentHasLiveOwner(
+    execution: AgentExecutionRecord,
+    ids: Set<string>,
+    runId: string | null,
+    run: TriggerRunRecord | undefined,
+  ) {
+    return (
       this.hasUnsettledExecution(execution) ||
       ids.size > 1 ||
       (execution.workflowStepRunId !== null && runId === null) ||
-      (runId !== null &&
-        (run?.organizationId !== execution.organizationId ||
-          run.projectId !== execution.projectId ||
-          run.payloadExpiryState !== "expired"))
-    )
-      disposition = "live_owner";
-    else if (ageFrom >= cutoff) disposition = "not_old_enough";
-    return { id: execution.id, ageFrom, disposition, runId };
+      (runId !== null && !expiredLaunchRun(run, execution))
+    );
   }
 
   private sessionOptionsCandidate(
@@ -1390,24 +1554,33 @@ class MemoryDatabase implements Database {
       }, null) ??
       this.agentSessionCreatedAt.get(session.id) ??
       null;
-    let disposition: AuxiliaryPayloadCandidate["disposition"] = "eligible";
-    if (!session.agentId || !session.workspaceId) disposition = "unbound_session";
-    else if (executions.length === 0) disposition = "unused_session";
-    else if (!executions.some((execution) => execution.agentSessionAction !== null))
-      disposition = "incomplete_bootstrap";
-    else if (
+    const disposition =
+      !session.agentId || !session.workspaceId
+        ? "unbound_session"
+        : this.boundSessionOptionsDisposition(executions, ageFrom, cutoff);
+    return { id: session.id, ageFrom, disposition };
+  }
+
+  private boundSessionOptionsDisposition(
+    executions: AgentExecutionRecord[],
+    ageFrom: Date | null,
+    cutoff: Date,
+  ): AuxiliaryPayloadCandidate["disposition"] {
+    if (executions.length === 0) return "unused_session";
+    if (!executions.some((execution) => execution.agentSessionAction !== null))
+      return "incomplete_bootstrap";
+    if (
       executions.some(
         (execution) =>
           execution.hubActionAcknowledgements.finishExecutionCall?.status === "running",
       )
     )
-      disposition = "pending_hub_action";
-    else if (executions.some((execution) => this.hasUnsettledExecution(execution)))
-      disposition = "live_owner";
-    else if (executions.some((execution) => execution.usedTemporaryCredentials == null))
-      disposition = "flag_unknown";
-    else if (ageFrom !== null && ageFrom >= cutoff) disposition = "not_old_enough";
-    return { id: session.id, ageFrom, disposition };
+      return "pending_hub_action";
+    if (executions.some((execution) => this.hasUnsettledExecution(execution))) return "live_owner";
+    if (executions.some((execution) => execution.usedTemporaryCredentials == null))
+      return "flag_unknown";
+    if (ageFrom !== null && ageFrom >= cutoff) return "not_old_enough";
+    return "eligible";
   }
 
   private hasUnsettledExecution(execution: AgentExecutionRecord): boolean {
