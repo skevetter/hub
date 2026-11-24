@@ -225,7 +225,7 @@ class GitHubAppClient {
       request: githubRequestOptions(this.options.fetch),
       ...pluginOverrides(this.options),
     });
-    octokit.hook.before("request", refuseRetryOfCreateComment);
+    octokit.hook.before("request", refuseRetryOfCreateComment(octokit));
     return octokit;
   }
 
@@ -285,12 +285,14 @@ function failFastOnRateLimit(kind: "primary" | "secondary") {
   };
 }
 
-// Keeps repository names and ids out of the log whether the URL is a template or resolved.
+// Keeps account, repository and id values out of the log for templates, resolved URLs and
+// URLs behind an API base prefix.
 function routeShape(url: string): string {
   return url
     .replace(/^https?:\/\/[^/]+/u, "")
-    .replace(/\?.*$/u, "")
-    .replace(/^\/repos\/[^/]+\/[^/]+/u, "/repos/:owner/:repo")
+    .replace(/[?#].*$/u, "")
+    .replace(/\/repos\/[^/]+\/[^/]+/gu, "/repos/:owner/:repo")
+    .replace(/\/(orgs|users)\/[^/]+/gu, "/$1/:name")
     .replace(/\/\d+(?=\/|$)/gu, "/:id");
 }
 
@@ -299,22 +301,25 @@ const THROTTLE_POLICY = {
   onSecondaryRateLimit: failFastOnRateLimit("secondary"),
 };
 
-// Matches a route template and a resolved URL alike.
-const CREATE_COMMENT_PATH = /^\/repos\/[^/]+\/[^/]+\/issues\/[^/]+\/comments$/u;
+// Not anchored at the start so an API base prefix such as /api/v3 still matches.
+const CREATE_COMMENT_PATH = /\/repos\/[^/]+\/[^/]+\/issues\/[^/]+\/comments$/u;
 
-interface HookedRequest {
-  method: string;
-  url: string;
-  baseUrl?: string;
-  request: object;
-}
+type HookedRequest = Parameters<Octokit["request"]["endpoint"]["parse"]>[0] & {
+  request?: object;
+};
 
-// A retried POST after a lost response would publish the comment twice. The nested request
-// object can be shared with the client defaults, so it is replaced, never mutated.
-function refuseRetryOfCreateComment(options: HookedRequest) {
-  if (options.method.toUpperCase() !== "POST") return;
-  const { pathname } = new URL(options.url, options.baseUrl ?? "https://api.github.com");
-  if (CREATE_COMMENT_PATH.test(pathname)) options.request = { ...options.request, retries: 0 };
+// A retried POST after a lost response would publish the comment twice. The hook sees the
+// request before Octokit expands templates and trailing slashes, so the endpoint parser
+// resolves it first. The nested request object can be shared with the client defaults, so it
+// is replaced, never mutated.
+function refuseRetryOfCreateComment(octokit: Octokit) {
+  return (options: HookedRequest) => {
+    const resolved = octokit.request.endpoint.parse(options);
+    if (resolved.method !== "POST") return;
+    if (CREATE_COMMENT_PATH.test(new URL(resolved.url).pathname)) {
+      options.request = { ...options.request, retries: 0 };
+    }
+  };
 }
 
 function pluginOverrides(options: CreateGitHubAuthOptions) {

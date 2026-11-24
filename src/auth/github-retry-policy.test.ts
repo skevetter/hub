@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
+import { logger } from "../logger.js";
 import { createGitHubReactionClient } from "../triggers/github/provider.js";
 import { createGitHubAuth } from "./github.js";
 
@@ -162,6 +163,47 @@ describe("GitHub client retry and throttle policy", () => {
 
     assert.equal(requests.length, 1);
     assert.ok(performance.now() - startedAt < 2_000);
+  });
+
+  it.each([
+    ["a trailing slash", "POST /repos/acme/app/issues/7/comments/", "https://api.github.com"],
+    ["a query template", "POST /repos/acme/app/issues/7/comments{?flag}", "https://api.github.com"],
+    [
+      "an API base prefix",
+      "POST /repos/acme/app/issues/7/comments",
+      "https://ghe.example.test/api/v3",
+    ],
+  ])("publishes a comment at most once with %s", async (_name, route, baseUrl) => {
+    const { auth, requests } = harness(unavailable);
+    const octokit = await auth.createInstallationOctokit(142);
+
+    await assert.rejects(octokit.request(route, { body: "hello", baseUrl, flag: "x" }));
+
+    assert.equal(requests.length, 1);
+  });
+
+  it("logs a rate limit without account or repository names under an API base prefix", async () => {
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      const { auth, requests } = harness(() =>
+        Response.json(
+          { message: "You have exceeded a secondary rate limit." },
+          { status: 403, headers: { "retry-after": "60" } },
+        ),
+      );
+      const octokit = await auth.createInstallationOctokit(142);
+
+      await assert.rejects(
+        octokit.request("GET https://ghe.example.test/api/v3/repos/acme/secret-repo/issues/7"),
+      );
+
+      assert.equal(requests.length, 1);
+      const logged = JSON.stringify(warn.mock.calls);
+      assert.ok(logged.includes("/repos/:owner/:repo/issues/:id"));
+      assert.ok(!logged.includes("acme") && !logged.includes("secret-repo"));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("keeps spacing writes one second apart", async () => {
