@@ -4141,15 +4141,34 @@ class MemoryDatabase implements Database {
   }
 
   async ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number, now: Date) {
+    return this.ownedTerminalNotification(triggerRunId, generation, now) !== undefined;
+  }
+
+  async renewWorkflowRunTerminalNotification(
+    triggerRunId: string,
+    generation: number,
+    now: Date,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const run = this.ownedTerminalNotification(triggerRunId, generation, now);
+    if (run === undefined) return false;
+    this.triggerRuns.set(run.id, {
+      ...run,
+      terminalNotificationLeaseExpiresAt: new Date(now.getTime() + leaseMs),
+    });
+    return true;
+  }
+
+  private ownedTerminalNotification(triggerRunId: string, generation: number, now: Date) {
     const run = this.triggerRuns.get(triggerRunId);
-    return (
-      run?.outcome === "accepted" &&
-      run.payloadExpiredAt == null &&
+    return run?.outcome === "accepted" &&
+      run.payloadExpiryState == null &&
       run.terminalNotificationGeneration === generation &&
       run.terminalNotificationDeliveredAt === null &&
       run.terminalNotificationLeaseExpiresAt !== null &&
       run.terminalNotificationLeaseExpiresAt > now
-    );
+      ? run
+      : undefined;
   }
 
   async markWorkflowRunTerminalNotificationDelivered(

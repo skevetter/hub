@@ -1710,6 +1710,24 @@ class PgDatabase implements Database {
     return rows.rowCount === 1;
   }
 
+  async renewWorkflowRunTerminalNotification(
+    triggerRunId: string,
+    generation: number,
+    now: Date,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const result = await query(
+      this.pool,
+      `update trigger_runs
+       set terminal_notification_lease_expires_at = $4
+       where id = $1 and terminal_notification_generation = $2 and outcome = 'accepted'
+         and terminal_notification_lease_expires_at > $3
+         and terminal_notification_delivered_at is null and payload_expiry_state is null`,
+      [triggerRunId, generation, now, new Date(now.getTime() + leaseMs)],
+    );
+    return result.rowCount === 1;
+  }
+
   async markWorkflowRunTerminalNotificationDelivered(
     triggerRunId: string,
     generation: number,
