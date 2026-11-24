@@ -85,6 +85,39 @@ it("counts only the active tenant's failures and drops them after Mark seen", as
   }
 });
 
+it("acts only on the organization in the address when the session's active organization differs", async () => {
+  const { accountId, database, organizationId, request, runtime } = fixture;
+  const [addressed, other] = ["pin-addressed", "pin-other"];
+  for (const id of [addressed, other]) {
+    await runtime.query("insert into organization (id, name, slug) values ($1, $1, $1)", [id]);
+    await runtime.query(
+      "insert into member (id, organization_id, user_id, role) values ($1, $1, $2, 'member')",
+      [id, accountId],
+    );
+  }
+  await runtime.query("update session set active_organization_id = $1", [other]);
+  await seedFailedRun(database, addressed, "Addressed job");
+  await seedFailedRun(database, other, "Other job");
+  const activeMarker = await database.readFailedRunsSeenThrough(accountId, organizationId);
+
+  const before = await snapshot(request(), addressed);
+  assert.equal(before.status, "ok");
+  expect(before.data.items).toMatchObject([
+    { id: "runs:failed", action: { to: `/o/${addressed}/activity` } },
+  ]);
+  expect(before.data.items[0]?.detail).toContain("Addressed job");
+  expect(before.data.items[0]?.detail).not.toContain("Other job");
+
+  expect(await markSeen(request("POST", origin), addressed)).toEqual({ status: "ok", data: null });
+  expect(await snapshot(request(), addressed)).toMatchObject({ status: "ok", data: { items: [] } });
+  expect(await database.readFailedRunsSeenThrough(accountId, addressed)).not.toBeNull();
+  expect(await database.readFailedRunsSeenThrough(accountId, other)).toBeNull();
+  expect(await database.readFailedRunsSeenThrough(accountId, organizationId)).toBe(activeMarker);
+  const untouched = await snapshot(request(), other);
+  assert.equal(untouched.status, "ok");
+  expect(untouched.data.items[0]?.detail).toContain("Other job");
+});
+
 async function seedFailedRun(database: Database, organizationId: string, name: string) {
   const project = await database.createProject({
     organizationId,
@@ -173,7 +206,7 @@ async function startInstance() {
       [organizationId, accountId],
     );
     await runtime.query("insert into organization (id, name, slug) values ($1, $1, $1)", [foreign]);
-    return { auth, database, request, organizationId, slug, accountId, close };
+    return { auth, database, request, organizationId, runtime, slug, accountId, close };
   } catch (error) {
     await close();
     throw error;
