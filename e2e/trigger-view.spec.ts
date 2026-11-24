@@ -210,6 +210,21 @@ test("holds a toast while it has focus and dismisses it from the keyboard", asyn
   await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe("content");
 });
 
+test("dismisses a focused toast with Escape and returns focus to the page", async ({
+  hub,
+  page,
+}) => {
+  await createManualTrigger(hub, page);
+  const log = page.getByRole("log", { name: "Notifications" });
+  await dismissAllToasts(log);
+  await saveEdit(page);
+  const toast = log.locator('[data-slot="toast"]');
+  await toast.getByRole("link", { name: "View trigger" }).focus();
+  await page.keyboard.press("Escape");
+  await expect(toast).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe("content");
+});
+
 test("hides a toast that belongs to another organization after a switch", async ({ hub, page }) => {
   await createManualTrigger(hub, page);
   await hub.createAnotherOrganization("owner", "Globex");
