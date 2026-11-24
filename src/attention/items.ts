@@ -3,6 +3,7 @@ import type {
   DroppedProviderEventCount,
   FailedRunSummary,
   OrganizationConnectionUsage,
+  TriggerMatchActivity,
   WaitingSessionSummary,
 } from "../db/types.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
@@ -33,6 +34,7 @@ interface AttentionInputs {
     permissions: readonly string[];
   }[];
   triggers: readonly { enabled: boolean }[];
+  triggerMatches: readonly TriggerMatchActivity[];
   dropped: readonly DroppedProviderEventCount[];
   failedRuns: FailedRunSummary;
   sessions: { hasActiveProfile: boolean; waiting: WaitingSessionSummary } | null;
@@ -48,6 +50,7 @@ export function deriveAttention(input: AttentionInputs): AttentionItem[] {
     ...daemonItems(input, base),
     ...droppedItems(input.dropped, base),
     ...runItems(input, base),
+    ...stoppedTriggerItems(input.triggerMatches, base),
     ...sessionItems(input.sessions, base),
   ];
 }
@@ -136,6 +139,35 @@ function droppedItems(dropped: AttentionInputs["dropped"], base: string): Attent
       },
     ];
   });
+}
+
+function stoppedTriggerItems(triggers: AttentionInputs["triggerMatches"], base: string) {
+  const items = triggers
+    .filter(({ previousMatches, recentMatches }) => previousMatches > 0 && recentMatches === 0)
+    .sort((a, b) => b.previousMatches - a.previousMatches || a.name.localeCompare(b.name))
+    .flatMap((trigger) => stoppedTriggerItem(trigger, base) ?? []);
+  // Limit the menu to the five strongest signals.
+  return items.slice(0, 5);
+}
+
+function stoppedTriggerItem(
+  { id, name, previousMatches, providers }: TriggerMatchActivity,
+  base: string,
+): AttentionItem | undefined {
+  const source = providers.find(({ recentEvents }) => recentEvents > 0);
+  if (source === undefined) return undefined;
+  const { provider, recentEvents } = source;
+  return {
+    id: `trigger:${id}`,
+    source: "trigger",
+    title: `${name} stopped matching events`,
+    detail: `Matched ${eventCount(previousMatches)} in the previous 7 days and none in the last 7 days, while ${recentEvents.toLocaleString("en")} ${LIST_PROVIDER_LABELS[provider]} ${recentEvents === 1 ? "event" : "events"} still arrived.`,
+    action: { label: "Open trigger", to: `${base}/triggers/${id}` },
+  };
+}
+
+function eventCount(count: number): string {
+  return `${count.toLocaleString("en")} ${count === 1 ? "event" : "events"}`;
 }
 
 function relativeLabel(time: Date, now: Date): string {

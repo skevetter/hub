@@ -7,8 +7,11 @@ import {
   TIMELINE_ORGANIZATION as org,
   type TimelinePostgresHarness,
 } from "../db/test-utils/run-timeline-postgres.js";
-import type { AcceptedTriggerRunRecord } from "../db/types.js";
+import type { AcceptedTriggerRunRecord, Database, OrganizationTriggerRecord } from "../db/types.js";
 import { enrollTestDaemon } from "../test-utils/project-configuration.js";
+import { eventDefinition } from "../triggers/configuration/events.js";
+import { compileTriggerDocument } from "../triggers/configuration/index.js";
+import { RECENT_PROVIDER_EVENTS_SQL, TRIGGER_MATCHES_SQL } from "./trigger-matches.js";
 import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { FAILED_RUNS_SQL, WAITING_SESSIONS_SQL } from "./queries.js";
 
@@ -235,4 +238,245 @@ it("uses indexed receipt and run lookups for a selective attention window", asyn
   const sessionsOutput = sessionsPlan.rows.map((row) => row["QUERY PLAN"]).join("\n");
   expect(sessionsOutput).toContain("interactive_sessions");
   process.stdout.write(`${output}\n${sessionsOutput}\n`);
+});
+
+const matchWindow = {
+  previousStart: new Date("2026-02-01T00:00:00Z"),
+  recentStart: new Date("2026-02-08T00:00:00Z"),
+  now: new Date("2026-02-15T00:00:00Z"),
+};
+
+function slackConnection(organizationId: string) {
+  return {
+    id: randomUUID(),
+    organizationId,
+    teamId: organizationId,
+    slug: organizationId,
+    teamName: organizationId,
+    botUserId: "bot",
+    botAccessToken: "fixture",
+    scopes: [],
+    providerApplicationId: null,
+  };
+}
+
+const matchConnections = [slackConnection(org), slackConnection(otherOrg)];
+
+async function matchDatabase(engine: "postgres" | "memory") {
+  if (engine === "memory")
+    return createMemoryDatabase({
+      organizationIds: [org, otherOrg],
+      slackConnections: matchConnections,
+    });
+  for (const connection of matchConnections) {
+    await pg.runtime.query(
+      `insert into slack_connections
+        (id, organization_id, team_id, slug, team_name, bot_user_id, bot_access_token)
+       values ($1, $2, $2, $2, $2, 'bot', 'fixture')`,
+      [connection.id, connection.organizationId],
+    );
+  }
+  return pg.database;
+}
+
+interface MatchFixture {
+  name: string;
+  events: readonly ("slack.mention" | "github.push" | "github.notification" | "manual.run")[];
+  enabled?: boolean;
+  organizationId?: string;
+}
+
+async function matchTrigger(database: Database, fixture: MatchFixture) {
+  const yaml = `name: sample
+enabled: true
+on:
+  manual.run: {}
+run:
+  target: { daemon: devbox, cwd: /workspace }
+  agent: { provider: codex, mode: full-access }
+  prompt: Run task
+`;
+  const compiled = compileTriggerDocument(yaml);
+  const [event] = compiled.events;
+  assert.ok(event);
+  return database.saveOrganizationTrigger({
+    organizationId: fixture.organizationId ?? org,
+    name: fixture.name,
+    enabled: fixture.enabled ?? true,
+    format: "single_run",
+    yaml,
+    normalizedConfiguration: {
+      environments: [compiled.environment],
+      triggers: fixture.events.map((on, index) => ({
+        ...event,
+        name: `${event.name}-${index}`,
+        on,
+        filters: eventDefinition(on).origin === "hub" ? {} : { from_users: ["fixture"] },
+      })),
+    },
+    contentHash: fixture.name,
+    sourceKind: "manual",
+    sourceEvidence: {},
+    createdByUserId: null,
+    routes: [],
+  });
+}
+
+async function matchRun(
+  database: Database,
+  trigger: OrganizationTriggerRecord,
+  receivedAt: Date,
+  { rejected = false, name = trigger.name } = {},
+) {
+  const { organizationId, runtimeProjectId: projectId } = trigger;
+  const receipt = await database.persistManualEvent({
+    organizationId,
+    projectId,
+    deliveryId: randomUUID(),
+    source: "manual.run",
+    payload: {},
+    receivedAt,
+  });
+  assert.equal(receipt.status, "accepted");
+  const input = {
+    organizationId,
+    projectId,
+    providerEventReceiptId: receipt.event.providerEventReceiptId,
+    configurationRevisionId: receipt.event.configurationRevisionId,
+    configuredTriggerName: name,
+    prompt: "",
+    inputs: {},
+    triggerContext: {},
+    outputContext: {},
+    createdAt: matchWindow.now,
+  };
+  if (rejected) {
+    await database.createRejectedTriggerRun({
+      ...input,
+      rejection: { code: "missing_required", inputName: "fixture" },
+    });
+    return;
+  }
+  await database.createAcceptedTriggerRun({ ...input, deadlineAt: matchWindow.now, stepIds: [] });
+}
+
+async function deliverMatchEvent(database: Database, teamId: string, receivedAt: Date) {
+  const event = await database.acceptSlackEvent({
+    teamId,
+    receivedAt,
+    deliveryId: randomUUID(),
+    source: "slack.mention",
+    payload: {},
+    dropReason: "no_project_route",
+  });
+  expect(event.status).toBe("dropped");
+}
+
+async function seedMatchRuns(database: Database) {
+  const { previousStart, recentStart, now } = matchWindow;
+  const stopped = await matchTrigger(database, {
+    name: "stopped",
+    events: ["github.push", "slack.mention"],
+  });
+  await matchRun(database, stopped, previousStart, { rejected: true });
+  await matchRun(database, stopped, new Date(recentStart.getTime() - 1));
+  await matchRun(database, stopped, new Date(previousStart.getTime() - 1));
+  await matchRun(database, stopped, recentStart, { name: "another-trigger" });
+  await matchRun(database, stopped, new Date(now.getTime() + 1));
+  const still = await matchTrigger(database, { name: "still", events: ["slack.mention"] });
+  await matchRun(database, still, previousStart);
+  await matchRun(database, still, recentStart);
+  const disabled = await matchTrigger(database, {
+    name: "disabled",
+    events: ["slack.mention"],
+    enabled: false,
+  });
+  await matchRun(database, disabled, previousStart);
+  const unserved = await matchTrigger(database, {
+    name: "unserved",
+    events: ["github.notification"],
+  });
+  await matchRun(database, unserved, previousStart);
+  await matchTrigger(database, { name: "never", events: ["slack.mention"] });
+  await matchTrigger(database, { name: "manual", events: ["manual.run"] });
+  const foreign = await matchTrigger(database, {
+    name: "foreign",
+    events: ["slack.mention"],
+    organizationId: otherOrg,
+  });
+  await matchRun(database, foreign, previousStart);
+  await deliverMatchEvent(database, org, new Date(recentStart.getTime() - 1));
+  await deliverMatchEvent(database, org, now);
+  await deliverMatchEvent(database, org, new Date(now.getTime() + 1));
+  await deliverMatchEvent(database, otherOrg, recentStart);
+}
+
+it.each(["postgres", "memory"] as const)(
+  "reads stop-rule window evidence on %s",
+  async (engine) => {
+    const database = await matchDatabase(engine);
+    await seedMatchRuns(database);
+    const counts = await database.listTriggerMatchActivity(org, matchWindow);
+    expect(
+      counts
+        .map(({ id, ...evidence }) => {
+          expect(id).toBeTruthy();
+          return evidence;
+        })
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    ).toEqual([
+      {
+        name: "never",
+        previousMatches: 0,
+        recentMatches: 0,
+        providers: [{ provider: "slack", recentEvents: 1 }],
+      },
+      {
+        name: "still",
+        previousMatches: 1,
+        recentMatches: 1,
+        providers: [{ provider: "slack", recentEvents: 1 }],
+      },
+      {
+        name: "stopped",
+        previousMatches: 2,
+        recentMatches: 0,
+        providers: [
+          { provider: "github", recentEvents: 0 },
+          { provider: "slack", recentEvents: 1 },
+        ],
+      },
+      {
+        name: "unserved",
+        previousMatches: 1,
+        recentMatches: 0,
+        providers: [{ provider: "github_notification", recentEvents: 0 }],
+      },
+    ]);
+  },
+);
+
+it("uses indexed receipt and run lookups for the stop rule", async () => {
+  const { runtime } = pg;
+  const { previousStart, recentStart, now } = matchWindow;
+  const plans = await Promise.all([
+    runtime.query(`explain (analyze, buffers) ${TRIGGER_MATCHES_SQL}`, [
+      org,
+      previousStart,
+      recentStart,
+      now,
+    ]),
+    runtime.query(`explain (analyze, buffers) ${RECENT_PROVIDER_EVENTS_SQL}`, [
+      org,
+      recentStart,
+      now,
+      ["github", "slack", "discord", "linear", "github_notification"],
+    ]),
+  ]);
+  const matchPlans = plans.map(({ rows }) => rows.map((row) => row["QUERY PLAN"]).join("\n"));
+  expect(matchPlans[0]).toContain("trigger_runs_receipt_project_configured_unique");
+  for (const plan of matchPlans) {
+    expect(plan).toContain("provider_event_receipts_organization_received_idx");
+  }
+  process.stdout.write(`${matchPlans.join("\n")}\n`);
 });

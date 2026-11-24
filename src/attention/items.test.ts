@@ -1,3 +1,4 @@
+import type { TriggerMatchActivity } from "../db/types.js";
 import { expect, it } from "vitest";
 import { SLACK_REQUIRED_BOT_SCOPES } from "../providers/slack/client.js";
 import { attentionSnapshotSchema } from "./contract.js";
@@ -10,6 +11,7 @@ const empty = {
   connections: { github: [], slack: [], linear: [], discord: [{ guildName: "chat" }] },
   daemons: [],
   triggers: [],
+  triggerMatches: [],
   dropped: [],
   failedRuns: { count: 0, newest: null },
   sessions: null,
@@ -112,4 +114,58 @@ it("lists actionable sources in fixed order with Home copy and tenant links", ()
     title: "2 sessions wait for permission",
     detail: "Newest session",
   });
+});
+
+const matching = {
+  id: "deploy",
+  name: "Deploy",
+  previousMatches: 1,
+  recentMatches: 0,
+  providers: [
+    { provider: "github", recentEvents: 0 },
+    { provider: "slack", recentEvents: 1 },
+  ],
+} satisfies TriggerMatchActivity;
+
+it("warns once for a trigger that stopped matching while one of its providers still sent events", () => {
+  expect(deriveAttention({ ...empty, triggerMatches: [matching] })).toEqual([
+    {
+      id: "trigger:deploy",
+      source: "trigger",
+      title: "Deploy stopped matching events",
+      detail:
+        "Matched 1 event in the previous 7 days and none in the last 7 days, while 1 Slack event still arrived.",
+      action: { label: "Open trigger", to: "/o/team/triggers/deploy" },
+    },
+  ]);
+});
+
+it("ignores triggers that never matched, still match, or stopped receiving events", () => {
+  expect(
+    deriveAttention({
+      ...empty,
+      triggerMatches: [
+        { ...matching, previousMatches: 0 },
+        { ...matching, recentMatches: 1 },
+        { ...matching, providers: [{ provider: "github", recentEvents: 0 }] },
+      ],
+    }),
+  ).toEqual([]);
+});
+
+it("caps stopped triggers at five, ordered by prior matches then name", () => {
+  const triggerMatches = ["a", "f", "e", "d", "c", "b", "g"].map((name) => ({
+    recentMatches: 0,
+    providers: matching.providers,
+    id: name,
+    name,
+    previousMatches: name === "g" ? 12 : 1,
+  }));
+  expect(deriveAttention({ ...empty, triggerMatches }).map(({ id }) => id)).toEqual([
+    "trigger:g",
+    "trigger:a",
+    "trigger:b",
+    "trigger:c",
+    "trigger:d",
+  ]);
 });

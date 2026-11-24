@@ -20,15 +20,22 @@ export class AttentionDashboard {
     const { id: organizationId, slug } = tenant.organization;
     const reader = { organizationId, userId: account.account.id, role: tenant.membership.role };
     const now = this.options.now?.() ?? new Date();
-    const since = new Date(now.getTime() - ATTENTION_WINDOW_DAYS * 86_400_000);
-    const [connections, daemons, triggers, dropped, failedRuns, sessions] = await Promise.all([
-      this.database.organizationConnectionUsage(organizationId),
-      this.database.listDaemonsForOrganization(organizationId),
-      this.database.listOrganizationTriggers(organizationId),
-      this.database.countRecentDroppedEvents(organizationId, since),
-      this.failedRuns(reader, since),
-      this.sessions(reader),
-    ]);
+    const windowMs = ATTENTION_WINDOW_DAYS * 86_400_000;
+    const since = new Date(now.getTime() - windowMs);
+    const [connections, daemons, triggers, triggerMatches, dropped, failedRuns, sessions] =
+      await Promise.all([
+        this.database.organizationConnectionUsage(organizationId),
+        this.database.listDaemonsForOrganization(organizationId),
+        this.database.listOrganizationTriggers(organizationId),
+        this.database.listTriggerMatchActivity(organizationId, {
+          previousStart: new Date(now.getTime() - 2 * windowMs),
+          recentStart: since,
+          now,
+        }),
+        this.database.countRecentDroppedEvents(organizationId, since),
+        this.failedRuns(reader, since),
+        this.sessions(reader),
+      ]);
     return {
       items: deriveAttention({
         organizationSlug: slug,
@@ -36,6 +43,7 @@ export class AttentionDashboard {
         connections,
         daemons,
         triggers,
+        triggerMatches,
         dropped,
         failedRuns,
         sessions,

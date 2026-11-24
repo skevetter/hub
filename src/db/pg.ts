@@ -5,6 +5,7 @@ import {
   markFailedRunsSeen,
   readFailedRunsSeenThrough,
 } from "../attention/queries.js";
+import { listTriggerMatchActivity } from "../attention/trigger-matches.js";
 import { FAILED_RUN_FILTER, FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { SurfaceRepository } from "../surfaces/postgres-store.js";
 import {
@@ -4536,6 +4537,9 @@ class PgDatabase implements Database {
     );
     return rows.rows.map(({ status, count }) => ({ status, count }));
   }
+
+  listTriggerMatchActivity: Database["listTriggerMatchActivity"] = (...args) =>
+    listTriggerMatchActivity(this.pool, ...args);
 
   countFailedRunsSince: Database["countFailedRunsSince"] = (...args) =>
     countFailedRunsSince(this.pool, ...args);

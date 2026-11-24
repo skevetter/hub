@@ -926,6 +926,25 @@ export interface ActivityRunKey {
   id: string;
 }
 
+export type TriggerMatchProvider = Extract<
+  ListProvider,
+  "github" | "slack" | "discord" | "linear" | "github_notification"
+>;
+
+export interface TriggerMatchActivity {
+  id: string;
+  name: string;
+  previousMatches: number;
+  recentMatches: number;
+  providers: { provider: TriggerMatchProvider; recentEvents: number }[];
+}
+
+export interface TriggerMatchWindow {
+  previousStart: Date;
+  recentStart: Date;
+  now: Date;
+}
+
 export interface ActivityRunPageRequest {
   limit: number;
   status?: RunStatusFilter;
@@ -1939,6 +1958,10 @@ export interface Database
   ): Promise<OrganizationRunRecord[]>;
   /** How many runs the organization's triggers started at or after `since`, by status. */
   countOrganizationRunsSince(organizationId: string, since: Date): Promise<OrganizationRunCount[]>;
+  listTriggerMatchActivity(
+    organizationId: string,
+    window: TriggerMatchWindow,
+  ): Promise<TriggerMatchActivity[]>;
   countFailedRunsSince(
     organizationId: string,
     since: Date,

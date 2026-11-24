@@ -1,3 +1,4 @@
+import { triggerMatchActivity } from "../attention/trigger-matches.js";
 import { FAILED_RUN_FILTER, FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { MemorySurfaceStore } from "../surfaces/memory-store.js";
 import {
@@ -232,6 +233,8 @@ import type {
   LinearConnectionRefreshOperation,
   ActivityRunPageRecord,
   ActivityRunPageRequest,
+  TriggerMatchActivity,
+  TriggerMatchWindow,
   ActivityRunScope,
   TriggerListKey,
   TriggerListPage,
@@ -6873,6 +6876,59 @@ class MemoryDatabase implements Database {
     const now = this.now().toISOString();
     if (seen === undefined || now > seen) this.failedRunsSeen.set(key, now);
   };
+
+  listTriggerMatchActivity: Database["listTriggerMatchActivity"] = async (
+    organizationId,
+    window,
+  ) => {
+    const matches = this.triggerMatchCounts(organizationId, window);
+    const receipts = new Map<string, number>();
+    for (const {
+      organizationId: owner,
+      provider,
+      receivedAt,
+    } of this.providerEventReceipts.values()) {
+      if (owner !== organizationId || receivedAt < window.recentStart || receivedAt > window.now)
+        continue;
+      receipts.set(provider, (receipts.get(provider) ?? 0) + 1);
+    }
+    const triggers = await this.listOrganizationTriggers(organizationId);
+    return triggers
+      .filter(({ enabled }) => enabled)
+      .flatMap(({ id, name, runtimeProjectId, activeRevisionId }) => {
+        const configuration =
+          this.organizationTriggerRevisions.get(activeRevisionId)?.normalizedConfiguration;
+        const counts = matches.get(JSON.stringify([runtimeProjectId, name])) ?? {
+          previousMatches: 0,
+          recentMatches: 0,
+        };
+        return triggerMatchActivity({ id, name, configuration }, counts, receipts);
+      });
+  };
+
+  private triggerMatchCounts(organizationId: string, window: TriggerMatchWindow) {
+    const matches = new Map<
+      string,
+      Pick<TriggerMatchActivity, "previousMatches" | "recentMatches">
+    >();
+    for (const { id } of this.organizationRunOrder.get(organizationId) ?? []) {
+      const run = this.triggerRuns.get(id);
+      if (run === undefined) continue;
+      const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
+      if (
+        receipt?.organizationId !== organizationId ||
+        receipt.receivedAt < window.previousStart ||
+        receipt.receivedAt > window.now
+      )
+        continue;
+      const key = JSON.stringify([run.projectId, run.configuredTriggerName]);
+      const counts = matches.get(key) ?? { previousMatches: 0, recentMatches: 0 };
+      if (receipt.receivedAt < window.recentStart) counts.previousMatches++;
+      else counts.recentMatches++;
+      matches.set(key, counts);
+    }
+    return matches;
+  }
 
   countFailedRunsSince: Database["countFailedRunsSince"] = async (
     organizationId,
