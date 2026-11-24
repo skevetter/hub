@@ -20,7 +20,10 @@ test("redirects only a reachable organization index to Home", async ({ hub, page
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
 
   await page.goto(new URL("/o/unknown", page.url()).href);
-  await expect(page.getByRole("alert")).toContainText("Organization unavailable");
+  // A read that backed off and retried could not show this before about three seconds.
+  await expect(page.getByRole("alert")).toContainText("Organization unavailable", {
+    timeout: 2_500,
+  });
   await expect(page).toHaveURL(/\/o\/unknown$/u);
 });
 

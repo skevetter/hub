@@ -10,6 +10,8 @@ export type Snapshot<T> =
 
 class SnapshotFailure extends Error {}
 
+const defaultRetry = (failureCount: number): boolean => failureCount < 2;
+
 /**
  * Server Result failures belong to the query's error channel, never its data cache. React Query
  * retains the last successful value and retries a failed read twice. A background failure does
@@ -21,20 +23,24 @@ export function useSnapshotQuery<T>(options: {
   queryFn: (context: QueryFunctionContext) => Promise<Result<T>>;
   enabled?: boolean;
   refetchInterval?: number;
+  /** Whether to ask again after a failure. `message` is the server's, null when none arrived. */
+  retry?: (failureCount: number, message: string | null) => boolean;
 }): Snapshot<T> & {
   refetch: (options?: { cancelRefetch?: boolean }) => void;
   isFetching: boolean;
   /** Set when a background refresh failed and the data shown is the last good answer. */
   refreshFailure: { message: string | null } | null;
 } {
+  const { retry = defaultRetry, ...queryOptions } = options;
   const query = useQuery({
-    ...options,
+    ...queryOptions,
     queryFn: async (context) => {
       const result = await options.queryFn(context);
       if (result.status === "error") throw new SnapshotFailure(result.error.message);
       return result.data;
     },
-    retry: 2,
+    retry: (failureCount, error) =>
+      retry(failureCount, error instanceof SnapshotFailure ? error.message : null),
   });
   const reload = query.refetch;
   const refetch = useCallback(
