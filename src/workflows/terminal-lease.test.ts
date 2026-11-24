@@ -240,6 +240,24 @@ describe("terminal notification lease", () => {
     await work.engine.stop();
   });
 
+  it("keeps the claim and marks once when renewals throw past the lease expiry", async () => {
+    const work = await fixture();
+    for (let i = 0; i < 3; i += 1) work.renew.mockRejectedValueOnce(new Error("database blip"));
+    await start(work);
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(work.renew).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(work.renew).toHaveBeenCalledTimes(4);
+    work.handler.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(work.mark).toHaveBeenCalledExactlyOnceWith(work.runId, 1, new Date(), null);
+    expect(await work.readRun()).toMatchObject({ terminalNotificationDeliveredAt: new Date() });
+    expect(await work.claim()).toBeUndefined();
+    expect(work.onWorkflowRunTerminal).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    await work.engine.stop();
+  });
+
   it("clears renewal when the handler rejects", async () => {
     const work = await fixture();
     await start(work);

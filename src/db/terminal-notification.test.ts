@@ -73,10 +73,10 @@ function renewalTests(getDatabase: () => Database) {
     );
   });
 
-  it("refuses to renew at or after expiry", async () => {
+  it("renews after expiry while nobody re-claimed, keeping the generation", async () => {
     const database = getDatabase();
     const { id, generation } = await claim(database);
-    for (const offset of [30_000, 30_001]) {
+    for (const offset of [30_000, 45_000]) {
       assert.equal(
         await database.renewWorkflowRunTerminalNotification(
           id,
@@ -84,10 +84,61 @@ function renewalTests(getDatabase: () => Database) {
           at(offset),
           TERMINAL_LEASE_MS,
         ),
-        false,
+        true,
       );
     }
-    await database.markWorkflowRunTerminalNotificationDelivered(id, generation, at(30_001), null);
+    assert.equal(
+      await database.claimPendingWorkflowRunTerminalNotification(at(74_999), TERMINAL_LEASE_MS),
+      undefined,
+    );
+    await database.markWorkflowRunTerminalNotificationDelivered(id, generation, at(60_000), null);
+    assert.equal(
+      await database.claimPendingWorkflowRunTerminalNotification(at(200_000), TERMINAL_LEASE_MS),
+      undefined,
+    );
+  });
+
+  it("fences out the old holder once an expired lease is re-claimed", async () => {
+    const database = getDatabase();
+    const { id, generation } = await claim(database);
+    const replay = await database.claimPendingWorkflowRunTerminalNotification(
+      at(30_000),
+      TERMINAL_LEASE_MS,
+    );
+    assert.equal(replay?.terminalNotificationGeneration, generation + 1);
+    assert.equal(
+      await database.renewWorkflowRunTerminalNotification(
+        id,
+        generation,
+        at(31_000),
+        TERMINAL_LEASE_MS,
+      ),
+      false,
+    );
+    await database.markWorkflowRunTerminalNotificationDelivered(id, generation, at(31_000), null);
+    assert.equal(
+      await database.ownsWorkflowRunTerminalNotification(id, generation + 1, at(31_000)),
+      true,
+    );
+    assert.equal(
+      await database.renewWorkflowRunTerminalNotification(
+        id,
+        generation + 1,
+        at(31_000),
+        TERMINAL_LEASE_MS,
+      ),
+      true,
+    );
+    await database.markWorkflowRunTerminalNotificationDelivered(
+      id,
+      generation + 1,
+      at(32_000),
+      null,
+    );
+    assert.equal(
+      await database.claimPendingWorkflowRunTerminalNotification(at(200_000), TERMINAL_LEASE_MS),
+      undefined,
+    );
   });
 
   it("refuses renewal after delivery or payload expiry", async () => {
