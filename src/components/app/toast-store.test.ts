@@ -33,6 +33,30 @@ describe("toast store", () => {
     expect(titles()).toEqual(["T1", "T2", "T3"]);
   });
 
+  it("caps each organization on its own", () => {
+    toast({ title: "Acme first", scope: "acme" });
+    for (let n = 0; n <= MAX_TOASTS; n += 1) toast({ title: `Globex ${n}`, scope: "globex" });
+    expect(titles()).toEqual(["Acme first", "Globex 1", "Globex 2", "Globex 3"]);
+    const all = toastSnapshot();
+    expect(visibleToasts(all, "acme").map(({ title }) => title)).toEqual(["Acme first"]);
+  });
+
+  it("caps toasts without an organization separately from scoped ones", () => {
+    for (let n = 0; n <= MAX_TOASTS; n += 1) toast({ title: `Any ${n}` });
+    toast({ title: "Acme", scope: "acme" });
+    expect(titles()).toEqual(["Any 1", "Any 2", "Any 3", "Acme"]);
+  });
+
+  it("shows at most the cap when unscoped and scoped toasts share an organization", () => {
+    for (let n = 0; n < MAX_TOASTS; n += 1) toast({ title: `Any ${n}` });
+    toast({ title: "Acme", scope: "acme" });
+    expect(visibleToasts(toastSnapshot(), "acme").map(({ title }) => title)).toEqual([
+      "Any 1",
+      "Any 2",
+      "Acme",
+    ]);
+  });
+
   it("dismisses one toast and ignores an unknown id", () => {
     toast({ title: "Keep" });
     const gone = toast({ title: "Gone" });
