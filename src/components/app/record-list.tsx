@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import { cn } from "../../lib/utils.js";
+
 /**
  * A short list of records inside a card, for the times a table would be wrong: the records are
  * already grouped by the card's own subject, so a header row would only repeat it.
@@ -22,12 +24,15 @@ export function RecordList({ label, children }: { label: string; children: React
  */
 export function RecordRow({
   children,
+  lead,
   status,
   actions,
   busy,
 }: {
   /** The identity of the record, normally a `TwoLine`. */
   children: ReactNode;
+  /** Its state as a leading `StateBlock`: left of the record, or above it on a phone. */
+  lead?: ReactNode;
   /** Its state, always a `StatusPill`. */
   status?: ReactNode;
   /** Its actions, always behind a `RowActions` kebab. */
@@ -38,13 +43,19 @@ export function RecordRow({
     <li
       data-slot="record-row"
       aria-busy={busy || undefined}
-      className="flex min-w-0 items-center justify-between gap-3 py-3 first:pt-0 last:pb-0"
+      className={cn(
+        "flex min-w-0 items-center justify-between gap-3 py-3 first:pt-0 last:pb-0",
+        lead !== undefined && "max-md:flex-col max-md:items-start",
+      )}
     >
-      <div className="min-w-0">{children}</div>
-      <div className="flex shrink-0 items-center gap-2">
-        {status}
-        {actions}
-      </div>
+      {lead}
+      <div className={cn("min-w-0", lead !== undefined && "md:flex-1")}>{children}</div>
+      {status === undefined && actions === undefined ? null : (
+        <div className="flex shrink-0 items-center gap-2">
+          {status}
+          {actions}
+        </div>
+      )}
     </li>
   );
 }
