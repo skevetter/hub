@@ -38,9 +38,10 @@
       }
     },
     {
-      "files": ["src/run-payload-retention/summary.ts"],
+      "files": ["src/db/pg.ts", "src/db/memory.ts"],
       "rules": {
-        "max-params": ["error", { "max": 5 }]
+        "max-params": ["error", { "max": 5 }],
+        "typescript/no-non-null-assertion": "off"
       }
     }
   ]

@@ -21,26 +21,29 @@ interface StatusWrite {
 
 const TABLES: Record<string, true | undefined> = { workflow_step_runs: true, trigger_runs: true };
 
+function isAssignmentTerminator(token: string | undefined): boolean {
+  return (
+    token === "where" || token === "from" || token === "returning" || token === ";" || token === ")"
+  );
+}
+
+function assignmentDepth(token: string | undefined, depth: number): number {
+  if (token === "(") depth += 1;
+  if (token === ")") depth -= 1;
+  return depth;
+}
+
 function hasStatusAssignment(tokens: string[], cursor: number): boolean {
   let depth = 0;
   let assignment = true;
   for (; cursor < tokens.length; cursor += 1) {
     const token = tokens[cursor];
-    if (
-      depth === 0 &&
-      (token === "where" ||
-        token === "from" ||
-        token === "returning" ||
-        token === ";" ||
-        token === ")")
-    )
-      break;
+    if (depth === 0 && isAssignmentTerminator(token)) break;
     if (depth === 0 && assignment) {
       if (token === "status" && tokens[cursor + 1] === "=") return true;
       assignment = false;
     }
-    if (token === "(") depth += 1;
-    if (token === ")") depth -= 1;
+    depth = assignmentDepth(token, depth);
     if (depth === 0 && token === ",") assignment = true;
   }
   return false;
@@ -53,6 +56,25 @@ function expressionName(node: ts.Node | undefined): string | undefined {
   return undefined;
 }
 
+function statusProperties(object: ts.ObjectLiteralExpression): boolean {
+  return object.properties.some(
+    (property) => "name" in property && expressionName(property.name) === "status",
+  );
+}
+
+function drizzleUpdateTable(update: ts.Expression): string | undefined {
+  if (
+    !ts.isCallExpression(update) ||
+    !ts.isPropertyAccessExpression(update.expression) ||
+    update.expression.name.text !== "update"
+  )
+    return undefined;
+  return expressionName(update.arguments[0])?.replace(
+    /[A-Z]/g,
+    (letter) => `_${letter.toLowerCase()}`,
+  );
+}
+
 function drizzleStatusTable(node: ts.CallExpression): string | undefined {
   if (
     !ts.isPropertyAccessExpression(node.expression) ||
@@ -61,26 +83,23 @@ function drizzleStatusTable(node: ts.CallExpression): string | undefined {
     !ts.isObjectLiteralExpression(node.arguments[0])
   )
     return undefined;
-  const update = node.expression.expression;
-  if (
-    !ts.isCallExpression(update) ||
-    !ts.isPropertyAccessExpression(update.expression) ||
-    update.expression.name.text !== "update"
-  )
-    return undefined;
-  const table = expressionName(update.arguments[0])?.replace(
-    /[A-Z]/g,
-    (letter) => `_${letter.toLowerCase()}`,
-  );
-  if (
-    table &&
-    TABLES[table] === true &&
-    node.arguments[0].properties.some(
-      (property) => "name" in property && expressionName(property.name) === "status",
-    )
-  )
-    return table;
+  const table = drizzleUpdateTable(node.expression.expression);
+  if (table && TABLES[table] === true && statusProperties(node.arguments[0])) return table;
   return undefined;
+}
+
+function sqlUpdateStatusTable(tokens: string[], cursor: number): string | undefined {
+  if (tokens[cursor] === "only") cursor += 1;
+  let table = tokens[cursor++];
+  while (tokens[cursor] === ".") {
+    table = tokens[cursor + 1];
+    cursor += 2;
+  }
+  if (table === undefined || TABLES[table] !== true) return undefined;
+  if (tokens[cursor] === "as") cursor += 2;
+  else if (tokens[cursor] !== "set") cursor += 1;
+  if (tokens[cursor++] !== "set") return undefined;
+  return hasStatusAssignment(tokens, cursor) ? table : undefined;
 }
 
 function sqlStatusTables(sql: string): string[] {
@@ -96,18 +115,8 @@ function sqlStatusTables(sql: string): string[] {
   const tables: string[] = [];
   for (let i = 0; i < tokens.length; i += 1) {
     if (tokens[i] !== "update") continue;
-    let cursor = i + 1;
-    if (tokens[cursor] === "only") cursor += 1;
-    let table = tokens[cursor++];
-    while (tokens[cursor] === ".") {
-      table = tokens[cursor + 1];
-      cursor += 2;
-    }
-    if (table === undefined || TABLES[table] !== true) continue;
-    if (tokens[cursor] === "as") cursor += 2;
-    else if (tokens[cursor] !== "set") cursor += 1;
-    if (tokens[cursor++] !== "set") continue;
-    if (hasStatusAssignment(tokens, cursor)) tables.push(table);
+    const table = sqlUpdateStatusTable(tokens, i + 1);
+    if (table !== undefined) tables.push(table);
   }
   return tables;
 }
@@ -127,39 +136,39 @@ function postgresStatusTables(node: ts.Node): string[] {
   return [];
 }
 
-function memoryStatusTables(node: ts.Node, checker: ts.TypeChecker): string[] {
-  function recordTables(expression: ts.Expression): string[] {
-    const recordType = checker.getTypeAtLocation(expression);
-    function tables(type: ts.Type): string[] {
-      if (type.isUnion()) return type.types.flatMap(tables);
-      const name = type.aliasSymbol?.name ?? type.getSymbol()?.name;
-      if (name === "WorkflowStepRunRecord") return ["workflow_step_runs"];
-      if (
-        name === "TriggerRunRecord" ||
-        name === "AcceptedTriggerRunRecord" ||
-        name === "RejectedTriggerRunRecord"
-      )
-        return ["trigger_runs"];
-      const status = type.getProperty("status");
-      return (status?.declarations ?? []).flatMap((declaration) => {
-        const parent = declaration.parent;
-        if (!ts.isInterfaceDeclaration(parent)) return [];
-        if (parent.name.text === "WorkflowStepRunRecord") return ["workflow_step_runs"];
-        if (
-          parent.name.text === "AcceptedTriggerRunRecord" ||
-          parent.name.text === "RejectedTriggerRunRecord"
-        )
-          return ["trigger_runs"];
-        return [];
-      });
-    }
-    return [...new Set(tables(recordType))];
-  }
-  function statusProperties(object: ts.ObjectLiteralExpression): boolean {
-    return object.properties.some(
-      (property) => "name" in property && expressionName(property.name) === "status",
-    );
-  }
+function statusDeclarationTables(declaration: ts.Declaration): string[] {
+  const parent = declaration.parent;
+  if (!ts.isInterfaceDeclaration(parent)) return [];
+  if (parent.name.text === "WorkflowStepRunRecord") return ["workflow_step_runs"];
+  if (
+    parent.name.text === "AcceptedTriggerRunRecord" ||
+    parent.name.text === "RejectedTriggerRunRecord"
+  )
+    return ["trigger_runs"];
+  return [];
+}
+
+function namedRecordTables(name: string | undefined): string[] | undefined {
+  if (name === "WorkflowStepRunRecord") return ["workflow_step_runs"];
+  if (
+    name === "TriggerRunRecord" ||
+    name === "AcceptedTriggerRunRecord" ||
+    name === "RejectedTriggerRunRecord"
+  )
+    return ["trigger_runs"];
+  return undefined;
+}
+
+function recordTypeTables(type: ts.Type): string[] {
+  if (type.isUnion()) return type.types.flatMap(recordTypeTables);
+  const name = type.aliasSymbol?.name ?? type.getSymbol()?.name;
+  const tables = namedRecordTables(name);
+  if (tables !== undefined) return tables;
+  const status = type.getProperty("status");
+  return (status?.declarations ?? []).flatMap(statusDeclarationTables);
+}
+
+function statusAssignmentTarget(node: ts.Node): ts.Expression | undefined {
   if (
     ts.isBinaryExpression(node) &&
     node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
@@ -169,17 +178,12 @@ function memoryStatusTables(node: ts.Node, checker: ts.TypeChecker): string[] {
     const name = ts.isPropertyAccessExpression(node.left)
       ? node.left.name.text
       : expressionName(node.left.argumentExpression);
-    if (name === "status") return recordTables(node.left.expression);
+    if (name === "status") return node.left.expression;
   }
-  if (ts.isObjectLiteralExpression(node) && statusProperties(node)) {
-    return [
-      ...new Set(
-        node.properties.flatMap((property) =>
-          ts.isSpreadAssignment(property) ? recordTables(property.expression) : [],
-        ),
-      ),
-    ];
-  }
+  return undefined;
+}
+
+function objectAssignStatusTarget(node: ts.Node): ts.Expression | undefined {
   if (
     ts.isCallExpression(node) &&
     ts.isPropertyAccessExpression(node.expression) &&
@@ -191,8 +195,28 @@ function memoryStatusTables(node: ts.Node, checker: ts.TypeChecker): string[] {
       .slice(1)
       .some((argument) => ts.isObjectLiteralExpression(argument) && statusProperties(argument))
   )
-    return recordTables(node.arguments[0]);
-  return [];
+    return node.arguments[0];
+  return undefined;
+}
+
+function memoryStatusTables(node: ts.Node, checker: ts.TypeChecker): string[] {
+  function recordTables(expression: ts.Expression): string[] {
+    const recordType = checker.getTypeAtLocation(expression);
+    return [...new Set(recordTypeTables(recordType))];
+  }
+  const assignment = statusAssignmentTarget(node);
+  if (assignment !== undefined) return recordTables(assignment);
+  if (ts.isObjectLiteralExpression(node) && statusProperties(node)) {
+    return [
+      ...new Set(
+        node.properties.flatMap((property) =>
+          ts.isSpreadAssignment(property) ? recordTables(property.expression) : [],
+        ),
+      ),
+    ];
+  }
+  const target = objectAssignStatusTarget(node);
+  return target === undefined ? [] : recordTables(target);
 }
 
 function memorySourceFile(source: string): { file: ts.SourceFile; checker: ts.TypeChecker } {
@@ -217,42 +241,44 @@ function memorySourceFile(source: string): { file: ts.SourceFile; checker: ts.Ty
   return { file, checker: program.getTypeChecker() };
 }
 
-function analyzeStatusPaths(
-  source: string,
-  backend: "postgres" | "memory" = "postgres",
-): { writes: StatusWrite[]; uncovered: string[] } {
-  const memory = backend === "memory" ? memorySourceFile(source) : undefined;
-  const file =
-    memory?.file ??
-    ts.createSourceFile("pg.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+function functionVariableName(node: ts.Node): string | undefined {
+  if (
+    ts.isVariableDeclaration(node) &&
+    ts.isIdentifier(node.name) &&
+    node.initializer &&
+    (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+  )
+    return node.name.text;
+  return undefined;
+}
+
+function ownerDeclaration(node: ts.Node, className: string | undefined) {
+  if (
+    ts.isMethodDeclaration(node) &&
+    node.name &&
+    (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name))
+  ) {
+    const root = !node.modifiers?.some(
+      (modifier) =>
+        modifier.kind === ts.SyntaxKind.PrivateKeyword ||
+        modifier.kind === ts.SyntaxKind.ProtectedKeyword,
+    );
+    return { name: node.name.text, root, className };
+  }
+  if (ts.isFunctionDeclaration(node)) {
+    return { name: node.name?.text, root: false, className: undefined };
+  }
+  return { name: functionVariableName(node), root: false, className };
+}
+
+function discoverOwners(file: ts.SourceFile) {
   const owners = new Map<string, Owner>();
   const declarations = new Map<ts.Node, Owner>();
   function discover(node: ts.Node, className?: string): void {
     if (ts.isClassDeclaration(node)) className = node.name?.text ?? "<anonymous>";
-    let name: string | undefined;
-    let root = false;
-    if (
-      ts.isMethodDeclaration(node) &&
-      node.name &&
-      (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name))
-    ) {
-      name = node.name.text;
-      root = !node.modifiers?.some(
-        (modifier) =>
-          modifier.kind === ts.SyntaxKind.PrivateKeyword ||
-          modifier.kind === ts.SyntaxKind.ProtectedKeyword,
-      );
-    } else if (ts.isFunctionDeclaration(node)) {
-      name = node.name?.text;
-      className = undefined;
-    } else if (
-      ts.isVariableDeclaration(node) &&
-      ts.isIdentifier(node.name) &&
-      node.initializer &&
-      (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
-    ) {
-      name = node.name.text;
-    }
+    const declaration = ownerDeclaration(node, className);
+    const { name, root } = declaration;
+    className = declaration.className;
     if (name !== undefined) {
       const id = className === undefined ? name : `${className}.${name}`;
       const owner: Owner = {
@@ -268,20 +294,34 @@ function analyzeStatusPaths(
     ts.forEachChild(node, (child) => discover(child, className));
   }
   discover(file);
+  return { owners, declarations };
+}
+
+function recordOwnerCall(owner: Owner, node: ts.CallExpression): void {
+  if (ts.isIdentifier(node.expression)) owner.calls.add(node.expression.text);
+  if (
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.expression.kind === ts.SyntaxKind.ThisKeyword
+  ) {
+    owner.calls.add(`${owner.className}.${node.expression.name.text}`);
+  }
+}
+
+function analyzeStatusPaths(
+  source: string,
+  backend: "postgres" | "memory" = "postgres",
+): { writes: StatusWrite[]; uncovered: string[] } {
+  const memory = backend === "memory" ? memorySourceFile(source) : undefined;
+  const file =
+    memory?.file ??
+    ts.createSourceFile("pg.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const { owners, declarations } = discoverOwners(file);
   const writes: StatusWrite[] = [];
   function inspect(node: ts.Node, parentOwner?: Owner): void {
     const owner = declarations.get(node) ?? parentOwner;
     const tables = memory ? memoryStatusTables(node, memory.checker) : postgresStatusTables(node);
     for (const table of tables) writes.push({ owner: owner?.id ?? "<unowned>", table, roots: [] });
-    if (owner && ts.isCallExpression(node)) {
-      if (ts.isIdentifier(node.expression)) owner.calls.add(node.expression.text);
-      if (
-        ts.isPropertyAccessExpression(node.expression) &&
-        node.expression.expression.kind === ts.SyntaxKind.ThisKeyword
-      ) {
-        owner.calls.add(`${owner.className}.${node.expression.name.text}`);
-      }
-    }
+    if (owner && ts.isCallExpression(node)) recordOwnerCall(owner, node);
     ts.forEachChild(node, (child) => inspect(child, owner));
   }
   inspect(file);
@@ -310,7 +350,13 @@ describe("workflow status persistence observation", () => {
   it("covers every PostgreSQL status statement and every public root reaching its helpers", async () => {
     const source = await readFile(new URL("../db/pg.ts", import.meta.url), "utf8");
     const { writes, uncovered } = analyzeStatusPaths(source);
-    assert.ok(writes.some((write) => write.owner.endsWith(".createWorkflowStepExecution")));
+    assert.ok(
+      writes.some(
+        (write) =>
+          write.owner === "markWorkflowStepExecutionStarted" &&
+          write.roots.includes("createWorkflowStepExecution"),
+      ),
+    );
     for (const helper of [
       "timeoutWorkflowRunOnClient",
       "timeoutWorkflowStepOnClient",

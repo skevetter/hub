@@ -5,8 +5,14 @@ import {
   organizationTriggerRoutesForSave,
 } from "./linear-trigger-routes.js";
 import { isCanceledExecution, type StopCleanupState } from "../triggers/run-stop.js";
+import type { ScheduleStore } from "../triggers/schedule/index.js";
+import type { GitHubNotificationStore } from "../triggers/github-notifications/index.js";
+import type {
+  ExecutionAuthorityRecord,
+  ExecutionCredentialLease,
+  ExecutionAuthorityStore,
+} from "../execution-authority/index.js";
 import type { RunReplyRecord, RunReplyScope } from "../run-replies/store.js";
-import type { AcceptCommandInput, AcceptCommandResult } from "../interactive-sessions/store.js";
 import { capabilities } from "../interactive-sessions/access.js";
 import {
   advanceForCommand,
@@ -45,11 +51,16 @@ import {
   stateEvent,
   unsettledStatuses,
   validMessage,
-} from "../interactive-sessions/store.js";
-import type {
-  RetireLinearPilotSessionInput,
-  SessionEventDraft,
-  StartSessionInput,
+  type ClaimCommandInput,
+  type RetireLinearPilotSessionInput,
+  type SaveSessionProfileInput,
+  type SaveSessionProfileResult,
+  type SetParticipantInput,
+  type StartSessionResult,
+  type AcceptCommandInput,
+  type AcceptCommandResult,
+  type SessionEventDraft,
+  type StartSessionInput,
 } from "../interactive-sessions/store.js";
 import type {
   SessionAuditRecord,
@@ -76,12 +87,13 @@ import {
   STOP_INTERRUPT_LEASE_MS,
   STOP_INTERRUPT_MAX_AGE_MS,
   stopInterruptMayHaveSent,
+  type StopInterruptCoverage,
   type StopInterruptState,
   type StopInterruptStore,
 } from "./stop-interrupt.js";
-import type { GitHubSyncAuditLink } from "./schema.js";
+import type { GitHubSyncAuditLink, AgentExecutionStatus, MachineStatus } from "./schema.js";
 import { temporaryCredentialFact } from "../agent-sessions/credentials.js";
-import { sessionLock } from "../agent-sessions/index.js";
+import { sessionLock, type AgentSessionAction } from "../agent-sessions/index.js";
 import type { AgentSessionRecord } from "../agent-sessions/types.js";
 import { coversExpectedFanout, expectedFanout } from "../run-payload-retention/fanout.js";
 import {
@@ -100,7 +112,6 @@ import {
 } from "../run-payload-retention/store.js";
 import { readScriptStepHandle } from "../workflows/script-output.js";
 import { randomUUID } from "node:crypto";
-import type { AgentExecutionStatus, MachineStatus } from "./schema.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
@@ -110,7 +121,7 @@ import {
   preRoutingDropEvidence,
   requireManualReceiptReplayBinding,
 } from "./receipt-replay.js";
-import { launchedAgent } from "./mappers.js";
+import { launchedAgent, toProviderEventReceiptRecordSummary } from "./mappers.js";
 import type {
   AgentExecutionRecord,
   AgentExecutionOutputAttempt,
@@ -182,6 +193,7 @@ import type {
   DroppedEventPageRequest,
   DroppedEventPresence,
   ProjectTriggerRoute,
+  MigrateProjectTriggerInput,
   MigrateProjectTriggersInput,
   OrganizationTriggerRecord,
   OrganizationTriggerRevisionRecord,
@@ -223,6 +235,7 @@ import type {
   TriggerListKey,
   TriggerListPage,
   TriggerListRequest,
+  PendingHubActionScope,
 } from "./types.js";
 import {
   clearOverrideKey,
@@ -244,7 +257,6 @@ import {
 } from "./unsupported-linear.js";
 import { activityTimestampMicros, compareRunsNewestFirst } from "./activity-key.js";
 import { hasTriggerEvent, triggerProviderEvent } from "./trigger-list.js";
-import { toProviderEventReceiptRecordSummary } from "./mappers.js";
 import {
   displayedDropReason,
   GITHUB_LIFECYCLE_RECEIPT,
@@ -283,8 +295,8 @@ type UnsupportedLinearReceiptKey = Pick<
 >;
 
 export interface MemoryDatabaseOptions {
-  schedules?: import("../triggers/schedule/index.js").ScheduleStore;
-  githubNotifications?: import("../triggers/github-notifications/index.js").GitHubNotificationStore;
+  schedules?: ScheduleStore;
+  githubNotifications?: GitHubNotificationStore;
   onInsertAgentExecution?: (execution: AgentExecutionRecord) => void;
   organizationIds?: readonly string[];
   memberships?: readonly {
@@ -301,6 +313,28 @@ export interface MemoryDatabaseOptions {
   unsupportedLinearReceiptsPerHour?: number;
   githubConnections?: readonly GitHubConnectionRecord[];
   githubSyncOwner?: GitHubInstallationSyncOwner;
+}
+
+interface MemoryTriggerMigrationPlan {
+  candidate: MigrateProjectTriggerInput;
+  configuration: ReturnType<typeof parseCompiledHubConfig>;
+  routes: OrganizationTriggerRoute[];
+}
+
+function runtimeTriggerRoutes(
+  routes: readonly OrganizationTriggerRoute[],
+  configuration: ReturnType<typeof parseCompiledHubConfig>,
+  fallbackName: string,
+) {
+  return routes.map((route) => ({
+    provider: route.provider,
+    connectionId: route.connectionId,
+    resourceId: route.resourceId,
+    triggerName:
+      configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
+      configuration.triggers[0]?.name ??
+      fallbackName,
+  }));
 }
 
 function compareTriggerListKeys(left: TriggerListKey, right: TriggerListKey): number {
@@ -336,6 +370,102 @@ function transitionWithTerminalRun(
 function laterCooldown(previous: Date | null, next: Date | null): Date | null {
   if (next === null || (previous !== null && previous >= next)) return previous;
   return new Date(next);
+}
+
+function progressBlocksTimelineExpiry(progress: RunProgressMessage): boolean {
+  return (
+    isProgressUnsettled(progress) ||
+    (progress.credentialRetryAt?.getTime() ?? 0) > Date.now() ||
+    (progress.credentialRejectedUntil?.getTime() ?? 0) > Date.now()
+  );
+}
+
+function progressCompensationIsDue(message: RunProgressMessage, now: Date): boolean {
+  return (
+    (message.state === "active" || message.state === "finished") &&
+    (message.retryAt === null || message.retryAt <= now) &&
+    message.compensationRequestedGen > message.compensationDoneGen &&
+    (message.compensationNotBefore === null || message.compensationNotBefore <= now)
+  );
+}
+
+function nextCompensationNotBefore(
+  message: RunProgressMessage,
+  pending: boolean,
+  notBefore: Date | undefined,
+): Date | null {
+  return notBefore === undefined || (pending && message.compensationNotBefore === null)
+    ? null
+    : new Date(
+        pending && message.compensationNotBefore !== null
+          ? Math.min(message.compensationNotBefore.getTime(), notBefore.getTime())
+          : notBefore,
+      );
+}
+
+function replaySessionCommand(
+  session: SessionRecord,
+  command: SessionCommandRecord,
+  hash: string,
+  input: AcceptCommandInput,
+): AcceptCommandResult {
+  return command.requestHash === hash
+    ? {
+        status: "replayed",
+        ...structuredClone({ session, command: replayCommand(command, input.bodyCutoff) }),
+      }
+    : refused("idempotency_conflict");
+}
+
+function commandLeaseActive(command: SessionCommandRecord, leaseNow: Date) {
+  return (
+    command.status === "dispatching" &&
+    command.claimExpiresAt !== null &&
+    command.claimExpiresAt > leaseNow
+  );
+}
+
+function updateSessionParticipant(
+  row: SessionWithParticipants,
+  input: SetParticipantInput,
+  current: SessionWithParticipants["participants"][number] | undefined,
+  { organizationId, userId }: { organizationId: string; userId: string },
+) {
+  if (input.role === null) {
+    row.participants = row.participants.filter((person) => person.userId !== input.userId);
+  } else if (current) {
+    current.role = input.role;
+    current.addedByUserId = userId;
+  } else {
+    row.participants.push({
+      userId: input.userId,
+      role: input.role,
+      organizationId,
+      sessionId: input.sessionId,
+      addedByUserId: userId,
+      createdAt: new Date(input.now),
+    });
+    row.participants.sort((a, b) => a.userId.localeCompare(b.userId));
+  }
+}
+
+function commandStateEvent(session: SessionRecord) {
+  return stateEvent(
+    session,
+    session.state === "running" ? "stop_unconfirmed" : session.stateReason,
+  );
+}
+
+function replyRunEndedWithoutSuccess(run: TriggerRunRecord | undefined) {
+  return run?.status === "failed" || run?.status === "timed_out" || run?.status === "canceled";
+}
+
+function expiredLaunchRun(run: TriggerRunRecord | undefined, execution: AgentExecutionRecord) {
+  return (
+    run?.organizationId === execution.organizationId &&
+    run.projectId === execution.projectId &&
+    run.payloadExpiryState === "expired"
+  );
 }
 
 const interactiveSessionLock = "isession-memory";
@@ -404,9 +534,7 @@ class MemoryDatabase implements Database {
         if (row.state !== "pending" && row.state !== "sending") return [];
         const run = this.triggerRuns.get(row.runId);
         const at = row.attemptedAt ?? run?.completedAt;
-        const endedWithoutSuccess =
-          row.state === "pending" &&
-          (run?.status === "failed" || run?.status === "timed_out" || run?.status === "canceled");
+        const endedWithoutSuccess = row.state === "pending" && replyRunEndedWithoutSuccess(run);
         return at != null && (at <= cutoff || endedWithoutSuccess) ? [{ at, row }] : [];
       });
       return structuredClone(
@@ -453,7 +581,10 @@ class MemoryDatabase implements Database {
   private readonly sessionProfiles = new Map<string, StoredSessionProfile>();
   private readonly interactiveSessions = new Map<string, SessionWithParticipants>();
   private readonly interactiveSessionsByOrganization = new Map<string, SessionWithParticipants[]>();
-  private readonly interactiveCommands = new Map<string, SessionCommandRecord[]>();
+  private readonly interactiveCommands = new Map<
+    string,
+    [SessionCommandRecord, ...SessionCommandRecord[]]
+  >();
   private readonly interactiveEvents = new Map<string, SessionEventRecord[]>();
   private readonly interactiveAudit = new Map<string, SessionAuditRecord[]>();
 
@@ -497,23 +628,31 @@ class MemoryDatabase implements Database {
       if (role !== "owner" && this.sessionDaemonEnroller(organizationId, daemon) !== userId) {
         return "forbidden";
       }
-      const current =
-        input.id === null ? undefined : this.sessionProfiles.get(input.id.toLowerCase());
-      if (!profileVersionMatches(input, current)) return "version_conflict";
-      if (current && role !== "owner" && current.createdByUserId !== userId) return "forbidden";
-      if (
-        [...this.sessionProfiles.values()].some(
-          (profile) =>
-            profile.organizationId === organizationId &&
-            profile.name === input.name &&
-            profile.id !== current?.id,
-        )
-      )
-        return "name_taken";
-      const record = profileRecord(input, settings, current);
-      this.sessionProfiles.set(record.id, structuredClone(record));
-      return structuredClone(record);
+      return this.storeSessionProfile(input, settings, { organizationId, userId, role });
     });
+
+  private storeSessionProfile(
+    input: SaveSessionProfileInput,
+    settings: ReturnType<typeof profileSettings>,
+    { organizationId, userId, role }: StartSessionInput["principal"],
+  ): SaveSessionProfileResult {
+    const current =
+      input.id === null ? undefined : this.sessionProfiles.get(input.id.toLowerCase());
+    if (!profileVersionMatches(input, current)) return "version_conflict";
+    if (current && role !== "owner" && current.createdByUserId !== userId) return "forbidden";
+    if (
+      [...this.sessionProfiles.values()].some(
+        (profile) =>
+          profile.organizationId === organizationId &&
+          profile.name === input.name &&
+          profile.id !== current?.id,
+      )
+    )
+      return "name_taken";
+    const record = profileRecord(input, settings, current);
+    this.sessionProfiles.set(record.id, structuredClone(record));
+    return structuredClone(record);
+  }
 
   startInteractiveSession: Database["startInteractiveSession"] = (input) =>
     this.withAdvisoryLock(interactiveSessionLock, async () => {
@@ -537,70 +676,105 @@ class MemoryDatabase implements Database {
           session.startedByUserId === userId &&
           session.startIdempotencyKey === input.idempotencyKey.toLowerCase(),
       );
-      if (prior) {
-        if (!this.sessionRights(prior, userId)?.view) return refused("forbidden");
-        return prior.session.startRequestHash === hash
-          ? {
-              status: "replayed",
-              ...structuredClone({
-                session: prior.session,
-                command: replayCommand(
-                  this.interactiveCommands.get(prior.session.id)![0]!,
-                  input.bodyCutoff,
-                ),
-              }),
-            }
-          : refused("idempotency_conflict");
-      }
-      if (!validMessage(input.message)) return refused("message_too_long");
-      const profile = this.sessionProfiles.get(input.profileId.toLowerCase());
-      if (profile?.organizationId !== organizationId || profile.status !== "active")
-        return refused("profile_unavailable");
-      if (profile.version !== input.profileVersion) return refused("profile_changed");
-      if (requester && profile.createdByUserId !== userId) return refused("forbidden");
+      if (prior) return this.replaySessionStart(prior, userId, hash, input);
+      const profile = this.profileForSessionStart(input, { organizationId, userId, requester });
+      if (typeof profile === "string") return refused(profile);
       const capacity = await this.startCapacity(profile, input);
       if (capacity) return refused(capacity);
       if (!people.every((person) => this.sessionMemberRole(organizationId, person.userId)))
         return refused("invalid_participant");
       if (!(await this.consumeOrganizationUsage(sessionUsage(input.principal, input.usage))))
         return refused("usage_limit");
-      const session = newSession(input, profile, hash);
-      const command = newCommand(session, input, "message", "steer", input.message, hash);
-      const row: SessionWithParticipants = {
-        session,
-        participants: people.map(({ userId: participantId, role }) => ({
-          userId: participantId,
-          role,
-          organizationId,
-          sessionId: session.id,
-          addedByUserId: userId,
-          createdAt: input.now,
-        })),
-      };
-      this.interactiveSessions.set(session.id, row);
-      const organizationSessions = this.interactiveSessionsByOrganization.get(organizationId);
-      if (organizationSessions === undefined) {
-        this.interactiveSessionsByOrganization.set(organizationId, [row]);
-      } else {
-        organizationSessions.push(row);
-      }
-      this.interactiveCommands.set(session.id, [structuredClone(command)]);
-      this.interactiveEvents.set(session.id, []);
-      this.appendSessionEvents(row, session, input.now, [
-        stateEvent(session),
-        messageEvent(command),
-      ]);
-      this.saveSessionAudit(
-        sessionAudit(
-          session,
-          userId,
-          "started",
-          { profileId: profile.id, commandId: command.id },
-          input.now,
-        ),
-      );
-      return { status: "created", ...structuredClone({ session: row.session, command }) };
+      return this.createSessionStart(input, profile, { organizationId, userId, people, hash });
     });
+
+  private replaySessionStart(
+    prior: SessionWithParticipants,
+    userId: string,
+    hash: string,
+    input: StartSessionInput,
+  ): StartSessionResult {
+    if (!this.sessionRights(prior, userId)?.view) return refused("forbidden");
+    return prior.session.startRequestHash === hash
+      ? {
+          status: "replayed",
+          ...structuredClone({
+            session: prior.session,
+            command: replayCommand(
+              this.interactiveCommands.get(prior.session.id)![0],
+              input.bodyCutoff,
+            ),
+          }),
+        }
+      : refused("idempotency_conflict");
+  }
+
+  private profileForSessionStart(
+    input: StartSessionInput,
+    {
+      organizationId,
+      userId,
+      requester,
+    }: { organizationId: string; userId: string; requester: StartSessionInput["nativeRequester"] },
+  ) {
+    if (!validMessage(input.message)) return "message_too_long";
+    const profile = this.sessionProfiles.get(input.profileId.toLowerCase());
+    if (profile?.organizationId !== organizationId || profile.status !== "active")
+      return "profile_unavailable";
+    if (profile.version !== input.profileVersion) return "profile_changed";
+    if (requester && profile.createdByUserId !== userId) return "forbidden";
+    return profile;
+  }
+
+  private createSessionStart(
+    input: StartSessionInput,
+    profile: StoredSessionProfile,
+    {
+      organizationId,
+      userId,
+      people,
+      hash,
+    }: {
+      organizationId: string;
+      userId: string;
+      people: ReturnType<typeof startParticipants>;
+      hash: string;
+    },
+  ): StartSessionResult {
+    const session = newSession(input, profile, hash);
+    const command = newCommand(session, input, "message", "steer", input.message, hash);
+    const row: SessionWithParticipants = {
+      session,
+      participants: people.map(({ userId: participantId, role }) => ({
+        userId: participantId,
+        role,
+        organizationId,
+        sessionId: session.id,
+        addedByUserId: userId,
+        createdAt: input.now,
+      })),
+    };
+    this.interactiveSessions.set(session.id, row);
+    const organizationSessions = this.interactiveSessionsByOrganization.get(organizationId);
+    if (organizationSessions === undefined) {
+      this.interactiveSessionsByOrganization.set(organizationId, [row]);
+    } else {
+      organizationSessions.push(row);
+    }
+    this.interactiveCommands.set(session.id, [structuredClone(command)]);
+    this.interactiveEvents.set(session.id, []);
+    this.appendSessionEvents(row, session, input.now, [stateEvent(session), messageEvent(command)]);
+    this.saveSessionAudit(
+      sessionAudit(
+        session,
+        userId,
+        "started",
+        { profileId: profile.id, commandId: command.id },
+        input.now,
+      ),
+    );
+    return { status: "created", ...structuredClone({ session: row.session, command }) };
+  }
 
   acceptInteractiveSessionCommand: Database["acceptInteractiveSessionCommand"] = (input) =>
     this.withAdvisoryLock(interactiveSessionLock, async () => {
@@ -608,10 +782,8 @@ class MemoryDatabase implements Database {
       const row = this.scopedInteractiveSession(organizationId, input.sessionId);
       if (!row) return refused("not_found");
       const { session } = row;
-      const rights = this.sessionRights(row, userId);
-      const allowed = rights?.[commandCapability[input.kind]];
-      if (!rights?.view && !allowed) return refused("not_found");
-      if (!allowed) return refused("forbidden");
+      const accessRefusal = this.sessionCommandAccessRefusal(row, userId, input);
+      if (accessRefusal) return refused(accessRefusal);
       const commands = this.interactiveCommands.get(session.id)!;
       if (input.kind === "retry") return this.rearmSessionMessage(row, input);
       const hash = commandHash(input);
@@ -620,52 +792,81 @@ class MemoryDatabase implements Database {
           command.authorUserId === userId &&
           command.idempotencyKey === input.idempotencyKey.toLowerCase(),
       );
-      if (prior) {
-        return prior.requestHash === hash
-          ? {
-              status: "replayed",
-              ...structuredClone({ session, command: replayCommand(prior, input.bodyCutoff) }),
-            }
-          : refused("idempotency_conflict");
-      }
-      if (input.kind !== "close" && !this.activeSessionDaemon(session))
-        return refused("daemon_unavailable");
-      const refusal = commandRefusal(session, input);
+      if (prior) return replaySessionCommand(session, prior, hash, input);
+      const refusal = this.sessionCommandRefusal(session, input);
       if (refusal) return refused(refusal);
       if (input.kind === "message") {
-        const cutoff = sendRateCutoff(input.now);
-        const recent = commands.filter(
-          (entry) =>
-            entry.kind === "message" && entry.authorUserId === userId && entry.createdAt > cutoff,
-        );
-        if (recent.length >= input.maxMessagesPerMinute) return refused("rate_limited");
-        if (this.queuedMessageCount(session) >= input.maxQueued) return refused("queue_full");
+        const limits = this.sessionMessageLimit(session, commands, userId, input);
+        if (limits) return refused(limits);
         if (!(await this.consumeOrganizationUsage(sessionUsage(input.principal, input.usage))))
           return refused("usage_limit");
       }
-      const next = advanceForCommand(session, input);
-      const command = newCommand(
-        next,
-        input,
-        input.kind,
-        input.kind === "message" ? input.delivery : null,
-        input.kind === "message" ? input.message : null,
-        hash,
-      );
-      const drafts =
-        input.kind === "message"
-          ? [messageEvent(command)]
-          : [
-              stateEvent(next),
-              ...this.supersedeInteractiveCommands(session, input.kind, input.now),
-            ];
-      commands.push(structuredClone(command));
-      this.appendSessionEvents(row, next, input.now, drafts);
-      this.saveSessionAudit(
-        sessionAudit(session, userId, input.kind, { commandId: command.id }, input.now),
-      );
-      return { status: "accepted", ...structuredClone({ session: row.session, command }) };
+      return this.recordSessionCommand(row, input, { session, commands, userId, hash });
     });
+
+  private sessionCommandAccessRefusal(
+    row: SessionWithParticipants,
+    userId: string,
+    input: AcceptCommandInput,
+  ) {
+    const rights = this.sessionRights(row, userId);
+    const allowed = rights?.[commandCapability[input.kind]];
+    if (!rights?.view && !allowed) return "not_found";
+    if (!allowed) return "forbidden";
+    return undefined;
+  }
+
+  private sessionCommandRefusal(session: SessionRecord, input: AcceptCommandInput) {
+    if (input.kind !== "close" && !this.activeSessionDaemon(session)) return "daemon_unavailable";
+    return commandRefusal(session, input);
+  }
+
+  private sessionMessageLimit(
+    session: SessionRecord,
+    commands: SessionCommandRecord[],
+    userId: string,
+    input: Extract<AcceptCommandInput, { kind: "message" }>,
+  ) {
+    const cutoff = sendRateCutoff(input.now);
+    const recent = commands.filter(
+      (entry) =>
+        entry.kind === "message" && entry.authorUserId === userId && entry.createdAt > cutoff,
+    );
+    if (recent.length >= input.maxMessagesPerMinute) return "rate_limited";
+    if (this.queuedMessageCount(session) >= input.maxQueued) return "queue_full";
+    return undefined;
+  }
+
+  private recordSessionCommand(
+    row: SessionWithParticipants,
+    input: Exclude<AcceptCommandInput, { kind: "retry" }>,
+    {
+      session,
+      commands,
+      userId,
+      hash,
+    }: { session: SessionRecord; commands: SessionCommandRecord[]; userId: string; hash: string },
+  ): AcceptCommandResult {
+    const next = advanceForCommand(session, input);
+    const command = newCommand(
+      next,
+      input,
+      input.kind,
+      input.kind === "message" ? input.delivery : null,
+      input.kind === "message" ? input.message : null,
+      hash,
+    );
+    const drafts =
+      input.kind === "message"
+        ? [messageEvent(command)]
+        : [stateEvent(next), ...this.supersedeInteractiveCommands(session, input.kind, input.now)];
+    commands.push(structuredClone(command));
+    this.appendSessionEvents(row, next, input.now, drafts);
+    this.saveSessionAudit(
+      sessionAudit(session, userId, input.kind, { commandId: command.id }, input.now),
+    );
+    return { status: "accepted", ...structuredClone({ session: row.session, command }) };
+  }
 
   listInteractiveSessions: Database["listInteractiveSessions"] = async (
     organizationId,
@@ -769,43 +970,48 @@ class MemoryDatabase implements Database {
             (input.lane !== "control" || command.kind !== "message") &&
             (session.state !== "closed" || command.kind === "close"),
         );
-      if (
-        candidates.some(
-          (command) =>
-            command.status === "dispatching" &&
-            command.claimExpiresAt !== null &&
-            command.claimExpiresAt > leaseNow,
-        )
-      )
-        return undefined;
-      let nextSession = session;
-      let claimed: SessionCommandRecord | undefined;
-      for (const command of candidates) {
-        if (!commandLeaseEligible(command, input, session.state, leaseNow)) continue;
-        const rights = this.sessionRights(row, command.authorUserId);
-        const patch = claimPatch(command, input, rights, leaseNow);
-        Object.assign(command, structuredClone(patch));
-        drafts.push(deliveryEvent(command));
-        if (command.status === "dispatching") {
-          claimed = command;
-          break;
-        }
-        nextSession = exhaustedControlState(session, command, input.now);
-        if (nextSession !== session) {
-          drafts.push(
-            stateEvent(
-              nextSession,
-              nextSession.state === "running" ? "stop_unconfirmed" : nextSession.stateReason,
-            ),
-          );
-          if (nextSession.state === "closed")
-            drafts.push(...this.supersedeInteractiveCommands(nextSession, "close", input.now));
-          break;
-        }
-      }
+      if (candidates.some((command) => commandLeaseActive(command, leaseNow))) return undefined;
+      const { nextSession, claimed } = this.claimSessionCandidate(row, input, {
+        session,
+        leaseNow,
+        drafts,
+        candidates,
+      });
       if (drafts.length > 0) this.appendSessionEvents(row, nextSession, input.now, drafts);
       return structuredClone(claimed);
     });
+
+  private claimSessionCandidate(
+    row: SessionWithParticipants,
+    input: ClaimCommandInput,
+    {
+      session,
+      leaseNow,
+      drafts,
+      candidates,
+    }: {
+      session: SessionRecord;
+      leaseNow: Date;
+      drafts: SessionEventDraft[];
+      candidates: SessionCommandRecord[];
+    },
+  ) {
+    for (const command of candidates) {
+      if (!commandLeaseEligible(command, input, session.state, leaseNow)) continue;
+      const rights = this.sessionRights(row, command.authorUserId);
+      const patch = claimPatch(command, input, rights, leaseNow);
+      Object.assign(command, structuredClone(patch));
+      drafts.push(deliveryEvent(command));
+      if (command.status === "dispatching") return { nextSession: session, claimed: command };
+      const nextSession = exhaustedControlState(session, command, input.now);
+      if (nextSession === session) continue;
+      drafts.push(commandStateEvent(nextSession));
+      if (nextSession.state === "closed")
+        drafts.push(...this.supersedeInteractiveCommands(nextSession, "close", input.now));
+      return { nextSession, claimed: undefined };
+    }
+    return { nextSession: session, claimed: undefined };
+  }
 
   settleInteractiveSessionCommand: Database["settleInteractiveSessionCommand"] = (input) =>
     this.withAdvisoryLock(interactiveSessionLock, async () => {
@@ -912,40 +1118,13 @@ class MemoryDatabase implements Database {
       const { organizationId, userId } = input.principal;
       const row = this.scopedInteractiveSession(organizationId, input.sessionId);
       if (!row) return "not_found";
-      const rights = this.sessionRights(row, userId);
-      if (!rights?.view) return "not_found";
-      if (!rights.manageParticipants) return "forbidden";
-      if (input.role !== null && !this.sessionMemberRole(organizationId, input.userId))
-        return "not_member";
+      const refusal = this.sessionParticipantRefusal(row, input, { organizationId, userId });
+      if (refusal) return refusal;
       const current = row.participants.find((person) => person.userId === input.userId);
       if ((current?.role ?? null) === input.role) return input.role === null ? "removed" : "set";
-      if (
-        current?.role === "controller" &&
-        input.role !== "controller" &&
-        !row.participants.some(
-          (person) =>
-            person.userId !== input.userId &&
-            person.role === "controller" &&
-            this.sessionMemberRole(organizationId, person.userId),
-        )
-      )
+      if (this.removesLastSessionController(row, input, current, organizationId))
         return "last_controller";
-      if (input.role === null) {
-        row.participants = row.participants.filter((person) => person.userId !== input.userId);
-      } else if (current) {
-        current.role = input.role;
-        current.addedByUserId = userId;
-      } else {
-        row.participants.push({
-          userId: input.userId,
-          role: input.role,
-          organizationId,
-          sessionId: input.sessionId,
-          addedByUserId: userId,
-          createdAt: new Date(input.now),
-        });
-        row.participants.sort((a, b) => a.userId.localeCompare(b.userId));
-      }
+      updateSessionParticipant(row, input, current, { organizationId, userId });
       const data = { userId: input.userId, role: input.role };
       this.appendSessionEvents(row, row.session, input.now, [
         { kind: "participants", commandId: null, data },
@@ -955,6 +1134,37 @@ class MemoryDatabase implements Database {
       );
       return input.role === null ? "removed" : "set";
     });
+
+  private sessionParticipantRefusal(
+    row: SessionWithParticipants,
+    input: SetParticipantInput,
+    { organizationId, userId }: { organizationId: string; userId: string },
+  ) {
+    const rights = this.sessionRights(row, userId);
+    if (!rights?.view) return "not_found";
+    if (!rights.manageParticipants) return "forbidden";
+    if (input.role !== null && !this.sessionMemberRole(organizationId, input.userId))
+      return "not_member";
+    return undefined;
+  }
+
+  private removesLastSessionController(
+    row: SessionWithParticipants,
+    input: SetParticipantInput,
+    current: SessionWithParticipants["participants"][number] | undefined,
+    organizationId: string,
+  ) {
+    return (
+      current?.role === "controller" &&
+      input.role !== "controller" &&
+      !row.participants.some(
+        (person) =>
+          person.userId !== input.userId &&
+          person.role === "controller" &&
+          this.sessionMemberRole(organizationId, person.userId),
+      )
+    );
+  }
 
   listRecoverableInteractiveSessions: Database["listRecoverableInteractiveSessions"] = async (
     organizationId,
@@ -1062,14 +1272,7 @@ class MemoryDatabase implements Database {
     const userId = input.principal.userId;
     const retryKey = input.idempotencyKey.toLowerCase();
     const requestHash = commandHash(input);
-    const prior = this.interactiveAudit
-      .get(session.id)
-      ?.find(
-        (event) =>
-          event.action === "interactive_session.retry" &&
-          event.actorIdentity === userId &&
-          event.evidence["retryKey"] === retryKey,
-      );
+    const prior = this.priorSessionRetry(session.id, userId, retryKey);
     if (prior && prior.evidence["requestHash"] !== requestHash)
       return refused("idempotency_conflict");
     if (!prior) {
@@ -1107,8 +1310,19 @@ class MemoryDatabase implements Database {
     return { status: "accepted", ...structuredClone({ session: row.session, command }) };
   }
 
+  private priorSessionRetry(sessionId: string, userId: string, retryKey: string) {
+    return this.interactiveAudit
+      .get(sessionId)
+      ?.find(
+        (event) =>
+          event.action === "interactive_session.retry" &&
+          event.actorIdentity === userId &&
+          event.evidence["retryKey"] === retryKey,
+      );
+  }
+
   private queuedMessageCount(session: SessionRecord): number {
-    const commands = this.interactiveCommands.get(session.id)!;
+    const commands = this.interactiveCommands.get(session.id) ?? [];
     const queued = commands.filter(
       (command) =>
         command.generation === session.generation &&
@@ -1286,6 +1500,20 @@ class MemoryDatabase implements Database {
     execution: AgentExecutionRecord,
     cutoff: Date,
   ): AuxiliaryPayloadCandidate & { runId: string | null } {
+    const ids = this.launchIntentRunIds(execution);
+    const [runId = null] = ids;
+    const run = runId === null ? undefined : this.triggerRuns.get(runId);
+    const ageFrom = execution.completedAt ?? execution.startedAt;
+    let disposition: AuxiliaryPayloadCandidate["disposition"] = "eligible";
+    if (execution.hubActionAcknowledgements.finishExecutionCall?.status === "running")
+      disposition = "pending_hub_action";
+    else if (execution.usedTemporaryCredentials == null) disposition = "flag_unknown";
+    else if (this.launchIntentHasLiveOwner(execution, ids, runId, run)) disposition = "live_owner";
+    else if (ageFrom >= cutoff) disposition = "not_old_enough";
+    return { id: execution.id, ageFrom, disposition, runId };
+  }
+
+  private launchIntentRunIds(execution: AgentExecutionRecord) {
     const declared = execution.launchIntent?.triggerRunId ?? null;
     const ids = new Set(
       [...this.workflowStepRuns.values()]
@@ -1296,25 +1524,21 @@ class MemoryDatabase implements Database {
         .map((step) => step.triggerRunId),
     );
     if (declared !== null) ids.add(declared);
-    const [runId = null] = ids;
-    const run = runId === null ? undefined : this.triggerRuns.get(runId);
-    const ageFrom = execution.completedAt ?? execution.startedAt;
-    let disposition: AuxiliaryPayloadCandidate["disposition"] = "eligible";
-    if (execution.hubActionAcknowledgements.finishExecutionCall?.status === "running")
-      disposition = "pending_hub_action";
-    else if (execution.usedTemporaryCredentials == null) disposition = "flag_unknown";
-    else if (
+    return ids;
+  }
+
+  private launchIntentHasLiveOwner(
+    execution: AgentExecutionRecord,
+    ids: Set<string>,
+    runId: string | null,
+    run: TriggerRunRecord | undefined,
+  ) {
+    return (
       this.hasUnsettledExecution(execution) ||
       ids.size > 1 ||
       (execution.workflowStepRunId !== null && runId === null) ||
-      (runId !== null &&
-        (run?.organizationId !== execution.organizationId ||
-          run.projectId !== execution.projectId ||
-          run.payloadExpiryState !== "expired"))
-    )
-      disposition = "live_owner";
-    else if (ageFrom >= cutoff) disposition = "not_old_enough";
-    return { id: execution.id, ageFrom, disposition, runId };
+      (runId !== null && !expiredLaunchRun(run, execution))
+    );
   }
 
   private sessionOptionsCandidate(
@@ -1331,24 +1555,33 @@ class MemoryDatabase implements Database {
       }, null) ??
       this.agentSessionCreatedAt.get(session.id) ??
       null;
-    let disposition: AuxiliaryPayloadCandidate["disposition"] = "eligible";
-    if (!session.agentId || !session.workspaceId) disposition = "unbound_session";
-    else if (executions.length === 0) disposition = "unused_session";
-    else if (!executions.some((execution) => execution.agentSessionAction !== null))
-      disposition = "incomplete_bootstrap";
-    else if (
+    const disposition =
+      !session.agentId || !session.workspaceId
+        ? "unbound_session"
+        : this.boundSessionOptionsDisposition(executions, ageFrom, cutoff);
+    return { id: session.id, ageFrom, disposition };
+  }
+
+  private boundSessionOptionsDisposition(
+    executions: AgentExecutionRecord[],
+    ageFrom: Date | null,
+    cutoff: Date,
+  ): AuxiliaryPayloadCandidate["disposition"] {
+    if (executions.length === 0) return "unused_session";
+    if (!executions.some((execution) => execution.agentSessionAction !== null))
+      return "incomplete_bootstrap";
+    if (
       executions.some(
         (execution) =>
           execution.hubActionAcknowledgements.finishExecutionCall?.status === "running",
       )
     )
-      disposition = "pending_hub_action";
-    else if (executions.some((execution) => this.hasUnsettledExecution(execution)))
-      disposition = "live_owner";
-    else if (executions.some((execution) => execution.usedTemporaryCredentials == null))
-      disposition = "flag_unknown";
-    else if (ageFrom !== null && ageFrom >= cutoff) disposition = "not_old_enough";
-    return { id: session.id, ageFrom, disposition };
+      return "pending_hub_action";
+    if (executions.some((execution) => this.hasUnsettledExecution(execution))) return "live_owner";
+    if (executions.some((execution) => execution.usedTemporaryCredentials == null))
+      return "flag_unknown";
+    if (ageFrom !== null && ageFrom >= cutoff) return "not_old_enough";
+    return "eligible";
   }
 
   private hasUnsettledExecution(execution: AgentExecutionRecord): boolean {
@@ -1423,22 +1656,7 @@ class MemoryDatabase implements Database {
   };
 
   private receiptProof(receipt: ProviderEventReceiptRecord, cutoff: Date) {
-    const branches: ReceiptProofBranch[] = [];
-    for (const project of this.triggerRunIdsByProviderEventReceipt.get(receipt.id)?.values() ??
-      []) {
-      for (const id of project.values()) {
-        const run = this.triggerRuns.get(id);
-        if (run === undefined) continue;
-        const work = this.runPayloadWorkDisposition(run);
-        const blocker = work === "live" || work === "cleanup_blocked" ? "live_execution" : work;
-        branches.push({
-          ...run,
-          payloadExpiryState: run.payloadExpiryState ?? null,
-          payloadExpiredAt: run.payloadExpiredAt ?? null,
-          blocker: blocker === "eligible" ? null : blocker,
-        });
-      }
-    }
+    const branches = this.receiptProofBranches(receipt.id);
     const connections =
       receipt.provider === "github"
         ? this.githubConnections.values()
@@ -1472,6 +1690,29 @@ class MemoryDatabase implements Database {
       (id) => this.configurationRevisions.get(id),
       cutoff,
     );
+  }
+
+  private receiptProofBranches(receiptId: string) {
+    const branches: ReceiptProofBranch[] = [];
+    for (const project of this.triggerRunIdsByProviderEventReceipt.get(receiptId)?.values() ?? []) {
+      for (const id of project.values()) {
+        const run = this.triggerRuns.get(id);
+        if (run === undefined) continue;
+        branches.push(this.receiptProofBranch(run));
+      }
+    }
+    return branches;
+  }
+
+  private receiptProofBranch(run: TriggerRunRecord): ReceiptProofBranch {
+    const work = this.runPayloadWorkDisposition(run);
+    const blocker = work === "live" || work === "cleanup_blocked" ? "live_execution" : work;
+    return {
+      ...run,
+      payloadExpiryState: run.payloadExpiryState ?? null,
+      payloadExpiredAt: run.payloadExpiredAt ?? null,
+      blocker: blocker === "eligible" ? null : blocker,
+    };
   }
 
   scanGitHubSyncPayloads: Database["scanGitHubSyncPayloads"] = async (after, cutoff, limit) =>
@@ -1658,13 +1899,13 @@ class MemoryDatabase implements Database {
     for (const step of steps) stepCounts[step.status] = (stepCounts[step.status] ?? 0) + 1;
     const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
     if (receipt === undefined) throw new Error("run payload receipt unavailable");
-    const summary = summarizeRunPayload(
+    const summary = summarizeRunPayload({
       run,
       receipt,
       stepCounts,
-      this.runTimelineStates.get(run.id),
-      this.runProgressMessages.get(run.id),
-    );
+      timeline: this.runTimelineStates.get(run.id),
+      progress: this.runProgressMessages.get(run.id),
+    });
     const reduced = {
       ...run,
       payloadExpiredAt: new Date(now),
@@ -1716,13 +1957,7 @@ class MemoryDatabase implements Database {
       this.runPayloadExecutions(run, steps).some(isRunExecutionUnfinished)
     )
       return "live";
-    if (
-      run.outcome === "accepted" &&
-      (run.terminalNotificationLeaseExpiresAt !== null ||
-        (run.terminalNotificationPendingAt !== null &&
-          run.terminalNotificationDeliveredAt === null))
-    )
-      return "notification_pending";
+    if (hasPendingRunNotification(run)) return "notification_pending";
     const message = this.runProgressMessages.get(run.id);
     if (message !== undefined && isProgressUnsettled(message)) return "reporter_pending";
     return "eligible";
@@ -1760,7 +1995,7 @@ class MemoryDatabase implements Database {
   }
 
   // This test double has no background work. Scheduling tests use the actual embedded/PG runtime.
-  get schedules(): import("../triggers/schedule/index.js").ScheduleStore {
+  get schedules(): ScheduleStore {
     return (
       this.options.schedules ?? {
         async tick() {
@@ -1771,7 +2006,7 @@ class MemoryDatabase implements Database {
   }
   // Like schedules, polling needs real SQL; tests of it use the embedded runtime. This double
   // keeps only the status the Triggers page reads, and no cursor, so it never polls GitHub.
-  get githubNotifications(): import("../triggers/github-notifications/index.js").GitHubNotificationStore {
+  get githubNotifications(): GitHubNotificationStore {
     this.notificationStore ??= this.options.githubNotifications ?? this.memoryNotificationStore();
     return this.notificationStore;
   }
@@ -1789,10 +2024,8 @@ class MemoryDatabase implements Database {
     diagnosticExpiredAt: Date | null;
   };
 
-  private notificationStore:
-    | import("../triggers/github-notifications/index.js").GitHubNotificationStore
-    | undefined;
-  private memoryNotificationStore(): import("../triggers/github-notifications/index.js").GitHubNotificationStore {
+  private notificationStore: GitHubNotificationStore | undefined;
+  private memoryNotificationStore(): GitHubNotificationStore {
     const status = this.notificationStatus;
     return {
       exclusive: (operation) => operation(),
@@ -1847,7 +2080,7 @@ class MemoryDatabase implements Database {
         execution.hubActionCompletedAt !== null ||
         !isCanceledExecution(execution) ||
         (execution.hubActionAcknowledgements.stopInterruptGeneration ?? null) !== generation ||
-        (this.stopInterruptClaims.get(id)?.until ?? 0) > now
+        this.hasLiveStopInterruptClaim(id, now)
       )
         return undefined;
       this.stopInterruptClaims.set(id, { token, until: now + STOP_INTERRUPT_LEASE_MS });
@@ -1866,17 +2099,9 @@ class MemoryDatabase implements Database {
       let uncertain = false;
       for (const prior of this.agentExecutions.values()) {
         if (prior.id === id || prior.daemonId !== current.daemonId) continue;
-        const write = this.stopInterruptWrites.get(prior.id);
-        if (write?.agentId === agentId && write.startedAt >= acceptedAt) return "coalesced";
-        const attempt = this.stopInterruptStates.get(prior.id);
-        if (
-          (attempt?.startedAgentId ?? prior.daemonAgentId) === agentId &&
-          attempt?.startedAt !== undefined &&
-          Date.parse(attempt.startedAt) >= acceptedAt
-        ) {
-          if (attempt.acknowledgedPeerIds !== undefined) return "coalesced";
-          uncertain = true;
-        }
+        const coverage = this.priorStopInterruptCoverage(prior, agentId, acceptedAt);
+        if (coverage === "coalesced") return coverage;
+        if (coverage === "delivery_unconfirmed") uncertain = true;
       }
       return uncertain ? "delivery_unconfirmed" : undefined;
     },
@@ -1890,8 +2115,7 @@ class MemoryDatabase implements Database {
         claim?.token !== token ||
         claim.until <= now ||
         state === undefined ||
-        state.startedAt !== undefined ||
-        state.target !== undefined ||
+        stopInterruptMayHaveSent(state) ||
         this.stopInterruptExpired(execution, now)
       )
         return false;
@@ -1953,6 +2177,32 @@ class MemoryDatabase implements Database {
       }
     },
   };
+
+  private hasLiveStopInterruptClaim(id: string, now: number): boolean {
+    return (this.stopInterruptClaims.get(id)?.until ?? 0) > now;
+  }
+
+  private hasRecentStopWrite(id: string, agentId: string, acceptedAt: number): boolean {
+    const write = this.stopInterruptWrites.get(id);
+    return write?.agentId === agentId && write.startedAt >= acceptedAt;
+  }
+
+  private priorStopInterruptCoverage(
+    prior: AgentExecutionRecord,
+    agentId: string,
+    acceptedAt: number,
+  ): StopInterruptCoverage | undefined {
+    if (this.hasRecentStopWrite(prior.id, agentId, acceptedAt)) return "coalesced";
+    const attempt = this.stopInterruptStates.get(prior.id);
+    if (
+      (attempt?.startedAgentId ?? prior.daemonAgentId) === agentId &&
+      attempt?.startedAt !== undefined &&
+      Date.parse(attempt.startedAt) >= acceptedAt
+    ) {
+      return attempt.acknowledgedPeerIds !== undefined ? "coalesced" : "delivery_unconfirmed";
+    }
+    return undefined;
+  }
 
   private rememberStopWrite(id: string): void {
     const state = this.stopInterruptStates.get(id);
@@ -2078,17 +2328,8 @@ class MemoryDatabase implements Database {
     const opened = this.openTimelineForAppend(input, dedupeKey);
     if (opened === undefined || !("eventCount" in opened)) return opened;
     const state = opened;
-    const notice =
-      this.runTimelineEvents.get(state.triggerRunId)?.some((row) => row.kind === "truncated") ??
-      false;
-    if (state.stepEndCount >= 100 || input.kind === "run_finished")
-      this.refreshTimelineStepOmissions(state);
-    const data = prepareTimelineData(
-      input.kind,
-      input.kind === "run_finished"
-        ? { ...input.data, stepRowsOmitted: state.stepRowsOmitted }
-        : input.data,
-    );
+    const notice = this.hasTimelineTruncationNotice(state.triggerRunId);
+    const data = this.prepareTimelineAppendData(state, input);
     const bytes = jsonbBytes(data);
     if (timelineBudgetExceeded(state, input.kind, bytes, maxEvents, notice)) {
       this.dropTimelineEvent(state, input, notice);
@@ -2104,6 +2345,28 @@ class MemoryDatabase implements Database {
       data,
     };
     this.insertTimelineEvent(state, event);
+    this.finishTimelineAppend(state, input, event, { dedupeKey, bytes });
+    return { seq: event.seq, inserted: true };
+  }
+
+  private prepareTimelineAppendData(state: RunTimelineState, input: AppendRunTimelineEventInput) {
+    if (state.stepEndCount >= 100 || input.kind === "run_finished")
+      this.refreshTimelineStepOmissions(state);
+    return prepareTimelineData(
+      input.kind,
+      input.kind === "run_finished"
+        ? { ...input.data, stepRowsOmitted: state.stepRowsOmitted }
+        : input.data,
+    );
+  }
+
+  private finishTimelineAppend(
+    state: RunTimelineState,
+    input: AppendRunTimelineEventInput,
+    event: RunTimelineEvent,
+    accounting: { dedupeKey: string | undefined; bytes: number },
+  ): void {
+    const { dedupeKey, bytes } = accounting;
     if (dedupeKey !== undefined) {
       const dedupe = this.runTimelineDedupe.get(state.triggerRunId) ?? new Map<string, number>();
       dedupe.set(dedupeKey, event.seq);
@@ -2119,7 +2382,6 @@ class MemoryDatabase implements Database {
       state.sealedSeq = event.seq;
       state.sealedAt = new Date(input.at);
     }
-    return { seq: event.seq, inserted: true };
   }
 
   async recordRunTimelineDrops(
@@ -2151,6 +2413,14 @@ class MemoryDatabase implements Database {
       if (opened === undefined || !("eventCount" in opened)) return undefined;
       state = opened;
     }
+    return this.recordTimelineDropBatch(state, { organizationId, runId, count, at, batchId });
+  }
+
+  private recordTimelineDropBatch(
+    state: RunTimelineState,
+    batch: { organizationId: string; runId: string; count: number; at: Date; batchId: string },
+  ) {
+    const { organizationId, runId, count, at, batchId } = batch;
     const batchIds = this.runTimelineAccountingBatchIds.get(runId) ?? [];
     if (batchIds.includes(batchId)) {
       const notice = this.runTimelineEvents.get(runId)?.find((event) => event.kind === "truncated");
@@ -2162,8 +2432,7 @@ class MemoryDatabase implements Database {
     if (batchIds.length > 16) batchIds.shift();
     this.runTimelineAccountingBatchIds.set(runId, batchIds);
     state.droppedCount += count;
-    const notice =
-      this.runTimelineEvents.get(runId)?.some((event) => event.kind === "truncated") ?? false;
+    const notice = this.hasTimelineTruncationNotice(runId);
     if (state.sealedSeq !== null || notice) return { seq: state.eventCount, inserted: false };
     const seq = state.eventCount + 1;
     this.insertTimelineEvent(state, {
@@ -2190,12 +2459,21 @@ class MemoryDatabase implements Database {
     )
       return undefined;
     if (run.payloadExpiredAt != null) return { reason: "expired" };
-    let state = this.runTimelineStates.get(run.id);
+    const state = this.runTimelineStates.get(run.id);
     if (state?.expiredAt != null) return { reason: "expired" };
     if (state?.sealedSeq != null) {
       if (isOrdinary(input.kind)) state.droppedCount += 1;
       return { reason: "sealed" };
     }
+    return this.timelineAppendTarget(run, state, input, dedupeKey);
+  }
+
+  private timelineAppendTarget(
+    run: AcceptedTriggerRunRecord,
+    state: RunTimelineState | undefined,
+    input: AppendRunTimelineEventInput,
+    dedupeKey: string | undefined,
+  ): RunTimelineState | AppendRunTimelineEventResult {
     const existingSeq =
       dedupeKey === undefined ? undefined : this.runTimelineDedupe.get(run.id)?.get(dedupeKey);
     if (existingSeq !== undefined) return { seq: existingSeq, inserted: false };
@@ -2221,6 +2499,10 @@ class MemoryDatabase implements Database {
       this.runTimelineStates.set(run.id, state);
     }
     return state;
+  }
+
+  private hasTimelineTruncationNotice(runId: string): boolean {
+    return this.runTimelineEvents.get(runId)?.some((event) => event.kind === "truncated") ?? false;
   }
 
   private dropTimelineEvent(
@@ -2351,13 +2633,7 @@ class MemoryDatabase implements Database {
         }
         const state = this.runTimelineStates.get(run.id);
         const progress = this.runProgressMessages.get(run.id);
-        if (
-          progress !== undefined &&
-          (isProgressUnsettled(progress) ||
-            (progress.credentialRetryAt?.getTime() ?? 0) > Date.now() ||
-            (progress.credentialRejectedUntil?.getTime() ?? 0) > Date.now())
-        )
-          return false;
+        if (progress !== undefined && progressBlocksTimelineExpiry(progress)) return false;
         return (state !== undefined && state.expiredAt === null) || progress !== undefined;
       })
       .sort(
@@ -2445,8 +2721,7 @@ class MemoryDatabase implements Database {
     const message = this.runProgressMessages.get(input.triggerRunId);
     if (
       message?.organizationId !== input.organizationId ||
-      this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
-      this.triggerRuns.get(input.triggerRunId)?.payloadExpiredAt != null ||
+      !this.progressRunIsAvailable(input) ||
       (message.leaseOwner !== null &&
         message.leaseOwner !== input.owner &&
         message.leaseExpiresAt !== null &&
@@ -2500,8 +2775,7 @@ class MemoryDatabase implements Database {
     const message = this.runProgressMessages.get(input.triggerRunId);
     if (
       message?.organizationId !== input.organizationId ||
-      this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
-      this.triggerRuns.get(input.triggerRunId)?.payloadExpiredAt != null ||
+      !this.progressRunIsAvailable(input) ||
       message.leaseOwner !== input.owner ||
       message.version !== input.version ||
       message.leaseExpiresAt === null ||
@@ -2509,6 +2783,13 @@ class MemoryDatabase implements Database {
     )
       return undefined;
     return message;
+  }
+
+  private progressRunIsAvailable(input: RunProgressLeaseInput): boolean {
+    return (
+      this.triggerRuns.get(input.triggerRunId)?.organizationId === input.organizationId &&
+      this.triggerRuns.get(input.triggerRunId)?.payloadExpiredAt == null
+    );
   }
 
   async admitProgressWrite(input: AdmitProgressWriteInput): Promise<ProgressWriteAdmission> {
@@ -2605,21 +2886,7 @@ class MemoryDatabase implements Database {
             run.payloadExpiredAt != null
           )
             return false;
-          const terminal = run.status !== "running";
-          if (this.progressMessageNeedsSettle(message, settleThrough)) return true;
-          if (this.progressMessageNeedsRepair(message, now)) return true;
-          if (message.retryAt !== null && message.retryAt > now) return false;
-          if (message.state === "active" && terminal) return true;
-          if (message.state !== "pending") return false;
-          if (
-            terminal ||
-            (this.runTimelineEvents.get(run.id) ?? []).some((event) => event.kind === "run_started")
-          )
-            return true;
-          for (const step of this.workflowStepRuns.values()) {
-            if (step.triggerRunId === run.id && step.startedAt !== null) return true;
-          }
-          return false;
+          return this.progressMessageNeedsFinish(message, run, now, settleThrough);
         })
         .sort(
           (left, right) =>
@@ -2628,6 +2895,33 @@ class MemoryDatabase implements Database {
         )
         .slice(0, Math.max(0, limit)),
     );
+  }
+
+  private progressMessageNeedsFinish(
+    message: RunProgressMessage,
+    run: AcceptedTriggerRunRecord,
+    now: Date,
+    settleThrough: Date,
+  ): boolean {
+    const terminal = run.status !== "running";
+    if (this.progressMessageNeedsSettle(message, settleThrough)) return true;
+    if (this.progressMessageNeedsRepair(message, now)) return true;
+    if (message.retryAt !== null && message.retryAt > now) return false;
+    if (message.state === "active" && terminal) return true;
+    if (message.state !== "pending") return false;
+    return this.pendingProgressRunStarted(run, terminal);
+  }
+
+  private pendingProgressRunStarted(run: AcceptedTriggerRunRecord, terminal: boolean): boolean {
+    if (
+      terminal ||
+      (this.runTimelineEvents.get(run.id) ?? []).some((event) => event.kind === "run_started")
+    )
+      return true;
+    for (const step of this.workflowStepRuns.values()) {
+      if (step.triggerRunId === run.id && step.startedAt !== null) return true;
+    }
+    return false;
   }
 
   private progressMessageNeedsSettle(message: RunProgressMessage, through: Date): boolean {
@@ -2646,12 +2940,7 @@ class MemoryDatabase implements Database {
       message.leaseExpiresAt <= now;
     if (message.state === "creating") return message.leaseOwner === null || expiredLease;
     if (message.state === "active" && expiredLease) return true;
-    return (
-      (message.state === "active" || message.state === "finished") &&
-      (message.retryAt === null || message.retryAt <= now) &&
-      message.compensationRequestedGen > message.compensationDoneGen &&
-      (message.compensationNotBefore === null || message.compensationNotBefore <= now)
-    );
+    return progressCompensationIsDue(message, now);
   }
 
   async requestCompensation(
@@ -2668,14 +2957,7 @@ class MemoryDatabase implements Database {
       return undefined;
     const pending = message.compensationRequestedGen > message.compensationDoneGen;
     message.compensationRequestedGen += 1;
-    message.compensationNotBefore =
-      notBefore === undefined || (pending && message.compensationNotBefore === null)
-        ? null
-        : new Date(
-            pending && message.compensationNotBefore !== null
-              ? Math.min(message.compensationNotBefore.getTime(), notBefore.getTime())
-              : notBefore,
-          );
+    message.compensationNotBefore = nextCompensationNotBefore(message, pending, notBefore);
     return message.compensationRequestedGen;
   }
 
@@ -2722,11 +3004,7 @@ class MemoryDatabase implements Database {
     input: CreateAcceptedTriggerRunInput,
     replay?: "acknowledge",
   ): Promise<TriggerRunAdmission<AcceptedTriggerRunRecord>> {
-    const projectRuns =
-      this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
-      new Map<string, Map<string, string>>();
-    const triggerRuns = projectRuns.get(input.projectId) ?? new Map<string, string>();
-    const existingId = triggerRuns.get(input.configuredTriggerName);
+    const { projectRuns, triggerRuns, existingId } = this.triggerRunBranchIndex(input);
     const marked = this.checkReceiptAdmission(input, existingId, replay);
     if (marked !== undefined) return marked;
     if (existingId !== undefined) {
@@ -2737,31 +3015,7 @@ class MemoryDatabase implements Database {
       return { run: existing, created: false };
     }
     const now = input.createdAt ?? this.options.now?.() ?? new Date();
-    const run: AcceptedTriggerRunRecord = {
-      conversation: structuredClone(input.conversation ?? null),
-      id: input.id ?? randomUUID(),
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      configurationRevisionId: input.configurationRevisionId,
-      providerEventReceiptId: input.providerEventReceiptId,
-      configuredTriggerName: input.configuredTriggerName,
-      outcome: "accepted",
-      status: "running",
-      prompt: input.prompt,
-      inputs: freezeEvidence(input.inputs),
-      values: freezeEvidence(input.values ?? {}),
-      triggerContext: freezeEvidence(input.triggerContext),
-      outputContext: freezeEvidence(input.outputContext),
-      deadlineAt: input.deadlineAt,
-      deadlineKind: null,
-      failureReason: null,
-      reactionState: null,
-      terminalNotificationPendingAt: null,
-      terminalNotificationDeliveredAt: null,
-      terminalNotificationLeaseExpiresAt: null,
-      createdAt: now,
-      completedAt: null,
-    };
+    const run = newAcceptedTriggerRun(input, now);
     this.addOrganizationRun(run);
     if (input.replyMessage === true) {
       this.replyDeliveries.set(run.id, {
@@ -2779,31 +3033,7 @@ class MemoryDatabase implements Database {
     triggerRuns.set(input.configuredTriggerName, run.id);
     projectRuns.set(input.projectId, triggerRuns);
     this.triggerRunIdsByProviderEventReceipt.set(input.providerEventReceiptId, projectRuns);
-    for (const [ordinal, stepId] of input.stepIds.entries()) {
-      const step: WorkflowStepRunRecord = {
-        id: randomUUID(),
-        triggerRunId: run.id,
-        stepId,
-        ordinal,
-        status: "pending",
-        agentExecutionId: null,
-        output: null,
-        failureReason: null,
-        deadlineKind: null,
-        deadlineAt: null,
-        idleDeadlineAt: null,
-        startedAt: null,
-        completedAt: null,
-        dispatchIntent: null,
-      };
-      this.workflowStepRuns.set(step.id, step);
-    }
-    this.workflowWakeups.set(run.id, {
-      triggerRunId: run.id,
-      availableAt: now,
-      leaseExpiresAt: null,
-      leasedBeforeClaim: false,
-    });
+    this.addInitialWorkflowSteps(run, input, now);
     return { run, created: true };
   }
 
@@ -2818,11 +3048,7 @@ class MemoryDatabase implements Database {
     input: CreateRejectedTriggerRunInput,
     replay?: "acknowledge",
   ): Promise<TriggerRunAdmission<RejectedTriggerRunRecord>> {
-    const projectRuns =
-      this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
-      new Map<string, Map<string, string>>();
-    const triggerRuns = projectRuns.get(input.projectId) ?? new Map<string, string>();
-    const existingId = triggerRuns.get(input.configuredTriggerName);
+    const { projectRuns, triggerRuns, existingId } = this.triggerRunBranchIndex(input);
     const marked = this.checkReceiptAdmission(input, existingId, replay);
     if (marked !== undefined) return marked;
     if (existingId !== undefined) {
@@ -2857,6 +3083,49 @@ class MemoryDatabase implements Database {
     projectRuns.set(input.projectId, triggerRuns);
     this.triggerRunIdsByProviderEventReceipt.set(input.providerEventReceiptId, projectRuns);
     return { run, created: true };
+  }
+
+  private triggerRunBranchIndex(
+    input: CreateAcceptedTriggerRunInput | CreateRejectedTriggerRunInput,
+  ) {
+    const projectRuns =
+      this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
+      new Map<string, Map<string, string>>();
+    const triggerRuns = projectRuns.get(input.projectId) ?? new Map<string, string>();
+    const existingId = triggerRuns.get(input.configuredTriggerName);
+    return { projectRuns, triggerRuns, existingId };
+  }
+
+  private addInitialWorkflowSteps(
+    run: AcceptedTriggerRunRecord,
+    input: CreateAcceptedTriggerRunInput,
+    now: Date,
+  ) {
+    for (const [ordinal, stepId] of input.stepIds.entries()) {
+      const step: WorkflowStepRunRecord = {
+        id: randomUUID(),
+        triggerRunId: run.id,
+        stepId,
+        ordinal,
+        status: "pending",
+        agentExecutionId: null,
+        output: null,
+        failureReason: null,
+        deadlineKind: null,
+        deadlineAt: null,
+        idleDeadlineAt: null,
+        startedAt: null,
+        completedAt: null,
+        dispatchIntent: null,
+      };
+      this.workflowStepRuns.set(step.id, step);
+    }
+    this.workflowWakeups.set(run.id, {
+      triggerRunId: run.id,
+      availableAt: now,
+      leaseExpiresAt: null,
+      leasedBeforeClaim: false,
+    });
   }
 
   private checkReceiptAdmission(
@@ -3040,12 +3309,10 @@ class MemoryDatabase implements Database {
   }
 
   async createWorkflowStepExecution(input: WorkflowStepExecutionInput) {
-    let step = (await this.listWorkflowStepRunsForTriggerRun(input.triggerRunId)).find(
+    const step = (await this.listWorkflowStepRunsForTriggerRun(input.triggerRunId)).find(
       (candidate) => candidate.stepId === input.stepId && candidate.ordinal === input.ordinal,
     );
-    if (step === undefined) {
-      throw new Error("workflow step run not found");
-    }
+    if (step === undefined) throw new Error("workflow step run not found");
     if (step.agentExecutionId !== null) {
       return {
         stepRun: step,
@@ -3055,21 +3322,12 @@ class MemoryDatabase implements Database {
     }
     const run = this.triggerRuns.get(input.triggerRunId);
     const startedAt = input.execution.startedAt;
-    if (run === undefined || run.outcome !== "accepted" || run.status !== "running") {
+    if (!isRunningAcceptedWorkflowRun(run))
       return { stepRun: step, execution: undefined, created: false };
-    }
-    if (run.deadlineAt <= startedAt) {
-      this.timeoutWorkflowRun(run.id, startedAt);
-      return {
-        stepRun: this.workflowStepRuns.get(step.id) ?? step,
-        execution: undefined,
-        created: false,
-      };
-    }
-    // Reserve one meter unit before creating the execution, so a denied reservation creates
-    // nothing — the in-memory single-threaded model gives the same atomicity the Postgres
-    // transaction does. A replay hits the `agentExecutionId !== null` branch above and never
-    // reaches here, so it cannot double-consume.
+    const expiredStep = this.expireWorkflowStepBeforeStart(step, run, startedAt);
+    if (expiredStep !== undefined)
+      return { stepRun: expiredStep, execution: undefined, created: false };
+    // Reserve before insert so denial creates no execution and replay does not charge again.
     if (input.reservation !== undefined) {
       const reserved = await this.consumeOrganizationUsage({
         organizationId: input.execution.organizationId,
@@ -3087,27 +3345,17 @@ class MemoryDatabase implements Database {
           input.reservation.meter,
           input.reservation.periodStart,
         );
-        return {
-          stepRun: step,
-          execution: undefined,
-          created: false,
-          reservationDenied: {
-            meter: input.reservation.meter,
-            limit: input.reservation.limit,
-            current: usage?.used ?? 0,
-          },
-        };
+        return workflowStepReservationDenied(
+          step,
+          input.reservation.meter,
+          input.reservation.limit,
+          usage,
+        );
       }
     }
-    const currentRun = this.triggerRuns.get(run.id);
-    if (currentRun?.status === "canceled")
-      return { stepRun: this.workflowStepRuns.get(step.id)!, execution: undefined, created: false };
-    const deadlineAt = new Date(
-      Math.min(input.execution.deadlineAt.getTime(), run.deadlineAt.getTime()),
-    );
-    const idleDeadlineAt = new Date(
-      Math.min(input.execution.idleDeadlineAt.getTime(), deadlineAt.getTime()),
-    );
+    const canceled = this.canceledWorkflowStepStart(step, run.id);
+    if (canceled !== undefined) return canceled;
+    const { deadlineAt, idleDeadlineAt } = workflowStepExecutionDeadlines(input, run);
     const execution = await this.insertAgentExecution({
       ...input.execution,
       id: input.executionId,
@@ -3116,10 +3364,39 @@ class MemoryDatabase implements Database {
       idleDeadlineAt,
       workflowStepRunId: step.id,
     });
-    const currentStep = this.workflowStepRuns.get(step.id)!;
-    if (this.triggerRuns.get(run.id)?.status === "canceled")
-      return { stepRun: currentStep, execution: undefined, created: false };
-    step = {
+    return this.markWorkflowStepExecutionStarted(step, run, input, execution);
+  }
+
+  private expireWorkflowStepBeforeStart(
+    step: WorkflowStepRunRecord,
+    run: AcceptedTriggerRunRecord,
+    startedAt: Date,
+  ) {
+    if (run.deadlineAt <= startedAt) {
+      this.timeoutWorkflowRun(run.id, startedAt);
+      return this.workflowStepRuns.get(step.id) ?? step;
+    }
+    return undefined;
+  }
+
+  private canceledWorkflowStepStart(step: WorkflowStepRunRecord, runId: string) {
+    if (this.triggerRuns.get(runId)?.status !== "canceled") return undefined;
+    return {
+      stepRun: this.workflowStepRuns.get(step.id) ?? step,
+      execution: undefined,
+      created: false as const,
+    };
+  }
+
+  private markWorkflowStepExecutionStarted(
+    step: WorkflowStepRunRecord,
+    run: AcceptedTriggerRunRecord,
+    input: WorkflowStepExecutionInput,
+    execution: AgentExecutionRecord,
+  ) {
+    const canceled = this.canceledWorkflowStepStart(step, run.id);
+    if (canceled !== undefined) return canceled;
+    const updated: WorkflowStepRunRecord = {
       ...step,
       status: "running",
       agentExecutionId: execution.id,
@@ -3128,8 +3405,8 @@ class MemoryDatabase implements Database {
       dispatchIntent: input.execution.launchIntent ?? step.dispatchIntent,
       startedAt: execution.startedAt,
     };
-    this.workflowStepRuns.set(step.id, step);
-    return { stepRun: step, execution, created: true };
+    this.workflowStepRuns.set(updated.id, updated);
+    return { stepRun: updated, execution, created: true };
   }
 
   async linkWorkflowStepRunExecution(
@@ -3146,20 +3423,10 @@ class MemoryDatabase implements Database {
     const execution = this.agentExecutions.get(executionId);
     if (execution === undefined) throw new Error(`agent execution not found: ${executionId}`);
     const run = this.triggerRuns.get(step.triggerRunId);
-    if (run?.payloadExpiredAt != null || run?.status === "canceled")
-      return this.projectStepPayload(step);
+    if (shouldProjectLinkedWorkflowStep(run)) return this.projectStepPayload(step);
     if (execution.launchIntentExpiredAt != null)
       throw new Error("agent execution launch intent expired");
-    const updated = {
-      ...step,
-      status:
-        step.status === "succeeded" || step.status === "failed" || step.status === "timed_out"
-          ? step.status
-          : ("running" as const),
-      agentExecutionId: executionId,
-      startedAt: step.startedAt ?? execution.startedAt,
-      ...(dispatchIntent === undefined ? {} : { dispatchIntent }),
-    };
+    const updated = linkedWorkflowStep(step, execution, executionId, dispatchIntent);
     this.workflowStepRuns.set(stepRunId, updated);
     return updated;
   }
@@ -3181,9 +3448,9 @@ class MemoryDatabase implements Database {
       ...(failureReason === undefined ? {} : { failureReason }),
     });
     const step = this.workflowStepRuns.get(execution.workflowStepRunId);
-    return step === undefined
-      ? undefined
-      : { stepRun: step, run: this.triggerRuns.get(step.triggerRunId)! };
+    if (step === undefined) return undefined;
+    const run = this.triggerRuns.get(step.triggerRunId);
+    return run === undefined ? undefined : { stepRun: step, run };
   }
 
   async completeWorkflowAgentExecution(input: WorkflowAgentCompletionInput) {
@@ -3198,32 +3465,10 @@ class MemoryDatabase implements Database {
     const step = this.workflowStepRuns.get(execution.workflowStepRunId);
     if (step === undefined)
       throw new Error(`workflow step run not found: ${execution.workflowStepRunId}`);
-    const run = this.triggerRuns.get(step.triggerRunId);
-    if (run === undefined) throw new Error(`workflow trigger run not found: ${step.triggerRunId}`);
-    if (run.outcome !== "accepted") throw new Error("rejected trigger run has no workflow step");
-
+    const run = this.readWorkflowRunForStep(step);
     const observedAt = input.observedAt ?? this.now();
-    if (execution.status === "spawning" || execution.status === "running") {
-      const deadlineKind = workflowDeadlineKind(execution, step, run, observedAt);
-      if (deadlineKind === "whole_run") {
-        this.timeoutWorkflowRun(run.id, observedAt);
-        const terminalRun = this.triggerRuns.get(run.id);
-        return transitionWithTerminalRun(
-          {
-            execution: this.readAgentExecution(execution.id),
-            transitioned: true,
-            deadlineKind,
-          },
-          terminalRun,
-        );
-      }
-      if (deadlineKind !== undefined) {
-        const timedOut = this.timeoutWorkflowStep(execution.id, deadlineKind, observedAt);
-        const terminalRun = this.triggerRuns.get(run.id);
-        return transitionWithTerminalRun(timedOut, terminalRun);
-      }
-    }
-
+    const timedOut = this.timeoutWorkflowAgentIfDue(execution, step, run, observedAt);
+    if (timedOut !== undefined) return timedOut;
     const transitioned =
       execution.status === "spawning" || execution.status === "running"
         ? await this.transitionAgentExecution(
@@ -3232,13 +3477,43 @@ class MemoryDatabase implements Database {
             executionTransitionFields(input),
           )
         : { execution, transitioned: false };
-    if (
-      this.triggerRuns.get(run.id)?.status !== "canceled" &&
-      (transitioned.transitioned || isTerminalAgentExecutionStatus(execution.status))
-    ) {
+    if (canFinishWorkflowStep(this.triggerRuns.get(run.id), transitioned, execution)) {
       this.finishWorkflowStep(step, run, input);
     }
     return transitionWithTerminalRun(transitioned, this.triggerRuns.get(run.id));
+  }
+
+  private readWorkflowRunForStep(step: WorkflowStepRunRecord) {
+    const run = this.triggerRuns.get(step.triggerRunId);
+    if (run === undefined) throw new Error(`workflow trigger run not found: ${step.triggerRunId}`);
+    if (run.outcome !== "accepted") throw new Error("rejected trigger run has no workflow step");
+    return run;
+  }
+
+  private timeoutWorkflowAgentIfDue(
+    execution: AgentExecutionRecord,
+    step: WorkflowStepRunRecord,
+    run: AcceptedTriggerRunRecord,
+    observedAt: Date,
+  ) {
+    if (execution.status !== "spawning" && execution.status !== "running") return undefined;
+    const deadlineKind = workflowDeadlineKind(execution, step, run, observedAt);
+    if (deadlineKind === "whole_run") {
+      this.timeoutWorkflowRun(run.id, observedAt);
+      const terminalRun = this.triggerRuns.get(run.id);
+      return transitionWithTerminalRun(
+        {
+          execution: this.readAgentExecution(execution.id),
+          transitioned: true,
+          deadlineKind,
+        },
+        terminalRun,
+      );
+    }
+    if (deadlineKind === undefined) return undefined;
+    const timedOut = this.timeoutWorkflowStep(execution.id, deadlineKind, observedAt);
+    const terminalRun = this.triggerRuns.get(run.id);
+    return transitionWithTerminalRun(timedOut, terminalRun);
   }
 
   private finishWorkflowStep(
@@ -3246,17 +3521,13 @@ class MemoryDatabase implements Database {
     run: TriggerRunRecord,
     input: WorkflowAgentCompletionInput,
   ): void {
-    if (step.status === "succeeded" || step.status === "failed" || step.status === "timed_out") {
-      return;
-    }
+    if (isCompletedWorkflowStep(step)) return;
     if (run.outcome !== "accepted") throw new Error("rejected trigger run has no workflow step");
     const now = this.options.now?.() ?? new Date();
     const updatedStep: WorkflowStepRunRecord = {
       ...step,
       status: input.stepStatus,
-      output: freezeEvidence(input.stepOutput !== undefined ? input.stepOutput : input.result),
-      failureReason: input.failureReason ?? null,
-      deadlineKind: input.deadlineKind ?? step.deadlineKind,
+      ...workflowStepCompletionFields(step, input),
       completedAt: now,
     };
     this.workflowStepRuns.set(step.id, updatedStep);
@@ -3272,12 +3543,7 @@ class MemoryDatabase implements Database {
       return;
     }
     if (run.status === "running") {
-      let runStatus: TriggerRunRecord["status"] = input.stepStatus;
-      if (input.deadlineKind === "whole_run") {
-        runStatus = "timed_out";
-      } else if (input.deadlineKind !== undefined) {
-        runStatus = "failed";
-      }
+      const runStatus = workflowRunFailureStatus(input);
       this.triggerRuns.set(run.id, {
         ...this.pendingTerminalNotification(run, now),
         status: runStatus,
@@ -3298,33 +3564,13 @@ class MemoryDatabase implements Database {
     if (isTerminalAgentExecutionStatus(execution.status)) {
       return { execution, transitioned: false };
     }
-    const failureReason = deadlineKind === "step_idle" ? "step_idle_timeout" : "step_hard_timeout";
-    let hubAction: "interrupt" | "archive" | null = null;
-    if (execution.daemonId !== null) {
-      hubAction = execution.launchIntent?.autoArchive === true ? "archive" : "interrupt";
-    }
-    const updatedExecution: AgentExecutionRecord = {
-      ...execution,
-      status: "failed",
-      completedAt: now,
-      result: { status: "failed", reason: failureReason },
-      idleDeadlineAt: null,
-      hubAction,
-      hubActionCompletedAt: hubAction === null ? null : null,
-      hubActionReadyAt: null,
-      hubActionAcknowledgements: emptyHubActionAcknowledgements(),
-    };
-    this.agentExecutions.set(execution.id, updatedExecution);
+    const failureReason = stepTimeoutReason(deadlineKind);
+    const updatedExecution = this.timeoutAgentExecution(execution, failureReason, now);
     const step =
       execution.workflowStepRunId === null
         ? undefined
         : this.workflowStepRuns.get(execution.workflowStepRunId);
-    if (
-      step === undefined ||
-      step.status === "succeeded" ||
-      step.status === "failed" ||
-      step.status === "timed_out"
-    ) {
+    if (step === undefined || isCompletedWorkflowStep(step)) {
       return { execution: updatedExecution, transitioned: true, deadlineKind };
     }
     const run = this.triggerRuns.get(step.triggerRunId);
@@ -3351,43 +3597,39 @@ class MemoryDatabase implements Database {
     return { execution: updatedExecution, transitioned: true, deadlineKind };
   }
 
+  private timeoutAgentExecution(execution: AgentExecutionRecord, failureReason: string, now: Date) {
+    let hubAction: AgentExecutionRecord["hubAction"] = null;
+    if (execution.daemonId !== null) {
+      hubAction = execution.launchIntent?.autoArchive === true ? "archive" : "interrupt";
+    }
+    const updatedExecution: AgentExecutionRecord = {
+      ...execution,
+      status: "failed",
+      completedAt: now,
+      result: { status: "failed", reason: failureReason },
+      idleDeadlineAt: null,
+      hubAction,
+      hubActionCompletedAt: null,
+      hubActionReadyAt: null,
+      hubActionAcknowledgements: emptyHubActionAcknowledgements(),
+    };
+    this.agentExecutions.set(execution.id, updatedExecution);
+    return updatedExecution;
+  }
+
   private timeoutWorkflowRun(
     triggerRunId: string,
     now: Date,
   ): WorkflowDeadlineRecovery | undefined {
     const run = this.triggerRuns.get(triggerRunId);
-    if (run === undefined || run.outcome !== "accepted" || run.status !== "running") {
+    if (!isRunningAcceptedWorkflowRun(run)) {
       return undefined;
     }
     const executionIds: string[] = [];
     for (const step of this.workflowStepRuns.values()) {
       if (step.triggerRunId !== triggerRunId) continue;
-      if (step.agentExecutionId !== null) {
-        const execution = this.agentExecutions.get(step.agentExecutionId);
-        if (
-          execution !== undefined &&
-          (execution.status === "spawning" || execution.status === "running")
-        ) {
-          let hubAction: AgentExecutionRecord["hubAction"] = null;
-          if (execution.daemonId !== null) {
-            hubAction = execution.launchIntent?.autoArchive === true ? "archive" : "interrupt";
-          }
-          const updatedExecution: AgentExecutionRecord = {
-            ...execution,
-            status: "failed",
-            completedAt: now,
-            result: { status: "failed", reason: "whole_run_timeout" },
-            idleDeadlineAt: null,
-            hubAction,
-            hubActionCompletedAt: null,
-            hubActionReadyAt: null,
-            hubActionAcknowledgements: emptyHubActionAcknowledgements(),
-          };
-          this.agentExecutions.set(execution.id, updatedExecution);
-          executionIds.push(execution.id);
-        }
-      }
-      if (step.status === "pending" || step.status === "running") {
+      this.timeoutLinkedWorkflowExecution(step, now, executionIds);
+      if (isUnfinishedWorkflowStep(step)) {
         this.workflowStepRuns.set(step.id, {
           ...step,
           status: "timed_out",
@@ -3409,6 +3651,22 @@ class MemoryDatabase implements Database {
     return { triggerRunId: run.id, executionIds };
   }
 
+  private timeoutLinkedWorkflowExecution(
+    step: WorkflowStepRunRecord,
+    now: Date,
+    executionIds: string[],
+  ) {
+    if (step.agentExecutionId === null) return;
+    const execution = this.agentExecutions.get(step.agentExecutionId);
+    if (
+      execution !== undefined &&
+      (execution.status === "spawning" || execution.status === "running")
+    ) {
+      this.timeoutAgentExecution(execution, "whole_run_timeout", now);
+      executionIds.push(execution.id);
+    }
+  }
+
   async recoverWorkflowDeadlines(now: Date): Promise<readonly WorkflowDeadlineRecovery[]> {
     const recoveries: WorkflowDeadlineRecovery[] = [];
     for (const run of this.triggerRuns.values()) {
@@ -3420,38 +3678,45 @@ class MemoryDatabase implements Database {
       }
       const steps = await this.listWorkflowStepRunsForTriggerRun(run.id);
       for (const step of steps) {
-        if (step.status !== "running") continue;
-        const execution =
-          step.agentExecutionId === null
-            ? undefined
-            : this.agentExecutions.get(step.agentExecutionId);
-        if (execution !== undefined && isTerminalAgentExecutionStatus(execution.status)) continue;
-        const deadlineKind = workflowDeadlineKind(execution, step, run, now);
-        if (deadlineKind === undefined || deadlineKind === "whole_run") continue;
-        if (execution !== undefined) {
-          const recovery = this.timeoutWorkflowStep(execution.id, deadlineKind, now);
-          recoveries.push({ triggerRunId: run.id, executionIds: [recovery.execution.id] });
-        } else {
-          this.workflowStepRuns.set(step.id, {
-            ...step,
-            status: "timed_out",
-            failureReason: deadlineKind === "step_idle" ? "step_idle_timeout" : "step_hard_timeout",
-            deadlineKind,
-            completedAt: now,
-          });
-          this.triggerRuns.set(run.id, {
-            ...this.pendingTerminalNotification(run, now),
-            status: "failed",
-            deadlineKind,
-            failureReason: deadlineKind === "step_idle" ? "step_idle_timeout" : "step_hard_timeout",
-            completedAt: now,
-          });
-          this.workflowWakeups.delete(run.id);
-          recoveries.push({ triggerRunId: run.id, executionIds: [] });
-        }
+        const recovery = this.recoverWorkflowStepDeadline(step, run, now);
+        if (recovery !== undefined) recoveries.push(recovery);
       }
     }
     return recoveries;
+  }
+
+  private recoverWorkflowStepDeadline(
+    step: WorkflowStepRunRecord,
+    run: AcceptedTriggerRunRecord,
+    now: Date,
+  ): WorkflowDeadlineRecovery | undefined {
+    if (step.status !== "running") return undefined;
+    const execution =
+      step.agentExecutionId === null ? undefined : this.agentExecutions.get(step.agentExecutionId);
+    if (execution !== undefined && isTerminalAgentExecutionStatus(execution.status))
+      return undefined;
+    const deadlineKind = workflowDeadlineKind(execution, step, run, now);
+    if (deadlineKind === undefined || deadlineKind === "whole_run") return undefined;
+    if (execution !== undefined) {
+      const recovery = this.timeoutWorkflowStep(execution.id, deadlineKind, now);
+      return { triggerRunId: run.id, executionIds: [recovery.execution.id] };
+    }
+    this.workflowStepRuns.set(step.id, {
+      ...step,
+      status: "timed_out",
+      failureReason: stepTimeoutReason(deadlineKind),
+      deadlineKind,
+      completedAt: now,
+    });
+    this.triggerRuns.set(run.id, {
+      ...this.pendingTerminalNotification(run, now),
+      status: "failed",
+      deadlineKind,
+      failureReason: stepTimeoutReason(deadlineKind),
+      completedAt: now,
+    });
+    this.workflowWakeups.delete(run.id);
+    return { triggerRunId: run.id, executionIds: [] };
   }
 
   async markWorkflowStepSkipped(triggerRunId: string, stepId: string, reason: string) {
@@ -3561,24 +3826,7 @@ class MemoryDatabase implements Database {
             this.stopInterruptStates.get(execution.id)?.outcome ?? "delivery_unconfirmed",
         ),
     );
-    let cleanupState: StopCleanupState = "not_needed";
-    if (run.status === "canceled") {
-      if (pending) cleanupState = "waiting_for_daemon";
-      else if (outcomes.has("delivery_unconfirmed")) cleanupState = "delivery_unconfirmed";
-      else if (outcomes.has("target_gone")) cleanupState = "target_gone";
-      else if (
-        outcomes.has("confirmed") ||
-        outcomes.has("coalesced") ||
-        steps.some(
-          (step) =>
-            step.status === "canceled" &&
-            step.output !== null &&
-            typeof step.output === "object" &&
-            "exit_code" in step.output,
-        )
-      )
-        cleanupState = "confirmed";
-    }
+    const cleanupState = runStopCleanupState(run.status, pending, outcomes, steps);
     return {
       stoppedByName: null,
       cleanupState,
@@ -3598,13 +3846,14 @@ class MemoryDatabase implements Database {
     );
   }
 
-  private canRepeatStop(
-    run: TriggerRunRecord,
-    owned: readonly AgentExecutionRecord[],
-    steps: readonly WorkflowStepRunRecord[],
-    requested: string | undefined,
-    confirmedPeerCount: number | undefined,
-  ): boolean {
+  private canRepeatStop(input: {
+    run: TriggerRunRecord;
+    owned: readonly AgentExecutionRecord[];
+    steps: readonly WorkflowStepRunRecord[];
+    requested: string | undefined;
+    confirmedPeerCount: number | undefined;
+  }): boolean {
+    const { run, owned, steps, requested, confirmedPeerCount } = input;
     return (
       requested !== undefined &&
       confirmedPeerCount !== undefined &&
@@ -3615,12 +3864,7 @@ class MemoryDatabase implements Database {
   }
 
   private isRetryableStop(execution: AgentExecutionRecord, attemptId?: string) {
-    if (
-      execution.hubAction !== "interrupt" ||
-      execution.hubActionCompletedAt === null ||
-      !isCanceledExecution(execution)
-    )
-      return false;
+    if (!hasCompletedCanceledInterrupt(execution)) return false;
     const state = this.stopInterruptStates.get(execution.id);
     const outcome = state?.outcome ?? "delivery_unconfirmed";
     return (
@@ -3673,12 +3917,49 @@ class MemoryDatabase implements Database {
     );
     const owned = this.runPayloadExecutions(run, steps);
     const retrying = run.status === "canceled";
-    if (retrying && !this.canRepeatStop(run, owned, steps, retryAttemptId, confirmedPeerCount))
-      return noop;
-    if (!retrying && retryAttemptId !== undefined) return noop;
-    const targets = retrying
+    const targets = this.selectRunStopTargets({
+      run,
+      owned,
+      steps,
+      retrying,
+      confirmedPeerCount,
+      retryAttemptId,
+    });
+    return targets === undefined
+      ? noop
+      : this.applyRunStop({ run, now, steps, owned, targets, retrying, confirmedPeerCount });
+  }
+
+  private selectRunStopTargets(input: {
+    run: TriggerRunRecord;
+    owned: readonly AgentExecutionRecord[];
+    steps: readonly WorkflowStepRunRecord[];
+    retrying: boolean;
+    confirmedPeerCount: number | undefined;
+    retryAttemptId: string | undefined;
+  }) {
+    const { run, owned, steps, retrying, confirmedPeerCount, retryAttemptId } = input;
+    if (
+      retrying &&
+      !this.canRepeatStop({ run, owned, steps, requested: retryAttemptId, confirmedPeerCount })
+    )
+      return undefined;
+    if (!retrying && retryAttemptId !== undefined) return undefined;
+    return retrying
       ? owned.filter((execution) => this.isRetryableStop(execution, retryAttemptId))
       : owned.filter((execution) => !isTerminalAgentExecutionStatus(execution.status));
+  }
+
+  private applyRunStop(input: {
+    run: AcceptedTriggerRunRecord;
+    now: Date;
+    steps: readonly WorkflowStepRunRecord[];
+    owned: readonly AgentExecutionRecord[];
+    targets: readonly AgentExecutionRecord[];
+    retrying: boolean;
+    confirmedPeerCount: number | undefined;
+  }) {
+    const { run, now, steps, owned, targets, retrying, confirmedPeerCount } = input;
     const peers = this.stopPeers(owned, targets);
     const peerCount = this.countStopPeerRuns(peers);
     if (confirmedPeerCount !== undefined && confirmedPeerCount !== peerCount)
@@ -3688,17 +3969,35 @@ class MemoryDatabase implements Database {
       attemptId: randomUUID(),
       requestedAt: now.toISOString(),
     };
-    if (retrying) {
-      for (const execution of targets) {
-        this.stopInterruptStates.set(execution.id, structuredClone(attempt));
-        this.stopInterruptCheckedAt.delete(execution.id);
-        this.setStopInterruptGeneration(
-          { ...execution, hubActionCompletedAt: null },
-          attempt.attemptId,
-        );
-      }
-      return { run, transitioned: false, executionIds: targets.map(({ id }) => id) };
+    return retrying
+      ? this.repeatRunStop(run, targets, attempt)
+      : this.finishRunStop({ run, now, steps, targets, attempt });
+  }
+
+  private repeatRunStop(
+    run: TriggerRunRecord,
+    targets: readonly AgentExecutionRecord[],
+    attempt: RunStopAttempt,
+  ) {
+    for (const execution of targets) {
+      this.stopInterruptStates.set(execution.id, structuredClone(attempt));
+      this.stopInterruptCheckedAt.delete(execution.id);
+      this.setStopInterruptGeneration(
+        { ...execution, hubActionCompletedAt: null },
+        attempt.attemptId,
+      );
     }
+    return { run, transitioned: false, executionIds: targets.map(({ id }) => id) };
+  }
+
+  private finishRunStop(input: {
+    run: AcceptedTriggerRunRecord;
+    now: Date;
+    steps: readonly WorkflowStepRunRecord[];
+    targets: readonly AgentExecutionRecord[];
+    attempt: RunStopAttempt;
+  }) {
+    const { run, now, steps, targets, attempt } = input;
     for (const step of steps) {
       if (step.status !== "pending" && step.status !== "running") continue;
       this.workflowStepRuns.set(step.id, {
@@ -3756,17 +4055,14 @@ class MemoryDatabase implements Database {
     const run = this.triggerRuns.get(triggerRunId);
     const step =
       (stepId === undefined
-        ? steps.find(
-            (candidate) => candidate.status === "pending" || candidate.status === "running",
-          )
+        ? steps.find(isUnfinishedWorkflowStep)
         : steps.find((candidate) => candidate.stepId === stepId)) ?? steps[0];
     if (run === undefined || step === undefined) return undefined;
     if (run.status !== "running") return { stepRun: step, run, transitioned: false };
     const now = this.options.now?.() ?? new Date();
-    const updatedStep =
-      step.status === "pending" || step.status === "running"
-        ? { ...step, status, failureReason, completedAt: now }
-        : step;
+    const updatedStep = isUnfinishedWorkflowStep(step)
+      ? { ...step, status, failureReason, completedAt: now }
+      : step;
     if (run.outcome !== "accepted") throw new Error("rejected trigger run has no workflow step");
     const updatedRun: AcceptedTriggerRunRecord = {
       ...this.pendingTerminalNotification(run, now),
@@ -3782,9 +4078,7 @@ class MemoryDatabase implements Database {
 
   async recoverWorkflowWakeups(now: Date, excludedRunIds: readonly string[] = []) {
     for (const run of this.triggerRuns.values()) {
-      if (run.status !== "running" || run.payloadExpiredAt != null || run.deadlineAt <= now)
-        continue;
-      if (excludedRunIds.includes(run.id)) continue;
+      if (!canRecoverWorkflowWakeup(run, now, excludedRunIds)) continue;
       const wakeup = this.workflowWakeups.get(run.id);
       const steps = await this.listWorkflowStepRunsForTriggerRun(run.id);
       const execution = (
@@ -3915,49 +4209,49 @@ class MemoryDatabase implements Database {
   async acceptGitHubEvent(input: AcceptGitHubEventInput): Promise<ProviderEventAcceptance> {
     const binding = await this.findGitHubConnection(input.installationId);
     const reason = githubDropReason(input, binding);
-    return this.acceptMemoryEvent(
+    return this.acceptMemoryEvent({
       input,
-      binding?.organizationId,
-      binding?.id,
-      input.repositoryId === undefined ? null : String(input.repositoryId),
+      organizationId: binding?.organizationId,
+      connectionId: binding?.id,
+      resourceId: input.repositoryId === undefined ? null : String(input.repositoryId),
       reason,
-    );
+    });
   }
 
   async acceptDiscordEvent(input: AcceptDiscordEventInput): Promise<ProviderEventAcceptance> {
     const binding = await this.findDiscordConnection(input.guildId);
     const reason = discordDropReason(input, binding);
-    return this.acceptMemoryEvent(
+    return this.acceptMemoryEvent({
       input,
-      binding?.organizationId,
-      binding?.id,
-      input.guildId,
+      organizationId: binding?.organizationId,
+      connectionId: binding?.id,
+      resourceId: input.guildId,
       reason,
-    );
+    });
   }
 
   async acceptSlackEvent(input: AcceptSlackEventInput): Promise<ProviderEventAcceptance> {
     const binding = await this.findSlackConnection(input.teamId);
     const reason = slackDropReason(input, binding);
-    return this.acceptMemoryEvent(
+    return this.acceptMemoryEvent({
       input,
-      binding?.organizationId,
-      binding?.id,
-      input.teamId,
+      organizationId: binding?.organizationId,
+      connectionId: binding?.id,
+      resourceId: input.teamId,
       reason,
-    );
+    });
   }
 
   async acceptLinearEvent(input: AcceptLinearEventInput): Promise<ProviderEventAcceptance> {
     const binding = await this.findLinearConnection(input.linearOrganizationId);
     const reason = linearDropReason(input, binding);
-    return this.acceptMemoryEvent(
+    return this.acceptMemoryEvent({
       input,
-      binding?.organizationId,
-      binding?.id,
-      input.projectId ?? null,
+      organizationId: binding?.organizationId,
+      connectionId: binding?.id,
+      resourceId: input.projectId ?? null,
       reason,
-    );
+    });
   }
 
   async findMarkedLinearReceipt(
@@ -3979,44 +4273,11 @@ class MemoryDatabase implements Database {
       input.deliveryId,
       input.signatureHash,
     );
-    if (existing !== undefined) {
-      const receipt = this.providerEventReceipts.get(existing);
-      if (receipt?.payloadExpiryState != null) {
-        if (input.publicTriggerName !== undefined || input.boundWebhookTrigger !== undefined)
-          this.validateMarkedManualReceipt(input, receipt);
-        return {
-          status: "duplicate",
-          providerEventReceiptId: receipt.id,
-          replayed: true,
-          payloadExpiryState: receipt.payloadExpiryState,
-        };
-      }
-      const route = receipt?.acceptedRoutes?.[0];
-      if (receipt === undefined || route === undefined) {
-        return {
-          status: "duplicate" as const,
-          providerEventReceiptId: existing,
-          replayed: true,
-        };
-      }
-      this.assertBoundWebhookReceipt(input, route);
-      return {
-        status: "accepted" as const,
-        replayed: true,
-        event: {
-          providerEventReceiptId: receipt.id,
-          organizationId: receipt.organizationId,
-          projectId: route.projectId,
-          configurationRevisionId: route.configurationRevisionId,
-          deliveryId: receipt.deliveryId,
-          source: receipt.source,
-          payload: receipt.payload,
-          receivedAt: receipt.receivedAt,
-          connectionId: route.connectionId,
-          resourceId: route.resourceId,
-        },
-      };
-    }
+    if (existing !== undefined) return this.replayManualEvent(input, existing);
+    return this.insertManualEvent(input);
+  }
+
+  private insertManualEvent(input: PersistManualEventInput): ManualEventPersistence {
     const project = this.projects.get(input.projectId);
     if (
       project?.organizationId !== input.organizationId ||
@@ -4039,19 +4300,47 @@ class MemoryDatabase implements Database {
       resourceId: input.resourceId ?? null,
     };
     this.providerEventReceipts.set(receipt.id, { ...receipt, acceptedRoutes: [route] });
+    return acceptedManualEvent(input, receipt, route);
+  }
+
+  private replayManualEvent(
+    input: PersistManualEventInput,
+    existing: string,
+  ): ManualEventPersistence {
+    const receipt = this.providerEventReceipts.get(existing);
+    if (receipt?.payloadExpiryState != null) {
+      if (input.publicTriggerName !== undefined || input.boundWebhookTrigger !== undefined)
+        this.validateMarkedManualReceipt(input, receipt);
+      return {
+        status: "duplicate",
+        providerEventReceiptId: receipt.id,
+        replayed: true,
+        payloadExpiryState: receipt.payloadExpiryState,
+      };
+    }
+    const route = receipt?.acceptedRoutes?.[0];
+    if (receipt === undefined || route === undefined) {
+      return {
+        status: "duplicate" as const,
+        providerEventReceiptId: existing,
+        replayed: true,
+      };
+    }
+    this.assertBoundWebhookReceipt(input, route);
     return {
       status: "accepted" as const,
+      replayed: true,
       event: {
         providerEventReceiptId: receipt.id,
-        organizationId: input.organizationId,
-        projectId: input.projectId,
+        organizationId: receipt.organizationId,
+        projectId: route.projectId,
         configurationRevisionId: route.configurationRevisionId,
-        deliveryId: input.deliveryId,
-        source: input.source,
-        payload: input.payload,
-        receivedAt: input.receivedAt,
-        connectionId: input.connectionId ?? null,
-        resourceId: input.resourceId ?? null,
+        deliveryId: receipt.deliveryId,
+        source: receipt.source,
+        payload: receipt.payload,
+        receivedAt: receipt.receivedAt,
+        connectionId: route.connectionId,
+        resourceId: route.resourceId,
       },
     };
   }
@@ -4088,25 +4377,34 @@ class MemoryDatabase implements Database {
     input: Pick<PersistManualEventInput, "organizationId" | "projectId" | "boundWebhookTrigger">,
   ): void {
     const binding = input.boundWebhookTrigger;
-    if (binding !== undefined) {
-      const trigger = this.organizationTriggers.get(binding.id);
-      const project = this.projects.get(input.projectId);
-      if (
-        trigger?.organizationId !== input.organizationId ||
-        !trigger.enabled ||
-        trigger.name !== binding.name ||
-        trigger.runtimeProjectId !== input.projectId ||
-        project?.organizationId !== input.organizationId ||
-        project.status !== "active" ||
-        project.activeConfigurationRevisionId !== binding.configurationRevisionId ||
-        !hasBoundWebhookEvidence(
-          this.configurationRevisions.get(binding.configurationRevisionId)?.sourceEvidence,
-          binding.id,
-        )
-      ) {
-        throw new ManualRunRejected("configuration_not_found");
-      }
+    if (binding === undefined) return;
+    const trigger = this.organizationTriggers.get(binding.id);
+    const project = this.projects.get(input.projectId);
+    if (
+      trigger?.organizationId !== input.organizationId ||
+      !trigger.enabled ||
+      trigger.name !== binding.name ||
+      trigger.runtimeProjectId !== input.projectId ||
+      !this.matchesBoundWebhookProject(project, input, binding)
+    ) {
+      throw new ManualRunRejected("configuration_not_found");
     }
+  }
+
+  private matchesBoundWebhookProject(
+    project: ProjectRecord | undefined,
+    input: Pick<PersistManualEventInput, "organizationId">,
+    binding: NonNullable<PersistManualEventInput["boundWebhookTrigger"]>,
+  ): boolean {
+    return (
+      project?.organizationId === input.organizationId &&
+      project.status === "active" &&
+      project.activeConfigurationRevisionId === binding.configurationRevisionId &&
+      hasBoundWebhookEvidence(
+        this.configurationRevisions.get(binding.configurationRevisionId)?.sourceEvidence,
+        binding.id,
+      )
+    );
   }
 
   private assertBoundWebhookReceipt(
@@ -4215,12 +4513,25 @@ class MemoryDatabase implements Database {
       receipt.providerApplicationId !== owner.providerApplicationId
     )
       return;
-    const connection = this.githubConnections.get(receipt.installationId);
-    const bound =
-      receipt.connectionId === null || receipt.connectionId === connection?.id
-        ? connection
-        : undefined;
+    const bound = this.findBoundMemorySyncConnection(receipt);
     if (bound !== undefined && bound.providerApplicationId !== owner.providerApplicationId) return;
+    this.applyMemorySyncResult(receipt, bound, result);
+  }
+
+  private findBoundMemorySyncConnection(
+    receipt: MemoryGitHubSync,
+  ): GitHubConnectionRecord | undefined {
+    const connection = this.githubConnections.get(receipt.installationId);
+    return receipt.connectionId === null || receipt.connectionId === connection?.id
+      ? connection
+      : undefined;
+  }
+
+  private applyMemorySyncResult(
+    receipt: MemoryGitHubSync,
+    bound: GitHubConnectionRecord | undefined,
+    result: GitHubInstallationSyncResult,
+  ): void {
     if (bound === undefined) {
       if (receipt.connectionId !== null) receipt.retryAt = null;
       else if (result.status === "absent")
@@ -4439,16 +4750,17 @@ class MemoryDatabase implements Database {
       this.providerEventReceipts.get(attachment.providerEventReceiptId)?.payloadExpiryState != null
     )
       return undefined;
-    const stepRun =
-      execution.workflowStepRunId === null
-        ? undefined
-        : this.workflowStepRuns.get(execution.workflowStepRunId);
-    const triggerRun =
-      stepRun === undefined ? undefined : this.triggerRuns.get(stepRun.triggerRunId);
+    const triggerRun = this.findAttachmentTriggerRun(execution.workflowStepRunId);
     return execution.organizationId === attachment.organizationId &&
       triggerRun?.providerEventReceiptId === attachment.providerEventReceiptId
       ? attachment
       : undefined;
+  }
+
+  private findAttachmentTriggerRun(workflowStepRunId: string | null) {
+    const stepRun =
+      workflowStepRunId === null ? undefined : this.workflowStepRuns.get(workflowStepRunId);
+    return stepRun === undefined ? undefined : this.triggerRuns.get(stepRun.triggerRunId);
   }
 
   async insertMachine(input: InsertMachineInput): Promise<MachineRecord> {
@@ -4522,24 +4834,7 @@ class MemoryDatabase implements Database {
       completedByAgentAt: null,
       deadlineAt,
       idleDeadlineAt,
-      result: input.result ?? null,
-      triggerContext: input.triggerContext,
-      outputContext: input.outputContext,
-      reactionState: input.reactionState ?? null,
-      configurationRevisionId: input.configurationRevisionId,
-      completionTokenHash: input.completionTokenHash ?? null,
-      replyClaimedAt: null,
-      replyClaimCount: 0,
-      outputEmissions: {},
-      outputDeliveryAttempts: {},
-      launchIntent: input.launchIntent ?? null,
-      usedTemporaryCredentials: temporaryCredentialFact(input.launchIntent ?? null),
-      launchIntentExpiredAt: null,
-      launchRunId: null,
-      launchAgent: null,
-      daemonId: input.daemonId ?? null,
-      daemonAgentId: null,
-      workflowStepRunId: input.workflowStepRunId ?? null,
+      ...initialAgentExecutionPayload(input),
       hubAction: null,
       hubActionCompletedAt: null,
       hubActionReadyAt: null,
@@ -4649,10 +4944,7 @@ class MemoryDatabase implements Database {
     credential: { id: string; prefix: string; verifier: string };
   }): Promise<CliAuthorizationPollResult> {
     const now = this.options.now?.() ?? new Date();
-    const authorization = this.cliAuthorizations.get(input.deviceVerifier);
-    if (authorization !== undefined && authorization.expiresAt <= now) {
-      authorization.status = "expired";
-    }
+    const authorization = this.getCliAuthorizationForPoll(input.deviceVerifier, now);
     if (authorization === undefined || authorization.status === "expired") {
       return {
         status: "expired",
@@ -4665,6 +4957,27 @@ class MemoryDatabase implements Database {
         intervalSeconds: authorization.pollIntervalSeconds,
       };
     }
+    return this.pollActiveCliAuthorization(authorization, input, now);
+  }
+
+  // Approval sets the organization alongside the status.
+  private getCliAuthorizationForPoll(
+    deviceVerifier: string,
+    now: Date,
+  ): MemoryCliAuthorizationForPoll | undefined;
+  private getCliAuthorizationForPoll(deviceVerifier: string, now: Date) {
+    const authorization = this.cliAuthorizations.get(deviceVerifier);
+    if (authorization !== undefined && authorization.expiresAt <= now) {
+      authorization.status = "expired";
+    }
+    return authorization;
+  }
+
+  private pollActiveCliAuthorization(
+    authorization: MemoryCliAuthorizationForPoll,
+    input: Parameters<Database["pollCliAuthorization"]>[0],
+    now: Date,
+  ): CliAuthorizationPollResult {
     if (authorization.nextPollAt > now) {
       authorization.pollIntervalSeconds += 5;
       authorization.nextPollAt = new Date(
@@ -4676,13 +4989,14 @@ class MemoryDatabase implements Database {
       };
     }
     authorization.nextPollAt = new Date(now.getTime() + authorization.pollIntervalSeconds * 1_000);
+    const record: MemoryCliAuthorization = authorization;
     if (authorization.status === "approved") {
-      authorization.credential = input.credential;
-      authorization.status = "disclosed";
+      record.credential = input.credential;
+      record.status = "disclosed";
       return {
         status: "authorized",
         intervalSeconds: authorization.pollIntervalSeconds,
-        organizationId: authorization.approvedOrganizationId!,
+        organizationId: authorization.approvedOrganizationId,
       };
     }
     return {
@@ -4860,18 +5174,8 @@ class MemoryDatabase implements Database {
     ) {
       return this.projectExecutionPayload(execution);
     }
-    if (execution.workflowStepRunId !== null) {
-      const step = this.workflowStepRuns.get(execution.workflowStepRunId);
-      const run = step === undefined ? undefined : this.triggerRuns.get(step.triggerRunId);
-      if (
-        step === undefined ||
-        step.status !== "running" ||
-        run === undefined ||
-        run.status !== "running" ||
-        run.deadlineAt.getTime() <= processedAt.getTime()
-      ) {
-        return this.projectExecutionPayload(execution);
-      }
+    if (this.workflowBlocksIdleDeadlineRefresh(execution.workflowStepRunId, processedAt)) {
+      return this.projectExecutionPayload(execution);
     }
     const boundedIdleDeadlineAt = capIdleDeadline(idleDeadlineAt, execution.deadlineAt);
     const updated = { ...execution, idleDeadlineAt: boundedIdleDeadlineAt };
@@ -4883,6 +5187,22 @@ class MemoryDatabase implements Database {
       }
     }
     return updated;
+  }
+
+  private workflowBlocksIdleDeadlineRefresh(
+    workflowStepRunId: string | null,
+    processedAt: Date,
+  ): boolean {
+    if (workflowStepRunId === null) return false;
+    const step = this.workflowStepRuns.get(workflowStepRunId);
+    const run = step === undefined ? undefined : this.triggerRuns.get(step.triggerRunId);
+    return (
+      step === undefined ||
+      step.status !== "running" ||
+      run === undefined ||
+      run.status !== "running" ||
+      run.deadlineAt.getTime() <= processedAt.getTime()
+    );
   }
 
   async prepareAgentExecutionForDispatch(
@@ -5004,21 +5324,7 @@ class MemoryDatabase implements Database {
         );
       })
       .sort((left, right) => compareRunsNewestFirst(runOrder(left.run), runOrder(right.run)));
-    const bound = request.position;
-    const boundMicros =
-      bound === undefined ? undefined : activityTimestampMicros(bound.key.createdAt);
-    const inRange = records.filter(({ run }) => {
-      if (bound === undefined || boundMicros === undefined) return true;
-      const order = compareRunsNewestFirst(runOrder(run), {
-        micros: boundMicros,
-        id: bound.key.id,
-      });
-      return bound.direction === "before" ? order > 0 : order < 0;
-    });
-    const page =
-      bound?.direction === "after"
-        ? inRange.slice(Math.max(0, inRange.length - request.limit))
-        : inRange.slice(0, request.limit);
+    const page = sliceActivityRuns(records, request);
     const first = page[0]?.run;
     const last = page.at(-1)?.run;
     const key = (run: { createdAt: Date; id: string }) => ({
@@ -5180,24 +5486,27 @@ class MemoryDatabase implements Database {
     if (isTerminalAgentExecutionStatus(execution.status)) {
       return { execution: this.projectExecutionPayload(execution), transitioned: false };
     }
-    if (fields.deadlineCondition !== undefined) {
-      const current =
-        fields.deadlineCondition.kind === "hard" ? execution.deadlineAt : execution.idleDeadlineAt;
-      if (
-        current?.getTime() !== fields.deadlineCondition.deadlineAt.getTime() ||
-        current.getTime() > fields.deadlineCondition.observedAt.getTime()
-      ) {
-        return { execution, transitioned: false };
-      }
+    if (agentExecutionDeadlineConditionFailed(execution, fields.deadlineCondition)) {
+      return { execution, transitioned: false };
     }
 
+    const updated = this.applyAgentExecutionTransition(execution, toStatus, fields);
+    this.agentExecutions.set(id, updated);
+    return { execution: updated, transitioned: true };
+  }
+
+  private applyAgentExecutionTransition(
+    execution: AgentExecutionRecord,
+    toStatus: AgentExecutionStatus,
+    fields: TransitionAgentExecutionFields,
+  ): AgentExecutionRecord {
     let hubActionCompletedAt = execution.hubActionCompletedAt;
     let hubActionReadyAt = execution.hubActionReadyAt;
     if (fields.hubAction !== undefined) {
       hubActionCompletedAt = fields.hubAction === null ? this.now() : null;
       hubActionReadyAt = null;
     }
-    const updated: AgentExecutionRecord = {
+    return {
       ...execution,
       status: toStatus,
       completedAt: isTerminalAgentExecutionStatus(toStatus) ? this.now() : execution.completedAt,
@@ -5211,9 +5520,6 @@ class MemoryDatabase implements Database {
       hubActionCompletedAt,
       hubActionReadyAt,
     };
-
-    this.agentExecutions.set(id, updated);
-    return { execution: updated, transitioned: true };
   }
 
   async findRunningAgentExecutionsForMachine(machineId: string): Promise<AgentExecutionRecord[]> {
@@ -5232,7 +5538,7 @@ class MemoryDatabase implements Database {
 
   async findPendingHubActions(
     daemonId?: string,
-    scope?: import("./types.js").PendingHubActionScope,
+    scope?: PendingHubActionScope,
   ): Promise<AgentExecutionRecord[]> {
     const pending = Array.from(this.agentExecutions.values()).filter(
       (execution) =>
@@ -5264,10 +5570,7 @@ class MemoryDatabase implements Database {
       execution.hubAction !== "archive" ||
       execution.hubActionCompletedAt !== null ||
       execution.hubActionReadyAt !== null ||
-      execution.hubActionAcknowledgements.terminalAt === null ||
-      execution.hubActionAcknowledgements.idleAt === null ||
-      execution.hubActionAcknowledgements.finishExecutionCall === null ||
-      execution.hubActionAcknowledgements.finishExecutionCall.status !== "completed"
+      !hasCompletedHubActionAcknowledgements(execution.hubActionAcknowledgements)
     ) {
       return undefined;
     }
@@ -5303,20 +5606,7 @@ class MemoryDatabase implements Database {
         updatedAcknowledgements.idleAt = acknowledgement.observedAt;
       }
     } else {
-      const previous = updatedAcknowledgements.finishExecutionCall;
-      if (
-        previous === undefined ||
-        previous === null ||
-        (previous.status !== "completed" &&
-          (acknowledgement.status === "completed" ||
-            acknowledgement.observedAt.getTime() > previous.observedAt.getTime()))
-      ) {
-        updatedAcknowledgements.finishExecutionCall = {
-          callId: acknowledgement.callId ?? null,
-          status: acknowledgement.status,
-          observedAt: acknowledgement.observedAt,
-        };
-      }
+      applyFinishExecutionAcknowledgement(updatedAcknowledgements, acknowledgement);
     }
     const updated = { ...execution, hubActionAcknowledgements: updatedAcknowledgements };
     this.agentExecutions.set(executionId, updated);
@@ -5572,15 +5862,9 @@ class MemoryDatabase implements Database {
     return record;
   }
 
-  private readonly authorityRecords = new Map<
-    string,
-    import("../execution-authority/index.js").ExecutionAuthorityRecord
-  >();
-  private readonly authorityLeases = new Map<
-    string,
-    import("../execution-authority/index.js").ExecutionCredentialLease
-  >();
-  readonly executionAuthority: import("../execution-authority/index.js").ExecutionAuthorityStore = {
+  private readonly authorityRecords = new Map<string, ExecutionAuthorityRecord>();
+  private readonly authorityLeases = new Map<string, ExecutionCredentialLease>();
+  readonly executionAuthority: ExecutionAuthorityStore = {
     executions: async () => [...this.authorityRecords.keys()],
     read: async (id) => structuredClone(this.authorityRecords.get(id)),
     commit: async (record) => {
@@ -5605,10 +5889,7 @@ class MemoryDatabase implements Database {
     },
   };
 
-  private readonly agentSessions = new Map<
-    string,
-    import("../agent-sessions/index.js").AgentSessionRecord
-  >();
+  private readonly agentSessions = new Map<string, AgentSessionRecord>();
   private readonly agentSessionCreatedAt = new Map<string, Date>();
   async findAgentSession(id: string) {
     return structuredClone(this.agentSessions.get(id));
@@ -5620,9 +5901,7 @@ class MemoryDatabase implements Database {
       ),
     );
   }
-  async saveAgentSession(
-    session: import("../agent-sessions/index.js").AgentSessionRecord,
-  ): Promise<void> {
+  async saveAgentSession(session: AgentSessionRecord): Promise<void> {
     const current = this.agentSessions.get(session.id);
     if (current === undefined) this.agentSessionCreatedAt.set(session.id, new Date());
     if (current?.optionsReducedAt != null) {
@@ -5636,7 +5915,7 @@ class MemoryDatabase implements Database {
   async attachExecutionToSession(
     executionId: string,
     sessionId: string,
-    action?: import("../agent-sessions/index.js").AgentSessionAction,
+    action?: AgentSessionAction,
   ): Promise<void> {
     const execution = this.agentExecutions.get(executionId);
     const session = this.agentSessions.get(sessionId);
@@ -5739,100 +6018,10 @@ class MemoryDatabase implements Database {
     ) {
       throw new Error("project configuration changed during trigger migration");
     }
-    const compiledCandidates = input.triggers.map((candidate) => {
-      if (candidate.format !== "single_run" && candidate.format !== "legacy_multistep") {
-        throw new Error("invalid organization trigger format");
-      }
-      return parseCompiledHubConfig(candidate.normalizedConfiguration);
-    });
-    const legacyRoutes = this.projectTriggerRoutes.get(input.projectId) ?? [];
-    const candidateRoutes = input.triggers.map((candidate, index) => {
-      const configuredEventName = compiledCandidates[index]!.triggers[0]?.on;
-      if (configuredEventName === undefined) {
-        throw new Error(`migrated trigger ${candidate.name} has no configured event`);
-      }
-      return legacyRoutes
-        .filter((route) => route.triggerName === candidate.name)
-        .map(
-          (route): OrganizationTriggerRoute => ({
-            provider: route.provider,
-            connectionId: route.connectionId,
-            resourceId: route.resourceId,
-            configuredEventName,
-          }),
-        );
-    });
-    if (
-      candidateRoutes.reduce((total, routes) => total + routes.length, 0) !== legacyRoutes.length
-    ) {
-      throw new Error("project trigger routes do not match migrated triggers");
-    }
+    const plans = this.planMigratedTriggers(input);
     const created: OrganizationTriggerRecord[] = [];
-    for (const [index, candidate] of input.triggers.entries()) {
-      const name = this.availableMigratedTriggerName(
-        input.organizationId,
-        input.projectSlug,
-        candidate.name,
-      );
-      const now = this.now();
-      const triggerId = randomUUID();
-      const revisionId = randomUUID();
-      const runtimeProjectId = this.createTriggerRuntimeProject({
-        organizationId: input.organizationId,
-        name: candidate.name,
-        createdByUserId: null,
-      });
-      const trigger: OrganizationTriggerRecord = {
-        id: triggerId,
-        organizationId: input.organizationId,
-        name,
-        enabled: candidate.enabled,
-        format: candidate.format,
-        runtimeProjectId,
-        activeRevisionId: revisionId,
-        createdAt: now,
-        updatedAt: now,
-      };
-      const revision: OrganizationTriggerRevisionRecord = {
-        id: revisionId,
-        triggerId,
-        organizationId: input.organizationId,
-        version: 1,
-        yaml: candidate.yaml,
-        normalizedConfiguration: candidate.normalizedConfiguration,
-        contentHash: candidate.contentHash,
-        sourceKind: "project_migration",
-        sourceEvidence: candidate.sourceEvidence,
-        createdByUserId: null,
-        createdAt: now,
-      };
-      this.organizationTriggers.set(trigger.id, trigger);
-      this.organizationTriggerRevisions.set(revision.id, revision);
-      const routes = candidateRoutes[index]!;
-      this.organizationTriggerRoutes.set(trigger.id, routes);
-      const runtimeRevision = await this.insertProjectConfigurationRevision({
-        projectId: runtimeProjectId,
-        sourceKind: "manual",
-        sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
-        rawYaml: candidate.yaml,
-        normalizedConfiguration: candidate.normalizedConfiguration,
-        contentHash: candidate.contentHash,
-      });
-      const configuration = compiledCandidates[index]!;
-      await this.activateProjectConfigurationRevision(
-        runtimeProjectId,
-        runtimeRevision.id,
-        routes.map((route) => ({
-          provider: route.provider,
-          connectionId: route.connectionId,
-          resourceId: route.resourceId,
-          triggerName:
-            configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
-            configuration.triggers[0]?.name ??
-            candidate.name,
-        })),
-      );
-      created.push(trigger);
+    for (const plan of plans) {
+      created.push(await this.createMigratedTrigger(input, plan));
     }
     this.projectTriggerRoutes.delete(input.projectId);
     this.projects.set(input.projectId, {
@@ -5844,6 +6033,101 @@ class MemoryDatabase implements Database {
     });
     this.migratedProjects.add(input.projectId);
     return created;
+  }
+
+  private planMigratedTriggers(input: MigrateProjectTriggersInput): MemoryTriggerMigrationPlan[] {
+    const compiled = input.triggers.map((candidate) => {
+      if (candidate.format !== "single_run" && candidate.format !== "legacy_multistep") {
+        throw new Error("invalid organization trigger format");
+      }
+      return {
+        candidate,
+        configuration: parseCompiledHubConfig(candidate.normalizedConfiguration),
+      };
+    });
+    const legacyRoutes = this.projectTriggerRoutes.get(input.projectId) ?? [];
+    const plans = compiled.map(({ candidate, configuration }) => {
+      const configuredEventName = configuration.triggers[0]?.on;
+      if (configuredEventName === undefined) {
+        throw new Error(`migrated trigger ${candidate.name} has no configured event`);
+      }
+      const routes = legacyRoutes
+        .filter((route) => route.triggerName === candidate.name)
+        .map(
+          (route): OrganizationTriggerRoute => ({
+            provider: route.provider,
+            connectionId: route.connectionId,
+            resourceId: route.resourceId,
+            configuredEventName,
+          }),
+        );
+      return { candidate, configuration, routes };
+    });
+    if (plans.reduce((total, { routes }) => total + routes.length, 0) !== legacyRoutes.length) {
+      throw new Error("project trigger routes do not match migrated triggers");
+    }
+    return plans;
+  }
+
+  private async createMigratedTrigger(
+    input: MigrateProjectTriggersInput,
+    plan: MemoryTriggerMigrationPlan,
+  ): Promise<OrganizationTriggerRecord> {
+    const { candidate, configuration, routes } = plan;
+    const name = this.availableMigratedTriggerName(
+      input.organizationId,
+      input.projectSlug,
+      candidate.name,
+    );
+    const now = this.now();
+    const triggerId = randomUUID();
+    const revisionId = randomUUID();
+    const runtimeProjectId = this.createTriggerRuntimeProject({
+      organizationId: input.organizationId,
+      name: candidate.name,
+      createdByUserId: null,
+    });
+    const trigger: OrganizationTriggerRecord = {
+      id: triggerId,
+      organizationId: input.organizationId,
+      name,
+      enabled: candidate.enabled,
+      format: candidate.format,
+      runtimeProjectId,
+      activeRevisionId: revisionId,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const revision: OrganizationTriggerRevisionRecord = {
+      id: revisionId,
+      triggerId,
+      organizationId: input.organizationId,
+      version: 1,
+      yaml: candidate.yaml,
+      normalizedConfiguration: candidate.normalizedConfiguration,
+      contentHash: candidate.contentHash,
+      sourceKind: "project_migration",
+      sourceEvidence: candidate.sourceEvidence,
+      createdByUserId: null,
+      createdAt: now,
+    };
+    this.organizationTriggers.set(trigger.id, trigger);
+    this.organizationTriggerRevisions.set(revision.id, revision);
+    this.organizationTriggerRoutes.set(trigger.id, routes);
+    const runtimeRevision = await this.insertProjectConfigurationRevision({
+      projectId: runtimeProjectId,
+      sourceKind: "manual",
+      sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
+      rawYaml: candidate.yaml,
+      normalizedConfiguration: candidate.normalizedConfiguration,
+      contentHash: candidate.contentHash,
+    });
+    await this.activateProjectConfigurationRevision(
+      runtimeProjectId,
+      runtimeRevision.id,
+      runtimeTriggerRoutes(routes, configuration, candidate.name),
+    );
+    return trigger;
   }
 
   async listOrganizationTriggers(organizationId: string): Promise<OrganizationTriggerRecord[]> {
@@ -5948,21 +6232,7 @@ class MemoryDatabase implements Database {
     const routes = input.enabled
       ? organizationTriggerRoutesForSave(configuration, input.routes, linearConnectionIds)
       : [];
-    const existing =
-      input.triggerId === undefined ? undefined : this.organizationTriggers.get(input.triggerId);
-    if (existing !== undefined && existing.organizationId !== input.organizationId) {
-      throw new Error("organization trigger not found");
-    }
-    if (
-      Array.from(this.organizationTriggers.values()).some(
-        (trigger) =>
-          trigger.organizationId === input.organizationId &&
-          trigger.name === input.name &&
-          trigger.id !== input.triggerId,
-      )
-    ) {
-      throw new Error("trigger name already exists");
-    }
+    const existing = this.findSaveableTrigger(input);
     const now = this.now();
     const triggerId = existing?.id ?? randomUUID();
     const runtimeProjectId =
@@ -5972,19 +6242,48 @@ class MemoryDatabase implements Database {
         name: input.name,
         createdByUserId: input.createdByUserId,
       });
+    const { trigger, revision } = this.buildSavedTriggerRecords(input, {
+      existing,
+      triggerId,
+      runtimeProjectId,
+      now,
+    });
+    this.organizationTriggerRevisions.set(revision.id, revision);
+    this.organizationTriggers.set(trigger.id, trigger);
+    this.organizationTriggerRoutes.set(trigger.id, routes);
+    const runtimeRevision = await this.insertProjectConfigurationRevision({
+      projectId: runtimeProjectId,
+      sourceKind: input.sourceKind,
+      sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
+      rawYaml: input.yaml,
+      normalizedConfiguration: input.normalizedConfiguration,
+      contentHash: input.contentHash,
+      createdByUserId: input.createdByUserId,
+    });
+    await this.activateProjectConfigurationRevision(
+      runtimeProjectId,
+      runtimeRevision.id,
+      runtimeTriggerRoutes(routes, configuration, input.name),
+    );
+    return trigger;
+  }
+
+  private buildSavedTriggerRecords(
+    input: SaveOrganizationTriggerInput,
+    base: {
+      existing: OrganizationTriggerRecord | undefined;
+      triggerId: string;
+      runtimeProjectId: string;
+      now: Date;
+    },
+  ): { trigger: OrganizationTriggerRecord; revision: OrganizationTriggerRevisionRecord } {
+    const { existing, triggerId, runtimeProjectId, now } = base;
     const revisionId = randomUUID();
-    const version =
-      Math.max(
-        0,
-        ...Array.from(this.organizationTriggerRevisions.values())
-          .filter((revision) => revision.triggerId === triggerId)
-          .map((revision) => revision.version),
-      ) + 1;
     const revision: OrganizationTriggerRevisionRecord = {
       id: revisionId,
       triggerId,
       organizationId: input.organizationId,
-      version,
+      version: this.nextTriggerRevisionVersion(triggerId),
       yaml: input.yaml,
       normalizedConfiguration: input.normalizedConfiguration,
       contentHash: input.contentHash,
@@ -6004,32 +6303,39 @@ class MemoryDatabase implements Database {
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
-    this.organizationTriggerRevisions.set(revision.id, revision);
-    this.organizationTriggers.set(trigger.id, trigger);
-    this.organizationTriggerRoutes.set(trigger.id, routes);
-    const runtimeRevision = await this.insertProjectConfigurationRevision({
-      projectId: runtimeProjectId,
-      sourceKind: input.sourceKind,
-      sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
-      rawYaml: input.yaml,
-      normalizedConfiguration: input.normalizedConfiguration,
-      contentHash: input.contentHash,
-      createdByUserId: input.createdByUserId,
-    });
-    await this.activateProjectConfigurationRevision(
-      runtimeProjectId,
-      runtimeRevision.id,
-      routes.map((route) => ({
-        provider: route.provider,
-        connectionId: route.connectionId,
-        resourceId: route.resourceId,
-        triggerName:
-          configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
-          configuration.triggers[0]?.name ??
-          input.name,
-      })),
+    return { trigger, revision };
+  }
+
+  private findSaveableTrigger(
+    input: SaveOrganizationTriggerInput,
+  ): OrganizationTriggerRecord | undefined {
+    const existing =
+      input.triggerId === undefined ? undefined : this.organizationTriggers.get(input.triggerId);
+    if (existing !== undefined && existing.organizationId !== input.organizationId) {
+      throw new Error("organization trigger not found");
+    }
+    if (
+      Array.from(this.organizationTriggers.values()).some(
+        (trigger) =>
+          trigger.organizationId === input.organizationId &&
+          trigger.name === input.name &&
+          trigger.id !== input.triggerId,
+      )
+    ) {
+      throw new Error("trigger name already exists");
+    }
+    return existing;
+  }
+
+  private nextTriggerRevisionVersion(triggerId: string): number {
+    return (
+      Math.max(
+        0,
+        ...Array.from(this.organizationTriggerRevisions.values())
+          .filter((revision) => revision.triggerId === triggerId)
+          .map((revision) => revision.version),
+      ) + 1
     );
-    return trigger;
   }
 
   private createTriggerRuntimeProject(input: {
@@ -6332,21 +6638,21 @@ class MemoryDatabase implements Database {
       sourceState:
         authority === "manual"
           ? ({ kind: "manual", formattingPreserved: false } as const)
-          : ({
-              kind: "github",
-              githubConnectionId:
-                this.githubConfigurationSources.get(projectId)?.githubConnectionId ?? "unavailable",
-              githubRepositoryId:
-                this.githubConfigurationSources.get(projectId)?.githubRepositoryId ?? 0,
-              githubRepositoryFullName:
-                this.githubConfigurationSources.get(projectId)?.githubRepositoryFullName ??
-                "unavailable",
-              githubDefaultBranch:
-                this.githubConfigurationSources.get(projectId)?.githubDefaultBranch ?? "main",
-              automaticDeploymentEnabled:
-                this.githubConfigurationSources.get(projectId)?.automaticDeploymentEnabled ?? false,
-            } as const),
+          : this.githubConfigurationSourceState(projectId),
     };
+  }
+
+  private githubConfigurationSourceState(projectId: string) {
+    const source: Partial<SetProjectGitHubConfigurationSourceInput> =
+      this.githubConfigurationSources.get(projectId) ?? {};
+    return {
+      kind: "github",
+      githubConnectionId: source.githubConnectionId ?? "unavailable",
+      githubRepositoryId: source.githubRepositoryId ?? 0,
+      githubRepositoryFullName: source.githubRepositoryFullName ?? "unavailable",
+      githubDefaultBranch: source.githubDefaultBranch ?? "main",
+      automaticDeploymentEnabled: source.automaticDeploymentEnabled ?? false,
+    } as const;
   }
 
   async getHomeChecklistCompletedAt(organizationId: string): Promise<Date | null> {
@@ -6563,10 +6869,7 @@ class MemoryDatabase implements Database {
           source: receipt.source,
           status: run.status,
           receivedAt: receipt.receivedAt,
-          agent:
-            run.payloadExpiredAt == null
-              ? launchedAgent(execution?.launchIntent?.agent)
-              : (launchedAgent(step?.payloadSummary) ?? launchedAgent(execution?.launchAgent)),
+          agent: organizationRunAgent(run, step, execution),
           payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
         },
       ];
@@ -6634,6 +6937,13 @@ class MemoryDatabase implements Database {
     if (bound != null) return bound;
     const [route, other] = receipt.acceptedRoutes ?? [];
     if (route === undefined || other !== undefined) return null;
+    return this.singleRunTriggerForDroppedRoute(receipt, route);
+  }
+
+  private singleRunTriggerForDroppedRoute(
+    receipt: ProviderEventReceiptRecord,
+    route: { projectId: string },
+  ) {
     const triggers = [...this.organizationTriggers.values()].filter(
       (trigger) =>
         trigger.organizationId === receipt.organizationId &&
@@ -6913,44 +7223,15 @@ class MemoryDatabase implements Database {
     return attachment;
   }
 
-  private async acceptMemoryEvent(
-    input:
-      | AcceptGitHubEventInput
-      | AcceptDiscordEventInput
-      | AcceptSlackEventInput
-      | AcceptLinearEventInput,
-    organizationId: string | undefined,
-    connectionId: string | undefined,
-    resourceId: string | null,
-    reason: string | undefined,
-  ): Promise<ProviderEventAcceptance> {
+  private async acceptMemoryEvent({
+    input,
+    organizationId,
+    connectionId,
+    resourceId,
+    reason,
+  }: MemoryEventBinding): Promise<ProviderEventAcceptance> {
     const receiptId = this.findReceiptId(organizationId, input.deliveryId, input.signatureHash);
-    if (receiptId !== undefined) {
-      const receipt = this.providerEventReceipts.get(receiptId);
-      if (receipt === undefined) throw new Error("provider receipt unavailable");
-      const marked = markedProviderReplay(receipt);
-      if (marked !== undefined) return marked;
-      if (receipt.droppedReason !== null) {
-        return { status: "dropped", receiptId, reason: receipt.droppedReason };
-      }
-      if (receipt.acceptedRoutes === null) return { status: "duplicate", receiptId };
-      return {
-        status: "accepted",
-        receiptId,
-        events: receipt.acceptedRoutes.map((route) => ({
-          providerEventReceiptId: receipt.id,
-          organizationId: receipt.organizationId,
-          projectId: route.projectId,
-          configurationRevisionId: route.configurationRevisionId,
-          deliveryId: receipt.deliveryId,
-          source: receipt.source,
-          payload: receipt.payload,
-          receivedAt: receipt.receivedAt,
-          connectionId: route.connectionId,
-          resourceId: route.resourceId,
-        })),
-      };
-    }
+    if (receiptId !== undefined) return this.replayMemoryEvent(receiptId);
     if (organizationId === undefined || connectionId === undefined) {
       return {
         status: "dropped",
@@ -6958,6 +7239,43 @@ class MemoryDatabase implements Database {
         reason: reason ?? "provider_unbound",
       };
     }
+    return this.acceptBoundMemoryEvent({ input, organizationId, connectionId, resourceId, reason });
+  }
+
+  private replayMemoryEvent(receiptId: string): ProviderEventAcceptance {
+    const receipt = this.providerEventReceipts.get(receiptId);
+    if (receipt === undefined) throw new Error("provider receipt unavailable");
+    const marked = markedProviderReplay(receipt);
+    if (marked !== undefined) return marked;
+    if (receipt.droppedReason !== null) {
+      return { status: "dropped", receiptId, reason: receipt.droppedReason };
+    }
+    if (receipt.acceptedRoutes === null) return { status: "duplicate", receiptId };
+    return {
+      status: "accepted",
+      receiptId,
+      events: receipt.acceptedRoutes.map((route) => ({
+        providerEventReceiptId: receipt.id,
+        organizationId: receipt.organizationId,
+        projectId: route.projectId,
+        configurationRevisionId: route.configurationRevisionId,
+        deliveryId: receipt.deliveryId,
+        source: receipt.source,
+        payload: receipt.payload,
+        receivedAt: receipt.receivedAt,
+        connectionId: route.connectionId,
+        resourceId: route.resourceId,
+      })),
+    };
+  }
+
+  private acceptBoundMemoryEvent({
+    input,
+    organizationId,
+    connectionId,
+    resourceId,
+    reason,
+  }: BoundMemoryEvent): ProviderEventAcceptance {
     const provider = providerForInput(input);
     if (provider === "linear" && reason === "unsupported_event") {
       return this.acceptUnsupportedLinearReceipt(input, organizationId, connectionId);
@@ -6981,23 +7299,20 @@ class MemoryDatabase implements Database {
         reason,
       };
     }
-    const routes = Array.from(this.projectTriggerRoutes.entries()).flatMap(
-      ([projectId, candidates]) => {
-        const project = this.projects.get(projectId);
-        return project?.organizationId === organizationId &&
-          project.status === "active" &&
-          project.activeConfigurationRevisionId !== null
-          ? candidates
-              .filter(
-                (route) =>
-                  route.provider === provider &&
-                  route.connectionId === connectionId &&
-                  (route.resourceId === null || route.resourceId === resourceId),
-              )
-              .map((route) => Object.assign({}, route, { projectId }))
-          : [];
-      },
-    );
+    return this.routeMemoryEvent(receipt, {
+      input,
+      organizationId,
+      connectionId,
+      resourceId,
+      provider,
+    });
+  }
+
+  private routeMemoryEvent(
+    receipt: ProviderEventReceiptRecord,
+    { input, organizationId, connectionId, resourceId, provider }: MemoryEventRouting,
+  ): ProviderEventAcceptance {
+    const routes = this.memoryEventRoutes({ organizationId, connectionId, resourceId, provider });
     if (routes.length === 0) {
       this.providerEventReceipts.set(receipt.id, {
         ...receipt,
@@ -7031,6 +7346,29 @@ class MemoryDatabase implements Database {
     }));
     this.providerEventReceipts.set(receipt.id, { ...receipt, acceptedRoutes });
     return { status: "accepted", events, receiptId: receipt.id };
+  }
+
+  private memoryEventRoutes({
+    organizationId,
+    connectionId,
+    resourceId,
+    provider,
+  }: Omit<MemoryEventRouting, "input">) {
+    return Array.from(this.projectTriggerRoutes.entries()).flatMap(([projectId, candidates]) => {
+      const project = this.projects.get(projectId);
+      return project?.organizationId === organizationId &&
+        project.status === "active" &&
+        project.activeConfigurationRevisionId !== null
+        ? candidates
+            .filter(
+              (route) =>
+                route.provider === provider &&
+                route.connectionId === connectionId &&
+                (route.resourceId === null || route.resourceId === resourceId),
+            )
+            .map((route) => Object.assign({}, route, { projectId }))
+        : [];
+    });
   }
 
   private findReceiptId(
@@ -7189,6 +7527,125 @@ class MemoryDatabase implements Database {
   }
 }
 
+function acceptedManualEvent(
+  input: PersistManualEventInput,
+  receipt: ProviderEventReceiptRecord,
+  route: { configurationRevisionId: string },
+): ManualEventPersistence {
+  return {
+    status: "accepted" as const,
+    event: {
+      providerEventReceiptId: receipt.id,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      configurationRevisionId: route.configurationRevisionId,
+      deliveryId: input.deliveryId,
+      source: input.source,
+      payload: input.payload,
+      receivedAt: input.receivedAt,
+      connectionId: input.connectionId ?? null,
+      resourceId: input.resourceId ?? null,
+    },
+  };
+}
+
+function newAcceptedTriggerRun(
+  input: CreateAcceptedTriggerRunInput,
+  now: Date,
+): AcceptedTriggerRunRecord {
+  return {
+    conversation: structuredClone(input.conversation ?? null),
+    id: input.id ?? randomUUID(),
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+    configurationRevisionId: input.configurationRevisionId,
+    providerEventReceiptId: input.providerEventReceiptId,
+    configuredTriggerName: input.configuredTriggerName,
+    outcome: "accepted",
+    status: "running",
+    prompt: input.prompt,
+    inputs: freezeEvidence(input.inputs),
+    values: freezeEvidence(input.values ?? {}),
+    triggerContext: freezeEvidence(input.triggerContext),
+    outputContext: freezeEvidence(input.outputContext),
+    deadlineAt: input.deadlineAt,
+    deadlineKind: null,
+    failureReason: null,
+    reactionState: null,
+    terminalNotificationPendingAt: null,
+    terminalNotificationDeliveredAt: null,
+    terminalNotificationLeaseExpiresAt: null,
+    createdAt: now,
+    completedAt: null,
+  };
+}
+
+function initialAgentExecutionPayload(input: InsertAgentExecutionInput) {
+  return {
+    result: input.result ?? null,
+    triggerContext: input.triggerContext,
+    outputContext: input.outputContext,
+    reactionState: input.reactionState ?? null,
+    configurationRevisionId: input.configurationRevisionId,
+    completionTokenHash: input.completionTokenHash ?? null,
+    replyClaimedAt: null,
+    replyClaimCount: 0,
+    outputEmissions: {},
+    outputDeliveryAttempts: {},
+    launchIntent: input.launchIntent ?? null,
+    usedTemporaryCredentials: temporaryCredentialFact(input.launchIntent ?? null),
+    launchIntentExpiredAt: null,
+    launchRunId: null,
+    launchAgent: null,
+    daemonId: input.daemonId ?? null,
+    daemonAgentId: null,
+    workflowStepRunId: input.workflowStepRunId ?? null,
+  };
+}
+
+function agentExecutionDeadlineConditionFailed(
+  execution: AgentExecutionRecord,
+  condition: TransitionAgentExecutionFields["deadlineCondition"],
+): boolean {
+  if (condition === undefined) return false;
+  const current = condition.kind === "hard" ? execution.deadlineAt : execution.idleDeadlineAt;
+  return (
+    current?.getTime() !== condition.deadlineAt.getTime() ||
+    current.getTime() > condition.observedAt.getTime()
+  );
+}
+
+function hasCompletedHubActionAcknowledgements(
+  acknowledgements: AgentExecutionHubAcknowledgements,
+): boolean {
+  return !(
+    acknowledgements.terminalAt === null ||
+    acknowledgements.idleAt === null ||
+    acknowledgements.finishExecutionCall === null ||
+    acknowledgements.finishExecutionCall.status !== "completed"
+  );
+}
+
+function applyFinishExecutionAcknowledgement(
+  updatedAcknowledgements: AgentExecutionHubAcknowledgements,
+  acknowledgement: Extract<AgentExecutionHubAcknowledgementInput, { kind: "finish_execution" }>,
+): void {
+  const previous = updatedAcknowledgements.finishExecutionCall;
+  if (
+    previous === undefined ||
+    previous === null ||
+    (previous.status !== "completed" &&
+      (acknowledgement.status === "completed" ||
+        acknowledgement.observedAt.getTime() > previous.observedAt.getTime()))
+  ) {
+    updatedAcknowledgements.finishExecutionCall = {
+      callId: acknowledgement.callId ?? null,
+      status: acknowledgement.status,
+      observedAt: acknowledgement.observedAt,
+    };
+  }
+}
+
 function emptyHubActionAcknowledgements(): AgentExecutionHubAcknowledgements {
   return { terminalAt: null, idleAt: null, finishExecutionCall: null };
 }
@@ -7197,13 +7654,30 @@ function connectionPersistenceUnavailable(): never {
   throw new Error("connection persistence requires PostgreSQL");
 }
 
-function providerForInput(
-  input:
-    | AcceptGitHubEventInput
-    | AcceptDiscordEventInput
-    | AcceptSlackEventInput
-    | AcceptLinearEventInput,
-): "github" | "discord" | "slack" | "linear" {
+type MemoryEventInput =
+  | AcceptGitHubEventInput
+  | AcceptDiscordEventInput
+  | AcceptSlackEventInput
+  | AcceptLinearEventInput;
+
+interface MemoryEventBinding {
+  input: MemoryEventInput;
+  organizationId: string | undefined;
+  connectionId: string | undefined;
+  resourceId: string | null;
+  reason: string | undefined;
+}
+
+interface BoundMemoryEvent extends MemoryEventBinding {
+  organizationId: string;
+  connectionId: string;
+}
+
+type MemoryEventRouting = Omit<BoundMemoryEvent, "reason"> & {
+  provider: ReturnType<typeof providerForInput>;
+};
+
+function providerForInput(input: MemoryEventInput): "github" | "discord" | "slack" | "linear" {
   if ("installationId" in input) return "github";
   if ("guildId" in input) return "discord";
   return "teamId" in input ? "slack" : "linear";
@@ -7263,6 +7737,115 @@ interface MemoryCliAuthorization extends CliAuthorizationRecord {
   credential: { id: string; prefix: string; verifier: string } | null;
 }
 
+type MemoryCliAuthorizationForPoll =
+  | (MemoryCliAuthorization & { status: "approved"; approvedOrganizationId: string })
+  | (MemoryCliAuthorization & { status: Exclude<MemoryCliAuthorization["status"], "approved"> });
+
+function isRunningAcceptedWorkflowRun(
+  run: TriggerRunRecord | undefined,
+): run is AcceptedTriggerRunRecord & { status: "running" } {
+  return run !== undefined && run.outcome === "accepted" && run.status === "running";
+}
+
+function workflowStepExecutionDeadlines(
+  input: WorkflowStepExecutionInput,
+  run: AcceptedTriggerRunRecord,
+) {
+  const deadlineAt = new Date(
+    Math.min(input.execution.deadlineAt.getTime(), run.deadlineAt.getTime()),
+  );
+  const idleDeadlineAt = new Date(
+    Math.min(input.execution.idleDeadlineAt.getTime(), deadlineAt.getTime()),
+  );
+  return { deadlineAt, idleDeadlineAt };
+}
+
+function workflowStepReservationDenied(
+  step: WorkflowStepRunRecord,
+  meter: string,
+  limit: number,
+  usage: { used: number } | undefined,
+) {
+  return {
+    stepRun: step,
+    execution: undefined,
+    created: false,
+    reservationDenied: { meter, limit, current: usage?.used ?? 0 },
+  };
+}
+
+function isCompletedWorkflowStep(step: WorkflowStepRunRecord) {
+  return step.status === "succeeded" || step.status === "failed" || step.status === "timed_out";
+}
+
+function isUnfinishedWorkflowStep(step: WorkflowStepRunRecord) {
+  return step.status === "pending" || step.status === "running";
+}
+
+function shouldProjectLinkedWorkflowStep(run: TriggerRunRecord | undefined) {
+  return run?.payloadExpiredAt != null || run?.status === "canceled";
+}
+
+function linkedWorkflowStep(
+  step: WorkflowStepRunRecord,
+  execution: AgentExecutionRecord,
+  executionId: string,
+  dispatchIntent: LaunchMachineIntent | undefined,
+) {
+  return {
+    ...step,
+    status:
+      step.status === "succeeded" || step.status === "failed" || step.status === "timed_out"
+        ? step.status
+        : ("running" as const),
+    agentExecutionId: executionId,
+    startedAt: step.startedAt ?? execution.startedAt,
+    ...(dispatchIntent === undefined ? {} : { dispatchIntent }),
+  };
+}
+
+function canFinishWorkflowStep(
+  run: TriggerRunRecord | undefined,
+  transitioned: TransitionAgentExecutionResult,
+  execution: AgentExecutionRecord,
+) {
+  return (
+    run?.status !== "canceled" &&
+    (transitioned.transitioned || isTerminalAgentExecutionStatus(execution.status))
+  );
+}
+
+function workflowStepCompletionFields(
+  step: WorkflowStepRunRecord,
+  input: WorkflowAgentCompletionInput,
+) {
+  return {
+    output: freezeEvidence(input.stepOutput !== undefined ? input.stepOutput : input.result),
+    failureReason: input.failureReason ?? null,
+    deadlineKind: input.deadlineKind ?? step.deadlineKind,
+  };
+}
+
+function workflowRunFailureStatus(input: WorkflowAgentCompletionInput) {
+  const stepStatus = input.stepStatus;
+  if (input.deadlineKind === "whole_run") return "timed_out";
+  return input.deadlineKind !== undefined ? "failed" : stepStatus;
+}
+
+function stepTimeoutReason(deadlineKind: Exclude<WorkflowDeadlineKind, "whole_run">) {
+  return deadlineKind === "step_idle" ? "step_idle_timeout" : "step_hard_timeout";
+}
+
+function canRecoverWorkflowWakeup(
+  run: TriggerRunRecord,
+  now: Date,
+  excludedRunIds: readonly string[],
+) {
+  if (run.status !== "running" || run.payloadExpiredAt != null || run.deadlineAt <= now)
+    return false;
+  return !excludedRunIds.includes(run.id);
+}
+
 function workflowDeadlineKind(
   execution: AgentExecutionRecord | undefined,
   step: WorkflowStepRunRecord,
@@ -7272,21 +7855,20 @@ function workflowDeadlineKind(
   if (run.status === "running" && run.deadlineAt <= observedAt) return "whole_run";
   const hardDeadline = execution?.deadlineAt ?? step.deadlineAt;
   const idleDeadline = execution?.idleDeadlineAt ?? step.idleDeadlineAt;
-  if (hardDeadline !== null && hardDeadline !== undefined && hardDeadline <= observedAt) {
-    if (
-      idleDeadline !== null &&
-      idleDeadline !== undefined &&
-      idleDeadline <= observedAt &&
-      idleDeadline < hardDeadline
-    ) {
-      return "step_idle";
-    }
-    return "step_hard";
+  return workflowStepDeadlineKind(hardDeadline, idleDeadline, observedAt);
+}
+
+function workflowStepDeadlineKind(
+  hardDeadline: Date | null | undefined,
+  idleDeadline: Date | null | undefined,
+  observedAt: Date,
+) {
+  if (hardDeadline != null && hardDeadline <= observedAt) {
+    return idleDeadline != null && idleDeadline <= observedAt && idleDeadline < hardDeadline
+      ? "step_idle"
+      : "step_hard";
   }
-  if (idleDeadline !== null && idleDeadline !== undefined && idleDeadline <= observedAt) {
-    return "step_idle";
-  }
-  return undefined;
+  return idleDeadline != null && idleDeadline <= observedAt ? "step_idle" : undefined;
 }
 
 function capIdleDeadline(
@@ -7329,6 +7911,47 @@ function hasBoundWebhookEvidence(evidence: unknown, id: string): boolean {
     "triggerId" in evidence &&
     evidence.triggerId === id
   );
+}
+
+interface RunStopAttempt {
+  approvedPeerIds: string[];
+  attemptId: string;
+  requestedAt: string;
+}
+
+function hasCompletedCanceledInterrupt(execution: AgentExecutionRecord): boolean {
+  return (
+    execution.hubAction === "interrupt" &&
+    execution.hubActionCompletedAt !== null &&
+    isCanceledExecution(execution)
+  );
+}
+
+function runStopCleanupState(
+  status: TriggerRunRecord["status"],
+  pending: boolean,
+  outcomes: ReadonlySet<NonNullable<StopInterruptState["outcome"]>>,
+  steps: readonly WorkflowStepRunRecord[],
+): StopCleanupState {
+  let cleanupState: StopCleanupState = "not_needed";
+  if (status === "canceled") {
+    if (pending) cleanupState = "waiting_for_daemon";
+    else if (outcomes.has("delivery_unconfirmed")) cleanupState = "delivery_unconfirmed";
+    else if (outcomes.has("target_gone")) cleanupState = "target_gone";
+    else if (
+      outcomes.has("confirmed") ||
+      outcomes.has("coalesced") ||
+      steps.some(
+        (step) =>
+          step.status === "canceled" &&
+          step.output !== null &&
+          typeof step.output === "object" &&
+          "exit_code" in step.output,
+      )
+    )
+      cleanupState = "confirmed";
+  }
+  return cleanupState;
 }
 
 function stopCleanupPending(
@@ -7378,6 +8001,24 @@ function executionTransitionFields(
   };
 }
 
+function organizationRunAgent(
+  run: TriggerRunRecord,
+  step: WorkflowStepRunRecord | undefined,
+  execution: AgentExecutionRecord | undefined,
+) {
+  return run.payloadExpiredAt == null
+    ? launchedAgent(execution?.launchIntent?.agent)
+    : (launchedAgent(step?.payloadSummary) ?? launchedAgent(execution?.launchAgent));
+}
+
+function hasPendingRunNotification(run: TriggerRunRecord): boolean {
+  return (
+    run.outcome === "accepted" &&
+    (run.terminalNotificationLeaseExpiresAt !== null ||
+      (run.terminalNotificationPendingAt !== null && run.terminalNotificationDeliveredAt === null))
+  );
+}
+
 function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
   return (
     !isTerminalAgentExecutionStatus(execution.status) ||
@@ -7395,4 +8036,24 @@ function receiptOrder(receipt: Pick<ProviderEventReceiptRecord, "receivedAt" | "
 
 function runOrder(run: { createdAt: Date; id: string }) {
   return { micros: BigInt(run.createdAt.getTime()) * 1000n, id: run.id };
+}
+
+function sliceActivityRuns(
+  records: ProjectActivityRunListRecord[],
+  request: ActivityRunPageRequest,
+): ProjectActivityRunListRecord[] {
+  const bound = request.position;
+  const boundMicros =
+    bound === undefined ? undefined : activityTimestampMicros(bound.key.createdAt);
+  const inRange = records.filter(({ run }) => {
+    if (bound === undefined || boundMicros === undefined) return true;
+    const order = compareRunsNewestFirst(runOrder(run), {
+      micros: boundMicros,
+      id: bound.key.id,
+    });
+    return bound.direction === "before" ? order > 0 : order < 0;
+  });
+  return bound?.direction === "after"
+    ? inRange.slice(Math.max(0, inRange.length - request.limit))
+    : inRange.slice(0, request.limit);
 }
