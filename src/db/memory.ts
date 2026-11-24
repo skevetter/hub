@@ -3565,24 +3565,7 @@ class MemoryDatabase implements Database {
             this.stopInterruptStates.get(execution.id)?.outcome ?? "delivery_unconfirmed",
         ),
     );
-    let cleanupState: StopCleanupState = "not_needed";
-    if (run.status === "canceled") {
-      if (pending) cleanupState = "waiting_for_daemon";
-      else if (outcomes.has("delivery_unconfirmed")) cleanupState = "delivery_unconfirmed";
-      else if (outcomes.has("target_gone")) cleanupState = "target_gone";
-      else if (
-        outcomes.has("confirmed") ||
-        outcomes.has("coalesced") ||
-        steps.some(
-          (step) =>
-            step.status === "canceled" &&
-            step.output !== null &&
-            typeof step.output === "object" &&
-            "exit_code" in step.output,
-        )
-      )
-        cleanupState = "confirmed";
-    }
+    const cleanupState = runStopCleanupState(run.status, pending, outcomes, steps);
     return {
       stoppedByName: null,
       cleanupState,
@@ -3602,13 +3585,14 @@ class MemoryDatabase implements Database {
     );
   }
 
-  private canRepeatStop(
-    run: TriggerRunRecord,
-    owned: readonly AgentExecutionRecord[],
-    steps: readonly WorkflowStepRunRecord[],
-    requested: string | undefined,
-    confirmedPeerCount: number | undefined,
-  ): boolean {
+  private canRepeatStop(input: {
+    run: TriggerRunRecord;
+    owned: readonly AgentExecutionRecord[];
+    steps: readonly WorkflowStepRunRecord[];
+    requested: string | undefined;
+    confirmedPeerCount: number | undefined;
+  }): boolean {
+    const { run, owned, steps, requested, confirmedPeerCount } = input;
     return (
       requested !== undefined &&
       confirmedPeerCount !== undefined &&
@@ -3619,12 +3603,7 @@ class MemoryDatabase implements Database {
   }
 
   private isRetryableStop(execution: AgentExecutionRecord, attemptId?: string) {
-    if (
-      execution.hubAction !== "interrupt" ||
-      execution.hubActionCompletedAt === null ||
-      !isCanceledExecution(execution)
-    )
-      return false;
+    if (!hasCompletedCanceledInterrupt(execution)) return false;
     const state = this.stopInterruptStates.get(execution.id);
     const outcome = state?.outcome ?? "delivery_unconfirmed";
     return (
@@ -3677,12 +3656,49 @@ class MemoryDatabase implements Database {
     );
     const owned = this.runPayloadExecutions(run, steps);
     const retrying = run.status === "canceled";
-    if (retrying && !this.canRepeatStop(run, owned, steps, retryAttemptId, confirmedPeerCount))
-      return noop;
-    if (!retrying && retryAttemptId !== undefined) return noop;
-    const targets = retrying
+    const targets = this.selectRunStopTargets({
+      run,
+      owned,
+      steps,
+      retrying,
+      confirmedPeerCount,
+      retryAttemptId,
+    });
+    return targets === undefined
+      ? noop
+      : this.applyRunStop({ run, now, steps, owned, targets, retrying, confirmedPeerCount });
+  }
+
+  private selectRunStopTargets(input: {
+    run: TriggerRunRecord;
+    owned: readonly AgentExecutionRecord[];
+    steps: readonly WorkflowStepRunRecord[];
+    retrying: boolean;
+    confirmedPeerCount: number | undefined;
+    retryAttemptId: string | undefined;
+  }) {
+    const { run, owned, steps, retrying, confirmedPeerCount, retryAttemptId } = input;
+    if (
+      retrying &&
+      !this.canRepeatStop({ run, owned, steps, requested: retryAttemptId, confirmedPeerCount })
+    )
+      return undefined;
+    if (!retrying && retryAttemptId !== undefined) return undefined;
+    return retrying
       ? owned.filter((execution) => this.isRetryableStop(execution, retryAttemptId))
       : owned.filter((execution) => !isTerminalAgentExecutionStatus(execution.status));
+  }
+
+  private applyRunStop(input: {
+    run: AcceptedTriggerRunRecord;
+    now: Date;
+    steps: readonly WorkflowStepRunRecord[];
+    owned: readonly AgentExecutionRecord[];
+    targets: readonly AgentExecutionRecord[];
+    retrying: boolean;
+    confirmedPeerCount: number | undefined;
+  }) {
+    const { run, now, steps, owned, targets, retrying, confirmedPeerCount } = input;
     const peers = this.stopPeers(owned, targets);
     const peerCount = this.countStopPeerRuns(peers);
     if (confirmedPeerCount !== undefined && confirmedPeerCount !== peerCount)
@@ -3692,17 +3708,35 @@ class MemoryDatabase implements Database {
       attemptId: randomUUID(),
       requestedAt: now.toISOString(),
     };
-    if (retrying) {
-      for (const execution of targets) {
-        this.stopInterruptStates.set(execution.id, structuredClone(attempt));
-        this.stopInterruptCheckedAt.delete(execution.id);
-        this.setStopInterruptGeneration(
-          { ...execution, hubActionCompletedAt: null },
-          attempt.attemptId,
-        );
-      }
-      return { run, transitioned: false, executionIds: targets.map(({ id }) => id) };
+    return retrying
+      ? this.repeatRunStop(run, targets, attempt)
+      : this.finishRunStop({ run, now, steps, targets, attempt });
+  }
+
+  private repeatRunStop(
+    run: TriggerRunRecord,
+    targets: readonly AgentExecutionRecord[],
+    attempt: RunStopAttempt,
+  ) {
+    for (const execution of targets) {
+      this.stopInterruptStates.set(execution.id, structuredClone(attempt));
+      this.stopInterruptCheckedAt.delete(execution.id);
+      this.setStopInterruptGeneration(
+        { ...execution, hubActionCompletedAt: null },
+        attempt.attemptId,
+      );
     }
+    return { run, transitioned: false, executionIds: targets.map(({ id }) => id) };
+  }
+
+  private finishRunStop(input: {
+    run: AcceptedTriggerRunRecord;
+    now: Date;
+    steps: readonly WorkflowStepRunRecord[];
+    targets: readonly AgentExecutionRecord[];
+    attempt: RunStopAttempt;
+  }) {
+    const { run, now, steps, targets, attempt } = input;
     for (const step of steps) {
       if (step.status !== "pending" && step.status !== "running") continue;
       this.workflowStepRuns.set(step.id, {
@@ -7608,6 +7642,47 @@ function hasBoundWebhookEvidence(evidence: unknown, id: string): boolean {
     "triggerId" in evidence &&
     evidence.triggerId === id
   );
+}
+
+interface RunStopAttempt {
+  approvedPeerIds: string[];
+  attemptId: string;
+  requestedAt: string;
+}
+
+function hasCompletedCanceledInterrupt(execution: AgentExecutionRecord): boolean {
+  return (
+    execution.hubAction === "interrupt" &&
+    execution.hubActionCompletedAt !== null &&
+    isCanceledExecution(execution)
+  );
+}
+
+function runStopCleanupState(
+  status: TriggerRunRecord["status"],
+  pending: boolean,
+  outcomes: ReadonlySet<NonNullable<StopInterruptState["outcome"]>>,
+  steps: readonly WorkflowStepRunRecord[],
+): StopCleanupState {
+  let cleanupState: StopCleanupState = "not_needed";
+  if (status === "canceled") {
+    if (pending) cleanupState = "waiting_for_daemon";
+    else if (outcomes.has("delivery_unconfirmed")) cleanupState = "delivery_unconfirmed";
+    else if (outcomes.has("target_gone")) cleanupState = "target_gone";
+    else if (
+      outcomes.has("confirmed") ||
+      outcomes.has("coalesced") ||
+      steps.some(
+        (step) =>
+          step.status === "canceled" &&
+          step.output !== null &&
+          typeof step.output === "object" &&
+          "exit_code" in step.output,
+      )
+    )
+      cleanupState = "confirmed";
+  }
+  return cleanupState;
 }
 
 function stopCleanupPending(

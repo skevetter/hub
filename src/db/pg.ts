@@ -1542,117 +1542,15 @@ class PgDatabase implements Database {
     retryAttemptId?: string,
   ) {
     try {
-      return await this.pool.transaction(async (client) => {
-        const locked = await client.query<TriggerRunRow>(
-          "select * from trigger_runs where organization_id = $1 and id = $2 for update",
-          [organizationId, triggerRunId],
-        );
-        const current = locked.rows[0];
-        if (current === undefined) return undefined;
-        const runRecord = toTriggerRunRecord(current);
-        const noop = { run: runRecord, transitioned: false, executionIds: [] };
-        const retrying = current.status === "canceled" && retryAttemptId !== undefined;
-        if (!retrying && (current.status !== "running" || retryAttemptId !== undefined))
-          return noop;
-        const ownedQuery = `select linked.* from trigger_runs run cross join lateral (${RUN_STOP_OWNED}) linked
-          where run.id = $1`;
-        const targets = retrying
-          ? `${RUN_STOP_RETRYABLE} and ${RUN_STOP_ATTEMPT} = $2`
-          : "status in ('spawning', 'running')";
-        const scopeParams = retrying ? [triggerRunId, retryAttemptId] : [triggerRunId];
-        if (retrying) {
-          if (current.payload_expiry_state !== null || confirmedPeerCount === undefined)
-            return noop;
-          const retry = await client.query<{ attempt_id: string | null; pending: boolean }>(
-            `with owned as materialized (${ownedQuery})
-             select (select max(${RUN_STOP_ATTEMPT}) from owned where ${RUN_STOP_RETRYABLE}) as attempt_id,
-                    (${RUN_STOP_PENDING}) as pending
-             from trigger_runs run where run.id = $1`,
-            [triggerRunId],
-          );
-          if (retry.rows[0]?.attempt_id !== retryAttemptId || retry.rows[0].pending) return noop;
-        }
-        // Attaching an execution takes a foreign-key lock on its session row.
-        await client.query(
-          `with owned as materialized (${ownedQuery})
-           select session.id from agent_sessions session
-           where session.id in (select agent_session_id from owned where ${targets})
-           order by session.id for update`,
-          scopeParams,
-        );
-        const peers = await client.query<{ id: string; run_id: string }>(
-          `with owned as materialized (${ownedQuery}), targets as (select * from owned where ${targets})
-           ${RUN_STOP_PEERS}`,
-          scopeParams,
-        );
-        const peerCount = new Set(peers.rows.map(({ run_id }) => run_id)).size;
-        if (confirmedPeerCount !== undefined && confirmedPeerCount !== peerCount)
-          return { ...noop, conflict: peerCount };
-        const attemptId = randomUUID();
-        const approvedPeers = JSON.stringify(peers.rows.map(({ id }) => id));
-        if (retrying) {
-          const retried = await client.query<{ id: string }>(
-            `with owned as materialized (${ownedQuery})
-             update agent_executions set hub_action_completed_at = null,
-               hub_action_acknowledgements = jsonb_set(
-                 coalesce(hub_action_acknowledgements, '{}'::jsonb)
-                   - 'stop_interrupt_claim' - 'stop_interrupt_checked_at',
-                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
-                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
-                 || jsonb_build_object('stop_interrupt_generation', $4::text)
-             where id in (select id from owned where ${targets})
-             returning id`,
-            [triggerRunId, retryAttemptId, approvedPeers, attemptId],
-          );
-          return { ...noop, executionIds: retried.rows.map(({ id }) => id) };
-        }
-        const updated = await client.query<TriggerRunRow>(
-          `update trigger_runs set status = 'canceled', completed_at = now(),
-             terminal_notification_pending_at = now(), terminal_notification_lease_expires_at = null
-           where organization_id = $1 and id = $2 and status = 'running' returning *`,
-          [organizationId, triggerRunId],
-        );
-        const run = updated.rows[0]!;
-        await client.query(
-          `update workflow_step_runs
-           set status = case when status = 'running' then 'canceled' else 'skipped' end,
-               completed_at = $2
-           where trigger_run_id = $1 and status in ('pending', 'running')`,
-          [run.id, run.completed_at],
-        );
-        const executions = await client.query<{ id: string }>(
-          `update agent_executions
-           set status = 'failed', completed_at = $2, idle_deadline_at = null,
-               result = '{"status":"canceled"}',
-               hub_action = case when daemon_id is not null then 'interrupt' end,
-               hub_action_completed_at = null,
-               hub_action_acknowledgements = jsonb_set(
-                 coalesce(hub_action_acknowledgements, '{}'::jsonb),
-                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
-                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
-           where status in ('spawning', 'running') and id in (
-             select execution_id from trigger_runs run
-             cross join lateral (${runExecutions("run", "execution.id as execution_id")}) linked
-             where run.id = $1
-           )
-           returning id`,
-          [run.id, run.completed_at, approvedPeers, attemptId],
-        );
-        await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [run.id]);
-        if (stoppedByUserId !== undefined) {
-          await client.query(
-            `insert into audit_events
-             (organization_id, project_id, actor_kind, actor_identity, action, subject_type, subject_id, evidence, created_at)
-             values ($1, $2, 'user', $3, 'run.canceled', 'trigger_run', $4, '{}'::jsonb, $5)`,
-            [organizationId, run.project_id, stoppedByUserId, run.id, run.completed_at],
-          );
-        }
-        return {
-          run: toTriggerRunRecord(run),
-          transitioned: true,
-          executionIds: executions.rows.map(({ id }) => id),
-        };
-      });
+      return await this.pool.transaction((client) =>
+        cancelTriggerRunOnClient(client, {
+          organizationId,
+          triggerRunId,
+          stoppedByUserId,
+          confirmedPeerCount,
+          retryAttemptId,
+        }),
+      );
     } catch (error) {
       throw toDatabaseError(error);
     }
@@ -4834,6 +4732,155 @@ class PgDatabase implements Database {
     );
     return rows.rows[0] === undefined ? undefined : toAttachmentRecord(rows.rows[0]);
   }
+}
+
+interface CancelTriggerRunOptions {
+  organizationId: string;
+  triggerRunId: string;
+  stoppedByUserId: string | undefined;
+  confirmedPeerCount: number | undefined;
+  retryAttemptId: string | undefined;
+}
+
+async function cancelTriggerRunOnClient(client: QueryHandle, input: CancelTriggerRunOptions) {
+  const { organizationId, triggerRunId, confirmedPeerCount, retryAttemptId } = input;
+  const locked = await client.query<TriggerRunRow>(
+    "select * from trigger_runs where organization_id = $1 and id = $2 for update",
+    [organizationId, triggerRunId],
+  );
+  const current = locked.rows[0];
+  if (current === undefined) return undefined;
+  const runRecord = toTriggerRunRecord(current);
+  const noop = { run: runRecord, transitioned: false, executionIds: [] };
+  const retrying = current.status === "canceled" && retryAttemptId !== undefined;
+  if (!retrying && (current.status !== "running" || retryAttemptId !== undefined)) return noop;
+  const ownedQuery = `select linked.* from trigger_runs run cross join lateral (${RUN_STOP_OWNED}) linked
+          where run.id = $1`;
+  if (
+    retrying &&
+    (current.payload_expiry_state !== null ||
+      confirmedPeerCount === undefined ||
+      !(await hasRetryableRunStopOnClient(client, ownedQuery, triggerRunId, retryAttemptId)))
+  )
+    return noop;
+  return applyRunStopOnClient(client, input, { ownedQuery, retrying }, noop);
+}
+
+async function hasRetryableRunStopOnClient(
+  client: QueryHandle,
+  ownedQuery: string,
+  triggerRunId: string,
+  retryAttemptId: string,
+) {
+  const retry = await client.query<{ attempt_id: string | null; pending: boolean }>(
+    `with owned as materialized (${ownedQuery})
+             select (select max(${RUN_STOP_ATTEMPT}) from owned where ${RUN_STOP_RETRYABLE}) as attempt_id,
+                    (${RUN_STOP_PENDING}) as pending
+             from trigger_runs run where run.id = $1`,
+    [triggerRunId],
+  );
+  return retry.rows[0]?.attempt_id === retryAttemptId && !retry.rows[0].pending;
+}
+
+async function applyRunStopOnClient(
+  client: QueryHandle,
+  input: CancelTriggerRunOptions,
+  { ownedQuery, retrying }: { ownedQuery: string; retrying: boolean },
+  noop: { run: TriggerRunRecord; transitioned: boolean; executionIds: string[] },
+) {
+  const { triggerRunId, retryAttemptId, confirmedPeerCount } = input;
+  const targets = retrying
+    ? `${RUN_STOP_RETRYABLE} and ${RUN_STOP_ATTEMPT} = $2`
+    : "status in ('spawning', 'running')";
+  const scopeParams = retrying ? [triggerRunId, retryAttemptId] : [triggerRunId];
+  // Attaching an execution takes a foreign-key lock on its session row.
+  await client.query(
+    `with owned as materialized (${ownedQuery})
+           select session.id from agent_sessions session
+           where session.id in (select agent_session_id from owned where ${targets})
+           order by session.id for update`,
+    scopeParams,
+  );
+  const peers = await client.query<{ id: string; run_id: string }>(
+    `with owned as materialized (${ownedQuery}), targets as (select * from owned where ${targets})
+           ${RUN_STOP_PEERS}`,
+    scopeParams,
+  );
+  const peerCount = new Set(peers.rows.map(({ run_id }) => run_id)).size;
+  if (confirmedPeerCount !== undefined && confirmedPeerCount !== peerCount)
+    return { ...noop, conflict: peerCount };
+  const attemptId = randomUUID();
+  const approvedPeers = JSON.stringify(peers.rows.map(({ id }) => id));
+  if (retrying) {
+    const retried = await client.query<{ id: string }>(
+      `with owned as materialized (${ownedQuery})
+             update agent_executions set hub_action_completed_at = null,
+               hub_action_acknowledgements = jsonb_set(
+                 coalesce(hub_action_acknowledgements, '{}'::jsonb)
+                   - 'stop_interrupt_claim' - 'stop_interrupt_checked_at',
+                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
+                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
+                 || jsonb_build_object('stop_interrupt_generation', $4::text)
+             where id in (select id from owned where ${targets})
+             returning id`,
+      [triggerRunId, retryAttemptId, approvedPeers, attemptId],
+    );
+    return { ...noop, executionIds: retried.rows.map(({ id }) => id) };
+  }
+  return transitionRunStopOnClient(client, input, { approvedPeers, attemptId });
+}
+
+async function transitionRunStopOnClient(
+  client: QueryHandle,
+  { organizationId, triggerRunId, stoppedByUserId }: CancelTriggerRunOptions,
+  { approvedPeers, attemptId }: { approvedPeers: string; attemptId: string },
+) {
+  const updated = await client.query<TriggerRunRow>(
+    `update trigger_runs set status = 'canceled', completed_at = now(),
+             terminal_notification_pending_at = now(), terminal_notification_lease_expires_at = null
+           where organization_id = $1 and id = $2 and status = 'running' returning *`,
+    [organizationId, triggerRunId],
+  );
+  const run = requireReturnedRow(updated.rows[0], "canceled trigger run");
+  await client.query(
+    `update workflow_step_runs
+           set status = case when status = 'running' then 'canceled' else 'skipped' end,
+               completed_at = $2
+           where trigger_run_id = $1 and status in ('pending', 'running')`,
+    [run.id, run.completed_at],
+  );
+  const executions = await client.query<{ id: string }>(
+    `update agent_executions
+           set status = 'failed', completed_at = $2, idle_deadline_at = null,
+               result = '{"status":"canceled"}',
+               hub_action = case when daemon_id is not null then 'interrupt' end,
+               hub_action_completed_at = null,
+               hub_action_acknowledgements = jsonb_set(
+                 coalesce(hub_action_acknowledgements, '{}'::jsonb),
+                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
+                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
+           where status in ('spawning', 'running') and id in (
+             select execution_id from trigger_runs run
+             cross join lateral (${runExecutions("run", "execution.id as execution_id")}) linked
+             where run.id = $1
+           )
+           returning id`,
+    [run.id, run.completed_at, approvedPeers, attemptId],
+  );
+  await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [run.id]);
+  if (stoppedByUserId !== undefined) {
+    await client.query(
+      `insert into audit_events
+             (organization_id, project_id, actor_kind, actor_identity, action, subject_type, subject_id, evidence, created_at)
+             values ($1, $2, 'user', $3, 'run.canceled', 'trigger_run', $4, '{}'::jsonb, $5)`,
+      [organizationId, run.project_id, stoppedByUserId, run.id, run.completed_at],
+    );
+  }
+  return {
+    run: toTriggerRunRecord(run),
+    transitioned: true,
+    executionIds: executions.rows.map(({ id }) => id),
+  };
 }
 
 async function readAttachmentBySource(
