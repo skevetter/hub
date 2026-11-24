@@ -19,7 +19,7 @@ import { SessionEventBus } from "../interactive-sessions/bus.js";
 import { InteractiveSessionCoordinator } from "../interactive-sessions/coordinator.js";
 import { readInteractiveSessionSettings } from "../interactive-sessions/settings.js";
 import { FakeAgents } from "../interactive-sessions/test-utils/fake-agents.js";
-import { logger, redact } from "../logger.js";
+import { logger } from "../logger.js";
 import { createLinearRegistration } from "../providers/linear/index.js";
 import { prepareProfile, surfaceTenant } from "../surfaces/store.contract.js";
 import { pilotActivityIds, stableActivityId } from "./activities.js";
@@ -119,85 +119,6 @@ function setDelegationComment(payload: JsonObject, session: JsonObject, delegati
 }
 
 const delegationSessionId = "2138c045-6eb6-4cde-a191-84d4bdee87cd";
-const reusedSessionId = "2138c045-6eb6-4cde-a191-84d4bdee87ce";
-const delegationHistoryId = "2138c045-6eb6-4cde-a191-84d4bdee87cf";
-type RefusalScenario = "delegation-refusal" | "delegation-oversized";
-
-function delegationResult(input: {
-  request: z.infer<typeof graphQLRequest>;
-  nativeSessionId: string;
-  issueId: string;
-  at: (second: number) => string;
-  appUserId: string;
-  workspaceId: string;
-  humanId: string;
-  teamId: JsonObject[string] | undefined;
-  scenario: string;
-}) {
-  const {
-    request,
-    nativeSessionId,
-    issueId,
-    at,
-    appUserId,
-    workspaceId,
-    humanId,
-    teamId,
-    scenario,
-  } = input;
-  assert.match(request.query, /comment \{ id user \{ id \} \}/u);
-  assert.match(request.query, /history\(first: 20, orderBy: createdAt\)/u);
-  assert.match(request.query, /nodes\s*\{\s*id createdAt/u);
-  const requested = request.variables["sessionId"];
-  assert.ok(requested === nativeSessionId || requested === reusedSessionId);
-  if (scenario === "delegation-refusal")
-    return Response.json({
-      errors: [
-        {
-          message: "Origin read unavailable",
-          extensions: { type: "unavailable", code: "unavailable" },
-        },
-      ],
-    });
-  const human = { id: humanId };
-  const app = { id: appUserId };
-  return Response.json({
-    data: {
-      agentSession: {
-        id: requested,
-        createdAt: at(0),
-        appUser: app,
-        creator: human,
-        comment: { id: "comment-5e5e", user: human },
-        sourceComment: null,
-        issue: {
-          id: issueId,
-          identifier: "TEST-1",
-          title: "Check delegation",
-          description:
-            scenario === "delegation-oversized" ? "x".repeat(20_000) : "Use this description.",
-          team: { id: teamId, organization: { id: workspaceId } },
-          delegate: app,
-          assignee: null,
-          history: {
-            nodes: [
-              {
-                id: delegationHistoryId,
-                createdAt: at(-1),
-                actor: human,
-                botActor: null,
-                toDelegate: app,
-                toAssignee: null,
-                triageResponsibilityAutoAssigned: null,
-              },
-            ],
-          },
-        },
-      },
-    },
-  });
-}
-
 function activityResult(
   activity: NonNullable<z.infer<typeof graphQLRequest>["variables"]["input"]>,
   appUserId: string,
@@ -260,10 +181,6 @@ async function assertDeclinesOutsideScope(input: {
   }
 }
 
-function isRefusalScenario(scenario: string): scenario is RefusalScenario {
-  return scenario === "delegation-refusal" || scenario === "delegation-oversized";
-}
-
 async function assertNonOwnerCommentRefused(
   endpoint: Endpoint,
   payload: JsonObject,
@@ -280,138 +197,6 @@ async function assertNonOwnerCommentRefused(
   } finally {
     info.mockRestore();
   }
-}
-
-function refusalDetails(scenario: RefusalScenario) {
-  if (scenario === "delegation-oversized") return { reason: "oversized" };
-  return {
-    reason: "origin_unproven",
-    stage: "readback_failed",
-    linearAgentCode: "request_failed",
-    linearErrorType: "other",
-    linearErrorKinds: ["other"],
-  };
-}
-
-async function assertDelegationRefusal(input: {
-  endpoint: Endpoint;
-  payload: JsonObject;
-  runtime: DatabaseRuntime;
-  organizationId: string;
-  nativeSessionId: string;
-  publication: Publication;
-  agents: FakeAgents;
-  legacy: () => Promise<void>;
-  originReads: () => number;
-  scenario: RefusalScenario;
-}) {
-  const {
-    endpoint,
-    payload,
-    runtime,
-    organizationId,
-    nativeSessionId,
-    publication,
-    agents,
-    legacy,
-    originReads,
-    scenario,
-  } = input;
-  const info = vi.spyOn(logger, "info");
-  try {
-    await deliver(endpoint, payload);
-    await vi.waitFor(() => expect(publication).toHaveLength(1));
-    expect(publication[0]?.id).toBe("b3b15181-944e-4a14-923f-786fb8ec8433");
-    expect(publication[0]).toMatchObject({
-      type: "error",
-      body: "Paseo could not confirm who started this. Mention @paseo in a comment instead.",
-    });
-    const refusalLogs = info.mock.calls
-      .filter(([, message]) => message === "Linear pilot refused delivery")
-      .map(([fields]) => redact(fields));
-    expect(refusalLogs).toContainEqual({
-      ...refusalDetails(scenario),
-      action: "created",
-      nativeSessionId,
-    });
-    expect(
-      info.mock.calls.filter(([, message]) => message === "Linear pilot delegation fallback"),
-    ).toEqual([
-      [{ nativeSessionId, stage: "comment_author_missing" }, "Linear pilot delegation fallback"],
-    ]);
-    await deliver(endpoint, payload);
-    await vi.waitFor(() =>
-      expect(info).toHaveBeenCalledWith(
-        { reason: "duplicate", action: "created", nativeSessionId },
-        "Linear pilot refused delivery",
-      ),
-    );
-    const { rows } = await runtime.query(
-      "select 1 from interactive_sessions where organization_id = $1",
-      [organizationId],
-    );
-    expect(rows).toEqual([]);
-    await expectDelegationReceipts(
-      runtime,
-      organizationId,
-      scenario === "delegation-oversized"
-        ? [delegationReceipt("oversized", delegationHistoryId)]
-        : [delegationReceipt("origin_unproven")],
-    );
-    expect(publication).toHaveLength(1);
-    expect(originReads()).toBe(1);
-    expect(agents.creations).toEqual([]);
-    expect(legacy).not.toHaveBeenCalled();
-  } finally {
-    info.mockRestore();
-  }
-}
-
-function delegationReceipt(reason: string, historyEntryId?: string) {
-  return {
-    dropped_reason: reason,
-    payload: {
-      type: "agent_session",
-      action: "created",
-      ...(historyEntryId && { historyEntryId }),
-    },
-  };
-}
-
-async function expectDelegationReceipts(
-  runtime: DatabaseRuntime,
-  organizationId: string,
-  expected: ReturnType<typeof delegationReceipt>[],
-) {
-  const { rows } = await runtime.query(
-    `select dropped_reason, payload from provider_event_receipts
-     where organization_id = $1 and delivery_id like 'linear-pilot:%' order by dropped_reason`,
-    [organizationId],
-  );
-  expect(rows).toEqual(expected);
-}
-
-async function assertDelegationReuse(input: {
-  endpoint: Endpoint;
-  payload: JsonObject;
-  session: JsonObject;
-  runtime: DatabaseRuntime;
-  organizationId: string;
-  publication: Publication;
-  agents: FakeAgents;
-}) {
-  const { endpoint, payload, session, runtime, organizationId, publication, agents } = input;
-  const replay = { ...payload, agentSession: { ...session, id: reusedSessionId } };
-  await deliver(endpoint, replay);
-  await vi.waitFor(() =>
-    expect(publication.map(({ type }) => type)).toEqual(["thought", "response", "error"]),
-  );
-  await expectDelegationReceipts(runtime, organizationId, [
-    delegationReceipt("linear_pilot_admitted", delegationHistoryId),
-    delegationReceipt("origin_reused", delegationHistoryId),
-  ]);
-  expect(agents.creations).toHaveLength(1);
-  expect(agents.sends).toHaveLength(1);
 }
 
 function registeredBackend(scenario: string) {
@@ -454,7 +239,7 @@ async function assertPromptRefused(
 }
 
 function registeredSessionId(scenario: string) {
-  return scenario.startsWith("delegation") ? delegationSessionId : randomUUID();
+  return scenario === "delegation-non-owner-comment" ? delegationSessionId : randomUUID();
 }
 
 function coordinatorOptions(scenario: string) {
@@ -575,14 +360,7 @@ async function assertStopClosesToolSteps(input: {
 }
 
 async function exerciseRegisteredPilot(
-  scenario:
-    | "stop"
-    | "stop-race"
-    | "postgres"
-    | "start-refusal"
-    | "delegation"
-    | "delegation-non-owner-comment"
-    | RefusalScenario,
+  scenario: "stop" | "stop-race" | "postgres" | "start-refusal" | "delegation-non-owner-comment",
   terminalFailure?: "failed" | "canceled" | "unconfirmed",
   toolStepsCase?: ToolStepsCase,
 ) {
@@ -701,7 +479,6 @@ async function exerciseRegisteredPilot(
       const followUpAt = at(3);
       const freshTurnAt = at(4);
       const historyReads: string[] = [];
-      let originReads = 0;
       const publication: Publication = [];
       const actionSessions: string[] = [];
       const appId = connection.providerApplicationId;
@@ -720,7 +497,7 @@ async function exerciseRegisteredPilot(
       const signedIssueId = session["issueId"];
       assert(typeof signedIssueId === "string");
       const issueId: string = signedIssueId;
-      const delegation = scenario.startsWith("delegation");
+      const delegation = scenario === "delegation-non-owner-comment";
       setDelegationComment(payload, session, delegation);
 
       function prompted(id: string, createdAt: string, body: string | null): JsonObject {
@@ -820,20 +597,6 @@ async function exerciseRegisteredPilot(
             },
           });
         }
-        if (request.query.includes("PaseoPilotDelegationOrigin")) {
-          originReads++;
-          return delegationResult({
-            request,
-            nativeSessionId,
-            issueId,
-            at,
-            appUserId: connection.appUserId,
-            workspaceId: config.linearOrganizationId,
-            humanId: config.allowedHumanId,
-            teamId: objectAt(session, "issue")["teamId"],
-            scenario,
-          });
-        }
         if (request.query.includes("PaseoPilotPrompt")) {
           assert.match(request.query, /first: 1,/u);
           assert.match(request.query, /agentSessionId: \{ eq: \$sessionId \}/u);
@@ -868,7 +631,7 @@ async function exerciseRegisteredPilot(
         assert.match(request.query, /PaseoAgentActivityCreate/u);
         const activity = request.variables.input;
         assert(activity);
-        assert.ok([nativeSessionId, reusedSessionId].includes(activity.agentSessionId));
+        assert.equal(activity.agentSessionId, nativeSessionId);
         return publishActivity(activity, init);
       });
       async function publishActivity(
@@ -909,9 +672,8 @@ async function exerciseRegisteredPilot(
           delegation,
         });
 
-        if (scenario === "delegation-non-owner-comment") {
+        if (delegation) {
           await assertNonOwnerCommentRefused(endpoint, payload, nativeSessionId);
-          expect(originReads).toBe(0);
           expect(provider).not.toHaveBeenCalled();
           expect(agents.creations).toEqual([]);
           return;
@@ -964,21 +726,6 @@ async function exerciseRegisteredPilot(
           );
           expect(provider).not.toHaveBeenCalled();
           expect(agents.sends).toEqual([]);
-          return;
-        }
-        if (isRefusalScenario(scenario)) {
-          await assertDelegationRefusal({
-            endpoint,
-            payload,
-            runtime,
-            organizationId,
-            nativeSessionId,
-            publication,
-            agents,
-            legacy,
-            originReads: () => originReads,
-            scenario,
-          });
           return;
         }
         const began = performance.now();
@@ -1123,21 +870,6 @@ async function exerciseRegisteredPilot(
         const firstAnswer = publication[1];
         assert(firstAnswer?.type === "response");
         assert.match(firstAnswer.body, /Synthetic final answer/u);
-        if (scenario === "delegation") {
-          expect(send.text).toBe("Work on TEST-1: Check delegation\n\nUse this description.");
-          expect(originReads).toBe(1);
-          await assertDelegationReuse({
-            endpoint,
-            payload,
-            session,
-            runtime,
-            organizationId,
-            publication,
-            agents,
-          });
-          expect(legacy).not.toHaveBeenCalled();
-          return;
-        }
         assert.equal((await endpoint.handle(signedDelivery(payload))).status, 200);
 
         const legacyAdmission = vi.spyOn(database, "acceptLinearEvent");
@@ -1533,27 +1265,8 @@ test(
   120_000,
 );
 
-// The runtime no longer calls the history proof. Keep these cases until its separate removal.
-test.skip(
-  "a proven owner delegation acknowledges, starts a turn and publishes its answer",
-  () => exerciseRegisteredPilot("delegation"),
-  120_000,
-);
-
 test(
   "a non-owner comment on an owner-created session is refused before delegation readback",
   () => exerciseRegisteredPilot("delegation-non-owner-comment"),
-  120_000,
-);
-
-test.skip(
-  "a failed delegation read posts one fixed error and creates no Hub session",
-  () => exerciseRegisteredPilot("delegation-refusal"),
-  120_000,
-);
-
-test.skip(
-  "an oversized delegation records a refusal and posts one fixed error across replays",
-  () => exerciseRegisteredPilot("delegation-oversized"),
   120_000,
 );

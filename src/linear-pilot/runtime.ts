@@ -610,7 +610,6 @@ function clientFor(state: RuntimeState, grant: Active, activity = grant.activity
     operation.sessionId === activity.nativeSessionId &&
     (!("issueId" in operation) || operation.issueId === grant.origin.issueId) &&
     operation.kind !== "addHubUrl" &&
-    operation.kind !== "readDelegationOrigin" &&
     operation.kind !== "readNonOwnerOrigin" &&
     operation.kind !== "readDelegationConfirmation" &&
     operation.kind !== "readDelegationIssue";
