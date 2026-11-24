@@ -155,19 +155,7 @@ function appSurface(
       examples,
     };
   }
-  const listening = snapshot.triggers.flatMap((trigger) => {
-    if (!trigger.enabled) return [];
-    return (trigger.commentEvents ?? []).flatMap((event) => {
-      const comment = COMMENT_EVENTS.get(event.on);
-      return comment !== undefined && event.on.startsWith(`${provider}.`)
-        ? [{ trigger, event, comment }]
-        : [];
-    });
-  });
-  const matching =
-    listening.find(({ event }) => event.hasReplyOutput && event.commentPrefix !== null) ??
-    listening.find(({ event }) => event.hasReplyOutput) ??
-    listening[0];
+  const matching = findCommentTrigger(snapshot.triggers, provider);
   if (matching === undefined) {
     const name = healthy[0]?.label;
     return {
@@ -178,6 +166,16 @@ function appSurface(
       examples,
     };
   }
+  const location = healthy.length === 1 ? ` in ${healthy[0]?.label ?? label}` : "";
+  return matchedAppSurface(matching, provider, label, location);
+}
+
+function matchedAppSurface(
+  matching: NonNullable<ReturnType<typeof findCommentTrigger>>,
+  provider: "linear" | "github",
+  label: string,
+  location: string,
+): TrySurface {
   const { trigger, event, comment } = matching;
   const { commentPrefix, hasReplyOutput } = event;
   if (hasReplyOutput && commentPrefix === null) {
@@ -189,7 +187,6 @@ function appSurface(
       examples: [],
     };
   }
-  const location = healthy.length === 1 ? ` in ${healthy[0]?.label ?? label}` : "";
   return {
     key: provider,
     label,
@@ -198,6 +195,23 @@ function appSurface(
       : `${trigger.name} needs a reply output for the answer to appear on the ${comment.pullRequest ? "pull request" : "issue"}.`,
     examples: commentPrefix === null ? [] : commentExamples(event.on, commentPrefix),
   };
+}
+
+function findCommentTrigger(triggers: HomeSnapshot["triggers"], provider: "linear" | "github") {
+  const listening = triggers.flatMap((trigger) => {
+    if (!trigger.enabled) return [];
+    return (trigger.commentEvents ?? []).flatMap((event) => {
+      const comment = COMMENT_EVENTS.get(event.on);
+      return comment !== undefined && event.on.startsWith(`${provider}.`)
+        ? [{ trigger, event, comment }]
+        : [];
+    });
+  });
+  return (
+    listening.find(({ event }) => event.hasReplyOutput && event.commentPrefix !== null) ??
+    listening.find(({ event }) => event.hasReplyOutput) ??
+    listening[0]
+  );
 }
 
 const ISSUE_COMMENT = { action: "Comment on an issue", pullRequest: false } as const;

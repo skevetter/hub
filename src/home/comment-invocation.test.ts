@@ -9,9 +9,10 @@ import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-config
 import { matchGitHubInvocations } from "../triggers/github/match.js";
 import { OrganizationTriggerStore } from "../triggers/store.js";
 import { HomeDashboard } from "./dashboard.js";
-import { thingsToTry } from "./things-to-try.js";
+import type { HomeSnapshot } from "./functions.js";
+import { thingsToTry, type TrySurface } from "./things-to-try.js";
 
-it.each([
+const cases = [
   [
     "input choices",
     'filters: { from_users: ["*"], pattern: "/paseo", contains: "count=1" }',
@@ -29,9 +30,19 @@ it.each([
   ["no filters", "", "", false],
   ["Linear before GitHub", 'filters: { from_users: ["*"], pattern: "/paseo" }', "", true, "first"],
   ["GitHub before Linear", 'filters: { from_users: ["*"], pattern: "/paseo" }', "", true, "last"],
-] as const)(
-  "checks every offered comment against the real invocation for %s",
-  async (kind, filters, inputs, ready, linearPlacement?) => {
+] as const;
+
+it.each(
+  cases.map(([kind, filters, inputs, ready, linearPlacement]) => ({
+    kind,
+    filters,
+    inputs,
+    ready,
+    linearPlacement,
+  })),
+)(
+  "checks every offered comment against the real invocation for $kind",
+  async ({ kind, filters, inputs, ready, linearPlacement }) => {
     const organizationId = "org-1";
     const userId = "user-1";
     const connectionId = "github-1";
@@ -149,29 +160,43 @@ run:
         },
         { source: "github.issue_comment", connectionId },
       );
-    if (kind === "input choices") {
-      const accepted = match("/paseo count=10 Review this pull request.");
-      assert.ok(Array.isArray(accepted));
-      assert.equal(accepted[0]?.invocation.status, "accepted");
-    }
-    for (const { prompt } of surface.examples) {
-      const result = match(prompt);
-      assert.ok(Array.isArray(result), JSON.stringify({ prompt, result }));
-      assert.equal(result[0]?.invocation.status, "accepted", JSON.stringify({ prompt, result }));
-    }
-    if (linearPlacement !== undefined) {
-      assert.match(surface.where, /Comment on a pull request .* review is configured to run/u);
-      const linearSurface = thingsToTry(snapshot).find(({ key }) => key === "linear");
-      assert.equal(linearSurface?.where, "review only starts for comments that match its filters.");
-      assert.equal(linearSurface.next?.path, `triggers/${trigger.id}`);
-      assert.equal(linearSurface.examples.length, 0);
-    }
-    if (ready) {
-      assert.equal(surface.examples.length, 3);
-    } else {
-      assert.equal(surface.examples.length, 0);
-      assert.match(surface.where, /only starts for comments that match its filters/u);
-      assert.equal(surface.next?.path, `triggers/${trigger.id}`);
-    }
+    expectOfferedMatches(kind, surface, match);
+    if (linearPlacement !== undefined) expectLinearBeforeOrAfter(snapshot, surface, trigger.id);
+    expectReadySurface(surface, ready, trigger.id);
   },
 );
+
+function expectOfferedMatches(
+  kind: string,
+  surface: TrySurface,
+  match: (text: string) => ReturnType<typeof matchGitHubInvocations>,
+) {
+  if (kind === "input choices") {
+    const accepted = match("/paseo count=10 Review this pull request.");
+    assert.ok(Array.isArray(accepted));
+    assert.equal(accepted[0]?.invocation.status, "accepted");
+  }
+  for (const { prompt } of surface.examples) {
+    const result = match(prompt);
+    assert.ok(Array.isArray(result), JSON.stringify({ prompt, result }));
+    assert.equal(result[0]?.invocation.status, "accepted", JSON.stringify({ prompt, result }));
+  }
+}
+
+function expectLinearBeforeOrAfter(snapshot: HomeSnapshot, surface: TrySurface, triggerId: string) {
+  assert.match(surface.where, /Comment on a pull request .* review is configured to run/u);
+  const linearSurface = thingsToTry(snapshot).find(({ key }) => key === "linear");
+  assert.equal(linearSurface?.where, "review only starts for comments that match its filters.");
+  assert.equal(linearSurface.next?.path, `triggers/${triggerId}`);
+  assert.equal(linearSurface.examples.length, 0);
+}
+
+function expectReadySurface(surface: TrySurface, ready: boolean, triggerId: string) {
+  if (ready) {
+    assert.equal(surface.examples.length, 3);
+  } else {
+    assert.equal(surface.examples.length, 0);
+    assert.match(surface.where, /only starts for comments that match its filters/u);
+    assert.equal(surface.next?.path, `triggers/${triggerId}`);
+  }
+}

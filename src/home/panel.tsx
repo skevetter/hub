@@ -52,7 +52,7 @@ import type { RunTally } from "./dashboard.js";
 import { finishHomeSetup, homeSnapshot, type HomeSnapshot } from "./functions.js";
 import { HOME_MONTH_DAYS } from "./limits.js";
 import { memberFlagKey, useMemberFlag } from "./member-preference.js";
-import { thingsToTry, type TrySurfaceKey } from "./things-to-try.js";
+import { thingsToTry, type TrySurface, type TrySurfaceKey } from "./things-to-try.js";
 
 const HOME_DESCRIPTION = "What is running, what needs you, and what to try next.";
 const HOME_HEADING_ID = "home-heading";
@@ -96,19 +96,15 @@ export function HomePanel() {
   );
 }
 
-function HomeView({
-  snapshot,
-  accountId,
-  operator,
-  profiles,
-  canManageProfiles,
-}: {
+interface HomeViewProps {
   snapshot: Snapshot<HomeSnapshot> & { refetch: () => void; isFetching: boolean };
   accountId: string;
   operator: boolean;
   profiles: ProfileAvailability;
   canManageProfiles: boolean;
-}) {
+}
+
+function HomeView({ snapshot, ...props }: HomeViewProps) {
   const [focusOnCompletion, setFocusOnCompletion] = useState(false);
   const retryRequested = useRef(false);
   const { isFetching, status } = snapshot;
@@ -149,11 +145,28 @@ function HomeView({
       </>
     );
   }
-  const { data } = snapshot;
-  const base = `/o/${data.organization.slug}`;
   return (
     <>
       {header}
+      <HomeContent {...props} data={snapshot.data} onFinished={() => setFocusOnCompletion(true)} />
+    </>
+  );
+}
+
+function HomeContent({
+  data,
+  accountId,
+  operator,
+  profiles,
+  canManageProfiles,
+  onFinished,
+}: Omit<HomeViewProps, "snapshot"> & {
+  data: HomeSnapshot;
+  onFinished: () => void;
+}) {
+  const base = `/o/${data.organization.slug}`;
+  return (
+    <>
       <NeedsAttention data={data} base={base} profiles={profiles} />
       <Section>
         <HomeTiles data={data} />
@@ -166,7 +179,7 @@ function HomeView({
           operator={operator}
           profiles={profiles}
           canManageProfiles={canManageProfiles}
-          onFinished={() => setFocusOnCompletion(true)}
+          onFinished={onFinished}
         />
       ) : null}
       {profiles === null ? null : <HomeSessionStart organizationSlug={data.organization.slug} />}
@@ -176,44 +189,48 @@ function HomeView({
         profiles={profiles}
         canManageProfiles={canManageProfiles}
       />
-      <Section
-        title="Recent runs"
-        description={`The last ${String(data.windowDays)} days.`}
-        action={
-          <Button variant="link" asChild>
-            <Link to={`${base}/activity` as never}>View all</Link>
-          </Button>
-        }
-      >
-        {data.runs.length === 0 ? (
-          <EmptyState title="No recent runs" />
-        ) : (
-          <RecordList label="Recent runs">
-            {data.runs.slice(0, RECENT_RUNS_SHOWN).map((run) => (
-              <RecordRow
-                key={run.id}
-                status={
-                  <StatusPill tone={runTone(run.status)}>{statusLabel(run.status)}</StatusPill>
-                }
-              >
-                <TwoLine
-                  primary={run.triggerName}
-                  secondary={
-                    <>
-                      {run.payloadExpiredAt == null
-                        ? runSourceLabel(run.source)
-                        : "Run payload expired"}
-                      {" \u00b7 "}
-                      <RelativeTime value={run.receivedAt} />
-                    </>
-                  }
-                />
-              </RecordRow>
-            ))}
-          </RecordList>
-        )}
-      </Section>
+      <HomeRecentRuns data={data} base={base} />
     </>
+  );
+}
+
+function HomeRecentRuns({ data, base }: { data: HomeSnapshot; base: string }) {
+  return (
+    <Section
+      title="Recent runs"
+      description={`The last ${String(data.windowDays)} days.`}
+      action={
+        <Button variant="link" asChild>
+          <Link to={`${base}/activity` as never}>View all</Link>
+        </Button>
+      }
+    >
+      {data.runs.length === 0 ? (
+        <EmptyState title="No recent runs" />
+      ) : (
+        <RecordList label="Recent runs">
+          {data.runs.slice(0, RECENT_RUNS_SHOWN).map((run) => (
+            <RecordRow
+              key={run.id}
+              status={<StatusPill tone={runTone(run.status)}>{statusLabel(run.status)}</StatusPill>}
+            >
+              <TwoLine
+                primary={run.triggerName}
+                secondary={
+                  <>
+                    {run.payloadExpiredAt == null
+                      ? runSourceLabel(run.source)
+                      : "Run payload expired"}
+                    {" \u00b7 "}
+                    <RelativeTime value={run.receivedAt} />
+                  </>
+                }
+              />
+            </RecordRow>
+          ))}
+        </RecordList>
+      )}
+    </Section>
   );
 }
 
@@ -403,23 +420,27 @@ function ThingsToTry({
             </Button>
           )}
         </div>
-        {surface.examples.length === 0 ? null : (
-          <ul aria-label={`${surface.label} examples`} className="grid gap-4">
-            {surface.examples.map((example) => (
-              <li key={example.title} className="grid min-w-0 gap-1.5">
-                <CopyField
-                  prose
-                  label={example.title}
-                  value={example.prompt}
-                  copyLabel={`Copy the prompt: ${example.title}`}
-                />
-                <p className="text-xs text-muted-foreground">{example.description}</p>
-              </li>
-            ))}
-          </ul>
-        )}
+        <TryExamples surface={surface} />
       </Card>
     </Section>
+  );
+}
+
+function TryExamples({ surface }: { surface: TrySurface }) {
+  return surface.examples.length === 0 ? null : (
+    <ul aria-label={`${surface.label} examples`} className="grid gap-4">
+      {surface.examples.map((example) => (
+        <li key={example.title} className="grid min-w-0 gap-1.5">
+          <CopyField
+            prose
+            label={example.title}
+            value={example.prompt}
+            copyLabel={`Copy the prompt: ${example.title}`}
+          />
+          <p className="text-xs text-muted-foreground">{example.description}</p>
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -443,6 +464,72 @@ function HomeChecklist({
   const { organization } = snapshot;
   const checklist = deriveChecklist(snapshot, profiles);
   const setupReady = canFinishSetup(snapshot);
+  const completion = useFinishHomeSetup(organization, onFinished);
+  return (
+    <Section>
+      {completion.isError || completion.data?.status === "error" ? (
+        <FailureAlert
+          title="Setup could not be finished"
+          error={completion.error ?? completion.data}
+          fallback="Try finishing setup again."
+          focusOnArrival
+        />
+      ) : null}
+      {setupReady ? (
+        <FinishSetupCard
+          complete={checklist.complete}
+          operator={operator}
+          completion={completion}
+        />
+      ) : null}
+      {!checklist.complete ? (
+        <GetStarted
+          checklist={checklist}
+          snapshot={snapshot}
+          base={base}
+          accountId={accountId}
+          operator={operator}
+          profiles={profiles}
+          canManageProfiles={canManageProfiles}
+        />
+      ) : null}
+    </Section>
+  );
+}
+
+function FinishSetupCard({
+  complete,
+  operator,
+  completion,
+}: {
+  complete: boolean;
+  operator: boolean;
+  completion: ReturnType<typeof useFinishHomeSetup>;
+}) {
+  return (
+    <Card
+      title={complete ? "You are all set" : "Organization setup"}
+      description={
+        operator
+          ? "Finishing setup hides Getting started for the whole organization."
+          : "An instance operator can finish setup."
+      }
+      action={
+        operator ? (
+          <Button
+            disabled={completion.isPending}
+            aria-busy={completion.isPending}
+            onClick={() => completion.mutate()}
+          >
+            Finish setup
+          </Button>
+        ) : undefined
+      }
+    />
+  );
+}
+
+function useFinishHomeSetup(organization: HomeSnapshot["organization"], onFinished: () => void) {
   const queryClient = useQueryClient();
   const finish = useServerFn(finishHomeSetup);
   const completion = useMutation({
@@ -462,50 +549,7 @@ function HomeChecklist({
       onFinished();
     },
   });
-  return (
-    <Section>
-      {completion.isError || completion.data?.status === "error" ? (
-        <FailureAlert
-          title="Setup could not be finished"
-          error={completion.error ?? completion.data}
-          fallback="Try finishing setup again."
-          focusOnArrival
-        />
-      ) : null}
-      {setupReady ? (
-        <Card
-          title={checklist.complete ? "You are all set" : "Organization setup"}
-          description={
-            operator
-              ? "Finishing setup hides Getting started for the whole organization."
-              : "An instance operator can finish setup."
-          }
-          action={
-            operator ? (
-              <Button
-                disabled={completion.isPending}
-                aria-busy={completion.isPending}
-                onClick={() => completion.mutate()}
-              >
-                Finish setup
-              </Button>
-            ) : undefined
-          }
-        />
-      ) : null}
-      {!checklist.complete ? (
-        <GetStarted
-          checklist={checklist}
-          snapshot={snapshot}
-          base={base}
-          accountId={accountId}
-          operator={operator}
-          profiles={profiles}
-          canManageProfiles={canManageProfiles}
-        />
-      ) : null}
-    </Section>
-  );
+  return completion;
 }
 
 function GetStarted({

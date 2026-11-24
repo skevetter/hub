@@ -1,6 +1,6 @@
 import { getRouteApi, Link, linkOptions } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useId, useMemo, useState, type ChangeEvent, type FormEvent } from "react";
+import { useCallback, useId, useMemo, useState, type ChangeEvent, type ReactNode } from "react";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
 import { FormField } from "../components/app/form-field.js";
@@ -29,7 +29,7 @@ import {
   providerEventDropReasonHint,
   providerEventDropReasonSummary,
 } from "./drop-reason.js";
-import { droppedActivityPage } from "./functions.js";
+import { droppedActivityPage, type DroppedActivityPage } from "./functions.js";
 import { LIST_PROVIDERS, LIST_PROVIDER_LABELS } from "./list-providers.js";
 
 const route = getRouteApi("/_shell/o/$organizationSlug/activity/");
@@ -52,12 +52,54 @@ export function DroppedActivityPanel({ headingId }: { headingId: string }) {
   const tenant = useRouteTenant();
   const search = route.useSearch();
   const navigate = route.useNavigate();
-  const { cursor, provider, range, reason, size, source } = search;
+  const { cursor } = search;
   const organizationSlug = tenant.organization.slug;
   const accountId = tenant.account.id;
   const load = useServerFn(droppedActivityPage);
-  const filtered =
-    provider !== undefined || range !== undefined || reason !== undefined || source !== undefined;
+  const controls = useDroppedControls(search, accountId, navigate);
+  const snapshot = useSnapshotQuery({
+    queryKey: droppedActivityPageKey(organizationSlug, search),
+    queryFn: () => load({ data: droppedActivityPageRequest(organizationSlug, search) }),
+    ...(cursor === undefined ? { refetchInterval: 5_000 } : {}),
+  });
+  if (snapshot.status === "pending") return <DataTableSkeleton label={LABEL} columns={COLUMNS} />;
+  if (snapshot.status === "error") {
+    return (
+      <FailureAlert
+        title="Dropped events unavailable"
+        error={snapshot.error}
+        fallback="Hub couldn't load dropped events."
+      />
+    );
+  }
+  return (
+    <>
+      {snapshot.refreshFailure === null ? null : (
+        <FailureAlert
+          title="Dropped events may be out of date"
+          error={snapshot.refreshFailure.message}
+          fallback="Hub couldn't refresh dropped events."
+          onRetry={snapshot.refetch}
+          standalone
+        />
+      )}
+      <DroppedActivityResults
+        data={snapshot.data}
+        organizationSlug={organizationSlug}
+        headingId={headingId}
+        search={search}
+        controls={controls}
+      />
+    </>
+  );
+}
+
+function useDroppedControls(
+  search: ActivitySearch,
+  accountId: string,
+  navigate: ReturnType<typeof route.useNavigate>,
+) {
+  const { size } = search;
 
   const changeSize = useCallback(
     (next: PageSize, replace = false) => {
@@ -93,37 +135,27 @@ export function DroppedActivityPanel({ headingId }: { headingId: string }) {
     [setFilter],
   );
   const changeSource = useCallback((value: string) => setFilter("source", value), [setFilter]);
-  const snapshot = useSnapshotQuery({
-    queryKey: droppedActivityPageKey(organizationSlug, search),
-    queryFn: () => load({ data: droppedActivityPageRequest(organizationSlug, search) }),
-    ...(cursor === undefined ? { refetchInterval: 5_000 } : {}),
-  });
-  const clear = useMemo(
-    () => (
-      <ClearListFilters
-        target={pageTarget(organizationSlug, { size }, undefined)}
-        focusId={FILTERS_ID}
-      />
-    ),
-    [organizationSlug, size],
-  );
-  const empty = useMemo(
-    () =>
-      filtered ? { title: NO_FILTERED_EVENTS, action: clear } : { title: "No dropped events" },
-    [clear, filtered],
-  );
+  return { sizeControl, changeFilter, changeSource };
+}
 
-  if (snapshot.status === "pending") return <DataTableSkeleton label={LABEL} columns={COLUMNS} />;
-  if (snapshot.status === "error") {
-    return (
-      <FailureAlert
-        title="Dropped events unavailable"
-        error={snapshot.error}
-        fallback="Hub couldn't load dropped events."
-      />
-    );
-  }
-  const { events, nextCursor, previousCursor, startOffset } = snapshot.data;
+function DroppedActivityResults({
+  data,
+  organizationSlug,
+  headingId,
+  search,
+  controls,
+}: {
+  data: DroppedActivityPage;
+  organizationSlug: string;
+  headingId: string;
+  search: ActivitySearch;
+  controls: ReturnType<typeof useDroppedControls>;
+}) {
+  const { cursor, size } = search;
+  const { sizeControl, changeFilter, changeSource } = controls;
+  const filtered = hasDropFilters(search);
+  const { clear, empty } = useDroppedEmpty(organizationSlug, size, filtered);
+  const { events, nextCursor, previousCursor, startOffset } = data;
   const older = nextCursor === null ? null : pageTarget(organizationSlug, search, nextCursor);
   const newer =
     previousCursor === null ? null : pageTarget(organizationSlug, search, previousCursor);
@@ -136,43 +168,13 @@ export function DroppedActivityPanel({ headingId }: { headingId: string }) {
 
   return (
     <>
-      {snapshot.refreshFailure === null ? null : (
-        <FailureAlert
-          title="Dropped events may be out of date"
-          error={snapshot.refreshFailure.message}
-          fallback="Hub couldn't refresh dropped events."
-          onRetry={snapshot.refetch}
-          standalone
-        />
-      )}
-      <ListFilters id={FILTERS_ID}>
-        <ListFilterSelect
-          name="provider"
-          label="Provider"
-          allLabel="All providers"
-          options={PROVIDERS}
-          value={provider}
-          onChange={changeFilter}
-        />
-        <DroppedSourceFilter key={source ?? ""} source={source} onApply={changeSource} />
-        <ListFilterSelect
-          name="reason"
-          label="Drop reason"
-          allLabel="All reasons"
-          options={REASONS}
-          value={reason}
-          onChange={changeFilter}
-        />
-        <ListFilterSelect
-          name="range"
-          label="Time range"
-          allLabel="All time"
-          options={RANGES}
-          value={range}
-          onChange={changeFilter}
-        />
+      <DroppedActivityFilters
+        search={search}
+        changeFilter={changeFilter}
+        changeSource={changeSource}
+      >
         {filtered && events.length > 0 ? clear : null}
-      </ListFilters>
+      </DroppedActivityFilters>
       <DataTable label={LABEL} columns={COLUMNS} empty={empty} isEmpty={events.length === 0}>
         {events.map((event) => (
           <DroppedEvent key={event.id} event={event} organizationSlug={organizationSlug} />
@@ -192,13 +194,86 @@ export function DroppedActivityPanel({ headingId }: { headingId: string }) {
   );
 }
 
+function useDroppedEmpty(
+  organizationSlug: string,
+  size: ActivitySearch["size"],
+  filtered: boolean,
+) {
+  const clear = useMemo(
+    () => (
+      <ClearListFilters
+        target={pageTarget(organizationSlug, { size }, undefined)}
+        focusId={FILTERS_ID}
+      />
+    ),
+    [organizationSlug, size],
+  );
+  const empty = useMemo(
+    () =>
+      filtered ? { title: NO_FILTERED_EVENTS, action: clear } : { title: "No dropped events" },
+    [clear, filtered],
+  );
+
+  return { clear, empty };
+}
+
+function hasDropFilters({ provider, range, reason, source }: ActivitySearch): boolean {
+  return (
+    provider !== undefined || range !== undefined || reason !== undefined || source !== undefined
+  );
+}
+
+function DroppedActivityFilters({
+  search,
+  changeFilter,
+  changeSource,
+  children,
+}: {
+  search: ActivitySearch;
+  changeFilter: (event: ChangeEvent<HTMLSelectElement>) => void;
+  changeSource: (value: string) => void;
+  children: ReactNode;
+}) {
+  const { provider, range, reason, source } = search;
+  return (
+    <ListFilters id={FILTERS_ID}>
+      <ListFilterSelect
+        name="provider"
+        label="Provider"
+        allLabel="All providers"
+        options={PROVIDERS}
+        value={provider}
+        onChange={changeFilter}
+      />
+      <DroppedSourceFilter key={source ?? ""} source={source} onApply={changeSource} />
+      <ListFilterSelect
+        name="reason"
+        label="Drop reason"
+        allLabel="All reasons"
+        options={REASONS}
+        value={reason}
+        onChange={changeFilter}
+      />
+      <ListFilterSelect
+        name="range"
+        label="Time range"
+        allLabel="All time"
+        options={RANGES}
+        value={range}
+        onChange={changeFilter}
+      />
+      {children}
+    </ListFilters>
+  );
+}
+
 function droppedPageFeedback(
   search: ActivitySearch,
   countOfEvents: number,
   startOffset: number | null,
   filtered: boolean,
 ) {
-  const { size, provider, source, reason, range } = search;
+  const { size } = search;
   const count = `${countOfEvents} ${countOfEvents === 1 ? "event" : "events"}`;
   const rows =
     countOfEvents === 0 || startOffset === null
@@ -208,15 +283,21 @@ function droppedPageFeedback(
     filtered && countOfEvents === 0 ? NO_FILTERED_EVENTS : count,
     rows === undefined ? undefined : `Rows ${rows}`,
     `Rows per page ${size ?? DEFAULT_PAGE_SIZE}`,
-    provider === undefined ? undefined : `Provider ${LIST_PROVIDER_LABELS[provider]}`,
-    source === undefined ? undefined : `Source ${source}`,
-    reason === undefined ? undefined : `Drop reason ${DROP_REASON_LABELS[reason]}`,
-    range === undefined ? undefined : ACTIVITY_RANGE_LABELS[range],
+    ...dropFilterFeedback(search),
   ]
     .filter((detail) => detail !== undefined)
     .join(". ");
 
   return { summary: rows ?? count, announcement };
+}
+
+function dropFilterFeedback({ provider, source, reason, range }: ActivitySearch) {
+  return [
+    provider === undefined ? undefined : `Provider ${LIST_PROVIDER_LABELS[provider]}`,
+    source === undefined ? undefined : `Source ${source}`,
+    reason === undefined ? undefined : `Drop reason ${DROP_REASON_LABELS[reason]}`,
+    range === undefined ? undefined : ACTIVITY_RANGE_LABELS[range],
+  ];
 }
 
 function DroppedSourceFilter({
@@ -229,7 +310,7 @@ function DroppedSourceFilter({
   const id = useId();
   const [draft, setDraft] = useState(source ?? "");
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: ChangeEvent<HTMLFormElement>) => {
       event.preventDefault();
       onApply(draft);
     },
