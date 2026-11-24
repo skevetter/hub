@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { expect, type Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 import { test } from "./app.js";
 import type { PaseoHub } from "./helpers/hub.js";
 import { OrganizationTriggers } from "./helpers/triggers.js";
@@ -150,25 +150,54 @@ async function clientNavigate(page: Page, href: string, expected: "editor" | "re
 async function expectPhoneLayout(page: Page): Promise<void> {
   await page.setViewportSize({ width: 390, height: 844 });
   const bar = page.locator('[data-slot="sticky-actions"]');
-  const runNow = bar.getByRole("button", { name: "Run now" });
-  await expect(runNow).toBeVisible();
+  await expect(bar.getByRole("button", { name: "Run now" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Run now" })).toHaveCount(1);
-  const nav = await page.getByRole("navigation", { name: "Quick navigation" }).boundingBox();
-  const box = await bar.boundingBox();
-  const viewport = page.viewportSize();
-  if (nav === null || box === null || viewport === null) throw new Error("layout not measurable");
-  expect(box.y + box.height).toBeCloseTo(nav.y, 0);
-  expect(box.x).toBe(0);
-  expect(box.width).toBe(viewport.width);
-  const rowBlock = page.locator('[data-slot="state-block"]').first();
-  const rowLink = page.getByRole("list", { name: "Recent runs" }).getByRole("link");
-  const block = await rowBlock.boundingBox();
-  const link = await rowLink.boundingBox();
+  await scrollTo(bar, "top");
+  expect(await overflows(page)).toBe(true);
+  await expectBarFlushAboveNavigation(page);
+  await scrollTo(bar, "bottom");
+  await expectBarFlushAboveNavigation(page);
+  const block = await page.locator('[data-slot="state-block"]').first().boundingBox();
+  const link = await page
+    .getByRole("list", { name: "Recent runs" })
+    .getByRole("link")
+    .boundingBox();
   if (block === null || link === null) throw new Error("run row not measurable");
   expect(block.height).toBe(28);
-  expect(block.width).toBeLessThan(viewport.width / 2);
+  expect(block.width).toBeGreaterThanOrEqual(96);
+  expect(block.width).toBeLessThan(390 / 2);
   expect(block.y + block.height).toBeLessThanOrEqual(link.y);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+}
+
+async function overflows(page: Page): Promise<boolean> {
+  return page.evaluate(() => document.documentElement.scrollHeight > window.innerHeight);
+}
+
+/** Scrolls whichever ancestor of the bar actually scrolls: the shell may scroll the window or an inset. */
+async function scrollTo(bar: Locator, where: "top" | "bottom"): Promise<void> {
+  await bar.evaluate((element, target) => {
+    let node: HTMLElement | null = element.parentElement;
+    while (node !== null && node.scrollHeight <= node.clientHeight) node = node.parentElement;
+    const scroller = node ?? document.scrollingElement;
+    scroller?.scrollTo(0, target === "top" ? 0 : scroller.scrollHeight);
+  }, where);
+}
+
+async function expectBarFlushAboveNavigation(page: Page): Promise<void> {
+  const bar = page.locator('[data-slot="sticky-actions"]');
+  const navigation = page.getByRole("navigation", { name: "Quick navigation" });
+  await expect
+    .poll(async () => {
+      const [barBox, navBox] = await Promise.all([bar.boundingBox(), navigation.boundingBox()]);
+      if (barBox === null || navBox === null) return Number.NaN;
+      return (
+        Math.abs(barBox.y + barBox.height - navBox.y) +
+        Math.abs(barBox.x) +
+        Math.abs(barBox.width - 390)
+      );
+    })
+    .toBeLessThanOrEqual(1);
 }
 
 async function expectDesktopLayout(page: Page): Promise<void> {

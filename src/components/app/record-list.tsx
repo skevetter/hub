@@ -50,7 +50,7 @@ export function RecordRow({
     >
       {lead}
       <div className={cn("min-w-0", lead !== undefined && "md:flex-1")}>{children}</div>
-      {status === undefined && actions === undefined ? null : (
+      {lead !== undefined && status === undefined && actions === undefined ? null : (
         <div className="flex shrink-0 items-center gap-2">
           {status}
           {actions}
