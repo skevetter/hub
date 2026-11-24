@@ -5,7 +5,7 @@ import { PageHeader } from "../../components/app/page.js";
 import { Section } from "../../components/app/section.js";
 import { Button } from "../../components/ui/button.js";
 import type { SessionSnapshot } from "../functions.js";
-import type { StatusTone } from "../../components/app/status-pill.js";
+import { pillTone, sessionState } from "../../components/app/state-label.js";
 
 export function SessionsUnavailable() {
   return (
@@ -68,23 +68,13 @@ export function NewSessionLink({ organizationSlug }: { organizationSlug: string 
   );
 }
 
-const stateLabels: Record<
-  SessionSnapshot["session"]["state"],
-  { label: string; tone: StatusTone }
-> = {
-  starting: { label: "Starting", tone: "neutral" },
-  running: { label: "Running", tone: "success" },
-  idle: { label: "Idle", tone: "neutral" },
-  waiting_permission: { label: "Waiting for approval", tone: "warning" },
-  stopping: { label: "Stopping", tone: "warning" },
-  failed: { label: "Failed", tone: "danger" },
-  closed: { label: "Closed", tone: "neutral" },
-};
-
 export function sessionStatus(session: SessionSnapshot["session"]) {
-  return session.state === "idle" && session.stateReason === "stopped_by_person"
-    ? { label: "Stopped", tone: "neutral" as const }
-    : stateLabels[session.state];
+  return sessionState(session.state, session.stateReason);
+}
+
+export function sessionPill(session: SessionSnapshot["session"]) {
+  const { label, tone } = sessionStatus(session);
+  return { label, tone: pillTone(tone) };
 }
 
 const refusalMessages: Readonly<Record<string, string>> = {

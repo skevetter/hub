@@ -13,9 +13,10 @@ import { PageHeader, PageHeaderSkeleton } from "../../components/app/page.js";
 import { RelativeTime } from "../../components/app/relative-time.js";
 import { Section } from "../../components/app/section.js";
 import { SegmentedControl } from "../../components/app/segmented-control.js";
-import { StatusPill } from "../../components/app/status-pill.js";
+import { StateBlock } from "../../components/app/state-block.js";
 import { TwoLine } from "../../components/app/two-line.js";
 import { Button } from "../../components/ui/button.js";
+import { useRouteTenant } from "../../projects/context.js";
 import { listInteractiveSessions, type SessionListPage } from "../functions.js";
 import {
   NewSessionLink,
@@ -27,14 +28,16 @@ import {
 
 const DESCRIPTION = "Conversations with agents running on your daemons.";
 const COLUMNS = [
+  { header: "State", lead: true },
   { header: "Session", fill: true },
-  { header: "State" },
   { header: "Last activity", className: "hidden md:table-cell" },
 ];
 const FILTERS = [
   { value: "active", label: "Active" },
   { value: "all", label: "All" },
 ];
+
+type SessionListResult = Awaited<ReturnType<typeof listInteractiveSessions>>;
 
 export function SessionListLoading() {
   return (
@@ -52,10 +55,11 @@ export function SessionListPanel({
 }: {
   organizationSlug: string;
   filter: "active" | "all";
-  result: Awaited<ReturnType<typeof listInteractiveSessions>>;
+  result: SessionListResult;
 }) {
   const navigate = useNavigate();
   const account = useActiveAccount();
+  const tenant = useRouteTenant();
   const params = useMemo(() => ({ organizationSlug }), [organizationSlug]);
   const changeFilter = useCallback(
     (value: string) => {
@@ -71,12 +75,11 @@ export function SessionListPanel({
   if (result.status === "ok" && "outcome" in result.data && result.data.code === "not_found")
     return <SessionsUnavailable />;
   // The empty state carries the one New session action; a second filled button would compete.
-  const hasRows =
-    result.status === "ok" && !("outcome" in result.data) && result.data.sessions.length > 0;
+  const hasRows = hasSessionRows(result);
   return (
     <>
       <PageHeader title="Sessions" description={DESCRIPTION}>
-        {account.features?.interactiveSessions === true && account.capabilities.manageResources ? (
+        {account.features?.interactiveSessions === true && tenant.capabilities.manageResources ? (
           <Button asChild variant="outline">
             <Link to="/o/$organizationSlug/sessions/profiles" params={params}>
               Profiles
@@ -100,6 +103,10 @@ export function SessionListPanel({
       </Section>
     </>
   );
+}
+
+function hasSessionRows(result: SessionListResult) {
+  return result.status === "ok" && !("outcome" in result.data) && result.data.sessions.length > 0;
 }
 
 function SessionTable({
@@ -159,6 +166,24 @@ function SessionTable({
           <SessionRow key={session.id} organizationSlug={organizationSlug} session={session} />
         ))}
       </DataTable>
+      <SessionPagination error={error} next={next} busy={busy} loadMore={loadMore} />
+    </>
+  );
+}
+
+function SessionPagination({
+  error,
+  next,
+  busy,
+  loadMore,
+}: {
+  error: string | undefined;
+  next: SessionListPage["nextCursor"];
+  busy: boolean;
+  loadMore: () => void;
+}) {
+  return (
+    <>
       {error === undefined ? null : (
         <FailureAlert title="Could not load more sessions" error={error} fallback="Try again." />
       )}
@@ -205,10 +230,10 @@ function SessionRow({
   return (
     <DataRow onSelect={open}>
       <DataCell>
-        <TwoLine primary={title} secondary={byline} />
+        <StateBlock state={status} />
       </DataCell>
       <DataCell>
-        <StatusPill tone={status.tone}>{status.label}</StatusPill>
+        <TwoLine primary={title} secondary={byline} />
       </DataCell>
       <DataCell muted>
         <RelativeTime value={session.lastActivityAt} />

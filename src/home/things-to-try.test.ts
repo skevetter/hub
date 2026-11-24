@@ -63,7 +63,7 @@ describe("things to try", () => {
       commentEvents: [{ on: "linear.comment_created", hasReplyOutput: true, commentPrefix: null }],
     };
     const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers: [paused] });
-    assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new" });
+    assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new/edit" });
     assert.match(surface?.where ?? "", /Acme is connected/u);
   });
 
@@ -88,7 +88,7 @@ describe("things to try", () => {
     const trigger = { id: "t", name: "on-assign", event: "linear.issue_assigned", enabled: true };
     const [surface] = thingsToTry({ ...nothing, connections: [linear], triggers: [trigger] });
     assert.doesNotMatch(surface?.where ?? "", /Comment on an issue/u);
-    assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new" });
+    assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new/edit" });
   });
 
   it("requires the reply output on the trigger that listens to comments", () => {
@@ -162,7 +162,7 @@ describe("things to try", () => {
     const github = { ...linear, provider: "github" as const };
     const inbox = { id: "t", name: "inbox", event: "github.notification", enabled: true };
     const surface = thingsToTry({ ...nothing, connections: [github], triggers: [inbox] })[1];
-    assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new" });
+    assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new/edit" });
   });
 
   it("points a session at a profile first, then at a new session", () => {

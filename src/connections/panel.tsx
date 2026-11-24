@@ -20,12 +20,14 @@ import { useActiveAccount } from "../auth/active-account.js";
 import { CONNECTION_MUTATION_KEY } from "../auth/tenant-mutation.js";
 import { Card, CardSkeleton } from "../components/app/card.js";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
-import { FailureAlert, NoticeAlert } from "../components/app/failure-alert.js";
+import { FailureAlert } from "../components/app/failure-alert.js";
+import { toast } from "../components/app/toast-store.js";
 import { PageHeader } from "../components/app/page.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RowActions } from "../components/app/row-actions.js";
 import { Section } from "../components/app/section.js";
 import { StatusLine } from "../components/app/status-line.js";
+import { connectionState, pillTone, type ConnectionState } from "../components/app/state-label.js";
 import { StatusPill } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
@@ -53,6 +55,7 @@ import {
   type ConnectionReturn,
   type ConnectionReturnCopy,
 } from "./result-contract.js";
+import { confirmOnce } from "./outcome-toast.js";
 import { useConnectionReturn } from "./result.js";
 import {
   cacheAcknowledgedRevocation,
@@ -91,15 +94,18 @@ const PROVIDER_CARDS = [
 type ProviderStatus = ProviderConnectionStatus["status"];
 
 const UPDATING = <StatusPill tone="neutral">Updating</StatusPill>;
-const NOT_SET_UP = <StatusPill tone="neutral">Not set up</StatusPill>;
-const NEEDS_AUTHORIZATION = <StatusPill tone="warning">Needs authorization</StatusPill>;
-const STATE_PILLS: Record<ProviderStatus, ReactNode> = {
-  connected: <StatusPill tone="success">Connected</StatusPill>,
-  notConfigured: NOT_SET_UP,
-  disconnected: NOT_SET_UP,
-  requiresReauthorization: NEEDS_AUTHORIZATION,
-  suspended: NEEDS_AUTHORIZATION,
-};
+const STATE_PILLS = {
+  connected: connectionPill("connected"),
+  notConfigured: connectionPill("notConfigured"),
+  disconnected: connectionPill("disconnected"),
+  requiresReauthorization: connectionPill("requiresReauthorization"),
+  suspended: connectionPill("suspended"),
+} satisfies Record<ProviderStatus, ReactNode>;
+
+function connectionPill(status: ConnectionState) {
+  const { label, tone } = connectionState(status);
+  return <StatusPill tone={pillTone(tone)}>{label}</StatusPill>;
+}
 const ACTION_VERBS = {
   connected: "Connect",
   disconnected: "Connect",
@@ -142,7 +148,7 @@ export function OrganizationConnectionsPanel() {
   );
 }
 
-function ConnectionsContent() {
+function useConnectionQueries() {
   const tenant = useRouteTenant();
   const { isInstanceOperator } = useActiveAccount();
   const organizationSlug = tenant.organization.slug;
@@ -162,12 +168,18 @@ function ConnectionsContent() {
     queryKey: keys.status,
     queryFn: () => loadStatus({ data: scope }),
   });
+  return { scope, loading, snapshot, statusQuery, keys, isInstanceOperator };
+}
+
+function useConnectionCommands(queries: ReturnType<typeof useConnectionQueries>) {
+  const { scope, snapshot, statusQuery, keys } = queries;
   const [returned, setReturned] = useConnectionReturn();
   const connect = useMutation({
     mutationKey: CONNECTION_MUTATION_KEY,
     mutationFn: useServerFn(startConnection),
   });
-  const { revocation, snapshotProgress, statusProgress, paused } = useConnectionReadProgress(keys);
+  const progress = useConnectionReadProgress(keys);
+  const { revocation, paused } = progress;
   const disconnect = useConnectionRevocation(scope, keys);
   const mutationPending = useIsMutating({ mutationKey: CONNECTION_MUTATION_KEY }) > 0;
   const readFailure = connectionReadFailure(
@@ -176,8 +188,8 @@ function ConnectionsContent() {
     revocation !== undefined && paused,
   );
   const ready = snapshot.status === "success" && statusQuery.status === "success";
-  const { retry, retryState, retryPending, focusRetryButton, resetRetry, failure } =
-    useConnectionRetry(keys, ready, readFailure, paused);
+  const retry = useConnectionRetry(keys, ready, readFailure, paused);
+  const { resetRetry } = retry;
   const start = connect.mutate;
   const revoke = disconnect.mutate;
   const connectProvider = useCallback(
@@ -208,6 +220,24 @@ function ConnectionsContent() {
     ],
     [connect.data, connect.isError, disconnect.data, disconnect.isError],
   );
+  const emitted = useRef<unknown>(undefined);
+  return {
+    progress,
+    retry,
+    returned,
+    emitted,
+    disconnect,
+    mutationPending,
+    actions: { connectProvider, revokeConnection, mutations },
+  };
+}
+
+function ConnectionsContent() {
+  const queries = useConnectionQueries();
+  const { scope, loading, snapshot, statusQuery, isInstanceOperator } = queries;
+  const commands = useConnectionCommands(queries);
+  const { retry, retryState, retryPending, focusRetryButton, failure } = commands.retry;
+  const { revocation } = commands.progress;
   if (retryPending) {
     return (
       <>
@@ -228,10 +258,29 @@ function ConnectionsContent() {
       />
     );
   }
-  if (!ready) return loading;
+  if (snapshot.status !== "success" || statusQuery.status !== "success") return loading;
+  const data = commands.progress.snapshotProgress?.data ?? snapshot.data;
+  const statuses = commands.progress.statusProgress?.data ?? statusQuery.data;
+  return renderConnections({ data, statuses, scope, isInstanceOperator, commands });
+}
 
-  const data = snapshotProgress?.data ?? snapshot.data;
-  const statuses = statusProgress?.data ?? statusQuery.data;
+function renderConnections({
+  data,
+  statuses,
+  scope,
+  isInstanceOperator,
+  commands,
+}: {
+  data: OrganizationSnapshot;
+  statuses: ConnectionStatus;
+  scope: { organizationSlug: string };
+  isInstanceOperator: boolean;
+  commands: ReturnType<typeof useConnectionCommands>;
+}) {
+  const { disconnect, mutationPending, returned, emitted } = commands;
+  const { mutations, connectProvider, revokeConnection } = commands.actions;
+  const { revocation } = commands.progress;
+  const { retryState } = commands.retry;
   const canManage = data.capabilities.manageResources;
   const removing = disconnect.isPending ? disconnect.variables?.data : undefined;
   const busy = mutationPending || revocation !== undefined;
@@ -239,89 +288,150 @@ function ConnectionsContent() {
   const suspendedGitHub = data.connections.github.some(({ status }) => status === "suspended");
   const result = reconciledRevocation(disconnect, revocation, connections);
   const banner = revokeBannerCopy(result, returned, connections);
+  const view = {
+    statuses,
+    suspendedGitHub,
+    revocation,
+    removing,
+    data,
+    connections,
+    canManage,
+    busy,
+    revokeConnection,
+    scope,
+    isInstanceOperator,
+    connectProvider,
+  };
   return (
     <>
+      <ConnectionToast
+        {...successToast(banner, result === undefined ? returned : disconnect.submittedAt)}
+        emitted={emitted}
+        organizationSlug={scope.organizationSlug}
+      />
       {retryState === "complete" && result === undefined ? (
         <StatusLine>Connections loaded.</StatusLine>
       ) : null}
-      {banner === undefined ? null : <ConnectionReturnBanner copy={banner} />}
+      {banner?.tone === "error" ? <ConnectionReturnFailure copy={banner} /> : null}
       <CommandError mutations={mutations} />
       <Section className={GRID_COLUMNS}>
-        {PROVIDER_CARDS.map(({ provider, label, icon, description, droppedSearch }) => {
-          const reported = statuses[provider].status;
-          const status =
-            provider === "github" && reported !== "notConfigured" && suspendedGitHub
-              ? "suspended"
-              : reported;
-          const updating = revocation?.provider === provider;
-          const removingId = removing?.provider === provider ? removing.connectionId : undefined;
-          const dropped = data.droppedConnectionEvents[provider];
-          return (
-            <Card
-              key={provider}
-              label={label}
-              icon={icon}
-              title={label}
-              description={description}
-              status={updating ? UPDATING : STATE_PILLS[status]}
-            >
-              {connections[provider].length > 0 ? (
-                <ProviderConnections
-                  label={label}
-                  provider={provider}
-                  connections={connections[provider]}
-                  removingId={removingId}
-                  canManage={canManage}
-                  busy={busy}
-                  onRevoke={revokeConnection}
-                />
-              ) : null}
-              {provider === "linear" &&
-              dropped === "some" &&
-              canManage &&
-              connections.linear.length > 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  Linear events dropped because no route matched stay dropped after reconnecting.
-                </p>
-              ) : null}
-              {dropped !== "none" ? (
-                <div>
-                  <Link
-                    className="text-link underline underline-offset-2"
-                    to="/o/$organizationSlug/activity"
-                    params={scope}
-                    search={droppedSearch}
-                  >
-                    {dropped === "some"
-                      ? "Dropped events in the last 7 days"
-                      : "Check dropped events in Activity"}
-                  </Link>
-                </div>
-              ) : null}
-              {updating ? null : (
-                <ConnectionHint
-                  label={label}
-                  status={status}
-                  canManage={canManage}
-                  isInstanceOperator={isInstanceOperator}
-                />
-              )}
-              {canManage ? (
-                <ConnectionAction
-                  label={label}
-                  provider={provider}
-                  status={updating ? "disconnected" : status}
-                  isInstanceOperator={isInstanceOperator}
-                  busy={busy}
-                  onConnect={connectProvider}
-                />
-              ) : null}
-            </Card>
-          );
-        })}
+        {PROVIDER_CARDS.map((card) => renderConnectionCard(card, view))}
       </Section>
     </>
   );
+}
+
+interface ConnectionCardView {
+  statuses: ConnectionStatus;
+  suspendedGitHub: boolean;
+  revocation: ConnectionIdentity | undefined;
+  removing: RevokeInput["data"] | undefined;
+  data: OrganizationSnapshot;
+  connections: Record<ConnectionProvider, ConnectionRecord[]>;
+  canManage: boolean;
+  busy: boolean;
+  revokeConnection: (provider: ConnectionProvider, connectionId: string, label: string) => void;
+  scope: { organizationSlug: string };
+  isInstanceOperator: boolean;
+  connectProvider: (provider: ConnectionProvider) => void;
+}
+
+function renderConnectionCard(card: (typeof PROVIDER_CARDS)[number], view: ConnectionCardView) {
+  const { provider, label, icon, description } = card;
+  const { connections, canManage, busy, removing, isInstanceOperator } = view;
+  const reported = view.statuses[provider].status;
+  const status = connectionCardStatus(provider, reported, view.suspendedGitHub);
+  const updating = view.revocation?.provider === provider;
+  const removingId = removing?.provider === provider ? removing.connectionId : undefined;
+  const dropped = view.data.droppedConnectionEvents[provider];
+  return (
+    <Card
+      key={provider}
+      label={label}
+      icon={icon}
+      title={label}
+      description={description}
+      status={updating ? UPDATING : STATE_PILLS[status]}
+    >
+      {connections[provider].length > 0 ? (
+        <ProviderConnections
+          label={label}
+          provider={provider}
+          connections={connections[provider]}
+          removingId={removingId}
+          canManage={canManage}
+          busy={busy}
+          onRevoke={view.revokeConnection}
+        />
+      ) : null}
+      {renderDroppedLinearNotice(provider, view, dropped)}
+      {renderDroppedConnectionLink(card, view, dropped)}
+      {updating ? null : (
+        <ConnectionHint
+          label={label}
+          status={status}
+          canManage={canManage}
+          isInstanceOperator={isInstanceOperator}
+        />
+      )}
+      {canManage ? (
+        <ConnectionAction
+          label={label}
+          provider={provider}
+          status={updating ? "disconnected" : status}
+          isInstanceOperator={isInstanceOperator}
+          busy={busy}
+          onConnect={view.connectProvider}
+        />
+      ) : null}
+    </Card>
+  );
+}
+
+function connectionCardStatus(
+  provider: ConnectionProvider,
+  reported: ProviderStatus,
+  suspendedGitHub: boolean,
+) {
+  return provider === "github" && reported !== "notConfigured" && suspendedGitHub
+    ? "suspended"
+    : reported;
+}
+
+function renderDroppedLinearNotice(
+  provider: ConnectionProvider,
+  { canManage, connections }: ConnectionCardView,
+  dropped: OrganizationSnapshot["droppedConnectionEvents"][ConnectionProvider],
+) {
+  return provider === "linear" &&
+    dropped === "some" &&
+    canManage &&
+    connections.linear.length > 0 ? (
+    <p className="text-xs text-muted-foreground">
+      Linear events dropped because no route matched stay dropped after reconnecting.
+    </p>
+  ) : null;
+}
+
+function renderDroppedConnectionLink(
+  { droppedSearch }: (typeof PROVIDER_CARDS)[number],
+  { scope }: ConnectionCardView,
+  dropped: OrganizationSnapshot["droppedConnectionEvents"][ConnectionProvider],
+) {
+  return dropped !== "none" ? (
+    <div>
+      <Link
+        className="text-link underline underline-offset-2"
+        to="/o/$organizationSlug/activity"
+        params={scope}
+        search={droppedSearch}
+      >
+        {dropped === "some"
+          ? "Dropped events in the last 7 days"
+          : "Check dropped events in Activity"}
+      </Link>
+    </div>
+  ) : null;
 }
 
 type ConnectionRead = Pick<
@@ -343,6 +453,14 @@ function connectionReadFailure(snapshot: ConnectionRead, status: ConnectionRead,
   const statusFailure = failure(status);
   if (statusFailure != null) return { title: "Connections unavailable", ...statusFailure };
   return undefined;
+}
+
+function retryNeedsRead(
+  retryState: "idle" | "pending" | "complete",
+  ready: boolean,
+  failure: ReturnType<typeof connectionReadFailure>,
+) {
+  return retryState !== "idle" && (retryState === "pending" || (!ready && failure === undefined));
 }
 
 function useConnectionRetry(
@@ -379,10 +497,7 @@ function useConnectionRetry(
     restoreRetryFocus.current = false;
     document.getElementById(HEADING_ID)?.focus();
   }, [retrySucceeded]);
-  const retryPending =
-    !retryPaused &&
-    retryState !== "idle" &&
-    (retryState === "pending" || (!ready && failure === undefined));
+  const retryPending = !retryPaused && retryNeedsRead(retryState, ready, failure);
   return { retry, retryState, retryPending, focusRetryButton, resetRetry, failure };
 }
 
@@ -663,20 +778,45 @@ function connectionRows(
   };
 }
 
-function ConnectionReturnBanner({ copy }: { copy: ConnectionReturnCopy }): ReactNode {
-  if (copy.tone === "error") {
-    return (
-      <FailureAlert
-        standalone
-        title={copy.title}
-        error={copy.message}
-        fallback="Hub couldn't finish the connection. Start it again from this page."
-      />
-    );
-  }
+function ConnectionReturnFailure({
+  copy,
+}: {
+  copy: Extract<ConnectionReturnCopy, { tone: "error" }>;
+}): ReactNode {
   return (
-    <NoticeAlert standalone tone="success">
-      {copy.message}
-    </NoticeAlert>
+    <FailureAlert
+      page
+      title={copy.title}
+      error={copy.message}
+      fallback="Hub couldn't finish the connection. Start it again from this page."
+    />
   );
+}
+
+function successToast(banner: ConnectionReturnCopy | undefined, outcome: unknown) {
+  return banner?.tone === "success" ? { message: banner.message, outcome } : {};
+}
+
+/**
+ * A finished connection is a completed action, so it is confirmed rather than left on the page.
+ * Each outcome is confirmed once: `emitted` outlives this component, which unmounts while a
+ * background read fails, so a recovery or a reworded message never replays it.
+ */
+function ConnectionToast({
+  message,
+  outcome,
+  emitted,
+  organizationSlug,
+}: {
+  message?: string;
+  outcome?: unknown;
+  emitted: { current: unknown };
+  organizationSlug: string;
+}) {
+  useEffect(() => {
+    confirmOnce(emitted, { message, outcome }, (title) =>
+      toast({ id: `connection-return:${organizationSlug}`, scope: organizationSlug, title }),
+    );
+  }, [message, outcome, emitted, organizationSlug]);
+  return null;
 }

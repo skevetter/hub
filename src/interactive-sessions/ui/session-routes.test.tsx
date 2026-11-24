@@ -14,8 +14,11 @@ const state = vi.hoisted(() => ({
   read: vi.fn(),
   profiles: vi.fn(),
   role: "owner",
+  tenantRole: undefined as string | undefined,
   enabled: true,
 }));
+
+const routeRole = () => state.tenantRole ?? state.role;
 
 vi.mock("../functions.js", () => ({
   listInteractiveSessions: state.list,
@@ -23,6 +26,13 @@ vi.mock("../functions.js", () => ({
   listSessionProfiles: state.profiles,
   saveSessionProfile: vi.fn(),
   startInteractiveSession: vi.fn(),
+}));
+vi.mock("../../projects/context.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  useRouteTenant: () => ({
+    organization: { slug: "acme" },
+    capabilities: { manageResources: routeRole() !== "member" },
+  }),
 }));
 vi.mock("../../auth/active-account.js", () => ({
   useActiveAccount: () => ({
@@ -47,12 +57,13 @@ beforeEach(() => {
     Promise.resolve({
       status: "ok",
       data:
-        !state.enabled || (data.manage === true && state.role === "member")
+        !state.enabled || (data.manage === true && routeRole() === "member")
           ? { outcome: "refused", code: "not_found" }
           : [],
     }),
   );
   state.role = "owner";
+  state.tenantRole = undefined;
   state.enabled = true;
 });
 afterEach(() => {
@@ -170,6 +181,41 @@ it("keeps profile management out of the member routes", async () => {
   expect(await renderRoute("/o/acme/sessions/new")).toContain(
     "Ask an organization admin to create a session profile.",
   );
+  const html = await renderRoute("/o/acme/sessions/profiles");
+  expect(html).toContain("Sessions unavailable");
+  expect(html).not.toContain("Create a profile");
+});
+
+it("manages profiles by the role in the organization the URL names", async () => {
+  state.role = "member";
+  state.tenantRole = "admin";
+  const html = await renderRoute("/o/acme/sessions/profiles");
+  expect(html).toContain("No session profiles yet");
+  expect(html).toContain("Create a profile");
+});
+
+it("offers Profiles and profile creation by the role in the URL organization", async () => {
+  state.role = "member";
+  state.tenantRole = "admin";
+  expect(await renderRoute("/o/acme/sessions")).toContain('href="/o/acme/sessions/profiles"');
+  const html = await renderRoute("/o/acme/sessions/new");
+  expect(html).toContain("Create a profile");
+  expect(html).not.toContain("Ask an organization admin to create a session profile.");
+});
+
+it("withholds Profiles and profile creation when the URL organization role is member", async () => {
+  state.role = "admin";
+  state.tenantRole = "member";
+  expect(await renderRoute("/o/acme/sessions")).not.toContain('href="/o/acme/sessions/profiles"');
+  const html = await renderRoute("/o/acme/sessions/new");
+  expect(html).toContain("Ask an organization admin to create a session profile.");
+  expect(html).not.toContain("Create a profile");
+});
+
+it("keeps profile management out when the URL organization role is member", async () => {
+  state.role = "admin";
+  state.tenantRole = "member";
+  state.profiles.mockResolvedValue({ status: "ok", data: [] });
   const html = await renderRoute("/o/acme/sessions/profiles");
   expect(html).toContain("Sessions unavailable");
   expect(html).not.toContain("Create a profile");

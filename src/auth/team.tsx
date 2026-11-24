@@ -1,7 +1,7 @@
 import { Plus } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useMemo, useState, type SyntheticEvent } from "react";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
 import { DataCell, DataRow, DataTable, type DataColumn } from "../components/app/data-table.js";
 import { PageHeader } from "../components/app/page.js";
@@ -20,7 +20,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "../components/ui/select.js";
-import type { ActiveAccountState, TeamMember } from "./organization-contract.js";
 import { formValue, invitationRole } from "./account-actions.js";
 import { FormField, type FieldControl } from "../components/app/form-field.js";
 import { useActiveAccount } from "./active-account.js";
@@ -31,9 +30,6 @@ import { INVITATION_MUTATION_KEY } from "./tenant-mutation.js";
 import type { UsageLimitsView } from "../usage/dashboard.js";
 import { atLimit, LockedAction, useOrganizationLimits } from "../entitlements/ui/index.js";
 
-type AccountCommandResult = Result<{
-  state: "sessionExpired" | "organizationRequired" | "complete";
-}>;
 import {
   INVITATION_ROLES,
   ORGANIZATION_ROLES,
@@ -41,8 +37,13 @@ import {
   organizationRoleSchema,
   type InvitationRole,
   type OrganizationRole,
+  type ActiveAccountState,
+  type TeamMember,
 } from "./organization-contract.js";
 
+type AccountCommandResult = Result<{
+  state: "sessionExpired" | "organizationRequired" | "complete";
+}>;
 const INVITE_FAILURE =
   "Hub did not create the invitation. Check your connection and submit it again.";
 
@@ -144,25 +145,10 @@ function InvitationDialog({
   busy: boolean;
 }) {
   const [role, setRole] = useState<InvitationRole>(INVITATION_ROLES[1]);
-  const queryClient = useQueryClient();
-  // The dialog owns this request. It stays open until the invitation exists, so a refusal — a
-  // duplicate address, a seat that just went — is answered where the address was typed, with the
-  // address still in the field, instead of closing and reporting itself at the top of the page.
-  const create = useMutation({
-    mutationKey: INVITATION_MUTATION_KEY,
-    mutationFn: useServerFn(createInvitation) as (
-      input: Parameters<typeof createInvitation>[0],
-    ) => Promise<AccountCommandResult>,
-    onSuccess: async (result) => {
-      if (result.status !== "ok") return;
-      await queryClient.invalidateQueries({ queryKey: ["account"] });
-      setRole(INVITATION_ROLES[1]);
-      onOpenChange(false);
-    },
-  });
+  const create = useCreateInvitation(onOpenChange, setRole);
 
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>): void => {
+    (event: SyntheticEvent<HTMLFormElement>): void => {
       event.preventDefault();
       const data = new FormData(event.currentTarget);
       create.mutate({
@@ -181,20 +167,7 @@ function InvitationDialog({
   const failed = create.isError || create.data?.status === "error";
 
   const roleControl = useCallback(
-    (control: FieldControl) => (
-      <Select name="role" value={role} onValueChange={selectRole} required>
-        <SelectTrigger {...control} className="w-full">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {INVITATION_ROLES.map((roleValue) => (
-            <SelectItem value={roleValue} key={roleValue}>
-              {INVITATION_ROLE_LABELS[roleValue]}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    ),
+    (control: FieldControl) => renderInvitationRole(control, role, selectRole),
     [role, selectRole],
   );
 
@@ -225,6 +198,49 @@ function InvitationDialog({
   );
 }
 
+function useCreateInvitation(
+  onOpenChange: (open: boolean) => void,
+  setRole: (role: InvitationRole) => void,
+) {
+  const queryClient = useQueryClient();
+  // The dialog owns this request. It stays open until the invitation exists, so a refusal — a
+  // duplicate address, a seat that just went — is answered where the address was typed, with the
+  // address still in the field, instead of closing and reporting itself at the top of the page.
+  return useMutation({
+    mutationKey: INVITATION_MUTATION_KEY,
+    mutationFn: useServerFn(createInvitation) as (
+      input: Parameters<typeof createInvitation>[0],
+    ) => Promise<AccountCommandResult>,
+    onSuccess: async (result) => {
+      if (result.status !== "ok") return;
+      await queryClient.invalidateQueries({ queryKey: ["account"] });
+      setRole(INVITATION_ROLES[1]);
+      onOpenChange(false);
+    },
+  });
+}
+
+function renderInvitationRole(
+  control: FieldControl,
+  role: InvitationRole,
+  selectRole: (role: string) => void,
+) {
+  return (
+    <Select name="role" value={role} onValueChange={selectRole} required>
+      <SelectTrigger {...control} className="w-full">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {INVITATION_ROLES.map((roleValue) => (
+          <SelectItem value={roleValue} key={roleValue}>
+            {INVITATION_ROLE_LABELS[roleValue]}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
 function MembersTable({ account }: { account: ActiveAccount }) {
   return (
     <DataTable
@@ -241,39 +257,7 @@ function MembersTable({ account }: { account: ActiveAccount }) {
 }
 
 function MemberRow({ account, member }: { account: ActiveAccount; member: TeamMember }) {
-  const queryClient = useQueryClient();
-  const change = useMutation({
-    mutationKey: ACCOUNT_MUTATION_KEY,
-    mutationFn: useServerFn(changeMemberRole) as (
-      input: Parameters<typeof changeMemberRole>[0],
-    ) => Promise<AccountCommandResult>,
-    onSuccess: async (result) => {
-      if (result.status === "ok") await queryClient.invalidateQueries({ queryKey: ["account"] });
-    },
-  });
-  const removeMemberMutation = useMutation({
-    mutationKey: ACCOUNT_MUTATION_KEY,
-    mutationFn: useServerFn(removeMember) as (
-      input: Parameters<typeof removeMember>[0],
-    ) => Promise<AccountCommandResult>,
-    onSuccess: async (result) => {
-      if (result.status === "ok") await queryClient.invalidateQueries({ queryKey: ["account"] });
-    },
-  });
-  const canManage =
-    account.capabilities.manageMembers &&
-    (member.role !== "owner" || account.capabilities.manageOwners);
-  const changeRole = useCallback(
-    (value: string) => {
-      change.mutate({
-        data: { memberId: member.id, role: organizationRoleSchema.parse(value) },
-      });
-    },
-    [change, member.id],
-  );
-  const remove = useCallback(() => {
-    removeMemberMutation.mutate({ data: { memberId: member.id } });
-  }, [member.id, removeMemberMutation]);
+  const { canManage, changeRole, remove } = useMemberCommands(account, member);
 
   return (
     <DataRow>
@@ -325,6 +309,44 @@ function MemberRow({ account, member }: { account: ActiveAccount; member: TeamMe
       </DataCell>
     </DataRow>
   );
+}
+
+function useMemberCommands(account: ActiveAccount, member: TeamMember) {
+  const queryClient = useQueryClient();
+  const change = useMutation({
+    mutationKey: ACCOUNT_MUTATION_KEY,
+    mutationFn: useServerFn(changeMemberRole) as (
+      input: Parameters<typeof changeMemberRole>[0],
+    ) => Promise<AccountCommandResult>,
+    onSuccess: async (result) => {
+      if (result.status === "ok") await queryClient.invalidateQueries({ queryKey: ["account"] });
+    },
+  });
+  const removeMemberMutation = useMutation({
+    mutationKey: ACCOUNT_MUTATION_KEY,
+    mutationFn: useServerFn(removeMember) as (
+      input: Parameters<typeof removeMember>[0],
+    ) => Promise<AccountCommandResult>,
+    onSuccess: async (result) => {
+      if (result.status === "ok") await queryClient.invalidateQueries({ queryKey: ["account"] });
+    },
+  });
+  const canManage =
+    account.capabilities.manageMembers &&
+    (member.role !== "owner" || account.capabilities.manageOwners);
+  const changeRole = useCallback(
+    (value: string) => {
+      change.mutate({
+        data: { memberId: member.id, role: organizationRoleSchema.parse(value) },
+      });
+    },
+    [change, member.id],
+  );
+  const remove = useCallback(() => {
+    removeMemberMutation.mutate({ data: { memberId: member.id } });
+  }, [member.id, removeMemberMutation]);
+
+  return { canManage, changeRole, remove };
 }
 
 function InvitationList({

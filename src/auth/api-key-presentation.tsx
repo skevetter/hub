@@ -11,7 +11,8 @@ import { formatAbsolute, RelativeTime } from "../components/app/relative-time.js
 import { RowActions } from "../components/app/row-actions.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { DropdownMenuItem } from "../components/ui/dropdown-menu.js";
-import { StatusPill } from "../components/app/status-pill.js";
+import { StateBlock } from "../components/app/state-block.js";
+import { credentialState } from "../components/app/state-label.js";
 import { FieldDescription, FieldError } from "../components/ui/field.js";
 import type { Snapshot } from "../queries/index.js";
 import { githubSignerUrl, webhookCurl } from "../webhooks/contract.js";
@@ -74,6 +75,7 @@ export const SCOPE_OPTIONS = [
 ] as const;
 
 export const API_KEY_COLUMNS = [
+  { header: "Status", lead: true },
   { header: "Name", fill: true },
   { header: "Authentication" },
   { header: "Scopes", fill: true },
@@ -81,7 +83,6 @@ export const API_KEY_COLUMNS = [
   { header: "Triggers", fill: true },
   { header: "Created" },
   { header: "Last used" },
-  { header: "Status" },
   { header: "", align: "end" as const },
 ];
 
@@ -171,29 +172,38 @@ export function ApiKeyFormFields({
         pattern={"[a-z0-9][a-z0-9_.\\-]{0,62}"}
         maxLength={63}
       />
-      {signingTarget ?? (
-        <>
-          <fieldset className="grid gap-3">
-            <legend>Scopes</legend>
-            <div className="grid gap-3">
-              {SCOPE_OPTIONS.map((option) => (
-                <ScopeOption
-                  key={option.value}
-                  option={option}
-                  checked={scopes.includes(option.value)}
-                  onChange={onScopeChange}
-                />
-              ))}
-            </div>
-            {scopeError === undefined ? (
-              <FieldDescription>Select at least one scope.</FieldDescription>
-            ) : (
-              <FieldError>{scopeError}</FieldError>
-            )}
-          </fieldset>
-          <ApiKeyTriggerField triggers={triggers} />
-        </>
-      )}
+      {signingTarget ?? renderBearerKeyFields(scopes, triggers, scopeError, onScopeChange)}
+    </>
+  );
+}
+
+function renderBearerKeyFields(
+  scopes: readonly ApiKeyScope[],
+  triggers: ApiKeyTriggerChoices,
+  scopeError: string | undefined,
+  onScopeChange: (scope: ApiKeyScope, checked: boolean) => void,
+) {
+  return (
+    <>
+      <fieldset className="grid gap-3">
+        <legend>Scopes</legend>
+        <div className="grid gap-3">
+          {SCOPE_OPTIONS.map((option) => (
+            <ScopeOption
+              key={option.value}
+              option={option}
+              checked={scopes.includes(option.value)}
+              onChange={onScopeChange}
+            />
+          ))}
+        </div>
+        {scopeError === undefined ? (
+          <FieldDescription>Select at least one scope.</FieldDescription>
+        ) : (
+          <FieldError>{scopeError}</FieldError>
+        )}
+      </fieldset>
+      <ApiKeyTriggerField triggers={triggers} />
     </>
   );
 }
@@ -325,15 +335,7 @@ export function ApiKeyTable({
   );
 }
 
-function ApiKeyRow({
-  record,
-  canManage,
-  busy,
-  onRevoke,
-  signingAvailability,
-  onRotate,
-  onRetire,
-}: {
+interface ApiKeyRowProps {
   record: ApiKeyRecord;
   signingAvailability: ApiKeySigningAvailability;
   onRotate: ((record: ApiKeyRecord) => void) | undefined;
@@ -341,7 +343,10 @@ function ApiKeyRow({
   canManage: boolean;
   busy: boolean;
   onRevoke: (input: { data: { id: string } }) => void;
-}) {
+}
+
+function ApiKeyRow(props: ApiKeyRowProps) {
+  const { record, canManage, busy, onRevoke, signingAvailability, onRotate, onRetire } = props;
   const revoke = useCallback(() => onRevoke({ data: { id: record.id } }), [onRevoke, record.id]);
   const auth = record.authentication;
   const previousDeadline = auth?.previousAcceptUntil;
@@ -351,28 +356,20 @@ function ApiKeyRow({
     const id = auth?.previousVersionId;
     if (id != null) onRetire?.(record.id, id);
   }, [auth?.previousVersionId, onRetire, record.id]);
-  let allowedTriggers = "All";
-  if (record.allowedTriggers !== null) {
-    allowedTriggers =
-      record.allowedTriggers.length === 0 ? "None" : record.allowedTriggers.join(", ");
-  }
+  const allowedTriggers = allowedTriggerLabel(record.allowedTriggers);
   return (
     <DataRow>
+      <DataCell>
+        <StateBlock state={credentialState(record.revokedAt !== null)} />
+      </DataCell>
       <DataCell>{record.name}</DataCell>
       <DataCell>
-        {auth === undefined ? (
-          <TwoLine primary="Bearer token" secondary={record.prefix} mono />
-        ) : (
-          <TwoLine
-            primary="GitHub SHA-256"
-            secondary={signingStatus(
-              record.revokedAt,
-              signingAvailability,
-              previousDeadline,
-              overlapActive,
-            )}
-          />
-        )}
+        {renderApiKeyAuthentication(record, {
+          auth,
+          signingAvailability,
+          previousDeadline,
+          overlapActive,
+        })}
       </DataCell>
       <DataCell muted>
         {record.scopes
@@ -388,46 +385,106 @@ function ApiKeyRow({
         {record.lastUsedAt === null ? "Never" : <RelativeTime value={record.lastUsedAt} />}
       </DataCell>
       <DataCell>
-        <StatusPill tone={record.revokedAt === null ? "success" : "danger"}>
-          {record.revokedAt === null ? "Active" : "Revoked"}
-        </StatusPill>
-      </DataCell>
-      <DataCell>
-        {record.revokedAt === null && canManage ? (
-          <RowActions label={`Actions for ${record.name}`}>
-            {signingAvailability === "enabled" &&
-            auth?.currentVersionId != null &&
-            !overlapActive ? (
-              <DropdownMenuItem disabled={busy} onSelect={rotate}>
-                Rotate signing secret
-              </DropdownMenuItem>
-            ) : null}
-            {signingAvailability === "enabled" && auth?.previousVersionId != null ? (
-              <ConfirmMenuItem
-                label="Retire previous secret"
-                title="Retire previous signing secret?"
-                description={`Version ${auth.previousVersionId} will stop working immediately. Retire it before rotating again during an overlap.`}
-                confirmLabel="Retire previous secret"
-                cancelLabel="Cancel"
-                destructive
-                busy={busy}
-                onConfirm={retire}
-              />
-            ) : null}
-            <ConfirmMenuItem
-              label="Revoke"
-              destructive
-              title={`Revoke ${record.name}?`}
-              description="Any automation using this key stops working immediately. This cannot be undone."
-              confirmLabel="Revoke key"
-              cancelLabel="Cancel"
-              busy={busy}
-              onConfirm={revoke}
-            />
-          </RowActions>
-        ) : null}
+        {record.revokedAt === null && canManage
+          ? renderApiKeyActions({
+              record,
+              auth,
+              signingAvailability,
+              overlapActive,
+              busy,
+              rotate,
+              retire,
+              revoke,
+            })
+          : null}
       </DataCell>
     </DataRow>
+  );
+}
+
+function allowedTriggerLabel(triggers: ApiKeyRecord["allowedTriggers"]): string {
+  if (triggers === null) return "All";
+  return triggers.length === 0 ? "None" : triggers.join(", ");
+}
+
+function renderApiKeyAuthentication(
+  record: ApiKeyRecord,
+  {
+    auth,
+    signingAvailability,
+    previousDeadline,
+    overlapActive,
+  }: {
+    auth: ApiKeyRecord["authentication"];
+    signingAvailability: ApiKeySigningAvailability;
+    previousDeadline: string | null | undefined;
+    overlapActive: boolean;
+  },
+) {
+  return auth === undefined ? (
+    <TwoLine primary="Bearer token" secondary={record.prefix} mono />
+  ) : (
+    <TwoLine
+      primary="GitHub SHA-256"
+      secondary={signingStatus(
+        record.revokedAt,
+        signingAvailability,
+        previousDeadline,
+        overlapActive,
+      )}
+    />
+  );
+}
+
+function renderApiKeyActions({
+  record,
+  auth,
+  signingAvailability,
+  overlapActive,
+  busy,
+  rotate,
+  retire,
+  revoke,
+}: {
+  record: ApiKeyRecord;
+  auth: ApiKeyRecord["authentication"];
+  signingAvailability: ApiKeySigningAvailability;
+  overlapActive: boolean;
+  busy: boolean;
+  rotate: () => void;
+  retire: () => void;
+  revoke: () => void;
+}) {
+  return (
+    <RowActions label={`Actions for ${record.name}`}>
+      {signingAvailability === "enabled" && auth?.currentVersionId != null && !overlapActive ? (
+        <DropdownMenuItem disabled={busy} onSelect={rotate}>
+          Rotate signing secret
+        </DropdownMenuItem>
+      ) : null}
+      {signingAvailability === "enabled" && auth?.previousVersionId != null ? (
+        <ConfirmMenuItem
+          label="Retire previous secret"
+          title="Retire previous signing secret?"
+          description={`Version ${auth.previousVersionId} will stop working immediately. Retire it before rotating again during an overlap.`}
+          confirmLabel="Retire previous secret"
+          cancelLabel="Cancel"
+          destructive
+          busy={busy}
+          onConfirm={retire}
+        />
+      ) : null}
+      <ConfirmMenuItem
+        label="Revoke"
+        destructive
+        title={`Revoke ${record.name}?`}
+        description="Any automation using this key stops working immediately. This cannot be undone."
+        confirmLabel="Revoke key"
+        cancelLabel="Cancel"
+        busy={busy}
+        onConfirm={revoke}
+      />
+    </RowActions>
   );
 }
 

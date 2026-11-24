@@ -86,7 +86,7 @@ export class OrganizationHome {
       .getByRole("link", { name: "Create one", exact: true })
       .first()
       .click();
-    await expect(this.page).toHaveURL(/\/triggers\/new$/u);
+    await expect(this.page).toHaveURL(/\/triggers\/new\/edit$/u);
   }
 
   async expectRuns(count: number, outcomes: string) {

@@ -1,14 +1,5 @@
-import { createFileRoute } from "@tanstack/react-router";
-import { TriggerEditorPanel } from "../../../../../triggers/panel.js";
-import { triggerSearchSchema } from "../../../../../triggers/trigger-query.js";
+import { createFileRoute, Outlet } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/_shell/o/$organizationSlug/triggers/$triggerId")({
-  staticData: { breadcrumb: "Trigger editor" },
-  validateSearch: triggerSearchSchema,
-  component: TriggerEditorRoute,
+  component: Outlet,
 });
-
-function TriggerEditorRoute() {
-  const { triggerId } = Route.useParams();
-  return <TriggerEditorPanel triggerId={triggerId} />;
-}

@@ -68,7 +68,7 @@ State inks, used by `StateBlock`, `Figure` tone, `StatusLine` tone and badge cou
 | `done`      | ink / ink             | `#ededea` / `#ededea` | Succeeded, connected, online, on.                                                                             |
 | `off`       | `#d9d9d4` / `#5a5a55` | `#2f2f2c` / `#a5a5a0` | Queued, paused, off, closed, canceled, not set up.                                                            |
 
-Each state has a `-foreground` for the label on its block and a `-text` for the state set as type. There is no amber. Something either needs a person or it does not. Until rows move to `StateBlock`, `StatusPill` and `Checklist` read the old tone names, which now alias the state inks: `success` is done, `warning` and `danger` are attention, `neutral` is off.
+Each state has a `-foreground` for the label on its block and a `-text` for the state set as type. There is no amber. Something either needs a person or it does not. Until the remaining rows (project activity, run steps, members, API keys, provider cards) move to `StateBlock`, `StatusPill` and `Checklist` read the old tone names, which now alias the state inks: `success` is done, `warning` and `danger` are attention, `neutral` is off.
 
 Shell, in both themes: `rail` `#111111` (`#0a0a0a` dark), `rail-foreground` `#f7f7f4`, `rail-muted` `#a8a8a3`, `rail-accent` for hover, `rail-border` `#2e2e2e`. The current navigation item is a `live` fill with `live-foreground`. The rail is the one committed colour field; it stays ink in light mode. The `sidebar-*` tokens alias the rail. Keyboard focus on the rail uses `sidebar-ring`, at least 3:1 against `rail` in both themes; the phone tab outline is inset, so on the current tab, whose fill is `live`, it uses `live-foreground`.
 
@@ -148,7 +148,7 @@ The "Step" column says when a component reaches its Grid form: "Now" means it al
 | `FailureAlert`, `NoticeAlert`                                           | A failed request, or a neutral or success notice, as a polite live region.                                                           | 3    |
 | `WarningAlert`                                                          | Warn without blocking, inside a form or section.                                                                                     | 3    |
 | `StatusLine`                                                            | A polite live region with reserved height.                                                                                           | 3    |
-| `StateBlock`                                                            | Start a record row with its state: colour block plus label. Replaces `StatusPill` in rows. `unseen` adds "Not opened yet".           | 4    |
+| `StateBlock`                                                            | Start a record row with its state: colour block plus label, from a `StateView`. `unseen` adds "Not opened yet".                      | 4    |
 | `StateLabel` (module)                                                   | Name each object's states once: connection, daemon, run, session, trigger. Every pill, block, banner and sentence reads from it.     | 4    |
 | `StatusPill`                                                            | Show state outside a row. Never `Badge`, never a coloured span.                                                                      | 4    |
 | `RecordRow`, `RecordList`                                               | A grid row: state block, title and one line, where, time or actions. The whole row links when it navigates.                          | 4    |
@@ -182,8 +182,8 @@ The "Step" column says when a component reaches its Grid form: "Now" means it al
 Rules for the roster:
 
 1. A component owns its spacing to its neighbours. Callers never add `mb-*` or `mt-*` to a shared component; if the rhythm is wrong, fix it in the component.
-2. Every alert is one anatomy, owned by `Alert`: a tone glyph, a title, the message under it, and at most one control at the far edge, centred against the whole message. A caller passes those four things and never assembles them. The control sits at the far edge from `sm` up and takes its own row under the message on a phone.
-3. An alert standing in a page stack takes `standalone`, because nothing else owns the distance after it. Inside a form, a dialog or a section, leave it off.
+2. Every inline alert (in a form, a dialog or a section) is one anatomy, owned by `Alert`: a tone glyph, a title, the message under it, and at most one control at the far edge, centred against the whole message. A caller passes those four things and never assembles them. The control sits at the far edge from `sm` up and takes its own row under the message on a phone.
+3. An alert that stands in a page stack is a `PageAlert`, or `FailureAlert` with `page`: a 2 px foreground rule, a square mark in the state ink, a title, the message and at most one control. It is never boxed, and it owns the distance after it. The caller sets `role`: `alert` for something that arrived while the reader was here, `status` for a calmer notice, none for a warning derived from the page just opened. A finished action is a `toast()`, not an alert.
 4. A list with nothing in it is the empty state alone on the background. `DataTable` renders it instead of the table.
 5. Every skeleton lives next to the component it mirrors and shares its box.
 6. A value in a `CopyField` breaks anywhere; pass `prose` when the value is a sentence.

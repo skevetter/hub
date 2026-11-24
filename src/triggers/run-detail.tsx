@@ -3,13 +3,15 @@ import { useServerFn } from "@tanstack/react-start";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
 import { FailureAlert, NoticeAlert, type Failure } from "../components/app/failure-alert.js";
+import { PageAlert } from "../components/app/page-alert.js";
 import { ConfirmAction } from "../components/app/confirm-action.js";
 import { FollowBottom } from "../components/app/follow-bottom.js";
 import { Duration } from "../components/app/duration.js";
 import { PageHeader } from "../components/app/page.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
-import { StatusPill, statusLabel } from "../components/app/status-pill.js";
+import { pillTone, runState } from "../components/app/state-label.js";
+import { StatusPill } from "../components/app/status-pill.js";
 import { SummaryPanel } from "../components/app/summary-panel.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { useRouteTenant } from "../projects/context.js";
@@ -102,15 +104,47 @@ function LiveRunDetail({
   const queryClient = useQueryClient();
   const runId = detail.run.id;
   const cleanupPending = detail.stopDetails?.cleanupState === "waiting_for_daemon";
-  const replyPending =
-    state.status !== "running" &&
-    (detail.reply?.state === "pending" || detail.reply?.state === "sending");
+  const replyPending = awaitingRunReply(state.status, detail);
   useEffect(() => {
     if (!cleanupPending && !replyPending) return undefined;
     return pollRunDetail(() => {
       void queryClient.invalidateQueries({ queryKey: runDetailKey(organizationSlug, runId) });
     });
   }, [cleanupPending, organizationSlug, queryClient, replyPending, runId]);
+  const { stop, confirm, readImpact } = useRunStop(detail, organizationSlug, runId, queryClient);
+  const stoppedStatus =
+    stop.data?.status === "ok" && stop.data.data.status === "stopped"
+      ? stop.data.data.runStatus
+      : undefined;
+  const timeline = useMemo(
+    () => (stoppedStatus === undefined ? state : { ...state, status: stoppedStatus }),
+    [state, stoppedStatus],
+  );
+  return (
+    <RunDetailView
+      detail={detail}
+      timeline={timeline}
+      connection={state.connection}
+      stopBusy={stop.isPending}
+      onStop={confirm}
+      readStopImpact={readImpact}
+      stopError={stop.data?.status === "error" ? stop.data : stop.error}
+    />
+  );
+}
+
+function awaitingRunReply(status: RunEventPage["status"], detail: RunDetailSnapshot) {
+  return (
+    status !== "running" && (detail.reply?.state === "pending" || detail.reply?.state === "sending")
+  );
+}
+
+function useRunStop(
+  detail: RunDetailSnapshot,
+  organizationSlug: string,
+  runId: string,
+  queryClient: ReturnType<typeof useQueryClient>,
+) {
   const sendStop = useServerFn(stopRun);
   const load = useServerFn(runDetailSnapshot);
   const stop = useMutation({
@@ -141,25 +175,7 @@ function LiveRunDetail({
       ...(retryAttemptId === null ? {} : { retryAttemptId }),
     };
   }, [load, organizationSlug, runId]);
-  const stoppedStatus =
-    stop.data?.status === "ok" && stop.data.data.status === "stopped"
-      ? stop.data.data.runStatus
-      : undefined;
-  const timeline = useMemo(
-    () => (stoppedStatus === undefined ? state : { ...state, status: stoppedStatus }),
-    [state, stoppedStatus],
-  );
-  return (
-    <RunDetailView
-      detail={detail}
-      timeline={timeline}
-      connection={state.connection}
-      stopBusy={stop.isPending}
-      onStop={confirm}
-      readStopImpact={readImpact}
-      stopError={stop.data?.status === "error" ? stop.data : stop.error}
-    />
-  );
+  return { stop, confirm, readImpact };
 }
 
 export function RunDetailView({
@@ -190,7 +206,6 @@ export function RunDetailView({
     () => runSummaryRows(detail, timeline, connection, rows),
     [detail, timeline, connection, rows],
   );
-  const notice = timelineNotice(timeline);
   return (
     <>
       <div className="min-w-0 max-w-full overflow-hidden [&_p]:break-words">
@@ -207,65 +222,78 @@ export function RunDetailView({
           />
         </PageHeader>
       </div>
-      {stopError == null ? null : (
-        <FailureAlert
-          standalone
-          title="Stop failed"
-          error={stopError}
-          fallback="Hub couldn't stop this run."
-        />
-      )}
+      {renderStopFailure(stopError)}
       {timeline.status === "canceled" ? <CanceledRunNotice details={detail.stopDetails} /> : null}
-      {run.payloadExpiredAt == null ? null : (
-        <NoticeAlert standalone tone="neutral" title="Run payload expired">
-          This run's original event, inputs, prompts, and outputs expired under this Hub's retention
-          policy.
-        </NoticeAlert>
-      )}
+      {renderPayloadNotice(run.payloadExpiredAt)}
       <Section>
         <SummaryPanel label="Run" rows={summary} />
       </Section>
-      <Section title="Timeline">
-        {notice === null ? null : (
-          <NoticeAlert tone="neutral" title={notice}>
-            {timeline.origin === "derived" && !timeline.expired
-              ? "No tool events were recorded for this run"
-              : null}
-          </NoticeAlert>
-        )}
-        {timeline.expired ? null : (
-          <FollowBottom version={events.at(-1)?.seq ?? 0}>
-            <DataTable
-              label="Run timeline"
-              columns={TIMELINE_COLUMNS}
-              isEmpty={rows.length === 0}
-              empty={notice === null ? EMPTY_TIMELINE : NO_TOOL_EVENTS}
-            >
-              {rows.map((row) => (
-                <DataRow key={row.key}>
-                  <DataCell muted>
-                    <RelativeTime value={row.at} />
-                  </DataCell>
-                  <DataCell>{row.label}</DataCell>
-                  <DataCell>{row.detail}</DataCell>
-                </DataRow>
-              ))}
-            </DataTable>
-          </FollowBottom>
-        )}
-      </Section>
+      {renderRunTimeline(timeline, events, rows)}
       <RunSteps steps={detail.steps} events={events} terminal={terminal} />
     </>
   );
 }
 
-function StopRunAction({
-  detail,
-  terminal,
-  busy,
-  onConfirm,
-  readImpact,
-}: {
+function renderRunTimeline(
+  timeline: RunEventPage,
+  events: RunEventPage["events"],
+  rows: readonly TimelineRow[],
+) {
+  const notice = timelineNotice(timeline);
+  return (
+    <Section title="Timeline">
+      {notice === null ? null : (
+        <NoticeAlert tone="neutral" title={notice}>
+          {timeline.origin === "derived" && !timeline.expired
+            ? "No tool events were recorded for this run"
+            : null}
+        </NoticeAlert>
+      )}
+      {timeline.expired ? null : (
+        <FollowBottom version={events.at(-1)?.seq ?? 0}>
+          <DataTable
+            label="Run timeline"
+            columns={TIMELINE_COLUMNS}
+            isEmpty={rows.length === 0}
+            empty={notice === null ? EMPTY_TIMELINE : NO_TOOL_EVENTS}
+          >
+            {rows.map((row) => (
+              <DataRow key={row.key}>
+                <DataCell muted>
+                  <RelativeTime value={row.at} />
+                </DataCell>
+                <DataCell>{row.label}</DataCell>
+                <DataCell>{row.detail}</DataCell>
+              </DataRow>
+            ))}
+          </DataTable>
+        </FollowBottom>
+      )}
+    </Section>
+  );
+}
+
+function renderStopFailure(stopError: Failure | undefined) {
+  return stopError == null ? null : (
+    <FailureAlert
+      page
+      title="Stop failed"
+      error={stopError}
+      fallback="Hub couldn't stop this run."
+    />
+  );
+}
+
+function renderPayloadNotice(expiredAt: RunDetailSnapshot["run"]["payloadExpiredAt"]) {
+  return expiredAt == null ? null : (
+    <PageAlert role="status" tone="neutral" title="Run payload expired">
+      This run's original event, inputs, prompts, and outputs expired under this Hub's retention
+      policy.
+    </PageAlert>
+  );
+}
+
+interface StopRunActionProps {
   detail: RunDetailSnapshot;
   terminal: boolean;
   busy: boolean;
@@ -273,13 +301,55 @@ function StopRunAction({
     | ((confirmation: StopConfirmation) => Promise<BrowserStopResult | undefined>)
     | undefined;
   readImpact: (() => Promise<StopConfirmation | undefined>) | undefined;
-}) {
+}
+
+function StopRunAction({ detail, terminal, busy, onConfirm, readImpact }: StopRunActionProps) {
+  const { confirmation, impact, changeOpen, confirm } = useStopConfirmation(
+    detail,
+    onConfirm,
+    readImpact,
+  );
+  const retrying = detail.stopDetails?.retryAttemptId != null;
+  if (hideStopAction(detail, terminal, retrying, onConfirm)) return null;
+  const repeat = impact === undefined ? retrying : impact.retryAttemptId !== undefined;
+  const label = repeat ? "Stop again" : "Stop run";
+  return (
+    <ConfirmAction
+      label={label}
+      title={repeat ? "Send another interrupt?" : "Stop this run?"}
+      description={stopDescription(impact?.confirmedPeerCount, repeat, confirmation?.message)}
+      confirmLabel={label}
+      cancelLabel={repeat ? "Close" : "Keep running"}
+      destructive
+      busy={busy}
+      confirmDisabled={impact === undefined}
+      keepOpenOnConfirm
+      open={confirmation !== null}
+      onOpenChange={changeOpen}
+      onConfirm={confirm}
+    />
+  );
+}
+
+function hideStopAction(
+  detail: RunDetailSnapshot,
+  terminal: boolean,
+  retrying: boolean,
+  onConfirm: StopRunActionProps["onConfirm"],
+) {
+  return !detail.canStop || (terminal && !retrying) || onConfirm === undefined;
+}
+
+function useStopConfirmation(
+  detail: RunDetailSnapshot,
+  onConfirm: StopRunActionProps["onConfirm"],
+  readImpact: StopRunActionProps["readImpact"],
+) {
   const [confirmation, setConfirmation] = useState<{
     impact?: StopConfirmation;
     message?: string;
   } | null>(null);
   const request = useRef(0);
-  const retrying = detail.stopDetails?.retryAttemptId != null;
   const snapshotCount = detail.stopDetails?.otherAttachedRunCount;
   const snapshotAttempt = detail.stopDetails?.retryAttemptId;
   const changeOpen = useCallback(
@@ -288,15 +358,7 @@ function StopRunAction({
       setConfirmation(open ? {} : null);
       if (!open) return;
       const read =
-        readImpact?.() ??
-        Promise.resolve(
-          snapshotCount === undefined
-            ? undefined
-            : {
-                confirmedPeerCount: snapshotCount,
-                ...(snapshotAttempt == null ? {} : { retryAttemptId: snapshotAttempt }),
-              },
-        );
+        readImpact?.() ?? Promise.resolve(snapshotImpact(snapshotCount, snapshotAttempt));
       void read
         .catch(() => undefined)
         .then((impact) => {
@@ -330,25 +392,15 @@ function StopRunAction({
       return undefined;
     });
   }, [changeOpen, impact, onConfirm]);
-  if (!detail.canStop || (terminal && !retrying) || onConfirm === undefined) return null;
-  const repeat = impact === undefined ? retrying : impact.retryAttemptId !== undefined;
-  const label = repeat ? "Stop again" : "Stop run";
-  return (
-    <ConfirmAction
-      label={label}
-      title={repeat ? "Send another interrupt?" : "Stop this run?"}
-      description={stopDescription(impact?.confirmedPeerCount, repeat, confirmation?.message)}
-      confirmLabel={label}
-      cancelLabel={repeat ? "Close" : "Keep running"}
-      destructive
-      busy={busy}
-      confirmDisabled={impact === undefined}
-      keepOpenOnConfirm
-      open={confirmation !== null}
-      onOpenChange={changeOpen}
-      onConfirm={confirm}
-    />
-  );
+  return { confirmation, impact, changeOpen, confirm };
+}
+
+function snapshotImpact(
+  count: StopConfirmation["confirmedPeerCount"] | undefined,
+  attempt: string | null | undefined,
+): StopConfirmation | undefined {
+  if (count === undefined) return undefined;
+  return { confirmedPeerCount: count, ...(attempt == null ? {} : { retryAttemptId: attempt }) };
 }
 
 function stopDescription(
@@ -383,13 +435,13 @@ function CanceledRunNotice({ details }: { details: RunDetailSnapshot["stopDetail
   let note = details === undefined ? null : stopCleanupNotes[details.cleanupState];
   if (details?.cleanupState === "confirmed" && details.coalesced) note = stopCoalescedNote;
   return (
-    <NoticeAlert
-      standalone
+    <PageAlert
+      role="status"
       tone="neutral"
       title={`Stopped by ${details?.stoppedByName || "a person"}`}
     >
       {note}
-    </NoticeAlert>
+    </PageAlert>
   );
 }
 
@@ -400,23 +452,14 @@ function runSummaryRows(
   rows: readonly TimelineRow[],
 ) {
   const { run } = detail;
-  const events = timeline.events;
-  const finished = events.find((event) => event.kind === "run_finished");
   const status = timeline.status;
-  const completedAt = run.completedAt ?? finished?.at ?? null;
-  const startedAt = detail.steps.reduce<string>(
-    (earliest, step) =>
-      step.startedAt !== null && step.startedAt < earliest ? step.startedAt : earliest,
-    run.createdAt,
-  );
-  const durationMs =
-    typeof finished?.data["durationMs"] === "number" ? finished.data["durationMs"] : null;
+  const { startedAt, completedAt, durationMs } = runTiming(detail, timeline);
   return [
     {
       label: "Status",
       value: (
         <span className="flex items-center gap-2">
-          <StatusPill tone={tone(status)}>{statusLabel(status)}</StatusPill>
+          <StatusPill tone={pillTone(runState(status).tone)}>{runState(status).label}</StatusPill>
           <ConnectionPill connection={connection} />
         </span>
       ),
@@ -442,6 +485,34 @@ function runSummaryRows(
         />
       ),
     },
+    ...runProviderRows(detail, rows),
+    { label: "Repository", value: run.repo ?? "-" },
+    { label: "Received", value: <RelativeTime value={run.receivedAt} /> },
+    ...(completedAt === null
+      ? []
+      : [{ label: "Completed", value: <RelativeTime value={completedAt} /> }]),
+    ...(run.failureReason === null ? [] : [{ label: "Failure reason", value: run.failureReason }]),
+  ];
+}
+
+function runTiming(detail: RunDetailSnapshot, timeline: RunEventPage) {
+  const { run } = detail;
+  const events = timeline.events;
+  const finished = events.find((event) => event.kind === "run_finished");
+  const completedAt = run.completedAt ?? finished?.at ?? null;
+  const startedAt = detail.steps.reduce<string>(
+    (earliest, step) =>
+      step.startedAt !== null && step.startedAt < earliest ? step.startedAt : earliest,
+    run.createdAt,
+  );
+  const durationMs =
+    typeof finished?.data["durationMs"] === "number" ? finished.data["durationMs"] : null;
+  return { startedAt, completedAt, durationMs };
+}
+
+function runProviderRows(detail: RunDetailSnapshot, rows: readonly TimelineRow[]) {
+  const { run } = detail;
+  return [
     {
       label: "Activity",
       value:
@@ -483,12 +554,6 @@ function runSummaryRows(
     ...(run.webhookSummary?.prompt === undefined
       ? []
       : [{ label: "Message", value: run.webhookSummary.prompt }]),
-    { label: "Repository", value: run.repo ?? "-" },
-    { label: "Received", value: <RelativeTime value={run.receivedAt} /> },
-    ...(completedAt === null
-      ? []
-      : [{ label: "Completed", value: <RelativeTime value={completedAt} /> }]),
-    ...(run.failureReason === null ? [] : [{ label: "Failure reason", value: run.failureReason }]),
   ];
 }
 
@@ -526,6 +591,10 @@ export function progressMessageLabel(
     return detail.progressMessagesEnabled
       ? "Off for this trigger"
       : "Not posted: this Hub has progress messages off";
+  return liveProgressMessageLabel(progress);
+}
+
+function liveProgressMessageLabel(progress: NonNullable<RunDetailSnapshot["progress"]>) {
   if (progress.state === "active" || progress.state === "finished") {
     const providers = { github: "GitHub", slack: "Slack", linear: "Linear" };
     return `Posted to ${providers[progress.provider]}`;
@@ -541,10 +610,4 @@ export function progressMessageLabel(
     no_destination: "no place to post",
   };
   return `Not posted: ${progress.failure === null ? "could not confirm the message was created" : (reasons[progress.failure] ?? "could not confirm the message was created")}`;
-}
-
-function tone(status: string): "success" | "danger" | "neutral" {
-  if (status === "succeeded") return "success";
-  if (status === "failed" || status === "timed_out" || status === "rejected") return "danger";
-  return "neutral";
 }

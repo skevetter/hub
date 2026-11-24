@@ -1,5 +1,5 @@
 import { getRouteApi } from "@tanstack/react-router";
-import { useCallback, useMemo, type ChangeEvent } from "react";
+import { useCallback, useMemo, type ChangeEvent, type ReactNode } from "react";
 import { useSnapshotQuery } from "../queries/index.js";
 import { useServerFn } from "@tanstack/react-start";
 import { DataTableSkeleton } from "../components/app/data-table.js";
@@ -28,7 +28,7 @@ import {
   activitySearchSchema,
   type ActivitySearch,
 } from "./activity-query.js";
-import { triggerActivityPage } from "./functions.js";
+import { triggerActivityPage, type TriggerActivityPage } from "./functions.js";
 import { ACTIVITY_COLUMNS, TriggerActivityTable } from "./activity-table.js";
 import { LIST_PROVIDERS, LIST_PROVIDER_LABELS } from "./list-providers.js";
 
@@ -95,6 +95,34 @@ function RunsActivityPanel() {
   const { cursor, size } = search;
   const organizationSlug = tenant.organization.slug;
   const accountId = tenant.account.id;
+  const controls = useRunsActivityControls(size, accountId, navigate);
+  const snapshot = useSnapshotQuery({
+    queryKey: activityPageKey(organizationSlug, search),
+    queryFn: () => load({ data: activityPageRequest(organizationSlug, search) }),
+    // Only the newest page is live. An older page does not move, and a hidden tab is not polled.
+    ...(cursor === undefined ? { refetchInterval: LIVE_REFRESH_MS } : {}),
+  });
+  const filters = useRunsActivityFilters(snapshot, search, organizationSlug);
+  if (snapshot.status === "pending") {
+    return <DataTableSkeleton label="Trigger activity" columns={ACTIVITY_COLUMNS} />;
+  }
+  if (snapshot.status === "error") {
+    return (
+      <FailureAlert
+        title="Activity unavailable"
+        error={snapshot.error}
+        fallback="Hub couldn't load trigger activity."
+      />
+    );
+  }
+  return renderRunsActivity({ snapshot, search, organizationSlug, controls, filters });
+}
+
+function useRunsActivityControls(
+  size: ActivitySearch["size"],
+  accountId: string,
+  navigate: ReturnType<typeof route.useNavigate>,
+) {
   const changeSize = useCallback(
     (next: PageSize, replace = false) => {
       void navigate({
@@ -124,12 +152,17 @@ function RunsActivityPanel() {
     },
     [navigate],
   );
-  const snapshot = useSnapshotQuery({
-    queryKey: activityPageKey(organizationSlug, search),
-    queryFn: () => load({ data: activityPageRequest(organizationSlug, search) }),
-    // Only the newest page is live. An older page does not move, and a hidden tab is not polled.
-    ...(cursor === undefined ? { refetchInterval: LIVE_REFRESH_MS } : {}),
-  });
+  return { sizeControl, changeFilter };
+}
+
+type ActivitySnapshot = ReturnType<typeof useSnapshotQuery<TriggerActivityPage>>;
+
+function useRunsActivityFilters(
+  snapshot: ActivitySnapshot,
+  search: ActivitySearch,
+  organizationSlug: string,
+) {
+  const { size } = search;
   const triggers = snapshot.data?.triggers;
   const triggerOptions = useMemo(
     () => triggers?.map(({ id, name }) => ({ value: id, label: name })) ?? [],
@@ -148,29 +181,36 @@ function RunsActivityPanel() {
     () => (filtered ? { title: NO_FILTERED_RUNS, action: clear } : undefined),
     [clear, filtered],
   );
-  if (snapshot.status === "pending") {
-    return <DataTableSkeleton label="Trigger activity" columns={ACTIVITY_COLUMNS} />;
-  }
-  if (snapshot.status === "error") {
-    return (
-      <FailureAlert
-        title="Activity unavailable"
-        error={snapshot.error}
-        fallback="Hub couldn't load trigger activity."
-      />
-    );
-  }
+  return { triggerOptions, filtered, clear, empty };
+}
+
+function renderRunsActivity({
+  snapshot,
+  search,
+  organizationSlug,
+  controls,
+  filters,
+}: {
+  snapshot: Extract<ActivitySnapshot, { status: "success" }>;
+  search: ActivitySearch;
+  organizationSlug: string;
+  controls: ReturnType<typeof useRunsActivityControls>;
+  filters: ReturnType<typeof useRunsActivityFilters>;
+}) {
+  const { cursor } = search;
+  const { sizeControl, changeFilter } = controls;
+  const { triggerOptions, filtered, clear, empty } = filters;
   const { activity, nextCursor, previousCursor, startOffset } = snapshot.data;
   const newer =
     previousCursor === null ? null : pageTarget(organizationSlug, search, previousCursor);
   const older = nextCursor === null ? null : pageTarget(organizationSlug, search, nextCursor);
-  const { summary, announcement } = activityPageFeedback(
+  const { summary, announcement } = activityPageFeedback({
     search,
-    activity.length,
+    runCount: activity.length,
     startOffset,
     filtered,
     triggerOptions,
-  );
+  });
   return (
     <>
       {snapshot.refreshFailure === null ? null : (
@@ -179,44 +219,15 @@ function RunsActivityPanel() {
           error={snapshot.refreshFailure.message}
           fallback="Hub couldn't refresh trigger activity."
           onRetry={snapshot.refetch}
-          standalone
+          page
         />
       )}
-      <ListFilters id={FILTERS_ID}>
-        <ListFilterSelect
-          name="status"
-          label="Status"
-          allLabel="All statuses"
-          options={STATUS_OPTIONS}
-          value={search.status}
-          onChange={changeFilter}
-        />
-        <ListFilterSelect
-          name="trigger"
-          label="Trigger"
-          allLabel="All triggers"
-          options={triggerOptions}
-          value={search.trigger}
-          onChange={changeFilter}
-        />
-        <ListFilterSelect
-          name="provider"
-          label="Provider"
-          allLabel="All providers"
-          options={PROVIDER_OPTIONS}
-          value={search.provider}
-          onChange={changeFilter}
-        />
-        <ListFilterSelect
-          name="range"
-          label="Time range"
-          allLabel="All time"
-          options={RANGE_OPTIONS}
-          value={search.range}
-          onChange={changeFilter}
-        />
-        {filtered && activity.length > 0 ? clear : null}
-      </ListFilters>
+      {renderActivityFilters(
+        search,
+        changeFilter,
+        triggerOptions,
+        filtered && activity.length > 0 ? clear : null,
+      )}
       <TriggerActivityTable activity={activity} organizationSlug={organizationSlug} empty={empty} />
       <Pagination
         label="Activity pages"
@@ -232,14 +243,65 @@ function RunsActivityPanel() {
   );
 }
 
-function activityPageFeedback(
+function renderActivityFilters(
   search: ActivitySearch,
-  runCount: number,
-  startOffset: number | null,
-  filtered: boolean,
+  changeFilter: ReturnType<typeof useRunsActivityControls>["changeFilter"],
   triggerOptions: readonly ListFilterOption[],
+  clear: ReactNode,
 ) {
-  const { status, provider, trigger, range, size } = search;
+  return (
+    <ListFilters id={FILTERS_ID}>
+      <ListFilterSelect
+        name="status"
+        label="Status"
+        allLabel="All statuses"
+        options={STATUS_OPTIONS}
+        value={search.status}
+        onChange={changeFilter}
+      />
+      <ListFilterSelect
+        name="trigger"
+        label="Trigger"
+        allLabel="All triggers"
+        options={triggerOptions}
+        value={search.trigger}
+        onChange={changeFilter}
+      />
+      <ListFilterSelect
+        name="provider"
+        label="Provider"
+        allLabel="All providers"
+        options={PROVIDER_OPTIONS}
+        value={search.provider}
+        onChange={changeFilter}
+      />
+      <ListFilterSelect
+        name="range"
+        label="Time range"
+        allLabel="All time"
+        options={RANGE_OPTIONS}
+        value={search.range}
+        onChange={changeFilter}
+      />
+      {clear}
+    </ListFilters>
+  );
+}
+
+function activityPageFeedback({
+  search,
+  runCount,
+  startOffset,
+  filtered,
+  triggerOptions,
+}: {
+  search: ActivitySearch;
+  runCount: number;
+  startOffset: number | null;
+  filtered: boolean;
+  triggerOptions: readonly ListFilterOption[];
+}) {
+  const { size } = search;
   const count = `${runCount} ${runCount === 1 ? "run" : "runs"}`;
   const rows =
     runCount === 0 || startOffset === null
@@ -249,16 +311,25 @@ function activityPageFeedback(
     filtered && runCount === 0 ? NO_FILTERED_RUNS : count,
     rows === undefined ? undefined : `Rows ${rows}`,
     `Rows per page ${size ?? DEFAULT_PAGE_SIZE}`,
+    ...activityFilterDetails(search, triggerOptions),
+  ]
+    .filter((detail) => detail !== undefined)
+    .join(". ");
+  return { summary: rows ?? count, announcement };
+}
+
+function activityFilterDetails(
+  { status, provider, trigger, range }: ActivitySearch,
+  triggerOptions: readonly ListFilterOption[],
+) {
+  return [
     status === undefined ? undefined : `Status ${statusLabel(status)}`,
     provider === undefined ? undefined : `Provider ${LIST_PROVIDER_LABELS[provider]}`,
     trigger === undefined
       ? undefined
       : `Trigger ${triggerOptions.find(({ value }) => value === trigger)?.label ?? "unavailable"}`,
     range === undefined ? undefined : ACTIVITY_RANGE_LABELS[range],
-  ]
-    .filter((detail) => detail !== undefined)
-    .join(". ");
-  return { summary: rows ?? count, announcement };
+  ];
 }
 
 /** Newer follows the server's reverse cursor, so rows inserted since are not skipped. */

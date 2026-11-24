@@ -8,6 +8,7 @@ import { usePageContext } from "../navigation/index.js";
 import { Page } from "../components/app/page.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
 import { PanelSkeleton } from "../components/app/loading.js";
+import { Toaster } from "../components/app/toaster.js";
 import {
   Sidebar,
   SidebarContent,
@@ -185,6 +186,7 @@ function DashboardContent(props: DashboardContentProps) {
         </SidebarInset>
       </SiteHeaderActionsProvider>
       <PhoneNavigation items={navigation.items.slice(0, 3)}>{sidebar}</PhoneNavigation>
+      <Toaster returnFocusId={CONTENT_ID} scope={organization.slug} />
     </CommandMenuProvider>
   );
 }

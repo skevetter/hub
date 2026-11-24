@@ -208,6 +208,7 @@
   --color-rail-muted: var(--rail-muted);
   --color-rail-accent: var(--rail-accent);
   --color-rail-border: var(--rail-border);
+  --color-live-surface: color-mix(in srgb, var(--live) 10%, transparent);
   --color-success: var(--success);
   --color-success-surface: color-mix(in srgb, var(--success) 10%, transparent);
   --color-warning: var(--warning);

@@ -13,21 +13,23 @@ import { FailureAlert } from "../../components/app/failure-alert.js";
 import { PageHeader, PageHeaderSkeleton } from "../../components/app/page.js";
 import { RowActions } from "../../components/app/row-actions.js";
 import { Section } from "../../components/app/section.js";
-import { StatusPill } from "../../components/app/status-pill.js";
+import { StateBlock } from "../../components/app/state-block.js";
+import { enabledState } from "../../components/app/state-label.js";
 import { TwoLine } from "../../components/app/two-line.js";
 import { Button } from "../../components/ui/button.js";
 import { DropdownMenuItem } from "../../components/ui/dropdown-menu.js";
+import { useRouteTenant } from "../../projects/context.js";
 import { saveSessionProfile, type listSessionProfiles, type ProfileView } from "../functions.js";
 import { SessionProfileForm, type ProfileFormData } from "./session-profile-form.js";
 import { refusalMessage, SessionLoadFailure, SessionsUnavailable } from "./session-states.js";
 
 const DESCRIPTION = "Choose where sessions run and what settings agents use.";
 const COLUMNS = [
+  { header: "State", lead: true },
   { header: "Name", fill: true },
   { header: "Daemon", fill: true, className: "hidden lg:table-cell" },
   { header: "Directory", fill: true, className: "hidden lg:table-cell" },
   { header: "Provider / model", fill: true, className: "hidden lg:table-cell" },
-  { header: "State" },
   { header: "", align: "end" },
 ] satisfies DataColumn[];
 
@@ -48,9 +50,10 @@ export function SessionProfilesPanel({
   result: Awaited<ReturnType<typeof listSessionProfiles>>;
 }) {
   const account = useActiveAccount();
+  const tenant = useRouteTenant();
   if (
     account.features?.interactiveSessions !== true ||
-    !account.capabilities.manageResources ||
+    !tenant.capabilities.manageResources ||
     (result.status === "ok" && !Array.isArray(result.data) && result.data.code === "not_found")
   ) {
     return <SessionsUnavailable />;
@@ -66,20 +69,11 @@ export function SessionProfilesPanel({
   return <ProfileTable organizationSlug={organizationSlug} profiles={result.data} />;
 }
 
-function ProfileTable({
-  organizationSlug,
-  profiles,
-}: {
-  organizationSlug: string;
-  profiles: ProfileView[];
-}) {
+function useProfileSave(organizationSlug: string) {
   const router = useRouter();
   const save = useServerFn(saveSessionProfile);
   const saving = useRef(false);
   const [busy, setBusy] = useState(false);
-  const [editor, setEditor] = useState<ProfileView | null>();
-  const [error, setError] = useState<string>();
-
   const submit = useCallback(
     async (data: ProfileFormData) => {
       if (saving.current) return "A profile save is already in progress.";
@@ -100,7 +94,12 @@ function ProfileTable({
     },
     [organizationSlug, router, save],
   );
+  return { busy, submit };
+}
 
+function useProfileEditor(submit: (data: ProfileFormData) => Promise<string | null>) {
+  const [editor, setEditor] = useState<ProfileView | null>();
+  const [error, setError] = useState<string>();
   const close = useCallback(() => setEditor(undefined), []);
   const create = useCallback(() => {
     setError(undefined);
@@ -119,7 +118,10 @@ function ProfileTable({
     },
     [submit],
   );
+  return { editor, error, close, create, edit, toggle };
+}
 
+function useCreateProfile(busy: boolean, create: () => void) {
   const createButton = useMemo(
     () => (
       <Button type="button" disabled={busy} onClick={create}>
@@ -137,6 +139,19 @@ function ProfileTable({
     }),
     [createButton],
   );
+  return { createButton, empty };
+}
+
+function ProfileTable({
+  organizationSlug,
+  profiles,
+}: {
+  organizationSlug: string;
+  profiles: ProfileView[];
+}) {
+  const { busy, submit } = useProfileSave(organizationSlug);
+  const { editor, error, close, create, edit, toggle } = useProfileEditor(submit);
+  const { createButton, empty } = useCreateProfile(busy, create);
 
   return (
     <>
@@ -197,6 +212,9 @@ function ProfileRow({
   return (
     <DataRow>
       <DataCell>
+        <StateBlock state={enabledState(enabled)} />
+      </DataCell>
+      <DataCell>
         <span className="hidden lg:inline" title={profile.name}>
           {profile.name}
         </span>
@@ -207,11 +225,6 @@ function ProfileRow({
       <DataCell>{daemon}</DataCell>
       <DataCell>{profile.cwd}</DataCell>
       <DataCell>{agent}</DataCell>
-      <DataCell>
-        <StatusPill tone={enabled ? "success" : "neutral"}>
-          {enabled ? "Enabled" : "Disabled"}
-        </StatusPill>
-      </DataCell>
       <DataCell>
         <RowActions label={`Actions for ${profile.name}`}>
           <DropdownMenuItem disabled={busy} onSelect={openEditor}>

@@ -7,7 +7,8 @@ import {
   DataTableSkeleton,
   type DataColumn,
 } from "../components/app/data-table.js";
-import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
+import { FailureAlert } from "../components/app/failure-alert.js";
+import { PageAlert } from "../components/app/page-alert.js";
 import { PageHeader } from "../components/app/page.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
@@ -119,7 +120,7 @@ const LIMITS_EMPTY = { title: "No limits" };
 function SeatOverLimitBanner({ seats }: { seats: UsageMeasure }) {
   if (!overLimit(seats)) return null;
   return (
-    <WarningAlert standalone title="You're over your seat limit">
+    <PageAlert title="You're over your seat limit">
       <p>
         You have {seats.used} seats in use, but your limit is {seats.limit}.
       </p>
@@ -127,7 +128,7 @@ function SeatOverLimitBanner({ seats }: { seats: UsageMeasure }) {
         Your existing seats are kept — nothing was removed. You can't add more until you're within
         the limit.
       </p>
-    </WarningAlert>
+    </PageAlert>
   );
 }
 
