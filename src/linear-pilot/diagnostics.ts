@@ -1,7 +1,6 @@
 import { logger } from "../logger.js";
 import type { LinearAgentError, LinearAgentErrorDetails } from "../providers/linear/agent.js";
 import { surfaceUuid } from "../surfaces/store.js";
-import type { DelegationProofStage } from "./delegation.js";
 import type { DelegationFallback } from "./intake.js";
 
 interface DeliveryMetadata {
@@ -33,7 +32,7 @@ export function logPilotRefusal(
   reason: string,
   metadata: DeliveryMetadata,
   diagnostics?: LinearAgentErrorDetails & {
-    stage?: DelegationProofStage | "intake" | "issue_readback" | "signed_origin";
+    stage?: "intake" | "issue_readback" | "signed_origin" | "readback_failed" | "session_mismatch";
     linearAgentCode?: LinearAgentError["code"];
   },
 ): undefined {

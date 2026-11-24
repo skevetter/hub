@@ -199,6 +199,7 @@ function originProvider(scope: ProviderScope, scenario: Scenario) {
   const send: typeof fetch = async (_url, options) => {
     assert(typeof options?.body === "string");
     const { query, variables } = providerRequest.parse(JSON.parse(options.body));
+    if (/\bhistory\b|PaseoPilotHistory/u.test(query)) reads.push("history");
     if (query.includes("PaseoAgentViewer"))
       return Response.json({
         data: {
@@ -214,7 +215,6 @@ function originProvider(scope: ProviderScope, scenario: Scenario) {
       });
     if (query.includes("PaseoPilotDelegationConfirmation")) {
       reads.push("confirmation");
-      expect(query).not.toMatch(/\bhistory\b/u);
       return confirmationResponse(scope, scenario, options.signal);
     }
     if (query.includes("PaseoPilotDelegationIssue")) {
@@ -223,7 +223,6 @@ function originProvider(scope: ProviderScope, scenario: Scenario) {
       expect(query).toMatch(/\bdelegate\s*\{\s*id\s*\}/u);
       return replyIssueResponse(scope, scenario);
     }
-    if (/PaseoPilot(?:DelegationOrigin|History)/u.test(query)) reads.push("history");
     assert.match(query, /PaseoAgentActivityCreate/u);
     const { input } = variables;
     assert(input);
