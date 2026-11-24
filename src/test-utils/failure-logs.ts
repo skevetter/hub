@@ -24,6 +24,11 @@ export class FailureLogStream extends Writable {
       .filter((line) => line.length > 0)
       .map((line) => z.record(z.string(), z.unknown()).parse(JSON.parse(line)));
   }
+
+  /** Records that carry an error, leaving out ordinary lifecycle logs. */
+  failures(): Record<string, unknown>[] {
+    return this.records().filter((record) => "err" in record);
+  }
 }
 
 export function assertOneFailure(
@@ -36,16 +41,17 @@ export function assertOneFailure(
     canary: string;
   },
 ): Record<string, unknown> {
-  const records = stream.records();
+  const records = stream.failures();
   assert.equal(records.length, 1);
-  const record = records[0]!;
+  const [record] = records;
+  assert(record);
   assert.equal(record["operation"], expected.operation);
   assert.equal(record["component"], expected.component);
   assert.equal(record["failureKind"], expected.failureKind ?? "internal");
   assert.equal(record["level"], expected.level ?? 50);
   const error = z
     .object({ type: z.string(), stack: z.string().min(1) })
-    .passthrough()
+    .loose()
     .parse(record["err"]);
   assert.match(error.type, /Error$/u);
   assert.equal(stream.text().includes(expected.canary), false);
