@@ -8,20 +8,23 @@ import {
   type Page,
   type Request,
 } from "@playwright/test";
-import AxeBuilder from "@axe-core/playwright";
+import { AxeBuilder } from "@axe-core/playwright";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { WebSocket, type RawData } from "ws";
 import { z } from "zod";
 import { dump } from "js-yaml";
 import type { SourcePaseo } from "./source-paseo.js";
 import type { HubBundleFile } from "../../src/config/bundle.js";
-import type { BrowserDiscordEvent } from "../../src/e2e/harness/browser-providers.js";
-import type { BrowserProviderScenario } from "../../src/e2e/harness/browser-providers.js";
-import type { FixtureBillingProduct } from "../../src/e2e/harness/browser-billing.js";
+import type {
+  BrowserDiscordEvent,
+  BrowserProviderScenario,
+} from "../../src/e2e/harness/browser-providers.js";
 import {
   FIXTURE_BILLING_PRODUCTS,
   fixtureSubscriptionId,
+  type FixtureBillingProduct,
 } from "../../src/e2e/harness/browser-billing.js";
 import { configurationBundleFixture } from "../../src/test-utils/configuration-bundle.js";
 import { slugify } from "../../src/slug.js";
@@ -131,12 +134,18 @@ async function organizationDestinations(navigation: Locator): Promise<readonly s
   return destinations;
 }
 
-const ORGANIZATION_SETTINGS_SECTIONS: readonly OrganizationSettingsSection[] = [
+const ORGANIZATION_SETTINGS_SECTIONS = new Set<OrganizationSection | OrganizationSettingsSection>([
   "Team",
   "API keys",
   "Usage",
   "Billing",
-];
+]);
+
+function isOrganizationSettingsSection(
+  name: OrganizationSection | OrganizationSettingsSection,
+): name is OrganizationSettingsSection {
+  return ORGANIZATION_SETTINGS_SECTIONS.has(name);
+}
 
 interface TeamExpectation {
   membersPresent: string[];
@@ -168,19 +177,57 @@ interface OrganizationIsolationJourney {
 type StartBuiltApplication = (options?: BuiltApplicationOptions) => Promise<BuiltApplication>;
 type StartSourcePaseo = () => Promise<SourcePaseo>;
 
+const ManualRunResponseSchema = z
+  .object({
+    code: z.string().optional(),
+    detail: z.string().optional(),
+    issues: z.array(z.object({ message: z.string() }).loose()).optional(),
+    error: z.string().optional(),
+    reason: z.string().optional(),
+    workflowStatus: z.string().optional(),
+    triggerRunId: z.string().optional(),
+  })
+  .loose();
+
+function manualRunDetails(body: z.infer<typeof ManualRunResponseSchema>) {
+  const error = body.error ?? body.code;
+  const reason = body.reason ?? body.issues?.[0]?.message;
+  const triggerRunId = body.triggerRunId ?? rejectedManualRunId(body.detail);
+  return {
+    ...(error === undefined ? {} : { error }),
+    ...(reason === undefined ? {} : { reason }),
+    ...(body.workflowStatus === undefined ? {} : { workflowStatus: body.workflowStatus }),
+    ...(triggerRunId === undefined ? {} : { triggerRunId }),
+  };
+}
+
+function rejectedManualRunId(detail: string | undefined): string | undefined {
+  return /^Run (?<triggerRunId>\S+) rejected/u.exec(detail ?? "")?.groups?.["triggerRunId"];
+}
+
 export class PaseoHub {
   private readonly users = new Map<string, HubUser>();
   private readonly hubCredentials = new Map<string, string>();
   private sourcePaseo: SourcePaseo | undefined;
 
+  private readonly requests: APIRequestContext;
+  private readonly startApplication: StartBuiltApplication;
+  private readonly startSourcePaseo: StartSourcePaseo;
+
   constructor(
     private readonly primary: BuiltApplication,
     private readonly browser: Browser,
     private readonly page: Page,
-    private readonly requests: APIRequestContext,
-    private readonly startApplication: StartBuiltApplication,
-    private readonly startSourcePaseo: StartSourcePaseo,
-  ) {}
+    ...[requests, startApplication, startSourcePaseo]: [
+      requests: APIRequestContext,
+      startApplication: StartBuiltApplication,
+      startSourcePaseo: StartSourcePaseo,
+    ]
+  ) {
+    this.requests = requests;
+    this.startApplication = startApplication;
+    this.startSourcePaseo = startSourcePaseo;
+  }
 
   primaryApplication(): BuiltApplication {
     return this.primary;
@@ -238,13 +285,13 @@ export class PaseoHub {
       },
       expected: {
         status: 503,
-        body: problemBody(
-          "phase-zero-unavailable",
-          503,
-          "infrastructure_unavailable",
-          "Service unavailable",
-          "Public API authentication or storage is currently unavailable.",
-        ),
+        body: problemBody({
+          requestId: "phase-zero-unavailable",
+          status: 503,
+          code: "infrastructure_unavailable",
+          title: "Service unavailable",
+          detail: "Public API authentication or storage is currently unavailable.",
+        }),
         headers: { "content-type": PROBLEM_TYPE },
       },
     });
@@ -438,7 +485,8 @@ export class PaseoHub {
   }
 
   async createRunApiKey(alias: string): Promise<string> {
-    return await this.requireUser(alias).createRunApiKey();
+    const key = await this.requireUser(alias).createRunApiKey();
+    return key;
   }
 
   async proveInviteOnlyJourney(account: Account): Promise<void> {
@@ -512,7 +560,9 @@ export class PaseoHub {
             password: "blocked-signup-password",
           }),
         });
-        return { status: result.status, body: await result.json() };
+        const status = result.status;
+        const body: unknown = await result.json();
+        return { status, body };
       }, application.origin);
       expect(response).toEqual({ status: 403, body: { error: "registration_closed" } });
     } finally {
@@ -545,7 +595,9 @@ export class PaseoHub {
           headers: { "content-type": "application/json", origin },
           body: JSON.stringify({ name: "Blocked Organization" }),
         });
-        return { status: result.status, body: await result.json() };
+        const status = result.status;
+        const body: unknown = await result.json();
+        return { status, body };
       }, application.origin);
       expect(response).toEqual({ status: 403, body: { error: "organization_creation_disabled" } });
     } finally {
@@ -640,43 +692,7 @@ export class PaseoHub {
 
   async deliverSignedUnroutedSlackEvent(alias: string): Promise<void> {
     const email = this.requireUser(alias).accountEmail;
-    const [target] = z
-      .array(
-        z.object({
-          project_id: z.string().uuid(),
-          organization_id: z.string(),
-          user_id: z.string(),
-        }),
-      )
-      .parse(
-        await this.queryDatabaseRows(
-          this.primary,
-          `select project.id project_id, project.organization_id, "user".id user_id
-           from session
-           join "user" on "user".id = session.user_id
-           join projects project on project.organization_id = session.active_organization_id
-           where lower("user".email) = $1 and project.slug = 'default'
-           order by session.expires_at desc limit 1`,
-          [email],
-        ),
-      );
-    if (target === undefined) throw new Error("Slack event project unavailable");
-    await this.queryDatabase(
-      this.primary,
-      `insert into slack_connections
-         (organization_id, team_id, slug, team_name, bot_user_id, bot_access_token, scopes, connected_by_user_id)
-       values ($1, 'T-drop-reason', 'drop-reason-slack', 'Drop Reason Slack', 'UBOT',
-               'PRIVATE-SLACK-TOKEN',
-               '["app_mentions:read","channels:history","chat:write","files:read","groups:history","reactions:write","users:read"]'::jsonb, $2)`,
-      [target.organization_id, target.user_id],
-    );
-    const daemonSlug = "browser-drop-reason";
-    await this.seedDaemonForEmail(this.primary, email, daemonSlug);
-    await this.primary.installUnroutedSlackFixture({
-      projectId: target.project_id,
-      userId: target.user_id,
-      files: configurationBundleFixture(dump(browserUnroutedSlackConfiguration(daemonSlug))),
-    });
+    await this.installUnroutedSlackFixture(email);
 
     const body = JSON.stringify({
       type: "event_callback",
@@ -720,8 +736,48 @@ export class PaseoHub {
       ),
     );
     expect(reasons).toHaveLength(1);
-    expect(reasons[0]!.dropped_reason).toBe("trigger_filters_rejected");
+    expect(reasons[0]?.dropped_reason).toBe("trigger_filters_rejected");
     expect(JSON.stringify(reasons)).not.toMatch(/PRIVATE-|TOKEN|SIGNATURE/u);
+  }
+
+  private async installUnroutedSlackFixture(email: string): Promise<void> {
+    const [target] = z
+      .array(
+        z.object({
+          project_id: z.uuid(),
+          organization_id: z.string(),
+          user_id: z.string(),
+        }),
+      )
+      .parse(
+        await this.queryDatabaseRows(
+          this.primary,
+          `select project.id project_id, project.organization_id, "user".id user_id
+           from session
+           join "user" on "user".id = session.user_id
+           join projects project on project.organization_id = session.active_organization_id
+           where lower("user".email) = $1 and project.slug = 'default'
+           order by session.expires_at desc limit 1`,
+          [email],
+        ),
+      );
+    if (target === undefined) throw new Error("Slack event project unavailable");
+    await this.queryDatabase(
+      this.primary,
+      `insert into slack_connections
+         (organization_id, team_id, slug, team_name, bot_user_id, bot_access_token, scopes, connected_by_user_id)
+       values ($1, 'T-drop-reason', 'drop-reason-slack', 'Drop Reason Slack', 'UBOT',
+               'PRIVATE-SLACK-TOKEN',
+               '["app_mentions:read","channels:history","chat:write","files:read","groups:history","reactions:write","users:read"]'::jsonb, $2)`,
+      [target.organization_id, target.user_id],
+    );
+    const daemonSlug = "browser-drop-reason";
+    await this.seedDaemonForEmail(this.primary, email, daemonSlug);
+    await this.primary.installUnroutedSlackFixture({
+      projectId: target.project_id,
+      userId: target.user_id,
+      files: configurationBundleFixture(dump(browserUnroutedSlackConfiguration(daemonSlug))),
+    });
   }
 
   async setDaemonSlug(daemonId: string, slug: string): Promise<void> {
@@ -759,29 +815,11 @@ export class PaseoHub {
         input: input.rawInput,
       },
     });
-    const body = z
-      .object({
-        code: z.string().optional(),
-        detail: z.string().optional(),
-        issues: z.array(z.object({ message: z.string() }).passthrough()).optional(),
-        error: z.string().optional(),
-        reason: z.string().optional(),
-        workflowStatus: z.string().optional(),
-        triggerRunId: z.string().optional(),
-      })
-      .passthrough()
-      .parse(await response.json());
-    const error = body.error ?? body.code;
-    const reason = body.reason ?? body.issues?.[0]?.message;
-    const triggerRunId =
-      body.triggerRunId ??
-      /^Run (?<triggerRunId>\S+) rejected/u.exec(body.detail ?? "")?.groups?.["triggerRunId"];
+    const body = ManualRunResponseSchema.parse(await response.json());
+    const details = manualRunDetails(body);
     return {
       status: response.status(),
-      ...(error === undefined ? {} : { error }),
-      ...(reason === undefined ? {} : { reason }),
-      ...(body.workflowStatus === undefined ? {} : { workflowStatus: body.workflowStatus }),
-      ...(triggerRunId === undefined ? {} : { triggerRunId }),
+      ...details,
     };
   }
 
@@ -932,7 +970,9 @@ export class PaseoHub {
 
     // Re-tagging in Stripe brings the plan back: the mirror is a reconciled snapshot, not a
     // one-way delete.
-    await application.setBillingProduct(FIXTURE_BILLING_PRODUCTS[1]!);
+    const hosted = FIXTURE_BILLING_PRODUCTS[1];
+    if (hosted === undefined) throw new Error("Hosted fixture billing product is missing");
+    await application.setBillingProduct(hosted);
     await this.deliverBillingWebhook(application, "product.updated", "prod_fixture_hosted");
     await this.expectPublicBillingPlans(application, FIXTURE_BILLING_PLAN_EXPECTATIONS);
     return application.origin;
@@ -953,7 +993,8 @@ export class PaseoHub {
    * plan onto it — the whole migration mechanism for a plan change.
    */
   async raiseFreeExecutionAllowance(limit: number): Promise<void> {
-    const free = FIXTURE_BILLING_PRODUCTS[0]!;
+    const free = FIXTURE_BILLING_PRODUCTS[0];
+    if (free === undefined) throw new Error("Free fixture billing product is missing");
     await this.primary.setBillingProduct({
       ...free,
       metadata: { ...free.metadata, ent_executions_monthly_limit: String(limit) },
@@ -1250,11 +1291,35 @@ export class PaseoHub {
       this.installTenantProviderConfiguration(orbitId, "orbit-inc/app", "200"),
     ]);
 
-    await this.deliverGitHub("acme-github", 42, 9001, "acme-inc/app", "alice");
+    await this.deliverGitHub({
+      deliveryId: "acme-github",
+      installationId: 42,
+      repositoryId: 9001,
+      repo: "acme-inc/app",
+      actor: "alice",
+    });
     await this.deliverDiscord("301", "100", "800");
-    await this.deliverGitHub("orbit-github", 84, 9101, "orbit-inc/app", "alice");
+    await this.deliverGitHub({
+      deliveryId: "orbit-github",
+      installationId: 84,
+      repositoryId: 9101,
+      repo: "orbit-inc/app",
+      actor: "alice",
+    });
     await this.deliverDiscord("302", "200", "800");
 
+    const dispatches = await this.waitForTenantProviderDispatches();
+    expect(dispatches).toEqual([
+      dispatchEvidence("acme-github", acmeId, acmeDaemon.daemonId),
+      dispatchEvidence("discord-301", acmeId, acmeDaemon.daemonId),
+      dispatchEvidence("discord-302", orbitId, orbitDaemon.daemonId),
+      dispatchEvidence("orbit-github", orbitId, orbitDaemon.daemonId),
+    ]);
+    await Promise.all([acmeDaemon.close(), orbitDaemon.close()]);
+    await this.chooseOrganization(alias, "Acme");
+  }
+
+  private async waitForTenantProviderDispatches() {
     const dispatchesSchema = z.array(
       z.object({
         delivery_id: z.string(),
@@ -1263,7 +1328,7 @@ export class PaseoHub {
         machine_organization_id: z.string(),
         daemon_id: z.string(),
         daemon_slug: z.literal("shared-dispatch"),
-        execution_id: z.string().uuid(),
+        execution_id: z.uuid(),
       }),
     );
     const dispatches = await retryUntil(
@@ -1292,24 +1357,17 @@ export class PaseoHub {
         ),
       (rows) => rows.length === 4,
     );
-    expect(dispatches).toEqual([
-      dispatchEvidence("acme-github", acmeId, acmeDaemon.daemonId),
-      dispatchEvidence("discord-301", acmeId, acmeDaemon.daemonId),
-      dispatchEvidence("discord-302", orbitId, orbitDaemon.daemonId),
-      dispatchEvidence("orbit-github", orbitId, orbitDaemon.daemonId),
-    ]);
-    await Promise.all([acmeDaemon.close(), orbitDaemon.close()]);
-    await this.chooseOrganization(alias, "Acme");
+    return dispatches;
   }
 
   async proveDisconnectedProvidersDrop(): Promise<void> {
-    await this.deliverGitHub(
-      "acme-github-after-disconnect",
-      42,
-      9001,
-      "acme-inc/app",
-      "after-disconnect",
-    );
+    await this.deliverGitHub({
+      deliveryId: "acme-github-after-disconnect",
+      installationId: 42,
+      repositoryId: 9001,
+      repo: "acme-inc/app",
+      actor: "after-disconnect",
+    });
     await this.deliverDiscord("303", "100", "800");
     const dropped = z
       .array(
@@ -1604,13 +1662,37 @@ export class PaseoHub {
     await this.joinInvitation(memberAlias, invitation);
   }
 
-  async proveInvitationSurvivesSessionExpiry(
+  proveInvitationSurvivesSessionExpiry(
     ownerAlias: string,
     owner: Account,
-    inviteeAlias: string,
-    invitee: Account,
-    organization: string,
+    ...[inviteeAlias, invitee, organization]: [
+      inviteeAlias: string,
+      invitee: Account,
+      organization: string,
+    ]
   ): Promise<void> {
+    return this.proveInvitationAfterExpiry({
+      ownerAlias,
+      owner,
+      inviteeAlias,
+      invitee,
+      organization,
+    });
+  }
+
+  private async proveInvitationAfterExpiry({
+    ownerAlias,
+    owner,
+    inviteeAlias,
+    invitee,
+    organization,
+  }: {
+    ownerAlias: string;
+    owner: Account;
+    inviteeAlias: string;
+    invitee: Account;
+    organization: string;
+  }): Promise<void> {
     await this.signUpAs(ownerAlias, owner);
     await this.createOrganization(ownerAlias, organization);
     const invitation = await this.inviteMember(ownerAlias, invitee.email, "member");
@@ -1649,7 +1731,7 @@ export class PaseoHub {
       this.primary.origin,
       credential,
     );
-    const daemonId = z.string().uuid().parse(result["daemonId"]);
+    const daemonId = z.uuid().parse(result["daemonId"]);
     await this.queryDatabase(this.primary, "update daemons set slug = $2 where id = $1", [
       daemonId,
       slugify(displayName, "daemon"),
@@ -1925,7 +2007,13 @@ export class PaseoHub {
    * intake deduplicates on the payload's signature as well as on the delivery id.
    */
   async deliverUnroutedGitHubEvent(deliveryId: string): Promise<void> {
-    await this.deliverGitHub(deliveryId, 42, 9001, "acme-inc/app", deliveryId);
+    await this.deliverGitHub({
+      deliveryId,
+      installationId: 42,
+      repositoryId: 9001,
+      repo: "acme-inc/app",
+      actor: deliveryId,
+    });
   }
 
   /** A connected session-v1 daemon that serves the trigger editor's provider catalog. */
@@ -1999,12 +2087,13 @@ export class PaseoHub {
         ),
       );
     expect(identity).toBeDefined();
+    if (identity === undefined) return;
     await this.queryDatabase(
       this.primary,
       `insert into organization_triggers
          (id, organization_id, name, enabled, format, runtime_project_id)
        values ($1, $2, $3, true, 'legacy_multistep', null)`,
-      [triggerId, identity!.organization_id, name],
+      [triggerId, identity.organization_id, name],
     );
     await this.queryDatabase(
       this.primary,
@@ -2017,10 +2106,10 @@ export class PaseoHub {
       [
         revisionId,
         triggerId,
-        identity!.organization_id,
+        identity.organization_id,
         yaml,
         `browser-${randomUUID()}`,
-        identity!.user_id,
+        identity.user_id,
       ],
     );
     await this.queryDatabase(
@@ -2153,7 +2242,7 @@ export class PaseoHub {
       .object({
         deviceCode: z.string(),
         userCode: z.string(),
-        verificationUriComplete: z.string().url(),
+        verificationUriComplete: z.url(),
       })
       .parse(await response.json());
     return { ...request, verificationUrl: request.verificationUriComplete };
@@ -2200,13 +2289,19 @@ export class PaseoHub {
     });
   }
 
-  private async deliverGitHub(
-    deliveryId: string,
-    installationId: number,
-    repositoryId: number,
-    repo: string,
-    actor: string,
-  ): Promise<void> {
+  private async deliverGitHub({
+    deliveryId,
+    installationId,
+    repositoryId,
+    repo,
+    actor,
+  }: {
+    deliveryId: string;
+    installationId: number;
+    repositoryId: number;
+    repo: string;
+    actor: string;
+  }): Promise<void> {
     const payload = JSON.stringify(
       githubIssueCommentPayload(installationId, repositoryId, repo, actor),
     );
@@ -2248,7 +2343,8 @@ export class PaseoHub {
     text: string,
     values: readonly unknown[],
   ): Promise<unknown[]> {
-    return await application.query(text, values);
+    const rows = await application.query(text, values);
+    return rows;
   }
 
   private async verifyManualApplication(application: BuiltApplication): Promise<void> {
@@ -2394,7 +2490,11 @@ export class PaseoHub {
 
     expect((await post("/api/auth/organization/create", {})).status()).toBe(404);
 
-    const originFailures = [
+    const originFailures: {
+      name: string;
+      headers: Record<string, string>;
+      error: { message: string; code: string };
+    }[] = [
       {
         name: "hostile origin",
         headers: { origin: HOSTILE_ORIGIN },
@@ -2452,23 +2552,25 @@ export class PaseoHub {
       origin: HOSTILE_ORIGIN,
     });
 
-    for (const contract of [
-      {
-        name: "Better Auth rejects a hostile cookie origin",
-        headers: { "content-type": "application/json", origin: HOSTILE_ORIGIN },
-        body: '{"message":"Invalid origin","code":"INVALID_ORIGIN"}',
-      },
-      {
-        name: "Better Auth rejects a missing cookie origin",
-        headers: { "content-type": "application/json" },
-        body: '{"message":"Missing or null Origin","code":"MISSING_OR_NULL_ORIGIN"}',
-      },
-      {
-        name: "Better Auth rejects a null cookie origin",
-        headers: { "content-type": "application/json", origin: "null" },
-        body: '{"message":"Missing or null Origin","code":"MISSING_OR_NULL_ORIGIN"}',
-      },
-    ]) {
+    const cookieOriginFailures: { name: string; headers: Record<string, string>; body: string }[] =
+      [
+        {
+          name: "Better Auth rejects a hostile cookie origin",
+          headers: { "content-type": "application/json", origin: HOSTILE_ORIGIN },
+          body: '{"message":"Invalid origin","code":"INVALID_ORIGIN"}',
+        },
+        {
+          name: "Better Auth rejects a missing cookie origin",
+          headers: { "content-type": "application/json" },
+          body: '{"message":"Missing or null Origin","code":"MISSING_OR_NULL_ORIGIN"}',
+        },
+        {
+          name: "Better Auth rejects a null cookie origin",
+          headers: { "content-type": "application/json", origin: "null" },
+          body: '{"message":"Missing or null Origin","code":"MISSING_OR_NULL_ORIGIN"}',
+        },
+      ];
+    for (const contract of cookieOriginFailures) {
       await this.verifyExactContract(application, {
         name: contract.name,
         request: {
@@ -2509,7 +2611,7 @@ export class PaseoHub {
     expect(response.status()).toBe(201);
     expect(response.headers()["content-type"]).toBe(JSON_TYPE);
     const body = z
-      .object({ token: z.string().min(1), expiresAt: z.string().datetime() })
+      .object({ token: z.string().min(1), expiresAt: z.iso.datetime() })
       .strict()
       .parse(await response.json());
     return body.token;
@@ -2534,7 +2636,7 @@ export class PaseoHub {
     const body = z
       .object({
         projectSlug: z.literal("default"),
-        versionId: z.string().uuid(),
+        versionId: z.uuid(),
         version: z.literal(1),
         active: z.literal(true),
       })
@@ -2563,16 +2665,16 @@ export class PaseoHub {
     const body = z
       .object({
         deliveryKey: z.literal("built-contract-run"),
-        providerEventReceiptId: z.string().uuid(),
-        triggerRunId: z.string().uuid(),
+        providerEventReceiptId: z.uuid(),
+        triggerRunId: z.uuid(),
         configuredTriggerName: z.literal("deploy"),
         workflowStatus: z.literal("running"),
       })
       .strict()
       .parse(await response.json());
-    const execution = await retryUntil(
+    const [execution] = await retryUntil(
       async () =>
-        z.array(z.object({ id: z.string().uuid() })).parse(
+        z.array(z.object({ id: z.uuid() })).parse(
           await this.queryDatabaseRows(
             application,
             `select execution.id
@@ -2585,7 +2687,8 @@ export class PaseoHub {
         ),
       (rows) => rows.length === 1,
     );
-    return { executionId: execution[0]!.id };
+    if (execution === undefined) throw new Error("Execution is missing after polling");
+    return { executionId: execution.id };
   }
 
   private async completeExecution(
@@ -2595,13 +2698,12 @@ export class PaseoHub {
   ): Promise<void> {
     const capability = await daemon.executionCapability(executionId);
     const client = new McpClient({ name: "paseo-hub-browser-contract", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(new URL(capability.url), {
-      requestInit: { headers: capability.headers },
-    });
+    // The SDK getter returns string | undefined, unlike the exact optional Transport field.
+    const transport: Omit<Transport, "sessionId"> = new StreamableHTTPClientTransport(
+      new URL(capability.url),
+      { requestInit: { headers: capability.headers } },
+    );
     try {
-      // The SDK's getter is typed `string | undefined` while its Transport interface uses an
-      // exact-optional `sessionId?: string`; the runtime class is the SDK's official transport.
-      // @ts-expect-error upstream SDK exactOptionalPropertyTypes mismatch
       await client.connect(transport);
       const result = await client.callTool({ name: "finish_execution", arguments: {} });
       expect(result.isError).toBeUndefined();
@@ -2993,6 +3095,10 @@ class HubUser {
     );
     await dialog.getByRole("button", { name: "Done" }).click();
 
+    await this.expectApiKeyRevocation(revealedSecret);
+  }
+
+  private async expectApiKeyRevocation(revealedSecret: string): Promise<void> {
     const row = this.page
       .getByRole("table", { name: "API keys" })
       .getByRole("row")
@@ -3867,10 +3973,7 @@ class HubUser {
     await actions.click();
     await this.page.getByRole("menuitem", { name: "Copy link" }).click();
     await expect(this.page.getByRole("status")).toHaveText("Invitation link copied.");
-    return z
-      .string()
-      .url()
-      .parse(await this.page.evaluate(() => navigator.clipboard.readText()));
+    return z.url().parse(await this.page.evaluate(() => navigator.clipboard.readText()));
   }
 
   /** The invite control in its locked state: a link out to the remedy, not a disabled button. */
@@ -4502,9 +4605,8 @@ class HubUser {
     await this.openPlanDialog();
     const viewport = this.page.viewportSize();
     expect(viewport).not.toBeNull();
-    expect(
-      await this.page.evaluate(() => document.documentElement.scrollWidth),
-    ).toBeLessThanOrEqual(viewport!.width);
+    const scrollWidth = await this.page.evaluate(() => document.documentElement.scrollWidth);
+    if (viewport !== null) expect(scrollWidth).toBeLessThanOrEqual(viewport.width);
     const action = this.page.getByRole("dialog").getByRole("button", {
       name: `Subscribe to ${HOSTED_PLAN_NAME}`,
     });
@@ -4672,7 +4774,7 @@ class HubUser {
     await this.page.unroute(callback);
     await this.page.goto(connectionsUrl);
     await expect(this.page.getByRole("heading", { name: "Connections", level: 1 })).toBeVisible();
-    return z.string().url().parse(destination);
+    return z.url().parse(destination);
   }
 
   async expectProviderStartLocksAccountContext(
@@ -5275,13 +5377,11 @@ class HubUser {
   private async openOrganizationSection(
     name: OrganizationSection | OrganizationSettingsSection,
   ): Promise<void> {
-    const settings = ORGANIZATION_SETTINGS_SECTIONS.includes(name as OrganizationSettingsSection);
+    const settings = isOrganizationSettingsSection(name);
     await this.returnToOrganizationScope();
     const mobile = await this.mobileNavigation().isVisible();
     if (mobile) {
-      await this.openMobileOrganizationSection(
-        settings ? "Settings" : (name as OrganizationSection),
-      );
+      await this.openMobileOrganizationSection(settings ? "Settings" : name);
       if (settings) {
         await this.page
           .getByRole("navigation", { name: "Organization settings" })
@@ -5289,9 +5389,9 @@ class HubUser {
           .click();
       }
     } else if (settings) {
-      await this.navigation.openOrganizationSettings(name as OrganizationSettingsSection);
+      await this.navigation.openOrganizationSettings(name);
     } else {
-      await this.navigation.openOrganizationSection(name as OrganizationSection);
+      await this.navigation.openOrganizationSection(name);
     }
     await expect(this.page.getByRole("heading", { name, exact: true, level: 1 })).toBeVisible();
   }
@@ -5420,7 +5520,7 @@ async function expectAccessible(page: Page): Promise<void> {
 }
 
 function roleLabel(role: "owner" | "admin" | "member"): string {
-  return role[0]!.toUpperCase() + role.slice(1);
+  return role.slice(0, 1).toUpperCase() + role.slice(1);
 }
 
 class ContractDaemon {
@@ -5456,7 +5556,7 @@ class ContractDaemon {
         daemonId: z.literal(this.daemonId),
         slug: z.literal(this.slug),
         scopes: z.tuple([z.literal("hub.execution.*")]),
-        webSocketUrl: z.string().url(),
+        webSocketUrl: z.url(),
       })
       .strict()
       .parse(await response.json());
@@ -5494,7 +5594,7 @@ class ContractDaemon {
       await promise;
     }
     return z
-      .object({ url: z.string().url(), headers: z.record(z.string(), z.string()) })
+      .object({ url: z.url(), headers: z.record(z.string(), z.string()) })
       .parse(this.executionCapabilities.get(executionId));
   }
 
@@ -5537,17 +5637,7 @@ class ContractDaemon {
     }
     const request = envelope.data.message;
     if (request.type === "create_agent_request") {
-      const capability = request.config.mcpServers["hub"];
-      if (!capability) throw new Error("Hub execution capability is missing");
-      const executionId = new URL(capability.url).pathname.split("/")[2];
-      if (!executionId) throw new Error("Hub execution ID is missing");
-      this.executionCapabilities.set(executionId, capability);
-      this.sendAgentResponse("status", {
-        requestId: request.requestId,
-        status: "agent_created",
-        agentId: `agent-${executionId}`,
-        agent: this.agentSnapshot(`agent-${executionId}`),
-      });
+      this.acceptCreateAgent(request.requestId, request.config.mcpServers["hub"]);
       return;
     }
     if (request.type === "fetch_agent_request") {
@@ -5570,6 +5660,19 @@ class ContractDaemon {
     // Request names end in either `_request` or `.request`; the response keeps the separator.
     this.sendAgentResponse(request.type.replace(/([._])request$/, "$1response"), {
       requestId: request.requestId,
+    });
+  }
+
+  private acceptCreateAgent(requestId: string, capability: ExecutionCapability | undefined): void {
+    if (!capability) throw new Error("Hub execution capability is missing");
+    const executionId = new URL(capability.url).pathname.split("/")[2];
+    if (!executionId) throw new Error("Hub execution ID is missing");
+    this.executionCapabilities.set(executionId, capability);
+    this.sendAgentResponse("status", {
+      requestId,
+      status: "agent_created",
+      agentId: `agent-${executionId}`,
+      agent: this.agentSnapshot(`agent-${executionId}`),
     });
   }
 
@@ -5628,55 +5731,10 @@ class ContractDaemon {
    * (`agent-configuration-validator.ts` in getpaseo/paseo).
    */
   private acceptAgentValidation(value: unknown): boolean {
-    const envelope = z
-      .object({
-        type: z.literal("session"),
-        message: z.object({
-          type: z.literal("hub.execution.agent.validate.request"),
-          requestId: z.string(),
-          provider: z.string(),
-          model: z.string().optional(),
-          modeId: z.string().optional(),
-          thinkingOptionId: z.string().optional(),
-        }),
-      })
-      .safeParse(value);
+    const envelope = AgentValidationRequestSchema.safeParse(value);
     if (!envelope.success) return false;
     const request = envelope.data.message;
-    const provider = browserProviderSnapshot.find((entry) => entry.provider === request.provider);
-    const issues: { path: string[]; message: string }[] = [];
-    if (provider === undefined) {
-      issues.push({ path: ["provider"], message: `Provider '${request.provider}' is unavailable` });
-    } else {
-      const model =
-        request.model === undefined
-          ? provider.models.find((candidate) => "isDefault" in candidate && candidate.isDefault)
-          : provider.models.find((candidate) => candidate.id === request.model);
-      if (request.model !== undefined && model === undefined) {
-        issues.push({
-          path: ["model"],
-          message: `Model '${request.model}' is not available for provider '${request.provider}'`,
-        });
-      }
-      if (
-        request.modeId !== undefined &&
-        !provider.modes.some((candidate) => candidate.id === request.modeId)
-      ) {
-        issues.push({
-          path: ["modeId"],
-          message: `Mode '${request.modeId}' is not available for provider '${request.provider}'`,
-        });
-      }
-      if (
-        request.thinkingOptionId !== undefined &&
-        !model?.thinkingOptions.some((candidate) => candidate.id === request.thinkingOptionId)
-      ) {
-        issues.push({
-          path: ["thinkingOptionId"],
-          message: `Thinking option '${request.thinkingOptionId}' is not available for provider '${request.provider}'`,
-        });
-      }
-    }
+    const issues = agentValidationIssues(request);
     this.socket?.send(
       JSON.stringify({
         type: "session",
@@ -5783,7 +5841,10 @@ const browserProviderSnapshot = [
   },
 ] as const;
 
-type ExecutionCapability = { url: string; headers: Record<string, string> };
+interface ExecutionCapability {
+  url: string;
+  headers: Record<string, string>;
+}
 
 interface HttpContract {
   name: string;
@@ -5930,135 +5991,134 @@ const HTML_TYPE = "text/html; charset=utf-8";
 
 function manualFailureContracts(machineKey: string): readonly HttpContract[] {
   return [
-    exact("health", "/health", "GET", 200, '{"ok":true}', JSON_TYPE),
     exact(
+      "health",
+      { path: "/health", method: "GET" },
+      {
+        status: 200,
+        body: '{"ok":true}',
+        contentType: JSON_TYPE,
+      },
+    ),
+    machineAuthFailure(
       "enrollment token requires machine authentication",
       "/api/v1/daemons/enrollment-tokens",
-      "POST",
-      401,
-      problemBody(
-        "phase-zero-contract",
-        401,
-        "unauthorized",
-        "Authentication required",
-        "Provide an active Paseo organization credential in the Authorization: Bearer header.",
-      ),
-      PROBLEM_TYPE,
-      { "x-request-id": "phase-zero-contract" },
     ),
     exact(
       "daemon enrollment requires a token",
-      "/api/daemons/enroll",
-      "POST",
-      401,
-      '{"error":"unauthorized"}',
-      JSON_TYPE,
+      { path: "/api/daemons/enroll", method: "POST" },
+      { status: 401, body: '{"error":"unauthorized"}', contentType: JSON_TYPE },
     ),
     exact(
       "daemon revocation conceals missing daemons",
-      "/api/daemons/00000000-0000-4000-8000-000000000000",
-      "DELETE",
-      401,
-      '{"error":"unauthorized"}',
-      JSON_TYPE,
+      { path: "/api/daemons/00000000-0000-4000-8000-000000000000", method: "DELETE" },
+      { status: 401, body: '{"error":"unauthorized"}', contentType: JSON_TYPE },
     ),
     exact(
       "execution completion requires a token",
-      "/agent-executions/00000000-0000-4000-8000-000000000000/mcp",
-      "POST",
-      401,
-      '{"error":"unauthorized"}',
-      JSON_TYPE,
+      { path: "/agent-executions/00000000-0000-4000-8000-000000000000/mcp", method: "POST" },
+      { status: 401, body: '{"error":"unauthorized"}', contentType: JSON_TYPE },
     ),
-    exact(
-      "configuration install requires admin",
-      "/api/v1/configurations/install",
-      "POST",
-      401,
-      problemBody(
-        "phase-zero-contract",
-        401,
-        "unauthorized",
-        "Authentication required",
-        "Provide an active Paseo organization credential in the Authorization: Bearer header.",
-      ),
-      PROBLEM_TYPE,
-      { "x-request-id": "phase-zero-contract" },
-    ),
-    exact(
-      "manual run requires admin",
-      "/api/v1/manual-runs",
-      "POST",
-      401,
-      problemBody(
-        "phase-zero-contract",
-        401,
-        "unauthorized",
-        "Authentication required",
-        "Provide an active Paseo organization credential in the Authorization: Bearer header.",
-      ),
-      PROBLEM_TYPE,
-      { "x-request-id": "phase-zero-contract" },
-    ),
+    machineAuthFailure("configuration install requires admin", "/api/v1/configurations/install"),
+    machineAuthFailure("manual run requires admin", "/api/v1/manual-runs"),
     exact(
       "obsolete test trigger is unavailable",
-      "/test/trigger",
-      "POST",
-      404,
-      "Not Found",
-      TEXT_TYPE,
+      { path: "/test/trigger", method: "POST" },
+      { status: 404, body: "Not Found", contentType: TEXT_TYPE },
     ),
-    exact("obsolete test smoke is unavailable", "/test/smoke", "POST", 404, "Not Found", TEXT_TYPE),
-    exact("webhook requires a signature", "/webhook", "POST", 401, "Unauthorized", TEXT_TYPE),
+    exact(
+      "obsolete test smoke is unavailable",
+      { path: "/test/smoke", method: "POST" },
+      { status: 404, body: "Not Found", contentType: TEXT_TYPE },
+    ),
+    exact(
+      "webhook requires a signature",
+      { path: "/webhook", method: "POST" },
+      {
+        status: 401,
+        body: "Unauthorized",
+        contentType: TEXT_TYPE,
+      },
+    ),
+    ...authenticatedManualFailureContracts(machineKey),
+  ];
+}
+
+function machineAuthFailure(name: string, path: string): HttpContract {
+  return exact(
+    name,
+    { path, method: "POST", headers: { "x-request-id": "phase-zero-contract" } },
+    {
+      status: 401,
+      body: problemBody({
+        requestId: "phase-zero-contract",
+        status: 401,
+        code: "unauthorized",
+        title: "Authentication required",
+        detail:
+          "Provide an active Paseo organization credential in the Authorization: Bearer header.",
+      }),
+      contentType: PROBLEM_TYPE,
+    },
+  );
+}
+
+function authenticatedManualFailureContracts(machineKey: string): readonly HttpContract[] {
+  const headers = {
+    ...machineHeaders(machineKey),
+    "content-type": "application/json",
+    "x-request-id": "phase-zero-contract",
+  };
+  return [
     exact(
       "invalid configuration is not activated",
-      "/api/v1/configurations/install",
-      "POST",
-      422,
-      problemBody(
-        "phase-zero-contract",
-        422,
-        "invalid_configuration_bundle",
-        "Invalid configuration bundle",
-        "Correct the canonical Hub bundle files and submit them again.",
-        [{ path: [".paseo/hub.yml"], message: "invalid YAML: line 2, column 1" }],
-      ),
-      PROBLEM_TYPE,
       {
-        ...machineHeaders(machineKey),
-        "content-type": "application/json",
-        "x-request-id": "phase-zero-contract",
+        path: "/api/v1/configurations/install",
+        method: "POST",
+        headers: { ...headers },
+        body: JSON.stringify({
+          projectSlug: "default",
+          files: [{ path: ".paseo/hub.yml", content: "environments: [" }],
+        }),
       },
-      JSON.stringify({
-        projectSlug: "default",
-        files: [{ path: ".paseo/hub.yml", content: "environments: [" }],
-      }),
+      {
+        status: 422,
+        body: problemBody({
+          requestId: "phase-zero-contract",
+          status: 422,
+          code: "invalid_configuration_bundle",
+          title: "Invalid configuration bundle",
+          detail: "Correct the canonical Hub bundle files and submit them again.",
+          issues: [{ path: [".paseo/hub.yml"], message: "invalid YAML: line 2, column 1" }],
+        }),
+        contentType: PROBLEM_TYPE,
+      },
     ),
     exact(
       "unknown manual config is visible",
-      "/api/v1/manual-runs",
-      "POST",
-      404,
-      problemBody(
-        "phase-zero-contract",
-        404,
-        "project_not_found",
-        "Project not found",
-        "No active project with that slug exists in the credential's organization.",
-      ),
-      PROBLEM_TYPE,
       {
-        ...machineHeaders(machineKey),
-        "content-type": "application/json",
-        "x-request-id": "phase-zero-contract",
+        path: "/api/v1/manual-runs",
+        method: "POST",
+        headers: { ...headers },
+        body: JSON.stringify({
+          projectSlug: "missing",
+          trigger: "deploy",
+          actor: "contract-operator",
+          deliveryKey: "missing",
+          input: {},
+        }),
       },
-      JSON.stringify({
-        projectSlug: "missing",
-        trigger: "deploy",
-        actor: "contract-operator",
-        deliveryKey: "missing",
-        input: {},
-      }),
+      {
+        status: 404,
+        body: problemBody({
+          requestId: "phase-zero-contract",
+          status: 404,
+          code: "project_not_found",
+          title: "Project not found",
+          detail: "No active project with that slug exists in the credential's organization.",
+        }),
+        contentType: PROBLEM_TYPE,
+      },
     ),
   ];
 }
@@ -6066,22 +6126,73 @@ function manualFailureContracts(machineKey: string): readonly HttpContract[] {
 const WEBHOOK_SOURCE_CONTRACTS: readonly HttpContract[] = [
   exact(
     "manual trigger is unavailable in webhook mode",
-    "/test/trigger",
-    "POST",
-    404,
-    "Not Found",
-    TEXT_TYPE,
+    { path: "/test/trigger", method: "POST" },
+    { status: 404, body: "Not Found", contentType: TEXT_TYPE },
   ),
   exact(
     "manual smoke is unavailable in webhook mode",
-    "/test/smoke",
-    "POST",
-    404,
-    "Not Found",
-    TEXT_TYPE,
+    { path: "/test/smoke", method: "POST" },
+    { status: 404, body: "Not Found", contentType: TEXT_TYPE },
   ),
-  exact("webhook requires a signature", "/webhook", "POST", 401, "Unauthorized", TEXT_TYPE),
+  exact(
+    "webhook requires a signature",
+    { path: "/webhook", method: "POST" },
+    {
+      status: 401,
+      body: "Unauthorized",
+      contentType: TEXT_TYPE,
+    },
+  ),
 ];
+
+const AgentValidationRequestSchema = z.object({
+  type: z.literal("session"),
+  message: z.object({
+    type: z.literal("hub.execution.agent.validate.request"),
+    requestId: z.string(),
+    provider: z.string(),
+    model: z.string().optional(),
+    modeId: z.string().optional(),
+    thinkingOptionId: z.string().optional(),
+  }),
+});
+
+function agentValidationIssues(request: z.infer<typeof AgentValidationRequestSchema>["message"]) {
+  const provider = browserProviderSnapshot.find((entry) => entry.provider === request.provider);
+  if (provider === undefined) {
+    return [{ path: ["provider"], message: `Provider '${request.provider}' is unavailable` }];
+  }
+  const issues: { path: string[]; message: string }[] = [];
+  const model =
+    request.model === undefined
+      ? provider.models.find((candidate) => "isDefault" in candidate && candidate.isDefault)
+      : provider.models.find((candidate) => candidate.id === request.model);
+  if (request.model !== undefined && model === undefined) {
+    issues.push({
+      path: ["model"],
+      message: `Model '${request.model}' is not available for provider '${request.provider}'`,
+    });
+  }
+  if (
+    request.modeId !== undefined &&
+    !provider.modes.some((candidate) => candidate.id === request.modeId)
+  ) {
+    issues.push({
+      path: ["modeId"],
+      message: `Mode '${request.modeId}' is not available for provider '${request.provider}'`,
+    });
+  }
+  if (
+    request.thinkingOptionId !== undefined &&
+    !model?.thinkingOptions.some((candidate) => candidate.id === request.thinkingOptionId)
+  ) {
+    issues.push({
+      path: ["thinkingOptionId"],
+      message: `Thinking option '${request.thinkingOptionId}' is not available for provider '${request.provider}'`,
+    });
+  }
+  return issues;
+}
 
 const ExecutionRequestSchema = z.object({
   type: z.literal("session"),
@@ -6094,7 +6205,7 @@ const ExecutionRequestSchema = z.object({
           z.string(),
           z.object({
             type: z.literal("http"),
-            url: z.string().url(),
+            url: z.url(),
             headers: z.record(z.string(), z.string()).default({}),
           }),
         ),
@@ -6125,34 +6236,31 @@ const ExecutionRequestSchema = z.object({
 
 function exact(
   name: string,
-  path: string,
-  method: HttpRequest["method"],
-  status: number,
-  body: string,
-  contentType: string,
-  headers?: Record<string, string>,
-  requestBody?: string,
+  request: HttpRequest,
+  { status, body, contentType }: { status: number; body: string; contentType: string },
 ): HttpContract {
   return {
     name,
-    request: {
-      path,
-      method,
-      ...(headers === undefined ? {} : { headers }),
-      ...(requestBody === undefined ? {} : { body: requestBody }),
-    },
+    request,
     expected: { status, body, headers: { "content-type": contentType } },
   };
 }
 
-function problemBody(
-  requestId: string,
-  status: number,
-  code: string,
-  title: string,
-  detail: string,
-  issues?: readonly { path: readonly (string | number)[]; message: string }[],
-): string {
+function problemBody({
+  requestId,
+  status,
+  code,
+  title,
+  detail,
+  issues,
+}: {
+  requestId: string;
+  status: number;
+  code: string;
+  title: string;
+  detail: string;
+  issues?: readonly { path: readonly (string | number)[]; message: string }[];
+}): string {
   return JSON.stringify({
     type: `https://paseo.sh/problems/${code.replaceAll("_", "-")}`,
     title,
@@ -6320,7 +6428,8 @@ function readSocketData(data: RawData): string {
 }
 
 function plainLogs(value: string): string {
-  return value.replace(/\u001B\[[0-9;]*m/gu, "");
+  const colorCode = new RegExp(String.raw`${String.fromCharCode(27)}\[[0-9;]*m`, "gu");
+  return value.replace(colorCode, "");
 }
 
 async function retryUntil<T>(read: () => Promise<T>, done: (value: T) => boolean): Promise<T> {
