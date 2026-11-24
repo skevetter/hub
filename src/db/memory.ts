@@ -366,6 +366,37 @@ function laterCooldown(previous: Date | null, next: Date | null): Date | null {
   return new Date(next);
 }
 
+function progressBlocksTimelineExpiry(progress: RunProgressMessage): boolean {
+  return (
+    isProgressUnsettled(progress) ||
+    (progress.credentialRetryAt?.getTime() ?? 0) > Date.now() ||
+    (progress.credentialRejectedUntil?.getTime() ?? 0) > Date.now()
+  );
+}
+
+function progressCompensationIsDue(message: RunProgressMessage, now: Date): boolean {
+  return (
+    (message.state === "active" || message.state === "finished") &&
+    (message.retryAt === null || message.retryAt <= now) &&
+    message.compensationRequestedGen > message.compensationDoneGen &&
+    (message.compensationNotBefore === null || message.compensationNotBefore <= now)
+  );
+}
+
+function nextCompensationNotBefore(
+  message: RunProgressMessage,
+  pending: boolean,
+  notBefore: Date | undefined,
+): Date | null {
+  return notBefore === undefined || (pending && message.compensationNotBefore === null)
+    ? null
+    : new Date(
+        pending && message.compensationNotBefore !== null
+          ? Math.min(message.compensationNotBefore.getTime(), notBefore.getTime())
+          : notBefore,
+      );
+}
+
 const interactiveSessionLock = "isession-memory";
 
 export function createMemoryDatabase(
@@ -2106,17 +2137,8 @@ class MemoryDatabase implements Database {
     const opened = this.openTimelineForAppend(input, dedupeKey);
     if (opened === undefined || !("eventCount" in opened)) return opened;
     const state = opened;
-    const notice =
-      this.runTimelineEvents.get(state.triggerRunId)?.some((row) => row.kind === "truncated") ??
-      false;
-    if (state.stepEndCount >= 100 || input.kind === "run_finished")
-      this.refreshTimelineStepOmissions(state);
-    const data = prepareTimelineData(
-      input.kind,
-      input.kind === "run_finished"
-        ? { ...input.data, stepRowsOmitted: state.stepRowsOmitted }
-        : input.data,
-    );
+    const notice = this.hasTimelineTruncationNotice(state.triggerRunId);
+    const data = this.prepareTimelineAppendData(state, input);
     const bytes = jsonbBytes(data);
     if (timelineBudgetExceeded(state, input.kind, bytes, maxEvents, notice)) {
       this.dropTimelineEvent(state, input, notice);
@@ -2132,6 +2154,28 @@ class MemoryDatabase implements Database {
       data,
     };
     this.insertTimelineEvent(state, event);
+    this.finishTimelineAppend(state, input, event, { dedupeKey, bytes });
+    return { seq: event.seq, inserted: true };
+  }
+
+  private prepareTimelineAppendData(state: RunTimelineState, input: AppendRunTimelineEventInput) {
+    if (state.stepEndCount >= 100 || input.kind === "run_finished")
+      this.refreshTimelineStepOmissions(state);
+    return prepareTimelineData(
+      input.kind,
+      input.kind === "run_finished"
+        ? { ...input.data, stepRowsOmitted: state.stepRowsOmitted }
+        : input.data,
+    );
+  }
+
+  private finishTimelineAppend(
+    state: RunTimelineState,
+    input: AppendRunTimelineEventInput,
+    event: RunTimelineEvent,
+    accounting: { dedupeKey: string | undefined; bytes: number },
+  ): void {
+    const { dedupeKey, bytes } = accounting;
     if (dedupeKey !== undefined) {
       const dedupe = this.runTimelineDedupe.get(state.triggerRunId) ?? new Map<string, number>();
       dedupe.set(dedupeKey, event.seq);
@@ -2147,7 +2191,6 @@ class MemoryDatabase implements Database {
       state.sealedSeq = event.seq;
       state.sealedAt = new Date(input.at);
     }
-    return { seq: event.seq, inserted: true };
   }
 
   async recordRunTimelineDrops(
@@ -2179,6 +2222,14 @@ class MemoryDatabase implements Database {
       if (opened === undefined || !("eventCount" in opened)) return undefined;
       state = opened;
     }
+    return this.recordTimelineDropBatch(state, { organizationId, runId, count, at, batchId });
+  }
+
+  private recordTimelineDropBatch(
+    state: RunTimelineState,
+    batch: { organizationId: string; runId: string; count: number; at: Date; batchId: string },
+  ) {
+    const { organizationId, runId, count, at, batchId } = batch;
     const batchIds = this.runTimelineAccountingBatchIds.get(runId) ?? [];
     if (batchIds.includes(batchId)) {
       const notice = this.runTimelineEvents.get(runId)?.find((event) => event.kind === "truncated");
@@ -2190,8 +2241,7 @@ class MemoryDatabase implements Database {
     if (batchIds.length > 16) batchIds.shift();
     this.runTimelineAccountingBatchIds.set(runId, batchIds);
     state.droppedCount += count;
-    const notice =
-      this.runTimelineEvents.get(runId)?.some((event) => event.kind === "truncated") ?? false;
+    const notice = this.hasTimelineTruncationNotice(runId);
     if (state.sealedSeq !== null || notice) return { seq: state.eventCount, inserted: false };
     const seq = state.eventCount + 1;
     this.insertTimelineEvent(state, {
@@ -2218,12 +2268,21 @@ class MemoryDatabase implements Database {
     )
       return undefined;
     if (run.payloadExpiredAt != null) return { reason: "expired" };
-    let state = this.runTimelineStates.get(run.id);
+    const state = this.runTimelineStates.get(run.id);
     if (state?.expiredAt != null) return { reason: "expired" };
     if (state?.sealedSeq != null) {
       if (isOrdinary(input.kind)) state.droppedCount += 1;
       return { reason: "sealed" };
     }
+    return this.timelineAppendTarget(run, state, input, dedupeKey);
+  }
+
+  private timelineAppendTarget(
+    run: AcceptedTriggerRunRecord,
+    state: RunTimelineState | undefined,
+    input: AppendRunTimelineEventInput,
+    dedupeKey: string | undefined,
+  ): RunTimelineState | AppendRunTimelineEventResult {
     const existingSeq =
       dedupeKey === undefined ? undefined : this.runTimelineDedupe.get(run.id)?.get(dedupeKey);
     if (existingSeq !== undefined) return { seq: existingSeq, inserted: false };
@@ -2249,6 +2308,10 @@ class MemoryDatabase implements Database {
       this.runTimelineStates.set(run.id, state);
     }
     return state;
+  }
+
+  private hasTimelineTruncationNotice(runId: string): boolean {
+    return this.runTimelineEvents.get(runId)?.some((event) => event.kind === "truncated") ?? false;
   }
 
   private dropTimelineEvent(
@@ -2379,13 +2442,7 @@ class MemoryDatabase implements Database {
         }
         const state = this.runTimelineStates.get(run.id);
         const progress = this.runProgressMessages.get(run.id);
-        if (
-          progress !== undefined &&
-          (isProgressUnsettled(progress) ||
-            (progress.credentialRetryAt?.getTime() ?? 0) > Date.now() ||
-            (progress.credentialRejectedUntil?.getTime() ?? 0) > Date.now())
-        )
-          return false;
+        if (progress !== undefined && progressBlocksTimelineExpiry(progress)) return false;
         return (state !== undefined && state.expiredAt === null) || progress !== undefined;
       })
       .sort(
@@ -2473,8 +2530,7 @@ class MemoryDatabase implements Database {
     const message = this.runProgressMessages.get(input.triggerRunId);
     if (
       message?.organizationId !== input.organizationId ||
-      this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
-      this.triggerRuns.get(input.triggerRunId)?.payloadExpiredAt != null ||
+      !this.progressRunIsAvailable(input) ||
       (message.leaseOwner !== null &&
         message.leaseOwner !== input.owner &&
         message.leaseExpiresAt !== null &&
@@ -2528,8 +2584,7 @@ class MemoryDatabase implements Database {
     const message = this.runProgressMessages.get(input.triggerRunId);
     if (
       message?.organizationId !== input.organizationId ||
-      this.triggerRuns.get(input.triggerRunId)?.organizationId !== input.organizationId ||
-      this.triggerRuns.get(input.triggerRunId)?.payloadExpiredAt != null ||
+      !this.progressRunIsAvailable(input) ||
       message.leaseOwner !== input.owner ||
       message.version !== input.version ||
       message.leaseExpiresAt === null ||
@@ -2537,6 +2592,13 @@ class MemoryDatabase implements Database {
     )
       return undefined;
     return message;
+  }
+
+  private progressRunIsAvailable(input: RunProgressLeaseInput): boolean {
+    return (
+      this.triggerRuns.get(input.triggerRunId)?.organizationId === input.organizationId &&
+      this.triggerRuns.get(input.triggerRunId)?.payloadExpiredAt == null
+    );
   }
 
   async admitProgressWrite(input: AdmitProgressWriteInput): Promise<ProgressWriteAdmission> {
@@ -2633,21 +2695,7 @@ class MemoryDatabase implements Database {
             run.payloadExpiredAt != null
           )
             return false;
-          const terminal = run.status !== "running";
-          if (this.progressMessageNeedsSettle(message, settleThrough)) return true;
-          if (this.progressMessageNeedsRepair(message, now)) return true;
-          if (message.retryAt !== null && message.retryAt > now) return false;
-          if (message.state === "active" && terminal) return true;
-          if (message.state !== "pending") return false;
-          if (
-            terminal ||
-            (this.runTimelineEvents.get(run.id) ?? []).some((event) => event.kind === "run_started")
-          )
-            return true;
-          for (const step of this.workflowStepRuns.values()) {
-            if (step.triggerRunId === run.id && step.startedAt !== null) return true;
-          }
-          return false;
+          return this.progressMessageNeedsFinish(message, run, now, settleThrough);
         })
         .sort(
           (left, right) =>
@@ -2656,6 +2704,33 @@ class MemoryDatabase implements Database {
         )
         .slice(0, Math.max(0, limit)),
     );
+  }
+
+  private progressMessageNeedsFinish(
+    message: RunProgressMessage,
+    run: AcceptedTriggerRunRecord,
+    now: Date,
+    settleThrough: Date,
+  ): boolean {
+    const terminal = run.status !== "running";
+    if (this.progressMessageNeedsSettle(message, settleThrough)) return true;
+    if (this.progressMessageNeedsRepair(message, now)) return true;
+    if (message.retryAt !== null && message.retryAt > now) return false;
+    if (message.state === "active" && terminal) return true;
+    if (message.state !== "pending") return false;
+    return this.pendingProgressRunStarted(run, terminal);
+  }
+
+  private pendingProgressRunStarted(run: AcceptedTriggerRunRecord, terminal: boolean): boolean {
+    if (
+      terminal ||
+      (this.runTimelineEvents.get(run.id) ?? []).some((event) => event.kind === "run_started")
+    )
+      return true;
+    for (const step of this.workflowStepRuns.values()) {
+      if (step.triggerRunId === run.id && step.startedAt !== null) return true;
+    }
+    return false;
   }
 
   private progressMessageNeedsSettle(message: RunProgressMessage, through: Date): boolean {
@@ -2674,12 +2749,7 @@ class MemoryDatabase implements Database {
       message.leaseExpiresAt <= now;
     if (message.state === "creating") return message.leaseOwner === null || expiredLease;
     if (message.state === "active" && expiredLease) return true;
-    return (
-      (message.state === "active" || message.state === "finished") &&
-      (message.retryAt === null || message.retryAt <= now) &&
-      message.compensationRequestedGen > message.compensationDoneGen &&
-      (message.compensationNotBefore === null || message.compensationNotBefore <= now)
-    );
+    return progressCompensationIsDue(message, now);
   }
 
   async requestCompensation(
@@ -2696,14 +2766,7 @@ class MemoryDatabase implements Database {
       return undefined;
     const pending = message.compensationRequestedGen > message.compensationDoneGen;
     message.compensationRequestedGen += 1;
-    message.compensationNotBefore =
-      notBefore === undefined || (pending && message.compensationNotBefore === null)
-        ? null
-        : new Date(
-            pending && message.compensationNotBefore !== null
-              ? Math.min(message.compensationNotBefore.getTime(), notBefore.getTime())
-              : notBefore,
-          );
+    message.compensationNotBefore = nextCompensationNotBefore(message, pending, notBefore);
     return message.compensationRequestedGen;
   }
 
