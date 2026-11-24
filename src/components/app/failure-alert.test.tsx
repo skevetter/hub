@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it } from "vitest";
 
+import { FailureAlert, failureMessage } from "./failure-alert.js";
+
 const NOOP = (): void => {};
 const REVOKED = { status: "error", error: { message: "Daemon revoked" } } as const;
-
-import { FailureAlert, failureMessage } from "./failure-alert.js";
 
 const FALLBACK = "Hub did not receive the daemon list.";
 

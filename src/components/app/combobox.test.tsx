@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it } from "vitest";
 
-const NOOP = (): void => {};
-
 import { Combobox, comboboxLabel, comboboxSelection, type ComboboxOption } from "./combobox.js";
+
+const NOOP = (): void => {};
 
 interface Model extends ComboboxOption {
   provider: string;

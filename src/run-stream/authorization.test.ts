@@ -3,7 +3,7 @@ import { ProblemSchema } from "../public-api/contracts.js";
 import { randomUUID } from "node:crypto";
 import { setImmediate } from "node:timers/promises";
 import { afterAll, afterEach, beforeAll, describe, it, vi } from "vitest";
-import { RunStream } from "./index.js";
+import type { RunStream } from "./index.js";
 import type { DatabaseRuntime } from "../db/runtime/index.js";
 import {
   createStreamHarness,

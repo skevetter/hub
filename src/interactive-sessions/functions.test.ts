@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { handleInteractiveSessionEvents } from "../routes/api/v1/interactive-sessions/$sessionId/events.js";
 
 vi.mock("@tanstack/react-start", () => ({
   createServerOnlyFn: (fn: unknown) => fn,
@@ -13,8 +14,6 @@ vi.mock("@tanstack/react-start/server", () => ({ getRequest: vi.fn() }));
 vi.mock("../server/runtime.js", () => ({
   getApplication: vi.fn(async () => ({ interactiveSessions: null })),
 }));
-
-import { handleInteractiveSessionEvents } from "../routes/api/v1/interactive-sessions/$sessionId/events.js";
 
 type TestHandler = (input: { data: unknown }) => Promise<unknown>;
 let handlers: object;

@@ -1,8 +1,11 @@
-import { agentStep } from "../config/compiler.js";
+import {
+  agentStep,
+  compiledConfigurationHash,
+  parseCompiledHubConfig,
+} from "../config/compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { dump } from "js-yaml";
-import { compiledConfigurationHash, parseCompiledHubConfig } from "../config/compiler.js";
 import { ProjectConfigurationStore, revisionBundleFiles } from "./store.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";

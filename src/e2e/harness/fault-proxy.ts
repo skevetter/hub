@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { z } from "zod";
@@ -179,10 +179,7 @@ export class HubFaultProxy {
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
 
-  private async forwardHttp(
-    request: IncomingMessage,
-    response: import("node:http").ServerResponse,
-  ): Promise<void> {
+  private async forwardHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const body = await readRequestBody(request);
       const upstream = await fetch(new URL(request.url ?? "/", this.targetOrigin), {

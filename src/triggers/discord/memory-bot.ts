@@ -7,8 +7,7 @@ import type {
   DiscordRawMessageHandler,
   DiscordReactionInput,
 } from "./bot.js";
-import type { NormalizedDiscordMessageEvent } from "./events.js";
-import type { NormalizedDiscordContextMessage } from "./events.js";
+import type { NormalizedDiscordMessageEvent, NormalizedDiscordContextMessage } from "./events.js";
 
 export interface MemoryDiscordBotOptions {
   selfUserId: string;

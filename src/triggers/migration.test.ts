@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { compileHubBundle, type HubBundleFile } from "../config/bundle.js";
 import { createMemoryDatabase } from "../db/memory.js";
-import type { Database, ProjectRecord } from "../db/types.js";
+import type { Database, ProjectRecord, ProjectTriggerRoute } from "../db/types.js";
 import { migrateLegacyProjectTriggers } from "./migration.js";
 
 const hub = `
@@ -167,7 +167,7 @@ async function activeProject(
   database: Database,
   slug: string,
   workflows: readonly HubBundleFile[],
-  routes: readonly import("../db/types.js").ProjectTriggerRoute[] = [],
+  routes: readonly ProjectTriggerRoute[] = [],
 ): Promise<ProjectRecord> {
   const project = await database.createProject({
     organizationId: "org",

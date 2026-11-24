@@ -2,8 +2,6 @@ import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it } from "vitest";
 
-const NOOP = (): void => {};
-
 import { FileCode } from "lucide-react";
 
 import {
@@ -12,6 +10,8 @@ import {
   segmentHint,
   type SegmentedOption,
 } from "./segmented-control.js";
+
+const NOOP = (): void => {};
 
 const MODES: readonly SegmentedOption[] = [
   { value: "form", label: "Form" },

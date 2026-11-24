@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, createRouter, Outlet, RouterProvider } from "@tanstack/react-router";
+import type * as ReactStartModule from "@tanstack/react-start";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, it, vi } from "vitest";
 import { routeTree } from "../routeTree.gen.js";
 import { Route as RootRoute } from "../routes/__root.js";
 import { Route as ShellRoute } from "../routes/_shell.js";
 import { triggerSearchSchema } from "./trigger-query.js";
+import type * as ProjectsContextModule from "../projects/context.js";
+import type * as TriggerFunctionsModule from "./functions.js";
+import type * as QueriesModule from "../queries/index.js";
 
 const state = vi.hoisted(() => ({
   failed: false,
@@ -14,22 +18,22 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("@tanstack/react-start", async (original) => ({
-  ...(await original<typeof import("@tanstack/react-start")>()),
+  ...(await original<typeof ReactStartModule>()),
   useServerFn: (fn: unknown) => fn,
 }));
 
 vi.mock("../projects/context.js", async (original) => ({
-  ...(await original<typeof import("../projects/context.js")>()),
+  ...(await original<typeof ProjectsContextModule>()),
   useRouteTenant: () => ({ account: { id: "fixture" }, organization: { slug: "acme" } }),
 }));
 
 vi.mock("./functions.js", async (original) => ({
-  ...(await original<typeof import("./functions.js")>()),
+  ...(await original<typeof TriggerFunctionsModule>()),
   triggerListPage: async () => ({ status: "ok", data: state.data }),
 }));
 
 vi.mock("../queries/index.js", async (original) => ({
-  ...(await original<typeof import("../queries/index.js")>()),
+  ...(await original<typeof QueriesModule>()),
   useSnapshotQuery: () =>
     state.failed
       ? { status: "error", error: "Fixture unavailable" }

@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { createPostgresQueryRuntime } from "../db/test-utils/runtime.js";
-import type { DatabaseRuntime } from "../db/runtime/index.js";
-import { z } from "zod";
 import {
+  createPostgresQueryRuntime,
   createDatabase,
   testDatabaseLocks,
   testDatabaseRuntime,
 } from "../db/test-utils/runtime.js";
+import type { DatabaseRuntime } from "../db/runtime/index.js";
+import { z } from "zod";
 import type { Database } from "../db/types.js";
 import { OrganizationResources } from "../organizations/resources.js";
 import {

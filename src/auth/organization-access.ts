@@ -8,10 +8,10 @@ import type {
 import type { Locks } from "../db/runtime/locks/index.js";
 import { z } from "zod";
 import { reportFailure } from "../failures/index.js";
-import { OrganizationApiKeys, type ApiKeySummary } from "./api-keys.js";
+import { type OrganizationApiKeys, type ApiKeySummary } from "./api-keys.js";
 import { SigningRequestError } from "./webhook-secret-store.js";
 import { logger } from "../logger.js";
-import { OrganizationCliCredentials } from "./cli-credentials.js";
+import type { OrganizationCliCredentials } from "./cli-credentials.js";
 import {
   apiKeyCreateSchema,
   retireSigningSecretSchema,
