@@ -4,25 +4,13 @@ import { useEffect, useRef, type ReactNode, type Ref } from "react";
 import type { Result } from "../../contract/respond.js";
 import { Alert } from "../ui/alert.js";
 import { Button } from "../ui/button.js";
-
-/**
- * An alert inside a form, a dialog, or a section is spaced by that container's own gap. One
- * standing in a page stack has no gap to inherit — `PageHeader` and `Section` each own their
- * bottom margin and nothing owns the distance after an alert — so it owns that distance itself.
- * Three screens used to wrap it in a spacing div and two forgot, which is what a missing prop
- * looks like.
- */
-const PAGE_STACK_GAP = "mb-6";
+import { PageAlert } from "./page-alert.js";
 
 // One element per glyph, created once: an alert's icon never changes, and a fresh element on
 // every render is a new prop identity for no reason.
 const WARNING_GLYPH = <TriangleAlert />;
 const SUCCESS_GLYPH = <CircleCheck />;
 const NEUTRAL_GLYPH = <Info />;
-
-function standaloneClass(standalone: boolean): string | undefined {
-  return standalone ? PAGE_STACK_GAP : undefined;
-}
 
 /**
  * Everything a failed request can hand a screen. A query gives back a `Result` that may or may
@@ -61,7 +49,7 @@ export function FailureAlert({
   retryRef,
   focusOnArrival = false,
   passive = false,
-  standalone = false,
+  page = false,
 }: {
   title: string;
   error: Failure;
@@ -82,30 +70,42 @@ export function FailureAlert({
   focusOnArrival?: boolean;
   passive?: boolean;
   /** Set when the alert stands in a page stack rather than inside a form, dialog, or section. */
-  standalone?: boolean;
+  page?: boolean;
 }) {
   const alert = useRef<HTMLDivElement>(null);
   const message = failureMessage(error, fallback);
   useEffect(() => {
     if (focusOnArrival) alert.current?.focus();
   }, [focusOnArrival, title, message]);
+  const retry =
+    onRetry === undefined ? null : (
+      <Button ref={retryRef} type="button" size="sm" variant="outline" onClick={onRetry}>
+        Try again
+      </Button>
+    );
+  const focus = focusOnArrival ? { tabIndex: -1 } : {};
+  const role = passive ? undefined : "alert";
+  if (page) {
+    return (
+      <PageAlert ref={alert} role={role} title={title} {...focus}>
+        <p>{message}</p>
+        {details}
+        {retry}
+      </PageAlert>
+    );
+  }
   return (
     <Alert
       ref={alert}
       variant="destructive"
-      role={passive ? undefined : "alert"}
+      role={role}
       icon={WARNING_GLYPH}
       title={title}
-      className={standaloneClass(standalone)}
-      {...(focusOnArrival ? { tabIndex: -1 } : {})}
+      {...focus}
     >
       <p>{message}</p>
       {details}
-      {onRetry === undefined ? null : (
-        <Button ref={retryRef} type="button" size="sm" variant="outline" onClick={onRetry}>
-          Try again
-        </Button>
-      )}
+      {retry}
     </Alert>
   );
 }
@@ -119,13 +119,10 @@ export function FailureAlert({
 export function NoticeAlert({
   tone,
   title,
-  standalone = false,
   children,
 }: {
   tone: "neutral" | "success";
   title?: string;
-  /** Set when the alert stands in a page stack rather than inside a form, dialog, or section. */
-  standalone?: boolean;
   children: ReactNode;
 }) {
   return (
@@ -133,7 +130,6 @@ export function NoticeAlert({
       role="status"
       variant={tone === "success" ? "success" : "default"}
       icon={tone === "success" ? SUCCESS_GLYPH : NEUTRAL_GLYPH}
-      className={standaloneClass(standalone)}
       {...(title === undefined ? {} : { title })}
     >
       {children}
@@ -142,22 +138,19 @@ export function NoticeAlert({
 }
 
 /**
- * Something the reader should know before they act, that does not stop them acting. Every alert
- * on the dashboard is the same shape — glyph, title, message, optional trailing control — and
+ * Something the reader should know before they act, that does not stop them acting, inside a
+ * form or a section. A page's own warnings are `PageAlert`. Every inline alert is the same shape — glyph, title, message, optional trailing control — and
  * only the colour and the glyph say which kind it is.
  */
 export function WarningAlert({
   title,
   action,
-  standalone = false,
   passive = false,
   children,
 }: {
   title?: string;
   /** The way out of the warning, at the far edge: a link to the page that resolves it. */
   action?: ReactNode;
-  /** Set when the alert stands in a page stack rather than inside a form, dialog, or section. */
-  standalone?: boolean;
   /** Set for warnings derived from the page snapshot. */
   passive?: boolean;
   children: ReactNode;
@@ -167,7 +160,6 @@ export function WarningAlert({
       variant="warning"
       role={passive ? undefined : "alert"}
       icon={WARNING_GLYPH}
-      className={standaloneClass(standalone)}
       {...(title === undefined ? {} : { title })}
       {...(action === undefined ? {} : { action })}
     >

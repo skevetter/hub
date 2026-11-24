@@ -4679,7 +4679,9 @@ class HubUser {
   /** The banner is found by what it says. Its title is the accessible name of the warning; an
    * `aria-label` repeating it in different words would be a second name for one thing. */
   private overLimitBanner(): Locator {
-    return this.page.getByRole("alert").filter({ hasText: "You're over your seat limit" });
+    return this.page
+      .locator('[data-slot="alert"]')
+      .filter({ hasText: "You're over your seat limit" });
   }
 
   /** Assert the granted / override / effective cells of one entitlement row after a re-stamp — on
@@ -4744,19 +4746,24 @@ class HubUser {
     await expectAccessible(this.page);
   }
 
+  async expectNotification(message: string): Promise<void> {
+    const log = this.page.getByRole("log", { name: "Notifications" });
+    await expect(log.getByText(message, { exact: true })).toBeVisible();
+  }
+
   async connectGitHub(): Promise<void> {
     await this.openOrganizationSection("Connections");
     const connectionsUrl = this.page.url();
     await this.page.getByRole("button", { name: "Connect GitHub" }).click();
     await expect(this.page).toHaveURL(connectionsUrl);
-    await expect(this.page.getByRole("status")).toHaveText("GitHub connected.");
+    await this.expectNotification("GitHub connected.");
   }
 
   async connectDiscord(): Promise<void> {
     const connectionsUrl = this.page.url();
     await this.page.getByRole("button", { name: "Connect Discord" }).click();
     await expect(this.page).toHaveURL(connectionsUrl);
-    await expect(this.page.getByRole("status")).toHaveText("Discord connected.");
+    await this.expectNotification("Discord connected.");
   }
 
   async beginProviderConnection(provider: "github" | "discord"): Promise<string> {
@@ -4812,7 +4819,7 @@ class HubUser {
       await pending.release();
     }
     await expect(this.page).toHaveURL(/\/o\/[^/]+\/connections$/u);
-    await expect(this.page.getByRole("status")).toHaveText(`${name} connected.`);
+    await this.expectNotification(`${name} connected.`);
     await this.chooseOrganization(destinationOrganization);
     await expect(this.page.getByText(`${name} connected.`)).toHaveCount(0);
   }
@@ -4911,7 +4918,7 @@ class HubUser {
     const connectionsUrl = this.page.url();
     await this.page.goto(url);
     await expect(this.page).toHaveURL(connectionsUrl);
-    await expect(this.page.getByRole("status")).toHaveText(status);
+    await this.expectNotification(status);
   }
 
   async expectConnectionReturnConnectedForOrganization(
@@ -4924,7 +4931,7 @@ class HubUser {
     await expect(this.page.getByRole("button", { name: "Organization" })).toContainText(
       organization,
     );
-    await expect(this.page.getByRole("status")).toHaveText(status);
+    await this.expectNotification(status);
   }
 
   async expectConnectionReturnUnavailable(url: string): Promise<void> {
@@ -5027,7 +5034,7 @@ class HubUser {
       await expect(dialog).toBeVisible();
       await dialog.getByRole("button", { name: "Revoke connection" }).click();
       await expect(row).toHaveCount(0);
-      await expect(this.page.getByRole("status")).toHaveText(`${provider} disconnected.`);
+      await this.expectNotification(`${provider} disconnected.`);
     }
   }
 
@@ -5077,7 +5084,7 @@ class HubUser {
       await pending.release();
     }
 
-    await expect(this.page.getByRole("status")).toHaveText("GitHub disconnected.");
+    await this.expectNotification("GitHub disconnected.");
     await expect(github).toHaveCount(0);
     await this.chooseOrganization(destinationOrganization);
     await this.openOrganizationSection("Connections");

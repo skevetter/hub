@@ -137,7 +137,9 @@ for (const fail of [false, true]) {
     await expect(github.getByText("Not set up", { exact: true })).toBeVisible();
     await expect(github.getByRole("listitem")).toHaveCount(0);
     await expect(
-      page.getByRole("status").filter({ hasText: "GitHub disconnected." }),
+      page
+        .getByRole("log", { name: "Notifications" })
+        .getByText("GitHub disconnected.", { exact: true }),
     ).toBeVisible();
   });
 }
@@ -235,7 +237,11 @@ test("withholds stale connection details when the revoke refresh pauses offline"
   }
 
   await expect(github.getByText("Not set up", { exact: true })).toBeVisible();
-  await expect(page.getByRole("status").filter({ hasText: "GitHub disconnected." })).toBeVisible();
+  await expect(
+    page
+      .getByRole("log", { name: "Notifications" })
+      .getByText("GitHub disconnected.", { exact: true }),
+  ).toBeVisible();
 });
 
 test("names the removed installation when another GitHub connection remains", async ({
@@ -266,7 +272,9 @@ test("names the removed installation when another GitHub connection remains", as
   await expect(github.getByRole("listitem")).toContainText("beta-inc");
   await expect(github.getByText("Connected", { exact: true })).toBeVisible();
   await expect(
-    page.getByRole("status").filter({ hasText: "acme-inc disconnected." }),
+    page
+      .getByRole("log", { name: "Notifications" })
+      .getByText("acme-inc disconnected.", { exact: true }),
   ).toBeVisible();
   await expect(page.getByText("GitHub disconnected.")).toHaveCount(0);
 });
@@ -368,8 +376,11 @@ test("labels the controls and announcement when two Discord connections share a 
     .click();
   await expect(discord.getByRole("listitem")).toHaveCount(1);
   await expect(discord.getByRole("listitem")).toContainText("guild 200");
-  const announcement = page.getByRole("status").filter({ hasText: "Engineering" });
-  await expect(announcement).toHaveText("Engineering (guild 100) disconnected.");
+  await expect(
+    page
+      .getByRole("log", { name: "Notifications" })
+      .getByText("Engineering (guild 100) disconnected.", { exact: true }),
+  ).toBeVisible();
 });
 
 test.describe("Slack authorization", () => {

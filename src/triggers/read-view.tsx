@@ -7,6 +7,7 @@ import { LoadingLine, Spinner } from "../components/app/loading.js";
 import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
+import { StickyActions } from "../components/app/sticky-actions.js";
 import { StatusLine } from "../components/app/status-line.js";
 import { SummaryPanel } from "../components/app/summary-panel.js";
 import { Button } from "../components/ui/button.js";
@@ -58,6 +59,8 @@ export function TriggerReadPanel(scope: TriggerReadScope) {
 function TriggerReadView({ scope, trigger }: { scope: TriggerReadScope; trigger: Trigger }) {
   const manual = canInvokeManually(trigger.yaml);
   const state = triggerState(trigger);
+  const runner = useManualRun(scope);
+  const canRun = manual && state.label === "On";
   const description =
     describeTriggerYaml(trigger.yaml) ??
     `When ${triggerEventClause(trigger.event)}, run the configured action on the configured host.`;
@@ -68,7 +71,8 @@ function TriggerReadView({ scope, trigger }: { scope: TriggerReadScope; trigger:
         title={trigger.name}
         description={description}
         state={state}
-        canRun={manual && state.label === "On"}
+        canRun={canRun}
+        runner={runner}
       />
       <div className="grid min-w-0 gap-6 lg:grid-cols-3">
         <div className="min-w-0 lg:col-span-2">
@@ -82,9 +86,15 @@ function TriggerReadView({ scope, trigger }: { scope: TriggerReadScope; trigger:
         </div>
         <TriggerFacts trigger={trigger} />
       </div>
+      <StickyActions>
+        <RunStatus scope={scope} run={runner.run} />
+        <RunNowButton canRun={canRun} runner={runner} className="max-md:h-11" />
+      </StickyActions>
     </>
   );
 }
+
+type ManualRun = ReturnType<typeof useManualRun>;
 
 function TriggerReadHeader({
   scope,
@@ -92,44 +102,71 @@ function TriggerReadHeader({
   description,
   state,
   canRun,
+  runner,
 }: {
   scope: TriggerReadScope;
   title: string;
   description: string;
   state: TriggerState;
   canRun: boolean;
+  runner: ManualRun;
 }) {
-  const { organizationSlug } = scope;
   const search =
     useLocation({ select: ({ state: history }) => history.triggerListSearch }) ?? NO_EDITOR_SEARCH;
-  const { run, startRun } = useManualRun(scope);
-  const result = run.data;
   return (
     <div>
       <PageHeader title={title} description={description} status={state}>
-        <Button onClick={startRun} disabled={!canRun || run.isPending} aria-busy={run.isPending}>
-          {run.isPending ? <Spinner /> : null}
-          Run now
-        </Button>
+        <RunNowButton canRun={canRun} runner={runner} className="max-md:hidden" />
         <Button variant="outline" asChild>
           <Link to="/o/$organizationSlug/triggers/$triggerId/edit" params={scope} search={search}>
             Edit
           </Link>
         </Button>
       </PageHeader>
-      <StatusLine>
-        {result?.status === "ok" ? (
-          <>
-            Run started.{" "}
-            <RunLink organizationSlug={organizationSlug} runId={result.data.runId}>
-              View run
-            </RunLink>
-          </>
-        ) : (
-          (result?.error.message ?? (run.isError ? "Hub couldn't start this run." : null))
-        )}
-      </StatusLine>
+      <div className="max-md:hidden">
+        <RunStatus scope={scope} run={runner.run} />
+      </div>
     </div>
+  );
+}
+
+function RunNowButton({
+  canRun,
+  runner: { run, startRun },
+  className,
+}: {
+  canRun: boolean;
+  runner: ManualRun;
+  className: string;
+}) {
+  return (
+    <Button
+      className={className}
+      onClick={startRun}
+      disabled={!canRun || run.isPending}
+      aria-busy={run.isPending}
+    >
+      {run.isPending ? <Spinner /> : null}
+      Run now
+    </Button>
+  );
+}
+
+function RunStatus({ scope, run }: { scope: TriggerReadScope; run: ManualRun["run"] }) {
+  const result = run.data;
+  return (
+    <StatusLine>
+      {result?.status === "ok" ? (
+        <>
+          Run started.{" "}
+          <RunLink organizationSlug={scope.organizationSlug} runId={result.data.runId}>
+            View run
+          </RunLink>
+        </>
+      ) : (
+        (result?.error.message ?? (run.isError ? "Hub couldn't start this run." : null))
+      )}
+    </StatusLine>
   );
 }
 

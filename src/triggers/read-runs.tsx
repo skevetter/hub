@@ -6,7 +6,8 @@ import { LoadingLine } from "../components/app/loading.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
-import { StatusPill, statusLabel, type StatusTone } from "../components/app/status-pill.js";
+import { StateBlock, type StateTone } from "../components/app/state-block.js";
+import { statusLabel } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { respondOk, type Result } from "../contract/respond.js";
 import { useSnapshotQuery } from "../queries/index.js";
@@ -25,13 +26,13 @@ interface TriggerRuns {
   counts: RecentRuns;
 }
 
-const RUN_TONE: Record<RunRow["status"], StatusTone> = {
-  running: "neutral",
-  succeeded: "success",
-  failed: "danger",
-  timed_out: "danger",
-  canceled: "neutral",
-  rejected: "danger",
+const RUN_TONE: Record<RunRow["status"], StateTone> = {
+  running: "live",
+  succeeded: "done",
+  failed: "attention",
+  timed_out: "attention",
+  canceled: "off",
+  rejected: "attention",
 };
 
 export function triggerReadRunsKey({ organizationSlug, triggerId }: TriggerReadScope) {
@@ -82,18 +83,18 @@ function TriggerRunsContent({
 }
 
 function TriggerRun({ run, organizationSlug }: { run: RunRow; organizationSlug: string }) {
-  const status = runStatus(run);
+  const lead = runState(run);
   const link = recentRunLink(organizationSlug, run.id);
   const time = receivedTime(run.receivedAt);
   return (
-    <RecordRow status={status}>
+    <RecordRow lead={lead}>
       <TwoLine primary={link} secondary={time} />
     </RecordRow>
   );
 }
 
-function runStatus(run: RunRow) {
-  return <StatusPill tone={RUN_TONE[run.status]}>{statusLabel(run.status)}</StatusPill>;
+function runState(run: RunRow) {
+  return <StateBlock tone={RUN_TONE[run.status]}>{statusLabel(run.status)}</StateBlock>;
 }
 
 function receivedTime(value: string) {

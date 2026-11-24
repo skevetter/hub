@@ -1,5 +1,5 @@
 import { useSnapshotQuery } from "../queries/index.js";
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useState, type SyntheticEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import {
@@ -9,7 +9,8 @@ import {
   DataTableSkeleton,
   type DataColumn,
 } from "../components/app/data-table.js";
-import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
+import { FailureAlert } from "../components/app/failure-alert.js";
+import { PageAlert } from "../components/app/page-alert.js";
 import { FormDialog } from "../components/app/form-dialog.js";
 import { FormField } from "../components/app/form-field.js";
 import { PageHeader } from "../components/app/page.js";
@@ -150,7 +151,7 @@ function OperatorOrganization({ slug }: { slug: string }) {
 }
 
 function OrganizationContent({ snapshot, slug }: { snapshot: Snapshot; slug: string }) {
-  const { effective, granted, overrides } = snapshot.entitlements;
+  const { effective, overrides } = snapshot.entitlements;
   const [target, setTarget] = useState<OverrideTarget | null>(null);
   const closeEditor = useCallback(() => setTarget(null), []);
   const seatsOverridden = overrides.seats?.max !== undefined;
@@ -191,93 +192,126 @@ function OrganizationContent({ snapshot, slug }: { snapshot: Snapshot; slug: str
   return (
     <>
       <OverLimitBanner overages={snapshot.overages} />
-      <Section
-        title="Entitlements"
-        description={`Effective values for ${snapshot.organization.name}, granted by its plan and adjusted by any manual overrides.`}
-      >
-        <DataTable
-          label="Entitlements"
-          columns={ENTITLEMENT_COLUMNS}
-          isEmpty={false}
-          empty={ENTITLEMENTS_EMPTY}
-        >
-          <DataRow>
-            <DataCell>Seats</DataCell>
-            <DataCell muted>{seatLimitLabel(granted.seats.max)}</DataCell>
-            <DataCell muted>
-              {overrides.seats?.max === undefined ? "—" : seatLimitLabel(overrides.seats.max)}
-            </DataCell>
-            <DataCell>{seatLimitLabel(effective.seats.max)}</DataCell>
-            <DataCell muted>{snapshot.seatsInUse}</DataCell>
-            <DataCell>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                aria-label="Override seat limit"
-                onClick={editSeats}
-              >
-                Override
-              </Button>
-            </DataCell>
-          </DataRow>
-          <DataRow>
-            <DataCell>Members can invite</DataCell>
-            <DataCell muted>
-              <InviteState canInvite={granted.canInviteMembers} />
-            </DataCell>
-            <DataCell muted>
-              {overrides.canInviteMembers === undefined ? (
-                "—"
-              ) : (
-                <InviteState canInvite={overrides.canInviteMembers} />
-              )}
-            </DataCell>
-            <DataCell>
-              <InviteState canInvite={effective.canInviteMembers} />
-            </DataCell>
-            <DataCell muted>—</DataCell>
-            <DataCell>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                aria-label="Override members can invite"
-                onClick={editInvites}
-              >
-                Override
-              </Button>
-            </DataCell>
-          </DataRow>
-          <DataRow>
-            <DataCell>Executions this month</DataCell>
-            <DataCell muted>{meterLimitLabel(granted.meters["executions.monthly"].limit)}</DataCell>
-            <DataCell muted>
-              {overrides.meters?.["executions.monthly"]?.limit === undefined
-                ? "—"
-                : meterLimitLabel(overrides.meters["executions.monthly"].limit)}
-            </DataCell>
-            <DataCell>{meterLimitLabel(effectiveExecutionsLimit)}</DataCell>
-            <DataCell>{meterUsageLabel(snapshot.usage)}</DataCell>
-            <DataCell>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                aria-label="Override executions this month"
-                onClick={editExecutionsMonthly}
-              >
-                Override
-              </Button>
-            </DataCell>
-          </DataRow>
-        </DataTable>
-      </Section>
+      {renderEntitlements(snapshot, editSeats, editInvites, editExecutionsMonthly)}
       <Section title={AUDIT_TITLE} description={AUDIT_DESCRIPTION}>
         <AuditTrail history={snapshot.history} />
       </Section>
       {target !== null && <OverrideDialog target={target} slug={slug} onClose={closeEditor} />}
     </>
+  );
+}
+
+function renderEntitlements(
+  snapshot: Snapshot,
+  editSeats: () => void,
+  editInvites: () => void,
+  editExecutionsMonthly: () => void,
+) {
+  return (
+    <Section
+      title="Entitlements"
+      description={`Effective values for ${snapshot.organization.name}, granted by its plan and adjusted by any manual overrides.`}
+    >
+      <DataTable
+        label="Entitlements"
+        columns={ENTITLEMENT_COLUMNS}
+        isEmpty={false}
+        empty={ENTITLEMENTS_EMPTY}
+      >
+        {renderSeatsEntitlement(snapshot, editSeats)}
+        {renderInvitesEntitlement(snapshot, editInvites)}
+        {renderExecutionsEntitlement(snapshot, editExecutionsMonthly)}
+      </DataTable>
+    </Section>
+  );
+}
+
+function renderSeatsEntitlement(snapshot: Snapshot, editSeats: () => void) {
+  const { effective, granted, overrides } = snapshot.entitlements;
+  return (
+    <DataRow>
+      <DataCell>Seats</DataCell>
+      <DataCell muted>{seatLimitLabel(granted.seats.max)}</DataCell>
+      <DataCell muted>
+        {overrides.seats?.max === undefined ? "—" : seatLimitLabel(overrides.seats.max)}
+      </DataCell>
+      <DataCell>{seatLimitLabel(effective.seats.max)}</DataCell>
+      <DataCell muted>{snapshot.seatsInUse}</DataCell>
+      <DataCell>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-label="Override seat limit"
+          onClick={editSeats}
+        >
+          Override
+        </Button>
+      </DataCell>
+    </DataRow>
+  );
+}
+
+function renderInvitesEntitlement(snapshot: Snapshot, editInvites: () => void) {
+  const { effective, granted, overrides } = snapshot.entitlements;
+  return (
+    <DataRow>
+      <DataCell>Members can invite</DataCell>
+      <DataCell muted>
+        <InviteState canInvite={granted.canInviteMembers} />
+      </DataCell>
+      <DataCell muted>
+        {overrides.canInviteMembers === undefined ? (
+          "—"
+        ) : (
+          <InviteState canInvite={overrides.canInviteMembers} />
+        )}
+      </DataCell>
+      <DataCell>
+        <InviteState canInvite={effective.canInviteMembers} />
+      </DataCell>
+      <DataCell muted>—</DataCell>
+      <DataCell>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-label="Override members can invite"
+          onClick={editInvites}
+        >
+          Override
+        </Button>
+      </DataCell>
+    </DataRow>
+  );
+}
+
+function renderExecutionsEntitlement(snapshot: Snapshot, editExecutionsMonthly: () => void) {
+  const { effective, granted, overrides } = snapshot.entitlements;
+  const effectiveExecutionsLimit = effective.meters["executions.monthly"].limit;
+  return (
+    <DataRow>
+      <DataCell>Executions this month</DataCell>
+      <DataCell muted>{meterLimitLabel(granted.meters["executions.monthly"].limit)}</DataCell>
+      <DataCell muted>
+        {overrides.meters?.["executions.monthly"]?.limit === undefined
+          ? "—"
+          : meterLimitLabel(overrides.meters["executions.monthly"].limit)}
+      </DataCell>
+      <DataCell>{meterLimitLabel(effectiveExecutionsLimit)}</DataCell>
+      <DataCell>{meterUsageLabel(snapshot.usage)}</DataCell>
+      <DataCell>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-label="Override executions this month"
+          onClick={editExecutionsMonthly}
+        >
+          Override
+        </Button>
+      </DataCell>
+    </DataRow>
   );
 }
 
@@ -288,17 +322,17 @@ function OrganizationContent({ snapshot, slug }: { snapshot: Snapshot; slug: str
 function OverLimitBanner({ overages }: { overages: Snapshot["overages"] }) {
   if (overages.length === 0) return null;
   return (
-    <WarningAlert standalone title="This organization is over its limits">
+    <PageAlert title="This organization is over its limits">
       {overages.map((overage) => (
         <p key={overage.entitlement}>
           {`${overage.current} seats in use, but the effective limit is ${overage.limit}.`}
         </p>
       ))}
-    </WarningAlert>
+    </PageAlert>
   );
 }
 
-function OverrideDialog({
+function useOverrideActions({
   target,
   slug,
   onClose,
@@ -334,7 +368,7 @@ function OverrideDialog({
   const pending = save.isPending || clear.isPending;
 
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       const native = event.nativeEvent;
       const submitter = native instanceof SubmitEvent ? native.submitter : null;
@@ -358,6 +392,12 @@ function OverrideDialog({
     [onClose],
   );
 
+  return { pending, error, submit, handleOpenChange };
+}
+
+function OverrideDialog(props: Parameters<typeof useOverrideActions>[0]) {
+  const { target } = props;
+  const { pending, error, submit, handleOpenChange } = useOverrideActions(props);
   return (
     <FormDialog
       open
