@@ -23,10 +23,34 @@ import type {
   RunProgressMessage,
   RunTimelineEvent,
   RunTimelineState,
+  TimelineData,
   UpdateRunProgressMessageInput,
 } from "./store.js";
 
 type Row<T> = T & Record<string, unknown>;
+type LeaseRow = Pick<RunProgressMessage, "leaseOwner" | "leaseExpiresAt" | "version" | "state">;
+
+interface PreparedAppend {
+  stepId: string;
+  data: TimelineData;
+  maxEvents: number;
+}
+
+function requireTimelineRow<T>(row: T | undefined, detail: string): T {
+  if (row === undefined) throw new Error(`run timeline store invariant: ${detail}`);
+  return row;
+}
+
+function progressLeaseLost(row: LeaseRow | undefined, input: AdmitProgressWriteInput): boolean {
+  return (
+    row?.leaseOwner !== input.owner ||
+    row.version !== input.version ||
+    row.state !== input.state ||
+    row.leaseExpiresAt === null ||
+    row.leaseExpiresAt <= input.now
+  );
+}
+
 const STATE = `trigger_run_id as "triggerRunId", organization_id as "organizationId",
  event_count as "eventCount", byte_count as "byteCount", step_end_count as "stepEndCount",
  step_end_bytes as "stepEndBytes", step_rows_omitted as "stepRowsOmitted", dropped_count as "droppedCount",
@@ -74,24 +98,16 @@ export class RunTimelineRepository {
         `insert into run_timeline_state (trigger_run_id, organization_id, origin) values ($1, $2, 'captured') on conflict do nothing`,
         [runId, organizationId],
       );
-      const state = (
-        await transaction.query<Row<RunTimelineState> & { accountingBatchIds: string[] | null }>(
-          `select ${STATE}, accounting_batch_ids as "accountingBatchIds" from run_timeline_state where trigger_run_id = $1 and organization_id = $2 for update`,
-          [runId, organizationId],
-        )
-      ).rows[0]!;
+      const { rows } = await transaction.query<
+        Row<RunTimelineState> & { accountingBatchIds: string[] | null }
+      >(
+        `select ${STATE}, accounting_batch_ids as "accountingBatchIds" from run_timeline_state where trigger_run_id = $1 and organization_id = $2 for update`,
+        [runId, organizationId],
+      );
+      const state = requireTimelineRow(rows[0], "drop accounting state missing");
       if (state.expiredAt !== null) return undefined;
-      if (state.accountingBatchIds?.includes(batchId)) {
-        const notice = (
-          await transaction.query<{ seq: number }>(
-            `select seq from run_timeline_events where trigger_run_id = $1 and kind = 'truncated' limit 1`,
-            [runId],
-          )
-        ).rows[0];
-        return notice === undefined
-          ? { seq: state.eventCount, inserted: false }
-          : { seq: state.eventCount, inserted: false, noticeSeq: notice.seq };
-      }
+      if (state.accountingBatchIds?.includes(batchId))
+        return this.readRecordedDrop(transaction, runId, state);
       const batchIds = (state.accountingBatchIds ?? []).slice(-15);
       batchIds.push(batchId);
       await transaction.query(
@@ -115,6 +131,22 @@ export class RunTimelineRepository {
       );
       return { seq, inserted: true };
     });
+  }
+
+  private async readRecordedDrop(
+    transaction: TransactionHandle,
+    runId: string,
+    state: RunTimelineState,
+  ) {
+    const notice = (
+      await transaction.query<{ seq: number }>(
+        `select seq from run_timeline_events where trigger_run_id = $1 and kind = 'truncated' limit 1`,
+        [runId],
+      )
+    ).rows[0];
+    return notice === undefined
+      ? { seq: state.eventCount, inserted: false }
+      : { seq: state.eventCount, inserted: false, noticeSeq: notice.seq };
   }
 
   async appendRunTimelineEvent(
@@ -142,12 +174,11 @@ export class RunTimelineRepository {
         `insert into run_timeline_state (trigger_run_id, organization_id, origin) values ($1, $2, $3) on conflict do nothing`,
         [input.triggerRunId, input.organizationId, input.origin],
       );
-      const state = (
-        await transaction.query<Row<RunTimelineState>>(
-          `select ${STATE} from run_timeline_state where trigger_run_id = $1 and organization_id = $2 for update`,
-          [input.triggerRunId, input.organizationId],
-        )
-      ).rows[0]!;
+      const { rows } = await transaction.query<Row<RunTimelineState>>(
+        `select ${STATE} from run_timeline_state where trigger_run_id = $1 and organization_id = $2 for update`,
+        [input.triggerRunId, input.organizationId],
+      );
+      const state = requireTimelineRow(rows[0], "append state missing");
       if (state.expiredAt !== null) return { reason: "expired" };
       if (state.sealedSeq !== null) {
         if (isOrdinary(input.kind))
@@ -157,70 +188,103 @@ export class RunTimelineRepository {
           );
         return { reason: "sealed" };
       }
-      const duplicate = await transaction.query<{ seq: number }>(
-        `select seq from run_timeline_events where trigger_run_id = $1 and kind = $2 and
+      return this.appendUnsealedTimelineEvent(transaction, input, state, {
+        stepId,
+        data,
+        maxEvents,
+      });
+    });
+  }
+
+  private async appendUnsealedTimelineEvent(
+    transaction: TransactionHandle,
+    input: AppendRunTimelineEventInput,
+    state: RunTimelineState,
+    prepared: PreparedAppend,
+  ): Promise<AppendRunTimelineEventResult> {
+    const { stepId, data, maxEvents } = prepared;
+    const duplicate = await transaction.query<{ seq: number }>(
+      `select seq from run_timeline_events where trigger_run_id = $1 and kind = $2 and
         (($2 in ('run_started', 'step_started', 'step_finished', 'run_finished', 'agent_started') and step_id = $3)
          or ($2 in ('tool_started', 'tool_finished') and step_id = $3 and data->>'callId' = $4)
          or $2 = 'truncated') limit 1`,
-        [input.triggerRunId, input.kind, stepId, timelineCallIdText(data)],
-      );
-      if (duplicate.rows[0] !== undefined) return { seq: duplicate.rows[0].seq, inserted: false };
-      const notice =
-        (
-          await transaction.query(
-            `select 1 from run_timeline_events where trigger_run_id = $1 and kind = 'truncated' limit 1`,
-            [input.triggerRunId],
-          )
-        ).rowCount !== 0;
-      if (timelineBudgetExceeded(state, input.kind, 0, maxEvents, notice)) {
-        await this.drop(transaction, input, state, notice);
-        return { reason: "cap" };
-      }
-      if (input.kind === "run_finished") {
-        await this.refreshOmitted(transaction, input.triggerRunId, state);
-        data["stepRowsOmitted"] = state.stepRowsOmitted;
-      }
-      const prepared = prepareTimelineData(input.kind, data);
-      await transaction.query("savepoint timeline_append");
-      const inserted = await transaction.query<Row<RunTimelineEvent> & { bytes: number }>(
-        `insert into run_timeline_events (trigger_run_id, organization_id, seq, kind, at, step_id, data) values ($1,$2,$3,$4,$5,$6,$7::jsonb) on conflict do nothing returning ${EVENT}, octet_length(data::text) as bytes`,
-        [
-          input.triggerRunId,
-          input.organizationId,
-          state.eventCount + 1,
-          input.kind,
-          input.at,
-          stepId,
-          JSON.stringify(prepared),
-        ],
-      );
-      const event = inserted.rows[0];
-      if (event === undefined) return { seq: state.eventCount, inserted: false };
-      if (timelineBudgetExceeded(state, input.kind, event.bytes, maxEvents, notice)) {
-        await transaction.query("rollback to savepoint timeline_append");
-        await this.drop(transaction, input, state, notice);
-        return { reason: "cap" };
-      }
-      await transaction.query(
-        `update run_timeline_state set event_count = $2,
+      [input.triggerRunId, input.kind, stepId, timelineCallIdText(data)],
+    );
+    if (duplicate.rows[0] !== undefined) return { seq: duplicate.rows[0].seq, inserted: false };
+    const notice =
+      (
+        await transaction.query(
+          `select 1 from run_timeline_events where trigger_run_id = $1 and kind = 'truncated' limit 1`,
+          [input.triggerRunId],
+        )
+      ).rowCount !== 0;
+    if (timelineBudgetExceeded(state, input.kind, 0, maxEvents, notice)) {
+      await this.drop(transaction, input, state, notice);
+      return { reason: "cap" };
+    }
+    return this.insertTimelineEvent(transaction, input, state, { stepId, data, maxEvents, notice });
+  }
+
+  private async insertTimelineEvent(
+    transaction: TransactionHandle,
+    input: AppendRunTimelineEventInput,
+    state: RunTimelineState,
+    options: PreparedAppend & { notice: boolean },
+  ): Promise<AppendRunTimelineEventResult> {
+    const { stepId, data, maxEvents, notice } = options;
+    if (input.kind === "run_finished") {
+      await this.refreshOmitted(transaction, input.triggerRunId, state);
+      data["stepRowsOmitted"] = state.stepRowsOmitted;
+    }
+    const prepared = prepareTimelineData(input.kind, data);
+    await transaction.query("savepoint timeline_append");
+    const inserted = await transaction.query<Row<RunTimelineEvent> & { bytes: number }>(
+      `insert into run_timeline_events (trigger_run_id, organization_id, seq, kind, at, step_id, data) values ($1,$2,$3,$4,$5,$6,$7::jsonb) on conflict do nothing returning ${EVENT}, octet_length(data::text) as bytes`,
+      [
+        input.triggerRunId,
+        input.organizationId,
+        state.eventCount + 1,
+        input.kind,
+        input.at,
+        stepId,
+        JSON.stringify(prepared),
+      ],
+    );
+    const event = inserted.rows[0];
+    if (event === undefined) return { seq: state.eventCount, inserted: false };
+    if (timelineBudgetExceeded(state, input.kind, event.bytes, maxEvents, notice)) {
+      await transaction.query("rollback to savepoint timeline_append");
+      await this.drop(transaction, input, state, notice);
+      return { reason: "cap" };
+    }
+    return this.finishTimelineAppend(transaction, input, state, event);
+  }
+
+  private async finishTimelineAppend(
+    transaction: TransactionHandle,
+    input: AppendRunTimelineEventInput,
+    state: RunTimelineState,
+    event: Pick<RunTimelineEvent, "seq"> & { bytes: number },
+  ): Promise<AppendRunTimelineEventResult> {
+    await transaction.query(
+      `update run_timeline_state set event_count = $2,
         byte_count = byte_count + $3, step_end_count = step_end_count + $4, step_end_bytes = step_end_bytes + $5,
         sealed_seq = case when $6 then $2 else sealed_seq end, sealed_at = case when $6 then $7 else sealed_at end where trigger_run_id = $1`,
-        [
-          input.triggerRunId,
-          event.seq,
-          isOrdinary(input.kind) ? event.bytes : 0,
-          input.kind === "step_finished" ? 1 : 0,
-          input.kind === "step_finished" ? event.bytes : 0,
-          input.kind === "run_finished",
-          input.at,
-        ],
-      );
-      if (input.kind === "step_finished" && state.stepEndCount === 99) {
-        state.stepEndCount += 1;
-        await this.refreshOmitted(transaction, input.triggerRunId, state);
-      }
-      return { seq: event.seq, inserted: true };
-    });
+      [
+        input.triggerRunId,
+        event.seq,
+        isOrdinary(input.kind) ? event.bytes : 0,
+        input.kind === "step_finished" ? 1 : 0,
+        input.kind === "step_finished" ? event.bytes : 0,
+        input.kind === "run_finished",
+        input.at,
+      ],
+    );
+    if (input.kind === "step_finished" && state.stepEndCount === 99) {
+      state.stepEndCount += 1;
+      await this.refreshOmitted(transaction, input.triggerRunId, state);
+    }
+    return { seq: event.seq, inserted: true };
   }
 
   private async refreshOmitted(
@@ -228,12 +292,11 @@ export class RunTimelineRepository {
     runId: string,
     state: RunTimelineState,
   ): Promise<void> {
-    const count = (
-      await transaction.query<{ count: number }>(
-        `select count(*)::integer as count from workflow_step_runs where trigger_run_id = $1 and status in ('succeeded', 'failed', 'timed_out', 'skipped', 'canceled')`,
-        [runId],
-      )
-    ).rows[0]!.count;
+    const { rows } = await transaction.query<{ count: number }>(
+      `select count(*)::integer as count from workflow_step_runs where trigger_run_id = $1 and status in ('succeeded', 'failed', 'timed_out', 'skipped', 'canceled')`,
+      [runId],
+    );
+    const { count } = requireTimelineRow(rows[0], "terminal step count missing");
     state.stepRowsOmitted = Math.max(state.stepRowsOmitted, count - state.stepEndCount, 0);
     await transaction.query(
       `update run_timeline_state set step_rows_omitted = $2 where trigger_run_id = $1`,
@@ -463,14 +526,7 @@ export class RunTimelineRepository {
       ]);
       if (open.rowCount === 0) return { status: "lease_lost" };
       const row = await this.lockProgressRow(transaction, input);
-      if (
-        row?.leaseOwner !== input.owner ||
-        row.version !== input.version ||
-        row.state !== input.state ||
-        row.leaseExpiresAt === null ||
-        row.leaseExpiresAt <= input.now
-      )
-        return { status: "lease_lost" };
+      if (progressLeaseLost(row, input)) return { status: "lease_lost" };
       await this.locks.withTxLock(transaction, `progress-credential:${input.key}`);
       const cooldown = progressCooldownDecision(
         await this.progressCredentialCooldown(transaction, input.key),
@@ -508,14 +564,13 @@ export class RunTimelineRepository {
        from run_progress_messages where credential_key = $1`,
       [key],
     );
-    return result.rows[0]!;
+    return requireTimelineRow(result.rows[0], "credential cooldown aggregate missing");
   }
 
   private async lockProgressRow(
     transaction: TransactionHandle,
     scope: Pick<RunProgressMessage, "triggerRunId" | "organizationId">,
   ) {
-    type LeaseRow = Pick<RunProgressMessage, "leaseOwner" | "leaseExpiresAt" | "version" | "state">;
     const result = await transaction.query<Row<LeaseRow>>(
       `select lease_owner as "leaseOwner", lease_expires_at as "leaseExpiresAt", version, state
        from run_progress_messages where trigger_run_id = $1 and organization_id = $2 for no key update`,
