@@ -152,8 +152,10 @@ import type {
   GitHubRepositoryRecord,
   GitHubConfigurationTarget,
   ProjectTriggerRoute,
+  MigrateProjectTriggerInput,
   MigrateProjectTriggersInput,
   OrganizationTriggerRecord,
+  OrganizationTriggerRoute,
   OrganizationTriggerRevisionRecord,
   PendingProjectTriggerMigration,
   SaveOrganizationTriggerInput,
@@ -3958,200 +3960,20 @@ class PgDatabase implements Database {
     input: MigrateProjectTriggersInput,
   ): Promise<OrganizationTriggerRecord[]> {
     return this.pool.transaction(async (client) => {
-      const project = await client.query<{
-        active_configuration_revision_id: string | null;
-        organization_id: string;
-      }>(
-        `select organization_id, active_configuration_revision_id
-         from projects where id = $1 for update`,
-        [input.projectId],
-      );
-      const current = project.rows[0];
-      const alreadyMigrated = await client.query(
-        `select project_id from project_trigger_migrations where project_id = $1`,
-        [input.projectId],
-      );
-      if (alreadyMigrated.rowCount > 0) {
-        return [];
-      }
-      if (
-        current === undefined ||
-        current.organization_id !== input.organizationId ||
-        current.active_configuration_revision_id !== input.configurationRevisionId
-      ) {
-        throw new Error("project configuration changed during trigger migration");
-      }
-
-      const legacyRouteRows = await client.query<{
-        provider: ConnectionProvider;
-        connection_id: string;
-        resource_id: string | null;
-        trigger_name: string;
-      }>(
-        `select provider, connection_id::text, resource_id, trigger_name
-         from project_trigger_routes
-         where project_id = $1 and configuration_revision_id = $2
-         order by trigger_name, provider, connection_id, resource_id nulls first`,
-        [input.projectId, input.configurationRevisionId],
-      );
-      const configurations = input.triggers.map((candidate) =>
-        parseCompiledHubConfig(candidate.normalizedConfiguration),
-      );
-      const candidateRoutes = input.triggers.map((candidate, index) => {
-        const configuredEventName = configurations[index]!.triggers[0]?.on;
-        if (configuredEventName === undefined) {
-          throw new Error(`migrated trigger ${candidate.name} has no configured event`);
-        }
-        return legacyRouteRows.rows
-          .filter((route) => route.trigger_name === candidate.name)
-          .map((route) => ({
-            provider: route.provider,
-            connectionId: route.connection_id,
-            resourceId: route.resource_id,
-            configuredEventName,
-          }));
-      });
-      if (
-        candidateRoutes.reduce((total, routes) => total + routes.length, 0) !==
-        legacyRouteRows.rows.length
-      ) {
-        throw new Error("project trigger routes do not match migrated triggers");
-      }
-
+      if (!(await projectTriggerMigrationPending(client, input))) return [];
+      const plans = await planProjectTriggerMigration(client, input);
       const names = await client.query<{ name: string }>(
         `select name from organization_triggers where organization_id = $1 for update`,
         [input.organizationId],
       );
       const occupied = new Set(names.rows.map(({ name }) => name));
       const created: OrganizationTriggerRecord[] = [];
-      for (const [index, candidate] of input.triggers.entries()) {
-        const routes = candidateRoutes[index]!;
-        const name = availableMigratedTriggerName(occupied, input.projectSlug, candidate.name);
+      for (const plan of plans) {
+        const name = availableMigratedTriggerName(occupied, input.projectSlug, plan.candidate.name);
         occupied.add(name);
-        const runtimeProjectRows = await client.query<ProjectRow>(
-          `insert into projects
-             (organization_id, name, slug, created_by_user_id)
-           values ($1, $2, $3, null) returning *`,
-          [
-            input.organizationId,
-            `Trigger runtime: ${name}`,
-            `trigger-${randomUUID().replaceAll("-", "")}`,
-          ],
-        );
-        const runtimeProject = runtimeProjectRows.rows[0]!;
-        await client.query(
-          `insert into project_configuration_sources
-             (project_id, organization_id, kind, automatic_deployment_enabled, selected_by_user_id)
-           values ($1, $2, 'manual', false, null)`,
-          [runtimeProject.id, input.organizationId],
-        );
-        const triggerRows = await client.query<OrganizationTriggerRow>(
-          `insert into organization_triggers
-             (organization_id, name, enabled, format, runtime_project_id)
-           values ($1, $2, $3, $4, $5) returning *`,
-          [input.organizationId, name, candidate.enabled, candidate.format, runtimeProject.id],
-        );
-        const trigger = triggerRows.rows[0]!;
-        const revisionRows = await client.query<OrganizationTriggerRevisionRow>(
-          `insert into organization_trigger_revisions (
-             trigger_id, organization_id, version, yaml, normalized_configuration,
-             content_hash, source_kind, source_evidence, created_by_user_id
-           ) values ($1, $2, 1, $3, $4, $5, 'project_migration', $6, null)
-           returning *`,
-          [
-            trigger.id,
-            input.organizationId,
-            candidate.yaml,
-            candidate.normalizedConfiguration,
-            candidate.contentHash,
-            candidate.sourceEvidence,
-          ],
-        );
-        const revision = revisionRows.rows[0]!;
-        for (const route of routes) {
-          await client.query(
-            `insert into organization_trigger_routes (
-               organization_id, trigger_id, trigger_revision_id, provider,
-               connection_id, resource_id, configured_event_name
-             ) values ($1, $2, $3, $4, $5, $6, $7)`,
-            [
-              input.organizationId,
-              trigger.id,
-              revision.id,
-              route.provider,
-              route.connectionId,
-              route.resourceId,
-              route.configuredEventName,
-            ],
-          );
-        }
-        const runtimeRevisionRows = await client.query<ProjectConfigurationRevisionRow>(
-          `insert into project_configuration_revisions (
-             project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
-             normalized_configuration, validation_errors, content_hash,
-             created_by_user_id, received_at, validated_at
-           ) values ($1, $2, 1, 'manual', $3, $4, $5, null, $6, null,
-             clock_timestamp(), clock_timestamp()) returning *`,
-          [
-            runtimeProject.id,
-            input.organizationId,
-            { kind: "organization_trigger_adapter", triggerId: trigger.id },
-            candidate.yaml,
-            candidate.normalizedConfiguration,
-            candidate.contentHash,
-          ],
-        );
-        const runtimeRevision = runtimeRevisionRows.rows[0]!;
-        const configuration = configurations[index]!;
-        for (const route of routes) {
-          const configuredTriggerName =
-            configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
-            configuration.triggers[0]?.name ??
-            name;
-          await client.query(
-            `insert into project_trigger_routes (
-               organization_id, project_id, configuration_revision_id, provider,
-               connection_id, resource_id, trigger_name
-             ) values ($1, $2, $3, $4, $5, $6, $7)`,
-            [
-              input.organizationId,
-              runtimeProject.id,
-              runtimeRevision.id,
-              route.provider,
-              route.connectionId,
-              route.resourceId,
-              configuredTriggerName,
-            ],
-          );
-        }
-        await client.query(
-          `update projects set active_configuration_revision_id = $2,
-             updated_at = clock_timestamp() where id = $1`,
-          [runtimeProject.id, runtimeRevision.id],
-        );
-        const activated = await client.query<OrganizationTriggerRow>(
-          `update organization_triggers
-           set active_revision_id = $2, updated_at = clock_timestamp()
-           where id = $1 returning *`,
-          [trigger.id, revision.id],
-        );
-        created.push(toOrganizationTriggerRecord(activated.rows[0]!));
+        created.push(await migrateTriggerCandidate(client, { input, plan, name }));
       }
-      await client.query(
-        `insert into project_trigger_migrations
-           (project_id, organization_id, configuration_revision_id)
-         values ($1, $2, $3)`,
-        [input.projectId, input.organizationId, input.configurationRevisionId],
-      );
-      await client.query(`delete from project_trigger_routes where project_id = $1`, [
-        input.projectId,
-      ]);
-      await client.query(
-        `update projects set status = 'archived', archived_at = clock_timestamp(),
-           active_configuration_revision_id = null, updated_at = clock_timestamp()
-         where id = $1`,
-        [input.projectId],
-      );
+      await archiveMigratedProject(client, input);
       return created;
     });
   }
@@ -4173,46 +3995,19 @@ class PgDatabase implements Database {
   ): Promise<TriggerListPage> {
     const params: unknown[] = [organizationId];
     const conditions = organizationTriggerPageFilters(request, params);
-    const scoped = `from organization_triggers t
-      where t.organization_id = $1 and t.active_revision_id is not null ${conditions}`;
-    const position = request.position;
-    const previous = position?.direction === "previous";
-    const name = `t.name collate "C"`;
-    const key = `(${name}, t.id)`;
-    const boundary = `($${params.length + 1}::text collate "C", $${params.length + 2}::uuid)`;
-    const order = previous ? "desc" : "asc";
-    const values =
-      position === undefined ? params : [...params, position.key.name, position.key.id];
-    const { rows } = await query<OrganizationTriggerRow>(
-      this.pool,
-      `select t.* ${scoped}
-       ${position === undefined ? "" : `and ${key} ${previous ? "<" : ">"} ${boundary}`}
-       order by ${name} ${order}, t.id ${order} limit $${values.length + 1}`,
-      [...values, request.limit + 1],
-    );
+    const sql = organizationTriggerPageSql(conditions, params.length);
+    const previous = request.position?.direction === "previous";
+    const rows = await fetchOrganizationTriggerPageRows(this.pool, { request, sql, params });
     const more = rows.length > request.limit;
     const page = rows.slice(0, request.limit);
     if (previous) page.reverse();
-    const first = page[0];
-    const last = page.at(-1);
-    const adjacent = async (record: OrganizationTriggerRow | undefined, operator: "<" | ">") => {
-      if (record === undefined) return false;
-      const direction = operator === "<" ? "desc" : "asc";
-      const adjacentRows = await query(
-        this.pool,
-        `select 1 ${scoped} and ${key} ${operator} ${boundary}
-         order by ${name} ${direction}, t.id ${direction} limit 1`,
-        [...params, record.name, record.id],
-      );
-      return adjacentRows.rows.length > 0;
-    };
-    const hasPrevious = previous ? more : position !== undefined && (await adjacent(first, "<"));
-    const hasNext = previous ? await adjacent(last, ">") : more;
-    return {
-      records: page.map(toOrganizationTriggerRecord),
-      previous: hasPrevious && first !== undefined ? { id: first.id, name: first.name } : null,
-      next: hasNext && last !== undefined ? { id: last.id, name: last.name } : null,
-    };
+    const adjacent = (record: OrganizationTriggerRow | undefined, operator: "<" | ">") =>
+      organizationTriggerAdjacent(this.pool, { sql, params, record, operator });
+    const hasPrevious = previous
+      ? more
+      : request.position !== undefined && (await adjacent(page[0], "<"));
+    const hasNext = previous ? await adjacent(page.at(-1), ">") : more;
+    return toOrganizationTriggerPage(page, { hasPrevious, hasNext });
   }
 
   async findOrganizationTrigger(
@@ -4273,160 +4068,17 @@ class PgDatabase implements Database {
       // Validation resolves routes before this transaction, while connections can change concurrently.
       await this.locks.withTxLock(client, linearTriggerRoutesLock(input.organizationId));
       const configuration = parseCompiledHubConfig(input.normalizedConfiguration);
-      const linearConnections =
-        input.enabled && configuration.triggers.some(({ on }) => on.startsWith("linear."))
-          ? (
-              await client.query<{ id: string }>(
-                "select id from linear_connections where organization_id = $1",
-                [input.organizationId],
-              )
-            ).rows
-          : [];
-      const routes = input.enabled
-        ? organizationTriggerRoutesForSave(
-            configuration,
-            input.routes,
-            linearConnections.map(({ id }) => id),
-          )
-        : [];
-      let trigger: OrganizationTriggerRow;
-      if (input.triggerId === undefined) {
-        const runtimeProjectRows = await client.query<ProjectRow>(
-          `insert into projects
-             (organization_id, name, slug, created_by_user_id)
-           values ($1, $2, $3, $4) returning *`,
-          [
-            input.organizationId,
-            `Trigger runtime: ${input.name}`,
-            `trigger-${randomUUID().replaceAll("-", "")}`,
-            input.createdByUserId,
-          ],
-        );
-        const runtimeProject = runtimeProjectRows.rows[0]!;
-        await client.query(
-          `insert into project_configuration_sources
-             (project_id, organization_id, kind, automatic_deployment_enabled, selected_by_user_id)
-           values ($1, $2, 'manual', false, $3)`,
-          [runtimeProject.id, input.organizationId, input.createdByUserId],
-        );
-        const inserted = await client.query<OrganizationTriggerRow>(
-          `insert into organization_triggers
-             (organization_id, name, enabled, format, runtime_project_id)
-           values ($1, $2, $3, $4, $5) returning *`,
-          [input.organizationId, input.name, input.enabled, input.format, runtimeProject.id],
-        );
-        trigger = inserted.rows[0]!;
-      } else {
-        const updated = await client.query<OrganizationTriggerRow>(
-          `update organization_triggers
-           set name = $3, enabled = $4, format = $5, updated_at = clock_timestamp()
-           where id = $1 and organization_id = $2 returning *`,
-          [input.triggerId, input.organizationId, input.name, input.enabled, input.format],
-        );
-        if (updated.rows[0] === undefined) throw new Error("organization trigger not found");
-        trigger = updated.rows[0];
-      }
-      const revisionRows = await client.query<OrganizationTriggerRevisionRow>(
-        `insert into organization_trigger_revisions (
-           trigger_id, organization_id, version, yaml, normalized_configuration,
-           content_hash, source_kind, source_evidence, created_by_user_id
-         ) values (
-           $1, $2,
-           coalesce((select max(version) + 1 from organization_trigger_revisions where trigger_id = $1), 1),
-           $3, $4, $5, $6, $7, $8
-         ) returning *`,
-        [
-          trigger.id,
-          input.organizationId,
-          input.yaml,
-          input.normalizedConfiguration,
-          input.contentHash,
-          input.sourceKind,
-          input.sourceEvidence,
-          input.createdByUserId,
-        ],
-      );
-      const revision = revisionRows.rows[0]!;
-      await client.query(`delete from organization_trigger_routes where trigger_id = $1`, [
-        trigger.id,
-      ]);
-      for (const route of routes) {
-        await client.query(
-          `insert into organization_trigger_routes (
-             organization_id, trigger_id, trigger_revision_id, provider,
-             connection_id, resource_id, configured_event_name
-           ) values ($1, $2, $3, $4, $5, $6, $7)`,
-          [
-            input.organizationId,
-            trigger.id,
-            revision.id,
-            route.provider,
-            route.connectionId,
-            route.resourceId,
-            route.configuredEventName,
-          ],
-        );
-      }
-      const runtimeRevisionRows = await client.query<ProjectConfigurationRevisionRow>(
-        `insert into project_configuration_revisions (
-           project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
-           normalized_configuration, validation_errors, content_hash,
-           created_by_user_id, received_at, validated_at
-         ) values (
-           $1, $2,
-           coalesce((select max(version) + 1 from project_configuration_revisions where project_id = $1), 1),
-           $3, $4, $5, $6, null, $7, $8, clock_timestamp(), clock_timestamp()
-         ) returning *`,
-        [
-          trigger.runtime_project_id,
-          input.organizationId,
-          input.sourceKind,
-          { kind: "organization_trigger_adapter", triggerId: trigger.id },
-          input.yaml,
-          input.normalizedConfiguration,
-          input.contentHash,
-          input.createdByUserId,
-        ],
-      );
-      const runtimeRevision = runtimeRevisionRows.rows[0]!;
-      await client.query(`delete from project_trigger_routes where project_id = $1`, [
-        trigger.runtime_project_id,
-      ]);
-      for (const route of routes) {
-        const configuredTriggerName =
-          configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
-          configuration.triggers[0]?.name ??
-          input.name;
-        await client.query(
-          `insert into project_trigger_routes (
-             organization_id, project_id, configuration_revision_id, provider,
-             connection_id, resource_id, trigger_name
-           ) values ($1, $2, $3, $4, $5, $6, $7)`,
-          [
-            input.organizationId,
-            trigger.runtime_project_id,
-            runtimeRevision.id,
-            route.provider,
-            route.connectionId,
-            route.resourceId,
-            configuredTriggerName,
-          ],
-        );
-      }
-      await client.query(
-        `update projects set active_configuration_revision_id = $2, updated_at = clock_timestamp()
-         where id = $1`,
-        [trigger.runtime_project_id, runtimeRevision.id],
-      );
-      const activated = await client.query<OrganizationTriggerRow>(
-        `update organization_triggers
-         set active_revision_id = $2, updated_at = clock_timestamp()
-         where id = $1 returning *`,
-        [trigger.id, revision.id],
-      );
-      const recurrence = input.enabled ? input.recurrence : undefined;
-      await ScheduleRepository.synchronize(client, trigger.id, recurrence, new Date());
-      return toOrganizationTriggerRecord(activated.rows[0]!);
+      const routes = await resolveSavedTriggerRoutes(client, input, configuration);
+      const trigger = await upsertSavedTrigger(client, input);
+      const revision = await insertSavedRevision(client, input, trigger.id);
+      const rows = { input, trigger, revision, routes };
+      await replaceSavedOrganizationRoutes(client, rows);
+      const runtimeRevision = await insertSavedRuntimeRevision(client, input, trigger);
+      await replaceSavedRuntimeRoutes(client, rows, {
+        configuration,
+        runtimeRevisionId: runtimeRevision.id,
+      });
+      return activateSavedTrigger(client, rows, runtimeRevision.id);
     });
   }
 
@@ -5840,6 +5492,582 @@ interface WorkflowWakeupRow extends QueryRow {
   lease_expires_at: Date | null;
 }
 
+type CompiledTriggerConfig = ReturnType<typeof parseCompiledHubConfig>;
+
+interface TriggerMigrationPlan {
+  candidate: MigrateProjectTriggerInput;
+  configuration: CompiledTriggerConfig;
+  routes: OrganizationTriggerRoute[];
+}
+
+interface MigratedTriggerContext {
+  input: MigrateProjectTriggersInput;
+  plan: TriggerMigrationPlan;
+  name: string;
+}
+
+interface MigratedTriggerRows {
+  runtimeProject: ProjectRow;
+  trigger: OrganizationTriggerRow;
+  revision: OrganizationTriggerRevisionRow;
+}
+
+function runtimeTriggerName(
+  configuration: CompiledTriggerConfig,
+  configuredEventName: string,
+  fallback: string,
+): string {
+  return (
+    configuration.triggers.find(({ on }) => on === configuredEventName)?.name ??
+    configuration.triggers[0]?.name ??
+    fallback
+  );
+}
+
+async function projectTriggerMigrationPending(
+  client: QueryHandle,
+  input: MigrateProjectTriggersInput,
+): Promise<boolean> {
+  const project = await client.query<{
+    active_configuration_revision_id: string | null;
+    organization_id: string;
+  }>(
+    `select organization_id, active_configuration_revision_id
+         from projects where id = $1 for update`,
+    [input.projectId],
+  );
+  const current = project.rows[0];
+  const alreadyMigrated = await client.query(
+    `select project_id from project_trigger_migrations where project_id = $1`,
+    [input.projectId],
+  );
+  if (alreadyMigrated.rowCount > 0) {
+    return false;
+  }
+  if (
+    current === undefined ||
+    current.organization_id !== input.organizationId ||
+    current.active_configuration_revision_id !== input.configurationRevisionId
+  ) {
+    throw new Error("project configuration changed during trigger migration");
+  }
+  return true;
+}
+
+async function planProjectTriggerMigration(
+  client: QueryHandle,
+  input: MigrateProjectTriggersInput,
+): Promise<TriggerMigrationPlan[]> {
+  const legacyRouteRows = await client.query<{
+    provider: ConnectionProvider;
+    connection_id: string;
+    resource_id: string | null;
+    trigger_name: string;
+  }>(
+    `select provider, connection_id::text, resource_id, trigger_name
+         from project_trigger_routes
+         where project_id = $1 and configuration_revision_id = $2
+         order by trigger_name, provider, connection_id, resource_id nulls first`,
+    [input.projectId, input.configurationRevisionId],
+  );
+  const compiled = input.triggers.map((candidate) => ({
+    candidate,
+    configuration: parseCompiledHubConfig(candidate.normalizedConfiguration),
+  }));
+  const plans = compiled.map(({ candidate, configuration }) => {
+    const configuredEventName = configuration.triggers[0]?.on;
+    if (configuredEventName === undefined) {
+      throw new Error(`migrated trigger ${candidate.name} has no configured event`);
+    }
+    const routes = legacyRouteRows.rows
+      .filter((route) => route.trigger_name === candidate.name)
+      .map((route) => ({
+        provider: route.provider,
+        connectionId: route.connection_id,
+        resourceId: route.resource_id,
+        configuredEventName,
+      }));
+    return { candidate, configuration, routes };
+  });
+  if (
+    plans.reduce((total, { routes }) => total + routes.length, 0) !== legacyRouteRows.rows.length
+  ) {
+    throw new Error("project trigger routes do not match migrated triggers");
+  }
+  return plans;
+}
+
+async function insertMigratedRuntimeProject(
+  client: QueryHandle,
+  input: MigrateProjectTriggersInput,
+  name: string,
+): Promise<ProjectRow> {
+  const runtimeProjectRows = await client.query<ProjectRow>(
+    `insert into projects
+             (organization_id, name, slug, created_by_user_id)
+           values ($1, $2, $3, null) returning *`,
+    [
+      input.organizationId,
+      `Trigger runtime: ${name}`,
+      `trigger-${randomUUID().replaceAll("-", "")}`,
+    ],
+  );
+  const runtimeProject = requireReturnedRow(runtimeProjectRows.rows[0], "migrated runtime project");
+  await client.query(
+    `insert into project_configuration_sources
+             (project_id, organization_id, kind, automatic_deployment_enabled, selected_by_user_id)
+           values ($1, $2, 'manual', false, null)`,
+    [runtimeProject.id, input.organizationId],
+  );
+  return runtimeProject;
+}
+
+async function insertMigratedOrganizationTrigger(
+  client: QueryHandle,
+  context: MigratedTriggerContext,
+  runtimeProjectId: string,
+): Promise<Pick<MigratedTriggerRows, "trigger" | "revision">> {
+  const { input, plan, name } = context;
+  const { candidate } = plan;
+  const triggerRows = await client.query<OrganizationTriggerRow>(
+    `insert into organization_triggers
+             (organization_id, name, enabled, format, runtime_project_id)
+           values ($1, $2, $3, $4, $5) returning *`,
+    [input.organizationId, name, candidate.enabled, candidate.format, runtimeProjectId],
+  );
+  const trigger = requireReturnedRow(triggerRows.rows[0], "migrated organization trigger");
+  const revisionRows = await client.query<OrganizationTriggerRevisionRow>(
+    `insert into organization_trigger_revisions (
+             trigger_id, organization_id, version, yaml, normalized_configuration,
+             content_hash, source_kind, source_evidence, created_by_user_id
+           ) values ($1, $2, 1, $3, $4, $5, 'project_migration', $6, null)
+           returning *`,
+    [
+      trigger.id,
+      input.organizationId,
+      candidate.yaml,
+      candidate.normalizedConfiguration,
+      candidate.contentHash,
+      candidate.sourceEvidence,
+    ],
+  );
+  const revision = requireReturnedRow(
+    revisionRows.rows[0],
+    "migrated organization trigger revision",
+  );
+  for (const route of plan.routes) {
+    await client.query(
+      `insert into organization_trigger_routes (
+               organization_id, trigger_id, trigger_revision_id, provider,
+               connection_id, resource_id, configured_event_name
+             ) values ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        trigger.id,
+        revision.id,
+        route.provider,
+        route.connectionId,
+        route.resourceId,
+        route.configuredEventName,
+      ],
+    );
+  }
+  return { trigger, revision };
+}
+
+async function insertMigratedProjectRoutes(
+  client: QueryHandle,
+  context: MigratedTriggerContext,
+  target: { projectId: string; revisionId: string },
+): Promise<void> {
+  const { input, plan, name } = context;
+  for (const route of plan.routes) {
+    const configuredTriggerName = runtimeTriggerName(
+      plan.configuration,
+      route.configuredEventName,
+      name,
+    );
+    await client.query(
+      `insert into project_trigger_routes (
+               organization_id, project_id, configuration_revision_id, provider,
+               connection_id, resource_id, trigger_name
+             ) values ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        target.projectId,
+        target.revisionId,
+        route.provider,
+        route.connectionId,
+        route.resourceId,
+        configuredTriggerName,
+      ],
+    );
+  }
+}
+
+async function activateMigratedRuntime(
+  client: QueryHandle,
+  context: MigratedTriggerContext,
+  rows: MigratedTriggerRows,
+): Promise<OrganizationTriggerRecord> {
+  const { input, plan } = context;
+  const { runtimeProject, trigger, revision } = rows;
+  const runtimeRevisionRows = await client.query<ProjectConfigurationRevisionRow>(
+    `insert into project_configuration_revisions (
+             project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
+             normalized_configuration, validation_errors, content_hash,
+             created_by_user_id, received_at, validated_at
+           ) values ($1, $2, 1, 'manual', $3, $4, $5, null, $6, null,
+             clock_timestamp(), clock_timestamp()) returning *`,
+    [
+      runtimeProject.id,
+      input.organizationId,
+      { kind: "organization_trigger_adapter", triggerId: trigger.id },
+      plan.candidate.yaml,
+      plan.candidate.normalizedConfiguration,
+      plan.candidate.contentHash,
+    ],
+  );
+  const runtimeRevision = requireReturnedRow(
+    runtimeRevisionRows.rows[0],
+    "migrated runtime configuration revision",
+  );
+  await insertMigratedProjectRoutes(client, context, {
+    projectId: runtimeProject.id,
+    revisionId: runtimeRevision.id,
+  });
+  await client.query(
+    `update projects set active_configuration_revision_id = $2,
+             updated_at = clock_timestamp() where id = $1`,
+    [runtimeProject.id, runtimeRevision.id],
+  );
+  const activated = await client.query<OrganizationTriggerRow>(
+    `update organization_triggers
+           set active_revision_id = $2, updated_at = clock_timestamp()
+           where id = $1 returning *`,
+    [trigger.id, revision.id],
+  );
+  return toOrganizationTriggerRecord(
+    requireReturnedRow(activated.rows[0], "activated organization trigger"),
+  );
+}
+
+async function migrateTriggerCandidate(
+  client: QueryHandle,
+  context: MigratedTriggerContext,
+): Promise<OrganizationTriggerRecord> {
+  const runtimeProject = await insertMigratedRuntimeProject(client, context.input, context.name);
+  const { trigger, revision } = await insertMigratedOrganizationTrigger(
+    client,
+    context,
+    runtimeProject.id,
+  );
+  return activateMigratedRuntime(client, context, { runtimeProject, trigger, revision });
+}
+
+async function archiveMigratedProject(
+  client: QueryHandle,
+  input: MigrateProjectTriggersInput,
+): Promise<void> {
+  await client.query(
+    `insert into project_trigger_migrations
+           (project_id, organization_id, configuration_revision_id)
+         values ($1, $2, $3)`,
+    [input.projectId, input.organizationId, input.configurationRevisionId],
+  );
+  await client.query(`delete from project_trigger_routes where project_id = $1`, [input.projectId]);
+  await client.query(
+    `update projects set status = 'archived', archived_at = clock_timestamp(),
+           active_configuration_revision_id = null, updated_at = clock_timestamp()
+         where id = $1`,
+    [input.projectId],
+  );
+}
+
+interface SavedTriggerRows {
+  input: SaveOrganizationTriggerInput;
+  trigger: OrganizationTriggerRow;
+  revision: OrganizationTriggerRevisionRow;
+  routes: OrganizationTriggerRoute[];
+}
+
+async function resolveSavedTriggerRoutes(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+  configuration: CompiledTriggerConfig,
+): Promise<OrganizationTriggerRoute[]> {
+  const linearConnections =
+    input.enabled && configuration.triggers.some(({ on }) => on.startsWith("linear."))
+      ? (
+          await client.query<{ id: string }>(
+            "select id from linear_connections where organization_id = $1",
+            [input.organizationId],
+          )
+        ).rows
+      : [];
+  return input.enabled
+    ? organizationTriggerRoutesForSave(
+        configuration,
+        input.routes,
+        linearConnections.map(({ id }) => id),
+      )
+    : [];
+}
+
+async function insertSavedTrigger(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+): Promise<OrganizationTriggerRow> {
+  const runtimeProjectRows = await client.query<ProjectRow>(
+    `insert into projects
+             (organization_id, name, slug, created_by_user_id)
+           values ($1, $2, $3, $4) returning *`,
+    [
+      input.organizationId,
+      `Trigger runtime: ${input.name}`,
+      `trigger-${randomUUID().replaceAll("-", "")}`,
+      input.createdByUserId,
+    ],
+  );
+  const runtimeProject = requireReturnedRow(runtimeProjectRows.rows[0], "saved runtime project");
+  await client.query(
+    `insert into project_configuration_sources
+             (project_id, organization_id, kind, automatic_deployment_enabled, selected_by_user_id)
+           values ($1, $2, 'manual', false, $3)`,
+    [runtimeProject.id, input.organizationId, input.createdByUserId],
+  );
+  const inserted = await client.query<OrganizationTriggerRow>(
+    `insert into organization_triggers
+             (organization_id, name, enabled, format, runtime_project_id)
+           values ($1, $2, $3, $4, $5) returning *`,
+    [input.organizationId, input.name, input.enabled, input.format, runtimeProject.id],
+  );
+  return requireReturnedRow(inserted.rows[0], "saved organization trigger");
+}
+
+async function upsertSavedTrigger(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+): Promise<OrganizationTriggerRow> {
+  if (input.triggerId === undefined) return insertSavedTrigger(client, input);
+  const updated = await client.query<OrganizationTriggerRow>(
+    `update organization_triggers
+           set name = $3, enabled = $4, format = $5, updated_at = clock_timestamp()
+           where id = $1 and organization_id = $2 returning *`,
+    [input.triggerId, input.organizationId, input.name, input.enabled, input.format],
+  );
+  if (updated.rows[0] === undefined) throw new Error("organization trigger not found");
+  return updated.rows[0];
+}
+
+async function insertSavedRevision(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+  triggerId: string,
+): Promise<OrganizationTriggerRevisionRow> {
+  const revisionRows = await client.query<OrganizationTriggerRevisionRow>(
+    `insert into organization_trigger_revisions (
+           trigger_id, organization_id, version, yaml, normalized_configuration,
+           content_hash, source_kind, source_evidence, created_by_user_id
+         ) values (
+           $1, $2,
+           coalesce((select max(version) + 1 from organization_trigger_revisions where trigger_id = $1), 1),
+           $3, $4, $5, $6, $7, $8
+         ) returning *`,
+    [
+      triggerId,
+      input.organizationId,
+      input.yaml,
+      input.normalizedConfiguration,
+      input.contentHash,
+      input.sourceKind,
+      input.sourceEvidence,
+      input.createdByUserId,
+    ],
+  );
+  return requireReturnedRow(revisionRows.rows[0], "saved organization trigger revision");
+}
+
+async function replaceSavedOrganizationRoutes(
+  client: QueryHandle,
+  { input, trigger, revision, routes }: SavedTriggerRows,
+): Promise<void> {
+  await client.query(`delete from organization_trigger_routes where trigger_id = $1`, [trigger.id]);
+  for (const route of routes) {
+    await client.query(
+      `insert into organization_trigger_routes (
+             organization_id, trigger_id, trigger_revision_id, provider,
+             connection_id, resource_id, configured_event_name
+           ) values ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        trigger.id,
+        revision.id,
+        route.provider,
+        route.connectionId,
+        route.resourceId,
+        route.configuredEventName,
+      ],
+    );
+  }
+}
+
+async function insertSavedRuntimeRevision(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+  trigger: OrganizationTriggerRow,
+): Promise<ProjectConfigurationRevisionRow> {
+  const runtimeRevisionRows = await client.query<ProjectConfigurationRevisionRow>(
+    `insert into project_configuration_revisions (
+           project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
+           normalized_configuration, validation_errors, content_hash,
+           created_by_user_id, received_at, validated_at
+         ) values (
+           $1, $2,
+           coalesce((select max(version) + 1 from project_configuration_revisions where project_id = $1), 1),
+           $3, $4, $5, $6, null, $7, $8, clock_timestamp(), clock_timestamp()
+         ) returning *`,
+    [
+      trigger.runtime_project_id,
+      input.organizationId,
+      input.sourceKind,
+      { kind: "organization_trigger_adapter", triggerId: trigger.id },
+      input.yaml,
+      input.normalizedConfiguration,
+      input.contentHash,
+      input.createdByUserId,
+    ],
+  );
+  return requireReturnedRow(runtimeRevisionRows.rows[0], "saved runtime configuration revision");
+}
+
+async function replaceSavedRuntimeRoutes(
+  client: QueryHandle,
+  rows: SavedTriggerRows,
+  options: { configuration: CompiledTriggerConfig; runtimeRevisionId: string },
+): Promise<void> {
+  const { input, trigger, routes } = rows;
+  await client.query(`delete from project_trigger_routes where project_id = $1`, [
+    trigger.runtime_project_id,
+  ]);
+  for (const route of routes) {
+    const configuredTriggerName = runtimeTriggerName(
+      options.configuration,
+      route.configuredEventName,
+      input.name,
+    );
+    await client.query(
+      `insert into project_trigger_routes (
+             organization_id, project_id, configuration_revision_id, provider,
+             connection_id, resource_id, trigger_name
+           ) values ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        trigger.runtime_project_id,
+        options.runtimeRevisionId,
+        route.provider,
+        route.connectionId,
+        route.resourceId,
+        configuredTriggerName,
+      ],
+    );
+  }
+}
+
+async function activateSavedTrigger(
+  client: TransactionHandle,
+  rows: SavedTriggerRows,
+  runtimeRevisionId: string,
+): Promise<OrganizationTriggerRecord> {
+  const { input, trigger, revision } = rows;
+  await client.query(
+    `update projects set active_configuration_revision_id = $2, updated_at = clock_timestamp()
+         where id = $1`,
+    [trigger.runtime_project_id, runtimeRevisionId],
+  );
+  const activated = await client.query<OrganizationTriggerRow>(
+    `update organization_triggers
+         set active_revision_id = $2, updated_at = clock_timestamp()
+         where id = $1 returning *`,
+    [trigger.id, revision.id],
+  );
+  const recurrence = input.enabled ? input.recurrence : undefined;
+  await ScheduleRepository.synchronize(client, trigger.id, recurrence, new Date());
+  return toOrganizationTriggerRecord(
+    requireReturnedRow(activated.rows[0], "activated organization trigger"),
+  );
+}
+
+interface TriggerPageSql {
+  scoped: string;
+  name: string;
+  key: string;
+  boundary: string;
+}
+
+function organizationTriggerPageSql(conditions: string, paramCount: number): TriggerPageSql {
+  const name = `t.name collate "C"`;
+  return {
+    scoped: `from organization_triggers t
+      where t.organization_id = $1 and t.active_revision_id is not null ${conditions}`,
+    name,
+    key: `(${name}, t.id)`,
+    boundary: `($${paramCount + 1}::text collate "C", $${paramCount + 2}::uuid)`,
+  };
+}
+
+async function fetchOrganizationTriggerPageRows(
+  pool: QueryHandle,
+  options: { request: TriggerListRequest; sql: TriggerPageSql; params: unknown[] },
+): Promise<OrganizationTriggerRow[]> {
+  const { request, sql, params } = options;
+  const position = request.position;
+  const previous = position?.direction === "previous";
+  const order = previous ? "desc" : "asc";
+  const values = position === undefined ? params : [...params, position.key.name, position.key.id];
+  const { rows } = await query<OrganizationTriggerRow>(
+    pool,
+    `select t.* ${sql.scoped}
+       ${position === undefined ? "" : `and ${sql.key} ${previous ? "<" : ">"} ${sql.boundary}`}
+       order by ${sql.name} ${order}, t.id ${order} limit $${values.length + 1}`,
+    [...values, request.limit + 1],
+  );
+  return rows;
+}
+
+async function organizationTriggerAdjacent(
+  pool: QueryHandle,
+  options: {
+    sql: TriggerPageSql;
+    params: unknown[];
+    record: OrganizationTriggerRow | undefined;
+    operator: "<" | ">";
+  },
+): Promise<boolean> {
+  const { sql, params, record, operator } = options;
+  if (record === undefined) return false;
+  const direction = operator === "<" ? "desc" : "asc";
+  const adjacentRows = await query(
+    pool,
+    `select 1 ${sql.scoped} and ${sql.key} ${operator} ${sql.boundary}
+         order by ${sql.name} ${direction}, t.id ${direction} limit 1`,
+    [...params, record.name, record.id],
+  );
+  return adjacentRows.rows.length > 0;
+}
+
+function toOrganizationTriggerPage(
+  page: OrganizationTriggerRow[],
+  links: { hasPrevious: boolean; hasNext: boolean },
+): TriggerListPage {
+  const first = page[0];
+  const last = page.at(-1);
+  return {
+    records: page.map(toOrganizationTriggerRecord),
+    previous: links.hasPrevious && first !== undefined ? { id: first.id, name: first.name } : null,
+    next: links.hasNext && last !== undefined ? { id: last.id, name: last.name } : null,
+  };
+}
 function organizationTriggerPageFilters(request: TriggerListRequest, params: unknown[]): string {
   const filters: string[] = [];
   if (request.enabled !== undefined)
