@@ -275,12 +275,9 @@ describe.each(backends)("script step persistence (%s)", (backend, open) => {
 
       const missing = await linkedAgentStep(harness);
       const lookup = hideRunAfterCompletion(database, missing.run.id, backend === "in-memory");
-      const withoutRun = await database.completeWorkflowStep(
-        missing.execution.id,
-        "failed",
-        result,
-      );
-      lookup.mockRestore();
+      const withoutRun = await database
+        .completeWorkflowStep(missing.execution.id, "failed", result)
+        .finally(() => lookup.mockRestore());
 
       assert.equal(withoutRun, undefined);
       const step = await database.findWorkflowStepRunById(missing.step.id);
