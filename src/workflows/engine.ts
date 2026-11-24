@@ -65,6 +65,7 @@ import {
   TerminalNotificationLease,
 } from "./terminal-lease.js";
 
+const CONTEXT_MATERIALIZER_UNAVAILABLE_REASON = "trigger_context_materializer_unavailable";
 const DEFAULT_WAKEUP_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 250;
 
@@ -1019,7 +1020,7 @@ export class DurableWorkflowEngine {
     if (!stepUsesTriggerContext(step)) return null;
     const provider = providerForTriggerContext(this.options.providers ?? [], run.triggerContext);
     if (provider?.materializeContext === undefined) {
-      return this.failStepContext(run, step, "trigger_context_materializer_unavailable");
+      return this.failStepContext(run, step, CONTEXT_MATERIALIZER_UNAVAILABLE_REASON);
     }
     try {
       return asTriggerContextValue(
