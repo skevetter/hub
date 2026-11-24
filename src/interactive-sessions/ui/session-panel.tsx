@@ -1,6 +1,6 @@
 import { Link } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useActiveAccount } from "../../auth/active-account.js";
 import type { TeamMember } from "../../auth/organization-contract.js";
@@ -18,7 +18,7 @@ import { Button } from "../../components/ui/button.js";
 import type { Result } from "../../contract/respond.js";
 import {
   closeSession,
-  readInteractiveSession,
+  type readInteractiveSession,
   replaceSessionAgent,
   retrySessionMessage,
   sendSessionMessage,
@@ -140,9 +140,9 @@ function SessionContent({ stream, snapshot, organizationSlug }: SessionViewProps
   );
 }
 
-function SessionConversation({ stream, snapshot, organizationSlug }: SessionViewProps) {
+function useSessionMessages({ stream, snapshot, organizationSlug }: SessionViewProps) {
   const { session, capabilities } = snapshot;
-  const { view, items, refresh, loadOlder } = stream;
+  const { refresh } = stream;
   const { id: sessionId, state, generation, daemon } = session;
   const send = useServerFn(sendSessionMessage);
   const retry = useServerFn(retrySessionMessage);
@@ -174,45 +174,23 @@ function SessionConversation({ stream, snapshot, organizationSlug }: SessionView
     },
     [generation, organizationSlug, retry, run, sessionId],
   );
+  return { busy, error, offline, closed, writable, shouldQueue, steer, queue, sendAgain };
+}
+
+function SessionConversation(props: SessionViewProps) {
+  const { snapshot, stream } = props;
+  const { session, capabilities } = snapshot;
+  const { state } = session;
+  const { view, items } = stream;
+  const messages = useSessionMessages(props);
+  const { offline, writable, shouldQueue, sendAgain, busy } = messages;
   const stopping = state === "stopping";
   const canRetry = writable && !shouldQueue && !stopping && state !== "waiting_permission";
-  const mode = composerMode(state, shouldQueue);
-  let composer = null;
-  if (writable) {
-    composer = (
-      <Composer
-        agentState={mode}
-        busy={busy}
-        error={error}
-        disabledReason={stopping ? "Wait for the agent to stop." : undefined}
-        primaryLabel={shouldQueue ? "Queue for next turn" : "Send"}
-        placeholder={
-          state === "idle" ? "Send a message to continue" : "Steer the agent or queue a note"
-        }
-        hint={composerHint(mode, shouldQueue)}
-        onSteer={steer}
-        onQueue={queue}
-      />
-    );
-  } else if (!closed && !capabilities.send) {
-    composer = <StatusLine>View only. A controller can send messages.</StatusLine>;
-  }
+  const composer = renderSessionComposer(state, capabilities.send, stopping, messages);
   return (
     <div className="grid min-w-0 content-start gap-4">
       <Card>
-        {view.agent.before === null ? null : (
-          <div>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={loadOlder}
-              disabled={view.loadingOlder}
-            >
-              {view.loadingOlder ? "Loading..." : "Load earlier replies"}
-            </Button>
-          </div>
-        )}
+        {renderEarlierReplies(stream)}
         <Transcript
           items={items}
           version={view.version}
@@ -230,6 +208,59 @@ function SessionConversation({ stream, snapshot, organizationSlug }: SessionView
       )}
     </div>
   );
+}
+
+function renderEarlierReplies({ view, loadOlder }: SessionViewProps["stream"]) {
+  return view.agent.before === null ? null : (
+    <div>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={loadOlder}
+        disabled={view.loadingOlder}
+      >
+        {view.loadingOlder ? "Loading..." : "Load earlier replies"}
+      </Button>
+    </div>
+  );
+}
+
+function renderSessionComposer(
+  state: SessionSnapshot["session"]["state"],
+  canSend: boolean,
+  stopping: boolean,
+  {
+    writable,
+    closed,
+    shouldQueue,
+    busy,
+    error,
+    steer,
+    queue,
+  }: ReturnType<typeof useSessionMessages>,
+) {
+  const mode = composerMode(state, shouldQueue);
+  if (writable) {
+    return (
+      <Composer
+        agentState={mode}
+        busy={busy}
+        error={error}
+        disabledReason={stopping ? "Wait for the agent to stop." : undefined}
+        primaryLabel={shouldQueue ? "Queue for next turn" : "Send"}
+        placeholder={
+          state === "idle" ? "Send a message to continue" : "Steer the agent or queue a note"
+        }
+        hint={composerHint(mode, shouldQueue)}
+        onSteer={steer}
+        onQueue={queue}
+      />
+    );
+  }
+  return !closed && !canSend ? (
+    <StatusLine>View only. A controller can send messages.</StatusLine>
+  ) : null;
 }
 
 function composerMode(
@@ -312,9 +343,6 @@ function SessionNotices({
 }) {
   const { daemon, state, stateReason } = session;
   const offline = daemon.connection === "offline";
-  const waiting = state === "waiting_permission";
-  const historyMissing = history === "history_unavailable" || history === "agent_missing";
-  const failed = state === "failed" || (state === "closed" && stateReason === "launch_failed");
   const stopped = state === "idle" && stateReason === "stopped_by_person";
   const closed = state === "closed";
   const params = useMemo(() => ({ organizationSlug }), [organizationSlug]);
@@ -332,35 +360,10 @@ function SessionNotices({
     <>
       {reconnecting ? <StatusLine>Live updates paused, reconnecting.</StatusLine> : null}
       {missedUpdates && !offline ? <StatusLine>Some live updates were missed.</StatusLine> : null}
-      {offline ? (
-        <WarningAlert
-          standalone
-          title={daemon.slug ? `Daemon ${daemon.slug} is offline` : "The daemon is offline"}
-          action={daemonLink}
-        >
-          Your messages are kept and wait for it to reconnect. Agent replies load when the daemon
-          reconnects.
-        </WarningAlert>
-      ) : null}
-      {!offline && historyMissing ? (
-        <WarningAlert standalone title="Agent history unavailable">
-          The transcript still shows messages already loaded.
-        </WarningAlert>
-      ) : null}
-      {waiting ? (
-        <WarningAlert standalone title="The agent is waiting for permission">
-          Answer the prompt in the Paseo app on {daemon.slug || "the daemon"}. You can queue a
-          message while you wait.
-        </WarningAlert>
-      ) : null}
-      {failed ? (
-        <FailureAlert
-          standalone
-          title="Session agent failed"
-          error={null}
-          fallback={sessionFailure(stateReason)}
-        />
-      ) : null}
+      {renderOfflineNotice(daemon, offline, daemonLink)}
+      {renderHistoryNotice(offline, history)}
+      {renderPermissionNotice(daemon, state)}
+      {renderFailedNotice(session)}
       {stateReason === "stop_unconfirmed" ? (
         <WarningAlert standalone title="Stop could not be confirmed">
           Check the agent on the daemon before stopping it again.
@@ -380,13 +383,66 @@ function SessionNotices({
   );
 }
 
+function renderOfflineNotice(
+  daemon: SessionSnapshot["session"]["daemon"],
+  offline: boolean,
+  daemonLink: ReactNode,
+) {
+  return offline ? (
+    <WarningAlert
+      standalone
+      title={daemon.slug ? `Daemon ${daemon.slug} is offline` : "The daemon is offline"}
+      action={daemonLink}
+    >
+      Your messages are kept and wait for it to reconnect. Agent replies load when the daemon
+      reconnects.
+    </WarningAlert>
+  ) : null;
+}
+
+function renderHistoryNotice(
+  offline: boolean,
+  history: ReturnType<typeof useSessionStream>["view"]["history"],
+) {
+  const historyMissing = history === "history_unavailable" || history === "agent_missing";
+  return !offline && historyMissing ? (
+    <WarningAlert standalone title="Agent history unavailable">
+      The transcript still shows messages already loaded.
+    </WarningAlert>
+  ) : null;
+}
+
+function renderPermissionNotice(
+  daemon: SessionSnapshot["session"]["daemon"],
+  state: SessionSnapshot["session"]["state"],
+) {
+  return state === "waiting_permission" ? (
+    <WarningAlert standalone title="The agent is waiting for permission">
+      Answer the prompt in the Paseo app on {daemon.slug || "the daemon"}. You can queue a message
+      while you wait.
+    </WarningAlert>
+  ) : null;
+}
+
+function renderFailedNotice({ state, stateReason }: SessionSnapshot["session"]) {
+  const failed = state === "failed" || (state === "closed" && stateReason === "launch_failed");
+  return failed ? (
+    <FailureAlert
+      standalone
+      title="Session agent failed"
+      error={null}
+      fallback={sessionFailure(stateReason)}
+    />
+  ) : null;
+}
+
 function sessionFailure(reason: SessionSnapshot["session"]["stateReason"]) {
   if (reason === "agent_missing") return "The agent is no longer available on the daemon.";
   if (reason === "daemon_revoked") return "The daemon's access was revoked.";
   return "The agent could not be started.";
 }
 
-function SessionControls({
+function useSessionCommands({
   organizationSlug,
   snapshot,
   refresh,
@@ -395,8 +451,7 @@ function SessionControls({
   snapshot: SessionSnapshot;
   refresh: () => Promise<boolean>;
 }) {
-  const { session, capabilities, participants } = snapshot;
-  const { id: sessionId, state, generation } = session;
+  const { id: sessionId, generation } = snapshot.session;
   const stop = useServerFn(stopSession);
   const close = useServerFn(closeSession);
   const replace = useServerFn(replaceSessionAgent);
@@ -413,26 +468,21 @@ function SessionControls({
   const stopAgent = useCallback(() => command("stop"), [command]);
   const closeAgent = useCallback(() => command("close"), [command]);
   const replaceAgent = useCallback(() => command("replace"), [command]);
+  return { busy, error, stopAgent, closeAgent, replaceAgent };
+}
+
+function SessionControls(props: Parameters<typeof useSessionCommands>[0]) {
+  const { snapshot } = props;
+  const {
+    session: { state },
+    capabilities,
+  } = snapshot;
+  const { busy, error, stopAgent, closeAgent, replaceAgent } = useSessionCommands(props);
   if (state === "closed" && error === undefined) return null;
   return (
     <div className="grid min-w-0 max-w-64 justify-items-start gap-2 sm:justify-items-end">
       <div className="flex flex-wrap items-center gap-2">
-        {capabilities.stop && (state === "running" || state === "waiting_permission") ? (
-          <ConfirmAction
-            label="Stop"
-            title="Stop this agent?"
-            busy={busy}
-            destructive
-            confirmLabel="Stop agent"
-            cancelLabel="Cancel"
-            onConfirm={stopAgent}
-            description={
-              participants.length > 1
-                ? "Everyone on this shared session will see the agent stop. Its current step will be interrupted. Saved work stays."
-                : "The agent's current step will be interrupted. Saved work stays."
-            }
-          />
-        ) : null}
+        {renderSessionStopControl(snapshot, busy, stopAgent)}
         {capabilities.close && state !== "closed" ? (
           <ConfirmAction
             label="Close"
@@ -455,6 +505,29 @@ function SessionControls({
       )}
     </div>
   );
+}
+
+function renderSessionStopControl(
+  { session: { state }, capabilities, participants }: SessionSnapshot,
+  busy: boolean,
+  stopAgent: () => void,
+) {
+  return capabilities.stop && (state === "running" || state === "waiting_permission") ? (
+    <ConfirmAction
+      label="Stop"
+      title="Stop this agent?"
+      busy={busy}
+      destructive
+      confirmLabel="Stop agent"
+      cancelLabel="Cancel"
+      onConfirm={stopAgent}
+      description={
+        participants.length > 1
+          ? "Everyone on this shared session will see the agent stop. Its current step will be interrupted. Saved work stays."
+          : "The agent's current step will be interrupted. Saved work stays."
+      }
+    />
+  ) : null;
 }
 
 type ActionResult = Result<{ outcome: "accepted" } | { outcome: "refused"; code: string }>;
