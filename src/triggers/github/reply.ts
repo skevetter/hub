@@ -31,6 +31,14 @@ export interface GitHubReplyClient {
 }
 
 export interface GitHubCommentClient extends GitHubReplyClient {
+  findIssueCommentByMarker(input: {
+    installationId: number;
+    owner: string;
+    repo: string;
+    issueNumber: number;
+    marker: string;
+    since: string;
+  }): Promise<number | undefined>;
   updateIssueComment(input: {
     installationId: number;
     owner: string;

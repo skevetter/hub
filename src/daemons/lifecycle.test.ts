@@ -19,6 +19,11 @@ import { createLogger, serializeError } from "../logger.js";
 import { MAX_EXPLICIT_AGENT_TITLE_CHARS } from "@getpaseo/protocol/agent-title-limits";
 import { assertOneFailure, FailureLogStream } from "../test-utils/failure-logs.js";
 import { enrollTestDaemon, TEST_DAEMON_ID } from "../test-utils/project-configuration.js";
+import {
+  GITHUB_BILLING_DENIAL,
+  githubBillingTriggerContext,
+} from "../test-utils/github-billing-notice.js";
+import { createGitHubTriggerProvider } from "../triggers/github/provider.js";
 
 const DAEMON_ID = "daemon-ack-test";
 const AGENT_ID = "agent-ack-test";
@@ -646,6 +651,50 @@ describe("dispatch retries transient database failures", () => {
     });
     return { database, intent, lifecycle, calls, sleeps, stream };
   }
+
+  it("skips a standalone execution limit notice when the GitHub marker already exists", async () => {
+    const { database, intent, lifecycle: unusedLifecycle, stream } = await dispatchFixture();
+    await unusedLifecycle.stop();
+    const context = githubBillingTriggerContext();
+    const createIssueComment = vi.fn(async () => ({ id: 2 }));
+    const findIssueCommentByMarker = vi.fn(async ({ marker }: { marker: string }) =>
+      marker === "<!-- paseo-notice:execution-limit:test-delivery:92 -->" ? 1 : undefined,
+    );
+    const provider = createGitHubTriggerProvider({
+      configurationStoreForProject: () => {
+        throw new Error("not used");
+      },
+      reactions: { createReaction: async () => null, deleteReaction: async () => {} },
+      comments: { findIssueCommentByMarker, createIssueComment },
+      billingUrlForOrganization: async () => "https://hub.test/settings/billing",
+    });
+    const failure = new DaemonDispatchFailure(GITHUB_BILLING_DENIAL);
+    const connection = new AcknowledgementConnection();
+    vi.spyOn(connection.agents, "create").mockRejectedValue(failure);
+    const lifecycle = createDaemonDispatchLifecycle({
+      database,
+      connectionForDaemon: () => connection,
+      providers: [provider],
+      publicBaseUrl: "https://hub.test",
+      completionTokenSecret: "test-secret",
+      test: { logger: createLogger(stream) },
+    });
+    try {
+      await assert.rejects(
+        () =>
+          lifecycle.dispatchLaunchMachineIntent({
+            ...intent,
+            triggerContext: context,
+            outputContext: context,
+          }),
+        failure,
+      );
+      assert.equal(findIssueCommentByMarker.mock.calls.length, 1);
+      assert.equal(createIssueComment.mock.calls.length, 0);
+    } finally {
+      await lifecycle.stop();
+    }
+  });
 
   it("retries a pool timeout before the agent is created and launches it once", async () => {
     const { database, intent, lifecycle, calls, sleeps } = await dispatchFixture();

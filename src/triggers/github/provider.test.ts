@@ -29,6 +29,7 @@ describe("GitHub Phase 1 trigger provider", () => {
       reactions: new RecoveringReactions(),
       billingUrlForOrganization: async () => "https://example.com/billing",
       comments: {
+        findIssueCommentByMarker: async () => undefined,
         createIssueComment: async () => {
           comments += 1;
           return { id: 1 };
@@ -75,6 +76,7 @@ describe("GitHub Phase 1 trigger provider", () => {
         reactions,
         billingUrlForOrganization: async () => "https://hub.paseo.sh/o/acme/settings/billing",
         comments: {
+          findIssueCommentByMarker: async () => undefined,
           createIssueComment: async (input) => {
             comments.push(input);
             return { id: 1 };
@@ -97,15 +99,22 @@ describe("GitHub Phase 1 trigger provider", () => {
         }),
         reactionState,
       );
-      assert.deepEqual(comments, [
-        {
-          installationId: 42,
-          owner: "boudra",
-          repo: "faro",
-          issueNumber: 211,
-          body: "This org has used its 50 free runs for September. Runs reset on October 1, or upgrade to Pro under Billing: https://hub.paseo.sh/o/acme/settings/billing",
-        },
-      ]);
+      const marker = "\n\n<!-- paseo-notice:execution-limit:github-delivery-1:211 -->";
+      const [comment] = comments;
+      assert.equal(comments.length, 1);
+      assert.ok(comment);
+      const { body, ...target } = comment;
+      assert.deepEqual(target, {
+        installationId: 42,
+        owner: "boudra",
+        repo: "faro",
+        issueNumber: 211,
+      });
+      assert.ok(body.endsWith(marker));
+      assert.equal(
+        body.slice(0, -marker.length),
+        "This org has used its 50 free runs for September. Runs reset on October 1, or upgrade to Pro under Billing: https://hub.paseo.sh/o/acme/settings/billing",
+      );
       assert.deepEqual(
         reactions.created.map((call) => call.content),
         ["eyes"],

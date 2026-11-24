@@ -135,7 +135,7 @@ export function createGitHubRegistration(
     },
   );
   const reactions = options.reactionClient ?? createGitHubReactionClient(appAuth);
-  const comments = createGitHubCommentClient(appAuth);
+  const comments = createGitHubCommentClient(appAuth, configuration.appSlug);
   logger.info("using webhook event source");
   return assembleGitHubRegistration(registration, {
     appAuth,
@@ -305,8 +305,20 @@ function createGitHubWebhook(
   });
 }
 
-function createGitHubCommentClient(appAuth: GitHubAuth): GitHubCommentClient {
+function createGitHubCommentClient(appAuth: GitHubAuth, appSlug: string): GitHubCommentClient {
   return {
+    async findIssueCommentByMarker({ installationId, owner, repo, issueNumber, marker, since }) {
+      const octokit = await appAuth.createInstallationOctokit(installationId);
+      const { data: comments } = await octokit.request(
+        "GET /repos/{owner}/{repo}/issues/{issue_number}/comments",
+        { owner, repo, issue_number: issueNumber, since, per_page: 100, request: { retries: 0 } },
+      );
+      const token = await appAuth.getInstallationToken(installationId);
+      const bot = await appAuth.getAppBotIdentity(appSlug, token);
+      return comments.find(
+        (comment) => comment.user?.id === bot.id && comment.body?.includes(marker),
+      )?.id;
+    },
     async createIssueComment({ installationId, owner, repo, issueNumber, body }) {
       const octokit = await appAuth.createInstallationOctokit(installationId);
       const response = await octokit.request(
