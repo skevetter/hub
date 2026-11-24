@@ -13,6 +13,52 @@ import { ScriptStepRuntime } from "../workflows/script-step.js";
 import type { Database } from "./types.js";
 import type { AuthServer } from "../auth/server.js";
 import { ProjectDashboard } from "../projects/dashboard.js";
+import {
+  createTimelinePostgresHarness,
+  TIMELINE_ORGANIZATION,
+} from "./test-utils/run-timeline-postgres.js";
+
+describe.each(["memory", "postgres"] as const)("project configuration on %s", (driver) => {
+  it("rejects revisions for unknown and archived projects", async () => {
+    const harness = driver === "postgres" ? await createTimelinePostgresHarness() : undefined;
+    try {
+      const database = harness?.database ?? createMemoryDatabase();
+      await harness?.runtime.query(
+        `insert into "user" (id, name, email) values ('test-user', 'Test', 'test@example.test')`,
+      );
+      await harness?.runtime.query(
+        `insert into member (id, organization_id, user_id, role)
+         values ('test-member', $1, 'test-user', 'owner')`,
+        [TIMELINE_ORGANIZATION],
+      );
+      const project = await database.createProject({
+        organizationId: TIMELINE_ORGANIZATION,
+        name: "Archived project",
+        slug: "archived-project",
+        createdByUserId: null,
+      });
+      await database.archiveProject(TIMELINE_ORGANIZATION, project.id, "test-user");
+      for (const projectId of [randomUUID(), project.id]) {
+        await assert.rejects(
+          database.insertProjectConfigurationRevision({
+            projectId,
+            sourceKind: "manual",
+            sourceEvidence: { kind: "test" },
+            normalizedConfiguration: { environments: [], triggers: [] },
+            contentHash: "test",
+          }),
+          (error: unknown) =>
+            error instanceof Error &&
+            error.constructor === Error &&
+            error.message === "project not found",
+        );
+        assert.equal(await database.findActiveProjectConfiguration(projectId), undefined);
+      }
+    } finally {
+      await harness?.close();
+    }
+  }, 120_000);
+});
 
 const PROJECT_ID = "00000000-0000-4000-8000-000000000001";
 const CONFIGURATION: CompiledHubConfig = {
