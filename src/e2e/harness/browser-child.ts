@@ -100,11 +100,6 @@ interface AccountSetupFailureCommand {
   type: "fail-next-account-setup";
 }
 
-interface ProjectReadFailureCommand {
-  id: string;
-  type: "fail-next-project-read";
-}
-
 interface AccountEmailLinkCommand {
   id: string;
   type: "account-email-link";
@@ -201,7 +196,6 @@ async function main(): Promise<void> {
     billing,
     providerFixtures,
   });
-  const failNextProjectRead = installProjectReadFault(runtime);
   const server = await listenForBrowserRequests(runtime, options.publicBaseUrl);
   listenForBrowserCommands(server, runtime, {
     ...providerFixtures,
@@ -211,7 +205,6 @@ async function main(): Promise<void> {
     billingClient: billingFixtureClient,
     accountSetupFaults,
     accountEmails,
-    failNextProjectRead,
   });
 }
 
@@ -430,24 +423,6 @@ async function startBrowserRuntime({
   });
 }
 
-function installProjectReadFault(runtime: BrowserRuntime): () => void {
-  let failNextProjectRead = false;
-  const projectDashboard = runtime.projectDashboard;
-  if (projectDashboard !== null) {
-    const readProjectSnapshot = projectDashboard.projectSnapshot.bind(projectDashboard);
-    projectDashboard.projectSnapshot = async (...args) => {
-      if (failNextProjectRead) {
-        failNextProjectRead = false;
-        throw new Error("project read failed with formatless-project-secret-8ac72f");
-      }
-      return readProjectSnapshot(...args);
-    };
-  }
-  return () => {
-    failNextProjectRead = true;
-  };
-}
-
 async function listenForBrowserRequests(runtime: BrowserRuntime, publicBaseUrl: string) {
   const start = await loadBuiltStartServer();
   await start.startApplication(() => runtime);
@@ -651,7 +626,6 @@ interface CommandFixtures {
   billingClient: FixtureStripeBillingClient | null;
   accountSetupFaults: BrowserAccountSetupFaults;
   accountEmails: BrowserAccountEmails;
-  failNextProjectRead(): void;
 }
 
 async function acceptCommand(message: unknown, fixtures: CommandFixtures): Promise<void> {
@@ -678,11 +652,6 @@ function acceptFixtureControlCommand(message: unknown, fixtures: CommandFixtures
     return true;
   }
   if (acceptAccountFixtureCommand(message, fixtures)) return true;
-  if (isProjectReadFailureCommand(message)) {
-    fixtures.failNextProjectRead();
-    process.send?.({ id: message.id, ok: true });
-    return true;
-  }
   return false;
 }
 
@@ -1138,15 +1107,6 @@ function isInstallProviderDispatchFixtureCommand(
     typeof Reflect.get(value, "repository") === "string" &&
     typeof Reflect.get(value, "guildId") === "string" &&
     isBundleFileList(Reflect.get(value, "files"))
-  );
-}
-
-function isProjectReadFailureCommand(value: unknown): value is ProjectReadFailureCommand {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    Reflect.get(value, "type") === "fail-next-project-read" &&
-    typeof Reflect.get(value, "id") === "string"
   );
 }
 

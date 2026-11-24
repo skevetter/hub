@@ -4,7 +4,7 @@ import type { AuthServer } from "../auth/server.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import { logger } from "../logger.js";
 import { createStreamHarness, streamRequest } from "../run-stream/test-utils.js";
-import { ProjectDashboard } from "../projects/dashboard.js";
+import { activityRunDetailView, readActivityExecutions } from "../projects/activity-run-view.js";
 import { acceptingAgentValidator } from "../test-utils/agent-validator.js";
 import { TriggerDashboard } from "../triggers/dashboard.js";
 import { RunPayloadRetention } from "./index.js";
@@ -102,24 +102,22 @@ it("redacts memory records and serves expired run views while the receipt remain
   assert.equal(await database.expireRunPayloadChunk(old.run.id, CUTOFF, NOW), "expiring");
   assert.equal(await database.expireRunPayloadChunk(old.run.id, CUTOFF, NOW), "expired");
 
-  const projectDashboard = new ProjectDashboard(database, auth);
   const triggers = new TriggerDashboard(database, auth, acceptingAgentValidator());
   const request = new Request("https://hub.test/o/org/projects/project");
-  const snapshots = await Promise.all([
-    projectDashboard.activityRunSnapshot(request, {
-      organizationSlug: "org",
-      projectSlug: "project",
-      runId: old.run.id,
-    }),
-    projectDashboard.activityRunDetail(request, { organizationSlug: "org", runId: old.run.id }),
-    triggers.runDetail(request, "org", old.run.id),
-  ]);
+  const read = await readActivityExecutions(database, () =>
+    database.findOrganizationActivityRun("org", old.run.id),
+  );
+  assert.ok(read);
+  const snapshots = [
+    activityRunDetailView(read.activity, read.executions),
+    await triggers.runDetail(request, "org", old.run.id),
+  ] as const;
   assert.ok(snapshots.every((value) => value !== null));
   assert.doesNotMatch(JSON.stringify(snapshots), /raw-sentinel-memory/u);
-  assert.equal(snapshots[0].activity.payloadExpiredAt, NOW.toISOString());
-  assert.equal(snapshots[1]?.steps[0]?.payloadSummary?.exitCode, 0);
-  assert.equal(snapshots[2]?.timeline.expired, true);
-  assert.equal(snapshots[2]?.progressUnavailable, true);
+  assert.equal(snapshots[0].run.payloadExpiredAt, NOW.toISOString());
+  assert.equal(snapshots[0].steps[0]?.payloadSummary?.exitCode, 0);
+  assert.equal(snapshots[1]?.timeline.expired, true);
+  assert.equal(snapshots[1]?.progressUnavailable, true);
   assert.match(
     JSON.stringify(await database.findProjectActivityRun(project.id, live.run.id)),
     /raw-sentinel-memory/u,

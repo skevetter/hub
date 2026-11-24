@@ -13,7 +13,7 @@ import { PageHeader, PageHeaderSkeleton } from "../../components/app/page.js";
 import { RelativeTime } from "../../components/app/relative-time.js";
 import { Section } from "../../components/app/section.js";
 import { SegmentedControl } from "../../components/app/segmented-control.js";
-import { StatusPill } from "../../components/app/status-pill.js";
+import { StateBlock } from "../../components/app/state-block.js";
 import { TwoLine } from "../../components/app/two-line.js";
 import { Button } from "../../components/ui/button.js";
 import { useRouteTenant } from "../../projects/context.js";
@@ -28,8 +28,8 @@ import {
 
 const DESCRIPTION = "Conversations with agents running on your daemons.";
 const COLUMNS = [
+  { header: "State", lead: true },
   { header: "Session", fill: true },
-  { header: "State" },
   { header: "Last activity", className: "hidden md:table-cell" },
 ];
 const FILTERS = [
@@ -230,10 +230,10 @@ function SessionRow({
   return (
     <DataRow onSelect={open}>
       <DataCell>
-        <TwoLine primary={title} secondary={byline} />
+        <StateBlock state={status} />
       </DataCell>
       <DataCell>
-        <StatusPill tone={status.tone}>{status.label}</StatusPill>
+        <TwoLine primary={title} secondary={byline} />
       </DataCell>
       <DataCell muted>
         <RelativeTime value={session.lastActivityAt} />

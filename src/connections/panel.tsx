@@ -27,6 +27,7 @@ import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RowActions } from "../components/app/row-actions.js";
 import { Section } from "../components/app/section.js";
 import { StatusLine } from "../components/app/status-line.js";
+import { connectionState, pillTone, type ConnectionState } from "../components/app/state-label.js";
 import { StatusPill } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
@@ -93,15 +94,18 @@ const PROVIDER_CARDS = [
 type ProviderStatus = ProviderConnectionStatus["status"];
 
 const UPDATING = <StatusPill tone="neutral">Updating</StatusPill>;
-const NOT_SET_UP = <StatusPill tone="neutral">Not set up</StatusPill>;
-const NEEDS_AUTHORIZATION = <StatusPill tone="warning">Needs authorization</StatusPill>;
-const STATE_PILLS: Record<ProviderStatus, ReactNode> = {
-  connected: <StatusPill tone="success">Connected</StatusPill>,
-  notConfigured: NOT_SET_UP,
-  disconnected: NOT_SET_UP,
-  requiresReauthorization: NEEDS_AUTHORIZATION,
-  suspended: NEEDS_AUTHORIZATION,
-};
+const STATE_PILLS = {
+  connected: connectionPill("connected"),
+  notConfigured: connectionPill("notConfigured"),
+  disconnected: connectionPill("disconnected"),
+  requiresReauthorization: connectionPill("requiresReauthorization"),
+  suspended: connectionPill("suspended"),
+} satisfies Record<ProviderStatus, ReactNode>;
+
+function connectionPill(status: ConnectionState) {
+  const { label, tone } = connectionState(status);
+  return <StatusPill tone={pillTone(tone)}>{label}</StatusPill>;
+}
 const ACTION_VERBS = {
   connected: "Connect",
   disconnected: "Connect",

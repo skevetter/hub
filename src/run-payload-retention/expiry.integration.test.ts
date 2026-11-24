@@ -10,7 +10,7 @@ import { embeddedDatabaseRuntime, type QueryHandle, type QueryRow } from "../db/
 import { createTimelinePostgresHarness } from "../db/test-utils/run-timeline-postgres.js";
 import { createPostgresTestRuntime } from "../db/test-utils/runtime.js";
 import type { AgentExecutionRecord, Database } from "../db/types.js";
-import { activityRunDetailView, activityRunView } from "../projects/activity-run-view.js";
+import { activityRunDetailView } from "../projects/activity-run-view.js";
 import { enrollTestDaemon, TEST_DAEMON_ID } from "../test-utils/project-configuration.js";
 import { RunPayloadRetention } from "./index.js";
 
@@ -131,10 +131,9 @@ async function assertProtectedReads(database: Database) {
   const legacyExecution = await database.findAgentExecutionById(LEGACY_EXECUTION);
   assert.equal(execution?.result, null);
   assert.equal(legacyExecution?.triggerContext, null);
-  const legacy = activityRunView(activity, [undefined, execution]);
   const detail = activityRunDetailView(activity, [undefined, execution]);
-  assert.doesNotMatch(JSON.stringify({ legacy, detail }), marker);
-  assert.equal(legacy.rawPayload, null);
+  assert.doesNotMatch(JSON.stringify({ activity, detail }), marker);
+  assert.equal(activity.receipt.payload, null);
   assert.equal(detail.run.payloadExpiredAt, NOW.toISOString());
   assert.equal(detail.steps[0]?.output, null);
   assert.equal(detail.steps[0]?.outputExpired, true);
@@ -143,7 +142,7 @@ async function assertProtectedReads(database: Database) {
   assert.equal(list.find(({ run }) => run.id === runId(2))?.webhookActor, "raw-sentinel-actor");
   const live = await database.findProjectActivityRun(PROJECT, runId(2));
   assert.ok(live);
-  assert.match(JSON.stringify(activityRunView(live, [])), /raw-sentinel-receipt/u);
+  assert.match(JSON.stringify(live), /raw-sentinel-receipt/u);
 }
 
 async function seedCompletedExecutionOutput(runtime: QueryHandle) {
@@ -211,6 +210,151 @@ async function drain(retention: RunPayloadRetention) {
     if (result.complete) return result;
   }
   throw new Error("expiry did not finish");
+}
+
+type TerminalClaim = NonNullable<
+  Awaited<ReturnType<Database["claimPendingWorkflowRunTerminalNotification"]>>
+>;
+type RetentionRuntime = Parameters<typeof createDatabase>[0];
+type RetentionLocks = Parameters<typeof createDatabase>[1];
+
+async function assertFencedWrites(database: Database, first: TerminalClaim, second: TerminalClaim) {
+  assert.equal(
+    await database.setWorkflowScriptStepOutput(STEP, { text: "raw-sentinel-late-cleanup" }),
+    undefined,
+  );
+  assert.equal(
+    (
+      await database.updateWorkflowScriptStep(STEP, {
+        status: "succeeded",
+        at: NOW,
+        output: { text: "raw-sentinel-late-step" },
+      })
+    )?.output,
+    null,
+  );
+  assert.equal(
+    await database.acquireRunProgressLease({
+      triggerRunId: first.id,
+      organizationId: ORG,
+      now: NOW,
+      owner: "stale",
+    }),
+    undefined,
+  );
+  assert.deepEqual(
+    await database.appendRunTimelineEvent({
+      triggerRunId: first.id,
+      organizationId: ORG,
+      kind: "turn_started",
+      at: NOW,
+      origin: "captured",
+      data: {},
+    }),
+    { reason: "expired" },
+  );
+  await database.markWorkflowRunTerminalNotificationDelivered(
+    second.id,
+    second.terminalNotificationGeneration,
+    NOW,
+    { late: "raw-sentinel-sender" },
+  );
+  const replay = await database.createAcceptedTriggerRun({
+    organizationId: ORG,
+    projectId: PROJECT,
+    configurationRevisionId: REVISION,
+    providerEventReceiptId: RECEIPT,
+    configuredTriggerName: "workflow-eligible",
+    prompt: "raw-sentinel-replay",
+    inputs: {},
+    triggerContext: {},
+    outputContext: {},
+    deadlineAt: NOW,
+    stepIds: ["must-not-insert"],
+    createdAt: NOW,
+  });
+  assert.equal(replay.created, false);
+  assert.equal(replay.run.id, first.id);
+  assert.equal((await database.listWorkflowStepRunsForTriggerRun(first.id)).length, 54);
+}
+
+async function resumeExpiry(runtime: RetentionRuntime, locks: RetentionLocks, firstId: string) {
+  const replanned = { mode: "on" as const, retentionDays: 30, maxRunsPerPass: 50 };
+  const restarted = createDatabase(runtime, locks);
+  const resumed = new RunPayloadRetention(restarted, {
+    ...replanned,
+    retentionDays: 365,
+    maxRunsPerPass: 1,
+  });
+  assert.equal((await drain(resumed)).expired, 1);
+  assert.equal((await drain(new RunPayloadRetention(restarted, replanned))).expired, 1);
+  const stored = await runtime.query(
+    `select to_jsonb(run) as run,
+    (select jsonb_agg(step) from workflow_step_runs step where step.trigger_run_id = run.id) as steps,
+    (select jsonb_agg(execution order by execution.id) from agent_executions execution where id in ($2, $3)) as executions
+   from trigger_runs run where run.id = $1`,
+    [firstId, EXECUTION, LEGACY_EXECUTION],
+  );
+  assert.doesNotMatch(JSON.stringify(stored.rows), marker);
+  assert.match(JSON.stringify(stored.rows), /launch-intent-kept.*legacy-intent-kept/u);
+  return restarted;
+}
+
+async function assertFinishedSummaries(restarted: Database, firstId: string) {
+  const finished = await restarted.findTriggerRunById(firstId);
+  assert.equal(finished?.payloadExpiryState, "expired");
+  assert.equal(finished?.payloadSummary?.timelineCounts?.events, 1);
+  assert.equal(
+    finished?.payloadSummary?.progress.link,
+    "https://github.com/owner/repo/issues/9#issuecomment-8",
+  );
+}
+
+async function assertStepSummaries(restarted: Database) {
+  const step = await restarted.findWorkflowStepRunById(STEP);
+  assert.equal(step?.payloadSummary?.exitCode, 7);
+  assert.equal(step?.payloadSummary?.truncated, true);
+  assert.equal(
+    (await restarted.findWorkflowStepRunById(AGENT_STEP))?.payloadSummary?.model,
+    "gpt-5",
+  );
+}
+
+async function assertExecutionCompletions(restarted: Database) {
+  assert.equal(
+    (await restarted.findAgentExecutionById(EXECUTION))?.payloadCompletion,
+    "inferred_from_turn_end",
+  );
+  assert.equal(
+    (await restarted.findAgentExecutionById(LEGACY_EXECUTION))?.payloadCompletion,
+    "explicit_finish",
+  );
+}
+
+async function assertRejectedAndBlocked(
+  runtime: RetentionRuntime,
+  restarted: Database,
+  firstId: string,
+) {
+  const rejected = await restarted.findTriggerRunById(runId(12));
+  assert.ok(rejected?.outcome === "rejected");
+  assert.deepEqual(rejected.rejection, {
+    code: "invalid_choice",
+    inputName: "value",
+    value: null,
+    choices: [],
+  });
+  const blocked = await runtime.query(
+    `select id, prompt, payload_expired_at from trigger_runs
+  where id <> $1 and id <> $2 order by id`,
+    [firstId, runId(12)],
+  );
+  assert.equal(blocked.rowCount, 12);
+  assert.ok(
+    blocked.rows.every(
+      (row) => row["payload_expired_at"] === null && row["prompt"] === "raw-sentinel-prompt",
+    ),
+  );
 }
 
 describe("run payload expiry", () => {
@@ -294,122 +438,12 @@ describe("run payload expiry", () => {
         assert.equal((await database.findTriggerRunById(first.id))?.payloadExpiryState, "expiring");
         await assertProtectedReads(database);
         await assertProtectedExecutionReaders(database, runtime);
-        assert.equal(
-          await database.setWorkflowScriptStepOutput(STEP, { text: "raw-sentinel-late-cleanup" }),
-          undefined,
-        );
-        assert.equal(
-          (
-            await database.updateWorkflowScriptStep(STEP, {
-              status: "succeeded",
-              at: NOW,
-              output: { text: "raw-sentinel-late-step" },
-            })
-          )?.output,
-          null,
-        );
-        assert.equal(
-          await database.acquireRunProgressLease({
-            triggerRunId: first.id,
-            organizationId: ORG,
-            now: NOW,
-            owner: "stale",
-          }),
-          undefined,
-        );
-        assert.deepEqual(
-          await database.appendRunTimelineEvent({
-            triggerRunId: first.id,
-            organizationId: ORG,
-            kind: "turn_started",
-            at: NOW,
-            origin: "captured",
-            data: {},
-          }),
-          { reason: "expired" },
-        );
-        await database.markWorkflowRunTerminalNotificationDelivered(
-          second.id,
-          second.terminalNotificationGeneration,
-          NOW,
-          { late: "raw-sentinel-sender" },
-        );
-        const replay = await database.createAcceptedTriggerRun({
-          organizationId: ORG,
-          projectId: PROJECT,
-          configurationRevisionId: REVISION,
-          providerEventReceiptId: RECEIPT,
-          configuredTriggerName: "workflow-eligible",
-          prompt: "raw-sentinel-replay",
-          inputs: {},
-          triggerContext: {},
-          outputContext: {},
-          deadlineAt: NOW,
-          stepIds: ["must-not-insert"],
-          createdAt: NOW,
-        });
-        assert.equal(replay.created, false);
-        assert.equal(replay.run.id, first.id);
-        assert.equal((await database.listWorkflowStepRunsForTriggerRun(first.id)).length, 54);
-
-        const restarted = createDatabase(runtime, locks);
-        const resumed = new RunPayloadRetention(restarted, {
-          ...replanned,
-          retentionDays: 365,
-          maxRunsPerPass: 1,
-        });
-        assert.equal((await drain(resumed)).expired, 1);
-        assert.equal((await drain(new RunPayloadRetention(restarted, replanned))).expired, 1);
-        const stored = await runtime.query(
-          `select to_jsonb(run) as run,
-          (select jsonb_agg(step) from workflow_step_runs step where step.trigger_run_id = run.id) as steps,
-          (select jsonb_agg(execution order by execution.id) from agent_executions execution where id in ($2, $3)) as executions
-         from trigger_runs run where run.id = $1`,
-          [first.id, EXECUTION, LEGACY_EXECUTION],
-        );
-        assert.doesNotMatch(JSON.stringify(stored.rows), marker);
-        assert.match(JSON.stringify(stored.rows), /launch-intent-kept.*legacy-intent-kept/u);
-        const finished = await restarted.findTriggerRunById(first.id);
-        assert.equal(finished?.payloadExpiryState, "expired");
-        assert.equal(finished?.payloadSummary?.timelineCounts?.events, 1);
-        assert.equal(
-          finished?.payloadSummary?.progress.link,
-          "https://github.com/owner/repo/issues/9#issuecomment-8",
-        );
-        const step = await restarted.findWorkflowStepRunById(STEP);
-        assert.equal(step?.payloadSummary?.exitCode, 7);
-        assert.equal(step?.payloadSummary?.truncated, true);
-        assert.equal(
-          (await restarted.findWorkflowStepRunById(AGENT_STEP))?.payloadSummary?.model,
-          "gpt-5",
-        );
-        assert.equal(
-          (await restarted.findAgentExecutionById(EXECUTION))?.payloadCompletion,
-          "inferred_from_turn_end",
-        );
-        assert.equal(
-          (await restarted.findAgentExecutionById(LEGACY_EXECUTION))?.payloadCompletion,
-          "explicit_finish",
-        );
-        const rejected = await restarted.findTriggerRunById(runId(12));
-        assert.ok(rejected?.outcome === "rejected");
-        assert.deepEqual(rejected.rejection, {
-          code: "invalid_choice",
-          inputName: "value",
-          value: null,
-          choices: [],
-        });
-        const blocked = await runtime.query(
-          `select id, prompt, payload_expired_at from trigger_runs
-        where id <> $1 and id <> $2 order by id`,
-          [first.id, runId(12)],
-        );
-        assert.equal(blocked.rowCount, 12);
-        assert.ok(
-          blocked.rows.every(
-            (row) => row["payload_expired_at"] === null && row["prompt"] === "raw-sentinel-prompt",
-          ),
-        );
+        await assertFencedWrites(database, first, second);
+        const restarted = await resumeExpiry(runtime, locks, first.id);
+        await assertFinishedSummaries(restarted, first.id);
+        await assertStepSummaries(restarted);
+        await assertExecutionCompletions(restarted);
+        await assertRejectedAndBlocked(runtime, restarted, first.id);
         await assertProtectedReads(restarted);
       } finally {
         await runtime.close();

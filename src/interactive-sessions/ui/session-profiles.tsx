@@ -13,7 +13,8 @@ import { FailureAlert } from "../../components/app/failure-alert.js";
 import { PageHeader, PageHeaderSkeleton } from "../../components/app/page.js";
 import { RowActions } from "../../components/app/row-actions.js";
 import { Section } from "../../components/app/section.js";
-import { StatusPill } from "../../components/app/status-pill.js";
+import { StateBlock } from "../../components/app/state-block.js";
+import { enabledState } from "../../components/app/state-label.js";
 import { TwoLine } from "../../components/app/two-line.js";
 import { Button } from "../../components/ui/button.js";
 import { DropdownMenuItem } from "../../components/ui/dropdown-menu.js";
@@ -24,11 +25,11 @@ import { refusalMessage, SessionLoadFailure, SessionsUnavailable } from "./sessi
 
 const DESCRIPTION = "Choose where sessions run and what settings agents use.";
 const COLUMNS = [
+  { header: "State", lead: true },
   { header: "Name", fill: true },
   { header: "Daemon", fill: true, className: "hidden lg:table-cell" },
   { header: "Directory", fill: true, className: "hidden lg:table-cell" },
   { header: "Provider / model", fill: true, className: "hidden lg:table-cell" },
-  { header: "State" },
   { header: "", align: "end" },
 ] satisfies DataColumn[];
 
@@ -211,6 +212,9 @@ function ProfileRow({
   return (
     <DataRow>
       <DataCell>
+        <StateBlock state={enabledState(enabled)} />
+      </DataCell>
+      <DataCell>
         <span className="hidden lg:inline" title={profile.name}>
           {profile.name}
         </span>
@@ -221,11 +225,6 @@ function ProfileRow({
       <DataCell>{daemon}</DataCell>
       <DataCell>{profile.cwd}</DataCell>
       <DataCell>{agent}</DataCell>
-      <DataCell>
-        <StatusPill tone={enabled ? "success" : "neutral"}>
-          {enabled ? "Enabled" : "Disabled"}
-        </StatusPill>
-      </DataCell>
       <DataCell>
         <RowActions label={`Actions for ${profile.name}`}>
           <DropdownMenuItem disabled={busy} onSelect={openEditor}>

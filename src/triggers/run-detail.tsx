@@ -10,7 +10,8 @@ import { Duration } from "../components/app/duration.js";
 import { PageHeader } from "../components/app/page.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
-import { StatusPill, statusLabel } from "../components/app/status-pill.js";
+import { pillTone, runState } from "../components/app/state-label.js";
+import { StatusPill } from "../components/app/status-pill.js";
 import { SummaryPanel } from "../components/app/summary-panel.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { useRouteTenant } from "../projects/context.js";
@@ -458,7 +459,7 @@ function runSummaryRows(
       label: "Status",
       value: (
         <span className="flex items-center gap-2">
-          <StatusPill tone={tone(status)}>{statusLabel(status)}</StatusPill>
+          <StatusPill tone={pillTone(runState(status).tone)}>{runState(status).label}</StatusPill>
           <ConnectionPill connection={connection} />
         </span>
       ),
@@ -609,10 +610,4 @@ function liveProgressMessageLabel(progress: NonNullable<RunDetailSnapshot["progr
     no_destination: "no place to post",
   };
   return `Not posted: ${progress.failure === null ? "could not confirm the message was created" : (reasons[progress.failure] ?? "could not confirm the message was created")}`;
-}
-
-function tone(status: string): "success" | "danger" | "neutral" {
-  if (status === "succeeded") return "success";
-  if (status === "failed" || status === "timed_out" || status === "rejected") return "danger";
-  return "neutral";
 }

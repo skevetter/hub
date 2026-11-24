@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, it, vi } from "vitest";
 import { createAttachmentCapabilityRegistry } from "../attachments/capabilities.js";
-import { activityRunDetailView, activityRunView } from "../projects/activity-run-view.js";
+import { activityRunDetailView } from "../projects/activity-run-view.js";
 import { ReceiptRetention } from "../receipt-retention/index.js";
 import { createManualTriggerSource, dispatchManualTrigger } from "../triggers/manual/source.js";
 import { DurableWorkflowEngine } from "../workflows/engine.js";
@@ -273,7 +273,6 @@ describe("native receipt writer fences", () => {
     assert.ok(activity);
     assert.equal(activity.receipt.payload, null);
     assert.equal(activity.receipt.acceptedRoutes, null);
-    assert.equal(activityRunView(activity, []).rawPayload, null);
     assert.equal(activityRunDetailView(activity, []).run.webhookSummary, undefined);
     const [listing] = await harness.database.listProjectActivityRuns(run.projectId, 10);
     assert.equal(listing?.webhookActor, undefined);

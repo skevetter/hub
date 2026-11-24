@@ -2,7 +2,14 @@ import { useSnapshotQuery } from "../queries/index.js";
 import { KeyRound } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+  type SyntheticEvent,
+} from "react";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
 import { EmptyState } from "../components/app/empty-state.js";
@@ -15,7 +22,8 @@ import { RelativeTime } from "../components/app/relative-time.js";
 import { RowActions } from "../components/app/row-actions.js";
 import { SegmentedControl } from "../components/app/segmented-control.js";
 import { Section } from "../components/app/section.js";
-import { StatusPill } from "../components/app/status-pill.js";
+import { StateBlock } from "../components/app/state-block.js";
+import { credentialState } from "../components/app/state-label.js";
 import {
   Select,
   SelectContent,
@@ -94,10 +102,10 @@ const EMPTY_CLI_TABLE = {
   description: "Run paseo hub login to create one.",
 };
 const CLI_COLUMNS = [
+  { header: "Status", lead: true },
   { header: "Prefix", fill: true },
   { header: "Created" },
   { header: "Last used" },
-  { header: "Status" },
   { header: "", align: "end" as const },
 ];
 
@@ -111,140 +119,17 @@ export function ApiKeys() {
   return <OrganizationApiKeys key={account.organization.id} account={account} />;
 }
 
-function OrganizationApiKeys({ account }: { account: ReturnType<typeof useActiveAccount> }) {
-  const queryClient = useQueryClient();
-  const [creating, setCreating] = useState(false);
-  const [reveal, setReveal] = useState<ApiKeyReveal>();
-  const [rotating, setRotating] = useState<ApiKeyRecord>();
-  const createKey = useServerFn(createApiKey);
-  const rotateKey = useServerFn(rotateApiKeySigningSecret);
-  const retireKey = useServerFn(retireApiKeySigningSecret);
-  const invalidate = useCallback(
-    () => queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] }),
-    [account.organization.id, queryClient],
-  );
-  const load = useServerFn(listApiKeys) as (
-    input: Parameters<typeof listApiKeys>[0],
-  ) => Promise<ListResult>;
-  const snapshot = useSnapshotQuery({
-    queryKey: ["api-keys", account.organization.id],
-    queryFn: () => load({}),
-    enabled: account.capabilities.manageResources,
-  });
-  const create = useMutation({
-    mutationKey: API_KEY_MUTATION_KEY,
-    retry: false,
-    mutationFn: async (input: Parameters<typeof createApiKey>[0]) => {
-      const result = await createKey(input);
-      if (result.status === "error") return result.error.message;
-      const issued = result.data;
-      setReveal(
-        "signingSecret" in issued
-          ? {
-              signingSecret: issued.signingSecret,
-              keyId: issued.key.id,
-              trigger: issued.key.allowedTriggers[0],
-            }
-          : { secret: issued.secret },
-      );
-      return undefined;
-    },
-  });
-  const rotate = useMutation({
-    mutationKey: API_KEY_MUTATION_KEY,
-    retry: false,
-    mutationFn: async (input: {
-      record: ApiKeyRecord;
-      versionId: string;
-      overlapSeconds: number;
-    }) => {
-      const { record, versionId, overlapSeconds } = input;
-      const trigger = record.allowedTriggers?.[0];
-      if (trigger === undefined) return "Reload the key list to confirm the signing key's trigger.";
-      const result = await rotateKey({
-        data: { id: record.id, expectedCurrentVersionId: versionId, overlapSeconds },
-      });
-      if (result.status === "error") return result.error.message;
-      setReveal({
-        signingSecret: result.data.signingSecret,
-        keyId: record.id,
-        trigger,
-      });
-      return undefined;
-    },
-  });
-  const retire = useMutation({
-    mutationKey: API_KEY_MUTATION_KEY,
-    retry: false,
-    mutationFn: retireKey,
-    onSettled: invalidate,
-  });
-  const revoke = useMutation({
-    mutationKey: API_KEY_MUTATION_KEY,
-    mutationFn: useServerFn(revokeApiKey) as (
-      input: Parameters<typeof revokeApiKey>[0],
-    ) => Promise<Result<Record<string, never>>>,
-    onSuccess: async (result) => {
-      if (result.status === "ok") {
-        await queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] });
-      }
-    },
-  });
-  const revokeCli = useMutation({
-    mutationKey: API_KEY_MUTATION_KEY,
-    mutationFn: useServerFn(revokeCliCredential) as (
-      input: Parameters<typeof revokeCliCredential>[0],
-    ) => Promise<Result<Record<string, never>>>,
-    onSuccess: async (result) => {
-      if (result.status === "ok") {
-        await queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] });
-      }
-    },
-  });
-  const openCreate = useCallback(() => setCreating(true), []);
+type ActiveAccount = ReturnType<typeof useActiveAccount>;
+type QueryClient = ReturnType<typeof useQueryClient>;
+type RevealSetter = (reveal: ApiKeyReveal | undefined) => void;
+type ApiKeyPage = ReturnType<typeof useApiKeyPage>;
+type ApiKeyList = Extract<ListResult, { status: "ok" }>["data"];
+
+function OrganizationApiKeys({ account }: { account: ActiveAccount }) {
+  const page = useApiKeyPage(account);
+  const { snapshot } = page;
+  const { openCreate } = page.dialogs.creation;
   const reload = snapshot.refetch;
-  const close = useCallback(
-    (open: boolean) => {
-      if (!open && create.isPending) return;
-      setCreating(open);
-      if (!open) {
-        setReveal(undefined);
-        create.reset();
-        void invalidate();
-      }
-    },
-    [create, invalidate],
-  );
-  const submit = useCallback(
-    (data: Parameters<typeof createApiKey>[0]["data"]) => create.mutate({ data }),
-    [create],
-  );
-  const closeRotation = useCallback(
-    (open: boolean) => {
-      if (open || rotate.isPending) return;
-      setRotating(undefined);
-      setReveal(undefined);
-      rotate.reset();
-      void invalidate();
-    },
-    [invalidate, rotate],
-  );
-  const submitRotation = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      const versionId = rotating?.authentication?.currentVersionId;
-      const overlapSeconds = Number(new FormData(event.currentTarget).get("overlapHours")) * 3600;
-      if (rotating !== undefined && versionId != null) {
-        rotate.mutate({ record: rotating, versionId, overlapSeconds });
-      }
-    },
-    [rotate, rotating],
-  );
-  const retireVersion = useCallback(
-    (id: string, versionId: string) =>
-      retire.mutate({ data: { id, expectedPreviousVersionId: versionId } }),
-    [retire],
-  );
   const header = (
     <PageHeader title="API keys" description={`Machine access for ${account.organization.name}.`}>
       <Button asChild variant="outline">
@@ -295,13 +180,218 @@ function OrganizationApiKeys({ account }: { account: ReturnType<typeof useActive
       </>
     );
   }
-  const keys = [...snapshot.data.keys].sort((left, right) => {
-    const revoked = Number(left.revokedAt !== null) - Number(right.revokedAt !== null);
-    return revoked || right.createdAt.localeCompare(left.createdAt);
-  });
-  const cliCredentials = [...snapshot.data.cliCredentials].sort((left, right) =>
-    right.createdAt.localeCompare(left.createdAt),
+  return renderLoadedApiKeys(account, page, snapshot.data, header);
+}
+
+function useApiKeyPage(account: ActiveAccount) {
+  const queryClient = useQueryClient();
+  const [creating, setCreating] = useState(false);
+  const [reveal, setReveal] = useState<ApiKeyReveal>();
+  const [rotating, setRotating] = useState<ApiKeyRecord>();
+  const { snapshot, invalidate, mutations } = useApiKeyOperations(queryClient, account, setReveal);
+  const { create, rotate, retire } = mutations;
+  const openCreate = useCallback(() => setCreating(true), []);
+  const close = useCallback(
+    (open: boolean) => closeCreation(open, { create, invalidate, setCreating, setReveal }),
+    [create, invalidate],
   );
+  const submit = useCallback(
+    (data: Parameters<typeof createApiKey>[0]["data"]) => create.mutate({ data }),
+    [create],
+  );
+  const closeRotation = useCallback(
+    (open: boolean) => closeRotationState(open, { rotate, invalidate, setRotating, setReveal }),
+    [invalidate, rotate],
+  );
+  const submitRotation = useCallback(
+    (event: SyntheticEvent<HTMLFormElement>) => submitApiKeyRotation(event, rotate, rotating),
+    [rotate, rotating],
+  );
+  const retireVersion = useCallback(
+    (id: string, versionId: string) =>
+      retire.mutate({ data: { id, expectedPreviousVersionId: versionId } }),
+    [retire],
+  );
+  return {
+    snapshot,
+    dialogs: {
+      creation: { creating, reveal, openCreate, close, submit },
+      signing: { rotating, setRotating, closeRotation, submitRotation, retireVersion },
+    },
+    mutations,
+  };
+}
+
+function useApiKeyOperations(
+  queryClient: QueryClient,
+  account: ActiveAccount,
+  setReveal: RevealSetter,
+) {
+  const createKey = useServerFn(createApiKey);
+  const rotateKey = useServerFn(rotateApiKeySigningSecret);
+  const retireKey = useServerFn(retireApiKeySigningSecret);
+  const invalidate = useCallback(
+    () => queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] }),
+    [account.organization.id, queryClient],
+  );
+  const load = useServerFn(listApiKeys) as (
+    input: Parameters<typeof listApiKeys>[0],
+  ) => Promise<ListResult>;
+  const snapshot = useSnapshotQuery({
+    queryKey: ["api-keys", account.organization.id],
+    queryFn: () => load({}),
+    enabled: account.capabilities.manageResources,
+  });
+  const create = useCreateApiKeyMutation(createKey, setReveal);
+  const rotate = useRotateApiKeyMutation(rotateKey, setReveal);
+  const retire = useMutation({
+    mutationKey: API_KEY_MUTATION_KEY,
+    retry: false,
+    mutationFn: retireKey,
+    onSettled: invalidate,
+  });
+  const { revoke, revokeCli } = useApiKeyRevocations(queryClient, account);
+  return { snapshot, invalidate, mutations: { create, rotate, retire, revoke, revokeCli } };
+}
+
+function useCreateApiKeyMutation(
+  createKey: ReturnType<typeof useServerFn<typeof createApiKey>>,
+  setReveal: RevealSetter,
+) {
+  return useMutation({
+    mutationKey: API_KEY_MUTATION_KEY,
+    retry: false,
+    mutationFn: async (input: Parameters<typeof createApiKey>[0]) => {
+      const result = await createKey(input);
+      if (result.status === "error") return result.error.message;
+      const issued = result.data;
+      setReveal(
+        "signingSecret" in issued
+          ? {
+              signingSecret: issued.signingSecret,
+              keyId: issued.key.id,
+              trigger: issued.key.allowedTriggers[0],
+            }
+          : { secret: issued.secret },
+      );
+      return undefined;
+    },
+  });
+}
+
+function useRotateApiKeyMutation(
+  rotateKey: ReturnType<typeof useServerFn<typeof rotateApiKeySigningSecret>>,
+  setReveal: RevealSetter,
+) {
+  return useMutation({
+    mutationKey: API_KEY_MUTATION_KEY,
+    retry: false,
+    mutationFn: async (input: {
+      record: ApiKeyRecord;
+      versionId: string;
+      overlapSeconds: number;
+    }) => {
+      const { record, versionId, overlapSeconds } = input;
+      const trigger = record.allowedTriggers?.[0];
+      if (trigger === undefined) return "Reload the key list to confirm the signing key's trigger.";
+      const result = await rotateKey({
+        data: { id: record.id, expectedCurrentVersionId: versionId, overlapSeconds },
+      });
+      if (result.status === "error") return result.error.message;
+      setReveal({
+        signingSecret: result.data.signingSecret,
+        keyId: record.id,
+        trigger,
+      });
+      return undefined;
+    },
+  });
+}
+
+function useApiKeyRevocations(queryClient: QueryClient, account: ActiveAccount) {
+  const revoke = useMutation({
+    mutationKey: API_KEY_MUTATION_KEY,
+    mutationFn: useServerFn(revokeApiKey) as (
+      input: Parameters<typeof revokeApiKey>[0],
+    ) => Promise<Result<Record<string, never>>>,
+    onSuccess: async (result) => {
+      if (result.status === "ok") {
+        await queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] });
+      }
+    },
+  });
+  const revokeCli = useMutation({
+    mutationKey: API_KEY_MUTATION_KEY,
+    mutationFn: useServerFn(revokeCliCredential) as (
+      input: Parameters<typeof revokeCliCredential>[0],
+    ) => Promise<Result<Record<string, never>>>,
+    onSuccess: async (result) => {
+      if (result.status === "ok") {
+        await queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] });
+      }
+    },
+  });
+  return { revoke, revokeCli };
+}
+
+function closeCreation(
+  open: boolean,
+  {
+    create,
+    invalidate,
+    setCreating,
+    setReveal,
+  }: {
+    create: ReturnType<typeof useCreateApiKeyMutation>;
+    invalidate: () => Promise<void>;
+    setCreating: (open: boolean) => void;
+    setReveal: RevealSetter;
+  },
+) {
+  if (!open && create.isPending) return;
+  setCreating(open);
+  if (!open) {
+    setReveal(undefined);
+    create.reset();
+    void invalidate();
+  }
+}
+
+function closeRotationState(
+  open: boolean,
+  {
+    rotate,
+    invalidate,
+    setRotating,
+    setReveal,
+  }: {
+    rotate: ReturnType<typeof useRotateApiKeyMutation>;
+    invalidate: () => Promise<void>;
+    setRotating: (record: ApiKeyRecord | undefined) => void;
+    setReveal: RevealSetter;
+  },
+) {
+  if (open || rotate.isPending) return;
+  setRotating(undefined);
+  setReveal(undefined);
+  rotate.reset();
+  void invalidate();
+}
+
+function submitApiKeyRotation(
+  event: SyntheticEvent<HTMLFormElement>,
+  rotate: ReturnType<typeof useRotateApiKeyMutation>,
+  rotating: ApiKeyRecord | undefined,
+) {
+  event.preventDefault();
+  const versionId = rotating?.authentication?.currentVersionId;
+  const overlapSeconds = Number(new FormData(event.currentTarget).get("overlapHours")) * 3600;
+  if (rotating !== undefined && versionId != null) {
+    rotate.mutate({ record: rotating, versionId, overlapSeconds });
+  }
+}
+
+function apiKeyErrors({ create, rotate, retire, revoke }: ApiKeyPage["mutations"]) {
   const createError = create.isError ? CREATE_FAILURE : create.data;
   const rotateError = rotate.isError
     ? "Reload the key list before rotating again. A new version may have been issued."
@@ -317,6 +407,130 @@ function OrganizationApiKeys({ account }: { account: ReturnType<typeof useActive
     revoke.isError || revoke.data?.status === "error"
       ? failureMessage(revoke.data, REVOKE_FAILURE)
       : undefined;
+  return { createError, rotateError, table: { retireError, revokeError } };
+}
+
+function renderLoadedApiKeys(
+  account: ActiveAccount,
+  page: ApiKeyPage,
+  data: ApiKeyList,
+  header: ReactNode,
+) {
+  const {
+    dialogs: {
+      creation: { creating, reveal, close, submit },
+    },
+    mutations: { create },
+  } = page;
+  const keys = [...data.keys].sort((left, right) => {
+    const revoked = Number(left.revokedAt !== null) - Number(right.revokedAt !== null);
+    return revoked || right.createdAt.localeCompare(left.createdAt);
+  });
+  const cliCredentials = [...data.cliCredentials].sort((left, right) =>
+    right.createdAt.localeCompare(left.createdAt),
+  );
+  const { createError, rotateError, table } = apiKeyErrors(page.mutations);
+  const rotationDialog = renderApiKeyRotation(page, rotateError);
+  return (
+    <>
+      {header}
+      {renderApiKeyList({ account, keys, data, errors: table, page })}
+      {renderCliLogins(cliCredentials, page.mutations.revokeCli)}
+      <ApiKeyDialog
+        key={account.organization.id}
+        organizationSlug={account.organization.slug}
+        open={creating}
+        onOpenChange={close}
+        reveal={creating ? reveal : undefined}
+        canSign={data.signingAvailability === "enabled"}
+        busy={create.isPending}
+        error={createError}
+        onSubmit={submit}
+      />
+      {rotationDialog}
+    </>
+  );
+}
+
+function renderApiKeyList({
+  account,
+  keys,
+  data,
+  errors: { revokeError, retireError },
+  page,
+}: {
+  account: ActiveAccount;
+  keys: ApiKeyRecord[];
+  data: ApiKeyList;
+  errors: ReturnType<typeof apiKeyErrors>["table"];
+  page: ApiKeyPage;
+}) {
+  const {
+    dialogs: {
+      signing: { setRotating, retireVersion },
+    },
+    mutations: { revoke, retire, rotate },
+  } = page;
+  const reload = page.snapshot.refetch;
+  return (
+    <Section>
+      {revokeError === undefined ? null : (
+        <FailureAlert title="API key not revoked" error={revokeError} fallback={REVOKE_FAILURE} />
+      )}
+      {retireError === undefined ? null : (
+        <FailureAlert
+          title="Could not confirm retirement"
+          error={retireError}
+          fallback={retireError}
+          onRetry={reload}
+        />
+      )}
+      <ApiKeyTable
+        records={keys}
+        signingAvailability={data.signingAvailability}
+        onRotate={setRotating}
+        onRetire={retireVersion}
+        canManage={account.capabilities.manageResources}
+        busy={revoke.isPending || retire.isPending || rotate.isPending}
+        onRevoke={revoke.mutate}
+      />
+    </Section>
+  );
+}
+
+function renderCliLogins(
+  cliCredentials: CliCredentialRecord[],
+  revokeCli: ReturnType<typeof useApiKeyRevocations>["revokeCli"],
+) {
+  return (
+    <Section title={CLI_LOGINS.title} description={CLI_LOGINS.description}>
+      <DataTable
+        label="CLI logins"
+        columns={CLI_COLUMNS}
+        isEmpty={cliCredentials.length === 0}
+        empty={EMPTY_CLI_TABLE}
+      >
+        {cliCredentials.map((record) => (
+          <CliCredentialRow
+            key={record.id}
+            record={record}
+            busy={revokeCli.isPending}
+            onRevoke={revokeCli.mutate}
+          />
+        ))}
+      </DataTable>
+    </Section>
+  );
+}
+
+function renderApiKeyRotation(page: ApiKeyPage, rotateError: string | undefined) {
+  const {
+    dialogs: {
+      signing: { rotating, closeRotation, submitRotation },
+      creation: { reveal },
+    },
+    mutations: { rotate },
+  } = page;
   let rotationDialog;
   if (rotating !== undefined) {
     rotationDialog =
@@ -332,62 +546,7 @@ function OrganizationApiKeys({ account }: { account: ReturnType<typeof useActive
         <SecretDialog open onOpenChange={closeRotation} reveal={reveal} />
       );
   }
-  return (
-    <>
-      {header}
-      <Section>
-        {revokeError === undefined ? null : (
-          <FailureAlert title="API key not revoked" error={revokeError} fallback={REVOKE_FAILURE} />
-        )}
-        {retireError === undefined ? null : (
-          <FailureAlert
-            title="Could not confirm retirement"
-            error={retireError}
-            fallback={retireError}
-            onRetry={reload}
-          />
-        )}
-        <ApiKeyTable
-          records={keys}
-          signingAvailability={snapshot.data.signingAvailability}
-          onRotate={setRotating}
-          onRetire={retireVersion}
-          canManage={account.capabilities.manageResources}
-          busy={revoke.isPending || retire.isPending || rotate.isPending}
-          onRevoke={revoke.mutate}
-        />
-      </Section>
-      <Section title={CLI_LOGINS.title} description={CLI_LOGINS.description}>
-        <DataTable
-          label="CLI logins"
-          columns={CLI_COLUMNS}
-          isEmpty={cliCredentials.length === 0}
-          empty={EMPTY_CLI_TABLE}
-        >
-          {cliCredentials.map((record) => (
-            <CliCredentialRow
-              key={record.id}
-              record={record}
-              busy={revokeCli.isPending}
-              onRevoke={revokeCli.mutate}
-            />
-          ))}
-        </DataTable>
-      </Section>
-      <ApiKeyDialog
-        key={account.organization.id}
-        organizationSlug={account.organization.slug}
-        open={creating}
-        onOpenChange={close}
-        reveal={creating ? reveal : undefined}
-        canSign={snapshot.data.signingAvailability === "enabled"}
-        busy={create.isPending}
-        error={createError}
-        onSubmit={submit}
-      />
-      {rotationDialog}
-    </>
-  );
+  return rotationDialog;
 }
 
 function RotationDialog({
@@ -401,7 +560,7 @@ function RotationDialog({
   busy: boolean;
   error: string | undefined;
   onOpenChange: (open: boolean) => void;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (event: SyntheticEvent<HTMLFormElement>) => void;
 }) {
   const [hours, setHours] = useState("1");
   const deadline = record.authentication?.previousAcceptUntil;
@@ -455,6 +614,9 @@ function CliCredentialRow({
   return (
     <DataRow>
       <DataCell>
+        <StateBlock state={credentialState(record.revokedAt !== null)} />
+      </DataCell>
+      <DataCell>
         <span className="font-mono text-xs">{record.prefix}</span>
       </DataCell>
       <DataCell muted>
@@ -462,11 +624,6 @@ function CliCredentialRow({
       </DataCell>
       <DataCell muted>
         {record.lastUsedAt === null ? "Never" : <RelativeTime value={record.lastUsedAt} />}
-      </DataCell>
-      <DataCell>
-        <StatusPill tone={record.revokedAt === null ? "success" : "danger"}>
-          {record.revokedAt === null ? "Active" : "Revoked"}
-        </StatusPill>
       </DataCell>
       <DataCell>
         {record.revokedAt === null ? (
@@ -488,16 +645,7 @@ function CliCredentialRow({
   );
 }
 
-function ApiKeyDialog({
-  open,
-  organizationSlug,
-  onOpenChange,
-  reveal,
-  canSign,
-  busy,
-  error,
-  onSubmit,
-}: {
+interface ApiKeyDialogProps {
   open: boolean;
   organizationSlug: string;
   onOpenChange: (open: boolean) => void;
@@ -506,7 +654,67 @@ function ApiKeyDialog({
   busy: boolean;
   error: string | undefined;
   onSubmit: (data: Parameters<typeof createApiKey>[0]["data"]) => void;
-}) {
+}
+
+function ApiKeyDialog(props: ApiKeyDialogProps) {
+  const { open, organizationSlug, onOpenChange, reveal, canSign, busy, error, onSubmit } = props;
+  const {
+    fields,
+    authentication: { mode, signing, setMode },
+    validation: { snapshot, validationError, submit },
+  } = useApiKeyForm({
+    open,
+    organizationSlug,
+    canSign,
+    onSubmit,
+  });
+  if (reveal !== undefined) {
+    return <SecretDialog open={open} onOpenChange={onOpenChange} reveal={reveal} />;
+  }
+  const targets = signingTargets(snapshot);
+  return (
+    <FormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="Create API key"
+      description="Choose the machine operations this organization key can perform."
+      label="Create API key"
+      submitLabel="Create API key"
+      busy={busy}
+      onSubmit={submit}
+    >
+      {canSign ? (
+        <SegmentedControl
+          label="Authentication"
+          options={AUTHENTICATION_OPTIONS}
+          value={mode}
+          onChange={setMode}
+        />
+      ) : null}
+      <ApiKeyFormFields
+        {...fields}
+        signingTarget={signing ? renderSigningTarget(snapshot, targets) : undefined}
+      />
+      {validationError === undefined ? null : (
+        <FailureAlert
+          title="Check API key details"
+          error={validationError}
+          fallback="Check the actor and allowed trigger names."
+        />
+      )}
+      {error === undefined ? null : (
+        <FailureAlert title="API key not created" error={error} fallback={CREATE_FAILURE} />
+      )}
+    </FormDialog>
+  );
+}
+
+function useApiKeyForm({
+  open,
+  organizationSlug,
+  canSign,
+  onSubmit,
+}: Pick<ApiKeyDialogProps, "open" | "organizationSlug" | "canSign" | "onSubmit">) {
   const [mode, setMode] = useState("bearer");
   const signing = mode === "github";
   const [name, setName] = useState("");
@@ -514,6 +722,54 @@ function ApiKeyDialog({
   const [selectedScopes, setSelectedScopes] = useState<ApiKeyScope[]>([]);
   const [scopeError, setScopeError] = useState<string>();
   const [validationError, setValidationError] = useState<string>();
+  const { snapshot, triggers } = useApiKeyTriggerChoices(organizationSlug, open);
+  const updateScope = useCallback((scope: ApiKeyScope, checked: boolean) => {
+    setSelectedScopes((scopes) =>
+      checked ? [...scopes, scope] : scopes.filter((value) => value !== scope),
+    );
+  }, []);
+  useEffect(() => {
+    if (!open) {
+      setMode("bearer");
+      setName("");
+      setActorOverride(undefined);
+      setSelectedScopes([]);
+      setScopeError(undefined);
+      setValidationError(undefined);
+    }
+  }, [open]);
+  // A key with no scopes can do nothing, and the server refuses it. Say so where the choice is
+  // rather than greying out the submit, which explains nothing to whoever clicks it.
+  const submit = useCallback(
+    (event: SyntheticEvent<HTMLFormElement>) =>
+      submitApiKeyForm(event, {
+        signing,
+        canSign,
+        selectedScopes,
+        setScopeError,
+        setValidationError,
+        onSubmit,
+      }),
+    [canSign, onSubmit, selectedScopes, signing],
+  );
+
+  return {
+    fields: {
+      name,
+      actorOverride,
+      scopes: signing ? GITHUB_SIGNER_SCOPES : selectedScopes,
+      triggers,
+      scopeError,
+      onNameChange: setName,
+      onActorChange: setActorOverride,
+      onScopeChange: updateScope,
+    },
+    authentication: { mode, signing, setMode },
+    validation: { snapshot, validationError, submit },
+  };
+}
+
+function useApiKeyTriggerChoices(organizationSlug: string, open: boolean) {
   const loadTriggers = useServerFn(triggerSnapshot);
   const snapshot = useSnapshotQuery({
     queryKey: ["triggers", organizationSlug],
@@ -539,141 +795,103 @@ function ApiKeyDialog({
     }
     return { status: "error", data: undefined, error: triggerError };
   }, [triggerData, triggerError, triggerStatus]);
-  const updateScope = useCallback((scope: ApiKeyScope, checked: boolean) => {
-    setSelectedScopes((scopes) =>
-      checked ? [...scopes, scope] : scopes.filter((value) => value !== scope),
-    );
-  }, []);
-  useEffect(() => {
-    if (!open) {
-      setMode("bearer");
-      setName("");
-      setActorOverride(undefined);
-      setSelectedScopes([]);
-      setScopeError(undefined);
-      setValidationError(undefined);
-    }
-  }, [open]);
-  // A key with no scopes can do nothing, and the server refuses it. Say so where the choice is
-  // rather than greying out the submit, which explains nothing to whoever clicks it.
-  const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
-      if (signing && !canSign) {
-        event.preventDefault();
-        setValidationError(
-          "Signature authentication is unavailable. Reload the key list before trying again.",
-        );
-        return;
-      }
-      if (!signing && selectedScopes.length === 0) {
-        event.preventDefault();
-        setScopeError("Select at least one scope.");
-        return;
-      }
-      setScopeError(undefined);
-      event.preventDefault();
-      const payload = apiKeyFormPayload(new FormData(event.currentTarget), signing);
-      if (!payload.success) {
-        setValidationError(payload.error.issues.map((issue) => issue.message).join(". "));
-        return;
-      }
-      setValidationError(undefined);
-      onSubmit(payload.data);
-    },
-    [canSign, onSubmit, selectedScopes, signing],
-  );
+  return { snapshot, triggers };
+}
 
-  if (reveal !== undefined) {
-    return <SecretDialog open={open} onOpenChange={onOpenChange} reveal={reveal} />;
+function submitApiKeyForm(
+  event: SyntheticEvent<HTMLFormElement>,
+  {
+    signing,
+    canSign,
+    selectedScopes,
+    setScopeError,
+    setValidationError,
+    onSubmit,
+  }: {
+    signing: boolean;
+    canSign: boolean;
+    selectedScopes: readonly ApiKeyScope[];
+    setScopeError: (error: string | undefined) => void;
+    setValidationError: (error: string | undefined) => void;
+    onSubmit: ApiKeyDialogProps["onSubmit"];
+  },
+) {
+  if (signing && !canSign) {
+    event.preventDefault();
+    setValidationError(
+      "Signature authentication is unavailable. Reload the key list before trying again.",
+    );
+    return;
   }
-  const targets =
-    triggerStatus === "success"
-      ? triggerData.triggers.filter((trigger) => trigger.enabled && trigger.event === "manual.run")
-      : [];
+  if (!signing && selectedScopes.length === 0) {
+    event.preventDefault();
+    setScopeError("Select at least one scope.");
+    return;
+  }
+  setScopeError(undefined);
+  event.preventDefault();
+  const payload = apiKeyFormPayload(new FormData(event.currentTarget), signing);
+  if (!payload.success) {
+    setValidationError(payload.error.issues.map((issue) => issue.message).join(". "));
+    return;
+  }
+  setValidationError(undefined);
+  onSubmit(payload.data);
+}
+
+type TriggerSnapshot = ReturnType<typeof useApiKeyTriggerChoices>["snapshot"];
+
+function signingTargets({ status, data }: TriggerSnapshot) {
+  return status === "success"
+    ? data.triggers.filter((trigger) => trigger.enabled && trigger.event === "manual.run")
+    : [];
+}
+
+function renderSigningTarget(
+  snapshot: TriggerSnapshot,
+  targets: ReturnType<typeof signingTargets>,
+) {
+  const { status: triggerStatus, error: triggerError } = snapshot;
   return (
-    <FormDialog
-      open={open}
-      onOpenChange={onOpenChange}
-      title="Create API key"
-      description="Choose the machine operations this organization key can perform."
-      label="Create API key"
-      submitLabel="Create API key"
-      busy={busy}
-      onSubmit={submit}
-    >
-      {canSign ? (
-        <SegmentedControl
-          label="Authentication"
-          options={AUTHENTICATION_OPTIONS}
-          value={mode}
-          onChange={setMode}
-        />
-      ) : null}
-      <ApiKeyFormFields
-        name={name}
-        actorOverride={actorOverride}
-        scopes={signing ? GITHUB_SIGNER_SCOPES : selectedScopes}
-        triggers={triggers}
-        scopeError={scopeError}
-        onNameChange={setName}
-        onActorChange={setActorOverride}
-        onScopeChange={updateScope}
-        signingTarget={
-          signing ? (
-            <>
-              <FormField
-                id="github-signer-target"
-                label="Manual trigger"
-                required
-                description="This key can send events to this trigger only. Its scope is Send events."
-              >
-                {(control) => (
-                  <Select name="targetTriggerId" required disabled={targets.length === 0}>
-                    <SelectTrigger {...control}>
-                      <SelectValue placeholder="Select a trigger" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {targets.map((target) => (
-                        <SelectItem key={target.id} value={target.id}>
-                          {target.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                )}
-              </FormField>
-              {triggerStatus === "error" && (
-                <FailureAlert
-                  title="Triggers unavailable"
-                  error={triggerError}
-                  fallback="Reload the trigger list before creating a GitHub signing key."
-                  onRetry={snapshot.refetch}
-                />
-              )}
-              {triggerStatus === "pending" && <p>Loading triggers...</p>}
-              {triggerStatus === "success" && targets.length === 0 && (
-                <p>Create or enable a manual trigger first.</p>
-              )}
-              <WarningAlert title="Identical bodies are accepted once per key">
-                GitHub signs the body without a timestamp. Hub ignores delivery headers for routing
-                and deduplication. A captured body that Hub has never accepted can still arrive
-                later.
-              </WarningAlert>
-            </>
-          ) : undefined
-        }
-      />
-      {validationError === undefined ? null : (
+    <>
+      <FormField
+        id="github-signer-target"
+        label="Manual trigger"
+        required
+        description="This key can send events to this trigger only. Its scope is Send events."
+      >
+        {(control) => (
+          <Select name="targetTriggerId" required disabled={targets.length === 0}>
+            <SelectTrigger {...control}>
+              <SelectValue placeholder="Select a trigger" />
+            </SelectTrigger>
+            <SelectContent>
+              {targets.map((target) => (
+                <SelectItem key={target.id} value={target.id}>
+                  {target.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+      </FormField>
+      {triggerStatus === "error" && (
         <FailureAlert
-          title="Check API key details"
-          error={validationError}
-          fallback="Check the actor and allowed trigger names."
+          title="Triggers unavailable"
+          error={triggerError}
+          fallback="Reload the trigger list before creating a GitHub signing key."
+          onRetry={snapshot.refetch}
         />
       )}
-      {error === undefined ? null : (
-        <FailureAlert title="API key not created" error={error} fallback={CREATE_FAILURE} />
+      {triggerStatus === "pending" && <p>Loading triggers...</p>}
+      {triggerStatus === "success" && targets.length === 0 && (
+        <p>Create or enable a manual trigger first.</p>
       )}
-    </FormDialog>
+      <WarningAlert title="Identical bodies are accepted once per key">
+        GitHub signs the body without a timestamp. Hub ignores delivery headers for routing and
+        deduplication. A captured body that Hub has never accepted can still arrive later.
+      </WarningAlert>
+    </>
   );
 }
 

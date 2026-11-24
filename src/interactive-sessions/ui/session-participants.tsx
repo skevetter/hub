@@ -106,6 +106,15 @@ export function ParticipantList({
   );
 }
 
+interface ParticipantRowProps {
+  participant: Participant;
+  starter: boolean;
+  you: boolean;
+  onChange: ChangeParticipant | undefined;
+  editing: boolean;
+  disabled: boolean;
+}
+
 function ParticipantRow({
   participant,
   starter,
@@ -113,14 +122,7 @@ function ParticipantRow({
   onChange,
   editing,
   disabled,
-}: {
-  participant: Participant;
-  starter: boolean;
-  you: boolean;
-  onChange: ChangeParticipant | undefined;
-  editing: boolean;
-  disabled: boolean;
-}) {
+}: ParticipantRowProps) {
   const { userId, name, role } = participant;
   const change = useCallback(
     (value: string) => onChange?.(userId, value === "controller" ? "controller" : "viewer"),
@@ -134,18 +136,9 @@ function ParticipantRow({
   const canChange = onChange !== undefined && !starter;
   const actions = useMemo(
     () =>
-      canChange ? (
-        <RowActions label={`Actions for ${name}`}>
-          {editing ? null : (
-            <DropdownMenuItem disabled={disabled} onSelect={toggle}>
-              Make {role === "controller" ? "viewer" : "controller"}
-            </DropdownMenuItem>
-          )}
-          <DropdownMenuItem disabled={disabled} onSelect={remove}>
-            Remove
-          </DropdownMenuItem>
-        </RowActions>
-      ) : null,
+      canChange
+        ? renderParticipantActions({ disabled, editing, name, remove, role, toggle })
+        : null,
     [canChange, disabled, editing, name, remove, role, toggle],
   );
   const roleOptions = useMemo(
@@ -174,5 +167,34 @@ function ParticipantRow({
         secondary={starter ? "Started the session" : permission}
       />
     </RecordRow>
+  );
+}
+
+function renderParticipantActions({
+  disabled,
+  editing,
+  name,
+  remove,
+  role,
+  toggle,
+}: {
+  disabled: boolean;
+  editing: boolean;
+  name: string;
+  remove: () => void;
+  role: ParticipantRole;
+  toggle: () => void;
+}) {
+  return (
+    <RowActions label={`Actions for ${name}`}>
+      {editing ? null : (
+        <DropdownMenuItem disabled={disabled} onSelect={toggle}>
+          Make {role === "controller" ? "viewer" : "controller"}
+        </DropdownMenuItem>
+      )}
+      <DropdownMenuItem disabled={disabled} onSelect={remove}>
+        Remove
+      </DropdownMenuItem>
+    </RowActions>
   );
 }
