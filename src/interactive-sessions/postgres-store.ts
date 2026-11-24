@@ -96,11 +96,54 @@ import type {
   SessionEventRecord,
   SessionParticipantRecord,
   SessionPrincipal,
+  SessionProfileSettings,
   StoredSessionProfile,
   SessionRecord,
 } from "./types.js";
 
 const { body: _body, ...commandColumnsWithoutBody } = getTableColumns(commands);
+
+interface ProfileSaveContext {
+  organizationId: string;
+  userId: string;
+  role: "owner" | "admin";
+  current: StoredSessionProfile | undefined;
+  settings: SessionProfileSettings;
+}
+
+interface StartRequestContext {
+  organizationId: string;
+  userId: string;
+  requested: ReturnType<typeof startParticipants>;
+  hash: string;
+  requester: StartSessionInput["nativeRequester"];
+}
+
+type NewCommandInput = Exclude<AcceptCommandInput, { kind: "retry" }>;
+
+interface CommandAcceptance {
+  input: NewCommandInput;
+  userId: string;
+  hash: string;
+}
+
+interface ParticipantChange extends Pick<SessionPrincipal, "organizationId" | "userId"> {
+  session: SessionRecord;
+  people: SessionParticipantRecord[];
+}
+
+interface CommandCandidates {
+  input: ClaimCommandInput;
+  candidates: SessionCommandRecord[];
+  leaseNow: Date;
+}
+
+interface SessionAuditDetails {
+  actorIdentity: string;
+  action: string;
+  evidence: SessionAuditRecord["evidence"];
+  now: Date;
+}
 
 export class InteractiveSessionRepository implements InteractiveSessionStore {
   constructor(
@@ -146,59 +189,80 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       if (!profileVersionMatches(input, current)) return "version_conflict";
       if (current && role !== "owner" && current.createdByUserId !== userId) return "forbidden";
 
-      const [daemon] = await db
-        .select({
-          status: daemons.status,
-          permissions: daemons.permissions,
-          enrolledBy: cliCredentials.createdByUserId,
-        })
-        .from(daemons)
-        .leftJoin(
-          cliCredentials,
-          and(
-            eq(cliCredentials.id, daemons.registeredByCliCredentialId),
-            eq(cliCredentials.organizationId, organizationId),
-          ),
-        )
-        .where(and(eq(daemons.organizationId, organizationId), eq(daemons.id, input.daemonId)))
-        .for("share", { of: daemons });
-      if (daemon?.status !== "active" || !daemon.permissions.includes("hub.execute"))
-        return "daemon_unavailable";
-      // Personal CLI enrollment proves who enrolled the daemon. Legacy and shared-key enrollments require the owner.
-      if (role !== "owner" && daemon.enrolledBy !== userId) return "forbidden";
-
-      const {
-        rows: [options],
-      } = await tx.query<{ size: number }>("select octet_length($1::jsonb::text) as size", [
-        JSON.stringify(settings.providerOptions),
-      ]);
-      if (options === undefined || options.size > 4096) return "invalid_profile";
-
-      const [named] = await db
-        .select({ id: profiles.id })
-        .from(profiles)
-        .where(and(eq(profiles.organizationId, organizationId), eq(profiles.name, input.name)));
-      if (named && named.id !== current?.id) return "name_taken";
-      if (current) {
-        const [saved] = await db
-          .update(profiles)
-          .set({
-            ...settings,
-            maxActive: input.maxActive,
-            linearTemplate: input.linearTemplate,
-            version: current.version + 1,
-            updatedAt: input.now,
-          })
-          .where(and(eq(profiles.organizationId, organizationId), eq(profiles.id, current.id)))
-          .returning();
-        return saved!;
-      }
-      const [created] = await db
-        .insert(profiles)
-        .values(profileRecord(input, settings))
-        .returning();
-      return created!;
+      return this.saveAuthorizedProfile(tx, db, input, {
+        organizationId,
+        userId,
+        role,
+        current,
+        settings,
+      });
     });
+  }
+
+  private async saveAuthorizedProfile(
+    tx: QueryHandle,
+    db: DrizzleHandle,
+    input: SaveSessionProfileInput,
+    context: ProfileSaveContext,
+  ): Promise<SaveSessionProfileResult> {
+    const { organizationId, userId, role, settings } = context;
+    const [daemon] = await db
+      .select({
+        status: daemons.status,
+        permissions: daemons.permissions,
+        enrolledBy: cliCredentials.createdByUserId,
+      })
+      .from(daemons)
+      .leftJoin(
+        cliCredentials,
+        and(
+          eq(cliCredentials.id, daemons.registeredByCliCredentialId),
+          eq(cliCredentials.organizationId, organizationId),
+        ),
+      )
+      .where(and(eq(daemons.organizationId, organizationId), eq(daemons.id, input.daemonId)))
+      .for("share", { of: daemons });
+    if (daemon?.status !== "active" || !daemon.permissions.includes("hub.execute"))
+      return "daemon_unavailable";
+    // Personal CLI enrollment proves who enrolled the daemon. Legacy and shared-key enrollments require the owner.
+    if (role !== "owner" && daemon.enrolledBy !== userId) return "forbidden";
+
+    const {
+      rows: [options],
+    } = await tx.query<{ size: number }>("select octet_length($1::jsonb::text) as size", [
+      JSON.stringify(settings.providerOptions),
+    ]);
+    if (options === undefined || options.size > 4096) return "invalid_profile";
+
+    return this.persistProfile(db, input, context);
+  }
+
+  private async persistProfile(
+    db: DrizzleHandle,
+    input: SaveSessionProfileInput,
+    { organizationId, current, settings }: ProfileSaveContext,
+  ): Promise<SaveSessionProfileResult> {
+    const [named] = await db
+      .select({ id: profiles.id })
+      .from(profiles)
+      .where(and(eq(profiles.organizationId, organizationId), eq(profiles.name, input.name)));
+    if (named && named.id !== current?.id) return "name_taken";
+    if (current) {
+      const [saved] = await db
+        .update(profiles)
+        .set({
+          ...settings,
+          maxActive: input.maxActive,
+          linearTemplate: input.linearTemplate,
+          version: current.version + 1,
+          updatedAt: input.now,
+        })
+        .where(and(eq(profiles.organizationId, organizationId), eq(profiles.id, current.id)))
+        .returning();
+      return requiredRow(saved, "locked profile was not updated");
+    }
+    const [created] = await db.insert(profiles).values(profileRecord(input, settings)).returning();
+    return requiredRow(created, "profile insert did not return a row");
   }
 
   startInteractiveSession(input: StartSessionInput): Promise<StartSessionResult> {
@@ -235,75 +299,101 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
           ),
         )
         .for("share");
-      if (prior) {
-        if (!(await this.rights(db, prior, userId))?.view) return refused("forbidden");
-        if (prior.startRequestHash !== hash) return refused("idempotency_conflict");
-        const [command] = await db
-          .select()
-          .from(commands)
-          .where(and(commandScope(prior), eq(commands.ordinal, 1)));
-        return {
-          status: "replayed",
-          session: prior,
-          command: replayCommand(command!, input.bodyCutoff),
-        };
-      }
-      if (!validMessage(input.message)) return refused("message_too_long");
-      const [profile] = await db
-        .select()
-        .from(profiles)
-        .where(and(eq(profiles.organizationId, organizationId), eq(profiles.id, input.profileId)))
-        .for("share");
-      if (profile?.status !== "active") return refused("profile_unavailable");
-      if (profile.version !== input.profileVersion) return refused("profile_changed");
-      if (requester && profile.createdByUserId !== userId) return refused("forbidden");
-      const capacity = await this.startCapacity(tx, profile, input);
-      if (capacity) return refused(capacity);
-      const people = await db
-        .select({ userId: members.userId })
-        .from(members)
-        .where(
-          and(
-            eq(members.organizationId, organizationId),
-            inArray(
-              members.userId,
-              requested.map((person) => person.userId),
-            ),
-          ),
-        )
-        .for("share");
-      if (people.length !== requested.length) return refused("invalid_participant");
-      if (!(await this.reserveUsage(tx, sessionUsage(input.principal, input.usage))))
-        return refused("usage_limit");
-
-      const session = newSession(input, profile, hash);
-      const command = newCommand(session, input, "message", "steer", input.message, hash);
-      await db.insert(sessions).values(session);
-      await db.insert(participants).values(
-        requested.map(({ userId: participantId, role }) => ({
-          userId: participantId,
-          role,
-          organizationId,
-          sessionId: session.id,
-          addedByUserId: userId,
-          createdAt: input.now,
-        })),
-      );
-      await db.insert(commands).values(command);
-      const stored = await this.append(db, session, input.now, [
-        stateEvent(session),
-        messageEvent(command),
-      ]);
-      await this.audit(
-        db,
-        session,
-        userId,
-        "started",
-        { profileId: profile.id, commandId: command.id },
-        input.now,
-      );
-      return { status: "created", session: stored, command };
+      const context = { organizationId, userId, requested, hash, requester };
+      if (prior) return this.replaySessionStart(db, prior, input, context);
+      return this.createSessionStart(tx, db, input, context);
     });
+  }
+
+  private async replaySessionStart(
+    db: DrizzleHandle,
+    prior: SessionRecord,
+    input: StartSessionInput,
+    { userId, hash }: StartRequestContext,
+  ): Promise<StartSessionResult> {
+    if (!(await this.rights(db, prior, userId))?.view) return refused("forbidden");
+    if (prior.startRequestHash !== hash) return refused("idempotency_conflict");
+    const [command] = await db
+      .select()
+      .from(commands)
+      .where(and(commandScope(prior), eq(commands.ordinal, 1)));
+    const bodyCutoff = input.bodyCutoff;
+    return {
+      status: "replayed",
+      session: prior,
+      command: replayCommand(requiredRow(command, "start command is missing"), bodyCutoff),
+    };
+  }
+
+  private async createSessionStart(
+    tx: TransactionHandle,
+    db: DrizzleHandle,
+    input: StartSessionInput,
+    context: StartRequestContext,
+  ): Promise<StartSessionResult> {
+    const { organizationId, userId, requested, requester } = context;
+    if (!validMessage(input.message)) return refused("message_too_long");
+    const [profile] = await db
+      .select()
+      .from(profiles)
+      .where(and(eq(profiles.organizationId, organizationId), eq(profiles.id, input.profileId)))
+      .for("share");
+    if (profile?.status !== "active") return refused("profile_unavailable");
+    if (profile.version !== input.profileVersion) return refused("profile_changed");
+    if (requester && profile.createdByUserId !== userId) return refused("forbidden");
+    const capacity = await this.startCapacity(tx, profile, input);
+    if (capacity) return refused(capacity);
+    const people = await db
+      .select({ userId: members.userId })
+      .from(members)
+      .where(
+        and(
+          eq(members.organizationId, organizationId),
+          inArray(
+            members.userId,
+            requested.map((person) => person.userId),
+          ),
+        ),
+      )
+      .for("share");
+    if (people.length !== requested.length) return refused("invalid_participant");
+    if (!(await this.reserveUsage(tx, sessionUsage(input.principal, input.usage))))
+      return refused("usage_limit");
+
+    return this.insertSessionStart(db, input, profile, context);
+  }
+
+  private async insertSessionStart(
+    db: DrizzleHandle,
+    input: StartSessionInput,
+    profile: StoredSessionProfile,
+    { organizationId, userId, requested, hash }: StartRequestContext,
+  ): Promise<StartSessionResult> {
+    const session = newSession(input, profile, hash);
+    const command = newCommand(session, input, "message", "steer", input.message, hash);
+    await db.insert(sessions).values(session);
+    await db.insert(participants).values(
+      requested.map(({ userId: participantId, role }) => ({
+        userId: participantId,
+        role,
+        organizationId,
+        sessionId: session.id,
+        addedByUserId: userId,
+        createdAt: input.now,
+      })),
+    );
+    await db.insert(commands).values(command);
+    const stored = await this.append(db, session, input.now, [
+      stateEvent(session),
+      messageEvent(command),
+    ]);
+    await this.audit(db, session, {
+      actorIdentity: userId,
+      action: "started",
+      evidence: { profileId: profile.id, commandId: command.id },
+      now: input.now,
+    });
+    return { status: "created", session: stored, command };
   }
 
   acceptInteractiveSessionCommand(input: AcceptCommandInput): Promise<AcceptCommandResult> {
@@ -333,52 +423,73 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
           ? { status: "replayed", session, command: replayCommand(prior, input.bodyCutoff) }
           : refused("idempotency_conflict");
       }
-      if (input.kind !== "close" && !(await this.activeSessionDaemon(db, session)))
-        return refused("daemon_unavailable");
-      const refusal = commandRefusal(session, input);
-      if (refusal) return refused(refusal);
-      if (input.kind === "message") {
-        const [recent] = await db
-          .select({ count: count() })
-          .from(commands)
-          .where(
-            and(
-              commandScope(session),
-              eq(commands.kind, "message"),
-              eq(commands.authorUserId, userId),
-              gt(commands.createdAt, sendRateCutoff(input.now)),
-            ),
-          );
-        if (recent!.count >= input.maxMessagesPerMinute) return refused("rate_limited");
-        if ((await this.queuedMessageCount(db, session)) >= input.maxQueued)
-          return refused("queue_full");
-        if (!(await this.reserveUsage(tx, sessionUsage(input.principal, input.usage))))
-          return refused("usage_limit");
-      }
-
-      const next = advanceForCommand(session, input);
-      const command = newCommand(
-        next,
-        input,
-        input.kind,
-        input.kind === "message" ? input.delivery : null,
-        input.kind === "message" ? input.message : null,
-        hash,
-      );
-      const drafts: SessionEventDraft[] = [];
-      if (input.kind === "message") {
-        drafts.push(messageEvent(command));
-      } else {
-        drafts.push(
-          stateEvent(next),
-          ...(await this.supersede(db, session, input.kind, input.now)),
-        );
-      }
-      await db.insert(commands).values(command);
-      const stored = await this.append(db, next, input.now, drafts);
-      await this.audit(db, session, userId, input.kind, { commandId: command.id }, input.now);
-      return { status: "accepted", session: stored, command };
+      return this.acceptNewCommand(tx, db, session, { input, userId, hash });
     });
+  }
+
+  private async acceptNewCommand(
+    tx: TransactionHandle,
+    db: DrizzleHandle,
+    session: SessionRecord,
+    context: CommandAcceptance,
+  ): Promise<AcceptCommandResult> {
+    const { input, userId } = context;
+    if (input.kind !== "close" && !(await this.activeSessionDaemon(db, session)))
+      return refused("daemon_unavailable");
+    const refusal = commandRefusal(session, input);
+    if (refusal) return refused(refusal);
+    if (input.kind === "message") {
+      const [recent] = await db
+        .select({ count: count() })
+        .from(commands)
+        .where(
+          and(
+            commandScope(session),
+            eq(commands.kind, "message"),
+            eq(commands.authorUserId, userId),
+            gt(commands.createdAt, sendRateCutoff(input.now)),
+          ),
+        );
+      if (requiredRow(recent, "message count returned no row").count >= input.maxMessagesPerMinute)
+        return refused("rate_limited");
+      if ((await this.queuedMessageCount(db, session)) >= input.maxQueued)
+        return refused("queue_full");
+      if (!(await this.reserveUsage(tx, sessionUsage(input.principal, input.usage))))
+        return refused("usage_limit");
+    }
+
+    return this.insertAcceptedCommand(db, session, context);
+  }
+
+  private async insertAcceptedCommand(
+    db: DrizzleHandle,
+    session: SessionRecord,
+    { input, userId, hash }: CommandAcceptance,
+  ): Promise<AcceptCommandResult> {
+    const next = advanceForCommand(session, input);
+    const command = newCommand(
+      next,
+      input,
+      input.kind,
+      input.kind === "message" ? input.delivery : null,
+      input.kind === "message" ? input.message : null,
+      hash,
+    );
+    const drafts: SessionEventDraft[] = [];
+    if (input.kind === "message") {
+      drafts.push(messageEvent(command));
+    } else {
+      drafts.push(stateEvent(next), ...(await this.supersede(db, session, input.kind, input.now)));
+    }
+    await db.insert(commands).values(command);
+    const stored = await this.append(db, next, input.now, drafts);
+    await this.audit(db, session, {
+      actorIdentity: userId,
+      action: input.kind,
+      evidence: { commandId: command.id },
+      now: input.now,
+    });
+    return { status: "accepted", session: stored, command };
   }
 
   async listInteractiveSessions(
@@ -520,60 +631,76 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       const session = await this.lockSession(db, input.organizationId, input.sessionId);
       if (!session || session.state === "failed") return undefined;
       if (!(await this.activeSessionDaemon(db, session))) return undefined;
-      const candidates = await db
-        .select()
-        .from(commands)
-        .where(
-          and(
-            commandScope(session),
-            eq(commands.generation, session.generation),
-            inArray(commands.status, unsettledStatuses),
-            input.lane === "message" ? eq(commands.kind, "message") : undefined,
-            input.lane === "control" ? ne(commands.kind, "message") : undefined,
-            session.state === "closed" ? eq(commands.kind, "close") : undefined,
-          ),
-        )
-        .orderBy(asc(commands.ordinal))
-        .for("update");
+      const candidates = await this.lockCommandCandidates(db, session, input);
       const leaseNow = await leaseTime(tx);
-      const drafts: SessionEventDraft[] = [];
-      let nextSession: SessionRecord = session;
-      let claimed: SessionCommandRecord | undefined;
       if (
-        !candidates.some(
+        candidates.some(
           (command) =>
             command.status === "dispatching" &&
             command.claimExpiresAt !== null &&
             command.claimExpiresAt > leaseNow,
         )
-      ) {
-        for (const command of candidates) {
-          if (!commandLeaseEligible(command, input, session.state, leaseNow)) continue;
-          const rights = await this.rights(db, session, command.authorUserId);
-          const patch = claimPatch(command, input, rights, leaseNow);
-          const updated = await this.updateCommand(db, command, patch);
-          drafts.push(deliveryEvent(updated));
-          if (updated.status === "dispatching") {
-            claimed = updated;
-            break;
-          }
-          nextSession = exhaustedControlState(session, updated, input.now);
-          if (nextSession !== session) {
-            drafts.push(
-              stateEvent(
-                nextSession,
-                nextSession.state === "running" ? "stop_unconfirmed" : nextSession.stateReason,
-              ),
-            );
-            if (nextSession.state === "closed")
-              drafts.push(...(await this.supersede(db, nextSession, "close", input.now)));
-            break;
-          }
-        }
-      }
-      if (drafts.length > 0) await this.append(db, nextSession, input.now, drafts);
-      return claimed;
+      )
+        return undefined;
+      return this.claimFromCandidates(db, session, { input, candidates, leaseNow });
     });
+  }
+
+  private lockCommandCandidates(
+    db: DrizzleHandle,
+    session: SessionRecord,
+    input: ClaimCommandInput,
+  ) {
+    return db
+      .select()
+      .from(commands)
+      .where(
+        and(
+          commandScope(session),
+          eq(commands.generation, session.generation),
+          inArray(commands.status, unsettledStatuses),
+          input.lane === "message" ? eq(commands.kind, "message") : undefined,
+          input.lane === "control" ? ne(commands.kind, "message") : undefined,
+          session.state === "closed" ? eq(commands.kind, "close") : undefined,
+        ),
+      )
+      .orderBy(asc(commands.ordinal))
+      .for("update");
+  }
+
+  private async claimFromCandidates(
+    db: DrizzleHandle,
+    session: SessionRecord,
+    { input, candidates, leaseNow }: CommandCandidates,
+  ) {
+    const drafts: SessionEventDraft[] = [];
+    let nextSession: SessionRecord = session;
+    let claimed: SessionCommandRecord | undefined;
+    for (const command of candidates) {
+      if (!commandLeaseEligible(command, input, session.state, leaseNow)) continue;
+      const rights = await this.rights(db, session, command.authorUserId);
+      const patch = claimPatch(command, input, rights, leaseNow);
+      const updated = await this.updateCommand(db, command, patch);
+      drafts.push(deliveryEvent(updated));
+      if (updated.status === "dispatching") {
+        claimed = updated;
+        break;
+      }
+      nextSession = exhaustedControlState(session, updated, input.now);
+      if (nextSession !== session) {
+        drafts.push(
+          stateEvent(
+            nextSession,
+            nextSession.state === "running" ? "stop_unconfirmed" : nextSession.stateReason,
+          ),
+        );
+        if (nextSession.state === "closed")
+          drafts.push(...(await this.supersede(db, nextSession, "close", input.now)));
+        break;
+      }
+    }
+    if (drafts.length > 0) await this.append(db, nextSession, input.now, drafts);
+    return claimed;
   }
 
   settleInteractiveSessionCommand(input: SettleCommandInput) {
@@ -596,26 +723,35 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         )
         .for("update");
       if (!command?.claimExpiresAt || command.claimExpiresAt <= (await leaseTime(tx))) return false;
-      const updated = await this.updateCommand(
-        db,
-        command,
-        settlePatch(input.status, input.now, finalDeliveryCode(command, input)),
-      );
-      const next =
-        input.status === "unknown" || input.status === "failed"
-          ? exhaustedControlState(session, updated, input.now)
-          : session;
-      const drafts = [deliveryEvent(updated)];
-      if (next !== session) {
-        drafts.push(
-          stateEvent(next, next.state === "running" ? "stop_unconfirmed" : next.stateReason),
-        );
-        if (next.state === "closed")
-          drafts.push(...(await this.supersede(db, next, "close", input.now)));
-      }
-      await this.append(db, next, input.now, drafts);
-      return true;
+      return this.settleClaimedCommand(db, session, command, input);
     });
+  }
+
+  private async settleClaimedCommand(
+    db: DrizzleHandle,
+    session: SessionRecord,
+    command: SessionCommandRecord,
+    input: SettleCommandInput,
+  ) {
+    const updated = await this.updateCommand(
+      db,
+      command,
+      settlePatch(input.status, input.now, finalDeliveryCode(command, input)),
+    );
+    const next =
+      input.status === "unknown" || input.status === "failed"
+        ? exhaustedControlState(session, updated, input.now)
+        : session;
+    const drafts = [deliveryEvent(updated)];
+    if (next !== session) {
+      drafts.push(
+        stateEvent(next, next.state === "running" ? "stop_unconfirmed" : next.stateReason),
+      );
+      if (next.state === "closed")
+        drafts.push(...(await this.supersede(db, next, "close", input.now)));
+    }
+    await this.append(db, next, input.now, drafts);
+    return true;
   }
 
   bindInteractiveSessionAgent(input: BindSessionAgentInput) {
@@ -709,61 +845,83 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       if (!rights.manageParticipants) return "forbidden";
       if (input.role !== null && !(await this.role(db, organizationId, input.userId)))
         return "not_member";
-      const current = people.find((person) => person.userId === input.userId);
-      if ((current?.role ?? null) === input.role) return input.role === null ? "removed" : "set";
-      if (current?.role === "controller" && input.role !== "controller") {
-        const others = people.filter(
-          (person) => person.role === "controller" && person.userId !== input.userId,
-        );
-        const remaining =
-          others.length === 0
-            ? []
-            : await db
-                .select({ id: members.id })
-                .from(members)
-                .where(
-                  and(
-                    eq(members.organizationId, organizationId),
-                    inArray(
-                      members.userId,
-                      others.map((person) => person.userId),
-                    ),
-                  ),
-                )
-                .for("share");
-        if (remaining.length === 0) return "last_controller";
-      }
-      if (input.role === null) {
-        await db
-          .delete(participants)
-          .where(
-            and(
-              eq(participants.organizationId, organizationId),
-              eq(participants.sessionId, session.id),
-              eq(participants.userId, input.userId),
-            ),
-          );
-      } else {
-        await db
-          .insert(participants)
-          .values({
-            organizationId,
-            sessionId: session.id,
-            userId: input.userId,
-            role: input.role,
-            addedByUserId: userId,
-            createdAt: input.now,
-          })
-          .onConflictDoUpdate({
-            target: [participants.sessionId, participants.userId],
-            set: { role: input.role, addedByUserId: userId },
-          });
-      }
-      const data = { userId: input.userId, role: input.role };
-      await this.append(db, session, input.now, [{ kind: "participants", commandId: null, data }]);
-      await this.audit(db, session, userId, "participant_changed", data, input.now);
-      return input.role === null ? "removed" : "set";
+      return this.changeParticipant(db, input, { organizationId, userId, session, people });
     });
+  }
+
+  private async changeParticipant(
+    db: DrizzleHandle,
+    input: SetParticipantInput,
+    context: ParticipantChange,
+  ): Promise<SetParticipantResult> {
+    const { organizationId, people } = context;
+    const current = people.find((person) => person.userId === input.userId);
+    if ((current?.role ?? null) === input.role) return input.role === null ? "removed" : "set";
+    if (current?.role === "controller" && input.role !== "controller") {
+      const others = people.filter(
+        (person) => person.role === "controller" && person.userId !== input.userId,
+      );
+      const remaining =
+        others.length === 0
+          ? []
+          : await db
+              .select({ id: members.id })
+              .from(members)
+              .where(
+                and(
+                  eq(members.organizationId, organizationId),
+                  inArray(
+                    members.userId,
+                    others.map((person) => person.userId),
+                  ),
+                ),
+              )
+              .for("share");
+      if (remaining.length === 0) return "last_controller";
+    }
+    return this.persistParticipant(db, input, context);
+  }
+
+  private async persistParticipant(
+    db: DrizzleHandle,
+    input: SetParticipantInput,
+    { organizationId, userId, session }: ParticipantChange,
+  ): Promise<SetParticipantResult> {
+    if (input.role === null) {
+      await db
+        .delete(participants)
+        .where(
+          and(
+            eq(participants.organizationId, organizationId),
+            eq(participants.sessionId, session.id),
+            eq(participants.userId, input.userId),
+          ),
+        );
+    } else {
+      await db
+        .insert(participants)
+        .values({
+          organizationId,
+          sessionId: session.id,
+          userId: input.userId,
+          role: input.role,
+          addedByUserId: userId,
+          createdAt: input.now,
+        })
+        .onConflictDoUpdate({
+          target: [participants.sessionId, participants.userId],
+          set: { role: input.role, addedByUserId: userId },
+        });
+    }
+    const data = { userId: input.userId, role: input.role };
+    await this.append(db, session, input.now, [{ kind: "participants", commandId: null, data }]);
+    await this.audit(db, session, {
+      actorIdentity: userId,
+      action: "participant_changed",
+      evidence: data,
+      now: input.now,
+    });
+    return input.role === null ? "removed" : "set";
   }
 
   listRecoverableInteractiveSessions(organizationId: string, daemonId: string | null) {
@@ -831,7 +989,10 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
           ne(sessions.state, "closed"),
         ),
       );
-    if (active!.count >= input.maxActivePerDaemon) return "active_limit";
+    if (
+      requiredRow(active, "active session count returned no row").count >= input.maxActivePerDaemon
+    )
+      return "active_limit";
     if (input.nativeRequester) {
       const [profileActive] = await db
         .select({ count: count() })
@@ -843,7 +1004,11 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
             ne(sessions.state, "closed"),
           ),
         );
-      if (profileActive!.count >= profile.maxActive) return "active_limit";
+      if (
+        requiredRow(profileActive, "active profile session count returned no row").count >=
+        profile.maxActive
+      )
+        return "active_limit";
     }
     return undefined;
   }
@@ -921,7 +1086,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         ),
       )
       .returning();
-    return row!;
+    return requiredRow(row, "locked command was not updated");
   }
 
   private async supersede(
@@ -979,11 +1144,12 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
         ...event,
         organizationId: session.organizationId,
         sessionId: session.id,
-        seq: stored!.hubSeq - drafts.length + index + 1,
+        seq:
+          requiredRow(stored, "locked session was not updated").hubSeq - drafts.length + index + 1,
         at: now,
       })),
     );
-    return stored!;
+    return requiredRow(stored, "locked session was not updated");
   }
 
   private async rearmMessage(
@@ -1036,14 +1202,12 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
       return refused("queue_full");
     const command = await this.updateCommand(db, original, retryMessagePatch(original, input.now));
     const stored = await this.append(db, session, input.now, [deliveryEvent(command)]);
-    await this.audit(
-      db,
-      session,
-      userId,
-      "retry",
-      { commandId: command.id, retryKey, requestHash },
-      input.now,
-    );
+    await this.audit(db, session, {
+      actorIdentity: userId,
+      action: "retry",
+      evidence: { commandId: command.id, retryKey, requestHash },
+      now: input.now,
+    });
     return { status: "accepted", session: stored, command };
   }
 
@@ -1060,7 +1224,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
           sql`${commands.failureCode} is distinct from 'delivery_unconfirmed'`,
         ),
       );
-    return queued!.count;
+    return requiredRow(queued, "queued message count returned no row").count;
   }
 
   private async activeSessionDaemon(db: DrizzleHandle, session: SessionRecord): Promise<boolean> {
@@ -1077,10 +1241,7 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
   private async audit(
     db: DrizzleHandle,
     session: SessionRecord,
-    actorIdentity: string,
-    action: string,
-    evidence: SessionAuditRecord["evidence"],
-    now: Date,
+    { actorIdentity, action, evidence, now }: SessionAuditDetails,
   ) {
     await db
       .insert(auditEvents)
@@ -1088,12 +1249,17 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
   }
 }
 
+function requiredRow<T>(row: T | undefined, detail: string): T {
+  if (row === undefined) throw new Error("interactive session store invariant: " + detail);
+  return row;
+}
+
 async function leaseTime(tx: QueryHandle): Promise<Date> {
   // now() is fixed at transaction start, before waits for the session or command locks.
   const {
     rows: [clock],
   } = await tx.query<{ now: Date }>("select clock_timestamp() as now");
-  return clock!.now;
+  return requiredRow(clock, "clock_timestamp returned no row").now;
 }
 
 function sessionScope(organizationId: string, sessionId: string) {
@@ -1107,7 +1273,9 @@ function commandScope(session: SessionRecord) {
   );
 }
 
-function readEvent(row: typeof events.$inferSelect): SessionEventRecord {
+type PersistedEvent = typeof events.$inferSelect;
+
+function readEvent(row: PersistedEvent): SessionEventRecord {
   const { kind, commandId, data, ...scope } = row;
   if (kind === "message" && commandId !== null && "ordinal" in data) {
     return { ...scope, kind, commandId, data };
@@ -1115,6 +1283,15 @@ function readEvent(row: typeof events.$inferSelect): SessionEventRecord {
   if (kind === "delivery" && commandId !== null && "status" in data) {
     return { ...scope, kind, commandId, data };
   }
+  return readSessionEvent(scope, kind, commandId, data);
+}
+
+function readSessionEvent(
+  scope: Omit<PersistedEvent, "kind" | "commandId" | "data">,
+  kind: PersistedEvent["kind"],
+  commandId: PersistedEvent["commandId"],
+  data: PersistedEvent["data"],
+): SessionEventRecord {
   if (kind === "state" && commandId === null && "state" in data) {
     return { ...scope, kind, commandId, data };
   }
