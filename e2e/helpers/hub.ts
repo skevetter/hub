@@ -2025,7 +2025,10 @@ export class PaseoHub {
   /** A finished or running run of a saved trigger, received `minutesAgo` minutes ago. */
   async seedTriggerRun(
     triggerName: string,
-    run: { minutesAgo: number; status: "running" | "succeeded" | "failed" },
+    run: {
+      minutesAgo: number;
+      status: "running" | "succeeded" | "failed" | "timed_out" | "rejected";
+    },
   ): Promise<void> {
     const receivedAt = `now() - make_interval(mins => $3)`;
     await this.queryDatabase(
@@ -2046,9 +2049,12 @@ export class PaseoHub {
        )
        insert into trigger_runs
          (organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
-          configured_trigger_name, status, prompt, deadline_at, created_at)
+          configured_trigger_name, status, outcome, rejection, prompt, deadline_at, created_at)
        select receipt.organization_id, trigger.project_id, trigger.revision_id, receipt.id, $1, $2,
-              'Handle the event.', now() + interval '1 hour', ${receivedAt}
+              case when $2 = 'rejected' then 'rejected' else 'accepted' end,
+              case when $2 = 'rejected' then '{"code":"missing_required","inputName":"fixture"}'::jsonb end,
+              'Handle the event.', case when $2 <> 'rejected' then now() + interval '1 hour' end,
+              ${receivedAt}
        from receipt, trigger`,
       [triggerName, run.status, run.minutesAgo],
     );

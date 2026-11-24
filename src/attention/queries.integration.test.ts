@@ -9,7 +9,8 @@ import {
 } from "../db/test-utils/run-timeline-postgres.js";
 import type { AcceptedTriggerRunRecord } from "../db/types.js";
 import { enrollTestDaemon } from "../test-utils/project-configuration.js";
-import { FAILED_RUNS_SQL, FAILED_RUN_STATUSES, WAITING_SESSIONS_SQL } from "./queries.js";
+import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
+import { FAILED_RUNS_SQL, WAITING_SESSIONS_SQL } from "./queries.js";
 
 let pg: TimelinePostgresHarness;
 let template: AcceptedTriggerRunRecord;

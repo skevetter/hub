@@ -15,7 +15,6 @@ import { LIST_RESULT_ACTION } from "../components/app/list-result-announcement.j
 import { SegmentedControl } from "../components/app/segmented-control.js";
 import { DroppedActivityPanel } from "./dropped-activity-panel.js";
 import { PageHeader } from "../components/app/page.js";
-import { statusLabel } from "../components/app/status-pill.js";
 import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
 import { useRouteTenant } from "../projects/context.js";
 import { Pagination, type PaginationTarget } from "../components/app/pagination.js";
@@ -26,6 +25,7 @@ import {
   activityPageKey,
   activityPageRequest,
   activitySearchSchema,
+  activityStatusLabel,
   type ActivitySearch,
 } from "./activity-query.js";
 import { triggerActivityPage, type TriggerActivityPage } from "./functions.js";
@@ -42,7 +42,10 @@ const ACTIVITY_VIEWS = [
 ] as const;
 const ACTIVITY_DESCRIPTION = "Agent runs launched by organization triggers.";
 const NO_FILTERED_RUNS = "No runs match these filters";
-const STATUS_OPTIONS = ACTIVITY_STATUSES.map((value) => ({ value, label: statusLabel(value) }));
+const STATUS_OPTIONS = ACTIVITY_STATUSES.map((value) => ({
+  value,
+  label: activityStatusLabel(value),
+}));
 const RANGE_OPTIONS = ACTIVITY_RANGES.map((value) => ({
   value,
   label: ACTIVITY_RANGE_LABELS[value],
@@ -323,7 +326,7 @@ function activityFilterDetails(
   triggerOptions: readonly ListFilterOption[],
 ) {
   return [
-    status === undefined ? undefined : `Status ${statusLabel(status)}`,
+    status === undefined ? undefined : `Status ${activityStatusLabel(status)}`,
     provider === undefined ? undefined : `Provider ${LIST_PROVIDER_LABELS[provider]}`,
     trigger === undefined
       ? undefined

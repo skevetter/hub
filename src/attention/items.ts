@@ -9,6 +9,7 @@ import { linearConnectionRequiresReauthorization } from "../providers/linear/cli
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { DROP_REASON_GROUPS, type DropReasonGroup } from "../triggers/drop-reason.js";
 import { LIST_PROVIDER_LABELS } from "../triggers/list-providers.js";
+import { FAILED_RUN_FILTER } from "../triggers/run-status.js";
 import type { AttentionItem } from "./contract.js";
 
 interface Connections {
@@ -167,7 +168,7 @@ function runItems(
       action: {
         label: "Review runs",
         to: `${base}/activity`,
-        search: { status: "failed", range: "7d" },
+        search: { status: FAILED_RUN_FILTER, range: "7d" },
       },
       dismiss: { label: "Mark seen" },
     },

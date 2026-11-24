@@ -15,6 +15,7 @@ import { resolveRouteTenant } from "../projects/access.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { projectTriggerForm } from "../triggers/configuration/editor.js";
+import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { matchGitHubInvocations } from "../triggers/github/match.js";
 import { matchLinearInvocations } from "../triggers/linear/match.js";
 import { incompleteSetupStepTitles, SETUP_INCOMPLETE } from "./checklist.js";
@@ -256,8 +257,6 @@ function readerOf(
 ): SessionPrincipal {
   return { organizationId: tenant.organization.id, userId, role: tenant.membership.role };
 }
-
-const FAILED_RUN_STATUSES: ReadonlySet<string> = new Set(["failed", "timed_out", "rejected"]);
 
 function tally(counts: readonly OrganizationRunCount[]): RunTally {
   const result = { total: 0, succeeded: 0, failed: 0 };

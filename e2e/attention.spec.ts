@@ -96,7 +96,7 @@ test.describe("Attention behavior", () => {
     const rows = dialog.getByRole("listitem");
     await expect(rows).toHaveCount(2);
     await expect(rows.nth(0)).toContainText(CONNECTION_TITLE);
-    await expect(rows.nth(1)).toContainText("1 run failed");
+    await expect(rows.nth(1)).toContainText("3 runs failed");
     await expect(rows.nth(1)).toContainText(`Newest: ${TRIGGER}`);
     await expectOnlyToastLiveRegion(page);
     await dialog.getByRole("link", { name: "Open connections" }).click();
@@ -107,10 +107,13 @@ test.describe("Attention behavior", () => {
     await dialog.getByRole("link", { name: "Review runs" }).click();
     await expect(page).toHaveURL(/\/activity\?/u);
     expect(Object.fromEntries(new URL(page.url()).searchParams)).toMatchObject({
-      status: "failed",
+      status: "unsuccessful",
       range: "7d",
     });
-    await expect(page.getByRole("link", { name: TRIGGER, exact: true })).toBeVisible();
+    const runs = page.getByRole("table", { name: "Trigger activity" });
+    await expect(runs.getByRole("link", { name: TRIGGER, exact: true })).toHaveCount(3);
+    await expect(runs.getByText("Timed out", { exact: true })).toBeVisible();
+    await expect(runs.getByText("Rejected", { exact: true })).toBeVisible();
     await expect(dialog).toBeHidden();
     await markSeenAndReload(hub.primaryApplication(), page);
   });
@@ -226,6 +229,8 @@ async function seedFailedRun(hub: PaseoHub, page: Page, isMobile: boolean) {
   });
   await triggers.save(TRIGGER);
   await hub.seedTriggerRun(TRIGGER, { minutesAgo: 1, status: "failed" });
+  await hub.seedTriggerRun(TRIGGER, { minutesAgo: 2, status: "timed_out" });
+  await hub.seedTriggerRun(TRIGGER, { minutesAgo: 3, status: "rejected" });
   await page.getByRole("link", { name: "Home", exact: true }).click();
   if (isMobile) await page.setViewportSize({ width: 390, height: 844 });
 }
@@ -240,7 +245,7 @@ async function markSeenAndReload(app: BuiltApplication, page: Page) {
   });
   try {
     await dialog.getByRole("button", { name: "Mark seen" }).click();
-    await expect(dialog.getByText("1 run failed")).toHaveCount(0);
+    await expect(dialog.getByText("3 runs failed")).toHaveCount(0);
     await page.keyboard.press("Escape");
     await expect(attentionEntry(page, 1)).toBeVisible();
   } finally {
@@ -253,7 +258,7 @@ async function markSeenAndReload(app: BuiltApplication, page: Page) {
   await page.reload();
   await openAttention(page, 1);
   await expect(dialog.getByText(CONNECTION_TITLE)).toBeVisible();
-  await expect(dialog.getByText("1 run failed")).toHaveCount(0);
+  await expect(dialog.getByText("3 runs failed")).toHaveCount(0);
 }
 
 async function expectOnlyToastLiveRegion(page: Page) {

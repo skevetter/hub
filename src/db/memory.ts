@@ -1,4 +1,4 @@
-import { FAILED_RUN_STATUSES } from "../attention/queries.js";
+import { FAILED_RUN_FILTER, FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { MemorySurfaceStore } from "../surfaces/memory-store.js";
 import {
   linearRoutesForConnection,
@@ -5334,11 +5334,12 @@ class MemoryDatabase implements Database {
     request: ActivityRunPageRequest,
   ): Promise<ActivityRunPageRecord> {
     const { createdSince, provider, status } = request;
+    const statuses = status === FAILED_RUN_FILTER ? FAILED_RUN_STATUSES : new Set([status]);
     const records = [...this.triggerRuns.values()]
       .filter(
         (run) =>
           run.organizationId === organizationId &&
-          (status === undefined || run.status === status) &&
+          (status === undefined || statuses.has(run.status)) &&
           (createdSince === undefined || run.createdAt >= createdSince) &&
           scopes.some(
             ({ projectId, triggerName }) =>

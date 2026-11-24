@@ -2,11 +2,7 @@ import type { QueryHandle } from "../db/runtime/index.js";
 import type { FailedRunSummary, WaitingSessionSummary } from "../db/types.js";
 import type { SessionPrincipal } from "../interactive-sessions/types.js";
 
-export const FAILED_RUN_STATUSES: ReadonlySet<string> = new Set([
-  "failed",
-  "timed_out",
-  "rejected",
-]);
+import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 
 export const FAILED_RUNS_SQL = `select
     count(*) over ()::int as count,

@@ -1,3 +1,4 @@
+import type { RunStatusFilter } from "../triggers/run-status.js";
 import type { QueryHandle } from "./runtime/index.js";
 import type { SurfaceStore } from "../surfaces/store.js";
 import type { InteractiveSessionStore } from "../interactive-sessions/store.js";
@@ -927,7 +928,7 @@ export interface ActivityRunKey {
 
 export interface ActivityRunPageRequest {
   limit: number;
-  status?: TriggerRunRecord["status"];
+  status?: RunStatusFilter;
   provider?: ListProvider;
   createdSince?: Date;
   /** `before` reads older than the key, `after` reads newer. No position reads the newest page. */
