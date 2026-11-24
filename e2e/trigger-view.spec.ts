@@ -1,11 +1,14 @@
 import { join } from "node:path";
-import { expect, type Locator, type Page } from "@playwright/test";
+import { expect, type ElementHandle, type Locator, type Page } from "@playwright/test";
 import { test } from "./app.js";
 import type { PaseoHub } from "./helpers/hub.js";
 import { OrganizationTriggers } from "./helpers/triggers.js";
 
 const SHOTS = "/tmp/hub-ui/trigger-view-shots";
 const NAME = "review-queue";
+const PHONE = { width: 390, height: 844 };
+const REFUSAL = "Verify your email to run this trigger.";
+const LONG_REFUSAL = `${REFUSAL} We could not confirm the address on this account, so Hub did not start the run. Open the verification message in your inbox, follow its link, then come back to this page and try again. If the message is missing, request a new one from your account settings (reference trace-0123456789abcdef0123456789abcdef).`;
 const owner = {
   name: "Trigger Owner",
   email: "trigger-view-owner@example.test",
@@ -96,6 +99,42 @@ test("shows the verified-email refusal without creating a run", async ({ hub, pa
   expect(await app.query("select id from trigger_runs")).toEqual([]);
 });
 
+test("announces the run result in the bar's live region at phone width", async ({ hub, page }) => {
+  await createManualTrigger(hub, page);
+  await page.setViewportSize(PHONE);
+  const bar = page.locator('[data-slot="sticky-actions"]');
+  const region = await readyLiveRegion(bar);
+  await bar.getByRole("button", { name: "Run now" }).click();
+  await expectAnnounced(region, "Run started.");
+  await expect(bar.getByRole("status").getByRole("link", { name: "View run" })).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Run started." })).toHaveCount(1);
+});
+
+test("wraps a long refusal inside the bar without covering the navigation", async ({
+  hub,
+  page,
+}) => {
+  await createManualTrigger(hub, page);
+  const app = hub.primaryApplication();
+  await app.query('update "user" set email_verified = false where email = $1', [owner.email]);
+  await page.setViewportSize(PHONE);
+  await lengthenRefusal(page);
+  const bar = page.locator('[data-slot="sticky-actions"]');
+  const region = await readyLiveRegion(bar);
+  await bar.getByRole("button", { name: "Run now" }).click();
+  await expectAnnounced(region, LONG_REFUSAL);
+  await expect(bar.getByRole("status")).toBeVisible();
+  for (const where of ["top", "bottom"] as const) {
+    await scrollTo(bar, where);
+    await expectBarFlushAboveNavigation(page);
+    await expectBarContained(page, bar);
+  }
+  const lastFact = page.getByText("/workspace", { exact: true });
+  const [fact, barBox] = await Promise.all([lastFact.boundingBox(), bar.boundingBox()]);
+  if (fact === null || barBox === null) throw new Error("layout not measurable");
+  expect(fact.y + fact.height).toBeLessThanOrEqual(barBox.y);
+});
+
 async function createManualTrigger(hub: PaseoHub, page: Page): Promise<string> {
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
@@ -170,18 +209,89 @@ async function expectPhoneLayout(page: Page): Promise<void> {
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
 }
 
+/** The live region must already be on the page, empty, so a screen reader sees its text change. */
+async function readyLiveRegion(bar: Locator): Promise<ElementHandle> {
+  const region = bar.getByRole("status");
+  await expect(region).toBeVisible();
+  await expect(region).toHaveText("");
+  await expect(region).toHaveAttribute("aria-live", "polite");
+  const handle = await region.elementHandle();
+  if (handle === null) throw new Error("live region missing");
+  return handle;
+}
+
+/** The same node gains the text, which is what makes a polite region announce it. */
+async function expectAnnounced(region: ElementHandle, text: string): Promise<void> {
+  await expect
+    .poll(async () => region.evaluate((node) => (node.isConnected ? node.textContent : "")))
+    .toContain(text);
+}
+
+/** Answers the refusal with a message long enough to wrap onto several lines on a phone. */
+async function lengthenRefusal(page: Page): Promise<void> {
+  await page.route(
+    (url) => url.pathname.startsWith("/_serverFn/"),
+    async (route) => {
+      if (route.request().method() !== "POST") return route.continue();
+      const response = await route.fetch();
+      const body = (await response.text()).replaceAll(REFUSAL, LONG_REFUSAL);
+      const headers = Object.fromEntries(
+        Object.entries(response.headers()).filter(([name]) => name !== "content-length"),
+      );
+      return route.fulfill({ response, headers, body });
+    },
+  );
+}
+
+async function expectBarContained(page: Page, bar: Locator): Promise<void> {
+  const [barBox, statusBox, buttonBox, navBox] = await Promise.all([
+    bar.boundingBox(),
+    bar.getByRole("status").boundingBox(),
+    bar.getByRole("button", { name: "Run now" }).boundingBox(),
+    page.getByRole("navigation", { name: "Quick navigation" }).boundingBox(),
+  ]);
+  if (barBox === null || statusBox === null || buttonBox === null || navBox === null) {
+    throw new Error("layout not measurable");
+  }
+  expect(statusBox.x).toBeGreaterThanOrEqual(0);
+  expect(statusBox.x + statusBox.width).toBeLessThanOrEqual(PHONE.width);
+  expect(statusBox.y).toBeGreaterThanOrEqual(barBox.y);
+  expect(buttonBox.y + buttonBox.height).toBeLessThanOrEqual(navBox.y);
+  expect(statusBox.height).toBeGreaterThan(40);
+  expect(barBox.y).toBeGreaterThan(PHONE.height / 3);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(PHONE.width);
+  const covered = await bar.getByRole("button", { name: "Run now" }).evaluate((button) => {
+    const rect = button.getBoundingClientRect();
+    const top = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+    return top !== button && !button.contains(top);
+  });
+  expect(covered).toBe(false);
+}
+
 async function overflows(page: Page): Promise<boolean> {
   return page.evaluate(() => document.documentElement.scrollHeight > window.innerHeight);
 }
 
-/** Scrolls whichever ancestor of the bar actually scrolls: the shell may scroll the window or an inset. */
+/**
+ * Scrolls the container that really scrolls (an ancestor with overflow, else the document) to its
+ * start or end, and proves it got there, so a geometry check that follows is not made mid-page.
+ */
 async function scrollTo(bar: Locator, where: "top" | "bottom"): Promise<void> {
-  await bar.evaluate((element, target) => {
+  const atEdge = await bar.evaluate((element, target) => {
     let node: HTMLElement | null = element.parentElement;
-    while (node !== null && node.scrollHeight <= node.clientHeight) node = node.parentElement;
+    while (node !== null && !scrollsVertically(node)) node = node.parentElement;
     const scroller = node ?? document.scrollingElement;
-    scroller?.scrollTo(0, target === "top" ? 0 : scroller.scrollHeight);
+    if (scroller === null) return false;
+    scroller.scrollTo(0, target === "top" ? 0 : scroller.scrollHeight);
+    if (target === "top") return scroller.scrollTop === 0;
+    return Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) <= 1;
+
+    function scrollsVertically(candidate: HTMLElement): boolean {
+      const { overflowY } = getComputedStyle(candidate);
+      return /(auto|scroll)/u.test(overflowY) && candidate.scrollHeight > candidate.clientHeight;
+    }
   }, where);
+  expect(atEdge).toBe(true);
 }
 
 async function expectBarFlushAboveNavigation(page: Page): Promise<void> {
