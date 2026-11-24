@@ -310,7 +310,13 @@ describe("workflow status persistence observation", () => {
   it("covers every PostgreSQL status statement and every public root reaching its helpers", async () => {
     const source = await readFile(new URL("../db/pg.ts", import.meta.url), "utf8");
     const { writes, uncovered } = analyzeStatusPaths(source);
-    assert.ok(writes.some((write) => write.owner.endsWith(".createWorkflowStepExecution")));
+    assert.ok(
+      writes.some(
+        (write) =>
+          write.owner === "markWorkflowStepExecutionStarted" &&
+          write.roots.includes("createWorkflowStepExecution"),
+      ),
+    );
     for (const helper of [
       "timeoutWorkflowRunOnClient",
       "timeoutWorkflowStepOnClient",
