@@ -17,6 +17,7 @@ import { StatusPill } from "../../components/app/status-pill.js";
 import { TwoLine } from "../../components/app/two-line.js";
 import { Button } from "../../components/ui/button.js";
 import { DropdownMenuItem } from "../../components/ui/dropdown-menu.js";
+import { useRouteTenant } from "../../projects/context.js";
 import { saveSessionProfile, type listSessionProfiles, type ProfileView } from "../functions.js";
 import { SessionProfileForm, type ProfileFormData } from "./session-profile-form.js";
 import { refusalMessage, SessionLoadFailure, SessionsUnavailable } from "./session-states.js";
@@ -48,9 +49,10 @@ export function SessionProfilesPanel({
   result: Awaited<ReturnType<typeof listSessionProfiles>>;
 }) {
   const account = useActiveAccount();
+  const tenant = useRouteTenant();
   if (
     account.features?.interactiveSessions !== true ||
-    !account.capabilities.manageResources ||
+    !tenant.capabilities.manageResources ||
     (result.status === "ok" && !Array.isArray(result.data) && result.data.code === "not_found")
   ) {
     return <SessionsUnavailable />;
@@ -66,20 +68,11 @@ export function SessionProfilesPanel({
   return <ProfileTable organizationSlug={organizationSlug} profiles={result.data} />;
 }
 
-function ProfileTable({
-  organizationSlug,
-  profiles,
-}: {
-  organizationSlug: string;
-  profiles: ProfileView[];
-}) {
+function useProfileSave(organizationSlug: string) {
   const router = useRouter();
   const save = useServerFn(saveSessionProfile);
   const saving = useRef(false);
   const [busy, setBusy] = useState(false);
-  const [editor, setEditor] = useState<ProfileView | null>();
-  const [error, setError] = useState<string>();
-
   const submit = useCallback(
     async (data: ProfileFormData) => {
       if (saving.current) return "A profile save is already in progress.";
@@ -100,7 +93,12 @@ function ProfileTable({
     },
     [organizationSlug, router, save],
   );
+  return { busy, submit };
+}
 
+function useProfileEditor(submit: (data: ProfileFormData) => Promise<string | null>) {
+  const [editor, setEditor] = useState<ProfileView | null>();
+  const [error, setError] = useState<string>();
   const close = useCallback(() => setEditor(undefined), []);
   const create = useCallback(() => {
     setError(undefined);
@@ -119,7 +117,10 @@ function ProfileTable({
     },
     [submit],
   );
+  return { editor, error, close, create, edit, toggle };
+}
 
+function useCreateProfile(busy: boolean, create: () => void) {
   const createButton = useMemo(
     () => (
       <Button type="button" disabled={busy} onClick={create}>
@@ -137,6 +138,19 @@ function ProfileTable({
     }),
     [createButton],
   );
+  return { createButton, empty };
+}
+
+function ProfileTable({
+  organizationSlug,
+  profiles,
+}: {
+  organizationSlug: string;
+  profiles: ProfileView[];
+}) {
+  const { busy, submit } = useProfileSave(organizationSlug);
+  const { editor, error, close, create, edit, toggle } = useProfileEditor(submit);
+  const { createButton, empty } = useCreateProfile(busy, create);
 
   return (
     <>

@@ -107,6 +107,30 @@ async function enroll(hub: PaseoHub, profileAdmin?: string) {
   return daemon;
 }
 
+/** The desktop rail, the phone More sheet and the command menu all list Setup destinations. */
+async function expectProfilesDestination(page: Page, shown: boolean) {
+  const count = shown ? 1 : 0;
+  const organization = { name: "Organization", exact: true } as const;
+  const profiles = (scope: Locator) => scope.getByRole("link", { name: "Profiles", exact: true });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await expect(profiles(page.getByRole("navigation", organization))).toHaveCount(count);
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  const menu = page.getByRole("dialog", { name: "Command menu" });
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole("option", { name: "Profiles", exact: true })).toHaveCount(count);
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
+  await page.setViewportSize({ width: 390, height: 900 });
+  await page
+    .getByRole("navigation", { name: "Quick navigation" })
+    .getByRole("button", { name: "More" })
+    .click();
+  const sheet = page.getByRole("dialog", { name: "More" });
+  await expect(profiles(sheet.getByRole("navigation", organization))).toHaveCount(count);
+  await page.keyboard.press("Escape");
+  await expect(sheet).toBeHidden();
+}
+
 async function start(page: Page, app: Awaited<ReturnType<typeof setup>>, addViewer = false) {
   await page.goto(app.origin + app.base + "/sessions/new");
   await expect(page.getByRole("heading", { name: "New session", level: 1 })).toBeVisible();
@@ -210,11 +234,12 @@ test.describe("interactive sessions", () => {
         memberPage.getByRole("heading", { name: "Sessions", exact: true }),
       ).toBeVisible();
       await expect(memberPage.getByRole("link", { name: "Profiles", exact: true })).toHaveCount(0);
+      await expectProfilesDestination(memberPage, false);
       await memberPage.goto(profiles);
       await expect(memberPage.getByRole("heading", { name: "Sessions unavailable" })).toBeVisible();
 
-      await adminPage.setViewportSize({ width: 390, height: 900 });
       await adminPage.goto(sessions);
+      await expectProfilesDestination(adminPage, true);
       await adminPage.getByRole("link", { name: "Profiles", exact: true }).click();
       await expect(adminPage.getByText("No session profiles yet")).toBeVisible();
       await adminPage.getByRole("button", { name: "Create a profile" }).click();
