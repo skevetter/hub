@@ -1,5 +1,5 @@
 import { spawn, execFile, type ChildProcess } from "node:child_process";
-import { createConnection, createServer as createNetServer } from "node:net";
+import { createServer as createNetServer } from "node:net";
 import { rmSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -266,7 +266,7 @@ export class SourcePaseo {
     daemon.stderr?.on("data", record);
     this.daemon = daemon;
     await observe(
-      async () => canConnect(this.paths.daemonHost),
+      async () => acceptsWebSocket(this.paths.daemonHost),
       "source daemon readiness",
       daemon,
     ).catch((error: unknown) => {
@@ -409,16 +409,18 @@ async function observe(
   throw new Error(`Timed out waiting for ${description}`);
 }
 
-async function canConnect(host: string): Promise<boolean> {
-  const [hostname, portText] = host.split(":");
-  const port = Number(portText);
+// The daemon listens before it accepts sockets and answers 503 "Server not ready" in between, so a
+// bare TCP connect reports ready too early. A completed upgrade proves it takes connections.
+async function acceptsWebSocket(host: string): Promise<boolean> {
   return new Promise<boolean>((resolveConnection) => {
-    const socket = createConnection({ host: hostname, port });
-    socket.once("connect", () => {
-      socket.destroy();
-      resolveConnection(true);
-    });
-    socket.once("error", () => resolveConnection(false));
+    const socket = new WebSocket(`ws://${host}/ws`, { handshakeTimeout: 2_000 });
+    const settle = (accepted: boolean) => {
+      socket.terminate();
+      resolveConnection(accepted);
+    };
+    socket.once("open", () => settle(true));
+    socket.once("unexpected-response", () => settle(false));
+    socket.once("error", () => settle(false));
   });
 }
 

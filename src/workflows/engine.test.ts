@@ -42,6 +42,12 @@ import { once } from "node:events";
 import { createWebhookSource } from "../triggers/github/webhook.js";
 import { createFetchServer } from "../http/node-server.js";
 import { createServerShutdown } from "../server-shutdown.js";
+import { createDaemonDispatchLifecycle } from "../daemons/lifecycle.js";
+import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
+import {
+  GITHUB_BILLING_DENIAL,
+  githubBillingTriggerContext,
+} from "../test-utils/github-billing-notice.js";
 
 describe("durable multi-step workflow engine", () => {
   it.each([
@@ -597,6 +603,65 @@ run:
     },
     60_000,
   );
+
+  it("does not repost a GitHub billing notice after recording delivery fails", async () => {
+    let now = new Date("2026-08-06T12:00:00.000Z");
+    const database = createMemoryDatabase({ now: () => now });
+    const notices: string[] = [];
+    const findIssueCommentByMarker = vi.fn(async ({ marker }: { marker: string }) => {
+      for (const body of notices) if (body.includes(marker)) return 1;
+      return undefined;
+    });
+    const provider = createGitHubTriggerProvider({
+      configurationStoreForProject: () => {
+        throw new Error("not used");
+      },
+      reactions: { createReaction: async () => null, deleteReaction: async () => {} },
+      billingUrlForOrganization: async () => "https://hub.test/settings/billing",
+      comments: {
+        findIssueCommentByMarker,
+        createIssueComment: async ({ body }) => ({ id: notices.push(body) }),
+      },
+    });
+    const run = await seedGitHubBillingFailure(database, now);
+    const markDelivered = vi
+      .spyOn(database, "markWorkflowRunTerminalNotificationDelivered")
+      .mockRejectedValueOnce(new Error("database unavailable"));
+    const lifecycle = createDaemonDispatchLifecycle({
+      database,
+      connectionForDaemon: () => undefined,
+      providers: [provider],
+    });
+    const { engine } = createDurableWorkflowHandler({
+      database,
+      entitlements: createUnlimitedEntitlementsService(),
+      providers: [],
+      now: () => now,
+      logger: createLogger(new FailureLogStream()),
+      onWorkflowRunTerminal: (terminalRun) => lifecycle.notifyWorkflowRunTerminal(terminalRun),
+    });
+    try {
+      await engine.processAvailable();
+      await vi.waitFor(() => assert.equal(markDelivered.mock.calls.length, 1));
+      assert.equal(notices.length, 1);
+      const pending = await database.findTriggerRunById(run.id);
+      assert.ok(pending?.outcome === "accepted");
+      assert.equal(pending.terminalNotificationDeliveredAt, null);
+
+      now = new Date(now.getTime() + 30_001);
+      await engine.processAvailable();
+      await vi.waitFor(async () => {
+        const delivered = await database.findTriggerRunById(run.id);
+        assert.ok(delivered?.outcome === "accepted");
+        assert.deepEqual(delivered.terminalNotificationDeliveredAt, now);
+      });
+      assert.equal(findIssueCommentByMarker.mock.calls.length, 2);
+      assert.equal(notices.length, 1);
+    } finally {
+      await engine.stop();
+      await lifecycle.stop();
+    }
+  });
 
   it("retries a failed workflow terminal outbox delivery", async () => {
     const fixture = await workflowFixture({ rawConfiguration: deadlineConfiguration() });
@@ -1946,6 +2011,25 @@ interface Fixture {
   revisionId: string;
   configuration: CompiledHubConfig;
   trigger(message: string): DurableProviderEvent;
+}
+
+async function seedGitHubBillingFailure(database: Database, now: Date) {
+  const context = githubBillingTriggerContext();
+  const { run } = await database.createAcceptedTriggerRun({
+    organizationId: context.organizationId,
+    projectId: "billing-project",
+    configurationRevisionId: "billing-revision",
+    providerEventReceiptId: "billing-receipt",
+    configuredTriggerName: "billing",
+    prompt: "raw",
+    inputs: {},
+    triggerContext: context,
+    outputContext: context,
+    deadlineAt: new Date(now.getTime() + 60_000),
+    stepIds: ["step"],
+  });
+  await database.failWorkflowRun(run.id, "failed", GITHUB_BILLING_DENIAL);
+  return run;
 }
 
 async function workflowFixture(

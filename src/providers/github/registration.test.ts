@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
+import { createGitHubAuth, type GitHubAuth } from "../../auth/github.js";
 import type { AuthServer } from "../../auth/server.js";
 import {
   ProductRequestError,
   type OrganizationAccessValue,
 } from "../../auth/organization-access.js";
 import { createMemoryDatabase } from "../../db/memory.js";
+import { logger } from "../../logger.js";
 import {
   createActiveProjectConfiguration,
   enrollTestDaemon,
@@ -334,6 +336,7 @@ describe("GitHub registration", () => {
     const identityTokens: string[] = [];
     let identityLookups = 0;
     let identityFailure: Error | undefined;
+    let revokeToken: GitHubAuth["revokeInstallationToken"] = () => Promise.resolve();
     const registration = createGitHubRegistration({
       database,
       auth: null,
@@ -357,7 +360,7 @@ describe("GitHub registration", () => {
         },
         revokeInstallationToken: (token) => {
           revoked.push(token);
-          return Promise.resolve();
+          return revokeToken(token);
         },
         createInstallationOctokit: () => Promise.reject(new Error("unused")),
       },
@@ -420,16 +423,14 @@ describe("GitHub registration", () => {
     });
 
     identityFailure = new Error("identity unavailable");
-    await assert.rejects(
-      () =>
-        authority.mint({
-          projectId: "project-1",
-          connectionSlug: "getpaseo-github",
-          repositories: ["getpaseo/hub"],
-          permissions: { contents: "read" },
-        }),
-      /identity unavailable/u,
-    );
+    const mintWithIdentityFailure = () =>
+      authority.mint({
+        projectId: "project-1",
+        connectionSlug: "getpaseo-github",
+        repositories: ["getpaseo/hub"],
+        permissions: { contents: "read" },
+      });
+    await assert.rejects(mintWithIdentityFailure, (error: unknown) => error === identityFailure);
     assert.deepEqual(revoked, ["scoped-token"]);
 
     await authority.revoke(minted.token);
@@ -445,6 +446,30 @@ describe("GitHub registration", () => {
         }),
       /connection is unavailable/u,
     );
+
+    const failingAuth = createGitHubAuth({
+      appId: "42",
+      privateKey: "unused",
+      fetch: async () =>
+        Response.json({ message: "scoped-token was not revoked" }, { status: 503 }),
+      octokitPlugins: { throttle: false },
+      revokeRetryDelaysMs: [1, 2],
+    });
+    revokeToken = (token) => failingAuth.revokeInstallationToken(token);
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      await assert.rejects(mintWithIdentityFailure, (error: unknown) => error === identityFailure);
+      assert.equal(revoked.length, 4);
+      assert.deepEqual(warn.mock.calls, [
+        [
+          { attempts: 3, status: 503 },
+          "installation token revocation failed; token stays valid until it expires",
+        ],
+      ]);
+      assert.ok(!JSON.stringify(warn.mock.calls).includes("scoped-token"));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("returns a setup callback that carries no session to the connections landing", async () => {

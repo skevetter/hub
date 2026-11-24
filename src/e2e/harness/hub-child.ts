@@ -90,6 +90,8 @@ async function main(): Promise<void> {
       "runs:dispatch",
       "daemons:enroll",
     ],
+    undefined,
+    { actor: null },
   );
   if (createdApiKey === undefined) throw new Error("API key service unavailable");
   await writeFile(requiredEnvironment("HUB_E2E_MACHINE_KEY_FILE"), createdApiKey.secret, "utf8");

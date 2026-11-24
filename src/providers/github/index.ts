@@ -5,9 +5,15 @@ import type { RunProgressSettings } from "../../run-progress/settings.js";
 import type { AuthServer } from "../../auth/server.js";
 import { createGitHubAuth, repositoryNamesForAccount, type GitHubAuth } from "../../auth/github.js";
 import { DatabaseUnavailableError } from "../../db/errors.js";
-import type { Database, GitHubConnectionRecord } from "../../db/types.js";
+import type { Database, GitHubConnectionRecord, GitHubRepositorySnapshot } from "../../db/types.js";
 import { logger } from "../../logger.js";
-import type { ProviderConnectionRegistration, ProviderRegistration } from "../registration.js";
+import type {
+  GitHubAuthorityRegistration,
+  ProviderConnectionRegistration,
+  ProviderIntegrationRegistration,
+  ProviderRegistration,
+  TriggerProviderFactory,
+} from "../registration.js";
 import {
   CONNECTION_ATTEMPT_LIFETIME_MINUTES,
   CONNECTIONS_RETURN_ROUTE,
@@ -83,207 +89,103 @@ interface GitHubConnectionOptions {
   configuration: GitHubRegistrationConfiguration;
 }
 
+interface ConfiguredGitHubRegistration {
+  options: CreateGitHubRegistrationOptions;
+  configuration: GitHubRegistrationConfiguration;
+  publicBaseUrl: string;
+  database: Database;
+}
+
 export function createGitHubRegistration(
   options: CreateGitHubRegistrationOptions,
 ): ProviderRegistration {
   const configuration = options.configuration ?? null;
-  if (configuration === null || options.publicBaseUrl === undefined) {
+  const publicBaseUrl = options.publicBaseUrl;
+  if (configuration === null || publicBaseUrl === undefined) {
     return emptyGitHubRegistration(options);
   }
   if (options.database === null) {
     return databaseUnavailableGitHubRegistration(configuration);
   }
   const database = options.database;
+  const registration = { options, configuration, publicBaseUrl, database };
   let configurationForProject: ((projectId: string) => ProjectConfigurationStore) | undefined;
 
-  const appAuth =
-    options.appAuth ??
-    createGitHubAuth({
-      appId: configuration.appId,
-      privateKey: configuration.privateKey,
-      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-    });
-  const client =
-    options.connectionClient ??
-    createGitHubConnectionClient({
-      publicBaseUrl: options.publicBaseUrl,
-      appSlug: configuration.appSlug,
-      clientId: configuration.clientId,
-      clientSecret: configuration.clientSecret,
-      appAuth,
-      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-    });
-  const githubConfiguration =
-    options.configurationProvider ?? createGitHubConfigurationProvider(appAuth);
+  const { appAuth, client, githubConfiguration } = createGitHubClients(
+    options,
+    configuration,
+    publicBaseUrl,
+  );
   const lifecycle = createGitHubLifecycle(database, client, githubConfiguration, {
     providerApplicationId: configuration.appId,
     configurationVersion: options.configurationVersion ?? 0,
   });
-  const connection =
-    options.auth === null
-      ? githubConnectionStatus(true)
-      : createGitHubConnection(
-          {
-            database,
-            auth: options.auth,
-            applicationBaseUrl: options.applicationBaseUrl,
-            callbackOrigin: options.publicBaseUrl,
-            configurationVersion: options.configurationVersion ?? 0,
-            configuration,
-          },
-          { client, repositories: githubConfiguration },
-        );
-  const webhook = createWebhookSource(configuration.webhookSecret, {
-    accept: (input) =>
-      database.acceptGitHubEvent({
-        ...input,
-        providerApplicationId: configuration.appId,
-        providerConfigurationVersion: options.configurationVersion ?? 0,
-      }),
-    applyLifecycle: (delivery) => lifecycle.accept(delivery),
-    async synchronizePush(input) {
-      const payload = PushPayloadSchema.safeParse(input.payload);
-      if (!payload.success) return;
-      const incomingConnection = await database.findGitHubConnection(input.installationId);
-      if (incomingConnection === undefined) return;
-      const targets = await database.listGitHubConfigurationTargets(
-        incomingConnection.organizationId,
-        incomingConnection.id,
-        input.repositoryId,
-      );
-      await Promise.all(
-        targets
-          .filter((target) => payload.data.ref === `refs/heads/${target.defaultBranch}`)
-          .map((target) =>
-            synchronizeGitHubDefaultBranch({
-              database,
-              client: githubConfiguration,
-              projectId: target.projectId,
-              repositoryId: input.repositoryId,
-              expectedCommitSha: payload.data.after,
-              webhookDeliveryId: input.deliveryId,
-              configurationForProject: (projectId) => {
-                if (configurationForProject === undefined) {
-                  throw new Error("GitHub configuration store is not initialized");
-                }
-                return configurationForProject(projectId);
-              },
-            }),
-          ),
-      );
+  const connection = createConfiguredGitHubConnection(registration, {
+    client,
+    repositories: githubConfiguration,
+  });
+  const webhook = createGitHubWebhook(
+    { database, options, configuration, githubConfiguration },
+    (delivery) => lifecycle.accept(delivery),
+    (projectId) => {
+      if (configurationForProject === undefined) {
+        throw new Error("GitHub configuration store is not initialized");
+      }
+      return configurationForProject(projectId);
+    },
+  );
+  const reactions = options.reactionClient ?? createGitHubReactionClient(appAuth);
+  const comments = createGitHubCommentClient(appAuth, configuration.appSlug);
+  logger.info("using webhook event source");
+  return assembleGitHubRegistration(registration, {
+    appAuth,
+    connection,
+    webhook,
+    lifecycle,
+    comments,
+    triggerProvider: ({ configurationStoreForProject }) => {
+      configurationForProject = configurationStoreForProject;
+      return createGitHubTriggerProvider({
+        configurationStoreForProject,
+        reactions,
+        comments,
+        billingUrlForOrganization: (organizationId) =>
+          organizationBillingUrl(database, publicBaseUrl, organizationId),
+      });
     },
   });
-  const reactions = options.reactionClient ?? createGitHubReactionClient(appAuth);
-  const comments: GitHubCommentClient = {
-    async createIssueComment({ installationId, owner, repo, issueNumber, body }) {
-      const octokit = await appAuth.createInstallationOctokit(installationId);
-      const response = await octokit.request(
-        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
-        { owner, repo, issue_number: issueNumber, body },
-      );
-      return { id: response.data.id };
-    },
-    async updateIssueComment({ installationId, owner, repo, commentId, body }) {
-      const octokit = await appAuth.createInstallationOctokit(installationId);
-      await octokit.request(`PATCH ${issueCommentPath(owner, repo, commentId)}`, { body });
-    },
-  };
-  logger.info("using webhook event source");
+}
+
+function assembleGitHubRegistration(
+  registration: ConfiguredGitHubRegistration,
+  services: {
+    appAuth: GitHubAuth;
+    connection: ProviderConnectionRegistration;
+    webhook: ReturnType<typeof createWebhookSource>;
+    lifecycle: ReturnType<typeof createGitHubLifecycle>;
+    comments: GitHubCommentClient;
+    triggerProvider: TriggerProviderFactory;
+  },
+): ProviderRegistration {
+  const { options, configuration, publicBaseUrl, database } = registration;
+  const { appAuth, connection, webhook, lifecycle, comments, triggerProvider } = services;
   return {
     configurationSnapshot: {
       version: options.configurationVersion ?? 0,
-      callbackOrigin: options.publicBaseUrl,
+      callbackOrigin: publicBaseUrl,
     },
     connection,
     ...(options.runProgress?.progressMessagesEnabled !== true
       ? {}
       : {
-          progressProvider: new GitHubProgressProvider({
-            database,
-            settings: options.runProgress,
-            app: {
-              id: configuration.appId,
-              slug: configuration.appSlug,
-              privateKey: configuration.privateKey,
-              auth: appAuth,
-            },
-            ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-          }),
+          progressProvider: createGitHubProgress(
+            { database, settings: options.runProgress, fetch: options.fetch },
+            configuration,
+            appAuth,
+          ),
         }),
-    integration: {
-      async resolve(projectId, connectionSlug, value, context?: ConnectionResolutionContext) {
-        if (value !== "token") {
-          throw new Error(`unsupported github integration value: ${value}`);
-        }
-        const project = await database.findProjectById(projectId);
-        const selectedConnection =
-          project === undefined
-            ? undefined
-            : (await database.organizationConnectionUsage(project.organizationId)).github.find(
-                (candidate) =>
-                  candidate.organizationId === project.organizationId &&
-                  candidate.slug === connectionSlug,
-              );
-        if (selectedConnection === undefined || selectedConnection.status !== "active") {
-          throw new Error(`github connection is unavailable: ${connectionSlug}`);
-        }
-        const token = await appAuth.mintInstallationToken(selectedConnection.installationId);
-        await context?.registerToken?.({
-          provider: "github",
-          token: token.token,
-          expiresAt: token.expiresAt,
-        });
-        return token.token;
-      },
-      githubAuthority: {
-        async mint(input) {
-          const project = await database.findProjectById(input.projectId);
-          const selectedConnection =
-            project === undefined
-              ? undefined
-              : (await database.organizationConnectionUsage(project.organizationId)).github.find(
-                  (candidate) =>
-                    candidate.organizationId === project.organizationId &&
-                    candidate.slug === input.connectionSlug,
-                );
-          if (selectedConnection === undefined || selectedConnection.status !== "active") {
-            throw new Error(`github connection is unavailable: ${input.connectionSlug}`);
-          }
-          repositoryNamesForAccount(input.repositories, selectedConnection.accountLogin);
-          const token = await appAuth.mintInstallationAccessToken({
-            installationId: selectedConnection.installationId,
-            accountLogin: selectedConnection.accountLogin,
-            repositories: input.repositories,
-            permissions: input.permissions,
-          });
-          try {
-            const bot = await appAuth.getAppBotIdentity(configuration.appSlug, token.token);
-            return {
-              token: token.token,
-              expiresAt: token.expiresAt,
-              botUserId: bot.id,
-              botLogin: bot.login,
-            };
-          } catch (error) {
-            await appAuth.revokeInstallationToken(token.token);
-            throw error;
-          }
-        },
-        revoke: (token) => appAuth.revokeInstallationToken(token),
-      },
-    },
-    triggerProviders: [
-      ({ configurationStoreForProject }) => {
-        configurationForProject = configurationStoreForProject;
-        return createGitHubTriggerProvider({
-          configurationStoreForProject,
-          reactions,
-          comments,
-          billingUrlForOrganization: (organizationId) =>
-            organizationBillingUrl(database, options.publicBaseUrl!, organizationId),
-        });
-      },
-    ],
+    integration: createGitHubIntegration(database, appAuth, configuration),
+    triggerProviders: [triggerProvider],
     sources: [
       {
         async start(handler) {
@@ -305,6 +207,238 @@ export function createGitHubRegistration(
       },
     ],
     requests: [{ name: "webhook", handle: (request) => webhook.handle(request) }],
+  };
+}
+
+function createGitHubClients(
+  options: CreateGitHubRegistrationOptions,
+  configuration: GitHubRegistrationConfiguration,
+  publicBaseUrl: string,
+) {
+  const appAuth =
+    options.appAuth ??
+    createGitHubAuth({
+      appId: configuration.appId,
+      privateKey: configuration.privateKey,
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+    });
+  const client =
+    options.connectionClient ??
+    createGitHubConnectionClient({
+      publicBaseUrl,
+      appSlug: configuration.appSlug,
+      clientId: configuration.clientId,
+      clientSecret: configuration.clientSecret,
+      appAuth,
+      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+    });
+  const githubConfiguration =
+    options.configurationProvider ?? createGitHubConfigurationProvider(appAuth);
+  return { appAuth, client, githubConfiguration };
+}
+
+function createConfiguredGitHubConnection(
+  input: ConfiguredGitHubRegistration,
+  services: GitHubConnectionServices,
+): ProviderConnectionRegistration {
+  const { database, options, configuration, publicBaseUrl } = input;
+  return options.auth === null
+    ? githubConnectionStatus(true)
+    : createGitHubConnection(
+        {
+          database,
+          auth: options.auth,
+          applicationBaseUrl: options.applicationBaseUrl,
+          callbackOrigin: publicBaseUrl,
+          configurationVersion: options.configurationVersion ?? 0,
+          configuration,
+        },
+        services,
+      );
+}
+
+function createGitHubWebhook(
+  registration: {
+    database: Database;
+    options: CreateGitHubRegistrationOptions;
+    configuration: GitHubRegistrationConfiguration;
+    githubConfiguration: GitHubConfigurationProvider;
+  },
+  acceptLifecycle: Parameters<typeof createWebhookSource>[1]["applyLifecycle"],
+  configurationForProject: (projectId: string) => ProjectConfigurationStore,
+) {
+  const { database, options, configuration, githubConfiguration } = registration;
+  return createWebhookSource(configuration.webhookSecret, {
+    accept: (input) =>
+      database.acceptGitHubEvent({
+        ...input,
+        providerApplicationId: configuration.appId,
+        providerConfigurationVersion: options.configurationVersion ?? 0,
+      }),
+    applyLifecycle: acceptLifecycle,
+    async synchronizePush(input) {
+      const payload = PushPayloadSchema.safeParse(input.payload);
+      if (!payload.success) return;
+      const incomingConnection = await database.findGitHubConnection(input.installationId);
+      if (incomingConnection === undefined) return;
+      const targets = await database.listGitHubConfigurationTargets(
+        incomingConnection.organizationId,
+        incomingConnection.id,
+        input.repositoryId,
+      );
+      await Promise.all(
+        targets
+          .filter((target) => payload.data.ref === `refs/heads/${target.defaultBranch}`)
+          .map((target) =>
+            synchronizeGitHubDefaultBranch({
+              database,
+              client: githubConfiguration,
+              projectId: target.projectId,
+              repositoryId: input.repositoryId,
+              expectedCommitSha: payload.data.after,
+              webhookDeliveryId: input.deliveryId,
+              configurationForProject,
+            }),
+          ),
+      );
+    },
+  });
+}
+
+function createGitHubCommentClient(appAuth: GitHubAuth, appSlug: string): GitHubCommentClient {
+  return {
+    async findIssueCommentByMarker({ installationId, owner, repo, issueNumber, marker, since }) {
+      const octokit = await appAuth.createInstallationOctokit(installationId);
+      const { data: comments } = await octokit.request(
+        "GET /repos/{owner}/{repo}/issues/{issue_number}/comments",
+        {
+          owner,
+          repo,
+          issue_number: issueNumber,
+          ...(since === undefined ? {} : { since }),
+          per_page: 100,
+          request: { retries: 0 },
+        },
+      );
+      const token = await appAuth.getInstallationToken(installationId);
+      const bot = await appAuth.getAppBotIdentity(appSlug, token);
+      return comments.find(
+        (comment) =>
+          comment.user?.id === bot.id &&
+          comment.body?.split(/\r\n?|\n/u).some((line) => line.trim() === marker),
+      )?.id;
+    },
+    async createIssueComment({ installationId, owner, repo, issueNumber, body }) {
+      const octokit = await appAuth.createInstallationOctokit(installationId);
+      const response = await octokit.request(
+        "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
+        { owner, repo, issue_number: issueNumber, body },
+      );
+      return { id: response.data.id };
+    },
+    async updateIssueComment({ installationId, owner, repo, commentId, body }) {
+      const octokit = await appAuth.createInstallationOctokit(installationId);
+      await octokit.request(`PATCH ${issueCommentPath(owner, repo, commentId)}`, { body });
+    },
+  };
+}
+
+function createGitHubProgress(
+  input: { database: Database; settings: RunProgressSettings; fetch: typeof fetch | undefined },
+  configuration: GitHubRegistrationConfiguration,
+  appAuth: GitHubAuth,
+): GitHubProgressProvider {
+  return new GitHubProgressProvider({
+    database: input.database,
+    settings: input.settings,
+    app: {
+      id: configuration.appId,
+      slug: configuration.appSlug,
+      privateKey: configuration.privateKey,
+      auth: appAuth,
+    },
+    ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
+  });
+}
+
+function createGitHubIntegration(
+  database: Database,
+  appAuth: GitHubAuth,
+  configuration: GitHubRegistrationConfiguration,
+): ProviderIntegrationRegistration {
+  return {
+    async resolve(projectId, connectionSlug, value, context?: ConnectionResolutionContext) {
+      if (value !== "token") {
+        throw new Error(`unsupported github integration value: ${value}`);
+      }
+      const project = await database.findProjectById(projectId);
+      const selectedConnection =
+        project === undefined
+          ? undefined
+          : (await database.organizationConnectionUsage(project.organizationId)).github.find(
+              (candidate) =>
+                candidate.organizationId === project.organizationId &&
+                candidate.slug === connectionSlug,
+            );
+      if (selectedConnection === undefined || selectedConnection.status !== "active") {
+        throw new Error(`github connection is unavailable: ${connectionSlug}`);
+      }
+      const token = await appAuth.mintInstallationToken(selectedConnection.installationId);
+      await context?.registerToken?.({
+        provider: "github",
+        token: token.token,
+        expiresAt: token.expiresAt,
+      });
+      return token.token;
+    },
+    githubAuthority: createGitHubAuthority(database, appAuth, configuration),
+  };
+}
+
+function createGitHubAuthority(
+  database: Database,
+  appAuth: GitHubAuth,
+  configuration: GitHubRegistrationConfiguration,
+): GitHubAuthorityRegistration {
+  return {
+    async mint(input) {
+      const project = await database.findProjectById(input.projectId);
+      const selectedConnection =
+        project === undefined
+          ? undefined
+          : (await database.organizationConnectionUsage(project.organizationId)).github.find(
+              (candidate) =>
+                candidate.organizationId === project.organizationId &&
+                candidate.slug === input.connectionSlug,
+            );
+      if (selectedConnection === undefined || selectedConnection.status !== "active") {
+        throw new Error(`github connection is unavailable: ${input.connectionSlug}`);
+      }
+      repositoryNamesForAccount(input.repositories, selectedConnection.accountLogin);
+      const token = await appAuth.mintInstallationAccessToken({
+        installationId: selectedConnection.installationId,
+        accountLogin: selectedConnection.accountLogin,
+        repositories: input.repositories,
+        permissions: input.permissions,
+      });
+      try {
+        const bot = await appAuth.getAppBotIdentity(configuration.appSlug, token.token);
+        return {
+          token: token.token,
+          expiresAt: token.expiresAt,
+          botUserId: bot.id,
+          botLogin: bot.login,
+        };
+      } catch (error) {
+        try {
+          await appAuth.revokeInstallationToken(token.token);
+        } catch {
+          // Revocation logs its own failure. Keep the identity error for the caller.
+        }
+        throw error;
+      }
+    },
+    revoke: (token) => appAuth.revokeInstallationToken(token),
   };
 }
 
@@ -440,17 +574,19 @@ async function completeSetup(
   const state = url.searchParams.get("state");
   const installationId = positiveInteger(url.searchParams.get("installation_id"));
   const action = url.searchParams.get("setup_action");
-  if (state === null || client === undefined)
-    return connectionCallbackFailure({
-      request,
-      error: new GitHubCallbackError("invalid setup callback"),
-      provider: "github",
-      phase: "setup",
-      applicationBaseUrl: options.applicationBaseUrl,
-      returnRoute: CONNECTIONS_RETURN_ROUTE,
-    });
   let returnRoute: string = CONNECTIONS_RETURN_ROUTE;
   let callbackOrigin = options.applicationBaseUrl;
+  const fail = (error: unknown) =>
+    connectionCallbackFailure({
+      request,
+      error,
+      provider: "github",
+      phase: "setup",
+      applicationBaseUrl: callbackOrigin,
+      returnRoute,
+    });
+  if (state === null || client === undefined)
+    return fail(new GitHubCallbackError("invalid setup callback"));
   try {
     const access = await callbackConnectionAccess(options.auth, request);
     const attempt = await options.database.readConnectionAttempt({
@@ -474,42 +610,41 @@ async function completeSetup(
       );
     }
     if ((action !== "install" && action !== "update") || installationId === undefined) {
-      return connectionCallbackFailure({
-        request,
-        error: new GitHubCallbackError("invalid setup result"),
-        provider: "github",
-        phase: "setup",
-        applicationBaseUrl: callbackOrigin,
-        returnRoute: attempt.returnRoute,
-      });
+      return fail(new GitHubCallbackError("invalid setup result"));
     }
-    const nextState = newConnectionState();
-    const verifier = newConnectionState();
-    await options.database.advanceGitHubConnectionAttempt({
-      stateVerifier: stateHash(state),
-      phase: "github_setup",
-      access,
-      nextStateVerifier: stateHash(nextState),
-      installationId,
-      pkceVerifier: verifier,
-    });
-    return Response.redirect(
-      client.authorizationUrl({
-        state: nextState,
-        challenge: pkceChallenge(verifier),
-      }),
-      303,
-    );
+    return await advanceGitHubSetup(options.database, client, { state, access, installationId });
   } catch (error) {
-    return connectionCallbackFailure({
-      request,
-      error,
-      provider: "github",
-      phase: "setup",
-      applicationBaseUrl: callbackOrigin,
-      returnRoute,
-    });
+    return fail(error);
   }
+}
+
+async function advanceGitHubSetup(
+  database: Database,
+  client: GitHubConnectionClient,
+  input: {
+    state: string;
+    access: Awaited<ReturnType<typeof callbackConnectionAccess>>;
+    installationId: number;
+  },
+): Promise<Response> {
+  const { state, access, installationId } = input;
+  const nextState = newConnectionState();
+  const verifier = newConnectionState();
+  await database.advanceGitHubConnectionAttempt({
+    stateVerifier: stateHash(state),
+    phase: "github_setup",
+    access,
+    nextStateVerifier: stateHash(nextState),
+    installationId,
+    pkceVerifier: verifier,
+  });
+  return Response.redirect(
+    client.authorizationUrl({
+      state: nextState,
+      challenge: pkceChallenge(verifier),
+    }),
+    303,
+  );
 }
 
 async function completeAuthorization(
@@ -531,18 +666,20 @@ async function completeAuthorization(
       applicationBaseUrl: options.applicationBaseUrl,
     });
   }
-  if (state === null || code === null || services === undefined) {
-    return connectionCallbackFailure({
-      request,
-      error: new GitHubCallbackError("invalid authorization callback"),
-      provider: "github",
-      phase: "authorization",
-      applicationBaseUrl: options.applicationBaseUrl,
-      returnRoute: CONNECTIONS_RETURN_ROUTE,
-    });
-  }
   let returnRoute: string = CONNECTIONS_RETURN_ROUTE;
   let callbackOrigin = options.applicationBaseUrl;
+  const fail = (error: unknown) =>
+    connectionCallbackFailure({
+      request,
+      error,
+      provider: "github",
+      phase: "authorization",
+      applicationBaseUrl: callbackOrigin,
+      returnRoute,
+    });
+  if (state === null || code === null || services === undefined) {
+    return fail(new GitHubCallbackError("invalid authorization callback"));
+  }
   try {
     const access = await callbackConnectionAccess(options.auth, request);
     const attempt = await options.database.readConnectionAttempt({
@@ -556,58 +693,73 @@ async function completeAuthorization(
     if (installationId === undefined || attempt.pkceVerifier === null)
       throw new Error("invalid attempt");
     const verifier = attempt.pkceVerifier;
-    await options.database.synchronizeGitHubInstallation(installationId, async () => {
-      const identity = await services.client.verifyUserInstallation({
-        code,
-        verifier,
-        installationId,
-      });
-      if (identity === undefined) {
-        await options.database.consumeConnectionAttempt({
-          stateVerifier: stateHash(state),
-          phase: "github_user_authorization",
-          access,
-        });
-        throw new GitHubCallbackError("installation verification rejected");
-      }
-      const repositories =
-        identity.status === "suspended"
-          ? []
-          : await services.repositories.listInstallationRepositories({ installationId });
-      await bindGitHub(
-        options.database,
-        state,
-        access,
-        identity,
-        options.configuration.appId,
-        repositories,
-      );
+    await verifyAndBindGitHubInstallation(options, services, {
+      code,
+      verifier,
+      installationId,
+      state,
+      access,
     });
     return connectionResult(callbackOrigin, attempt.returnRoute, "github_connected", "github");
   } catch (error) {
-    return connectionCallbackFailure({
-      request,
-      error,
-      provider: "github",
-      phase: "authorization",
-      applicationBaseUrl: callbackOrigin,
-      returnRoute,
-    });
+    return fail(error);
   }
+}
+
+function verifyAndBindGitHubInstallation(
+  options: GitHubConnectionOptions,
+  services: GitHubConnectionServices,
+  input: {
+    code: string;
+    verifier: string;
+    installationId: number;
+    state: string;
+    access: Awaited<ReturnType<typeof callbackConnectionAccess>>;
+  },
+): Promise<void> {
+  const { code, verifier, installationId, state, access } = input;
+  return options.database.synchronizeGitHubInstallation(installationId, async () => {
+    const identity = await services.client.verifyUserInstallation({
+      code,
+      verifier,
+      installationId,
+    });
+    if (identity === undefined) {
+      await options.database.consumeConnectionAttempt({
+        stateVerifier: stateHash(state),
+        phase: "github_user_authorization",
+        access,
+      });
+      throw new GitHubCallbackError("installation verification rejected");
+    }
+    const repositories =
+      identity.status === "suspended"
+        ? []
+        : await services.repositories.listInstallationRepositories({ installationId });
+    await bindGitHub({
+      database: options.database,
+      state,
+      access,
+      identity,
+      providerApplicationId: options.configuration.appId,
+      repositories,
+    });
+  });
 }
 
 class GitHubCallbackError extends Error {
   readonly code = "invalidInput";
 }
 
-async function bindGitHub(
-  database: Database,
-  state: string,
-  access: Awaited<ReturnType<typeof callbackConnectionAccess>>,
-  identity: GitHubInstallationIdentity,
-  providerApplicationId: string,
-  repositories: import("../../db/types.js").GitHubRepositorySnapshot,
-): Promise<void> {
+async function bindGitHub(input: {
+  database: Database;
+  state: string;
+  access: Awaited<ReturnType<typeof callbackConnectionAccess>>;
+  identity: GitHubInstallationIdentity;
+  providerApplicationId: string;
+  repositories: GitHubRepositorySnapshot;
+}): Promise<void> {
+  const { database, state, access, identity, providerApplicationId, repositories } = input;
   await database.bindGitHubConnection({
     providerApplicationId,
     repositories,
