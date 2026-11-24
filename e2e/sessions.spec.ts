@@ -185,18 +185,20 @@ test.describe("interactive sessions", () => {
     page,
   }) => {
     const app = await setup(hub);
+    const beforeAdmin = new Set(browser.contexts());
     await hub.joinInvitationAs(
       "admin",
       admin,
       await hub.inviteMember("owner", admin.email, "admin"),
     );
-    const adminContext = browser.contexts().find((context) => context !== page.context());
+    const adminContext = browser.contexts().find((context) => !beforeAdmin.has(context));
     const adminPage = adminContext?.pages()[0];
     if (adminPage === undefined) throw new Error("Admin page unavailable");
+    const beforeMember = new Set(browser.contexts());
     await hub.addNewMember("owner", "viewer", viewer);
     const memberPage = browser
       .contexts()
-      .find((context) => context !== page.context() && context !== adminContext)
+      .find((context) => !beforeMember.has(context))
       ?.pages()[0];
     if (memberPage === undefined) throw new Error("Member page unavailable");
     const daemon = await enroll(hub, admin.email);
