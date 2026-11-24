@@ -18,7 +18,8 @@ import {
 import { CopyField } from "../components/app/copy-field.js";
 import { Disclosure } from "../components/app/disclosure.js";
 import { EmptyState } from "../components/app/empty-state.js";
-import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
+import { FailureAlert } from "../components/app/failure-alert.js";
+import { PageAlert } from "../components/app/page-alert.js";
 import { PageHeader } from "../components/app/page.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RelativeTime } from "../components/app/relative-time.js";
@@ -313,10 +314,8 @@ function NeedsAttention({
           .map(({ label }) => label)
           .join(", ");
         return (
-          <WarningAlert
+          <PageAlert
             key={provider}
-            passive
-            standalone
             title={`${PROVIDER_NAMES[provider]} needs authorization`}
             action={
               <Button asChild variant="outline" size="sm">
@@ -325,13 +324,11 @@ function NeedsAttention({
             }
           >
             <p>Review authorization for {names} in Connections.</p>
-          </WarningAlert>
+          </PageAlert>
         );
       })}
       {daemons === undefined ? null : (
-        <WarningAlert
-          passive
-          standalone
+        <PageAlert
           title={daemons.title}
           action={
             <Button asChild variant="outline" size="sm">
@@ -340,7 +337,7 @@ function NeedsAttention({
           }
         >
           <p>{daemons.message}</p>
-        </WarningAlert>
+        </PageAlert>
       )}
       <DroppedEventNotices data={data} />
     </>
@@ -910,10 +907,8 @@ function DroppedEventNotices({ data }: { data: HomeSnapshot }) {
       .map(({ provider, count }) => `${String(count)} from ${LIST_PROVIDER_LABELS[provider]}`)
       .join(", ");
     return (
-      <WarningAlert
+      <PageAlert
         key={reason}
-        passive
-        standalone
         title={DROP_NOTICE_TITLES[reason]}
         action={
           <Button asChild variant="outline" size="sm">
@@ -931,7 +926,7 @@ function DroppedEventNotices({ data }: { data: HomeSnapshot }) {
           {capped ? "At least " : ""}
           {total} {total === 1 ? "event" : "events"} in the last {data.windowDays} days ({sources}).
         </p>
-      </WarningAlert>
+      </PageAlert>
     );
   });
 }

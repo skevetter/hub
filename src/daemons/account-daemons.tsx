@@ -202,7 +202,7 @@ function renderDaemonsSnapshot(
     <>
       {revokeFailed ? (
         <FailureAlert
-          standalone
+          page
           title="The daemon wasn't revoked"
           error={revoke.data}
           fallback="Hub did not receive the daemon revocation result. Check your connection and reload its current status."

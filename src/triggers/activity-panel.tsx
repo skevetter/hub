@@ -219,7 +219,7 @@ function renderRunsActivity({
           error={snapshot.refreshFailure.message}
           fallback="Hub couldn't refresh trigger activity."
           onRetry={snapshot.refetch}
-          standalone
+          page
         />
       )}
       {renderActivityFilters(

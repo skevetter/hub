@@ -80,7 +80,7 @@ export function DroppedActivityPanel({ headingId }: { headingId: string }) {
           error={snapshot.refreshFailure.message}
           fallback="Hub couldn't refresh dropped events."
           onRetry={snapshot.refetch}
-          standalone
+          page
         />
       )}
       <DroppedActivityResults

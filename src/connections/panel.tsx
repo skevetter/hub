@@ -20,7 +20,8 @@ import { useActiveAccount } from "../auth/active-account.js";
 import { CONNECTION_MUTATION_KEY } from "../auth/tenant-mutation.js";
 import { Card, CardSkeleton } from "../components/app/card.js";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
-import { FailureAlert, NoticeAlert } from "../components/app/failure-alert.js";
+import { FailureAlert } from "../components/app/failure-alert.js";
+import { toast } from "../components/app/toast-store.js";
 import { PageHeader } from "../components/app/page.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RowActions } from "../components/app/row-actions.js";
@@ -296,10 +297,14 @@ function renderConnections({
   };
   return (
     <>
+      <ConnectionToast
+        message={banner?.tone === "success" ? banner.message : undefined}
+        organizationSlug={scope.organizationSlug}
+      />
       {retryState === "complete" && result === undefined ? (
         <StatusLine>Connections loaded.</StatusLine>
       ) : null}
-      {banner === undefined ? null : <ConnectionReturnBanner copy={banner} />}
+      {banner?.tone === "error" ? <ConnectionReturnFailure copy={banner} /> : null}
       <CommandError mutations={mutations} />
       <Section className={GRID_COLUMNS}>
         {PROVIDER_CARDS.map((card) => renderConnectionCard(card, view))}
@@ -765,20 +770,32 @@ function connectionRows(
   };
 }
 
-function ConnectionReturnBanner({ copy }: { copy: ConnectionReturnCopy }): ReactNode {
-  if (copy.tone === "error") {
-    return (
-      <FailureAlert
-        standalone
-        title={copy.title}
-        error={copy.message}
-        fallback="Hub couldn't finish the connection. Start it again from this page."
-      />
-    );
-  }
+function ConnectionReturnFailure({
+  copy,
+}: {
+  copy: Extract<ConnectionReturnCopy, { tone: "error" }>;
+}): ReactNode {
   return (
-    <NoticeAlert standalone tone="success">
-      {copy.message}
-    </NoticeAlert>
+    <FailureAlert
+      page
+      title={copy.title}
+      error={copy.message}
+      fallback="Hub couldn't finish the connection. Start it again from this page."
+    />
   );
+}
+
+/** A finished connection is a completed action, so it is confirmed rather than left on the page. */
+function ConnectionToast({
+  message,
+  organizationSlug,
+}: {
+  message: string | undefined;
+  organizationSlug: string;
+}) {
+  useEffect(() => {
+    if (message === undefined) return;
+    toast({ id: `connection-return:${organizationSlug}`, scope: organizationSlug, title: message });
+  }, [message, organizationSlug]);
+  return null;
 }

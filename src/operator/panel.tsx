@@ -9,7 +9,8 @@ import {
   DataTableSkeleton,
   type DataColumn,
 } from "../components/app/data-table.js";
-import { FailureAlert, WarningAlert } from "../components/app/failure-alert.js";
+import { FailureAlert } from "../components/app/failure-alert.js";
+import { PageAlert } from "../components/app/page-alert.js";
 import { FormDialog } from "../components/app/form-dialog.js";
 import { FormField } from "../components/app/form-field.js";
 import { PageHeader } from "../components/app/page.js";
@@ -321,13 +322,13 @@ function renderExecutionsEntitlement(snapshot: Snapshot, editExecutionsMonthly: 
 function OverLimitBanner({ overages }: { overages: Snapshot["overages"] }) {
   if (overages.length === 0) return null;
   return (
-    <WarningAlert standalone title="This organization is over its limits">
+    <PageAlert role="alert" title="This organization is over its limits">
       {overages.map((overage) => (
         <p key={overage.entitlement}>
           {`${overage.current} seats in use, but the effective limit is ${overage.limit}.`}
         </p>
       ))}
-    </WarningAlert>
+    </PageAlert>
   );
 }
 

@@ -7,7 +7,8 @@ import type { TeamMember } from "../../auth/organization-contract.js";
 import { Card } from "../../components/app/card.js";
 import { Composer, type ComposerAgentState } from "../../components/app/composer.js";
 import { ConfirmAction } from "../../components/app/confirm-action.js";
-import { FailureAlert, NoticeAlert, WarningAlert } from "../../components/app/failure-alert.js";
+import { FailureAlert } from "../../components/app/failure-alert.js";
+import { PageAlert } from "../../components/app/page-alert.js";
 import { PageHeader, PageHeaderSkeleton } from "../../components/app/page.js";
 import { RelativeTime } from "../../components/app/relative-time.js";
 import { Section } from "../../components/app/section.js";
@@ -365,19 +366,19 @@ function SessionNotices({
       {renderPermissionNotice(daemon, state)}
       {renderFailedNotice(session)}
       {stateReason === "stop_unconfirmed" ? (
-        <WarningAlert standalone title="Stop could not be confirmed">
+        <PageAlert role="alert" title="Stop could not be confirmed">
           Check the agent on the daemon before stopping it again.
-        </WarningAlert>
+        </PageAlert>
       ) : null}
       {stopped ? (
-        <NoticeAlert standalone tone="neutral" title="Stopped">
+        <PageAlert role="status" tone="neutral" title="Stopped">
           The agent stopped mid-step. Send a message to continue from here.
-        </NoticeAlert>
+        </PageAlert>
       ) : null}
       {closed ? (
-        <NoticeAlert standalone tone="neutral" title="Session closed">
+        <PageAlert role="status" tone="neutral" title="Session closed">
           The transcript remains readable.
-        </NoticeAlert>
+        </PageAlert>
       ) : null}
     </>
   );
@@ -389,14 +390,14 @@ function renderOfflineNotice(
   daemonLink: ReactNode,
 ) {
   return offline ? (
-    <WarningAlert
-      standalone
+    <PageAlert
+      role="alert"
       title={daemon.slug ? `Daemon ${daemon.slug} is offline` : "The daemon is offline"}
       action={daemonLink}
     >
       Your messages are kept and wait for it to reconnect. Agent replies load when the daemon
       reconnects.
-    </WarningAlert>
+    </PageAlert>
   ) : null;
 }
 
@@ -406,9 +407,9 @@ function renderHistoryNotice(
 ) {
   const historyMissing = history === "history_unavailable" || history === "agent_missing";
   return !offline && historyMissing ? (
-    <WarningAlert standalone title="Agent history unavailable">
+    <PageAlert role="alert" title="Agent history unavailable">
       The transcript still shows messages already loaded.
-    </WarningAlert>
+    </PageAlert>
   ) : null;
 }
 
@@ -417,10 +418,10 @@ function renderPermissionNotice(
   state: SessionSnapshot["session"]["state"],
 ) {
   return state === "waiting_permission" ? (
-    <WarningAlert standalone title="The agent is waiting for permission">
+    <PageAlert role="alert" title="The agent is waiting for permission">
       Answer the prompt in the Paseo app on {daemon.slug || "the daemon"}. You can queue a message
       while you wait.
-    </WarningAlert>
+    </PageAlert>
   ) : null;
 }
 
@@ -428,7 +429,7 @@ function renderFailedNotice({ state, stateReason }: SessionSnapshot["session"]) 
   const failed = state === "failed" || (state === "closed" && stateReason === "launch_failed");
   return failed ? (
     <FailureAlert
-      standalone
+      page
       title="Session agent failed"
       error={null}
       fallback={sessionFailure(stateReason)}

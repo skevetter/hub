@@ -89,7 +89,7 @@ export function CommandError({
   if (failed === undefined) return null;
   return (
     <FailureAlert
-      standalone
+      page
       title="The last action didn't complete"
       error={failed.data}
       fallback="Hub did not receive the project action result. Check your connection and reload the current project state."

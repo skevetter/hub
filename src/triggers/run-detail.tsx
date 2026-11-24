@@ -3,6 +3,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { DataCell, DataRow, DataTable, DataTableSkeleton } from "../components/app/data-table.js";
 import { FailureAlert, NoticeAlert, type Failure } from "../components/app/failure-alert.js";
+import { PageAlert } from "../components/app/page-alert.js";
 import { ConfirmAction } from "../components/app/confirm-action.js";
 import { FollowBottom } from "../components/app/follow-bottom.js";
 import { Duration } from "../components/app/duration.js";
@@ -274,7 +275,7 @@ function renderRunTimeline(
 function renderStopFailure(stopError: Failure | undefined) {
   return stopError == null ? null : (
     <FailureAlert
-      standalone
+      page
       title="Stop failed"
       error={stopError}
       fallback="Hub couldn't stop this run."
@@ -284,10 +285,10 @@ function renderStopFailure(stopError: Failure | undefined) {
 
 function renderPayloadNotice(expiredAt: RunDetailSnapshot["run"]["payloadExpiredAt"]) {
   return expiredAt == null ? null : (
-    <NoticeAlert standalone tone="neutral" title="Run payload expired">
+    <PageAlert role="status" tone="neutral" title="Run payload expired">
       This run's original event, inputs, prompts, and outputs expired under this Hub's retention
       policy.
-    </NoticeAlert>
+    </PageAlert>
   );
 }
 
@@ -433,13 +434,13 @@ function CanceledRunNotice({ details }: { details: RunDetailSnapshot["stopDetail
   let note = details === undefined ? null : stopCleanupNotes[details.cleanupState];
   if (details?.cleanupState === "confirmed" && details.coalesced) note = stopCoalescedNote;
   return (
-    <NoticeAlert
-      standalone
+    <PageAlert
+      role="status"
       tone="neutral"
       title={`Stopped by ${details?.stoppedByName || "a person"}`}
     >
       {note}
-    </NoticeAlert>
+    </PageAlert>
   );
 }
 
