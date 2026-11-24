@@ -36,7 +36,7 @@ import { Pagination } from "../components/app/pagination.js";
 import { Steps } from "../components/app/steps.js";
 import { SegmentedControl, type SegmentedOption } from "../components/app/segmented-control.js";
 import { StatusPill, statusLabel } from "../components/app/status-pill.js";
-import { toast, type ToastInput } from "../components/app/toast-store.js";
+import { toast } from "../components/app/toast-store.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
 import { Button } from "../components/ui/button.js";
@@ -67,6 +67,7 @@ import {
   type TriggerSnapshot,
   type TriggerListPage,
 } from "./functions.js";
+import { savedToast } from "./saved-toast.js";
 import { daemonProviderSnapshot } from "../daemons/functions.js";
 import type { HubProviderSnapshotEntry } from "../hub/protocol.js";
 import { EventFields } from "./event-fields.js";
@@ -460,24 +461,6 @@ function triggerListAnnouncement(
   ]
     .filter((detail) => detail !== undefined)
     .join(". ");
-}
-
-/** A new trigger has no id yet, so only an edit can offer View. */
-function savedToast(organizationSlug: string, triggerId: string | undefined): ToastInput {
-  const identity = { id: "trigger-saved", scope: organizationSlug, title: "Trigger saved" };
-  if (triggerId === undefined) return identity;
-  return {
-    ...identity,
-    action: (
-      <Link
-        to="/o/$organizationSlug/triggers/$triggerId"
-        params={{ organizationSlug, triggerId }}
-        className="text-link underline underline-offset-4 max-md:inline-flex max-md:min-h-11 max-md:items-center"
-      >
-        View trigger
-      </Link>
-    ),
-  };
 }
 
 function triggerPageTarget(organizationSlug: string, search: TriggerSearch, cursor?: string) {
