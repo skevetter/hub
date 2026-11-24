@@ -152,9 +152,13 @@ async function rejectSwitchFromMore(page: Page, acmeHome: string) {
     .getByRole("navigation", { name: "Quick navigation" })
     .getByRole("button", { name: "More", exact: true });
   const serverFunctions = "**/_serverFn/**";
-  await page.route(serverFunctions, (route) =>
-    route.request().postData()?.includes('"organizationId"') ? route.abort() : route.continue(),
-  );
+  const aborted: string[] = [];
+  await page.route(serverFunctions, (route) => {
+    const body = route.request().postData() ?? "";
+    if (!body.includes('"organizationId"')) return route.continue();
+    aborted.push(body);
+    return route.abort();
+  });
   try {
     await more.click();
     await sheet.getByRole("button", { name: "Organization" }).click();
@@ -165,6 +169,7 @@ async function rejectSwitchFromMore(page: Page, acmeHome: string) {
     ).toBeVisible();
     await expect(page).toHaveURL(acmeHome);
     await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
+    expect(aborted).toHaveLength(1);
   } finally {
     await page.unroute(serverFunctions);
   }
