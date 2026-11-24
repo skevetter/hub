@@ -23,11 +23,10 @@ test("a page alert is a heavy rule and a square mark, never a box, in both theme
 }) => {
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
-  await hub.seedSlackConnection("owner", "slack", "Acme");
-  await page.getByRole("link", { name: "Home", exact: true }).click();
-  const alert = page
-    .locator('[data-slot="alert"]')
-    .filter({ hasText: "Slack needs authorization" });
+  await page.goto(
+    `${hub.primaryApplication().origin}/connections?app=github&result=github_approval_required`,
+  );
+  const alert = page.getByRole("alert").filter({ hasText: "GitHub wasn't connected" });
   await expect(alert).toBeVisible();
   await page.addStyleTag({ content: "*, *::before, *::after { transition: none !important; }" });
 
@@ -44,12 +43,14 @@ test("a page alert is a heavy rule and a square mark, never a box, in both theme
         .analyze();
       expect(results.violations).toEqual([]);
       await page.screenshot({
-        path: join(SHOTS, `home-alert-${viewport.width}x${viewport.height}-${colorScheme}.png`),
+        path: join(
+          SHOTS,
+          `connection-return-alert-${viewport.width}x${viewport.height}-${colorScheme}.png`,
+        ),
         animations: "disabled",
       });
     }
   }
-  await expectActionPlacement(page, alert);
 });
 
 test("a finished connection change is a toast and leaves no alert on the page", async ({
@@ -112,15 +113,4 @@ async function expectInsideViewport(page: Page, alert: Locator, width: number): 
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(
     width,
   );
-}
-
-async function expectActionPlacement(page: Page, alert: Locator): Promise<void> {
-  await page.setViewportSize({ width: 390, height: 844 });
-  const link = alert.getByRole("link", { name: "Open connections", exact: true });
-  const [alertBox, linkBox] = await Promise.all([alert.boundingBox(), link.boundingBox()]);
-  expect(linkBox!.x + linkBox!.width).toBeLessThanOrEqual(alertBox!.x + alertBox!.width);
-  expect(linkBox!.height).toBeGreaterThanOrEqual(24);
-  await page.setViewportSize({ width: 1280, height: 800 });
-  const [wideAlert, wideLink] = await Promise.all([alert.boundingBox(), link.boundingBox()]);
-  expect(wideLink!.x).toBeGreaterThan(wideAlert!.x + wideAlert!.width / 2);
 }

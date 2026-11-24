@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { expect } from "@playwright/test";
 import { test } from "./app.js";
+import { openAttention } from "./helpers/attention.js";
 import { projectApp } from "./helpers/projects/index.js";
 
 test.use({ providerScenario: "slack-only" });
@@ -87,10 +88,12 @@ for (const width of [1280, 390]) {
     await expect(page).toHaveURL(/\/triggers\/new\/edit$/u);
 
     await openSection("Home");
-    const rejected = page
-      .locator('[data-slot="alert"]')
-      .filter({ hasText: "Trigger filters rejected events" });
-    await rejected.getByRole("link", { name: "View dropped events" }).click();
+    await page.reload();
+    const title = "Trigger filters rejected events";
+    await expect(page.getByRole("main").getByText(title)).toHaveCount(0);
+    const attention = await openAttention(page, 2);
+    const rejected = attention.getByRole("listitem").filter({ hasText: title });
+    await rejected.getByRole("link", { name: "View dropped events", exact: false }).click();
     await expect(page).toHaveURL(/[?&]reason=trigger_filters_rejected/u);
     await expect(page).toHaveURL(/[?&]range=7d/u);
     await expect(rows).toHaveCount(1);

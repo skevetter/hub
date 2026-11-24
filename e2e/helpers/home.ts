@@ -1,4 +1,7 @@
 import { expect, type Locator, type Page } from "@playwright/test";
+import { attentionDialog } from "./attention.js";
+
+const ROUTING_ATTENTION_TITLE = "Events arrived without a route or matching trigger";
 
 export type ChecklistStepTitle =
   | "Connect an app"
@@ -68,18 +71,18 @@ export class OrganizationHome {
     await this.step(title).getByRole("link", { name, exact: true }).click();
   }
 
-  nudge(): Locator {
-    return this.page
-      .locator('[data-slot="alert"]')
-      .filter({ hasText: "Events arrived without a route or matching trigger" });
+  async openRoutingAttention() {
+    await expect(this.page.getByRole("main").getByText(ROUTING_ATTENTION_TITLE)).toHaveCount(0);
+    await this.page.getByRole("button", { name: /^Attention, \d+ items?$/u }).click();
+    return attentionDialog(this.page).getByRole("listitem").filter({
+      hasText: ROUTING_ATTENTION_TITLE,
+    });
   }
 
-  async expectNoNudge() {
-    await expect(this.nudge()).toHaveCount(0);
-  }
-
-  async followNudge() {
-    await this.nudge().getByRole("link", { name: "View dropped events", exact: true }).click();
+  async followRoutingAttention(item: Locator) {
+    const link = item.getByRole("link", { name: /^View dropped events(?:$|:)/u });
+    await expect(link).toBeVisible();
+    await link.click();
     await expect(this.page).toHaveURL(/[?&]reason=routing/u);
     await this.page
       .getByRole("table", { name: "Dropped events" })

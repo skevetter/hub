@@ -1,5 +1,6 @@
 import { expect } from "@playwright/test";
 import { test } from "./app.js";
+import { attentionEntry } from "./helpers/attention.js";
 import { OrganizationHome } from "./helpers/home.js";
 import { OrganizationTriggers } from "./helpers/triggers.js";
 
@@ -33,7 +34,7 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     );
     await home.expectStep("Create a trigger", "To do");
     await home.expectStep("Record a run", "To do");
-    await home.expectNoNudge();
+    await expect(attentionEntry(page, 0)).toBeVisible();
     await home.expectRuns(0, "0 succeeded · 0 failed");
     await home.capture(`${SHOTS}/01-fresh.png`);
   });
@@ -64,14 +65,15 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await home.expectProgress("2 of 4 done");
   });
 
-  await test.step("events arriving with no trigger listening are a nudge to create one", async () => {
+  await test.step("Attention links unrouted events to the trigger editor", async () => {
     await hub.deliverUnroutedGitHubEvent("home-unrouted-1");
     await hub.deliverUnroutedGitHubEvent("home-unrouted-2");
     await home.reload();
-    await expect(home.nudge()).toContainText("2 events in the last 7 days");
-    await expect(home.nudge()).toContainText("2 from GitHub");
-    await home.capture(`${SHOTS}/03-unrouted-nudge.png`);
-    await home.followNudge();
+    const item = await home.openRoutingAttention();
+    await expect(item).toContainText("2 events in the last 7 days");
+    await expect(item).toContainText("2 from GitHub");
+    await page.screenshot({ path: `${SHOTS}/03-unrouted-attention.png` });
+    await home.followRoutingAttention(item);
   });
 
   await test.step("the editor starts from the connected daemon, and saving completes the third step", async () => {

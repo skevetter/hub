@@ -8,7 +8,6 @@ import type {
   OrganizationConnectionUsage,
   OrganizationRunCount,
   OrganizationRunRecord,
-  DroppedProviderEventCount,
   OrganizationTriggerRecord,
   OrganizationTriggerRevisionRecord,
 } from "../db/types.js";
@@ -22,8 +21,8 @@ import { incompleteSetupStepTitles, SETUP_INCOMPLETE } from "./checklist.js";
 import { HOME_MONTH_DAYS } from "./limits.js";
 import { commentExamples, isTryCommentEvent } from "./things-to-try.js";
 
-/** How far back the overview looks. One week is long enough to hold a first run and short enough that a nudge fades once a trigger listens. */
-export const HOME_WINDOW_DAYS = 7;
+/** How far back the overview looks. One week is long enough to hold a first run. */
+const HOME_WINDOW_DAYS = 7;
 const RUNS_SHOWN = 50;
 const DAY_MS = 86_400_000;
 
@@ -69,7 +68,6 @@ export interface HomeSnapshot {
   runCounts: { day: RunTally; month: RunTally };
   /** Whether the reader started or joined a session. Null means Sessions is off. */
   sessionStarted: boolean | null;
-  dropped: readonly DroppedProviderEventCount[];
   windowDays: number;
 }
 
@@ -143,7 +141,6 @@ export class HomeDashboard {
       dayRuns,
       monthRuns,
       sessionStarted,
-      dropped,
       checklistCompletedAt,
     ] = await Promise.all([
       this.database.organizationConnectionUsage(organizationId),
@@ -166,7 +163,6 @@ export class HomeDashboard {
       reader !== null && this.options.interactiveSessions === true
         ? this.database.hasOwnInteractiveSession(reader)
         : null,
-      this.database.countRecentDroppedEvents(organizationId, since),
       this.database.getHomeChecklistCompletedAt(organizationId),
     ]);
     return {
@@ -179,7 +175,6 @@ export class HomeDashboard {
       runs: snapshotRuns(runs),
       runCounts: { day: tally(dayRuns), month: tally(monthRuns) },
       sessionStarted,
-      dropped,
       windowDays: HOME_WINDOW_DAYS,
     };
   }
