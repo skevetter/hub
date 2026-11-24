@@ -1,6 +1,7 @@
 import type { QueryHandle } from "./runtime/index.js";
 import type { SurfaceStore } from "../surfaces/store.js";
 import type { InteractiveSessionStore } from "../interactive-sessions/store.js";
+import type { SessionPrincipal } from "../interactive-sessions/types.js";
 import type { RunPayloadRetentionStore } from "../run-payload-retention/store.js";
 import type {
   PayloadCompletion,
@@ -129,6 +130,16 @@ export interface OrganizationRunRecord {
 export interface OrganizationRunCount {
   status: TriggerRunRecord["status"];
   count: number;
+}
+
+export interface FailedRunSummary {
+  count: number;
+  newest: { triggerName: string; receivedAt: Date } | null;
+}
+
+export interface WaitingSessionSummary {
+  count: number;
+  sessions: { name: string }[];
 }
 
 export type DroppedEventPresence = "some" | "none" | "unknown";
@@ -1927,6 +1938,19 @@ export interface Database
   ): Promise<OrganizationRunRecord[]>;
   /** How many runs the organization's triggers started at or after `since`, by status. */
   countOrganizationRunsSince(organizationId: string, since: Date): Promise<OrganizationRunCount[]>;
+  countFailedRunsSince(
+    organizationId: string,
+    since: Date,
+    seenThrough: string | null,
+  ): Promise<FailedRunSummary>;
+  readFailedRunsSeenThrough(accountId: string, organizationId: string): Promise<string | null>;
+  markFailedRunsSeen(accountId: string, organizationId: string): Promise<void>;
+  hasActiveSessionProfile(organizationId: string): Promise<boolean>;
+  listSessionsWaitingForPermission(
+    organizationId: string,
+    viewer: SessionPrincipal,
+    limit: number,
+  ): Promise<WaitingSessionSummary>;
   listDroppedEventPage(
     organizationId: string,
     request: DroppedEventPageRequest,

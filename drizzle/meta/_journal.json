@@ -484,6 +484,13 @@
       "when": 1795314282125,
       "tag": "0068_surface_persistence",
       "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1795550435022,
+      "tag": "0069_account_attention_state",
+      "breakpoints": true
     }
   ]
 }

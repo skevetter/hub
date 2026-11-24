@@ -1,3 +1,10 @@
+import {
+  countFailedRunsSince,
+  hasActiveSessionProfile,
+  listSessionsWaitingForPermission,
+  markFailedRunsSeen,
+  readFailedRunsSeenThrough,
+} from "../attention/queries.js";
 import { SurfaceRepository } from "../surfaces/postgres-store.js";
 import {
   linearTriggerRoutesLock,
@@ -4528,6 +4535,21 @@ class PgDatabase implements Database {
     );
     return rows.rows.map(({ status, count }) => ({ status, count }));
   }
+
+  countFailedRunsSince: Database["countFailedRunsSince"] = (...args) =>
+    countFailedRunsSince(this.pool, ...args);
+
+  readFailedRunsSeenThrough: Database["readFailedRunsSeenThrough"] = (...args) =>
+    readFailedRunsSeenThrough(this.pool, ...args);
+
+  markFailedRunsSeen: Database["markFailedRunsSeen"] = (...args) =>
+    markFailedRunsSeen(this.pool, ...args);
+
+  hasActiveSessionProfile: Database["hasActiveSessionProfile"] = (organizationId) =>
+    hasActiveSessionProfile(this.pool, organizationId);
+
+  listSessionsWaitingForPermission: Database["listSessionsWaitingForPermission"] = (...args) =>
+    listSessionsWaitingForPermission(this.pool, ...args);
 
   listDroppedEventPage(organizationId: string, request: DroppedEventPageRequest) {
     return readDroppedEventPage(this.pool, organizationId, request);
