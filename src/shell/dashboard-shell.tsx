@@ -138,10 +138,10 @@ function DashboardContent(props: DashboardContentProps) {
   const { account, error, transitioning } = props;
   const tenant = useOptionalRouteTenant() ?? undefined;
   const organization = tenant?.organization ?? account.organization;
-  const navigation = organizationNavigation(
-    organization.slug,
-    account.features?.interactiveSessions === true,
-  );
+  const navigation = organizationNavigation(organization.slug, {
+    sessionsEnabled: account.features?.interactiveSessions === true,
+    manageResources: tenant?.capabilities.manageResources ?? account.capabilities.manageResources,
+  });
   const sidebar = <DashboardSidebar {...props} tenant={tenant} navigation={navigation} />;
   const settings = useMemo(
     () => ({
@@ -325,14 +325,19 @@ function AccountFooter({
   );
 }
 
-function organizationNavigation(slug: string, sessionsEnabled: boolean) {
+function organizationNavigation(
+  slug: string,
+  { sessionsEnabled, manageResources }: { sessionsEnabled: boolean; manageResources: boolean },
+) {
   const base = `/o/${slug}`;
+  const setup =
+    sessionsEnabled && manageResources ? SETUP_SECTIONS : SETUP_SECTIONS_WITHOUT_PROFILES;
   return {
     items: destinations(
       base,
       sessionsEnabled ? ORGANIZATION_SECTIONS : ORGANIZATION_SECTIONS_WITHOUT_SESSIONS,
     ),
-    setup: destinations(base, sessionsEnabled ? SETUP_SECTIONS : SETUP_SECTIONS_WITHOUT_SESSIONS),
+    setup: destinations(base, setup),
     administration: destinations(base, ORGANIZATION_ADMINISTRATION),
   };
 }
@@ -374,6 +379,7 @@ const ORGANIZATION_ADMINISTRATION: readonly SectionDestination[] = [
 const ORGANIZATION_SECTIONS_WITHOUT_SESSIONS = ORGANIZATION_SECTIONS.filter(
   ({ section }) => section !== "sessions",
 );
-const SETUP_SECTIONS_WITHOUT_SESSIONS = SETUP_SECTIONS.filter(
+// Profiles needs sessions and the right to manage resources; the page refuses everyone else.
+const SETUP_SECTIONS_WITHOUT_PROFILES = SETUP_SECTIONS.filter(
   ({ section }) => section !== "sessions/profiles",
 );
