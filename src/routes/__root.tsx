@@ -7,7 +7,10 @@ import { THEME_SCRIPT } from "../theme/preference.js";
 import { initialTheme, requestTheme } from "../theme/request-theme.js";
 import "../styles.entry.js";
 
-export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()({
+export const Route = createRootRouteWithContext<{
+  queryClient: QueryClient;
+  rawSearch?: () => string;
+}>()({
   server: { middleware: [requestTheme] },
   loader: initialTheme,
   head: () => ({
