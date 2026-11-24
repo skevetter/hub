@@ -60,6 +60,10 @@ import type { ScriptStepRunner } from "../daemons/terminals/script.js";
 import { ScriptStepRuntime, type ScriptStepLaunch } from "./script-step.js";
 import { canStopRun, type RunStopActor, type StopRunResult } from "../triggers/run-stop.js";
 import { DEFAULT_SCRIPT_LIMITS, type ScriptLimits } from "./script-limits.js";
+import {
+  DEFAULT_TERMINAL_NOTIFICATION_HOLD_MS,
+  TerminalNotificationLease,
+} from "./terminal-lease.js";
 
 const DEFAULT_WAKEUP_LEASE_MS = 30_000;
 const DEFAULT_WORKER_INTERVAL_MS = 250;
@@ -69,6 +73,9 @@ type AcceptedWorkflowRun = Extract<
   { outcome: "accepted" }
 >;
 type WorkflowStepRun = Awaited<ReturnType<Database["listWorkflowStepRunsForTriggerRun"]>>[number];
+type ClaimedTerminalNotification = AcceptedTriggerRunRecord & {
+  terminalNotificationGeneration: number;
+};
 interface PreparedWorkflowWakeup {
   run: AcceptedWorkflowRun;
   configuration: CompiledProjectConfiguration;
@@ -132,6 +139,7 @@ export interface DurableWorkflowEngineOptions {
   scriptLimits?: ScriptLimits | undefined;
   configurationRevisionId?: string;
   leaseMs?: number;
+  terminalNotificationHoldMs?: number;
   workerIntervalMs?: number;
   now?: () => Date;
   onWorkflowDeadlineExceeded?: (recovery: WorkflowDeadlineRecovery) => Promise<void>;
@@ -153,6 +161,7 @@ export interface DurableWorkflowEngineOptions {
 export class DurableWorkflowEngine {
   private readonly logger: Pick<Logger, "warn" | "error">;
   private readonly leaseMs: number;
+  private readonly terminalNotificationHoldMs: number;
   private readonly workerIntervalMs: number;
   private readonly now: () => Date;
   private readonly scripts: ScriptStepRuntime | undefined;
@@ -160,12 +169,15 @@ export class DurableWorkflowEngine {
   private workerTimer: NodeJS.Timeout | undefined;
   private processing: Promise<void> | undefined;
   private terminalNotificationProcessing: Promise<void> | undefined;
+  private terminalNotificationLease: TerminalNotificationLease | undefined;
   private terminalNotificationRecoveryRequested = false;
   private stopped = false;
 
   constructor(private readonly options: DurableWorkflowEngineOptions) {
     this.logger = options.logger ?? defaultLogger;
     this.leaseMs = options.leaseMs ?? DEFAULT_WAKEUP_LEASE_MS;
+    this.terminalNotificationHoldMs =
+      options.terminalNotificationHoldMs ?? DEFAULT_TERMINAL_NOTIFICATION_HOLD_MS;
     this.workerIntervalMs = options.workerIntervalMs ?? DEFAULT_WORKER_INTERVAL_MS;
     this.now = options.now ?? (() => new Date());
     this.scripts =
@@ -219,6 +231,7 @@ export class DurableWorkflowEngine {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.terminalNotificationLease?.stop();
     if (this.workerTimer !== undefined) clearInterval(this.workerTimer);
     this.workerTimer = undefined;
     await this.processing;
@@ -1214,28 +1227,67 @@ export class DurableWorkflowEngine {
     const database = this.options.database;
     if (database === null) return;
     while (!this.stopped) {
+      const claimedAt = this.now();
       const run = await database.claimPendingWorkflowRunTerminalNotification(
-        this.now(),
-        this.leaseMs,
+        claimedAt,
+        Math.min(this.leaseMs, this.terminalNotificationHoldMs),
       );
       if (run === undefined) return;
-      await this.options.timelineReconciler?.reconcileBeforeTerminal(run.organizationId, run.id);
+      const lease = new TerminalNotificationLease({
+        now: this.now,
+        leaseMs: this.leaseMs,
+        deadline: claimedAt.getTime() + this.terminalNotificationHoldMs,
+        renew: (now, leaseMs) =>
+          database.renewWorkflowRunTerminalNotification(
+            run.id,
+            run.terminalNotificationGeneration,
+            now,
+            leaseMs,
+          ),
+        report: (error, operation) => this.report(error, operation, { triggerRunId: run.id }),
+      });
+      this.terminalNotificationLease = lease;
+      if (!this.stopped) lease.start();
       try {
-        const generation = run.terminalNotificationGeneration;
-        if (!(await database.ownsWorkflowRunTerminalNotification(run.id, generation, this.now())))
-          continue;
-        const reactionState = await this.options.onWorkflowRunTerminal?.(run);
-        const deliveredReactionState =
-          reactionState === undefined ? terminalReactionState(run) : reactionState;
-        await database.markWorkflowRunTerminalNotificationDelivered(
+        await this.options.timelineReconciler?.reconcileBeforeTerminal(run.organizationId, run.id);
+        await this.deliverClaimedTerminalNotification(database, run, lease);
+      } finally {
+        lease.stop();
+        this.terminalNotificationLease = undefined;
+      }
+    }
+  }
+
+  private async deliverClaimedTerminalNotification(
+    database: Database,
+    run: ClaimedTerminalNotification,
+    lease: TerminalNotificationLease,
+  ): Promise<void> {
+    const generation = run.terminalNotificationGeneration;
+    try {
+      let reactionState: JsonValue | void;
+      try {
+        const owns = await database.ownsWorkflowRunTerminalNotification(
           run.id,
           generation,
           this.now(),
-          deliveredReactionState,
         );
-      } catch (error) {
-        this.report(error, "workflow.notification.terminal.deliver", { triggerRunId: run.id });
+        if (!owns || lease.lost) return;
+        reactionState = await this.options.onWorkflowRunTerminal?.(run);
+      } finally {
+        lease.stop();
       }
+      const pendingRenewal = lease.pendingRenewal;
+      if (pendingRenewal !== undefined) await pendingRenewal;
+      if (lease.lost) return;
+      await database.markWorkflowRunTerminalNotificationDelivered(
+        run.id,
+        generation,
+        this.now(),
+        reactionState === undefined ? terminalReactionState(run) : reactionState,
+      );
+    } catch (error) {
+      this.report(error, "workflow.notification.terminal.deliver", { triggerRunId: run.id });
     }
   }
 
