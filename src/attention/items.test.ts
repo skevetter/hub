@@ -84,7 +84,7 @@ it("lists actionable sources in fixed order with Home copy and tenant links", ()
     },
     sessions: {
       hasActiveProfile: true,
-      waiting: [{ name: "Newest session" }, { name: "Other session" }],
+      waiting: { count: 2, sessions: [{ name: "Newest session" }] },
     },
   });
   expect(attentionSnapshotSchema.parse({ items, generatedAt: now.toISOString() }).items).toEqual(

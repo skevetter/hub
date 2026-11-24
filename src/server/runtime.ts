@@ -18,6 +18,7 @@ import type { UsageDashboard } from "../usage/dashboard.js";
 import type { ProviderApplications } from "../provider-applications/index.js";
 import type { DaemonProviderCatalog } from "../daemons/provider-catalog.js";
 import type { HomeDashboard } from "../home/dashboard.js";
+import type { AttentionDashboard } from "../attention/dashboard.js";
 import type { RunStream } from "../run-stream/index.js";
 import type { InteractiveSessionService } from "../interactive-sessions/service.js";
 import type { InteractiveSessionStream } from "../interactive-sessions/stream.js";
@@ -82,6 +83,7 @@ export interface ApplicationRuntime {
   daemonProviderCatalog?: DaemonProviderCatalog | null;
   /** The organization landing: checklist facts and a recent-window overview. */
   homeDashboard?: HomeDashboard | null;
+  attentionDashboard?: AttentionDashboard | null;
   /** Org-scoped, read-only limits and usage. Present whenever database + browser auth are; no
    * billing dependency, so it renders on self-hosted and hosted alike. */
   usageDashboard: UsageDashboard | null;

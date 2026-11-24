@@ -1,5 +1,10 @@
 import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
-import type { DroppedProviderEventCount, OrganizationConnectionUsage } from "../db/types.js";
+import type {
+  DroppedProviderEventCount,
+  FailedRunSummary,
+  OrganizationConnectionUsage,
+  WaitingSessionSummary,
+} from "../db/types.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { DROP_REASON_GROUPS, type DropReasonGroup } from "../triggers/drop-reason.js";
@@ -28,8 +33,8 @@ interface AttentionInputs {
   }[];
   triggers: readonly { enabled: boolean }[];
   dropped: readonly DroppedProviderEventCount[];
-  failedRuns: { count: number; newest: { triggerName: string; receivedAt: Date } | null };
-  sessions: { hasActiveProfile: boolean; waiting: readonly { name: string }[] } | null;
+  failedRuns: FailedRunSummary;
+  sessions: { hasActiveProfile: boolean; waiting: WaitingSessionSummary } | null;
 }
 
 export const ATTENTION_WINDOW_DAYS = 7;
@@ -170,9 +175,9 @@ function runItems(
 }
 
 function sessionItems(sessions: AttentionInputs["sessions"], base: string): AttentionItem[] {
-  const newest = sessions?.waiting[0];
+  const newest = sessions?.waiting.sessions[0];
   if (sessions === null || newest === undefined) return [];
-  const count = sessions.waiting.length;
+  const { count } = sessions.waiting;
   return [
     {
       id: "sessions:permission",
