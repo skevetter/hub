@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 import { compiledConfigurationHash, type CompiledHubConfig } from "../config/compiler.js";
 import { createMemoryDatabase } from "./memory.js";
 import { createDatabase } from "./pg.js";
@@ -13,6 +13,52 @@ import { ScriptStepRuntime } from "../workflows/script-step.js";
 import type { Database } from "./types.js";
 import type { AuthServer } from "../auth/server.js";
 import { ProjectDashboard } from "../projects/dashboard.js";
+import {
+  createTimelinePostgresHarness,
+  TIMELINE_ORGANIZATION,
+} from "./test-utils/run-timeline-postgres.js";
+
+describe.each(["memory", "postgres"] as const)("project configuration on %s", (driver) => {
+  it("rejects revisions for unknown and archived projects", async () => {
+    const harness = driver === "postgres" ? await createTimelinePostgresHarness() : undefined;
+    try {
+      const database = harness?.database ?? createMemoryDatabase();
+      await harness?.runtime.query(
+        `insert into "user" (id, name, email) values ('test-user', 'Test', 'test@example.test')`,
+      );
+      await harness?.runtime.query(
+        `insert into member (id, organization_id, user_id, role)
+         values ('test-member', $1, 'test-user', 'owner')`,
+        [TIMELINE_ORGANIZATION],
+      );
+      const project = await database.createProject({
+        organizationId: TIMELINE_ORGANIZATION,
+        name: "Archived project",
+        slug: "archived-project",
+        createdByUserId: null,
+      });
+      await database.archiveProject(TIMELINE_ORGANIZATION, project.id, "test-user");
+      for (const projectId of [randomUUID(), project.id]) {
+        await assert.rejects(
+          database.insertProjectConfigurationRevision({
+            projectId,
+            sourceKind: "manual",
+            sourceEvidence: { kind: "test" },
+            normalizedConfiguration: { environments: [], triggers: [] },
+            contentHash: "test",
+          }),
+          (error: unknown) =>
+            error instanceof Error &&
+            error.constructor === Error &&
+            error.message === "project not found",
+        );
+        assert.equal(await database.findActiveProjectConfiguration(projectId), undefined);
+      }
+    } finally {
+      await harness?.close();
+    }
+  }, 120_000);
+});
 
 const PROJECT_ID = "00000000-0000-4000-8000-000000000001";
 const CONFIGURATION: CompiledHubConfig = {
@@ -131,6 +177,38 @@ const AGENT_VARIANTS = [
 
 type AcceptedRun = Awaited<ReturnType<typeof acceptedRun>>["run"];
 
+async function linkedAgentStep(harness: Harness) {
+  const { database, projectId } = harness;
+  const { run, step } = await acceptedRun(harness);
+  const execution = await database.insertAgentExecution({
+    organizationId: "org-1",
+    projectId,
+    machineId: null,
+    triggerContext: {},
+    outputContext: {},
+    configurationRevisionId: run.configurationRevisionId,
+    workflowStepRunId: step.id,
+  });
+  await database.linkWorkflowStepRunExecution(step.id, execution.id);
+  return { run, step, execution };
+}
+
+function hideRunAfterCompletion(database: Database, runId: string, inMemory: boolean) {
+  if (!inMemory) {
+    return vi.spyOn(database, "findTriggerRunById").mockResolvedValueOnce(undefined);
+  }
+  assert.ok("triggerRuns" in database && database.triggerRuns instanceof Map);
+  const { triggerRuns } = database;
+  const complete = database.completeWorkflowAgentExecution.bind(database);
+  return vi
+    .spyOn(database, "completeWorkflowAgentExecution")
+    .mockImplementationOnce(async (input) => {
+      const completion = await complete(input);
+      triggerRuns.delete(runId);
+      return completion;
+    });
+}
+
 async function completeAgentVariants(harness: Harness, run: AcceptedRun) {
   const { database } = harness;
   const steps = await database.listWorkflowStepRunsForTriggerRun(run.id);
@@ -182,7 +260,37 @@ const backends = [
   ["embedded PostgreSQL", embeddedHarness],
 ] as const;
 
-describe.each(backends)("script step persistence (%s)", (_name, open) => {
+describe.each(backends)("script step persistence (%s)", (backend, open) => {
+  it("returns no result when a completed workflow step has no run", async () => {
+    const harness = await open();
+    const { database, close } = harness;
+    try {
+      const normal = await linkedAgentStep(harness);
+      const result = { status: "failed" };
+      const completed = await database.completeWorkflowStep(normal.execution.id, "failed", result);
+      assert.ok(completed);
+      assert.equal(completed.run.id, normal.run.id);
+      assert.equal(completed.stepRun.id, normal.step.id);
+      assert.equal(completed.stepRun.status, "failed");
+
+      const missing = await linkedAgentStep(harness);
+      const lookup = hideRunAfterCompletion(database, missing.run.id, backend === "in-memory");
+      const withoutRun = await database
+        .completeWorkflowStep(missing.execution.id, "failed", result)
+        .finally(() => lookup.mockRestore());
+
+      assert.equal(withoutRun, undefined);
+      const step = await database.findWorkflowStepRunById(missing.step.id);
+      assert.equal(step?.status, "failed");
+      assert.deepEqual(step.output, result);
+      const execution = await database.findAgentExecutionById(missing.execution.id);
+      assert.equal(execution?.status, "failed");
+      assert.deepEqual(execution.result, result);
+    } finally {
+      await close();
+    }
+  });
+
   it("projects only displayed detail and authoritative agent completion", async () => {
     const harness = await open();
     const { database } = harness;
