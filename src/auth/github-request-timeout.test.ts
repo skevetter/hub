@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { describe, it, vi } from "vitest";
+import { createGitHubReactionClient } from "../triggers/github/provider.js";
 import { createGitHubAuth } from "./github.js";
 
 const TIMEOUT_MS = 40;
 const REPO_ROUTE = "GET /repos/acme/app";
+const COMMENT_ROUTE = "POST /repos/acme/app/issues/7/comments";
 const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
   .privateKey.export({ format: "pem", type: "pkcs8" })
   .toString();
@@ -45,6 +47,40 @@ function causedByTimeout(error: unknown): boolean {
   );
 }
 
+function stalledBody(
+  signal: AbortSignal | undefined,
+  status: number,
+  onRead?: () => void,
+): Promise<Response> {
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        signal?.addEventListener(
+          "abort",
+          () => controller.error(new DOMException("Body read aborted", "AbortError")),
+          { once: true },
+        );
+      },
+      pull() {
+        onRead?.();
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return Promise.resolve(
+    new Response(body, { status, headers: { "content-type": "application/json" } }),
+  );
+}
+
+function isBodyTimeout(error: unknown): boolean {
+  return (
+    causedByTimeout(error) &&
+    error instanceof Error &&
+    error.name === "HttpError" &&
+    Reflect.get(error, "status") === 500
+  );
+}
+
 describe("GitHub request timeout", () => {
   it("times out a hung read and retries it once with a fresh timeout", async () => {
     const respond = vi.fn(hangUntilAborted);
@@ -61,10 +97,7 @@ describe("GitHub request timeout", () => {
     const respond = vi.fn(hangUntilAborted);
     const octokit = await createAuth(respond).createInstallationOctokit(142);
 
-    await assert.rejects(
-      octokit.request("POST /repos/acme/app/issues/7/comments", { body: "hello" }),
-      causedByTimeout,
-    );
+    await assert.rejects(octokit.request(COMMENT_ROUTE, { body: "hello" }), causedByTimeout);
     assert.equal(respond.mock.calls.length, 1);
   });
 
@@ -145,4 +178,101 @@ describe("GitHub request timeout", () => {
       /requestTimeoutMs must be an integer/u,
     );
   });
+});
+
+describe("GitHub response body timeout", () => {
+  it("rejects a stalled GET body and retries it once with a fresh timeout", async () => {
+    const respond = vi.fn((signal?: AbortSignal) => stalledBody(signal, 200));
+    const octokit = await createAuth(respond).createInstallationOctokit(142);
+    const startedAt = performance.now();
+
+    await assert.rejects(octokit.request(REPO_ROUTE), isBodyTimeout);
+
+    assert.equal(respond.mock.calls.length, 2);
+    assert.notEqual(respond.mock.calls[0]?.[0], respond.mock.calls[1]?.[0]);
+    assert.ok(performance.now() - startedAt < 2_500);
+  }, 5_000);
+
+  it("rejects a stalled comment POST body without retrying", async () => {
+    const respond = vi.fn((signal?: AbortSignal) => stalledBody(signal, 201));
+    const octokit = await createAuth(respond).createInstallationOctokit(142);
+
+    await assert.rejects(octokit.request(COMMENT_ROUTE, { body: "hello" }), isBodyTimeout);
+    assert.equal(respond.mock.calls.length, 1);
+  }, 5_000);
+
+  it("rejects a stalled reaction response instead of returning an undefined ID", async () => {
+    const respond = vi.fn((signal?: AbortSignal) => stalledBody(signal, 201));
+    const reactions = createGitHubReactionClient(createAuth(respond));
+
+    await assert.rejects(
+      reactions.createReaction({
+        installationId: 142,
+        repo: "acme/app",
+        subject: { kind: "item", issueNumber: 7 },
+        content: "eyes",
+      }),
+      isBodyTimeout,
+    );
+    assert.equal(respond.mock.calls.length, 2);
+  }, 5_000);
+
+  it("returns a fast 201 JSON response with its headers and URL", async () => {
+    const headers = { "x-ratelimit-remaining": "42", "retry-after": "2" };
+    const url = "https://api.github.com/repos/acme/app/issues/7/comments";
+    const upstream = Response.json({ id: 7 }, { status: 201, statusText: "Created", headers });
+    Object.defineProperty(upstream, "url", { value: url });
+    const octokit = await createAuth(() => Promise.resolve(upstream)).createInstallationOctokit(
+      142,
+    );
+
+    const response = await octokit.request(COMMENT_ROUTE, { body: "hello" });
+
+    assert.equal(response.status, 201);
+    assert.deepEqual(response.data, { id: 7 });
+    assert.partialDeepStrictEqual(response.headers, headers);
+    assert.equal(response.url, url);
+  });
+
+  it.each([
+    ["DELETE /installation/token", 204],
+    ["DELETE /installation/token", 205],
+    ["HEAD /repos/acme/app", 200],
+  ])("preserves the empty response for %s (%i)", async (route, status) => {
+    const octokit = await createAuth(() =>
+      Promise.resolve(new Response(null, { status })),
+    ).createInstallationOctokit(142);
+
+    const response = await octokit.request(route);
+
+    assert.equal(response.status, status);
+    assert.equal(response.data, "");
+  });
+
+  it("keeps a stalled error response's status and fails within the timeout", async () => {
+    const respond = vi.fn((signal?: AbortSignal) => stalledBody(signal, 429));
+    const octokit = await createAuth(respond).createInstallationOctokit(142);
+    const startedAt = performance.now();
+
+    await assert.rejects(octokit.request(REPO_ROUTE), { status: 429 });
+
+    assert.equal(respond.mock.calls.length, 1);
+    assert.ok(performance.now() - startedAt < 1_000);
+  }, 5_000);
+
+  it("surfaces a caller abort during the body read as AbortError", async () => {
+    const reading = Promise.withResolvers<void>();
+    const octokit = await createAuth((signal) =>
+      stalledBody(signal, 200, reading.resolve),
+    ).createInstallationOctokit(142);
+    const controller = new AbortController();
+    const result = assert.rejects(
+      octokit.request(REPO_ROUTE, { request: { signal: controller.signal } }),
+      { name: "AbortError" },
+    );
+
+    await reading.promise;
+    controller.abort();
+    await result;
+  }, 5_000);
 });
