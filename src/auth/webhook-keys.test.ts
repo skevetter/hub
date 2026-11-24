@@ -35,7 +35,7 @@ const signingSettings = readWebhookSigningSettings({
   PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID: "test-key",
 });
 const keySummarySchema = z.object({
-  id: z.string().uuid(),
+  id: z.uuid(),
   name: z.string(),
   actor: apiKeyActorSchema.nullable(),
   allowedTriggers: apiKeyAllowedTriggersSchema.nullable(),
@@ -290,7 +290,11 @@ run:
           new Request(ORIGIN + "/api/auth/paseo/api-keys", {
             method: "POST",
             headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
-            body: JSON.stringify({ name, scopes: ["events:send"] }),
+            body: JSON.stringify({
+              organizationSlug: "identity-a",
+              name,
+              scopes: ["events:send"],
+            }),
           }),
         );
         assert.equal(response.status, 201);
@@ -327,6 +331,118 @@ run:
       .parse(await accepted.json());
     assert.equal(rotated.authentication.previousVersionId, input.expectedCurrentVersionId);
     assert.notEqual(rotated.authentication.currentVersionId, input.expectedCurrentVersionId);
+  });
+
+  describe("route organization", () => {
+    const readOnly = "identity-browser-reader";
+
+    async function joinIdentityB(role: "member" | "admin"): Promise<void> {
+      await runtime.query(
+        `insert into member (id, organization_id, user_id, role)
+         select $1, 'identity-b', id, $2 from "user" where email = 'identity-browser@example.test'`,
+        [readOnly, role],
+      );
+    }
+
+    async function holdsKey(organizationId: string, keyId: string): Promise<boolean> {
+      const keys = await auth.apiKeys!.list(organizationId);
+      return keys.some(({ id }) => id === keyId);
+    }
+
+    async function leaveIdentityB(): Promise<void> {
+      await runtime.query(`delete from member where id = $1`, [readOnly]);
+      const restored = await browserRequest("/api/auth/paseo/select-organization", {
+        organizationId: "identity-a",
+      });
+      assert.equal(restored.status, 200);
+    }
+
+    it("authorizes the organization in the address, not the active organization", async () => {
+      await joinIdentityB("member");
+      try {
+        // Active organization identity-a (owner); the address names identity-b (member).
+        const list = await browserRequest(
+          "/api/auth/paseo/api-keys",
+          undefined,
+          auth,
+          "identity-b",
+        );
+        assert.equal(list.status, 403);
+        const create = await browserRequest(
+          "/api/auth/paseo/api-keys",
+          { name: "Wrong org", scopes: ["runs:dispatch"] },
+          auth,
+          "identity-b",
+        );
+        assert.equal(create.status, 403);
+        assert.equal((await auth.apiKeys!.list("identity-b")).length, 0);
+
+        // Active organization identity-b (member); the address names identity-a (owner).
+        const selected = await browserRequest("/api/auth/paseo/select-organization", {
+          organizationId: "identity-b",
+        });
+        assert.equal(selected.status, 200);
+        const created = await browserRequest("/api/auth/paseo/api-keys", {
+          name: "Right org",
+          scopes: ["runs:dispatch"],
+        });
+        assert.equal(created.status, 201);
+        const { key } = keyResponseSchema.parse(await created.json());
+        assert.ok(await holdsKey("identity-a", key.id));
+        assert.equal((await auth.apiKeys!.list("identity-b")).length, 0);
+        const revokedElsewhere = await browserRequest(
+          "/api/auth/paseo/revoke-api-key",
+          { id: key.id },
+          auth,
+          "identity-b",
+        );
+        assert.equal(revokedElsewhere.status, 403);
+        assert.equal(
+          (await browserRequest("/api/auth/paseo/revoke-api-key", { id: key.id })).status,
+          200,
+        );
+      } finally {
+        await leaveIdentityB();
+      }
+    });
+
+    async function refusalsFor(slug: string): Promise<unknown[]> {
+      const list = await browserRequest("/api/auth/paseo/api-keys", undefined, auth, slug);
+      const revoke = await browserRequest(
+        "/api/auth/paseo/revoke-api-key",
+        { id: randomUUID() },
+        auth,
+        slug,
+      );
+      return [
+        [list.status, await list.json()],
+        [revoke.status, await revoke.json()],
+      ];
+    }
+
+    it("refuses an unknown slug and a foreign organization identically", async () => {
+      const foreign = await refusalsFor("identity-b");
+      const unknown = await refusalsFor("no-such-organization");
+      const refused = [
+        [404, { error: "organization_unavailable" }],
+        [404, { error: "organization_unavailable" }],
+      ];
+      assert.deepEqual([foreign, unknown], [refused, refused]);
+    });
+
+    it("rejects a request that names no organization", async () => {
+      const list = await browserRequest("/api/auth/paseo/api-keys", undefined, auth, null);
+      assert.equal(list.status, 400);
+      assert.deepEqual(await list.json(), { error: "invalid_request" });
+      const create = await browserRequest(
+        "/api/auth/paseo/api-keys",
+        { name: "No org", scopes: ["runs:dispatch"] },
+        auth,
+        null,
+      );
+      assert.equal(create.status, 400);
+      assert.deepEqual(await create.json(), { error: "invalid_request" });
+    });
   });
 
   it("denies signing key creation, rotation and retirement in an excluded organization", async () => {
@@ -680,12 +796,26 @@ run:
     });
   }
 
-  async function browserRequest(path: string, body?: unknown, server = auth): Promise<Response> {
+  /** Sends a browser-session request for the organization in the address (`identity-a` unless
+   * named); `null` leaves the organization out. */
+  async function browserRequest(
+    path: string,
+    body?: unknown,
+    server = auth,
+    organizationSlug: string | null = "identity-a",
+  ): Promise<Response> {
+    const routed = !path.endsWith("/select-organization") && organizationSlug !== null;
+    const url = new URL(path, ORIGIN);
+    if (routed && body === undefined) url.searchParams.set("organizationSlug", organizationSlug);
+    const payload =
+      routed && body !== undefined
+        ? { organizationSlug, ...z.record(z.string(), z.unknown()).parse(body) }
+        : body;
     return server.handle(
-      new Request(`${ORIGIN}${path}`, {
+      new Request(url, {
         method: body === undefined ? "GET" : "POST",
         headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(body === undefined ? {} : { body: JSON.stringify(payload) }),
       }),
     );
   }

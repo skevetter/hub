@@ -21,7 +21,7 @@ const invitationSchema = z.object({
   inviterName: z.string(),
   role: invitationRoleSchema,
   expiresAt: z.string(),
-  email: z.string().email().optional(),
+  email: z.email().optional(),
 });
 const teamMemberSchema = z.object({
   id: z.string(),
@@ -35,7 +35,7 @@ const managerInvitationSchema = z.object({
   email: z.string(),
   role: invitationRoleSchema,
   expiresAt: z.string(),
-  link: z.string().url(),
+  link: z.url(),
 });
 
 export const organizationCapabilitiesSchema = z.object({
@@ -43,6 +43,11 @@ export const organizationCapabilitiesSchema = z.object({
   manageMembers: z.boolean(),
   manageOwners: z.boolean(),
   manageResources: z.boolean(),
+});
+
+export const organizationTeamSchema = z.object({
+  members: z.array(teamMemberSchema),
+  invitations: z.array(managerInvitationSchema).optional(),
 });
 
 export const accountStateSchema = z.discriminatedUnion("status", [
@@ -85,16 +90,14 @@ export const accountStateSchema = z.discriminatedUnion("status", [
     membership: z.object({ id: z.string(), role: organizationRoleSchema }),
     capabilities: organizationCapabilitiesSchema,
     isInstanceOperator: z.boolean(),
-    team: z.object({
-      members: z.array(teamMemberSchema),
-      invitations: z.array(managerInvitationSchema).optional(),
-    }),
+    team: organizationTeamSchema,
     invitation: invitationSchema.optional(),
     invitationUnavailable: z.literal(true).optional(),
     canCreateOrganization: z.boolean(),
   }),
 ]);
 
+export type OrganizationTeam = z.infer<typeof organizationTeamSchema>;
 export type OrganizationRole = z.infer<typeof organizationRoleSchema>;
 export type InvitationRole = z.infer<typeof invitationRoleSchema>;
 export type OrganizationCapabilities = z.infer<typeof organizationCapabilitiesSchema>;

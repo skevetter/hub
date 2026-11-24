@@ -9,6 +9,7 @@ import {
   accountStateSchema,
   invitationRoleSchema,
   organizationRoleSchema,
+  organizationTeamSchema,
 } from "./organization-contract.js";
 import { PASSWORD_MIN_LENGTH } from "./instance-policy.js";
 import {
@@ -20,10 +21,11 @@ import {
   retireSigningSecretSchema,
   webhookSigningSummarySchema,
 } from "./api-key-contract.js";
+import { organizationSlugSchema, routeOrganizationInput } from "./route-organization.js";
 import { parseEntitlementDenial, type EntitlementDenialPayload } from "../entitlements/denial.js";
 
 const credentialsSchema = z.object({
-  email: z.string().email(),
+  email: z.email(),
   password: z.string().min(PASSWORD_MIN_LENGTH),
 });
 const signInSchema = credentialsSchema.extend({ invitation: z.string().min(1).optional() });
@@ -32,7 +34,7 @@ const signUpSchema = credentialsSchema.extend({
   invitation: z.string().min(1).optional(),
 });
 const emailSchema = z.object({
-  email: z.string().email(),
+  email: z.email(),
   invitation: z.string().min(1).optional(),
 });
 const resetPasswordSchema = z.object({
@@ -43,7 +45,7 @@ const accountEntrySchema = z.object({ invitation: z.string().optional() });
 const initialOperatorSchema = credentialsSchema.strip();
 const createOrganizationSchema = z.object({ name: z.string().trim().min(1).max(100) });
 const selectOrganizationSchema = z.object({ organizationId: z.string().min(1) });
-const createInvitationSchema = z.object({ email: z.string().email(), role: invitationRoleSchema });
+const createInvitationSchema = z.object({ email: z.email(), role: invitationRoleSchema });
 const invitationIdSchema = z.object({ invitationId: z.string().min(1) });
 const changeRoleSchema = z.object({ memberId: z.string().min(1), role: organizationRoleSchema });
 const memberIdSchema = z.object({ memberId: z.string().min(1) });
@@ -51,9 +53,10 @@ const passwordChangeSchema = z.object({
   currentPassword: z.string().min(1),
   newPassword: z.string().min(PASSWORD_MIN_LENGTH),
 });
-const apiKeyIdSchema = z.object({ id: z.string().uuid() });
+const apiKeyIdSchema = z.object({ id: z.uuid() });
+const routeOrganizationSchema = z.object({ organizationSlug: organizationSlugSchema });
 const cliCredentialSummarySchema = z.object({
-  id: z.string().uuid(),
+  id: z.uuid(),
   prefix: z.string(),
   createdAt: z.string(),
   lastUsedAt: z.string().nullable(),
@@ -270,50 +273,82 @@ export const changePassword = createServerFn({ method: "POST" })
     }
   });
 
-export const listApiKeys = createServerFn({ method: "GET" }).handler(
-  async (): Promise<
-    Result<{
-      keys: z.infer<typeof apiKeySummarySchema>[];
-      signingAvailability: "enabled" | "disabled" | "unavailable";
-      cliCredentials: z.infer<typeof cliCredentialSummarySchema>[];
-    }>
-  > => {
-    const response = await sendAccountQuery("/api/auth/paseo/api-keys");
-    if (response instanceof AccountRequestError)
+export const organizationTeam = createServerFn({ method: "GET" })
+  .validator(routeOrganizationSchema)
+  .handler(async ({ data }): Promise<Result<z.infer<typeof organizationTeamSchema>>> => {
+    const response = await sendAccountQuery("/api/auth/paseo/team", data.organizationSlug);
+    if (response instanceof AccountRequestError) {
       return accountTransportFailure(
         response,
-        "auth.api_keys.list",
-        "Hub couldn't load API keys. Reload the page.",
+        "auth.team.list",
+        "Hub couldn't load the team. Reload the page.",
       );
-    if (!response.ok)
+    }
+    if (!response.ok) {
       return accountResponseFailure(
-        "auth.api_keys.list",
+        "auth.team.list",
         response,
-        "Hub couldn't load API keys. Reload the page.",
+        "Hub couldn't load the team. Reload the page.",
       );
+    }
     try {
-      return respondOk(
-        z
-          .object({
-            keys: z.array(apiKeySummarySchema),
-            signingAvailability: z.enum(["enabled", "disabled", "unavailable"]),
-            cliCredentials: z.array(cliCredentialSummarySchema),
-          })
-          .parse(await response.json()),
-      );
+      const body = z.object({ team: organizationTeamSchema }).parse(await response.json());
+      return respondOk(body.team);
     } catch (error) {
-      return respondWithFailure(error, accountContext("auth.api_keys.list_response"), {
-        fallback: "Hub received an invalid API-key response. Reload the page.",
+      return respondWithFailure(error, accountContext("auth.team.list_response"), {
+        fallback: "Hub received an invalid team response. Reload the page.",
       });
     }
-  },
-);
+  });
+
+export const listApiKeys = createServerFn({ method: "GET" })
+  .validator(routeOrganizationSchema)
+  .handler(
+    async ({
+      data,
+    }): Promise<
+      Result<{
+        keys: z.infer<typeof apiKeySummarySchema>[];
+        signingAvailability: "enabled" | "disabled" | "unavailable";
+        cliCredentials: z.infer<typeof cliCredentialSummarySchema>[];
+      }>
+    > => {
+      const response = await sendAccountQuery("/api/auth/paseo/api-keys", data.organizationSlug);
+      if (response instanceof AccountRequestError)
+        return accountTransportFailure(
+          response,
+          "auth.api_keys.list",
+          "Hub couldn't load API keys. Reload the page.",
+        );
+      if (!response.ok)
+        return accountResponseFailure(
+          "auth.api_keys.list",
+          response,
+          "Hub couldn't load API keys. Reload the page.",
+        );
+      try {
+        return respondOk(
+          z
+            .object({
+              keys: z.array(apiKeySummarySchema),
+              signingAvailability: z.enum(["enabled", "disabled", "unavailable"]),
+              cliCredentials: z.array(cliCredentialSummarySchema),
+            })
+            .parse(await response.json()),
+        );
+      } catch (error) {
+        return respondWithFailure(error, accountContext("auth.api_keys.list_response"), {
+          fallback: "Hub received an invalid API-key response. Reload the page.",
+        });
+      }
+    },
+  );
 
 export const createApiKey = createServerFn({ method: "POST" })
-  .validator(apiKeyCreateSchema)
+  .validator(routeOrganizationInput(apiKeyCreateSchema))
   .handler(async ({ data }): Promise<Result<z.infer<typeof apiKeyCreateResultSchema>>> => {
     markSecretResponse();
-    const response = await sendAccountCommand("/api/auth/paseo/api-keys", data);
+    const response = await sendAccountCommand("/api/auth/paseo/api-keys", routeBody(data));
     if (response instanceof AccountRequestError)
       return accountTransportFailure(
         response,
@@ -321,7 +356,7 @@ export const createApiKey = createServerFn({ method: "POST" })
         "Reload the key list to check whether the API key was created.",
       );
     if (!response.ok) {
-      if (data.authentication !== undefined) return signingResponseFailure(response);
+      if (data.input.authentication !== undefined) return signingResponseFailure(response);
       return accountResponseFailure(
         "auth.api_keys.create",
         response,
@@ -344,12 +379,12 @@ export const createApiKey = createServerFn({ method: "POST" })
   });
 
 export const rotateApiKeySigningSecret = createServerFn({ method: "POST" })
-  .validator(rotateSigningSecretSchema)
+  .validator(routeOrganizationInput(rotateSigningSecretSchema))
   .handler(async ({ data }): Promise<Result<z.infer<typeof rotatedSigningSecretSchema>>> => {
     markSecretResponse();
     const response = await sendAccountCommand(
       "/api/auth/paseo/rotate-api-key-signing-secret",
-      data,
+      routeBody(data),
     );
     if (response instanceof AccountRequestError) {
       return respondError({
@@ -368,11 +403,11 @@ export const rotateApiKeySigningSecret = createServerFn({ method: "POST" })
   });
 
 export const retireApiKeySigningSecret = createServerFn({ method: "POST" })
-  .validator(retireSigningSecretSchema)
+  .validator(routeOrganizationInput(retireSigningSecretSchema))
   .handler(async ({ data }): Promise<Result<Record<string, never>>> => {
     const response = await sendAccountCommand(
       "/api/auth/paseo/retire-api-key-signing-secret",
-      data,
+      routeBody(data),
     );
     if (response instanceof AccountRequestError) {
       return respondError({
@@ -382,6 +417,10 @@ export const retireApiKeySigningSecret = createServerFn({ method: "POST" })
     if (!response.ok) return signingResponseFailure(response);
     return respondOk({});
   });
+
+function routeBody<TInput extends object>(data: { organizationSlug: string; input: TInput }) {
+  return { organizationSlug: data.organizationSlug, ...data.input };
+}
 
 function markSecretResponse(): void {
   setResponseHeader("cache-control", "no-store");
@@ -416,9 +455,9 @@ async function signingResponseFailure(response: Response) {
 }
 
 export const revokeApiKey = createServerFn({ method: "POST" })
-  .validator(apiKeyIdSchema)
+  .validator(routeOrganizationInput(apiKeyIdSchema))
   .handler(async ({ data }): Promise<Result<Record<string, never>>> => {
-    const response = await sendAccountCommand("/api/auth/paseo/revoke-api-key", data);
+    const response = await sendAccountCommand("/api/auth/paseo/revoke-api-key", routeBody(data));
     if (response instanceof AccountRequestError || !response.ok) {
       return response instanceof AccountRequestError
         ? accountTransportFailure(
@@ -436,9 +475,12 @@ export const revokeApiKey = createServerFn({ method: "POST" })
   });
 
 export const revokeCliCredential = createServerFn({ method: "POST" })
-  .validator(apiKeyIdSchema)
+  .validator(routeOrganizationInput(apiKeyIdSchema))
   .handler(async ({ data }): Promise<Result<Record<string, never>>> => {
-    const response = await sendAccountCommand("/api/auth/paseo/revoke-cli-credential", data);
+    const response = await sendAccountCommand(
+      "/api/auth/paseo/revoke-cli-credential",
+      routeBody(data),
+    );
     if (response instanceof AccountRequestError || !response.ok) {
       return response instanceof AccountRequestError
         ? accountTransportFailure(
@@ -516,9 +558,9 @@ export const selectOrganization = createServerFn({ method: "POST" })
   });
 
 export const createInvitation = createServerFn({ method: "POST" })
-  .validator(createInvitationSchema)
+  .validator(routeOrganizationInput(createInvitationSchema))
   .handler(async ({ data }): Promise<AccountCommandResult> => {
-    const response = await sendAccountCommand("/api/auth/paseo/create-invitation", data);
+    const response = await sendAccountCommand("/api/auth/paseo/create-invitation", routeBody(data));
     if (response instanceof AccountRequestError) {
       return accountTransportFailure(
         response,
@@ -528,7 +570,7 @@ export const createInvitation = createServerFn({ method: "POST" })
     }
     if (response.status === 401)
       return accountStateFailure("auth.invitation.create", response, "sessionExpired");
-    if (response.status === 403)
+    if (await lostOrganization(response))
       return accountStateFailure("auth.invitation.create", response, "organizationRequired");
     if (response.status === 409) {
       const denial = parseEntitlementDenial(await response.json().catch(() => undefined));
@@ -561,9 +603,9 @@ function invitationDenialMessage(denial: EntitlementDenialPayload): string {
 }
 
 export const cancelInvitation = createServerFn({ method: "POST" })
-  .validator(invitationIdSchema)
+  .validator(routeOrganizationInput(invitationIdSchema))
   .handler(async ({ data }): Promise<AccountCommandResult> => {
-    const response = await sendAccountCommand("/api/auth/paseo/cancel-invitation", data);
+    const response = await sendAccountCommand("/api/auth/paseo/cancel-invitation", routeBody(data));
     if (response instanceof AccountRequestError) {
       return accountTransportFailure(
         response,
@@ -573,7 +615,7 @@ export const cancelInvitation = createServerFn({ method: "POST" })
     }
     if (response.status === 401)
       return accountStateFailure("auth.invitation.cancel", response, "sessionExpired");
-    if (response.status === 403)
+    if (await lostOrganization(response))
       return accountStateFailure("auth.invitation.cancel", response, "organizationRequired");
     if (!response.ok)
       return accountResponseFailure(
@@ -606,9 +648,12 @@ export const acceptInvitation = createServerFn({ method: "POST" })
   });
 
 export const changeMemberRole = createServerFn({ method: "POST" })
-  .validator(changeRoleSchema)
+  .validator(routeOrganizationInput(changeRoleSchema))
   .handler(async ({ data }): Promise<AccountCommandResult> => {
-    const response = await sendAccountCommand("/api/auth/paseo/change-member-role", data);
+    const response = await sendAccountCommand(
+      "/api/auth/paseo/change-member-role",
+      routeBody(data),
+    );
     if (response instanceof AccountRequestError)
       return accountTransportFailure(
         response,
@@ -617,7 +662,7 @@ export const changeMemberRole = createServerFn({ method: "POST" })
       );
     if (response.status === 401)
       return accountStateFailure("auth.team.change_role", response, "sessionExpired");
-    if (response.status === 403)
+    if (await lostOrganization(response))
       return accountStateFailure("auth.team.change_role", response, "organizationRequired");
     if (!response.ok)
       return accountResponseFailure(
@@ -629,9 +674,9 @@ export const changeMemberRole = createServerFn({ method: "POST" })
   });
 
 export const removeMember = createServerFn({ method: "POST" })
-  .validator(memberIdSchema)
+  .validator(routeOrganizationInput(memberIdSchema))
   .handler(async ({ data }): Promise<AccountCommandResult> => {
-    const response = await sendAccountCommand("/api/auth/paseo/remove-member", data);
+    const response = await sendAccountCommand("/api/auth/paseo/remove-member", routeBody(data));
     if (response instanceof AccountRequestError)
       return accountTransportFailure(
         response,
@@ -640,7 +685,7 @@ export const removeMember = createServerFn({ method: "POST" })
       );
     if (response.status === 401)
       return accountStateFailure("auth.team.remove_member", response, "sessionExpired");
-    if (response.status === 403)
+    if (await lostOrganization(response))
       return accountStateFailure("auth.team.remove_member", response, "organizationRequired");
     if (!response.ok)
       return accountResponseFailure(
@@ -675,12 +720,17 @@ async function sendAccountCommand(
   }
 }
 
-async function sendAccountQuery(path: string): Promise<Response | AccountRequestError> {
+async function sendAccountQuery(
+  path: string,
+  organizationSlug: string,
+): Promise<Response | AccountRequestError> {
   const incoming = getRequest();
   try {
+    const url = new URL(path, incoming.url);
+    url.searchParams.set("organizationSlug", organizationSlug);
     const response = await (
       await getApplication()
-    ).browserAccount?.(new Request(new URL(path, incoming.url), { headers: incoming.headers }));
+    ).browserAccount?.(new Request(url, { headers: incoming.headers }));
     return response ?? new AccountRequestError(new Error("browser account capability unavailable"));
   } catch (error) {
     return new AccountRequestError(error);
@@ -716,6 +766,16 @@ function accountResponseFailure(operation: string, response: Response, message: 
     },
     { status: response.status },
   );
+}
+
+async function lostOrganization(response: Response): Promise<boolean> {
+  if (response.status === 403) return true;
+  if (response.status !== 404) return false;
+  const body: unknown = await response
+    .clone()
+    .json()
+    .catch(() => undefined);
+  return z.object({ error: z.literal("organization_unavailable") }).safeParse(body).success;
 }
 
 function accountStateFailure<TState extends "sessionExpired" | "organizationRequired">(

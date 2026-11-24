@@ -338,6 +338,42 @@ export class PaseoHub {
     await this.requireUser(alias).createOrganization(name);
   }
 
+  async openTeamOf(alias: string, organizationName: string): Promise<void> {
+    const rows = z
+      .array(z.object({ slug: z.string() }))
+      .parse(
+        await this.queryDatabaseRows(
+          this.primary,
+          `select slug from organization where name = $1`,
+          [organizationName],
+        ),
+      );
+    await this.requireUser(alias).openTeamByAddress(rows[0]!.slug);
+  }
+
+  async inviteOnTeamPage(alias: string, email: string): Promise<void> {
+    await this.requireUser(alias).inviteOnTeamPage(email);
+  }
+
+  /** The organization the session stores as active, which the page address does not change. */
+  async expectSessionActiveOrganization(alias: string, organizationName: string): Promise<void> {
+    const rows = z.array(z.object({ name: z.string() })).parse(
+      await this.queryDatabaseRows(
+        this.primary,
+        `select organization.name from session
+         join "user" on "user".id = session.user_id
+         join organization on organization.id = session.active_organization_id
+         where lower("user".email) = $1`,
+        [this.requireUser(alias).accountEmail],
+      ),
+    );
+    expect(rows.map((row) => row.name)).toEqual([organizationName]);
+  }
+
+  async expectTeamRows(alias: string, expected: TeamExpectation): Promise<void> {
+    await this.requireUser(alias).expectTeamRows(expected);
+  }
+
   async proveBootstrapJourney(
     account: Account,
     organizationName: string,
@@ -5279,6 +5315,24 @@ class HubUser {
 
   async expectTeam(expected: TeamExpectation): Promise<void> {
     await this.refreshOrganizationSection("Team");
+    await this.expectTeamRows(expected);
+  }
+
+  /** The team page for the organization in the address, whichever organization is active. */
+  async openTeamByAddress(slug: string): Promise<void> {
+    await this.page.goto(`${this.origin}/o/${slug}/settings/team`);
+    await expect(this.page.getByRole("heading", { name: "Team", level: 1 })).toBeVisible();
+  }
+
+  async inviteOnTeamPage(email: string): Promise<void> {
+    const form = await this.openInvitationForm();
+    await form.getByLabel("Invitee email").fill(email);
+    await form.getByRole("button", { name: "Create invitation" }).click();
+    await expect(form).toBeHidden();
+    await expect(this.invitationRow(email)).toBeVisible();
+  }
+
+  async expectTeamRows(expected: TeamExpectation): Promise<void> {
     const members = this.page.getByRole("table", { name: "Members" });
     for (const value of expected.membersPresent)
       await expect(members.getByText(value, { exact: true })).toBeVisible();
