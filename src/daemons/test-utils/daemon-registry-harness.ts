@@ -16,7 +16,7 @@ const SessionRequestSchema = z.object({
       executionId: z.string().optional(),
       action: z.enum(["interrupt", "archive"]).optional(),
     })
-    .passthrough(),
+    .loose(),
 });
 
 interface PendingRequest<T> {
@@ -40,11 +40,13 @@ export class DaemonRegistryHarness {
   private didShutdown = false;
   private stopped = false;
 
-  constructor(logger?: Pick<Logger, "warn" | "error">) {
+  constructor(logger?: Pick<Logger, "info" | "warn" | "error">) {
     this.registry = new ActiveDaemonRegistry(this.presence, undefined, logger);
   }
 
-  static async start(logger?: Pick<Logger, "warn" | "error">): Promise<DaemonRegistryHarness> {
+  static async start(
+    logger?: Pick<Logger, "info" | "warn" | "error">,
+  ): Promise<DaemonRegistryHarness> {
     const harness = new DaemonRegistryHarness(logger);
     await harness.serverListening();
     await harness.replaceConnection();
@@ -428,7 +430,9 @@ class RegistrySocket {
       });
     }
     const index = this.messages.findIndex((message) => message.type === type);
-    return this.messages.splice(index, 1)[0]!;
+    const [message] = this.messages.splice(index, 1);
+    if (message === undefined) throw new Error(`Daemon message ${type} is unavailable`);
+    return message;
   }
 
   send(message: unknown): void {
@@ -468,7 +472,8 @@ class RegistrySocket {
     const payload = Buffer.alloc(2);
     payload.writeUInt16BE(code, 0);
     const maskedPayload = Buffer.alloc(2);
-    for (let i = 0; i < 2; i += 1) maskedPayload[i] = payload[i]! ^ mask[i]!;
+    for (let i = 0; i < 2; i += 1)
+      maskedPayload.writeUInt8(payload.readUInt8(i) ^ mask.readUInt8(i), i);
     tcpSocket.write(Buffer.concat([Buffer.from([0x88, 0x82]), mask, maskedPayload]));
   }
 

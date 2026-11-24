@@ -4,8 +4,9 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
-import { z } from "zod";
+import type { z } from "zod";
 import type { Logger } from "pino";
+import type { CompiledAgent } from "../config/compiler.js";
 import type { Database, DaemonRecord } from "../db/types.js";
 import { reportFailure, type FailureKind } from "../failures/index.js";
 import { logger as defaultLogger } from "../logger.js";
@@ -58,6 +59,9 @@ interface ActiveSocket {
   ready: boolean;
   presenceReady: Promise<void>;
   providerSnapshotSupported: boolean;
+  acceptedAt: number;
+  heartbeatExpired: boolean;
+  stopHeartbeat: () => void;
 }
 
 export type DaemonSessionProtocol = "legacy" | "session-v1";
@@ -65,6 +69,20 @@ export type DaemonSessionProtocol = "legacy" | "session-v1";
 const DAEMON_SESSION_PROTOCOL_HEADER = "x-paseo-session-protocol";
 const DAEMON_SESSION_PROTOCOL_VERSION = "1";
 const PROVIDER_REQUEST_DEADLINE_MS = 20_000;
+// Proxies such as Cloudflare drop a WebSocket that carries no frames for about 100 seconds, and
+// daemons before 0.12.0 send no keepalive of their own. Protocol pings are answered by every
+// daemon version without application support.
+const DAEMON_PING_INTERVAL_MS = 30_000;
+const DAEMON_PONG_TIMEOUT_MS = 90_000;
+// Close reasons are peer-supplied text, so only reasons Hub itself sends are logged verbatim.
+const LOGGED_CLOSE_REASONS: ReadonlySet<string> = new Set([
+  "",
+  "replaced",
+  "revoked",
+  "invalid daemon message",
+  "daemon session permissions do not match enrollment",
+  "server shutdown",
+]);
 
 type DaemonConnectedHandler = (daemon: DaemonRecord) => void | Promise<void>;
 type DaemonDisconnectedHandler = (daemon: DaemonRecord) => void;
@@ -82,7 +100,7 @@ export class ActiveDaemonRegistry {
   constructor(
     private readonly database: Pick<Database, "setDaemonPresence" | "touchDaemon">,
     private readonly clock: DaemonClock = systemDaemonClock,
-    private readonly failureLogger: Pick<Logger, "warn" | "error"> = defaultLogger,
+    private readonly failureLogger: Pick<Logger, "info" | "warn" | "error"> = defaultLogger,
   ) {}
 
   accept(
@@ -92,6 +110,27 @@ export class ActiveDaemonRegistry {
   ): void {
     const previous = this.active.get(daemon.id);
     if (previous) this.rejectGeneration(daemon.id, previous.generation);
+    const active = this.createActiveSocket(daemon, socket);
+    this.active.set(daemon.id, active);
+    previous?.agents.close();
+    previous?.terminals.close();
+    previous?.socket.close(4001, "replaced");
+    socket.on("message", (data) => this.receive(active, readText(data)));
+    socket.on("error", (error) => {
+      // A peer that sends a malformed control frame (e.g. an invalid close
+      // status code) makes the `ws` receiver emit `error` on this socket.
+      // Node's EventEmitter rethrows unlistened `error` events as an
+      // uncaught exception, which without this listener kills the whole
+      // Hub process over one bad daemon connection. Report and let the
+      // subsequent `close` event drive the normal offline-presence cleanup.
+      this.report(error, "daemon.socket.error", daemon.id, "network");
+    });
+    socket.on("close", (code: number, reason: Buffer) => this.closed(active, code, reason));
+    if (sessionProtocol === "legacy") this.markReady(active);
+    else sendHello(daemon, socket);
+  }
+
+  private createActiveSocket(daemon: DaemonRecord, socket: WebSocket): ActiveSocket {
     const active: ActiveSocket = {
       agents: new DaemonAgents(
         (frame) => {
@@ -108,60 +147,37 @@ export class ActiveDaemonRegistry {
       ready: false,
       presenceReady: Promise.resolve(),
       providerSnapshotSupported: false,
+      acceptedAt: performance.now(),
+      heartbeatExpired: false,
+      stopHeartbeat: () => undefined,
     };
-    this.active.set(daemon.id, active);
-    previous?.agents.close();
-    previous?.terminals.close();
-    previous?.socket.close(4001, "replaced");
-    socket.on("message", (data) => this.receive(active, readText(data)));
-    socket.on("error", (error) => {
-      // A peer that sends a malformed control frame (e.g. an invalid close
-      // status code) makes the `ws` receiver emit `error` on this socket.
-      // Node's EventEmitter rethrows unlistened `error` events as an
-      // uncaught exception, which without this listener kills the whole
-      // Hub process over one bad daemon connection. Report and let the
-      // subsequent `close` event drive the normal offline-presence cleanup.
-      this.report(error, "daemon.socket.error", daemon.id, "network");
+    active.stopHeartbeat = startHeartbeat(socket, () => {
+      active.heartbeatExpired = true;
     });
-    socket.on("close", () => {
-      active.agents.close();
-      active.terminals.close();
-      if (this.active.get(daemon.id)?.generation === active.generation) {
-        this.active.delete(daemon.id);
-        this.rejectGeneration(daemon.id, active.generation);
-        const write = active.presenceReady.then(() =>
-          this.database.setDaemonPresence(daemon.id, "offline"),
-        );
-        this.presenceWrites.add(write);
-        void write.then(
-          () => this.presenceWrites.delete(write),
-          (error: unknown) => {
-            this.report(error, "daemon.presence.offline", daemon.id);
-          },
-        );
-        for (const handler of this.disconnectedHandlers) {
-          this.observeHandler(
-            () => handler(active.daemon),
-            "daemon.disconnected.handler",
-            daemon.id,
-          );
-        }
-      }
-    });
-    if (sessionProtocol === "legacy") {
-      this.markReady(active);
-    } else {
-      socket.send(
-        JSON.stringify(
-          HubDaemonHelloSchema.parse({
-            type: "hello",
-            clientId: `hub:${daemon.id}`,
-            clientType: "hub",
-            capabilities: { all_providers: true, selective_agent_timeline: true },
-            protocolVersion: 1,
-          }),
-        ),
-      );
+    return active;
+  }
+
+  private closed(active: ActiveSocket, code: number, reason: Buffer): void {
+    const daemonId = active.daemon.id;
+    active.stopHeartbeat();
+    this.logClose(active, code, reason);
+    active.agents.close();
+    active.terminals.close();
+    if (this.active.get(daemonId)?.generation !== active.generation) return;
+    this.active.delete(daemonId);
+    this.rejectGeneration(daemonId, active.generation);
+    const write = active.presenceReady.then(() =>
+      this.database.setDaemonPresence(daemonId, "offline"),
+    );
+    this.presenceWrites.add(write);
+    void write.then(
+      () => this.presenceWrites.delete(write),
+      (error: unknown) => {
+        this.report(error, "daemon.presence.offline", daemonId);
+      },
+    );
+    for (const handler of this.disconnectedHandlers) {
+      this.observeHandler(() => handler(active.daemon), "daemon.disconnected.handler", daemonId);
     }
   }
 
@@ -195,7 +211,7 @@ export class ActiveDaemonRegistry {
 
   validateAgentConfiguration(
     daemonId: string,
-    agent: import("../config/compiler.js").CompiledAgent,
+    agent: CompiledAgent,
   ): Promise<{ valid: true } | { valid: false; issues: readonly AgentValidationIssue[] }> {
     const active = this.active.get(daemonId);
     if (!active?.ready) return Promise.reject(new Error("daemon_not_connected"));
@@ -406,6 +422,10 @@ export class ActiveDaemonRegistry {
       );
       return;
     }
+    this.receiveExecutionMessage(active, value);
+  }
+
+  private receiveExecutionMessage(active: ActiveSocket, value: unknown): void {
     const envelope = HubExecutionOutboundSchema.safeParse(value);
     if (!envelope.success) return;
     const message = envelope.data.message;
@@ -457,33 +477,38 @@ export class ActiveDaemonRegistry {
     });
   }
 
+  private logClose(active: ActiveSocket, code: number, reason: Buffer): void {
+    const fields = {
+      operation: "daemon.socket.closed",
+      component: "daemons",
+      daemonId: active.daemon.id,
+      generation: active.generation,
+      closeCode: code,
+      closeReason: loggedCloseReason(reason),
+      connectedMs: Math.round(performance.now() - active.acceptedAt),
+    };
+    if (active.heartbeatExpired) {
+      this.failureLogger.warn(fields, "daemon socket closed after missed heartbeat");
+    } else {
+      this.failureLogger.info(fields, "daemon socket closed");
+    }
+  }
+
   private observeHandler(
     handler: () => void | Promise<void>,
     operation: string,
     daemonId: string,
     kind?: FailureKind,
-    executionId?: string,
   ): void {
     void Promise.resolve()
       .then(handler)
-      .catch((error: unknown) => this.report(error, operation, daemonId, kind, executionId));
+      .catch((error: unknown) => this.report(error, operation, daemonId, kind));
   }
 
-  private report(
-    error: unknown,
-    operation: string,
-    daemonId: string,
-    kind?: FailureKind,
-    executionId?: string,
-  ): void {
+  private report(error: unknown, operation: string, daemonId: string, kind?: FailureKind): void {
     reportFailure(
       error,
-      {
-        operation,
-        component: "daemons",
-        daemonId,
-        ...(executionId === undefined ? {} : { executionId }),
-      },
+      { operation, component: "daemons", daemonId },
       { logger: this.failureLogger, ...(kind === undefined ? {} : { kind }) },
     );
   }
@@ -574,6 +599,47 @@ export class ActiveDaemonRegistry {
       request.reject(new Error("daemon disconnected"));
     }
   }
+}
+
+function sendHello(daemon: DaemonRecord, socket: WebSocket): void {
+  socket.send(
+    JSON.stringify(
+      HubDaemonHelloSchema.parse({
+        type: "hello",
+        clientId: `hub:${daemon.id}`,
+        clientType: "hub",
+        capabilities: { all_providers: true, selective_agent_timeline: true },
+        protocolVersion: 1,
+      }),
+    ),
+  );
+}
+
+function startHeartbeat(socket: WebSocket, onExpired: () => void): () => void {
+  if (socket.readyState !== WebSocket.OPEN) return () => undefined;
+  const pings = setInterval(() => {
+    if (socket.readyState === WebSocket.OPEN) socket.ping();
+  }, DAEMON_PING_INTERVAL_MS);
+  const deadline = setTimeout(() => {
+    clearInterval(pings);
+    if (socket.readyState !== WebSocket.OPEN) return;
+    onExpired();
+    socket.terminate();
+  }, DAEMON_PONG_TIMEOUT_MS);
+  pings.unref?.();
+  deadline.unref?.();
+  const pong = () => deadline.refresh();
+  socket.on("pong", pong);
+  return () => {
+    clearInterval(pings);
+    clearTimeout(deadline);
+    socket.off("pong", pong);
+  };
+}
+
+function loggedCloseReason(reason: Buffer): string {
+  const text = reason.toString("utf8");
+  return LOGGED_CLOSE_REASONS.has(text) ? text : "unrecognized";
 }
 
 function samePermissions(actual: readonly string[], expected: readonly string[]): boolean {

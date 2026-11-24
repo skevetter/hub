@@ -1,9 +1,10 @@
 import { z } from "zod";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { createServer } from "node:http";
 import { afterEach, beforeEach, describe, it, vi } from "vitest";
-import { WebSocket, type RawData } from "ws";
+import { WebSocket, WebSocketServer, type RawData } from "ws";
 import type { DaemonRecord } from "../db/types.js";
 import { classifyFailure } from "../failures/index.js";
 import { HubDaemonHelloSchema } from "../hub/protocol.js";
@@ -216,7 +217,7 @@ describe("daemon socket deadlines", () => {
     assert.equal(vi.getTimerCount(), 0);
     await vi.advanceTimersByTimeAsync(1000);
     assert.equal(terminate.mock.calls.length, 0);
-    assert.equal(stream.records().length, 0);
+    assert.equal(stream.failures().length, 0);
   });
 
   function setupProviderRead() {
@@ -607,7 +608,7 @@ describe("daemon socket generations", () => {
     const canary = "offline-presence-secret-7e12";
     daemon.failOfflinePresence(new Error(canary));
     await daemon.disconnectCurrent();
-    await vi.waitFor(() => assert.equal(stream.records().length, 1));
+    await vi.waitFor(() => assert.equal(stream.failures().length, 1));
     await assert.rejects(daemon.stop(), { message: canary });
 
     assertOneFailure(stream, {
@@ -686,4 +687,227 @@ describe("daemon socket generations", () => {
       canary: "invalid-close-code-1006-never-logged",
     });
   });
+});
+
+describe("daemon socket heartbeat", () => {
+  const cleanups: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    for (const cleanup of cleanups.splice(0).toReversed()) await cleanup();
+  });
+
+  async function connectDaemon(options: {
+    autoPong: boolean;
+    sessionProtocol: "legacy" | "session-v1";
+  }) {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout"] });
+    const now = new Date();
+    const daemon: DaemonRecord = {
+      id: randomUUID(),
+      slug: "heartbeat-daemon",
+      machineId: randomUUID(),
+      serverId: randomUUID(),
+      daemonPublicKey: "public-key",
+      credentialVerifier: "verifier",
+      permissions: ["hub.execute"],
+      registeredByApiKeyId: null,
+      registeredByCliCredentialId: null,
+      status: "active",
+      presence: "offline",
+      connectedAt: null,
+      disconnectedAt: null,
+      lastSeenAt: now,
+      createdAt: now,
+    };
+    const stream = new FailureLogStream();
+    const presence: string[] = [];
+    const registry = new ActiveDaemonRegistry(
+      {
+        touchDaemon: async () => undefined,
+        setDaemonPresence: async (_id, value) => {
+          presence.push(value);
+        },
+      },
+      undefined,
+      createLogger(stream),
+    );
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    cleanups.push(async () => {
+      await registry.stop();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const address = server.address();
+    assert(address !== null && typeof address === "object");
+    const accepted = new Promise<WebSocket>((resolve) => server.once("connection", resolve));
+    const client = new WebSocket(`ws://127.0.0.1:${address.port}`, {
+      autoPong: options.autoPong,
+    });
+    cleanups.push(async () => {
+      client.terminate();
+    });
+    const pings: number[] = [];
+    client.on("ping", () => pings.push(pings.length));
+    client.on("message", (data: RawData) => {
+      if (!HubDaemonHelloSchema.safeParse(JSON.parse(rawDataToText(data))).success) return;
+      client.send(
+        JSON.stringify({
+          type: "session",
+          message: {
+            type: "status",
+            payload: { status: "server_info", serverId: "heartbeat", permissions: ["hub.execute"] },
+          },
+        }),
+      );
+    });
+    const clientClosed = new Promise<number>((resolve) => {
+      client.once("close", (code) => resolve(code));
+    });
+    await new Promise<void>((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    const socket = await accepted;
+    // vi.waitFor advances fake timers on every poll, which would move the heartbeat clock.
+    const ready = new Promise<void>((resolve) => registry.onConnected(() => resolve()));
+    registry.accept(daemon, socket, options.sessionProtocol);
+    await ready;
+    return { registry, daemon, client, socket, pings, presence, stream, clientClosed };
+  }
+
+  async function heartbeatAnswered(socket: WebSocket): Promise<void> {
+    const pong = once(socket, "pong");
+    await vi.advanceTimersByTimeAsync(30_000);
+    await pong;
+  }
+
+  function closeRecords(stream: FailureLogStream) {
+    return stream.records().filter((record) => record["operation"] === "daemon.socket.closed");
+  }
+
+  it("keeps an idle daemon connected past the proxy idle window", async () => {
+    const { registry, daemon, socket, pings, presence } = await connectDaemon({
+      autoPong: true,
+      sessionProtocol: "session-v1",
+    });
+
+    for (let interval = 0; interval < 10; interval += 1) await heartbeatAnswered(socket);
+
+    assert.equal(pings.length, 10);
+    assert.equal(socket.readyState, WebSocket.OPEN);
+    assert.notEqual(registry.connection(daemon.id), undefined);
+    assert.deepEqual(presence, ["connected"]);
+  });
+
+  it("keeps a legacy daemon that sends no keepalive of its own connected", async () => {
+    const { registry, daemon, client, socket, pings } = await connectDaemon({
+      autoPong: true,
+      sessionProtocol: "legacy",
+    });
+    let clientPings = 0;
+    socket.on("ping", () => {
+      clientPings += 1;
+    });
+
+    for (let interval = 0; interval < 10; interval += 1) await heartbeatAnswered(socket);
+
+    assert.equal(clientPings, 0);
+    assert.equal(pings.length, 10);
+    assert.equal(client.readyState, WebSocket.OPEN);
+    assert.notEqual(registry.connection(daemon.id), undefined);
+  });
+
+  it("terminates a daemon that stops answering pings after 90 seconds and logs the close", async () => {
+    const { registry, daemon, client, socket, pings, presence, stream, clientClosed } =
+      await connectDaemon({
+        autoPong: false,
+        sessionProtocol: "session-v1",
+      });
+
+    for (let interval = 0; interval < 2; interval += 1) {
+      const ping = once(client, "ping");
+      await vi.advanceTimersByTimeAsync(30_000);
+      await ping;
+    }
+    await vi.advanceTimersByTimeAsync(29_999);
+    assert.equal(socket.readyState, WebSocket.OPEN);
+    assert.equal(pings.length, 2);
+    assert.notEqual(registry.connection(daemon.id), undefined);
+
+    await vi.advanceTimersByTimeAsync(1);
+    assert.notEqual(socket.readyState, WebSocket.OPEN);
+    assert.equal(await clientClosed, 1006);
+    await vi.waitFor(() => assert.deepEqual(presence, ["connected", "offline"]));
+    assert.equal(registry.connection(daemon.id), undefined);
+    const [record, ...rest] = closeRecords(stream);
+    assert.deepEqual(rest, []);
+    assert.equal(record?.["level"], 40);
+    assert.equal(record["msg"], "daemon socket closed after missed heartbeat");
+    assert.equal(record["daemonId"], daemon.id);
+    assert.equal(record["closeCode"], 1006);
+    assert.equal(record["closeReason"], "");
+    assert.equal(typeof record["connectedMs"], "number");
+  });
+
+  it("measures the 90 seconds from the latest pong", async () => {
+    const { client, socket } = await connectDaemon({
+      autoPong: false,
+      sessionProtocol: "session-v1",
+    });
+    const ping = once(client, "ping");
+    await vi.advanceTimersByTimeAsync(30_000);
+    await ping;
+    await vi.advanceTimersByTimeAsync(5_000);
+    const pong = once(socket, "pong");
+    client.pong();
+    await pong;
+
+    await vi.advanceTimersByTimeAsync(89_999);
+    assert.equal(socket.readyState, WebSocket.OPEN);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.notEqual(socket.readyState, WebSocket.OPEN);
+  });
+
+  it("logs the close code of an ordinary disconnect without peer-supplied reason text", async () => {
+    const { client, stream } = await connectDaemon({
+      autoPong: true,
+      sessionProtocol: "session-v1",
+    });
+    const canary = "close-reason-secret-41c7";
+
+    client.close(4000, canary);
+    await vi.waitFor(() => assert.equal(closeRecords(stream).length, 1));
+
+    const [record] = closeRecords(stream);
+    assert.equal(record?.["level"], 30);
+    assert.equal(record["msg"], "daemon socket closed");
+    assert.equal(record["closeCode"], 4000);
+    assert.equal(record["closeReason"], "unrecognized");
+    assert.equal(stream.text().includes(canary), false);
+  });
+
+  it("logs the reason Hub gave when it replaces a daemon socket", async () => {
+    const { registry, daemon, socket, stream } = await connectDaemon({
+      autoPong: true,
+      sessionProtocol: "legacy",
+    });
+
+    registry.accept(daemon, unopenedReplacement(), "legacy");
+    await once(socket, "close");
+
+    const [record] = closeRecords(stream);
+    assert.equal(record?.["closeCode"], 4001);
+    assert.equal(record["closeReason"], "replaced");
+  });
+
+  function unopenedReplacement(): WebSocket {
+    const replacement = z
+      .instanceof(WebSocket)
+      .parse(Reflect.construct(WebSocket, [null, undefined, { autoPong: true }]));
+    vi.spyOn(replacement, "close").mockImplementation(() => {
+      replacement.emit("close", 1001, Buffer.alloc(0));
+    });
+    return replacement;
+  }
 });

@@ -1,12 +1,15 @@
 import { createDatabase } from "../pg.js";
 import { postgresDatabaseRuntime } from "../runtime/index.js";
-import type { DatabaseRuntimeBundle } from "../runtime/index.js";
+import type { DatabaseRuntimeBundle, PostgresPoolOptions } from "../runtime/index.js";
 import type { Database } from "../types.js";
 
 const testRuntimes = new WeakMap<Database, DatabaseRuntimeBundle>();
 
-export async function createPostgresTestRuntime(connectionString: string) {
-  const bundle = await postgresDatabaseRuntime(connectionString);
+export async function createPostgresTestRuntime(
+  connectionString: string,
+  poolOptions?: PostgresPoolOptions,
+) {
+  const bundle = await postgresDatabaseRuntime(connectionString, poolOptions);
   try {
     await bundle.runtime.migrate();
     return { ...bundle, database: createDatabase(bundle.runtime, bundle.locks) };
@@ -16,8 +19,11 @@ export async function createPostgresTestRuntime(connectionString: string) {
   }
 }
 
-export async function createPostgresTestDatabase(connectionString: string) {
-  const composed = await createPostgresTestRuntime(connectionString);
+export async function createPostgresTestDatabase(
+  connectionString: string,
+  poolOptions?: PostgresPoolOptions,
+) {
+  const composed = await createPostgresTestRuntime(connectionString, poolOptions);
   testRuntimes.set(composed.database, composed);
   return composed.database;
 }

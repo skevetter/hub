@@ -477,6 +477,8 @@ run:
         appId: "123",
         privateKey: privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
         now: () => now.getTime(),
+        // Retry backoff and the one second write spacing are real-time waits this test does not exercise.
+        octokitPlugins: { retry: false, throttle: false },
         fetch: async (input, init) => {
           const path = new URL(input instanceof Request ? input.url : input).pathname;
           const method = init?.method ?? "GET";

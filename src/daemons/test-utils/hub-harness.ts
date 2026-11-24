@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import type { Server } from "node:http";
-import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { createStartHandler, defaultStreamHandler } from "@tanstack/react-start/server";
 import { dump } from "js-yaml";
 import { WebSocket, type RawData } from "ws";
@@ -23,7 +23,8 @@ import {
   hashAgentExecutionCompletionToken,
 } from "../../agent-executions/completion-token.js";
 import { createDatabase, testDatabaseRuntime } from "../../db/test-utils/runtime.js";
-import { isolatedPostgresDatabase } from "../../db/test-utils/isolated-postgres.js";
+import { startDaemonTestPostgres } from "./postgres-container.js";
+import { clonedPostgresDatabase } from "../../db/test-utils/isolated-postgres.js";
 import type { ApiKeyScope } from "../../auth/api-key-contract.js";
 import type { OperationAuthenticator } from "../../auth/operation-auth.js";
 import type {
@@ -63,6 +64,9 @@ import type { HubBundleFile } from "../../config/bundle.js";
 import { RunStream } from "../../run-stream/index.js";
 import { readRunProgressSettings } from "../../run-progress/settings.js";
 
+// Connection setup to a shared container stalls for seconds when parallel suites saturate the
+// machine; production keeps its own acquire limit.
+const HARNESS_POOL_OPTIONS = { acquireTimeoutMs: 15_000 } as const;
 const HUB_ORGANIZATION_ID = "org_1";
 const HUB_PROJECT_ID = "00000000-0000-4000-8000-000000000001";
 const HUB_PROJECT_SLUG = "default";
@@ -181,7 +185,7 @@ type FakeAgentRequest = z.infer<typeof ExecutionSessionRequestSchema>["message"]
 
 export class HubHarness {
   private postgres: StartedPostgreSqlContainer | undefined;
-  private isolatedDatabase: ReturnType<typeof isolatedPostgresDatabase> | undefined;
+  private isolatedDatabase: Awaited<ReturnType<typeof clonedPostgresDatabase>> | undefined;
   private database: Database | undefined;
   private readonly entitlements = createUnlimitedEntitlementsService();
   private server: Server | undefined;
@@ -269,12 +273,18 @@ export class HubHarness {
 
   static async startupFailureRollsBack(): Promise<boolean> {
     const harness = new HubHarness();
+    const interrupted = new Error("startup interrupted");
     try {
-      harness.postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
-      harness.database = await createDatabase(harness.postgres.getConnectionUri());
-      throw new Error("startup interrupted");
-    } catch {
+      harness.postgres = await startDaemonTestPostgres();
+      harness.database = await createDatabase(
+        harness.postgres.getConnectionUri(),
+        HARNESS_POOL_OPTIONS,
+      );
+      throw interrupted;
+    } catch (error) {
       await harness.stop();
+      // A setup failure leaves nothing to roll back, so it must not count as a passing rollback.
+      if (error !== interrupted) throw error;
       return harness.postgres === undefined && harness.database === undefined;
     }
   }
@@ -1721,13 +1731,13 @@ export class HubHarness {
   private async startResources(postgres?: StartedPostgreSqlContainer): Promise<void> {
     let databaseUrl: string;
     if (postgres) {
-      this.isolatedDatabase = isolatedPostgresDatabase(postgres.getConnectionUri());
+      this.isolatedDatabase = await clonedPostgresDatabase(postgres);
       databaseUrl = this.isolatedDatabase.url;
     } else {
-      this.postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
+      this.postgres = await startDaemonTestPostgres();
       databaseUrl = this.postgres.getConnectionUri();
     }
-    this.database = await createDatabase(databaseUrl);
+    this.database = await createDatabase(databaseUrl, HARNESS_POOL_OPTIONS);
     await this.seedProject(this.database);
     await this.seedDaemon(this.database);
     await this.seedConfiguration(this.database);
@@ -3127,10 +3137,16 @@ function machineHeaders(auth: "valid" | "missing" | "wrong"): Record<string, str
   return {};
 }
 
+// A wall-clock budget instead of an attempt count: under load each observation is a slow
+// database read, so a fixed number of polls ends long before Hub settles.
+const WAIT_FOR_HUB_STATE_MS = 15_000;
+
 async function waitFor(observation: () => Promise<boolean>): Promise<void> {
-  for (let attempt = 0; attempt < 300; attempt += 1) {
+  const deadline = performance.now() + WAIT_FOR_HUB_STATE_MS;
+  while (performance.now() < deadline) {
     if (await observation()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  if (await observation()) return;
   throw new Error("Timed out waiting for Hub state");
 }
