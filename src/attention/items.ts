@@ -8,7 +8,11 @@ import type {
 } from "../db/types.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
-import { DROP_REASON_GROUPS, type DropReasonGroup } from "../triggers/drop-reason.js";
+import {
+  DROP_REASON_GROUPS,
+  DROP_REASON_LABELS,
+  type DropReasonGroup,
+} from "../triggers/drop-reason.js";
 import { LIST_PROVIDER_LABELS } from "../triggers/list-providers.js";
 import { FAILED_RUN_FILTER } from "../triggers/run-status.js";
 import type { AttentionItem } from "./contract.js";
@@ -48,10 +52,10 @@ export function deriveAttention(input: AttentionInputs): AttentionItem[] {
   return [
     ...connectionItems(input, base),
     ...daemonItems(input, base),
-    ...droppedItems(input.dropped, base),
     ...runItems(input, base),
     ...stoppedTriggerItems(input.triggerMatches, base),
     ...sessionItems(input.sessions, base),
+    ...droppedItems(input.dropped, base),
   ];
 }
 
@@ -108,37 +112,35 @@ function daemonItems(
   ];
 }
 
-const DROP_NOTICE_TITLES: Record<DropReasonGroup, string> = {
-  routing: "Events arrived without a route or matching trigger",
-  trigger_filters_rejected: "Trigger filters rejected events",
-  configuration_unavailable: "Events arrived while configuration was unavailable",
-  unsupported_event: "Linear sent unsupported events",
-  other: "Hub dropped events for other reasons",
-};
-
 function droppedItems(dropped: AttentionInputs["dropped"], base: string): AttentionItem[] {
-  const capped = dropped.reduce((total, { count }) => total + count, 0) >= RECENT_DROP_COUNT_LIMIT;
-  return DROP_REASON_GROUPS.flatMap((reason): AttentionItem[] => {
-    const group = dropped.filter((entry) => entry.reason === reason);
-    if (group.length === 0) return [];
-    const total = group.reduce((sum, { count }) => sum + count, 0);
-    const sources = group
-      .map(({ provider, count }) => `${String(count)} from ${LIST_PROVIDER_LABELS[provider]}`)
-      .join(", ");
-    return [
-      {
-        id: `dropped:${reason}`,
-        source: "dropped",
-        title: DROP_NOTICE_TITLES[reason],
-        detail: `${capped ? "At least " : ""}${String(total)} ${total === 1 ? "event" : "events"} in the last ${String(ATTENTION_WINDOW_DAYS)} days (${sources}).`,
-        action: {
-          label: "View dropped events",
-          to: `${base}/activity`,
-          search: { view: "dropped", reason, range: "7d" },
-        },
-      },
-    ];
+  const counts = new Map<DropReasonGroup, number>();
+  let total = 0;
+  for (const { count, reason } of dropped) {
+    total += count;
+    counts.set(reason, (counts.get(reason) ?? 0) + count);
+  }
+  if (total === 0) return [];
+  const detail = DROP_REASON_GROUPS.flatMap((reason) => {
+    const count = counts.get(reason);
+    return count === undefined
+      ? []
+      : [`${count.toLocaleString("en")} ${DROP_REASON_LABELS[reason].toLowerCase()}`];
   });
+  const prefix = total >= RECENT_DROP_COUNT_LIMIT ? "At least " : "";
+  return [
+    {
+      id: "dropped",
+      source: "dropped",
+      quiet: true,
+      title: `${prefix}${eventCount(total)} dropped in the last 7 days`,
+      detail: `${detail.join(", ")}.`,
+      action: {
+        label: "View dropped events",
+        to: `${base}/activity`,
+        search: { view: "dropped", range: "7d" },
+      },
+    },
+  ];
 }
 
 function stoppedTriggerItems(triggers: AttentionInputs["triggerMatches"], base: string) {

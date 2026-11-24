@@ -2,6 +2,7 @@ import { Link, type AnyRouter } from "@tanstack/react-router";
 import { useCallback } from "react";
 import { AttentionRow, AttentionRowsSkeleton } from "../components/app/attention-row.js";
 import { Button } from "../components/ui/button.js";
+import { actionableAttentionItems } from "./client-state.js";
 import type { AttentionItem } from "./contract.js";
 import type { useAttention } from "./use-attention.js";
 
@@ -35,7 +36,44 @@ export function AttentionPanel({
     );
   }
   const { items } = snapshot.data;
-  if (items.length === 0) return <p className="py-3 text-muted-foreground">Nothing needs you.</p>;
+  const actionable = actionableAttentionItems(items);
+  const information = items.filter(({ quiet }) => quiet === true);
+  return (
+    <>
+      {actionable.length === 0 ? (
+        <p className="py-3 text-muted-foreground">Nothing needs you.</p>
+      ) : (
+        <ActionableAttention
+          items={actionable}
+          onFollow={onFollow}
+          markSeenPending={markSeenPending}
+          markFailedRunsSeen={markFailedRunsSeen}
+        />
+      )}
+      {information.length === 0 ? null : (
+        <section aria-label="For information" className="border-t border-border pt-3">
+          <h3 className="pb-2 text-muted-foreground">For information</h3>
+          <ul>
+            {information.map((item) => (
+              <AttentionRow key={item.id} quiet title={item.title} detail={item.detail}>
+                <AttentionAction item={item} items={items} onFollow={onFollow} />
+              </AttentionRow>
+            ))}
+          </ul>
+        </section>
+      )}
+    </>
+  );
+}
+
+function ActionableAttention({
+  items,
+  markFailedRunsSeen,
+  markSeenPending,
+  onFollow,
+}: Pick<AttentionPanelProps, "markFailedRunsSeen" | "markSeenPending" | "onFollow"> & {
+  items: readonly AttentionItem[];
+}) {
   return (
     <ul>
       {items.map((item) => (

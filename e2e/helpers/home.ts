@@ -1,7 +1,7 @@
 import { expect, type Locator, type Page } from "@playwright/test";
-import { attentionDialog } from "./attention.js";
+import { openAttention } from "./attention.js";
 
-const ROUTING_ATTENTION_TITLE = "Events arrived without a route or matching trigger";
+const ROUTING_ATTENTION_TITLE = "2 events dropped in the last 7 days";
 
 export type ChecklistStepTitle =
   | "Connect an app"
@@ -73,17 +73,15 @@ export class OrganizationHome {
 
   async openRoutingAttention() {
     await expect(this.page.getByRole("main").getByText(ROUTING_ATTENTION_TITLE)).toHaveCount(0);
-    await this.page.getByRole("button", { name: /^Attention, \d+ items?$/u }).click();
-    return attentionDialog(this.page).getByRole("listitem").filter({
-      hasText: ROUTING_ATTENTION_TITLE,
-    });
+    const dialog = await openAttention(this.page, 0);
+    return dialog.getByRole("region", { name: "For information" }).getByRole("listitem");
   }
 
   async followRoutingAttention(item: Locator) {
-    const link = item.getByRole("link", { name: /^View dropped events(?:$|:)/u });
+    const link = item.getByRole("link", { name: "View dropped events", exact: true });
     await expect(link).toBeVisible();
     await link.click();
-    await expect(this.page).toHaveURL(/[?&]reason=routing/u);
+    await expect(this.page).toHaveURL(/[?&]view=dropped/u);
     await this.page
       .getByRole("table", { name: "Dropped events" })
       .getByRole("link", { name: "Create one", exact: true })

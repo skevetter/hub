@@ -12,23 +12,33 @@ export function AttentionMark() {
 export function AttentionRow({
   title,
   detail,
+  quiet,
   children,
 }: {
   title: string;
   detail: string;
+  quiet?: true;
   children: ReactNode;
 }) {
   return (
-    <li className={ROW_CLASS}>
-      <div className="pt-1.5 flex">
-        <AttentionMark />
-      </div>
+    <li
+      className={
+        quiet === true
+          ? "grid items-start gap-x-3 gap-y-1 pb-3 md:grid-cols-[minmax(0,1fr)_auto]"
+          : ROW_CLASS
+      }
+    >
+      {quiet === true ? null : (
+        <div className="pt-1.5 flex">
+          <AttentionMark />
+        </div>
+      )}
       <div className="grid gap-1 wrap-anywhere">
-        <p className="font-strong">{title}</p>
+        <p className={quiet === true ? "text-muted-foreground" : "font-strong"}>{title}</p>
         <p className="text-pretty text-muted-foreground">{detail}</p>
       </div>
       <div
-        className={`${ACTION_CLASS} flex flex-wrap items-center gap-x-4 gap-y-1 md:flex-col md:items-end`}
+        className={`${quiet === true ? "" : ACTION_CLASS} flex flex-wrap items-center gap-x-4 gap-y-1 md:flex-col md:items-end`}
       >
         {children}
       </div>

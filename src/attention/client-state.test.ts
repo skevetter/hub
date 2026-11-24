@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { attentionLabel, withoutFailedRuns } from "./client-state.js";
+import { actionableAttentionItems, attentionLabel, withoutFailedRuns } from "./client-state.js";
 import type { AttentionItem } from "./contract.js";
 
 test.each([
@@ -26,9 +26,21 @@ test("optimistic dismissal only removes failed runs without changing the origina
     action: { label: "Review runs", to: "/o/acme/activity", search: { status: "failed" } },
     dismiss: { label: "Mark seen" },
   };
+  const dropped: AttentionItem = {
+    id: "dropped",
+    source: "dropped",
+    quiet: true,
+    title: "1 event dropped in the last 7 days",
+    detail: "1 missing route or trigger.",
+    action: { label: "View dropped events", to: "/o/acme/activity" },
+  };
   const generatedAt = "2026-01-01T00:00:00.000Z";
-  const snapshot = { items: [failed, connection], generatedAt };
+  const snapshot = { items: [failed, connection, dropped], generatedAt };
 
-  expect(withoutFailedRuns(snapshot)).toEqual({ items: [connection], generatedAt });
-  expect(snapshot.items).toEqual([failed, connection]);
+  expect(actionableAttentionItems([dropped])).toEqual([]);
+  expect(attentionLabel(actionableAttentionItems(snapshot.items).length)).toBe(
+    "Attention, 2 items",
+  );
+  expect(withoutFailedRuns(snapshot)).toEqual({ items: [connection, dropped], generatedAt });
+  expect(snapshot.items).toEqual([failed, connection, dropped]);
 });

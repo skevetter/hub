@@ -95,25 +95,44 @@ it("lists actionable sources in fixed order with Home copy and tenant links", ()
   expect(items.map(({ id }) => id)).toEqual([
     "connection:github",
     "daemons",
-    "dropped:routing",
-    "dropped:unsupported_event",
     "runs:failed",
     "sessions:permission",
+    "dropped",
   ]);
   expect(items.every(({ action }) => action.to.startsWith("/o/team/"))).toBe(true);
   expect(items[1]?.detail).toBe(
     "workstation is not connected. Reconnect a daemon to run work configured for it.",
   );
-  expect(items[3]?.detail).toBe("At least 1 event in the last 7 days (1 from Linear).");
-  expect(items[4]).toMatchObject({
+  expect(items[2]).toMatchObject({
     title: "2 runs failed",
     detail: "Newest: Build, 2 minutes ago.",
     dismiss: { label: "Mark seen" },
   });
-  expect(items[5]).toMatchObject({
+  expect(items[3]).toMatchObject({
     title: "2 sessions wait for permission",
     detail: "Newest session",
   });
+  expect(items[4]).toEqual({
+    id: "dropped",
+    source: "dropped",
+    quiet: true,
+    title: "At least 2,500 events dropped in the last 7 days",
+    detail: "2,499 missing route or trigger, 1 unsupported event.",
+    action: {
+      label: "View dropped events",
+      to: "/o/team/activity",
+      search: { view: "dropped", range: "7d" },
+    },
+  });
+});
+
+it("reports a single dropped event as quiet information", () => {
+  const items = deriveAttention({
+    ...empty,
+    dropped: [{ count: 1, provider: "github", reason: "routing" }],
+  });
+  expect(items).toHaveLength(1);
+  expect(items[0]).toMatchObject({ quiet: true, title: "1 event dropped in the last 7 days" });
 });
 
 const matching = {

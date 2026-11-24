@@ -83,7 +83,7 @@ export function PhoneNavigation({
 
 function PhoneAttention() {
   const attention = useAttention();
-  const count = attention.snapshot.data?.items.length ?? 0;
+  const { count } = attention;
   const [open, setOpen] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
   const close = useCallback(() => setOpen(false), []);

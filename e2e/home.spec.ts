@@ -70,8 +70,8 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await hub.deliverUnroutedGitHubEvent("home-unrouted-2");
     await home.reload();
     const item = await home.openRoutingAttention();
-    await expect(item).toContainText("2 events in the last 7 days");
-    await expect(item).toContainText("2 from GitHub");
+    await expect(item).toContainText("2 events dropped in the last 7 days");
+    await expect(item).toContainText("2 missing route or trigger");
     await page.screenshot({ path: `${SHOTS}/03-unrouted-attention.png` });
     await home.followRoutingAttention(item);
   });

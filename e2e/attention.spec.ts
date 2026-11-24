@@ -192,21 +192,34 @@ test.describe("Attention behavior", () => {
     await expect(dialog.getByText(CONNECTION_TITLE)).toBeVisible();
   });
 
-  test("groups dropped events in order and qualifies counts at the cap", async ({ hub, page }) => {
+  test("shows quiet dropped events below actionable items and qualifies the cap", async ({
+    hub,
+    page,
+    isMobile,
+  }) => {
     const app = hub.primaryApplication();
     await seedDroppedEvents(app);
     await page.reload();
-    const dialog = await openAttention(page, 4);
-    await expectDroppedRows(dialog, false);
+    const dialog = await openAttention(page, 0);
+    await expectDroppedRow(dialog, false);
+    await expect(dialog.getByText("Nothing needs you.")).toBeVisible();
+    await expect(attentionEntry(page, 0)).toBeVisible();
+    await expect(attentionEntry(page, 0).locator(".bg-attention")).toHaveCount(0);
+
     await insertLastDroppedEvent(app);
+    await hub.seedSuspendedGitHubConnection(ORGANIZATION);
     await page.reload();
-    await openAttention(page, 4);
-    await expectDroppedRows(dialog, true);
-    await dialog.getByRole("link", { name: /^View dropped events: Events arrived/u }).click();
+    await openAttention(page, 1);
+    await expect(dialog.getByRole("listitem").first()).toContainText(CONNECTION_TITLE);
+    await expect(dialog.getByText("Nothing needs you.")).toHaveCount(0);
+    await expectDroppedRow(dialog, true);
+    const surface = isMobile ? "sheet" : "popover";
+    await checkAttentionThemes(page, `[data-slot="${surface}-content"]`, `${surface}-information`);
+
+    await dialog.getByRole("link", { name: "View dropped events", exact: true }).click();
     await expect(page).toHaveURL(/\/activity\?/u);
-    expect(Object.fromEntries(new URL(page.url()).searchParams)).toMatchObject({
+    expect(Object.fromEntries(new URL(page.url()).searchParams)).toEqual({
       view: "dropped",
-      reason: "routing",
       range: "7d",
     });
     await expect(page.getByRole("table", { name: "Dropped events" })).toBeVisible();
@@ -343,26 +356,19 @@ function insertLastDroppedEvent(app: BuiltApplication) {
   );
 }
 
-async function expectDroppedRows(dialog: Locator, capped: boolean) {
-  const rows = dialog.getByRole("listitem");
-  const prefix = capped ? "At least " : "";
-  const title = [
-    "Events arrived without a route or matching trigger",
-    "Trigger filters rejected events",
-    "Linear sent unsupported events",
-    "Hub dropped events for other reasons",
-  ];
-  const detail = [
-    `${prefix}2461 events in the last 7 days (2415 from GitHub, 46 from Linear).`,
-    `${prefix}26 events in the last 7 days (26 from Linear).`,
-    `${prefix}1 event in the last 7 days (1 from Linear).`,
-    `${prefix}${capped ? 12 : 11} events in the last 7 days (${capped ? 12 : 11} from Linear).`,
-  ];
-  await expect(rows).toHaveCount(title.length);
-  for (const [index, name] of title.entries()) {
-    await expect(rows.nth(index).getByText(name, { exact: true })).toBeVisible();
-    await expect(rows.nth(index).getByText(detail[index] ?? "", { exact: true })).toBeVisible();
-  }
+async function expectDroppedRow(dialog: Locator, capped: boolean) {
+  const information = dialog.getByRole("region", { name: "For information" });
+  const row = information.getByRole("listitem");
+  const title = capped ? "At least 2,500" : "2,499";
+  const other = capped ? 12 : 11;
+  await expect(information.getByRole("heading", { name: "For information" })).toBeVisible();
+  await expect(row).toHaveCount(1);
+  await expect(row).toContainText(`${title} events dropped in the last 7 days`);
+  await expect(row).toContainText(
+    `2,461 missing route or trigger, 26 trigger filters rejected, 1 unsupported event, ${other} other reasons.`,
+  );
+  await expect(row.locator(".bg-attention")).toHaveCount(0);
+  await expect(row.getByRole("button", { name: "Mark seen" })).toHaveCount(0);
 }
 
 async function switchFromMore(page: Page, more: Locator, name: string) {
@@ -396,7 +402,7 @@ async function expectSheetFit(sheet: Locator) {
   ).toBeGreaterThanOrEqual(44);
 }
 
-async function checkAttentionThemes(page: Page, selector: string, surface: "desktop" | "phone") {
+async function checkAttentionThemes(page: Page, selector: string, surface: string) {
   const output = process.env["HUB_ATTENTION_SCREEN_DIR"];
   for (const colorScheme of ["light", "dark"] as const) {
     await page.emulateMedia({ colorScheme, reducedMotion: "reduce" });

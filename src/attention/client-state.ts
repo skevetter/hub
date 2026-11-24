@@ -1,4 +1,8 @@
-import type { AttentionSnapshot } from "./contract.js";
+import type { AttentionItem, AttentionSnapshot } from "./contract.js";
+
+export function actionableAttentionItems(items: readonly AttentionItem[]): AttentionItem[] {
+  return items.filter(({ quiet }) => quiet !== true);
+}
 
 export function attentionLabel(count: number): string {
   if (count === 0) return "Attention";

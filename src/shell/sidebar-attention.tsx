@@ -16,7 +16,7 @@ function AttentionPopover() {
   const headingId = useId();
   const heading = useRef<HTMLHeadingElement>(null);
   const [open, setOpen] = useState(false);
-  const count = attention.snapshot.data?.items.length ?? 0;
+  const { count } = attention;
   const close = useCallback(() => setOpen(false), []);
   const focusHeading = useCallback((event: Event) => {
     event.preventDefault();

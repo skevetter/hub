@@ -3,7 +3,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { toast } from "../components/app/toast-store.js";
 import { useOptionalRouteTenant } from "../projects/route-tenant-context.js";
 import { useSnapshotQuery } from "../queries/index.js";
-import { withoutFailedRuns } from "./client-state.js";
+import { actionableAttentionItems, withoutFailedRuns } from "./client-state.js";
 import type { AttentionSnapshot } from "./contract.js";
 import { attentionSnapshot, markFailedRunsSeen } from "./functions.js";
 
@@ -32,6 +32,7 @@ export function useAttention() {
   const markSeen = useMarkFailedRunsSeen();
   return {
     snapshot,
+    count: actionableAttentionItems(snapshot.data?.items ?? []).length,
     markSeenPending: markSeen.isPending,
     markFailedRunsSeen: () => {
       if (organizationSlug !== undefined) markSeen.mutate({ organizationSlug, queryKey });
