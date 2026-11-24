@@ -113,6 +113,12 @@ See the [self-hosting guide](https://paseo.sh/docs/hub/self-hosting) for product
 For Linear setup and workflows, see the public [Linear app](https://paseo.sh/docs/hub/self-hosting/linear-app) and [Linear triggers](https://paseo.sh/docs/hub/triggers/linear) guides.
 For this fork's agent scopes, delegation behavior and reauthorization requirements, see [Linear agents](docs/linear-agents.md).
 
+## One Hub process per database
+
+Run one Hub process for each database, with PostgreSQL or embedded storage. Two processes on one database are not supported. Workflow wakeups and script runs have no ownership fence between processes, so a second process can redeliver a wakeup or mark a running script as orphaned.
+
+A deploy must stop the old process before it starts the new one. Do not run old and new side by side, and do not add replicas. A systemd unit with `Type=simple` and `systemctl restart` does this.
+
 ## Stop and restart
 
 On SIGTERM or SIGINT, Hub stops accepting connections and new upgrades. Requests arriving
