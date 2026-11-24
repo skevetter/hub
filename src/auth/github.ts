@@ -29,7 +29,7 @@ const InstallationTokenResponseSchema = z
     token: z.string(),
     expires_at: z.string(),
   })
-  .passthrough();
+  .loose();
 const GitHubAppBotIdentitySchema = z.object({ id: z.number().int().positive(), login: z.string() });
 
 interface ProgressOctokitOptions {
@@ -61,15 +61,41 @@ interface CreateGitHubAuthOptions {
   privateKey: string;
   fetch?: typeof fetch;
   now?: () => number;
+  /** Octokit's own retry and write throttling stay on unless a caller turns them off. */
+  octokitPlugins?: { retry?: boolean; throttle?: boolean };
 }
 
 export function createGitHubAuth(options: CreateGitHubAuthOptions): GitHubAuth {
-  const installationTokenCache = new Map<number, InstallationTokenCacheEntry>();
-  const appBotIdentityCache = new Map<string, Promise<GitHubAppBotIdentity>>();
-  const now = options.now ?? Date.now;
+  const client = new GitHubAppClient(options);
+  return {
+    getInstallation: (installationId) => client.getInstallation(installationId),
+    getInstallationToken: (installationId) => client.getInstallationToken(installationId),
+    mintInstallationToken: (installationId) => client.mintInstallationToken(installationId),
+    mintInstallationAccessToken: (input) => client.mintInstallationAccessToken(input),
+    getAppBotIdentity: (appSlug, installationToken) =>
+      client.getAppBotIdentity(appSlug, installationToken),
+    revokeInstallationToken: (token) => client.revokeInstallationToken(token),
+    createInstallationOctokit: (installationId, progress) =>
+      client.createInstallationOctokit(installationId, progress),
+  };
+}
 
-  async function getInstallation(installationId: number): Promise<GitHubInstallation | undefined> {
-    const octokit = await getAppOctokit();
+interface TokenRestrictions {
+  repositories: readonly string[];
+  permissions: Readonly<Record<string, GitHubAppPermissionLevel>>;
+}
+
+class GitHubAppClient {
+  private readonly installationTokenCache = new Map<number, InstallationTokenCacheEntry>();
+  private readonly appBotIdentityCache = new Map<string, Promise<GitHubAppBotIdentity>>();
+  private readonly now: () => number;
+
+  constructor(private readonly options: CreateGitHubAuthOptions) {
+    this.now = options.now ?? Date.now;
+  }
+
+  async getInstallation(installationId: number): Promise<GitHubInstallation | undefined> {
+    const octokit = await this.getAppOctokit();
     try {
       const response = await octokit.request("GET /app/installations/{installation_id}", {
         installation_id: installationId,
@@ -81,21 +107,21 @@ export function createGitHubAuth(options: CreateGitHubAuthOptions): GitHubAuth {
     }
   }
 
-  async function getInstallationToken(
+  async getInstallationToken(
     installationId: number,
     progress?: ProgressOctokitOptions,
   ): Promise<string> {
     progress?.signal?.throwIfAborted();
-    const cachedEntry = installationTokenCache.get(installationId);
+    const cachedEntry = this.installationTokenCache.get(installationId);
     const refreshWindowMs = 60_000;
 
-    if (cachedEntry !== undefined && cachedEntry.expiresAt - refreshWindowMs > now()) {
+    if (cachedEntry !== undefined && cachedEntry.expiresAt - refreshWindowMs > this.now()) {
       return cachedEntry.token;
     }
 
-    const data = await requestInstallationToken(installationId, undefined, progress);
+    const data = await this.requestInstallationToken(installationId, undefined, progress);
 
-    installationTokenCache.set(installationId, {
+    this.installationTokenCache.set(installationId, {
       token: data.token,
       expiresAt: new Date(data.expires_at).getTime(),
     });
@@ -106,21 +132,19 @@ export function createGitHubAuth(options: CreateGitHubAuthOptions): GitHubAuth {
     return data.token;
   }
 
-  async function mintInstallationToken(
-    installationId: number,
-  ): Promise<GitHubInstallationAccessToken> {
-    const data = await requestInstallationToken(installationId);
+  async mintInstallationToken(installationId: number): Promise<GitHubInstallationAccessToken> {
+    const data = await this.requestInstallationToken(installationId);
     logger.debug({ installationId, expiresAt: data.expires_at }, "minted installation token");
     return { token: data.token, expiresAt: new Date(data.expires_at).getTime() };
   }
 
-  async function mintInstallationAccessToken(input: {
+  async mintInstallationAccessToken(input: {
     installationId: number;
     accountLogin: string;
     repositories: readonly string[];
     permissions: Readonly<Record<string, GitHubAppPermissionLevel>>;
   }): Promise<GitHubInstallationAccessToken> {
-    const data = await requestInstallationToken(input.installationId, {
+    const data = await this.requestInstallationToken(input.installationId, {
       repositories: repositoryNamesForAccount(input.repositories, input.accountLogin),
       permissions: { ...input.permissions },
     });
@@ -131,51 +155,52 @@ export function createGitHubAuth(options: CreateGitHubAuthOptions): GitHubAuth {
     return { token: data.token, expiresAt: new Date(data.expires_at).getTime() };
   }
 
-  async function revokeInstallationToken(token: string): Promise<void> {
-    const octokit = new Octokit({
-      auth: token,
-      request: githubRequestOptions(options.fetch),
-    });
+  async revokeInstallationToken(token: string): Promise<void> {
+    const octokit = this.plainOctokit(token);
     await octokit.request("DELETE /installation/token", {
       headers: githubApiVersionHeader(),
     });
   }
 
-  async function getAppBotIdentity(
+  getAppBotIdentity(appSlug: string, installationToken: string): Promise<GitHubAppBotIdentity> {
+    const cached = this.appBotIdentityCache.get(appSlug);
+    if (cached !== undefined) return Promise.resolve(cached);
+    const pending = this.fetchAppBotIdentity(appSlug, installationToken);
+    this.appBotIdentityCache.set(appSlug, pending);
+    return pending.catch((error: unknown) => {
+      if (this.appBotIdentityCache.get(appSlug) === pending)
+        this.appBotIdentityCache.delete(appSlug);
+      throw error;
+    });
+  }
+
+  async createInstallationOctokit(
+    installationId: number,
+    progress?: ProgressOctokitOptions,
+  ): Promise<Octokit> {
+    const token = await this.getInstallationToken(installationId, progress);
+    progress?.signal?.throwIfAborted();
+    return this.authenticatedOctokit(token, progress);
+  }
+
+  private async fetchAppBotIdentity(
     appSlug: string,
     installationToken: string,
   ): Promise<GitHubAppBotIdentity> {
-    const cached = appBotIdentityCache.get(appSlug);
-    if (cached !== undefined) return cached;
-    const pending = (async () => {
-      const octokit = new Octokit({
-        auth: installationToken,
-        request: githubRequestOptions(options.fetch),
-      });
-      const response = await octokit.request("GET /users/{username}", {
-        username: `${appSlug}[bot]`,
-      });
-      return GitHubAppBotIdentitySchema.parse(response.data);
-    })();
-    appBotIdentityCache.set(appSlug, pending);
-    try {
-      return await pending;
-    } catch (error) {
-      if (appBotIdentityCache.get(appSlug) === pending) appBotIdentityCache.delete(appSlug);
-      throw error;
-    }
+    const octokit = this.plainOctokit(installationToken);
+    const response = await octokit.request("GET /users/{username}", {
+      username: `${appSlug}[bot]`,
+    });
+    return GitHubAppBotIdentitySchema.parse(response.data);
   }
 
-  async function requestInstallationToken(
+  private async requestInstallationToken(
     installationId: number,
-    restrictions?: {
-      repositories: readonly string[];
-      permissions: Readonly<Record<string, GitHubAppPermissionLevel>>;
-    },
+    restrictions?: TokenRestrictions,
     progress?: ProgressOctokitOptions,
   ) {
     progress?.signal?.throwIfAborted();
-    const octokit = await getAppOctokit(progress);
+    const octokit = await this.getAppOctokit(progress);
     progress?.signal?.throwIfAborted();
     await progress?.beforeTokenRequest?.();
     progress?.signal?.throwIfAborted();
@@ -184,68 +209,70 @@ export function createGitHubAuth(options: CreateGitHubAuthOptions): GitHubAuth {
       {
         installation_id: installationId,
         headers: githubApiVersionHeader(),
-        ...(progress?.signal === undefined ? {} : { request: { signal: progress.signal } }),
-        ...(restrictions === undefined
-          ? {}
-          : {
-              repositories: [...restrictions.repositories],
-              permissions: { ...restrictions.permissions },
-            }),
+        ...tokenRequestScope(restrictions, progress),
       },
     );
     return InstallationTokenResponseSchema.parse(response.data);
   }
 
-  async function createInstallationOctokit(
-    installationId: number,
-    progress?: ProgressOctokitOptions,
-  ): Promise<Octokit> {
-    const token = await getInstallationToken(installationId, progress);
-    progress?.signal?.throwIfAborted();
-    return authenticatedOctokit(token, progress);
+  private async getAppOctokit(progress?: ProgressOctokitOptions): Promise<Octokit> {
+    return this.authenticatedOctokit(await this.createAppJwt(), progress);
   }
 
-  async function getAppOctokit(progress?: ProgressOctokitOptions): Promise<Octokit> {
-    return authenticatedOctokit(await createAppJwt(), progress);
-  }
-
-  function authenticatedOctokit(auth: string, progress?: ProgressOctokitOptions): Octokit {
-    if (progress === undefined)
-      return new Octokit({ auth, request: githubRequestOptions(options.fetch) });
+  private plainOctokit(auth: string): Octokit {
     return new Octokit({
       auth,
-      request: { fetch: githubProgressFetch(options.fetch ?? fetch) },
+      request: githubRequestOptions(this.options.fetch),
+      ...pluginOverrides(this.options),
+    });
+  }
+
+  private authenticatedOctokit(auth: string, progress?: ProgressOctokitOptions): Octokit {
+    if (progress === undefined) return this.plainOctokit(auth);
+    return new Octokit({
+      auth,
+      request: { fetch: githubProgressFetch(this.options.fetch ?? fetch) },
       retry: { enabled: false },
       throttle: { enabled: false },
     });
   }
 
-  async function createAppJwt(): Promise<string> {
-    const appId = options.appId;
-    const privateKey = options.privateKey;
-    const nowSeconds = Math.floor(now() / 1000);
+  private async createAppJwt(): Promise<string> {
+    const nowSeconds = Math.floor(this.now() / 1000);
 
     return jwt.sign(
       {
         iat: nowSeconds - 60,
         exp: nowSeconds + 10 * 60,
-        iss: appId,
+        iss: this.options.appId,
       },
-      privateKey,
+      this.options.privateKey,
       {
         algorithm: "RS256",
       },
     );
   }
+}
 
+function tokenRequestScope(
+  restrictions: TokenRestrictions | undefined,
+  progress: ProgressOctokitOptions | undefined,
+) {
   return {
-    getInstallation,
-    getInstallationToken,
-    mintInstallationToken,
-    mintInstallationAccessToken,
-    getAppBotIdentity,
-    revokeInstallationToken,
-    createInstallationOctokit,
+    ...(progress?.signal === undefined ? {} : { request: { signal: progress.signal } }),
+    ...(restrictions === undefined
+      ? {}
+      : {
+          repositories: [...restrictions.repositories],
+          permissions: { ...restrictions.permissions },
+        }),
+  };
+}
+function pluginOverrides(options: CreateGitHubAuthOptions) {
+  const plugins = options.octokitPlugins;
+  return {
+    ...(plugins?.retry === false ? { retry: { enabled: false } } : {}),
+    ...(plugins?.throttle === false ? { throttle: { enabled: false } } : {}),
   };
 }
 
