@@ -2,7 +2,8 @@ import { z } from "zod";
 
 export const attentionItemSchema = z.object({
   id: z.string(),
-  source: z.enum(["connection", "daemons", "dropped", "runs", "sessions"]),
+  source: z.enum(["connection", "daemons", "dropped", "runs", "sessions", "trigger"]),
+  quiet: z.literal(true).optional(),
   title: z.string(),
   detail: z.string(),
   action: z.object({
