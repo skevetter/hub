@@ -278,11 +278,20 @@ const RETRY_POLICY = { retries: 1, doNotRetry: [400, 401, 403, 404, 410, 422, 42
 function failFastOnRateLimit(kind: "primary" | "secondary") {
   return (retryAfterSeconds: number, request: { method: string; url: string }): false => {
     logger.warn(
-      { kind, retryAfterSeconds, method: request.method, url: request.url },
+      { kind, retryAfterSeconds, method: request.method, route: routeShape(request.url) },
       "GitHub rate limit reached",
     );
     return false;
   };
+}
+
+// Keeps repository names and ids out of the log whether the URL is a template or resolved.
+function routeShape(url: string): string {
+  return url
+    .replace(/^https?:\/\/[^/]+/u, "")
+    .replace(/\?.*$/u, "")
+    .replace(/^\/repos\/[^/]+\/[^/]+/u, "/repos/:owner/:repo")
+    .replace(/\/\d+(?=\/|$)/gu, "/:id");
 }
 
 const THROTTLE_POLICY = {
@@ -290,14 +299,23 @@ const THROTTLE_POLICY = {
   onSecondaryRateLimit: failFastOnRateLimit("secondary"),
 };
 
-// A retried POST after a lost response would publish the comment twice.
-function refuseRetryOfCreateComment(options: { method: string; url: string; request: object }) {
-  if (`${options.method} ${options.url}` === CREATE_COMMENT_ROUTE) {
-    Object.assign(options.request, { retries: 0 });
-  }
+// Matches a route template and a resolved URL alike.
+const CREATE_COMMENT_PATH = /^\/repos\/[^/]+\/[^/]+\/issues\/[^/]+\/comments$/u;
+
+interface HookedRequest {
+  method: string;
+  url: string;
+  baseUrl?: string;
+  request: object;
 }
 
-const CREATE_COMMENT_ROUTE = "POST /repos/{owner}/{repo}/issues/{issue_number}/comments";
+// A retried POST after a lost response would publish the comment twice. The nested request
+// object can be shared with the client defaults, so it is replaced, never mutated.
+function refuseRetryOfCreateComment(options: HookedRequest) {
+  if (options.method.toUpperCase() !== "POST") return;
+  const { pathname } = new URL(options.url, options.baseUrl ?? "https://api.github.com");
+  if (CREATE_COMMENT_PATH.test(pathname)) options.request = { ...options.request, retries: 0 };
+}
 
 function pluginOverrides(options: CreateGitHubAuthOptions) {
   const plugins = options.octokitPlugins;

@@ -51,6 +51,36 @@ describe("GitHub client retry and throttle policy", () => {
     assert.deepEqual(requests, [{ method: "POST", path: "/repos/acme/app/issues/7/comments" }]);
   });
 
+  it("publishes a comment at most once when the endpoint is given as a resolved URL", async () => {
+    const { auth, requests } = harness(unavailable);
+    const octokit = await auth.createInstallationOctokit(142);
+
+    await assert.rejects(
+      octokit.request("POST /repos/acme/app/issues/7/comments", { body: "hello" }),
+    );
+
+    assert.equal(requests.length, 1);
+  });
+
+  it("keeps the retry setting of the client after a comment is created", async () => {
+    const { auth, requests } = harness(unavailable);
+    const octokit = await auth.createInstallationOctokit(142);
+
+    await assert.rejects(
+      octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
+        owner: "acme",
+        repo: "app",
+        issue_number: 7,
+        body: "hello",
+      }),
+    );
+    await assert.rejects(
+      octokit.request("GET /repos/{owner}/{repo}", { owner: "acme", repo: "app" }),
+    );
+
+    assert.equal(requests.length, 3);
+  });
+
   it("still retries a PATCH of a known comment", async () => {
     const { auth, requests } = harness(unavailable);
     const octokit = await auth.createInstallationOctokit(142);
@@ -132,6 +162,26 @@ describe("GitHub client retry and throttle policy", () => {
 
     assert.equal(requests.length, 1);
     assert.ok(performance.now() - startedAt < 2_000);
+  });
+
+  it("keeps spacing writes one second apart", async () => {
+    const { auth, requests } = harness(() => Response.json({}));
+    const octokit = await auth.createInstallationOctokit(142);
+    const startedAt = performance.now();
+
+    await Promise.all(
+      [1, 2].map((comment_id) =>
+        octokit.request("PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}", {
+          owner: "acme",
+          repo: "app",
+          comment_id,
+          body: "edited",
+        }),
+      ),
+    );
+
+    assert.equal(requests.length, 2);
+    assert.ok(performance.now() - startedAt >= 900);
   });
 
   it("keeps retry and throttling off for run progress clients", async () => {
