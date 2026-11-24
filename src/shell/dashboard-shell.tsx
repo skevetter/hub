@@ -166,7 +166,7 @@ function DashboardContent(props: DashboardContentProps) {
       </Sidebar>
       <SiteHeaderActionsProvider>
         <SidebarInset className="pb-[var(--shell-bottom-bar)] md:pb-0">
-          <PhoneHeader />
+          <PhoneHeader scope={organization.name} />
           <SiteHeader
             scope={organization.name}
             {...(tenant?.project == null ? {} : { project: tenant.project.name })}
