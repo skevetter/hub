@@ -8,7 +8,7 @@ test("unknown pages, APIs, and browser probes have intentional 404s without rout
 }) => {
   await openUnknownPage(hub, page);
   await expect(page.getByRole("heading", { name: "Page not found" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Return home" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Go home" })).toBeVisible();
 
   const api = await page.request.get(`${hub.primaryApplication().origin}/api/unknown-operation`);
   expect(api.status()).toBe(404);
