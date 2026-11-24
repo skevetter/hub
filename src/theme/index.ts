@@ -34,7 +34,7 @@ function subscribe(listener: () => void) {
 }
 
 function setChoice(choice: ThemeChoice): void {
-  document.cookie = themeCookie(choice);
+  document.cookie = themeCookie(choice, window.location.protocol === "https:");
   const resolved = resolveTheme(choice, window.matchMedia(DARK_QUERY).matches);
   const root = document.documentElement;
   root.classList.toggle("light", resolved === "light");

@@ -44,13 +44,17 @@ it("persists and applies a selection immediately", () => {
   const toggle = vi.fn();
   const document = { cookie: "", documentElement: { classList: { toggle } } };
   vi.stubGlobal("document", document);
-  vi.stubGlobal("window", { matchMedia: () => ({ matches: true }), dispatchEvent: vi.fn() });
+  vi.stubGlobal("window", {
+    location: { protocol: "https:" },
+    matchMedia: () => ({ matches: true }),
+    dispatchEvent: vi.fn(),
+  });
 
   renderToStaticMarkup(<ThemeSwitch />);
   expect(state.onChange).toBeTypeOf("function");
   state.onChange?.("light");
 
-  expect(document.cookie).toBe("theme=light; Path=/; Max-Age=31536000; SameSite=Lax");
+  expect(document.cookie).toBe("theme=light; Path=/; Max-Age=31536000; SameSite=Lax; Secure");
   expect(toggle.mock.calls).toEqual([
     ["light", true],
     ["dark", false],
