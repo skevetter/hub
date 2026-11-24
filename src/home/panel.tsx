@@ -26,7 +26,9 @@ import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
 import { SegmentedControl } from "../components/app/segmented-control.js";
 import { StatGrid, StatTile, StatTileSkeleton } from "../components/app/stat-tile.js";
-import { StatusPill, statusLabel, type StatusTone } from "../components/app/status-pill.js";
+import { StateBlock } from "../components/app/state-block.js";
+import { runState } from "../components/app/state-label.js";
+import { StatusPill, type StatusTone } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
@@ -211,10 +213,7 @@ function HomeRecentRuns({ data, base }: { data: HomeSnapshot; base: string }) {
       ) : (
         <RecordList label="Recent runs">
           {data.runs.slice(0, RECENT_RUNS_SHOWN).map((run) => (
-            <RecordRow
-              key={run.id}
-              status={<StatusPill tone={runTone(run.status)}>{statusLabel(run.status)}</StatusPill>}
-            >
+            <RecordRow key={run.id} lead={<StateBlock state={runState(run.status)} />}>
               <TwoLine
                 primary={run.triggerName}
                 secondary={
@@ -617,14 +616,16 @@ function GetStarted({
 interface StepPresentation {
   title: string;
   hint: ReactNode;
-  status: { label: string; tone: StatusTone };
+  status: { label: string; tone: StepTone };
   /** The one next action, when there is one the reader can press. */
   action?: ReactNode;
   /** A command to run somewhere else, when that is the next action. */
   command?: { label: string; value: string };
 }
 
-const STEP_STATES: Record<StatusTone, ChecklistItemState> = {
+type StepTone = Exclude<StatusTone, "live">;
+
+const STEP_STATES: Record<StepTone, ChecklistItemState> = {
   success: "done",
   neutral: "todo",
   warning: "attention",
@@ -941,12 +942,6 @@ function runSourceLabel(source: string): string {
 
 function runOutcomes({ succeeded, failed }: RunTally): string {
   return `${String(succeeded)} succeeded \u00b7 ${String(failed)} failed`;
-}
-
-function runTone(status: HomeSnapshot["runs"][number]["status"]): StatusTone {
-  if (status === "succeeded") return "success";
-  if (status === "failed" || status === "timed_out" || status === "rejected") return "danger";
-  return "neutral";
 }
 
 function triggerDetail(total: number, enabled: number): string {

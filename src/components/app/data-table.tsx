@@ -18,6 +18,11 @@ export interface DataColumn {
   fill?: boolean;
   /** Responsive visibility for the column, header and cells alike. */
   className?: string;
+  /**
+   * The column holds the row's `StateBlock`. A table that opens with one stacks each row on a
+   * phone: the block above the record, at its own width, never a column squeezed beside it.
+   */
+  lead?: boolean;
 }
 
 /** The columns of the table a cell is drawn in, and which of them the cell sits under. */
@@ -111,27 +116,37 @@ function TableShell({
   columns: readonly DataColumn[];
   children: ReactNode;
 }) {
+  const firstFill = columns.findIndex((column) => column.fill === true);
+  const stacked = columns[0]?.lead === true;
   return (
     // Every table is `tabular-nums`. A count, a limit, and a duration all sit in columns here,
     // and figuring out which cells hold digits is not a decision a caller should be making one
     // screen at a time. Proportional digits cost nothing on prose and misalign every column.
     <div className="min-w-0 overflow-hidden rounded-sm border bg-card">
-      <Table aria-label={label} className="tabular-nums">
-        <TableHeader>
-          <TableRow>
+      <Table
+        aria-label={label}
+        className={cn("tabular-nums", stacked && "max-sm:block")}
+        {...(stacked ? { role: "table" } : {})}
+      >
+        <TableHeader
+          {...(stacked ? { role: "rowgroup" } : {})}
+          className={cn(stacked && "max-sm:sr-only")}
+        >
+          <TableRow {...(stacked ? { role: "row" } : {})}>
             {columns.map((column, index) => (
               <TableHead
                 key={columnKey(column, index)}
+                {...(stacked ? { role: "columnheader" } : {})}
                 className={cn(
                   // A fitted column is a 1px request the browser widens to its widest value and
                   // never past it, so fitted columns stay next to each other on a wide screen.
                   // Filling columns share what is left by how much each holds, and give it back
                   // the same way when there is not enough. A floor keeps a filling column
                   // readable once there is room for one; on a phone there is not, and a table
-                  // that scrolls sideways is worse than a name that truncates. The first column
+                  // that scrolls sideways is worse than a name that truncates. The first filling column
                   // names the record, so its floor is higher: it is the last column a reader can
                   // afford to lose.
-                  column.fill === true && (index === 0 ? "sm:min-w-48" : "sm:min-w-32"),
+                  column.fill === true && (index === firstFill ? "sm:min-w-48" : "sm:min-w-32"),
                   column.fill !== true && "w-px",
                   column.align === "end" && "text-right",
                   column.className,
@@ -142,7 +157,10 @@ function TableShell({
             ))}
           </TableRow>
         </TableHeader>
-        <TableBody>
+        <TableBody
+          {...(stacked ? { role: "rowgroup" } : {})}
+          className={cn(stacked && "max-sm:block")}
+        >
           <TableColumns.Provider value={columns}>{children}</TableColumns.Provider>
         </TableBody>
       </Table>
@@ -166,6 +184,8 @@ function columnKey(column: DataColumn, index: number): string {
  * `onSelect` requires one.
  */
 export function DataRow({ children, onSelect }: { children: ReactNode; onSelect?: () => void }) {
+  const stacked = useContext(TableColumns)[0]?.lead === true;
+  const stackedRow = stacked ? { role: "row", className: STACKED_ROW } : { className: undefined };
   // Each cell learns its column from its position, so a cell never restates how its column
   // reads. A cell left out with `cond ? <DataCell /> : null` drops out here too.
   const cells = Children.toArray(children).map((cell, index) => (
@@ -173,29 +193,47 @@ export function DataRow({ children, onSelect }: { children: ReactNode; onSelect?
       {cell}
     </CellIndex.Provider>
   ));
-  if (onSelect === undefined) return <TableRow>{cells}</TableRow>;
+  if (onSelect === undefined) return <TableRow {...stackedRow}>{cells}</TableRow>;
   return (
-    <TableRow data-navigates="true" className="cursor-pointer" onClick={onSelect}>
+    <TableRow
+      data-navigates="true"
+      {...stackedRow}
+      className={cn("cursor-pointer", stackedRow.className)}
+      onClick={onSelect}
+    >
       {cells}
     </TableRow>
   );
 }
 
+/**
+ * Under 640 px a row that opens with a state block is a column: block, then record. Chrome drops
+ * the row and cell roles once `display` leaves the table model, so the cells carry them again.
+ */
+const STACKED_ROW =
+  "max-sm:flex max-sm:flex-col max-sm:items-stretch max-sm:gap-1 max-sm:px-4 max-sm:py-3";
+
+function cellAttributes(columns: readonly DataColumn[], column: DataColumn, muted: boolean) {
+  const stacked = columns[0]?.lead === true;
+  const className = cn(
+    stacked && "max-sm:h-auto max-sm:min-w-0 max-sm:px-0",
+    column.align === "end" && "text-right max-sm:self-end",
+    muted && "text-muted-foreground",
+    column.className,
+  );
+  return stacked ? { role: "cell", className } : { className };
+}
+
 /** A value in a row. Its alignment, visibility, and whether it truncates are its column's. */
 export function DataCell({ children, muted = false }: { children: ReactNode; muted?: boolean }) {
   const index = useContext(CellIndex);
-  const column = useContext(TableColumns)[index];
+  const columns = useContext(TableColumns);
+  const column = columns[index];
   if (column === undefined) {
     throw new Error(`DataCell ${String(index)} has no column: a row holds one cell per column.`);
   }
   return (
-    <TableCell
-      className={cn(
-        column.align === "end" && "text-right",
-        muted && "text-muted-foreground",
-        column.className,
-      )}
-    >
+    <TableCell {...cellAttributes(columns, column, muted)}>
       {column.fill === true ? (
         // A grid item that clips has no minimum width, so the column can give way, while its
         // widest value still sets the column's share of the spare width. Anything that is not a

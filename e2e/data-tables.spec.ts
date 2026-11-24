@@ -118,8 +118,8 @@ test("the trigger list cuts paths and details before names, event kinds, and tim
     await showAt(page, 1100, table);
     for (const trigger of TRIGGERS) {
       const cells = rowCells(table, trigger.name);
-      await expectWhole(cells.nth(0), trigger.name);
-      await expectWhole(cells.nth(1), trigger.kind);
+      await expectWhole(cells.nth(1), trigger.name);
+      await expectWhole(cells.nth(2), trigger.kind);
     }
   });
 
@@ -127,13 +127,13 @@ test("the trigger list cuts paths and details before names, event kinds, and tim
     await showAt(page, 1280, table);
     for (const trigger of TRIGGERS) {
       const cells = rowCells(table, trigger.name);
-      await expectWhole(cells.nth(0), trigger.name);
-      if (trigger.recurrence === true) await expectWhole(cells.nth(1), trigger.kind);
-      else await expectWhole(cells.nth(1));
-      await expectWhole(cells.nth(3));
+      await expectWhole(cells.nth(1), trigger.name);
+      if (trigger.recurrence === true) await expectWhole(cells.nth(2), trigger.kind);
+      else await expectWhole(cells.nth(2));
+      await expectWhole(cells.nth(4));
     }
     const path = rowCells(table, "slack-help")
-      .nth(2)
+      .nth(3)
       .getByTitle(`${WORKSPACES}/platform/infrastructure-runbooks`);
     expect(await endsInView(path)).toBe(true);
   });

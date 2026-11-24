@@ -3,15 +3,10 @@ import type { ReactNode } from "react";
 import { Skeleton } from "../ui/skeleton.js";
 import { Card } from "./card.js";
 import { RelativeTime } from "./relative-time.js";
-import { StatusPill, type StatusTone } from "./status-pill.js";
+import { daemonState, pillTone, type DaemonState } from "./state-label.js";
+import { StatusPill } from "./status-pill.js";
 import { SummaryPanel, type SummaryRow } from "./summary-panel.js";
 import { TwoLine } from "./two-line.js";
-
-const STATUS = {
-  connected: { label: "Connected", tone: "success" },
-  offline: { label: "Offline", tone: "neutral" },
-  revoked: { label: "Revoked", tone: "danger" },
-} satisfies Record<string, { label: string; tone: StatusTone }>;
 
 const IDENTITY = "flex min-w-0 items-start gap-3";
 const STATUS_ROW = "flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground";
@@ -27,12 +22,12 @@ export function DeviceCard({
 }: {
   name: string;
   id: string;
-  status: keyof typeof STATUS;
+  status: DaemonState;
   lastSeenAt: string;
   details: readonly SummaryRow[];
   actions?: ReactNode;
 }) {
-  const { tone, label } = STATUS[status];
+  const { tone, label } = daemonState(status);
   return (
     <Card>
       <div className="flex min-w-0 items-start justify-between gap-3">
@@ -49,7 +44,7 @@ export function DeviceCard({
         {actions}
       </div>
       <div className={STATUS_ROW}>
-        <StatusPill tone={tone}>{label}</StatusPill>
+        <StatusPill tone={pillTone(tone)}>{label}</StatusPill>
         <span>
           Last seen <RelativeTime value={lastSeenAt} />
         </span>
