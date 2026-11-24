@@ -1,3 +1,4 @@
+import { Bell } from "lucide-react";
 import { useCallback, useId, useRef, useState } from "react";
 import { AttentionPanel } from "../attention/attention-panel.js";
 import { attentionLabel } from "../attention/client-state.js";
@@ -29,8 +30,9 @@ function AttentionPopover() {
         <PopoverTrigger asChild>
           <SidebarMenuButton
             aria-label={attentionLabel(count)}
-            className="group-data-[collapsible=icon]:justify-center"
+            className="relative group-data-[collapsible=icon]:justify-center"
           >
+            <Bell aria-hidden="true" className="hidden group-data-[collapsible=icon]:block" />
             <span className="group-data-[collapsible=icon]:sr-only">Attention</span>
             {count === 0 ? null : (
               <>
@@ -40,7 +42,9 @@ function AttentionPopover() {
                 >
                   {count}
                 </span>
-                <AttentionMark />
+                <span className="flex group-data-[collapsible=icon]:absolute group-data-[collapsible=icon]:top-1 group-data-[collapsible=icon]:right-1">
+                  <AttentionMark />
+                </span>
               </>
             )}
           </SidebarMenuButton>

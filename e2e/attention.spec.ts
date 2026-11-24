@@ -45,6 +45,56 @@ test.describe("desktop Attention", () => {
     await expect(page).toHaveURL(/\/connections$/u);
     await expect(panel).toBeHidden();
   });
+
+  test("shows a collapsed rail icon before loading and with or without items", async ({
+    hub,
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 844 });
+    await hub.signUpAs("owner", owner);
+    const [snapshot] = await Promise.all([
+      page.waitForResponse(async (response) => {
+        if (!response.url().includes("/_serverFn/")) return false;
+        return (await response.text().catch(() => "")).includes('"generatedAt"');
+      }),
+      hub.createOrganization("owner", ORGANIZATION),
+    ]);
+    const collapsed = page.locator('[data-collapsible="icon"]');
+    const toggle = page.locator('[data-sidebar="trigger"]');
+    await toggle.click();
+    const empty = attentionEntry(page, 0);
+    await expect(collapsed.getByRole("button", { name: "Attention", exact: true })).toBeVisible();
+    await expect(empty.locator("svg")).toBeVisible();
+    await expect(empty.locator(".bg-attention")).toHaveCount(0);
+    const dialog = await openAttention(page, 0);
+    await expect(dialog.getByText("Nothing needs you.")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+
+    await hub.seedSuspendedGitHubConnection(ORGANIZATION);
+    const held = Promise.withResolvers<void>();
+    const snapshotPath = new URL(snapshot.url()).pathname;
+    const interceptSnapshot = (url: URL) => url.pathname === snapshotPath;
+    await page.route(
+      interceptSnapshot,
+      async (route) => {
+        await held.promise;
+        await route.continue();
+      },
+      { times: 1 },
+    );
+    try {
+      await page.reload();
+      if (!(await collapsed.isVisible())) await toggle.click();
+      await expect(empty.locator("svg")).toBeVisible();
+      await expect(empty.locator(".bg-attention")).toHaveCount(0);
+    } finally {
+      held.resolve();
+    }
+    const active = attentionEntry(page, 1);
+    await expect(active.locator("svg")).toBeVisible();
+    await expect(active.locator(".bg-attention")).toBeVisible();
+  });
 });
 
 test.describe("phone Attention", () => {
@@ -203,6 +253,8 @@ test.describe("Attention behavior", () => {
     const dialog = await openAttention(page, 0);
     await expectDroppedRow(dialog, false);
     await expect(dialog.getByText("Nothing needs you.")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
     await expect(attentionEntry(page, 0)).toBeVisible();
     await expect(attentionEntry(page, 0).locator(".bg-attention")).toHaveCount(0);
 
