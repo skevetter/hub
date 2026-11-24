@@ -122,6 +122,40 @@ describe("GitHub App authentication", () => {
     assert.deepEqual(cached, first);
     assert.deepEqual(requests, ["GET /users/paseo%5Bbot%5D"]);
   });
+
+  describe("Octokit plugins", () => {
+    function identityRequests(octokitPlugins?: { retry?: boolean; throttle?: boolean }) {
+      const statuses = [500, 400];
+      const requests: number[] = [];
+      const auth = createGitHubAuth({
+        appId: "12345",
+        privateKey: testPrivateKey(),
+        ...(octokitPlugins === undefined ? {} : { octokitPlugins }),
+        fetch: async () => {
+          const status = statuses[requests.length] ?? 400;
+          requests.push(status);
+          return Response.json({ message: "unavailable" }, { status });
+        },
+      });
+      return { requests, result: auth.getAppBotIdentity("paseo", "installation-token") };
+    }
+
+    it("retries a server error by default", async () => {
+      const { requests, result } = identityRequests();
+
+      await assert.rejects(result);
+
+      assert.deepEqual(requests, [500, 400]);
+    });
+
+    it("sends a single request when retry is turned off", async () => {
+      const { requests, result } = identityRequests({ retry: false, throttle: false });
+
+      await assert.rejects(result);
+
+      assert.deepEqual(requests, [500]);
+    });
+  });
 });
 
 function createGitHubAuthHarness(now: () => number) {
