@@ -4602,9 +4602,9 @@ class PgDatabase implements Database {
         input.createdByUserId ?? null,
       ],
     );
-    return toProjectConfigurationRevisionRecord(
-      requireReturnedRow(rows.rows[0], "inserted configuration revision"),
-    );
+    const revision = rows.rows[0];
+    if (revision === undefined) throw new Error("project not found");
+    return toProjectConfigurationRevisionRecord(revision);
   }
 
   async activateProjectConfigurationRevision(
