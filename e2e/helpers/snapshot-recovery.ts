@@ -3,6 +3,7 @@ import type { BuiltApplication } from "./hub.js";
 
 /** Real database faults in the isolated application, with no intercepted server responses. */
 export class SnapshotRecovery {
+  private readonly readPaths = new Set<string>();
   private failures = 0;
 
   constructor(
@@ -10,10 +11,21 @@ export class SnapshotRecovery {
     private readonly app: BuiltApplication,
   ) {
     page.on("response", async (response) => {
-      if (!response.url().includes("/_serverFn/")) return;
+      if (!this.readPaths.has(new URL(response.url()).pathname)) return;
       const body = await response.text().catch(() => "");
       if (body.includes("quote reference")) this.failures++;
     });
+  }
+
+  private async watchRead(payloadMarker: string) {
+    // Discover the built function path so unrelated reads (such as Attention) cannot affect counts.
+    const response = await this.page.waitForResponse(async (candidate) => {
+      if (!new URL(candidate.url()).pathname.startsWith("/_serverFn/")) return false;
+      if (candidate.request().method() !== "GET" || !candidate.ok()) return false;
+      const body = await candidate.text().catch(() => "");
+      return body.includes(payloadMarker);
+    });
+    this.readPaths.add(new URL(response.url()).pathname);
   }
 
   async visitTriggers() {
@@ -21,7 +33,7 @@ export class SnapshotRecovery {
   }
 
   async openTriggers() {
-    await this.visitTriggers();
+    await Promise.all([this.watchRead('"Existing trigger"'), this.visitTriggers()]);
     await expect(this.page.getByRole("table", { name: "Triggers", exact: true })).toBeVisible();
   }
 
@@ -120,7 +132,10 @@ export class SnapshotRecovery {
     await this.app.query("alter table unavailable_triggers rename to organization_triggers");
   }
   async openDaemons() {
-    await this.page.getByRole("link", { name: "Daemons", exact: true }).click();
+    await Promise.all([
+      this.watchRead('"daemons","canManage"'),
+      this.page.getByRole("link", { name: "Daemons", exact: true }).click(),
+    ]);
     await this.expectDaemons();
   }
 
@@ -139,7 +154,10 @@ export class SnapshotRecovery {
 
   async openUsage() {
     await this.page.getByRole("link", { name: "Settings", exact: true }).click();
-    await this.page.getByRole("link", { name: "Usage", exact: true }).click();
+    await Promise.all([
+      this.watchRead('"organization","limits","history"'),
+      this.page.getByRole("link", { name: "Usage", exact: true }).click(),
+    ]);
     await this.expectUsage();
   }
 
