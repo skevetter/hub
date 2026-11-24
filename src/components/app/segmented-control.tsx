@@ -1,4 +1,3 @@
-/* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop -- each item's ref callback and click handler are scoped to the option rendered beside them */
 import type { LucideIcon } from "lucide-react";
 import {
   createElement,
@@ -25,6 +24,15 @@ export interface SegmentedOption {
   hint?: string;
 }
 
+interface SegmentedControlProps {
+  label: string;
+  /** The quiet line above the track, e.g. the question the modes answer. */
+  description?: string;
+  value: string;
+  options: readonly SegmentedOption[];
+  onChange: (value: string) => void;
+}
+
 /**
  * Pick one of a few modes. A radio group, not a row of buttons: one stop in the tab order, the
  * arrow keys move between options, and a screen reader hears "2 of 3 selected" rather than
@@ -39,14 +47,7 @@ export function SegmentedControl({
   value,
   options,
   onChange,
-}: {
-  label: string;
-  /** The quiet line above the track, e.g. the question the modes answer. */
-  description?: string;
-  value: string;
-  options: readonly SegmentedOption[];
-  onChange: (value: string) => void;
-}) {
+}: SegmentedControlProps) {
   const items = useRef(new Map<string, HTMLButtonElement>());
   const descriptionId = useId();
   const move = useCallback(
@@ -79,38 +80,60 @@ export function SegmentedControl({
           ? {}
           : { "aria-describedby": descriptionId })}
         onKeyDown={move}
-        className="inline-flex w-fit items-center gap-0.5 rounded-md bg-muted p-0.5"
+        className="inline-flex w-fit items-center gap-0.5 rounded-sm bg-muted p-0.5"
       >
-        {options.map((option) => {
-          const active = option.value === value;
-          return (
-            <button
-              key={option.value}
-              ref={(node) => {
-                if (node === null) items.current.delete(option.value);
-                else items.current.set(option.value, node);
-              }}
-              type="button"
-              role="radio"
-              aria-checked={active}
-              tabIndex={active ? 0 : -1}
-              disabled={option.disabled === true}
-              onClick={() => onChange(option.value)}
-              className={cn(
-                "inline-flex h-7 items-center gap-1.5 rounded-sm px-2.5 text-xs whitespace-nowrap transition-colors duration-150 disabled:pointer-events-none disabled:opacity-50 [&_svg]:size-3.5",
-                active
-                  ? "bg-background text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              <SegmentIcon icon={option.icon} />
-              {option.label}
-            </button>
-          );
-        })}
+        {options.map((option) => (
+          <Segment
+            key={option.value}
+            option={option}
+            active={option.value === value}
+            items={items.current}
+            onChange={onChange}
+          />
+        ))}
       </div>
       {hint === undefined ? null : <p className="text-xs text-muted-foreground">{hint}</p>}
     </div>
+  );
+}
+
+function Segment({
+  option,
+  active,
+  items,
+  onChange,
+}: {
+  option: SegmentedOption;
+  active: boolean;
+  items: Map<string, HTMLButtonElement>;
+  onChange: (value: string) => void;
+}) {
+  const { value } = option;
+  const register = useCallback(
+    (node: HTMLButtonElement | null) => {
+      if (node === null) items.delete(value);
+      else items.set(value, node);
+    },
+    [items, value],
+  );
+  const select = useCallback(() => onChange(value), [onChange, value]);
+  return (
+    <button
+      ref={register}
+      type="button"
+      role="radio"
+      aria-checked={active}
+      tabIndex={active ? 0 : -1}
+      disabled={option.disabled === true}
+      onClick={select}
+      className={cn(
+        "inline-flex h-7 items-center gap-1.5 rounded-sm px-2.5 text-xs whitespace-nowrap transition-colors duration-150 disabled:pointer-events-none disabled:opacity-50 [&_svg]:size-3.5",
+        active ? "bg-background text-foreground" : "text-muted-foreground hover:text-foreground",
+      )}
+    >
+      <SegmentIcon icon={option.icon} />
+      {option.label}
+    </button>
   );
 }
 
@@ -174,13 +197,15 @@ export function nextSegmentValue(
   const first = selectable[0];
   const last = selectable[selectable.length - 1];
   if (first === undefined || last === undefined) return undefined;
-  if (key === "Home") return first.value === value ? undefined : first.value;
-  if (key === "End") return last.value === value ? undefined : last.value;
+  if (key === "Home") return changedValue(first, value);
+  if (key === "End") return changedValue(last, value);
   const step = ARROW_STEPS[key];
   if (step === undefined) return undefined;
   const current = selectable.findIndex((option) => option.value === value);
   if (current === -1) return step === 1 ? first.value : last.value;
-  const next = selectable[(current + step + selectable.length) % selectable.length];
-  if (next === undefined || next.value === value) return undefined;
-  return next.value;
+  return changedValue(selectable[(current + step + selectable.length) % selectable.length], value);
+}
+
+function changedValue(option: SegmentedOption | undefined, value: string): string | undefined {
+  return option?.value === value ? undefined : option?.value;
 }

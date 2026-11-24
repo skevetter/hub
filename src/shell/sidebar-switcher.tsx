@@ -63,7 +63,7 @@ export function SidebarSwitcher({
             tone={tone}
             {...(secondary === undefined ? {} : { secondary })}
           />
-          <ChevronsUpDown aria-hidden="true" className="ml-auto size-4 text-muted-foreground" />
+          <ChevronsUpDown aria-hidden="true" className="ml-auto size-4 text-rail-muted" />
         </SidebarMenuButton>
       </DropdownMenuTrigger>
       <DropdownMenuContent
@@ -75,30 +75,6 @@ export function SidebarSwitcher({
         {children}
       </DropdownMenuContent>
     </DropdownMenu>
-  );
-}
-
-/**
- * The same row where there is nothing to switch to. The instance is the deployment: one of it,
- * always, so its header states where you are instead of offering a choice that has one option.
- */
-export function SidebarIdentity({
-  media,
-  primary,
-  secondary,
-  size = "lg",
-  tone = "primary",
-}: SwitcherFace) {
-  return (
-    <div className="flex h-12 w-full items-center gap-2 overflow-hidden rounded-md px-2 text-left text-sm group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-0!">
-      <Face
-        media={media}
-        primary={primary}
-        size={size}
-        tone={tone}
-        {...(secondary === undefined ? {} : { secondary })}
-      />
-    </div>
   );
 }
 
@@ -117,8 +93,8 @@ function Face({
       {size === "lg" ? (
         <span
           className={cn(
-            "flex aspect-square size-8 shrink-0 items-center justify-center rounded-md text-xs",
-            tone === "primary" ? "bg-primary text-primary-foreground" : "bg-sidebar-accent",
+            "flex aspect-square size-8 shrink-0 items-center justify-center rounded-sm text-xs",
+            tone === "primary" ? "bg-sidebar-foreground text-sidebar" : "bg-sidebar-accent",
           )}
         >
           {media}
@@ -129,7 +105,7 @@ function Face({
       <span className="grid flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
         <span className="truncate text-sm">{primary}</span>
         {secondary === undefined ? null : (
-          <span className="truncate text-xs text-muted-foreground">{secondary}</span>
+          <span className="truncate text-xs text-rail-muted">{secondary}</span>
         )}
       </span>
     </>

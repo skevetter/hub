@@ -92,35 +92,9 @@ function Entry({
   onRetry: ((id: string) => void) | undefined;
   retryBusy: boolean;
 }) {
-  const retry = useCallback(() => onRetry?.(item.id), [item.id, onRetry]);
   switch (item.kind) {
     case "human":
-      return (
-        <div data-entry="human" className="grid min-w-0 justify-items-end gap-1">
-          <div className="flex min-w-0 max-w-full items-center justify-end gap-2 text-xs text-muted-foreground">
-            <span className="min-w-0 truncate">{item.author}</span>
-            <StatusPill tone={DELIVERY[item.status].tone}>{DELIVERY[item.status].label}</StatusPill>
-            {item.retryable && onRetry !== undefined ? (
-              <Button
-                type="button"
-                size="xs"
-                variant="outline"
-                onClick={retry}
-                disabled={retryBusy}
-              >
-                Send again
-              </Button>
-            ) : null}
-          </div>
-          {item.text === null ? (
-            <p className="text-sm text-muted-foreground">Message expired</p>
-          ) : (
-            <p className="max-w-xl min-w-0 rounded-xl bg-muted px-3 py-2 text-sm whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]">
-              {item.text}
-            </p>
-          )}
-        </div>
-      );
+      return <HumanEntry item={item} onRetry={onRetry} retryBusy={retryBusy} />;
     case "assistant":
       return (
         <div data-entry="assistant" className="grid min-w-0 justify-items-start gap-1">
@@ -143,13 +117,46 @@ function Entry({
           <StatusPill tone={TOOL_TONE[item.status]}>{statusLabel(item.status)}</StatusPill>
         </p>
       );
-    default:
+    case "boundary":
       return (
         <p className="min-w-0 text-center text-xs text-muted-foreground [overflow-wrap:anywhere]">
           {item.label}
         </p>
       );
   }
+  return null;
+}
+
+function HumanEntry({
+  item,
+  onRetry,
+  retryBusy,
+}: {
+  item: Extract<TranscriptItem, { kind: "human" }>;
+  onRetry: ((id: string) => void) | undefined;
+  retryBusy: boolean;
+}) {
+  const retry = useCallback(() => onRetry?.(item.id), [item.id, onRetry]);
+  return (
+    <div data-entry="human" className="grid min-w-0 justify-items-end gap-1">
+      <div className="flex min-w-0 max-w-full items-center justify-end gap-2 text-xs text-muted-foreground">
+        <span className="min-w-0 truncate">{item.author}</span>
+        <StatusPill tone={DELIVERY[item.status].tone}>{DELIVERY[item.status].label}</StatusPill>
+        {item.retryable && onRetry !== undefined ? (
+          <Button type="button" size="xs" variant="outline" onClick={retry} disabled={retryBusy}>
+            Send again
+          </Button>
+        ) : null}
+      </div>
+      {item.text === null ? (
+        <p className="text-sm text-muted-foreground">Message expired</p>
+      ) : (
+        <p className="max-w-xl min-w-0 rounded-sm bg-muted px-3 py-2 text-sm whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]">
+          {item.text}
+        </p>
+      )}
+    </div>
+  );
 }
 
 /** The feed's own box: a few entries of varying length, so nothing moves when it fills. */

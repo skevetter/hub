@@ -1,4 +1,4 @@
-import { expect } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
 import { test } from "./app.js";
 import {
   GITHUB_EVENT_CREDENTIALS,
@@ -8,6 +8,7 @@ import {
 import { expectOneFailure, recordsFor, stripAnsi } from "./helpers/logs.js";
 import { SHOTS, type AppSetupSession } from "./helpers/app-evidence.js";
 import type { PaseoHub } from "./helpers/hub.js";
+import { projectApp } from "./helpers/projects/index.js";
 
 // Every journey claims a second, genuinely pristine application beside the fixture's own.
 test.describe.configure({ timeout: 150_000 });
@@ -639,11 +640,12 @@ test("an environment-managed app is read-only, connectable, and names its variab
 }) => {
   const session = await openSetup(hub, ["github"]);
   try {
-    const { surface } = session;
+    const { surface, page } = session;
     const github = surface.github;
     await github.expectStatus("Managed by environment");
     await surface.leave("Do this later");
     await session.openManagement();
+    const orbitApps = await openOrbitAppsWithoutSwitching(page);
     await github.expand();
 
     const notice = github.environmentNotice();
@@ -672,12 +674,35 @@ test("an environment-managed app is read-only, connectable, and names its variab
 
     // Environment-managed is still connectable.
     await github.action("Install on GitHub").click();
+    await github.expectFocusedResult("GitHub connected.");
+    await expect(page).toHaveURL(orbitApps);
     await github.expectStatus("Managed by environment");
     await github.expectSummary({ Installations: "acme-inc" });
   } finally {
     await session.close();
   }
 });
+
+async function openOrbitAppsWithoutSwitching(page: Page) {
+  const defaultApps = page.url();
+  const organization = page.getByRole("button", { name: "Organization", exact: true });
+  await organization.click();
+  const menu = page.getByRole("menu");
+  const defaultName = await menu
+    .getByRole("menuitem")
+    .and(page.locator('[aria-current="true"]'))
+    .innerText();
+  await page.keyboard.press("Escape");
+  await projectApp(page).navigation.createOrganizationLandingHint("Orbit");
+  await expect(page).toHaveURL(/\/o\/[^/]+\/home$/u);
+  const orbitApps = new URL("settings/instance/apps", page.url()).href;
+  await organization.click();
+  await menu.getByRole("menuitem", { name: defaultName, exact: true }).click();
+  await expect(page).toHaveURL(new URL("../../../home", `${defaultApps}/`).href);
+  await page.goto(orbitApps);
+  await expect(organization).toContainText("Orbit");
+  return orbitApps;
+}
 
 test("the operator finishes, then manages the same apps from the account menu", async ({ hub }) => {
   const session = await hub.openAppSetup({
@@ -819,8 +844,16 @@ test("a member has no Apps surface at all", async ({ hub }) => {
     });
     try {
       await expect(member.page.getByRole("link", { name: "Apps", exact: true })).toHaveCount(0);
+      const organization = new URL(member.page.url()).pathname.replace(/\/home$/u, "");
+      await member.page.goto(`${session.origin}${organization}/settings/team`);
+      const settings = member.page.getByRole("navigation", { name: "Organization settings" });
+      await expect(settings.getByRole("link", { name: "Instance", exact: true })).toHaveCount(0);
+      await member.page.goto(`${session.origin}${organization}/settings/instance/apps`);
+      await expect(member.page.getByRole("alert")).toContainText(
+        "Only an instance operator can view app setup.",
+      );
       await member.page.goto(`${session.origin}/apps`);
-      // The route renders, the capability refuses: no credential status of any kind.
+      await expect(member.page).toHaveURL(`${session.origin}/apps`);
       await expect(
         member.page.getByText("Only an instance operator can view app setup."),
       ).toBeVisible();

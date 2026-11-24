@@ -2,6 +2,13 @@ import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it, vi } from "vitest";
 
+import {
+  orderTranscript,
+  Transcript,
+  TranscriptSkeleton,
+  type TranscriptItem,
+} from "./transcript.js";
+
 const follow = vi.hoisted(() => ({ props: [] as { version: number }[] }));
 
 vi.mock("./follow-bottom.js", () => ({
@@ -10,13 +17,6 @@ vi.mock("./follow-bottom.js", () => ({
     return <div data-follow-version={version}>{children}</div>;
   },
 }));
-
-import {
-  orderTranscript,
-  Transcript,
-  TranscriptSkeleton,
-  type TranscriptItem,
-} from "./transcript.js";
 
 const MESSAGES: readonly TranscriptItem[] = [
   {
@@ -41,7 +41,10 @@ const MESSAGES: readonly TranscriptItem[] = [
   { id: "i6", kind: "assistant", text: "first reply", truncated: false, seq: 3 },
 ];
 
-function render(items: readonly TranscriptItem[], extra: { working?: boolean } = {}): string {
+function render(
+  items: readonly TranscriptItem[],
+  extra: Pick<Parameters<typeof Transcript>[0], "working" | "onRetry" | "retryBusy"> = {},
+): string {
   return renderToStaticMarkup(<Transcript items={items} version={items.length} {...extra} />);
 }
 
@@ -82,6 +85,25 @@ describe("transcript entries", () => {
       { id: "i7", kind: "human", author: "Ada", text: "hm", status: "unknown", seq: null },
     ]);
     assert.match(unknown, /Delivery unknown/u);
+  });
+
+  it("shows a retry control only when a message can be resent and a handler is provided", () => {
+    const item: TranscriptItem = {
+      id: "retry",
+      kind: "human",
+      author: "Ada",
+      text: "could not send",
+      status: "failed",
+      retryable: true,
+      seq: null,
+    };
+    const onRetry = vi.fn();
+    assert.match(
+      render([item], { onRetry, retryBusy: true }),
+      /<button[^>]* disabled=""[^>]*>Send again<\/button>/u,
+    );
+    assert.doesNotMatch(render([item]), /Send again/u);
+    assert.doesNotMatch(render([{ ...item, retryable: false }], { onRetry }), /Send again/u);
   });
 
   it("shows a tool as its name and status and nothing else", () => {

@@ -127,7 +127,9 @@ it("shows the list and detail loading states", async () => {
   expect(await renderRoute("/o/acme/sessions", true)).toContain("Loading sessions");
   const detail = await renderRoute("/o/acme/sessions/00000000-0000-4000-8000-000000000001", true);
   expect(detail).toContain("Loading session");
-  expect(detail).toContain("rounded-xl border bg-card p-6");
+  expect(detail).toMatch(
+    /aria-busy="true" aria-label="Loading session">[\s\S]*<section[^>]*>\s*<div[^>]*aria-hidden="true"/,
+  );
 });
 
 it("shows a retryable error on a failed session list request", async () => {

@@ -1,9 +1,135 @@
 import assert from "node:assert/strict";
 import { Writable } from "node:stream";
-import { describe, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ProductRequestError } from "../auth/organization-access.js";
+import type { AuthServer } from "../auth/server.js";
+import { createMemoryDatabase } from "../db/memory.js";
+import type { ConnectionAttemptRecord, StartConnectionAttemptInput } from "../db/types.js";
 import { createLogger } from "../logger.js";
-import { CONNECTIONS_RETURN_ROUTE, connectionCallbackFailure } from "./shared.js";
+import {
+  CONNECTIONS_RETURN_ROUTE,
+  cancelledConnectionResult,
+  connectionAccess,
+  connectionCallbackFailure,
+  manageConnectionAccess,
+  stateHash,
+} from "./shared.js";
+
+function orbitConnection(returnRoute: string) {
+  const request = new Request(
+    `https://hub.test/start?${new URLSearchParams({ organizationSlug: "orbit", returnRoute })}`,
+  );
+  const auth: AuthServer = {
+    resolveAccount: () =>
+      Promise.resolve({
+        account: { id: "alice", name: "Alice", email: "alice@example.test" },
+        session: { id: "session", activeOrganizationId: "acme-id" },
+        isInstanceOperator: true,
+      }),
+    handle: vi.fn(),
+    resources: vi.fn(),
+    resolveOrganizationAccess: vi.fn(),
+    rejectCookieMutation: vi.fn(),
+    close: vi.fn(),
+  };
+  const database = createMemoryDatabase({
+    memberships: [
+      {
+        userId: "alice",
+        organizationId: "acme-id",
+        organizationSlug: "acme",
+        organizationName: "Acme",
+        membershipId: "acme-owner",
+        role: "owner",
+      },
+      {
+        userId: "alice",
+        organizationId: "orbit-id",
+        organizationSlug: "orbit",
+        organizationName: "Orbit",
+        membershipId: "orbit-owner",
+        role: "owner",
+      },
+    ],
+  });
+  let stored: ConnectionAttemptRecord | undefined;
+  database.startConnectionAttempt = (input) => {
+    stored = storedAttempt(input);
+    return Promise.resolve();
+  };
+  database.readConnectionAttempt = () =>
+    stored === undefined ? Promise.reject(new Error("No attempt")) : Promise.resolve(stored);
+  database.consumeConnectionAttempt = () => {
+    stored = undefined;
+    return Promise.resolve();
+  };
+  return { auth, request, database };
+}
+
+function storedAttempt(input: StartConnectionAttemptInput): ConnectionAttemptRecord {
+  return {
+    ...input,
+    ...input.access,
+    id: "attempt",
+    phase: "github_user_authorization",
+    candidateExternalId: null,
+    pkceVerifier: null,
+    expiresAt: new Date(Date.now() + 60_000),
+    consumedAt: null,
+  };
+}
+
+describe("connection return routes", () => {
+  it("carries the verified Orbit Apps route from start authority through the callback", async () => {
+    const { auth, request, database } = orbitConnection("/apps");
+    const access = await manageConnectionAccess(auth, database, request);
+    const stateVerifier = stateHash("fixture-state");
+    await database.startConnectionAttempt({
+      access: connectionAccess(access),
+      provider: "github",
+      stateVerifier,
+      lifetimeMinutes: 10,
+      configurationVersion: 0,
+      providerApplicationId: "github-1",
+      callbackOrigin: "https://hub.test",
+      configurationSnapshot: null,
+      expectedConfigurationVersion: null,
+      activateConfiguration: false,
+    });
+    expect(
+      await database.readConnectionAttempt({
+        stateVerifier,
+        phase: "github_user_authorization",
+        access: { userId: "alice", sessionId: "session" },
+      }),
+    ).toMatchObject({
+      organizationId: "orbit-id",
+      returnRoute: "/o/orbit/settings/instance/apps",
+    });
+    const response = await cancelledConnectionResult({
+      auth,
+      database,
+      request,
+      provider: "github",
+      phase: "github_user_authorization",
+      state: "fixture-state",
+      applicationBaseUrl: "https://hub.test",
+    });
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe(
+      "https://hub.test/o/orbit/settings/instance/apps?app=github&result=github_cancelled",
+    );
+  });
+
+  it.each([
+    ["/", "/"],
+    ["/o/acme/settings/instance/apps", "/o/orbit/connections"],
+    ["https://example.com", "/o/orbit/connections"],
+  ])("maps the %s return token to %s", async (token, expected) => {
+    const { auth, request, database } = orbitConnection(token);
+    expect((await manageConnectionAccess(auth, database, request)).returnRoute).toBe(expected);
+  });
+});
 
 class CaptureStream extends Writable {
   readonly chunks: string[] = [];

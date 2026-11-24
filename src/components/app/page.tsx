@@ -61,7 +61,7 @@ export function PageHeader({
             ref={heading}
             id={id}
             tabIndex={-1}
-            className="min-w-0 wrap-anywhere text-xl font-title"
+            className="min-w-0 wrap-anywhere text-xl font-strong"
           >
             {title}
           </h1>

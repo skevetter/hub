@@ -86,7 +86,7 @@ export function ListFilterSelect({
       <select
         id={id}
         name={name}
-        className="h-8 min-w-0 truncate rounded-md border border-input bg-background px-2.5"
+        className="h-8 min-w-0 truncate rounded-sm border border-input bg-background px-2.5"
         value={value ?? ""}
         onChange={onChange}
       >

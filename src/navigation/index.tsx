@@ -3,7 +3,6 @@ import { trimPathRight, useMatches } from "@tanstack/react-router";
 declare module "@tanstack/react-router" {
   interface StaticDataRouteOption {
     breadcrumb?: string;
-    instance?: boolean;
     tabs?: boolean;
     projectSection?: "overview" | "configuration" | "activity" | "settings";
   }
@@ -16,7 +15,6 @@ export function usePageContext() {
       breadcrumbs: matches.flatMap(({ staticData }) =>
         staticData.breadcrumb === undefined ? [] : [staticData.breadcrumb],
       ),
-      instance: matches.some(({ staticData }) => staticData.instance === true),
       tabs: matches.some(({ staticData }) => staticData.tabs === true),
       projectSection:
         matches
@@ -35,8 +33,8 @@ export function usePresentedTenantScope():
   | undefined {
   return useMatches({
     select: (matches) => {
-      const params = matches.at(-1)!.params;
-      return "organizationSlug" in params
+      const params = matches.at(-1)?.params;
+      return params !== undefined && "organizationSlug" in params
         ? { organizationSlug: params.organizationSlug }
         : undefined;
     },

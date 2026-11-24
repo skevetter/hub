@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import type { QueryClient } from "@tanstack/react-query";
 import {
   Link,
@@ -7,10 +7,16 @@ import {
   Outlet,
   Scripts,
 } from "@tanstack/react-router";
+import { PageHeader } from "../components/app/page.js";
 import { Button } from "../components/ui/button.js";
+import { InitialThemeContext } from "../theme/index.js";
+import { THEME_SCRIPT } from "../theme/preference.js";
+import { initialTheme, requestTheme } from "../theme/request-theme.js";
 import "../styles.entry.js";
 
 export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()({
+  server: { middleware: [requestTheme] },
+  loader: initialTheme,
   head: () => ({
     meta: [
       { charSet: "utf-8" },
@@ -25,47 +31,41 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       },
     ],
   }),
-  component: Root,
+  shellComponent: Document,
+  component: Outlet,
   notFoundComponent: NotFound,
 });
 
-function Root() {
-  return (
-    <Document>
-      <Outlet />
-    </Document>
-  );
-}
-
 function NotFound() {
   return (
-    <Document>
-      <main className="grid min-h-svh place-items-center px-6 py-16">
-        <div className="grid max-w-md gap-4 text-center">
-          <p className="text-sm text-muted-foreground">404</p>
-          <h1 className="text-xl font-title">Page not found</h1>
-          <p className="text-sm text-muted-foreground">
-            This address does not match a page in Paseo Hub. Check the address or return home.
-          </p>
-          <div>
-            <Button asChild>
-              <Link to="/">Return home</Link>
-            </Button>
-          </div>
+    <main className="grid min-h-svh place-items-center px-6 py-16">
+      <div className="grid max-w-md gap-4">
+        <PageHeader
+          title="Page not found"
+          description="This address does not match a page in Paseo Hub. Check the address or return home."
+        />
+        <div>
+          <Button asChild>
+            <Link to="/">Return home</Link>
+          </Button>
         </div>
-      </main>
-    </Document>
+      </div>
+    </main>
   );
 }
 
 function Document({ children }: { children: ReactNode }) {
+  const loaderChoice = Route.useLoaderData();
+  // The script and hook own this class after the initial render.
+  const [choice] = useState(loaderChoice);
   return (
-    <html lang="en" className="dark">
+    <html lang="en" className={choice === "system" ? undefined : choice} suppressHydrationWarning>
       <head>
+        <script>{THEME_SCRIPT}</script>
         <HeadContent />
       </head>
       <body>
-        {children}
+        <InitialThemeContext value={choice}>{children}</InitialThemeContext>
         <Scripts />
       </body>
     </html>

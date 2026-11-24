@@ -1,4 +1,5 @@
-// Inter Variable is self-hosted; it must load before the sheet that names it in --font-sans.
-import "@fontsource-variable/inter/index.css";
+// Faces are self-hosted; they must load before the sheet that names them in --font-sans and --font-mono.
+import "@fontsource-variable/archivo/index.css";
+import "@fontsource-variable/jetbrains-mono/index.css";
 
 import "./styles.css";

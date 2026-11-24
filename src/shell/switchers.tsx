@@ -1,12 +1,9 @@
-/* oxlint-disable typescript-eslint/no-unsafe-type-assertion -- dynamic tenant URLs are assembled from server-resolved route metadata */
-import { Check, FolderKanban, LogOut, Plus, ShieldCheck } from "lucide-react";
-import { Link } from "@tanstack/react-router";
-import { useCallback, useState, type FormEvent } from "react";
+import { Check, LogOut, Plus } from "lucide-react";
+import { useCallback, useState, type ComponentProps } from "react";
 
-import { usePageContext } from "../navigation/index.js";
-import { PaseoGlyph } from "../components/app/auth-layout.js";
 import { FormDialog } from "../components/app/form-dialog.js";
 import { FormField } from "../components/app/form-field.js";
+import { ThemeSwitch } from "../components/app/theme-switch.js";
 import {
   DropdownMenuItem,
   DropdownMenuLabel,
@@ -21,11 +18,7 @@ import { SidebarSwitcher } from "./sidebar-switcher.js";
 /** The organization, project, and membership behind the URL, once the shell has resolved it. */
 export type RouteTenant = NonNullable<ReturnType<typeof useOptionalRouteTenant>>;
 
-/** Where the instance surfaces begin, for the one link into them that is not in a nav group. */
-const INSTANCE_ENTRY = "/apps";
-
-const ORGANIZATION_MARK = <PaseoGlyph />;
-const PROJECT_MARK = <FolderKanban aria-hidden="true" />;
+type OrganizationSubmit = ComponentProps<typeof FormDialog>["onSubmit"];
 
 const ROLE_LABELS: Record<string, string> = {
   owner: "Owner",
@@ -52,25 +45,15 @@ export function OrganizationSwitcher({
   onCreateOrganization: (name: string) => void;
   onSelectOrganization: (organizationId: string, slug: string) => void;
 }) {
-  const [creating, setCreating] = useState(false);
-  const requestCreate = useCallback((event: Event) => {
-    event.preventDefault();
-    setCreating(true);
-  }, []);
-  const create = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      onCreateOrganization(formValue(new FormData(event.currentTarget), "name"));
-      setCreating(false);
-    },
-    [onCreateOrganization],
-  );
+  const { creating, setCreating, requestCreate, create } =
+    useOrganizationCreation(onCreateOrganization);
+  const selectOrganization = useOrganizationSelection(onSelectOrganization);
 
   return (
     <>
       <SidebarSwitcher
         label="Organization"
-        media={ORGANIZATION_MARK}
+        media={organization.name.trim().charAt(0).toUpperCase()}
         primary={organization.name}
         secondary={ROLE_LABELS[role] ?? role}
       >
@@ -83,7 +66,7 @@ export function OrganizationSwitcher({
             slug={membership.slug}
             selected={membership.id === organization.id}
             busy={busy}
-            onSelect={onSelectOrganization}
+            onSelect={selectOrganization}
           />
         ))}
         {account.canCreateOrganization ? (
@@ -96,24 +79,73 @@ export function OrganizationSwitcher({
           </>
         ) : null}
       </SidebarSwitcher>
-      <FormDialog
+      <CreateOrganizationDialog
         open={creating}
         onOpenChange={setCreating}
-        title="New organization"
-        label="Create organization"
-        submitLabel="Create organization"
         busy={busy}
         onSubmit={create}
-      >
-        <FormField
-          id="new-organization-name"
-          label="Organization name"
-          kind="text"
-          name="name"
-          required
-        />
-      </FormDialog>
+      />
     </>
+  );
+}
+
+function useOrganizationSelection(onSelect: (organizationId: string, slug: string) => void) {
+  const { isMobile, setOpenMobile } = useSidebar();
+  return useCallback(
+    (organizationId: string, slug: string) => {
+      if (isMobile) setOpenMobile(false);
+      onSelect(organizationId, slug);
+    },
+    [isMobile, onSelect, setOpenMobile],
+  );
+}
+
+function useOrganizationCreation(onCreateOrganization: (name: string) => void) {
+  const [creating, setCreating] = useState(false);
+  const requestCreate = useCallback((event: Event) => {
+    event.preventDefault();
+    setCreating(true);
+  }, []);
+  const create: OrganizationSubmit = useCallback(
+    (event) => {
+      event.preventDefault();
+      onCreateOrganization(formValue(new FormData(event.currentTarget), "name"));
+      setCreating(false);
+    },
+    [onCreateOrganization],
+  );
+  return { creating, setCreating, requestCreate, create };
+}
+
+function CreateOrganizationDialog({
+  open,
+  onOpenChange,
+  busy,
+  onSubmit,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  busy: boolean;
+  onSubmit: OrganizationSubmit;
+}) {
+  return (
+    <FormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title="New organization"
+      label="Create organization"
+      submitLabel="Create organization"
+      busy={busy}
+      onSubmit={onSubmit}
+    >
+      <FormField
+        id="new-organization-name"
+        label="Organization name"
+        kind="text"
+        name="name"
+        required
+      />
+    </FormDialog>
   );
 }
 
@@ -149,63 +181,17 @@ function OrganizationItem({
   );
 }
 
-/** One line, and no organization on it: the switcher above already says which one. */
-export function ProjectSwitcher({ tenant }: { tenant: RouteTenant }) {
-  const { projectSection: section } = usePageContext();
-  const activeProjects = tenant.projects.filter((project) => project.status === "active");
-  return (
-    <SidebarSwitcher
-      label="Project"
-      size="default"
-      media={PROJECT_MARK}
-      primary={tenant.project?.name ?? "Project"}
-    >
-      <DropdownMenuLabel>Projects</DropdownMenuLabel>
-      {activeProjects.map((project) => (
-        <DropdownMenuItem key={project.id} asChild>
-          <Link
-            to={`/o/${tenant.organization.slug}/projects/${project.slug}/${section}` as never}
-            aria-current={project.id === tenant.project?.id ? "true" : undefined}
-          >
-            <span className="truncate">{project.name}</span>
-            {project.id === tenant.project?.id ? (
-              <Check aria-hidden="true" className="ml-auto" />
-            ) : null}
-          </Link>
-        </DropdownMenuItem>
-      ))}
-      <DropdownMenuSeparator />
-      <DropdownMenuItem asChild>
-        <Link to={`/o/${tenant.organization.slug}/projects` as never}>All projects</Link>
-      </DropdownMenuItem>
-    </SidebarSwitcher>
-  );
-}
-
-/**
- * The account menu carries what belongs to the person rather than to a tenant. Instance
- * administration is one of those: `is_instance_operator` is a property of the user, so no
- * position inside the organization → project sidebar would be true.
- */
 export function AccountMenu({
   email,
   name,
-  operator,
   busy,
   onSignOut,
 }: {
   email: string;
   name: string;
-  operator: boolean;
   busy: boolean;
   onSignOut: () => void;
 }) {
-  const { isMobile, setOpenMobile } = useSidebar();
-  // On compact the menu opens inside the drawer covering the destination, so leaving for the
-  // instance has to dismiss it the way a sidebar destination does.
-  const navigate = useCallback(() => {
-    if (isMobile) setOpenMobile(false);
-  }, [isMobile, setOpenMobile]);
   return (
     <SidebarSwitcher
       label={email}
@@ -215,17 +201,8 @@ export function AccountMenu({
       primary={name}
       secondary={email}
     >
-      {operator ? (
-        <>
-          <DropdownMenuItem asChild>
-            <Link to={INSTANCE_ENTRY} onClick={navigate}>
-              <ShieldCheck aria-hidden="true" />
-              Instance administration
-            </Link>
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-        </>
-      ) : null}
+      <ThemeSwitch />
+      <DropdownMenuSeparator />
       <DropdownMenuItem disabled={busy} onSelect={onSignOut}>
         <LogOut aria-hidden="true" />
         Sign out

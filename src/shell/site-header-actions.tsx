@@ -19,11 +19,8 @@ export function SiteHeaderActionsProvider({ children }: { children: ReactNode })
 }
 
 /**
- * Where a route's own controls land in the chrome, from `sm` up. A phone header holds the
- * sidebar trigger and the breadcrumb and nothing else: a mode switch and two buttons do not fit
- * beside them, and the slot that tried scrolled its own primary action off the right edge with
- * no sign it was there. Below `sm` this renders nothing, and the route puts the same controls in
- * the page — which is where a thumb reaches them anyway.
+ * Route controls share the desktop header. From `sm` to `md` they get their own row
+ * below the phone header. Below `sm` the route puts the controls in the page.
  */
 export function SiteHeaderActionsTarget() {
   const target = useContext(SiteHeaderActionsContext);

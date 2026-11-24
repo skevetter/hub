@@ -75,27 +75,35 @@ test("keeps settings tabs aligned through pending navigation and Back", async ({
   await expectSettingsPage(page, "Team");
 });
 
-test("switches organization and instance context with the presented page", async ({
-  hub,
-  page,
-}) => {
+test("keeps the organization rail through pending instance navigation", async ({ hub, page }) => {
   await openOrganization(hub, page);
   await hub.grantOperator("owner");
-  await expectOrganizationPage(page, "Home");
+  const { navigation } = projectApp(page);
+  await navigation.openOrganizationSection("Settings");
+  await expectSettingsPage(page, "Team");
+  const settings = page
+    .getByRole("navigation", { name: "Organization", exact: true })
+    .getByRole("link", { name: "Settings", exact: true });
   const download = await holdPageScripts(page);
   try {
-    await enterInstance(page);
+    await openSettingsTab(page, "Instance");
     await download.requested;
-    await expectOrganizationPage(page, "Home");
+    await expectSettingsPage(page, "Team");
+    await expect(settings).toHaveAttribute("aria-current", "page");
     await download.showPendingPage();
-    await projectApp(page).navigation.expectBreadcrumb("Instance", "Apps");
-    await expect(page.getByRole("navigation", { name: "Instance", exact: true })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Home", exact: true })).toBeHidden();
+    await expect(settings).toBeVisible();
+    await expect(settings).toHaveAttribute("aria-current", "page");
+    await expect(page.getByRole("button", { name: "Organization", exact: true })).toContainText(
+      "Acme",
+    );
+    await expect(page.getByRole("heading", { name: "Team", level: 1 })).toBeHidden();
   } finally {
     await download.release();
   }
-  await expect(page.getByRole("heading", { name: "Apps", exact: true })).toBeVisible();
-  await projectApp(page).navigation.leaveInstance();
+  await navigation.expectBreadcrumb("Acme", "Settings", "Instance", "Apps");
+  await expect(settings).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("heading", { name: "Apps", level: 1 })).toBeVisible();
+  await navigation.leaveInstance();
   await expectOrganizationPage(page, "Home");
 });
 
@@ -177,9 +185,4 @@ async function expectSettingsDestination(page: Page, name: string) {
 async function expectSettingsPage(page: Page, name: string) {
   await expectSettingsDestination(page, name);
   await expect(page.getByRole("heading", { name, exact: true, level: 1 })).toBeVisible();
-}
-
-async function enterInstance(page: Page) {
-  const menu = await projectApp(page).navigation.openAccountMenu(owner.email);
-  await menu.getByRole("menuitem", { name: "Instance administration" }).click();
 }

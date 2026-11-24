@@ -39,7 +39,7 @@ export function SummaryPanel({
       className={cn(
         inline
           ? "grid min-w-0 gap-x-6 gap-y-3 border-t pt-4 sm:grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))]"
-          : "grid gap-px overflow-hidden rounded-xl border bg-border sm:grid-cols-[repeat(auto-fit,minmax(16rem,1fr))]",
+          : "grid gap-px overflow-hidden rounded-sm border bg-border sm:grid-cols-[repeat(auto-fit,minmax(16rem,1fr))]",
         className,
       )}
     >

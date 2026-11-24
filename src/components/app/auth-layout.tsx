@@ -58,11 +58,11 @@ export function AuthCard({
   useEffect(() => heading.current?.focus(), []);
   return (
     <section
-      className="grid gap-6 rounded-xl border bg-card p-6"
+      className="grid gap-6 rounded-sm border bg-card p-6"
       {...(titleId === undefined ? {} : { "aria-labelledby": titleId })}
     >
       <div className="grid gap-1.5">
-        <h1 ref={heading} id={titleId} tabIndex={-1} className="text-base font-title outline-none">
+        <h1 ref={heading} id={titleId} tabIndex={-1} className="text-base font-strong outline-none">
           {title}
         </h1>
         {description === undefined ? null : (
@@ -88,7 +88,7 @@ export function AuthCard({
  */
 export function AuthCardSkeleton() {
   return (
-    <div aria-busy="true" className="grid gap-6 rounded-xl border bg-card p-6">
+    <div aria-busy="true" className="grid gap-6 rounded-sm border bg-card p-6">
       <div className="grid gap-1.5">
         <Skeleton className="h-6 w-44" />
         <Skeleton className="h-5 w-60 max-w-full" />
@@ -109,7 +109,7 @@ export function AuthCardSkeleton() {
 export function ProductMark({ className }: { className?: string }) {
   return (
     <div className={cn("flex items-center gap-2", className)}>
-      <span className="flex size-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
+      <span className="flex size-7 items-center justify-center rounded-sm bg-primary text-primary-foreground">
         <PaseoGlyph />
       </span>
       <span className="text-sm">Paseo Hub</span>

@@ -7,6 +7,7 @@ import { Skeleton } from "../ui/skeleton.js";
 export interface TabNavItem {
   to: string;
   label: string;
+  subtree?: boolean;
 }
 
 /**
@@ -18,11 +19,14 @@ export interface TabNavItem {
  * These are routes. A control that swaps state without changing the URL is `SegmentedControl`.
  */
 export function TabNav({ label, items }: { label: string; items: readonly TabNavItem[] }) {
-  const pathname = useMatches({ select: (matches) => trimPathRight(matches.at(-1)!.pathname) });
+  const pathname = useMatches({
+    select: (matches) => trimPathRight(matches.at(-1)?.pathname ?? ""),
+  });
   return (
     <nav aria-label={label} className="mb-6 flex flex-wrap gap-4 border-b">
       {items.map((item) => {
-        const active = pathname === item.to;
+        const active =
+          pathname === item.to || (item.subtree === true && pathname.startsWith(`${item.to}/`));
         return (
           <Link
             key={item.to}
