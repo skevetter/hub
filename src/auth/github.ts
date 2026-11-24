@@ -346,12 +346,29 @@ function validateRequestTimeout(timeoutMs: number): void {
 }
 
 function githubTimeoutFetch(request: typeof fetch, timeoutMs: number): typeof fetch {
-  return (input, init) => {
+  return async (input, init) => {
     const timeout = AbortSignal.timeout(timeoutMs);
     const caller = init?.signal;
     const signal = caller == null ? timeout : AbortSignal.any([caller, timeout]);
-    return request(input, { ...init, signal });
+    const response = await request(input, { ...init, signal });
+    if (!response.ok || response.body === null) return response;
+    return bufferGitHubResponse(response, signal);
   };
+}
+
+async function bufferGitHubResponse(response: Response, signal: AbortSignal): Promise<Response> {
+  // Octokit can swallow a body read failure and report a successful request.
+  const body = await response.arrayBuffer().catch((error: unknown) => {
+    signal.throwIfAborted();
+    throw error;
+  });
+  signal.throwIfAborted();
+  const buffered = new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+  return Object.defineProperty(buffered, "url", { value: response.url });
 }
 
 function githubApiVersionHeader() {
