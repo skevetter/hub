@@ -1899,13 +1899,13 @@ class MemoryDatabase implements Database {
     for (const step of steps) stepCounts[step.status] = (stepCounts[step.status] ?? 0) + 1;
     const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
     if (receipt === undefined) throw new Error("run payload receipt unavailable");
-    const summary = summarizeRunPayload(
+    const summary = summarizeRunPayload({
       run,
       receipt,
       stepCounts,
-      this.runTimelineStates.get(run.id),
-      this.runProgressMessages.get(run.id),
-    );
+      timeline: this.runTimelineStates.get(run.id),
+      progress: this.runProgressMessages.get(run.id),
+    });
     const reduced = {
       ...run,
       payloadExpiredAt: new Date(now),
