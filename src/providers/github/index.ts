@@ -311,12 +311,21 @@ function createGitHubCommentClient(appAuth: GitHubAuth, appSlug: string): GitHub
       const octokit = await appAuth.createInstallationOctokit(installationId);
       const { data: comments } = await octokit.request(
         "GET /repos/{owner}/{repo}/issues/{issue_number}/comments",
-        { owner, repo, issue_number: issueNumber, since, per_page: 100, request: { retries: 0 } },
+        {
+          owner,
+          repo,
+          issue_number: issueNumber,
+          ...(since === undefined ? {} : { since }),
+          per_page: 100,
+          request: { retries: 0 },
+        },
       );
       const token = await appAuth.getInstallationToken(installationId);
       const bot = await appAuth.getAppBotIdentity(appSlug, token);
       return comments.find(
-        (comment) => comment.user?.id === bot.id && comment.body?.includes(marker),
+        (comment) =>
+          comment.user?.id === bot.id &&
+          comment.body?.split(/\r\n?|\n/u).some((line) => line.trim() === marker),
       )?.id;
     },
     async createIssueComment({ installationId, owner, repo, issueNumber, body }) {

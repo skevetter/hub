@@ -13,6 +13,7 @@ import {
 } from "../failure-notice.js";
 import type { Conversation } from "../continuation.js";
 import type { GitHubCommentClient } from "./reply.js";
+import { billingNoticeSince, executionLimitNoticeMarker } from "./billing-notice.js";
 import { matchGitHubInvocations } from "./match.js";
 import {
   IssueCommentPayloadSchema,
@@ -261,12 +262,13 @@ async function postExecutionLimitNotice(
   const [owner, repo] = splitRepo(triggerContext.target.repository);
   await deletePreviousReaction(options.reactions, triggerContext, githubReactionId(reactionState));
   const { delivery_id, received_at } = triggerContext.event.github;
-  const marker = `<!-- paseo-notice:execution-limit:${encodeURIComponent(delivery_id)}:${issueNumber} -->`;
+  const marker = executionLimitNoticeMarker(delivery_id, issueNumber);
+  const since = billingNoticeSince(received_at);
   const target = { installationId: triggerContext.target.installationId, owner, repo, issueNumber };
   const existing = await options.comments.findIssueCommentByMarker({
     ...target,
     marker,
-    since: received_at,
+    ...(since === undefined ? {} : { since }),
   });
   if (existing !== undefined) return;
 

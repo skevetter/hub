@@ -99,7 +99,7 @@ describe("GitHub Phase 1 trigger provider", () => {
         }),
         reactionState,
       );
-      const marker = "\n\n<!-- paseo-notice:execution-limit:github-delivery-1:211 -->";
+      const marker = "\n\n<!-- paseo-notice:execution-limit:github%2Ddelivery%2D1:211 -->";
       const [comment] = comments;
       assert.equal(comments.length, 1);
       assert.ok(comment);

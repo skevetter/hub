@@ -37,7 +37,7 @@ export interface GitHubCommentClient extends GitHubReplyClient {
     repo: string;
     issueNumber: number;
     marker: string;
-    since: string;
+    since?: string;
   }): Promise<number | undefined>;
   updateIssueComment(input: {
     installationId: number;
