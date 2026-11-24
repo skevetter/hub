@@ -151,10 +151,11 @@ function useRunStop(
     mutationFn: (confirmation: StopConfirmation) =>
       sendStop({ data: { organizationSlug, runId, ...confirmation } }),
     onSuccess: async (result) => {
-      if (result.status === "ok" && result.data.status === "stopped")
-        await queryClient.invalidateQueries({
-          queryKey: runDetailKey(organizationSlug, detail.run.id),
-        });
+      if (result.status !== "ok" || result.data.status !== "stopped") return;
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: runDetailKey(organizationSlug, detail.run.id) }),
+        queryClient.invalidateQueries({ queryKey: ["attention"] }),
+      ]);
     },
   });
   const sendConfirmation = stop.mutateAsync;
