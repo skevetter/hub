@@ -8,7 +8,7 @@ import runtimeFiles from "./test-runtime-files.json" with { type: "json" };
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -393,13 +393,13 @@ test("test-changed stops the selected Vitest run with its descendants and remove
       }
       assert.ok(started, output || "Selected Vitest child did not start");
       const lock = join(root, "status-lock");
-      assert.equal(JSON.parse(await readFile(lock, "utf8")).pid, caller.pid);
+      assert.equal(JSON.parse(await readFile(join(lock, "pid"), "utf8")).pid, caller.pid);
       caller.kill(signal);
       const [code, terminatedBy] = await once(caller, "exit", {
         signal: AbortSignal.timeout(5500),
       });
       if (signal === "SIGINT") assert.equal(await readFile(marker + "-signal", "utf8"), signal);
-      await assert.rejects(readFile(lock), { code: "ENOENT" });
+      await assert.rejects(stat(lock), { code: "ENOENT" });
       assert.equal(terminatedBy, null);
       assert.equal(code, 1);
       assert.match(output, new RegExp(`INTERRUPTED: ${signal}`, "u"));
@@ -491,7 +491,7 @@ test("TERM during changed-runner cleanup prevents successful metrics", async (t)
     assert.match(output, /1 passed, 0 failed/u);
     assert.match(output, /INTERRUPTED: SIGTERM/u);
     await assert.rejects(readFile(metrics), { code: "ENOENT" });
-    await assert.rejects(readFile(lock), { code: "ENOENT" });
+    await assert.rejects(stat(lock), { code: "ENOENT" });
     assert.deepEqual(await readdir(temp), []);
   } finally {
     if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
@@ -553,7 +553,7 @@ test("the changed runner fails if a passing worker leaves background children", 
     assert.equal(result.status, 1);
     assert.match(result.stderr, /background children were still running/iu);
     await assert.rejects(readFile(metrics), { code: "ENOENT" });
-    await assert.rejects(readFile(lock), { code: "ENOENT" });
+    await assert.rejects(stat(lock), { code: "ENOENT" });
   } finally {
     const pid = Number(await readFile(join(root, "status-descendant"), "utf8").catch(() => ""));
     if (pid) {

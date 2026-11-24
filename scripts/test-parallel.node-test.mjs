@@ -2,9 +2,19 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 
-import { constants, existsSync } from "node:fs";
+import { constants, existsSync, mkdirSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 
-import { mkdir, mkdtemp, open, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -362,23 +372,220 @@ test("a zero exit still fails for missing, empty, or unexpected reports", async 
   }
 });
 
-test("takes over a stale full-suite lock and refuses a live owner", async (t) => {
+async function tempLock(t) {
   const directory = await mkdtemp(join(tmpdir(), "hub-fake-lock-"));
   t.after(() => rm(directory, { recursive: true }));
-  const path = join(directory, "lock");
+  return join(directory, "lock");
+}
+
+async function readOwner(path) {
+  return JSON.parse(await readFile(join(path, "pid"), "utf8"));
+}
+
+test("takes over a stale full-suite lock with a mismatched start time", async (t) => {
+  const path = await tempLock(t);
+  await mkdir(path);
+  await writeFile(
+    join(path, "pid"),
+    JSON.stringify({ pid: process.pid, startTime: "old start", groups: [] }),
+  );
+  await writeFile(join(path, "pid.00000000-0000-0000-0000-000000000000.tmp"), "unfinished update");
   const messages = [];
-  await writeFile(path, JSON.stringify({ pid: process.pid, startTime: "old start", groups: [] }));
   const lock = await takeFullSuiteLock(path, (line) => messages.push(line));
-  try {
-    assert.match(messages.join("\n"), /stale full-suite lock/u);
-    const owner = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(owner.pid, process.pid);
-    assert.notEqual(owner.startTime, "old start");
-    await assert.rejects(takeFullSuiteLock(path), /lock is held/u);
-  } finally {
-    await lock.release();
+  assert.deepEqual(messages, [
+    `Reclaiming stale full-suite lock at ${path} from PID ${process.pid}.`,
+  ]);
+  const owner = await readOwner(path);
+  assert.equal(owner.pid, process.pid);
+  assert.notEqual(owner.startTime, "old start");
+  lock.release();
+});
+
+test("refuses a live full-suite owner and reports its PID", async (t) => {
+  const path = await tempLock(t);
+  const lock = await takeFullSuiteLock(path);
+  const owner = await readOwner(path);
+  await assert.rejects(takeFullSuiteLock(path), {
+    message: `The full-suite lock is held at ${path}. Owner PID ${process.pid}.`,
+  });
+  assert.deepEqual(await readOwner(path), owner);
+  lock.release();
+});
+
+test("refuses a hand-made directory with no usable pid file", async (t) => {
+  const path = await tempLock(t);
+  await mkdir(path);
+  assert.equal(fullSuiteLockHeld(path), true);
+  await assert.rejects(takeFullSuiteLock(path), /no pid file/u);
+  assert.ok((await stat(path)).isDirectory());
+  await writeFile(join(path, "pid"), "{");
+  assert.equal(fullSuiteLockHeld(path), true);
+  await assert.rejects(takeFullSuiteLock(path), /no pid file/u);
+  assert.equal(await readFile(join(path, "pid"), "utf8"), "{");
+});
+
+test("refuses a legacy lock file without changing it", async (t) => {
+  const path = await tempLock(t);
+  await writeFile(path, "legacy");
+  assert.equal(fullSuiteLockHeld(path), true);
+  await assert.rejects(takeFullSuiteLock(path), /not a directory.*removing it by hand/u);
+  assert.equal(await readFile(path, "utf8"), "legacy");
+});
+
+test("refuses a live plain PID", async (t) => {
+  const path = await tempLock(t);
+  await mkdir(path);
+  await writeFile(join(path, "pid"), `${process.pid}\n`);
+  assert.equal(fullSuiteLockHeld(path), true);
+  await assert.rejects(takeFullSuiteLock(path), {
+    message: `The full-suite lock is held at ${path}. Owner PID ${process.pid}.`,
+  });
+});
+
+test("reclaims a dead plain PID", async (t) => {
+  const path = await tempLock(t);
+  const exited = spawn(process.execPath, ["-e", ""]);
+  assert.deepEqual(await once(exited, "exit"), [0, null]);
+  await mkdir(path);
+  await writeFile(join(path, "pid"), `${exited.pid}\n`);
+  assert.equal(fullSuiteLockHeld(path), false);
+  const messages = [];
+  const lock = await takeFullSuiteLock(path, (line) => messages.push(line));
+  assert.deepEqual(messages, [
+    `Reclaiming stale full-suite lock at ${path} from PID ${exited.pid}.`,
+  ]);
+  assert.equal((await readOwner(path)).pid, process.pid);
+  lock.release();
+});
+
+test("release removes the pid file and its directory", async (t) => {
+  const path = await tempLock(t);
+  const lock = await takeFullSuiteLock(path);
+  assert.ok((await stat(path)).isDirectory());
+  assert.ok((await stat(join(path, "pid"))).isFile());
+  lock.release();
+  await assert.rejects(stat(join(path, "pid")), { code: "ENOENT" });
+  await assert.rejects(stat(path), { code: "ENOENT" });
+});
+
+test("release refuses while groups are registered", async (t) => {
+  const path = await tempLock(t);
+  const lock = await takeFullSuiteLock(path);
+  lock.track(process.pid);
+  assert.throws(() => lock.release(), /groups remain registered/u);
+  assert.deepEqual(
+    (await readOwner(path)).groups.map(({ pid }) => pid),
+    [process.pid],
+  );
+  lock.forget(process.pid);
+  lock.release();
+});
+
+test("release refuses to remove a different owner's pid file", async (t) => {
+  const path = await tempLock(t);
+  const lock = await takeFullSuiteLock(path);
+  const replacement = { ...(await readOwner(path)), token: "replacement" };
+  await writeFile(join(path, "pid"), JSON.stringify(replacement));
+  assert.throws(() => lock.release(), /lock changed owners/u);
+  assert.deepEqual(await readOwner(path), replacement);
+});
+
+const lockModule = new URL("./test-worker-group.mjs", import.meta.url).href;
+
+function lockContender(path) {
+  const code = `
+    import { once } from "node:events";
+    import { takeFullSuiteLock } from ${JSON.stringify(lockModule)};
+    const start = once(process, "message");
+    const finish = once(process, "disconnect");
+    process.send("ready");
+    await start;
+    let lock;
+    try {
+      lock = await takeFullSuiteLock(process.argv[1], () => {});
+      process.send("won");
+    } catch (error) {
+      process.send(error.message);
+    }
+    await finish;
+    lock?.release();
+  `;
+  return spawn(process.execPath, ["--input-type=module", "-e", code, "--", path], {
+    stdio: ["ignore", "ignore", "inherit", "ipc"],
+  });
+}
+
+test("exactly one concurrent taker wins", async (t) => {
+  for (const mode of ["fresh", "stale"]) {
+    await t.test(mode, async (t) => {
+      const path = await tempLock(t);
+      if (mode === "stale") {
+        await mkdir(path);
+        await writeFile(
+          join(path, "pid"),
+          JSON.stringify({ pid: process.pid, startTime: "old start", groups: [] }),
+        );
+      }
+      const children = Array.from({ length: 6 }, () => lockContender(path));
+      const exits = children.map((child) => once(child, "exit"));
+      const signal = AbortSignal.timeout(10_000);
+      try {
+        await Promise.all(children.map((child) => once(child, "message", { signal })));
+        const results = Promise.all(children.map((child) => once(child, "message", { signal })));
+        for (const child of children) child.send("take");
+        const outcomes = (await results).map(([outcome]) => outcome);
+        assert.equal(
+          outcomes.filter((result) => result === "won").length,
+          1,
+          JSON.stringify(outcomes),
+        );
+        for (const result of outcomes.filter((result) => result !== "won"))
+          assert.match(result, /The full-suite lock is held at/u);
+        assert.equal((await readOwner(path)).pid, children[outcomes.indexOf("won")].pid);
+      } finally {
+        for (const child of children) {
+          if (child.connected) child.disconnect();
+        }
+        await Promise.all(exits);
+      }
+      await assert.rejects(stat(path), { code: "ENOENT" });
+    });
   }
-  await assert.rejects(readFile(path), { code: "ENOENT" });
+});
+
+test("a reclaim race loser keeps the winner's lock", async (t) => {
+  const path = await tempLock(t);
+  const pidFile = join(path, "pid");
+  await mkdir(path);
+  await writeFile(
+    pidFile,
+    JSON.stringify({ pid: process.pid, startTime: "old start", groups: [] }),
+  );
+  const winner = `${process.pid}\n`;
+  await assert.rejects(
+    takeFullSuiteLock(path, () => {
+      unlinkSync(pidFile);
+      rmdirSync(path);
+      mkdirSync(path);
+      writeFileSync(pidFile, winner);
+    }),
+    /lock is held/u,
+  );
+  assert.equal(await readFile(pidFile, "utf8"), winner);
+});
+
+test("a reclaim race loser keeps an owner with the same PID and a different token", async (t) => {
+  const path = await tempLock(t);
+  const pidFile = join(path, "pid");
+  const staleOwner = { pid: process.pid, startTime: "old start", token: "stale", groups: [] };
+  const winner = { ...staleOwner, token: "winner" };
+  await mkdir(path);
+  await writeFile(pidFile, JSON.stringify(staleOwner));
+  await assert.rejects(
+    takeFullSuiteLock(path, () => writeFileSync(pidFile, JSON.stringify(winner))),
+    /lock is held/u,
+  );
+  assert.deepEqual(await readOwner(path), winner);
 });
 
 test("waits for a worker group on abort and escalates when a descendant ignores TERM", async (t) => {
@@ -408,11 +615,11 @@ test("waits for a worker group on abort and escalates when a descendant ignores 
   );
   try {
     await waitFor(() => existsSync(ready), "fake child did not start");
-    assert.equal(JSON.parse(await readFile(path, "utf8")).groups.length, 1);
+    assert.equal((await readOwner(path)).groups.length, 1);
     controller.abort("SIGTERM");
     const result = await worker;
     assert.notEqual(result.exitCode, 0);
-    assert.equal(JSON.parse(await readFile(path, "utf8")).groups.length, 0);
+    assert.equal((await readOwner(path)).groups.length, 0);
   } finally {
     controller.abort("SIGTERM");
     await worker.catch(() => undefined);
@@ -437,7 +644,7 @@ test("recovers a killed runner's lock after its recorded group exits", async (t)
   const ready = join(directory, "worker-ready");
   const code = `
     import { open } from "node:fs/promises";
-    import { takeFullSuiteLock, runWorkerGroup } from ${JSON.stringify(new URL("./test-worker-group.mjs", import.meta.url).href)};
+    import { takeFullSuiteLock, runWorkerGroup } from ${JSON.stringify(lockModule)};
     const [path, ready] = process.argv.slice(1);
     const lock = await takeFullSuiteLock(path);
     const log = await open(path + ".log", "w");
@@ -460,7 +667,7 @@ test("recovers a killed runner's lock after its recorded group exits", async (t)
   const messages = [];
   const replacement = await takeFullSuiteLock(path, (message) => messages.push(message));
   assert.match(messages.join("\n"), /stale full-suite lock/u);
-  assert.deepEqual(JSON.parse(await readFile(path, "utf8")).groups, []);
+  assert.deepEqual((await readOwner(path)).groups, []);
   replacement.release();
 });
 
@@ -470,7 +677,11 @@ test("a symlinked runner path still executes the CLI", async (t) => {
   const runner = fileURLToPath(new URL("./test-parallel.mjs", import.meta.url));
   await symlink(dirname(runner), join(directory, "scripts"), "dir");
   const result = spawnSync(process.execPath, [join(directory, "scripts/test-parallel.mjs")], {
-    env: { ...process.env, TEST_SHARDS: "invalid" },
+    env: {
+      ...process.env,
+      TEST_SHARDS: "invalid",
+      HUB_TEST_FULLSUITE_LOCK: join(directory, "lock"),
+    },
     encoding: "utf8",
   });
   assert.equal(result.status, 1);
@@ -598,7 +809,8 @@ test("reruns see a lock as held only while its owner or recorded groups run", as
   const exited = spawn(process.execPath, ["-e", ""]);
   await once(exited, "exit");
   const owner = { pid: exited.pid, startTime: "Thu Jan  1 00:00:00 1970", groups: [] };
-  await writeFile(path, JSON.stringify(owner));
+  await mkdir(path);
+  await writeFile(join(path, "pid"), JSON.stringify(owner));
   assert.equal(fullSuiteLockHeld(path), false);
 
   const worker = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
@@ -608,14 +820,16 @@ test("reruns see a lock as held only while its owner or recorded groups run", as
   t.after(() => {
     if (worker.exitCode === null) worker.kill("SIGKILL");
   });
-  await writeFile(
-    path,
-    JSON.stringify({ ...owner, groups: [{ pid: worker.pid, startTime: "unknown" }] }),
-  );
+  const workerOwner = { ...owner, groups: [{ pid: worker.pid, startTime: "unknown" }] };
+  await writeFile(join(path, "pid"), JSON.stringify(workerOwner));
   assert.equal(fullSuiteLockHeld(path), true);
+  await assert.rejects(takeFullSuiteLock(path), /lock is held/u);
+  assert.deepEqual(await readOwner(path), workerOwner);
   worker.kill("SIGKILL");
   await once(worker, "exit");
   assert.equal(fullSuiteLockHeld(path), false);
+  const replacement = await takeFullSuiteLock(path, () => {});
+  replacement.release();
 });
 
 async function parallelFixture(t, run, files = ["selected.test.ts"]) {
@@ -690,7 +904,7 @@ test("a serial rerun owns the full-suite lock until its worker exits", async (t)
   const exited = once(caller, "exit");
   try {
     await waitFor(() => existsSync(join(root, "ready")), "serial worker did not start");
-    assert.equal(JSON.parse(await readFile(lock, "utf8")).pid, caller.pid);
+    assert.equal((await readOwner(lock)).pid, caller.pid);
     const contender = spawnSync(process.execPath, args, {
       ...options,
       encoding: "utf8",
@@ -705,7 +919,7 @@ test("a serial rerun owns the full-suite lock until its worker exits", async (t)
     await writeFile(join(root, "release"), "");
     assert.deepEqual(await exited, [0, null]);
   }
-  await assert.rejects(readFile(lock), { code: "ENOENT" });
+  await assert.rejects(stat(lock), { code: "ENOENT" });
 });
 
 test("TERM after the serial worker exits cannot turn its report into a pass", async (t) => {
@@ -754,7 +968,7 @@ test("TERM after the serial worker exits cannot turn its report into a pass", as
     await exited;
     assert.match(output, /INTERRUPTED/u);
     assert.doesNotMatch(output, /Serial rerun: PASS/u);
-    await assert.rejects(readFile(lock), { code: "ENOENT" });
+    await assert.rejects(stat(lock), { code: "ENOENT" });
   } finally {
     if (writer) await writer.close();
     if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
@@ -824,7 +1038,7 @@ test("TERM during a shard report read preserves the prior timing cache", async (
     assert.match(output, /INTERRUPTED: SIGTERM/u);
     await assert.rejects(readFile(metrics), { code: "ENOENT" });
     assert.equal(await readFile(cache, "utf8"), previous);
-    await assert.rejects(readFile(lock), { code: "ENOENT" });
+    await assert.rejects(stat(lock), { code: "ENOENT" });
   } finally {
     if (caller.exitCode === null && caller.signalCode === null) caller.kill("SIGKILL");
     await exited;
@@ -959,7 +1173,7 @@ test("parallel shards and serial reruns fail when a passing worker leaves backgr
         assert.match(result.stdout, /background children were still running/iu);
         assert.doesNotMatch(result.stdout, /: PASS/u);
         await assert.rejects(readFile(metrics), { code: "ENOENT" });
-        await assert.rejects(readFile(lock), { code: "ENOENT" });
+        await assert.rejects(stat(lock), { code: "ENOENT" });
       } finally {
         const pid = Number(await readFile(join(root, "descendant"), "utf8").catch(() => ""));
         if (pid) {
