@@ -1451,22 +1451,7 @@ class MemoryDatabase implements Database {
   };
 
   private receiptProof(receipt: ProviderEventReceiptRecord, cutoff: Date) {
-    const branches: ReceiptProofBranch[] = [];
-    for (const project of this.triggerRunIdsByProviderEventReceipt.get(receipt.id)?.values() ??
-      []) {
-      for (const id of project.values()) {
-        const run = this.triggerRuns.get(id);
-        if (run === undefined) continue;
-        const work = this.runPayloadWorkDisposition(run);
-        const blocker = work === "live" || work === "cleanup_blocked" ? "live_execution" : work;
-        branches.push({
-          ...run,
-          payloadExpiryState: run.payloadExpiryState ?? null,
-          payloadExpiredAt: run.payloadExpiredAt ?? null,
-          blocker: blocker === "eligible" ? null : blocker,
-        });
-      }
-    }
+    const branches = this.receiptProofBranches(receipt.id);
     const connections =
       receipt.provider === "github"
         ? this.githubConnections.values()
@@ -1500,6 +1485,29 @@ class MemoryDatabase implements Database {
       (id) => this.configurationRevisions.get(id),
       cutoff,
     );
+  }
+
+  private receiptProofBranches(receiptId: string) {
+    const branches: ReceiptProofBranch[] = [];
+    for (const project of this.triggerRunIdsByProviderEventReceipt.get(receiptId)?.values() ?? []) {
+      for (const id of project.values()) {
+        const run = this.triggerRuns.get(id);
+        if (run === undefined) continue;
+        branches.push(this.receiptProofBranch(run));
+      }
+    }
+    return branches;
+  }
+
+  private receiptProofBranch(run: TriggerRunRecord): ReceiptProofBranch {
+    const work = this.runPayloadWorkDisposition(run);
+    const blocker = work === "live" || work === "cleanup_blocked" ? "live_execution" : work;
+    return {
+      ...run,
+      payloadExpiryState: run.payloadExpiryState ?? null,
+      payloadExpiredAt: run.payloadExpiredAt ?? null,
+      blocker: blocker === "eligible" ? null : blocker,
+    };
   }
 
   scanGitHubSyncPayloads: Database["scanGitHubSyncPayloads"] = async (after, cutoff, limit) =>
@@ -1744,13 +1752,7 @@ class MemoryDatabase implements Database {
       this.runPayloadExecutions(run, steps).some(isRunExecutionUnfinished)
     )
       return "live";
-    if (
-      run.outcome === "accepted" &&
-      (run.terminalNotificationLeaseExpiresAt !== null ||
-        (run.terminalNotificationPendingAt !== null &&
-          run.terminalNotificationDeliveredAt === null))
-    )
-      return "notification_pending";
+    if (hasPendingRunNotification(run)) return "notification_pending";
     const message = this.runProgressMessages.get(run.id);
     if (message !== undefined && isProgressUnsettled(message)) return "reporter_pending";
     return "eligible";
@@ -2748,11 +2750,7 @@ class MemoryDatabase implements Database {
     input: CreateAcceptedTriggerRunInput,
     replay?: "acknowledge",
   ): Promise<TriggerRunAdmission<AcceptedTriggerRunRecord>> {
-    const projectRuns =
-      this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
-      new Map<string, Map<string, string>>();
-    const triggerRuns = projectRuns.get(input.projectId) ?? new Map<string, string>();
-    const existingId = triggerRuns.get(input.configuredTriggerName);
+    const { projectRuns, triggerRuns, existingId } = this.triggerRunBranchIndex(input);
     const marked = this.checkReceiptAdmission(input, existingId, replay);
     if (marked !== undefined) return marked;
     if (existingId !== undefined) {
@@ -2763,31 +2761,7 @@ class MemoryDatabase implements Database {
       return { run: existing, created: false };
     }
     const now = input.createdAt ?? this.options.now?.() ?? new Date();
-    const run: AcceptedTriggerRunRecord = {
-      conversation: structuredClone(input.conversation ?? null),
-      id: input.id ?? randomUUID(),
-      organizationId: input.organizationId,
-      projectId: input.projectId,
-      configurationRevisionId: input.configurationRevisionId,
-      providerEventReceiptId: input.providerEventReceiptId,
-      configuredTriggerName: input.configuredTriggerName,
-      outcome: "accepted",
-      status: "running",
-      prompt: input.prompt,
-      inputs: freezeEvidence(input.inputs),
-      values: freezeEvidence(input.values ?? {}),
-      triggerContext: freezeEvidence(input.triggerContext),
-      outputContext: freezeEvidence(input.outputContext),
-      deadlineAt: input.deadlineAt,
-      deadlineKind: null,
-      failureReason: null,
-      reactionState: null,
-      terminalNotificationPendingAt: null,
-      terminalNotificationDeliveredAt: null,
-      terminalNotificationLeaseExpiresAt: null,
-      createdAt: now,
-      completedAt: null,
-    };
+    const run = newAcceptedTriggerRun(input, now);
     this.addOrganizationRun(run);
     if (input.replyMessage === true) {
       this.replyDeliveries.set(run.id, {
@@ -2805,31 +2779,7 @@ class MemoryDatabase implements Database {
     triggerRuns.set(input.configuredTriggerName, run.id);
     projectRuns.set(input.projectId, triggerRuns);
     this.triggerRunIdsByProviderEventReceipt.set(input.providerEventReceiptId, projectRuns);
-    for (const [ordinal, stepId] of input.stepIds.entries()) {
-      const step: WorkflowStepRunRecord = {
-        id: randomUUID(),
-        triggerRunId: run.id,
-        stepId,
-        ordinal,
-        status: "pending",
-        agentExecutionId: null,
-        output: null,
-        failureReason: null,
-        deadlineKind: null,
-        deadlineAt: null,
-        idleDeadlineAt: null,
-        startedAt: null,
-        completedAt: null,
-        dispatchIntent: null,
-      };
-      this.workflowStepRuns.set(step.id, step);
-    }
-    this.workflowWakeups.set(run.id, {
-      triggerRunId: run.id,
-      availableAt: now,
-      leaseExpiresAt: null,
-      leasedBeforeClaim: false,
-    });
+    this.addInitialWorkflowSteps(run, input, now);
     return { run, created: true };
   }
 
@@ -2844,11 +2794,7 @@ class MemoryDatabase implements Database {
     input: CreateRejectedTriggerRunInput,
     replay?: "acknowledge",
   ): Promise<TriggerRunAdmission<RejectedTriggerRunRecord>> {
-    const projectRuns =
-      this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
-      new Map<string, Map<string, string>>();
-    const triggerRuns = projectRuns.get(input.projectId) ?? new Map<string, string>();
-    const existingId = triggerRuns.get(input.configuredTriggerName);
+    const { projectRuns, triggerRuns, existingId } = this.triggerRunBranchIndex(input);
     const marked = this.checkReceiptAdmission(input, existingId, replay);
     if (marked !== undefined) return marked;
     if (existingId !== undefined) {
@@ -2883,6 +2829,49 @@ class MemoryDatabase implements Database {
     projectRuns.set(input.projectId, triggerRuns);
     this.triggerRunIdsByProviderEventReceipt.set(input.providerEventReceiptId, projectRuns);
     return { run, created: true };
+  }
+
+  private triggerRunBranchIndex(
+    input: CreateAcceptedTriggerRunInput | CreateRejectedTriggerRunInput,
+  ) {
+    const projectRuns =
+      this.triggerRunIdsByProviderEventReceipt.get(input.providerEventReceiptId) ??
+      new Map<string, Map<string, string>>();
+    const triggerRuns = projectRuns.get(input.projectId) ?? new Map<string, string>();
+    const existingId = triggerRuns.get(input.configuredTriggerName);
+    return { projectRuns, triggerRuns, existingId };
+  }
+
+  private addInitialWorkflowSteps(
+    run: AcceptedTriggerRunRecord,
+    input: CreateAcceptedTriggerRunInput,
+    now: Date,
+  ) {
+    for (const [ordinal, stepId] of input.stepIds.entries()) {
+      const step: WorkflowStepRunRecord = {
+        id: randomUUID(),
+        triggerRunId: run.id,
+        stepId,
+        ordinal,
+        status: "pending",
+        agentExecutionId: null,
+        output: null,
+        failureReason: null,
+        deadlineKind: null,
+        deadlineAt: null,
+        idleDeadlineAt: null,
+        startedAt: null,
+        completedAt: null,
+        dispatchIntent: null,
+      };
+      this.workflowStepRuns.set(step.id, step);
+    }
+    this.workflowWakeups.set(run.id, {
+      triggerRunId: run.id,
+      availableAt: now,
+      leaseExpiresAt: null,
+      leasedBeforeClaim: false,
+    });
   }
 
   private checkReceiptAdmission(
@@ -3925,49 +3914,49 @@ class MemoryDatabase implements Database {
   async acceptGitHubEvent(input: AcceptGitHubEventInput): Promise<ProviderEventAcceptance> {
     const binding = await this.findGitHubConnection(input.installationId);
     const reason = githubDropReason(input, binding);
-    return this.acceptMemoryEvent(
+    return this.acceptMemoryEvent({
       input,
-      binding?.organizationId,
-      binding?.id,
-      input.repositoryId === undefined ? null : String(input.repositoryId),
+      organizationId: binding?.organizationId,
+      connectionId: binding?.id,
+      resourceId: input.repositoryId === undefined ? null : String(input.repositoryId),
       reason,
-    );
+    });
   }
 
   async acceptDiscordEvent(input: AcceptDiscordEventInput): Promise<ProviderEventAcceptance> {
     const binding = await this.findDiscordConnection(input.guildId);
     const reason = discordDropReason(input, binding);
-    return this.acceptMemoryEvent(
+    return this.acceptMemoryEvent({
       input,
-      binding?.organizationId,
-      binding?.id,
-      input.guildId,
+      organizationId: binding?.organizationId,
+      connectionId: binding?.id,
+      resourceId: input.guildId,
       reason,
-    );
+    });
   }
 
   async acceptSlackEvent(input: AcceptSlackEventInput): Promise<ProviderEventAcceptance> {
     const binding = await this.findSlackConnection(input.teamId);
     const reason = slackDropReason(input, binding);
-    return this.acceptMemoryEvent(
+    return this.acceptMemoryEvent({
       input,
-      binding?.organizationId,
-      binding?.id,
-      input.teamId,
+      organizationId: binding?.organizationId,
+      connectionId: binding?.id,
+      resourceId: input.teamId,
       reason,
-    );
+    });
   }
 
   async acceptLinearEvent(input: AcceptLinearEventInput): Promise<ProviderEventAcceptance> {
     const binding = await this.findLinearConnection(input.linearOrganizationId);
     const reason = linearDropReason(input, binding);
-    return this.acceptMemoryEvent(
+    return this.acceptMemoryEvent({
       input,
-      binding?.organizationId,
-      binding?.id,
-      input.projectId ?? null,
+      organizationId: binding?.organizationId,
+      connectionId: binding?.id,
+      resourceId: input.projectId ?? null,
       reason,
-    );
+    });
   }
 
   async findMarkedLinearReceipt(
@@ -3989,44 +3978,11 @@ class MemoryDatabase implements Database {
       input.deliveryId,
       input.signatureHash,
     );
-    if (existing !== undefined) {
-      const receipt = this.providerEventReceipts.get(existing);
-      if (receipt?.payloadExpiryState != null) {
-        if (input.publicTriggerName !== undefined || input.boundWebhookTrigger !== undefined)
-          this.validateMarkedManualReceipt(input, receipt);
-        return {
-          status: "duplicate",
-          providerEventReceiptId: receipt.id,
-          replayed: true,
-          payloadExpiryState: receipt.payloadExpiryState,
-        };
-      }
-      const route = receipt?.acceptedRoutes?.[0];
-      if (receipt === undefined || route === undefined) {
-        return {
-          status: "duplicate" as const,
-          providerEventReceiptId: existing,
-          replayed: true,
-        };
-      }
-      this.assertBoundWebhookReceipt(input, route);
-      return {
-        status: "accepted" as const,
-        replayed: true,
-        event: {
-          providerEventReceiptId: receipt.id,
-          organizationId: receipt.organizationId,
-          projectId: route.projectId,
-          configurationRevisionId: route.configurationRevisionId,
-          deliveryId: receipt.deliveryId,
-          source: receipt.source,
-          payload: receipt.payload,
-          receivedAt: receipt.receivedAt,
-          connectionId: route.connectionId,
-          resourceId: route.resourceId,
-        },
-      };
-    }
+    if (existing !== undefined) return this.replayManualEvent(input, existing);
+    return this.insertManualEvent(input);
+  }
+
+  private insertManualEvent(input: PersistManualEventInput): ManualEventPersistence {
     const project = this.projects.get(input.projectId);
     if (
       project?.organizationId !== input.organizationId ||
@@ -4049,19 +4005,47 @@ class MemoryDatabase implements Database {
       resourceId: input.resourceId ?? null,
     };
     this.providerEventReceipts.set(receipt.id, { ...receipt, acceptedRoutes: [route] });
+    return acceptedManualEvent(input, receipt, route);
+  }
+
+  private replayManualEvent(
+    input: PersistManualEventInput,
+    existing: string,
+  ): ManualEventPersistence {
+    const receipt = this.providerEventReceipts.get(existing);
+    if (receipt?.payloadExpiryState != null) {
+      if (input.publicTriggerName !== undefined || input.boundWebhookTrigger !== undefined)
+        this.validateMarkedManualReceipt(input, receipt);
+      return {
+        status: "duplicate",
+        providerEventReceiptId: receipt.id,
+        replayed: true,
+        payloadExpiryState: receipt.payloadExpiryState,
+      };
+    }
+    const route = receipt?.acceptedRoutes?.[0];
+    if (receipt === undefined || route === undefined) {
+      return {
+        status: "duplicate" as const,
+        providerEventReceiptId: existing,
+        replayed: true,
+      };
+    }
+    this.assertBoundWebhookReceipt(input, route);
     return {
       status: "accepted" as const,
+      replayed: true,
       event: {
         providerEventReceiptId: receipt.id,
-        organizationId: input.organizationId,
-        projectId: input.projectId,
+        organizationId: receipt.organizationId,
+        projectId: route.projectId,
         configurationRevisionId: route.configurationRevisionId,
-        deliveryId: input.deliveryId,
-        source: input.source,
-        payload: input.payload,
-        receivedAt: input.receivedAt,
-        connectionId: input.connectionId ?? null,
-        resourceId: input.resourceId ?? null,
+        deliveryId: receipt.deliveryId,
+        source: receipt.source,
+        payload: receipt.payload,
+        receivedAt: receipt.receivedAt,
+        connectionId: route.connectionId,
+        resourceId: route.resourceId,
       },
     };
   }
@@ -6582,10 +6566,7 @@ class MemoryDatabase implements Database {
           source: receipt.source,
           status: run.status,
           receivedAt: receipt.receivedAt,
-          agent:
-            run.payloadExpiredAt == null
-              ? launchedAgent(execution?.launchIntent?.agent)
-              : (launchedAgent(step?.payloadSummary) ?? launchedAgent(execution?.launchAgent)),
+          agent: organizationRunAgent(run, step, execution),
           payloadExpiredAt: run.payloadExpiredAt?.toISOString() ?? null,
         },
       ];
@@ -6653,6 +6634,13 @@ class MemoryDatabase implements Database {
     if (bound != null) return bound;
     const [route, other] = receipt.acceptedRoutes ?? [];
     if (route === undefined || other !== undefined) return null;
+    return this.singleRunTriggerForDroppedRoute(receipt, route);
+  }
+
+  private singleRunTriggerForDroppedRoute(
+    receipt: ProviderEventReceiptRecord,
+    route: { projectId: string },
+  ) {
     const triggers = [...this.organizationTriggers.values()].filter(
       (trigger) =>
         trigger.organizationId === receipt.organizationId &&
@@ -6932,44 +6920,15 @@ class MemoryDatabase implements Database {
     return attachment;
   }
 
-  private async acceptMemoryEvent(
-    input:
-      | AcceptGitHubEventInput
-      | AcceptDiscordEventInput
-      | AcceptSlackEventInput
-      | AcceptLinearEventInput,
-    organizationId: string | undefined,
-    connectionId: string | undefined,
-    resourceId: string | null,
-    reason: string | undefined,
-  ): Promise<ProviderEventAcceptance> {
+  private async acceptMemoryEvent({
+    input,
+    organizationId,
+    connectionId,
+    resourceId,
+    reason,
+  }: MemoryEventBinding): Promise<ProviderEventAcceptance> {
     const receiptId = this.findReceiptId(organizationId, input.deliveryId, input.signatureHash);
-    if (receiptId !== undefined) {
-      const receipt = this.providerEventReceipts.get(receiptId);
-      if (receipt === undefined) throw new Error("provider receipt unavailable");
-      const marked = markedProviderReplay(receipt);
-      if (marked !== undefined) return marked;
-      if (receipt.droppedReason !== null) {
-        return { status: "dropped", receiptId, reason: receipt.droppedReason };
-      }
-      if (receipt.acceptedRoutes === null) return { status: "duplicate", receiptId };
-      return {
-        status: "accepted",
-        receiptId,
-        events: receipt.acceptedRoutes.map((route) => ({
-          providerEventReceiptId: receipt.id,
-          organizationId: receipt.organizationId,
-          projectId: route.projectId,
-          configurationRevisionId: route.configurationRevisionId,
-          deliveryId: receipt.deliveryId,
-          source: receipt.source,
-          payload: receipt.payload,
-          receivedAt: receipt.receivedAt,
-          connectionId: route.connectionId,
-          resourceId: route.resourceId,
-        })),
-      };
-    }
+    if (receiptId !== undefined) return this.replayMemoryEvent(receiptId);
     if (organizationId === undefined || connectionId === undefined) {
       return {
         status: "dropped",
@@ -6977,6 +6936,43 @@ class MemoryDatabase implements Database {
         reason: reason ?? "provider_unbound",
       };
     }
+    return this.acceptBoundMemoryEvent({ input, organizationId, connectionId, resourceId, reason });
+  }
+
+  private replayMemoryEvent(receiptId: string): ProviderEventAcceptance {
+    const receipt = this.providerEventReceipts.get(receiptId);
+    if (receipt === undefined) throw new Error("provider receipt unavailable");
+    const marked = markedProviderReplay(receipt);
+    if (marked !== undefined) return marked;
+    if (receipt.droppedReason !== null) {
+      return { status: "dropped", receiptId, reason: receipt.droppedReason };
+    }
+    if (receipt.acceptedRoutes === null) return { status: "duplicate", receiptId };
+    return {
+      status: "accepted",
+      receiptId,
+      events: receipt.acceptedRoutes.map((route) => ({
+        providerEventReceiptId: receipt.id,
+        organizationId: receipt.organizationId,
+        projectId: route.projectId,
+        configurationRevisionId: route.configurationRevisionId,
+        deliveryId: receipt.deliveryId,
+        source: receipt.source,
+        payload: receipt.payload,
+        receivedAt: receipt.receivedAt,
+        connectionId: route.connectionId,
+        resourceId: route.resourceId,
+      })),
+    };
+  }
+
+  private acceptBoundMemoryEvent({
+    input,
+    organizationId,
+    connectionId,
+    resourceId,
+    reason,
+  }: BoundMemoryEvent): ProviderEventAcceptance {
     const provider = providerForInput(input);
     if (provider === "linear" && reason === "unsupported_event") {
       return this.acceptUnsupportedLinearReceipt(input, organizationId, connectionId);
@@ -7000,23 +6996,20 @@ class MemoryDatabase implements Database {
         reason,
       };
     }
-    const routes = Array.from(this.projectTriggerRoutes.entries()).flatMap(
-      ([projectId, candidates]) => {
-        const project = this.projects.get(projectId);
-        return project?.organizationId === organizationId &&
-          project.status === "active" &&
-          project.activeConfigurationRevisionId !== null
-          ? candidates
-              .filter(
-                (route) =>
-                  route.provider === provider &&
-                  route.connectionId === connectionId &&
-                  (route.resourceId === null || route.resourceId === resourceId),
-              )
-              .map((route) => Object.assign({}, route, { projectId }))
-          : [];
-      },
-    );
+    return this.routeMemoryEvent(receipt, {
+      input,
+      organizationId,
+      connectionId,
+      resourceId,
+      provider,
+    });
+  }
+
+  private routeMemoryEvent(
+    receipt: ProviderEventReceiptRecord,
+    { input, organizationId, connectionId, resourceId, provider }: MemoryEventRouting,
+  ): ProviderEventAcceptance {
+    const routes = this.memoryEventRoutes({ organizationId, connectionId, resourceId, provider });
     if (routes.length === 0) {
       this.providerEventReceipts.set(receipt.id, {
         ...receipt,
@@ -7050,6 +7043,29 @@ class MemoryDatabase implements Database {
     }));
     this.providerEventReceipts.set(receipt.id, { ...receipt, acceptedRoutes });
     return { status: "accepted", events, receiptId: receipt.id };
+  }
+
+  private memoryEventRoutes({
+    organizationId,
+    connectionId,
+    resourceId,
+    provider,
+  }: Omit<MemoryEventRouting, "input">) {
+    return Array.from(this.projectTriggerRoutes.entries()).flatMap(([projectId, candidates]) => {
+      const project = this.projects.get(projectId);
+      return project?.organizationId === organizationId &&
+        project.status === "active" &&
+        project.activeConfigurationRevisionId !== null
+        ? candidates
+            .filter(
+              (route) =>
+                route.provider === provider &&
+                route.connectionId === connectionId &&
+                (route.resourceId === null || route.resourceId === resourceId),
+            )
+            .map((route) => Object.assign({}, route, { projectId }))
+        : [];
+    });
   }
 
   private findReceiptId(
@@ -7208,6 +7224,59 @@ class MemoryDatabase implements Database {
   }
 }
 
+function acceptedManualEvent(
+  input: PersistManualEventInput,
+  receipt: ProviderEventReceiptRecord,
+  route: { configurationRevisionId: string },
+): ManualEventPersistence {
+  return {
+    status: "accepted" as const,
+    event: {
+      providerEventReceiptId: receipt.id,
+      organizationId: input.organizationId,
+      projectId: input.projectId,
+      configurationRevisionId: route.configurationRevisionId,
+      deliveryId: input.deliveryId,
+      source: input.source,
+      payload: input.payload,
+      receivedAt: input.receivedAt,
+      connectionId: input.connectionId ?? null,
+      resourceId: input.resourceId ?? null,
+    },
+  };
+}
+
+function newAcceptedTriggerRun(
+  input: CreateAcceptedTriggerRunInput,
+  now: Date,
+): AcceptedTriggerRunRecord {
+  return {
+    conversation: structuredClone(input.conversation ?? null),
+    id: input.id ?? randomUUID(),
+    organizationId: input.organizationId,
+    projectId: input.projectId,
+    configurationRevisionId: input.configurationRevisionId,
+    providerEventReceiptId: input.providerEventReceiptId,
+    configuredTriggerName: input.configuredTriggerName,
+    outcome: "accepted",
+    status: "running",
+    prompt: input.prompt,
+    inputs: freezeEvidence(input.inputs),
+    values: freezeEvidence(input.values ?? {}),
+    triggerContext: freezeEvidence(input.triggerContext),
+    outputContext: freezeEvidence(input.outputContext),
+    deadlineAt: input.deadlineAt,
+    deadlineKind: null,
+    failureReason: null,
+    reactionState: null,
+    terminalNotificationPendingAt: null,
+    terminalNotificationDeliveredAt: null,
+    terminalNotificationLeaseExpiresAt: null,
+    createdAt: now,
+    completedAt: null,
+  };
+}
+
 function initialAgentExecutionPayload(input: InsertAgentExecutionInput) {
   return {
     result: input.result ?? null,
@@ -7282,13 +7351,30 @@ function connectionPersistenceUnavailable(): never {
   throw new Error("connection persistence requires PostgreSQL");
 }
 
-function providerForInput(
-  input:
-    | AcceptGitHubEventInput
-    | AcceptDiscordEventInput
-    | AcceptSlackEventInput
-    | AcceptLinearEventInput,
-): "github" | "discord" | "slack" | "linear" {
+type MemoryEventInput =
+  | AcceptGitHubEventInput
+  | AcceptDiscordEventInput
+  | AcceptSlackEventInput
+  | AcceptLinearEventInput;
+
+interface MemoryEventBinding {
+  input: MemoryEventInput;
+  organizationId: string | undefined;
+  connectionId: string | undefined;
+  resourceId: string | null;
+  reason: string | undefined;
+}
+
+interface BoundMemoryEvent extends MemoryEventBinding {
+  organizationId: string;
+  connectionId: string;
+}
+
+type MemoryEventRouting = Omit<BoundMemoryEvent, "reason"> & {
+  provider: ReturnType<typeof providerForInput>;
+};
+
+function providerForInput(input: MemoryEventInput): "github" | "discord" | "slack" | "linear" {
   if ("installationId" in input) return "github";
   if ("guildId" in input) return "discord";
   return "teamId" in input ? "slack" : "linear";
@@ -7569,6 +7655,24 @@ function executionTransitionFields(
       : { deadlineCondition: input.deadlineCondition }),
     ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
   };
+}
+
+function organizationRunAgent(
+  run: TriggerRunRecord,
+  step: WorkflowStepRunRecord | undefined,
+  execution: AgentExecutionRecord | undefined,
+) {
+  return run.payloadExpiredAt == null
+    ? launchedAgent(execution?.launchIntent?.agent)
+    : (launchedAgent(step?.payloadSummary) ?? launchedAgent(execution?.launchAgent));
+}
+
+function hasPendingRunNotification(run: TriggerRunRecord): boolean {
+  return (
+    run.outcome === "accepted" &&
+    (run.terminalNotificationLeaseExpiresAt !== null ||
+      (run.terminalNotificationPendingAt !== null && run.terminalNotificationDeliveredAt === null))
+  );
 }
 
 function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {

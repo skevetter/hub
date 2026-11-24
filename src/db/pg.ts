@@ -427,7 +427,7 @@ async function stageRunPayload(client: QueryHandle, row: TriggerRunRow, now: Dat
   for (const count of counts.rows) stepCounts[count.status] = count.count;
   const summary = summarizeRunPayload(
     run,
-    receipt.rows[0]!,
+    requireReturnedRow(receipt.rows[0], "trigger run receipt"),
     stepCounts,
     timeline.rows[0],
     progress.rows[0],
@@ -1076,31 +1076,7 @@ class PgDatabase implements Database {
           if (record.outcome !== "rejected") throw new Error("trigger branch outcome conflict");
           return { run: record, created: false };
         }
-        const createdAt = input.createdAt ?? new Date();
-        const inserted = await client.query<TriggerRunRow>(
-          `insert into trigger_runs
-           (id, organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
-           configured_trigger_name, outcome, status,
-            prompt, inputs, values, trigger_context, output_context, deadline_at, rejection, created_at, completed_at)
-         values (coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6, 'rejected', 'rejected',
-                 $7, $8, '{}'::jsonb, $9, $10, null, $12, $11, $11)
-         on conflict (provider_event_receipt_id, project_id, configured_trigger_name) do nothing
-         returning *`,
-          [
-            input.id ?? null,
-            input.organizationId,
-            input.projectId,
-            input.configurationRevisionId,
-            input.providerEventReceiptId,
-            input.configuredTriggerName,
-            input.prompt,
-            input.inputs,
-            input.triggerContext,
-            input.outputContext,
-            createdAt,
-            input.rejection,
-          ],
-        );
+        const inserted = await insertRejectedTriggerRun(client, input);
         let run = inserted.rows[0];
         const created = run !== undefined;
         if (run === undefined) {
@@ -5866,24 +5842,38 @@ function activityRunFilterSql(request: ActivityRunPageRequest, params: unknown[]
   return filters.join("\n       ");
 }
 
+function insertRejectedTriggerRun(client: QueryHandle, input: CreateRejectedTriggerRunInput) {
+  const createdAt = input.createdAt ?? new Date();
+  return client.query<TriggerRunRow>(
+    `insert into trigger_runs
+           (id, organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
+           configured_trigger_name, outcome, status,
+            prompt, inputs, values, trigger_context, output_context, deadline_at, rejection, created_at, completed_at)
+         values (coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6, 'rejected', 'rejected',
+                 $7, $8, '{}'::jsonb, $9, $10, null, $12, $11, $11)
+         on conflict (provider_event_receipt_id, project_id, configured_trigger_name) do nothing
+         returning *`,
+    [
+      input.id ?? null,
+      input.organizationId,
+      input.projectId,
+      input.configurationRevisionId,
+      input.providerEventReceiptId,
+      input.configuredTriggerName,
+      input.prompt,
+      input.inputs,
+      input.triggerContext,
+      input.outputContext,
+      createdAt,
+      input.rejection,
+    ],
+  );
+}
+
 export function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
   const expired = row.payload_expiry_state != null;
   const evidence = toRunEvidence(row, expired);
-  if (row.outcome === "rejected") {
-    if (row.status !== "rejected" || row.rejection === null || row.rejection === undefined) {
-      throw new Error(`invalid rejected trigger run ${row.id}`);
-    }
-    const rejected: RejectedTriggerRunRecord = {
-      ...evidence,
-      outcome: "rejected",
-      status: "rejected",
-      rejection: expired
-        ? reduceRejection(parseInvocationRejection(row.rejection))
-        : parseInvocationRejection(row.rejection),
-      completedAt: row.completed_at ?? row.created_at,
-    };
-    return rejected;
-  }
+  if (row.outcome === "rejected") return toRejectedTriggerRunRecord(row, evidence, expired);
   if (row.outcome !== "accepted" || row.status === "rejected" || row.rejection !== null) {
     throw new Error(`invalid accepted trigger run ${row.id}`);
   }
@@ -5903,6 +5893,25 @@ export function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
     completedAt: row.completed_at,
   };
   return accepted;
+}
+
+function toRejectedTriggerRunRecord(
+  row: TriggerRunRow,
+  evidence: ReturnType<typeof toRunEvidence>,
+  expired: boolean,
+): RejectedTriggerRunRecord {
+  if (row.status !== "rejected" || row.rejection === null || row.rejection === undefined) {
+    throw new Error(`invalid rejected trigger run ${row.id}`);
+  }
+  return {
+    ...evidence,
+    outcome: "rejected",
+    status: "rejected",
+    rejection: expired
+      ? reduceRejection(parseInvocationRejection(row.rejection))
+      : parseInvocationRejection(row.rejection),
+    completedAt: row.completed_at ?? row.created_at,
+  };
 }
 
 function toRunEvidence(row: TriggerRunRow, expired: boolean) {
