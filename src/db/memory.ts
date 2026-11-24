@@ -3353,9 +3353,8 @@ class MemoryDatabase implements Database {
         );
       }
     }
-    const currentRun = this.triggerRuns.get(run.id);
-    if (currentRun?.status === "canceled")
-      return { stepRun: this.workflowStepRuns.get(step.id)!, execution: undefined, created: false };
+    const canceled = this.canceledWorkflowStepStart(step, run.id);
+    if (canceled !== undefined) return canceled;
     const { deadlineAt, idleDeadlineAt } = workflowStepExecutionDeadlines(input, run);
     const execution = await this.insertAgentExecution({
       ...input.execution,
@@ -3380,15 +3379,23 @@ class MemoryDatabase implements Database {
     return undefined;
   }
 
+  private canceledWorkflowStepStart(step: WorkflowStepRunRecord, runId: string) {
+    if (this.triggerRuns.get(runId)?.status !== "canceled") return undefined;
+    return {
+      stepRun: this.workflowStepRuns.get(step.id) ?? step,
+      execution: undefined,
+      created: false as const,
+    };
+  }
+
   private markWorkflowStepExecutionStarted(
     step: WorkflowStepRunRecord,
     run: AcceptedTriggerRunRecord,
     input: WorkflowStepExecutionInput,
     execution: AgentExecutionRecord,
   ) {
-    const currentStep = this.workflowStepRuns.get(step.id)!;
-    if (this.triggerRuns.get(run.id)?.status === "canceled")
-      return { stepRun: currentStep, execution: undefined, created: false };
+    const canceled = this.canceledWorkflowStepStart(step, run.id);
+    if (canceled !== undefined) return canceled;
     const updated: WorkflowStepRunRecord = {
       ...step,
       status: "running",
