@@ -430,7 +430,11 @@ function createGitHubAuthority(
           botLogin: bot.login,
         };
       } catch (error) {
-        await appAuth.revokeInstallationToken(token.token);
+        try {
+          await appAuth.revokeInstallationToken(token.token);
+        } catch {
+          // Revocation logs its own failure. Keep the identity error for the caller.
+        }
         throw error;
       }
     },
