@@ -84,7 +84,7 @@ for (const width of [1280, 390]) {
     await page.getByRole("combobox", { name: "Time range" }).selectOption("24h");
     await expect(page).toHaveURL(/[?&]range=24h/u);
     await rows.first().getByRole("link", { name: "Create one" }).click();
-    await expect(page).toHaveURL(/\/triggers\/new$/u);
+    await expect(page).toHaveURL(/\/triggers\/new\/edit$/u);
 
     await openSection("Home");
     const rejected = page

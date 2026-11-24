@@ -162,7 +162,7 @@ function appSurface(
       key: provider,
       label,
       where: `${name ?? label} is connected. Create a comment trigger and configure its filters and reply output.`,
-      next: { label: "New trigger", path: "triggers/new" },
+      next: { label: "New trigger", path: "triggers/new/edit" },
       examples,
     };
   }

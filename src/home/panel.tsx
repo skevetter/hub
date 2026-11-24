@@ -837,7 +837,7 @@ function triggerStep(
     status: TO_DO,
     action: (
       <Button asChild variant="outline" size="sm">
-        <Link to={`${base}/triggers/new` as never}>New trigger</Link>
+        <Link to={`${base}/triggers/new/edit` as never}>New trigger</Link>
       </Button>
     ),
   };

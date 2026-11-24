@@ -131,7 +131,7 @@ const LIST_HEADING_ID = "triggers-title";
 const LIST_FILTERS_ID = "triggers-filters";
 const NO_FILTERED_TRIGGERS = "No triggers match these filters";
 const triggerListRoute = getRouteApi("/_shell/o/$organizationSlug/triggers/");
-const triggerEditorRoute = getRouteApi("/_shell/o/$organizationSlug/triggers/$triggerId");
+const triggerEditorRoute = getRouteApi("/_shell/o/$organizationSlug/triggers/$triggerId/edit");
 const PROVIDER_OPTIONS = LIST_PROVIDERS.map((value) => ({
   value,
   label: LIST_PROVIDER_LABELS[value],
@@ -207,7 +207,7 @@ function TriggerList({
   refetch,
 }: TriggerListProps) {
   const editor = (triggerId: string) => ({
-    to: "/o/$organizationSlug/triggers/$triggerId" as const,
+    to: "/o/$organizationSlug/triggers/$triggerId/edit" as const,
     params: { organizationSlug, triggerId },
     search,
   });
@@ -353,10 +353,10 @@ function TriggerListTable({
   filtered: boolean;
   clear: ReactNode;
 }) {
-  const editor = (triggerId: string) => ({
+  const read = (triggerId: string) => ({
     to: "/o/$organizationSlug/triggers/$triggerId" as const,
     params: { organizationSlug, triggerId },
-    search,
+    state: { triggerListSearch: search },
   });
   return (
     <DataTable
@@ -373,7 +373,7 @@ function TriggerListTable({
       }
     >
       {data.triggers.map((trigger) => (
-        <TriggerListRow key={trigger.id} trigger={trigger} target={editor(trigger.id)} />
+        <TriggerListRow key={trigger.id} trigger={trigger} target={read(trigger.id)} />
       ))}
     </DataTable>
   );
@@ -382,7 +382,7 @@ function TriggerListTable({
 interface TriggerRowTarget {
   to: "/o/$organizationSlug/triggers/$triggerId";
   params: { organizationSlug: string; triggerId: string };
-  search: TriggerSearch;
+  state: { triggerListSearch: TriggerSearch };
 }
 
 function TriggerListRow({

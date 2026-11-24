@@ -126,7 +126,7 @@ run:
       await assert.rejects(store.save({ userId, yaml }), /non-empty filters.from_users allowlist/u);
       const snapshot = await dashboard.snapshot(request, "acme");
       const surface = thingsToTry(snapshot).find(({ key }) => key === "github");
-      assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new" });
+      assert.deepEqual(surface?.next, { label: "New trigger", path: "triggers/new/edit" });
       assert.doesNotMatch(surface?.where ?? "", /Comment on/u);
       return;
     }

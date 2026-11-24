@@ -391,7 +391,7 @@ function DropGuidance({
     event.workspaceOrRepo,
   );
   const create = linkOptions({
-    to: "/o/$organizationSlug/triggers/$triggerId",
+    to: "/o/$organizationSlug/triggers/$triggerId/edit",
     params: { organizationSlug, triggerId: "new" },
   });
   const connections = linkOptions({
@@ -433,7 +433,7 @@ function ReviewTriggerLink({
           search: { provider: event.provider },
         })
       : linkOptions({
-          to: "/o/$organizationSlug/triggers/$triggerId",
+          to: "/o/$organizationSlug/triggers/$triggerId/edit",
           params: { organizationSlug, triggerId: event.triggerId },
         });
   return (
