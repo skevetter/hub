@@ -215,6 +215,7 @@ it("withholds Profiles and profile creation when the URL organization role is me
 it("keeps profile management out when the URL organization role is member", async () => {
   state.role = "admin";
   state.tenantRole = "member";
+  state.profiles.mockResolvedValue({ status: "ok", data: [] });
   const html = await renderRoute("/o/acme/sessions/profiles");
   expect(html).toContain("Sessions unavailable");
   expect(html).not.toContain("Create a profile");
