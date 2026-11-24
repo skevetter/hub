@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import { useParams, useRouter } from "@tanstack/react-router";
 import { PageHeader } from "./page.js";
 import { Button } from "../ui/button.js";
+import { publicRouteMessage, referenceIn } from "../../failures/reference.js";
 
 interface RouteStateProps {
   title: string;
@@ -34,18 +35,9 @@ export function NotFoundPage({ home = "/" }: { home?: string }) {
   );
 }
 
-const SAFE_MESSAGES = new Set(["Organization unavailable."]);
-
 export function routeErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : "";
-  if (SAFE_MESSAGES.has(message)) return message;
-  const reference =
-    /quote reference ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) when reporting it\./iu.exec(
-      message,
-    )?.[1];
-  return reference === undefined
-    ? "The page could not be loaded."
-    : `The page could not be loaded. If it happens again, quote reference ${reference} when reporting it.`;
+  return publicRouteMessage(message, referenceIn(message));
 }
 
 export function ErrorPage({
