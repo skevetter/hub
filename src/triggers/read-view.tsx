@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation } from "@tanstack/react-router";
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 import { useServerFn } from "@tanstack/react-start";
 import { FailureAlert } from "../components/app/failure-alert.js";
 import { LoadingLine, Spinner } from "../components/app/loading.js";
@@ -102,17 +102,7 @@ function TriggerReadHeader({
   const { organizationSlug } = scope;
   const search =
     useLocation({ select: ({ state: history }) => history.triggerListSearch }) ?? NO_EDITOR_SEARCH;
-  const start = useServerFn(runManualTrigger);
-  const queryClient = useQueryClient();
-  const run = useMutation({
-    mutationFn: (deliveryKey: string) => start({ data: { ...scope, deliveryKey } }),
-    onSuccess: async (result) => {
-      if (result.status === "ok")
-        await queryClient.invalidateQueries({ queryKey: triggerReadRunsKey(scope) });
-    },
-  });
-  const { mutate } = run;
-  const startRun = useCallback(() => mutate(crypto.randomUUID()), [mutate]);
+  const { run, startRun } = useManualRun(scope);
   const result = run.data;
   return (
     <div>
@@ -141,6 +131,27 @@ function TriggerReadHeader({
       </StatusLine>
     </div>
   );
+}
+
+function useManualRun(scope: TriggerReadScope) {
+  const start = useServerFn(runManualTrigger);
+  const queryClient = useQueryClient();
+  // A retry after a failed or uncertain dispatch reuses the key so it cannot start a second run.
+  const deliveryKey = useRef<string>(undefined);
+  const run = useMutation({
+    mutationFn: (key: string) => start({ data: { ...scope, deliveryKey: key } }),
+    onSuccess: async (result) => {
+      if (result.status !== "ok") return;
+      deliveryKey.current = undefined;
+      await queryClient.invalidateQueries({ queryKey: triggerReadRunsKey(scope) });
+    },
+  });
+  const { mutate } = run;
+  const startRun = useCallback(() => {
+    deliveryKey.current ??= crypto.randomUUID();
+    mutate(deliveryKey.current);
+  }, [mutate]);
+  return { run, startRun };
 }
 
 function triggerState(trigger: Trigger): TriggerState {
