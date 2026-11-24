@@ -4465,16 +4465,17 @@ class MemoryDatabase implements Database {
       this.providerEventReceipts.get(attachment.providerEventReceiptId)?.payloadExpiryState != null
     )
       return undefined;
-    const stepRun =
-      execution.workflowStepRunId === null
-        ? undefined
-        : this.workflowStepRuns.get(execution.workflowStepRunId);
-    const triggerRun =
-      stepRun === undefined ? undefined : this.triggerRuns.get(stepRun.triggerRunId);
+    const triggerRun = this.findAttachmentTriggerRun(execution.workflowStepRunId);
     return execution.organizationId === attachment.organizationId &&
       triggerRun?.providerEventReceiptId === attachment.providerEventReceiptId
       ? attachment
       : undefined;
+  }
+
+  private findAttachmentTriggerRun(workflowStepRunId: string | null) {
+    const stepRun =
+      workflowStepRunId === null ? undefined : this.workflowStepRuns.get(workflowStepRunId);
+    return stepRun === undefined ? undefined : this.triggerRuns.get(stepRun.triggerRunId);
   }
 
   async insertMachine(input: InsertMachineInput): Promise<MachineRecord> {
@@ -4548,24 +4549,7 @@ class MemoryDatabase implements Database {
       completedByAgentAt: null,
       deadlineAt,
       idleDeadlineAt,
-      result: input.result ?? null,
-      triggerContext: input.triggerContext,
-      outputContext: input.outputContext,
-      reactionState: input.reactionState ?? null,
-      configurationRevisionId: input.configurationRevisionId,
-      completionTokenHash: input.completionTokenHash ?? null,
-      replyClaimedAt: null,
-      replyClaimCount: 0,
-      outputEmissions: {},
-      outputDeliveryAttempts: {},
-      launchIntent: input.launchIntent ?? null,
-      usedTemporaryCredentials: temporaryCredentialFact(input.launchIntent ?? null),
-      launchIntentExpiredAt: null,
-      launchRunId: null,
-      launchAgent: null,
-      daemonId: input.daemonId ?? null,
-      daemonAgentId: null,
-      workflowStepRunId: input.workflowStepRunId ?? null,
+      ...initialAgentExecutionPayload(input),
       hubAction: null,
       hubActionCompletedAt: null,
       hubActionReadyAt: null,
@@ -4905,18 +4889,8 @@ class MemoryDatabase implements Database {
     ) {
       return this.projectExecutionPayload(execution);
     }
-    if (execution.workflowStepRunId !== null) {
-      const step = this.workflowStepRuns.get(execution.workflowStepRunId);
-      const run = step === undefined ? undefined : this.triggerRuns.get(step.triggerRunId);
-      if (
-        step === undefined ||
-        step.status !== "running" ||
-        run === undefined ||
-        run.status !== "running" ||
-        run.deadlineAt.getTime() <= processedAt.getTime()
-      ) {
-        return this.projectExecutionPayload(execution);
-      }
+    if (this.workflowBlocksIdleDeadlineRefresh(execution.workflowStepRunId, processedAt)) {
+      return this.projectExecutionPayload(execution);
     }
     const boundedIdleDeadlineAt = capIdleDeadline(idleDeadlineAt, execution.deadlineAt);
     const updated = { ...execution, idleDeadlineAt: boundedIdleDeadlineAt };
@@ -4928,6 +4902,22 @@ class MemoryDatabase implements Database {
       }
     }
     return updated;
+  }
+
+  private workflowBlocksIdleDeadlineRefresh(
+    workflowStepRunId: string | null,
+    processedAt: Date,
+  ): boolean {
+    if (workflowStepRunId === null) return false;
+    const step = this.workflowStepRuns.get(workflowStepRunId);
+    const run = step === undefined ? undefined : this.triggerRuns.get(step.triggerRunId);
+    return (
+      step === undefined ||
+      step.status !== "running" ||
+      run === undefined ||
+      run.status !== "running" ||
+      run.deadlineAt.getTime() <= processedAt.getTime()
+    );
   }
 
   async prepareAgentExecutionForDispatch(
@@ -5225,24 +5215,27 @@ class MemoryDatabase implements Database {
     if (isTerminalAgentExecutionStatus(execution.status)) {
       return { execution: this.projectExecutionPayload(execution), transitioned: false };
     }
-    if (fields.deadlineCondition !== undefined) {
-      const current =
-        fields.deadlineCondition.kind === "hard" ? execution.deadlineAt : execution.idleDeadlineAt;
-      if (
-        current?.getTime() !== fields.deadlineCondition.deadlineAt.getTime() ||
-        current.getTime() > fields.deadlineCondition.observedAt.getTime()
-      ) {
-        return { execution, transitioned: false };
-      }
+    if (agentExecutionDeadlineConditionFailed(execution, fields.deadlineCondition)) {
+      return { execution, transitioned: false };
     }
 
+    const updated = this.applyAgentExecutionTransition(execution, toStatus, fields);
+    this.agentExecutions.set(id, updated);
+    return { execution: updated, transitioned: true };
+  }
+
+  private applyAgentExecutionTransition(
+    execution: AgentExecutionRecord,
+    toStatus: AgentExecutionStatus,
+    fields: TransitionAgentExecutionFields,
+  ): AgentExecutionRecord {
     let hubActionCompletedAt = execution.hubActionCompletedAt;
     let hubActionReadyAt = execution.hubActionReadyAt;
     if (fields.hubAction !== undefined) {
       hubActionCompletedAt = fields.hubAction === null ? this.now() : null;
       hubActionReadyAt = null;
     }
-    const updated: AgentExecutionRecord = {
+    return {
       ...execution,
       status: toStatus,
       completedAt: isTerminalAgentExecutionStatus(toStatus) ? this.now() : execution.completedAt,
@@ -5256,9 +5249,6 @@ class MemoryDatabase implements Database {
       hubActionCompletedAt,
       hubActionReadyAt,
     };
-
-    this.agentExecutions.set(id, updated);
-    return { execution: updated, transitioned: true };
   }
 
   async findRunningAgentExecutionsForMachine(machineId: string): Promise<AgentExecutionRecord[]> {
@@ -5309,10 +5299,7 @@ class MemoryDatabase implements Database {
       execution.hubAction !== "archive" ||
       execution.hubActionCompletedAt !== null ||
       execution.hubActionReadyAt !== null ||
-      execution.hubActionAcknowledgements.terminalAt === null ||
-      execution.hubActionAcknowledgements.idleAt === null ||
-      execution.hubActionAcknowledgements.finishExecutionCall === null ||
-      execution.hubActionAcknowledgements.finishExecutionCall.status !== "completed"
+      !hasCompletedHubActionAcknowledgements(execution.hubActionAcknowledgements)
     ) {
       return undefined;
     }
@@ -5348,20 +5335,7 @@ class MemoryDatabase implements Database {
         updatedAcknowledgements.idleAt = acknowledgement.observedAt;
       }
     } else {
-      const previous = updatedAcknowledgements.finishExecutionCall;
-      if (
-        previous === undefined ||
-        previous === null ||
-        (previous.status !== "completed" &&
-          (acknowledgement.status === "completed" ||
-            acknowledgement.observedAt.getTime() > previous.observedAt.getTime()))
-      ) {
-        updatedAcknowledgements.finishExecutionCall = {
-          callId: acknowledgement.callId ?? null,
-          status: acknowledgement.status,
-          observedAt: acknowledgement.observedAt,
-        };
-      }
+      applyFinishExecutionAcknowledgement(updatedAcknowledgements, acknowledgement);
     }
     const updated = { ...execution, hubActionAcknowledgements: updatedAcknowledgements };
     this.agentExecutions.set(executionId, updated);
@@ -7247,6 +7221,72 @@ class MemoryDatabase implements Database {
     }
 
     return execution;
+  }
+}
+
+function initialAgentExecutionPayload(input: InsertAgentExecutionInput) {
+  return {
+    result: input.result ?? null,
+    triggerContext: input.triggerContext,
+    outputContext: input.outputContext,
+    reactionState: input.reactionState ?? null,
+    configurationRevisionId: input.configurationRevisionId,
+    completionTokenHash: input.completionTokenHash ?? null,
+    replyClaimedAt: null,
+    replyClaimCount: 0,
+    outputEmissions: {},
+    outputDeliveryAttempts: {},
+    launchIntent: input.launchIntent ?? null,
+    usedTemporaryCredentials: temporaryCredentialFact(input.launchIntent ?? null),
+    launchIntentExpiredAt: null,
+    launchRunId: null,
+    launchAgent: null,
+    daemonId: input.daemonId ?? null,
+    daemonAgentId: null,
+    workflowStepRunId: input.workflowStepRunId ?? null,
+  };
+}
+
+function agentExecutionDeadlineConditionFailed(
+  execution: AgentExecutionRecord,
+  condition: TransitionAgentExecutionFields["deadlineCondition"],
+): boolean {
+  if (condition === undefined) return false;
+  const current = condition.kind === "hard" ? execution.deadlineAt : execution.idleDeadlineAt;
+  return (
+    current?.getTime() !== condition.deadlineAt.getTime() ||
+    current.getTime() > condition.observedAt.getTime()
+  );
+}
+
+function hasCompletedHubActionAcknowledgements(
+  acknowledgements: AgentExecutionHubAcknowledgements,
+): boolean {
+  return !(
+    acknowledgements.terminalAt === null ||
+    acknowledgements.idleAt === null ||
+    acknowledgements.finishExecutionCall === null ||
+    acknowledgements.finishExecutionCall.status !== "completed"
+  );
+}
+
+function applyFinishExecutionAcknowledgement(
+  updatedAcknowledgements: AgentExecutionHubAcknowledgements,
+  acknowledgement: Extract<AgentExecutionHubAcknowledgementInput, { kind: "finish_execution" }>,
+): void {
+  const previous = updatedAcknowledgements.finishExecutionCall;
+  if (
+    previous === undefined ||
+    previous === null ||
+    (previous.status !== "completed" &&
+      (acknowledgement.status === "completed" ||
+        acknowledgement.observedAt.getTime() > previous.observedAt.getTime()))
+  ) {
+    updatedAcknowledgements.finishExecutionCall = {
+      callId: acknowledgement.callId ?? null,
+      status: acknowledgement.status,
+      observedAt: acknowledgement.observedAt,
+    };
   }
 }
 
