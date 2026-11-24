@@ -101,6 +101,14 @@ for (const width of [1280, 390]) {
     });
     await expect(rows).toHaveCount(15);
     await expect(pager.getByRole("button", { name: "Newer", exact: true })).toBeDisabled();
+    await expect(page.getByRole("combobox", { name: "Provider" })).toHaveValue("");
+    await page.getByRole("combobox", { name: "Drop reason" }).selectOption({
+      label: "Trigger filters rejected",
+    });
+    await expect(page).toHaveURL(/[?&]reason=trigger_filters_rejected(?:&|$)/u);
+    await expect(rows).toHaveCount(1);
+    await expect(rows).toContainText("Slack");
+    await expect(rows).toContainText("The event did not pass the configured trigger filters.");
 
     await openSection("Connections");
     await connections
