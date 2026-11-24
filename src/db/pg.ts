@@ -247,6 +247,141 @@ const EXECUTION_INSERT_OWNERS = `select run.payload_expiry_state, run.status fro
       and run.organization_id = $2 and run.project_id = $3)
   for share of run`;
 
+const INSERT_AGENT_EXECUTION = `
+          with owners as materialized (${EXECUTION_INSERT_OWNERS})
+          insert into agent_executions (
+            id,
+            organization_id,
+            project_id,
+            machine_id,
+            daemon_id,
+            status,
+            started_at,
+            trigger_context,
+            output_context,
+            configuration_revision_id,
+            completion_token_hash,
+            deadline_at,
+            idle_deadline_at,
+            launch_intent,
+            workflow_step_run_id,
+            result,
+            completed_at,
+            reaction_state,
+            used_temporary_credentials
+          )
+          select coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
+                 $12,
+                 case
+                   when $13::timestamptz is null then null
+                   when $12::timestamptz is null then $13::timestamptz
+                   else least($12::timestamptz, $13::timestamptz)
+                 end,
+                 $14, $15, $16,
+                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
+                 $17, $18
+          from projects
+          where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
+            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
+            and exists (
+              select 1 from project_configuration_revisions
+              where id = $10 and project_id = $3 and organization_id = $2
+            )
+            and ($5::uuid is null or exists (
+              select 1 from daemons daemon
+              join machines daemon_machine on daemon_machine.id = daemon.machine_id
+              where daemon.id = $5 and daemon_machine.org_id = $2
+            ))
+            and ($4::uuid is null or exists (
+              select 1 from machines where id = $4 and org_id = $2
+            ))
+          returning *
+        `;
+
+const INSERT_AGENT_EXECUTION_IF_ABSENT = `
+          with owners as materialized (${EXECUTION_INSERT_OWNERS})
+          insert into agent_executions (
+            id,
+            organization_id,
+            project_id,
+            machine_id,
+            daemon_id,
+            status,
+            started_at,
+            trigger_context,
+            output_context,
+            configuration_revision_id,
+            completion_token_hash,
+            deadline_at,
+            idle_deadline_at,
+            launch_intent,
+            workflow_step_run_id,
+            result,
+            completed_at,
+            used_temporary_credentials
+          )
+          select $1, $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
+                 $12,
+                 case
+                   when $13::timestamptz is null then null
+                   when $12::timestamptz is null then $13::timestamptz
+                   else least($12::timestamptz, $13::timestamptz)
+                 end,
+                 $14, $15, $16,
+                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
+                 $17
+          from projects
+          where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
+            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
+            and exists (
+              select 1 from project_configuration_revisions
+              where id = $10 and project_id = $3 and organization_id = $2
+            )
+            and ($5::uuid is null or exists (
+              select 1 from daemons daemon
+              join machines daemon_machine on daemon_machine.id = daemon.machine_id
+              where daemon.id = $5 and daemon_machine.org_id = $2
+            ))
+            and ($4::uuid is null or exists (
+              select 1 from machines where id = $4 and org_id = $2
+            ))
+          on conflict (id) do nothing
+          returning *
+        `;
+
+const TRANSITION_AGENT_EXECUTION = `
+          update agent_executions
+          set
+            status = $2,
+            completed_at = case
+              when $3::boolean then now()
+              else completed_at
+            end,
+            result = case when $4::boolean then $5 else result end,
+            completed_by_agent_at = case
+              when $6::boolean and $2 = 'succeeded'::agent_execution_status then now()
+              else completed_by_agent_at
+            end,
+            idle_deadline_at = case
+              when $3::boolean then null
+              else idle_deadline_at
+            end,
+            hub_action = case when $10::boolean then $11 else hub_action end,
+            hub_action_completed_at = case
+              when $10::boolean and $11::text is null then now()
+              when $10::boolean then null
+              else hub_action_completed_at
+            end
+          where id = $1
+            and status in ('spawning', 'running')
+            and (
+              $7::text is null
+              or ($7 = 'hard' and deadline_at = $8 and deadline_at <= $9)
+              or ($7 = 'idle' and idle_deadline_at = $8 and idle_deadline_at <= $9)
+            )
+          returning *
+        `;
+
 const EXECUTION_PAYLOAD_PROJECTION = `execution.id, execution.agent_session_id, execution.agent_session_action,
   execution.organization_id, execution.project_id, execution.machine_id, execution.status,
   execution.started_at, execution.completed_at, execution.completed_by_agent_at, execution.deadline_at,
@@ -846,79 +981,12 @@ class PgDatabase implements Database {
 
   async insertAgentExecution(input: InsertAgentExecutionInput): Promise<AgentExecutionRecord> {
     try {
-      const rows = await query<AgentExecutionRow>(
-        this.pool,
-        `
-          with owners as materialized (${EXECUTION_INSERT_OWNERS})
-          insert into agent_executions (
-            id,
-            organization_id,
-            project_id,
-            machine_id,
-            daemon_id,
-            status,
-            started_at,
-            trigger_context,
-            output_context,
-            configuration_revision_id,
-            completion_token_hash,
-            deadline_at,
-            idle_deadline_at,
-            launch_intent,
-            workflow_step_run_id,
-            result,
-            completed_at,
-            reaction_state,
-            used_temporary_credentials
-          )
-          select coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
-                 $12,
-                 case
-                   when $13::timestamptz is null then null
-                   when $12::timestamptz is null then $13::timestamptz
-                   else least($12::timestamptz, $13::timestamptz)
-                 end,
-                 $14, $15, $16,
-                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
-                 $17, $18
-          from projects
-          where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
-            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
-            and exists (
-              select 1 from project_configuration_revisions
-              where id = $10 and project_id = $3 and organization_id = $2
-            )
-            and ($5::uuid is null or exists (
-              select 1 from daemons daemon
-              join machines daemon_machine on daemon_machine.id = daemon.machine_id
-              where daemon.id = $5 and daemon_machine.org_id = $2
-            ))
-            and ($4::uuid is null or exists (
-              select 1 from machines where id = $4 and org_id = $2
-            ))
-          returning *
-        `,
-        [
-          input.id ?? null,
-          input.organizationId,
-          input.projectId,
-          input.machineId,
-          input.daemonId ?? null,
-          input.status ?? "spawning",
-          input.startedAt ?? null,
-          input.triggerContext,
-          input.outputContext,
-          input.configurationRevisionId,
-          input.completionTokenHash ?? null,
-          input.deadlineAt ?? null,
-          input.idleDeadlineAt ?? null,
-          input.launchIntent ?? null,
-          input.workflowStepRunId ?? null,
-          input.result ?? null,
-          input.reactionState ?? null,
-          temporaryCredentialFact(input.launchIntent ?? null),
-        ],
-      );
+      const rows = await query<AgentExecutionRow>(this.pool, INSERT_AGENT_EXECUTION, [
+        input.id ?? null,
+        ...agentExecutionInsertParameters(input),
+        input.reactionState ?? null,
+        temporaryCredentialFact(input.launchIntent ?? null),
+      ]);
       const execution = rows.rows[0];
 
       if (execution === undefined) {
@@ -935,78 +1003,11 @@ class PgDatabase implements Database {
     input: InsertAgentExecutionInput & { id: string },
   ): Promise<AgentExecutionRecord | undefined> {
     try {
-      const rows = await query<AgentExecutionRow>(
-        this.pool,
-        `
-          with owners as materialized (${EXECUTION_INSERT_OWNERS})
-          insert into agent_executions (
-            id,
-            organization_id,
-            project_id,
-            machine_id,
-            daemon_id,
-            status,
-            started_at,
-            trigger_context,
-            output_context,
-            configuration_revision_id,
-            completion_token_hash,
-            deadline_at,
-            idle_deadline_at,
-            launch_intent,
-            workflow_step_run_id,
-            result,
-            completed_at,
-            used_temporary_credentials
-          )
-          select $1, $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
-                 $12,
-                 case
-                   when $13::timestamptz is null then null
-                   when $12::timestamptz is null then $13::timestamptz
-                   else least($12::timestamptz, $13::timestamptz)
-                 end,
-                 $14, $15, $16,
-                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
-                 $17
-          from projects
-          where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
-            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
-            and exists (
-              select 1 from project_configuration_revisions
-              where id = $10 and project_id = $3 and organization_id = $2
-            )
-            and ($5::uuid is null or exists (
-              select 1 from daemons daemon
-              join machines daemon_machine on daemon_machine.id = daemon.machine_id
-              where daemon.id = $5 and daemon_machine.org_id = $2
-            ))
-            and ($4::uuid is null or exists (
-              select 1 from machines where id = $4 and org_id = $2
-            ))
-          on conflict (id) do nothing
-          returning *
-        `,
-        [
-          input.id,
-          input.organizationId,
-          input.projectId,
-          input.machineId,
-          input.daemonId ?? null,
-          input.status ?? "spawning",
-          input.startedAt ?? null,
-          input.triggerContext,
-          input.outputContext,
-          input.configurationRevisionId,
-          input.completionTokenHash ?? null,
-          input.deadlineAt ?? null,
-          input.idleDeadlineAt ?? null,
-          input.launchIntent ?? null,
-          input.workflowStepRunId ?? null,
-          input.result ?? null,
-          temporaryCredentialFact(input.launchIntent ?? null),
-        ],
-      );
+      const rows = await query<AgentExecutionRow>(this.pool, INSERT_AGENT_EXECUTION_IF_ABSENT, [
+        input.id,
+        ...agentExecutionInsertParameters(input),
+        temporaryCredentialFact(input.launchIntent ?? null),
+      ]);
       const execution = rows.rows[0];
       return execution === undefined ? undefined : toAgentExecutionRecord(execution);
     } catch (error) {
@@ -2726,31 +2727,11 @@ class PgDatabase implements Database {
 
         let workflowRefreshAllowed = true;
         if (existing.workflow_step_run_id !== null) {
-          const stepRows = await client.query<WorkflowStepRunRow>(
-            `select * from workflow_step_runs where id = $1`,
-            [existing.workflow_step_run_id],
+          workflowRefreshAllowed = await canRefreshWorkflowIdleDeadlineOnClient(
+            client,
+            existing.workflow_step_run_id,
+            processedAt,
           );
-          const stepCandidate = stepRows.rows[0];
-          if (stepCandidate !== undefined) {
-            const runRows = await client.query<TriggerRunRow>(
-              `select * from trigger_runs where id = $1 for update`,
-              [stepCandidate.trigger_run_id],
-            );
-            const lockedStepRows = await client.query<WorkflowStepRunRow>(
-              `select * from workflow_step_runs where id = $1 for update`,
-              [stepCandidate.id],
-            );
-            const step = lockedStepRows.rows[0];
-            const run = runRows.rows[0];
-            workflowRefreshAllowed =
-              step !== undefined &&
-              step.status === "running" &&
-              run !== undefined &&
-              run.status === "running" &&
-              (run.deadline_at === null || run.deadline_at > processedAt);
-          } else {
-            workflowRefreshAllowed = false;
-          }
         }
 
         let row: AgentExecutionRow | undefined;
@@ -3136,61 +3117,9 @@ class PgDatabase implements Database {
     completedAt: Date,
   ): Promise<AgentExecutionRecord | undefined> {
     try {
-      return await this.pool.transaction(async (client) => {
-        const selected = await client.query<AgentExecutionRow>(
-          `select * from agent_executions where id = $1 for update`,
-          [executionId],
-        );
-        const row = selected.rows[0];
-        if (row === undefined) {
-          return undefined;
-        }
-        const execution = toAgentExecutionRecord(row);
-        const attempt = execution.outputDeliveryAttempts[attemptId];
-        if (attempt === undefined) {
-          return undefined;
-        }
-        if (attempt.status === "succeeded") {
-          return findAgentExecutionOnClient(client, executionId);
-        }
-        if (attempt.status !== "pending") {
-          return undefined;
-        }
-        if (attempt.leaseExpiresAt <= completedAt) {
-          await client.query(
-            `update agent_executions
-           set output_delivery_attempts = $2::jsonb
-           where id = $1`,
-            [
-              executionId,
-              JSON.stringify({
-                ...execution.outputDeliveryAttempts,
-                [attemptId]: { ...attempt, status: "failed" as const, completedAt: null },
-              }),
-            ],
-          );
-          return undefined;
-        }
-        const outputEmissions = {
-          ...execution.outputEmissions,
-          [attempt.outputType]: (execution.outputEmissions[attempt.outputType] ?? 0) + 1,
-        };
-        await client.query(
-          `update agent_executions
-         set output_emissions = $2::jsonb,
-             output_delivery_attempts = $3::jsonb
-         where id = $1`,
-          [
-            executionId,
-            JSON.stringify(outputEmissions),
-            JSON.stringify({
-              ...execution.outputDeliveryAttempts,
-              [attemptId]: { ...attempt, status: "succeeded" as const, completedAt },
-            }),
-          ],
-        );
-        return findAgentExecutionOnClient(client, executionId);
-      });
+      return await this.pool.transaction((client) =>
+        completeAgentExecutionOutputOnClient(client, executionId, attemptId, completedAt),
+      );
     } catch (error) {
       throw toDatabaseError(error);
     }
@@ -3243,51 +3172,8 @@ class PgDatabase implements Database {
     try {
       const rows = await query<AgentExecutionRow>(
         this.pool,
-        `
-          update agent_executions
-          set
-            status = $2,
-            completed_at = case
-              when $3::boolean then now()
-              else completed_at
-            end,
-            result = case when $4::boolean then $5 else result end,
-            completed_by_agent_at = case
-              when $6::boolean and $2 = 'succeeded'::agent_execution_status then now()
-              else completed_by_agent_at
-            end,
-            idle_deadline_at = case
-              when $3::boolean then null
-              else idle_deadline_at
-            end,
-            hub_action = case when $10::boolean then $11 else hub_action end,
-            hub_action_completed_at = case
-              when $10::boolean and $11::text is null then now()
-              when $10::boolean then null
-              else hub_action_completed_at
-            end
-          where id = $1
-            and status in ('spawning', 'running')
-            and (
-              $7::text is null
-              or ($7 = 'hard' and deadline_at = $8 and deadline_at <= $9)
-              or ($7 = 'idle' and idle_deadline_at = $8 and idle_deadline_at <= $9)
-            )
-          returning *
-        `,
-        [
-          id,
-          toStatus,
-          isTerminalAgentExecutionStatus(toStatus),
-          fields.result !== undefined,
-          fields.result ?? null,
-          fields.completedByAgent === true,
-          fields.deadlineCondition?.kind ?? null,
-          fields.deadlineCondition?.deadlineAt ?? null,
-          fields.deadlineCondition?.observedAt ?? null,
-          fields.hubAction !== undefined,
-          fields.hubAction ?? null,
-        ],
+        TRANSITION_AGENT_EXECUTION,
+        agentExecutionTransitionParameters(id, toStatus, fields),
       );
       const execution = rows.rows[0];
 
@@ -3403,25 +3289,7 @@ class PgDatabase implements Database {
       let parameters: unknown[];
       if (acknowledgement.kind === "terminal" || acknowledgement.kind === "idle") {
         const field = acknowledgement.kind === "terminal" ? "terminal_at" : "idle_at";
-        statement = `
-          update agent_executions
-          set hub_action_acknowledgements = jsonb_set(
-            ${state},
-            '{${field}}',
-            case
-              when ${state}->>'${field}' is null
-                or (${state}->>'${field}')::timestamptz < $2::timestamptz
-                then to_jsonb($2::timestamptz)
-              else ${state}->'${field}'
-            end,
-            true
-          )
-          where id = $1
-            and (
-              ${state}->>'${field}' is null
-              or (${state}->>'${field}')::timestamptz < $2::timestamptz
-            )
-          returning id`;
+        statement = hubTimestampAcknowledgementStatement(state, field);
         parameters = [executionId, acknowledgement.observedAt];
       } else {
         statement = `
@@ -5309,6 +5177,26 @@ function isDaemonSlugConflict(error: unknown): boolean {
   );
 }
 
+function agentExecutionInsertParameters(input: InsertAgentExecutionInput): unknown[] {
+  return [
+    input.organizationId,
+    input.projectId,
+    input.machineId,
+    input.daemonId ?? null,
+    input.status ?? "spawning",
+    input.startedAt ?? null,
+    input.triggerContext,
+    input.outputContext,
+    input.configurationRevisionId,
+    input.completionTokenHash ?? null,
+    input.deadlineAt ?? null,
+    input.idleDeadlineAt ?? null,
+    input.launchIntent ?? null,
+    input.workflowStepRunId ?? null,
+    input.result ?? null,
+  ];
+}
+
 async function insertAgentExecutionOnClient(
   client: QueryHandle,
   input: InsertAgentExecutionInput,
@@ -5342,27 +5230,146 @@ async function insertAgentExecutionOnClient(
      returning *`,
     [
       input.id ?? null,
-      input.organizationId,
-      input.projectId,
-      input.machineId,
-      input.daemonId ?? null,
-      input.status ?? "spawning",
-      input.startedAt ?? null,
-      input.triggerContext,
-      input.outputContext,
-      input.configurationRevisionId,
-      input.completionTokenHash ?? null,
-      input.deadlineAt ?? null,
-      input.idleDeadlineAt ?? null,
-      input.launchIntent ?? null,
-      input.workflowStepRunId ?? null,
-      input.result ?? null,
+      ...agentExecutionInsertParameters(input),
       temporaryCredentialFact(input.launchIntent ?? null),
     ],
   );
   const execution = rows.rows[0];
   if (execution === undefined) throw new Error("agent execution insert returned no row");
   return execution;
+}
+
+async function canRefreshWorkflowIdleDeadlineOnClient(
+  client: QueryHandle,
+  stepRunId: string,
+  processedAt: Date,
+): Promise<boolean> {
+  const stepRows = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs where id = $1`,
+    [stepRunId],
+  );
+  const stepCandidate = stepRows.rows[0];
+  if (stepCandidate === undefined) return false;
+  const runRows = await client.query<TriggerRunRow>(
+    `select * from trigger_runs where id = $1 for update`,
+    [stepCandidate.trigger_run_id],
+  );
+  const lockedStepRows = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs where id = $1 for update`,
+    [stepCandidate.id],
+  );
+  const step = lockedStepRows.rows[0];
+  const run = runRows.rows[0];
+  return (
+    step !== undefined &&
+    step.status === "running" &&
+    run !== undefined &&
+    run.status === "running" &&
+    (run.deadline_at === null || run.deadline_at > processedAt)
+  );
+}
+
+async function completeAgentExecutionOutputOnClient(
+  client: QueryHandle,
+  executionId: string,
+  attemptId: string,
+  completedAt: Date,
+): Promise<AgentExecutionRecord | undefined> {
+  const selected = await client.query<AgentExecutionRow>(
+    `select * from agent_executions where id = $1 for update`,
+    [executionId],
+  );
+  const row = selected.rows[0];
+  if (row === undefined) {
+    return undefined;
+  }
+  const execution = toAgentExecutionRecord(row);
+  const attempt = execution.outputDeliveryAttempts[attemptId];
+  if (attempt === undefined) {
+    return undefined;
+  }
+  if (attempt.status === "succeeded") {
+    return findAgentExecutionOnClient(client, executionId);
+  }
+  if (attempt.status !== "pending") {
+    return undefined;
+  }
+  if (attempt.leaseExpiresAt <= completedAt) {
+    await client.query(
+      `update agent_executions
+           set output_delivery_attempts = $2::jsonb
+           where id = $1`,
+      [
+        executionId,
+        JSON.stringify({
+          ...execution.outputDeliveryAttempts,
+          [attemptId]: { ...attempt, status: "failed" as const, completedAt: null },
+        }),
+      ],
+    );
+    return undefined;
+  }
+  const outputEmissions = {
+    ...execution.outputEmissions,
+    [attempt.outputType]: (execution.outputEmissions[attempt.outputType] ?? 0) + 1,
+  };
+  await client.query(
+    `update agent_executions
+         set output_emissions = $2::jsonb,
+             output_delivery_attempts = $3::jsonb
+         where id = $1`,
+    [
+      executionId,
+      JSON.stringify(outputEmissions),
+      JSON.stringify({
+        ...execution.outputDeliveryAttempts,
+        [attemptId]: { ...attempt, status: "succeeded" as const, completedAt },
+      }),
+    ],
+  );
+  return findAgentExecutionOnClient(client, executionId);
+}
+
+function agentExecutionTransitionParameters(
+  id: string,
+  toStatus: AgentExecutionStatus,
+  fields: TransitionAgentExecutionFields,
+): unknown[] {
+  return [
+    id,
+    toStatus,
+    isTerminalAgentExecutionStatus(toStatus),
+    fields.result !== undefined,
+    fields.result ?? null,
+    fields.completedByAgent === true,
+    fields.deadlineCondition?.kind ?? null,
+    fields.deadlineCondition?.deadlineAt ?? null,
+    fields.deadlineCondition?.observedAt ?? null,
+    fields.hubAction !== undefined,
+    fields.hubAction ?? null,
+  ];
+}
+
+function hubTimestampAcknowledgementStatement(state: string, field: string): string {
+  return `
+          update agent_executions
+          set hub_action_acknowledgements = jsonb_set(
+            ${state},
+            '{${field}}',
+            case
+              when ${state}->>'${field}' is null
+                or (${state}->>'${field}')::timestamptz < $2::timestamptz
+                then to_jsonb($2::timestamptz)
+              else ${state}->'${field}'
+            end,
+            true
+          )
+          where id = $1
+            and (
+              ${state}->>'${field}' is null
+              or (${state}->>'${field}')::timestamptz < $2::timestamptz
+            )
+          returning id`;
 }
 
 function isTerminalAgentExecutionStatus(status: AgentExecutionStatus): boolean {
