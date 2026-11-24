@@ -413,6 +413,7 @@ async function startBrowserRuntime({
   return createApplicationRuntime({
     database,
     auth,
+    verifiedActorEmailRequired: auth !== null,
     entitlements: entitlements.service,
     billing,
     ...providers,
