@@ -2536,28 +2536,13 @@ class PgDatabase implements Database {
     // The null ordering matches the index; both columns are not null, so it changes no row order.
     const position = request.position;
     const after = position?.direction === "after";
-    const rows = await query<ProjectActivityRunListRow & { page_created_at: string }>(
-      this.pool,
-      `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
-              receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
-              receipts.provider_configuration_version, receipts.source, receipts.repo,
-              receipts.received_at, receipts.dropped_reason,
-              receipts.payload_expiry_state as receipt_payload_expiry_state,
-              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null
-                     and receipts.source = 'webhook.received'
-                     and jsonb_typeof(receipts.payload->'actor') = 'string'
-                then receipts.payload->>'actor'
-              end as webhook_actor,
-              runs.created_at::text as page_created_at
-       ${scoped}
-       ${position === undefined ? "" : `and (runs.created_at, runs.id) ${after ? ">" : "<"} ${boundary}`}
-       order by runs.created_at ${after ? "asc nulls first" : "desc nulls last"},
-                runs.id ${after ? "asc nulls first" : "desc nulls last"}
-       limit $${scopeParams.length + (position === undefined ? 1 : 3)}`,
-      position === undefined
-        ? [...scopeParams, request.limit + 1]
-        : [...scopeParams, position.key.createdAt, position.key.id, request.limit + 1],
-    );
+    const rows = await this.queryActivityPageRows(request, {
+      scoped,
+      scopeParams,
+      boundary,
+      position,
+      after,
+    });
     const more = rows.rows.length > request.limit;
     const page = rows.rows.slice(0, request.limit);
     if (after) page.reverse();
@@ -2586,6 +2571,41 @@ class PgDatabase implements Database {
       older: hasOlder ? keyOf(last) : null,
       newer: hasNewer ? keyOf(first) : null,
     };
+  }
+
+  private queryActivityPageRows(
+    request: ActivityRunPageRequest,
+    options: {
+      scoped: string;
+      scopeParams: unknown[];
+      boundary: string;
+      position: ActivityRunPageRequest["position"];
+      after: boolean;
+    },
+  ) {
+    const { scoped, scopeParams, boundary, position, after } = options;
+    return query<ProjectActivityRunListRow & { page_created_at: string }>(
+      this.pool,
+      `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
+              receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
+              receipts.provider_configuration_version, receipts.source, receipts.repo,
+              receipts.received_at, receipts.dropped_reason,
+              receipts.payload_expiry_state as receipt_payload_expiry_state,
+              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null
+                     and receipts.source = 'webhook.received'
+                     and jsonb_typeof(receipts.payload->'actor') = 'string'
+                then receipts.payload->>'actor'
+              end as webhook_actor,
+              runs.created_at::text as page_created_at
+       ${scoped}
+       ${position === undefined ? "" : `and (runs.created_at, runs.id) ${after ? ">" : "<"} ${boundary}`}
+       order by runs.created_at ${after ? "asc nulls first" : "desc nulls last"},
+                runs.id ${after ? "asc nulls first" : "desc nulls last"}
+       limit $${scopeParams.length + (position === undefined ? 1 : 3)}`,
+      position === undefined
+        ? [...scopeParams, request.limit + 1]
+        : [...scopeParams, position.key.createdAt, position.key.id, request.limit + 1],
+    );
   }
 
   async findProjectActivityRun(projectId: string, runId: string) {

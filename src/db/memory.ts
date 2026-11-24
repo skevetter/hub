@@ -87,6 +87,7 @@ import {
   STOP_INTERRUPT_LEASE_MS,
   STOP_INTERRUPT_MAX_AGE_MS,
   stopInterruptMayHaveSent,
+  type StopInterruptCoverage,
   type StopInterruptState,
   type StopInterruptStore,
 } from "./stop-interrupt.js";
@@ -2079,7 +2080,7 @@ class MemoryDatabase implements Database {
         execution.hubActionCompletedAt !== null ||
         !isCanceledExecution(execution) ||
         (execution.hubActionAcknowledgements.stopInterruptGeneration ?? null) !== generation ||
-        (this.stopInterruptClaims.get(id)?.until ?? 0) > now
+        this.hasLiveStopInterruptClaim(id, now)
       )
         return undefined;
       this.stopInterruptClaims.set(id, { token, until: now + STOP_INTERRUPT_LEASE_MS });
@@ -2098,17 +2099,9 @@ class MemoryDatabase implements Database {
       let uncertain = false;
       for (const prior of this.agentExecutions.values()) {
         if (prior.id === id || prior.daemonId !== current.daemonId) continue;
-        const write = this.stopInterruptWrites.get(prior.id);
-        if (write?.agentId === agentId && write.startedAt >= acceptedAt) return "coalesced";
-        const attempt = this.stopInterruptStates.get(prior.id);
-        if (
-          (attempt?.startedAgentId ?? prior.daemonAgentId) === agentId &&
-          attempt?.startedAt !== undefined &&
-          Date.parse(attempt.startedAt) >= acceptedAt
-        ) {
-          if (attempt.acknowledgedPeerIds !== undefined) return "coalesced";
-          uncertain = true;
-        }
+        const coverage = this.priorStopInterruptCoverage(prior, agentId, acceptedAt);
+        if (coverage === "coalesced") return coverage;
+        if (coverage === "delivery_unconfirmed") uncertain = true;
       }
       return uncertain ? "delivery_unconfirmed" : undefined;
     },
@@ -2122,8 +2115,7 @@ class MemoryDatabase implements Database {
         claim?.token !== token ||
         claim.until <= now ||
         state === undefined ||
-        state.startedAt !== undefined ||
-        state.target !== undefined ||
+        stopInterruptMayHaveSent(state) ||
         this.stopInterruptExpired(execution, now)
       )
         return false;
@@ -2185,6 +2177,32 @@ class MemoryDatabase implements Database {
       }
     },
   };
+
+  private hasLiveStopInterruptClaim(id: string, now: number): boolean {
+    return (this.stopInterruptClaims.get(id)?.until ?? 0) > now;
+  }
+
+  private hasRecentStopWrite(id: string, agentId: string, acceptedAt: number): boolean {
+    const write = this.stopInterruptWrites.get(id);
+    return write?.agentId === agentId && write.startedAt >= acceptedAt;
+  }
+
+  private priorStopInterruptCoverage(
+    prior: AgentExecutionRecord,
+    agentId: string,
+    acceptedAt: number,
+  ): StopInterruptCoverage | undefined {
+    if (this.hasRecentStopWrite(prior.id, agentId, acceptedAt)) return "coalesced";
+    const attempt = this.stopInterruptStates.get(prior.id);
+    if (
+      (attempt?.startedAgentId ?? prior.daemonAgentId) === agentId &&
+      attempt?.startedAt !== undefined &&
+      Date.parse(attempt.startedAt) >= acceptedAt
+    ) {
+      return attempt.acknowledgedPeerIds !== undefined ? "coalesced" : "delivery_unconfirmed";
+    }
+    return undefined;
+  }
 
   private rememberStopWrite(id: string): void {
     const state = this.stopInterruptStates.get(id);
@@ -4352,25 +4370,34 @@ class MemoryDatabase implements Database {
     input: Pick<PersistManualEventInput, "organizationId" | "projectId" | "boundWebhookTrigger">,
   ): void {
     const binding = input.boundWebhookTrigger;
-    if (binding !== undefined) {
-      const trigger = this.organizationTriggers.get(binding.id);
-      const project = this.projects.get(input.projectId);
-      if (
-        trigger?.organizationId !== input.organizationId ||
-        !trigger.enabled ||
-        trigger.name !== binding.name ||
-        trigger.runtimeProjectId !== input.projectId ||
-        project?.organizationId !== input.organizationId ||
-        project.status !== "active" ||
-        project.activeConfigurationRevisionId !== binding.configurationRevisionId ||
-        !hasBoundWebhookEvidence(
-          this.configurationRevisions.get(binding.configurationRevisionId)?.sourceEvidence,
-          binding.id,
-        )
-      ) {
-        throw new ManualRunRejected("configuration_not_found");
-      }
+    if (binding === undefined) return;
+    const trigger = this.organizationTriggers.get(binding.id);
+    const project = this.projects.get(input.projectId);
+    if (
+      trigger?.organizationId !== input.organizationId ||
+      !trigger.enabled ||
+      trigger.name !== binding.name ||
+      trigger.runtimeProjectId !== input.projectId ||
+      !this.matchesBoundWebhookProject(project, input, binding)
+    ) {
+      throw new ManualRunRejected("configuration_not_found");
     }
+  }
+
+  private matchesBoundWebhookProject(
+    project: ProjectRecord | undefined,
+    input: Pick<PersistManualEventInput, "organizationId">,
+    binding: NonNullable<PersistManualEventInput["boundWebhookTrigger"]>,
+  ): boolean {
+    return (
+      project?.organizationId === input.organizationId &&
+      project.status === "active" &&
+      project.activeConfigurationRevisionId === binding.configurationRevisionId &&
+      hasBoundWebhookEvidence(
+        this.configurationRevisions.get(binding.configurationRevisionId)?.sourceEvidence,
+        binding.id,
+      )
+    );
   }
 
   private assertBoundWebhookReceipt(
@@ -4479,12 +4506,25 @@ class MemoryDatabase implements Database {
       receipt.providerApplicationId !== owner.providerApplicationId
     )
       return;
-    const connection = this.githubConnections.get(receipt.installationId);
-    const bound =
-      receipt.connectionId === null || receipt.connectionId === connection?.id
-        ? connection
-        : undefined;
+    const bound = this.findBoundMemorySyncConnection(receipt);
     if (bound !== undefined && bound.providerApplicationId !== owner.providerApplicationId) return;
+    this.applyMemorySyncResult(receipt, bound, result);
+  }
+
+  private findBoundMemorySyncConnection(
+    receipt: MemoryGitHubSync,
+  ): GitHubConnectionRecord | undefined {
+    const connection = this.githubConnections.get(receipt.installationId);
+    return receipt.connectionId === null || receipt.connectionId === connection?.id
+      ? connection
+      : undefined;
+  }
+
+  private applyMemorySyncResult(
+    receipt: MemoryGitHubSync,
+    bound: GitHubConnectionRecord | undefined,
+    result: GitHubInstallationSyncResult,
+  ): void {
     if (bound === undefined) {
       if (receipt.connectionId !== null) receipt.retryAt = null;
       else if (result.status === "absent")
@@ -5277,21 +5317,7 @@ class MemoryDatabase implements Database {
         );
       })
       .sort((left, right) => compareRunsNewestFirst(runOrder(left.run), runOrder(right.run)));
-    const bound = request.position;
-    const boundMicros =
-      bound === undefined ? undefined : activityTimestampMicros(bound.key.createdAt);
-    const inRange = records.filter(({ run }) => {
-      if (bound === undefined || boundMicros === undefined) return true;
-      const order = compareRunsNewestFirst(runOrder(run), {
-        micros: boundMicros,
-        id: bound.key.id,
-      });
-      return bound.direction === "before" ? order > 0 : order < 0;
-    });
-    const page =
-      bound?.direction === "after"
-        ? inRange.slice(Math.max(0, inRange.length - request.limit))
-        : inRange.slice(0, request.limit);
+    const page = sliceActivityRuns(records, request);
     const first = page[0]?.run;
     const last = page.at(-1)?.run;
     const key = (run: { createdAt: Date; id: string }) => ({
@@ -8003,4 +8029,24 @@ function receiptOrder(receipt: Pick<ProviderEventReceiptRecord, "receivedAt" | "
 
 function runOrder(run: { createdAt: Date; id: string }) {
   return { micros: BigInt(run.createdAt.getTime()) * 1000n, id: run.id };
+}
+
+function sliceActivityRuns(
+  records: ProjectActivityRunListRecord[],
+  request: ActivityRunPageRequest,
+): ProjectActivityRunListRecord[] {
+  const bound = request.position;
+  const boundMicros =
+    bound === undefined ? undefined : activityTimestampMicros(bound.key.createdAt);
+  const inRange = records.filter(({ run }) => {
+    if (bound === undefined || boundMicros === undefined) return true;
+    const order = compareRunsNewestFirst(runOrder(run), {
+      micros: boundMicros,
+      id: bound.key.id,
+    });
+    return bound.direction === "before" ? order > 0 : order < 0;
+  });
+  return bound?.direction === "after"
+    ? inRange.slice(Math.max(0, inRange.length - request.limit))
+    : inRange.slice(0, request.limit);
 }
