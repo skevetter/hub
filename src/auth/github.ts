@@ -1,3 +1,5 @@
+import { addAbortListener } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import jwt from "jsonwebtoken";
 import { Octokit } from "octokit";
 import { z } from "zod";
@@ -9,6 +11,8 @@ import type { GitHubInstallation } from "./github-events.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_REQUEST_TIMEOUT_MS = 2_147_483_647;
+const MAX_REVOKE_TIMEOUT_MS = 20_000;
+const REVOKE_RETRY_DELAYS_MS = [500, 1_500] as const;
 
 interface InstallationTokenCacheEntry {
   expiresAt: number;
@@ -64,6 +68,8 @@ interface CreateGitHubAuthOptions {
   privateKey: string;
   fetch?: typeof fetch;
   requestTimeoutMs?: number;
+  revokeTimeoutMs?: number;
+  revokeRetryDelaysMs?: readonly [number, number];
   now?: () => number;
   /** Octokit retry (one attempt) and fail-fast write throttling stay on unless a caller turns them off. */
   octokitPlugins?: { retry?: boolean; throttle?: boolean };
@@ -164,9 +170,33 @@ class GitHubAppClient {
 
   async revokeInstallationToken(token: string): Promise<void> {
     const octokit = this.plainOctokit(token);
-    await octokit.request("DELETE /installation/token", {
-      headers: githubApiVersionHeader(),
-    });
+    const signal = AbortSignal.timeout(
+      Math.min(this.options.revokeTimeoutMs ?? MAX_REVOKE_TIMEOUT_MS, MAX_REVOKE_TIMEOUT_MS),
+    );
+    const retryDelays = this.options.revokeRetryDelaysMs ?? REVOKE_RETRY_DELAYS_MS;
+    let attempts = 0;
+    for (const retryDelay of [...retryDelays, undefined]) {
+      attempts++;
+      try {
+        await requestTokenRevocation(octokit, signal);
+        return;
+      } catch (error) {
+        const status = revocationHttpStatus(error);
+        // An expired or previously revoked token no longer grants access.
+        if (status === 401 || status === 404) return;
+        if (
+          retryDelay !== undefined &&
+          isRetryableRevocation(status) &&
+          (await waitForRevocationRetry(retryDelay, signal))
+        )
+          continue;
+        logger.warn(
+          { attempts, status },
+          "installation token revocation failed; token stays valid until it expires",
+        );
+        throw error;
+      }
+    }
   }
 
   getAppBotIdentity(appSlug: string, installationToken: string): Promise<GitHubAppBotIdentity> {
@@ -260,6 +290,44 @@ class GitHubAppClient {
         algorithm: "RS256",
       },
     );
+  }
+}
+
+async function requestTokenRevocation(octokit: Octokit, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  const aborted = Promise.withResolvers<never>();
+  const listener = addAbortListener(signal, () => aborted.reject(signal.reason));
+  try {
+    await Promise.race([
+      octokit.request("DELETE /installation/token", {
+        headers: githubApiVersionHeader(),
+        request: { retries: 0, signal },
+      }),
+      aborted.promise,
+    ]);
+  } finally {
+    listener[Symbol.dispose]();
+  }
+}
+
+function revocationHttpStatus(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const response: unknown = Reflect.get(error, "response");
+  if (typeof response !== "object" || response === null) return undefined;
+  const status: unknown = Reflect.get(response, "status");
+  return typeof status === "number" ? status : undefined;
+}
+
+function isRetryableRevocation(status: number | undefined): boolean {
+  return status === undefined || (status >= 500 && status < 600);
+}
+
+async function waitForRevocationRetry(ms: number, signal: AbortSignal): Promise<boolean> {
+  try {
+    await delay(ms, undefined, { signal });
+    return true;
+  } catch {
+    return false;
   }
 }
 
