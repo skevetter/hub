@@ -2,7 +2,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { type FormEvent, type ReactNode } from "react";
+import { type SubmitEvent, type ReactNode } from "react";
 import { Card } from "../components/app/card.js";
 import { ConfirmAction } from "../components/app/confirm-action.js";
 import { DataCell, DataRow, DataTable } from "../components/app/data-table.js";
@@ -128,7 +128,7 @@ export function ProjectGeneralSettingsPanel() {
   });
   if (!snapshot.ok) return snapshot.element;
   const data = snapshot.data;
-  const submit = (event: FormEvent<HTMLFormElement>) => {
+  const submit = (event: SubmitEvent<HTMLFormElement>) => {
     event.preventDefault();
     const slug = formString(new FormData(event.currentTarget), "slug");
     updateSlug.mutate(
@@ -146,45 +146,62 @@ export function ProjectGeneralSettingsPanel() {
   return (
     <SettingsPage>
       <CommandError mutations={[updateSlug, archive]} />
-      {data.capabilities.manageResources ? (
-        <>
-          <Section
-            title="Project URL"
-            description="Changing the slug deliberately breaks old project URLs."
-          >
-            <form
-              aria-label="Change project slug"
-              className="grid max-w-md gap-4"
-              onSubmit={submit}
-            >
-              <FormField
-                id="project-slug"
-                label="Project slug"
-                kind="text"
-                name="slug"
-                defaultValue={data.project.slug}
-                pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
-                required
-              />
-              <FormActions>
-                <Button type="submit">Save slug</Button>
-              </FormActions>
-            </form>
-          </Section>
-          <Section title="Archive project">
-            <ConfirmAction
-              label="Archive project"
-              title={`Archive ${data.project.name}?`}
-              description="Routing is released; running recovery and history remain."
-              confirmLabel="Archive project"
-              cancelLabel="Cancel"
-              busy={archive.isPending}
-              onConfirm={() => archive.mutate({ data: scope })}
-            />
-          </Section>
-        </>
-      ) : null}
+      {data.capabilities.manageResources
+        ? renderProjectSettingsActions({
+            project: data.project,
+            submit,
+            archiving: archive.isPending,
+            onArchive: () => archive.mutate({ data: scope }),
+          })
+        : null}
     </SettingsPage>
+  );
+}
+
+function renderProjectSettingsActions({
+  project,
+  submit,
+  archiving,
+  onArchive,
+}: {
+  project: ProjectSnapshot["project"];
+  submit: (event: SubmitEvent<HTMLFormElement>) => void;
+  archiving: boolean;
+  onArchive: () => void;
+}) {
+  return (
+    <>
+      <Section
+        title="Project URL"
+        description="Changing the slug deliberately breaks old project URLs."
+      >
+        <form aria-label="Change project slug" className="grid max-w-md gap-4" onSubmit={submit}>
+          <FormField
+            id="project-slug"
+            label="Project slug"
+            kind="text"
+            name="slug"
+            defaultValue={project.slug}
+            pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
+            required
+          />
+          <FormActions>
+            <Button type="submit">Save slug</Button>
+          </FormActions>
+        </form>
+      </Section>
+      <Section title="Archive project">
+        <ConfirmAction
+          label="Archive project"
+          title={`Archive ${project.name}?`}
+          description="Routing is released; running recovery and history remain."
+          confirmLabel="Archive project"
+          cancelLabel="Cancel"
+          busy={archiving}
+          onConfirm={onArchive}
+        />
+      </Section>
+    </>
   );
 }
 
@@ -243,48 +260,50 @@ function ActivityTable({
       isEmpty={activity.length === 0}
       empty={{ title: "No activity" }}
     >
-      {activity.map((event) => {
-        const { status } = event;
-        return (
-          <DataRow key={event.id}>
-            <DataCell>
-              <TwoLine
-                primary={
-                  detailBasePath && event.configuredTriggerName !== null ? (
-                    <Button variant="link" asChild>
-                      <Link to={`${detailBasePath}/${event.id}` as never}>
-                        {event.configuredTriggerName}
-                      </Link>
-                    </Button>
-                  ) : (
-                    <span className="font-mono">{event.id.slice(0, 12)}</span>
-                  )
-                }
-                {...(event.repo === null ? {} : { secondary: event.repo })}
-              />
-            </DataCell>
-            <DataCell>{event.provider}</DataCell>
-            <DataCell>
-              <div className="flex items-center gap-2">
-                <ProviderGlyph provider={event.provider} source={event.source} />
-                <TwoLine
-                  primary={activitySourceLabel(event)}
-                  {...("webhookSummary" in event && event.webhookSummary?.prompt !== undefined
-                    ? { secondary: event.webhookSummary.prompt }
-                    : {})}
-                />
-              </div>
-            </DataCell>
-            <DataCell>
-              <StatusPill tone={executionTone(status)}>{statusLabel(status)}</StatusPill>
-            </DataCell>
-            <DataCell muted>
-              <RelativeTime value={event.receivedAt} />
-            </DataCell>
-          </DataRow>
-        );
-      })}
+      {activity.map((event) => renderActivityRow(event, detailBasePath))}
     </DataTable>
+  );
+}
+
+function renderActivityRow(event: ProjectSnapshot["activity"][number], detailBasePath?: string) {
+  const { status } = event;
+  return (
+    <DataRow key={event.id}>
+      <DataCell>
+        <TwoLine
+          primary={
+            detailBasePath && event.configuredTriggerName !== null ? (
+              <Button variant="link" asChild>
+                <Link to={`${detailBasePath}/${event.id}` as never}>
+                  {event.configuredTriggerName}
+                </Link>
+              </Button>
+            ) : (
+              <span className="font-mono">{event.id.slice(0, 12)}</span>
+            )
+          }
+          {...(event.repo === null ? {} : { secondary: event.repo })}
+        />
+      </DataCell>
+      <DataCell>{event.provider}</DataCell>
+      <DataCell>
+        <div className="flex items-center gap-2">
+          <ProviderGlyph provider={event.provider} source={event.source} />
+          <TwoLine
+            primary={activitySourceLabel(event)}
+            {...("webhookSummary" in event && event.webhookSummary?.prompt !== undefined
+              ? { secondary: event.webhookSummary.prompt }
+              : {})}
+          />
+        </div>
+      </DataCell>
+      <DataCell>
+        <StatusPill tone={executionTone(status)}>{statusLabel(status)}</StatusPill>
+      </DataCell>
+      <DataCell muted>
+        <RelativeTime value={event.receivedAt} />
+      </DataCell>
+    </DataRow>
   );
 }
 
