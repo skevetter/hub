@@ -4547,7 +4547,7 @@ class PgDatabase implements Database {
                  '{"releasedRoutes":true}')`,
           [organizationId, projectId, userId, projectId],
         );
-        return toProjectRecord(archived.rows[0]!);
+        return toProjectRecord(requireReturnedRow(archived.rows[0], "archived project"));
       });
     } catch (error) {
       throw toDatabaseError(error);
@@ -4602,7 +4602,9 @@ class PgDatabase implements Database {
         input.createdByUserId ?? null,
       ],
     );
-    return toProjectConfigurationRevisionRecord(rows.rows[0]!);
+    return toProjectConfigurationRevisionRecord(
+      requireReturnedRow(rows.rows[0], "inserted configuration revision"),
+    );
   }
 
   async activateProjectConfigurationRevision(
@@ -4613,25 +4615,7 @@ class PgDatabase implements Database {
     try {
       return await this.pool.transaction(async (client) => {
         const revision = await lockValidProjectRevision(client, projectId, revisionId);
-        const compiledRoutes =
-          routes ??
-          (
-            await client.query<{
-              provider: ConnectionProvider;
-              connection_id: string;
-              resource_id: string | null;
-              trigger_name: string;
-            }>(
-              `select provider, connection_id, resource_id, trigger_name
-             from project_trigger_routes where configuration_revision_id = $1`,
-              [revisionId],
-            )
-          ).rows.map((row) => ({
-            provider: row.provider,
-            connectionId: row.connection_id,
-            resourceId: row.resource_id,
-            triggerName: row.trigger_name,
-          }));
+        const compiledRoutes = routes ?? (await this.loadRevisionTriggerRoutes(client, revisionId));
         await client.query(`delete from project_trigger_routes where project_id = $1`, [projectId]);
         for (const route of compiledRoutes) {
           await client.query(
@@ -4670,6 +4654,25 @@ class PgDatabase implements Database {
     } catch (error) {
       throw toDatabaseError(error);
     }
+  }
+
+  private async loadRevisionTriggerRoutes(client: QueryHandle, revisionId: string) {
+    const result = await client.query<{
+      provider: ConnectionProvider;
+      connection_id: string;
+      resource_id: string | null;
+      trigger_name: string;
+    }>(
+      `select provider, connection_id, resource_id, trigger_name
+             from project_trigger_routes where configuration_revision_id = $1`,
+      [revisionId],
+    );
+    return result.rows.map((row) => ({
+      provider: row.provider,
+      connectionId: row.connection_id,
+      resourceId: row.resource_id,
+      triggerName: row.trigger_name,
+    }));
   }
 
   async findProjectConfigurationRollbackTarget(projectId: string) {
@@ -4778,43 +4781,7 @@ class PgDatabase implements Database {
   ): Promise<ProjectConfigurationRevisionRecord> {
     try {
       return await this.pool.transaction(async (client) => {
-        const project = await client.query<ProjectRow>(
-          `select project.*
-         from projects project
-         join member on member.organization_id = project.organization_id
-         where project.id = $1 and project.status = 'active'
-           and member.user_id = $2 and member.role in ('owner', 'admin')
-           and project.active_configuration_revision_id is not null
-         for update of project`,
-          [input.projectId, input.userId],
-        );
-        const projectRow = project.rows[0];
-        if (projectRow === undefined) throw new Error("project access denied");
-        const inserted = await client.query<ProjectConfigurationRevisionRow>(
-          `insert into project_configuration_revisions (
-           project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
-           normalized_configuration, content_hash, created_by_user_id, received_at, validated_at
-         ) values (
-           $1, $2,
-           coalesce((select max(version) + 1 from project_configuration_revisions where project_id = $1), 1),
-           'manual', $3, $4, $5, $6, $7, clock_timestamp(), clock_timestamp()
-         ) returning *`,
-          [
-            input.projectId,
-            projectRow.organization_id,
-            {
-              kind: "authority-switch",
-              fromRevisionId: projectRow.active_configuration_revision_id,
-              formattingPreserved: true,
-              bundle: input.bundle,
-            },
-            input.rawYaml,
-            input.normalizedConfiguration,
-            input.contentHash,
-            input.userId,
-          ],
-        );
-        const revision = inserted.rows[0]!;
+        const revision = await this.insertManualAuthorityRevision(client, input);
         await client.query(
           `update project_configuration_sources
          set kind = 'manual', github_connection_id = null, github_repository_id = null,
@@ -4854,6 +4821,49 @@ class PgDatabase implements Database {
     } catch (error) {
       throw toDatabaseError(error);
     }
+  }
+
+  private async insertManualAuthorityRevision(
+    client: QueryHandle,
+    input: SwitchProjectConfigurationToManualInput,
+  ) {
+    const project = await client.query<ProjectRow>(
+      `select project.*
+         from projects project
+         join member on member.organization_id = project.organization_id
+         where project.id = $1 and project.status = 'active'
+           and member.user_id = $2 and member.role in ('owner', 'admin')
+           and project.active_configuration_revision_id is not null
+         for update of project`,
+      [input.projectId, input.userId],
+    );
+    const projectRow = project.rows[0];
+    if (projectRow === undefined) throw new Error("project access denied");
+    const inserted = await client.query<ProjectConfigurationRevisionRow>(
+      `insert into project_configuration_revisions (
+           project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
+           normalized_configuration, content_hash, created_by_user_id, received_at, validated_at
+         ) values (
+           $1, $2,
+           coalesce((select max(version) + 1 from project_configuration_revisions where project_id = $1), 1),
+           'manual', $3, $4, $5, $6, $7, clock_timestamp(), clock_timestamp()
+         ) returning *`,
+      [
+        input.projectId,
+        projectRow.organization_id,
+        {
+          kind: "authority-switch",
+          fromRevisionId: projectRow.active_configuration_revision_id,
+          formattingPreserved: true,
+          bundle: input.bundle,
+        },
+        input.rawYaml,
+        input.normalizedConfiguration,
+        input.contentHash,
+        input.userId,
+      ],
+    );
+    return requireReturnedRow(inserted.rows[0], "inserted manual configuration revision");
   }
 
   async setProjectGitHubConfigurationSource(
@@ -4963,44 +4973,9 @@ class PgDatabase implements Database {
     const sourceRow = source.rows[0];
     if (sourceRow === undefined) throw new Error("configuration authority not found");
     const activeRevision = (await this.findActiveProjectConfiguration(projectId)) ?? null;
-    const attempts = await query<{
-      id: string;
-      project_id: string;
-      github_connection_id: string | null;
-      github_repository_id: number | null;
-      webhook_delivery_id: string | null;
-      commit_sha: string | null;
-      outcome: string;
-      evidence: unknown;
-      created_at: Date;
-    }>(
-      this.pool,
-      `select * from configuration_sync_attempts
-       where project_id = $1 order by created_at desc, id desc limit 1`,
-      [projectId],
-    );
-    const attempt = attempts.rows[0];
-    const lastSyncAttempt =
-      attempt === undefined
-        ? null
-        : {
-            id: attempt.id,
-            projectId: attempt.project_id,
-            githubConnectionId: attempt.github_connection_id,
-            githubRepositoryId: attempt.github_repository_id,
-            webhookDeliveryId: attempt.webhook_delivery_id,
-            commitSha: attempt.commit_sha,
-            outcome: attempt.outcome,
-            evidence: attempt.evidence,
-            createdAt: attempt.created_at,
-          };
+    const lastSyncAttempt = await this.findLastConfigurationSyncAttempt(projectId);
     if (sourceRow.kind === "manual") {
-      const evidence = activeRevision?.sourceEvidence;
-      const formattingPreserved =
-        typeof evidence === "object" &&
-        evidence !== null &&
-        "formattingPreserved" in evidence &&
-        evidence.formattingPreserved === true;
+      const formattingPreserved = this.isFormattingPreserved(activeRevision?.sourceEvidence);
       return {
         authority: "manual",
         activeRevision,
@@ -5031,6 +5006,49 @@ class PgDatabase implements Database {
     };
   }
 
+  private async findLastConfigurationSyncAttempt(
+    projectId: string,
+  ): Promise<ConfigurationSyncAttemptRecord | null> {
+    const attempts = await query<{
+      id: string;
+      project_id: string;
+      github_connection_id: string | null;
+      github_repository_id: number | null;
+      webhook_delivery_id: string | null;
+      commit_sha: string | null;
+      outcome: string;
+      evidence: unknown;
+      created_at: Date;
+    }>(
+      this.pool,
+      `select * from configuration_sync_attempts
+       where project_id = $1 order by created_at desc, id desc limit 1`,
+      [projectId],
+    );
+    const attempt = attempts.rows[0];
+    if (attempt === undefined) return null;
+    return {
+      id: attempt.id,
+      projectId: attempt.project_id,
+      githubConnectionId: attempt.github_connection_id,
+      githubRepositoryId: attempt.github_repository_id,
+      webhookDeliveryId: attempt.webhook_delivery_id,
+      commitSha: attempt.commit_sha,
+      outcome: attempt.outcome,
+      evidence: attempt.evidence,
+      createdAt: attempt.created_at,
+    };
+  }
+
+  private isFormattingPreserved(evidence: unknown): boolean {
+    return (
+      typeof evidence === "object" &&
+      evidence !== null &&
+      "formattingPreserved" in evidence &&
+      evidence.formattingPreserved === true
+    );
+  }
+
   async getHomeChecklistCompletedAt(organizationId: string): Promise<Date | null> {
     const result = await this.pool.query<{ home_checklist_completed_at: Date | null }>(
       "select home_checklist_completed_at from organization where id = $1",
@@ -5053,81 +5071,11 @@ class PgDatabase implements Database {
   }
 
   async organizationConnectionUsage(organizationId: string): Promise<OrganizationConnectionUsage> {
-    const github = await query<{
-      id: string;
-      organization_id: string;
-      slug: string;
-      installation_id: number | string;
-      account_id: string;
-      account_login: string;
-      account_type: string;
-      status: "active" | "suspended";
-      provider_application_id: string | null;
-    }>(
-      this.pool,
-      `select connection.id, connection.organization_id, connection.slug,
-              connection.installation_id,
-              connection.account_id, connection.account_login, connection.account_type,
-              connection.status, connection.provider_application_id
-       from github_connections connection
-       where connection.organization_id = $1
-       order by connection.account_login, connection.id`,
-      [organizationId],
-    );
+    const github = await this.queryGitHubConnectionUsage(organizationId);
     const [discord, slack, linear] = await Promise.all([
-      query<{
-        id: string;
-        organization_id: string;
-        slug: string;
-        guild_id: string;
-        guild_name: string;
-        provider_application_id: string | null;
-      }>(
-        this.pool,
-        `select id, organization_id, slug, guild_id, guild_name, provider_application_id
-         from discord_connections where organization_id = $1
-         order by guild_name, id`,
-        [organizationId],
-      ),
-      query<{
-        id: string;
-        organization_id: string;
-        slug: string;
-        team_id: string;
-        team_name: string;
-        bot_user_id: string;
-        bot_access_token: string;
-        scopes: unknown;
-        provider_application_id: string | null;
-      }>(
-        this.pool,
-        `select id, organization_id, slug, team_id, team_name, bot_user_id, bot_access_token, scopes,
-                provider_application_id
-         from slack_connections where organization_id = $1
-         order by team_name, id`,
-        [organizationId],
-      ),
-      query<{
-        id: string;
-        organization_id: string;
-        slug: string;
-        linear_organization_id: string;
-        linear_organization_name: string;
-        app_user_id: string;
-        access_token: string;
-        refresh_token: string | null;
-        access_token_expires_at: Date | null;
-        scopes: unknown;
-        provider_application_id: string | null;
-      }>(
-        this.pool,
-        `select id, organization_id, slug, linear_organization_id, linear_organization_name,
-                app_user_id, access_token, refresh_token, access_token_expires_at, scopes,
-                provider_application_id
-         from linear_connections where organization_id = $1
-         order by linear_organization_name, id`,
-        [organizationId],
-      ),
+      this.queryDiscordConnectionUsage(organizationId),
+      this.querySlackConnectionUsage(organizationId),
+      this.queryLinearConnectionUsage(organizationId),
     ]);
     return {
       github: github.rows.map((row) => ({
@@ -5174,6 +5122,92 @@ class PgDatabase implements Database {
         providerApplicationId: row.provider_application_id,
       })),
     };
+  }
+
+  private queryGitHubConnectionUsage(organizationId: string) {
+    return query<{
+      id: string;
+      organization_id: string;
+      slug: string;
+      installation_id: number | string;
+      account_id: string;
+      account_login: string;
+      account_type: string;
+      status: "active" | "suspended";
+      provider_application_id: string | null;
+    }>(
+      this.pool,
+      `select connection.id, connection.organization_id, connection.slug,
+              connection.installation_id,
+              connection.account_id, connection.account_login, connection.account_type,
+              connection.status, connection.provider_application_id
+       from github_connections connection
+       where connection.organization_id = $1
+       order by connection.account_login, connection.id`,
+      [organizationId],
+    );
+  }
+
+  private queryDiscordConnectionUsage(organizationId: string) {
+    return query<{
+      id: string;
+      organization_id: string;
+      slug: string;
+      guild_id: string;
+      guild_name: string;
+      provider_application_id: string | null;
+    }>(
+      this.pool,
+      `select id, organization_id, slug, guild_id, guild_name, provider_application_id
+         from discord_connections where organization_id = $1
+         order by guild_name, id`,
+      [organizationId],
+    );
+  }
+
+  private querySlackConnectionUsage(organizationId: string) {
+    return query<{
+      id: string;
+      organization_id: string;
+      slug: string;
+      team_id: string;
+      team_name: string;
+      bot_user_id: string;
+      bot_access_token: string;
+      scopes: unknown;
+      provider_application_id: string | null;
+    }>(
+      this.pool,
+      `select id, organization_id, slug, team_id, team_name, bot_user_id, bot_access_token, scopes,
+                provider_application_id
+         from slack_connections where organization_id = $1
+         order by team_name, id`,
+      [organizationId],
+    );
+  }
+
+  private queryLinearConnectionUsage(organizationId: string) {
+    return query<{
+      id: string;
+      organization_id: string;
+      slug: string;
+      linear_organization_id: string;
+      linear_organization_name: string;
+      app_user_id: string;
+      access_token: string;
+      refresh_token: string | null;
+      access_token_expires_at: Date | null;
+      scopes: unknown;
+      provider_application_id: string | null;
+    }>(
+      this.pool,
+      `select id, organization_id, slug, linear_organization_id, linear_organization_name,
+                app_user_id, access_token, refresh_token, access_token_expires_at, scopes,
+                provider_application_id
+         from linear_connections where organization_id = $1
+         order by linear_organization_name, id`,
+      [organizationId],
+    );
   }
 
   async listGitHubRepositories(organizationId: string): Promise<GitHubRepositoryRecord[]> {

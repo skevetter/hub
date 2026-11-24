@@ -6343,21 +6343,21 @@ class MemoryDatabase implements Database {
       sourceState:
         authority === "manual"
           ? ({ kind: "manual", formattingPreserved: false } as const)
-          : ({
-              kind: "github",
-              githubConnectionId:
-                this.githubConfigurationSources.get(projectId)?.githubConnectionId ?? "unavailable",
-              githubRepositoryId:
-                this.githubConfigurationSources.get(projectId)?.githubRepositoryId ?? 0,
-              githubRepositoryFullName:
-                this.githubConfigurationSources.get(projectId)?.githubRepositoryFullName ??
-                "unavailable",
-              githubDefaultBranch:
-                this.githubConfigurationSources.get(projectId)?.githubDefaultBranch ?? "main",
-              automaticDeploymentEnabled:
-                this.githubConfigurationSources.get(projectId)?.automaticDeploymentEnabled ?? false,
-            } as const),
+          : this.githubConfigurationSourceState(projectId),
     };
+  }
+
+  private githubConfigurationSourceState(projectId: string) {
+    const source: Partial<SetProjectGitHubConfigurationSourceInput> =
+      this.githubConfigurationSources.get(projectId) ?? {};
+    return {
+      kind: "github",
+      githubConnectionId: source.githubConnectionId ?? "unavailable",
+      githubRepositoryId: source.githubRepositoryId ?? 0,
+      githubRepositoryFullName: source.githubRepositoryFullName ?? "unavailable",
+      githubDefaultBranch: source.githubDefaultBranch ?? "main",
+      automaticDeploymentEnabled: source.automaticDeploymentEnabled ?? false,
+    } as const;
   }
 
   async getHomeChecklistCompletedAt(organizationId: string): Promise<Date | null> {
