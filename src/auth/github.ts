@@ -61,7 +61,7 @@ interface CreateGitHubAuthOptions {
   privateKey: string;
   fetch?: typeof fetch;
   now?: () => number;
-  /** Octokit's own retry and write throttling stay on unless a caller turns them off. */
+  /** Octokit retry (one attempt) and fail-fast write throttling stay on unless a caller turns them off. */
   octokitPlugins?: { retry?: boolean; throttle?: boolean };
 }
 
@@ -220,11 +220,13 @@ class GitHubAppClient {
   }
 
   private plainOctokit(auth: string): Octokit {
-    return new Octokit({
+    const octokit = new Octokit({
       auth,
       request: githubRequestOptions(this.options.fetch),
       ...pluginOverrides(this.options),
     });
+    octokit.hook.before("request", refuseRetryOfCreateComment);
+    return octokit;
   }
 
   private authenticatedOctokit(auth: string, progress?: ProgressOctokitOptions): Octokit {
@@ -268,11 +270,40 @@ function tokenRequestScope(
         }),
   };
 }
+// 429 is rate limiting: the throttle plugin owns it, and a blind retry would only add load.
+const RETRY_POLICY = { retries: 1, doNotRetry: [400, 401, 403, 404, 410, 422, 429, 451] };
+
+// The Octokit default waits out the quota reset (up to an hour) inside the caller, which is far
+// longer than the 30 s notification lease and GitHub's 10 s webhook window. Fail instead.
+function failFastOnRateLimit(kind: "primary" | "secondary") {
+  return (retryAfterSeconds: number, request: { method: string; url: string }): false => {
+    logger.warn(
+      { kind, retryAfterSeconds, method: request.method, url: request.url },
+      "GitHub rate limit reached",
+    );
+    return false;
+  };
+}
+
+const THROTTLE_POLICY = {
+  onRateLimit: failFastOnRateLimit("primary"),
+  onSecondaryRateLimit: failFastOnRateLimit("secondary"),
+};
+
+// A retried POST after a lost response would publish the comment twice.
+function refuseRetryOfCreateComment(options: { method: string; url: string; request: object }) {
+  if (`${options.method} ${options.url}` === CREATE_COMMENT_ROUTE) {
+    Object.assign(options.request, { retries: 0 });
+  }
+}
+
+const CREATE_COMMENT_ROUTE = "POST /repos/{owner}/{repo}/issues/{issue_number}/comments";
+
 function pluginOverrides(options: CreateGitHubAuthOptions) {
   const plugins = options.octokitPlugins;
   return {
-    ...(plugins?.retry === false ? { retry: { enabled: false } } : {}),
-    ...(plugins?.throttle === false ? { throttle: { enabled: false } } : {}),
+    retry: plugins?.retry === false ? { enabled: false } : RETRY_POLICY,
+    throttle: plugins?.throttle === false ? { enabled: false } : THROTTLE_POLICY,
   };
 }
 
