@@ -1,4 +1,4 @@
-import { expect } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
 import { test } from "./app.js";
 import { projectApp } from "./helpers/projects/index.js";
 
@@ -142,4 +142,35 @@ test("switching organization closes More and returns focus to its trigger", asyn
   await expect(page).toHaveURL(acmeHome);
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
   await expect(more).toBeFocused();
+
+  await rejectSwitchFromMore(page, acmeHome);
 });
+
+async function rejectSwitchFromMore(page: Page, acmeHome: string) {
+  const sheet = page.getByRole("dialog", { name: "More" });
+  const more = page
+    .getByRole("navigation", { name: "Quick navigation" })
+    .getByRole("button", { name: "More", exact: true });
+  const serverFunctions = "**/_serverFn/**";
+  await page.route(serverFunctions, (route) =>
+    route.request().postData()?.includes('"organizationId"') ? route.abort() : route.continue(),
+  );
+  try {
+    await more.click();
+    await sheet.getByRole("button", { name: "Organization" }).click();
+    await page.getByRole("menuitem", { name: "Orbit", exact: true }).click();
+    await expect(sheet).toBeHidden();
+    await expect(
+      page.getByRole("alert").filter({ hasText: "Hub did not receive the account update." }),
+    ).toBeVisible();
+    await expect(page).toHaveURL(acmeHome);
+    await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
+  } finally {
+    await page.unroute(serverFunctions);
+  }
+  await more.click();
+  await expect(sheet.getByRole("button", { name: "Organization" })).toContainText("Acme");
+  await page.screenshot({ path: `${SHOTS}/04-rejected-switch.png`, animations: "disabled" });
+  await page.keyboard.press("Escape");
+  await expect(sheet).toBeHidden();
+}
