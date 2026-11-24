@@ -8,12 +8,10 @@ import { githubProgressFetch } from "./github-progress-fetch.js";
 import { GITHUB_APP_PERMISSION_VOCABULARY } from "../config/github-authority.js";
 import { GitHubInstallationSchema } from "./github-events.js";
 import type { GitHubInstallation } from "./github-events.js";
+import { TOKEN_REVOKE_BUDGET_MS } from "./revocation-budget.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_REQUEST_TIMEOUT_MS = 2_147_483_647;
-// The execution authority stops waiting for a revoke after 10 s and schedules its own retry, so a
-// revoke must finish inside that window to never overlap the retry.
-export const MAX_REVOKE_TIMEOUT_MS = 9_000;
 const REVOKE_RETRY_DELAYS_MS = [500, 1_500] as const;
 
 interface InstallationTokenCacheEntry {
@@ -177,7 +175,7 @@ class GitHubAppClient {
       observedStatus = response.status;
     });
     const signal = AbortSignal.timeout(
-      Math.min(this.options.revokeTimeoutMs ?? MAX_REVOKE_TIMEOUT_MS, MAX_REVOKE_TIMEOUT_MS),
+      Math.min(this.options.revokeTimeoutMs ?? TOKEN_REVOKE_BUDGET_MS, TOKEN_REVOKE_BUDGET_MS),
     );
     const retryDelays = this.options.revokeRetryDelaysMs ?? REVOKE_RETRY_DELAYS_MS;
     let attempts = 0;

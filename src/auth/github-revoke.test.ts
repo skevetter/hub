@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { afterEach, describe, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { logger } from "../logger.js";
-import { MAX_REVOKE_TIMEOUT_MS, createGitHubAuth } from "./github.js";
+import { createGitHubAuth } from "./github.js";
+import { TOKEN_REVOKE_BUDGET_MS, TOKEN_REVOKE_WATCHDOG_MS } from "./revocation-budget.js";
 
 const TOKEN = "ghs_revoke_test_secret";
 const WARNING = "installation token revocation failed; token stays valid until it expires";
@@ -27,6 +28,12 @@ function githubError(status: number) {
   return Response.json({ message: `GitHub error for ${TOKEN}` }, { status });
 }
 
+function fakeTimeout(ms: number): AbortSignal {
+  const deadline = new AbortController();
+  setTimeout(() => deadline.abort(new DOMException("budget expired", "TimeoutError")), ms);
+  return deadline.signal;
+}
+
 const hangUntilAborted: typeof fetch = (_input, init) => {
   const signal = init?.signal;
   const pending = Promise.withResolvers<Response>();
@@ -34,7 +41,10 @@ const hangUntilAborted: typeof fetch = (_input, init) => {
   return pending.promise;
 };
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe("GitHub installation token revocation", () => {
   it("deletes the token on the first try", async () => {
@@ -154,8 +164,24 @@ describe("GitHub installation token revocation", () => {
     assert.equal(warn.mock.calls.length, 0);
   });
 
-  it("keeps the default budget inside the execution authority's 10 s revoke watchdog", () => {
-    assert.ok(MAX_REVOKE_TIMEOUT_MS < 10_000);
+  it("leaves a margin between the provider budget and the watchdog", () => {
+    assert.ok(TOKEN_REVOKE_WATCHDOG_MS > TOKEN_REVOKE_BUDGET_MS);
+  });
+
+  it("rejects a fetch that ignores abort when the default budget expires", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(AbortSignal, "timeout").mockImplementationOnce(fakeTimeout);
+    const { revoke, request } = harness(() => new Promise(() => undefined));
+    const failed = vi.fn<(error: unknown) => void>();
+    void revoke().catch(failed);
+
+    await vi.advanceTimersByTimeAsync(TOKEN_REVOKE_BUDGET_MS - 1);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(failed).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(failed).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ name: "TimeoutError" }),
+    );
   });
 
   it("enforces the overall budget even when fetch never settles", async () => {
