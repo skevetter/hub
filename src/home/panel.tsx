@@ -616,14 +616,16 @@ function GetStarted({
 interface StepPresentation {
   title: string;
   hint: ReactNode;
-  status: { label: string; tone: StatusTone };
+  status: { label: string; tone: StepTone };
   /** The one next action, when there is one the reader can press. */
   action?: ReactNode;
   /** A command to run somewhere else, when that is the next action. */
   command?: { label: string; value: string };
 }
 
-const STEP_STATES: Record<StatusTone, ChecklistItemState> = {
+type StepTone = Exclude<StatusTone, "live">;
+
+const STEP_STATES: Record<StepTone, ChecklistItemState> = {
   success: "done",
   neutral: "todo",
   warning: "attention",

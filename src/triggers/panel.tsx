@@ -111,7 +111,7 @@ type TriggerTextField = Exclude<
 >;
 
 const TRIGGER_COLUMNS = [
-  { header: "Status" },
+  { header: "Status", lead: true },
   { header: "Trigger", fill: true },
   { header: "Event", fill: true, className: "hidden md:table-cell" },
   { header: "Target", fill: true, className: "hidden xl:table-cell" },

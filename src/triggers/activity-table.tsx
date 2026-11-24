@@ -8,7 +8,7 @@ import type { TriggerActivityPage } from "./functions.js";
 import type { ComponentProps } from "react";
 
 export const ACTIVITY_COLUMNS = [
-  { header: "Status" },
+  { header: "Status", lead: true },
   { header: "Trigger", fill: true },
   { header: "Provider", className: "hidden sm:table-cell" },
   { header: "Source", fill: true, className: "hidden sm:table-cell" },

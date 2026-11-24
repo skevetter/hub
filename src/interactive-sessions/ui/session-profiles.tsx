@@ -25,7 +25,7 @@ import { refusalMessage, SessionLoadFailure, SessionsUnavailable } from "./sessi
 
 const DESCRIPTION = "Choose where sessions run and what settings agents use.";
 const COLUMNS = [
-  { header: "State" },
+  { header: "State", lead: true },
   { header: "Name", fill: true },
   { header: "Daemon", fill: true, className: "hidden lg:table-cell" },
   { header: "Directory", fill: true, className: "hidden lg:table-cell" },

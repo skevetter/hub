@@ -11,6 +11,7 @@ export { statusLabel, type StatusTone };
  * the data, not about the pill — `statusLabel` is where a machine value becomes a sentence.
  */
 const toneStyles: Record<StatusTone, string> = {
+  live: "bg-live-surface text-live-text",
   success: "bg-success-surface text-success",
   warning: "bg-warning-surface text-warning",
   danger: "bg-danger-surface text-danger",

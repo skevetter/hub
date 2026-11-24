@@ -75,14 +75,23 @@ async function expectLeadingBlock(page: Page, table: Locator, width: number): Pr
   const block = row.locator('[data-slot="state-block"]');
   await expect(block).toBeVisible();
   const box = await block.boundingBox();
-  const first = await row.getByRole("cell").first().boundingBox();
-  if (box === null || first === null) throw new Error("row not measurable");
+  const record = await row.getByRole("cell").nth(1).boundingBox();
+  if (box === null || record === null) throw new Error("row not measurable");
   expect(box.height).toBe(28);
   expect(box.width).toBeGreaterThanOrEqual(96);
-  expect(box.x).toBeLessThanOrEqual(first.x + 16 + 1);
+  if (width < 640) {
+    expect(box.y + box.height).toBeLessThanOrEqual(record.y);
+    expect(box.width).toBeLessThan(width / 2);
+  } else {
+    expect(box.x + box.width).toBeLessThanOrEqual(record.x);
+  }
   const radius = await block.evaluate((node) => getComputedStyle(node).borderRadius);
   expect(radius).toBe("0px");
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(width);
+  const region = await table
+    .locator("xpath=ancestor::*[@data-slot='table-container']")
+    .evaluate((node) => node.scrollWidth - node.clientWidth);
+  expect(region).toBeLessThanOrEqual(0);
 }
 
 async function expectNoAxeViolations(page: Page): Promise<void> {

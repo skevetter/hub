@@ -65,7 +65,7 @@ describe("state labels", () => {
 
   it("maps each state ink to one pill tone", () => {
     assert.equal(pillTone("attention"), "danger");
-    assert.equal(pillTone("live"), "success");
+    assert.equal(pillTone("live"), "live");
     assert.equal(pillTone("done"), "success");
     assert.equal(pillTone("off"), "neutral");
   });

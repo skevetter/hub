@@ -2,7 +2,7 @@
 export type StateTone = "attention" | "live" | "done" | "off";
 
 /** The pill's tones. They alias the state inks until every pill is retired. */
-export type StatusTone = "success" | "warning" | "danger" | "neutral";
+export type StatusTone = "live" | "success" | "warning" | "danger" | "neutral";
 
 /** What a person reads and the ink it takes. Every pill, block and sentence about a state reads this. */
 export interface StateView {
@@ -97,7 +97,7 @@ export function enabledState(enabled: boolean): StateView {
 
 const PILL_TONE: Record<StateTone, StatusTone> = {
   attention: "danger",
-  live: "success",
+  live: "live",
   done: "success",
   off: "neutral",
 };

@@ -28,7 +28,7 @@ import {
 
 const DESCRIPTION = "Conversations with agents running on your daemons.";
 const COLUMNS = [
-  { header: "State" },
+  { header: "State", lead: true },
   { header: "Session", fill: true },
   { header: "Last activity", className: "hidden md:table-cell" },
 ];
