@@ -36,6 +36,7 @@ import { Pagination } from "../components/app/pagination.js";
 import { Steps } from "../components/app/steps.js";
 import { SegmentedControl, type SegmentedOption } from "../components/app/segmented-control.js";
 import { StatusPill, statusLabel } from "../components/app/status-pill.js";
+import { toast, type ToastInput } from "../components/app/toast-store.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
 import { Button } from "../components/ui/button.js";
@@ -461,6 +462,23 @@ function triggerListAnnouncement(
     .join(". ");
 }
 
+/** A new trigger has no id yet, so only an edit can offer View. */
+function savedToast(organizationSlug: string, triggerId: string | undefined): ToastInput {
+  if (triggerId === undefined) return { title: "Trigger saved" };
+  return {
+    title: "Trigger saved",
+    action: (
+      <Link
+        to="/o/$organizationSlug/triggers/$triggerId"
+        params={{ organizationSlug, triggerId }}
+        className="text-link underline underline-offset-4"
+      >
+        View trigger
+      </Link>
+    ),
+  };
+}
+
 function triggerPageTarget(organizationSlug: string, search: TriggerSearch, cursor?: string) {
   return {
     to: "/o/$organizationSlug/triggers" as const,
@@ -550,10 +568,11 @@ export function TriggerEditorPanel({ triggerId }: { triggerId: string }) {
   }) => Promise<Result<{ state: "complete" }>>;
   const save = useMutation({
     mutationFn: saveCommand,
-    onSuccess: async (result) => {
+    onSuccess: async (result, variables) => {
       if (result.status !== "ok") return;
       await queryClient.invalidateQueries({ queryKey: ["triggers", organizationSlug] });
       await navigate(listTarget);
+      toast(savedToast(organizationSlug, variables.data.triggerId));
     },
   });
   if (snapshot.status === "pending") return <TriggerEditorSkeleton />;

@@ -7,6 +7,7 @@ import { OrganizationTriggers } from "./helpers/triggers.js";
 const SHOTS = "/tmp/hub-ui/trigger-view-shots";
 const NAME = "review-queue";
 const PHONE = { width: 390, height: 844 };
+const TOAST_MS = 9000;
 const REFUSAL = "Verify your email to run this trigger.";
 const LONG_REFUSAL = `${REFUSAL} We could not confirm the address on this account, so Hub did not start the run. Open the verification message in your inbox, follow its link, then come back to this page and try again. If the message is missing, request a new one from your account settings (reference trace-0123456789abcdef0123456789abcdef).`;
 const owner = {
@@ -134,6 +135,82 @@ test("wraps a long refusal inside the bar without covering the navigation", asyn
   if (fact === null || barBox === null) throw new Error("layout not measurable");
   expect(fact.y + fact.height).toBeLessThanOrEqual(barBox.y);
 });
+
+test("confirms a saved trigger with a toast that holds, links and dismisses", async ({
+  hub,
+  page,
+}) => {
+  await createManualTrigger(hub, page);
+  const log = page.getByRole("log", { name: "Notifications" });
+  await expect(log).toHaveAttribute("aria-live", "polite");
+  await expect(log).toContainText("Trigger saved");
+  await dismissAllToasts(log);
+  await expect(log).toHaveText("");
+  const region = await log.elementHandle();
+  if (region === null) throw new Error("notification region missing");
+  await page.clock.install();
+  await saveEdit(page);
+  await expectAnnounced(region, "Trigger saved");
+  const toast = log.locator('[data-slot="toast"]');
+  await expect(toast.getByRole("link", { name: "View trigger" })).toBeVisible();
+  await toast.hover();
+  await page.clock.fastForward(TOAST_MS);
+  await expect(toast).toBeVisible();
+  await page.mouse.move(0, 0);
+  await page.clock.fastForward(TOAST_MS);
+  await expect(toast).toHaveCount(0);
+  await expect(page.getByRole("table", { name: "Triggers" })).toBeVisible();
+});
+
+test("places a toast clear of the phone bars and returns focus when it is dismissed", async ({
+  hub,
+  page,
+}) => {
+  await createManualTrigger(hub, page);
+  await page.setViewportSize(PHONE);
+  const log = page.getByRole("log", { name: "Notifications" });
+  await dismissAllToasts(log);
+  await saveEdit(page);
+  const toast = log.locator('[data-slot="toast"]');
+  await expect(toast).toBeVisible();
+  await expectToastClearOfBars(page, toast);
+  const dismiss = toast.getByRole("button", { name: "Dismiss: Trigger saved" });
+  const target = await dismiss.boundingBox();
+  expect(target?.width).toBeGreaterThanOrEqual(44);
+  expect(target?.height).toBeGreaterThanOrEqual(44);
+  await toast.getByRole("link", { name: "View trigger" }).click();
+  await expect(page.getByRole("heading", { name: NAME, level: 1 })).toBeVisible();
+  await expect(toast).toBeVisible();
+  await dismiss.click();
+  await expect(toast).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe("content");
+});
+
+async function dismissAllToasts(log: Locator): Promise<void> {
+  const dismiss = log.getByRole("button", { name: /^Dismiss/u });
+  while ((await dismiss.count()) > 0) await dismiss.first().click();
+}
+
+async function saveEdit(page: Page): Promise<void> {
+  await page.getByRole("link", { name: "Edit", exact: true }).click();
+  const form = page.locator("#trigger-editor-form");
+  await form.getByRole("checkbox", { name: "Enabled" }).uncheck();
+  await form.getByRole("button", { name: "Save changes" }).click();
+  await expect(page).toHaveURL(/\/triggers$/u);
+}
+
+async function expectToastClearOfBars(page: Page, toast: Locator): Promise<void> {
+  const [box, header, nav] = await Promise.all([
+    toast.boundingBox(),
+    page.locator("header:visible").first().boundingBox(),
+    page.getByRole("navigation", { name: "Quick navigation" }).boundingBox(),
+  ]);
+  if (box === null || header === null || nav === null) throw new Error("layout not measurable");
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(PHONE.width);
+  expect(box.y).toBeGreaterThanOrEqual(header.y + header.height);
+  expect(box.y + box.height).toBeLessThanOrEqual(nav.y);
+}
 
 async function createManualTrigger(hub: PaseoHub, page: Page): Promise<string> {
   await hub.signUpAs("owner", owner);
