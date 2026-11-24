@@ -23,6 +23,15 @@ for (const width of [390, 1280]) {
     await page.getByRole("link", { name: "Go home" }).click();
     await expect(page).toHaveURL(home);
     await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
+    for (const nested of ["/settings/__missing__", "/activity/run/extra"]) {
+      await page.goto(home.replace(/\/home$/u, nested));
+      await expect(page.getByRole("heading", { name: "Page not found", level: 1 })).toBeVisible();
+      await expectShell(page, width);
+      await expect(page.getByRole("link", { name: "Go home" })).toHaveAttribute(
+        "href",
+        new URL(home).pathname,
+      );
+    }
     await page.goto(home.replace(/\/home$/u, "/settings/billing"));
     await expect(page.getByRole("heading", { name: "Page not found", level: 1 })).toBeVisible();
     await expectShell(page, width);

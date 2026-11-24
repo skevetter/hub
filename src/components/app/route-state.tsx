@@ -76,6 +76,10 @@ export function useRouteHome(): string {
   return homeFor(params.organizationSlug);
 }
 
+export function RouteNotFound() {
+  return <NotFoundPage home={useRouteHome()} />;
+}
+
 // Server-rendered loader errors arrive without a reset function.
 export function RouteErrorBoundary({ error, reset }: { error: unknown; reset?: () => void }) {
   const router = useRouter();

@@ -1,7 +1,13 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { getRouter } from "../../router.js";
-import { ErrorPage, homeFor, NotFoundPage, RouteErrorBoundary } from "./route-state.js";
+import {
+  ErrorPage,
+  homeFor,
+  NotFoundPage,
+  RouteErrorBoundary,
+  RouteNotFound,
+} from "./route-state.js";
 
 describe("route states", () => {
   it("renders not found with a home action", () => {
@@ -13,6 +19,10 @@ describe("route states", () => {
 
   it("uses the safe error page for every route without its own", () => {
     expect(getRouter().options.defaultErrorComponent).toBe(RouteErrorBoundary);
+  });
+
+  it("uses the shared not found page under nested layouts", () => {
+    expect(getRouter().options.defaultNotFoundComponent).toBe(RouteNotFound);
   });
 
   it("sends home to the organization when one is in the address", () => {
