@@ -57,6 +57,14 @@ describe("toast store", () => {
     ]);
   });
 
+  it("moves a reused id into its new organization and displaces only that organization's oldest", () => {
+    toast({ id: "move", title: "Moved", scope: "acme" });
+    for (let n = 1; n <= MAX_TOASTS; n += 1) toast({ title: `Globex ${n}`, scope: "globex" });
+    toast({ id: "move", title: "Moved", scope: "globex" });
+    expect(titles()).toEqual(["Globex 2", "Globex 3", "Moved"]);
+    expect(visibleToasts(toastSnapshot(), "acme")).toEqual([]);
+  });
+
   it("dismisses one toast and ignores an unknown id", () => {
     toast({ title: "Keep" });
     const gone = toast({ title: "Gone" });
