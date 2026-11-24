@@ -36,6 +36,8 @@ const FILTERS = [
   { value: "all", label: "All" },
 ];
 
+type SessionListResult = Awaited<ReturnType<typeof listInteractiveSessions>>;
+
 export function SessionListLoading() {
   return (
     <div aria-busy="true" aria-label="Loading sessions">
@@ -52,7 +54,7 @@ export function SessionListPanel({
 }: {
   organizationSlug: string;
   filter: "active" | "all";
-  result: Awaited<ReturnType<typeof listInteractiveSessions>>;
+  result: SessionListResult;
 }) {
   const navigate = useNavigate();
   const account = useActiveAccount();
@@ -71,8 +73,7 @@ export function SessionListPanel({
   if (result.status === "ok" && "outcome" in result.data && result.data.code === "not_found")
     return <SessionsUnavailable />;
   // The empty state carries the one New session action; a second filled button would compete.
-  const hasRows =
-    result.status === "ok" && !("outcome" in result.data) && result.data.sessions.length > 0;
+  const hasRows = hasSessionRows(result);
   return (
     <>
       <PageHeader title="Sessions" description={DESCRIPTION}>
@@ -100,6 +101,10 @@ export function SessionListPanel({
       </Section>
     </>
   );
+}
+
+function hasSessionRows(result: SessionListResult) {
+  return result.status === "ok" && !("outcome" in result.data) && result.data.sessions.length > 0;
 }
 
 function SessionTable({
@@ -159,6 +164,24 @@ function SessionTable({
           <SessionRow key={session.id} organizationSlug={organizationSlug} session={session} />
         ))}
       </DataTable>
+      <SessionPagination error={error} next={next} busy={busy} loadMore={loadMore} />
+    </>
+  );
+}
+
+function SessionPagination({
+  error,
+  next,
+  busy,
+  loadMore,
+}: {
+  error: string | undefined;
+  next: SessionListPage["nextCursor"];
+  busy: boolean;
+  loadMore: () => void;
+}) {
+  return (
+    <>
       {error === undefined ? null : (
         <FailureAlert title="Could not load more sessions" error={error} fallback="Try again." />
       )}

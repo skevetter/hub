@@ -16,7 +16,12 @@ import { SummaryPanel } from "../../components/app/summary-panel.js";
 import { Button } from "../../components/ui/button.js";
 import { useSnapshotQuery } from "../../queries/index.js";
 import { listSessionProfiles, startInteractiveSession, type ProfileView } from "../functions.js";
-import { ParticipantList, ParticipantPicker, type Participant } from "./session-participants.js";
+import {
+  ParticipantList,
+  ParticipantPicker,
+  type ChangeParticipant,
+  type Participant,
+} from "./session-participants.js";
 import { SessionLoadFailure, SessionsUnavailable, refusalMessage } from "./session-states.js";
 import type { ParticipantRole } from "../types.js";
 
@@ -58,22 +63,7 @@ export function NewSessionPanel({
   if (active?.length === 0) {
     const canManage =
       account.features?.interactiveSessions === true && account.capabilities.manageResources;
-    body = (
-      <EmptyState
-        title="No active session profiles"
-        {...(canManage
-          ? {}
-          : { description: "Ask an organization admin to create a session profile." })}
-      >
-        {canManage ? (
-          <Button asChild>
-            <Link to="/o/$organizationSlug/sessions/profiles" params={params}>
-              Create a profile
-            </Link>
-          </Button>
-        ) : null}
-      </EmptyState>
-    );
+    body = <EmptyProfiles canManage={canManage} params={params} />;
   } else if (active !== undefined) {
     body = <CreateSessionForm organizationSlug={organizationSlug} profiles={active} />;
   }
@@ -82,6 +72,31 @@ export function NewSessionPanel({
       <PageHeader title="New session" description={DESCRIPTION} />
       {body}
     </>
+  );
+}
+
+function EmptyProfiles({
+  canManage,
+  params,
+}: {
+  canManage: boolean;
+  params: { organizationSlug: string };
+}) {
+  return (
+    <EmptyState
+      title="No active session profiles"
+      {...(canManage
+        ? {}
+        : { description: "Ask an organization admin to create a session profile." })}
+    >
+      {canManage ? (
+        <Button asChild>
+          <Link to="/o/$organizationSlug/sessions/profiles" params={params}>
+            Create a profile
+          </Link>
+        </Button>
+      ) : null}
+    </EmptyState>
   );
 }
 
@@ -133,23 +148,84 @@ function CreateSessionForm({
   compact?: boolean;
 }) {
   const account = useActiveAccount();
-  const navigate = useNavigate();
-  const start = useServerFn(startInteractiveSession);
   const [profileId, setProfileId] = useState("");
-  const [participants, setParticipants] = useState<Participant[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
-  const request = useRef<{ fingerprint: string; key: string }>(undefined);
-  const inFlight = useRef(false);
-  const profile =
-    profiles.find(({ id }) => id === profileId) ?? (profileId === "" ? profiles[0] : undefined);
-  const settings = useMemo(
+  const profile = findProfile(profiles, profileId);
+  const settings = useProfileSettings(profile);
+  const { participants, members, change } = useSessionParticipants(account, organizationSlug);
+  const secondaryAction = useSecondaryAction(organizationSlug, compact);
+  const select = useCallback(({ value }: { value: string }) => setProfileId(value), []);
+  const { busy, error, submit } = useStartSession(organizationSlug, profile, participants);
+  const form = (
+    <div className="grid min-w-0 gap-4">
+      <ProfilesPicker
+        profile={profile}
+        profiles={profiles}
+        value={profileId || profile?.id || ""}
+        onChange={select}
+        compact={compact}
+        disabled={busy}
+      />
+      {compact || profile === undefined ? null : (
+        <SummaryPanel inline label="Agent settings" rows={settings} />
+      )}
+      <FullAccessWarning profile={profile} />
+      {compact ? null : (
+        <SessionParticipants
+          accountId={account.account.id}
+          participants={participants}
+          members={members}
+          onChange={change}
+          busy={busy}
+        />
+      )}
+      <Composer
+        agentState="idle"
+        busy={busy}
+        error={error}
+        disabledReason={profile === undefined ? "Choose an active profile." : undefined}
+        messageLabel="First message"
+        primaryLabel="Start session"
+        placeholder="What should the agent do?"
+        hint="Ctrl or Cmd+Enter starts the session."
+        onSteer={submit}
+        onQueue={submit}
+        secondaryAction={secondaryAction}
+      />
+    </div>
+  );
+  return compact ? form : <Card>{form}</Card>;
+}
+
+function FullAccessWarning({ profile }: { profile: ProfileView | undefined }) {
+  if (profile?.mode !== "full") return null;
+  return (
+    <WarningAlert title="Full access">
+      This agent runs tools without asking. Controllers can use it to run commands on the daemon.
+    </WarningAlert>
+  );
+}
+
+function findProfile(profiles: readonly ProfileView[], profileId: string) {
+  return (
+    profiles.find(({ id }) => id === profileId) ?? (profileId === "" ? profiles[0] : undefined)
+  );
+}
+
+function useProfileSettings(profile: ProfileView | undefined) {
+  return useMemo(
     () => [
       { label: "Model", value: profile?.model ?? "Provider default" },
       { label: "Mode", value: profile?.mode ?? "Provider default" },
     ],
     [profile],
   );
+}
+
+function useSessionParticipants(
+  account: ReturnType<typeof useActiveAccount>,
+  organizationSlug: string,
+) {
+  const [participants, setParticipants] = useState<Participant[]>([]);
   const members = useMemo(
     () =>
       account.organization.slug === organizationSlug
@@ -157,25 +233,6 @@ function CreateSessionForm({
         : NO_MEMBERS,
     [account, organizationSlug],
   );
-  const params = useMemo(() => ({ organizationSlug }), [organizationSlug]);
-  const secondaryAction = useMemo(
-    () => (
-      <Button asChild variant="outline">
-        {compact ? (
-          <Link to="/o/$organizationSlug/sessions/new" params={params}>
-            More options
-          </Link>
-        ) : (
-          <Link to="/o/$organizationSlug/sessions" params={params}>
-            Cancel
-          </Link>
-        )}
-      </Button>
-    ),
-    [compact, params],
-  );
-
-  const select = useCallback(({ value }: { value: string }) => setProfileId(value), []);
   const change = useCallback(
     (userId: string, role: ParticipantRole | null) => {
       const member = members.find((candidate) => candidate.userId === userId);
@@ -192,7 +249,40 @@ function CreateSessionForm({
     },
     [members],
   );
+  return { participants, members, change };
+}
 
+function useSecondaryAction(organizationSlug: string, compact: boolean) {
+  const params = useMemo(() => ({ organizationSlug }), [organizationSlug]);
+  return useMemo(
+    () => (
+      <Button asChild variant="outline">
+        {compact ? (
+          <Link to="/o/$organizationSlug/sessions/new" params={params}>
+            More options
+          </Link>
+        ) : (
+          <Link to="/o/$organizationSlug/sessions" params={params}>
+            Cancel
+          </Link>
+        )}
+      </Button>
+    ),
+    [compact, params],
+  );
+}
+
+function useStartSession(
+  organizationSlug: string,
+  profile: ProfileView | undefined,
+  participants: readonly Participant[],
+) {
+  const navigate = useNavigate();
+  const start = useServerFn(startInteractiveSession);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const request = useRef<{ fingerprint: string; key: string }>(undefined);
+  const inFlight = useRef(false);
   const submit = useCallback(
     async (message: string) => {
       if (inFlight.current || profile === undefined) return false;
@@ -232,64 +322,44 @@ function CreateSessionForm({
     },
     [navigate, organizationSlug, participants, profile, start],
   );
+  return { busy, error, submit };
+}
 
-  const form = (
-    <div className="grid min-w-0 gap-4">
-      <ProfilesPicker
-        profile={profile}
-        profiles={profiles}
-        value={profileId || profile?.id || ""}
-        onChange={select}
-        compact={compact}
-        disabled={busy}
-      />
-      {compact || profile === undefined ? null : (
-        <SummaryPanel inline label="Agent settings" rows={settings} />
+function SessionParticipants({
+  accountId,
+  participants,
+  members,
+  onChange,
+  busy,
+}: {
+  accountId: string;
+  participants: readonly Participant[];
+  members: readonly TeamMember[];
+  onChange: ChangeParticipant;
+  busy: boolean;
+}) {
+  return (
+    <Section
+      title="Participants"
+      description="Controllers can send messages. Viewers can only read. You are a controller."
+    >
+      {participants.length === 0 ? null : (
+        <ParticipantList
+          participants={participants}
+          accountId={accountId}
+          onChange={onChange}
+          editing
+          disabled={busy}
+        />
       )}
-      {profile?.mode === "full" ? (
-        <WarningAlert title="Full access">
-          This agent runs tools without asking. Controllers can use it to run commands on the
-          daemon.
-        </WarningAlert>
-      ) : null}
-      {compact ? null : (
-        <Section
-          title="Participants"
-          description="Controllers can send messages. Viewers can only read. You are a controller."
-        >
-          {participants.length === 0 ? null : (
-            <ParticipantList
-              participants={participants}
-              accountId={account.account.id}
-              onChange={change}
-              editing
-              disabled={busy}
-            />
-          )}
-          <ParticipantPicker
-            members={members}
-            participants={participants}
-            onChange={change}
-            disabled={busy || participants.length >= 20}
-          />
-        </Section>
-      )}
-      <Composer
-        agentState="idle"
-        busy={busy}
-        error={error}
-        disabledReason={profile === undefined ? "Choose an active profile." : undefined}
-        messageLabel="First message"
-        primaryLabel="Start session"
-        placeholder="What should the agent do?"
-        hint="Ctrl or Cmd+Enter starts the session."
-        onSteer={submit}
-        onQueue={submit}
-        secondaryAction={secondaryAction}
+      <ParticipantPicker
+        members={members}
+        participants={participants}
+        onChange={onChange}
+        disabled={busy || participants.length >= 20}
       />
-    </div>
+    </Section>
   );
-  return compact ? form : <Card>{form}</Card>;
 }
 
 export function profileSentence(profile: Pick<ProfileView, "daemonSlug" | "cwd" | "provider">) {
