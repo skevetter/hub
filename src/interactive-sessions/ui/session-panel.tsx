@@ -33,7 +33,7 @@ import {
   MissingSession,
   SessionLoadFailure,
   refusalMessage,
-  sessionStatus,
+  sessionPill,
 } from "./session-states.js";
 import { useSessionStream } from "./use-session-stream.js";
 
@@ -106,7 +106,7 @@ function SessionContent({ stream, snapshot, organizationSlug }: SessionViewProps
   );
   return (
     <>
-      <PageHeader title={session.title} description={description} status={sessionStatus(session)}>
+      <PageHeader title={session.title} description={description} status={sessionPill(session)}>
         <SessionControls
           organizationSlug={organizationSlug}
           snapshot={snapshot}

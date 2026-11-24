@@ -111,6 +111,7 @@ function TableShell({
   columns: readonly DataColumn[];
   children: ReactNode;
 }) {
+  const firstFill = columns.findIndex((column) => column.fill === true);
   return (
     // Every table is `tabular-nums`. A count, a limit, and a duration all sit in columns here,
     // and figuring out which cells hold digits is not a decision a caller should be making one
@@ -128,10 +129,10 @@ function TableShell({
                   // Filling columns share what is left by how much each holds, and give it back
                   // the same way when there is not enough. A floor keeps a filling column
                   // readable once there is room for one; on a phone there is not, and a table
-                  // that scrolls sideways is worse than a name that truncates. The first column
+                  // that scrolls sideways is worse than a name that truncates. The first filling column
                   // names the record, so its floor is higher: it is the last column a reader can
                   // afford to lose.
-                  column.fill === true && (index === 0 ? "sm:min-w-48" : "sm:min-w-32"),
+                  column.fill === true && (index === firstFill ? "sm:min-w-48" : "sm:min-w-32"),
                   column.fill !== true && "w-px",
                   column.align === "end" && "text-right",
                   column.className,

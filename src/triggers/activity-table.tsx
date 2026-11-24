@@ -1,16 +1,17 @@
 import { DataCell, DataRow, DataTable } from "../components/app/data-table.js";
 import { RelativeTime } from "../components/app/relative-time.js";
-import { StatusPill, statusLabel } from "../components/app/status-pill.js";
+import { StateBlock } from "../components/app/state-block.js";
+import { runState } from "../components/app/state-label.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import type { TriggerActivityPage } from "./functions.js";
 import type { ComponentProps } from "react";
 
 export const ACTIVITY_COLUMNS = [
+  { header: "Status" },
   { header: "Trigger", fill: true },
   { header: "Provider", className: "hidden sm:table-cell" },
   { header: "Source", fill: true, className: "hidden sm:table-cell" },
-  { header: "Status" },
   { header: "Received" },
 ];
 const EMPTY_ACTIVITY = { title: "No activity" };
@@ -33,6 +34,9 @@ export function TriggerActivityTable({
     >
       {activity.map((run) => (
         <DataRow key={run.id}>
+          <DataCell>
+            <StateBlock state={runState(run.status)} />
+          </DataCell>
           <DataCell>
             <a
               href={`/o/${encodeURIComponent(organizationSlug)}/activity/${encodeURIComponent(run.id)}`}
@@ -58,9 +62,6 @@ export function TriggerActivityTable({
               />
             </div>
           </DataCell>
-          <DataCell>
-            <StatusPill tone={tone(run.status)}>{statusLabel(run.status)}</StatusPill>
-          </DataCell>
           <DataCell muted>
             <RelativeTime value={run.receivedAt} />
           </DataCell>
@@ -68,10 +69,4 @@ export function TriggerActivityTable({
       ))}
     </DataTable>
   );
-}
-
-function tone(status: string): "success" | "danger" | "neutral" {
-  if (status === "succeeded") return "success";
-  if (status === "failed" || status === "timed_out" || status === "rejected") return "danger";
-  return "neutral";
 }

@@ -26,7 +26,9 @@ import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
 import { SegmentedControl } from "../components/app/segmented-control.js";
 import { StatGrid, StatTile, StatTileSkeleton } from "../components/app/stat-tile.js";
-import { StatusPill, statusLabel, type StatusTone } from "../components/app/status-pill.js";
+import { StateBlock } from "../components/app/state-block.js";
+import { runState } from "../components/app/state-label.js";
+import { StatusPill, type StatusTone } from "../components/app/status-pill.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
@@ -211,10 +213,7 @@ function HomeRecentRuns({ data, base }: { data: HomeSnapshot; base: string }) {
       ) : (
         <RecordList label="Recent runs">
           {data.runs.slice(0, RECENT_RUNS_SHOWN).map((run) => (
-            <RecordRow
-              key={run.id}
-              status={<StatusPill tone={runTone(run.status)}>{statusLabel(run.status)}</StatusPill>}
-            >
+            <RecordRow key={run.id} lead={<StateBlock state={runState(run.status)} />}>
               <TwoLine
                 primary={run.triggerName}
                 secondary={
@@ -941,12 +940,6 @@ function runSourceLabel(source: string): string {
 
 function runOutcomes({ succeeded, failed }: RunTally): string {
   return `${String(succeeded)} succeeded \u00b7 ${String(failed)} failed`;
-}
-
-function runTone(status: HomeSnapshot["runs"][number]["status"]): StatusTone {
-  if (status === "succeeded") return "success";
-  if (status === "failed" || status === "timed_out" || status === "rejected") return "danger";
-  return "neutral";
 }
 
 function triggerDetail(total: number, enabled: number): string {

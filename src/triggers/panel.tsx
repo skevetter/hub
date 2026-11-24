@@ -35,7 +35,9 @@ import { PageHeader, PageHeaderSkeleton } from "../components/app/page.js";
 import { Pagination } from "../components/app/pagination.js";
 import { Steps } from "../components/app/steps.js";
 import { SegmentedControl, type SegmentedOption } from "../components/app/segmented-control.js";
-import { StatusPill, statusLabel } from "../components/app/status-pill.js";
+import { StateBlock } from "../components/app/state-block.js";
+import { enabledState } from "../components/app/state-label.js";
+import { statusLabel } from "../components/app/status-pill.js";
 import { toast } from "../components/app/toast-store.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { usePageSizePreference } from "../components/app/use-page-size-preference.js";
@@ -109,11 +111,11 @@ type TriggerTextField = Exclude<
 >;
 
 const TRIGGER_COLUMNS = [
+  { header: "Status" },
   { header: "Trigger", fill: true },
   { header: "Event", fill: true, className: "hidden md:table-cell" },
   { header: "Target", fill: true, className: "hidden xl:table-cell" },
   { header: "Last triggered", className: "hidden xl:table-cell" },
-  { header: "Status" },
 ] as const;
 
 const EVENT_OPTIONS: readonly ComboboxOption[] = EDITOR_EVENTS.map((value) => {
@@ -402,6 +404,9 @@ function TriggerListRow({
       }}
     >
       <DataCell>
+        <StateBlock state={enabledState(trigger.enabled)} />
+      </DataCell>
+      <DataCell>
         <span className="flex items-center gap-3">
           <span
             className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-muted text-foreground"
@@ -437,11 +442,6 @@ function TriggerListRow({
       </DataCell>
       <DataCell>
         <LastTriggered lastTriggered={trigger.lastTriggered} recentRuns={trigger.recentRuns} />
-      </DataCell>
-      <DataCell>
-        <StatusPill tone={trigger.enabled ? "success" : "neutral"}>
-          {trigger.enabled ? "Enabled" : "Disabled"}
-        </StatusPill>
       </DataCell>
     </DataRow>
   );
