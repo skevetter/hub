@@ -19,8 +19,9 @@ export function readThemeCookie(cookies: string | null): ThemeChoice {
   return parseThemeChoice(cookies?.match(COOKIE_PATTERN)?.[1]);
 }
 
-export function themeCookie(choice: ThemeChoice): string {
-  return `${THEME_COOKIE}=${choice}; ${COOKIE_ATTRIBUTES}`;
+export function themeCookie(choice: ThemeChoice, secure: boolean): string {
+  const cookie = `${THEME_COOKIE}=${choice}; ${COOKIE_ATTRIBUTES}`;
+  return secure ? `${cookie}; Secure` : cookie;
 }
 
 export function cycleTheme(choice: ThemeChoice): ThemeChoice {

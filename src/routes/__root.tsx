@@ -1,14 +1,7 @@
 import { useState, type ReactNode } from "react";
 import type { QueryClient } from "@tanstack/react-query";
-import {
-  Link,
-  createRootRouteWithContext,
-  HeadContent,
-  Outlet,
-  Scripts,
-} from "@tanstack/react-router";
-import { PageHeader } from "../components/app/page.js";
-import { Button } from "../components/ui/button.js";
+import { createRootRouteWithContext, HeadContent, Outlet, Scripts } from "@tanstack/react-router";
+import { NotFoundPage } from "../components/app/route-state.js";
 import { InitialThemeContext } from "../theme/index.js";
 import { THEME_SCRIPT } from "../theme/preference.js";
 import { initialTheme, requestTheme } from "../theme/request-theme.js";
@@ -39,17 +32,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
 function NotFound() {
   return (
     <main className="grid min-h-svh place-items-center px-6 py-16">
-      <div className="grid max-w-md gap-4">
-        <PageHeader
-          title="Page not found"
-          description="This address does not match a page in Paseo Hub. Check the address or return home."
-        />
-        <div>
-          <Button asChild>
-            <Link to="/">Return home</Link>
-          </Button>
-        </div>
-      </div>
+      <NotFoundPage />
     </main>
   );
 }

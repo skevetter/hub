@@ -6,6 +6,7 @@ import {
   parseThemeChoice,
   readThemeCookie,
   THEME_CHANGE,
+  themeCookie,
   THEME_SCRIPT,
 } from "./preference.js";
 
@@ -21,6 +22,13 @@ describe("theme choice", () => {
   it("reads only the theme cookie", () => {
     expect(readThemeCookie("other_theme=dark; theme=light; other=dark")).toBe("light");
     expect(readThemeCookie("other_theme=dark")).toBe("system");
+  });
+
+  it("marks the cookie Secure only on HTTPS", () => {
+    expect(themeCookie("dark", true)).toBe(
+      "theme=dark; Path=/; Max-Age=31536000; SameSite=Lax; Secure",
+    );
+    expect(themeCookie("dark", false)).toBe("theme=dark; Path=/; Max-Age=31536000; SameSite=Lax");
   });
 
   it("cycles System, Light, Dark, then System", () => {

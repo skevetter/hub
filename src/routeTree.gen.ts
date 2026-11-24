@@ -34,6 +34,7 @@ import { Route as ApiBillingPlansRouteImport } from './routes/api/billing/plans'
 import { Route as ApiAuthSplatRouteImport } from './routes/api/auth/$'
 import { Route as AgentSessionsSessionIdMcpRouteImport } from './routes/agent-sessions/$sessionId/mcp'
 import { Route as AgentExecutionsExecutionIdMcpRouteImport } from './routes/agent-executions/$executionId/mcp'
+import { Route as ShellOOrganizationSlugRouteRouteImport } from './routes/_shell/o/$organizationSlug/route'
 import { Route as ShellOOrganizationSlugIndexRouteImport } from './routes/_shell/o/$organizationSlug/index'
 import { Route as ApiV1CliAuthorizationsPollRouteImport } from './routes/api/v1/cli-authorizations/poll'
 import { Route as ApiIntegrationsSlackEventsRouteImport } from './routes/api/integrations/slack/events'
@@ -197,11 +198,17 @@ const AgentExecutionsExecutionIdMcpRoute =
     path: '/agent-executions/$executionId/mcp',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ShellOOrganizationSlugRouteRoute =
+  ShellOOrganizationSlugRouteRouteImport.update({
+    id: '/o/$organizationSlug',
+    path: '/o/$organizationSlug',
+    getParentRoute: () => ShellRoute,
+  } as any)
 const ShellOOrganizationSlugIndexRoute =
   ShellOOrganizationSlugIndexRouteImport.update({
-    id: '/o/$organizationSlug/',
-    path: '/o/$organizationSlug/',
-    getParentRoute: () => ShellRoute,
+    id: '/',
+    path: '/',
+    getParentRoute: () => ShellOOrganizationSlugRouteRoute,
   } as any)
 const ApiV1CliAuthorizationsPollRoute =
   ApiV1CliAuthorizationsPollRouteImport.update({
@@ -259,45 +266,45 @@ const AgentExecutionsExecutionIdAttachmentsAttachmentIdRoute =
   } as any)
 const ShellOOrganizationSlugTriggersRoute =
   ShellOOrganizationSlugTriggersRouteImport.update({
-    id: '/o/$organizationSlug/triggers',
-    path: '/o/$organizationSlug/triggers',
-    getParentRoute: () => ShellRoute,
+    id: '/triggers',
+    path: '/triggers',
+    getParentRoute: () => ShellOOrganizationSlugRouteRoute,
   } as any)
 const ShellOOrganizationSlugSettingsRoute =
   ShellOOrganizationSlugSettingsRouteImport.update({
-    id: '/o/$organizationSlug/settings',
-    path: '/o/$organizationSlug/settings',
-    getParentRoute: () => ShellRoute,
+    id: '/settings',
+    path: '/settings',
+    getParentRoute: () => ShellOOrganizationSlugRouteRoute,
   } as any)
 const ShellOOrganizationSlugSessionsRoute =
   ShellOOrganizationSlugSessionsRouteImport.update({
-    id: '/o/$organizationSlug/sessions',
-    path: '/o/$organizationSlug/sessions',
-    getParentRoute: () => ShellRoute,
+    id: '/sessions',
+    path: '/sessions',
+    getParentRoute: () => ShellOOrganizationSlugRouteRoute,
   } as any)
 const ShellOOrganizationSlugHomeRoute =
   ShellOOrganizationSlugHomeRouteImport.update({
-    id: '/o/$organizationSlug/home',
-    path: '/o/$organizationSlug/home',
-    getParentRoute: () => ShellRoute,
+    id: '/home',
+    path: '/home',
+    getParentRoute: () => ShellOOrganizationSlugRouteRoute,
   } as any)
 const ShellOOrganizationSlugDaemonsRoute =
   ShellOOrganizationSlugDaemonsRouteImport.update({
-    id: '/o/$organizationSlug/daemons',
-    path: '/o/$organizationSlug/daemons',
-    getParentRoute: () => ShellRoute,
+    id: '/daemons',
+    path: '/daemons',
+    getParentRoute: () => ShellOOrganizationSlugRouteRoute,
   } as any)
 const ShellOOrganizationSlugConnectionsRoute =
   ShellOOrganizationSlugConnectionsRouteImport.update({
-    id: '/o/$organizationSlug/connections',
-    path: '/o/$organizationSlug/connections',
-    getParentRoute: () => ShellRoute,
+    id: '/connections',
+    path: '/connections',
+    getParentRoute: () => ShellOOrganizationSlugRouteRoute,
   } as any)
 const ShellOOrganizationSlugActivityRoute =
   ShellOOrganizationSlugActivityRouteImport.update({
-    id: '/o/$organizationSlug/activity',
-    path: '/o/$organizationSlug/activity',
-    getParentRoute: () => ShellRoute,
+    id: '/activity',
+    path: '/activity',
+    getParentRoute: () => ShellOOrganizationSlugRouteRoute,
   } as any)
 const ShellOOrganizationSlugTriggersIndexRoute =
   ShellOOrganizationSlugTriggersIndexRouteImport.update({
@@ -429,6 +436,7 @@ export interface FileRoutesByFullPath {
   '/test/smoke': typeof TestSmokeRoute
   '/test/stripe-checkout': typeof TestStripeCheckoutRoute
   '/test/trigger': typeof TestTriggerRoute
+  '/o/$organizationSlug': typeof ShellOOrganizationSlugRouteRouteWithChildren
   '/agent-executions/$executionId/mcp': typeof AgentExecutionsExecutionIdMcpRoute
   '/agent-sessions/$sessionId/mcp': typeof AgentSessionsSessionIdMcpRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
@@ -550,6 +558,7 @@ export interface FileRoutesById {
   '/test/stripe-checkout': typeof TestStripeCheckoutRoute
   '/test/trigger': typeof TestTriggerRoute
   '/_shell/': typeof ShellIndexRoute
+  '/_shell/o/$organizationSlug': typeof ShellOOrganizationSlugRouteRouteWithChildren
   '/agent-executions/$executionId/mcp': typeof AgentExecutionsExecutionIdMcpRoute
   '/agent-sessions/$sessionId/mcp': typeof AgentSessionsSessionIdMcpRoute
   '/api/auth/$': typeof ApiAuthSplatRoute
@@ -614,6 +623,7 @@ export interface FileRouteTypes {
     | '/test/smoke'
     | '/test/stripe-checkout'
     | '/test/trigger'
+    | '/o/$organizationSlug'
     | '/agent-executions/$executionId/mcp'
     | '/agent-sessions/$sessionId/mcp'
     | '/api/auth/$'
@@ -734,6 +744,7 @@ export interface FileRouteTypes {
     | '/test/stripe-checkout'
     | '/test/trigger'
     | '/_shell/'
+    | '/_shell/o/$organizationSlug'
     | '/agent-executions/$executionId/mcp'
     | '/agent-sessions/$sessionId/mcp'
     | '/api/auth/$'
@@ -990,12 +1001,19 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AgentExecutionsExecutionIdMcpRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/_shell/o/$organizationSlug': {
+      id: '/_shell/o/$organizationSlug'
+      path: '/o/$organizationSlug'
+      fullPath: '/o/$organizationSlug'
+      preLoaderRoute: typeof ShellOOrganizationSlugRouteRouteImport
+      parentRoute: typeof ShellRoute
+    }
     '/_shell/o/$organizationSlug/': {
       id: '/_shell/o/$organizationSlug/'
-      path: '/o/$organizationSlug'
+      path: '/'
       fullPath: '/o/$organizationSlug/'
       preLoaderRoute: typeof ShellOOrganizationSlugIndexRouteImport
-      parentRoute: typeof ShellRoute
+      parentRoute: typeof ShellOOrganizationSlugRouteRoute
     }
     '/api/v1/cli-authorizations/poll': {
       id: '/api/v1/cli-authorizations/poll'
@@ -1062,52 +1080,52 @@ declare module '@tanstack/react-router' {
     }
     '/_shell/o/$organizationSlug/triggers': {
       id: '/_shell/o/$organizationSlug/triggers'
-      path: '/o/$organizationSlug/triggers'
+      path: '/triggers'
       fullPath: '/o/$organizationSlug/triggers'
       preLoaderRoute: typeof ShellOOrganizationSlugTriggersRouteImport
-      parentRoute: typeof ShellRoute
+      parentRoute: typeof ShellOOrganizationSlugRouteRoute
     }
     '/_shell/o/$organizationSlug/settings': {
       id: '/_shell/o/$organizationSlug/settings'
-      path: '/o/$organizationSlug/settings'
+      path: '/settings'
       fullPath: '/o/$organizationSlug/settings'
       preLoaderRoute: typeof ShellOOrganizationSlugSettingsRouteImport
-      parentRoute: typeof ShellRoute
+      parentRoute: typeof ShellOOrganizationSlugRouteRoute
     }
     '/_shell/o/$organizationSlug/sessions': {
       id: '/_shell/o/$organizationSlug/sessions'
-      path: '/o/$organizationSlug/sessions'
+      path: '/sessions'
       fullPath: '/o/$organizationSlug/sessions'
       preLoaderRoute: typeof ShellOOrganizationSlugSessionsRouteImport
-      parentRoute: typeof ShellRoute
+      parentRoute: typeof ShellOOrganizationSlugRouteRoute
     }
     '/_shell/o/$organizationSlug/home': {
       id: '/_shell/o/$organizationSlug/home'
-      path: '/o/$organizationSlug/home'
+      path: '/home'
       fullPath: '/o/$organizationSlug/home'
       preLoaderRoute: typeof ShellOOrganizationSlugHomeRouteImport
-      parentRoute: typeof ShellRoute
+      parentRoute: typeof ShellOOrganizationSlugRouteRoute
     }
     '/_shell/o/$organizationSlug/daemons': {
       id: '/_shell/o/$organizationSlug/daemons'
-      path: '/o/$organizationSlug/daemons'
+      path: '/daemons'
       fullPath: '/o/$organizationSlug/daemons'
       preLoaderRoute: typeof ShellOOrganizationSlugDaemonsRouteImport
-      parentRoute: typeof ShellRoute
+      parentRoute: typeof ShellOOrganizationSlugRouteRoute
     }
     '/_shell/o/$organizationSlug/connections': {
       id: '/_shell/o/$organizationSlug/connections'
-      path: '/o/$organizationSlug/connections'
+      path: '/connections'
       fullPath: '/o/$organizationSlug/connections'
       preLoaderRoute: typeof ShellOOrganizationSlugConnectionsRouteImport
-      parentRoute: typeof ShellRoute
+      parentRoute: typeof ShellOOrganizationSlugRouteRoute
     }
     '/_shell/o/$organizationSlug/activity': {
       id: '/_shell/o/$organizationSlug/activity'
-      path: '/o/$organizationSlug/activity'
+      path: '/activity'
       fullPath: '/o/$organizationSlug/activity'
       preLoaderRoute: typeof ShellOOrganizationSlugActivityRouteImport
-      parentRoute: typeof ShellRoute
+      parentRoute: typeof ShellOOrganizationSlugRouteRoute
     }
     '/_shell/o/$organizationSlug/triggers/': {
       id: '/_shell/o/$organizationSlug/triggers/'
@@ -1356,13 +1374,7 @@ const ShellOOrganizationSlugTriggersRouteWithChildren =
     ShellOOrganizationSlugTriggersRouteChildren,
   )
 
-interface ShellRouteChildren {
-  ShellAppsRoute: typeof ShellAppsRoute
-  ShellCliLoginRoute: typeof ShellCliLoginRoute
-  ShellConnectionsRoute: typeof ShellConnectionsRoute
-  ShellOperatorRoute: typeof ShellOperatorRoute
-  ShellTriggersRoute: typeof ShellTriggersRoute
-  ShellIndexRoute: typeof ShellIndexRoute
+interface ShellOOrganizationSlugRouteRouteChildren {
   ShellOOrganizationSlugActivityRoute: typeof ShellOOrganizationSlugActivityRouteWithChildren
   ShellOOrganizationSlugConnectionsRoute: typeof ShellOOrganizationSlugConnectionsRoute
   ShellOOrganizationSlugDaemonsRoute: typeof ShellOOrganizationSlugDaemonsRoute
@@ -1373,6 +1385,38 @@ interface ShellRouteChildren {
   ShellOOrganizationSlugIndexRoute: typeof ShellOOrganizationSlugIndexRoute
 }
 
+const ShellOOrganizationSlugRouteRouteChildren: ShellOOrganizationSlugRouteRouteChildren =
+  {
+    ShellOOrganizationSlugActivityRoute:
+      ShellOOrganizationSlugActivityRouteWithChildren,
+    ShellOOrganizationSlugConnectionsRoute:
+      ShellOOrganizationSlugConnectionsRoute,
+    ShellOOrganizationSlugDaemonsRoute: ShellOOrganizationSlugDaemonsRoute,
+    ShellOOrganizationSlugHomeRoute: ShellOOrganizationSlugHomeRoute,
+    ShellOOrganizationSlugSessionsRoute:
+      ShellOOrganizationSlugSessionsRouteWithChildren,
+    ShellOOrganizationSlugSettingsRoute:
+      ShellOOrganizationSlugSettingsRouteWithChildren,
+    ShellOOrganizationSlugTriggersRoute:
+      ShellOOrganizationSlugTriggersRouteWithChildren,
+    ShellOOrganizationSlugIndexRoute: ShellOOrganizationSlugIndexRoute,
+  }
+
+const ShellOOrganizationSlugRouteRouteWithChildren =
+  ShellOOrganizationSlugRouteRoute._addFileChildren(
+    ShellOOrganizationSlugRouteRouteChildren,
+  )
+
+interface ShellRouteChildren {
+  ShellAppsRoute: typeof ShellAppsRoute
+  ShellCliLoginRoute: typeof ShellCliLoginRoute
+  ShellConnectionsRoute: typeof ShellConnectionsRoute
+  ShellOperatorRoute: typeof ShellOperatorRoute
+  ShellTriggersRoute: typeof ShellTriggersRoute
+  ShellIndexRoute: typeof ShellIndexRoute
+  ShellOOrganizationSlugRouteRoute: typeof ShellOOrganizationSlugRouteRouteWithChildren
+}
+
 const ShellRouteChildren: ShellRouteChildren = {
   ShellAppsRoute: ShellAppsRoute,
   ShellCliLoginRoute: ShellCliLoginRoute,
@@ -1380,19 +1424,8 @@ const ShellRouteChildren: ShellRouteChildren = {
   ShellOperatorRoute: ShellOperatorRoute,
   ShellTriggersRoute: ShellTriggersRoute,
   ShellIndexRoute: ShellIndexRoute,
-  ShellOOrganizationSlugActivityRoute:
-    ShellOOrganizationSlugActivityRouteWithChildren,
-  ShellOOrganizationSlugConnectionsRoute:
-    ShellOOrganizationSlugConnectionsRoute,
-  ShellOOrganizationSlugDaemonsRoute: ShellOOrganizationSlugDaemonsRoute,
-  ShellOOrganizationSlugHomeRoute: ShellOOrganizationSlugHomeRoute,
-  ShellOOrganizationSlugSessionsRoute:
-    ShellOOrganizationSlugSessionsRouteWithChildren,
-  ShellOOrganizationSlugSettingsRoute:
-    ShellOOrganizationSlugSettingsRouteWithChildren,
-  ShellOOrganizationSlugTriggersRoute:
-    ShellOOrganizationSlugTriggersRouteWithChildren,
-  ShellOOrganizationSlugIndexRoute: ShellOOrganizationSlugIndexRoute,
+  ShellOOrganizationSlugRouteRoute:
+    ShellOOrganizationSlugRouteRouteWithChildren,
 }
 
 const ShellRouteWithChildren = ShellRoute._addFileChildren(ShellRouteChildren)
