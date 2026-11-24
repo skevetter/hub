@@ -1,6 +1,6 @@
 /* oxlint-disable typescript-eslint/no-unsafe-type-assertion -- server functions are erased to a generic call signature at the boundary */
 import { useSnapshotQuery, type Snapshot } from "../queries/index.js";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, type useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useMemo, type ReactNode } from "react";
 import { FailureAlert } from "../components/app/failure-alert.js";
