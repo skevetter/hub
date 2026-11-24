@@ -22,7 +22,7 @@ export default defineConfig({
     {
       name: "mobile-chromium",
       testMatch:
-        /(dashboard-mobile|dashboard-navigation-mobile|apps-mobile|billing-mobile)\.spec\.ts/u,
+        /(attention|dashboard-mobile|dashboard-navigation-mobile|apps-mobile|billing-mobile)\.spec\.ts/u,
       use: {
         ...devices["Pixel 7"],
         trace: "retain-on-failure",

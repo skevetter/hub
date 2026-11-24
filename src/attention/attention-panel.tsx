@@ -22,7 +22,13 @@ export function AttentionPanel({
     return (
       <div className="flex items-center justify-between gap-3 py-3">
         <p>Attention could not load.</p>
-        <Button type="button" variant="outline" disabled={snapshot.isFetching} onClick={retry}>
+        <Button
+          type="button"
+          variant="outline"
+          className="max-md:min-h-11"
+          disabled={snapshot.isFetching}
+          onClick={retry}
+        >
           Try again
         </Button>
       </div>
@@ -39,6 +45,7 @@ export function AttentionPanel({
             <Button
               type="button"
               variant="ghost"
+              className="max-md:min-h-11"
               disabled={markSeenPending}
               onClick={markFailedRunsSeen}
             >
@@ -65,7 +72,7 @@ function AttentionAction({
     (other) => other.id !== item.id && other.action.label === action.label,
   );
   return (
-    <Button asChild variant="link">
+    <Button asChild variant="link" className="max-md:min-h-11">
       <Link<AnyRouter, string, string>
         to={action.to}
         search={action.search}

@@ -23,7 +23,13 @@ test("shows quick destinations and the full organization navigation under More",
   const header = location.locator('[aria-current="page"]');
   await expect(location).toContainText("Acme");
   await expect(header).toHaveText("Home");
-  await expect(quick.getByRole("link")).toHaveText(["Home", "Activity", "Triggers"]);
+  await expect(quick.getByRole("link").or(quick.getByRole("button"))).toHaveText([
+    "Home",
+    "Activity",
+    "Triggers",
+    "Attention",
+    "More",
+  ]);
   await expect(quick.getByRole("link", { name: "Home" })).toHaveAttribute("aria-current", "page");
   await expect(page.getByRole("button", { name: "Toggle Sidebar" })).toBeHidden();
 
@@ -99,6 +105,7 @@ test("phone navigation uses the rail outline in both themes", async ({ hub, page
     for (const control of [
       page.getByRole("button", { name: "Search", exact: true }),
       quick.getByRole("link", { name: "Activity" }),
+      quick.getByRole("button", { name: "Attention", exact: true }),
       more,
     ]) {
       await control.focus();

@@ -2,7 +2,8 @@ import type { ReactNode } from "react";
 import { Skeleton } from "../ui/skeleton.js";
 
 const ROW_CLASS =
-  "grid min-h-16 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 gap-y-1 border-b border-border py-3 last:border-b-0";
+  "grid min-h-16 grid-cols-[auto_minmax(0,1fr)] items-start gap-x-3 gap-y-1 border-b border-border py-3 last:border-b-0 md:grid-cols-[auto_minmax(0,1fr)_auto]";
+const ACTION_CLASS = "col-start-2 md:col-start-3";
 
 export function AttentionMark() {
   return <span aria-hidden="true" className="size-2 shrink-0 bg-attention" />;
@@ -26,7 +27,11 @@ export function AttentionRow({
         <p className="font-strong">{title}</p>
         <p className="text-pretty text-muted-foreground">{detail}</p>
       </div>
-      <div className="flex flex-col items-end gap-1">{children}</div>
+      <div
+        className={`${ACTION_CLASS} flex flex-wrap items-center gap-x-4 gap-y-1 md:flex-col md:items-end`}
+      >
+        {children}
+      </div>
     </li>
   );
 }
@@ -41,7 +46,9 @@ export function AttentionRowsSkeleton() {
             <Skeleton className="h-5 w-3/4" />
             <Skeleton className="h-5 w-full" />
           </div>
-          <Skeleton className="h-5 w-24" />
+          <div className={`${ACTION_CLASS} flex items-center max-md:min-h-11`}>
+            <Skeleton className="h-5 w-24" />
+          </div>
         </li>
       ))}
     </ul>
