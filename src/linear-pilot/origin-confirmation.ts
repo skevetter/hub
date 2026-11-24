@@ -222,6 +222,15 @@ function belongsToClaim(waiting: Waiting, key: Key) {
   return waiting.issueId === key.issueId && waiting.applicationId === key.applicationId;
 }
 
+async function postClaimedRefusal(context: Context, kind: "expired" | "delegationRefused") {
+  const { event } = context.qualified;
+  try {
+    await writer(context)[kind](event.nativeSessionId);
+  } catch {
+    logConfirmation(event, "origin_refusal_post_failed");
+  }
+}
+
 async function startConfirmed(
   context: Context,
   key: Key,
@@ -235,14 +244,14 @@ async function startConfirmed(
   if (age < 0) return undefined;
   if (age > DELEGATION_CONFIRM_TTL_MS) {
     if (await claimConfirmation(database, key, "expired", receivedAt))
-      await writer(context).expired(event.nativeSessionId);
+      await postClaimedRefusal(context, "expired");
     return undefined;
   }
   if (!(await claimConfirmation(database, key, "started", receivedAt))) {
     return logConfirmation(event, "origin_reused");
   }
   const message = await delegationPrompt(context, reply);
-  if (message === undefined) await writer(context).delegationRefused(event.nativeSessionId);
+  if (message === undefined) await postClaimedRefusal(context, "delegationRefused");
   return message;
 }
 

@@ -193,7 +193,7 @@ function replyIssueResponse(scope: ProviderScope, scenario: Scenario) {
   });
 }
 
-function originProvider(scope: ProviderScope, scenario: Scenario) {
+function originProvider(scope: ProviderScope, scenario: Scenario, failErrorWrites: boolean) {
   const writes: { id: string; type: string; body: string }[] = [];
   const reads: string[] = [];
   const send: typeof fetch = async (_url, options) => {
@@ -227,6 +227,8 @@ function originProvider(scope: ProviderScope, scenario: Scenario) {
     const { input } = variables;
     assert(input);
     writes.push({ id: input.id, ...input.content });
+    if (failErrorWrites && input.content.type === "error")
+      return Response.json({ errors: [{ message: "synthetic activity write failure" }] });
     return Response.json({
       data: {
         agentActivityCreate: {
@@ -291,7 +293,7 @@ function reflectFirstTurn(agents: FakeAgents) {
   };
 }
 
-async function fixture(scenario: Scenario = "ok") {
+async function fixture(scenario: Scenario, failErrorWrites: boolean) {
   const dir = await mkdtemp(join(tmpdir(), "hub-confirmation-test-"));
   const { runtime, locks } = await embeddedDatabaseRuntime(dir);
   const database = createDatabase(runtime, locks);
@@ -311,7 +313,7 @@ async function fixture(scenario: Scenario = "ok") {
       allowedHumanId: randomUUID(),
     };
     const scope = scopeFrom(config, tenant.connection.appUserId);
-    const provider = originProvider(scope, scenario);
+    const provider = originProvider(scope, scenario, failErrorWrites);
     const agents = new FakeAgents();
     reflectFirstTurn(agents);
 
@@ -395,8 +397,9 @@ async function elicit(test: Fixture, endpoint: Endpoint) {
 async function runTest(
   scenario: Scenario,
   check: (test: Fixture, endpoint: Endpoint) => Promise<void>,
+  { failErrorWrites = false } = {},
 ) {
-  const test = await fixture(scenario);
+  const test = await fixture(scenario, failErrorWrites);
   const endpoint = test.open();
   try {
     await check(test, endpoint);
@@ -551,6 +554,60 @@ it.each([
       expect(await test.claims(started)).toBe(1);
       expect(test.agents.creations).toHaveLength(0);
     });
+  },
+  25_000,
+);
+
+it.each([
+  { kind: "delegationRefused", scenario: "delegate removed", claim: started, elapsed: 0 },
+  {
+    kind: "owner_expired",
+    scenario: "ok",
+    claim: "linear_pilot_owner_expired",
+    elapsed: DELEGATION_CONFIRM_TTL_MS + 1,
+  },
+] as const)(
+  "keeps the one-shot claim when the $kind activity write fails",
+  async ({ kind, scenario, claim, elapsed }) => {
+    await runTest(
+      scenario,
+      async (test, endpoint) => {
+        const now = Date.now();
+        const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+        const info = vi.spyOn(logger, "info");
+        try {
+          await elicit(test, endpoint);
+          clock.mockReturnValue(now + elapsed);
+          const reply = prompted(test.scope);
+          await endpoint.deliver(reply);
+          await vi.waitFor(() =>
+            expect(info).toHaveBeenCalledWith(
+              {
+                nativeSessionId: test.scope.sessionId,
+                action: "prompted",
+                reason: "origin_refusal_post_failed",
+              },
+              "Linear pilot refused delivery",
+            ),
+          );
+          expect(await test.claims(claim)).toBe(1);
+          if (elapsed > 0) await endpoint.deliver(reply);
+          clock.mockReturnValue(now);
+          await expectOneShot(endpoint, test.scope, reply);
+          expect(test.writes).toHaveLength(2);
+          expect(test.writes[1]).toMatchObject({
+            id: originActivityId(test.scope.sessionId, kind),
+            type: "error",
+          });
+          expect(test.agents.creations).toEqual([]);
+          expect(await test.claims(claim)).toBe(1);
+        } finally {
+          info.mockRestore();
+          clock.mockRestore();
+        }
+      },
+      { failErrorWrites: true },
+    );
   },
   25_000,
 );
