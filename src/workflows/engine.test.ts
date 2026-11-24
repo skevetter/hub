@@ -331,6 +331,42 @@ run:
     assert.equal(steps[0]?.failureReason, "trigger_context_materializer_unavailable");
   });
 
+  it("defers a step while its daemon cannot take a dispatch and runs it once the daemon is back", async () => {
+    const fixture = await workflowFixture();
+    const dispatches: string[] = [];
+    const checkedDaemons: string[] = [];
+    let connected = false;
+    const { handler, engine } = engineFor(fixture, dispatches, {
+      canDispatchToDaemon: (daemonId) => {
+        checkedDaemons.push(daemonId);
+        return connected;
+      },
+    });
+
+    await handler(fixture.trigger("run"));
+    await engine.processAvailable();
+    await engine.processAvailable();
+
+    const run = (
+      await fixture.database.findTriggerRunsByProviderEventReceiptId(fixture.providerEventReceiptId)
+    )[0]!;
+    const deferredStep = (await fixture.database.listWorkflowStepRunsForTriggerRun(run.id))[0]!;
+    assert.deepEqual(dispatches, []);
+    assert.ok(checkedDaemons.length >= 2);
+    assert.equal(
+      await fixture.database.findAgentExecutionByWorkflowStepRunId(deferredStep.id),
+      undefined,
+    );
+    assert.equal((await fixture.database.findTriggerRunById(run.id))?.status, "running");
+
+    connected = true;
+    await engine.processAvailable();
+
+    assert.equal(dispatches.length, 1);
+    assert.ok(await fixture.database.findAgentExecutionByWorkflowStepRunId(deferredStep.id));
+    await engine.stop();
+  });
+
   it("carries provider options and startup timeout into persisted and dispatched launch intent", async () => {
     const rawConfiguration = deadlineConfiguration();
     const options = {
@@ -2194,14 +2230,16 @@ function engineFor(
     beforeDispatch?: (intent: LaunchMachineIntent) => Promise<void>;
     now?: () => Date;
     onWorkflowRunTerminal?: (run: TriggerRunRecord) => Promise<void>;
+    canDispatchToDaemon?: (daemonId: string) => boolean;
   } = {},
 ) {
-  const { beforeDispatch, now, onWorkflowRunTerminal } = options;
+  const { beforeDispatch, now, onWorkflowRunTerminal, canDispatchToDaemon } = options;
   return createDurableWorkflowHandler({
     database: fixture.database,
     entitlements: fixture.entitlements,
     providers: [providerMatch(fixture.configuration, fixture.revisionId)],
     ...(now === undefined ? {} : { now }),
+    ...(canDispatchToDaemon === undefined ? {} : { canDispatchToDaemon }),
     ...(onWorkflowRunTerminal === undefined ? {} : { onWorkflowRunTerminal }),
     dispatchLaunchMachineIntent: async (intent) => {
       await beforeDispatch?.(intent);
