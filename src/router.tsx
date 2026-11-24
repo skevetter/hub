@@ -4,7 +4,7 @@ import { routeTree } from "./routeTree.gen";
 import { PanelSkeleton } from "./components/app/loading.js";
 import { RouteErrorBoundary, RouteNotFound } from "./components/app/route-state.js";
 import { resetQueriesOnReaderChange } from "./auth/reader-cache.js";
-import { routeErrorAdapter } from "./ssr-errors.js";
+import { installRouteErrorGuard, routeErrorAdapter } from "./ssr-errors.js";
 
 // Start's own handler passes this option the same way: RouterConstructorOptions omits it although
 // the router reads it for both dehydration and hydration.
@@ -30,6 +30,7 @@ export function getRouter() {
     ),
   });
   current.router = router;
+  installRouteErrorGuard(router);
   return router;
 }
 

@@ -16,12 +16,13 @@ const reportFailure = vi.hoisted(() => vi.fn());
 vi.mock("./failures/index.js", () => ({ reportFailure }));
 
 const { getRouter } = await import("./router.js");
-const { routeErrorAdapter, serializedRouteMessage } = await import("./ssr-errors.js");
+const { installRouteErrorGuard, routeErrorAdapter, serializedRouteMessage } =
+  await import("./ssr-errors.js");
 
 const SERIALIZATION = { serializationAdapters: [routeErrorAdapter] };
 const REFERENCE = "12345678-1234-1234-1234-123456789abc";
 
-function rendered(error: Error): Promise<string> {
+function rendered(error: unknown): Promise<string> {
   const root = createRootRoute();
   const broken = createRoute({
     getParentRoute: () => root,
@@ -39,6 +40,7 @@ function rendered(error: Error): Promise<string> {
 }
 
 async function dehydrated(router: AnyRouter): Promise<string> {
+  installRouteErrorGuard(router);
   attachRouterServerSsrUtils({ router, manifest: undefined });
   const ssr = router.serverSsr;
   if (ssr === undefined) throw new Error("server SSR utilities were not attached");
@@ -61,6 +63,16 @@ describe("server-rendered route errors", () => {
     expect(html).not.toContain("secret_table");
     expect(html).toContain(`quote reference ${REFERENCE} when reporting it.`);
     expect(reportFailure).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["a string", "SECRET_string_value"],
+    ["a plain object", { message: "SECRET_object_value", code: "SECRET_code" }],
+  ])("keeps %s thrown by a loader out of the page", async (_name, thrown) => {
+    reportFailure.mockReturnValue({ kind: "internal", requestId: REFERENCE });
+    const html = await rendered(thrown);
+    expect(html).not.toContain("SECRET");
+    expect(html).toContain(`quote reference ${REFERENCE} when reporting it.`);
   });
 
   it("keeps an allowed message and an existing reference", async () => {
