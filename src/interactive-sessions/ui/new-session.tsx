@@ -14,6 +14,7 @@ import { PageHeader, PageHeaderSkeleton } from "../../components/app/page.js";
 import { Section } from "../../components/app/section.js";
 import { SummaryPanel } from "../../components/app/summary-panel.js";
 import { Button } from "../../components/ui/button.js";
+import { useRouteTenant } from "../../projects/context.js";
 import { useSnapshotQuery } from "../../queries/index.js";
 import { listSessionProfiles, startInteractiveSession, type ProfileView } from "../functions.js";
 import {
@@ -45,6 +46,7 @@ export function NewSessionPanel({
   profiles: Awaited<ReturnType<typeof listSessionProfiles>>;
 }) {
   const account = useActiveAccount();
+  const tenant = useRouteTenant();
   const params = useMemo(() => ({ organizationSlug }), [organizationSlug]);
   const active = useMemo(
     () =>
@@ -62,7 +64,7 @@ export function NewSessionPanel({
   let body = <SessionLoadFailure title="Session profiles unavailable" error={profiles} />;
   if (active?.length === 0) {
     const canManage =
-      account.features?.interactiveSessions === true && account.capabilities.manageResources;
+      account.features?.interactiveSessions === true && tenant.capabilities.manageResources;
     body = <EmptyProfiles canManage={canManage} params={params} />;
   } else if (active !== undefined) {
     body = <CreateSessionForm organizationSlug={organizationSlug} profiles={active} />;

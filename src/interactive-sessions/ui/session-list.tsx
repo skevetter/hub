@@ -16,6 +16,7 @@ import { SegmentedControl } from "../../components/app/segmented-control.js";
 import { StatusPill } from "../../components/app/status-pill.js";
 import { TwoLine } from "../../components/app/two-line.js";
 import { Button } from "../../components/ui/button.js";
+import { useRouteTenant } from "../../projects/context.js";
 import { listInteractiveSessions, type SessionListPage } from "../functions.js";
 import {
   NewSessionLink,
@@ -58,6 +59,7 @@ export function SessionListPanel({
 }) {
   const navigate = useNavigate();
   const account = useActiveAccount();
+  const tenant = useRouteTenant();
   const params = useMemo(() => ({ organizationSlug }), [organizationSlug]);
   const changeFilter = useCallback(
     (value: string) => {
@@ -77,7 +79,7 @@ export function SessionListPanel({
   return (
     <>
       <PageHeader title="Sessions" description={DESCRIPTION}>
-        {account.features?.interactiveSessions === true && account.capabilities.manageResources ? (
+        {account.features?.interactiveSessions === true && tenant.capabilities.manageResources ? (
           <Button asChild variant="outline">
             <Link to="/o/$organizationSlug/sessions/profiles" params={params}>
               Profiles
