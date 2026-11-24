@@ -17,6 +17,7 @@ describe("state labels", () => {
     ["succeeded", "Succeeded", "done"],
     ["failed", "Failed", "attention"],
     ["timed_out", "Timed out", "attention"],
+    ["dropped", "Dropped", "attention"],
     ["rejected", "Rejected", "attention"],
     ["canceled", "Canceled", "off"],
   ])("names run %s", (status, label, tone) => {

@@ -17,6 +17,8 @@ const VIEWPORTS = [
   { width: 390, height: 844 },
 ];
 
+const PHONE_WIDTH = 390;
+
 test.describe.configure({ timeout: 180_000 });
 
 test("a trigger, its runs and its state are blocks that lead their rows, in both themes and sizes", async ({
@@ -64,23 +66,36 @@ test("a trigger, its runs and its state are blocks that lead their rows, in both
   }
 });
 
-test("API keys and a run's steps lead with their state block, and a revoked key reads as ended", async ({
+test("API keys lead with their state block, a long actor stays inside a phone, and a revoked key reads as ended", async ({
   hub,
   page,
 }) => {
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
-  await hub.createRunApiKey("owner");
   await projectApp(page).navigation.openOrganizationSettings("API keys");
+  await page.getByRole("button", { name: "Create API key" }).first().click();
+  const dialog = page.getByRole("dialog");
+  const form = dialog.getByRole("form", { name: "Create API key" });
+  await form.getByLabel("Name").fill("Phase Two runner");
+  await form.getByRole("textbox", { name: "Actor" }).fill(`a${"b".repeat(62)}`);
+  await form.getByLabel("Start runs").check();
+  await form.getByRole("button", { name: "Create API key" }).click();
+  await dialog.getByRole("button", { name: "Done" }).click();
   const keys = page.url();
+  const table = page.getByRole("table", { name: "API keys" });
   for (const viewport of VIEWPORTS) {
     await page.setViewportSize(viewport);
     await page.goto(keys);
-    const table = page.getByRole("table", { name: "API keys" });
     await expect(table.locator('[data-slot="state-block"]').first()).toHaveText("Active");
     await expectLeadingBlock(page, table, viewport.width, true);
     await shoot(page, `api-keys-${viewport.width}`);
   }
+  await page.getByRole("button", { name: "Actions for Phase Two runner" }).click();
+  await page.getByRole("menuitem", { name: "Revoke" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Revoke key" }).click();
+  await expect(table.locator('[data-slot="state-block"]').first()).toHaveText("Revoked");
+  await expectLeadingBlock(page, table, PHONE_WIDTH, true);
+  await shoot(page, "api-keys-revoked-390");
 });
 
 async function openActivity(page: Page): Promise<Locator> {

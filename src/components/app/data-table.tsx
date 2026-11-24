@@ -227,7 +227,8 @@ function StackedLabel({ columns, index }: { columns: readonly DataColumn[]; inde
 function cellAttributes(columns: readonly DataColumn[], column: DataColumn, muted: boolean) {
   const stacked = columns[0]?.lead === true;
   const className = cn(
-    stacked && "max-sm:h-auto max-sm:min-w-0 max-sm:px-0",
+    stacked &&
+      "max-sm:h-auto max-sm:min-w-0 max-sm:px-0 max-sm:whitespace-normal max-sm:wrap-anywhere",
     column.align === "end" && "text-right max-sm:self-end",
     muted && "text-muted-foreground",
     column.className,
