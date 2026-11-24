@@ -89,14 +89,18 @@ for (const width of [1280, 390]) {
 
     await openSection("Home");
     await page.reload();
-    const title = "Trigger filters rejected events";
-    await expect(page.getByRole("main").getByText(title)).toHaveCount(0);
-    const attention = await openAttention(page, 2);
-    const rejected = attention.getByRole("listitem").filter({ hasText: title });
-    await rejected.getByRole("link", { name: "View dropped events", exact: false }).click();
-    await expect(page).toHaveURL(/[?&]reason=trigger_filters_rejected/u);
-    await expect(page).toHaveURL(/[?&]range=7d/u);
-    await expect(rows).toHaveCount(1);
+    const attention = await openAttention(page, 0);
+    const information = attention.getByRole("region", { name: "For information" });
+    const dropped = information.getByRole("listitem");
+    await expect(dropped).toContainText("22 events dropped in the last 7 days");
+    await dropped.getByRole("link", { name: "View dropped events", exact: true }).click();
+    await expect(page).toHaveURL(/\/activity\?/u);
+    expect(Object.fromEntries(new URL(page.url()).searchParams)).toEqual({
+      view: "dropped",
+      range: "7d",
+    });
+    await expect(rows).toHaveCount(15);
+    await expect(pager.getByRole("button", { name: "Newer", exact: true })).toBeDisabled();
 
     await openSection("Connections");
     await connections
