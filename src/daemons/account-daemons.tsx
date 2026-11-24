@@ -9,7 +9,7 @@ import {
   useMemo,
   useRef,
   useState,
-  type FormEvent,
+  type SyntheticEvent,
 } from "react";
 import { useActiveAccount } from "../auth/active-account.js";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
@@ -103,6 +103,16 @@ function AccountDaemons({
     queryKey,
     queryFn: () => loadDaemons({ data: { organizationSlug } }),
   });
+  const scope = { accountId, organizationId, organizationSlug };
+  const commands = useDaemonCommands(scope, queryClient);
+  return renderDaemonsSnapshot({ ...scope, showProfiles }, snapshot, commands);
+}
+
+function useDaemonRefresh(
+  accountId: string,
+  organizationId: string,
+  queryClient: ReturnType<typeof useQueryClient>,
+) {
   const [completedAction, setCompletedAction] = useState<CompletedDaemonAction>();
   const refreshAfterAction = useCallback(
     async (
@@ -130,6 +140,18 @@ function AccountDaemons({
       await queryClient.invalidateQueries({ queryKey: ["account"] });
     },
     [accountId, organizationId, queryClient],
+  );
+  return { completedAction, refreshAfterAction };
+}
+
+function useDaemonCommands(
+  { accountId, organizationId, organizationSlug }: DaemonsScope,
+  queryClient: ReturnType<typeof useQueryClient>,
+) {
+  const { completedAction, refreshAfterAction } = useDaemonRefresh(
+    accountId,
+    organizationId,
+    queryClient,
   );
   const rename = useMutation({
     mutationKey: DAEMON_MUTATION_KEY,
@@ -165,8 +187,17 @@ function AccountDaemons({
     (daemonId: string) => revoke.mutate({ data: { organizationSlug, daemonId } }),
     [organizationSlug, revoke],
   );
-  const revokeFailed = revoke.isError || revoke.data?.status === "error";
   const busy = rename.isPending || revoke.isPending;
+  return { completedAction, busy, revoke, renameSelected, revokeSelected };
+}
+
+function renderDaemonsSnapshot(
+  { accountId, organizationSlug, showProfiles }: DaemonsScope & { showProfiles: boolean },
+  snapshot: ReturnType<typeof useSnapshotQuery<BrowserDaemonList>>,
+  commands: ReturnType<typeof useDaemonCommands>,
+) {
+  const { completedAction, busy, revoke, renameSelected, revokeSelected } = commands;
+  const revokeFailed = revoke.isError || revoke.data?.status === "error";
   return (
     <>
       {revokeFailed ? (
@@ -218,22 +249,22 @@ interface DaemonsFilters {
   status: DaemonFilterStatus;
 }
 
-function DaemonsContent({
+interface DaemonsContentProps extends DaemonActions {
+  snapshot: BrowserDaemonList;
+  accountId: string;
+  organizationSlug: string;
+  showProfiles: boolean;
+  completedAction: CompletedDaemonAction | undefined;
+}
+
+function useDaemonsContent({
   snapshot,
   accountId,
   organizationSlug,
   showProfiles,
   completedAction,
   busy,
-  onRename,
-  onRevoke,
-}: DaemonActions & {
-  snapshot: BrowserDaemonList;
-  accountId: string;
-  organizationSlug: string;
-  showProfiles: boolean;
-  completedAction: CompletedDaemonAction | undefined;
-}) {
+}: DaemonsContentProps) {
   const searchId = useId();
   const [providerReads] = useState(createProviderReadLimiter);
   const [filters, setFilters] = useState<DaemonsFilters>(INITIAL_FILTERS);
@@ -250,18 +281,7 @@ function DaemonsContent({
     accountId,
     organizationSlug,
   );
-  const lastRestored = useRef<CompletedDaemonAction>(undefined);
-  useEffect(() => {
-    if (completedAction === undefined || busy || completedAction === lastRestored.current)
-      return undefined;
-    // Let the dialog finish its own close and focus restoration before moving focus.
-    const restore = window.setTimeout(() => {
-      focusDaemonActions(searchId, completedAction.daemonId);
-      lastRestored.current = completedAction;
-    });
-    return () => window.clearTimeout(restore);
-  }, [busy, completedAction, searchId]);
-
+  useRestoreDaemonActionFocus(searchId, busy, completedAction);
   const apply = useCallback((next: DaemonsFilters) => {
     setFilters(next);
     setHasFiltered(true);
@@ -283,6 +303,63 @@ function DaemonsContent({
     apply(INITIAL_FILTERS);
   }, [apply, searchId]);
 
+  return {
+    searchId,
+    filters,
+    hasFiltered,
+    matches,
+    profiles,
+    providerReads,
+    search,
+    changeStatus,
+    clear,
+  };
+}
+
+function useRestoreDaemonActionFocus(
+  searchId: string,
+  busy: boolean,
+  completedAction: CompletedDaemonAction | undefined,
+) {
+  const lastRestored = useRef<CompletedDaemonAction>(undefined);
+  useEffect(() => {
+    if (completedAction === undefined || busy || completedAction === lastRestored.current)
+      return undefined;
+    // Let the dialog finish its own close and focus restoration before moving focus.
+    const restore = window.setTimeout(() => {
+      focusDaemonActions(searchId, completedAction.daemonId);
+      lastRestored.current = completedAction;
+    });
+    return () => window.clearTimeout(restore);
+  }, [busy, completedAction, searchId]);
+}
+
+function DaemonsContent(props: DaemonsContentProps) {
+  const { snapshot, completedAction, accountId, organizationSlug, busy, onRename, onRevoke } =
+    props;
+  const { daemons, canManage } = snapshot;
+  const {
+    searchId,
+    filters,
+    hasFiltered,
+    matches,
+    profiles,
+    providerReads,
+    search,
+    changeStatus,
+    clear,
+  } = useDaemonsContent(props);
+  const device = {
+    searchId,
+    accountId,
+    organizationSlug,
+    profiles,
+    providerReads,
+    canManage,
+    busy,
+    onRename,
+    onRevoke,
+  };
   return (
     <>
       {daemons.length === 0 ? null : (
@@ -298,27 +375,26 @@ function DaemonsContent({
           ? `${matches.length} ${matches.length === 1 ? "daemon" : "daemons"} shown`
           : null}
       </span>
-      <div className="grid min-w-0 gap-6">
-        <DaemonResults hasDaemons={daemons.length > 0} onClear={clear}>
-          {matches.map((daemon) => (
-            <ConnectedDaemonDevice
-              key={daemon.id}
-              daemon={daemon}
-              searchId={searchId}
-              accountId={accountId}
-              organizationSlug={organizationSlug}
-              profiles={profiles}
-              providerReads={providerReads}
-              canManage={canManage}
-              busy={busy}
-              onRename={onRename}
-              onRevoke={onRevoke}
-            />
-          ))}
-        </DaemonResults>
-        {daemons.length > 0 && canManage ? <ConnectAnotherDaemon /> : null}
-      </div>
+      {renderDaemonResults(matches, daemons.length > 0, clear, device)}
     </>
+  );
+}
+
+function renderDaemonResults(
+  matches: readonly BrowserDaemon[],
+  hasDaemons: boolean,
+  clear: () => void,
+  device: Omit<Parameters<typeof ConnectedDaemonDevice>[0], "daemon">,
+) {
+  return (
+    <div className="grid min-w-0 gap-6">
+      <DaemonResults hasDaemons={hasDaemons} onClear={clear}>
+        {matches.map((daemon) => (
+          <ConnectedDaemonDevice key={daemon.id} daemon={daemon} {...device} />
+        ))}
+      </DaemonResults>
+      {hasDaemons && device.canManage ? <ConnectAnotherDaemon /> : null}
+    </div>
   );
 }
 
@@ -483,21 +559,22 @@ function DaemonRowActions({
   );
 }
 
-function RenameDaemonDialog({
-  daemon,
-  searchId,
-  busy,
-  onRename,
-  open,
-  onOpenChange,
-}: {
+interface RenameDaemonDialogProps {
   daemon: BrowserDaemon;
   searchId: string;
   busy: boolean;
   onRename: (daemonId: string, slug: string) => Promise<string | undefined>;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-}) {
+}
+
+function useDaemonRename({
+  daemon,
+  searchId,
+  onRename,
+  open,
+  onOpenChange,
+}: RenameDaemonDialogProps) {
   const [error, setError] = useState<string>();
   const renamed = useRef(false);
   useEffect(() => {
@@ -528,7 +605,7 @@ function RenameDaemonDialog({
     [changeOpen, daemon.id, onRename],
   );
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       const slug = new FormData(event.currentTarget).get("slug");
       if (typeof slug !== "string") return;
@@ -537,6 +614,12 @@ function RenameDaemonDialog({
     [completeRename],
   );
 
+  return { error, changeOpen, submit };
+}
+
+function RenameDaemonDialog(props: RenameDaemonDialogProps) {
+  const { daemon, open, busy } = props;
+  const { error, changeOpen, submit } = useDaemonRename(props);
   return (
     <FormDialog
       open={open}
