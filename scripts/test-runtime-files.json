@@ -49,5 +49,5 @@
     "src/run-timeline/scrub.test.ts"
   ],
   "src/run-timeline/test-utils/build17-scrubber.ts": ["src/run-timeline/scrub.test.ts"],
-  "src/styles.css": ["src/motion-policy.test.ts"]
+  "src/styles.css": ["src/motion-policy.test.ts", "src/typography-policy.test.ts"]
 }
