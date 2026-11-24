@@ -1371,12 +1371,9 @@ class PgDatabase implements Database {
       ...(failureReason === undefined ? {} : { failureReason }),
     });
     const step = await this.findWorkflowStepRunById(execution.workflowStepRunId);
-    return step === undefined
-      ? undefined
-      : {
-          stepRun: step,
-          run: (await this.findTriggerRunById(step.triggerRunId))!,
-        };
+    if (step === undefined) return undefined;
+    const run = await this.findTriggerRunById(step.triggerRunId);
+    return run === undefined ? undefined : { stepRun: step, run };
   }
 
   async completeWorkflowAgentExecution(input: WorkflowAgentCompletionInput) {

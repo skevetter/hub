@@ -3207,9 +3207,9 @@ class MemoryDatabase implements Database {
       ...(failureReason === undefined ? {} : { failureReason }),
     });
     const step = this.workflowStepRuns.get(execution.workflowStepRunId);
-    return step === undefined
-      ? undefined
-      : { stepRun: step, run: this.triggerRuns.get(step.triggerRunId)! };
+    if (step === undefined) return undefined;
+    const run = this.triggerRuns.get(step.triggerRunId);
+    return run === undefined ? undefined : { stepRun: step, run };
   }
 
   async completeWorkflowAgentExecution(input: WorkflowAgentCompletionInput) {
