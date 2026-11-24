@@ -17,6 +17,7 @@ import { StatusPill } from "../../components/app/status-pill.js";
 import { TwoLine } from "../../components/app/two-line.js";
 import { Button } from "../../components/ui/button.js";
 import { DropdownMenuItem } from "../../components/ui/dropdown-menu.js";
+import { useRouteTenant } from "../../projects/context.js";
 import { saveSessionProfile, type listSessionProfiles, type ProfileView } from "../functions.js";
 import { SessionProfileForm, type ProfileFormData } from "./session-profile-form.js";
 import { refusalMessage, SessionLoadFailure, SessionsUnavailable } from "./session-states.js";
@@ -48,9 +49,10 @@ export function SessionProfilesPanel({
   result: Awaited<ReturnType<typeof listSessionProfiles>>;
 }) {
   const account = useActiveAccount();
+  const tenant = useRouteTenant();
   if (
     account.features?.interactiveSessions !== true ||
-    !account.capabilities.manageResources ||
+    !tenant.capabilities.manageResources ||
     (result.status === "ok" && !Array.isArray(result.data) && result.data.code === "not_found")
   ) {
     return <SessionsUnavailable />;
