@@ -80,20 +80,23 @@ function stepState(
   event: RunEvent | undefined,
   terminal: boolean,
 ) {
-  let status: string = step.status;
-  if (event?.kind === "step_finished" && typeof event.data["status"] === "string")
-    status = event.data["status"];
-  else if (
-    event?.kind === "step_started" &&
-    (step.status === "pending" || step.status === "running")
-  )
-    status = "running";
-  if (terminal && (status === "pending" || status === "running")) status = "not_run";
+  const status = eventStepStatus(step.status, event);
   return {
-    status,
+    status: terminal && isInProgress(status) ? "not_run" : status,
     started: step.startedAt ?? (event?.kind === "step_started" ? event.at : null),
     completed: step.completedAt ?? (event?.kind === "step_finished" ? event.at : null),
   };
+}
+
+function eventStepStatus(status: string, event: RunEvent | undefined): string {
+  if (event?.kind === "step_finished" && typeof event.data["status"] === "string")
+    return event.data["status"];
+  if (event?.kind === "step_started" && isInProgress(status)) return "running";
+  return status;
+}
+
+function isInProgress(status: string): boolean {
+  return status === "pending" || status === "running";
 }
 
 function StepOutput({ step, status }: { step: RunDetail["steps"][number]; status: string }) {
@@ -102,21 +105,28 @@ function StepOutput({ step, status }: { step: RunDetail["steps"][number]; status
   if (!step.isAgent && isScriptStepOutput(step.output)) {
     return <ScriptStepOutput stepId={step.id} status={status} output={step.output} />;
   }
-  let output = step.output;
-  if (
-    completion === "inferred_from_turn_end" &&
-    output !== null &&
-    typeof output === "object" &&
-    !Array.isArray(output)
-  ) {
-    output = output["output"] ?? null;
-  }
+  const output = unwrappedOutput(step.output, completion);
   return (
     <>
       {completion === null ? null : <span>Completion: {completion}</span>}
       {output === null ? "No output" : <PlainOutput id={step.id} value={output} />}
     </>
   );
+}
+
+function unwrappedOutput(
+  output: RunDetail["steps"][number]["output"],
+  completion: RunDetail["steps"][number]["completion"],
+) {
+  if (
+    completion === "inferred_from_turn_end" &&
+    output !== null &&
+    typeof output === "object" &&
+    !Array.isArray(output)
+  ) {
+    return output["output"] ?? null;
+  }
+  return output;
 }
 
 function ExpiredStepOutput({ step }: { step: RunDetail["steps"][number] }) {
