@@ -22,10 +22,10 @@ const LinearTokenResponseSchema = z
   .object({
     access_token: z.string().min(1),
     refresh_token: z.string().min(1).optional(),
-    expires_in: z.number().finite().positive().optional(),
+    expires_in: z.number().positive().optional(),
     scope: z.string().optional(),
   })
-  .passthrough();
+  .loose();
 
 const OAuthErrorSchema = z.object({ error: z.string() });
 
@@ -54,7 +54,7 @@ const IssueResponseSchema = z.object({
         identifier: z.string().min(1).optional(),
         title: z.string(),
         description: z.string().nullable().optional(),
-        url: z.string().url().optional(),
+        url: z.url().optional(),
         project: z
           .object({ id: z.string().min(1) })
           .nullable()
@@ -80,7 +80,7 @@ const IssueCommentHistoryResponseSchema = z.object({
         z.object({
           id: z.string().min(1),
           body: z.string(),
-          createdAt: z.string().datetime(),
+          createdAt: z.iso.datetime(),
           user: z
             .object({
               id: z.string().min(1),

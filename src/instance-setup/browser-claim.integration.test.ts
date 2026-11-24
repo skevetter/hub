@@ -34,7 +34,7 @@ const accountStateSchema = z
     isInstanceOperator: z.boolean().optional(),
     registration: z.string().optional(),
   })
-  .passthrough();
+  .loose();
 
 describe("first-run claim at the browser boundary", () => {
   let postgres: StartedPostgreSqlContainer;

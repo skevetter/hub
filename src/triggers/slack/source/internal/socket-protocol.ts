@@ -24,7 +24,7 @@ export const SlackSocketEnvelopeSchema = z.object({
 export const SlackSocketOpenResponseSchema = z.object({
   ok: z.boolean(),
   error: z.string().max(255).optional(),
-  url: z.string().url().optional(),
+  url: z.url().optional(),
 });
 
 export function slackSocketAck(envelopeId: string): string {

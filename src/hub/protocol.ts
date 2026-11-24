@@ -13,7 +13,7 @@ type WireJsonValue =
 const JsonValueSchema: z.ZodType<WireJsonValue> = z.lazy(() =>
   z.union([
     z.string(),
-    z.number().finite(),
+    z.number(),
     z.boolean(),
     z.null(),
     z.array(JsonValueSchema),
@@ -70,7 +70,7 @@ export const HubExecutionAgentSnapshotSchema = z
     id: z.string(),
     status: AgentStatusSchema,
   })
-  .passthrough();
+  .loose();
 
 const HubTimelineItemSchema = z
   .object({
@@ -81,7 +81,7 @@ const HubTimelineItemSchema = z
     name: z.string().optional(),
     status: z.string().optional(),
   })
-  .passthrough();
+  .loose();
 
 /** `hub / finish_execution` is how the daemon's omp provider titles a bridged MCP tool call. */
 export function isHubFinishExecutionToolName(name: string): boolean {
@@ -110,7 +110,7 @@ export const HubDaemonServerInfoEnvelopeSchema = z.object({
         permissions: z.array(z.string()),
         features: z.object({ providersSnapshot: z.boolean().optional() }).optional(),
       })
-      .passthrough(),
+      .loose(),
   }),
 });
 
@@ -121,37 +121,37 @@ export const HubExecutionAgentStreamEventSchema = z.discriminatedUnion("type", [
       sessionId: z.string(),
       provider: z.string(),
     })
-    .passthrough(),
-  z.object({ type: z.literal("turn_started"), provider: z.string() }).passthrough(),
-  z.object({ type: z.literal("turn_completed"), provider: z.string() }).passthrough(),
+    .loose(),
+  z.object({ type: z.literal("turn_started"), provider: z.string() }).loose(),
+  z.object({ type: z.literal("turn_completed"), provider: z.string() }).loose(),
   z
     .object({
       type: z.literal("turn_failed"),
       provider: z.string(),
       error: z.string(),
     })
-    .passthrough(),
+    .loose(),
   z
     .object({
       type: z.literal("turn_canceled"),
       provider: z.string(),
       reason: z.string(),
     })
-    .passthrough(),
+    .loose(),
   z
     .object({
       type: z.literal("timeline"),
       provider: z.string(),
       item: HubTimelineItemSchema,
     })
-    .passthrough(),
+    .loose(),
   z
     .object({
       type: z.literal("permission_requested"),
       provider: z.string(),
       request: z.record(z.string(), z.unknown()),
     })
-    .passthrough(),
+    .loose(),
   z
     .object({
       type: z.literal("permission_resolved"),
@@ -159,7 +159,7 @@ export const HubExecutionAgentStreamEventSchema = z.discriminatedUnion("type", [
       requestId: z.string(),
       resolution: z.record(z.string(), z.unknown()),
     })
-    .passthrough(),
+    .loose(),
   z
     .object({
       type: z.literal("attention_required"),
@@ -168,7 +168,7 @@ export const HubExecutionAgentStreamEventSchema = z.discriminatedUnion("type", [
       timestamp: z.string(),
       shouldNotify: z.boolean(),
     })
-    .passthrough(),
+    .loose(),
 ]);
 
 export const HubExecutionAgentValidateRequestSchema = z.object({

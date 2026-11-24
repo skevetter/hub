@@ -9,16 +9,14 @@ const repositorySchema = z
     full_name: z.string().min(1),
     default_branch: z.string().min(1),
   })
-  .passthrough();
-const repositoryListSchema = z.object({ repositories: z.array(repositorySchema) }).passthrough();
-const referenceSchema = z.object({ object: z.object({ sha: z.string().min(1) }) }).passthrough();
+  .loose();
+const repositoryListSchema = z.object({ repositories: z.array(repositorySchema) }).loose();
+const referenceSchema = z.object({ object: z.object({ sha: z.string().min(1) }) }).loose();
 const contentSchema = z.discriminatedUnion("type", [
-  z
-    .object({ type: z.literal("file"), encoding: z.literal("base64"), content: z.string() })
-    .passthrough(),
-  z.object({ type: z.literal("dir") }).passthrough(),
-  z.object({ type: z.literal("symlink") }).passthrough(),
-  z.object({ type: z.literal("submodule") }).passthrough(),
+  z.object({ type: z.literal("file"), encoding: z.literal("base64"), content: z.string() }).loose(),
+  z.object({ type: z.literal("dir") }).loose(),
+  z.object({ type: z.literal("symlink") }).loose(),
+  z.object({ type: z.literal("submodule") }).loose(),
 ]);
 const treeSchema = z
   .object({
@@ -30,10 +28,10 @@ const treeSchema = z
           mode: z.string(),
           type: z.enum(["blob", "tree", "commit"]),
         })
-        .passthrough(),
+        .loose(),
     ),
   })
-  .passthrough();
+  .loose();
 
 export function createGitHubConfigurationProvider(auth: GitHubAuth): GitHubConfigurationProvider {
   async function repository(installationId: number, repositoryId: number) {

@@ -11,7 +11,7 @@ const decisionSchema = userCodeSchema.extend({
   organizationId: z.string().min(1),
 });
 const authorizationSchema = z.object({
-  expiresAt: z.string().datetime(),
+  expiresAt: z.iso.datetime(),
   organization: z.object({ id: z.string(), name: z.string(), slug: z.string() }),
   canManage: z.boolean(),
 });

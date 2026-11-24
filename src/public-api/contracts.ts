@@ -33,9 +33,9 @@ export const ValidatedTriggerSchema = z
 
 export const InstalledTriggerSchema = z
   .object({
-    triggerId: z.string().uuid(),
+    triggerId: z.uuid(),
     name: z.string(),
-    revisionId: z.string().uuid(),
+    revisionId: z.uuid(),
     version: z.number().int().positive(),
     active: z.literal(true),
   })
@@ -51,9 +51,9 @@ export const CliAuthorizationSchema = z
   .object({
     deviceCode: z.string(),
     userCode: z.string(),
-    verificationUri: z.string().url(),
-    verificationUriComplete: z.string().url(),
-    expiresAt: z.string().datetime({ offset: true }),
+    verificationUri: z.url(),
+    verificationUriComplete: z.url(),
+    expiresAt: z.iso.datetime({ offset: true }),
     interval: z.number().int().positive(),
   })
   .strict()
@@ -85,7 +85,7 @@ export const CliAuthorizationPollSchema = z
 
 export const ProblemSchema = z
   .object({
-    type: z.string().url(),
+    type: z.url(),
     title: z.string(),
     status: z.number().int().min(400).max(599),
     detail: z.string(),
@@ -170,7 +170,7 @@ export const InstallConfigurationRequestSchema = z
 export const InstalledConfigurationSchema = z
   .object({
     projectSlug: z.string(),
-    versionId: z.string().uuid(),
+    versionId: z.uuid(),
     version: z.number().int().positive(),
     active: z.literal(true),
   })
@@ -197,7 +197,7 @@ export const ValidatedConfigurationSchema = z
 
 export const ProjectSchema = z
   .object({
-    id: z.string().uuid(),
+    id: z.uuid(),
     name: z.string(),
     slug: z.string(),
   })
@@ -221,7 +221,7 @@ export const ProjectListSchema = z
 
 export const TriggerExportSchema = z
   .object({
-    id: z.string().uuid(),
+    id: z.uuid(),
     name: z.string(),
     enabled: z.boolean(),
     format: z.enum(["single_run", "legacy_multistep"]),
@@ -237,7 +237,7 @@ export const TriggerListSchema = z
 
 export const ConfigurationResourcesSchema = z
   .object({
-    daemons: z.array(z.object({ id: z.string().uuid(), slug: z.string() }).strict()),
+    daemons: z.array(z.object({ id: z.uuid(), slug: z.string() }).strict()),
     github: z.array(
       z
         .object({
@@ -276,7 +276,7 @@ export const SetupResourcesSchema = z
 export const DispatchManualRunRequestSchema = z
   .object({
     projectSlug: z.string().trim().min(1).max(100),
-    expectedVersionId: z.string().uuid().optional(),
+    expectedVersionId: z.uuid().optional(),
     trigger: z.string().trim().min(1).max(200),
     actor: z.string().trim().min(1).max(200).optional(),
     deliveryKey: z.string().trim().min(1).max(200),
@@ -296,8 +296,8 @@ export const DispatchManualRunRequestSchema = z
 export const DispatchedManualRunSchema = z
   .object({
     deliveryKey: z.string(),
-    providerEventReceiptId: z.string().uuid(),
-    triggerRunId: z.string().uuid(),
+    providerEventReceiptId: z.uuid(),
+    triggerRunId: z.uuid(),
     configuredTriggerName: z.string(),
     workflowStatus: z.enum(["running", "succeeded", "failed", "timed_out", "canceled"]),
   })
@@ -336,7 +336,7 @@ export const WebhookHeadersSchema = z
   });
 
 export const GitHubWebhookPathSchema = WebhookPathSchema.extend({
-  keyId: z.string().uuid().describe("Public id of the trigger's GitHub signing key."),
+  keyId: z.uuid().describe("Public id of the trigger's GitHub signing key."),
 }).openapi("GitHubWebhookPath");
 
 export const GitHubWebhookHeadersSchema = WebhookHeadersSchema.extend({
@@ -410,7 +410,7 @@ export const ReceivedWebhookSchema = z
 export const EnrollmentTokenSchema = z
   .object({
     token: z.string().min(32),
-    expiresAt: z.string().datetime({ offset: true }),
+    expiresAt: z.iso.datetime({ offset: true }),
   })
   .strict()
   .openapi("EnrollmentToken", {
@@ -422,10 +422,10 @@ export const EnrollmentTokenSchema = z
 
 export type Problem = z.infer<typeof ProblemSchema>;
 
-export const RunStopPathSchema = z.object({ id: z.string().uuid() });
+export const RunStopPathSchema = z.object({ id: z.uuid() });
 export const StoppedRunSchema = z
   .object({
-    runId: z.string().uuid(),
+    runId: z.uuid(),
     status: z.enum(["running", "succeeded", "failed", "timed_out", "canceled", "rejected"]),
     cleanupState: z.enum(stopCleanupStates),
     note: z.string().optional(),

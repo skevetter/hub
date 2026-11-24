@@ -113,7 +113,7 @@ const sessionSchema = z.object({
       userId: z.string(),
       activeOrganizationId: z.string().nullable().optional(),
     })
-    .passthrough(),
+    .loose(),
   user: z
     .object({
       id: z.string(),
@@ -122,7 +122,7 @@ const sessionSchema = z.object({
       mustChangePassword: z.boolean().optional(),
       isInstanceOperator: z.boolean().optional(),
     })
-    .passthrough(),
+    .loose(),
 });
 
 const RAW_PRODUCT_PATHS = new Set([

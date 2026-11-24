@@ -159,7 +159,7 @@ const changeRoleBody = z
   .strict();
 const removeMemberBody = z.object({ memberId: z.string().min(1) }).strict();
 const createApiKeyBody = apiKeyCreateSchema;
-const apiKeyIdBody = z.object({ id: z.string().uuid() }).strict();
+const apiKeyIdBody = z.object({ id: z.uuid() }).strict();
 
 export async function withInteractiveSessionAccountFeature(response: Response): Promise<Response> {
   if (!response.ok) return response;

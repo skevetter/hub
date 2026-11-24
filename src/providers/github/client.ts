@@ -26,19 +26,19 @@ export interface GitHubConnectionClient {
 
 const userSchema = z.object({ id: z.number().int().positive() });
 const membershipSchema = z.object({ role: z.string(), state: z.string() });
-const tokenSchema = z.object({ access_token: z.string().min(1) }).passthrough();
+const tokenSchema = z.object({ access_token: z.string().min(1) }).loose();
 const userInstallationsSchema = z
-  .object({ installations: z.array(z.object({ id: z.number().int().positive() }).passthrough()) })
-  .passthrough();
+  .object({ installations: z.array(z.object({ id: z.number().int().positive() }).loose()) })
+  .loose();
 const installationSchema = z
   .object({
     id: z.number().int().positive(),
     suspended_at: z.string().nullable().optional(),
     account: z
       .object({ id: z.union([z.number(), z.string()]), login: z.string(), type: z.string() })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 export function createGitHubConnectionClient(input: {
   publicBaseUrl: string;

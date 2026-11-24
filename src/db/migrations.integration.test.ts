@@ -69,7 +69,7 @@ it("places surface persistence at journal index 68 after the accepted reply migr
 });
 
 it("chains the surface persistence snapshot to the accepted reply snapshot", async () => {
-  const snapshotSchema = z.object({ id: z.string().uuid(), prevId: z.string().uuid() });
+  const snapshotSchema = z.object({ id: z.uuid(), prevId: z.uuid() });
   const reply = snapshotSchema.parse(
     JSON.parse(await readFile(join(DRIZZLE_MIGRATIONS, "meta/0067_snapshot.json"), "utf8")),
   );

@@ -1,4 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { formatError } from "zod";
 import {
   type NormalizedGitHubEvent,
   WebhookPayloadSchema,
@@ -234,7 +235,7 @@ async function verifyWebhookRequest(
   if (!parsedBody.success) {
     reportGitHubRejection("invalid_payload", 400, secret, signature);
     return Response.json(
-      { error: "invalid webhook payload", issues: parsedBody.error.format() },
+      { error: "invalid webhook payload", issues: formatError(parsedBody.error) },
       { status: 400 },
     );
   }

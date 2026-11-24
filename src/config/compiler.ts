@@ -47,7 +47,7 @@ const MAX_SCRIPT_BYTES = 64 * 1024;
 const EXPRESSION_START = "${{";
 const EXPRESSION_END = "}}";
 
-const InputValueSchema = z.union([z.string(), z.number().finite(), z.boolean()]);
+const InputValueSchema = z.union([z.string(), z.number(), z.boolean()]);
 
 const AuthoredInputSchema = z
   .object({
@@ -84,7 +84,7 @@ const AllowOutputSchema = z
   .superRefine((output, context) => {
     if (output.max === 0) {
       context.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: "custom",
         path: ["max"],
         message:
           output.required === true
@@ -126,12 +126,12 @@ const AuthoredTriggerFilterSchema = z
   .strict();
 
 const CompiledTriggerFilterSchema = AuthoredTriggerFilterSchema.extend({
-  connectionId: z.string().uuid().optional(),
+  connectionId: z.uuid().optional(),
   resourceId: z.string().min(1).optional(),
 }).superRefine((filter, context) => {
   if (filter.resourceId !== undefined && filter.connectionId === undefined) {
     context.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: "custom",
       path: ["resourceId"],
       message: "resourceId requires connectionId",
     });

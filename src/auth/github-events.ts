@@ -2,23 +2,19 @@ import { z } from "zod";
 
 const OptionalStringSchema = z.string().optional().catch(undefined);
 const OptionalNumberSchema = z.number().optional().catch(undefined);
-const UserSchema = z
-  .object({ login: OptionalStringSchema })
-  .passthrough()
-  .optional()
-  .catch(undefined);
-const LabelSchema = z.object({ name: OptionalStringSchema }).passthrough();
+const UserSchema = z.object({ login: OptionalStringSchema }).loose().optional().catch(undefined);
+const LabelSchema = z.object({ name: OptionalStringSchema }).loose();
 
 export const WebhookPayloadSchema = z
   .object({
     repository: z
       .object({ id: OptionalNumberSchema, full_name: OptionalStringSchema })
-      .passthrough()
+      .loose()
       .optional()
       .catch(undefined),
-    installation: z.object({ id: OptionalNumberSchema }).passthrough().optional().catch(undefined),
+    installation: z.object({ id: OptionalNumberSchema }).loose().optional().catch(undefined),
   })
-  .passthrough();
+  .loose();
 
 export const NormalizedGitHubEventSchema = z.object({
   id: z.string(),
@@ -37,9 +33,9 @@ export const GitHubInstallationSchema = z
       .object({
         login: z.string(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 export const GitHubRepositorySchema = z
   .object({
@@ -50,9 +46,9 @@ export const GitHubRepositorySchema = z
       .object({
         login: z.string(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 export const GitHubEventSchema = z
   .object({
@@ -62,11 +58,11 @@ export const GitHubEventSchema = z
       .object({
         name: z.string(),
       })
-      .passthrough(),
+      .loose(),
     payload: z.record(z.string(), z.unknown()),
     created_at: z.string(),
   })
-  .passthrough();
+  .loose();
 
 export function readGitHubTriggerUrl(payload: unknown): string | undefined {
   return (
@@ -117,7 +113,7 @@ export const IssueCommentPayloadSchema = z
         html_url: OptionalStringSchema,
         user: UserSchema,
         labels: z.array(LabelSchema).optional().catch(undefined),
-        pull_request: z.object({}).passthrough().optional().catch(undefined),
+        pull_request: z.object({}).loose().optional().catch(undefined),
       })
       .optional()
       .catch(undefined),
@@ -131,7 +127,7 @@ export const IssueCommentPayloadSchema = z
       .catch(undefined),
     sender: UserSchema,
   })
-  .passthrough();
+  .loose();
 
 export const IssuesPayloadSchema = z
   .object({
@@ -150,7 +146,7 @@ export const IssuesPayloadSchema = z
     sender: UserSchema,
     label: LabelSchema.optional().catch(undefined),
   })
-  .passthrough();
+  .loose();
 
 export const PullRequestPayloadSchema = z
   .object({
@@ -177,7 +173,7 @@ export const PullRequestPayloadSchema = z
     sender: UserSchema,
     label: LabelSchema.optional().catch(undefined),
   })
-  .passthrough();
+  .loose();
 
 export const PullRequestReviewPayloadSchema = PullRequestPayloadSchema.extend({
   review: z
@@ -206,7 +202,7 @@ export const PullRequestResponseSchema = z
       ref: z.string(),
     }),
   })
-  .passthrough();
+  .loose();
 
 export const PushPayloadSchema = WebhookPayloadSchema.extend({
   after: z.string(),
@@ -220,7 +216,7 @@ export const PushPayloadSchema = WebhookPayloadSchema.extend({
           modified: z.array(z.string()).default([]),
           removed: z.array(z.string()).default([]),
         })
-        .passthrough(),
+        .loose(),
     )
     .default([]),
 });

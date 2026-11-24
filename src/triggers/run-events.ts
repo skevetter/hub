@@ -23,7 +23,7 @@ export interface RunDetailSnapshot extends Omit<ActivityRunDetail, "steps"> {
 export const runEventSchema = z.object({
   seq: z.number().int().positive(),
   kind: z.enum(TIMELINE_KINDS),
-  at: z.string().datetime(),
+  at: z.iso.datetime(),
   stepId: z.string(),
   data: z.record(z.string(), z.json()),
 });

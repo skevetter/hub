@@ -20,13 +20,11 @@ const contextSchema = z
   .object({
     event: z
       .object({
-        manual: z
-          .object({ input: z.unknown(), data: z.unknown(), source: z.string() })
-          .passthrough(),
+        manual: z.object({ input: z.unknown(), data: z.unknown(), source: z.string() }).loose(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 async function harness(access = authorization) {
   const database = createMemoryDatabase();

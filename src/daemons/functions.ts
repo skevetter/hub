@@ -7,21 +7,21 @@ import { getApplication } from "../server/runtime.js";
 import type { HubProviderSnapshot } from "../hub/protocol.js";
 
 const daemonSchema = z.object({
-  id: z.string().uuid(),
+  id: z.uuid(),
   slug: z.string(),
   status: z.enum(["active", "revoked"]),
   presence: z.enum(["offline", "connected"]),
-  connectedAt: z.string().datetime().nullable(),
-  lastSeenAt: z.string().datetime(),
-  registeredAt: z.string().datetime(),
+  connectedAt: z.iso.datetime().nullable(),
+  lastSeenAt: z.iso.datetime(),
+  registeredAt: z.iso.datetime(),
   permissions: z.array(z.string()),
 });
 const daemonListSchema = z.object({
   daemons: z.array(daemonSchema),
   canManage: z.boolean(),
 });
-const renameSchema = z.object({ daemonId: z.string().uuid(), slug: z.string() });
-const daemonIdSchema = z.object({ daemonId: z.string().uuid() });
+const renameSchema = z.object({ daemonId: z.uuid(), slug: z.string() });
+const daemonIdSchema = z.object({ daemonId: z.uuid() });
 const organizationScopeSchema = z.object({ organizationSlug: z.string().min(1) });
 const scopedRenameSchema = organizationScopeSchema.extend(renameSchema.shape);
 const scopedDaemonIdSchema = organizationScopeSchema.extend(daemonIdSchema.shape);

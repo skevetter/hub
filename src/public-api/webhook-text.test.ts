@@ -141,9 +141,9 @@ describe("webhook Unicode storage validation", () => {
         .object({
           event: z
             .object({
-              manual: z.object({ input: markerSchema, data: markerSchema }).passthrough(),
+              manual: z.object({ input: markerSchema, data: markerSchema }).loose(),
             })
-            .passthrough(),
+            .loose(),
         })
         .parse(run.triggerContext);
       assert.ok(Buffer.byteLength(JSON.stringify(context.event, null, 2), "utf8") <= 65_536);

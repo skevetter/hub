@@ -30,15 +30,15 @@ import { createExecutionCapabilityServer } from "./server.js";
 const RpcResponseSchema = z
   .object({
     result: z.unknown().optional(),
-    error: z.object({ code: z.number() }).passthrough().optional(),
+    error: z.object({ code: z.number() }).loose().optional(),
   })
-  .passthrough();
-const ToolResultSchema = z.object({ isError: z.boolean().optional() }).passthrough();
+  .loose();
+const ToolResultSchema = z.object({ isError: z.boolean().optional() }).loose();
 const ToolsListSchema = z
   .object({
-    tools: z.array(z.object({ name: z.string(), inputSchema: z.unknown() }).passthrough()),
+    tools: z.array(z.object({ name: z.string(), inputSchema: z.unknown() }).loose()),
   })
-  .passthrough();
+  .loose();
 
 describe("execution capability MCP boundary", () => {
   it.each([

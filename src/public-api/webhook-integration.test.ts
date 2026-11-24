@@ -14,8 +14,8 @@ import { parseInvocationInputs } from "../triggers/invocation.js";
 const dispatchedSchema = z
   .object({
     deliveryKey: z.string(),
-    providerEventReceiptId: z.string().uuid(),
-    triggerRunId: z.string().uuid(),
+    providerEventReceiptId: z.uuid(),
+    triggerRunId: z.uuid(),
     configuredTriggerName: z.string(),
     workflowStatus: z.string(),
     duplicate: z.boolean(),

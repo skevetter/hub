@@ -3,8 +3,8 @@ import type { BoundWebhookTrigger } from "../../db/types.js";
 
 export const ManualTriggerPayloadSchema = z.object({
   organizationId: z.string().min(1, "organizationId is required"),
-  projectId: z.string().uuid("projectId is required"),
-  connectionId: z.string().uuid().nullable().optional(),
+  projectId: z.string().check(z.uuid("projectId is required")),
+  connectionId: z.uuid().nullable().optional(),
   resourceId: z.string().nullable().optional(),
   source: z
     .string()
