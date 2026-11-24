@@ -24,7 +24,7 @@ import {
 } from "../../agent-executions/completion-token.js";
 import { createDatabase, testDatabaseRuntime } from "../../db/test-utils/runtime.js";
 import { startDaemonTestPostgres } from "./postgres-container.js";
-import { isolatedPostgresDatabase } from "../../db/test-utils/isolated-postgres.js";
+import { clonedPostgresDatabase } from "../../db/test-utils/isolated-postgres.js";
 import type { ApiKeyScope } from "../../auth/api-key-contract.js";
 import type { OperationAuthenticator } from "../../auth/operation-auth.js";
 import type {
@@ -185,7 +185,7 @@ type FakeAgentRequest = z.infer<typeof ExecutionSessionRequestSchema>["message"]
 
 export class HubHarness {
   private postgres: StartedPostgreSqlContainer | undefined;
-  private isolatedDatabase: ReturnType<typeof isolatedPostgresDatabase> | undefined;
+  private isolatedDatabase: Awaited<ReturnType<typeof clonedPostgresDatabase>> | undefined;
   private database: Database | undefined;
   private readonly entitlements = createUnlimitedEntitlementsService();
   private server: Server | undefined;
@@ -1728,7 +1728,7 @@ export class HubHarness {
   private async startResources(postgres?: StartedPostgreSqlContainer): Promise<void> {
     let databaseUrl: string;
     if (postgres) {
-      this.isolatedDatabase = isolatedPostgresDatabase(postgres.getConnectionUri());
+      this.isolatedDatabase = await clonedPostgresDatabase(postgres);
       databaseUrl = this.isolatedDatabase.url;
     } else {
       this.postgres = await startDaemonTestPostgres();
