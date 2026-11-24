@@ -2,7 +2,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { ExternalLink } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type SubmitEvent, type ReactNode } from "react";
 import { Card, CardSkeleton } from "../components/app/card.js";
 import { FormField } from "../components/app/form-field.js";
 import { CopyBlock, CopyField } from "../components/app/copy-field.js";
@@ -60,17 +60,7 @@ interface SaveMutationInput {
   data: Record<string, unknown> & { provider: string; transport?: "socket" | "webhook" };
 }
 
-// eslint-disable-next-line complexity -- this component owns one provider card's complete workflow.
-export function ProviderSection({
-  guide,
-  view,
-  callbackOrigin,
-  surface,
-  organizationId,
-  open,
-  onOpenChange,
-  returned,
-}: {
+interface ProviderSectionProps {
   guide: ProviderGuide;
   view: ProviderApplicationView;
   callbackOrigin: string;
@@ -80,7 +70,26 @@ export function ProviderSection({
   onOpenChange: (open: boolean) => void;
   /** The outcome of an install or authorization that just came back to this section. */
   returned: SectionReturn | undefined;
-}) {
+}
+
+export function ProviderSection(props: ProviderSectionProps) {
+  const { guide, surface, organizationId } = props;
+  const state = useProviderSectionState(props);
+  const { connect } = state.submission.mutations;
+  const startConnection = useCallback(() => {
+    connect.mutate({ data: { provider: guide.provider, organizationId, surface } });
+  }, [connect, guide.provider, organizationId, surface]);
+
+  return renderProviderSection(props, state, startConnection);
+}
+
+type SetOutcome = (outcome: Outcome | undefined) => void;
+type ProviderQueryClient = ReturnType<typeof useQueryClient>;
+type ProviderSectionState = ReturnType<typeof useProviderSectionState>;
+type SubmitProviderForm = (event: SubmitEvent<HTMLFormElement>) => void;
+
+function useProviderSectionState(props: ProviderSectionProps) {
+  const { guide, view, callbackOrigin, returned, surface } = props;
   const queryClient = useQueryClient();
   const savedSlackTransport = view.identifiers["transport"] === "webhook" ? "webhook" : "socket";
   const [slackTransport, setSlackTransport] = useState<"socket" | "webhook">(savedSlackTransport);
@@ -89,6 +98,63 @@ export function ProviderSection({
   const [replacing, setReplacing] = useState(false);
   const [errors, setErrors] = useState<Readonly<Record<string, string>>>({});
   const [outcome, setOutcome] = useState<Outcome | undefined>(returned);
+  const { result, replace, fields } = useProviderSectionFocus({
+    outcome,
+    replacing,
+    activeGuide,
+    callbackOrigin,
+  });
+  const mutations = useProviderSectionMutations({
+    queryClient,
+    activeGuide,
+    guide,
+    setOutcome,
+    setReplacing,
+  });
+  const { save } = mutations;
+  const busy = providerBusy(mutations);
+  const submit = useCallback(
+    (event: SubmitEvent<HTMLFormElement>) =>
+      submitProviderForm(event, {
+        activeGuide,
+        fields,
+        save,
+        surface,
+        configurationVersion: view.configurationVersion,
+        setErrors,
+      }),
+    [activeGuide, fields, save, surface, view.configurationVersion],
+  );
+
+  return {
+    activeGuide,
+    submission: { submit, mutations, busy },
+    editing: {
+      slackTransport,
+      setSlackTransport,
+      replacing,
+      setReplacing,
+      errors,
+      setErrors,
+      outcome,
+      setOutcome,
+      result,
+      replace,
+    },
+  };
+}
+
+function useProviderSectionFocus({
+  outcome,
+  replacing,
+  activeGuide,
+  callbackOrigin,
+}: {
+  outcome: Outcome | undefined;
+  replacing: boolean;
+  activeGuide: ProviderGuide;
+  callbackOrigin: string;
+}) {
   const result = useRef<HTMLDivElement>(null);
   const replace = useRef<HTMLButtonElement>(null);
   const fields = guideFields(activeGuide, callbackOrigin);
@@ -103,12 +169,68 @@ export function ProviderSection({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- the first field name is stable per guide
   }, [activeGuide, replacing]);
 
+  return { result, replace, fields };
+}
+
+function useProviderSectionMutations({
+  queryClient,
+  activeGuide,
+  guide,
+  setOutcome,
+  setReplacing,
+}: {
+  queryClient: ProviderQueryClient;
+  activeGuide: ProviderGuide;
+  guide: ProviderGuide;
+  setOutcome: SetOutcome;
+  setReplacing: (replacing: boolean) => void;
+}) {
+  const save = useSaveProviderApplication({ queryClient, activeGuide, setOutcome, setReplacing });
+  const connect = useMutation({
+    mutationFn: useServerFn(beginProviderConnection) as (
+      input: Parameters<typeof beginProviderConnection>[0],
+    ) => Promise<ConnectResponse>,
+    onSuccess: (response) => {
+      if (response.status === "error") {
+        setOutcome({ tone: "error", message: response.error.message });
+        return;
+      }
+      window.location.assign(response.data.url);
+    },
+    onError: () => setOutcome({ tone: "error", message: unreachable(guide.name) }),
+  });
+  const retryDelivery = useMutation({
+    mutationFn: useServerFn(retrySlackSocketDelivery) as (input: {}) => Promise<VoidResponse>,
+    onSuccess: async (response) => {
+      if (response.status === "error") {
+        setOutcome({ tone: "error", message: response.error.message });
+        return;
+      }
+      setOutcome({ tone: "success", message: "Slack is reconnecting." });
+      await queryClient.invalidateQueries({ queryKey: ["provider-applications"] });
+    },
+    onError: () => setOutcome({ tone: "error", message: unreachable("Slack") }),
+  });
+  return { save, connect, retryDelivery };
+}
+
+function useSaveProviderApplication({
+  queryClient,
+  activeGuide,
+  setOutcome,
+  setReplacing,
+}: {
+  queryClient: ProviderQueryClient;
+  activeGuide: ProviderGuide;
+  setOutcome: SetOutcome;
+  setReplacing: (replacing: boolean) => void;
+}) {
   const saveProvider = useServerFn(verifyAndSaveProviderApplication) as (
     input: SaveMutationInput,
   ) => Promise<SaveResponse>;
   const saveSocket = useServerFn(configureSlackSocketApplication);
 
-  const save = useMutation({
+  return useMutation({
     mutationFn: (input: SaveMutationInput) => {
       if (input.data.provider !== "slack" || input.data.transport !== "socket") {
         return saveProvider(input);
@@ -142,33 +264,61 @@ export function ProviderSection({
     },
     onError: () => setOutcome({ tone: "error", message: unreachable(activeGuide.name) }),
   });
+}
 
-  const connect = useMutation({
-    mutationFn: useServerFn(beginProviderConnection) as (
-      input: Parameters<typeof beginProviderConnection>[0],
-    ) => Promise<ConnectResponse>,
-    onSuccess: (response) => {
-      if (response.status === "error") {
-        setOutcome({ tone: "error", message: response.error.message });
-        return;
-      }
-      window.location.assign(response.data.url);
+function submitProviderForm(
+  event: SubmitEvent<HTMLFormElement>,
+  {
+    activeGuide,
+    fields,
+    save,
+    surface,
+    configurationVersion,
+    setErrors,
+  }: {
+    activeGuide: ProviderGuide;
+    fields: ReturnType<typeof guideFields>;
+    save: ReturnType<typeof useSaveProviderApplication>;
+    surface: ProviderApplicationSurface;
+    configurationVersion: ProviderApplicationView["configurationVersion"];
+    setErrors: (errors: Readonly<Record<string, string>>) => void;
+  },
+) {
+  event.preventDefault();
+  const form = new FormData(event.currentTarget);
+  const missing: Record<string, string> = {};
+  const values: Record<string, string> = {};
+  for (const field of fields) {
+    const value = form.get(field.name);
+    const text = typeof value === "string" ? value.trim() : "";
+    if (text.length === 0) {
+      if (field.optional !== true) missing[field.name] = field.required;
+      continue;
+    }
+    values[field.name] = field.kind === "text" ? text : rawValue(form, field.name);
+  }
+  setErrors(missing);
+  if (Object.keys(missing).length > 0) return;
+  const expectedVersion =
+    configurationVersion === null || configurationVersion === 0
+      ? {}
+      : { expectedVersion: configurationVersion };
+  save.mutate({
+    data: {
+      provider: activeGuide.provider,
+      ...(activeGuide.transport === undefined ? {} : { transport: activeGuide.transport }),
+      surface,
+      ...expectedVersion,
+      ...values,
     },
-    onError: () => setOutcome({ tone: "error", message: unreachable(guide.name) }),
   });
-  const retryDelivery = useMutation({
-    mutationFn: useServerFn(retrySlackSocketDelivery) as (input: {}) => Promise<VoidResponse>,
-    onSuccess: async (response) => {
-      if (response.status === "error") {
-        setOutcome({ tone: "error", message: response.error.message });
-        return;
-      }
-      setOutcome({ tone: "success", message: "Slack is reconnecting." });
-      await queryClient.invalidateQueries({ queryKey: ["provider-applications"] });
-    },
-    onError: () => setOutcome({ tone: "error", message: unreachable("Slack") }),
-  });
+}
 
+function providerBusy({
+  save,
+  connect,
+  retryDelivery,
+}: ReturnType<typeof useProviderSectionMutations>) {
   const pending = save.isPending || connect.isPending || retryDelivery.isPending;
   // A save that resolved into a redirect keeps the section busy until the browser leaves, so the
   // form cannot be submitted twice in the gap.
@@ -176,68 +326,38 @@ export function ProviderSection({
     (save.isSuccess && save.data.status === "ok" && save.data.data.status === "continuing") ||
     (connect.isSuccess && connect.data.status === "ok");
   const busy = pending || leaving;
+  return { busy, leaving };
+}
 
-  const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
-      event.preventDefault();
-      const form = new FormData(event.currentTarget);
-      const missing: Record<string, string> = {};
-      const values: Record<string, string> = {};
-      for (const field of fields) {
-        const value = form.get(field.name);
-        const text = typeof value === "string" ? value.trim() : "";
-        if (text.length === 0) {
-          if (field.optional !== true) missing[field.name] = field.required;
-          continue;
-        }
-        values[field.name] = field.kind === "text" ? text : rawValue(form, field.name);
-      }
-      setErrors(missing);
-      if (Object.keys(missing).length > 0) return;
-      const expectedVersion =
-        view.configurationVersion === null || view.configurationVersion === 0
-          ? {}
-          : { expectedVersion: view.configurationVersion };
-      save.mutate({
-        data: {
-          provider: activeGuide.provider,
-          ...(activeGuide.transport === undefined ? {} : { transport: activeGuide.transport }),
-          surface,
-          ...expectedVersion,
-          ...values,
-        },
-      });
+function renderProviderSection(
+  props: ProviderSectionProps,
+  state: ProviderSectionState,
+  startConnection: () => void,
+) {
+  const { guide, view, callbackOrigin, open, onOpenChange } = props;
+  const {
+    activeGuide,
+    editing: { replacing },
+    submission: {
+      submit,
+      busy: { busy, leaving },
     },
-    [activeGuide, fields, save, surface, view.configurationVersion],
-  );
-
-  const startConnection = useCallback(() => {
-    connect.mutate({ data: { provider: guide.provider, organizationId, surface } });
-  }, [connect, guide.provider, organizationId, surface]);
-
+  } = state;
   const status = statusPresentation(view.status);
   // Once anything is saved the instructions become reference material and move behind a
   // disclosure, so completed work is never buried under the manual that created it.
   const phase = sectionPhase(activeGuide, view, callbackOrigin, replacing);
 
-  const form =
-    phase === "guiding" || phase === "replacing" ? (
-      <PasteForm
-        id={`${activeGuide.provider}-application-form`}
-        guide={activeGuide}
-        origin={callbackOrigin}
-        errors={errors}
-        view={view}
-        busy={busy}
-        replacing={replacing}
-        pendingLabel={save.isPending || leaving ? guide.actions.savePending : undefined}
-        onSubmit={submit}
-        onCancel={() => {
-          setReplacing(false);
-          requestAnimationFrame(() => replace.current?.focus());
-        }}
-      />
-    ) : null;
+  const form = renderProviderPasteForm({
+    guide,
+    view,
+    callbackOrigin,
+    state,
+    phase,
+    busy,
+    leaving,
+    submit,
+  });
 
   return (
     <Disclosure
@@ -249,36 +369,110 @@ export function ProviderSection({
       description={guide.summary}
       status={<StatusPill tone={status.tone}>{status.label}</StatusPill>}
     >
-      <div className="grid gap-5">
-        {view.managedByEnvironment ? <EnvironmentNotice guide={activeGuide} /> : null}
-        {/* One node for the whole life of the section. A save moves the section from setup to
-            saved, and focus that had just landed on a node the phase change unmounts is focus
-            dropped on the floor. */}
-        <ResultRegion ref={result} guide={activeGuide} outcome={outcome} />
-        {guide.provider === "slack" &&
-        (phase === "guiding" || phase === "replacing" || phase === "blocked") ? (
-          <SlackTransportChoice value={slackTransport} onChange={setSlackTransport} />
-        ) : null}
-        <SectionBody
-          guide={activeGuide}
-          view={view}
-          origin={callbackOrigin}
-          phase={phase}
-          form={form}
-          busy={busy}
-          connecting={connect.isPending || leaving}
-          replaceRef={replace}
-          onConnect={startConnection}
-          onRetry={() => retryDelivery.mutate({})}
-          onReplace={() => {
-            setErrors({});
-            setOutcome(undefined);
-            setReplacing(true);
-          }}
-        />
-      </div>
+      {renderProviderContent({ props, state, phase, form, startConnection })}
     </Disclosure>
   );
+}
+
+function renderProviderContent({
+  props: { guide, view, callbackOrigin },
+  state: { activeGuide, editing, submission },
+  phase,
+  form,
+  startConnection,
+}: {
+  props: ProviderSectionProps;
+  state: ProviderSectionState;
+  phase: SectionPhase;
+  form: ReactNode;
+  startConnection: () => void;
+}) {
+  const {
+    slackTransport,
+    setSlackTransport,
+    setReplacing,
+    setErrors,
+    outcome,
+    setOutcome,
+    result,
+    replace,
+  } = editing;
+  const {
+    mutations: { connect, retryDelivery },
+    busy: { busy, leaving },
+  } = submission;
+  return (
+    <div className="grid gap-5">
+      {view.managedByEnvironment ? <EnvironmentNotice guide={activeGuide} /> : null}
+      {/* One node for the whole life of the section. A save moves the section from setup to
+          saved, and focus that had just landed on a node the phase change unmounts is focus
+          dropped on the floor. */}
+      <ResultRegion ref={result} guide={activeGuide} outcome={outcome} />
+      {guide.provider === "slack" &&
+      (phase === "guiding" || phase === "replacing" || phase === "blocked") ? (
+        <SlackTransportChoice value={slackTransport} onChange={setSlackTransport} />
+      ) : null}
+      <SectionBody
+        guide={activeGuide}
+        view={view}
+        origin={callbackOrigin}
+        phase={phase}
+        form={form}
+        busy={busy}
+        connecting={connect.isPending || leaving}
+        replaceRef={replace}
+        onConnect={startConnection}
+        onRetry={() => retryDelivery.mutate({})}
+        onReplace={() => {
+          setErrors({});
+          setOutcome(undefined);
+          setReplacing(true);
+        }}
+      />
+    </div>
+  );
+}
+
+function renderProviderPasteForm({
+  guide,
+  view,
+  callbackOrigin,
+  state,
+  phase,
+  busy,
+  leaving,
+  submit,
+}: Pick<ProviderSectionProps, "guide" | "view" | "callbackOrigin"> & {
+  state: ProviderSectionState;
+  phase: SectionPhase;
+  busy: boolean;
+  leaving: boolean;
+  submit: SubmitProviderForm;
+}) {
+  const {
+    activeGuide,
+    editing: { errors, replacing, setReplacing, replace },
+    submission: {
+      mutations: { save },
+    },
+  } = state;
+  return phase === "guiding" || phase === "replacing" ? (
+    <PasteForm
+      id={`${activeGuide.provider}-application-form`}
+      guide={activeGuide}
+      origin={callbackOrigin}
+      errors={errors}
+      view={view}
+      busy={busy}
+      replacing={replacing}
+      pendingLabel={save.isPending || leaving ? guide.actions.savePending : undefined}
+      onSubmit={submit}
+      onCancel={() => {
+        setReplacing(false);
+        requestAnimationFrame(() => replace.current?.focus());
+      }}
+    />
+  ) : null;
 }
 
 /**
@@ -337,19 +531,7 @@ function sectionPhase(
   return view.status === "notConfigured" ? "guiding" : "saved";
 }
 
-function SectionBody({
-  guide,
-  view,
-  origin,
-  phase,
-  form,
-  busy,
-  connecting,
-  replaceRef,
-  onConnect,
-  onRetry,
-  onReplace,
-}: {
+interface SectionBodyProps {
   guide: ProviderGuide;
   view: ProviderApplicationView;
   origin: string;
@@ -361,7 +543,10 @@ function SectionBody({
   onConnect: () => void;
   onRetry: () => void;
   onReplace: () => void;
-}) {
+}
+
+function SectionBody(props: SectionBodyProps) {
+  const { guide, origin, phase, form } = props;
   if (phase === "blocked") return <HttpsGate guide={guide} origin={origin} />;
   if (phase === "guiding") {
     // The task layout. Instructions read down one column while the values they produce land in a
@@ -378,40 +563,56 @@ function SectionBody({
       {phase === "replacing" ? (
         <div className="lg:max-w-md">{form}</div>
       ) : (
-        <>
-          <SummaryPanel label={`${guide.name} app`} rows={summaryRows(guide, view, origin)} />
-          {/* `FormActions` puts the last child on the right, so the filled connect button is last. */}
-          <FormActions>
-            {view.managedByEnvironment ? null : (
-              <Button
-                ref={replaceRef}
-                type="button"
-                variant="outline"
-                disabled={busy}
-                onClick={onReplace}
-              >
-                Replace credentials
-              </Button>
-            )}
-            {guide.provider === "slack" &&
-            view.identifiers["transport"] === "socket" &&
-            view.deliveryStatus?.state === "actionNeeded" ? (
-              <Button type="button" variant="outline" disabled={busy} onClick={onRetry}>
-                Retry
-              </Button>
-            ) : null}
-            <ConnectAction
-              guide={guide}
-              view={view}
-              busy={busy}
-              pending={connecting}
-              onConnect={onConnect}
-            />
-          </FormActions>
-        </>
+        renderSavedProvider(props)
       )}
       <SetupSteps guide={guide} origin={origin} />
     </div>
+  );
+}
+
+function renderSavedProvider({
+  guide,
+  view,
+  origin,
+  busy,
+  connecting,
+  replaceRef,
+  onConnect,
+  onRetry,
+  onReplace,
+}: Omit<SectionBodyProps, "phase" | "form">) {
+  return (
+    <>
+      <SummaryPanel label={`${guide.name} app`} rows={summaryRows(guide, view, origin)} />
+      {/* `FormActions` puts the last child on the right, so the filled connect button is last. */}
+      <FormActions>
+        {view.managedByEnvironment ? null : (
+          <Button
+            ref={replaceRef}
+            type="button"
+            variant="outline"
+            disabled={busy}
+            onClick={onReplace}
+          >
+            Replace credentials
+          </Button>
+        )}
+        {guide.provider === "slack" &&
+        view.identifiers["transport"] === "socket" &&
+        view.deliveryStatus?.state === "actionNeeded" ? (
+          <Button type="button" variant="outline" disabled={busy} onClick={onRetry}>
+            Retry
+          </Button>
+        ) : null}
+        <ConnectAction
+          guide={guide}
+          view={view}
+          busy={busy}
+          pending={connecting}
+          onConnect={onConnect}
+        />
+      </FormActions>
+    </>
   );
 }
 
@@ -447,19 +648,7 @@ function summaryRows(
   origin: string,
 ): readonly SummaryRow[] {
   const rows: SummaryRow[] = [];
-  const identity = view.identity;
-  if (identity !== null) {
-    // Slack's OAuth response carries no app name, only the App ID, so that is what is shown —
-    // rather than a placeholder dressed up as one.
-    const value = identity.provider === "slack" ? identity.id : identity.name;
-    rows.push({ label: guide.summaryLabels.identity, value });
-    if (guide.summaryLabels.owner !== undefined && identity.provider === "github") {
-      rows.push({ label: guide.summaryLabels.owner, value: identity.ownerLogin });
-    }
-    if (identity.provider === "discord") {
-      rows.push({ label: "Application ID", value: identity.id });
-    }
-  }
+  addIdentityRows(rows, guide, view.identity);
   if (guide.provider === "slack") {
     rows.push({
       label: "Delivery",
@@ -486,13 +675,41 @@ function summaryRows(
   });
   if (guide.receivesEvents) rows.push({ label: "Events", value: eventState(guide, view, origin) });
   if (view.managedByEnvironment) {
-    for (const field of guideFields(guide, origin)) {
-      if (field.identifier === undefined) continue;
-      const value = view.identifiers[field.identifier];
-      if (value !== undefined) rows.push({ label: field.label, value });
-    }
+    addEnvironmentRows(rows, guide, view, origin);
   }
   return rows;
+}
+
+function addIdentityRows(
+  rows: SummaryRow[],
+  guide: ProviderGuide,
+  identity: ProviderApplicationView["identity"],
+) {
+  if (identity !== null) {
+    // Slack's OAuth response carries no app name, only the App ID, so that is what is shown —
+    // rather than a placeholder dressed up as one.
+    const value = identity.provider === "slack" ? identity.id : identity.name;
+    rows.push({ label: guide.summaryLabels.identity, value });
+    if (guide.summaryLabels.owner !== undefined && identity.provider === "github") {
+      rows.push({ label: guide.summaryLabels.owner, value: identity.ownerLogin });
+    }
+    if (identity.provider === "discord") {
+      rows.push({ label: "Application ID", value: identity.id });
+    }
+  }
+}
+
+function addEnvironmentRows(
+  rows: SummaryRow[],
+  guide: ProviderGuide,
+  view: ProviderApplicationView,
+  origin: string,
+) {
+  for (const field of guideFields(guide, origin)) {
+    if (field.identifier === undefined) continue;
+    const value = view.identifiers[field.identifier];
+    if (value !== undefined) rows.push({ label: field.label, value });
+  }
 }
 
 /** Says only what the boundary can prove: a signed delivery arrived, or nothing has yet. */
@@ -539,18 +756,7 @@ function slackSocketEventState(
  * its own actions, and its own border, so on a wide screen it reads as the second half of a
  * two-part task rather than as loose inputs floating under the instructions.
  */
-function PasteForm({
-  id,
-  guide,
-  origin,
-  errors,
-  view,
-  busy,
-  replacing,
-  pendingLabel,
-  onSubmit,
-  onCancel,
-}: {
+interface PasteFormProps {
   id: string;
   guide: ProviderGuide;
   origin: string;
@@ -559,9 +765,13 @@ function PasteForm({
   busy: boolean;
   replacing: boolean;
   pendingLabel: string | undefined;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (event: SubmitEvent<HTMLFormElement>) => void;
   onCancel: () => void;
-}) {
+}
+
+function PasteForm(props: PasteFormProps) {
+  const { id, guide, origin, errors, view, busy } = props;
+  const { replacing, pendingLabel, onSubmit, onCancel } = props;
   const groups = guideGroups(guide, origin).filter((group) => group.fields.length > 0);
   return (
     <Card
@@ -581,29 +791,9 @@ function PasteForm({
         onSubmit={onSubmit}
         className="grid gap-4"
       >
-        {groups.map((group, index) => (
-          <FieldSet key={group.id} className="gap-4" disabled={busy}>
-            {group.title === undefined || index === 0 ? null : (
-              <p className="border-t pt-4 text-sm text-muted-foreground">
-                {group.title} — optional
-              </p>
-            )}
-            {group.fields.map((field) => (
-              <FormField
-                key={field.name}
-                id={`${guide.provider}-${field.name}`}
-                name={field.name}
-                label={field.label}
-                kind={field.kind}
-                {...(field.description === undefined ? {} : { description: field.description })}
-                {...(errors[field.name] === undefined ? {} : { error: errors[field.name] })}
-                {...storedDefault(
-                  field.identifier === undefined ? undefined : view.identifiers[field.identifier],
-                )}
-              />
-            ))}
-          </FieldSet>
-        ))}
+        {groups.map((group, index) =>
+          renderPasteGroup(group, index, { guide, view, errors, busy }),
+        )}
         <FormActions>
           {replacing ? (
             <Button type="button" variant="outline" disabled={busy} onClick={onCancel}>
@@ -619,6 +809,44 @@ function PasteForm({
         )}
       </form>
     </Card>
+  );
+}
+
+function renderPasteGroup(
+  group: GuideGroup,
+  index: number,
+  {
+    guide,
+    view,
+    errors,
+    busy,
+  }: {
+    guide: ProviderGuide;
+    view: ProviderApplicationView;
+    errors: Readonly<Record<string, string>>;
+    busy: boolean;
+  },
+) {
+  return (
+    <FieldSet key={group.id} className="gap-4" disabled={busy}>
+      {group.title === undefined || index === 0 ? null : (
+        <p className="border-t pt-4 text-sm text-muted-foreground">{group.title} — optional</p>
+      )}
+      {group.fields.map((field) => (
+        <FormField
+          key={field.name}
+          id={`${guide.provider}-${field.name}`}
+          name={field.name}
+          label={field.label}
+          kind={field.kind}
+          {...(field.description === undefined ? {} : { description: field.description })}
+          {...(errors[field.name] === undefined ? {} : { error: errors[field.name] })}
+          {...storedDefault(
+            field.identifier === undefined ? undefined : view.identifiers[field.identifier],
+          )}
+        />
+      ))}
+    </FieldSet>
   );
 }
 
@@ -822,38 +1050,44 @@ function StepBody({
       </span>
       {/* One offset from the sentence, then gap between whatever the step attaches to itself. A
           list item cannot be a grid without losing its number, so the grid is this wrapper. */}
-      {attachments ? (
-        <div className="mt-3 grid gap-3">
-          {step.permissions === undefined ? null : (
-            <SummaryPanel
-              label={`${guide.name} permissions`}
-              rows={permissionRows(step.permissions)}
-            />
-          )}
-          {step.events === undefined ? null : (
-            <ul className="flex flex-wrap gap-1.5">
-              {step.events.map((event) => (
-                <li key={event}>
-                  <StatusPill tone="neutral" dot={false}>
-                    {event}
-                  </StatusPill>
-                </li>
-              ))}
-            </ul>
-          )}
-          {urls.map((url) => (
-            <CopyField key={url.key} label={url.label} value={guideUrl(origin, url.path)} />
-          ))}
-          {step.manifest === true ? (
-            <CopyBlock
-              label="App manifest"
-              value={slackManifest(origin, guide.transport ?? "socket")}
-              action="Copy manifest"
-            />
-          ) : null}
-        </div>
-      ) : null}
+      {attachments ? renderStepAttachments(guide, step, origin, urls) : null}
     </>
+  );
+}
+
+function renderStepAttachments(
+  guide: ProviderGuide,
+  step: GuideStep,
+  origin: string,
+  urls: ProviderGuide["urls"],
+) {
+  return (
+    <div className="mt-3 grid gap-3">
+      {step.permissions === undefined ? null : (
+        <SummaryPanel label={`${guide.name} permissions`} rows={permissionRows(step.permissions)} />
+      )}
+      {step.events === undefined ? null : (
+        <ul className="flex flex-wrap gap-1.5">
+          {step.events.map((event) => (
+            <li key={event}>
+              <StatusPill tone="neutral" dot={false}>
+                {event}
+              </StatusPill>
+            </li>
+          ))}
+        </ul>
+      )}
+      {urls.map((url) => (
+        <CopyField key={url.key} label={url.label} value={guideUrl(origin, url.path)} />
+      ))}
+      {step.manifest === true ? (
+        <CopyBlock
+          label="App manifest"
+          value={slackManifest(origin, guide.transport ?? "socket")}
+          action="Copy manifest"
+        />
+      ) : null}
+    </div>
   );
 }
 
