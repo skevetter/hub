@@ -38,7 +38,11 @@ export async function clonedPostgresDatabase(postgres: StartedPostgreSqlContaine
 function migratedTemplate(postgres: StartedPostgreSqlContainer): Promise<string> {
   const existing = migratedTemplates.get(postgres);
   if (existing !== undefined) return existing;
-  const created = createMigratedTemplate(postgres.getConnectionUri());
+  const created = createMigratedTemplate(postgres.getConnectionUri()).catch((error: unknown) => {
+    // A transient setup failure fails one test; the next test retries instead of reusing it.
+    migratedTemplates.delete(postgres);
+    throw error;
+  });
   migratedTemplates.set(postgres, created);
   return created;
 }
