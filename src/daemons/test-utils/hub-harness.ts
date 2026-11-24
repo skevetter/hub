@@ -273,15 +273,18 @@ export class HubHarness {
 
   static async startupFailureRollsBack(): Promise<boolean> {
     const harness = new HubHarness();
+    const interrupted = new Error("startup interrupted");
     try {
       harness.postgres = await startDaemonTestPostgres();
       harness.database = await createDatabase(
         harness.postgres.getConnectionUri(),
         HARNESS_POOL_OPTIONS,
       );
-      throw new Error("startup interrupted");
-    } catch {
+      throw interrupted;
+    } catch (error) {
       await harness.stop();
+      // A setup failure leaves nothing to roll back, so it must not count as a passing rollback.
+      if (error !== interrupted) throw error;
       return harness.postgres === undefined && harness.database === undefined;
     }
   }
