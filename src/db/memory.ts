@@ -4150,7 +4150,7 @@ class MemoryDatabase implements Database {
     now: Date,
     leaseMs: number,
   ): Promise<boolean> {
-    const run = this.ownedTerminalNotification(triggerRunId, generation, now);
+    const run = this.fencedTerminalNotification(triggerRunId, generation);
     if (run === undefined) return false;
     this.triggerRuns.set(run.id, {
       ...run,
@@ -4160,13 +4160,21 @@ class MemoryDatabase implements Database {
   }
 
   private ownedTerminalNotification(triggerRunId: string, generation: number, now: Date) {
+    const run = this.fencedTerminalNotification(triggerRunId, generation);
+    return run?.terminalNotificationLeaseExpiresAt != null &&
+      run.terminalNotificationLeaseExpiresAt > now
+      ? run
+      : undefined;
+  }
+
+  // Renewal fences on the claim generation alone: a lapsed lease nobody re-claimed is still ours.
+  private fencedTerminalNotification(triggerRunId: string, generation: number) {
     const run = this.triggerRuns.get(triggerRunId);
     return run?.outcome === "accepted" &&
       run.payloadExpiryState == null &&
       run.terminalNotificationGeneration === generation &&
       run.terminalNotificationDeliveredAt === null &&
-      run.terminalNotificationLeaseExpiresAt !== null &&
-      run.terminalNotificationLeaseExpiresAt > now
+      run.terminalNotificationLeaseExpiresAt !== null
       ? run
       : undefined;
   }
