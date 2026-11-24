@@ -151,12 +151,30 @@ interface InstallProviderDispatchFixtureCommand {
 // webhook payloads with — see WEBHOOK_SECRET there and GITHUB_WEBHOOK_SECRET for precedent.
 const FIXTURE_STRIPE_SECRET_KEY = "sk_test_e2e_fixture_0000000000000000000000";
 
+interface BrowserBootOptions {
+  publicBaseUrl: string;
+  scenario: BrowserProviderScenario;
+}
+
+type BrowserDatabase = Awaited<ReturnType<typeof createBrowserDatabase>>;
+type BrowserEntitlements = ReturnType<typeof composeEntitlements>;
+type BrowserRuntime = Awaited<ReturnType<typeof createApplicationRuntime>>;
+type BrowserProviderFixtures = Omit<
+  StaticProviderOptions,
+  "auth" | "database" | "publicBaseUrl" | "scenario"
+> & {
+  slackSocket: BrowserSlackSocketFixture;
+};
+
 async function main(): Promise<void> {
-  const publicBaseUrl =
-    process.env["PASEO_HUB_APP_URL"] ?? `http://127.0.0.1:${requiredEnvironment("PORT")}`;
-  const scenario = readScenario();
+  const options = {
+    publicBaseUrl:
+      process.env["PASEO_HUB_APP_URL"] ?? `http://127.0.0.1:${requiredEnvironment("PORT")}`,
+    scenario: readScenario(),
+  };
   const databaseProfile = requiredEnvironment("PASEO_E2E_DATABASE_PROFILE");
-  const { database, runtime: databaseRuntime, locks } = await createBrowserDatabase();
+  const browserDatabase = await createBrowserDatabase();
+  const { database, runtime: databaseRuntime } = browserDatabase;
   if (databaseProfile === "legacy") await seedLegacyMachineAuthTarget(databaseRuntime);
   const entitlements = composeEntitlements(database, databaseRuntime);
   // Compose (and sync) billing before auth: a billing-configured harness provisions new
@@ -167,6 +185,48 @@ async function main(): Promise<void> {
     billingCatalog,
     billingClient: billingFixtureClient,
   } = await composeFixtureBilling(database, entitlements.seatUsage);
+  const { auth, accountSetupFaults, accountEmails } = await createBrowserAuth({
+    browserDatabase,
+    entitlements,
+    billing,
+    publicBaseUrl: options.publicBaseUrl,
+  });
+  await writeMachineKey(auth, databaseProfile, databaseRuntime);
+  const providerFixtures = await createBrowserProviderFixtures(options.scenario);
+  const runtime = await startBrowserRuntime({
+    ...options,
+    browserDatabase,
+    entitlements,
+    auth,
+    billing,
+    providerFixtures,
+  });
+  const failNextProjectRead = installProjectReadFault(runtime);
+  const server = await listenForBrowserRequests(runtime, options.publicBaseUrl);
+  listenForBrowserCommands(server, runtime, {
+    ...providerFixtures,
+    database,
+    databaseRuntime,
+    billingCatalog,
+    billingClient: billingFixtureClient,
+    accountSetupFaults,
+    accountEmails,
+    failNextProjectRead,
+  });
+}
+
+async function createBrowserAuth({
+  browserDatabase,
+  entitlements,
+  billing,
+  publicBaseUrl,
+}: {
+  browserDatabase: BrowserDatabase;
+  entitlements: BrowserEntitlements;
+  billing: BillingRuntime | null;
+  publicBaseUrl: string;
+}) {
+  const { runtime: databaseRuntime, locks } = browserDatabase;
   const authSecret = requiredEnvironment("PASEO_HUB_AUTH_SECRET");
   const accountSetupFaults = new BrowserAccountSetupFaults();
   const accountEmails = new BrowserAccountEmails();
@@ -185,6 +245,14 @@ async function main(): Promise<void> {
       )
     : null;
   await auth?.initialize?.();
+  return { auth, accountSetupFaults, accountEmails };
+}
+
+async function writeMachineKey(
+  auth: AuthServer | null,
+  databaseProfile: string,
+  databaseRuntime: DatabaseRuntime,
+): Promise<void> {
   const machineAuth = machineAuthEnabled();
   await seedMachineAuthTargetIfRequired(auth, machineAuth, databaseProfile, databaseRuntime);
   const machineKey =
@@ -200,95 +268,149 @@ async function main(): Promise<void> {
     machineKey?.secret ?? "",
     "utf8",
   );
+}
+
+async function createBrowserProviderFixtures(
+  scenario: BrowserProviderScenario,
+): Promise<BrowserProviderFixtures> {
   const bot = new BrowserDiscordBot(scenario);
   const slackBot = new BrowserSlackBot();
   const slackSocket = new BrowserSlackSocketFixture(scenario);
   await slackSocket.start();
   const githubConfiguration = new BrowserGitHubConfiguration();
+  return { bot, slackBot, slackSocket, githubConfiguration };
+}
+
+interface StaticProviderOptions extends BrowserBootOptions {
+  auth: AuthServer;
+  database: Database;
+  bot: BrowserDiscordBot;
+  slackBot: BrowserSlackBot;
+  githubConfiguration: BrowserGitHubConfiguration;
+}
+
+function staticRegistrations(input: StaticProviderOptions): ProviderRegistration[] {
+  const { database, auth, publicBaseUrl, scenario, bot, slackBot } = input;
+  return [
+    browserGitHubRegistration(input),
+    createDiscordRegistration({
+      database,
+      auth,
+      applicationBaseUrl: publicBaseUrl,
+      publicBaseUrl,
+      configuration:
+        scenario === "not-configured" || scenario === "slack-only"
+          ? null
+          : {
+              botToken: "token",
+              clientId: "900",
+              clientSecret: "secret",
+            },
+      bot,
+      ...(scenario === "not-configured"
+        ? {}
+        : { connectionClient: new BrowserDiscordConnections(publicBaseUrl, scenario) }),
+    }),
+    browserSlackRegistration({ database, auth, publicBaseUrl, scenario, slackBot }),
+    createLinearRegistration({
+      database,
+      auth,
+      applicationBaseUrl: publicBaseUrl,
+      publicBaseUrl,
+      configuration: null,
+    }),
+  ];
+}
+
+function browserGitHubRegistration({
+  database,
+  auth,
+  publicBaseUrl,
+  scenario,
+  githubConfiguration,
+}: StaticProviderOptions): ProviderRegistration {
   const githubConfigured = hasBrowserGitHub(scenario);
+  return createGitHubRegistration({
+    database,
+    auth,
+    applicationBaseUrl: publicBaseUrl,
+    publicBaseUrl,
+    configuration: githubConfigured
+      ? {
+          appId: "42",
+          appSlug: "paseo",
+          clientId: "client",
+          clientSecret: "secret",
+          webhookSecret: requiredEnvironment("GITHUB_WEBHOOK_SECRET"),
+          privateKey: "fixture-private-key",
+        }
+      : null,
+    ...(githubConfigured
+      ? {
+          appAuth: new BrowserGitHubAuth(),
+          connectionClient: new BrowserGitHubConnections(publicBaseUrl, scenario),
+          configurationProvider: githubConfiguration,
+          reactionClient: new BrowserGitHubReactions(),
+        }
+      : {}),
+  });
+}
+
+function browserSlackRegistration({
+  database,
+  auth,
+  publicBaseUrl,
+  scenario,
+  slackBot,
+}: Omit<StaticProviderOptions, "bot" | "githubConfiguration">): ProviderRegistration {
   const slackConfigured = scenario === "slack-only";
+  return createSlackRegistration({
+    database,
+    auth,
+    applicationBaseUrl: publicBaseUrl,
+    publicBaseUrl,
+    configuration: slackConfigured
+      ? {
+          transport: "webhook",
+          appId: "browser-slack-app",
+          clientId: "browser-slack-client",
+          clientSecret: "browser-slack-client-secret",
+          signingSecret: requiredEnvironment("PASEO_E2E_SLACK_SIGNING_SECRET"),
+        }
+      : null,
+    ...(slackConfigured ? { botClient: slackBot } : {}),
+  });
+}
+
+async function startBrowserRuntime({
+  browserDatabase,
+  entitlements,
+  auth,
+  billing,
+  providerFixtures,
+  publicBaseUrl,
+  scenario,
+}: BrowserBootOptions & {
+  browserDatabase: BrowserDatabase;
+  entitlements: BrowserEntitlements;
+  auth: AuthServer | null;
+  billing: BillingRuntime | null;
+  providerFixtures: BrowserProviderFixtures;
+}): Promise<BrowserRuntime> {
+  const { database, runtime: databaseRuntime, locks } = browserDatabase;
   const registrations =
     auth === null
       ? []
-      : [
-          createGitHubRegistration({
-            database,
-            auth,
-            applicationBaseUrl: publicBaseUrl,
-            publicBaseUrl,
-            configuration: githubConfigured
-              ? {
-                  appId: "42",
-                  appSlug: "paseo",
-                  clientId: "client",
-                  clientSecret: "secret",
-                  webhookSecret: requiredEnvironment("GITHUB_WEBHOOK_SECRET"),
-                  privateKey: "fixture-private-key",
-                }
-              : null,
-            ...(githubConfigured
-              ? {
-                  appAuth: new BrowserGitHubAuth(),
-                  connectionClient: new BrowserGitHubConnections(publicBaseUrl, scenario),
-                  configurationProvider: githubConfiguration,
-                  reactionClient: new BrowserGitHubReactions(),
-                }
-              : {}),
-          }),
-          createDiscordRegistration({
-            database,
-            auth,
-            applicationBaseUrl: publicBaseUrl,
-            publicBaseUrl,
-            configuration:
-              scenario === "not-configured" || scenario === "slack-only"
-                ? null
-                : {
-                    botToken: "token",
-                    clientId: "900",
-                    clientSecret: "secret",
-                  },
-            bot,
-            ...(scenario === "not-configured"
-              ? {}
-              : { connectionClient: new BrowserDiscordConnections(publicBaseUrl, scenario) }),
-          }),
-          createSlackRegistration({
-            database,
-            auth,
-            applicationBaseUrl: publicBaseUrl,
-            publicBaseUrl,
-            configuration: slackConfigured
-              ? {
-                  transport: "webhook",
-                  appId: "browser-slack-app",
-                  clientId: "browser-slack-client",
-                  clientSecret: "browser-slack-client-secret",
-                  signingSecret: requiredEnvironment("PASEO_E2E_SLACK_SIGNING_SECRET"),
-                }
-              : null,
-            ...(slackConfigured ? { botClient: slackBot } : {}),
-          }),
-          createLinearRegistration({
-            database,
-            auth,
-            applicationBaseUrl: publicBaseUrl,
-            publicBaseUrl,
-            configuration: null,
-          }),
-        ];
+      : staticRegistrations({ database, auth, publicBaseUrl, scenario, ...providerFixtures });
   const providers = await providerRuntimeOptions(auth, registrations, {
     database,
     databaseRuntime,
     locks,
     publicBaseUrl,
     scenario,
-    bot,
-    slackBot,
-    slackSocket,
-    githubConfiguration,
+    ...providerFixtures,
   });
-  const runtime = await createApplicationRuntime({
+  return createApplicationRuntime({
     database,
     auth,
     entitlements: entitlements.service,
@@ -301,10 +423,13 @@ async function main(): Promise<void> {
     async close() {
       await auth?.close();
       await entitlements.close();
-      await slackSocket.close();
+      await providerFixtures.slackSocket.close();
       await database.close();
     },
   });
+}
+
+function installProjectReadFault(runtime: BrowserRuntime): () => void {
   let failNextProjectRead = false;
   const projectDashboard = runtime.projectDashboard;
   if (projectDashboard !== null) {
@@ -317,6 +442,12 @@ async function main(): Promise<void> {
       return readProjectSnapshot(...args);
     };
   }
+  return () => {
+    failNextProjectRead = true;
+  };
+}
+
+async function listenForBrowserRequests(runtime: BrowserRuntime, publicBaseUrl: string) {
   const start = await loadBuiltStartServer();
   await start.startApplication(() => runtime);
   const server = createFetchServer(
@@ -333,22 +464,16 @@ async function main(): Promise<void> {
     server.once("error", reject);
     server.listen(Number(requiredEnvironment("PORT")), "127.0.0.1", resolve);
   });
+  return server;
+}
 
+function listenForBrowserCommands(
+  server: ReturnType<typeof createFetchServer>,
+  runtime: BrowserRuntime,
+  fixtures: CommandFixtures,
+): void {
   process.on("message", (message: unknown) => {
-    void acceptCommand(message, {
-      bot,
-      slackSocket,
-      database,
-      databaseRuntime,
-      githubConfiguration,
-      billingCatalog,
-      billingClient: billingFixtureClient,
-      accountSetupFaults,
-      accountEmails,
-      failNextProjectRead: () => {
-        failNextProjectRead = true;
-      },
-    });
+    void acceptCommand(message, fixtures);
   });
   const stop = () => void shutdown(server, () => runtime.stop());
   process.once("SIGTERM", stop);
@@ -529,18 +654,7 @@ interface CommandFixtures {
 }
 
 async function acceptCommand(message: unknown, fixtures: CommandFixtures): Promise<void> {
-  const { bot, githubConfiguration, billingCatalog, billingClient } = fixtures;
-  if (isGitHubConfigurationCommand(message)) {
-    githubConfiguration.setRevision(message);
-    process.send?.({ id: message.id, ok: true });
-    return;
-  }
-  if (acceptAccountFixtureCommand(message, fixtures)) return;
-  if (isProjectReadFailureCommand(message)) {
-    fixtures.failNextProjectRead();
-    process.send?.({ id: message.id, ok: true });
-    return;
-  }
+  if (acceptFixtureControlCommand(message, fixtures)) return;
   if (isDaemonEnrollmentCommand(message)) {
     await acceptDaemonEnrollmentCommand(message, fixtures);
     return;
@@ -553,6 +667,28 @@ async function acceptCommand(message: unknown, fixtures: CommandFixtures): Promi
     await acceptDatabaseQueryCommand(message, fixtures.databaseRuntime);
     return;
   }
+  await acceptDispatchFixtureCommand(message, fixtures);
+}
+
+function acceptFixtureControlCommand(message: unknown, fixtures: CommandFixtures): boolean {
+  if (isGitHubConfigurationCommand(message)) {
+    fixtures.githubConfiguration.setRevision(message);
+    process.send?.({ id: message.id, ok: true });
+    return true;
+  }
+  if (acceptAccountFixtureCommand(message, fixtures)) return true;
+  if (isProjectReadFailureCommand(message)) {
+    fixtures.failNextProjectRead();
+    process.send?.({ id: message.id, ok: true });
+    return true;
+  }
+  return false;
+}
+
+async function acceptDispatchFixtureCommand(
+  message: unknown,
+  fixtures: CommandFixtures,
+): Promise<void> {
   if (isInstallUnroutedSlackFixtureCommand(message)) {
     await acceptInstallUnroutedSlackFixture(message, fixtures.database);
     return;
@@ -565,8 +701,12 @@ async function acceptCommand(message: unknown, fixtures: CommandFixtures): Promi
     );
     return;
   }
-  if (acceptBillingCommand(message, billingCatalog, billingClient)) return;
+  if (acceptBillingCommand(message, fixtures)) return;
   if (!isDiscordCommand(message)) return;
+  await deliverDiscordCommand(message, fixtures.bot);
+}
+
+async function deliverDiscordCommand(message: DiscordCommand, bot: BrowserDiscordBot) {
   try {
     await bot.deliver(message.event);
     process.send?.({ id: message.id, ok: true });
@@ -622,60 +762,79 @@ async function acceptInstallProviderDispatchFixture(
   runtime: DatabaseRuntime,
 ): Promise<void> {
   try {
-    const project = await database.findProjectBySlugForOrganization(
-      message.organizationId,
-      "default",
-    );
-    if (project === undefined) throw new Error("default project unavailable");
-    const daemon = await database.findDaemonBySlugForOrganization(
-      message.organizationId,
-      "shared-dispatch",
-    );
-    if (daemon === undefined) throw new Error("dispatch daemon unavailable");
-    const [owner] = (
-      await runtime.query<{ user_id: string }>(
-        `select user_id from member
-       where organization_id = $1 and role = 'owner'
-       order by id limit 1`,
-        [message.organizationId],
-      )
-    ).rows;
-    if (owner === undefined) throw new Error("organization owner unavailable");
-    const repository = await database.findGitHubRepositoryForOrganization(
-      message.organizationId,
-      message.repository,
-    );
-    if (repository === undefined) throw new Error("GitHub repository unavailable");
-    const github = (await database.organizationConnectionUsage(message.organizationId)).github.find(
-      (connection) => connection.id === repository.connectionId,
-    );
-    if (github === undefined || github.organizationId !== message.organizationId) {
-      throw new Error("GitHub connection unavailable");
-    }
-    await database.setProjectGitHubConfigurationSource({
-      projectId: project.id,
-      githubConnectionId: github.id,
-      githubRepositoryId: repository.repositoryId,
-      githubRepositoryFullName: message.repository,
-      githubDefaultBranch: "main",
-      automaticDeploymentEnabled: true,
-      userId: owner.user_id,
+    const { projectId, userId } = await providerDispatchTarget(message.organizationId, {
+      database,
+      runtime,
     });
+    await setProviderDispatchConfigurationSource({ database, message, projectId, userId });
     const discord = await database.findDiscordConnection(message.guildId);
     if (discord === undefined || discord.organizationId !== message.organizationId) {
       throw new Error("Discord connection unavailable");
     }
-    const store = new ProjectConfigurationStore(database, project.id);
+    const store = new ProjectConfigurationStore(database, projectId);
     const revision = await store.insertManualBundleRevision({
       files: message.files,
-      userId: owner.user_id,
-      sourceEvidence: { kind: "browser-fixture", userId: owner.user_id },
+      userId,
+      sourceEvidence: { kind: "browser-fixture", userId },
     });
     await store.activate(revision.id);
     process.send?.({ id: message.id, ok: true });
   } catch (error) {
     sendCommandError(message.id, error);
   }
+}
+
+async function providerDispatchTarget(
+  organizationId: string,
+  { database, runtime }: { database: Database; runtime: DatabaseRuntime },
+) {
+  const project = await database.findProjectBySlugForOrganization(organizationId, "default");
+  if (project === undefined) throw new Error("default project unavailable");
+  const daemon = await database.findDaemonBySlugForOrganization(organizationId, "shared-dispatch");
+  if (daemon === undefined) throw new Error("dispatch daemon unavailable");
+  const [owner] = (
+    await runtime.query<{ user_id: string }>(
+      `select user_id from member
+       where organization_id = $1 and role = 'owner'
+       order by id limit 1`,
+      [organizationId],
+    )
+  ).rows;
+  if (owner === undefined) throw new Error("organization owner unavailable");
+  return { projectId: project.id, userId: owner.user_id };
+}
+
+async function setProviderDispatchConfigurationSource({
+  database,
+  message,
+  projectId,
+  userId,
+}: {
+  database: Database;
+  message: InstallProviderDispatchFixtureCommand;
+  projectId: string;
+  userId: string;
+}): Promise<void> {
+  const repository = await database.findGitHubRepositoryForOrganization(
+    message.organizationId,
+    message.repository,
+  );
+  if (repository === undefined) throw new Error("GitHub repository unavailable");
+  const github = (await database.organizationConnectionUsage(message.organizationId)).github.find(
+    (connection) => connection.id === repository.connectionId,
+  );
+  if (github === undefined || github.organizationId !== message.organizationId) {
+    throw new Error("GitHub connection unavailable");
+  }
+  await database.setProjectGitHubConfigurationSource({
+    projectId,
+    githubConnectionId: github.id,
+    githubRepositoryId: repository.repositoryId,
+    githubRepositoryFullName: message.repository,
+    githubDefaultBranch: "main",
+    automaticDeploymentEnabled: true,
+    userId,
+  });
 }
 
 function sendCommandError(id: string, error: unknown): void {
@@ -822,52 +981,68 @@ async function prepareSlackSocketWorkflow(
   ]);
 }
 
-/** Handle the fixture billing IPC commands (product edit, cancel, seat inspection). Returns true
- * when it recognized and replied to a billing command, keeping `acceptCommand` under the
- * complexity cap. */
-function acceptBillingCommand(
-  message: unknown,
-  billingCatalog: FixtureStripeCatalogSource | null,
-  billingClient: FixtureStripeBillingClient | null,
-): boolean {
+function acceptBillingCommand(message: unknown, fixtures: CommandFixtures): boolean {
   if (isBillingProductCommand(message)) {
-    if (billingCatalog === null) {
-      process.send?.({ id: message.id, ok: false, error: "billing is not configured" });
-      return true;
-    }
-    billingCatalog.setProduct(message.product);
-    process.send?.({ id: message.id, ok: true });
+    replyToBillingProduct(message, fixtures.billingCatalog);
     return true;
   }
   if (isBillingCancelSubscriptionCommand(message)) {
-    if (billingClient === null) {
-      process.send?.({ id: message.id, ok: false, error: "billing is not configured" });
-      return true;
-    }
-    // Stand in for the customer canceling in the Stripe portal: the subscription now reads
-    // canceled, and the caller then delivers the signed customer.subscription.deleted webhook.
-    const canceled = billingClient.cancelSubscription(message.organizationId);
-    process.send?.({
-      id: message.id,
-      ok: canceled,
-      error: canceled ? undefined : "no subscription",
-    });
+    replyToBillingCancel(message, fixtures.billingClient);
     return true;
   }
   if (isBillingInspectCommand(message)) {
-    if (billingClient === null) {
-      process.send?.({ id: message.id, ok: false, error: "billing is not configured" });
-      return true;
-    }
-    // The seat quantity Stripe was last told to bill — what the seat-quantity E2E asserts.
-    process.send?.({
-      id: message.id,
-      ok: true,
-      data: { reportedSeatQuantity: billingClient.reportedSeatQuantity(message.organizationId) },
-    });
+    replyToBillingInspect(message, fixtures.billingClient);
     return true;
   }
   return false;
+}
+
+function replyToBillingProduct(
+  message: BillingProductCommand,
+  billingCatalog: FixtureStripeCatalogSource | null,
+): void {
+  if (billingCatalog === null) {
+    replyBillingNotConfigured(message.id);
+    return;
+  }
+  billingCatalog.setProduct(message.product);
+  process.send?.({ id: message.id, ok: true });
+}
+
+function replyToBillingCancel(
+  message: BillingCancelSubscriptionCommand,
+  billingClient: FixtureStripeBillingClient | null,
+): void {
+  if (billingClient === null) {
+    replyBillingNotConfigured(message.id);
+    return;
+  }
+  // The caller delivers the signed customer.subscription.deleted webhook separately.
+  const canceled = billingClient.cancelSubscription(message.organizationId);
+  process.send?.({
+    id: message.id,
+    ok: canceled,
+    error: canceled ? undefined : "no subscription",
+  });
+}
+
+function replyToBillingInspect(
+  message: BillingInspectCommand,
+  billingClient: FixtureStripeBillingClient | null,
+): void {
+  if (billingClient === null) {
+    replyBillingNotConfigured(message.id);
+    return;
+  }
+  process.send?.({
+    id: message.id,
+    ok: true,
+    data: { reportedSeatQuantity: billingClient.reportedSeatQuantity(message.organizationId) },
+  });
+}
+
+function replyBillingNotConfigured(id: string): void {
+  process.send?.({ id, ok: false, error: "billing is not configured" });
 }
 
 function isGitHubConfigurationCommand(value: unknown): value is GitHubConfigurationCommand {
