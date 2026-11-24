@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it, vi } from "vitest";
 import { logger } from "../logger.js";
-import { createGitHubAuth } from "./github.js";
+import { MAX_REVOKE_TIMEOUT_MS, createGitHubAuth } from "./github.js";
 
 const TOKEN = "ghs_revoke_test_secret";
 const WARNING = "installation token revocation failed; token stays valid until it expires";
@@ -51,6 +51,31 @@ describe("GitHub installation token revocation", () => {
     assert.equal(init?.method, "DELETE");
     assert.equal(new Headers(init?.headers).get("authorization"), `token ${TOKEN}`);
     assert.equal(warn.mock.calls.length, 0);
+  });
+
+  it("keeps the HTTP status when the error body cannot be decoded", async () => {
+    const limited = () =>
+      new Response("null", {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "60" },
+      });
+    const { revoke, request, warn } = harness(async () => limited());
+
+    await assert.rejects(revoke());
+
+    assert.equal(request.mock.calls.length, 1);
+    assert.deepEqual(warn.mock.calls[0]?.[0], { attempts: 1, status: 429 });
+  });
+
+  it("still retries a 502 whose error body cannot be decoded", async () => {
+    const broken = () =>
+      new Response("null", { status: 502, headers: { "content-type": "application/json" } });
+    const { revoke, request } = harness(async () => new Response(null, { status: 204 }));
+    request.mockResolvedValueOnce(broken());
+
+    await revoke();
+
+    assert.equal(request.mock.calls.length, 2);
   });
 
   it("retries a 502 and succeeds on the second try", async () => {
@@ -127,6 +152,10 @@ describe("GitHub installation token revocation", () => {
     assert.equal(request.mock.calls[1]?.[1]?.signal?.aborted, true);
     assert.equal(request.mock.calls[2]?.[1]?.signal?.aborted, false);
     assert.equal(warn.mock.calls.length, 0);
+  });
+
+  it("keeps the default budget inside the execution authority's 10 s revoke watchdog", () => {
+    assert.ok(MAX_REVOKE_TIMEOUT_MS < 10_000);
   });
 
   it("enforces the overall budget even when fetch never settles", async () => {

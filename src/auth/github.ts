@@ -11,7 +11,9 @@ import type { GitHubInstallation } from "./github-events.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_REQUEST_TIMEOUT_MS = 2_147_483_647;
-const MAX_REVOKE_TIMEOUT_MS = 20_000;
+// The execution authority stops waiting for a revoke after 10 s and schedules its own retry, so a
+// revoke must finish inside that window to never overlap the retry.
+export const MAX_REVOKE_TIMEOUT_MS = 9_000;
 const REVOKE_RETRY_DELAYS_MS = [500, 1_500] as const;
 
 interface InstallationTokenCacheEntry {
@@ -169,7 +171,11 @@ class GitHubAppClient {
   }
 
   async revokeInstallationToken(token: string): Promise<void> {
-    const octokit = this.plainOctokit(token);
+    // Octokit can throw while decoding an error body before it attaches the HTTP status.
+    let observedStatus: number | undefined;
+    const octokit = this.plainOctokit(token, (response) => {
+      observedStatus = response.status;
+    });
     const signal = AbortSignal.timeout(
       Math.min(this.options.revokeTimeoutMs ?? MAX_REVOKE_TIMEOUT_MS, MAX_REVOKE_TIMEOUT_MS),
     );
@@ -177,11 +183,12 @@ class GitHubAppClient {
     let attempts = 0;
     for (const retryDelay of [...retryDelays, undefined]) {
       attempts++;
+      observedStatus = undefined;
       try {
         await requestTokenRevocation(octokit, signal);
         return;
       } catch (error) {
-        const status = revocationHttpStatus(error);
+        const status = revocationStatus(error, observedStatus);
         // An expired or previously revoked token no longer grants access.
         if (status === 401 || status === 404) return;
         if (
@@ -256,10 +263,11 @@ class GitHubAppClient {
     return this.authenticatedOctokit(await this.createAppJwt(), progress);
   }
 
-  private plainOctokit(auth: string): Octokit {
+  private plainOctokit(auth: string, observe?: (response: Response) => void): Octokit {
+    const timed = githubTimeoutFetch(this.options.fetch ?? fetch, this.requestTimeoutMs);
     const octokit = new Octokit({
       auth,
-      request: { fetch: githubTimeoutFetch(this.options.fetch ?? fetch, this.requestTimeoutMs) },
+      request: { fetch: observe === undefined ? timed : observingFetch(timed, observe) },
       ...pluginOverrides(this.options),
     });
     octokit.hook.before("request", refuseRetryOfCreateComment(octokit));
@@ -308,6 +316,10 @@ async function requestTokenRevocation(octokit: Octokit, signal: AbortSignal): Pr
   } finally {
     listener[Symbol.dispose]();
   }
+}
+
+function revocationStatus(error: unknown, observed: number | undefined): number | undefined {
+  return revocationHttpStatus(error) ?? observed;
 }
 
 function revocationHttpStatus(error: unknown): number | undefined {
@@ -419,6 +431,17 @@ function githubTimeoutFetch(request: typeof fetch, timeoutMs: number): typeof fe
     const caller = init?.signal;
     const signal = caller == null ? timeout : AbortSignal.any([caller, timeout]);
     return request(input, { ...init, signal });
+  };
+}
+
+function observingFetch(
+  request: typeof fetch,
+  observe: (response: Response) => void,
+): typeof fetch {
+  return async (input, init) => {
+    const response = await request(input, init);
+    observe(response);
+    return response;
   };
 }
 
