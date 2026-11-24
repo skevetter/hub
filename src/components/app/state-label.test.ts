@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import {
   connectionState,
+  credentialState,
   daemonState,
   pillTone,
   runState,
@@ -37,7 +38,7 @@ describe("state labels", () => {
 
   it("names daemons", () => {
     assert.equal(daemonState("offline").tone, "off");
-    assert.equal(daemonState("revoked").tone, "attention");
+    assert.equal(daemonState("revoked").tone, "off");
     assert.equal(daemonState("connected").tone, "done");
   });
 
@@ -56,6 +57,11 @@ describe("state labels", () => {
   it("says a session a person stopped is stopped, not idle", () => {
     assert.deepEqual(sessionState("idle", "stopped_by_person"), { label: "Stopped", tone: "off" });
     assert.equal(sessionState("running", "stopped_by_person").label, "Running");
+  });
+
+  it("names credentials, and a revoked one as ended rather than needing a person", () => {
+    assert.deepEqual(credentialState(false), { label: "Active", tone: "done" });
+    assert.deepEqual(credentialState(true), daemonState("revoked"));
   });
 
   it("names triggers and profiles", () => {

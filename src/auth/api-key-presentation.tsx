@@ -11,7 +11,8 @@ import { formatAbsolute, RelativeTime } from "../components/app/relative-time.js
 import { RowActions } from "../components/app/row-actions.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { DropdownMenuItem } from "../components/ui/dropdown-menu.js";
-import { StatusPill } from "../components/app/status-pill.js";
+import { StateBlock } from "../components/app/state-block.js";
+import { credentialState } from "../components/app/state-label.js";
 import { FieldDescription, FieldError } from "../components/ui/field.js";
 import type { Snapshot } from "../queries/index.js";
 import { githubSignerUrl, webhookCurl } from "../webhooks/contract.js";
@@ -74,6 +75,7 @@ export const SCOPE_OPTIONS = [
 ] as const;
 
 export const API_KEY_COLUMNS = [
+  { header: "Status", lead: true },
   { header: "Name", fill: true },
   { header: "Authentication" },
   { header: "Scopes", fill: true },
@@ -81,7 +83,6 @@ export const API_KEY_COLUMNS = [
   { header: "Triggers", fill: true },
   { header: "Created" },
   { header: "Last used" },
-  { header: "Status" },
   { header: "", align: "end" as const },
 ];
 
@@ -358,6 +359,9 @@ function ApiKeyRow(props: ApiKeyRowProps) {
   const allowedTriggers = allowedTriggerLabel(record.allowedTriggers);
   return (
     <DataRow>
+      <DataCell>
+        <StateBlock state={credentialState(record.revokedAt !== null)} />
+      </DataCell>
       <DataCell>{record.name}</DataCell>
       <DataCell>
         {renderApiKeyAuthentication(record, {
@@ -379,11 +383,6 @@ function ApiKeyRow(props: ApiKeyRowProps) {
       </DataCell>
       <DataCell muted>
         {record.lastUsedAt === null ? "Never" : <RelativeTime value={record.lastUsedAt} />}
-      </DataCell>
-      <DataCell>
-        <StatusPill tone={record.revokedAt === null ? "success" : "danger"}>
-          {record.revokedAt === null ? "Active" : "Revoked"}
-        </StatusPill>
       </DataCell>
       <DataCell>
         {record.revokedAt === null && canManage

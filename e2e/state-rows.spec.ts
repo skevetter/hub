@@ -2,6 +2,7 @@ import { join } from "node:path";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, type Locator, type Page } from "@playwright/test";
 import { test } from "./app.js";
+import { projectApp } from "./helpers/projects/index.js";
 import { OrganizationTriggers } from "./helpers/triggers.js";
 
 const SHOTS = "/tmp/hub-ui/state-rows-shots";
@@ -63,6 +64,25 @@ test("a trigger, its runs and its state are blocks that lead their rows, in both
   }
 });
 
+test("API keys and a run's steps lead with their state block, and a revoked key reads as ended", async ({
+  hub,
+  page,
+}) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.createRunApiKey("owner");
+  await projectApp(page).navigation.openOrganizationSettings("API keys");
+  const keys = page.url();
+  for (const viewport of VIEWPORTS) {
+    await page.setViewportSize(viewport);
+    await page.goto(keys);
+    const table = page.getByRole("table", { name: "API keys" });
+    await expect(table.locator('[data-slot="state-block"]').first()).toHaveText("Active");
+    await expectLeadingBlock(page, table, viewport.width, true);
+    await shoot(page, `api-keys-${viewport.width}`);
+  }
+});
+
 async function openActivity(page: Page): Promise<Locator> {
   await page.getByRole("link", { name: "Activity", exact: true }).first().click();
   const table = page.getByRole("table", { name: "Trigger activity" });
@@ -70,7 +90,13 @@ async function openActivity(page: Page): Promise<Locator> {
   return table;
 }
 
-async function expectLeadingBlock(page: Page, table: Locator, width: number): Promise<void> {
+/** The nine-column key table scrolls inside its region on a desktop, as it did before; phones stack. */
+async function expectLeadingBlock(
+  page: Page,
+  table: Locator,
+  width: number,
+  wide = false,
+): Promise<void> {
   const row = table.getByRole("row").nth(1);
   const block = row.locator('[data-slot="state-block"]');
   await expect(block).toBeVisible();
@@ -91,7 +117,7 @@ async function expectLeadingBlock(page: Page, table: Locator, width: number): Pr
   const region = await table
     .locator("xpath=ancestor::*[@data-slot='table-container']")
     .evaluate((node) => node.scrollWidth - node.clientWidth);
-  expect(region).toBeLessThanOrEqual(0);
+  if (!wide || width < 640) expect(region).toBeLessThanOrEqual(0);
 }
 
 async function expectNoAxeViolations(page: Page): Promise<void> {

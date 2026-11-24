@@ -4,15 +4,16 @@ import { DataCell, DataRow, DataTable } from "../components/app/data-table.js";
 import { Disclosure } from "../components/app/disclosure.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
-import { StatusPill, statusLabel } from "../components/app/status-pill.js";
+import { StateBlock } from "../components/app/state-block.js";
+import { runState } from "../components/app/state-label.js";
 import type { ActivityRunDetail as RunDetail } from "../projects/activity-run-view.js";
 import { isScriptStepOutput, ScriptStepOutput } from "../projects/script-step-output.js";
 import type { RunEvent } from "./run-events.js";
 
 const OUTPUT_LIMIT = 64 * 1024;
 const STEP_COLUMNS = [
+  { header: "Status", lead: true },
   { header: "Step", fill: true },
-  { header: "Status" },
   { header: "Started" },
   { header: "Completed" },
   { header: "Output", fill: true },
@@ -51,10 +52,10 @@ export function RunSteps({
           return (
             <DataRow key={step.id}>
               <DataCell>
-                {step.ordinal + 1}. {step.stepId}
+                <StateBlock state={runState(status)} />
               </DataCell>
               <DataCell>
-                <StatusPill tone={tone(status)}>{statusLabel(status)}</StatusPill>
+                {step.ordinal + 1}. {step.stepId}
               </DataCell>
               <DataCell muted>{time(started)}</DataCell>
               <DataCell muted>{time(completed)}</DataCell>
@@ -176,10 +177,4 @@ function PlainOutput({ id, value }: { id: string; value: unknown }) {
 
 function time(value: string | null) {
   return value === null ? "-" : <RelativeTime value={value} />;
-}
-
-function tone(status: string): "success" | "danger" | "neutral" {
-  if (status === "succeeded") return "success";
-  if (status === "failed" || status === "timed_out" || status === "rejected") return "danger";
-  return "neutral";
 }

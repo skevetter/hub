@@ -213,6 +213,17 @@ export function DataRow({ children, onSelect }: { children: ReactNode; onSelect?
 const STACKED_ROW =
   "max-sm:flex max-sm:flex-col max-sm:items-stretch max-sm:gap-1 max-sm:px-4 max-sm:py-3";
 
+/**
+ * A stacked row has no header over its values, so each one but the state block and the record
+ * names itself. Hidden from 640 px, where the header row is back.
+ */
+function StackedLabel({ columns, index }: { columns: readonly DataColumn[]; index: number }) {
+  const header = columns[index]?.header ?? "";
+  const record = columns.findIndex((column) => column.fill === true);
+  if (columns[0]?.lead !== true || index === 0 || index === record || header === "") return null;
+  return <span className="block text-xs text-muted-foreground sm:hidden">{header}</span>;
+}
+
 function cellAttributes(columns: readonly DataColumn[], column: DataColumn, muted: boolean) {
   const stacked = columns[0]?.lead === true;
   const className = cn(
@@ -234,6 +245,7 @@ export function DataCell({ children, muted = false }: { children: ReactNode; mut
   }
   return (
     <TableCell {...cellAttributes(columns, column, muted)}>
+      <StackedLabel columns={columns} index={index} />
       {column.fill === true ? (
         // A grid item that clips has no minimum width, so the column can give way, while its
         // widest value still sets the column's share of the spare width. Anything that is not a

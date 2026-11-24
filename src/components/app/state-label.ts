@@ -43,6 +43,7 @@ const RUN: ReadonlyMap<string, StateView> = new Map([
   ["timed_out", { label: "Timed out", tone: "attention" }],
   ["canceled", { label: "Canceled", tone: "off" }],
   ["rejected", { label: "Rejected", tone: "attention" }],
+  ["dropped", { label: "Dropped", tone: "attention" }],
 ]);
 
 const NEEDS_AUTHORIZATION: StateView = { label: "Needs authorization", tone: "attention" };
@@ -55,10 +56,13 @@ const CONNECTION: Record<ConnectionState, StateView> = {
   suspended: NEEDS_AUTHORIZATION,
 };
 
+/** Ended on purpose. Nothing is left for a person to do. */
+const REVOKED: StateView = { label: "Revoked", tone: "off" };
+
 const DAEMON: Record<DaemonState, StateView> = {
   connected: { label: "Connected", tone: "done" },
   offline: { label: "Offline", tone: "off" },
-  revoked: { label: "Revoked", tone: "attention" },
+  revoked: REVOKED,
 };
 
 const SESSION: Record<SessionState, StateView> = {
@@ -88,6 +92,11 @@ export function daemonState(status: DaemonState): StateView {
 
 export function sessionState(state: SessionState, reason?: string | null): StateView {
   return state === "idle" && reason === "stopped_by_person" ? STOPPED : SESSION[state];
+}
+
+/** An API key or a terminal login. */
+export function credentialState(revoked: boolean): StateView {
+  return revoked ? REVOKED : { label: "Active", tone: "done" };
 }
 
 /** A trigger or a session profile: on, or switched off. */

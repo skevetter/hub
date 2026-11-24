@@ -22,7 +22,8 @@ import { RelativeTime } from "../components/app/relative-time.js";
 import { RowActions } from "../components/app/row-actions.js";
 import { SegmentedControl } from "../components/app/segmented-control.js";
 import { Section } from "../components/app/section.js";
-import { StatusPill } from "../components/app/status-pill.js";
+import { StateBlock } from "../components/app/state-block.js";
+import { credentialState } from "../components/app/state-label.js";
 import {
   Select,
   SelectContent,
@@ -101,10 +102,10 @@ const EMPTY_CLI_TABLE = {
   description: "Run paseo hub login to create one.",
 };
 const CLI_COLUMNS = [
+  { header: "Status", lead: true },
   { header: "Prefix", fill: true },
   { header: "Created" },
   { header: "Last used" },
-  { header: "Status" },
   { header: "", align: "end" as const },
 ];
 
@@ -613,6 +614,9 @@ function CliCredentialRow({
   return (
     <DataRow>
       <DataCell>
+        <StateBlock state={credentialState(record.revokedAt !== null)} />
+      </DataCell>
+      <DataCell>
         <span className="font-mono text-xs">{record.prefix}</span>
       </DataCell>
       <DataCell muted>
@@ -620,11 +624,6 @@ function CliCredentialRow({
       </DataCell>
       <DataCell muted>
         {record.lastUsedAt === null ? "Never" : <RelativeTime value={record.lastUsedAt} />}
-      </DataCell>
-      <DataCell>
-        <StatusPill tone={record.revokedAt === null ? "success" : "danger"}>
-          {record.revokedAt === null ? "Active" : "Revoked"}
-        </StatusPill>
       </DataCell>
       <DataCell>
         {record.revokedAt === null ? (
