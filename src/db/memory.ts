@@ -187,6 +187,7 @@ import type {
   DroppedEventPageRequest,
   DroppedEventPresence,
   ProjectTriggerRoute,
+  MigrateProjectTriggerInput,
   MigrateProjectTriggersInput,
   OrganizationTriggerRecord,
   OrganizationTriggerRevisionRecord,
@@ -306,6 +307,28 @@ export interface MemoryDatabaseOptions {
   unsupportedLinearReceiptsPerHour?: number;
   githubConnections?: readonly GitHubConnectionRecord[];
   githubSyncOwner?: GitHubInstallationSyncOwner;
+}
+
+interface MemoryTriggerMigrationPlan {
+  candidate: MigrateProjectTriggerInput;
+  configuration: ReturnType<typeof parseCompiledHubConfig>;
+  routes: OrganizationTriggerRoute[];
+}
+
+function runtimeTriggerRoutes(
+  routes: readonly OrganizationTriggerRoute[],
+  configuration: ReturnType<typeof parseCompiledHubConfig>,
+  fallbackName: string,
+) {
+  return routes.map((route) => ({
+    provider: route.provider,
+    connectionId: route.connectionId,
+    resourceId: route.resourceId,
+    triggerName:
+      configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
+      configuration.triggers[0]?.name ??
+      fallbackName,
+  }));
 }
 
 function compareTriggerListKeys(left: TriggerListKey, right: TriggerListKey): number {
@@ -5750,100 +5773,10 @@ class MemoryDatabase implements Database {
     ) {
       throw new Error("project configuration changed during trigger migration");
     }
-    const compiledCandidates = input.triggers.map((candidate) => {
-      if (candidate.format !== "single_run" && candidate.format !== "legacy_multistep") {
-        throw new Error("invalid organization trigger format");
-      }
-      return parseCompiledHubConfig(candidate.normalizedConfiguration);
-    });
-    const legacyRoutes = this.projectTriggerRoutes.get(input.projectId) ?? [];
-    const candidateRoutes = input.triggers.map((candidate, index) => {
-      const configuredEventName = compiledCandidates[index]!.triggers[0]?.on;
-      if (configuredEventName === undefined) {
-        throw new Error(`migrated trigger ${candidate.name} has no configured event`);
-      }
-      return legacyRoutes
-        .filter((route) => route.triggerName === candidate.name)
-        .map(
-          (route): OrganizationTriggerRoute => ({
-            provider: route.provider,
-            connectionId: route.connectionId,
-            resourceId: route.resourceId,
-            configuredEventName,
-          }),
-        );
-    });
-    if (
-      candidateRoutes.reduce((total, routes) => total + routes.length, 0) !== legacyRoutes.length
-    ) {
-      throw new Error("project trigger routes do not match migrated triggers");
-    }
+    const plans = this.planMigratedTriggers(input);
     const created: OrganizationTriggerRecord[] = [];
-    for (const [index, candidate] of input.triggers.entries()) {
-      const name = this.availableMigratedTriggerName(
-        input.organizationId,
-        input.projectSlug,
-        candidate.name,
-      );
-      const now = this.now();
-      const triggerId = randomUUID();
-      const revisionId = randomUUID();
-      const runtimeProjectId = this.createTriggerRuntimeProject({
-        organizationId: input.organizationId,
-        name: candidate.name,
-        createdByUserId: null,
-      });
-      const trigger: OrganizationTriggerRecord = {
-        id: triggerId,
-        organizationId: input.organizationId,
-        name,
-        enabled: candidate.enabled,
-        format: candidate.format,
-        runtimeProjectId,
-        activeRevisionId: revisionId,
-        createdAt: now,
-        updatedAt: now,
-      };
-      const revision: OrganizationTriggerRevisionRecord = {
-        id: revisionId,
-        triggerId,
-        organizationId: input.organizationId,
-        version: 1,
-        yaml: candidate.yaml,
-        normalizedConfiguration: candidate.normalizedConfiguration,
-        contentHash: candidate.contentHash,
-        sourceKind: "project_migration",
-        sourceEvidence: candidate.sourceEvidence,
-        createdByUserId: null,
-        createdAt: now,
-      };
-      this.organizationTriggers.set(trigger.id, trigger);
-      this.organizationTriggerRevisions.set(revision.id, revision);
-      const routes = candidateRoutes[index]!;
-      this.organizationTriggerRoutes.set(trigger.id, routes);
-      const runtimeRevision = await this.insertProjectConfigurationRevision({
-        projectId: runtimeProjectId,
-        sourceKind: "manual",
-        sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
-        rawYaml: candidate.yaml,
-        normalizedConfiguration: candidate.normalizedConfiguration,
-        contentHash: candidate.contentHash,
-      });
-      const configuration = compiledCandidates[index]!;
-      await this.activateProjectConfigurationRevision(
-        runtimeProjectId,
-        runtimeRevision.id,
-        routes.map((route) => ({
-          provider: route.provider,
-          connectionId: route.connectionId,
-          resourceId: route.resourceId,
-          triggerName:
-            configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
-            configuration.triggers[0]?.name ??
-            candidate.name,
-        })),
-      );
-      created.push(trigger);
+    for (const plan of plans) {
+      created.push(await this.createMigratedTrigger(input, plan));
     }
     this.projectTriggerRoutes.delete(input.projectId);
     this.projects.set(input.projectId, {
@@ -5855,6 +5788,101 @@ class MemoryDatabase implements Database {
     });
     this.migratedProjects.add(input.projectId);
     return created;
+  }
+
+  private planMigratedTriggers(input: MigrateProjectTriggersInput): MemoryTriggerMigrationPlan[] {
+    const compiled = input.triggers.map((candidate) => {
+      if (candidate.format !== "single_run" && candidate.format !== "legacy_multistep") {
+        throw new Error("invalid organization trigger format");
+      }
+      return {
+        candidate,
+        configuration: parseCompiledHubConfig(candidate.normalizedConfiguration),
+      };
+    });
+    const legacyRoutes = this.projectTriggerRoutes.get(input.projectId) ?? [];
+    const plans = compiled.map(({ candidate, configuration }) => {
+      const configuredEventName = configuration.triggers[0]?.on;
+      if (configuredEventName === undefined) {
+        throw new Error(`migrated trigger ${candidate.name} has no configured event`);
+      }
+      const routes = legacyRoutes
+        .filter((route) => route.triggerName === candidate.name)
+        .map(
+          (route): OrganizationTriggerRoute => ({
+            provider: route.provider,
+            connectionId: route.connectionId,
+            resourceId: route.resourceId,
+            configuredEventName,
+          }),
+        );
+      return { candidate, configuration, routes };
+    });
+    if (plans.reduce((total, { routes }) => total + routes.length, 0) !== legacyRoutes.length) {
+      throw new Error("project trigger routes do not match migrated triggers");
+    }
+    return plans;
+  }
+
+  private async createMigratedTrigger(
+    input: MigrateProjectTriggersInput,
+    plan: MemoryTriggerMigrationPlan,
+  ): Promise<OrganizationTriggerRecord> {
+    const { candidate, configuration, routes } = plan;
+    const name = this.availableMigratedTriggerName(
+      input.organizationId,
+      input.projectSlug,
+      candidate.name,
+    );
+    const now = this.now();
+    const triggerId = randomUUID();
+    const revisionId = randomUUID();
+    const runtimeProjectId = this.createTriggerRuntimeProject({
+      organizationId: input.organizationId,
+      name: candidate.name,
+      createdByUserId: null,
+    });
+    const trigger: OrganizationTriggerRecord = {
+      id: triggerId,
+      organizationId: input.organizationId,
+      name,
+      enabled: candidate.enabled,
+      format: candidate.format,
+      runtimeProjectId,
+      activeRevisionId: revisionId,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const revision: OrganizationTriggerRevisionRecord = {
+      id: revisionId,
+      triggerId,
+      organizationId: input.organizationId,
+      version: 1,
+      yaml: candidate.yaml,
+      normalizedConfiguration: candidate.normalizedConfiguration,
+      contentHash: candidate.contentHash,
+      sourceKind: "project_migration",
+      sourceEvidence: candidate.sourceEvidence,
+      createdByUserId: null,
+      createdAt: now,
+    };
+    this.organizationTriggers.set(trigger.id, trigger);
+    this.organizationTriggerRevisions.set(revision.id, revision);
+    this.organizationTriggerRoutes.set(trigger.id, routes);
+    const runtimeRevision = await this.insertProjectConfigurationRevision({
+      projectId: runtimeProjectId,
+      sourceKind: "manual",
+      sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
+      rawYaml: candidate.yaml,
+      normalizedConfiguration: candidate.normalizedConfiguration,
+      contentHash: candidate.contentHash,
+    });
+    await this.activateProjectConfigurationRevision(
+      runtimeProjectId,
+      runtimeRevision.id,
+      runtimeTriggerRoutes(routes, configuration, candidate.name),
+    );
+    return trigger;
   }
 
   async listOrganizationTriggers(organizationId: string): Promise<OrganizationTriggerRecord[]> {
@@ -5959,21 +5987,7 @@ class MemoryDatabase implements Database {
     const routes = input.enabled
       ? organizationTriggerRoutesForSave(configuration, input.routes, linearConnectionIds)
       : [];
-    const existing =
-      input.triggerId === undefined ? undefined : this.organizationTriggers.get(input.triggerId);
-    if (existing !== undefined && existing.organizationId !== input.organizationId) {
-      throw new Error("organization trigger not found");
-    }
-    if (
-      Array.from(this.organizationTriggers.values()).some(
-        (trigger) =>
-          trigger.organizationId === input.organizationId &&
-          trigger.name === input.name &&
-          trigger.id !== input.triggerId,
-      )
-    ) {
-      throw new Error("trigger name already exists");
-    }
+    const existing = this.findSaveableTrigger(input);
     const now = this.now();
     const triggerId = existing?.id ?? randomUUID();
     const runtimeProjectId =
@@ -5983,19 +5997,48 @@ class MemoryDatabase implements Database {
         name: input.name,
         createdByUserId: input.createdByUserId,
       });
+    const { trigger, revision } = this.buildSavedTriggerRecords(input, {
+      existing,
+      triggerId,
+      runtimeProjectId,
+      now,
+    });
+    this.organizationTriggerRevisions.set(revision.id, revision);
+    this.organizationTriggers.set(trigger.id, trigger);
+    this.organizationTriggerRoutes.set(trigger.id, routes);
+    const runtimeRevision = await this.insertProjectConfigurationRevision({
+      projectId: runtimeProjectId,
+      sourceKind: input.sourceKind,
+      sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
+      rawYaml: input.yaml,
+      normalizedConfiguration: input.normalizedConfiguration,
+      contentHash: input.contentHash,
+      createdByUserId: input.createdByUserId,
+    });
+    await this.activateProjectConfigurationRevision(
+      runtimeProjectId,
+      runtimeRevision.id,
+      runtimeTriggerRoutes(routes, configuration, input.name),
+    );
+    return trigger;
+  }
+
+  private buildSavedTriggerRecords(
+    input: SaveOrganizationTriggerInput,
+    base: {
+      existing: OrganizationTriggerRecord | undefined;
+      triggerId: string;
+      runtimeProjectId: string;
+      now: Date;
+    },
+  ): { trigger: OrganizationTriggerRecord; revision: OrganizationTriggerRevisionRecord } {
+    const { existing, triggerId, runtimeProjectId, now } = base;
     const revisionId = randomUUID();
-    const version =
-      Math.max(
-        0,
-        ...Array.from(this.organizationTriggerRevisions.values())
-          .filter((revision) => revision.triggerId === triggerId)
-          .map((revision) => revision.version),
-      ) + 1;
     const revision: OrganizationTriggerRevisionRecord = {
       id: revisionId,
       triggerId,
       organizationId: input.organizationId,
-      version,
+      version: this.nextTriggerRevisionVersion(triggerId),
       yaml: input.yaml,
       normalizedConfiguration: input.normalizedConfiguration,
       contentHash: input.contentHash,
@@ -6015,32 +6058,39 @@ class MemoryDatabase implements Database {
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
-    this.organizationTriggerRevisions.set(revision.id, revision);
-    this.organizationTriggers.set(trigger.id, trigger);
-    this.organizationTriggerRoutes.set(trigger.id, routes);
-    const runtimeRevision = await this.insertProjectConfigurationRevision({
-      projectId: runtimeProjectId,
-      sourceKind: input.sourceKind,
-      sourceEvidence: { kind: "organization_trigger_adapter", triggerId },
-      rawYaml: input.yaml,
-      normalizedConfiguration: input.normalizedConfiguration,
-      contentHash: input.contentHash,
-      createdByUserId: input.createdByUserId,
-    });
-    await this.activateProjectConfigurationRevision(
-      runtimeProjectId,
-      runtimeRevision.id,
-      routes.map((route) => ({
-        provider: route.provider,
-        connectionId: route.connectionId,
-        resourceId: route.resourceId,
-        triggerName:
-          configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
-          configuration.triggers[0]?.name ??
-          input.name,
-      })),
+    return { trigger, revision };
+  }
+
+  private findSaveableTrigger(
+    input: SaveOrganizationTriggerInput,
+  ): OrganizationTriggerRecord | undefined {
+    const existing =
+      input.triggerId === undefined ? undefined : this.organizationTriggers.get(input.triggerId);
+    if (existing !== undefined && existing.organizationId !== input.organizationId) {
+      throw new Error("organization trigger not found");
+    }
+    if (
+      Array.from(this.organizationTriggers.values()).some(
+        (trigger) =>
+          trigger.organizationId === input.organizationId &&
+          trigger.name === input.name &&
+          trigger.id !== input.triggerId,
+      )
+    ) {
+      throw new Error("trigger name already exists");
+    }
+    return existing;
+  }
+
+  private nextTriggerRevisionVersion(triggerId: string): number {
+    return (
+      Math.max(
+        0,
+        ...Array.from(this.organizationTriggerRevisions.values())
+          .filter((revision) => revision.triggerId === triggerId)
+          .map((revision) => revision.version),
+      ) + 1
     );
-    return trigger;
   }
 
   private createTriggerRuntimeProject(input: {
