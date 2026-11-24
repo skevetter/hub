@@ -1,23 +1,19 @@
-/* oxlint-disable typescript-eslint/no-unsafe-type-assertion -- server functions are erased to a generic call signature at the boundary */
-import { useSnapshotQuery, type Snapshot } from "../queries/index.js";
-import { useMutation, type useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useMemo, type ReactNode } from "react";
+import type { useQueryClient } from "@tanstack/react-query";
+import { useMemo } from "react";
 import { FailureAlert } from "../components/app/failure-alert.js";
-import { PanelSkeleton } from "../components/app/loading.js";
 import type { Result } from "../contract/respond.js";
+import { useSnapshotQuery } from "../queries/index.js";
 import { useRouteTenant } from "./context.js";
 import type { ProjectDashboard } from "./dashboard.js";
-import { organizationSnapshot, projectSnapshot } from "./functions.js";
+import { organizationSnapshot } from "./functions.js";
 
 /**
- * The load/command plumbing every dashboard panel shares: one snapshot query per
- * scope, one mutation shape, and the two states — pending and failed — a panel
- * renders instead of its content.
+ * The load/command plumbing the organization panels share: one snapshot query per scope and the
+ * failure a command leaves behind.
  */
 
 export type OrganizationSnapshot = Awaited<ReturnType<ProjectDashboard["organizationSnapshot"]>>;
-export type ProjectSnapshot = Awaited<ReturnType<ProjectDashboard["projectSnapshot"]>>;
 
 export function useOrganizationSnapshot() {
   const tenant = useRouteTenant();
@@ -31,51 +27,6 @@ export function useOrganizationSnapshot() {
     queryFn: () => load({ data: { organizationSlug: tenant.organization.slug } }),
   });
   return { ...query, queryKey };
-}
-
-export function useProjectSnapshot() {
-  const tenant = useRouteTenant();
-  const load = useServerFn(projectSnapshot);
-  const scope = projectScope(tenant);
-  const query = useSnapshotQuery({
-    queryKey: ["project", tenant.account.id, tenant.organization.id, tenant.project?.id],
-    queryFn: () => load({ data: scope }),
-  });
-  return queryState<ProjectSnapshot>(query, "Project unavailable");
-}
-
-/**
- * The two states a panel renders instead of its content. `pending` is the panel's own skeleton;
- * without one it falls back to the generic panel shape, which is right only where the surface
- * cannot yet say what it is.
- */
-export function queryState<T>(
-  query: Snapshot<T>,
-  title: string,
-  pending?: ReactNode,
-): { ok: true; data: T } | { ok: false; element: ReactNode } {
-  if (query.status === "pending") return { ok: false, element: pending ?? <PanelSkeleton /> };
-  if (query.status === "error")
-    return {
-      ok: false,
-      element: <FailureAlert title={title} error={query.error} fallback={`${title}.`} />,
-    };
-  return { ok: true, data: query.data };
-}
-
-export function useProjectCommand<TInput, TOutput = { state: "complete" }>(
-  command: (input: TInput) => Promise<Result<TOutput>>,
-  queryClient: ReturnType<typeof useQueryClient>,
-  scope: { organizationSlug: string; projectSlug?: string },
-) {
-  return useMutation({
-    mutationFn: useServerFn(command as never) as unknown as (
-      input: TInput,
-    ) => Promise<Result<TOutput>>,
-    onSuccess: async (result) => {
-      if (result.status === "ok") await invalidateScope(queryClient, scope);
-    },
-  });
 }
 
 export function CommandError({
@@ -97,9 +48,9 @@ export function CommandError({
   );
 }
 
-export async function invalidateScope(
+async function invalidateScope(
   queryClient: ReturnType<typeof useQueryClient>,
-  scope: { organizationSlug: string; projectSlug?: string },
+  scope: { organizationSlug: string },
 ) {
   await Promise.all([
     queryClient.invalidateQueries({ queryKey: ["organization"] }),
@@ -113,9 +64,4 @@ export async function invalidateOrganization(
   organizationSlug: string,
 ) {
   await invalidateScope(queryClient, { organizationSlug });
-}
-
-export function projectScope(tenant: ReturnType<typeof useRouteTenant>) {
-  if (tenant.project === null) throw new Error("project route has no project context");
-  return { organizationSlug: tenant.organization.slug, projectSlug: tenant.project.slug };
 }
