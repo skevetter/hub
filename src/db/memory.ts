@@ -1,4 +1,4 @@
-import { triggerMatchActivity } from "../attention/trigger-matches.js";
+import { TRIGGER_MATCH_PROVIDERS, triggerMatchActivity } from "../attention/trigger-matches.js";
 import { FAILED_RUN_FILTER, FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { MemorySurfaceStore } from "../surfaces/memory-store.js";
 import {
@@ -6898,7 +6898,7 @@ class MemoryDatabase implements Database {
       .flatMap(({ id, name, runtimeProjectId, activeRevisionId }) => {
         const configuration =
           this.organizationTriggerRevisions.get(activeRevisionId)?.normalizedConfiguration;
-        const counts = matches.get(JSON.stringify([runtimeProjectId, name])) ?? {
+        const counts = matches.get(runtimeProjectId) ?? {
           previousMatches: 0,
           recentMatches: 0,
         };
@@ -6915,13 +6915,9 @@ class MemoryDatabase implements Database {
       const run = this.triggerRuns.get(id);
       if (run === undefined) continue;
       const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
-      if (
-        receipt?.organizationId !== organizationId ||
-        receipt.receivedAt < window.previousStart ||
-        receipt.receivedAt > window.now
-      )
+      if (receipt?.organizationId !== organizationId || !isTriggerMatchReceipt(receipt, window))
         continue;
-      const key = JSON.stringify([run.projectId, run.configuredTriggerName]);
+      const key = run.projectId;
       const counts = matches.get(key) ?? { previousMatches: 0, recentMatches: 0 };
       if (receipt.receivedAt < window.recentStart) counts.previousMatches++;
       else counts.recentMatches++;
@@ -8172,6 +8168,14 @@ function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
 // store is for tests.
 function receiptOrder(receipt: Pick<ProviderEventReceiptRecord, "receivedAt" | "id">) {
   return { micros: BigInt(receipt.receivedAt.getTime()) * 1000n, id: receipt.id };
+}
+
+function isTriggerMatchReceipt(receipt: ProviderEventReceiptRecord, window: TriggerMatchWindow) {
+  return (
+    TRIGGER_MATCH_PROVIDERS.has(receipt.provider) &&
+    receipt.receivedAt >= window.previousStart &&
+    receipt.receivedAt <= window.now
+  );
 }
 
 function runOrder(run: { createdAt: Date; id: string }) {

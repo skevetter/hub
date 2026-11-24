@@ -6,7 +6,8 @@ import type {
   TriggerMatchWindow,
 } from "../db/types.js";
 
-const PROVIDERS = ["github", "slack", "discord", "linear", "github_notification"] as const;
+export const PROVIDERS = ["github", "slack", "discord", "linear", "github_notification"] as const;
+export const TRIGGER_MATCH_PROVIDERS: ReadonlySet<string> = new Set(PROVIDERS);
 
 export function triggerMatchProviders(configuration: unknown) {
   const notification = triggerProviderEvent("github_notification");
@@ -39,18 +40,20 @@ export function triggerMatchActivity(
     : [{ id: trigger.id, name: trigger.name, ...counts, providers }];
 }
 
+// A trigger keeps its dedicated runtime project across revisions and renames.
 export const TRIGGER_MATCHES_SQL = `with matches as (
-    select run.project_id, run.configured_trigger_name,
+    select run.project_id,
       count(*) filter (where receipt.received_at < $3)::int as "previousMatches",
       count(*) filter (where receipt.received_at >= $3)::int as "recentMatches"
     from provider_event_receipts receipt
     join lateral (
-      select project_id, configured_trigger_name from trigger_runs
+      select project_id from trigger_runs
       where organization_id = $1 and provider_event_receipt_id = receipt.id
       offset 0
     ) run on true
     where receipt.organization_id = $1 and receipt.received_at between $2 and $4
-    group by run.project_id, run.configured_trigger_name
+      and receipt.provider = any($5::text[])
+    group by run.project_id
   )
   select trigger.id, trigger.name, revision.normalized_configuration as configuration,
     coalesce(matches."previousMatches", 0) as "previousMatches",
@@ -59,7 +62,6 @@ export const TRIGGER_MATCHES_SQL = `with matches as (
   join organization_trigger_revisions revision on revision.id = trigger.active_revision_id
     and revision.trigger_id = trigger.id and revision.organization_id = $1
   left join matches on matches.project_id = trigger.runtime_project_id
-    and matches.configured_trigger_name = trigger.name
   where trigger.organization_id = $1 and trigger.enabled`;
 
 export const RECENT_PROVIDER_EVENTS_SQL = `select provider, count(*)::int as count
@@ -78,6 +80,7 @@ export async function listTriggerMatchActivity(
       previousStart,
       recentStart,
       now,
+      PROVIDERS,
     ]),
     database.query<{ provider: TriggerMatchProvider; count: number }>(RECENT_PROVIDER_EVENTS_SQL, [
       organizationId,

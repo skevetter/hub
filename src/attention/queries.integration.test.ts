@@ -7,11 +7,15 @@ import {
   TIMELINE_ORGANIZATION as org,
   type TimelinePostgresHarness,
 } from "../db/test-utils/run-timeline-postgres.js";
-import type { AcceptedTriggerRunRecord, Database, OrganizationTriggerRecord } from "../db/types.js";
+import type {
+  AcceptedTriggerRunRecord,
+  Database,
+  DurableProviderEvent,
+  OrganizationTriggerRoute,
+} from "../db/types.js";
 import { enrollTestDaemon } from "../test-utils/project-configuration.js";
-import { eventDefinition } from "../triggers/configuration/events.js";
 import { compileTriggerDocument } from "../triggers/configuration/index.js";
-import { RECENT_PROVIDER_EVENTS_SQL, TRIGGER_MATCHES_SQL } from "./trigger-matches.js";
+import { PROVIDERS, RECENT_PROVIDER_EVENTS_SQL, TRIGGER_MATCHES_SQL } from "./trigger-matches.js";
 import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { FAILED_RUNS_SQL, WAITING_SESSIONS_SQL } from "./queries.js";
 
@@ -261,12 +265,24 @@ function slackConnection(organizationId: string) {
 }
 
 const matchConnections = [slackConnection(org), slackConnection(otherOrg)];
+const matchGitHub = {
+  id: randomUUID(),
+  organizationId: org,
+  slug: "github",
+  installationId: 12,
+  accountId: "fixture",
+  accountLogin: "fixture",
+  accountType: "Organization",
+  status: "active" as const,
+  providerApplicationId: null,
+};
 
 async function matchDatabase(engine: "postgres" | "memory") {
   if (engine === "memory")
     return createMemoryDatabase({
       organizationIds: [org, otherOrg],
       slackConnections: matchConnections,
+      githubConnections: [matchGitHub],
     });
   for (const connection of matchConnections) {
     await pg.runtime.query(
@@ -276,88 +292,143 @@ async function matchDatabase(engine: "postgres" | "memory") {
       [connection.id, connection.organizationId],
     );
   }
+  await pg.runtime.query(
+    `insert into github_connections
+       (id, organization_id, installation_id, slug, account_id, account_login, account_type, status)
+     values ($1, $2, $3, 'github', 'fixture', 'fixture', 'Organization', 'active')`,
+    [matchGitHub.id, org, matchGitHub.installationId],
+  );
   return pg.database;
 }
 
+type MatchEvent = "slack.mention" | "github.issue_comment" | "github.notification" | "manual.run";
+const MATCH_EVENT_FILTERS: Record<MatchEvent, string> = {
+  "slack.mention": '{ from_users: ["fixture"] }',
+  "github.issue_comment": '{ from_users: ["fixture"] }',
+  "github.notification": "{ repo: fixture/repo, reason: author }",
+  "manual.run": "{}",
+};
+
 interface MatchFixture {
+  id?: string;
   name: string;
-  events: readonly ("slack.mention" | "github.push" | "github.notification" | "manual.run")[];
+  events: readonly MatchEvent[];
   enabled?: boolean;
   organizationId?: string;
 }
 
+function matchRoutes(events: readonly MatchEvent[], organizationId: string) {
+  const slack = matchConnections.find((connection) => connection.organizationId === organizationId);
+  assert.ok(slack);
+  return events.flatMap<OrganizationTriggerRoute>((configuredEventName) => {
+    if (configuredEventName === "slack.mention")
+      return [
+        {
+          configuredEventName,
+          provider: "slack" as const,
+          connectionId: slack.id,
+          resourceId: null,
+        },
+      ];
+    if (configuredEventName === "github.issue_comment")
+      return [
+        {
+          configuredEventName,
+          provider: "github" as const,
+          connectionId: matchGitHub.id,
+          resourceId: null,
+        },
+      ];
+    return [];
+  });
+}
+
 async function matchTrigger(database: Database, fixture: MatchFixture) {
-  const yaml = `name: sample
-enabled: true
+  const { name, enabled = true, organizationId = org } = fixture;
+  const eventYaml = fixture.events
+    .map((event) => `  ${event}: { filters: ${MATCH_EVENT_FILTERS[event]} }`)
+    .join("\n");
+  const yaml = `name: ${name}
+enabled: ${String(enabled)}
 on:
-  manual.run: {}
+${eventYaml}
 run:
   target: { daemon: devbox, cwd: /workspace }
   agent: { provider: codex, mode: full-access }
   prompt: Run task
 `;
   const compiled = compileTriggerDocument(yaml);
-  const [event] = compiled.events;
-  assert.ok(event);
-  return database.saveOrganizationTrigger({
-    organizationId: fixture.organizationId ?? org,
-    name: fixture.name,
-    enabled: fixture.enabled ?? true,
+  const trigger = await database.saveOrganizationTrigger({
+    ...(fixture.id === undefined ? {} : { triggerId: fixture.id }),
+    organizationId,
+    name,
+    enabled,
     format: "single_run",
     yaml,
-    normalizedConfiguration: {
-      environments: [compiled.environment],
-      triggers: fixture.events.map((on, index) => ({
-        ...event,
-        name: `${event.name}-${index}`,
-        on,
-        filters: eventDefinition(on).origin === "hub" ? {} : { from_users: ["fixture"] },
-      })),
-    },
-    contentHash: fixture.name,
+    normalizedConfiguration: { environments: [compiled.environment], triggers: compiled.events },
+    contentHash: compiled.authoredHash,
     sourceKind: "manual",
     sourceEvidence: {},
     createdByUserId: null,
-    routes: [],
+    routes: matchRoutes(fixture.events, organizationId),
   });
+  return { trigger, events: compiled.events };
+}
+
+type MatchTrigger = Awaited<ReturnType<typeof matchTrigger>>;
+
+async function matchedReceipt(
+  database: Database,
+  { organizationId, runtimeProjectId: projectId }: MatchTrigger["trigger"],
+  on: MatchEvent,
+  receivedAt: Date,
+): Promise<DurableProviderEvent> {
+  const input = { deliveryId: randomUUID(), source: on, payload: {}, receivedAt };
+  if (on === "manual.run") {
+    const result = await database.persistManualEvent({ ...input, organizationId, projectId });
+    assert.equal(result.status, "accepted");
+    return result.event;
+  }
+  const result =
+    on === "slack.mention"
+      ? await database.acceptSlackEvent({ ...input, teamId: organizationId })
+      : await database.acceptGitHubEvent({ ...input, installationId: matchGitHub.installationId });
+  assert.equal(result.status, "accepted");
+  const event = result.events.find((route) => route.projectId === projectId);
+  assert.ok(event);
+  return event;
 }
 
 async function matchRun(
   database: Database,
-  trigger: OrganizationTriggerRecord,
-  receivedAt: Date,
-  { rejected = false, name = trigger.name } = {},
+  fixture: MatchTrigger,
+  input: { receivedAt: Date; on: MatchEvent; rejected?: boolean },
 ) {
-  const { organizationId, runtimeProjectId: projectId } = trigger;
-  const receipt = await database.persistManualEvent({
+  const { on, receivedAt, rejected } = input;
+  const configured = fixture.events.find((event) => event.on === on);
+  assert.ok(configured);
+  const { organizationId, projectId, providerEventReceiptId, configurationRevisionId } =
+    await matchedReceipt(database, fixture.trigger, on, receivedAt);
+  const run = {
     organizationId,
     projectId,
-    deliveryId: randomUUID(),
-    source: "manual.run",
-    payload: {},
-    receivedAt,
-  });
-  assert.equal(receipt.status, "accepted");
-  const input = {
-    organizationId,
-    projectId,
-    providerEventReceiptId: receipt.event.providerEventReceiptId,
-    configurationRevisionId: receipt.event.configurationRevisionId,
-    configuredTriggerName: name,
+    providerEventReceiptId,
+    configurationRevisionId,
+    configuredTriggerName: configured.name,
     prompt: "",
     inputs: {},
     triggerContext: {},
     outputContext: {},
     createdAt: matchWindow.now,
   };
-  if (rejected) {
+  if (rejected === true) {
     await database.createRejectedTriggerRun({
-      ...input,
+      ...run,
       rejection: { code: "missing_required", inputName: "fixture" },
     });
     return;
   }
-  await database.createAcceptedTriggerRun({ ...input, deadlineAt: matchWindow.now, stepIds: [] });
+  await database.createAcceptedTriggerRun({ ...run, deadlineAt: matchWindow.now, stepIds: [] });
 }
 
 async function deliverMatchEvent(database: Database, teamId: string, receivedAt: Date) {
@@ -372,31 +443,63 @@ async function deliverMatchEvent(database: Database, teamId: string, receivedAt:
   expect(event.status).toBe("dropped");
 }
 
-async function seedMatchRuns(database: Database) {
+async function seedStoppedMatches(database: Database) {
   const { previousStart, recentStart, now } = matchWindow;
   const stopped = await matchTrigger(database, {
     name: "stopped",
-    events: ["github.push", "slack.mention"],
+    events: ["manual.run", "github.issue_comment", "slack.mention"],
   });
-  await matchRun(database, stopped, previousStart, { rejected: true });
-  await matchRun(database, stopped, new Date(recentStart.getTime() - 1));
-  await matchRun(database, stopped, new Date(previousStart.getTime() - 1));
-  await matchRun(database, stopped, recentStart, { name: "another-trigger" });
-  await matchRun(database, stopped, new Date(now.getTime() + 1));
-  const still = await matchTrigger(database, { name: "still", events: ["slack.mention"] });
-  await matchRun(database, still, previousStart);
-  await matchRun(database, still, recentStart);
-  const disabled = await matchTrigger(database, {
-    name: "disabled",
-    events: ["slack.mention"],
-    enabled: false,
+  await matchRun(database, stopped, {
+    receivedAt: previousStart,
+    on: "github.issue_comment",
+    rejected: true,
   });
-  await matchRun(database, disabled, previousStart);
+  await matchRun(database, stopped, {
+    receivedAt: new Date(recentStart.getTime() - 1),
+    on: "slack.mention",
+  });
+  await matchRun(database, stopped, {
+    receivedAt: new Date(previousStart.getTime() - 1),
+    on: "slack.mention",
+  });
+  await matchRun(database, stopped, { receivedAt: recentStart, on: "manual.run" });
+  await matchRun(database, stopped, {
+    receivedAt: new Date(now.getTime() + 1),
+    on: "slack.mention",
+  });
+
+  const renamed = await matchTrigger(database, {
+    id: stopped.trigger.id,
+    name: "renamed",
+    events: ["manual.run", "github.issue_comment", "slack.mention"],
+  });
+  expect(renamed.trigger.runtimeProjectId).toBe(stopped.trigger.runtimeProjectId);
+}
+
+async function seedMatchRuns(database: Database) {
+  const { previousStart, recentStart, now } = matchWindow;
+  await seedStoppedMatches(database);
+  const still = await matchTrigger(database, {
+    name: "deploy",
+    events: ["github.issue_comment", "slack.mention"],
+  });
+  expect(still.events[1]?.name).toBe("deploy-event-2");
+  await matchRun(database, still, { receivedAt: previousStart, on: "github.issue_comment" });
+  await matchRun(database, still, { receivedAt: recentStart, on: "slack.mention" });
+  const disabledFixture = { name: "disabled", events: ["slack.mention"] } as const;
+  const disabled = await matchTrigger(database, disabledFixture);
+  await matchRun(database, disabled, { receivedAt: previousStart, on: "slack.mention" });
+  await matchTrigger(database, { ...disabledFixture, id: disabled.trigger.id, enabled: false });
   const unserved = await matchTrigger(database, {
+    name: "unserved",
+    events: ["github.issue_comment"],
+  });
+  await matchRun(database, unserved, { receivedAt: previousStart, on: "github.issue_comment" });
+  await matchTrigger(database, {
+    id: unserved.trigger.id,
     name: "unserved",
     events: ["github.notification"],
   });
-  await matchRun(database, unserved, previousStart);
   await matchTrigger(database, { name: "never", events: ["slack.mention"] });
   await matchTrigger(database, { name: "manual", events: ["manual.run"] });
   const foreign = await matchTrigger(database, {
@@ -404,7 +507,7 @@ async function seedMatchRuns(database: Database) {
     events: ["slack.mention"],
     organizationId: otherOrg,
   });
-  await matchRun(database, foreign, previousStart);
+  await matchRun(database, foreign, { receivedAt: previousStart, on: "slack.mention" });
   await deliverMatchEvent(database, org, new Date(recentStart.getTime() - 1));
   await deliverMatchEvent(database, org, now);
   await deliverMatchEvent(database, org, new Date(now.getTime() + 1));
@@ -426,24 +529,27 @@ it.each(["postgres", "memory"] as const)(
         .sort((a, b) => a.name.localeCompare(b.name)),
     ).toEqual([
       {
+        name: "deploy",
+        previousMatches: 1,
+        recentMatches: 1,
+        providers: [
+          { provider: "github", recentEvents: 0 },
+          { provider: "slack", recentEvents: 2 },
+        ],
+      },
+      {
         name: "never",
         previousMatches: 0,
         recentMatches: 0,
-        providers: [{ provider: "slack", recentEvents: 1 }],
+        providers: [{ provider: "slack", recentEvents: 2 }],
       },
       {
-        name: "still",
-        previousMatches: 1,
-        recentMatches: 1,
-        providers: [{ provider: "slack", recentEvents: 1 }],
-      },
-      {
-        name: "stopped",
+        name: "renamed",
         previousMatches: 2,
         recentMatches: 0,
         providers: [
           { provider: "github", recentEvents: 0 },
-          { provider: "slack", recentEvents: 1 },
+          { provider: "slack", recentEvents: 2 },
         ],
       },
       {
@@ -465,12 +571,13 @@ it("uses indexed receipt and run lookups for the stop rule", async () => {
       previousStart,
       recentStart,
       now,
+      PROVIDERS,
     ]),
     runtime.query(`explain (analyze, buffers) ${RECENT_PROVIDER_EVENTS_SQL}`, [
       org,
       recentStart,
       now,
-      ["github", "slack", "discord", "linear", "github_notification"],
+      PROVIDERS,
     ]),
   ]);
   const matchPlans = plans.map(({ rows }) => rows.map((row) => row["QUERY PLAN"]).join("\n"));
