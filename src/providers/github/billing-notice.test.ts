@@ -141,6 +141,19 @@ describe("GitHub execution limit notices", () => {
     assert.equal(fixture.posts.length, 0);
   });
 
+  it.each([2, 3])("posts nothing when the list fails on page %i", async (failingPage) => {
+    const fixture = billingNoticeFixture((url) =>
+      Number(url.searchParams.get("page")) === failingPage
+        ? Response.json({ message: "comment list unavailable" }, { status: 503 })
+        : Response.json(pagedComments(Number(url.searchParams.get("page")), 0)),
+    );
+
+    await assert.rejects(() => fixture.deliver(), /comment list unavailable/u);
+
+    assert.equal(fixture.lists.length, failingPage);
+    assert.equal(fixture.posts.length, 0);
+  });
+
   it("posts separate notices for different deliveries on the same issue", async () => {
     const page: Array<{ id: number; body: string; user: { id: number } }> = [];
     const fixture = billingNoticeFixture(() => Response.json(page));
