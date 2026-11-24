@@ -4,8 +4,12 @@ import { TriggerReadPanel } from "../../../../../../triggers/read-view.js";
 
 export const Route = createFileRoute("/_shell/o/$organizationSlug/triggers/$triggerId/")({
   staticData: { breadcrumb: "Trigger" },
-  beforeLoad: ({ location, params }) => {
-    const href = legacyTriggerEditorHref(location, params.triggerId);
+  beforeLoad: ({ context, location, params }) => {
+    const searchStr = context.rawSearch?.() ?? location.searchStr;
+    const href = legacyTriggerEditorHref(
+      { pathname: location.pathname, searchStr },
+      params.triggerId,
+    );
     if (href !== undefined) redirect({ href, replace: true, throw: true });
   },
   component: TriggerReadRoute,

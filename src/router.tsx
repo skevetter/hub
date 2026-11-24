@@ -10,17 +10,21 @@ export function getRouter() {
     defaultOptions: { mutations: { networkMode: "always" } },
   });
   if (typeof window !== "undefined") resetQueriesOnReaderChange(queryClient);
-  return createRouter({
+  const history: { current?: { location: { search: string } } } = {};
+  const router = createRouter({
     routeTree,
     scrollRestoration: true,
     defaultPendingComponent: () => <PanelSkeleton label="Loading page" />,
     defaultErrorComponent: RouteErrorBoundary,
     defaultNotFoundComponent: RouteNotFound,
-    context: { queryClient },
+    // The router re-serialises the query it parses; this keeps the bytes the visitor sent.
+    context: { queryClient, rawSearch: () => history.current?.location.search ?? "" },
     Wrap: ({ children }) => (
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     ),
   });
+  history.current = router.history;
+  return router;
 }
 
 declare module "@tanstack/react-router" {
