@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
+import { TOKEN_REVOKE_WATCHDOG_MS } from "../auth/revocation-budget.js";
 import type { CompiledGitHubAuthority } from "../config/github-authority.js";
 import {
   parseConnectionTemplate,
@@ -21,7 +22,6 @@ export type {
   ExecutionCredentialLease,
 } from "./internal/store.js";
 
-const TOKEN_REVOCATION_TIMEOUT_MS = 10_000;
 const REVOCATION_RETRY_BASE_DELAY_MS = 1_000;
 
 export interface ExecutionAuthorityClock {
@@ -454,7 +454,7 @@ async function revokeToken(
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () => reject(new Error("token revocation timed out")),
-          TOKEN_REVOCATION_TIMEOUT_MS,
+          TOKEN_REVOKE_WATCHDOG_MS,
         );
       }),
     ]);
