@@ -4,10 +4,12 @@ import { isScriptStep, parseCompiledHubConfig, type CompiledTrigger } from "../c
 import type { SessionPrincipal } from "../interactive-sessions/types.js";
 import type {
   Database,
+  DaemonRecord,
   OrganizationConnectionUsage,
   OrganizationRunCount,
   OrganizationRunRecord,
   DroppedProviderEventCount,
+  OrganizationTriggerRecord,
   OrganizationTriggerRevisionRecord,
 } from "../db/types.js";
 import { resolveRouteTenant } from "../projects/access.js";
@@ -171,62 +173,86 @@ export class HomeDashboard {
       organization,
       checklistCompletedAt: checklistCompletedAt?.toISOString() ?? null,
       appsConfigured: this.providerAppsConfigured(connections),
-      connections: [
-        ...connections.github.map(({ slug, accountLogin, status }) => ({
-          provider: "github" as const,
-          slug,
-          label: accountLogin,
-          needsAuthorization: status === "suspended",
-        })),
-        ...connections.slack.map(({ slug, teamName, scopes }) => ({
-          provider: "slack" as const,
-          slug,
-          label: teamName,
-          needsAuthorization: !hasRequiredSlackScopes(scopes),
-        })),
-        ...connections.discord.map(({ slug, guildName }) => ({
-          provider: "discord" as const,
-          slug,
-          label: guildName,
-          needsAuthorization: false,
-        })),
-        ...connections.linear.map((connection) => ({
-          provider: "linear" as const,
-          slug: connection.slug,
-          label: connection.linearOrganizationName,
-          needsAuthorization: linearConnectionRequiresReauthorization(connection),
-        })),
-      ],
-      daemons: daemons
-        .filter(({ status }) => status === "active")
-        .map(({ id, slug, presence, permissions }) => ({
-          id,
-          slug,
-          presence,
-          canExecute: permissions.includes("hub.execute"),
-        })),
-      triggers: triggers.map((trigger, index) =>
-        Object.assign(
-          { id: trigger.id, name: trigger.name, enabled: trigger.enabled },
-          triggerFacts(revisions[index], trigger.format, connections),
-        ),
-      ),
-      runs: runs.map((run) => ({
-        id: run.id,
-        triggerName: run.triggerName,
-        provider: run.provider,
-        source: run.source,
-        status: run.status,
-        receivedAt: run.receivedAt.toISOString(),
-        agent: run.agent,
-        payloadExpiredAt: run.payloadExpiredAt ?? null,
-      })),
+      connections: snapshotConnections(connections),
+      daemons: snapshotDaemons(daemons),
+      triggers: snapshotTriggers(triggers, revisions, connections),
+      runs: snapshotRuns(runs),
       runCounts: { day: tally(dayRuns), month: tally(monthRuns) },
       sessionStarted,
       dropped,
       windowDays: HOME_WINDOW_DAYS,
     };
   }
+}
+
+function snapshotConnections(
+  connections: OrganizationConnectionUsage,
+): HomeSnapshot["connections"] {
+  return [
+    ...connections.github.map<HomeSnapshot["connections"][number]>(
+      ({ slug, accountLogin, status }) => ({
+        provider: "github",
+        slug,
+        label: accountLogin,
+        needsAuthorization: status === "suspended",
+      }),
+    ),
+    ...connections.slack.map<HomeSnapshot["connections"][number]>(({ slug, teamName, scopes }) => ({
+      provider: "slack",
+      slug,
+      label: teamName,
+      needsAuthorization: !hasRequiredSlackScopes(scopes),
+    })),
+    ...connections.discord.map<HomeSnapshot["connections"][number]>(({ slug, guildName }) => ({
+      provider: "discord",
+      slug,
+      label: guildName,
+      needsAuthorization: false,
+    })),
+    ...connections.linear.map<HomeSnapshot["connections"][number]>((connection) => ({
+      provider: "linear",
+      slug: connection.slug,
+      label: connection.linearOrganizationName,
+      needsAuthorization: linearConnectionRequiresReauthorization(connection),
+    })),
+  ];
+}
+
+function snapshotDaemons(daemons: readonly DaemonRecord[]): HomeSnapshot["daemons"] {
+  return daemons
+    .filter(({ status }) => status === "active")
+    .map(({ id, slug, presence, permissions }) => ({
+      id,
+      slug,
+      presence,
+      canExecute: permissions.includes("hub.execute"),
+    }));
+}
+
+function snapshotTriggers(
+  triggers: readonly OrganizationTriggerRecord[],
+  revisions: readonly (OrganizationTriggerRevisionRecord | undefined)[],
+  connections: OrganizationConnectionUsage,
+): HomeSnapshot["triggers"] {
+  return triggers.map((trigger, index) =>
+    Object.assign(
+      { id: trigger.id, name: trigger.name, enabled: trigger.enabled },
+      triggerFacts(revisions[index], trigger.format, connections),
+    ),
+  );
+}
+
+function snapshotRuns(runs: readonly OrganizationRunRecord[]): HomeSnapshot["runs"] {
+  return runs.map((run) => ({
+    id: run.id,
+    triggerName: run.triggerName,
+    provider: run.provider,
+    source: run.source,
+    status: run.status,
+    receivedAt: run.receivedAt.toISOString(),
+    agent: run.agent,
+    payloadExpiredAt: run.payloadExpiredAt ?? null,
+  }));
 }
 
 function readerOf(
@@ -262,23 +288,30 @@ function triggerFacts(
 
   const { triggers } = parseCompiledHubConfig(revision.normalizedConfiguration);
   const comments = triggers.filter(({ on }) => isTryCommentEvent(on));
-  const event =
-    primaryEvent ??
-    (format === "legacy_multistep" ? "" : (comments[0]?.on ?? triggers[0]?.on ?? ""));
-  if (comments.length === 0) return { event };
+  const event = primaryEvent ?? fallbackTriggerEvent(format, comments, triggers);
+  return comments.length === 0
+    ? { event }
+    : { event, commentEvents: comments.map((comment) => commentFacts(comment, connections)) };
+}
 
-  const commentEvents = comments.map((comment) => {
-    const replyType = `${comment.on.split(".", 1)[0]}.reply`;
-    const hasReplyOutput = comment.steps.some(
-      (step) => !isScriptStep(step) && step.allowOutputs.some(({ type }) => type === replyType),
-    );
-    return {
-      on: comment.on,
-      hasReplyOutput,
-      commentPrefix: hasReplyOutput ? acceptedCommentPrefix(comment, connections) : null,
-    };
-  });
-  return { event, commentEvents };
+function fallbackTriggerEvent(
+  format: OrganizationTriggerRecord["format"],
+  comments: readonly CompiledTrigger[],
+  triggers: readonly CompiledTrigger[],
+): string {
+  return format === "legacy_multistep" ? "" : (comments[0]?.on ?? triggers[0]?.on ?? "");
+}
+
+function commentFacts(comment: CompiledTrigger, connections: OrganizationConnectionUsage) {
+  const replyType = `${comment.on.split(".", 1)[0]}.reply`;
+  const hasReplyOutput = comment.steps.some(
+    (step) => !isScriptStep(step) && step.allowOutputs.some(({ type }) => type === replyType),
+  );
+  return {
+    on: comment.on,
+    hasReplyOutput,
+    commentPrefix: hasReplyOutput ? acceptedCommentPrefix(comment, connections) : null,
+  };
 }
 
 function acceptedCommentPrefix(
@@ -291,72 +324,87 @@ function acceptedCommentPrefix(
   const examples = commentExamples(trigger.on, prefix);
 
   // Preview a comment with no claim about the reader's provider identity or the target's scope.
-  const results = examples.map(({ prompt }) => {
-    if (trigger.on === "linear.comment_created") {
-      const healthy = connections.linear.filter(
-        (connection) => !linearConnectionRequiresReauthorization(connection),
-      );
-      return (
-        healthy.length > 0 &&
-        healthy.every((connection) =>
-          matchLinearInvocations(
-            configuration,
-            {
-              type: "comment",
-              action: "create",
-              id: "home-preview",
-              organizationId: connection.linearOrganizationId,
-              actor: null,
-              comment: { id: "home-preview", body: prompt, issueId: "home-preview" },
-              issue: {
-                id: "home-preview",
-                title: "",
-                description: null,
-                projectId: null,
-                stateId: null,
-                assigneeId: null,
-                labelIds: [],
-              },
-            },
-            connection.id,
-            connection.appUserId,
-          ).some(({ invocation }) => invocation.status === "accepted"),
-        )
-      );
-    }
-
-    const healthy = connections.github.filter(({ status }) => status !== "suspended");
-    const type =
-      trigger.on === "github.pull_request_review_comment"
-        ? "pull_request_review_comment"
-        : "issue_comment";
-    return (
-      healthy.length > 0 &&
-      healthy.every((connection) => {
-        const matches = matchGitHubInvocations(
-          configuration,
-          {
-            id: "home-preview",
-            type,
-            repo: "",
-            repositoryId: 0,
-            installationId: connection.installationId,
-            createdAt: "",
-            payload: {
-              action: "created",
-              comment: { body: prompt },
-              issue: trigger.on === "github.issue_comment_created" ? {} : { pull_request: {} },
-            },
-          },
-          { source: `github.${type}`, connectionId: connection.id },
-        );
-        return (
-          typeof matches !== "string" &&
-          matches.some(({ invocation }) => invocation.status === "accepted")
-        );
-      })
-    );
-  });
+  const results = examples.map(({ prompt }) =>
+    trigger.on === "linear.comment_created"
+      ? linearAcceptsExample(configuration, connections.linear, prompt)
+      : githubAcceptsExample(configuration, connections.github, prompt, trigger),
+  );
 
   return results.length > 0 && results.every(Boolean) ? prefix : null;
+}
+
+function linearAcceptsExample(
+  configuration: { triggers: CompiledTrigger[] },
+  connections: OrganizationConnectionUsage["linear"],
+  prompt: string,
+): boolean {
+  const healthy = connections.filter(
+    (connection) => !linearConnectionRequiresReauthorization(connection),
+  );
+  return (
+    healthy.length > 0 &&
+    healthy.every((connection) =>
+      matchLinearInvocations(
+        configuration,
+        {
+          type: "comment",
+          action: "create",
+          id: "home-preview",
+          organizationId: connection.linearOrganizationId,
+          actor: null,
+          comment: { id: "home-preview", body: prompt, issueId: "home-preview" },
+          issue: {
+            id: "home-preview",
+            title: "",
+            description: null,
+            projectId: null,
+            stateId: null,
+            assigneeId: null,
+            labelIds: [],
+          },
+        },
+        connection.id,
+        connection.appUserId,
+      ).some(({ invocation }) => invocation.status === "accepted"),
+    )
+  );
+}
+
+function githubAcceptsExample(
+  configuration: { triggers: CompiledTrigger[] },
+  connections: OrganizationConnectionUsage["github"],
+  prompt: string,
+  trigger: CompiledTrigger,
+): boolean {
+  const healthy = connections.filter(({ status }) => status !== "suspended");
+  const type =
+    trigger.on === "github.pull_request_review_comment"
+      ? "pull_request_review_comment"
+      : "issue_comment";
+  return (
+    healthy.length > 0 &&
+    healthy.every((connection) => {
+      const matches = matchGitHubInvocations(
+        configuration,
+        {
+          id: "home-preview",
+          type,
+          repo: "",
+          repositoryId: 0,
+          installationId: connection.installationId,
+          createdAt: "",
+          payload: {
+            action: "created",
+            comment: { body: prompt },
+            issue: trigger.on === "github.issue_comment_created" ? {} : { pull_request: {} },
+          },
+        },
+        { source: `github.${type}`, connectionId: connection.id },
+      );
+      return (
+        typeof matches !== "string" &&
+        matches.some(({ invocation }) => invocation.status === "accepted")
+      );
+    })
+  );
 }
