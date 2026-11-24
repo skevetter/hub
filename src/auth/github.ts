@@ -7,6 +7,9 @@ import { GITHUB_APP_PERMISSION_VOCABULARY } from "../config/github-authority.js"
 import { GitHubInstallationSchema } from "./github-events.js";
 import type { GitHubInstallation } from "./github-events.js";
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const MAX_REQUEST_TIMEOUT_MS = 2_147_483_647;
+
 interface InstallationTokenCacheEntry {
   expiresAt: number;
   token: string;
@@ -60,6 +63,7 @@ interface CreateGitHubAuthOptions {
   appId: string;
   privateKey: string;
   fetch?: typeof fetch;
+  requestTimeoutMs?: number;
   now?: () => number;
   /** Octokit retry (one attempt) and fail-fast write throttling stay on unless a caller turns them off. */
   octokitPlugins?: { retry?: boolean; throttle?: boolean };
@@ -89,9 +93,12 @@ class GitHubAppClient {
   private readonly installationTokenCache = new Map<number, InstallationTokenCacheEntry>();
   private readonly appBotIdentityCache = new Map<string, Promise<GitHubAppBotIdentity>>();
   private readonly now: () => number;
+  private readonly requestTimeoutMs: number;
 
   constructor(private readonly options: CreateGitHubAuthOptions) {
     this.now = options.now ?? Date.now;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    validateRequestTimeout(this.requestTimeoutMs);
   }
 
   async getInstallation(installationId: number): Promise<GitHubInstallation | undefined> {
@@ -222,7 +229,7 @@ class GitHubAppClient {
   private plainOctokit(auth: string): Octokit {
     const octokit = new Octokit({
       auth,
-      request: githubRequestOptions(this.options.fetch),
+      request: { fetch: githubTimeoutFetch(this.options.fetch ?? fetch, this.requestTimeoutMs) },
       ...pluginOverrides(this.options),
     });
     octokit.hook.before("request", refuseRetryOfCreateComment(octokit));
@@ -330,8 +337,21 @@ function pluginOverrides(options: CreateGitHubAuthOptions) {
   };
 }
 
-function githubRequestOptions(fetchOverride: typeof fetch | undefined) {
-  return fetchOverride === undefined ? {} : { fetch: fetchOverride };
+function validateRequestTimeout(timeoutMs: number): void {
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_REQUEST_TIMEOUT_MS) {
+    throw new Error(
+      `GitHub requestTimeoutMs must be an integer from 1 to ${MAX_REQUEST_TIMEOUT_MS}`,
+    );
+  }
+}
+
+function githubTimeoutFetch(request: typeof fetch, timeoutMs: number): typeof fetch {
+  return (input, init) => {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const caller = init?.signal;
+    const signal = caller == null ? timeout : AbortSignal.any([caller, timeout]);
+    return request(input, { ...init, signal });
+  };
 }
 
 function githubApiVersionHeader() {
