@@ -175,15 +175,78 @@ test("places a toast clear of the phone bars and returns focus when it is dismis
   await expect(toast).toBeVisible();
   await expectToastClearOfBars(page, toast);
   const dismiss = toast.getByRole("button", { name: "Dismiss: Trigger saved" });
-  const target = await dismiss.boundingBox();
-  expect(target?.width).toBeGreaterThanOrEqual(44);
-  expect(target?.height).toBeGreaterThanOrEqual(44);
-  await toast.getByRole("link", { name: "View trigger" }).click();
+  const view = toast.getByRole("link", { name: "View trigger" });
+  for (const control of [dismiss, view]) {
+    const target = await control.boundingBox();
+    expect(target?.width).toBeGreaterThanOrEqual(44);
+    expect(target?.height).toBeGreaterThanOrEqual(44);
+  }
+  await view.click();
   await expect(page.getByRole("heading", { name: NAME, level: 1 })).toBeVisible();
   await expect(toast).toBeVisible();
   await dismiss.click();
   await expect(toast).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe("content");
+});
+
+test("holds a toast while it has focus and dismisses it from the keyboard", async ({
+  hub,
+  page,
+}) => {
+  await createManualTrigger(hub, page);
+  const log = page.getByRole("log", { name: "Notifications" });
+  await dismissAllToasts(log);
+  await page.clock.install();
+  await saveEdit(page);
+  const toast = log.locator('[data-slot="toast"]');
+  const view = toast.getByRole("link", { name: "View trigger" });
+  await view.focus();
+  await page.clock.fastForward(TOAST_MS);
+  await expect(toast).toBeVisible();
+  await page.keyboard.press("Tab");
+  await expect(toast.getByRole("button", { name: "Dismiss: Trigger saved" })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(toast).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe("content");
+});
+
+test("hides a toast that belongs to another organization after a switch", async ({ hub, page }) => {
+  await createManualTrigger(hub, page);
+  await hub.createAnotherOrganization("owner", "Globex");
+  await hub.chooseOrganization("owner", "Acme");
+  const log = page.getByRole("log", { name: "Notifications" });
+  await dismissAllToasts(log);
+  const triggers = new OrganizationTriggers(page);
+  await triggers.open();
+  await triggers.openReadView(NAME);
+  await saveEdit(page);
+  const toast = log.locator('[data-slot="toast"]');
+  await expect(toast).toContainText("Trigger saved");
+  await hub.chooseOrganization("owner", "Globex");
+  await expect(toast).toHaveCount(0);
+  await hub.chooseOrganization("owner", "Acme");
+  await expect(toast).toContainText("Trigger saved");
+});
+
+test("gives a replaced toast a fresh timeout", async ({ hub, page }) => {
+  await createManualTrigger(hub, page);
+  const log = page.getByRole("log", { name: "Notifications" });
+  await dismissAllToasts(log);
+  await page.clock.install();
+  await saveEdit(page);
+  const toast = log.locator('[data-slot="toast"]');
+  await expect(toast).toHaveCount(1);
+  await page.mouse.move(0, 0);
+  await page.clock.fastForward(7000);
+  await expect(toast).toHaveCount(1);
+  await page.getByRole("link", { name: NAME, exact: true }).click();
+  await saveEdit(page);
+  await expect(toast).toHaveCount(1);
+  await page.mouse.move(0, 0);
+  await page.clock.fastForward(5000);
+  await expect(toast).toHaveCount(1);
+  await page.clock.fastForward(4000);
+  await expect(toast).toHaveCount(0);
 });
 
 async function dismissAllToasts(log: Locator): Promise<void> {

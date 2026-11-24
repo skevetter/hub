@@ -464,14 +464,15 @@ function triggerListAnnouncement(
 
 /** A new trigger has no id yet, so only an edit can offer View. */
 function savedToast(organizationSlug: string, triggerId: string | undefined): ToastInput {
-  if (triggerId === undefined) return { title: "Trigger saved" };
+  const identity = { id: "trigger-saved", scope: organizationSlug, title: "Trigger saved" };
+  if (triggerId === undefined) return identity;
   return {
-    title: "Trigger saved",
+    ...identity,
     action: (
       <Link
         to="/o/$organizationSlug/triggers/$triggerId"
         params={{ organizationSlug, triggerId }}
-        className="text-link underline underline-offset-4"
+        className="text-link underline underline-offset-4 max-md:inline-flex max-md:min-h-11 max-md:items-center"
       >
         View trigger
       </Link>

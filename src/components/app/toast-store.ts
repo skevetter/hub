@@ -7,6 +7,8 @@ export interface ToastInput {
   action?: ReactNode;
   /** Reusing an id replaces the toast on screen instead of stacking a second one. */
   id?: string;
+  /** The organization the result belongs to; it is hidden while another one is open. */
+  scope?: string;
 }
 
 export interface ToastItem extends ToastInput {
@@ -37,6 +39,10 @@ export function toast(input: ToastInput): string {
 
 export function dismissToast(id: string): void {
   if (items.some((item) => item.id === id)) publish(items.filter((item) => item.id !== id));
+}
+
+export function visibleToasts(all: readonly ToastItem[], scope: string): readonly ToastItem[] {
+  return all.filter((item) => item.scope === undefined || item.scope === scope);
 }
 
 export function clearToasts(): void {

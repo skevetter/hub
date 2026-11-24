@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { clearToasts, dismissToast, MAX_TOASTS, toast, toastSnapshot } from "./toast-store.js";
+import {
+  clearToasts,
+  dismissToast,
+  MAX_TOASTS,
+  toast,
+  toastSnapshot,
+  visibleToasts,
+} from "./toast-store.js";
 
 function titles(): string[] {
   return toastSnapshot().map(({ title }) => title);
@@ -32,6 +39,14 @@ describe("toast store", () => {
     dismissToast(gone);
     dismissToast("missing");
     expect(titles()).toEqual(["Keep"]);
+  });
+
+  it("shows an organization's toast only while that organization is open", () => {
+    toast({ title: "Anywhere" });
+    toast({ title: "Acme only", scope: "acme" });
+    const all = toastSnapshot();
+    expect(visibleToasts(all, "acme").map(({ title }) => title)).toEqual(["Anywhere", "Acme only"]);
+    expect(visibleToasts(all, "globex").map(({ title }) => title)).toEqual(["Anywhere"]);
   });
 
   it("notifies the snapshot reader with a new array only when something changed", () => {

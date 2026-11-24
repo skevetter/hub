@@ -2,17 +2,18 @@ import { X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Button } from "../ui/button.js";
-import { dismissToast, useToasts, type ToastItem } from "./toast-store.js";
+import { dismissToast, useToasts, visibleToasts, type ToastItem } from "./toast-store.js";
 
 /** Long enough to read a sentence and reach a View link; hover and focus hold it open. */
 export const TOAST_DURATION_MS = 8000;
 
-function useDismissAfterDelay(id: string, held: boolean): void {
+/** Keyed on the item, so a replacement under the same id gets a fresh timeout. */
+function useDismissAfterDelay(item: ToastItem, held: boolean): void {
   useEffect(() => {
     if (held) return undefined;
-    const timer = window.setTimeout(() => dismissToast(id), TOAST_DURATION_MS);
+    const timer = window.setTimeout(() => dismissToast(item.id), TOAST_DURATION_MS);
     return () => window.clearTimeout(timer);
-  }, [id, held]);
+  }, [item, held]);
 }
 
 /** A toast stays while the pointer or the keyboard is on it, so a reader is never raced. */
@@ -33,7 +34,7 @@ function useHold() {
 
 function ToastCard({ item, returnFocusId }: { item: ToastItem; returnFocusId: string }) {
   const { held, handlers } = useHold();
-  useDismissAfterDelay(item.id, held);
+  useDismissAfterDelay(item, held);
   const dismiss = useCallback(() => {
     // The card is about to unmount with focus inside it; hand the keyboard back to the page.
     document.getElementById(returnFocusId)?.focus({ preventScroll: true });
@@ -72,8 +73,8 @@ function ToastCard({ item, returnFocusId }: { item: ToastItem; returnFocusId: st
  * joins the single status region that a page's own message uses. On a phone it sits under the top bar, clear of
  * the bottom bar and the sticky action bar; from `md` it sits at the bottom right.
  */
-export function Toaster({ returnFocusId }: { returnFocusId: string }) {
-  const items = useToasts();
+export function Toaster({ returnFocusId, scope }: { returnFocusId: string; scope: string }) {
+  const items = visibleToasts(useToasts(), scope);
   return (
     <div
       data-slot="toaster"

@@ -186,7 +186,7 @@ function DashboardContent(props: DashboardContentProps) {
         </SidebarInset>
       </SiteHeaderActionsProvider>
       <PhoneNavigation items={navigation.items.slice(0, 3)}>{sidebar}</PhoneNavigation>
-      <Toaster returnFocusId={CONTENT_ID} />
+      <Toaster returnFocusId={CONTENT_ID} scope={organization.slug} />
     </CommandMenuProvider>
   );
 }
