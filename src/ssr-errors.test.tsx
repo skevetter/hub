@@ -16,21 +16,32 @@ const reportFailure = vi.hoisted(() => vi.fn());
 vi.mock("./failures/index.js", () => ({ reportFailure }));
 
 const { getRouter } = await import("./router.js");
-const { installRouteErrorGuard, routeErrorAdapter, serializedRouteMessage } =
-  await import("./ssr-errors.js");
+const {
+  installRouteErrorGuard,
+  routeErrorAdapter,
+  routePromiseAdapter,
+  routeSerializationAdapters,
+  serializedRouteMessage,
+} = await import("./ssr-errors.js");
 
-const SERIALIZATION = { serializationAdapters: [routeErrorAdapter] };
+const SERIALIZATION = { serializationAdapters: routeSerializationAdapters };
 const REFERENCE = "12345678-1234-1234-1234-123456789abc";
 
 function rendered(error: unknown): Promise<string> {
-  const root = createRootRoute();
-  const broken = createRoute({
-    getParentRoute: () => root,
-    path: "/",
-    loader: () => {
-      throw error;
-    },
+  return renderedLoader(() => {
+    throw error;
   });
+}
+
+function rejected(reason: unknown): Promise<never> {
+  const pending = Promise.reject(reason);
+  pending.catch(() => undefined);
+  return pending;
+}
+
+function renderedLoader(loader: () => unknown): Promise<string> {
+  const root = createRootRoute();
+  const broken = createRoute({ getParentRoute: () => root, path: "/", loader });
   const router = createRouter({
     routeTree: root.addChildren([broken]),
     history: createMemoryHistory({ initialEntries: ["/"] }),
@@ -54,7 +65,9 @@ async function dehydrated(router: AnyRouter): Promise<string> {
 
 describe("server-rendered route errors", () => {
   it("is registered on the app router", () => {
-    expect(getRouter().options.serializationAdapters).toContain(routeErrorAdapter);
+    const adapters = getRouter().options.serializationAdapters;
+    expect(adapters).toContain(routeErrorAdapter);
+    expect(adapters).toContain(routePromiseAdapter);
   });
 
   it("keeps the original message out of the page and gives a reference", async () => {
@@ -73,6 +86,22 @@ describe("server-rendered route errors", () => {
     const html = await rendered(thrown);
     expect(html).not.toContain("SECRET");
     expect(html).toContain(`quote reference ${REFERENCE} when reporting it.`);
+  });
+
+  it.each([
+    ["a string", "SECRET_string_value"],
+    ["a plain object", { message: "SECRET_object_value", code: "SECRET_code" }],
+    ["an Error", new Error("SECRET_error_value")],
+  ])("keeps a promise in loader data rejected with %s out of the page", async (_name, reason) => {
+    reportFailure.mockReturnValue({ kind: "internal", requestId: REFERENCE });
+    const html = await renderedLoader(() => ({ rows: [{ pending: rejected(reason) }] }));
+    expect(html).not.toContain("SECRET");
+    expect(html).toContain(`quote reference ${REFERENCE} when reporting it.`);
+  });
+
+  it("still delivers a promise that resolves", async () => {
+    const html = await renderedLoader(() => ({ pending: Promise.resolve("visible_value") }));
+    expect(html).toContain("visible_value");
   });
 
   it("keeps an allowed message and an existing reference", async () => {

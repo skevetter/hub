@@ -34,6 +34,37 @@ function thrownValue(error: unknown): boolean {
   );
 }
 
+function asError(reason: unknown): unknown {
+  if (!thrownValue(reason)) return reason;
+  return new Error("A promise was rejected with a value that is not an Error.", { cause: reason });
+}
+
+// The value type is a stand-in: the router's serialization types accept only known shapes.
+type RoutePromise = Promise<string>;
+
+const normalized = new WeakSet<RoutePromise>();
+
+/**
+ * A promise in loader data is serialized as a rejection when it fails, and the rejection value
+ * does not pass through the error adapter unless it is an Error. This swaps each promise for one
+ * that rejects only with an Error. The swapped promise is remembered so it is not swapped again.
+ */
+export const routePromiseAdapter = createSerializationAdapter({
+  key: "hub-route-promise",
+  test: (value: unknown): value is RoutePromise =>
+    typeof window === "undefined" && value instanceof Promise && !normalized.has(value),
+  toSerializable: (promise: RoutePromise) => {
+    const safe = promise.catch((reason: unknown): string => {
+      throw asError(reason);
+    });
+    normalized.add(safe);
+    return safe;
+  },
+  fromSerializable: (promise: RoutePromise) => promise,
+});
+
+export const routeSerializationAdapters = [routeErrorAdapter, routePromiseAdapter];
+
 interface MatchState {
   id: string;
   error?: unknown;
