@@ -6,6 +6,7 @@ import { getApplication } from "../server/runtime.js";
 import { respondWithFailure } from "../failures/index.js";
 import { isTenantRouteNotFoundError } from "./access.js";
 import { ProjectCommandError } from "./command-error.js";
+import { ORGANIZATION_UNAVAILABLE, PROJECT_UNAVAILABLE } from "./unavailable.js";
 import type { ProjectDashboard } from "./dashboard.js";
 
 const organizationScopeSchema = z
@@ -68,7 +69,7 @@ function unavailable(): never {
 
 export function readUnavailableMessage(error: unknown, projectScoped: boolean): string {
   if (isTenantRouteNotFoundError(error)) {
-    return projectScoped ? "Project unavailable." : "Organization unavailable.";
+    return projectScoped ? PROJECT_UNAVAILABLE : ORGANIZATION_UNAVAILABLE;
   }
   return projectScoped
     ? "Hub couldn't load this project's configuration. Reload the page to try again."
