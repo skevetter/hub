@@ -72,12 +72,14 @@ test.describe("desktop Attention", () => {
     await expect(dialog).toBeHidden();
 
     await hub.seedSuspendedGitHubConnection(ORGANIZATION);
+    const intercepted = Promise.withResolvers<void>();
     const held = Promise.withResolvers<void>();
     const snapshotPath = new URL(snapshot.url()).pathname;
     const interceptSnapshot = (url: URL) => url.pathname === snapshotPath;
     await page.route(
       interceptSnapshot,
       async (route) => {
+        intercepted.resolve();
         await held.promise;
         await route.continue();
       },
@@ -85,6 +87,7 @@ test.describe("desktop Attention", () => {
     );
     try {
       await page.reload();
+      await intercepted.promise;
       if (!(await collapsed.isVisible())) await toggle.click();
       await expect(empty.locator("svg")).toBeVisible();
       await expect(empty.locator(".bg-attention")).toHaveCount(0);
