@@ -562,9 +562,59 @@ it.each(["postgres", "memory"] as const)(
   },
 );
 
+async function seedStopRulePlan(window: typeof matchWindow) {
+  const { database, runtime } = pg;
+  const { trigger } = await matchTrigger(database, {
+    name: "plan",
+    events: ["github.notification"],
+  });
+  const { runtimeProjectId: projectId } = trigger;
+  const project = await database.findProjectById(projectId);
+  assert.ok(project?.activeConfigurationRevisionId);
+  await runtime.query(
+    `with receipts as (
+       insert into provider_event_receipts
+         (organization_id, provider, delivery_id, source, payload, received_at, dropped_reason)
+       select $1, 'github_notification', gen_random_uuid()::text, 'github.notification', '{}',
+         case when n <= 5000 then $2::timestamptz - interval '40 days'
+              when n <= 5032 then $2::timestamptz + interval '1 day'
+              else $3::timestamptz + interval '1 day' end,
+         case when n > 5032 then 'trigger_filters_rejected' end
+       from generate_series(1, 5064) n returning id, received_at, dropped_reason
+     )
+     insert into trigger_runs
+       (organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
+        configured_trigger_name, status, prompt, deadline_at, created_at)
+     select $1, $4, $5, id, 'plan', 'succeeded', '', received_at + interval '1 hour', received_at
+     from receipts where dropped_reason is null`,
+    [
+      org,
+      window.previousStart,
+      window.recentStart,
+      projectId,
+      project.activeConfigurationRevisionId,
+    ],
+  );
+  await runtime.query("analyze provider_event_receipts, trigger_runs");
+}
+
 it("uses indexed receipt and run lookups for the stop rule", async () => {
-  const { runtime } = pg;
-  const { previousStart, recentStart, now } = matchWindow;
+  const { database, runtime } = pg;
+  const window = {
+    previousStart: new Date("2026-07-01T00:00:00Z"),
+    recentStart: new Date("2026-07-08T00:00:00Z"),
+    now: new Date("2026-07-15T00:00:00Z"),
+  };
+  await seedStopRulePlan(window);
+  const activity = (await database.listTriggerMatchActivity(org, window)).find(
+    ({ name }) => name === "plan",
+  );
+  expect(activity).toMatchObject({
+    previousMatches: 32,
+    recentMatches: 0,
+    providers: [{ provider: "github_notification", recentEvents: 32 }],
+  });
+  const { previousStart, recentStart, now } = window;
   const plans = await Promise.all([
     runtime.query(`explain (analyze, buffers) ${TRIGGER_MATCHES_SQL}`, [
       org,
