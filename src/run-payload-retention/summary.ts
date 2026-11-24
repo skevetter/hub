@@ -139,13 +139,16 @@ function githubProgressLink(ref: unknown): string | null {
     : null;
 }
 
-export function summarizeRunPayload(
-  run: TriggerRunRecord,
-  receipt: Pick<ProviderEventReceiptSummary, "provider" | "repo">,
-  stepCounts: RunPayloadSummary["stepCounts"],
-  timeline: Pick<RunTimelineState, "eventCount" | "droppedCount"> | undefined,
-  progress: Pick<RunProgressMessage, "state" | "provider" | "externalRef"> | undefined,
-): RunPayloadSummary {
+export interface RunPayloadSummaryInput {
+  run: TriggerRunRecord;
+  receipt: Pick<ProviderEventReceiptSummary, "provider" | "repo">;
+  stepCounts: RunPayloadSummary["stepCounts"];
+  timeline: Pick<RunTimelineState, "eventCount" | "droppedCount"> | undefined;
+  progress: Pick<RunProgressMessage, "state" | "provider" | "externalRef"> | undefined;
+}
+
+export function summarizeRunPayload(input: RunPayloadSummaryInput): RunPayloadSummary {
+  const { run, receipt, stepCounts, timeline, progress } = input;
   const repo = repositoryName(receipt.repo);
   return {
     version: 1,

@@ -425,13 +425,13 @@ async function stageRunPayload(client: QueryHandle, row: TriggerRunRow, now: Dat
   );
   const stepCounts: RunPayloadSummary["stepCounts"] = {};
   for (const count of counts.rows) stepCounts[count.status] = count.count;
-  const summary = summarizeRunPayload(
+  const summary = summarizeRunPayload({
     run,
-    requireReturnedRow(receipt.rows[0], "trigger run receipt"),
+    receipt: requireReturnedRow(receipt.rows[0], "trigger run receipt"),
     stepCounts,
-    timeline.rows[0],
-    progress.rows[0],
-  );
+    timeline: timeline.rows[0],
+    progress: progress.rows[0],
+  });
   await client.query(
     `update trigger_runs set payload_expiry_state = 'expiring', payload_expired_at = $2,
       payload_summary = $3, prompt = '', inputs = '{}', values = '{}', trigger_context = '{}',
@@ -1708,6 +1708,24 @@ class PgDatabase implements Database {
       [triggerRunId, generation, now],
     );
     return rows.rowCount === 1;
+  }
+
+  async renewWorkflowRunTerminalNotification(
+    triggerRunId: string,
+    generation: number,
+    now: Date,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const result = await query(
+      this.pool,
+      `update trigger_runs
+       set terminal_notification_lease_expires_at = $4
+       where id = $1 and terminal_notification_generation = $2 and outcome = 'accepted'
+         and terminal_notification_lease_expires_at > $3
+         and terminal_notification_delivered_at is null and payload_expiry_state is null`,
+      [triggerRunId, generation, now, new Date(now.getTime() + leaseMs)],
+    );
+    return result.rowCount === 1;
   }
 
   async markWorkflowRunTerminalNotificationDelivered(

@@ -1569,6 +1569,12 @@ export interface Database
     generation: number,
     now: Date,
   ): Promise<boolean>;
+  renewWorkflowRunTerminalNotification(
+    triggerRunId: string,
+    generation: number,
+    now: Date,
+    leaseMs: number,
+  ): Promise<boolean>;
   markWorkflowRunTerminalNotificationDelivered(
     triggerRunId: string,
     generation: number,

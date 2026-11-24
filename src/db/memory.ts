@@ -1899,13 +1899,13 @@ class MemoryDatabase implements Database {
     for (const step of steps) stepCounts[step.status] = (stepCounts[step.status] ?? 0) + 1;
     const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
     if (receipt === undefined) throw new Error("run payload receipt unavailable");
-    const summary = summarizeRunPayload(
+    const summary = summarizeRunPayload({
       run,
       receipt,
       stepCounts,
-      this.runTimelineStates.get(run.id),
-      this.runProgressMessages.get(run.id),
-    );
+      timeline: this.runTimelineStates.get(run.id),
+      progress: this.runProgressMessages.get(run.id),
+    });
     const reduced = {
       ...run,
       payloadExpiredAt: new Date(now),
@@ -3353,9 +3353,8 @@ class MemoryDatabase implements Database {
         );
       }
     }
-    const currentRun = this.triggerRuns.get(run.id);
-    if (currentRun?.status === "canceled")
-      return { stepRun: this.workflowStepRuns.get(step.id)!, execution: undefined, created: false };
+    const canceled = this.canceledWorkflowStepStart(step, run.id);
+    if (canceled !== undefined) return canceled;
     const { deadlineAt, idleDeadlineAt } = workflowStepExecutionDeadlines(input, run);
     const execution = await this.insertAgentExecution({
       ...input.execution,
@@ -3380,15 +3379,23 @@ class MemoryDatabase implements Database {
     return undefined;
   }
 
+  private canceledWorkflowStepStart(step: WorkflowStepRunRecord, runId: string) {
+    if (this.triggerRuns.get(runId)?.status !== "canceled") return undefined;
+    return {
+      stepRun: this.workflowStepRuns.get(step.id) ?? step,
+      execution: undefined,
+      created: false as const,
+    };
+  }
+
   private markWorkflowStepExecutionStarted(
     step: WorkflowStepRunRecord,
     run: AcceptedTriggerRunRecord,
     input: WorkflowStepExecutionInput,
     execution: AgentExecutionRecord,
   ) {
-    const currentStep = this.workflowStepRuns.get(step.id)!;
-    if (this.triggerRuns.get(run.id)?.status === "canceled")
-      return { stepRun: currentStep, execution: undefined, created: false };
+    const canceled = this.canceledWorkflowStepStart(step, run.id);
+    if (canceled !== undefined) return canceled;
     const updated: WorkflowStepRunRecord = {
       ...step,
       status: "running",
@@ -4134,15 +4141,34 @@ class MemoryDatabase implements Database {
   }
 
   async ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number, now: Date) {
+    return this.ownedTerminalNotification(triggerRunId, generation, now) !== undefined;
+  }
+
+  async renewWorkflowRunTerminalNotification(
+    triggerRunId: string,
+    generation: number,
+    now: Date,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const run = this.ownedTerminalNotification(triggerRunId, generation, now);
+    if (run === undefined) return false;
+    this.triggerRuns.set(run.id, {
+      ...run,
+      terminalNotificationLeaseExpiresAt: new Date(now.getTime() + leaseMs),
+    });
+    return true;
+  }
+
+  private ownedTerminalNotification(triggerRunId: string, generation: number, now: Date) {
     const run = this.triggerRuns.get(triggerRunId);
-    return (
-      run?.outcome === "accepted" &&
-      run.payloadExpiredAt == null &&
+    return run?.outcome === "accepted" &&
+      run.payloadExpiryState == null &&
       run.terminalNotificationGeneration === generation &&
       run.terminalNotificationDeliveredAt === null &&
       run.terminalNotificationLeaseExpiresAt !== null &&
       run.terminalNotificationLeaseExpiresAt > now
-    );
+      ? run
+      : undefined;
   }
 
   async markWorkflowRunTerminalNotificationDelivered(
