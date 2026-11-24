@@ -1723,6 +1723,8 @@ async function initializeGitWorkspace(workspace: string): Promise<void> {
       "user.name=Hub E2E",
       "-c",
       "user.email=hub-e2e@example.invalid",
+      "-c",
+      "commit.gpgsign=false",
       "commit",
       "-qm",
       "fixture",
