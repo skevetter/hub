@@ -10,7 +10,7 @@ export function getRouter() {
     defaultOptions: { mutations: { networkMode: "always" } },
   });
   if (typeof window !== "undefined") resetQueriesOnReaderChange(queryClient);
-  const history: { current?: { location: { search: string } } } = {};
+  const current: { router?: { history: { location: { search: string } } } } = {};
   const router = createRouter({
     routeTree,
     scrollRestoration: true,
@@ -18,12 +18,12 @@ export function getRouter() {
     defaultErrorComponent: RouteErrorBoundary,
     defaultNotFoundComponent: RouteNotFound,
     // The router re-serialises the query it parses; this keeps the bytes the visitor sent.
-    context: { queryClient, rawSearch: () => history.current?.location.search ?? "" },
+    context: { queryClient, rawSearch: () => current.router?.history.location.search ?? "" },
     Wrap: ({ children }) => (
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     ),
   });
-  history.current = router.history;
+  current.router = router;
   return router;
 }
 

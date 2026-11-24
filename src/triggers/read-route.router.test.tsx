@@ -1,12 +1,6 @@
-import { QueryClient } from "@tanstack/react-query";
-import {
-  createMemoryHistory,
-  createRouter,
-  defaultParseSearch,
-  Outlet,
-} from "@tanstack/react-router";
+import { createMemoryHistory, defaultParseSearch, Outlet } from "@tanstack/react-router";
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { routeTree } from "../routeTree.gen.js";
+import { getRouter } from "../router.js";
 import { Route as RootRoute } from "../routes/__root.js";
 import { Route as ShellRoute } from "../routes/_shell.js";
 
@@ -28,11 +22,11 @@ async function follow(start: string): Promise<string[]> {
   const visited = [start];
   let path = start;
   for (let hops = 0; hops < 4; hops += 1) {
-    const history = createMemoryHistory({ initialEntries: [path] });
-    const router = createRouter({
-      routeTree,
-      history,
-      context: { queryClient: new QueryClient(), rawSearch: () => history.location.search },
+    // The server builds the router first and swaps in the request's history afterwards.
+    const router = getRouter();
+    router.update({
+      ...router.options,
+      history: createMemoryHistory({ initialEntries: [path] }),
     });
     await router.load();
     const next = router.state.redirect?.options.href;
