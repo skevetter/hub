@@ -14,21 +14,22 @@ describe("Slack webhook", () => {
     const body = new TextEncoder().encode('{"text":"héllo"}');
     const signature = sign(timestamp, body);
 
-    assert.equal(verifySlackSignature(SECRET, timestamp, body, signature, NOW), true);
-    assert.equal(
-      verifySlackSignature(SECRET, timestamp, body, sign(timestamp, "different"), NOW),
-      false,
-    );
-    assert.equal(
-      verifySlackSignature(SECRET, String(Number(timestamp) - 301), body, signature, NOW),
-      false,
-    );
-    assert.equal(
-      verifySlackSignature(SECRET, String(Number(timestamp) + 301), body, signature, NOW),
-      false,
-    );
-    assert.equal(verifySlackSignature(SECRET, "not-a-time", body, signature, NOW), false);
-    assert.equal(verifySlackSignature(SECRET, timestamp, body, "v0=short", NOW), false);
+    const verify = (overrides: { timestamp?: string; signature?: string }) =>
+      verifySlackSignature({
+        secret: SECRET,
+        timestamp,
+        body,
+        signature,
+        nowMilliseconds: NOW,
+        ...overrides,
+      });
+
+    assert.equal(verify({}), true);
+    assert.equal(verify({ signature: sign(timestamp, "different") }), false);
+    assert.equal(verify({ timestamp: String(Number(timestamp) - 301) }), false);
+    assert.equal(verify({ timestamp: String(Number(timestamp) + 301) }), false);
+    assert.equal(verify({ timestamp: "not-a-time" }), false);
+    assert.equal(verify({ signature: "v0=short" }), false);
   });
 
   it("answers a signed URL verification without accepting an event", async () => {

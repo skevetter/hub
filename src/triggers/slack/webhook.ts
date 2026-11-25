@@ -10,7 +10,7 @@ import { SlackUrlVerificationSchema } from "./events.js";
 
 const MAX_WEBHOOK_BYTES = 1_048_576;
 const MAX_TIMESTAMP_SKEW_SECONDS = 5 * 60;
-const SlackEnvelopeTypeSchema = z.object({ type: z.string() }).passthrough();
+const SlackEnvelopeTypeSchema = z.object({ type: z.string() }).loose();
 
 export interface SlackWebhookSourceOptions {
   appId: string;
@@ -67,7 +67,15 @@ async function verifySlackRequest(
 
   const body = await readBoundedRequestBody(request, MAX_WEBHOOK_BYTES);
   if (body instanceof Response) return body;
-  if (!verifySlackSignature(options.signingSecret, timestamp, body, signature, options.now?.())) {
+  if (
+    !verifySlackSignature({
+      secret: options.signingSecret,
+      timestamp,
+      body,
+      signature,
+      nowMilliseconds: options.now?.(),
+    })
+  ) {
     reportSlackRejection("signature_verification_failed", 401, options.signingSecret, signature);
     return new Response("Unauthorized", { status: 401 });
   }
@@ -153,13 +161,16 @@ function matchesConfiguredApp(requestAppId: string | undefined, configuredAppId:
   return requestAppId === undefined || requestAppId === configuredAppId;
 }
 
-export function verifySlackSignature(
-  secret: string,
-  timestamp: string,
-  body: string | Uint8Array,
-  signature: string,
-  nowMilliseconds = Date.now(),
-): boolean {
+export interface SlackSignatureInput {
+  secret: string;
+  timestamp: string;
+  body: string | Uint8Array;
+  signature: string;
+  nowMilliseconds?: number | undefined;
+}
+
+export function verifySlackSignature(input: SlackSignatureInput): boolean {
+  const { secret, timestamp, body, signature, nowMilliseconds = Date.now() } = input;
   if (!/^\d+$/u.test(timestamp) || !/^v0=[a-f0-9]{64}$/u.test(signature)) return false;
   const seconds = Number(timestamp);
   if (!Number.isSafeInteger(seconds)) return false;

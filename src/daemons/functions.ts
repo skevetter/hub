@@ -7,21 +7,21 @@ import { getApplication } from "../server/runtime.js";
 import type { HubProviderSnapshot } from "../hub/protocol.js";
 
 const daemonSchema = z.object({
-  id: z.string().uuid(),
+  id: z.uuid(),
   slug: z.string(),
   status: z.enum(["active", "revoked"]),
   presence: z.enum(["offline", "connected"]),
-  connectedAt: z.string().datetime().nullable(),
-  lastSeenAt: z.string().datetime(),
-  registeredAt: z.string().datetime(),
+  connectedAt: z.iso.datetime().nullable(),
+  lastSeenAt: z.iso.datetime(),
+  registeredAt: z.iso.datetime(),
   permissions: z.array(z.string()),
 });
 const daemonListSchema = z.object({
   daemons: z.array(daemonSchema),
   canManage: z.boolean(),
 });
-const renameSchema = z.object({ daemonId: z.string().uuid(), slug: z.string() });
-const daemonIdSchema = z.object({ daemonId: z.string().uuid() });
+const renameSchema = z.object({ daemonId: z.uuid(), slug: z.string() });
+const daemonIdSchema = z.object({ daemonId: z.uuid() });
 const organizationScopeSchema = z.object({ organizationSlug: z.string().min(1) });
 const scopedRenameSchema = organizationScopeSchema.extend(renameSchema.shape);
 const scopedDaemonIdSchema = organizationScopeSchema.extend(daemonIdSchema.shape);
@@ -78,7 +78,7 @@ export const daemonList = createServerFn({ method: "GET" })
           "daemon.list",
           response,
           "Hub couldn't load this organization's daemons. Reload the page.",
-          data.organizationSlug,
+          { organizationSlug: data.organizationSlug },
         );
       }
       return respondOk(daemonListSchema.parse(await response.json()));
@@ -134,8 +134,7 @@ export const renameDaemon = createServerFn({ method: "POST" })
           "daemon.rename",
           response,
           "Hub couldn't rename the daemon. Reload its current name before submitting again.",
-          data.organizationSlug,
-          data.daemonId,
+          data,
         );
       return respondOk({ state: "complete" });
     } catch (error) {
@@ -173,8 +172,7 @@ export const revokeDaemon = createServerFn({ method: "POST" })
           "daemon.revoke",
           response,
           "Hub couldn't revoke the daemon. Reload its status before submitting again.",
-          data.organizationSlug,
-          data.daemonId,
+          data,
         );
       return respondOk({ state: "complete" });
     } catch (error) {
@@ -218,12 +216,11 @@ function daemonResponseFailure(
   operation: string,
   response: Response,
   message: string,
-  organizationSlug: string,
-  daemonId?: string,
+  data: { organizationSlug: string; daemonId?: string },
 ) {
   return respondWithFailure(
     new Error(`daemon operation returned HTTP ${response.status}`),
-    { ...daemonContext(operation, organizationSlug, daemonId), status: response.status },
+    { ...daemonContext(operation, data.organizationSlug, data.daemonId), status: response.status },
     {
       fallback: message,
       authentication: message,

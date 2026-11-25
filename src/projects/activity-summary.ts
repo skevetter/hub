@@ -35,7 +35,7 @@ export interface TriggerSummary {
 
 const ManualTriggerPayloadSchema = z
   .object({ trigger: z.string().optional(), actor: z.string().optional() })
-  .passthrough();
+  .loose();
 
 const WebhookTriggerPayloadSchema = z
   .object({
@@ -43,7 +43,7 @@ const WebhookTriggerPayloadSchema = z
     actor: z.string().optional(),
     input: z.string().optional(),
   })
-  .passthrough();
+  .loose();
 
 /**
  * Turns a trigger's raw provider payload into the one line a human needs to recognise
@@ -209,20 +209,23 @@ function summarizeLinear(payload: unknown): TriggerSummary {
   if (!event.success) {
     return { provider: "linear", headline: "Linear event", actor: null, externalUrl: null };
   }
-  const issue = event.data.type === "issue" ? event.data.issue : event.data.issue;
+  return summarizeLinearEvent(event.data);
+}
+
+function summarizeLinearEvent(data: z.infer<typeof NormalizedLinearEventSchema>): TriggerSummary {
+  const { issue, actor } = data;
   if (issue === null) {
     return {
       provider: "linear",
       headline: "Linear comment",
-      actor: event.data.actor?.name ?? null,
+      actor: actor?.name ?? null,
       externalUrl: null,
     };
   }
-  const prefix = issue.identifier === undefined ? "Issue" : issue.identifier;
   return {
     provider: "linear",
-    headline: `${prefix}: ${truncate(issue.title, 96)}`,
-    actor: event.data.actor?.name ?? event.data.actor?.id ?? null,
+    headline: `${issue.identifier ?? "Issue"}: ${truncate(issue.title, 96)}`,
+    actor: actor?.name ?? actor?.id ?? null,
     externalUrl: issue.url ?? null,
   };
 }
