@@ -150,6 +150,11 @@ export interface WaitingSessionSummary {
   sessions: { name: string }[];
 }
 
+export interface SessionAttention {
+  hasActiveProfile: boolean;
+  waiting: WaitingSessionSummary;
+}
+
 export type DroppedEventPresence = "some" | "none" | "unknown";
 
 export interface DroppedProviderEventCount {
@@ -1981,9 +1986,17 @@ export interface Database
     since: Date,
     seenThrough: string | null,
   ): Promise<FailedRunSummary>;
+  /** The failed runs the reader has not marked seen, in one read with the marker itself. */
+  countUnseenFailedRuns(
+    accountId: string,
+    organizationId: string,
+    since: Date,
+  ): Promise<FailedRunSummary>;
   readFailedRunsSeenThrough(accountId: string, organizationId: string): Promise<string | null>;
   /** Hides every failed run in the window that has ended so far; later failures stay unseen. */
   markFailedRunsSeen(accountId: string, organizationId: string, since: Date): Promise<void>;
+  /** Whether the organization has an active profile, and the sessions waiting on the viewer. */
+  readSessionAttention(viewer: SessionPrincipal, limit: number): Promise<SessionAttention>;
   hasActiveSessionProfile(organizationId: string): Promise<boolean>;
   listSessionsWaitingForPermission(
     organizationId: string,

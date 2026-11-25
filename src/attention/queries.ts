@@ -1,5 +1,5 @@
 import type { QueryHandle } from "../db/runtime/index.js";
-import type { FailedRunSummary, WaitingSessionSummary } from "../db/types.js";
+import type { FailedRunSummary, SessionAttention, WaitingSessionSummary } from "../db/types.js";
 import type { SessionPrincipal } from "../interactive-sessions/types.js";
 
 import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
@@ -7,7 +7,7 @@ import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 // A run is unseen by when it ended badly, not when its event arrived: an event received before
 // "Mark seen" can fail after it. Rejected runs are created finished and set completed_at too;
 // the created_at fallback only covers a row that predates that.
-export const FAILED_RUNS_SQL = `select
+const failedRunsSql = (seenThrough: string) => `select
     count(*) over ()::int as count,
     coalesce((
       select case when count(*) = 1 then min(trigger.name) end
@@ -22,25 +22,50 @@ export const FAILED_RUNS_SQL = `select
     from trigger_runs
     where provider_event_receipt_id = receipt.id and organization_id = $1
       and status = any($4::text[])
-      and coalesce(completed_at, created_at) > coalesce($3::timestamptz, '-infinity'::timestamptz)
+      and coalesce(completed_at, created_at) > coalesce(${seenThrough}, '-infinity'::timestamptz)
     offset 0
   ) run on true
   where receipt.organization_id = $1 and receipt.received_at >= $2
   order by run.failed_at desc, run.id desc
   limit 1`;
 
-export async function countFailedRunsSince(
+export const FAILED_RUNS_SQL = failedRunsSql("$3::timestamptz");
+
+// The reader's marker is read in the same statement, so a snapshot needs one round trip.
+export const UNSEEN_FAILED_RUNS_SQL = failedRunsSql(
+  `(select failed_runs_seen_through from account_attention_state
+     where account_id = $3 and organization_id = $1)`,
+);
+
+export function countFailedRunsSince(
   database: QueryHandle,
   organizationId: string,
   since: Date,
   seenThrough: string | null,
 ): Promise<FailedRunSummary> {
+  return failedRunSummary(database, FAILED_RUNS_SQL, [organizationId, since, seenThrough]);
+}
+
+export function countUnseenFailedRuns(
+  database: QueryHandle,
+  accountId: string,
+  organizationId: string,
+  since: Date,
+): Promise<FailedRunSummary> {
+  return failedRunSummary(database, UNSEEN_FAILED_RUNS_SQL, [organizationId, since, accountId]);
+}
+
+async function failedRunSummary(
+  database: QueryHandle,
+  sql: string,
+  params: readonly unknown[],
+): Promise<FailedRunSummary> {
   const {
     rows: [row],
-  } = await database.query<{ count: number; trigger_name: string; failed_at: Date }>(
-    FAILED_RUNS_SQL,
-    [organizationId, since, seenThrough, [...FAILED_RUN_STATUSES]],
-  );
+  } = await database.query<{ count: number; trigger_name: string; failed_at: Date }>(sql, [
+    ...params,
+    [...FAILED_RUN_STATUSES],
+  ]);
   return row === undefined
     ? { count: 0, newest: null }
     : {
@@ -82,6 +107,34 @@ export async function listSessionsWaitingForPermission(
     limit,
   ]);
   return { count: rows[0]?.count ?? 0, sessions: rows.map(({ name }) => ({ name })) };
+}
+
+// The profile check rides on the waiting-sessions statement, so Attention reads both at once.
+export const SESSION_ATTENTION_SQL = `select
+    exists (
+      select 1 from interactive_session_profiles where organization_id = $1 and status = 'active'
+    ) as has_profile,
+    waiting.name, waiting.count
+  from (select 1) anchor
+  left join lateral (${WAITING_SESSIONS_SQL}) waiting on true`;
+
+export async function readSessionAttention(
+  database: QueryHandle,
+  viewer: SessionPrincipal,
+  limit: number,
+): Promise<SessionAttention> {
+  const { rows } = await database.query<{
+    has_profile: boolean;
+    name: string | null;
+    count: number | null;
+  }>(SESSION_ATTENTION_SQL, [viewer.organizationId, viewer.userId, Math.max(limit, 0)]);
+  return {
+    hasActiveProfile: rows[0]?.has_profile === true,
+    waiting: {
+      count: rows[0]?.count ?? 0,
+      sessions: rows.flatMap(({ name }) => (name === null ? [] : [{ name }])),
+    },
+  };
 }
 
 export async function hasActiveSessionProfile(database: QueryHandle, organizationId: string) {

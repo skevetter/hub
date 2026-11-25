@@ -10,6 +10,7 @@ import { createDatabase } from "../db/pg.js";
 import { embeddedDatabaseRuntime } from "../db/runtime/index.js";
 import type { Database } from "../db/types.js";
 import { HomeDashboard } from "../home/dashboard.js";
+import { ProjectTenantResolver } from "../projects/access.js";
 import { AttentionDashboard } from "./dashboard.js";
 import {
   attentionSnapshotRequest as snapshot,
@@ -60,7 +61,7 @@ it("requires a same-origin POST and does not write a marker on rejection", async
 
 it("counts only the active tenant's failures and drops them after Mark seen", async () => {
   const { database, organizationId, request, slug } = fixture;
-  const sessionRead = vi.spyOn(database, "listSessionsWaitingForPermission");
+  const sessionRead = vi.spyOn(database, "readSessionAttention");
   try {
     await seedFailedRun(database, foreign, "Foreign job");
     expect(await snapshot(request(), slug)).toMatchObject({ status: "ok", data: { items: [] } });
@@ -134,6 +135,33 @@ it("acts only on the organization in the address when the session's active organ
   assert.equal(untouched.status, "ok");
   expect(untouched.data.items[0]?.detail).toContain("Other job");
 });
+
+// Before the reads were folded together a snapshot cost 12 statements besides sign-in, 14 with
+// Sessions on. Tenant resolution is measured on its own so an auth change cannot hide a read.
+it.each([
+  { interactiveSessions: false, reads: 6 },
+  { interactiveSessions: true, reads: 7 },
+])(
+  "reads a snapshot in $reads statements with Sessions $interactiveSessions",
+  async ({ interactiveSessions, reads }) => {
+    const { accountId, auth, database, request, runtime, slug } = fixture;
+    const counting = vi.spyOn(runtime, "query");
+    try {
+      await new ProjectTenantResolver(database).resolve({
+        userId: accountId,
+        organizationSlug: slug,
+      });
+      const tenant = counting.mock.calls.length;
+      await new AttentionDashboard(database, auth, { interactiveSessions }).snapshot(
+        request(),
+        slug,
+      );
+      expect(counting.mock.calls.length - 2 * tenant).toBe(reads);
+    } finally {
+      counting.mockRestore();
+    }
+  },
+);
 
 async function seedFailedRun(database: Database, organizationId: string, name: string) {
   await failRun(database, await seedRunningRun(database, organizationId, name));

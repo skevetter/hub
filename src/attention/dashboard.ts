@@ -18,7 +18,8 @@ export class AttentionDashboard {
       organizationSlug,
     });
     const { id: organizationId, slug } = tenant.organization;
-    const reader = { organizationId, userId: account.account.id, role: tenant.membership.role };
+    const userId = account.account.id;
+    const reader = { organizationId, userId, role: tenant.membership.role };
     const now = this.options.now?.() ?? new Date();
     const windowMs = ATTENTION_WINDOW_DAYS * 86_400_000;
     const since = new Date(now.getTime() - windowMs);
@@ -33,7 +34,7 @@ export class AttentionDashboard {
           now,
         }),
         this.database.countRecentDroppedEvents(organizationId, since),
-        this.failedRuns(reader, since),
+        this.database.countUnseenFailedRuns(userId, organizationId, since),
         this.sessions(reader),
       ]);
     return {
@@ -64,17 +65,9 @@ export class AttentionDashboard {
     await this.database.markFailedRunsSeen(account.account.id, tenant.organization.id, since);
   }
 
-  private async failedRuns({ organizationId, userId }: SessionPrincipal, since: Date) {
-    const seenThrough = await this.database.readFailedRunsSeenThrough(userId, organizationId);
-    return this.database.countFailedRunsSince(organizationId, since, seenThrough);
-  }
-
-  private async sessions(reader: SessionPrincipal) {
-    if (this.options.interactiveSessions !== true) return null;
-    const [hasActiveProfile, waiting] = await Promise.all([
-      this.database.hasActiveSessionProfile(reader.organizationId),
-      this.database.listSessionsWaitingForPermission(reader.organizationId, reader, 1),
-    ]);
-    return { hasActiveProfile, waiting };
+  private sessions(reader: SessionPrincipal) {
+    return this.options.interactiveSessions === true
+      ? this.database.readSessionAttention(reader, 1)
+      : null;
   }
 }
