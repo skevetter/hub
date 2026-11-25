@@ -23,13 +23,18 @@ describe("Slack webhook", () => {
         nowMilliseconds: NOW,
         ...overrides,
       });
+    const verifyValidlySigned = (skewedTimestamp: string) =>
+      verify({ timestamp: skewedTimestamp, signature: sign(skewedTimestamp, body) });
+    const secondsFromNow = (seconds: number) => String(Number(timestamp) + seconds);
 
     assert.equal(verify({}), true);
     assert.equal(verify({ signature: sign(timestamp, "different") }), false);
-    assert.equal(verify({ timestamp: String(Number(timestamp) - 301) }), false);
-    assert.equal(verify({ timestamp: String(Number(timestamp) + 301) }), false);
-    assert.equal(verify({ timestamp: "not-a-time" }), false);
     assert.equal(verify({ signature: "v0=short" }), false);
+    assert.equal(verifyValidlySigned(secondsFromNow(-300)), true);
+    assert.equal(verifyValidlySigned(secondsFromNow(300)), true);
+    assert.equal(verifyValidlySigned(secondsFromNow(-301)), false);
+    assert.equal(verifyValidlySigned(secondsFromNow(301)), false);
+    assert.equal(verifyValidlySigned("not-a-time"), false);
   });
 
   it("answers a signed URL verification without accepting an event", async () => {
