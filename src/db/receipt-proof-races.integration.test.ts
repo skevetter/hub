@@ -40,6 +40,13 @@ async function fixture(harness: TimelinePostgresHarness, route: ProviderEventRou
 const writers = ["accepted", "rejected", "drop", "attachment"] as const;
 type Writer = (typeof writers)[number];
 
+function assertReceiptExpiryState(
+  receipt: Awaited<ReturnType<Database["findProviderEventReceiptById"]>>,
+  state: "expiring" | "expired" | null,
+): void {
+  assert.equal(receipt?.payloadExpiryState, state);
+}
+
 async function write(
   database: Database,
   writer: Writer,
@@ -72,6 +79,7 @@ async function write(
       );
     case "drop":
       return database.markProviderEventDropped(id, "configuration_unavailable", MATRIX_ORG);
+    case "attachment":
     default:
       return database.insertAttachment({
         providerEventReceiptId: id,
@@ -293,14 +301,11 @@ describe("production receipt expiry lock ordering", () => {
         changedOrMissing: 0,
       });
       assert.equal(stopped, false);
-      assert.equal(
-        (await other.database.findProviderEventReceiptById(first.id))?.payloadExpiryState,
+      assertReceiptExpiryState(
+        await other.database.findProviderEventReceiptById(first.id),
         "expiring",
       );
-      assert.equal(
-        (await other.database.findProviderEventReceiptById(fresh.id))?.payloadExpiryState,
-        null,
-      );
+      assertReceiptExpiryState(await other.database.findProviderEventReceiptById(fresh.id), null);
       release.resolve();
       await stopping;
       assert.equal(stopped, true);

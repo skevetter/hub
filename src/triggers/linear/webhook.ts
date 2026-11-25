@@ -64,6 +64,20 @@ interface VerifiedLinearRequest {
   receivedAt: Date;
 }
 
+type NormalizedLinearEvent = NonNullable<ReturnType<typeof normalizeLinearEvent>>;
+
+interface LinearHandoff {
+  verified: VerifiedLinearRequest;
+  handlers: Set<TriggerHandler>;
+  options: LinearWebhookSourceOptions;
+}
+
+interface LinearDispatch extends LinearHandoff {
+  event: NormalizedLinearEvent;
+  source: "linear.issue" | "linear.comment";
+  preserveBindingDrop?: boolean;
+}
+
 export function createLinearWebhookSource(
   options: LinearWebhookSourceOptions,
 ): LinearWebhookEndpoint {
@@ -135,18 +149,10 @@ async function handoffLinearEvent(
     if (event === undefined) {
       const envelope = isRecord(verified.payload) ? verified.payload : {};
       const organizationId = envelope["organizationId"];
-      if (
-        typeof organizationId !== "string" ||
-        organizationId.length === 0 ||
-        organizationId.length > 255 ||
-        organizationId.includes("\u0000")
-      )
-        return new Response("OK", { status: 200 });
+      if (!isValidOrganizationId(organizationId)) return new Response("OK", { status: 200 });
       linearOrganizationId = organizationId;
       if (
-        eventIdentifier(envelope["type"]) === "agent_session_event" &&
-        (verified.eventName === null ||
-          eventIdentifier(verified.eventName) === "agent_session_event") &&
+        isPilotSessionDelivery(envelope, verified) &&
         (await options.offerVerifiedLinearPilotEvent?.(verified)) === true
       ) {
         return new Response("OK", { status: 200 });
@@ -154,7 +160,7 @@ async function handoffLinearEvent(
       return await acceptUnsupportedLinearEvent(verified, organizationId, options);
     }
     linearOrganizationId = event.organizationId;
-    return await handoffNormalizedLinearEvent(event, verified, handlers, options);
+    return await handoffNormalizedLinearEvent(event, { verified, handlers, options });
   } catch (error) {
     if (
       linearOrganizationId !== undefined &&
@@ -166,41 +172,54 @@ async function handoffLinearEvent(
   }
 }
 
-async function handoffNormalizedLinearEvent(
-  normalized: NonNullable<ReturnType<typeof normalizeDelivery>>,
+function isValidOrganizationId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length !== 0 &&
+    value.length <= 255 &&
+    !value.includes("\u0000")
+  );
+}
+
+function isPilotSessionDelivery(
+  envelope: Record<string, unknown>,
   verified: VerifiedLinearRequest,
-  handlers: Set<TriggerHandler>,
-  options: LinearWebhookSourceOptions,
+): boolean {
+  return (
+    eventIdentifier(envelope["type"]) === "agent_session_event" &&
+    (verified.eventName === null || eventIdentifier(verified.eventName) === "agent_session_event")
+  );
+}
+
+async function handoffNormalizedLinearEvent(
+  normalized: NormalizedLinearEvent,
+  handoff: LinearHandoff,
 ): Promise<Response> {
+  const { verified, options } = handoff;
   const linearOrganizationId = normalized.organizationId;
   let event: ReturnType<typeof normalizeDelivery> = normalized;
-  if (
-    event.type === "comment" &&
-    event.action === "create" &&
-    isRecord(verified.payload) &&
-    eventIdentifier(verified.payload["type"]) === "comment" &&
-    (await options.suppressVerifiedLinearPilotComment?.(event)) === true
-  ) {
+  const pilotSuppression = pilotCommentSuppression(event, verified, options);
+  if (pilotSuppression !== undefined && (await pilotSuppression.result) === true) {
     return new Response("OK", { status: 200 });
   }
   if (
     event.type === "comment" &&
     (hasLinearRunReplyMarker(event.comment.body, event.comment.id) ||
       isPaseoAppAuthor(event, {
-        appUserId: await options.findAppUserId?.(linearOrganizationId),
+        appUserId: await findAppUserId(options, linearOrganizationId),
       }))
   ) {
     return new Response("OK", { status: 200 });
   }
   if (await findMarkedReceipt(options, verified, linearOrganizationId))
     return new Response("OK", { status: 200 });
-  if (eventProjectId(event) === undefined && options.resolveIssue !== undefined) {
+  if (needsIssueHydration(event, options)) {
     const source = linearEventSource(event);
     if (
       options.canHydrateIssue !== undefined &&
       !(await options.canHydrateIssue(event.organizationId))
     ) {
-      return await acceptAndDispatchLinearEvent(event, source, verified, handlers, options, true);
+      return acceptAndDispatchLinearEvent({ ...handoff, event, source, preserveBindingDrop: true });
     }
     const issue = await options.resolveIssue({
       linearOrganizationId: event.organizationId,
@@ -208,16 +227,46 @@ async function handoffNormalizedLinearEvent(
     });
     event = normalizeDelivery(verified, issue);
   }
+  return dispatchNormalizedLinearEvent(event, linearOrganizationId, handoff);
+}
+
+function pilotCommentSuppression(
+  event: NormalizedLinearEvent,
+  verified: VerifiedLinearRequest,
+  options: LinearWebhookSourceOptions,
+) {
+  if (
+    event.type !== "comment" ||
+    event.action !== "create" ||
+    !isRecord(verified.payload) ||
+    eventIdentifier(verified.payload["type"]) !== "comment"
+  )
+    return undefined;
+  // Eligible comments still await when no pilot callback is installed.
+  return { result: options.suppressVerifiedLinearPilotComment?.(event) };
+}
+
+function findAppUserId(options: LinearWebhookSourceOptions, linearOrganizationId: string) {
+  return options.findAppUserId?.(linearOrganizationId);
+}
+
+function needsIssueHydration(
+  event: NormalizedLinearEvent,
+  options: LinearWebhookSourceOptions,
+): options is LinearWebhookSourceOptions &
+  Required<Pick<LinearWebhookSourceOptions, "resolveIssue">> {
+  return eventProjectId(event) === undefined && options.resolveIssue !== undefined;
+}
+
+function dispatchNormalizedLinearEvent(
+  event: ReturnType<typeof normalizeDelivery>,
+  linearOrganizationId: string,
+  handoff: LinearHandoff,
+): Promise<Response> {
   if (event === undefined) {
-    return await acceptUnsupportedLinearEvent(verified, linearOrganizationId, options);
+    return acceptUnsupportedLinearEvent(handoff.verified, linearOrganizationId, handoff.options);
   }
-  return await acceptAndDispatchLinearEvent(
-    event,
-    linearEventSource(event),
-    verified,
-    handlers,
-    options,
-  );
+  return acceptAndDispatchLinearEvent({ ...handoff, event, source: linearEventSource(event) });
 }
 
 function normalizeDelivery(verified: VerifiedLinearRequest, issue?: LinearIssueDetails) {
@@ -284,14 +333,14 @@ async function findMarkedReceipt(
   );
 }
 
-async function acceptAndDispatchLinearEvent(
-  event: NonNullable<ReturnType<typeof normalizeLinearEvent>>,
-  source: "linear.issue" | "linear.comment",
-  verified: VerifiedLinearRequest,
-  handlers: Set<TriggerHandler>,
-  options: LinearWebhookSourceOptions,
+async function acceptAndDispatchLinearEvent({
+  event,
+  source,
+  verified,
+  handlers,
+  options,
   preserveBindingDrop = false,
-): Promise<Response> {
+}: LinearDispatch): Promise<Response> {
   const projectId = eventProjectId(event);
   const acceptance = await options.accept({
     linearOrganizationId: event.organizationId,
@@ -319,9 +368,7 @@ async function acceptAndDispatchLinearEvent(
   return new Response("OK", { status: 200 });
 }
 
-function linearEventSource(
-  event: NonNullable<ReturnType<typeof normalizeLinearEvent>>,
-): "linear.issue" | "linear.comment" {
+function linearEventSource(event: NormalizedLinearEvent): LinearDispatch["source"] {
   return event.type === "issue" ? "linear.issue" : "linear.comment";
 }
 

@@ -1,4 +1,5 @@
 import type { AgentEvent } from "./agents/index.js";
+import type { DaemonAgentStreamEvent } from "./protocol.js";
 
 /**
  * How long a finished turn must stay quiet before Hub treats it as the end of the run. Any new
@@ -54,7 +55,10 @@ export class TurnEndTracker {
     // Snapshots describe state from before the prompt. Status updates are not trusted either way:
     // Hub asks the daemon for the agent's status when the settle timer fires.
     if (event.type !== "agent_stream") return "none";
-    const stream = event.event;
+    return this.observeStream(event.event);
+  }
+
+  private observeStream(stream: DaemonAgentStreamEvent): TurnEndVerdict {
     switch (stream.type) {
       case "turn_completed":
         this.finished = true;
@@ -63,21 +67,31 @@ export class TurnEndTracker {
       case "thread_started":
         return "none";
       case "attention_required":
-        return stream.reason === "finished" ? "none" : this.interrupt(true);
-      case "timeline": {
-        const item = stream.item;
-        if (item.type === "assistant_message" && typeof item.text === "string") {
-          if (this.captureOutput) this.append(item.messageId, item.text);
-          return this.interrupt(false);
-        }
-        // Reasoning sits beside the answer. Anything else is work, so earlier text is not final.
-        return this.interrupt(item.type !== "reasoning");
-      }
-      // turn_started, turn_failed, turn_canceled, permission_requested, permission_resolved, and
-      // any event added later: not a normal turn end, so none of it may complete the run.
+      case "timeline":
+        return this.observeActivity(stream);
+      case "permission_requested":
+      case "permission_resolved":
+      case "turn_canceled":
+      case "turn_failed":
+      case "turn_started":
       default:
         return this.interrupt(true);
     }
+  }
+
+  private observeActivity(
+    stream: Extract<DaemonAgentStreamEvent, { type: "attention_required" | "timeline" }>,
+  ): TurnEndVerdict {
+    if (stream.type === "attention_required") {
+      return stream.reason === "finished" ? "none" : this.interrupt(true);
+    }
+    const item = stream.item;
+    if (item.type === "assistant_message" && typeof item.text === "string") {
+      if (this.captureOutput) this.append(item.messageId, item.text);
+      return this.interrupt(false);
+    }
+    // Reasoning sits beside the answer. Anything else is work, so earlier text is not final.
+    return this.interrupt(item.type !== "reasoning");
   }
 
   /** Whether the turn end seen at `generation` is still the latest word from the agent. */
@@ -135,10 +149,10 @@ function wellFormed(text: string): string {
     const code = text.charCodeAt(index);
     if (code === 0) continue;
     const isHigh = code >= 0xd800 && code <= 0xdbff;
-    const isLow = code >= 0xdc00 && code <= 0xdfff;
+    const isLow = isLowSurrogate(code);
     if (isHigh) {
       const next = text.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) {
+      if (isLowSurrogate(next)) {
         result += text.slice(index, index + 2);
         index += 1;
       } else {
@@ -149,4 +163,8 @@ function wellFormed(text: string): string {
     }
   }
   return result;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
 }

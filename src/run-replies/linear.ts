@@ -32,6 +32,8 @@ const sourceSchema = z.object({
   }),
 });
 
+type LinearReplyEvent = z.infer<typeof sourceSchema>["event"]["linear"];
+
 interface LinearRunReplyOptions {
   database: Database;
   client: Pick<LinearApiClient, "readIssue" | "readComment" | "createComment">;
@@ -136,20 +138,7 @@ export class LinearRunReplyWriter {
       );
       return created === commentId ? null : undefined;
     } catch (error) {
-      if (error instanceof LinearCredentialError) return credentialFailure(error);
-      if (error instanceof LinearApiError) {
-        if (error.status === 404) return "target_mismatch";
-        if ([401, 403].includes(error.status)) return "provider_rejected";
-        if (error.rateLimitBeforeExecution)
-          return error.retryAfterMs ?? DEFAULT_LINEAR_RETRY_AFTER_MS;
-        if (error.graphqlRejected) {
-          return error.status === 429 || error.graphqlCodes.includes("RATELIMITED")
-            ? "provider_rate_limited"
-            : "provider_rejected";
-        }
-      }
-      // A transport or response error can follow a committed comment.
-      return undefined;
+      return createFailure(error);
     }
   }
 
@@ -215,7 +204,22 @@ export class LinearRunReplyWriter {
         : "connection_unavailable";
     }
     if (typeof target === "string") return target;
-    const { connection } = target;
+    const rendered = this.renderReply(run, answer, target.connection);
+    if (typeof rendered === "string") return rendered;
+    const { text } = rendered;
+    try {
+      return (await this.verifyTarget(target)) ? { target, text } : "target_mismatch";
+    } catch (error) {
+      signal.throwIfAborted();
+      return error instanceof LinearCredentialError ? credentialFailure(error) : "target_mismatch";
+    }
+  }
+
+  private renderReply(
+    run: AcceptedTriggerRunRecord,
+    answer: FinalReplyAnswer,
+    connection: LinearConnectionRecord,
+  ): { text: string } | RunReplyFailure {
     const secrets = [
       this.options.clientSecret,
       connection.accessToken,
@@ -233,35 +237,16 @@ export class LinearRunReplyWriter {
     }
     if (text === "") return "empty_answer";
     if (secrets.some((secret) => text.includes(secret))) return "body_contains_secret";
-    try {
-      return (await this.verifyTarget(target)) ? { target, text } : "target_mismatch";
-    } catch (error) {
-      signal.throwIfAborted();
-      return error instanceof LinearCredentialError ? credentialFailure(error) : "target_mismatch";
-    }
+    return { text };
   }
 
   private async authorize(
     run: AcceptedTriggerRunRecord,
     signal: AbortSignal,
   ): Promise<ReplyTarget | RunReplyFailure> {
-    const output = LinearOutputContextSchema.safeParse(run.outputContext);
-    const source = sourceSchema.safeParse(run.triggerContext);
-    if (!output.success || !source.success || run.payloadExpiryState != null)
-      return "target_mismatch";
-    const { linearOrganizationId, issueId } = output.data;
-    const {
-      target,
-      event: { linear },
-    } = source.data;
-    if (
-      linearOrganizationId !== target.linearOrganizationId ||
-      linearOrganizationId !== linear.organization.id ||
-      issueId !== target.issueId ||
-      issueId !== linear.issue.id ||
-      (linear.event_type === "comment" && (linear.action !== "create" || linear.comment === null))
-    )
-      return "target_mismatch";
+    const source = matchingReplySource(run);
+    if (source === undefined) return "target_mismatch";
+    const { linearOrganizationId, issueId, linear } = source;
     const authority = await authorizeLinearCommentConnection(
       this.options.connectionForLinearOrganization,
       linearOrganizationId,
@@ -320,11 +305,51 @@ export class LinearRunReplyWriter {
   }
 }
 
+function matchingReplySource(run: AcceptedTriggerRunRecord) {
+  const output = LinearOutputContextSchema.safeParse(run.outputContext);
+  const source = sourceSchema.safeParse(run.triggerContext);
+  if (!output.success || !source.success || run.payloadExpiryState != null) return undefined;
+  const { linearOrganizationId, issueId } = output.data;
+  const {
+    target,
+    event: { linear },
+  } = source.data;
+  if (
+    linearOrganizationId !== target.linearOrganizationId ||
+    linearOrganizationId !== linear.organization.id ||
+    issueId !== target.issueId ||
+    issueId !== linear.issue.id ||
+    !isReplyableEvent(linear)
+  )
+    return undefined;
+  return { linearOrganizationId, issueId, linear };
+}
+
+function isReplyableEvent(linear: LinearReplyEvent): boolean {
+  return linear.event_type !== "comment" || (linear.action === "create" && linear.comment !== null);
+}
+
+function createFailure(error: unknown): RunReplyFailure | undefined | number {
+  if (error instanceof LinearCredentialError) return credentialFailure(error);
+  // A transport or response error can follow a committed comment.
+  if (!(error instanceof LinearApiError)) return undefined;
+  if (error.status === 404) return "target_mismatch";
+  if ([401, 403].includes(error.status)) return "provider_rejected";
+  if (error.rateLimitBeforeExecution) return error.retryAfterMs ?? DEFAULT_LINEAR_RETRY_AFTER_MS;
+  if (!error.graphqlRejected) return undefined;
+  return error.status === 429 || error.graphqlCodes.includes("RATELIMITED")
+    ? "provider_rate_limited"
+    : "provider_rejected";
+}
+
 function credentialFailure(error: LinearCredentialError): RunReplyFailure {
   switch (error.code) {
     case "scope_missing":
     case "body_contains_secret":
       return error.code;
+    case "connection_not_owned":
+    case "connection_unavailable":
+    case "reauthorize":
     default:
       return "connection_unavailable";
   }
