@@ -6897,12 +6897,26 @@ class MemoryDatabase implements Database {
     organizationId,
   ) => this.failedRunsSeen.get(JSON.stringify([accountId, organizationId])) ?? null;
 
-  markFailedRunsSeen: Database["markFailedRunsSeen"] = async (accountId, organizationId) => {
+  markFailedRunsSeen: Database["markFailedRunsSeen"] = async (accountId, organizationId, since) => {
     const key = JSON.stringify([accountId, organizationId]);
+    const ended = this.endedFailedRuns(organizationId, since);
+    if (ended.length === 0) return;
+    const through = new Date(Math.max(...ended.map(({ failedAt }) => failedAt.getTime())));
     const seen = this.failedRunsSeen.get(key);
-    const now = this.now().toISOString();
-    if (seen === undefined || now > seen) this.failedRunsSeen.set(key, now);
+    if (seen === undefined || through.toISOString() > seen)
+      this.failedRunsSeen.set(key, through.toISOString());
   };
+
+  /** Failed runs of the organization whose event arrived in the window, by when they ended. */
+  private endedFailedRuns(organizationId: string, since: Date) {
+    return (this.organizationRunOrder.get(organizationId) ?? []).flatMap(({ id }) => {
+      const run = this.triggerRuns.get(id);
+      if (run === undefined || !FAILED_RUN_STATUSES.has(run.status)) return [];
+      const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
+      if (receipt?.organizationId !== organizationId || receipt.receivedAt < since) return [];
+      return [{ run, failedAt: run.completedAt ?? run.createdAt }];
+    });
+  }
 
   listTriggerMatchActivity: Database["listTriggerMatchActivity"] = async (
     organizationId,
@@ -6959,20 +6973,11 @@ class MemoryDatabase implements Database {
     seenThrough,
   ) => {
     const after = seenThrough === null ? -Infinity : Date.parse(seenThrough);
-    const matches = (this.organizationRunOrder.get(organizationId) ?? []).flatMap(({ id }) => {
-      const run = this.triggerRuns.get(id);
-      if (run === undefined || !FAILED_RUN_STATUSES.has(run.status)) return [];
-      const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
-      if (
-        receipt?.organizationId !== organizationId ||
-        receipt.receivedAt < since ||
-        receipt.receivedAt.getTime() <= after
-      )
-        return [];
-      return [{ run, receivedAt: receipt.receivedAt }];
-    });
-    const latest = matches.sort(
-      (a, b) => b.receivedAt.getTime() - a.receivedAt.getTime() || b.run.id.localeCompare(a.run.id),
+    const matches = this.endedFailedRuns(organizationId, since).filter(
+      ({ failedAt }) => failedAt.getTime() > after,
+    );
+    const latest = [...matches].sort(
+      (a, b) => b.failedAt.getTime() - a.failedAt.getTime() || b.run.id.localeCompare(a.run.id),
     )[0];
     if (latest === undefined) return { count: 0, newest: null };
     const triggers = [...this.organizationTriggers.values()].filter(
@@ -6985,7 +6990,7 @@ class MemoryDatabase implements Database {
         triggerName:
           (triggers.length === 1 ? triggers[0]?.name : undefined) ??
           latest.run.configuredTriggerName,
-        receivedAt: new Date(latest.receivedAt),
+        failedAt: new Date(latest.failedAt),
       },
     };
   };

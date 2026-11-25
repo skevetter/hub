@@ -135,7 +135,8 @@ export interface OrganizationRunCount {
 
 export interface FailedRunSummary {
   count: number;
-  newest: { triggerName: string; receivedAt: Date } | null;
+  /** The latest to end badly, by when the run ended. */
+  newest: { triggerName: string; failedAt: Date } | null;
 }
 
 export interface WaitingSessionSummary {
@@ -1974,7 +1975,8 @@ export interface Database
     seenThrough: string | null,
   ): Promise<FailedRunSummary>;
   readFailedRunsSeenThrough(accountId: string, organizationId: string): Promise<string | null>;
-  markFailedRunsSeen(accountId: string, organizationId: string): Promise<void>;
+  /** Hides every failed run in the window that has ended so far; later failures stay unseen. */
+  markFailedRunsSeen(accountId: string, organizationId: string, since: Date): Promise<void>;
   hasActiveSessionProfile(organizationId: string): Promise<boolean>;
   listSessionsWaitingForPermission(
     organizationId: string,

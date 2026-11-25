@@ -4,6 +4,9 @@ import type { SessionPrincipal } from "../interactive-sessions/types.js";
 
 import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 
+// A run is unseen by when it ended badly, not when its event arrived: an event received before
+// "Mark seen" can fail after it. Rejected runs are created finished and set completed_at too;
+// the created_at fallback only covers a row that predates that.
 export const FAILED_RUNS_SQL = `select
     count(*) over ()::int as count,
     coalesce((
@@ -11,17 +14,19 @@ export const FAILED_RUNS_SQL = `select
       from organization_triggers trigger
       where trigger.runtime_project_id = run.project_id and trigger.organization_id = $1
     ), run.configured_trigger_name) as trigger_name,
-    receipt.received_at
+    run.failed_at
   from provider_event_receipts receipt
   join lateral (
-    select id, project_id, configured_trigger_name from trigger_runs
+    select id, project_id, configured_trigger_name,
+      coalesce(completed_at, created_at) as failed_at
+    from trigger_runs
     where provider_event_receipt_id = receipt.id and organization_id = $1
       and status = any($4::text[])
+      and coalesce(completed_at, created_at) > coalesce($3::timestamptz, '-infinity'::timestamptz)
     offset 0
   ) run on true
   where receipt.organization_id = $1 and receipt.received_at >= $2
-    and receipt.received_at > coalesce($3::timestamptz, '-infinity'::timestamptz)
-  order by receipt.received_at desc, run.id desc
+  order by run.failed_at desc, run.id desc
   limit 1`;
 
 export async function countFailedRunsSince(
@@ -32,7 +37,7 @@ export async function countFailedRunsSince(
 ): Promise<FailedRunSummary> {
   const {
     rows: [row],
-  } = await database.query<{ count: number; trigger_name: string; received_at: Date }>(
+  } = await database.query<{ count: number; trigger_name: string; failed_at: Date }>(
     FAILED_RUNS_SQL,
     [organizationId, since, seenThrough, [...FAILED_RUN_STATUSES]],
   );
@@ -40,7 +45,7 @@ export async function countFailedRunsSince(
     ? { count: 0, newest: null }
     : {
         count: row.count,
-        newest: { triggerName: row.trigger_name, receivedAt: row.received_at },
+        newest: { triggerName: row.trigger_name, failedAt: row.failed_at },
       };
 }
 
@@ -101,18 +106,36 @@ export async function readFailedRunsSeenThrough(
   return rows[0]?.seen_through ?? null;
 }
 
+// The marker advances to the newest end time among the runs the count looks at, so it is in the
+// same terms as the count's filter. now() would compare the database clock with end times the
+// application wrote, and a run that fails just after the click could fall behind it.
+export const MARK_FAILED_RUNS_SEEN_SQL = `insert into account_attention_state
+    (account_id, organization_id, failed_runs_seen_through)
+  select $1, $2, max(coalesce(run.completed_at, run.created_at))
+  from provider_event_receipts receipt
+  join lateral (
+    select completed_at, created_at from trigger_runs
+    where provider_event_receipt_id = receipt.id and organization_id = $2
+      and status = any($4::text[])
+    offset 0
+  ) run on true
+  where receipt.organization_id = $2 and receipt.received_at >= $3
+  having max(coalesce(run.completed_at, run.created_at)) is not null
+  on conflict (account_id, organization_id) do update
+    set failed_runs_seen_through = greatest(
+      account_attention_state.failed_runs_seen_through, excluded.failed_runs_seen_through
+    )`;
+
 export async function markFailedRunsSeen(
   database: QueryHandle,
   accountId: string,
   organizationId: string,
+  since: Date,
 ) {
-  await database.query(
-    `insert into account_attention_state (account_id, organization_id, failed_runs_seen_through)
-     values ($1, $2, now())
-     on conflict (account_id, organization_id) do update
-       set failed_runs_seen_through = greatest(
-         account_attention_state.failed_runs_seen_through, excluded.failed_runs_seen_through
-       )`,
-    [accountId, organizationId],
-  );
+  await database.query(MARK_FAILED_RUNS_SEEN_SQL, [
+    accountId,
+    organizationId,
+    since,
+    [...FAILED_RUN_STATUSES],
+  ]);
 }

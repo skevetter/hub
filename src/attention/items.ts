@@ -198,7 +198,7 @@ function runItems(
       id: "runs:failed",
       source: "runs",
       title: `${String(count)} ${count === 1 ? "run" : "runs"} failed`,
-      detail: `Newest: ${newest.triggerName}, ${relativeLabel(newest.receivedAt, now)}.`,
+      detail: `Newest: ${newest.triggerName}, ${relativeLabel(newest.failedAt, now)}.`,
       action: {
         label: "Review runs",
         to: `${base}/activity`,

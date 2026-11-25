@@ -58,7 +58,10 @@ export class AttentionDashboard {
     const { account, tenant } = await resolveRouteTenant(this.auth, this.database, request, {
       organizationSlug,
     });
-    await this.database.markFailedRunsSeen(account.account.id, tenant.organization.id);
+    const since = new Date(
+      (this.options.now?.() ?? new Date()).getTime() - ATTENTION_WINDOW_DAYS * 86_400_000,
+    );
+    await this.database.markFailedRunsSeen(account.account.id, tenant.organization.id, since);
   }
 
   private async failedRuns({ organizationId, userId }: SessionPrincipal, since: Date) {

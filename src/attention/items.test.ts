@@ -82,7 +82,7 @@ it("lists actionable sources in fixed order with Home copy and tenant links", ()
     ],
     failedRuns: {
       count: 2,
-      newest: { triggerName: "Build", receivedAt: new Date("2026-01-08T11:58:00Z") },
+      newest: { triggerName: "Build", failedAt: new Date("2026-01-08T11:58:00Z") },
     },
     sessions: {
       hasActiveProfile: true,
