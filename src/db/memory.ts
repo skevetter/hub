@@ -1,3 +1,5 @@
+import { TRIGGER_MATCH_PROVIDERS, triggerMatchActivity } from "../attention/trigger-matches.js";
+import { FAILED_RUN_FILTER, FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { MemorySurfaceStore } from "../surfaces/memory-store.js";
 import {
   linearRoutesForConnection,
@@ -231,6 +233,8 @@ import type {
   LinearConnectionRefreshOperation,
   ActivityRunPageRecord,
   ActivityRunPageRequest,
+  TriggerMatchActivity,
+  TriggerMatchWindow,
   ActivityRunScope,
   TriggerListKey,
   TriggerListPage,
@@ -609,6 +613,13 @@ class MemoryDatabase implements Database {
         .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)),
     );
 
+  hasActiveSessionProfile: Database["hasActiveSessionProfile"] = async (organizationId) => {
+    for (const profile of this.sessionProfiles.values()) {
+      if (profile.organizationId === organizationId && profile.status === "active") return true;
+    }
+    return false;
+  };
+
   findSessionProfile: Database["findSessionProfile"] = async (organizationId, id) => {
     const profile = this.sessionProfiles.get(id.toLowerCase());
     return profile?.organizationId === organizationId ? structuredClone(profile) : undefined;
@@ -895,6 +906,31 @@ class MemoryDatabase implements Database {
           b.lastActivityAt.getTime() - a.lastActivityAt.getTime() || b.id.localeCompare(a.id),
       );
     return structuredClone(sessionPage(rows, page.limit));
+  };
+
+  listSessionsWaitingForPermission: Database["listSessionsWaitingForPermission"] = async (
+    organizationId,
+    viewer,
+    limit,
+  ) => {
+    const role = this.sessionMemberRole(organizationId, viewer.userId);
+    if (viewer.organizationId !== organizationId || !role || limit <= 0)
+      return { count: 0, sessions: [] };
+    const waiting = (this.interactiveSessionsByOrganization.get(organizationId) ?? [])
+      .filter(
+        ({ session, participants }) =>
+          session.state === "waiting_permission" &&
+          capabilities({ ...viewer, role }, session, participants).view,
+      )
+      .map(({ session }) => session)
+      .sort(
+        (a, b) =>
+          b.lastActivityAt.getTime() - a.lastActivityAt.getTime() || b.id.localeCompare(a.id),
+      );
+    return {
+      count: waiting.length,
+      sessions: waiting.slice(0, limit).map(({ title }) => ({ name: title })),
+    };
   };
 
   hasOwnInteractiveSession: Database["hasOwnInteractiveSession"] = async ({
@@ -2295,6 +2331,7 @@ class MemoryDatabase implements Database {
   private readonly organizationIds: Set<string>;
   private readonly memberships: NonNullable<MemoryDatabaseOptions["memberships"]>[number][];
   private readonly homeChecklistCompletions = new Map<string, Date>();
+  private readonly failedRunsSeen = new Map<string, string>();
 
   constructor(private readonly options: MemoryDatabaseOptions = {}) {
     this.memberships = [...(options.memberships ?? [])];
@@ -5327,11 +5364,12 @@ class MemoryDatabase implements Database {
     request: ActivityRunPageRequest,
   ): Promise<ActivityRunPageRecord> {
     const { createdSince, provider, status } = request;
+    const statuses = status === FAILED_RUN_FILTER ? FAILED_RUN_STATUSES : new Set([status]);
     const records = [...this.triggerRuns.values()]
       .filter(
         (run) =>
           run.organizationId === organizationId &&
-          (status === undefined || run.status === status) &&
+          (status === undefined || statuses.has(run.status)) &&
           (createdSince === undefined || run.createdAt >= createdSince) &&
           scopes.some(
             ({ projectId, triggerName }) =>
@@ -6854,6 +6892,104 @@ class MemoryDatabase implements Database {
     return [...counts].map(([status, count]) => ({ status, count }));
   }
 
+  readFailedRunsSeenThrough: Database["readFailedRunsSeenThrough"] = async (
+    accountId,
+    organizationId,
+  ) => this.failedRunsSeen.get(JSON.stringify([accountId, organizationId])) ?? null;
+
+  markFailedRunsSeen: Database["markFailedRunsSeen"] = async (accountId, organizationId) => {
+    const key = JSON.stringify([accountId, organizationId]);
+    const seen = this.failedRunsSeen.get(key);
+    const now = this.now().toISOString();
+    if (seen === undefined || now > seen) this.failedRunsSeen.set(key, now);
+  };
+
+  listTriggerMatchActivity: Database["listTriggerMatchActivity"] = async (
+    organizationId,
+    window,
+  ) => {
+    const matches = this.triggerMatchCounts(organizationId, window);
+    const receipts = new Map<string, number>();
+    for (const {
+      organizationId: owner,
+      provider,
+      receivedAt,
+    } of this.providerEventReceipts.values()) {
+      if (owner !== organizationId || receivedAt < window.recentStart || receivedAt > window.now)
+        continue;
+      receipts.set(provider, (receipts.get(provider) ?? 0) + 1);
+    }
+    const triggers = await this.listOrganizationTriggers(organizationId);
+    return triggers
+      .filter(({ enabled }) => enabled)
+      .flatMap(({ id, name, runtimeProjectId, activeRevisionId }) => {
+        const configuration =
+          this.organizationTriggerRevisions.get(activeRevisionId)?.normalizedConfiguration;
+        const counts = matches.get(runtimeProjectId) ?? {
+          previousMatches: 0,
+          recentMatches: 0,
+        };
+        return triggerMatchActivity({ id, name, configuration }, counts, receipts);
+      });
+  };
+
+  private triggerMatchCounts(organizationId: string, window: TriggerMatchWindow) {
+    const matches = new Map<
+      string,
+      Pick<TriggerMatchActivity, "previousMatches" | "recentMatches">
+    >();
+    for (const { id } of this.organizationRunOrder.get(organizationId) ?? []) {
+      const run = this.triggerRuns.get(id);
+      if (run === undefined) continue;
+      const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
+      if (receipt?.organizationId !== organizationId || !isTriggerMatchReceipt(receipt, window))
+        continue;
+      const key = run.projectId;
+      const counts = matches.get(key) ?? { previousMatches: 0, recentMatches: 0 };
+      if (receipt.receivedAt < window.recentStart) counts.previousMatches++;
+      else counts.recentMatches++;
+      matches.set(key, counts);
+    }
+    return matches;
+  }
+
+  countFailedRunsSince: Database["countFailedRunsSince"] = async (
+    organizationId,
+    since,
+    seenThrough,
+  ) => {
+    const after = seenThrough === null ? -Infinity : Date.parse(seenThrough);
+    const matches = (this.organizationRunOrder.get(organizationId) ?? []).flatMap(({ id }) => {
+      const run = this.triggerRuns.get(id);
+      if (run === undefined || !FAILED_RUN_STATUSES.has(run.status)) return [];
+      const receipt = this.providerEventReceipts.get(run.providerEventReceiptId);
+      if (
+        receipt?.organizationId !== organizationId ||
+        receipt.receivedAt < since ||
+        receipt.receivedAt.getTime() <= after
+      )
+        return [];
+      return [{ run, receivedAt: receipt.receivedAt }];
+    });
+    const latest = matches.sort(
+      (a, b) => b.receivedAt.getTime() - a.receivedAt.getTime() || b.run.id.localeCompare(a.run.id),
+    )[0];
+    if (latest === undefined) return { count: 0, newest: null };
+    const triggers = [...this.organizationTriggers.values()].filter(
+      ({ organizationId: owner, runtimeProjectId }) =>
+        owner === organizationId && runtimeProjectId === latest.run.projectId,
+    );
+    return {
+      count: matches.length,
+      newest: {
+        triggerName:
+          (triggers.length === 1 ? triggers[0]?.name : undefined) ??
+          latest.run.configuredTriggerName,
+        receivedAt: new Date(latest.receivedAt),
+      },
+    };
+  };
+
   async listOrganizationRunsSince(
     organizationId: string,
     since: Date,
@@ -8059,6 +8195,14 @@ function isRunExecutionUnfinished(execution: AgentExecutionRecord): boolean {
 // store is for tests.
 function receiptOrder(receipt: Pick<ProviderEventReceiptRecord, "receivedAt" | "id">) {
   return { micros: BigInt(receipt.receivedAt.getTime()) * 1000n, id: receipt.id };
+}
+
+function isTriggerMatchReceipt(receipt: ProviderEventReceiptRecord, window: TriggerMatchWindow) {
+  return (
+    TRIGGER_MATCH_PROVIDERS.has(receipt.provider) &&
+    receipt.receivedAt >= window.previousStart &&
+    receipt.receivedAt <= window.now
+  );
 }
 
 function runOrder(run: { createdAt: Date; id: string }) {

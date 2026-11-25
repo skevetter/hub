@@ -1,19 +1,35 @@
 import { expect, type Page } from "@playwright/test";
 import type { BuiltApplication } from "./hub.js";
 
+type ReadEndpoint = "triggers" | "tenant" | "daemons" | "usage";
+
 /** Real database faults in the isolated application, with no intercepted server responses. */
 export class SnapshotRecovery {
-  private failures = 0;
+  private readonly readPaths = new Map<string, ReadEndpoint>();
+  private readonly failures = new Map<ReadEndpoint, number>();
 
   constructor(
     private readonly page: Page,
     private readonly app: BuiltApplication,
   ) {
     page.on("response", async (response) => {
-      if (!response.url().includes("/_serverFn/")) return;
+      const endpoint = this.readPaths.get(new URL(response.url()).pathname);
+      if (endpoint === undefined) return;
       const body = await response.text().catch(() => "");
-      if (body.includes("quote reference")) this.failures++;
+      if (body.includes("quote reference"))
+        this.failures.set(endpoint, this.failureCount(endpoint) + 1);
     });
+  }
+
+  private async watchRead(endpoint: ReadEndpoint, payloadMarker: string) {
+    // Discover the built function path so unrelated reads (such as Attention) cannot affect counts.
+    const response = await this.page.waitForResponse(async (candidate) => {
+      if (!new URL(candidate.url()).pathname.startsWith("/_serverFn/")) return false;
+      if (candidate.request().method() !== "GET" || !candidate.ok()) return false;
+      const body = await candidate.text().catch(() => "");
+      return body.includes(payloadMarker);
+    });
+    this.readPaths.set(new URL(response.url()).pathname, endpoint);
   }
 
   async visitTriggers() {
@@ -21,7 +37,7 @@ export class SnapshotRecovery {
   }
 
   async openTriggers() {
-    await this.visitTriggers();
+    await Promise.all([this.watchRead("triggers", '"Existing trigger"'), this.visitTriggers()]);
     await expect(this.page.getByRole("table", { name: "Triggers", exact: true })).toBeVisible();
   }
 
@@ -74,15 +90,24 @@ export class SnapshotRecovery {
     });
   }
 
-  async expectFailures(count: number) {
-    await expect.poll(() => this.failures, { timeout: 10_000 }).toBe(count);
+  failureCount(endpoint: ReadEndpoint) {
+    return this.failures.get(endpoint) ?? 0;
   }
 
-  async expectRetriesStopped() {
-    await this.expectFailures(3);
+  async expectFailures(count: number, endpoint: ReadEndpoint, baseline: number) {
+    await expect
+      .poll(() => this.failureCount(endpoint) - baseline, {
+        message: `${endpoint} read failures since fault`,
+        timeout: 10_000,
+      })
+      .toBe(count);
+  }
+
+  async expectTriggerRetriesStopped(baseline: number) {
+    await this.expectFailures(3, "triggers", baseline);
     // Exceed the next default exponential retry delay to prove the retry budget is exhausted.
     await this.page.waitForTimeout(4_500);
-    expect(this.failures).toBe(3);
+    expect(this.failureCount("triggers") - baseline).toBe(3);
   }
 
   async expectTrigger(name = "Existing trigger") {
@@ -112,15 +137,43 @@ export class SnapshotRecovery {
     });
   }
 
+  async watchTenant() {
+    await Promise.all([
+      this.watchRead("tenant", '"capabilities","project","projects"'),
+      this.returnToTab(),
+    ]);
+  }
+
+  async expectOrganization(name: string) {
+    await expect(
+      this.page.getByRole("button", { name: "Organization", exact: true }),
+    ).toContainText(name);
+  }
+
   async interruptTenant() {
-    await this.app.query("alter table organization_triggers rename to unavailable_triggers");
+    // The shared tenant lookup selects this column even on organization-only routes.
+    await this.app.query(
+      "alter table projects rename column archived_at to unavailable_archived_at",
+    );
   }
 
   async restoreTenant() {
-    await this.app.query("alter table unavailable_triggers rename to organization_triggers");
+    await this.app.query(
+      "alter table projects rename column unavailable_archived_at to archived_at",
+    );
   }
+
+  async renameOrganization() {
+    await this.app.query(
+      "update organization set name = 'Updated organization' where name = 'Snapshot test'",
+    );
+  }
+
   async openDaemons() {
-    await this.page.getByRole("link", { name: "Daemons", exact: true }).click();
+    await Promise.all([
+      this.watchRead("daemons", '"daemons","canManage"'),
+      this.page.getByRole("link", { name: "Daemons", exact: true }).click(),
+    ]);
     await this.expectDaemons();
   }
 
@@ -139,7 +192,10 @@ export class SnapshotRecovery {
 
   async openUsage() {
     await this.page.getByRole("link", { name: "Settings", exact: true }).click();
-    await this.page.getByRole("link", { name: "Usage", exact: true }).click();
+    await Promise.all([
+      this.watchRead("usage", '"organization","limits","history"'),
+      this.page.getByRole("link", { name: "Usage", exact: true }).click(),
+    ]);
     await this.expectUsage();
   }
 

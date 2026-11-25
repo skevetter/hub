@@ -1,3 +1,12 @@
+import {
+  countFailedRunsSince,
+  hasActiveSessionProfile,
+  listSessionsWaitingForPermission,
+  markFailedRunsSeen,
+  readFailedRunsSeenThrough,
+} from "../attention/queries.js";
+import { listTriggerMatchActivity } from "../attention/trigger-matches.js";
+import { FAILED_RUN_FILTER, FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { SurfaceRepository } from "../surfaces/postgres-store.js";
 import {
   linearTriggerRoutesLock,
@@ -4547,6 +4556,24 @@ class PgDatabase implements Database {
     return rows.rows.map(({ status, count }) => ({ status, count }));
   }
 
+  listTriggerMatchActivity: Database["listTriggerMatchActivity"] = (...args) =>
+    listTriggerMatchActivity(this.pool, ...args);
+
+  countFailedRunsSince: Database["countFailedRunsSince"] = (...args) =>
+    countFailedRunsSince(this.pool, ...args);
+
+  readFailedRunsSeenThrough: Database["readFailedRunsSeenThrough"] = (...args) =>
+    readFailedRunsSeenThrough(this.pool, ...args);
+
+  markFailedRunsSeen: Database["markFailedRunsSeen"] = (...args) =>
+    markFailedRunsSeen(this.pool, ...args);
+
+  hasActiveSessionProfile: Database["hasActiveSessionProfile"] = (organizationId) =>
+    hasActiveSessionProfile(this.pool, organizationId);
+
+  listSessionsWaitingForPermission: Database["listSessionsWaitingForPermission"] = (...args) =>
+    listSessionsWaitingForPermission(this.pool, ...args);
+
   listDroppedEventPage(organizationId: string, request: DroppedEventPageRequest) {
     return readDroppedEventPage(this.pool, organizationId, request);
   }
@@ -5910,7 +5937,9 @@ function organizationTriggerHasEventSql(comparison: string): string {
 
 function activityRunFilterSql(request: ActivityRunPageRequest, params: unknown[]): string {
   const filters: string[] = [];
-  if (request.status !== undefined) {
+  if (request.status === FAILED_RUN_FILTER) {
+    filters.push(`and runs.status = any($${params.push([...FAILED_RUN_STATUSES])}::text[])`);
+  } else if (request.status !== undefined) {
     filters.push(`and runs.status = $${params.push(request.status)}`);
   }
   if (request.createdSince !== undefined) {

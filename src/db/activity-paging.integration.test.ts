@@ -51,6 +51,7 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
     const read = (request: Partial<ActivityRunPageRequest>, inScopes = scopes) =>
       database.listOrganizationActivityPage(ORGANIZATION, inScopes, { limit: 15, ...request });
     for (const status of ACTIVITY_STATUSES) {
+      if (status === "unsuccessful") continue;
       const { records } = await read({ status });
       assert.equal(records.length, 15);
       assert.ok(records.every(({ run }) => run.status === status));
@@ -93,6 +94,18 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
       limit: 15,
     });
     assert.deepEqual(foreign.records, []);
+  });
+
+  it("includes only unsuccessful runs before limiting the page", async () => {
+    const { records } = await database.listOrganizationActivityPage(ORGANIZATION, scopes, {
+      status: "unsuccessful",
+      limit: 15,
+    });
+    assert.equal(records.length, 15);
+    assert.deepEqual(
+      new Set(records.map(({ run }) => run.status)),
+      new Set(["failed", "timed_out", "rejected"]),
+    );
   });
 
   it.each(PAGE_SIZES)("walks tied keys both ways at size %i", async (limit) => {

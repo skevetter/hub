@@ -1249,6 +1249,20 @@ export const organizations = pgTable("organization", {
   homeChecklistCompletedAt: timestamp("home_checklist_completed_at", { withTimezone: true }),
 });
 
+export const accountAttentionState = pgTable(
+  "account_attention_state",
+  {
+    accountId: text("account_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    failedRunsSeenThrough: timestamp("failed_runs_seen_through", { withTimezone: true }).notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.accountId, table.organizationId] })],
+);
+
 export const organizationConnectionAttempts = pgTable(
   "organization_connection_attempts",
   {

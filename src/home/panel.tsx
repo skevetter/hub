@@ -19,7 +19,6 @@ import { CopyField } from "../components/app/copy-field.js";
 import { Disclosure } from "../components/app/disclosure.js";
 import { EmptyState } from "../components/app/empty-state.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
-import { PageAlert } from "../components/app/page-alert.js";
 import { PageHeader } from "../components/app/page.js";
 import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RelativeTime } from "../components/app/relative-time.js";
@@ -39,10 +38,7 @@ import {
   sessionProfileQueryOptions,
 } from "../interactive-sessions/ui/new-session.js";
 import { useRouteTenant } from "../projects/context.js";
-import { RECENT_DROP_COUNT_LIMIT } from "../db/dropped-events.js";
 import { EDITOR_EVENTS, eventDefinition, isEditorEvent } from "../triggers/configuration/events.js";
-import { DROP_REASON_GROUPS, type DropReasonGroup } from "../triggers/drop-reason.js";
-import { LIST_PROVIDER_LABELS } from "../triggers/list-providers.js";
 import {
   canFinishSetup,
   deriveChecklist,
@@ -57,7 +53,7 @@ import { HOME_MONTH_DAYS } from "./limits.js";
 import { memberFlagKey, useMemberFlag } from "./member-preference.js";
 import { thingsToTry, type TrySurface, type TrySurfaceKey } from "./things-to-try.js";
 
-const HOME_DESCRIPTION = "What is running, what needs you, and what to try next.";
+const HOME_DESCRIPTION = "What is running and what to try next.";
 const HOME_HEADING_ID = "home-heading";
 const RECENT_RUNS_SHOWN = 5;
 
@@ -170,7 +166,6 @@ function HomeContent({
   const base = `/o/${data.organization.slug}`;
   return (
     <>
-      <NeedsAttention data={data} base={base} profiles={profiles} />
       <Section>
         <HomeTiles data={data} />
       </Section>
@@ -280,91 +275,6 @@ function HomeLoading() {
       </div>
     </div>
   );
-}
-
-const PROVIDER_NAMES = { github: "GitHub", slack: "Slack", discord: "Discord", linear: "Linear" };
-
-/**
- * Only what the reader has to act on, each with the one place to act. Nothing here is a state
- * report: a daemon that is offline while nothing depends on it is not a problem.
- */
-function NeedsAttention({
-  data,
-  base,
-  profiles,
-}: {
-  data: HomeSnapshot;
-  base: string;
-  profiles: ProfileAvailability;
-}) {
-  const providers = [
-    ...new Set(
-      data.connections
-        .filter(({ needsAuthorization }) => needsAuthorization)
-        .map(({ provider }) => provider),
-    ),
-  ];
-  const daemons = daemonAttention(data, profiles);
-  return (
-    <>
-      {providers.map((provider) => {
-        const names = data.connections
-          .filter((connection) => connection.provider === provider && connection.needsAuthorization)
-          .map(({ label }) => label)
-          .join(", ");
-        return (
-          <PageAlert
-            key={provider}
-            title={`${PROVIDER_NAMES[provider]} needs authorization`}
-            action={
-              <Button asChild variant="outline" size="sm">
-                <Link to={`${base}/connections` as never}>Open connections</Link>
-              </Button>
-            }
-          >
-            <p>Review authorization for {names} in Connections.</p>
-          </PageAlert>
-        );
-      })}
-      {daemons === undefined ? null : (
-        <PageAlert
-          title={daemons.title}
-          action={
-            <Button asChild variant="outline" size="sm">
-              <Link to={`${base}/daemons` as never}>View daemons</Link>
-            </Button>
-          }
-        >
-          <p>{daemons.message}</p>
-        </PageAlert>
-      )}
-      <DroppedEventNotices data={data} />
-    </>
-  );
-}
-
-/** Work is waiting on a daemon only when something would use one: a trigger or a profile. */
-function daemonAttention(
-  data: HomeSnapshot,
-  profiles: ProfileAvailability,
-): { title: string; message: string } | undefined {
-  const waiting =
-    data.triggers.some(({ enabled }) => enabled) || (typeof profiles === "number" && profiles > 0);
-  if (!waiting || data.daemons.length === 0) return undefined;
-  const able = data.daemons.filter(({ canExecute }) => canExecute);
-  if (able.some(({ presence }) => presence === "connected")) return undefined;
-  if (able.length === 0) {
-    return {
-      title: "No daemon may run agents",
-      message:
-        "No enrolled daemon may run agents yet. Triggers and sessions cannot start an agent until one is allowed to run Hub automations.",
-    };
-  }
-  const names = able.map(({ slug }) => slug).join(", ");
-  return {
-    title: "No daemon that may run agents is connected.",
-    message: `${names} ${able.length === 1 ? "is" : "are"} not connected. Reconnect a daemon to run work configured for it.`,
-  };
 }
 
 function ThingsToTry({
@@ -887,49 +797,6 @@ export function runHint(triggers: HomeSnapshot["triggers"]): string {
     }
   }
   return [...hints].join(" ");
-}
-
-const DROP_NOTICE_TITLES: Record<DropReasonGroup, string> = {
-  routing: "Events arrived without a route or matching trigger",
-  trigger_filters_rejected: "Trigger filters rejected events",
-  configuration_unavailable: "Events arrived while configuration was unavailable",
-  unsupported_event: "Linear sent unsupported events",
-  other: "Hub dropped events for other reasons",
-};
-
-function DroppedEventNotices({ data }: { data: HomeSnapshot }) {
-  const capped =
-    data.dropped.reduce((total, { count }) => total + count, 0) >= RECENT_DROP_COUNT_LIMIT;
-  return DROP_REASON_GROUPS.map((reason) => {
-    const group = data.dropped.filter((count) => count.reason === reason);
-    if (group.length === 0) return null;
-    const total = group.reduce((sum, { count }) => sum + count, 0);
-    const sources = group
-      .map(({ provider, count }) => `${String(count)} from ${LIST_PROVIDER_LABELS[provider]}`)
-      .join(", ");
-    return (
-      <PageAlert
-        key={reason}
-        title={DROP_NOTICE_TITLES[reason]}
-        action={
-          <Button asChild variant="outline" size="sm">
-            <Link
-              to="/o/$organizationSlug/activity"
-              params={{ organizationSlug: data.organization.slug }}
-              search={{ view: "dropped", reason, range: "7d" }}
-            >
-              View dropped events
-            </Link>
-          </Button>
-        }
-      >
-        <p>
-          {capped ? "At least " : ""}
-          {total} {total === 1 ? "event" : "events"} in the last {data.windowDays} days ({sources}).
-        </p>
-      </PageAlert>
-    );
-  });
 }
 
 function runSourceLabel(source: string): string {

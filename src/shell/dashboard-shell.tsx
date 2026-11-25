@@ -38,6 +38,7 @@ import { NavigationGroup, type NavigationItem } from "./navigation-group.js";
 import { AccountMenu, OrganizationSwitcher, type RouteTenant } from "./switchers.js";
 import { CommandMenuProvider, CommandSearchButton } from "./command-menu.js";
 import { PhoneHeader, PhoneNavigation } from "./phone-navigation.js";
+import { SidebarAttention } from "./sidebar-attention.js";
 import { SiteHeader } from "./site-header.js";
 import { CONTENT_ID, SkipLink } from "./skip-link.js";
 import { SiteHeaderActionsProvider } from "./site-header-actions.js";
@@ -163,7 +164,7 @@ function DashboardContent(props: DashboardContentProps) {
     >
       <SkipLink />
       <Sidebar collapsible="icon" data-rail-focus>
-        {sidebar}
+        <DashboardSidebar {...props} tenant={tenant} navigation={navigation} desktop />
       </Sidebar>
       <SiteHeaderActionsProvider>
         <SidebarInset className="pb-[var(--shell-bottom-bar)] md:pb-0">
@@ -258,12 +259,14 @@ function DashboardSidebar({
   onSelectOrganization,
   onSignOut,
   navigation,
+  desktop = false,
 }: Pick<
   DashboardContentProps,
   "account" | "busy" | "onCreateOrganization" | "onSelectOrganization" | "onSignOut"
 > & {
   tenant: RouteTenant | undefined;
   navigation: ReturnType<typeof organizationNavigation>;
+  desktop?: boolean;
 }) {
   const organization = tenant?.organization ?? account.organization;
   return (
@@ -291,6 +294,7 @@ function DashboardSidebar({
       <AccountFooter
         account={account}
         showMeter={tenant !== undefined}
+        showAttention={desktop}
         busy={busy}
         onSignOut={onSignOut}
       />
@@ -301,11 +305,13 @@ function DashboardSidebar({
 function AccountFooter({
   account,
   showMeter,
+  showAttention,
   busy,
   onSignOut,
 }: {
   account: ActiveAccount;
   showMeter: boolean;
+  showAttention: boolean;
   busy: boolean;
   onSignOut: () => void;
 }) {
@@ -313,6 +319,7 @@ function AccountFooter({
     <SidebarFooter>
       <SidebarMenu>
         {showMeter ? <ExecutionMeter /> : null}
+        {showAttention ? <SidebarAttention /> : null}
         <SidebarHelp />
         <SidebarMenuItem>
           <AccountMenu

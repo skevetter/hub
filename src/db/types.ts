@@ -1,6 +1,8 @@
+import type { RunStatusFilter } from "../triggers/run-status.js";
 import type { QueryHandle } from "./runtime/index.js";
 import type { SurfaceStore } from "../surfaces/store.js";
 import type { InteractiveSessionStore } from "../interactive-sessions/store.js";
+import type { SessionPrincipal } from "../interactive-sessions/types.js";
 import type { RunPayloadRetentionStore } from "../run-payload-retention/store.js";
 import type {
   PayloadCompletion,
@@ -129,6 +131,16 @@ export interface OrganizationRunRecord {
 export interface OrganizationRunCount {
   status: TriggerRunRecord["status"];
   count: number;
+}
+
+export interface FailedRunSummary {
+  count: number;
+  newest: { triggerName: string; receivedAt: Date } | null;
+}
+
+export interface WaitingSessionSummary {
+  count: number;
+  sessions: { name: string }[];
 }
 
 export type DroppedEventPresence = "some" | "none" | "unknown";
@@ -914,9 +926,28 @@ export interface ActivityRunKey {
   id: string;
 }
 
+export type TriggerMatchProvider = Extract<
+  ListProvider,
+  "github" | "slack" | "discord" | "linear" | "github_notification"
+>;
+
+export interface TriggerMatchActivity {
+  id: string;
+  name: string;
+  previousMatches: number;
+  recentMatches: number;
+  providers: { provider: TriggerMatchProvider; recentEvents: number }[];
+}
+
+export interface TriggerMatchWindow {
+  previousStart: Date;
+  recentStart: Date;
+  now: Date;
+}
+
 export interface ActivityRunPageRequest {
   limit: number;
-  status?: TriggerRunRecord["status"];
+  status?: RunStatusFilter;
   provider?: ListProvider;
   createdSince?: Date;
   /** `before` reads older than the key, `after` reads newer. No position reads the newest page. */
@@ -1933,6 +1964,23 @@ export interface Database
   ): Promise<OrganizationRunRecord[]>;
   /** How many runs the organization's triggers started at or after `since`, by status. */
   countOrganizationRunsSince(organizationId: string, since: Date): Promise<OrganizationRunCount[]>;
+  listTriggerMatchActivity(
+    organizationId: string,
+    window: TriggerMatchWindow,
+  ): Promise<TriggerMatchActivity[]>;
+  countFailedRunsSince(
+    organizationId: string,
+    since: Date,
+    seenThrough: string | null,
+  ): Promise<FailedRunSummary>;
+  readFailedRunsSeenThrough(accountId: string, organizationId: string): Promise<string | null>;
+  markFailedRunsSeen(accountId: string, organizationId: string): Promise<void>;
+  hasActiveSessionProfile(organizationId: string): Promise<boolean>;
+  listSessionsWaitingForPermission(
+    organizationId: string,
+    viewer: SessionPrincipal,
+    limit: number,
+  ): Promise<WaitingSessionSummary>;
   listDroppedEventPage(
     organizationId: string,
     request: DroppedEventPageRequest,

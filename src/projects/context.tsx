@@ -4,9 +4,9 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 import { usePresentedTenantScope } from "../navigation/index.js";
 import { tenantContext } from "./functions.js";
 import { shouldRetryTenantRead } from "./unavailable.js";
-import type { ProjectDashboard } from "./dashboard.js";
+import { ProjectTenantContext } from "./route-tenant-context.js";
 
-type TenantContextValue = Awaited<ReturnType<ProjectDashboard["tenantContext"]>>;
+export { useOptionalRouteTenant, useRouteTenant } from "./route-tenant-context.js";
 
 /**
  * Which organization and project the URL is in, once the server has confirmed them.
@@ -22,7 +22,6 @@ export type RouteTenantStatus =
   | { state: "failed"; title: string; message: string }
   | { state: "ready" };
 
-const ProjectTenantContext = createContext<TenantContextValue | null>(null);
 const RouteTenantStatusContext = createContext<RouteTenantStatus>({ state: "outside" });
 
 export function RouteTenantProvider({ children }: { children: ReactNode }) {
@@ -71,16 +70,6 @@ function tenantStatus(read: {
     return { state: "failed", title, message: read.failure === "" ? `${title}.` : read.failure };
   }
   return { state: "ready" };
-}
-
-export function useRouteTenant(): TenantContextValue {
-  const tenant = useContext(ProjectTenantContext);
-  if (tenant === null) throw new Error("useRouteTenant used outside an organization route");
-  return tenant;
-}
-
-export function useOptionalRouteTenant(): TenantContextValue | null {
-  return useContext(ProjectTenantContext);
 }
 
 export function useRouteTenantStatus(): RouteTenantStatus {
