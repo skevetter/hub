@@ -279,12 +279,7 @@ export function profileSettings(input: SaveSessionProfileInput): SessionProfileS
 export function profileValidation(
   settings: SessionProfileSettings & Pick<SaveSessionProfileInput, "maxActive" | "linearTemplate">,
 ): "invalid_mode" | "invalid_profile" | undefined {
-  if (
-    settings.provider === "omp" &&
-    (!settings.mode || (settings.mode === "full" && !settings.fullAccessAcknowledged))
-  ) {
-    return "invalid_mode";
-  }
+  if (invalidProfileMode(settings)) return "invalid_mode";
   const nameLength = Array.from(settings.name).length;
   if (
     nameLength < 1 ||
@@ -297,6 +292,13 @@ export function profileValidation(
   )
     return "invalid_profile";
   return undefined;
+}
+
+function invalidProfileMode(settings: SessionProfileSettings): boolean {
+  return (
+    settings.provider === "omp" &&
+    (!settings.mode || (settings.mode === "full" && !settings.fullAccessAcknowledged))
+  );
 }
 
 function jsonbTextSize(value: JsonValue): number {
@@ -328,7 +330,9 @@ function jsonbTextSize(value: JsonValue): number {
   const power = Number(exponent);
   const sign = value < 0 ? 1 : 0;
   if (power >= 0) return sign + power + 1;
-  const digits = mantissa!.replace(/[-.]/gu, "").length;
+  if (mantissa === undefined)
+    throw new Error("interactive session store invariant: exponent without a mantissa");
+  const digits = mantissa.replace(/[-.]/gu, "").length;
   return sign + 1 - power + digits;
 }
 
@@ -486,13 +490,17 @@ export function newSession(
   };
 }
 
+interface NewCommandDetails {
+  kind: CommandKind;
+  delivery: Delivery | null;
+  body: string | null;
+  requestHash: string;
+}
+
 export function newCommand(
   session: SessionRecord,
   input: Pick<AcceptCommandInput, "principal" | "idempotencyKey" | "now">,
-  kind: CommandKind,
-  delivery: Delivery | null,
-  body: string | null,
-  requestHash: string,
+  { kind, delivery, body, requestHash }: NewCommandDetails,
 ): SessionCommandRecord {
   return {
     id: randomUUID(),
@@ -532,19 +540,34 @@ export function commandRefusal(
   if (input.kind === "replace") return session.state === "failed" ? undefined : "invalid_mode";
   if (input.kind === "close") return undefined;
   if (session.state === "failed") return "session_failed";
+  return activeCommandRefusal(session, input);
+}
+
+function activeCommandRefusal(
+  session: SessionRecord,
+  input: AcceptCommandInput,
+): RefusalCode | undefined {
   if (input.kind === "stop") {
     return session.state === "running" || session.state === "waiting_permission"
       ? undefined
       : "not_stoppable";
   }
   if (input.kind === "message" || input.kind === "retry") {
-    if (session.state === "stopping") return "session_stopping";
-    if (input.kind === "retry")
-      return session.state === "waiting_permission" ? "waiting_permission" : undefined;
-    if (session.state === "waiting_permission" && input.delivery === "steer")
-      return "waiting_permission";
-    if (!validMessage(input.message)) return "message_too_long";
+    return messageCommandRefusal(session, input);
   }
+  return undefined;
+}
+
+function messageCommandRefusal(
+  session: SessionRecord,
+  input: Extract<AcceptCommandInput, { kind: "message" | "retry" }>,
+): RefusalCode | undefined {
+  if (session.state === "stopping") return "session_stopping";
+  if (input.kind === "retry")
+    return session.state === "waiting_permission" ? "waiting_permission" : undefined;
+  if (session.state === "waiting_permission" && input.delivery === "steer")
+    return "waiting_permission";
+  if (!validMessage(input.message)) return "message_too_long";
   return undefined;
 }
 
@@ -574,6 +597,8 @@ export function advanceForCommand(
         daemonAgentId: null,
         daemonWorkspaceId: null,
       };
+    case "message":
+    case "retry":
     default:
       return next;
   }
@@ -631,19 +656,7 @@ export function closeLinearPilotSession(
   profile: SessionProfileRecord | undefined,
   command: LinearPilotRetirementCommand | undefined,
 ): SessionRecord | undefined {
-  if (
-    profile?.id !== input.profileId ||
-    profile.organizationId !== input.organizationId ||
-    profile.status !== "active" ||
-    profile.access !== "private" ||
-    profile.createdByUserId !== input.ownerUserId ||
-    command?.id !== input.commandId ||
-    command.ordinal !== 1 ||
-    command.kind !== "message" ||
-    command.status !== "delivered" ||
-    command.authorUserId !== input.ownerUserId ||
-    command.generation !== input.generation
-  )
+  if (!matchesLinearPilotProfile(profile, input) || !matchesLinearPilotCommand(command, input))
     return undefined;
   return {
     ...session,
@@ -652,6 +665,33 @@ export function closeLinearPilotSession(
     closedAt: input.now,
     closedByUserId: null,
   };
+}
+
+function matchesLinearPilotProfile(
+  profile: SessionProfileRecord | undefined,
+  input: RetireLinearPilotSessionInput,
+): boolean {
+  return (
+    profile?.id === input.profileId &&
+    profile.organizationId === input.organizationId &&
+    profile.status === "active" &&
+    profile.access === "private" &&
+    profile.createdByUserId === input.ownerUserId
+  );
+}
+
+function matchesLinearPilotCommand(
+  command: LinearPilotRetirementCommand | undefined,
+  input: RetireLinearPilotSessionInput,
+): boolean {
+  return (
+    command?.id === input.commandId &&
+    command.ordinal === 1 &&
+    command.kind === "message" &&
+    command.status === "delivered" &&
+    command.authorUserId === input.ownerUserId &&
+    command.generation === input.generation
+  );
 }
 
 export function interruptCommand(
@@ -664,6 +704,14 @@ export function interruptCommand(
     return settlePatch("superseded", now);
   }
   if (command.kind !== "message") return undefined;
+  return interruptMessageCommand(command, kind, now);
+}
+
+function interruptMessageCommand(
+  command: SessionCommandRecord,
+  kind: "stop" | "close",
+  now: Date,
+): Partial<SessionCommandRecord> | undefined {
   if (command.status === "pending" || command.status === "queued")
     return settlePatch("superseded", now);
   if (command.failureCode === "delivery_unconfirmed") return undefined;
@@ -698,18 +746,21 @@ export function commandLeaseEligible(
   sessionState: SessionState,
   leaseNow: Date,
 ): boolean {
-  if (
-    command.kind === "message" &&
-    (sessionState === "waiting_permission" || sessionState === "stopping") &&
-    !(command.status === "dispatching" && command.failureCode === "delivery_unconfirmed")
-  )
-    return false;
+  if (messageLeaseBlocked(command, sessionState)) return false;
   return (
     (command.claimExpiresAt === null || command.claimExpiresAt <= leaseNow) &&
     (command.status === "pending" ||
       (command.status === "unknown" && command.failureCode !== "delivery_unconfirmed") ||
       command.status === "dispatching" ||
       (command.status === "queued" && sessionState === "idle" && input.agentIdle))
+  );
+}
+
+function messageLeaseBlocked(command: SessionCommandRecord, sessionState: SessionState): boolean {
+  return (
+    command.kind === "message" &&
+    (sessionState === "waiting_permission" || sessionState === "stopping") &&
+    !(command.status === "dispatching" && command.failureCode === "delivery_unconfirmed")
   );
 }
 
@@ -856,12 +907,16 @@ export function replayCommand(
   return bodyVisible(command, cutoff) ? command : { ...command, body: null };
 }
 
+export interface SessionAuditDetails {
+  actorIdentity: string;
+  action: string;
+  evidence: SessionAuditRecord["evidence"];
+  now: Date;
+}
+
 export function sessionAudit(
   session: SessionRecord,
-  actorIdentity: string,
-  action: string,
-  evidence: SessionAuditRecord["evidence"],
-  now: Date,
+  { actorIdentity, action, evidence, now }: SessionAuditDetails,
 ): SessionAuditRecord {
   return {
     id: randomUUID(),
