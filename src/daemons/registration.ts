@@ -11,7 +11,7 @@ import { reportFailure } from "../failures/index.js";
 const renameBody = z.object({ slug: z.string().trim().min(1).max(100) }).strict();
 const enrollmentBody = z
   .object({
-    daemonId: z.string().uuid(),
+    daemonId: z.uuid(),
     idempotencyKey: z.string(),
     hostname: z.string().trim().min(1).max(253).optional(),
     serverId: z.string(),
@@ -138,8 +138,7 @@ export async function enrollDaemon(
     serverId: input.data.serverId,
     daemonPublicKey: input.data.daemonPublicKey,
     credentialVerifier: input.data.credentialVerifier,
-    suggestedSlug:
-      input.data.hostname === undefined ? fallbackSlug : slugify(input.data.hostname, fallbackSlug),
+    suggestedSlug: slugify(input.data.hostname ?? "", fallbackSlug),
     permissions,
     tokenVerifier: verifier(token),
     now: clock.nowDate(),
@@ -148,21 +147,23 @@ export async function enrollDaemon(
     return Response.json({ error: "invalid enrollment token" }, { status: 401 });
   }
   if (daemon.status === "slug_conflict") return daemonSlugConflict(daemon.slug);
-  const webSocketUrl = new URL("/api/daemons/socket", publicBaseUrl ?? request.url);
-  webSocketUrl.protocol = webSocketUrl.protocol === "https:" ? "wss:" : "ws:";
-  const response = {
-    daemonId: daemon.id,
-    slug: daemon.slug,
-    webSocketUrl: webSocketUrl.toString(),
-  };
+  const webSocketUrl = daemonSocketUrl(publicBaseUrl ?? request.url);
+  const response = { daemonId: daemon.id, slug: daemon.slug, webSocketUrl };
   return Response.json(
     input.data.permissions === undefined
-      ? {
-          ...response,
-          scopes: daemon.permissions.includes("hub.execute") ? ["hub.execution.*"] : [],
-        }
+      ? { ...response, scopes: legacyScopes(daemon.permissions) }
       : { ...response, permissions: daemon.permissions },
   );
+}
+
+function daemonSocketUrl(base: string): string {
+  const url = new URL("/api/daemons/socket", base);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString();
+}
+
+function legacyScopes(permissions: readonly string[]): string[] {
+  return permissions.includes("hub.execute") ? ["hub.execution.*"] : [];
 }
 
 export async function updateDaemonPermissions(
