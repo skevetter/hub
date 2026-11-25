@@ -305,29 +305,55 @@ function createGitHubWebhook(
   });
 }
 
+const MARKER_SCAN_PAGE_SIZE = 100;
+const MARKER_SCAN_MAX_PAGES = 3;
+
+// Pages are requested by number through the same client, never by following a Link header.
+async function scanForNoticeMarker(
+  appAuth: GitHubAuth,
+  appSlug: string,
+  input: Parameters<GitHubCommentClient["findIssueCommentByMarker"]>[0],
+): Promise<number | undefined> {
+  const { installationId, owner, repo, issueNumber, marker, since } = input;
+  const octokit = await appAuth.createInstallationOctokit(installationId);
+  let botId: number | undefined;
+  for (let page = 1; page <= MARKER_SCAN_MAX_PAGES; page += 1) {
+    const { data: comments } = await octokit.request(
+      "GET /repos/{owner}/{repo}/issues/{issue_number}/comments",
+      {
+        owner,
+        repo,
+        issue_number: issueNumber,
+        ...(since === undefined ? {} : { since }),
+        per_page: MARKER_SCAN_PAGE_SIZE,
+        page,
+        request: { retries: 0 },
+      },
+    );
+    botId ??= await appBotId(appAuth, appSlug, installationId);
+    const found = comments.find(
+      (comment) =>
+        comment.user?.id === botId &&
+        comment.body?.split(/\r\n?|\n/u).some((line) => line.trim() === marker),
+    );
+    if (found !== undefined) return found.id;
+    if (comments.length < MARKER_SCAN_PAGE_SIZE) return undefined;
+  }
+  return undefined;
+}
+
+async function appBotId(
+  appAuth: GitHubAuth,
+  appSlug: string,
+  installationId: number,
+): Promise<number> {
+  const token = await appAuth.getInstallationToken(installationId);
+  return (await appAuth.getAppBotIdentity(appSlug, token)).id;
+}
+
 function createGitHubCommentClient(appAuth: GitHubAuth, appSlug: string): GitHubCommentClient {
   return {
-    async findIssueCommentByMarker({ installationId, owner, repo, issueNumber, marker, since }) {
-      const octokit = await appAuth.createInstallationOctokit(installationId);
-      const { data: comments } = await octokit.request(
-        "GET /repos/{owner}/{repo}/issues/{issue_number}/comments",
-        {
-          owner,
-          repo,
-          issue_number: issueNumber,
-          ...(since === undefined ? {} : { since }),
-          per_page: 100,
-          request: { retries: 0 },
-        },
-      );
-      const token = await appAuth.getInstallationToken(installationId);
-      const bot = await appAuth.getAppBotIdentity(appSlug, token);
-      return comments.find(
-        (comment) =>
-          comment.user?.id === bot.id &&
-          comment.body?.split(/\r\n?|\n/u).some((line) => line.trim() === marker),
-      )?.id;
-    },
+    findIssueCommentByMarker: (input) => scanForNoticeMarker(appAuth, appSlug, input),
     async createIssueComment({ installationId, owner, repo, issueNumber, body }) {
       const octokit = await appAuth.createInstallationOctokit(installationId);
       const response = await octokit.request(
