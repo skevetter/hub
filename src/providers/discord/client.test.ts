@@ -40,7 +40,45 @@ describe("Discord connection client", () => {
     assert.equal(await provider.verifyGuild("code"), undefined);
     assert.deepEqual(discord.membershipRequests, ["100"]);
   });
+
+  it("sends the configured client credentials and callback with the token grant", async () => {
+    const discord = new DiscordProviderPort();
+    const provider = createDiscordConnectionClient(new InheritedCredentials(discord.options()));
+
+    await provider.verifyGuild("the-code");
+
+    assert.equal(discord.tokenBodies.length, 1);
+    const body = new URLSearchParams(discord.tokenBodies[0]);
+    assert.equal(body.get("client_id"), "200");
+    assert.equal(body.get("client_secret"), "secret");
+    assert.equal(body.get("grant_type"), "authorization_code");
+    assert.equal(body.get("code"), "the-code");
+    assert.equal(
+      body.get("redirect_uri"),
+      "https://hub.example.test/api/integrations/discord/callback",
+    );
+  });
 });
+
+class InheritedCredentials {
+  readonly publicBaseUrl: string;
+  readonly botToken: string;
+  readonly fetch: typeof fetch;
+
+  constructor(base: ReturnType<DiscordProviderPort["options"]>) {
+    this.publicBaseUrl = base.publicBaseUrl;
+    this.botToken = base.botToken;
+    this.fetch = base.fetch;
+  }
+
+  get clientId() {
+    return "200";
+  }
+
+  get clientSecret() {
+    return "secret";
+  }
+}
 
 class DiscordProviderPort {
   guildStatus = 200;
@@ -48,6 +86,7 @@ class DiscordProviderPort {
   oauthGuildId = "100";
   membershipGuildId = "100";
   readonly membershipRequests: string[] = [];
+  readonly tokenBodies: string[] = [];
 
   options() {
     return {
@@ -59,9 +98,10 @@ class DiscordProviderPort {
     };
   }
 
-  private readonly request: typeof fetch = (input) => {
+  private readonly request: typeof fetch = (input, init) => {
     const url = requestUrl(input);
     if (url.pathname === "/api/v10/oauth2/token") {
+      this.tokenBodies.push(init?.body instanceof URLSearchParams ? init.body.toString() : "");
       return Promise.resolve(
         Response.json({
           access_token: "oauth-token",

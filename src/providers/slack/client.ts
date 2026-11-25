@@ -20,11 +20,9 @@ const SlackOAuthResponseSchema = z
     scope: z.string().optional(),
     team: z.object({ id: z.string().min(1), name: z.string().min(1) }).optional(),
   })
-  .passthrough();
+  .loose();
 
-const SlackApiResponseSchema = z
-  .object({ ok: z.boolean(), error: z.string().optional() })
-  .passthrough();
+const SlackApiResponseSchema = z.object({ ok: z.boolean(), error: z.string().optional() }).loose();
 const SlackAuthTestResponseSchema = SlackApiResponseSchema.extend({
   team_id: z.string().min(1).optional(),
   user_id: z.string().min(1).optional(),
@@ -49,6 +47,38 @@ export interface SlackConnectionClient {
   exchangeCode(code: string): Promise<SlackInstallation>;
   verifyInstallation(installation: SlackInstallation): Promise<void>;
   revoke(botAccessToken: string): Promise<void>;
+}
+
+async function verifySlackInstallation(
+  request: typeof fetch,
+  installation: SlackInstallation,
+): Promise<void> {
+  if (!hasRequiredSlackScopes(installation.scopes)) throw new SlackBotVerificationError();
+  const response = await request("https://slack.com/api/auth.test", {
+    headers: { authorization: `Bearer ${installation.botAccessToken}` },
+  });
+  if (!response.ok) throw new SlackBotVerificationError();
+  const result = SlackAuthTestResponseSchema.parse(await response.json());
+  if (
+    !result.ok ||
+    result.team_id !== installation.teamId ||
+    result.user_id !== installation.botUserId
+  ) {
+    throw new SlackBotVerificationError();
+  }
+}
+
+async function revokeSlackToken(request: typeof fetch, botAccessToken: string): Promise<void> {
+  const response = await request("https://slack.com/api/auth.revoke", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${botAccessToken}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+  });
+  if (!response.ok) throw new Error(`Slack revoke HTTP ${response.status}`);
+  const result = SlackApiResponseSchema.parse(await response.json());
+  if (!result.ok) throw new Error(`Slack revoke ${result.error ?? "unknown_error"}`);
 }
 
 export function createSlackConnectionClient(options: {
@@ -103,31 +133,10 @@ export function createSlackConnectionClient(options: {
       };
     },
     async verifyInstallation(installation) {
-      if (!hasRequiredSlackScopes(installation.scopes)) throw new SlackBotVerificationError();
-      const response = await request("https://slack.com/api/auth.test", {
-        headers: { authorization: `Bearer ${installation.botAccessToken}` },
-      });
-      if (!response.ok) throw new SlackBotVerificationError();
-      const result = SlackAuthTestResponseSchema.parse(await response.json());
-      if (
-        !result.ok ||
-        result.team_id !== installation.teamId ||
-        result.user_id !== installation.botUserId
-      ) {
-        throw new SlackBotVerificationError();
-      }
+      await verifySlackInstallation(request, installation);
     },
     async revoke(botAccessToken) {
-      const response = await request("https://slack.com/api/auth.revoke", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${botAccessToken}`,
-          "content-type": "application/x-www-form-urlencoded",
-        },
-      });
-      if (!response.ok) throw new Error(`Slack revoke HTTP ${response.status}`);
-      const result = SlackApiResponseSchema.parse(await response.json());
-      if (!result.ok) throw new Error(`Slack revoke ${result.error ?? "unknown_error"}`);
+      await revokeSlackToken(request, botAccessToken);
     },
   };
 }

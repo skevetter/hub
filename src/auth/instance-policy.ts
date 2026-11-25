@@ -52,17 +52,24 @@ export function readInstanceAuthPolicy(
   const registrationMode = parsePolicyValue(
     "PASEO_REGISTRATION_MODE",
     environment["PASEO_REGISTRATION_MODE"],
-    registrationModeSchema,
-    REGISTRATION_MODES,
-    "invite_only",
+    { schema: registrationModeSchema, allowed: REGISTRATION_MODES, fallback: "invite_only" },
   );
   const organizationCreation = parsePolicyValue(
     "PASEO_ORGANIZATION_CREATION",
     environment["PASEO_ORGANIZATION_CREATION"],
-    organizationCreationSchema,
-    ORGANIZATION_CREATION_MODES,
-    "disabled",
+    {
+      schema: organizationCreationSchema,
+      allowed: ORGANIZATION_CREATION_MODES,
+      fallback: "disabled",
+    },
   );
+  const bootstrap = readBootstrapSettings(environment);
+  return { registrationMode, organizationCreation, bootstrap };
+}
+
+function readBootstrapSettings(
+  environment: Record<string, string | undefined>,
+): BootstrapSettings | undefined {
   const organizationName = environment["PASEO_BOOTSTRAP_ORGANIZATION"]?.trim() ?? "";
   const ownerEmail = environment["PASEO_BOOTSTRAP_OWNER_EMAIL"]?.trim() ?? "";
   const ownerPassword = environment["PASEO_BOOTSTRAP_OWNER_PASSWORD"] ?? "";
@@ -70,19 +77,13 @@ export function readInstanceAuthPolicy(
     (value) => value.length > 0,
   ).length;
 
-  if (suppliedBootstrapFields === 0) {
-    return { registrationMode, organizationCreation, bootstrap: undefined };
-  }
+  if (suppliedBootstrapFields === 0) return undefined;
   if (suppliedBootstrapFields === 2 && ownerPassword.length === 0) {
     validateBootstrapIdentity(organizationName, ownerEmail);
     return {
-      registrationMode,
-      organizationCreation,
-      bootstrap: {
-        organizationName,
-        ownerEmail: normalizeEmail(ownerEmail),
-        ownerPassword: undefined,
-      },
+      organizationName,
+      ownerEmail: normalizeEmail(ownerEmail),
+      ownerPassword: undefined,
     };
   }
   if (suppliedBootstrapFields !== 3) {
@@ -90,26 +91,25 @@ export function readInstanceAuthPolicy(
       "PASEO_BOOTSTRAP_ORGANIZATION, PASEO_BOOTSTRAP_OWNER_EMAIL, and PASEO_BOOTSTRAP_OWNER_PASSWORD must be supplied together",
     );
   }
+  return passwordBootstrapSettings(organizationName, ownerEmail, ownerPassword);
+}
 
+function passwordBootstrapSettings(
+  organizationName: string,
+  ownerEmail: string,
+  ownerPassword: string,
+): BootstrapSettings {
   validateBootstrapIdentity(organizationName, ownerEmail);
   bootstrapPasswordSchema.parse(ownerPassword);
   if (normalizeEmail(ownerPassword) === normalizeEmail(ownerEmail)) {
     throw new Error("PASEO_BOOTSTRAP_OWNER_PASSWORD must not equal the owner email");
   }
 
-  return {
-    registrationMode,
-    organizationCreation,
-    bootstrap: {
-      organizationName,
-      ownerEmail: normalizeEmail(ownerEmail),
-      ownerPassword,
-    },
-  };
+  return { organizationName, ownerEmail: normalizeEmail(ownerEmail), ownerPassword };
 }
 
 function validateBootstrapIdentity(organizationName: string, ownerEmail: string): void {
-  const parsedEmail = z.string().email().safeParse(ownerEmail);
+  const parsedEmail = z.email().safeParse(ownerEmail);
   if (!parsedEmail.success) throw new Error("PASEO_BOOTSTRAP_OWNER_EMAIL must be a valid email");
   if (organizationName.length > 100) {
     throw new Error("PASEO_BOOTSTRAP_ORGANIZATION must not exceed 100 characters");
@@ -119,13 +119,11 @@ function validateBootstrapIdentity(organizationName: string, ownerEmail: string)
 function parsePolicyValue<T extends string>(
   name: string,
   value: string | undefined,
-  schema: z.ZodType<T>,
-  allowed: readonly T[],
-  fallback: T,
+  policy: { schema: z.ZodType<T>; allowed: readonly T[]; fallback: T },
 ): T {
-  const result = schema.safeParse(value ?? fallback);
+  const result = policy.schema.safeParse(value ?? policy.fallback);
   if (result.success) return result.data;
-  throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
+  throw new Error(`${name} must be one of: ${policy.allowed.join(", ")}`);
 }
 
 export function normalizeEmail(email: string): string {
