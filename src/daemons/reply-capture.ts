@@ -134,15 +134,23 @@ class LastAssistantMessage {
         this.interrupted = true;
         return;
       case "timeline":
-        if (event.item.type === "user_message") this.startTurn();
-        if (event.item.type === "tool_call") this.crossedTool = true;
-        if (event.item.type === "assistant_message" && typeof event.item.text === "string") {
-          const turnId = typeof event["turnId"] === "string" ? event["turnId"] : undefined;
-          this.append(event.item.text, event.item.messageId, turnId);
-        }
+        this.observeTimeline(event);
         return;
+      case "attention_required":
+      case "permission_requested":
+      case "permission_resolved":
+      case "thread_started":
       default:
         return;
+    }
+  }
+
+  private observeTimeline(event: Extract<AgentStream["event"], { type: "timeline" }>): void {
+    if (event.item.type === "user_message") this.startTurn();
+    if (event.item.type === "tool_call") this.crossedTool = true;
+    if (event.item.type === "assistant_message" && typeof event.item.text === "string") {
+      const turnId = typeof event["turnId"] === "string" ? event["turnId"] : undefined;
+      this.append(event.item.text, event.item.messageId, turnId);
     }
   }
 
@@ -151,11 +159,7 @@ class LastAssistantMessage {
   }
 
   private append(value: string, messageId: string | undefined, turnId: string | undefined) {
-    if (
-      this.completed ||
-      (turnId !== undefined && this.turnId !== undefined && turnId !== this.turnId)
-    )
-      this.startTurn();
+    if (this.startsNewTurn(turnId)) this.startTurn();
     if (this.interrupted) return;
     if (messageId !== this.messageId || (messageId === undefined && this.crossedTool))
       this.clearMessage();
@@ -165,6 +169,13 @@ class LastAssistantMessage {
     this.text += value.slice(0, available);
     this.truncated ||= value.length > available;
     this.crossedTool = false;
+  }
+
+  private startsNewTurn(turnId: string | undefined): boolean {
+    return (
+      this.completed ||
+      (turnId !== undefined && this.turnId !== undefined && turnId !== this.turnId)
+    );
   }
 
   private startTurn() {
