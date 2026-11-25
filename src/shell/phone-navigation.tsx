@@ -1,6 +1,10 @@
 import { Ellipsis, X } from "lucide-react";
-import type { ReactNode } from "react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
 
+import { AttentionPanel } from "../attention/attention-panel.js";
+import { attentionLabel } from "../attention/client-state.js";
+import { useAttention } from "../attention/use-attention.js";
+import { AttentionMark } from "../components/app/attention-row.js";
 import {
   Sheet,
   SheetClose,
@@ -47,11 +51,12 @@ export function PhoneNavigation({
   return (
     <nav
       aria-label="Quick navigation"
-      className="fixed inset-x-0 bottom-0 z-20 grid h-[var(--shell-bottom-bar)] grid-cols-4 border-t border-rail-border bg-rail pb-[var(--shell-bottom-safe-area)] md:hidden"
+      className="fixed inset-x-0 bottom-0 z-20 grid h-[var(--shell-bottom-bar)] grid-cols-5 border-t border-rail-border bg-rail pb-[var(--shell-bottom-safe-area)] md:hidden"
     >
       {items.map((item) => (
         <NavItem key={item.to} item={item} phoneTab />
       ))}
+      {isMobile ? <PhoneAttention /> : null}
       <Sheet open={isMobile && openMobile} onOpenChange={setOpenMobile}>
         <SheetTrigger className={cn(PHONE_TAB_CLASS, "text-rail-muted hover:bg-rail-accent")}>
           <Ellipsis aria-hidden="true" className="size-4" />
@@ -69,15 +74,70 @@ export function PhoneNavigation({
             <SheetDescription className="sr-only">Navigation and account</SheetDescription>
           </SheetHeader>
           {children}
-          <SheetClose
-            aria-label="Close"
-            className="absolute top-2 right-2 grid size-11 place-items-center rounded-sm text-rail-muted hover:bg-rail-accent hover:text-rail-foreground"
-          >
-            <X aria-hidden="true" className="size-4" />
-          </SheetClose>
+          <PhoneSheetClose rail />
         </SheetContent>
       </Sheet>
     </nav>
+  );
+}
+
+function PhoneAttention() {
+  const attention = useAttention();
+  const { count } = attention;
+  const [open, setOpen] = useState(false);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const close = useCallback(() => setOpen(false), []);
+  const focusHeading = useCallback((event: Event) => {
+    event.preventDefault();
+    heading.current?.focus({ preventScroll: true });
+  }, []);
+
+  return (
+    <Sheet open={open} onOpenChange={setOpen}>
+      <SheetTrigger
+        className={cn(PHONE_TAB_CLASS, "text-rail-muted hover:bg-rail-accent")}
+        aria-label={attentionLabel(count)}
+      >
+        <span aria-hidden="true" className="grid size-4 place-items-center">
+          {count > 0 ? <AttentionMark /> : null}
+        </span>
+        <span>Attention</span>
+      </SheetTrigger>
+      <SheetContent
+        side="bottom"
+        showCloseButton={false}
+        className="max-h-svh gap-0 overflow-y-auto border-input text-sm md:hidden"
+        style={SHEET_STYLE}
+        onOpenAutoFocus={focusHeading}
+      >
+        <SheetHeader className="border-b-2 border-foreground">
+          <SheetTitle ref={heading} tabIndex={-1}>
+            Attention
+          </SheetTitle>
+          <SheetDescription className="sr-only">Items that need your attention</SheetDescription>
+        </SheetHeader>
+        <div className="px-4">
+          <AttentionPanel {...attention} onFollow={close} />
+        </div>
+        <PhoneSheetClose />
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+function PhoneSheetClose({ rail = false }: { rail?: boolean }) {
+  return (
+    <SheetClose
+      aria-label="Close"
+      className={cn(
+        "absolute top-2 right-2 grid size-11 place-items-center rounded-sm",
+        rail
+          ? "text-rail-muted hover:bg-rail-accent hover:text-rail-foreground"
+          : "text-muted-foreground hover:bg-accent hover:text-foreground",
+      )}
+    >
+      <X aria-hidden="true" className="size-4" />
+    </SheetClose>
   );
 }
 

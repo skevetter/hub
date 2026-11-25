@@ -2059,7 +2059,10 @@ export class PaseoHub {
   /** A finished or running run of a saved trigger, received `minutesAgo` minutes ago. */
   async seedTriggerRun(
     triggerName: string,
-    run: { minutesAgo: number; status: "running" | "succeeded" | "failed" },
+    run: {
+      minutesAgo: number;
+      status: "running" | "succeeded" | "failed" | "timed_out" | "rejected";
+    },
   ): Promise<void> {
     const receivedAt = `now() - make_interval(mins => $3)`;
     await this.queryDatabase(
@@ -2080,9 +2083,12 @@ export class PaseoHub {
        )
        insert into trigger_runs
          (organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
-          configured_trigger_name, status, prompt, deadline_at, created_at)
+          configured_trigger_name, status, outcome, rejection, prompt, deadline_at, created_at)
        select receipt.organization_id, trigger.project_id, trigger.revision_id, receipt.id, $1, $2,
-              'Handle the event.', now() + interval '1 hour', ${receivedAt}
+              case when $2 = 'rejected' then 'rejected' else 'accepted' end,
+              case when $2 = 'rejected' then '{"code":"missing_required","inputName":"fixture"}'::jsonb end,
+              'Handle the event.', case when $2 <> 'rejected' then now() + interval '1 hour' end,
+              ${receivedAt}
        from receipt, trigger`,
       [triggerName, run.status, run.minutesAgo],
     );
@@ -4256,11 +4262,12 @@ class HubUser {
   }
 
   /**
-   * The footer's stops after the destinations: Help, then the account menu. The execution meter
-   * and its upgrade link precede Help on a metered organization, which this harness never is —
-   * the browser fixtures that configure billing do not drive the sidebar by keyboard.
+   * After the destinations: Attention, Help, then the account menu. The execution meter and its
+   * upgrade link precede Help in metered organizations, which these keyboard tests do not use.
    */
   private async tabThroughSidebarFooter(): Promise<void> {
+    await this.page.keyboard.press("Tab");
+    await expect(this.page.getByRole("button", { name: /^Attention(?:,|$)/u })).toBeFocused();
     await this.page.keyboard.press("Tab");
     await expect(this.page.getByRole("button", { name: "Help", exact: true })).toBeFocused();
     await this.page.keyboard.press("Tab");

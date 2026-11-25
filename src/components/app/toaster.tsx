@@ -1,5 +1,5 @@
 import { X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
 
 import { Button } from "../ui/button.js";
 import { dismissToast, useToasts, visibleToasts, type ToastItem } from "./toast-store.js";
@@ -17,7 +17,7 @@ function useDismissAfterDelay(item: ToastItem, held: boolean): void {
 }
 
 /** A toast stays while the pointer or the keyboard is on it, so a reader is never raced. */
-function useHold() {
+function useHold(onEscape: () => void) {
   const [hovered, setHovered] = useState(false);
   const [focused, setFocused] = useState(false);
   const handlers = useMemo(
@@ -26,20 +26,25 @@ function useHold() {
       onMouseLeave: () => setHovered(false),
       onFocus: () => setFocused(true),
       onBlur: () => setFocused(false),
+      onKeyDown: (event: KeyboardEvent<HTMLElement>) => {
+        if (event.key !== "Escape") return;
+        event.stopPropagation();
+        onEscape();
+      },
     }),
-    [],
+    [onEscape],
   );
   return { held: hovered || focused, handlers };
 }
 
 function ToastCard({ item, returnFocusId }: { item: ToastItem; returnFocusId: string }) {
-  const { held, handlers } = useHold();
-  useDismissAfterDelay(item, held);
   const dismiss = useCallback(() => {
     // The card is about to unmount with focus inside it; hand the keyboard back to the page.
     document.getElementById(returnFocusId)?.focus({ preventScroll: true });
     dismissToast(item.id);
   }, [item.id, returnFocusId]);
+  const { held, handlers } = useHold(dismiss);
+  useDismissAfterDelay(item, held);
   return (
     <div
       data-slot="toast"

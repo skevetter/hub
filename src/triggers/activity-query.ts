@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { DEFAULT_PAGE_SIZE, parsePageSize } from "../components/app/page-size.js";
-import type { TriggerRunRecord } from "../db/types.js";
+import { statusLabel } from "../components/app/state-label.js";
+import { FAILED_RUN_FILTER, type RunStatusFilter } from "./run-status.js";
 import { DROP_REASON_FILTERS } from "./drop-reason.js";
 import { LIST_PROVIDERS } from "./list-providers.js";
 
@@ -11,7 +12,13 @@ export const ACTIVITY_STATUSES = [
   "timed_out",
   "canceled",
   "rejected",
-] as const satisfies readonly TriggerRunRecord["status"][];
+  FAILED_RUN_FILTER,
+] as const satisfies readonly RunStatusFilter[];
+
+export function activityStatusLabel(status: RunStatusFilter): string {
+  return status === FAILED_RUN_FILTER ? "Failed, timed out or rejected" : statusLabel(status);
+}
+
 export const ACTIVITY_RANGES = ["24h", "7d", "30d"] as const;
 export const ACTIVITY_RANGE_LABELS: Record<(typeof ACTIVITY_RANGES)[number], string> = {
   "24h": "Last 24 hours",

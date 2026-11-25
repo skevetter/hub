@@ -1,4 +1,3 @@
-import type { ProviderEventDropReasonCode } from "../triggers/drop-reason.js";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { describe, it } from "vitest";
@@ -36,7 +35,6 @@ describe("home read model", () => {
     assert.deepEqual(snapshot.daemons, []);
     assert.deepEqual(snapshot.triggers, []);
     assert.deepEqual(snapshot.runs, []);
-    assert.deepEqual(snapshot.dropped, []);
     assert.equal(snapshot.windowDays, 7);
   });
 
@@ -50,8 +48,14 @@ describe("home read model", () => {
       "org-1",
       acceptingAgentValidator(),
     ).save({ yaml: triggerYaml, userId: "user-1" });
-    await recordRun(database, trigger.runtimeProjectId, "first", "succeeded", 120_000);
-    await recordRun(database, trigger.runtimeProjectId, "second", "failed", 60_000);
+    await recordRun(database, trigger.runtimeProjectId, "first", {
+      status: "succeeded",
+      ageMs: 120_000,
+    });
+    await recordRun(database, trigger.runtimeProjectId, "second", {
+      status: "failed",
+      ageMs: 60_000,
+    });
 
     const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
       now: () => NOW,
@@ -102,14 +106,11 @@ describe("home read model", () => {
       "org-1",
       acceptingAgentValidator(),
     ).save({ yaml: scheduledTriggerYaml, userId: "user-1" });
-    await recordRun(
-      database,
-      trigger.runtimeProjectId,
-      "tick",
-      "succeeded",
-      60_000,
-      "schedule.tick",
-    );
+    await recordRun(database, trigger.runtimeProjectId, "tick", {
+      status: "succeeded",
+      ageMs: 60_000,
+      event: "schedule.tick",
+    });
 
     const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
       now: () => NOW,
@@ -121,28 +122,6 @@ describe("home read model", () => {
     );
   });
 
-  it("counts dropped receipts by reason group and provider inside the window", async () => {
-    const database = memberDatabase();
-    await dropSlackEvent(database, "recent-1", new Date("2026-09-20T12:00:00.000Z"));
-    await dropSlackEvent(database, "recent-2", new Date("2026-09-21T09:00:00.000Z"));
-    await dropSlackEvent(database, "stale", new Date("2026-09-01T12:00:00.000Z"));
-    await dropSlackEvent(
-      database,
-      "filtered",
-      new Date("2026-09-21T10:00:00.000Z"),
-      "trigger_filters_rejected",
-    );
-
-    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
-      now: () => NOW,
-    }).snapshot(request, "acme");
-
-    assert.deepEqual(snapshot.dropped, [
-      { provider: "slack", reason: "routing", count: 2 },
-      { provider: "slack", reason: "trigger_filters_rejected", count: 1 },
-    ]);
-  });
-
   it("counts runs started in the last 24 hours and the last 30 days by outcome", async () => {
     const database = memberDatabase();
     await enrollTestDaemon(database, "org-1");
@@ -152,10 +131,22 @@ describe("home read model", () => {
       acceptingAgentValidator(),
     ).save({ yaml: triggerYaml, userId: "user-1" });
     const hour = 3_600_000;
-    await recordRun(database, trigger.runtimeProjectId, "hour", "succeeded", hour);
-    await recordRun(database, trigger.runtimeProjectId, "two-hours", "failed", 2 * hour);
-    await recordRun(database, trigger.runtimeProjectId, "three-days", "succeeded", 72 * hour);
-    await recordRun(database, trigger.runtimeProjectId, "forty-days", "succeeded", 960 * hour);
+    await recordRun(database, trigger.runtimeProjectId, "hour", {
+      status: "succeeded",
+      ageMs: hour,
+    });
+    await recordRun(database, trigger.runtimeProjectId, "two-hours", {
+      status: "failed",
+      ageMs: 2 * hour,
+    });
+    await recordRun(database, trigger.runtimeProjectId, "three-days", {
+      status: "succeeded",
+      ageMs: 72 * hour,
+    });
+    await recordRun(database, trigger.runtimeProjectId, "forty-days", {
+      status: "succeeded",
+      ageMs: 960 * hour,
+    });
 
     const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
       now: () => NOW,
@@ -497,13 +488,17 @@ async function enrollConnectedOnlyDaemon(database: Database): Promise<void> {
   });
 }
 
+interface RunOptions {
+  status: "succeeded" | "failed";
+  ageMs: number;
+  event?: string;
+}
+
 async function recordRun(
   database: Database,
   projectId: string,
   deliveryId: string,
-  status: "succeeded" | "failed",
-  ageMs: number,
-  event = "manual.run",
+  { status, ageMs, event = "manual.run" }: RunOptions,
 ): Promise<void> {
   const revision = await database.findActiveProjectConfiguration(projectId);
   assert.ok(revision);
@@ -535,9 +530,30 @@ async function recordRun(
     stepIds: ["run"],
     createdAt: new Date(NOW.getTime() - ageMs),
   });
+  await recordExecution(database, {
+    projectId,
+    revisionId: revision.id,
+    runId: run.id,
+    deliveryId,
+  });
+  if (status === "succeeded") await database.succeedTriggerRun(run.id);
+  else await database.failWorkflowRun(run.id, "failed", "agent_interrupted", "run");
+}
+
+interface ExecutionOptions {
+  projectId: string;
+  revisionId: string;
+  runId: string;
+  deliveryId: string;
+}
+
+async function recordExecution(
+  database: Database,
+  { projectId, revisionId, runId, deliveryId }: ExecutionOptions,
+): Promise<void> {
   const executionId = `execution-${deliveryId}`;
   await database.createWorkflowStepExecution({
-    triggerRunId: run.id,
+    triggerRunId: runId,
     stepId: "run",
     ordinal: 0,
     executionId,
@@ -549,15 +565,15 @@ async function recordRun(
       daemonId: TEST_DAEMON_ID,
       triggerContext: {},
       outputContext: {},
-      configurationRevisionId: revision.id,
+      configurationRevisionId: revisionId,
       deadlineAt: new Date(NOW.getTime() + 3_600_000),
       idleDeadlineAt: new Date(NOW.getTime() + 600_000),
       startedAt: new Date(NOW.getTime() - 30_000),
       launchIntent: buildLaunchMachineIntent({
         organizationId: "org-1",
         projectId,
-        triggerRunId: run.id,
-        configurationRevisionId: revision.id,
+        triggerRunId: runId,
+        configurationRevisionId: revisionId,
         triggerName: "manual-task",
         environmentName: "target",
         environment: {
@@ -577,25 +593,6 @@ async function recordRun(
       }),
     },
   });
-  if (status === "succeeded") await database.succeedTriggerRun(run.id);
-  else await database.failWorkflowRun(run.id, "failed", "agent_interrupted", "run");
-}
-
-async function dropSlackEvent(
-  database: Database,
-  deliveryId: string,
-  receivedAt: Date,
-  reason: ProviderEventDropReasonCode = "no_project_route",
-): Promise<void> {
-  const accepted = await database.acceptSlackEvent({
-    teamId: "T-ACME",
-    deliveryId,
-    source: "slack.mention",
-    payload: {},
-    receivedAt,
-    dropReason: reason,
-  });
-  assert.equal(accepted.status, "dropped");
 }
 
 const triggerYaml = `name: manual-task

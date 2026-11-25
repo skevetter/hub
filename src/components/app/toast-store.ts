@@ -18,6 +18,14 @@ export interface ToastItem extends ToastInput {
 /** Older toasts leave first, so a burst of saves never stacks more than the reader can read. */
 export const MAX_TOASTS = 3;
 
+/** Each organization has its own cap, so a burst in a hidden organization cannot evict a visible toast. */
+function withinCap(all: readonly ToastItem[], scope: string | undefined): readonly ToastItem[] {
+  const own = all.filter((item) => item.scope === scope);
+  if (own.length <= MAX_TOASTS) return all;
+  const dropped = new Set(own.slice(0, own.length - MAX_TOASTS).map(({ id }) => id));
+  return all.filter(({ id }) => !dropped.has(id));
+}
+
 const NONE: readonly ToastItem[] = [];
 const listeners = new Set<() => void>();
 let items: readonly ToastItem[] = NONE;
@@ -33,7 +41,7 @@ export function toast(input: ToastInput): string {
   counter += 1;
   const id = input.id ?? `toast-${counter}`;
   const item: ToastItem = { ...input, id };
-  publish([...items.filter((existing) => existing.id !== id), item].slice(-MAX_TOASTS));
+  publish(withinCap([...items.filter((existing) => existing.id !== id), item], item.scope));
   return id;
 }
 
@@ -42,7 +50,7 @@ export function dismissToast(id: string): void {
 }
 
 export function visibleToasts(all: readonly ToastItem[], scope: string): readonly ToastItem[] {
-  return all.filter((item) => item.scope === undefined || item.scope === scope);
+  return all.filter((item) => item.scope === undefined || item.scope === scope).slice(-MAX_TOASTS);
 }
 
 export function clearToasts(): void {

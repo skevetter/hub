@@ -37,6 +37,7 @@ const DROPPED_EVENT_ACTIVITY_MIGRATION = "0066_dropped_event_activity";
 const ACTIVITY_WEBHOOK_LOOKUP_MIGRATION = "0065_activity_webhook_receipt_lookup";
 const LINEAR_RUN_REPLIES_MIGRATION = "0067_linear_run_replies";
 const SURFACE_PERSISTENCE_MIGRATION = "0068_surface_persistence";
+const ACCOUNT_ATTENTION_STATE_MIGRATION = "0069_account_attention_state";
 const LINEAR_RUN_REPLIES_WHEN = 1795305193694;
 const migrationJournalSchema = z.object({
   entries: z.array(
@@ -122,6 +123,7 @@ describe("database migration application", () => {
           [66, DROPPED_EVENT_ACTIVITY_MIGRATION],
           [67, LINEAR_RUN_REPLIES_MIGRATION],
           [68, SURFACE_PERSISTENCE_MIGRATION],
+          [69, ACCOUNT_ATTENTION_STATE_MIGRATION],
         ],
       );
       const baseline = (await journal()).rows;
@@ -173,6 +175,7 @@ describe("database migration application", () => {
         { hash: createHash("sha256").update(droppedEventActivityMigration).digest("hex") },
         { hash: createHash("sha256").update(replyMigration).digest("hex") },
         { hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION) },
+        { hash: await migrationHash(ACCOUNT_ATTENTION_STATE_MIGRATION) },
       ]);
       const [definition] = (await index(triggerIndex)).rows;
       assert.ok(definition);
@@ -256,11 +259,17 @@ describe("database migration application", () => {
       });
       const surface = (await readMigrationJournal()).entries[68];
       assert.equal(surface?.tag, SURFACE_PERSISTENCE_MIGRATION);
+      const attention = (await readMigrationJournal()).entries[69];
+      assert.equal(attention?.tag, ACCOUNT_ATTENTION_STATE_MIGRATION);
       const upgraded = [
         ...baseline,
         {
           hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION),
           created_at: String(surface.when),
+        },
+        {
+          hash: await migrationHash(ACCOUNT_ATTENTION_STATE_MIGRATION),
+          created_at: String(attention.when),
         },
       ];
       await runtime.migrate();
@@ -519,7 +528,7 @@ describe("database migration application", () => {
         url,
         "select hash from drizzle.__drizzle_migrations order by id",
       );
-      assert.equal(migrated.rowCount, baseline.rows.length + 10);
+      assert.equal(migrated.rowCount, baseline.rows.length + 11);
       assert.deepEqual(migrated.rows, [
         ...baseline.rows,
         { hash: createHash("sha256").update(receiptMigration).digest("hex") },
@@ -532,6 +541,7 @@ describe("database migration application", () => {
         { hash: createHash("sha256").update(droppedEventActivityMigration).digest("hex") },
         { hash: createHash("sha256").update(replyMigration).digest("hex") },
         { hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION) },
+        { hash: await migrationHash(ACCOUNT_ATTENTION_STATE_MIGRATION) },
       ]);
       assert.deepEqual(
         (await poolQuery(url, "select home_checklist_completed_at from organization")).rows,
@@ -710,6 +720,7 @@ describe("database migration application", () => {
       { hash: createHash("sha256").update(droppedEventActivityMigration).digest("hex") },
       { hash: createHash("sha256").update(replyMigration).digest("hex") },
       { hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION) },
+      { hash: await migrationHash(ACCOUNT_ATTENTION_STATE_MIGRATION) },
     ]);
     assert.deepEqual(
       (
@@ -788,7 +799,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 69);
+      assert.equal(journal.rowCount, 70);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",
@@ -854,7 +865,14 @@ describe("database migration application", () => {
       assert.ok(!databaseDump.output.includes(created.signingSecret));
       assert.ok(!databaseDump.output.includes(settings.keyring.get("local")!.toString("base64")));
 
-      await assertSigningRestore(postgres, url, keys, id, created.signingSecret, settings);
+      await assertSigningRestore({
+        postgres,
+        originalUrl: url,
+        keys,
+        signerId: id,
+        secret: created.signingSecret,
+        settings,
+      });
       const current = created.authentication.currentVersionId!;
       const rotate = () =>
         runtime.transaction((client) =>
@@ -2702,14 +2720,17 @@ interface HistoricalBaselineOptions {
   through: string;
 }
 
-async function assertSigningRestore(
-  postgres: StartedPostgreSqlContainer,
-  originalUrl: string,
-  keys: OrganizationApiKeys,
-  signerId: string,
-  secret: string,
-  settings: ReturnType<typeof readWebhookSigningSettings>,
-): Promise<void> {
+interface SigningRestoreOptions {
+  postgres: StartedPostgreSqlContainer;
+  originalUrl: string;
+  keys: OrganizationApiKeys;
+  signerId: string;
+  secret: string;
+  settings: ReturnType<typeof readWebhookSigningSettings>;
+}
+
+async function assertSigningRestore(options: SigningRestoreOptions): Promise<void> {
+  const { postgres, originalUrl, keys, signerId, secret, settings } = options;
   const restoredName = "restored_signing_" + randomUUID().replaceAll("-", "");
   const username = postgres.getUsername();
   const created = await postgres.exec(["createdb", "-U", username, restoredName]);
@@ -2921,17 +2942,33 @@ async function historicalShape(url: string) {
   }
 }
 
+interface LegacyUpgradeParts {
+  database: Awaited<ReturnType<typeof createDatabase>>;
+  operations: ReturnType<typeof createHubApplication>["operations"];
+  publicApi: ReturnType<typeof createHubApplication>["publicApi"];
+  hub: ReturnType<typeof createHubApplication>["hub"];
+  apiKey: string;
+  legacyToken: string;
+}
+
 class LegacyUpgrade {
   private readonly legacyDaemonId = "10000000-0000-4000-8000-000000000099";
 
-  private constructor(
-    private readonly database: Awaited<ReturnType<typeof createDatabase>>,
-    private readonly operations: ReturnType<typeof createHubApplication>["operations"],
-    private readonly publicApi: ReturnType<typeof createHubApplication>["publicApi"],
-    private readonly hub: ReturnType<typeof createHubApplication>["hub"],
-    private readonly apiKey: string,
-    private readonly legacyToken: string,
-  ) {}
+  private readonly database: LegacyUpgradeParts["database"];
+  private readonly operations: LegacyUpgradeParts["operations"];
+  private readonly publicApi: LegacyUpgradeParts["publicApi"];
+  private readonly hub: LegacyUpgradeParts["hub"];
+  private readonly apiKey: string;
+  private readonly legacyToken: string;
+
+  private constructor(parts: LegacyUpgradeParts) {
+    this.database = parts.database;
+    this.operations = parts.operations;
+    this.publicApi = parts.publicApi;
+    this.hub = parts.hub;
+    this.apiKey = parts.apiKey;
+    this.legacyToken = parts.legacyToken;
+  }
 
   static async start(
     database: Awaited<ReturnType<typeof createDatabase>>,
@@ -2975,14 +3012,14 @@ class LegacyUpgrade {
       publicApi: { status: "enabled", authenticator: operationAuth },
     });
     await application.hub.start();
-    return new LegacyUpgrade(
+    return new LegacyUpgrade({
       database,
-      application.operations,
-      application.publicApi,
-      application.hub,
+      operations: application.operations,
+      publicApi: application.publicApi,
+      hub: application.hub,
       apiKey,
       legacyToken,
-    );
+    });
   }
 
   async issueEnrollmentToken(): Promise<number> {

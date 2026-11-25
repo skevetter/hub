@@ -101,7 +101,6 @@ const ready: HomeSnapshot = {
     month: { total: 41, succeeded: 30, failed: 9 },
   },
   sessionStarted: null,
-  dropped: [],
   windowDays: 7,
 };
 const fresh: HomeSnapshot = {
@@ -278,58 +277,17 @@ describe("Home recent runs", () => {
   });
 });
 
-describe("Home needs attention", () => {
-  it("stays silent when nothing needs the reader", () => {
-    assert.doesNotMatch(renderHome(ready), /role="alert"/u);
+it("keeps organization attention out of Home while still counting connected daemons", () => {
+  const markup = renderHome({
+    ...ready,
+    connections: [{ provider: "slack", slug: "slack", label: "Acme", needsAuthorization: true }],
+    daemons: [
+      { id: "devbox", slug: "devbox", presence: "offline", canExecute: true },
+      { id: "laptop", slug: "laptop", presence: "connected", canExecute: false },
+    ],
   });
-
-  it("names a connection that needs authorization and links to connections", () => {
-    const markup = renderHome({
-      ...ready,
-      connections: [{ provider: "slack", slug: "slack", label: "Acme", needsAuthorization: true }],
-    });
-    assert.match(markup, /Slack needs authorization/u);
-    const warning = /<div data-slot="alert"[^>]*>/u.exec(markup)?.[0];
-    assert.ok(warning);
-    assert.doesNotMatch(warning, /role="alert"|aria-live=/u);
-    assert.match(markup, /Review authorization for Acme/u);
-    assert.match(markup, /<a href="\/o\/acme\/connections">Open connections<\/a>/u);
-  });
-
-  it("warns that work is waiting when every daemon that may run agents is offline", () => {
-    const markup = renderHome({
-      ...ready,
-      daemons: [
-        { id: "daemon", slug: "devbox", presence: "offline", canExecute: true },
-        { id: "daemon-2", slug: "builder", presence: "offline", canExecute: true },
-        { id: "daemon-3", slug: "laptop", presence: "connected", canExecute: false },
-      ],
-    });
-    assert.match(markup, /No daemon that may run agents is connected\./u);
-    assert.match(markup, /devbox, builder are not connected/u);
-    assert.match(tile(markup, "Daemons connected"), /1\s+3 enrolled/u);
-    assert.match(markup, /<a href="\/o\/acme\/daemons">View daemons<\/a>/u);
-  });
-
-  it("says when no enrolled daemon may run agents and names the other dropped events", () => {
-    const markup = renderHome({
-      ...ready,
-      daemons: [{ id: "daemon", slug: "laptop", presence: "connected", canExecute: false }],
-      dropped: [{ provider: "github", reason: "other", count: 1 }],
-    });
-    assert.match(markup, /No enrolled daemon may run agents yet\./u);
-    assert.match(markup, /until one is allowed to run Hub automations/u);
-    assert.match(markup, /Hub dropped events for other reasons/u);
-  });
-
-  it("does not warn about an offline daemon nothing depends on", () => {
-    const markup = renderHome({
-      ...ready,
-      triggers: [],
-      daemons: [{ id: "daemon", slug: "devbox", presence: "offline", canExecute: true }],
-    });
-    assert.doesNotMatch(markup, /No daemon that may run agents is connected/u);
-  });
+  assert.doesNotMatch(markup, /data-slot="alert"|Review authorization for Acme|View daemons/u);
+  assert.match(tile(markup, "Daemons connected"), /1\s+2 enrolled/u);
 });
 
 describe("Home getting started", () => {
