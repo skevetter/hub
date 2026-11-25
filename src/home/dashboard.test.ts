@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 import type { AuthServer } from "../auth/server.js";
 import { createMemoryDatabase } from "../db/memory.js";
 import type { Database } from "../db/types.js";
@@ -94,6 +94,36 @@ describe("home read model", () => {
       snapshot.triggerRuns.map(({ total, failed, latest }) => [total, failed, latest?.status]),
       [[2, 1, "failed"]],
     );
+  });
+
+  it("reads every trigger's revision in one statement, however many triggers there are", async () => {
+    const database = memberDatabase();
+    await enrollTestDaemon(database, "org-1");
+    const store = new OrganizationTriggerStore(database, "org-1", acceptingAgentValidator());
+    for (const name of ["a", "b", "c", "d", "e"])
+      await store.save({
+        yaml: triggerYaml.replace("manual-task", `task-${name}`),
+        userId: "user-1",
+      });
+    const reads = {
+      perTriggerRevision: vi.spyOn(database, "findOrganizationTriggerRevision"),
+      allRevisions: vi.spyOn(database, "listActiveOrganizationTriggerRevisions"),
+      triggers: vi.spyOn(database, "listOrganizationTriggers"),
+      summaries: vi.spyOn(database, "summarizeTriggerRuns"),
+    };
+
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
+
+    assert.deepEqual(
+      snapshot.triggers.map(({ name, event }) => [name, event]),
+      ["a", "b", "c", "d", "e"].map((name) => [`task-${name}`, "manual.run"]),
+    );
+    assert.equal(reads.perTriggerRevision.mock.calls.length, 0);
+    assert.equal(reads.allRevisions.mock.calls.length, 1);
+    assert.equal(reads.triggers.mock.calls.length, 1);
+    assert.equal(reads.summaries.mock.calls.length, 1);
   });
 
   it("names a run after its trigger, not after the event within the trigger that started it", async () => {

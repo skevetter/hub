@@ -135,23 +135,27 @@ export class HomeDashboard {
     const organizationId = organization.id;
     const now = this.now().getTime();
     const since = new Date(now - HOME_WINDOW_DAYS * DAY_MS);
-    const triggers = await this.database.listOrganizationTriggers(organizationId);
-    const [connections, daemons, revisions, runs, summaries, sessionStarted, checklistCompletedAt] =
-      await Promise.all([
-        this.database.organizationConnectionUsage(organizationId),
-        this.database.listDaemonsForOrganization(organizationId),
-        Promise.all(
-          triggers.map((trigger) =>
-            this.database.findOrganizationTriggerRevision(trigger.id, trigger.activeRevisionId),
-          ),
-        ),
-        this.database.listOrganizationRunsSince(organizationId, since, LATEST_RUNS),
-        reader === null ? [] : this.database.summarizeTriggerRuns(organizationId, since),
-        reader !== null && this.options.interactiveSessions === true
-          ? this.database.hasOwnInteractiveSession(reader)
-          : null,
-        this.database.getHomeChecklistCompletedAt(organizationId),
-      ]);
+    const [
+      triggers,
+      connections,
+      daemons,
+      revisions,
+      runs,
+      summaries,
+      sessionStarted,
+      checklistCompletedAt,
+    ] = await Promise.all([
+      this.database.listOrganizationTriggers(organizationId),
+      this.database.organizationConnectionUsage(organizationId),
+      this.database.listDaemonsForOrganization(organizationId),
+      this.database.listActiveOrganizationTriggerRevisions(organizationId),
+      this.database.listOrganizationRunsSince(organizationId, since, LATEST_RUNS),
+      reader === null ? [] : this.database.summarizeTriggerRuns(organizationId, since),
+      reader !== null && this.options.interactiveSessions === true
+        ? this.database.hasOwnInteractiveSession(reader)
+        : null,
+      this.database.getHomeChecklistCompletedAt(organizationId),
+    ]);
     return {
       organization,
       checklistCompletedAt: checklistCompletedAt?.toISOString() ?? null,
@@ -213,13 +217,16 @@ function snapshotDaemons(daemons: readonly DaemonRecord[]): HomeSnapshot["daemon
 
 function snapshotTriggers(
   triggers: readonly OrganizationTriggerRecord[],
-  revisions: readonly (OrganizationTriggerRevisionRecord | undefined)[],
+  revisions: readonly OrganizationTriggerRevisionRecord[],
   connections: OrganizationConnectionUsage,
 ): HomeSnapshot["triggers"] {
-  return triggers.map((trigger, index) =>
+  // Keyed by trigger: a save between the two reads can move the active revision, and the
+  // revision read is the one that carries the current event.
+  const byTrigger = new Map(revisions.map((revision) => [revision.triggerId, revision]));
+  return triggers.map((trigger) =>
     Object.assign(
       { id: trigger.id, name: trigger.name, enabled: trigger.enabled },
-      triggerFacts(revisions[index], trigger.format, connections),
+      triggerFacts(byTrigger.get(trigger.id), trigger.format, connections),
     ),
   );
 }

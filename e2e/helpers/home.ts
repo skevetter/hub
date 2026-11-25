@@ -111,6 +111,15 @@ export class OrganizationHome {
     await expect(this.triggerRow(triggerName)).toContainText(state);
   }
 
+  triggerRows(): Locator {
+    return this.page.getByRole("list", { name: "Trigger health" }).getByRole("listitem");
+  }
+
+  async followViewAllTriggers() {
+    await this.page.getByRole("main").getByRole("link", { name: "View all", exact: true }).click();
+    await expect(this.page).toHaveURL(/\/o\/[^/]+\/triggers$/u);
+  }
+
   /** Home keeps no run list; this link under the triggers is the way to Activity. */
   recentRunsLink(): Locator {
     return this.page

@@ -5,7 +5,7 @@ import {
   type TimelinePostgresHarness,
 } from "../db/test-utils/run-timeline-postgres.js";
 import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
-import { TRIGGER_RUN_SUMMARY_SQL } from "./queries.js";
+import { ACTIVE_TRIGGER_REVISIONS_SQL, TRIGGER_RUN_SUMMARY_SQL } from "./queries.js";
 
 let pg: TimelinePostgresHarness;
 const since = new Date("2026-01-08T00:00:00Z");
@@ -239,5 +239,104 @@ describe("per-trigger run summaries", () => {
     const output = plan.rows.map((row) => row["QUERY PLAN"]).join("\n");
     expect(output).toContain("trigger_runs_project_created_idx");
     expect(output).not.toMatch(/Seq Scan on trigger_runs/u);
+  });
+});
+
+async function seedRevisions(name: string, versions: number, organizationId = org) {
+  const {
+    rows: [trigger],
+  } = await pg.runtime.query<{ id: string }>(
+    `insert into organization_triggers (organization_id, name, format)
+     values ($1, $2, 'legacy_multistep') returning id`,
+    [organizationId, `seed:${name}`],
+  );
+  const ids: string[] = [];
+  for (let version = 1; version <= versions; version += 1) {
+    const {
+      rows: [revision],
+    } = await pg.runtime.query<{ id: string }>(
+      `insert into organization_trigger_revisions
+         (trigger_id, organization_id, version, yaml, normalized_configuration, content_hash,
+          source_kind, source_evidence)
+       values ($1, $2, $3, $4, '{}'::jsonb, $5, 'manual', '{}'::jsonb) returning id`,
+      [
+        trigger!.id,
+        organizationId,
+        version,
+        `name: ${name} v${String(version)}`,
+        `${name}-${String(version)}`,
+      ],
+    );
+    ids.push(revision!.id);
+  }
+  return { triggerId: trigger!.id, revisionIds: ids };
+}
+
+async function activate({ triggerId, revisionIds }: Awaited<ReturnType<typeof seedRevisions>>) {
+  await pg.runtime.query("update organization_triggers set active_revision_id = $2 where id = $1", [
+    triggerId,
+    revisionIds.at(-1),
+  ]);
+}
+
+describe("active trigger revisions", () => {
+  it("returns each trigger's active revision once, for the organization only", async () => {
+    const first = await seedRevisions("first", 3);
+    const second = await seedRevisions("second", 1);
+    await seedRevisions("draft", 2);
+    const theirs = await seedRevisions("theirs", 2, otherOrg);
+    await Promise.all([first, second, theirs].map(activate));
+
+    const revisions = await pg.database.listActiveOrganizationTriggerRevisions(org);
+    const ownIds = new Set([first.triggerId, second.triggerId]);
+    const mine = revisions.filter(({ triggerId }) => ownIds.has(triggerId));
+
+    expect(mine.map(({ id }) => id).sort()).toEqual(
+      [first, second].map(({ revisionIds }) => revisionIds.at(-1)!).sort(),
+    );
+    expect(mine.find(({ triggerId }) => triggerId === first.triggerId)).toMatchObject({
+      version: 3,
+      yaml: "name: first v3",
+      organizationId: org,
+    });
+    expect(revisions.some(({ yaml }) => yaml.startsWith("name: draft"))).toBe(false);
+    expect(revisions.some(({ triggerId }) => triggerId === theirs.triggerId)).toBe(false);
+    expect(await pg.database.listActiveOrganizationTriggerRevisions("absent")).toEqual([]);
+  });
+
+  it("looks each revision up by key instead of scanning the revisions table", async () => {
+    const { runtime } = pg;
+    for (const [organizationId, count] of [
+      [org, 40],
+      [otherOrg, 2000],
+    ] as const) {
+      await runtime.query(
+        `insert into organization_triggers (organization_id, name, format)
+         select $1, 'seed:plan-' || n, 'legacy_multistep' from generate_series(1, $2::int) n`,
+        [organizationId, count],
+      );
+    }
+    await runtime.query(`insert into organization_trigger_revisions
+        (trigger_id, organization_id, version, yaml, normalized_configuration, content_hash,
+         source_kind, source_evidence)
+      select id, organization_id, 1, '', '{}'::jsonb, 'plan-' || id, 'manual', '{}'::jsonb
+      from organization_triggers where name like 'seed:plan-%'`);
+    await runtime.query(`insert into organization_trigger_revisions
+        (trigger_id, organization_id, version, yaml, normalized_configuration, content_hash,
+         source_kind, source_evidence)
+      select id, organization_id, 2, '', '{}'::jsonb, 'plan-2-' || id, 'manual', '{}'::jsonb
+      from organization_triggers where name like 'seed:plan-%'`);
+    await runtime.query(`update organization_triggers trigger set active_revision_id = revision.id
+      from organization_trigger_revisions revision
+      where revision.trigger_id = trigger.id and revision.version = 2
+        and trigger.name like 'seed:plan-%'`);
+    await runtime.query("analyze organization_triggers, organization_trigger_revisions");
+    const plan = await runtime.query(`explain (analyze, buffers) ${ACTIVE_TRIGGER_REVISIONS_SQL}`, [
+      org,
+    ]);
+    const output = plan.rows.map((row) => row["QUERY PLAN"]).join("\n");
+    expect(output).toMatch(/Index (Only )?Scan using organization_trigger_revisions_/u);
+    expect(output).toMatch(/Index Cond: \(\(?id = trigger\.active_revision_id\)/u);
+    expect(output).not.toMatch(/Seq Scan on organization_trigger_revisions/u);
   });
 });

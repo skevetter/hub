@@ -6,7 +6,7 @@ import {
   readFailedRunsSeenThrough,
 } from "../attention/queries.js";
 import { listTriggerMatchActivity } from "../attention/trigger-matches.js";
-import { summarizeTriggerRuns } from "../home/queries.js";
+import { ACTIVE_TRIGGER_REVISIONS_SQL, summarizeTriggerRuns } from "../home/queries.js";
 import { FAILED_RUN_FILTER, FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { SurfaceRepository } from "../surfaces/postgres-store.js";
 import {
@@ -3583,6 +3583,17 @@ class PgDatabase implements Database {
     return rows.rows[0] === undefined
       ? undefined
       : toOrganizationTriggerRevisionRecord(rows.rows[0]);
+  }
+
+  async listActiveOrganizationTriggerRevisions(
+    organizationId: string,
+  ): Promise<OrganizationTriggerRevisionRecord[]> {
+    const { rows } = await query<OrganizationTriggerRevisionRow>(
+      this.pool,
+      ACTIVE_TRIGGER_REVISIONS_SQL,
+      [organizationId],
+    );
+    return rows.map(toOrganizationTriggerRevisionRecord);
   }
 
   async findOrganizationTriggerMigrationRevision(

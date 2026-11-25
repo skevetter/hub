@@ -6277,6 +6277,16 @@ class MemoryDatabase implements Database {
     return revision?.triggerId === triggerId ? revision : undefined;
   }
 
+  async listActiveOrganizationTriggerRevisions(
+    organizationId: string,
+  ): Promise<OrganizationTriggerRevisionRecord[]> {
+    return Array.from(this.organizationTriggers.values()).flatMap((trigger) => {
+      if (trigger.organizationId !== organizationId) return [];
+      const revision = this.organizationTriggerRevisions.get(trigger.activeRevisionId);
+      return revision?.triggerId === trigger.id ? [revision] : [];
+    });
+  }
+
   async findOrganizationTriggerMigrationRevision(
     triggerId: string,
   ): Promise<OrganizationTriggerRevisionRecord | undefined> {

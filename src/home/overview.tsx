@@ -19,7 +19,12 @@ import { Button } from "../components/ui/button.js";
 import { PROVIDER_NAMES } from "../connections/status.js";
 import { EDITOR_EVENTS, eventDefinition, isEditorEvent } from "../triggers/configuration/events.js";
 import type { HomeSnapshot } from "./dashboard.js";
-import { triggerHealth, type TriggerHealth, type TriggerHealthRow } from "./trigger-health.js";
+import {
+  HOME_TRIGGER_ROWS,
+  triggerHealth,
+  type TriggerHealth,
+  type TriggerHealthRow,
+} from "./trigger-health.js";
 
 const INLINE_LINK =
   "text-link underline underline-offset-4 max-md:inline-flex max-md:min-h-11 max-md:items-center";
@@ -129,10 +134,16 @@ function HomeTriggers({
       ) : (
         <>
           <RecordList label="Trigger health">
-            {health.rows.map((row) => (
+            {health.rows.slice(0, HOME_TRIGGER_ROWS).map((row) => (
               <TriggerRow key={row.id} row={row} base={base} windowDays={data.windowDays} />
             ))}
           </RecordList>
+          {health.rows.length > HOME_TRIGGER_ROWS ? (
+            <p className="mt-3 text-xs text-muted-foreground">
+              Showing the {String(HOME_TRIGGER_ROWS)} worst of {String(health.rows.length)}{" "}
+              triggers. View all for the rest.
+            </p>
+          ) : null}
           <p className="mt-4 text-sm">
             <Link to={`${base}/activity` as never} className={INLINE_LINK}>
               Recent runs

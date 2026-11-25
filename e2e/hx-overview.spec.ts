@@ -92,6 +92,31 @@ for (const width of [390, 1280])
     expect(await dimensions(page.locator("[data-slot=figure]"))).toEqual(loadingHeights);
   });
 
+test("Home lists the ten worst triggers and leaves the rest to View all", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const names = Array.from(
+    { length: 12 },
+    (_, index) => `cap-${String(index + 1).padStart(2, "0")}`,
+  );
+  for (const name of names)
+    await hub.seedLegacyTrigger(
+      "owner",
+      name,
+      `name: ${name}\nenabled: true\non:\n  manual.run: {}\nrun:\n  target: { daemon: devbox, cwd: /workspace }\n  agent: { provider: codex, model: gpt-5.4, mode: full-access }\n  prompt: Handle it\n`,
+    );
+  const home = new OrganizationHome(page);
+  await home.reload();
+
+  await expect(home.triggerRows()).toHaveCount(10);
+  await expect(home.triggerRow("cap-10")).toBeVisible();
+  await expect(home.triggerRow("cap-11")).toHaveCount(0);
+  await expect(page.getByText("Showing the 10 worst of 12 triggers.")).toBeVisible();
+  await home.expectFigure("triggers on", 12);
+  await home.followViewAllTriggers();
+  await expect(page.getByRole("link", { name: "cap-12", exact: true })).toBeVisible();
+});
+
 test("Home wraps long record names at 390 px", async ({ hub, page }) => {
   const name = "w".repeat(60);
   const connection = "C".repeat(60);
