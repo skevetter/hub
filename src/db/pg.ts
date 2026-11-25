@@ -1707,14 +1707,14 @@ class PgDatabase implements Database {
     }
   }
 
-  async ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number, now: Date) {
+  async ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number) {
     const rows = await query(
       this.pool,
       `select 1 from trigger_runs
        where id = $1 and terminal_notification_generation = $2
-         and terminal_notification_lease_expires_at > $3
+         and terminal_notification_lease_expires_at is not null
          and terminal_notification_delivered_at is null and payload_expiry_state is null`,
-      [triggerRunId, generation, now],
+      [triggerRunId, generation],
     );
     return rows.rowCount === 1;
   }

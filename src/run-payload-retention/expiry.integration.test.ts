@@ -390,7 +390,6 @@ describe("run payload expiry", () => {
           await database.ownsWorkflowRunTerminalNotification(
             first.id,
             first.terminalNotificationGeneration,
-            NOW,
           ),
           false,
         );

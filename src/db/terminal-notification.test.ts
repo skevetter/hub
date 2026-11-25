@@ -13,10 +13,10 @@ import type { Database } from "./types.js";
 const NOW = new Date();
 const at = (offset: number) => new Date(NOW.getTime() + offset);
 
-async function claim(database: Database) {
-  const id = await seedTerminalNotification(database, NOW);
+async function claim(database: Database, claimedAt = NOW) {
+  const id = await seedTerminalNotification(database, claimedAt);
   const claimed = await database.claimPendingWorkflowRunTerminalNotification(
-    NOW,
+    claimedAt,
     TERMINAL_LEASE_MS,
   );
   assert.equal(claimed?.id, id);
@@ -40,10 +40,7 @@ function renewalTests(getDatabase: () => Database) {
       await database.claimPendingWorkflowRunTerminalNotification(at(30_000), TERMINAL_LEASE_MS),
       undefined,
     );
-    assert.equal(
-      await database.ownsWorkflowRunTerminalNotification(id, generation, at(39_999)),
-      true,
-    );
+    assert.equal(await database.ownsWorkflowRunTerminalNotification(id, generation), true);
     await database.markWorkflowRunTerminalNotificationDelivered(id, generation, at(39_999), null);
   });
 
@@ -116,10 +113,7 @@ function renewalTests(getDatabase: () => Database) {
       false,
     );
     await database.markWorkflowRunTerminalNotificationDelivered(id, generation, at(31_000), null);
-    assert.equal(
-      await database.ownsWorkflowRunTerminalNotification(id, generation + 1, at(31_000)),
-      true,
-    );
+    assert.equal(await database.ownsWorkflowRunTerminalNotification(id, generation + 1), true);
     assert.equal(
       await database.renewWorkflowRunTerminalNotification(
         id,
@@ -139,6 +133,27 @@ function renewalTests(getDatabase: () => Database) {
       await database.claimPendingWorkflowRunTerminalNotification(at(200_000), TERMINAL_LEASE_MS),
       undefined,
     );
+  });
+
+  it("still owns after expiry while nobody re-claimed, and loses ownership at a re-claim", async () => {
+    const database = getDatabase();
+    const { id, generation } = await claim(database, at(-120_000));
+    assert.equal(await database.ownsWorkflowRunTerminalNotification(id, generation), true);
+    assert.equal(await database.ownsWorkflowRunTerminalNotification(id, generation - 1), false);
+    const replay = await database.claimPendingWorkflowRunTerminalNotification(
+      at(-60_000),
+      TERMINAL_LEASE_MS,
+    );
+    assert.equal(replay?.terminalNotificationGeneration, generation + 1);
+    assert.equal(await database.ownsWorkflowRunTerminalNotification(id, generation), false);
+    assert.equal(await database.ownsWorkflowRunTerminalNotification(id, generation + 1), true);
+    await database.markWorkflowRunTerminalNotificationDelivered(
+      id,
+      generation + 1,
+      at(31_000),
+      null,
+    );
+    assert.equal(await database.ownsWorkflowRunTerminalNotification(id, generation + 1), false);
   });
 
   it("refuses renewal after delivery or payload expiry", async () => {

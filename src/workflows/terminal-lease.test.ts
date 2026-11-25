@@ -258,6 +258,30 @@ describe("terminal notification lease", () => {
     await work.engine.stop();
   });
 
+  it("still runs the handler when slow reconciling outlasts the lease with every renewal failing", async () => {
+    const reconciliation = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    vi.spyOn(RunTimelineReconciler.prototype, "reconcileBeforeTerminal").mockImplementation(() => {
+      entered.resolve();
+      return reconciliation.promise;
+    });
+    const work = await fixture({ reconcile: true });
+    for (let i = 0; i < 3; i += 1) work.renew.mockRejectedValueOnce(new Error("database blip"));
+    await work.engine.processAvailable();
+    await entered.promise;
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(work.renew).toHaveBeenCalledTimes(3);
+    reconciliation.resolve();
+    await work.started;
+    work.handler.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(work.onWorkflowRunTerminal).toHaveBeenCalledTimes(1);
+    expect(work.mark).toHaveBeenCalledExactlyOnceWith(work.runId, 1, new Date(), null);
+    expect(await work.claim()).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    await work.engine.stop();
+  });
+
   it("clears renewal when the handler rejects", async () => {
     const work = await fixture();
     await start(work);

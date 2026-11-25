@@ -1269,11 +1269,7 @@ export class DurableWorkflowEngine {
     try {
       let reactionState: JsonValue | void;
       try {
-        const owns = await database.ownsWorkflowRunTerminalNotification(
-          run.id,
-          generation,
-          this.now(),
-        );
+        const owns = await database.ownsWorkflowRunTerminalNotification(run.id, generation);
         if (!owns || lease.lost) return;
         reactionState = await this.options.onWorkflowRunTerminal?.(run);
       } finally {
