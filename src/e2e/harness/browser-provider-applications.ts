@@ -17,13 +17,13 @@ import {
   type ProviderApplicationVerifier,
 } from "../../provider-applications/index.js";
 import {
-  BrowserDiscordBot,
+  type BrowserDiscordBot,
   BrowserDiscordConnections,
   BrowserGitHubAuth,
   BrowserGitHubConnections,
-  BrowserGitHubConfiguration,
+  type BrowserGitHubConfiguration,
   BrowserGitHubReactions,
-  BrowserSlackBot,
+  type BrowserSlackBot,
   type BrowserProviderScenario,
 } from "./browser-providers.js";
 

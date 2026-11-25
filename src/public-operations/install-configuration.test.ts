@@ -1,4 +1,4 @@
-import { agentStep } from "../config/compiler.js";
+import { agentStep, parseCompiledHubConfig } from "../config/compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import {
@@ -7,7 +7,6 @@ import {
   validateHubBundleForOrganization,
   type DaemonAgentConfigurationValidator,
 } from "../configuration/store.js";
-import { parseCompiledHubConfig } from "../config/compiler.js";
 import type { HubBundleFile } from "../config/bundle.js";
 import { hashPromptPartialContent } from "../config/prompt-partials.js";
 import { createMemoryDatabase } from "../db/memory.js";

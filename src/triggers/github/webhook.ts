@@ -1,7 +1,9 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
-import { WebhookPayloadSchema } from "../../auth/github-events.js";
-import type { WebhookPayload } from "../../auth/github-events.js";
+import {
+  type NormalizedGitHubEvent,
+  WebhookPayloadSchema,
+  type WebhookPayload,
+} from "../../auth/github-events.js";
 import { isDatabaseUnavailableError } from "../../db/errors.js";
 import type { ProviderEventAcceptance } from "../../db/types.js";
 import { reportFailure } from "../../failures/index.js";

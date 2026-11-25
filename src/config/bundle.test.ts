@@ -1,8 +1,7 @@
-import { agentStep } from "./compiler.js";
+import { agentStep, compiledConfigurationHash } from "./compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import { compileHubBundle, HubBundleError } from "./bundle.js";
-import { compiledConfigurationHash } from "./compiler.js";
 
 const hub = `
 environments:

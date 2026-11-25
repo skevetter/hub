@@ -5,7 +5,7 @@ import {
   replyMessageError,
   SCRIPT_NOTIFICATION_REASONS,
 } from "../triggers/configuration/events.js";
-import { ContinuationSchema } from "../triggers/continuation.js";
+import { ContinuationSchema, type Continuation } from "../triggers/continuation.js";
 import {
   hasProgressDestination,
   PROGRESS_DESTINATION_REQUIRED,
@@ -306,7 +306,7 @@ export interface CompiledInput {
 
 export interface CompiledAgentStep {
   kind?: "agent" | undefined;
-  continuation?: import("../triggers/continuation.js").Continuation | undefined;
+  continuation?: Continuation | undefined;
   id: string;
   environment: string;
   maxRuntimeMs: number;

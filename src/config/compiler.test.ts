@@ -1,7 +1,5 @@
-import { agentStep } from "./compiler.js";
-import assert from "node:assert/strict";
-import { describe, it } from "vitest";
 import {
+  agentStep,
   compileHubConfig,
   compiledConfigurationHash,
   parseCompiledHubConfig,
@@ -11,6 +9,8 @@ import {
   type CompiledStep,
   type CompiledTrigger,
 } from "./compiler.js";
+import assert from "node:assert/strict";
+import { describe, it } from "vitest";
 
 const environment = { name: "runner", kind: "daemon" as const, daemon: "runner", cwd: "/repo" };
 

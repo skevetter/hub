@@ -5,6 +5,8 @@ import type {
   HubExecutionAgentStreamEvent,
   HubProviderSnapshot,
 } from "../hub/protocol.js";
+import type { AgentConnection, AgentHistory } from "./agents/index.js";
+import type { TerminalConnection } from "./terminals/index.js";
 
 export interface DaemonCreateAgentOptions {
   provider: string;
@@ -76,10 +78,10 @@ export type AgentValidationVerdict =
   | { valid: false; issues: readonly AgentValidationIssue[] };
 
 export interface DaemonConnection {
-  agents: import("./agents/index.js").AgentConnection;
-  history?: import("./agents/index.js").AgentHistory;
+  agents: AgentConnection;
+  history?: AgentHistory;
   /** Absent on a connection that cannot run script steps. */
-  terminals?: import("./terminals/index.js").TerminalConnection;
+  terminals?: TerminalConnection;
   getProviderSnapshot(options: { cwd?: string }): Promise<HubProviderSnapshot>;
   refreshProviderSnapshot(options: { cwd?: string; providers?: string[] }): Promise<void>;
   /** The daemon's own answer about whether it can run this agent as configured. */

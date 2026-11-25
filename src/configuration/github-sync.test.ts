@@ -1,7 +1,6 @@
-import { agentStep } from "../config/compiler.js";
+import { agentStep, parseCompiledHubConfig } from "../config/compiler.js";
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
-import { parseCompiledHubConfig } from "../config/compiler.js";
 import {
   hashPromptPartialContent,
   type PromptPartialReadResult,

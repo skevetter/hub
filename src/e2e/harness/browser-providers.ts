@@ -1,7 +1,9 @@
 import type { Message } from "discord.js";
 import type { GitHubAuth } from "../../auth/github.js";
-import type { DiscordGuildIdentity } from "../../providers/discord/client.js";
-import type { DiscordConnectionClient } from "../../providers/discord/client.js";
+import type {
+  DiscordGuildIdentity,
+  DiscordConnectionClient,
+} from "../../providers/discord/client.js";
 import type {
   GitHubConnectionClient,
   GitHubInstallationIdentity,

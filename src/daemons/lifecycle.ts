@@ -1,8 +1,7 @@
 import { STOP_RECOVERY_BATCH_SIZE, stopInterruptMayHaveSent } from "../db/stop-interrupt.js";
 import type { RunTimeline } from "../run-timeline/index.js";
-import { DaemonAgentError } from "./agents/index.js";
+import { DaemonAgentError, type AgentEvent } from "./agents/index.js";
 import { AgentSessions, AgentSessionError } from "../agent-sessions/index.js";
-import type { AgentEvent } from "./agents/index.js";
 import {
   buildExecutionCapabilityMcpServer,
   deriveAgentExecutionCompletionToken,
@@ -32,7 +31,7 @@ import { isTransientDatabaseError } from "../db/errors.js";
 import { retryDiagnostic, retryWithBackoff, type RetryRuntime } from "../db/retry.js";
 import { MAX_EXPLICIT_AGENT_TITLE_CHARS } from "@getpaseo/protocol/agent-title-limits";
 import { reportFailure } from "../failures/index.js";
-import type { TriggerProvider } from "../triggers/index.js";
+import type { TriggerProvider, TriggerProviderReactionState } from "../triggers/index.js";
 import { isCanceledExecution } from "../triggers/run-stop.js";
 import type { ExecutionAuthority } from "../execution-authority/index.js";
 import { OutputExecutorRegistry } from "../execution-capabilities/outputs.js";
@@ -47,7 +46,6 @@ import {
   notifyDispatchAccepted,
   notifyMachineTerminated,
 } from "../triggers/lifecycle.js";
-import type { TriggerProviderReactionState } from "../triggers/index.js";
 import {
   DaemonResponseLostError,
   type DaemonAgentStreamEvent,

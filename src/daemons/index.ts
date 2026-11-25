@@ -10,6 +10,7 @@ import {
   DaemonSpawnAckTimeoutError,
   type DaemonDispatchLifecycle,
   type DaemonDispatchResult,
+  type ExecutionDeadlineClock,
 } from "./lifecycle.js";
 import type {
   DaemonAgentStreamEvent,
@@ -33,7 +34,7 @@ export { enrollDaemon, revokeDaemon, updateDaemonPermissions } from "./registrat
 interface DaemonModuleTestOptions {
   logger?: Logger;
   dispatchTimeoutMs?: number;
-  deadlineClock?: import("./lifecycle.js").ExecutionDeadlineClock;
+  deadlineClock?: ExecutionDeadlineClock;
 }
 
 export interface DaemonModuleOptions {

@@ -6,6 +6,7 @@ import {
   compiledConfigurationHash,
   isScriptStep,
   parseCompiledHubConfig,
+  type CompiledAgent,
   type CompiledHubConfig,
   type CompiledTriggerFilter,
   type CompiledTrigger,
@@ -38,7 +39,7 @@ export interface StoredProjectConfiguration {
 export interface DaemonAgentConfigurationValidator {
   validateAgentConfiguration(
     daemonId: string,
-    agent: import("../config/compiler.js").CompiledAgent,
+    agent: CompiledAgent,
   ): Promise<
     | { valid: true }
     | {

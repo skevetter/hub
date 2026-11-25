@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type * as ReactStartModule from "@tanstack/react-start";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
@@ -12,7 +13,7 @@ import { SessionProfileForm } from "./session-profile-form.js";
 const { loadProviders } = vi.hoisted(() => ({ loadProviders: vi.fn() }));
 
 vi.mock("@tanstack/react-start", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@tanstack/react-start")>()),
+  ...(await importOriginal<typeof ReactStartModule>()),
   useServerFn: (fn: unknown) => fn,
 }));
 vi.mock("../../auth/active-account.js", () => ({

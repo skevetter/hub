@@ -3,7 +3,7 @@ import type { EntitlementsService } from "../entitlements/service.js";
 import type { TriggerHandler, TriggerProvider } from "../triggers/index.js";
 import {
   createDurableWorkflowHandler,
-  DurableWorkflowEngine,
+  type DurableWorkflowEngine,
   type DurableWorkflowEngineOptions,
 } from "../workflows/engine.js";
 import type { LaunchMachineIntent } from "./launch-machine-intent.js";

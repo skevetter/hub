@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { createPostgresQueryRuntime } from "../db/test-utils/runtime.js";
-import { z } from "zod";
 import {
+  createPostgresQueryRuntime,
   createDatabase,
   testDatabaseLocks,
   testDatabaseRuntime,
 } from "../db/test-utils/runtime.js";
+import { z } from "zod";
 import { InstanceBootstrapError, InstanceSetup } from "./index.js";
 import { createAuthServer, type AuthServer } from "../auth/server.js";
 import { composeEntitlements } from "../auth/entitlements.js";

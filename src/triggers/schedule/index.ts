@@ -1,4 +1,4 @@
-import type { TriggerSource } from "../index.js";
+import type { TriggerSource, TriggerProvider } from "../index.js";
 import { reportFailure } from "../../failures/index.js";
 export { ScheduleRepository } from "./internal/repository.js";
 
@@ -50,7 +50,7 @@ export function createScheduleSource(
 }
 
 /** Only the clock accepts scheduled occurrences; public event intake cannot synthesize them. */
-export function createScheduleProvider(): import("../index.js").TriggerProvider<
+export function createScheduleProvider(): TriggerProvider<
   "schedule",
   { event: { schedule: { trigger_id: string; scheduled_at: string; timezone: string } } }
 > {

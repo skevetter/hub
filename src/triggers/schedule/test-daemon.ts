@@ -1,5 +1,6 @@
 import type { AgentConnection, AgentSnapshot } from "../../daemons/agents/index.js";
 import type { DaemonConnection, DaemonCreateAgentOptions } from "../../daemons/protocol.js";
+import type { HubProviderSnapshot } from "../../hub/protocol.js";
 
 /** A daemon port fake: Hub exercises its actual session and execution lifecycle. */
 export class ScheduleTestDaemon implements DaemonConnection {
@@ -23,7 +24,7 @@ export class ScheduleTestDaemon implements DaemonConnection {
     control: async () => {},
     watch: async () => () => {},
   };
-  async getProviderSnapshot(): Promise<import("../../hub/protocol.js").HubProviderSnapshot> {
+  async getProviderSnapshot(): Promise<HubProviderSnapshot> {
     throw new Error("Provider catalog is not used by this test daemon.");
   }
   async refreshProviderSnapshot() {}

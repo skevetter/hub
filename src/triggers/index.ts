@@ -4,6 +4,7 @@ import type { WorktreeTarget } from "../config/index.js";
 import type { InvocationParseResult } from "./invocation.js";
 import type { ProviderEventDropReasonCode } from "./drop-reason.js";
 import type { ManualRunIdentity } from "./manual/provider.js";
+import type { Conversation } from "./continuation.js";
 
 export interface ExternalTrigger {
   providerEventReceiptId: string;
@@ -54,7 +55,7 @@ export function cleanTriggerAgent(agent: TriggerAgentConfig): TriggerAgentConfig
 }
 
 interface TriggerProviderMatchBase<TriggerContext, OutputContext> {
-  conversation?: import("./continuation.js").Conversation | null;
+  conversation?: Conversation | null;
   triggerName: string;
   triggerContext: TriggerContext;
   outputContext: OutputContext;
@@ -66,7 +67,7 @@ export interface AcceptedTriggerProviderMatch<
   TriggerContext = unknown,
   OutputContext = TriggerContext,
 > extends TriggerProviderMatchBase<TriggerContext, OutputContext> {
-  conversation: import("./continuation.js").Conversation | null;
+  conversation: Conversation | null;
   invocation: Extract<InvocationParseResult, { status: "accepted" }>;
 }
 

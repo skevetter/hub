@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { ProblemSchema } from "../public-api/contracts.js";
 import { setImmediate } from "node:timers/promises";
 import { afterAll, afterEach, beforeAll, describe, it, vi } from "vitest";
-import { RunStream } from "./index.js";
+import type { RunStream } from "./index.js";
 import {
   createStreamHarness,
   ORGANIZATION,

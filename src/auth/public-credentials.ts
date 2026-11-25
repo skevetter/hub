@@ -1,4 +1,4 @@
-import { CLI_CREDENTIAL_PREFIX, OrganizationCliCredentials } from "./cli-credentials.js";
+import { CLI_CREDENTIAL_PREFIX, type OrganizationCliCredentials } from "./cli-credentials.js";
 import type { OrganizationApiKeys } from "./api-keys.js";
 import type { OperationAuthenticator } from "./operation-auth.js";
 

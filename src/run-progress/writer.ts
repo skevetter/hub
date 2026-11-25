@@ -5,7 +5,7 @@ import type {
   RunTimelineEvent,
   UpdateRunProgressMessageInput,
 } from "../run-timeline/store.js";
-import { CREDENTIAL_CIRCUIT_MS, CredentialBackoff } from "./backoff.js";
+import { CREDENTIAL_CIRCUIT_MS, type CredentialBackoff } from "./backoff.js";
 import { GitHubProgressProvider } from "./github.js";
 import { renderProgress } from "./render.js";
 import type { RunProgressSettings } from "./settings.js";

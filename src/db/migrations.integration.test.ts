@@ -5,12 +5,15 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, it } from "vitest";
 
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { postgresDatabaseRuntime } from "./runtime/index.js";
-import type { DatabaseRuntime, QueryHandle, QueryRow } from "./runtime/index.js";
-import { createPostgresQueryRuntime } from "./test-utils/runtime.js";
+import {
+  postgresDatabaseRuntime,
+  type DatabaseRuntime,
+  type QueryHandle,
+  type QueryRow,
+} from "./runtime/index.js";
+import { createPostgresQueryRuntime, createDatabase } from "./test-utils/runtime.js";
 import { z } from "zod";
 import { dump } from "js-yaml";
-import { createDatabase } from "./test-utils/runtime.js";
 import { createHubApplication } from "../app.js";
 import { ProjectConfigurationStore, revisionBundleFiles } from "../configuration/store.js";
 import { configurationBundleFixture } from "../test-utils/configuration-bundle.js";

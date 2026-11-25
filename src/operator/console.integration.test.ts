@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { createPostgresQueryRuntime } from "../db/test-utils/runtime.js";
-import { z } from "zod";
-import { composeEntitlements, type ComposedEntitlements } from "../auth/entitlements.js";
-import { createAuthServer, type AuthServer } from "../auth/server.js";
 import {
+  createPostgresQueryRuntime,
   createDatabase,
   testDatabaseLocks,
   testDatabaseRuntime,
 } from "../db/test-utils/runtime.js";
+import { z } from "zod";
+import { composeEntitlements, type ComposedEntitlements } from "../auth/entitlements.js";
+import { createAuthServer, type AuthServer } from "../auth/server.js";
 import type { Database } from "../db/types.js";
 import { OperatorConsole, OperatorForbiddenError } from "./console.js";
 

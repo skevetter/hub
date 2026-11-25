@@ -18,7 +18,12 @@ import { createMemoryDatabase } from "../db/memory.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { createFetchServer } from "../http/node-server.js";
 import { registerResponseLifecycle, takeResponseLifecycle } from "../http/response-lifecycle.js";
-import { OutputExecutorRegistry, replyOutputTool, type OutputCapability } from "./outputs.js";
+import {
+  OutputExecutorRegistry,
+  replyOutputTool,
+  type OutputCapability,
+  type OutputExecutionInput,
+} from "./outputs.js";
 import { FinishCallRegistry } from "./finish-calls.js";
 import { createExecutionCapabilityServer } from "./server.js";
 
@@ -808,7 +813,7 @@ async function capabilityFixture(
     completionTokenHash: hashAgentExecutionCompletionToken(token),
     launchIntent: intent,
   });
-  const outbound: Array<import("./outputs.js").OutputExecutionInput> = [];
+  const outbound: Array<OutputExecutionInput> = [];
   const outputs = new OutputExecutorRegistry();
   outputs.register({
     type: "slack.reply",

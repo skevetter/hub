@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import type * as CryptoModule from "node:crypto";
 import { describe, it, vi } from "vitest";
 import {
   deriveSigningSecret,
@@ -9,7 +10,7 @@ import {
 } from "./webhook-signatures.js";
 
 vi.mock("node:crypto", async (importOriginal) => {
-  const crypto = await importOriginal<typeof import("node:crypto")>();
+  const crypto = await importOriginal<typeof CryptoModule>();
   return { ...crypto, timingSafeEqual: vi.fn(crypto.timingSafeEqual) };
 });
 

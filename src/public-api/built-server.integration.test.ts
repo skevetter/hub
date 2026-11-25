@@ -2,16 +2,16 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { createPostgresQueryRuntime } from "../db/test-utils/runtime.js";
-import { createApplicationRuntime } from "../application-runtime.js";
-import { createAuthServer, type AuthServer } from "../auth/server.js";
-import { composeEntitlements } from "../auth/entitlements.js";
-import { CliAuthorizations } from "../cli-authorizations/index.js";
 import {
+  createPostgresQueryRuntime,
   createDatabase,
   testDatabaseLocks,
   testDatabaseRuntime,
 } from "../db/test-utils/runtime.js";
+import { createApplicationRuntime } from "../application-runtime.js";
+import { createAuthServer, type AuthServer } from "../auth/server.js";
+import { composeEntitlements } from "../auth/entitlements.js";
+import { CliAuthorizations } from "../cli-authorizations/index.js";
 import { TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
 import { configurationBundleFixture } from "../test-utils/configuration-bundle.js";
 import {
