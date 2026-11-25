@@ -151,23 +151,30 @@ export class SessionStreamSubscriber {
 
   private receive(notification: SessionNotification): void {
     if (this.closed) return;
-    if (notification.kind === "access_changed" || notification.kind === "hub") {
-      if (notification.kind === "hub" && notification.event.seq > this.hubSeq) {
-        this.pendingHub.add(notification.event.seq);
-        if (this.queueOverLimit()) {
-          this.fail("slow_consumer");
-          return;
-        }
-      }
+    if (notification.kind === "hub") {
+      if (!this.receiveHub(notification.event)) return;
+    } else if (notification.kind === "access_changed") {
       this.hubDirty = true;
-      if (notification.kind === "access_changed" || notification.event.kind === "participants")
-        this.recheck();
+      this.recheck();
     } else if (notification.kind === "shutdown") {
       this.shutdown(notification.reconnectMs);
     } else if (notification.kind !== "agent" || validAgentEpoch(notification.epoch)) {
       this.enqueueLive(notification);
     }
     this.wake?.();
+  }
+
+  private receiveHub(event: SessionEventRecord): boolean {
+    if (event.seq > this.hubSeq) {
+      this.pendingHub.add(event.seq);
+      if (this.queueOverLimit()) {
+        this.fail("slow_consumer");
+        return false;
+      }
+    }
+    this.hubDirty = true;
+    if (event.kind === "participants") this.recheck();
+    return true;
   }
 
   private enqueueLive(event: LiveEvent): void {
@@ -244,58 +251,64 @@ export class SessionStreamSubscriber {
           this.send(": stream open\n\n");
           return;
         }
-        const hub = this.hubRows[this.hubIndex];
-        if (hub !== undefined) {
-          this.hubIndex += 1;
-          if (await this.sendHub(hub)) return;
-          continue;
-        }
-        if (this.hubDirty) {
-          await this.fetchHub();
-          continue;
-        }
-        if (this.catchUp !== null) {
-          const cursor = this.catchUp;
-          this.catchUp = null;
-          await this.fetchAgentCatchUp(cursor);
-          continue;
-        }
-        if (this.pendingAgent) {
-          const event = this.pendingAgent;
-          this.pendingAgent = undefined;
-          if (this.sendAgent(event)) return;
-          continue;
-        }
-        const replayed = this.agentReplay.shift();
-        if (replayed !== undefined) {
-          if (this.sendLive(replayed)) return;
-          continue;
-        }
-        const queued = this.live.shift();
-        if (queued !== undefined) {
-          this.liveBytes -= queued.bytes;
-          if (this.sendLive(queued.event)) return;
-          continue;
-        }
-        if (this.ping) {
-          this.ping = false;
-          this.send(": ping\n\n");
-          return;
-        }
+        const replay = this.pullReplay();
+        const sent = replay === undefined ? this.pullLive() : await replay;
+        if (sent) return;
+        if (replay !== undefined || sent !== undefined) continue;
         await new Promise<void>((resolve) => {
           this.wake = resolve;
         });
         this.wake = undefined;
       }
     } catch (error) {
-      if (this.closed) return;
-      if (error instanceof SessionReadError && error.code === "not_found") {
-        this.fail("reauth");
-        return;
-      }
-      this.options.reportFailure(error);
-      this.end(this.frameAtCursor("resync", {}));
+      this.handlePullError(error);
     }
+  }
+
+  private pullReplay(): Promise<boolean | void> | undefined {
+    const hub = this.hubRows[this.hubIndex];
+    if (hub !== undefined) {
+      this.hubIndex += 1;
+      return this.sendHub(hub);
+    }
+    if (this.hubDirty) return this.fetchHub();
+    if (this.catchUp !== null) {
+      const cursor = this.catchUp;
+      this.catchUp = null;
+      return this.fetchAgentCatchUp(cursor);
+    }
+    return undefined;
+  }
+
+  private pullLive(): boolean | undefined {
+    if (this.pendingAgent) {
+      const event = this.pendingAgent;
+      this.pendingAgent = undefined;
+      return this.sendAgent(event);
+    }
+    const replayed = this.agentReplay.shift();
+    if (replayed !== undefined) return this.sendLive(replayed);
+    const queued = this.live.shift();
+    if (queued !== undefined) {
+      this.liveBytes -= queued.bytes;
+      return this.sendLive(queued.event);
+    }
+    if (this.ping) {
+      this.ping = false;
+      this.send(": ping\n\n");
+      return true;
+    }
+    return undefined;
+  }
+
+  private handlePullError(error: unknown): void {
+    if (this.closed) return;
+    if (error instanceof SessionReadError && error.code === "not_found") {
+      this.fail("reauth");
+      return;
+    }
+    this.options.reportFailure(error);
+    this.end(this.frameAtCursor("resync", {}));
   }
 
   private async fetchHub(): Promise<void> {
@@ -380,6 +393,7 @@ export class SessionStreamSubscriber {
           this.agent = null;
         }
         return this.send(this.frameAtCursor("gap", { reason: event.reason }));
+      case "resync":
       default:
         this.end(this.frameAtCursor("resync", {}));
         return true;
