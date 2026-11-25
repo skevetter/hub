@@ -111,6 +111,20 @@ export class OrganizationHome {
     await expect(this.triggerRow(triggerName)).toContainText(state);
   }
 
+  /** Home keeps no run list; this link under the triggers is the way to Activity. */
+  recentRunsLink(): Locator {
+    return this.page
+      .getByRole("main")
+      .getByRole("link", { name: "Recent runs", exact: true })
+      .and(this.page.locator('a[href$="/activity"]'));
+  }
+
+  async followRecentRuns() {
+    await this.recentRunsLink().click();
+    await expect(this.page).toHaveURL(/\/o\/[^/]+\/activity$/u);
+    await expect(this.page.getByRole("heading", { name: "Activity", level: 1 })).toBeVisible();
+  }
+
   async capture(path: string) {
     await this.page.evaluate(() => window.scrollTo(0, 0));
     await this.page.screenshot({ path, fullPage: true });

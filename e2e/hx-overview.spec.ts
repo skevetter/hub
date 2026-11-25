@@ -180,6 +180,9 @@ run:
   expect(
     await viewAll.evaluate((element) => element.getBoundingClientRect().height),
   ).toBeGreaterThanOrEqual(44);
+  expect(
+    await home.recentRunsLink().evaluate((element) => element.getBoundingClientRect().height),
+  ).toBeGreaterThanOrEqual(44);
   await triggerName.click();
   await expect(page.getByRole("heading", { name, level: 1 })).toBeVisible();
 });
