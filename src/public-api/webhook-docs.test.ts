@@ -14,8 +14,8 @@ const execFileAsync = promisify(execFile);
 const responseSchema = z
   .object({
     deliveryKey: z.string(),
-    providerEventReceiptId: z.string().uuid(),
-    triggerRunId: z.string().uuid(),
+    providerEventReceiptId: z.uuid(),
+    triggerRunId: z.uuid(),
     configuredTriggerName: z.literal("build-finished"),
     workflowStatus: z.string(),
     duplicate: z.boolean(),
@@ -26,6 +26,19 @@ const report = {
   status: "failed",
   failures: 2,
 };
+
+function exampleCommand(language: string, code: string) {
+  switch (language) {
+    case "sh":
+      return { command: "/bin/sh", args: ["-c", code] };
+    case "javascript":
+      return { command: process.execPath, args: ["--input-type=module", "--eval", code] };
+    case "python":
+      return { command: "python3", args: ["-c", code] };
+    default:
+      throw new Error(`Unexecuted documentation language: ${language}`);
+  }
+}
 
 it("runs every webhook guide example against the embedded HTTP server", async () => {
   const document = await readFile(new URL("../../docs/webhooks.md", import.meta.url), "utf8");
@@ -71,24 +84,7 @@ it("runs every webhook guide example against the embedded HTTP server", async ()
         continue;
       }
       assert.ok(projectId, "Install the documented YAML before sending its examples");
-      let command: string;
-      let args: string[];
-      switch (example.language) {
-        case "sh":
-          command = "/bin/sh";
-          args = ["-c", example.code];
-          break;
-        case "javascript":
-          command = process.execPath;
-          args = ["--input-type=module", "--eval", example.code];
-          break;
-        case "python":
-          command = "python3";
-          args = ["-c", example.code];
-          break;
-        default:
-          throw new Error(`Unexecuted documentation language: ${example.language}`);
-      }
+      const { command, args } = exampleCommand(example.language, example.code);
       if (example.code.includes("HUB_SIGNING_SECRET")) {
         assert.ok(triggerId);
         const signer = await hub.createSigner(triggerId, "ci-partner");

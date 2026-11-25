@@ -3,7 +3,7 @@ import { ProblemSchema } from "../public-api/contracts.js";
 import { randomUUID } from "node:crypto";
 import { setImmediate } from "node:timers/promises";
 import { afterAll, afterEach, beforeAll, describe, it, vi } from "vitest";
-import { RunStream } from "./index.js";
+import type { RunStream } from "./index.js";
 import type { DatabaseRuntime } from "../db/runtime/index.js";
 import {
   createStreamHarness,
@@ -82,6 +82,24 @@ for (const backend of ["embedded", "pooled"] as const) {
       const service = harness.stream();
       services.push(service);
       return service;
+    }
+
+    async function invalidateCredential(mode: string, keyId: string, cliId: string) {
+      if (mode === "key revocation") await harness.apiKeys!.revoke(ORGANIZATION, keyId);
+      if (mode === "scope removal")
+        await harness.runtime!.query(
+          "update organization_api_keys set scopes = ARRAY['runs:dispatch'] where id = $1",
+          [keyId],
+        );
+      if (mode === "CLI revocation") await harness.cliCredentials!.revoke(ORGANIZATION, cliId);
+      if (mode === "owner removal")
+        await harness.runtime!.query("delete from member where id = 'stream-owner-row'");
+      if (mode === "owner demotion")
+        await harness.runtime!.query(
+          "update member set role = 'member' where id = 'stream-owner-row'",
+        );
+      if (mode === "session expiry") harness.setSessionActive(false);
+      if (mode === "member removal") await harness.removeMember();
     }
 
     it("accepts a read key, CLI credential and member session, but never falls back from an Authorization header", async () => {
@@ -234,21 +252,7 @@ for (const backend of ["embedded", "pooled"] as const) {
           `select last_used_at from ${table} where id = $1`,
           [id],
         );
-        if (mode === "key revocation") await harness.apiKeys!.revoke(ORGANIZATION, key.summary.id);
-        if (mode === "scope removal")
-          await harness.runtime!.query(
-            "update organization_api_keys set scopes = ARRAY['runs:dispatch'] where id = $1",
-            [key.summary.id],
-          );
-        if (mode === "CLI revocation") await harness.cliCredentials!.revoke(ORGANIZATION, cli.id);
-        if (mode === "owner removal")
-          await harness.runtime!.query("delete from member where id = 'stream-owner-row'");
-        if (mode === "owner demotion")
-          await harness.runtime!.query(
-            "update member set role = 'member' where id = 'stream-owner-row'",
-          );
-        if (mode === "session expiry") harness.setSessionActive(false);
-        if (mode === "member removal") await harness.removeMember();
+        await invalidateCredential(mode, key.summary.id, cli.id);
         for (let tick = 0; tick < 30; tick++) {
           await vi.advanceTimersByTimeAsync(2000);
           await queries.settle();

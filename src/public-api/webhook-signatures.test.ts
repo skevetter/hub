@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomUUID } from "node:crypto";
+import type * as CryptoModule from "node:crypto";
 import { once } from "node:events";
 import { createConnection } from "node:net";
 import { afterAll, beforeAll, describe, it, vi } from "vitest";
@@ -14,7 +15,7 @@ import { testSigningSettings, webhookFixture } from "./test-utils/webhook-fixtur
 const randomFixture = vi.hoisted(() => ({ nextToken: undefined as Buffer | undefined }));
 
 vi.mock("node:crypto", async (importOriginal) => {
-  const crypto = await importOriginal<typeof import("node:crypto")>();
+  const crypto = await importOriginal<typeof CryptoModule>();
   function randomBytes(size: number): Buffer;
   function randomBytes(size: number, callback: Parameters<typeof crypto.randomBytes>[1]): void;
   function randomBytes(size: number, callback?: Parameters<typeof crypto.randomBytes>[1]) {
@@ -68,6 +69,10 @@ async function signed(
 async function result(response: Response, status: number) {
   assert.equal(response.status, status, await response.clone().text());
   return ReceivedWebhookSchema.parse(await response.json());
+}
+
+async function assertDuplicateIfSuccessful(response: Response) {
+  if (response.status === 200) assert.equal((await result(response, 200)).duplicate, true);
 }
 
 async function problem(response: Response, status: number, code: string) {
@@ -449,7 +454,7 @@ describe("GitHub signer webhook intake", () => {
         try {
           const second = await signed(isolated, signer);
           assert.ok(second.status === 200 || second.status === 409);
-          if (second.status === 200) assert.equal((await result(second, 200)).duplicate, true);
+          await assertDuplicateIfSuccessful(second);
         } finally {
           resume.resolve();
         }
