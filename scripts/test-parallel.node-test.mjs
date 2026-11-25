@@ -2,7 +2,15 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 
-import { constants, existsSync, mkdirSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  constants,
+  existsSync,
+  mkdirSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 
 import {
   mkdir,
@@ -571,6 +579,25 @@ test("a reclaim race loser keeps the winner's lock", async (t) => {
     }),
     /lock is held/u,
   );
+  assert.equal(await readFile(pidFile, "utf8"), winner);
+});
+
+test("a reclaim race loser keeps a tokenless winner written over the same inode", async (t) => {
+  const path = await tempLock(t);
+  const pidFile = join(path, "pid");
+  await mkdir(path);
+  await writeFile(
+    pidFile,
+    JSON.stringify({ pid: process.pid, startTime: "old start", groups: [] }),
+  );
+  const before = statSync(pidFile);
+  const winner = `${process.pid}\n`;
+  await assert.rejects(
+    takeFullSuiteLock(path, () => writeFileSync(pidFile, winner)),
+    /lock is held/u,
+  );
+  const after = statSync(pidFile);
+  assert.deepEqual([after.dev, after.ino], [before.dev, before.ino]);
   assert.equal(await readFile(pidFile, "utf8"), winner);
 });
 
