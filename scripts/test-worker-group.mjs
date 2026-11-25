@@ -110,7 +110,7 @@ function snapshot(path, minPid = 2) {
     const { dev, ino } = fstatSync(fd);
     const raw = readFileSync(fd, "utf8").trim();
     const owner = /^\d+$/u.test(raw) ? { pid: Number(raw), groups: [] } : JSON.parse(raw);
-    return validOwner(owner, minPid) ? { dev, ino, owner } : { owner: null };
+    return validOwner(owner, minPid) ? { dev, ino, raw, owner } : { owner: null };
   } catch (error) {
     if (error.code === "ENOENT") return null;
     if (error instanceof SyntaxError) return { owner: null };
@@ -195,11 +195,14 @@ function makeLockDirectory(path) {
   }
 }
 
+// A freed inode number is often handed straight to the next file on Linux, and an owner written
+// by hand has no token, so the file content is part of the identity too.
 function sameOwner(current, observed) {
   return (
     observed?.owner &&
     observed.dev === current.dev &&
     observed.ino === current.ino &&
+    observed.raw === current.raw &&
     observed.owner.pid === current.owner.pid &&
     observed.owner.token === current.owner.token
   );
