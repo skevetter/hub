@@ -39,7 +39,7 @@ export function Section({
             )}
           </div>
           {action === undefined ? null : (
-            <div className="shrink-0 [&>a]:inline-flex [&>a]:min-h-6 [&>a]:items-center">
+            <div className="shrink-0 [&>a]:inline-flex [&>a]:min-h-6 [&>a]:items-center max-md:[&>a]:min-h-11">
               {action}
             </div>
           )}

@@ -21,7 +21,6 @@ import { EDITOR_EVENTS, eventDefinition, isEditorEvent } from "../triggers/confi
 import type { HomeSnapshot } from "./dashboard.js";
 import { triggerHealth, type TriggerHealth, type TriggerHealthRow } from "./trigger-health.js";
 
-const TRIGGERS_SHOWN = 8;
 const INLINE_LINK =
   "text-link underline underline-offset-4 max-md:inline-flex max-md:min-h-11 max-md:items-center";
 
@@ -85,7 +84,11 @@ function FailingCaption({
   return (
     <>
       Latest:{" "}
-      <Link to={`${base}/activity/${latestFailure.runId}` as never} className={INLINE_LINK}>
+      <Link
+        to={`${base}/activity/${latestFailure.runId}` as never}
+        className={INLINE_LINK}
+        aria-label={`View latest failed run for ${latestFailure.triggerName}`}
+      >
         {latestFailure.triggerName}
       </Link>
       {", "}
@@ -119,13 +122,13 @@ function HomeTriggers({
           title="No triggers yet"
           description="A trigger turns an event into an agent run."
         >
-          <Button asChild variant="outline" size="sm">
+          <Button asChild variant="outline" size="sm" className="max-md:min-h-11">
             <Link to={`${base}/triggers/new/edit` as never}>Create a trigger</Link>
           </Button>
         </EmptyState>
       ) : (
         <RecordList label="Trigger health">
-          {health.rows.slice(0, TRIGGERS_SHOWN).map((row) => (
+          {health.rows.map((row) => (
             <TriggerRow key={row.id} row={row} base={base} windowDays={data.windowDays} />
           ))}
         </RecordList>

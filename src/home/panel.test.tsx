@@ -31,7 +31,19 @@ vi.mock("@tanstack/react-start", async (importOriginal) => ({
   useServerFn: (fn: unknown) => fn,
 }));
 vi.mock("@tanstack/react-router", () => ({
-  Link: ({ to, children }: { to: string; children: ReactNode }) => <a href={to}>{children}</a>,
+  Link: ({
+    to,
+    children,
+    "aria-label": label,
+  }: {
+    to: string;
+    children: ReactNode;
+    "aria-label"?: string;
+  }) => (
+    <a href={to} {...(label === undefined ? {} : { "aria-label": label })}>
+      {children}
+    </a>
+  ),
 }));
 vi.mock("../projects/context.js", () => ({
   useRouteTenant: () => ({
@@ -263,7 +275,24 @@ describe("Home figures", () => {
       /^2 triggers failing Latest: Triage, failed /u,
     );
     assert.match(markup, /<a href="\/o\/acme\/activity\/newest"[^>]*>Triage<\/a>/u);
+    assert.match(markup, /aria-label="View latest failed run for Triage"/u);
     assert.match(markup, /text-attention-text/u);
+  });
+
+  it("lists every trigger, so none of the failing ones is cut off", () => {
+    const ids = Array.from({ length: 12 }, (_, position) => `t${String(position)}`);
+    const markup = renderHome({
+      ...ready,
+      triggers: ids.map((id) => ({ id, name: `name-${id}`, event: "manual.run", enabled: true })),
+      triggerRuns: ids.map((triggerId) => ({
+        triggerId,
+        total: 1,
+        failed: 1,
+        latest: { id: `run-${triggerId}`, status: "failed", startedAt: "2026-11-20T00:00:00.000Z" },
+      })),
+    });
+    const list = markup.slice(markup.indexOf('aria-label="Trigger health"'));
+    assert.equal(list.match(/href="\/o\/acme\/triggers\/t\d+"/gu)?.length, 12);
   });
 
   it("counts connected daemons and those that cannot run agents", () => {

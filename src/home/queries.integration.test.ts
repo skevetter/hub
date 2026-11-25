@@ -147,13 +147,22 @@ describe("per-trigger run summaries", () => {
     ]);
     const [summary] = await pg.database.summarizeTriggerRuns(org, since);
     expect(summary).toMatchObject({ triggerId: id, total: 3, failed: 1 });
-    const {
-      rows: [newest],
-    } = await pg.runtime.query<{ id: string; status: string }>(
-      `select id, status from trigger_runs where configured_trigger_name = 'seed:edge'
-       order by created_at desc, id desc limit 1`,
-    );
-    expect(summary?.latest).toMatchObject({ id: newest?.id, status: newest?.status });
+    const high = "ffffffff-ffff-4fff-8fff-fffffffffff";
+    const low = "00000000-0000-4000-8000-00000000000";
+    const give = async (status: string, runId: string) =>
+      pg.runtime.query("update trigger_runs set id = $1 where status = $2 and created_at = $3", [
+        runId,
+        status,
+        new Date(since.getTime() + 5000),
+      ]);
+    await give("failed", `${high}1`);
+    await give("succeeded", `${low}1`);
+    const failedWins = await pg.database.summarizeTriggerRuns(org, since);
+    expect(failedWins[0]?.latest).toMatchObject({ id: `${high}1`, status: "failed" });
+    await give("failed", `${low}2`);
+    await give("succeeded", `${high}2`);
+    const succeededWins = await pg.database.summarizeTriggerRuns(org, since);
+    expect(succeededWins[0]?.latest).toMatchObject({ id: `${high}2`, status: "succeeded" });
   });
 
   it("never reports another organization's triggers or runs", async () => {

@@ -176,6 +176,10 @@ run:
   ).toBeGreaterThan(32);
   await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText(organization);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
+  const viewAll = page.getByRole("link", { name: "View all", exact: true }).first();
+  expect(
+    await viewAll.evaluate((element) => element.getBoundingClientRect().height),
+  ).toBeGreaterThanOrEqual(44);
   await triggerName.click();
   await expect(page.getByRole("heading", { name, level: 1 })).toBeVisible();
 });
