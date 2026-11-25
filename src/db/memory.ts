@@ -4188,8 +4188,8 @@ class MemoryDatabase implements Database {
     return updated;
   }
 
-  async ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number, now: Date) {
-    return this.ownedTerminalNotification(triggerRunId, generation, now) !== undefined;
+  async ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number) {
+    return this.fencedTerminalNotification(triggerRunId, generation) !== undefined;
   }
 
   async renewWorkflowRunTerminalNotification(
@@ -4207,15 +4207,8 @@ class MemoryDatabase implements Database {
     return true;
   }
 
-  private ownedTerminalNotification(triggerRunId: string, generation: number, now: Date) {
-    const run = this.fencedTerminalNotification(triggerRunId, generation);
-    return run?.terminalNotificationLeaseExpiresAt != null &&
-      run.terminalNotificationLeaseExpiresAt > now
-      ? run
-      : undefined;
-  }
-
-  // Renewal fences on the claim generation alone: a lapsed lease nobody re-claimed is still ours.
+  // The ownership check and renewal fence on the claim generation alone: a lapsed lease nobody
+  // re-claimed is still ours, and only a re-claim bumps the generation.
   private fencedTerminalNotification(triggerRunId: string, generation: number) {
     const run = this.triggerRuns.get(triggerRunId);
     return run?.outcome === "accepted" &&

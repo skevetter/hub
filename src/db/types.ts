@@ -1602,11 +1602,7 @@ export interface Database
     now: Date,
     leaseMs: number,
   ): Promise<(AcceptedTriggerRunRecord & { terminalNotificationGeneration: number }) | undefined>;
-  ownsWorkflowRunTerminalNotification(
-    triggerRunId: string,
-    generation: number,
-    now: Date,
-  ): Promise<boolean>;
+  ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number): Promise<boolean>;
   renewWorkflowRunTerminalNotification(
     triggerRunId: string,
     generation: number,
