@@ -268,7 +268,7 @@ class GitHubAppClient {
       request: { fetch: observe === undefined ? timed : observingFetch(timed, observe) },
       ...pluginOverrides(this.options),
     });
-    octokit.hook.before("request", refuseRetryOfCreateComment(octokit));
+    octokit.hook.before("request", refuseRetryOfNonIdempotentPost(octokit));
     return octokit;
   }
 
@@ -388,20 +388,23 @@ const THROTTLE_POLICY = {
 
 // Not anchored at the start so an API base prefix such as /api/v3 still matches.
 const CREATE_COMMENT_PATH = /\/repos\/[^/]+\/[^/]+\/issues\/[^/]+\/comments$/u;
+const CREATE_ACCESS_TOKEN_PATH = /\/app\/installations\/[^/]+\/access_tokens$/u;
 
 type HookedRequest = Parameters<Octokit["request"]["endpoint"]["parse"]>[0] & {
   request?: object;
 };
 
-// A retried POST after a lost response would publish the comment twice. The hook sees the
+// A retried POST after a lost response would publish the comment twice, or mint a second
+// installation token nobody holds and nothing revokes. The hook sees the
 // request before Octokit expands templates and trailing slashes, so the endpoint parser
 // resolves it first. The nested request object can be shared with the client defaults, so it
 // is replaced, never mutated.
-function refuseRetryOfCreateComment(octokit: Octokit) {
+function refuseRetryOfNonIdempotentPost(octokit: Octokit) {
   return (options: HookedRequest) => {
     const resolved = octokit.request.endpoint.parse(options);
     if (resolved.method !== "POST") return;
-    if (CREATE_COMMENT_PATH.test(new URL(resolved.url).pathname)) {
+    const path = new URL(resolved.url).pathname;
+    if (CREATE_COMMENT_PATH.test(path) || CREATE_ACCESS_TOKEN_PATH.test(path)) {
       options.request = { ...options.request, retries: 0 };
     }
   };
