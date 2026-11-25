@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { createPostgresQueryRuntime, createDatabase } from "./test-utils/runtime.js";
+import { createPostgresQueryRuntime } from "./test-utils/runtime.js";
 import { afterAll, beforeAll, describe, it } from "vitest";
+import { createDatabase } from "./test-utils/runtime.js";
 import {
   compileHubConfig,
   compiledConfigurationHash,

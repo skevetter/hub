@@ -109,7 +109,7 @@ export function readInstanceAuthPolicy(
 }
 
 function validateBootstrapIdentity(organizationName: string, ownerEmail: string): void {
-  const parsedEmail = z.email().safeParse(ownerEmail);
+  const parsedEmail = z.string().email().safeParse(ownerEmail);
   if (!parsedEmail.success) throw new Error("PASEO_BOOTSTRAP_OWNER_EMAIL must be a valid email");
   if (organizationName.length > 100) {
     throw new Error("PASEO_BOOTSTRAP_ORGANIZATION must not exceed 100 characters");

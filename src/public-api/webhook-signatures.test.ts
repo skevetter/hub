@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { createHash, createHmac, randomUUID } from "node:crypto";
-import type * as CryptoModule from "node:crypto";
 import { once } from "node:events";
 import { createConnection } from "node:net";
 import { afterAll, beforeAll, describe, it, vi } from "vitest";
@@ -15,7 +14,7 @@ import { testSigningSettings, webhookFixture } from "./test-utils/webhook-fixtur
 const randomFixture = vi.hoisted(() => ({ nextToken: undefined as Buffer | undefined }));
 
 vi.mock("node:crypto", async (importOriginal) => {
-  const crypto = await importOriginal<typeof CryptoModule>();
+  const crypto = await importOriginal<typeof import("node:crypto")>();
   function randomBytes(size: number): Buffer;
   function randomBytes(size: number, callback: Parameters<typeof crypto.randomBytes>[1]): void;
   function randomBytes(size: number, callback?: Parameters<typeof crypto.randomBytes>[1]) {

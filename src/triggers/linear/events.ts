@@ -8,7 +8,7 @@ const LinearIssueSchema = z.object({
   identifier: z.string().min(1).optional(),
   title: z.string(),
   description: z.string().nullable(),
-  url: z.url().optional(),
+  url: z.string().url().optional(),
   projectId: LinearIdSchema.nullable(),
   stateId: LinearIdSchema.nullable(),
   assigneeId: LinearIdSchema.nullable(),
@@ -31,7 +31,7 @@ export const NormalizedLinearIssueEventSchema = z.object({
   actor: LinearActorSchema.nullable(),
   issue: LinearIssueSchema,
   updatedFrom: LinearIssuePreviousSchema,
-  occurredAt: z.iso.datetime().optional(),
+  occurredAt: z.string().datetime().optional(),
 });
 
 export const NormalizedLinearCommentEventSchema = z.object({
@@ -42,7 +42,7 @@ export const NormalizedLinearCommentEventSchema = z.object({
   actor: LinearActorSchema.nullable(),
   comment: z.object({ id: LinearIdSchema, body: z.string(), issueId: LinearIdSchema }),
   issue: LinearIssueSchema.nullable(),
-  occurredAt: z.iso.datetime().optional(),
+  occurredAt: z.string().datetime().optional(),
 });
 
 export const NormalizedLinearEventSchema = z.discriminatedUnion("type", [

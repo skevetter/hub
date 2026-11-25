@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   AgentStreamMessageSchema,
-  type AgentTimelineCursorSchema,
+  AgentTimelineCursorSchema,
   AgentTimelineEntryPayloadSchema,
   FetchAgentTimelineResponseMessageSchema,
 } from "@getpaseo/protocol/messages";
@@ -10,7 +10,8 @@ import {
   HubExecutionAgentStreamEventSchema,
   HubExecutionAgentSnapshotSchema,
 } from "../../hub/protocol.js";
-import { type DaemonCreateAgentOptions, DaemonResponseLostError } from "../protocol.js";
+import type { DaemonCreateAgentOptions } from "../protocol.js";
+import { DaemonResponseLostError } from "../protocol.js";
 
 const SnapshotSchema = z.object({
   id: z.string(),
@@ -89,7 +90,7 @@ const EnvelopeSchema = z.object({
 });
 const ResultSchema = z
   .object({ error: z.string().nullable().optional(), accepted: z.boolean().optional() })
-  .loose();
+  .passthrough();
 
 export class DaemonAgentError extends Error {
   constructor(

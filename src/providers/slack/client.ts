@@ -20,9 +20,11 @@ const SlackOAuthResponseSchema = z
     scope: z.string().optional(),
     team: z.object({ id: z.string().min(1), name: z.string().min(1) }).optional(),
   })
-  .loose();
+  .passthrough();
 
-const SlackApiResponseSchema = z.object({ ok: z.boolean(), error: z.string().optional() }).loose();
+const SlackApiResponseSchema = z
+  .object({ ok: z.boolean(), error: z.string().optional() })
+  .passthrough();
 const SlackAuthTestResponseSchema = SlackApiResponseSchema.extend({
   team_id: z.string().min(1).optional(),
   user_id: z.string().min(1).optional(),

@@ -465,7 +465,9 @@ describe("generated public OpenAPI", () => {
       const documentedResponses = z
         .record(
           z.string(),
-          z.object({ headers: z.object({ "X-Request-ID": z.unknown() }).loose() }).loose(),
+          z
+            .object({ headers: z.object({ "X-Request-ID": z.unknown() }).passthrough() })
+            .passthrough(),
         )
         .parse(operation.responses);
       assert.deepEqual(Object.keys(documentedResponses).sort(), [...statuses].sort());

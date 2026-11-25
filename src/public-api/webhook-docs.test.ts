@@ -14,8 +14,8 @@ const execFileAsync = promisify(execFile);
 const responseSchema = z
   .object({
     deliveryKey: z.string(),
-    providerEventReceiptId: z.uuid(),
-    triggerRunId: z.uuid(),
+    providerEventReceiptId: z.string().uuid(),
+    triggerRunId: z.string().uuid(),
     configuredTriggerName: z.literal("build-finished"),
     workflowStatus: z.string(),
     duplicate: z.boolean(),

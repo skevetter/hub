@@ -1,10 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { formatError } from "zod";
-import {
-  type NormalizedGitHubEvent,
-  WebhookPayloadSchema,
-  type WebhookPayload,
-} from "../../auth/github-events.js";
+import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
+import { WebhookPayloadSchema } from "../../auth/github-events.js";
+import type { WebhookPayload } from "../../auth/github-events.js";
 import { isDatabaseUnavailableError } from "../../db/errors.js";
 import type { ProviderEventAcceptance } from "../../db/types.js";
 import { reportFailure } from "../../failures/index.js";
@@ -235,7 +232,7 @@ async function verifyWebhookRequest(
   if (!parsedBody.success) {
     reportGitHubRejection("invalid_payload", 400, secret, signature);
     return Response.json(
-      { error: "invalid webhook payload", issues: formatError(parsedBody.error) },
+      { error: "invalid webhook payload", issues: parsedBody.error.format() },
       { status: 400 },
     );
   }

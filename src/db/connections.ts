@@ -25,7 +25,6 @@ import type {
   ConnectionStartAuthority,
   DiscordConnectionRecord,
   GitHubConnectionRecord,
-  GitHubRepositorySnapshot,
   LinearConnectionRecord,
   LinearConnectionRefreshOperation,
   ReadConnectionAttemptInput,
@@ -1286,7 +1285,7 @@ export async function replaceGitHubRepositories(
   transaction: DrizzleHandle,
   organizationId: string,
   connectionId: string,
-  repositories: GitHubRepositorySnapshot,
+  repositories: import("./types.js").GitHubRepositorySnapshot,
 ): Promise<void> {
   const ids = repositories.map((repository) => repository.repositoryId);
   await transaction

@@ -1,7 +1,9 @@
 import { z } from "zod";
 import { reportFailure } from "../../failures/index.js";
 
-const SlackApiResponseSchema = z.object({ ok: z.boolean(), error: z.string().optional() }).loose();
+const SlackApiResponseSchema = z
+  .object({ ok: z.boolean(), error: z.string().optional() })
+  .passthrough();
 const SlackFileSchema = z
   .object({
     id: z.string().min(1).max(255),
@@ -10,7 +12,7 @@ const SlackFileSchema = z
     mimetype: z.string().min(1).max(255).optional(),
     size: z.number().int().nonnegative().optional(),
   })
-  .loose();
+  .passthrough();
 const SlackThreadMessageSchema = z
   .object({
     ts: z.string().regex(/^\d+\.\d+$/u),
@@ -19,7 +21,7 @@ const SlackThreadMessageSchema = z
     bot_id: z.string().min(1).max(255).optional(),
     files: z.array(SlackFileSchema).optional(),
   })
-  .loose();
+  .passthrough();
 const SlackThreadRepliesSchema = SlackApiResponseSchema.extend({
   messages: z.array(SlackThreadMessageSchema).optional(),
   response_metadata: z.object({ next_cursor: z.string().optional() }).optional(),

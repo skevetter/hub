@@ -21,8 +21,8 @@ const tokenSchema = z
     access_token: z.string().min(1),
     guild: z.object({ id: DiscordSnowflakeSchema, name: z.string() }),
   })
-  .loose();
-const guildSchema = z.object({ id: DiscordSnowflakeSchema, name: z.string() }).loose();
+  .passthrough();
+const guildSchema = z.object({ id: DiscordSnowflakeSchema, name: z.string() }).passthrough();
 
 export function createDiscordConnectionClient(input: {
   publicBaseUrl: string;

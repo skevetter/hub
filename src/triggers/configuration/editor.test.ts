@@ -1,10 +1,11 @@
 import { compileTriggerDocument, parseTriggerDocument } from "./index.js";
 import { matchTriggers } from "../github/match.js";
 import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
-import { agentRun, TriggerDocumentSchema } from "./schema.js";
+import { agentRun } from "./schema.js";
 import { EDITOR_EVENTS, eventDefinition } from "./events.js";
 import { describe, expect, test } from "vitest";
 import { parseDocument } from "yaml";
+import { TriggerDocumentSchema } from "./schema.js";
 import {
   changeTriggerEvent,
   createTriggerYaml,

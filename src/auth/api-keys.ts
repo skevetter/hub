@@ -18,8 +18,6 @@ import { withApiKeySerialization } from "../db/api-key-serialization.js";
 
 import { SigningRequestError, WebhookSecretStore } from "./webhook-secret-store.js";
 import type { WebhookSigningSettings } from "./webhook-signatures.js";
-import type { TenantRouteAccess } from "../db/types.js";
-import type { OperationScope } from "./operation-auth.js";
 
 const API_KEY_PREFIX = "paseo_pk_";
 const API_KEY_PREFIX_LENGTH = 12;
@@ -44,11 +42,11 @@ export interface CreatedApiKey {
 }
 
 export interface OperationAuthorization {
-  user?: { id: string; role: TenantRouteAccess["membership"]["role"] };
+  user?: { id: string; role: import("../db/types.js").TenantRouteAccess["membership"]["role"] };
   kind: "apiKey" | "cliCredential";
   credentialId: string;
   organizationId: string;
-  scopes: readonly OperationScope[];
+  scopes: readonly import("./operation-auth.js").OperationScope[];
   actor?: string | null;
   allowedTriggers?: readonly string[] | null;
 }
@@ -90,7 +88,7 @@ export class OrganizationApiKeys {
 
   async reauthorize(
     access: OperationAuthorization,
-    requiredScope: OperationScope,
+    requiredScope: import("./operation-auth.js").OperationScope,
   ): Promise<boolean> {
     if (access.kind !== "apiKey") return false;
     const result = await this.pool.query(
@@ -232,7 +230,7 @@ export class OrganizationApiKeys {
 
   async authorize(
     request: Request,
-    requiredScope: OperationScope,
+    requiredScope: import("./operation-auth.js").OperationScope,
   ): Promise<OperationAuthorizationResult> {
     const token = bearerToken(request.headers.get("authorization"));
     const parsed = token === undefined ? undefined : parseApiKey(token);
