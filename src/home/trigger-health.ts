@@ -1,5 +1,4 @@
 import { enabledState, runState, type StateView } from "../components/app/state-label.js";
-import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import type { HomeSnapshot } from "./dashboard.js";
 
 type Latest = HomeSnapshot["triggerRuns"][number]["latest"];
@@ -19,7 +18,7 @@ export interface TriggerHealthRow {
 export interface TriggerHealth {
   /** Worst first: needs a person, then running, then fine, then off. */
   rows: readonly TriggerHealthRow[];
-  /** Enabled triggers whose newest run failed, timed out or was rejected. */
+  /** Enabled triggers whose newest run is in a state that needs a person. */
   failing: number;
   running: number;
   paused: number;
@@ -69,8 +68,13 @@ function stateOf(enabled: boolean, latest: Latest): StateView {
   return latest === null ? NO_RUNS : runState(latest.status);
 }
 
+/**
+ * Failing is what the row shows in red. Count, sort order and colour all read the state's tone,
+ * so the figure can never disagree with the list under it. A switched-off or never-run trigger
+ * has a quiet state, so it is not failing.
+ */
 function isFailing(row: TriggerHealthRow): boolean {
-  return row.enabled && row.latest !== null && FAILED_RUN_STATUSES.has(row.latest.status);
+  return row.state.tone === "attention";
 }
 
 function newestFailure(failing: readonly TriggerHealthRow[]): TriggerHealth["latestFailure"] {

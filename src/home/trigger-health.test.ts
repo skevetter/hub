@@ -1,7 +1,20 @@
 import assert from "node:assert/strict";
-import { describe, it } from "vitest";
+import { afterEach, describe, it, vi } from "vitest";
+import type * as StateLabel from "../components/app/state-label.js";
+import { runState, type StateView } from "../components/app/state-label.js";
+import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import type { HomeSnapshot } from "./dashboard.js";
 import { triggerHealth } from "./trigger-health.js";
+
+const toneOverride = vi.hoisted(() => new Map<string, StateView>());
+vi.mock("../components/app/state-label.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof StateLabel>();
+  return {
+    ...actual,
+    runState: (status: string) => toneOverride.get(status) ?? actual.runState(status),
+  };
+});
+afterEach(() => toneOverride.clear());
 
 type Status = NonNullable<HomeSnapshot["triggerRuns"][number]["latest"]>["status"];
 
@@ -18,7 +31,57 @@ const runs = (triggerId: string, status: Status | null, at = "2026-11-24T10:00:0
   latest: status === null ? null : { id: `${triggerId}-run`, status, startedAt: at },
 });
 
+// A new run status will not compile until it is listed here, and then it is checked below.
+const EVERY_STATUS = [
+  "running",
+  "succeeded",
+  "failed",
+  "timed_out",
+  "canceled",
+  "rejected",
+] as const satisfies readonly Status[];
+const EVERY_STATUS_LISTED: [Exclude<Status, (typeof EVERY_STATUS)[number]>] extends [never]
+  ? true
+  : false = true;
+
 describe("trigger health", () => {
+  it.each(EVERY_STATUS)(
+    "counts, colours and sorts a trigger whose last run is %s by one definition",
+    (status) => {
+      const health = triggerHealth({
+        triggers: [trigger("fine"), trigger("subject")],
+        triggerRuns: [
+          runs("fine", "succeeded", "2026-11-24T12:00:00.000Z"),
+          runs("subject", status),
+        ],
+      });
+      const red = runState(status).tone === "attention";
+      const subject = health.rows.findIndex(({ id }) => id === "subject");
+      assert.equal(health.failing, red ? 1 : 0);
+      assert.equal(health.rows[subject]?.state.tone === "attention", red);
+      assert.equal(subject === 0, red || status === "running");
+      assert.equal(health.latestFailure !== null, red);
+    },
+  );
+
+  it("follows the state a row shows, so a status that turns red is counted and listed first", () => {
+    toneOverride.set("canceled", { label: "Canceled", tone: "attention" });
+    const health = triggerHealth({
+      triggers: [trigger("fine"), trigger("odd", true, "Odd")],
+      triggerRuns: [runs("fine", "succeeded", "2026-11-24T12:00:00.000Z"), runs("odd", "canceled")],
+    });
+    assert.equal(health.failing, 1);
+    assert.equal(health.rows[0]?.id, "odd");
+    assert.equal(health.latestFailure?.triggerName, "Odd");
+  });
+
+  it("shows the window's failed tally for exactly the statuses that turn a row red", () => {
+    assert.ok(EVERY_STATUS_LISTED);
+    for (const status of EVERY_STATUS) {
+      assert.equal(FAILED_RUN_STATUSES.has(status), runState(status).tone === "attention", status);
+    }
+  });
+
   it("orders needs-a-person, running, fine, then off, newest first inside a group", () => {
     const { rows } = triggerHealth({
       triggers: ["ok", "idle", "paused", "old", "live", "new", "tied"].map((id) =>

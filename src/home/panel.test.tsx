@@ -373,6 +373,22 @@ describe("Home triggers", () => {
     assert.match(markup, /GitHub issue comment created[^<]*\u00b7 last run <time/u);
   });
 
+  it.each([
+    ["manual.run", "Manual run"],
+    ["webhook.received", "Manual run"],
+    ["github.issue_created", "GitHub issue created"],
+    ["linear.comment", "Linear comment created"],
+    ["linear.issue", "Linear issue event"],
+    ["external.unknown", "external.unknown"],
+  ])("labels a trigger's event %s as %s", (event, label) => {
+    const markup = renderHome({
+      ...ready,
+      triggers: [{ id: "trigger", name: "Deploy", event, enabled: true }],
+    });
+    const list = markup.slice(markup.indexOf('aria-label="Trigger health"'));
+    assert.equal(/>([^<>]+) \u00b7 last run <time\b/u.exec(list)?.[1], label);
+  });
+
   it("offers View all, and a first trigger when there is none", () => {
     assert.match(renderHome(ready), /<a href="\/o\/acme\/triggers">View all<\/a>/u);
     const markup = renderHome(fresh);
