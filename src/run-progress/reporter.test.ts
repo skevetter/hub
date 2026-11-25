@@ -26,6 +26,8 @@ import { RunTimelineBus } from "../run-timeline/bus.js";
 import type { AdmitProgressWriteInput, RunTimelineEvent } from "../run-timeline/store.js";
 import { ProgressReporter } from "./index.js";
 import { CredentialBackoff } from "./backoff.js";
+import { GitHubProgressProvider } from "./github.js";
+import { readRunProgressSettings } from "./settings.js";
 import { LateWriteObservers, MessageWriter } from "./writer.js";
 import type { ProgressCall, ProgressClock, ProgressProvider, StoredRef } from "./types.js";
 
@@ -236,13 +238,13 @@ function fixture(database?: Database, drain?: () => Promise<void>) {
     return reporter;
   };
 
-  const writer = () =>
+  const writer = (backoff = new CredentialBackoff(() => 0.5)) =>
     new MessageWriter({
       database: store,
       clock,
       settings: { minEditSeconds: 20, maxEdits: 120, retentionDays: 30 },
       signal: new AbortController().signal,
-      backoff: new CredentialBackoff(() => 0.5),
+      backoff,
       report: (code) => failures.push(code),
     });
 
@@ -271,10 +273,12 @@ function fixture(database?: Database, drain?: () => Promise<void>) {
     started = true,
     state = "pending",
     reference = REFERENCE,
+    providerName = "linear",
   }: {
     started?: boolean;
     reference?: StoredRef;
     state?: "pending" | "creating" | "active" | "finished";
+    providerName?: ProgressProvider["name"];
   } = {}) {
     const run = await createRun(store, clock);
     const scope = { triggerRunId: run.id, organizationId: ORGANIZATION };
@@ -304,7 +308,7 @@ function fixture(database?: Database, drain?: () => Promise<void>) {
     assert.ok(
       await store.insertRunProgressMessageIfAbsent({
         ...scope,
-        provider: "linear",
+        provider: providerName,
         now: clock.date(),
       }),
     );
@@ -321,9 +325,69 @@ function fixture(database?: Database, drain?: () => Promise<void>) {
         ),
       );
     }
-    return { run, read, acquire, update, compensate, finish };
+    return { run, scope, read, acquire, update, compensate, finish };
   }
   return { clock, bus, store, provider, failures, start, event, seed, writer };
+}
+
+function holdProgressRelease(store: Database, runId: string) {
+  const held = Promise.withResolvers<void>();
+  const reached = Promise.withResolvers<void>();
+  const update = store.updateRunProgressMessage.bind(store);
+  vi.spyOn(store, "updateRunProgressMessage").mockImplementation(async (input) => {
+    if (input.triggerRunId === runId && input.releaseLease) {
+      reached.resolve();
+      await held.promise;
+    }
+    return update(input);
+  });
+  return {
+    unblock: held.resolve,
+    waitFor: (writing: Promise<unknown>) =>
+      Promise.race([
+        reached.promise,
+        writing.then(() => assert.fail("Writer finished without reaching the held update")),
+      ]),
+  };
+}
+
+type SeededProgress = Awaited<ReturnType<ReturnType<typeof fixture>["seed"]>>;
+
+async function writeWithHeldCredentialSlot(
+  f: ReturnType<typeof fixture>,
+  seeded: SeededProgress,
+  provider: ProgressProvider,
+) {
+  const backoff = new CredentialBackoff(() => 0.5);
+  const released = vi.fn<() => void>();
+  const admit = backoff.admit.bind(backoff);
+  vi.spyOn(backoff, "admit").mockImplementation((...args) => {
+    const admission = admit(...args);
+    if (!("release" in admission)) return admission;
+    return { release: released.mockImplementation(admission.release) };
+  });
+  const blocked = holdProgressRelease(f.store, seeded.run.id);
+  const writing = f.writer(backoff).write(seeded.scope, provider);
+  try {
+    await blocked.waitFor(writing);
+    assert.equal(
+      released.mock.calls.length,
+      0,
+      "Credential slot released before the update settled",
+    );
+  } finally {
+    blocked.unblock();
+    await writing;
+  }
+  assert.equal(released.mock.calls.length, 1);
+  return (await writing).row;
+}
+
+interface AuthorizationSlotCase {
+  name: string;
+  authorize: ProgressProvider["authorize"];
+  secrets?: readonly string[];
+  failure: string;
 }
 
 describe("run progress reporter", () => {
@@ -1054,6 +1118,115 @@ describe("reporter lifecycle integration", () => {
     assert.equal((await second.read())?.failure, "credential_rejected");
     assert.equal((await third.read())?.state, "active");
     assert.deepEqual(f.failures, ["credential_rejected"]);
+  });
+
+  it("holds the credential slot until the stop write settles", async () => {
+    const f = fixture();
+    const first = await f.seed();
+    const second = await f.seed();
+    const backoff = new CredentialBackoff(() => 0.5);
+    const blocked = holdProgressRelease(f.store, first.run.id);
+    f.provider.authorize = async (_locator, run) =>
+      run.id === first.run.id ? { refused: "policy" } : "ok";
+
+    const stopping = f.writer(backoff).write(first.scope, f.provider);
+    try {
+      await blocked.waitFor(stopping);
+      const waiting = await f.writer(backoff).write(second.scope, f.provider);
+      assert.equal(waiting.wakeAt, f.clock.now() + 250);
+      assert.equal(f.provider.requests.length, 0);
+    } finally {
+      blocked.unblock();
+      await stopping;
+    }
+    assert.equal((await stopping).row?.state, "refused");
+    await f.writer(backoff).write(second.scope, f.provider);
+    assert.equal(f.provider.requests.length, 1);
+  });
+
+  it.each<AuthorizationSlotCase>([
+    {
+      name: "transient authorization failure",
+      authorize: async () => {
+        throw new Error("authorization failed");
+      },
+      failure: "transient_failure",
+    },
+    {
+      name: "credential rejection",
+      authorize: async () => ({ unavailable: "credential_rejected" }),
+      failure: "credential_rejected",
+    },
+    {
+      name: "authorization unavailable",
+      authorize: async () => ({ unavailable: "offline" }),
+      failure: "authorization_unavailable",
+    },
+    {
+      name: "body-secret refusal",
+      authorize: async () => "ok",
+      secrets: ["Paseo run: Running"],
+      failure: "body_contains_secret",
+    },
+  ])("holds the credential slot during $name", async ({ authorize, secrets, failure }) => {
+    const f = fixture();
+    const seeded = await f.seed();
+    f.provider.authorize = authorize;
+    f.provider.secrets = async () => secrets ?? [];
+    const row = await writeWithHeldCredentialSlot(f, seeded, f.provider);
+    assert.equal(row?.failure, failure);
+    assert.equal(f.provider.requests.length, 0);
+  });
+
+  const githubReference = {
+    credential: { kind: "progress-token" },
+    repository: "acme/widgets",
+    issueNumber: 1,
+    commentId: 2,
+  } satisfies StoredRef;
+
+  it.each([
+    {
+      name: "unknown-create stop",
+      adopted: undefined,
+      state: "abandoned",
+      failure: "create_unknown",
+    },
+    {
+      name: "non-OK adoption stop",
+      adopted: { status: "refused", code: "public_repository" },
+      state: "refused",
+      failure: "public_repository",
+    },
+    {
+      name: "successful adoption release",
+      adopted: { status: "ok", ref: githubReference },
+      state: "active",
+      failure: null,
+    },
+  ] satisfies {
+    name: string;
+    adopted: Awaited<ReturnType<GitHubProgressProvider["adopt"]>>;
+    state: string;
+    failure: string | null;
+  }[])("holds the credential slot during $name", async ({ adopted, state, failure }) => {
+    const f = fixture();
+    const seeded = await f.seed({
+      state: "creating",
+      reference: githubReference,
+      providerName: "github",
+    });
+    await f.clock.advanceTo(60_000);
+    const provider = new GitHubProgressProvider({
+      database: f.store,
+      settings: readRunProgressSettings({}),
+      fetch: async () => assert.fail("Unexpected GitHub request during adoption test"),
+    });
+    const adopt = vi.spyOn(provider, "adopt").mockResolvedValue(adopted);
+    const row = await writeWithHeldCredentialSlot(f, seeded, provider);
+    assert.equal(adopt.mock.calls.length, 1);
+    assert.equal(row?.state, state);
+    assert.equal(row?.failure, failure);
   });
 
   it("restarts a durable final retry chain when the run finished while Hub was down", async () => {

@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { AcceptedTriggerRunRecord } from "../db/types.js";
+import type { AcceptedTriggerRunRecord, WorkflowStepRunRecord } from "../db/types.js";
 import type {
   RunProgressMessage,
   RunTimelineEvent,
   UpdateRunProgressMessageInput,
 } from "../run-timeline/store.js";
-import { CREDENTIAL_CIRCUIT_MS, CredentialBackoff } from "./backoff.js";
+import { CREDENTIAL_CIRCUIT_MS, type CredentialBackoff } from "./backoff.js";
 import { GitHubProgressProvider } from "./github.js";
 import { renderProgress } from "./render.js";
 import type { RunProgressSettings } from "./settings.js";
@@ -154,6 +154,9 @@ interface Operation {
   budget: Budget;
 }
 
+type Preparation = Pick<Operation, "lease" | "run" | "kind" | "budget">;
+type VisibilityPatch = Pick<Patch, "visibility" | "visibilityCheckedAt">;
+
 function credentialKey({ lease, ref }: Pick<Operation, "lease" | "ref">): string {
   return createHash("sha256")
     .update(JSON.stringify([lease.provider, ref.credential]))
@@ -161,6 +164,14 @@ function credentialKey({ lease, ref }: Pick<Operation, "lease" | "ref">): string
 }
 
 type MutationOutcome = ProgressCall | "transient" | "timeout";
+type RetryOutcome = Extract<ProgressCall, { status: "retry" }> | "transient" | "timeout";
+
+interface MutationRecord {
+  current: RunProgressMessage;
+  observedGen: number;
+  outcome: MutationOutcome;
+  secrets: readonly string[];
+}
 
 function uncertain(outcome: MutationOutcome): boolean {
   return typeof outcome === "string" || (outcome.status === "retry" && outcome.transient === true);
@@ -206,12 +217,16 @@ export function canEditRegularly(row: RunProgressMessage, maxEdits: number): boo
   return row.editCount < maxEdits && row.failedEdits < REGULAR_FAILURE_LIMIT;
 }
 
+interface RegularEditTiming {
+  now: number;
+  ageFrom: number;
+  seconds: number;
+  localSendStart?: number | undefined;
+}
+
 export function regularEditAt(
   row: RunProgressMessage,
-  now: number,
-  ageFrom: number,
-  seconds: number,
-  localSendStart?: number,
+  { now, ageFrom, seconds, localSendStart }: RegularEditTiming,
 ): number {
   const interval = now - ageFrom > 900_000 ? 60_000 : seconds * 1000;
   const durableStart = (row.lastRegularAttemptAt ?? row.lastEditAt)?.getTime() ?? now - interval;
@@ -223,13 +238,50 @@ export function regularEditAt(
 
 export function repairAt(row: RunProgressMessage): number | undefined {
   if (row.state !== "active" && row.state !== "finished") return undefined;
-  const generationAt =
-    row.compensationRequestedGen > row.compensationDoneGen
-      ? (row.compensationNotBefore?.getTime() ?? 0)
-      : Infinity;
-  const at = Math.min(generationAt, row.settleAt?.getTime() ?? Infinity);
+  const at = Math.min(compensationAt(row), row.settleAt?.getTime() ?? Infinity);
   if (at === Infinity) return undefined;
   return Math.max(at, row.retryAt?.getTime() ?? 0);
+}
+
+function compensationAt(row: RunProgressMessage): number {
+  return row.compensationRequestedGen > row.compensationDoneGen
+    ? (row.compensationNotBefore?.getTime() ?? 0)
+    : Infinity;
+}
+
+function leaseIsHeld(row: RunProgressMessage, now: number): boolean {
+  return row.leaseOwner !== null && (row.leaseExpiresAt?.getTime() ?? 0) > now;
+}
+
+function shouldWaitForStart(
+  { kind, run }: Preparation,
+  steps: WorkflowStepRunRecord[],
+  events: RunTimelineEvent[],
+): boolean {
+  return (
+    kind === "create" &&
+    run.status === "running" &&
+    !steps.some((step) => step.startedAt !== null) &&
+    !events.some((event) => event.kind === "run_started")
+  );
+}
+
+function createReservation(
+  operation: Operation,
+  provider: ProgressProvider,
+): StoredRef | undefined {
+  return operation.kind === "create" && provider instanceof GitHubProgressProvider
+    ? provider.createReservation(operation.ref.credential)
+    : undefined;
+}
+
+function reservationContainsSecret(
+  reference: StoredRef | undefined,
+  secrets: readonly string[],
+): boolean {
+  if (reference === undefined) return false;
+  const serialized = JSON.stringify(reference);
+  return secrets.some((secret) => secret !== "" && serialized.includes(secret));
 }
 
 export class MessageWriter {
@@ -253,8 +305,7 @@ export class MessageWriter {
     if (!["pending", "creating", "active", "finished"].includes(previous.state))
       return { row: previous };
     const now = clock.now();
-    if (previous.leaseOwner !== null && (previous.leaseExpiresAt?.getTime() ?? 0) > now)
-      return { row: previous, wakeAt: now + LEASE_RETRY_MS };
+    if (leaseIsHeld(previous, now)) return { row: previous, wakeAt: now + LEASE_RETRY_MS };
     const budget = new Budget(clock, signal, clock.monotonic() + OPERATION_MS);
     const lease = await budget.run(() =>
       database.acquireRunProgressLease({
@@ -297,7 +348,7 @@ export class MessageWriter {
     provider: ProgressProvider,
     budget: Budget,
   ): Promise<WriteResult> {
-    const { database, clock } = this.options;
+    const { database } = this.options;
     if (lease.state === "creating") return this.recoverCreate(lease, provider, budget);
     const expired = previous.leaseOwner !== null && lease.version === previous.version + 1;
     if (expired && lease.state === "active") {
@@ -314,6 +365,16 @@ export class MessageWriter {
     );
     if (run?.outcome !== "accepted") return this.release(lease);
     if (run.payloadExpiredAt != null) return this.release(lease);
+    return this.writeAcceptedRun(lease, run, provider, budget);
+  }
+
+  private async writeAcceptedRun(
+    lease: RunProgressMessage,
+    run: AcceptedTriggerRunRecord,
+    provider: ProgressProvider,
+    budget: Budget,
+  ): Promise<WriteResult> {
+    const { clock } = this.options;
     const kind = this.kind(lease, run, clock.now());
     if (kind === undefined) return this.release(lease);
     if (
@@ -328,7 +389,7 @@ export class MessageWriter {
       const due = this.regularDue(lease, run);
       if (due > clock.now()) return { ...(await this.release(lease, {}, due)), regularPace: true };
     }
-    return this.prepare(lease, run, kind, provider, budget);
+    return this.prepare({ lease, run, kind, budget }, provider);
   }
 
   private async recoverCreate(
@@ -356,10 +417,10 @@ export class MessageWriter {
       const found = await budget
         .run((signal) => provider.adopt(run, target, signal), PROVIDER_MS)
         .catch(() => undefined);
-      if (found === undefined) return this.stopMessage(lease, "abandoned", "create_unknown");
+      if (found === undefined) return await this.stopMessage(lease, "abandoned", "create_unknown");
       if (found.status !== "ok")
-        return this.stopMessage(lease, found.status, failureCode(found.code, found.status));
-      return this.release(
+        return await this.stopMessage(lease, found.status, failureCode(found.code, found.status));
+      return await this.release(
         lease,
         {
           state: "active",
@@ -389,12 +450,10 @@ export class MessageWriter {
   }
 
   private async prepare(
-    lease: RunProgressMessage,
-    run: AcceptedTriggerRunRecord,
-    kind: WriteKind,
+    preparation: Preparation,
     provider: ProgressProvider,
-    budget: Budget,
   ): Promise<WriteResult> {
+    const { lease, run, kind, budget } = preparation;
     const { database } = this.options;
     const [steps, events, slug] = await budget.run(() =>
       Promise.all([
@@ -403,13 +462,7 @@ export class MessageWriter {
         database.findOrganizationSlugById(run.organizationId),
       ]),
     );
-    if (
-      kind === "create" &&
-      run.status === "running" &&
-      !steps.some((step) => step.startedAt !== null) &&
-      !events.some((event) => event.kind === "run_started")
-    )
-      return this.release(lease);
+    if (shouldWaitForStart(preparation, steps, events)) return this.release(lease);
     const ref = parseStoredRef(kind === "create" ? provider.destination(run) : lease.externalRef);
     if (ref === undefined) {
       return this.stopMessage(
@@ -445,7 +498,9 @@ export class MessageWriter {
       });
       events.push(...page);
       if (page.length < limit) break;
-      afterSeq = page.at(-1)!.seq;
+      const last = page.at(-1);
+      if (last === undefined) throw new Error("Full timeline page has no last event");
+      afterSeq = last.seq;
     }
     return events;
   }
@@ -454,7 +509,7 @@ export class MessageWriter {
     operation: Operation,
     provider: ProgressProvider,
   ): Promise<WriteResult> {
-    const { lease, run, ref, body, budget, kind } = operation;
+    const { lease, ref, budget } = operation;
     const { backoff, clock, database } = this.options;
     const locator = ref.credential;
     const shared = await budget.run(() =>
@@ -463,47 +518,44 @@ export class MessageWriter {
     const admission = backoff.admit(locator, clock.now(), shared);
     if ("waitUntil" in admission) return this.release(lease, {}, admission.waitUntil);
     if ("rejected" in admission) return this.credentialRejected(lease);
+    return this.authorizeInSlot(operation, provider, admission);
+  }
+
+  private async authorizeInSlot(
+    operation: Operation,
+    provider: ProgressProvider,
+    admission: { release: () => void },
+  ): Promise<WriteResult> {
+    const { lease, ref, body, budget } = operation;
+    const locator = ref.credential;
     try {
       let authorization: Awaited<ReturnType<ProgressProvider["authorize"]>>;
       let secrets: readonly string[] = [];
       try {
-        let visibility: Pick<Patch, "visibility" | "visibilityCheckedAt"> | undefined;
+        let visibility: VisibilityPatch | undefined;
+        const recordVisibility = (result: VisibilityPatch) => {
+          visibility = result;
+        };
         authorization = await budget.run(
-          (signal) =>
-            provider instanceof GitHubProgressProvider
-              ? provider.authorize(locator, run, signal, {
-                  ref,
-                  kind: kind === "create" ? "create" : "edit",
-                  visibility: {
-                    visibility: lease.visibility,
-                    visibilityCheckedAt: lease.visibilityCheckedAt,
-                    now: clock.now(),
-                    expectedRepositoryId:
-                      typeof ref["repositoryId"] === "number" ? ref["repositoryId"] : undefined,
-                    force: run.status !== "running",
-                    record: (result) => {
-                      visibility = result;
-                    },
-                  },
-                })
-              : provider.authorize(locator, run, signal),
+          (signal) => this.authorize(operation, provider, signal, recordVisibility),
           PROVIDER_MS,
         );
         const visibilityPatch = visibility;
-        if (visibilityPatch !== undefined) {
-          const updated = await budget.run(() => this.update(lease, visibilityPatch, false));
-          if (updated === undefined) return {};
-        }
+        if (
+          visibilityPatch !== undefined &&
+          (await budget.run(() => this.update(lease, visibilityPatch, false))) === undefined
+        )
+          return {};
         if (authorization === "ok")
           secrets = await budget.run((signal) => provider.secrets(locator, signal), PROVIDER_MS);
       } catch {
         if (this.options.signal.aborted) return {};
         const retryAt = await this.recordBackoff(operation, "transient");
-        return this.transientFailure(operation, retryAt, false, false);
+        return await this.transientFailure(operation, retryAt, false, false);
       }
       if (authorization !== "ok") {
         if ("refused" in authorization)
-          return this.stopMessage(
+          return await this.stopMessage(
             lease,
             "refused",
             failureCode(authorization.refused, "policy_refused"),
@@ -513,20 +565,44 @@ export class MessageWriter {
             status: "unavailable",
             code: "credential_rejected",
           });
-          return this.credentialRejected(lease);
+          return await this.credentialRejected(lease);
         }
-        return this.stopMessage(
+        return await this.stopMessage(
           lease,
           "unavailable",
           failureCode(authorization.unavailable, "authorization_unavailable"),
         );
       }
       if (secrets.some((secret) => secret !== "" && body.includes(secret)))
-        return this.stopMessage(lease, "refused", "body_contains_secret");
+        return await this.stopMessage(lease, "refused", "body_contains_secret");
       return await this.send(operation, provider, secrets);
     } finally {
       admission.release();
     }
+  }
+
+  private authorize(
+    { lease, run, ref, kind }: Operation,
+    provider: ProgressProvider,
+    signal: AbortSignal,
+    record: (result: VisibilityPatch) => void,
+  ): ReturnType<ProgressProvider["authorize"]> {
+    const locator = ref.credential;
+    if (!(provider instanceof GitHubProgressProvider))
+      return provider.authorize(locator, run, signal);
+    return provider.authorize(locator, run, signal, {
+      ref,
+      kind: kind === "create" ? "create" : "edit",
+      visibility: {
+        visibility: lease.visibility,
+        visibilityCheckedAt: lease.visibilityCheckedAt,
+        now: this.options.clock.now(),
+        expectedRepositoryId:
+          typeof ref["repositoryId"] === "number" ? ref["repositoryId"] : undefined,
+        force: run.status !== "running",
+        record,
+      },
+    });
   }
 
   private async send(
@@ -536,15 +612,9 @@ export class MessageWriter {
   ): Promise<WriteResult> {
     const { lease, kind, budget } = operation;
     const { clock, database } = this.options;
-    const createReference =
-      kind === "create" && provider instanceof GitHubProgressProvider
-        ? provider.createReservation(operation.ref.credential)
-        : undefined;
-    if (createReference !== undefined) {
-      const serialized = JSON.stringify(createReference);
-      if (secrets.some((secret) => secret !== "" && serialized.includes(secret)))
-        return this.stopMessage(lease, "refused", "body_contains_secret");
-    }
+    const createReference = createReservation(operation, provider);
+    if (reservationContainsSecret(createReference, secrets))
+      return this.stopMessage(lease, "refused", "body_contains_secret");
     const admission = await budget.run(() =>
       database.admitProgressWrite({
         triggerRunId: lease.triggerRunId,
@@ -563,17 +633,12 @@ export class MessageWriter {
     if (admission.status === "rejected") return this.credentialRejected(lease);
 
     const expected = kind === "create" ? "creating" : lease.state;
-    const current = await budget.run(() =>
+    const row = await budget.run(() =>
       database.findRunProgressMessage(lease.organizationId, lease.triggerRunId),
     );
     budget.check();
-    if (
-      current?.leaseOwner !== this.owner ||
-      current.version !== lease.version ||
-      current.state !== expected ||
-      (current.leaseExpiresAt?.getTime() ?? 0) <= clock.now()
-    )
-      return {};
+    const current = this.ownedLease(row, lease, expected, clock);
+    if (current === undefined) return {};
     const observedGen = current.compensationRequestedGen;
     let outcome: MutationOutcome;
     try {
@@ -585,12 +650,28 @@ export class MessageWriter {
       outcome = error instanceof OperationDeadline ? "timeout" : "transient";
     }
     try {
-      return await this.record(operation, current, observedGen, outcome, secrets);
+      return await this.record(operation, { current, observedGen, outcome, secrets });
     } catch {
       // Preserve the lease for recovery when the outcome and repair signal are both uncertain.
       this.options.report("outcome_record_failed", lease);
       return { row: lease, wakeAt: clock.now() + LEASE_RETRY_MS };
     }
+  }
+
+  private ownedLease(
+    current: RunProgressMessage | undefined,
+    lease: RunProgressMessage,
+    expected: RunProgressMessage["state"],
+    clock: ProgressClock,
+  ): RunProgressMessage | undefined {
+    if (
+      current?.leaseOwner !== this.owner ||
+      current.version !== lease.version ||
+      current.state !== expected ||
+      (current.leaseExpiresAt?.getTime() ?? 0) <= clock.now()
+    )
+      return undefined;
+    return current;
   }
 
   private invokeMutation(
@@ -631,13 +712,12 @@ export class MessageWriter {
   }
 
   private regularDue(row: RunProgressMessage, run: AcceptedTriggerRunRecord): number {
-    return regularEditAt(
-      row,
-      this.options.clock.now(),
-      run.createdAt.getTime(),
-      this.options.settings.minEditSeconds,
-      this.recentRegularStarts.get(row.triggerRunId),
-    );
+    return regularEditAt(row, {
+      now: this.options.clock.now(),
+      ageFrom: run.createdAt.getTime(),
+      seconds: this.options.settings.minEditSeconds,
+      localSendStart: this.recentRegularStarts.get(row.triggerRunId),
+    });
   }
 
   private pruneRegularStarts(now: number): void {
@@ -658,14 +738,10 @@ export class MessageWriter {
 
   private async record(
     operation: Operation,
-    current: RunProgressMessage,
-    observedGen: number,
-    outcome: MutationOutcome,
-    secrets: readonly string[],
+    { current, observedGen, outcome, secrets }: MutationRecord,
   ): Promise<WriteResult> {
-    const { lease, kind } = operation;
-    const { database, clock } = this.options;
-    const now = clock.now();
+    const { kind } = operation;
+    const now = this.options.clock.now();
     await this.requestUncertainRepair(operation, current, outcome);
     if (this.options.signal.aborted) return {};
     if (outcome === "timeout" && kind === "regular") {
@@ -675,19 +751,38 @@ export class MessageWriter {
       operation,
       typeof outcome === "string" ? "transient" : outcome,
     );
-    if (typeof outcome === "string" || outcome.status === "retry") {
-      const safeCreate = typeof outcome !== "string" && outcome.notCreated && !outcome.transient;
-      if (kind === "create" && !safeCreate)
-        return this.afterSend(lease, {
-          state: "abandoned",
-          failure: "create_unknown",
-          externalRef: null,
-        });
-      return this.transientFailure(operation, retryAt, false, true);
-    }
+    if (typeof outcome === "string" || outcome.status === "retry")
+      return this.recordRetry(operation, outcome, retryAt);
     if (outcome.status !== "ok") return this.recordRefusal(operation, outcome);
     if (kind === "create") return this.recordCreated(operation, now, outcome.ref, secrets);
     if (kind === "final") return this.finish(operation, now);
+    return this.recordEdit(operation, now, current, observedGen);
+  }
+
+  private recordRetry(
+    operation: Operation,
+    outcome: RetryOutcome,
+    retryAt: number,
+  ): Promise<WriteResult> {
+    const { kind, lease } = operation;
+    const safeCreate = typeof outcome !== "string" && outcome.notCreated && !outcome.transient;
+    if (kind === "create" && !safeCreate)
+      return this.afterSend(lease, {
+        state: "abandoned",
+        failure: "create_unknown",
+        externalRef: null,
+      });
+    return this.transientFailure(operation, retryAt, false, true);
+  }
+
+  private async recordEdit(
+    operation: Operation,
+    now: number,
+    current: RunProgressMessage,
+    observedGen: number,
+  ): Promise<WriteResult> {
+    const { kind, lease } = operation;
+    const { database } = this.options;
     const result = await this.afterSend(lease, {
       ...this.successPatch(operation, now),
       ...(kind === "repair" && current.settleAt !== null && current.settleAt.getTime() <= now

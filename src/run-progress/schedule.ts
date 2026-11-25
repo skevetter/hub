@@ -1,3 +1,4 @@
+import type { AcceptedTriggerRunRecord } from "../db/types.js";
 import type { RunTimelineBus } from "../run-timeline/bus.js";
 import type { RunProgressMessage } from "../run-timeline/store.js";
 import type { RunProgressSettings } from "./settings.js";
@@ -8,6 +9,7 @@ import {
   canEditRegularly,
   regularEditAt,
   repairAt,
+  type WriteResult,
 } from "./writer.js";
 
 interface Entry {
@@ -83,24 +85,37 @@ export class MessageSchedule {
           entry.scope.triggerRunId,
         );
         if (run?.outcome !== "accepted" || !this.isCurrent(entry)) return;
-        const now = clock.now();
-        if (
-          entry.row.state === "active" &&
-          run.status === "running" &&
-          !canEditRegularly(entry.row, settings.maxEdits)
-        )
-          continue;
-        const due =
-          entry.row.state === "active" && run.status === "running"
-            ? regularEditAt(entry.row, now, run.createdAt.getTime(), settings.minEditSeconds)
-            : Math.max(now, entry.row.retryAt?.getTime() ?? 0);
-        this.wake(entry, due);
+        this.wakeObservedRun(entry, run, clock, settings);
       }
     } catch {
       this.options.report("observation_failed", entry.scope);
     } finally {
       entry.reading = false;
     }
+  }
+
+  private wakeObservedRun(
+    entry: Entry,
+    run: AcceptedTriggerRunRecord,
+    clock: ProgressClock,
+    settings: ScheduleOptions["settings"],
+  ): void {
+    const now = clock.now();
+    if (
+      entry.row.state === "active" &&
+      run.status === "running" &&
+      !canEditRegularly(entry.row, settings.maxEdits)
+    )
+      return;
+    const due =
+      entry.row.state === "active" && run.status === "running"
+        ? regularEditAt(entry.row, {
+            now,
+            ageFrom: run.createdAt.getTime(),
+            seconds: settings.minEditSeconds,
+          })
+        : Math.max(now, entry.row.retryAt?.getTime() ?? 0);
+    this.wake(entry, due);
   }
 
   private wake(entry: Entry, when: number): void {
@@ -128,31 +143,38 @@ export class MessageSchedule {
     try {
       const provider = this.options.providerFor(entry.row.provider);
       if (provider === undefined) return;
-      const { row, wakeAt, regularPace } = await this.options.writer.write(entry.scope, provider);
-      if (!this.isCurrent(entry)) return;
-      if (row === undefined) {
-        this.remove(entry);
-        return;
-      }
-      entry.row = row;
-      const due = repairAt(row);
-      if (row.state !== "active" && row.state !== "pending") {
-        if (due === undefined && wakeAt === undefined) {
-          this.remove(entry);
-          return;
-        }
-      }
-      if (wakeAt !== undefined) {
-        entry.wakeAt = regularPace ? Math.min(entry.wakeAt, wakeAt) : wakeAt;
-      } else if (due !== undefined) {
-        this.wake(entry, due);
-      }
+      const result = await this.options.writer.write(entry.scope, provider);
+      this.applyWriteResult(entry, result);
     } catch {
       this.options.report("writer_failed", entry.scope);
       this.wake(entry, this.options.clock.now() + 5_000);
     } finally {
       entry.running = false;
       if (this.isCurrent(entry)) this.arm(entry);
+    }
+  }
+
+  private applyWriteResult(entry: Entry, { row, wakeAt, regularPace }: WriteResult): void {
+    if (!this.isCurrent(entry)) return;
+    if (row === undefined) {
+      this.remove(entry);
+      return;
+    }
+    entry.row = row;
+    const due = repairAt(row);
+    if (
+      row.state !== "active" &&
+      row.state !== "pending" &&
+      due === undefined &&
+      wakeAt === undefined
+    ) {
+      this.remove(entry);
+      return;
+    }
+    if (wakeAt !== undefined) {
+      entry.wakeAt = regularPace ? Math.min(entry.wakeAt, wakeAt) : wakeAt;
+    } else if (due !== undefined) {
+      this.wake(entry, due);
     }
   }
 
