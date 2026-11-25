@@ -401,6 +401,7 @@ describe("Home triggers", () => {
     assert.doesNotMatch(markup, /aria-label="Recent runs"/u);
     assert.equal(markup.match(/<a href="\/o\/acme\/activity">Recent runs<\/a>/gu)?.length, 1);
     const list = markup.indexOf('aria-label="Trigger health"');
+    assert.ok(list > -1);
     assert.ok(markup.indexOf(">Recent runs<") > list);
   });
 
