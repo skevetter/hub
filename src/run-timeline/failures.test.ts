@@ -81,6 +81,12 @@ function productionSources(directory: string): string[] {
   });
 }
 
+function namedConstruction(node: ts.Node, name: string): ts.NewExpression | undefined {
+  if (ts.isNewExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name)
+    return node;
+  return undefined;
+}
+
 function reasonInputs(node: ts.Node): readonly ts.Node[] {
   if (ts.isConditionalExpression(node)) return [node.whenTrue, node.whenFalse];
   if (ts.isBinaryExpression(node)) return [node.left, node.right];
@@ -91,13 +97,47 @@ function reasonInputs(node: ts.Node): readonly ts.Node[] {
   )
     return [node.expression];
   if (ts.isArrayLiteralExpression(node)) return node.elements;
-  if (
-    ts.isNewExpression(node) &&
-    ts.isIdentifier(node.expression) &&
-    node.expression.text === "Set"
-  )
-    return node.arguments ?? [];
-  return [];
+  return namedConstruction(node, "Set")?.arguments ?? [];
+}
+
+function createReasonCollector(checker: ts.TypeChecker, reasons: Set<string>) {
+  function collectIdentifier(node: ts.Identifier, seen: Set<ts.Node>): void {
+    const symbol = checker.getSymbolAtLocation(node);
+    for (const declaration of symbol?.declarations ?? []) {
+      if (ts.isVariableDeclaration(declaration) && declaration.initializer !== undefined)
+        collect(declaration.initializer, seen);
+    }
+  }
+
+  function collectTemplate(node: ts.TemplateExpression): void {
+    expect(
+      node.getText(),
+      "New dynamic failure templates need an explicit vocabulary decision",
+    ).toBe("`workflow_step_${status}`");
+    reasons.add("workflow_step_failed");
+    reasons.add("workflow_step_timed_out");
+  }
+
+  function collect(node: ts.Node, seen = new Set<ts.Node>()): void {
+    if (seen.has(node)) return;
+    seen.add(node);
+    if (ts.isStringLiteralLike(node)) {
+      reasons.add(node.text);
+    } else if (ts.isIdentifier(node)) {
+      collectIdentifier(node, seen);
+    } else if (ts.isTemplateExpression(node)) {
+      collectTemplate(node);
+    } else {
+      for (const input of reasonInputs(node)) collect(input, seen);
+    }
+  }
+  return collect;
+}
+
+function reasonArgumentIndex(method: string): number | undefined {
+  if (method === "failWorkflowRun") return 2;
+  if (method === "failAgentExecution") return 1;
+  return undefined;
 }
 
 function enumerateReasonLiterals(): { reasons: Set<string>; sinks: number; constants: number } {
@@ -107,52 +147,23 @@ function enumerateReasonLiterals(): { reasons: Set<string>; sinks: number; const
     noResolve: true,
     target: ts.ScriptTarget.ESNext,
   });
-  const checker = program.getTypeChecker();
   const reasons = new Set<string>();
+  const collect = createReasonCollector(program.getTypeChecker(), reasons);
   let sinks = 0;
   let constants = 0;
-  const collect = (node: ts.Node, seen = new Set<ts.Node>()): void => {
-    if (seen.has(node)) return;
-    seen.add(node);
-    if (ts.isStringLiteralLike(node)) {
-      reasons.add(node.text);
-    } else if (ts.isIdentifier(node)) {
-      const symbol = checker.getSymbolAtLocation(node);
-      for (const declaration of symbol?.declarations ?? []) {
-        if (ts.isVariableDeclaration(declaration) && declaration.initializer !== undefined)
-          collect(declaration.initializer, seen);
-      }
-    } else if (ts.isTemplateExpression(node)) {
-      const template = node.getText();
-      expect(template, "New dynamic failure templates need an explicit vocabulary decision").toBe(
-        "`workflow_step_${status}`",
-      );
-      reasons.add("workflow_step_failed");
-      reasons.add("workflow_step_timed_out");
-    } else {
-      for (const input of reasonInputs(node)) collect(input, seen);
-    }
-  };
   function collectSink(node: ts.Node): void {
-    if (
-      ts.isNewExpression(node) &&
-      ts.isIdentifier(node.expression) &&
-      node.expression.text === "DaemonDispatchFailure"
-    ) {
+    const construction = namedConstruction(node, "DaemonDispatchFailure");
+    if (construction !== undefined) {
       sinks += 1;
-      if (node.arguments?.[0] !== undefined) collect(node.arguments[0]);
+      const reason = construction.arguments?.[0];
+      if (reason !== undefined) collect(reason);
     }
-    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
-      const method = node.expression.name.text;
-      if (method === "failWorkflowRun") {
-        sinks += 1;
-        if (node.arguments[2] !== undefined) collect(node.arguments[2]);
-      }
-      if (method === "failAgentExecution") {
-        sinks += 1;
-        if (node.arguments[1] !== undefined) collect(node.arguments[1]);
-      }
-    }
+    if (!ts.isCallExpression(node) || !ts.isPropertyAccessExpression(node.expression)) return;
+    const index = reasonArgumentIndex(node.expression.name.text);
+    if (index === undefined) return;
+    sinks += 1;
+    const reason = node.arguments[index];
+    if (reason !== undefined) collect(reason);
   }
   for (const file of files) {
     const source = program.getSourceFile(file);
@@ -299,6 +310,7 @@ describe("closed failure vocabulary", () => {
     expect(constants).toBeGreaterThanOrEqual(3);
     expect(reasons.has("completion_auth_not_configured")).toBe(true);
     expect(reasons.has("trigger_context_materializer_unavailable")).toBe(true);
+    expect(reasons.has("trigger_context_unavailable")).toBe(true);
     expect(reasons.has("script interrupted: Hub restarted while it was running")).toBe(true);
     for (const reason of reasons) {
       expect(
