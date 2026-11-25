@@ -51,11 +51,11 @@ describe("organization checklist completion", () => {
     assert.equal(deriveChecklist(ready).complete, true);
     assert.equal(ready.checklistCompletedAt, null);
 
-    const runTotals = vi.spyOn(fixture.database, "countOrganizationRunsSince");
+    const runSummaries = vi.spyOn(fixture.database, "summarizeTriggerRuns");
     const completedAt = await fixture.dashboard.completeChecklist(fixture.post(), fixture.slug);
-    const aggregateReads = runTotals.mock.calls.length;
-    runTotals.mockRestore();
-    assert.equal(aggregateReads, 0, "finishing setup does not need the dashboard run totals");
+    const aggregateReads = runSummaries.mock.calls.length;
+    runSummaries.mockRestore();
+    assert.equal(aggregateReads, 0, "finishing setup does not need the per-trigger run summaries");
     assert.equal((await fixture.snapshot()).checklistCompletedAt, completedAt);
 
     await fixture.runtime.query("delete from slack_connections where organization_id = $1", [

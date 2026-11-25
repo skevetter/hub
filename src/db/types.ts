@@ -128,9 +128,15 @@ export interface OrganizationRunRecord {
   agent: { provider: string; model: string | null } | null;
 }
 
-export interface OrganizationRunCount {
-  status: TriggerRunRecord["status"];
-  count: number;
+/** What one trigger's runs look like to an overview: the window's tally and its newest run ever. */
+export interface TriggerRunSummary {
+  triggerId: string;
+  /** Runs created at or after the window start. */
+  total: number;
+  /** Of those, the ones that failed, timed out or were rejected. */
+  failed: number;
+  /** The newest run whatever the window, so a trigger that went quiet still shows how it ended. */
+  latest: { id: string; status: TriggerRunRecord["status"]; createdAt: Date } | null;
 }
 
 export interface FailedRunSummary {
@@ -1963,8 +1969,8 @@ export interface Database
     since: Date,
     limit: number,
   ): Promise<OrganizationRunRecord[]>;
-  /** How many runs the organization's triggers started at or after `since`, by status. */
-  countOrganizationRunsSince(organizationId: string, since: Date): Promise<OrganizationRunCount[]>;
+  /** One entry per trigger of the organization, including triggers that never ran. */
+  summarizeTriggerRuns(organizationId: string, since: Date): Promise<TriggerRunSummary[]>;
   listTriggerMatchActivity(
     organizationId: string,
     window: TriggerMatchWindow,

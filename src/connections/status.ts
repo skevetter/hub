@@ -3,7 +3,7 @@ import type { ConnectionProvider, ConnectionStatus } from "./functions.js";
 
 export type ProviderConnectionStatus = ConnectionStatus[ConnectionProvider];
 
-const PROVIDER_NAMES = {
+export const PROVIDER_NAMES = {
   github: "GitHub",
   discord: "Discord",
   slack: "Slack",

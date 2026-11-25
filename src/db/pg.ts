@@ -6,6 +6,7 @@ import {
   readFailedRunsSeenThrough,
 } from "../attention/queries.js";
 import { listTriggerMatchActivity } from "../attention/trigger-matches.js";
+import { summarizeTriggerRuns } from "../home/queries.js";
 import { FAILED_RUN_FILTER, FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { SurfaceRepository } from "../surfaces/postgres-store.js";
 import {
@@ -118,7 +119,6 @@ import type {
   TransitionAgentExecutionResult,
   ProviderEventReceiptRecord,
   ProviderEventReplayMetadata,
-  OrganizationRunCount,
   OrganizationRunRecord,
   DroppedEventPageRequest,
   EnrollDaemonInput,
@@ -4541,20 +4541,8 @@ class PgDatabase implements Database {
     }));
   }
 
-  async countOrganizationRunsSince(
-    organizationId: string,
-    since: Date,
-  ): Promise<OrganizationRunCount[]> {
-    const rows = await query<{ status: OrganizationRunCount["status"]; count: number }>(
-      this.pool,
-      `select status, count(*)::int as count
-       from trigger_runs
-       where organization_id = $1 and created_at >= $2
-       group by status`,
-      [organizationId, since],
-    );
-    return rows.rows.map(({ status, count }) => ({ status, count }));
-  }
+  summarizeTriggerRuns: Database["summarizeTriggerRuns"] = (...args) =>
+    summarizeTriggerRuns(this.pool, ...args);
 
   listTriggerMatchActivity: Database["listTriggerMatchActivity"] = (...args) =>
     listTriggerMatchActivity(this.pool, ...args);

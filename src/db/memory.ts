@@ -190,8 +190,8 @@ import type {
   GitHubRepositoryRecord,
   GitHubRepositorySnapshot,
   OrganizationConnectionUsage,
-  OrganizationRunCount,
   OrganizationRunRecord,
+  TriggerRunSummary,
   DroppedEventPageRequest,
   DroppedEventPresence,
   ProjectTriggerRoute,
@@ -6892,15 +6892,31 @@ class MemoryDatabase implements Database {
     }
   }
 
-  async countOrganizationRunsSince(
-    organizationId: string,
-    since: Date,
-  ): Promise<OrganizationRunCount[]> {
-    const counts = new Map<OrganizationRunCount["status"], number>();
-    for (const run of this.organizationRunsSince(organizationId, since)) {
-      counts.set(run.status, (counts.get(run.status) ?? 0) + 1);
+  async summarizeTriggerRuns(organizationId: string, since: Date): Promise<TriggerRunSummary[]> {
+    const byProject = new Map<string, TriggerRunSummary[]>();
+    const summaries: TriggerRunSummary[] = [];
+    for (const trigger of this.organizationTriggers.values()) {
+      if (trigger.organizationId !== organizationId) continue;
+      const summary: TriggerRunSummary = {
+        triggerId: trigger.id,
+        total: 0,
+        failed: 0,
+        latest: null,
+      };
+      summaries.push(summary);
+      byProject.set(trigger.runtimeProjectId, [
+        ...(byProject.get(trigger.runtimeProjectId) ?? []),
+        summary,
+      ]);
     }
-    return [...counts].map(([status, count]) => ({ status, count }));
+    const order = this.organizationRunOrder.get(organizationId) ?? [];
+    for (let index = order.length - 1; index >= 0; index -= 1) {
+      const run = this.triggerRuns.get(order[index]!.id);
+      if (run === undefined) continue;
+      for (const summary of byProject.get(run.projectId) ?? [])
+        tallyTriggerRun(summary, run, since);
+    }
+    return summaries;
   }
 
   readFailedRunsSeenThrough: Database["readFailedRunsSeenThrough"] = async (
@@ -7955,6 +7971,14 @@ function workflowStepReservationDenied(
 
 function isCompletedWorkflowStep(step: WorkflowStepRunRecord) {
   return step.status === "succeeded" || step.status === "failed" || step.status === "timed_out";
+}
+
+/** Newest first: the first run seen is the latest, and only runs inside the window are tallied. */
+function tallyTriggerRun(summary: TriggerRunSummary, run: TriggerRunRecord, since: Date) {
+  summary.latest ??= { id: run.id, status: run.status, createdAt: run.createdAt };
+  if (run.createdAt < since) return;
+  summary.total += 1;
+  if (FAILED_RUN_STATUSES.has(run.status)) summary.failed += 1;
 }
 
 function isUnfinishedWorkflowStep(step: WorkflowStepRunRecord) {

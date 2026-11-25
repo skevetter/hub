@@ -35,7 +35,8 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await home.expectStep("Create a trigger", "To do");
     await home.expectStep("Record a run", "To do");
     await expect(attentionEntry(page, 0)).toBeVisible();
-    await home.expectRuns(0, "0 succeeded · 0 failed");
+    await home.expectFigure("triggers failing", 0);
+    await home.expectFigure("triggers on", 0);
     await home.capture(`${SHOTS}/01-fresh.png`);
   });
 
@@ -112,8 +113,10 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await home.open();
     await expect(home.allSet()).toBeVisible();
     await expect(home.finishSetup()).toHaveCount(0);
-    await home.expectRuns(1, "0 succeeded · 0 failed");
-    await home.expectRecentRun("deploy", "Running");
+    await home.expectFigure("triggers failing", 0);
+    await home.expectFigure("trigger on", 1);
+    await home.expectTrigger("deploy", "Running");
+    await expect(page.getByRole("list", { name: "Recent runs" })).toHaveCount(0);
 
     await hub.grantOperator("owner");
     await home.expectOpen();
@@ -124,7 +127,7 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await home.expectChecklistHidden();
     await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeFocused();
     await home.reload();
-    await home.expectRecentRun("deploy", "Running");
+    await home.expectTrigger("deploy", "Running");
     await home.expectChecklistHidden();
   });
 });

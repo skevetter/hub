@@ -13,6 +13,7 @@ it("gives trailing section links a 24 px minimum height at every width", () => {
     </Section>,
   );
   assert.match(markup, /class="[^"]*\[&amp;&gt;a\]:min-h-6[^"]*"[^>]*><a href="\/activity"/u);
+  assert.match(markup, /max-md:\[&amp;&gt;a\]:min-h-11/u);
 });
 
 it("names a titled section using its heading", () => {
