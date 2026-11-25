@@ -15,7 +15,7 @@ import type {
 } from "../db/types.js";
 import { enrollTestDaemon } from "../test-utils/project-configuration.js";
 import { compileTriggerDocument } from "../triggers/configuration/index.js";
-import { PROVIDERS, RECENT_PROVIDER_EVENTS_SQL, TRIGGER_MATCHES_SQL } from "./trigger-matches.js";
+import { PROVIDERS, TRIGGER_MATCHES_SQL } from "./trigger-matches.js";
 import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { FAILED_RUNS_SQL, MARK_FAILED_RUNS_SEEN_SQL, WAITING_SESSIONS_SQL } from "./queries.js";
 
@@ -208,6 +208,26 @@ describe("failed runs by the time they ended", () => {
     expect((await database.countFailedRunsSince(org, since, null)).count).toBe(1);
     expect((await database.countFailedRunsSince(org, since, mark)).count).toBe(0);
   });
+
+  it("reads the marker and the count together", async () => {
+    const { database } = pg;
+    await seedRun({ name: "Before", status: "failed", received: 5, ended: 10 });
+    expect(await database.countUnseenFailedRuns("reader", org, since)).toEqual(
+      await database.countFailedRunsSince(org, since, null),
+    );
+    await database.markFailedRunsSeen("reader", org, since);
+    await seedRun({ name: "After", status: "failed", received: 6, ended: 20 });
+    const mark = await database.readFailedRunsSeenThrough("reader", org);
+    expect(await database.countUnseenFailedRuns("reader", org, since)).toEqual(
+      await database.countFailedRunsSince(org, since, mark),
+    );
+    expect(await database.countUnseenFailedRuns("reader", org, since)).toMatchObject({
+      count: 1,
+      newest: { triggerName: "After" },
+    });
+    expect((await database.countUnseenFailedRuns("owner", org, since)).count).toBe(2);
+    expect((await database.countUnseenFailedRuns("reader", otherOrg, since)).count).toBe(0);
+  });
 });
 
 describe("the in-memory marker", () => {
@@ -281,6 +301,9 @@ describe("the in-memory marker", () => {
   });
 });
 
+let sessionsSeeded: Promise<void> | undefined;
+const ensureSessions = () => (sessionsSeeded ??= seedSessions());
+
 async function seedSessions() {
   const { database, runtime } = pg;
   await enrollTestDaemon(database, org);
@@ -343,7 +366,7 @@ async function seedSessions() {
 }
 
 it("orders and counts only waiting sessions the current membership may view", async () => {
-  await seedSessions();
+  await ensureSessions();
   expect(await pg.database.hasActiveSessionProfile(org)).toBe(true);
   expect(await pg.database.hasActiveSessionProfile(otherOrg)).toBe(false);
   const read = (userId: string, limit = 3, organizationId = org) =>
@@ -360,6 +383,43 @@ it("orders and counts only waiting sessions the current membership may view", as
   expect(await read("owner", 1)).toEqual({ count: 3, sessions: [{ name: "Owner's Linear" }] });
   expect(await read("outsider")).toEqual({ count: 0, sessions: [] });
   expect(await read("owner", 3, otherOrg)).toEqual({ count: 0, sessions: [] });
+});
+
+it("reads the profile flag with the waiting sessions the viewer may see", async () => {
+  await ensureSessions();
+  const { database } = pg;
+  for (const [userId, limit, organizationId] of [
+    ["reader", 1, org],
+    ["admin", 1, org],
+    ["owner", 1, org],
+    ["owner", 3, org],
+    ["owner", 0, org],
+    ["owner", -1, org],
+    ["outsider", 1, org],
+    ["owner", 1, otherOrg],
+  ] as const) {
+    const viewer = { organizationId, userId, role: "owner" } as const;
+    expect(await database.readSessionAttention(viewer, limit)).toEqual({
+      hasActiveProfile: await database.hasActiveSessionProfile(organizationId),
+      waiting: await database.listSessionsWaitingForPermission(organizationId, viewer, limit),
+    });
+  }
+  expect(
+    (
+      await database.readSessionAttention(
+        { organizationId: org, userId: "owner", role: "owner" },
+        1,
+      )
+    ).hasActiveProfile,
+  ).toBe(true);
+  expect(
+    (
+      await database.readSessionAttention(
+        { organizationId: otherOrg, userId: "owner", role: "owner" },
+        1,
+      )
+    ).hasActiveProfile,
+  ).toBe(false);
 });
 
 it("uses indexed receipt and run lookups for a selective attention window", async () => {
@@ -774,25 +834,16 @@ it("uses indexed receipt and run lookups for the stop rule", async () => {
     providers: [{ provider: "github_notification", recentEvents: 32 }],
   });
   const { previousStart, recentStart, now } = window;
-  const plans = await Promise.all([
-    runtime.query(`explain (analyze, buffers) ${TRIGGER_MATCHES_SQL}`, [
-      org,
-      previousStart,
-      recentStart,
-      now,
-      PROVIDERS,
-    ]),
-    runtime.query(`explain (analyze, buffers) ${RECENT_PROVIDER_EVENTS_SQL}`, [
-      org,
-      recentStart,
-      now,
-      PROVIDERS,
-    ]),
+  const { rows } = await runtime.query(`explain (analyze, buffers) ${TRIGGER_MATCHES_SQL}`, [
+    org,
+    previousStart,
+    recentStart,
+    now,
+    PROVIDERS,
   ]);
-  const matchPlans = plans.map(({ rows }) => rows.map((row) => row["QUERY PLAN"]).join("\n"));
-  expect(matchPlans[0]).toContain("trigger_runs_receipt_project_configured_unique");
-  for (const plan of matchPlans) {
-    expect(plan).toContain("provider_event_receipts_organization_received_idx");
-  }
-  process.stdout.write(`${matchPlans.join("\n")}\n`);
+  const matchPlan = rows.map((row) => row["QUERY PLAN"]).join("\n");
+  expect(matchPlan).toContain("trigger_runs_receipt_project_configured_unique");
+  expect(matchPlan).toContain("provider_event_receipts_organization_received_idx");
+  expect(matchPlan).not.toMatch(/Seq Scan on provider_event_receipts/u);
+  process.stdout.write(`${matchPlan}\n`);
 });

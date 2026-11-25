@@ -1,11 +1,14 @@
 import {
   countFailedRunsSince,
+  countUnseenFailedRuns,
   hasActiveSessionProfile,
   listSessionsWaitingForPermission,
   markFailedRunsSeen,
   readFailedRunsSeenThrough,
+  readSessionAttention,
 } from "../attention/queries.js";
 import { listTriggerMatchActivity } from "../attention/trigger-matches.js";
+import { organizationConnectionUsage } from "./connection-usage.js";
 import { ACTIVE_TRIGGER_REVISIONS_SQL, summarizeTriggerRuns } from "../home/queries.js";
 import { FAILED_RUN_FILTER, FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { SurfaceRepository } from "../surfaces/postgres-store.js";
@@ -4272,144 +4275,8 @@ class PgDatabase implements Database {
     return completedAt;
   }
 
-  async organizationConnectionUsage(organizationId: string): Promise<OrganizationConnectionUsage> {
-    const github = await this.queryGitHubConnectionUsage(organizationId);
-    const [discord, slack, linear] = await Promise.all([
-      this.queryDiscordConnectionUsage(organizationId),
-      this.querySlackConnectionUsage(organizationId),
-      this.queryLinearConnectionUsage(organizationId),
-    ]);
-    return {
-      github: github.rows.map((row) => ({
-        id: row.id,
-        organizationId: row.organization_id,
-        slug: row.slug,
-        installationId: Number(row.installation_id),
-        accountId: row.account_id,
-        accountLogin: row.account_login,
-        accountType: row.account_type,
-        status: row.status,
-        providerApplicationId: row.provider_application_id,
-      })),
-      discord: discord.rows.map((row) => ({
-        id: row.id,
-        organizationId: row.organization_id,
-        slug: row.slug,
-        guildId: row.guild_id,
-        guildName: row.guild_name,
-        providerApplicationId: row.provider_application_id,
-      })),
-      slack: slack.rows.map((row) => ({
-        id: row.id,
-        organizationId: row.organization_id,
-        slug: row.slug,
-        teamId: row.team_id,
-        teamName: row.team_name,
-        botUserId: row.bot_user_id,
-        botAccessToken: row.bot_access_token,
-        scopes: stringArray(row.scopes),
-        providerApplicationId: row.provider_application_id,
-      })),
-      linear: linear.rows.map((row) => ({
-        id: row.id,
-        organizationId: row.organization_id,
-        slug: row.slug,
-        linearOrganizationId: row.linear_organization_id,
-        linearOrganizationName: row.linear_organization_name,
-        appUserId: row.app_user_id,
-        accessToken: row.access_token,
-        refreshToken: row.refresh_token,
-        accessTokenExpiresAt: row.access_token_expires_at,
-        scopes: stringArray(row.scopes),
-        providerApplicationId: row.provider_application_id,
-      })),
-    };
-  }
-
-  private queryGitHubConnectionUsage(organizationId: string) {
-    return query<{
-      id: string;
-      organization_id: string;
-      slug: string;
-      installation_id: number | string;
-      account_id: string;
-      account_login: string;
-      account_type: string;
-      status: "active" | "suspended";
-      provider_application_id: string | null;
-    }>(
-      this.pool,
-      `select connection.id, connection.organization_id, connection.slug,
-              connection.installation_id,
-              connection.account_id, connection.account_login, connection.account_type,
-              connection.status, connection.provider_application_id
-       from github_connections connection
-       where connection.organization_id = $1
-       order by connection.account_login, connection.id`,
-      [organizationId],
-    );
-  }
-
-  private queryDiscordConnectionUsage(organizationId: string) {
-    return query<{
-      id: string;
-      organization_id: string;
-      slug: string;
-      guild_id: string;
-      guild_name: string;
-      provider_application_id: string | null;
-    }>(
-      this.pool,
-      `select id, organization_id, slug, guild_id, guild_name, provider_application_id
-         from discord_connections where organization_id = $1
-         order by guild_name, id`,
-      [organizationId],
-    );
-  }
-
-  private querySlackConnectionUsage(organizationId: string) {
-    return query<{
-      id: string;
-      organization_id: string;
-      slug: string;
-      team_id: string;
-      team_name: string;
-      bot_user_id: string;
-      bot_access_token: string;
-      scopes: unknown;
-      provider_application_id: string | null;
-    }>(
-      this.pool,
-      `select id, organization_id, slug, team_id, team_name, bot_user_id, bot_access_token, scopes,
-                provider_application_id
-         from slack_connections where organization_id = $1
-         order by team_name, id`,
-      [organizationId],
-    );
-  }
-
-  private queryLinearConnectionUsage(organizationId: string) {
-    return query<{
-      id: string;
-      organization_id: string;
-      slug: string;
-      linear_organization_id: string;
-      linear_organization_name: string;
-      app_user_id: string;
-      access_token: string;
-      refresh_token: string | null;
-      access_token_expires_at: Date | null;
-      scopes: unknown;
-      provider_application_id: string | null;
-    }>(
-      this.pool,
-      `select id, organization_id, slug, linear_organization_id, linear_organization_name,
-                app_user_id, access_token, refresh_token, access_token_expires_at, scopes,
-                provider_application_id
-         from linear_connections where organization_id = $1
-         order by linear_organization_name, id`,
-      [organizationId],
-    );
+  organizationConnectionUsage(organizationId: string): Promise<OrganizationConnectionUsage> {
+    return organizationConnectionUsage(this.pool, organizationId);
   }
 
   async listGitHubRepositories(organizationId: string): Promise<GitHubRepositoryRecord[]> {
@@ -4565,6 +4432,12 @@ class PgDatabase implements Database {
 
   countFailedRunsSince: Database["countFailedRunsSince"] = (...args) =>
     countFailedRunsSince(this.pool, ...args);
+
+  countUnseenFailedRuns: Database["countUnseenFailedRuns"] = (...args) =>
+    countUnseenFailedRuns(this.pool, ...args);
+
+  readSessionAttention: Database["readSessionAttention"] = (...args) =>
+    readSessionAttention(this.pool, ...args);
 
   readFailedRunsSeenThrough: Database["readFailedRunsSeenThrough"] = (...args) =>
     readFailedRunsSeenThrough(this.pool, ...args);
@@ -4999,10 +4872,6 @@ async function query<T extends QueryRow = QueryRow>(
 function requireReturnedRow<T extends QueryRow>(row: T | undefined, description: string): T {
   if (row === undefined) throw new Error(`missing ${description}`);
   return row;
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
 }
 
 function isDaemonSlugConflict(error: unknown): boolean {

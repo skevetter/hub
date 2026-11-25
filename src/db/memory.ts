@@ -6927,6 +6927,22 @@ class MemoryDatabase implements Database {
     return summaries;
   }
 
+  countUnseenFailedRuns: Database["countUnseenFailedRuns"] = async (
+    accountId,
+    organizationId,
+    since,
+  ) =>
+    this.countFailedRunsSince(
+      organizationId,
+      since,
+      await this.readFailedRunsSeenThrough(accountId, organizationId),
+    );
+
+  readSessionAttention: Database["readSessionAttention"] = async (viewer, limit) => ({
+    hasActiveProfile: await this.hasActiveSessionProfile(viewer.organizationId),
+    waiting: await this.listSessionsWaitingForPermission(viewer.organizationId, viewer, limit),
+  });
+
   readFailedRunsSeenThrough: Database["readFailedRunsSeenThrough"] = async (
     accountId,
     organizationId,
