@@ -112,8 +112,11 @@ type TriggerTextField = Exclude<
 
 const TRIGGER_COLUMNS = [
   { header: "Status", lead: true },
-  { header: "Trigger", fill: true },
-  { header: "Event", fill: true, className: "hidden md:table-cell" },
+  // From 1280 px the Target column joins and the table has no spare width. Without a floor the
+  // shortfall is shared by every flexible column, so a long name or the longest event kind loses
+  // a pixel to the font's metrics. The floors make the Target column take the cut instead.
+  { header: "Trigger", fill: true, className: "xl:min-w-71" },
+  { header: "Event", fill: true, className: "hidden md:table-cell xl:min-w-67" },
   { header: "Target", fill: true, className: "hidden xl:table-cell" },
   { header: "Last triggered", className: "hidden xl:table-cell" },
 ] as const;
