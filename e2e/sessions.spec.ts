@@ -167,6 +167,33 @@ test("hides Sessions navigation and routes when the flag is off", async ({ hub, 
 test.describe("interactive sessions", () => {
   test.use({ interactiveSessions: true });
 
+  test("only the deepest destination is current: Profiles lights alone under Sessions", async ({
+    hub,
+    page,
+  }) => {
+    const app = await setup(hub);
+    const current = (scope: Locator) => scope.locator('a[aria-current="page"]');
+    const rail = page.getByRole("navigation", { name: "Organization", exact: true });
+    await page.setViewportSize({ width: 1280, height: 900 });
+
+    await page.goto(app.origin + app.base + "/sessions/profiles");
+    await expect(page.getByRole("heading", { name: "Profiles", level: 1 })).toBeVisible();
+    await expect(current(rail)).toHaveText(["Profiles"]);
+
+    await page.setViewportSize({ width: 390, height: 900 });
+    await page
+      .getByRole("navigation", { name: "Quick navigation" })
+      .getByRole("button", { name: "More" })
+      .click();
+    await expect(current(page.getByRole("dialog", { name: "More" }))).toHaveText(["Profiles"]);
+    await page.keyboard.press("Escape");
+
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto(app.origin + app.base + "/sessions");
+    await expect(page.getByRole("heading", { name: "Sessions", exact: true })).toBeVisible();
+    await expect(current(rail)).toHaveText(["Sessions"]);
+  });
+
   test("a profile loads providers for a new working directory", async ({ hub, page }) => {
     const app = await setup(hub);
     const daemon = await enroll(hub, owner.email);

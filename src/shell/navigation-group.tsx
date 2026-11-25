@@ -4,7 +4,7 @@ import type { LucideIcon } from "lucide-react";
 import { useCallback } from "react";
 
 import { cn } from "../lib/utils.js";
-import { usePresentedDestination } from "../navigation/index.js";
+import { useActiveDestination } from "../navigation/index.js";
 import {
   SidebarGroup,
   SidebarGroupContent,
@@ -37,24 +37,27 @@ export function NavigationGroup({
   administration?: readonly NavigationItem[];
   setup?: readonly NavigationItem[];
 }) {
+  const active = useActiveDestination([...items, ...(setup ?? []), ...(administration ?? [])]);
   return (
     <nav aria-label={label}>
       <SidebarGroup>
         <SidebarGroupContent>
           <SidebarMenu>
             {items.map((item) => (
-              <NavItem key={item.to} item={item} />
+              <NavItem key={item.to} item={item} active={item.to === active} />
             ))}
           </SidebarMenu>
         </SidebarGroupContent>
-        {setup === undefined || setup.length === 0 ? null : <SetupGroup items={setup} />}
+        {setup === undefined || setup.length === 0 ? null : (
+          <SetupGroup items={setup} active={active} />
+        )}
         {administration === undefined || administration.length === 0 ? null : (
           <>
             <SidebarSeparator className="my-2" />
             <SidebarGroupContent>
               <SidebarMenu>
                 {administration.map((item) => (
-                  <NavItem key={item.to} item={item} />
+                  <NavItem key={item.to} item={item} active={item.to === active} />
                 ))}
               </SidebarMenu>
             </SidebarGroupContent>
@@ -65,20 +68,30 @@ export function NavigationGroup({
   );
 }
 
-function SetupGroup({ items }: { items: readonly NavigationItem[] }) {
+function SetupGroup({
+  items,
+  active,
+}: {
+  items: readonly NavigationItem[];
+  active: string | undefined;
+}) {
   return (
     <>
       <SidebarGroupLabel className="text-rail-muted">Setup</SidebarGroupLabel>
       <SidebarGroupContent>
         <SidebarMenu>
           {items.map((item) => (
-            <NavItem key={item.to} item={item} />
+            <NavItem key={item.to} item={item} active={item.to === active} />
           ))}
         </SidebarMenu>
       </SidebarGroupContent>
     </>
   );
 }
+
+// The router marks every link whose path prefixes the page as current, which would light Sessions
+// beside Profiles. The deepest destination is chosen by `useActiveDestination` instead.
+const EXACT_PATH = { exact: true };
 
 /**
  * Navigation stays inside the running app. A plain anchor reloads the document, which
@@ -87,9 +100,16 @@ function SetupGroup({ items }: { items: readonly NavigationItem[] }) {
 export const PHONE_TAB_CLASS =
   "flex min-h-11 flex-col items-center justify-center gap-1 text-xs focus-visible:outline-sidebar-ring focus-visible:-outline-offset-2";
 
-export function NavItem({ item, phoneTab = false }: { item: NavigationItem; phoneTab?: boolean }) {
-  const { to, label, icon: Icon, subtree = false } = item;
-  const active = usePresentedDestination(to, subtree);
+export function NavItem({
+  item,
+  active,
+  phoneTab = false,
+}: {
+  item: NavigationItem;
+  active: boolean;
+  phoneTab?: boolean;
+}) {
+  const { to, label, icon: Icon } = item;
   const { isMobile, setOpenMobile } = useSidebar();
   // On compact the sidebar is an overlay covering the destination. A document load used
   // to dismiss it; client-side navigation has to dismiss it deliberately.
@@ -100,6 +120,7 @@ export function NavItem({ item, phoneTab = false }: { item: NavigationItem; phon
   const link = (
     <Link
       to={to as never}
+      activeOptions={EXACT_PATH}
       aria-current={active ? "page" : undefined}
       onClick={navigate}
       className={

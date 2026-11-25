@@ -1,4 +1,6 @@
-import { trimPathRight, useMatches } from "@tanstack/react-router";
+import { useMatches } from "@tanstack/react-router";
+
+import { deepestDestination, type NavigationDestination } from "./destination.js";
 
 declare module "@tanstack/react-router" {
   interface StaticDataRouteOption {
@@ -43,11 +45,14 @@ export function usePresentedTenantScope():
 }
 
 /** Links reflect the presented route tree, rather than the URL of an unfinished navigation. */
-export function usePresentedDestination(to: string, subtree = false): boolean {
+export function useActiveDestination(
+  destinations: readonly NavigationDestination[],
+): string | undefined {
   return useMatches({
     select: (matches) =>
-      (subtree ? matches : matches.slice(-1)).some(
-        (match) => trimPathRight(match.pathname) === trimPathRight(to),
+      deepestDestination(
+        destinations,
+        matches.map((match) => match.pathname),
       ),
   });
 }
