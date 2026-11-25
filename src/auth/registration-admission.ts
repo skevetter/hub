@@ -5,7 +5,7 @@ import type { InstanceAuthPolicy } from "./instance-policy.js";
 import { normalizeEmail } from "./instance-policy.js";
 import { reportFailure } from "../failures/index.js";
 
-const signupEmailBody = z.object({ email: z.string().email() }).passthrough();
+const signupEmailBody = z.object({ email: z.email() }).loose();
 const INVITATION_LOCK_PREFIX = "paseo:invitation:";
 
 export function invitationLockName(invitationId: string): string {
@@ -73,7 +73,7 @@ export class RegistrationAdmission {
         [normalizeEmail(email)],
       );
       if (existingUser.rowCount !== 0) throw new RegistrationAdmissionError();
-      return await action();
+      return action();
     });
   }
 

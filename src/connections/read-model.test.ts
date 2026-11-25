@@ -62,6 +62,8 @@ describe("organization connection snapshot", () => {
             return "some";
           case "slack":
             return "unknown";
+          case "discord":
+          case "linear":
           default:
             return "none";
         }

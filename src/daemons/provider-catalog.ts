@@ -32,6 +32,6 @@ export class DaemonProviderCatalog {
     if (connection === undefined) throw new Error("daemon_not_connected");
     const scope = input.cwd === undefined ? {} : { cwd: input.cwd };
     if (input.refresh === true) await connection.refreshProviderSnapshot(scope);
-    return await connection.getProviderSnapshot(scope);
+    return connection.getProviderSnapshot(scope);
   }
 }
