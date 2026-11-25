@@ -3,7 +3,6 @@ import type {
   BillingPlanRecord,
   Database,
   StampOrganizationEntitlementsInput,
-  BillingPlanPriceInterval,
 } from "../db/types.js";
 import {
   entitlementsSchema,
@@ -17,6 +16,7 @@ import { logger } from "../logger.js";
 import { syncBillingCatalog } from "./catalog-sync.js";
 import type { BillingConfig } from "./config.js";
 import type { StripeCatalogSource } from "./stripe-catalog-source.js";
+import type { BillingPlanPriceInterval } from "../db/types.js";
 import type { StripeBillingClient, StripeSubscriptionState } from "./stripe-billing-client.js";
 import { selectActivePlanPrice } from "./plan-prices.js";
 import { publicBillingPlans, type PublicBillingPlan } from "./public-catalog.js";

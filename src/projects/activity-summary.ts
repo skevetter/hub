@@ -35,7 +35,7 @@ export interface TriggerSummary {
 
 const ManualTriggerPayloadSchema = z
   .object({ trigger: z.string().optional(), actor: z.string().optional() })
-  .loose();
+  .passthrough();
 
 const WebhookTriggerPayloadSchema = z
   .object({
@@ -43,7 +43,7 @@ const WebhookTriggerPayloadSchema = z
     actor: z.string().optional(),
     input: z.string().optional(),
   })
-  .loose();
+  .passthrough();
 
 /**
  * Turns a trigger's raw provider payload into the one line a human needs to recognise

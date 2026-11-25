@@ -10,7 +10,7 @@ import { SlackUrlVerificationSchema } from "./events.js";
 
 const MAX_WEBHOOK_BYTES = 1_048_576;
 const MAX_TIMESTAMP_SKEW_SECONDS = 5 * 60;
-const SlackEnvelopeTypeSchema = z.object({ type: z.string() }).loose();
+const SlackEnvelopeTypeSchema = z.object({ type: z.string() }).passthrough();
 
 export interface SlackWebhookSourceOptions {
   appId: string;

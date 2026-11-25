@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { type WebSocket, type RawData } from "ws";
+import { WebSocket, type RawData } from "ws";
 import { reportFailure } from "../../../../failures/index.js";
 import { logger } from "../../../../logger.js";
 import type { TriggerHandler, TriggerSource } from "../../../index.js";

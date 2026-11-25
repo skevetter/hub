@@ -636,7 +636,7 @@ describe("webhook OpenAPI contract", () => {
             content: z.record(z.string(), z.unknown()).optional(),
             headers: z.record(z.string(), z.unknown()).optional(),
           })
-          .loose(),
+          .passthrough(),
       )
       .parse(operation.responses);
     for (const status of ["200", "202"]) {

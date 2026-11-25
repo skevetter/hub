@@ -26,7 +26,7 @@ export type InvocationRejection =
   | { code: "invalid_default_type"; inputName: string; expectedType: InvocationInputType }
   | { code: "invalid_default_choice"; inputName: string };
 
-const JsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+const JsonPrimitiveSchema = z.union([z.string(), z.number().finite(), z.boolean(), z.null()]);
 
 export const InvocationRejectionSchema = z.discriminatedUnion("code", [
   z

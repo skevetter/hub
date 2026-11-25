@@ -1,4 +1,4 @@
-import type { respondError } from "../contract/respond.js";
+import { respondError } from "../contract/respond.js";
 import { respondWithFailure } from "../failures/index.js";
 import { guideFor } from "./guides.js";
 import { ProviderApplicationError, type Provider } from "./index.js";
