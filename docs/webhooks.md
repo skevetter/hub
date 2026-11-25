@@ -216,12 +216,18 @@ before rotating again. If you lose a reveal response, reload the list to check i
 rotate explicitly or revoke the key. The list and API never recover an issued secret.
 
 Session-authenticated managers can create a signing key with
-`POST /api/auth/paseo/api-keys` using `scopes: ["events:send"]`, a bound `actor`, and
-`authentication: { mode: "hmac", profile: "github_sha256", targetTriggerId }`.
+`POST /api/auth/paseo/api-keys` using `organizationSlug`, `scopes: ["events:send"]`, a bound
+`actor`, and `authentication: { mode: "hmac", profile: "github_sha256", targetTriggerId }`.
+Every session-authenticated key endpoint names the organization it acts on, in the body, or in the
+`organizationSlug` query parameter for `GET /api/auth/paseo/api-keys`. The caller must be a member
+of that organization with permission to manage API keys. A request without it returns
+`400 invalid_request`. A slug that does not exist, or that the caller does not belong to, returns
+`404 organization_unavailable`. The session's active organization is not used.
 The response includes `signingSecret` once and uses `Cache-Control: no-store`.
-`POST /api/auth/paseo/rotate-api-key-signing-secret` takes `id`, `expectedCurrentVersionId`
-and optional `overlapSeconds`. `POST /api/auth/paseo/retire-api-key-signing-secret`
-takes `id` and `expectedPreviousVersionId`. Stale versions and an unexpired previous
+`POST /api/auth/paseo/rotate-api-key-signing-secret` takes `organizationSlug`, `id`,
+`expectedCurrentVersionId` and optional `overlapSeconds`.
+`POST /api/auth/paseo/retire-api-key-signing-secret` takes `organizationSlug`, `id` and
+`expectedPreviousVersionId`. Stale versions and an unexpired previous
 version during rotation return `409`. Listing returns version metadata only. Revocation
 continues to work when signing is disabled.
 

@@ -17,6 +17,7 @@
 
 ### Changed
 
+- Team and API key settings act on the organization in the page address, not the organization last selected in the session. The session-authenticated endpoints `POST /api/auth/paseo/api-keys`, `POST /api/auth/paseo/rotate-api-key-signing-secret` and `POST /api/auth/paseo/retire-api-key-signing-secret` now require `organizationSlug` in the JSON body, and `GET /api/auth/paseo/api-keys` requires it as a query parameter. A request without it fails with `400 invalid_request`. A slug that does not exist or that the caller does not belong to fails with `404 organization_unavailable`. Hub no longer falls back to the active organization. See [authenticated webhook triggers](docs/webhooks.md).
 - Linear connections request assignable and mentionable agent scopes and show consent for each installation. Existing connections require reauthorization. The assigned issue trigger also accepts delegation to the installed app. See [Linear agents](docs/linear-agents.md).
 - Unhandled provider event receipts expire automatically after seven days on every instance. Receipts routed to a trigger or still referenced by a run or attachment remain available.
 

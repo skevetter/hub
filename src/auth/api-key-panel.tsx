@@ -49,7 +49,8 @@ import {
   rotateApiKeySigningSecret,
   retireApiKeySigningSecret,
 } from "./functions.js";
-import { useActiveAccount } from "./active-account.js";
+import { useRouteTenant } from "../projects/context.js";
+import type { RouteInput } from "./route-organization.js";
 import { API_KEY_MUTATION_KEY } from "./tenant-mutation.js";
 import { triggerSnapshot } from "../triggers/functions.js";
 import { webhookSettings } from "../webhooks/functions.js";
@@ -115,27 +116,27 @@ const CLI_LOGINS = {
 };
 
 export function ApiKeys() {
-  const account = useActiveAccount();
-  return <OrganizationApiKeys key={account.organization.id} account={account} />;
+  const tenant = useRouteTenant();
+  return <OrganizationApiKeys key={tenant.organization.id} tenant={tenant} />;
 }
 
-type ActiveAccount = ReturnType<typeof useActiveAccount>;
+type RouteTenant = ReturnType<typeof useRouteTenant>;
 type QueryClient = ReturnType<typeof useQueryClient>;
 type RevealSetter = (reveal: ApiKeyReveal | undefined) => void;
 type ApiKeyPage = ReturnType<typeof useApiKeyPage>;
 type ApiKeyList = Extract<ListResult, { status: "ok" }>["data"];
 
-function OrganizationApiKeys({ account }: { account: ActiveAccount }) {
-  const page = useApiKeyPage(account);
+function OrganizationApiKeys({ tenant }: { tenant: RouteTenant }) {
+  const page = useApiKeyPage(tenant);
   const { snapshot } = page;
   const { openCreate } = page.dialogs.creation;
   const reload = snapshot.refetch;
   const header = (
-    <PageHeader title="API keys" description={`Machine access for ${account.organization.name}.`}>
+    <PageHeader title="API keys" description={`Machine access for ${tenant.organization.name}.`}>
       <Button asChild variant="outline">
         <a href="https://paseo.sh/docs/hub/api">API reference</a>
       </Button>
-      {account.capabilities.manageResources ? (
+      {tenant.capabilities.manageResources ? (
         <Button type="button" onClick={openCreate}>
           <KeyRound aria-hidden="true" />
           Create API key
@@ -143,7 +144,7 @@ function OrganizationApiKeys({ account }: { account: ActiveAccount }) {
       ) : null}
     </PageHeader>
   );
-  if (!account.capabilities.manageResources) {
+  if (!tenant.capabilities.manageResources) {
     return (
       <>
         {header}
@@ -180,15 +181,15 @@ function OrganizationApiKeys({ account }: { account: ActiveAccount }) {
       </>
     );
   }
-  return renderLoadedApiKeys(account, page, snapshot.data, header);
+  return renderLoadedApiKeys(tenant, page, snapshot.data, header);
 }
 
-function useApiKeyPage(account: ActiveAccount) {
+function useApiKeyPage(tenant: RouteTenant) {
   const queryClient = useQueryClient();
   const [creating, setCreating] = useState(false);
   const [reveal, setReveal] = useState<ApiKeyReveal>();
   const [rotating, setRotating] = useState<ApiKeyRecord>();
-  const { snapshot, invalidate, mutations } = useApiKeyOperations(queryClient, account, setReveal);
+  const { snapshot, invalidate, mutations } = useApiKeyOperations(queryClient, tenant, setReveal);
   const { create, rotate, retire } = mutations;
   const openCreate = useCallback(() => setCreating(true), []);
   const close = useCallback(
@@ -196,7 +197,7 @@ function useApiKeyPage(account: ActiveAccount) {
     [create, invalidate],
   );
   const submit = useCallback(
-    (data: Parameters<typeof createApiKey>[0]["data"]) => create.mutate({ data }),
+    (data: RouteInput<Parameters<typeof createApiKey>[0]>["data"]) => create.mutate({ data }),
     [create],
   );
   const closeRotation = useCallback(
@@ -224,45 +225,48 @@ function useApiKeyPage(account: ActiveAccount) {
 
 function useApiKeyOperations(
   queryClient: QueryClient,
-  account: ActiveAccount,
+  tenant: RouteTenant,
   setReveal: RevealSetter,
 ) {
   const createKey = useServerFn(createApiKey);
   const rotateKey = useServerFn(rotateApiKeySigningSecret);
   const retireKey = useServerFn(retireApiKeySigningSecret);
   const invalidate = useCallback(
-    () => queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] }),
-    [account.organization.id, queryClient],
+    () => queryClient.invalidateQueries({ queryKey: ["api-keys", tenant.organization.id] }),
+    [tenant.organization.id, queryClient],
   );
+  const organizationSlug = tenant.organization.slug;
   const load = useServerFn(listApiKeys) as (
     input: Parameters<typeof listApiKeys>[0],
   ) => Promise<ListResult>;
   const snapshot = useSnapshotQuery({
-    queryKey: ["api-keys", account.organization.id],
-    queryFn: () => load({}),
-    enabled: account.capabilities.manageResources,
+    queryKey: ["api-keys", tenant.organization.id],
+    queryFn: () => load({ data: { organizationSlug } }),
+    enabled: tenant.capabilities.manageResources,
   });
-  const create = useCreateApiKeyMutation(createKey, setReveal);
-  const rotate = useRotateApiKeyMutation(rotateKey, setReveal);
+  const create = useCreateApiKeyMutation(createKey, organizationSlug, setReveal);
+  const rotate = useRotateApiKeyMutation(rotateKey, organizationSlug, setReveal);
   const retire = useMutation({
     mutationKey: API_KEY_MUTATION_KEY,
     retry: false,
-    mutationFn: retireKey,
+    mutationFn: (input: RouteInput<Parameters<typeof retireKey>[0]>) =>
+      retireKey({ data: { ...input.data, organizationSlug } }),
     onSettled: invalidate,
   });
-  const { revoke, revokeCli } = useApiKeyRevocations(queryClient, account);
+  const { revoke, revokeCli } = useApiKeyRevocations(queryClient, tenant);
   return { snapshot, invalidate, mutations: { create, rotate, retire, revoke, revokeCli } };
 }
 
 function useCreateApiKeyMutation(
   createKey: ReturnType<typeof useServerFn<typeof createApiKey>>,
+  organizationSlug: string,
   setReveal: RevealSetter,
 ) {
   return useMutation({
     mutationKey: API_KEY_MUTATION_KEY,
     retry: false,
-    mutationFn: async (input: Parameters<typeof createApiKey>[0]) => {
-      const result = await createKey(input);
+    mutationFn: async (input: RouteInput<Parameters<typeof createApiKey>[0]>) => {
+      const result = await createKey({ data: { ...input.data, organizationSlug } });
       if (result.status === "error") return result.error.message;
       const issued = result.data;
       setReveal(
@@ -281,6 +285,7 @@ function useCreateApiKeyMutation(
 
 function useRotateApiKeyMutation(
   rotateKey: ReturnType<typeof useServerFn<typeof rotateApiKeySigningSecret>>,
+  organizationSlug: string,
   setReveal: RevealSetter,
 ) {
   return useMutation({
@@ -295,7 +300,12 @@ function useRotateApiKeyMutation(
       const trigger = record.allowedTriggers?.[0];
       if (trigger === undefined) return "Reload the key list to confirm the signing key's trigger.";
       const result = await rotateKey({
-        data: { id: record.id, expectedCurrentVersionId: versionId, overlapSeconds },
+        data: {
+          organizationSlug,
+          id: record.id,
+          expectedCurrentVersionId: versionId,
+          overlapSeconds,
+        },
       });
       if (result.status === "error") return result.error.message;
       setReveal({
@@ -308,26 +318,27 @@ function useRotateApiKeyMutation(
   });
 }
 
-function useApiKeyRevocations(queryClient: QueryClient, account: ActiveAccount) {
+function useApiKeyRevocations(queryClient: QueryClient, tenant: RouteTenant) {
+  const { slug: organizationSlug } = tenant.organization;
+  const revokeKey = useServerFn(revokeApiKey);
+  const revokeLogin = useServerFn(revokeCliCredential);
   const revoke = useMutation({
     mutationKey: API_KEY_MUTATION_KEY,
-    mutationFn: useServerFn(revokeApiKey) as (
-      input: Parameters<typeof revokeApiKey>[0],
-    ) => Promise<Result<Record<string, never>>>,
+    mutationFn: (input: RouteInput<Parameters<typeof revokeApiKey>[0]>) =>
+      revokeKey({ data: { ...input.data, organizationSlug } }),
     onSuccess: async (result) => {
       if (result.status === "ok") {
-        await queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] });
+        await queryClient.invalidateQueries({ queryKey: ["api-keys", tenant.organization.id] });
       }
     },
   });
   const revokeCli = useMutation({
     mutationKey: API_KEY_MUTATION_KEY,
-    mutationFn: useServerFn(revokeCliCredential) as (
-      input: Parameters<typeof revokeCliCredential>[0],
-    ) => Promise<Result<Record<string, never>>>,
+    mutationFn: (input: RouteInput<Parameters<typeof revokeCliCredential>[0]>) =>
+      revokeLogin({ data: { ...input.data, organizationSlug } }),
     onSuccess: async (result) => {
       if (result.status === "ok") {
-        await queryClient.invalidateQueries({ queryKey: ["api-keys", account.organization.id] });
+        await queryClient.invalidateQueries({ queryKey: ["api-keys", tenant.organization.id] });
       }
     },
   });
@@ -411,7 +422,7 @@ function apiKeyErrors({ create, rotate, retire, revoke }: ApiKeyPage["mutations"
 }
 
 function renderLoadedApiKeys(
-  account: ActiveAccount,
+  tenant: RouteTenant,
   page: ApiKeyPage,
   data: ApiKeyList,
   header: ReactNode,
@@ -434,11 +445,11 @@ function renderLoadedApiKeys(
   return (
     <>
       {header}
-      {renderApiKeyList({ account, keys, data, errors: table, page })}
+      {renderApiKeyList({ tenant, keys, data, errors: table, page })}
       {renderCliLogins(cliCredentials, page.mutations.revokeCli)}
       <ApiKeyDialog
-        key={account.organization.id}
-        organizationSlug={account.organization.slug}
+        key={tenant.organization.id}
+        organizationSlug={tenant.organization.slug}
         open={creating}
         onOpenChange={close}
         reveal={creating ? reveal : undefined}
@@ -453,13 +464,13 @@ function renderLoadedApiKeys(
 }
 
 function renderApiKeyList({
-  account,
+  tenant,
   keys,
   data,
   errors: { revokeError, retireError },
   page,
 }: {
-  account: ActiveAccount;
+  tenant: RouteTenant;
   keys: ApiKeyRecord[];
   data: ApiKeyList;
   errors: ReturnType<typeof apiKeyErrors>["table"];
@@ -490,7 +501,7 @@ function renderApiKeyList({
         signingAvailability={data.signingAvailability}
         onRotate={setRotating}
         onRetire={retireVersion}
-        canManage={account.capabilities.manageResources}
+        canManage={tenant.capabilities.manageResources}
         busy={revoke.isPending || retire.isPending || rotate.isPending}
         onRevoke={revoke.mutate}
       />
@@ -653,7 +664,7 @@ interface ApiKeyDialogProps {
   canSign: boolean;
   busy: boolean;
   error: string | undefined;
-  onSubmit: (data: Parameters<typeof createApiKey>[0]["data"]) => void;
+  onSubmit: (data: RouteInput<Parameters<typeof createApiKey>[0]>["data"]) => void;
 }
 
 function ApiKeyDialog(props: ApiKeyDialogProps) {
