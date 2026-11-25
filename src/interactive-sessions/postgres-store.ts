@@ -82,6 +82,7 @@ import type {
   RetireLinearPilotSessionInput,
   SaveSessionProfileInput,
   SaveSessionProfileResult,
+  SessionAuditDetails,
   SessionEventDraft,
   SessionPageInput,
   SetParticipantInput,
@@ -91,7 +92,6 @@ import type {
   StartSessionResult,
 } from "./store.js";
 import type {
-  SessionAuditRecord,
   SessionCommandRecord,
   SessionEventRecord,
   SessionParticipantRecord,
@@ -136,13 +136,6 @@ interface CommandCandidates {
   input: ClaimCommandInput;
   candidates: SessionCommandRecord[];
   leaseNow: Date;
-}
-
-interface SessionAuditDetails {
-  actorIdentity: string;
-  action: string;
-  evidence: SessionAuditRecord["evidence"];
-  now: Date;
 }
 
 export class InteractiveSessionRepository implements InteractiveSessionStore {
@@ -370,7 +363,12 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
     { organizationId, userId, requested, hash }: StartRequestContext,
   ): Promise<StartSessionResult> {
     const session = newSession(input, profile, hash);
-    const command = newCommand(session, input, "message", "steer", input.message, hash);
+    const command = newCommand(session, input, {
+      kind: "message",
+      delivery: "steer",
+      body: input.message,
+      requestHash: hash,
+    });
     await db.insert(sessions).values(session);
     await db.insert(participants).values(
       requested.map(({ userId: participantId, role }) => ({
@@ -467,14 +465,12 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
     { input, userId, hash }: CommandAcceptance,
   ): Promise<AcceptCommandResult> {
     const next = advanceForCommand(session, input);
-    const command = newCommand(
-      next,
-      input,
-      input.kind,
-      input.kind === "message" ? input.delivery : null,
-      input.kind === "message" ? input.message : null,
-      hash,
-    );
+    const command = newCommand(next, input, {
+      kind: input.kind,
+      delivery: input.kind === "message" ? input.delivery : null,
+      body: input.kind === "message" ? input.message : null,
+      requestHash: hash,
+    });
     const drafts: SessionEventDraft[] = [];
     if (input.kind === "message") {
       drafts.push(messageEvent(command));
@@ -1238,14 +1234,8 @@ export class InteractiveSessionRepository implements InteractiveSessionStore {
     return daemon?.status === "active" && daemon.permissions.includes("hub.execute");
   }
 
-  private async audit(
-    db: DrizzleHandle,
-    session: SessionRecord,
-    { actorIdentity, action, evidence, now }: SessionAuditDetails,
-  ) {
-    await db
-      .insert(auditEvents)
-      .values(sessionAudit(session, actorIdentity, action, evidence, now));
+  private async audit(db: DrizzleHandle, session: SessionRecord, details: SessionAuditDetails) {
+    await db.insert(auditEvents).values(sessionAudit(session, details));
   }
 }
 

@@ -753,7 +753,12 @@ class MemoryDatabase implements Database {
     },
   ): StartSessionResult {
     const session = newSession(input, profile, hash);
-    const command = newCommand(session, input, "message", "steer", input.message, hash);
+    const command = newCommand(session, input, {
+      kind: "message",
+      delivery: "steer",
+      body: input.message,
+      requestHash: hash,
+    });
     const row: SessionWithParticipants = {
       session,
       participants: people.map(({ userId: participantId, role }) => ({
@@ -776,13 +781,12 @@ class MemoryDatabase implements Database {
     this.interactiveEvents.set(session.id, []);
     this.appendSessionEvents(row, session, input.now, [stateEvent(session), messageEvent(command)]);
     this.saveSessionAudit(
-      sessionAudit(
-        session,
-        userId,
-        "started",
-        { profileId: profile.id, commandId: command.id },
-        input.now,
-      ),
+      sessionAudit(session, {
+        actorIdentity: userId,
+        action: "started",
+        evidence: { profileId: profile.id, commandId: command.id },
+        now: input.now,
+      }),
     );
     return { status: "created", ...structuredClone({ session: row.session, command }) };
   }
@@ -859,14 +863,12 @@ class MemoryDatabase implements Database {
     }: { session: SessionRecord; commands: SessionCommandRecord[]; userId: string; hash: string },
   ): AcceptCommandResult {
     const next = advanceForCommand(session, input);
-    const command = newCommand(
-      next,
-      input,
-      input.kind,
-      input.kind === "message" ? input.delivery : null,
-      input.kind === "message" ? input.message : null,
-      hash,
-    );
+    const command = newCommand(next, input, {
+      kind: input.kind,
+      delivery: input.kind === "message" ? input.delivery : null,
+      body: input.kind === "message" ? input.message : null,
+      requestHash: hash,
+    });
     const drafts =
       input.kind === "message"
         ? [messageEvent(command)]
@@ -874,7 +876,12 @@ class MemoryDatabase implements Database {
     commands.push(structuredClone(command));
     this.appendSessionEvents(row, next, input.now, drafts);
     this.saveSessionAudit(
-      sessionAudit(session, userId, input.kind, { commandId: command.id }, input.now),
+      sessionAudit(session, {
+        actorIdentity: userId,
+        action: input.kind,
+        evidence: { commandId: command.id },
+        now: input.now,
+      }),
     );
     return { status: "accepted", ...structuredClone({ session: row.session, command }) };
   }
@@ -1166,7 +1173,12 @@ class MemoryDatabase implements Database {
         { kind: "participants", commandId: null, data },
       ]);
       this.saveSessionAudit(
-        sessionAudit(row.session, userId, "participant_changed", data, input.now),
+        sessionAudit(row.session, {
+          actorIdentity: userId,
+          action: "participant_changed",
+          evidence: data,
+          now: input.now,
+        }),
       );
       return input.role === null ? "removed" : "set";
     });
@@ -1335,13 +1347,12 @@ class MemoryDatabase implements Database {
     Object.assign(command, retryMessagePatch(command, input.now));
     this.appendSessionEvents(row, session, input.now, [deliveryEvent(command)]);
     this.saveSessionAudit(
-      sessionAudit(
-        session,
-        userId,
-        "retry",
-        { commandId: command.id, retryKey, requestHash },
-        input.now,
-      ),
+      sessionAudit(session, {
+        actorIdentity: userId,
+        action: "retry",
+        evidence: { commandId: command.id, retryKey, requestHash },
+        now: input.now,
+      }),
     );
     return { status: "accepted", ...structuredClone({ session: row.session, command }) };
   }
