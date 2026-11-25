@@ -3,6 +3,7 @@ import { useServerFn } from "@tanstack/react-start";
 import { createContext, useContext, useMemo, type ReactNode } from "react";
 import { usePresentedTenantScope } from "../navigation/index.js";
 import { tenantContext } from "./functions.js";
+import { shouldRetryTenantRead } from "./unavailable.js";
 import type { ProjectDashboard } from "./dashboard.js";
 
 type TenantContextValue = Awaited<ReturnType<ProjectDashboard["tenantContext"]>>;
@@ -29,8 +30,9 @@ export function RouteTenantProvider({ children }: { children: ReactNode }) {
   const load = useServerFn(tenantContext);
   const snapshot = useSnapshotQuery({
     queryKey: ["tenant", scope?.organizationSlug, scope?.projectSlug],
-    queryFn: () => load({ data: scope! }),
+    queryFn: () => load({ data: requiredScope(scope) }),
     enabled: scope !== undefined,
+    retry: shouldRetryTenantRead,
   });
   const tenant = scope !== undefined && snapshot.status === "success" ? snapshot.data : null;
   // The status is recomputed only when the read moves, so the whole dashboard below does not
@@ -48,6 +50,11 @@ export function RouteTenantProvider({ children }: { children: ReactNode }) {
       <ProjectTenantContext.Provider value={tenant}>{children}</ProjectTenantContext.Provider>
     </RouteTenantStatusContext.Provider>
   );
+}
+
+function requiredScope<T>(scope: T | undefined): T {
+  if (scope === undefined) throw new Error("tenant read ran without a route scope");
+  return scope;
 }
 
 /** `failure` is the server's message, the empty string for a request that never arrived. */

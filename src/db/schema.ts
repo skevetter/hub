@@ -3,6 +3,7 @@ import { otherDropPredicate, routingDropPredicate } from "./dropped-events.js";
 import { sql } from "drizzle-orm";
 import {
   type AnyPgColumn,
+  type ExtraConfigColumn,
   boolean,
   bigint,
   check,
@@ -21,7 +22,30 @@ import {
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import type { JsonValue } from "../config/compiler.js";
 import { INVITATION_ROLES, ORGANIZATION_ROLES } from "../auth/organization-contract.js";
-import { API_KEY_SCOPES } from "../auth/api-key-contract.js";
+import type { API_KEY_SCOPES } from "../auth/api-key-contract.js";
+import type { Conversation } from "../triggers/continuation.js";
+import type {
+  RunPayloadSummary,
+  StepPayloadSummary,
+  PayloadCompletion,
+  PayloadAgentSummary,
+} from "../run-payload-retention/summary.js";
+import type { RunReplyRecord, RunReplyFailure } from "../run-replies/store.js";
+import type { AgentSessionRecord, AgentSessionAction } from "../agent-sessions/index.js";
+import type {
+  SessionProfileSettings,
+  SessionProfileStatus,
+  SessionLaunch,
+  SessionState,
+  SessionStateReason,
+  ParticipantRole,
+  CommandKind,
+  Delivery,
+  CommandStatus,
+  CommandFailureCode,
+  SessionEventRecord,
+} from "../interactive-sessions/types.js";
+import type { SurfacePolicy } from "../surfaces/store.js";
 
 export { INVITATION_ROLES, ORGANIZATION_ROLES };
 
@@ -65,6 +89,55 @@ export const unsupportedLinearReceiptBudgets = pgTable("unsupported_linear_recei
   written: integer().notNull(),
   retainedUpperBound: integer("retained_upper_bound").notNull(),
 });
+
+function droppedReceiptIndexes(
+  table: Record<
+    "organizationId" | "receivedAt" | "id" | "provider" | "droppedReason" | "source",
+    ExtraConfigColumn
+  >,
+) {
+  return [
+    index("provider_event_receipts_org_dropped_order_idx")
+      .on(
+        table.organizationId,
+        table.receivedAt.desc().nullsFirst(),
+        table.id.desc().nullsFirst(),
+        table.provider,
+        table.droppedReason,
+      )
+      .where(sql`${table.droppedReason} is not null`),
+    index("provider_event_receipts_org_dropped_provider_idx")
+      .on(
+        table.organizationId,
+        table.provider,
+        table.receivedAt.desc().nullsFirst(),
+        table.id.desc().nullsFirst(),
+      )
+      .where(sql`${table.droppedReason} is not null`),
+    index("provider_event_receipts_org_dropped_source_idx")
+      .on(
+        table.organizationId,
+        table.source,
+        table.receivedAt.desc().nullsFirst(),
+        table.id.desc().nullsFirst(),
+      )
+      .where(sql`${table.droppedReason} is not null`),
+    index("provider_event_receipts_org_dropped_reason_idx")
+      .on(
+        table.organizationId,
+        table.droppedReason,
+        table.receivedAt.desc().nullsFirst(),
+        table.id.desc().nullsFirst(),
+      )
+      .where(sql`${table.droppedReason} is not null`),
+    index("provider_event_receipts_org_dropped_routing_idx")
+      .on(table.organizationId, table.receivedAt.desc().nullsFirst(), table.id.desc().nullsFirst())
+      .where(sql.raw(routingDropPredicate("dropped_reason"))),
+    index("provider_event_receipts_org_dropped_other_idx")
+      .on(table.organizationId, table.receivedAt.desc().nullsFirst(), table.id.desc().nullsFirst())
+      .where(sql.raw(otherDropPredicate("dropped_reason"))),
+  ];
+}
 
 export const providerEventReceipts = pgTable(
   "provider_event_receipts",
@@ -122,45 +195,7 @@ export const providerEventReceipts = pgTable(
     index("provider_event_receipts_org_unsupported_linear_idx")
       .on(table.organizationId, table.receivedAt.desc().nullsFirst(), table.id.desc().nullsFirst())
       .where(sql.raw(UNSUPPORTED_LINEAR_RECEIPT_PREDICATE)),
-    index("provider_event_receipts_org_dropped_order_idx")
-      .on(
-        table.organizationId,
-        table.receivedAt.desc().nullsFirst(),
-        table.id.desc().nullsFirst(),
-        table.provider,
-        table.droppedReason,
-      )
-      .where(sql`${table.droppedReason} is not null`),
-    index("provider_event_receipts_org_dropped_provider_idx")
-      .on(
-        table.organizationId,
-        table.provider,
-        table.receivedAt.desc().nullsFirst(),
-        table.id.desc().nullsFirst(),
-      )
-      .where(sql`${table.droppedReason} is not null`),
-    index("provider_event_receipts_org_dropped_source_idx")
-      .on(
-        table.organizationId,
-        table.source,
-        table.receivedAt.desc().nullsFirst(),
-        table.id.desc().nullsFirst(),
-      )
-      .where(sql`${table.droppedReason} is not null`),
-    index("provider_event_receipts_org_dropped_reason_idx")
-      .on(
-        table.organizationId,
-        table.droppedReason,
-        table.receivedAt.desc().nullsFirst(),
-        table.id.desc().nullsFirst(),
-      )
-      .where(sql`${table.droppedReason} is not null`),
-    index("provider_event_receipts_org_dropped_routing_idx")
-      .on(table.organizationId, table.receivedAt.desc().nullsFirst(), table.id.desc().nullsFirst())
-      .where(sql.raw(routingDropPredicate("dropped_reason"))),
-    index("provider_event_receipts_org_dropped_other_idx")
-      .on(table.organizationId, table.receivedAt.desc().nullsFirst(), table.id.desc().nullsFirst())
-      .where(sql.raw(otherDropPredicate("dropped_reason"))),
+    ...droppedReceiptIndexes(table),
     index("provider_event_receipts_org_webhook_idx")
       .on(table.organizationId, table.id)
       .where(sql`${table.provider} = 'manual' and ${table.source} = 'webhook.received'`),
@@ -509,6 +544,40 @@ export const projectTriggerMigrations = pgTable(
   ],
 );
 
+function triggerRunForeignKeys(
+  table: Record<
+    "organizationId" | "projectId" | "configurationRevisionId" | "providerEventReceiptId",
+    ExtraConfigColumn
+  >,
+) {
+  return [
+    foreignKey({
+      columns: [table.organizationId],
+      foreignColumns: [organizations.id],
+      name: "trigger_runs_organization_fk",
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.projectId, table.organizationId],
+      foreignColumns: [projects.id, projects.organizationId],
+      name: "trigger_runs_project_organization_fk",
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.configurationRevisionId, table.projectId, table.organizationId],
+      foreignColumns: [
+        projectConfigurationRevisions.id,
+        projectConfigurationRevisions.projectId,
+        projectConfigurationRevisions.organizationId,
+      ],
+      name: "trigger_runs_revision_project_organization_fk",
+    }),
+    foreignKey({
+      columns: [table.providerEventReceiptId, table.organizationId],
+      foreignColumns: [providerEventReceipts.id, providerEventReceipts.organizationId],
+      name: "trigger_runs_receipt_organization_fk",
+    }),
+  ];
+}
+
 export const triggerRuns = pgTable(
   "trigger_runs",
   {
@@ -518,7 +587,7 @@ export const triggerRuns = pgTable(
     configurationRevisionId: uuid("configuration_revision_id").notNull(),
     providerEventReceiptId: uuid("provider_event_receipt_id").notNull(),
     configuredTriggerName: text("configured_trigger_name").notNull(),
-    conversation: jsonb().$type<import("../triggers/continuation.js").Conversation>(),
+    conversation: jsonb().$type<Conversation>(),
     outcome: text().$type<"accepted" | "rejected">().notNull().default("accepted"),
     status: text()
       .$type<"running" | "succeeded" | "failed" | "timed_out" | "canceled" | "rejected">()
@@ -546,10 +615,7 @@ export const triggerRuns = pgTable(
       .default(0),
     payloadExpiredAt: timestamp("payload_expired_at", { withTimezone: true }),
     payloadExpiryState: text("payload_expiry_state").$type<"expiring" | "expired">(),
-    payloadSummary:
-      jsonb("payload_summary").$type<
-        import("../run-payload-retention/summary.js").RunPayloadSummary
-      >(),
+    payloadSummary: jsonb("payload_summary").$type<RunPayloadSummary>(),
     rejection: jsonb(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     completedAt: timestamp("completed_at", { withTimezone: true }),
@@ -601,30 +667,7 @@ export const triggerRuns = pgTable(
       sql`(${table.outcome} = 'accepted' and ${table.deadlineAt} is not null)
         or (${table.outcome} = 'rejected' and ${table.deadlineAt} is null)`,
     ),
-    foreignKey({
-      columns: [table.organizationId],
-      foreignColumns: [organizations.id],
-      name: "trigger_runs_organization_fk",
-    }).onDelete("cascade"),
-    foreignKey({
-      columns: [table.projectId, table.organizationId],
-      foreignColumns: [projects.id, projects.organizationId],
-      name: "trigger_runs_project_organization_fk",
-    }).onDelete("cascade"),
-    foreignKey({
-      columns: [table.configurationRevisionId, table.projectId, table.organizationId],
-      foreignColumns: [
-        projectConfigurationRevisions.id,
-        projectConfigurationRevisions.projectId,
-        projectConfigurationRevisions.organizationId,
-      ],
-      name: "trigger_runs_revision_project_organization_fk",
-    }),
-    foreignKey({
-      columns: [table.providerEventReceiptId, table.organizationId],
-      foreignColumns: [providerEventReceipts.id, providerEventReceipts.organizationId],
-      name: "trigger_runs_receipt_organization_fk",
-    }),
+    ...triggerRunForeignKeys(table),
   ],
 );
 
@@ -788,15 +831,12 @@ export const runReplyDeliveries = pgTable(
     triggerRunId: uuid("trigger_run_id").primaryKey(),
     organizationId: text("organization_id").notNull(),
     commentId: uuid("comment_id").notNull().defaultRandom().unique(),
-    state: text()
-      .$type<import("../run-replies/store.js").RunReplyRecord["state"]>()
-      .notNull()
-      .default("pending"),
+    state: text().$type<RunReplyRecord["state"]>().notNull().default("pending"),
     length: integer(),
     contentHash: text("content_hash"),
     bindingHash: text("binding_hash"),
     attemptedAt: timestamp("attempted_at", { withTimezone: true }),
-    failure: text().$type<import("../run-replies/store.js").RunReplyFailure>(),
+    failure: text().$type<RunReplyFailure>(),
   },
   (table) => [
     foreignKey({
@@ -845,10 +885,7 @@ export const workflowStepRuns = pgTable(
     deadlineAt: timestamp("deadline_at", { withTimezone: true }),
     idleDeadlineAt: timestamp("idle_deadline_at", { withTimezone: true }),
     dispatchIntent: jsonb("dispatch_intent").$type<LaunchMachineIntent>(),
-    payloadSummary:
-      jsonb("payload_summary").$type<
-        import("../run-payload-retention/summary.js").StepPayloadSummary
-      >(),
+    payloadSummary: jsonb("payload_summary").$type<StepPayloadSummary>(),
     startedAt: timestamp("started_at", { withTimezone: true }),
     completedAt: timestamp("completed_at", { withTimezone: true }),
   },
@@ -1027,11 +1064,8 @@ export const agentSessions = pgTable(
       .notNull()
       .references(() => projects.id),
     continuationKey: text("continuation_key"),
-    data: jsonb().$type<import("../agent-sessions/index.js").AgentSessionRecord>().notNull(),
-    creationOptions:
-      jsonb("creation_options").$type<
-        import("../agent-sessions/index.js").AgentSessionRecord["creationOptions"]
-      >(),
+    data: jsonb().$type<AgentSessionRecord>().notNull(),
+    creationOptions: jsonb("creation_options").$type<AgentSessionRecord["creationOptions"]>(),
     optionsReducedAt: timestamp("options_reduced_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }),
   },
@@ -1044,8 +1078,7 @@ export const agentExecutions = pgTable(
   "agent_executions",
   {
     id: uuid().defaultRandom().primaryKey(),
-    agentSessionAction:
-      text("agent_session_action").$type<import("../agent-sessions/index.js").AgentSessionAction>(),
+    agentSessionAction: text("agent_session_action").$type<AgentSessionAction>(),
     agentSessionId: uuid("agent_session_id").references(() => agentSessions.id),
     organizationId: text("organization_id").notNull(),
     projectId: uuid("project_id").notNull(),
@@ -1059,10 +1092,7 @@ export const agentExecutions = pgTable(
     deadlineAt: timestamp("deadline_at", { withTimezone: true }),
     idleDeadlineAt: timestamp("idle_deadline_at", { withTimezone: true }),
     result: jsonb(),
-    payloadCompletion:
-      text("payload_completion").$type<
-        import("../run-payload-retention/summary.js").PayloadCompletion
-      >(),
+    payloadCompletion: text("payload_completion").$type<PayloadCompletion>(),
     triggerContext: jsonb("trigger_context"),
     outputContext: jsonb("output_context"),
     reactionState: jsonb("reaction_state"),
@@ -1076,10 +1106,7 @@ export const agentExecutions = pgTable(
     usedTemporaryCredentials: boolean("used_temporary_credentials"),
     launchIntentExpiredAt: timestamp("launch_intent_expired_at", { withTimezone: true }),
     launchRunId: uuid("launch_run_id"),
-    launchAgent:
-      jsonb("launch_agent").$type<
-        import("../run-payload-retention/summary.js").PayloadAgentSummary
-      >(),
+    launchAgent: jsonb("launch_agent").$type<PayloadAgentSummary>(),
     daemonId: uuid("daemon_id"),
     daemonAgentId: text("daemon_agent_id"),
     workflowStepRunId: uuid("workflow_step_run_id"),
@@ -1955,10 +1982,7 @@ export const interactiveSessionProfiles = pgTable(
     name: text().notNull(),
     daemonId: uuid("daemon_id").notNull(),
     cwd: text().notNull(),
-    worktree:
-      jsonb().$type<
-        import("../interactive-sessions/types.js").SessionProfileSettings["worktree"]
-      >(),
+    worktree: jsonb().$type<SessionProfileSettings["worktree"]>(),
     provider: text().notNull(),
     model: text(),
     mode: text(),
@@ -1971,9 +1995,7 @@ export const interactiveSessionProfiles = pgTable(
     access: text().$type<"private">().default("private").notNull(),
     maxActive: integer("max_active").default(4).notNull(),
     linearTemplate: text("linear_template"),
-    status: text()
-      .$type<import("../interactive-sessions/types.js").SessionProfileStatus>()
-      .notNull(),
+    status: text().$type<SessionProfileStatus>().notNull(),
     version: integer().default(1).notNull(),
     createdByUserId: text("created_by_user_id").references(() => users.id, {
       onDelete: "set null",
@@ -2043,12 +2065,11 @@ export const interactiveSessions = pgTable(
     origin: text().$type<"web" | "linear">().default("web").notNull(),
     // Keep the requester's identity evidence after membership removal.
     requesterIdentityId: uuid("requester_identity_id"),
-    launch: jsonb().$type<import("../interactive-sessions/types.js").SessionLaunch>().notNull(),
+    launch: jsonb().$type<SessionLaunch>().notNull(),
     daemonId: uuid("daemon_id").notNull(),
     title: text().notNull(),
-    state: text().$type<import("../interactive-sessions/types.js").SessionState>().notNull(),
-    stateReason:
-      text("state_reason").$type<import("../interactive-sessions/types.js").SessionStateReason>(),
+    state: text().$type<SessionState>().notNull(),
+    stateReason: text("state_reason").$type<SessionStateReason>(),
     generation: integer().default(1).notNull(),
     turn: integer().default(0).notNull(),
     daemonAgentId: text("daemon_agent_id"),
@@ -2124,7 +2145,7 @@ export const interactiveSessionParticipants = pgTable(
     userId: text("user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
-    role: text().$type<import("../interactive-sessions/types.js").ParticipantRole>().notNull(),
+    role: text().$type<ParticipantRole>().notNull(),
     addedByUserId: text("added_by_user_id").references(() => users.id, { onDelete: "set null" }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
@@ -2158,11 +2179,10 @@ export const interactiveSessionCommands = pgTable(
     sessionId: uuid("session_id").notNull(),
     ordinal: integer().notNull(),
     generation: integer().notNull(),
-    kind: text().$type<import("../interactive-sessions/types.js").CommandKind>().notNull(),
-    delivery: text().$type<import("../interactive-sessions/types.js").Delivery>(),
-    status: text().$type<import("../interactive-sessions/types.js").CommandStatus>().notNull(),
-    failureCode:
-      text("failure_code").$type<import("../interactive-sessions/types.js").CommandFailureCode>(),
+    kind: text().$type<CommandKind>().notNull(),
+    delivery: text().$type<Delivery>(),
+    status: text().$type<CommandStatus>().notNull(),
+    failureCode: text("failure_code").$type<CommandFailureCode>(),
     body: text(),
     bodyExpiredAt: timestamp("body_expired_at", { withTimezone: true }),
     authorUserId: text("author_user_id").references(() => users.id, { onDelete: "set null" }),
@@ -2232,13 +2252,9 @@ export const interactiveSessionEvents = pgTable(
       .notNull()
       .references(() => organizations.id, { onDelete: "cascade" }),
     seq: integer().notNull(),
-    kind: text()
-      .$type<import("../interactive-sessions/types.js").SessionEventRecord["kind"]>()
-      .notNull(),
+    kind: text().$type<SessionEventRecord["kind"]>().notNull(),
     commandId: uuid("command_id"),
-    data: jsonb()
-      .$type<import("../interactive-sessions/types.js").SessionEventRecord["data"]>()
-      .notNull(),
+    data: jsonb().$type<SessionEventRecord["data"]>().notNull(),
     at: timestamp({ withTimezone: true }).notNull(),
   },
   (table) => [
@@ -2309,10 +2325,10 @@ export const surfacePolicies = pgTable(
     revision: integer().default(1).notNull(),
     profileId: uuid("profile_id").notNull(),
     profileVersion: integer("profile_version").notNull(),
-    scope: jsonb().$type<import("../surfaces/store.js").SurfacePolicy["scope"]>().notNull(),
+    scope: jsonb().$type<SurfacePolicy["scope"]>().notNull(),
     publishAnswers: boolean("publish_answers").default(false).notNull(),
     moveOnBegin: text("move_on_begin")
-      .$type<import("../surfaces/store.js").SurfacePolicy["moveOnBegin"]>()
+      .$type<SurfacePolicy["moveOnBegin"]>()
       .default("unchanged")
       .notNull(),
     moveOnFinish: text("move_on_finish").$type<"unchanged">().default("unchanged").notNull(),

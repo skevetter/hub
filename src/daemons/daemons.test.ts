@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
-import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import type { StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, it } from "vitest";
 import { DaemonDispatchFailure } from "./index.js";
 import { DaemonResponseLostError } from "./protocol.js";
 import { ENROLLMENT_LIFETIME_MS } from "./registration.js";
 import { HubHarness } from "./test-utils/hub-harness.js";
+import { startDaemonTestPostgres } from "./test-utils/postgres-container.js";
 import { currentProjectConfigurationFiles } from "../test-utils/current-project-configuration.js";
 
 describe("daemon enrollment and execution", () => {
   let postgres: StartedPostgreSqlContainer;
   let hub: HubHarness;
   beforeAll(async () => {
-    postgres = await new PostgreSqlContainer("postgres:17-alpine").start();
+    postgres = await startDaemonTestPostgres();
   }, 120_000);
   afterAll(async () => {
     await postgres?.stop();
@@ -699,7 +700,7 @@ describe("daemon enrollment and execution", () => {
 
     await hub.restartApp();
     await hub.runtimeResources({ executionSubscriptions: 1 });
-    const recovered = await hub.execution(handedOff.execution.id);
+    const recovered = await hub.waitForRecoveredExecution(handedOff.execution.id, "running");
     assert.equal(recovered.status, "running");
     assert.deepEqual(hub.authorityRevokedTokens(), []);
     assert.equal(hub.authorityMintInputs().length, 1);
@@ -1733,7 +1734,8 @@ describe("daemon enrollment and execution", () => {
     await hub.waitForExecutionStatus(pending.id, "running");
     await hub.advanceDispatchTime(10_000);
 
-    assert.equal((await hub.execution(pending.id)).status, "failed");
+    assert.equal((await hub.waitForExecutionStatus(pending.id, "failed")).status, "failed");
+    await hub.waitForControlAction("interrupt");
     assert.deepEqual(hub.controlActions(), ["interrupt"]);
   });
 
@@ -2192,7 +2194,7 @@ describe("daemon enrollment and execution", () => {
 describe("daemon enrollment and execution", () => {
   it("rolls back partially acquired startup resources", async () => {
     assert.equal(await HubHarness.startupFailureRollsBack(), true);
-  });
+  }, 120_000);
 });
 
 function toolResultIsError(response: Record<string, unknown>): boolean | undefined {

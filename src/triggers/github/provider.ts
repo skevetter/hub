@@ -11,7 +11,9 @@ import {
   isExecutionLimitDenial,
   missingBillingUrl,
 } from "../failure-notice.js";
-import type { GitHubReplyClient } from "./reply.js";
+import type { Conversation } from "../continuation.js";
+import type { GitHubCommentClient } from "./reply.js";
+import { billingNoticeSince, executionLimitNoticeMarker } from "./billing-notice.js";
 import { matchGitHubInvocations } from "./match.js";
 import {
   IssueCommentPayloadSchema,
@@ -156,44 +158,21 @@ interface GitHubReactionState {
   readonly reactionId: number;
 }
 
-export function createGitHubTriggerProvider(options: {
+interface GitHubTriggerProviderOptions {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
   reactions: GitHubReactionClient;
-  comments?: GitHubReplyClient;
+  comments?: Pick<GitHubCommentClient, "createIssueComment" | "findIssueCommentByMarker">;
   billingUrlForOrganization?: (organizationId: string) => Promise<string>;
-}): TriggerProvider<"github", GitHubTriggerContext> {
+}
+
+export function createGitHubTriggerProvider(
+  options: GitHubTriggerProviderOptions,
+): TriggerProvider<"github", GitHubTriggerContext> {
   return {
     name: "github",
     eventNames: GITHUB_TRIGGER_SOURCE_NAMES,
     async match(externalTrigger) {
-      const event = NormalizedGitHubEventSchema.parse(externalTrigger.payload);
-      const stored = await options
-        .configurationStoreForProject(externalTrigger.projectId)
-        .getRevision(externalTrigger.configurationRevisionId);
-      if (stored === undefined) return "configuration_unavailable";
-      const matches = matchGitHubInvocations(stored.configuration, event, externalTrigger);
-      if (typeof matches === "string") return matches;
-      const triggerContext: GitHubTriggerContext = {
-        provider: "github",
-        organizationId: externalTrigger.organizationId,
-        target: { installationId: event.installationId, repository: event.repo },
-        event: buildGitHubMergeData(event),
-        reactionSubject: reactionSubjectForEvent(event),
-      };
-      return matches.map(
-        ({ triggerName, invocation }): TriggerProviderMatch<GitHubTriggerContext> => {
-          const match = {
-            conversation: githubConversation(event),
-            triggerName,
-            triggerContext,
-            outputContext: triggerContext,
-            configurationRevisionId: stored.revision.id,
-            hubConfig: stored.configuration,
-          };
-          if (invocation.status === "accepted") return Object.assign(match, { invocation });
-          return Object.assign(match, { invocation });
-        },
-      );
+      return matchTrigger(options.configurationStoreForProject, externalTrigger);
     },
     async materializeContext(launch) {
       return launch.triggerContext.event;
@@ -221,33 +200,84 @@ export function createGitHubTriggerProvider(options: {
       return null;
     },
     async onAgentExecutionFailed(triggerContext, _outputContext, reason, reactionState) {
-      if (isExecutionLimitDenial(reason) && triggerContext.event.github.item?.number != null) {
-        if (options.comments === undefined) throw new Error("GitHub comment client unavailable");
-        const [owner, repo] = splitRepo(triggerContext.target.repository);
-        await deletePreviousReaction(
-          options.reactions,
-          triggerContext,
-          githubReactionId(reactionState),
-        );
-        await options.comments.createIssueComment({
-          installationId: triggerContext.target.installationId,
-          owner,
-          repo,
-          issueNumber: triggerContext.event.github.item.number,
-          body: await agentFailureNotice(
-            reason,
-            triggerContext.organizationId,
-            options.billingUrlForOrganization ?? missingBillingUrl,
-          ),
-        });
-        return null;
+      const issueNumber = isExecutionLimitDenial(reason)
+        ? triggerContext.event.github.item?.number
+        : undefined;
+      if (issueNumber == null) {
+        return reactToLifecycle(options.reactions, triggerContext, "-1", reactionState);
       }
-      return reactToLifecycle(options.reactions, triggerContext, "-1", reactionState);
+      await postExecutionLimitNotice(
+        options,
+        triggerContext,
+        { reason, issueNumber },
+        reactionState,
+      );
+      return null;
     },
     async onMachineTerminated(triggerContext, _reason, reactionState) {
       return reactToLifecycle(options.reactions, triggerContext, "-1", reactionState);
     },
   };
+}
+
+async function matchTrigger(
+  configurationStoreForProject: GitHubTriggerProviderOptions["configurationStoreForProject"],
+  externalTrigger: Parameters<TriggerProvider["match"]>[0],
+) {
+  const event = NormalizedGitHubEventSchema.parse(externalTrigger.payload);
+  const stored = await configurationStoreForProject(externalTrigger.projectId).getRevision(
+    externalTrigger.configurationRevisionId,
+  );
+  if (stored === undefined) return "configuration_unavailable";
+  const matches = matchGitHubInvocations(stored.configuration, event, externalTrigger);
+  if (typeof matches === "string") return matches;
+  const triggerContext: GitHubTriggerContext = {
+    provider: "github",
+    organizationId: externalTrigger.organizationId,
+    target: { installationId: event.installationId, repository: event.repo },
+    event: buildGitHubMergeData(event),
+    reactionSubject: reactionSubjectForEvent(event),
+  };
+  return matches.map(({ triggerName, invocation }): TriggerProviderMatch<GitHubTriggerContext> => {
+    const match = {
+      conversation: githubConversation(event),
+      triggerName,
+      triggerContext,
+      outputContext: triggerContext,
+      configurationRevisionId: stored.revision.id,
+      hubConfig: stored.configuration,
+    };
+    if (invocation.status === "accepted") return Object.assign(match, { invocation });
+    return Object.assign(match, { invocation });
+  });
+}
+
+async function postExecutionLimitNotice(
+  options: GitHubTriggerProviderOptions,
+  triggerContext: GitHubTriggerContext,
+  { reason, issueNumber }: { reason: string; issueNumber: number },
+  reactionState: TriggerProviderReactionState | undefined,
+): Promise<void> {
+  if (options.comments === undefined) throw new Error("GitHub comment client unavailable");
+  const [owner, repo] = splitRepo(triggerContext.target.repository);
+  await deletePreviousReaction(options.reactions, triggerContext, githubReactionId(reactionState));
+  const { delivery_id, received_at } = triggerContext.event.github;
+  const marker = executionLimitNoticeMarker(delivery_id, issueNumber);
+  const since = billingNoticeSince(received_at);
+  const target = { installationId: triggerContext.target.installationId, owner, repo, issueNumber };
+  const existing = await options.comments.findIssueCommentByMarker({
+    ...target,
+    marker,
+    ...(since === undefined ? {} : { since }),
+  });
+  if (existing !== undefined) return;
+
+  const notice = await agentFailureNotice(
+    reason,
+    triggerContext.organizationId,
+    options.billingUrlForOrganization ?? missingBillingUrl,
+  );
+  await options.comments.createIssueComment({ ...target, body: `${notice}\n\n${marker}` });
 }
 
 function buildGitHubMergeData(event: NormalizedGitHubEvent): GitHubMergeData {
@@ -331,6 +361,10 @@ function reactionSubjectForEvent(event: NormalizedGitHubEvent): GitHubReactionSu
       : { kind: "item", issueNumber: payload.pull_request.number };
   }
 
+  return commentReactionSubject(event);
+}
+
+function commentReactionSubject(event: NormalizedGitHubEvent): GitHubReactionSubject | null {
   if (event.type === "issue_comment") {
     const payload = IssueCommentPayloadSchema.parse(event.payload);
     return payload.comment?.id === undefined
@@ -358,9 +392,7 @@ function splitRepo(fullName: string): [owner: string, repo: string] {
   return [owner, repo];
 }
 
-function githubConversation(
-  event: NormalizedGitHubEvent,
-): import("../continuation.js").Conversation | null {
+function githubConversation(event: NormalizedGitHubEvent): Conversation | null {
   const item = event.payload["pull_request"] ?? event.payload["issue"];
   if (typeof item !== "object" || item === null) return null;
   const number: unknown = Reflect.get(item, "number");

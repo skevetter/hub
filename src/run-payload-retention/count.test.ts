@@ -174,13 +174,13 @@ it("constructs provider links from validated IDs and drops event text and untrus
     triggerContext: unknown = {},
     repo: string | null = null,
   ) =>
-    summarizeRunPayload(
-      { ...run, outputContext, triggerContext },
-      { provider, repo },
-      {},
-      undefined,
-      undefined,
-    );
+    summarizeRunPayload({
+      run: { ...run, outputContext, triggerContext },
+      receipt: { provider, repo },
+      stepCounts: {},
+      timeline: undefined,
+      progress: undefined,
+    });
   const github = summarize(
     "github",
     {},

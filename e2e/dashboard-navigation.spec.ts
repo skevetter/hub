@@ -19,9 +19,16 @@ test("redirects only a reachable organization index to Home", async ({ hub, page
   await expect(page).toHaveURL(home);
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
 
+  const reads = new Map<string, number>();
+  page.on("request", (request) => {
+    if (!request.url().includes("/_serverFn/")) return;
+    reads.set(request.url(), (reads.get(request.url()) ?? 0) + 1);
+  });
   await page.goto(new URL("/o/unknown", page.url()).href);
   await expect(page.getByRole("alert")).toContainText("Organization unavailable");
   await expect(page).toHaveURL(/\/o\/unknown$/u);
+  // The answer is final, so no read is asked a second time before it shows.
+  expect(Math.max(...reads.values())).toBe(1);
 });
 
 /** Projects are a runtime compatibility detail, not a concept in the hosted product navigation. */

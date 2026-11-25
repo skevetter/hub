@@ -18,8 +18,6 @@ const ERROR_BODY = "Paseo Hub could not complete this request.";
 const CONTINUATION_ERROR_BODY =
   "Paseo could not continue this conversation. Mention @paseo in a new comment.";
 const errorBodies = { terminal: ERROR_BODY, continuation: CONTINUATION_ERROR_BODY };
-const DELEGATION_ERROR_BODY =
-  "Paseo could not confirm who started this. Mention @paseo in a comment instead.";
 const STOP_BODY = "Stopped.";
 const STOP_UNCONFIRMED_BODY = "Stop requested; I could not confirm it stopped";
 const BUSY_BODY = "Still working on the previous message; reply when I have answered.";
@@ -78,7 +76,7 @@ export function tracePilotActivities(
   };
 }
 type BodyContent = Extract<LinearAgentActivityContent, { body: string }>;
-type Purpose = "ack" | "terminal" | "stop" | "busy" | "delegationRefused";
+type Purpose = "ack" | "terminal" | "stop" | "busy";
 
 interface ActivityOptions {
   /** Return L1 bound to this event's exact installation and current operation authorization. */
@@ -88,24 +86,11 @@ interface ActivityOptions {
 
 function activityTiming(purpose: Purpose, receivedAt: number, started: number) {
   const ack = purpose === "ack";
-  const initial = ack || purpose === "delegationRefused";
-  return { ack, initial, deadline: initial ? receivedAt + PILOT_ACK_MS : started + TERMINAL_MS };
+  return { ack, deadline: ack ? receivedAt + PILOT_ACK_MS : started + TERMINAL_MS };
 }
 
 function expiredInitialWrite(deadline: number, receivedAt: number, started: number) {
   return !Number.isFinite(deadline) || receivedAt > started || started >= deadline;
-}
-
-type WriteDelegationRefusal = (
-  event: LinearPilotAcceptedEvent,
-) => Promise<LinearPilotWriteDisposition>;
-
-function delegationRefusalWriter(write: WriteDelegationRefusal) {
-  return function refuseDelegation(event: LinearPilotAcceptedEvent) {
-    if (event.kind !== "created" || event.interactionId !== event.nativeSessionId)
-      return Promise.resolve({ disposition: "denied" } as const);
-    return write(event);
-  };
 }
 
 export function claimPilotActivity(claims: Map<string, number>, slot: string, started: number) {
@@ -226,7 +211,6 @@ async function deliver(
 
 interface WriteTiming {
   ack: boolean;
-  initial: boolean;
   deadline: number;
 }
 
@@ -237,13 +221,13 @@ async function deliverBeforeDeadline(
   options: Required<ActivityOptions>,
 ) {
   const { signal, purpose, event } = input;
-  const { ack, initial, deadline } = timing;
+  const { ack, deadline } = timing;
   const { clientFor, now } = options;
   const timeout = new AbortController();
   const callSignal = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
   const interrupted = () => {
     if (timeout.signal.aborted || now() >= deadline) {
-      return { disposition: initial ? "expired" : "unconfirmed", activityId } as const;
+      return { disposition: ack ? "expired" : "unconfirmed", activityId } as const;
     }
     return callSignal.aborted ? ({ disposition: "cancelled", activityId } as const) : undefined;
   };
@@ -276,7 +260,7 @@ function makeWriter(options: Required<ActivityOptions>): Write {
     if (signal?.aborted) return { disposition: "cancelled" };
     const started = options.now();
     const timing = activityTiming(purpose, event.receivedAt, started);
-    if (timing.initial && expiredInitialWrite(timing.deadline, event.receivedAt, started))
+    if (timing.ack && expiredInitialWrite(timing.deadline, event.receivedAt, started))
       return { disposition: "expired" };
     const activityId = stableActivityId(event.nativeSessionId, purpose, event.interactionId);
     const refused = claimWrite(input, claims, started);
@@ -327,19 +311,6 @@ function stopWith(write: Write) {
   };
 }
 
-function refuseWith(write: Write) {
-  return delegationRefusalWriter((event) =>
-    write({
-      event,
-      attempt: "first-attempt",
-      purpose: "delegationRefused",
-      kind: "error",
-      prepareBody: () => DELEGATION_ERROR_BODY,
-      signal: undefined,
-    }),
-  );
-}
-
 export function createLinearPilotActivities({ clientFor, now = Date.now }: ActivityOptions) {
   const write = makeWriter({ clientFor, now });
   return {
@@ -375,7 +346,6 @@ export function createLinearPilotActivities({ clientFor, now = Date.now }: Activ
         signal,
       });
     },
-    refuseDelegation: refuseWith(write),
     busy(
       event: LinearPilotAcceptedEvent,
       attempt: LinearPilotActivityAttempt,

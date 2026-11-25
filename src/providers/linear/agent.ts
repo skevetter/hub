@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { DELEGATION_HISTORY_LIMIT, delegationReadback } from "../../linear-pilot/delegation.js";
 import {
   readPilotPriorPage,
   readPilotPromptPage,
@@ -152,7 +151,6 @@ export type LinearAgentOperation =
       kind:
         | "readPilotPrompt"
         | "readPilotHistory"
-        | "readDelegationOrigin"
         | "readDelegationConfirmation"
         | "readDelegationIssue";
       sessionId: string;
@@ -191,59 +189,6 @@ type Send = <T>(
   variables: Record<string, unknown>,
   data: z.ZodType<T>,
 ) => Promise<T>;
-
-const delegationOriginQuery = `query PaseoPilotDelegationOrigin($sessionId: String!) {
-  agentSession(id: $sessionId) {
-    id createdAt appUser { id } creator { id } comment { id user { id } } sourceComment { id }
-    issue {
-      id identifier title description team { id organization { id } }
-      delegate { id } assignee { id }
-      history(first: ${DELEGATION_HISTORY_LIMIT}, orderBy: createdAt) {
-        nodes {
-          id createdAt actor { id } botActor { id } toDelegate { id } toAssignee { id }
-          triageResponsibilityAutoAssigned
-        }
-      }
-    }
-  }
-}`;
-
-type RunDelegationRead = (
-  operation: LinearAgentOperation,
-  variables: { sessionId: string },
-  signal: AbortSignal,
-  perform: (
-    send: Send,
-    viewer: z.infer<typeof user>,
-    checkCurrent: () => Promise<void>,
-  ) => Promise<z.infer<typeof delegationReadback>>,
-) => Promise<z.infer<typeof delegationReadback>>;
-
-async function fetchDelegationOrigin(
-  send: Send,
-  checkCurrent: () => Promise<void>,
-  variables: { sessionId: string },
-) {
-  const result = await send(delegationOriginQuery, variables, delegationReadback);
-  await checkCurrent();
-  return result;
-}
-
-function delegationOriginReader(
-  run: RunDelegationRead,
-  requireScope: (input: PilotHistoryScope) => PilotHistoryScope,
-) {
-  return async function readDelegationOrigin(input: PilotHistoryScope, signal: AbortSignal) {
-    const { sessionId, issueId } = requireScope(input);
-    const variables = { sessionId };
-    return run(
-      { kind: "readDelegationOrigin", sessionId, issueId },
-      variables,
-      signal,
-      (send, _viewer, checkCurrent) => fetchDelegationOrigin(send, checkCurrent, variables),
-    );
-  };
-}
 
 function agentConnection(options: LinearAgentClientOptions) {
   const binding = Object.freeze({ ...options.binding });
@@ -586,7 +531,6 @@ function historyMethods(
   requireHistoryScope: ReturnType<typeof agentConnection>["requireHistoryScope"],
 ) {
   return {
-    readDelegationOrigin: delegationOriginReader(run, requireHistoryScope),
     async readPilotPrompt(
       input: PilotHistoryScope,
       expected: z.input<typeof historyPrompt>,

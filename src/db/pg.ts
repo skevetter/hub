@@ -55,6 +55,9 @@ import {
 } from "./workflow-intake.js";
 import { randomUUID } from "node:crypto";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import type { StopCleanupState } from "../triggers/run-stop.js";
+import type { AgentSessionAction } from "../agent-sessions/index.js";
+import type { Conversation } from "../triggers/continuation.js";
 import { parseCompiledHubConfig, type JsonValue } from "../config/compiler.js";
 import { parseInvocationInputs, parseInvocationRejection } from "../triggers/invocation.js";
 import { DEFAULT_UNSUPPORTED_LINEAR_RECEIPTS_PER_HOUR } from "./unsupported-linear.js";
@@ -85,7 +88,7 @@ import {
   launchedAgent,
 } from "./mappers.js";
 import type { AgentExecutionStatus, MachineSource, MachineStatus } from "./schema.js";
-import type { DatabaseRuntime, QueryHandle, QueryRow } from "./runtime/index.js";
+import type { DatabaseRuntime, QueryHandle, QueryRow, TransactionHandle } from "./runtime/index.js";
 import type { Locks } from "./runtime/locks/index.js";
 import { triggerProviderEvent } from "./trigger-list.js";
 import type {
@@ -149,8 +152,10 @@ import type {
   GitHubRepositoryRecord,
   GitHubConfigurationTarget,
   ProjectTriggerRoute,
+  MigrateProjectTriggerInput,
   MigrateProjectTriggersInput,
   OrganizationTriggerRecord,
+  OrganizationTriggerRoute,
   OrganizationTriggerRevisionRecord,
   PendingProjectTriggerMigration,
   SaveOrganizationTriggerInput,
@@ -190,6 +195,7 @@ import type {
   ActivityRunScope,
   TriggerListPage,
   TriggerListRequest,
+  PendingHubActionScope,
 } from "./types.js";
 
 const STEP_PAYLOAD_PROJECTION = `step.id, step.trigger_run_id, step.step_id, step.ordinal, step.status,
@@ -241,6 +247,141 @@ const EXECUTION_INSERT_OWNERS = `select run.payload_expiry_state, run.status fro
       and run.organization_id = $2 and run.project_id = $3)
   for share of run`;
 
+const INSERT_AGENT_EXECUTION = `
+          with owners as materialized (${EXECUTION_INSERT_OWNERS})
+          insert into agent_executions (
+            id,
+            organization_id,
+            project_id,
+            machine_id,
+            daemon_id,
+            status,
+            started_at,
+            trigger_context,
+            output_context,
+            configuration_revision_id,
+            completion_token_hash,
+            deadline_at,
+            idle_deadline_at,
+            launch_intent,
+            workflow_step_run_id,
+            result,
+            completed_at,
+            reaction_state,
+            used_temporary_credentials
+          )
+          select coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
+                 $12,
+                 case
+                   when $13::timestamptz is null then null
+                   when $12::timestamptz is null then $13::timestamptz
+                   else least($12::timestamptz, $13::timestamptz)
+                 end,
+                 $14, $15, $16,
+                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
+                 $17, $18
+          from projects
+          where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
+            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
+            and exists (
+              select 1 from project_configuration_revisions
+              where id = $10 and project_id = $3 and organization_id = $2
+            )
+            and ($5::uuid is null or exists (
+              select 1 from daemons daemon
+              join machines daemon_machine on daemon_machine.id = daemon.machine_id
+              where daemon.id = $5 and daemon_machine.org_id = $2
+            ))
+            and ($4::uuid is null or exists (
+              select 1 from machines where id = $4 and org_id = $2
+            ))
+          returning *
+        `;
+
+const INSERT_AGENT_EXECUTION_IF_ABSENT = `
+          with owners as materialized (${EXECUTION_INSERT_OWNERS})
+          insert into agent_executions (
+            id,
+            organization_id,
+            project_id,
+            machine_id,
+            daemon_id,
+            status,
+            started_at,
+            trigger_context,
+            output_context,
+            configuration_revision_id,
+            completion_token_hash,
+            deadline_at,
+            idle_deadline_at,
+            launch_intent,
+            workflow_step_run_id,
+            result,
+            completed_at,
+            used_temporary_credentials
+          )
+          select $1, $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
+                 $12,
+                 case
+                   when $13::timestamptz is null then null
+                   when $12::timestamptz is null then $13::timestamptz
+                   else least($12::timestamptz, $13::timestamptz)
+                 end,
+                 $14, $15, $16,
+                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
+                 $17
+          from projects
+          where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
+            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
+            and exists (
+              select 1 from project_configuration_revisions
+              where id = $10 and project_id = $3 and organization_id = $2
+            )
+            and ($5::uuid is null or exists (
+              select 1 from daemons daemon
+              join machines daemon_machine on daemon_machine.id = daemon.machine_id
+              where daemon.id = $5 and daemon_machine.org_id = $2
+            ))
+            and ($4::uuid is null or exists (
+              select 1 from machines where id = $4 and org_id = $2
+            ))
+          on conflict (id) do nothing
+          returning *
+        `;
+
+const TRANSITION_AGENT_EXECUTION = `
+          update agent_executions
+          set
+            status = $2,
+            completed_at = case
+              when $3::boolean then now()
+              else completed_at
+            end,
+            result = case when $4::boolean then $5 else result end,
+            completed_by_agent_at = case
+              when $6::boolean and $2 = 'succeeded'::agent_execution_status then now()
+              else completed_by_agent_at
+            end,
+            idle_deadline_at = case
+              when $3::boolean then null
+              else idle_deadline_at
+            end,
+            hub_action = case when $10::boolean then $11 else hub_action end,
+            hub_action_completed_at = case
+              when $10::boolean and $11::text is null then now()
+              when $10::boolean then null
+              else hub_action_completed_at
+            end
+          where id = $1
+            and status in ('spawning', 'running')
+            and (
+              $7::text is null
+              or ($7 = 'hard' and deadline_at = $8 and deadline_at <= $9)
+              or ($7 = 'idle' and idle_deadline_at = $8 and idle_deadline_at <= $9)
+            )
+          returning *
+        `;
+
 const EXECUTION_PAYLOAD_PROJECTION = `execution.id, execution.agent_session_id, execution.agent_session_action,
   execution.organization_id, execution.project_id, execution.machine_id, execution.status,
   execution.started_at, execution.completed_at, execution.completed_by_agent_at, execution.deadline_at,
@@ -284,13 +425,13 @@ async function stageRunPayload(client: QueryHandle, row: TriggerRunRow, now: Dat
   );
   const stepCounts: RunPayloadSummary["stepCounts"] = {};
   for (const count of counts.rows) stepCounts[count.status] = count.count;
-  const summary = summarizeRunPayload(
+  const summary = summarizeRunPayload({
     run,
-    receipt.rows[0]!,
+    receipt: requireReturnedRow(receipt.rows[0], "trigger run receipt"),
     stepCounts,
-    timeline.rows[0],
-    progress.rows[0],
-  );
+    timeline: timeline.rows[0],
+    progress: progress.rows[0],
+  });
   await client.query(
     `update trigger_runs set payload_expiry_state = 'expiring', payload_expired_at = $2,
       payload_summary = $3, prompt = '', inputs = '{}', values = '{}', trigger_context = '{}',
@@ -840,79 +981,12 @@ class PgDatabase implements Database {
 
   async insertAgentExecution(input: InsertAgentExecutionInput): Promise<AgentExecutionRecord> {
     try {
-      const rows = await query<AgentExecutionRow>(
-        this.pool,
-        `
-          with owners as materialized (${EXECUTION_INSERT_OWNERS})
-          insert into agent_executions (
-            id,
-            organization_id,
-            project_id,
-            machine_id,
-            daemon_id,
-            status,
-            started_at,
-            trigger_context,
-            output_context,
-            configuration_revision_id,
-            completion_token_hash,
-            deadline_at,
-            idle_deadline_at,
-            launch_intent,
-            workflow_step_run_id,
-            result,
-            completed_at,
-            reaction_state,
-            used_temporary_credentials
-          )
-          select coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
-                 $12,
-                 case
-                   when $13::timestamptz is null then null
-                   when $12::timestamptz is null then $13::timestamptz
-                   else least($12::timestamptz, $13::timestamptz)
-                 end,
-                 $14, $15, $16,
-                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
-                 $17, $18
-          from projects
-          where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
-            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
-            and exists (
-              select 1 from project_configuration_revisions
-              where id = $10 and project_id = $3 and organization_id = $2
-            )
-            and ($5::uuid is null or exists (
-              select 1 from daemons daemon
-              join machines daemon_machine on daemon_machine.id = daemon.machine_id
-              where daemon.id = $5 and daemon_machine.org_id = $2
-            ))
-            and ($4::uuid is null or exists (
-              select 1 from machines where id = $4 and org_id = $2
-            ))
-          returning *
-        `,
-        [
-          input.id ?? null,
-          input.organizationId,
-          input.projectId,
-          input.machineId,
-          input.daemonId ?? null,
-          input.status ?? "spawning",
-          input.startedAt ?? null,
-          input.triggerContext,
-          input.outputContext,
-          input.configurationRevisionId,
-          input.completionTokenHash ?? null,
-          input.deadlineAt ?? null,
-          input.idleDeadlineAt ?? null,
-          input.launchIntent ?? null,
-          input.workflowStepRunId ?? null,
-          input.result ?? null,
-          input.reactionState ?? null,
-          temporaryCredentialFact(input.launchIntent ?? null),
-        ],
-      );
+      const rows = await query<AgentExecutionRow>(this.pool, INSERT_AGENT_EXECUTION, [
+        input.id ?? null,
+        ...agentExecutionInsertParameters(input),
+        input.reactionState ?? null,
+        temporaryCredentialFact(input.launchIntent ?? null),
+      ]);
       const execution = rows.rows[0];
 
       if (execution === undefined) {
@@ -929,78 +1003,11 @@ class PgDatabase implements Database {
     input: InsertAgentExecutionInput & { id: string },
   ): Promise<AgentExecutionRecord | undefined> {
     try {
-      const rows = await query<AgentExecutionRow>(
-        this.pool,
-        `
-          with owners as materialized (${EXECUTION_INSERT_OWNERS})
-          insert into agent_executions (
-            id,
-            organization_id,
-            project_id,
-            machine_id,
-            daemon_id,
-            status,
-            started_at,
-            trigger_context,
-            output_context,
-            configuration_revision_id,
-            completion_token_hash,
-            deadline_at,
-            idle_deadline_at,
-            launch_intent,
-            workflow_step_run_id,
-            result,
-            completed_at,
-            used_temporary_credentials
-          )
-          select $1, $2, $3, $4, $5, $6::agent_execution_status, coalesce($7, now()), $8, $9, $10, $11,
-                 $12,
-                 case
-                   when $13::timestamptz is null then null
-                   when $12::timestamptz is null then $13::timestamptz
-                   else least($12::timestamptz, $13::timestamptz)
-                 end,
-                 $14, $15, $16,
-                 case when $6 = 'failed'::agent_execution_status then coalesce($7, now()) else null end,
-                 $17
-          from projects
-          where projects.id = $3 and projects.organization_id = $2 and projects.status = 'active'
-            and not exists (select 1 from owners where payload_expiry_state is not null or status = 'canceled')
-            and exists (
-              select 1 from project_configuration_revisions
-              where id = $10 and project_id = $3 and organization_id = $2
-            )
-            and ($5::uuid is null or exists (
-              select 1 from daemons daemon
-              join machines daemon_machine on daemon_machine.id = daemon.machine_id
-              where daemon.id = $5 and daemon_machine.org_id = $2
-            ))
-            and ($4::uuid is null or exists (
-              select 1 from machines where id = $4 and org_id = $2
-            ))
-          on conflict (id) do nothing
-          returning *
-        `,
-        [
-          input.id,
-          input.organizationId,
-          input.projectId,
-          input.machineId,
-          input.daemonId ?? null,
-          input.status ?? "spawning",
-          input.startedAt ?? null,
-          input.triggerContext,
-          input.outputContext,
-          input.configurationRevisionId,
-          input.completionTokenHash ?? null,
-          input.deadlineAt ?? null,
-          input.idleDeadlineAt ?? null,
-          input.launchIntent ?? null,
-          input.workflowStepRunId ?? null,
-          input.result ?? null,
-          temporaryCredentialFact(input.launchIntent ?? null),
-        ],
-      );
+      const rows = await query<AgentExecutionRow>(this.pool, INSERT_AGENT_EXECUTION_IF_ABSENT, [
+        input.id,
+        ...agentExecutionInsertParameters(input),
+        temporaryCredentialFact(input.launchIntent ?? null),
+      ]);
       const execution = rows.rows[0];
       return execution === undefined ? undefined : toAgentExecutionRecord(execution);
     } catch (error) {
@@ -1069,31 +1076,7 @@ class PgDatabase implements Database {
           if (record.outcome !== "rejected") throw new Error("trigger branch outcome conflict");
           return { run: record, created: false };
         }
-        const createdAt = input.createdAt ?? new Date();
-        const inserted = await client.query<TriggerRunRow>(
-          `insert into trigger_runs
-           (id, organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
-           configured_trigger_name, outcome, status,
-            prompt, inputs, values, trigger_context, output_context, deadline_at, rejection, created_at, completed_at)
-         values (coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6, 'rejected', 'rejected',
-                 $7, $8, '{}'::jsonb, $9, $10, null, $12, $11, $11)
-         on conflict (provider_event_receipt_id, project_id, configured_trigger_name) do nothing
-         returning *`,
-          [
-            input.id ?? null,
-            input.organizationId,
-            input.projectId,
-            input.configurationRevisionId,
-            input.providerEventReceiptId,
-            input.configuredTriggerName,
-            input.prompt,
-            input.inputs,
-            input.triggerContext,
-            input.outputContext,
-            createdAt,
-            input.rejection,
-          ],
-        );
+        const inserted = await insertRejectedTriggerRun(client, input);
         let run = inserted.rows[0];
         const created = run !== undefined;
         if (run === undefined) {
@@ -1245,7 +1228,10 @@ class PgDatabase implements Database {
           `update workflow_wakeups set lease_expires_at = $2 where trigger_run_id = $1 returning *`,
           [wakeup.trigger_run_id, new Date(now.getTime() + leaseMs)],
         );
-        return toWorkflowWakeupRecord(updated.rows[0]!, wakeup.lease_expires_at !== null);
+        return toWorkflowWakeupRecord(
+          requireReturnedRow(updated.rows[0], "claimed workflow wakeup"),
+          wakeup.lease_expires_at !== null,
+        );
       });
     } catch (error) {
       throw toDatabaseError(error);
@@ -1273,12 +1259,7 @@ class PgDatabase implements Database {
         const run = runRows.rows[0];
         if (run === undefined) throw new Error("workflow trigger run not found");
         if (run.outcome !== "accepted" || run.status !== "running") {
-          const stepRows = await client.query<WorkflowStepRunRow>(
-            `select * from workflow_step_runs where trigger_run_id = $1 and step_id = $2 and ordinal = $3`,
-            [input.triggerRunId, input.stepId, input.ordinal],
-          );
-          const step = stepRows.rows[0];
-          if (step === undefined) throw new Error("workflow step run not found");
+          const step = await findWorkflowStepForExecution(client, input);
           return {
             stepRun: toWorkflowStepRunRecord({
               ...step,
@@ -1290,106 +1271,10 @@ class PgDatabase implements Database {
         }
         if (run.deadline_at === null || run.deadline_at.getTime() <= startedAt.getTime()) {
           await timeoutWorkflowRunOnClient(client, run, startedAt);
-          const stepRows = await client.query<WorkflowStepRunRow>(
-            `select * from workflow_step_runs where trigger_run_id = $1 and step_id = $2 and ordinal = $3`,
-            [input.triggerRunId, input.stepId, input.ordinal],
-          );
-          const step = stepRows.rows[0];
-          if (step === undefined) throw new Error("workflow step run not found");
+          const step = await findWorkflowStepForExecution(client, input);
           return { stepRun: toWorkflowStepRunRecord(step), execution: undefined, created: false };
         }
-        const deadlineAt = new Date(
-          Math.min(input.execution.deadlineAt.getTime(), run.deadline_at.getTime()),
-        );
-        const idleDeadlineAt = new Date(
-          Math.min(
-            input.execution.idleDeadlineAt.getTime(),
-            deadlineAt.getTime(),
-            run.deadline_at.getTime(),
-          ),
-        );
-        const selected = await client.query<WorkflowStepRunRow>(
-          `select * from workflow_step_runs where trigger_run_id = $1 and step_id = $2 and ordinal = $3 for update`,
-          [input.triggerRunId, input.stepId, input.ordinal],
-        );
-        let step = selected.rows[0];
-        if (step === undefined) throw new Error("workflow step run not found");
-        if (step.agent_execution_id !== null) {
-          const existing = await client.query<AgentExecutionRow>(
-            `select * from agent_executions where id = $1`,
-            [step.agent_execution_id],
-          );
-          return {
-            stepRun: toWorkflowStepRunRecord(step),
-            execution:
-              existing.rows[0] === undefined ? undefined : toAgentExecutionRecord(existing.rows[0]),
-            created: false,
-          };
-        }
-        const execution = await insertAgentExecutionOnClient(client, {
-          ...input.execution,
-          id: input.executionId,
-          deadlineAt,
-          idleDeadlineAt,
-          workflowStepRunId: step.id,
-        });
-        // Reserve one meter unit in the same transaction that creates the execution. If the
-        // reservation is denied the whole transaction rolls back, so no execution is created and
-        // nothing is dispatched — metering is atomic with the work it permits.
-        if (input.reservation !== undefined) {
-          const reserved = await reserveOrganizationUsageOnClient(client, {
-            organizationId: input.execution.organizationId,
-            meter: input.reservation.meter,
-            periodStart: input.reservation.periodStart,
-            amount: 1,
-            limit: input.reservation.limit,
-          });
-          if (reserved === undefined) {
-            if (input.reservation.limit === null) {
-              throw new Error("unreachable: an unlimited meter reservation cannot be denied");
-            }
-            const usage = await client.query<OrganizationUsageRow>(
-              `select used from organization_usage
-             where organization_id = $1 and meter = $2 and period_start = $3`,
-              [
-                input.execution.organizationId,
-                input.reservation.meter,
-                input.reservation.periodStart,
-              ],
-            );
-            return client.rollback({
-              stepRun: toWorkflowStepRunRecord(step),
-              execution: undefined,
-              created: false,
-              reservationDenied: {
-                meter: input.reservation.meter,
-                limit: input.reservation.limit,
-                current: Number(usage.rows[0]?.used ?? 0),
-              },
-            });
-          }
-        }
-        const updated = await client.query<WorkflowStepRunRow>(
-          `update workflow_step_runs
-         set status = 'running', agent_execution_id = $2, started_at = coalesce(started_at, $3),
-             deadline_at = $4, idle_deadline_at = $5, dispatch_intent = coalesce($6, dispatch_intent)
-         where id = $1 and agent_execution_id is null
-         returning *`,
-          [
-            step.id,
-            execution.id,
-            execution.started_at,
-            execution.deadline_at,
-            execution.idle_deadline_at,
-            input.execution.launchIntent ?? null,
-          ],
-        );
-        step = updated.rows[0] ?? step;
-        return {
-          stepRun: toWorkflowStepRunRecord(step),
-          execution: toAgentExecutionRecord(execution),
-          created: true,
-        };
+        return startWorkflowStepExecutionOnClient(client, input, run.deadline_at);
       });
     } catch (error) {
       throw toDatabaseError(error);
@@ -1428,15 +1313,7 @@ class PgDatabase implements Database {
         if (step.agent_execution_id === executionId) {
           return toWorkflowStepRunRecord(step);
         }
-        const execution = await client.query<AgentExecutionRow>(
-          `select * from agent_executions where id = $1 for update`,
-          [executionId],
-        );
-        const executionRow = execution.rows[0];
-        if (executionRow === undefined)
-          throw new Error(`agent execution not found: ${executionId}`);
-        if (executionRow.launch_intent_expired_at != null)
-          throw new Error("agent execution launch intent expired");
+        const executionRow = await lockLinkableWorkflowExecution(client, executionId);
         const updated = await client.query<WorkflowStepRunRow>(
           `update workflow_step_runs
          set status = case when status = 'pending' then 'running' else status end,
@@ -1470,12 +1347,9 @@ class PgDatabase implements Database {
       ...(failureReason === undefined ? {} : { failureReason }),
     });
     const step = await this.findWorkflowStepRunById(execution.workflowStepRunId);
-    return step === undefined
-      ? undefined
-      : {
-          stepRun: step,
-          run: (await this.findTriggerRunById(step.triggerRunId))!,
-        };
+    if (step === undefined) return undefined;
+    const run = await this.findTriggerRunById(step.triggerRunId);
+    return run === undefined ? undefined : { stepRun: step, run };
   }
 
   async completeWorkflowAgentExecution(input: WorkflowAgentCompletionInput) {
@@ -1500,95 +1374,7 @@ class PgDatabase implements Database {
             ...(input.hubAction === undefined ? {} : { hubAction: input.hubAction }),
           });
         }
-
-        const stepLookup = await client.query<WorkflowStepRunRow>(
-          `select * from workflow_step_runs where id = $1`,
-          [initial.workflow_step_run_id],
-        );
-        const stepCandidate = stepLookup.rows[0];
-        if (stepCandidate === undefined) throw new Error("workflow step run not found");
-        const runRows = await client.query<TriggerRunRow>(
-          `select * from trigger_runs where id = $1 for update`,
-          [stepCandidate.trigger_run_id],
-        );
-        const run = runRows.rows[0];
-        if (run === undefined) throw new Error("workflow trigger run not found");
-        const stepRows = await client.query<WorkflowStepRunRow>(
-          `select * from workflow_step_runs where id = $1 for update`,
-          [initial.workflow_step_run_id],
-        );
-        const step = stepRows.rows[0];
-        if (step === undefined) throw new Error("workflow step run not found");
-
-        const executionRows = await client.query<AgentExecutionRow>(
-          `select * from agent_executions where id = $1 for update`,
-          [input.executionId],
-        );
-        const execution = executionRows.rows[0];
-        if (execution === undefined)
-          throw new Error(`agent execution not found: ${input.executionId}`);
-        if (run.payload_expiry_state != null || run.status === "canceled") {
-          return {
-            execution: toAgentExecutionRecord({
-              ...execution,
-              payload_hidden: run.payload_expiry_state != null,
-            }),
-            transitioned: false,
-          };
-        }
-        const observedAt = input.observedAt ?? new Date();
-        if (execution.status === "spawning" || execution.status === "running") {
-          const deadlineKind = workflowDeadlineKind(execution, step, run, observedAt);
-          if (deadlineKind === "whole_run") {
-            const recovery = await timeoutWorkflowRunOnClient(client, run, observedAt);
-            const terminalRun = await findTriggerRunOnClient(client, run.id);
-            const updatedExecution = await findAgentExecutionOnClient(client, input.executionId);
-            return transitionWithTerminalRun(
-              {
-                execution: updatedExecution ?? toAgentExecutionRecord(execution),
-                transitioned: recovery.executionIds.includes(input.executionId),
-                deadlineKind,
-              },
-              terminalRun,
-            );
-          }
-          if (deadlineKind !== undefined) {
-            const updated = await timeoutWorkflowStepOnClient(
-              client,
-              execution,
-              step,
-              run,
-              deadlineKind,
-              observedAt,
-            );
-            const terminalRun = await findTriggerRunOnClient(client, run.id);
-            return transitionWithTerminalRun(
-              {
-                execution: toAgentExecutionRecord(updated),
-                transitioned: true,
-                deadlineKind,
-              },
-              terminalRun,
-            );
-          }
-        }
-
-        const liveTransition = await transitionWorkflowAgentExecution(client, execution, input);
-        if (liveTransition === undefined) {
-          return { execution: toAgentExecutionRecord(execution), transitioned: false };
-        }
-
-        await finishWorkflowStepAndRun(client, step, run, input);
-        const terminalRun = await findTriggerRunOnClient(client, run.id);
-
-        return transitionWithTerminalRun(
-          {
-            execution: toAgentExecutionRecord(liveTransition.execution),
-            transitioned: liveTransition.transitioned,
-            ...(input.deadlineKind === undefined ? {} : { deadlineKind: input.deadlineKind }),
-          },
-          terminalRun,
-        );
+        return completeLinkedWorkflowExecution(client, input, initial.workflow_step_run_id);
       });
     } catch (error) {
       throw toDatabaseError(error);
@@ -1701,7 +1487,7 @@ class PgDatabase implements Database {
   async readRunStopDetails(organizationId: string, triggerRunId: string) {
     const result = await query<{
       stoppedByName: string | null;
-      cleanupState: import("../triggers/run-stop.js").StopCleanupState;
+      cleanupState: StopCleanupState;
       coalesced: boolean;
       retryAttemptId: string | null;
       otherAttachedRunCount: number;
@@ -1756,117 +1542,15 @@ class PgDatabase implements Database {
     retryAttemptId?: string,
   ) {
     try {
-      return await this.pool.transaction(async (client) => {
-        const locked = await client.query<TriggerRunRow>(
-          "select * from trigger_runs where organization_id = $1 and id = $2 for update",
-          [organizationId, triggerRunId],
-        );
-        const current = locked.rows[0];
-        if (current === undefined) return undefined;
-        const runRecord = toTriggerRunRecord(current);
-        const noop = { run: runRecord, transitioned: false, executionIds: [] };
-        const retrying = current.status === "canceled" && retryAttemptId !== undefined;
-        if (!retrying && (current.status !== "running" || retryAttemptId !== undefined))
-          return noop;
-        const ownedQuery = `select linked.* from trigger_runs run cross join lateral (${RUN_STOP_OWNED}) linked
-          where run.id = $1`;
-        const targets = retrying
-          ? `${RUN_STOP_RETRYABLE} and ${RUN_STOP_ATTEMPT} = $2`
-          : "status in ('spawning', 'running')";
-        const scopeParams = retrying ? [triggerRunId, retryAttemptId] : [triggerRunId];
-        if (retrying) {
-          if (current.payload_expiry_state !== null || confirmedPeerCount === undefined)
-            return noop;
-          const retry = await client.query<{ attempt_id: string | null; pending: boolean }>(
-            `with owned as materialized (${ownedQuery})
-             select (select max(${RUN_STOP_ATTEMPT}) from owned where ${RUN_STOP_RETRYABLE}) as attempt_id,
-                    (${RUN_STOP_PENDING}) as pending
-             from trigger_runs run where run.id = $1`,
-            [triggerRunId],
-          );
-          if (retry.rows[0]?.attempt_id !== retryAttemptId || retry.rows[0].pending) return noop;
-        }
-        // Attaching an execution takes a foreign-key lock on its session row.
-        await client.query(
-          `with owned as materialized (${ownedQuery})
-           select session.id from agent_sessions session
-           where session.id in (select agent_session_id from owned where ${targets})
-           order by session.id for update`,
-          scopeParams,
-        );
-        const peers = await client.query<{ id: string; run_id: string }>(
-          `with owned as materialized (${ownedQuery}), targets as (select * from owned where ${targets})
-           ${RUN_STOP_PEERS}`,
-          scopeParams,
-        );
-        const peerCount = new Set(peers.rows.map(({ run_id }) => run_id)).size;
-        if (confirmedPeerCount !== undefined && confirmedPeerCount !== peerCount)
-          return { ...noop, conflict: peerCount };
-        const attemptId = randomUUID();
-        const approvedPeers = JSON.stringify(peers.rows.map(({ id }) => id));
-        if (retrying) {
-          const retried = await client.query<{ id: string }>(
-            `with owned as materialized (${ownedQuery})
-             update agent_executions set hub_action_completed_at = null,
-               hub_action_acknowledgements = jsonb_set(
-                 coalesce(hub_action_acknowledgements, '{}'::jsonb)
-                   - 'stop_interrupt_claim' - 'stop_interrupt_checked_at',
-                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
-                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
-                 || jsonb_build_object('stop_interrupt_generation', $4::text)
-             where id in (select id from owned where ${targets})
-             returning id`,
-            [triggerRunId, retryAttemptId, approvedPeers, attemptId],
-          );
-          return { ...noop, executionIds: retried.rows.map(({ id }) => id) };
-        }
-        const updated = await client.query<TriggerRunRow>(
-          `update trigger_runs set status = 'canceled', completed_at = now(),
-             terminal_notification_pending_at = now(), terminal_notification_lease_expires_at = null
-           where organization_id = $1 and id = $2 and status = 'running' returning *`,
-          [organizationId, triggerRunId],
-        );
-        const run = updated.rows[0]!;
-        await client.query(
-          `update workflow_step_runs
-           set status = case when status = 'running' then 'canceled' else 'skipped' end,
-               completed_at = $2
-           where trigger_run_id = $1 and status in ('pending', 'running')`,
-          [run.id, run.completed_at],
-        );
-        const executions = await client.query<{ id: string }>(
-          `update agent_executions
-           set status = 'failed', completed_at = $2, idle_deadline_at = null,
-               result = '{"status":"canceled"}',
-               hub_action = case when daemon_id is not null then 'interrupt' end,
-               hub_action_completed_at = null,
-               hub_action_acknowledgements = jsonb_set(
-                 coalesce(hub_action_acknowledgements, '{}'::jsonb),
-                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
-                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
-           where status in ('spawning', 'running') and id in (
-             select execution_id from trigger_runs run
-             cross join lateral (${runExecutions("run", "execution.id as execution_id")}) linked
-             where run.id = $1
-           )
-           returning id`,
-          [run.id, run.completed_at, approvedPeers, attemptId],
-        );
-        await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [run.id]);
-        if (stoppedByUserId !== undefined) {
-          await client.query(
-            `insert into audit_events
-             (organization_id, project_id, actor_kind, actor_identity, action, subject_type, subject_id, evidence, created_at)
-             values ($1, $2, 'user', $3, 'run.canceled', 'trigger_run', $4, '{}'::jsonb, $5)`,
-            [organizationId, run.project_id, stoppedByUserId, run.id, run.completed_at],
-          );
-        }
-        return {
-          run: toTriggerRunRecord(run),
-          transitioned: true,
-          executionIds: executions.rows.map(({ id }) => id),
-        };
-      });
+      return await this.pool.transaction((client) =>
+        cancelTriggerRunOnClient(client, {
+          organizationId,
+          triggerRunId,
+          stoppedByUserId,
+          confirmedPeerCount,
+          retryAttemptId,
+        }),
+      );
     } catch (error) {
       throw toDatabaseError(error);
     }
@@ -1910,9 +1594,7 @@ class PgDatabase implements Database {
           [triggerRunId, stepId ?? null],
         );
         const step = stepRows.rows[0];
-        if (run === undefined || step === undefined) {
-          return undefined;
-        }
+        if (run === undefined || step === undefined) return undefined;
         if (run.status !== "running") {
           return {
             stepRun: toWorkflowStepRunRecord({
@@ -1932,20 +1614,18 @@ class PgDatabase implements Database {
          where id = $1 returning *`,
           [step.id, status, failureReason, completedAt],
         );
-        const updatedRun = await client.query<TriggerRunRow>(
-          `update trigger_runs
-         set status = $2, failure_reason = $3, completed_at = $4,
-             terminal_notification_pending_at = coalesce(terminal_notification_pending_at, $4),
-             terminal_notification_lease_expires_at = null
-         where id = $1 returning *`,
-          [triggerRunId, status, failureReason, completedAt],
-        );
+        const updatedRun = await markWorkflowRunFailed(client, {
+          triggerRunId,
+          status,
+          failureReason,
+          completedAt,
+        });
         await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [
           triggerRunId,
         ]);
         return {
           stepRun: toWorkflowStepRunRecord(updatedStep.rows[0] ?? step),
-          run: toTriggerRunRecord(updatedRun.rows[0]!),
+          run: toTriggerRunRecord(requireReturnedRow(updatedRun.rows[0], "failed workflow run")),
           transitioned: true,
         };
       });
@@ -2008,7 +1688,7 @@ class PgDatabase implements Database {
          returning *`,
           [run.id, new Date(now.getTime() + leaseMs)],
         );
-        const row = updated.rows[0]!;
+        const row = requireReturnedRow(updated.rows[0], "claimed terminal notification run");
         const record = toTriggerRunRecord(row);
         if (record.outcome !== "accepted") throw new Error("unexpected notification run outcome");
         return { ...record, terminalNotificationGeneration: row.terminal_notification_generation };
@@ -2028,6 +1708,24 @@ class PgDatabase implements Database {
       [triggerRunId, generation, now],
     );
     return rows.rowCount === 1;
+  }
+
+  async renewWorkflowRunTerminalNotification(
+    triggerRunId: string,
+    generation: number,
+    now: Date,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const result = await query(
+      this.pool,
+      `update trigger_runs
+       set terminal_notification_lease_expires_at = $3
+       where id = $1 and terminal_notification_generation = $2 and outcome = 'accepted'
+         and terminal_notification_lease_expires_at is not null
+         and terminal_notification_delivered_at is null and payload_expiry_state is null`,
+      [triggerRunId, generation, new Date(now.getTime() + leaseMs)],
+    );
+    return result.rowCount === 1;
   }
 
   async markWorkflowRunTerminalNotificationDelivered(
@@ -2090,61 +1788,7 @@ class PgDatabase implements Database {
           [now],
         );
         for (const run of activeRuns.rows) {
-          const steps = await client.query<WorkflowStepRunRow>(
-            `select * from workflow_step_runs
-           where trigger_run_id = $1 and status = 'running'
-           order by ordinal
-           for update`,
-            [run.id],
-          );
-          for (const step of steps.rows) {
-            const executionRows =
-              step.agent_execution_id === null
-                ? { rows: [] as AgentExecutionRow[] }
-                : await client.query<AgentExecutionRow>(
-                    `select * from agent_executions where id = $1 for update`,
-                    [step.agent_execution_id],
-                  );
-            const execution = executionRows.rows[0];
-            if (
-              execution !== undefined &&
-              (execution.status === "succeeded" || execution.status === "failed")
-            ) {
-              continue;
-            }
-            const deadlineKind = workflowDeadlineKind(execution, step, run, now);
-            if (deadlineKind === undefined || deadlineKind === "whole_run") continue;
-            if (execution === undefined) {
-              const reason =
-                deadlineKind === "step_idle" ? "step_idle_timeout" : "step_hard_timeout";
-              await client.query(
-                `update workflow_step_runs
-               set status = 'timed_out', failure_reason = $2, deadline_kind = $3, completed_at = $4
-               where id = $1 and status = 'running'`,
-                [step.id, reason, deadlineKind, now],
-              );
-              await client.query(
-                `update trigger_runs
-               set status = 'failed', deadline_kind = $2, failure_reason = $3, completed_at = $4
-               where id = $1 and status = 'running'`,
-                [run.id, deadlineKind, reason, now],
-              );
-              await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [
-                run.id,
-              ]);
-              recoveries.push({ triggerRunId: run.id, executionIds: [] });
-            } else {
-              const updated = await timeoutWorkflowStepOnClient(
-                client,
-                execution,
-                step,
-                run,
-                deadlineKind,
-                now,
-              );
-              recoveries.push({ triggerRunId: run.id, executionIds: [updated.id] });
-            }
-          }
+          await recoverWorkflowStepDeadlines(client, now, run, recoveries);
         }
         return recoveries;
       });
@@ -2154,9 +1798,10 @@ class PgDatabase implements Database {
   }
 
   async issueEnrollmentToken(input: EnrollmentTokenRecord): Promise<boolean> {
-    if (input.issuedByCliCredentialId !== undefined && input.issuedByCliCredentialId !== null) {
+    const cliCredentialId = input.issuedByCliCredentialId;
+    if (cliCredentialId !== undefined && cliCredentialId !== null) {
       return this.pool.transaction(async (client) => {
-        await this.locks.withTxLock(client, input.issuedByCliCredentialId!);
+        await this.locks.withTxLock(client, cliCredentialId);
         const credential = await client.query(
           `select id from organization_cli_credentials
            where id = $1 and organization_id = $2 and revoked_at is null for update`,
@@ -2179,7 +1824,8 @@ class PgDatabase implements Database {
         return true;
       });
     }
-    if (input.issuedByApiKeyId === undefined || input.issuedByApiKeyId === null) {
+    const apiKeyId = input.issuedByApiKeyId;
+    if (apiKeyId === undefined || apiKeyId === null) {
       await query(
         this.pool,
         `insert into daemon_enrollment_tokens
@@ -2190,9 +1836,9 @@ class PgDatabase implements Database {
       return true;
     }
 
-    return withApiKeySerialization(input.issuedByApiKeyId, async () => {
+    return withApiKeySerialization(apiKeyId, async () => {
       return this.pool.transaction(async (client) => {
-        await this.locks.withTxLock(client, input.issuedByApiKeyId!);
+        await this.locks.withTxLock(client, apiKeyId);
         const key = await client.query(
           `select id
            from organization_api_keys
@@ -2229,7 +1875,7 @@ class PgDatabase implements Database {
          where status in ('pending', 'approved') and expires_at > now()`,
           [input.fingerprintVerifier],
         );
-        const counts = capacity.rows[0]!;
+        const counts = requireReturnedRow(capacity.rows[0], "CLI authorization capacity counts");
         if (
           counts.fingerprint_count >= input.perFingerprintLimit ||
           counts.global_count >= input.globalLimit
@@ -2252,7 +1898,9 @@ class PgDatabase implements Database {
             input.lifetimeSeconds,
           ],
         );
-        return toCliAuthorization(inserted.rows[0]!);
+        return toCliAuthorization(
+          requireReturnedRow(inserted.rows[0], "inserted CLI authorization"),
+        );
       });
     } catch (error) {
       throw toDatabaseError(error);
@@ -2338,178 +1986,218 @@ class PgDatabase implements Database {
     credential: { id: string; prefix: string; verifier: string };
   }): Promise<CliAuthorizationPollResult> {
     try {
-      return await this.pool.transaction(async (client) => {
-        const selected = await client.query<CliAuthorizationRow>(
-          `select *, now() as database_now
-         from cli_authorizations where device_verifier = $1 for update`,
-          [input.deviceVerifier],
-        );
-        const authorization = selected.rows[0];
-        if (authorization !== undefined && authorization.expires_at <= authorization.database_now) {
-          await client.query(`update cli_authorizations set status = 'expired' where id = $1`, [
-            authorization.id,
-          ]);
-          return {
-            status: "expired",
-            intervalSeconds: authorization.poll_interval_seconds,
-          };
-        }
-        if (authorization === undefined) {
-          return client.rollback({ status: "expired" as const, intervalSeconds: 5 });
-        }
-        if (
-          authorization.status === "denied" ||
-          authorization.status === "expired" ||
-          authorization.status === "disclosed"
-        ) {
-          return {
-            status: authorization.status,
-            intervalSeconds: authorization.poll_interval_seconds,
-          };
-        }
-        if (authorization.next_poll_at > authorization.database_now) {
-          const intervalSeconds = authorization.poll_interval_seconds + 5;
-          await client.query(
-            `update cli_authorizations
-           set poll_interval_seconds = $2::integer,
-               next_poll_at = now() + ($2::integer * interval '1 second')
-           where id = $1`,
-            [authorization.id, intervalSeconds],
-          );
-          return { status: "slow_down", intervalSeconds };
-        }
-        await client.query(
-          `update cli_authorizations
-         set next_poll_at = now() + (poll_interval_seconds * interval '1 second')
-         where id = $1`,
-          [authorization.id],
-        );
-        if (authorization.status === "approved") {
-          await client.query(
-            `insert into organization_cli_credentials
-             (id, organization_id, prefix, verifier, created_by_user_id)
-           values ($1, $2, $3, $4, $5)`,
-            [
-              input.credential.id,
-              authorization.approved_organization_id,
-              input.credential.prefix,
-              input.credential.verifier,
-              authorization.approved_by_user_id,
-            ],
-          );
-          await client.query(
-            `update cli_authorizations set status = 'disclosed', credential_id = $2 where id = $1`,
-            [authorization.id, input.credential.id],
-          );
-          return {
-            status: "authorized",
-            intervalSeconds: authorization.poll_interval_seconds,
-            organizationId: authorization.approved_organization_id!,
-          };
-        }
-        return {
-          status: authorization.status,
-          intervalSeconds: authorization.poll_interval_seconds,
-        };
-      });
+      return await this.pool.transaction((client) =>
+        this.pollCliAuthorizationInTransaction(client, input),
+      );
     } catch (error) {
       throw toDatabaseError(error);
     }
   }
 
+  private async pollCliAuthorizationInTransaction(
+    client: TransactionHandle,
+    input: Parameters<Database["pollCliAuthorization"]>[0],
+  ): Promise<CliAuthorizationPollResult> {
+    const selected = await client.query<CliAuthorizationPollRow>(
+      `select *, now() as database_now
+         from cli_authorizations where device_verifier = $1 for update`,
+      [input.deviceVerifier],
+    );
+    const authorization = selected.rows[0];
+    if (authorization !== undefined && authorization.expires_at <= authorization.database_now) {
+      await client.query(`update cli_authorizations set status = 'expired' where id = $1`, [
+        authorization.id,
+      ]);
+      return {
+        status: "expired",
+        intervalSeconds: authorization.poll_interval_seconds,
+      };
+    }
+    if (authorization === undefined) {
+      return client.rollback({ status: "expired" as const, intervalSeconds: 5 });
+    }
+    if (
+      authorization.status === "denied" ||
+      authorization.status === "expired" ||
+      authorization.status === "disclosed"
+    ) {
+      return {
+        status: authorization.status,
+        intervalSeconds: authorization.poll_interval_seconds,
+      };
+    }
+    if (authorization.next_poll_at > authorization.database_now) {
+      const intervalSeconds = authorization.poll_interval_seconds + 5;
+      await client.query(
+        `update cli_authorizations
+           set poll_interval_seconds = $2::integer,
+               next_poll_at = now() + ($2::integer * interval '1 second')
+           where id = $1`,
+        [authorization.id, intervalSeconds],
+      );
+      return { status: "slow_down", intervalSeconds };
+    }
+    await client.query(
+      `update cli_authorizations
+         set next_poll_at = now() + (poll_interval_seconds * interval '1 second')
+         where id = $1`,
+      [authorization.id],
+    );
+    if (authorization.status === "approved") {
+      return this.discloseCliAuthorization(client, authorization, input);
+    }
+    return {
+      status: authorization.status,
+      intervalSeconds: authorization.poll_interval_seconds,
+    };
+  }
+
+  private async discloseCliAuthorization(
+    client: QueryHandle,
+    authorization: ApprovedCliAuthorizationRow,
+    input: Parameters<Database["pollCliAuthorization"]>[0],
+  ): Promise<CliAuthorizationPollResult> {
+    await client.query(
+      `insert into organization_cli_credentials
+             (id, organization_id, prefix, verifier, created_by_user_id)
+           values ($1, $2, $3, $4, $5)`,
+      [
+        input.credential.id,
+        authorization.approved_organization_id,
+        input.credential.prefix,
+        input.credential.verifier,
+        authorization.approved_by_user_id,
+      ],
+    );
+    await client.query(
+      `update cli_authorizations set status = 'disclosed', credential_id = $2 where id = $1`,
+      [authorization.id, input.credential.id],
+    );
+    return {
+      status: "authorized",
+      intervalSeconds: authorization.poll_interval_seconds,
+      organizationId: authorization.approved_organization_id,
+    };
+  }
+
   async enrollDaemon(input: EnrollDaemonInput) {
-    let requestedSlug: string | undefined;
+    const state: { requestedSlug?: string } = {};
     try {
-      return await this.pool.transaction(async (client) => {
-        const existing = await client.query<DaemonRow>(
-          `select * from daemons where idempotency_key = $1`,
-          [input.idempotencyKey],
-        );
-        if (
-          existing.rows[0] &&
-          existing.rows[0].id === input.daemonId &&
-          existing.rows[0].enrollment_verifier === input.tokenVerifier
-        ) {
-          return toDaemon(existing.rows[0]);
-        }
-        const token = await client.query<{
-          id: string;
-          organization_id: string | null;
-          issued_by_api_key_id: string | null;
-          issued_by_cli_credential_id: string | null;
-        }>(
-          `update daemon_enrollment_tokens
+      return await this.pool.transaction((client) =>
+        this.enrollDaemonInTransaction(client, input, state),
+      );
+    } catch (error) {
+      if (state.requestedSlug !== undefined && isDaemonSlugConflict(error)) {
+        return { status: "slug_conflict" as const, slug: state.requestedSlug };
+      }
+      throw toDatabaseError(error);
+    }
+  }
+
+  private async enrollDaemonInTransaction(
+    client: TransactionHandle,
+    input: EnrollDaemonInput,
+    state: { requestedSlug?: string },
+  ): Promise<DaemonRecord | undefined> {
+    const existing = await client.query<DaemonRow>(
+      `select * from daemons where idempotency_key = $1`,
+      [input.idempotencyKey],
+    );
+    if (
+      existing.rows[0] &&
+      existing.rows[0].id === input.daemonId &&
+      existing.rows[0].enrollment_verifier === input.tokenVerifier
+    ) {
+      return toDaemon(existing.rows[0]);
+    }
+    const token = await client.query<{
+      id: string;
+      organization_id: string | null;
+      issued_by_api_key_id: string | null;
+      issued_by_cli_credential_id: string | null;
+    }>(
+      `update daemon_enrollment_tokens
          set consumed_at = $2
          where verifier = $1 and organization_id is not null and consumed_at is null
            and expires_at > $2
          returning id, organization_id, issued_by_api_key_id, issued_by_cli_credential_id`,
-          [input.tokenVerifier, input.now],
-        );
-        const consumedToken = token.rows[0];
-        if (consumedToken?.organization_id === null || consumedToken === undefined)
-          return client.rollback(undefined);
-        const machine = await client.query<MachineRow>(
-          `insert into machines (org_id, source, status) values ($1, $2, 'alive') returning *`,
-          [consumedToken.organization_id, { kind: "daemon", daemonId: input.daemonId }],
-        );
-        const suggestedSlug = input.suggestedSlug ?? `daemon-${input.daemonId.slice(0, 8)}`;
-        requestedSlug = suggestedSlug;
-        let daemon = await client.query<DaemonRow>(
-          `insert into daemons
+      [input.tokenVerifier, input.now],
+    );
+    const consumedToken = token.rows[0];
+    if (consumedToken?.organization_id === null || consumedToken === undefined)
+      return client.rollback(undefined);
+    const machine = await client.query<MachineRow>(
+      `insert into machines (org_id, source, status) values ($1, $2, 'alive') returning *`,
+      [consumedToken.organization_id, { kind: "daemon", daemonId: input.daemonId }],
+    );
+    const suggestedSlug = input.suggestedSlug ?? `daemon-${input.daemonId.slice(0, 8)}`;
+    state.requestedSlug = suggestedSlug;
+    const enrolledMachine = requireReturnedRow(machine.rows[0], "inserted daemon machine");
+    const options = {
+      input,
+      token: consumedToken,
+      machineId: enrolledMachine.id,
+      slug: suggestedSlug,
+      retry: false,
+    };
+    const daemon = await this.insertEnrolledDaemon(client, options);
+    if (daemon !== undefined) return toDaemon(daemon);
+
+    const uniqueSlug = `${suggestedSlug}-${input.daemonId.slice(0, 8)}`;
+    state.requestedSlug = uniqueSlug;
+    const retried = await this.insertEnrolledDaemon(client, {
+      ...options,
+      slug: uniqueSlug,
+      retry: true,
+    });
+    return toDaemon(requireReturnedRow(retried, "inserted daemon"));
+  }
+
+  private async insertEnrolledDaemon(
+    client: QueryHandle,
+    options: {
+      input: EnrollDaemonInput;
+      token: {
+        organization_id: string | null;
+        issued_by_api_key_id: string | null;
+        issued_by_cli_credential_id: string | null;
+      };
+      machineId: string;
+      slug: string;
+      retry: boolean;
+    },
+  ): Promise<DaemonRow | undefined> {
+    const { input, token, machineId, slug, retry } = options;
+    const daemon = await client.query<DaemonRow>(
+      retry
+        ? `insert into daemons
+             (id, idempotency_key, enrollment_verifier, slug, machine_id, organization_id, server_id,
+              daemon_public_key, credential_verifier, scopes,
+              registered_by_api_key_id, registered_by_cli_credential_id, status)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active') returning *`
+        : `insert into daemons
            (id, idempotency_key, enrollment_verifier, slug, machine_id, organization_id, server_id,
             daemon_public_key, credential_verifier, scopes,
             registered_by_api_key_id, registered_by_cli_credential_id, status)
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active')
          on conflict (organization_id, slug) do nothing
          returning *`,
-          [
-            input.daemonId,
-            input.idempotencyKey,
-            input.tokenVerifier,
-            suggestedSlug,
-            machine.rows[0]!.id,
-            consumedToken.organization_id,
-            input.serverId,
-            input.daemonPublicKey,
-            input.credentialVerifier,
-            JSON.stringify(input.permissions),
-            consumedToken.issued_by_api_key_id,
-            consumedToken.issued_by_cli_credential_id,
-          ],
-        );
-        if (daemon.rows[0] === undefined) {
-          const uniqueSlug = `${suggestedSlug}-${input.daemonId.slice(0, 8)}`;
-          requestedSlug = uniqueSlug;
-          daemon = await client.query<DaemonRow>(
-            `insert into daemons
-             (id, idempotency_key, enrollment_verifier, slug, machine_id, organization_id, server_id,
-              daemon_public_key, credential_verifier, scopes,
-              registered_by_api_key_id, registered_by_cli_credential_id, status)
-           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active') returning *`,
-            [
-              input.daemonId,
-              input.idempotencyKey,
-              input.tokenVerifier,
-              uniqueSlug,
-              machine.rows[0]!.id,
-              consumedToken.organization_id,
-              input.serverId,
-              input.daemonPublicKey,
-              input.credentialVerifier,
-              JSON.stringify(input.permissions),
-              consumedToken.issued_by_api_key_id,
-              consumedToken.issued_by_cli_credential_id,
-            ],
-          );
-        }
-        return toDaemon(daemon.rows[0]!);
-      });
-    } catch (error) {
-      if (requestedSlug !== undefined && isDaemonSlugConflict(error)) {
-        return { status: "slug_conflict" as const, slug: requestedSlug };
-      }
-      throw toDatabaseError(error);
-    }
+      [
+        input.daemonId,
+        input.idempotencyKey,
+        input.tokenVerifier,
+        slug,
+        machineId,
+        token.organization_id,
+        input.serverId,
+        input.daemonPublicKey,
+        input.credentialVerifier,
+        JSON.stringify(input.permissions),
+        token.issued_by_api_key_id,
+        token.issued_by_cli_credential_id,
+      ],
+    );
+    return daemon.rows[0];
   }
 
   async findDaemonBySlugForOrganization(
@@ -2676,31 +2364,11 @@ class PgDatabase implements Database {
 
         let workflowRefreshAllowed = true;
         if (existing.workflow_step_run_id !== null) {
-          const stepRows = await client.query<WorkflowStepRunRow>(
-            `select * from workflow_step_runs where id = $1`,
-            [existing.workflow_step_run_id],
+          workflowRefreshAllowed = await canRefreshWorkflowIdleDeadlineOnClient(
+            client,
+            existing.workflow_step_run_id,
+            processedAt,
           );
-          const stepCandidate = stepRows.rows[0];
-          if (stepCandidate !== undefined) {
-            const runRows = await client.query<TriggerRunRow>(
-              `select * from trigger_runs where id = $1 for update`,
-              [stepCandidate.trigger_run_id],
-            );
-            const lockedStepRows = await client.query<WorkflowStepRunRow>(
-              `select * from workflow_step_runs where id = $1 for update`,
-              [stepCandidate.id],
-            );
-            const step = lockedStepRows.rows[0];
-            const run = runRows.rows[0];
-            workflowRefreshAllowed =
-              step !== undefined &&
-              step.status === "running" &&
-              run !== undefined &&
-              run.status === "running" &&
-              (run.deadline_at === null || run.deadline_at > processedAt);
-          } else {
-            workflowRefreshAllowed = false;
-          }
         }
 
         let row: AgentExecutionRow | undefined;
@@ -2886,28 +2554,13 @@ class PgDatabase implements Database {
     // The null ordering matches the index; both columns are not null, so it changes no row order.
     const position = request.position;
     const after = position?.direction === "after";
-    const rows = await query<ProjectActivityRunListRow & { page_created_at: string }>(
-      this.pool,
-      `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
-              receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
-              receipts.provider_configuration_version, receipts.source, receipts.repo,
-              receipts.received_at, receipts.dropped_reason,
-              receipts.payload_expiry_state as receipt_payload_expiry_state,
-              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null
-                     and receipts.source = 'webhook.received'
-                     and jsonb_typeof(receipts.payload->'actor') = 'string'
-                then receipts.payload->>'actor'
-              end as webhook_actor,
-              runs.created_at::text as page_created_at
-       ${scoped}
-       ${position === undefined ? "" : `and (runs.created_at, runs.id) ${after ? ">" : "<"} ${boundary}`}
-       order by runs.created_at ${after ? "asc nulls first" : "desc nulls last"},
-                runs.id ${after ? "asc nulls first" : "desc nulls last"}
-       limit $${scopeParams.length + (position === undefined ? 1 : 3)}`,
-      position === undefined
-        ? [...scopeParams, request.limit + 1]
-        : [...scopeParams, position.key.createdAt, position.key.id, request.limit + 1],
-    );
+    const rows = await this.queryActivityPageRows(request, {
+      scoped,
+      scopeParams,
+      boundary,
+      position,
+      after,
+    });
     const more = rows.rows.length > request.limit;
     const page = rows.rows.slice(0, request.limit);
     if (after) page.reverse();
@@ -2936,6 +2589,41 @@ class PgDatabase implements Database {
       older: hasOlder ? keyOf(last) : null,
       newer: hasNewer ? keyOf(first) : null,
     };
+  }
+
+  private queryActivityPageRows(
+    request: ActivityRunPageRequest,
+    options: {
+      scoped: string;
+      scopeParams: unknown[];
+      boundary: string;
+      position: ActivityRunPageRequest["position"];
+      after: boolean;
+    },
+  ) {
+    const { scoped, scopeParams, boundary, position, after } = options;
+    return query<ProjectActivityRunListRow & { page_created_at: string }>(
+      this.pool,
+      `select runs.*, receipts.provider, receipts.connection_id, receipts.resource_id,
+              receipts.delivery_id, receipts.signature_hash, receipts.provider_application_id,
+              receipts.provider_configuration_version, receipts.source, receipts.repo,
+              receipts.received_at, receipts.dropped_reason,
+              receipts.payload_expiry_state as receipt_payload_expiry_state,
+              case when runs.payload_expiry_state is null and receipts.payload_expiry_state is null
+                     and receipts.source = 'webhook.received'
+                     and jsonb_typeof(receipts.payload->'actor') = 'string'
+                then receipts.payload->>'actor'
+              end as webhook_actor,
+              runs.created_at::text as page_created_at
+       ${scoped}
+       ${position === undefined ? "" : `and (runs.created_at, runs.id) ${after ? ">" : "<"} ${boundary}`}
+       order by runs.created_at ${after ? "asc nulls first" : "desc nulls last"},
+                runs.id ${after ? "asc nulls first" : "desc nulls last"}
+       limit $${scopeParams.length + (position === undefined ? 1 : 3)}`,
+      position === undefined
+        ? [...scopeParams, request.limit + 1]
+        : [...scopeParams, position.key.createdAt, position.key.id, request.limit + 1],
+    );
   }
 
   async findProjectActivityRun(projectId: string, runId: string) {
@@ -3086,61 +2774,9 @@ class PgDatabase implements Database {
     completedAt: Date,
   ): Promise<AgentExecutionRecord | undefined> {
     try {
-      return await this.pool.transaction(async (client) => {
-        const selected = await client.query<AgentExecutionRow>(
-          `select * from agent_executions where id = $1 for update`,
-          [executionId],
-        );
-        const row = selected.rows[0];
-        if (row === undefined) {
-          return undefined;
-        }
-        const execution = toAgentExecutionRecord(row);
-        const attempt = execution.outputDeliveryAttempts[attemptId];
-        if (attempt === undefined) {
-          return undefined;
-        }
-        if (attempt.status === "succeeded") {
-          return findAgentExecutionOnClient(client, executionId);
-        }
-        if (attempt.status !== "pending") {
-          return undefined;
-        }
-        if (attempt.leaseExpiresAt <= completedAt) {
-          await client.query(
-            `update agent_executions
-           set output_delivery_attempts = $2::jsonb
-           where id = $1`,
-            [
-              executionId,
-              JSON.stringify({
-                ...execution.outputDeliveryAttempts,
-                [attemptId]: { ...attempt, status: "failed" as const, completedAt: null },
-              }),
-            ],
-          );
-          return undefined;
-        }
-        const outputEmissions = {
-          ...execution.outputEmissions,
-          [attempt.outputType]: (execution.outputEmissions[attempt.outputType] ?? 0) + 1,
-        };
-        await client.query(
-          `update agent_executions
-         set output_emissions = $2::jsonb,
-             output_delivery_attempts = $3::jsonb
-         where id = $1`,
-          [
-            executionId,
-            JSON.stringify(outputEmissions),
-            JSON.stringify({
-              ...execution.outputDeliveryAttempts,
-              [attemptId]: { ...attempt, status: "succeeded" as const, completedAt },
-            }),
-          ],
-        );
-        return findAgentExecutionOnClient(client, executionId);
-      });
+      return await this.pool.transaction((client) =>
+        completeAgentExecutionOutputOnClient(client, executionId, attemptId, completedAt),
+      );
     } catch (error) {
       throw toDatabaseError(error);
     }
@@ -3193,51 +2829,8 @@ class PgDatabase implements Database {
     try {
       const rows = await query<AgentExecutionRow>(
         this.pool,
-        `
-          update agent_executions
-          set
-            status = $2,
-            completed_at = case
-              when $3::boolean then now()
-              else completed_at
-            end,
-            result = case when $4::boolean then $5 else result end,
-            completed_by_agent_at = case
-              when $6::boolean and $2 = 'succeeded'::agent_execution_status then now()
-              else completed_by_agent_at
-            end,
-            idle_deadline_at = case
-              when $3::boolean then null
-              else idle_deadline_at
-            end,
-            hub_action = case when $10::boolean then $11 else hub_action end,
-            hub_action_completed_at = case
-              when $10::boolean and $11::text is null then now()
-              when $10::boolean then null
-              else hub_action_completed_at
-            end
-          where id = $1
-            and status in ('spawning', 'running')
-            and (
-              $7::text is null
-              or ($7 = 'hard' and deadline_at = $8 and deadline_at <= $9)
-              or ($7 = 'idle' and idle_deadline_at = $8 and idle_deadline_at <= $9)
-            )
-          returning *
-        `,
-        [
-          id,
-          toStatus,
-          isTerminalAgentExecutionStatus(toStatus),
-          fields.result !== undefined,
-          fields.result ?? null,
-          fields.completedByAgent === true,
-          fields.deadlineCondition?.kind ?? null,
-          fields.deadlineCondition?.deadlineAt ?? null,
-          fields.deadlineCondition?.observedAt ?? null,
-          fields.hubAction !== undefined,
-          fields.hubAction ?? null,
-        ],
+        TRANSITION_AGENT_EXECUTION,
+        agentExecutionTransitionParameters(id, toStatus, fields),
       );
       const execution = rows.rows[0];
 
@@ -3291,10 +2884,7 @@ class PgDatabase implements Database {
     }
   }
 
-  async findPendingHubActions(
-    daemonId?: string,
-    scope?: import("./types.js").PendingHubActionScope,
-  ) {
+  async findPendingHubActions(daemonId?: string, scope?: PendingHubActionScope) {
     try {
       const rows = await query<AgentExecutionRow>(
         this.pool,
@@ -3356,25 +2946,7 @@ class PgDatabase implements Database {
       let parameters: unknown[];
       if (acknowledgement.kind === "terminal" || acknowledgement.kind === "idle") {
         const field = acknowledgement.kind === "terminal" ? "terminal_at" : "idle_at";
-        statement = `
-          update agent_executions
-          set hub_action_acknowledgements = jsonb_set(
-            ${state},
-            '{${field}}',
-            case
-              when ${state}->>'${field}' is null
-                or (${state}->>'${field}')::timestamptz < $2::timestamptz
-                then to_jsonb($2::timestamptz)
-              else ${state}->'${field}'
-            end,
-            true
-          )
-          where id = $1
-            and (
-              ${state}->>'${field}' is null
-              or (${state}->>'${field}')::timestamptz < $2::timestamptz
-            )
-          returning id`;
+        statement = hubTimestampAcknowledgementStatement(state, field);
         parameters = [executionId, acknowledgement.observedAt];
       } else {
         statement = `
@@ -3409,7 +2981,9 @@ class PgDatabase implements Database {
         ];
       }
       const rows = await query<{ id: string }>(this.pool, statement, parameters);
-      return rows.rows[0] === undefined ? undefined : this.findAgentExecutionById(executionId);
+      return rows.rows[0] === undefined
+        ? undefined
+        : await this.findAgentExecutionById(executionId);
     } catch (error) {
       throw toDatabaseError(error);
     }
@@ -3823,7 +3397,7 @@ class PgDatabase implements Database {
   async attachExecutionToSession(
     executionId: string,
     sessionId: string,
-    action?: import("../agent-sessions/index.js").AgentSessionAction,
+    action?: AgentSessionAction,
   ): Promise<void> {
     const result = await this.pool.query(
       `update agent_executions e set agent_session_id = s.id, agent_session_action = coalesce(e.agent_session_action, $3) from agent_sessions s
@@ -3911,200 +3485,20 @@ class PgDatabase implements Database {
     input: MigrateProjectTriggersInput,
   ): Promise<OrganizationTriggerRecord[]> {
     return this.pool.transaction(async (client) => {
-      const project = await client.query<{
-        active_configuration_revision_id: string | null;
-        organization_id: string;
-      }>(
-        `select organization_id, active_configuration_revision_id
-         from projects where id = $1 for update`,
-        [input.projectId],
-      );
-      const current = project.rows[0];
-      const alreadyMigrated = await client.query(
-        `select project_id from project_trigger_migrations where project_id = $1`,
-        [input.projectId],
-      );
-      if (alreadyMigrated.rowCount > 0) {
-        return [];
-      }
-      if (
-        current === undefined ||
-        current.organization_id !== input.organizationId ||
-        current.active_configuration_revision_id !== input.configurationRevisionId
-      ) {
-        throw new Error("project configuration changed during trigger migration");
-      }
-
-      const legacyRouteRows = await client.query<{
-        provider: ConnectionProvider;
-        connection_id: string;
-        resource_id: string | null;
-        trigger_name: string;
-      }>(
-        `select provider, connection_id::text, resource_id, trigger_name
-         from project_trigger_routes
-         where project_id = $1 and configuration_revision_id = $2
-         order by trigger_name, provider, connection_id, resource_id nulls first`,
-        [input.projectId, input.configurationRevisionId],
-      );
-      const configurations = input.triggers.map((candidate) =>
-        parseCompiledHubConfig(candidate.normalizedConfiguration),
-      );
-      const candidateRoutes = input.triggers.map((candidate, index) => {
-        const configuredEventName = configurations[index]!.triggers[0]?.on;
-        if (configuredEventName === undefined) {
-          throw new Error(`migrated trigger ${candidate.name} has no configured event`);
-        }
-        return legacyRouteRows.rows
-          .filter((route) => route.trigger_name === candidate.name)
-          .map((route) => ({
-            provider: route.provider,
-            connectionId: route.connection_id,
-            resourceId: route.resource_id,
-            configuredEventName,
-          }));
-      });
-      if (
-        candidateRoutes.reduce((total, routes) => total + routes.length, 0) !==
-        legacyRouteRows.rows.length
-      ) {
-        throw new Error("project trigger routes do not match migrated triggers");
-      }
-
+      if (!(await projectTriggerMigrationPending(client, input))) return [];
+      const plans = await planProjectTriggerMigration(client, input);
       const names = await client.query<{ name: string }>(
         `select name from organization_triggers where organization_id = $1 for update`,
         [input.organizationId],
       );
       const occupied = new Set(names.rows.map(({ name }) => name));
       const created: OrganizationTriggerRecord[] = [];
-      for (const [index, candidate] of input.triggers.entries()) {
-        const routes = candidateRoutes[index]!;
-        const name = availableMigratedTriggerName(occupied, input.projectSlug, candidate.name);
+      for (const plan of plans) {
+        const name = availableMigratedTriggerName(occupied, input.projectSlug, plan.candidate.name);
         occupied.add(name);
-        const runtimeProjectRows = await client.query<ProjectRow>(
-          `insert into projects
-             (organization_id, name, slug, created_by_user_id)
-           values ($1, $2, $3, null) returning *`,
-          [
-            input.organizationId,
-            `Trigger runtime: ${name}`,
-            `trigger-${randomUUID().replaceAll("-", "")}`,
-          ],
-        );
-        const runtimeProject = runtimeProjectRows.rows[0]!;
-        await client.query(
-          `insert into project_configuration_sources
-             (project_id, organization_id, kind, automatic_deployment_enabled, selected_by_user_id)
-           values ($1, $2, 'manual', false, null)`,
-          [runtimeProject.id, input.organizationId],
-        );
-        const triggerRows = await client.query<OrganizationTriggerRow>(
-          `insert into organization_triggers
-             (organization_id, name, enabled, format, runtime_project_id)
-           values ($1, $2, $3, $4, $5) returning *`,
-          [input.organizationId, name, candidate.enabled, candidate.format, runtimeProject.id],
-        );
-        const trigger = triggerRows.rows[0]!;
-        const revisionRows = await client.query<OrganizationTriggerRevisionRow>(
-          `insert into organization_trigger_revisions (
-             trigger_id, organization_id, version, yaml, normalized_configuration,
-             content_hash, source_kind, source_evidence, created_by_user_id
-           ) values ($1, $2, 1, $3, $4, $5, 'project_migration', $6, null)
-           returning *`,
-          [
-            trigger.id,
-            input.organizationId,
-            candidate.yaml,
-            candidate.normalizedConfiguration,
-            candidate.contentHash,
-            candidate.sourceEvidence,
-          ],
-        );
-        const revision = revisionRows.rows[0]!;
-        for (const route of routes) {
-          await client.query(
-            `insert into organization_trigger_routes (
-               organization_id, trigger_id, trigger_revision_id, provider,
-               connection_id, resource_id, configured_event_name
-             ) values ($1, $2, $3, $4, $5, $6, $7)`,
-            [
-              input.organizationId,
-              trigger.id,
-              revision.id,
-              route.provider,
-              route.connectionId,
-              route.resourceId,
-              route.configuredEventName,
-            ],
-          );
-        }
-        const runtimeRevisionRows = await client.query<ProjectConfigurationRevisionRow>(
-          `insert into project_configuration_revisions (
-             project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
-             normalized_configuration, validation_errors, content_hash,
-             created_by_user_id, received_at, validated_at
-           ) values ($1, $2, 1, 'manual', $3, $4, $5, null, $6, null,
-             clock_timestamp(), clock_timestamp()) returning *`,
-          [
-            runtimeProject.id,
-            input.organizationId,
-            { kind: "organization_trigger_adapter", triggerId: trigger.id },
-            candidate.yaml,
-            candidate.normalizedConfiguration,
-            candidate.contentHash,
-          ],
-        );
-        const runtimeRevision = runtimeRevisionRows.rows[0]!;
-        const configuration = configurations[index]!;
-        for (const route of routes) {
-          const configuredTriggerName =
-            configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
-            configuration.triggers[0]?.name ??
-            name;
-          await client.query(
-            `insert into project_trigger_routes (
-               organization_id, project_id, configuration_revision_id, provider,
-               connection_id, resource_id, trigger_name
-             ) values ($1, $2, $3, $4, $5, $6, $7)`,
-            [
-              input.organizationId,
-              runtimeProject.id,
-              runtimeRevision.id,
-              route.provider,
-              route.connectionId,
-              route.resourceId,
-              configuredTriggerName,
-            ],
-          );
-        }
-        await client.query(
-          `update projects set active_configuration_revision_id = $2,
-             updated_at = clock_timestamp() where id = $1`,
-          [runtimeProject.id, runtimeRevision.id],
-        );
-        const activated = await client.query<OrganizationTriggerRow>(
-          `update organization_triggers
-           set active_revision_id = $2, updated_at = clock_timestamp()
-           where id = $1 returning *`,
-          [trigger.id, revision.id],
-        );
-        created.push(toOrganizationTriggerRecord(activated.rows[0]!));
+        created.push(await migrateTriggerCandidate(client, { input, plan, name }));
       }
-      await client.query(
-        `insert into project_trigger_migrations
-           (project_id, organization_id, configuration_revision_id)
-         values ($1, $2, $3)`,
-        [input.projectId, input.organizationId, input.configurationRevisionId],
-      );
-      await client.query(`delete from project_trigger_routes where project_id = $1`, [
-        input.projectId,
-      ]);
-      await client.query(
-        `update projects set status = 'archived', archived_at = clock_timestamp(),
-           active_configuration_revision_id = null, updated_at = clock_timestamp()
-         where id = $1`,
-        [input.projectId],
-      );
+      await archiveMigratedProject(client, input);
       return created;
     });
   }
@@ -4126,46 +3520,19 @@ class PgDatabase implements Database {
   ): Promise<TriggerListPage> {
     const params: unknown[] = [organizationId];
     const conditions = organizationTriggerPageFilters(request, params);
-    const scoped = `from organization_triggers t
-      where t.organization_id = $1 and t.active_revision_id is not null ${conditions}`;
-    const position = request.position;
-    const previous = position?.direction === "previous";
-    const name = `t.name collate "C"`;
-    const key = `(${name}, t.id)`;
-    const boundary = `($${params.length + 1}::text collate "C", $${params.length + 2}::uuid)`;
-    const order = previous ? "desc" : "asc";
-    const values =
-      position === undefined ? params : [...params, position.key.name, position.key.id];
-    const { rows } = await query<OrganizationTriggerRow>(
-      this.pool,
-      `select t.* ${scoped}
-       ${position === undefined ? "" : `and ${key} ${previous ? "<" : ">"} ${boundary}`}
-       order by ${name} ${order}, t.id ${order} limit $${values.length + 1}`,
-      [...values, request.limit + 1],
-    );
+    const sql = organizationTriggerPageSql(conditions, params.length);
+    const previous = request.position?.direction === "previous";
+    const rows = await fetchOrganizationTriggerPageRows(this.pool, { request, sql, params });
     const more = rows.length > request.limit;
     const page = rows.slice(0, request.limit);
     if (previous) page.reverse();
-    const first = page[0];
-    const last = page.at(-1);
-    const adjacent = async (record: OrganizationTriggerRow | undefined, operator: "<" | ">") => {
-      if (record === undefined) return false;
-      const direction = operator === "<" ? "desc" : "asc";
-      const adjacentRows = await query(
-        this.pool,
-        `select 1 ${scoped} and ${key} ${operator} ${boundary}
-         order by ${name} ${direction}, t.id ${direction} limit 1`,
-        [...params, record.name, record.id],
-      );
-      return adjacentRows.rows.length > 0;
-    };
-    const hasPrevious = previous ? more : position !== undefined && (await adjacent(first, "<"));
-    const hasNext = previous ? await adjacent(last, ">") : more;
-    return {
-      records: page.map(toOrganizationTriggerRecord),
-      previous: hasPrevious && first !== undefined ? { id: first.id, name: first.name } : null,
-      next: hasNext && last !== undefined ? { id: last.id, name: last.name } : null,
-    };
+    const adjacent = (record: OrganizationTriggerRow | undefined, operator: "<" | ">") =>
+      organizationTriggerAdjacent(this.pool, { sql, params, record, operator });
+    const hasPrevious = previous
+      ? more
+      : request.position !== undefined && (await adjacent(page[0], "<"));
+    const hasNext = previous ? await adjacent(page.at(-1), ">") : more;
+    return toOrganizationTriggerPage(page, { hasPrevious, hasNext });
   }
 
   async findOrganizationTrigger(
@@ -4226,160 +3593,17 @@ class PgDatabase implements Database {
       // Validation resolves routes before this transaction, while connections can change concurrently.
       await this.locks.withTxLock(client, linearTriggerRoutesLock(input.organizationId));
       const configuration = parseCompiledHubConfig(input.normalizedConfiguration);
-      const linearConnections =
-        input.enabled && configuration.triggers.some(({ on }) => on.startsWith("linear."))
-          ? (
-              await client.query<{ id: string }>(
-                "select id from linear_connections where organization_id = $1",
-                [input.organizationId],
-              )
-            ).rows
-          : [];
-      const routes = input.enabled
-        ? organizationTriggerRoutesForSave(
-            configuration,
-            input.routes,
-            linearConnections.map(({ id }) => id),
-          )
-        : [];
-      let trigger: OrganizationTriggerRow;
-      if (input.triggerId === undefined) {
-        const runtimeProjectRows = await client.query<ProjectRow>(
-          `insert into projects
-             (organization_id, name, slug, created_by_user_id)
-           values ($1, $2, $3, $4) returning *`,
-          [
-            input.organizationId,
-            `Trigger runtime: ${input.name}`,
-            `trigger-${randomUUID().replaceAll("-", "")}`,
-            input.createdByUserId,
-          ],
-        );
-        const runtimeProject = runtimeProjectRows.rows[0]!;
-        await client.query(
-          `insert into project_configuration_sources
-             (project_id, organization_id, kind, automatic_deployment_enabled, selected_by_user_id)
-           values ($1, $2, 'manual', false, $3)`,
-          [runtimeProject.id, input.organizationId, input.createdByUserId],
-        );
-        const inserted = await client.query<OrganizationTriggerRow>(
-          `insert into organization_triggers
-             (organization_id, name, enabled, format, runtime_project_id)
-           values ($1, $2, $3, $4, $5) returning *`,
-          [input.organizationId, input.name, input.enabled, input.format, runtimeProject.id],
-        );
-        trigger = inserted.rows[0]!;
-      } else {
-        const updated = await client.query<OrganizationTriggerRow>(
-          `update organization_triggers
-           set name = $3, enabled = $4, format = $5, updated_at = clock_timestamp()
-           where id = $1 and organization_id = $2 returning *`,
-          [input.triggerId, input.organizationId, input.name, input.enabled, input.format],
-        );
-        if (updated.rows[0] === undefined) throw new Error("organization trigger not found");
-        trigger = updated.rows[0];
-      }
-      const revisionRows = await client.query<OrganizationTriggerRevisionRow>(
-        `insert into organization_trigger_revisions (
-           trigger_id, organization_id, version, yaml, normalized_configuration,
-           content_hash, source_kind, source_evidence, created_by_user_id
-         ) values (
-           $1, $2,
-           coalesce((select max(version) + 1 from organization_trigger_revisions where trigger_id = $1), 1),
-           $3, $4, $5, $6, $7, $8
-         ) returning *`,
-        [
-          trigger.id,
-          input.organizationId,
-          input.yaml,
-          input.normalizedConfiguration,
-          input.contentHash,
-          input.sourceKind,
-          input.sourceEvidence,
-          input.createdByUserId,
-        ],
-      );
-      const revision = revisionRows.rows[0]!;
-      await client.query(`delete from organization_trigger_routes where trigger_id = $1`, [
-        trigger.id,
-      ]);
-      for (const route of routes) {
-        await client.query(
-          `insert into organization_trigger_routes (
-             organization_id, trigger_id, trigger_revision_id, provider,
-             connection_id, resource_id, configured_event_name
-           ) values ($1, $2, $3, $4, $5, $6, $7)`,
-          [
-            input.organizationId,
-            trigger.id,
-            revision.id,
-            route.provider,
-            route.connectionId,
-            route.resourceId,
-            route.configuredEventName,
-          ],
-        );
-      }
-      const runtimeRevisionRows = await client.query<ProjectConfigurationRevisionRow>(
-        `insert into project_configuration_revisions (
-           project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
-           normalized_configuration, validation_errors, content_hash,
-           created_by_user_id, received_at, validated_at
-         ) values (
-           $1, $2,
-           coalesce((select max(version) + 1 from project_configuration_revisions where project_id = $1), 1),
-           $3, $4, $5, $6, null, $7, $8, clock_timestamp(), clock_timestamp()
-         ) returning *`,
-        [
-          trigger.runtime_project_id,
-          input.organizationId,
-          input.sourceKind,
-          { kind: "organization_trigger_adapter", triggerId: trigger.id },
-          input.yaml,
-          input.normalizedConfiguration,
-          input.contentHash,
-          input.createdByUserId,
-        ],
-      );
-      const runtimeRevision = runtimeRevisionRows.rows[0]!;
-      await client.query(`delete from project_trigger_routes where project_id = $1`, [
-        trigger.runtime_project_id,
-      ]);
-      for (const route of routes) {
-        const configuredTriggerName =
-          configuration.triggers.find(({ on }) => on === route.configuredEventName)?.name ??
-          configuration.triggers[0]?.name ??
-          input.name;
-        await client.query(
-          `insert into project_trigger_routes (
-             organization_id, project_id, configuration_revision_id, provider,
-             connection_id, resource_id, trigger_name
-           ) values ($1, $2, $3, $4, $5, $6, $7)`,
-          [
-            input.organizationId,
-            trigger.runtime_project_id,
-            runtimeRevision.id,
-            route.provider,
-            route.connectionId,
-            route.resourceId,
-            configuredTriggerName,
-          ],
-        );
-      }
-      await client.query(
-        `update projects set active_configuration_revision_id = $2, updated_at = clock_timestamp()
-         where id = $1`,
-        [trigger.runtime_project_id, runtimeRevision.id],
-      );
-      const activated = await client.query<OrganizationTriggerRow>(
-        `update organization_triggers
-         set active_revision_id = $2, updated_at = clock_timestamp()
-         where id = $1 returning *`,
-        [trigger.id, revision.id],
-      );
-      const recurrence = input.enabled ? input.recurrence : undefined;
-      await ScheduleRepository.synchronize(client, trigger.id, recurrence, new Date());
-      return toOrganizationTriggerRecord(activated.rows[0]!);
+      const routes = await resolveSavedTriggerRoutes(client, input, configuration);
+      const trigger = await upsertSavedTrigger(client, input);
+      const revision = await insertSavedRevision(client, input, trigger.id);
+      const rows = { input, trigger, revision, routes };
+      await replaceSavedOrganizationRoutes(client, rows);
+      const runtimeRevision = await insertSavedRuntimeRevision(client, input, trigger);
+      await replaceSavedRuntimeRoutes(client, rows, {
+        configuration,
+        runtimeRevisionId: runtimeRevision.id,
+      });
+      return activateSavedTrigger(client, rows, runtimeRevision.id);
     });
   }
 
@@ -4449,13 +3673,13 @@ class PgDatabase implements Database {
         : {
             project: toProjectRecord({
               id: row.project_id,
-              organization_id: row.project_organization_id!,
-              name: row.project_name!,
-              slug: row.project_slug!,
-              status: row.project_status!,
+              organization_id: row.project_organization_id,
+              name: row.project_name,
+              slug: row.project_slug,
+              status: row.project_status,
               created_by_user_id: row.project_created_by_user_id,
-              created_at: row.project_created_at!,
-              updated_at: row.project_updated_at!,
+              created_at: row.project_created_at,
+              updated_at: row.project_updated_at,
               archived_at: row.project_archived_at,
               active_configuration_revision_id: row.project_active_configuration_revision_id,
             }),
@@ -4500,7 +3724,7 @@ class PgDatabase implements Database {
                  '{"releasedRoutes":true}')`,
           [organizationId, projectId, userId, projectId],
         );
-        return toProjectRecord(archived.rows[0]!);
+        return toProjectRecord(requireReturnedRow(archived.rows[0], "archived project"));
       });
     } catch (error) {
       throw toDatabaseError(error);
@@ -4555,7 +3779,9 @@ class PgDatabase implements Database {
         input.createdByUserId ?? null,
       ],
     );
-    return toProjectConfigurationRevisionRecord(rows.rows[0]!);
+    const revision = rows.rows[0];
+    if (revision === undefined) throw new Error("project not found");
+    return toProjectConfigurationRevisionRecord(revision);
   }
 
   async activateProjectConfigurationRevision(
@@ -4566,25 +3792,7 @@ class PgDatabase implements Database {
     try {
       return await this.pool.transaction(async (client) => {
         const revision = await lockValidProjectRevision(client, projectId, revisionId);
-        const compiledRoutes =
-          routes ??
-          (
-            await client.query<{
-              provider: ConnectionProvider;
-              connection_id: string;
-              resource_id: string | null;
-              trigger_name: string;
-            }>(
-              `select provider, connection_id, resource_id, trigger_name
-             from project_trigger_routes where configuration_revision_id = $1`,
-              [revisionId],
-            )
-          ).rows.map((row) => ({
-            provider: row.provider,
-            connectionId: row.connection_id,
-            resourceId: row.resource_id,
-            triggerName: row.trigger_name,
-          }));
+        const compiledRoutes = routes ?? (await this.loadRevisionTriggerRoutes(client, revisionId));
         await client.query(`delete from project_trigger_routes where project_id = $1`, [projectId]);
         for (const route of compiledRoutes) {
           await client.query(
@@ -4623,6 +3831,25 @@ class PgDatabase implements Database {
     } catch (error) {
       throw toDatabaseError(error);
     }
+  }
+
+  private async loadRevisionTriggerRoutes(client: QueryHandle, revisionId: string) {
+    const result = await client.query<{
+      provider: ConnectionProvider;
+      connection_id: string;
+      resource_id: string | null;
+      trigger_name: string;
+    }>(
+      `select provider, connection_id, resource_id, trigger_name
+             from project_trigger_routes where configuration_revision_id = $1`,
+      [revisionId],
+    );
+    return result.rows.map((row) => ({
+      provider: row.provider,
+      connectionId: row.connection_id,
+      resourceId: row.resource_id,
+      triggerName: row.trigger_name,
+    }));
   }
 
   async findProjectConfigurationRollbackTarget(projectId: string) {
@@ -4731,43 +3958,7 @@ class PgDatabase implements Database {
   ): Promise<ProjectConfigurationRevisionRecord> {
     try {
       return await this.pool.transaction(async (client) => {
-        const project = await client.query<ProjectRow>(
-          `select project.*
-         from projects project
-         join member on member.organization_id = project.organization_id
-         where project.id = $1 and project.status = 'active'
-           and member.user_id = $2 and member.role in ('owner', 'admin')
-           and project.active_configuration_revision_id is not null
-         for update of project`,
-          [input.projectId, input.userId],
-        );
-        const projectRow = project.rows[0];
-        if (projectRow === undefined) throw new Error("project access denied");
-        const inserted = await client.query<ProjectConfigurationRevisionRow>(
-          `insert into project_configuration_revisions (
-           project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
-           normalized_configuration, content_hash, created_by_user_id, received_at, validated_at
-         ) values (
-           $1, $2,
-           coalesce((select max(version) + 1 from project_configuration_revisions where project_id = $1), 1),
-           'manual', $3, $4, $5, $6, $7, clock_timestamp(), clock_timestamp()
-         ) returning *`,
-          [
-            input.projectId,
-            projectRow.organization_id,
-            {
-              kind: "authority-switch",
-              fromRevisionId: projectRow.active_configuration_revision_id,
-              formattingPreserved: true,
-              bundle: input.bundle,
-            },
-            input.rawYaml,
-            input.normalizedConfiguration,
-            input.contentHash,
-            input.userId,
-          ],
-        );
-        const revision = inserted.rows[0]!;
+        const revision = await this.insertManualAuthorityRevision(client, input);
         await client.query(
           `update project_configuration_sources
          set kind = 'manual', github_connection_id = null, github_repository_id = null,
@@ -4807,6 +3998,49 @@ class PgDatabase implements Database {
     } catch (error) {
       throw toDatabaseError(error);
     }
+  }
+
+  private async insertManualAuthorityRevision(
+    client: QueryHandle,
+    input: SwitchProjectConfigurationToManualInput,
+  ) {
+    const project = await client.query<ProjectRow>(
+      `select project.*
+         from projects project
+         join member on member.organization_id = project.organization_id
+         where project.id = $1 and project.status = 'active'
+           and member.user_id = $2 and member.role in ('owner', 'admin')
+           and project.active_configuration_revision_id is not null
+         for update of project`,
+      [input.projectId, input.userId],
+    );
+    const projectRow = project.rows[0];
+    if (projectRow === undefined) throw new Error("project access denied");
+    const inserted = await client.query<ProjectConfigurationRevisionRow>(
+      `insert into project_configuration_revisions (
+           project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
+           normalized_configuration, content_hash, created_by_user_id, received_at, validated_at
+         ) values (
+           $1, $2,
+           coalesce((select max(version) + 1 from project_configuration_revisions where project_id = $1), 1),
+           'manual', $3, $4, $5, $6, $7, clock_timestamp(), clock_timestamp()
+         ) returning *`,
+      [
+        input.projectId,
+        projectRow.organization_id,
+        {
+          kind: "authority-switch",
+          fromRevisionId: projectRow.active_configuration_revision_id,
+          formattingPreserved: true,
+          bundle: input.bundle,
+        },
+        input.rawYaml,
+        input.normalizedConfiguration,
+        input.contentHash,
+        input.userId,
+      ],
+    );
+    return requireReturnedRow(inserted.rows[0], "inserted manual configuration revision");
   }
 
   async setProjectGitHubConfigurationSource(
@@ -4916,44 +4150,9 @@ class PgDatabase implements Database {
     const sourceRow = source.rows[0];
     if (sourceRow === undefined) throw new Error("configuration authority not found");
     const activeRevision = (await this.findActiveProjectConfiguration(projectId)) ?? null;
-    const attempts = await query<{
-      id: string;
-      project_id: string;
-      github_connection_id: string | null;
-      github_repository_id: number | null;
-      webhook_delivery_id: string | null;
-      commit_sha: string | null;
-      outcome: string;
-      evidence: unknown;
-      created_at: Date;
-    }>(
-      this.pool,
-      `select * from configuration_sync_attempts
-       where project_id = $1 order by created_at desc, id desc limit 1`,
-      [projectId],
-    );
-    const attempt = attempts.rows[0];
-    const lastSyncAttempt =
-      attempt === undefined
-        ? null
-        : {
-            id: attempt.id,
-            projectId: attempt.project_id,
-            githubConnectionId: attempt.github_connection_id,
-            githubRepositoryId: attempt.github_repository_id,
-            webhookDeliveryId: attempt.webhook_delivery_id,
-            commitSha: attempt.commit_sha,
-            outcome: attempt.outcome,
-            evidence: attempt.evidence,
-            createdAt: attempt.created_at,
-          };
+    const lastSyncAttempt = await this.findLastConfigurationSyncAttempt(projectId);
     if (sourceRow.kind === "manual") {
-      const evidence = activeRevision?.sourceEvidence;
-      const formattingPreserved =
-        typeof evidence === "object" &&
-        evidence !== null &&
-        "formattingPreserved" in evidence &&
-        evidence.formattingPreserved === true;
+      const formattingPreserved = this.isFormattingPreserved(activeRevision?.sourceEvidence);
       return {
         authority: "manual",
         activeRevision,
@@ -4984,6 +4183,49 @@ class PgDatabase implements Database {
     };
   }
 
+  private async findLastConfigurationSyncAttempt(
+    projectId: string,
+  ): Promise<ConfigurationSyncAttemptRecord | null> {
+    const attempts = await query<{
+      id: string;
+      project_id: string;
+      github_connection_id: string | null;
+      github_repository_id: number | null;
+      webhook_delivery_id: string | null;
+      commit_sha: string | null;
+      outcome: string;
+      evidence: unknown;
+      created_at: Date;
+    }>(
+      this.pool,
+      `select * from configuration_sync_attempts
+       where project_id = $1 order by created_at desc, id desc limit 1`,
+      [projectId],
+    );
+    const attempt = attempts.rows[0];
+    if (attempt === undefined) return null;
+    return {
+      id: attempt.id,
+      projectId: attempt.project_id,
+      githubConnectionId: attempt.github_connection_id,
+      githubRepositoryId: attempt.github_repository_id,
+      webhookDeliveryId: attempt.webhook_delivery_id,
+      commitSha: attempt.commit_sha,
+      outcome: attempt.outcome,
+      evidence: attempt.evidence,
+      createdAt: attempt.created_at,
+    };
+  }
+
+  private isFormattingPreserved(evidence: unknown): boolean {
+    return (
+      typeof evidence === "object" &&
+      evidence !== null &&
+      "formattingPreserved" in evidence &&
+      evidence.formattingPreserved === true
+    );
+  }
+
   async getHomeChecklistCompletedAt(organizationId: string): Promise<Date | null> {
     const result = await this.pool.query<{ home_checklist_completed_at: Date | null }>(
       "select home_checklist_completed_at from organization where id = $1",
@@ -5006,81 +4248,11 @@ class PgDatabase implements Database {
   }
 
   async organizationConnectionUsage(organizationId: string): Promise<OrganizationConnectionUsage> {
-    const github = await query<{
-      id: string;
-      organization_id: string;
-      slug: string;
-      installation_id: number | string;
-      account_id: string;
-      account_login: string;
-      account_type: string;
-      status: "active" | "suspended";
-      provider_application_id: string | null;
-    }>(
-      this.pool,
-      `select connection.id, connection.organization_id, connection.slug,
-              connection.installation_id,
-              connection.account_id, connection.account_login, connection.account_type,
-              connection.status, connection.provider_application_id
-       from github_connections connection
-       where connection.organization_id = $1
-       order by connection.account_login, connection.id`,
-      [organizationId],
-    );
+    const github = await this.queryGitHubConnectionUsage(organizationId);
     const [discord, slack, linear] = await Promise.all([
-      query<{
-        id: string;
-        organization_id: string;
-        slug: string;
-        guild_id: string;
-        guild_name: string;
-        provider_application_id: string | null;
-      }>(
-        this.pool,
-        `select id, organization_id, slug, guild_id, guild_name, provider_application_id
-         from discord_connections where organization_id = $1
-         order by guild_name, id`,
-        [organizationId],
-      ),
-      query<{
-        id: string;
-        organization_id: string;
-        slug: string;
-        team_id: string;
-        team_name: string;
-        bot_user_id: string;
-        bot_access_token: string;
-        scopes: unknown;
-        provider_application_id: string | null;
-      }>(
-        this.pool,
-        `select id, organization_id, slug, team_id, team_name, bot_user_id, bot_access_token, scopes,
-                provider_application_id
-         from slack_connections where organization_id = $1
-         order by team_name, id`,
-        [organizationId],
-      ),
-      query<{
-        id: string;
-        organization_id: string;
-        slug: string;
-        linear_organization_id: string;
-        linear_organization_name: string;
-        app_user_id: string;
-        access_token: string;
-        refresh_token: string | null;
-        access_token_expires_at: Date | null;
-        scopes: unknown;
-        provider_application_id: string | null;
-      }>(
-        this.pool,
-        `select id, organization_id, slug, linear_organization_id, linear_organization_name,
-                app_user_id, access_token, refresh_token, access_token_expires_at, scopes,
-                provider_application_id
-         from linear_connections where organization_id = $1
-         order by linear_organization_name, id`,
-        [organizationId],
-      ),
+      this.queryDiscordConnectionUsage(organizationId),
+      this.querySlackConnectionUsage(organizationId),
+      this.queryLinearConnectionUsage(organizationId),
     ]);
     return {
       github: github.rows.map((row) => ({
@@ -5127,6 +4299,92 @@ class PgDatabase implements Database {
         providerApplicationId: row.provider_application_id,
       })),
     };
+  }
+
+  private queryGitHubConnectionUsage(organizationId: string) {
+    return query<{
+      id: string;
+      organization_id: string;
+      slug: string;
+      installation_id: number | string;
+      account_id: string;
+      account_login: string;
+      account_type: string;
+      status: "active" | "suspended";
+      provider_application_id: string | null;
+    }>(
+      this.pool,
+      `select connection.id, connection.organization_id, connection.slug,
+              connection.installation_id,
+              connection.account_id, connection.account_login, connection.account_type,
+              connection.status, connection.provider_application_id
+       from github_connections connection
+       where connection.organization_id = $1
+       order by connection.account_login, connection.id`,
+      [organizationId],
+    );
+  }
+
+  private queryDiscordConnectionUsage(organizationId: string) {
+    return query<{
+      id: string;
+      organization_id: string;
+      slug: string;
+      guild_id: string;
+      guild_name: string;
+      provider_application_id: string | null;
+    }>(
+      this.pool,
+      `select id, organization_id, slug, guild_id, guild_name, provider_application_id
+         from discord_connections where organization_id = $1
+         order by guild_name, id`,
+      [organizationId],
+    );
+  }
+
+  private querySlackConnectionUsage(organizationId: string) {
+    return query<{
+      id: string;
+      organization_id: string;
+      slug: string;
+      team_id: string;
+      team_name: string;
+      bot_user_id: string;
+      bot_access_token: string;
+      scopes: unknown;
+      provider_application_id: string | null;
+    }>(
+      this.pool,
+      `select id, organization_id, slug, team_id, team_name, bot_user_id, bot_access_token, scopes,
+                provider_application_id
+         from slack_connections where organization_id = $1
+         order by team_name, id`,
+      [organizationId],
+    );
+  }
+
+  private queryLinearConnectionUsage(organizationId: string) {
+    return query<{
+      id: string;
+      organization_id: string;
+      slug: string;
+      linear_organization_id: string;
+      linear_organization_name: string;
+      app_user_id: string;
+      access_token: string;
+      refresh_token: string | null;
+      access_token_expires_at: Date | null;
+      scopes: unknown;
+      provider_application_id: string | null;
+    }>(
+      this.pool,
+      `select id, organization_id, slug, linear_organization_id, linear_organization_name,
+                app_user_id, access_token, refresh_token, access_token_expires_at, scopes,
+                provider_application_id
+         from linear_connections where organization_id = $1
+         order by linear_organization_name, id`,
+      [organizationId],
+    );
   }
 
   async listGitHubRepositories(organizationId: string): Promise<GitHubRepositoryRecord[]> {
@@ -5514,6 +4772,155 @@ class PgDatabase implements Database {
   }
 }
 
+interface CancelTriggerRunOptions {
+  organizationId: string;
+  triggerRunId: string;
+  stoppedByUserId: string | undefined;
+  confirmedPeerCount: number | undefined;
+  retryAttemptId: string | undefined;
+}
+
+async function cancelTriggerRunOnClient(client: QueryHandle, input: CancelTriggerRunOptions) {
+  const { organizationId, triggerRunId, confirmedPeerCount, retryAttemptId } = input;
+  const locked = await client.query<TriggerRunRow>(
+    "select * from trigger_runs where organization_id = $1 and id = $2 for update",
+    [organizationId, triggerRunId],
+  );
+  const current = locked.rows[0];
+  if (current === undefined) return undefined;
+  const runRecord = toTriggerRunRecord(current);
+  const noop = { run: runRecord, transitioned: false, executionIds: [] };
+  const retrying = current.status === "canceled" && retryAttemptId !== undefined;
+  if (!retrying && (current.status !== "running" || retryAttemptId !== undefined)) return noop;
+  const ownedQuery = `select linked.* from trigger_runs run cross join lateral (${RUN_STOP_OWNED}) linked
+          where run.id = $1`;
+  if (
+    retrying &&
+    (current.payload_expiry_state !== null ||
+      confirmedPeerCount === undefined ||
+      !(await hasRetryableRunStopOnClient(client, ownedQuery, triggerRunId, retryAttemptId)))
+  )
+    return noop;
+  return applyRunStopOnClient(client, input, { ownedQuery, retrying }, noop);
+}
+
+async function hasRetryableRunStopOnClient(
+  client: QueryHandle,
+  ownedQuery: string,
+  triggerRunId: string,
+  retryAttemptId: string,
+) {
+  const retry = await client.query<{ attempt_id: string | null; pending: boolean }>(
+    `with owned as materialized (${ownedQuery})
+             select (select max(${RUN_STOP_ATTEMPT}) from owned where ${RUN_STOP_RETRYABLE}) as attempt_id,
+                    (${RUN_STOP_PENDING}) as pending
+             from trigger_runs run where run.id = $1`,
+    [triggerRunId],
+  );
+  return retry.rows[0]?.attempt_id === retryAttemptId && !retry.rows[0].pending;
+}
+
+async function applyRunStopOnClient(
+  client: QueryHandle,
+  input: CancelTriggerRunOptions,
+  { ownedQuery, retrying }: { ownedQuery: string; retrying: boolean },
+  noop: { run: TriggerRunRecord; transitioned: boolean; executionIds: string[] },
+) {
+  const { triggerRunId, retryAttemptId, confirmedPeerCount } = input;
+  const targets = retrying
+    ? `${RUN_STOP_RETRYABLE} and ${RUN_STOP_ATTEMPT} = $2`
+    : "status in ('spawning', 'running')";
+  const scopeParams = retrying ? [triggerRunId, retryAttemptId] : [triggerRunId];
+  // Attaching an execution takes a foreign-key lock on its session row.
+  await client.query(
+    `with owned as materialized (${ownedQuery})
+           select session.id from agent_sessions session
+           where session.id in (select agent_session_id from owned where ${targets})
+           order by session.id for update`,
+    scopeParams,
+  );
+  const peers = await client.query<{ id: string; run_id: string }>(
+    `with owned as materialized (${ownedQuery}), targets as (select * from owned where ${targets})
+           ${RUN_STOP_PEERS}`,
+    scopeParams,
+  );
+  const peerCount = new Set(peers.rows.map(({ run_id }) => run_id)).size;
+  if (confirmedPeerCount !== undefined && confirmedPeerCount !== peerCount)
+    return { ...noop, conflict: peerCount };
+  const attemptId = randomUUID();
+  const approvedPeers = JSON.stringify(peers.rows.map(({ id }) => id));
+  if (retrying) {
+    const retried = await client.query<{ id: string }>(
+      `with owned as materialized (${ownedQuery})
+             update agent_executions set hub_action_completed_at = null,
+               hub_action_acknowledgements = jsonb_set(
+                 coalesce(hub_action_acknowledgements, '{}'::jsonb)
+                   - 'stop_interrupt_claim' - 'stop_interrupt_checked_at',
+                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
+                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
+                 || jsonb_build_object('stop_interrupt_generation', $4::text)
+             where id in (select id from owned where ${targets})
+             returning id`,
+      [triggerRunId, retryAttemptId, approvedPeers, attemptId],
+    );
+    return { ...noop, executionIds: retried.rows.map(({ id }) => id) };
+  }
+  return transitionRunStopOnClient(client, input, { approvedPeers, attemptId });
+}
+
+async function transitionRunStopOnClient(
+  client: QueryHandle,
+  { organizationId, triggerRunId, stoppedByUserId }: CancelTriggerRunOptions,
+  { approvedPeers, attemptId }: { approvedPeers: string; attemptId: string },
+) {
+  const updated = await client.query<TriggerRunRow>(
+    `update trigger_runs set status = 'canceled', completed_at = now(),
+             terminal_notification_pending_at = now(), terminal_notification_lease_expires_at = null
+           where organization_id = $1 and id = $2 and status = 'running' returning *`,
+    [organizationId, triggerRunId],
+  );
+  const run = requireReturnedRow(updated.rows[0], "canceled trigger run");
+  await client.query(
+    `update workflow_step_runs
+           set status = case when status = 'running' then 'canceled' else 'skipped' end,
+               completed_at = $2
+           where trigger_run_id = $1 and status in ('pending', 'running')`,
+    [run.id, run.completed_at],
+  );
+  const executions = await client.query<{ id: string }>(
+    `update agent_executions
+           set status = 'failed', completed_at = $2, idle_deadline_at = null,
+               result = '{"status":"canceled"}',
+               hub_action = case when daemon_id is not null then 'interrupt' end,
+               hub_action_completed_at = null,
+               hub_action_acknowledgements = jsonb_set(
+                 coalesce(hub_action_acknowledgements, '{}'::jsonb),
+                 '{stop_interrupt}', jsonb_build_object('approvedPeerIds', $3::jsonb,
+                   'attemptId', $4::text, 'requestedAt', clock_timestamp()))
+           where status in ('spawning', 'running') and id in (
+             select execution_id from trigger_runs run
+             cross join lateral (${runExecutions("run", "execution.id as execution_id")}) linked
+             where run.id = $1
+           )
+           returning id`,
+    [run.id, run.completed_at, approvedPeers, attemptId],
+  );
+  await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [run.id]);
+  if (stoppedByUserId !== undefined) {
+    await client.query(
+      `insert into audit_events
+             (organization_id, project_id, actor_kind, actor_identity, action, subject_type, subject_id, evidence, created_at)
+             values ($1, $2, 'user', $3, 'run.canceled', 'trigger_run', $4, '{}'::jsonb, $5)`,
+      [organizationId, run.project_id, stoppedByUserId, run.id, run.completed_at],
+    );
+  }
+  return {
+    run: toTriggerRunRecord(run),
+    transitioned: true,
+    executionIds: executions.rows.map(({ id }) => id),
+  };
+}
+
 async function readAttachmentBySource(
   handle: QueryHandle,
   receiptId: string,
@@ -5558,6 +4965,11 @@ async function query<T extends QueryRow = QueryRow>(
   return pool.query<T>(text, values);
 }
 
+function requireReturnedRow<T extends QueryRow>(row: T | undefined, description: string): T {
+  if (row === undefined) throw new Error(`missing ${description}`);
+  return row;
+}
+
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : [];
 }
@@ -5569,6 +4981,26 @@ function isDaemonSlugConflict(error: unknown): boolean {
     postgresError.code === "23505" &&
     postgresError.constraint === "daemons_organization_slug_unique"
   );
+}
+
+function agentExecutionInsertParameters(input: InsertAgentExecutionInput): unknown[] {
+  return [
+    input.organizationId,
+    input.projectId,
+    input.machineId,
+    input.daemonId ?? null,
+    input.status ?? "spawning",
+    input.startedAt ?? null,
+    input.triggerContext,
+    input.outputContext,
+    input.configurationRevisionId,
+    input.completionTokenHash ?? null,
+    input.deadlineAt ?? null,
+    input.idleDeadlineAt ?? null,
+    input.launchIntent ?? null,
+    input.workflowStepRunId ?? null,
+    input.result ?? null,
+  ];
 }
 
 async function insertAgentExecutionOnClient(
@@ -5604,27 +5036,146 @@ async function insertAgentExecutionOnClient(
      returning *`,
     [
       input.id ?? null,
-      input.organizationId,
-      input.projectId,
-      input.machineId,
-      input.daemonId ?? null,
-      input.status ?? "spawning",
-      input.startedAt ?? null,
-      input.triggerContext,
-      input.outputContext,
-      input.configurationRevisionId,
-      input.completionTokenHash ?? null,
-      input.deadlineAt ?? null,
-      input.idleDeadlineAt ?? null,
-      input.launchIntent ?? null,
-      input.workflowStepRunId ?? null,
-      input.result ?? null,
+      ...agentExecutionInsertParameters(input),
       temporaryCredentialFact(input.launchIntent ?? null),
     ],
   );
   const execution = rows.rows[0];
   if (execution === undefined) throw new Error("agent execution insert returned no row");
   return execution;
+}
+
+async function canRefreshWorkflowIdleDeadlineOnClient(
+  client: QueryHandle,
+  stepRunId: string,
+  processedAt: Date,
+): Promise<boolean> {
+  const stepRows = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs where id = $1`,
+    [stepRunId],
+  );
+  const stepCandidate = stepRows.rows[0];
+  if (stepCandidate === undefined) return false;
+  const runRows = await client.query<TriggerRunRow>(
+    `select * from trigger_runs where id = $1 for update`,
+    [stepCandidate.trigger_run_id],
+  );
+  const lockedStepRows = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs where id = $1 for update`,
+    [stepCandidate.id],
+  );
+  const step = lockedStepRows.rows[0];
+  const run = runRows.rows[0];
+  return (
+    step !== undefined &&
+    step.status === "running" &&
+    run !== undefined &&
+    run.status === "running" &&
+    (run.deadline_at === null || run.deadline_at > processedAt)
+  );
+}
+
+async function completeAgentExecutionOutputOnClient(
+  client: QueryHandle,
+  executionId: string,
+  attemptId: string,
+  completedAt: Date,
+): Promise<AgentExecutionRecord | undefined> {
+  const selected = await client.query<AgentExecutionRow>(
+    `select * from agent_executions where id = $1 for update`,
+    [executionId],
+  );
+  const row = selected.rows[0];
+  if (row === undefined) {
+    return undefined;
+  }
+  const execution = toAgentExecutionRecord(row);
+  const attempt = execution.outputDeliveryAttempts[attemptId];
+  if (attempt === undefined) {
+    return undefined;
+  }
+  if (attempt.status === "succeeded") {
+    return findAgentExecutionOnClient(client, executionId);
+  }
+  if (attempt.status !== "pending") {
+    return undefined;
+  }
+  if (attempt.leaseExpiresAt <= completedAt) {
+    await client.query(
+      `update agent_executions
+           set output_delivery_attempts = $2::jsonb
+           where id = $1`,
+      [
+        executionId,
+        JSON.stringify({
+          ...execution.outputDeliveryAttempts,
+          [attemptId]: { ...attempt, status: "failed" as const, completedAt: null },
+        }),
+      ],
+    );
+    return undefined;
+  }
+  const outputEmissions = {
+    ...execution.outputEmissions,
+    [attempt.outputType]: (execution.outputEmissions[attempt.outputType] ?? 0) + 1,
+  };
+  await client.query(
+    `update agent_executions
+         set output_emissions = $2::jsonb,
+             output_delivery_attempts = $3::jsonb
+         where id = $1`,
+    [
+      executionId,
+      JSON.stringify(outputEmissions),
+      JSON.stringify({
+        ...execution.outputDeliveryAttempts,
+        [attemptId]: { ...attempt, status: "succeeded" as const, completedAt },
+      }),
+    ],
+  );
+  return findAgentExecutionOnClient(client, executionId);
+}
+
+function agentExecutionTransitionParameters(
+  id: string,
+  toStatus: AgentExecutionStatus,
+  fields: TransitionAgentExecutionFields,
+): unknown[] {
+  return [
+    id,
+    toStatus,
+    isTerminalAgentExecutionStatus(toStatus),
+    fields.result !== undefined,
+    fields.result ?? null,
+    fields.completedByAgent === true,
+    fields.deadlineCondition?.kind ?? null,
+    fields.deadlineCondition?.deadlineAt ?? null,
+    fields.deadlineCondition?.observedAt ?? null,
+    fields.hubAction !== undefined,
+    fields.hubAction ?? null,
+  ];
+}
+
+function hubTimestampAcknowledgementStatement(state: string, field: string): string {
+  return `
+          update agent_executions
+          set hub_action_acknowledgements = jsonb_set(
+            ${state},
+            '{${field}}',
+            case
+              when ${state}->>'${field}' is null
+                or (${state}->>'${field}')::timestamptz < $2::timestamptz
+                then to_jsonb($2::timestamptz)
+              else ${state}->'${field}'
+            end,
+            true
+          )
+          where id = $1
+            and (
+              ${state}->>'${field}' is null
+              or (${state}->>'${field}')::timestamptz < $2::timestamptz
+            )
+          returning id`;
 }
 
 function isTerminalAgentExecutionStatus(status: AgentExecutionStatus): boolean {
@@ -5659,7 +5210,7 @@ interface TriggerRunRow extends QueryRow {
   payload_expired_at: Date | null;
   payload_summary: TriggerRunRecord["payloadSummary"];
   terminal_notification_generation: number;
-  conversation: import("../triggers/continuation.js").Conversation | null;
+  conversation: Conversation | null;
   id: string;
   organization_id: string;
   project_id: string;
@@ -5754,6 +5305,582 @@ interface WorkflowWakeupRow extends QueryRow {
   lease_expires_at: Date | null;
 }
 
+type CompiledTriggerConfig = ReturnType<typeof parseCompiledHubConfig>;
+
+interface TriggerMigrationPlan {
+  candidate: MigrateProjectTriggerInput;
+  configuration: CompiledTriggerConfig;
+  routes: OrganizationTriggerRoute[];
+}
+
+interface MigratedTriggerContext {
+  input: MigrateProjectTriggersInput;
+  plan: TriggerMigrationPlan;
+  name: string;
+}
+
+interface MigratedTriggerRows {
+  runtimeProject: ProjectRow;
+  trigger: OrganizationTriggerRow;
+  revision: OrganizationTriggerRevisionRow;
+}
+
+function runtimeTriggerName(
+  configuration: CompiledTriggerConfig,
+  configuredEventName: string,
+  fallback: string,
+): string {
+  return (
+    configuration.triggers.find(({ on }) => on === configuredEventName)?.name ??
+    configuration.triggers[0]?.name ??
+    fallback
+  );
+}
+
+async function projectTriggerMigrationPending(
+  client: QueryHandle,
+  input: MigrateProjectTriggersInput,
+): Promise<boolean> {
+  const project = await client.query<{
+    active_configuration_revision_id: string | null;
+    organization_id: string;
+  }>(
+    `select organization_id, active_configuration_revision_id
+         from projects where id = $1 for update`,
+    [input.projectId],
+  );
+  const current = project.rows[0];
+  const alreadyMigrated = await client.query(
+    `select project_id from project_trigger_migrations where project_id = $1`,
+    [input.projectId],
+  );
+  if (alreadyMigrated.rowCount > 0) {
+    return false;
+  }
+  if (
+    current === undefined ||
+    current.organization_id !== input.organizationId ||
+    current.active_configuration_revision_id !== input.configurationRevisionId
+  ) {
+    throw new Error("project configuration changed during trigger migration");
+  }
+  return true;
+}
+
+async function planProjectTriggerMigration(
+  client: QueryHandle,
+  input: MigrateProjectTriggersInput,
+): Promise<TriggerMigrationPlan[]> {
+  const legacyRouteRows = await client.query<{
+    provider: ConnectionProvider;
+    connection_id: string;
+    resource_id: string | null;
+    trigger_name: string;
+  }>(
+    `select provider, connection_id::text, resource_id, trigger_name
+         from project_trigger_routes
+         where project_id = $1 and configuration_revision_id = $2
+         order by trigger_name, provider, connection_id, resource_id nulls first`,
+    [input.projectId, input.configurationRevisionId],
+  );
+  const compiled = input.triggers.map((candidate) => ({
+    candidate,
+    configuration: parseCompiledHubConfig(candidate.normalizedConfiguration),
+  }));
+  const plans = compiled.map(({ candidate, configuration }) => {
+    const configuredEventName = configuration.triggers[0]?.on;
+    if (configuredEventName === undefined) {
+      throw new Error(`migrated trigger ${candidate.name} has no configured event`);
+    }
+    const routes = legacyRouteRows.rows
+      .filter((route) => route.trigger_name === candidate.name)
+      .map((route) => ({
+        provider: route.provider,
+        connectionId: route.connection_id,
+        resourceId: route.resource_id,
+        configuredEventName,
+      }));
+    return { candidate, configuration, routes };
+  });
+  if (
+    plans.reduce((total, { routes }) => total + routes.length, 0) !== legacyRouteRows.rows.length
+  ) {
+    throw new Error("project trigger routes do not match migrated triggers");
+  }
+  return plans;
+}
+
+async function insertMigratedRuntimeProject(
+  client: QueryHandle,
+  input: MigrateProjectTriggersInput,
+  name: string,
+): Promise<ProjectRow> {
+  const runtimeProjectRows = await client.query<ProjectRow>(
+    `insert into projects
+             (organization_id, name, slug, created_by_user_id)
+           values ($1, $2, $3, null) returning *`,
+    [
+      input.organizationId,
+      `Trigger runtime: ${name}`,
+      `trigger-${randomUUID().replaceAll("-", "")}`,
+    ],
+  );
+  const runtimeProject = requireReturnedRow(runtimeProjectRows.rows[0], "migrated runtime project");
+  await client.query(
+    `insert into project_configuration_sources
+             (project_id, organization_id, kind, automatic_deployment_enabled, selected_by_user_id)
+           values ($1, $2, 'manual', false, null)`,
+    [runtimeProject.id, input.organizationId],
+  );
+  return runtimeProject;
+}
+
+async function insertMigratedOrganizationTrigger(
+  client: QueryHandle,
+  context: MigratedTriggerContext,
+  runtimeProjectId: string,
+): Promise<Pick<MigratedTriggerRows, "trigger" | "revision">> {
+  const { input, plan, name } = context;
+  const { candidate } = plan;
+  const triggerRows = await client.query<OrganizationTriggerRow>(
+    `insert into organization_triggers
+             (organization_id, name, enabled, format, runtime_project_id)
+           values ($1, $2, $3, $4, $5) returning *`,
+    [input.organizationId, name, candidate.enabled, candidate.format, runtimeProjectId],
+  );
+  const trigger = requireReturnedRow(triggerRows.rows[0], "migrated organization trigger");
+  const revisionRows = await client.query<OrganizationTriggerRevisionRow>(
+    `insert into organization_trigger_revisions (
+             trigger_id, organization_id, version, yaml, normalized_configuration,
+             content_hash, source_kind, source_evidence, created_by_user_id
+           ) values ($1, $2, 1, $3, $4, $5, 'project_migration', $6, null)
+           returning *`,
+    [
+      trigger.id,
+      input.organizationId,
+      candidate.yaml,
+      candidate.normalizedConfiguration,
+      candidate.contentHash,
+      candidate.sourceEvidence,
+    ],
+  );
+  const revision = requireReturnedRow(
+    revisionRows.rows[0],
+    "migrated organization trigger revision",
+  );
+  for (const route of plan.routes) {
+    await client.query(
+      `insert into organization_trigger_routes (
+               organization_id, trigger_id, trigger_revision_id, provider,
+               connection_id, resource_id, configured_event_name
+             ) values ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        trigger.id,
+        revision.id,
+        route.provider,
+        route.connectionId,
+        route.resourceId,
+        route.configuredEventName,
+      ],
+    );
+  }
+  return { trigger, revision };
+}
+
+async function insertMigratedProjectRoutes(
+  client: QueryHandle,
+  context: MigratedTriggerContext,
+  target: { projectId: string; revisionId: string },
+): Promise<void> {
+  const { input, plan, name } = context;
+  for (const route of plan.routes) {
+    const configuredTriggerName = runtimeTriggerName(
+      plan.configuration,
+      route.configuredEventName,
+      name,
+    );
+    await client.query(
+      `insert into project_trigger_routes (
+               organization_id, project_id, configuration_revision_id, provider,
+               connection_id, resource_id, trigger_name
+             ) values ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        target.projectId,
+        target.revisionId,
+        route.provider,
+        route.connectionId,
+        route.resourceId,
+        configuredTriggerName,
+      ],
+    );
+  }
+}
+
+async function activateMigratedRuntime(
+  client: QueryHandle,
+  context: MigratedTriggerContext,
+  rows: MigratedTriggerRows,
+): Promise<OrganizationTriggerRecord> {
+  const { input, plan } = context;
+  const { runtimeProject, trigger, revision } = rows;
+  const runtimeRevisionRows = await client.query<ProjectConfigurationRevisionRow>(
+    `insert into project_configuration_revisions (
+             project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
+             normalized_configuration, validation_errors, content_hash,
+             created_by_user_id, received_at, validated_at
+           ) values ($1, $2, 1, 'manual', $3, $4, $5, null, $6, null,
+             clock_timestamp(), clock_timestamp()) returning *`,
+    [
+      runtimeProject.id,
+      input.organizationId,
+      { kind: "organization_trigger_adapter", triggerId: trigger.id },
+      plan.candidate.yaml,
+      plan.candidate.normalizedConfiguration,
+      plan.candidate.contentHash,
+    ],
+  );
+  const runtimeRevision = requireReturnedRow(
+    runtimeRevisionRows.rows[0],
+    "migrated runtime configuration revision",
+  );
+  await insertMigratedProjectRoutes(client, context, {
+    projectId: runtimeProject.id,
+    revisionId: runtimeRevision.id,
+  });
+  await client.query(
+    `update projects set active_configuration_revision_id = $2,
+             updated_at = clock_timestamp() where id = $1`,
+    [runtimeProject.id, runtimeRevision.id],
+  );
+  const activated = await client.query<OrganizationTriggerRow>(
+    `update organization_triggers
+           set active_revision_id = $2, updated_at = clock_timestamp()
+           where id = $1 returning *`,
+    [trigger.id, revision.id],
+  );
+  return toOrganizationTriggerRecord(
+    requireReturnedRow(activated.rows[0], "activated organization trigger"),
+  );
+}
+
+async function migrateTriggerCandidate(
+  client: QueryHandle,
+  context: MigratedTriggerContext,
+): Promise<OrganizationTriggerRecord> {
+  const runtimeProject = await insertMigratedRuntimeProject(client, context.input, context.name);
+  const { trigger, revision } = await insertMigratedOrganizationTrigger(
+    client,
+    context,
+    runtimeProject.id,
+  );
+  return activateMigratedRuntime(client, context, { runtimeProject, trigger, revision });
+}
+
+async function archiveMigratedProject(
+  client: QueryHandle,
+  input: MigrateProjectTriggersInput,
+): Promise<void> {
+  await client.query(
+    `insert into project_trigger_migrations
+           (project_id, organization_id, configuration_revision_id)
+         values ($1, $2, $3)`,
+    [input.projectId, input.organizationId, input.configurationRevisionId],
+  );
+  await client.query(`delete from project_trigger_routes where project_id = $1`, [input.projectId]);
+  await client.query(
+    `update projects set status = 'archived', archived_at = clock_timestamp(),
+           active_configuration_revision_id = null, updated_at = clock_timestamp()
+         where id = $1`,
+    [input.projectId],
+  );
+}
+
+interface SavedTriggerRows {
+  input: SaveOrganizationTriggerInput;
+  trigger: OrganizationTriggerRow;
+  revision: OrganizationTriggerRevisionRow;
+  routes: OrganizationTriggerRoute[];
+}
+
+async function resolveSavedTriggerRoutes(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+  configuration: CompiledTriggerConfig,
+): Promise<OrganizationTriggerRoute[]> {
+  const linearConnections =
+    input.enabled && configuration.triggers.some(({ on }) => on.startsWith("linear."))
+      ? (
+          await client.query<{ id: string }>(
+            "select id from linear_connections where organization_id = $1",
+            [input.organizationId],
+          )
+        ).rows
+      : [];
+  return input.enabled
+    ? organizationTriggerRoutesForSave(
+        configuration,
+        input.routes,
+        linearConnections.map(({ id }) => id),
+      )
+    : [];
+}
+
+async function insertSavedTrigger(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+): Promise<OrganizationTriggerRow> {
+  const runtimeProjectRows = await client.query<ProjectRow>(
+    `insert into projects
+             (organization_id, name, slug, created_by_user_id)
+           values ($1, $2, $3, $4) returning *`,
+    [
+      input.organizationId,
+      `Trigger runtime: ${input.name}`,
+      `trigger-${randomUUID().replaceAll("-", "")}`,
+      input.createdByUserId,
+    ],
+  );
+  const runtimeProject = requireReturnedRow(runtimeProjectRows.rows[0], "saved runtime project");
+  await client.query(
+    `insert into project_configuration_sources
+             (project_id, organization_id, kind, automatic_deployment_enabled, selected_by_user_id)
+           values ($1, $2, 'manual', false, $3)`,
+    [runtimeProject.id, input.organizationId, input.createdByUserId],
+  );
+  const inserted = await client.query<OrganizationTriggerRow>(
+    `insert into organization_triggers
+             (organization_id, name, enabled, format, runtime_project_id)
+           values ($1, $2, $3, $4, $5) returning *`,
+    [input.organizationId, input.name, input.enabled, input.format, runtimeProject.id],
+  );
+  return requireReturnedRow(inserted.rows[0], "saved organization trigger");
+}
+
+async function upsertSavedTrigger(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+): Promise<OrganizationTriggerRow> {
+  if (input.triggerId === undefined) return insertSavedTrigger(client, input);
+  const updated = await client.query<OrganizationTriggerRow>(
+    `update organization_triggers
+           set name = $3, enabled = $4, format = $5, updated_at = clock_timestamp()
+           where id = $1 and organization_id = $2 returning *`,
+    [input.triggerId, input.organizationId, input.name, input.enabled, input.format],
+  );
+  if (updated.rows[0] === undefined) throw new Error("organization trigger not found");
+  return updated.rows[0];
+}
+
+async function insertSavedRevision(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+  triggerId: string,
+): Promise<OrganizationTriggerRevisionRow> {
+  const revisionRows = await client.query<OrganizationTriggerRevisionRow>(
+    `insert into organization_trigger_revisions (
+           trigger_id, organization_id, version, yaml, normalized_configuration,
+           content_hash, source_kind, source_evidence, created_by_user_id
+         ) values (
+           $1, $2,
+           coalesce((select max(version) + 1 from organization_trigger_revisions where trigger_id = $1), 1),
+           $3, $4, $5, $6, $7, $8
+         ) returning *`,
+    [
+      triggerId,
+      input.organizationId,
+      input.yaml,
+      input.normalizedConfiguration,
+      input.contentHash,
+      input.sourceKind,
+      input.sourceEvidence,
+      input.createdByUserId,
+    ],
+  );
+  return requireReturnedRow(revisionRows.rows[0], "saved organization trigger revision");
+}
+
+async function replaceSavedOrganizationRoutes(
+  client: QueryHandle,
+  { input, trigger, revision, routes }: SavedTriggerRows,
+): Promise<void> {
+  await client.query(`delete from organization_trigger_routes where trigger_id = $1`, [trigger.id]);
+  for (const route of routes) {
+    await client.query(
+      `insert into organization_trigger_routes (
+             organization_id, trigger_id, trigger_revision_id, provider,
+             connection_id, resource_id, configured_event_name
+           ) values ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        trigger.id,
+        revision.id,
+        route.provider,
+        route.connectionId,
+        route.resourceId,
+        route.configuredEventName,
+      ],
+    );
+  }
+}
+
+async function insertSavedRuntimeRevision(
+  client: QueryHandle,
+  input: SaveOrganizationTriggerInput,
+  trigger: OrganizationTriggerRow,
+): Promise<ProjectConfigurationRevisionRow> {
+  const runtimeRevisionRows = await client.query<ProjectConfigurationRevisionRow>(
+    `insert into project_configuration_revisions (
+           project_id, organization_id, version, source_kind, source_evidence, raw_yaml,
+           normalized_configuration, validation_errors, content_hash,
+           created_by_user_id, received_at, validated_at
+         ) values (
+           $1, $2,
+           coalesce((select max(version) + 1 from project_configuration_revisions where project_id = $1), 1),
+           $3, $4, $5, $6, null, $7, $8, clock_timestamp(), clock_timestamp()
+         ) returning *`,
+    [
+      trigger.runtime_project_id,
+      input.organizationId,
+      input.sourceKind,
+      { kind: "organization_trigger_adapter", triggerId: trigger.id },
+      input.yaml,
+      input.normalizedConfiguration,
+      input.contentHash,
+      input.createdByUserId,
+    ],
+  );
+  return requireReturnedRow(runtimeRevisionRows.rows[0], "saved runtime configuration revision");
+}
+
+async function replaceSavedRuntimeRoutes(
+  client: QueryHandle,
+  rows: SavedTriggerRows,
+  options: { configuration: CompiledTriggerConfig; runtimeRevisionId: string },
+): Promise<void> {
+  const { input, trigger, routes } = rows;
+  await client.query(`delete from project_trigger_routes where project_id = $1`, [
+    trigger.runtime_project_id,
+  ]);
+  for (const route of routes) {
+    const configuredTriggerName = runtimeTriggerName(
+      options.configuration,
+      route.configuredEventName,
+      input.name,
+    );
+    await client.query(
+      `insert into project_trigger_routes (
+             organization_id, project_id, configuration_revision_id, provider,
+             connection_id, resource_id, trigger_name
+           ) values ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        input.organizationId,
+        trigger.runtime_project_id,
+        options.runtimeRevisionId,
+        route.provider,
+        route.connectionId,
+        route.resourceId,
+        configuredTriggerName,
+      ],
+    );
+  }
+}
+
+async function activateSavedTrigger(
+  client: TransactionHandle,
+  rows: SavedTriggerRows,
+  runtimeRevisionId: string,
+): Promise<OrganizationTriggerRecord> {
+  const { input, trigger, revision } = rows;
+  await client.query(
+    `update projects set active_configuration_revision_id = $2, updated_at = clock_timestamp()
+         where id = $1`,
+    [trigger.runtime_project_id, runtimeRevisionId],
+  );
+  const activated = await client.query<OrganizationTriggerRow>(
+    `update organization_triggers
+         set active_revision_id = $2, updated_at = clock_timestamp()
+         where id = $1 returning *`,
+    [trigger.id, revision.id],
+  );
+  const recurrence = input.enabled ? input.recurrence : undefined;
+  await ScheduleRepository.synchronize(client, trigger.id, recurrence, new Date());
+  return toOrganizationTriggerRecord(
+    requireReturnedRow(activated.rows[0], "activated organization trigger"),
+  );
+}
+
+interface TriggerPageSql {
+  scoped: string;
+  name: string;
+  key: string;
+  boundary: string;
+}
+
+function organizationTriggerPageSql(conditions: string, paramCount: number): TriggerPageSql {
+  const name = `t.name collate "C"`;
+  return {
+    scoped: `from organization_triggers t
+      where t.organization_id = $1 and t.active_revision_id is not null ${conditions}`,
+    name,
+    key: `(${name}, t.id)`,
+    boundary: `($${paramCount + 1}::text collate "C", $${paramCount + 2}::uuid)`,
+  };
+}
+
+async function fetchOrganizationTriggerPageRows(
+  pool: QueryHandle,
+  options: { request: TriggerListRequest; sql: TriggerPageSql; params: unknown[] },
+): Promise<OrganizationTriggerRow[]> {
+  const { request, sql, params } = options;
+  const position = request.position;
+  const previous = position?.direction === "previous";
+  const order = previous ? "desc" : "asc";
+  const values = position === undefined ? params : [...params, position.key.name, position.key.id];
+  const { rows } = await query<OrganizationTriggerRow>(
+    pool,
+    `select t.* ${sql.scoped}
+       ${position === undefined ? "" : `and ${sql.key} ${previous ? "<" : ">"} ${sql.boundary}`}
+       order by ${sql.name} ${order}, t.id ${order} limit $${values.length + 1}`,
+    [...values, request.limit + 1],
+  );
+  return rows;
+}
+
+async function organizationTriggerAdjacent(
+  pool: QueryHandle,
+  options: {
+    sql: TriggerPageSql;
+    params: unknown[];
+    record: OrganizationTriggerRow | undefined;
+    operator: "<" | ">";
+  },
+): Promise<boolean> {
+  const { sql, params, record, operator } = options;
+  if (record === undefined) return false;
+  const direction = operator === "<" ? "desc" : "asc";
+  const adjacentRows = await query(
+    pool,
+    `select 1 ${sql.scoped} and ${sql.key} ${operator} ${sql.boundary}
+         order by ${sql.name} ${direction}, t.id ${direction} limit 1`,
+    [...params, record.name, record.id],
+  );
+  return adjacentRows.rows.length > 0;
+}
+
+function toOrganizationTriggerPage(
+  page: OrganizationTriggerRow[],
+  links: { hasPrevious: boolean; hasNext: boolean },
+): TriggerListPage {
+  const first = page[0];
+  const last = page.at(-1);
+  return {
+    records: page.map(toOrganizationTriggerRecord),
+    previous: links.hasPrevious && first !== undefined ? { id: first.id, name: first.name } : null,
+    next: links.hasNext && last !== undefined ? { id: last.id, name: last.name } : null,
+  };
+}
 function organizationTriggerPageFilters(request: TriggerListRequest, params: unknown[]): string {
   const filters: string[] = [];
   if (request.enabled !== undefined)
@@ -5800,24 +5927,38 @@ function activityRunFilterSql(request: ActivityRunPageRequest, params: unknown[]
   return filters.join("\n       ");
 }
 
+function insertRejectedTriggerRun(client: QueryHandle, input: CreateRejectedTriggerRunInput) {
+  const createdAt = input.createdAt ?? new Date();
+  return client.query<TriggerRunRow>(
+    `insert into trigger_runs
+           (id, organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
+           configured_trigger_name, outcome, status,
+            prompt, inputs, values, trigger_context, output_context, deadline_at, rejection, created_at, completed_at)
+         values (coalesce($1, gen_random_uuid()), $2, $3, $4, $5, $6, 'rejected', 'rejected',
+                 $7, $8, '{}'::jsonb, $9, $10, null, $12, $11, $11)
+         on conflict (provider_event_receipt_id, project_id, configured_trigger_name) do nothing
+         returning *`,
+    [
+      input.id ?? null,
+      input.organizationId,
+      input.projectId,
+      input.configurationRevisionId,
+      input.providerEventReceiptId,
+      input.configuredTriggerName,
+      input.prompt,
+      input.inputs,
+      input.triggerContext,
+      input.outputContext,
+      createdAt,
+      input.rejection,
+    ],
+  );
+}
+
 export function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
   const expired = row.payload_expiry_state != null;
   const evidence = toRunEvidence(row, expired);
-  if (row.outcome === "rejected") {
-    if (row.status !== "rejected" || row.rejection === null || row.rejection === undefined) {
-      throw new Error(`invalid rejected trigger run ${row.id}`);
-    }
-    const rejected: RejectedTriggerRunRecord = {
-      ...evidence,
-      outcome: "rejected",
-      status: "rejected",
-      rejection: expired
-        ? reduceRejection(parseInvocationRejection(row.rejection))
-        : parseInvocationRejection(row.rejection),
-      completedAt: row.completed_at ?? row.created_at,
-    };
-    return rejected;
-  }
+  if (row.outcome === "rejected") return toRejectedTriggerRunRecord(row, evidence, expired);
   if (row.outcome !== "accepted" || row.status === "rejected" || row.rejection !== null) {
     throw new Error(`invalid accepted trigger run ${row.id}`);
   }
@@ -5837,6 +5978,25 @@ export function toTriggerRunRecord(row: TriggerRunRow): TriggerRunRecord {
     completedAt: row.completed_at,
   };
   return accepted;
+}
+
+function toRejectedTriggerRunRecord(
+  row: TriggerRunRow,
+  evidence: ReturnType<typeof toRunEvidence>,
+  expired: boolean,
+): RejectedTriggerRunRecord {
+  if (row.status !== "rejected" || row.rejection === null || row.rejection === undefined) {
+    throw new Error(`invalid rejected trigger run ${row.id}`);
+  }
+  return {
+    ...evidence,
+    outcome: "rejected",
+    status: "rejected",
+    rejection: expired
+      ? reduceRejection(parseInvocationRejection(row.rejection))
+      : parseInvocationRejection(row.rejection),
+    completedAt: row.completed_at ?? row.created_at,
+  };
 }
 
 function toRunEvidence(row: TriggerRunRow, expired: boolean) {
@@ -5912,7 +6072,7 @@ export interface AgentExecutionRow extends QueryRow {
   payload_completion?: PayloadCompletion | null;
   payload_hidden?: boolean;
   agent_session_id: string | null;
-  agent_session_action: import("../agent-sessions/index.js").AgentSessionAction | null;
+  agent_session_action: AgentSessionAction | null;
   id: string;
   organization_id: string;
   project_id: string;
@@ -6024,6 +6184,16 @@ interface CliAuthorizationRow extends QueryRow {
   expires_at: Date;
   database_now: Date;
 }
+
+// Approval sets the organization, and disclosure requires it for the credential insert.
+type ApprovedCliAuthorizationRow = CliAuthorizationRow & {
+  status: "approved";
+  approved_organization_id: string;
+};
+
+type CliAuthorizationPollRow =
+  | ApprovedCliAuthorizationRow
+  | (CliAuthorizationRow & { status: Exclude<CliAuthorizationRow["status"], "approved"> });
 
 function toDaemon(row: DaemonRow): DaemonRecord {
   return {
@@ -6488,6 +6658,358 @@ function deadlineConditionAllows(
   );
 }
 
+async function findWorkflowStepForExecution(
+  client: QueryHandle,
+  input: WorkflowStepExecutionInput,
+) {
+  const stepRows = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs where trigger_run_id = $1 and step_id = $2 and ordinal = $3`,
+    [input.triggerRunId, input.stepId, input.ordinal],
+  );
+  const step = stepRows.rows[0];
+  if (step === undefined) throw new Error("workflow step run not found");
+  return step;
+}
+
+async function startWorkflowStepExecutionOnClient(
+  client: TransactionHandle,
+  input: WorkflowStepExecutionInput,
+  runDeadlineAt: Date,
+) {
+  const deadlineAt = new Date(
+    Math.min(input.execution.deadlineAt.getTime(), runDeadlineAt.getTime()),
+  );
+  const idleDeadlineAt = new Date(
+    Math.min(
+      input.execution.idleDeadlineAt.getTime(),
+      deadlineAt.getTime(),
+      runDeadlineAt.getTime(),
+    ),
+  );
+  const selected = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs where trigger_run_id = $1 and step_id = $2 and ordinal = $3 for update`,
+    [input.triggerRunId, input.stepId, input.ordinal],
+  );
+  const step = selected.rows[0];
+  if (step === undefined) throw new Error("workflow step run not found");
+  if (step.agent_execution_id !== null) {
+    const existing = await client.query<AgentExecutionRow>(
+      `select * from agent_executions where id = $1`,
+      [step.agent_execution_id],
+    );
+    return {
+      stepRun: toWorkflowStepRunRecord(step),
+      execution:
+        existing.rows[0] === undefined ? undefined : toAgentExecutionRecord(existing.rows[0]),
+      created: false,
+    };
+  }
+  const execution = await insertAgentExecutionOnClient(client, {
+    ...input.execution,
+    id: input.executionId,
+    deadlineAt,
+    idleDeadlineAt,
+    workflowStepRunId: step.id,
+  });
+  // Roll back execution creation if its meter reservation is denied.
+  const reservationDenied = await reserveWorkflowStepExecutionUsage(client, input);
+  if (reservationDenied !== undefined) {
+    return client.rollback({
+      stepRun: toWorkflowStepRunRecord(step),
+      execution: undefined,
+      created: false,
+      reservationDenied,
+    });
+  }
+  const updatedStep = await markWorkflowStepExecutionStarted(client, step, execution, input);
+  return {
+    stepRun: toWorkflowStepRunRecord(updatedStep),
+    execution: toAgentExecutionRecord(execution),
+    created: true,
+  };
+}
+
+async function markWorkflowStepExecutionStarted(
+  client: QueryHandle,
+  step: WorkflowStepRunRow,
+  execution: AgentExecutionRow,
+  input: WorkflowStepExecutionInput,
+) {
+  const updated = await client.query<WorkflowStepRunRow>(
+    `update workflow_step_runs
+         set status = 'running', agent_execution_id = $2, started_at = coalesce(started_at, $3),
+             deadline_at = $4, idle_deadline_at = $5, dispatch_intent = coalesce($6, dispatch_intent)
+         where id = $1 and agent_execution_id is null
+         returning *`,
+    [
+      step.id,
+      execution.id,
+      execution.started_at,
+      execution.deadline_at,
+      execution.idle_deadline_at,
+      input.execution.launchIntent ?? null,
+    ],
+  );
+  return updated.rows[0] ?? step;
+}
+
+async function reserveWorkflowStepExecutionUsage(
+  client: QueryHandle,
+  input: WorkflowStepExecutionInput,
+) {
+  const reservation = input.reservation;
+  if (reservation === undefined) return undefined;
+  const reserved = await reserveOrganizationUsageOnClient(client, {
+    organizationId: input.execution.organizationId,
+    meter: reservation.meter,
+    periodStart: reservation.periodStart,
+    amount: 1,
+    limit: reservation.limit,
+  });
+  if (reserved !== undefined) return undefined;
+  if (reservation.limit === null) {
+    throw new Error("unreachable: an unlimited meter reservation cannot be denied");
+  }
+  const usage = await client.query<OrganizationUsageRow>(
+    `select used from organization_usage
+             where organization_id = $1 and meter = $2 and period_start = $3`,
+    [input.execution.organizationId, reservation.meter, reservation.periodStart],
+  );
+  return {
+    meter: reservation.meter,
+    limit: reservation.limit,
+    current: Number(usage.rows[0]?.used ?? 0),
+  };
+}
+
+async function lockLinkableWorkflowExecution(client: QueryHandle, executionId: string) {
+  const execution = await client.query<AgentExecutionRow>(
+    `select * from agent_executions where id = $1 for update`,
+    [executionId],
+  );
+  const executionRow = execution.rows[0];
+  if (executionRow === undefined) throw new Error(`agent execution not found: ${executionId}`);
+  if (executionRow.launch_intent_expired_at != null)
+    throw new Error("agent execution launch intent expired");
+  return executionRow;
+}
+
+async function completeLinkedWorkflowExecution(
+  client: QueryHandle,
+  input: WorkflowAgentCompletionInput,
+  stepRunId: string,
+) {
+  const { run, step, execution } = await lockWorkflowCompletionRows(
+    client,
+    input.executionId,
+    stepRunId,
+  );
+  if (run.payload_expiry_state != null || run.status === "canceled") {
+    return {
+      execution: toAgentExecutionRecord({
+        ...execution,
+        payload_hidden: run.payload_expiry_state != null,
+      }),
+      transitioned: false,
+    };
+  }
+  const observedAt = input.observedAt ?? new Date();
+  const timeout = await completeOverdueWorkflowExecution(
+    { client, execution, step, run, observedAt },
+    input.executionId,
+  );
+  if (timeout !== undefined) return timeout;
+
+  const liveTransition = await transitionWorkflowAgentExecution(client, execution, input);
+  if (liveTransition === undefined) {
+    return { execution: toAgentExecutionRecord(execution), transitioned: false };
+  }
+
+  await finishWorkflowStepAndRun(client, step, run, input);
+  const terminalRun = await findTriggerRunOnClient(client, run.id);
+
+  return transitionWithTerminalRun(
+    {
+      execution: toAgentExecutionRecord(liveTransition.execution),
+      transitioned: liveTransition.transitioned,
+      ...(input.deadlineKind === undefined ? {} : { deadlineKind: input.deadlineKind }),
+    },
+    terminalRun,
+  );
+}
+
+async function lockWorkflowCompletionRows(
+  client: QueryHandle,
+  executionId: string,
+  stepRunId: string,
+) {
+  const stepLookup = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs where id = $1`,
+    [stepRunId],
+  );
+  const stepCandidate = stepLookup.rows[0];
+  if (stepCandidate === undefined) throw new Error("workflow step run not found");
+  const runRows = await client.query<TriggerRunRow>(
+    `select * from trigger_runs where id = $1 for update`,
+    [stepCandidate.trigger_run_id],
+  );
+  const run = runRows.rows[0];
+  if (run === undefined) throw new Error("workflow trigger run not found");
+  const stepRows = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs where id = $1 for update`,
+    [stepRunId],
+  );
+  const step = stepRows.rows[0];
+  if (step === undefined) throw new Error("workflow step run not found");
+
+  const executionRows = await client.query<AgentExecutionRow>(
+    `select * from agent_executions where id = $1 for update`,
+    [executionId],
+  );
+  const execution = executionRows.rows[0];
+  if (execution === undefined) throw new Error(`agent execution not found: ${executionId}`);
+  return { run, step, execution };
+}
+
+interface WorkflowStepDeadlineContext {
+  client: QueryHandle;
+  execution: AgentExecutionRow;
+  step: WorkflowStepRunRow;
+  run: TriggerRunRow;
+  observedAt: Date;
+}
+
+async function completeOverdueWorkflowExecution(
+  context: WorkflowStepDeadlineContext,
+  executionId: string,
+) {
+  const { client, execution, step, run, observedAt } = context;
+  const deadlineKind =
+    execution.status === "spawning" || execution.status === "running"
+      ? workflowDeadlineKind(execution, step, run, observedAt)
+      : undefined;
+  if (deadlineKind === undefined) return undefined;
+  if (deadlineKind === "whole_run") {
+    const recovery = await timeoutWorkflowRunOnClient(client, run, observedAt);
+    const terminalRun = await findTriggerRunOnClient(client, run.id);
+    const updatedExecution = await findAgentExecutionOnClient(client, executionId);
+    return transitionWithTerminalRun(
+      {
+        execution: updatedExecution ?? toAgentExecutionRecord(execution),
+        transitioned: recovery.executionIds.includes(executionId),
+        deadlineKind,
+      },
+      terminalRun,
+    );
+  }
+  const updated = await timeoutWorkflowStepOnClient({ ...context, deadlineKind });
+  const terminalRun = await findTriggerRunOnClient(client, run.id);
+  return transitionWithTerminalRun(
+    {
+      execution: toAgentExecutionRecord(updated),
+      transitioned: true,
+      deadlineKind,
+    },
+    terminalRun,
+  );
+}
+
+function markWorkflowRunFailed(
+  client: QueryHandle,
+  options: {
+    triggerRunId: string;
+    status: "failed" | "timed_out";
+    failureReason: string;
+    completedAt: Date;
+  },
+) {
+  const { triggerRunId, status, failureReason, completedAt } = options;
+  return client.query<TriggerRunRow>(
+    `update trigger_runs
+         set status = $2, failure_reason = $3, completed_at = $4,
+             terminal_notification_pending_at = coalesce(terminal_notification_pending_at, $4),
+             terminal_notification_lease_expires_at = null
+         where id = $1 returning *`,
+    [triggerRunId, status, failureReason, completedAt],
+  );
+}
+
+async function recoverWorkflowStepDeadlines(
+  client: QueryHandle,
+  now: Date,
+  run: TriggerRunRow,
+  recoveries: WorkflowDeadlineRecovery[],
+) {
+  const steps = await client.query<WorkflowStepRunRow>(
+    `select * from workflow_step_runs
+           where trigger_run_id = $1 and status = 'running'
+           order by ordinal
+           for update`,
+    [run.id],
+  );
+  for (const step of steps.rows) {
+    const recovery = await recoverWorkflowStepDeadline(client, now, run, step);
+    if (recovery !== undefined) recoveries.push(recovery);
+  }
+}
+
+async function recoverWorkflowStepDeadline(
+  client: QueryHandle,
+  now: Date,
+  run: TriggerRunRow,
+  step: WorkflowStepRunRow,
+): Promise<WorkflowDeadlineRecovery | undefined> {
+  const execution =
+    step.agent_execution_id === null
+      ? undefined
+      : (
+          await client.query<AgentExecutionRow>(
+            `select * from agent_executions where id = $1 for update`,
+            [step.agent_execution_id],
+          )
+        ).rows[0];
+  const deadlineKind =
+    execution?.status === "succeeded" || execution?.status === "failed"
+      ? undefined
+      : workflowDeadlineKind(execution, step, run, now);
+  if (deadlineKind === undefined || deadlineKind === "whole_run") return undefined;
+  if (execution === undefined) {
+    await timeoutWorkflowStepWithoutExecution({ client, step, run, deadlineKind, observedAt: now });
+    return { triggerRunId: run.id, executionIds: [] };
+  }
+  const updated = await timeoutWorkflowStepOnClient({
+    client,
+    execution,
+    step,
+    run,
+    deadlineKind,
+    observedAt: now,
+  });
+  return { triggerRunId: run.id, executionIds: [updated.id] };
+}
+
+async function timeoutWorkflowStepWithoutExecution(
+  options: Omit<WorkflowStepDeadlineContext, "execution"> & {
+    deadlineKind: Exclude<WorkflowDeadlineKind, "whole_run">;
+  },
+) {
+  const { client, step, run, deadlineKind, observedAt: now } = options;
+  const reason = deadlineKind === "step_idle" ? "step_idle_timeout" : "step_hard_timeout";
+  await client.query(
+    `update workflow_step_runs
+               set status = 'timed_out', failure_reason = $2, deadline_kind = $3, completed_at = $4
+               where id = $1 and status = 'running'`,
+    [step.id, reason, deadlineKind, now],
+  );
+  await client.query(
+    `update trigger_runs
+               set status = 'failed', deadline_kind = $2, failure_reason = $3, completed_at = $4
+               where id = $1 and status = 'running'`,
+    [run.id, deadlineKind, reason, now],
+  );
+  await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [run.id]);
+}
+
 function workflowDeadlineKind(
   execution: AgentExecutionRow | undefined,
   step: WorkflowStepRunRow,
@@ -6499,24 +7021,28 @@ function workflowDeadlineKind(
   }
   const hardDeadline = execution?.deadline_at ?? step.deadline_at;
   const idleDeadline = execution?.idle_deadline_at ?? step.idle_deadline_at;
+  return workflowStepDeadlineKind(hardDeadline, idleDeadline, observedAt);
+}
+
+function workflowStepDeadlineKind(
+  hardDeadline: Date | null,
+  idleDeadline: Date | null,
+  observedAt: Date,
+): WorkflowDeadlineKind | undefined {
   if (hardDeadline !== null && hardDeadline <= observedAt) {
-    if (idleDeadline !== null && idleDeadline <= observedAt && idleDeadline < hardDeadline) {
-      return "step_idle";
-    }
-    return "step_hard";
+    return idleDeadline !== null && idleDeadline <= observedAt && idleDeadline < hardDeadline
+      ? "step_idle"
+      : "step_hard";
   }
-  if (idleDeadline !== null && idleDeadline <= observedAt) return "step_idle";
-  return undefined;
+  return idleDeadline !== null && idleDeadline <= observedAt ? "step_idle" : undefined;
 }
 
 async function timeoutWorkflowStepOnClient(
-  client: QueryHandle,
-  execution: AgentExecutionRow,
-  step: WorkflowStepRunRow,
-  run: TriggerRunRow,
-  deadlineKind: Exclude<WorkflowDeadlineKind, "whole_run">,
-  observedAt: Date,
+  options: WorkflowStepDeadlineContext & {
+    deadlineKind: Exclude<WorkflowDeadlineKind, "whole_run">;
+  },
 ): Promise<AgentExecutionRow> {
+  const { client, execution, step, run, deadlineKind, observedAt } = options;
   const reason = deadlineKind === "step_idle" ? "step_idle_timeout" : "step_hard_timeout";
   const updatedExecution = await client.query<AgentExecutionRow>(
     `update agent_executions
@@ -6654,20 +7180,7 @@ async function finishWorkflowStepAndRun(
   if (isTerminalWorkflowStepStatus(step.status)) return;
 
   const completedAt = input.observedAt ?? new Date();
-  await client.query(
-    `update workflow_step_runs
-     set status = $2, output = $3, failure_reason = $4,
-         deadline_kind = coalesce($6, deadline_kind), completed_at = $5
-     where id = $1`,
-    [
-      step.id,
-      input.stepStatus,
-      input.stepOutput !== undefined ? input.stepOutput : (input.result ?? null),
-      input.failureReason ?? null,
-      completedAt,
-      input.deadlineKind ?? null,
-    ],
-  );
+  await updateFinishedWorkflowStep(client, step.id, input, completedAt);
   if (input.stepStatus === "succeeded") {
     if (run.status === "running") await wakeWorkflowRun(client, step.trigger_run_id, completedAt);
     return;
@@ -6696,6 +7209,28 @@ async function finishWorkflowStepAndRun(
   await client.query(`delete from workflow_wakeups where trigger_run_id = $1`, [
     step.trigger_run_id,
   ]);
+}
+
+async function updateFinishedWorkflowStep(
+  client: QueryHandle,
+  stepRunId: string,
+  input: WorkflowAgentCompletionInput,
+  completedAt: Date,
+) {
+  await client.query(
+    `update workflow_step_runs
+     set status = $2, output = $3, failure_reason = $4,
+         deadline_kind = coalesce($6, deadline_kind), completed_at = $5
+     where id = $1`,
+    [
+      stepRunId,
+      input.stepStatus,
+      input.stepOutput !== undefined ? input.stepOutput : (input.result ?? null),
+      input.failureReason ?? null,
+      completedAt,
+      input.deadlineKind ?? null,
+    ],
+  );
 }
 
 async function findTriggerRunOnClient(
@@ -6756,20 +7291,38 @@ function toGitHubRepositoryRecord(row: GitHubRepositoryRow): GitHubRepositoryRec
   };
 }
 
-interface TenantRouteAccessRow extends QueryRow {
+interface TenantRouteAccessBaseRow extends QueryRow {
   organization_id: string;
   organization_name: string;
   organization_slug: string;
   membership_id: string;
   membership_role: "owner" | "admin" | "member";
-  project_id: string | null;
-  project_organization_id: string | null;
-  project_name: string | null;
-  project_slug: string | null;
-  project_status: "active" | "archived" | null;
+}
+
+interface TenantRouteAccessWithoutProject extends TenantRouteAccessBaseRow {
+  project_id: null;
+  project_organization_id: null;
+  project_name: null;
+  project_slug: null;
+  project_status: null;
+  project_created_by_user_id: null;
+  project_created_at: null;
+  project_updated_at: null;
+  project_archived_at: null;
+  project_active_configuration_revision_id: null;
+}
+
+interface TenantRouteAccessWithProject extends TenantRouteAccessBaseRow {
+  project_id: string;
+  project_organization_id: string;
+  project_name: string;
+  project_slug: string;
+  project_status: "active" | "archived";
   project_created_by_user_id: string | null;
-  project_created_at: Date | null;
-  project_updated_at: Date | null;
+  project_created_at: Date;
+  project_updated_at: Date;
   project_archived_at: Date | null;
   project_active_configuration_revision_id: string | null;
 }
+
+type TenantRouteAccessRow = TenantRouteAccessWithoutProject | TenantRouteAccessWithProject;

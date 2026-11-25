@@ -6,17 +6,13 @@ import type {
   PayloadCompletion,
   RunPayloadSummary,
   StepPayloadSummary,
+  PayloadAgentSummary,
 } from "../run-payload-retention/summary.js";
 import type { RunTimelineStore } from "../run-timeline/store.js";
 import type {
   AgentExecutionStatus,
   MachineSource,
   MachineStatus,
-  ReceiptPayloadExpiryState,
-  ReceiptPreRoutingDrop,
-  ManualReceiptReplayBinding,
-} from "./schema.js";
-export type {
   ReceiptPayloadExpiryState,
   ReceiptPreRoutingDrop,
   ManualReceiptReplayBinding,
@@ -37,6 +33,21 @@ import type {
   EntitlementTemplate,
   OverrideKey,
 } from "../entitlements/catalog.js";
+import type { AgentSessionAction, AgentSessionRecord } from "../agent-sessions/index.js";
+import type { Conversation } from "../triggers/continuation.js";
+import type { Recurrence } from "../triggers/schedule/recurrence.js";
+import type { ExecutionAuthorityStore } from "../execution-authority/index.js";
+import type { ScheduleStore } from "../triggers/schedule/index.js";
+import type { GitHubNotificationStore } from "../triggers/github-notifications/index.js";
+import type { RunStopDetails } from "../triggers/run-stop.js";
+import type { StopInterruptStore } from "./stop-interrupt.js";
+import type { RunReplyStore } from "../run-replies/store.js";
+
+export type {
+  ReceiptPayloadExpiryState,
+  ReceiptPreRoutingDrop,
+  ManualReceiptReplayBinding,
+} from "./schema.js";
 
 export type WorkflowDeadlineKind = "step_hard" | "step_idle" | "whole_run";
 
@@ -179,7 +190,7 @@ export interface MachineRecord {
 export interface AgentExecutionRecord {
   payloadCompletion?: PayloadCompletion | null;
   agentSessionId: string | null;
-  agentSessionAction: import("../agent-sessions/index.js").AgentSessionAction | null;
+  agentSessionAction: AgentSessionAction | null;
   id: string;
   organizationId: string;
   projectId: string;
@@ -204,7 +215,7 @@ export interface AgentExecutionRecord {
   usedTemporaryCredentials?: boolean | null;
   launchIntentExpiredAt?: Date | null;
   launchRunId?: string | null;
-  launchAgent?: import("../run-payload-retention/summary.js").PayloadAgentSummary | null;
+  launchAgent?: PayloadAgentSummary | null;
   daemonId: string | null;
   daemonAgentId: string | null;
   workflowStepRunId: string | null;
@@ -841,7 +852,7 @@ interface TriggerRunEvidence {
   payloadExpiredAt?: Date | null;
   payloadSummary?: RunPayloadSummary | null;
   payloadExpiryState?: "expiring" | "expired" | null;
-  conversation: import("../triggers/continuation.js").Conversation | null;
+  conversation: Conversation | null;
   id: string;
   organizationId: string;
   projectId: string;
@@ -970,7 +981,7 @@ export interface WorkflowWakeupRecord {
 
 export interface CreateAcceptedTriggerRunInput {
   replyMessage?: true;
-  conversation?: import("../triggers/continuation.js").Conversation | null;
+  conversation?: Conversation | null;
   id?: string;
   organizationId: string;
   projectId: string;
@@ -1309,7 +1320,7 @@ export interface MigrateProjectTriggersInput {
 }
 
 export interface SaveOrganizationTriggerInput {
-  recurrence?: import("../triggers/schedule/recurrence.js").Recurrence;
+  recurrence?: Recurrence;
   organizationId: string;
   triggerId?: string;
   name: string;
@@ -1388,21 +1399,16 @@ export interface TerminateMachineFields {
 
 export interface Database
   extends RunTimelineStore, RunPayloadRetentionStore, InteractiveSessionStore, SurfaceStore {
-  readonly executionAuthority: import("../execution-authority/index.js").ExecutionAuthorityStore;
-  readonly schedules: import("../triggers/schedule/index.js").ScheduleStore;
-  readonly githubNotifications: import("../triggers/github-notifications/index.js").GitHubNotificationStore;
-  findAgentSessionByKey(
-    projectId: string,
-    key: string,
-  ): Promise<import("../agent-sessions/index.js").AgentSessionRecord | undefined>;
-  findAgentSession(
-    id: string,
-  ): Promise<import("../agent-sessions/index.js").AgentSessionRecord | undefined>;
-  saveAgentSession(session: import("../agent-sessions/index.js").AgentSessionRecord): Promise<void>;
+  readonly executionAuthority: ExecutionAuthorityStore;
+  readonly schedules: ScheduleStore;
+  readonly githubNotifications: GitHubNotificationStore;
+  findAgentSessionByKey(projectId: string, key: string): Promise<AgentSessionRecord | undefined>;
+  findAgentSession(id: string): Promise<AgentSessionRecord | undefined>;
+  saveAgentSession(session: AgentSessionRecord): Promise<void>;
   attachExecutionToSession(
     executionId: string,
     sessionId: string,
-    action?: import("../agent-sessions/index.js").AgentSessionAction,
+    action?: AgentSessionAction,
   ): Promise<void>;
   listAgentSessionExecutions(sessionId: string): Promise<AgentExecutionRecord[]>;
 
@@ -1533,7 +1539,7 @@ export interface Database
   readRunStopDetails(
     organizationId: string,
     triggerRunId: string,
-  ): Promise<import("../triggers/run-stop.js").RunStopDetails | undefined>;
+  ): Promise<RunStopDetails | undefined>;
   cancelTriggerRun(
     organizationId: string,
     triggerRunId: string,
@@ -1543,8 +1549,8 @@ export interface Database
   ): Promise<
     (TransitionTriggerRunResult & { executionIds: string[]; conflict?: number }) | undefined
   >;
-  readonly stopInterrupts: import("./stop-interrupt.js").StopInterruptStore;
-  readonly runReplies: import("../run-replies/store.js").RunReplyStore;
+  readonly stopInterrupts: StopInterruptStore;
+  readonly runReplies: RunReplyStore;
   succeedTriggerRun(triggerRunId: string): Promise<TransitionTriggerRunResult | undefined>;
   failWorkflowRun(
     triggerRunId: string,
@@ -1562,6 +1568,12 @@ export interface Database
     triggerRunId: string,
     generation: number,
     now: Date,
+  ): Promise<boolean>;
+  renewWorkflowRunTerminalNotification(
+    triggerRunId: string,
+    generation: number,
+    now: Date,
+    leaseMs: number,
   ): Promise<boolean>;
   markWorkflowRunTerminalNotificationDelivered(
     triggerRunId: string,

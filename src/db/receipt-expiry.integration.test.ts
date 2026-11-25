@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, it } from "vitest";
+import { afterAll, beforeAll, describe, it, vi } from "vitest";
 import { createAttachmentCapabilityRegistry } from "../attachments/capabilities.js";
 import { activityRunDetailView } from "../projects/activity-run-view.js";
 import { ReceiptRetention } from "../receipt-retention/index.js";
@@ -18,6 +18,7 @@ import type {
   Database,
   DurableProviderEvent,
   ReceiptPayloadExpiryState,
+  WorkflowStepExecutionInput,
 } from "./types.js";
 
 const deadlineAt = new Date("2099-01-01T00:00:00Z");
@@ -428,6 +429,95 @@ describe.each(["expiring", "expired"] as const)("memory receipt replay in %s", (
     assert.equal((await database.findProviderEventReceiptById(receipt.id))?.droppedReason, null);
   });
 });
+
+async function memoryStepExecutionFixture() {
+  const database = createMemoryDatabase({ organizationIds: [organizationId] });
+  const { run } = await intake(database);
+  const accepted = await database.createAcceptedTriggerRun(run);
+  const [step] = await database.listWorkflowStepRunsForTriggerRun(accepted.run.id);
+  assert.ok(step);
+  const steps: unknown = Object.getOwnPropertyDescriptor(database, "workflowStepRuns")?.value;
+  assert.ok(steps instanceof Map);
+  const input: WorkflowStepExecutionInput = {
+    triggerRunId: accepted.run.id,
+    stepId: step.stepId,
+    ordinal: step.ordinal,
+    executionId: randomUUID(),
+    execution: {
+      organizationId,
+      projectId: run.projectId,
+      machineId: null,
+      configurationRevisionId: run.configurationRevisionId,
+      workflowStepRunId: step.id,
+      triggerContext: {},
+      outputContext: {},
+      deadlineAt,
+      idleDeadlineAt: deadlineAt,
+      startedAt: new Date(),
+    },
+  };
+  return { database, step, steps, input };
+}
+
+it("keeps the original memory-store step when usage reservation cancels the run and removes the step", async () => {
+  const { database, step, steps, input } = await memoryStepExecutionFixture();
+  const consume = database.consumeOrganizationUsage.bind(database);
+  const hook = vi.spyOn(database, "consumeOrganizationUsage").mockImplementation(async (usage) => {
+    const reserved = await consume(usage);
+    await database.cancelTriggerRun(organizationId, input.triggerRunId);
+    assert.equal(steps.delete(step.id), true);
+    return reserved;
+  });
+  try {
+    const result = await database.createWorkflowStepExecution({
+      ...input,
+      reservation: { meter: "executions.monthly", periodStart: new Date("2026-01-01"), limit: 1 },
+    });
+    assert.deepEqual(result, { stepRun: step, execution: undefined, created: false });
+  } finally {
+    hook.mockRestore();
+  }
+});
+
+it.each(["canceled", "running"] as const)(
+  "handles a memory-store step removed after execution insertion while the run is %s",
+  async (status) => {
+    const { database, step, steps, input } = await memoryStepExecutionFixture();
+    const insert = database.insertAgentExecution.bind(database);
+    const hook = vi
+      .spyOn(database, "insertAgentExecution")
+      .mockImplementation(async (execution) => {
+        const inserted = await insert(execution);
+        if (status === "canceled")
+          await database.cancelTriggerRun(organizationId, input.triggerRunId);
+        assert.equal(steps.delete(step.id), true);
+        return inserted;
+      });
+    try {
+      const result = await database.createWorkflowStepExecution(input);
+      if (status === "canceled") {
+        assert.deepEqual(result, { stepRun: step, execution: undefined, created: false });
+        return;
+      }
+      assert.equal(result.created, true);
+      assert.equal(result.execution?.id, input.executionId);
+      assert.deepEqual(result.stepRun, {
+        ...step,
+        status: "running",
+        agentExecutionId: input.executionId,
+        deadlineAt: input.execution.deadlineAt,
+        idleDeadlineAt: input.execution.idleDeadlineAt,
+        startedAt: input.execution.startedAt,
+      });
+      assert.deepEqual(
+        await database.findWorkflowStepRunByTriggerRun(input.triggerRunId),
+        result.stepRun,
+      );
+    } finally {
+      hook.mockRestore();
+    }
+  },
+);
 
 it("drops an engine callback that already loaded its event before the receipt was marked", async () => {
   const database = createMemoryDatabase({ organizationIds: [organizationId] });

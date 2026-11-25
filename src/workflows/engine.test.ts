@@ -42,6 +42,12 @@ import { once } from "node:events";
 import { createWebhookSource } from "../triggers/github/webhook.js";
 import { createFetchServer } from "../http/node-server.js";
 import { createServerShutdown } from "../server-shutdown.js";
+import { createDaemonDispatchLifecycle } from "../daemons/lifecycle.js";
+import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
+import {
+  GITHUB_BILLING_DENIAL,
+  githubBillingTriggerContext,
+} from "../test-utils/github-billing-notice.js";
 
 describe("durable multi-step workflow engine", () => {
   it.each([
@@ -325,6 +331,42 @@ run:
     assert.equal(steps[0]?.failureReason, "trigger_context_materializer_unavailable");
   });
 
+  it("defers a step while its daemon cannot take a dispatch and runs it once the daemon is back", async () => {
+    const fixture = await workflowFixture();
+    const dispatches: string[] = [];
+    const checkedDaemons: string[] = [];
+    let connected = false;
+    const { handler, engine } = engineFor(fixture, dispatches, {
+      canDispatchToDaemon: (daemonId) => {
+        checkedDaemons.push(daemonId);
+        return connected;
+      },
+    });
+
+    await handler(fixture.trigger("run"));
+    await engine.processAvailable();
+    await engine.processAvailable();
+
+    const run = (
+      await fixture.database.findTriggerRunsByProviderEventReceiptId(fixture.providerEventReceiptId)
+    )[0]!;
+    const deferredStep = (await fixture.database.listWorkflowStepRunsForTriggerRun(run.id))[0]!;
+    assert.deepEqual(dispatches, []);
+    assert.ok(checkedDaemons.length >= 2);
+    assert.equal(
+      await fixture.database.findAgentExecutionByWorkflowStepRunId(deferredStep.id),
+      undefined,
+    );
+    assert.equal((await fixture.database.findTriggerRunById(run.id))?.status, "running");
+
+    connected = true;
+    await engine.processAvailable();
+
+    assert.equal(dispatches.length, 1);
+    assert.ok(await fixture.database.findAgentExecutionByWorkflowStepRunId(deferredStep.id));
+    await engine.stop();
+  });
+
   it("carries provider options and startup timeout into persisted and dispatched launch intent", async () => {
     const rawConfiguration = deadlineConfiguration();
     const options = {
@@ -477,6 +519,8 @@ run:
         appId: "123",
         privateKey: privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
         now: () => now.getTime(),
+        // Retry backoff and the one second write spacing are real-time waits this test does not exercise.
+        octokitPlugins: { retry: false, throttle: false },
         fetch: async (input, init) => {
           const path = new URL(input instanceof Request ? input.url : input).pathname;
           const method = init?.method ?? "GET";
@@ -595,6 +639,65 @@ run:
     },
     60_000,
   );
+
+  it("does not repost a GitHub billing notice after recording delivery fails", async () => {
+    let now = new Date("2026-08-06T12:00:00.000Z");
+    const database = createMemoryDatabase({ now: () => now });
+    const notices: string[] = [];
+    const findIssueCommentByMarker = vi.fn(async ({ marker }: { marker: string }) => {
+      for (const body of notices) if (body.includes(marker)) return 1;
+      return undefined;
+    });
+    const provider = createGitHubTriggerProvider({
+      configurationStoreForProject: () => {
+        throw new Error("not used");
+      },
+      reactions: { createReaction: async () => null, deleteReaction: async () => {} },
+      billingUrlForOrganization: async () => "https://hub.test/settings/billing",
+      comments: {
+        findIssueCommentByMarker,
+        createIssueComment: async ({ body }) => ({ id: notices.push(body) }),
+      },
+    });
+    const run = await seedGitHubBillingFailure(database, now);
+    const markDelivered = vi
+      .spyOn(database, "markWorkflowRunTerminalNotificationDelivered")
+      .mockRejectedValueOnce(new Error("database unavailable"));
+    const lifecycle = createDaemonDispatchLifecycle({
+      database,
+      connectionForDaemon: () => undefined,
+      providers: [provider],
+    });
+    const { engine } = createDurableWorkflowHandler({
+      database,
+      entitlements: createUnlimitedEntitlementsService(),
+      providers: [],
+      now: () => now,
+      logger: createLogger(new FailureLogStream()),
+      onWorkflowRunTerminal: (terminalRun) => lifecycle.notifyWorkflowRunTerminal(terminalRun),
+    });
+    try {
+      await engine.processAvailable();
+      await vi.waitFor(() => assert.equal(markDelivered.mock.calls.length, 1));
+      assert.equal(notices.length, 1);
+      const pending = await database.findTriggerRunById(run.id);
+      assert.ok(pending?.outcome === "accepted");
+      assert.equal(pending.terminalNotificationDeliveredAt, null);
+
+      now = new Date(now.getTime() + 30_001);
+      await engine.processAvailable();
+      await vi.waitFor(async () => {
+        const delivered = await database.findTriggerRunById(run.id);
+        assert.ok(delivered?.outcome === "accepted");
+        assert.deepEqual(delivered.terminalNotificationDeliveredAt, now);
+      });
+      assert.equal(findIssueCommentByMarker.mock.calls.length, 2);
+      assert.equal(notices.length, 1);
+    } finally {
+      await engine.stop();
+      await lifecycle.stop();
+    }
+  });
 
   it("retries a failed workflow terminal outbox delivery", async () => {
     const fixture = await workflowFixture({ rawConfiguration: deadlineConfiguration() });
@@ -1946,6 +2049,25 @@ interface Fixture {
   trigger(message: string): DurableProviderEvent;
 }
 
+async function seedGitHubBillingFailure(database: Database, now: Date) {
+  const context = githubBillingTriggerContext();
+  const { run } = await database.createAcceptedTriggerRun({
+    organizationId: context.organizationId,
+    projectId: "billing-project",
+    configurationRevisionId: "billing-revision",
+    providerEventReceiptId: "billing-receipt",
+    configuredTriggerName: "billing",
+    prompt: "raw",
+    inputs: {},
+    triggerContext: context,
+    outputContext: context,
+    deadlineAt: new Date(now.getTime() + 60_000),
+    stepIds: ["step"],
+  });
+  await database.failWorkflowRun(run.id, "failed", GITHUB_BILLING_DENIAL);
+  return run;
+}
+
 async function workflowFixture(
   options: {
     unavailableValue?: boolean;
@@ -2108,14 +2230,16 @@ function engineFor(
     beforeDispatch?: (intent: LaunchMachineIntent) => Promise<void>;
     now?: () => Date;
     onWorkflowRunTerminal?: (run: TriggerRunRecord) => Promise<void>;
+    canDispatchToDaemon?: (daemonId: string) => boolean;
   } = {},
 ) {
-  const { beforeDispatch, now, onWorkflowRunTerminal } = options;
+  const { beforeDispatch, now, onWorkflowRunTerminal, canDispatchToDaemon } = options;
   return createDurableWorkflowHandler({
     database: fixture.database,
     entitlements: fixture.entitlements,
     providers: [providerMatch(fixture.configuration, fixture.revisionId)],
     ...(now === undefined ? {} : { now }),
+    ...(canDispatchToDaemon === undefined ? {} : { canDispatchToDaemon }),
     ...(onWorkflowRunTerminal === undefined ? {} : { onWorkflowRunTerminal }),
     dispatchLaunchMachineIntent: async (intent) => {
       await beforeDispatch?.(intent);

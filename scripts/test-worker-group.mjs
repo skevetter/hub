@@ -5,12 +5,16 @@ import {
   fstatSync,
   linkSync,
   lstatSync,
+  mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 export const testSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
@@ -86,7 +90,19 @@ export async function stopGroup(pid, signal, graceMs = gracePeriod) {
   return true;
 }
 
-function snapshot(path) {
+function validOwner(owner, minPid) {
+  return (
+    Number.isSafeInteger(owner?.pid) &&
+    owner.pid >= minPid &&
+    Array.isArray(owner.groups) &&
+    owner.groups.every(
+      (group) =>
+        Number.isSafeInteger(group?.pid) && group.pid > 1 && typeof group.startTime === "string",
+    )
+  );
+}
+
+function snapshot(path, minPid = 2) {
   let fd;
   try {
     if (!lstatSync(path).isFile()) return { owner: null };
@@ -94,20 +110,7 @@ function snapshot(path) {
     const { dev, ino } = fstatSync(fd);
     const raw = readFileSync(fd, "utf8").trim();
     const owner = /^\d+$/u.test(raw) ? { pid: Number(raw), groups: [] } : JSON.parse(raw);
-    if (
-      !Number.isSafeInteger(owner?.pid) ||
-      owner.pid <= 1 ||
-      !Array.isArray(owner.groups) ||
-      owner.groups.some(
-        (group) =>
-          !Number.isSafeInteger(group?.pid) ||
-          group.pid <= 1 ||
-          typeof group.startTime !== "string",
-      )
-    ) {
-      return { owner: null };
-    }
-    return { dev, ino, owner };
+    return validOwner(owner, minPid) ? { dev, ino, raw, owner } : { owner: null };
   } catch (error) {
     if (error.code === "ENOENT") return null;
     if (error instanceof SyntaxError) return { owner: null };
@@ -144,19 +147,34 @@ async function retireGroup(group) {
   }
 }
 
-// A lock is free when its owner has exited and none of its recorded groups still run.
+function fullSuiteSnapshot(path) {
+  const entry = lstatSync(path, { throwIfNoEntry: false });
+  if (!entry) return null;
+  if (!entry.isDirectory()) return { nonDirectory: true };
+  return snapshot(join(path, "pid"), 1) ?? { owner: null };
+}
+
 export function fullSuiteLockHeld(path = fullSuiteLockPath) {
-  const current = snapshot(path);
+  const current = fullSuiteSnapshot(path);
   if (!current) return false;
   if (!current.owner || !stale(current.owner)) return true;
   return current.owner.groups.some((group) => groupAlive(group.pid));
 }
 
-export function takeFullSuiteLock(path = fullSuiteLockPath, print = console.log) {
-  return takeTestLock(path, "full-suite", print);
+function fullSuiteBusy(path, current) {
+  const message = `The full-suite lock is held at ${path}.`;
+  if (current.nonDirectory) {
+    return new Error(
+      `${message} It is not a directory. Check its owner before removing it by hand.`,
+    );
+  }
+  const detail = current.owner
+    ? `Owner PID ${current.owner.pid}.`
+    : "There is no pid file with a valid owner.";
+  return new Error(`${message} ${detail}`);
 }
 
-export async function takeTestLock(path, label, print = console.log) {
+function createOwner() {
   const owner = {
     pid: process.pid,
     startTime: startTime(process.pid),
@@ -164,6 +182,88 @@ export async function takeTestLock(path, label, print = console.log) {
     groups: [],
   };
   if (!owner.startTime) throw new Error("Could not determine the test runner's start time.");
+  return owner;
+}
+
+function makeLockDirectory(path) {
+  try {
+    mkdirSync(path);
+    return true;
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    return false;
+  }
+}
+
+// A freed inode number is often handed straight to the next file on Linux, and an owner written
+// by hand has no token, so the file content is part of the identity too.
+function sameOwner(current, observed) {
+  return (
+    observed?.owner &&
+    observed.dev === current.dev &&
+    observed.ino === current.ino &&
+    observed.raw === current.raw &&
+    observed.owner.pid === current.owner.pid &&
+    observed.owner.token === current.owner.token
+  );
+}
+
+function canReclaim(path, current) {
+  const observed = fullSuiteSnapshot(path);
+  if (!observed) return false;
+  if (!sameOwner(current, observed)) throw fullSuiteBusy(path, observed);
+  return true;
+}
+
+function removeLockDirectory(path) {
+  for (const name of readdirSync(path)) {
+    if (/^pid\.[a-f0-9-]{36}\.tmp$/u.test(name)) unlinkSync(join(path, name));
+  }
+  unlinkSync(join(path, "pid"));
+  rmdirSync(path);
+}
+
+async function reclaimFullSuiteLock(path, current, print) {
+  // Keep the claim outside the directory so it survives removal of the stale pid file.
+  const claim = await takeTestLock(
+    `${path}.reclaim-${current.dev}-${current.ino}`,
+    "full-suite",
+    print,
+  );
+  try {
+    if (!canReclaim(path, current)) return;
+    await Promise.all(current.owner.groups.map(retireGroup));
+    if (current.owner.groups.some((group) => groupAlive(group.pid))) {
+      throw fullSuiteBusy(path, current);
+    }
+    if (!canReclaim(path, current)) return;
+    print(`Reclaiming stale full-suite lock at ${path} from PID ${current.owner.pid}.`);
+    if (canReclaim(path, current)) removeLockDirectory(path);
+  } finally {
+    claim.release();
+  }
+}
+
+export async function takeFullSuiteLock(path = fullSuiteLockPath, print = console.log) {
+  const owner = createOwner();
+  while (!makeLockDirectory(path)) {
+    const current = fullSuiteSnapshot(path);
+    if (!current) continue;
+    if (!current.owner || !stale(current.owner)) throw fullSuiteBusy(path, current);
+    await reclaimFullSuiteLock(path, current, print);
+  }
+  const pidPath = join(path, "pid");
+  try {
+    publish(pidPath, owner, true);
+  } catch (error) {
+    rmdirSync(path);
+    throw error;
+  }
+  return lockHandle(pidPath, owner, "full-suite", () => removeLockDirectory(path));
+}
+
+export async function takeTestLock(path, label, print = console.log) {
+  const owner = createOwner();
   const busy = () => new Error(`The ${label} lock is held at ${path}.`);
   while (true) {
     try {
@@ -188,6 +288,10 @@ export async function takeTestLock(path, label, print = console.log) {
       claim.release();
     }
   }
+  return lockHandle(path, owner, label, () => unlinkSync(path));
+}
+
+function lockHandle(path, owner, label, remove) {
   return {
     track(pid) {
       const started = startTime(pid);
@@ -204,7 +308,7 @@ export async function takeTestLock(path, label, print = console.log) {
         throw new Error("Test process groups remain registered. The lock stays in place.");
       if (snapshot(path)?.owner?.token !== owner.token)
         throw new Error(`The ${label} lock changed owners.`);
-      unlinkSync(path);
+      remove();
     },
   };
 }
