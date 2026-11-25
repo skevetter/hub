@@ -1884,6 +1884,10 @@ export interface Database
     triggerId: string,
     revisionId: string,
   ): Promise<OrganizationTriggerRevisionRecord | undefined>;
+  /** The active revision of every trigger in the organization, in one read. */
+  listActiveOrganizationTriggerRevisions(
+    organizationId: string,
+  ): Promise<OrganizationTriggerRevisionRecord[]>;
   findOrganizationTriggerMigrationRevision(
     triggerId: string,
   ): Promise<OrganizationTriggerRevisionRecord | undefined>;

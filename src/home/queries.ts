@@ -21,6 +21,17 @@ export const TRIGGER_RUN_SUMMARY_SQL = `select trigger.id as trigger_id, counts.
   ) latest on true
   where trigger.organization_id = $1`;
 
+// One statement for every trigger's active revision. The lateral lookup is a key lookup per
+// trigger; a plain join lets the planner hash the revisions of every organization instead.
+export const ACTIVE_TRIGGER_REVISIONS_SQL = `select revision.*
+  from organization_triggers trigger
+  cross join lateral (
+    select * from organization_trigger_revisions
+    where id = trigger.active_revision_id and trigger_id = trigger.id
+    limit 1
+  ) revision
+  where trigger.organization_id = $1`;
+
 interface SummaryRow extends QueryRow {
   trigger_id: string;
   total: number;

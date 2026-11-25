@@ -279,7 +279,33 @@ describe("Home figures", () => {
     assert.match(markup, /text-attention-text/u);
   });
 
-  it("lists every trigger, so none of the failing ones is cut off", () => {
+  it("lists the ten worst triggers and counts all of them in the figures", () => {
+    const ids = Array.from({ length: 12 }, (_, position) => `t${String(position)}`);
+    const failingIds = new Set(["t10", "t11"]);
+    const markup = renderHome({
+      ...ready,
+      triggers: ids.map((id) => ({ id, name: `name-${id}`, event: "manual.run", enabled: true })),
+      triggerRuns: ids.map((triggerId) => ({
+        triggerId,
+        total: 1,
+        failed: failingIds.has(triggerId) ? 1 : 0,
+        latest: {
+          id: `run-${triggerId}`,
+          status: failingIds.has(triggerId) ? "failed" : "succeeded",
+          startedAt: "2026-11-20T00:00:00.000Z",
+        },
+      })),
+    });
+    const list = markup.slice(markup.indexOf('aria-label="Trigger health"'));
+    const shown = [...list.matchAll(/href="\/o\/acme\/triggers\/(t\d+)"/gu)].map((m) => m[1]);
+    assert.equal(shown.length, 10);
+    assert.deepEqual(shown.slice(0, 2).sort(), ["t10", "t11"]);
+    assert.match(markup, /Showing the 10 worst of 12 triggers/u);
+    assert.match(figure(markup, "triggers failing"), /^2 triggers failing/u);
+    assert.match(figure(markup, "triggers on"), /^12 triggers on/u);
+  });
+
+  it("counts failing triggers the list leaves out", () => {
     const ids = Array.from({ length: 12 }, (_, position) => `t${String(position)}`);
     const markup = renderHome({
       ...ready,
@@ -292,7 +318,13 @@ describe("Home figures", () => {
       })),
     });
     const list = markup.slice(markup.indexOf('aria-label="Trigger health"'));
-    assert.equal(list.match(/href="\/o\/acme\/triggers\/t\d+"/gu)?.length, 12);
+    assert.equal(list.match(/href="\/o\/acme\/triggers\/t\d+"/gu)?.length, 10);
+    assert.match(figure(markup, "triggers failing"), /^12 triggers failing/u);
+    assert.match(markup, /Showing the 10 worst of 12 triggers/u);
+  });
+
+  it("says nothing about a cut when every trigger fits", () => {
+    assert.doesNotMatch(renderHome(failing), /Showing the/u);
   });
 
   it("counts connected daemons and those that cannot run agents", () => {

@@ -26,6 +26,9 @@ export interface TriggerHealth {
   latestFailure: { triggerName: string; runId: string; status: string; startedAt: string } | null;
 }
 
+/** Home shows the worst rows only; the figures above still count every trigger. */
+export const HOME_TRIGGER_ROWS = 10;
+
 const NO_RUNS: StateView = { label: "No runs yet", tone: "off" };
 const RANK = { attention: 0, live: 1, done: 2, off: 3 } as const;
 
