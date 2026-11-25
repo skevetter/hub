@@ -117,6 +117,9 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await home.expectFigure("trigger on", 1);
     await home.expectTrigger("deploy", "Running");
     await expect(page.getByRole("list", { name: "Recent runs" })).toHaveCount(0);
+    await home.followRecentRuns();
+    await expect(page.getByRole("row").filter({ hasText: "deploy" })).toBeVisible();
+    await home.open();
 
     await hub.grantOperator("owner");
     await home.expectOpen();

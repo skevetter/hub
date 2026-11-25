@@ -127,11 +127,18 @@ function HomeTriggers({
           </Button>
         </EmptyState>
       ) : (
-        <RecordList label="Trigger health">
-          {health.rows.map((row) => (
-            <TriggerRow key={row.id} row={row} base={base} windowDays={data.windowDays} />
-          ))}
-        </RecordList>
+        <>
+          <RecordList label="Trigger health">
+            {health.rows.map((row) => (
+              <TriggerRow key={row.id} row={row} base={base} windowDays={data.windowDays} />
+            ))}
+          </RecordList>
+          <p className="mt-4 text-sm">
+            <Link to={`${base}/activity` as never} className={INLINE_LINK}>
+              Recent runs
+            </Link>
+          </p>
+        </>
       )}
     </Section>
   );

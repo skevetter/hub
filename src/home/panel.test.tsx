@@ -396,9 +396,16 @@ describe("Home triggers", () => {
     assert.match(markup, /<a href="\/o\/acme\/triggers\/new\/edit">Create a trigger<\/a>/u);
   });
 
-  it("keeps recent runs off Home", () => {
+  it("keeps the run list off Home and leaves one link to Activity under the triggers", () => {
     const markup = renderHome(failing);
-    assert.doesNotMatch(markup, /Recent runs|aria-label="Recent runs"/u);
+    assert.doesNotMatch(markup, /aria-label="Recent runs"/u);
+    assert.equal(markup.match(/<a href="\/o\/acme\/activity">Recent runs<\/a>/gu)?.length, 1);
+    const list = markup.indexOf('aria-label="Trigger health"');
+    assert.ok(markup.indexOf(">Recent runs<") > list);
+  });
+
+  it("offers no Activity link before there is a trigger", () => {
+    assert.doesNotMatch(renderHome(fresh), /Recent runs/u);
   });
 });
 
