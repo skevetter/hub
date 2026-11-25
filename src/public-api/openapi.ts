@@ -129,7 +129,7 @@ registry.registerPath({
   security: [{ bearerAuth: [] }, { browserSession: [] }],
   "x-required-scopes": ["runs:read"],
   request: {
-    params: z.object({ id: z.string().uuid() }),
+    params: z.object({ id: z.uuid() }),
     headers: z.object({
       "Last-Event-ID": z
         .string()

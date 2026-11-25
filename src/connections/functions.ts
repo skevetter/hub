@@ -54,8 +54,8 @@ const scopeSchema = z.object({
 const providerSchema = scopeSchema.extend({
   provider: z.enum(CONNECTION_PROVIDERS),
 });
-const disconnectSchema = providerSchema.extend({ connectionId: z.string().uuid() });
-const startSchema = z.object({ url: z.string().url() });
+const disconnectSchema = providerSchema.extend({ connectionId: z.uuid() });
+const startSchema = z.object({ url: z.url() });
 
 export type ConnectionStatus = z.infer<typeof connectionStatusSchema>;
 export type ConnectionDisconnectResult = `${ConnectionProvider}_disconnected`;

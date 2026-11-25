@@ -28,7 +28,7 @@ const WorktreeTargetSchema = z.discriminatedUnion("mode", [
 export const IDENTIFIER = /^[a-z][a-z0-9_-]*$/u;
 const EVENT_NAME = /^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*$/u;
 const CONNECTION_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
-const InputValueSchema = z.union([z.string(), z.number().finite(), z.boolean()]);
+const InputValueSchema = z.union([z.string(), z.number(), z.boolean()]);
 
 export const TriggerInputSchema = z
   .object({
@@ -295,7 +295,7 @@ export const TriggerDocumentSchema = z
     }
     if (Object.keys(trigger.on).length === 0) {
       context.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: "custom",
         path: ["on"],
         message: "at least one event is required",
       });
@@ -306,7 +306,7 @@ export const TriggerDocumentSchema = z
       Object.keys(trigger.run.agent.choices).length === 0
     ) {
       context.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: "custom",
         path: ["run", "agent", "choices"],
         message: "at least one agent choice is required",
       });

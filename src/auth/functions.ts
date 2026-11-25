@@ -23,7 +23,7 @@ import {
 import { parseEntitlementDenial, type EntitlementDenialPayload } from "../entitlements/denial.js";
 
 const credentialsSchema = z.object({
-  email: z.string().email(),
+  email: z.email(),
   password: z.string().min(PASSWORD_MIN_LENGTH),
 });
 const signInSchema = credentialsSchema.extend({ invitation: z.string().min(1).optional() });
@@ -32,7 +32,7 @@ const signUpSchema = credentialsSchema.extend({
   invitation: z.string().min(1).optional(),
 });
 const emailSchema = z.object({
-  email: z.string().email(),
+  email: z.email(),
   invitation: z.string().min(1).optional(),
 });
 const resetPasswordSchema = z.object({
@@ -43,7 +43,7 @@ const accountEntrySchema = z.object({ invitation: z.string().optional() });
 const initialOperatorSchema = credentialsSchema.strip();
 const createOrganizationSchema = z.object({ name: z.string().trim().min(1).max(100) });
 const selectOrganizationSchema = z.object({ organizationId: z.string().min(1) });
-const createInvitationSchema = z.object({ email: z.string().email(), role: invitationRoleSchema });
+const createInvitationSchema = z.object({ email: z.email(), role: invitationRoleSchema });
 const invitationIdSchema = z.object({ invitationId: z.string().min(1) });
 const changeRoleSchema = z.object({ memberId: z.string().min(1), role: organizationRoleSchema });
 const memberIdSchema = z.object({ memberId: z.string().min(1) });
@@ -51,9 +51,9 @@ const passwordChangeSchema = z.object({
   currentPassword: z.string().min(1),
   newPassword: z.string().min(PASSWORD_MIN_LENGTH),
 });
-const apiKeyIdSchema = z.object({ id: z.string().uuid() });
+const apiKeyIdSchema = z.object({ id: z.uuid() });
 const cliCredentialSummarySchema = z.object({
-  id: z.string().uuid(),
+  id: z.uuid(),
   prefix: z.string(),
   createdAt: z.string(),
   lastUsedAt: z.string().nullable(),

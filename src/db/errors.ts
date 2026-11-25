@@ -4,7 +4,7 @@ const PgErrorCodeSchema = z
   .object({
     code: z.string().optional(),
   })
-  .passthrough();
+  .loose();
 
 export class DatabaseUnavailableError extends Error {
   constructor(message = "database unavailable", options?: { cause?: unknown }) {

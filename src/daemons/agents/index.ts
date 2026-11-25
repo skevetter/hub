@@ -89,7 +89,7 @@ const EnvelopeSchema = z.object({
 });
 const ResultSchema = z
   .object({ error: z.string().nullable().optional(), accepted: z.boolean().optional() })
-  .passthrough();
+  .loose();
 
 export class DaemonAgentError extends Error {
   constructor(

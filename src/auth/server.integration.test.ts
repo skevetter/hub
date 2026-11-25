@@ -888,8 +888,8 @@ class AccountBrowser {
     const response = await this.get("/api/auth/get-session");
     const session = z
       .object({
-        session: z.object({ activeOrganizationId: z.string() }).passthrough(),
-        user: z.object({ email: z.string() }).passthrough(),
+        session: z.object({ activeOrganizationId: z.string() }).loose(),
+        user: z.object({ email: z.string() }).loose(),
       })
       .parse(await response.json());
     return {

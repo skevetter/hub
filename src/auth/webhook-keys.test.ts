@@ -35,7 +35,7 @@ const signingSettings = readWebhookSigningSettings({
   PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID: "test-key",
 });
 const keySummarySchema = z.object({
-  id: z.string().uuid(),
+  id: z.uuid(),
   name: z.string(),
   actor: apiKeyActorSchema.nullable(),
   allowedTriggers: apiKeyAllowedTriggersSchema.nullable(),

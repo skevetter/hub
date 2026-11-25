@@ -89,7 +89,7 @@ export const webhookSigningSummarySchema = webhookSigningAuthenticationSchema.ex
 });
 
 export const apiKeySummarySchema = z.object({
-  id: z.string().uuid(),
+  id: z.uuid(),
   name: z.string(),
   prefix: z.string(),
   scopes: z.array(apiKeyScopeSchema),

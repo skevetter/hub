@@ -16,7 +16,7 @@ import { createHubApplication } from "../app.js";
 import { createUnlimitedEntitlementsService } from "../entitlements/test-utils.js";
 import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
 
-const createdApiKeyResponseSchema = z.object({ key: z.object({ id: z.string().uuid() }) });
+const createdApiKeyResponseSchema = z.object({ key: z.object({ id: z.uuid() }) });
 
 describe("organization API-key boundary", () => {
   let postgres: StartedPostgreSqlContainer;

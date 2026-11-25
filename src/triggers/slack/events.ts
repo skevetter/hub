@@ -14,7 +14,7 @@ export const SlackUrlVerificationSchema = z
     challenge: z.string().min(1),
     api_app_id: SlackIdSchema.optional(),
   })
-  .passthrough();
+  .loose();
 
 export const SlackEventCallbackSchema = z
   .object({
@@ -25,7 +25,7 @@ export const SlackEventCallbackSchema = z
     event_time: z.number().int().nonnegative(),
     event: z.unknown(),
   })
-  .passthrough();
+  .loose();
 
 const SlackAppMentionSchema = z
   .object({
@@ -48,11 +48,11 @@ const SlackAppMentionSchema = z
             mimetype: z.string().max(255).optional(),
             size: z.number().int().nonnegative().optional(),
           })
-          .passthrough(),
+          .loose(),
       )
       .optional(),
   })
-  .passthrough();
+  .loose();
 
 export const NormalizedSlackMentionEventSchema = z.object({
   type: z.literal("mention"),

@@ -11,7 +11,7 @@ import { reportFailure } from "../failures/index.js";
 const renameBody = z.object({ slug: z.string().trim().min(1).max(100) }).strict();
 const enrollmentBody = z
   .object({
-    daemonId: z.string().uuid(),
+    daemonId: z.uuid(),
     idempotencyKey: z.string(),
     hostname: z.string().trim().min(1).max(253).optional(),
     serverId: z.string(),

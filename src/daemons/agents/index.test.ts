@@ -104,7 +104,7 @@ test("timeline sends a projected request and returns entries with cursors", asyn
   const query = { direction: "after", cursor: { epoch, seq: 3 }, limit: 10 } as const;
   const agents = new DaemonAgents((frame) => {
     const { message } = z
-      .object({ message: z.object({ requestId: z.string() }).passthrough() })
+      .object({ message: z.object({ requestId: z.string() }).loose() })
       .parse(JSON.parse(frame));
     expect(message).toEqual({
       type: "fetch_agent_timeline_request",
