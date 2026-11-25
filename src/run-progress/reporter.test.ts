@@ -1056,6 +1056,52 @@ describe("reporter lifecycle integration", () => {
     assert.deepEqual(f.failures, ["credential_rejected"]);
   });
 
+  it("holds the credential slot until the stop write settles", async () => {
+    const f = fixture();
+    const first = await f.seed();
+    const second = await f.seed();
+    const backoff = new CredentialBackoff(() => 0.5);
+    const held = Promise.withResolvers<void>();
+    const reached = Promise.withResolvers<void>();
+    const database = new Proxy(f.store, {
+      get(target, key) {
+        const method: unknown = Reflect.get(target, key);
+        if (key !== "updateRunProgressMessage" || typeof method !== "function") return method;
+        return async (input: Parameters<Database["updateRunProgressMessage"]>[0]) => {
+          if (input.triggerRunId === first.run.id && input.patch.state === "refused") {
+            reached.resolve();
+            await held.promise;
+          }
+          const result: unknown = Reflect.apply(method, target, [input]);
+          return result;
+        };
+      },
+    });
+    const writerFor = (db: Database) =>
+      new MessageWriter({
+        database: db,
+        clock: f.clock,
+        settings: { minEditSeconds: 20, maxEdits: 120, retentionDays: 30 },
+        signal: new AbortController().signal,
+        backoff,
+        report: (code) => f.failures.push(code),
+      });
+    f.provider.authorize = async (_locator, run) =>
+      run.id === first.run.id ? { refused: "policy" } : "ok";
+    const scope = (run: { id: string }) => ({ triggerRunId: run.id, organizationId: ORGANIZATION });
+
+    const stopping = writerFor(database).write(scope(first.run), f.provider);
+    await reached.promise;
+    const waiting = await writerFor(f.store).write(scope(second.run), f.provider);
+    assert.equal(waiting.wakeAt, f.clock.now() + 250);
+    assert.equal(f.provider.requests.length, 0);
+
+    held.resolve();
+    assert.equal((await stopping).row?.state, "refused");
+    await writerFor(f.store).write(scope(second.run), f.provider);
+    assert.equal(f.provider.requests.length, 1);
+  });
+
   it("restarts a durable final retry chain when the run finished while Hub was down", async () => {
     const f = fixture();
     const run = await f.seed({ state: "active" });
