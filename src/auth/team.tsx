@@ -1,9 +1,15 @@
 import { Plus } from "lucide-react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useMemo, useState, type SyntheticEvent } from "react";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
-import { DataCell, DataRow, DataTable, type DataColumn } from "../components/app/data-table.js";
+import {
+  DataCell,
+  DataRow,
+  DataTable,
+  DataTableSkeleton,
+  type DataColumn,
+} from "../components/app/data-table.js";
 import { PageHeader } from "../components/app/page.js";
 import { RowActions } from "../components/app/row-actions.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
@@ -22,8 +28,16 @@ import {
 } from "../components/ui/select.js";
 import { formValue, invitationRole } from "./account-actions.js";
 import { FormField, type FieldControl } from "../components/app/form-field.js";
-import { useActiveAccount } from "./active-account.js";
-import { cancelInvitation, changeMemberRole, createInvitation, removeMember } from "./functions.js";
+import { useRouteTenant } from "../projects/context.js";
+import type { RouteInput } from "./route-organization.js";
+import { useSnapshotQuery } from "../queries/index.js";
+import {
+  cancelInvitation,
+  changeMemberRole,
+  createInvitation,
+  organizationTeam,
+  removeMember,
+} from "./functions.js";
 import type { Result } from "../contract/respond.js";
 import { ACCOUNT_MUTATION_KEY, useAccountMutationPending } from "./account-mutation.js";
 import { INVITATION_MUTATION_KEY } from "./tenant-mutation.js";
@@ -37,7 +51,8 @@ import {
   organizationRoleSchema,
   type InvitationRole,
   type OrganizationRole,
-  type ActiveAccountState,
+  type OrganizationCapabilities,
+  type OrganizationTeam,
   type TeamMember,
 } from "./organization-contract.js";
 
@@ -47,7 +62,8 @@ type AccountCommandResult = Result<{
 const INVITE_FAILURE =
   "Hub did not create the invitation. Check your connection and submit it again.";
 
-const EMPTY_INVITATIONS: NonNullable<ActiveAccountState["team"]["invitations"]> = [];
+const EMPTY_INVITATIONS: NonNullable<OrganizationTeam["invitations"]> = [];
+const TEAM_FAILURE = "Hub did not receive the team. Check your connection and reload.";
 const INVITATION_ROLE_LABELS = {
   admin: "Admin",
   member: "Member",
@@ -57,7 +73,31 @@ const ORGANIZATION_ROLE_LABELS = {
   admin: "Admin",
   member: "Member",
 } satisfies Record<OrganizationRole, string>;
-type ActiveAccount = ActiveAccountState & { busy: boolean };
+/** The organization in the address, with whether a mutation is in flight. */
+interface TeamScope {
+  id: string;
+  slug: string;
+  name: string;
+  capabilities: OrganizationCapabilities;
+  busy: boolean;
+}
+
+function teamQueryKey(organizationId: string) {
+  return ["organization-team", organizationId] as const;
+}
+
+function useRefreshTeam(organizationId: string) {
+  const queryClient = useQueryClient();
+  return useCallback(() => refreshTeam(queryClient, organizationId), [organizationId, queryClient]);
+}
+
+// The active-account read also carries the team (the sessions panel lists participants from it).
+async function refreshTeam(queryClient: QueryClient, organizationId: string) {
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: teamQueryKey(organizationId) }),
+    queryClient.invalidateQueries({ queryKey: ["account"] }),
+  ]);
+}
 
 const MEMBER_COLUMNS: readonly DataColumn[] = [
   { header: "Member", fill: true },
@@ -79,22 +119,37 @@ const INVITATIONS_EMPTY = {
 };
 
 export function Team() {
-  const account = useActiveAccount();
+  const tenant = useRouteTenant();
+  const { organization, capabilities } = tenant;
   const [inviting, setInviting] = useState(false);
   const invite = useCallback(() => setInviting(true), []);
   const busy = useAccountMutationPending();
-  const limits = useOrganizationLimits(account.capabilities.manageMembers);
+  const limits = useOrganizationLimits(capabilities.manageMembers);
   const limit = limits === undefined ? null : inviteLimit(limits);
-  const activeAccount = useMemo(() => ({ ...account, busy }), [account, busy]);
+  const scope = useMemo<TeamScope>(
+    () => ({
+      id: organization.id,
+      slug: organization.slug,
+      name: organization.name,
+      capabilities,
+      busy,
+    }),
+    [organization.id, organization.slug, organization.name, capabilities, busy],
+  );
+  const load = useServerFn(organizationTeam);
+  const snapshot = useSnapshotQuery({
+    queryKey: teamQueryKey(organization.id),
+    queryFn: () => load({ data: { organizationSlug: organization.slug } }),
+  });
 
   return (
     <>
       <PageHeader
         id="team-heading"
         title="Team"
-        description={`People with access to ${account.organization.name}.`}
+        description={`People with access to ${organization.name}.`}
       >
-        {account.capabilities.manageMembers && (
+        {capabilities.manageMembers && (
           <LockedAction
             limit={limit}
             label="Invite member"
@@ -104,20 +159,53 @@ export function Team() {
           />
         )}
       </PageHeader>
-      <Section title="Members">
-        <MembersTable account={activeAccount} />
-      </Section>
-      {account.capabilities.manageMembers && (
-        <Section title="Pending invitations">
-          <InvitationList
-            invitations={account.team.invitations ?? EMPTY_INVITATIONS}
-            busy={busy}
-            organizationName={account.organization.name}
-          />
-        </Section>
+      <TeamContent snapshot={snapshot} scope={scope} />
+      {capabilities.manageMembers && (
+        <InvitationDialog
+          open={inviting}
+          onOpenChange={setInviting}
+          busy={busy}
+          organization={organization}
+        />
       )}
-      {account.capabilities.manageMembers && (
-        <InvitationDialog open={inviting} onOpenChange={setInviting} busy={busy} />
+    </>
+  );
+}
+
+function TeamContent({
+  snapshot,
+  scope,
+}: {
+  snapshot: ReturnType<typeof useSnapshotQuery<OrganizationTeam>>;
+  scope: TeamScope;
+}) {
+  if (snapshot.status === "pending") {
+    return (
+      <Section title="Members">
+        <DataTableSkeleton label="Members" columns={MEMBER_COLUMNS} />
+      </Section>
+    );
+  }
+  if (snapshot.status === "error") {
+    return (
+      <FailureAlert
+        title="Team unavailable"
+        error={snapshot.error}
+        fallback={TEAM_FAILURE}
+        onRetry={snapshot.refetch}
+      />
+    );
+  }
+  const { members, invitations } = snapshot.data;
+  return (
+    <>
+      <Section title="Members">
+        <MembersTable members={members} scope={scope} />
+      </Section>
+      {scope.capabilities.manageMembers && (
+        <Section title="Pending invitations">
+          <InvitationList invitations={invitations ?? EMPTY_INVITATIONS} scope={scope} />
+        </Section>
       )}
     </>
   );
@@ -139,13 +227,15 @@ function InvitationDialog({
   open,
   onOpenChange,
   busy,
+  organization,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   busy: boolean;
+  organization: { id: string; slug: string };
 }) {
   const [role, setRole] = useState<InvitationRole>(INVITATION_ROLES[1]);
-  const create = useCreateInvitation(onOpenChange, setRole);
+  const create = useCreateInvitation(organization, onOpenChange, setRole);
 
   const submit = useCallback(
     (event: SyntheticEvent<HTMLFormElement>): void => {
@@ -199,21 +289,24 @@ function InvitationDialog({
 }
 
 function useCreateInvitation(
+  organization: { id: string; slug: string },
   onOpenChange: (open: boolean) => void,
   setRole: (role: InvitationRole) => void,
 ) {
-  const queryClient = useQueryClient();
+  const refresh = useRefreshTeam(organization.id);
+  const create = useServerFn(createInvitation) as (
+    input: Parameters<typeof createInvitation>[0],
+  ) => Promise<AccountCommandResult>;
   // The dialog owns this request. It stays open until the invitation exists, so a refusal — a
   // duplicate address, a seat that just went — is answered where the address was typed, with the
   // address still in the field, instead of closing and reporting itself at the top of the page.
   return useMutation({
     mutationKey: INVITATION_MUTATION_KEY,
-    mutationFn: useServerFn(createInvitation) as (
-      input: Parameters<typeof createInvitation>[0],
-    ) => Promise<AccountCommandResult>,
+    mutationFn: (input: RouteInput<Parameters<typeof createInvitation>[0]>) =>
+      create({ data: { ...input.data, organizationSlug: organization.slug } }),
     onSuccess: async (result) => {
       if (result.status !== "ok") return;
-      await queryClient.invalidateQueries({ queryKey: ["account"] });
+      await refresh();
       setRole(INVITATION_ROLES[1]);
       onOpenChange(false);
     },
@@ -241,23 +334,23 @@ function renderInvitationRole(
   );
 }
 
-function MembersTable({ account }: { account: ActiveAccount }) {
+function MembersTable({ members, scope }: { members: TeamMember[]; scope: TeamScope }) {
   return (
     <DataTable
       label="Members"
       columns={MEMBER_COLUMNS}
-      isEmpty={account.team.members.length === 0}
+      isEmpty={members.length === 0}
       empty={MEMBERS_EMPTY}
     >
-      {account.team.members.map((member) => (
-        <MemberRow account={account} member={member} key={member.id} />
+      {members.map((member) => (
+        <MemberRow scope={scope} member={member} key={member.id} />
       ))}
     </DataTable>
   );
 }
 
-function MemberRow({ account, member }: { account: ActiveAccount; member: TeamMember }) {
-  const { canManage, changeRole, remove } = useMemberCommands(account, member);
+function MemberRow({ scope, member }: { scope: TeamScope; member: TeamMember }) {
+  const { canManage, changeRole, remove } = useMemberCommands(scope, member);
 
   return (
     <DataRow>
@@ -270,14 +363,14 @@ function MemberRow({ account, member }: { account: ActiveAccount; member: TeamMe
             key={`${member.id}:${member.role}`}
             value={member.role}
             onValueChange={changeRole}
-            disabled={account.busy}
+            disabled={scope.busy}
           >
             <SelectTrigger size="sm" aria-label={`Role for ${member.name}`} className="w-32">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
               {ORGANIZATION_ROLES.filter(
-                (role) => role !== "owner" || account.capabilities.manageOwners,
+                (role) => role !== "owner" || scope.capabilities.manageOwners,
               ).map((role) => (
                 <SelectItem value={role} key={role}>
                   {ORGANIZATION_ROLE_LABELS[role]}
@@ -295,11 +388,11 @@ function MemberRow({ account, member }: { account: ActiveAccount; member: TeamMe
         {canManage ? (
           <RowActions label={`Actions for ${member.name}`}>
             <ConfirmMenuItem
-              busy={account.busy}
+              busy={scope.busy}
               destructive
               label={`Remove ${member.name}`}
               title={`Remove ${member.name}?`}
-              description={`${member.name} will immediately lose access to ${account.organization.name}. This action cannot be undone.`}
+              description={`${member.name} will immediately lose access to ${scope.name}. This action cannot be undone.`}
               cancelLabel="Keep member"
               confirmLabel={`Remove ${member.name}`}
               onConfirm={remove}
@@ -311,29 +404,34 @@ function MemberRow({ account, member }: { account: ActiveAccount; member: TeamMe
   );
 }
 
-function useMemberCommands(account: ActiveAccount, member: TeamMember) {
-  const queryClient = useQueryClient();
+function useMemberCommands(scope: TeamScope, member: TeamMember) {
+  const refresh = useRefreshTeam(scope.id);
+  const changeRoleCommand = useServerFn(changeMemberRole) as (
+    input: Parameters<typeof changeMemberRole>[0],
+  ) => Promise<AccountCommandResult>;
+  const removeMemberCommand = useServerFn(removeMember) as (
+    input: Parameters<typeof removeMember>[0],
+  ) => Promise<AccountCommandResult>;
+  const organizationSlug = scope.slug;
   const change = useMutation({
     mutationKey: ACCOUNT_MUTATION_KEY,
-    mutationFn: useServerFn(changeMemberRole) as (
-      input: Parameters<typeof changeMemberRole>[0],
-    ) => Promise<AccountCommandResult>,
+    mutationFn: (input: RouteInput<Parameters<typeof changeMemberRole>[0]>) =>
+      changeRoleCommand({ data: { ...input.data, organizationSlug } }),
     onSuccess: async (result) => {
-      if (result.status === "ok") await queryClient.invalidateQueries({ queryKey: ["account"] });
+      if (result.status === "ok") await refresh();
     },
   });
   const removeMemberMutation = useMutation({
     mutationKey: ACCOUNT_MUTATION_KEY,
-    mutationFn: useServerFn(removeMember) as (
-      input: Parameters<typeof removeMember>[0],
-    ) => Promise<AccountCommandResult>,
+    mutationFn: (input: RouteInput<Parameters<typeof removeMember>[0]>) =>
+      removeMemberCommand({ data: { ...input.data, organizationSlug } }),
     onSuccess: async (result) => {
-      if (result.status === "ok") await queryClient.invalidateQueries({ queryKey: ["account"] });
+      if (result.status === "ok") await refresh();
     },
   });
   const canManage =
-    account.capabilities.manageMembers &&
-    (member.role !== "owner" || account.capabilities.manageOwners);
+    scope.capabilities.manageMembers &&
+    (member.role !== "owner" || scope.capabilities.manageOwners);
   const changeRole = useCallback(
     (value: string) => {
       change.mutate({
@@ -351,12 +449,10 @@ function useMemberCommands(account: ActiveAccount, member: TeamMember) {
 
 function InvitationList({
   invitations,
-  busy,
-  organizationName,
+  scope,
 }: {
-  invitations: NonNullable<ActiveAccountState["team"]["invitations"]>;
-  busy: boolean;
-  organizationName: string;
+  invitations: NonNullable<OrganizationTeam["invitations"]>;
+  scope: TeamScope;
 }) {
   const [copyStatus, setCopyStatus] = useState<string>();
 
@@ -380,11 +476,8 @@ function InvitationList({
             </DataCell>
             <DataCell>
               <InvitationActions
-                id={invitation.id}
-                email={invitation.email}
-                link={invitation.link}
-                organizationName={organizationName}
-                busy={busy}
+                invitation={invitation}
+                scope={scope}
                 onCopyStatusChange={setCopyStatus}
               />
             </DataCell>
@@ -397,28 +490,24 @@ function InvitationList({
 }
 
 function InvitationActions({
-  id,
-  email,
-  link,
-  organizationName,
-  busy,
+  invitation: { id, email, link },
+  scope,
   onCopyStatusChange,
 }: {
-  id: string;
-  email: string;
-  link: string;
-  organizationName: string;
-  busy: boolean;
+  invitation: { id: string; email: string; link: string };
+  scope: TeamScope;
   onCopyStatusChange: (status: string) => void;
 }) {
-  const queryClient = useQueryClient();
+  const refresh = useRefreshTeam(scope.id);
+  const cancelCommand = useServerFn(cancelInvitation) as (
+    input: Parameters<typeof cancelInvitation>[0],
+  ) => Promise<AccountCommandResult>;
   const cancelInvitationMutation = useMutation({
     mutationKey: ACCOUNT_MUTATION_KEY,
-    mutationFn: useServerFn(cancelInvitation) as (
-      input: Parameters<typeof cancelInvitation>[0],
-    ) => Promise<AccountCommandResult>,
+    mutationFn: (input: RouteInput<Parameters<typeof cancelInvitation>[0]>) =>
+      cancelCommand({ data: { ...input.data, organizationSlug: scope.slug } }),
     onSuccess: async (result) => {
-      if (result.status === "ok") await queryClient.invalidateQueries({ queryKey: ["account"] });
+      if (result.status === "ok") await refresh();
     },
   });
   const cancel = useCallback(() => {
@@ -438,11 +527,11 @@ function InvitationActions({
     <RowActions label={`Actions for ${email}`}>
       <DropdownMenuItem onSelect={copy}>Copy link</DropdownMenuItem>
       <ConfirmMenuItem
-        busy={busy}
+        busy={scope.busy}
         destructive
         label="Cancel invitation"
         title={`Cancel invitation for ${email}?`}
-        description={`${email} will no longer be able to use this invitation to join ${organizationName}.`}
+        description={`${email} will no longer be able to use this invitation to join ${scope.name}.`}
         cancelLabel="Keep invitation"
         confirmLabel="Cancel invitation"
         onConfirm={cancel}

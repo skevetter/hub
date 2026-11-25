@@ -38,6 +38,7 @@ import {
   parseInvitationRole,
   parseOrganizationRole,
 } from "./organization-policy.js";
+import { organizationSlugSchema, splitRouteOrganization } from "./route-organization.js";
 import { invitationLockName } from "./registration-admission.js";
 import {
   provisionOrganization,
@@ -116,6 +117,8 @@ interface OrganizationAccessOptions {
   invitationMailer?: InvitationMailer;
 }
 
+type RouteHandler = (request: Request) => Promise<Response>;
+
 interface MembershipRow extends QueryRow {
   member_id: string;
   organization_id: string;
@@ -151,7 +154,7 @@ interface TargetMemberRow extends QueryRow {
 const organizationIdBody = z.object({ organizationId: z.string().min(1) }).strict();
 const createOrganizationBody = z.object({ name: z.string().trim().min(1).max(100) }).strict();
 const createInvitationBody = z
-  .object({ email: z.string().trim().email(), role: invitationRoleSchema })
+  .object({ email: z.string().trim().pipe(z.email()), role: invitationRoleSchema })
   .strict();
 const invitationIdBody = z.object({ invitationId: z.string().min(1) }).strict();
 const changeRoleBody = z
@@ -176,36 +179,38 @@ export async function withInteractiveSessionAccountFeature(response: Response): 
 export class OrganizationAccess {
   constructor(private readonly options: OrganizationAccessOptions) {}
 
-  async handle(request: Request): Promise<Response> {
+  private readonly getRoutes: Readonly<Record<string, RouteHandler>> = {
+    "/api/auth/paseo/state": (request) => this.state(request),
+    "/api/auth/paseo/api-keys": (request) => this.listApiKeys(request),
+    "/api/auth/paseo/team": (request) => this.organizationTeam(request),
+  };
+
+  private readonly postRoutes: Readonly<Record<string, RouteHandler>> = {
+    "/api/auth/paseo/create-organization": (request) => this.createOrganization(request),
+    "/api/auth/paseo/select-organization": (request) => this.selectOrganization(request),
+    "/api/auth/paseo/create-invitation": (request) => this.createInvitation(request),
+    "/api/auth/paseo/cancel-invitation": (request) => this.cancelInvitation(request),
+    "/api/auth/paseo/accept-invitation": (request) => this.acceptInvitation(request),
+    "/api/auth/paseo/change-member-role": (request) => this.changeMemberRole(request),
+    "/api/auth/paseo/remove-member": (request) => this.removeMember(request),
+    "/api/auth/paseo/api-keys": (request) => this.createApiKey(request),
+    "/api/auth/paseo/revoke-api-key": (request) => this.revokeApiKey(request),
+    "/api/auth/paseo/revoke-cli-credential": (request) => this.revokeCliCredential(request),
+    "/api/auth/paseo/rotate-api-key-signing-secret": (request) => this.rotateSigningSecret(request),
+    "/api/auth/paseo/retire-api-key-signing-secret": (request) => this.retireSigningSecret(request),
+  };
+
+  private route(request: Request): RouteHandler | undefined {
     const path = new URL(request.url).pathname;
+    const routes = request.method === "GET" ? this.getRoutes : this.postRoutes;
+    if (request.method !== "GET" && request.method !== "POST") return undefined;
+    return Object.hasOwn(routes, path) ? routes[path] : undefined;
+  }
+
+  async handle(request: Request): Promise<Response> {
     try {
-      if (request.method === "GET" && path === "/api/auth/paseo/state") {
-        return await this.state(request);
-      }
-      if (request.method === "GET" && path === "/api/auth/paseo/api-keys") {
-        return await this.listApiKeys(request);
-      }
-      if (request.method !== "POST") return notFound();
-      if (path === "/api/auth/paseo/create-organization") {
-        return await this.createOrganization(request);
-      }
-      if (path === "/api/auth/paseo/select-organization") {
-        return await this.selectOrganization(request);
-      }
-      if (path === "/api/auth/paseo/create-invitation") {
-        return await this.createInvitation(request);
-      }
-      if (path === "/api/auth/paseo/cancel-invitation") {
-        return await this.cancelInvitation(request);
-      }
-      if (path === "/api/auth/paseo/accept-invitation") {
-        return await this.acceptInvitation(request);
-      }
-      if (path === "/api/auth/paseo/change-member-role") {
-        return await this.changeMemberRole(request);
-      }
-      if (path === "/api/auth/paseo/remove-member") return await this.removeMember(request);
-      return await this.handleKeyCommand(path, request);
+      const route = this.route(request);
+      return route === undefined ? notFound() : await route(request);
     } catch (error) {
       if (error instanceof SigningRequestError) {
         return Response.json({ error: error.code }, { status: error.status });
@@ -250,29 +255,33 @@ export class OrganizationAccess {
   private async state(request: Request): Promise<Response> {
     const session = await this.options.sessions.read(request.headers);
     const invitationId = new URL(request.url).searchParams.get("invitation");
-    if (session === undefined) {
-      // A pristine instance has no accounts to sign in to and no invitations to carry, so the
-      // first-run journey replaces the sign-in wall entirely until someone claims it.
-      if ((await this.options.instanceSetup.status()) === "available") {
-        return Response.json({ status: "instanceSetupRequired" });
-      }
-      const invitation =
-        invitationId === null
-          ? undefined
-          : await this.signedOutInvitation(this.options.pool, invitationId);
-      return Response.json({
-        status: "signedOut",
-        registration: this.options.policy.registrationMode,
-        ...(invitation === undefined ? {} : { invitation: invitationSummary(invitation, true) }),
-        ...(invitationId !== null && invitation === undefined
-          ? { invitationUnavailable: true }
-          : {}),
-      });
-    }
+    if (session === undefined) return this.signedOutState(invitationId);
     const account = { id: session.userId, name: session.name, email: session.email };
     if (session.mustChangePassword) {
       return Response.json({ status: "passwordChangeRequired", account });
     }
+    return this.signedInState(session, invitationId);
+  }
+
+  private async signedOutState(invitationId: string | null): Promise<Response> {
+    // A pristine instance has no accounts to sign in to and no invitations to carry, so the
+    // first-run journey replaces the sign-in wall entirely until someone claims it.
+    if ((await this.options.instanceSetup.status()) === "available") {
+      return Response.json({ status: "instanceSetupRequired" });
+    }
+    const invitation =
+      invitationId === null
+        ? undefined
+        : await this.signedOutInvitation(this.options.pool, invitationId);
+    return Response.json({
+      status: "signedOut",
+      registration: this.options.policy.registrationMode,
+      ...invitationFields({ invitationId, invitation, signedOut: true }),
+    });
+  }
+
+  private async signedInState(session: AccountSession, invitationId: string | null) {
+    const account = { id: session.userId, name: session.name, email: session.email };
     const memberships = await this.memberships(this.options.pool, session.userId);
     const resolvedSession = await this.activateBootstrapOrganization(session, memberships);
     const invitation =
@@ -280,45 +289,39 @@ export class OrganizationAccess {
         ? undefined
         : await this.availableInvitation(this.options.pool, invitationId, session.email);
     const access = membershipAccess(resolvedSession, memberships);
+    const common = { account, memberships: membershipSummaries(memberships) };
+    const canCreateOrganization = this.options.policy.organizationCreation === "open";
 
     if (access === undefined) {
       return Response.json({
         status: "organizationRequired",
-        account,
-        memberships: membershipSummaries(memberships),
-        canCreateOrganization: this.options.policy.organizationCreation === "open",
-        ...(invitation === undefined ? {} : { invitation: invitationSummary(invitation) }),
-        ...(invitationId !== null && invitation === undefined
-          ? { invitationUnavailable: true }
-          : {}),
+        ...common,
+        canCreateOrganization,
+        ...invitationFields({ invitationId, invitation, signedOut: false }),
       });
     }
 
     if (resolvedSession.isInstanceOperator && !(await this.options.appOnboarding.isComplete())) {
       return Response.json({
         status: "appSetupRequired",
-        account,
-        memberships: membershipSummaries(memberships),
+        ...common,
         organization: access.organization,
         capabilities: access.capabilities,
       });
     }
 
-    const team = await this.team(access);
     return Response.json({
       status: "active",
-      account,
-      memberships: membershipSummaries(memberships),
+      ...common,
       organization: access.organization,
       membership: access.membership,
       capabilities: access.capabilities,
       // Presentation only — it decides whether the operator nav renders. Every operator read and
       // write re-checks the flag server-side, so a forged value here buys nothing.
       isInstanceOperator: resolvedSession.isInstanceOperator,
-      canCreateOrganization: this.options.policy.organizationCreation === "open",
-      team,
-      ...(invitation === undefined ? {} : { invitation: invitationSummary(invitation) }),
-      ...(invitationId !== null && invitation === undefined ? { invitationUnavailable: true } : {}),
+      canCreateOrganization,
+      team: await this.team(access),
+      ...invitationFields({ invitationId, invitation, signedOut: false }),
     });
   }
 
@@ -366,25 +369,9 @@ export class OrganizationAccess {
     return Response.json({ organizationId: input.organizationId });
   }
 
-  private handleKeyCommand(path: string, request: Request): Promise<Response> {
-    switch (path) {
-      case "/api/auth/paseo/api-keys":
-        return this.createApiKey(request);
-      case "/api/auth/paseo/revoke-api-key":
-        return this.revokeApiKey(request);
-      case "/api/auth/paseo/revoke-cli-credential":
-        return this.revokeCliCredential(request);
-      case "/api/auth/paseo/rotate-api-key-signing-secret":
-        return this.rotateSigningSecret(request);
-      case "/api/auth/paseo/retire-api-key-signing-secret":
-        return this.retireSigningSecret(request);
-      default:
-        return Promise.resolve(notFound());
-    }
-  }
-
   private async listApiKeys(request: Request): Promise<Response> {
-    const access = await this.requireActiveAccess(await this.requireSession(request));
+    const session = await this.requireSession(request);
+    const access = await this.requireRouteAccess(session, queryOrganizationSlug(request));
     if (!access.capabilities.manageResources) {
       throw new ProductRequestError(403, "forbidden");
     }
@@ -405,8 +392,8 @@ export class OrganizationAccess {
 
   private async createApiKey(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
-    const input = await parseBody(request, createApiKeyBody);
-    const access = await this.requireActiveAccess(session);
+    const { organizationSlug, input } = await parseOrganizationBody(request, createApiKeyBody);
+    const access = await this.requireRouteAccess(session, organizationSlug);
     const { apiKeys } = this.options;
     const organizationId = access.organization.id;
     if (input.authentication === undefined) {
@@ -443,8 +430,11 @@ export class OrganizationAccess {
 
   private async rotateSigningSecret(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
-    const input = await parseBody(request, rotateSigningSecretSchema);
-    const access = await this.requireActiveAccess(session);
+    const { organizationSlug, input } = await parseOrganizationBody(
+      request,
+      rotateSigningSecretSchema,
+    );
+    const access = await this.requireRouteAccess(session, organizationSlug);
     const organizationId = access.organization.id;
     const rotated = await this.withApiKeyManager(access, (client) =>
       this.options.apiKeys.signing.rotate(client, organizationId, input),
@@ -463,8 +453,11 @@ export class OrganizationAccess {
 
   private async retireSigningSecret(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
-    const input = await parseBody(request, retireSigningSecretSchema);
-    const access = await this.requireActiveAccess(session);
+    const { organizationSlug, input } = await parseOrganizationBody(
+      request,
+      retireSigningSecretSchema,
+    );
+    const access = await this.requireRouteAccess(session, organizationSlug);
     const organizationId = access.organization.id;
     await this.withApiKeyManager(access, (client) =>
       this.options.apiKeys.signing.retire(client, organizationId, input),
@@ -481,8 +474,8 @@ export class OrganizationAccess {
 
   private async revokeApiKey(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
-    const input = await parseBody(request, apiKeyIdBody);
-    const access = await this.requireActiveAccess(session);
+    const { organizationSlug, input } = await parseOrganizationBody(request, apiKeyIdBody);
+    const access = await this.requireRouteAccess(session, organizationSlug);
     const organizationId = access.organization.id;
     await this.withApiKeyManager(access, async (client) => {
       if (!(await this.options.apiKeys.revoke(organizationId, input.id, client))) {
@@ -518,8 +511,8 @@ export class OrganizationAccess {
 
   private async revokeCliCredential(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
-    const input = await parseBody(request, apiKeyIdBody);
-    const access = await this.requireActiveAccess(session);
+    const { organizationSlug, input } = await parseOrganizationBody(request, apiKeyIdBody);
+    const access = await this.requireRouteAccess(session, organizationSlug);
     await this.options.pool.transaction(async (client) => {
       await lockOrganizationMembershipTransitions(
         this.options.locks,
@@ -539,81 +532,12 @@ export class OrganizationAccess {
 
   private async createInvitation(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
-    const input = await parseBody(request, createInvitationBody);
-    const access = await this.requireActiveAccess(session);
+    const { organizationSlug, input } = await parseOrganizationBody(request, createInvitationBody);
+    const access = await this.requireRouteAccess(session, organizationSlug);
     const email = normalizeEmail(input.email);
-    const invitation = await this.options.pool.transaction(async (client) => {
-      await lockOrganizationMembershipTransitions(
-        this.options.locks,
-        client,
-        access.organization.id,
-      );
-      await lockOrganizationMembers(client, access.organization.id);
-      const actorRole = await currentActorRole(client, access);
-      if (!capabilitiesFor(actorRole).manageMembers) {
-        throw new ProductRequestError(403, "forbidden");
-      }
-      const existingMember = await client.query(
-        `select 1 from member
-         join "user" on "user".id = member.user_id
-         where member.organization_id = $1 and lower("user".email) = $2
-         limit 1`,
-        [access.organization.id, email],
-      );
-      if (existingMember.rowCount !== 0) {
-        throw new ProductRequestError(409, "already_member");
-      }
-      await client.query(
-        `update invitation set status = 'canceled'
-         where organization_id = $1 and status = 'pending' and expires_at <= now()`,
-        [access.organization.id],
-      );
-      const alreadyPending = await client.query<InvitationRow>(
-        `select id, organization_id, '' as organization_name, '' as inviter_name,
-                email, role, expires_at
-         from invitation
-         where organization_id = $1 and lower(email) = $2 and status = 'pending'
-           and expires_at > now()`,
-        [access.organization.id, email],
-      );
-      const pendingReinvite = alreadyPending.rows[0];
-      if (pendingReinvite !== undefined) return pendingReinvite;
-      // A genuinely new invitee reserves a seat, so the organization must both be allowed to
-      // invite at all and have a free seat. Both checks run under the membership advisory lock
-      // held by this transaction, so a burst of concurrent invites is serialized against one
-      // another. Re-inviting an existing member or pending invitee (handled above) is exempt.
-      await this.options.entitlements.requireFlag(access.organization.id, "canInviteMembers");
-      await this.options.entitlements.requireHeadroom(access.organization.id, "seats");
-      const inserted = await client.query<InvitationRow>(
-        `insert into invitation
-          (id, organization_id, email, role, status, expires_at, inviter_id, created_at)
-         values ($1, $2, $3, $4, 'pending', now() + ($6 * interval '1 hour'), $5, now())
-         on conflict (organization_id, lower(email)) where status = 'pending' do nothing
-         returning id, organization_id, '' as organization_name, '' as inviter_name,
-                   email, role, expires_at`,
-        [
-          randomUUID(),
-          access.organization.id,
-          email,
-          input.role,
-          session.userId,
-          INVITATION_LIFETIME_HOURS,
-        ],
-      );
-      const created = inserted.rows[0];
-      if (created !== undefined) return created;
-      const existing = await client.query<InvitationRow>(
-        `select id, organization_id, '' as organization_name, '' as inviter_name,
-                email, role, expires_at
-         from invitation
-         where organization_id = $1 and lower(email) = $2 and status = 'pending'
-           and expires_at > now()`,
-        [access.organization.id, email],
-      );
-      const pending = existing.rows[0];
-      if (pending === undefined) throw new Error("pending invitation conflict returned no row");
-      return pending;
-    });
+    const invitation = await this.options.pool.transaction((client) =>
+      this.insertInvitation(client, { access, session, email, role: input.role }),
+    );
     await this.notifyMembershipChanged(access.organization.id);
     const summary = managerInvitationSummary(invitation, this.options.baseURL);
     await this.options.invitationMailer
@@ -633,15 +557,69 @@ export class OrganizationAccess {
           organizationId: access.organization.id,
         });
       });
-    return Response.json(summary, {
-      status: 201,
-    });
+    return Response.json(summary, { status: 201 });
+  }
+
+  private async insertInvitation(
+    client: TransactionHandle,
+    request: {
+      access: OrganizationAccessValue;
+      session: AccountSession;
+      email: string;
+      role: z.infer<typeof invitationRoleSchema>;
+    },
+  ): Promise<InvitationRow> {
+    const { access, session, email, role } = request;
+    const organizationId = access.organization.id;
+    await lockOrganizationMembershipTransitions(this.options.locks, client, organizationId);
+    await lockOrganizationMembers(client, organizationId);
+    const actorRole = await currentActorRole(client, access);
+    if (!capabilitiesFor(actorRole).manageMembers) {
+      throw new ProductRequestError(403, "forbidden");
+    }
+    const existingMember = await client.query(
+      `select 1 from member
+       join "user" on "user".id = member.user_id
+       where member.organization_id = $1 and lower("user".email) = $2
+       limit 1`,
+      [organizationId, email],
+    );
+    if (existingMember.rowCount !== 0) {
+      throw new ProductRequestError(409, "already_member");
+    }
+    await client.query(
+      `update invitation set status = 'canceled'
+       where organization_id = $1 and status = 'pending' and expires_at <= now()`,
+      [organizationId],
+    );
+    const pendingReinvite = await pendingInvitation(client, organizationId, email);
+    if (pendingReinvite !== undefined) return pendingReinvite;
+    // A genuinely new invitee reserves a seat, so the organization must both be allowed to
+    // invite at all and have a free seat. Both checks run under the membership advisory lock
+    // held by this transaction, so a burst of concurrent invites is serialized against one
+    // another. Re-inviting an existing member or pending invitee (handled above) is exempt.
+    await this.options.entitlements.requireFlag(organizationId, "canInviteMembers");
+    await this.options.entitlements.requireHeadroom(organizationId, "seats");
+    const inserted = await client.query<InvitationRow>(
+      `insert into invitation
+        (id, organization_id, email, role, status, expires_at, inviter_id, created_at)
+       values ($1, $2, $3, $4, 'pending', now() + ($6 * interval '1 hour'), $5, now())
+       on conflict (organization_id, lower(email)) where status = 'pending' do nothing
+       returning id, organization_id, '' as organization_name, '' as inviter_name,
+                 email, role, expires_at`,
+      [randomUUID(), organizationId, email, role, session.userId, INVITATION_LIFETIME_HOURS],
+    );
+    const created = inserted.rows[0];
+    if (created !== undefined) return created;
+    const pending = await pendingInvitation(client, organizationId, email);
+    if (pending === undefined) throw new Error("pending invitation conflict returned no row");
+    return pending;
   }
 
   private async cancelInvitation(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
-    const input = await parseBody(request, invitationIdBody);
-    const access = await this.requireActiveAccess(session);
+    const { organizationSlug, input } = await parseOrganizationBody(request, invitationIdBody);
+    const access = await this.requireRouteAccess(session, organizationSlug);
     await this.options.pool.transaction(async (client) => {
       await this.options.locks.withTxLock(client, invitationLockName(input.invitationId));
       await lockOrganizationMembershipTransitions(
@@ -719,8 +697,8 @@ export class OrganizationAccess {
 
   private async changeMemberRole(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
-    const input = await parseBody(request, changeRoleBody);
-    const access = await this.requireActiveAccess(session);
+    const { organizationSlug, input } = await parseOrganizationBody(request, changeRoleBody);
+    const access = await this.requireRouteAccess(session, organizationSlug);
     await this.options.pool.transaction(async (client) => {
       await lockOrganizationMembershipTransitions(
         this.options.locks,
@@ -752,8 +730,8 @@ export class OrganizationAccess {
 
   private async removeMember(request: Request): Promise<Response> {
     const session = await this.requireSession(request);
-    const input = await parseBody(request, removeMemberBody);
-    const access = await this.requireActiveAccess(session);
+    const { organizationSlug, input } = await parseOrganizationBody(request, removeMemberBody);
+    const access = await this.requireRouteAccess(session, organizationSlug);
     await this.options.pool.transaction(async (client) => {
       await lockOrganizationMembershipTransitions(
         this.options.locks,
@@ -817,10 +795,37 @@ export class OrganizationAccess {
     return session;
   }
 
-  private async requireActiveAccess(session: AccountSession): Promise<OrganizationAccessValue> {
-    const access = await this.activeAccess(this.options.pool, session);
-    if (access === undefined) throw new ProductRequestError(403, "organization_required");
+  /**
+   * The caller's access to the organization named in the address. An unknown slug and a slug the
+   * caller does not belong to answer identically, so a response cannot be used to probe which
+   * organizations exist. The active organization is never consulted.
+   */
+  private async requireRouteAccess(
+    session: AccountSession,
+    organizationSlug: string,
+  ): Promise<OrganizationAccessValue> {
+    const result = await this.options.pool.query<MembershipRow>(
+      `select member.id as member_id, organization.id as organization_id,
+              organization.name as organization_name, organization.slug as organization_slug,
+              member.role
+       from member
+       join organization on organization.id = member.organization_id
+       where member.user_id = $1 and organization.slug = $2`,
+      [session.userId, organizationSlug],
+    );
+    const row = result.rows[0];
+    const access =
+      row === undefined
+        ? undefined
+        : membershipAccess({ ...session, activeOrganizationId: row.organization_id }, [row]);
+    if (access === undefined) throw new ProductRequestError(404, "organization_unavailable");
     return access;
+  }
+
+  private async organizationTeam(request: Request): Promise<Response> {
+    const session = await this.requireSession(request);
+    const access = await this.requireRouteAccess(session, queryOrganizationSlug(request));
+    return Response.json({ team: await this.team(access) });
   }
 
   private async activeAccess(
@@ -959,6 +964,34 @@ export class OrganizationAccess {
   }
 }
 
+async function pendingInvitation(
+  client: QueryHandle,
+  organizationId: string,
+  email: string,
+): Promise<InvitationRow | undefined> {
+  const result = await client.query<InvitationRow>(
+    `select id, organization_id, '' as organization_name, '' as inviter_name,
+            email, role, expires_at
+     from invitation
+     where organization_id = $1 and lower(email) = $2 and status = 'pending'
+       and expires_at > now()`,
+    [organizationId, email],
+  );
+  return result.rows[0];
+}
+
+function invitationFields(input: {
+  invitationId: string | null;
+  invitation: InvitationRow | undefined;
+  signedOut: boolean;
+}) {
+  const { invitationId, invitation, signedOut } = input;
+  if (invitation !== undefined) {
+    return { invitation: invitationSummary(invitation, signedOut) };
+  }
+  return invitationId === null ? {} : { invitationUnavailable: true };
+}
+
 function membershipAccess(
   session: AccountSession,
   memberships: readonly MembershipRow[],
@@ -1027,17 +1060,36 @@ function managerInvitationSummary(invitation: InvitationRow, baseURL: string) {
   };
 }
 
+async function readBody(request: Request): Promise<unknown> {
+  try {
+    return await request.json();
+  } catch {
+    throw new ProductRequestError(400, "invalid_request");
+  }
+}
+
 async function parseBody<TSchema extends z.ZodType>(
   request: Request,
   schema: TSchema,
 ): Promise<z.output<TSchema>> {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    throw new ProductRequestError(400, "invalid_request");
-  }
-  const parsed = schema.safeParse(body);
+  const parsed = schema.safeParse(await readBody(request));
+  if (!parsed.success) throw new ProductRequestError(400, "invalid_request");
+  return parsed.data;
+}
+
+async function parseOrganizationBody<TSchema extends z.ZodType>(
+  request: Request,
+  schema: TSchema,
+): Promise<{ organizationSlug: string; input: z.output<TSchema> }> {
+  const parsed = splitRouteOrganization(await readBody(request), schema);
+  if (parsed === undefined) throw new ProductRequestError(400, "invalid_request");
+  return parsed;
+}
+
+function queryOrganizationSlug(request: Request): string {
+  const parsed = organizationSlugSchema.safeParse(
+    new URL(request.url).searchParams.get("organizationSlug"),
+  );
   if (!parsed.success) throw new ProductRequestError(400, "invalid_request");
   return parsed.data;
 }

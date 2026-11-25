@@ -3,8 +3,8 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import {
-  createPostgresQueryRuntime,
   createDatabase,
+  createPostgresQueryRuntime,
   testDatabaseLocks,
   testDatabaseRuntime,
 } from "../db/test-utils/runtime.js";
@@ -308,13 +308,78 @@ describe("account and organization boundary", () => {
     assert.equal(await hub.pendingInvitationCount(organizationId, bob.email), 0);
   });
 
-  it("denies every active-organization mutation without its request boundary", async () => {
+  it("denies every route-organization mutation without its request boundary", async () => {
     const hub = await startAccounts(postgres);
     const signedOut = hub.signedOut();
     const withoutOrganization = await hub.signUp("Alice", "alice@example.com");
 
-    assert.deepEqual(await signedOut.teamMutationStatuses(), [401, 401, 401, 401]);
-    assert.deepEqual(await withoutOrganization.teamMutationStatuses(), [403, 403, 403, 403]);
+    assert.deepEqual(await signedOut.teamMutationStatuses("acme"), [401, 401, 401, 401]);
+    assert.deepEqual(await withoutOrganization.teamMutationStatuses("acme"), [404, 404, 404, 404]);
+  });
+
+  it("acts on the organization in the address, whatever the active organization is", async () => {
+    const hub = await startAccounts(postgres);
+    const team = await hub.createThreePersonTeam();
+    const acme = await team.member.activeSlug();
+    const acmeId = (await team.member.requireActiveState()).organization.id;
+    const carolcoId = await team.member.createOrganization("Carolco");
+    const carolco = await team.member.activeSlug();
+    const carolMemberInCarolco = (await team.member.requireActiveState()).membership.id;
+
+    // Active organization is Carolco (owner); the address names Acme, where she is a member.
+    assert.equal(await team.member.createInvitation("dan@example.com", "member", acme), 403);
+    assert.equal(await team.member.changeRole(team.admin.memberId, "member", acme), 403);
+    assert.equal(await team.member.removeMember(team.admin.memberId, acme), 403);
+    assert.equal(await hub.pendingInvitationCount(acmeId, "dan@example.com"), 0);
+
+    // Active organization is Acme (member); the address names Carolco, where she owns.
+    await team.member.selectOrganization(acmeId);
+    assert.equal(await team.member.createInvitation("dan@example.com", "member"), 403);
+    const invitation = await team.member.invite("dan@example.com", "member", carolco);
+    assert.equal(await hub.pendingInvitationCount(carolcoId, "dan@example.com"), 1);
+    assert.equal(await hub.pendingInvitationCount(acmeId, "dan@example.com"), 0);
+    assert.equal(await team.member.cancelInvitation(invitation.id, acme), 403);
+    assert.equal(await team.member.cancelInvitation(invitation.id, carolco), 200);
+    assert.equal(await team.member.changeRole(carolMemberInCarolco, "member", carolco), 409);
+    assert.equal((await team.member.requireActiveState()).organization.slug, acme);
+  });
+
+  it("answers an unknown slug and a slug the caller does not belong to the same way", async () => {
+    const hub = await startAccounts(postgres);
+    const team = await hub.createThreePersonTeam();
+    const acme = await team.owner.activeSlug();
+    const dave = await hub.signUp("Dave", "dave@example.com");
+    await dave.createOrganization("Davesco");
+
+    const refused = { status: 404, body: { error: "organization_unavailable" } };
+    for (const slug of [acme, "no-such-organization"]) {
+      const responses = await dave.routeEndpointResponses(slug);
+      assert.equal(responses.length, 11);
+      for (const response of responses) assert.deepEqual(response, refused, slug);
+    }
+    assert.deepEqual(await dave.team(acme), { status: 404, members: 0 });
+    assert.deepEqual(await dave.team("no-such-organization"), { status: 404, members: 0 });
+  });
+
+  it("rejects a route-organization request that names no organization", async () => {
+    const hub = await startAccounts(postgres);
+    const alice = await hub.signUp("Alice", "alice@example.com");
+    await alice.createOrganization("Acme");
+
+    const responses = await alice.routeEndpointResponses(undefined);
+    for (const response of responses) {
+      assert.deepEqual(response, { status: 400, body: { error: "invalid_request" } });
+    }
+  });
+
+  it("lists a team for any member and its pending invitations only for managers", async () => {
+    const hub = await startAccounts(postgres);
+    const team = await hub.createThreePersonTeam();
+    const acme = await team.owner.activeSlug();
+    await team.owner.invite("dan@example.com", "member");
+
+    assert.deepEqual(await team.member.team(acme), { status: 200, members: 3 });
+    assert.deepEqual(await team.admin.team(acme), { status: 200, members: 3, invitations: 1 });
   });
 
   it("validates cookie mutations against the adapter's trusted request origin", async () => {
@@ -395,9 +460,10 @@ describe("account and organization boundary", () => {
     const invitation = await alice.invite("bob@example.com", "member");
     const acmeMemberId = (await alice.requireActiveState()).team.members[0]!.id;
     await alice.createOrganization("Elsewhere");
+    const elsewhere = await alice.activeSlug();
 
-    assert.equal(await alice.cancelInvitation(invitation.id), 404);
-    assert.equal(await alice.changeRole(acmeMemberId, "admin"), 404);
+    assert.equal(await alice.cancelInvitation(invitation.id, elsewhere), 404);
+    assert.equal(await alice.changeRole(acmeMemberId, "admin", elsewhere), 404);
     assert.equal(await alice.createInvitationWithTenantOverride("foreign"), 400);
     assert.deepEqual(await alice.unsupportedOrganizationPaths(), [404, 404, 404, 404, 404]);
     assert.equal((await alice.requireActiveState()).organization.id === acme, false);
@@ -699,6 +765,7 @@ class PaseoAccounts {
 
   async revokeDuringInvitation(actor: AccountBrowser, organizationId: string): Promise<number> {
     const blocker = await createPostgresQueryRuntime(this.url);
+    const slug = await actor.activeSlug();
 
     try {
       let request!: Promise<number>;
@@ -710,7 +777,7 @@ class PaseoAccounts {
          for update of member`,
           [organizationId, actor.email],
         );
-        request = actor.createInvitation("blocked@example.com", "member");
+        request = actor.createInvitation("blocked@example.com", "member", slug);
         await waitForBlockedTransaction(blocker);
         await transaction.query(
           `delete from member using "user"
@@ -924,14 +991,83 @@ class AccountBrowser {
     return (await this.post("/api/auth/paseo/select-organization", { organizationId })).status;
   }
 
-  async invite(email: string, role: "admin" | "member"): Promise<InvitationCredential> {
-    const response = await this.post("/api/auth/paseo/create-invitation", { email, role });
+  /** The slug of the organization this account is currently active in, read like the address bar. */
+  async activeSlug(): Promise<string> {
+    return (await this.requireActiveState()).organization.slug;
+  }
+
+  /** Posts to a route-organization endpoint. The slug is the address, never an inference. */
+  private async postRoute(path: string, body: object, slug?: string): Promise<Response> {
+    return this.post(path, { organizationSlug: slug ?? (await this.activeSlug()), ...body });
+  }
+
+  /** Every route-organization endpoint, called for the given slug, as status and body. */
+  async routeEndpointResponses(
+    slug: string | undefined,
+  ): Promise<Array<{ status: number; body: unknown }>> {
+    const id = randomUUID();
+    const posts: Array<[string, object]> = [
+      ["create-invitation", { email: "probe@example.com", role: "member" }],
+      ["cancel-invitation", { invitationId: id }],
+      ["change-member-role", { memberId: id, role: "member" }],
+      ["remove-member", { memberId: id }],
+      ["api-keys", { name: "Probe", scopes: ["events:send"], actor: "probe" }],
+      ["revoke-api-key", { id }],
+      ["revoke-cli-credential", { id }],
+      ["rotate-api-key-signing-secret", { id, expectedCurrentVersionId: randomUUID() }],
+      ["retire-api-key-signing-secret", { id, expectedPreviousVersionId: randomUUID() }],
+    ];
+    const query = slug === undefined ? "" : `?organizationSlug=${encodeURIComponent(slug)}`;
+    const responses = await Promise.all([
+      ...posts.map(([path, body]) =>
+        this.post(
+          `/api/auth/paseo/${path}`,
+          slug === undefined ? body : { ...body, organizationSlug: slug },
+        ),
+      ),
+      this.get(`/api/auth/paseo/api-keys${query}`),
+      this.get(`/api/auth/paseo/team${query}`),
+    ]);
+    return Promise.all(responses.map(describeResponse));
+  }
+
+  async team(slug: string): Promise<{ status: number; members: number; invitations?: number }> {
+    const response = await this.get(
+      `/api/auth/paseo/team?organizationSlug=${encodeURIComponent(slug)}`,
+    );
+    if (response.status !== 200) return { status: response.status, members: 0 };
+    const { team } = z
+      .object({
+        team: z.object({
+          members: z.array(z.unknown()),
+          invitations: z.array(z.unknown()).optional(),
+        }),
+      })
+      .parse(await response.json());
+    return {
+      status: 200,
+      members: team.members.length,
+      ...(team.invitations === undefined ? {} : { invitations: team.invitations.length }),
+    };
+  }
+
+  async invite(
+    email: string,
+    role: "admin" | "member",
+    slug?: string,
+  ): Promise<InvitationCredential> {
+    const response = await this.postRoute(
+      "/api/auth/paseo/create-invitation",
+      { email, role },
+      slug,
+    );
     assert.equal(response.status, 201);
     return z.object({ id: z.string(), link: z.string() }).parse(await response.json());
   }
 
-  async createInvitation(email: string, role: "admin" | "member"): Promise<number> {
-    return (await this.post("/api/auth/paseo/create-invitation", { email, role })).status;
+  async createInvitation(email: string, role: "admin" | "member", slug?: string): Promise<number> {
+    return (await this.postRoute("/api/auth/paseo/create-invitation", { email, role }, slug))
+      .status;
   }
 
   async createInvitationDenied(
@@ -944,7 +1080,7 @@ class AccountBrowser {
     limit: number | null;
     current: number | null;
   }> {
-    const response = await this.post("/api/auth/paseo/create-invitation", { email, role });
+    const response = await this.postRoute("/api/auth/paseo/create-invitation", { email, role });
     assert.equal(response.status, 409);
     return z
       .object({
@@ -967,7 +1103,7 @@ class AccountBrowser {
 
   async createInvitationWithTenantOverride(organizationId: string): Promise<number> {
     return (
-      await this.post("/api/auth/paseo/create-invitation", {
+      await this.postRoute("/api/auth/paseo/create-invitation", {
         email: "target@example.com",
         role: "member",
         organizationId,
@@ -975,8 +1111,9 @@ class AccountBrowser {
     ).status;
   }
 
-  async cancelInvitation(invitationId: string): Promise<number> {
-    return (await this.post("/api/auth/paseo/cancel-invitation", { invitationId })).status;
+  async cancelInvitation(invitationId: string, slug?: string): Promise<number> {
+    return (await this.postRoute("/api/auth/paseo/cancel-invitation", { invitationId }, slug))
+      .status;
   }
 
   async acceptInvitation(invitationId: string): Promise<number> {
@@ -995,12 +1132,20 @@ class AccountBrowser {
     return responses.map(({ status }) => status);
   }
 
-  async changeRole(memberId: string, role: "owner" | "admin" | "member"): Promise<number> {
+  async changeRole(
+    memberId: string,
+    role: "owner" | "admin" | "member",
+    slug?: string,
+  ): Promise<number> {
     return (
-      await this.post("/api/auth/paseo/change-member-role", {
-        memberId,
-        role,
-      })
+      await this.postRoute(
+        "/api/auth/paseo/change-member-role",
+        {
+          memberId,
+          role,
+        },
+        slug,
+      )
     ).status;
   }
 
@@ -1011,30 +1156,40 @@ class AccountBrowser {
     assert.equal(await this.changeRole(memberId, role), 200);
   }
 
-  async removeMember(memberId: string): Promise<number> {
-    return (await this.post("/api/auth/paseo/remove-member", { memberId })).status;
+  async removeMember(memberId: string, slug?: string): Promise<number> {
+    return (await this.postRoute("/api/auth/paseo/remove-member", { memberId }, slug)).status;
   }
 
   async lastOwnerRace(memberId: string): Promise<number[]> {
+    const organizationSlug = await this.activeSlug();
     const responses = await Promise.all([
-      this.post("/api/auth/paseo/change-member-role", { memberId, role: "member" }),
-      this.post("/api/auth/paseo/remove-member", { memberId }),
+      this.post("/api/auth/paseo/change-member-role", {
+        organizationSlug,
+        memberId,
+        role: "member",
+      }),
+      this.post("/api/auth/paseo/remove-member", { organizationSlug, memberId }),
     ]);
     return responses.map(({ status }) => status);
   }
 
-  async teamMutationStatuses(): Promise<number[]> {
+  async teamMutationStatuses(organizationSlug: string): Promise<number[]> {
     const responses = await Promise.all([
       this.post("/api/auth/paseo/create-invitation", {
+        organizationSlug,
         email: "target@example.com",
         role: "member",
       }),
-      this.post("/api/auth/paseo/cancel-invitation", { invitationId: randomUUID() }),
+      this.post("/api/auth/paseo/cancel-invitation", {
+        organizationSlug,
+        invitationId: randomUUID(),
+      }),
       this.post("/api/auth/paseo/change-member-role", {
+        organizationSlug,
         memberId: randomUUID(),
         role: "member",
       }),
-      this.post("/api/auth/paseo/remove-member", { memberId: randomUUID() }),
+      this.post("/api/auth/paseo/remove-member", { organizationSlug, memberId: randomUUID() }),
     ]);
     return responses.map(({ status }) => status);
   }
@@ -1100,6 +1255,11 @@ class AccountBrowser {
       headers: this.cookie.length === 0 ? {} : { cookie: this.cookie },
     });
   }
+}
+
+async function describeResponse(response: Response): Promise<{ status: number; body: unknown }> {
+  const body: unknown = await response.json();
+  return { status: response.status, body };
 }
 
 function missingResources(): ResourceIds {

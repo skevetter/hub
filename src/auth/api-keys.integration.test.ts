@@ -3,13 +3,14 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import {
-  createPostgresQueryRuntime,
   createDatabase,
+  createPostgresQueryRuntime,
   testDatabaseLocks,
   testDatabaseRuntime,
 } from "../db/test-utils/runtime.js";
 import type { Database } from "../db/types.js";
 import { createAuthServer, type AuthServer } from "./server.js";
+import type { ApiKeyScope } from "./api-key-contract.js";
 import { composeEntitlements, type ComposedEntitlements } from "./entitlements.js";
 import { z } from "zod";
 import { createHubApplication } from "../app.js";
@@ -240,57 +241,7 @@ describe("organization API-key boundary", () => {
           validStatus: 201,
         },
       ];
-      for (const operation of cases) {
-        const valid = await auth.apiKeys!.create(
-          "organization-a",
-          "user-a",
-          `valid-${operation.scope}-${randomUUID()}`,
-          [operation.scope],
-          undefined,
-          { actor: "automation" },
-        );
-        const insufficientScope =
-          operation.scope === "configuration:install" ? "runs:dispatch" : "configuration:install";
-        const insufficient = await auth.apiKeys!.create(
-          "organization-a",
-          "user-a",
-          `insufficient-${operation.scope}-${randomUUID()}`,
-          [insufficientScope],
-        );
-        const revoked = await auth.apiKeys!.create(
-          "organization-a",
-          "user-a",
-          `revoked-${operation.scope}-${randomUUID()}`,
-          [operation.scope],
-        );
-        assert.equal(await auth.apiKeys!.revoke("organization-a", revoked.summary.id), true);
-        for (const [name, credential, expected] of [
-          ["missing", undefined, 401],
-          ["malformed", "not-a-paseo-key", 401],
-          ["revoked", revoked.secret, 401],
-          ["insufficient", insufficient.secret, 403],
-          ["valid", valid.secret, operation.validStatus],
-        ] as const) {
-          const response = await application.publicApi.handle(
-            new Request(`http://localhost:3000${operation.path}`, {
-              method: "POST",
-              headers: {
-                ...(credential === undefined ? {} : { authorization: `Bearer ${credential}` }),
-                ...(operation.body === undefined ? {} : { "content-type": "application/json" }),
-              },
-              ...(operation.body === undefined ? {} : { body: JSON.stringify(operation.body) }),
-            }),
-          );
-          assert.equal(response.status, expected, `${operation.scope}: ${name}`);
-          if (expected === 401) {
-            assert.equal(
-              response.headers.get("www-authenticate"),
-              "Bearer",
-              `${operation.scope}: ${name}`,
-            );
-          }
-        }
-      }
+      for (const operation of cases) await checkOperationCredentials(application, operation);
     } finally {
       await application.hub.stop();
       await database.close();
@@ -405,7 +356,7 @@ describe("organization API-key boundary", () => {
     );
     assert.equal(select.status, 200);
     const list = await auth.handle(
-      new Request("http://localhost:3000/api/auth/paseo/api-keys", {
+      new Request("http://localhost:3000/api/auth/paseo/api-keys?organizationSlug=organization-a", {
         headers: { cookie, origin: "http://localhost:3000" },
       }),
     );
@@ -463,7 +414,11 @@ describe("organization API-key boundary", () => {
               origin: "http://localhost:3000",
               "content-type": "application/json",
             },
-            body: JSON.stringify({ name: `pool-key-${index}`, scopes: ["runs:dispatch"] }),
+            body: JSON.stringify({
+              organizationSlug: "organization-a",
+              name: `pool-key-${index}`,
+              scopes: ["runs:dispatch"],
+            }),
           }),
         ),
       ),
@@ -487,7 +442,7 @@ describe("organization API-key boundary", () => {
               origin: "http://localhost:3000",
               "content-type": "application/json",
             },
-            body: JSON.stringify({ id }),
+            body: JSON.stringify({ organizationSlug: "organization-a", id }),
           }),
         ),
       ),
@@ -497,6 +452,71 @@ describe("organization API-key boundary", () => {
       Array(concurrent).fill(200),
     );
   });
+
+  interface PublicOperation {
+    path: string;
+    scope: ApiKeyScope;
+    validStatus: number;
+    body?: object;
+  }
+
+  async function checkOperationCredentials(
+    application: ReturnType<typeof createHubApplication>,
+    operation: PublicOperation,
+  ): Promise<void> {
+    const keys = auth.apiKeys!;
+    const valid = await keys.create(
+      "organization-a",
+      "user-a",
+      `valid-${operation.scope}-${randomUUID()}`,
+      [operation.scope],
+      undefined,
+      { actor: "automation" },
+    );
+    const insufficientScope =
+      operation.scope === "configuration:install" ? "runs:dispatch" : "configuration:install";
+    const insufficient = await keys.create(
+      "organization-a",
+      "user-a",
+      `insufficient-${operation.scope}-${randomUUID()}`,
+      [insufficientScope],
+    );
+    const revoked = await keys.create(
+      "organization-a",
+      "user-a",
+      `revoked-${operation.scope}-${randomUUID()}`,
+      [operation.scope],
+    );
+    assert.equal(await keys.revoke("organization-a", revoked.summary.id), true);
+    for (const [name, credential, expected] of [
+      ["missing", undefined, 401],
+      ["malformed", "not-a-paseo-key", 401],
+      ["revoked", revoked.secret, 401],
+      ["insufficient", insufficient.secret, 403],
+      ["valid", valid.secret, operation.validStatus],
+    ] as const) {
+      const response = await application.publicApi.handle(operationRequest(operation, credential));
+      assert.equal(response.status, expected, `${operation.scope}: ${name}`);
+      if (expected === 401) {
+        assert.equal(
+          response.headers.get("www-authenticate"),
+          "Bearer",
+          `${operation.scope}: ${name}`,
+        );
+      }
+    }
+  }
+
+  function operationRequest(operation: PublicOperation, credential: string | undefined): Request {
+    const headers: Record<string, string> = {};
+    if (credential !== undefined) headers["authorization"] = `Bearer ${credential}`;
+    if (operation.body !== undefined) headers["content-type"] = "application/json";
+    return new Request(`http://localhost:3000${operation.path}`, {
+      method: "POST",
+      headers,
+      ...(operation.body === undefined ? {} : { body: JSON.stringify(operation.body) }),
+    });
+  }
 });
 
 function request(secret: string): Request {

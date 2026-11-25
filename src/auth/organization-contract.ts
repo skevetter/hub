@@ -45,6 +45,11 @@ export const organizationCapabilitiesSchema = z.object({
   manageResources: z.boolean(),
 });
 
+export const organizationTeamSchema = z.object({
+  members: z.array(teamMemberSchema),
+  invitations: z.array(managerInvitationSchema).optional(),
+});
+
 export const accountStateSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("instanceSetupRequired"),
@@ -85,16 +90,14 @@ export const accountStateSchema = z.discriminatedUnion("status", [
     membership: z.object({ id: z.string(), role: organizationRoleSchema }),
     capabilities: organizationCapabilitiesSchema,
     isInstanceOperator: z.boolean(),
-    team: z.object({
-      members: z.array(teamMemberSchema),
-      invitations: z.array(managerInvitationSchema).optional(),
-    }),
+    team: organizationTeamSchema,
     invitation: invitationSchema.optional(),
     invitationUnavailable: z.literal(true).optional(),
     canCreateOrganization: z.boolean(),
   }),
 ]);
 
+export type OrganizationTeam = z.infer<typeof organizationTeamSchema>;
 export type OrganizationRole = z.infer<typeof organizationRoleSchema>;
 export type InvitationRole = z.infer<typeof invitationRoleSchema>;
 export type OrganizationCapabilities = z.infer<typeof organizationCapabilitiesSchema>;

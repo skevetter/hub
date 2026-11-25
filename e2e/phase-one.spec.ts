@@ -67,6 +67,28 @@ test("keeps an invitation available when acceptance discovers an expired session
   await hub.proveInvitationSurvivesSessionExpiry("alice", alice, "bob", bob, "Acme");
 });
 
+test("manages the team of the organization in the address, not the active one", async ({ hub }) => {
+  await hub.signUpAs("alice", alice);
+  await hub.createOrganization("alice", "Acme");
+  await hub.inviteMember("alice", "eve@example.com", "member");
+  await hub.createAnotherOrganization("alice", "Orbit");
+
+  await hub.openTeamOf("alice", "Acme");
+  await hub.expectTeamRows("alice", {
+    membersPresent: ["Alice"],
+    membersAbsent: [],
+    invitationsPresent: ["eve@example.com"],
+  });
+  await hub.inviteOnTeamPage("alice", "gus@example.com");
+  await hub.expectSessionActiveOrganization("alice", "Orbit");
+  await hub.openTeamOf("alice", "Orbit");
+  await hub.expectTeamRows("alice", {
+    membersPresent: ["Alice"],
+    membersAbsent: [],
+    invitationsAbsent: ["eve@example.com", "gus@example.com"],
+  });
+});
+
 test("clears cached tenant state when the loaded session expires", async ({ hub }) => {
   await hub.establishLoadedTeam("alice", alice, "Acme", "pending@example.com");
   await hub.expireSession("alice");
