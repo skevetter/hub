@@ -365,30 +365,9 @@ async function resolveBootstrapOrganization(
   settings: BootstrapSettings,
   existingOrganizationId: string | null,
 ): Promise<ExistingOrganization | undefined> {
-  let resolvedOrganizationId = existingOrganizationId;
-  if (resolvedOrganizationId === null) {
-    const matchingOrganizations = await client.query<{ id: string }>(
-      `select id from organization where lower(trim(name)) = lower(trim($1)) order by id for update`,
-      [settings.organizationName],
-    );
-    if (matchingOrganizations.rows.length > 1) {
-      throw new InstanceBootstrapError(
-        "bootstrap organization name matches more than one existing organization; resolve the ambiguity before restarting",
-      );
-    }
-    if (matchingOrganizations.rows.length === 1) {
-      resolvedOrganizationId = matchingOrganizations.rows[0]!.id;
-    } else {
-      const existingOrganizations = await client.query<{ count: number }>(
-        `select count(*)::integer as count from organization`,
-      );
-      if (existingOrganizations.rows[0]?.count !== 0) {
-        throw new InstanceBootstrapError(
-          "bootstrap cannot identify the existing organization from the configured name; resolve ownership before restarting",
-        );
-      }
-    }
-  }
+  const resolvedOrganizationId =
+    existingOrganizationId ??
+    (await findBootstrapOrganizationId(client, settings.organizationName));
   if (resolvedOrganizationId === null) return undefined;
 
   const result = await client.query<ExistingOrganization>(
@@ -417,6 +396,36 @@ async function resolveBootstrapOrganization(
     );
   }
   return existingOrganization;
+}
+
+async function findBootstrapOrganizationId(
+  client: QueryHandle,
+  organizationName: string,
+): Promise<string | null> {
+  const matchingOrganizations = await client.query<{ id: string }>(
+    `select id from organization where lower(trim(name)) = lower(trim($1)) order by id for update`,
+    [organizationName],
+  );
+  if (matchingOrganizations.rows.length > 1) {
+    throw new InstanceBootstrapError(
+      "bootstrap organization name matches more than one existing organization; resolve the ambiguity before restarting",
+    );
+  }
+  if (matchingOrganizations.rows.length === 1) {
+    const [organization] = matchingOrganizations.rows;
+    if (organization === undefined)
+      throw new Error("instance setup invariant: expected the matching organization row");
+    return organization.id;
+  }
+  const existingOrganizations = await client.query<{ count: number }>(
+    `select count(*)::integer as count from organization`,
+  );
+  if (existingOrganizations.rows[0]?.count !== 0) {
+    throw new InstanceBootstrapError(
+      "bootstrap cannot identify the existing organization from the configured name; resolve ownership before restarting",
+    );
+  }
+  return null;
 }
 
 async function adoptExistingOrganization(

@@ -65,7 +65,8 @@ export class ReceiptRetention {
               (select id from candidates order by id desc limit 1) as cursor`,
       [this.cursor, this.cutoff, BATCH_SIZE, PROVIDER_EVENT_DROP_REASON_CODES],
     );
-    const batch = result.rows[0]!;
+    const [batch] = result.rows;
+    if (batch === undefined) throw new Error("receipt retention invariant: expected a batch row");
     const complete = batch.scanned < BATCH_SIZE;
     this.cursor = complete ? null : batch.cursor;
     if (complete) this.cutoff = undefined;

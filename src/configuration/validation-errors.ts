@@ -64,5 +64,5 @@ export function configurationValidationIssues(
 }
 
 function sentenceCase(message: string): string {
-  return message.length === 0 ? message : `${message[0]!.toUpperCase()}${message.slice(1)}`;
+  return `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
 }

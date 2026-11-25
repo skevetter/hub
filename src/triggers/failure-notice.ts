@@ -2,10 +2,18 @@ import { decodeEntitlementDenialFailureReason } from "../entitlements/denial.js"
 import type { Database } from "../db/types.js";
 
 export function isExecutionLimitDenial(reason: string): boolean {
+  return readExecutionLimitDenial(reason) !== undefined;
+}
+
+function readExecutionLimitDenial(reason: string) {
   const denial = decodeEntitlementDenialFailureReason(reason);
-  return (
-    denial?.entitlement === "executions.monthly" && denial.kind === "meter" && denial.limit !== null
-  );
+  if (
+    denial?.entitlement === "executions.monthly" &&
+    denial.kind === "meter" &&
+    denial.limit !== null
+  )
+    return denial;
+  return undefined;
 }
 
 export function missingBillingUrl(): Promise<string> {
@@ -18,8 +26,8 @@ export async function agentFailureNotice(
   billingUrlForOrganization: (organizationId: string) => Promise<string>,
   now = new Date(),
 ): Promise<string> {
-  if (!isExecutionLimitDenial(reason)) return `Paseo agent failed: ${reason}`;
-  const denial = decodeEntitlementDenialFailureReason(reason)!;
+  const denial = readExecutionLimitDenial(reason);
+  if (denial === undefined) return `Paseo agent failed: ${reason}`;
   const month = new Intl.DateTimeFormat("en-US", { month: "long", timeZone: "UTC" }).format(now);
   const reset = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
   const resetDay = new Intl.DateTimeFormat("en-US", {

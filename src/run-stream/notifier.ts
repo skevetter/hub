@@ -58,8 +58,7 @@ export class RunStreamNotifier {
       const merged = new Map(this.rows.map((row) => [row.seq, row]));
       for (const row of page) merged.set(row.seq, row);
       const sorted = [...merged.values()].sort((a, b) => a.seq - b.seq);
-      let start = sorted.length - 1;
-      while (start > 0 && sorted[start]!.seq === sorted[start - 1]!.seq + 1) start -= 1;
+      const start = contiguousSuffixStart(sorted);
       this.rows = sorted.slice(Math.max(start, sorted.length - 500));
     }
     return page;
@@ -87,4 +86,17 @@ export class RunStreamNotifier {
     }, 2000);
     this.timer.unref();
   }
+}
+
+function contiguousSuffixStart(sorted: readonly RunTimelineEvent[]): number {
+  let start = sorted.length - 1;
+  while (start > 0) {
+    const current = sorted[start];
+    const previous = sorted[start - 1];
+    if (current === undefined || previous === undefined)
+      throw new Error("run stream notifier invariant: expected adjacent sorted rows");
+    if (current.seq !== previous.seq + 1) break;
+    start -= 1;
+  }
+  return start;
 }

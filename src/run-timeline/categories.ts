@@ -32,7 +32,12 @@ const CATEGORIES: Readonly<Record<string, ToolCategory>> = {
 
 export function toolCategory(name: string): ToolCategory {
   if (isHubFinishExecutionToolName(name)) return "finish";
-  if (Object.hasOwn(CATEGORIES, name)) return CATEGORIES[name]!;
+  if (Object.hasOwn(CATEGORIES, name)) {
+    const category = CATEGORIES[name];
+    if (category === undefined)
+      throw new Error("timeline categories invariant: expected a category for an own name");
+    return category;
+  }
   if (name.startsWith("mcp__") || name.startsWith("mcp.") || name.includes(" / ")) return "mcp";
   return "other";
 }

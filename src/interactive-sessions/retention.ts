@@ -50,7 +50,10 @@ export class SessionMessageRetention {
         "select count(*) as count from interactive_session_commands where body is not null and created_at < $1",
         [cutoff],
       );
-      const eligible = Number(rows[0]!.count);
+      const [row] = rows;
+      if (row === undefined)
+        throw new Error("interactive session retention invariant: expected a count row");
+      const eligible = Number(row.count);
       logger.info({ eligible }, "interactive session message retention count");
       return eligible;
     }
