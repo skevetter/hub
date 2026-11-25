@@ -633,11 +633,12 @@ export class MessageWriter {
     if (admission.status === "rejected") return this.credentialRejected(lease);
 
     const expected = kind === "create" ? "creating" : lease.state;
-    const current = await budget.run(() =>
+    const row = await budget.run(() =>
       database.findRunProgressMessage(lease.organizationId, lease.triggerRunId),
     );
     budget.check();
-    if (!this.ownsLease(current, lease, expected, clock)) return {};
+    const current = this.ownedLease(row, lease, expected, clock);
+    if (current === undefined) return {};
     const observedGen = current.compensationRequestedGen;
     let outcome: MutationOutcome;
     try {
@@ -657,18 +658,20 @@ export class MessageWriter {
     }
   }
 
-  private ownsLease(
+  private ownedLease(
     current: RunProgressMessage | undefined,
     lease: RunProgressMessage,
     expected: RunProgressMessage["state"],
     clock: ProgressClock,
-  ): current is RunProgressMessage {
-    return !(
+  ): RunProgressMessage | undefined {
+    if (
       current?.leaseOwner !== this.owner ||
       current.version !== lease.version ||
       current.state !== expected ||
       (current.leaseExpiresAt?.getTime() ?? 0) <= clock.now()
-    );
+    )
+      return undefined;
+    return current;
   }
 
   private invokeMutation(
