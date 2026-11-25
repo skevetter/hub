@@ -62,6 +62,8 @@ import { canStopRun, type RunStopActor, type StopRunResult } from "../triggers/r
 import { DEFAULT_SCRIPT_LIMITS, type ScriptLimits } from "./script-limits.js";
 import {
   DEFAULT_TERMINAL_NOTIFICATION_HOLD_MS,
+  DEFAULT_TERMINAL_NOTIFICATION_STOP_GRACE_MS,
+  settlesWithin,
   TerminalNotificationLease,
 } from "./terminal-lease.js";
 
@@ -142,6 +144,8 @@ export interface DurableWorkflowEngineOptions {
   configurationRevisionId?: string;
   leaseMs?: number;
   terminalNotificationHoldMs?: number;
+  /** How long stop() waits for a terminal notification in flight before abandoning it. */
+  terminalNotificationStopGraceMs?: number;
   workerIntervalMs?: number;
   now?: () => Date;
   onWorkflowDeadlineExceeded?: (recovery: WorkflowDeadlineRecovery) => Promise<void>;
@@ -164,6 +168,8 @@ export class DurableWorkflowEngine {
   private readonly logger: Pick<Logger, "warn" | "error">;
   private readonly leaseMs: number;
   private readonly terminalNotificationHoldMs: number;
+  private readonly terminalNotificationStopGraceMs: number;
+  private readonly abandonedTerminalNotifications = new Set<Promise<void>>();
   private readonly workerIntervalMs: number;
   private readonly now: () => Date;
   private readonly scripts: ScriptStepRuntime | undefined;
@@ -180,6 +186,8 @@ export class DurableWorkflowEngine {
     this.leaseMs = options.leaseMs ?? DEFAULT_WAKEUP_LEASE_MS;
     this.terminalNotificationHoldMs =
       options.terminalNotificationHoldMs ?? DEFAULT_TERMINAL_NOTIFICATION_HOLD_MS;
+    this.terminalNotificationStopGraceMs =
+      options.terminalNotificationStopGraceMs ?? DEFAULT_TERMINAL_NOTIFICATION_STOP_GRACE_MS;
     this.workerIntervalMs = options.workerIntervalMs ?? DEFAULT_WORKER_INTERVAL_MS;
     this.now = options.now ?? (() => new Date());
     this.scripts =
@@ -239,7 +247,18 @@ export class DurableWorkflowEngine {
     await this.processing;
     await this.scripts?.stop();
     await Promise.all(this.background);
-    await this.terminalNotificationProcessing;
+    await this.awaitTerminalNotificationsOnStop();
+  }
+
+  private async awaitTerminalNotificationsOnStop(): Promise<void> {
+    const processing = this.terminalNotificationProcessing;
+    if (processing === undefined) return;
+    if (await settlesWithin(processing, this.terminalNotificationStopGraceMs)) return;
+    this.report(
+      new Error("Terminal notification handler still running at engine stop; abandoning it"),
+      "workflow.notification.terminal.stop_grace",
+      { abandonedPending: this.abandonedTerminalNotifications.size },
+    );
   }
 
   /**
@@ -1228,36 +1247,84 @@ export class DurableWorkflowEngine {
   private async recoverPendingWorkflowRunTerminalNotifications(): Promise<void> {
     const database = this.options.database;
     if (database === null) return;
+    const abandonedRunIds: string[] = [];
     while (!this.stopped) {
       const claimedAt = this.now();
       const run = await database.claimPendingWorkflowRunTerminalNotification(
         claimedAt,
         Math.min(this.leaseMs, this.terminalNotificationHoldMs),
+        abandonedRunIds,
       );
       if (run === undefined) return;
-      const lease = new TerminalNotificationLease({
-        now: this.now,
-        leaseMs: this.leaseMs,
-        deadline: claimedAt.getTime() + this.terminalNotificationHoldMs,
-        renew: (now, leaseMs) =>
-          database.renewWorkflowRunTerminalNotification(
-            run.id,
-            run.terminalNotificationGeneration,
-            now,
-            leaseMs,
-          ),
-        report: (error, operation) => this.report(error, operation, { triggerRunId: run.id }),
-      });
-      this.terminalNotificationLease = lease;
-      if (!this.stopped) lease.start();
-      try {
-        await this.options.timelineReconciler?.reconcileBeforeTerminal(run.organizationId, run.id);
-        await this.deliverClaimedTerminalNotification(database, run, lease);
-      } finally {
-        lease.stop();
-        this.terminalNotificationLease = undefined;
+      if (!(await this.processClaimedTerminalNotification(database, run, claimedAt))) {
+        abandonedRunIds.push(run.id);
       }
     }
+  }
+
+  private async processClaimedTerminalNotification(
+    database: Database,
+    run: ClaimedTerminalNotification,
+    claimedAt: Date,
+  ): Promise<boolean> {
+    const lease = new TerminalNotificationLease({
+      now: this.now,
+      leaseMs: this.leaseMs,
+      deadline: claimedAt.getTime() + this.terminalNotificationHoldMs,
+      renew: (now, leaseMs) =>
+        database.renewWorkflowRunTerminalNotification(
+          run.id,
+          run.terminalNotificationGeneration,
+          now,
+          leaseMs,
+        ),
+      report: (error, operation) => this.report(error, operation, { triggerRunId: run.id }),
+    });
+    this.terminalNotificationLease = lease;
+    if (!this.stopped) lease.start();
+    const work = this.reconcileAndDeliver(database, run, lease);
+    try {
+      const settled = await settlesWithin(work, this.terminalNotificationHoldMs);
+      if (!settled) this.abandonTerminalNotification(run, claimedAt, work);
+      return settled;
+    } finally {
+      lease.stop();
+      this.terminalNotificationLease = undefined;
+    }
+  }
+
+  private async reconcileAndDeliver(
+    database: Database,
+    run: ClaimedTerminalNotification,
+    lease: TerminalNotificationLease,
+  ): Promise<void> {
+    await this.options.timelineReconciler?.reconcileBeforeTerminal(run.organizationId, run.id);
+    await this.deliverClaimedTerminalNotification(database, run, lease);
+  }
+
+  // Provider hooks take no abort signal, so a hung one is left running. A late result is still
+  // written under the claim's generation, which a re-claim has already moved on.
+  private abandonTerminalNotification(
+    run: ClaimedTerminalNotification,
+    claimedAt: Date,
+    work: Promise<void>,
+  ): void {
+    const tracked = work
+      .catch((error: unknown) =>
+        this.report(error, "workflow.notification.terminal.abandoned", { triggerRunId: run.id }),
+      )
+      .finally(() => this.abandonedTerminalNotifications.delete(tracked));
+    this.abandonedTerminalNotifications.add(tracked);
+    this.report(
+      new Error("Terminal notification handler exceeded its time bound and was abandoned"),
+      "workflow.notification.terminal.timeout",
+      {
+        triggerRunId: run.id,
+        provider: providerNameOf(run.triggerContext),
+        elapsedMs: this.now().getTime() - claimedAt.getTime(),
+        abandonedPending: this.abandonedTerminalNotifications.size,
+      },
+    );
   }
 
   private async deliverClaimedTerminalNotification(
@@ -1596,15 +1663,20 @@ function stepUsesTriggerContext(step: CompiledAgentStep): boolean {
   );
 }
 
-function providerForTriggerContext(
-  providers: readonly TriggerProvider[],
-  triggerContext: unknown,
-): TriggerProvider | undefined {
+function providerNameOf(triggerContext: unknown): string | undefined {
   if (typeof triggerContext !== "object" || triggerContext === null) return undefined;
   if (!("provider" in triggerContext) || typeof triggerContext.provider !== "string") {
     return undefined;
   }
-  return providers.find((provider) => provider.name === triggerContext.provider);
+  return triggerContext.provider;
+}
+
+function providerForTriggerContext(
+  providers: readonly TriggerProvider[],
+  triggerContext: unknown,
+): TriggerProvider | undefined {
+  const name = providerNameOf(triggerContext);
+  return name === undefined ? undefined : providers.find((provider) => provider.name === name);
 }
 
 function composeValues(

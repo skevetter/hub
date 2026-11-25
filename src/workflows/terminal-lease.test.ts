@@ -213,7 +213,7 @@ describe("terminal notification lease", () => {
     await start(work);
     await vi.advanceTimersByTimeAsync(10_000);
     const stopping = work.engine.stop();
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(TERMINAL_LEASE_MS - 1);
     expect(await work.claim()).toBeUndefined();
     await vi.advanceTimersByTimeAsync(1);
@@ -222,6 +222,7 @@ describe("terminal notification lease", () => {
     expect(work.mark).not.toHaveBeenCalled();
     work.handler.resolve();
     await stopping;
+    await vi.advanceTimersByTimeAsync(0);
     expect(vi.getTimerCount()).toBe(0);
   });
 

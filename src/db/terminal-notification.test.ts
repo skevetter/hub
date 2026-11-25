@@ -24,6 +24,35 @@ async function claim(database: Database, claimedAt = NOW) {
 }
 
 function renewalTests(getDatabase: () => Database) {
+  it("skips excluded runs when claiming an expired lease", async () => {
+    const database = getDatabase();
+    const first = await claim(database);
+    const second = await claim(database);
+    const later = at(2 * TERMINAL_LEASE_MS);
+    const claimed = await database.claimPendingWorkflowRunTerminalNotification(
+      later,
+      TERMINAL_LEASE_MS,
+      [first.id],
+    );
+    assert.equal(claimed?.id, second.id);
+    assert.equal(claimed.terminalNotificationGeneration, second.generation + 1);
+    assert.equal(
+      await database.claimPendingWorkflowRunTerminalNotification(later, TERMINAL_LEASE_MS, [
+        first.id,
+        second.id,
+      ]),
+      undefined,
+    );
+    for (const run of [first.id, second.id]) {
+      await database.markWorkflowRunTerminalNotificationDelivered(
+        run,
+        run === first.id ? first.generation : second.generation + 1,
+        later,
+        null,
+      );
+    }
+  });
+
   it("extends a claim beyond its original expiry without changing generation", async () => {
     const database = getDatabase();
     const { id, generation } = await claim(database);
