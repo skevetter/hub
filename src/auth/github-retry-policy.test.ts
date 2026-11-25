@@ -238,6 +238,49 @@ describe("GitHub client retry and throttle policy", () => {
   });
 });
 
+describe("GitHub installation token mint retry", () => {
+  const mintAuth = (fetchImpl: () => Promise<Response>) => {
+    const mints: string[] = [];
+    const auth = createGitHubAuth({
+      appId: "12345",
+      privateKey: testPrivateKey(),
+      fetch: async (input, init) => {
+        const request =
+          input instanceof Request && init === undefined ? input : new Request(input, init);
+        mints.push(`${request.method} ${new URL(request.url).pathname}`);
+        return fetchImpl();
+      },
+    });
+    return { auth, mints };
+  };
+
+  it("mints at most once when the response is a server error", async () => {
+    const { auth, mints } = mintAuth(async () => unavailable());
+
+    await assert.rejects(auth.createInstallationOctokit(142));
+
+    assert.deepEqual(mints, ["POST /app/installations/142/access_tokens"]);
+  });
+
+  it("mints at most once when the connection fails after the request", async () => {
+    const { auth, mints } = mintAuth(async () => {
+      throw new TypeError("fetch failed");
+    });
+
+    await assert.rejects(auth.createInstallationOctokit(142));
+
+    assert.equal(mints.length, 1);
+  });
+
+  it("still retries a read of the app installation once", async () => {
+    const { auth, mints } = mintAuth(async () => unavailable());
+
+    await assert.rejects(auth.getInstallation(142));
+
+    assert.deepEqual(mints, ["GET /app/installations/142", "GET /app/installations/142"]);
+  });
+});
+
 function testPrivateKey(): string {
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   return privateKey.export({ format: "pem", type: "pkcs8" }).toString();
