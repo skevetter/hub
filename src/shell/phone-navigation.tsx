@@ -16,7 +16,7 @@ import {
 } from "../components/ui/sheet.js";
 import { useSidebar } from "../components/ui/sidebar.js";
 import { cn } from "../lib/utils.js";
-import { usePageContext } from "../navigation/index.js";
+import { useActiveDestination, usePageContext } from "../navigation/index.js";
 import { CommandSearchButton } from "./command-menu.js";
 import { NavItem, PHONE_TAB_CLASS, type NavigationItem } from "./navigation-group.js";
 
@@ -48,13 +48,14 @@ export function PhoneNavigation({
   children: ReactNode;
 }) {
   const { isMobile, openMobile, setOpenMobile } = useSidebar();
+  const active = useActiveDestination(items);
   return (
     <nav
       aria-label="Quick navigation"
       className="fixed inset-x-0 bottom-0 z-20 grid h-[var(--shell-bottom-bar)] grid-cols-5 border-t border-rail-border bg-rail pb-[var(--shell-bottom-safe-area)] md:hidden"
     >
       {items.map((item) => (
-        <NavItem key={item.to} item={item} phoneTab />
+        <NavItem key={item.to} item={item} active={item.to === active} phoneTab />
       ))}
       {isMobile ? <PhoneAttention /> : null}
       <Sheet open={isMobile && openMobile} onOpenChange={setOpenMobile}>
