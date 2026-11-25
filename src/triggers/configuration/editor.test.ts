@@ -1,11 +1,10 @@
 import { compileTriggerDocument, parseTriggerDocument } from "./index.js";
 import { matchTriggers } from "../github/match.js";
 import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
-import { agentRun } from "./schema.js";
+import { agentRun, TriggerDocumentSchema } from "./schema.js";
 import { EDITOR_EVENTS, eventDefinition } from "./events.js";
 import { describe, expect, test } from "vitest";
 import { parseDocument } from "yaml";
-import { TriggerDocumentSchema } from "./schema.js";
 import {
   changeTriggerEvent,
   createTriggerYaml,
@@ -942,15 +941,35 @@ const labelEvents = new Set([
   "github.issues",
   "github.pull_request",
 ]);
+function editableTrigger(yaml: string) {
+  const projection = projectTriggerForm(yaml);
+  if (projection.status !== "editable") throw new Error(projection.reason);
+  return projection.value;
+}
+
+function expectedTextDrops(
+  from: (typeof githubEvents)[number],
+  to: (typeof githubEvents)[number],
+  text: object,
+) {
+  const dropsText = from !== to && to === "github.push";
+  const expectedDrops = dropsText
+    ? eventDefinition(from)
+        .qualifiers.filter(({ key }) => Object.hasOwn(text, key))
+        .map(({ label }) => label)
+    : [];
+  if (labelEvents.has(from) && !labelEvents.has(to)) expectedDrops.unshift("Added label");
+  return expectedDrops;
+}
+
 test.each(githubEvents.flatMap((from) => githubEvents.map((to) => [from, to] as const)))(
   "carries GitHub matcher text rules from %s to %s when the destination supports them",
   (from, to) => {
-    const projection = projectTriggerForm(ADVANCED);
-    if (projection.status !== "editable") throw new Error(projection.reason);
+    const projection = editableTrigger(ADVANCED);
     const text = { pattern: "/run", contains: "deploy", exclude_contains: "skip" };
     const document = parseDocument(
       createTriggerYaml({
-        ...projection.value,
+        ...projection,
         event: from,
         qualifiers: { label: "ready" },
       }),
@@ -958,17 +977,11 @@ test.each(githubEvents.flatMap((from) => githubEvents.map((to) => [from, to] as 
     const sourcePath = ["on", from, "filters"];
     for (const [key, value] of Object.entries(text)) document.setIn([...sourcePath, key], value);
     const fromYaml = document.toString();
-    const authored = projectTriggerForm(fromYaml);
-    if (authored.status !== "editable") throw new Error(authored.reason);
-    const next = changeTriggerEvent(authored.value, to);
+    const authored = editableTrigger(fromYaml);
+    const next = changeTriggerEvent(authored, to);
     const dropsText = from !== to && to === "github.push";
-    const expectedDrops = dropsText
-      ? eventDefinition(from)
-          .qualifiers.filter(({ key }) => Object.hasOwn(text, key))
-          .map(({ label }) => label)
-      : [];
-    if (labelEvents.has(from) && !labelEvents.has(to)) expectedDrops.unshift("Added label");
-    expect(droppedTriggerRules(authored.value, next)).toEqual(expectedDrops);
+    const expectedDrops = expectedTextDrops(from, to, text);
+    expect(droppedTriggerRules(authored, next)).toEqual(expectedDrops);
     const saved = patchTriggerYaml(fromYaml, {
       ...next,
       qualifiers: { ...next.qualifiers, ...(labelEvents.has(to) ? { label: "ready" } : {}) },

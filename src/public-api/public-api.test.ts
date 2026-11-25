@@ -380,6 +380,15 @@ describe("public API interface", () => {
   });
 });
 
+function documentedOperation(path: string) {
+  return path === "/api/v1/projects" ||
+    path === "/api/v1/triggers" ||
+    path === "/api/v1/configuration-resources" ||
+    path === "/api/v1/setup-resources"
+    ? publicOpenApiDocument.paths?.[path]?.get
+    : publicOpenApiDocument.paths?.[path]?.post;
+}
+
 describe("generated public OpenAPI", () => {
   it("contains only public v1 operations with complete auth, scopes, statuses, and schemas", async () => {
     const temporaryDirectory = await mkdtemp(join(tmpdir(), "paseo-openapi-"));
@@ -451,13 +460,7 @@ describe("generated public OpenAPI", () => {
       "/api/v1/daemons/enrollment-tokens": ["daemons:enroll", ["201", "401", "403", "500", "503"]],
     } as const;
     for (const [path, [scope, statuses]] of Object.entries(expectations)) {
-      const operation =
-        path === "/api/v1/projects" ||
-        path === "/api/v1/triggers" ||
-        path === "/api/v1/configuration-resources" ||
-        path === "/api/v1/setup-resources"
-          ? publicOpenApiDocument.paths?.[path]?.get
-          : publicOpenApiDocument.paths?.[path]?.post;
+      const operation = documentedOperation(path);
       assert.ok(operation?.operationId);
       assert.deepEqual(operation.security, [{ bearerAuth: [] }]);
       assert.deepEqual(Reflect.get(operation, "x-required-scopes"), [scope]);
@@ -465,9 +468,7 @@ describe("generated public OpenAPI", () => {
       const documentedResponses = z
         .record(
           z.string(),
-          z
-            .object({ headers: z.object({ "X-Request-ID": z.unknown() }).passthrough() })
-            .passthrough(),
+          z.object({ headers: z.object({ "X-Request-ID": z.unknown() }).loose() }).loose(),
         )
         .parse(operation.responses);
       assert.deepEqual(Object.keys(documentedResponses).sort(), [...statuses].sort());

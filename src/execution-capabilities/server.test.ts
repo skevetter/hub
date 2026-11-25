@@ -18,22 +18,27 @@ import { createMemoryDatabase } from "../db/memory.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { createFetchServer } from "../http/node-server.js";
 import { registerResponseLifecycle, takeResponseLifecycle } from "../http/response-lifecycle.js";
-import { OutputExecutorRegistry, replyOutputTool, type OutputCapability } from "./outputs.js";
+import {
+  OutputExecutorRegistry,
+  replyOutputTool,
+  type OutputCapability,
+  type OutputExecutionInput,
+} from "./outputs.js";
 import { FinishCallRegistry } from "./finish-calls.js";
 import { createExecutionCapabilityServer } from "./server.js";
 
 const RpcResponseSchema = z
   .object({
     result: z.unknown().optional(),
-    error: z.object({ code: z.number() }).passthrough().optional(),
+    error: z.object({ code: z.number() }).loose().optional(),
   })
-  .passthrough();
-const ToolResultSchema = z.object({ isError: z.boolean().optional() }).passthrough();
+  .loose();
+const ToolResultSchema = z.object({ isError: z.boolean().optional() }).loose();
 const ToolsListSchema = z
   .object({
-    tools: z.array(z.object({ name: z.string(), inputSchema: z.unknown() }).passthrough()),
+    tools: z.array(z.object({ name: z.string(), inputSchema: z.unknown() }).loose()),
   })
-  .passthrough();
+  .loose();
 
 describe("execution capability MCP boundary", () => {
   it.each([
@@ -171,17 +176,7 @@ describe("execution capability MCP boundary", () => {
 
   it("tells the finish call registry when a finish call starts and how it ended", async () => {
     const finishCalls = new FinishCallRegistry();
-    const fixture = await capabilityFixture(
-      undefined,
-      "succeeded",
-      1,
-      undefined,
-      false,
-      [],
-      undefined,
-      [],
-      finishCalls,
-    );
+    const fixture = await capabilityFixture({ finishCalls });
     const seen: boolean[] = [];
     const original = fixture.database.transitionAgentExecution.bind(fixture.database);
     vi.spyOn(fixture.database, "transitionAgentExecution").mockImplementation(async (...args) => {
@@ -207,24 +202,14 @@ describe("execution capability MCP boundary", () => {
 
   it("records a finish call that failed to complete as failed", async () => {
     const finishCalls = new FinishCallRegistry();
-    const fixture = await capabilityFixture(
-      undefined,
-      "failed",
-      1,
-      undefined,
-      false,
-      [],
-      undefined,
-      [],
-      finishCalls,
-    );
+    const fixture = await capabilityFixture({ completionStatus: "failed", finishCalls });
     const result = await fixture.call("tools/call", { name: "finish_execution", arguments: {} });
     assert.equal(ToolResultSchema.parse(result.result).isError, true);
     assert.equal(finishCalls.ownsOutcome(fixture.executionId), false);
   });
 
   it("allows an event-native reply to be sent repeatedly without a synthetic cap", async () => {
-    const fixture = await capabilityFixture(undefined, "succeeded", null);
+    const fixture = await capabilityFixture({ maxReplies: null });
 
     for (const content of ["Starting.", "Still working.", "Done."]) {
       const response = await fixture.call("tools/call", {
@@ -242,11 +227,13 @@ describe("execution capability MCP boundary", () => {
   });
 
   it("renders the structured execution MCP contract exposed by the server", async () => {
-    const fixture = await capabilityFixture(undefined, "succeeded", 1, {
-      type: "object",
-      additionalProperties: false,
-      required: ["repo"],
-      properties: { repo: { type: "string", enum: ["paseo", "hub"] } },
+    const fixture = await capabilityFixture({
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["repo"],
+        properties: { repo: { type: "string", enum: ["paseo", "hub"] } },
+      },
     });
     const endpoint = await serveFixture(fixture);
     const client = new Client({ name: "paseo-hub-test", version: "1.0.0" });
@@ -300,7 +287,7 @@ describe("execution capability MCP boundary", () => {
 
   it("flushes a successful MCP response without reconciling the pending archive", async () => {
     let responseFinished = false;
-    const fixture = await capabilityFixture(undefined, "succeeded", 1, undefined, true);
+    const fixture = await capabilityFixture({ autoArchive: true });
     const endpoint = await serveFixture(fixture);
     const observeFinish = (_request: IncomingMessage, response: ServerResponse) => {
       response.once("finish", () => {
@@ -338,7 +325,7 @@ describe("execution capability MCP boundary", () => {
   });
 
   it("closes MCP transport on response abort while leaving the archive pending", async () => {
-    const fixture = await capabilityFixture(undefined, "succeeded", 1, undefined, true);
+    const fixture = await capabilityFixture({ autoArchive: true });
     let releaseBody!: () => void;
     const bodyRelease = new Promise<void>((resolve) => {
       releaseBody = resolve;
@@ -444,7 +431,10 @@ describe("execution capability MCP boundary", () => {
         },
       },
     };
-    const fixture = await capabilityFixture(() => Promise.resolve(), "succeeded", 1, schema);
+    const fixture = await capabilityFixture({
+      execute: () => Promise.resolve(),
+      outputSchema: schema,
+    });
     const tools = await fixture.call("tools/list");
     const tool = ToolsListSchema.parse(tools.result).tools.find(
       (candidate) => candidate.name === "finish_execution",
@@ -554,7 +544,7 @@ describe("execution capability MCP boundary", () => {
   });
 
   it("reports a failed durable completion as a tool error", async () => {
-    const fixture = await capabilityFixture(undefined, "failed");
+    const fixture = await capabilityFixture({ completionStatus: "failed" });
 
     const response = await fixture.call("tools/call", {
       name: "finish_execution",
@@ -566,15 +556,10 @@ describe("execution capability MCP boundary", () => {
   });
 
   it("keeps finish recoverable until a required output is emitted", async () => {
-    const fixture = await capabilityFixture(
-      undefined,
-      "succeeded",
-      1,
-      undefined,
-      false,
-      ["slack.reply"],
-      { ...replyOutputTool, name: "post_to_slack" },
-    );
+    const fixture = await capabilityFixture({
+      requiredOutputTypes: ["slack.reply"],
+      outputTool: { ...replyOutputTool, name: "post_to_slack" },
+    });
 
     const missing = await fixture.call("tools/call", {
       name: "finish_execution",
@@ -612,9 +597,7 @@ describe("execution capability MCP boundary", () => {
   });
 
   it("rejects a required output that has no materialized Hub capability", async () => {
-    const fixture = await capabilityFixture(undefined, "succeeded", 1, undefined, false, [
-      "manual.reply",
-    ]);
+    const fixture = await capabilityFixture({ requiredOutputTypes: ["manual.reply"] });
     const response = await fixture.server.handle(
       new Request(`https://hub.test/agent-executions/${fixture.executionId}/mcp`, {
         method: "POST",
@@ -634,22 +617,17 @@ describe("execution capability MCP boundary", () => {
   });
 
   it("guides and materializes multiple required output capabilities", async () => {
-    const fixture = await capabilityFixture(
-      undefined,
-      "succeeded",
-      1,
-      undefined,
-      false,
-      ["slack.reply", "manual.reply"],
-      { ...replyOutputTool, name: "post_to_slack" },
-      [
+    const fixture = await capabilityFixture({
+      requiredOutputTypes: ["slack.reply", "manual.reply"],
+      outputTool: { ...replyOutputTool, name: "post_to_slack" },
+      additionalCapabilities: [
         {
           type: "manual.reply",
           tool: { ...replyOutputTool, name: "send_manual_reply" },
           execute: async () => undefined,
         },
       ],
-    );
+    });
     const missing = await fixture.call("tools/call", {
       name: "finish_execution",
       arguments: {},
@@ -683,7 +661,7 @@ describe("execution capability MCP boundary", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const fixture = await capabilityFixture(async () => gate);
+    const fixture = await capabilityFixture({ execute: async () => gate });
     const first = fixture.call("tools/call", {
       name: "reply",
       arguments: { content: "first" },
@@ -717,7 +695,7 @@ describe("execution capability MCP boundary", () => {
   });
 
   it("allows replies up to the configured maximum", async () => {
-    const fixture = await capabilityFixture(() => Promise.resolve(), "succeeded", 3);
+    const fixture = await capabilityFixture({ execute: () => Promise.resolve(), maxReplies: 3 });
 
     for (const content of ["first", "second", "third"]) {
       const response = await fixture.call("tools/call", {
@@ -737,17 +715,13 @@ describe("execution capability MCP boundary", () => {
 
   it("allows a failed required reply delivery to be retried before finish", async () => {
     let attempts = 0;
-    const fixture = await capabilityFixture(
-      async () => {
+    const fixture = await capabilityFixture({
+      execute: async () => {
         attempts += 1;
         if (attempts === 1) throw new Error("delivery timeout");
       },
-      "succeeded",
-      1,
-      undefined,
-      false,
-      ["slack.reply"],
-    );
+      requiredOutputTypes: ["slack.reply"],
+    });
     const failed = await fixture.call("tools/call", {
       name: "reply",
       arguments: { content: "first" },
@@ -782,17 +756,31 @@ const slackOutputContext = {
   messageTs: "100.2",
 };
 
-async function capabilityFixture(
-  execute: (() => Promise<void>) | undefined = () => Promise.resolve(),
-  completionStatus: "succeeded" | "failed" = "succeeded",
-  maxReplies: number | null = 1,
-  outputSchema?: JsonValue,
+function finishCallOptions(finishCalls: FinishCallRegistry | undefined) {
+  return finishCalls === undefined ? {} : { finishCalls };
+}
+
+async function capabilityFixture({
+  execute = () => Promise.resolve(),
+  completionStatus = "succeeded",
+  maxReplies = 1,
+  outputSchema,
   autoArchive = false,
-  requiredOutputTypes: readonly string[] = [],
+  requiredOutputTypes = [],
   outputTool = replyOutputTool,
-  additionalCapabilities: readonly OutputCapability[] = [],
-  finishCalls?: FinishCallRegistry,
-) {
+  additionalCapabilities = [],
+  finishCalls,
+}: {
+  execute?: () => Promise<void>;
+  completionStatus?: "succeeded" | "failed";
+  maxReplies?: number | null;
+  outputSchema?: JsonValue;
+  autoArchive?: boolean;
+  requiredOutputTypes?: readonly string[];
+  outputTool?: typeof replyOutputTool;
+  additionalCapabilities?: readonly OutputCapability[];
+  finishCalls?: FinishCallRegistry;
+} = {}) {
   const database = createMemoryDatabase();
   const executionId = randomUUID();
   const token = "token";
@@ -808,7 +796,7 @@ async function capabilityFixture(
     completionTokenHash: hashAgentExecutionCompletionToken(token),
     launchIntent: intent,
   });
-  const outbound: Array<import("./outputs.js").OutputExecutionInput> = [];
+  const outbound: Array<OutputExecutionInput> = [];
   const outputs = new OutputExecutorRegistry();
   outputs.register({
     type: "slack.reply",
@@ -827,7 +815,7 @@ async function capabilityFixture(
   const server = createExecutionCapabilityServer({
     database,
     outputs,
-    ...(finishCalls === undefined ? {} : { finishCalls }),
+    ...finishCallOptions(finishCalls),
     async completeExecution(input) {
       completions.push(input);
       return (

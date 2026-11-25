@@ -330,15 +330,35 @@ describe("webhook HTTP intake", () => {
 
   it("rejects malformed, empty, invalid UTF-8, and structurally invalid JSON without invoking", async () => {
     const f = fixture();
-    const cases: [BodyInit | null, string, number, string][] = [
-      ["", "application/json", 400, "invalid_json"],
-      ["{", "application/json", 400, "invalid_json"],
-      ["", "text/plain", 400, "invalid_request"],
-      ["\ufeff", "text/plain", 400, "invalid_request"],
-      [new Uint8Array([0xc3, 0x28]), "text/plain", 400, "invalid_request"],
-      [new Uint8Array([0xff]), "application/json", 400, "invalid_request"],
-      ['{"message":5}', "application/json", 422, "invalid_input"],
-      ['{"message":null}', "application/json", 422, "invalid_input"],
+    const cases: { body: BodyInit | null; contentType: string; status: number; code: string }[] = [
+      { body: "", contentType: "application/json", status: 400, code: "invalid_json" },
+      { body: "{", contentType: "application/json", status: 400, code: "invalid_json" },
+      { body: "", contentType: "text/plain", status: 400, code: "invalid_request" },
+      { body: "\ufeff", contentType: "text/plain", status: 400, code: "invalid_request" },
+      {
+        body: new Uint8Array([0xc3, 0x28]),
+        contentType: "text/plain",
+        status: 400,
+        code: "invalid_request",
+      },
+      {
+        body: new Uint8Array([0xff]),
+        contentType: "application/json",
+        status: 400,
+        code: "invalid_request",
+      },
+      {
+        body: '{"message":5}',
+        contentType: "application/json",
+        status: 422,
+        code: "invalid_input",
+      },
+      {
+        body: '{"message":null}',
+        contentType: "application/json",
+        status: 422,
+        code: "invalid_input",
+      },
       ...[
         "null",
         "[]",
@@ -351,14 +371,14 @@ describe("webhook HTTP intake", () => {
         JSON.stringify(
           Object.fromEntries(Array.from({ length: 1001 }, (_, index) => [`k${index}`, 1])),
         ),
-      ].map((body): [BodyInit, string, number, string] => [
+      ].map((body) => ({
         body,
-        "application/json",
-        422,
-        "invalid_body",
-      ]),
+        contentType: "application/json",
+        status: 422,
+        code: "invalid_body",
+      })),
     ];
-    for (const [body, contentType, status, code] of cases)
+    for (const { body, contentType, status, code } of cases)
       await expectProblem(await f.api.handle(hook(body, { contentType })), status, code);
     assert.equal(f.calls.length, 0);
     assert.equal((await f.api.handle(hook(nested(20)))).status, 202);
@@ -636,7 +656,7 @@ describe("webhook OpenAPI contract", () => {
             content: z.record(z.string(), z.unknown()).optional(),
             headers: z.record(z.string(), z.unknown()).optional(),
           })
-          .passthrough(),
+          .loose(),
       )
       .parse(operation.responses);
     for (const status of ["200", "202"]) {
