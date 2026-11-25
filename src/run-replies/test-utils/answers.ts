@@ -62,7 +62,9 @@ export function realisticAnswers(count: number): string[] {
     const target = 1_500 + Math.floor(next() * 1_900);
     let text = `${intros[Math.floor(next() * intros.length)]}\n\n`;
     for (let guard = 0; text.length < target && guard < 60; guard += 1) {
-      const block = blocks[Math.floor(next() * blocks.length)]!(index + guard);
+      const render = blocks[Math.floor(next() * blocks.length)];
+      if (render === undefined) throw new Error("realistic answers invariant: expected a block");
+      const block = render(index + guard);
       if (text.length + block.length < 3_350) text += `${block}\n`;
     }
     text += outros[Math.floor(next() * outros.length)];

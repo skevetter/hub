@@ -26,7 +26,7 @@ export type InvocationRejection =
   | { code: "invalid_default_type"; inputName: string; expectedType: InvocationInputType }
   | { code: "invalid_default_choice"; inputName: string };
 
-const JsonPrimitiveSchema = z.union([z.string(), z.number().finite(), z.boolean(), z.null()]);
+const JsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 
 export const InvocationRejectionSchema = z.discriminatedUnion("code", [
   z
@@ -319,9 +319,12 @@ function readNextToken(
   const start = offset;
   const match = /^([a-z][a-z0-9_-]*)=([^\s]*)(?:\s+|$)/u.exec(message.slice(start));
   if (match === null) return undefined;
+  const [, name, value] = match;
+  if (name === undefined || value === undefined)
+    throw new Error("trigger invocation invariant: expected token name and value");
   return {
-    name: match[1]!,
-    value: match[2]!,
+    name,
+    value,
     end: start + match[0].length,
   };
 }

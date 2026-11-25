@@ -54,7 +54,8 @@ export class FakeAgents implements AgentConnection, AgentHistory {
 
   async send(agentId: string, messageId: string, text: string) {
     this.sends.push({ agentId, messageId, text });
-    const agent = this.snapshots.get(agentId)!;
+    const agent = this.snapshots.get(agentId);
+    if (agent === undefined) throw new Error("fake agents invariant: expected a send snapshot");
     agent.status = "running";
     await this.afterSend?.();
   }
@@ -95,14 +96,15 @@ export class FakeAgents implements AgentConnection, AgentHistory {
     event: Extract<AgentEvent, { type: "agent_stream" }>["event"],
     cursor?: { seq: number; epoch: string },
   ) {
-    const agent = this.snapshots.get(agentId)!;
-    if (
+    const agent = this.snapshots.get(agentId);
+    const finished =
       event.type === "turn_completed" ||
       event.type === "turn_canceled" ||
-      event.type === "turn_failed"
-    )
-      agent.status = "idle";
-    if (event.type === "turn_started") agent.status = "running";
+      event.type === "turn_failed";
+    if (finished || event.type === "turn_started") {
+      if (agent === undefined) throw new Error("fake agents invariant: expected a turn snapshot");
+      agent.status = finished ? "idle" : "running";
+    }
     for (const listener of this.listeners.get(agentId) ?? []) {
       listener({
         type: "agent_stream",

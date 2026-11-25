@@ -69,7 +69,10 @@ export async function recordUnsupportedLinearAdmission(
        ) retained`,
       [organizationId, UNSUPPORTED_LINEAR_RECEIPT_LIMIT + 1],
     );
-    retained = rows[0]!.count;
+    const [row] = rows;
+    if (row === undefined)
+      throw new Error("unsupported Linear invariant: expected a receipt count row");
+    retained = row.count;
     if (retained > UNSUPPORTED_LINEAR_RECEIPT_LIMIT) {
       await database.query(
         `delete from provider_event_receipts where id = (

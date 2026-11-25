@@ -73,7 +73,7 @@ function resolveSchemaAtPath(
 
   const properties = resolved["properties"];
   if (!isRecord(properties)) return undefined;
-  return resolveSchemaAtPath(properties[path[0]!], path.slice(1), root, seen);
+  return resolveSchemaAtPath(properties[String(path[0])], path.slice(1), root, seen);
 }
 
 function finiteChoices(

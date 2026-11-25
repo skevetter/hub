@@ -35,7 +35,10 @@ export function parseConnectionTemplate(
         `${path} contains unsupported interpolation ${template.slice(start, end + 2)}; expected paseo.connections.<slug>.<value>`,
       );
     }
-    references.push({ slug: match[1]!, value: match[2]! });
+    const [, slug, value] = match;
+    if (slug === undefined || value === undefined)
+      throw new Error("connection template invariant: expected connection slug and value");
+    references.push({ slug, value });
     cursor = end + 2;
   }
 

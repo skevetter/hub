@@ -53,7 +53,12 @@ export function failurePhrase(
 ): TimelineFailurePhrase {
   if (status === "timed_out") return fixed("run_timeout");
   if (typeof reason !== "string") return fixed("failed");
-  if (Object.hasOwn(REASONS, reason)) return fixed(REASONS[reason]!);
+  if (Object.hasOwn(REASONS, reason)) {
+    const code = REASONS[reason];
+    if (code === undefined)
+      throw new Error("timeline failures invariant: expected a code for an own reason");
+    return fixed(code);
+  }
   const exit = /^script exited ([0-9]+)$/u.exec(reason);
   if (exit !== null && exit[0] === reason) {
     const code = Number(exit[1]);
