@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import {
   createTimelinePostgresHarness,
@@ -17,7 +17,7 @@ import { enrollTestDaemon } from "../test-utils/project-configuration.js";
 import { compileTriggerDocument } from "../triggers/configuration/index.js";
 import { PROVIDERS, RECENT_PROVIDER_EVENTS_SQL, TRIGGER_MATCHES_SQL } from "./trigger-matches.js";
 import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
-import { FAILED_RUNS_SQL, WAITING_SESSIONS_SQL } from "./queries.js";
+import { FAILED_RUNS_SQL, MARK_FAILED_RUNS_SEEN_SQL, WAITING_SESSIONS_SQL } from "./queries.js";
 
 let pg: TimelinePostgresHarness;
 let template: AcceptedTriggerRunRecord;
@@ -45,7 +45,19 @@ beforeAll(async () => {
 
 afterAll(async () => pg?.close());
 
-async function seedRun(name: string, status: string, seconds: number) {
+interface SeededRun {
+  name: string;
+  status: string;
+  /** Seconds after `since` that the event arrived. */
+  received: number;
+  /** Seconds after `since` that the run ended; a running run has none. */
+  ended?: number;
+}
+
+const SEEDED_DELIVERY = "seed:";
+
+async function seedRun({ name, status, received, ended = received }: SeededRun) {
+  const at = (seconds: number) => new Date(since.getTime() + seconds * 1000);
   await pg.runtime.query(
     `with receipt as (
       insert into provider_event_receipts (organization_id, provider, delivery_id, source, payload, received_at)
@@ -53,81 +65,220 @@ async function seedRun(name: string, status: string, seconds: number) {
       returning id
     )
     insert into trigger_runs (organization_id, project_id, configuration_revision_id,
-      provider_event_receipt_id, configured_trigger_name, status, prompt, outcome, rejection, created_at, deadline_at)
-    select $1, $4, $5, id, $2, $6, '', case when $6 = 'rejected' then 'rejected' else 'accepted' end,
-      case when $6 = 'rejected' then '{}'::jsonb else null end, $7,
-      case when $6 = 'rejected' then null else $7::timestamptz end from receipt`,
+      provider_event_receipt_id, configured_trigger_name, status, prompt, outcome, rejection,
+      created_at, completed_at, deadline_at)
+    select $1, $4, $5, id, $9, $6, '', case when $6 = 'rejected' then 'rejected' else 'accepted' end,
+      case when $6 = 'rejected' then '{}'::jsonb else null end, $3,
+      case when $6 = 'running' then null else $7::timestamptz end,
+      case when $6 = 'rejected' then null else $8::timestamptz end from receipt`,
     [
       org,
-      name,
-      new Date(since.getTime() + seconds * 1000),
+      `${SEEDED_DELIVERY}${name}`,
+      at(received),
       template.projectId,
       template.configurationRevisionId,
       status,
+      at(ended),
       new Date("2030-01-01T00:00:00Z"),
+      name,
     ],
   );
 }
 
-it("counts failure statuses by receipt time after the exact marker and within the window", async () => {
-  await seedRun("Too old", "failed", -1);
-  await seedRun("At cutoff", "failed", 0);
-  await seedRun("Timed out", "timed_out", 1);
-  await seedRun("Newest", "rejected", 2);
-  await seedRun("Succeeded", "succeeded", 3);
-  const { database } = pg;
-  expect(await database.countFailedRunsSince(org, since, null)).toEqual({
-    count: 3,
-    newest: { triggerName: "Newest", receivedAt: new Date(since.getTime() + 2000) },
-  });
-  expect((await database.countFailedRunsSince(org, since, "2026-01-01T00:00:01Z")).count).toBe(1);
-  expect(await database.countFailedRunsSince(org, since, "2026-01-01T00:00:02Z")).toEqual({
-    count: 0,
-    newest: null,
-  });
-  expect(await database.countFailedRunsSince(otherOrg, since, null)).toEqual({
-    count: 0,
-    newest: null,
-  });
+async function clearSeededRuns() {
   await pg.runtime.query(
-    `insert into organization_triggers (organization_id, name, format, runtime_project_id)
-     values ($1, 'One', 'single_run', $2), ($1, 'Two', 'single_run', $2)`,
-    [org, template.projectId],
+    `delete from trigger_runs where provider_event_receipt_id in (
+       select id from provider_event_receipts where delivery_id like $1)`,
+    [`${SEEDED_DELIVERY}%`],
   );
-  expect(await database.countFailedRunsSince(org, since, null)).toMatchObject({
-    count: 3,
-    newest: { triggerName: "Newest" },
+  await pg.runtime.query("delete from provider_event_receipts where delivery_id like $1", [
+    `${SEEDED_DELIVERY}%`,
+  ]);
+  await pg.runtime.query("delete from account_attention_state");
+}
+
+const iso = (seconds: number) => new Date(since.getTime() + seconds * 1000).toISOString();
+
+describe("failed runs by the time they ended", () => {
+  beforeEach(clearSeededRuns);
+
+  it("counts failure statuses by end time after the exact marker and within the window", async () => {
+    await seedRun({ name: "Too old", status: "failed", received: -1 });
+    await seedRun({ name: "At cutoff", status: "failed", received: 0 });
+    await seedRun({ name: "Timed out", status: "timed_out", received: 1 });
+    await seedRun({ name: "Newest", status: "rejected", received: 2 });
+    await seedRun({ name: "Succeeded", status: "succeeded", received: 3 });
+    const { database } = pg;
+    expect(await database.countFailedRunsSince(org, since, null)).toEqual({
+      count: 3,
+      newest: { triggerName: "Newest", failedAt: new Date(iso(2)) },
+    });
+    expect((await database.countFailedRunsSince(org, since, iso(1))).count).toBe(1);
+    expect(await database.countFailedRunsSince(org, since, iso(2))).toEqual({
+      count: 0,
+      newest: null,
+    });
+    expect(await database.countFailedRunsSince(otherOrg, since, null)).toEqual({
+      count: 0,
+      newest: null,
+    });
+    await pg.runtime.query(
+      `insert into organization_triggers (organization_id, name, format, runtime_project_id)
+       values ($1, 'One', 'single_run', $2), ($1, 'Two', 'single_run', $2)`,
+      [org, template.projectId],
+    );
+    expect(await database.countFailedRunsSince(org, since, null)).toMatchObject({
+      count: 3,
+      newest: { triggerName: "Newest" },
+    });
+    await pg.runtime.query("delete from organization_triggers where name in ('One', 'Two')");
+  });
+
+  it("counts a run whose event arrived before the marker and which failed or timed out after it", async () => {
+    const { database } = pg;
+    await seedRun({ name: "Failed later", status: "failed", received: 5, ended: 20 });
+    await seedRun({ name: "Timed out later", status: "timed_out", received: 2, ended: 30 });
+    await seedRun({ name: "Failed before", status: "failed", received: 5, ended: 8 });
+    await seedRun({ name: "Rejected before", status: "rejected", received: 9 });
+    await seedRun({ name: "Still running", status: "running", received: 4, ended: 40 });
+    expect(await database.countFailedRunsSince(org, since, iso(10))).toEqual({
+      count: 2,
+      newest: { triggerName: "Timed out later", failedAt: new Date(iso(30)) },
+    });
+    expect((await database.countFailedRunsSince(org, since, iso(25))).count).toBe(1);
+    expect((await database.countFailedRunsSince(org, since, iso(30))).count).toBe(0);
+    expect((await database.countFailedRunsSince(otherOrg, since, iso(10))).count).toBe(0);
+  });
+
+  it("falls back to the creation time for a run that never recorded when it ended", async () => {
+    await seedRun({ name: "Legacy", status: "failed", received: 5, ended: 5 });
+    await pg.runtime.query(
+      "update trigger_runs set completed_at = null, created_at = $1 where configured_trigger_name = 'Legacy'",
+      [iso(12)],
+    );
+    expect(await pg.database.countFailedRunsSince(org, since, iso(10))).toMatchObject({
+      count: 1,
+      newest: { failedAt: new Date(iso(12)) },
+    });
+  });
+
+  it("moves the marker to the newest end time in the window, never past it", async () => {
+    const { database, runtime } = pg;
+    expect(await database.readFailedRunsSeenThrough("reader", org)).toBeNull();
+    await database.markFailedRunsSeen("reader", org, since);
+    expect(await database.readFailedRunsSeenThrough("reader", org)).toBeNull();
+    expect((await runtime.query("select * from account_attention_state")).rowCount).toBe(0);
+
+    await seedRun({ name: "Old failure", status: "failed", received: -5, ended: 50 });
+    await seedRun({ name: "First", status: "failed", received: 5, ended: 10 });
+    await seedRun({ name: "Second", status: "timed_out", received: 6, ended: 20 });
+    await seedRun({ name: "Still running", status: "running", received: 7, ended: 90 });
+    await Promise.all([
+      database.markFailedRunsSeen("reader", org, since),
+      database.markFailedRunsSeen("reader", org, since),
+    ]);
+    const mark = await database.readFailedRunsSeenThrough("reader", org);
+    assert.ok(mark !== null);
+    expect(Date.parse(mark)).toBe(since.getTime() + 20_000);
+    expect((await runtime.query("select * from account_attention_state")).rowCount).toBe(1);
+    expect((await database.countFailedRunsSince(org, since, mark)).count).toBe(0);
+
+    await seedRun({ name: "Fails after the click", status: "failed", received: 6, ended: 21 });
+    expect(await database.countFailedRunsSince(org, since, mark)).toMatchObject({
+      count: 1,
+      newest: { triggerName: "Fails after the click" },
+    });
+    await database.markFailedRunsSeen("reader", org, since);
+    const advanced = await database.readFailedRunsSeenThrough("reader", org);
+    assert.ok(advanced !== null);
+    expect(Date.parse(advanced)).toBe(since.getTime() + 21_000);
+    await database.markFailedRunsSeen("reader", org, new Date(since.getTime() + 60_000));
+    expect(await database.readFailedRunsSeenThrough("reader", org)).toBe(advanced);
+  });
+
+  it("keeps the marker scoped to one account and one organization", async () => {
+    const { database } = pg;
+    await seedRun({ name: "Scoped", status: "failed", received: 5, ended: 10 });
+    await database.markFailedRunsSeen("reader", org, since);
+    await database.markFailedRunsSeen("reader", otherOrg, since);
+    expect(await database.readFailedRunsSeenThrough("reader", otherOrg)).toBeNull();
+    expect(await database.readFailedRunsSeenThrough("owner", org)).toBeNull();
+    const mark = await database.readFailedRunsSeenThrough("reader", org);
+    assert.ok(mark !== null);
+    expect((await database.countFailedRunsSince(org, since, null)).count).toBe(1);
+    expect((await database.countFailedRunsSince(org, since, mark)).count).toBe(0);
   });
 });
 
-it("stores one marker for each account and organization using database time", async () => {
-  const { database, runtime } = pg;
-  const before = await runtime.query<{ now: Date }>("select clock_timestamp() as now");
-  expect(await database.readFailedRunsSeenThrough("reader", org)).toBeNull();
-  await Promise.all([
-    database.markFailedRunsSeen("reader", org),
-    database.markFailedRunsSeen("reader", org),
-  ]);
-  const after = await runtime.query<{ now: Date }>("select clock_timestamp() as now");
-  const mark = await database.readFailedRunsSeenThrough("reader", org);
-  assert.ok(mark !== null && before.rows[0] && after.rows[0]);
-  expect(Date.parse(mark)).toBeGreaterThanOrEqual(before.rows[0].now.getTime());
-  expect(Date.parse(mark)).toBeLessThanOrEqual(after.rows[0].now.getTime());
-  expect((await runtime.query("select * from account_attention_state")).rowCount).toBe(1);
-  expect(await database.readFailedRunsSeenThrough("reader", otherOrg)).toBeNull();
-  expect(await database.readFailedRunsSeenThrough("owner", org)).toBeNull();
-  expect((await database.countFailedRunsSince(org, since, mark)).count).toBe(0);
-});
+describe("the in-memory marker", () => {
+  async function acceptedRun(database: Database, name: string) {
+    const project = await database.createProject({
+      organizationId: org,
+      name,
+      slug: name,
+      createdByUserId: null,
+    });
+    const revision = await database.insertProjectConfigurationRevision({
+      projectId: project.id,
+      sourceKind: "manual",
+      sourceEvidence: { kind: "test" },
+      normalizedConfiguration: { environments: [], triggers: [] },
+      contentHash: name,
+    });
+    await database.activateProjectConfigurationRevision(project.id, revision.id, []);
+    const receipt = await database.persistManualEvent({
+      organizationId: org,
+      projectId: project.id,
+      deliveryId: randomUUID(),
+      source: "manual.run",
+      payload: {},
+      receivedAt: new Date(since.getTime() + 5000),
+    });
+    assert.equal(receipt.status, "accepted");
+    const { run } = await database.createAcceptedTriggerRun({
+      organizationId: org,
+      projectId: project.id,
+      configurationRevisionId: revision.id,
+      providerEventReceiptId: receipt.event.providerEventReceiptId,
+      configuredTriggerName: name,
+      prompt: "",
+      inputs: {},
+      triggerContext: {},
+      outputContext: {},
+      deadlineAt: new Date(since.getTime() + 3_600_000),
+      stepIds: ["work"],
+    });
+    return run;
+  }
 
-it("models a monotonic scoped marker in memory", async () => {
-  let now = since;
-  const database = createMemoryDatabase({ now: () => now });
-  await database.markFailedRunsSeen("reader", org);
-  now = new Date(since.getTime() - 1000);
-  await database.markFailedRunsSeen("reader", org);
-  expect(await database.readFailedRunsSeenThrough("reader", org)).toBe(since.toISOString());
-  expect(await database.readFailedRunsSeenThrough("reader", otherOrg)).toBeNull();
-  expect(await database.readFailedRunsSeenThrough("owner", org)).toBeNull();
+  it("is scoped, monotonic and follows when runs end", async () => {
+    let now = new Date(since.getTime() + 10_000);
+    const database = createMemoryDatabase({ now: () => now });
+    const early = await acceptedRun(database, "early");
+    const late = await acceptedRun(database, "late");
+    await database.markFailedRunsSeen("reader", org, since);
+    expect(await database.readFailedRunsSeenThrough("reader", org)).toBeNull();
+
+    await database.failWorkflowRun(early.id, "failed", "Fixture", "work");
+    now = new Date(since.getTime() + 20_000);
+    await database.markFailedRunsSeen("reader", org, since);
+    const mark = await database.readFailedRunsSeenThrough("reader", org);
+    expect(mark).toBe(iso(10));
+    expect((await database.countFailedRunsSince(org, since, mark)).count).toBe(0);
+    expect(await database.readFailedRunsSeenThrough("reader", otherOrg)).toBeNull();
+    expect(await database.readFailedRunsSeenThrough("owner", org)).toBeNull();
+
+    now = new Date(since.getTime() + 30_000);
+    await database.failWorkflowRun(late.id, "timed_out", "Fixture", "work");
+    expect(await database.countFailedRunsSince(org, since, mark)).toMatchObject({
+      count: 1,
+      newest: { triggerName: "late", failedAt: new Date(iso(30)) },
+    });
+    await database.markFailedRunsSeen("reader", org, since);
+    expect(await database.readFailedRunsSeenThrough("reader", org)).toBe(iso(30));
+    await database.markFailedRunsSeen("reader", org, new Date(since.getTime() + 60_000));
+    expect(await database.readFailedRunsSeenThrough("reader", org)).toBe(iso(30));
+  });
 });
 
 async function seedSessions() {
@@ -234,6 +385,14 @@ it("uses indexed receipt and run lookups for a selective attention window", asyn
   const output = plan.rows.map((row) => row["QUERY PLAN"]).join("\n");
   expect(output).toContain("provider_event_receipts_organization_received_idx");
   expect(output).toContain("trigger_runs_receipt_project_configured_unique");
+  const markPlan = await runtime.query(`explain ${MARK_FAILED_RUNS_SEEN_SQL}`, [
+    "reader",
+    org,
+    since,
+    [...FAILED_RUN_STATUSES],
+  ]);
+  const markOutput = markPlan.rows.map((row) => row["QUERY PLAN"]).join("\n");
+  expect(markOutput).toContain("provider_event_receipts_organization_received_idx");
   const sessionsPlan = await runtime.query(`explain (analyze, buffers) ${WAITING_SESSIONS_SQL}`, [
     org,
     "reader",

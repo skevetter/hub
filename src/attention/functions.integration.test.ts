@@ -85,6 +85,23 @@ it("counts only the active tenant's failures and drops them after Mark seen", as
   }
 });
 
+it("counts a run whose event arrived before Mark seen and which fails after it", async () => {
+  const { database, organizationId, request, slug } = fixture;
+  const running = await seedRunningRun(database, organizationId, "Slow job");
+  await seedFailedRun(database, organizationId, "Quick job");
+  expect(await markSeen(request("POST", origin), slug)).toEqual({ status: "ok", data: null });
+  expect(await snapshot(request(), slug)).toMatchObject({ status: "ok", data: { items: [] } });
+
+  await failRun(database, running);
+  const after = await snapshot(request(), slug);
+  assert.equal(after.status, "ok");
+  expect(after.data.items).toMatchObject([{ id: "runs:failed", title: "1 run failed" }]);
+  expect(after.data.items[0]?.detail).toContain("Slow job");
+
+  expect(await markSeen(request("POST", origin), slug)).toEqual({ status: "ok", data: null });
+  expect(await snapshot(request(), slug)).toMatchObject({ status: "ok", data: { items: [] } });
+});
+
 it("acts only on the organization in the address when the session's active organization differs", async () => {
   const { accountId, database, organizationId, request, runtime } = fixture;
   const [addressed, other] = ["pin-addressed", "pin-other"];
@@ -119,10 +136,21 @@ it("acts only on the organization in the address when the session's active organ
 });
 
 async function seedFailedRun(database: Database, organizationId: string, name: string) {
+  await failRun(database, await seedRunningRun(database, organizationId, name));
+}
+
+async function failRun(database: Database, runId: string) {
+  assert.equal(
+    (await database.failWorkflowRun(runId, "failed", "Fixture failure", "work"))?.transitioned,
+    true,
+  );
+}
+
+async function seedRunningRun(database: Database, organizationId: string, name: string) {
   const project = await database.createProject({
     organizationId,
     name,
-    slug: "project",
+    slug: `project-${name.toLowerCase().replaceAll(/\W+/gu, "-")}`,
     createdByUserId: null,
   });
   const revision = await database.insertProjectConfigurationRevision({
@@ -156,10 +184,7 @@ async function seedFailedRun(database: Database, organizationId: string, name: s
     deadlineAt: new Date(Date.now() + 60_000),
     stepIds: ["work"],
   });
-  assert.equal(
-    (await database.failWorkflowRun(run.id, "failed", "Fixture failure", "work"))?.transitioned,
-    true,
-  );
+  return run.id;
 }
 
 async function startInstance() {
