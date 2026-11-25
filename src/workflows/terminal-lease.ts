@@ -7,6 +7,21 @@ interface TerminalLeaseOptions {
 }
 
 export const DEFAULT_TERMINAL_NOTIFICATION_HOLD_MS = 5 * 60_000;
+export const DEFAULT_TERMINAL_NOTIFICATION_STOP_GRACE_MS = 10_000;
+
+/** Resolves true when the work settles in time and false at the deadline; the work is not cancelled. */
+export async function settlesWithin(work: Promise<void>, ms: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<false>((resolve) => {
+    timer = setTimeout(resolve, ms, false);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([work.then(() => true as const), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export class TerminalNotificationLease {
   private timer: NodeJS.Timeout | undefined;

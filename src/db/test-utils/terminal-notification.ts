@@ -5,7 +5,11 @@ import type { Database } from "../types.js";
 export const TERMINAL_TEST_ORG = "terminal-notification";
 export const TERMINAL_LEASE_MS = 30_000;
 
-export async function seedTerminalNotification(database: Database, now: Date) {
+export async function seedTerminalNotification(
+  database: Database,
+  now: Date,
+  triggerContext: Record<string, string> = {},
+) {
   const project = await database.createProject({
     organizationId: TERMINAL_TEST_ORG,
     name: "Terminal notification",
@@ -37,7 +41,7 @@ export async function seedTerminalNotification(database: Database, now: Date) {
     configuredTriggerName: "terminal",
     prompt: "",
     inputs: {},
-    triggerContext: {},
+    triggerContext,
     outputContext: {},
     deadlineAt: new Date(now.getTime() + 3_600_000),
     stepIds: ["work"],

@@ -1667,7 +1667,11 @@ class PgDatabase implements Database {
     );
   }
 
-  async claimPendingWorkflowRunTerminalNotification(now: Date, leaseMs: number) {
+  async claimPendingWorkflowRunTerminalNotification(
+    now: Date,
+    leaseMs: number,
+    excludedRunIds: readonly string[] = [],
+  ) {
     try {
       return await this.pool.transaction(async (client) => {
         const selected = await client.query<TriggerRunRow>(
@@ -1675,6 +1679,7 @@ class PgDatabase implements Database {
          where outcome = 'accepted'
            and status <> 'running'
            and payload_expiry_state is null
+           and not (id = any($2::uuid[]))
            and terminal_notification_pending_at is not null
            and terminal_notification_delivered_at is null
            and (
@@ -1683,7 +1688,7 @@ class PgDatabase implements Database {
            )
          order by terminal_notification_pending_at, id
          for update skip locked limit 1`,
-          [now],
+          [now, excludedRunIds],
         );
         const run = selected.rows[0];
         if (run === undefined) {

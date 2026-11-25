@@ -4160,10 +4160,15 @@ class MemoryDatabase implements Database {
     }
   }
 
-  async claimPendingWorkflowRunTerminalNotification(now: Date, leaseMs: number) {
+  async claimPendingWorkflowRunTerminalNotification(
+    now: Date,
+    leaseMs: number,
+    excludedRunIds: readonly string[] = [],
+  ) {
     const candidate = Array.from(this.triggerRuns.values())
       .filter(
         (run): run is AcceptedTriggerRunRecord =>
+          !excludedRunIds.includes(run.id) &&
           run.outcome === "accepted" &&
           run.status !== "running" &&
           run.payloadExpiredAt == null &&

@@ -1601,6 +1601,7 @@ export interface Database
   claimPendingWorkflowRunTerminalNotification(
     now: Date,
     leaseMs: number,
+    excludedRunIds?: readonly string[],
   ): Promise<(AcceptedTriggerRunRecord & { terminalNotificationGeneration: number }) | undefined>;
   ownsWorkflowRunTerminalNotification(triggerRunId: string, generation: number): Promise<boolean>;
   renewWorkflowRunTerminalNotification(
