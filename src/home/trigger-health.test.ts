@@ -1,9 +1,20 @@
 import assert from "node:assert/strict";
-import { describe, it } from "vitest";
-import { runState } from "../components/app/state-label.js";
+import { afterEach, describe, it, vi } from "vitest";
+import type * as StateLabel from "../components/app/state-label.js";
+import { runState, type StateView } from "../components/app/state-label.js";
 import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import type { HomeSnapshot } from "./dashboard.js";
 import { triggerHealth } from "./trigger-health.js";
+
+const toneOverride = vi.hoisted(() => new Map<string, StateView>());
+vi.mock("../components/app/state-label.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof StateLabel>();
+  return {
+    ...actual,
+    runState: (status: string) => toneOverride.get(status) ?? actual.runState(status),
+  };
+});
+afterEach(() => toneOverride.clear());
 
 type Status = NonNullable<HomeSnapshot["triggerRuns"][number]["latest"]>["status"];
 
@@ -52,6 +63,17 @@ describe("trigger health", () => {
       assert.equal(health.latestFailure !== null, red);
     },
   );
+
+  it("follows the state a row shows, so a status that turns red is counted and listed first", () => {
+    toneOverride.set("canceled", { label: "Canceled", tone: "attention" });
+    const health = triggerHealth({
+      triggers: [trigger("fine"), trigger("odd", true, "Odd")],
+      triggerRuns: [runs("fine", "succeeded", "2026-11-24T12:00:00.000Z"), runs("odd", "canceled")],
+    });
+    assert.equal(health.failing, 1);
+    assert.equal(health.rows[0]?.id, "odd");
+    assert.equal(health.latestFailure?.triggerName, "Odd");
+  });
 
   it("shows the window's failed tally for exactly the statuses that turn a row red", () => {
     assert.ok(EVERY_STATUS_LISTED);
