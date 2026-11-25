@@ -90,18 +90,25 @@ export class OrganizationHome {
     await expect(this.page).toHaveURL(/\/triggers\/new\/edit$/u);
   }
 
-  async expectRuns(count: number, outcomes: string) {
-    const tile = this.page.getByText("Runs, 24 hours", { exact: true }).locator("..").locator("..");
-    await expect(tile).toContainText(String(count));
-    await expect(tile).toContainText(outcomes);
+  figures() {
+    return this.page.getByRole("group", { name: "Overview", exact: true });
   }
 
-  async expectRecentRun(triggerName: string, status: string) {
-    const row = this.page
-      .getByRole("list", { name: "Recent runs" })
+  /** The figure that counts the unit, for example "triggers failing", read as its numeral. */
+  async expectFigure(unit: string, value: number) {
+    const figure = this.figures().locator("[data-slot=figure]").filter({ hasText: unit });
+    await expect(figure.locator("span").first()).toHaveText(String(value));
+  }
+
+  triggerRow(triggerName: string): Locator {
+    return this.page
+      .getByRole("list", { name: "Trigger health" })
       .getByRole("listitem")
       .filter({ hasText: triggerName });
-    await expect(row).toContainText(status);
+  }
+
+  async expectTrigger(triggerName: string, state: string) {
+    await expect(this.triggerRow(triggerName)).toContainText(state);
   }
 
   async capture(path: string) {

@@ -9,6 +9,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { useActiveAccount } from "../auth/active-account.js";
 import { Card, CardSkeleton } from "../components/app/card.js";
+import { FigureSkeleton, Figures } from "../components/app/figure.js";
 import {
   Checklist,
   ChecklistItem,
@@ -17,18 +18,12 @@ import {
 } from "../components/app/checklist.js";
 import { CopyField } from "../components/app/copy-field.js";
 import { Disclosure } from "../components/app/disclosure.js";
-import { EmptyState } from "../components/app/empty-state.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
 import { PageHeader } from "../components/app/page.js";
-import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
 import { SegmentedControl } from "../components/app/segmented-control.js";
-import { StatGrid, StatTile, StatTileSkeleton } from "../components/app/stat-tile.js";
-import { StateBlock } from "../components/app/state-block.js";
-import { runState } from "../components/app/state-label.js";
 import { StatusPill, type StatusTone } from "../components/app/status-pill.js";
-import { TwoLine } from "../components/app/two-line.js";
 import { Button } from "../components/ui/button.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "../daemons/handoff.js";
@@ -38,7 +33,6 @@ import {
   sessionProfileQueryOptions,
 } from "../interactive-sessions/ui/new-session.js";
 import { useRouteTenant } from "../projects/context.js";
-import { EDITOR_EVENTS, eventDefinition, isEditorEvent } from "../triggers/configuration/events.js";
 import {
   canFinishSetup,
   deriveChecklist,
@@ -47,15 +41,13 @@ import {
   type ChecklistStep,
   type ProfileAvailability,
 } from "./checklist.js";
-import type { RunTally } from "./dashboard.js";
 import { finishHomeSetup, homeSnapshot, type HomeSnapshot } from "./functions.js";
-import { HOME_MONTH_DAYS } from "./limits.js";
 import { memberFlagKey, useMemberFlag } from "./member-preference.js";
+import { HomeOverview } from "./overview.js";
 import { thingsToTry, type TrySurface, type TrySurfaceKey } from "./things-to-try.js";
 
-const HOME_DESCRIPTION = "What is running and what to try next.";
+const HOME_DESCRIPTION = "Whether your triggers are working, and what to try next.";
 const HOME_HEADING_ID = "home-heading";
-const RECENT_RUNS_SHOWN = 5;
 
 export function HomePanel() {
   const tenant = useRouteTenant();
@@ -166,9 +158,6 @@ function HomeContent({
   const base = `/o/${data.organization.slug}`;
   return (
     <>
-      <Section>
-        <HomeTiles data={data} />
-      </Section>
       {data.checklistCompletedAt === null ? (
         <HomeChecklist
           snapshot={data}
@@ -180,6 +169,7 @@ function HomeContent({
           onFinished={onFinished}
         />
       ) : null}
+      <HomeOverview data={data} base={base} />
       {profiles === null ? null : <HomeSessionStart organizationSlug={data.organization.slug} />}
       <ThingsToTry
         snapshot={data}
@@ -187,77 +177,7 @@ function HomeContent({
         profiles={profiles}
         canManageProfiles={canManageProfiles}
       />
-      <HomeRecentRuns data={data} base={base} />
     </>
-  );
-}
-
-function HomeRecentRuns({ data, base }: { data: HomeSnapshot; base: string }) {
-  return (
-    <Section
-      title="Recent runs"
-      description={`The last ${String(data.windowDays)} days.`}
-      action={
-        <Button variant="link" asChild>
-          <Link to={`${base}/activity` as never}>View all</Link>
-        </Button>
-      }
-    >
-      {data.runs.length === 0 ? (
-        <EmptyState title="No recent runs" />
-      ) : (
-        <RecordList label="Recent runs">
-          {data.runs.slice(0, RECENT_RUNS_SHOWN).map((run) => (
-            <RecordRow key={run.id} lead={<StateBlock state={runState(run.status)} />}>
-              <TwoLine
-                primary={run.triggerName}
-                secondary={
-                  <>
-                    {run.payloadExpiredAt == null
-                      ? runSourceLabel(run.source)
-                      : "Run payload expired"}
-                    {" \u00b7 "}
-                    <RelativeTime value={run.receivedAt} />
-                  </>
-                }
-              />
-            </RecordRow>
-          ))}
-        </RecordList>
-      )}
-    </Section>
-  );
-}
-
-/**
- * The figures a reader checks first. Runs are counted over rolling windows because the server
- * does not know the reader's midnight.
- */
-function HomeTiles({ data }: { data: HomeSnapshot }) {
-  const enabled = data.triggers.filter((trigger) => trigger.enabled).length;
-  return (
-    <StatGrid columns={4}>
-      <StatTile
-        label="Runs, 24 hours"
-        value={String(data.runCounts.day.total)}
-        detail={runOutcomes(data.runCounts.day)}
-      />
-      <StatTile
-        label={`Runs, ${String(HOME_MONTH_DAYS)} days`}
-        value={String(data.runCounts.month.total)}
-        detail={runOutcomes(data.runCounts.month)}
-      />
-      <StatTile
-        label="Active triggers"
-        value={String(enabled)}
-        detail={triggerDetail(data.triggers.length, enabled)}
-      />
-      <StatTile
-        label="Daemons connected"
-        value={String(data.daemons.filter(({ presence }) => presence === "connected").length)}
-        detail={daemonDetail(data.daemons)}
-      />
-    </StatGrid>
   );
 }
 
@@ -265,11 +185,11 @@ function HomeLoading() {
   return (
     <div role="group" aria-busy="true" aria-label="Loading Home">
       <div className="grid gap-8">
-        <StatGrid columns={4}>
-          {Array.from({ length: 4 }, (_, position) => (
-            <StatTileSkeleton key={position} />
+        <Figures label="Loading overview">
+          {Array.from({ length: 3 }, (_, position) => (
+            <FigureSkeleton key={position} />
           ))}
-        </StatGrid>
+        </Figures>
         <CardSkeleton lines={4} />
         <CardSkeleton lines={3} />
       </div>
@@ -797,27 +717,4 @@ export function runHint(triggers: HomeSnapshot["triggers"]): string {
     }
   }
   return [...hints].join(" ");
-}
-
-function runSourceLabel(source: string): string {
-  if (isEditorEvent(source)) return eventDefinition(source).label;
-  // An issue receipt can match either of the Linear issue events.
-  if (source === "linear.issue") return "Linear issue event";
-  const event = EDITOR_EVENTS.find((id) => eventDefinition(id).receiptSource === source);
-  return event === undefined ? source : eventDefinition(event).label;
-}
-
-function runOutcomes({ succeeded, failed }: RunTally): string {
-  return `${String(succeeded)} succeeded \u00b7 ${String(failed)} failed`;
-}
-
-function triggerDetail(total: number, enabled: number): string {
-  if (total === 0) return "None yet";
-  const paused = total - enabled;
-  return paused === 0 ? "None paused" : `${String(paused)} paused`;
-}
-
-function daemonDetail(daemons: HomeSnapshot["daemons"]): string {
-  const cannot = daemons.filter(({ canExecute }) => !canExecute).length;
-  return `${String(daemons.length)} enrolled${cannot === 0 ? "" : ` \u00b7 ${String(cannot)} cannot run agents`}`;
 }

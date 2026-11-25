@@ -6,32 +6,25 @@ import type {
   Database,
   DaemonRecord,
   OrganizationConnectionUsage,
-  OrganizationRunCount,
   OrganizationRunRecord,
   OrganizationTriggerRecord,
   OrganizationTriggerRevisionRecord,
+  TriggerRunSummary,
 } from "../db/types.js";
 import { resolveRouteTenant } from "../projects/access.js";
 import { linearConnectionRequiresReauthorization } from "../providers/linear/client.js";
 import { hasRequiredSlackScopes } from "../providers/slack/client.js";
 import { projectTriggerForm } from "../triggers/configuration/editor.js";
-import { FAILED_RUN_STATUSES } from "../triggers/run-status.js";
 import { matchGitHubInvocations } from "../triggers/github/match.js";
 import { matchLinearInvocations } from "../triggers/linear/match.js";
 import { incompleteSetupStepTitles, SETUP_INCOMPLETE } from "./checklist.js";
-import { HOME_MONTH_DAYS } from "./limits.js";
 import { commentExamples, isTryCommentEvent } from "./things-to-try.js";
 
 /** How far back the overview looks. One week is long enough to hold a first run. */
 const HOME_WINDOW_DAYS = 7;
-const RUNS_SHOWN = 50;
+/** Setup only asks whether a run happened, and which one was last. */
+const LATEST_RUNS = 1;
 const DAY_MS = 86_400_000;
-
-export interface RunTally {
-  total: number;
-  succeeded: number;
-  failed: number;
-}
 
 export interface HomeSnapshot {
   organization: { id: string; name: string; slug: string };
@@ -64,9 +57,18 @@ export interface HomeSnapshot {
       commentPrefix: string | null;
     }[];
   }[];
+  /**
+   * One entry per trigger when the reader may see run health: the window's tally, and how the
+   * trigger's newest run ever ended. Empty when the snapshot is only read for setup.
+   */
+  triggerRuns: readonly {
+    triggerId: string;
+    total: number;
+    failed: number;
+    latest: { id: string; status: OrganizationRunRecord["status"]; startedAt: string } | null;
+  }[];
+  /** The newest runs in the window; setup only asks whether one happened. */
   runs: readonly (Omit<OrganizationRunRecord, "receivedAt"> & { receivedAt: string })[];
-  /** Every run in the last 24 hours and the last `HOME_MONTH_DAYS` days, not only the ones listed. */
-  runCounts: { day: RunTally; month: RunTally };
   /** Whether the reader started or joined a session. Null means Sessions is off. */
   sessionStarted: boolean | null;
   windowDays: number;
@@ -134,38 +136,22 @@ export class HomeDashboard {
     const now = this.now().getTime();
     const since = new Date(now - HOME_WINDOW_DAYS * DAY_MS);
     const triggers = await this.database.listOrganizationTriggers(organizationId);
-    const [
-      connections,
-      daemons,
-      revisions,
-      runs,
-      dayRuns,
-      monthRuns,
-      sessionStarted,
-      checklistCompletedAt,
-    ] = await Promise.all([
-      this.database.organizationConnectionUsage(organizationId),
-      this.database.listDaemonsForOrganization(organizationId),
-      Promise.all(
-        triggers.map((trigger) =>
-          this.database.findOrganizationTriggerRevision(trigger.id, trigger.activeRevisionId),
-        ),
-      ),
-      this.database.listOrganizationRunsSince(organizationId, since, RUNS_SHOWN),
-      reader === null
-        ? []
-        : this.database.countOrganizationRunsSince(organizationId, new Date(now - DAY_MS)),
-      reader === null
-        ? []
-        : this.database.countOrganizationRunsSince(
-            organizationId,
-            new Date(now - HOME_MONTH_DAYS * DAY_MS),
+    const [connections, daemons, revisions, runs, summaries, sessionStarted, checklistCompletedAt] =
+      await Promise.all([
+        this.database.organizationConnectionUsage(organizationId),
+        this.database.listDaemonsForOrganization(organizationId),
+        Promise.all(
+          triggers.map((trigger) =>
+            this.database.findOrganizationTriggerRevision(trigger.id, trigger.activeRevisionId),
           ),
-      reader !== null && this.options.interactiveSessions === true
-        ? this.database.hasOwnInteractiveSession(reader)
-        : null,
-      this.database.getHomeChecklistCompletedAt(organizationId),
-    ]);
+        ),
+        this.database.listOrganizationRunsSince(organizationId, since, LATEST_RUNS),
+        reader === null ? [] : this.database.summarizeTriggerRuns(organizationId, since),
+        reader !== null && this.options.interactiveSessions === true
+          ? this.database.hasOwnInteractiveSession(reader)
+          : null,
+        this.database.getHomeChecklistCompletedAt(organizationId),
+      ]);
     return {
       organization,
       checklistCompletedAt: checklistCompletedAt?.toISOString() ?? null,
@@ -173,8 +159,8 @@ export class HomeDashboard {
       connections: snapshotConnections(connections),
       daemons: snapshotDaemons(daemons),
       triggers: snapshotTriggers(triggers, revisions, connections),
+      triggerRuns: summaries.map(snapshotTriggerRun),
       runs: snapshotRuns(runs),
-      runCounts: { day: tally(dayRuns), month: tally(monthRuns) },
       sessionStarted,
       windowDays: HOME_WINDOW_DAYS,
     };
@@ -238,6 +224,23 @@ function snapshotTriggers(
   );
 }
 
+function snapshotTriggerRun({
+  triggerId,
+  total,
+  failed,
+  latest,
+}: TriggerRunSummary): HomeSnapshot["triggerRuns"][number] {
+  return {
+    triggerId,
+    total,
+    failed,
+    latest:
+      latest === null
+        ? null
+        : { id: latest.id, status: latest.status, startedAt: latest.createdAt.toISOString() },
+  };
+}
+
 function snapshotRuns(runs: readonly OrganizationRunRecord[]): HomeSnapshot["runs"] {
   return runs.map((run) => ({
     id: run.id,
@@ -256,16 +259,6 @@ function readerOf(
   userId: string,
 ): SessionPrincipal {
   return { organizationId: tenant.organization.id, userId, role: tenant.membership.role };
-}
-
-function tally(counts: readonly OrganizationRunCount[]): RunTally {
-  const result = { total: 0, succeeded: 0, failed: 0 };
-  for (const { status, count } of counts) {
-    result.total += count;
-    if (status === "succeeded") result.succeeded += count;
-    else if (FAILED_RUN_STATUSES.has(status)) result.failed += count;
-  }
-  return result;
 }
 
 function triggerFacts(

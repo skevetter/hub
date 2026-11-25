@@ -38,7 +38,7 @@ test("Home restores keyboard focus after a retry", async ({ hub, page }) => {
   await page.route("**/_serverFn/**", async (route) => {
     const response = await route.fetch();
     const body = await response.text();
-    if (failHome && body.includes("runCounts")) {
+    if (failHome && body.includes("triggerRuns")) {
       await route.fulfill({ status: 500, body: "Home test failure" });
     } else {
       await route.fulfill({ response, body });
@@ -50,7 +50,7 @@ test("Home restores keyboard focus after a retry", async ({ hub, page }) => {
     await expect(retry).toBeVisible();
     failHome = false;
     await retry.press("Enter");
-    await expect(page.getByText("Runs, 24 hours", { exact: true })).toBeVisible();
+    await expect(page.getByText("triggers failing", { exact: true })).toBeVisible();
     await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeFocused();
   } finally {
     await page.unrouteAll({ behavior: "wait" });
@@ -58,7 +58,7 @@ test("Home restores keyboard focus after a retry", async ({ hub, page }) => {
 });
 
 for (const width of [390, 1280])
-  test(`Home reserves the loaded tile heights at ${String(width)} px`, async ({ hub, page }) => {
+  test(`Home reserves the loaded figure heights at ${String(width)} px`, async ({ hub, page }) => {
     await hub.signUpAs("owner", owner);
     await hub.createOrganization("owner", "Acme");
     await hub.connectProviderDaemon("owner", "Acme");
@@ -71,26 +71,25 @@ for (const width of [390, 1280])
     await page.route("**/_serverFn/**", async (route) => {
       const response = await route.fetch();
       const body = await response.text();
-      if (body.includes("runCounts")) await heldSnapshot;
+      if (body.includes("triggerRuns")) await heldSnapshot;
       await route.fulfill({ response, body });
     });
     await page.reload();
-    const dimensions = (container: ReturnType<typeof page.locator>) =>
-      container
-        .locator("div.grid-cols-2 > section")
-        .evaluateAll((tiles) => tiles.map((tile) => tile.getBoundingClientRect().height));
+    const dimensions = (figures: ReturnType<typeof page.locator>) =>
+      figures.evaluateAll((elements) =>
+        elements.map((element) => element.getBoundingClientRect().height),
+      );
     const loading = page.getByRole("group", { name: "Loading Home" });
     let loadingHeights: number[];
     try {
       await expect(loading).toBeVisible();
-      loadingHeights = await dimensions(loading);
-      expect(loadingHeights).toHaveLength(4);
+      loadingHeights = await dimensions(loading.locator("div.grid-cols-2 > div"));
+      expect(loadingHeights).toHaveLength(3);
     } finally {
       releaseSnapshot();
     }
-    await expect(page.getByText("Daemons connected", { exact: true })).toBeVisible();
-    await expect(page.getByText("Open sessions", { exact: true })).toHaveCount(0);
-    expect(await dimensions(page.locator("main"))).toEqual(loadingHeights);
+    await expect(page.getByText(/^daemons? connected$/u)).toBeVisible();
+    expect(await dimensions(page.locator("[data-slot=figure]"))).toEqual(loadingHeights);
   });
 
 test("Home wraps long record names at 390 px", async ({ hub, page }) => {
@@ -160,12 +159,14 @@ run:
   const home = new OrganizationHome(page);
   await home.expectStep("Enroll a daemon", daemonName);
   await home.expectStep("Create a trigger", name);
-  await home.expectRecentRun(name, "Succeeded");
-  await expect(page.getByRole("list", { name: "Recent runs" })).toContainText("Manual run");
-  const runName = page.getByRole("list", { name: "Recent runs" }).getByText(name, { exact: true });
+  await home.expectTrigger(name, "Succeeded");
+  await expect(page.getByRole("list", { name: "Recent runs" })).toHaveCount(0);
+  const triggerName = home.triggerRow(name).getByRole("link", { name, exact: true });
   expect(
-    await runName.evaluate(
-      (element) => element.clientHeight > parseFloat(getComputedStyle(element).lineHeight),
+    await triggerName.evaluate(
+      (element) =>
+        element.getBoundingClientRect().height >
+        parseFloat(getComputedStyle(element).lineHeight) * 2,
     ),
   ).toBe(true);
   const profilePicker = page.getByRole("combobox", { name: "Profile" });
@@ -175,7 +176,7 @@ run:
   ).toBeGreaterThan(32);
   await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText(organization);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
-  await page.getByRole("link", { name: "Open trigger" }).click();
+  await triggerName.click();
   await expect(page.getByRole("heading", { name, level: 1 })).toBeVisible();
 });
 
@@ -255,7 +256,7 @@ test("Home gets the profile step and session form from one fetch", async ({ hub,
   expect(profileRequests).toBe(1);
 });
 
-test("reads Home as figures, a checklist the member can put away, and prompts to try", async ({
+test("reads Home as figures, triggers, a checklist the member can put away, and prompts to try", async ({
   hub,
   page,
 }) => {
@@ -264,14 +265,12 @@ test("reads Home as figures, a checklist the member can put away, and prompts to
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
 
   await test.step("a fresh organization shows zeroed figures and nothing to worry about", async () => {
-    for (const label of [
-      "Runs, 24 hours",
-      "Runs, 30 days",
-      "Active triggers",
-      "Daemons connected",
-    ]) {
-      await expect(page.getByText(label, { exact: true })).toBeVisible();
+    const home = new OrganizationHome(page);
+    for (const unit of ["triggers failing", "triggers on", "daemons connected"]) {
+      await expect(page.getByText(unit, { exact: true })).toBeVisible();
+      await home.expectFigure(unit, 0);
     }
+    await expect(page.getByText("No triggers yet", { exact: true })).toBeVisible();
     await expect(page.getByRole("alert")).toHaveCount(0);
   });
 

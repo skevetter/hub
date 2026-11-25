@@ -67,7 +67,7 @@ run:
     });
     return run;
   }
-  return { db, addRun };
+  return { db, addRun, triggerId: trigger.id };
 }
 
 it("keeps the run order, inclusive cutoff, and current row status", async () => {
@@ -99,11 +99,29 @@ it("keeps the run order, inclusive cutoff, and current row status", async () => 
       ["edge", "succeeded"],
     ],
   );
-  assert.deepEqual(await db.countOrganizationRunsSince(organizationId, cutoff), [
-    { status: "running", count: 2 },
-    { status: "succeeded", count: 1 },
-  ]);
   assert.deepEqual(await db.listOrganizationRunsSince("another-org", cutoff, 10), []);
+});
+
+it("summarizes a trigger's window and its newest run whatever the window", async () => {
+  const { db, addRun, triggerId } = await runFixture();
+  const cutoff = new Date(+now - 5000);
+  await addRun("before", new Date(+cutoff - 1));
+  const edge = await addRun("edge", cutoff);
+  await db.failWorkflowRun(edge.id, "failed", "agent_interrupted", "run");
+  await addRun("z", now);
+
+  assert.deepEqual(await db.summarizeTriggerRuns(organizationId, cutoff), [
+    {
+      triggerId,
+      total: 2,
+      failed: 1,
+      latest: { id: "z", status: "running", createdAt: now },
+    },
+  ]);
+  assert.deepEqual(await db.summarizeTriggerRuns(organizationId, new Date(+now + 1)), [
+    { triggerId, total: 0, failed: 0, latest: { id: "z", status: "running", createdAt: now } },
+  ]);
+  assert.deepEqual(await db.summarizeTriggerRuns("another-org", cutoff), []);
 });
 
 it("passes over workflow steps once for one or several recent runs", async () => {

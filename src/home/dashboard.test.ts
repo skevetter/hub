@@ -34,11 +34,12 @@ describe("home read model", () => {
     assert.deepEqual(snapshot.connections, []);
     assert.deepEqual(snapshot.daemons, []);
     assert.deepEqual(snapshot.triggers, []);
+    assert.deepEqual(snapshot.triggerRuns, []);
     assert.deepEqual(snapshot.runs, []);
     assert.equal(snapshot.windowDays, 7);
   });
 
-  it("reads daemons with whether they can run agents, triggers with their event, and recent runs with the agent that ran", async () => {
+  it("reads daemons with whether they can run agents, triggers with their event, and the newest run with the agent that ran", async () => {
     const database = memberDatabase();
     await enrollTestDaemon(database, "org-1");
     await enrollConnectedOnlyDaemon(database);
@@ -87,14 +88,11 @@ describe("home read model", () => {
           status: "failed",
           agent: { provider: "codex", model: "gpt-5.4" },
         },
-        {
-          triggerName: "manual-task",
-          provider: "manual",
-          source: "manual.run",
-          status: "succeeded",
-          agent: { provider: "codex", model: "gpt-5.4" },
-        },
       ],
+    );
+    assert.deepEqual(
+      snapshot.triggerRuns.map(({ total, failed, latest }) => [total, failed, latest?.status]),
+      [[2, 1, "failed"]],
     );
   });
 
@@ -122,7 +120,7 @@ describe("home read model", () => {
     );
   });
 
-  it("counts runs started in the last 24 hours and the last 30 days by outcome", async () => {
+  it("summarizes each trigger's runs in the window and keeps how its newest run ended", async () => {
     const database = memberDatabase();
     await enrollTestDaemon(database, "org-1");
     const trigger = await new OrganizationTriggerStore(
@@ -152,10 +150,65 @@ describe("home read model", () => {
       now: () => NOW,
     }).snapshot(request, "acme");
 
-    assert.deepEqual(snapshot.runCounts, {
-      day: { total: 2, succeeded: 1, failed: 1 },
-      month: { total: 3, succeeded: 2, failed: 1 },
+    assert.deepEqual(
+      snapshot.triggerRuns.map(({ triggerId, total, failed, latest }) => ({
+        triggerId,
+        total,
+        failed,
+        latest: latest && { status: latest.status, startedAt: latest.startedAt },
+      })),
+      [
+        {
+          triggerId: trigger.id,
+          total: 3,
+          failed: 1,
+          latest: { status: "succeeded", startedAt: new Date(NOW.getTime() - hour).toISOString() },
+        },
+      ],
+    );
+  });
+
+  it("reports a trigger that went quiet by how it last ended, with no runs in the window", async () => {
+    const database = memberDatabase();
+    await enrollTestDaemon(database, "org-1");
+    const trigger = await new OrganizationTriggerStore(
+      database,
+      "org-1",
+      acceptingAgentValidator(),
+    ).save({ yaml: triggerYaml, userId: "user-1" });
+    await recordRun(database, trigger.runtimeProjectId, "long-ago", {
+      status: "failed",
+      ageMs: 960 * 3_600_000,
     });
+
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
+
+    assert.equal(snapshot.triggerRuns.length, 1);
+    assert.deepEqual(
+      { ...snapshot.triggerRuns[0], latest: snapshot.triggerRuns[0]?.latest?.status },
+      { triggerId: trigger.id, total: 0, failed: 0, latest: "failed" },
+    );
+    assert.deepEqual(snapshot.runs, []);
+  });
+
+  it("lists a trigger that never ran with no run to show", async () => {
+    const database = memberDatabase();
+    await enrollTestDaemon(database, "org-1");
+    const trigger = await new OrganizationTriggerStore(
+      database,
+      "org-1",
+      acceptingAgentValidator(),
+    ).save({ yaml: triggerYaml, userId: "user-1" });
+
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
+
+    assert.deepEqual(snapshot.triggerRuns, [
+      { triggerId: trigger.id, total: 0, failed: 0, latest: null },
+    ]);
   });
 
   it("does not flag a connection whose grant covers what Hub needs", async () => {

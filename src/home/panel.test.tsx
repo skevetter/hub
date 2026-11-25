@@ -96,10 +96,14 @@ const ready: HomeSnapshot = {
       agent: null,
     },
   ],
-  runCounts: {
-    day: { total: 3, succeeded: 2, failed: 1 },
-    month: { total: 41, succeeded: 30, failed: 9 },
-  },
+  triggerRuns: [
+    {
+      triggerId: "trigger",
+      total: 3,
+      failed: 1,
+      latest: { id: "run", status: "succeeded", startedAt: "2026-11-20T00:00:00.000Z" },
+    },
+  ],
   sessionStarted: null,
   windowDays: 7,
 };
@@ -108,18 +112,32 @@ const fresh: HomeSnapshot = {
   connections: [],
   daemons: [],
   triggers: [],
+  triggerRuns: [],
   runs: [],
-  runCounts: {
-    day: { total: 0, succeeded: 0, failed: 0 },
-    month: { total: 0, succeeded: 0, failed: 0 },
-  },
 };
 
-/** The text of the tile with this label, as a reader would scan it. */
-function tile(markup: string, label: string): string {
-  const start = markup.indexOf(`>${label}<`);
-  assert.notEqual(start, -1, `no tile labelled ${label}`);
-  return markup.slice(start, markup.indexOf("</section>", start)).replaceAll(/<[^>]+>/gu, " ");
+/** The text of the figure with this unit, as a reader would scan it. */
+function figure(markup: string, unit: string): string {
+  const block = markup
+    .split('data-slot="figure"')
+    .slice(1)
+    .find((candidate) => candidate.includes(`>${unit}<`));
+  assert.ok(block, `no figure with the unit ${unit}`);
+  return block
+    .slice(block.indexOf(">") + 1, block.indexOf("</div>"))
+    .replaceAll(/<[^>]+>/gu, " ")
+    .replaceAll(/\s+/gu, " ")
+    .replaceAll(/\s([,.])/gu, "$1")
+    .replaceAll("&#x27;", "'")
+    .trim();
+}
+
+/** The trigger rows in the order a reader sees them, as their names. */
+function triggerNames(markup: string): string[] {
+  const list = markup.slice(markup.indexOf('aria-label="Trigger health"'));
+  return [...list.slice(0, list.indexOf("</ul>")).matchAll(/triggers\/([^"]+)">([^<]+)</gu)].map(
+    (match) => match[2] ?? "",
+  );
 }
 
 function renderHome(snapshot: HomeSnapshot, operator = true, profiles: ProfileAvailability = 0) {
@@ -165,21 +183,11 @@ describe("Home query states", () => {
     assert.match(markup, /role="group"[^>]*aria-busy="true"[^>]*aria-label="Loading Home"/u);
   });
 
-  it.each([
-    [false, 4],
-    [true, 4],
-  ] as const)(
-    "renders the tile count when the session feature is %s",
-    (sessionsEnabled, columns) => {
-      const markup = renderHomeQuery(
-        { status: "pending", data: undefined, error: null },
-        true,
-        sessionsEnabled,
-      );
-      const tiles = markup.split('class="grid gap-4 grid-cols-2')[1]?.split("<div aria-busy")[0];
-      assert.equal(tiles?.match(/<section\b/gu)?.length, columns);
-    },
-  );
+  it("reserves three figures while it loads", () => {
+    const markup = renderHomeQuery({ status: "pending", data: undefined, error: null });
+    assert.match(markup, /role="group"[^>]*aria-label="Loading overview"/u);
+    assert.equal(markup.match(/border-t-2/gu)?.length, 3);
+  });
 });
 
 describe("Home checklist", () => {
@@ -215,79 +223,163 @@ describe("Home checklist", () => {
       false,
     );
     assert.doesNotMatch(markup, /Get started|You are all set|Finish setup/u);
-    assert.match(markup, /Recent runs/u);
+    assert.match(markup, /Trigger health/u);
   });
 });
 
 describe("Home figures", () => {
-  it("counts runs over 24 hours and 30 days with their outcomes", () => {
-    const markup = renderHome(ready);
-    assert.match(tile(markup, "Runs, 24 hours"), /3\s+2 succeeded \u00b7 1 failed/u);
-    assert.match(tile(markup, "Runs, 30 days"), /41\s+30 succeeded \u00b7 9 failed/u);
-  });
-
-  it("counts enabled triggers and says how many are paused", () => {
+  it("counts enabled triggers and says how many are paused and running", () => {
     const markup = renderHome({
       ...ready,
       triggers: [
         ...ready.triggers,
         { id: "paused", name: "Nightly", event: "schedule.tick", enabled: false },
       ],
+      triggerRuns: [
+        {
+          triggerId: "trigger",
+          total: 1,
+          failed: 0,
+          latest: { id: "run", status: "running", startedAt: "2026-11-20T00:00:00.000Z" },
+        },
+      ],
     });
-    assert.match(tile(markup, "Active triggers"), /1\s+1 paused/u);
+    assert.equal(figure(markup, "trigger on"), "1 trigger on 1 paused \u00b7 1 running");
   });
 
-  it("shows the same four organization figures with sessions on or off", () => {
-    assert.doesNotMatch(renderHome(ready), /Open sessions/u);
-    const markup = renderHome(
-      {
-        ...ready,
-        sessionStarted: true,
-      },
-      true,
-      0,
+  it("says nothing is failing when no trigger's last run failed", () => {
+    const markup = renderHome(ready);
+    assert.equal(
+      figure(markup, "triggers failing"),
+      "0 triggers failing No trigger's last run failed.",
     );
+    assert.doesNotMatch(markup, /text-attention-text/u);
+  });
+
+  it("puts the latest failed run under the failing figure and links to it", () => {
+    const markup = renderHome(failing);
+    assert.match(
+      figure(markup, "triggers failing"),
+      /^2 triggers failing Latest: Triage, failed /u,
+    );
+    assert.match(markup, /<a href="\/o\/acme\/activity\/newest"[^>]*>Triage<\/a>/u);
+    assert.match(markup, /text-attention-text/u);
+  });
+
+  it("counts connected daemons and those that cannot run agents", () => {
+    const markup = renderHome({
+      ...ready,
+      daemons: [
+        { id: "devbox", slug: "devbox", presence: "offline", canExecute: true },
+        { id: "laptop", slug: "laptop", presence: "connected", canExecute: false },
+      ],
+    });
+    assert.equal(
+      figure(markup, "daemon connected"),
+      "1 daemon connected 2 enrolled \u00b7 1 cannot run agents",
+    );
+  });
+
+  it("shows the same three figures with sessions on or off", () => {
+    const markup = renderHome({ ...ready, sessionStarted: true }, true, 0);
     assert.doesNotMatch(markup, /Open sessions|open now/u);
-    for (const name of [
-      "Runs, 24 hours",
-      "Runs, 30 days",
-      "Active triggers",
-      "Daemons connected",
-    ]) {
-      assert.equal(tile(markup, name), tile(renderHome(ready), name));
-    }
+    for (const unit of ["triggers failing", "trigger on", "daemon connected"])
+      assert.equal(figure(markup, unit), figure(renderHome(ready), unit));
     assert.match(markup, /You started or joined a session/u);
   });
 });
 
-describe("Home recent runs", () => {
-  it.each([
-    ["manual.run", "Manual run"],
-    ["webhook.received", "Manual run"],
-    ["github.issue_created", "GitHub issue created"],
-    ["linear.comment", "Linear comment created"],
-    ["linear.issue", "Linear issue event"],
-    ["external.unknown", "external.unknown"],
-  ])("labels the source %s as %s", (source, label) => {
-    const run = ready.runs[0];
-    assert.ok(run);
-    const markup = renderHome({ ...ready, runs: [{ ...run, source }] });
-    const list = markup.slice(markup.indexOf('aria-label="Recent runs"'));
-    assert.equal(/>([^<>]+) \u00b7 <time\b/u.exec(list)?.[1], label);
+const failing: HomeSnapshot = {
+  ...ready,
+  triggers: [
+    { id: "ok", name: "Deploy", event: "manual.run", enabled: true },
+    { id: "old", name: "Audit", event: "schedule.tick", enabled: true },
+    { id: "new", name: "Triage", event: "github.issue_comment_created", enabled: true },
+    { id: "quiet", name: "Nightly", event: "schedule.tick", enabled: false },
+  ],
+  triggerRuns: [
+    {
+      triggerId: "ok",
+      total: 5,
+      failed: 0,
+      latest: { id: "ok-run", status: "succeeded", startedAt: "2026-11-24T10:00:00.000Z" },
+    },
+    {
+      triggerId: "old",
+      total: 2,
+      failed: 2,
+      latest: { id: "older", status: "timed_out", startedAt: "2026-11-24T09:00:00.000Z" },
+    },
+    {
+      triggerId: "new",
+      total: 1,
+      failed: 1,
+      latest: { id: "newest", status: "failed", startedAt: "2026-11-24T11:00:00.000Z" },
+    },
+    { triggerId: "quiet", total: 0, failed: 0, latest: null },
+  ],
+};
+
+describe("Home triggers", () => {
+  it("lists triggers worst first with the state of each last run", () => {
+    const markup = renderHome(failing);
+    assert.deepEqual(triggerNames(markup), ["Triage", "Audit", "Deploy", "Nightly"]);
+    const list = markup.slice(markup.indexOf('aria-label="Trigger health"'));
+    assert.match(list, /Failed<\/span>/u);
+    assert.match(list, /Timed out<\/span>/u);
+    assert.match(list, /Disabled<\/span>/u);
+  });
+
+  it("shows the window's runs and failures, singular and plural", () => {
+    const markup = renderHome(failing);
+    assert.match(markup, /1 run in 7 days \u00b7 1 failed/u);
+    assert.match(markup, /2 runs in 7 days \u00b7 2 failed/u);
+    assert.match(markup, /5 runs in 7 days</u);
+    assert.match(markup, /No runs in 7 days/u);
+  });
+
+  it("links each trigger and names its event beside when it last ran", () => {
+    const markup = renderHome(failing);
+    assert.match(markup, /<a href="\/o\/acme\/triggers\/new"[^>]*>Triage<\/a>/u);
+    assert.match(markup, /GitHub issue comment created[^<]*\u00b7 last run <time/u);
+  });
+
+  it("offers View all, and a first trigger when there is none", () => {
+    assert.match(renderHome(ready), /<a href="\/o\/acme\/triggers">View all<\/a>/u);
+    const markup = renderHome(fresh);
+    assert.match(markup, /No triggers yet/u);
+    assert.match(markup, /<a href="\/o\/acme\/triggers\/new\/edit">Create a trigger<\/a>/u);
+  });
+
+  it("keeps recent runs off Home", () => {
+    const markup = renderHome(failing);
+    assert.doesNotMatch(markup, /Recent runs|aria-label="Recent runs"/u);
   });
 });
 
-it("keeps organization attention out of Home while still counting connected daemons", () => {
-  const markup = renderHome({
-    ...ready,
-    connections: [{ provider: "slack", slug: "slack", label: "Acme", needsAuthorization: true }],
-    daemons: [
-      { id: "devbox", slug: "devbox", presence: "offline", canExecute: true },
-      { id: "laptop", slug: "laptop", presence: "connected", canExecute: false },
-    ],
+describe("Home where it runs", () => {
+  it("lists daemons and apps with a state each", () => {
+    const markup = renderHome({
+      ...ready,
+      connections: [
+        { provider: "slack", slug: "slack", label: "Acme Slack", needsAuthorization: true },
+        { provider: "github", slug: "gh", label: "acme-inc", needsAuthorization: false },
+      ],
+      daemons: [
+        { id: "devbox", slug: "devbox", presence: "offline", canExecute: true },
+        { id: "laptop", slug: "laptop", presence: "connected", canExecute: false },
+      ],
+    });
+    const list = markup.slice(markup.indexOf('aria-label="Daemons and apps"'));
+    assert.match(list, /Offline[\s\S]*devbox[\s\S]*Daemon/u);
+    assert.match(list, /Cannot run agents[\s\S]*laptop/u);
+    assert.match(list, /Needs authorization[\s\S]*Acme Slack[\s\S]*Slack/u);
+    assert.match(list, /Connected[\s\S]*acme-inc[\s\S]*GitHub/u);
   });
-  assert.doesNotMatch(markup, /data-slot="alert"|Review authorization for Acme|View daemons/u);
-  assert.match(tile(markup, "Daemons connected"), /1\s+2 enrolled/u);
+
+  it("says nothing is connected on a fresh organization", () => {
+    assert.match(renderHome(fresh), /Nothing connected yet/u);
+  });
 });
 
 describe("Home getting started", () => {
