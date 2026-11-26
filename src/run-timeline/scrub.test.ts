@@ -276,6 +276,14 @@ it("keeps the production scrubber byte-for-byte at build 17", () => {
   );
 });
 
+function compareUrlBudgets(
+  scrubbers: readonly ReturnType<typeof createTimelineScrubber>[],
+  budgets: readonly number[],
+  input: string,
+): void {
+  for (const scrub of scrubbers) for (const budget of budgets) scrub(input, budget);
+}
+
 it("matches build 17 across the URL-only review corpus", () => {
   const pieces = [
     "a",
@@ -318,10 +326,52 @@ it("matches build 17 across the URL-only review corpus", () => {
         { length: 1 + Math.floor(random() * 14) },
         () => pieces[Math.floor(random() * pieces.length)],
       ).join("");
-      for (const scrub of scrubbers) for (const budget of budgets) scrub(input, budget);
+      compareUrlBudgets(scrubbers, budgets, input);
     }
   }
 });
+
+function assertFieldMarkers(
+  scrub: ReturnType<typeof createTimelineScrubber>,
+  forbidden: ReadonlySet<string>,
+): void {
+  for (const { input } of FIELD_CORPUS) {
+    for (let budget = 0; budget <= 16; budget += 1) {
+      const safe = scrub(input, budget);
+      assertPrivate(safe, forbidden, budget);
+      expect(
+        safe === "" || safe === "[redacted]" || safe.endsWith("...") || /^\.*$/u.test(safe),
+      ).toBe(true);
+    }
+  }
+}
+
+function assertQuotedMasks(
+  scrub: ReturnType<typeof createTimelineScrubber>,
+  quote: string,
+  escape: string,
+): void {
+  const secret = ["aBcD0192", escape, quote, " ", "EfGh3456", "IjKl7890"].join("");
+  const encoded = secret.replaceAll("\\", "\\\\").replaceAll(quote, `\\${quote}`);
+  expect(scrub(secret, 240)).toBe(secret);
+  const forbidden = new Set([...eightGrams(secret), ...eightGrams(encoded)]);
+  for (const label of ["TOKEN", "PASSWORD", "SECRET", "API_KEY", "Authorization"]) {
+    for (const separator of ["=", ": "]) {
+      const input = `${label}${separator}${quote}${encoded}${quote} tail`;
+      const safe = scrub(input, 240);
+      expect(safe).toBe("[redacted]");
+      assertPrivate(safe, forbidden, 240);
+    }
+  }
+  for (const flag of ["token", "password", "secret", "api-key"]) {
+    for (const separator of ["=", " "]) {
+      const input = `--${flag}${separator}${quote}${encoded}${quote} tail`;
+      const safe = scrub(input, 240);
+      assertPrivate(safe, forbidden, 240);
+      assertPrivate(scrub(input.slice(0, -6), 240), forbidden, 240);
+    }
+  }
+}
 
 describe("stored-text privacy contract: whole fields redact on sensitive labels or userinfo; known normalized secrets lose every 8-code-unit fragment across cuts; arbitrary unlabeled base64/hex secrets and unknown unlabeled passwords are explicit non-guarantees", () => {
   it("states limits: arbitrary unlabeled base64/hex secrets, unknown unlabeled passwords and personal data are not guaranteed; benign sensitive-label mentions intentionally redact whole fields", () => {
@@ -474,15 +524,7 @@ describe("stored-text privacy contract: whole fields redact on sensitive labels 
       for (const { secret } of FIELD_CORPUS)
         for (const fragment of eightGrams(secret)) forbidden.add(fragment);
       for (const value of known) for (const fragment of eightGrams(value)) forbidden.add(fragment);
-      for (const { input } of FIELD_CORPUS) {
-        for (let budget = 0; budget <= 16; budget += 1) {
-          const safe = scrub(input, budget);
-          assertPrivate(safe, forbidden, budget);
-          expect(
-            safe === "" || safe === "[redacted]" || safe.endsWith("...") || /^\.*$/u.test(safe),
-          ).toBe(true);
-        }
-      }
+      assertFieldMarkers(scrub, forbidden);
     }
   });
 
@@ -574,26 +616,7 @@ describe("stored-text privacy contract: whole fields redact on sensitive labels 
     const scrub = createTimelineScrubber();
     for (const quote of ['"', "'"]) {
       for (const escape of ["", "\\"]) {
-        const secret = ["aBcD0192", escape, quote, " ", "EfGh3456", "IjKl7890"].join("");
-        const encoded = secret.replaceAll("\\", "\\\\").replaceAll(quote, `\\${quote}`);
-        expect(scrub(secret, 240)).toBe(secret);
-        const forbidden = new Set([...eightGrams(secret), ...eightGrams(encoded)]);
-        for (const label of ["TOKEN", "PASSWORD", "SECRET", "API_KEY", "Authorization"]) {
-          for (const separator of ["=", ": "]) {
-            const input = `${label}${separator}${quote}${encoded}${quote} tail`;
-            const safe = scrub(input, 240);
-            expect(safe).toBe("[redacted]");
-            assertPrivate(safe, forbidden, 240);
-          }
-        }
-        for (const flag of ["token", "password", "secret", "api-key"]) {
-          for (const separator of ["=", " "]) {
-            const input = `--${flag}${separator}${quote}${encoded}${quote} tail`;
-            const safe = scrub(input, 240);
-            assertPrivate(safe, forbidden, 240);
-            assertPrivate(scrub(input.slice(0, -6), 240), forbidden, 240);
-          }
-        }
+        assertQuotedMasks(scrub, quote, escape);
       }
     }
   });
