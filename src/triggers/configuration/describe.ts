@@ -45,28 +45,8 @@ export function describeTrigger(document: TriggerDocument, literal: Literal = ()
   const eligible: string[] = [];
   const blocked: string[] = [];
   for (const [event, definition] of Object.entries(document.on)) {
-    const path = ["on", event];
-    if (!literal(path)) {
-      eligible.push("When a configured event arrives");
-      continue;
-    }
-    const filterPath = [...path, "filters"];
-    const entries = Object.entries(definition.filters ?? {});
-    const direct = entries.filter(([key]) => literal([...filterPath, key]));
-    const filters: Filters = Object.fromEntries(direct);
-    const reason = blockedReason(event, definition.filters ?? {});
-    if (reason !== undefined) {
-      blocked.push(reason);
-      continue;
-    }
-    if (event === "schedule.tick" && definition.recurrence !== undefined) {
-      eligible.push(describeSchedule(definition.recurrence, literal([...path, "recurrence"])));
-      continue;
-    }
-    const opaque = direct.length < entries.length ? " with additional configured filters" : "";
-    eligible.push(
-      `When ${triggerEventClause(event)}${describeFilters(event, filters, Boolean(definition.filters?.pattern))}${opaque}`,
-    );
+    const clause = describeEvent(event, definition, literal);
+    (clause.blocked ? blocked : eligible).push(clause.text);
   }
   if (eligible.length === 0) return `${joinClauses(blocked)}.`;
   const run = document.run;
@@ -80,6 +60,38 @@ export function describeTrigger(document: TriggerDocument, literal: Literal = ()
       ? " Post the agent's final reply on the source Linear issue after a successful run."
       : "";
   return `${joinClauses(eligible)}, run ${action} on ${host}${excluded}.${reply}`;
+}
+
+function describeEvent(
+  event: string,
+  definition: TriggerDocument["on"][string],
+  literal: Literal,
+): { blocked: boolean; text: string } {
+  const path = ["on", event];
+  if (!literal(path)) return { blocked: false, text: "When a configured event arrives" };
+
+  const filterPath = [...path, "filters"];
+  const entries = Object.entries(definition.filters ?? {});
+  const direct = entries.filter(([key]) => literal([...filterPath, key]));
+  const filters: Filters = Object.fromEntries(direct);
+  const reason = blockedReason(event, definition.filters ?? {});
+  if (reason !== undefined) return { blocked: true, text: reason };
+
+  const text =
+    event === "schedule.tick" && definition.recurrence !== undefined
+      ? describeSchedule(definition.recurrence, literal([...path, "recurrence"]))
+      : describeEventClause(event, definition, filters, direct.length < entries.length);
+  return { blocked: false, text };
+}
+
+function describeEventClause(
+  event: string,
+  definition: TriggerDocument["on"][string],
+  filters: Filters,
+  opaque: boolean,
+): string {
+  const suffix = opaque ? " with additional configured filters" : "";
+  return `When ${triggerEventClause(event)}${describeFilters(event, filters, Boolean(definition.filters?.pattern))}${suffix}`;
 }
 
 function lowerFirst(value: string): string {
@@ -119,10 +131,13 @@ function blockedReason(event: string, filters: NonNullable<Filters>): string | u
     if (event === "slack.mention") return "For Slack mentions, no channels can match";
     if (event === "discord.mention") return "For Discord mentions, no channels can match";
   }
-  if (event === "github.push" && filters.from_users && !filters.from_users.includes("*")) {
-    return "A named sender filter cannot match because push events carry no sender";
-  }
-  return undefined;
+  return blockedPushReason(event, filters);
+}
+
+function blockedPushReason(event: string, filters: NonNullable<Filters>): string | undefined {
+  return event === "github.push" && filters.from_users && !filters.from_users.includes("*")
+    ? "A named sender filter cannot match because push events carry no sender"
+    : undefined;
 }
 
 type Filters = TriggerDocument["on"][string]["filters"];
@@ -133,20 +148,34 @@ function describeFilters(event: string, filters: Filters, hasPattern: boolean): 
   const prefixCommand = definition.provider === "slack" || definition.provider === "discord";
   const names = filters.from_users ?? [];
   const clauses = [];
-  if (
-    definition.audience !== "none" &&
-    names.length > 0 &&
-    !(definition.audience === "wildcard" && names.includes("*"))
-  ) {
-    clauses.push(`from ${alternatives.format(names)}`);
-  }
+  const audience = describeAudience(definition, names);
+  if (audience !== undefined) clauses.push(audience);
   for (const qualifier of definition.qualifiers) {
-    if (prefixCommand && qualifier.key === "contains" && hasPattern) continue;
-    const value = filters[qualifier.key];
-    const clause = describeQualifier(qualifier, value, prefixCommand);
+    const clause = describeFilter(qualifier, filters, prefixCommand, hasPattern);
     if (clause !== undefined) clauses.push(clause);
   }
   return clauses.length === 0 ? "" : ` ${clauses.join(" ")}`;
+}
+
+function describeFilter(
+  qualifier: QualifierDefinition,
+  filters: NonNullable<Filters>,
+  prefixCommand: boolean,
+  hasPattern: boolean,
+): string | undefined {
+  if (prefixCommand && qualifier.key === "contains" && hasPattern) return undefined;
+  return describeQualifier(qualifier, filters[qualifier.key], prefixCommand);
+}
+
+function describeAudience(
+  definition: ReturnType<typeof eventDefinition>,
+  names: string[],
+): string | undefined {
+  return definition.audience !== "none" &&
+    names.length > 0 &&
+    !(definition.audience === "wildcard" && names.includes("*"))
+    ? `from ${alternatives.format(names)}`
+    : undefined;
 }
 
 function describeQualifier(
@@ -157,22 +186,41 @@ function describeQualifier(
   if (value === undefined || value === "") return undefined;
   const name = label.toLowerCase();
   if (typeof value === "string") {
-    if (key === "repo" || key === "project") return `in ${name} ${value}`;
-    if (prefixCommand && (key === "pattern" || key === "contains")) {
-      return `with command prefix ${JSON.stringify(value)}`;
-    }
-    if (key === "pattern" || key === "contains" || key === "exclude_contains") {
-      return `and the ${name} ${JSON.stringify(value)}`;
-    }
-    return `with ${name} ${JSON.stringify(value)}`;
+    return describeTextQualifier({ key, name, value, prefixCommand });
   }
   if (Array.isArray(value)) {
-    if (value.length === 0) return undefined;
-    const format = key === "labels" ? together : alternatives;
-    if (key === "exclude_labels") return `without labels ${format.format(value)}`;
-    return `with ${name} ${format.format(value)}`;
+    return describeListQualifier(key, name, value);
   }
   return Object.keys(value).length === 0 ? undefined : "with matching inputs";
+}
+
+function describeTextQualifier({
+  key,
+  name,
+  value,
+  prefixCommand,
+}: {
+  key: QualifierDefinition["key"];
+  name: string;
+  value: string;
+  prefixCommand: boolean;
+}): string {
+  if (key === "repo" || key === "project") return `in ${name} ${value}`;
+  const match = key === "pattern" || key === "contains";
+  if (prefixCommand && match) return `with command prefix ${JSON.stringify(value)}`;
+  const prefix = match || key === "exclude_contains" ? "and the" : "with";
+  return `${prefix} ${name} ${JSON.stringify(value)}`;
+}
+
+function describeListQualifier(
+  key: QualifierDefinition["key"],
+  name: string,
+  value: string[],
+): string | undefined {
+  if (value.length === 0) return undefined;
+  const format = key === "labels" ? together : alternatives;
+  const prefix = key === "exclude_labels" ? "without labels" : `with ${name}`;
+  return `${prefix} ${format.format(value)}`;
 }
 
 export function describeTriggerYaml(yaml: string): string | undefined {
