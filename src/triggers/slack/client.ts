@@ -1,9 +1,7 @@
 import { z } from "zod";
 import { reportFailure } from "../../failures/index.js";
 
-const SlackApiResponseSchema = z
-  .object({ ok: z.boolean(), error: z.string().optional() })
-  .passthrough();
+const SlackApiResponseSchema = z.object({ ok: z.boolean(), error: z.string().optional() }).loose();
 const SlackFileSchema = z
   .object({
     id: z.string().min(1).max(255),
@@ -12,7 +10,7 @@ const SlackFileSchema = z
     mimetype: z.string().min(1).max(255).optional(),
     size: z.number().int().nonnegative().optional(),
   })
-  .passthrough();
+  .loose();
 const SlackThreadMessageSchema = z
   .object({
     ts: z.string().regex(/^\d+\.\d+$/u),
@@ -21,7 +19,7 @@ const SlackThreadMessageSchema = z
     bot_id: z.string().min(1).max(255).optional(),
     files: z.array(SlackFileSchema).optional(),
   })
-  .passthrough();
+  .loose();
 const SlackThreadRepliesSchema = SlackApiResponseSchema.extend({
   messages: z.array(SlackThreadMessageSchema).optional(),
   response_metadata: z.object({ next_cursor: z.string().optional() }).optional(),
@@ -102,13 +100,43 @@ export interface SlackBotClient {
   }): Promise<Response>;
 }
 
-export function createSlackBotClient(options: {
+interface SlackBotClientOptions {
   tokenForWorkspace(organizationId: string, teamId: string): Promise<string | undefined>;
   fetch?: typeof fetch;
   requestTimeoutMs?: number;
-}): SlackBotClient {
-  const request = options.fetch ?? fetch;
+}
 
+export function createSlackBotClient(options: SlackBotClientOptions): SlackBotClient {
+  const request = options.fetch ?? fetch;
+  const { call, callJson } = createPostCalls(options, request);
+  const queryJson = createQueryCall(options, request);
+  const { lookupUserName, downloadAttachment } = createResourceReaders(options, request, callJson);
+
+  return {
+    sendMessage: (input) =>
+      call(input.organizationId, input.teamId, "chat.postMessage", {
+        channel: input.channelId,
+        thread_ts: input.threadTs,
+        text: input.content,
+      }),
+    addReaction: (input) =>
+      call(input.organizationId, input.teamId, "reactions.add", {
+        channel: input.channelId,
+        timestamp: input.messageTs,
+        name: input.name,
+      }),
+    removeReaction: (input) =>
+      call(input.organizationId, input.teamId, "reactions.remove", {
+        channel: input.channelId,
+        timestamp: input.messageTs,
+        name: input.name,
+      }),
+    readThreadMessages: createThreadReader(queryJson),
+    lookupUserName,
+    downloadAttachment,
+  };
+}
+function createPostCalls(options: SlackBotClientOptions, request: typeof fetch) {
   async function call(
     organizationId: string,
     teamId: string,
@@ -128,7 +156,7 @@ export function createSlackBotClient(options: {
     });
     if (!response.ok) throw new Error(`Slack API HTTP ${response.status}`);
     const result = SlackApiResponseSchema.parse(await response.json());
-    if (!result.ok) throw new Error(`Slack API ${result.error ?? "unknown_error"}`);
+    assertSlackApiSuccess(result);
   }
 
   async function callJson(
@@ -152,6 +180,10 @@ export function createSlackBotClient(options: {
     return response.json();
   }
 
+  return { call, callJson };
+}
+
+function createQueryCall(options: SlackBotClientOptions, request: typeof fetch) {
   async function queryJson(
     organizationId: string,
     teamId: string,
@@ -171,16 +203,21 @@ export function createSlackBotClient(options: {
     return response.json();
   }
 
-  async function readThreadMessages(input: {
-    organizationId: string;
-    teamId: string;
-    channelId: string;
-    threadTs: string;
-    beforeTs: string;
-  }): Promise<SlackThreadReadResult> {
+  return queryJson;
+}
+
+type ThreadInput = Parameters<NonNullable<SlackBotClient["readThreadMessages"]>>[0];
+type ThreadPage = z.infer<typeof SlackThreadRepliesSchema>;
+
+interface ThreadHistory {
+  root: SlackThreadMessage | undefined;
+  selectedReplies: SlackThreadMessage[];
+}
+
+function createThreadReader(queryJson: ReturnType<typeof createQueryCall>) {
+  return async function readThreadMessages(input: ThreadInput): Promise<SlackThreadReadResult> {
     let cursor: string | undefined;
-    let root: SlackThreadMessage | undefined;
-    let selectedReplies: SlackThreadMessage[] = [];
+    const history: ThreadHistory = { root: undefined, selectedReplies: [] };
     const seenCursors = new Set<string>();
     let complete = true;
     let pagesRead = 0;
@@ -188,39 +225,22 @@ export function createSlackBotClient(options: {
       let result: z.infer<typeof SlackThreadRepliesSchema>;
       try {
         result = SlackThreadRepliesSchema.parse(
-          await queryJson(input.organizationId, input.teamId, "conversations.replies", {
-            channel: input.channelId,
-            ts: input.threadTs,
-            latest: input.beforeTs,
-            inclusive: "false",
-            limit: "100",
-            ...(cursor === undefined ? {} : { cursor }),
-          }),
+          await queryJson(
+            input.organizationId,
+            input.teamId,
+            "conversations.replies",
+            threadQuery(input, cursor),
+          ),
         );
-        if (!result.ok) throw new Error(`Slack API ${result.error ?? "unknown_error"}`);
+        assertSlackApiSuccess(result);
       } catch (error) {
-        if (root === undefined && selectedReplies.length === 0) throw error;
-        reportFailure(
-          error,
-          { operation: "slack.thread.history.page", component: "providers", provider: "slack" },
-          { diagnostic: { teamId: input.teamId, channelId: input.channelId, pagesRead } },
-        );
+        reportThreadPageError(error, history, input, pagesRead);
         complete = false;
         break;
       }
-      const page = (result.messages ?? [])
-        .map(normalizeThreadMessage)
-        .filter((message) => compareSlackTs(message.ts, input.beforeTs) < 0);
-      root ??= page.find((message) => message.ts === input.threadTs);
-      selectedReplies = [
-        ...selectedReplies,
-        ...page.filter((message) => message.ts !== input.threadTs),
-      ]
-        .sort((left, right) => compareSlackTs(right.ts, left.ts))
-        .slice(0, SLACK_THREAD_CONTEXT_LIMIT - 1);
+      selectThreadPage(history, result, input);
       pagesRead += 1;
-      const next = result.response_metadata?.next_cursor;
-      cursor = next === undefined || next.length === 0 ? undefined : next;
+      cursor = threadPageCursor(result);
       if (cursor === undefined) break;
       if (seenCursors.has(cursor)) {
         complete = false;
@@ -233,13 +253,69 @@ export function createSlackBotClient(options: {
       }
     }
 
-    if (root === undefined) throw new Error("Slack thread root unavailable");
+    if (history.root === undefined) throw new Error("Slack thread root unavailable");
     return {
-      messages: [root, ...selectedReplies.sort((left, right) => compareSlackTs(left.ts, right.ts))],
+      messages: [
+        history.root,
+        ...history.selectedReplies.sort((left, right) => compareSlackTs(left.ts, right.ts)),
+      ],
       complete,
     };
-  }
+  };
+}
 
+function threadQuery(input: ThreadInput, cursor: string | undefined): Record<string, string> {
+  return {
+    channel: input.channelId,
+    ts: input.threadTs,
+    latest: input.beforeTs,
+    inclusive: "false",
+    limit: "100",
+    ...(cursor === undefined ? {} : { cursor }),
+  };
+}
+
+function assertSlackApiSuccess(result: z.infer<typeof SlackApiResponseSchema>): void {
+  if (!result.ok) throw new Error(`Slack API ${result.error ?? "unknown_error"}`);
+}
+
+function reportThreadPageError(
+  error: unknown,
+  history: ThreadHistory,
+  input: ThreadInput,
+  pagesRead: number,
+): void {
+  if (history.root === undefined && history.selectedReplies.length === 0) throw error;
+  reportFailure(
+    error,
+    { operation: "slack.thread.history.page", component: "providers", provider: "slack" },
+    { diagnostic: { teamId: input.teamId, channelId: input.channelId, pagesRead } },
+  );
+}
+
+function selectThreadPage(history: ThreadHistory, result: ThreadPage, input: ThreadInput): void {
+  const page = (result.messages ?? [])
+    .map(normalizeThreadMessage)
+    .filter((message) => compareSlackTs(message.ts, input.beforeTs) < 0);
+  history.root ??= page.find((message) => message.ts === input.threadTs);
+  history.selectedReplies = [
+    ...history.selectedReplies,
+    ...page.filter((message) => message.ts !== input.threadTs),
+  ]
+    .sort((left, right) => compareSlackTs(right.ts, left.ts))
+    .slice(0, SLACK_THREAD_CONTEXT_LIMIT - 1);
+}
+
+function threadPageCursor(result: ThreadPage): string | undefined {
+  const next = result.response_metadata?.next_cursor;
+  return next === undefined || next.length === 0 ? undefined : next;
+}
+
+function createResourceReaders(
+  options: SlackBotClientOptions,
+  request: typeof fetch,
+  callJson: ReturnType<typeof createPostCalls>["callJson"],
+) {
   async function downloadAttachment(input: {
     organizationId: string;
     teamId: string;
@@ -279,29 +355,7 @@ export function createSlackBotClient(options: {
     return result.user?.name;
   }
 
-  return {
-    sendMessage: (input) =>
-      call(input.organizationId, input.teamId, "chat.postMessage", {
-        channel: input.channelId,
-        thread_ts: input.threadTs,
-        text: input.content,
-      }),
-    addReaction: (input) =>
-      call(input.organizationId, input.teamId, "reactions.add", {
-        channel: input.channelId,
-        timestamp: input.messageTs,
-        name: input.name,
-      }),
-    removeReaction: (input) =>
-      call(input.organizationId, input.teamId, "reactions.remove", {
-        channel: input.channelId,
-        timestamp: input.messageTs,
-        name: input.name,
-      }),
-    readThreadMessages,
-    lookupUserName,
-    downloadAttachment,
-  };
+  return { downloadAttachment, lookupUserName };
 }
 
 function normalizeThreadMessage(
