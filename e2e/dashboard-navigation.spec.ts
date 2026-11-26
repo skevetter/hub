@@ -27,6 +27,8 @@ test("redirects only a reachable organization index to Home", async ({ hub, page
   await page.goto(new URL("/o/unknown", page.url()).href);
   await expect(page.getByRole("alert")).toContainText("Organization unavailable");
   await expect(page).toHaveURL(/\/o\/unknown$/u);
+  // The signed-in organization is not where this URL points, so no crumb claims it is.
+  await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toHaveCount(0);
   // The answer is final, so no read is asked a second time before it shows.
   expect(Math.max(...reads.values())).toBe(1);
 });

@@ -20,6 +20,9 @@ test("reads, edits, and starts a trigger as a verified user", async ({ hub, page
   const daemon = await createManualTrigger(hub, page);
   await page.setViewportSize({ width: 1280, height: 800 });
   await expectReadView(page, daemon);
+  const trail = page.getByRole("navigation", { name: "Breadcrumb" });
+  await expect(trail.locator('[aria-current="page"]')).toHaveText(NAME);
+  await expect(trail.getByText("Trigger", { exact: true })).toHaveCount(0);
   await captureThemes(page, { width: 1280, height: 800 }, "empty");
   await captureThemes(page, { width: 390, height: 844 }, "empty");
   await expectReadView(page, daemon);

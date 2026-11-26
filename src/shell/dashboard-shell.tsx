@@ -5,6 +5,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useMemo, type CSSProperties } from "react";
 import { usePageContext } from "../navigation/index.js";
+import { CrumbLabelsProvider } from "../navigation/crumb-label-context.js";
 import { Page } from "../components/app/page.js";
 import { FailureAlert } from "../components/app/failure-alert.js";
 import { PanelSkeleton } from "../components/app/loading.js";
@@ -138,6 +139,7 @@ type DashboardContentProps = { account: ActiveAccount } & ReturnType<
 function DashboardContent(props: DashboardContentProps) {
   const { account, error, transitioning } = props;
   const tenant = useOptionalRouteTenant() ?? undefined;
+  const unavailable = useRouteTenantStatus().state === "failed";
   const organization = tenant?.organization ?? account.organization;
   const navigation = organizationNavigation(organization.slug, {
     sessionsEnabled: account.features?.interactiveSessions === true,
@@ -154,41 +156,68 @@ function DashboardContent(props: DashboardContentProps) {
   );
 
   return (
-    <CommandMenuProvider
-      navigation={navigation}
-      settings={settings}
-      memberships={account.memberships}
-      busy={props.busy}
-      onSelectOrganization={props.onSelectOrganization}
-    >
-      <SkipLink />
-      <Sidebar collapsible="icon" data-rail-focus>
-        <DashboardSidebar {...props} tenant={tenant} navigation={navigation} />
-      </Sidebar>
-      <SiteHeaderActionsProvider>
-        <SidebarInset className="pb-[var(--shell-bottom-bar)] md:pb-0">
-          <PhoneHeader scope={organization.name} organizationSlug={organization.slug} />
-          <SiteHeader
-            scope={organization.name}
-            organizationSlug={organization.slug}
-            {...(tenant?.project == null ? {} : { project: tenant.project.name })}
-          />
-          {/* The app's one content inset. Screens never pad themselves. */}
-          <div
-            id={CONTENT_ID}
-            tabIndex={-1}
-            className="flex flex-1 flex-col p-4 outline-none md:p-8"
-          >
-            <Page>
-              <ErrorSummary message={error} />
-              <PageContent account={account} tenant={tenant} transitioning={transitioning} />
-            </Page>
-          </div>
-        </SidebarInset>
-      </SiteHeaderActionsProvider>
-      <PhoneNavigation items={navigation.items.slice(0, 3)}>{sidebar}</PhoneNavigation>
-      <Toaster returnFocusId={CONTENT_ID} scope={organization.slug} />
-    </CommandMenuProvider>
+    <CrumbLabelsProvider>
+      <CommandMenuProvider
+        navigation={navigation}
+        settings={settings}
+        memberships={account.memberships}
+        busy={props.busy}
+        onSelectOrganization={props.onSelectOrganization}
+      >
+        <SkipLink />
+        <Sidebar collapsible="icon" data-rail-focus>
+          <DashboardSidebar {...props} tenant={tenant} navigation={navigation} />
+        </Sidebar>
+        <SiteHeaderActionsProvider>
+          <SidebarInset className="pb-[var(--shell-bottom-bar)] md:pb-0">
+            <ShellHeaders
+              organization={organization}
+              unavailable={unavailable}
+              project={tenant?.project?.name}
+            />
+            {/* The app's one content inset. Screens never pad themselves. */}
+            <div
+              id={CONTENT_ID}
+              tabIndex={-1}
+              className="flex flex-1 flex-col p-4 outline-none md:p-8"
+            >
+              <Page>
+                <ErrorSummary message={error} />
+                <PageContent account={account} tenant={tenant} transitioning={transitioning} />
+              </Page>
+            </div>
+          </SidebarInset>
+        </SiteHeaderActionsProvider>
+        <PhoneNavigation items={navigation.items.slice(0, 3)}>{sidebar}</PhoneNavigation>
+        <Toaster returnFocusId={CONTENT_ID} scope={organization.slug} />
+      </CommandMenuProvider>
+    </CrumbLabelsProvider>
+  );
+}
+
+function ShellHeaders({
+  organization,
+  unavailable,
+  project,
+}: {
+  organization: { name: string; slug: string };
+  unavailable: boolean;
+  project: string | undefined;
+}) {
+  return (
+    <>
+      <PhoneHeader
+        scope={organization.name}
+        organizationSlug={organization.slug}
+        unavailable={unavailable}
+      />
+      <SiteHeader
+        scope={organization.name}
+        organizationSlug={organization.slug}
+        unavailable={unavailable}
+        {...(project === undefined ? {} : { project })}
+      />
+    </>
   );
 }
 
