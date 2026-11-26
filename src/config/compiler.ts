@@ -16,6 +16,7 @@ import {
   expressionPaths,
   parseExpression,
   expressionPathsInTemplate,
+  isReservedContextKey,
   validateExecutionTemplate,
   type Expression,
   type ExpressionPath,
@@ -967,7 +968,7 @@ function validatePromptPartialPathForCompilation(value: string): string {
 function compileValues(trigger: AuthoredTrigger): Readonly<Record<string, Expression>> {
   const values: Record<string, Expression> = {};
   for (const [name, source] of Object.entries(trigger.values ?? {})) {
-    assertIdentifier(name, `value name on trigger ${trigger.name}`);
+    assertContextName(name, `value name on trigger ${trigger.name}`);
     values[name] = compileAt(["triggers", trigger.name, "values", name], () =>
       parseExpression(source),
     );
@@ -1540,7 +1541,7 @@ function validateCompiledTrigger(
   validateCompiledSteps(trigger, environments);
   validateCompiledInputs(trigger);
   for (const [name, expression] of Object.entries(trigger.values)) {
-    assertIdentifier(name, "value name");
+    assertContextName(name, "value name");
     if (!isExpression(expression)) throw new Error(`value ${name} contains an invalid expression`);
   }
   validateExpressionContract(trigger.name, trigger, environments);
@@ -1553,6 +1554,7 @@ function validateCompiledSteps(
 ): void {
   const stepIds = new Set<string>();
   for (const step of trigger.steps) {
+    assertContextName(step.id, "step id");
     if (stepIds.has(step.id)) throw new Error(`duplicate step id: ${step.id}`);
     stepIds.add(step.id);
     if (!environments.has(step.environment) && !step.environment.includes(EXPRESSION_START)) {
@@ -1760,7 +1762,7 @@ function validateAuthoredIds(config: AuthoredHubConfig): void {
     triggers.add(trigger.name);
     const steps = new Set<string>();
     for (const step of trigger.steps) {
-      assertIdentifier(step.id, "step id");
+      assertContextName(step.id, "step id");
       if (steps.has(step.id)) throw new Error(`duplicate step id: ${step.id}`);
       steps.add(step.id);
     }
@@ -1836,6 +1838,12 @@ function validateExternalTriggerLaunch(trigger: CompiledTrigger): void {
 
 function assertIdentifier(value: string, kind: string): void {
   if (!IDENTIFIER.test(value)) throw new Error(`invalid ${kind}: ${value}`);
+}
+
+// Expressions never read these keys, so a step or value with one of these names could not be referenced.
+function assertContextName(value: string, kind: string): void {
+  assertIdentifier(value, kind);
+  if (isReservedContextKey(value)) throw new Error(`${kind} ${value} is reserved`);
 }
 
 function rejectRemovedFields(raw: unknown): void {
