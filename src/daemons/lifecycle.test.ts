@@ -1,4 +1,6 @@
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import { deriveAgentExecutionCompletionToken } from "../agent-executions/completion-token.js";
+import { AgentSessions } from "../agent-sessions/index.js";
 import { DaemonResponseLostError } from "./protocol.js";
 import type { AgentConnection } from "./agents/index.js";
 import assert from "node:assert/strict";
@@ -8,8 +10,10 @@ import type { DaemonEvent, DaemonConnection } from "./protocol.js";
 import {
   createDaemonDispatchLifecycle,
   DaemonDispatchFailure,
+  durableExecutionId,
   executionWorkspaceTitle,
   type DaemonDispatchLifecycle,
+  type DaemonDispatchLifecycleOptions,
 } from "./lifecycle.js";
 import { createDurableWorkflowHandler } from "../workflows/engine.js";
 import type { TriggerProvider } from "../triggers/index.js";
@@ -25,11 +29,92 @@ import {
 } from "../test-utils/github-billing-notice.js";
 import { createGitHubTriggerProvider } from "../triggers/github/provider.js";
 import type { GitHubCommentClient } from "../triggers/github/reply.js";
+import { IDLE_TIMEOUT_MS, turnEndFixture } from "./test-utils/turn-end-fixture.js";
 
 const DAEMON_ID = "daemon-ack-test";
 const AGENT_ID = "agent-ack-test";
 const EXECUTION_ID = "00000000-0000-4000-8000-000000000001";
+const PEER_ID = "00000000-0000-4000-8000-000000000002";
 const ACKNOWLEDGED_AT = new Date("2026-01-01T00:00:01.000Z");
+
+describe("stop interrupt recovery", () => {
+  it.each([
+    { outcome: "target_gone", status: "revoked", expired: false, sessionOutcome: undefined },
+    { outcome: "delivery_unconfirmed", status: "active", expired: true, sessionOutcome: undefined },
+    { outcome: "coalesced", status: "active", expired: false, sessionOutcome: "coalesced" },
+    { outcome: "confirmed", status: "active", expired: false, sessionOutcome: [PEER_ID] },
+  ] as const)("completes as $outcome and releases the claim once", async (scenario) => {
+    const database = createMemoryDatabase();
+    await seedStopExecution(database);
+    vi.spyOn(database, "findDaemonById").mockResolvedValue({
+      ...daemonRecord(),
+      status: scenario.status,
+    });
+    const store = database.stopInterrupts;
+    const claimOriginal = store.claim.bind(store);
+    const claim = vi.spyOn(store, "claim").mockImplementation(async (id, token, generation) => {
+      const acquired = await claimOriginal(id, token, generation);
+      assert.ok(acquired);
+      return { state: { approvedPeerIds: [PEER_ID] }, expired: scenario.expired };
+    });
+    const complete = vi.spyOn(store, "complete");
+    const release = vi.spyOn(store, "release");
+    const sessionOutcome = scenario.sessionOutcome;
+    const session = vi
+      .spyOn(AgentSessions.prototype, "interruptStoppedExecution")
+      .mockResolvedValue(
+        typeof sessionOutcome === "string" ? sessionOutcome : sessionOutcome?.slice(),
+      );
+    const lifecycle = createLifecycle(database, new AcknowledgementConnection());
+    try {
+      await lifecycle.recoverPendingHubActions(DAEMON_ID);
+
+      assert.equal(claim.mock.calls.length, 1);
+      const call = claim.mock.calls[0];
+      assert.ok(call);
+      const [id, token, generation] = call;
+      assert.equal(id, EXECUTION_ID);
+      assert.ok(token);
+      assert.equal(generation, null);
+      assert.deepEqual(complete.mock.calls, [[EXECUTION_ID, token, scenario.outcome]]);
+      assert.deepEqual(release.mock.calls, [[EXECUTION_ID, token]]);
+      const [completedAt] = complete.mock.invocationCallOrder;
+      const [releasedAt] = release.mock.invocationCallOrder;
+      assert.ok(completedAt);
+      assert.ok(releasedAt);
+      assert.ok(completedAt < releasedAt);
+      assert.equal(session.mock.calls.length, sessionOutcome === undefined ? 0 : 1);
+      const peer = await database.findAgentExecutionById(PEER_ID);
+      assert.ok(peer);
+      assert.equal(peer.status, scenario.outcome === "confirmed" ? "failed" : "spawning");
+      if (scenario.outcome === "confirmed") {
+        assert.deepEqual(peer.result, { status: "failed", reason: "agent_interrupted" });
+        assert.equal(peer.hubAction, null);
+      }
+    } finally {
+      session.mockRestore();
+      await lifecycle.stop();
+    }
+  });
+});
+
+async function seedStopExecution(database: ReturnType<typeof createMemoryDatabase>): Promise<void> {
+  const input = {
+    organizationId: "org-stop-test",
+    projectId: "project-stop-test",
+    machineId: null,
+    daemonId: DAEMON_ID,
+    triggerContext: {},
+    outputContext: {},
+    configurationRevisionId: "revision-stop-test",
+  };
+  await database.insertAgentExecution({ ...input, id: EXECUTION_ID });
+  await database.insertAgentExecution({ ...input, id: PEER_ID });
+  await database.transitionAgentExecution(EXECUTION_ID, "failed", {
+    result: { status: "canceled" },
+    hubAction: "interrupt",
+  });
+}
 
 describe("execution workspace title", () => {
   const executionId = "e6a296d1-1f0c-4c4e-9b2a-000000000000";
@@ -61,6 +146,44 @@ describe("execution workspace title", () => {
       "Hub · intake · e6a296d1",
     );
   });
+});
+
+it("re-arms the idle deadline when a concurrent refresh wins over expiry", async () => {
+  const organizationId = "org-deadline-rearm";
+  const database = createMemoryDatabase({ organizationIds: [organizationId] });
+  const fixture = await turnEndFixture({ database, organizationId });
+  try {
+    const { execution } = await fixture.dispatch();
+    await fixture.deliver(fixture.events.status("idle"));
+    const retryDelay = 1_000;
+    const transitionOriginal = database.transitionAgentExecution.bind(database);
+    const transition = vi
+      .spyOn(database, "transitionAgentExecution")
+      .mockImplementationOnce(async (id, status, fields) => {
+        const now = fixture.clock.now();
+        await database.setAgentExecutionIdleDeadline(
+          id,
+          new Date(now + retryDelay),
+          new Date(now - 1),
+          new Date(now),
+        );
+        return transitionOriginal(id, status, fields);
+      });
+
+    await fixture.clock.advance(IDLE_TIMEOUT_MS + retryDelay - 1);
+
+    assert.equal(transition.mock.calls.length, 1);
+    assert.equal((await fixture.execution(execution.id)).status, "running");
+    await fixture.clock.advance(1);
+
+    assert.equal(transition.mock.calls.length, 2);
+    assert.deepEqual((await fixture.execution(execution.id)).result, {
+      status: "failed",
+      reason: "idle_timeout",
+    });
+  } finally {
+    await fixture.lifecycle.stop();
+  }
 });
 
 describe("durable Hub action acknowledgement state", () => {
@@ -347,6 +470,62 @@ describe("durable Hub action acknowledgement state", () => {
     assert.notEqual(execution?.hubActionReadyAt, null);
     assert.notEqual(execution?.hubActionCompletedAt, null);
     await fixture.lifecycle.stop();
+  });
+
+  it.each([
+    { description: "ordinary finish", reads: 3, records: true },
+    { description: "continued finish", continuationKey: "continued", reads: 3, records: false },
+    { description: "unrelated tool", name: "shell", reads: 2, records: false },
+    { description: "unrecognised status", status: "unknown", reads: 2, records: false },
+    { description: "missing call ID", missingCallId: true, reads: 2, records: false },
+  ])("checks acknowledgement reads and writes for $description", async (scenario) => {
+    const organizationId = "org-finish-ack";
+    const database = createMemoryDatabase({ organizationIds: [organizationId] });
+    const { continuationKey } = scenario;
+    const fixture = await turnEndFixture({
+      database,
+      organizationId,
+      ...(continuationKey === undefined ? {} : { continuationKey }),
+    });
+    try {
+      const { execution } = await fixture.dispatch();
+      const read = vi.spyOn(database, "findAgentExecutionById");
+      const record = vi.spyOn(database, "recordAgentExecutionHubAcknowledgement");
+      const event = fixture.stream({
+        type: "timeline",
+        provider: "claude",
+        item: {
+          type: "tool_call",
+          name: scenario.name ?? "mcp__hub__finish_execution",
+          status: scenario.status ?? "completed",
+          ...(scenario.missingCallId === true ? {} : { callId: "finish-call" }),
+        },
+      });
+      await fixture.deliver(event);
+
+      assert.deepEqual(
+        read.mock.calls,
+        Array.from({ length: scenario.reads }, () => [execution.id]),
+      );
+      assert.deepEqual(
+        record.mock.calls,
+        scenario.records
+          ? [
+              [
+                execution.id,
+                {
+                  kind: "finish_execution",
+                  callId: "finish-call",
+                  status: "completed",
+                  observedAt: new Date(event.timestamp),
+                },
+              ],
+            ]
+          : [],
+      );
+    } finally {
+      await fixture.lifecycle.stop();
+    }
   });
 
   it("archives after finish_execution reported by the omp provider's bridged tool title", async () => {
@@ -743,6 +922,130 @@ describe("dispatch retries transient database failures", () => {
     assert.equal(second.execution.id, first.execution.id);
     assert.equal(findIssueCommentByMarker.mock.calls.length, 2);
     assert.equal(fixture.createIssueComment.mock.calls.length, 1);
+  });
+
+  it.each([
+    { phase: "claimed", deadlineAt: null, message: "durable execution cannot be resumed" },
+    {
+      phase: "prepared",
+      deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+      message: "durable execution has no deadline",
+    },
+  ])("rejects a $phase durable dispatch without a deadline", async ({ deadlineAt, message }) => {
+    const { database, intent, lifecycle, calls } = await dispatchFixture();
+    const id = durableExecutionId(intent);
+    const execution = await database.insertAgentExecution({
+      id,
+      organizationId: intent.organizationId,
+      projectId: intent.projectId,
+      daemonId: intent.environment.daemonId,
+      machineId: null,
+      triggerContext: intent.triggerContext,
+      outputContext: intent.outputContext,
+      configurationRevisionId: intent.configurationRevisionId,
+      launchIntent: intent,
+      ...(deadlineAt === null ? {} : { deadlineAt }),
+    });
+    const prepare = vi
+      .spyOn(database, "prepareAgentExecutionForDispatch")
+      .mockResolvedValue({ ...execution, deadlineAt: null });
+
+    try {
+      await assert.rejects(() => lifecycle.handoffLaunchMachineIntent(intent), {
+        message: `${message}: ${id}`,
+      });
+      assert.equal(prepare.mock.calls.length, deadlineAt === null ? 0 : 1);
+      assert.deepEqual(calls, { creates: [], sends: [] });
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("rejects dispatch when the trigger run no longer matches the launch authority", async () => {
+    const { database, intent, lifecycle, calls } = await dispatchFixture();
+    const insert = vi.spyOn(database, "insertAgentExecution");
+    vi.spyOn(database, "findTriggerRunById").mockResolvedValue(undefined);
+    try {
+      await assert.rejects(() => lifecycle.dispatchLaunchMachineIntent(intent), {
+        name: "DaemonDispatchFailure",
+        message: "daemon dispatch failed: tenant_authority_mismatch",
+      });
+      assert.equal(insert.mock.calls.length, 0);
+      assert.deepEqual(calls, { creates: [], sends: [] });
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("does not complete an execution that disappears after the callback token check", async () => {
+    const { database, intent, lifecycle } = await dispatchFixture();
+    try {
+      const { execution } = await lifecycle.dispatchLaunchMachineIntent(intent);
+      const executionId = execution.id;
+      const find = vi
+        .spyOn(database, "findAgentExecutionById")
+        .mockResolvedValueOnce(execution)
+        .mockResolvedValueOnce(undefined);
+      const transition = vi.spyOn(database, "transitionAgentExecution");
+      const token = deriveAgentExecutionCompletionToken("test-secret", executionId);
+      await assert.rejects(
+        () => lifecycle.completeAgentExecutionFromCallback({ executionId, token }),
+        {
+          name: "AgentExecutionCompletionFailure",
+          message: "agent execution completion failed: not_found",
+        },
+      );
+      assert.deepEqual(find.mock.calls, [[executionId], [executionId]]);
+      assert.equal(transition.mock.calls.length, 0);
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("preserves the recovery error when execution authority disappears before the resume check", async () => {
+    const { database, intent, lifecycle, stream } = await dispatchFixture();
+    const canResume = vi.fn(async () => true);
+    const options: DaemonDispatchLifecycleOptions = {
+      database,
+      connectionForDaemon: () => new AcknowledgementConnection(),
+      publicBaseUrl: "https://hub.test",
+      completionTokenSecret: "test-secret",
+      executionAuthority: {
+        canResume,
+        materialize: async () => ({ env: {} }),
+        recover: async () => {},
+        onExecutionTerminal: async () => {},
+        resourceCounts: () => ({ executionStates: 0, leases: 0, pendingMaterializations: 0 }),
+        stop: async () => {},
+      },
+      test: { logger: createLogger(stream) },
+    };
+    const recovery = createDaemonDispatchLifecycle(options);
+    const resume = vi.spyOn(AgentSessions.prototype, "canResumeAuthority");
+    try {
+      const { execution } = await lifecycle.dispatchLaunchMachineIntent(intent);
+      await lifecycle.stop();
+      resume.mockImplementationOnce(async (current, available) => {
+        delete options.executionAuthority;
+        return available(current.id);
+      });
+
+      await recovery.recoverDaemon({ ...daemonRecord(), id: TEST_DAEMON_ID });
+
+      assert.equal(resume.mock.calls.length, 1);
+      const [result] = resume.mock.results;
+      assert.ok(result?.type === "return");
+      await assert.rejects(result.value, {
+        name: "TypeError",
+        message: "Cannot read properties of undefined (reading 'canResume')",
+      });
+      assert.equal(canResume.mock.calls.length, 0);
+      assert.equal((await database.findAgentExecutionById(execution.id))?.status, "running");
+    } finally {
+      resume.mockRestore();
+      await recovery.stop();
+      await lifecycle.stop();
+    }
   });
 
   it("retries a pool timeout before the agent is created and launches it once", async () => {

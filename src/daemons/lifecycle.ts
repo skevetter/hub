@@ -1,4 +1,8 @@
-import { STOP_RECOVERY_BATCH_SIZE, stopInterruptMayHaveSent } from "../db/stop-interrupt.js";
+import {
+  STOP_RECOVERY_BATCH_SIZE,
+  stopInterruptMayHaveSent,
+  type StopInterruptState,
+} from "../db/stop-interrupt.js";
 import type { RunTimeline } from "../run-timeline/index.js";
 import { DaemonAgentError } from "./agents/index.js";
 import { AgentSessions, AgentSessionError } from "../agent-sessions/index.js";
@@ -32,7 +36,7 @@ import { isTransientDatabaseError } from "../db/errors.js";
 import { retryDiagnostic, retryWithBackoff, type RetryRuntime } from "../db/retry.js";
 import { MAX_EXPLICIT_AGENT_TITLE_CHARS } from "@getpaseo/protocol/agent-title-limits";
 import { reportFailure } from "../failures/index.js";
-import type { TriggerProvider } from "../triggers/index.js";
+import type { TriggerProvider, TriggerProviderReactionState } from "../triggers/index.js";
 import { isCanceledExecution } from "../triggers/run-stop.js";
 import type { ExecutionAuthority } from "../execution-authority/index.js";
 import { OutputExecutorRegistry } from "../execution-capabilities/outputs.js";
@@ -47,7 +51,6 @@ import {
   notifyDispatchAccepted,
   notifyMachineTerminated,
 } from "../triggers/lifecycle.js";
-import type { TriggerProviderReactionState } from "../triggers/index.js";
 import {
   DaemonResponseLostError,
   type DaemonAgentStreamEvent,
@@ -74,6 +77,35 @@ interface PreparedDaemonDispatch {
   completionToken: string;
   deadlineAt: Date;
   publicBaseUrl: string;
+}
+
+interface CompletionCallbackInput {
+  executionId: string;
+  token: string;
+  output?: unknown;
+}
+
+interface CompletionCallbackOptions {
+  deferHubAction?: boolean;
+}
+
+interface CompleteAgentExecutionOptions extends CompletionCallbackOptions {
+  completedByAgent?: boolean;
+  output?: unknown;
+  /** Set when the agent's turn ended without finish_execution; null when it said nothing. */
+  turnEnd?: { text: string; truncated: boolean } | null;
+}
+
+interface FailAgentExecutionDetails {
+  alreadyInterrupted?: boolean;
+  lastInvalidOutput?: unknown;
+  notifyProvider?: boolean;
+  deadlineCondition?: {
+    kind: "hard" | "idle";
+    deadlineAt: Date;
+    observedAt: Date;
+  };
+  deadlineKind?: WorkflowDeadlineKind;
 }
 
 interface HubExecutionEnv {
@@ -438,35 +470,18 @@ export class DaemonDispatchLifecycle {
       ),
       this.options.database.findMachineForOrganization(intent.organizationId, daemon.machineId),
     ]);
-    if (
-      run === undefined ||
-      run.organizationId !== intent.organizationId ||
-      run.projectId !== intent.projectId ||
-      config?.projectId !== intent.projectId ||
-      daemonMachine?.orgId !== intent.organizationId
-    ) {
-      throw new DaemonDispatchFailure("tenant_authority_mismatch");
-    }
+    assertDispatchAuthority(intent, run, config, daemonMachine);
 
     const executionId = durableId ?? randomUUID();
     const completionToken = this.completionToken(executionId);
     const deadlineAt =
       intent.deadlineAt ??
       new Date(this.now() + (intent.timeoutMs ?? DEFAULT_AGENT_EXECUTION_TIMEOUT_MS));
-    const executionInput = {
+    const executionInput = dispatchExecutionInput(intent, daemon, {
       id: executionId,
-      organizationId: intent.organizationId,
-      projectId: intent.projectId,
-      machineId: daemon.machineId,
-      daemonId: daemon.id,
-      triggerContext: intent.triggerContext,
-      outputContext: intent.outputContext,
-      configurationRevisionId: intent.configurationRevisionId,
-      completionTokenHash: hashAgentExecutionCompletionToken(completionToken),
+      completionToken,
       deadlineAt,
-      workflowStepRunId: intent.workflowStepRunId ?? null,
-      launchIntent: intent,
-    };
+    });
     const execution =
       durableId === undefined
         ? await this.options.database.insertAgentExecution(executionInput)
@@ -493,7 +508,7 @@ export class DaemonDispatchLifecycle {
   private async prepareClaimedDurableDispatch(
     execution: AgentExecutionRecord,
   ): Promise<PreparedDaemonDispatch | undefined> {
-    if (execution.status !== "spawning" || execution.daemonAgentId !== null) return undefined;
+    if (!isUnattachedSpawningExecution(execution)) return undefined;
     const intent = execution.launchIntent;
     const daemonId = execution.daemonId ?? intent?.environment.daemonId;
     if (
@@ -608,25 +623,12 @@ export class DaemonDispatchLifecycle {
             ...(persistedWorktree === undefined ? {} : { environmentWorktree: persistedWorktree }),
             triggerContext: intent.triggerContext,
           });
-    const {
-      env: _persistedEnvironmentEnv,
-      worktree: _persistedWorktree,
-      ...environment
-    } = intent.environment;
-    const environmentWorktree = materialized.environmentWorktree ?? persistedWorktree;
-    const materializedIntent: LaunchMachineIntent = {
-      ...intent,
-      environment: {
-        ...environment,
-        ...(materialized.environmentEnv === undefined ? {} : { env: materialized.environmentEnv }),
-        ...(environmentWorktree === undefined ? {} : { worktree: environmentWorktree }),
-      },
-    };
+    const materializedIntent = applyLaunchMaterialization(intent, materialized, persistedWorktree);
     if (this.options.executionAuthority === undefined && materializedIntent.github !== undefined) {
       throw new Error("GitHub step authority is unavailable");
     }
     const authoredEnv = {
-      ...(materialized.environmentEnv ?? intent.environment.env),
+      ...launchEnvironmentEnv(intent, materialized),
       ...materializedIntent.env,
     };
     let env: Record<string, string>;
@@ -641,8 +643,7 @@ export class DaemonDispatchLifecycle {
           executionId,
           projectId: materializedIntent.projectId,
           triggerContext: materializedIntent.triggerContext,
-          ...(Object.keys(authoredEnv).length === 0 ? {} : { env: authoredEnv }),
-          ...(materializedIntent.github === undefined ? {} : { github: materializedIntent.github }),
+          ...authorityLaunchOptions(authoredEnv, materializedIntent),
         })
       ).env;
     }
@@ -672,29 +673,14 @@ export class DaemonDispatchLifecycle {
     event: DaemonAgentStreamEvent,
     observedAt: Date,
   ): Promise<void> {
-    switch (event.type) {
-      case "thread_started":
-        if (await this.refreshAgentIdleDeadline(executionId, observedAt)) {
-          await this.startAgentExecution(executionId);
-        }
-        return;
-      case "timeline":
-        await this.refreshAgentIdleDeadline(executionId, observedAt);
-        return;
-      case "turn_completed":
-      case "turn_failed":
-      case "turn_canceled":
-        await this.refreshAgentIdleDeadline(executionId, observedAt);
-        return;
-      case "permission_requested":
-      case "permission_resolved":
-      case "turn_started":
-      case "attention_required":
-        await this.refreshAgentIdleDeadline(executionId, observedAt);
-        return;
+    if (event.type === "thread_started") {
+      if (await this.refreshAgentIdleDeadline(executionId, observedAt)) {
+        await this.startAgentExecution(executionId);
+      }
+      return;
     }
-
-    return assertNeverAgentStreamEvent(event);
+    assertIdleRefreshEvent(event);
+    await this.refreshAgentIdleDeadline(executionId, observedAt);
   }
 
   private captureTimelineEvent(
@@ -710,45 +696,55 @@ export class DaemonDispatchLifecycle {
     }
   }
 
-  private async handleDaemonEvent(
+  private handleDaemonEvent(
     executionId: string,
     daemonId: string,
     event: DaemonEvent,
     source: "live" | "snapshot" = "live",
   ): Promise<void> {
-    if (event.type === "agent_stream") {
-      const observedAt = new Date(event.timestamp);
-      this.captureTimelineEvent(executionId, event.event, observedAt, source);
-      if (event.event.type === "timeline" && event.event.item.type === "tool_call") {
-        const item = event.event.item;
-        if (
-          typeof item.name === "string" &&
-          isHubFinishExecutionToolName(item.name) &&
-          typeof item.callId === "string" &&
-          isHubFinishExecutionStatus(item.status) &&
-          (await this.options.database.findAgentExecutionById(executionId))?.launchIntent
-            ?.continuation === undefined
-        ) {
-          await this.options.database.recordAgentExecutionHubAcknowledgement(executionId, {
-            kind: "finish_execution",
-            callId: item.callId,
-            status: item.status,
-            observedAt,
-          });
-        }
-      }
-      await this.handleAgentStreamEvent(executionId, event.event, observedAt);
-      if (event.event.type === "turn_completed") {
-        await this.options.database.recordAgentExecutionHubAcknowledgement(executionId, {
-          kind: "terminal",
-          observedAt,
-        });
-        await this.acknowledgeAgentExecutionHubAction(executionId, event.agentId, observedAt);
-      } else if (event.event.type === "timeline") {
-        await this.acknowledgeAgentExecutionHubAction(executionId, event.agentId, observedAt);
-      }
-      return;
+    return event.type === "agent_stream"
+      ? this.handleDaemonStreamMessage(executionId, event, source)
+      : this.handleDaemonStatusEvent(executionId, daemonId, event, source);
+  }
+
+  private async handleDaemonStreamMessage(
+    executionId: string,
+    event: Extract<DaemonEvent, { type: "agent_stream" }>,
+    source: "live" | "snapshot",
+  ): Promise<void> {
+    const observedAt = new Date(event.timestamp);
+    this.captureTimelineEvent(executionId, event.event, observedAt, source);
+    const item = finishExecutionToolCall(event.event);
+    if (
+      item !== undefined &&
+      (await this.options.database.findAgentExecutionById(executionId))?.launchIntent
+        ?.continuation === undefined
+    ) {
+      await this.options.database.recordAgentExecutionHubAcknowledgement(executionId, {
+        kind: "finish_execution",
+        callId: item.callId,
+        status: item.status,
+        observedAt,
+      });
     }
+    await this.handleAgentStreamEvent(executionId, event.event, observedAt);
+    if (event.event.type === "turn_completed") {
+      await this.options.database.recordAgentExecutionHubAcknowledgement(executionId, {
+        kind: "terminal",
+        observedAt,
+      });
+      await this.acknowledgeAgentExecutionHubAction(executionId, event.agentId, observedAt);
+    } else if (event.event.type === "timeline") {
+      await this.acknowledgeAgentExecutionHubAction(executionId, event.agentId, observedAt);
+    }
+  }
+
+  private async handleDaemonStatusEvent(
+    executionId: string,
+    daemonId: string,
+    event: Exclude<DaemonEvent, { type: "agent_stream" }>,
+    source: "live" | "snapshot",
+  ): Promise<void> {
     if (source === "snapshot") {
       // Watches read state before delivering a prompt. That state belongs to the previous turn
       // until this execution has finished; it must not start or fail the new execution.
@@ -811,7 +807,7 @@ export class DaemonDispatchLifecycle {
     }
 
     let execution = await this.options.database.findAgentExecutionById(executionId);
-    if (execution === undefined || isTerminalExecutionStatus(execution.status)) return;
+    if (!isActiveExecution(execution)) return;
     const processedAt = new Date(this.now());
     if (
       await this.expireIfDaemonEventDeadlineElapsed(executionId, execution, observedAt, processedAt)
@@ -820,7 +816,7 @@ export class DaemonDispatchLifecycle {
     if ((status === "running" || status === "idle") && execution.status === "spawning") {
       await this.startAgentExecution(executionId);
       execution = await this.options.database.findAgentExecutionById(executionId);
-      if (execution === undefined || isTerminalExecutionStatus(execution.status)) return;
+      if (!isActiveExecution(execution)) return;
     }
 
     const idleDeadlineAt = this.idleDeadlineForStatus(execution, status, source, observedAt);
@@ -839,11 +835,7 @@ export class DaemonDispatchLifecycle {
     observedAt: Date,
     processedAt: Date,
   ): Promise<boolean> {
-    if (
-      (execution.deadlineAt !== null && execution.deadlineAt.getTime() <= processedAt.getTime()) ||
-      (execution.idleDeadlineAt !== null &&
-        execution.idleDeadlineAt.getTime() <= observedAt.getTime())
-    ) {
+    if (daemonEventDeadlineElapsed(execution, observedAt, processedAt)) {
       await this.expireExecutionAtCurrentDeadline(executionId, false);
       return true;
     }
@@ -886,15 +878,11 @@ export class DaemonDispatchLifecycle {
 
   private async refreshAgentIdleDeadline(executionId: string, observedAt: Date): Promise<boolean> {
     const execution = await this.options.database.findAgentExecutionById(executionId);
-    if (execution === undefined || isTerminalExecutionStatus(execution.status)) {
+    if (!isActiveExecution(execution)) {
       return false;
     }
     const processedAt = new Date(this.now());
-    if (
-      (execution.deadlineAt !== null && execution.deadlineAt.getTime() <= processedAt.getTime()) ||
-      (execution.idleDeadlineAt !== null &&
-        execution.idleDeadlineAt.getTime() <= observedAt.getTime())
-    ) {
+    if (daemonEventDeadlineElapsed(execution, observedAt, processedAt)) {
       await this.expireExecutionAtCurrentDeadline(executionId, false);
       return false;
     }
@@ -920,24 +908,12 @@ export class DaemonDispatchLifecycle {
   }
 
   async completeAgentExecutionFromCallback(
-    input: {
-      executionId: string;
-      token: string;
-      output?: unknown;
-    },
-    options: { deferHubAction?: boolean } = {},
+    input: CompletionCallbackInput,
+    options: CompletionCallbackOptions = {},
   ): Promise<AgentExecutionRecord> {
     const existingExecution = await this.options.database.findAgentExecutionById(input.executionId);
-    if (existingExecution === undefined) {
-      throw new AgentExecutionCompletionFailure("not_found");
-    }
-
-    if (
-      existingExecution.completionTokenHash === null ||
-      !verifyAgentExecutionCompletionToken(input.token, existingExecution.completionTokenHash)
-    ) {
-      throw new AgentExecutionCompletionFailure("unauthorized");
-    }
+    assertCompletionExecutionExists(existingExecution);
+    assertCompletionToken(existingExecution, input);
 
     if (isTerminalExecutionStatus(existingExecution.status)) {
       return existingExecution;
@@ -945,9 +921,7 @@ export class DaemonDispatchLifecycle {
 
     await this.waitForPendingStreamHandlers(input.executionId);
     const currentExecution = await this.options.database.findAgentExecutionById(input.executionId);
-    if (currentExecution === undefined) {
-      throw new AgentExecutionCompletionFailure("not_found");
-    }
+    assertCompletionExecutionExists(currentExecution);
     if (isTerminalExecutionStatus(currentExecution.status)) {
       return currentExecution;
     }
@@ -955,17 +929,14 @@ export class DaemonDispatchLifecycle {
       throw new AgentExecutionCompletionFailure("expired");
     }
 
-    if (currentExecution.launchIntent?.outputSchema !== undefined) {
-      validateStructuredOutput(currentExecution.launchIntent.outputSchema, input.output);
-    }
+    validateCallbackOutput(currentExecution, input);
     this.clearExecutionDeadline(input.executionId);
     this.replyCapture?.noteExplicitFinish(input.executionId);
-    const execution = await this.completeAgentExecution(input.executionId, {
-      completedByAgent: true,
-      ...(options.deferHubAction === undefined ? {} : { deferHubAction: options.deferHubAction }),
-      ...(input.output === undefined ? {} : { output: input.output }),
-    });
-    if (options.deferHubAction === true && execution.hubAction === "archive") {
+    const execution = await this.completeAgentExecution(
+      input.executionId,
+      callbackCompletionOptions(input, options),
+    );
+    if (defersArchiveAcknowledgement(execution, options)) {
       await this.reconcileHubActionSafely(execution);
     }
     if (execution.status !== "succeeded") {
@@ -1125,11 +1096,12 @@ export class DaemonDispatchLifecycle {
     if (intent === null || this.options.publicBaseUrl === undefined)
       throw new Error("execution launch intent cannot be recovered");
     // An existing agent cannot receive replacement process environment credentials.
+    const options = this.options;
     if (
       current.agentSessionId !== null &&
-      this.options.executionAuthority &&
+      hasExecutionAuthority(options) &&
       !(await this.sessionOwner().canResumeAuthority(current, (executionId) =>
-        this.options.executionAuthority!.canResume({
+        options.executionAuthority.canResume({
           executionId,
           projectId: intent.projectId,
           triggerContext: intent.triggerContext,
@@ -1243,44 +1215,19 @@ export class DaemonDispatchLifecycle {
 
   private async completeAgentExecution(
     executionId: string,
-    options: {
-      completedByAgent?: boolean;
-      output?: unknown;
-      deferHubAction?: boolean;
-      /** Set when the agent's turn ended without finish_execution; null when it said nothing. */
-      turnEnd?: { text: string; truncated: boolean } | null;
-    } = {},
+    options: CompleteAgentExecutionOptions = {},
   ): Promise<AgentExecutionRecord> {
     const existing = await this.options.database.findAgentExecutionById(executionId);
     if (existing === undefined) throw new Error(`agent execution not found: ${executionId}`);
-    const structuredOutput =
-      existing.launchIntent?.outputSchema === undefined || options.output === undefined
-        ? undefined
-        : jsonValue(options.output);
-    const inferred = inferredTurnEndResult(
-      options.turnEnd,
-      existing.launchIntent?.replyMessage !== true,
-    );
+    const { fields, workflow } = successfulExecutionTransition(existing, options);
     const transition = await this.transitionTerminalAgentExecution(
       executionId,
       "succeeded",
-      {
-        result:
-          inferred ??
-          (structuredOutput === undefined
-            ? { status: "succeeded" }
-            : { status: "succeeded", output: options.output }),
-        completedByAgent: options.completedByAgent === true,
-      },
-      {
-        stepStatus: "succeeded",
-        stepOutput: inferred ?? structuredOutput,
-      },
+      fields,
+      workflow,
     );
     if (!transition.transitioned) {
-      if (isTerminalExecutionStatus(transition.execution.status)) {
-        this.releaseExecutionResources(executionId);
-      }
+      this.releaseIfExecutionTerminal(executionId, transition.execution);
       return transition.execution;
     }
 
@@ -1289,11 +1236,11 @@ export class DaemonDispatchLifecycle {
     this.finishCalls.release(executionId);
 
     const { execution } = transition;
-    if (this.replyCapture?.has(executionId) === true)
+    if (this.hasRunReplyCapture(executionId))
       await this.completeRunReplyCapture(execution, options.completedByAgent === true);
-    const deferArchiveAcknowledgement =
-      options.deferHubAction === true && execution.hubAction === "archive";
-    if (!deferArchiveAcknowledgement) this.releaseExecutionResources(executionId);
+    if (!defersArchiveAcknowledgement(execution, options)) {
+      this.releaseExecutionResources(executionId);
+    }
     this.startedExecutions.delete(executionId);
     await this.notifyExecutionTerminal(execution);
     if (options.deferHubAction !== true) await this.reconcileHubActionSafely(execution);
@@ -1305,60 +1252,32 @@ export class DaemonDispatchLifecycle {
     return execution;
   }
 
+  private hasRunReplyCapture(executionId: string): boolean {
+    return this.replyCapture?.has(executionId) === true;
+  }
+
+  private releaseIfExecutionTerminal(executionId: string, execution: AgentExecutionRecord): void {
+    if (isTerminalExecutionStatus(execution.status)) this.releaseExecutionResources(executionId);
+  }
+
   private async failAgentExecution(
     executionId: string,
     reason: string,
-    details: {
-      alreadyInterrupted?: boolean;
-      lastInvalidOutput?: unknown;
-      notifyProvider?: boolean;
-      deadlineCondition?: {
-        kind: "hard" | "idle";
-        deadlineAt: Date;
-        observedAt: Date;
-      };
-      deadlineKind?: WorkflowDeadlineKind;
-    } = {},
+    details: FailAgentExecutionDetails = {},
   ): Promise<AgentExecutionRecord | undefined> {
     const current = await this.options.database.findAgentExecutionById(executionId);
     if (current === undefined) throw new Error(`agent execution not found: ${executionId}`);
-    const result = {
-      status: "failed" as const,
-      reason,
-      ...(details.lastInvalidOutput === undefined
-        ? {}
-        : { lastInvalidOutput: details.lastInvalidOutput }),
-    };
-    const workflowDeadline =
-      current.workflowStepRunId !== null && details.deadlineCondition !== undefined;
-    const stepStatus =
-      workflowDeadline ||
-      (details.deadlineCondition?.kind === "hard" &&
-        current.deadlineAt !== null &&
-        current.deadlineAt.getTime() <= this.now())
-        ? ("timed_out" as const)
-        : ("failed" as const);
+    const { fields, workflow } = failedExecutionTransition(current, reason, details, () =>
+      this.now(),
+    );
     const transition = await this.transitionTerminalAgentExecution(
       executionId,
       "failed",
-      {
-        result,
-        ...(details.alreadyInterrupted === true ? { hubAction: null } : {}),
-        ...(details.deadlineCondition === undefined
-          ? {}
-          : { deadlineCondition: details.deadlineCondition }),
-      },
-      {
-        stepStatus,
-        stepOutput: result,
-        failureReason: reason,
-        ...(details.deadlineKind === undefined ? {} : { deadlineKind: details.deadlineKind }),
-      },
+      fields,
+      workflow,
     );
     if (!transition.transitioned) {
-      if (isTerminalExecutionStatus(transition.execution.status)) {
-        this.releaseExecutionResources(executionId);
-      }
+      this.releaseIfExecutionTerminal(executionId, transition.execution);
       return undefined;
     }
 
@@ -1459,25 +1378,25 @@ export class DaemonDispatchLifecycle {
 
   private async sendPendingHubAction(candidate: AgentExecutionRecord): Promise<void> {
     const execution = await this.options.database.findAgentExecutionById(candidate.id);
-    if (execution === undefined || execution.hubActionCompletedAt !== null || this.stopping) return;
+    if (!isUnfinishedHubAction(execution) || this.stopping) return;
     const action = execution.hubAction;
     const daemonId = execution.daemonId;
     if (action === null || daemonId === null) return;
     const connection = this.options.connectionForDaemon(daemonId);
-    if (action === "interrupt" && isCanceledExecution(execution)) {
+    if (isCanceledInterruptAction(execution, action)) {
       // Keep the generation observed by this recovery so a queued contender cannot
       // claim a new attempt after another worker releases the row.
       const generation = candidate.hubActionAcknowledgements.stopInterruptGeneration ?? null;
       await this.sendStopInterrupt(execution, daemonId, connection?.agents, generation);
-      return;
+    } else if (connection !== undefined) {
+      const settled = await withHubActionTimeout(
+        this.sessionOwner().control(execution, connection.agents, action),
+        this.dispatchTimeoutMs,
+        (callback, delayMs) => this.scheduleDeadline(async () => callback(), delayMs),
+      );
+      if (settled !== undefined)
+        await this.options.database.completeHubAction(execution.id, action);
     }
-    if (connection === undefined) return;
-    const settled = await withHubActionTimeout(
-      this.sessionOwner().control(execution, connection.agents, action),
-      this.dispatchTimeoutMs,
-      (callback, delayMs) => this.scheduleDeadline(async () => callback(), delayMs),
-    );
-    if (settled !== undefined) await this.options.database.completeHubAction(execution.id, action);
   }
 
   private async sendStopInterrupt(
@@ -1496,25 +1415,21 @@ export class DaemonDispatchLifecycle {
       let interrupted = state?.acknowledgedPeerIds;
       if (interrupted === undefined) {
         const daemon = await database.findDaemonById(daemonId);
-        if (daemon?.status === "revoked" && !stopInterruptMayHaveSent(state)) {
-          await store.complete(execution.id, token, "target_gone");
-          return;
-        }
-        if (claimed.expired || state === null || stopInterruptMayHaveSent(state)) {
-          await store.complete(execution.id, token, "delivery_unconfirmed");
-          return;
-        }
-        const outcome = await this.sessionOwner().interruptStoppedExecution(
-          execution,
-          agents,
-          token,
-          state.approvedPeerIds,
-        );
+        const delivery = stopInterruptDelivery(daemon, claimed, state);
+        const outcome =
+          typeof delivery === "string"
+            ? delivery
+            : await this.sessionOwner().interruptStoppedExecution(
+                execution,
+                agents,
+                token,
+                delivery.approvedPeerIds,
+              );
         if (typeof outcome === "string") {
           await store.complete(execution.id, token, outcome);
-          return;
+        } else {
+          interrupted = outcome;
         }
-        interrupted = outcome;
       }
       if (interrupted === undefined) return;
       await Promise.all(
@@ -1925,14 +1840,23 @@ export class DaemonDispatchLifecycle {
     // runs after each one and again right before the write.
     const stillWanted = () =>
       !this.stopping && this.turnEnds.get(executionId) === tracker && tracker.isCurrent(generation);
+    const ownsTurnEnd = () => stillWanted() && !this.finishCalls.ownsOutcome(executionId);
     await this.waitForPendingStreamHandlers(executionId);
-    if (!stillWanted() || this.finishCalls.ownsOutcome(executionId)) return;
+    if (!ownsTurnEnd()) return;
     const execution = await this.options.database.findAgentExecutionById(executionId);
-    if (execution === undefined || !mayCompleteOnTurnEnd(execution) || !stillWanted()) return;
-    if (await this.expireExecutionIfDeadlineElapsed(execution)) return;
-    if (!stillWanted() || (await this.hasOtherActiveSessionExecution(execution))) return;
-    if (!stillWanted() || !(await this.agentIsIdle(execution))) return;
-    if (!stillWanted() || this.finishCalls.ownsOutcome(executionId)) return;
+    if (
+      !isTurnEndCandidate(execution, stillWanted) ||
+      (await this.expireExecutionIfDeadlineElapsed(execution))
+    )
+      return;
+    if (
+      !stillWanted() ||
+      (await this.hasOtherActiveSessionExecution(execution)) ||
+      !stillWanted() ||
+      !(await this.agentIsIdle(execution)) ||
+      !ownsTurnEnd()
+    )
+      return;
     await this.completeAgentExecution(executionId, { turnEnd: tracker.finalOutput() ?? null });
   }
 
@@ -2050,7 +1974,7 @@ export class DaemonDispatchLifecycle {
       await this.waitForPendingStreamHandlers(executionId);
     }
     const execution = await this.options.database.findAgentExecutionById(executionId);
-    if (execution === undefined || isTerminalExecutionStatus(execution.status)) return false;
+    if (!isActiveExecution(execution)) return false;
     const deadline = nextExecutionDeadline(execution);
     if (deadline === undefined || deadline.at.getTime() > this.now()) {
       this.armExecutionDeadline(execution);
@@ -2067,15 +1991,11 @@ export class DaemonDispatchLifecycle {
       },
       ...(failure.deadlineKind === undefined ? {} : { deadlineKind: failure.deadlineKind }),
     });
-    if (failed !== undefined) {
-      return true;
+    if (failed === undefined) {
+      const current = await this.options.database.findAgentExecutionById(executionId);
+      if (isActiveExecution(current)) this.armExecutionDeadline(current);
     }
-
-    const current = await this.options.database.findAgentExecutionById(executionId);
-    if (current !== undefined && !isTerminalExecutionStatus(current.status)) {
-      this.armExecutionDeadline(current);
-    }
-    return false;
+    return failed !== undefined;
   }
 
   private async isWholeRunDeadlineExpired(execution: AgentExecutionRecord): Promise<boolean> {
@@ -2143,6 +2063,301 @@ export class DaemonDispatchLifecycle {
     }
     return deriveAgentExecutionCompletionToken(this.options.completionTokenSecret, executionId);
   }
+}
+
+function assertDispatchAuthority(
+  intent: LaunchMachineIntent,
+  run: Awaited<ReturnType<Database["findTriggerRunById"]>>,
+  config: Awaited<ReturnType<Database["findProjectConfigurationRevision"]>>,
+  daemonMachine: Awaited<ReturnType<Database["findMachineForOrganization"]>>,
+): void {
+  if (
+    run === undefined ||
+    run.organizationId !== intent.organizationId ||
+    run.projectId !== intent.projectId ||
+    config?.projectId !== intent.projectId ||
+    daemonMachine?.orgId !== intent.organizationId
+  ) {
+    throw new DaemonDispatchFailure("tenant_authority_mismatch");
+  }
+}
+
+function dispatchExecutionInput(
+  intent: LaunchMachineIntent,
+  daemon: DaemonRecord,
+  { id, completionToken, deadlineAt }: { id: string; completionToken: string; deadlineAt: Date },
+): Parameters<Database["insertAgentExecutionIfAbsent"]>[0] {
+  return {
+    id,
+    organizationId: intent.organizationId,
+    projectId: intent.projectId,
+    machineId: daemon.machineId,
+    daemonId: daemon.id,
+    triggerContext: intent.triggerContext,
+    outputContext: intent.outputContext,
+    configurationRevisionId: intent.configurationRevisionId,
+    completionTokenHash: hashAgentExecutionCompletionToken(completionToken),
+    deadlineAt,
+    workflowStepRunId: intent.workflowStepRunId ?? null,
+    launchIntent: intent,
+  };
+}
+
+function hasExecutionAuthority(
+  options: DaemonDispatchLifecycleOptions,
+): options is DaemonDispatchLifecycleOptions & { executionAuthority: ExecutionAuthority } {
+  return Boolean(options.executionAuthority);
+}
+
+function isUnattachedSpawningExecution(execution: AgentExecutionRecord): boolean {
+  return execution.status === "spawning" && execution.daemonAgentId === null;
+}
+
+function applyLaunchMaterialization(
+  intent: LaunchMachineIntent,
+  materialized: Awaited<ReturnType<NonNullable<TriggerProvider["materializeLaunch"]>>>,
+  persistedWorktree: LaunchMachineIntent["environment"]["worktree"],
+): LaunchMachineIntent {
+  const {
+    env: _persistedEnvironmentEnv,
+    worktree: _persistedWorktree,
+    ...environment
+  } = intent.environment;
+  const environmentWorktree = materialized.environmentWorktree ?? persistedWorktree;
+  return {
+    ...intent,
+    environment: {
+      ...environment,
+      ...(materialized.environmentEnv === undefined ? {} : { env: materialized.environmentEnv }),
+      ...(environmentWorktree === undefined ? {} : { worktree: environmentWorktree }),
+    },
+  };
+}
+
+function authorityLaunchOptions(authoredEnv: Record<string, string>, intent: LaunchMachineIntent) {
+  return {
+    ...(Object.keys(authoredEnv).length === 0 ? {} : { env: authoredEnv }),
+    ...(intent.github === undefined ? {} : { github: intent.github }),
+  };
+}
+
+function launchEnvironmentEnv(
+  intent: LaunchMachineIntent,
+  materialized: Awaited<ReturnType<NonNullable<TriggerProvider["materializeLaunch"]>>>,
+) {
+  return materialized.environmentEnv ?? intent.environment.env;
+}
+
+function assertIdleRefreshEvent(
+  event: Exclude<DaemonAgentStreamEvent, { type: "thread_started" }>,
+): void {
+  switch (event.type) {
+    case "timeline":
+    case "turn_completed":
+    case "turn_failed":
+    case "turn_canceled":
+    case "permission_requested":
+    case "permission_resolved":
+    case "turn_started":
+    case "attention_required":
+      return;
+  }
+  assertNeverAgentStreamEvent(event);
+}
+
+function finishExecutionToolCall(event: DaemonAgentStreamEvent) {
+  if (event.type !== "timeline" || event.item.type !== "tool_call") return undefined;
+  const item = event.item;
+  return isRecognizedFinishExecutionToolCall(item) ? item : undefined;
+}
+
+type TimelineItem = Extract<DaemonAgentStreamEvent, { type: "timeline" }>["item"];
+
+function isRecognizedFinishExecutionToolCall(
+  item: TimelineItem,
+): item is TimelineItem & { callId: string; status: AgentExecutionHubFinishExecutionStatus } {
+  return (
+    typeof item.name === "string" &&
+    isHubFinishExecutionToolName(item.name) &&
+    typeof item.callId === "string" &&
+    isHubFinishExecutionStatus(item.status)
+  );
+}
+
+function isActiveExecution(
+  execution: AgentExecutionRecord | undefined,
+): execution is AgentExecutionRecord {
+  return execution !== undefined && !isTerminalExecutionStatus(execution.status);
+}
+
+function daemonEventDeadlineElapsed(
+  execution: AgentExecutionRecord,
+  observedAt: Date,
+  processedAt: Date,
+): boolean {
+  return (
+    (execution.deadlineAt !== null && execution.deadlineAt.getTime() <= processedAt.getTime()) ||
+    (execution.idleDeadlineAt !== null &&
+      execution.idleDeadlineAt.getTime() <= observedAt.getTime())
+  );
+}
+
+function assertCompletionExecutionExists(
+  execution: AgentExecutionRecord | undefined,
+): asserts execution is AgentExecutionRecord {
+  if (execution === undefined) throw new AgentExecutionCompletionFailure("not_found");
+}
+
+function assertCompletionToken(
+  execution: AgentExecutionRecord,
+  input: CompletionCallbackInput,
+): void {
+  if (
+    execution.completionTokenHash === null ||
+    !verifyAgentExecutionCompletionToken(input.token, execution.completionTokenHash)
+  ) {
+    throw new AgentExecutionCompletionFailure("unauthorized");
+  }
+}
+
+function validateCallbackOutput(
+  execution: AgentExecutionRecord,
+  input: CompletionCallbackInput,
+): void {
+  if (execution.launchIntent?.outputSchema !== undefined) {
+    validateStructuredOutput(execution.launchIntent.outputSchema, input.output);
+  }
+}
+
+function callbackCompletionOptions(
+  input: CompletionCallbackInput,
+  options: CompletionCallbackOptions,
+): CompleteAgentExecutionOptions {
+  return {
+    completedByAgent: true,
+    ...(options.deferHubAction === undefined ? {} : { deferHubAction: options.deferHubAction }),
+    ...(input.output === undefined ? {} : { output: input.output }),
+  };
+}
+
+function defersArchiveAcknowledgement(
+  execution: AgentExecutionRecord,
+  options: CompletionCallbackOptions,
+): boolean {
+  return options.deferHubAction === true && execution.hubAction === "archive";
+}
+
+interface ExecutionTransition {
+  fields: TransitionAgentExecutionFields;
+  workflow: Pick<
+    WorkflowAgentCompletionInput,
+    "stepStatus" | "stepOutput" | "failureReason" | "deadlineKind"
+  >;
+}
+
+function successfulExecutionTransition(
+  existing: AgentExecutionRecord,
+  options: CompleteAgentExecutionOptions,
+): ExecutionTransition {
+  const structuredOutput =
+    existing.launchIntent?.outputSchema === undefined || options.output === undefined
+      ? undefined
+      : jsonValue(options.output);
+  const inferred = inferredTurnEndResult(
+    options.turnEnd,
+    existing.launchIntent?.replyMessage !== true,
+  );
+  return {
+    fields: {
+      result:
+        inferred ??
+        (structuredOutput === undefined
+          ? { status: "succeeded" }
+          : { status: "succeeded", output: options.output }),
+      completedByAgent: options.completedByAgent === true,
+    },
+    workflow: {
+      stepStatus: "succeeded",
+      stepOutput: inferred ?? structuredOutput,
+    },
+  };
+}
+
+function failedExecutionTransition(
+  current: AgentExecutionRecord,
+  reason: string,
+  details: FailAgentExecutionDetails,
+  now: () => number,
+): ExecutionTransition {
+  const result = {
+    status: "failed" as const,
+    reason,
+    ...(details.lastInvalidOutput === undefined
+      ? {}
+      : { lastInvalidOutput: details.lastInvalidOutput }),
+  };
+  const stepStatus = failedExecutionStepStatus(current, details, now);
+  return {
+    fields: {
+      result,
+      ...(details.alreadyInterrupted === true ? { hubAction: null } : {}),
+      ...(details.deadlineCondition === undefined
+        ? {}
+        : { deadlineCondition: details.deadlineCondition }),
+    },
+    workflow: {
+      stepStatus,
+      stepOutput: result,
+      failureReason: reason,
+      ...(details.deadlineKind === undefined ? {} : { deadlineKind: details.deadlineKind }),
+    },
+  };
+}
+
+function failedExecutionStepStatus(
+  current: AgentExecutionRecord,
+  details: FailAgentExecutionDetails,
+  now: () => number,
+): "timed_out" | "failed" {
+  const workflowDeadline =
+    current.workflowStepRunId !== null && details.deadlineCondition !== undefined;
+  return workflowDeadline ||
+    (details.deadlineCondition?.kind === "hard" &&
+      current.deadlineAt !== null &&
+      current.deadlineAt.getTime() <= now())
+    ? "timed_out"
+    : "failed";
+}
+
+function isUnfinishedHubAction(
+  execution: AgentExecutionRecord | undefined,
+): execution is AgentExecutionRecord {
+  return execution !== undefined && execution.hubActionCompletedAt === null;
+}
+
+function isCanceledInterruptAction(execution: AgentExecutionRecord, action: HubAction): boolean {
+  return action === "interrupt" && isCanceledExecution(execution);
+}
+
+function stopInterruptDelivery(
+  daemon: DaemonRecord | undefined,
+  claim: { expired: boolean },
+  state: StopInterruptState | null,
+): "target_gone" | "delivery_unconfirmed" | StopInterruptState {
+  if (daemon?.status === "revoked" && !stopInterruptMayHaveSent(state)) {
+    return "target_gone";
+  }
+  if (claim.expired || state === null || stopInterruptMayHaveSent(state)) {
+    return "delivery_unconfirmed";
+  }
+  return state;
+}
+
+function isTurnEndCandidate(
+  execution: AgentExecutionRecord | undefined,
+  stillWanted: () => boolean,
+): execution is AgentExecutionRecord {
+  return execution !== undefined && mayCompleteOnTurnEnd(execution) && stillWanted();
 }
 
 export function durableExecutionId(

@@ -1,11 +1,17 @@
 import assert from "node:assert/strict";
-import { describe, it } from "vitest";
+import { describe, it, vi } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import type { AgentExecutionRecord } from "../db/types.js";
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { mayCompleteOnTurnEnd } from "./lifecycle.js";
 import type { AgentEvent } from "./agents/index.js";
-import { MAX_TURN_END_OUTPUT_CHARS, TurnEndTracker } from "./turn-end.js";
+import {
+  MAX_TURN_END_OUTPUT_CHARS,
+  TURN_END_COMPLETION,
+  TURN_END_SETTLE_MS,
+  TurnEndTracker,
+} from "./turn-end.js";
+import { turnEndFixture } from "./test-utils/turn-end-fixture.js";
 import { registerTurnEndScenarios } from "./test-utils/turn-end-scenarios.js";
 
 const at = "2026-01-01T00:00:00.000Z";
@@ -260,3 +266,86 @@ describe("daemon lifecycle with the in-memory database", () => {
     organizationId: "org-turn-end",
   }));
 });
+
+describe("turn-end completion ownership", () => {
+  it.each(["a newer turn", "an explicit finish"] as const)(
+    "does not write when %s takes ownership during the idle check",
+    async (owner) => {
+      const fixture = await ownershipFixture();
+      try {
+        const { execution } = await fixture.dispatch();
+        await fixture.endTurn("finished");
+        const getOriginal = fixture.agents.get.bind(fixture.agents);
+        const get = vi.spyOn(fixture.agents, "get").mockImplementationOnce(async (agentId) => {
+          if (owner === "a newer turn") await fixture.deliver(fixture.events.turnStarted());
+          else fixture.lifecycle.finishCalls.start(execution.id);
+          return getOriginal(agentId);
+        });
+        const write = vi.spyOn(fixture.database, "transitionAgentExecution");
+
+        await fixture.clock.advance(TURN_END_SETTLE_MS);
+
+        assert.equal(get.mock.calls.length, 1);
+        assert.equal(write.mock.calls.length, 0);
+        assert.equal((await fixture.execution(execution.id)).status, "running");
+      } finally {
+        await fixture.lifecycle.stop();
+      }
+    },
+  );
+
+  it("does not check daemon idle or write while another execution shares the turn", async () => {
+    const fixture = await ownershipFixture("shared-turn");
+    try {
+      const first = await fixture.dispatch();
+      const second = await fixture.dispatch();
+      await fixture.endTurn("finished");
+      const get = vi.spyOn(fixture.agents, "get");
+      const readSiblings = vi.spyOn(fixture.database, "listAgentSessionExecutions");
+      const write = vi.spyOn(fixture.database, "transitionAgentExecution");
+      const sessionId = (await fixture.execution(first.execution.id)).agentSessionId;
+      assert.ok(sessionId);
+      assert.equal((await fixture.execution(second.execution.id)).agentSessionId, sessionId);
+
+      await fixture.clock.advance(TURN_END_SETTLE_MS);
+
+      assert.deepEqual(readSiblings.mock.calls, [[sessionId], [sessionId]]);
+      assert.equal(get.mock.calls.length, 0);
+      assert.equal(write.mock.calls.length, 0);
+      assert.equal((await fixture.execution(first.execution.id)).status, "running");
+      assert.equal((await fixture.execution(second.execution.id)).status, "running");
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
+
+  it("writes one inferred completion when the tracked turn still owns the outcome", async () => {
+    const fixture = await ownershipFixture();
+    try {
+      const { execution } = await fixture.dispatch();
+      await fixture.endTurn("finished");
+      const write = vi.spyOn(fixture.database, "transitionAgentExecution");
+
+      await fixture.clock.advance(TURN_END_SETTLE_MS);
+
+      assert.equal(write.mock.calls.length, 1);
+      assert.deepEqual((await fixture.execution(execution.id)).result, {
+        status: "succeeded",
+        completion: TURN_END_COMPLETION,
+        output: "finished",
+      });
+    } finally {
+      await fixture.lifecycle.stop();
+    }
+  });
+});
+
+function ownershipFixture(continuationKey?: string) {
+  const organizationId = "org-turn-owner";
+  return turnEndFixture({
+    database: createMemoryDatabase({ organizationIds: [organizationId] }),
+    organizationId,
+    completeOnTurnEnd: true,
+    ...(continuationKey === undefined ? {} : { continuationKey }),
+  });
+}
