@@ -44,24 +44,13 @@ export function PlanDialog({
 }) {
   const intervals = offeredIntervals(plans);
   const [interval, setInterval] = useState<BillingPlanPriceInterval>(intervals[0] ?? "monthly");
-  const checkout = useMutation({
-    mutationFn: useServerFn(billingCheckout) as (
-      input: Parameters<typeof billingCheckout>[0],
-    ) => Promise<CheckoutResult>,
-    onSuccess: (result) => {
-      if (result.status === "ok") redirectTo(result.data.url);
-    },
-  });
+  const { checkout, choose } = useCheckout({ slug, interval });
   const failed = checkout.data?.status === "error";
   const handleOpenChange = useCallback(
     (open: boolean) => {
       if (!open) onClose();
     },
     [onClose],
-  );
-  const choose = useCallback(
-    (planSlug: string) => checkout.mutate({ data: { organizationSlug: slug, planSlug, interval } }),
-    [checkout, interval, slug],
   );
 
   return (
@@ -97,6 +86,22 @@ export function PlanDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+function useCheckout({ slug, interval }: { slug: string; interval: BillingPlanPriceInterval }) {
+  const checkout = useMutation({
+    mutationFn: useServerFn(billingCheckout) as (
+      input: Parameters<typeof billingCheckout>[0],
+    ) => Promise<CheckoutResult>,
+    onSuccess: (result) => {
+      if (result.status === "ok") redirectTo(result.data.url);
+    },
+  });
+  const choose = useCallback(
+    (planSlug: string) => checkout.mutate({ data: { organizationSlug: slug, planSlug, interval } }),
+    [checkout, interval, slug],
+  );
+  return { checkout, choose };
 }
 
 /** Rendered only when the catalog prices more than one interval: a choice between two words. */
