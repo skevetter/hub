@@ -51,6 +51,33 @@ test("the command menu navigates, switches organization, and applies theme witho
   expect(await page.evaluate(() => performance.timeOrigin)).toBe(documentStart);
 });
 
+test("the command menu finds settings and actions by name", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  const dialog = page.getByRole("dialog", { name: "Command menu" });
+  const input = dialog.getByRole("combobox", { name: "Search commands" });
+  const base = page.url().replace(/\/home$/u, "");
+
+  await page.keyboard.press("Control+k");
+  await input.fill("webhook");
+  await expect(dialog.getByRole("option", { name: "Triggers", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("option", { name: "New trigger", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("option", { name: "Create API key", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("option", { name: "Activity", exact: true })).toHaveCount(0);
+
+  await input.fill("api key");
+  await expect(dialog.getByRole("option", { name: "API keys", exact: true })).toBeVisible();
+  await input.fill("Create API key");
+  await input.press("Enter");
+  await expect(page).toHaveURL(`${base}/settings/api-keys`);
+  await expect(dialog).toBeHidden();
+
+  await page.keyboard.press("Control+k");
+  await input.fill("New trigger");
+  await input.press("Enter");
+  await expect(page).toHaveURL(/\/triggers\/new\/edit/u);
+});
+
 test("the account menu offers System, Light, and Dark", async ({ hub, page, context }) => {
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");

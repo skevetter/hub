@@ -24,6 +24,7 @@ import {
   CommandItem,
   CommandList,
 } from "../components/ui/command.js";
+import { commandActions, matchCommand, pageKeywords } from "./command-entries.js";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "../components/ui/dialog.js";
 import { SidebarMenuButton } from "../components/ui/sidebar.js";
 import { THEME_OPTIONS, useTheme } from "../theme/index.js";
@@ -60,9 +61,9 @@ export function CommandMenuProvider({
         >
           <DialogTitle className="sr-only">Command menu</DialogTitle>
           <DialogDescription className="sr-only">
-            Search pages, organizations, and themes
+            Search pages, settings, actions, organizations, and themes
           </DialogDescription>
-          <Command label="Search commands">
+          <Command label="Search commands" filter={matchCommand}>
             <CommandInput placeholder="Search commands..." />
             <MenuCommands {...commands} close={close} />
           </Command>
@@ -173,8 +174,23 @@ function MenuCommands({
   return (
     <CommandList>
       <CommandEmpty>No matching commands.</CommandEmpty>
-      <RouteCommands heading="Navigate" items={navigation.items} navigate={navigate} />
-      <RouteCommands heading="Setup" items={navigation.setup} navigate={navigate} />
+      <RouteCommands
+        heading="Navigate"
+        slug={settings.slug}
+        items={navigation.items}
+        navigate={navigate}
+      />
+      <ActionCommands
+        settings={settings}
+        sessionsEnabled={navigation.items.some(({ to }) => to.endsWith("/sessions"))}
+        navigate={navigate}
+      />
+      <RouteCommands
+        heading="Setup"
+        slug={settings.slug}
+        items={navigation.setup}
+        navigate={navigate}
+      />
       <SettingsCommands settings={settings} navigate={navigate} />
       <CommandGroup heading="Switch organization">
         {memberships.map((membership) => (
@@ -201,10 +217,11 @@ function SettingsCommands({
   const items = useOrganizationSettingsItems(settings);
   return (
     <>
-      <RouteCommands heading="Settings" items={items} navigate={navigate} />
+      <RouteCommands heading="Settings" slug={settings.slug} items={items} navigate={navigate} />
       {settings.isInstanceOperator ? (
         <RouteCommands
           heading="Instance"
+          slug={settings.slug}
           items={instanceSettingsItems(settings.slug)}
           navigate={navigate}
         />
@@ -213,37 +230,81 @@ function SettingsCommands({
   );
 }
 
+function ActionCommands({
+  settings,
+  sessionsEnabled,
+  navigate,
+}: {
+  settings: SettingsAccess;
+  sessionsEnabled: boolean;
+  navigate: (to: string) => void;
+}) {
+  const actions = commandActions({
+    slug: settings.slug,
+    manageResources: settings.manageResources,
+    sessionsEnabled,
+  });
+  if (actions.length === 0) return null;
+  return (
+    <CommandGroup heading="Actions">
+      {actions.map(({ to, label, keywords }) => (
+        <RouteCommand
+          key={to}
+          to={to}
+          label={label}
+          group="Actions"
+          keywords={keywords}
+          navigate={navigate}
+        />
+      ))}
+    </CommandGroup>
+  );
+}
+
 function RouteCommands({
   heading,
+  slug,
   items,
   navigate,
 }: {
   heading: string;
+  slug: string;
   items: readonly Destination[];
   navigate: (to: string) => void;
 }) {
   return (
     <CommandGroup heading={heading}>
-      {items.map((item) => (
-        <RouteCommand key={item.to} item={item} group={heading} navigate={navigate} />
+      {items.map(({ to, label }) => (
+        <RouteCommand
+          key={to}
+          to={to}
+          label={label}
+          group={heading}
+          keywords={pageKeywords(slug, to)}
+          navigate={navigate}
+        />
       ))}
     </CommandGroup>
   );
 }
 
 function RouteCommand({
-  item,
+  to,
+  label,
   group,
+  keywords,
   navigate,
 }: {
-  item: Destination;
+  to: string;
+  label: string;
   group: string;
+  keywords: string[];
   navigate: (to: string) => void;
 }) {
-  const select = useCallback(() => navigate(item.to), [item.to, navigate]);
+  const select = useCallback(() => navigate(to), [to, navigate]);
   return (
-    <CommandItem value={`${item.label} ${group}`} onSelect={select}>
-      {item.label}
+    <CommandItem value={`${label} ${group}`} keywords={keywords} onSelect={select}>
+      {label}
     </CommandItem>
   );
 }
