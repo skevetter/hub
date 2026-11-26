@@ -30,6 +30,7 @@ import { configurationBundleFixture } from "../../src/test-utils/configuration-b
 import { slugify } from "../../src/slug.js";
 import { AppSetupSurface, allowClipboard } from "./apps.js";
 import { SHOTS } from "./app-evidence.js";
+import { shellLink } from "./shell-links.js";
 import {
   ProjectNavigation,
   type OrganizationSection,
@@ -5413,7 +5414,7 @@ class HubUser {
   }
 
   private async expectCurrentDaemonAbsent(displayName: string): Promise<void> {
-    await this.page.getByRole("link", { name: "Daemons", exact: true }).click();
+    await shellLink(this.page, "Daemons").click();
     await expect(this.page).toHaveURL(/\/o\/[^/]+\/daemons$/u);
     await expect(this.page.getByRole("heading", { name: "Daemons" })).toBeVisible();
     await expect(this.page.getByRole("row").filter({ hasText: displayName })).toHaveCount(0);

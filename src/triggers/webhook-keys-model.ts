@@ -9,7 +9,10 @@ export const DEFAULT_OVERLAP_MINUTES = 60;
 export const MAX_OVERLAP_MINUTES = 24 * 60;
 
 /** Live means not revoked and not past its expiry. A key with a future expiry is still live. */
-export function webhookKeyStatus(key: WebhookKeyRecord, now: number): WebhookKeyStatus {
+export function webhookKeyStatus(
+  key: Pick<WebhookKeyRecord, "revokedAt" | "expiresAt">,
+  now: number,
+): WebhookKeyStatus {
   if (key.revokedAt !== null) return "revoked";
   if (key.expiresAt === null) return "active";
   return new Date(key.expiresAt).getTime() > now ? "expiring" : "expired";

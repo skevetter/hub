@@ -20,7 +20,7 @@ import {
 } from "../components/ui/dialog.js";
 import { DropdownMenuItem } from "../components/ui/dropdown-menu.js";
 import { StateBlock } from "../components/app/state-block.js";
-import { credentialState } from "../components/app/state-label.js";
+import { webhookKeyState, webhookKeyStatus } from "../triggers/webhook-keys-model.js";
 import { FieldDescription, FieldError } from "../components/ui/field.js";
 import type { Snapshot } from "../queries/index.js";
 import { githubSignerUrl, webhookCurl } from "../webhooks/contract.js";
@@ -41,6 +41,7 @@ export interface ApiKeyRecord {
   createdAt: string;
   lastUsedAt: string | null;
   revokedAt: string | null;
+  expiresAt: string | null;
   authentication?: WebhookSigningSummary | undefined;
 }
 
@@ -306,8 +307,10 @@ export function ApiKeyTable({
   signingAvailability = "disabled",
   onRotate,
   onRetire,
+  now = Date.now(),
 }: {
   records: ApiKeyRecord[];
+  now?: number;
   signingAvailability?: ApiKeySigningAvailability;
   onRotate?: (record: ApiKeyRecord) => void;
   onRetire?: (id: string, versionId: string) => void;
@@ -326,6 +329,7 @@ export function ApiKeyTable({
         <ApiKeyRow
           key={record.id}
           record={record}
+          now={now}
           canManage={canManage}
           busy={busy}
           onRevoke={onRevoke}
@@ -340,6 +344,7 @@ export function ApiKeyTable({
 
 interface ApiKeyRowProps {
   record: ApiKeyRecord;
+  now: number;
   signingAvailability: ApiKeySigningAvailability;
   onRotate: ((record: ApiKeyRecord) => void) | undefined;
   onRetire: ((id: string, versionId: string) => void) | undefined;
@@ -349,7 +354,7 @@ interface ApiKeyRowProps {
 }
 
 function ApiKeyRow(props: ApiKeyRowProps) {
-  const { record, canManage, busy, onRevoke, signingAvailability, onRotate, onRetire } = props;
+  const { record, now, canManage, busy, onRevoke, signingAvailability, onRotate, onRetire } = props;
   const revoke = useCallback(() => onRevoke({ data: { id: record.id } }), [onRevoke, record.id]);
   const auth = record.authentication;
   const previousDeadline = auth?.previousAcceptUntil;
@@ -368,7 +373,7 @@ function ApiKeyRow(props: ApiKeyRowProps) {
   return (
     <DataRow>
       <DataCell>
-        <StateBlock state={credentialState(record.revokedAt !== null)} />
+        <StateBlock state={webhookKeyState(webhookKeyStatus(record, now))} />
       </DataCell>
       <DataCell>
         <TwoLine

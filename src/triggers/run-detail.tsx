@@ -152,10 +152,9 @@ function useRunStop(
       sendStop({ data: { organizationSlug, runId, ...confirmation } }),
     onSuccess: async (result) => {
       if (result.status !== "ok" || result.data.status !== "stopped") return;
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: runDetailKey(organizationSlug, detail.run.id) }),
-        queryClient.invalidateQueries({ queryKey: ["attention"] }),
-      ]);
+      await queryClient.invalidateQueries({
+        queryKey: runDetailKey(organizationSlug, detail.run.id),
+      });
     },
   });
   const sendConfirmation = stop.mutateAsync;
