@@ -31,6 +31,10 @@ export function createObservedDatabase(
   database: Database,
   options: ObservedDatabaseOptions,
 ): Database {
+  return bindObservedMethods(database, createOverrides(database, options));
+}
+
+function createAfterObservation(options: ObservedDatabaseOptions) {
   async function report(
     error: unknown,
     operation: string,
@@ -61,12 +65,19 @@ export function createObservedDatabase(
     return persisted;
   }
 
-  function scopeFor(run: TriggerRunRecord | undefined): TimelineRunScope | undefined {
-    return run?.outcome === "accepted"
-      ? { organizationId: run.organizationId, triggerRunId: run.id }
-      : undefined;
-  }
+  return { observe, after };
+}
 
+function scopeFor(run: TriggerRunRecord | undefined): TimelineRunScope | undefined {
+  return run?.outcome === "accepted"
+    ? { organizationId: run.organizationId, triggerRunId: run.id }
+    : undefined;
+}
+
+type ObservedMethods = Pick<Database, (typeof OBSERVED_DATABASE_METHODS)[number]>;
+
+function createWorkflowObservers(database: Database, options: ObservedDatabaseOptions) {
+  const { observe, after } = createAfterObservation(options);
   function reconcile(scope: TimelineRunScope | undefined): void {
     if (scope !== undefined) {
       observe(() => options.reconciler.reconcile(scope.organizationId, scope.triggerRunId), scope);
@@ -100,7 +111,21 @@ export function createObservedDatabase(
     if (association !== undefined) reconcile(await runScope(association.triggerRunId));
   }
 
-  const overrides: Pick<Database, (typeof OBSERVED_DATABASE_METHODS)[number]> = {
+  function observeRecoveries(
+    recoveries: Awaited<ReturnType<Database["recoverWorkflowDeadlines"]>>,
+  ) {
+    for (const recovery of recoveries) {
+      observe(async () => reconcile(await runScope(recovery.triggerRunId)));
+    }
+  }
+
+  return { after, steps: { reconcile, observeStep, observeExecution }, observeRecoveries };
+}
+
+function createOverrides(database: Database, options: ObservedDatabaseOptions): ObservedMethods {
+  const { after, steps, observeRecoveries } = createWorkflowObservers(database, options);
+  const { reconcile, observeStep, observeExecution } = steps;
+  return {
     createWorkflowStepExecution: (input) =>
       after(database.createWorkflowStepExecution(input), (result) =>
         observeStep(result.stepRun, result.created),
@@ -134,12 +159,11 @@ export function createObservedDatabase(
         if (result?.transitioned) reconcile(scopeFor(result.run));
       }),
     recoverWorkflowDeadlines: (now) =>
-      after(database.recoverWorkflowDeadlines(now), (recoveries) => {
-        for (const recovery of recoveries) {
-          observe(async () => reconcile(await runScope(recovery.triggerRunId)));
-        }
-      }),
+      after(database.recoverWorkflowDeadlines(now), observeRecoveries),
   };
+}
+
+function bindObservedMethods(database: Database, overrides: ObservedMethods): Database {
   const bindings = new Map<PropertyKey, unknown>();
   return new Proxy(database, {
     get(target, property) {
