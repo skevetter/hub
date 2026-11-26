@@ -64,6 +64,9 @@ const ANCHORED_STEPS = STEPS.replace("prompt: Plan it.", "prompt: &p Plan it.")
   .replace("prompt: Fix it.", "prompt: *p")
   .replace("    if: \"${{ steps.plan.outputs.verdict == 'fix' }}\"\n", "");
 
+const ALIAS_REFUSAL =
+  "This change would break a YAML alias. Edit the anchor or alias in YAML first.";
+
 function form(yaml: string): TriggerFormValue {
   const projection = projectTriggerForm(yaml);
   if (projection.status !== "editable") throw new Error(projection.reason);
@@ -178,7 +181,7 @@ describe("writing steps", () => {
     expect(patched(STEPS, form(STEPS))).toBe(STEPS);
   });
 
-  it("converts run to steps when a step is added, keeping its conversation and the target", () => {
+  it("converts a plain run without aliases when a step is added", () => {
     const yaml = patched(RUN, complete(addStep(form(RUN))));
     const document = parseTriggerDocument(yaml);
     expect(document.run).toBeUndefined();
@@ -187,6 +190,16 @@ describe("writing steps", () => {
     expect(document.steps?.[0]).toMatchObject({ continuation: { mode: "conversation" } });
     expect(document.steps?.[1]).not.toHaveProperty("continuation");
     expect(() => compileTriggerDocument(yaml)).not.toThrow();
+  });
+
+  it("converts a run when its alias keeps the same anchor", () => {
+    const yaml = RUN.replace("name: build-review", "name: &p review").replace(
+      "prompt: Review it.",
+      "prompt: *p",
+    );
+    const converted = patched(yaml, complete(addStep(form(yaml))));
+    expect(converted).toContain("prompt: *p");
+    expect(parseTriggerDocument(converted).steps?.[0]).toMatchObject({ prompt: "review" });
   });
 
   it("keeps a one-step list as a list, and does not write a continuation for a new agent", () => {
@@ -239,8 +252,38 @@ steps:
     expect(patchTriggerYaml(ANCHORED_STEPS, changed)).toBe(ANCHORED_STEPS);
     expect(mergeTriggerForm(ANCHORED_STEPS, changed)).toEqual({
       status: "incomplete",
-      reason: "This change would break a YAML alias. Edit the anchor or alias in YAML first.",
+      reason: ALIAS_REFUSAL,
     });
+  });
+
+  it("refuses to convert a run when its alias would resolve to a different anchor", () => {
+    const run = RUN.replace(ON, "")
+      .replace("name: build-review", "name: &p review")
+      .replace("prompt: Review it.", "prompt: *p");
+    const yaml = run + ON.replace("connection: acme-slack", "connection: &p work-slack");
+    const value = form(yaml);
+    expect(step(value, 0).prompt).toBe("review");
+    const changed = complete(addStep(value));
+    expect(patchTriggerYaml(yaml, changed)).toBe(yaml);
+    expect(mergeTriggerForm(yaml, changed)).toEqual({
+      status: "incomplete",
+      reason: ALIAS_REFUSAL,
+    });
+  });
+
+  it("refuses to replace a run when the surviving target alias would lose its anchor", () => {
+    const yaml = RUN.replace("run:\n", "run:\n  prompt: &dir /workspace/app\n")
+      .replace("cwd: /workspace/app", "cwd: *dir")
+      .replace("  prompt: Review it.\n", "");
+    const added = complete(addStep(form(yaml)));
+    const replacement = withStep({ ...added, steps: added.steps.slice(1) }, 0, { id: "run" });
+    expect(mergeTriggerForm(yaml, replacement)).toEqual({
+      status: "incomplete",
+      reason: ALIAS_REFUSAL,
+    });
+    expect(patchTriggerYaml(yaml, replacement)).toBe(yaml);
+    expect(stepListEditError(added, { kind: "remove", index: 0 })).toBe(ALIAS_REFUSAL);
+    expect(removeStep(added, 0)).toBe(added);
   });
 
   it("adds a step, writes the whole-run deadline, and drops a cleared condition", () => {

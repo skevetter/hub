@@ -17,6 +17,17 @@ export type YamlPath = readonly (string | number)[];
 export const SHARED_YAML_FIELD =
   "This field is shared with another field through a YAML anchor. Edit it in YAML.";
 
+export const BROKEN_YAML_ALIAS =
+  "This change would break a YAML alias. Edit the anchor or alias in YAML first.";
+
+export function isYamlAliasRefusal(cause: unknown): boolean {
+  return (
+    cause instanceof Error &&
+    (cause.message === BROKEN_YAML_ALIAS ||
+      cause.message.startsWith("Unresolved alias (the anchor must be set before the alias):"))
+  );
+}
+
 export function assertDocument(document: Document): void {
   const [error] = document.errors;
   if (error !== undefined) throw new Error(error.message);

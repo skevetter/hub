@@ -37,7 +37,9 @@ import {
 import { blankToUndefined, commaSeparated, incompleteReason, refused } from "./editor-text.js";
 import {
   assertDocument,
+  BROKEN_YAML_ALIAS,
   deleteIfPresent,
+  isYamlAliasRefusal,
   sameValue,
   setIfChanged,
   setOptional,
@@ -177,7 +179,7 @@ function projectEditorEvent(
       ),
     ),
     ...metadata,
-    ...stepOrderMetadata(parsed.source, yaml),
+    ...stepOrderMetadata(parsed.source, yaml, projected),
   };
   return { status: "editable", value };
 }
@@ -271,13 +273,27 @@ function patchExistingTrigger(
 
   const document = parseDocument(yaml, { compat: ["timestamp"] });
   assertDocument(document);
+  try {
+    patchExistingDocument(document, previous, value, unchanged);
+    return { yaml: document.toString({ lineWidth: 0 }) };
+  } catch (cause) {
+    if (isYamlAliasRefusal(cause)) return { yaml, refusal: BROKEN_YAML_ALIAS };
+    throw cause;
+  }
+}
+
+function patchExistingDocument(
+  document: Document,
+  previous: TriggerFormValue,
+  value: TriggerFormValue,
+  unchanged: boolean,
+): void {
   patchMessageFlags(document, previous, value);
-  if (unchanged) return { yaml: document.toString({ lineWidth: 0 }) };
+  if (unchanged) return;
   if (previous.name !== value.name) setIfChanged(document, ["name"], value.name);
   if (previous.enabled !== value.enabled) setIfChanged(document, ["enabled"], value.enabled);
   patchEvent(document, previous, value);
   patchRun(document, previous, value);
-  return { yaml: document.toString({ lineWidth: 0 }) };
 }
 
 function patchMessageFlags(

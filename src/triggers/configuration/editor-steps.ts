@@ -1,4 +1,4 @@
-import { isMap, isSeq, parseDocument, type Document } from "yaml";
+import { isMap, isSeq, parseDocument, type Document, type YAMLMap } from "yaml";
 import { expressionPaths, parseExpression } from "../../workflows/expression.js";
 import { ContinuationSchema } from "../continuation.js";
 import type { TriggerFieldErrors } from "./editor.js";
@@ -12,9 +12,9 @@ import {
   splitAgentId,
 } from "./editor-text.js";
 import {
+  BROKEN_YAML_ALIAS,
   deleteIfPresent,
   requireWritableYaml,
-  SHARED_YAML_FIELD,
   setIfChanged,
   setOptional,
   sharedYamlPath,
@@ -205,7 +205,7 @@ export function hasScriptStep(value: { steps: readonly TriggerStepFormValue[] })
 // -- Editing the list ---------------------------------------------------------------------------
 
 export interface StepOrderMetadata {
-  stepOrderSource?: { yaml: string; count: number; shared: boolean };
+  stepOrderSource?: { yaml: string; steps: readonly TriggerStepFormValue[] };
 }
 
 interface StepListValue extends StepOrderMetadata {
@@ -270,10 +270,11 @@ export function stepOrderError(
 ): string | undefined {
   const source = previous.stepOrderSource;
   if (source === undefined) return undefined;
-  const matches = matchStepOrigins(source.count, next);
-  if (sameStepOrder(source.count, matches)) return undefined;
-  if (source.shared) return SHARED_YAML_FIELD;
-  return prospectiveStepOrderError(source.yaml, matches);
+  const document = parseDocument(source.yaml, { compat: ["timestamp"] });
+  // New rows have no anchors and may still be incomplete.
+  return refused(() =>
+    patchStepLayout(document, source.steps, next, () => document.createNode({})),
+  );
 }
 
 function proposedStepOrder(
@@ -611,24 +612,40 @@ export interface StepLayout {
   steps: PlannedStep[];
 }
 
+type CreateStepNode = (step: TriggerStepFormValue, shorthand: boolean) => YAMLMap;
+
+export function patchStepLayout(
+  document: Document,
+  previous: readonly TriggerStepFormValue[],
+  next: readonly TriggerStepFormValue[],
+  createStep: CreateStepNode = (step, shorthand) =>
+    document.createNode(stepDocument(step, shorthand)),
+): StepLayout {
+  const aliases = yamlAliases(document);
+  const layout = applyStepLayout(document, previous, next, createStep);
+  if (yamlAliasTargetsChanged(document, aliases)) throw new Error(BROKEN_YAML_ALIAS);
+  return layout;
+}
+
 /**
  * Makes the document's step structure match the form's and says where each step now lives.
  * A `run` document stays one while the form still has just its plain step, and becomes a list
  * the moment it has more or the step needs an id, a condition or an output schema.
  */
-export function patchStepLayout(
+function applyStepLayout(
   document: Document,
   previous: readonly TriggerStepFormValue[],
   next: readonly TriggerStepFormValue[],
+  createStep: CreateStepNode,
 ): StepLayout {
   if (document.has("run")) {
     const [only] = next;
     if (only !== undefined && staysShorthand(previous[0], next)) {
-      return patchShorthandLayout(document, previous[0], only);
+      return patchShorthandLayout(document, previous[0], only, createStep);
     }
     convertRunToSteps(document, previous[0]);
   }
-  return patchStepList(document, previous, next);
+  return patchStepList(document, previous, next, createStep);
 }
 
 /**
@@ -654,12 +671,13 @@ function patchShorthandLayout(
   document: Document,
   previous: TriggerStepFormValue | undefined,
   next: TriggerStepFormValue,
+  createStep: CreateStepNode,
 ): StepLayout {
   const kept = next.origin === 0;
   if (!kept) {
     requireWritableYaml(document, ["run"]);
     const target = document.getIn(["run", "target"], true);
-    const run = document.createNode(stepDocument(next, true));
+    const run = createStep(next, true);
     run.items.unshift(document.createPair("target", target));
     document.set("run", run);
   }
@@ -689,6 +707,7 @@ function patchStepList(
   document: Document,
   previous: readonly TriggerStepFormValue[],
   next: readonly TriggerStepFormValue[],
+  createStep: CreateStepNode,
 ): StepLayout {
   const sequence = document.get("steps", true);
   if (!isSeq(sequence)) throw new Error("Expected a list of steps.");
@@ -697,9 +716,7 @@ function patchStepList(
     requireWritableYaml(document, ["steps"]);
     const items = next.map((step, index) => {
       const match = matches[index];
-      return match === undefined
-        ? document.createNode(stepDocument(step, false))
-        : sequence.items[match];
+      return match === undefined ? createStep(step, false) : sequence.items[match];
     });
     sequence.items = items;
   }
@@ -891,32 +908,12 @@ function patchGitHubAuthority(
 
 // -- YAML anchors -------------------------------------------------------------------------------
 
-export function stepOrderMetadata(source: Document, yaml: string): StepOrderMetadata {
-  const sequence = source.get("steps", true);
-  if (!isSeq(sequence)) return {};
-  const aliases = yamlAliases(source);
-  if (aliases.size === 0) return {};
-  return {
-    stepOrderSource: {
-      yaml,
-      count: sequence.items.length,
-      shared: sharedYamlPath(source, ["steps"], aliases),
-    },
-  };
-}
-
-function prospectiveStepOrderError(
+export function stepOrderMetadata(
+  source: Document,
   yaml: string,
-  matches: readonly (number | undefined)[],
-): string | undefined {
-  const document = parseDocument(yaml, { compat: ["timestamp"] });
-  const sequence = document.get("steps", true);
-  if (!isSeq(sequence)) return undefined;
-  const aliases = yamlAliases(document);
-  sequence.items = matches.map((match) => (match === undefined ? null : sequence.items[match]));
-  return yamlAliasTargetsChanged(document, aliases)
-    ? "This change would break a YAML alias. Edit the anchor or alias in YAML first."
-    : undefined;
+  steps: readonly TriggerStepFormValue[],
+): StepOrderMetadata {
+  return yamlAliases(source).size === 0 ? {} : { stepOrderSource: { yaml, steps } };
 }
 
 const STEP_FIELD_PATHS: [TriggerStepField, ...string[]][] = [
