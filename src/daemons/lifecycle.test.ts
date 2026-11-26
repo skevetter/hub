@@ -13,6 +13,7 @@ import {
   durableExecutionId,
   executionWorkspaceTitle,
   type DaemonDispatchLifecycle,
+  type DaemonDispatchLifecycleOptions,
 } from "./lifecycle.js";
 import { createDurableWorkflowHandler } from "../workflows/engine.js";
 import type { TriggerProvider } from "../triggers/index.js";
@@ -997,6 +998,52 @@ describe("dispatch retries transient database failures", () => {
       assert.deepEqual(find.mock.calls, [[executionId], [executionId]]);
       assert.equal(transition.mock.calls.length, 0);
     } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("preserves the recovery error when execution authority disappears before the resume check", async () => {
+    const { database, intent, lifecycle, stream } = await dispatchFixture();
+    const canResume = vi.fn(async () => true);
+    const options: DaemonDispatchLifecycleOptions = {
+      database,
+      connectionForDaemon: () => new AcknowledgementConnection(),
+      publicBaseUrl: "https://hub.test",
+      completionTokenSecret: "test-secret",
+      executionAuthority: {
+        canResume,
+        materialize: async () => ({ env: {} }),
+        recover: async () => {},
+        onExecutionTerminal: async () => {},
+        resourceCounts: () => ({ executionStates: 0, leases: 0, pendingMaterializations: 0 }),
+        stop: async () => {},
+      },
+      test: { logger: createLogger(stream) },
+    };
+    const recovery = createDaemonDispatchLifecycle(options);
+    const resume = vi.spyOn(AgentSessions.prototype, "canResumeAuthority");
+    try {
+      const { execution } = await lifecycle.dispatchLaunchMachineIntent(intent);
+      await lifecycle.stop();
+      resume.mockImplementationOnce(async (current, available) => {
+        delete options.executionAuthority;
+        return available(current.id);
+      });
+
+      await recovery.recoverDaemon({ ...daemonRecord(), id: TEST_DAEMON_ID });
+
+      assert.equal(resume.mock.calls.length, 1);
+      const [result] = resume.mock.results;
+      assert.ok(result?.type === "return");
+      await assert.rejects(result.value, {
+        name: "TypeError",
+        message: "Cannot read properties of undefined (reading 'canResume')",
+      });
+      assert.equal(canResume.mock.calls.length, 0);
+      assert.equal((await database.findAgentExecutionById(execution.id))?.status, "running");
+    } finally {
+      resume.mockRestore();
+      await recovery.stop();
       await lifecycle.stop();
     }
   });
