@@ -38,6 +38,7 @@ const ACTIVITY_WEBHOOK_LOOKUP_MIGRATION = "0065_activity_webhook_receipt_lookup"
 const LINEAR_RUN_REPLIES_MIGRATION = "0067_linear_run_replies";
 const SURFACE_PERSISTENCE_MIGRATION = "0068_surface_persistence";
 const ACCOUNT_ATTENTION_STATE_MIGRATION = "0069_account_attention_state";
+const TRIGGER_WEBHOOK_KEY_EXPIRY_MIGRATION = "0070_trigger_webhook_key_expiry";
 const LINEAR_RUN_REPLIES_WHEN = 1795305193694;
 const migrationJournalSchema = z.object({
   entries: z.array(
@@ -124,6 +125,7 @@ describe("database migration application", () => {
           [67, LINEAR_RUN_REPLIES_MIGRATION],
           [68, SURFACE_PERSISTENCE_MIGRATION],
           [69, ACCOUNT_ATTENTION_STATE_MIGRATION],
+          [70, TRIGGER_WEBHOOK_KEY_EXPIRY_MIGRATION],
         ],
       );
       const baseline = (await journal()).rows;
@@ -176,6 +178,7 @@ describe("database migration application", () => {
         { hash: createHash("sha256").update(replyMigration).digest("hex") },
         { hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION) },
         { hash: await migrationHash(ACCOUNT_ATTENTION_STATE_MIGRATION) },
+        { hash: await migrationHash(TRIGGER_WEBHOOK_KEY_EXPIRY_MIGRATION) },
       ]);
       const [definition] = (await index(triggerIndex)).rows;
       assert.ok(definition);
@@ -261,6 +264,8 @@ describe("database migration application", () => {
       assert.equal(surface?.tag, SURFACE_PERSISTENCE_MIGRATION);
       const attention = (await readMigrationJournal()).entries[69];
       assert.equal(attention?.tag, ACCOUNT_ATTENTION_STATE_MIGRATION);
+      const keyExpiry = (await readMigrationJournal()).entries[70];
+      assert.equal(keyExpiry?.tag, TRIGGER_WEBHOOK_KEY_EXPIRY_MIGRATION);
       const upgraded = [
         ...baseline,
         {
@@ -270,6 +275,10 @@ describe("database migration application", () => {
         {
           hash: await migrationHash(ACCOUNT_ATTENTION_STATE_MIGRATION),
           created_at: String(attention.when),
+        },
+        {
+          hash: await migrationHash(TRIGGER_WEBHOOK_KEY_EXPIRY_MIGRATION),
+          created_at: String(keyExpiry.when),
         },
       ];
       await runtime.migrate();
@@ -528,7 +537,7 @@ describe("database migration application", () => {
         url,
         "select hash from drizzle.__drizzle_migrations order by id",
       );
-      assert.equal(migrated.rowCount, baseline.rows.length + 11);
+      assert.equal(migrated.rowCount, baseline.rows.length + 12);
       assert.deepEqual(migrated.rows, [
         ...baseline.rows,
         { hash: createHash("sha256").update(receiptMigration).digest("hex") },
@@ -542,6 +551,7 @@ describe("database migration application", () => {
         { hash: createHash("sha256").update(replyMigration).digest("hex") },
         { hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION) },
         { hash: await migrationHash(ACCOUNT_ATTENTION_STATE_MIGRATION) },
+        { hash: await migrationHash(TRIGGER_WEBHOOK_KEY_EXPIRY_MIGRATION) },
       ]);
       assert.deepEqual(
         (await poolQuery(url, "select home_checklist_completed_at from organization")).rows,
@@ -721,6 +731,7 @@ describe("database migration application", () => {
       { hash: createHash("sha256").update(replyMigration).digest("hex") },
       { hash: await migrationHash(SURFACE_PERSISTENCE_MIGRATION) },
       { hash: await migrationHash(ACCOUNT_ATTENTION_STATE_MIGRATION) },
+      { hash: await migrationHash(TRIGGER_WEBHOOK_KEY_EXPIRY_MIGRATION) },
     ]);
     assert.deepEqual(
       (
@@ -799,7 +810,7 @@ describe("database migration application", () => {
     try {
       await runtime.migrate();
       const journal = await runtime.query("select id from drizzle.__drizzle_migrations");
-      assert.equal(journal.rowCount, 70);
+      assert.equal(journal.rowCount, 71);
       const settings = readWebhookSigningSettings({
         PASEO_HUB_WEBHOOK_HMAC_ENABLED: "true",
         PASEO_HUB_WEBHOOK_GITHUB_SIGNATURES_ENABLED: "true",
