@@ -165,6 +165,14 @@ describe("writing steps", () => {
     });
   });
 
+  it("keeps every other step byte-identical when one step of a list is edited", () => {
+    const edited = patched(STEPS, withStep(form(STEPS), 0, { prompt: "Plan it twice." }));
+    expect(edited).toContain("prompt: Plan it twice.");
+    const rest = STEPS.slice(STEPS.indexOf("  - id: build"));
+    expect(edited.endsWith(rest)).toBe(true);
+    expect(patched(STEPS, form(STEPS))).toBe(STEPS);
+  });
+
   it("converts run to steps when a step is added, keeping its conversation and the target", () => {
     const yaml = patched(RUN, complete(addStep(form(RUN))));
     const document = parseTriggerDocument(yaml);

@@ -61,12 +61,12 @@ import {
   sharedYamlField,
   mergeTriggerForm,
   needsActorFilter,
-  projectTriggerForm,
   triggerFormErrors,
   type TriggerFieldErrors,
   type TriggerFormValue,
 } from "./configuration/editor.js";
 import { describeTriggerYaml, triggerEventClause } from "./configuration/describe.js";
+import { projectPanelForm } from "./panel-projection.js";
 import {
   saveTrigger,
   triggerEditorSnapshot,
@@ -905,7 +905,7 @@ function useTriggerEditorState(
   // What the mode the reader is *not* in would receive. In form mode that is the YAML the form
   // serialises to; in YAML mode it is the form the document projects onto.
   const other = useMemo(
-    () => (mode === "form" ? mergeTriggerForm(yaml, form) : projectTriggerForm(yaml)),
+    () => (mode === "form" ? mergeTriggerForm(yaml, form) : projectPanelForm(yaml)),
     [mode, yaml, form],
   );
   const description = useMemo(
@@ -949,7 +949,7 @@ function useEditorRepresentations(
 ) {
   const initialForm = trigger?.draft ?? defaultForm(snapshot);
   const initialYaml = trigger?.yaml ?? "";
-  const initialProjection = useMemo(() => projectTriggerForm(initialYaml), [initialYaml]);
+  const initialProjection = useMemo(() => projectPanelForm(initialYaml), [initialYaml]);
   const initialMode =
     trigger === null || (initialProjection.status === "editable" && !legacy) ? "form" : "yaml";
   const [mode, setMode] = useState<EditorMode>(initialMode);
@@ -985,7 +985,7 @@ function editorSubmit({
   };
 }
 
-type EditorProjection = ReturnType<typeof mergeTriggerForm> | ReturnType<typeof projectTriggerForm>;
+type EditorProjection = ReturnType<typeof mergeTriggerForm> | ReturnType<typeof projectPanelForm>;
 
 function describeEditor({
   form,
