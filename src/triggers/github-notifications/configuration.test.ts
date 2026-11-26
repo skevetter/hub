@@ -120,7 +120,9 @@ describe("github.notification configuration", () => {
     const edited = patchTriggerYaml(FILTERED, {
       ...projection.value,
       name: "renamed",
-      prompt: "Changed.",
+      steps: projection.value.steps.map((step, index) =>
+        index === 0 ? { ...step, prompt: "Changed." } : step,
+      ),
     });
     expect(edited).toContain("# poll my mentions");
     const document = parseTriggerDocument(edited);

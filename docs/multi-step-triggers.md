@@ -82,7 +82,9 @@ match in agent, `env`, `github`, `background`, output schema and allowed outputs
 where two such steps differ, at `steps.N.continuation`, and says which fields differ. Give one step
 `continuation: new` or a different key. Each event is checked on its own. The reply tool a chat event adds
 to the last agent step, and a key written with inputs or event data, are checked when the step dispatches.
-A key written as a template is compared by its text when it reads nothing from the event. On Slack, Discord, Linear and GitHub events the reply output is added to the last
+A key written as a template is compared by its text when it reads nothing from the event.
+A conversation key belongs to the project, not to one trigger: two triggers in the same project that use
+the same key and match in the fields above share one session. On Slack, Discord, Linear and GitHub events the reply output is added to the last
 agent step, so two steps that both use `continuation: conversation` always differ there.
 
 ## Choosing between agents
@@ -96,6 +98,14 @@ refused at `steps.N.agent.choices`. Steps with an inline `agent` are not affecte
 A later step reads an earlier step with `${{ steps.<id>.outputs.<field> }}`. The earlier step must
 declare `output.schema`, and only earlier steps can be read. The compiler checks both when you save.
 If the earlier step was skipped by `if`, a step that reads its output fails instead of running with an empty value.
+
+## Editing in the form
+
+The form edits `run` and `steps` documents and leaves comments and keys it does not own untouched.
+A document that uses YAML anchors and aliases is edited conservatively: a change that would make an
+alias point at a different anchor, or leave it without one, is refused and the document is not
+changed. For example, adding a step and editing an aliased field in one save is refused; save the two
+edits separately, or edit the anchor and alias in YAML.
 
 ## Errors
 
