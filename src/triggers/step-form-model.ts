@@ -1,3 +1,5 @@
+import { isSeq, parseDocument } from "yaml";
+
 import { stepFormErrors } from "./configuration/editor-steps.js";
 import type { StepListChange } from "./configuration/editor-steps.js";
 import type {
@@ -53,6 +55,11 @@ export function stepFieldId(base: string, index: number): string {
 /** A trigger lists its steps once it has several, or one that is more than the plain `run`. */
 export function startsAsList(steps: TriggerFormValue["steps"], plain: boolean): boolean {
   return steps.length > 1 || !plain;
+}
+
+/** Whether the document writes `steps` as a list, which the form keeps editing as one. */
+export function yamlListsSteps(yaml: string): boolean {
+  return isSeq(parseDocument(yaml, { compat: ["timestamp"] }).get("steps"));
 }
 
 /** Row keys follow their rows through a move or a removal, so a row keeps its own field state. */

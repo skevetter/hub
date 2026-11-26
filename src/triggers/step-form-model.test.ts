@@ -10,6 +10,7 @@ import {
   stepAt,
   stepFieldId,
   stepFieldKey,
+  yamlListsSteps,
 } from "./step-form-model.js";
 
 function form(...ids: string[]): TriggerFormValue {
@@ -50,6 +51,13 @@ describe("step form model", () => {
     expect(startsAsList(form("run").steps, true)).toBe(false);
     expect(startsAsList(form("run").steps, false)).toBe(true);
     expect(startsAsList(form("a", "b").steps, true)).toBe(true);
+  });
+
+  it("tells a listed step from the plain run in the document", () => {
+    expect(yamlListsSteps("steps:\n  - id: run\n    prompt: hi\n")).toBe(true);
+    expect(yamlListsSteps("run:\n  prompt: hi\n")).toBe(false);
+    expect(yamlListsSteps("")).toBe(false);
+    expect(yamlListsSteps("steps: nope")).toBe(false);
   });
 
   it("moves and removes row keys with their rows", () => {

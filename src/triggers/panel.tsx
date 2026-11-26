@@ -62,12 +62,20 @@ import {
 } from "./configuration/editor.js";
 import { describeTriggerYaml, triggerEventClause } from "./configuration/describe.js";
 import { hasScriptStep, isShorthandSteps } from "./configuration/editor-steps.js";
-import { RunLimitField, StepBody, StepCard, StepListFooter, useStepRows } from "./steps-section.js";
-import { StepLimitFields, agentStepDescription } from "./step-fields.js";
+import {
+  RunLimitField,
+  StepBody,
+  StepCard,
+  StepListFooter,
+  useStepRows,
+  type StepRows,
+} from "./steps-section.js";
+import { StepLimitFields, agentStepDescription, type StepAgentProps } from "./step-fields.js";
 import {
   fieldError,
   saveFieldErrors,
   startsAsList,
+  yamlListsSteps,
   type TriggerFieldProps,
 } from "./step-form-model.js";
 import { useDaemonProviderCatalog } from "./use-daemon-provider-catalog.js";
@@ -843,6 +851,7 @@ function TriggerEditorFields({
       errors={editor.fieldErrors}
       triggerId={triggerId}
       snapshot={snapshot}
+      yaml={editor.yaml}
       onChange={editor.setForm}
     />
   );
@@ -909,7 +918,8 @@ function useTriggerEditorState({
 }) {
   const { mode, setMode, yaml, setYaml, form, setForm, initialProjection } =
     useEditorRepresentations(trigger, snapshot, legacy);
-  const saved = useSavedFieldErrors(saveFailure, form);
+  const submitted = useRef(form);
+  const saved = useSavedFieldErrors(saveFailure, form, submitted);
   // What the mode the reader is *not* in would receive. In form mode that is the YAML the form
   // serialises to; in YAML mode it is the form the document projects onto.
   const other = useMemo(
@@ -929,7 +939,11 @@ function useTriggerEditorState({
   const refuse = () => setRefused(true);
   const switchMode = (next: EditorMode) =>
     switchEditorMode(next, { mode, other, setForm, setYaml, setMode, refuse });
-  const submit = editorSubmit({ mode, other, yaml, onSave, refuse });
+  const save = (next: string) => {
+    submitted.current = form;
+    onSave(next);
+  };
+  const submit = editorSubmit({ mode, other, yaml, onSave: save, refuse });
   return {
     mode,
     yaml,
@@ -952,22 +966,23 @@ function useTriggerEditorState({
 }
 
 /**
- * The save check names the step it refuses. That mark belongs to the form as it was submitted, so
- * it goes as soon as the reader changes anything, and comes back if the same refusal does.
+ * The save check names the step it refuses by its position in the form as it was submitted. That
+ * mark goes as soon as the reader changes anything, including while the save is still in flight,
+ * and comes back if the same refusal does.
  */
-function useSavedFieldErrors(failure: SaveFailure | undefined, form: TriggerFormValue) {
-  const latest = useRef(form);
-  useEffect(() => {
-    latest.current = form;
-  });
+function useSavedFieldErrors(
+  failure: SaveFailure | undefined,
+  form: TriggerFormValue,
+  submitted: { current: TriggerFormValue },
+) {
   const [saved, setSaved] = useState<{ errors: TriggerFieldErrors; form: TriggerFormValue }>();
   useEffect(() => {
     setSaved(
       failure === undefined
         ? undefined
-        : { errors: saveFieldErrors(failure.message), form: latest.current },
+        : { errors: saveFieldErrors(failure.message), form: submitted.current },
     );
-  }, [failure]);
+  }, [failure, submitted]);
   return saved?.form === form ? saved.errors : NO_FIELD_ERRORS;
 }
 
@@ -1394,9 +1409,10 @@ function TriggerReplyField({ form, errors, onChange }: TriggerFieldProps) {
 type TriggerFormProps = TriggerFieldProps & {
   triggerId: string | undefined;
   snapshot: TriggerSnapshot;
+  yaml: string;
 };
 
-function TriggerForm({ form, errors, triggerId, snapshot, onChange }: TriggerFormProps) {
+function TriggerForm({ form, errors, triggerId, snapshot, yaml, onChange }: TriggerFormProps) {
   const selectedDaemon = snapshot.daemons.find((daemon) => daemon.slug === form.daemon);
   const hasAgent = form.steps.some((step) => step.action === "prompt");
   const providerCatalog = useDaemonProviderCatalog(
@@ -1407,7 +1423,7 @@ function TriggerForm({ form, errors, triggerId, snapshot, onChange }: TriggerFor
   // Once a trigger lists its steps it keeps listing them, so removing down to one step does not
   // swap the card the reader is editing for a different one.
   const [listed, setListed] = useState(() =>
-    startsAsList(form.steps, isShorthandSteps(form.steps)),
+    startsAsList(form.steps, isShorthandSteps(form.steps) && !yamlListsSteps(yaml)),
   );
   const showList = listed || form.steps.length > 1;
   const rows = useStepRows({ form, errors, onChange, onAdd: () => setListed(true) });
@@ -1440,24 +1456,38 @@ function TriggerForm({ form, errors, triggerId, snapshot, onChange }: TriggerFor
           selected={selectedDaemon !== undefined}
           listed={showList}
         />
-        {showList ? (
-          form.steps.map((_, index) => (
-            <StepCard key={rows.keys[index] ?? String(index)} {...step} index={index} rows={rows} />
-          ))
-        ) : (
-          <Card
-            title={EDITOR_STEPS.agent.title}
-            {...descriptionProp(
-              agentStepDescription(form.steps[0]?.action === "script", step.hasDaemon),
-            )}
-          >
-            <StepBody {...step} index={0} />
-          </Card>
-        )}
+        {stepCards({ listed: showList, rows, step })}
       </Steps>
       <StepListFooter rows={rows} count={form.steps.length} />
       <TriggerExecutionNote steps={form.steps} />
     </div>
+  );
+}
+
+/** A plain function, not a component: `Steps` numbers each card it is handed as its own row. */
+function stepCards({
+  listed,
+  rows,
+  step,
+}: {
+  listed: boolean;
+  rows: StepRows;
+  step: Omit<StepAgentProps, "index"> & { hasDaemon: boolean };
+}) {
+  if (listed) {
+    return step.form.steps.map((_, index) => (
+      <StepCard key={rows.keys[index] ?? String(index)} {...step} index={index} rows={rows} />
+    ));
+  }
+  return (
+    <Card
+      title={EDITOR_STEPS.agent.title}
+      {...descriptionProp(
+        agentStepDescription(step.form.steps[0]?.action === "script", step.hasDaemon),
+      )}
+    >
+      <StepBody {...step} index={0} />
+    </Card>
   );
 }
 
@@ -1547,7 +1577,7 @@ function TriggerTargetCard({
   onChange,
   selected,
   listed,
-}: Omit<TriggerFormProps, "triggerId"> & { selected: boolean; listed: boolean }) {
+}: Omit<TriggerFormProps, "triggerId" | "yaml"> & { selected: boolean; listed: boolean }) {
   const daemonOptions = snapshot.daemons.map((daemon) => ({
     value: daemon.slug,
     label: daemon.slug,

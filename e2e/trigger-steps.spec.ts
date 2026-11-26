@@ -42,6 +42,10 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
     await expect(page.getByRole("region", { name: /^Step \d+:/u })).toHaveCount(0);
     await steps.addStep();
     await steps.expectOrder(["run", "step-2"]);
+    await expect(steps.step(2).getByLabel("Step ID", { exact: true })).toBeFocused();
+    await expect(page.getByRole("status").filter({ hasText: "Step added" })).toHaveText(
+      "Step added. 2 steps.",
+    );
     await expect(steps.step(1).getByLabel("Instructions", { exact: true })).toHaveValue(
       "Review the request.",
     );
@@ -69,10 +73,19 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
   await test.step("moving a step above the one its condition reads flags the condition and keeps its text", async () => {
     await steps.move(2, "up");
     await steps.expectOrder(["fix", "review", "step-3"]);
+    await expect(steps.step(1).getByRole("button", { name: "Actions for step 1" })).toBeFocused();
+    await expect(page.getByRole("status").filter({ hasText: "Step moved" })).toHaveText(
+      "Step moved to position 1 of 3.",
+    );
     await expect(steps.step(1).getByLabel("Run only if", { exact: true })).toHaveValue(CONDITION);
     await expect(steps.step(1)).toContainText(
       'Step "review" does not run before this step, so its outputs are not available.',
     );
+    const editorUrl = page.url();
+    await steps.submit();
+    await expect(steps.step(1)).toContainText("does not run before this step");
+    await expect(steps.step(1).getByLabel("Run only if", { exact: true })).toHaveValue(CONDITION);
+    expect(page.url()).toBe(editorUrl);
     await steps.move(1, "down");
     await steps.expectOrder(["review", "fix", "step-3"]);
     await expect(steps.step(2)).not.toContainText("does not run before this step");
@@ -92,6 +105,22 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
     await expect(steps.step(1).getByRole("alert")).toHaveCount(0);
     await steps.chooseContinuity(2, "New agent");
     await expect(steps.step(2).getByRole("alert")).toHaveCount(0);
+  });
+
+  await test.step("a refusal that arrives after the form changed is not put on a step", async () => {
+    await steps.chooseContinuity(2, "Same conversation");
+    await page.route("**/_serverFn/**", async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await route.continue();
+    });
+    await steps.submit();
+    await steps.step(1).getByLabel("Instructions", { exact: true }).fill("Review it again.");
+    await expect(page.getByText(/continues the same conversation as step/u)).toBeVisible();
+    await expect(page.getByRole("region", { name: /^Step \d+:/u }).getByRole("alert")).toHaveCount(
+      0,
+    );
+    await page.unroute("**/_serverFn/**");
+    await steps.chooseContinuity(2, "New agent");
   });
 
   await test.step("the list saves in order and opens again as it was written", async () => {
@@ -116,8 +145,10 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
 
   await test.step("a step is removed after confirming, and the last one cannot be", async () => {
     await steps.remove(3);
+    await expect(steps.step(2).getByRole("button", { name: "Actions for step 2" })).toBeFocused();
     await steps.remove(2);
     await steps.expectOrder(["review"]);
+    await expect(steps.step(1).getByRole("button", { name: "Actions for step 1" })).toBeFocused();
     await steps.expectRemovalRefused(1);
     await expect(page.getByRole("button", { name: "Add step", exact: true })).toBeVisible();
   });
@@ -176,6 +207,22 @@ steps:
       "This change would break a YAML alias.",
     );
     await steps.expectOrder(["plan", "build"]);
+  });
+
+  await test.step("a one-step list written in YAML keeps its step controls", async () => {
+    await triggers.switchToYaml();
+    await triggers.replaceYaml(`name: alias-steps
+on:
+  manual.run: {}
+target: { daemon: ${daemon}, cwd: /workspace/acme }
+steps:
+  - id: run
+    ${agent}
+    prompt: Plan it.
+`);
+    await triggers.switchToForm();
+    await steps.expectOrder(["run"]);
+    await expect(steps.step(1).getByLabel("Step ID", { exact: true })).toHaveValue("run");
   });
 
   await test.step("a run whose alias would move cannot gain a step in the same save", async () => {

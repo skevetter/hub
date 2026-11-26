@@ -44,6 +44,7 @@ import {
 export interface StepRows {
   keys: readonly string[];
   error: string | undefined;
+  status: string;
   add: () => void;
   move: (from: number, to: number) => void;
   remove: (index: number) => void;
@@ -52,6 +53,41 @@ export interface StepRows {
 interface Refusal {
   message: string;
   form: TriggerFormValue;
+}
+
+interface Focus {
+  target: "id" | "menu";
+  index: number;
+}
+
+const stepCount = (count: number) => `${String(count)} ${count === 1 ? "step" : "steps"}`;
+
+function focusStepControl({ target, index }: Focus) {
+  const selector =
+    target === "id"
+      ? `#${stepFieldId("trigger-step-id", index)}`
+      : `[aria-label="Actions for step ${String(index + 1)}"]`;
+  document.querySelector<HTMLElement>(selector)?.focus();
+}
+
+/** The control a list edit leaves the reader on, once the rows have been redrawn. */
+function useStepFocus() {
+  const [focus, setFocus] = useState<Focus>();
+  useEffect(() => {
+    if (focus === undefined) return undefined;
+    const timer = setTimeout(() => {
+      focusStepControl(focus);
+      setFocus(undefined);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [focus]);
+  return setFocus;
+}
+
+function editStatus(change: StepListChange, count: number): string {
+  return change.kind === "remove"
+    ? `Step removed. ${stepCount(count - 1)}.`
+    : `Step moved to position ${String(change.to + 1)} of ${String(count)}.`;
 }
 
 /**
@@ -69,6 +105,8 @@ export function useStepRows({
     form.steps.map((_, position) => `row-${String(position)}`),
   );
   const [refusal, setRefusal] = useState<Refusal>();
+  const [status, setStatus] = useState("");
+  const setFocus = useStepFocus();
   const keys = form.steps.map((_, position) => stored[position] ?? `row-extra-${String(position)}`);
   const edit = (change: StepListChange) => {
     const message = stepListEditError(form, change);
@@ -83,6 +121,10 @@ export function useStepRows({
     if (next === form) return;
     setStored(reorderRowKeys(keys, change));
     onChange(next);
+    setStatus(editStatus(change, form.steps.length));
+    const index =
+      change.kind === "remove" ? Math.min(change.index, next.steps.length - 1) : change.to;
+    setFocus({ target: "menu", index });
   };
   const add = () => {
     const next = addStep(form);
@@ -91,10 +133,13 @@ export function useStepRows({
     setStored([...keys, `row-${String(counter.current)}`]);
     onChange(next);
     onAdd();
+    setStatus(`Step added. ${stepCount(next.steps.length)}.`);
+    setFocus({ target: "id", index: next.steps.length - 1 });
   };
   return {
     keys,
     error: refusal?.form === form ? refusal.message : undefined,
+    status,
     add,
     move: (from, to) => edit({ kind: "move", from, to }),
     remove: (index) => edit({ kind: "remove", index }),
@@ -262,6 +307,9 @@ function StepConditionFields(props: StepAgentProps) {
 export function StepListFooter({ rows, count }: { rows: StepRows; count: number }) {
   return (
     <div className="grid justify-items-start gap-3">
+      <p role="status" className="sr-only">
+        {rows.status}
+      </p>
       {rows.error === undefined ? null : (
         <WarningAlert title="Steps not changed">
           <p>{rows.error}</p>
