@@ -25,6 +25,7 @@ import type {
   ConnectionStartAuthority,
   DiscordConnectionRecord,
   GitHubConnectionRecord,
+  GitHubRepositorySnapshot,
   LinearConnectionRecord,
   LinearConnectionRefreshOperation,
   ReadConnectionAttemptInput,
@@ -163,41 +164,7 @@ export class ConnectionRepository {
         .for("update");
       if (existing !== undefined && existing.organizationId !== attempt.organizationId)
         throw new ConnectionConflictError();
-      const [connection] =
-        existing === undefined
-          ? await transaction
-              .insert(schema.githubConnections)
-              .values({
-                organizationId: attempt.organizationId,
-                installationId: input.installationId,
-                providerApplicationId: input.providerApplicationId,
-                slug: await uniqueConnectionSlug(
-                  transaction,
-                  attempt.organizationId,
-                  "github",
-                  input.accountLogin,
-                ),
-                accountId: input.accountId,
-                accountLogin: input.accountLogin,
-                accountType: input.accountType,
-                status: input.status,
-                connectedByUserId: attempt.userId,
-                suspendedAt: input.status === "suspended" ? sql`clock_timestamp()` : null,
-              })
-              .returning({ id: schema.githubConnections.id })
-          : await transaction
-              .update(schema.githubConnections)
-              .set({
-                accountId: input.accountId,
-                accountLogin: input.accountLogin,
-                accountType: input.accountType,
-                status: input.status,
-                suspendedAt: input.status === "suspended" ? sql`clock_timestamp()` : null,
-                updatedAt: sql`clock_timestamp()`,
-              })
-              .where(eq(schema.githubConnections.id, existing.id))
-              .returning({ id: schema.githubConnections.id });
-      if (connection === undefined) throw new Error("GitHub connection unavailable");
+      const connection = await writeGitHubConnection(transaction, attempt, input, existing);
       await replaceGitHubRepositories(
         transaction,
         attempt.organizationId,
@@ -271,71 +238,9 @@ export class ConnectionRepository {
       if (existing !== undefined && existing.organizationId !== attempt.organizationId) {
         throw new ConnectionConflictError();
       }
-      if (existing === undefined) {
-        await transaction.insert(schema.slackConnections).values({
-          organizationId: attempt.organizationId,
-          teamId: input.teamId,
-          providerApplicationId: input.providerApplicationId,
-          teamName: input.teamName,
-          slug: await uniqueConnectionSlug(
-            transaction,
-            attempt.organizationId,
-            "slack",
-            input.teamName,
-          ),
-          botUserId: input.botUserId,
-          botAccessToken: input.botAccessToken,
-          scopes: input.scopes,
-          connectedByUserId: attempt.userId,
-        });
-      } else {
-        await transaction
-          .update(schema.slackConnections)
-          .set({
-            teamName: input.teamName,
-            providerApplicationId: input.providerApplicationId,
-            botUserId: input.botUserId,
-            botAccessToken: input.botAccessToken,
-            scopes: input.scopes,
-            connectedByUserId: attempt.userId,
-            updatedAt: sql`clock_timestamp()`,
-          })
-          .where(eq(schema.slackConnections.id, existing.id));
-      }
+      await writeSlackConnection(transaction, attempt, input, existing);
       if (providerConfiguration !== undefined) {
-        const [stored] = await transaction
-          .select({ version: schema.runtimeProviderConfiguration.version })
-          .from(schema.runtimeProviderConfiguration)
-          .where(eq(schema.runtimeProviderConfiguration.provider, "slack"))
-          .for("update");
-        if (stored?.version !== providerConfiguration.expectedVersion) {
-          const error = new Error("provider configuration changed");
-          error.name = "ProviderConfigurationConflictError";
-          throw error;
-        }
-        if (stored === undefined) {
-          await transaction.insert(schema.runtimeProviderConfiguration).values({
-            provider: "slack",
-            configuration: providerConfiguration.configuration,
-            verifiedExternalIdentity: providerConfiguration.identity,
-            version: 1,
-            verifiedAt: sql`clock_timestamp()`,
-            updatedAt: sql`clock_timestamp()`,
-            updatedByUserId: providerConfiguration.updatedByUserId,
-          });
-        } else {
-          await transaction
-            .update(schema.runtimeProviderConfiguration)
-            .set({
-              configuration: providerConfiguration.configuration,
-              verifiedExternalIdentity: providerConfiguration.identity,
-              version: sql`${schema.runtimeProviderConfiguration.version} + 1`,
-              verifiedAt: sql`clock_timestamp()`,
-              updatedAt: sql`clock_timestamp()`,
-              updatedByUserId: providerConfiguration.updatedByUserId,
-            })
-            .where(eq(schema.runtimeProviderConfiguration.provider, "slack"));
-        }
+        await writeProviderConfiguration(transaction, "slack", providerConfiguration);
         await writeProviderActivation(
           transaction,
           "slack",
@@ -393,79 +298,9 @@ export class ConnectionRepository {
       if (existing !== undefined && existing.organizationId !== attempt.organizationId) {
         throw new ConnectionConflictError();
       }
-      const [connection] =
-        existing === undefined
-          ? await transaction
-              .insert(schema.linearConnections)
-              .values({
-                organizationId: attempt.organizationId,
-                providerApplicationId: input.providerApplicationId,
-                linearOrganizationId: input.linearOrganizationId,
-                linearOrganizationName: input.linearOrganizationName,
-                slug: await uniqueConnectionSlug(
-                  transaction,
-                  attempt.organizationId,
-                  "linear",
-                  input.linearOrganizationName,
-                ),
-                appUserId: input.appUserId,
-                accessToken: input.accessToken,
-                refreshToken: input.refreshToken ?? null,
-                accessTokenExpiresAt: input.accessTokenExpiresAt ?? null,
-                scopes: input.scopes,
-                connectedByUserId: attempt.userId,
-              })
-              .returning({ id: schema.linearConnections.id })
-          : await transaction
-              .update(schema.linearConnections)
-              .set({
-                providerApplicationId: input.providerApplicationId,
-                linearOrganizationName: input.linearOrganizationName,
-                appUserId: input.appUserId,
-                accessToken: input.accessToken,
-                refreshToken: input.refreshToken ?? null,
-                accessTokenExpiresAt: input.accessTokenExpiresAt ?? null,
-                scopes: input.scopes,
-                connectedByUserId: attempt.userId,
-                updatedAt: sql`clock_timestamp()`,
-              })
-              .where(eq(schema.linearConnections.id, existing.id))
-              .returning({ id: schema.linearConnections.id });
-      if (connection === undefined) throw new Error("Linear connection unavailable");
+      const connection = await writeLinearConnection(transaction, attempt, input, existing);
       if (providerConfiguration !== undefined) {
-        const [stored] = await transaction
-          .select({ version: schema.runtimeProviderConfiguration.version })
-          .from(schema.runtimeProviderConfiguration)
-          .where(eq(schema.runtimeProviderConfiguration.provider, "linear"))
-          .for("update");
-        if (stored?.version !== providerConfiguration.expectedVersion) {
-          const error = new Error("provider configuration changed");
-          error.name = "ProviderConfigurationConflictError";
-          throw error;
-        }
-        if (stored === undefined) {
-          await transaction.insert(schema.runtimeProviderConfiguration).values({
-            provider: "linear",
-            configuration: providerConfiguration.configuration,
-            verifiedExternalIdentity: providerConfiguration.identity,
-            version: 1,
-            verifiedAt: sql`clock_timestamp()`,
-            updatedAt: sql`clock_timestamp()`,
-            updatedByUserId: providerConfiguration.updatedByUserId,
-          });
-        } else {
-          await transaction
-            .update(schema.runtimeProviderConfiguration)
-            .set({
-              configuration: providerConfiguration.configuration,
-              verifiedExternalIdentity: providerConfiguration.identity,
-              version: sql`${schema.runtimeProviderConfiguration.version} + 1`,
-              verifiedAt: sql`clock_timestamp()`,
-              updatedAt: sql`clock_timestamp()`,
-              updatedByUserId: providerConfiguration.updatedByUserId,
-            })
-            .where(eq(schema.runtimeProviderConfiguration.provider, "linear"));
-        }
+        await writeProviderConfiguration(transaction, "linear", providerConfiguration);
         await writeProviderActivation(
           transaction,
           "linear",
@@ -600,118 +435,19 @@ export class ConnectionRepository {
     return this.runtime.transaction(async (runtimeTransaction) => {
       const transaction = runtimeTransaction.drizzle();
       await lockStartAuthority(transaction, access);
-      if (provider === "github") {
-        const [connection] = await transaction
-          .select({ id: schema.githubConnections.id })
-          .from(schema.githubConnections)
-          .where(
-            and(
-              eq(schema.githubConnections.id, connectionId),
-              eq(schema.githubConnections.organizationId, access.organizationId),
-            ),
-          )
-          .for("update");
-        if (connection === undefined) throw new ConnectionAccessDeniedError();
-        await clearGitHubConnectionReferences(transaction, connectionId);
-        await transaction
-          .delete(schema.githubConnections)
-          .where(eq(schema.githubConnections.id, connectionId));
-        return { provider } as const;
-      }
-      if (provider === "discord") {
-        const [connection] = await transaction
-          .select({ guildId: schema.discordConnections.guildId })
-          .from(schema.discordConnections)
-          .where(
-            and(
-              eq(schema.discordConnections.id, connectionId),
-              eq(schema.discordConnections.organizationId, access.organizationId),
-            ),
-          )
-          .for("update");
-        if (connection === undefined) throw new ConnectionAccessDeniedError();
-        await transaction
-          .delete(schema.projectTriggerRoutes)
-          .where(eq(schema.projectTriggerRoutes.connectionId, connectionId));
-        await transaction
-          .delete(schema.discordConnections)
-          .where(eq(schema.discordConnections.id, connectionId));
-        return {
-          provider,
-          guildId: connection.guildId,
-        } as const;
+      if (provider === "github" || provider === "discord") {
+        return provider === "github"
+          ? disconnectGitHub(transaction, connectionId, access)
+          : disconnectDiscord(transaction, connectionId, access);
       }
       if (provider === "linear") {
         await this.locks.withTxLock(
           runtimeTransaction,
           linearTriggerRoutesLock(access.organizationId),
         );
-        const [connection] = await transaction
-          .select({
-            linearOrganizationId: schema.linearConnections.linearOrganizationId,
-            accessToken: schema.linearConnections.accessToken,
-          })
-          .from(schema.linearConnections)
-          .where(
-            and(
-              eq(schema.linearConnections.id, connectionId),
-              eq(schema.linearConnections.organizationId, access.organizationId),
-            ),
-          )
-          .for("update");
-        if (connection === undefined) throw new ConnectionAccessDeniedError();
-        await transaction
-          .delete(schema.projectTriggerRoutes)
-          .where(
-            and(
-              eq(schema.projectTriggerRoutes.organizationId, access.organizationId),
-              eq(schema.projectTriggerRoutes.provider, "linear"),
-              eq(schema.projectTriggerRoutes.connectionId, connectionId),
-            ),
-          );
-        await transaction
-          .delete(schema.organizationTriggerRoutes)
-          .where(
-            and(
-              eq(schema.organizationTriggerRoutes.organizationId, access.organizationId),
-              eq(schema.organizationTriggerRoutes.provider, "linear"),
-              eq(schema.organizationTriggerRoutes.connectionId, connectionId),
-            ),
-          );
-        await transaction
-          .delete(schema.linearConnections)
-          .where(eq(schema.linearConnections.id, connectionId));
-        return {
-          provider,
-          linearOrganizationId: connection.linearOrganizationId,
-          accessToken: connection.accessToken,
-        } as const;
+        return disconnectLinear(transaction, connectionId, access);
       }
-      const [connection] = await transaction
-        .select({
-          teamId: schema.slackConnections.teamId,
-          botAccessToken: schema.slackConnections.botAccessToken,
-        })
-        .from(schema.slackConnections)
-        .where(
-          and(
-            eq(schema.slackConnections.id, connectionId),
-            eq(schema.slackConnections.organizationId, access.organizationId),
-          ),
-        )
-        .for("update");
-      if (connection === undefined) throw new ConnectionAccessDeniedError();
-      await transaction
-        .delete(schema.projectTriggerRoutes)
-        .where(eq(schema.projectTriggerRoutes.connectionId, connectionId));
-      await transaction
-        .delete(schema.slackConnections)
-        .where(eq(schema.slackConnections.id, connectionId));
-      return {
-        provider,
-        teamId: connection.teamId,
-        botAccessToken: connection.botAccessToken,
-      } as const;
+      return disconnectSlack(transaction, connectionId, access, provider);
     });
   }
 
@@ -800,30 +536,314 @@ export class ConnectionRepository {
   }
 }
 
+async function writeGitHubConnection(
+  transaction: HubTransaction,
+  attempt: AttemptRow,
+  input: BindGitHubConnectionInput,
+  existing: { id: string } | undefined,
+): Promise<{ id: string }> {
+  const [connection] =
+    existing === undefined
+      ? await transaction
+          .insert(schema.githubConnections)
+          .values({
+            organizationId: attempt.organizationId,
+            installationId: input.installationId,
+            providerApplicationId: input.providerApplicationId,
+            slug: await uniqueConnectionSlug(
+              transaction,
+              attempt.organizationId,
+              "github",
+              input.accountLogin,
+            ),
+            accountId: input.accountId,
+            accountLogin: input.accountLogin,
+            accountType: input.accountType,
+            status: input.status,
+            connectedByUserId: attempt.userId,
+            suspendedAt: input.status === "suspended" ? sql`clock_timestamp()` : null,
+          })
+          .returning({ id: schema.githubConnections.id })
+      : await transaction
+          .update(schema.githubConnections)
+          .set({
+            accountId: input.accountId,
+            accountLogin: input.accountLogin,
+            accountType: input.accountType,
+            status: input.status,
+            suspendedAt: input.status === "suspended" ? sql`clock_timestamp()` : null,
+            updatedAt: sql`clock_timestamp()`,
+          })
+          .where(eq(schema.githubConnections.id, existing.id))
+          .returning({ id: schema.githubConnections.id });
+  if (connection === undefined) throw new Error("GitHub connection unavailable");
+  return connection;
+}
+
+async function writeSlackConnection(
+  transaction: HubTransaction,
+  attempt: AttemptRow,
+  input: BindSlackConnectionInput,
+  existing: { id: string } | undefined,
+): Promise<void> {
+  if (existing === undefined) {
+    await transaction.insert(schema.slackConnections).values({
+      organizationId: attempt.organizationId,
+      teamId: input.teamId,
+      providerApplicationId: input.providerApplicationId,
+      teamName: input.teamName,
+      slug: await uniqueConnectionSlug(
+        transaction,
+        attempt.organizationId,
+        "slack",
+        input.teamName,
+      ),
+      botUserId: input.botUserId,
+      botAccessToken: input.botAccessToken,
+      scopes: input.scopes,
+      connectedByUserId: attempt.userId,
+    });
+  } else {
+    await transaction
+      .update(schema.slackConnections)
+      .set({
+        teamName: input.teamName,
+        providerApplicationId: input.providerApplicationId,
+        botUserId: input.botUserId,
+        botAccessToken: input.botAccessToken,
+        scopes: input.scopes,
+        connectedByUserId: attempt.userId,
+        updatedAt: sql`clock_timestamp()`,
+      })
+      .where(eq(schema.slackConnections.id, existing.id));
+  }
+}
+
+async function writeLinearConnection(
+  transaction: HubTransaction,
+  attempt: AttemptRow,
+  input: BindLinearConnectionInput,
+  existing: { id: string } | undefined,
+): Promise<{ id: string }> {
+  const [connection] =
+    existing === undefined
+      ? await transaction
+          .insert(schema.linearConnections)
+          .values({
+            organizationId: attempt.organizationId,
+            providerApplicationId: input.providerApplicationId,
+            linearOrganizationId: input.linearOrganizationId,
+            linearOrganizationName: input.linearOrganizationName,
+            slug: await uniqueConnectionSlug(
+              transaction,
+              attempt.organizationId,
+              "linear",
+              input.linearOrganizationName,
+            ),
+            appUserId: input.appUserId,
+            accessToken: input.accessToken,
+            refreshToken: input.refreshToken ?? null,
+            accessTokenExpiresAt: input.accessTokenExpiresAt ?? null,
+            scopes: input.scopes,
+            connectedByUserId: attempt.userId,
+          })
+          .returning({ id: schema.linearConnections.id })
+      : await transaction
+          .update(schema.linearConnections)
+          .set({
+            providerApplicationId: input.providerApplicationId,
+            linearOrganizationName: input.linearOrganizationName,
+            appUserId: input.appUserId,
+            accessToken: input.accessToken,
+            refreshToken: input.refreshToken ?? null,
+            accessTokenExpiresAt: input.accessTokenExpiresAt ?? null,
+            scopes: input.scopes,
+            connectedByUserId: attempt.userId,
+            updatedAt: sql`clock_timestamp()`,
+          })
+          .where(eq(schema.linearConnections.id, existing.id))
+          .returning({ id: schema.linearConnections.id });
+  if (connection === undefined) throw new Error("Linear connection unavailable");
+  return connection;
+}
+
+async function writeProviderConfiguration(
+  transaction: HubTransaction,
+  provider: "slack" | "linear",
+  providerConfiguration: CompleteSlackProviderApplicationInput["providerConfiguration"],
+): Promise<void> {
+  const [stored] = await transaction
+    .select({ version: schema.runtimeProviderConfiguration.version })
+    .from(schema.runtimeProviderConfiguration)
+    .where(eq(schema.runtimeProviderConfiguration.provider, provider))
+    .for("update");
+  if (stored?.version !== providerConfiguration.expectedVersion) {
+    const error = new Error("provider configuration changed");
+    error.name = "ProviderConfigurationConflictError";
+    throw error;
+  }
+  if (stored === undefined) {
+    await transaction.insert(schema.runtimeProviderConfiguration).values({
+      provider,
+      configuration: providerConfiguration.configuration,
+      verifiedExternalIdentity: providerConfiguration.identity,
+      version: 1,
+      verifiedAt: sql`clock_timestamp()`,
+      updatedAt: sql`clock_timestamp()`,
+      updatedByUserId: providerConfiguration.updatedByUserId,
+    });
+  } else {
+    await transaction
+      .update(schema.runtimeProviderConfiguration)
+      .set({
+        configuration: providerConfiguration.configuration,
+        verifiedExternalIdentity: providerConfiguration.identity,
+        version: sql`${schema.runtimeProviderConfiguration.version} + 1`,
+        verifiedAt: sql`clock_timestamp()`,
+        updatedAt: sql`clock_timestamp()`,
+        updatedByUserId: providerConfiguration.updatedByUserId,
+      })
+      .where(eq(schema.runtimeProviderConfiguration.provider, provider));
+  }
+}
+
+async function disconnectGitHub(
+  transaction: HubTransaction,
+  connectionId: string,
+  access: ConnectionStartAuthority,
+) {
+  const [connection] = await transaction
+    .select({ id: schema.githubConnections.id })
+    .from(schema.githubConnections)
+    .where(
+      and(
+        eq(schema.githubConnections.id, connectionId),
+        eq(schema.githubConnections.organizationId, access.organizationId),
+      ),
+    )
+    .for("update");
+  if (connection === undefined) throw new ConnectionAccessDeniedError();
+  await clearGitHubConnectionReferences(transaction, connectionId);
+  await transaction
+    .delete(schema.githubConnections)
+    .where(eq(schema.githubConnections.id, connectionId));
+  return { provider: "github" } as const;
+}
+
+async function disconnectDiscord(
+  transaction: HubTransaction,
+  connectionId: string,
+  access: ConnectionStartAuthority,
+) {
+  const [connection] = await transaction
+    .select({ guildId: schema.discordConnections.guildId })
+    .from(schema.discordConnections)
+    .where(
+      and(
+        eq(schema.discordConnections.id, connectionId),
+        eq(schema.discordConnections.organizationId, access.organizationId),
+      ),
+    )
+    .for("update");
+  if (connection === undefined) throw new ConnectionAccessDeniedError();
+  await transaction
+    .delete(schema.projectTriggerRoutes)
+    .where(eq(schema.projectTriggerRoutes.connectionId, connectionId));
+  await transaction
+    .delete(schema.discordConnections)
+    .where(eq(schema.discordConnections.id, connectionId));
+  return {
+    provider: "discord",
+    guildId: connection.guildId,
+  } as const;
+}
+
+async function disconnectLinear(
+  transaction: HubTransaction,
+  connectionId: string,
+  access: ConnectionStartAuthority,
+) {
+  const [connection] = await transaction
+    .select({
+      linearOrganizationId: schema.linearConnections.linearOrganizationId,
+      accessToken: schema.linearConnections.accessToken,
+    })
+    .from(schema.linearConnections)
+    .where(
+      and(
+        eq(schema.linearConnections.id, connectionId),
+        eq(schema.linearConnections.organizationId, access.organizationId),
+      ),
+    )
+    .for("update");
+  if (connection === undefined) throw new ConnectionAccessDeniedError();
+  await transaction
+    .delete(schema.projectTriggerRoutes)
+    .where(
+      and(
+        eq(schema.projectTriggerRoutes.organizationId, access.organizationId),
+        eq(schema.projectTriggerRoutes.provider, "linear"),
+        eq(schema.projectTriggerRoutes.connectionId, connectionId),
+      ),
+    );
+  await transaction
+    .delete(schema.organizationTriggerRoutes)
+    .where(
+      and(
+        eq(schema.organizationTriggerRoutes.organizationId, access.organizationId),
+        eq(schema.organizationTriggerRoutes.provider, "linear"),
+        eq(schema.organizationTriggerRoutes.connectionId, connectionId),
+      ),
+    );
+  await transaction
+    .delete(schema.linearConnections)
+    .where(eq(schema.linearConnections.id, connectionId));
+  return {
+    provider: "linear",
+    linearOrganizationId: connection.linearOrganizationId,
+    accessToken: connection.accessToken,
+  } as const;
+}
+
+async function disconnectSlack(
+  transaction: HubTransaction,
+  connectionId: string,
+  access: ConnectionStartAuthority,
+  provider: "slack",
+) {
+  const [connection] = await transaction
+    .select({
+      teamId: schema.slackConnections.teamId,
+      botAccessToken: schema.slackConnections.botAccessToken,
+    })
+    .from(schema.slackConnections)
+    .where(
+      and(
+        eq(schema.slackConnections.id, connectionId),
+        eq(schema.slackConnections.organizationId, access.organizationId),
+      ),
+    )
+    .for("update");
+  if (connection === undefined) throw new ConnectionAccessDeniedError();
+  await transaction
+    .delete(schema.projectTriggerRoutes)
+    .where(eq(schema.projectTriggerRoutes.connectionId, connectionId));
+  await transaction
+    .delete(schema.slackConnections)
+    .where(eq(schema.slackConnections.id, connectionId));
+  return {
+    provider,
+    teamId: connection.teamId,
+    botAccessToken: connection.botAccessToken,
+  } as const;
+}
+
 async function addLinearTriggerRoutes(
   transaction: TransactionHandle,
   organizationId: string,
   connectionId: string,
 ): Promise<void> {
-  const { rows: triggers } = await transaction.query<{
-    trigger_id: string;
-    trigger_revision_id: string;
-    project_id: string;
-    project_revision_id: string;
-    normalized_configuration: unknown;
-  }>(
-    `select t.id as trigger_id, r.id as trigger_revision_id, p.id as project_id,
-            p.active_configuration_revision_id as project_revision_id, r.normalized_configuration
-     from organization_triggers t
-     join organization_trigger_revisions r
-       on r.id = t.active_revision_id and r.trigger_id = t.id and r.organization_id = t.organization_id
-     join projects p
-       on p.id = t.runtime_project_id and p.organization_id = t.organization_id
-     where t.organization_id = $1 and t.enabled and p.status = 'active'
-       and p.active_configuration_revision_id is not null
-       and jsonb_path_exists(r.normalized_configuration, '$.triggers[*].on ? (@ starts with "linear.")')`,
-    [organizationId],
-  );
+  const { rows: triggers } = await readLinearTriggers(transaction, organizationId);
   // Wildcard resource IDs are NULL, so the route indexes alone allow duplicates.
   // The organization lock serializes this check with other connection writes and trigger saves.
   for (const trigger of triggers) {
@@ -869,6 +889,28 @@ async function addLinearTriggerRoutes(
       );
     }
   }
+}
+
+async function readLinearTriggers(transaction: TransactionHandle, organizationId: string) {
+  return transaction.query<{
+    trigger_id: string;
+    trigger_revision_id: string;
+    project_id: string;
+    project_revision_id: string;
+    normalized_configuration: unknown;
+  }>(
+    `select t.id as trigger_id, r.id as trigger_revision_id, p.id as project_id,
+            p.active_configuration_revision_id as project_revision_id, r.normalized_configuration
+     from organization_triggers t
+     join organization_trigger_revisions r
+       on r.id = t.active_revision_id and r.trigger_id = t.id and r.organization_id = t.organization_id
+     join projects p
+       on p.id = t.runtime_project_id and p.organization_id = t.organization_id
+     where t.organization_id = $1 and t.enabled and p.status = 'active'
+       and p.active_configuration_revision_id is not null
+       and jsonb_path_exists(r.normalized_configuration, '$.triggers[*].on ? (@ starts with "linear.")')`,
+    [organizationId],
+  );
 }
 
 async function clearGitHubConnectionReferences(
@@ -1071,6 +1113,13 @@ async function requireConsumableAttempt(
   if (stored?.version !== (attempt.expectedConfigurationVersion ?? undefined)) {
     throw providerApplicationChanged();
   }
+  requireMatchingActivation(stored, activation);
+}
+
+function requireMatchingActivation(
+  stored: { version: number; identity: unknown } | undefined,
+  activation: { applicationId: string; configurationVersion: number } | undefined,
+): void {
   if (stored === undefined) {
     if (activation !== undefined) throw providerApplicationChanged();
     return;
@@ -1285,7 +1334,7 @@ export async function replaceGitHubRepositories(
   transaction: DrizzleHandle,
   organizationId: string,
   connectionId: string,
-  repositories: import("./types.js").GitHubRepositorySnapshot,
+  repositories: GitHubRepositorySnapshot,
 ): Promise<void> {
   const ids = repositories.map((repository) => repository.repositoryId);
   await transaction
