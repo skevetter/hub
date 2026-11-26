@@ -120,44 +120,34 @@ export function withAutomaticReply(trigger: CompiledTrigger): CompiledTrigger {
 /**
  * Agent steps that continue the same conversation share one session, and a session only accepts
  * steps with the same agent, env, github grant, background setting, output schema and allowed
- * outputs. Refuse that at save time instead of failing the second step when it dispatches. A key
- * is shared across the trigger's events, so the same step on two events is compared too. A key
- * that reads inputs or event data is only known at dispatch, and is checked there.
+ * outputs. Refuse that at save time instead of failing the second step when it dispatches. Each
+ * event is checked on its own; the reply tool an event adds, and a key that reads inputs or event
+ * data, are only known when the step dispatches and are checked there.
  */
 export function continuationIssues(triggers: readonly CompiledTrigger[]): TriggerDocumentIssue[] {
+  return triggers.flatMap(eventContinuationIssues);
+}
+
+function eventContinuationIssues(trigger: CompiledTrigger): TriggerDocumentIssue[] {
   const issues: TriggerDocumentIssue[] = [];
-  const firstWith = new Map<string, SessionStep>();
-  for (const trigger of triggers) {
-    for (const [index, step] of trigger.steps.entries()) {
-      const key = isScriptStep(step) ? undefined : sharedSessionKey(trigger, step);
-      if (isScriptStep(step) || key === undefined) continue;
-      const here: SessionStep = { id: step.id, step, event: trigger.on };
-      const first = firstWith.get(key);
-      if (first === undefined) {
-        firstWith.set(key, here);
-        continue;
-      }
-      const differing = sessionDifferences(first.step, step);
-      if (differing.length > 0) {
-        issues.push({
-          path: ["steps", index, "continuation"],
-          message: conflictMessage(first, here, differing),
-        });
-      }
+  const firstWith = new Map<string, { id: string; step: CompiledAgentStep }>();
+  for (const [index, step] of trigger.steps.entries()) {
+    const key = isScriptStep(step) ? undefined : sharedSessionKey(trigger, step);
+    if (isScriptStep(step) || key === undefined) continue;
+    const first = firstWith.get(key);
+    if (first === undefined) {
+      firstWith.set(key, { id: step.id, step });
+      continue;
+    }
+    const differing = sessionDifferences(first.step, step);
+    if (differing.length > 0) {
+      issues.push({
+        path: ["steps", index, "continuation"],
+        message: `Step "${step.id}" continues the same conversation as step "${first.id}" but differs in ${differing.join(", ")}. A conversation only continues across steps that match in those. Give one of them continuation: new, or a different key.`,
+      });
     }
   }
   return issues;
-}
-
-interface SessionStep {
-  id: string;
-  step: CompiledAgentStep;
-  event: string;
-}
-
-function conflictMessage(first: SessionStep, here: SessionStep, differing: string[]): string {
-  const where = (item: SessionStep) => (first.event === here.event ? "" : ` on ${item.event}`);
-  return `Step "${here.id}"${where(here)} continues the same conversation as step "${first.id}"${where(first)} but differs in ${differing.join(", ")}. A conversation only continues across steps that match in those. Give one of them continuation: new, or a different key.`;
 }
 
 const EMPTY_CONTEXT: ExpressionContext = {
@@ -184,9 +174,8 @@ function sharedSessionKey(trigger: CompiledTrigger, step: CompiledAgentStep): st
   const { continuation } = step;
   if (continuation === undefined || continuation.mode === "new") return undefined;
   if (continuation.mode === "key") return `key:${staticKey(continuation.key)}`;
-  // Without a conversation to continue, conversation mode starts a new agent. A conversation
-  // belongs to one event, so another event's steps never share it.
-  return automaticReplyType(trigger.on) === undefined ? undefined : `conversation:${trigger.on}`;
+  // Without a conversation to continue, conversation mode starts a new agent.
+  return automaticReplyType(trigger.on) === undefined ? undefined : "conversation";
 }
 
 function sessionDifferences(left: CompiledAgentStep, right: CompiledAgentStep): string[] {

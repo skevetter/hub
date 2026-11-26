@@ -163,11 +163,9 @@ describe("a document with steps", () => {
     expect(templated?.path).toBe("steps.1.continuation");
   });
 
-  it("compares a keyed step across the events of the trigger", () => {
+  it("checks each event on its own, leaving a reply tool that only one event adds to dispatch", () => {
     const yaml = `name: both\non:\n  manual.run: {}\n  linear.comment_created:\n    connection: linear\n    filters: { from_users: [alice] }\ntarget: { daemon: devbox, cwd: /workspace/app }\nsteps:\n  - id: a\n    continuation: { mode: key, key: shared }\n    agent: { provider: codex }\n    prompt: Go\n`;
-    const [issue] = issuesOf(yaml);
-    expect(issue?.message).toContain("differs in allowed outputs");
-    expect(issue?.message).toContain("on linear.comment_created");
+    expect(issuesOf(yaml)).toEqual([]);
   });
 
   it("puts an invalid output schema or idle timeout on the step", () => {
@@ -175,6 +173,10 @@ describe("a document with steps", () => {
       `  - id: a\n    agent: { provider: codex }\n    prompt: Go\n${extra}`;
     const [schema] = issuesOf(listDocument(step("    output:\n      schema: { type: bogus }\n")));
     expect(schema?.path).toBe("steps.0.output.schema");
+    const [nonJson] = issuesOf(
+      listDocument(step("    output:\n      schema: { type: object, description: .nan }\n")),
+    );
+    expect(nonJson?.path).toBe("steps.0.output.schema");
     expect(issuesOf(listDocument(step("    idle_timeout: 3h\n")))).toEqual([
       { path: "steps.0.idle_timeout", message: "step a idle_timeout must not exceed max_runtime" },
     ]);

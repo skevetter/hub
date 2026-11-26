@@ -80,10 +80,9 @@ without `continuation` behaves like `run` with `continuation: new`.
 Steps that continue the same conversation share one agent session, and a session only accepts steps that
 match in agent, `env`, `github`, `background`, output schema and allowed outputs. Hub refuses a document
 where two such steps differ, at `steps.N.continuation`, and says which fields differ. Give one step
-`continuation: new` or a different key. A key is shared by every event of the trigger, so one keyed step
-on a chat event and on a manual event differs in its reply output too. A key written as a template is
-compared by its text when it reads nothing from the event. A key that reads inputs or event data is
-checked when the step dispatches. On Slack, Discord, Linear and GitHub events the reply output is added to the last
+`continuation: new` or a different key. Each event is checked on its own. The reply tool a chat event adds
+to the last agent step, and a key written with inputs or event data, are checked when the step dispatches.
+A key written as a template is compared by its text when it reads nothing from the event. On Slack, Discord, Linear and GitHub events the reply output is added to the last
 agent step, so two steps that both use `continuation: conversation` always differ there.
 
 ## Choosing between agents

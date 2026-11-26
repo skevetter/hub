@@ -765,13 +765,13 @@ function compileAgentStep(
   const { maxRuntimeMs, idleTimeoutMs } = compileAgentRuntimes(trigger, step, stepPath);
   const condition = compileStepCondition(step.if, stepPath);
   const outputDeclaration =
-    step.output === undefined ? undefined : { schema: cloneJsonValue(step.output.schema) };
-  if (outputDeclaration !== undefined) {
-    const { schema } = outputDeclaration;
-    compileAt([...stepPath, "output", "schema"], () =>
-      validateOutputSchema(schema, `step ${step.id} output.schema`),
-    );
-  }
+    step.output === undefined
+      ? undefined
+      : compileAt([...stepPath, "output", "schema"], () => {
+          const schema = cloneJsonValue(step.output?.schema);
+          validateOutputSchema(schema, `step ${step.id} output.schema`);
+          return { schema };
+        });
   compileAt([...stepPath, "complete_on_turn_end"], () =>
     assertTurnEndCompletionAllowed(step.id, {
       enabled: step.complete_on_turn_end === true,
