@@ -66,6 +66,12 @@
           }
         ]
       }
+    },
+    {
+      "files": ["src/routes/**/*.test.ts", "src/routes/**/*.test.tsx"],
+      "rules": {
+        "typescript/only-throw-error": ["error", { "allow": [] }]
+      }
     }
   ]
 }
