@@ -106,8 +106,8 @@ Scale (Tailwind names remapped in `@theme`; use the name for the role):
 3. **Spacing.** Steps of 4, 8, 12, 16, 24, 32, 40, 56 and 72 px. Sections are 56 px apart (40 px on phones). A section starts with a 2 px `foreground` rule and its heading 12 px below.
 4. **Density.** Controls are 36 px high on desktop and 44 px on phones. Table rows have 16 px vertical padding. State blocks are 28 px high.
 5. **Page column.** Up to 1240 px wide, 40 px inset on desktop, 16 px on phones. The shell owns it; screens never pad themselves.
-6. **Shell, desktop.** A 232 px ink rail: organization switcher, search (opens the command menu and shows the shortcut), the main group, the Setup group, Settings, then Attention, Help and the account menu with the theme choice at the foot. The content header holds the breadcrumb and route actions.
-7. **Shell, phone (under 860 px).** An ink top bar (mark, section name, search) and a fixed ink bottom bar: Home, Activity, Sessions, Attention, More. Content pads clear of it. A detail page's primary action sits in a sticky bar above it. Route actions move under the page title.
+6. **Shell, desktop.** A 232 px ink rail: organization switcher, search (opens the command menu and shows the shortcut), the main group, the Setup group, Settings, then Help and the account menu with the theme choice at the foot. The content header holds the breadcrumb and route actions.
+7. **Shell, phone (under 860 px).** An ink top bar (mark, section name, search) and a fixed ink bottom bar: Home, Activity, Triggers, More. Content pads clear of it. A detail page's primary action sits in a sticky bar above it. Route actions move under the page title.
 8. **Detail pages.** Content in columns 1 to 8, facts in 9 to 12. On phones, facts follow the content.
 9. **State blocks on phones** are a label above the record, not a full-width bar. They keep their desktop width: fit to the label, at least 96 px.
 
@@ -142,7 +142,6 @@ The "Step" column says when a component reaches its Grid form: "Now" means it al
 | `ThemeSwitch`                                                           | System, Light, Dark. Reads and writes the theme module only.                                                                         | 1    |
 | `ErrorPage`, `NotFoundPage`, `RefusedPage`                              | Errors, 404 and refusals inside the shell: cause, then Retry or Go home.                                                             | 2    |
 | `PageAlert`                                                             | Page attention: one stack at the top of a page, one item per source, each with one action. Replaces `WarningAlert` as a page banner. | 3    |
-| `AttentionMenu`                                                         | The shell's Attention entry and its list of organization-wide items.                                                                 | 3    |
 | `Toaster`, `toast()`                                                    | Confirm a completed action, with View or Undo where possible.                                                                        | 3    |
 | `AppStatusBar`                                                          | App-level trouble (connection lost, session expired) inside the shell, with Retry.                                                   | 3    |
 | `FailureAlert`, `NoticeAlert`                                           | A failed request, or a neutral or success notice, as a polite live region.                                                           | 3    |
@@ -189,7 +188,7 @@ Rules for the roster:
 7. Every component has one visual result. `className` is for placement in a grid only; if a caller needs it to change a look, the component is missing a prop.
 8. Delete what nothing imports. Dead primitives in `ui` are deleted, not kept for later.
 
-Notification levels, one component each: field (`FormField` error), section (`StatusLine`), page (`PageAlert`), organization (`AttentionMenu`), completed action (`Toaster`), app (`AppStatusBar`), empty (`EmptyState`), loading (a skeleton or `LoadingLine`).
+Notification levels, one component each: field (`FormField` error), section (`StatusLine`), page (`PageAlert`), completed action (`Toaster`), app (`AppStatusBar`), empty (`EmptyState`), loading (a skeleton or `LoadingLine`).
 
 ## Do and don't
 
