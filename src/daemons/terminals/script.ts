@@ -243,7 +243,9 @@ function finishRun(
   if (thrown instanceof ScriptRunAborted) throw new ScriptRunAborted(stopped ? null : target);
   if (thrown instanceof Error) throw thrown;
   if (thrown !== undefined) {
-    throw new Error("Script run failed with a non-Error value", { cause: thrown });
+    const message =
+      typeof thrown === "string" ? thrown : "Script run failed with a non-Error value";
+    throw new Error(message, { cause: thrown });
   }
   const result = outcome ?? refused(new Error("script run ended without an outcome"), input.cwd);
   return stopped ? result : { ...result, cleanup: target };

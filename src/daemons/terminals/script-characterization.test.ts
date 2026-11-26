@@ -21,17 +21,24 @@ describe("script runner boundaries", () => {
     expect(daemon.killed).toEqual(["terminal-1"]);
   });
 
-  it.each([{ detail: "sleep failed" }, "sleep failed"])(
+  it.each([
+    ["string", "sleep failed", "sleep failed"],
+    ["empty string", "", ""],
+    ["object", { detail: "sleep failed" }, "Script run failed with a non-Error value"],
+    ["number", 17, "Script run failed with a non-Error value"],
+    ["null", null, "Script run failed with a non-Error value"],
+  ] as const)(
     "wraps a non-Error rejection from polling after cleanup (%s)",
-    async (reason) => {
+    async (_label, reason, message) => {
       const daemon = new FakeTerminalDaemon();
       const clock = new FakeClock();
       clock.sleep = async () => Promise.reject(reason);
-      const run = runScript(daemon.client, input, clock);
-      await expect(run).rejects.toThrow("Script run failed with a non-Error value");
-      const error: unknown = await run.catch((failure: unknown) => failure);
+      const error: unknown = await runScript(daemon.client, input, clock).catch(
+        (failure: unknown) => failure,
+      );
       expect(error).toBeInstanceOf(Error);
       if (!(error instanceof Error)) throw new Error("Expected a wrapped rejection");
+      expect(error.message).toBe(message);
       expect(error.cause).toBe(reason);
       expect(daemon.killed).toEqual(["terminal-1"]);
     },
