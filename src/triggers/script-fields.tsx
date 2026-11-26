@@ -1,13 +1,15 @@
 /* oxlint-disable eslint-plugin-react-perf/jsx-no-new-function-as-prop -- the controls bind one trigger form */
 import { MessageSquareText, SquareTerminal } from "lucide-react";
-import type { ReactNode } from "react";
+import type { ComponentProps, ReactElement, ReactNode } from "react";
 
 import { NoticeAlert } from "../components/app/failure-alert.js";
 import { FormField } from "../components/app/form-field.js";
 import { SegmentedControl, type SegmentedOption } from "../components/app/segmented-control.js";
 import { Textarea } from "../components/ui/textarea.js";
 import {
-  changeTriggerAction,
+  changeStepAction,
+  firstStep,
+  patchFirstStep,
   sharedYamlField,
   type TriggerAction,
   type TriggerFieldErrors,
@@ -36,14 +38,14 @@ export function ActionField({
 }: {
   value: TriggerFormValue;
   onChange: (value: TriggerFormValue) => void;
-}) {
+}): ReactElement<ComponentProps<typeof SegmentedControl>> {
   return (
     <SegmentedControl
       label="Action"
       description="What runs when the event arrives."
-      value={value.action}
+      value={firstStep(value).action}
       options={ACTION_OPTIONS}
-      onChange={(action) => onChange(changeTriggerAction(value, parseAction(action)))}
+      onChange={(action) => onChange(changeStepAction(value, 0, parseAction(action)))}
     />
   );
 }
@@ -62,14 +64,14 @@ export function ScriptFields({
   errors: TriggerFieldErrors;
   onChange: (value: TriggerFormValue) => void;
 }) {
-  const error = errors.script;
+  const error = errors["steps.0.script"];
   return (
     <>
       <FormField
         id="trigger-script"
         label="Script"
         description="Run by /bin/sh -c. Output and the exit code are kept in the run history. Event data is in the HUB_EVENT_JSON environment variable."
-        {...sharedYamlField(value, "script")}
+        {...sharedYamlField(value, "steps.0.script")}
         required
         {...(error === undefined ? {} : { error })}
       >
@@ -77,8 +79,8 @@ export function ScriptFields({
           <Textarea
             {...control}
             name="script"
-            value={value.script}
-            onChange={(event) => onChange({ ...value, script: event.target.value })}
+            value={firstStep(value).script}
+            onChange={(event) => onChange(patchFirstStep(value, { script: event.target.value }))}
             rows={10}
             spellCheck={false}
             placeholder={'echo "$HUB_EVENT_JSON"'}
@@ -102,10 +104,10 @@ export function ScriptFields({
  */
 export function triggerSecondaryLine(trigger: {
   format?: string | undefined;
-  draft: Pick<TriggerFormValue, "action" | "agent"> | null;
+  draft: Pick<TriggerFormValue, "steps"> | null;
 }): ReactNode {
   if (trigger.format === "legacy_multistep") return "Legacy YAML";
-  if (trigger.draft?.action === "script") {
+  if (trigger.draft?.steps[0]?.action === "script") {
     return (
       <span className="inline-flex items-center gap-1">
         <SquareTerminal aria-hidden="true" className="size-3.5 shrink-0" />
@@ -113,5 +115,5 @@ export function triggerSecondaryLine(trigger: {
       </span>
     );
   }
-  return trigger.draft?.agent ?? "Advanced YAML";
+  return trigger.draft?.steps[0]?.agent ?? "Advanced YAML";
 }

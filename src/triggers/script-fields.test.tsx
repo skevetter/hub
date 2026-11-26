@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, it } from "vitest";
-import type { TriggerFormValue } from "./configuration/editor.js";
+import { newStepFormValue, type TriggerFormValue } from "./configuration/editor.js";
 import { ProgressMessageField } from "./panel.js";
 import { ActionField, ScriptFields, triggerSecondaryLine } from "./script-fields.js";
 
@@ -14,25 +14,13 @@ const form: TriggerFormValue = {
   qualifiers: {},
   daemon: "devbox",
   cwd: "/workspace/webapp",
-  agent: "",
-  mode: "",
-  thinkingOptionId: "",
-  providerOptions: "",
-  continuationMode: "conversation",
-  continuationKey: "",
-  maxRuntime: "10m",
-  idleTimeout: "10m",
-  completeOnTurnEnd: false,
-  githubConnection: "",
-  githubRepositories: "",
-  githubPermissions: "",
-  githubDuration: "",
-  prompt: "",
-  action: "script",
-  script: 'echo "$HUB_EVENT_JSON"\n',
+  runMaxRuntime: "",
+  steps: [
+    newStepFormValue({ action: "script", maxRuntime: "10m", script: 'echo "$HUB_EVENT_JSON"\n' }),
+  ],
 };
 
-const promptForm: TriggerFormValue = { ...form, action: "prompt" };
+const promptForm: TriggerFormValue = { ...form, steps: [newStepFormValue()] };
 const noop = () => undefined;
 
 describe("trigger progress message field", () => {
@@ -95,6 +83,17 @@ describe("trigger action choice", () => {
     const markup = renderToStaticMarkup(<ActionField value={promptForm} onChange={noop} />);
     assert.match(markup, /role="radio"[^>]*aria-checked="true"[^>]*>(?:(?!<\/button>).)*Prompt/su);
   });
+
+  it("changes only the first action and preserves later steps", () => {
+    const second = newStepFormValue({ id: "later", prompt: "Keep this" });
+    const original = { ...promptForm, steps: [...promptForm.steps, second] };
+    let updated: TriggerFormValue | undefined;
+    const control = ActionField({ value: original, onChange: (value) => (updated = value) });
+    control.props.onChange("script");
+    assert.equal(updated?.steps[0]?.action, "script");
+    assert.equal(updated?.steps[1], second);
+    assert.equal(original.steps[0]?.action, "prompt");
+  });
 });
 
 describe("script fields", () => {
@@ -118,7 +117,7 @@ describe("script fields", () => {
   });
 
   it("marks the script field with its error", () => {
-    const markup = render({ script: "Script is required." });
+    const markup = render({ "steps.0.script": "Script is required." });
     assert.match(markup, /aria-invalid="true"/u);
     assert.match(markup, /Script is required\./u);
   });
@@ -132,7 +131,7 @@ describe("script fields", () => {
 describe("trigger list line", () => {
   it("shows Script with a terminal glyph in place of the agent", () => {
     const markup = renderToStaticMarkup(
-      <>{triggerSecondaryLine({ draft: { action: "script", agent: "" } })}</>,
+      <>{triggerSecondaryLine({ draft: { steps: [newStepFormValue({ action: "script" })] } })}</>,
     );
     assert.match(markup, /<svg[^>]*lucide-square-terminal/u);
     assert.match(markup, /Script/u);
@@ -140,7 +139,7 @@ describe("trigger list line", () => {
 
   it("still shows the agent for a prompt trigger", () => {
     assert.equal(
-      triggerSecondaryLine({ draft: { action: "prompt", agent: "codex/gpt-5.4" } }),
+      triggerSecondaryLine({ draft: { steps: [newStepFormValue({ agent: "codex/gpt-5.4" })] } }),
       "codex/gpt-5.4",
     );
     assert.equal(triggerSecondaryLine({ draft: null }), "Advanced YAML");
