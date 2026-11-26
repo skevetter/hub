@@ -272,7 +272,7 @@ describe("Home figures", () => {
     const markup = renderHome(failing);
     assert.match(
       figure(markup, "triggers failing"),
-      /^2 triggers failing Latest: Triage, failed /u,
+      /^2 triggers failing Latest: Triage, did not finish /u,
     );
     assert.match(markup, /<a href="\/o\/acme\/activity\/newest"[^>]*>Triage<\/a>/u);
     assert.match(markup, /aria-label="View latest failed run for Triage"/u);
@@ -386,8 +386,7 @@ describe("Home triggers", () => {
     const markup = renderHome(failing);
     assert.deepEqual(triggerNames(markup), ["Triage", "Audit", "Deploy", "Nightly"]);
     const list = markup.slice(markup.indexOf('aria-label="Trigger health"'));
-    assert.match(list, /Failed<\/span>/u);
-    assert.match(list, /Timed out<\/span>/u);
+    assert.equal(list.match(/Did not finish<\/span>/gu)?.length, 2);
     assert.match(list, /Disabled<\/span>/u);
   });
 

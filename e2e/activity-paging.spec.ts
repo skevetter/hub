@@ -68,14 +68,14 @@ test("Activity pages and filters stay in the URL at desktop and phone widths", a
   await expect.soft(announcement).toContainText("25 runs", { timeout: 1000 });
   expect(new URL(page.url()).searchParams.get("cursor")).toBeNull();
 
-  await page.getByRole("combobox", { name: "Status" }).selectOption("failed");
-  await expect(page).toHaveURL(/[?&]status=failed/u);
+  await page.getByRole("combobox", { name: "Status" }).selectOption("did_not_finish");
+  await expect(page).toHaveURL(/[?&]status=did_not_finish/u);
   await expect(announcement).toContainText("1 run.");
   const previousAnnouncement = await announcement.textContent();
   const livePoll = page.waitForResponse(
     (response) =>
       new URL(response.url()).pathname.startsWith("/_serverFn/") &&
-      response.url().includes("failed"),
+      response.url().includes("did_not_finish"),
   );
   await livePoll;
   await expect(rows).toHaveCount(1);

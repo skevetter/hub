@@ -11,7 +11,7 @@ vi.mock("../components/app/state-label.js", async (importOriginal) => {
   const actual = await importOriginal<typeof StateLabel>();
   return {
     ...actual,
-    runState: (status: string) => toneOverride.get(status) ?? actual.runState(status),
+    runListState: (status: string) => toneOverride.get(status) ?? actual.runListState(status),
   };
 });
 afterEach(() => toneOverride.clear());
@@ -114,7 +114,12 @@ describe("trigger health", () => {
       ],
     });
     const labels = Object.fromEntries(rows.map(({ id, state }) => [id, state.label]));
-    assert.deepEqual(labels, { a: "Failed", b: "No runs yet", c: "Disabled", d: "Canceled" });
+    assert.deepEqual(labels, {
+      a: "Did not finish",
+      b: "No runs yet",
+      c: "Disabled",
+      d: "Canceled",
+    });
   });
 
   it("counts failing, running and paused triggers; a paused trigger never fails", () => {

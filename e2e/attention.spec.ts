@@ -165,7 +165,7 @@ test.describe("Attention behavior", () => {
     });
     const runs = page.getByRole("table", { name: "Trigger activity" });
     await expect(runs.getByRole("link", { name: TRIGGER, exact: true })).toHaveCount(3);
-    await expect(runs.getByText("Timed out", { exact: true })).toBeVisible();
+    await expect(runs.getByText("Did not finish", { exact: true })).toHaveCount(2);
     await expect(runs.getByText("Rejected", { exact: true })).toBeVisible();
     await expect(dialog).toBeHidden();
     await markSeenAndReload(hub.primaryApplication(), page);

@@ -1,4 +1,4 @@
-import { enabledState, runState, type StateView } from "../components/app/state-label.js";
+import { enabledState, runListState, type StateView } from "../components/app/state-label.js";
 import type { HomeSnapshot } from "./dashboard.js";
 
 type Latest = HomeSnapshot["triggerRuns"][number]["latest"];
@@ -68,7 +68,7 @@ function healthRow(
 
 function stateOf(enabled: boolean, latest: Latest): StateView {
   if (!enabled) return enabledState(false);
-  return latest === null ? NO_RUNS : runState(latest.status);
+  return latest === null ? NO_RUNS : runListState(latest.status);
 }
 
 /**

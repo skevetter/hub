@@ -18,13 +18,13 @@ describe("activity search", () => {
     const trigger = crypto.randomUUID();
     assert.deepEqual(
       activitySearchSchema.parse({
-        status: "timed_out",
+        status: "did_not_finish",
         provider: "webhook",
         trigger: trigger.toUpperCase(),
         range: "30d",
         size: "50",
       }),
-      { status: "timed_out", provider: "webhook", trigger, range: "30d", size: 50 },
+      { status: "did_not_finish", provider: "webhook", trigger, range: "30d", size: 50 },
     );
   });
 
@@ -202,7 +202,7 @@ describe("trigger activity pages", () => {
     });
     assert.deepEqual(matched.activity, first.activity);
     for (const filters of [
-      { status: "failed" },
+      { status: "did_not_finish" },
       { provider: "webhook" },
       { trigger: crypto.randomUUID() },
     ] as const) {
