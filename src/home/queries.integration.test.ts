@@ -304,6 +304,39 @@ describe("active trigger revisions", () => {
     expect(await pg.database.listActiveOrganizationTriggerRevisions("absent")).toEqual([]);
   });
 
+  it("skips an active revision that carries another organization's id", async () => {
+    const { runtime } = pg;
+    const own = await seedRevisions("foreign-stamp", 1);
+    const kept = await seedRevisions("kept-stamp", 1);
+    await Promise.all([own, kept].map(activate));
+    const constraint = "organization_trigger_revisions_trigger_organization_fk";
+    await runtime.query(`alter table organization_trigger_revisions drop constraint ${constraint}`);
+    try {
+      await runtime.query(
+        "update organization_trigger_revisions set organization_id = $2 where id = $1",
+        [own.revisionIds[0], otherOrg],
+      );
+      const triggerIds = (await pg.database.listActiveOrganizationTriggerRevisions(org)).map(
+        ({ triggerId }) => triggerId,
+      );
+      expect(triggerIds).toContain(kept.triggerId);
+      expect(triggerIds).not.toContain(own.triggerId);
+      expect(
+        (await pg.database.listActiveOrganizationTriggerRevisions(otherOrg)).map(
+          ({ triggerId }) => triggerId,
+        ),
+      ).not.toContain(own.triggerId);
+    } finally {
+      await runtime.query(
+        "update organization_trigger_revisions set organization_id = $2 where id = $1",
+        [own.revisionIds[0], org],
+      );
+      await runtime.query(`alter table organization_trigger_revisions add constraint ${constraint}
+        foreign key (trigger_id, organization_id) references organization_triggers (id, organization_id)
+        on delete cascade`);
+    }
+  });
+
   it("looks each revision up by key instead of scanning the revisions table", async () => {
     const { runtime } = pg;
     for (const [organizationId, count] of [

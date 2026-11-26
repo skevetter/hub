@@ -27,7 +27,7 @@ export const ACTIVE_TRIGGER_REVISIONS_SQL = `select revision.*
   from organization_triggers trigger
   cross join lateral (
     select * from organization_trigger_revisions
-    where id = trigger.active_revision_id and trigger_id = trigger.id
+    where id = trigger.active_revision_id and trigger_id = trigger.id and organization_id = $1
     limit 1
   ) revision
   where trigger.organization_id = $1`;
