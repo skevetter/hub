@@ -28,6 +28,7 @@ import {
 } from "../test-utils/github-billing-notice.js";
 import { createGitHubTriggerProvider } from "../triggers/github/provider.js";
 import type { GitHubCommentClient } from "../triggers/github/reply.js";
+import { turnEndFixture } from "./test-utils/turn-end-fixture.js";
 
 const DAEMON_ID = "daemon-ack-test";
 const AGENT_ID = "agent-ack-test";
@@ -430,6 +431,62 @@ describe("durable Hub action acknowledgement state", () => {
     assert.notEqual(execution?.hubActionReadyAt, null);
     assert.notEqual(execution?.hubActionCompletedAt, null);
     await fixture.lifecycle.stop();
+  });
+
+  it.each([
+    { description: "ordinary finish", reads: 3, records: true },
+    { description: "continued finish", continuationKey: "continued", reads: 3, records: false },
+    { description: "unrelated tool", name: "shell", reads: 2, records: false },
+    { description: "unrecognised status", status: "unknown", reads: 2, records: false },
+    { description: "missing call ID", missingCallId: true, reads: 2, records: false },
+  ])("checks acknowledgement reads and writes for $description", async (scenario) => {
+    const organizationId = "org-finish-ack";
+    const database = createMemoryDatabase({ organizationIds: [organizationId] });
+    const { continuationKey } = scenario;
+    const fixture = await turnEndFixture({
+      database,
+      organizationId,
+      ...(continuationKey === undefined ? {} : { continuationKey }),
+    });
+    try {
+      const { execution } = await fixture.dispatch();
+      const read = vi.spyOn(database, "findAgentExecutionById");
+      const record = vi.spyOn(database, "recordAgentExecutionHubAcknowledgement");
+      const event = fixture.stream({
+        type: "timeline",
+        provider: "claude",
+        item: {
+          type: "tool_call",
+          name: scenario.name ?? "mcp__hub__finish_execution",
+          status: scenario.status ?? "completed",
+          ...(scenario.missingCallId === true ? {} : { callId: "finish-call" }),
+        },
+      });
+      await fixture.deliver(event);
+
+      assert.deepEqual(
+        read.mock.calls,
+        Array.from({ length: scenario.reads }, () => [execution.id]),
+      );
+      assert.deepEqual(
+        record.mock.calls,
+        scenario.records
+          ? [
+              [
+                execution.id,
+                {
+                  kind: "finish_execution",
+                  callId: "finish-call",
+                  status: "completed",
+                  observedAt: new Date(event.timestamp),
+                },
+              ],
+            ]
+          : [],
+      );
+    } finally {
+      await fixture.lifecycle.stop();
+    }
   });
 
   it("archives after finish_execution reported by the omp provider's bridged tool title", async () => {
