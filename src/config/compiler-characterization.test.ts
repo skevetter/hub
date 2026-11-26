@@ -353,3 +353,60 @@ describe("workflow reference validation", () => {
     );
   });
 });
+
+const nonFiniteAuthority =
+  "step work environment uses an agent-produced authority without provable finite choices; use a finite enum or const";
+
+describe("finite authority expressions", () => {
+  it.each([
+    '!null && "runner"',
+    '(null == null) && "runner"',
+    '(null != "runner") && "runner"',
+    'false || "runner"',
+  ])("accepts the finite result of %s", (expression) => {
+    const environment = expressionTemplate(expression);
+    const compiled = compileHubConfig(configuration({}, { environment }));
+    assert.equal(compiled.triggers[0]?.steps[0]?.environment, environment);
+    assert.deepEqual(parseCompiledHubConfig(compiled), compiled);
+  });
+
+  it.each(["null", 'null || "runner"', "values.target"])(
+    "rejects unprovable authority from %s",
+    (expression) => {
+      const raw = configuration(
+        { values: { target: "null" } },
+        { environment: expressionTemplate(expression) },
+      );
+      assertIssue(() => compileHubConfig(raw), nonFiniteAuthority, [...workPath, "environment"]);
+    },
+  );
+
+  it("accepts a value derived from a finite input", () => {
+    const environment = expressionTemplate("values.target");
+    const compiled = compileHubConfig(
+      configuration(
+        {
+          values: { target: "paseo.inputs.target" },
+          inputs: { target: { type: "string", choices: ["runner"], required: true } },
+        },
+        { environment },
+      ),
+    );
+    assert.equal(compiled.triggers[0]?.steps[0]?.environment, environment);
+    assert.deepEqual(parseCompiledHubConfig(compiled), compiled);
+  });
+
+  it("accepts authority from an earlier step's finite output", () => {
+    const environment = expressionTemplate("steps.prepare.outputs.target");
+    const steps = workflowSteps(
+      {
+        id: "prepare",
+        output: { schema: { type: "object", properties: { target: { const: "runner" } } } },
+      },
+      { environment },
+    );
+    const compiled = compileHubConfig(configuration({ steps }));
+    assert.equal(compiled.triggers[0]?.steps[1]?.environment, environment);
+    assert.deepEqual(parseCompiledHubConfig(compiled), compiled);
+  });
+});
