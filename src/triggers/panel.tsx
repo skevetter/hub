@@ -49,9 +49,14 @@ import { CodeEditor } from "../projects/configuration/code-editor.js";
 import { useRouteTenant } from "../projects/context.js";
 import type { Result } from "../contract/respond.js";
 import {
+  newStepFormValue,
+  type TriggerStepFormValue,
+  type TriggerFormField,
   describeTriggerEvent,
   changeTriggerEvent,
   droppedTriggerRules,
+  firstStep,
+  patchFirstStep,
   isManualNoCallers,
   sharedYamlField,
   mergeTriggerForm,
@@ -1007,7 +1012,10 @@ function describeEditor({
 function describeUnprojectedEditor(form: TriggerFormValue, yaml: string) {
   if (yaml !== "") return `When ${triggerEventClause(form.event)}, run the configured action.`;
   const target = form.daemon === "" ? "the selected host" : `host ${form.daemon}`;
-  const action = form.action === "script" ? "a script" : form.agent || "the selected agent";
+  const action =
+    firstStep(form).action === "script"
+      ? "a script"
+      : firstStep(form).agent || "the selected agent";
   return `When ${triggerEventClause(form.event)}, run ${action} on ${target}.`;
 }
 
@@ -1136,7 +1144,7 @@ function compatibilityTitle(legacy: boolean, advanced: boolean): string {
 }
 
 /** The error slot a field carries, absent while that field is fine. */
-function fieldError(errors: TriggerFieldErrors, key: keyof TriggerFormValue) {
+function fieldError(errors: TriggerFieldErrors, key: TriggerFormField) {
   const error = errors[key];
   return error === undefined ? {} : { error };
 }
@@ -1373,13 +1381,13 @@ type TriggerFormProps = TriggerFieldProps & {
 
 function TriggerForm({ form, errors, triggerId, snapshot, onChange }: TriggerFormProps) {
   const selectedDaemon = snapshot.daemons.find((daemon) => daemon.slug === form.daemon);
-  const script = form.action === "script";
+  const script = firstStep(form).action === "script";
   const providerCatalog = useDaemonProviderCatalog(
     snapshot.organization.slug,
     script ? undefined : selectedDaemon?.id,
     form.cwd,
   );
-  const [githubExpanded, setGithubExpanded] = useState(form.githubConnection !== "");
+  const [githubExpanded, setGithubExpanded] = useState(firstStep(form).githubConnection !== "");
   const [optionsExpanded, setOptionsExpanded] = useState(false);
   const fields = { form, errors, onChange };
   return (
@@ -1455,6 +1463,16 @@ function triggerFieldUpdate({ form, onChange }: Pick<TriggerFieldProps, "form" |
 function triggerTextField(props: Pick<TriggerFieldProps, "form" | "onChange">) {
   const update = triggerFieldUpdate(props);
   return (key: TriggerTextField) => (value: string) => update(key, value);
+}
+
+function stepFieldUpdate({ form, onChange }: Pick<TriggerFieldProps, "form" | "onChange">) {
+  return <Key extends keyof TriggerStepFormValue>(key: Key, value: TriggerStepFormValue[Key]) =>
+    onChange(patchFirstStep(form, { [key]: value }));
+}
+
+function stepTextField(props: Pick<TriggerFieldProps, "form" | "onChange">) {
+  const update = stepFieldUpdate(props);
+  return (key: keyof TriggerStepFormValue) => (value: string) => update(key, value);
 }
 
 function TriggerIdentityFields({
@@ -1569,14 +1587,17 @@ function TargetDaemonField({
           placeholder="Select a daemon"
           empty="No daemons found."
           onChange={(option) =>
-            onChange({
-              ...form,
-              daemon: option.value,
-              agent: "",
-              mode: "",
-              thinkingOptionId: "",
-              providerOptions: "",
-            })
+            onChange(
+              patchFirstStep(
+                { ...form, daemon: option.value },
+                {
+                  agent: "",
+                  mode: "",
+                  thinkingOptionId: "",
+                  providerOptions: "",
+                },
+              ),
+            )
           }
         />
       )}
@@ -1585,9 +1606,10 @@ function TargetDaemonField({
 }
 
 function TargetRuntimeFields({ form, errors, onChange }: TriggerFieldProps) {
-  const script = form.action === "script";
+  const script = firstStep(form).action === "script";
   const targetCopy = script ? SCRIPT_TARGET_COPY : AGENT_TARGET_COPY;
   const text = triggerTextField({ form, onChange });
+  const stepText = stepTextField({ form, onChange });
   return (
     <div className="grid gap-4 sm:grid-cols-2">
       <FormField
@@ -1608,11 +1630,11 @@ function TargetRuntimeFields({ form, errors, onChange }: TriggerFieldProps) {
         description={targetCopy.maxRuntime}
         kind="text"
         name="maxRuntime"
-        value={form.maxRuntime}
-        onChange={text("maxRuntime")}
+        value={firstStep(form).maxRuntime}
+        onChange={stepText("maxRuntime")}
         required
-        {...sharedYamlField(form, "maxRuntime")}
-        {...fieldError(errors, "maxRuntime")}
+        {...sharedYamlField(form, "steps.0.maxRuntime")}
+        {...fieldError(errors, "steps.0.maxRuntime")}
       />
       {script ? null : (
         <FormField
@@ -1621,11 +1643,11 @@ function TargetRuntimeFields({ form, errors, onChange }: TriggerFieldProps) {
           description="Stop an unresponsive agent, for example 10m."
           kind="text"
           name="idleTimeout"
-          value={form.idleTimeout}
-          onChange={text("idleTimeout")}
+          value={firstStep(form).idleTimeout}
+          onChange={stepText("idleTimeout")}
           required
-          {...sharedYamlField(form, "idleTimeout")}
-          {...fieldError(errors, "idleTimeout")}
+          {...sharedYamlField(form, "steps.0.idleTimeout")}
+          {...fieldError(errors, "steps.0.idleTimeout")}
         />
       )}
     </div>
@@ -1665,15 +1687,17 @@ function TriggerProviderFields({
 }
 
 function TriggerContinuityFields({ form, errors, onChange }: TriggerFieldProps) {
-  const text = triggerTextField({ form, onChange });
+  const stepText = stepTextField({ form, onChange });
   return (
     <>
-      <fieldset disabled={sharedYamlField(form, "continuationMode").disabled}>
+      <fieldset disabled={sharedYamlField(form, "steps.0.continuationMode").disabled}>
         <SegmentedControl
           label="Agent continuity"
-          description={sharedYamlField(form, "continuationMode").description ?? "Agent continuity"}
-          value={form.continuationMode}
-          onChange={text("continuationMode")}
+          description={
+            sharedYamlField(form, "steps.0.continuationMode").description ?? "Agent continuity"
+          }
+          value={firstStep(form).continuationMode}
+          onChange={stepText("continuationMode")}
           options={[
             {
               value: "conversation",
@@ -1693,18 +1717,18 @@ function TriggerContinuityFields({ form, errors, onChange }: TriggerFieldProps) 
           ]}
         />
       </fieldset>
-      {form.continuationMode === "key" ? (
+      {firstStep(form).continuationMode === "key" ? (
         <FormField
           id="trigger-continuation-key"
           label="Continuation key"
           kind="text"
           name="continuationKey"
-          value={form.continuationKey}
-          onChange={text("continuationKey")}
+          value={firstStep(form).continuationKey}
+          onChange={stepText("continuationKey")}
           description="A key or expression, for example ${{ paseo.inputs.ticket }}."
           required
-          {...sharedYamlField(form, "continuationKey")}
-          {...fieldError(errors, "continuationKey")}
+          {...sharedYamlField(form, "steps.0.continuationKey")}
+          {...fieldError(errors, "steps.0.continuationKey")}
         />
       ) : null}
     </>
@@ -1718,23 +1742,23 @@ function TriggerPromptFields({
   optionsExpanded,
   setOptionsExpanded,
 }: TriggerFieldProps & { optionsExpanded: boolean; setOptionsExpanded: (open: boolean) => void }) {
-  const update = triggerFieldUpdate({ form, onChange });
-  const text = triggerTextField({ form, onChange });
+  const updateStep = stepFieldUpdate({ form, onChange });
+  const stepText = stepTextField({ form, onChange });
   return (
     <>
       <PromptEditor
-        value={form.prompt}
-        {...sharedYamlField(form, "prompt")}
-        {...fieldError(errors, "prompt")}
-        onChange={(prompt) => update("prompt", prompt)}
+        value={firstStep(form).prompt}
+        {...sharedYamlField(form, "steps.0.prompt")}
+        {...fieldError(errors, "steps.0.prompt")}
+        onChange={(prompt) => updateStep("prompt", prompt)}
       />
       <CheckboxField
         id="trigger-complete-on-turn-end"
         label="Complete when the agent ends its turn"
         description="If the agent stops without calling finish_execution, count the run as done instead of failing it at the idle timeout. Not for runs with a structured output or a required output."
-        checked={form.completeOnTurnEnd}
-        {...sharedYamlField(form, "completeOnTurnEnd")}
-        onChange={(checked) => update("completeOnTurnEnd", checked)}
+        checked={firstStep(form).completeOnTurnEnd}
+        {...sharedYamlField(form, "steps.0.completeOnTurnEnd")}
+        onChange={(checked) => updateStep("completeOnTurnEnd", checked)}
       />
       <Disclosure
         id="trigger-provider-options"
@@ -1749,11 +1773,11 @@ function TriggerPromptFields({
           description="Passed to the provider on your daemon. YAML-only agent fields remain untouched."
           kind="multiline"
           name="providerOptions"
-          value={form.providerOptions}
-          onChange={text("providerOptions")}
+          value={firstStep(form).providerOptions}
+          onChange={stepText("providerOptions")}
           placeholder={'{"sandbox_mode":"workspace-write"}'}
-          {...sharedYamlField(form, "providerOptions")}
-          {...fieldError(errors, "providerOptions")}
+          {...sharedYamlField(form, "steps.0.providerOptions")}
+          {...fieldError(errors, "steps.0.providerOptions")}
         />
       </Disclosure>
     </>
@@ -1780,8 +1804,8 @@ function TriggerGitHubFields({
       label: connection.label,
     })),
   ];
-  const githubEnabled = form.githubConnection !== "";
-  const update = triggerFieldUpdate({ form, onChange });
+  const githubEnabled = firstStep(form).githubConnection !== "";
+  const updateStep = stepFieldUpdate({ form, onChange });
   return (
     <Disclosure
       id="trigger-github"
@@ -1795,16 +1819,16 @@ function TriggerGitHubFields({
           id="trigger-github-connection"
           label="GitHub connection"
           description="Mints a short-lived, restricted GH_TOKEN for this run."
-          {...sharedYamlField(form, "githubConnection")}
+          {...sharedYamlField(form, "steps.0.githubConnection")}
         >
           {(control) => (
             <Combobox
               {...control}
-              value={form.githubConnection}
+              value={firstStep(form).githubConnection}
               options={githubConnectionOptions}
               placeholder="Select a GitHub connection"
               empty="No GitHub connections found."
-              onChange={(option) => update("githubConnection", option.value)}
+              onChange={(option) => updateStep("githubConnection", option.value)}
             />
           )}
         </FormField>
@@ -1817,7 +1841,7 @@ function TriggerGitHubFields({
 }
 
 function TriggerGitHubScopeFields({ form, errors, onChange }: TriggerFieldProps) {
-  const text = triggerTextField({ form, onChange });
+  const stepText = stepTextField({ form, onChange });
   return (
     <>
       <FormField
@@ -1826,9 +1850,9 @@ function TriggerGitHubScopeFields({ form, errors, onChange }: TriggerFieldProps)
         description="Comma-separated owner/repository names."
         kind="text"
         name="githubRepositories"
-        value={form.githubRepositories}
-        onChange={text("githubRepositories")}
-        {...sharedYamlField(form, "githubRepositories")}
+        value={firstStep(form).githubRepositories}
+        onChange={stepText("githubRepositories")}
+        {...sharedYamlField(form, "steps.0.githubRepositories")}
         required
       />
       <FormField
@@ -1837,9 +1861,9 @@ function TriggerGitHubScopeFields({ form, errors, onChange }: TriggerFieldProps)
         description="At most 1h."
         kind="text"
         name="githubDuration"
-        value={form.githubDuration}
-        onChange={text("githubDuration")}
-        {...sharedYamlField(form, "githubDuration")}
+        value={firstStep(form).githubDuration}
+        onChange={stepText("githubDuration")}
+        {...sharedYamlField(form, "steps.0.githubDuration")}
         required
       />
       <FormField
@@ -1848,18 +1872,18 @@ function TriggerGitHubScopeFields({ form, errors, onChange }: TriggerFieldProps)
         description="Defaults to read-only repository contents when empty."
         kind="multiline"
         name="githubPermissions"
-        value={form.githubPermissions}
-        onChange={text("githubPermissions")}
+        value={firstStep(form).githubPermissions}
+        onChange={stepText("githubPermissions")}
         placeholder={'{"contents":"write","pull_requests":"write"}'}
-        {...sharedYamlField(form, "githubPermissions")}
-        {...fieldError(errors, "githubPermissions")}
+        {...sharedYamlField(form, "steps.0.githubPermissions")}
+        {...fieldError(errors, "steps.0.githubPermissions")}
       />
     </>
   );
 }
 
 function AccessCard({ form, errors, onChange }: TriggerFieldProps) {
-  const script = form.action === "script";
+  const script = firstStep(form).action === "script";
   const { audience } = eventDefinition(form.event);
   const noCallers = isManualNoCallers(form);
   let description: string | undefined;
@@ -1879,7 +1903,7 @@ function AccessCard({ form, errors, onChange }: TriggerFieldProps) {
 }
 
 function TriggerAudienceFields({ form, errors, onChange }: TriggerFieldProps) {
-  const script = form.action === "script";
+  const script = firstStep(form).action === "script";
   const { audience } = eventDefinition(form.event);
   const manual = form.event === "manual.run";
   const chooseAudience = !script && audience === "wildcard";
@@ -2119,21 +2143,23 @@ function ProviderCatalogFields({
         label="Agent"
         description="Models the selected daemon can run unattended: Claude, Codex, OpenCode, or omp."
         required
-        {...sharedYamlField(form, "agent")}
-        {...fieldError(errors, "agent")}
+        {...sharedYamlField(form, "steps.0.agent")}
+        {...fieldError(errors, "steps.0.agent")}
       >
         {(control) => (
           <Combobox
             {...control}
             required
             loading={loading}
-            value={form.agent}
+            value={firstStep(form).agent}
             options={agentOptions}
             placeholder="Select a model"
             searchPlaceholder="Search models…"
             empty="No models found."
             onChange={(option) =>
-              onChange({ ...form, agent: option.value, mode: "", thinkingOptionId: "" })
+              onChange(
+                patchFirstStep(form, { agent: option.value, mode: "", thinkingOptionId: "" }),
+              )
             }
           />
         )}
@@ -2158,7 +2184,7 @@ interface ProviderCatalogFieldProps {
 }
 
 function ProviderExecutionFields({ form, errors, entries, onChange }: ProviderCatalogFieldProps) {
-  const selected = selectedProviderModel(entries, form.agent);
+  const selected = selectedProviderModel(entries, firstStep(form).agent);
   const modeOptions = unattendedModeOptions(selected.entry);
   const thinkingOptions = (selected.model?.thinkingOptions ?? []).map((option) => ({
     value: option.id,
@@ -2171,18 +2197,18 @@ function ProviderExecutionFields({ form, errors, entries, onChange }: ProviderCa
         label="Execution mode"
         description="Modes reported for the selected provider. omp runs unattended only in full."
         required
-        {...sharedYamlField(form, "mode")}
-        {...fieldError(errors, "mode")}
+        {...sharedYamlField(form, "steps.0.mode")}
+        {...fieldError(errors, "steps.0.mode")}
       >
         {(control) => (
           <Combobox
             {...control}
             required
-            value={form.mode}
+            value={firstStep(form).mode}
             options={modeOptions}
             placeholder="Select a mode"
             empty="No modes found."
-            onChange={(option) => onChange({ ...form, mode: option.value })}
+            onChange={(option) => onChange(patchFirstStep(form, { mode: option.value }))}
           />
         )}
       </FormField>
@@ -2191,18 +2217,20 @@ function ProviderExecutionFields({ form, errors, entries, onChange }: ProviderCa
           id="trigger-thinking"
           label="Thinking"
           description="Thinking options reported for the selected model."
-          {...sharedYamlField(form, "thinkingOptionId")}
+          {...sharedYamlField(form, "steps.0.thinkingOptionId")}
           required
         >
           {(control) => (
             <Combobox
               {...control}
               required
-              value={form.thinkingOptionId}
+              value={firstStep(form).thinkingOptionId}
               options={thinkingOptions}
               placeholder="Select a thinking option"
               empty="No thinking options found."
-              onChange={(option) => onChange({ ...form, thinkingOptionId: option.value })}
+              onChange={(option) =>
+                onChange(patchFirstStep(form, { thinkingOptionId: option.value }))
+              }
             />
           )}
         </FormField>
@@ -2262,22 +2290,13 @@ function defaultForm(snapshot: TriggerSnapshot): TriggerFormValue {
     qualifiers: {},
     daemon: daemon?.slug ?? "",
     cwd: "",
-    agent: "",
-    mode: "",
-    thinkingOptionId: "",
-    providerOptions: "",
-    continuationMode: "conversation",
-    continuationKey: "",
-    maxRuntime: "2h",
-    idleTimeout: "10m",
-    completeOnTurnEnd: false,
-    githubConnection: "",
-    githubRepositories: "",
-    githubPermissions: "",
-    githubDuration: "1h",
-    action: "prompt",
-    script: "",
-    prompt:
-      "Handle this request in the originating conversation.\n\nWhen hub.reply is available, use it for useful progress updates and your final user-facing response. Call hub.finish_execution once the request is complete.\n\nRequest:\n${{ paseo.prompt }}",
+    runMaxRuntime: "",
+    steps: [
+      newStepFormValue({
+        githubDuration: "1h",
+        prompt:
+          "Handle this request in the originating conversation.\n\nWhen hub.reply is available, use it for useful progress updates and your final user-facing response. Call hub.finish_execution once the request is complete.\n\nRequest:\n${{ paseo.prompt }}",
+      }),
+    ],
   };
 }

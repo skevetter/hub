@@ -4,36 +4,50 @@ import {
   DEFAULT_RECURRENCE,
   type Recurrence,
 } from "../schedule/recurrence.js";
-import { ContinuationSchema } from "../continuation.js";
 import { hasProgressDestination, PROGRESS_DESTINATION_REQUIRED } from "../progress-events.js";
-import {
-  isAlias,
-  isCollection,
-  isMap,
-  isNode,
-  isScalar,
-  isSeq,
-  parseDocument,
-  stringify,
-  visit,
-  type Document,
-  type Alias,
-  type Node,
-  type YAMLMap,
-  type YAMLSeq,
-} from "yaml";
+import { isAlias, isMap, isScalar, parseDocument, stringify, type Document } from "yaml";
 import { z } from "zod";
 import { parseTriggerDocument } from "./document.js";
 import {
-  DEFAULT_SCRIPT_MAX_RUNTIME,
+  addStep,
+  changeStepAction,
+  earlierStepOutputs,
+  firstStep,
+  patchFirstStep,
+  hasScriptStep,
+  isShorthandSteps,
+  moveStep,
+  newStepFormValue,
+  patchStep,
+  patchStepLayout,
+  projectSteps,
+  remapStepErrors,
+  removeStep,
+  sharedStepFields,
+  stepDocument,
+  stepFormErrors,
+  type TriggerAction,
+  type TriggerStepField,
+  type TriggerStepFormValue,
+} from "./editor-steps.js";
+import { blankToUndefined, commaSeparated, incompleteReason, refused } from "./editor-text.js";
+import {
+  assertDocument,
+  deleteIfPresent,
+  sameValue,
+  setIfChanged,
+  setOptional,
+  SHARED_YAML_FIELD,
+  sharedYamlPath,
+  yamlAliases,
+} from "./editor-yaml.js";
+import {
   IDENTIFIER,
-  isScriptRun,
   TriggerDocumentSchema,
   TriggerFilterSchema,
-  type TriggerAgentRun,
   type TriggerDocument,
-  type TriggerScriptRun,
 } from "./schema.js";
+import { normalizeSteps } from "./steps.js";
 
 import {
   eventDefinition,
@@ -47,9 +61,20 @@ import {
   type QualifierKey,
 } from "./events.js";
 
-export type TriggerAction = "prompt" | "script";
-
-const DEFAULT_AGENT_MAX_RUNTIME = "2h";
+export {
+  addStep,
+  changeStepAction,
+  earlierStepOutputs,
+  firstStep,
+  patchFirstStep,
+  moveStep,
+  newStepFormValue,
+  remapStepErrors,
+  removeStep,
+  SHARED_YAML_FIELD,
+};
+export type { TriggerAction, TriggerStepField, TriggerStepFormValue };
+export { joinAgentId, parseProviderOptions, splitAgentId } from "./editor-text.js";
 
 export interface TriggerFormValue {
   name: string;
@@ -66,38 +91,32 @@ export interface TriggerFormValue {
   recurrence?: Recurrence;
   daemon: string;
   cwd: string;
-  agent: string;
-  mode: string;
-  thinkingOptionId: string;
-  providerOptions: string;
-  continuationMode: string;
-  continuationKey: string;
-  maxRuntime: string;
-  idleTimeout: string;
-  /** Count a finished agent turn as done when the agent never calls finish_execution. */
-  completeOnTurnEnd: boolean;
-  githubConnection: string;
-  githubRepositories: string;
-  githubPermissions: string;
-  githubDuration: string;
-  prompt: string;
-  /** What the trigger runs: an agent prompt, or a shell script on the daemon host. */
-  action: TriggerAction;
-  script: string;
+  /** The whole-run deadline. Empty leaves it to the steps' own limits. */
+  runMaxRuntime: string;
+  /** What the trigger runs, in order. One plain step is written as `run`, several as `steps`. */
+  steps: TriggerStepFormValue[];
 }
 
-export type TriggerFormField = keyof TriggerFormValue | `qualifiers.${QualifierKey}`;
+export type TriggerFormField =
+  | keyof TriggerFormValue
+  | `qualifiers.${QualifierKey}`
+  | `steps.${number}.${TriggerStepField}`;
 
-export const SHARED_YAML_FIELD =
-  "This field is shared with another field through a YAML anchor. Edit it in YAML.";
+const STEP_FIELD_KEY = /^steps\.(\d+)\.(.+)$/u;
 
+/** Whether a field, or a field of one step, is shared with another through a YAML anchor. */
 export function sharedYamlField(
   form: TriggerFormValue,
   field: TriggerFormField,
 ): { disabled?: true; description?: string } {
-  return form.sharedFields?.includes(field) === true
-    ? { disabled: true, description: SHARED_YAML_FIELD }
-    : {};
+  const step = STEP_FIELD_KEY.exec(field);
+  const shared =
+    step === null
+      ? form.sharedFields?.includes(field) === true
+      : (form.steps[Number(step[1])]?.sharedFields as readonly string[] | undefined)?.includes(
+          step[2] ?? "",
+        ) === true;
+  return shared ? { disabled: true, description: SHARED_YAML_FIELD } : {};
 }
 
 const GITHUB_TEXT_KEYS: readonly QualifierKey[] = ["pattern", "contains", "exclude_contains"];
@@ -105,9 +124,6 @@ const GITHUB_TEXT_KEYS: readonly QualifierKey[] = ["pattern", "contains", "exclu
 export type TriggerFormProjection =
   | { status: "editable"; value: TriggerFormValue }
   | { status: "yaml_only"; reason: string };
-
-const ProviderOptionsSchema = z.record(z.string(), z.unknown());
-const GitHubPermissionsSchema = z.record(z.string(), z.enum(["read", "write", "admin"]));
 
 export function projectTriggerForm(yaml: string): TriggerFormProjection {
   const parsed = parseEditorDocument(yaml);
@@ -138,28 +154,32 @@ function projectEditorEvent(
     ...(advancedFilters.length === 0 ? {} : { advancedFilters }),
     ...(sharedFields.length === 0 ? {} : { sharedFields }),
   };
-  const run = trigger.run;
-  if (run === undefined) {
-    return {
-      status: "yaml_only",
-      reason: "Triggers with several steps can only be edited in YAML.",
-    };
+  const { target, steps, shorthand } = normalizeSteps(trigger);
+  const projected = projectSteps(steps);
+  if (projected === undefined) {
+    return { status: "yaml_only", reason: "Agent choices can only be edited in YAML." };
   }
-  if (isScriptRun(run)) {
-    return {
-      status: "editable",
-      value: { ...toScriptFormValue(trigger, run, event, definition), ...metadata },
-    };
-  }
-  return "choices" in run.agent
-    ? { status: "yaml_only", reason: "Agent choices can only be edited in YAML." }
-    : {
-        status: "editable",
-        value: {
-          ...toFormValue({ trigger, run, event, definition, agent: run.agent }),
-          ...metadata,
-        },
-      };
+  const value: TriggerFormValue = {
+    ...toBaseFormValue(trigger, event, definition),
+    daemon: target.daemon,
+    cwd: target.cwd,
+    runMaxRuntime: trigger.max_runtime ?? "",
+    steps: projected.map((step, index) =>
+      withSharedFields(
+        step,
+        sharedStepFields(parsed.source, shorthand ? ["run"] : ["steps", index]),
+      ),
+    ),
+    ...metadata,
+  };
+  return { status: "editable", value };
+}
+
+function withSharedFields(
+  step: TriggerStepFormValue,
+  shared: TriggerStepField[],
+): TriggerStepFormValue {
+  return shared.length === 0 ? step : { ...step, sharedFields: shared };
 }
 
 function sharedTriggerFields(source: Document, event: EditorEvent): TriggerFormField[] {
@@ -167,6 +187,7 @@ function sharedTriggerFields(source: Document, event: EditorEvent): TriggerFormF
   if (aliases.size === 0) return [];
 
   const eventPath = ["on", event];
+  const targetBase = source.has("run") ? ["run", "target"] : ["target"];
   const fields: [TriggerFormField, ...string[]][] = [
     ["name", "name"],
     ["enabled", "enabled"],
@@ -176,24 +197,10 @@ function sharedTriggerFields(source: Document, event: EditorEvent): TriggerFormF
     ["connection", ...eventPath, "connection"],
     ["allowedUsers", ...eventPath, "filters", "from_users"],
     ["recurrence", ...eventPath, "recurrence"],
-    ["daemon", "run", "target", "daemon"],
-    ["cwd", "run", "target", "cwd"],
-    ["agent", "run", "agent", "provider"],
-    ["agent", "run", "agent", "model"],
-    ["mode", "run", "agent", "mode"],
-    ["thinkingOptionId", "run", "agent", "thinkingOptionId"],
-    ["providerOptions", "run", "agent", "options"],
-    ["continuationMode", "run", "continuation"],
-    ["continuationKey", "run", "continuation"],
-    ["maxRuntime", "run", "max_runtime"],
-    ["idleTimeout", "run", "idle_timeout"],
-    ["completeOnTurnEnd", "run", "complete_on_turn_end"],
-    ["githubConnection", "run", "github", "connection"],
-    ["githubRepositories", "run", "github", "repositories"],
-    ["githubPermissions", "run", "github", "permissions"],
-    ["githubDuration", "run", "github", "duration"],
-    ["prompt", "run", "prompt"],
-    ["script", "run", "script"],
+    ["daemon", ...targetBase, "daemon"],
+    ["cwd", ...targetBase, "cwd"],
+    ["runMaxRuntime", "max_runtime"],
+    ["steps", "steps"],
   ];
   const definition = eventDefinition(event);
   const keys = new Set(definition.qualifiers.map(({ key }) => key));
@@ -237,78 +244,6 @@ function messageFormFields(trigger: TriggerDocument) {
   };
 }
 
-function toScriptFormValue(
-  trigger: TriggerDocument,
-  run: TriggerScriptRun,
-  event: EditorEvent,
-  definition: TriggerDocument["on"][string],
-): TriggerFormValue {
-  return {
-    ...toBaseFormValue(trigger, event, definition),
-    daemon: run.target.daemon,
-    cwd: run.target.cwd,
-    agent: "",
-    mode: "",
-    thinkingOptionId: "",
-    providerOptions: "",
-    continuationMode: "conversation",
-    continuationKey: "",
-    maxRuntime: run.max_runtime,
-    idleTimeout: "10m",
-    completeOnTurnEnd: false,
-    githubConnection: "",
-    githubRepositories: "",
-    githubPermissions: "",
-    githubDuration: "",
-    prompt: "",
-    action: "script",
-    script: run.script,
-  };
-}
-
-function toFormValue({
-  trigger,
-  run,
-  event,
-  definition,
-  agent,
-}: {
-  trigger: TriggerDocument;
-  run: TriggerAgentRun;
-  event: EditorEvent;
-  definition: TriggerDocument["on"][string];
-  agent: Extract<TriggerAgentRun["agent"], { provider: string }>;
-}): TriggerFormValue {
-  return {
-    ...toBaseFormValue(trigger, event, definition),
-    daemon: run.target.daemon,
-    cwd: run.target.cwd,
-    agent: joinAgentId(agent.provider, agent.model),
-    mode: agent.mode ?? "",
-    thinkingOptionId: agent.thinkingOptionId ?? "",
-    providerOptions: agent.options === undefined ? "" : JSON.stringify(agent.options, null, 2),
-    continuationMode: run.continuation.mode,
-    continuationKey: run.continuation.mode === "key" ? run.continuation.key : "",
-    maxRuntime: run.max_runtime,
-    idleTimeout: run.idle_timeout,
-    completeOnTurnEnd: run.complete_on_turn_end === true,
-    ...githubFormFields(run),
-    prompt: run.prompt,
-    action: "prompt",
-    script: "",
-  };
-}
-
-function githubFormFields(run: TriggerAgentRun) {
-  return {
-    githubConnection: run.github?.connection ?? "",
-    githubRepositories: run.github?.repositories?.join(", ") ?? "",
-    githubPermissions:
-      run.github?.permissions === undefined ? "" : JSON.stringify(run.github.permissions, null, 2),
-    githubDuration: run.github?.duration ?? "",
-  };
-}
-
 /** Patch only form-owned YAML nodes, retaining comments, ordering, and advanced nodes. */
 export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string {
   const projection = projectTriggerForm(yaml);
@@ -346,100 +281,18 @@ function patchMessageFlags(
 }
 
 function patchRun(document: Document, previous: TriggerFormValue, next: TriggerFormValue): void {
-  patchRunTarget(document, previous, next);
-  const actionChanged = previous.action !== next.action;
-  if (actionChanged || previous.maxRuntime !== next.maxRuntime) {
-    setIfChanged(document, ["run", "max_runtime"], next.maxRuntime.trim());
+  if (previous.runMaxRuntime !== next.runMaxRuntime) {
+    setOptional(document, ["max_runtime"], blankToUndefined(next.runMaxRuntime));
   }
-  if (next.action === "script") {
-    if (actionChanged) {
-      for (const key of [
-        "agent",
-        "prompt",
-        "continuation",
-        "idle_timeout",
-        "github",
-        "complete_on_turn_end",
-      ]) {
-        deleteIfPresent(document, ["run", key]);
-      }
-    }
-    if (actionChanged || previous.script !== next.script) {
-      setIfChanged(document, ["run", "script"], next.script);
-    }
-    return;
+  const layout = patchStepLayout(document, previous.steps, next.steps);
+  if (previous.daemon !== next.daemon) {
+    setIfChanged(document, [...layout.targetBase, "daemon"], next.daemon);
   }
-  if (actionChanged) deleteIfPresent(document, ["run", "script"]);
-  patchAgentRun(document, previous, next);
-}
-
-function patchRunTarget(
-  document: Document,
-  previous: TriggerFormValue,
-  next: TriggerFormValue,
-): void {
-  if (previous.daemon !== next.daemon)
-    setIfChanged(document, ["run", "target", "daemon"], next.daemon);
-  if (previous.cwd !== next.cwd) setIfChanged(document, ["run", "target", "cwd"], next.cwd);
-}
-
-function patchAgentRun(
-  document: Document,
-  previous: TriggerFormValue,
-  next: TriggerFormValue,
-): void {
-  const changed = (...fields: (keyof TriggerFormValue)[]) =>
-    previous.action !== next.action || fields.some((field) => previous[field] !== next[field]);
-  patchAgentSettings(document, next, changed);
-  if (changed("continuationMode", "continuationKey")) {
-    setIfChanged(document, ["run", "continuation"], formContinuation(next));
+  if (previous.cwd !== next.cwd) setIfChanged(document, [...layout.targetBase, "cwd"], next.cwd);
+  for (const [index, planned] of layout.steps.entries()) {
+    const step = next.steps[index];
+    if (step !== undefined) patchStep(document, planned, step);
   }
-  if (changed("idleTimeout")) {
-    setIfChanged(document, ["run", "idle_timeout"], next.idleTimeout.trim());
-  }
-  if (changed("completeOnTurnEnd")) {
-    setOptional(document, ["run", "complete_on_turn_end"], next.completeOnTurnEnd || undefined);
-  }
-  if (changed("githubConnection", "githubRepositories", "githubPermissions", "githubDuration")) {
-    patchGitHubAuthority(document, next);
-  }
-  if (changed("prompt")) setIfChanged(document, ["run", "prompt"], next.prompt);
-}
-
-function patchAgentSettings(
-  document: Document,
-  next: TriggerFormValue,
-  changed: (...fields: (keyof TriggerFormValue)[]) => boolean,
-): void {
-  if (changed("agent")) {
-    const agent = splitAgentId(next.agent);
-    setIfChanged(document, ["run", "agent", "provider"], agent.provider);
-    setOptional(document, ["run", "agent", "model"], agent.model);
-  }
-  if (changed("mode")) setIfChanged(document, ["run", "agent", "mode"], next.mode.trim());
-  if (changed("thinkingOptionId")) {
-    setOptional(
-      document,
-      ["run", "agent", "thinkingOptionId"],
-      blankToUndefined(next.thinkingOptionId),
-    );
-  }
-  if (changed("providerOptions")) {
-    setOptional(document, ["run", "agent", "options"], parseProviderOptions(next.providerOptions));
-  }
-}
-
-function patchGitHubAuthority(document: Document, value: TriggerFormValue): void {
-  const path = ["run", "github"];
-  const github = githubAuthority(value);
-  if (github === undefined || !isMap(document.getIn(path, true))) {
-    setOptional(document, path, github);
-    return;
-  }
-  setIfChanged(document, [...path, "connection"], github.connection);
-  setOptional(document, [...path, "repositories"], github.repositories);
-  setOptional(document, [...path, "permissions"], github.permissions);
-  setOptional(document, [...path, "duration"], github.duration);
 }
 
 function patchEvent(document: Document, previous: TriggerFormValue, next: TriggerFormValue) {
@@ -566,12 +419,6 @@ export function mergeTriggerForm(yaml: string, value: TriggerFormValue): Trigger
   }
 }
 
-function incompleteReason(cause: unknown): string {
-  return cause instanceof Error && cause.message.trim() !== ""
-    ? cause.message
-    : "The trigger is invalid.";
-}
-
 export function createTriggerYaml(value: TriggerFormValue): string {
   validateFormValue(value);
   const trigger = {
@@ -581,46 +428,16 @@ export function createTriggerYaml(value: TriggerFormValue): string {
     ...(value.progressMessage === true ? { progress_message: true } : {}),
     ...(value.replyMessage === true ? { reply_message: true } : {}),
   };
-  if (value.action === "script") {
-    return stringify(
-      {
-        ...trigger,
-        run: {
-          target: { daemon: value.daemon, cwd: value.cwd },
-          script: value.script,
-          max_runtime: value.maxRuntime.trim(),
-        },
-      },
-      { lineWidth: 0, compat: ["timestamp"] },
-    );
-  }
-  const agent = splitAgentId(value.agent);
-  const providerOptions = parseProviderOptions(value.providerOptions);
-  const github = githubAuthority(value);
-  return stringify(
-    {
-      ...trigger,
-      run: {
-        target: { daemon: value.daemon, cwd: value.cwd },
-        agent: {
-          provider: agent.provider,
-          ...(agent.model === undefined ? {} : { model: agent.model }),
-          mode: value.mode.trim(),
-          ...(blankToUndefined(value.thinkingOptionId) === undefined
-            ? {}
-            : { thinkingOptionId: value.thinkingOptionId.trim() }),
-          ...(providerOptions === undefined ? {} : { options: providerOptions }),
-        },
-        continuation: formContinuation(value),
-        max_runtime: value.maxRuntime.trim(),
-        idle_timeout: value.idleTimeout.trim(),
-        ...(value.completeOnTurnEnd ? { complete_on_turn_end: true } : {}),
-        ...(github === undefined ? {} : { github }),
-        prompt: value.prompt,
-      },
-    },
-    { lineWidth: 0, compat: ["timestamp"] },
-  );
+  const runMaxRuntime = blankToUndefined(value.runMaxRuntime);
+  const target = { daemon: value.daemon, cwd: value.cwd };
+  const document = {
+    ...trigger,
+    ...(runMaxRuntime === undefined ? {} : { max_runtime: runMaxRuntime }),
+    ...(isShorthandSteps(value.steps)
+      ? { run: { target, ...stepDocument(firstStep(value), true) } }
+      : { target, steps: value.steps.map((step) => stepDocument(step, false)) }),
+  };
+  return stringify(document, { lineWidth: 0, compat: ["timestamp"] });
 }
 
 function formEventDefinition(value: TriggerFormValue): TriggerDocument["on"][string] {
@@ -660,7 +477,7 @@ function authoredAudience(value: TriggerFormValue): string[] | undefined {
 export function isManualNoCallers(value: TriggerFormValue): boolean {
   return (
     value.event === "manual.run" &&
-    value.action === "prompt" &&
+    !hasScriptStep(value) &&
     value.manualNoCallers === true &&
     value.allowedUsers === ""
   );
@@ -695,35 +512,6 @@ function recurrenceErrors(value: TriggerFormValue): TriggerFieldErrors {
   return { recurrence: issue.message };
 }
 
-function githubAuthority(value: TriggerFormValue) {
-  const connection = blankToUndefined(value.githubConnection);
-  if (connection === undefined) return undefined;
-  const repositories = commaSeparated(value.githubRepositories);
-  const permissions = parsePermissions(value.githubPermissions);
-  const duration = blankToUndefined(value.githubDuration);
-  return {
-    connection,
-    ...(repositories.length === 0 ? {} : { repositories }),
-    ...(permissions === undefined ? {} : { permissions }),
-    ...(duration === undefined ? {} : { duration }),
-  };
-}
-
-function parsePermissions(value: string): Record<string, "read" | "write" | "admin"> | undefined {
-  if (value.trim().length === 0) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new Error("GitHub permissions must be valid JSON.");
-  }
-  const permissions = GitHubPermissionsSchema.safeParse(parsed);
-  if (!permissions.success) {
-    throw new Error('GitHub permissions map a scope to "read", "write", or "admin".');
-  }
-  return permissions.data;
-}
-
 /** What is wrong with each field, keyed by the field that has to change. */
 export type TriggerFieldErrors = Partial<Record<TriggerFormField, string>>;
 
@@ -739,9 +527,7 @@ export function triggerFormErrors(value: TriggerFormValue): TriggerFieldErrors {
   const errors = triggerEventErrors(value);
   if (value.daemon.trim().length === 0) errors.daemon = "Daemon is required.";
   Object.assign(errors, workingDirectoryErrors(value));
-  if (value.maxRuntime.trim().length === 0) errors.maxRuntime = "Maximum runtime is required.";
-  if (value.action === "script") return Object.assign(errors, scriptErrors(value));
-  addAgentRunErrors(errors, value);
+  Object.assign(errors, stepFormErrors(value.steps));
   return errors;
 }
 
@@ -767,21 +553,6 @@ function triggerEventErrors(value: TriggerFormValue): TriggerFieldErrors {
   return errors;
 }
 
-function addAgentRunErrors(errors: TriggerFieldErrors, value: TriggerFormValue): void {
-  if (value.idleTimeout.trim().length === 0) errors.idleTimeout = "Idle timeout is required.";
-  const agent = refused(() => splitAgentId(value.agent));
-  if (agent !== undefined) errors.agent = agent;
-  if (value.mode.trim().length === 0) errors.mode = "Execution mode is required.";
-  const options = refused(() => parseProviderOptions(value.providerOptions));
-  if (options !== undefined) errors.providerOptions = options;
-  if (value.githubConnection.trim().length !== 0) {
-    const permissions = refused(() => parsePermissions(value.githubPermissions));
-    if (permissions !== undefined) errors.githubPermissions = permissions;
-  }
-  Object.assign(errors, continuationErrors(value));
-  if (value.prompt.trim().length === 0) errors.prompt = "Instructions are required.";
-}
-
 function qualifierErrors(value: TriggerFormValue): TriggerFieldErrors {
   const errors: TriggerFieldErrors = {};
   for (const qualifier of eventDefinition(value.event).qualifiers) {
@@ -795,21 +566,10 @@ function qualifierErrors(value: TriggerFormValue): TriggerFieldErrors {
   return errors;
 }
 
-function scriptErrors(value: TriggerFormValue): TriggerFieldErrors {
-  if (value.script.trim().length === 0) return { script: "Script is required." };
-  if (value.script.includes("${{")) {
-    return {
-      script:
-        "Script text is not templated. Read event data from the HUB_EVENT_JSON environment variable.",
-    };
-  }
-  return {};
-}
-
 function actorErrors(value: TriggerFormValue): TriggerFieldErrors {
   if (isManualNoCallers(value)) return {};
   const named = commaSeparated(value.allowedUsers);
-  if (value.action === "script") {
+  if (hasScriptStep(value)) {
     return named.length === 0 || named.includes("*")
       ? { allowedUsers: "Name the people allowed to start a script. It cannot run for everyone." }
       : {};
@@ -827,7 +587,7 @@ function actorErrors(value: TriggerFormValue): TriggerFieldErrors {
 
 /** A notification has no actor, so a script on it must narrow by repository or reason. */
 function scriptEventErrors(value: TriggerFormValue): TriggerFieldErrors {
-  if (value.action !== "script") return {};
+  if (!hasScriptStep(value)) return {};
   if (value.event !== "github.notification") return {};
   const errors: TriggerFieldErrors = {};
   const repo = value.qualifiers.repo?.trim() ?? "";
@@ -846,52 +606,9 @@ function scriptEventErrors(value: TriggerFormValue): TriggerFieldErrors {
   return errors;
 }
 
-/** The message a parse refused with, or `undefined` when it accepted the value. */
-function refused(parse: () => unknown): string | undefined {
-  try {
-    parse();
-    return undefined;
-  } catch (cause) {
-    return incompleteReason(cause);
-  }
-}
-
 function validateFormValue(value: TriggerFormValue): void {
   const [message] = Object.values(triggerFormErrors(value));
   if (message !== undefined) throw new Error(message);
-}
-
-export function parseProviderOptions(value: string): Record<string, unknown> | undefined {
-  if (value.trim().length === 0) return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new Error("Provider options must be valid JSON.");
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("Provider options must be a JSON object.");
-  }
-  return ProviderOptionsSchema.parse(parsed);
-}
-
-export function joinAgentId(provider: string, model: string | undefined): string {
-  return model === undefined ? provider : `${provider}/${model}`;
-}
-
-export function splitAgentId(value: string): { provider: string; model?: string } {
-  const normalized = value.trim();
-  const separator = normalized.indexOf("/");
-  if (separator < 0) {
-    if (normalized.length === 0) throw new Error("Agent is required.");
-    return { provider: normalized };
-  }
-  const provider = normalized.slice(0, separator).trim();
-  const model = normalized.slice(separator + 1).trim();
-  if (provider.length === 0 || model.length === 0) {
-    throw new Error("Agent must look like provider/model.");
-  }
-  return { provider, model };
 }
 
 const EditorEventFiltersSchema = z.looseObject({
@@ -953,151 +670,8 @@ function projectUnknownFilters(raw: unknown, document: Document): ParsedEditorDo
     : undefined;
 }
 
-function assertDocument(document: Document): void {
-  const [error] = document.errors;
-  if (error !== undefined) throw new Error(error.message);
-}
-
-function updateSequence(document: Document, sequence: YAMLSeq, values: readonly unknown[]): void {
-  const oldItems = new Map<unknown, unknown[]>();
-  for (const item of sequence.items) {
-    const value: unknown = isNode(item) ? item.toJS(document) : item;
-    const matches = oldItems.get(value) ?? [];
-    matches.push(item);
-    oldItems.set(value, matches);
-  }
-  const aliases = yamlAliases(document);
-  sequence.items = values.map(
-    (value) => oldItems.get(value)?.shift() ?? document.createNode(value),
-  );
-  restoreSequenceAliases(document, aliases);
-}
-
-function yamlAliases(document: Document): Map<Alias, Node> {
-  const aliases = new Map<Alias, Node>();
-  visit(document, {
-    Alias(_key, alias) {
-      const target = alias.resolve(document);
-      if (target !== undefined) aliases.set(alias, target);
-    },
-  });
-  return aliases;
-}
-
-function sharedYamlPath(
-  document: Document,
-  path: readonly string[],
-  aliases: Map<Alias, Node>,
-  includeDescendants = true,
-): boolean {
-  if (aliases.size === 0) return false;
-  let node: unknown = document.contents;
-  for (const key of path) {
-    if (isAlias(node)) return true;
-    if (!isMap(node)) return false;
-    if (hasExternalReference(node, aliases, false)) return true;
-    node = node.get(key, true);
-  }
-  return (
-    isNode(node) &&
-    ((isAlias(node) && !includeDescendants) ||
-      hasExternalReference(node, aliases, includeDescendants))
-  );
-}
-
-function hasExternalReference(
-  node: Node,
-  aliases: Map<Alias, Node>,
-  includeDescendants: boolean,
-): boolean {
-  for (const [alias, target] of aliases) {
-    if (
-      (target === node || (includeDescendants && yamlContains(node, target))) &&
-      !yamlContains(node, alias)
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function yamlContains(parent: Node, child: Node): boolean {
-  if (parent === child) return true;
-  return (
-    parent.range != null &&
-    child.range != null &&
-    parent.range[0] <= child.range[0] &&
-    child.range[2] <= parent.range[2]
-  );
-}
-
-function requireWritableYaml(document: Document, path: readonly string[]): void {
-  if (sharedYamlPath(document, path, yamlAliases(document))) throw new Error(SHARED_YAML_FIELD);
-}
-
-function restoreSequenceAliases(document: Document, aliases: Map<Alias, Node>): void {
-  // Promote the first surviving alias if a list edit removed its anchor.
-  visit(document, {
-    Alias(_key, alias) {
-      return alias.resolve(document) === undefined ? aliases.get(alias) : undefined;
-    },
-  });
-}
-
-function setIfChanged(document: Document, path: readonly string[], value: unknown): void {
-  const node = document.getIn(path, true);
-  const current: unknown = isNode(node) ? node.toJS(document) : node;
-  if (sameValue(current, value)) return;
-  requireWritableYaml(document, path);
-  if (isSeq(node) && Array.isArray(value)) {
-    updateSequence(document, node, value);
-    return;
-  }
-  const replacement =
-    isAlias(node) || isCollection(node) ? replacementNode(document, node, value) : value;
-  document.setIn(path, replacement);
-}
-
-function replacementNode(document: Document, node: Alias | YAMLMap | YAMLSeq, value: unknown) {
-  // Write at the alias site so a field edit cannot change the value at its anchor.
-  const replacement = document.createNode(value);
-  if (node.comment !== undefined) replacement.comment = node.comment;
-  if (node.commentBefore !== undefined) replacement.commentBefore = node.commentBefore;
-  if (node.spaceBefore !== undefined) replacement.spaceBefore = node.spaceBefore;
-  if (isCollection(node) && isCollection(replacement) && node.flow !== undefined)
-    replacement.flow = node.flow;
-  return replacement;
-}
-
-function setOptional(document: Document, path: readonly string[], value: unknown): void {
-  if (value === undefined) deleteIfPresent(document, path);
-  else setIfChanged(document, path, value);
-}
-
-function deleteIfPresent(document: Document, path: readonly string[]): void {
-  if (!document.hasIn(path)) return;
-  requireWritableYaml(document, path);
-  document.deleteIn(path);
-}
-
 function sameFormValue(left: TriggerFormValue, right: TriggerFormValue): boolean {
   return sameValue(left, right);
-}
-
-function sameValue(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function commaSeparated(value: string): string[] {
-  return value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
-
-function blankToUndefined(value: string): string | undefined {
-  const normalized = value.trim();
-  return normalized.length === 0 ? undefined : normalized;
 }
 
 /** Provider-bound state and qualifier compatibility belong to the form model. */
@@ -1191,35 +765,6 @@ function appendDroppedEventOptions(
   if (previous.replyMessage === true && next.replyMessage === false) dropped.push("Agent reply");
 }
 
-/**
- * Moving between a prompt and a script keeps what the two share and resets what the other
- * action's defaults would get wrong: the run limit, and an open audience a script may not have.
- */
-export function changeTriggerAction(
-  value: TriggerFormValue,
-  action: TriggerAction,
-): TriggerFormValue {
-  if (value.action === action) return value;
-  const next = { ...value, action };
-  if (action === "script") {
-    return {
-      ...next,
-      maxRuntime:
-        value.maxRuntime === DEFAULT_AGENT_MAX_RUNTIME
-          ? DEFAULT_SCRIPT_MAX_RUNTIME
-          : value.maxRuntime,
-      allowedUsers: value.allowedUsers.trim() === "*" ? "" : value.allowedUsers,
-    };
-  }
-  return {
-    ...next,
-    maxRuntime:
-      value.maxRuntime === DEFAULT_SCRIPT_MAX_RUNTIME
-        ? DEFAULT_AGENT_MAX_RUNTIME
-        : value.maxRuntime,
-  };
-}
-
 function carriedGitHubText(value: TriggerFormValue, key: string): boolean {
   const definition = eventDefinition(value.event);
   return (
@@ -1274,20 +819,6 @@ function authoredInputs(value: string) {
   } catch {
     throw new Error("Input matches must be a JSON object with string, number, or boolean values.");
   }
-}
-
-function formContinuation(value: TriggerFormValue) {
-  return ContinuationSchema.parse(
-    value.continuationMode === "key"
-      ? { mode: "key", key: value.continuationKey }
-      : { mode: value.continuationMode },
-  );
-}
-
-function continuationErrors(value: TriggerFormValue): TriggerFieldErrors {
-  return refused(() => formContinuation(value)) === undefined
-    ? {}
-    : { continuationKey: "Enter a continuation key or expression." };
 }
 
 /**
