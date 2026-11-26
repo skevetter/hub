@@ -1,6 +1,12 @@
+import { once } from "node:events";
 import { describe, expect, it } from "vitest";
-import { type ScriptRunInput, type ScriptStepRunner } from "../daemons/terminals/script.js";
+import {
+  ScriptRunAborted,
+  type ScriptRunInput,
+  type ScriptStepRunner,
+} from "../daemons/terminals/script.js";
 import { createMemoryDatabase } from "../db/memory.js";
+import { scriptTerminalName } from "./script-output.js";
 import {
   MAX_EVENT_JSON_BYTES,
   SCRIPT_RUNNER_UNAVAILABLE_REASON,
@@ -154,4 +160,50 @@ describe("script step runtime characterization", () => {
       "script timed out after 2s, when the trigger's deadline came first (the step allows 3s)",
     );
   });
+
+  it.each(["pending cleanup", "terminal handle"] as const)(
+    "persists the %s when a running step is canceled",
+    async (outputKind) => {
+      const { launch, options } = await fixture();
+      const { database } = options;
+      const ready = Promise.withResolvers<void>();
+      options.runner = runner(async (_daemonId, input) => {
+        if (input.signal === undefined) throw new Error("missing abort signal");
+        await input.onTerminal?.({ id: "terminal", workspaceId: "workspace" });
+        const aborted = once(input.signal, "abort");
+        ready.resolve();
+        await aborted;
+        const cleanup = {
+          cwd: "/repo",
+          name: input.name,
+          terminalId: "terminal",
+          workspaceId: "workspace",
+        };
+        throw new ScriptRunAborted(outputKind === "pending cleanup" ? cleanup : undefined);
+      });
+      const runtime = new ScriptStepRuntime(options);
+      await runtime.start(launch, wakeup);
+      await ready.promise;
+      await database.cancelTriggerRun(launch.run.organizationId, launch.run.id);
+      await runtime.stop();
+      const step = await database.findWorkflowStepRunById(launch.stepRun.id);
+      const handle = {
+        daemon_id: "daemon",
+        cwd: "/repo",
+        terminal_id: "terminal",
+        workspace_id: "workspace",
+      };
+      expect(step?.status).toBe("canceled");
+      expect(step?.output).toEqual(
+        outputKind === "pending cleanup"
+          ? {
+              exit_code: null,
+              output_tail: "",
+              truncated: false,
+              cleanup: { ...handle, name: scriptTerminalName(launch.stepRun.id) },
+            }
+          : handle,
+      );
+    },
+  );
 });

@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { createMemoryDatabase } from "../db/memory.js";
 import type { Database } from "../db/types.js";
+import { enrollTestDaemon, TEST_DAEMON_SLUG } from "../test-utils/project-configuration.js";
 import {
   synchronizeGitHubDefaultBranch,
   synchronizeGitHubProjectConfiguration,
   type GitHubConfigurationProvider,
 } from "./github-sync.js";
+import { ProjectConfigurationStore } from "./store.js";
 
 const hub = ".paseo/hub.yml";
 const workflow = ".paseo/workflows/a.yml";
@@ -13,6 +15,7 @@ const workflow = ".paseo/workflows/a.yml";
 function provider(
   entries: Awaited<ReturnType<GitHubConfigurationProvider["listFilesAtCommit"]>>,
   calls: unknown[],
+  files: Readonly<Record<string, string>> = { [hub]: "" },
 ): GitHubConfigurationProvider {
   return {
     listInstallationRepositories: async () => [],
@@ -23,8 +26,23 @@ function provider(
     },
     readFileAtCommit: async (input) => {
       calls.push(input.path);
-      return input.path === hub ? { kind: "file", content: "" } : undefined;
+      const content = files[input.path];
+      return content === undefined ? undefined : { kind: "file", content };
     },
+  };
+}
+
+function configurationTarget(projectId: string, organizationId = "org") {
+  return {
+    id: "target",
+    organizationId,
+    projectId,
+    connectionId: "connection",
+    installationId: 3,
+    repositoryId: 5,
+    fullName: "owner/repo",
+    defaultBranch: "main",
+    automaticDeploymentEnabled: true,
   };
 }
 
@@ -32,17 +50,7 @@ function databaseFixture() {
   const attempts: unknown[] = [];
   const revisions: unknown[] = [];
   const database = Object.assign(createMemoryDatabase(), {
-    findGitHubConfigurationTarget: async () => ({
-      id: "target",
-      organizationId: "org",
-      projectId: "project",
-      connectionId: "connection",
-      installationId: 3,
-      repositoryId: 5,
-      fullName: "owner/repo",
-      defaultBranch: "main",
-      automaticDeploymentEnabled: true,
-    }),
+    findGitHubConfigurationTarget: async () => configurationTarget("project"),
     recordConfigurationSyncAttempt: async (attempt) => {
       attempts.push(attempt);
       throw new Error("attempt sentinel");
@@ -138,4 +146,73 @@ describe("GitHub configuration sync characterization", () => {
     expect(calls.filter((call) => typeof call === "string")).toEqual([hub]);
     expect(attempts).toEqual([]);
   });
+});
+
+const activationFiles = {
+  [hub]: `environments:
+  runner: { kind: daemon, daemon: ${TEST_DAEMON_SLUG}, cwd: /repo }
+`,
+  [workflow]: `name: run
+on: manual.run
+max_runtime: 1h
+steps:
+  - id: work
+    environment: runner
+    max_runtime: 10m
+    idle_timeout: 1m
+    agent: { provider: codex }
+    prompt: [{ text: Run }]
+`,
+};
+
+describe("GitHub default branch activation", () => {
+  it.each(["default store", "supplied store"] as const)(
+    "activates the exact revision using the %s",
+    async (selection) => {
+      const database = createMemoryDatabase();
+      const project = await database.createProject({
+        organizationId: "org_1",
+        name: "Test",
+        slug: "sync-test",
+        createdByUserId: "test-user",
+      });
+      await enrollTestDaemon(database);
+      database.findGitHubConfigurationTarget = async () =>
+        configurationTarget(project.id, project.organizationId);
+      const activationCalls: unknown[] = [];
+      const activate = database.activateProjectConfigurationRevision.bind(database);
+      database.activateProjectConfigurationRevision = async (...args) => {
+        activationCalls.push(args);
+        return activate(...args);
+      };
+      const factoryCalls: string[] = [];
+      const configurationForProject = (projectId: string) => {
+        factoryCalls.push(projectId);
+        return new ProjectConfigurationStore(database, projectId);
+      };
+      const entries = Object.keys(activationFiles).map((path) => ({ path, kind: "file" as const }));
+      const supplied = selection === "supplied store";
+      const result = await synchronizeGitHubDefaultBranch({
+        database,
+        client: provider(entries, [], activationFiles),
+        projectId: project.id,
+        expectedCommitSha: "actual",
+        webhookDeliveryId: "delivery",
+        ...(supplied ? { configurationForProject } : {}),
+      });
+
+      expect(factoryCalls).toEqual(supplied ? [project.id] : []);
+      expect(result?.outcome).toBe("activated");
+      if (result?.outcome !== "activated") throw new Error("expected activation");
+      expect(activationCalls).toEqual([[project.id, result.revision.id, []]]);
+      expect(result.revision.sourceEvidence).toMatchObject({
+        kind: "github",
+        commitSha: "actual",
+        webhookDeliveryId: "delivery",
+      });
+      expect((await database.findActiveProjectConfiguration(project.id))?.id).toBe(
+        result.revision.id,
+      );
+    },
+  );
 });
