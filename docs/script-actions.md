@@ -48,17 +48,20 @@ A script trigger accepts only these fields under `run`:
 
 Every other run option is refused when you save, with the reason: `agent`, `prompt`,
 `continuation`, `output`, `outputs`, `github`, `env`, `idle_timeout`, `startup_timeout`, `title`,
-`background`, `auto_archive`, and `worktree` under `target`. A trigger runs a script or an agent,
-not both.
+`background`, `auto_archive`, and `worktree` under `target`. A `run` is a script or an agent,
+not both. Use `steps` for both.
 
 The script text is literal. Hub never renders `${{ }}` into it, and a script that contains one is
 refused. Read the event from `HUB_EVENT_JSON` instead.
 
 ## A script and an agent on one event
 
-To run a script and also start an agent for the same event, write two triggers. Hub already starts
-every trigger an event matches, so both run, each on its own. There is no step chaining and no
-`if` between them.
+To run a script and an agent in order, with `if` between them, use `steps`. See
+[multi-step triggers](multi-step-triggers.md).
+
+To run them independently for the same event, write two triggers. Hub already starts every trigger
+an event matches, so both run, each on its own. Triggers do not wait for each other or share
+output.
 
 The script trigger:
 
@@ -97,7 +100,7 @@ run:
     Notification: ${{ paseo.context }}
 ```
 
-Save each as its own trigger. The two do not wait for each other and do not share output.
+Save each as its own trigger.
 
 ## Event data
 

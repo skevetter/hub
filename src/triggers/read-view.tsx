@@ -11,6 +11,7 @@ import { StickyActions } from "../components/app/sticky-actions.js";
 import { StatusLine } from "../components/app/status-line.js";
 import { SummaryPanel } from "../components/app/summary-panel.js";
 import { Button } from "../components/ui/button.js";
+import { useCrumbLabel } from "../navigation/crumb-label-context.js";
 import { useSnapshotQuery } from "../queries/index.js";
 import { describeTriggerYaml, triggerEventClause } from "./configuration/describe.js";
 import { runManualTrigger, triggerEditorSnapshot, type TriggerSnapshot } from "./functions.js";
@@ -71,6 +72,7 @@ function TriggerReadView({
   trigger: Trigger;
   canManage: boolean;
 }) {
+  useCrumbLabel(`/o/${scope.organizationSlug}/triggers/${scope.triggerId}`, trigger.name);
   const manual = canInvokeManually(trigger.yaml);
   const state = triggerState(trigger);
   const runner = useManualRun(scope);

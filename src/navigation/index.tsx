@@ -1,5 +1,8 @@
 import { useMatches } from "@tanstack/react-router";
+import { useMemo } from "react";
 
+import { applyCrumbLabels } from "./crumb-labels.js";
+import { useCrumbLabels } from "./crumb-label-context.js";
 import { deepestDestination, type NavigationDestination } from "./destination.js";
 
 declare module "@tanstack/react-router" {
@@ -18,6 +21,15 @@ export interface Crumb {
 
 /** Shared layout context comes from the routes TanStack is presenting, including pending UI. */
 export function usePageContext() {
+  const labels = useCrumbLabels();
+  const page = usePresentedPage();
+  return useMemo(
+    () => ({ ...page, breadcrumbs: applyCrumbLabels(page.breadcrumbs, labels) }),
+    [page, labels],
+  );
+}
+
+function usePresentedPage() {
   return useMatches({
     select: (matches) => ({
       breadcrumbs: matches.flatMap(({ staticData, pathname }): Crumb[] =>

@@ -138,6 +138,34 @@ export interface TriggerRunSummary {
   latest: { id: string; status: TriggerRunRecord["status"]; createdAt: Date } | null;
 }
 
+/** One UTC calendar day of the organization's trigger runs. */
+export interface RunsDay {
+  /** YYYY-MM-DD. */
+  day: string;
+  total: number;
+  /** Of those, the ones that failed, timed out or were rejected. */
+  failed: number;
+}
+
+export type TriggerMatchProvider = Extract<
+  ListProvider,
+  "github" | "slack" | "discord" | "linear" | "github_notification"
+>;
+
+export interface TriggerMatchActivity {
+  id: string;
+  name: string;
+  previousMatches: number;
+  recentMatches: number;
+  providers: { provider: TriggerMatchProvider; recentEvents: number }[];
+}
+
+export interface TriggerMatchWindow {
+  previousStart: Date;
+  recentStart: Date;
+  now: Date;
+}
+
 export type DroppedEventPresence = "some" | "none" | "unknown";
 
 export interface DroppedProviderEventCount {
@@ -1941,6 +1969,13 @@ export interface Database
   ): Promise<OrganizationRunRecord[]>;
   /** One entry per trigger of the organization, including triggers that never ran. */
   summarizeTriggerRuns(organizationId: string, since: Date): Promise<TriggerRunSummary[]>;
+  /** Runs created in `[since, until)` counted per UTC day; days without runs are absent. */
+  listRunsPerDay(organizationId: string, since: Date, until: Date): Promise<RunsDay[]>;
+  /** One entry per enabled trigger that listens to a provider, with its matched event counts. */
+  listTriggerMatchActivity(
+    organizationId: string,
+    window: TriggerMatchWindow,
+  ): Promise<TriggerMatchActivity[]>;
   listDroppedEventPage(
     organizationId: string,
     request: DroppedEventPageRequest,

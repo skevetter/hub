@@ -3,7 +3,12 @@ import { z } from "zod";
 import type { GitHubAuth } from "../auth/github.js";
 import { GITHUB_API_ORIGIN, githubProgressFetch } from "../auth/github-progress-fetch.js";
 import { GITHUB_APP_PERMISSION_VOCABULARY } from "../config/github-authority.js";
-import type { AcceptedTriggerRunRecord, Database } from "../db/types.js";
+import type {
+  AcceptedTriggerRunRecord,
+  Database,
+  GitHubConnectionRecord,
+  TriggerRunRecord,
+} from "../db/types.js";
 import { logger } from "../logger.js";
 import {
   GitHubReplyOutputContextSchema,
@@ -123,6 +128,20 @@ interface Authorization {
   actorPath: string;
 }
 
+type GitHubClient = Pick<Authorization, "request" | "secrets" | "actorPath"> & {
+  markerKey: string;
+};
+
+interface AuthorizationDetails {
+  target: Destination;
+  binding: Binding;
+  scope: RunScope;
+  client: GitHubClient;
+  metadata: { repositoryId: number };
+  request: GitHubRequest;
+  pinned: StoredRef | undefined;
+}
+
 interface GitHubProgressOptions {
   database: Pick<
     Database,
@@ -200,8 +219,8 @@ export class GitHubProgressProvider implements ProgressProvider {
     const binding = await this.readBinding(scope, target);
     signal.throwIfAborted();
     if ("status" in binding) return authorizationRefusal(binding);
-    const pinned = operation?.kind === "create" ? undefined : operation?.ref;
-    const mismatch = pinned === undefined ? undefined : pinnedBindingMismatch(binding, pinned);
+    const pinned = pinnedReference(operation);
+    const mismatch = pinnedBindingMismatch(binding, pinned);
     if (mismatch !== undefined) return authorizationRefusal(mismatch);
     const guard = (requestSignal: AbortSignal) =>
       this.guardBinding(scope, target, binding, requestSignal);
@@ -215,6 +234,19 @@ export class GitHubProgressProvider implements ProgressProvider {
     };
     const metadata = await this.checkVisibility(target, request, signal, operation?.visibility);
     if ("status" in metadata) return authorizationRefusal(metadata);
+    return this.recordAuthorization(locator, {
+      target,
+      binding,
+      scope,
+      client,
+      metadata,
+      request,
+      pinned,
+    });
+  }
+
+  private recordAuthorization(locator: CredentialLocator, details: AuthorizationDetails) {
+    const { target, binding, scope, client, metadata, request, pinned } = details;
     if (binding.kind === "installation" && binding.repositoryId !== metadata.repositoryId)
       return { refused: targetMismatch.code };
     const marker = createHmac("sha256", client.markerKey)
@@ -241,6 +273,12 @@ export class GitHubProgressProvider implements ProgressProvider {
     return "ok" as const;
   }
 
+  private targetForRun(run: TriggerRunRecord | undefined, scope: RunScope) {
+    return run?.outcome === "accepted" && run.projectId === scope.projectId
+      ? this.destination(run)
+      : undefined;
+  }
+
   private async readTarget(
     locator: CredentialLocator,
     scope: RunScope,
@@ -255,20 +293,14 @@ export class GitHubProgressProvider implements ProgressProvider {
       scope.id,
     );
     signal.throwIfAborted();
-    const target =
-      run?.outcome === "accepted" && run.projectId === scope.projectId
-        ? this.destination(run)
-        : undefined;
+    const target = this.targetForRun(run, scope);
     if (
       run?.outcome !== "accepted" ||
       target === undefined ||
       !sameCredential(locator, target.credential)
     )
       return targetMismatch;
-    if (operation !== undefined && !matchesTarget(target, operation.ref)) return targetMismatch;
-    if (operation?.kind === "edit" && !githubId.safeParse(operation.ref["commentId"]).success)
-      return invalidReference;
-    return { target };
+    return operationRefusal(target, operation) ?? { target };
   }
 
   async secrets(locator: CredentialLocator, signal: AbortSignal): Promise<readonly string[]> {
@@ -335,26 +367,7 @@ export class GitHubProgressProvider implements ProgressProvider {
       "GET",
       `${issueCommentsPath(owner, repo, target.issueNumber)}?${query}`,
     );
-    if (!jsonSuccess(response)) return undefined;
-    const comments = commentList.safeParse(response.data);
-    if (
-      !comments.success ||
-      comments.data.length > 100 ||
-      comments.data.some(
-        (comment) =>
-          !matchingStatus(comment.status, response.status) || !matchesIssue(comment, target),
-      )
-    )
-      return undefined;
-    const matches = comments.data.filter(
-      ({ body, user }) => user?.id === actor.data.id && body?.endsWith(`\n\n${auth.marker}`),
-    );
-    if (matches.length !== 1) return undefined;
-    const ref = storedReference(auth, matches[0]!.id);
-    const serialized = JSON.stringify(ref);
-    return auth.secrets.some((secret) => secret !== "" && serialized.includes(secret))
-      ? undefined
-      : ref;
+    return adoptableReference(response, auth, actor.data.id);
   }
 
   private async guardBinding(
@@ -382,11 +395,7 @@ export class GitHubProgressProvider implements ProgressProvider {
     if (locator.kind === "progress-token") {
       if (settings.githubToken === undefined) return noCredential;
       const slug = await database.findOrganizationSlugById(run.organizationId);
-      if (slug === undefined || !Object.hasOwn(settings.githubOrgs, slug))
-        return { status: "refused", code: "org_not_mapped" };
-      return allowsGitHubRepository(settings.githubOrgs[slug]!, target.repository)
-        ? { kind: "progress-token", slug }
-        : { status: "refused", code: "repo_not_allowed" };
+      return progressTokenBinding(settings, slug, target.repository);
     }
     if (app === undefined) return noCredential;
     const [connection, repository] = await Promise.all([
@@ -394,11 +403,7 @@ export class GitHubProgressProvider implements ProgressProvider {
       database.findGitHubRepositoryForOrganization(run.organizationId, target.repository),
     ]);
     if (
-      connection === undefined ||
-      connection.status !== "active" ||
-      connection.organizationId !== run.organizationId ||
-      connection.installationId !== locator.installationId ||
-      connection.providerApplicationId !== app.id ||
+      !ownsInstallation(connection, run, locator, app) ||
       repository === undefined ||
       repository.connectionId !== connection.id ||
       repository.organizationId !== run.organizationId ||
@@ -418,22 +423,14 @@ export class GitHubProgressProvider implements ProgressProvider {
     locator: GitHubLocator,
     signal: AbortSignal,
     guard: (signal: AbortSignal) => Promise<void>,
-  ): Promise<
-    | {
-        request: GitHubRequest;
-        secrets: readonly string[];
-        markerKey: string;
-        actorPath: string;
-      }
-    | Refusal
-  > {
+  ): Promise<GitHubClient | Refusal> {
     signal.throwIfAborted();
     if (locator.kind === "progress-token") {
       const token = this.options.settings.githubToken;
       if (token === undefined) return noCredential;
       return {
         request: (requestSignal, method, path, body) =>
-          this.tokenRequest(token, requestSignal, method, path, body),
+          this.tokenRequest(token, requestSignal, { method, path, body }),
         secrets: [token],
         markerKey: token,
         actorPath: "/user",
@@ -462,17 +459,7 @@ export class GitHubProgressProvider implements ProgressProvider {
     const token = z.object({ token: z.string().min(1) }).safeParse(auth);
     if (!token.success) return noCredential;
     return {
-      request: async (requestSignal, method, path, body) => {
-        requestSignal.throwIfAborted();
-        const result = await octokit
-          .request(`${method} ${path}`, {
-            headers: { "x-github-api-version": GITHUB_APP_PERMISSION_VOCABULARY.apiVersion },
-            ...(body === undefined ? {} : { body }),
-            request: { signal: requestSignal, redirect: "manual" },
-          })
-          .then(octokitResponse, (error: unknown) => octokitError(error));
-        return result ?? { status: 0, data: undefined, headers: new Headers() };
-      },
+      request: installationRequest(octokit),
       secrets: [token.data.token, app.privateKey],
       markerKey: app.privateKey,
       actorPath: `/users/${encodeURIComponent(`${app.slug}[bot]`)}`,
@@ -482,9 +469,11 @@ export class GitHubProgressProvider implements ProgressProvider {
   private async tokenRequest(
     token: string,
     signal: AbortSignal,
-    method: "GET" | "POST" | "PATCH",
-    path: string,
-    body?: string,
+    {
+      method,
+      path,
+      body,
+    }: { method: "GET" | "POST" | "PATCH"; path: string; body: string | undefined },
   ): Promise<GitHubResponse> {
     signal.throwIfAborted();
     const response = await this.fetch(`${GITHUB_API_ORIGIN}${path}`, {
@@ -513,20 +502,13 @@ export class GitHubProgressProvider implements ProgressProvider {
     signal: AbortSignal,
     check: VisibilityCheck | undefined,
   ): Promise<{ repositoryId: number } | Refusal> {
-    const cached = cachedVisibility(check);
-    let metadata = cached;
+    let metadata = cachedVisibility(check);
     if (metadata === undefined) {
       const [owner, repo] = splitRepository(target);
       const fresh = await readRepository(request, repositoryPath(owner, repo), signal);
-      if ("status" in fresh) {
-        if (fresh === visibilityUnknown)
-          check?.record({ visibility: "unknown", visibilityCheckedAt: new Date(check.now) });
-        return fresh;
-      }
-      if (check?.expectedRepositoryId !== undefined && check.expectedRepositoryId !== fresh.id)
-        return targetMismatch;
-      metadata = { repositoryId: fresh.id, visibility: fresh.private ? "private" : "public" };
-      check?.record({ visibility: metadata.visibility, visibilityCheckedAt: new Date(check.now) });
+      const checked = recordFreshVisibility(fresh, check);
+      if ("status" in checked) return checked;
+      metadata = checked;
     }
     if (metadata.visibility === "public" && this.options.settings.publicRepos === "refuse")
       return {
@@ -552,16 +534,9 @@ export class GitHubProgressProvider implements ProgressProvider {
       signal.throwIfAborted();
       const auth = this.takeAuthorization(ref.credential);
       if (auth === undefined) return invalidCredential;
-      const comment = commentId.safeParse({ id: ref["commentId"] });
-      if (method === "PATCH" && !comment.success)
-        return { status: "unavailable", code: "invalid_reference" };
-      const commentNumber = method === "PATCH" ? comment.data?.id : undefined;
-      if (!matchesTarget(auth.target, ref)) return targetMismatch;
-      if (commentNumber !== undefined) {
-        const mismatch = pinnedBindingMismatch(auth.binding, ref);
-        if (mismatch !== undefined) return mismatch;
-        if (ref["repositoryId"] !== auth.repositoryId) return targetMismatch;
-      }
+      const resolved = resolveWriteTarget(auth, method, ref);
+      if ("status" in resolved) return resolved;
+      const { commentNumber } = resolved;
       if (body.includes(markerPrefix) || auth.secrets.some((secret) => body.includes(secret)))
         return { status: "refused", code: "body_contains_secret" };
       const [owner, repo] = splitRepository(auth.target);
@@ -584,6 +559,113 @@ ${auth.marker}`,
   }
 }
 
+function pinnedReference(operation: AuthorizationRequest | undefined): StoredRef | undefined {
+  return operation?.kind === "create" ? undefined : operation?.ref;
+}
+
+function operationRefusal(target: Destination, operation: AuthorizationRequest | undefined) {
+  if (operation !== undefined && !matchesTarget(target, operation.ref)) return targetMismatch;
+  if (operation?.kind === "edit" && !githubId.safeParse(operation.ref["commentId"]).success)
+    return invalidReference;
+  return undefined;
+}
+
+function progressTokenBinding(
+  settings: GitHubProgressOptions["settings"],
+  slug: string | undefined,
+  repository: string,
+): Binding | Refusal {
+  if (slug === undefined || !Object.hasOwn(settings.githubOrgs, slug))
+    return { status: "refused", code: "org_not_mapped" };
+  const patterns = settings.githubOrgs[slug];
+  if (patterns === undefined)
+    throw new TypeError("Cannot read properties of undefined (reading 'includes')");
+  return allowsGitHubRepository(patterns, repository)
+    ? { kind: "progress-token", slug }
+    : { status: "refused", code: "repo_not_allowed" };
+}
+
+function ownsInstallation(
+  connection: GitHubConnectionRecord | undefined,
+  run: RunScope,
+  locator: Extract<GitHubLocator, { kind: "installation" }>,
+  app: NonNullable<GitHubProgressOptions["app"]>,
+): connection is GitHubConnectionRecord {
+  return (
+    connection !== undefined &&
+    connection.status === "active" &&
+    connection.organizationId === run.organizationId &&
+    connection.installationId === locator.installationId &&
+    connection.providerApplicationId === app.id
+  );
+}
+
+function installationRequest(
+  octokit: Awaited<ReturnType<GitHubAuth["createInstallationOctokit"]>>,
+): GitHubRequest {
+  return async (requestSignal, method, path, body) => {
+    requestSignal.throwIfAborted();
+    const result = await octokit
+      .request(`${method} ${path}`, {
+        headers: { "x-github-api-version": GITHUB_APP_PERMISSION_VOCABULARY.apiVersion },
+        ...(body === undefined ? {} : { body }),
+        request: { signal: requestSignal, redirect: "manual" },
+      })
+      .then(octokitResponse, (error: unknown) => octokitError(error));
+    return result ?? { status: 0, data: undefined, headers: new Headers() };
+  };
+}
+
+function validComments(response: GitHubResponse, target: Destination) {
+  if (!jsonSuccess(response)) return undefined;
+  const comments = commentList.safeParse(response.data);
+  if (
+    !comments.success ||
+    comments.data.length > 100 ||
+    comments.data.some(
+      (comment) =>
+        !matchingStatus(comment.status, response.status) || !matchesIssue(comment, target),
+    )
+  )
+    return undefined;
+  return comments.data;
+}
+
+function adoptableReference(response: GitHubResponse, auth: Authorization, actorId: number) {
+  const matches = validComments(response, auth.target)?.filter(
+    ({ body, user }) => user?.id === actorId && body?.endsWith(`\n\n${auth.marker}`),
+  );
+  if (matches?.length !== 1) return undefined;
+  const [match] = matches;
+  if (match === undefined)
+    throw new TypeError("Cannot read properties of undefined (reading 'id')");
+  const ref = storedReference(auth, match.id);
+  const serialized = JSON.stringify(ref);
+  return auth.secrets.some((secret) => secret !== "" && serialized.includes(secret))
+    ? undefined
+    : ref;
+}
+
+function resolveWriteTarget(
+  auth: Authorization,
+  method: "POST" | "PATCH",
+  ref: StoredRef,
+): { commentNumber: number | undefined } | Refusal {
+  const comment = commentId.safeParse({ id: ref["commentId"] });
+  if (method === "PATCH" && !comment.success)
+    return { status: "unavailable", code: "invalid_reference" };
+  const commentNumber = method === "PATCH" ? comment.data?.id : undefined;
+  if (!matchesTarget(auth.target, ref)) return targetMismatch;
+  const mismatch = commentNumber === undefined ? undefined : editBindingMismatch(auth, ref);
+  return mismatch ?? { commentNumber };
+}
+
+function editBindingMismatch(auth: Authorization, ref: StoredRef): Refusal | undefined {
+  const mismatch = pinnedBindingMismatch(auth.binding, ref);
+  if (mismatch !== undefined) return mismatch;
+  return ref["repositoryId"] === auth.repositoryId ? undefined : targetMismatch;
+}
+
 function cachedVisibility(check: VisibilityCheck | undefined) {
   if (check === undefined || check.force || check.expectedRepositoryId === undefined)
     return undefined;
@@ -593,6 +675,25 @@ function cachedVisibility(check: VisibilityCheck | undefined) {
   if (visibility === "private" || visibility === "public")
     return { repositoryId: check.expectedRepositoryId, visibility };
   return undefined;
+}
+
+function recordFreshVisibility(
+  fresh: Awaited<ReturnType<typeof readRepository>>,
+  check: VisibilityCheck | undefined,
+) {
+  if ("status" in fresh) {
+    if (fresh === visibilityUnknown)
+      check?.record({ visibility: "unknown", visibilityCheckedAt: new Date(check.now) });
+    return fresh;
+  }
+  if (check?.expectedRepositoryId !== undefined && check.expectedRepositoryId !== fresh.id)
+    return targetMismatch;
+  const metadata = {
+    repositoryId: fresh.id,
+    visibility: fresh.private ? "private" : "public",
+  } as const;
+  check?.record({ visibility: metadata.visibility, visibilityCheckedAt: new Date(check.now) });
+  return metadata;
 }
 
 async function readRepository(request: GitHubRequest, path: string, signal: AbortSignal) {
@@ -623,7 +724,8 @@ function matchesTarget(target: Destination, ref: StoredRef): boolean {
   );
 }
 
-function pinnedBindingMismatch(binding: Binding, ref: StoredRef): Refusal | undefined {
+function pinnedBindingMismatch(binding: Binding, ref: StoredRef | undefined): Refusal | undefined {
+  if (ref === undefined) return undefined;
   if (!githubId.safeParse(ref["repositoryId"]).success) return invalidReference;
   if (binding.kind !== "installation") return undefined;
   if (ref["connectionId"] !== binding.connectionId) return connectionReplaced;
@@ -637,21 +739,8 @@ async function mutationResult(
   signal: AbortSignal,
 ): Promise<ProgressCall> {
   const create = commentNumber === undefined;
-  if (response.status >= 200 && response.status < 300) {
-    const comment = commentIdentity.safeParse(response.data);
-    if (
-      !jsonSuccess(response) ||
-      !comment.success ||
-      !matchingStatus(comment.data.status, response.status)
-    )
-      return unknownWrite;
-    if (create) {
-      return response.status === 201 && matchesIssue(comment.data, auth.target)
-        ? { status: "ok", ref: storedReference(auth, comment.data.id) }
-        : unknownWrite;
-    }
-    return comment.data.id === commentNumber ? { status: "ok" } : unknownWrite;
-  }
+  if (response.status >= 200 && response.status < 300)
+    return successfulMutation(auth, commentNumber, response);
   const failure = writeFailure(response, create);
   if (failure.status !== "unavailable" || failure.code !== "scope_missing") return failure;
   const [owner, repo] = splitRepository(auth.target);
@@ -661,6 +750,26 @@ async function mutationResult(
   return issue?.status === 200 && lockedIssue.safeParse(issue.data).success
     ? { status: "unavailable", code: "locked" }
     : failure;
+}
+
+function successfulMutation(
+  auth: Authorization,
+  commentNumber: number | undefined,
+  response: GitHubResponse,
+): ProgressCall {
+  const comment = commentIdentity.safeParse(response.data);
+  if (
+    !jsonSuccess(response) ||
+    !comment.success ||
+    !matchingStatus(comment.data.status, response.status)
+  )
+    return unknownWrite;
+  if (commentNumber === undefined) {
+    return response.status === 201 && matchesIssue(comment.data, auth.target)
+      ? { status: "ok", ref: storedReference(auth, comment.data.id) }
+      : unknownWrite;
+  }
+  return comment.data.id === commentNumber ? { status: "ok" } : unknownWrite;
 }
 
 function jsonSuccess(response: GitHubResponse): boolean {
@@ -739,7 +848,7 @@ function bindingChanged(locator: GitHubLocator): Refusal {
 
 function splitRepository(target: Destination): [string, string] {
   const [owner, repo] = target.repository.split("/");
-  return [owner!, repo!];
+  return [String(owner), String(repo)];
 }
 
 function boundReference({ target, binding, repositoryId }: Authorization): StoredRef {
@@ -782,22 +891,38 @@ function octokitResponse(response: {
 function writeFailure({ status, headers, data }: GitHubResponse, create: boolean): ProgressCall {
   const evidence = rejection.safeParse(data);
   if (create && evidence.data?.partial === true) return unknownWrite;
+  const failure = definiteWriteFailure(status, headers, create);
+  if (failure !== undefined) return failure;
+  const retryAfter = headers.get("retry-after");
+  const exhausted = headers.get("x-ratelimit-remaining") === "0";
+  if (status === 429 || (status === 403 && (retryAfter !== null || exhausted)))
+    return rateLimitedWrite(headers, create, evidence.data);
+  return status === 403 ? { status: "unavailable", code: "scope_missing" } : unknownWrite;
+}
+
+function definiteWriteFailure(
+  status: number,
+  headers: Headers,
+  create: boolean,
+): ProgressCall | undefined {
   if (status === 401) return credentialRejected;
   if (status === 404 || status === 410)
     return create ? { status: "unavailable", code: "target_not_found" } : { status: "gone" };
   if (status === 422) return { status: "unavailable", code: "rejected" };
   if (status === 403 && headers.has("x-github-sso"))
     return { status: "unavailable", code: "sso_required" };
-  const retryAfter = headers.get("retry-after");
-  const exhausted = headers.get("x-ratelimit-remaining") === "0";
-  if (status === 429 || (status === 403 && (retryAfter !== null || exhausted))) {
-    if (create && evidence.data?.rejected !== true) return unknownWrite;
-    return {
-      status: "retry",
-      afterMs: retryAfterMs(headers, Date.now()) ?? 60_000,
-      notCreated: create,
-    };
-  }
-  if (status === 403) return { status: "unavailable", code: "scope_missing" };
-  return unknownWrite;
+  return undefined;
+}
+
+function rateLimitedWrite(
+  headers: Headers,
+  create: boolean,
+  evidence: z.infer<typeof rejection> | undefined,
+): ProgressCall {
+  if (create && evidence?.rejected !== true) return unknownWrite;
+  return {
+    status: "retry",
+    afterMs: retryAfterMs(headers, Date.now()) ?? 60_000,
+    notCreated: create,
+  };
 }
