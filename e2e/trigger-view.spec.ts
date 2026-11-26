@@ -42,7 +42,7 @@ test("reads, edits, and starts a trigger as a verified user", async ({ hub, page
     href ?? "",
   );
   await expect(
-    page.getByText("Last 24 hours: 1 total, 0 succeeded, 0 failed or timed out."),
+    page.getByText("Last 24 hours: 1 total, 0 succeeded, 0 did not finish."),
   ).toBeVisible();
   await expectPhoneLayout(page);
   await captureThemes(page, { width: 390, height: 844 }, "with-run");

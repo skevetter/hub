@@ -1,7 +1,7 @@
 import { DataCell, DataRow, DataTable } from "../components/app/data-table.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { StateBlock } from "../components/app/state-block.js";
-import { runState } from "../components/app/state-label.js";
+import { runListState } from "../components/app/state-label.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import type { TriggerActivityPage } from "./functions.js";
@@ -35,7 +35,7 @@ export function TriggerActivityTable({
       {activity.map((run) => (
         <DataRow key={run.id}>
           <DataCell>
-            <StateBlock state={runState(run.status)} />
+            <StateBlock state={runListState(run.status)} />
           </DataCell>
           <DataCell>
             <a

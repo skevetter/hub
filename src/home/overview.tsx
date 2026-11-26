@@ -11,7 +11,7 @@ import { StateBlock } from "../components/app/state-block.js";
 import {
   connectionState,
   daemonState,
-  runState,
+  runListState,
   type StateView,
 } from "../components/app/state-label.js";
 import { TwoLine } from "../components/app/two-line.js";
@@ -97,7 +97,7 @@ function FailingCaption({
         {latestFailure.triggerName}
       </Link>
       {", "}
-      {runState(latestFailure.status).label.toLowerCase()}{" "}
+      {runListState(latestFailure.status).label.toLowerCase()}{" "}
       <RelativeTime value={latestFailure.startedAt} />
     </>
   );

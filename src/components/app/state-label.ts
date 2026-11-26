@@ -82,6 +82,13 @@ export function runState(status: string): StateView {
   return RUN.get(status) ?? { label: statusLabel(status), tone: "off" };
 }
 
+const DID_NOT_FINISH: StateView = { label: "Did not finish", tone: "attention" };
+
+/** A run in a list: failed and timed out read as one outcome. The run page uses runState. */
+export function runListState(status: string): StateView {
+  return status === "failed" || status === "timed_out" ? DID_NOT_FINISH : runState(status);
+}
+
 export function connectionState(status: ConnectionState): StateView {
   return CONNECTION[status];
 }

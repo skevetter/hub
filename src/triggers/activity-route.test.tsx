@@ -177,14 +177,14 @@ describe("organization activity routes", () => {
 
       state.snapshot = { activity: [], nextCursor: null, previousCursor: null };
       assert.match(await renderRoute("/o/acme%20team/activity"), /No activity/u);
-      const filtered = await renderRoute("/o/acme%20team/activity?status=failed&size=25");
+      const filtered = await renderRoute("/o/acme%20team/activity?status=did_not_finish&size=25");
       assert.match(filtered, /No runs match these filters/u);
       assert.match(filtered, /Clear filters/u);
       assert.match(filtered, /Rows per page/u);
 
       state.failed = true;
       assert.match(
-        await renderRoute("/o/acme%20team/activity?status=failed"),
+        await renderRoute("/o/acme%20team/activity?status=did_not_finish"),
         /Activity unavailable/u,
       );
       state.failed = false;

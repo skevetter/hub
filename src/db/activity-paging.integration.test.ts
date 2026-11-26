@@ -6,6 +6,7 @@ import { PostgreSqlContainer } from "@testcontainers/postgresql";
 import { afterAll, beforeAll, describe, it, vi } from "vitest";
 import { PAGE_SIZES } from "../components/app/page-size.js";
 import { ACTIVITY_STATUSES } from "../triggers/activity-query.js";
+import { runStatusesFor } from "../triggers/run-status.js";
 import { createDatabase } from "./pg.js";
 import { embeddedDatabaseRuntime, type DatabaseRuntime } from "./runtime/index.js";
 import { createPostgresTestRuntime } from "./test-utils/runtime.js";
@@ -51,10 +52,9 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
     const read = (request: Partial<ActivityRunPageRequest>, inScopes = scopes) =>
       database.listOrganizationActivityPage(ORGANIZATION, inScopes, { limit: 15, ...request });
     for (const status of ACTIVITY_STATUSES) {
-      if (status === "unsuccessful") continue;
       const { records } = await read({ status });
       assert.equal(records.length, 15);
-      assert.ok(records.every(({ run }) => run.status === status));
+      assert.ok(records.every(({ run }) => runStatusesFor(status).has(run.status)));
     }
     for (const provider of ["webhook", "manual", "github"] as const) {
       const { records } = await read({ provider });
@@ -94,6 +94,18 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
       limit: 15,
     });
     assert.deepEqual(foreign.records, []);
+  });
+
+  it("groups failed and timed out runs as did not finish before limiting the page", async () => {
+    const { records } = await database.listOrganizationActivityPage(ORGANIZATION, scopes, {
+      status: "did_not_finish",
+      limit: 15,
+    });
+    assert.equal(records.length, 15);
+    assert.deepEqual(
+      new Set(records.map(({ run }) => run.status)),
+      new Set(["failed", "timed_out"]),
+    );
   });
 
   it("includes only unsuccessful runs before limiting the page", async () => {
@@ -182,7 +194,7 @@ describe.each(["postgres", "pglite"] as const)("activity page SQL on %s", (engin
       try {
         const samples = [
           { label: "default", request: {}, scopes },
-          { label: "status", request: { status: "failed" }, scopes },
+          { label: "status", request: { status: "did_not_finish" }, scopes },
           { label: "trigger", request: {}, scopes: [scopes.at(-1)!] },
           { label: "provider", request: { provider: "github" }, scopes },
           { label: "time", request: { createdSince: NEWEST }, scopes },

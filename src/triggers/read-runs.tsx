@@ -7,7 +7,7 @@ import { RecordList, RecordRow } from "../components/app/record-list.js";
 import { RelativeTime } from "../components/app/relative-time.js";
 import { Section } from "../components/app/section.js";
 import { StateBlock } from "../components/app/state-block.js";
-import { runState } from "../components/app/state-label.js";
+import { runListState } from "../components/app/state-label.js";
 import { TwoLine } from "../components/app/two-line.js";
 import { respondOk, type Result } from "../contract/respond.js";
 import { useSnapshotQuery } from "../queries/index.js";
@@ -85,7 +85,7 @@ function TriggerRun({ run, organizationSlug }: { run: RunRow; organizationSlug: 
 }
 
 function runBlock(run: RunRow) {
-  return <StateBlock state={runState(run.status)} />;
+  return <StateBlock state={runListState(run.status)} />;
 }
 
 function receivedTime(value: string) {
@@ -126,7 +126,7 @@ function runLinkParams(organizationSlug: string, runId: string) {
 }
 
 function formatRunCounts({ total, succeeded, failed }: RecentRuns): string {
-  return `Last 24 hours: ${total} total, ${succeeded} succeeded, ${failed} failed or timed out.`;
+  return `Last 24 hours: ${total} total, ${succeeded} succeeded, ${failed} did not finish.`;
 }
 
 async function readTriggerRuns(
