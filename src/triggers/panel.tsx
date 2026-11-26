@@ -132,8 +132,6 @@ const EVENT_OPTIONS: readonly ComboboxOption[] = EDITOR_EVENTS.map((value) => {
   };
 });
 
-const TRIGGERS_DESCRIPTION = "Launch agents on your compute when organization events arrive.";
-const TRIGGER_EDITOR_DESCRIPTION = "One event launches one agent on your compute.";
 const LIST_HEADING_ID = "triggers-title";
 const LIST_FILTERS_ID = "triggers-filters";
 const NO_FILTERED_TRIGGERS = "No triggers match these filters";
@@ -172,7 +170,7 @@ export function TriggersPanel() {
   if (snapshot.status === "pending") {
     return (
       <>
-        <PageHeader title="Triggers" description={TRIGGERS_DESCRIPTION} />
+        <PageHeader title="Triggers" />
         <DataTableSkeleton label="Triggers" columns={TRIGGER_COLUMNS} />
       </>
     );
@@ -220,7 +218,7 @@ function TriggerList({
   });
   return (
     <>
-      <PageHeader id={LIST_HEADING_ID} title="Triggers" description={TRIGGERS_DESCRIPTION}>
+      <PageHeader id={LIST_HEADING_ID} title="Triggers">
         {data.canManage ? (
           <Button asChild>
             <Link {...editor("new")}>
@@ -698,7 +696,7 @@ function TriggerEditorHeading({
           label: editor.form.enabled ? "Enabled" : "Disabled",
           tone: editor.form.enabled ? "success" : "neutral",
         }}
-        description={editor.description}
+        {...descriptionProp(editor.description)}
       />
     </>
   );
@@ -997,8 +995,8 @@ function describeEditor({
   other: EditorProjection;
   yaml: string;
 }) {
-  if (legacy) return TRIGGER_EDITOR_DESCRIPTION;
-  if (mode === "yaml") return describeTriggerYaml(yaml) ?? TRIGGER_EDITOR_DESCRIPTION;
+  if (legacy) return undefined;
+  if (mode === "yaml") return describeTriggerYaml(yaml);
   if (other.status === "ok" || other.status === "invalid_document") {
     const summary = describeTriggerYaml(other.yaml);
     if (summary !== undefined) return summary;
@@ -1206,7 +1204,7 @@ function TriggerEventCard({
     document.getElementById("trigger-event")?.focus();
   };
   return (
-    <Card title={EDITOR_STEPS.event.title} description={EDITOR_STEPS.event.description}>
+    <Card title={EDITOR_STEPS.event.title}>
       <TriggerEventSelector
         form={form}
         errors={errors}
@@ -1407,7 +1405,7 @@ function TriggerForm({ form, errors, triggerId, snapshot, onChange }: TriggerFor
         />
         <Card
           title={EDITOR_STEPS.agent.title}
-          description={agentStepDescription(script, selectedDaemon !== undefined)}
+          {...descriptionProp(agentStepDescription(script, selectedDaemon !== undefined))}
         >
           <ActionField value={form} onChange={onChange} />
           {script ? <ScriptFields value={form} errors={errors} onChange={onChange} /> : null}
@@ -1520,9 +1518,9 @@ function TriggerTargetCard({
   return (
     <Card
       title={EDITOR_STEPS.target.title}
-      description={noDaemons ? NO_DAEMON_DESCRIPTION : EDITOR_STEPS.target.description}
       {...(noDaemons
         ? {
+            description: NO_DAEMON_DESCRIPTION,
             action: (
               <Button asChild variant="outline" size="sm">
                 <Link to={`/o/${snapshot.organization.slug}/daemons` as never}>Go to Daemons</Link>
@@ -1863,15 +1861,13 @@ function TriggerGitHubScopeFields({ form, errors, onChange }: TriggerFieldProps)
 function AccessCard({ form, errors, onChange }: TriggerFieldProps) {
   const script = form.action === "script";
   const { audience } = eventDefinition(form.event);
-  const manual = form.event === "manual.run";
   const noCallers = isManualNoCallers(form);
-  let description: string = EDITOR_STEPS.access.description;
+  let description: string | undefined;
   if (script) description = SCRIPT_ACCESS_DESCRIPTION;
-  else if (manual) description = "Choose who can start this trigger manually or by webhook.";
   else if (audience === "optional")
     description = "Restrict which Linear users can start the run, or leave the list empty.";
   return (
-    <Card title={EDITOR_STEPS.access.title} description={description}>
+    <Card title={EDITOR_STEPS.access.title} {...descriptionProp(description)}>
       {noCallers ? (
         <WarningAlert title="Nobody can run this trigger">
           <p>The caller list is empty.</p>
@@ -1953,7 +1949,7 @@ function TriggerEditorSkeleton() {
       <Button variant="ghost" size="sm" className="mb-4 -ml-2.5" disabled>
         <ArrowLeft aria-hidden="true" /> Triggers
       </Button>
-      <PageHeaderSkeleton description={TRIGGER_EDITOR_DESCRIPTION} />
+      <PageHeaderSkeleton />
       <div className="grid gap-6">
         <Card>
           <div className="grid gap-4 sm:grid-cols-2">
@@ -1963,7 +1959,7 @@ function TriggerEditorSkeleton() {
         </Card>
         <Steps>
           {Object.values(EDITOR_STEPS).map((step) => (
-            <Card key={step.title} title={step.title} description={step.description}>
+            <Card key={step.title} title={step.title}>
               <div className="grid gap-4 sm:grid-cols-2">
                 <FieldSkeleton />
                 <FieldSkeleton />
@@ -1984,28 +1980,28 @@ function TriggerEditorSkeleton() {
 const EDITOR_STEPS = {
   event: {
     title: "The event",
-    description: "What starts the agent.",
   },
   access: {
     title: "Who can invoke it",
-    description: "Choose which senders can start the run.",
   },
   target: {
     title: "Where it runs",
-    description: "The daemon owns compute, credentials, and sandboxing.",
   },
   agent: {
     title: "What runs there",
-    description: "The agent, its model, and the instructions it is given.",
   },
 } as const;
 
 /** What the step says while the decision above it is still missing. */
 const NO_DAEMON_DESCRIPTION =
   "No daemon is connected to this organization yet, and a trigger runs on a daemon.";
-function agentStepDescription(script: boolean, hasDaemon: boolean): string {
+function agentStepDescription(script: boolean, hasDaemon: boolean): string | undefined {
   if (script) return SCRIPT_DESCRIPTION;
-  return hasDaemon ? EDITOR_STEPS.agent.description : NO_AGENT_DESCRIPTION;
+  return hasDaemon ? undefined : NO_AGENT_DESCRIPTION;
+}
+
+function descriptionProp(description: string | undefined) {
+  return description === undefined ? {} : { description };
 }
 
 const AGENT_TARGET_COPY = {

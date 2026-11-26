@@ -487,22 +487,11 @@ export class AppSetupSurface {
 
   async expectOnboarding(): Promise<void> {
     await expect(this.page.getByRole("heading", { name: "Set up your apps" })).toBeVisible();
-    await expect(
-      this.page.getByText(
-        "Paseo Hub talks to GitHub, Slack, Discord, and Linear through apps you create and own.",
-        { exact: false },
-      ),
-    ).toBeVisible();
     await this.expectCopyContract();
   }
 
   async expectManagement(): Promise<void> {
     await expect(this.page.getByRole("heading", { name: "Apps", exact: true })).toBeVisible();
-    await expect(
-      this.page.getByText(
-        "The GitHub, Slack, Discord, and Linear apps Hub uses to reach your workspaces.",
-      ),
-    ).toBeVisible();
   }
 
   /** The alert that reports a failed attempt to leave app setup, with its own retry. */

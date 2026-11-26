@@ -55,7 +55,7 @@ export function RunDetailPanel({ runId }: { runId: string }) {
   if (snapshot.status === "pending")
     return (
       <>
-        <PageHeader title="Run detail" description="Loading run..." />
+        <PageHeader title="Run detail" />
         <DataTableSkeleton label="Run timeline" columns={TIMELINE_COLUMNS} />
       </>
     );

@@ -144,11 +144,7 @@ export function Team() {
 
   return (
     <>
-      <PageHeader
-        id="team-heading"
-        title="Team"
-        description={`People with access to ${organization.name}.`}
-      >
+      <PageHeader id="team-heading" title="Team">
         {capabilities.manageMembers && (
           <LockedAction
             limit={limit}

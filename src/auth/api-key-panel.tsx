@@ -132,7 +132,7 @@ function OrganizationApiKeys({ tenant }: { tenant: RouteTenant }) {
   const { openCreate } = page.dialogs.creation;
   const reload = snapshot.refetch;
   const header = (
-    <PageHeader title="API keys" description={`Machine access for ${tenant.organization.name}.`}>
+    <PageHeader title="API keys">
       <Button asChild variant="outline">
         <a href="https://paseo.sh/docs/hub/api">API reference</a>
       </Button>

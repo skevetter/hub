@@ -34,7 +34,7 @@ export function BillingPanel({ openPlans }: { openPlans: boolean }) {
     queryFn: () => load({ data: { organizationSlug: tenant.organization.slug } }),
   });
 
-  if (query.status === "pending") return <BillingLoading name={tenant.organization.name} />;
+  if (query.status === "pending") return <BillingLoading />;
   if (query.status === "error") {
     return (
       <FailureAlert
@@ -76,10 +76,7 @@ function BillingContent({
 
   return (
     <>
-      <PageHeader
-        title="Billing"
-        description={`Plan and billing for ${overview.organization.name}.`}
-      >
+      <PageHeader title="Billing">
         <Button variant="outline" size="sm" asChild>
           <Link to={`/o/${slug}/settings/usage` as never}>View usage</Link>
         </Button>
@@ -208,10 +205,10 @@ function redirectTo(url: string): void {
   window.location.assign(url);
 }
 
-function BillingLoading({ name }: { name: string }) {
+function BillingLoading() {
   return (
     <>
-      <PageHeader title="Billing" description={`Plan and billing for ${name}.`} />
+      <PageHeader title="Billing" />
       <Section title="Plan">
         <CardSkeleton lines={4} />
       </Section>

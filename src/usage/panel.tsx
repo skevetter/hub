@@ -22,9 +22,7 @@ import { overLimit } from "./limits.js";
 type Snapshot = Awaited<ReturnType<UsageDashboard["snapshot"]>>;
 
 const LIMITS_TITLE = "Limits";
-const LIMITS_DESCRIPTION = "What this organization is allowed, and how much is in use.";
 const HISTORY_TITLE = "History";
-const HISTORY_DESCRIPTION = "Every change to this organization's limits, most recent first.";
 const LIMIT_COLUMNS: readonly DataColumn[] = [
   { header: "Resource", fill: true },
   { header: "Limit" },
@@ -57,7 +55,7 @@ export function OrganizationUsagePanel() {
     queryFn: () => load({ data: { organizationSlug: tenant.organization.slug } }),
   });
 
-  if (query.status === "pending") return <UsageLoading name={tenant.organization.name} />;
+  if (query.status === "pending") return <UsageLoading />;
   if (query.status === "error") {
     return (
       <FailureAlert
@@ -74,12 +72,9 @@ function UsageContent({ snapshot }: { snapshot: Snapshot }) {
   const { limits } = snapshot;
   return (
     <>
-      <PageHeader
-        title="Usage"
-        description={`Limits and usage for ${snapshot.organization.name}.`}
-      />
+      <PageHeader title="Usage" />
       <SeatOverLimitBanner seats={limits.seats} />
-      <Section title={LIMITS_TITLE} description={LIMITS_DESCRIPTION}>
+      <Section title={LIMITS_TITLE}>
         <DataTable label="Limits" columns={LIMIT_COLUMNS} isEmpty={false} empty={LIMITS_EMPTY}>
           <DataRow>
             <DataCell>Seats</DataCell>
@@ -102,7 +97,7 @@ function UsageContent({ snapshot }: { snapshot: Snapshot }) {
           </DataRow>
         </DataTable>
       </Section>
-      <Section title={HISTORY_TITLE} description={HISTORY_DESCRIPTION}>
+      <Section title={HISTORY_TITLE}>
         <History history={snapshot.history} />
       </Section>
     </>
@@ -162,14 +157,14 @@ function measureUsage(measure: UsageMeasure): string {
   return measure.limit === null ? String(measure.used) : `${measure.used}/${measure.limit}`;
 }
 
-function UsageLoading({ name }: { name: string }) {
+function UsageLoading() {
   return (
     <>
-      <PageHeader title="Usage" description={`Limits and usage for ${name}.`} />
-      <Section title={LIMITS_TITLE} description={LIMITS_DESCRIPTION}>
+      <PageHeader title="Usage" />
+      <Section title={LIMITS_TITLE}>
         <DataTableSkeleton label="Limits" columns={LIMIT_COLUMNS} />
       </Section>
-      <Section title={HISTORY_TITLE} description={HISTORY_DESCRIPTION}>
+      <Section title={HISTORY_TITLE}>
         <DataTableSkeleton label="History" columns={HISTORY_COLUMNS} rows={2} />
       </Section>
     </>
