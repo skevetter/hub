@@ -56,7 +56,7 @@ const BAR_SLOT = 10;
 const CHART_HEIGHT = 100;
 
 function RunsChart({ days }: { days: readonly Day[] }) {
-  const peak = Math.max(1, ...days.map(({ total }) => total));
+  const peak = Math.max(0, ...days.map(({ total }) => total));
   return (
     <div className="grid gap-2">
       <svg
@@ -67,7 +67,13 @@ function RunsChart({ days }: { days: readonly Day[] }) {
         className="h-24 w-full border-b-2 border-foreground"
       >
         {days.map(({ day, total, failed }, index) => (
-          <Bar key={day} slot={index} finished={total - failed} failed={failed} peak={peak} />
+          <Bar
+            key={day}
+            slot={index}
+            finished={total - failed}
+            failed={failed}
+            peak={Math.max(1, peak)}
+          />
         ))}
       </svg>
       <div className="flex justify-between text-xs text-muted-foreground tabular-nums">

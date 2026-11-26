@@ -445,7 +445,6 @@ describe("read plans", () => {
     expect(output).toContain("trigger_runs_receipt_project_configured_unique");
     expect(output).toContain("provider_event_receipts_organization_received_idx");
     expect(output).not.toMatch(/Seq Scan on provider_event_receipts/u);
-    process.stdout.write(`${output}\n`);
   });
 
   it("scans only the window's runs for the daily read", async () => {
@@ -454,13 +453,12 @@ describe("read plans", () => {
     await seedWindowHistory(world, plan);
     const { rows } = await pg.runtime.query(`explain (analyze, buffers) ${RUNS_PER_DAY_SQL}`, [
       world.org,
-      ms(window.previousStart, 8 * 86_400_000),
-      ms(window.previousStart, 20 * 86_400_000),
+      window.previousStart,
+      window.now,
       ["failed", "timed_out"],
     ]);
     const output = rows.map((row) => row["QUERY PLAN"]).join("\n");
     expect(output).toContain("trigger_runs_organization_created_id_idx");
     expect(output).not.toMatch(/Seq Scan on trigger_runs/u);
-    process.stdout.write(`${output}\n`);
   });
 });

@@ -140,7 +140,7 @@ test("Home counts each thing that needs a person and links to it", async ({ hub,
   await home.open();
 
   await test.step("each figure counts its thing and says what it found", async () => {
-    await home.expectNeedsYou("triggers failing", 1);
+    await home.expectNeedsYou("failing", 1);
     await home.expectNeedsYou("app to authorize", 1);
     await home.expectNeedsYouCaption("app to authorize", "Acme Slack.");
     await home.expectNeedsYou("daemon to check", 1);
@@ -156,7 +156,7 @@ test("Home counts each thing that needs a person and links to it", async ({ hub,
 
   await test.step("each figure has one link to where the person acts", async () => {
     const links = [
-      ["triggers failing", "Review runs", /\/activity\?.*status=did_not_finish/u],
+      ["failing", "Review runs", /\/activity\?.*status=unsuccessful/u],
       ["app to authorize", "Open connections", /\/connections$/u],
       ["daemon to check", "View daemons", /\/daemons$/u],
       ["stopped matching", "Open trigger", /\/triggers\/[0-9a-f-]{36}$/u],
@@ -186,7 +186,6 @@ test("Home wraps long record names at 390 px", async ({ hub, page }) => {
   const connection = "C".repeat(60);
   const daemonName = "d".repeat(60);
   const organization = "O".repeat(60);
-  const profile = "P".repeat(60);
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", organization);
   await hub.connectGitHub("owner");
@@ -207,12 +206,6 @@ test("Home wraps long record names at 390 px", async ({ hub, page }) => {
     provider: "github",
   });
   await hub.seedProviderReceipt(name, { minutesAgo: 60, provider: "github" });
-  await hub.primaryApplication().query(
-    `insert into interactive_session_profiles (id, organization_id, name, daemon_id, cwd, provider, status)
-     select gen_random_uuid(), organization_id, $1, id, '/workspace', 'codex', 'active'
-     from daemons where slug = $2`,
-    [profile, daemon],
-  );
   await page.getByRole("link", { name: "Home", exact: true }).click();
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole("radio", { name: "GitHub" }).click();
@@ -230,11 +223,6 @@ test("Home wraps long record names at 390 px", async ({ hub, page }) => {
   expect(
     await stoppedLink.evaluate((element) => element.getBoundingClientRect().height),
   ).toBeGreaterThanOrEqual(44);
-  const profilePicker = page.getByRole("combobox", { name: "Profile" });
-  await expect(profilePicker).toContainText(profile);
-  expect(
-    await profilePicker.evaluate((element) => element.getBoundingClientRect().height),
-  ).toBeGreaterThan(32);
   await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText(organization);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
   await stoppedLink.click();

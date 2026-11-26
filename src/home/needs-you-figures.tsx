@@ -2,6 +2,7 @@
 import { Link } from "@tanstack/react-router";
 
 import { Figure, Figures } from "../components/app/figure.js";
+import { FAILED_RUN_FILTER } from "../triggers/run-status.js";
 import type { HomeSnapshot } from "./dashboard.js";
 import { needsYou, type NeedsYou } from "./needs-you.js";
 
@@ -39,7 +40,7 @@ function FailingFigure({ found: { failing }, base }: FigureProps) {
       {failing === 0 ? (
         "Last runs all finished."
       ) : (
-        <Link to={`${base}/activity?status=did_not_finish` as never} className={LINK}>
+        <Link to={`${base}/activity?status=${FAILED_RUN_FILTER}` as never} className={LINK}>
           Review runs
         </Link>
       )}

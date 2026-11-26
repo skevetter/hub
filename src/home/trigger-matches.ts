@@ -99,7 +99,8 @@ export function countMatchesByProject(
 
 // A trigger keeps its dedicated runtime project across revisions and renames. A receipt matches
 // a project when it started a run there, or when its filters dropped it after routing it there;
-// the union counts each receipt once per project. The window's provider receipt totals ride on
+// the union counts each receipt once per project; `offset 0` keeps the planner from flattening the
+// run lookup into a join that scans every run. The window's provider receipt totals ride on
 // every trigger row as one object, so a snapshot reads both in one statement. Routes are cleared
 // when a payload expires, so a filter-dropped match older than payload retention is not counted.
 export const TRIGGER_MATCHES_SQL = `with routed as (

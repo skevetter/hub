@@ -298,7 +298,7 @@ describe("Home needs you", () => {
     assert.equal(figure(markup, "triggers failing"), "2 triggers failing Review runs");
     assert.match(
       markup,
-      /<a href="\/o\/acme\/activity\?status=did_not_finish"[^>]*>Review runs<\/a>/u,
+      /<a href="\/o\/acme\/activity\?status=unsuccessful"[^>]*>Review runs<\/a>/u,
     );
     assert.match(markup, /text-attention-text/u);
   });
@@ -396,7 +396,7 @@ describe("Home runs", () => {
   it("says there are no runs yet and still draws the baseline", () => {
     const markup = renderHome({ ...ready, runDays: runDays([]) });
     assert.equal(figure(markup, "did not finish"), "0 did not finish No runs yet.");
-    assert.match(markup, /Peak 1 a day/u);
+    assert.match(markup, /Peak 0 a day/u);
   });
 });
 
