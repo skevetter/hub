@@ -93,40 +93,7 @@ export async function createTimelinePostgresHarness(): Promise<TimelinePostgresH
       runtime: root.runtime,
       database: root.database,
       async createRun(input = {}) {
-        const revision = await root.database.insertProjectConfigurationRevision({
-          projectId: project.id,
-          sourceKind: "manual",
-          sourceEvidence: { kind: "test" },
-          normalizedConfiguration: { environments: [], triggers: [] },
-          contentHash: "pooled-timeline-configuration",
-        });
-        await root.database.activateProjectConfigurationRevision(project.id, revision.id, []);
-        const receipt = await root.database.persistManualEvent({
-          organizationId: TIMELINE_ORGANIZATION,
-          projectId: project.id,
-          deliveryId: randomUUID(),
-          source: "manual.run",
-          payload: {},
-          receivedAt: new Date(),
-        });
-        assert.equal(receipt.status, "accepted");
-        if (receipt.status !== "accepted") throw new Error("Manual receipt was not accepted");
-        return (
-          await root.database.createAcceptedTriggerRun({
-            organizationId: TIMELINE_ORGANIZATION,
-            projectId: project.id,
-            configurationRevisionId: revision.id,
-            providerEventReceiptId: receipt.event.providerEventReceiptId,
-            configuredTriggerName: "timeline",
-            prompt: "",
-            inputs: {},
-            triggerContext: {},
-            outputContext: {},
-            deadlineAt: new Date(Date.now() + 3600000),
-            stepIds: ["work"],
-            ...input,
-          })
-        ).run;
+        return createTimelineRun(root.database, project.id, input);
       },
       async connect(
         hooks: TimelineQueryHooks = {},
@@ -141,24 +108,17 @@ export async function createTimelinePostgresHarness(): Promise<TimelinePostgresH
           "select pg_backend_pid() as pid",
         );
         const runtime = observedRuntime(bundle.runtime, hooks);
+        const row = rows[0];
+        if (row === undefined)
+          throw new TypeError("Cannot read properties of undefined (reading 'pid')");
         return {
           runtime,
-          pid: rows[0]!.pid,
+          pid: row.pid,
           database: createDatabase(runtime, bundle.locks, unsupportedLinearReceiptsPerHour),
         };
       },
       async waitForLockOrRead(pid: number, wasRead: () => boolean = () => false) {
-        const deadline = performance.now() + 2000;
-        while (performance.now() < deadline) {
-          if (wasRead()) return "read" as const;
-          const result = await root.runtime.query<{ blocked: boolean }>(
-            "select cardinality(pg_blocking_pids($1)) > 0 as blocked",
-            [pid],
-          );
-          if (result.rows[0]!.blocked) return "blocked" as const;
-          await delay(5);
-        }
-        throw new Error("PostgreSQL did not reach the expected lock wait or state read");
+        return waitForTimelineLockOrRead(root.runtime, pid, wasRead);
       },
       async close() {
         await Promise.all(connections.map((runtime) => runtime.close()));
@@ -170,6 +130,68 @@ export async function createTimelinePostgresHarness(): Promise<TimelinePostgresH
     await container.stop();
     throw error;
   }
+}
+
+async function createTimelineRun(
+  database: Database,
+  projectId: string,
+  input: NonNullable<Parameters<TimelinePostgresHarness["createRun"]>[0]>,
+) {
+  const revision = await database.insertProjectConfigurationRevision({
+    projectId,
+    sourceKind: "manual",
+    sourceEvidence: { kind: "test" },
+    normalizedConfiguration: { environments: [], triggers: [] },
+    contentHash: "pooled-timeline-configuration",
+  });
+  await database.activateProjectConfigurationRevision(projectId, revision.id, []);
+  const receipt = await database.persistManualEvent({
+    organizationId: TIMELINE_ORGANIZATION,
+    projectId,
+    deliveryId: randomUUID(),
+    source: "manual.run",
+    payload: {},
+    receivedAt: new Date(),
+  });
+  assert.equal(receipt.status, "accepted");
+  if (receipt.status !== "accepted") throw new Error("Manual receipt was not accepted");
+  return (
+    await database.createAcceptedTriggerRun({
+      organizationId: TIMELINE_ORGANIZATION,
+      projectId,
+      configurationRevisionId: revision.id,
+      providerEventReceiptId: receipt.event.providerEventReceiptId,
+      configuredTriggerName: "timeline",
+      prompt: "",
+      inputs: {},
+      triggerContext: {},
+      outputContext: {},
+      deadlineAt: new Date(Date.now() + 3600000),
+      stepIds: ["work"],
+      ...input,
+    })
+  ).run;
+}
+
+async function waitForTimelineLockOrRead(
+  runtime: DatabaseRuntime,
+  pid: number,
+  wasRead: () => boolean,
+) {
+  const deadline = performance.now() + 2000;
+  while (performance.now() < deadline) {
+    if (wasRead()) return "read" as const;
+    const result = await runtime.query<{ blocked: boolean }>(
+      "select cardinality(pg_blocking_pids($1)) > 0 as blocked",
+      [pid],
+    );
+    const row = result.rows[0];
+    if (row === undefined)
+      throw new TypeError("Cannot read properties of undefined (reading 'blocked')");
+    if (row.blocked) return "blocked" as const;
+    await delay(5);
+  }
+  throw new Error("PostgreSQL did not reach the expected lock wait or state read");
 }
 
 export function pooledTimelineEvent(
