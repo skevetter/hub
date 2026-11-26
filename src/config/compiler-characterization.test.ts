@@ -410,3 +410,52 @@ describe("finite authority expressions", () => {
     assert.deepEqual(parseCompiledHubConfig(compiled), compiled);
   });
 });
+
+describe("named agent and value selection", () => {
+  it("requires finite choices to evaluate an otherwise finite selector", () => {
+    const raw = configuration(
+      { inputs: { answer: { type: "boolean" } }, values: { answer: "paseo.inputs.answer" } },
+      { agent: expressionTemplate("!values.answer") },
+    );
+    assertIssue(() => compileHubConfig(raw), "step work agent must resolve from finite choices", [
+      ...workPath,
+      "agent",
+    ]);
+  });
+
+  it("reports unknown named agents in selector choice order", () => {
+    const agent = expressionTemplate("paseo.inputs.agent");
+    const options = { namedAgents: { known: { provider: "codex" } } };
+    const inputs = { agent: { type: "string", required: true, choices: ["first", "second"] } };
+    assertIssue(
+      () => compileHubConfig(configuration({ inputs }, { agent }), options),
+      "step work agent resolves to unknown named agent first",
+      [...workPath, "agent"],
+    );
+    inputs.agent.choices.reverse();
+    assertIssue(
+      () => compileHubConfig(configuration({ inputs }, { agent }), options),
+      "step work agent resolves to unknown named agent second",
+      [...workPath, "agent"],
+    );
+  });
+
+  it("reports the first cyclic or undeclared value before checking step fields", () => {
+    const step = { agent: expressionTemplate("values.unavailable") };
+    const cycle = { first: "values.second", second: "values.first" };
+    const undeclared = { target: "values.missing" };
+    assertIssue(
+      () => compileHubConfig(configuration({ values: { ...cycle, ...undeclared } }, step)),
+      "value dependency cycle includes first",
+    );
+    assertIssue(
+      () => compileHubConfig(configuration({ values: { ...undeclared, ...cycle } }, step)),
+      "value target references undeclared value missing",
+    );
+    assertIssue(
+      () => compileHubConfig(configuration({}, step)),
+      "step work agent references undeclared value unavailable",
+      [...workPath, "agent"],
+    );
+  });
+});
