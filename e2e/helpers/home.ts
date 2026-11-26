@@ -1,4 +1,11 @@
+import { join } from "node:path";
+import AxeBuilder from "@axe-core/playwright";
 import { expect, type Locator, type Page } from "@playwright/test";
+
+const SHOT_VIEWPORTS = [
+  { width: 1280, height: 800 },
+  { width: 390, height: 844 },
+];
 
 const ROUTING_ATTENTION_TITLE = "2 events dropped in the last 7 days";
 
@@ -140,6 +147,37 @@ export class OrganizationHome {
       () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
     );
     expect(overflow).toBe(0);
+  }
+
+  /** Each viewport in light and dark: no sideways scroll, no axe violations in the figures, one screenshot. */
+  async captureThemes(directory: string, name: string) {
+    await this.page.addStyleTag({
+      content: "*, *::before, *::after { transition: none !important; }",
+    });
+    for (const viewport of SHOT_VIEWPORTS) {
+      await this.page.setViewportSize(viewport);
+      for (const colorScheme of ["light", "dark"] as const) {
+        await this.page.emulateMedia({ colorScheme });
+        await expect(this.page.locator("html")).toHaveClass(
+          new RegExp(`\\b${colorScheme}\\b`, "u"),
+        );
+        await this.expectNoHorizontalScroll();
+        const results = await new AxeBuilder({ page: this.page })
+          .include('[role="group"][aria-label="Needs you"]')
+          .include('[role="group"][aria-label="Runs"]')
+          .include('[role="img"]')
+          .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+          .analyze();
+        expect(results.violations).toEqual([]);
+        await this.page.screenshot({
+          path: join(directory, `${name}-${String(viewport.width)}-${colorScheme}.png`),
+          fullPage: true,
+          animations: "disabled",
+        });
+      }
+    }
+    await this.page.setViewportSize({ width: 1280, height: 720 });
+    await this.page.emulateMedia({ colorScheme: null });
   }
 
   async expectRemovedSurfacesAbsent() {

@@ -119,6 +119,7 @@ run:
 }
 
 const WEEK_MINUTES = 7 * 24 * 60;
+const HOME_SHOTS = "/tmp/hub-ui/home-shots";
 
 test("Home counts each thing that needs a person and links to it", async ({ hub, page }) => {
   await hub.signUpAs("owner", owner);
@@ -179,6 +180,10 @@ test("Home counts each thing that needs a person and links to it", async ({ hub,
       expect(height).toBeGreaterThanOrEqual(44);
     }
   });
+
+  await test.step("both themes at both widths read cleanly", async () => {
+    await home.captureThemes(HOME_SHOTS, "needs-you");
+  });
 });
 
 test("Home wraps long record names at 390 px", async ({ hub, page }) => {
@@ -218,8 +223,9 @@ test("Home wraps long record names at 390 px", async ({ hub, page }) => {
   const home = new OrganizationHome(page);
   await home.expectStep("Enroll a daemon", daemonName);
   await home.expectStep("Create a trigger", name);
-  const stoppedLink = page.getByRole("link", { name: "Open trigger", exact: true });
-  await expect(page.getByRole("group", { name: "Needs you", exact: true })).toContainText(name);
+  const needsYou = page.getByRole("group", { name: "Needs you", exact: true });
+  const stoppedLink = needsYou.getByRole("link", { name: "Open trigger", exact: true });
+  await expect(needsYou).toContainText(name);
   expect(
     await stoppedLink.evaluate((element) => element.getBoundingClientRect().height),
   ).toBeGreaterThanOrEqual(44);
@@ -319,6 +325,7 @@ test("reads Home as needs-you figures, run counts, a checklist the member can pu
     await expect(home.runsChart()).toBeVisible();
     await home.expectRemovedSurfacesAbsent();
     await expect(page.getByRole("alert")).toHaveCount(0);
+    await home.captureThemes(HOME_SHOTS, "all-clear");
   });
 
   const checklist = page.getByRole("button", { name: /Getting started/u });
