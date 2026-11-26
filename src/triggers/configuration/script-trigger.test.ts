@@ -10,6 +10,7 @@ import {
   TriggerDocumentError,
 } from "./index.js";
 import { isScriptRun } from "./schema.js";
+import { documentRun } from "./steps.js";
 
 const NOTIFICATION = `
 name: build-on-review
@@ -58,10 +59,11 @@ function issues(yaml: string): { path: string; message: string }[] {
 describe("script actions in a trigger document", () => {
   it("parses a script run with the script default runtime", () => {
     const document = parseTriggerDocument(NOTIFICATION);
-    assert.ok(isScriptRun(document.run));
-    assert.equal(document.run.script, "npm ci\nnpm test\n");
-    assert.equal(document.run.max_runtime, "10m");
-    assert.deepEqual(document.run.target, { daemon: "devbox", cwd: "/workspace/webapp" });
+    const run = documentRun(document);
+    assert.ok(isScriptRun(run));
+    assert.equal(run.script, "npm ci\nnpm test\n");
+    assert.equal(run.max_runtime, "10m");
+    assert.deepEqual(run.target, { daemon: "devbox", cwd: "/workspace/webapp" });
   });
 
   it("compiles to one script step with no agent, prompt, or continuation", () => {

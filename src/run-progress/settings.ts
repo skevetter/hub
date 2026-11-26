@@ -29,21 +29,20 @@ export function readRunProgressSettings(environment: Environment): RunProgressSe
     ...(githubToken === undefined ? {} : { githubToken }),
     githubOrgs: readGitHubOrganizations(environment["PASEO_HUB_PROGRESS_GITHUB_ORGS"]),
     publicRepos: readPublicRepositories(environment["PASEO_HUB_PROGRESS_PUBLIC_REPOS"]),
-    timelineMaxEvents: readInteger(environment, "PASEO_HUB_TIMELINE_MAX_EVENTS", 500, 50, 5000),
-    retentionDays: readInteger(environment, "PASEO_HUB_TIMELINE_RETENTION_DAYS", 30, 1, 365),
-    minEditSeconds: readInteger(environment, "PASEO_HUB_PROGRESS_MIN_EDIT_SECONDS", 20, 5, 600),
-    maxEdits: readInteger(environment, "PASEO_HUB_PROGRESS_MAX_EDITS", 120, 10, 1000),
-    streamMaxPerKey: readInteger(environment, "PASEO_HUB_STREAM_MAX_PER_KEY", 5, 1, 100),
-    streamMaxPerOrg: readInteger(environment, "PASEO_HUB_STREAM_MAX_PER_ORG", 20, 1, 500),
-    streamMaxTotal: readInteger(environment, "PASEO_HUB_STREAM_MAX_TOTAL", 200, 1, 2000),
+    timelineMaxEvents: readInteger(environment, "PASEO_HUB_TIMELINE_MAX_EVENTS", 500, [50, 5000]),
+    retentionDays: readInteger(environment, "PASEO_HUB_TIMELINE_RETENTION_DAYS", 30, [1, 365]),
+    minEditSeconds: readInteger(environment, "PASEO_HUB_PROGRESS_MIN_EDIT_SECONDS", 20, [5, 600]),
+    maxEdits: readInteger(environment, "PASEO_HUB_PROGRESS_MAX_EDITS", 120, [10, 1000]),
+    streamMaxPerKey: readInteger(environment, "PASEO_HUB_STREAM_MAX_PER_KEY", 5, [1, 100]),
+    streamMaxPerOrg: readInteger(environment, "PASEO_HUB_STREAM_MAX_PER_ORG", 20, [1, 500]),
+    streamMaxTotal: readInteger(environment, "PASEO_HUB_STREAM_MAX_TOTAL", 200, [1, 2000]),
     streamHeartbeatSeconds: readInteger(
       environment,
       "PASEO_HUB_STREAM_HEARTBEAT_SECONDS",
       15,
-      5,
-      60,
+      [5, 60],
     ),
-    streamMaxSeconds: readInteger(environment, "PASEO_HUB_STREAM_MAX_SECONDS", 3600, 60, 86400),
+    streamMaxSeconds: readInteger(environment, "PASEO_HUB_STREAM_MAX_SECONDS", 3600, [60, 86400]),
   };
   if (settings.runStreamEnabled && !settings.runTimelineEnabled) {
     throw new Error("PASEO_HUB_RUN_STREAM needs PASEO_HUB_RUN_TIMELINE=true.");
@@ -68,8 +67,7 @@ function readInteger(
   environment: Environment,
   name: string,
   fallback: number,
-  min: number,
-  max: number,
+  [min, max]: readonly [number, number],
 ): number {
   const raw = environment[name]?.trim();
   if (raw === undefined || raw === "") return fallback;

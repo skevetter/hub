@@ -12,16 +12,20 @@ import {
   droppedTriggerRules,
   needsActorFilter,
   mergeTriggerForm,
+  newStepFormValue,
   patchTriggerYaml,
   projectTriggerForm,
   splitAgentId,
   triggerFormErrors,
+  type TriggerFormValue,
+  type TriggerStepFormValue,
 } from "./editor.js";
 
 import {
   GITHUB_SEMANTIC_TRIGGER_EVENT_NAMES,
   GITHUB_TRIGGER_SOURCE_NAMES,
 } from "../github/classification.js";
+import { documentRun } from "./steps.js";
 
 const ADVANCED = `# keep this heading
 name: answer
@@ -70,6 +74,28 @@ run:
   auto_archive: false
 `;
 
+function withStep(value: TriggerFormValue, patch: Partial<TriggerStepFormValue>) {
+  return {
+    ...value,
+    steps: value.steps.map((step, index) => (index === 0 ? { ...step, ...patch } : step)),
+  };
+}
+
+function manualForm(name: string, step: Partial<TriggerStepFormValue>): TriggerFormValue {
+  return {
+    name,
+    enabled: true,
+    event: "manual.run",
+    connection: "",
+    allowedUsers: "*",
+    qualifiers: {},
+    daemon: "office",
+    cwd: "/workspace",
+    runMaxRuntime: "",
+    steps: [newStepFormValue({ githubDuration: "1h", ...step })],
+  };
+}
+
 describe("trigger form YAML bridge", () => {
   test("editing a manual trigger preserves its named sender restriction", () => {
     const original = `name: answer
@@ -89,7 +115,7 @@ run:
     const trigger = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
     expect(trigger.on["manual.run"]?.filters?.from_users).toEqual(["alice", "bob"]);
     expect(saved.yaml).toContain("# named webhook callers");
-    expect(trigger.run.target.cwd).toBe("/new-workspace");
+    expect(documentRun(trigger).target.cwd).toBe("/new-workspace");
   });
 
   test("preserves YAML aliases and their comments during an unrelated form edit", () => {
@@ -120,19 +146,17 @@ run:
     const projection = projectTriggerForm(ADVANCED);
     if (projection.status !== "editable") throw new Error(projection.reason);
     const yaml = patchTriggerYaml(ADVANCED, {
-      ...projection.value,
+      ...withStep(projection.value, { agent: "pi/gateway/vendor/model-v1", mode: "safe" }),
       cwd: "/new-workspace",
-      agent: "pi/gateway/vendor/model-v1",
-      mode: "safe",
     });
     expect(yaml).toContain("# keep this heading");
     const value = TriggerDocumentSchema.parse(parseDocument(yaml).toJS());
-    expect(value.run.target).toEqual({
+    expect(documentRun(value).target).toEqual({
       daemon: "office",
       cwd: "/new-workspace",
       worktree: { mode: "branch-off", newBranch: "hub-work" },
     });
-    expect(agentRun(value.run).agent).toEqual({
+    expect(agentRun(documentRun(value)).agent).toEqual({
       provider: "pi",
       model: "gateway/vendor/model-v1",
       mode: "safe",
@@ -141,27 +165,27 @@ run:
     });
     expect(value.inputs).toBeDefined();
     expect(value.max_runtime).toBe("4h");
-    expect(agentRun(value.run).startup_timeout).toBe("3m");
-    expect(agentRun(value.run).env).toEqual({ TEAM: "core" });
-    expect(agentRun(value.run).github).toEqual({
+    expect(agentRun(documentRun(value)).startup_timeout).toBe("3m");
+    expect(agentRun(documentRun(value)).env).toEqual({ TEAM: "core" });
+    expect(agentRun(documentRun(value)).github).toEqual({
       connection: "company-github",
       repositories: ["paseo/hub"],
     });
-    expect(agentRun(value.run).output).toBeDefined();
-    expect(agentRun(value.run).outputs).toEqual({ "slack.reply": { max: 3 } });
-    expect(agentRun(value.run).auto_archive).toBe(false);
+    expect(agentRun(documentRun(value)).output).toBeDefined();
+    expect(agentRun(documentRun(value)).outputs).toEqual({ "slack.reply": { max: 3 } });
+    expect(agentRun(documentRun(value)).auto_archive).toBe(false);
     expect(value.on["slack.mention"]?.filters?.channels).toEqual(["engineering"]);
   });
 
   test("edits provider options without touching thinking selection", () => {
     const projection = projectTriggerForm(ADVANCED);
     if (projection.status !== "editable") throw new Error(projection.reason);
-    const yaml = patchTriggerYaml(ADVANCED, {
-      ...projection.value,
-      providerOptions: '{"sandbox_mode":"read-only"}',
-    });
+    const yaml = patchTriggerYaml(
+      ADVANCED,
+      withStep(projection.value, { providerOptions: '{"sandbox_mode":"read-only"}' }),
+    );
     const value = TriggerDocumentSchema.parse(parseDocument(yaml).toJS());
-    const { agent } = agentRun(value.run);
+    const { agent } = agentRun(documentRun(value));
     if ("choices" in agent) throw new Error("expected an inline agent");
     expect(agent.options).toEqual({ sandbox_mode: "read-only" });
     expect(agent.thinkingOptionId).toBe("xhigh");
@@ -170,13 +194,18 @@ run:
   test("keeps advanced YAML added before a new trigger's first save", () => {
     const projection = projectTriggerForm(ADVANCED);
     if (projection.status !== "editable") throw new Error(projection.reason);
-    const merged = mergeTriggerForm(ADVANCED, { ...projection.value, prompt: "Changed." });
+    const merged = mergeTriggerForm(ADVANCED, withStep(projection.value, { prompt: "Changed." }));
     if (merged.status !== "ok") throw new Error(merged.reason);
     expect(merged.yaml).toContain("# keep this heading");
+    expect(merged.yaml).toBe(
+      parseDocument(ADVANCED.replace("prompt: Handle it.", "prompt: Changed."), {
+        compat: ["timestamp"],
+      }).toString({ lineWidth: 0 }),
+    );
     const value = TriggerDocumentSchema.parse(parseDocument(merged.yaml).toJS());
-    expect(agentRun(value.run).prompt).toBe("Changed.");
-    expect(agentRun(value.run).target.worktree).toBeDefined();
-    expect(agentRun(value.run).outputs).toBeDefined();
+    expect(agentRun(documentRun(value)).prompt).toBe("Changed.");
+    expect(agentRun(documentRun(value)).target.worktree).toBeDefined();
+    expect(agentRun(documentRun(value)).outputs).toBeDefined();
   });
 
   test("keeps unsupported shapes in YAML-only mode", () => {
@@ -195,32 +224,13 @@ run:
   });
 
   test("creates a deliberately minimal new trigger", () => {
-    const yaml = createTriggerYaml({
-      name: "answer",
-      enabled: true,
-      event: "manual.run",
-      connection: "",
-      allowedUsers: "*",
-      qualifiers: {},
-      daemon: "office",
-      cwd: "/workspace",
-      agent: "codex/gpt-5.4",
-      mode: "full-access",
-      thinkingOptionId: "",
-      providerOptions: "",
-      continuationMode: "conversation",
-      continuationKey: "",
-      maxRuntime: "2h",
-      idleTimeout: "10m",
-      completeOnTurnEnd: false,
-      githubConnection: "",
-      githubRepositories: "",
-      githubPermissions: "",
-      githubDuration: "1h",
-      prompt: "Handle it.",
-      action: "prompt",
-      script: "",
-    });
+    const yaml = createTriggerYaml(
+      manualForm("answer", {
+        agent: "codex/gpt-5.4",
+        mode: "full-access",
+        prompt: "Handle it.",
+      }),
+    );
     expect(parseDocument(yaml).toJS()).toEqual({
       name: "answer",
       enabled: true,
@@ -290,45 +300,24 @@ ${ADVANCED}`;
   });
 
   test("writes complete_on_turn_end only when the box is ticked", () => {
-    const form = {
-      name: "answer",
-      enabled: true,
-      event: "manual.run" as const,
-      connection: "",
-      allowedUsers: "*",
-      qualifiers: {},
-      daemon: "office",
-      cwd: "/workspace",
+    const form = manualForm("answer", {
       agent: "claude",
       mode: "default",
-      thinkingOptionId: "",
-      providerOptions: "",
-      continuationMode: "conversation",
-      continuationKey: "",
-      maxRuntime: "2h",
-      idleTimeout: "10m",
-      completeOnTurnEnd: false,
-      githubConnection: "",
-      githubRepositories: "",
-      githubPermissions: "",
-      githubDuration: "1h",
       prompt: "Handle it.",
-      action: "prompt" as const,
-      script: "",
-    };
+    });
     const off = createTriggerYaml(form);
     expect(off).not.toContain("complete_on_turn_end");
 
-    const on = createTriggerYaml({ ...form, completeOnTurnEnd: true });
+    const on = createTriggerYaml(withStep(form, { completeOnTurnEnd: true }));
     expect(parseDocument(on).getIn(["run", "complete_on_turn_end"])).toBe(true);
     const projection = projectTriggerForm(on);
     if (projection.status !== "editable") throw new Error(projection.reason);
-    expect(projection.value.completeOnTurnEnd).toBe(true);
+    expect(projection.value.steps[0]?.completeOnTurnEnd).toBe(true);
 
-    const cleared = mergeTriggerForm(on, { ...projection.value, completeOnTurnEnd: false });
+    const cleared = mergeTriggerForm(on, withStep(projection.value, { completeOnTurnEnd: false }));
     if (cleared.status !== "ok") throw new Error(cleared.reason);
     expect(cleared.yaml).not.toContain("complete_on_turn_end");
-    const set = mergeTriggerForm(off, { ...form, completeOnTurnEnd: true });
+    const set = mergeTriggerForm(off, withStep(form, { completeOnTurnEnd: true }));
     if (set.status !== "ok") throw new Error(set.reason);
     expect(parseDocument(set.yaml).getIn(["run", "complete_on_turn_end"])).toBe(true);
   });
@@ -337,39 +326,20 @@ ${ADVANCED}`;
     const authored = ADVANCED.replace("run:", "run:\n  complete_on_turn_end: false");
     const projection = projectTriggerForm(authored);
     if (projection.status !== "editable") throw new Error(projection.reason);
-    expect(projection.value.completeOnTurnEnd).toBe(false);
+    expect(projection.value.steps[0]?.completeOnTurnEnd).toBe(false);
     const merged = mergeTriggerForm(authored, { ...projection.value, name: "renamed" });
     if (merged.status !== "ok") throw new Error(merged.reason);
     expect(merged.yaml).toContain("complete_on_turn_end: false");
   });
 
   test("submits an unchanged minimal manual trigger", () => {
-    const initial = createTriggerYaml({
-      name: "deploy",
-      enabled: true,
-      event: "manual.run",
-      connection: "",
-      allowedUsers: "*",
-      qualifiers: {},
-      daemon: "office",
-      cwd: "/workspace",
-      agent: "opencode",
-      mode: "full-access",
-      thinkingOptionId: "",
-      providerOptions: "",
-      continuationMode: "conversation",
-      continuationKey: "",
-      maxRuntime: "2h",
-      idleTimeout: "10m",
-      completeOnTurnEnd: false,
-      githubConnection: "",
-      githubRepositories: "",
-      githubPermissions: "",
-      githubDuration: "1h",
-      prompt: "${{ paseo.prompt }}",
-      action: "prompt",
-      script: "",
-    });
+    const initial = createTriggerYaml(
+      manualForm("deploy", {
+        agent: "opencode",
+        mode: "full-access",
+        prompt: "${{ paseo.prompt }}",
+      }),
+    );
     const projection = projectTriggerForm(initial);
     if (projection.status !== "editable") throw new Error(projection.reason);
 
@@ -393,11 +363,11 @@ ${ADVANCED}`;
       status: "incomplete",
       reason: "Daemon is required.",
     });
-    expect(mergeTriggerForm("", { ...projection.value, agent: "" })).toEqual({
+    expect(mergeTriggerForm("", withStep(projection.value, { agent: "" }))).toEqual({
       status: "incomplete",
       reason: "Agent is required.",
     });
-    expect(mergeTriggerForm("", { ...projection.value, providerOptions: "{" })).toEqual({
+    expect(mergeTriggerForm("", withStep(projection.value, { providerOptions: "{" }))).toEqual({
       status: "incomplete",
       reason: "Provider options must be valid JSON.",
     });
@@ -431,14 +401,14 @@ describe("what the form still needs", () => {
     expect(triggerFormErrors({ ...editable(), cwd: "workspace" })).toEqual({
       cwd: "Working directory must be an absolute path.",
     });
-    expect(triggerFormErrors({ ...editable(), agent: "" })).toEqual({
-      agent: "Agent is required.",
+    expect(triggerFormErrors(withStep(editable(), { agent: "" }))).toEqual({
+      "steps.0.agent": "Agent is required.",
     });
-    expect(triggerFormErrors({ ...editable(), providerOptions: "{" })).toEqual({
-      providerOptions: "Provider options must be valid JSON.",
+    expect(triggerFormErrors(withStep(editable(), { providerOptions: "{" }))).toEqual({
+      "steps.0.providerOptions": "Provider options must be valid JSON.",
     });
-    expect(triggerFormErrors({ ...editable(), prompt: "  " })).toEqual({
-      prompt: "Instructions are required.",
+    expect(triggerFormErrors(withStep(editable(), { prompt: "  " }))).toEqual({
+      "steps.0.prompt": "Instructions are required.",
     });
   });
 
@@ -462,19 +432,19 @@ describe("what the form still needs", () => {
 
   test("reads GitHub permissions only when a GitHub connection is chosen", () => {
     expect(
-      triggerFormErrors({ ...editable(), githubConnection: "", githubPermissions: "{" })
-        .githubPermissions,
+      triggerFormErrors(withStep(editable(), { githubConnection: "", githubPermissions: "{" }))[
+        "steps.0.githubPermissions"
+      ],
     ).toBeUndefined();
     expect(
-      triggerFormErrors({ ...editable(), githubConnection: "company", githubPermissions: "{" })
-        .githubPermissions,
+      triggerFormErrors(
+        withStep(editable(), { githubConnection: "company", githubPermissions: "{" }),
+      )["steps.0.githubPermissions"],
     ).toBe("GitHub permissions must be valid JSON.");
     expect(
-      triggerFormErrors({
-        ...editable(),
-        githubConnection: "company",
-        githubPermissions: '{"a":1}',
-      }).githubPermissions,
+      triggerFormErrors(
+        withStep(editable(), { githubConnection: "company", githubPermissions: '{"a":1}' }),
+      )["steps.0.githubPermissions"],
     ).toBe('GitHub permissions map a scope to "read", "write", or "admin".');
   });
 
@@ -598,15 +568,20 @@ test.each(["github.issue_label_added", "github.pull_request_label_added"])(
 test("continuation policies round-trip through the form and YAML", () => {
   const projection = projectTriggerForm(ADVANCED);
   if (projection.status !== "editable") throw new Error(projection.reason);
-  expect(projection.value.continuationMode).toBe("conversation");
+  expect(projection.value.steps[0]?.continuationMode).toBe("conversation");
   for (const mode of ["key", "new", "conversation"]) {
-    const yaml = patchTriggerYaml(ADVANCED, {
-      ...projection.value,
-      continuationMode: mode,
-      continuationKey: "${{ paseo.inputs.ticket }}",
-    });
+    const yaml = patchTriggerYaml(
+      ADVANCED,
+      withStep(projection.value, {
+        continuationMode: mode,
+        continuationKey: "${{ paseo.inputs.ticket }}",
+      }),
+    );
     const next = projectTriggerForm(yaml);
-    expect(next).toMatchObject({ status: "editable", value: { continuationMode: mode } });
+    expect(next).toMatchObject({
+      status: "editable",
+      value: { steps: [{ continuationMode: mode }] },
+    });
     expect(yaml).toContain("# keep this heading");
   }
 });
@@ -1005,7 +980,7 @@ test("preserves an explicit empty manual caller list during an unrelated edit", 
   expect(saved.yaml).toContain("# nobody can invoke this");
   const parsed = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
   expect(parsed.on["manual.run"]?.filters?.from_users).toEqual([]);
-  expect(parsed.run.target.cwd).toBe("/other");
+  expect(documentRun(parsed).target.cwd).toBe("/other");
 });
 
 test("clearing an aliased list leaves the original list and its other aliases in place", () => {
@@ -1036,5 +1011,5 @@ test("keeps an anchored progress flag and its alias during an unrelated edit", (
   if (saved.status !== "ok") throw new Error(saved.reason);
   expect(saved.yaml).toContain("progress_message: &flag false");
   expect(saved.yaml).toContain("report: *flag");
-  expect(parseTriggerDocument(saved.yaml).run.target.cwd).toBe("/other");
+  expect(documentRun(parseTriggerDocument(saved.yaml)).target.cwd).toBe("/other");
 });
