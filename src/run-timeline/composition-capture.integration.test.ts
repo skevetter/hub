@@ -45,6 +45,130 @@ async function stopWithStalledTimeline(
   assert.ok(terminal?.outcome === "accepted" && terminal.terminalNotificationDeliveredAt);
 }
 
+function emitFixtureEvents(id: string, emit: (id: string, event: AgentEvent) => void): void {
+  emit(id, {
+    type: "agent_stream",
+    agentId: id,
+    timestamp: new Date().toISOString(),
+    event: { type: "thread_started", provider: "claude", sessionId: PRIVATE_KEY },
+  });
+  emit(id, {
+    type: "agent_stream",
+    agentId: id,
+    timestamp: new Date().toISOString(),
+    event: {
+      type: "turn_failed",
+      provider: "claude",
+      error: [TOKEN, DATABASE_SECRET, PRIVATE_KEY, AUTH_SECRET].join(" "),
+    },
+  });
+  emit(id, {
+    type: "agent_stream",
+    agentId: id,
+    timestamp: new Date().toISOString(),
+    event: {
+      type: "timeline",
+      provider: "claude",
+      item: {
+        type: "tool_call",
+        callId: "after-prompt",
+        name: "Bash",
+        status: "completed",
+        detail: { command: TOKEN },
+      },
+    },
+  });
+}
+
+function fixtureConnection(): DaemonConnection {
+  const listeners = new Map<string, Set<(event: AgentEvent) => void>>();
+  const emit = (id: string, event: AgentEvent) => {
+    for (const listener of listeners.get(id) ?? []) listener(event);
+  };
+  return {
+    agents: {
+      create: async (id) => ({ id, workspaceId: "fixture-workspace", status: "idle" }),
+      get: async (id) => ({ id, workspaceId: "fixture-workspace", status: "idle" }),
+      restore: async () => true,
+      control: async () => {},
+      watch: async (id, listener) => {
+        const subscriptions = listeners.get(id) ?? new Set();
+        subscriptions.add(listener);
+        listeners.set(id, subscriptions);
+        listener({
+          type: "agent_stream",
+          agentId: id,
+          timestamp: new Date().toISOString(),
+          event: {
+            type: "timeline",
+            provider: "claude",
+            item: {
+              type: "tool_call",
+              callId: "before-prompt",
+              name: "Read",
+              status: "completed",
+            },
+          },
+        });
+        return () => {
+          subscriptions.delete(listener);
+        };
+      },
+      send: async (id) => emitFixtureEvents(id, emit),
+    },
+    getProviderSnapshot: async () => {
+      throw new Error("unused");
+    },
+    refreshProviderSnapshot: async () => {},
+    validateAgentConfiguration: async () => ({ valid: true }),
+  };
+}
+
+function assertCapturePersistence(
+  enabled: boolean,
+  rows: Awaited<ReturnType<Database["listRunTimelineEvents"]>>,
+  state: Awaited<ReturnType<Database["readRunTimelineState"]>>,
+): void {
+  if (enabled) {
+    assert.ok(state?.sealedSeq);
+    assert.equal(rows.at(-1)?.kind, "run_finished");
+    assert.equal(rows.filter((row) => row.kind === "step_finished").length, 1);
+    assert.equal(rows.filter((row) => row.kind === "agent_started").length, 1);
+    assert.equal(
+      rows.some((row) => row.data["callId"] === "before-prompt"),
+      false,
+    );
+    assert.equal(rows.find((row) => row.kind === "tool_finished")?.data["callId"], "after-prompt");
+    const stored = JSON.stringify(rows);
+    for (const secret of [TOKEN, DATABASE_SECRET, PRIVATE_KEY, AUTH_SECRET]) {
+      for (let index = 0; index + 8 <= secret.length; index += 1)
+        assert.equal(stored.includes(secret.slice(index, index + 8)), false);
+    }
+  } else {
+    assert.deepEqual(rows, []);
+    assert.equal(state, undefined);
+  }
+}
+
+function assertResourceCounts(
+  runtime: Awaited<ReturnType<typeof createApplicationRuntime>>,
+  enabled: boolean,
+): void {
+  assert.deepEqual(
+    runtime.hub.resourceCounts(),
+    enabled
+      ? {
+          executionSubscriptions: 0,
+          timelineQueueDepth: 0,
+          timelineQueueEntries: 0,
+          timelineAccountingEntries: 0,
+          timelineAccountingGiveUps: 0,
+          timelineAccountingDropsAbandoned: 0,
+        }
+      : { executionSubscriptions: 0 },
+  );
+}
+
 describe("optional capture application composition", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -86,80 +210,7 @@ describe("optional capture application composition", () => {
         },
         { organizationId: ORGANIZATION },
       );
-      const listeners = new Map<string, Set<(event: AgentEvent) => void>>();
-      const emit = (id: string, event: AgentEvent) => {
-        for (const listener of listeners.get(id) ?? []) listener(event);
-      };
-      const connection: DaemonConnection = {
-        agents: {
-          create: async (id) => ({ id, workspaceId: "fixture-workspace", status: "idle" }),
-          get: async (id) => ({ id, workspaceId: "fixture-workspace", status: "idle" }),
-          restore: async () => true,
-          control: async () => {},
-          watch: async (id, listener) => {
-            const subscriptions = listeners.get(id) ?? new Set();
-            subscriptions.add(listener);
-            listeners.set(id, subscriptions);
-            listener({
-              type: "agent_stream",
-              agentId: id,
-              timestamp: new Date().toISOString(),
-              event: {
-                type: "timeline",
-                provider: "claude",
-                item: {
-                  type: "tool_call",
-                  callId: "before-prompt",
-                  name: "Read",
-                  status: "completed",
-                },
-              },
-            });
-            return () => {
-              subscriptions.delete(listener);
-            };
-          },
-          send: async (id) => {
-            emit(id, {
-              type: "agent_stream",
-              agentId: id,
-              timestamp: new Date().toISOString(),
-              event: { type: "thread_started", provider: "claude", sessionId: PRIVATE_KEY },
-            });
-            emit(id, {
-              type: "agent_stream",
-              agentId: id,
-              timestamp: new Date().toISOString(),
-              event: {
-                type: "turn_failed",
-                provider: "claude",
-                error: [TOKEN, DATABASE_SECRET, PRIVATE_KEY, AUTH_SECRET].join(" "),
-              },
-            });
-            emit(id, {
-              type: "agent_stream",
-              agentId: id,
-              timestamp: new Date().toISOString(),
-              event: {
-                type: "timeline",
-                provider: "claude",
-                item: {
-                  type: "tool_call",
-                  callId: "after-prompt",
-                  name: "Bash",
-                  status: "completed",
-                  detail: { command: TOKEN },
-                },
-              },
-            });
-          },
-        },
-        getProviderSnapshot: async () => {
-          throw new Error("unused");
-        },
-        refreshProviderSnapshot: async () => {},
-        validateAgentConfiguration: async () => ({ valid: true }),
-      };
+      const connection = fixtureConnection();
       let closed = false;
       const release = Promise.withResolvers<void>();
       const reached = Promise.withResolvers<void>();
@@ -195,19 +246,7 @@ describe("optional capture application composition", () => {
         },
       });
       try {
-        assert.deepEqual(
-          runtime.hub.resourceCounts(),
-          enabled
-            ? {
-                executionSubscriptions: 0,
-                timelineQueueDepth: 0,
-                timelineQueueEntries: 0,
-                timelineAccountingEntries: 0,
-                timelineAccountingGiveUps: 0,
-                timelineAccountingDropsAbandoned: 0,
-              }
-            : { executionSubscriptions: 0 },
-        );
+        assertResourceCounts(runtime, enabled);
         const receipt = await database.persistManualEvent({
           organizationId: ORGANIZATION,
           projectId: project.id,
@@ -281,46 +320,13 @@ describe("optional capture application composition", () => {
           limit: 100,
         });
         const state = await database.readRunTimelineState(ORGANIZATION, run.id);
-        if (enabled) {
-          assert.ok(state?.sealedSeq);
-          assert.equal(rows.at(-1)?.kind, "run_finished");
-          assert.equal(rows.filter((row) => row.kind === "step_finished").length, 1);
-          assert.equal(rows.filter((row) => row.kind === "agent_started").length, 1);
-          assert.equal(
-            rows.some((row) => row.data["callId"] === "before-prompt"),
-            false,
-          );
-          assert.equal(
-            rows.find((row) => row.kind === "tool_finished")?.data["callId"],
-            "after-prompt",
-          );
-          const stored = JSON.stringify(rows);
-          for (const secret of [TOKEN, DATABASE_SECRET, PRIVATE_KEY, AUTH_SECRET]) {
-            for (let index = 0; index + 8 <= secret.length; index += 1)
-              assert.equal(stored.includes(secret.slice(index, index + 8)), false);
-          }
-        } else {
-          assert.deepEqual(rows, []);
-          assert.equal(state, undefined);
-        }
+        assertCapturePersistence(enabled, rows, state);
       } finally {
         release.resolve();
         await runtime.stop();
       }
       assert.equal(closed, true);
-      assert.deepEqual(
-        runtime.hub.resourceCounts(),
-        enabled
-          ? {
-              executionSubscriptions: 0,
-              timelineQueueDepth: 0,
-              timelineQueueEntries: 0,
-              timelineAccountingEntries: 0,
-              timelineAccountingGiveUps: 0,
-              timelineAccountingDropsAbandoned: 0,
-            }
-          : { executionSubscriptions: 0 },
-      );
+      assertResourceCounts(runtime, enabled);
     },
   );
 });
