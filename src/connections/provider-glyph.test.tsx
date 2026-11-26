@@ -36,4 +36,11 @@ describe("provider glyph", () => {
       );
     }
   });
+
+  it("draws Linear with the published logomark", () => {
+    const markup = renderToStaticMarkup(<ProviderGlyph provider="linear" />);
+    assert.match(markup, /viewBox="0 0 100 100"/u);
+    assert.ok(markup.includes("M1.22541 61.5228c-.2225-.9485.90748-1.5459 1.59638-.857L39.3"));
+    assert.ok(markup.includes("99 37.3375-.3903.3487-.984.3258-1.3542-.0443L12.6587 18.074Z"));
+  });
 });
