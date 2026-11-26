@@ -1,10 +1,17 @@
 import { once } from "node:events";
 import { request, type Server, type ServerResponse } from "node:http";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { beginHttpShutdown, createFetchServer } from "./node-server.js";
 import { registerResponseLifecycle } from "./response-lifecycle.js";
 
 type Interruption = "close" | "error" | "drain" | "stall" | "unbounded";
+
+function restoreTimers(): void {
+  vi.clearAllTimers();
+  vi.useRealTimers();
+}
+
+afterEach(restoreTimers);
 
 async function listen(server: Server): Promise<number> {
   server.listen(0, "127.0.0.1");
@@ -146,22 +153,19 @@ function checkStallDeadline(mode: Interruption, outgoing: ServerResponse) {
 async function characterizeForwarding(mode: Interruption) {
   const fixture = forwardingFixture(mode);
   const port = await listen(fixture.server);
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-  const timers = vi.spyOn(globalThis, "setTimeout");
   const client = openClient(port);
   try {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const outgoing = await fixture.blocked;
     const closed = responseClosed(outgoing);
-    const stalls = timers.mock.calls.filter(([, delay]) => delay === 30_000).length;
-    expect(stalls).toBe(mode === "close" || mode === "unbounded" ? 0 : 1);
+    expect(vi.getTimerCount()).toBe(mode === "close" || mode === "unbounded" ? 0 : 1);
     checkStallDeadline(mode, outgoing);
     scheduleInterruption(mode, outgoing, () => client.destroy());
     await closed;
     await beginHttpShutdown(fixture.server).drained;
     expect(snapshot(outgoing, fixture)).toEqual(expected(mode));
   } finally {
-    timers.mockRestore();
-    vi.useRealTimers();
+    restoreTimers();
     client.destroy();
     await stop(fixture.server);
   }

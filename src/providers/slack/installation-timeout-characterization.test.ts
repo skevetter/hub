@@ -1,6 +1,13 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { startSlackSocketFixture } from "../../test-utils/slack-socket-fixture.js";
 import { createSlackSocketInstallationVerifier } from "./installation.js";
+
+function restoreTimers(): void {
+  vi.clearAllTimers();
+  vi.useRealTimers();
+}
+
+afterEach(restoreTimers);
 
 function pauseAuthTest() {
   const received = Promise.withResolvers<AbortSignal>();
@@ -23,8 +30,8 @@ describe("Slack socket verification timeout", () => {
   it("maps an aborted auth.test request to a verification timeout", async () => {
     const slack = await startSlackSocketFixture();
     const auth = pauseAuthTest();
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       const verifier = createSlackSocketInstallationVerifier({
         apiBaseUrl: slack.apiBaseUrl,
         timeoutMs: 1_000,
@@ -44,7 +51,7 @@ describe("Slack socket verification timeout", () => {
       expect(signal.aborted).toBe(true);
       expect(slack.authorizations).toEqual(["Bearer fixture-app"]);
     } finally {
-      vi.useRealTimers();
+      restoreTimers();
       auth.restore();
       await slack.close();
     }
