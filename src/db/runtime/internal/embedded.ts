@@ -5,7 +5,6 @@ import { PGlite } from "@electric-sql/pglite";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 import { drizzle } from "drizzle-orm/pglite";
 import * as schema from "../../schema.js";
-import { TransactionRollback } from "../index.js";
 import type {
   DatabaseRuntime,
   DatabaseRuntimeBundle,
@@ -19,6 +18,7 @@ import type { EmbeddedLockLifecycle } from "../locks/index.js";
 import { acquireDataDirectoryLock, type DataDirectoryLock } from "./data-directory-lock.js";
 import { reportFailure } from "../../../failures/index.js";
 import { runtimeFile } from "../../../runtime-files.js";
+import { TransactionRollback } from "./transaction-rollback.js";
 
 const MIGRATIONS_FOLDER = runtimeFile("drizzle");
 

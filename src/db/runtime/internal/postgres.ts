@@ -5,10 +5,8 @@ import { logger } from "../../../logger.js";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import type { PoolClient } from "pg";
 import { createPool, type PostgresPool, type PostgresPoolOptions } from "./pool.js";
-export { createPool } from "./pool.js";
 import * as schema from "../../schema.js";
 import { toDatabaseError } from "../../errors.js";
-import { TransactionRollback } from "../index.js";
 import type {
   DatabaseRuntime,
   DatabaseRuntimeBundle,
@@ -20,6 +18,9 @@ import type {
 } from "../index.js";
 import { postgresLocks } from "../locks/index.js";
 import { runtimeFile } from "../../../runtime-files.js";
+import { TransactionRollback } from "./transaction-rollback.js";
+
+export { createPool } from "./pool.js";
 
 const MIGRATIONS_FOLDER = runtimeFile("drizzle");
 const DEFAULT_POSTGRES_DATABASE = "postgres";

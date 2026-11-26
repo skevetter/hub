@@ -8,6 +8,7 @@ import type { PostgresPoolOptions } from "./internal/pool.js";
 
 export { readDatabasePoolOptions } from "./internal/pool-options.js";
 export type { PostgresPoolOptions } from "./internal/pool.js";
+export { TransactionRollback } from "./internal/transaction-rollback.js";
 
 export type QueryRow = Record<string, unknown>;
 
@@ -60,9 +61,4 @@ export function postgresDatabaseRuntime(
 
 export function embeddedDatabaseRuntime(dataDirectory: string): Promise<DatabaseRuntimeBundle> {
   return createEmbeddedRuntime(dataDirectory);
-}
-
-/** @package */
-export class TransactionRollback {
-  constructor(readonly result: unknown) {}
 }
