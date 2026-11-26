@@ -21,6 +21,17 @@ function evaluate(source: string) {
   return evaluateExpression(parseExpression(source), context);
 }
 
+function expectEvaluationError(source: string, message: string): void {
+  try {
+    evaluate(source);
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    expect(error.message).toBe(message);
+    return;
+  }
+  throw new Error("expected expression evaluation to throw");
+}
+
 describe("workflow expression characterization", () => {
   const successes = [
     ["${{ true || false && false }}", true],
@@ -80,12 +91,37 @@ describe("workflow expression characterization", () => {
     ],
   ] as const;
   it.each(errors)("rejects %s", (source, message) => {
-    expect(() => evaluate(source)).toThrow(new Error(message));
+    expectEvaluationError(source, message);
   });
 
   it("renders JSON and strings without changing their representation", () => {
     expect(renderExpressionTemplate("a:${{ paseo.context }}:${{ paseo.prompt }}", context)).toBe(
       'a:{"event":true}:ship it',
+    );
+  });
+});
+
+describe("workflow input key characterization", () => {
+  it.each([
+    ["constructor", Object],
+    ["__proto__", Object.prototype],
+  ] as const)("reads inherited input %s from an explicit AST", (key, result: unknown) => {
+    expect(
+      evaluateExpression(
+        { kind: "path", value: { namespace: "paseo", path: ["inputs", key] } },
+        context,
+      ),
+    ).toBe(result);
+  });
+
+  it("reads the inherited constructor from source", () => {
+    expect(evaluate("paseo.inputs.constructor")).toBe(Object);
+  });
+
+  it("rejects the leading underscore of __proto__ in source", () => {
+    expectEvaluationError(
+      "paseo.inputs.__proto__",
+      "invalid workflow expression: unexpected token _",
     );
   });
 });
