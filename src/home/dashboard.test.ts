@@ -96,6 +96,36 @@ describe("home read model", () => {
     );
   });
 
+  it("reads the event of a trigger written as steps, which the form can now edit", async () => {
+    const database = memberDatabase();
+    await enrollTestDaemon(database, "org-1");
+    const stepsYaml = `name: two-steps
+on:
+  manual.run: {}
+target: { daemon: ${TEST_DAEMON_SLUG}, cwd: /workspace }
+steps:
+  - id: plan
+    agent: { provider: codex, mode: full-access }
+    prompt: Plan it
+  - id: build
+    agent: { provider: codex, mode: full-access }
+    prompt: Build it
+`;
+    await new OrganizationTriggerStore(database, "org-1", acceptingAgentValidator()).save({
+      yaml: stepsYaml,
+      userId: "user-1",
+    });
+
+    const snapshot = await new HomeDashboard(database, accountAuth(), APPS_CONFIGURED, {
+      now: () => NOW,
+    }).snapshot(request, "acme");
+
+    assert.deepEqual(
+      snapshot.triggers.map(({ name, event }) => [name, event]),
+      [["two-steps", "manual.run"]],
+    );
+  });
+
   it("reads every trigger's revision in one statement, however many triggers there are", async () => {
     const database = memberDatabase();
     await enrollTestDaemon(database, "org-1");
