@@ -459,3 +459,135 @@ describe("named agent and value selection", () => {
     );
   });
 });
+
+describe("authored contract precedence", () => {
+  it("checks environment IDs before trigger IDs and step IDs", () => {
+    const raw = configuration();
+    const [environment] = raw.environments;
+    const [trigger] = raw.triggers;
+    assert.ok(environment && trigger);
+    const repeated = { ...raw, triggers: [trigger, { ...trigger, steps: workflowSteps({}, {}) }] };
+    assertIssue(
+      () => compileHubConfig({ ...repeated, environments: [environment, environment] }),
+      "duplicate environment id: runner",
+    );
+    assertIssue(() => compileHubConfig(repeated), "duplicate trigger id: run");
+    assertIssue(
+      () => compileHubConfig(configuration({ steps: workflowSteps({}, {}) })),
+      "duplicate step id: work",
+    );
+    assertIssue(
+      () => compileHubConfig({ ...repeated, environments: [{ ...environment, name: "Runner" }] }),
+      "invalid environment name: Runner",
+    );
+  });
+
+  it("checks idle timeout and structured output before required turn-end outputs", () => {
+    const step = {
+      complete_on_turn_end: true,
+      allow_outputs: [{ type: "manual.reply", required: true }],
+    };
+    const output = { schema: { type: "object" } };
+    assertIssue(
+      () => compileHubConfig(configuration({}, { ...step, output, idle_timeout: "11m" })),
+      "step work idle_timeout must not exceed max_runtime",
+    );
+    assertIssue(
+      () => compileHubConfig(configuration({}, { ...step, output })),
+      "step work complete_on_turn_end cannot be combined with output.schema: a finished turn has no structured output",
+    );
+    assertIssue(
+      () => compileHubConfig(configuration({}, step)),
+      "step work complete_on_turn_end cannot be combined with a required output: the agent must emit it before it finishes",
+    );
+  });
+
+  it.each([
+    [[true], "choices do not match type"],
+    [["elsewhere"], "default is not an allowed choice"],
+  ] as const)("reports the first invalid input choice rule for %j", (choices, message) => {
+    const raw = configuration({
+      inputs: { target: { type: "string", default: "runner", choices } },
+    });
+    assertIssue(() => compileHubConfig(raw), `trigger run input target ${message}`, [
+      "triggers",
+      "run",
+      "inputs",
+    ]);
+  });
+});
+
+const storedContractIssue = "active configuration contains an invalid compiled workflow contract";
+
+function storedFixture() {
+  const config = compileHubConfig(
+    configuration({ inputs: { target: { type: "string", choices: ["runner"], required: true } } }),
+  );
+  const [environment] = config.environments;
+  const [trigger] = config.triggers;
+  const [step] = trigger?.steps ?? [];
+  assert.ok(environment && trigger && step);
+  return { environment, trigger, step };
+}
+
+function assertStoredIssue(value: unknown): void {
+  assertIssue(() => parseCompiledHubConfig(value), storedContractIssue);
+}
+
+describe("stored workflow contracts", () => {
+  it("rejects duplicate IDs and an invalid environment name", () => {
+    const { environment, trigger, step } = storedFixture();
+    assertStoredIssue({ environments: [environment, environment], triggers: [trigger] });
+    assertStoredIssue({ environments: [environment], triggers: [trigger, trigger] });
+    assertStoredIssue({
+      environments: [environment],
+      triggers: [{ ...trigger, steps: [step, step] }],
+    });
+    assertStoredIssue({ environments: [{ ...environment, name: "Runner" }], triggers: [trigger] });
+  });
+
+  it.each([
+    ["no steps", { steps: [] }],
+    ["an undeclared input filter", { filters: { inputs: { missing: "runner" } } }],
+    ["a mistyped input filter", { filters: { inputs: { target: 1 } } }],
+    ["a disallowed input filter choice", { filters: { inputs: { target: "elsewhere" } } }],
+    [
+      "mistyped input choices",
+      { inputs: { target: { type: "string", required: true, choices: [1] } } },
+    ],
+  ] as const)("rejects %s", (_name, fields) => {
+    const { environment, trigger } = storedFixture();
+    assertStoredIssue({ environments: [environment], triggers: [{ ...trigger, ...fields }] });
+  });
+
+  it.each([
+    ["idle greater than max", { idleTimeoutMs: 660_000 }],
+    [
+      "turn completion with an output",
+      { completeOnTurnEnd: true, output: { schema: { type: "object" } } },
+    ],
+    ["an invalid binary condition", { condition: { kind: "binary", operator: "invalid" } }],
+    [
+      "an invalid input path",
+      { condition: { kind: "path", value: { namespace: "paseo", path: ["inputs", 1] } } },
+    ],
+    [
+      "an invalid execution path",
+      { condition: { kind: "path", value: { namespace: "paseo", path: ["execution", "name"] } } },
+    ],
+    [
+      "an invalid step output path",
+      { condition: { kind: "path", value: { namespace: "steps", stepId: "work", path: [1] } } },
+    ],
+    [
+      "an invalid value path",
+      { condition: { kind: "path", value: { namespace: "values", name: 1 } } },
+    ],
+  ] as const)("rejects %s", (_name, fields) => {
+    const { environment, trigger, step } = storedFixture();
+    assertStoredIssue({
+      environments: [environment],
+      triggers: [{ ...trigger, steps: [{ ...step, ...fields }] }],
+    });
+  });
+});
