@@ -3,7 +3,7 @@ import type { EntitlementsService } from "../entitlements/service.js";
 import type { TriggerHandler, TriggerProvider } from "../triggers/index.js";
 import {
   createDurableWorkflowHandler,
-  DurableWorkflowEngine,
+  type DurableWorkflowEngine,
   type DurableWorkflowEngineOptions,
 } from "../workflows/engine.js";
 import type { LaunchMachineIntent } from "./launch-machine-intent.js";
@@ -66,6 +66,13 @@ export function createDispatcherWithEngine(options: DispatcherOptions): {
     ...(options.timelineReconciler === undefined
       ? {}
       : { timelineReconciler: options.timelineReconciler }),
+    ...workflowLifecycleOptions(options),
+  };
+  return createDurableWorkflowHandler(engineOptions);
+}
+
+function workflowLifecycleOptions(options: DispatcherOptions) {
+  return {
     ...(options.configurationRevisionId === undefined
       ? {}
       : { configurationRevisionId: options.configurationRevisionId }),
@@ -90,5 +97,4 @@ export function createDispatcherWithEngine(options: DispatcherOptions): {
       ? {}
       : { onWorkflowRunTerminal: options.onWorkflowRunTerminal }),
   };
-  return createDurableWorkflowHandler(engineOptions);
 }

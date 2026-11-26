@@ -62,6 +62,13 @@ describe("provider application failure copy", () => {
       messageFor("discord", new ProviderApplicationError("credentialsRejected", "clientSecret")),
       "Discord rejected the Client Secret. Nothing was saved. Open OAuth2, reset the Client Secret, copy it, then verify again.",
     );
+    assert.match(
+      messageFor(
+        "discord",
+        new ProviderApplicationError("credentialsRejected", "discordGatewayDisallowedIntents"),
+      ),
+      /^Discord rejected these credentials\./u,
+    );
   });
 
   it("does not collapse a wrong application into a rejected credential", () => {
