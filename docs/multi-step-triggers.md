@@ -82,7 +82,9 @@ match in agent, `env`, `github`, `background`, output schema and allowed outputs
 where two such steps differ, at `steps.N.continuation`, and says which fields differ. Give one step
 `continuation: new` or a different key. Each event is checked on its own. The reply tool a chat event adds
 to the last agent step, and a key written with inputs or event data, are checked when the step dispatches.
-A key written as a template is compared by its text when it reads nothing from the event. On Slack, Discord, Linear and GitHub events the reply output is added to the last
+A key written as a template is compared by its text when it reads nothing from the event.
+A conversation key belongs to the project, not to one trigger: two triggers in the same project that use
+the same key and match in the fields above share one session. On Slack, Discord, Linear and GitHub events the reply output is added to the last
 agent step, so two steps that both use `continuation: conversation` always differ there.
 
 ## Choosing between agents
