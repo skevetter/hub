@@ -27,7 +27,6 @@ test("shows quick destinations and the full organization navigation under More",
     "Home",
     "Activity",
     "Triggers",
-    "Attention",
     "More",
   ]);
   await expect(quick.getByRole("link", { name: "Home" })).toHaveAttribute("aria-current", "page");
@@ -105,7 +104,6 @@ test("phone navigation uses the rail outline in both themes", async ({ hub, page
     for (const control of [
       page.getByRole("button", { name: "Search", exact: true }),
       quick.getByRole("link", { name: "Activity" }),
-      quick.getByRole("button", { name: "Attention", exact: true }),
       more,
     ]) {
       await control.focus();

@@ -55,7 +55,6 @@ import { TriggerDashboard } from "./triggers/dashboard.js";
 import type { ProviderApplications } from "./provider-applications/index.js";
 import { DaemonProviderCatalog } from "./daemons/provider-catalog.js";
 import { HomeDashboard } from "./home/dashboard.js";
-import { AttentionDashboard } from "./attention/dashboard.js";
 import type { ScriptLimits } from "./workflows/script-limits.js";
 import { runShutdownStage } from "./shutdown-stage.js";
 import type { TriggerSource } from "./triggers/index.js";
@@ -283,7 +282,6 @@ function createApplicationSurface(input: ApplicationSurfaceOptions): Application
     ),
     daemonProviderCatalog: daemonProviderCatalogFor(options, application.hub),
     homeDashboard: homeDashboardFor(options, connections),
-    attentionDashboard: attentionDashboardFor(options),
     ...entitlementSurfaces(options),
     testTriggerRoutes: options.testTriggerRoutes ?? false,
     auth: (request) => {
@@ -979,13 +977,6 @@ function homeDashboardFor(
       [...connections.values()].some((connection) => isConfigured(connection.status(bindings))),
     { interactiveSessions: options.interactiveSessions?.enabled === true },
   );
-}
-
-function attentionDashboardFor(options: ApplicationCompositionOptions): AttentionDashboard | null {
-  if (options.database === null || options.auth === null) return null;
-  return new AttentionDashboard(options.database, options.auth, {
-    interactiveSessions: options.interactiveSessions?.enabled === true,
-  });
 }
 
 function isConfigured(status: unknown): boolean {

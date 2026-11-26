@@ -1,5 +1,4 @@
 import { expect, type Locator, type Page } from "@playwright/test";
-import { openAttention } from "./attention.js";
 
 const ROUTING_ATTENTION_TITLE = "2 events dropped in the last 7 days";
 
@@ -71,17 +70,16 @@ export class OrganizationHome {
     await this.step(title).getByRole("link", { name, exact: true }).click();
   }
 
-  async openRoutingAttention() {
+  async expectNoRoutingNotice() {
     await expect(this.page.getByRole("main").getByText(ROUTING_ATTENTION_TITLE)).toHaveCount(0);
-    const dialog = await openAttention(this.page, 0);
-    return dialog.getByRole("region", { name: "For information" }).getByRole("listitem");
   }
 
-  async followRoutingAttention(item: Locator) {
-    const link = item.getByRole("link", { name: "View dropped events", exact: true });
-    await expect(link).toBeVisible();
-    await link.click();
-    await expect(this.page).toHaveURL(/[?&]view=dropped/u);
+  async openDroppedEvents() {
+    await this.page.goto(new URL("./activity?view=dropped&range=7d", this.page.url()).toString());
+    await expect(this.page.getByRole("table", { name: "Dropped events" })).toBeVisible();
+  }
+
+  async createTriggerFromDroppedEvents() {
     await this.page
       .getByRole("table", { name: "Dropped events" })
       .getByRole("link", { name: "Create one", exact: true })

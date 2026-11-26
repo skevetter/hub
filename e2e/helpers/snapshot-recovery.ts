@@ -22,7 +22,7 @@ export class SnapshotRecovery {
   }
 
   private async watchRead(endpoint: ReadEndpoint, payloadMarker: string) {
-    // Discover the built function path so unrelated reads (such as Attention) cannot affect counts.
+    // Discover the built function path so unrelated reads cannot affect counts.
     const response = await this.page.waitForResponse(async (candidate) => {
       if (!new URL(candidate.url()).pathname.startsWith("/_serverFn/")) return false;
       if (candidate.request().method() !== "GET" || !candidate.ok()) return false;

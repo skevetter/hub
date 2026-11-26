@@ -1,7 +1,6 @@
 import { join } from "node:path";
 import { expect } from "@playwright/test";
 import { test } from "./app.js";
-import { openAttention } from "./helpers/attention.js";
 import { projectApp } from "./helpers/projects/index.js";
 
 test.use({ providerScenario: "slack-only" });
@@ -88,17 +87,7 @@ for (const width of [1280, 390]) {
     await expect(page).toHaveURL(/\/triggers\/new\/edit$/u);
 
     await openSection("Home");
-    await page.reload();
-    const attention = await openAttention(page, 0);
-    const information = attention.getByRole("region", { name: "For information" });
-    const dropped = information.getByRole("listitem");
-    await expect(dropped).toContainText("22 events dropped in the last 7 days");
-    await dropped.getByRole("link", { name: "View dropped events", exact: true }).click();
-    await expect(page).toHaveURL(/\/activity\?/u);
-    expect(Object.fromEntries(new URL(page.url()).searchParams)).toEqual({
-      view: "dropped",
-      range: "7d",
-    });
+    await page.goto(new URL("./activity?view=dropped&range=7d", page.url()).toString());
     await expect(rows).toHaveCount(15);
     await expect(pager.getByRole("button", { name: "Newer", exact: true })).toBeDisabled();
     await expect(page.getByRole("combobox", { name: "Provider" })).toHaveValue("");

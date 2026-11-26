@@ -1,13 +1,3 @@
-import {
-  countFailedRunsSince,
-  countUnseenFailedRuns,
-  hasActiveSessionProfile,
-  listSessionsWaitingForPermission,
-  markFailedRunsSeen,
-  readFailedRunsSeenThrough,
-  readSessionAttention,
-} from "../attention/queries.js";
-import { listTriggerMatchActivity } from "../attention/trigger-matches.js";
 import { organizationConnectionUsage } from "./connection-usage.js";
 import { ACTIVE_TRIGGER_REVISIONS_SQL, summarizeTriggerRuns } from "../home/queries.js";
 import { runStatusesFor } from "../triggers/run-status.js";
@@ -4426,30 +4416,6 @@ class PgDatabase implements Database {
 
   summarizeTriggerRuns: Database["summarizeTriggerRuns"] = (...args) =>
     summarizeTriggerRuns(this.pool, ...args);
-
-  listTriggerMatchActivity: Database["listTriggerMatchActivity"] = (...args) =>
-    listTriggerMatchActivity(this.pool, ...args);
-
-  countFailedRunsSince: Database["countFailedRunsSince"] = (...args) =>
-    countFailedRunsSince(this.pool, ...args);
-
-  countUnseenFailedRuns: Database["countUnseenFailedRuns"] = (...args) =>
-    countUnseenFailedRuns(this.pool, ...args);
-
-  readSessionAttention: Database["readSessionAttention"] = (...args) =>
-    readSessionAttention(this.pool, ...args);
-
-  readFailedRunsSeenThrough: Database["readFailedRunsSeenThrough"] = (...args) =>
-    readFailedRunsSeenThrough(this.pool, ...args);
-
-  markFailedRunsSeen: Database["markFailedRunsSeen"] = (...args) =>
-    markFailedRunsSeen(this.pool, ...args);
-
-  hasActiveSessionProfile: Database["hasActiveSessionProfile"] = (organizationId) =>
-    hasActiveSessionProfile(this.pool, organizationId);
-
-  listSessionsWaitingForPermission: Database["listSessionsWaitingForPermission"] = (...args) =>
-    listSessionsWaitingForPermission(this.pool, ...args);
 
   listDroppedEventPage(organizationId: string, request: DroppedEventPageRequest) {
     return readDroppedEventPage(this.pool, organizationId, request);
