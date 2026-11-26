@@ -1,5 +1,4 @@
-import assert from "node:assert/strict";
-import { test } from "node:test";
+import { describe, expect, it } from "vitest";
 import { createAssistantTextRedactor } from "./redact.js";
 
 const redactor = createAssistantTextRedactor(["swordfish", "abaabab", "", "swordfish"]);
@@ -40,11 +39,13 @@ const batchCases: [string[], boolean, string[]][] = [
   ],
 ];
 
-for (const [index, [parts, truncated, expected]] of batchCases.entries()) {
-  await test(`batch redaction ${index}`, () => {
-    assert.deepEqual(redactor.redact(parts, truncated), expected);
-  });
-}
+describe("batch redaction", () => {
+  for (const [index, [parts, truncated, expected]] of batchCases.entries()) {
+    it(`batch redaction ${index}`, () => {
+      expect(redactor.redact(parts, truncated)).toStrictEqual(expected);
+    });
+  }
+});
 
 const streamingCases = [
   ["prefix swo", "rdfish suffix", true, "prefix ", "[redacted] suffix"],
@@ -56,11 +57,16 @@ const streamingCases = [
   ["---BEGIN TEST---\nprivate", "\n---END TEST--- tail", false, "[redacted]", " tail"],
 ] as const;
 
-for (const [index, [first, second, boundary, firstSafe, secondSafe]] of streamingCases.entries()) {
-  await test(`streaming redaction ${index}`, () => {
-    const stream = redactor.open();
-    assert.deepEqual(stream(first, [first], first.length, boundary, false), [firstSafe]);
-    assert.deepEqual(stream("", ["", ""], 0, false, false), ["", ""]);
-    assert.deepEqual(stream(second, [second], second.length, false, true), [secondSafe]);
-  });
-}
+describe("streaming redaction", () => {
+  for (const [
+    index,
+    [first, second, boundary, firstSafe, secondSafe],
+  ] of streamingCases.entries()) {
+    it(`streaming redaction ${index}`, () => {
+      const stream = redactor.open();
+      expect(stream(first, [first], first.length, boundary, false)).toStrictEqual([firstSafe]);
+      expect(stream("", ["", ""], 0, false, false)).toStrictEqual(["", ""]);
+      expect(stream(second, [second], second.length, false, true)).toStrictEqual([secondSafe]);
+    });
+  }
+});
