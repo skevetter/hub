@@ -424,10 +424,17 @@ function operatorPrecedence(operator: BinaryOperator): number {
   return 4;
 }
 
+const FORBIDDEN_CONTEXT_KEYS = new Set(["constructor", "prototype", "__proto__"]);
+
+function readOwnContextKey<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
+  if (FORBIDDEN_CONTEXT_KEYS.has(key) || !Object.hasOwn(record, key)) return undefined;
+  return record[key];
+}
+
 function readPath(path: ExpressionPath, context: ExpressionContext): JsonValue {
   if (path.namespace === "paseo") return readPaseoPath(path.path, context);
   if (path.namespace === "values") {
-    const expression = context.values[path.name];
+    const expression = readOwnContextKey(context.values, path.name);
     if (expression === undefined)
       throw new ExpressionEvaluationError(`value ${path.name} is unavailable`);
     return evaluateExpression(expression, context);
@@ -439,7 +446,7 @@ function readStepOutput(
   path: Extract<ExpressionPath, { namespace: "steps" }>,
   context: ExpressionContext,
 ): JsonValue {
-  const step = context.steps[path.stepId];
+  const step = readOwnContextKey(context.steps, path.stepId);
   if (step === undefined || step.status !== "succeeded") {
     throw new ExpressionEvaluationError(`output from step ${path.stepId} is unavailable`);
   }
@@ -468,7 +475,7 @@ function readPaseoPath(
     }
     return context.executionId;
   }
-  return context.inputs[path[1]] ?? null;
+  return readOwnContextKey(context.inputs, path[1]) ?? null;
 }
 
 function truthy(value: JsonValue): boolean {
