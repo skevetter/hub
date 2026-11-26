@@ -47,13 +47,13 @@ describe("dynamic provider runtime", () => {
         });
         await vi.advanceTimersByTimeAsync(0);
         assert.equal(readOpen.mock.calls.length, 0);
-        const candidate = await providerRuntime.prepare(
-          "linear",
-          providerConfiguration("linear", "app"),
-          "https://hub.test",
-          providerIdentity("linear", "app"),
-          1,
-        );
+        const candidate = await providerRuntime.prepare({
+          provider: "linear",
+          configuration: providerConfiguration("linear", "app"),
+          callbackOrigin: "https://hub.test",
+          identity: providerIdentity("linear", "app"),
+          configurationVersion: 1,
+        });
         await candidate.start();
         candidate.publish();
         await vi.advanceTimersByTimeAsync(SWEEP_MS);
@@ -94,13 +94,13 @@ describe("dynamic provider runtime", () => {
     for (const registration of runtime.registrations()) {
       for (const output of registration.outputs) registry.register(output);
     }
-    const candidate = await runtime.prepare(
-      "github",
-      providerConfiguration("github", "A1"),
-      "https://hub.test",
-      providerIdentity("github", "A1"),
-      1,
-    );
+    const candidate = await runtime.prepare({
+      provider: "github",
+      configuration: providerConfiguration("github", "A1"),
+      callbackOrigin: "https://hub.test",
+      identity: providerIdentity("github", "A1"),
+      configurationVersion: 1,
+    });
     await candidate.start();
     candidate.publish();
     const outputContext = {
@@ -162,13 +162,13 @@ describe("dynamic provider runtime", () => {
       },
     })!;
 
-    const candidate = await runtime.prepare(
-      "github",
-      providerConfiguration("github", "A1"),
-      "https://hub.test",
-      providerIdentity("github", "A1"),
-      1,
-    );
+    const candidate = await runtime.prepare({
+      provider: "github",
+      configuration: providerConfiguration("github", "A1"),
+      callbackOrigin: "https://hub.test",
+      identity: providerIdentity("github", "A1"),
+      configurationVersion: 1,
+    });
     await candidate.start();
     candidate.publish();
 
@@ -191,13 +191,13 @@ describe("dynamic provider runtime", () => {
       .find((registration) => registration.connection.name === "slack")!;
     await stable.sources[0]!.start(() => Promise.resolve());
 
-    const first = await runtime.prepare(
-      "slack",
-      slackConfiguration("A1"),
-      "https://hub.test",
-      { provider: "slack", id: "A1", name: "A1" },
-      1,
-    );
+    const first = await runtime.prepare({
+      provider: "slack",
+      configuration: slackConfiguration("A1"),
+      callbackOrigin: "https://hub.test",
+      identity: { provider: "slack", id: "A1", name: "A1" },
+      configurationVersion: 1,
+    });
     await first.start();
     first.publish();
     const trigger = stable.triggerProviders[0]!({
@@ -212,13 +212,13 @@ describe("dynamic provider runtime", () => {
     if (typeof matches === "string") throw new Error("expected a match");
     const oldMatch = matches[0];
 
-    const second = await runtime.prepare(
-      "slack",
-      slackConfiguration("A2"),
-      "https://hub.test",
-      { provider: "slack", id: "A2", name: "A2" },
-      2,
-    );
+    const second = await runtime.prepare({
+      provider: "slack",
+      configuration: slackConfiguration("A2"),
+      callbackOrigin: "https://hub.test",
+      identity: { provider: "slack", id: "A2", name: "A2" },
+      configurationVersion: 2,
+    });
     await second.start();
     second.publish();
     await new Promise((resolve) => setImmediate(resolve));
@@ -263,13 +263,13 @@ describe("dynamic provider runtime", () => {
         throw new Error("unused");
       },
     })!;
-    const first = await runtime.prepare(
-      "slack",
-      slackConfiguration("A1"),
-      "https://hub.test",
-      { provider: "slack", id: "A1", name: "A1" },
-      1,
-    );
+    const first = await runtime.prepare({
+      provider: "slack",
+      configuration: slackConfiguration("A1"),
+      callbackOrigin: "https://hub.test",
+      identity: { provider: "slack", id: "A1", name: "A1" },
+      configurationVersion: 1,
+    });
     await first.start();
     first.publish();
     const matches = await trigger.match(externalTrigger());
@@ -282,13 +282,13 @@ describe("dynamic provider runtime", () => {
       triggerContext: match.triggerContext,
     });
 
-    const second = await runtime.prepare(
-      "slack",
-      slackConfiguration("A2"),
-      "https://hub.test",
-      { provider: "slack", id: "A2", name: "A2" },
-      2,
-    );
+    const second = await runtime.prepare({
+      provider: "slack",
+      configuration: slackConfiguration("A2"),
+      callbackOrigin: "https://hub.test",
+      identity: { provider: "slack", id: "A2", name: "A2" },
+      configurationVersion: 2,
+    });
     await second.start();
     second.publish();
 
@@ -335,22 +335,22 @@ describe("dynamic provider runtime", () => {
         throw new Error("unused");
       },
     })!;
-    const githubCandidate = await runtime.prepare(
-      "github",
-      providerConfiguration("github", "A1"),
-      "https://hub.test",
-      providerIdentity("github", "A1"),
-      1,
-    );
+    const githubCandidate = await runtime.prepare({
+      provider: "github",
+      configuration: providerConfiguration("github", "A1"),
+      callbackOrigin: "https://hub.test",
+      identity: providerIdentity("github", "A1"),
+      configurationVersion: 1,
+    });
     await githubCandidate.start();
     githubCandidate.publish();
-    const discordCandidate = await runtime.prepare(
-      "discord",
-      providerConfiguration("discord", "D1"),
-      "https://hub.test",
-      providerIdentity("discord", "D1"),
-      1,
-    );
+    const discordCandidate = await runtime.prepare({
+      provider: "discord",
+      configuration: providerConfiguration("discord", "D1"),
+      callbackOrigin: "https://hub.test",
+      identity: providerIdentity("discord", "D1"),
+      configurationVersion: 1,
+    });
     await discordCandidate.start();
     discordCandidate.publish();
 
@@ -418,13 +418,13 @@ describe("dynamic provider runtime", () => {
       .registrations()
       .find((registration) => registration.connection.name === "github")!;
     await stable.sources[0]!.start(() => Promise.resolve());
-    const first = await runtime.prepare(
-      "github",
-      providerConfiguration("github", "A1"),
-      "https://hub.test",
-      providerIdentity("github", "A1"),
-      1,
-    );
+    const first = await runtime.prepare({
+      provider: "github",
+      configuration: providerConfiguration("github", "A1"),
+      callbackOrigin: "https://hub.test",
+      identity: providerIdentity("github", "A1"),
+      configurationVersion: 1,
+    });
     await first.start();
     first.publish();
     const trigger = stable.triggerProviders[0]!({
@@ -445,13 +445,13 @@ describe("dynamic provider runtime", () => {
       triggerContext: match.triggerContext,
     });
 
-    const second = await runtime.prepare(
-      "github",
-      providerConfiguration("github", "A2"),
-      "https://hub.test",
-      providerIdentity("github", "A2"),
-      2,
-    );
+    const second = await runtime.prepare({
+      provider: "github",
+      configuration: providerConfiguration("github", "A2"),
+      callbackOrigin: "https://hub.test",
+      identity: providerIdentity("github", "A2"),
+      configurationVersion: 2,
+    });
     await second.start();
     second.publish();
 
@@ -494,22 +494,22 @@ describe("dynamic provider runtime", () => {
       .registrations()
       .find((registration) => registration.connection.name === "slack")!;
     await stable.sources[0]!.start(() => Promise.resolve());
-    const first = await runtime.prepare(
-      "slack",
-      slackConfiguration("A1"),
-      "https://hub.test",
-      { provider: "slack", id: "A1", name: "A1" },
-      1,
-    );
+    const first = await runtime.prepare({
+      provider: "slack",
+      configuration: slackConfiguration("A1"),
+      callbackOrigin: "https://hub.test",
+      identity: { provider: "slack", id: "A1", name: "A1" },
+      configurationVersion: 1,
+    });
     await first.start();
     first.publish();
-    const failed = await runtime.prepare(
-      "slack",
-      slackConfiguration("A2"),
-      "https://hub.test",
-      { provider: "slack", id: "A2", name: "A2" },
-      2,
-    );
+    const failed = await runtime.prepare({
+      provider: "slack",
+      configuration: slackConfiguration("A2"),
+      callbackOrigin: "https://hub.test",
+      identity: { provider: "slack", id: "A2", name: "A2" },
+      configurationVersion: 2,
+    });
 
     await assert.rejects(() => failed.start(), /start failed/u);
     await failed.close();
@@ -533,13 +533,13 @@ describe("dynamic provider runtime", () => {
         .registrations()
         .find((registration) => registration.connection.name === provider)!;
       await stable.sources[0]!.start(() => Promise.resolve());
-      const candidate = await runtime.prepare(
+      const candidate = await runtime.prepare({
         provider,
-        providerConfiguration(provider, "one"),
-        "https://hub.test",
-        providerIdentity(provider, "one"),
-        1,
-      );
+        configuration: providerConfiguration(provider, "one"),
+        callbackOrigin: "https://hub.test",
+        identity: providerIdentity(provider, "one"),
+        configurationVersion: 1,
+      });
 
       await candidate.start();
       candidate.publish();
@@ -566,22 +566,22 @@ describe("dynamic provider runtime", () => {
         .registrations()
         .find((registration) => registration.connection.name === provider)!;
       await stable.sources[0]!.start(() => Promise.resolve());
-      const first = await runtime.prepare(
+      const first = await runtime.prepare({
         provider,
-        providerConfiguration(provider, "one"),
-        "https://hub.test",
-        providerIdentity(provider, "one"),
-        1,
-      );
+        configuration: providerConfiguration(provider, "one"),
+        callbackOrigin: "https://hub.test",
+        identity: providerIdentity(provider, "one"),
+        configurationVersion: 1,
+      });
       await first.start();
       first.publish();
-      const replacement = await runtime.prepare(
+      const replacement = await runtime.prepare({
         provider,
-        providerConfiguration(provider, "two"),
-        "https://hub.test",
-        providerIdentity(provider, "two"),
-        2,
-      );
+        configuration: providerConfiguration(provider, "two"),
+        callbackOrigin: "https://hub.test",
+        identity: providerIdentity(provider, "two"),
+        configurationVersion: 2,
+      });
 
       await assert.rejects(() => replacement.start(), /start failed/u);
       await replacement.close();
@@ -613,13 +613,13 @@ describe("dynamic provider runtime", () => {
         configurationSnapshot: { version: configurationVersion, callbackOrigin },
       }),
     });
-    const active = await runtime.prepare(
-      "slack",
-      slackConfiguration("new"),
-      "https://new-origin.test",
-      { provider: "slack", id: "new", name: "New" },
-      2,
-    );
+    const active = await runtime.prepare({
+      provider: "slack",
+      configuration: slackConfiguration("new"),
+      callbackOrigin: "https://new-origin.test",
+      identity: { provider: "slack", id: "new", name: "New" },
+      configurationVersion: 2,
+    });
     active.publish();
     const stable = runtime
       .registrations()
@@ -659,24 +659,24 @@ describe("dynamic provider runtime", () => {
       accepted.push(String(event.payload));
       return Promise.resolve();
     });
-    const first = await runtime.prepare(
-      "slack",
-      slackConfiguration("one"),
-      "https://hub.test",
-      { provider: "slack", id: "one", name: "One" },
-      1,
-    );
+    const first = await runtime.prepare({
+      provider: "slack",
+      configuration: slackConfiguration("one"),
+      callbackOrigin: "https://hub.test",
+      identity: { provider: "slack", id: "one", name: "One" },
+      configurationVersion: 1,
+    });
     await first.start();
     await assert.rejects(sourceHandlers.get("one")!(durableEvent("before-first-publish")));
     first.publish();
     await sourceHandlers.get("one")!(durableEvent("first-active"));
-    const second = await runtime.prepare(
-      "slack",
-      slackConfiguration("two"),
-      "https://hub.test",
-      { provider: "slack", id: "two", name: "Two" },
-      2,
-    );
+    const second = await runtime.prepare({
+      provider: "slack",
+      configuration: slackConfiguration("two"),
+      callbackOrigin: "https://hub.test",
+      identity: { provider: "slack", id: "two", name: "Two" },
+      configurationVersion: 2,
+    });
     await second.start();
     await assert.rejects(sourceHandlers.get("two")!(durableEvent("before-second-publish")));
     second.publish();

@@ -128,17 +128,17 @@ export interface ProviderRuntimeCandidate {
 }
 
 export interface ProviderRuntimeOwner {
-  prepare(
-    provider: Provider,
-    configuration: ProviderApplicationConfiguration,
-    callbackOrigin: string,
-    identity: ProviderApplicationIdentity,
-    configurationVersion: number,
+  prepare(options: {
+    provider: Provider;
+    configuration: ProviderApplicationConfiguration;
+    callbackOrigin: string;
+    identity: ProviderApplicationIdentity;
+    configurationVersion: number;
     activation?: {
       expectedConfigurationVersion: number | undefined;
       activateConfiguration: boolean;
-    },
-  ): Promise<ProviderRuntimeCandidate>;
+    };
+  }): Promise<ProviderRuntimeCandidate>;
   identity?(provider: Provider): ProviderApplicationIdentity | undefined;
   onSlackInstallation?(
     handler: (input: {
@@ -579,13 +579,13 @@ async function beginStoredConnection(
   if (identity === undefined) throw new ProviderApplicationError("invalidInput");
   let candidate: ProviderRuntimeCandidate | undefined;
   try {
-    const prepared = await options.runtime.prepare(
+    const prepared = await options.runtime.prepare({
       provider,
       configuration,
       callbackOrigin,
       identity,
       configurationVersion,
-    );
+    });
     candidate = prepared;
     if (prepared.beginConnection === undefined) {
       throw new Error("provider connection unavailable");
@@ -664,13 +664,13 @@ async function activateSlackSocket(
   };
   let candidate: ProviderRuntimeCandidate | undefined;
   try {
-    candidate = await options.runtime.prepare(
-      "slack",
+    candidate = await options.runtime.prepare({
+      provider: "slack",
       configuration,
-      await safeCallbackOrigin(options, request),
+      callbackOrigin: await safeCallbackOrigin(options, request),
       identity,
-      (input.expectedVersion ?? 0) + 1,
-    );
+      configurationVersion: (input.expectedVersion ?? 0) + 1,
+    });
     await candidate.start();
     const saved = await options.store.completeSlackSocketApplication({
       configuration,
@@ -925,13 +925,13 @@ export async function activateProviderApplicationsAtStartup(
       rejectStartupIdentityConflict(identity, stored, connections, claimLegacyConnections);
       preparing = true;
       const configurationVersion = activeVersion(environmentConfiguration, stored);
-      candidate = await options.runtime.prepare(
+      candidate = await options.runtime.prepare({
         provider,
         configuration,
-        options.callbackOrigin,
+        callbackOrigin: options.callbackOrigin,
         identity,
         configurationVersion,
-      );
+      });
       await candidate.start();
       if (
         claimLegacyConnections &&
@@ -1028,17 +1028,17 @@ async function beginSlackConfiguration(
   if (organizationId === null || options.beginCandidateConnection === undefined) {
     throw new ProviderApplicationError("invalidInput");
   }
-  const candidate = await options.runtime.prepare(
-    "slack",
-    withoutExpectedVersion(input),
+  const candidate = await options.runtime.prepare({
+    provider: "slack",
+    configuration: withoutExpectedVersion(input),
     callbackOrigin,
-    { provider: "slack", id: input.appId, name: input.appId },
-    (input.expectedVersion ?? 0) + 1,
-    {
+    identity: { provider: "slack", id: input.appId, name: input.appId },
+    configurationVersion: (input.expectedVersion ?? 0) + 1,
+    activation: {
       expectedConfigurationVersion: input.expectedVersion,
       activateConfiguration: true,
     },
-  );
+  });
   if (candidate.beginConnection === undefined) {
     await closeCandidate(candidate, "slack", "begin_configuration");
     throw new ProviderApplicationError("internal");
@@ -1082,17 +1082,17 @@ async function beginLinearConfiguration(
   if (organizationId === null || options.beginCandidateConnection === undefined) {
     throw new ProviderApplicationError("invalidInput");
   }
-  const candidate = await options.runtime.prepare(
-    "linear",
-    withoutExpectedVersion(input),
+  const candidate = await options.runtime.prepare({
+    provider: "linear",
+    configuration: withoutExpectedVersion(input),
     callbackOrigin,
-    { provider: "linear", id: input.clientId, name: "Linear app" },
-    (input.expectedVersion ?? 0) + 1,
-    {
+    identity: { provider: "linear", id: input.clientId, name: "Linear app" },
+    configurationVersion: (input.expectedVersion ?? 0) + 1,
+    activation: {
       expectedConfigurationVersion: input.expectedVersion,
       activateConfiguration: true,
     },
-  );
+  });
   if (candidate.beginConnection === undefined) {
     await closeCandidate(candidate, "linear", "begin_configuration");
     throw new ProviderApplicationError("internal");
@@ -1136,13 +1136,13 @@ async function verifyAndActivateProvider(
   }
   let candidate: ProviderRuntimeCandidate | undefined;
   try {
-    candidate = await options.runtime.prepare(
+    candidate = await options.runtime.prepare({
       provider,
-      withoutExpectedVersion(input),
+      configuration: withoutExpectedVersion(input),
       callbackOrigin,
       identity,
-      (input.expectedVersion ?? 0) + 1,
-    );
+      configurationVersion: (input.expectedVersion ?? 0) + 1,
+    });
     await candidate.start();
     const saved = await options.store.save({
       provider,
@@ -1230,13 +1230,13 @@ async function completeSlackInstallation(
   }
   let candidate: ProviderRuntimeCandidate | undefined;
   try {
-    candidate = await options.runtime.prepare(
-      "slack",
+    candidate = await options.runtime.prepare({
+      provider: "slack",
       configuration,
-      input.callbackOrigin,
+      callbackOrigin: input.callbackOrigin,
       identity,
-      (input.expectedConfigurationVersion ?? 0) + 1,
-    );
+      configurationVersion: (input.expectedConfigurationVersion ?? 0) + 1,
+    });
     await candidate.start();
     await options.store.completeSlackInstallation({
       configuration,
@@ -1283,13 +1283,13 @@ async function completeLinearInstallation(
   }
   let candidate: ProviderRuntimeCandidate | undefined;
   try {
-    candidate = await options.runtime.prepare(
-      "linear",
+    candidate = await options.runtime.prepare({
+      provider: "linear",
       configuration,
-      input.callbackOrigin,
+      callbackOrigin: input.callbackOrigin,
       identity,
-      (input.expectedConfigurationVersion ?? 0) + 1,
-    );
+      configurationVersion: (input.expectedConfigurationVersion ?? 0) + 1,
+    });
     await candidate.start();
     await options.store.completeLinearInstallation({
       configuration,

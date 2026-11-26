@@ -97,8 +97,6 @@ interface DynamicProviderRuntimeOptions {
   }) => ProviderRegistration;
 }
 
-type PrepareArguments = Parameters<ProviderRuntimeOwner["prepare"]>;
-
 interface BuildRegistrationInput {
   provider: Provider;
   configuration: ProviderApplicationConfiguration;
@@ -134,10 +132,6 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
     };
   }
 
-  static {
-    Object.defineProperty(Reflect.get(this.prototype, "prepare"), "length", { value: 6 });
-  }
-
   registrations(): readonly ProviderRegistration[] {
     return [this.stable.github, this.stable.discord, this.stable.slack, this.stable.linear];
   }
@@ -162,16 +156,14 @@ export class DynamicProviderRuntime implements ProviderRuntimeOwner {
     this.linearInstallationHandler = handler;
   }
 
-  async prepare(
-    ...[
-      provider,
-      configuration,
-      callbackOrigin,
-      identity,
-      configurationVersion,
-      activation,
-    ]: PrepareArguments
-  ): Promise<ProviderRuntimeCandidate> {
+  async prepare({
+    provider,
+    configuration,
+    callbackOrigin,
+    identity,
+    configurationVersion,
+    activation,
+  }: Parameters<ProviderRuntimeOwner["prepare"]>[0]): Promise<ProviderRuntimeCandidate> {
     const registration = this.build({
       provider,
       configuration,

@@ -811,11 +811,11 @@ class BlockingRuntime implements ProviderRuntimeOwner {
     return this.linearInstallationHandler(input);
   }
 
-  prepare(
-    ...[provider, configuration, , , configurationVersion]: Parameters<
-      ProviderRuntimeOwner["prepare"]
-    >
-  ): Promise<ProviderRuntimeCandidate> {
+  prepare({
+    provider,
+    configuration,
+    configurationVersion,
+  }: Parameters<ProviderRuntimeOwner["prepare"]>[0]): Promise<ProviderRuntimeCandidate> {
     const candidate = new Candidate(
       provider,
       this,

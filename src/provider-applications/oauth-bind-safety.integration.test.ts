@@ -465,7 +465,9 @@ async function databaseFixture(engine: "PGlite" | "PostgreSQL"): Promise<{
 class RecordingRuntime implements ProviderRuntimeOwner {
   readonly published: Provider[] = [];
 
-  prepare(provider: Provider): Promise<ProviderRuntimeCandidate> {
+  prepare({
+    provider,
+  }: Parameters<ProviderRuntimeOwner["prepare"]>[0]): Promise<ProviderRuntimeCandidate> {
     return Promise.resolve({
       start: () => Promise.resolve(),
       publish: () => this.published.push(provider),
