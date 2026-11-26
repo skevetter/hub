@@ -48,6 +48,19 @@ function hasOrderedSchemaIssues(error: unknown): boolean {
   return true;
 }
 
+function assertIssue(
+  run: () => unknown,
+  message: string,
+  path?: readonly (string | number)[],
+): void {
+  assert.throws(run, (error) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, message);
+    assert.deepEqual(Reflect.get(error, "path"), path);
+    return true;
+  });
+}
+
 describe("compiler characterization", () => {
   it("reports authored issues in schema order", () => {
     const raw = configuration(
@@ -172,5 +185,101 @@ describe("compiler characterization", () => {
         ),
       /env\.GH_TOKEN.*paseo\.connections/u,
     );
+  });
+});
+
+const scriptStep = { id: "work", environment: "runner", max_runtime: "10m", script: "true" };
+const notificationPrefix =
+  "trigger run runs a script on github.notification, which has no actor to allowlist.";
+const notificationFromUsers =
+  "trigger run: github.notification has no commenter or author, so it does not accept from_users.";
+const notificationReasons = "author, assign, review_requested, state_change, ci_activity";
+
+describe("trigger launch security", () => {
+  it.each([undefined, [], ["maintainer", "*"]].map((users) => ({ users })))(
+    "requires named script actors: $users",
+    ({ users }) => {
+      const raw = configuration({
+        on: "github.push",
+        filters: { from_users: users },
+        steps: [scriptStep],
+      });
+      assertIssue(
+        () => compileHubConfig(raw),
+        "trigger run runs a script, so github.push needs filters.from_users that names the people allowed to start it. A wildcard or empty list would let anyone who can reach this event run code on the host.",
+      );
+    },
+  );
+
+  it.each([
+    ["scheduled script", { on: "schedule.tick", steps: [scriptStep] }],
+    [
+      "named script actor",
+      { on: "github.push", filters: { from_users: ["maintainer"] }, steps: [scriptStep] },
+    ],
+    [
+      "protected notification",
+      {
+        on: "github.notification",
+        filters: { repo: "owner/repo", reason: "review_requested" },
+        steps: [scriptStep],
+      },
+    ],
+    ["Hub event without actors", { on: "manual.run" }],
+    ["project-scoped scout", { on: "linear.issue_entered_scope", filters: { project: "project" } }],
+  ] as const)("accepts %s", (_name, trigger) => {
+    const compiled = compileHubConfig(configuration(trigger));
+    assert.equal(compiled.triggers[0]?.on, trigger.on);
+    assert.deepEqual(parseCompiledHubConfig(compiled), compiled);
+  });
+
+  it("reports missing notification repository before rejecting from_users", () => {
+    const on = "github.notification";
+    const steps = [scriptStep];
+    const filters = { reason: "review_requested", from_users: ["maintainer"] };
+    assertIssue(
+      () => compileHubConfig(configuration({ on, steps, filters })),
+      `${notificationPrefix} Set both filters.repo and filters.reason. reason must be one of ${notificationReasons}.`,
+    );
+    assertIssue(
+      () =>
+        compileHubConfig(configuration({ on, steps, filters: { ...filters, repo: "owner/repo" } })),
+      notificationFromUsers,
+    );
+  });
+
+  it("requires a notification reason and rejects an unsafe reason", () => {
+    const on = "github.notification";
+    const steps = [scriptStep];
+    const filters = { repo: "owner/repo" };
+    assertIssue(
+      () => compileHubConfig(configuration({ on, steps, filters })),
+      `${notificationPrefix} Set both filters.repo and filters.reason. reason must be one of ${notificationReasons}.`,
+    );
+    assertIssue(
+      () =>
+        compileHubConfig(configuration({ on, steps, filters: { ...filters, reason: "mention" } })),
+      `${notificationPrefix} filters.reason "mention" is not allowed for a script. Use one of ${notificationReasons}. Third parties can cause mention, team_mention, comment, subscribed and manual notifications, so those could let an outsider run code on the host.`,
+    );
+  });
+
+  it.each([
+    [
+      "notification actors",
+      { on: "github.notification", filters: { from_users: [] } },
+      notificationFromUsers,
+    ],
+    [
+      "empty external audience",
+      { on: "github.push", filters: { from_users: [] } },
+      "trigger run requires a non-empty filters.from_users allowlist for externally sourced events",
+    ],
+    [
+      "scout with only an audience",
+      { on: "linear.issue_entered_scope", filters: { from_users: ["maintainer"] } },
+      "trigger run requires filters.project for linear.issue_entered_scope",
+    ],
+  ] as const)("rejects %s", (_name, trigger, message) => {
+    assertIssue(() => compileHubConfig(configuration(trigger)), message);
   });
 });
