@@ -18,7 +18,7 @@ export const SHARED_YAML_FIELD =
   "This field is shared with another field through a YAML anchor. Edit it in YAML.";
 
 export const BROKEN_YAML_ALIAS =
-  "This change would break a YAML alias. Edit the anchor or alias in YAML first.";
+  "This change would break a YAML alias. Save the step change and the other edits separately, or edit the anchor and alias in YAML.";
 
 export function isYamlAliasRefusal(cause: unknown): boolean {
   return (

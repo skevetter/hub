@@ -65,7 +65,7 @@ const ANCHORED_STEPS = STEPS.replace("prompt: Plan it.", "prompt: &p Plan it.")
   .replace("    if: \"${{ steps.plan.outputs.verdict == 'fix' }}\"\n", "");
 
 const ALIAS_REFUSAL =
-  "This change would break a YAML alias. Edit the anchor or alias in YAML first.";
+  "This change would break a YAML alias. Save the step change and the other edits separately, or edit the anchor and alias in YAML.";
 
 function form(yaml: string): TriggerFormValue {
   const projection = projectTriggerForm(yaml);

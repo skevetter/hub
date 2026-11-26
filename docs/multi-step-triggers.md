@@ -97,6 +97,14 @@ A later step reads an earlier step with `${{ steps.<id>.outputs.<field> }}`. The
 declare `output.schema`, and only earlier steps can be read. The compiler checks both when you save.
 If the earlier step was skipped by `if`, a step that reads its output fails instead of running with an empty value.
 
+## Editing in the form
+
+The form edits `run` and `steps` documents and leaves comments and keys it does not own untouched.
+A document that uses YAML anchors and aliases is edited conservatively: a change that would make an
+alias point at a different anchor, or leave it without one, is refused and the document is not
+changed. For example, adding a step and editing an aliased field in one save is refused; save the two
+edits separately, or edit the anchor and alias in YAML.
+
 ## Errors
 
 Validation errors name the place in the document: `steps.1.if`, `steps.0.id`, `target.daemon`. With
