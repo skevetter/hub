@@ -1,4 +1,4 @@
-import type { RunReplyRecord, RunReplyStore } from "../run-replies/store.js";
+import type { RunReplyRecord, RunReplyReservation, RunReplyStore } from "../run-replies/store.js";
 import type { DatabaseRuntime } from "./runtime/index.js";
 import type { Locks } from "./runtime/locks/index.js";
 
@@ -16,46 +16,7 @@ export function postgresRunReplies(runtime: DatabaseRuntime, locks: Locks): RunR
       );
       return rows[0];
     },
-    reserve(input) {
-      return runtime.transaction(async (transaction) => {
-        const { organizationId, runId, length, hash, bindingHash, perHour } = input;
-        await locks.withTxLock(transaction, `run-reply:${organizationId}`);
-        const { rows } = await transaction.query<{
-          state: RunReplyRecord["state"];
-          eligible: boolean;
-        }>(
-          `select reply.state, run.status = 'succeeded' and run.payload_expiry_state is null as eligible
-           from run_reply_deliveries reply join trigger_runs run on run.id = reply.trigger_run_id
-           where reply.organization_id = $1 and reply.trigger_run_id = $2
-           for update of reply for share of run`,
-          [organizationId, runId],
-        );
-        const row = rows[0];
-        if (row === undefined || !row.eligible) return "run_unavailable";
-        if (row.state !== "pending") return "already_handled";
-        const recent = await transaction.query<{ count: number }>(
-          `select count(*)::integer as count from run_reply_deliveries
-           where organization_id = $1 and attempted_at > clock_timestamp() - interval '1 hour'`,
-          [organizationId],
-        );
-        if (recent.rows[0]!.count >= perHour) {
-          await transaction.query(
-            `update run_reply_deliveries set state = 'refused', failure = 'rate_limited'
-             where trigger_run_id = $1`,
-            [runId],
-          );
-          return "rate_limited";
-        }
-        await transaction.query(
-          `update run_reply_deliveries
-           set state = 'sending', length = $2, content_hash = $3, binding_hash = $4,
-               attempted_at = clock_timestamp()
-           where trigger_run_id = $1`,
-          [runId, length, hash, bindingHash],
-        );
-        return "reserved";
-      });
-    },
+    reserve: (input) => reserveRunReply(runtime, locks, input),
     async finish({ organizationId, runId, from, failure }) {
       const { rowCount } = await runtime.query(
         `update run_reply_deliveries set state = $4, failure = $5
@@ -76,4 +37,48 @@ export function postgresRunReplies(runtime: DatabaseRuntime, locks: Locks): RunR
       return rows;
     },
   };
+}
+
+function reserveRunReply(runtime: DatabaseRuntime, locks: Locks, input: RunReplyReservation) {
+  return runtime.transaction(async (transaction) => {
+    const { organizationId, runId, length, hash, bindingHash, perHour } = input;
+    await locks.withTxLock(transaction, `run-reply:${organizationId}`);
+    const { rows } = await transaction.query<{
+      state: RunReplyRecord["state"];
+      eligible: boolean;
+    }>(
+      `select reply.state, run.status = 'succeeded' and run.payload_expiry_state is null as eligible
+           from run_reply_deliveries reply join trigger_runs run on run.id = reply.trigger_run_id
+           where reply.organization_id = $1 and reply.trigger_run_id = $2
+           for update of reply for share of run`,
+      [organizationId, runId],
+    );
+    const row = rows[0];
+    if (row === undefined || !row.eligible) return "run_unavailable";
+    if (row.state !== "pending") return "already_handled";
+    const recent = await transaction.query<{ count: number }>(
+      `select count(*)::integer as count from run_reply_deliveries
+           where organization_id = $1 and attempted_at > clock_timestamp() - interval '1 hour'`,
+      [organizationId],
+    );
+    const count = recent.rows[0];
+    if (count === undefined)
+      throw new TypeError("Cannot read properties of undefined (reading 'count')");
+    if (count.count >= perHour) {
+      await transaction.query(
+        `update run_reply_deliveries set state = 'refused', failure = 'rate_limited'
+             where trigger_run_id = $1`,
+        [runId],
+      );
+      return "rate_limited";
+    }
+    await transaction.query(
+      `update run_reply_deliveries
+           set state = 'sending', length = $2, content_hash = $3, binding_hash = $4,
+               attempted_at = clock_timestamp()
+           where trigger_run_id = $1`,
+      [runId, length, hash, bindingHash],
+    );
+    return "reserved";
+  });
 }
