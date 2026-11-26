@@ -6,6 +6,7 @@ import {
   compiledConfigurationHash,
   isScriptStep,
   parseCompiledHubConfig,
+  type CompiledAgent,
   type CompiledHubConfig,
   type CompiledTriggerFilter,
   type CompiledTrigger,
@@ -38,7 +39,7 @@ export interface StoredProjectConfiguration {
 export interface DaemonAgentConfigurationValidator {
   validateAgentConfiguration(
     daemonId: string,
-    agent: import("../config/compiler.js").CompiledAgent,
+    agent: CompiledAgent,
   ): Promise<
     | { valid: true }
     | {
@@ -127,13 +128,11 @@ export class ProjectConfigurationStore {
     sourceEvidence?: unknown;
   }): Promise<ProjectConfigurationRevisionRecord> {
     const bundle = compileHubBundle(input.files);
-    const prepared = await prepareCompiledRevision(
-      this.database,
-      this.projectId,
-      bundle.configuration,
-      bundle.agentValidationTargets,
-      this.daemonAgentValidator,
-    );
+    const prepared = await prepareCompiledRevision(this.database, this.projectId, {
+      configuration: bundle.configuration,
+      agentValidationTargets: bundle.agentValidationTargets,
+      daemonAgentValidator: this.daemonAgentValidator,
+    });
     return this.database.insertProjectConfigurationRevision({
       projectId: this.projectId,
       sourceKind: "manual",
@@ -164,13 +163,11 @@ export class ProjectConfigurationStore {
     const bundle = compileHubBundle(input.files);
     const prepared =
       input.validationErrors === undefined
-        ? await prepareCompiledRevision(
-            this.database,
-            this.projectId,
-            bundle.configuration,
-            bundle.agentValidationTargets,
-            this.daemonAgentValidator,
-          )
+        ? await prepareCompiledRevision(this.database, this.projectId, {
+            configuration: bundle.configuration,
+            agentValidationTargets: bundle.agentValidationTargets,
+            daemonAgentValidator: this.daemonAgentValidator,
+          })
         : {
             normalizedConfiguration: bundle.configuration,
             contentHash: bundle.authoredHash,
@@ -296,13 +293,11 @@ export async function validateHubBundleForOrganization(
   } catch (error) {
     return { valid: false, validationErrors: formatConfigurationError(error) };
   }
-  const prepared = await prepareCompiledRevisionForOrganization(
-    database,
-    organizationId,
-    bundle.configuration,
-    bundle.agentValidationTargets,
+  const prepared = await prepareCompiledRevisionForOrganization(database, organizationId, {
+    configuration: bundle.configuration,
+    agentValidationTargets: bundle.agentValidationTargets,
     daemonAgentValidator,
-  );
+  });
   return prepared.validationErrors === undefined
     ? { valid: true }
     : { valid: false, validationErrors: prepared.validationErrors };
@@ -363,13 +358,19 @@ function toProjectConfiguration(configuration: CompiledHubConfig): CompiledProje
   return { environments, triggers: configuration.triggers };
 }
 
+type RevisionCompilationInput = Pick<
+  CompiledHubBundle,
+  "configuration" | "agentValidationTargets"
+> & {
+  daemonAgentValidator: DaemonAgentConfigurationValidator | undefined;
+};
+
 async function prepareCompiledRevision(
   database: Database,
   projectId: string,
-  configuration: CompiledHubConfig,
-  agentValidationTargets: readonly HubBundleAgentValidationTarget[],
-  daemonAgentValidator: DaemonAgentConfigurationValidator | undefined,
+  input: RevisionCompilationInput,
 ): Promise<Extract<PreparedRevision, { kind: "compiled" }>> {
+  const { configuration } = input;
   const project = await database.findProjectById(projectId);
   if (project === undefined) {
     return {
@@ -379,21 +380,13 @@ async function prepareCompiledRevision(
       validationErrors: { formErrors: ["unresolved organization resources: project"] },
     };
   }
-  return prepareCompiledRevisionForOrganization(
-    database,
-    project.organizationId,
-    configuration,
-    agentValidationTargets,
-    daemonAgentValidator,
-  );
+  return prepareCompiledRevisionForOrganization(database, project.organizationId, input);
 }
 
 async function prepareCompiledRevisionForOrganization(
   database: Database,
   organizationId: string,
-  configuration: CompiledHubConfig,
-  agentValidationTargets: readonly HubBundleAgentValidationTarget[],
-  daemonAgentValidator: DaemonAgentConfigurationValidator | undefined,
+  { configuration, agentValidationTargets, daemonAgentValidator }: RevisionCompilationInput,
 ): Promise<Extract<PreparedRevision, { kind: "compiled" }>> {
   const compiled = await resolveCompiledConfiguration(database, organizationId, configuration);
   if (!compiled.success) {
@@ -635,101 +628,143 @@ async function compileTriggerRoutes(
   return routes.routes;
 }
 
+type ConnectionUsage = Awaited<ReturnType<Database["organizationConnectionUsage"]>>;
+
+interface TriggerCompilation {
+  triggers: CompiledTrigger[];
+  routes: ProjectTriggerRoute[];
+  issues: { path: readonly (string | number)[]; message: string }[];
+}
+
+interface TriggerResolution {
+  trigger: CompiledTrigger;
+  provider: ConnectionProvider;
+  filter: CompiledTrigger["filters"];
+  candidates: ReturnType<typeof connectionCandidates>;
+}
+
 async function compileTriggers(
   database: Database,
   organizationId: string,
   triggers: readonly CompiledTrigger[],
-): Promise<{
-  triggers: CompiledTrigger[];
-  routes: ProjectTriggerRoute[];
-  issues: readonly { path: readonly (string | number)[]; message: string }[];
-}> {
+): Promise<TriggerCompilation> {
   const usage = await database.organizationConnectionUsage(organizationId);
-  const compiled: CompiledTrigger[] = [];
-  const routes: ProjectTriggerRoute[] = [];
-  const issues: { path: readonly (string | number)[]; message: string }[] = [];
+  const compilation: TriggerCompilation = { triggers: [], routes: [], issues: [] };
 
   for (const trigger of triggers) {
     const provider = providerForEvent(trigger.on);
     if (provider === undefined) {
-      compiled.push(trigger);
+      compilation.triggers.push(trigger);
       continue;
     }
-    const filter = trigger.filters;
-    if (filter?.connectionId !== undefined && filter.resourceId !== undefined) {
-      compiled.push(trigger);
-      routes.push({
-        provider,
-        connectionId: filter.connectionId,
-        resourceId: filter.resourceId,
-        triggerName: trigger.name,
+    const pending = prepareTriggerResolution(trigger, provider, usage, compilation);
+    if (pending === undefined) continue;
+    const { authored, candidates } = pending;
+    const resolved = await resolveResource({
+      database,
+      organizationId,
+      provider,
+      resource: authored,
+      allowedConnectionIds: new Set(candidates.map((connection) => connection.id)),
+    });
+    if (resolved === undefined) {
+      compilation.issues.push({
+        path: triggerFilterPath(trigger, resourceField(provider)),
+        message: `"${authored}" does not match any ${resourceLabel(provider)} (${await formatResourceCandidates(
+          database,
+          organizationId,
+          provider,
+          candidates,
+        )})`,
       });
       continue;
     }
-    const authored = readAuthoredResource(provider, filter);
-    const candidates = connectionCandidates(provider, usage, filter);
-    const authoredConnection = filter?.connection;
-    if (typeof authoredConnection === "string" && candidates.length === 0) {
-      issues.push({
-        path: triggerFilterPath(trigger, "connection"),
-        message: `"${authoredConnection}" does not match any ${providerLabel(provider)} connection (${formatConnectionCandidates(provider, usage[provider])})`,
-      });
-      continue;
-    }
-    if (authored !== undefined) {
-      const resolved = await resolveResource(
-        database,
-        organizationId,
-        provider,
-        authored,
-        new Set(candidates.map((connection) => connection.id)),
-      );
-      if (resolved === undefined) {
-        issues.push({
-          path: triggerFilterPath(trigger, resourceField(provider)),
-          message: `"${authored}" does not match any ${resourceLabel(provider)} (${await formatResourceCandidates(
-            database,
-            organizationId,
-            provider,
-            candidates,
-          )})`,
-        });
-        continue;
-      }
-      const resolvedFilter =
-        provider === "github"
-          ? filter
-          : { ...filter, [resourceField(provider)]: resolved.resourceId };
-      const nextFilter: CompiledTriggerFilter = {
-        ...resolvedFilter,
-        connectionId: resolved.connectionId,
-        resourceId: resolved.resourceId,
-      };
-      compiled.push({ ...trigger, filters: nextFilter });
-      routes.push({
-        provider,
-        connectionId: resolved.connectionId,
-        resourceId: resolved.resourceId,
-        triggerName: trigger.name,
-      });
-      continue;
-    }
-
-    const nextFilter: CompiledTriggerFilter | undefined =
-      typeof authoredConnection === "string" && filter !== undefined
-        ? { ...filter, connectionId: candidates[0]!.id }
-        : filter;
-    compiled.push({ ...trigger, ...(nextFilter === undefined ? {} : { filters: nextFilter }) });
-    for (const connection of candidates) {
-      routes.push({
-        provider,
-        connectionId: connection.id,
-        resourceId: null,
-        triggerName: trigger.name,
-      });
-    }
+    addResolvedTrigger(pending, resolved, compilation);
   }
-  return { triggers: compiled, routes, issues };
+  return compilation;
+}
+
+function prepareTriggerResolution(
+  trigger: CompiledTrigger,
+  provider: ConnectionProvider,
+  usage: ConnectionUsage,
+  compilation: TriggerCompilation,
+): (TriggerResolution & { authored: string }) | undefined {
+  const filter = trigger.filters;
+  if (filter?.connectionId !== undefined && filter.resourceId !== undefined) {
+    compilation.triggers.push(trigger);
+    compilation.routes.push({
+      provider,
+      connectionId: filter.connectionId,
+      resourceId: filter.resourceId,
+      triggerName: trigger.name,
+    });
+    return undefined;
+  }
+  const authored = readAuthoredResource(provider, filter);
+  const candidates = connectionCandidates(provider, usage, filter);
+  const authoredConnection = filter?.connection;
+  if (typeof authoredConnection === "string" && candidates.length === 0) {
+    compilation.issues.push({
+      path: triggerFilterPath(trigger, "connection"),
+      message: `"${authoredConnection}" does not match any ${providerLabel(provider)} connection (${formatConnectionCandidates(provider, usage[provider])})`,
+    });
+    return undefined;
+  }
+  const resolution = { trigger, provider, filter, candidates };
+  const pending = authored === undefined ? undefined : { ...resolution, authored };
+  if (pending === undefined) addUnscopedTrigger(resolution, authoredConnection, compilation);
+  return pending;
+}
+
+function addUnscopedTrigger(
+  { trigger, provider, filter, candidates }: TriggerResolution,
+  authoredConnection: string | undefined,
+  compilation: TriggerCompilation,
+): void {
+  let nextFilter = filter;
+  if (typeof authoredConnection === "string" && filter !== undefined) {
+    const candidate = candidates[0];
+    if (candidate !== undefined) nextFilter = { ...filter, connectionId: candidate.id };
+  }
+  compilation.triggers.push({
+    ...trigger,
+    ...(nextFilter === undefined ? {} : { filters: nextFilter }),
+  });
+  for (const connection of candidates) {
+    compilation.routes.push({
+      provider,
+      connectionId: connection.id,
+      resourceId: null,
+      triggerName: trigger.name,
+    });
+  }
+}
+
+interface ResolvedResource {
+  connectionId: string;
+  resourceId: string;
+}
+
+function addResolvedTrigger(
+  { trigger, provider, filter }: TriggerResolution,
+  resolved: ResolvedResource,
+  compilation: TriggerCompilation,
+): void {
+  const resolvedFilter =
+    provider === "github" ? filter : { ...filter, [resourceField(provider)]: resolved.resourceId };
+  const nextFilter: CompiledTriggerFilter = {
+    ...resolvedFilter,
+    connectionId: resolved.connectionId,
+    resourceId: resolved.resourceId,
+  };
+  compilation.triggers.push({ ...trigger, filters: nextFilter });
+  compilation.routes.push({
+    provider,
+    connectionId: resolved.connectionId,
+    resourceId: resolved.resourceId,
+    triggerName: trigger.name,
+  });
 }
 
 function providerForEvent(eventName: string): ConnectionProvider | undefined {
@@ -759,7 +794,7 @@ function readAuthoredResource(
 
 function connectionCandidates(
   provider: ConnectionProvider,
-  usage: Awaited<ReturnType<Database["organizationConnectionUsage"]>>,
+  usage: ConnectionUsage,
   filters: CompiledTrigger["filters"] | undefined,
 ) {
   const connections = usage[provider];
@@ -768,40 +803,69 @@ function connectionCandidates(
   return connections.filter((connection) => connection.slug === authoredSlug);
 }
 
-async function resolveResource(
-  database: Database,
-  organizationId: string,
-  provider: ConnectionProvider,
+interface ResourceResolutionInput {
+  database: Database;
+  organizationId: string;
+  provider: ConnectionProvider;
+  resource: string;
+  allowedConnectionIds: ReadonlySet<string>;
+}
+
+async function resolveResource({
+  database,
+  organizationId,
+  provider,
+  resource,
+  allowedConnectionIds,
+}: ResourceResolutionInput): Promise<ResolvedResource | undefined> {
+  if (provider === "github") {
+    return resolveGitHubResource(
+      await database.listGitHubRepositories(organizationId),
+      resource,
+      allowedConnectionIds,
+    );
+  }
+  const usage = await database.organizationConnectionUsage(organizationId);
+  if (provider === "linear") {
+    const connections = usage.linear.filter(({ id }) => allowedConnectionIds.has(id));
+    const connection = connections.length === 1 ? connections[0] : undefined;
+    return connection === undefined
+      ? undefined
+      : { connectionId: connection.id, resourceId: resource };
+  }
+  return resolveChatResource(usage, provider, resource, allowedConnectionIds);
+}
+
+function resolveGitHubResource(
+  repositories: Awaited<ReturnType<Database["listGitHubRepositories"]>>,
   resource: string,
   allowedConnectionIds: ReadonlySet<string>,
-): Promise<{ connectionId: string; resourceId: string } | undefined> {
-  if (provider === "github") {
-    const repositories = (await database.listGitHubRepositories(organizationId)).filter(
-      (repository) =>
-        repository.fullName === resource && allowedConnectionIds.has(repository.connectionId),
-    );
-    if (repositories.length !== 1) return undefined;
-    const repository = repositories[0]!;
-    return { connectionId: repository.connectionId, resourceId: String(repository.repositoryId) };
-  }
+): ResolvedResource | undefined {
+  const matches = repositories.filter(
+    (repository) =>
+      repository.fullName === resource && allowedConnectionIds.has(repository.connectionId),
+  );
+  const repository = matches.length === 1 ? matches[0] : undefined;
+  return repository === undefined
+    ? undefined
+    : { connectionId: repository.connectionId, resourceId: String(repository.repositoryId) };
+}
+
+function resolveChatResource(
+  usage: ConnectionUsage,
+  provider: "slack" | "discord",
+  resource: string,
+  allowedConnectionIds: ReadonlySet<string>,
+): ResolvedResource | undefined {
+  const matches = ({ id, slug }: { id: string; slug: string }) =>
+    slug === resource && allowedConnectionIds.has(id);
   if (provider === "slack") {
-    const connection = (await database.organizationConnectionUsage(organizationId)).slack.find(
-      ({ id, slug }) => slug === resource && allowedConnectionIds.has(id),
-    );
+    const connection = usage.slack.find(matches);
     return connection === undefined
       ? undefined
       : { connectionId: connection.id, resourceId: connection.teamId };
   }
-  if (provider === "linear") {
-    const connections = (await database.organizationConnectionUsage(organizationId)).linear.filter(
-      ({ id }) => allowedConnectionIds.has(id),
-    );
-    if (connections.length !== 1) return undefined;
-    return { connectionId: connections[0]!.id, resourceId: resource };
-  }
-  const connection = (await database.organizationConnectionUsage(organizationId)).discord.find(
-    ({ id, slug }) => slug === resource && allowedConnectionIds.has(id),
-  );
+  const connection = usage.discord.find(matches);
   return connection === undefined
     ? undefined
     : { connectionId: connection.id, resourceId: connection.guildId };
