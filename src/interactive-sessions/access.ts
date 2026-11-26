@@ -27,8 +27,17 @@ export function capabilities(
     };
   }
 
+  return webCapabilities(manager, participant !== undefined, controller, starter);
+}
+
+function webCapabilities(
+  manager: boolean,
+  participant: boolean,
+  controller: boolean,
+  starter: boolean,
+) {
   return {
-    view: manager || participant !== undefined,
+    view: manager || participant,
     send: controller,
     stop: manager || starter,
     close: manager || starter,
