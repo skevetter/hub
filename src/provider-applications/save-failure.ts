@@ -1,5 +1,10 @@
-import { respondError } from "../contract/respond.js";
-import { respondWithFailure } from "../failures/index.js";
+import type { respondError } from "../contract/respond.js";
+import {
+  respondWithFailure,
+  type FailureContext,
+  type FailureKind,
+  type ReportOptions,
+} from "../failures/index.js";
 import { guideFor } from "./guides.js";
 import { ProviderApplicationError, type Provider } from "./index.js";
 
@@ -19,64 +24,77 @@ export function providerApplicationSaveFailure(
   const code = errorCode(error);
   const gateway = discordGatewayDiagnostic(error);
   const report = { operation, component: "provider_applications", provider } as const;
+  const details = { provider, name, code, error };
+  const override = setupFailureOverride(details) ?? credentialFailureOverride(details);
 
+  if (override !== undefined) {
+    const { fallback, kind } = override;
+    return respondWithFailure(error, report, { fallback }, { kind, scrubValues });
+  }
+  return respondToRemainingSaveFailure(details, report, {
+    scrubValues,
+    ...(gateway === undefined ? {} : { diagnostic: gateway }),
+  });
+}
+
+interface SaveFailureDetails {
+  provider: Provider;
+  name: string;
+  code: string | undefined;
+  error: unknown;
+}
+
+interface SaveFailureOverride {
+  kind: FailureKind;
+  fallback: string;
+}
+
+function setupFailureOverride({
+  provider,
+  name,
+  code,
+  error,
+}: SaveFailureDetails): SaveFailureOverride | undefined {
   if ((provider === "slack" || provider === "linear") && code === "httpsRequired") {
-    return respondWithFailure(
-      error,
-      report,
-      {
-        fallback: `${name} only works over HTTPS, and Hub is at ${errorContext(error) ?? "an HTTP address"}. Nothing was saved. Reopen Hub at its public HTTPS address to set up ${name}.`,
-      },
-      { kind: "validation", scrubValues },
-    );
+    return {
+      kind: "validation",
+      fallback: `${name} only works over HTTPS, and Hub is at ${errorContext(error) ?? "an HTTP address"}. Nothing was saved. Reopen Hub at its public HTTPS address to set up ${name}.`,
+    };
   }
+  let fallback: string | undefined;
   if (code === "managedByEnvironment") {
-    return respondWithFailure(
-      error,
-      report,
-      {
-        fallback: `${name} is set by Hub's environment, so it cannot be edited here. Nothing was saved. Change ${environmentVariables(provider)} where you set Hub's environment, then restart Hub.`,
-      },
-      { kind: "conflict", scrubValues },
-    );
-  }
-  if (code === "configurationConflict") {
-    return respondWithFailure(
-      error,
-      report,
-      {
-        fallback: `Someone else changed the ${name} app while this page was open. Nothing was saved. Reload the page to see the current values, then verify again.`,
-      },
-      { kind: "conflict", scrubValues },
-    );
-  }
-  if (code === "identityConflict") {
+    fallback = `${name} is set by Hub's environment, so it cannot be edited here. Nothing was saved. Change ${environmentVariables(provider)} where you set Hub's environment, then restart Hub.`;
+  } else if (code === "configurationConflict") {
+    fallback = `Someone else changed the ${name} app while this page was open. Nothing was saved. Reload the page to see the current values, then verify again.`;
+  } else if (code === "identityConflict") {
     const identity = errorContext(error) ?? name;
-    return respondWithFailure(
-      error,
-      report,
-      {
-        fallback: `${name} is already connected as ${identity}, and connections cannot move to a different ${applicationNoun(provider)}. Nothing was saved. Remove its connections first, or rotate the secrets of the same ${applicationNoun(provider)}.`,
-      },
-      { kind: "conflict", scrubValues },
-    );
+    fallback = `${name} is already connected as ${identity}, and connections cannot move to a different ${applicationNoun(provider)}. Nothing was saved. Remove its connections first, or rotate the secrets of the same ${applicationNoun(provider)}.`;
   }
+  return fallback === undefined ? undefined : { kind: "conflict", fallback };
+}
+
+function credentialFailureOverride({
+  provider,
+  code,
+  error,
+}: SaveFailureDetails): SaveFailureOverride | undefined {
   if (code === "credentialsRejected") {
-    return respondWithFailure(
-      error,
-      report,
-      { fallback: credentialMessage(provider, errorContext(error)) },
-      { kind: "credentialsRejected", scrubValues },
-    );
+    return {
+      kind: "credentialsRejected",
+      fallback: credentialMessage(provider, errorContext(error)),
+    };
   }
   if (provider === "slack" && code === "permissionMissing") {
-    return respondWithFailure(
-      error,
-      report,
-      { fallback: slackPermissionMessage(errorContext(error)) },
-      { kind: "permissionMissing", scrubValues },
-    );
+    return { kind: "permissionMissing", fallback: slackPermissionMessage(errorContext(error)) };
   }
+  return undefined;
+}
+
+function respondToRemainingSaveFailure(
+  { provider, name, error }: SaveFailureDetails,
+  report: FailureContext,
+  options: ReportOptions,
+): ReturnType<typeof respondError> {
   if (provider === "discord" && errorContext(error) === "discordGatewayDisallowedIntents") {
     return respondWithFailure(
       error,
@@ -85,11 +103,7 @@ export function providerApplicationSaveFailure(
         fallback:
           "Discord refused the bot because Message Content Intent is off, so it would only receive empty messages. Nothing was saved. Turn it on under Bot → Privileged Gateway Intents, save in Discord, then verify again.",
       },
-      {
-        kind: "permissionMissing",
-        scrubValues,
-        ...(gateway === undefined ? {} : { diagnostic: gateway }),
-      },
+      { kind: "permissionMissing", ...options },
     );
   }
 
@@ -109,7 +123,7 @@ export function providerApplicationSaveFailure(
       conflict: `The ${name} app changed while it was being saved. Nothing was saved. Reload the page to see the current values, then verify again.`,
       validation: `Some of the ${name} details were missing or malformed. Nothing was saved. Check every field against the setup steps, then verify again.`,
     },
-    { scrubValues, ...(gateway === undefined ? {} : { diagnostic: gateway }) },
+    options,
   );
 }
 
