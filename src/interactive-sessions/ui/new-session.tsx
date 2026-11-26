@@ -15,8 +15,11 @@ import { Section } from "../../components/app/section.js";
 import { SummaryPanel } from "../../components/app/summary-panel.js";
 import { Button } from "../../components/ui/button.js";
 import { useRouteTenant } from "../../projects/context.js";
-import { useSnapshotQuery } from "../../queries/index.js";
-import { listSessionProfiles, startInteractiveSession, type ProfileView } from "../functions.js";
+import {
+  startInteractiveSession,
+  type listSessionProfiles,
+  type ProfileView,
+} from "../functions.js";
 import {
   ParticipantList,
   ParticipantPicker,
@@ -112,45 +115,19 @@ export function sessionProfileQueryOptions(
   };
 }
 
-export function HomeSessionStart({ organizationSlug }: { organizationSlug: string }) {
-  const list = useServerFn(listSessionProfiles);
-  const accountId = useActiveAccount().account.id;
-  const profiles = useSnapshotQuery(sessionProfileQueryOptions(organizationSlug, accountId, list));
-  const active = useMemo(
-    () =>
-      Array.isArray(profiles.data) ? profiles.data.filter(({ status }) => status === "active") : [],
-    [profiles.data],
-  );
-  if (active.length === 0) return null;
-  return (
-    <Section>
-      <Card title="Start a session">
-        <CreateSessionForm
-          key={organizationSlug}
-          organizationSlug={organizationSlug}
-          profiles={active}
-          compact
-        />
-      </Card>
-    </Section>
-  );
-}
-
 function CreateSessionForm({
   organizationSlug,
   profiles,
-  compact = false,
 }: {
   organizationSlug: string;
   profiles: readonly ProfileView[];
-  compact?: boolean;
 }) {
   const account = useActiveAccount();
   const [profileId, setProfileId] = useState("");
   const profile = findProfile(profiles, profileId);
   const settings = useProfileSettings(profile);
   const { participants, members, change } = useSessionParticipants(account, organizationSlug);
-  const secondaryAction = useSecondaryAction(organizationSlug, compact);
+  const secondaryAction = useSecondaryAction(organizationSlug);
   const select = useCallback(({ value }: { value: string }) => setProfileId(value), []);
   const { busy, error, submit } = useStartSession(organizationSlug, profile, participants);
   const form = (
@@ -160,22 +137,19 @@ function CreateSessionForm({
         profiles={profiles}
         value={profileId || profile?.id || ""}
         onChange={select}
-        compact={compact}
         disabled={busy}
       />
-      {compact || profile === undefined ? null : (
+      {profile === undefined ? null : (
         <SummaryPanel inline label="Agent settings" rows={settings} />
       )}
       <FullAccessWarning profile={profile} />
-      {compact ? null : (
-        <SessionParticipants
-          accountId={account.account.id}
-          participants={participants}
-          members={members}
-          onChange={change}
-          busy={busy}
-        />
-      )}
+      <SessionParticipants
+        accountId={account.account.id}
+        participants={participants}
+        members={members}
+        onChange={change}
+        busy={busy}
+      />
       <Composer
         agentState="idle"
         busy={busy}
@@ -191,7 +165,7 @@ function CreateSessionForm({
       />
     </div>
   );
-  return compact ? form : <Card>{form}</Card>;
+  return <Card>{form}</Card>;
 }
 
 function FullAccessWarning({ profile }: { profile: ProfileView | undefined }) {
@@ -250,23 +224,17 @@ function useSessionParticipants(
   return { participants, members, change };
 }
 
-function useSecondaryAction(organizationSlug: string, compact: boolean) {
+function useSecondaryAction(organizationSlug: string) {
   const params = useMemo(() => ({ organizationSlug }), [organizationSlug]);
   return useMemo(
     () => (
       <Button asChild variant="outline">
-        {compact ? (
-          <Link to="/o/$organizationSlug/sessions/new" params={params}>
-            More options
-          </Link>
-        ) : (
-          <Link to="/o/$organizationSlug/sessions" params={params}>
-            Cancel
-          </Link>
-        )}
+        <Link to="/o/$organizationSlug/sessions" params={params}>
+          Cancel
+        </Link>
       </Button>
     ),
-    [compact, params],
+    [params],
   );
 }
 
@@ -370,14 +338,12 @@ function ProfilesPicker({
   profiles,
   value,
   onChange,
-  compact,
   disabled,
 }: {
   profile: ProfileView | undefined;
   profiles: readonly ProfileView[];
   value: string;
   onChange: (option: { value: string }) => void;
-  compact: boolean;
   disabled: boolean;
 }) {
   const id = useId();
@@ -407,7 +373,7 @@ function ProfilesPicker({
     <FormField
       id={id}
       label="Profile"
-      {...(compact || profile === undefined ? {} : { description: profileSentence(profile) })}
+      {...(profile === undefined ? {} : { description: profileSentence(profile) })}
       disabled={disabled}
     >
       {picker}

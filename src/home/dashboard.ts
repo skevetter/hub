@@ -9,6 +9,7 @@ import type {
   OrganizationRunRecord,
   OrganizationTriggerRecord,
   OrganizationTriggerRevisionRecord,
+  RunsDay,
   TriggerRunSummary,
 } from "../db/types.js";
 import { resolveRouteTenant } from "../projects/access.js";
@@ -18,7 +19,9 @@ import { projectTriggerForm } from "../triggers/configuration/editor.js";
 import { matchGitHubInvocations } from "../triggers/github/match.js";
 import { matchLinearInvocations } from "../triggers/linear/match.js";
 import { incompleteSetupStepTitles, SETUP_INCOMPLETE } from "./checklist.js";
+import { chartWindow, fillRunDays } from "./runs-per-day.js";
 import { commentExamples, isTryCommentEvent } from "./things-to-try.js";
+import { stoppedTriggers } from "./trigger-matches.js";
 
 /** How far back the overview looks. One week is long enough to hold a first run. */
 const HOME_WINDOW_DAYS = 7;
@@ -67,6 +70,13 @@ export interface HomeSnapshot {
     failed: number;
     latest: { id: string; status: OrganizationRunRecord["status"]; startedAt: string } | null;
   }[];
+  /** Runs per UTC day for the chart, oldest first and zero-filled. Empty when read only for setup. */
+  runDays: readonly RunsDay[];
+  /**
+   * Enabled triggers that matched events the week before and none in the last week while their
+   * app still sent events, most earlier matches first. Empty when read only for setup.
+   */
+  stoppedTriggers: readonly { id: string; name: string; previousMatches: number }[];
   /** The newest runs in the window; setup only asks whether one happened. */
   runs: readonly (Omit<OrganizationRunRecord, "receivedAt"> & { receivedAt: string })[];
   /** Whether the reader started or joined a session. Null means Sessions is off. */
@@ -135,6 +145,7 @@ export class HomeDashboard {
     const organizationId = organization.id;
     const now = this.now().getTime();
     const since = new Date(now - HOME_WINDOW_DAYS * DAY_MS);
+    const chart = chartWindow(new Date(now));
     const [
       triggers,
       connections,
@@ -142,6 +153,8 @@ export class HomeDashboard {
       revisions,
       runs,
       summaries,
+      runDays,
+      matchActivity,
       sessionStarted,
       checklistCompletedAt,
     ] = await Promise.all([
@@ -151,6 +164,10 @@ export class HomeDashboard {
       this.database.listActiveOrganizationTriggerRevisions(organizationId),
       this.database.listOrganizationRunsSince(organizationId, since, LATEST_RUNS),
       reader === null ? [] : this.database.summarizeTriggerRuns(organizationId, since),
+      reader === null ? [] : this.database.listRunsPerDay(organizationId, chart.since, chart.until),
+      reader === null
+        ? []
+        : this.database.listTriggerMatchActivity(organizationId, matchWindow(now)),
       reader !== null && this.options.interactiveSessions === true
         ? this.database.hasOwnInteractiveSession(reader)
         : null,
@@ -164,11 +181,21 @@ export class HomeDashboard {
       daemons: snapshotDaemons(daemons),
       triggers: snapshotTriggers(triggers, revisions, connections),
       triggerRuns: summaries.map(snapshotTriggerRun),
+      runDays: fillRunDays(runDays, chart.since),
+      stoppedTriggers: stoppedTriggers(matchActivity),
       runs: snapshotRuns(runs),
       sessionStarted,
       windowDays: HOME_WINDOW_DAYS,
     };
   }
+}
+
+function matchWindow(now: number) {
+  return {
+    previousStart: new Date(now - 2 * HOME_WINDOW_DAYS * DAY_MS),
+    recentStart: new Date(now - HOME_WINDOW_DAYS * DAY_MS),
+    now: new Date(now),
+  };
 }
 
 function snapshotConnections(

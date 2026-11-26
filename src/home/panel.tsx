@@ -28,10 +28,7 @@ import { Button } from "../components/ui/button.js";
 import { ProviderGlyph } from "../connections/provider-glyph.js";
 import { daemonLoginCommand, GRANT_EXECUTE_COMMAND } from "../daemons/handoff.js";
 import { listSessionProfiles } from "../interactive-sessions/functions.js";
-import {
-  HomeSessionStart,
-  sessionProfileQueryOptions,
-} from "../interactive-sessions/ui/new-session.js";
+import { sessionProfileQueryOptions } from "../interactive-sessions/ui/new-session.js";
 import { useRouteTenant } from "../projects/context.js";
 import {
   canFinishSetup,
@@ -162,7 +159,6 @@ function HomeContent({
         />
       ) : null}
       <HomeOverview data={data} base={base} />
-      {profiles === null ? null : <HomeSessionStart organizationSlug={data.organization.slug} />}
       <ThingsToTry
         snapshot={data}
         base={base}
@@ -177,8 +173,8 @@ function HomeLoading() {
   return (
     <div role="group" aria-busy="true" aria-label="Loading Home">
       <div className="grid gap-8">
-        <Figures label="Loading overview">
-          {Array.from({ length: 3 }, (_, position) => (
+        <Figures label="Loading overview" columns={4}>
+          {Array.from({ length: 4 }, (_, position) => (
             <FigureSkeleton key={position} />
           ))}
         </Figures>

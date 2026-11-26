@@ -2061,12 +2061,16 @@ export class PaseoHub {
     return daemon.slug;
   }
 
-  /** A finished or running run of a saved trigger, received `minutesAgo` minutes ago. */
+  /**
+   * A finished or running run of a saved trigger, received `minutesAgo` minutes ago. The event
+   * came from `provider`; Home counts a run as a trigger match only for an app's events.
+   */
   async seedTriggerRun(
     triggerName: string,
     run: {
       minutesAgo: number;
       status: "running" | "succeeded" | "failed" | "timed_out" | "rejected";
+      provider?: "manual" | "github";
     },
   ): Promise<void> {
     const receivedAt = `now() - make_interval(mins => $3)`;
@@ -2081,7 +2085,7 @@ export class PaseoHub {
        ), receipt as (
          insert into provider_event_receipts
            (organization_id, provider, delivery_id, source, payload, received_at)
-         select organization_id, 'manual', gen_random_uuid()::text, 'manual.run', '{}'::jsonb,
+         select organization_id, $4::text, gen_random_uuid()::text, $5::text, '{}'::jsonb,
                 ${receivedAt}
          from trigger
          returning id, organization_id
@@ -2095,7 +2099,29 @@ export class PaseoHub {
               'Handle the event.', case when $2 <> 'rejected' then now() + interval '1 hour' end,
               ${receivedAt}
        from receipt, trigger`,
-      [triggerName, run.status, run.minutesAgo],
+      [
+        triggerName,
+        run.status,
+        run.minutesAgo,
+        run.provider ?? "manual",
+        run.provider === "github" ? "github.pull_request_comment_created" : "manual.run",
+      ],
+    );
+  }
+
+  /** An app event the trigger's organization received without starting a run. */
+  async seedProviderReceipt(
+    triggerName: string,
+    event: { minutesAgo: number; provider: "github" },
+  ): Promise<void> {
+    await this.queryDatabase(
+      this.primary,
+      `insert into provider_event_receipts
+         (organization_id, provider, delivery_id, source, payload, received_at)
+       select organization_id, $2::text, gen_random_uuid()::text, 'github.issues_opened',
+              '{}'::jsonb, now() - make_interval(mins => $3)
+       from organization_triggers where name = $1`,
+      [triggerName, event.provider, event.minutesAgo],
     );
   }
 

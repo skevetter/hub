@@ -1,4 +1,4 @@
-import { expect } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
 import { test as browserTest } from "./app.js";
 import { OrganizationHome } from "./helpers/home.js";
 import { OrganizationTriggers } from "./helpers/triggers.js";
@@ -61,7 +61,6 @@ for (const width of [390, 1280])
     await hub.signUpAs("owner", owner);
     await hub.createOrganization("owner", "Acme");
     await hub.connectProviderDaemon("owner", "Acme");
-    await hub.seedConnectedOnlyDaemon("owner", "laptop");
     await page.setViewportSize({ width, height: 844 });
     let releaseSnapshot = () => {};
     const heldSnapshot = new Promise<void>((resolve) => {
@@ -83,57 +82,16 @@ for (const width of [390, 1280])
     try {
       await expect(loading).toBeVisible();
       loadingHeights = await dimensions(loading.locator("div.grid-cols-2 > div"));
-      expect(loadingHeights).toHaveLength(3);
+      expect(loadingHeights).toHaveLength(4);
     } finally {
       releaseSnapshot();
     }
-    await expect(page.getByText(/^daemons? connected$/u)).toBeVisible();
-    expect(await dimensions(page.locator("[data-slot=figure]"))).toEqual(loadingHeights);
+    await expect(page.getByText("triggers failing", { exact: true })).toBeVisible();
+    const needsYou = page.getByRole("group", { name: "Needs you", exact: true });
+    expect(await dimensions(needsYou.locator("[data-slot=figure]"))).toEqual(loadingHeights);
   });
 
-test("Home lists the ten worst triggers and leaves the rest to View all", async ({ hub, page }) => {
-  await hub.signUpAs("owner", owner);
-  await hub.createOrganization("owner", "Acme");
-  const names = Array.from(
-    { length: 12 },
-    (_, index) => `cap-${String(index + 1).padStart(2, "0")}`,
-  );
-  for (const name of names)
-    await hub.seedLegacyTrigger(
-      "owner",
-      name,
-      `name: ${name}\nenabled: true\non:\n  manual.run: {}\nrun:\n  target: { daemon: devbox, cwd: /workspace }\n  agent: { provider: codex, model: gpt-5.4, mode: full-access }\n  prompt: Handle it\n`,
-    );
-  const home = new OrganizationHome(page);
-  await home.reload();
-
-  await expect(home.triggerRows()).toHaveCount(10);
-  await expect(home.triggerRow("cap-10")).toBeVisible();
-  await expect(home.triggerRow("cap-11")).toHaveCount(0);
-  await expect(page.getByText("Showing the 10 worst of 12 triggers.")).toBeVisible();
-  await home.expectFigure("triggers on", 12);
-  await home.followViewAllTriggers();
-  await expect(page.getByRole("link", { name: "cap-12", exact: true })).toBeVisible();
-});
-
-test("Home wraps long record names at 390 px", async ({ hub, page }) => {
-  const name = "w".repeat(60);
-  const connection = "C".repeat(60);
-  const daemonName = "d".repeat(60);
-  const organization = "O".repeat(60);
-  const profile = "P".repeat(60);
-  await hub.signUpAs("owner", owner);
-  await hub.createOrganization("owner", organization);
-  await hub.connectGitHub("owner");
-  const daemon = await hub.connectProviderDaemon("owner", organization);
-  await hub.seedSlackConnection("owner", "slack", connection);
-  const daemonId = await hub.seedDaemonSlug("owner", daemonName);
-  await hub
-    .primaryApplication()
-    .query("update daemons set scopes = $1::jsonb where id = $2", [
-      JSON.stringify(["hub.execute"]),
-      daemonId,
-    ]);
+async function saveGitHubCommentTrigger(page: Page, name: string, daemon: string) {
   const triggers = new OrganizationTriggers(page);
   await triggers.open();
   await triggers.startNew();
@@ -158,7 +116,97 @@ run:
   prompt: Review this.
 `);
   await triggers.save(name);
+}
+
+const WEEK_MINUTES = 7 * 24 * 60;
+
+test("Home counts each thing that needs a person and links to it", async ({ hub, page }) => {
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await hub.connectGitHub("owner");
+  const daemon = await hub.connectProviderDaemon("owner", "Acme");
+  await hub.seedConnectedOnlyDaemon("owner", "laptop");
+  await hub.seedSlackConnection("owner", "slack", "Acme Slack");
+  await hub.primaryApplication().query("update slack_connections set scopes = '[]'::jsonb");
+  await saveGitHubCommentTrigger(page, "reviewer", daemon);
+  await hub.seedTriggerRun("reviewer", {
+    minutesAgo: WEEK_MINUTES + 3 * 24 * 60,
+    status: "succeeded",
+    provider: "github",
+  });
+  await hub.seedTriggerRun("reviewer", { minutesAgo: 1, status: "failed" });
+  await hub.seedProviderReceipt("reviewer", { minutesAgo: 60, provider: "github" });
+  const home = new OrganizationHome(page);
+  await home.open();
+
+  await test.step("each figure counts its thing and says what it found", async () => {
+    await home.expectNeedsYou("triggers failing", 1);
+    await home.expectNeedsYou("app to authorize", 1);
+    await home.expectNeedsYouCaption("app to authorize", "Acme Slack.");
+    await home.expectNeedsYou("daemon to check", 1);
+    await home.expectNeedsYou("stopped matching", 1);
+    await home.expectNeedsYouCaption(
+      "stopped matching",
+      "reviewer matched 1 the week before and none since.",
+    );
+    await home.expectRuns(2, 1);
+    await expect(home.runsChart()).toHaveAttribute("aria-label", /1 run, 1 did not finish/u);
+    await home.expectRemovedSurfacesAbsent();
+  });
+
+  await test.step("each figure has one link to where the person acts", async () => {
+    const links = [
+      ["triggers failing", "Review runs", /\/activity\?.*status=did_not_finish/u],
+      ["app to authorize", "Open connections", /\/connections$/u],
+      ["daemon to check", "View daemons", /\/daemons$/u],
+      ["stopped matching", "Open trigger", /\/triggers\/[0-9a-f-]{36}$/u],
+    ] as const;
+    for (const [unit, name, url] of links) {
+      await home.followNeedsYouLink(unit, name);
+      await expect(page).toHaveURL(url);
+      await page.goBack();
+      await home.expectOpen();
+    }
+  });
+
+  await test.step("the figures fit a 390 px phone with touch-sized links", async () => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await home.expectNoHorizontalScroll();
+    const links = await home.needsYou().getByRole("link").all();
+    expect(links).toHaveLength(4);
+    for (const link of links) {
+      const height = await link.evaluate((element) => element.getBoundingClientRect().height);
+      expect(height).toBeGreaterThanOrEqual(44);
+    }
+  });
+});
+
+test("Home wraps long record names at 390 px", async ({ hub, page }) => {
+  const name = "w".repeat(60);
+  const connection = "C".repeat(60);
+  const daemonName = "d".repeat(60);
+  const organization = "O".repeat(60);
+  const profile = "P".repeat(60);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", organization);
+  await hub.connectGitHub("owner");
+  const daemon = await hub.connectProviderDaemon("owner", organization);
+  await hub.seedSlackConnection("owner", "slack", connection);
+  const daemonId = await hub.seedDaemonSlug("owner", daemonName);
+  await hub
+    .primaryApplication()
+    .query("update daemons set scopes = $1::jsonb where id = $2", [
+      JSON.stringify(["hub.execute"]),
+      daemonId,
+    ]);
+  await saveGitHubCommentTrigger(page, name, daemon);
   await hub.seedTriggerRun(name, { minutesAgo: 1, status: "succeeded" });
+  await hub.seedTriggerRun(name, {
+    minutesAgo: WEEK_MINUTES + 24 * 60,
+    status: "succeeded",
+    provider: "github",
+  });
+  await hub.seedProviderReceipt(name, { minutesAgo: 60, provider: "github" });
   await hub.primaryApplication().query(
     `insert into interactive_session_profiles (id, organization_id, name, daemon_id, cwd, provider, status)
      select gen_random_uuid(), organization_id, $1, id, '/workspace', 'codex', 'active'
@@ -177,16 +225,11 @@ run:
   const home = new OrganizationHome(page);
   await home.expectStep("Enroll a daemon", daemonName);
   await home.expectStep("Create a trigger", name);
-  await home.expectTrigger(name, "Succeeded");
-  await expect(page.getByRole("list", { name: "Recent runs" })).toHaveCount(0);
-  const triggerName = home.triggerRow(name).getByRole("link", { name, exact: true });
+  const stoppedLink = page.getByRole("link", { name: "Open trigger", exact: true });
+  await expect(page.getByRole("group", { name: "Needs you", exact: true })).toContainText(name);
   expect(
-    await triggerName.evaluate(
-      (element) =>
-        element.getBoundingClientRect().height >
-        parseFloat(getComputedStyle(element).lineHeight) * 2,
-    ),
-  ).toBe(true);
+    await stoppedLink.evaluate((element) => element.getBoundingClientRect().height),
+  ).toBeGreaterThanOrEqual(44);
   const profilePicker = page.getByRole("combobox", { name: "Profile" });
   await expect(profilePicker).toContainText(profile);
   expect(
@@ -194,14 +237,7 @@ run:
   ).toBeGreaterThan(32);
   await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText(organization);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(390);
-  const viewAll = page.getByRole("link", { name: "View all", exact: true }).first();
-  expect(
-    await viewAll.evaluate((element) => element.getBoundingClientRect().height),
-  ).toBeGreaterThanOrEqual(44);
-  expect(
-    await home.recentRunsLink().evaluate((element) => element.getBoundingClientRect().height),
-  ).toBeGreaterThanOrEqual(44);
-  await triggerName.click();
+  await stoppedLink.click();
   await expect(page.getByRole("heading", { name, level: 1 })).toBeVisible();
 });
 
@@ -244,7 +280,7 @@ test("Home names the expired run as the only remaining setup step", async ({ hub
   await expect(alert).toBeFocused();
 });
 
-test("Home gets the profile step and session form from one fetch", async ({ hub, page }) => {
+test("Home gets the profile step from one fetch", async ({ hub, page }) => {
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
   const slug = await hub.connectProviderDaemon("owner", "Acme");
@@ -277,11 +313,10 @@ test("Home gets the profile step and session form from one fetch", async ({ hub,
     releaseProfiles();
   }
   await expect(row).toContainText("Done");
-  await expect(page.getByRole("heading", { name: "Start a session" })).toBeVisible();
   expect(profileRequests).toBe(1);
 });
 
-test("reads Home as figures, triggers, a checklist the member can put away, and prompts to try", async ({
+test("reads Home as needs-you figures, run counts, a checklist the member can put away, and prompts to try", async ({
   hub,
   page,
 }) => {
@@ -289,13 +324,12 @@ test("reads Home as figures, triggers, a checklist the member can put away, and 
   await hub.createOrganization("owner", "Acme");
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
 
-  await test.step("a fresh organization shows zeroed figures and nothing to worry about", async () => {
+  await test.step("a fresh organization shows four zeroes and nothing to worry about", async () => {
     const home = new OrganizationHome(page);
-    for (const unit of ["triggers failing", "triggers on", "daemons connected"]) {
-      await expect(page.getByText(unit, { exact: true })).toBeVisible();
-      await home.expectFigure(unit, 0);
-    }
-    await expect(page.getByText("No triggers yet", { exact: true })).toBeVisible();
+    await home.expectAllClear();
+    await home.expectRuns(0, 0);
+    await expect(home.runsChart()).toBeVisible();
+    await home.expectRemovedSurfacesAbsent();
     await expect(page.getByRole("alert")).toHaveCount(0);
   });
 

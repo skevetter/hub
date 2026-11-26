@@ -559,7 +559,7 @@ test.describe("interactive sessions", () => {
           page.getByRole("heading", { name: title, level: 1, exact: true }),
         ).toBeVisible();
         if (screen === "home")
-          await expect(page.getByRole("heading", { name: "Start a session" })).toBeVisible();
+          await expect(page.getByRole("heading", { name: "Start a session" })).toHaveCount(0);
         if (screen === "sessions")
           await expect(page.getByRole("link", { name: "Web on devbox" })).toHaveAttribute(
             "href",
@@ -570,16 +570,16 @@ test.describe("interactive sessions", () => {
           await capture(page, screen.replace("/", "-"), width);
         }
       }
-      await page.goto(app.origin + app.base + "/home");
+      await page.goto(app.origin + app.base + "/sessions/new");
       const firstMessage = page.getByRole("textbox", { name: "First message" });
-      await firstMessage.fill("Started from Home");
+      await firstMessage.fill("Started from New session");
       await firstMessage.press("Control+Enter");
       await expect(page).toHaveURL(/\/sessions\/[a-f0-9-]{36}$/u);
-      await expect(page.getByText("Started from Home")).toBeVisible();
+      await expect(page.getByText("Started from New session")).toBeVisible();
       await page.getByRole("button", { name: "Close", exact: true }).click();
       await page.getByRole("alertdialog").getByRole("button", { name: "Close session" }).click();
       await expect(page.getByText("The transcript remains readable.")).toBeVisible();
-      await expect(page.getByText("Started from Home")).toBeVisible();
+      await expect(page.getByText("Started from New session")).toBeVisible();
       await expect(page.getByRole("textbox", { name: "Message", exact: true })).toHaveCount(0);
     } finally {
       await daemon.disconnect();

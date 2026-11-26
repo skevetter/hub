@@ -20,12 +20,13 @@ const FRAME = "grid min-w-0 content-start gap-1 border-t-2 border-foreground pt-
 export function Figure({
   value,
   unit,
-  caption,
+  children,
   tone,
 }: {
   value: string;
   unit: string;
-  caption?: ReactNode;
+  /** The caption line. */
+  children?: ReactNode;
   tone?: FigureTone | undefined;
 }) {
   return (
@@ -34,18 +35,31 @@ export function Figure({
         <span className={cn("font-strong text-3xl tabular-nums", tone && TONE[tone])}>{value}</span>
         <span className="text-sm">{unit}</span>
       </p>
-      {caption === undefined ? null : <p className="text-xs text-muted-foreground">{caption}</p>}
+      {children === undefined ? null : (
+        <p className="wrap-anywhere text-xs text-muted-foreground">{children}</p>
+      )}
     </div>
   );
 }
 
-/** Figures that lead a page: two across on a phone, three from `md`. Owns the space after them. */
-export function Figures({ label, children }: { label: string; children: ReactNode }) {
+/** Figures that lead a page: two across on a phone, three or four from `md`. Owns the space after them. */
+export function Figures({
+  label,
+  columns = 3,
+  children,
+}: {
+  label: string;
+  columns?: 3 | 4;
+  children: ReactNode;
+}) {
   return (
     <div
       role="group"
       aria-label={label}
-      className="mb-10 grid grid-cols-2 gap-x-4 gap-y-6 last:mb-0 md:grid-cols-3 md:gap-x-6"
+      className={cn(
+        "mb-10 grid grid-cols-2 gap-x-4 gap-y-6 last:mb-0 md:gap-x-6",
+        columns === 4 ? "md:grid-cols-4" : "md:grid-cols-3",
+      )}
     >
       {children}
     </div>
