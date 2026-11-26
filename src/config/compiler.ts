@@ -766,13 +766,19 @@ function compileAgentStep(
   const condition = compileStepCondition(step.if, stepPath);
   const outputDeclaration =
     step.output === undefined ? undefined : { schema: cloneJsonValue(step.output.schema) };
-  if (outputDeclaration !== undefined)
-    validateOutputSchema(outputDeclaration.schema, `step ${step.id} output.schema`);
-  assertTurnEndCompletionAllowed(step.id, {
-    enabled: step.complete_on_turn_end === true,
-    structuredOutput: outputDeclaration !== undefined,
-    requiredOutputs: (step.allow_outputs ?? []).some((output) => output.required === true),
-  });
+  if (outputDeclaration !== undefined) {
+    const { schema } = outputDeclaration;
+    compileAt([...stepPath, "output", "schema"], () =>
+      validateOutputSchema(schema, `step ${step.id} output.schema`),
+    );
+  }
+  compileAt([...stepPath, "complete_on_turn_end"], () =>
+    assertTurnEndCompletionAllowed(step.id, {
+      enabled: step.complete_on_turn_end === true,
+      structuredOutput: outputDeclaration !== undefined,
+      requiredOutputs: (step.allow_outputs ?? []).some((output) => output.required === true),
+    }),
+  );
   const { env, github } = compileAgentEnvironment(trigger, step);
   const agent = compileAt([...stepPath, "agent"], () =>
     compileAgentSelection(trigger.name, step.id, step.agent, namedAgents),
@@ -816,7 +822,10 @@ function compileAgentRuntimes(
     parseDurationMs(step.idle_timeout, `trigger ${trigger.name} step ${step.id} idle_timeout`),
   );
   if (idleTimeoutMs > maxRuntimeMs) {
-    throw new Error(`step ${step.id} idle_timeout must not exceed max_runtime`);
+    throw new HubConfigurationCompilationError(
+      [...stepPath, "idle_timeout"],
+      `step ${step.id} idle_timeout must not exceed max_runtime`,
+    );
   }
   return { maxRuntimeMs, idleTimeoutMs };
 }

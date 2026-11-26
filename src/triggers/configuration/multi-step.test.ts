@@ -149,6 +149,37 @@ describe("a document with steps", () => {
     expect(issue?.message).toContain("differs in agent");
   });
 
+  it("compares background, treats an empty env as none, and sees through a literal template key", () => {
+    const step = (id: string, key: string, extra = "") =>
+      `  - id: ${id}\n    continuation: { mode: key, key: "${key}" }\n    agent: { provider: codex }\n    prompt: Go\n${extra}`;
+    const [background] = issuesOf(
+      manualDocument(step("a", "k") + step("b", "k", "    background: true\n")),
+    );
+    expect(background?.message).toContain("differs in background");
+    expect(issuesOf(manualDocument(step("a", "k") + step("b", "k", "    env: {}\n")))).toEqual([]);
+    const [templated] = issuesOf(
+      manualDocument(step("a", "shared") + step("b", "${{ 'shared' }}", "    background: true\n")),
+    );
+    expect(templated?.path).toBe("steps.1.continuation");
+  });
+
+  it("compares a keyed step across the events of the trigger", () => {
+    const yaml = `name: both\non:\n  manual.run: {}\n  linear.comment_created:\n    connection: linear\n    filters: { from_users: [alice] }\ntarget: { daemon: devbox, cwd: /workspace/app }\nsteps:\n  - id: a\n    continuation: { mode: key, key: shared }\n    agent: { provider: codex }\n    prompt: Go\n`;
+    const [issue] = issuesOf(yaml);
+    expect(issue?.message).toContain("differs in allowed outputs");
+    expect(issue?.message).toContain("on linear.comment_created");
+  });
+
+  it("puts an invalid output schema or idle timeout on the step", () => {
+    const step = (extra: string) =>
+      `  - id: a\n    agent: { provider: codex }\n    prompt: Go\n${extra}`;
+    const [schema] = issuesOf(listDocument(step("    output:\n      schema: { type: bogus }\n")));
+    expect(schema?.path).toBe("steps.0.output.schema");
+    expect(issuesOf(listDocument(step("    idle_timeout: 3h\n")))).toEqual([
+      { path: "steps.0.idle_timeout", message: "step a idle_timeout must not exceed max_runtime" },
+    ]);
+  });
+
   it("counts the automatic reply output as a difference for conversation steps on a chat event", () => {
     const step = (id: string) =>
       `  - id: ${id}\n    continuation: { mode: conversation }\n    agent: { provider: codex }\n    prompt: Go\n`;

@@ -71,16 +71,19 @@ sum of its steps' deadlines, up to the 24 hour limit every deadline has. Each st
 ## Continuation
 
 Follow-up replies continue a step only when that step says so. In a `steps` list, an agent step without
-`continuation` starts a new agent every time. Set `continuation: conversation` or
+`continuation` starts a new agent every time. Set `continuation: { mode: conversation }` or
 `continuation: { mode: key, key: ... }` on a step to continue an earlier conversation.
 
 `run` is different: it keeps `continuation: conversation` as its default. So a one-item `steps` list
 without `continuation` behaves like `run` with `continuation: new`.
 
 Steps that continue the same conversation share one agent session, and a session only accepts steps that
-match in agent, `env`, `github`, output schema and allowed outputs. Hub refuses a document where two such
-steps differ, at `steps.N.continuation`, and says which fields differ. Give one step `continuation: new`
-or a different key. On Slack, Discord, Linear and GitHub events the reply output is added to the last
+match in agent, `env`, `github`, `background`, output schema and allowed outputs. Hub refuses a document
+where two such steps differ, at `steps.N.continuation`, and says which fields differ. Give one step
+`continuation: new` or a different key. A key is shared by every event of the trigger, so one keyed step
+on a chat event and on a manual event differs in its reply output too. A key written as a template is
+compared by its text when it reads nothing from the event. A key that reads inputs or event data is
+checked when the step dispatches. On Slack, Discord, Linear and GitHub events the reply output is added to the last
 agent step, so two steps that both use `continuation: conversation` always differ there.
 
 ## Choosing between agents

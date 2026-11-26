@@ -364,7 +364,7 @@ export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
 
 function assertContinuations(events: readonly CompiledTrigger[]): void {
   const issues = new Map<string, TriggerDocumentIssue>();
-  for (const issue of events.flatMap(continuationIssues)) {
+  for (const issue of continuationIssues(events)) {
     issues.set(`${issue.path.join(".")}:${issue.message}`, issue);
   }
   if (issues.size > 0) throw new TriggerDocumentError([...issues.values()]);

@@ -5,7 +5,6 @@ import type {
   CompiledAgentStep,
   CompiledTrigger,
 } from "../../config/compiler.js";
-import type { Continuation } from "../continuation.js";
 import { canonicalJson } from "./canonical-json.js";
 import type { TriggerDocumentIssue } from "./document.js";
 import {
@@ -20,6 +19,11 @@ import {
   type TriggerScriptStep,
   type TriggerStep,
 } from "./schema.js";
+import {
+  expressionPathsInTemplate,
+  renderExpressionTemplate,
+  type ExpressionContext,
+} from "../../workflows/expression.js";
 import { stepContinuation } from "./steps.js";
 
 export function authoredSteps(steps: readonly TriggerStep[]): AuthoredStep[] {
@@ -115,39 +119,74 @@ export function withAutomaticReply(trigger: CompiledTrigger): CompiledTrigger {
 
 /**
  * Agent steps that continue the same conversation share one session, and a session only accepts
- * steps with the same agent, env, github grant, output schema and allowed outputs. Refuse that at
- * save time instead of failing the second step when it dispatches.
+ * steps with the same agent, env, github grant, background setting, output schema and allowed
+ * outputs. Refuse that at save time instead of failing the second step when it dispatches. A key
+ * is shared across the trigger's events, so the same step on two events is compared too. A key
+ * that reads inputs or event data is only known at dispatch, and is checked there.
  */
-export function continuationIssues(trigger: CompiledTrigger): TriggerDocumentIssue[] {
+export function continuationIssues(triggers: readonly CompiledTrigger[]): TriggerDocumentIssue[] {
   const issues: TriggerDocumentIssue[] = [];
-  const firstWith = new Map<string, { id: string; step: CompiledAgentStep }>();
-  for (const [index, step] of trigger.steps.entries()) {
-    const key = isScriptStep(step) ? undefined : sharedSessionKey(step.continuation, trigger.on);
-    if (isScriptStep(step) || key === undefined) continue;
-    const first = firstWith.get(key);
-    if (first === undefined) {
-      firstWith.set(key, { id: step.id, step });
-      continue;
-    }
-    const differing = sessionDifferences(first.step, step);
-    if (differing.length > 0) {
-      issues.push({
-        path: ["steps", index, "continuation"],
-        message: `Step "${step.id}" continues the same conversation as step "${first.id}" but differs in ${differing.join(", ")}. A conversation only continues across steps that match in those. Give one of them continuation: new, or a different key.`,
-      });
+  const firstWith = new Map<string, SessionStep>();
+  for (const trigger of triggers) {
+    for (const [index, step] of trigger.steps.entries()) {
+      const key = isScriptStep(step) ? undefined : sharedSessionKey(trigger, step);
+      if (isScriptStep(step) || key === undefined) continue;
+      const here: SessionStep = { id: step.id, step, event: trigger.on };
+      const first = firstWith.get(key);
+      if (first === undefined) {
+        firstWith.set(key, here);
+        continue;
+      }
+      const differing = sessionDifferences(first.step, step);
+      if (differing.length > 0) {
+        issues.push({
+          path: ["steps", index, "continuation"],
+          message: conflictMessage(first, here, differing),
+        });
+      }
     }
   }
   return issues;
 }
 
-function sharedSessionKey(
-  continuation: Continuation | undefined,
-  event: string,
-): string | undefined {
+interface SessionStep {
+  id: string;
+  step: CompiledAgentStep;
+  event: string;
+}
+
+function conflictMessage(first: SessionStep, here: SessionStep, differing: string[]): string {
+  const where = (item: SessionStep) => (first.event === here.event ? "" : ` on ${item.event}`);
+  return `Step "${here.id}"${where(here)} continues the same conversation as step "${first.id}"${where(first)} but differs in ${differing.join(", ")}. A conversation only continues across steps that match in those. Give one of them continuation: new, or a different key.`;
+}
+
+const EMPTY_CONTEXT: ExpressionContext = {
+  prompt: "",
+  context: null,
+  inputs: {},
+  steps: {},
+  values: {},
+};
+
+/** A key that reads nothing from the event is the same text whether or not it is templated. */
+function staticKey(key: string): string {
+  try {
+    if (expressionPathsInTemplate(key).length === 0) {
+      return renderExpressionTemplate(key, EMPTY_CONTEXT);
+    }
+  } catch {
+    // Dispatch reports a key that cannot be rendered.
+  }
+  return key;
+}
+
+function sharedSessionKey(trigger: CompiledTrigger, step: CompiledAgentStep): string | undefined {
+  const { continuation } = step;
   if (continuation === undefined || continuation.mode === "new") return undefined;
-  if (continuation.mode === "key") return `key:${continuation.key}`;
-  // Without a conversation to continue, conversation mode starts a new agent.
-  return automaticReplyType(event) === undefined ? undefined : "conversation";
+  if (continuation.mode === "key") return `key:${staticKey(continuation.key)}`;
+  // Without a conversation to continue, conversation mode starts a new agent. A conversation
+  // belongs to one event, so another event's steps never share it.
+  return automaticReplyType(trigger.on) === undefined ? undefined : `conversation:${trigger.on}`;
 }
 
 function sessionDifferences(left: CompiledAgentStep, right: CompiledAgentStep): string[] {
@@ -155,8 +194,9 @@ function sessionDifferences(left: CompiledAgentStep, right: CompiledAgentStep): 
     [...step.allowOutputs].sort((a, b) => a.type.localeCompare(b.type));
   const fields: [string, unknown, unknown][] = [
     ["agent", left.agent, right.agent],
-    ["env", left.env, right.env],
-    ["github", left.github, right.github],
+    ["env", left.env ?? {}, right.env ?? {}],
+    ["github", left.github ?? null, right.github ?? null],
+    ["background", left.background, right.background],
     ["output schema", left.output, right.output],
     ["allowed outputs", outputs(left), outputs(right)],
   ];
