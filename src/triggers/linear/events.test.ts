@@ -153,3 +153,23 @@ it.each([
     accepted,
   );
 });
+
+it.each([
+  ["  https://linear.app  ", "https://linear.app"],
+  ["ftp://example.com/file", "ftp://example.com/file"],
+  ["http:x", "http:x"],
+])("retains the legacy normalized URL for %j", (url, expected) => {
+  const event = normalizeComment({ issue: { id: "issue-1", title: "Issue", url } });
+  assert.equal(event?.issue?.url, expected);
+});
+
+it.each([
+  ["2026-01-02T00:00:00+01:00", false],
+  ["2026-01-02T00:00:00", false],
+  ["2026-01-02T00:00:00.123456Z", true],
+])("checks the timestamp suffix and precision for %s", (occurredAt, accepted) => {
+  const event = normalizeComment({});
+  const result = NormalizedLinearEventSchema.safeParse({ ...event, occurredAt });
+  assert.equal(result.success, accepted);
+  assert.equal(result.data?.occurredAt, accepted ? occurredAt : undefined);
+});
