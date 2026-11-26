@@ -297,7 +297,7 @@ describe("durable Hub action acknowledgement state", () => {
 
     assert.equal(failureHooks, 0);
     const pendingDelivery = await database.findTriggerRunById(run.id);
-    assert.equal(pendingDelivery?.status, "failed");
+    assert.equal(pendingDelivery?.status, "timed_out");
     assert.equal(pendingDelivery?.outcome, "accepted");
     assert.equal(
       pendingDelivery?.outcome === "accepted"

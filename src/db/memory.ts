@@ -3635,7 +3635,7 @@ class MemoryDatabase implements Database {
     if (run.status === "running") {
       this.triggerRuns.set(run.id, {
         ...this.pendingTerminalNotification(run, now),
-        status: "failed",
+        status: "timed_out",
         deadlineKind,
         failureReason,
         completedAt: now,
@@ -3758,7 +3758,7 @@ class MemoryDatabase implements Database {
     });
     this.triggerRuns.set(run.id, {
       ...this.pendingTerminalNotification(run, now),
-      status: "failed",
+      status: "timed_out",
       deadlineKind,
       failureReason: stepTimeoutReason(deadlineKind),
       completedAt: now,
@@ -8056,8 +8056,7 @@ function workflowStepCompletionFields(
 
 function workflowRunFailureStatus(input: WorkflowAgentCompletionInput) {
   const stepStatus = input.stepStatus;
-  if (input.deadlineKind === "whole_run") return "timed_out";
-  return input.deadlineKind !== undefined ? "failed" : stepStatus;
+  return input.deadlineKind !== undefined ? "timed_out" : stepStatus;
 }
 
 function stepTimeoutReason(deadlineKind: Exclude<WorkflowDeadlineKind, "whole_run">) {

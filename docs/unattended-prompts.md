@@ -8,7 +8,7 @@ agent calls it, Hub treats the run as unfinished.
 
 Claude sometimes answers with a short "ok" and ends its turn without calling `finish_execution`.
 In one measurement about 30 percent of Claude runs did this. The work was done, but the run sat
-idle until `idle_timeout` passed and Hub marked it failed with `step_idle_timeout`. Permission mode
+idle until `idle_timeout` passed and Hub marked the run timed out with `step_idle_timeout`. Permission mode
 and load did not change the rate. Naming the tool in the prompt made 15 of 15 runs finish.
 
 Hub never rewrites a prompt, so it cannot add that line for you. You add it, or you turn on
@@ -31,7 +31,7 @@ to its execution already, so the tool needs no executionId. The same line works 
 ## Setting: complete_on_turn_end
 
 `complete_on_turn_end` is an option on the agent action. It is off by default. When it is off,
-nothing changes: an agent that stops without calling `finish_execution` fails with
+nothing changes: an agent that stops without calling `finish_execution` times out with
 `step_idle_timeout` once `idle_timeout` passes.
 
 ```yaml
