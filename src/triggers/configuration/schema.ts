@@ -140,9 +140,35 @@ export const TriggerScriptRunSchema = z
   })
   .strict();
 
+/** A step of a multi-step trigger: the run's fields without target, plus an id and a condition. */
+const StepIdentitySchema = {
+  id: z.string().regex(IDENTIFIER),
+  /** Skips the step when it evaluates to false. May read `steps.<id>.outputs` of earlier steps. */
+  if: z.string().min(1).optional(),
+};
+
+export const TriggerAgentStepSchema = TriggerAgentRunSchema.omit({ target: true }).extend(
+  StepIdentitySchema,
+);
+
+export const TriggerScriptStepSchema = TriggerScriptRunSchema.omit({ target: true }).extend(
+  StepIdentitySchema,
+);
+
+/** The most steps one trigger may have. It bounds a run's size and its step table. */
+export const MAX_TRIGGER_STEPS = 20;
+
 export type TriggerAgentRun = z.infer<typeof TriggerAgentRunSchema>;
 export type TriggerScriptRun = z.infer<typeof TriggerScriptRunSchema>;
 export type TriggerRun = TriggerAgentRun | TriggerScriptRun;
+export type TriggerAgentStep = z.infer<typeof TriggerAgentStepSchema>;
+export type TriggerScriptStep = z.infer<typeof TriggerScriptStepSchema>;
+export type TriggerStep = TriggerAgentStep | TriggerScriptStep;
+export type TriggerTarget = z.infer<typeof TriggerTargetSchema>;
+
+export function isScriptStep(step: TriggerStep): step is TriggerScriptStep {
+  return "script" in step;
+}
 
 export function isScriptRun(run: TriggerRun): run is TriggerScriptRun {
   return "script" in run;
@@ -200,8 +226,7 @@ function parseAgentRun(value: object, issue: RunIssue): TriggerRun {
 }
 
 function parseScriptRun(value: object, issue: RunIssue): TriggerRun {
-  const refused = Object.entries(SCRIPT_REJECTED_OPTIONS).filter(([key]) => key in value);
-  for (const [key, message] of refused) issue([key], message);
+  const refused = refuseAgentOptions(value, issue);
   const target: unknown = "target" in value ? value.target : undefined;
   const worktree = typeof target === "object" && target !== null && "worktree" in target;
   if (worktree) {
@@ -210,11 +235,45 @@ function parseScriptRun(value: object, issue: RunIssue): TriggerRun {
       "worktree does not apply to a script. It runs in the working directory as it is.",
     );
   }
-  if (refused.length > 0 || worktree) return z.NEVER;
+  if (refused || worktree) return z.NEVER;
   return readRunResult(TriggerScriptRunSchema.safeParse(value), issue);
 }
 
-function readRunResult(parsed: z.ZodSafeParseResult<TriggerRun>, issue: RunIssue): TriggerRun {
+function refuseAgentOptions(value: object, issue: RunIssue): boolean {
+  const refused = Object.entries(SCRIPT_REJECTED_OPTIONS).filter(([key]) => key in value);
+  for (const [key, message] of refused) issue([key], message);
+  return refused.length > 0;
+}
+
+const STEP_TARGET_MESSAGE =
+  "target is set once for all steps. Put it at the top level of the document, next to steps.";
+
+/**
+ * A step is an agent step or a script step, chosen by the `script` key like `run`, but it never
+ * carries a target: every step shares the document's.
+ */
+export const TriggerStepSchema = z.unknown().transform((value, context): TriggerStep => {
+  const issue: RunIssue = (path, message) => context.addIssue({ code: "custom", path, message });
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    issue([], "A step must be an object with an id and an action: agent and prompt, or script.");
+    return z.NEVER;
+  }
+  if ("target" in value) {
+    issue(["target"], STEP_TARGET_MESSAGE);
+    return z.NEVER;
+  }
+  if ("script" in value) {
+    if (refuseAgentOptions(value, issue)) return z.NEVER;
+    return readRunResult(TriggerScriptStepSchema.safeParse(value), issue);
+  }
+  if (!("agent" in value) && !("prompt" in value)) {
+    issue([], "A step needs an action: agent with prompt, or script.");
+    return z.NEVER;
+  }
+  return readRunResult(TriggerAgentStepSchema.safeParse(value), issue);
+});
+
+function readRunResult<T>(parsed: z.ZodSafeParseResult<T>, issue: RunIssue): T {
   if (parsed.success) return parsed.data;
   for (const found of parsed.error.issues) issue(issuePath(found.path), found.message);
   return z.NEVER;
@@ -236,7 +295,11 @@ export const TriggerDocumentSchema = z
     max_runtime: z.string().min(1).optional(),
     progress_message: z.boolean().optional(),
     reply_message: z.boolean().optional(),
-    run: TriggerRunSchema,
+    /** One step, with its own target. Use `steps` for several. */
+    run: TriggerRunSchema.optional(),
+    /** The target every step shares. Only with `steps`. */
+    target: TriggerTargetSchema.optional(),
+    steps: z.array(TriggerStepSchema).optional(),
   })
   .strict()
   .superRefine((trigger, context) => {
@@ -271,18 +334,113 @@ export const TriggerDocumentSchema = z
         message: "at least one event is required",
       });
     }
-    if (
-      !isScriptRun(trigger.run) &&
-      "choices" in trigger.run.agent &&
-      Object.keys(trigger.run.agent.choices).length === 0
-    ) {
-      context.addIssue({
-        code: "custom",
-        path: ["run", "agent", "choices"],
-        message: "at least one agent choice is required",
-      });
+    for (const { path, agent } of documentAgents(trigger)) {
+      if ("choices" in agent && Object.keys(agent.choices).length === 0) {
+        context.addIssue({
+          code: "custom",
+          path: [...path, "choices"],
+          message: "at least one agent choice is required",
+        });
+      }
     }
-  });
+  })
+  .superRefine(actionIssues);
+
+type AgentSelection = z.infer<typeof TriggerAgentSelectionSchema>;
+interface ActionFields {
+  run?: TriggerRun | undefined;
+  steps?: TriggerStep[] | undefined;
+  target?: TriggerTarget | undefined;
+}
+
+/** Every agent selection in the document, addressed by where it is written. */
+export function documentAgents(
+  document: ActionFields,
+): { path: (string | number)[]; agent: AgentSelection }[] {
+  if (document.run !== undefined) {
+    return isScriptRun(document.run) ? [] : [{ path: ["run", "agent"], agent: document.run.agent }];
+  }
+  const found: { path: (string | number)[]; agent: AgentSelection }[] = [];
+  for (const [index, step] of (document.steps ?? []).entries()) {
+    if (!isScriptStep(step)) found.push({ path: ["steps", index, "agent"], agent: step.agent });
+  }
+  return found;
+}
+
+/** `run` or `steps`, never both, and the fields that go with each. */
+function actionIssues(trigger: ActionFields, context: z.RefinementCtx): void {
+  const issue = (path: (string | number)[], message: string) =>
+    context.addIssue({ code: "custom", path, message });
+  if (trigger.run !== undefined && trigger.steps !== undefined) {
+    issue(["steps"], "Use run for one step or steps for several, not both.");
+  } else if (trigger.run === undefined && trigger.steps === undefined) {
+    issue([], "A trigger needs run for one step or steps for several.");
+  } else if (trigger.run !== undefined) {
+    if (trigger.target !== undefined) {
+      issue(["target"], "A top-level target goes with steps. With run, put target inside run.");
+    }
+  } else if (trigger.steps !== undefined) {
+    stepsIssues(trigger.steps, trigger.target, issue);
+  }
+}
+
+type IssueAdder = (path: (string | number)[], message: string) => void;
+
+function stepsIssues(
+  steps: readonly TriggerStep[],
+  target: TriggerTarget | undefined,
+  issue: IssueAdder,
+): void {
+  if (steps.length === 0) issue(["steps"], "steps needs at least one step.");
+  if (steps.length > MAX_TRIGGER_STEPS) {
+    issue(["steps"], `A trigger can have at most ${String(MAX_TRIGGER_STEPS)} steps.`);
+  }
+  if (target === undefined) {
+    issue(["target"], "steps needs a top-level target with a daemon and a cwd.");
+  } else if (target.worktree !== undefined && steps.some(isScriptStep)) {
+    issue(
+      ["target", "worktree"],
+      "worktree does not apply to a script. It runs in the working directory as it is.",
+    );
+  }
+  const seen = new Set<string>();
+  for (const [index, step] of steps.entries()) {
+    if (seen.has(step.id)) {
+      issue(["steps", index, "id"], `The step id "${step.id}" is used more than once.`);
+    }
+    seen.add(step.id);
+  }
+  choicesIssues(steps, issue);
+}
+
+/**
+ * Compiled triggers hold one table of named agents, so steps that choose between agents must list
+ * the same choices. Otherwise a step could select an agent that only another step declared.
+ */
+function choicesIssues(steps: readonly TriggerStep[], issue: IssueAdder): void {
+  let first: { choices: string } | undefined;
+  for (const [index, step] of steps.entries()) {
+    if (isScriptStep(step) || !("choices" in step.agent)) continue;
+    const choices = canonicalJson(step.agent.choices);
+    if (first === undefined) first = { choices };
+    else if (first.choices !== choices) {
+      issue(
+        ["steps", index, "agent", "choices"],
+        "Steps that choose between agents must list the same choices as the first step that does.",
+      );
+    }
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const entries = Object.entries(value).sort(([left], [right]) => left.localeCompare(right));
+    const body = entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`);
+    return `{${body.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
 
 export type TriggerDocument = z.infer<typeof TriggerDocumentSchema>;
 

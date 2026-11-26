@@ -1,0 +1,86 @@
+# Multi-step triggers
+
+A trigger can run several steps in order when its event arrives. Each step is an agent prompt or a
+shell script. Use `run` for one step and `steps` for two or more. A document has one of them,
+never both.
+
+## YAML
+
+Put the target at the top level of the document. Every step runs on that daemon and in that
+directory.
+
+```yaml
+name: build-check
+on:
+  manual.run:
+    filters:
+      from_users: [alice]
+target:
+  daemon: your-daemon
+  cwd: /workspace/app
+max_runtime: 3h
+steps:
+  - id: build
+    script: npm ci && npm run build
+    max_runtime: 15m
+  - id: review
+    agent: { provider: codex }
+    prompt: Review the build log in the output tail.
+    output:
+      schema:
+        type: object
+        properties:
+          verdict: { enum: [ok, fix] }
+        required: [verdict]
+  - id: fix
+    if: "${{ steps.review.outputs.verdict == 'fix' }}"
+    agent: { provider: codex }
+    prompt: Fix the problems from the review.
+```
+
+A document with `run` is unchanged. It is the same as one step with the id `run`, and its target
+stays inside `run`. Existing triggers, their saved text, and their hashes do not change.
+
+## Rules
+
+| Rule             | Detail                                                                                               |
+| ---------------- | ---------------------------------------------------------------------------------------------------- |
+| `run` or `steps` | Exactly one. Both, or neither, is refused.                                                           |
+| Step count       | 1 to 20. A longer list is refused at `steps`.                                                        |
+| `target`         | Top level, with `steps`. A step with its own `target` is refused. With `run`, target stays in `run`. |
+| `id`             | Required on every step. Letters, digits, `_` and `-`. Unique within the trigger.                     |
+| Step kind        | A step with `script` is a script step. Otherwise it is an agent step with `agent` and `prompt`.      |
+| `if`             | Optional. Skips the step when it is false. It may read `steps.<id>.outputs` of earlier steps.        |
+| `continuation`   | Per agent step. There is no document-level `continuation`.                                           |
+| Reply            | `reply_message` adds the reply output to the last agent step only.                                   |
+
+A step accepts the fields `run` accepts for its kind, except `target`. A script step refuses the
+same agent options as a script `run`. See [script actions](script-actions.md). A `worktree` under
+`target` is refused when any step is a script, because a script runs in the directory as it is.
+
+## When a step fails
+
+A step that fails or times out stops the run. Later steps do not start. There is no
+continue-on-failure option. A step skipped by `if` does not stop the run.
+
+`max_runtime` at the top level is the deadline for the whole run. When you leave it out, the run gets the
+sum of its steps' deadlines, up to the 24 hour limit every deadline has. Each step keeps its own
+`max_runtime`, `idle_timeout` and `startup_timeout`. Any of them ending the run records
+`timed_out`.
+
+## Choosing between agents
+
+A step can use `agent.select` with `choices`, as `run` does. Hub keeps one table of named agents for
+the trigger, so every step that uses `choices` must list the same ones. A step whose choices differ is
+refused at `steps.N.agent.choices`. Steps with an inline `agent` are not affected.
+
+## Step output
+
+A later step reads an earlier step with `${{ steps.<id>.outputs.<field> }}`. The earlier step must
+declare `output.schema`, and only earlier steps can be read. The compiler checks both when you save.
+If the earlier step was skipped by `if`, a step that reads its output fails instead of running with an empty value.
+
+## Errors
+
+Validation errors name the place in the document: `steps.1.if`, `steps.0.id`, `target.daemon`. With
+`run`, they name `run...` as before.

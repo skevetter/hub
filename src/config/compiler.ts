@@ -40,7 +40,7 @@ import { validateConnectionTemplate } from "./connection-template.js";
 const IDENTIFIER = /^[a-z][a-z0-9_-]*$/u;
 const EVENT_NAME = /^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*$/u;
 const DURATION = /^([1-9][0-9]*)(ms|s|m|h)$/u;
-const MAX_DURATION_MS = 24 * 60 * 60_000;
+export const MAX_DURATION_MS = 24 * 60 * 60_000;
 const INPUT_NAME = /^[a-z][a-z0-9_-]*$/u;
 const DYNAMIC_INPUT_REFERENCE = /^\$\{\{\s*paseo\.inputs\.([a-z][a-z0-9_-]*)\s*\}\}$/u;
 const MAX_SCRIPT_BYTES = 64 * 1024;

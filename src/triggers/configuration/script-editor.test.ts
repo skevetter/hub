@@ -14,6 +14,7 @@ import {
 import { SCRIPT_NOTIFICATION_REASONS } from "./events.js";
 import { compileTriggerDocument } from "./index.js";
 import { agentRun, isScriptRun, TriggerDocumentSchema } from "./schema.js";
+import { documentRun } from "./steps.js";
 
 const SCRIPT_YAML = `# keep this heading
 name: build-on-review
@@ -99,8 +100,9 @@ describe("script trigger form bridge", () => {
     expect(yaml).toContain("# keep this heading");
     expect(yaml).toContain("contains: urgent");
     const document = TriggerDocumentSchema.parse(parseDocument(yaml).toJS());
-    expect(isScriptRun(document.run) && document.run.script).toBe("make deploy\nmake verify\n");
-    expect(document.run.max_runtime).toBe("20m");
+    const run = documentRun(document);
+    expect(isScriptRun(run) && run.script).toBe("make deploy\nmake verify\n");
+    expect(run.max_runtime).toBe("20m");
     expect(editable(yaml).script).toBe("make deploy\nmake verify\n");
   });
 
@@ -183,8 +185,8 @@ describe("script trigger form bridge", () => {
       prompt: "Review it.",
     });
     const document = TriggerDocumentSchema.parse(parseDocument(yaml).toJS());
-    expect(isScriptRun(document.run)).toBe(false);
-    expect(agentRun(document.run).prompt).toBe("Review it.");
+    expect(isScriptRun(documentRun(document))).toBe(false);
+    expect(agentRun(documentRun(document)).prompt).toBe("Review it.");
     expect(yaml).not.toContain("script:");
   });
 

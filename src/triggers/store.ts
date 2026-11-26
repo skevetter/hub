@@ -16,7 +16,8 @@ import {
   type TriggerDocument,
   type TriggerDocumentIssue,
 } from "./configuration/index.js";
-import { isScriptRun, type TriggerAgentRun } from "./configuration/schema.js";
+import { documentAgents, isScriptStep, type TriggerAgentRun } from "./configuration/schema.js";
+import { normalizeSteps } from "./configuration/steps.js";
 import {
   supportsUnattendedRuns,
   unattendedModeRefusal,
@@ -155,8 +156,8 @@ export class OrganizationTriggerStore {
       } catch (error) {
         throw new TriggerDocumentError([
           {
-            path: ["run", "target", "daemon"],
-            message: daemonUnavailable(compiled.authored.run.target.daemon, error),
+            path: targetPath(compiled.authored, "daemon"),
+            message: daemonUnavailable(normalizeSteps(compiled.authored).target.daemon, error),
           },
         ]);
       }
@@ -176,16 +177,21 @@ export class OrganizationTriggerStore {
 /** Every agent the document may launch, each addressed by where it is written. */
 function authoredAgents(
   trigger: TriggerDocument,
-): readonly { path: readonly string[]; agent: AuthoredAgent }[] {
+): readonly { path: readonly (string | number)[]; agent: AuthoredAgent }[] {
   // A script has no agent to check against the daemon.
-  if (isScriptRun(trigger.run)) return [];
-  if ("choices" in trigger.run.agent) {
-    return Object.entries(trigger.run.agent.choices).map(([name, agent]) => ({
-      path: ["run", "agent", "choices", name],
-      agent,
-    }));
-  }
-  return [{ path: ["run", "agent"], agent: trigger.run.agent }];
+  return documentAgents(trigger).flatMap(({ path, agent }) =>
+    "choices" in agent
+      ? Object.entries(agent.choices).map(([name, choice]) => ({
+          path: [...path, "choices", name],
+          agent: choice,
+        }))
+      : [{ path, agent }],
+  );
+}
+
+/** Where the target is written: inside `run` for one step, at the top level for several. */
+function targetPath(trigger: TriggerDocument, field: "daemon" | "cwd"): string[] {
+  return normalizeSteps(trigger).shorthand ? ["run", "target", field] : ["target", field];
 }
 
 /** The daemon names fields by its own wire contract; the document names them by its schema. */
@@ -214,18 +220,20 @@ function runtimeChanged(previousYaml: string, compiled: CompiledTriggerDocument)
   } catch {
     return true;
   }
-  const runtime = (document: TriggerDocument) =>
-    JSON.stringify({
-      target: document.run.target,
-      agent: isScriptRun(document.run) ? null : document.run.agent,
+  const runtime = (document: TriggerDocument) => {
+    const { target, steps } = normalizeSteps(document);
+    return JSON.stringify({
+      target,
+      agents: steps.map((step) => (isScriptStep(step) ? null : step.agent)),
     });
+  };
   return runtime(previous) !== runtime(compiled.authored);
 }
 
 function validateAuthoringContract(trigger: TriggerDocument): void {
   const issues: Array<{ path: readonly (string | number)[]; message: string }> = [];
-  if (!trigger.run.target.cwd.startsWith("/")) {
-    issues.push({ path: ["run", "target", "cwd"], message: "must be an absolute path" });
+  if (!normalizeSteps(trigger).target.cwd.startsWith("/")) {
+    issues.push({ path: targetPath(trigger, "cwd"), message: "must be an absolute path" });
   }
   for (const { path, agent } of authoredAgents(trigger)) {
     if (agent.mode === undefined) {

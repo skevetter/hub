@@ -11,6 +11,7 @@ import {
   serializeTriggerDocument,
   TriggerDocumentError,
 } from "./index.js";
+import { documentRun } from "./steps.js";
 
 function reportsMissingEvent(error: unknown): boolean {
   return (
@@ -209,10 +210,11 @@ describe("self-contained trigger documents", () => {
   background: ${background}`,
           );
     const compiled = compileTriggerDocument(yaml);
-    assert.equal(agentRun(compiled.authored.run).background, background ?? false);
+    assert.equal(agentRun(documentRun(compiled.authored)).background, background ?? false);
     assert.equal(agentStep(compiled.events[0]?.steps[0]).background, background ?? false);
     assert.equal(
-      agentRun(parseTriggerDocument(serializeTriggerDocument(compiled.authored)).run).background,
+      agentRun(documentRun(parseTriggerDocument(serializeTriggerDocument(compiled.authored))))
+        .background,
       background ?? false,
     );
   });
@@ -238,7 +240,7 @@ describe("self-contained trigger documents", () => {
       const exported = serializeTriggerDocument(compiled.authored);
       assert.equal(/complete_on_turn_end/u.test(exported), completeOnTurnEnd !== undefined);
       assert.equal(
-        agentRun(parseTriggerDocument(exported).run).complete_on_turn_end,
+        agentRun(documentRun(parseTriggerDocument(exported))).complete_on_turn_end,
         completeOnTurnEnd,
       );
     },
@@ -272,7 +274,7 @@ describe("self-contained trigger documents", () => {
     const compiled = compileTriggerDocument(yaml);
     assert.equal(agentStep(compiled.events[0]?.steps[0]).startupTimeoutMs, 180_000);
     assert.equal(
-      agentRun(parseTriggerDocument(serializeTriggerDocument(compiled.authored)).run)
+      agentRun(documentRun(parseTriggerDocument(serializeTriggerDocument(compiled.authored))))
         .startup_timeout,
       "3m",
     );
@@ -284,7 +286,8 @@ describe("self-contained trigger documents", () => {
     const compiled = compileTriggerDocument(yaml);
     assert.equal(agentStep(compiled.events[0]?.steps[0]).title, title);
     assert.equal(
-      agentRun(parseTriggerDocument(serializeTriggerDocument(compiled.authored)).run).title,
+      agentRun(documentRun(parseTriggerDocument(serializeTriggerDocument(compiled.authored))))
+        .title,
       title,
     );
   });

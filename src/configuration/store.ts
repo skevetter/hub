@@ -1,5 +1,9 @@
 import { parseTriggerDocument } from "../triggers/configuration/index.js";
-import { isScriptRun } from "../triggers/configuration/schema.js";
+import {
+  isScriptStep as isAuthoredScriptStep,
+  type TriggerStep,
+} from "../triggers/configuration/schema.js";
+import { normalizeSteps } from "../triggers/configuration/steps.js";
 import { dump, load } from "js-yaml";
 import { z } from "zod";
 import {
@@ -8,6 +12,7 @@ import {
   parseCompiledHubConfig,
   type CompiledAgent,
   type CompiledHubConfig,
+  type CompiledStep,
   type CompiledTriggerFilter,
   type CompiledTrigger,
 } from "../config/compiler.js";
@@ -310,19 +315,25 @@ export function parseProjectConfiguration(
   // Migrate the newly introduced default at the authored-document boundary. Existing
   // execution launch intents remain untouched and finish with their original contract.
   const document = triggerDocument(revision);
-  if (document !== undefined && !isScriptRun(document.run)) {
-    const policy = document.run.continuation;
+  if (document !== undefined) {
+    const { steps } = normalizeSteps(document);
     return toProjectConfiguration({
       ...configuration,
       triggers: configuration.triggers.map((trigger) => ({
         ...trigger,
-        steps: trigger.steps.map((step) =>
-          isScriptStep(step) ? step : { ...step, continuation: step.continuation ?? policy },
-        ),
+        steps: trigger.steps.map((step, index) => withAuthoredContinuation(step, steps[index])),
       })),
     });
   }
   return toProjectConfiguration(configuration);
+}
+
+function withAuthoredContinuation(
+  step: CompiledStep,
+  authored: TriggerStep | undefined,
+): CompiledStep {
+  if (isScriptStep(step) || authored === undefined || isAuthoredScriptStep(authored)) return step;
+  return { ...step, continuation: step.continuation ?? authored.continuation };
 }
 
 /**

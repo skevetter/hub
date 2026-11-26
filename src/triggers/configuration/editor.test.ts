@@ -22,6 +22,7 @@ import {
   GITHUB_SEMANTIC_TRIGGER_EVENT_NAMES,
   GITHUB_TRIGGER_SOURCE_NAMES,
 } from "../github/classification.js";
+import { documentRun } from "./steps.js";
 
 const ADVANCED = `# keep this heading
 name: answer
@@ -89,7 +90,7 @@ run:
     const trigger = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
     expect(trigger.on["manual.run"]?.filters?.from_users).toEqual(["alice", "bob"]);
     expect(saved.yaml).toContain("# named webhook callers");
-    expect(trigger.run.target.cwd).toBe("/new-workspace");
+    expect(documentRun(trigger).target.cwd).toBe("/new-workspace");
   });
 
   test("preserves YAML aliases and their comments during an unrelated form edit", () => {
@@ -127,12 +128,12 @@ run:
     });
     expect(yaml).toContain("# keep this heading");
     const value = TriggerDocumentSchema.parse(parseDocument(yaml).toJS());
-    expect(value.run.target).toEqual({
+    expect(documentRun(value).target).toEqual({
       daemon: "office",
       cwd: "/new-workspace",
       worktree: { mode: "branch-off", newBranch: "hub-work" },
     });
-    expect(agentRun(value.run).agent).toEqual({
+    expect(agentRun(documentRun(value)).agent).toEqual({
       provider: "pi",
       model: "gateway/vendor/model-v1",
       mode: "safe",
@@ -141,15 +142,15 @@ run:
     });
     expect(value.inputs).toBeDefined();
     expect(value.max_runtime).toBe("4h");
-    expect(agentRun(value.run).startup_timeout).toBe("3m");
-    expect(agentRun(value.run).env).toEqual({ TEAM: "core" });
-    expect(agentRun(value.run).github).toEqual({
+    expect(agentRun(documentRun(value)).startup_timeout).toBe("3m");
+    expect(agentRun(documentRun(value)).env).toEqual({ TEAM: "core" });
+    expect(agentRun(documentRun(value)).github).toEqual({
       connection: "company-github",
       repositories: ["paseo/hub"],
     });
-    expect(agentRun(value.run).output).toBeDefined();
-    expect(agentRun(value.run).outputs).toEqual({ "slack.reply": { max: 3 } });
-    expect(agentRun(value.run).auto_archive).toBe(false);
+    expect(agentRun(documentRun(value)).output).toBeDefined();
+    expect(agentRun(documentRun(value)).outputs).toEqual({ "slack.reply": { max: 3 } });
+    expect(agentRun(documentRun(value)).auto_archive).toBe(false);
     expect(value.on["slack.mention"]?.filters?.channels).toEqual(["engineering"]);
   });
 
@@ -161,7 +162,7 @@ run:
       providerOptions: '{"sandbox_mode":"read-only"}',
     });
     const value = TriggerDocumentSchema.parse(parseDocument(yaml).toJS());
-    const { agent } = agentRun(value.run);
+    const { agent } = agentRun(documentRun(value));
     if ("choices" in agent) throw new Error("expected an inline agent");
     expect(agent.options).toEqual({ sandbox_mode: "read-only" });
     expect(agent.thinkingOptionId).toBe("xhigh");
@@ -174,9 +175,9 @@ run:
     if (merged.status !== "ok") throw new Error(merged.reason);
     expect(merged.yaml).toContain("# keep this heading");
     const value = TriggerDocumentSchema.parse(parseDocument(merged.yaml).toJS());
-    expect(agentRun(value.run).prompt).toBe("Changed.");
-    expect(agentRun(value.run).target.worktree).toBeDefined();
-    expect(agentRun(value.run).outputs).toBeDefined();
+    expect(agentRun(documentRun(value)).prompt).toBe("Changed.");
+    expect(agentRun(documentRun(value)).target.worktree).toBeDefined();
+    expect(agentRun(documentRun(value)).outputs).toBeDefined();
   });
 
   test("keeps unsupported shapes in YAML-only mode", () => {
@@ -1005,7 +1006,7 @@ test("preserves an explicit empty manual caller list during an unrelated edit", 
   expect(saved.yaml).toContain("# nobody can invoke this");
   const parsed = TriggerDocumentSchema.parse(parseDocument(saved.yaml).toJS());
   expect(parsed.on["manual.run"]?.filters?.from_users).toEqual([]);
-  expect(parsed.run.target.cwd).toBe("/other");
+  expect(documentRun(parsed).target.cwd).toBe("/other");
 });
 
 test("clearing an aliased list leaves the original list and its other aliases in place", () => {
@@ -1036,5 +1037,5 @@ test("keeps an anchored progress flag and its alias during an unrelated edit", (
   if (saved.status !== "ok") throw new Error(saved.reason);
   expect(saved.yaml).toContain("progress_message: &flag false");
   expect(saved.yaml).toContain("report: *flag");
-  expect(parseTriggerDocument(saved.yaml).run.target.cwd).toBe("/other");
+  expect(documentRun(parseTriggerDocument(saved.yaml)).target.cwd).toBe("/other");
 });
