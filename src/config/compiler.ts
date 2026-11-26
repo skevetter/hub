@@ -5,7 +5,7 @@ import {
   replyMessageError,
   SCRIPT_NOTIFICATION_REASONS,
 } from "../triggers/configuration/events.js";
-import { ContinuationSchema } from "../triggers/continuation.js";
+import { ContinuationSchema, type Continuation } from "../triggers/continuation.js";
 import {
   hasProgressDestination,
   PROGRESS_DESTINATION_REQUIRED,
@@ -47,7 +47,7 @@ const MAX_SCRIPT_BYTES = 64 * 1024;
 const EXPRESSION_START = "${{";
 const EXPRESSION_END = "}}";
 
-const InputValueSchema = z.union([z.string(), z.number().finite(), z.boolean()]);
+const InputValueSchema = z.union([z.string(), z.number(), z.boolean()]);
 
 const AuthoredInputSchema = z
   .object({
@@ -84,7 +84,7 @@ const AllowOutputSchema = z
   .superRefine((output, context) => {
     if (output.max === 0) {
       context.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: "custom",
         path: ["max"],
         message:
           output.required === true
@@ -126,12 +126,12 @@ const AuthoredTriggerFilterSchema = z
   .strict();
 
 const CompiledTriggerFilterSchema = AuthoredTriggerFilterSchema.extend({
-  connectionId: z.string().uuid().optional(),
+  connectionId: z.uuid().optional(),
   resourceId: z.string().min(1).optional(),
 }).superRefine((filter, context) => {
   if (filter.resourceId !== undefined && filter.connectionId === undefined) {
     context.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: "custom",
       path: ["resourceId"],
       message: "resourceId requires connectionId",
     });
@@ -306,7 +306,7 @@ export interface CompiledInput {
 
 export interface CompiledAgentStep {
   kind?: "agent" | undefined;
-  continuation?: import("../triggers/continuation.js").Continuation | undefined;
+  continuation?: Continuation | undefined;
   id: string;
   environment: string;
   maxRuntimeMs: number;
@@ -566,14 +566,13 @@ export function compileHubConfig(
   );
   validateEnvironmentTemplates(authored.environments);
   const triggers = authored.triggers.map((trigger) =>
-    compileTrigger(
-      trigger,
+    compileTrigger(trigger, {
       environmentNames,
       environments,
-      options.resolvedPromptPartials,
-      options.namedAgents ?? {},
-      options.sourceFiles?.[trigger.name],
-    ),
+      resolvedPromptPartials: options.resolvedPromptPartials,
+      namedAgents: options.namedAgents ?? {},
+      sourceFile: options.sourceFiles?.[trigger.name],
+    }),
   );
   const compiled = { environments: authored.environments, triggers } satisfies CompiledHubConfig;
   validateCompiledContract(compiled);
@@ -626,14 +625,22 @@ export function parseDurationMs(value: string, field: string): number {
   return duration;
 }
 
+interface StepCompilationOptions {
+  environmentNames: ReadonlySet<string>;
+  environments: ReadonlyMap<string, AuthoredEnvironment>;
+  resolvedPromptPartials: ResolvedPromptPartials | undefined;
+  namedAgents: Readonly<Record<string, CompiledAgent>>;
+}
+
+interface TriggerCompilationOptions extends StepCompilationOptions {
+  sourceFile: string | undefined;
+}
+
 function compileTrigger(
   trigger: AuthoredTrigger,
-  environmentNames: ReadonlySet<string>,
-  environments: ReadonlyMap<string, AuthoredEnvironment>,
-  resolvedPromptPartials: ResolvedPromptPartials | undefined,
-  namedAgents: Readonly<Record<string, CompiledAgent>>,
-  sourceFile: string | undefined,
+  options: TriggerCompilationOptions,
 ): CompiledTrigger {
+  const { environmentNames, environments, sourceFile } = options;
   const triggerPath = ["triggers", trigger.name] as const;
   compileAt([...triggerPath, "on"], () => {
     if (!EVENT_NAME.test(trigger.on)) throw new Error(`invalid trigger event: ${trigger.on}`);
@@ -654,9 +661,7 @@ function compileTrigger(
   compileAt([...triggerPath, "steps"], () =>
     validateEnvironmentInputChoices(trigger, inputs, environmentNames, environments),
   );
-  const steps = trigger.steps.map((step) =>
-    compileStep(trigger, step, environmentNames, environments, resolvedPromptPartials, namedAgents),
-  );
+  const steps = trigger.steps.map((step) => compileStep(trigger, step, options));
   const values = compileValues(trigger);
   const compiled = {
     name: trigger.name,
@@ -679,11 +684,9 @@ function compileTrigger(
 function compileStep(
   trigger: AuthoredTrigger,
   step: AuthoredStep,
-  environmentNames: ReadonlySet<string>,
-  environments: ReadonlyMap<string, AuthoredEnvironment>,
-  resolvedPromptPartials: ResolvedPromptPartials | undefined,
-  namedAgents: Readonly<Record<string, CompiledAgent>>,
+  options: StepCompilationOptions,
 ): CompiledStep {
+  const { environmentNames, environments, resolvedPromptPartials, namedAgents } = options;
   checkStepEnvironment(trigger, step, environmentNames, environments);
   if ("script" in step) return compileScriptStep(trigger, step);
   return compileAgentStep(trigger, step, resolvedPromptPartials, namedAgents);
@@ -714,10 +717,7 @@ function compileScriptStep(trigger: AuthoredTrigger, step: AuthoredScriptStep): 
   const maxRuntimeMs = compileAt([...stepPath, "max_runtime"], () =>
     parseDurationMs(step.max_runtime, `trigger ${trigger.name} step ${step.id} max_runtime`),
   );
-  const condition =
-    step.if === undefined
-      ? undefined
-      : compileAt([...stepPath, "if"], () => parseExpression(step.if!));
+  const condition = compileStepCondition(step.if, stepPath);
   compileAt([...stepPath, "script"], () => validateScriptText(step.script));
   return {
     kind: "script",
@@ -727,6 +727,15 @@ function compileScriptStep(trigger: AuthoredTrigger, step: AuthoredScriptStep): 
     script: step.script,
     ...(condition === undefined ? {} : { condition }),
   };
+}
+
+function compileStepCondition(
+  condition: string | undefined,
+  stepPath: readonly string[],
+): Expression | undefined {
+  return condition === undefined
+    ? undefined
+    : compileAt([...stepPath, "if"], () => parseExpression(condition));
 }
 
 /**
@@ -753,19 +762,8 @@ function compileAgentStep(
   namedAgents: Readonly<Record<string, CompiledAgent>>,
 ): CompiledAgentStep {
   const stepPath = ["triggers", trigger.name, "steps", step.id] as const;
-  const maxRuntimeMs = compileAt([...stepPath, "max_runtime"], () =>
-    parseDurationMs(step.max_runtime, `trigger ${trigger.name} step ${step.id} max_runtime`),
-  );
-  const idleTimeoutMs = compileAt([...stepPath, "idle_timeout"], () =>
-    parseDurationMs(step.idle_timeout, `trigger ${trigger.name} step ${step.id} idle_timeout`),
-  );
-  if (idleTimeoutMs > maxRuntimeMs) {
-    throw new Error(`step ${step.id} idle_timeout must not exceed max_runtime`);
-  }
-  const condition =
-    step.if === undefined
-      ? undefined
-      : compileAt([...stepPath, "if"], () => parseExpression(step.if!));
+  const { maxRuntimeMs, idleTimeoutMs } = compileAgentRuntimes(trigger, step, stepPath);
+  const condition = compileStepCondition(step.if, stepPath);
   const outputDeclaration =
     step.output === undefined ? undefined : { schema: cloneJsonValue(step.output.schema) };
   if (outputDeclaration !== undefined)
@@ -775,26 +773,22 @@ function compileAgentStep(
     structuredOutput: outputDeclaration !== undefined,
     requiredOutputs: (step.allow_outputs ?? []).some((output) => output.required === true),
   });
-  const env = step.env === undefined ? undefined : { ...step.env };
-  const github =
-    step.github === undefined
-      ? undefined
-      : compileGitHubAuthority(step.github, `trigger ${trigger.name} step ${step.id} github`);
-  validateStepEnvironmentContract(trigger.name, trigger.on, step.id, env, github);
+  const { env, github } = compileAgentEnvironment(trigger, step);
   const agent = compileAt([...stepPath, "agent"], () =>
     compileAgentSelection(trigger.name, step.id, step.agent, namedAgents),
   );
+  const startupTimeout = step.startup_timeout;
   return {
     id: step.id,
     environment: step.environment,
     maxRuntimeMs,
     idleTimeoutMs,
-    ...(step.startup_timeout === undefined
+    ...(startupTimeout === undefined
       ? {}
       : {
           startupTimeoutMs: compileAt([...stepPath, "startup_timeout"], () =>
             parseDurationMs(
-              step.startup_timeout!,
+              startupTimeout,
               `trigger ${trigger.name} step ${step.id} startup_timeout`,
             ),
           ),
@@ -806,6 +800,39 @@ function compileAgentStep(
     ...(github === undefined ? {} : { github }),
     ...(condition === undefined ? {} : { condition }),
     ...(outputDeclaration === undefined ? {} : { output: outputDeclaration }),
+    ...compileAgentOutputOptions(step),
+  };
+}
+
+function compileAgentRuntimes(
+  trigger: AuthoredTrigger,
+  step: AuthoredAgentStep,
+  stepPath: readonly string[],
+) {
+  const maxRuntimeMs = compileAt([...stepPath, "max_runtime"], () =>
+    parseDurationMs(step.max_runtime, `trigger ${trigger.name} step ${step.id} max_runtime`),
+  );
+  const idleTimeoutMs = compileAt([...stepPath, "idle_timeout"], () =>
+    parseDurationMs(step.idle_timeout, `trigger ${trigger.name} step ${step.id} idle_timeout`),
+  );
+  if (idleTimeoutMs > maxRuntimeMs) {
+    throw new Error(`step ${step.id} idle_timeout must not exceed max_runtime`);
+  }
+  return { maxRuntimeMs, idleTimeoutMs };
+}
+
+function compileAgentEnvironment(trigger: AuthoredTrigger, step: AuthoredAgentStep) {
+  const env = step.env === undefined ? undefined : { ...step.env };
+  const github =
+    step.github === undefined
+      ? undefined
+      : compileGitHubAuthority(step.github, `trigger ${trigger.name} step ${step.id} github`);
+  validateStepEnvironmentContract(trigger, step.id, { env, github });
+  return { env, github };
+}
+
+function compileAgentOutputOptions(step: AuthoredAgentStep) {
+  return {
     allowOutputs: (step.allow_outputs ?? []).map((allowOutput) => ({
       type: allowOutput.type,
       max: allowOutput.max ?? 1,
@@ -951,17 +978,7 @@ function compileInputs(trigger: AuthoredTrigger): Readonly<Record<string, Compil
     if (!matchesInputType(input.default, input.type)) {
       throw new Error(`trigger ${trigger.name} input ${name} default does not match type`);
     }
-    if (input.choices !== undefined) {
-      if (input.choices.some((choice) => !matchesInputType(choice, input.type))) {
-        throw new Error(`trigger ${trigger.name} input ${name} choices do not match type`);
-      }
-      if (
-        input.default !== undefined &&
-        !input.choices.some((choice) => choice === input.default)
-      ) {
-        throw new Error(`trigger ${trigger.name} input ${name} default is not an allowed choice`);
-      }
-    }
+    validateInputChoices(input, `trigger ${trigger.name} input ${name}`);
     compiled[name] = {
       type: input.type,
       required: input.required ?? false,
@@ -970,6 +987,19 @@ function compileInputs(trigger: AuthoredTrigger): Readonly<Record<string, Compil
     };
   }
   return compiled;
+}
+
+function validateInputChoices(
+  input: Pick<CompiledInput, "type" | "default" | "choices"> | AuthoredInput,
+  path: string,
+): void {
+  if (input.choices === undefined) return;
+  if (input.choices.some((choice) => !matchesInputType(choice, input.type))) {
+    throw new Error(`${path} choices do not match type`);
+  }
+  if (input.default !== undefined && !input.choices.some((choice) => choice === input.default)) {
+    throw new Error(`${path} default is not an allowed choice`);
+  }
 }
 
 function validateInputFilters(
@@ -1000,11 +1030,7 @@ function validateEnvironmentInputChoices(
   environments: ReadonlyMap<string, AuthoredEnvironment>,
 ): void {
   for (const step of trigger.steps) {
-    const reference = DYNAMIC_INPUT_REFERENCE.exec(step.environment);
-    if (reference === null) continue;
-    const input = inputs[reference[1]!];
-    if (input === undefined || input.choices === undefined) continue;
-    for (const choice of input.choices) {
+    for (const choice of environmentInputChoices(step.environment, inputs)) {
       if (typeof choice !== "string" || !environmentNames.has(choice)) {
         throw new Error(
           `trigger ${trigger.name} step ${step.id} environment choice ${String(choice)} is not a configured environment`,
@@ -1028,18 +1054,12 @@ function validateCompiledInputs(trigger: CompiledTrigger): void {
     if (input.required && input.default !== undefined) {
       throw new Error(`input ${name} cannot be both required and defaulted`);
     }
-    if (input.choices !== undefined) {
-      if (input.choices.some((choice) => !matchesInputType(choice, input.type))) {
-        throw new Error(`input ${name} choices do not match type`);
-      }
-      if (
-        input.default !== undefined &&
-        !input.choices.some((choice) => choice === input.default)
-      ) {
-        throw new Error(`input ${name} default is not an allowed choice`);
-      }
-    }
+    validateInputChoices(input, `input ${name}`);
   }
+  validateCompiledInputFilters(trigger);
+}
+
+function validateCompiledInputFilters(trigger: CompiledTrigger): void {
   for (const [name, value] of Object.entries(trigger.filters?.inputs ?? {})) {
     const input = trigger.inputs[name];
     if (input === undefined || !matchesInputType(value, input.type)) {
@@ -1051,272 +1071,379 @@ function validateCompiledInputs(trigger: CompiledTrigger): void {
   }
 }
 
+interface ExpressionContract {
+  trigger: CompiledTrigger;
+  environments: ReadonlyMap<string, AuthoredEnvironment | CompiledEnvironment>;
+  environmentNames: ReadonlySet<string>;
+  stepOrdinals: ReadonlyMap<string, number>;
+  valueNames: ReadonlySet<string>;
+  visiting: Set<string>;
+}
+
+interface ExpressionSite {
+  ordinal: number;
+  path: string;
+  authorityBearing?: boolean;
+  contextAllowed?: boolean;
+}
+
 function validateExpressionContract(
   triggerName: string,
   trigger: CompiledTrigger,
-  environments: ReadonlyMap<string, AuthoredEnvironment | CompiledEnvironment>,
+  environments: ExpressionContract["environments"],
 ): void {
-  const environmentNames = new Set(environments.keys());
-  const stepOrdinals = new Map(trigger.steps.map((step, ordinal) => [step.id, ordinal]));
-  const valueNames = new Set(Object.keys(trigger.values));
-  const visiting = new Set<string>();
+  const contract: ExpressionContract = {
+    trigger,
+    environments,
+    environmentNames: new Set(environments.keys()),
+    stepOrdinals: new Map(trigger.steps.map((step, ordinal) => [step.id, ordinal])),
+    valueNames: new Set(Object.keys(trigger.values)),
+    visiting: new Set<string>(),
+  };
 
-  for (const name of valueNames) validateValue(name);
+  for (const name of contract.valueNames) validateValue(contract, name);
   for (const [ordinal, step] of trigger.steps.entries()) {
-    if (step.condition !== undefined)
-      compileAt(["triggers", triggerName, "steps", step.id, "if"], () =>
-        validateExpression(step.condition!, ordinal, `step ${step.id} if`, false),
-      );
-    compileAt(["triggers", triggerName, "steps", step.id, "environment"], () => {
-      validateTemplate(step.environment, ordinal, `step ${step.id} environment`, true);
-      validateEnvironmentSelection(step.environment, ordinal, step.id);
-    });
-    if (isScriptStep(step)) continue;
-    if (step.title !== undefined)
-      compileAt(["triggers", triggerName, "steps", step.id, "title"], () =>
-        validateTitleTemplate(step.title!, `step ${step.id} title`),
-      );
-    if ("selector" in step.agent) {
-      const selection = step.agent;
-      compileAt(["triggers", triggerName, "steps", step.id, "agent"], () => {
-        validateTemplate(selection.selector, ordinal, `step ${step.id} agent`, true);
-        const selected = finiteTemplateValues(selection.selector, ordinal);
-        if (selected === undefined) {
-          throw new Error(`step ${step.id} agent must resolve from finite choices`);
-        }
-        for (const name of selected) {
-          if (!Object.hasOwn(selection.choices, name)) {
-            throw new Error(`step ${step.id} agent resolves to unknown named agent ${name}`);
-          }
-        }
-      });
-    }
-    for (const [index, block] of step.prompt.entries()) {
-      compileAt(["triggers", triggerName, "steps", step.id, "prompt", index], () =>
-        validateTemplate(
-          block.kind === "text" ? block.value : block.content,
-          ordinal,
-          `step ${step.id} prompt[${index}]`,
-          false,
-          true,
-        ),
-      );
-    }
+    validateStepExpressions(contract, step, ordinal, ["triggers", triggerName, "steps", step.id]);
   }
-
-  function validateEnvironmentSelection(template: string, ordinal: number, stepId: string): void {
-    const selected = finiteTemplateValues(template, ordinal);
-    if (selected === undefined) {
-      throw new Error(`step ${stepId} environment must resolve from finite choices`);
-    }
-    for (const name of selected) {
-      if (!environmentNames.has(name)) {
-        throw new Error(`step ${stepId} resolves to unknown environment ${name}`);
-      }
-      if (environments.get(name)?.kind !== "daemon") {
-        throw new Error(`step ${stepId} environment ${name} must be a daemon environment`);
-      }
-    }
-  }
-
-  function finiteTemplateValues(template: string, ordinal: number): readonly string[] | undefined {
-    let results = [""];
-    let cursor = 0;
-    while (cursor < template.length) {
-      const start = template.indexOf(EXPRESSION_START, cursor);
-      if (start < 0) return results.map((prefix) => prefix + template.slice(cursor));
-      const end = template.indexOf(EXPRESSION_END, start + EXPRESSION_START.length);
-      if (end < 0) return undefined;
-      const literal = template.slice(cursor, start);
-      const choices = finiteExpressionValues(
-        parseExpression(template.slice(start + EXPRESSION_START.length, end)),
-        ordinal,
-      );
-      if (choices === undefined) return undefined;
-      results = results.flatMap((prefix) =>
-        choices.map((choice) => prefix + literal + interpolatedValue(choice)),
-      );
-      cursor = end + EXPRESSION_END.length;
-    }
-    return [...new Set(results)];
-  }
-
-  function finiteExpressionValues(
-    expression: Expression,
-    ordinal: number,
-  ): readonly JsonValue[] | undefined {
-    if (expression.kind === "literal") return [expression.value];
-    if (expression.kind === "path") return finitePathValues(expression.value, ordinal);
-    if (expression.kind === "not") {
-      const values = finiteExpressionValues(expression.value, ordinal);
-      return values === undefined ? undefined : [...new Set(values.map((value) => !truthy(value)))];
-    }
-    const left = finiteExpressionValues(expression.left, ordinal);
-    const right = finiteExpressionValues(expression.right, ordinal);
-    if (left === undefined || right === undefined) return undefined;
-    const results: JsonValue[] = [];
-    for (const leftValue of left) {
-      for (const rightValue of right) {
-        results.push(finiteBinaryValue(expression.operator, leftValue, rightValue));
-      }
-    }
-    return uniqueJsonValues(results);
-  }
-
-  function finitePathValues(
-    reference: ExpressionPath,
-    ordinal: number,
-  ): readonly JsonValue[] | undefined {
-    if (reference.namespace === "paseo") {
-      if (!Array.isArray(reference.path)) return undefined;
-      const input = trigger.inputs[reference.path[1]];
-      if (input?.choices === undefined) return undefined;
-      return input.required || input.default !== undefined
-        ? input.choices
-        : [...input.choices, null];
-    }
-    if (reference.namespace === "values") {
-      const value = trigger.values[reference.name];
-      return value === undefined ? undefined : finiteExpressionValues(value, ordinal);
-    }
-    const referencedOrdinal = stepOrdinals.get(reference.stepId);
-    if (referencedOrdinal === undefined || referencedOrdinal >= ordinal) return undefined;
-    const output = trigger.steps[referencedOrdinal]?.output;
-    return output === undefined ? undefined : finiteSchemaChoices(output.schema, reference.path);
-  }
-
-  function validateValue(name: string, ordinal = Number.POSITIVE_INFINITY): void {
-    if (visiting.has(name)) throw new Error(`value dependency cycle includes ${name}`);
-    const expression = trigger.values[name];
-    if (expression === undefined) throw new Error(`value ${name} is unavailable`);
-    visiting.add(name);
-    validateExpression(expression, ordinal, `value ${name}`, false);
-    visiting.delete(name);
-  }
-
-  function validateExpression(
-    expression: Expression,
-    ordinal: number,
-    path: string,
-    authorityBearing: boolean,
-    contextAllowed = false,
-  ): void {
-    for (const reference of expressionPaths(expression)) {
-      validateReference(reference, ordinal, path, authorityBearing, contextAllowed);
-      if (reference.namespace === "values") validateValue(reference.name, ordinal);
-    }
-    if (authorityBearing && !isFiniteAuthorityExpression(expression)) {
-      throw new Error(
-        `${path} uses an agent-produced authority without provable finite choices; use a finite enum or const`,
-      );
-    }
-  }
-
-  function validateTemplate(
-    value: string | undefined,
-    ordinal: number,
-    path: string,
-    authorityBearing: boolean,
-    contextAllowed = false,
-  ): void {
-    if (value === undefined) return;
-    let cursor = 0;
-    while (true) {
-      const start = value.indexOf(EXPRESSION_START, cursor);
-      if (start < 0) return;
-      const end = value.indexOf(EXPRESSION_END, start + EXPRESSION_START.length);
-      if (end < 0) throw new Error(`${path} uses an unterminated expression`);
-      const expression = parseExpression(value.slice(start + EXPRESSION_START.length, end));
-      validateExpression(expression, ordinal, path, authorityBearing, contextAllowed);
-      cursor = end + EXPRESSION_END.length;
-    }
-  }
-
-  function validateReference(
-    reference: ExpressionPath,
-    ordinal: number,
-    path: string,
-    authorityBearing: boolean,
-    contextAllowed: boolean,
-  ): void {
-    if (reference.namespace === "paseo") {
-      if (reference.path === "prompt") {
-        if (authorityBearing)
-          throw new Error(`${path} uses paseo.prompt in an authority-bearing field`);
-        return;
-      }
-      if (reference.path === "context") {
-        if (!contextAllowed) throw new Error(`${path} uses paseo.context outside a step prompt`);
-        return;
-      }
-      if (reference.path[0] === "execution") {
-        throw new Error(
-          `${path} uses paseo.execution outside environment worktree.newBranch or a step title`,
-        );
-      }
-      const inputName = reference.path[1];
-      const input = trigger.inputs[inputName];
-      if (input === undefined) throw new Error(`${path} references undeclared input ${inputName}`);
-      if (authorityBearing && input.choices === undefined) {
-        throw new Error(`${path} uses input ${inputName} without finite choices`);
-      }
-      return;
-    }
-    if (reference.namespace === "values") {
-      if (!valueNames.has(reference.name))
-        throw new Error(`${path} references undeclared value ${reference.name}`);
-      return;
-    }
-    const referencedOrdinal = stepOrdinals.get(reference.stepId);
-    if (referencedOrdinal === undefined)
-      throw new Error(`${path} references unknown step ${reference.stepId}`);
-    if (referencedOrdinal >= ordinal) {
-      throw new Error(`${path} cannot reference forward step ${reference.stepId}`);
-    }
-    const referencedStep = trigger.steps[referencedOrdinal];
-    if (referencedStep?.output === undefined) {
-      throw new Error(
-        `${path} references output from step ${reference.stepId} without an output schema`,
-      );
-    }
-    if (authorityBearing && !hasFiniteSchemaChoices(referencedStep.output.schema, reference.path)) {
-      throw new Error(
-        `${path} uses agent output without provable finite choices for authority; use a finite enum or const`,
-      );
-    }
-  }
-
-  function isFiniteAuthorityExpression(expression: Expression): boolean {
-    if (expression.kind === "literal") return expression.value !== null;
-    if (expression.kind === "not") return true;
-    if (expression.kind === "binary") {
-      if (expression.operator === "==" || expression.operator === "!=") return true;
-      return (
-        isFiniteAuthorityExpression(expression.left) &&
-        isFiniteAuthorityExpression(expression.right)
-      );
-    }
-    const reference = expression.value;
-    if (reference.namespace === "paseo") {
-      return (
-        reference.path !== "prompt" && trigger.inputs[reference.path[1]]?.choices !== undefined
-      );
-    }
-    if (reference.namespace === "values") {
-      const value = trigger.values[reference.name];
-      return value !== undefined && isFiniteAuthorityExpression(value);
-    }
-    const referencedOrdinal = stepOrdinals.get(reference.stepId);
-    const step = referencedOrdinal === undefined ? undefined : trigger.steps[referencedOrdinal];
-    return step?.output !== undefined && hasFiniteSchemaChoices(step.output.schema, reference.path);
-  }
-
   if (
     trigger.steps.some((step) => step.environment.includes("${{")) &&
-    environmentNames.size === 0
+    contract.environmentNames.size === 0
   ) {
     throw new Error(`trigger ${triggerName} has no configured environments`);
   }
+}
+
+function validateStepExpressions(
+  contract: ExpressionContract,
+  step: CompiledStep,
+  ordinal: number,
+  stepPath: readonly string[],
+): void {
+  const { condition } = step;
+  if (condition !== undefined)
+    compileAt([...stepPath, "if"], () =>
+      validateExpression(contract, condition, { ordinal, path: `step ${step.id} if` }),
+    );
+  compileAt([...stepPath, "environment"], () => {
+    validateTemplate(contract, step.environment, {
+      ordinal,
+      path: `step ${step.id} environment`,
+      authorityBearing: true,
+    });
+    validateEnvironmentSelection(contract, step.environment, ordinal, step.id);
+  });
+  if (!isScriptStep(step)) validateAgentStepExpressions(contract, step, ordinal, stepPath);
+}
+
+function validateAgentStepExpressions(
+  contract: ExpressionContract,
+  step: CompiledAgentStep,
+  ordinal: number,
+  stepPath: readonly string[],
+): void {
+  const { title } = step;
+  if (title !== undefined)
+    compileAt([...stepPath, "title"], () => validateTitleTemplate(title, `step ${step.id} title`));
+  const { agent } = step;
+  if ("selector" in agent)
+    compileAt([...stepPath, "agent"], () =>
+      validateAgentSelection(contract, agent, ordinal, step.id),
+    );
+  for (const [index, block] of step.prompt.entries()) {
+    compileAt([...stepPath, "prompt", index], () =>
+      validateTemplate(contract, block.kind === "text" ? block.value : block.content, {
+        ordinal,
+        path: `step ${step.id} prompt[${index}]`,
+        contextAllowed: true,
+      }),
+    );
+  }
+}
+
+function validateAgentSelection(
+  contract: ExpressionContract,
+  selection: CompiledNamedAgentSelection,
+  ordinal: number,
+  stepId: string,
+): void {
+  validateTemplate(contract, selection.selector, {
+    ordinal,
+    path: `step ${stepId} agent`,
+    authorityBearing: true,
+  });
+  const selected = finiteTemplateValues(contract, selection.selector, ordinal);
+  if (selected === undefined) {
+    throw new Error(`step ${stepId} agent must resolve from finite choices`);
+  }
+  for (const name of selected) {
+    if (!Object.hasOwn(selection.choices, name)) {
+      throw new Error(`step ${stepId} agent resolves to unknown named agent ${name}`);
+    }
+  }
+}
+
+function validateEnvironmentSelection(
+  contract: ExpressionContract,
+  template: string,
+  ordinal: number,
+  stepId: string,
+): void {
+  const selected = finiteTemplateValues(contract, template, ordinal);
+  if (selected === undefined) {
+    throw new Error(`step ${stepId} environment must resolve from finite choices`);
+  }
+  for (const name of selected) {
+    if (!contract.environmentNames.has(name)) {
+      throw new Error(`step ${stepId} resolves to unknown environment ${name}`);
+    }
+    if (contract.environments.get(name)?.kind !== "daemon") {
+      throw new Error(`step ${stepId} environment ${name} must be a daemon environment`);
+    }
+  }
+}
+
+function finiteTemplateValues(
+  contract: ExpressionContract,
+  template: string,
+  ordinal: number,
+): readonly string[] | undefined {
+  let results = [""];
+  let cursor = 0;
+  while (cursor < template.length) {
+    const start = template.indexOf(EXPRESSION_START, cursor);
+    if (start < 0) break;
+    const end = template.indexOf(EXPRESSION_END, start + EXPRESSION_START.length);
+    if (end < 0) return undefined;
+    const literal = template.slice(cursor, start);
+    const choices = finiteExpressionValues(
+      contract,
+      parseExpression(template.slice(start + EXPRESSION_START.length, end)),
+      ordinal,
+    );
+    if (choices === undefined) return undefined;
+    results = results.flatMap((prefix) =>
+      choices.map((choice) => prefix + literal + interpolatedValue(choice)),
+    );
+    cursor = end + EXPRESSION_END.length;
+  }
+  return cursor < template.length
+    ? results.map((prefix) => prefix + template.slice(cursor))
+    : [...new Set(results)];
+}
+
+function finiteExpressionValues(
+  contract: ExpressionContract,
+  expression: Expression,
+  ordinal: number,
+): readonly JsonValue[] | undefined {
+  if (expression.kind === "literal" || expression.kind === "path") {
+    return expression.kind === "literal"
+      ? [expression.value]
+      : finitePathValues(contract, expression.value, ordinal);
+  }
+  if (expression.kind === "not") {
+    const values = finiteExpressionValues(contract, expression.value, ordinal);
+    return values === undefined ? undefined : [...new Set(values.map((value) => !truthy(value)))];
+  }
+  return finiteBinaryValues(contract, expression, ordinal);
+}
+
+function finiteBinaryValues(
+  contract: ExpressionContract,
+  expression: Extract<Expression, { kind: "binary" }>,
+  ordinal: number,
+): readonly JsonValue[] | undefined {
+  const left = finiteExpressionValues(contract, expression.left, ordinal);
+  const right = finiteExpressionValues(contract, expression.right, ordinal);
+  if (left === undefined || right === undefined) return undefined;
+  const results: JsonValue[] = [];
+  for (const leftValue of left) {
+    for (const rightValue of right) {
+      results.push(finiteBinaryValue(expression.operator, leftValue, rightValue));
+    }
+  }
+  return uniqueJsonValues(results);
+}
+
+function finitePathValues(
+  contract: ExpressionContract,
+  reference: ExpressionPath,
+  ordinal: number,
+): readonly JsonValue[] | undefined {
+  if (reference.namespace === "paseo") {
+    return finiteInputPathValues(contract.trigger.inputs, reference.path);
+  }
+  if (reference.namespace === "values") {
+    const value = contract.trigger.values[reference.name];
+    return value === undefined ? undefined : finiteExpressionValues(contract, value, ordinal);
+  }
+  const referencedOrdinal = contract.stepOrdinals.get(reference.stepId);
+  const output =
+    referencedOrdinal === undefined || referencedOrdinal >= ordinal
+      ? undefined
+      : contract.trigger.steps[referencedOrdinal]?.output;
+  return output === undefined ? undefined : finiteSchemaChoices(output.schema, reference.path);
+}
+
+function finiteInputPathValues(
+  inputs: CompiledTrigger["inputs"],
+  path: Extract<ExpressionPath, { namespace: "paseo" }>["path"],
+): readonly JsonValue[] | undefined {
+  if (!Array.isArray(path)) return undefined;
+  const input = inputs[path[1]];
+  if (input?.choices === undefined) return undefined;
+  return input.required || input.default !== undefined ? input.choices : [...input.choices, null];
+}
+
+function validateValue(
+  contract: ExpressionContract,
+  name: string,
+  ordinal = Number.POSITIVE_INFINITY,
+): void {
+  if (contract.visiting.has(name)) throw new Error(`value dependency cycle includes ${name}`);
+  const expression = contract.trigger.values[name];
+  if (expression === undefined) throw new Error(`value ${name} is unavailable`);
+  contract.visiting.add(name);
+  validateExpression(contract, expression, { ordinal, path: `value ${name}` });
+  contract.visiting.delete(name);
+}
+
+function validateExpression(
+  contract: ExpressionContract,
+  expression: Expression,
+  site: ExpressionSite,
+): void {
+  for (const reference of expressionPaths(expression)) {
+    validateReference(contract, reference, site);
+    if (reference.namespace === "values") validateValue(contract, reference.name, site.ordinal);
+  }
+  if (site.authorityBearing && !isFiniteAuthorityExpression(contract, expression)) {
+    throw new Error(
+      `${site.path} uses an agent-produced authority without provable finite choices; use a finite enum or const`,
+    );
+  }
+}
+
+function validateTemplate(
+  contract: ExpressionContract,
+  value: string | undefined,
+  site: ExpressionSite,
+): void {
+  if (value === undefined) return;
+  let cursor = 0;
+  while (true) {
+    const start = value.indexOf(EXPRESSION_START, cursor);
+    if (start < 0) return;
+    const end = value.indexOf(EXPRESSION_END, start + EXPRESSION_START.length);
+    if (end < 0) throw new Error(`${site.path} uses an unterminated expression`);
+    const expression = parseExpression(value.slice(start + EXPRESSION_START.length, end));
+    validateExpression(contract, expression, site);
+    cursor = end + EXPRESSION_END.length;
+  }
+}
+
+function validateReference(
+  contract: ExpressionContract,
+  reference: ExpressionPath,
+  site: ExpressionSite,
+): void {
+  if (reference.namespace === "paseo") {
+    validatePaseoReference(contract.trigger.inputs, reference.path, site);
+  } else if (reference.namespace === "values") {
+    if (!contract.valueNames.has(reference.name))
+      throw new Error(`${site.path} references undeclared value ${reference.name}`);
+  } else {
+    validateStepReference(contract, reference, site);
+  }
+}
+
+function validatePaseoReference(
+  inputs: CompiledTrigger["inputs"],
+  referencePath: Extract<ExpressionPath, { namespace: "paseo" }>["path"],
+  { path, authorityBearing, contextAllowed }: ExpressionSite,
+): void {
+  if (referencePath === "prompt") {
+    if (authorityBearing)
+      throw new Error(`${path} uses paseo.prompt in an authority-bearing field`);
+    return;
+  }
+  if (referencePath === "context") {
+    if (!contextAllowed) throw new Error(`${path} uses paseo.context outside a step prompt`);
+    return;
+  }
+  if (referencePath[0] === "execution") {
+    throw new Error(
+      `${path} uses paseo.execution outside environment worktree.newBranch or a step title`,
+    );
+  }
+  const inputName = referencePath[1];
+  const input = inputs[inputName];
+  if (input === undefined) throw new Error(`${path} references undeclared input ${inputName}`);
+  if (authorityBearing && input.choices === undefined) {
+    throw new Error(`${path} uses input ${inputName} without finite choices`);
+  }
+}
+
+function validateStepReference(
+  contract: ExpressionContract,
+  reference: Extract<ExpressionPath, { namespace: "steps" }>,
+  { ordinal, path, authorityBearing }: ExpressionSite,
+): void {
+  const referencedOrdinal = contract.stepOrdinals.get(reference.stepId);
+  if (referencedOrdinal === undefined)
+    throw new Error(`${path} references unknown step ${reference.stepId}`);
+  if (referencedOrdinal >= ordinal) {
+    throw new Error(`${path} cannot reference forward step ${reference.stepId}`);
+  }
+  const referencedStep = contract.trigger.steps[referencedOrdinal];
+  if (referencedStep?.output === undefined) {
+    throw new Error(
+      `${path} references output from step ${reference.stepId} without an output schema`,
+    );
+  }
+  if (authorityBearing && !hasFiniteSchemaChoices(referencedStep.output.schema, reference.path)) {
+    throw new Error(
+      `${path} uses agent output without provable finite choices for authority; use a finite enum or const`,
+    );
+  }
+}
+
+function isFiniteAuthorityExpression(
+  contract: ExpressionContract,
+  expression: Expression,
+): boolean {
+  if (expression.kind === "literal" || expression.kind === "not") {
+    return expression.kind === "not" || expression.value !== null;
+  }
+  if (expression.kind === "binary") {
+    return (
+      expression.operator === "==" ||
+      expression.operator === "!=" ||
+      (isFiniteAuthorityExpression(contract, expression.left) &&
+        isFiniteAuthorityExpression(contract, expression.right))
+    );
+  }
+  return isFiniteAuthorityReference(contract, expression.value);
+}
+
+function isFiniteAuthorityReference(
+  contract: ExpressionContract,
+  reference: ExpressionPath,
+): boolean {
+  if (reference.namespace === "paseo") {
+    return (
+      reference.path !== "prompt" &&
+      contract.trigger.inputs[reference.path[1]]?.choices !== undefined
+    );
+  }
+  if (reference.namespace === "values") {
+    const value = contract.trigger.values[reference.name];
+    return value !== undefined && isFiniteAuthorityExpression(contract, value);
+  }
+  const referencedOrdinal = contract.stepOrdinals.get(reference.stepId);
+  const step =
+    referencedOrdinal === undefined ? undefined : contract.trigger.steps[referencedOrdinal];
+  return step?.output !== undefined && hasFiniteSchemaChoices(step.output.schema, reference.path);
 }
 
 function compileAt<T>(path: readonly (string | number)[], operation: () => T): T {
@@ -1371,63 +1498,86 @@ function matchesInputType(value: JsonPrimitive | undefined, type: AuthoredInput[
 
 function validateCompiledContract(config: CompiledHubConfig): void {
   validateEnvironmentTemplates(config.environments);
-  const environmentIds = new Set<string>();
-  const environments = new Map<string, CompiledEnvironment>();
-  for (const environment of config.environments) {
-    if (environmentIds.has(environment.name)) {
-      throw new Error(`duplicate environment id: ${environment.name}`);
-    }
-    if (!IDENTIFIER.test(environment.name))
-      throw new Error(`invalid environment name: ${environment.name}`);
-    environmentIds.add(environment.name);
-    environments.set(environment.name, environment);
-  }
-
+  const environments = validateCompiledEnvironments(config.environments);
   const triggerIds = new Set<string>();
   for (const trigger of config.triggers) {
     if (triggerIds.has(trigger.name)) throw new Error(`duplicate trigger id: ${trigger.name}`);
     triggerIds.add(trigger.name);
-    if (trigger.steps.length === 0)
-      throw new Error(`trigger ${trigger.name} must contain a workflow step`);
-    const stepIds = new Set<string>();
-    for (const step of trigger.steps) {
-      if (stepIds.has(step.id)) throw new Error(`duplicate step id: ${step.id}`);
-      stepIds.add(step.id);
-      if (!environmentIds.has(step.environment) && !step.environment.includes(EXPRESSION_START)) {
-        throw new Error(`step ${step.id} references unknown environment ${step.environment}`);
-      }
-      validateCompiledStepEnvironment(step, trigger.inputs, environments);
-      if (isScriptStep(step)) {
-        validateScriptText(step.script);
-        if (step.condition !== undefined && !isExpression(step.condition)) {
-          throw new Error(`step ${step.id} contains an invalid condition`);
-        }
-        continue;
-      }
-      validateStepEnvironmentContract(trigger.name, trigger.on, step.id, step.env, step.github);
-      if (step.idleTimeoutMs > step.maxRuntimeMs) {
-        throw new Error(`step ${step.id} idle_timeout must not exceed max_runtime`);
-      }
-      validateCompiledPromptBlocks(step);
-      assertTurnEndCompletionAllowed(step.id, {
-        enabled: step.completeOnTurnEnd === true,
-        structuredOutput: step.output !== undefined,
-        requiredOutputs: step.allowOutputs.some((output) => output.required),
-      });
-      if (step.condition !== undefined && !isExpression(step.condition)) {
-        throw new Error(`step ${step.id} contains an invalid condition`);
-      }
-      if (step.output !== undefined)
-        validateOutputSchema(step.output.schema, `step ${step.id} output.schema`);
+    validateCompiledTrigger(trigger, environments);
+  }
+}
+
+function validateCompiledEnvironments(
+  configured: readonly CompiledEnvironment[],
+): ReadonlyMap<string, CompiledEnvironment> {
+  const environments = new Map<string, CompiledEnvironment>();
+  for (const environment of configured) {
+    if (environments.has(environment.name)) {
+      throw new Error(`duplicate environment id: ${environment.name}`);
     }
-    validateCompiledInputs(trigger);
-    for (const [name, expression] of Object.entries(trigger.values)) {
-      assertIdentifier(name, "value name");
-      if (!isExpression(expression))
-        throw new Error(`value ${name} contains an invalid expression`);
+    if (!IDENTIFIER.test(environment.name))
+      throw new Error(`invalid environment name: ${environment.name}`);
+    environments.set(environment.name, environment);
+  }
+  return environments;
+}
+
+function validateCompiledTrigger(
+  trigger: CompiledTrigger,
+  environments: ReadonlyMap<string, CompiledEnvironment>,
+): void {
+  if (trigger.steps.length === 0)
+    throw new Error(`trigger ${trigger.name} must contain a workflow step`);
+  validateCompiledSteps(trigger, environments);
+  validateCompiledInputs(trigger);
+  for (const [name, expression] of Object.entries(trigger.values)) {
+    assertIdentifier(name, "value name");
+    if (!isExpression(expression)) throw new Error(`value ${name} contains an invalid expression`);
+  }
+  validateExpressionContract(trigger.name, trigger, environments);
+  validateTriggerLaunchSecurity(trigger);
+}
+
+function validateCompiledSteps(
+  trigger: CompiledTrigger,
+  environments: ReadonlyMap<string, CompiledEnvironment>,
+): void {
+  const stepIds = new Set<string>();
+  for (const step of trigger.steps) {
+    if (stepIds.has(step.id)) throw new Error(`duplicate step id: ${step.id}`);
+    stepIds.add(step.id);
+    if (!environments.has(step.environment) && !step.environment.includes(EXPRESSION_START)) {
+      throw new Error(`step ${step.id} references unknown environment ${step.environment}`);
     }
-    validateExpressionContract(trigger.name, trigger, environments);
-    validateTriggerLaunchSecurity(trigger);
+    validateCompiledStepEnvironment(step, trigger.inputs, environments);
+    if (isScriptStep(step)) {
+      validateScriptText(step.script);
+      validateCompiledStepCondition(step);
+    } else {
+      validateCompiledAgentStep(trigger, step);
+    }
+  }
+}
+
+function validateCompiledAgentStep(trigger: CompiledTrigger, step: CompiledAgentStep): void {
+  validateStepEnvironmentContract(trigger, step.id, step);
+  if (step.idleTimeoutMs > step.maxRuntimeMs) {
+    throw new Error(`step ${step.id} idle_timeout must not exceed max_runtime`);
+  }
+  validateCompiledPromptBlocks(step);
+  assertTurnEndCompletionAllowed(step.id, {
+    enabled: step.completeOnTurnEnd === true,
+    structuredOutput: step.output !== undefined,
+    requiredOutputs: step.allowOutputs.some((output) => output.required),
+  });
+  validateCompiledStepCondition(step);
+  if (step.output !== undefined)
+    validateOutputSchema(step.output.schema, `step ${step.id} output.schema`);
+}
+
+function validateCompiledStepCondition(step: CompiledStep): void {
+  if (step.condition !== undefined && !isExpression(step.condition)) {
+    throw new Error(`step ${step.id} contains an invalid condition`);
   }
 }
 
@@ -1471,10 +1621,7 @@ function validateCompiledStepEnvironment(
   if (staticEnvironment !== undefined && staticEnvironment.kind !== "daemon") {
     throw new Error(`step ${step.id} environment ${step.environment} must be a daemon environment`);
   }
-  const environmentReference = DYNAMIC_INPUT_REFERENCE.exec(step.environment);
-  const environmentInput =
-    environmentReference === null ? undefined : inputs[environmentReference[1]!];
-  for (const choice of environmentInput?.choices ?? []) {
+  for (const choice of environmentInputChoices(step.environment, inputs)) {
     if (typeof choice !== "string") continue;
     const choiceEnvironment = environments.get(choice);
     if (choiceEnvironment !== undefined && choiceEnvironment.kind !== "daemon") {
@@ -1483,12 +1630,18 @@ function validateCompiledStepEnvironment(
   }
 }
 
+function environmentInputChoices(
+  environment: string,
+  inputs: Readonly<Record<string, CompiledInput>>,
+): readonly JsonPrimitive[] {
+  const inputName = DYNAMIC_INPUT_REFERENCE.exec(environment)?.[1];
+  return inputName === undefined ? [] : (inputs[inputName]?.choices ?? []);
+}
+
 function validateStepEnvironmentContract(
-  triggerName: string,
-  triggerEvent: string,
+  { name: triggerName, on: triggerEvent }: { name: string; on: string },
   stepId: string,
-  env: Readonly<Record<string, string>> | undefined,
-  github: CompiledGitHubAuthority | undefined,
+  { env, github }: Pick<CompiledAgentStep, "env" | "github">,
 ): void {
   if (env !== undefined) {
     for (const [key, value] of Object.entries(env)) {
@@ -1558,7 +1711,10 @@ function isExpression(value: unknown): value is Expression {
 }
 
 function isExpressionPath(value: unknown): boolean {
-  if (!isRecord(value) || typeof value["namespace"] !== "string") return false;
+  return isRecord(value) && typeof value["namespace"] === "string" && hasExpressionPath(value);
+}
+
+function hasExpressionPath(value: Record<string, unknown>): boolean {
   if (value["namespace"] === "values") return typeof value["name"] === "string";
   if (value["namespace"] === "steps") {
     return (
@@ -1567,13 +1723,16 @@ function isExpressionPath(value: unknown): boolean {
       value["path"].every((part) => typeof part === "string")
     );
   }
+  return value["namespace"] === "paseo" && isPaseoExpressionPath(value["path"]);
+}
+
+function isPaseoExpressionPath(path: unknown): boolean {
   return (
-    value["namespace"] === "paseo" &&
-    (value["path"] === "prompt" ||
-      (Array.isArray(value["path"]) &&
-        value["path"].length === 2 &&
-        ((value["path"][0] === "inputs" && typeof value["path"][1] === "string") ||
-          (value["path"][0] === "execution" && value["path"][1] === "id"))))
+    path === "prompt" ||
+    (Array.isArray(path) &&
+      path.length === 2 &&
+      ((path[0] === "inputs" && typeof path[1] === "string") ||
+        (path[0] === "execution" && path[1] === "id")))
   );
 }
 
@@ -1645,6 +1804,10 @@ function validateTriggerLaunchSecurity(trigger: CompiledTrigger): void {
     throw new Error(`trigger ${trigger.name}: ${NOTIFICATION_FROM_USERS_MESSAGE}`);
   }
   if (isEditorEvent(trigger.on) && eventDefinition(trigger.on).origin === "hub") return;
+  validateExternalTriggerLaunch(trigger);
+}
+
+function validateExternalTriggerLaunch(trigger: CompiledTrigger): void {
   // A project scout is an intentionally autonomous, project-scoped policy. Every other
   // externally-originated Linear action remains actor-allowlisted below.
   if (trigger.on === "linear.issue_entered_scope") {
