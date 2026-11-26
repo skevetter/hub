@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ConfirmMenuItem } from "../components/app/confirm-action.js";
 import { CopyBlock, CopyField } from "../components/app/copy-field.js";
 import { CheckboxField } from "../components/app/checkbox-field.js";
@@ -9,7 +9,15 @@ import { FormField } from "../components/app/form-field.js";
 import { LoadingLine } from "../components/app/loading.js";
 import { formatAbsolute, RelativeTime } from "../components/app/relative-time.js";
 import { RowActions } from "../components/app/row-actions.js";
+import { SummaryPanel, type SummaryRow } from "../components/app/summary-panel.js";
 import { TwoLine } from "../components/app/two-line.js";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "../components/ui/dialog.js";
 import { DropdownMenuItem } from "../components/ui/dropdown-menu.js";
 import { StateBlock } from "../components/app/state-block.js";
 import { credentialState } from "../components/app/state-label.js";
@@ -77,11 +85,6 @@ export const SCOPE_OPTIONS = [
 export const API_KEY_COLUMNS = [
   { header: "Status", lead: true },
   { header: "Name", fill: true },
-  { header: "Authentication" },
-  { header: "Scopes", fill: true },
-  { header: "Actor" },
-  { header: "Triggers", fill: true },
-  { header: "Created" },
   { header: "Last used" },
   { header: "", align: "end" as const },
 ];
@@ -356,50 +359,92 @@ function ApiKeyRow(props: ApiKeyRowProps) {
     const id = auth?.previousVersionId;
     if (id != null) onRetire?.(record.id, id);
   }, [auth?.previousVersionId, onRetire, record.id]);
-  const allowedTriggers = allowedTriggerLabel(record.allowedTriggers);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const openDetails = useCallback(() => setDetailsOpen(true), []);
+  const authentication = useMemo(
+    () => ({ auth, signingAvailability, previousDeadline, overlapActive }),
+    [auth, signingAvailability, previousDeadline, overlapActive],
+  );
   return (
     <DataRow>
       <DataCell>
         <StateBlock state={credentialState(record.revokedAt !== null)} />
       </DataCell>
-      <DataCell>{record.name}</DataCell>
       <DataCell>
-        {renderApiKeyAuthentication(record, {
-          auth,
-          signingAvailability,
-          previousDeadline,
-          overlapActive,
-        })}
-      </DataCell>
-      <DataCell muted>
-        {record.scopes
-          .map((scope) => SCOPE_OPTIONS.find((option) => option.value === scope)?.label ?? scope)
-          .join(", ")}
-      </DataCell>
-      <DataCell muted>{record.actor ?? "none"}</DataCell>
-      <DataCell muted>{allowedTriggers}</DataCell>
-      <DataCell muted>
-        <RelativeTime value={record.createdAt} />
+        <TwoLine
+          primary={record.name}
+          secondary={auth === undefined ? record.prefix : "GitHub SHA-256"}
+          mono={auth === undefined}
+        />
       </DataCell>
       <DataCell muted>
         {record.lastUsedAt === null ? "Never" : <RelativeTime value={record.lastUsedAt} />}
       </DataCell>
       <DataCell>
-        {record.revokedAt === null && canManage
-          ? renderApiKeyActions({
-              record,
-              auth,
-              signingAvailability,
-              overlapActive,
-              busy,
-              rotate,
-              retire,
-              revoke,
-            })
-          : null}
+        {renderApiKeyActions({
+          record,
+          manage: record.revokedAt === null && canManage,
+          signing: { auth, availability: signingAvailability, overlapActive, busy },
+          handlers: { openDetails, rotate, retire, revoke },
+        })}
+        <ApiKeyDetails
+          record={record}
+          authentication={authentication}
+          open={detailsOpen}
+          onOpenChange={setDetailsOpen}
+        />
       </DataCell>
     </DataRow>
   );
+}
+
+export interface ApiKeyAuthentication {
+  auth: ApiKeyRecord["authentication"];
+  signingAvailability: ApiKeySigningAvailability;
+  previousDeadline: string | null | undefined;
+  overlapActive: boolean;
+}
+
+export function ApiKeyDetails({
+  record,
+  authentication,
+  open,
+  onOpenChange,
+}: {
+  record: ApiKeyRecord;
+  authentication: ApiKeyAuthentication;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{record.name}</DialogTitle>
+          <DialogDescription>API key details</DialogDescription>
+        </DialogHeader>
+        <SummaryPanel label="API key" inline rows={apiKeyDetailRows(record, authentication)} />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export function apiKeyDetailRows(
+  record: ApiKeyRecord,
+  authentication: ApiKeyAuthentication,
+): SummaryRow[] {
+  return [
+    { label: "Authentication", value: renderApiKeyAuthentication(record, authentication) },
+    {
+      label: "Scopes",
+      value: record.scopes
+        .map((scope) => SCOPE_OPTIONS.find((option) => option.value === scope)?.label ?? scope)
+        .join(", "),
+    },
+    { label: "Actor", value: record.actor ?? "none" },
+    { label: "Allowed triggers", value: allowedTriggerLabel(record.allowedTriggers) },
+    { label: "Created", value: <RelativeTime value={record.createdAt} /> },
+  ];
 }
 
 function allowedTriggerLabel(triggers: ApiKeyRecord["allowedTriggers"]): string {
@@ -409,17 +454,7 @@ function allowedTriggerLabel(triggers: ApiKeyRecord["allowedTriggers"]): string 
 
 function renderApiKeyAuthentication(
   record: ApiKeyRecord,
-  {
-    auth,
-    signingAvailability,
-    previousDeadline,
-    overlapActive,
-  }: {
-    auth: ApiKeyRecord["authentication"];
-    signingAvailability: ApiKeySigningAvailability;
-    previousDeadline: string | null | undefined;
-    overlapActive: boolean;
-  },
+  { auth, signingAvailability, previousDeadline, overlapActive }: ApiKeyAuthentication,
 ) {
   return auth === undefined ? (
     <TwoLine primary="Bearer token" secondary={record.prefix} mono />
@@ -438,31 +473,56 @@ function renderApiKeyAuthentication(
 
 function renderApiKeyActions({
   record,
-  auth,
-  signingAvailability,
-  overlapActive,
-  busy,
-  rotate,
-  retire,
-  revoke,
+  manage,
+  signing,
+  handlers,
 }: {
   record: ApiKeyRecord;
-  auth: ApiKeyRecord["authentication"];
-  signingAvailability: ApiKeySigningAvailability;
-  overlapActive: boolean;
-  busy: boolean;
-  rotate: () => void;
-  retire: () => void;
-  revoke: () => void;
+  manage: boolean;
+  signing: SigningActions;
+  handlers: { openDetails: () => void; rotate: () => void; retire: () => void; revoke: () => void };
 }) {
+  const { openDetails, rotate, retire, revoke } = handlers;
   return (
     <RowActions label={`Actions for ${record.name}`}>
-      {signingAvailability === "enabled" && auth?.currentVersionId != null && !overlapActive ? (
+      <DropdownMenuItem onSelect={openDetails}>View details</DropdownMenuItem>
+      {manage ? renderSigningActions(signing, { rotate, retire }) : null}
+      {manage ? (
+        <ConfirmMenuItem
+          label="Revoke"
+          destructive
+          title={`Revoke ${record.name}?`}
+          description="Any automation using this key stops working immediately. This cannot be undone."
+          confirmLabel="Revoke key"
+          cancelLabel="Cancel"
+          busy={signing.busy}
+          onConfirm={revoke}
+        />
+      ) : null}
+    </RowActions>
+  );
+}
+
+interface SigningActions {
+  auth: ApiKeyRecord["authentication"];
+  availability: ApiKeySigningAvailability;
+  overlapActive: boolean;
+  busy: boolean;
+}
+
+function renderSigningActions(
+  { auth, availability, overlapActive, busy }: SigningActions,
+  { rotate, retire }: { rotate: () => void; retire: () => void },
+) {
+  if (availability !== "enabled") return null;
+  return (
+    <>
+      {auth?.currentVersionId != null && !overlapActive ? (
         <DropdownMenuItem disabled={busy} onSelect={rotate}>
           Rotate signing secret
         </DropdownMenuItem>
       ) : null}
-      {signingAvailability === "enabled" && auth?.previousVersionId != null ? (
+      {auth?.previousVersionId != null ? (
         <ConfirmMenuItem
           label="Retire previous secret"
           title="Retire previous signing secret?"
@@ -474,17 +534,7 @@ function renderApiKeyActions({
           onConfirm={retire}
         />
       ) : null}
-      <ConfirmMenuItem
-        label="Revoke"
-        destructive
-        title={`Revoke ${record.name}?`}
-        description="Any automation using this key stops working immediately. This cannot be undone."
-        confirmLabel="Revoke key"
-        cancelLabel="Cancel"
-        busy={busy}
-        onConfirm={revoke}
-      />
-    </RowActions>
+    </>
   );
 }
 

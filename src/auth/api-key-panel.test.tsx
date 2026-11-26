@@ -7,11 +7,15 @@ import {
   ApiKeyTable,
   ApiKeyTriggerField,
   GitHubSecretContent,
+  apiKeyDetailRows,
   apiKeyFormPayload,
+  type ApiKeyAuthentication,
   type ApiKeyRecord,
+  type ApiKeySigningAvailability,
   type ApiKeyTriggerChoices,
   type ApiKeyWebhookSettings,
 } from "./api-key-presentation.js";
+import { SummaryPanel } from "../components/app/summary-panel.js";
 import type { ApiKeyScope } from "./api-key-contract.js";
 
 const triggers: ApiKeyTriggerChoices = {
@@ -210,39 +214,57 @@ describe("API key form", () => {
   });
 });
 
+const bearer: ApiKeyAuthentication = {
+  auth: undefined,
+  signingAvailability: "disabled",
+  previousDeadline: undefined,
+  overlapActive: false,
+};
+const renderDetails = (key: ApiKeyRecord) =>
+  renderToStaticMarkup(<SummaryPanel label="API key" rows={apiKeyDetailRows(key, bearer)} />);
+
 describe("API key table", () => {
-  it("shows actor and trigger columns and identifies legacy actorless keys", () => {
-    const markup = renderTable([record]);
+  it("fits with four columns and keeps the rest in the details", () => {
+    const markup = renderTable([{ ...record, lastUsedAt: null }]);
+    for (const header of ["Status", "Name", "Last used"]) {
+      assert.match(markup, new RegExp(`>${header}<`, "u"));
+    }
+    for (const header of ["Authentication", "Scopes", "Actor", "Triggers", "Created"]) {
+      assert.doesNotMatch(markup, new RegExp(`<th[^>]*>${header}<`, "u"));
+    }
+    assert.match(markup, /Legacy key/u);
+    assert.match(markup, /paseo_pk_example/u);
+    assert.match(markup, /Never/u);
+    assert.match(markup, /Actions for Legacy key/u);
+  });
+
+  it("offers details to read-only members and for revoked keys", () => {
+    const markup = renderTable([{ ...record, revokedAt: "2026-11-15T12:00:00.000Z" }]);
+    assert.match(markup, /Actions for Legacy key/u);
+  });
+
+  it("identifies legacy actorless keys in the details", () => {
+    const markup = renderDetails(record);
     assert.match(markup, />Actor</u);
-    assert.match(markup, />Triggers</u);
+    assert.match(markup, />Allowed triggers</u);
     assert.match(markup, />none</u);
     assert.match(markup, />All</u);
+    assert.match(markup, /Bearer token/u);
   });
 
   it("distinguishes unrestricted keys, deny-all keys and named restrictions", () => {
-    const markup = renderTable([
-      record,
-      {
-        ...record,
-        id: "deny-all",
-        name: "Restricted key",
-        actor: "ci-partner",
-        allowedTriggers: [],
-      },
-      {
-        ...record,
-        id: "selected",
-        scopes: ["events:send"],
-        actor: "build-worker",
-        allowedTriggers: ["build-finished", "deploy-ready"],
-      },
-    ]);
-    assert.match(markup, />All</u);
-    assert.match(markup, />None</u);
-    assert.match(markup, />ci-partner</u);
-    assert.match(markup, />build-worker</u);
-    assert.match(markup, /build-finished, deploy-ready/u);
-    assert.match(markup, /Send events/u);
+    const denyAll = renderDetails({ ...record, actor: "ci-partner", allowedTriggers: [] });
+    assert.match(denyAll, />None</u);
+    assert.match(denyAll, />ci-partner</u);
+    const named = renderDetails({
+      ...record,
+      scopes: ["events:send"],
+      actor: "build-worker",
+      allowedTriggers: ["build-finished", "deploy-ready"],
+    });
+    assert.match(named, />build-worker</u);
+    assert.match(named, /build-finished, deploy-ready/u);
+    assert.match(named, /Send events/u);
   });
 });
 
@@ -329,19 +351,23 @@ describe("GitHub signing keys", () => {
     assert.match(reveal, /Copy signing secret/u);
     assert.match(reveal, /hub.example.test\/api\/v1\/hooks\/build-finished\/signers\//u);
     assert.ok(reveal.includes(signingSecret));
-    const disabled = renderTable(records);
-    assert.match(disabled, /Signature authentication disabled/u);
-    assert.ok(!disabled.includes(signingSecret));
-    assert.ok(!disabled.includes(signedRecord.prefix));
-    const enabled = renderToStaticMarkup(
-      <ApiKeyTable
-        records={records}
-        canManage={false}
-        busy={false}
-        onRevoke={noop}
-        signingAvailability="enabled"
-      />,
-    );
-    assert.match(enabled, /Previous version expired/u);
+    const table = renderTable(records);
+    assert.match(table, /GitHub SHA-256/u);
+    assert.ok(!table.includes(signingSecret));
+    assert.ok(!table.includes(signedRecord.prefix));
+    const details = (signingAvailability: ApiKeySigningAvailability, overlapActive: boolean) =>
+      renderToStaticMarkup(
+        <SummaryPanel
+          label="API key"
+          rows={apiKeyDetailRows(signedRecord, {
+            auth: signedRecord.authentication,
+            signingAvailability,
+            previousDeadline: signedRecord.authentication?.previousAcceptUntil,
+            overlapActive,
+          })}
+        />,
+      );
+    assert.match(details("disabled", false), /Signature authentication disabled/u);
+    assert.match(details("enabled", false), /Previous version expired/u);
   });
 });

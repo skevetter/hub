@@ -87,14 +87,29 @@ test("API keys lead with their state block, a long actor stays inside a phone, a
     await page.setViewportSize(viewport);
     await page.goto(keys);
     await expect(table.locator('[data-slot="state-block"]').first()).toHaveText("Active");
-    await expectLeadingBlock(page, table, viewport.width, true);
+    await expectLeadingBlock(page, table, viewport.width);
     await shoot(page, `api-keys-${viewport.width}`);
   }
+  await expect(table.getByRole("columnheader")).toHaveText([
+    "Status",
+    "Name",
+    "Last used",
+    "Actions",
+  ]);
+  await page.getByRole("button", { name: "Actions for Phase Two runner" }).click();
+  await page.getByRole("menuitem", { name: "View details" }).click();
+  const details = page.getByRole("dialog", { name: "Phase Two runner" });
+  for (const label of ["Authentication", "Scopes", "Actor", "Allowed triggers", "Created"]) {
+    await expect(details.getByText(label, { exact: true })).toBeVisible();
+  }
+  await expect(details).toContainText(`a${"b".repeat(62)}`);
+  await shoot(page, "api-keys-details-390");
+  await details.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Actions for Phase Two runner" }).click();
   await page.getByRole("menuitem", { name: "Revoke" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Revoke key" }).click();
   await expect(table.locator('[data-slot="state-block"]').first()).toHaveText("Revoked");
-  await expectLeadingBlock(page, table, PHONE_WIDTH, true);
+  await expectLeadingBlock(page, table, PHONE_WIDTH);
   await shoot(page, "api-keys-revoked-390");
 });
 
@@ -105,13 +120,8 @@ async function openActivity(page: Page): Promise<Locator> {
   return table;
 }
 
-/** The nine-column key table scrolls inside its region on a desktop, as it did before; phones stack. */
-async function expectLeadingBlock(
-  page: Page,
-  table: Locator,
-  width: number,
-  wide = false,
-): Promise<void> {
+/** Every table fits its region at every width: nothing scrolls sideways, and phones stack. */
+async function expectLeadingBlock(page: Page, table: Locator, width: number): Promise<void> {
   const row = table.getByRole("row").nth(1);
   const block = row.locator('[data-slot="state-block"]');
   await expect(block).toBeVisible();
@@ -132,7 +142,7 @@ async function expectLeadingBlock(
   const region = await table
     .locator("xpath=ancestor::*[@data-slot='table-container']")
     .evaluate((node) => node.scrollWidth - node.clientWidth);
-  if (!wide || width < 640) expect(region).toBeLessThanOrEqual(0);
+  expect(region).toBeLessThanOrEqual(0);
 }
 
 async function expectNoAxeViolations(page: Page): Promise<void> {
