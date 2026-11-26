@@ -28,7 +28,7 @@ import {
 } from "../test-utils/github-billing-notice.js";
 import { createGitHubTriggerProvider } from "../triggers/github/provider.js";
 import type { GitHubCommentClient } from "../triggers/github/reply.js";
-import { turnEndFixture } from "./test-utils/turn-end-fixture.js";
+import { IDLE_TIMEOUT_MS, turnEndFixture } from "./test-utils/turn-end-fixture.js";
 
 const DAEMON_ID = "daemon-ack-test";
 const AGENT_ID = "agent-ack-test";
@@ -145,6 +145,44 @@ describe("execution workspace title", () => {
       "Hub · intake · e6a296d1",
     );
   });
+});
+
+it("re-arms the idle deadline when a concurrent refresh wins over expiry", async () => {
+  const organizationId = "org-deadline-rearm";
+  const database = createMemoryDatabase({ organizationIds: [organizationId] });
+  const fixture = await turnEndFixture({ database, organizationId });
+  try {
+    const { execution } = await fixture.dispatch();
+    await fixture.deliver(fixture.events.status("idle"));
+    const retryDelay = 1_000;
+    const transitionOriginal = database.transitionAgentExecution.bind(database);
+    const transition = vi
+      .spyOn(database, "transitionAgentExecution")
+      .mockImplementationOnce(async (id, status, fields) => {
+        const now = fixture.clock.now();
+        await database.setAgentExecutionIdleDeadline(
+          id,
+          new Date(now + retryDelay),
+          new Date(now - 1),
+          new Date(now),
+        );
+        return transitionOriginal(id, status, fields);
+      });
+
+    await fixture.clock.advance(IDLE_TIMEOUT_MS + retryDelay - 1);
+
+    assert.equal(transition.mock.calls.length, 1);
+    assert.equal((await fixture.execution(execution.id)).status, "running");
+    await fixture.clock.advance(1);
+
+    assert.equal(transition.mock.calls.length, 2);
+    assert.deepEqual((await fixture.execution(execution.id)).result, {
+      status: "failed",
+      reason: "idle_timeout",
+    });
+  } finally {
+    await fixture.lifecycle.stop();
+  }
 });
 
 describe("durable Hub action acknowledgement state", () => {
