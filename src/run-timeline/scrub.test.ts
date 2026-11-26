@@ -3,19 +3,20 @@ import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
 import { createTimelineScrubber as createCurrentScrubber } from "./scrub.js";
-import { createTimelineScrubber as createBuild17Scrubber } from "./test-utils/build17-scrubber.js";
+import { createTimelineScrubber as createReferenceScrubber } from "./test-utils/build17-scrubber.js";
 
-// Compare the exact inputs, secret inventories and byte budgets in the existing contracts.
+// Check both scrubber copies with the same inputs, secret inventories and byte budgets.
 const createTimelineScrubber: typeof createCurrentScrubber = (options) => {
   const current = createCurrentScrubber(options);
-  const build17 = createBuild17Scrubber(options);
+  const reference = createReferenceScrubber(options);
   return (input, maxBytes) => {
     const actual = current(input, maxBytes);
-    const expected = build17(input, maxBytes);
+    const expected = reference(input, maxBytes);
     if (actual !== expected)
-      expect(actual, `Build 17 mismatch for ${JSON.stringify(input)} at ${maxBytes} bytes`).toBe(
-        expected,
-      );
+      expect(
+        actual,
+        `Scrubber copies differ for ${JSON.stringify(input)} at ${maxBytes} bytes`,
+      ).toBe(expected);
     return actual;
   };
 };
@@ -219,7 +220,7 @@ function context(seed: number): string {
   );
 }
 
-function generatedBuild17Inputs(): string[] {
+function generatedParityInputs(): string[] {
   const hexDigits = "0123456789abcdef".split("");
   return Array.from({ length: 64 }, (_, seed) => {
     let state = seed + 1;
@@ -251,8 +252,8 @@ function generatedBuild17Inputs(): string[] {
   }).flat();
 }
 
-it("matches the build 17 stored-text scrubber on 512 seeded inputs and multiple byte budgets", () => {
-  const inputs = generatedBuild17Inputs();
+it("keeps both scrubber copies in sync on 512 seeded inputs and multiple byte budgets", () => {
+  const inputs = generatedParityInputs();
   expect(new Set(inputs).size).toBe(512);
   const budgets = [0, 1, 2, 3, 7, 8, 16, 63, 240, 8192, Infinity, -1, 2.5, NaN];
   for (const options of [undefined, { scrubValues: [PAYLOAD, SHORT_SECRET, "[redacte"] }]) {
@@ -261,18 +262,18 @@ it("matches the build 17 stored-text scrubber on 512 seeded inputs and multiple 
   }
 });
 
-it("keeps the production scrubber byte-for-byte at build 17", () => {
+it("keeps the scrubber copies byte-identical after normalizing imports and removing the fixture header", () => {
   const fixture = readFileSync(
     new URL("./test-utils/build17-scrubber.ts", import.meta.url),
     "utf8",
   );
-  const original = fixture
+  const reference = fixture
     .slice(fixture.indexOf("\n") + 1)
     .replace('from "../../logger.js"', 'from "../logger.js"')
     .replace('from "../capture-types.js"', 'from "./capture-types.js"');
   const current = readFileSync(new URL("./scrub.ts", import.meta.url));
   expect(createHash("sha256").update(current).digest("hex")).toBe(
-    createHash("sha256").update(original).digest("hex"),
+    createHash("sha256").update(reference).digest("hex"),
   );
 });
 
@@ -284,7 +285,7 @@ function compareUrlBudgets(
   for (const scrub of scrubbers) for (const budget of budgets) scrub(input, budget);
 }
 
-it("matches build 17 across the URL-only review corpus", () => {
+it("keeps both scrubber copies in sync across the URL-only review corpus", () => {
   const pieces = [
     "a",
     "b",
