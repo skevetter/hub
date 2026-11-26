@@ -62,6 +62,7 @@ import { canStopRun, type RunStopActor, type StopRunResult } from "../triggers/r
 import { DEFAULT_SCRIPT_LIMITS, type ScriptLimits } from "./script-limits.js";
 import {
   DEFAULT_TERMINAL_NOTIFICATION_HOLD_MS,
+  ABANDONED_TERMINAL_WARN_AT,
   DEFAULT_TERMINAL_NOTIFICATION_STOP_GRACE_MS,
   settlesWithin,
   TerminalNotificationLease,
@@ -1315,6 +1316,7 @@ export class DurableWorkflowEngine {
       )
       .finally(() => this.abandonedTerminalNotifications.delete(tracked));
     this.abandonedTerminalNotifications.add(tracked);
+    const abandonedPending = this.abandonedTerminalNotifications.size;
     this.report(
       new Error("Terminal notification handler exceeded its time bound and was abandoned"),
       "workflow.notification.terminal.timeout",
@@ -1322,9 +1324,15 @@ export class DurableWorkflowEngine {
         triggerRunId: run.id,
         provider: providerNameOf(run.triggerContext),
         elapsedMs: this.now().getTime() - claimedAt.getTime(),
-        abandonedPending: this.abandonedTerminalNotifications.size,
+        abandonedPending,
       },
     );
+    if (abandonedPending >= ABANDONED_TERMINAL_WARN_AT) {
+      this.logger.warn(
+        { operation: "workflow.notification.terminal.abandoned_backlog", abandonedPending },
+        "Abandoned terminal notification handlers are still running",
+      );
+    }
   }
 
   private async deliverClaimedTerminalNotification(
