@@ -100,3 +100,25 @@ describe("Hub bundle compilation characterization", () => {
     ).toEqual([[hub, "environments", "local", "cwd"]]);
   });
 });
+
+describe("Hub bundle path validation", () => {
+  it.each([
+    "../x.yml",
+    "/abs/x.yml",
+    "a\\b.yml",
+    "a//b.yml",
+    "./a.yml",
+    "",
+    "a/../b.yml",
+    "a/./b.yml",
+    `${workflow}/`,
+  ])("rejects unsafe path %j without rewriting it", (path) => {
+    const files = [{ path, content: "" }, ...fixture()];
+    expect(issues(files)).toEqual([{ path: [path], message: "unsafe bundle path" }]);
+    expect(() => compileHubBundle(files)).toThrow(new Error(`${path}: unsafe bundle path`));
+  });
+
+  it.each([hub, workflow, partial])("accepts canonical path %s", (path) => {
+    expect(compileHubBundle(fixture()).files.some((file) => file.path === path)).toBe(true);
+  });
+});
