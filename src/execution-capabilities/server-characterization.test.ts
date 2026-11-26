@@ -41,6 +41,7 @@ type Fault =
 
 interface Probe {
   session?: boolean;
+  plainSessionToolOnly?: boolean;
   badRoute?: boolean;
   bearer?: string | null;
   secretGone?: boolean;
@@ -100,6 +101,7 @@ function fixtureDatabase(
   execution: AgentExecutionRecord,
   trace: unknown[],
 ): Database {
+  const plainTool = { ...replyOutputTool, name: "plain", inputSchema: { type: "object" } } as const;
   const session = {
     id: sessionId,
     organizationId: "org",
@@ -112,10 +114,7 @@ function fixtureDatabase(
     optionsReducedAt: time,
     creationOptions: { provider: "codex", model: null },
     capabilityTokenHash: hashAgentExecutionCompletionToken(token),
-    tools: [
-      replyOutputTool,
-      { ...replyOutputTool, name: "plain", inputSchema: { type: "object" } },
-    ],
+    tools: probe.plainSessionToolOnly ? [plainTool] : [replyOutputTool, plainTool],
   } satisfies NonNullable<Awaited<ReturnType<Database["findAgentSession"]>>>;
   let reads = 0;
   return Object.assign(createMemoryDatabase(), {
@@ -288,7 +287,7 @@ export const capabilityCases: Record<string, [Probe, number, string]> = {
     '"required":["content","executionId"]',
   ],
   "session discovery without schema properties": [
-    { method: "tools/list", session: true },
+    { method: "tools/list", session: true, plainSessionToolOnly: true },
     200,
     '"required":["executionId"]',
   ],
@@ -404,6 +403,107 @@ export const capabilityCases: Record<string, [Probe, number, string]> = {
   ],
 };
 
+const initializeParams = {
+  protocolVersion: "2025-03-26",
+  capabilities: {},
+  clientInfo: { name: "probe", version: "1" },
+};
+
+const discoveryCases = [
+  [
+    { method: "initialize", params: initializeParams },
+    {
+      result: {
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: {} },
+        serverInfo: { name: "paseo-hub-execution", version: "1.0.0" },
+      },
+      jsonrpc: "2.0",
+      id: 7,
+    },
+  ],
+  [
+    { method: "tools/list" },
+    {
+      result: {
+        tools: [
+          {
+            name: "finish_execution",
+            description: "Completes this execution and records its optional structured output.",
+            inputSchema: { type: "object", properties: {}, additionalProperties: false },
+          },
+          {
+            name: "reply",
+            description:
+              "Sends a reply to the conversation that triggered this execution. (up to 2 times).",
+            inputSchema: {
+              type: "object",
+              properties: { content: { type: "string", minLength: 1 } },
+              required: ["content"],
+              additionalProperties: false,
+            },
+          },
+        ],
+      },
+      jsonrpc: "2.0",
+      id: 7,
+    },
+  ],
+  [
+    { method: "initialize", session: true, params: initializeParams },
+    {
+      result: {
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: {} },
+        serverInfo: { name: "paseo-hub-session", version: "1.0.0" },
+      },
+      jsonrpc: "2.0",
+      id: 7,
+    },
+  ],
+  [
+    { method: "tools/list", session: true },
+    {
+      result: {
+        tools: [
+          {
+            name: "reply",
+            description: "Sends a reply to the conversation that triggered this execution.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                content: { type: "string", minLength: 1 },
+                executionId: {
+                  type: "string",
+                  description: "Execution ID supplied with the request prompt.",
+                },
+              },
+              required: ["content", "executionId"],
+              additionalProperties: false,
+            },
+          },
+          {
+            name: "plain",
+            description: "Sends a reply to the conversation that triggered this execution.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                executionId: {
+                  type: "string",
+                  description: "Execution ID supplied with the request prompt.",
+                },
+              },
+              required: ["executionId"],
+            },
+          },
+        ],
+      },
+      jsonrpc: "2.0",
+      id: 7,
+    },
+  ],
+] as const;
+
 describe("execution capability behavior", () => {
   for (const [name, [probe, status, message]] of Object.entries(capabilityCases)) {
     it(name, async () => {
@@ -412,6 +512,15 @@ describe("execution capability behavior", () => {
       expect(outcome.body).toContain(message);
     });
   }
+
+  it("preserves exact initialization and tool discovery for both MCP endpoints", async () => {
+    for (const [probe, expected] of discoveryCases) {
+      const outcome = await runCapabilityProbe(probe);
+      expect(outcome.status).toBe(200);
+      const body: unknown = JSON.parse(outcome.body ?? "");
+      expect(body).toStrictEqual(expected);
+    }
+  });
 
   it("passes the derived token and owns the finish outcome before completion", async () => {
     const outcome = await runCapabilityProbe(sessionCall());
