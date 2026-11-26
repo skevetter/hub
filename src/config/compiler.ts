@@ -1389,9 +1389,6 @@ function validatePaseoReference(
   const inputName = referencePath[1];
   const input = declaredInput(inputs, inputName);
   if (input === undefined) throw new Error(`${path} references undeclared input ${inputName}`);
-  if (isReservedContextKey(inputName)) {
-    throw new Error(`${path} references input ${inputName}, which expressions cannot read`);
-  }
   if (authorityBearing && input.choices === undefined) {
     throw new Error(`${path} uses input ${inputName} without finite choices`);
   }

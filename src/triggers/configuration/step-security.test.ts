@@ -131,13 +131,16 @@ describe("input names that expressions cannot read", () => {
     assert.equal(refusal(withInputs([name])), undefined);
   });
 
-  it.each(["constructor", "prototype"])("refuses an expression that reads input %s", (name) => {
-    const yaml = withInputs([name]).replace(
-      "    prompt: Fix it.",
-      `    prompt: Fix it.\n    if: "\${{ paseo.inputs.${name} }}"`,
-    );
-    assert.match(refusal(yaml) ?? "", /which expressions cannot read/u);
-  });
+  it.each(["constructor", "prototype"])(
+    "keeps a fallback expression on declared input %s working",
+    (name) => {
+      const yaml = withInputs([name]).replace(
+        "    prompt: Fix it.",
+        `    prompt: Fix it.\n    if: "\${{ paseo.inputs.${name} ?? true }}"`,
+      );
+      assert.equal(refusal(yaml), undefined);
+    },
+  );
 
   it("refuses an undeclared reference that names an inherited key", () => {
     const yaml = multiStep(on).replace(
