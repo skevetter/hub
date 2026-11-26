@@ -1,5 +1,6 @@
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
 import { deriveAgentExecutionCompletionToken } from "../agent-executions/completion-token.js";
+import { AgentSessions } from "../agent-sessions/index.js";
 import { DaemonResponseLostError } from "./protocol.js";
 import type { AgentConnection } from "./agents/index.js";
 import assert from "node:assert/strict";
@@ -31,7 +32,87 @@ import type { GitHubCommentClient } from "../triggers/github/reply.js";
 const DAEMON_ID = "daemon-ack-test";
 const AGENT_ID = "agent-ack-test";
 const EXECUTION_ID = "00000000-0000-4000-8000-000000000001";
+const PEER_ID = "00000000-0000-4000-8000-000000000002";
 const ACKNOWLEDGED_AT = new Date("2026-01-01T00:00:01.000Z");
+
+describe("stop interrupt recovery", () => {
+  it.each([
+    { outcome: "target_gone", status: "revoked", expired: false, sessionOutcome: undefined },
+    { outcome: "delivery_unconfirmed", status: "active", expired: true, sessionOutcome: undefined },
+    { outcome: "coalesced", status: "active", expired: false, sessionOutcome: "coalesced" },
+    { outcome: "confirmed", status: "active", expired: false, sessionOutcome: [PEER_ID] },
+  ] as const)("completes as $outcome and releases the claim once", async (scenario) => {
+    const database = createMemoryDatabase();
+    await seedStopExecution(database);
+    vi.spyOn(database, "findDaemonById").mockResolvedValue({
+      ...daemonRecord(),
+      status: scenario.status,
+    });
+    const store = database.stopInterrupts;
+    const claimOriginal = store.claim.bind(store);
+    const claim = vi.spyOn(store, "claim").mockImplementation(async (id, token, generation) => {
+      const acquired = await claimOriginal(id, token, generation);
+      assert.ok(acquired);
+      return { state: { approvedPeerIds: [PEER_ID] }, expired: scenario.expired };
+    });
+    const complete = vi.spyOn(store, "complete");
+    const release = vi.spyOn(store, "release");
+    const sessionOutcome = scenario.sessionOutcome;
+    const session = vi
+      .spyOn(AgentSessions.prototype, "interruptStoppedExecution")
+      .mockResolvedValue(
+        typeof sessionOutcome === "string" ? sessionOutcome : sessionOutcome?.slice(),
+      );
+    const lifecycle = createLifecycle(database, new AcknowledgementConnection());
+    try {
+      await lifecycle.recoverPendingHubActions(DAEMON_ID);
+
+      assert.equal(claim.mock.calls.length, 1);
+      const call = claim.mock.calls[0];
+      assert.ok(call);
+      const [id, token, generation] = call;
+      assert.equal(id, EXECUTION_ID);
+      assert.ok(token);
+      assert.equal(generation, null);
+      assert.deepEqual(complete.mock.calls, [[EXECUTION_ID, token, scenario.outcome]]);
+      assert.deepEqual(release.mock.calls, [[EXECUTION_ID, token]]);
+      const [completedAt] = complete.mock.invocationCallOrder;
+      const [releasedAt] = release.mock.invocationCallOrder;
+      assert.ok(completedAt);
+      assert.ok(releasedAt);
+      assert.ok(completedAt < releasedAt);
+      assert.equal(session.mock.calls.length, sessionOutcome === undefined ? 0 : 1);
+      const peer = await database.findAgentExecutionById(PEER_ID);
+      assert.ok(peer);
+      assert.equal(peer.status, scenario.outcome === "confirmed" ? "failed" : "spawning");
+      if (scenario.outcome === "confirmed") {
+        assert.deepEqual(peer.result, { status: "failed", reason: "agent_interrupted" });
+        assert.equal(peer.hubAction, null);
+      }
+    } finally {
+      session.mockRestore();
+      await lifecycle.stop();
+    }
+  });
+});
+
+async function seedStopExecution(database: ReturnType<typeof createMemoryDatabase>): Promise<void> {
+  const input = {
+    organizationId: "org-stop-test",
+    projectId: "project-stop-test",
+    machineId: null,
+    daemonId: DAEMON_ID,
+    triggerContext: {},
+    outputContext: {},
+    configurationRevisionId: "revision-stop-test",
+  };
+  await database.insertAgentExecution({ ...input, id: EXECUTION_ID });
+  await database.insertAgentExecution({ ...input, id: PEER_ID });
+  await database.transitionAgentExecution(EXECUTION_ID, "failed", {
+    result: { status: "canceled" },
+    hubAction: "interrupt",
+  });
+}
 
 describe("execution workspace title", () => {
   const executionId = "e6a296d1-1f0c-4c4e-9b2a-000000000000";
