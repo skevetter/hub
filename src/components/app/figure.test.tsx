@@ -5,11 +5,15 @@ import { Figure, FigureSkeleton, Figures } from "./figure.js";
 
 describe("Figure", () => {
   it("sets the numeral over a heavy rule with its unit and caption", () => {
-    const markup = renderToStaticMarkup(<Figure value="14" unit="runs today" caption="3 failed" />);
+    const markup = renderToStaticMarkup(
+      <Figure value="14" unit="runs today">
+        3 failed
+      </Figure>,
+    );
     assert.match(markup, /class="[^"]*border-t-2[^"]*border-foreground/u);
     assert.match(markup, /<span class="[^"]*font-strong text-3xl tabular-nums[^"]*">14<\/span>/u);
     assert.match(markup, /<span class="text-sm">runs today<\/span>/u);
-    assert.match(markup, /<p class="text-xs text-muted-foreground">3 failed<\/p>/u);
+    assert.match(markup, /<p class="[^"]*text-xs text-muted-foreground">3 failed<\/p>/u);
   });
 
   it("spends a state ink only when it is asked to", () => {

@@ -1,4 +1,11 @@
+import { join } from "node:path";
+import AxeBuilder from "@axe-core/playwright";
 import { expect, type Locator, type Page } from "@playwright/test";
+
+const SHOT_VIEWPORTS = [
+  { width: 1280, height: 800 },
+  { width: 390, height: 844 },
+];
 
 const ROUTING_ATTENTION_TITLE = "2 events dropped in the last 7 days";
 
@@ -88,48 +95,97 @@ export class OrganizationHome {
     await expect(this.page).toHaveURL(/\/triggers\/new\/edit$/u);
   }
 
-  figures() {
-    return this.page.getByRole("group", { name: "Overview", exact: true });
+  needsYou() {
+    return this.page.getByRole("group", { name: "Needs you", exact: true });
   }
 
-  /** The figure that counts the unit, for example "triggers failing", read as its numeral. */
-  async expectFigure(unit: string, value: number) {
-    const figure = this.figures().locator("[data-slot=figure]").filter({ hasText: unit });
-    await expect(figure.locator("span").first()).toHaveText(String(value));
+  private needsYouFigure(unit: string): Locator {
+    return this.needsYou().locator("[data-slot=figure]").filter({ hasText: unit });
   }
 
-  triggerRow(triggerName: string): Locator {
-    return this.page
-      .getByRole("list", { name: "Trigger health" })
-      .getByRole("listitem")
-      .filter({ hasText: triggerName });
+  /** The "Needs you" figure whose unit contains the text, read as its numeral. */
+  async expectNeedsYou(unit: string, value: number) {
+    await expect(this.needsYouFigure(unit).locator("span").first()).toHaveText(String(value));
   }
 
-  async expectTrigger(triggerName: string, state: string) {
-    await expect(this.triggerRow(triggerName)).toContainText(state);
+  async expectNeedsYouCaption(unit: string, caption: string | RegExp) {
+    await expect(this.needsYouFigure(unit)).toContainText(caption);
   }
 
-  triggerRows(): Locator {
-    return this.page.getByRole("list", { name: "Trigger health" }).getByRole("listitem");
+  async followNeedsYouLink(unit: string, name: string) {
+    await this.needsYouFigure(unit).getByRole("link", { name, exact: true }).click();
   }
 
-  async followViewAllTriggers() {
-    await this.page.getByRole("main").getByRole("link", { name: "View all", exact: true }).click();
-    await expect(this.page).toHaveURL(/\/o\/[^/]+\/triggers$/u);
+  async expectAllClear() {
+    for (const unit of [
+      "triggers failing",
+      "apps to authorize",
+      "daemons to check",
+      "stopped matching",
+    ]) {
+      await this.expectNeedsYou(unit, 0);
+      await expect(this.needsYouFigure(unit).getByRole("link")).toHaveCount(0);
+    }
   }
 
-  /** Home keeps no run list; this link under the triggers is the way to Activity. */
-  recentRunsLink(): Locator {
-    return this.page
-      .getByRole("main")
-      .getByRole("link", { name: "Recent runs", exact: true })
-      .and(this.page.locator('a[href$="/activity"]'));
+  runsFigures() {
+    return this.page.getByRole("group", { name: "Runs", exact: true });
   }
 
-  async followRecentRuns() {
-    await this.recentRunsLink().click();
-    await expect(this.page).toHaveURL(/\/o\/[^/]+\/activity$/u);
-    await expect(this.page.getByRole("heading", { name: "Activity", level: 1 })).toBeVisible();
+  async expectRuns(total: number, didNotFinish: number) {
+    const figures = this.runsFigures().locator("[data-slot=figure]");
+    await expect(figures.nth(0).locator("span").first()).toHaveText(String(total));
+    await expect(figures.nth(1).locator("span").first()).toHaveText(String(didNotFinish));
+  }
+
+  runsChart(): Locator {
+    return this.page.getByRole("img", { name: /^Runs per day\./u });
+  }
+
+  async expectNoHorizontalScroll() {
+    const overflow = await this.page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBe(0);
+  }
+
+  /** Each viewport in light and dark: no sideways scroll, no axe violations in the figures, one screenshot. */
+  async captureThemes(directory: string, name: string) {
+    await this.page.addStyleTag({
+      content: "*, *::before, *::after { transition: none !important; }",
+    });
+    for (const viewport of SHOT_VIEWPORTS) {
+      await this.page.setViewportSize(viewport);
+      for (const colorScheme of ["light", "dark"] as const) {
+        await this.page.emulateMedia({ colorScheme });
+        await expect(this.page.locator("html")).toHaveClass(
+          new RegExp(`\\b${colorScheme}\\b`, "u"),
+        );
+        await this.expectNoHorizontalScroll();
+        const results = await new AxeBuilder({ page: this.page })
+          .include('[role="group"][aria-label="Needs you"]')
+          .include('[role="group"][aria-label="Runs"]')
+          .include('[role="img"]')
+          .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+          .analyze();
+        expect(results.violations).toEqual([]);
+        await this.page.screenshot({
+          path: join(directory, `${name}-${String(viewport.width)}-${colorScheme}.png`),
+          fullPage: true,
+          animations: "disabled",
+        });
+      }
+    }
+    await this.page.setViewportSize({ width: 1280, height: 720 });
+    await this.page.emulateMedia({ colorScheme: null });
+  }
+
+  async expectRemovedSurfacesAbsent() {
+    const main = this.page.getByRole("main");
+    await expect(main.getByRole("list", { name: "Trigger health" })).toHaveCount(0);
+    await expect(main.getByRole("link", { name: "Recent runs", exact: true })).toHaveCount(0);
+    await expect(main.getByRole("heading", { name: "Start a session" })).toHaveCount(0);
+    await expect(main.getByText("Where it runs")).toHaveCount(0);
   }
 
   async capture(path: string) {
