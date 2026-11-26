@@ -1,9 +1,26 @@
-import { WebSocket } from "ws";
+import { EventEmitter } from "node:events";
+import { afterEach, expect, it, vi } from "vitest";
 import * as failures from "../../../../failures/index.js";
-import * as connection from "./connection.js";
-import { expect, it, vi } from "vitest";
+import { assertRealTimersRestored } from "../../../../test-utils/real-timers.js";
 import { startSlackSocketFixture } from "../../../../test-utils/slack-socket-fixture.js";
+import * as connection from "./connection.js";
 import { createSlackSocketSource, type SlackSocketSourceOptions } from "./socket.js";
+
+let fakeOpen: (() => Promise<ReturnType<TestSocket["connection"]>>) | undefined;
+
+vi.mock("./connection.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof connection>();
+  return {
+    ...actual,
+    openSlackSocket: (options: Parameters<typeof actual.openSlackSocket>[0]) =>
+      fakeOpen === undefined ? actual.openSlackSocket(options) : fakeOpen(),
+  };
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  assertRealTimersRestored();
+});
 
 it("acknowledges malformed and rate-limited envelopes without durable intake", async () => {
   await withSocket(async ({ slack, accept }) => {
@@ -202,39 +219,27 @@ it("does not ack binary, oversized, or disconnect frames", async () => {
 
 type SendCallback = (error?: Error) => void;
 
-class TestSocket extends WebSocket {
+class TestSocket extends EventEmitter {
   readonly closed = Promise.withResolvers<number>();
   ackError?: Error;
 
-  override readonly send = vi.fn(
-    (_data: unknown, optionsOrCallback?: object | SendCallback, callback?: SendCallback) => {
-      const done = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
-      done?.(this.ackError);
-    },
-  );
-  override readonly close = vi.fn((code: number = 1000, _reason?: string | Buffer) =>
-    this.closed.resolve(code),
-  );
+  readonly send = vi.fn((_data: string, done: SendCallback) => done(this.ackError));
+  readonly close = vi.fn((code: number = 1000, _reason?: string) => this.closed.resolve(code));
 
-  constructor() {
-    super(null);
-  }
-
-  connection(): connection.OpenSlackSocketResult {
+  connection() {
     return {
       appId: "A123",
       socket: this,
       closed: this.closed.promise,
-      close: async (_timeoutMs, reason) => this.close(1000, reason),
+      close: async (_timeoutMs: number, reason: string) => this.close(1000, reason),
     };
   }
 }
 
 function mockTransport() {
   const socket = new TestSocket();
-  const open = vi.spyOn(connection, "openSlackSocket");
   let connected = false;
-  open.mockImplementation(() => {
+  const open = vi.fn(() => {
     const transport = connected ? new TestSocket() : socket;
     connected = true;
     return Promise.resolve(transport.connection());
@@ -256,17 +261,18 @@ function socketTestRig() {
 }
 
 async function withTransport(run: (rig: ReturnType<typeof socketTestRig>) => Promise<void>) {
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const rig = socketTestRig();
   try {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    fakeOpen = rig.open;
     await run(rig);
   } finally {
     try {
       await rig.source.stop();
     } finally {
-      rig.open.mockRestore();
-      rig.report.mockRestore();
       vi.useRealTimers();
+      fakeOpen = undefined;
+      rig.report.mockRestore();
     }
   }
 }
