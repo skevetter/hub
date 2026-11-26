@@ -83,7 +83,9 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
     );
     const editorUrl = page.url();
     await steps.submit();
-    await expect(steps.step(1)).toContainText("does not run before this step");
+    await expect(
+      page.getByRole("alert").filter({ hasText: "This trigger is not ready to save" }),
+    ).toBeVisible();
     await expect(steps.step(1).getByLabel("Run only if", { exact: true })).toHaveValue(CONDITION);
     expect(page.url()).toBe(editorUrl);
     await steps.move(1, "down");
@@ -109,13 +111,20 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
 
   await test.step("a refusal that arrives after the form changed is not put on a step", async () => {
     await steps.chooseContinuity(2, "Same conversation");
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     await page.route("**/_serverFn/**", async (route) => {
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await held;
       await route.continue();
     });
     await steps.submit();
     await steps.step(1).getByLabel("Instructions", { exact: true }).fill("Review it again.");
-    await expect(page.getByText(/continues the same conversation as step/u)).toBeVisible();
+    release();
+    await expect(page.getByRole("alert").filter({ hasText: "Trigger not saved" })).toContainText(
+      "continues the same conversation as step",
+    );
     await expect(page.getByRole("region", { name: /^Step \d+:/u }).getByRole("alert")).toHaveCount(
       0,
     );

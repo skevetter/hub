@@ -58,6 +58,8 @@ describe("step form model", () => {
     expect(yamlListsSteps("run:\n  prompt: hi\n")).toBe(false);
     expect(yamlListsSteps("")).toBe(false);
     expect(yamlListsSteps("steps: nope")).toBe(false);
+    expect(yamlListsSteps("base: &b\n  steps:\n    - id: run\n<<: *b\n")).toBe(true);
+    expect(yamlListsSteps("steps: *missing")).toBe(false);
   });
 
   it("moves and removes row keys with their rows", () => {

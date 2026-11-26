@@ -918,7 +918,7 @@ function useTriggerEditorState({
 }) {
   const { mode, setMode, yaml, setYaml, form, setForm, initialProjection } =
     useEditorRepresentations(trigger, snapshot, legacy);
-  const submitted = useRef(form);
+  const { submitted, save } = useSubmittedForm(form, onSave);
   const saved = useSavedFieldErrors(saveFailure, form, submitted);
   // What the mode the reader is *not* in would receive. In form mode that is the YAML the form
   // serialises to; in YAML mode it is the form the document projects onto.
@@ -939,10 +939,6 @@ function useTriggerEditorState({
   const refuse = () => setRefused(true);
   const switchMode = (next: EditorMode) =>
     switchEditorMode(next, { mode, other, setForm, setYaml, setMode, refuse });
-  const save = (next: string) => {
-    submitted.current = form;
-    onSave(next);
-  };
   const submit = editorSubmit({ mode, other, yaml, onSave: save, refuse });
   return {
     mode,
@@ -984,6 +980,16 @@ function useSavedFieldErrors(
     );
   }, [failure, submitted]);
   return saved?.form === form ? saved.errors : NO_FIELD_ERRORS;
+}
+
+/** The form as it was when Save was pressed, which is what a save refusal speaks about. */
+function useSubmittedForm(form: TriggerFormValue, onSave: (yaml: string) => void) {
+  const submitted = useRef(form);
+  const save = (yaml: string) => {
+    submitted.current = form;
+    onSave(yaml);
+  };
+  return { submitted, save };
 }
 
 function useEditorRepresentations(

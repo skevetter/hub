@@ -1,4 +1,4 @@
-import { isSeq, parseDocument } from "yaml";
+import { parseDocument } from "yaml";
 
 import { stepFormErrors } from "./configuration/editor-steps.js";
 import type { StepListChange } from "./configuration/editor-steps.js";
@@ -59,7 +59,15 @@ export function startsAsList(steps: TriggerFormValue["steps"], plain: boolean): 
 
 /** Whether the document writes `steps` as a list, which the form keeps editing as one. */
 export function yamlListsSteps(yaml: string): boolean {
-  return isSeq(parseDocument(yaml, { compat: ["timestamp"] }).get("steps"));
+  try {
+    const document = parseDocument(yaml, { compat: ["timestamp"], merge: true });
+    const value: unknown = document.toJS();
+    return (
+      typeof value === "object" && value !== null && "steps" in value && Array.isArray(value.steps)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Row keys follow their rows through a move or a removal, so a row keeps its own field state. */
