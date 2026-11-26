@@ -66,7 +66,13 @@ describe("Linear connection client", () => {
       accessTokenExpiresAt: new Date(1_700_003_600_000),
       scopes: ["comments:create", "read"],
     });
-    assert.match(requests[0]?.body ?? "", /code=code-value/u);
+    assert.deepEqual(Object.fromEntries(new URLSearchParams(requests[0]?.body)), {
+      client_id: "client-id",
+      client_secret: "client-secret",
+      grant_type: "authorization_code",
+      code: "code-value",
+      redirect_uri: "https://hub.test/api/integrations/linear/callback",
+    });
   });
 
   it("falls back to required scopes when Linear omits them during authorization", async () => {

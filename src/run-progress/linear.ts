@@ -18,27 +18,15 @@ interface LinearProgressOptions {
   clientSecret: string;
 }
 
+type LinearProgressAuthorizations = WeakMap<
+  CredentialLocator,
+  { connection: LinearConnectionRecord; issueId: string }
+>;
+
 export function createLinearProgressProvider(options: LinearProgressOptions): ProgressProvider {
   const { client, connectionForLinearOrganization, readRunOutputContext, clientSecret } = options;
   // The writer passes the same locator through authorization, secret checks, and one mutation.
-  const authorized = new WeakMap<
-    CredentialLocator,
-    {
-      connection: LinearConnectionRecord;
-      issueId: string;
-    }
-  >();
-
-  const writeOptions = (locator: CredentialLocator, signal: AbortSignal) => {
-    const authorization = authorized.get(locator);
-    authorized.delete(locator);
-    if (authorization === undefined) throw new LinearCredentialError("connection_not_owned");
-    return {
-      issueId: authorization.issueId,
-      binding: linearConnectionBinding(authorization.connection),
-      signal,
-    };
-  };
+  const authorized: LinearProgressAuthorizations = new WeakMap();
 
   return {
     name: "linear",
@@ -62,13 +50,12 @@ export function createLinearProgressProvider(options: LinearProgressOptions): Pr
       signal.throwIfAborted();
       if (!context.success || context.data.linearOrganizationId !== locator.linearOrganizationId)
         return { refused: "target_mismatch" };
-      const authority = await authorizeLinearCommentConnection(
-        connectionForLinearOrganization,
-        locator.linearOrganizationId,
-        run.organizationId,
-        "write",
+      const authority = await authorizeLinearCommentConnection(connectionForLinearOrganization, {
+        linearOrganizationId: locator.linearOrganizationId,
+        organizationId: run.organizationId,
+        requiredScope: "write",
         signal,
-      );
+      });
       if (!("connection" in authority)) return authority;
       authorized.set(locator, { connection: authority.connection, issueId: context.data.issueId });
       return "ok";
@@ -82,6 +69,26 @@ export function createLinearProgressProvider(options: LinearProgressOptions): Pr
           : [clientSecret, connection.accessToken, connection.refreshToken ?? ""],
       );
     },
+    ...createLinearProgressWriters(client, authorized),
+  };
+}
+
+function createLinearProgressWriters(
+  client: LinearProgressOptions["client"],
+  authorized: LinearProgressAuthorizations,
+): Pick<ProgressProvider, "create" | "edit"> {
+  const writeOptions = (locator: CredentialLocator, signal: AbortSignal) => {
+    const authorization = authorized.get(locator);
+    authorized.delete(locator);
+    if (authorization === undefined) throw new LinearCredentialError("connection_not_owned");
+    return {
+      issueId: authorization.issueId,
+      binding: linearConnectionBinding(authorization.connection),
+      signal,
+    };
+  };
+
+  return {
     async create({ credential, issueId }, body, signal) {
       if (
         credential.kind !== "linear-organization" ||
@@ -164,6 +171,10 @@ function mapWriteError(error: unknown): ProgressCall {
     case 404:
       return { status: "gone" };
   }
+  return mapGraphqlWriteError(error);
+}
+
+function mapGraphqlWriteError(error: LinearApiError): ProgressCall {
   const { graphqlCodes } = error;
   if (graphqlCodes.some((code) => authenticationErrorCodes.has(code)))
     return { status: "unavailable", code: "reauthorize" };

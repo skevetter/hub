@@ -22,10 +22,10 @@ const LinearTokenResponseSchema = z
   .object({
     access_token: z.string().min(1),
     refresh_token: z.string().min(1).optional(),
-    expires_in: z.number().finite().positive().optional(),
+    expires_in: z.number().positive().optional(),
     scope: z.string().optional(),
   })
-  .passthrough();
+  .loose();
 
 const OAuthErrorSchema = z.object({ error: z.string() });
 
@@ -54,7 +54,7 @@ const IssueResponseSchema = z.object({
         identifier: z.string().min(1).optional(),
         title: z.string(),
         description: z.string().nullable().optional(),
-        url: z.string().url().optional(),
+        url: z.url().optional(),
         project: z
           .object({ id: z.string().min(1) })
           .nullable()
@@ -80,7 +80,7 @@ const IssueCommentHistoryResponseSchema = z.object({
         z.object({
           id: z.string().min(1),
           body: z.string(),
-          createdAt: z.string().datetime(),
+          createdAt: z.iso.datetime(),
           user: z
             .object({
               id: z.string().min(1),
@@ -136,18 +136,33 @@ const CommentUpdateResponseSchema = z.object({
   }),
 });
 
+interface LinearApiErrorDetails {
+  code?: string | undefined;
+  retryAfterMs?: number | undefined;
+  rateLimitBeforeExecution?: boolean;
+  graphqlCodes?: readonly string[];
+  graphqlRejected?: boolean;
+  graphqlErrorType?: string | undefined;
+}
+
 export class LinearApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number,
-    readonly code?: string,
-    readonly retryAfterMs?: number,
-    readonly rateLimitBeforeExecution = false,
-    readonly graphqlCodes: readonly string[] = [],
-    readonly graphqlRejected = false,
-    readonly graphqlErrorType?: string,
-  ) {
+  readonly status: number;
+  readonly code: string | undefined;
+  readonly retryAfterMs: number | undefined;
+  readonly rateLimitBeforeExecution: boolean;
+  readonly graphqlCodes: readonly string[];
+  readonly graphqlRejected: boolean;
+  readonly graphqlErrorType: string | undefined;
+
+  constructor(message: string, status: number, details: LinearApiErrorDetails = {}) {
     super(message);
+    this.status = status;
+    this.code = details.code;
+    this.retryAfterMs = details.retryAfterMs;
+    this.rateLimitBeforeExecution = details.rateLimitBeforeExecution ?? false;
+    this.graphqlCodes = details.graphqlCodes ?? [];
+    this.graphqlRejected = details.graphqlRejected ?? false;
+    this.graphqlErrorType = details.graphqlErrorType;
     this.name = "LinearApiError";
   }
 }
@@ -271,11 +286,14 @@ export function linearConnectionBinding(
 
 export async function authorizeLinearCommentConnection(
   lookup: Database["findLinearConnection"],
-  linearOrganizationId: string,
-  organizationId: string,
-  requiredScope: LinearCommentScope,
-  signal: AbortSignal,
+  options: {
+    linearOrganizationId: string;
+    organizationId: string;
+    requiredScope: LinearCommentScope;
+    signal: AbortSignal;
+  },
 ) {
+  const { linearOrganizationId, organizationId, requiredScope, signal } = options;
   signal.throwIfAborted();
   const connection = await lookup(linearOrganizationId);
   signal.throwIfAborted();
@@ -347,27 +365,8 @@ export function createLinearConnectionClient(options: {
       });
       return `https://linear.app/oauth/authorize?${parameters.toString()}`;
     },
-    async exchangeCode(code) {
-      const token = await exchangeToken(
-        request,
-        options,
-        {
-          grant_type: "authorization_code",
-          code,
-          redirect_uri: redirectUri,
-        },
-        now,
-      );
-      const viewer = await readViewer(request, token.accessToken);
-      return {
-        linearOrganizationId: viewer.organization.id,
-        linearOrganizationName: viewer.organization.name,
-        appUserId: viewer.id,
-        accessToken: token.accessToken,
-        refreshToken: token.refreshToken ?? null,
-        accessTokenExpiresAt: token.accessTokenExpiresAt ?? null,
-        scopes: token.scopes ?? [...LINEAR_REQUIRED_SCOPES],
-      };
+    exchangeCode(code) {
+      return exchangeAuthorizationCode(request, { options, redirectUri, now, code });
     },
     async refresh(refreshToken, signal) {
       const token = await exchangeToken(
@@ -377,8 +376,7 @@ export function createLinearConnectionClient(options: {
           grant_type: "refresh_token",
           refresh_token: refreshToken,
         },
-        now,
-        signal,
+        { now, signal },
       );
       return {
         accessToken: token.accessToken,
@@ -402,11 +400,52 @@ export function createLinearConnectionClient(options: {
   };
 }
 
+type LinearClientCredentials = Pick<
+  Parameters<typeof createLinearConnectionClient>[0],
+  "clientId" | "clientSecret"
+>;
+
+async function exchangeAuthorizationCode(
+  request: typeof fetch,
+  {
+    options,
+    code,
+    redirectUri,
+    now,
+  }: {
+    options: LinearClientCredentials;
+    code: string;
+    redirectUri: string;
+    now: () => Date;
+  },
+): Promise<LinearInstallation> {
+  const token = await exchangeToken(
+    request,
+    options,
+    {
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+    },
+    { now },
+  );
+  const viewer = await readViewer(request, token.accessToken);
+  return {
+    linearOrganizationId: viewer.organization.id,
+    linearOrganizationName: viewer.organization.name,
+    appUserId: viewer.id,
+    accessToken: token.accessToken,
+    refreshToken: token.refreshToken ?? null,
+    accessTokenExpiresAt: token.accessTokenExpiresAt ?? null,
+    scopes: token.scopes ?? [...LINEAR_REQUIRED_SCOPES],
+  };
+}
+
 /**
  * The API client always finds credentials through the external Linear organization ID. That ID is
  * part of signed webhook evidence and output context, while Hub organization IDs remain internal.
  */
-export function createLinearApiClient(options: {
+interface LinearApiClientOptions {
   connectionForLinearOrganization(
     linearOrganizationId: string,
   ): Promise<LinearConnectionRecord | undefined>;
@@ -414,37 +453,53 @@ export function createLinearApiClient(options: {
   connectionClient: Pick<LinearConnectionClient, "refresh">;
   fetch?: typeof fetch;
   now?: () => Date;
-}): LinearApiClient {
+}
+
+export function createLinearApiClient(options: LinearApiClientOptions): LinearApiClient {
   const request = options.fetch ?? fetch;
   const now = options.now ?? (() => new Date());
-  // Avoid duplicate local work, while the database transaction remains the cross-process source of
-  // truth for refresh serialization and rebind safety.
-  const refreshes = new Map<string, Promise<LinearConnectionRecord>>();
-
-  const hasUsableAccessToken = (connection: LinearConnectionRecord): boolean =>
-    hasUsableLinearAccessToken(connection, now());
-
-  const checkWriteConnection = (
-    connection: LinearConnectionRecord,
-    write?: LinearCommentWriteOptions,
-  ): void => {
-    if (write === undefined) return;
-    const { binding } = write;
-    if (
-      connection.id !== binding.id ||
-      connection.organizationId !== binding.organizationId ||
-      connection.linearOrganizationId !== binding.linearOrganizationId ||
-      connection.providerApplicationId !== binding.providerApplicationId ||
-      connection.appUserId !== binding.appUserId
-    )
-      throw new LinearCredentialError("connection_not_owned");
-    if (!connection.scopes.includes(write.requiredScope ?? "write"))
-      throw new LinearCredentialError("scope_missing");
-    if (linearConnectionRequiresReauthorization(connection, now()))
-      throw new LinearCredentialError("reauthorize");
+  const connectionForToken = createConnectionForToken(options, now);
+  return {
+    ...createLinearReaders(request, connectionForToken),
+    readIssueComments(input) {
+      return readIssueComments(request, connectionForToken, input);
+    },
+    ...createLinearWriters(request, connectionForToken, options, now),
   };
+}
 
-  const connectionForToken = async (
+function checkWriteConnection(
+  now: () => Date,
+  connection: LinearConnectionRecord,
+  write?: LinearCommentWriteOptions,
+): void {
+  if (write === undefined) return;
+  const { binding } = write;
+  if (
+    connection.id !== binding.id ||
+    connection.organizationId !== binding.organizationId ||
+    connection.linearOrganizationId !== binding.linearOrganizationId ||
+    connection.providerApplicationId !== binding.providerApplicationId ||
+    connection.appUserId !== binding.appUserId
+  )
+    throw new LinearCredentialError("connection_not_owned");
+  if (!connection.scopes.includes(write.requiredScope ?? "write"))
+    throw new LinearCredentialError("scope_missing");
+  if (linearConnectionRequiresReauthorization(connection, now()))
+    throw new LinearCredentialError("reauthorize");
+}
+
+type ConnectionForToken = (
+  linearOrganizationId: string,
+  write?: LinearCommentWriteOptions,
+) => Promise<LinearConnectionRecord>;
+
+function createConnectionForToken(
+  options: LinearApiClientOptions,
+  now: () => Date,
+): ConnectionForToken {
+  const refreshConnection = createConnectionRefresher(options, now);
+  return async (
     linearOrganizationId: string,
     write?: LinearCommentWriteOptions,
   ): Promise<LinearConnectionRecord> => {
@@ -452,18 +507,24 @@ export function createLinearApiClient(options: {
     const connection = await options.connectionForLinearOrganization(linearOrganizationId);
     write?.signal.throwIfAborted();
     if (connection === undefined) throw new LinearCredentialError("connection_unavailable");
-    checkWriteConnection(connection, write);
-    if (hasUsableAccessToken(connection)) return connection;
+    checkWriteConnection(now, connection, write);
+    if (hasUsableLinearAccessToken(connection, now())) return connection;
     if (connection.refreshToken === null) throw new LinearCredentialError("reauthorize");
     return refreshConnection(linearOrganizationId, connection.id, write);
   };
+}
+
+function createConnectionRefresher(options: LinearApiClientOptions, now: () => Date) {
+  // Avoid duplicate local work, while the database transaction remains the cross-process source of
+  // truth for refresh serialization and rebind safety.
+  const refreshes = new Map<string, Promise<LinearConnectionRecord>>();
 
   const refreshUnderLock = (linearOrganizationId: string, write?: LinearCommentWriteOptions) =>
     options.withLinearConnectionRefresh(linearOrganizationId, async (current, updateTokens) => {
       write?.signal.throwIfAborted();
       if (current === undefined) throw new LinearCredentialError("connection_unavailable");
-      checkWriteConnection(current, write);
-      if (hasUsableAccessToken(current)) return current;
+      checkWriteConnection(now, current, write);
+      if (hasUsableLinearAccessToken(current, now())) return current;
       if (current.refreshToken === null) throw new LinearCredentialError("reauthorize");
       const refreshed = await options.connectionClient.refresh(current.refreshToken, write?.signal);
       write?.signal.throwIfAborted();
@@ -472,7 +533,7 @@ export function createLinearApiClient(options: {
       return { ...current, ...refreshed };
     });
 
-  const refreshConnection = async (
+  return async (
     linearOrganizationId: string,
     connectionId: string,
     write?: LinearCommentWriteOptions,
@@ -489,36 +550,12 @@ export function createLinearApiClient(options: {
       if (refreshes.get(connectionId) === pending) refreshes.delete(connectionId);
     }
   };
+}
 
-  const accessTokenFor = async (linearOrganizationId: string) =>
-    (await connectionForToken(linearOrganizationId)).accessToken;
-
-  const commentMutation = async (
-    input: { linearOrganizationId: string; body: string },
-    payload: GraphqlPayload,
-    write?: LinearCommentWriteOptions,
-  ): Promise<unknown> => {
-    let connection = await connectionForToken(input.linearOrganizationId, write);
-    if (write !== undefined) {
-      write.signal.throwIfAborted();
-      const current = await options.connectionForLinearOrganization(input.linearOrganizationId);
-      write.signal.throwIfAborted();
-      if (current === undefined) throw new LinearCredentialError("connection_not_owned");
-      checkWriteConnection(current, write);
-      if (
-        input.body.includes(current.accessToken) ||
-        (current.refreshToken && input.body.includes(current.refreshToken))
-      )
-        throw new LinearCredentialError("body_contains_secret");
-      connection = current;
-    }
-    return graphql(request, connection.accessToken, payload, {
-      mutation: true,
-      signal: write?.signal,
-      now,
-    });
-  };
-
+function createLinearReaders(
+  request: typeof fetch,
+  connectionForToken: ConnectionForToken,
+): Pick<LinearApiClient, "readIssue" | "readComment"> {
   return {
     async readIssue(input, write) {
       const { accessToken } = await connectionForToken(input.linearOrganizationId, write);
@@ -542,19 +579,7 @@ export function createLinearApiClient(options: {
         ),
       );
       const issue = result.data.issue;
-      return issue === null
-        ? undefined
-        : {
-            id: issue.id,
-            ...(issue.identifier === undefined ? {} : { identifier: issue.identifier }),
-            title: issue.title,
-            description: issue.description ?? null,
-            ...(issue.url === undefined ? {} : { url: issue.url }),
-            projectId: issue.project?.id ?? null,
-            stateId: issue.state?.id ?? null,
-            assigneeId: issue.assignee?.id ?? null,
-            labelIds: issue.labels.nodes.map(({ id }) => id),
-          };
+      return issue === null ? undefined : mapLinearIssue(issue);
     },
     async readComment({ linearOrganizationId, commentId }, write) {
       const { accessToken } = await connectionForToken(linearOrganizationId, write);
@@ -573,10 +598,36 @@ export function createLinearApiClient(options: {
       );
       return result.data.comment;
     },
-    async readIssueComments(input) {
-      const result = IssueCommentHistoryResponseSchema.parse(
-        await graphql(request, await accessTokenFor(input.linearOrganizationId), {
-          query: `query PaseoIssueCommentHistory($issueId: String!, $before: DateTime!) {
+  };
+}
+
+function mapLinearIssue(
+  issue: NonNullable<z.infer<typeof IssueResponseSchema>["data"]["issue"]>,
+): LinearIssueDetails {
+  return {
+    id: issue.id,
+    ...(issue.identifier === undefined ? {} : { identifier: issue.identifier }),
+    title: issue.title,
+    description: issue.description ?? null,
+    ...(issue.url === undefined ? {} : { url: issue.url }),
+    projectId: issue.project?.id ?? null,
+    stateId: issue.state?.id ?? null,
+    assigneeId: issue.assignee?.id ?? null,
+    labelIds: issue.labels.nodes.map(({ id }) => id),
+  };
+}
+
+async function readIssueComments(
+  request: typeof fetch,
+  connectionForToken: ConnectionForToken,
+  input: Parameters<LinearApiClient["readIssueComments"]>[0],
+): Promise<LinearIssueCommentHistory> {
+  const accessTokenFor = async (linearOrganizationId: string) =>
+    (await connectionForToken(linearOrganizationId)).accessToken;
+
+  const result = IssueCommentHistoryResponseSchema.parse(
+    await graphql(request, await accessTokenFor(input.linearOrganizationId), {
+      query: `query PaseoIssueCommentHistory($issueId: String!, $before: DateTime!) {
             comments(
               last: ${LINEAR_ISSUE_COMMENT_CONTEXT_LIMIT}
               orderBy: createdAt
@@ -589,30 +640,39 @@ export function createLinearApiClient(options: {
               pageInfo { hasPreviousPage }
             }
           }`,
-          variables: { issueId: input.issueId, before: input.beforeCreatedAt },
-        }),
-      );
-      const comments = result.data.comments.nodes
-        .map((comment) => ({
-          id: comment.id,
-          body: comment.body,
-          createdAt: comment.createdAt,
-          author:
-            comment.user === undefined || comment.user === null
-              ? null
-              : {
-                  id: comment.user.id,
-                  ...(comment.user.name === undefined || comment.user.name === null
-                    ? {}
-                    : { name: comment.user.name }),
-                },
-        }))
-        .sort(compareLinearCommentOrder);
-      return {
-        comments,
-        complete: !result.data.comments.pageInfo.hasPreviousPage,
-      };
-    },
+      variables: { issueId: input.issueId, before: input.beforeCreatedAt },
+    }),
+  );
+  const comments = result.data.comments.nodes
+    .map((comment) => ({
+      id: comment.id,
+      body: comment.body,
+      createdAt: comment.createdAt,
+      author:
+        comment.user === undefined || comment.user === null
+          ? null
+          : {
+              id: comment.user.id,
+              ...(comment.user.name === undefined || comment.user.name === null
+                ? {}
+                : { name: comment.user.name }),
+            },
+    }))
+    .sort(compareLinearCommentOrder);
+  return {
+    comments,
+    complete: !result.data.comments.pageInfo.hasPreviousPage,
+  };
+}
+
+function createLinearWriters(
+  request: typeof fetch,
+  connectionForToken: ConnectionForToken,
+  options: LinearApiClientOptions,
+  now: () => Date,
+): Pick<LinearApiClient, "createComment" | "updateComment"> {
+  const commentMutation = createCommentMutation(request, connectionForToken, options, now);
+  return {
     async createComment(input, write) {
       const { issueId, body, commentId } = input;
       const payload =
@@ -653,6 +713,39 @@ export function createLinearApiClient(options: {
   };
 }
 
+function createCommentMutation(
+  request: typeof fetch,
+  connectionForToken: ConnectionForToken,
+  options: LinearApiClientOptions,
+  now: () => Date,
+) {
+  return async (
+    input: { linearOrganizationId: string; body: string },
+    payload: GraphqlPayload,
+    write?: LinearCommentWriteOptions,
+  ): Promise<unknown> => {
+    let connection = await connectionForToken(input.linearOrganizationId, write);
+    if (write !== undefined) {
+      write.signal.throwIfAborted();
+      const current = await options.connectionForLinearOrganization(input.linearOrganizationId);
+      write.signal.throwIfAborted();
+      if (current === undefined) throw new LinearCredentialError("connection_not_owned");
+      checkWriteConnection(now, current, write);
+      if (
+        input.body.includes(current.accessToken) ||
+        (current.refreshToken && input.body.includes(current.refreshToken))
+      )
+        throw new LinearCredentialError("body_contains_secret");
+      connection = current;
+    }
+    return graphql(request, connection.accessToken, payload, {
+      mutation: true,
+      signal: write?.signal,
+      now,
+    });
+  };
+}
+
 function compareLinearCommentOrder(
   left: Pick<LinearIssueComment, "createdAt" | "id">,
   right: Pick<LinearIssueComment, "createdAt" | "id">,
@@ -663,10 +756,9 @@ function compareLinearCommentOrder(
 
 async function exchangeToken(
   request: typeof fetch,
-  options: Pick<Parameters<typeof createLinearConnectionClient>[0], "clientId" | "clientSecret">,
+  options: LinearClientCredentials,
   values: Record<string, string>,
-  now: () => Date,
-  signal?: AbortSignal,
+  { now, signal }: { now: () => Date; signal?: AbortSignal | undefined },
 ): Promise<{
   accessToken: string;
   refreshToken?: string;
@@ -826,43 +918,67 @@ function checkGraphqlResponse(response: Response, result: unknown, now: () => Da
   if (response.ok && !envelope.success) return;
   const rawErrors = envelope.success ? envelope.data.errors : [];
   const errors = parseGraphqlErrors(rawErrors);
-  const rateLimited = errors.find(
-    ({ extensions }) => extensions?.code?.toUpperCase() === "RATELIMITED",
-  );
-  const codes = errors.flatMap(({ extensions }) =>
-    extensions?.code === undefined ? [] : [extensions.code.toUpperCase()],
-  );
+  const rateLimited = errors.find(isRateLimitedError);
+  const codes = errors.flatMap(graphqlErrorCodes);
   const error = rateLimited ?? errors[0];
   const { code, type } = error?.extensions ?? {};
   const delay =
     rateLimited !== undefined || response.status === 429
       ? linearRetryAfterMs(response.headers, now().getTime())
       : undefined;
+  const { rateLimitBeforeExecution, graphqlRejected } = classifyGraphqlRejection({
+    response,
+    result,
+    rawErrors,
+    errors,
+    rateLimited: rateLimited !== undefined,
+  });
+  throw new LinearApiError(graphqlErrorMessage(response, error), response.status, {
+    code,
+    retryAfterMs: delay,
+    rateLimitBeforeExecution,
+    graphqlCodes: codes,
+    graphqlRejected,
+    graphqlErrorType: type,
+  });
+}
+
+type GraphqlError = z.infer<typeof GraphqlErrorSchema>;
+
+function graphqlErrorMessage(response: Response, error: GraphqlError | undefined): string {
+  return response.ok
+    ? `Linear GraphQL ${error?.message ?? "response contained errors"}`
+    : `Linear GraphQL HTTP ${response.status}`;
+}
+
+function isRateLimitedError({ extensions }: GraphqlError): boolean {
+  return extensions?.code?.toUpperCase() === "RATELIMITED";
+}
+
+function graphqlErrorCodes({ extensions }: GraphqlError): string[] {
+  return extensions?.code === undefined ? [] : [extensions.code.toUpperCase()];
+}
+
+function classifyGraphqlRejection(input: {
+  response: Response;
+  result: unknown;
+  rawErrors: unknown[];
+  errors: GraphqlError[];
+  rateLimited: boolean;
+}) {
+  const { response, result, rawErrors, errors, rateLimited } = input;
   const beforeExecution =
     !hasResponseField(result, "data") &&
     !rawErrors.some((entry) => hasResponseField(entry, "path"));
   const rateLimitBeforeExecution =
-    rateLimited !== undefined &&
-    (response.status === 400 || response.status === 429) &&
-    beforeExecution;
+    rateLimited && (response.status === 400 || response.status === 429) && beforeExecution;
   const graphqlRejected =
     (beforeExecution &&
       errors.length > 0 &&
       errors.length === rawErrors.length &&
       errors.every(({ message }) => Boolean(message))) ||
     rejectedCommentCreate(response.status, result);
-  throw new LinearApiError(
-    response.ok
-      ? `Linear GraphQL ${error?.message ?? "response contained errors"}`
-      : `Linear GraphQL HTTP ${response.status}`,
-    response.status,
-    code,
-    delay,
-    rateLimitBeforeExecution,
-    codes,
-    graphqlRejected,
-    type,
-  );
+  return { rateLimitBeforeExecution, graphqlRejected };
 }
 
 function rejectedCommentCreate(status: number, result: unknown): boolean {
@@ -918,12 +1034,15 @@ export { hasUsableLinearAccessToken };
 
 export async function requestLinearAgentGraphql(
   request: typeof fetch,
-  accessToken: string,
-  query: string,
-  variables: Record<string, unknown>,
-  signal: AbortSignal,
-  now: () => Date,
+  options: {
+    accessToken: string;
+    query: string;
+    variables: Record<string, unknown>;
+    signal: AbortSignal;
+    now: () => Date;
+  },
 ): Promise<unknown> {
+  const { accessToken, query, variables, signal, now } = options;
   const response = await linearRequest(request, "https://api.linear.app/graphql", {
     method: "POST",
     headers: {

@@ -309,14 +309,13 @@ function agentTransport(
     checkPayloadCredentials(serialized, connection);
     const response = await providerRequest(
       () =>
-        requestLinearAgentGraphql(
-          options.fetch,
-          connection.accessToken,
+        requestLinearAgentGraphql(options.fetch, {
+          accessToken: connection.accessToken,
           query,
           variables,
           signal,
           now,
-        ),
+        }),
       signal,
       options.pilotOperations,
     );
