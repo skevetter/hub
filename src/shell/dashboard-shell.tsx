@@ -168,9 +168,10 @@ function DashboardContent(props: DashboardContentProps) {
       </Sidebar>
       <SiteHeaderActionsProvider>
         <SidebarInset className="pb-[var(--shell-bottom-bar)] md:pb-0">
-          <PhoneHeader scope={organization.name} />
+          <PhoneHeader scope={organization.name} organizationSlug={organization.slug} />
           <SiteHeader
             scope={organization.name}
+            organizationSlug={organization.slug}
             {...(tenant?.project == null ? {} : { project: tenant.project.name })}
           />
           {/* The app's one content inset. Screens never pad themselves. */}

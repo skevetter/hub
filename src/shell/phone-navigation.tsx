@@ -18,10 +18,21 @@ import { useSidebar } from "../components/ui/sidebar.js";
 import { cn } from "../lib/utils.js";
 import { useActiveDestination, usePageContext } from "../navigation/index.js";
 import { CommandSearchButton } from "./command-menu.js";
+import { CrumbLink } from "./crumb-link.js";
 import { NavItem, PHONE_TAB_CLASS, type NavigationItem } from "./navigation-group.js";
 
-export function PhoneHeader({ scope }: { scope: string }) {
+const PHONE_CRUMB_LINK = "truncate underline-offset-4 hover:underline focus-visible:underline";
+
+export function PhoneHeader({
+  scope,
+  organizationSlug,
+}: {
+  scope: string;
+  organizationSlug: string;
+}) {
   const { breadcrumbs } = usePageContext();
+  const current = breadcrumbs.at(-1);
+  const parents = breadcrumbs.slice(0, -1);
   return (
     <header className="top-0 z-10 flex h-12 shrink-0 items-center gap-3 border-b border-rail-border bg-rail px-4 text-rail-foreground max-md:sticky md:hidden">
       <span
@@ -30,9 +41,21 @@ export function PhoneHeader({ scope }: { scope: string }) {
         className="size-5 shrink-0 rounded-sm bg-rail-foreground"
       />
       <nav aria-label="Breadcrumb" className="grid min-w-0">
-        <span className="truncate text-xs text-rail-muted">{scope}</span>
+        <span className="flex min-w-0 items-center gap-1 text-xs text-rail-muted">
+          <CrumbLink to={`/o/${organizationSlug}/home`} className={PHONE_CRUMB_LINK}>
+            {scope}
+          </CrumbLink>
+          {parents.map((entry) => (
+            <span key={`${entry.to}:${entry.label}`} className="flex min-w-0 items-center gap-1">
+              <span aria-hidden="true">/</span>
+              <CrumbLink to={entry.to} className={PHONE_CRUMB_LINK}>
+                {entry.label}
+              </CrumbLink>
+            </span>
+          ))}
+        </span>
         <span aria-current="page" className="truncate text-sm font-strong">
-          {breadcrumbs.at(-1) ?? "Paseo Hub"}
+          {current?.label ?? "Paseo Hub"}
         </span>
       </nav>
       <CommandSearchButton phone />

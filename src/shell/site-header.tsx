@@ -1,15 +1,27 @@
-import { usePageContext } from "../navigation/index.js";
+import { CrumbLink } from "./crumb-link.js";
+import { usePageContext, type Crumb } from "../navigation/index.js";
 import { cn } from "../lib/utils.js";
 import { Separator } from "../components/ui/separator.js";
 import { SidebarTrigger } from "../components/ui/sidebar.js";
 import { SiteHeaderActionsTarget } from "./site-header-actions.js";
 
+const CRUMB_LINK =
+  "truncate underline-offset-4 hover:text-foreground hover:underline focus-visible:underline";
+
 /**
  * Header context, not a second title. The page owns its `<h1>`; this says where that page sits,
- * which is why it leads with where you are — the same scope the sidebar header stacks — rather
- * than repeating the view.
+ * which is why it leads with where you are (the same scope the sidebar header stacks) rather
+ * than repeating the view. Every crumb but the current page is a link up the chain.
  */
-export function SiteHeader({ scope, project }: { scope: string; project?: string }) {
+export function SiteHeader({
+  scope,
+  organizationSlug,
+  project,
+}: {
+  scope: string;
+  organizationSlug: string;
+  project?: string;
+}) {
   const { breadcrumbs: trail } = usePageContext();
   return (
     <header className="sticky top-0 z-10 hidden shrink-0 items-center gap-2 bg-background px-4 max-md:static sm:flex md:h-12 md:border-b">
@@ -19,12 +31,19 @@ export function SiteHeader({ scope, project }: { scope: string; project?: string
         aria-label="Breadcrumb"
         className="hidden min-w-0 items-center gap-1.5 overflow-hidden text-sm md:flex"
       >
-        <span className="truncate text-muted-foreground">{scope}</span>
+        <CrumbLink
+          to={`/o/${organizationSlug}/home`}
+          className={cn(CRUMB_LINK, "text-muted-foreground")}
+        >
+          {scope}
+        </CrumbLink>
         {project === undefined ? null : <Crumb context>{project}</Crumb>}
         {trail.map((entry, index) => (
-          <Crumb key={entry} context={index < trail.length - 1}>
-            {entry}
-          </Crumb>
+          <TrailCrumb
+            key={`${entry.to}:${entry.label}`}
+            entry={entry}
+            current={index === trail.length - 1}
+          />
         ))}
       </nav>
       <SiteHeaderActionsTarget />
@@ -32,13 +51,38 @@ export function SiteHeader({ scope, project }: { scope: string; project?: string
   );
 }
 
-function Crumb({ context = false, children }: { context?: boolean; children: string }) {
+function TrailCrumb({ entry, current }: { entry: Crumb; current: boolean }) {
+  if (current) return <Crumb current>{entry.label}</Crumb>;
+  return (
+    <Crumb context>
+      <CrumbLink to={entry.to} className={CRUMB_LINK}>
+        {entry.label}
+      </CrumbLink>
+    </Crumb>
+  );
+}
+
+function Crumb({
+  context = false,
+  current = false,
+  children,
+}: {
+  context?: boolean;
+  current?: boolean;
+  children: React.ReactNode;
+}) {
   return (
     <span className={cn("flex min-w-0 items-center gap-1.5", context && "text-muted-foreground")}>
       <span aria-hidden="true" className="text-muted-foreground">
         /
       </span>
-      <span className="truncate">{children}</span>
+      {current ? (
+        <span aria-current="page" className="truncate">
+          {children}
+        </span>
+      ) : (
+        children
+      )}
     </span>
   );
 }
