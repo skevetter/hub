@@ -139,6 +139,12 @@ function projectEditorEvent(
     ...(sharedFields.length === 0 ? {} : { sharedFields }),
   };
   const run = trigger.run;
+  if (run === undefined) {
+    return {
+      status: "yaml_only",
+      reason: "Triggers with several steps can only be edited in YAML.",
+    };
+  }
   if (isScriptRun(run)) {
     return {
       status: "editable",

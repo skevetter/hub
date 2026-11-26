@@ -1,8 +1,23 @@
-import { isAlias, isMap, isNode, parseDocument, visit, type Document, type Node } from "yaml";
+import {
+  isAlias,
+  isMap,
+  isNode,
+  isSeq,
+  parseDocument,
+  visit,
+  type Document,
+  type Node,
+} from "yaml";
 
 import { recurrenceSummary } from "../schedule/recurrence.js";
 import { eventDefinition, isEditorEvent, type QualifierDefinition } from "./events.js";
-import { isScriptRun, TriggerDocumentSchema, type TriggerDocument } from "./schema.js";
+import {
+  isScriptStep,
+  TriggerDocumentSchema,
+  type TriggerDocument,
+  type TriggerStep,
+} from "./schema.js";
+import { normalizeSteps } from "./steps.js";
 
 const alternatives = new Intl.ListFormat("en", { type: "disjunction" });
 const together = new Intl.ListFormat("en", { type: "conjunction" });
@@ -39,7 +54,7 @@ export function triggerEventClause(event: string): string {
   );
 }
 
-type Literal = (path: readonly string[]) => boolean;
+type Literal = (path: readonly (string | number)[]) => boolean;
 
 export function describeTrigger(document: TriggerDocument, literal: Literal = () => true): string {
   const eligible: string[] = [];
@@ -49,11 +64,11 @@ export function describeTrigger(document: TriggerDocument, literal: Literal = ()
     (clause.blocked ? blocked : eligible).push(clause.text);
   }
   if (eligible.length === 0) return `${joinClauses(blocked)}.`;
-  const run = document.run;
-  const host = literal(["run", "target", "daemon"])
-    ? `host ${run.target.daemon}`
+  const { target, steps, shorthand } = normalizeSteps(document);
+  const host = literal([...(shorthand ? ["run"] : []), "target", "daemon"])
+    ? `host ${target.daemon}`
     : "the configured host";
-  const action = describeAction(run, literal);
+  const action = describeSteps(steps, literal, shorthand);
   const excluded = blocked.length === 0 ? "" : `, while ${lowerFirst(joinClauses(blocked))}`;
   const reply =
     document.reply_message === true && literal(["reply_message"])
@@ -115,11 +130,32 @@ function describeSchedule(
     : `On the configured schedule in ${recurrence.timezone}`;
 }
 
-function describeAction(run: TriggerDocument["run"], literal: Literal): string {
-  if (isScriptRun(run)) return "a script";
-  if ("choices" in run.agent || !literal(["run", "agent", "provider"])) return "the selected agent";
-  const { provider, model } = run.agent;
-  if (model === undefined || !literal(["run", "agent", "model"])) return provider;
+function describeSteps(
+  steps: readonly TriggerStep[],
+  literal: Literal,
+  shorthand: boolean,
+): string {
+  const [only] = steps;
+  if (steps.length === 1 && only !== undefined) {
+    return describeAction(only, literal, shorthand ? ["run"] : ["steps", 0]);
+  }
+  const names = steps.map((step, index) =>
+    literal(["steps", index, "id"]) ? step.id : `step ${String(index + 1)}`,
+  );
+  return `${String(steps.length)} steps (${together.format(names)})`;
+}
+
+function describeAction(
+  step: TriggerStep,
+  literal: Literal,
+  path: readonly (string | number)[],
+): string {
+  if (isScriptStep(step)) return "a script";
+  if ("choices" in step.agent || !literal([...path, "agent", "provider"])) {
+    return "the selected agent";
+  }
+  const { provider, model } = step.agent;
+  if (model === undefined || !literal([...path, "agent", "model"])) return provider;
   return `${provider}/${model}`;
 }
 
@@ -248,18 +284,21 @@ function collectAliasTargets(document: Document): Set<Node> {
   return targets;
 }
 
+function childNode(node: unknown, key: string | number, aliasTargets: Set<Node>): unknown {
+  if (isSeq(node)) return aliasTargets.has(node) ? undefined : node.get(key, true);
+  if (!isMap(node) || aliasTargets.has(node) || node.items.some((pair) => isAlias(pair.key))) {
+    return undefined;
+  }
+  return node.get(key, true);
+}
+
 function isLiteralAt(
   document: Document,
-  path: readonly string[],
+  path: readonly (string | number)[],
   aliasTargets: Set<Node>,
 ): boolean {
   let node: unknown = document.contents;
-  for (const key of path) {
-    if (!isMap(node) || aliasTargets.has(node) || node.items.some((pair) => isAlias(pair.key))) {
-      return false;
-    }
-    node = node.get(key, true);
-  }
+  for (const key of path) node = childNode(node, key, aliasTargets);
   if (!isNode(node)) return false;
   // Event names are safe when the authored mapping key is literal, even if the rule is opaque.
   if (path.length === 2 && path[0] === "on") return true;
