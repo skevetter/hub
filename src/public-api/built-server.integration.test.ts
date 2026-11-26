@@ -273,19 +273,25 @@ builtServerTests("built TanStack public API PostgreSQL contract", () => {
       assert.equal(installed.projectSlug, "same-project");
       assert.match(installed.versionId, /^[0-9a-f-]{36}$/u);
 
+      // Both credentials are bound to an actor (the CLI account email, the API key name), so the
+      // manual run must omit the actor or claim that same actor. A different claim is 403.
       const manualBody = {
         projectSlug: "same-project",
-        trigger: "not-configured",
-        actor: "automation",
+        trigger: "configured",
         deliveryKey: "shared-delivery-key",
         input: { organizationId },
       };
+      const mismatched = await post("/api/v1/manual-runs", secrets[organizationId], {
+        ...manualBody,
+        actor: "automation",
+      });
+      assert.equal(mismatched.status, 403);
+      assert.equal(ProblemSchema.parse(await mismatched.json()).code, "actor_forbidden");
       const first = await post("/api/v1/manual-runs", secrets[organizationId], manualBody);
-      assert.equal(first.status, 404);
-      assert.equal(ProblemSchema.parse(await first.json()).code, "trigger_not_found");
+      assert.equal(first.status, 200, await first.clone().text());
       const duplicate = await post("/api/v1/manual-runs", secrets[organizationId], manualBody);
-      assert.equal(duplicate.status, 404);
-      assert.equal(ProblemSchema.parse(await duplicate.json()).code, "trigger_not_found");
+      assert.equal(duplicate.status, 200, await duplicate.clone().text());
+      assert.deepEqual(await duplicate.json(), await first.json());
 
       const enrollment = await post("/api/v1/daemons/enrollment-tokens", secrets[organizationId]);
       assert.equal(enrollment.status, 201);
@@ -528,6 +534,7 @@ function validPublicApiConfiguration(): string {
     "triggers:",
     "  - name: configured",
     "    on: manual.run",
+    '    filters: { from_users: ["*"] }',
     "    max_runtime: 1h",
     "    steps:",
     "      - id: work",
