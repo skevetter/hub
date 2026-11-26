@@ -53,17 +53,20 @@ export async function waitingConfirmation(query: QueryHandle, input: Confirmatio
   return row;
 }
 
-export async function claimConfirmation(
-  query: QueryHandle,
-  input: ConfirmationKey,
-  kind: ClaimKind,
-  receivedAt: Date,
-) {
+interface Claim {
+  kind: ClaimKind;
+  receivedAt: Date;
+  /** The owner reply that won a "started" claim; later deliveries of it are replays. */
+  activityId?: string;
+}
+
+export async function claimConfirmation(query: QueryHandle, input: ConfirmationKey, claim: Claim) {
+  const { kind, receivedAt, activityId } = claim;
   const result = await query.query(
     `insert into provider_event_receipts
        (organization_id, provider, connection_id, delivery_id, provider_application_id,
         source, resource_id, payload, received_at, dropped_reason)
-     values ($1, 'linear', $2, $3, $4, 'linear.agent_session', $5, '{}'::jsonb, $6, $7)
+     values ($1, 'linear', $2, $3, $4, 'linear.agent_session', $5, $6::jsonb, $7, $8)
      on conflict do nothing`,
     [
       input.organizationId,
@@ -71,9 +74,23 @@ export async function claimConfirmation(
       confirmationKey(input, kind),
       input.applicationId,
       input.issueId,
+      JSON.stringify(activityId === undefined ? {} : { activityId: activityId.toLowerCase() }),
       receivedAt,
       reasons[kind],
     ],
   );
   return result.rowCount === 1;
+}
+
+export async function confirmingActivityId(query: QueryHandle, input: ConfirmationKey) {
+  const {
+    rows: [row],
+  } = await query.query<{ activityId: string | null }>(
+    `select payload->>'activityId' as "activityId"
+       from provider_event_receipts
+      where organization_id = $1 and provider = 'linear' and delivery_id = $2
+        and dropped_reason = $3`,
+    [input.organizationId, confirmationKey(input, "started"), reasons.started],
+  );
+  return row?.activityId ?? undefined;
 }

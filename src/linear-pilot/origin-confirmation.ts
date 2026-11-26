@@ -14,7 +14,11 @@ import {
   originClient,
   readOriginWithin,
 } from "./origin-activities.js";
-import { claimConfirmation, waitingConfirmation } from "./origin-confirmation-receipt.js";
+import {
+  claimConfirmation,
+  confirmingActivityId,
+  waitingConfirmation,
+} from "./origin-confirmation-receipt.js";
 
 export const DELEGATION_CONFIRM_TTL_MS = 24 * 60 * 60 * 1000;
 const CONFIRMATION_READ_MS = 4_000;
@@ -158,7 +162,7 @@ async function refuseConfirmation(
   logConfirmation(qualified.event, "origin_unproven", stage);
   if (
     canAcknowledge(context) &&
-    (await claimConfirmation(database, receiptKey(qualified), "refused", receivedAt))
+    (await claimConfirmation(database, receiptKey(qualified), { kind: "refused", receivedAt }))
   )
     await writer(context).delegationRefused(qualified.event.nativeSessionId);
 }
@@ -176,7 +180,10 @@ export async function awaitDelegationOwner(context: Context) {
   const issue = confirmedIssue(result, event);
   if (issue === undefined)
     return refuseConfirmation(context, result == null ? "readback_failed" : "session_mismatch");
-  if (!canAcknowledge(context) || !(await claimConfirmation(database, key, "awaiting", receivedAt)))
+  if (
+    !canAcknowledge(context) ||
+    !(await claimConfirmation(database, key, { kind: "awaiting", receivedAt }))
+  )
     return;
   await writer(context).awaitingOwner(event.nativeSessionId, issue);
 }
@@ -184,7 +191,7 @@ export async function awaitDelegationOwner(context: Context) {
 function eligiblePrompt(
   event: Event,
   allowedHumanId: string,
-): event is Event & { message: string } {
+): event is Event & { message: string; activityId: string } {
   return (
     event.kind === "prompted" &&
     event.humanId === allowedHumanId &&
@@ -234,7 +241,7 @@ async function postClaimedRefusal(context: Context, kind: "expired" | "delegatio
 async function startConfirmed(
   context: Context,
   key: Key,
-  { age, reply }: { age: number; reply: string },
+  { age, reply, activityId }: { age: number; reply: string; activityId: string },
 ) {
   const {
     database,
@@ -243,16 +250,29 @@ async function startConfirmed(
   } = context;
   if (age < 0) return undefined;
   if (age > DELEGATION_CONFIRM_TTL_MS) {
-    if (await claimConfirmation(database, key, "expired", receivedAt))
+    if (await claimConfirmation(database, key, { kind: "expired", receivedAt }))
       await postClaimedRefusal(context, "expired");
     return undefined;
   }
-  if (!(await claimConfirmation(database, key, "started", receivedAt))) {
+  if (!(await claimConfirmation(database, key, { kind: "started", receivedAt, activityId }))) {
     return logConfirmation(event, "origin_reused");
   }
   const message = await delegationPrompt(context, reply);
   if (message === undefined) await postClaimedRefusal(context, "delegationRefused");
   return message;
+}
+
+// The confirming reply started the session. Anything else from the owner is an ordinary
+// follow-up; a missing record (older claim) keeps the old refusal.
+async function startedSessionDecision(context: Context, key: Key): Promise<OwnerDecision> {
+  const { database, qualified } = context;
+  const { event } = qualified;
+  const confirming = await confirmingActivityId(database, key);
+  if (confirming === undefined || confirming === event.activityId?.toLowerCase()) {
+    logConfirmation(event, "origin_reused");
+    return { handled: true };
+  }
+  return { handled: false };
 }
 
 export async function confirmDelegationOwner(
@@ -270,11 +290,9 @@ export async function confirmDelegationOwner(
     !belongsToClaim(waiting, key)
   )
     return { handled: true };
-  if (await sessionExists()) {
-    logConfirmation(event, "origin_reused");
-    return { handled: true };
-  }
+  if (await sessionExists()) return startedSessionDecision(context, key);
   const age = receivedAt.getTime() - waiting.receivedAt.getTime();
-  const message = await startConfirmed(context, key, { age, reply: event.message });
+  const { message: reply, activityId } = event;
+  const message = await startConfirmed(context, key, { age, reply, activityId });
   return message === undefined ? { handled: true } : { handled: true, message };
 }
