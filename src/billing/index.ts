@@ -1,5 +1,6 @@
 import StripeSDK from "stripe";
 import type {
+  BillingPlanPriceInterval,
   BillingPlanRecord,
   Database,
   StampOrganizationEntitlementsInput,
@@ -16,7 +17,6 @@ import { logger } from "../logger.js";
 import { syncBillingCatalog } from "./catalog-sync.js";
 import type { BillingConfig } from "./config.js";
 import type { StripeCatalogSource } from "./stripe-catalog-source.js";
-import type { BillingPlanPriceInterval } from "../db/types.js";
 import type { StripeBillingClient, StripeSubscriptionState } from "./stripe-billing-client.js";
 import { selectActivePlanPrice } from "./plan-prices.js";
 import { publicBillingPlans, type PublicBillingPlan } from "./public-catalog.js";
@@ -184,6 +184,12 @@ export class BillingRequestError extends Error {
  * `src/entitlements/` never imports this module.
  */
 export class BillingRuntime {
+  private readonly config: BillingConfig;
+  private readonly database: Database;
+  private readonly catalogSource: StripeCatalogSource;
+  private readonly billingClient: StripeBillingClient;
+  private readonly seatUsage: SeatUsageReader;
+  private readonly presentations: BillingPlanPresentations;
   /** Signature verification only — a fixture's plausible-but-fake secret works identically. */
   private readonly stripe: StripeSDK;
   private readonly subscriptionCache = new Map<
@@ -195,15 +201,14 @@ export class BillingRuntime {
     }
   >();
 
-  constructor(
-    private readonly config: BillingConfig,
-    private readonly database: Database,
-    private readonly catalogSource: StripeCatalogSource,
-    private readonly billingClient: StripeBillingClient,
-    private readonly seatUsage: SeatUsageReader,
-    private readonly presentations: BillingPlanPresentations,
-  ) {
-    this.stripe = new StripeSDK(config.stripeSecretKey);
+  constructor(options: Required<ComposeBillingOptions>) {
+    this.config = options.config;
+    this.database = options.database;
+    this.catalogSource = options.catalogSource;
+    this.billingClient = options.billingClient;
+    this.seatUsage = options.seatUsage;
+    this.presentations = options.presentations;
+    this.stripe = new StripeSDK(this.config.stripeSecretKey);
   }
 
   async syncCatalog(): Promise<void> {
@@ -358,14 +363,15 @@ export class BillingRuntime {
       planName: stamped?.name ?? null,
       status: live ? subscription.status : null,
       cancelAtPeriodEnd: live ? subscription.cancelAtPeriodEnd : false,
-      currentPeriodEnd: live ? (subscription.currentPeriodEnd?.toISOString() ?? null) : null,
+      currentPeriodEnd: subscriptionPeriodEnd(subscription),
       manageable: live,
     };
   }
 
-  async handleWebhook(request: Request): Promise<Response> {
-    const payload = await request.text();
-    const signatureHeader = request.headers.get("stripe-signature");
+  private verifyWebhook(
+    payload: string,
+    signatureHeader: string | null,
+  ): { event: StripeSDK.Event; signatureHeader: string } | { response: Response } {
     if (signatureHeader === null) {
       reportFailure(
         Object.assign(new Error("Stripe signature header missing"), {
@@ -379,15 +385,15 @@ export class BillingRuntime {
         },
         { status: 400, kind: "authentication", scrubValues: [this.config.stripeWebhookSecret] },
       );
-      return new Response("missing signature", { status: 400 });
+      return { response: new Response("missing signature", { status: 400 }) };
     }
-    let event: StripeSDK.Event;
     try {
-      event = this.stripe.webhooks.constructEvent(
+      const event = this.stripe.webhooks.constructEvent(
         payload,
         signatureHeader,
         this.config.stripeWebhookSecret,
       );
+      return { event, signatureHeader };
     } catch (error) {
       reportFailure(
         error,
@@ -403,8 +409,16 @@ export class BillingRuntime {
           scrubValues: [this.config.stripeWebhookSecret, signatureHeader],
         },
       );
-      return new Response("invalid signature", { status: 400 });
+      return { response: new Response("invalid signature", { status: 400 }) };
     }
+  }
+
+  async handleWebhook(request: Request): Promise<Response> {
+    const payload = await request.text();
+    const verified = this.verifyWebhook(payload, request.headers.get("stripe-signature"));
+    if ("response" in verified) return verified.response;
+    const { event, signatureHeader } = verified;
+    let response: Response | undefined;
     try {
       if (CATALOG_SYNC_EVENT_TYPES.has(event.type)) {
         await this.syncCatalog();
@@ -424,7 +438,7 @@ export class BillingRuntime {
             },
             { status: 503, diagnostic: { eventType: event.type } },
           );
-          return new Response("subscription not reconcilable yet", { status: 503 });
+          response = new Response("subscription not reconcilable yet", { status: 503 });
         }
       }
     } catch (error) {
@@ -446,11 +460,14 @@ export class BillingRuntime {
       );
       return new Response("reconciliation failed", { status: 503 });
     }
-    logger.info(
-      { provider: "stripe", eventId: event.id, eventType: event.type },
-      "billing webhook processed",
-    );
-    return Response.json({ received: true });
+    if (response === undefined) {
+      logger.info(
+        { provider: "stripe", eventId: event.id, eventType: event.type },
+        "billing webhook processed",
+      );
+      response = Response.json({ received: true });
+    }
+    return response;
   }
 
   /**
@@ -570,6 +587,10 @@ export class BillingRuntime {
   }
 }
 
+function subscriptionPeriodEnd(subscription: StripeSubscriptionState | undefined): string | null {
+  return subscription?.currentPeriodEnd?.toISOString() ?? null;
+}
+
 /** The `plan_stamp` reconciliation writes onto an organization; `plan_version` is the template
  * hash so a replay with an unchanged template is a no-op. */
 function planStamp(granted: Entitlements, planId: string | null): SubscriptionStamp {
@@ -604,12 +625,12 @@ function subscriptionReferenceFromEvent(event: StripeSDK.Event): string | undefi
 }
 
 export function composeBilling(options: ComposeBillingOptions): BillingRuntime {
-  return new BillingRuntime(
-    options.config,
-    options.database,
-    options.catalogSource,
-    options.billingClient,
-    options.seatUsage,
-    options.presentations ?? HUB_PLAN_PRESENTATIONS,
-  );
+  return new BillingRuntime({
+    config: options.config,
+    database: options.database,
+    catalogSource: options.catalogSource,
+    billingClient: options.billingClient,
+    seatUsage: options.seatUsage,
+    presentations: options.presentations ?? HUB_PLAN_PRESENTATIONS,
+  });
 }

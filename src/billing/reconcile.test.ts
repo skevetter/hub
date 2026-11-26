@@ -314,6 +314,7 @@ describe("subscription webhook reconciliation", () => {
       subscriptionWebhook("customer.subscription.created", "sub_1"),
     );
     assert.equal(response.status, 503);
+    assert.equal(await response.text(), "subscription not reconcilable yet");
     // Nothing was stamped: an unresolved active subscription must be revisited, not acknowledged.
     assert.equal(await database.getOrganizationEntitlements("org_1"), undefined);
   });
@@ -351,6 +352,7 @@ describe("customer-facing subscription view", () => {
     assert.equal(view.planSlug, "solo");
     assert.equal(view.planName, "Solo");
     assert.equal(view.status, "active");
+    assert.equal(view.currentPeriodEnd, "2030-01-01T00:00:00.000Z");
     assert.equal(view.manageable, true);
   });
 
@@ -367,6 +369,7 @@ describe("customer-facing subscription view", () => {
     assert.equal(view.planSlug, "free");
     assert.equal(view.planName, "Free");
     assert.equal(view.status, null);
+    assert.equal(view.currentPeriodEnd, null);
     assert.equal(view.manageable, false);
   });
 
