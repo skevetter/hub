@@ -24,7 +24,7 @@ steps:
     script: npm ci && npm run build
     max_runtime: 15m
   - id: review
-    agent: { provider: codex }
+    agent: { provider: codex, mode: full-access }
     prompt: Review the build log in the output tail.
     output:
       schema:
@@ -34,7 +34,7 @@ steps:
         required: [verdict]
   - id: fix
     if: "${{ steps.review.outputs.verdict == 'fix' }}"
-    agent: { provider: codex }
+    agent: { provider: codex, mode: full-access }
     prompt: Fix the problems from the review.
 ```
 

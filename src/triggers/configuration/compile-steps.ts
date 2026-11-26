@@ -8,7 +8,12 @@ import type {
 import type { Continuation } from "../continuation.js";
 import { canonicalJson } from "./canonical-json.js";
 import type { TriggerDocumentIssue } from "./document.js";
-import { isScriptStep, MAX_DURATION_MS, parseDurationMs } from "../../config/compiler.js";
+import {
+  HubConfigurationCompilationError,
+  isScriptStep,
+  MAX_DURATION_MS,
+  parseDurationMs,
+} from "../../config/compiler.js";
 import {
   isScriptStep as isAuthoredScriptStep,
   type TriggerAgentStep,
@@ -28,11 +33,37 @@ export function authoredSteps(steps: readonly TriggerStep[]): AuthoredStep[] {
 export function defaultRunDeadline(steps: readonly TriggerStep[]): string {
   const [only] = steps;
   if (steps.length === 1 && only !== undefined) return only.max_runtime;
-  const total = steps.reduce(
-    (sum, step) => sum + parseDurationMs(step.max_runtime, `step ${step.id} max_runtime`),
-    0,
-  );
+  const total = steps.reduce((sum, step) => sum + stepRuntimeMs(step), 0);
   return `${String(Math.min(total, MAX_DURATION_MS))}ms`;
+}
+
+function stepRuntimeMs(step: TriggerStep): number {
+  try {
+    return parseDurationMs(step.max_runtime, `step ${step.id} max_runtime`);
+  } catch (error) {
+    throw new HubConfigurationCompilationError(
+      ["triggers", "", "steps", step.id, "max_runtime"],
+      error instanceof Error ? error.message : "invalid max_runtime",
+      { cause: error },
+    );
+  }
+}
+
+/**
+ * The authored place a compiler error belongs to. A steps document names the step; a run document
+ * keeps the whole-document path it always had.
+ */
+export function authoredIssuePath(
+  authored: { max_runtime?: string | undefined },
+  { steps, shorthand }: { steps: readonly TriggerStep[]; shorthand: boolean },
+  path: readonly (string | number)[],
+): (string | number)[] {
+  const [root, , section, key, ...rest] = path;
+  if (root !== "triggers") return [];
+  if (section === "max_runtime" && authored.max_runtime !== undefined) return ["max_runtime"];
+  if (section !== "steps" || shorthand) return [];
+  const index = steps.findIndex((step) => step.id === key);
+  return index === -1 ? [] : ["steps", index, ...rest];
 }
 
 /** Steps that choose between agents list the same choices, which the schema enforces. */

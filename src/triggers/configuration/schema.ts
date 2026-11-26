@@ -1,7 +1,7 @@
 import { RecurrenceSchema } from "../schedule/recurrence.js";
 import { z } from "zod";
 import { ContinuationSchema } from "../continuation.js";
-import { canonicalJson } from "./canonical-json.js";
+import { canonicalJson, isBoundedJson } from "./canonical-json.js";
 import { hasProgressDestination, PROGRESS_DESTINATION_REQUIRED } from "../progress-events.js";
 import {
   eventDefinition,
@@ -76,19 +76,30 @@ export const TriggerAgentSchema = z
     model: z.string().min(1).optional(),
     mode: z.string().min(1).optional(),
     thinkingOptionId: z.string().min(1).optional(),
-    options: z.record(z.string(), z.custom<JsonValue>()).optional(),
+    options: z
+      .record(
+        z.string(),
+        z.custom<JsonValue>(isBoundedJson, "must be a finite value that does not refer to itself"),
+      )
+      .optional(),
   })
   .strict();
 
-export const TriggerAgentSelectionSchema = z.union([
-  TriggerAgentSchema,
-  z
-    .object({
-      select: z.string().min(1),
-      choices: z.record(z.string().regex(IDENTIFIER), TriggerAgentSchema),
-    })
-    .strict(),
-]);
+export const TriggerAgentSelectionSchema = z.union(
+  [
+    TriggerAgentSchema,
+    z
+      .object({
+        select: z.string().min(1),
+        choices: z.record(z.string().regex(IDENTIFIER), TriggerAgentSchema),
+      })
+      .strict(),
+  ],
+  {
+    error:
+      "An agent is { provider, ... } or { select, choices }. Its options must be finite values that do not refer to themselves.",
+  },
+);
 
 export const TriggerTargetSchema = z
   .object({

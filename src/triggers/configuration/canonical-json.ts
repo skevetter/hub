@@ -8,3 +8,21 @@ export function canonicalJson(value: unknown): string {
   }
   return JSON.stringify(value) ?? "undefined";
 }
+
+const MAX_JSON_NODES = 10_000;
+
+/**
+ * Whether a parsed value is a finite tree: no object contains itself, and aliases do not expand to
+ * more than a fixed number of nodes. YAML aliases can build either, and walking them recurses.
+ */
+export function isBoundedJson(value: unknown): boolean {
+  let remaining = MAX_JSON_NODES;
+  const walk = (node: unknown, ancestors: readonly object[]): boolean => {
+    if (typeof node !== "object" || node === null) return true;
+    remaining -= 1;
+    if (remaining < 0 || ancestors.includes(node)) return false;
+    const next = [...ancestors, node];
+    return Object.values(node).every((child) => walk(child, next));
+  };
+  return walk(value, []);
+}

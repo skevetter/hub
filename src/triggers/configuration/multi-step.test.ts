@@ -177,17 +177,51 @@ describe("a document with steps", () => {
       `  - id: a\n    if: "\${{ steps.b.outputs.x == 'y' }}"\n    agent: { provider: codex }\n    prompt: Go\n` +
         `  - id: b\n    agent: { provider: codex }\n    prompt: Go\n`,
     );
-    expect(issuesOf(later)).not.toEqual([]);
+    expect(issuesOf(later)).toEqual([
+      { path: "steps.0.if", message: "step a if cannot reference forward step b" },
+    ]);
     const unshaped = listDocument(
       `  - id: a\n    agent: { provider: codex }\n    prompt: Go\n` +
         `  - id: b\n    if: "\${{ steps.a.outputs.x == 'y' }}"\n    agent: { provider: codex }\n    prompt: Go\n`,
     );
-    expect(issuesOf(unshaped)).not.toEqual([]);
+    expect(issuesOf(unshaped)).toEqual([
+      {
+        path: "steps.1.if",
+        message: "step b if references output from step a without an output schema",
+      },
+    ]);
+  });
+
+  it("puts compiler errors on the authored step, and a deadline error on max_runtime", () => {
+    const step = (id: string, extra = "") =>
+      `  - id: ${id}\n    agent: { provider: codex }\n    prompt: Go\n${extra}`;
+    expect(issuesOf(listDocument(step("a") + step("b", '    if: "${{ ( }}"\n')))).toEqual([
+      { path: "steps.1.if", message: "invalid workflow expression: expected a value" },
+    ]);
+    expect(issuesOf(listDocument(`  - id: a\n    script: ""\n` + step("b")))).toEqual([
+      { path: "steps.0.script", message: "script must not be blank" },
+    ]);
+    expect(issuesOf(listDocument(step("a", "    max_runtime: 25h\n") + step("b")))).toEqual([
+      { path: "steps.0.max_runtime", message: "step a max_runtime must not exceed 24h" },
+    ]);
+    const [deadline] = issuesOf(`${listDocument(step("a"))}max_runtime: 25h\n`);
+    expect(deadline?.path).toBe("max_runtime");
+  });
+
+  it("refuses agent options that refer to themselves without overflowing the stack", () => {
+    const choices = listDocument(
+      "  - id: a\n    agent:\n      select: c\n      choices:\n        c: { provider: codex, options: &loop { again: *loop } }\n    prompt: Go\n",
+    );
+    const [issue] = issuesOf(choices);
+    expect(issue?.path).toBe("steps.0.agent");
+    expect(issue?.message).toContain("do not refer to themselves");
   });
 
   it("refuses a script step the same way a script run is refused", () => {
     const wildcard = MIXED.replace("from_users: [U0BNGPZEXT2]", "from_users: ['*']");
-    expect(issuesOf(wildcard)).not.toEqual([]);
+    const [issue] = issuesOf(wildcard);
+    expect(issue?.message).toContain("needs filters.from_users that names the people allowed");
+    expect(issue?.message).toContain("runs a script");
   });
 
   it("requires steps that choose between agents to list the same choices", () => {

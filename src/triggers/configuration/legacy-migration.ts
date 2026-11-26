@@ -12,7 +12,12 @@ import type {
   CompiledTrigger,
   JsonPrimitive,
 } from "../../config/compiler.js";
-import { compileHubConfig, isScriptStep, parseCompiledHubConfig } from "../../config/compiler.js";
+import {
+  compileHubConfig,
+  HubConfigurationCompilationError,
+  isScriptStep,
+  parseCompiledHubConfig,
+} from "../../config/compiler.js";
 import {
   parseTriggerDocument,
   TriggerDocumentError,
@@ -20,6 +25,7 @@ import {
 } from "./document.js";
 import type { CompiledTriggerDocument } from "./index.js";
 import {
+  authoredIssuePath,
   authoredSteps,
   continuationIssues,
   defaultRunDeadline,
@@ -310,16 +316,18 @@ function duration(milliseconds: number): string {
 
 export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
   const authored = parseTriggerDocument(yaml);
-  const { target, steps } = normalizeSteps(authored);
+  const normalized = normalizeSteps(authored);
+  const { target, steps } = normalized;
   const namedAgents = sharedNamedAgents(steps);
   const environment = {
     name: "target",
     kind: "daemon" as const,
     ...target,
   };
-  const triggers = authoredEventTriggers(authored, steps);
   let compiled: ReturnType<typeof compileHubConfig>;
+  let triggers: AuthoredTrigger[];
   try {
+    triggers = authoredEventTriggers(authored, steps);
     compiled = compileHubConfig(
       {
         environments: [environment],
@@ -329,7 +337,13 @@ export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
     );
   } catch (error) {
     throw new TriggerDocumentError([
-      { path: [], message: error instanceof Error ? error.message : "trigger compilation failed" },
+      {
+        path:
+          error instanceof HubConfigurationCompilationError
+            ? authoredIssuePath(authored, normalized, error.path)
+            : [],
+        message: error instanceof Error ? error.message : "trigger compilation failed",
+      },
     ]);
   }
   const compiledEnvironment = compiled.environments[0];

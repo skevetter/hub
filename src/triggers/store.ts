@@ -113,7 +113,7 @@ export class OrganizationTriggerStore {
       },
     );
     if (!resolved.success) {
-      throw new TriggerDocumentError(resolved.issues);
+      throw new TriggerDocumentError(authoredResolutionIssues(compiled.authored, resolved.issues));
     }
     if (options.previousYaml === undefined || runtimeChanged(options.previousYaml, compiled)) {
       await this.validateAgainstDaemon(compiled, resolved.configuration);
@@ -194,6 +194,19 @@ function targetPath(trigger: TriggerDocument, field: "daemon" | "cwd"): string[]
   return normalizeSteps(trigger).shorthand ? ["run", "target", field] : ["target", field];
 }
 
+/** The target is not a resource in the document, so its daemon problem belongs on the target. */
+function authoredResolutionIssues(
+  trigger: TriggerDocument,
+  issues: readonly TriggerDocumentIssue[],
+): TriggerDocumentIssue[] {
+  return issues.map((issue) => {
+    const [, resource, name, field] = issue.path;
+    return resource === "environments" && name === "target" && field === "daemon"
+      ? { ...issue, path: targetPath(trigger, "daemon") }
+      : issue;
+  });
+}
+
 /** The daemon names fields by its own wire contract; the document names them by its schema. */
 function authoredFieldName(segment: string | number): string | number {
   if (segment === "modeId") return "mode";
@@ -224,7 +237,7 @@ function runtimeChanged(previousYaml: string, compiled: CompiledTriggerDocument)
     const { target, steps } = normalizeSteps(document);
     return JSON.stringify({
       target,
-      agents: steps.map((step) => (isScriptStep(step) ? null : step.agent)),
+      agents: steps.flatMap((step) => (isScriptStep(step) ? [] : [step.agent])),
     });
   };
   return runtime(previous) !== runtime(compiled.authored);
