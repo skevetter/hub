@@ -7,7 +7,7 @@ export const PROVIDERS = ["github", "slack", "discord", "linear", "github_notifi
 export const TRIGGER_MATCH_PROVIDERS: ReadonlySet<string> = new Set(PROVIDERS);
 
 /** Receipts the filters turned away still reached the trigger's event, so they count as matches. */
-export const FILTER_DROP_REASON = "trigger_filters_rejected";
+export const FILTER_DROP_CODE = "trigger_filters_rejected";
 
 export function triggerMatchProviders(configuration: unknown) {
   const notification = triggerProviderEvent("github_notification");
@@ -74,7 +74,7 @@ export interface MatchEvidence {
 export function matchedProjects(receipt: MatchEvidence): ReadonlySet<string> {
   return new Set([
     ...receipt.runProjects,
-    ...(receipt.droppedReason === FILTER_DROP_REASON ? receipt.routedProjects : []),
+    ...(receipt.droppedReason === FILTER_DROP_CODE ? receipt.routedProjects : []),
   ]);
 }
 
@@ -122,7 +122,7 @@ export const TRIGGER_MATCHES_SQL = `with routed as (
     ) route
     where receipt.organization_id = $1 and receipt.received_at between $2 and $4
       and receipt.provider = any($5::text[])
-      and receipt.dropped_reason = '${FILTER_DROP_REASON}'
+      and receipt.dropped_reason = '${FILTER_DROP_CODE}'
   ), matches as (
     select project_id,
       count(*) filter (where received_at < $3)::int as "previousMatches",
