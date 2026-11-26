@@ -22,13 +22,13 @@ const PHONE_CRUMB_LINK = "truncate underline-offset-4 hover:underline focus-visi
 export function PhoneHeader({
   scope,
   organizationSlug,
+  unavailable = false,
 }: {
   scope: string;
   organizationSlug: string;
+  /** The URL names a place that did not resolve, so the signed-in organization is not where this is. */
+  unavailable?: boolean;
 }) {
-  const { breadcrumbs } = usePageContext();
-  const current = breadcrumbs.at(-1);
-  const parents = breadcrumbs.slice(0, -1);
   return (
     <header className="top-0 z-10 flex h-12 shrink-0 items-center gap-3 border-b border-rail-border bg-rail px-4 text-rail-foreground max-md:sticky md:hidden">
       <span
@@ -36,26 +36,39 @@ export function PhoneHeader({
         aria-label="Paseo"
         className="size-5 shrink-0 rounded-sm bg-rail-foreground"
       />
-      <nav aria-label="Breadcrumb" className="grid min-w-0">
-        <span className="flex min-w-0 items-center gap-1 text-xs text-rail-muted">
-          <CrumbLink to={`/o/${organizationSlug}/home`} className={PHONE_CRUMB_LINK}>
-            {scope}
-          </CrumbLink>
-          {parents.map((entry) => (
-            <span key={`${entry.to}:${entry.label}`} className="flex min-w-0 items-center gap-1">
-              <span aria-hidden="true">/</span>
-              <CrumbLink to={entry.to} className={PHONE_CRUMB_LINK}>
-                {entry.label}
-              </CrumbLink>
-            </span>
-          ))}
-        </span>
-        <span aria-current="page" className="truncate text-sm font-strong">
-          {current?.label ?? "Paseo Hub"}
-        </span>
-      </nav>
+      {unavailable ? (
+        <span className="truncate text-sm font-strong">Paseo Hub</span>
+      ) : (
+        <PhoneTrail scope={scope} organizationSlug={organizationSlug} />
+      )}
       <CommandSearchButton phone />
     </header>
+  );
+}
+
+function PhoneTrail({ scope, organizationSlug }: { scope: string; organizationSlug: string }) {
+  const { breadcrumbs } = usePageContext();
+  const current = breadcrumbs.at(-1);
+  const parents = breadcrumbs.slice(0, -1);
+  return (
+    <nav aria-label="Breadcrumb" className="grid min-w-0">
+      <span className="flex min-w-0 items-center gap-1 text-xs text-rail-muted">
+        <CrumbLink to={`/o/${organizationSlug}/home`} className={PHONE_CRUMB_LINK}>
+          {scope}
+        </CrumbLink>
+        {parents.map((entry) => (
+          <span key={`${entry.to}:${entry.label}`} className="flex min-w-0 items-center gap-1">
+            <span aria-hidden="true">/</span>
+            <CrumbLink to={entry.to} className={PHONE_CRUMB_LINK}>
+              {entry.label}
+            </CrumbLink>
+          </span>
+        ))}
+      </span>
+      <span aria-current="page" className="truncate text-sm font-strong">
+        {current?.label ?? "Paseo Hub"}
+      </span>
+    </nav>
   );
 }
 
