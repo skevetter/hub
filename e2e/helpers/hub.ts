@@ -4276,12 +4276,10 @@ class HubUser {
   }
 
   /**
-   * After the destinations: Attention, Help, then the account menu. The execution meter and its
+   * After the destinations: Help, then the account menu. The execution meter and its
    * upgrade link precede Help in metered organizations, which these keyboard tests do not use.
    */
   private async tabThroughSidebarFooter(): Promise<void> {
-    await this.page.keyboard.press("Tab");
-    await expect(this.page.getByRole("button", { name: /^Attention(?:,|$)/u })).toBeFocused();
     await this.page.keyboard.press("Tab");
     await expect(this.page.getByRole("button", { name: "Help", exact: true })).toBeFocused();
     await this.page.keyboard.press("Tab");

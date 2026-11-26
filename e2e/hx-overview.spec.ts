@@ -1,6 +1,5 @@
 import { expect } from "@playwright/test";
 import { test as browserTest } from "./app.js";
-import { openAttention } from "./helpers/attention.js";
 import { OrganizationHome } from "./helpers/home.js";
 import { OrganizationTriggers } from "./helpers/triggers.js";
 
@@ -175,12 +174,6 @@ run:
   await expect(
     page.getByRole("main").getByText(`Review authorization for ${connection} in Connections.`),
   ).toHaveCount(0);
-  const attention = await openAttention(page);
-  await expect(
-    attention.getByText(`Review authorization for ${connection} in Connections.`),
-  ).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(attention).toBeHidden();
   const home = new OrganizationHome(page);
   await home.expectStep("Enroll a daemon", daemonName);
   await home.expectStep("Create a trigger", name);
@@ -345,20 +338,6 @@ test("reads Home as figures, triggers, a checklist the member can put away, and 
     await page.keyboard.press("ArrowLeft");
     await page.keyboard.press("ArrowLeft");
     await page.getByRole("link", { name: "Connect Linear", exact: true }).click();
-    await expect(page).toHaveURL(/\/connections$/u);
-  });
-
-  await test.step("Attention, not Home, links to the connection that needs authorization", async () => {
-    await hub.seedSlackConnection("owner", "slack", "Acme");
-    await page.getByRole("link", { name: "Home", exact: true }).click();
-    await page.reload();
-    await expect(
-      page.getByRole("main").getByText("Slack needs authorization", { exact: true }),
-    ).toHaveCount(0);
-    const attention = await openAttention(page, 1);
-    const item = attention.getByRole("listitem").filter({ hasText: "Slack needs authorization" });
-    await expect(item).toContainText("Review authorization for Acme");
-    await item.getByRole("link", { name: "Open connections", exact: true }).click();
     await expect(page).toHaveURL(/\/connections$/u);
   });
 

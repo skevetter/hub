@@ -2,7 +2,6 @@ import type { RunStatusFilter } from "../triggers/run-status.js";
 import type { QueryHandle } from "./runtime/index.js";
 import type { SurfaceStore } from "../surfaces/store.js";
 import type { InteractiveSessionStore } from "../interactive-sessions/store.js";
-import type { SessionPrincipal } from "../interactive-sessions/types.js";
 import type { RunPayloadRetentionStore } from "../run-payload-retention/store.js";
 import type {
   PayloadCompletion,
@@ -137,22 +136,6 @@ export interface TriggerRunSummary {
   failed: number;
   /** The newest run whatever the window, so a trigger that went quiet still shows how it ended. */
   latest: { id: string; status: TriggerRunRecord["status"]; createdAt: Date } | null;
-}
-
-export interface FailedRunSummary {
-  count: number;
-  /** The latest to end badly, by when the run ended. */
-  newest: { triggerName: string; failedAt: Date } | null;
-}
-
-export interface WaitingSessionSummary {
-  count: number;
-  sessions: { name: string }[];
-}
-
-export interface SessionAttention {
-  hasActiveProfile: boolean;
-  waiting: WaitingSessionSummary;
 }
 
 export type DroppedEventPresence = "some" | "none" | "unknown";
@@ -936,25 +919,6 @@ export interface ActivityRunScope {
 export interface ActivityRunKey {
   createdAt: string;
   id: string;
-}
-
-export type TriggerMatchProvider = Extract<
-  ListProvider,
-  "github" | "slack" | "discord" | "linear" | "github_notification"
->;
-
-export interface TriggerMatchActivity {
-  id: string;
-  name: string;
-  previousMatches: number;
-  recentMatches: number;
-  providers: { provider: TriggerMatchProvider; recentEvents: number }[];
-}
-
-export interface TriggerMatchWindow {
-  previousStart: Date;
-  recentStart: Date;
-  now: Date;
 }
 
 export interface ActivityRunPageRequest {
@@ -1977,32 +1941,6 @@ export interface Database
   ): Promise<OrganizationRunRecord[]>;
   /** One entry per trigger of the organization, including triggers that never ran. */
   summarizeTriggerRuns(organizationId: string, since: Date): Promise<TriggerRunSummary[]>;
-  listTriggerMatchActivity(
-    organizationId: string,
-    window: TriggerMatchWindow,
-  ): Promise<TriggerMatchActivity[]>;
-  countFailedRunsSince(
-    organizationId: string,
-    since: Date,
-    seenThrough: string | null,
-  ): Promise<FailedRunSummary>;
-  /** The failed runs the reader has not marked seen, in one read with the marker itself. */
-  countUnseenFailedRuns(
-    accountId: string,
-    organizationId: string,
-    since: Date,
-  ): Promise<FailedRunSummary>;
-  readFailedRunsSeenThrough(accountId: string, organizationId: string): Promise<string | null>;
-  /** Hides every failed run in the window that has ended so far; later failures stay unseen. */
-  markFailedRunsSeen(accountId: string, organizationId: string, since: Date): Promise<void>;
-  /** Whether the organization has an active profile, and the sessions waiting on the viewer. */
-  readSessionAttention(viewer: SessionPrincipal, limit: number): Promise<SessionAttention>;
-  hasActiveSessionProfile(organizationId: string): Promise<boolean>;
-  listSessionsWaitingForPermission(
-    organizationId: string,
-    viewer: SessionPrincipal,
-    limit: number,
-  ): Promise<WaitingSessionSummary>;
   listDroppedEventPage(
     organizationId: string,
     request: DroppedEventPageRequest,

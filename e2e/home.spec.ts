@@ -1,6 +1,5 @@
 import { expect } from "@playwright/test";
 import { test } from "./app.js";
-import { attentionEntry } from "./helpers/attention.js";
 import { OrganizationHome } from "./helpers/home.js";
 import { OrganizationTriggers } from "./helpers/triggers.js";
 
@@ -34,7 +33,6 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     );
     await home.expectStep("Create a trigger", "To do");
     await home.expectStep("Record a run", "To do");
-    await expect(attentionEntry(page, 0)).toBeVisible();
     await home.expectFigure("triggers failing", 0);
     await home.expectFigure("triggers on", 0);
     await home.capture(`${SHOTS}/01-fresh.png`);
@@ -66,15 +64,14 @@ test("walks a hosted organization from sign-in to its first run", async ({ hub, 
     await home.expectProgress("2 of 4 done");
   });
 
-  await test.step("Attention links unrouted events to the trigger editor", async () => {
+  await test.step("dropped events link to the trigger editor", async () => {
     await hub.deliverUnroutedGitHubEvent("home-unrouted-1");
     await hub.deliverUnroutedGitHubEvent("home-unrouted-2");
     await home.reload();
-    const item = await home.openRoutingAttention();
-    await expect(item).toContainText("2 events dropped in the last 7 days");
-    await expect(item).toContainText("2 missing route or trigger");
-    await page.screenshot({ path: `${SHOTS}/03-unrouted-attention.png` });
-    await home.followRoutingAttention(item);
+    await home.expectNoRoutingNotice();
+    await home.openDroppedEvents();
+    await page.screenshot({ path: `${SHOTS}/03-unrouted-dropped.png` });
+    await home.createTriggerFromDroppedEvents();
   });
 
   await test.step("the editor starts from the connected daemon, and saving completes the third step", async () => {
