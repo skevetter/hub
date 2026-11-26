@@ -48,6 +48,23 @@ export interface CreatedApiKey {
   secret: string;
 }
 
+export interface CreateApiKeyOptions {
+  organizationId: string;
+  createdByUserId: string;
+  name: string;
+  scopes: readonly ApiKeyScope[];
+  client?: QueryHandle;
+  identity?: ApiKeyIdentityOptions;
+}
+
+export interface CreateSignedApiKeyOptions {
+  client: TransactionHandle;
+  organizationId: string;
+  createdByUserId: string;
+  input: ReturnType<typeof apiKeyCreateSchema.parse>;
+  authentication: WebhookSigningAuthentication;
+}
+
 export interface CreatedTriggerWebhookKey extends CreatedApiKey {
   actorAllowedByTrigger: boolean;
 }
@@ -120,23 +137,7 @@ export class OrganizationApiKeys {
     return result.rowCount === 1;
   }
 
-  create(
-    organizationId: string,
-    createdByUserId: string,
-    name: string,
-    scopes: readonly ApiKeyScope[],
-  ): Promise<CreatedApiKey> {
-    return this.createWith({ organizationId, createdByUserId, name, scopes });
-  }
-
-  async createWith(options: {
-    organizationId: string;
-    createdByUserId: string;
-    name: string;
-    scopes: readonly ApiKeyScope[];
-    client?: QueryHandle;
-    identity?: ApiKeyIdentityOptions;
-  }): Promise<CreatedApiKey> {
+  async create(options: CreateApiKeyOptions): Promise<CreatedApiKey> {
     const { organizationId, createdByUserId, name, scopes } = options;
     const input = apiKeyCreateSchema.parse({
       ...options.identity,
@@ -148,13 +149,7 @@ export class OrganizationApiKeys {
     return { summary: summary(created.row), secret: created.secret };
   }
 
-  async createSigned(options: {
-    client: TransactionHandle;
-    organizationId: string;
-    createdByUserId: string;
-    input: ReturnType<typeof apiKeyCreateSchema.parse>;
-    authentication: WebhookSigningAuthentication;
-  }) {
+  async createSigned(options: CreateSignedApiKeyOptions) {
     const { client, organizationId, createdByUserId, input, authentication } = options;
     this.signing.requireAvailable(organizationId);
     const { name } = await requireWebhookTarget(client, organizationId, {

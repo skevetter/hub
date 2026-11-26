@@ -126,13 +126,18 @@ builtServerTests("built TanStack public API PostgreSQL contract", () => {
         bootstrap: undefined,
       },
     });
-    const keyB = await auth.apiKeys!.create("organization-b", "user-b", "built B", [
-      "projects:read",
-      "configuration:validate",
-      "configuration:install",
-      "runs:dispatch",
-      "daemons:enroll",
-    ]);
+    const keyB = await auth.apiKeys!.create({
+      organizationId: "organization-b",
+      createdByUserId: "user-b",
+      name: "built B",
+      scopes: [
+        "projects:read",
+        "configuration:validate",
+        "configuration:install",
+        "runs:dispatch",
+        "daemons:enroll",
+      ],
+    });
     const cliAuthorizations = new CliAuthorizations(database, {
       resolveOrganizationAccess: () =>
         Promise.resolve({

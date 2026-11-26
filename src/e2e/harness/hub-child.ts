@@ -79,7 +79,7 @@ async function main(): Promise<void> {
     policy: readInstanceAuthPolicy(process.env),
   });
   await auth.initialize?.();
-  const createdApiKey = await auth.apiKeys?.createWith({
+  const createdApiKey = await auth.apiKeys?.create({
     organizationId,
     createdByUserId: "hub-e2e",
     name: "hub e2e automation",

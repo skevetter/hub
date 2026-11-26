@@ -104,10 +104,10 @@ describe("stream admission and timers", () => {
       const run = await harness.createRun();
       const service = harness.stream();
       for (const request of [
-        streamRequest(run.id, harness.key, `?after=${encodeURIComponent(cursor)}`),
+        streamRequest(run.id, harness.key, { query: `?after=${encodeURIComponent(cursor)}` }),
         ...(cursor.includes("\n") || cursor.trim() !== cursor
           ? []
-          : [streamRequest(run.id, harness.key, "", { "last-event-id": cursor })]),
+          : [streamRequest(run.id, harness.key, { headers: { "last-event-id": cursor } })]),
       ]) {
         const response = await service.handle(request, run.id);
         assert.equal(response.status, 400);
@@ -122,7 +122,10 @@ describe("stream admission and timers", () => {
     const run = await harness.createRun();
     const service = harness.stream();
     const response = await service.handle(
-      streamRequest(run.id, harness.key, "?after=0", { "last-event-id": "invalid" }),
+      streamRequest(run.id, harness.key, {
+        query: "?after=0",
+        headers: { "last-event-id": "invalid" },
+      }),
       run.id,
     );
     assert.equal(response.status, 200);
@@ -152,7 +155,7 @@ describe("stream admission and timers", () => {
     const service = harness.stream();
     const controller = new AbortController();
     const response = await service.handle(
-      streamRequest(run.id, harness.key, "", {}, controller.signal),
+      streamRequest(run.id, harness.key, { signal: controller.signal }),
       run.id,
     );
     const original = harness.database.findTriggerRunForOrganization.bind(harness.database);

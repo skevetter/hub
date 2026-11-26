@@ -170,7 +170,7 @@ for (const backend of ["memory", "embedded", "pooled"] as const) {
           [run.id],
         );
         const reader = new StreamReader(
-          await stream().handle(streamRequest(run.id, harness.key, "?after=0"), run.id),
+          await stream().handle(streamRequest(run.id, harness.key, { query: "?after=0" }), run.id),
         );
         assert.equal((await reader.event("status")).data["firstSeq"], 3);
         const text = await reader.all();
@@ -191,7 +191,7 @@ for (const backend of ["memory", "embedded", "pooled"] as const) {
       await harness.database.failWorkflowRun(run.id, "failed", "agent_execution_failed");
       const service = stream();
       const reader = new StreamReader(
-        await service.handle(streamRequest(run.id, harness.key, query, headers), run.id),
+        await service.handle(streamRequest(run.id, harness.key, { query, headers }), run.id),
       );
       const text = await reader.all();
       assert.equal(Number(/^id: ([0-9]+)$/mu.exec(text)?.[1]), first);
@@ -205,7 +205,7 @@ for (const backend of ["memory", "embedded", "pooled"] as const) {
       await harness.append(run.id);
       const service = stream();
       const reader = new StreamReader(
-        await service.handle(streamRequest(run.id, harness.key, "?after=3"), run.id),
+        await service.handle(streamRequest(run.id, harness.key, { query: "?after=3" }), run.id),
       );
       await reader.event("status");
       for (let index = 0; index < 3; index++) await harness.append(run.id);

@@ -4,9 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
-import { createPostgresQueryRuntime } from "./db/test-utils/runtime.js";
 import { HubHarness } from "./daemons/test-utils/hub-harness.js";
-import { createDatabase, testDatabaseLocks, testDatabaseRuntime } from "./db/test-utils/runtime.js";
+import {
+  createDatabase,
+  createPostgresQueryRuntime,
+  testDatabaseLocks,
+  testDatabaseRuntime,
+} from "./db/test-utils/runtime.js";
 import { createAuthServer } from "./auth/server.js";
 import { composeEntitlements, type ComposedEntitlements } from "./auth/entitlements.js";
 import { startProductionRuntime, stopProductionRuntime } from "./index.js";
@@ -237,12 +241,12 @@ describe("production Hub cold start", () => {
           bootstrap: undefined,
         },
       });
-      const key = await keyAuthority.apiKeys!.create(
-        identity.organization_id,
-        identity.user_id,
-        "production contract test",
-        ["configuration:install"],
-      );
+      const key = await keyAuthority.apiKeys!.create({
+        organizationId: identity.organization_id,
+        createdByUserId: identity.user_id,
+        name: "production contract test",
+        scopes: ["configuration:install"],
+      });
 
       const response = await runtime.publicApi.handleOperation(
         "installConfiguration",

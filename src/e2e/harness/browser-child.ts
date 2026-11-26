@@ -251,11 +251,12 @@ async function writeMachineKey(
   const machineKey =
     auth === null || !machineAuth
       ? undefined
-      : await auth.apiKeys?.create("phase-zero", "phase-zero-user", "browser e2e automation", [
-          "configuration:install",
-          "runs:dispatch",
-          "daemons:enroll",
-        ]);
+      : await auth.apiKeys?.create({
+          organizationId: "phase-zero",
+          createdByUserId: "phase-zero-user",
+          name: "browser e2e automation",
+          scopes: ["configuration:install", "runs:dispatch", "daemons:enroll"],
+        });
   await writeFile(
     requiredEnvironment("PASEO_E2E_MACHINE_KEY_FILE"),
     machineKey?.secret ?? "",
