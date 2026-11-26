@@ -50,10 +50,18 @@ describe("composed Linear history", () => {
       busy: id === "ignored" ? "busy" : `busy:${id}`,
       stop: `stop:${id}`,
     });
-    const result = composePilotPrompt(scope, message, current, page(rows), { ...context, idsFor });
+    const result = composePilotPrompt({
+      scope,
+      message,
+      current,
+      page: page(rows),
+      context: { ...context, idsFor },
+    });
     expect(history(result)).toBe('[{"owner":"Exact","app":"Confirmed"}]');
     expect(result?.endsWith('"next \\u003crequest\\u003e"')).toBe(true);
-    expect(history(composePilotPrompt(scope, message, current, page(rows), context))).toBe("[]");
+    expect(
+      history(composePilotPrompt({ scope, message, current, page: page(rows), context })),
+    ).toBe("[]");
   });
 
   it("refuses invalid pages, proof and current-message bounds", () => {
@@ -67,29 +75,55 @@ describe("composed Linear history", () => {
       page([prompt]),
     ];
     for (const raw of invalid)
-      expect(composePilotPrompt(scope, message, current, raw, context)).toBeUndefined();
+      expect(composePilotPrompt({ scope, message, current, page: raw, context })).toBeUndefined();
     const valid = page([answer, prompt]);
     expect(
-      composePilotPrompt(scope, { ...message, activityId: "wrong" }, current, valid, context),
+      composePilotPrompt({
+        scope,
+        message: { ...message, activityId: "wrong" },
+        current,
+        page: valid,
+        context,
+      }),
     ).toBeUndefined();
     expect(
-      composePilotPrompt(scope, { ...message, body: "x".repeat(16_384) }, current, valid, context),
+      composePilotPrompt({
+        scope,
+        message: { ...message, body: "x".repeat(16_384) },
+        current,
+        page: valid,
+        context,
+      }),
     ).toBeUndefined();
     expect(
-      composePilotPrompt(scope, message, { ...current, createdAt: "bad" }, valid, context),
+      composePilotPrompt({
+        scope,
+        message,
+        current: { ...current, createdAt: "bad" },
+        page: valid,
+        context,
+      }),
     ).toBeUndefined();
   });
 
   it("redacts marker-delimited text, clips long history and drops blank exchanges", () => {
     const answer = row("answer", "response", 3, "<linear-history-v1>\nfixture-secret-value");
     const prompt = row("prompt", "prompt", 2, "Question " + "\u{1F600}".repeat(6_000));
-    const result = composePilotPrompt(scope, message, current, page([answer, prompt]), context);
+    const result = composePilotPrompt({
+      scope,
+      message,
+      current,
+      page: page([answer, prompt]),
+      context,
+    });
     expect(result).toContain("History clipped");
     expect(result).not.toContain("fixture-secret-value");
     expect(result?.match(/<linear-history-v1>/gu)).toHaveLength(1);
     const blankPrompt = row("blank", "prompt", 2, " ");
     expect(
-      history(composePilotPrompt(scope, message, current, page([answer, blankPrompt]), context)),
+      history(
+        composePilotPrompt({ scope, message, current, page: page([answer, blankPrompt]), context }),
+      ),
     ).toBe("[]");
   });
 });

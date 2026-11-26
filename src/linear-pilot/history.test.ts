@@ -35,9 +35,15 @@ function compose(nodes: FixtureActivity[], body = current.body, secrets: string[
       row.createdAt < verified.createdAt,
   );
   assert.ok(confirmed);
-  return composePilotPrompt(conversation, message, verified, activityPage(nodes), {
-    confirmedResponseId: confirmed.id,
-    secrets,
+  return composePilotPrompt({
+    scope: conversation,
+    message,
+    current: verified,
+    page: activityPage(nodes),
+    context: {
+      confirmedResponseId: confirmed.id,
+      secrets,
+    },
   });
 }
 
@@ -192,26 +198,32 @@ describe("Linear pilot history", () => {
       idsFor,
     };
     expect(
-      composePilotPrompt(scope, successor, immediate, page([initialPrompt]), stopProof),
+      composePilotPrompt({
+        scope,
+        message: successor,
+        current: immediate,
+        page: page([initialPrompt]),
+        context: stopProof,
+      }),
     ).toBeUndefined();
-    const immediatePrompt = composePilotPrompt(
+    const immediatePrompt = composePilotPrompt({
       scope,
-      successor,
-      immediate,
-      page([initialStop, initialPrompt]),
-      stopProof,
-    );
+      message: successor,
+      current: immediate,
+      page: page([initialStop, initialPrompt]),
+      context: stopProof,
+    });
     expect(sections(immediatePrompt)).toMatchObject({ owner: successor.body, history: [] });
 
     const verified = verifyPilotPrompt(scope, current, page([currentRow]));
     assert.ok(verified);
-    const prompt = composePilotPrompt(
+    const prompt = composePilotPrompt({
       scope,
-      current,
-      verified,
-      page([successorAnswer, successorPrompt, initialStop, initialPrompt]),
-      { confirmedResponseId: successorAnswer.id, secrets: [], idsFor },
-    );
+      message: current,
+      current: verified,
+      page: page([successorAnswer, successorPrompt, initialStop, initialPrompt]),
+      context: { confirmedResponseId: successorAnswer.id, secrets: [], idsFor },
+    });
     expect(sections(prompt).history).toEqual([{ owner: successor.body, app: "Later answer" }]);
   });
 
@@ -234,9 +246,15 @@ describe("Linear pilot history", () => {
       activityPage([initialRows[1]!, initialRows[0]!]),
     ]) {
       expect(
-        composePilotPrompt(conversation, current, verified, page, {
-          confirmedResponseId: initialRows[0]!.id,
-          secrets: [],
+        composePilotPrompt({
+          scope: conversation,
+          message: current,
+          current: verified,
+          page,
+          context: {
+            confirmedResponseId: initialRows[0]!.id,
+            secrets: [],
+          },
         }),
       ).toBeUndefined();
     }
