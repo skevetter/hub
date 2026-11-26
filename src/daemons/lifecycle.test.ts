@@ -1,4 +1,5 @@
 import type { LaunchMachineIntent } from "../dispatcher/launch-machine-intent.js";
+import { deriveAgentExecutionCompletionToken } from "../agent-executions/completion-token.js";
 import { DaemonResponseLostError } from "./protocol.js";
 import type { AgentConnection } from "./agents/index.js";
 import assert from "node:assert/strict";
@@ -8,6 +9,7 @@ import type { DaemonEvent, DaemonConnection } from "./protocol.js";
 import {
   createDaemonDispatchLifecycle,
   DaemonDispatchFailure,
+  durableExecutionId,
   executionWorkspaceTitle,
   type DaemonDispatchLifecycle,
 } from "./lifecycle.js";
@@ -743,6 +745,84 @@ describe("dispatch retries transient database failures", () => {
     assert.equal(second.execution.id, first.execution.id);
     assert.equal(findIssueCommentByMarker.mock.calls.length, 2);
     assert.equal(fixture.createIssueComment.mock.calls.length, 1);
+  });
+
+  it.each([
+    { phase: "claimed", deadlineAt: null, message: "durable execution cannot be resumed" },
+    {
+      phase: "prepared",
+      deadlineAt: new Date("2099-01-01T00:00:00.000Z"),
+      message: "durable execution has no deadline",
+    },
+  ])("rejects a $phase durable dispatch without a deadline", async ({ deadlineAt, message }) => {
+    const { database, intent, lifecycle, calls } = await dispatchFixture();
+    const id = durableExecutionId(intent);
+    const execution = await database.insertAgentExecution({
+      id,
+      organizationId: intent.organizationId,
+      projectId: intent.projectId,
+      daemonId: intent.environment.daemonId,
+      machineId: null,
+      triggerContext: intent.triggerContext,
+      outputContext: intent.outputContext,
+      configurationRevisionId: intent.configurationRevisionId,
+      launchIntent: intent,
+      ...(deadlineAt === null ? {} : { deadlineAt }),
+    });
+    const prepare = vi
+      .spyOn(database, "prepareAgentExecutionForDispatch")
+      .mockResolvedValue({ ...execution, deadlineAt: null });
+
+    try {
+      await assert.rejects(() => lifecycle.handoffLaunchMachineIntent(intent), {
+        message: `${message}: ${id}`,
+      });
+      assert.equal(prepare.mock.calls.length, deadlineAt === null ? 0 : 1);
+      assert.deepEqual(calls, { creates: [], sends: [] });
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("rejects dispatch when the trigger run no longer matches the launch authority", async () => {
+    const { database, intent, lifecycle, calls } = await dispatchFixture();
+    const insert = vi.spyOn(database, "insertAgentExecution");
+    vi.spyOn(database, "findTriggerRunById").mockResolvedValue(undefined);
+    try {
+      await assert.rejects(() => lifecycle.dispatchLaunchMachineIntent(intent), {
+        name: "DaemonDispatchFailure",
+        message: "daemon dispatch failed: tenant_authority_mismatch",
+      });
+      assert.equal(insert.mock.calls.length, 0);
+      assert.deepEqual(calls, { creates: [], sends: [] });
+    } finally {
+      await lifecycle.stop();
+    }
+  });
+
+  it("does not complete an execution that disappears after the callback token check", async () => {
+    const { database, intent, lifecycle } = await dispatchFixture();
+    try {
+      const { execution } = await lifecycle.dispatchLaunchMachineIntent(intent);
+      const executionId = execution.id;
+      const find = vi
+        .spyOn(database, "findAgentExecutionById")
+        .mockResolvedValueOnce(execution)
+        .mockResolvedValueOnce(undefined);
+      const transition = vi.spyOn(database, "transitionAgentExecution");
+      const token = deriveAgentExecutionCompletionToken("test-secret", executionId);
+      await assert.rejects(
+        () => lifecycle.completeAgentExecutionFromCallback({ executionId, token }),
+        {
+          name: "AgentExecutionCompletionFailure",
+          message: "agent execution completion failed: not_found",
+        },
+      );
+      assert.deepEqual(find.mock.calls, [[executionId], [executionId]]);
+      assert.equal(transition.mock.calls.length, 0);
+    } finally {
+      await lifecycle.stop();
+    }
   });
 
   it("retries a pool timeout before the agent is created and launches it once", async () => {
