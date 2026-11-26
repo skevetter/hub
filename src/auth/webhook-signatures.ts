@@ -22,8 +22,8 @@ export function readWebhookSigningSettings(
     );
   }
 
-  const organizations = readSigningOrganizations(env["PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS"]);
-  const keyring = readSigningKeyring(env["PASEO_HUB_WEBHOOK_HMAC_KEYRING"]);
+  const organizations = readSigningOrganizations(env);
+  const keyring = readSigningKeyring(env);
   const activeKeyId = env["PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID"];
   if (
     (activeKeyId !== undefined && !keyring.has(activeKeyId)) ||
@@ -40,9 +40,9 @@ export function readWebhookSigningSettings(
   };
 }
 
-function readSigningOrganizations(value: string | undefined): string[] {
+function readSigningOrganizations(env: Readonly<Record<string, string | undefined>>): string[] {
   const organizationsName = "PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS";
-  const organizations = parseSetting(value, organizationsName, []);
+  const organizations = parseSetting(env[organizationsName], organizationsName, []);
   if (
     !Array.isArray(organizations) ||
     !organizations.every(isOrganizationId) ||
@@ -57,9 +57,11 @@ function isOrganizationId(id: unknown): id is string {
   return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(id);
 }
 
-function readSigningKeyring(setting: string | undefined): Map<string, Buffer> {
+function readSigningKeyring(
+  env: Readonly<Record<string, string | undefined>>,
+): Map<string, Buffer> {
   const ringName = "PASEO_HUB_WEBHOOK_HMAC_KEYRING";
-  const ring = parseSetting(setting, ringName, {});
+  const ring = parseSetting(env[ringName], ringName, {});
   if (ring === null || typeof ring !== "object" || Array.isArray(ring)) {
     throw new Error(`${ringName} must be a JSON object.`);
   }
