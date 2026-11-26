@@ -1,6 +1,7 @@
 import { RecurrenceSchema } from "../schedule/recurrence.js";
 import { z } from "zod";
 import { ContinuationSchema } from "../continuation.js";
+import { canonicalJson } from "./canonical-json.js";
 import { hasProgressDestination, PROGRESS_DESTINATION_REQUIRED } from "../progress-events.js";
 import {
   eventDefinition,
@@ -147,9 +148,11 @@ const StepIdentitySchema = {
   if: z.string().min(1).optional(),
 };
 
-export const TriggerAgentStepSchema = TriggerAgentRunSchema.omit({ target: true }).extend(
-  StepIdentitySchema,
-);
+/** Continuation is opt-in per step: a step without one starts a new agent. */
+export const TriggerAgentStepSchema = TriggerAgentRunSchema.omit({ target: true }).extend({
+  ...StepIdentitySchema,
+  continuation: ContinuationSchema.optional(),
+});
 
 export const TriggerScriptStepSchema = TriggerScriptRunSchema.omit({ target: true }).extend(
   StepIdentitySchema,
@@ -430,16 +433,6 @@ function choicesIssues(steps: readonly TriggerStep[], issue: IssueAdder): void {
       );
     }
   }
-}
-
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (typeof value === "object" && value !== null) {
-    const entries = Object.entries(value).sort(([left], [right]) => left.localeCompare(right));
-    const body = entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`);
-    return `{${body.join(",")}}`;
-  }
-  return JSON.stringify(value) ?? "undefined";
 }
 
 export type TriggerDocument = z.infer<typeof TriggerDocumentSchema>;

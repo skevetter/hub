@@ -3,7 +3,7 @@ import {
   isScriptStep as isAuthoredScriptStep,
   type TriggerStep,
 } from "../triggers/configuration/schema.js";
-import { normalizeSteps } from "../triggers/configuration/steps.js";
+import { normalizeSteps, stepContinuation } from "../triggers/configuration/steps.js";
 import { dump, load } from "js-yaml";
 import { z } from "zod";
 import {
@@ -333,7 +333,7 @@ function withAuthoredContinuation(
   authored: TriggerStep | undefined,
 ): CompiledStep {
   if (isScriptStep(step) || authored === undefined || isAuthoredScriptStep(authored)) return step;
-  return { ...step, continuation: step.continuation ?? authored.continuation };
+  return { ...step, continuation: step.continuation ?? stepContinuation(authored) };
 }
 
 /**

@@ -1,5 +1,7 @@
+import type { Continuation } from "../continuation.js";
 import {
   isScriptRun,
+  type TriggerAgentStep,
   type TriggerDocument,
   type TriggerRun,
   type TriggerStep,
@@ -46,4 +48,12 @@ function runAsStep(run: TriggerRun): TriggerStep {
 export function documentRun(document: Pick<TriggerDocument, "run">): TriggerRun {
   if (document.run === undefined) throw new Error("the trigger document uses steps, not run");
   return document.run;
+}
+
+/**
+ * What an agent step does with follow-up replies. A `run` always carries one, defaulted to
+ * conversation. A step in a list starts a new agent unless it names a continuation.
+ */
+export function stepContinuation(step: TriggerAgentStep): Continuation {
+  return step.continuation ?? { mode: "new" };
 }

@@ -51,7 +51,7 @@ stays inside `run`. Existing triggers, their saved text, and their hashes do not
 | `id`             | Required on every step. Letters, digits, `_` and `-`. Unique within the trigger.                     |
 | Step kind        | A step with `script` is a script step. Otherwise it is an agent step with `agent` and `prompt`.      |
 | `if`             | Optional. Skips the step when it is false. It may read `steps.<id>.outputs` of earlier steps.        |
-| `continuation`   | Per agent step. There is no document-level `continuation`.                                           |
+| `continuation`   | Per agent step, opt in. A step without one starts a new agent. No document-level `continuation`.     |
 | Reply            | `reply_message` adds the reply output to the last agent step only.                                   |
 
 A step accepts the fields `run` accepts for its kind, except `target`. A script step refuses the
@@ -67,6 +67,21 @@ continue-on-failure option. A step skipped by `if` does not stop the run.
 sum of its steps' deadlines, up to the 24 hour limit every deadline has. Each step keeps its own
 `max_runtime`, `idle_timeout` and `startup_timeout`. Any of them ending the run records
 `timed_out`.
+
+## Continuation
+
+Follow-up replies continue a step only when that step says so. In a `steps` list, an agent step without
+`continuation` starts a new agent every time. Set `continuation: conversation` or
+`continuation: { mode: key, key: ... }` on a step to continue an earlier conversation.
+
+`run` is different: it keeps `continuation: conversation` as its default. So a one-item `steps` list
+without `continuation` behaves like `run` with `continuation: new`.
+
+Steps that continue the same conversation share one agent session, and a session only accepts steps that
+match in agent, `env`, `github`, output schema and allowed outputs. Hub refuses a document where two such
+steps differ, at `steps.N.continuation`, and says which fields differ. Give one step `continuation: new`
+or a different key. On Slack, Discord, Linear and GitHub events the reply output is added to the last
+agent step, so two steps that both use `continuation: conversation` always differ there.
 
 ## Choosing between agents
 

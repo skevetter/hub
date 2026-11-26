@@ -2,8 +2,12 @@ import type {
   AuthoredAgentStep,
   AuthoredStep,
   CompiledAgent,
+  CompiledAgentStep,
   CompiledTrigger,
 } from "../../config/compiler.js";
+import type { Continuation } from "../continuation.js";
+import { canonicalJson } from "./canonical-json.js";
+import type { TriggerDocumentIssue } from "./document.js";
 import { isScriptStep, MAX_DURATION_MS, parseDurationMs } from "../../config/compiler.js";
 import {
   isScriptStep as isAuthoredScriptStep,
@@ -11,6 +15,7 @@ import {
   type TriggerScriptStep,
   type TriggerStep,
 } from "./schema.js";
+import { stepContinuation } from "./steps.js";
 
 export function authoredSteps(steps: readonly TriggerStep[]): AuthoredStep[] {
   return steps.map((step) => (isAuthoredScriptStep(step) ? scriptStep(step) : agentStep(step)));
@@ -52,7 +57,7 @@ export function withStepContinuation(
       if (authored === undefined || isScriptStep(step) || isAuthoredScriptStep(authored)) {
         return step;
       }
-      return { ...step, continuation: authored.continuation };
+      return { ...step, continuation: stepContinuation(authored) };
     }),
   };
 }
@@ -75,6 +80,58 @@ export function withAutomaticReply(trigger: CompiledTrigger): CompiledTrigger {
           },
     ),
   };
+}
+
+/**
+ * Agent steps that continue the same conversation share one session, and a session only accepts
+ * steps with the same agent, env, github grant, output schema and allowed outputs. Refuse that at
+ * save time instead of failing the second step when it dispatches.
+ */
+export function continuationIssues(trigger: CompiledTrigger): TriggerDocumentIssue[] {
+  const issues: TriggerDocumentIssue[] = [];
+  const firstWith = new Map<string, { id: string; step: CompiledAgentStep }>();
+  for (const [index, step] of trigger.steps.entries()) {
+    const key = isScriptStep(step) ? undefined : sharedSessionKey(step.continuation, trigger.on);
+    if (isScriptStep(step) || key === undefined) continue;
+    const first = firstWith.get(key);
+    if (first === undefined) {
+      firstWith.set(key, { id: step.id, step });
+      continue;
+    }
+    const differing = sessionDifferences(first.step, step);
+    if (differing.length > 0) {
+      issues.push({
+        path: ["steps", index, "continuation"],
+        message: `Step "${step.id}" continues the same conversation as step "${first.id}" but differs in ${differing.join(", ")}. A conversation only continues across steps that match in those. Give one of them continuation: new, or a different key.`,
+      });
+    }
+  }
+  return issues;
+}
+
+function sharedSessionKey(
+  continuation: Continuation | undefined,
+  event: string,
+): string | undefined {
+  if (continuation === undefined || continuation.mode === "new") return undefined;
+  if (continuation.mode === "key") return `key:${continuation.key}`;
+  // Without a conversation to continue, conversation mode starts a new agent.
+  return automaticReplyType(event) === undefined ? undefined : "conversation";
+}
+
+function sessionDifferences(left: CompiledAgentStep, right: CompiledAgentStep): string[] {
+  const outputs = (step: CompiledAgentStep) =>
+    [...step.allowOutputs].sort((a, b) => a.type.localeCompare(b.type));
+  const fields: [string, unknown, unknown][] = [
+    ["agent", left.agent, right.agent],
+    ["env", left.env, right.env],
+    ["github", left.github, right.github],
+    ["output schema", left.output, right.output],
+    ["allowed outputs", outputs(left), outputs(right)],
+  ];
+  return fields
+    .filter(([, before, after]) => canonicalJson(before) !== canonicalJson(after))
+    .map(([name]) => name);
 }
 
 function lastAgentIndex(steps: CompiledTrigger["steps"]): number {

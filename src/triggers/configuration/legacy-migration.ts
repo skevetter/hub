@@ -13,10 +13,15 @@ import type {
   JsonPrimitive,
 } from "../../config/compiler.js";
 import { compileHubConfig, isScriptStep, parseCompiledHubConfig } from "../../config/compiler.js";
-import { parseTriggerDocument, TriggerDocumentError } from "./document.js";
+import {
+  parseTriggerDocument,
+  TriggerDocumentError,
+  type TriggerDocumentIssue,
+} from "./document.js";
 import type { CompiledTriggerDocument } from "./index.js";
 import {
   authoredSteps,
+  continuationIssues,
   defaultRunDeadline,
   sharedNamedAgents,
   withAutomaticReply,
@@ -331,14 +336,24 @@ export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
   if (compiledEnvironment === undefined) {
     throw new Error("compiled trigger target is missing");
   }
+  const events = compiled.triggers.map((trigger) =>
+    withAutomaticReply(withStepContinuation(trigger, steps)),
+  );
+  assertContinuations(events);
   return {
     authored,
     environment: compiledEnvironment,
-    events: compiled.triggers.map((trigger) =>
-      withAutomaticReply(withStepContinuation(trigger, steps)),
-    ),
+    events,
     authoredHash: createHash("sha256").update(yaml).digest("hex"),
   };
+}
+
+function assertContinuations(events: readonly CompiledTrigger[]): void {
+  const issues = new Map<string, TriggerDocumentIssue>();
+  for (const issue of events.flatMap(continuationIssues)) {
+    issues.set(`${issue.path.join(".")}:${issue.message}`, issue);
+  }
+  if (issues.size > 0) throw new TriggerDocumentError([...issues.values()]);
 }
 
 function authoredEventTriggers(

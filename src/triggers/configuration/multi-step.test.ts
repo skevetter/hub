@@ -73,6 +73,10 @@ function agentSteps(count: number): string {
   ).join("");
 }
 
+function manualDocument(steps: string): string {
+  return `name: many\non:\n  manual.run: {}\ntarget: { daemon: devbox, cwd: /workspace/app }\nsteps:\n${steps}`;
+}
+
 function listDocument(steps: string): string {
   return `name: many\n${ON}target: { daemon: devbox, cwd: /workspace/app }\nsteps:\n${steps}`;
 }
@@ -94,6 +98,7 @@ steps:
   - id: run
     agent: { provider: codex }
     prompt: Review it.
+    continuation: { mode: conversation }
 `;
     const shorthand = compileTriggerDocument(SHORTHAND);
     const list = compileTriggerDocument(listed);
@@ -109,7 +114,7 @@ describe("a document with steps", () => {
     expect(steps.map((step) => step.id)).toEqual(["build", "review", "fix"]);
     expect(steps.map(isScriptStep)).toEqual([true, false, false]);
     expect(agentStep(steps[1]).continuation).toEqual({ mode: "key", key: "review-thread" });
-    expect(agentStep(steps[2]).continuation).toEqual({ mode: "conversation" });
+    expect(agentStep(steps[2]).continuation).toEqual({ mode: "new" });
     expect(agentStep(steps[2]).condition).toBeDefined();
     expect(agentStep(steps[1]).condition).toBeUndefined();
     expect(event?.maxRuntimeMs).toBe(3 * 3_600_000);
@@ -124,6 +129,32 @@ describe("a document with steps", () => {
     const steps = compileTriggerDocument(MIXED).events[0]?.steps ?? [];
     const replies = steps.map((step) => (isScriptStep(step) ? [] : outputTypes(step)));
     expect(replies).toEqual([[], [], ["slack.reply"]]);
+  });
+
+  it("starts a new agent for a step without continuation, unlike run", () => {
+    const listed = compileTriggerDocument(listDocument(agentSteps(1)));
+    expect(agentStep(listed.events[0]?.steps[0]).continuation).toEqual({ mode: "new" });
+    const shorthand = compileTriggerDocument(SHORTHAND);
+    expect(agentStep(shorthand.events[0]?.steps[0]).continuation).toEqual({ mode: "conversation" });
+  });
+
+  it("refuses steps that continue one conversation but could not share a session", () => {
+    const step = (id: string, model: string, key = "shared") =>
+      `  - id: ${id}\n    continuation: { mode: key, key: ${key} }\n    agent: { provider: codex, model: ${model} }\n    prompt: Go\n`;
+    expect(issuesOf(manualDocument(step("a", "m1") + step("b", "m1")))).toEqual([]);
+    expect(issuesOf(manualDocument(step("a", "m1") + step("b", "m2", "other")))).toEqual([]);
+    const [issue] = issuesOf(manualDocument(step("a", "m1") + step("b", "m2")));
+    expect(issue?.path).toBe("steps.1.continuation");
+    expect(issue?.message).toContain('Step "b" continues the same conversation as step "a"');
+    expect(issue?.message).toContain("differs in agent");
+  });
+
+  it("counts the automatic reply output as a difference for conversation steps on a chat event", () => {
+    const step = (id: string) =>
+      `  - id: ${id}\n    continuation: { mode: conversation }\n    agent: { provider: codex }\n    prompt: Go\n`;
+    const [issue] = issuesOf(listDocument(step("a") + step("b")));
+    expect(issue?.message).toContain("allowed outputs");
+    expect(issuesOf(manualDocument(step("a") + step("b")))).toEqual([]);
   });
 
   it("round trips through serialization as steps", () => {
@@ -213,7 +244,7 @@ describe("tools that read a document with steps", () => {
     };
     const steps = parseProjectConfiguration(revision).triggers[0]?.steps ?? [];
     expect(agentStep(steps[1]).continuation).toEqual({ mode: "key", key: "review-thread" });
-    expect(agentStep(steps[2]).continuation).toEqual({ mode: "conversation" });
+    expect(agentStep(steps[2]).continuation).toEqual({ mode: "new" });
     expect(steps[0] !== undefined && isScriptStep(steps[0])).toBe(true);
   });
 });
