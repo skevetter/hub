@@ -302,6 +302,76 @@ function pauseAfter(runtime: DatabaseRuntime, matches: (statement: string) => bo
   return { database, held: held.promise, release: release.resolve };
 }
 
+async function seedCredentialHistory(runtime: QueryHandle, history: CredentialHistory) {
+  const ids = history.intents
+    .map(() => randomUUID())
+    .sort((left, right) => left.localeCompare(right));
+  const before = [];
+  for (const [index, intent] of history.intents.entries()) {
+    const result = await runtime.query<{ launch_intent: LaunchMachineIntent | null }>(
+      `insert into agent_executions (id, organization_id, project_id, configuration_revision_id,
+                status, completed_at, started_at, launch_intent)
+             values ($1, $2, $3, $4, 'succeeded', $5, $5, $6::jsonb)
+             returning launch_intent`,
+      [ids[index], ORG, PROJECT, REVISION, OLD, intent === null ? null : JSON.stringify(intent)],
+    );
+    before.push(result.rows[0]!.launch_intent);
+  }
+  assert.equal(build14Selection(before), history.build14, history.key);
+  return ids;
+}
+
+function assertLaunchAuxiliaryCounts(counted: Awaited<ReturnType<typeof drain>>) {
+  assert.equal(counted.auxiliaryCounts.launchIntent.live_owner?.count, 1);
+  assert.equal(counted.auxiliaryCounts.launchIntent.flag_unknown?.count, 1);
+  assert.equal(counted.auxiliaryCounts.session.eligible?.count, 1);
+  assert.equal(counted.auxiliaryCounts.session.unbound_session?.count, 1);
+  assert.equal(counted.auxiliaryCounts.session.unused_session?.count, 1);
+  assert.deepEqual(counted.auxiliaryCounts.session.incomplete_bootstrap, {
+    count: 1,
+    oldestAgeMs: NOW.getTime() - OLD.getTime(),
+  });
+  assert.deepEqual(counted.auxiliaryCounts.machine.machine_legacy, {
+    count: 1,
+    oldestAgeMs: NOW.getTime() - OLD.getTime(),
+  });
+}
+
+async function verifyRedactedLaunch(
+  database: Database,
+  {
+    dump,
+    name,
+    expiredMarkers,
+    retainedMarkers,
+    session,
+    old,
+  }: {
+    dump: (name: string) => Promise<string>;
+    name: string;
+    expiredMarkers: string[];
+    retainedMarkers: string[];
+    session: AgentSessionRecord;
+    old: { id: string };
+  },
+) {
+  const after = await dump(name);
+  for (const marker of expiredMarkers) assert.ok(!after.includes(marker), marker);
+  for (const marker of retainedMarkers) assert.ok(after.includes(marker), marker);
+  const reduced = await database.findAgentSession(session.id);
+  assert.ok(reduced?.optionsReducedAt);
+  assert.deepEqual(reduced.creationOptions, {
+    provider: "codex",
+    model: "gpt-5",
+    toolPolicy: { preapproved: [{ kind: "mcp", server: "hub", tool: "reply" }] },
+  });
+  const execution = await database.findAgentExecutionById(old.id);
+  assert.equal(execution?.launchIntent, null);
+  assert.equal(execution.usedTemporaryCredentials, true);
+  assert.deepEqual(execution.launchAgent, { provider: "codex", model: "gpt-5" });
+  assert.equal(execution.outputContext, null);
+}
+
 describe("launch and session expiry in PostgreSQL", () => {
   let postgres: StartedPostgreSqlContainer;
   beforeAll(async () => {
@@ -347,28 +417,7 @@ describe("launch and session expiry in PostgreSQL", () => {
     try {
       const cases = [];
       for (const history of credentialHistories) {
-        const ids = history.intents
-          .map(() => randomUUID())
-          .sort((left, right) => left.localeCompare(right));
-        const before = [];
-        for (const [index, intent] of history.intents.entries()) {
-          const result = await runtime.query<{ launch_intent: LaunchMachineIntent | null }>(
-            `insert into agent_executions (id, organization_id, project_id, configuration_revision_id,
-                status, completed_at, started_at, launch_intent)
-             values ($1, $2, $3, $4, 'succeeded', $5, $5, $6::jsonb)
-             returning launch_intent`,
-            [
-              ids[index],
-              ORG,
-              PROJECT,
-              REVISION,
-              OLD,
-              intent === null ? null : JSON.stringify(intent),
-            ],
-          );
-          before.push(result.rows[0]!.launch_intent);
-        }
-        assert.equal(build14Selection(before), history.build14, history.key);
+        const ids = await seedCredentialHistory(runtime, history);
         cases.push({ history, ids });
       }
 
@@ -582,19 +631,7 @@ describe("launch and session expiry in PostgreSQL", () => {
       const counted = await drain(
         new RunPayloadRetention(database, { ...settings, mode: "count" }),
       );
-      assert.equal(counted.auxiliaryCounts.launchIntent.live_owner?.count, 1);
-      assert.equal(counted.auxiliaryCounts.launchIntent.flag_unknown?.count, 1);
-      assert.equal(counted.auxiliaryCounts.session.eligible?.count, 1);
-      assert.equal(counted.auxiliaryCounts.session.unbound_session?.count, 1);
-      assert.equal(counted.auxiliaryCounts.session.unused_session?.count, 1);
-      assert.deepEqual(counted.auxiliaryCounts.session.incomplete_bootstrap, {
-        count: 1,
-        oldestAgeMs: NOW.getTime() - OLD.getTime(),
-      });
-      assert.deepEqual(counted.auxiliaryCounts.machine.machine_legacy, {
-        count: 1,
-        oldestAgeMs: NOW.getTime() - OLD.getTime(),
-      });
+      assertLaunchAuxiliaryCounts(counted);
       assert.deepEqual(await tableHashes(runtime), hashes);
       const applied = await drain(new RunPayloadRetention(database, settings));
       assert.equal(applied.expired, 1);
@@ -609,21 +646,14 @@ describe("launch and session expiry in PostgreSQL", () => {
       assert.equal((await database.findAgentSession(incomplete.id))?.optionsReducedAt, null);
       assert.equal((await database.findAgentSession(unused.id))?.optionsReducedAt, null);
       await database.saveAgentSession(session);
-      const after = await dump(name);
-      for (const marker of expiredMarkers) assert.ok(!after.includes(marker), marker);
-      for (const marker of retainedMarkers) assert.ok(after.includes(marker), marker);
-      const reduced = await database.findAgentSession(session.id);
-      assert.ok(reduced?.optionsReducedAt);
-      assert.deepEqual(reduced.creationOptions, {
-        provider: "codex",
-        model: "gpt-5",
-        toolPolicy: { preapproved: [{ kind: "mcp", server: "hub", tool: "reply" }] },
+      await verifyRedactedLaunch(database, {
+        dump,
+        name,
+        expiredMarkers,
+        retainedMarkers,
+        session,
+        old,
       });
-      const execution = await database.findAgentExecutionById(old.id);
-      assert.equal(execution?.launchIntent, null);
-      assert.equal(execution.usedTemporaryCredentials, true);
-      assert.deepEqual(execution.launchAgent, { provider: "codex", model: "gpt-5" });
-      assert.equal(execution.outputContext, null);
       const newer = await fixture.arrival({ credentialed: true, label: "rotated" });
       assert.equal((await newer.dispatch()).action, "created");
       assert.equal(fixture.connection.creates.length, 2);
