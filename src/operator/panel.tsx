@@ -47,9 +47,7 @@ type OverrideTarget =
   | { kind: "executionsMonthly"; key: OverrideKey; hasOverride: boolean; limit: number | null };
 
 const PICKER_TITLE = "Organization";
-const PICKER_DESCRIPTION = "Pick an organization to manage its entitlements.";
 const AUDIT_TITLE = "Audit trail";
-const AUDIT_DESCRIPTION = "Every provisioning, plan stamp, and override, most recent first.";
 const ENTITLEMENT_COLUMNS: readonly DataColumn[] = [
   { header: "Entitlement", fill: true },
   { header: "Granted" },
@@ -79,10 +77,7 @@ export function OperatorEntitlementsPage() {
   const [slug, setSlug] = useState<string | null>(null);
   return (
     <>
-      <PageHeader
-        title="Operator"
-        description="View and edit any organization's entitlements. Instance operators only."
-      />
+      <PageHeader title="Operator" />
       <OrganizationPicker slug={slug} onSelect={setSlug} />
       {slug !== null && <OperatorOrganization slug={slug} />}
     </>
@@ -113,7 +108,7 @@ function OrganizationPicker({
     );
   }
   return (
-    <Section title={PICKER_TITLE} description={PICKER_DESCRIPTION}>
+    <Section title={PICKER_TITLE}>
       <Select {...(slug === null ? {} : { value: slug })} onValueChange={onSelect}>
         <SelectTrigger aria-label="Manage organization" className="w-full max-w-sm">
           <SelectValue placeholder="Select an organization" />
@@ -193,7 +188,7 @@ function OrganizationContent({ snapshot, slug }: { snapshot: Snapshot; slug: str
     <>
       <OverLimitBanner overages={snapshot.overages} />
       {renderEntitlements(snapshot, editSeats, editInvites, editExecutionsMonthly)}
-      <Section title={AUDIT_TITLE} description={AUDIT_DESCRIPTION}>
+      <Section title={AUDIT_TITLE}>
         <AuditTrail history={snapshot.history} />
       </Section>
       {target !== null && <OverrideDialog target={target} slug={slug} onClose={closeEditor} />}
@@ -208,10 +203,7 @@ function renderEntitlements(
   editExecutionsMonthly: () => void,
 ) {
   return (
-    <Section
-      title="Entitlements"
-      description={`Effective values for ${snapshot.organization.name}, granted by its plan and adjusted by any manual overrides.`}
-    >
+    <Section title="Entitlements">
       <DataTable
         label="Entitlements"
         columns={ENTITLEMENT_COLUMNS}
@@ -565,7 +557,7 @@ function meterUsageLabel(usage: Snapshot["usage"]): string {
 
 function OrganizationPickerLoading() {
   return (
-    <Section title={PICKER_TITLE} description={PICKER_DESCRIPTION}>
+    <Section title={PICKER_TITLE}>
       <Skeleton aria-busy="true" className="h-9 w-full max-w-sm" />
     </Section>
   );
@@ -577,7 +569,7 @@ function OperatorOrganizationLoading() {
       <Section title="Entitlements">
         <DataTableSkeleton label="Entitlements" columns={ENTITLEMENT_COLUMNS} />
       </Section>
-      <Section title={AUDIT_TITLE} description={AUDIT_DESCRIPTION}>
+      <Section title={AUDIT_TITLE}>
         <DataTableSkeleton label="Audit trail" columns={AUDIT_COLUMNS} rows={2} />
       </Section>
     </>

@@ -140,11 +140,7 @@ export function AppSetupEntry({
   const failed = finish.data?.status === "error" || finish.isError;
   return (
     <AuthLayout width="xl">
-      <PageHeader
-        title="Set up your apps"
-        description="Paseo Hub talks to GitHub, Slack, Discord, and Linear through apps you create and own. Set up the ones you want to use."
-        focusOnMount
-      />
+      <PageHeader title="Set up your apps" focusOnMount />
       <div className="grid min-w-0 gap-6">
         {failed ? <ExitFailure error={finish.data} onRetry={done} /> : null}
         <ProviderApplications surface="appSetup" organizationId={organizationId} />
@@ -188,10 +184,7 @@ function ExitFailure({ error, onRetry }: { error: Failure; onRetry: () => void }
 export function AppsPanel({ organizationId }: { organizationId: string }) {
   return (
     <>
-      <PageHeader
-        title="Apps"
-        description="The GitHub, Slack, Discord, and Linear apps Hub uses to reach your workspaces."
-      />
+      <PageHeader title="Apps" />
       <ProviderApplications surface="apps" organizationId={organizationId} />
     </>
   );

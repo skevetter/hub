@@ -46,7 +46,6 @@ import { memberFlagKey, useMemberFlag } from "./member-preference.js";
 import { HomeOverview } from "./overview.js";
 import { thingsToTry, type TrySurface, type TrySurfaceKey } from "./things-to-try.js";
 
-const HOME_DESCRIPTION = "Whether your triggers are working, and what to try next.";
 const HOME_HEADING_ID = "home-heading";
 
 export function HomePanel() {
@@ -104,14 +103,7 @@ function HomeView({ snapshot, ...props }: HomeViewProps) {
     retryRequested.current = false;
     if (status === "success") document.getElementById(HOME_HEADING_ID)?.focus();
   }, [isFetching, status]);
-  const header = (
-    <PageHeader
-      id={HOME_HEADING_ID}
-      title="Home"
-      description={HOME_DESCRIPTION}
-      focusOnMount={focusOnCompletion}
-    />
-  );
+  const header = <PageHeader id={HOME_HEADING_ID} title="Home" focusOnMount={focusOnCompletion} />;
   if (snapshot.status === "pending") {
     return (
       <>
@@ -226,10 +218,7 @@ function ThingsToTry({
   if (surface === undefined) return null;
   return (
     <Section>
-      <Card
-        title="Things to try"
-        description="Explore example prompts and see what each surface needs."
-      >
+      <Card title="Things to try">
         <SegmentedControl
           label="Where to try it"
           value={surface.key}

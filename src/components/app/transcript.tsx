@@ -60,7 +60,7 @@ export function Transcript({
   return (
     <div className="grid min-w-0 gap-3">
       {ordered.length === 0 && !working ? (
-        <EmptyState title="No messages yet" description="Messages and agent replies appear here." />
+        <EmptyState title="No messages yet" />
       ) : (
         <FollowBottom version={version} label="Session transcript" maxHeight="min(55vh, 36rem)">
           <ul className="grid min-w-0 gap-4">

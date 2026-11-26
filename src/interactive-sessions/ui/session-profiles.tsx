@@ -23,7 +23,6 @@ import { saveSessionProfile, type listSessionProfiles, type ProfileView } from "
 import { SessionProfileForm, type ProfileFormData } from "./session-profile-form.js";
 import { refusalMessage, SessionLoadFailure, SessionsUnavailable } from "./session-states.js";
 
-const DESCRIPTION = "Choose where sessions run and what settings agents use.";
 const COLUMNS = [
   { header: "State", lead: true },
   { header: "Name", fill: true },
@@ -36,7 +35,7 @@ const COLUMNS = [
 export function SessionProfilesLoading() {
   return (
     <div aria-busy="true" aria-label="Loading session profiles">
-      <PageHeaderSkeleton description={DESCRIPTION} />
+      <PageHeaderSkeleton />
       <DataTableSkeleton label="Session profiles" columns={COLUMNS} />
     </div>
   );
@@ -61,7 +60,7 @@ export function SessionProfilesPanel({
   if (result.status === "error" || !Array.isArray(result.data)) {
     return (
       <>
-        <PageHeader title="Session profiles" description={DESCRIPTION} />
+        <PageHeader title="Session profiles" />
         <SessionLoadFailure title="Session profiles unavailable" error={result} />
       </>
     );
@@ -155,7 +154,7 @@ function ProfileTable({
 
   return (
     <>
-      <PageHeader title="Session profiles" description={DESCRIPTION}>
+      <PageHeader title="Session profiles">
         {profiles.length === 0 ? null : createButton}
       </PageHeader>
       <Section>

@@ -15,11 +15,7 @@ interface WebhookInvocationProps {
 
 export function WebhookCard(props: WebhookInvocationProps) {
   return (
-    <Card
-      icon={WEBHOOK_ICON}
-      title="Webhook"
-      description="Send an authenticated event to this manual trigger."
-    >
+    <Card icon={WEBHOOK_ICON} title="Webhook">
       <WebhookInvocation {...props} />
     </Card>
   );

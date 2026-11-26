@@ -115,7 +115,6 @@ function HomeTriggers({
   return (
     <Section
       title="Triggers"
-      description="The last run of each trigger. Worst first."
       action={
         <Button variant="link" asChild>
           <Link to={`${base}/triggers` as never}>View all</Link>
@@ -205,7 +204,7 @@ function windowTally({ total, failed }: TriggerHealthRow, days: number): string 
 function HomeWhereItRuns({ data }: { data: HomeSnapshot }) {
   const empty = data.daemons.length === 0 && data.connections.length === 0;
   return (
-    <Section title="Where it runs" description="Machines and apps the triggers depend on.">
+    <Section title="Where it runs">
       {empty ? (
         <EmptyState
           title="Nothing connected yet"

@@ -138,11 +138,7 @@ export function OrganizationConnectionsPanel() {
   const { account, organization } = useRouteTenant();
   return (
     <>
-      <PageHeader
-        id={HEADING_ID}
-        title="Connections"
-        description="These services let Hub receive events and post replies for your organization."
-      />
+      <PageHeader id={HEADING_ID} title="Connections" />
       <ConnectionsContent key={JSON.stringify([account.id, organization.id])} />
     </>
   );

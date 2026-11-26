@@ -26,7 +26,6 @@ import {
   sessionStatus,
 } from "./session-states.js";
 
-const DESCRIPTION = "Conversations with agents running on your daemons.";
 const COLUMNS = [
   { header: "State", lead: true },
   { header: "Session", fill: true },
@@ -42,7 +41,7 @@ type SessionListResult = Awaited<ReturnType<typeof listInteractiveSessions>>;
 export function SessionListLoading() {
   return (
     <div aria-busy="true" aria-label="Loading sessions">
-      <PageHeaderSkeleton description={DESCRIPTION} />
+      <PageHeaderSkeleton />
       <DataTableSkeleton label="Sessions" columns={COLUMNS} />
     </div>
   );
@@ -78,7 +77,7 @@ export function SessionListPanel({
   const hasRows = hasSessionRows(result);
   return (
     <>
-      <PageHeader title="Sessions" description={DESCRIPTION}>
+      <PageHeader title="Sessions">
         {account.features?.interactiveSessions === true && tenant.capabilities.manageResources ? (
           <Button asChild variant="outline">
             <Link to="/o/$organizationSlug/sessions/profiles" params={params}>

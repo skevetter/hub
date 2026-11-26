@@ -43,7 +43,6 @@ import { useDeviceProfiles, useDeviceProviders } from "./device-queries.js";
 import { createProviderReadLimiter, type ProviderReadLimiter } from "./provider-read-limiter.js";
 import { daemonsQueryKey, refreshDaemons } from "./status.js";
 
-const DAEMONS_DESCRIPTION = "See the machines that run your agents and what Hub can do on them.";
 const FILTER_OPTIONS = [
   { value: "all", label: "All" },
   { value: "connected", label: "Connected" },
@@ -74,7 +73,7 @@ export function DaemonsPanel({
   const showProfiles = features?.interactiveSessions === true;
   return (
     <>
-      <PageHeader id="daemons-heading" title="Daemons" description={DAEMONS_DESCRIPTION} />
+      <PageHeader id="daemons-heading" title="Daemons" />
       {tenantAccountId === account.id ? (
         <AccountDaemons
           key={`${account.id}:${organizationId}`}

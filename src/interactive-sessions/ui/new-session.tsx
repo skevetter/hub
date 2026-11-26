@@ -26,13 +26,12 @@ import {
 import { SessionLoadFailure, SessionsUnavailable, refusalMessage } from "./session-states.js";
 import type { ParticipantRole } from "../types.js";
 
-const DESCRIPTION = "Choose where the agent runs, then send the first message.";
 const NO_MEMBERS: readonly TeamMember[] = [];
 
 export function NewSessionLoading() {
   return (
     <div aria-busy="true" aria-label="Loading session profiles">
-      <PageHeaderSkeleton description={DESCRIPTION} />
+      <PageHeaderSkeleton />
       <CardSkeleton />
     </div>
   );
@@ -71,7 +70,7 @@ export function NewSessionPanel({
   }
   return (
     <>
-      <PageHeader title="New session" description={DESCRIPTION} />
+      <PageHeader title="New session" />
       {body}
     </>
   );
@@ -125,10 +124,7 @@ export function HomeSessionStart({ organizationSlug }: { organizationSlug: strin
   if (active.length === 0) return null;
   return (
     <Section>
-      <Card
-        title="Start a session"
-        description="Pick where it runs, then say what you want done. The agent works on your daemon."
-      >
+      <Card title="Start a session">
         <CreateSessionForm
           key={organizationSlug}
           organizationSlug={organizationSlug}

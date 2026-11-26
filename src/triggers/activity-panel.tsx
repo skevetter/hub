@@ -40,7 +40,6 @@ const ACTIVITY_VIEWS = [
   { value: "runs", label: "Runs" },
   { value: "dropped", label: "Dropped" },
 ] as const;
-const ACTIVITY_DESCRIPTION = "Agent runs launched by organization triggers.";
 const NO_FILTERED_RUNS = "No runs match these filters";
 const STATUS_OPTIONS = ACTIVITY_STATUSES.map((value) => ({
   value,
@@ -72,11 +71,7 @@ export function TriggerActivityPanel() {
   );
   return (
     <>
-      <PageHeader
-        id={HEADING_ID}
-        title="Activity"
-        description={dropped ? "Provider events Hub received and dropped." : ACTIVITY_DESCRIPTION}
-      />
+      <PageHeader id={HEADING_ID} title="Activity" />
       <div className="mb-3">
         <SegmentedControl
           label="Activity view"
