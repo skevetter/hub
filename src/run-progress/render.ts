@@ -35,10 +35,9 @@ function duration(start: Date, end: Date): string {
   return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
-function activity(
-  events: readonly RunTimelineEvent[],
-  value: (text: string | number) => string,
-): string {
+type FormatValue = (text: string | number) => string;
+
+function toolCalls(events: readonly RunTimelineEvent[]) {
   const calls = new Map<string, { category: unknown; failed: boolean }>();
   for (const event of events) {
     if (event.kind !== "tool_started" && event.kind !== "tool_finished") continue;
@@ -50,13 +49,17 @@ function activity(
       failed: previous?.failed === true || status === "failed",
     });
   }
-  const categories = [...calls.values()];
+  return [...calls.values()];
+}
+
+function activity(events: readonly RunTimelineEvent[], value: FormatValue): string {
+  const categories = toolCalls(events);
   const counts = TOOL_CATEGORIES.flatMap((category) => {
     const count = categories.filter((call) => call.category === category).length;
     return count === 0 ? [] : [value(`${count} ${categoryLabels[category][count === 1 ? 0 : 1]}`)];
   });
   const failures = categories.filter((call) => call.failed).length;
-  return `Activity: ${counts.length ? counts.join(", ") + ". " : ""}${value(`${calls.size} tool ${calls.size === 1 ? "call" : "calls"}`)}, ${value(failures)} failed.`;
+  return `Activity: ${counts.length ? counts.join(", ") + ". " : ""}${value(`${categories.length} tool ${categories.length === 1 ? "call" : "calls"}`)}, ${value(failures)} failed.`;
 }
 
 function runLink(input: ProgressRenderInput): string | undefined {
@@ -71,68 +74,84 @@ function runLink(input: ProgressRenderInput): string | undefined {
   return href;
 }
 
+function runningLines(
+  { events, steps }: Pick<ProgressRenderInput, "events" | "steps">,
+  started: Date,
+  value: FormatValue,
+): string[] {
+  const latest = events.at(-1)?.at ?? started;
+  const permission = events.findLast(
+    (event) =>
+      event.kind === "permission_requested" ||
+      event.kind === "permission_resolved" ||
+      event.kind === "step_finished" ||
+      event.kind === "turn_ended" ||
+      event.kind === "turn_failed" ||
+      event.kind === "turn_canceled",
+  );
+  const lines = [
+    "Paseo run: Running",
+    `Started ${value(utc(started))}. Updated ${value(utc(latest))}.`,
+  ];
+  if (permission?.kind === "permission_requested") lines.push("Now: waiting for permission");
+  lines.push(activity(events, value));
+  const step = steps.find(({ status }) => status === "running");
+  if (step?.startedAt != null) {
+    const position = steps.indexOf(step) + 1;
+    lines.push(
+      `Step ${value(position)} of ${value(steps.length)} running since ${value(utc(step.startedAt))}.`,
+    );
+  }
+  return lines;
+}
+
+function terminalTitle(run: AcceptedTriggerRunRecord, elapsed: string, value: FormatValue): string {
+  if (run.status === "succeeded") return `Paseo run: Succeeded in ${value(elapsed)}`;
+  if (run.status === "canceled") return `Paseo run: stopped by a person after ${value(elapsed)}.`;
+  const failure = failurePhrase(run.failureReason, run.status);
+  const status = run.status === "timed_out" ? "Timed out" : "Failed";
+  return `Paseo run: ${value(status)} in ${value(elapsed)}: ${value(failure.phrase)} (${value(failure.code)}).`;
+}
+
+function terminalLines(
+  { run, events, steps }: Pick<ProgressRenderInput, "run" | "events" | "steps">,
+  started: Date,
+  value: FormatValue,
+): string[] {
+  const finished = run.completedAt ?? started;
+  const title = terminalTitle(run, duration(started, finished), value);
+  const finishedLine = `Finished ${value(utc(finished))}.`;
+  const activityLine = activity(events, value);
+  const outcomes = [
+    ["succeeded", "succeeded"],
+    ["failed", "failed"],
+    ["timed_out", "timed out"],
+    ["canceled", "stopped"],
+    ["skipped", "skipped"],
+    ["pending", "not run"],
+  ] as const;
+  const counts = outcomes.flatMap(([status, label]) => {
+    const count = steps.filter(
+      (step) => step.status === status || (status === "pending" && step.status === "running"),
+    ).length;
+    return count ? [value(`${count} ${label}`)] : [];
+  });
+  return [
+    title,
+    finishedLine,
+    activityLine,
+    `Steps: ${counts.length ? counts.join(", ") : "0 succeeded"} of ${value(steps.length)}.`,
+  ];
+}
+
 export function renderProgress(input: ProgressRenderInput): string {
   const { run, events, steps, provider, maxBodyChars } = input;
   const value = (text: string | number) => (provider === "linear" ? `\`${text}\`` : String(text));
   const started = events.find((event) => event.kind === "run_started")?.at ?? run.createdAt;
-  const lines: string[] = [];
-  if (run.status === "running") {
-    const latest = events.at(-1)?.at ?? started;
-    const permission = events.findLast(
-      (event) =>
-        event.kind === "permission_requested" ||
-        event.kind === "permission_resolved" ||
-        event.kind === "step_finished" ||
-        event.kind === "turn_ended" ||
-        event.kind === "turn_failed" ||
-        event.kind === "turn_canceled",
-    );
-    lines.push(
-      "Paseo run: Running",
-      `Started ${value(utc(started))}. Updated ${value(utc(latest))}.`,
-    );
-    if (permission?.kind === "permission_requested") lines.push("Now: waiting for permission");
-    lines.push(activity(events, value));
-    const step = steps.find(({ status }) => status === "running");
-    if (step?.startedAt != null) {
-      const position = steps.indexOf(step) + 1;
-      lines.push(
-        `Step ${value(position)} of ${value(steps.length)} running since ${value(utc(step.startedAt))}.`,
-      );
-    }
-  } else {
-    const finished = run.completedAt ?? started;
-    const elapsed = duration(started, finished);
-    if (run.status === "succeeded") lines.push(`Paseo run: Succeeded in ${value(elapsed)}`);
-    else if (run.status === "canceled")
-      lines.push(`Paseo run: stopped by a person after ${value(elapsed)}.`);
-    else {
-      const failure = failurePhrase(run.failureReason, run.status);
-      const status = run.status === "timed_out" ? "Timed out" : "Failed";
-      lines.push(
-        `Paseo run: ${value(status)} in ${value(elapsed)}: ${value(failure.phrase)} (${value(failure.code)}).`,
-      );
-    }
-    lines.push(`Finished ${value(utc(finished))}.`, activity(events, value));
-    const outcomes = [
-      ["succeeded", "succeeded"],
-      ["failed", "failed"],
-      ["timed_out", "timed out"],
-      ["canceled", "stopped"],
-      ["skipped", "skipped"],
-      ["pending", "not run"],
-    ] as const;
-    const counts = outcomes.flatMap(([status, label]) => {
-      const count = steps.filter(
-        (step) => step.status === status || (status === "pending" && step.status === "running"),
-      ).length;
-      return count ? [value(`${count} ${label}`)] : [];
-    });
-    lines.push(
-      `Steps: ${counts.length ? counts.join(", ") : "0 succeeded"} of ${value(steps.length)}.`,
-    );
-  }
-
+  const lines =
+    run.status === "running"
+      ? runningLines({ events, steps }, started, value)
+      : terminalLines({ run, events, steps }, started, value);
   const escape = (text: string) =>
     provider === "slack"
       ? text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -144,5 +163,6 @@ export function renderProgress(input: ProgressRenderInput): string {
     if (body.length + link.length + 1 <= maxBodyChars) return body + "\n" + link;
   }
   if (body.length <= maxBodyChars) return body;
-  return escape(lines[0]!).length <= maxBodyChars ? escape(lines[0]!) : "";
+  const [title = ""] = lines;
+  return escape(title).length <= maxBodyChars ? escape(title) : "";
 }

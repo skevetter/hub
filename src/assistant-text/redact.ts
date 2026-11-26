@@ -38,8 +38,7 @@ interface Carry {
 
 function armorMarker(text: string, offset: number, keyword: "BEGIN" | "END") {
   for (let start = text.indexOf("-", offset); start !== -1; start = text.indexOf("-", offset)) {
-    offset = start + 1;
-    while (text[offset] === "-") offset += 1;
+    offset = endOfDashes(text, start + 1);
     if (offset - start < 3) continue;
     while (/\s/u.test(text[offset] ?? "")) offset += 1;
     const end = offset + keyword.length;
@@ -47,6 +46,11 @@ function armorMarker(text: string, offset: number, keyword: "BEGIN" | "END") {
       return { start, end };
   }
   return undefined;
+}
+
+function endOfDashes(text: string, offset: number): number {
+  while (text[offset] === "-") offset += 1;
+  return offset;
 }
 
 function finishArmor(text: string, offset: number): number | undefined {
@@ -59,10 +63,7 @@ function finishArmor(text: string, offset: number): number | undefined {
     offset = footer.end;
     while (offset < text.length && text[offset] !== "\r" && text[offset] !== "\n") {
       dashes = text[offset++] === "-" ? dashes + 1 : 0;
-      if (dashes === 3) {
-        while (text[offset] === "-") offset += 1;
-        return offset;
-      }
+      if (dashes === 3) return endOfDashes(text, offset);
     }
   }
   return undefined;
@@ -98,9 +99,9 @@ function partialArmor(text: string, release: number, boundary: boolean): Span[] 
     let start = text.length - count;
     if (start < 0 || text.slice(start).toUpperCase() !== word.slice(0, count)) continue;
     while (/\s/u.test(text[start - 1] ?? "")) start -= 1;
-    const endOfDashes = start;
+    const dashEnd = start;
     while (text[start - 1] === "-") start -= 1;
-    if (endOfDashes - start < 3 || start >= release) continue;
+    if (dashEnd - start < 3 || start >= release) continue;
     return [
       {
         start,
@@ -126,7 +127,7 @@ function scanAuthority(
   while (text[start] === "/" || text[start] === "\\") start += 1;
   let end = start;
   let lastAt = start;
-  while (end < text.length && !AUTHORITY_END.test(text[end]!)) {
+  while (end < text.length && !AUTHORITY_END.test(text.charAt(end))) {
     if (text[end] === "@") lastAt = end + 1;
     if (text.startsWith("%40", end)) lastAt = end + 3;
     end += 1;
@@ -158,9 +159,10 @@ function matchedSpans(
   capture = false,
 ): Span[] {
   return [...text.matchAll(pattern)].map((match) => {
-    const end = match.index + match[0].length;
+    const [whole, group = whole] = match;
+    const end = match.index + whole.length;
     return {
-      start: end - match[capture ? 1 : 0]!.length,
+      start: end - (capture ? group : whole).length,
       end,
       open: end === text.length ? continuation : undefined,
     };
@@ -186,8 +188,8 @@ function entropySpans(text: string, assignments: readonly Span[]): Span[] {
   let index = 0;
   for (const match of text.matchAll(ENTROPY)) {
     const end = match.index + match[0].length;
-    while (assignments[index] && assignments[index]!.start <= match.index) index += 1;
-    const assignment = assignments[index];
+    let assignment = assignments[index];
+    while (assignment && assignment.start <= match.index) assignment = assignments[++index];
     const start = assignment && assignment.start < end ? assignment.start : match.index;
     if (highEntropy(text.slice(start, end)))
       spans.push({ start, end, open: end === text.length ? ENTROPY_SUFFIX : undefined });
@@ -198,10 +200,11 @@ function entropySpans(text: string, assignments: readonly Span[]): Span[] {
 function querySpans(text: string): Span[] {
   const spans: Span[] = [];
   for (const match of text.matchAll(QUERY_VALUE)) {
-    if (!SENSITIVE_QUERY.test(match[1]!)) continue;
-    const end = match.index + match[0].length;
+    const [whole, key = "", value = whole] = match;
+    if (!SENSITIVE_QUERY.test(key)) continue;
+    const end = match.index + whole.length;
     spans.push({
-      start: end - match[2]!.length,
+      start: end - value.length,
       end,
       open: end === text.length ? QUERY_SUFFIX : undefined,
     });
@@ -218,7 +221,7 @@ function prepareSecret(value: string): Secret {
   const fallback = [0];
   let match = 0;
   for (let index = 1; index < value.length; index += 1) {
-    while (match && value[index] !== value[match]) match = fallback[match - 1]!;
+    while (match && value[index] !== value[match]) match = fallback[match - 1] ?? 0;
     if (value[index] === value[match]) match += 1;
     fallback.push(match);
   }
@@ -228,19 +231,21 @@ function prepareSecret(value: string): Secret {
 function secretSuffix(text: string, { value, fallback }: Secret): number {
   let match = 0;
   for (let index = Math.max(0, text.length - value.length + 1); index < text.length; index += 1) {
-    while (match && text[index] !== value[match]) match = fallback[match - 1]!;
+    while (match && text[index] !== value[match]) match = fallback[match - 1] ?? 0;
     if (text[index] === value[match]) match += 1;
   }
   return match;
 }
 
-function knownSpans(
-  text: string,
-  secrets: readonly Secret[],
-  release: number,
-  partial: boolean,
-  boundary: boolean,
-): Span[] {
+interface SpanWindow {
+  release: number;
+  partial: boolean;
+  streaming: boolean;
+  carry?: Carry | undefined;
+}
+
+function knownSpans(text: string, secrets: readonly Secret[], window: SpanWindow): Span[] {
+  const { release, partial, streaming } = window;
   const spans: Span[] = [];
   for (const secret of secrets) {
     const { value } = secret;
@@ -254,8 +259,8 @@ function knownSpans(
         start,
         end: text.length,
         open: { value, offset: matched },
-        quiet: boundary,
-        markOnResume: boundary,
+        quiet: !streaming,
+        markOnResume: !streaming,
       });
   }
   return spans;
@@ -263,21 +268,52 @@ function knownSpans(
 
 function continueSpan(text: string, carry: Carry): Span {
   const { length, open, quiet } = carry;
-  if (open === "armor") {
-    const close = finishArmor(text, 0);
-    return {
-      start: 0,
-      end: close ?? text.length,
-      open: armorContinuation(close, text.length),
-      quiet,
-    };
-  }
+  if (open === "armor") return continueArmor(text, 0, quiet);
   if (open instanceof RegExp) {
-    const end = length + open.exec(text.slice(length))![0].length;
+    const suffix = text.slice(length);
+    const [matched] = open.exec(suffix) ?? [suffix];
+    const end = length + matched.length;
     return { start: 0, end, open: end === text.length ? open : undefined, quiet };
   }
   if (open === undefined) return { start: 0, end: length, quiet };
   return continueLiteral(text, length, open, quiet);
+}
+
+function continueArmor(text: string, offset: number, quiet: boolean): Span {
+  const close = finishArmor(text, offset);
+  return {
+    start: 0,
+    end: close ?? text.length,
+    open: armorContinuation(close, text.length),
+    quiet,
+  };
+}
+
+function literalMatchLength(
+  text: string,
+  length: number,
+  literal: Exclude<Continuation, RegExp | "armor">,
+): number {
+  let matched = 0;
+  for (
+    ;
+    length + matched < text.length && literal.offset + matched < literal.value.length;
+    matched += 1
+  ) {
+    const character = text[length + matched];
+    if (
+      (literal.armor ? uppercaseCharacter(character) : character) !==
+      literal.value[literal.offset + matched]
+    )
+      break;
+  }
+  return matched;
+}
+
+function uppercaseCharacter(character: string | undefined): string {
+  if (character === undefined)
+    throw new TypeError("Cannot read properties of undefined (reading 'toUpperCase')");
+  return character.toUpperCase();
 }
 
 function continueLiteral(
@@ -286,30 +322,11 @@ function continueLiteral(
   literal: Exclude<Continuation, RegExp | "armor">,
   quiet: boolean,
 ): Span {
-  let matched = 0;
-  for (
-    ;
-    length + matched < text.length && literal.offset + matched < literal.value.length;
-    matched += 1
-  ) {
-    const character = text[length + matched]!;
-    if (
-      (literal.armor ? character.toUpperCase() : character) !==
-      literal.value[literal.offset + matched]
-    )
-      break;
-  }
+  const matched = literalMatchLength(text, length, literal);
   const end = length + matched;
   const offset = literal.offset + matched;
-  if (literal.armor && offset === literal.value.length && !/[\w]/iu.test(text[end] ?? "")) {
-    const close = finishArmor(text, end);
-    return {
-      start: 0,
-      end: close ?? text.length,
-      open: armorContinuation(close, text.length),
-      quiet,
-    };
-  }
+  if (literal.armor && offset === literal.value.length && !/[\w]/iu.test(text[end] ?? ""))
+    return continueArmor(text, end, quiet);
   return {
     start: 0,
     end,
@@ -351,67 +368,82 @@ function project(parts: readonly string[], spans: readonly Span[]): string[] {
   });
 }
 
+function inspect(text: string, known: readonly Secret[], window: SpanWindow) {
+  const { release, streaming, partial, carry } = window;
+  const prior = carry && continueSpan(text, carry);
+  const armor = armorSpans(text, prior?.open === "armor" ? text.length : (prior?.end ?? 0));
+  const assigned = matchedSpans(text, ASSIGNMENT, ENTROPY_SUFFIX, true);
+  return mergedSpans([
+    ...(prior ? [prior] : []),
+    ...armor,
+    ...matchedSpans(text, PREFIX_TOKEN, TOKEN),
+    ...matchedSpans(text, JWT, JWT_SUFFIX),
+    ...matchedSpans(text, BEARER, BEARER_SUFFIX, true),
+    ...assigned,
+    ...entropySpans(text, assigned),
+    ...urlSpans(text, release, streaming),
+    ...querySpans(text),
+    ...knownSpans(text, known, window),
+    ...(partial ? partialArmor(text, release, !streaming) : []),
+  ]);
+}
+
+type StreamArguments = [
+  value: string,
+  parts: readonly string[],
+  length: number,
+  boundary: boolean,
+  final: boolean,
+];
+
+function openStream(known: readonly Secret[]) {
+  let carry: Carry | undefined;
+  return Object.defineProperty(
+    (...[value, parts, length, boundary, final]: StreamArguments) => {
+      if (length === 0) return parts.map(() => "");
+      const spans = inspect(value, known, {
+        release: length,
+        streaming: !boundary,
+        partial: !final,
+        carry,
+      });
+      const crossed = spans.find(
+        (span) =>
+          span.start < length &&
+          (span.end > length || (span.end === length && span.open !== undefined)),
+      );
+      carry =
+        crossed && !final
+          ? {
+              length: crossed.end - length,
+              open: crossed.open,
+              // A partial known value at a tool boundary only earns a marker on continuation.
+              quiet: !crossed.markOnResume,
+            }
+          : undefined;
+      return project(parts, spans);
+    },
+    "length",
+    { value: 5 },
+  );
+}
+
 export function createAssistantTextRedactor(values: readonly string[]) {
   const known = [...new Set(values.filter(Boolean))].map(prepareSecret);
-  function inspect(
-    text: string,
-    length: number,
-    streaming: boolean,
-    allowPartial: boolean,
-    carry?: Carry,
-  ) {
-    const prior = carry && continueSpan(text, carry);
-    const armor = armorSpans(text, prior?.open === "armor" ? text.length : (prior?.end ?? 0));
-    const assigned = matchedSpans(text, ASSIGNMENT, ENTROPY_SUFFIX, true);
-    return mergedSpans([
-      ...(prior ? [prior] : []),
-      ...armor,
-      ...matchedSpans(text, PREFIX_TOKEN, TOKEN),
-      ...matchedSpans(text, JWT, JWT_SUFFIX),
-      ...matchedSpans(text, BEARER, BEARER_SUFFIX, true),
-      ...assigned,
-      ...entropySpans(text, assigned),
-      ...urlSpans(text, length, streaming),
-      ...querySpans(text),
-      ...knownSpans(text, known, length, allowPartial, !streaming),
-      ...(allowPartial ? partialArmor(text, length, !streaming) : []),
-    ]);
-  }
   return {
     redact(parts: readonly string[], truncated: boolean) {
       const text = parts.join("");
-      const spans = inspect(text, text.length, false, truncated);
+      const spans = inspect(text, known, {
+        release: text.length,
+        streaming: false,
+        partial: truncated,
+      });
       // A known value that crosses the input limit is hidden as a span.
       for (const span of spans) span.quiet = false;
       return project(parts, spans);
     },
     open() {
-      let carry: Carry | undefined;
-      return (
-        value: string,
-        parts: readonly string[],
-        length: number,
-        boundary: boolean,
-        final: boolean,
-      ) => {
-        if (length === 0) return parts.map(() => "");
-        const spans = inspect(value, length, !boundary, !final, carry);
-        const crossed = spans.find(
-          (span) =>
-            span.start < length &&
-            (span.end > length || (span.end === length && span.open !== undefined)),
-        );
-        carry =
-          crossed && !final
-            ? {
-                length: crossed.end - length,
-                open: crossed.open,
-                // A partial known value at a tool boundary only earns a marker on continuation.
-                quiet: !crossed.markOnResume,
-              }
-            : undefined;
-        return project(parts, spans);
-      };
+      return openStream(known);
     },
   };
 }

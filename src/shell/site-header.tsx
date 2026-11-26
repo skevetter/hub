@@ -17,37 +17,56 @@ export function SiteHeader({
   scope,
   organizationSlug,
   project,
+  unavailable = false,
 }: {
   scope: string;
   organizationSlug: string;
   project?: string;
+  /** The URL names a place that did not resolve, so the signed-in organization is not where this is. */
+  unavailable?: boolean;
 }) {
-  const { breadcrumbs: trail } = usePageContext();
   return (
     <header className="sticky top-0 z-10 hidden shrink-0 items-center gap-2 bg-background px-4 max-md:static sm:flex md:h-12 md:border-b">
       <SidebarTrigger className="-ml-1 hidden md:inline-flex" />
       <Separator orientation="vertical" className="mr-1 hidden h-4 md:block" />
-      <nav
-        aria-label="Breadcrumb"
-        className="hidden min-w-0 items-center gap-1.5 overflow-hidden text-sm md:flex"
-      >
-        <CrumbLink
-          to={`/o/${organizationSlug}/home`}
-          className={cn(CRUMB_LINK, "text-muted-foreground")}
-        >
-          {scope}
-        </CrumbLink>
-        {project === undefined ? null : <Crumb context>{project}</Crumb>}
-        {trail.map((entry, index) => (
-          <TrailCrumb
-            key={`${entry.to}:${entry.label}`}
-            entry={entry}
-            current={index === trail.length - 1}
-          />
-        ))}
-      </nav>
+      {unavailable ? null : (
+        <HeaderTrail scope={scope} organizationSlug={organizationSlug} project={project} />
+      )}
       <SiteHeaderActionsTarget />
     </header>
+  );
+}
+
+function HeaderTrail({
+  scope,
+  organizationSlug,
+  project,
+}: {
+  scope: string;
+  organizationSlug: string;
+  project: string | undefined;
+}) {
+  const { breadcrumbs: trail } = usePageContext();
+  return (
+    <nav
+      aria-label="Breadcrumb"
+      className="hidden min-w-0 items-center gap-1.5 overflow-hidden text-sm md:flex"
+    >
+      <CrumbLink
+        to={`/o/${organizationSlug}/home`}
+        className={cn(CRUMB_LINK, "text-muted-foreground")}
+      >
+        {scope}
+      </CrumbLink>
+      {project === undefined ? null : <Crumb context>{project}</Crumb>}
+      {trail.map((entry, index) => (
+        <TrailCrumb
+          key={`${entry.to}:${entry.label}`}
+          entry={entry}
+          current={index === trail.length - 1}
+        />
+      ))}
+    </nav>
   );
 }
 

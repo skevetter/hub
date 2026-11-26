@@ -2,8 +2,6 @@ import { createHash } from "node:crypto";
 import { dump } from "js-yaml";
 import { compileHubBundle, type HubBundleFile } from "../../config/bundle.js";
 import type {
-  AuthoredAgentStep,
-  AuthoredStep,
   AuthoredTrigger,
   CompiledAgent,
   CompiledAgentSelection,
@@ -14,15 +12,29 @@ import type {
   CompiledTrigger,
   JsonPrimitive,
 } from "../../config/compiler.js";
-import { compileHubConfig, isScriptStep, parseCompiledHubConfig } from "../../config/compiler.js";
-import { parseTriggerDocument, TriggerDocumentError } from "./document.js";
+import {
+  compileHubConfig,
+  HubConfigurationCompilationError,
+  isScriptStep,
+  parseCompiledHubConfig,
+} from "../../config/compiler.js";
+import {
+  parseTriggerDocument,
+  TriggerDocumentError,
+  type TriggerDocumentIssue,
+} from "./document.js";
 import type { CompiledTriggerDocument } from "./index.js";
 import {
-  isScriptRun,
-  type TriggerAgentRun,
-  type TriggerDocument,
-  type TriggerScriptRun,
-} from "./schema.js";
+  authoredIssuePath,
+  authoredSteps,
+  continuationIssues,
+  defaultRunDeadline,
+  sharedNamedAgents,
+  withAutomaticReply,
+  withStepContinuation,
+} from "./compile-steps.js";
+import type { TriggerAgentRun, TriggerDocument, TriggerStep } from "./schema.js";
+import { normalizeSteps } from "./steps.js";
 
 export type MigratedLegacyTrigger =
   | {
@@ -304,16 +316,18 @@ function duration(milliseconds: number): string {
 
 export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
   const authored = parseTriggerDocument(yaml);
-  const run = authored.run;
-  const namedAgents = isScriptRun(run) || !("choices" in run.agent) ? undefined : run.agent.choices;
+  const normalized = normalizeSteps(authored);
+  const { target, steps } = normalized;
+  const namedAgents = sharedNamedAgents(steps);
   const environment = {
     name: "target",
     kind: "daemon" as const,
-    ...run.target,
+    ...target,
   };
-  const triggers = authoredEventTriggers(authored, run);
   let compiled: ReturnType<typeof compileHubConfig>;
+  let triggers: AuthoredTrigger[];
   try {
+    triggers = authoredEventTriggers(authored, steps);
     compiled = compileHubConfig(
       {
         environments: [environment],
@@ -323,31 +337,42 @@ export function compileTriggerDocument(yaml: string): CompiledTriggerDocument {
     );
   } catch (error) {
     throw new TriggerDocumentError([
-      { path: [], message: error instanceof Error ? error.message : "trigger compilation failed" },
+      {
+        path:
+          error instanceof HubConfigurationCompilationError
+            ? authoredIssuePath(authored, normalized, error.path)
+            : [],
+        message: error instanceof Error ? error.message : "trigger compilation failed",
+      },
     ]);
   }
   const compiledEnvironment = compiled.environments[0];
   if (compiledEnvironment === undefined) {
     throw new Error("compiled trigger target is missing");
   }
+  const events = compiled.triggers.map((trigger) =>
+    withAutomaticReply(withStepContinuation(trigger, steps)),
+  );
+  assertContinuations(events);
   return {
     authored,
     environment: compiledEnvironment,
-    events: compiled.triggers.map((trigger) =>
-      withAutomaticReply({
-        ...trigger,
-        steps: trigger.steps.map((step) =>
-          isScriptRun(run) ? step : { ...step, continuation: run.continuation },
-        ),
-      }),
-    ),
+    events,
     authoredHash: createHash("sha256").update(yaml).digest("hex"),
   };
 }
 
+function assertContinuations(events: readonly CompiledTrigger[]): void {
+  const issues = new Map<string, TriggerDocumentIssue>();
+  for (const issue of continuationIssues(events)) {
+    issues.set(`${issue.path.join(".")}:${issue.message}`, issue);
+  }
+  if (issues.size > 0) throw new TriggerDocumentError([...issues.values()]);
+}
+
 function authoredEventTriggers(
   authored: TriggerDocument,
-  run: TriggerDocument["run"],
+  steps: readonly TriggerStep[],
 ): AuthoredTrigger[] {
   const triggers: AuthoredTrigger[] = [];
   const events = Object.entries(authored.on);
@@ -361,84 +386,16 @@ function authoredEventTriggers(
     const compiledTrigger: AuthoredTrigger = {
       name: internalEventName(authored.name, index, named),
       on: event,
-      max_runtime: authored.max_runtime ?? run.max_runtime,
+      max_runtime: authored.max_runtime ?? defaultRunDeadline(steps),
       ...(authored.progress_message === true ? { progress_message: true } : {}),
       ...(authored.reply_message === true ? { reply_message: true } : {}),
       filters: compileEventFilters(event, definition),
-      steps: [isScriptRun(run) ? scriptStep(run) : agentStep(run)],
+      steps: authoredSteps(steps),
     };
     if (authored.inputs !== undefined) compiledTrigger.inputs = authored.inputs;
     triggers.push(compiledTrigger);
   }
   return triggers;
-}
-
-function scriptStep(run: TriggerScriptRun): AuthoredStep {
-  return { id: "run", environment: "target", max_runtime: run.max_runtime, script: run.script };
-}
-
-function agentStep(run: TriggerAgentRun): AuthoredAgentStep {
-  const allowOutputs = authoredOutputGrants(run.outputs);
-  return {
-    id: "run",
-    environment: "target",
-    max_runtime: run.max_runtime,
-    idle_timeout: run.idle_timeout,
-    ...(run.startup_timeout === undefined ? {} : { startup_timeout: run.startup_timeout }),
-    agent: "choices" in run.agent ? run.agent.select : run.agent,
-    ...(run.title === undefined ? {} : { title: run.title }),
-    prompt: [{ text: run.prompt }],
-    ...(run.env === undefined ? {} : { env: run.env }),
-    ...(run.github === undefined ? {} : { github: run.github }),
-    ...(run.output === undefined ? {} : { output: run.output }),
-    ...(allowOutputs.length === 0 ? {} : { allow_outputs: allowOutputs }),
-    auto_archive: run.auto_archive,
-    background: run.background,
-    ...(run.complete_on_turn_end === true ? { complete_on_turn_end: true } : {}),
-  };
-}
-
-function authoredOutputGrants(
-  outputs: TriggerAgentRun["outputs"],
-): NonNullable<AuthoredAgentStep["allow_outputs"]> {
-  const allowOutputs: NonNullable<AuthoredAgentStep["allow_outputs"]> = [];
-  for (const [type, output] of Object.entries(outputs ?? {})) {
-    const grant: NonNullable<AuthoredAgentStep["allow_outputs"]>[number] = { type };
-    if (output.max !== undefined) grant.max = output.max;
-    if (output.required !== undefined) grant.required = output.required;
-    allowOutputs.push(grant);
-  }
-  return allowOutputs;
-}
-
-function withAutomaticReply(trigger: CompiledTrigger): CompiledTrigger {
-  const replyType = automaticReplyType(trigger.on);
-  if (replyType === undefined) return trigger;
-  return {
-    ...trigger,
-    steps: trigger.steps.map((step) =>
-      isScriptStep(step)
-        ? step
-        : {
-            ...step,
-            allowOutputs: step.allowOutputs.some(({ type }) => type === replyType)
-              ? step.allowOutputs
-              : [...step.allowOutputs, { type: replyType, required: false }],
-          },
-    ),
-  };
-}
-
-function automaticReplyType(event: string): string | undefined {
-  // A notification has no installation to reply through.
-  if (event === "github.notification") return undefined;
-  const provider = event.split(".", 1)[0];
-  return provider === "slack" ||
-    provider === "discord" ||
-    provider === "linear" ||
-    provider === "github"
-    ? `${provider}.reply`
-    : undefined;
 }
 
 function compileEventFilters(

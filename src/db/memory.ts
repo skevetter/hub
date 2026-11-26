@@ -1,4 +1,14 @@
-import { FAILED_RUN_STATUSES, runStatusesFor } from "../triggers/run-status.js";
+import { chartDayKey } from "../home/runs-per-day.js";
+import {
+  countMatchesByProject,
+  triggerMatchActivity,
+  type MatchEvidence,
+} from "../home/trigger-matches.js";
+import {
+  DID_NOT_FINISH_STATUSES,
+  FAILED_RUN_STATUSES,
+  runStatusesFor,
+} from "../triggers/run-status.js";
 import { MemorySurfaceStore } from "../surfaces/memory-store.js";
 import {
   linearRoutesForConnection,
@@ -191,6 +201,8 @@ import type {
   OrganizationConnectionUsage,
   OrganizationRunRecord,
   TriggerRunSummary,
+  RunsDay,
+  TriggerMatchWindow,
   DroppedEventPageRequest,
   DroppedEventPresence,
   ProjectTriggerRoute,
@@ -6890,6 +6902,72 @@ class MemoryDatabase implements Database {
         tallyTriggerRun(summary, run, since);
     }
     return summaries;
+  }
+
+  listRunsPerDay: Database["listRunsPerDay"] = async (organizationId, since, until) => {
+    const days = new Map<string, RunsDay>();
+    for (const { id } of this.organizationRunOrder.get(organizationId) ?? []) {
+      const run = this.triggerRuns.get(id);
+      if (run === undefined || run.createdAt < since || run.createdAt >= until) continue;
+      const day = chartDayKey(run.createdAt);
+      const entry = days.get(day) ?? { day, total: 0, failed: 0 };
+      entry.total += 1;
+      if (DID_NOT_FINISH_STATUSES.has(run.status)) entry.failed += 1;
+      days.set(day, entry);
+    }
+    return [...days.values()].sort((a, b) => a.day.localeCompare(b.day));
+  };
+
+  listTriggerMatchActivity: Database["listTriggerMatchActivity"] = async (
+    organizationId,
+    window,
+  ) => {
+    const matches = countMatchesByProject(this.matchEvidence(organizationId), window);
+    const receipts = this.recentReceiptTotals(organizationId, window);
+    return Array.from(this.organizationTriggers.values())
+      .filter((trigger) => trigger.organizationId === organizationId && trigger.enabled)
+      .flatMap(({ id, name, runtimeProjectId, activeRevisionId }) => {
+        const configuration =
+          this.organizationTriggerRevisions.get(activeRevisionId)?.normalizedConfiguration;
+        const counts = matches.get(runtimeProjectId) ?? { previousMatches: 0, recentMatches: 0 };
+        return triggerMatchActivity({ id, name, configuration }, counts, receipts);
+      });
+  };
+
+  private *matchEvidence(organizationId: string): Generator<MatchEvidence> {
+    const runProjects = new Map<string, string[]>();
+    for (const { id } of this.organizationRunOrder.get(organizationId) ?? []) {
+      const run = this.triggerRuns.get(id);
+      if (run === undefined) continue;
+      runProjects.set(run.providerEventReceiptId, [
+        ...(runProjects.get(run.providerEventReceiptId) ?? []),
+        run.projectId,
+      ]);
+    }
+    for (const receipt of this.providerEventReceipts.values()) {
+      if (receipt.organizationId !== organizationId) continue;
+      yield {
+        provider: receipt.provider,
+        receivedAt: receipt.receivedAt,
+        droppedReason: receipt.droppedReason,
+        runProjects: runProjects.get(receipt.id) ?? [],
+        routedProjects: (receipt.acceptedRoutes ?? []).map(({ projectId }) => projectId),
+      };
+    }
+  }
+
+  private recentReceiptTotals(organizationId: string, window: TriggerMatchWindow) {
+    const totals = new Map<string, number>();
+    for (const {
+      organizationId: owner,
+      provider,
+      receivedAt,
+    } of this.providerEventReceipts.values()) {
+      if (owner !== organizationId || receivedAt < window.recentStart || receivedAt > window.now)
+        continue;
+      totals.set(provider, (totals.get(provider) ?? 0) + 1);
+    }
+    return totals;
   }
 
   async listOrganizationRunsSince(

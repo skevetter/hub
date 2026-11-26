@@ -7,6 +7,8 @@ import {
   patchTriggerYaml,
   projectTriggerForm,
   triggerFormErrors,
+  type TriggerFormValue,
+  type TriggerStepFormValue,
 } from "./editor.js";
 
 const AGENT_YAML = `# Keep this header.
@@ -28,6 +30,13 @@ function editable(yaml = AGENT_YAML) {
   return projection.value;
 }
 
+function withStep(value: TriggerFormValue, patch: Partial<TriggerStepFormValue>) {
+  return {
+    ...value,
+    steps: value.steps.map((step, index) => (index === 0 ? { ...step, ...patch } : step)),
+  };
+}
+
 test("retains explicit false flags in the form and strips them from unchanged YAML", () => {
   const yaml = `${AGENT_YAML}progress_message: false\nreply_message: false\n`;
   const value = editable(yaml);
@@ -42,24 +51,25 @@ test("updates agent settings and authority in their original YAML order", () => 
   const original = `${AGENT_YAML}  github: { connection: old } # Keep authority.\n`;
   const value = editable(original);
   const yaml = patchTriggerYaml(original, {
-    ...value,
+    ...withStep(value, {
+      agent: "pi/vendor/model",
+      mode: " safe ",
+      thinkingOptionId: " high ",
+      providerOptions: '{"temperature":0}',
+      continuationMode: "key",
+      continuationKey: "item",
+      maxRuntime: " 3h ",
+      idleTimeout: " 15m ",
+      completeOnTurnEnd: true,
+      githubConnection: " new ",
+      githubRepositories: "one/repo, two/repo",
+      githubPermissions: '{"issues":"write"}',
+      githubDuration: " 1h ",
+      prompt: "Review again.",
+    }),
     name: "new-check",
     enabled: true,
     daemon: "secondary",
-    agent: "pi/vendor/model",
-    mode: " safe ",
-    thinkingOptionId: " high ",
-    providerOptions: '{"temperature":0}',
-    continuationMode: "key",
-    continuationKey: "item",
-    maxRuntime: " 3h ",
-    idleTimeout: " 15m ",
-    completeOnTurnEnd: true,
-    githubConnection: " new ",
-    githubRepositories: "one/repo, two/repo",
-    githubPermissions: '{"issues":"write"}',
-    githubDuration: " 1h ",
-    prompt: "Review again.",
   });
   assert.equal(
     yaml,
@@ -83,20 +93,22 @@ run:
   complete_on_turn_end: true
 `,
   );
-  assert.equal(editable(yaml).githubPermissions, '{\n  "issues": "write"\n}');
+  assert.equal(editable(yaml).steps[0]?.githubPermissions, '{\n  "issues": "write"\n}');
 });
 
 test("replaces prompt-only fields on conversion to script and restores them on reversal", () => {
   const agent = { ...editable(), manualNoCallers: false, allowedUsers: "alice" };
-  const script = { ...agent, action: "script" as const, script: "echo ready" };
+  const script = withStep(agent, { action: "script", script: "echo ready" });
   const yaml = patchTriggerYaml(AGENT_YAML, script);
   assert.doesNotMatch(yaml, /agent:|prompt:|idle_timeout:/);
-  assert.equal(editable(yaml).script, "echo ready");
-  const edited = patchTriggerYaml(yaml, { ...editable(yaml), script: "echo again" });
-  assert.equal(editable(edited).script, "echo again");
+  assert.equal(editable(yaml).steps[0]?.script, "echo ready");
+  const edited = patchTriggerYaml(yaml, withStep(editable(yaml), { script: "echo again" }));
+  assert.equal(editable(edited).steps[0]?.script, "echo again");
   const restored = patchTriggerYaml(edited, agent);
   assert.doesNotMatch(restored, /script:/);
-  assert.equal(editable(restored).prompt, agent.prompt);
+  const [originalStep] = agent.steps;
+  assert.ok(originalStep);
+  assert.equal(editable(restored).steps[0]?.prompt, originalStep.prompt);
 });
 
 test("changes events without moving the named rule cleanup ahead of advanced filters", () => {
@@ -119,23 +131,24 @@ test("changes events without moving the named rule cleanup ahead of advanced fil
 
 test("preserves field error order for invalid drafts", () => {
   const value = {
-    ...editable(),
+    ...withStep(editable(), {
+      maxRuntime: "",
+      idleTimeout: "",
+      agent: "codex/",
+      mode: "",
+      providerOptions: "[]",
+      githubConnection: "github",
+      githubPermissions: "{",
+      continuationMode: "key",
+      continuationKey: "",
+      prompt: "",
+    }),
     name: "NOT-valid",
     event: "linear.issue_entered_scope" as const,
     progressMessage: true,
     replyMessage: true,
     daemon: " ",
     cwd: "relative",
-    maxRuntime: "",
-    idleTimeout: "",
-    agent: "codex/",
-    mode: "",
-    providerOptions: "[]",
-    githubConnection: "github",
-    githubPermissions: "{",
-    continuationMode: "key",
-    continuationKey: "",
-    prompt: "",
   };
   assert.deepEqual(Object.entries(triggerFormErrors(value)), [
     ["name", "Use lowercase letters, digits, and hyphens, starting with a letter."],
@@ -144,14 +157,14 @@ test("preserves field error order for invalid drafts", () => {
     ["qualifiers.project", "Project is required."],
     ["daemon", "Daemon is required."],
     ["cwd", "Working directory must be an absolute path."],
-    ["maxRuntime", "Maximum runtime is required."],
-    ["idleTimeout", "Idle timeout is required."],
-    ["agent", "Agent must look like provider/model."],
-    ["mode", "Execution mode is required."],
-    ["providerOptions", "Provider options must be a JSON object."],
-    ["githubPermissions", "GitHub permissions must be valid JSON."],
-    ["continuationKey", "Enter a continuation key or expression."],
-    ["prompt", "Instructions are required."],
+    ["steps.0.maxRuntime", "Maximum runtime is required."],
+    ["steps.0.idleTimeout", "Idle timeout is required."],
+    ["steps.0.agent", "Agent must look like provider/model."],
+    ["steps.0.mode", "Execution mode is required."],
+    ["steps.0.providerOptions", "Provider options must be a JSON object."],
+    ["steps.0.githubPermissions", "GitHub permissions must be valid JSON."],
+    ["steps.0.continuationKey", "Enter a continuation key or expression."],
+    ["steps.0.prompt", "Instructions are required."],
   ]);
   assert.throws(() => patchTriggerYaml(AGENT_YAML, value), {
     message: "Use lowercase letters, digits, and hyphens, starting with a letter.",

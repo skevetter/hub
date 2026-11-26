@@ -37,6 +37,32 @@ interface CredentialState {
   sequentialFailures: number;
 }
 
+function missingState(property: keyof CredentialState, action: "reading" | "setting"): TypeError {
+  const operation = action === "reading" ? "read" : "set";
+  return new TypeError(`Cannot ${operation} properties of undefined (${action} '${property}')`);
+}
+
+function readState(
+  state: CredentialState | undefined,
+  property: keyof CredentialState,
+): CredentialState {
+  if (state === undefined) throw missingState(property, "reading");
+  return state;
+}
+
+function writeState(
+  state: CredentialState | undefined,
+  property: "writeAfter" | "retryAfter" | "sequentialFailures",
+  value: number,
+): void {
+  if (state === undefined) throw missingState(property, "setting");
+  state[property] = value;
+}
+
+function retryAt(state: CredentialState, shared?: ProgressCredentialCooldown): number {
+  return Math.max(state.writeAfter, state.retryAfter, shared?.retryAt?.getTime() ?? 0);
+}
+
 export class CredentialBackoff {
   private readonly states = new Map<string, CredentialState>();
   private inFlight = 0;
@@ -58,7 +84,7 @@ export class CredentialBackoff {
     }
     if (Math.max(state.rejectedUntil, shared?.rejectedUntil?.getTime() ?? 0) > now)
       return { rejected: true };
-    const waitUntil = Math.max(state.writeAfter, state.retryAfter, shared?.retryAt?.getTime() ?? 0);
+    const waitUntil = retryAt(state, shared);
     if (waitUntil > now) return { waitUntil };
     if (state.busy || this.inFlight >= MAX_IN_FLIGHT) return { waitUntil: now + 250 };
 
@@ -73,7 +99,7 @@ export class CredentialBackoff {
   }
 
   sent(locator: CredentialLocator, now: number): void {
-    this.states.get(JSON.stringify(locator))!.writeAfter = now + WRITE_SPACING_MS;
+    writeState(this.states.get(JSON.stringify(locator)), "writeAfter", now + WRITE_SPACING_MS);
   }
 
   result(
@@ -82,20 +108,22 @@ export class CredentialBackoff {
     result: ProgressCall | "transient",
     reportRejected: () => void,
   ): number {
-    const state = this.states.get(JSON.stringify(locator))!;
+    const state = this.states.get(JSON.stringify(locator));
     if (result === "transient" || (result.status === "retry" && result.transient)) {
-      const base = Math.min(600_000, 30_000 * 2 ** state.sequentialFailures);
+      const current = readState(state, "sequentialFailures");
+      const base = Math.min(600_000, 30_000 * 2 ** current.sequentialFailures);
       const jitter = 0.8 + 0.4 * this.random();
-      state.sequentialFailures += 1;
-      state.retryAfter = now + Math.min(600_000, Math.round(base * jitter));
+      current.sequentialFailures += 1;
+      current.retryAfter = now + Math.min(600_000, Math.round(base * jitter));
     } else if (result.status === "retry") {
-      state.retryAfter = now + clampRetryAfter(result.afterMs);
+      writeState(state, "retryAfter", now + clampRetryAfter(result.afterMs));
     } else if (result.status === "unavailable" && result.code === "credential_rejected") {
-      if (state.rejectedUntil <= now) reportRejected();
-      state.rejectedUntil = now + CREDENTIAL_CIRCUIT_MS;
+      const current = readState(state, "rejectedUntil");
+      if (current.rejectedUntil <= now) reportRejected();
+      current.rejectedUntil = now + CREDENTIAL_CIRCUIT_MS;
     } else if (result.status === "ok") {
-      state.sequentialFailures = 0;
+      writeState(state, "sequentialFailures", 0);
     }
-    return state.retryAfter;
+    return readState(state, "retryAfter").retryAfter;
   }
 }

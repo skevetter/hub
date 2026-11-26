@@ -41,26 +41,7 @@ function rejectsWithoutValue(environment: Record<string, string>, variable: stri
   );
 }
 
-describe("run progress settings", () => {
-  it("defaults to disabled capture, streams and reporters with retention enabled", () => {
-    assert.deepEqual(readRunProgressSettings({}), {
-      runTimelineEnabled: false,
-      runStreamEnabled: false,
-      progressMessagesEnabled: false,
-      githubOrgs: {},
-      publicRepos: "refuse",
-      timelineMaxEvents: 500,
-      retentionDays: 30,
-      minEditSeconds: 20,
-      maxEdits: 120,
-      streamMaxPerKey: 5,
-      streamMaxPerOrg: 20,
-      streamMaxTotal: 200,
-      streamHeartbeatSeconds: 15,
-      streamMaxSeconds: 3600,
-    });
-  });
-
+function registerIntegerTests(): void {
   for (const [variable, property, fallback, min, max] of integerSettings) {
     for (const value of [undefined, "", "   "]) {
       it(`keeps the default for ${JSON.stringify(value)}`, () => {
@@ -97,7 +78,9 @@ describe("run progress settings", () => {
       });
     }
   }
+}
 
+function registerBooleanTests(): void {
   for (const [variable, property] of booleanSettings) {
     for (const value of [undefined, "", "false"]) {
       it(`disables for ${JSON.stringify(value)}`, () => {
@@ -129,6 +112,31 @@ describe("run progress settings", () => {
       });
     }
   }
+}
+
+describe("run progress settings", () => {
+  it("defaults to disabled capture, streams and reporters with retention enabled", () => {
+    assert.deepEqual(readRunProgressSettings({}), {
+      runTimelineEnabled: false,
+      runStreamEnabled: false,
+      progressMessagesEnabled: false,
+      githubOrgs: {},
+      publicRepos: "refuse",
+      timelineMaxEvents: 500,
+      retentionDays: 30,
+      minEditSeconds: 20,
+      maxEdits: 120,
+      streamMaxPerKey: 5,
+      streamMaxPerOrg: 20,
+      streamMaxTotal: 200,
+      streamHeartbeatSeconds: 15,
+      streamMaxSeconds: 3600,
+    });
+  });
+
+  registerIntegerTests();
+
+  registerBooleanTests();
 
   for (const variable of ["PASEO_HUB_RUN_STREAM", "PASEO_HUB_PROGRESS_MESSAGES"]) {
     for (const timeline of [undefined, "", "false"]) {

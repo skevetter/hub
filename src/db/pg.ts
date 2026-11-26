@@ -1,5 +1,7 @@
 import { organizationConnectionUsage } from "./connection-usage.js";
 import { ACTIVE_TRIGGER_REVISIONS_SQL, summarizeTriggerRuns } from "../home/queries.js";
+import { listRunsPerDay } from "../home/runs-per-day.js";
+import { listTriggerMatchActivity } from "../home/trigger-matches.js";
 import { runStatusesFor } from "../triggers/run-status.js";
 import { SurfaceRepository } from "../surfaces/postgres-store.js";
 import {
@@ -4416,6 +4418,11 @@ class PgDatabase implements Database {
 
   summarizeTriggerRuns: Database["summarizeTriggerRuns"] = (...args) =>
     summarizeTriggerRuns(this.pool, ...args);
+
+  listRunsPerDay: Database["listRunsPerDay"] = (...args) => listRunsPerDay(this.pool, ...args);
+
+  listTriggerMatchActivity: Database["listTriggerMatchActivity"] = (...args) =>
+    listTriggerMatchActivity(this.pool, ...args);
 
   listDroppedEventPage(organizationId: string, request: DroppedEventPageRequest) {
     return readDroppedEventPage(this.pool, organizationId, request);
