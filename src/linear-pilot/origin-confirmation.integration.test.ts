@@ -15,6 +15,7 @@ import { logger } from "../logger.js";
 import { createLinearRegistration } from "../providers/linear/index.js";
 import { prepareProfile, surfaceTenant } from "../surfaces/store.contract.js";
 import type { LinearPilotConfig } from "./config.js";
+import { pilotActivityIds } from "./activities.js";
 import { originActivityId } from "./origin-activities.js";
 import { DELEGATION_CONFIRM_TTL_MS } from "./origin-confirmation.js";
 import { createLinearPilotRuntime } from "./runtime.js";
@@ -97,6 +98,7 @@ function prompted(
   scope: ProviderScope,
   options: {
     activityId?: string;
+    body?: string;
     actor?: string | null;
     issueId?: string;
     sessionId?: string;
@@ -116,7 +118,7 @@ function prompted(
       userId: actor,
       user: actor === null ? null : { id: actor },
       agentSessionId: signed.sessionId,
-      content: { type: "prompt", body: startText },
+      content: { type: "prompt", body: options.body ?? startText },
       signal: null,
     },
   };
@@ -193,9 +195,56 @@ function replyIssueResponse(scope: ProviderScope, scenario: Scenario) {
   });
 }
 
+interface HistoryRow {
+  id: string;
+  createdAt: string;
+  type: "prompt" | "response";
+  body: string;
+}
+
+const typenames = {
+  prompt: "AgentActivityPromptContent",
+  response: "AgentActivityResponseContent",
+} as const;
+
+function historyResponse(
+  scope: ProviderScope,
+  rows: HistoryRow[],
+  variables: Record<string, unknown>,
+) {
+  const { activityId, before } = variables;
+  const selected =
+    typeof activityId === "string"
+      ? rows.filter((row) => row.id === activityId)
+      : rows
+          .filter((row) => typeof before === "string" && row.createdAt < before)
+          .toSorted((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const owner = { id: scope.humanId };
+  const nodes = selected.map(({ id, createdAt, type, body }) => ({
+    id,
+    createdAt,
+    agentSession: { id: scope.sessionId },
+    user: type === "prompt" ? owner : { id: scope.appUserId },
+    promptAuthor: type === "prompt" ? owner : null,
+    signal: null,
+    content: { __typename: typenames[type], type, body },
+  }));
+  return Response.json({
+    data: {
+      agentSession: {
+        id: scope.sessionId,
+        issue: { id: scope.issueId },
+        appUser: { id: scope.appUserId },
+        activities: { nodes, pageInfo: { hasNextPage: false, hasPreviousPage: false } },
+      },
+    },
+  });
+}
+
 function originProvider(scope: ProviderScope, scenario: Scenario, failErrorWrites: boolean) {
   const writes: { id: string; type: string; body: string }[] = [];
   const reads: string[] = [];
+  const rows: HistoryRow[] = [];
   const send: typeof fetch = async (_url, options) => {
     assert(typeof options?.body === "string");
     const { query, variables } = providerRequest.parse(JSON.parse(options.body));
@@ -223,6 +272,8 @@ function originProvider(scope: ProviderScope, scenario: Scenario, failErrorWrite
       expect(query).toMatch(/\bdelegate\s*\{\s*id\s*\}/u);
       return replyIssueResponse(scope, scenario);
     }
+    if (query.includes("PaseoPilotPrompt") || query.includes("PaseoPilotHistory"))
+      return historyResponse(scope, rows, variables);
     assert.match(query, /PaseoAgentActivityCreate/u);
     const { input } = variables;
     assert(input);
@@ -242,7 +293,7 @@ function originProvider(scope: ProviderScope, scenario: Scenario, failErrorWrite
       },
     });
   };
-  return { writes, reads, send };
+  return { writes, reads, rows, send };
 }
 
 async function insertTenant(runtime: QueryHandle, tenant: ReturnType<typeof surfaceTenant>) {
@@ -362,6 +413,12 @@ async function fixture(scenario: Scenario, failErrorWrites: boolean) {
       ...provider,
       open,
       close,
+      async forgetConfirmingActivity() {
+        await runtime.query(
+          "update provider_event_receipts set payload = '{}'::jsonb where organization_id = $1 and dropped_reason = 'linear_pilot_owner_confirmed'",
+          [tenant.organizationId],
+        );
+      },
       async claims(reason: string) {
         return (
           await runtime.query(
@@ -409,24 +466,28 @@ async function runTest(
   }
 }
 
-async function expectOneShot(endpoint: Endpoint, scope: ProviderScope, reply: JsonObject) {
+function reusedCount(info: { mock: { calls: unknown[][] } }) {
+  return info.mock.calls.filter(
+    ([fields]) =>
+      typeof fields === "object" &&
+      fields !== null &&
+      "reason" in fields &&
+      fields.reason === "origin_reused",
+  ).length;
+}
+
+async function expectReused(endpoint: Endpoint, payloads: JsonObject[]) {
   const info = vi.spyOn(logger, "info");
   try {
-    await endpoint.deliver(reply);
-    await endpoint.deliver(prompted(scope));
-    await vi.waitFor(() => {
-      const reused = info.mock.calls.filter(
-        ([fields]) =>
-          typeof fields === "object" &&
-          fields !== null &&
-          "reason" in fields &&
-          fields.reason === "origin_reused",
-      );
-      expect(reused).toHaveLength(2);
-    });
+    for (const payload of payloads) await endpoint.deliver(payload);
+    await vi.waitFor(() => expect(reusedCount(info)).toBe(payloads.length));
   } finally {
     info.mockRestore();
   }
+}
+
+async function expectOneShot(endpoint: Endpoint, scope: ProviderScope, reply: JsonObject) {
+  await expectReused(endpoint, [reply, prompted(scope)]);
 }
 
 it("owner reply starts exactly once after restart and delegation never calls the history read", async () => {
@@ -441,7 +502,7 @@ it("owner reply starts exactly once after restart and delegation never calls the
       expect(test.agents.sends[0]?.text).toBe(
         "Work on TEST-1: Fresh title\n\nFresh description.\n\n" + startText,
       );
-      await expectOneShot(restarted, test.scope, reply);
+      await expectReused(restarted, [reply]);
       expect(await test.claims(started)).toBe(1);
       expect(test.agents.sends).toHaveLength(1);
       expect(test.reads).toEqual(["confirmation", "issue"]);
@@ -637,6 +698,120 @@ it.each([
   },
   25_000,
 );
+
+const followUpText = "Thanks. Reply with one word: done.";
+
+function completeFirstTurn(agents: FakeAgents) {
+  const send = agents.sends.at(0);
+  assert(send);
+  const turnId = "origin-first-turn";
+  agents.emit(
+    send.agentId,
+    {
+      type: "timeline",
+      provider: "codex",
+      turnId,
+      item: { type: "assistant_message", text: "Synthetic final answer", messageId: "answer" },
+    },
+    { epoch: turnId, seq: 2 },
+  );
+  agents.emit(send.agentId, { type: "turn_completed", provider: "codex", turnId });
+}
+
+function at(seconds: number) {
+  return new Date(Date.UTC(2026, 10, 26, 4, 50, seconds)).toISOString();
+}
+
+async function startAndAnswer(test: Fixture, endpoint: Endpoint, confirmingId: string) {
+  const { scope } = test;
+  await elicit(test, endpoint);
+  await endpoint.deliver(prompted(scope, { activityId: confirmingId }));
+  await vi.waitFor(() => expect(test.agents.sends).toHaveLength(1));
+  completeFirstTurn(test.agents);
+  const answerId = pilotActivityIds(scope.sessionId, scope.sessionId).response;
+  await vi.waitFor(() => expect(test.writes.map(({ id }) => id)).toContain(answerId));
+  test.rows.push(
+    { id: confirmingId, createdAt: at(1), type: "prompt", body: startText },
+    { id: answerId, createdAt: at(3), type: "response", body: "Synthetic final answer" },
+  );
+}
+
+function followUp(test: Fixture, activityId: string) {
+  test.rows.push({ id: activityId, createdAt: at(30), type: "prompt", body: followUpText });
+  return prompted(test.scope, { activityId, body: followUpText });
+}
+
+it("delivers a later owner reply after the confirmed start as a normal follow-up", async () => {
+  await runTest("ok", async (test, endpoint) => {
+    await startAndAnswer(test, endpoint, randomUUID());
+    const info = vi.spyOn(logger, "info");
+    try {
+      await endpoint.deliver(followUp(test, randomUUID()));
+      await vi.waitFor(() => expect(test.agents.sends).toHaveLength(2), { timeout: 5_000 });
+      expect(test.agents.creations).toHaveLength(2);
+      expect(test.agents.sends[1]?.text).toContain(followUpText);
+      expect(test.agents.sends[1]?.text).toContain("Synthetic final answer");
+      expect(reusedCount(info)).toBe(0);
+      expect(await test.claims(started)).toBe(1);
+      expect(await test.claims(waiting)).toBe(1);
+    } finally {
+      info.mockRestore();
+    }
+  });
+}, 25_000);
+
+it("refuses a replay of the confirming reply after the start and after a follow-up", async () => {
+  await runTest("ok", async (test, endpoint) => {
+    const confirmingId = randomUUID();
+    await startAndAnswer(test, endpoint, confirmingId);
+    await expectReused(endpoint, [prompted(test.scope, { activityId: confirmingId })]);
+    expect(test.agents.sends).toHaveLength(1);
+    await endpoint.deliver(followUp(test, randomUUID()));
+    await vi.waitFor(() => expect(test.agents.sends).toHaveLength(2), { timeout: 5_000 });
+    await expectReused(endpoint, [
+      prompted(test.scope, { activityId: confirmingId.toUpperCase() }),
+    ]);
+    expect(test.agents.sends).toHaveLength(2);
+    expect(test.agents.creations).toHaveLength(2);
+    expect(await test.claims(started)).toBe(1);
+  });
+}, 25_000);
+
+it("keeps refusing non-owner replies after the confirmed start", async () => {
+  await runTest("ok", async (test, endpoint) => {
+    const confirmingId = randomUUID();
+    await startAndAnswer(test, endpoint, confirmingId);
+    const writes = test.writes.length;
+    for (const actor of ["other", test.scope.appUserId, null])
+      await endpoint.deliver(prompted(test.scope, { actor, body: followUpText }));
+    await expectReused(endpoint, [prompted(test.scope, { activityId: confirmingId })]);
+    expect(test.agents.sends).toHaveLength(1);
+    expect(test.agents.creations).toHaveLength(1);
+    expect(test.writes).toHaveLength(writes);
+  });
+}, 25_000);
+
+it("keeps the old refusal when the claim has no recorded confirming reply", async () => {
+  await runTest("ok", async (test, endpoint) => {
+    await startAndAnswer(test, endpoint, randomUUID());
+    await test.forgetConfirmingActivity();
+    await expectReused(endpoint, [followUp(test, randomUUID())]);
+    expect(test.agents.sends).toHaveLength(1);
+    expect(test.agents.creations).toHaveLength(1);
+  });
+}, 25_000);
+
+it("never reaches the follow-up path when the delegate was removed before the reply", async () => {
+  await runTest("delegate removed", async (test, endpoint) => {
+    await elicit(test, endpoint);
+    await endpoint.deliver(prompted(test.scope));
+    await vi.waitFor(() => expect(test.writes).toHaveLength(2));
+    await expectReused(endpoint, [followUp(test, randomUUID())]);
+    expect(test.writes.map(({ type }) => type)).toEqual(["elicitation", "error"]);
+    expect(test.agents.creations).toHaveLength(0);
+    expect(await test.claims(started)).toBe(1);
+  });
+}, 25_000);
 
 it("refuses a missing signed creator without readback or waiting claim", async () => {
   await runTest("ok", async (test, endpoint) => {
