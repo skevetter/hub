@@ -241,8 +241,10 @@ function finishRun(
   input: ScriptRunInput,
 ): ScriptRunResult {
   if (thrown instanceof ScriptRunAborted) throw new ScriptRunAborted(stopped ? null : target);
-  // A transport can reject with any value. Preserve that reason for the caller.
-  if (thrown !== undefined) AbortSignal.abort(thrown).throwIfAborted();
+  if (thrown instanceof Error) throw thrown;
+  if (thrown !== undefined) {
+    throw new Error("Script run failed with a non-Error value", { cause: thrown });
+  }
   const result = outcome ?? refused(new Error("script run ended without an outcome"), input.cwd);
   return stopped ? result : { ...result, cleanup: target };
 }
