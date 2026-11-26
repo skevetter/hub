@@ -200,6 +200,45 @@ test.each(["agent_request_key_conflict", "agent_request_outcome_unknown"])(
   },
 );
 
+test("rejects a legacy create failure without treating its code as an RPC error code", async () => {
+  const agents = new DaemonAgents((frame) => {
+    const { message } = z
+      .object({ message: z.object({ requestId: z.string() }) })
+      .parse(JSON.parse(frame));
+    agents.receive({
+      type: "session",
+      message: {
+        type: "status",
+        payload: {
+          requestId: message.requestId,
+          status: "agent_create_failed",
+          code: "legacy_code",
+        },
+      },
+    });
+  });
+  enable(agents);
+  const error = await agents.create("key", options).catch((failure: unknown) => failure);
+  expect(error).toBeInstanceOf(DaemonAgentError);
+  expect(error).toMatchObject({ message: "Daemon request rejected", code: undefined });
+});
+
+test.each(["agent_stream", "agent_update"])(
+  "consumes a malformed %s without notifying watchers",
+  async (type) => {
+    const agents = connect([]);
+    const listener = vi.fn<(event: AgentEvent) => void>();
+    const unwatch = await agents.watch("agent", listener);
+    listener.mockClear();
+    expect(
+      agents.receive({ type: "session", message: { type, payload: { kind: "upsert" } } }),
+    ).toBe(true);
+    expect(listener).not.toHaveBeenCalled();
+    unwatch();
+    agents.close();
+  },
+);
+
 test("a lost send acknowledgement rejects with DaemonResponseLostError", async () => {
   vi.useFakeTimers();
   const sendFrame = vi.fn<(frame: string) => void>();

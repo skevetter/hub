@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   AgentStreamMessageSchema,
-  AgentTimelineCursorSchema,
+  type AgentTimelineCursorSchema,
   AgentTimelineEntryPayloadSchema,
   FetchAgentTimelineResponseMessageSchema,
 } from "@getpaseo/protocol/messages";
@@ -90,7 +90,7 @@ const EnvelopeSchema = z.object({
 });
 const ResultSchema = z
   .object({ error: z.string().nullable().optional(), accepted: z.boolean().optional() })
-  .passthrough();
+  .loose();
 
 export class DaemonAgentError extends Error {
   constructor(
@@ -134,18 +134,15 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
     const requestId = payload["requestId"];
     const pending = typeof requestId === "string" ? this.pending.get(requestId) : undefined;
     if (pending) {
-      if (type === "rpc_error" || payload["status"] === "agent_create_failed") {
-        pending.reject(
-          new DaemonAgentError(
-            z.string().catch("Daemon request rejected").parse(payload["error"]),
-            type === "rpc_error" && typeof payload["code"] === "string"
-              ? payload["code"]
-              : undefined,
-          ),
-        );
-      } else pending.resolve(payload);
+      const error = responseError(type, payload);
+      if (error === undefined) pending.resolve(payload);
+      else pending.reject(error);
       return true;
     }
+    return this.receiveEvent(type, payload);
+  }
+
+  private receiveEvent(type: string, payload: Record<string, unknown>): boolean {
     if (type === "agent_update" && payload["kind"] === "upsert") {
       const agent = SnapshotSchema.safeParse(payload["agent"]);
       if (agent.success)
@@ -290,9 +287,7 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
   ): Promise<() => void> {
     this.assertOpen();
     if (authorize && !(await authorize())) throw new DaemonFrameNotSentError();
-    const listeners = this.listeners.get(agentId) ?? new Set();
-    listeners.add(listener);
-    this.listeners.set(agentId, listeners);
+    const unsubscribe = this.addListener(agentId, listener);
     try {
       if (!this.observing) {
         await this.request({
@@ -314,28 +309,43 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
       try {
         const response = await this.request({ type: "fetch_agent_request", agentId });
         this.assertOpen();
-        const agent = SnapshotSchema.safeParse(response["agent"]);
-        if (agent.success && agent.data.id === agentId)
-          listener({
-            type: "agent_snapshot",
-            agent: agent.data,
-            timestamp: this.now().toISOString(),
-          });
+        this.deliverSnapshot(agentId, response, listener);
       } catch (error) {
-        if (this.closed || error instanceof DaemonResponseLostError) throw error;
-        // Snapshot reads are best effort; older daemons keep their live subscription usable.
-        this.reportFailure(error, "daemon.agent.watch.snapshot");
+        this.handleSnapshotFailure(error);
       }
     } catch (error) {
-      listeners.delete(listener);
-      if (listeners.size === 0) this.listeners.delete(agentId);
+      unsubscribe();
       throw error;
     }
     this.assertOpen();
+    return unsubscribe;
+  }
+  private addListener(agentId: string, listener: (event: AgentEvent) => void): () => void {
+    const listeners = this.listeners.get(agentId) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(agentId, listeners);
     return () => {
       listeners.delete(listener);
       if (listeners.size === 0) this.listeners.delete(agentId);
     };
+  }
+  private deliverSnapshot(
+    agentId: string,
+    response: Record<string, unknown>,
+    listener: (event: AgentEvent) => void,
+  ): void {
+    const agent = SnapshotSchema.safeParse(response["agent"]);
+    if (agent.success && agent.data.id === agentId)
+      listener({
+        type: "agent_snapshot",
+        agent: agent.data,
+        timestamp: this.now().toISOString(),
+      });
+  }
+  private handleSnapshotFailure(error: unknown): void {
+    if (this.closed || error instanceof DaemonResponseLostError) throw error;
+    // Snapshot reads are best effort; older daemons keep their live subscription usable.
+    this.reportFailure(error, "daemon.agent.watch.snapshot");
   }
   private emit(agentId: string, event: AgentEvent): void {
     for (const listener of this.listeners.get(agentId) ?? []) listener(event);
@@ -368,4 +378,15 @@ export class DaemonAgents implements AgentConnection, AgentHistory {
       this.pending.delete(requestId);
     }
   }
+}
+
+function responseError(
+  type: string,
+  payload: Record<string, unknown>,
+): DaemonAgentError | undefined {
+  if (type !== "rpc_error" && payload["status"] !== "agent_create_failed") return undefined;
+  return new DaemonAgentError(
+    z.string().catch("Daemon request rejected").parse(payload["error"]),
+    type === "rpc_error" && typeof payload["code"] === "string" ? payload["code"] : undefined,
+  );
 }
