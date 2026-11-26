@@ -6283,7 +6283,9 @@ class MemoryDatabase implements Database {
     return Array.from(this.organizationTriggers.values()).flatMap((trigger) => {
       if (trigger.organizationId !== organizationId) return [];
       const revision = this.organizationTriggerRevisions.get(trigger.activeRevisionId);
-      return revision?.triggerId === trigger.id ? [revision] : [];
+      return revision?.triggerId === trigger.id && revision.organizationId === organizationId
+        ? [revision]
+        : [];
     });
   }
 
