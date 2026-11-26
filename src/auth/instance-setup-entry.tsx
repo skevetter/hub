@@ -1,10 +1,9 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useState, type SyntheticEvent } from "react";
 import { AuthCard, AuthLayout } from "../components/app/auth-layout.js";
-import { AuthForm } from "../components/app/auth-form.js";
+import { AuthForm, AuthActions } from "../components/app/auth-form.js";
 import { failureMessage } from "../components/app/failure-alert.js";
-import { AuthActions } from "../components/app/auth-form.js";
 import { Button } from "../components/ui/button.js";
 import { formValue } from "./account-actions.js";
 import { ErrorSummary } from "./account-states.js";
@@ -39,7 +38,7 @@ export function InstanceSetupEntry() {
     setAccountRequested(false);
   }, [claim]);
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       const data = new FormData(event.currentTarget);
       claim.mutate({
@@ -98,7 +97,7 @@ function AccountSetupForm({
 }: {
   busy: boolean;
   message: string | undefined;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (event: SyntheticEvent<HTMLFormElement>) => void;
   onBack: () => void;
 }) {
   return (

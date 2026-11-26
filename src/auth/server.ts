@@ -1,5 +1,5 @@
 import type { WebhookSigningSettings } from "./webhook-signatures.js";
-import { betterAuth } from "better-auth";
+import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { tanstackStartCookies } from "better-auth/tanstack-start";
 import { z } from "zod";
@@ -113,7 +113,7 @@ const sessionSchema = z.object({
       userId: z.string(),
       activeOrganizationId: z.string().nullable().optional(),
     })
-    .passthrough(),
+    .loose(),
   user: z
     .object({
       id: z.string(),
@@ -122,7 +122,7 @@ const sessionSchema = z.object({
       mustChangePassword: z.boolean().optional(),
       isInstanceOperator: z.boolean().optional(),
     })
-    .passthrough(),
+    .loose(),
 });
 
 const RAW_PRODUCT_PATHS = new Set([
@@ -150,6 +150,51 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
   });
   const appOnboarding = new InstanceAppOnboarding(options.database);
   const accountMailer = options.accountMailer;
+  const auth = createAuthApi(options, database, accountMailer);
+  const sessions = createSessionReader(auth);
+  const access = new OrganizationAccess({
+    pool: options.database,
+    locks: options.locks,
+    sessions,
+    baseURL: options.baseURL,
+    policy,
+    apiKeys,
+    cliCredentials,
+    entitlements: options.entitlements,
+    instanceSetup,
+    appOnboarding,
+    provisioningEntitlements,
+    ...(options.onMembershipChanged === undefined
+      ? {}
+      : { onMembershipChanged: options.onMembershipChanged }),
+    ...(options.invitationMailer === undefined
+      ? {}
+      : { invitationMailer: options.invitationMailer }),
+  });
+  const browserOrigin = new URL(options.baseURL).origin;
+  const requestContext = { options, auth, access, registration, browserOrigin, sessions };
+
+  return {
+    ...createAuthRequestHandlers(requestContext),
+    ...createAuthEmailActions({ ...requestContext, accountMailer }),
+    ...createAuthLifecycleActions({ ...requestContext, instanceSetup, appOnboarding }),
+    ...createAuthAccessActions(access, browserOrigin),
+    initialize: async () => {
+      await apiKeys.signing.checkReadiness();
+      await instanceSetup.initializeFromPolicy();
+    },
+    apiKeys,
+    cliCredentials,
+    publicCredentials,
+    close: () => Promise.resolve(),
+  };
+}
+
+function createAuthApi(
+  options: AuthServerOptions,
+  database: ReturnType<DatabaseRuntime["drizzle"]>,
+  accountMailer: AccountMailer | undefined,
+) {
   const authSchema = {
     user: schema.users,
     session: schema.sessions,
@@ -159,7 +204,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
     member: schema.members,
     invitation: schema.invitations,
   };
-  const auth = betterAuth({
+  return betterAuth({
     baseURL: options.baseURL,
     secret: options.secret,
     ...(options.trustedClientIpHeader === undefined
@@ -172,25 +217,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
           },
         }),
     database: drizzleAdapter(database, { provider: "pg", schema: authSchema }),
-    emailAndPassword: {
-      enabled: true,
-      minPasswordLength: PASSWORD_MIN_LENGTH,
-      requireEmailVerification: accountMailer !== undefined,
-      revokeSessionsOnPasswordReset: true,
-      ...(accountMailer === undefined
-        ? {}
-        : { sendResetPassword: (email) => accountMailer.sendPasswordReset(email) }),
-    },
-    ...(accountMailer === undefined
-      ? {}
-      : {
-          emailVerification: {
-            autoSignInAfterVerification: true,
-            sendOnSignIn: true,
-            sendVerificationEmail: (email: Parameters<AccountMailer["sendVerificationEmail"]>[0]) =>
-              accountMailer.sendVerificationEmail(email),
-          },
-        }),
+    ...authEmailOptions(accountMailer),
     user: {
       additionalFields: {
         mustChangePassword: {
@@ -212,7 +239,36 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
     },
     plugins: [paseoOrganizationPlugin(), tanstackStartCookies()],
   });
-  const sessions = {
+}
+
+function authEmailOptions(accountMailer: AccountMailer | undefined) {
+  return {
+    emailAndPassword: {
+      enabled: true,
+      minPasswordLength: PASSWORD_MIN_LENGTH,
+      requireEmailVerification: accountMailer !== undefined,
+      revokeSessionsOnPasswordReset: true,
+      ...(accountMailer === undefined
+        ? {}
+        : { sendResetPassword: (email) => accountMailer.sendPasswordReset(email) }),
+    },
+    ...(accountMailer === undefined
+      ? {}
+      : {
+          emailVerification: {
+            autoSignInAfterVerification: true,
+            sendOnSignIn: true,
+            sendVerificationEmail: (email: Parameters<AccountMailer["sendVerificationEmail"]>[0]) =>
+              accountMailer.sendVerificationEmail(email),
+          },
+        }),
+  } satisfies Pick<BetterAuthOptions, "emailAndPassword" | "emailVerification">;
+}
+
+type AuthApi = ReturnType<typeof createAuthApi>;
+
+function createSessionReader(auth: AuthApi) {
+  return {
     async read(headers: Headers): Promise<AccountSession | undefined> {
       const value = await auth.api.getSession({ headers });
       const parsed = sessionSchema.safeParse(value);
@@ -228,27 +284,21 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
       };
     },
   };
-  const access = new OrganizationAccess({
-    pool: options.database,
-    locks: options.locks,
-    sessions,
-    baseURL: options.baseURL,
-    policy,
-    apiKeys,
-    cliCredentials,
-    entitlements: options.entitlements,
-    instanceSetup,
-    appOnboarding,
-    provisioningEntitlements,
-    ...(options.onMembershipChanged === undefined
-      ? {}
-      : { onMembershipChanged: options.onMembershipChanged }),
-    ...(options.invitationMailer === undefined
-      ? {}
-      : { invitationMailer: options.invitationMailer }),
-  });
-  const browserOrigin = new URL(options.baseURL).origin;
+}
 
+interface AuthRequestContext {
+  options: AuthServerOptions;
+  auth: AuthApi;
+  access: OrganizationAccess;
+  registration: RegistrationAdmission;
+  browserOrigin: string;
+  sessions: ReturnType<typeof createSessionReader>;
+}
+
+function createAuthRequestHandlers(
+  context: AuthRequestContext,
+): Pick<AuthServer, "handle" | "browserAccount"> {
+  const { auth, access, registration, browserOrigin } = context;
   return {
     handle(request) {
       const path = new URL(request.url).pathname;
@@ -257,8 +307,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
           request,
           requestBrowserOrigin(request, browserOrigin),
         );
-        if (rejected !== undefined) return Promise.resolve(rejected);
-        return access.handle(request);
+        return rejected !== undefined ? Promise.resolve(rejected) : access.handle(request);
       }
       if (path === "/api/auth/sign-up/email") {
         return registration
@@ -270,18 +319,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
             throw error;
           });
       }
-      if (path === "/api/auth/change-password") {
-        const rejected = rejectCrossOriginCookieMutation(
-          request,
-          requestBrowserOrigin(request, browserOrigin),
-        );
-        if (rejected !== undefined) return Promise.resolve(rejected);
-        return changePassword(request);
-      }
-      if (!RAW_PRODUCT_PATHS.has(path) && !path.startsWith("/api/auth/reset-password/")) {
-        return Promise.resolve(Response.json({ error: "not_found" }, { status: 404 }));
-      }
-      return auth.handler(request);
+      return handleRawAuthRequest(request, path, context);
     },
     browserAccount: (request) => {
       const path = new URL(request.url).pathname;
@@ -296,10 +334,73 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
           requestBrowserOrigin(request, browserOrigin),
         );
         if (rejected !== undefined) return Promise.resolve(rejected);
-        if (path === "/api/auth/change-password") return changePassword(request);
+        if (path === "/api/auth/change-password") return changeRawPassword(request, context);
       }
       return access.handle(request);
     },
+  };
+}
+
+function handleRawAuthRequest(
+  request: Request,
+  path: string,
+  context: AuthRequestContext,
+): Promise<Response> {
+  const { auth, browserOrigin } = context;
+  if (path === "/api/auth/change-password") {
+    const rejected = rejectCrossOriginCookieMutation(
+      request,
+      requestBrowserOrigin(request, browserOrigin),
+    );
+    return rejected !== undefined ? Promise.resolve(rejected) : changeRawPassword(request, context);
+  }
+  if (!RAW_PRODUCT_PATHS.has(path) && !path.startsWith("/api/auth/reset-password/")) {
+    return Promise.resolve(Response.json({ error: "not_found" }, { status: 404 }));
+  }
+  return auth.handler(request);
+}
+
+async function changeRawPassword(
+  request: Request,
+  { auth, options, sessions }: AuthRequestContext,
+): Promise<Response> {
+  const session = await sessions.read(request.headers);
+  const body = await request
+    .clone()
+    .json()
+    .then((value: unknown) => value)
+    .catch(() => undefined);
+  const response =
+    typeof body === "object" && body !== null
+      ? await auth.handler(
+          new Request(request.url, {
+            method: "POST",
+            headers: request.headers,
+            body: JSON.stringify({ ...body, revokeOtherSessions: true }),
+          }),
+        )
+      : await auth.handler(request);
+  if (response.ok && session !== undefined) {
+    await options.database.query(`update "user" set must_change_password = false where id = $1`, [
+      session.userId,
+    ]);
+  }
+  return response;
+}
+
+function createAuthEmailActions({
+  options,
+  auth,
+  registration,
+  browserOrigin,
+  accountMailer,
+}: Pick<AuthRequestContext, "options" | "auth" | "registration" | "browserOrigin"> & {
+  accountMailer: AccountMailer | undefined;
+}): Pick<
+  AuthServer,
+  "signInEmail" | "signUpEmail" | "sendVerificationEmail" | "requestPasswordReset" | "resetPassword"
+> {
+  return {
     async signInEmail(data, headers) {
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       await auth.api.signInEmail({
@@ -340,6 +441,22 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       await auth.api.resetPassword({ body: data, headers });
     },
+  };
+}
+
+function createAuthLifecycleActions({
+  options,
+  auth,
+  access,
+  browserOrigin,
+  sessions,
+  instanceSetup,
+  appOnboarding,
+}: Omit<AuthRequestContext, "registration"> & {
+  instanceSetup: InstanceSetup;
+  appOnboarding: InstanceAppOnboarding;
+}): Pick<AuthServer, "claimInstance" | "completeAppOnboarding" | "signOut" | "changePassword"> {
+  return {
     async claimInstance(operator, headers) {
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       const claim = await instanceSetup.claim(operator);
@@ -380,6 +497,17 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
         [session.userId],
       );
     },
+  };
+}
+
+function createAuthAccessActions(
+  access: OrganizationAccess,
+  browserOrigin: string,
+): Pick<
+  AuthServer,
+  "resources" | "resolveOrganizationAccess" | "resolveAccount" | "rejectCookieMutation"
+> {
+  return {
     async resources(request, organizations) {
       return access.resources(request, organizations);
     },
@@ -391,40 +519,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
         requestBrowserOrigin(request, browserOrigin),
         originPolicy,
       ),
-    initialize: async () => {
-      await apiKeys.signing.checkReadiness();
-      await instanceSetup.initializeFromPolicy();
-    },
-    apiKeys,
-    cliCredentials,
-    publicCredentials,
-    close: () => Promise.resolve(),
   };
-
-  async function changePassword(request: Request): Promise<Response> {
-    const session = await sessions.read(request.headers);
-    const body = await request
-      .clone()
-      .json()
-      .then((value: unknown) => value)
-      .catch(() => undefined);
-    const response =
-      typeof body === "object" && body !== null
-        ? await auth.handler(
-            new Request(request.url, {
-              method: "POST",
-              headers: request.headers,
-              body: JSON.stringify({ ...body, revokeOtherSessions: true }),
-            }),
-          )
-        : await auth.handler(request);
-    if (response.ok && session !== undefined) {
-      await options.database.query(`update "user" set must_change_password = false where id = $1`, [
-        session.userId,
-      ]);
-    }
-    return response;
-  }
 }
 
 function requestBrowserOrigin(request: Request, fallback: string): string {
@@ -485,6 +580,14 @@ function rejectCrossOriginCookieMutation(
       "CROSS_SITE_NAVIGATION_LOGIN_BLOCKED",
     );
   }
+  return rejectInvalidCookieMutationOrigin(request, browserOrigin, requireOrigin);
+}
+
+function rejectInvalidCookieMutationOrigin(
+  request: Request,
+  browserOrigin: string,
+  requireOrigin: boolean,
+): Response | undefined {
   const origin = request.headers.get("origin");
   const suppliedOrigin = requireOrigin ? origin : (origin ?? request.headers.get("referer"));
   if (suppliedOrigin === null || suppliedOrigin === "null") {
