@@ -115,7 +115,7 @@ it("reports a failed ack send, closes the socket, and reconnects", async () => {
     const error = new Error("send failed");
     socket.ackError = error;
     await connect(source);
-    emitFrame(socket, { type: "interactive", envelope_id: "ack-failure" });
+    emitFrame(socket, { type: "interactive", envelope_id: "ack-failure", payload: {} });
     await vi.advanceTimersByTimeAsync(0);
 
     expect(socket.send).toHaveBeenCalledOnce();
@@ -194,7 +194,7 @@ it("passes a non-validation intake error to handoff failure handling and closes 
 it("does not ack binary, oversized, or disconnect frames", async () => {
   await withTransport(async ({ accept, source, socket, report }) => {
     await connect(source);
-    emitFrame(socket, { type: "interactive", envelope_id: "binary" }, true);
+    emitFrame(socket, { type: "interactive", envelope_id: "binary", payload: {} }, true);
     emitFrame(socket, {
       type: "interactive",
       envelope_id: "oversized",
