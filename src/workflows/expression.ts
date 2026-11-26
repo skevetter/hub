@@ -64,108 +64,120 @@ const TOKEN =
   /\s*(?:(true|false|null)|(-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)|("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|([a-z][a-z0-9_-]*)|(!=|==|&&|\|\||\?\?|!)|(\.)|(\()|(\))|(\[)|(\])|(\{)|(\})|(,)|(:)|(.))/gy;
 
 export function parseExpression(source: string): Expression {
-  const text = unwrapExpression(source);
-  const tokens = tokenize(text);
-  let index = 0;
-  const parse = (minimumPrecedence = 0): Expression => {
-    let left = parsePrefix();
+  return new ExpressionParser(tokenize(unwrapExpression(source))).read();
+}
+
+class ExpressionParser {
+  private index = 0;
+
+  constructor(private readonly tokens: readonly Token[]) {}
+
+  read(): Expression {
+    const result = this.parse();
+    if (this.tokens[this.index]?.kind !== "end") {
+      throw new ExpressionSyntaxError("unexpected token");
+    }
+    return result;
+  }
+
+  private parse(minimumPrecedence = 0): Expression {
+    let left = this.parsePrefix();
     while (true) {
-      const token = tokens[index];
+      const token = this.tokens[this.index];
       if (token?.kind !== "operator") break;
       if (token.value === "!") break;
-      const operator = token.value as BinaryOperator;
+      const operator = token.value;
       const precedence = operatorPrecedence(operator);
       if (precedence < minimumPrecedence) break;
-      index += 1;
-      const right = parse(precedence + 1);
+      this.index += 1;
+      const right = this.parse(precedence + 1);
       left = { kind: "binary", operator, left, right };
     }
     return left;
-  };
+  }
 
-  const parsePrefix = (): Expression => {
-    const token = tokens[index++];
-    if (token === undefined) throw new ExpressionSyntaxError("expression ended unexpectedly");
+  private parsePrefix(): Expression {
+    const token = this.readToken();
     if (token.kind === "literal") return { kind: "literal", value: token.value };
     if (token.kind === "operator" && token.value === "!") {
-      return { kind: "not", value: parsePrefix() };
+      return { kind: "not", value: this.parsePrefix() };
     }
     if (token.kind === "left") {
-      const value = parse();
-      if (tokens[index]?.kind !== "right") throw new ExpressionSyntaxError("missing ')'");
-      index += 1;
+      const value = this.parse();
+      if (this.tokens[this.index]?.kind !== "right") throw new ExpressionSyntaxError("missing ')'");
+      this.index += 1;
       return value;
     }
-    if (token.kind === "array-left") return parseArrayLiteral();
-    if (token.kind === "object-left") return parseObjectLiteral();
+    if (token.kind === "array-left") return this.parseArrayLiteral();
+    if (token.kind === "object-left") return this.parseObjectLiteral();
     if (token.kind !== "identifier") throw new ExpressionSyntaxError("expected a value");
-    return parsePath(token.value);
-  };
+    return pathExpression(this.readPathParts(token.value));
+  }
 
-  const result = parse();
-  if (tokens[index]?.kind !== "end") throw new ExpressionSyntaxError("unexpected token");
-  return result;
+  private readToken(): Token {
+    const token = this.tokens[this.index++];
+    if (token === undefined) throw new ExpressionSyntaxError("expression ended unexpectedly");
+    return token;
+  }
 
-  function parsePath(first: string): Expression {
+  private readPathParts(first: string): string[] {
     const parts = [first];
-    while (tokens[index]?.kind === "dot") {
-      index += 1;
-      const next = tokens[index++];
+    while (this.tokens[this.index]?.kind === "dot") {
+      this.index += 1;
+      const next = this.tokens[this.index++];
       if (next?.kind !== "identifier") throw new ExpressionSyntaxError("expected path segment");
       parts.push(next.value);
     }
-    if (parts[0] === "paseo") return parsePaseoPath(parts);
-    if (parts[0] === "steps" && parts.length >= 4 && parts[2] === "outputs") {
-      return {
-        kind: "path",
-        value: { namespace: "steps", stepId: parts[1]!, path: parts.slice(3) },
-      };
-    }
-    if (parts[0] === "values" && parts.length === 2) {
-      return { kind: "path", value: { namespace: "values", name: parts[1]! } };
-    }
-    throw new ExpressionSyntaxError(`unsupported path ${parts.join(".")}`);
+    return parts;
   }
 
-  function parseArrayLiteral(): Expression {
+  private parseArrayLiteral(): Expression {
     const values: JsonValue[] = [];
-    if (tokens[index]?.kind === "array-right") {
-      index += 1;
+    if (this.tokens[this.index]?.kind === "array-right") {
+      this.index += 1;
       return { kind: "literal", value: values };
     }
     while (true) {
-      values.push(readJsonLiteral());
-      const separator = tokens[index++];
+      values.push(this.readJsonLiteral());
+      const separator = this.tokens[this.index++];
       if (separator?.kind === "array-right") break;
       if (separator?.kind !== "comma") throw new ExpressionSyntaxError("expected ',' or ']'");
-      if (tokens[index]?.kind === "array-right") throw new ExpressionSyntaxError("trailing comma");
+      if (this.tokens[this.index]?.kind === "array-right")
+        throw new ExpressionSyntaxError("trailing comma");
     }
     return { kind: "literal", value: values };
   }
 
-  function parseObjectLiteral(): Expression {
+  private parseObjectLiteral(): Expression {
     const value: Record<string, JsonValue> = {};
-    if (tokens[index]?.kind === "object-right") {
-      index += 1;
+    if (this.tokens[this.index]?.kind === "object-right") {
+      this.index += 1;
       return { kind: "literal", value };
     }
     while (true) {
-      const key = tokens[index++];
-      if (key?.kind !== "literal" || typeof key.value !== "string") {
-        throw new ExpressionSyntaxError("object keys must be strings");
-      }
-      if (tokens[index++]?.kind !== "colon") throw new ExpressionSyntaxError("expected ':'");
-      value[key.value] = readJsonLiteral();
-      const separator = tokens[index++];
+      const key = this.readObjectKey();
+      value[key] = this.readJsonLiteral();
+      const separator = this.tokens[this.index++];
       if (separator?.kind === "object-right") break;
       if (separator?.kind !== "comma") throw new ExpressionSyntaxError("expected ',' or '}'");
-      if (tokens[index]?.kind === "object-right") throw new ExpressionSyntaxError("trailing comma");
+      if (this.tokens[this.index]?.kind === "object-right")
+        throw new ExpressionSyntaxError("trailing comma");
     }
     return { kind: "literal", value };
   }
 
-  function readJsonLiteral(): JsonValue {
-    const expression = parsePrefix();
+  private readObjectKey(): string {
+    const key = this.tokens[this.index++];
+    if (key?.kind !== "literal" || typeof key.value !== "string") {
+      throw new ExpressionSyntaxError("object keys must be strings");
+    }
+    if (this.tokens[this.index++]?.kind !== "colon")
+      throw new ExpressionSyntaxError("expected ':'");
+    return key.value;
+  }
+
+  private readJsonLiteral(): JsonValue {
+    const expression = this.parsePrefix();
     if (expression.kind !== "literal") {
       throw new ExpressionSyntaxError("JSON literals cannot contain paths or operators");
     }
@@ -173,18 +185,35 @@ export function parseExpression(source: string): Expression {
   }
 }
 
+function pathExpression(parts: readonly string[]): Expression {
+  const [namespace, name, field] = parts;
+  if (namespace === "paseo") return parsePaseoPath(parts);
+  if (namespace === "steps" && parts.length >= 4 && field === "outputs" && name !== undefined) {
+    return {
+      kind: "path",
+      value: { namespace: "steps", stepId: name, path: parts.slice(3) },
+    };
+  }
+  if (namespace === "values" && parts.length === 2 && name !== undefined) {
+    return { kind: "path", value: { namespace: "values", name } };
+  }
+  throw new ExpressionSyntaxError(`unsupported path ${parts.join(".")}`);
+}
+
 function parsePaseoPath(parts: readonly string[]): Expression {
-  if (parts[1] === "prompt" && parts.length === 2) {
-    return { kind: "path", value: { namespace: "paseo", path: "prompt" } };
+  const [, member, key] = parts;
+  if (parts.length === 2) {
+    if (member === "prompt") return { kind: "path", value: { namespace: "paseo", path: "prompt" } };
+    if (member === "context")
+      return { kind: "path", value: { namespace: "paseo", path: "context" } };
   }
-  if (parts[1] === "context" && parts.length === 2) {
-    return { kind: "path", value: { namespace: "paseo", path: "context" } };
-  }
-  if (parts[1] === "inputs" && parts.length === 3) {
-    return { kind: "path", value: { namespace: "paseo", path: ["inputs", parts[2]!] } };
-  }
-  if (parts[1] === "execution" && parts[2] === "id" && parts.length === 3) {
-    return { kind: "path", value: { namespace: "paseo", path: ["execution", "id"] } };
+  if (parts.length === 3) {
+    if (member === "inputs" && key !== undefined) {
+      return { kind: "path", value: { namespace: "paseo", path: ["inputs", key] } };
+    }
+    if (member === "execution" && key === "id") {
+      return { kind: "path", value: { namespace: "paseo", path: ["execution", "id"] } };
+    }
   }
   throw new ExpressionSyntaxError(`unsupported path ${parts.join(".")}`);
 }
@@ -213,18 +242,26 @@ export function evaluateExpression(expression: Expression, context: ExpressionCo
       return !truthy(evaluateExpression(expression.value, context));
     case "binary": {
       const left = evaluateExpression(expression.left, context);
-      if (expression.operator === "&&")
-        return truthy(left) ? evaluateExpression(expression.right, context) : left;
-      if (expression.operator === "||")
-        return truthy(left) ? left : evaluateExpression(expression.right, context);
-      if (expression.operator === "??")
-        return left === null ? evaluateExpression(expression.right, context) : left;
+      const selection = selectBinaryResult(expression, left);
+      if (selection === "left") return left;
       const right = evaluateExpression(expression.right, context);
-      if (expression.operator === "==") return sameJsonValue(left, right);
-      return !sameJsonValue(left, right);
+      if (selection === "right") return right;
+      return expression.operator === "=="
+        ? sameJsonValue(left, right)
+        : !sameJsonValue(left, right);
     }
   }
   throw new Error("unreachable expression node");
+}
+
+function selectBinaryResult(
+  expression: Extract<Expression, { kind: "binary" }>,
+  left: JsonValue,
+): "left" | "right" | "compare" {
+  if (expression.operator === "&&") return truthy(left) ? "right" : "left";
+  if (expression.operator === "||") return truthy(left) ? "left" : "right";
+  if (expression.operator === "??") return left === null ? "right" : "left";
+  return "compare";
 }
 
 export function renderExpressionTemplate(template: string, context: ExpressionContext): string {
@@ -300,25 +337,16 @@ function tokenize(source: string): Token[] {
 }
 
 function tokenFromMatch(match: RegExpExecArray): Token | undefined {
-  const [
-    raw,
-    word,
-    number,
-    string,
-    identifier,
-    operator,
-    dot,
-    left,
-    right,
-    arrayLeft,
-    arrayRight,
-    objectLeft,
-    objectRight,
-    comma,
-    colon,
-    other,
-  ] = match;
+  const [raw, , , , , , , , , , , , , , , other] = match;
   if (other !== undefined) throw new ExpressionSyntaxError(`unexpected token ${other}`);
+  const token = scalarToken(match) ?? punctuationToken(match);
+  if (token !== undefined) return token;
+  if (raw.trim() === "") return undefined;
+  throw new ExpressionSyntaxError("unexpected token");
+}
+
+function scalarToken(match: RegExpExecArray): Token | undefined {
+  const [, word, number, string, identifier, operator] = match;
   if (word !== undefined) {
     let value: JsonValue = null;
     if (word === "true") value = true;
@@ -329,6 +357,27 @@ function tokenFromMatch(match: RegExpExecArray): Token | undefined {
   if (string !== undefined) return { kind: "literal", value: parseStringLiteral(string) };
   if (identifier !== undefined) return { kind: "identifier", value: identifier };
   if (operator !== undefined && isOperator(operator)) return { kind: "operator", value: operator };
+  return undefined;
+}
+
+function punctuationToken(match: RegExpExecArray): Token | undefined {
+  const [
+    ,
+    ,
+    ,
+    ,
+    ,
+    ,
+    dot,
+    left,
+    right,
+    arrayLeft,
+    arrayRight,
+    objectLeft,
+    objectRight,
+    comma,
+    colon,
+  ] = match;
   if (dot !== undefined) return { kind: "dot" };
   if (left !== undefined) return { kind: "left" };
   if (right !== undefined) return { kind: "right" };
@@ -338,8 +387,7 @@ function tokenFromMatch(match: RegExpExecArray): Token | undefined {
   if (objectRight !== undefined) return { kind: "object-right" };
   if (comma !== undefined) return { kind: "comma" };
   if (colon !== undefined) return { kind: "colon" };
-  if (raw.trim() === "") return undefined;
-  throw new ExpressionSyntaxError("unexpected token");
+  return undefined;
 }
 
 function parseStringLiteral(value: string): string {
@@ -377,23 +425,20 @@ function operatorPrecedence(operator: BinaryOperator): number {
 }
 
 function readPath(path: ExpressionPath, context: ExpressionContext): JsonValue {
-  if (path.namespace === "paseo") {
-    if (path.path === "prompt") return context.prompt;
-    if (path.path === "context") return context.context;
-    if (path.path[0] === "execution") {
-      if (context.executionId === undefined) {
-        throw new ExpressionEvaluationError("execution ID is unavailable");
-      }
-      return context.executionId;
-    }
-    return context.inputs[path.path[1]] ?? null;
-  }
+  if (path.namespace === "paseo") return readPaseoPath(path.path, context);
   if (path.namespace === "values") {
     const expression = context.values[path.name];
     if (expression === undefined)
       throw new ExpressionEvaluationError(`value ${path.name} is unavailable`);
     return evaluateExpression(expression, context);
   }
+  return readStepOutput(path, context);
+}
+
+function readStepOutput(
+  path: Extract<ExpressionPath, { namespace: "steps" }>,
+  context: ExpressionContext,
+): JsonValue {
   const step = context.steps[path.stepId];
   if (step === undefined || step.status !== "succeeded") {
     throw new ExpressionEvaluationError(`output from step ${path.stepId} is unavailable`);
@@ -409,6 +454,21 @@ function readPath(path: ExpressionPath, context: ExpressionContext): JsonValue {
   }
   if (!isJsonValue(value)) throw new ExpressionEvaluationError("output contains a non-JSON value");
   return value;
+}
+
+function readPaseoPath(
+  path: Extract<ExpressionPath, { namespace: "paseo" }>["path"],
+  context: ExpressionContext,
+): JsonValue {
+  if (path === "prompt") return context.prompt;
+  if (path === "context") return context.context;
+  if (path[0] === "execution") {
+    if (context.executionId === undefined) {
+      throw new ExpressionEvaluationError("execution ID is unavailable");
+    }
+    return context.executionId;
+  }
+  return context.inputs[path[1]] ?? null;
 }
 
 function truthy(value: JsonValue): boolean {
