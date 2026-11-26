@@ -12,7 +12,7 @@ import {
   withReference,
 } from "../failures/index.js";
 import { INTERNAL_CLIENT_ADDRESS_HEADER } from "./client-address.js";
-import { takeResponseLifecycle } from "./response-lifecycle.js";
+import { takeResponseLifecycle, type ResponseLifecycle } from "./response-lifecycle.js";
 import { TRUSTED_REQUEST_ORIGIN_HEADER } from "./request-origin.js";
 import { HttpRequestDrain } from "./request-drain.js";
 import { problem, requestIdentifier } from "../public-api/problem.js";
@@ -134,29 +134,9 @@ async function forwardRequest(
     const { response } = tracked;
     const lifecycle = takeResponseLifecycle(response);
     let responseForwarded = false;
-    let lifecycleSettled = false;
-    const reportLifecycleFailure = (error: unknown): void => {
-      reportFailure(
-        error,
-        { operation: "http.response.lifecycle", component: "http", method: request.method },
-        options.logger === undefined ? {} : { logger: options.logger },
-      );
-    };
-    const runLifecycle = (callback: (() => void | Promise<void>) | undefined): void => {
-      if (callback === undefined || lifecycleSettled) return;
-      lifecycleSettled = true;
-      try {
-        void Promise.resolve(callback()).catch(reportLifecycleFailure);
-      } catch (error) {
-        reportLifecycleFailure(error);
-      }
-    };
-    const abortLifecycle = (): void => {
-      if (lifecycle === undefined) return;
-      runLifecycle(lifecycle.onAbort);
-    };
+    const ownership = trackResponseLifecycle({ lifecycle, outgoing, request, options });
     if (outgoing.writableEnded || outgoing.destroyed) {
-      abortLifecycle();
+      ownership.abort();
       void response.body?.cancel().catch((error: unknown) => {
         reportFailure(
           error,
@@ -166,80 +146,138 @@ async function forwardRequest(
       });
       return;
     }
-    let responseRequestId: string | undefined;
-    if (response.status >= 400 && !tracked.failureReported) {
-      const requestId = response.headers.get("x-request-id");
-      responseRequestId = reportFailure(
-        new Error(`HTTP response completed with status ${response.status}`),
-        {
-          operation: "http.response",
-          component: "http",
-          method: request.method,
-          path: new URL(request.url).pathname,
-          status: response.status,
-          ...(requestId === null ? {} : { requestId }),
-        },
-        {
-          status: response.status,
-          ...(options.logger === undefined ? {} : { logger: options.logger }),
-        },
-      ).requestId;
-    }
-    if (lifecycle !== undefined) {
-      const removeLifecycleListeners = () => {
-        outgoing.off("finish", finishLifecycle);
-        outgoing.off("close", markResponseAborted);
-        outgoing.off("error", markResponseAborted);
-      };
-      const finishLifecycle = () => {
-        removeLifecycleListeners();
-        if (!responseForwarded) abortLifecycle();
-        else runLifecycle(lifecycle.onFinish);
-      };
-      const markResponseAborted = () => {
-        removeLifecycleListeners();
-        if (outgoing.writableFinished) return;
+    const responseRequestId = responseFailureReference(request, tracked, options);
+    ownership.listen(
+      () => responseForwarded,
+      () => {
         responseForwarded = false;
-        abortLifecycle();
-      };
-      outgoing.once("finish", finishLifecycle);
-      outgoing.once("close", markResponseAborted);
-      outgoing.once("error", markResponseAborted);
-    }
-    outgoing.statusCode = response.status;
-    outgoing.statusMessage = response.statusText;
-    for (const [name, value] of response.headers) outgoing.setHeader(name, value);
-    if (responseRequestId !== undefined) outgoing.setHeader("x-request-id", responseRequestId);
-    const cookies = response.headers.getSetCookie();
-    if (cookies.length > 0) outgoing.setHeader("set-cookie", cookies);
-    if (response.headers.get("content-type")?.startsWith("text/event-stream"))
-      outgoing.removeHeader("connection");
-    else if (!outgoing.shouldKeepAlive) outgoing.setHeader("connection", "close");
+      },
+    );
+    writeResponseHeaders(response, outgoing, responseRequestId);
     if (response.body === null) {
       responseForwarded = true;
       outgoing.end();
       return;
     }
-    responseForwarded = await forwardResponseBody(
-      response.body,
+    responseForwarded = await forwardResponseBody({
+      body: response.body,
       outgoing,
-      request.method,
-      options.logger ?? defaultLogger,
-      lifecycle !== undefined,
-    );
+      method: request.method,
+      logger: options.logger ?? defaultLogger,
+      boundedStall: lifecycle !== undefined,
+    });
     if (responseForwarded) outgoing.end();
   } catch (error) {
     respondToRequestFailure(error, incoming, outgoing, options.logger ?? defaultLogger);
   }
 }
 
-async function forwardResponseBody(
-  body: ReadableStream<Uint8Array>,
+function trackResponseLifecycle(context: {
+  lifecycle: ResponseLifecycle | undefined;
+  outgoing: ServerResponse;
+  request: Request;
+  options: FetchServerOptions;
+}) {
+  const { lifecycle, outgoing, request, options } = context;
+  let lifecycleSettled = false;
+  const reportLifecycleFailure = (error: unknown): void => {
+    reportFailure(
+      error,
+      { operation: "http.response.lifecycle", component: "http", method: request.method },
+      options.logger === undefined ? {} : { logger: options.logger },
+    );
+  };
+  const runLifecycle = (callback: (() => void | Promise<void>) | undefined): void => {
+    if (callback === undefined || lifecycleSettled) return;
+    lifecycleSettled = true;
+    try {
+      void Promise.resolve(callback()).catch(reportLifecycleFailure);
+    } catch (error) {
+      reportLifecycleFailure(error);
+    }
+  };
+  const abortLifecycle = (): void => {
+    if (lifecycle === undefined) return;
+    runLifecycle(lifecycle.onAbort);
+  };
+  const listen = (isForwarded: () => boolean, markUnforwarded: () => void) => {
+    if (lifecycle === undefined) return;
+    const removeLifecycleListeners = () => {
+      outgoing.off("finish", finishLifecycle);
+      outgoing.off("close", markResponseAborted);
+      outgoing.off("error", markResponseAborted);
+    };
+    const finishLifecycle = () => {
+      removeLifecycleListeners();
+      if (!isForwarded()) abortLifecycle();
+      else runLifecycle(lifecycle.onFinish);
+    };
+    const markResponseAborted = () => {
+      removeLifecycleListeners();
+      if (outgoing.writableFinished) return;
+      markUnforwarded();
+      abortLifecycle();
+    };
+    outgoing.once("finish", finishLifecycle);
+    outgoing.once("close", markResponseAborted);
+    outgoing.once("error", markResponseAborted);
+  };
+  return { abort: abortLifecycle, listen };
+}
+
+function responseFailureReference(
+  request: Request,
+  tracked: { response: Response; failureReported: boolean },
+  options: FetchServerOptions,
+): string | undefined {
+  const { response } = tracked;
+  if (response.status >= 400 && !tracked.failureReported) {
+    const requestId = response.headers.get("x-request-id");
+    return reportFailure(
+      new Error(`HTTP response completed with status ${response.status}`),
+      {
+        operation: "http.response",
+        component: "http",
+        method: request.method,
+        path: new URL(request.url).pathname,
+        status: response.status,
+        ...(requestId === null ? {} : { requestId }),
+      },
+      {
+        status: response.status,
+        ...(options.logger === undefined ? {} : { logger: options.logger }),
+      },
+    ).requestId;
+  }
+  return undefined;
+}
+
+function writeResponseHeaders(
+  response: Response,
   outgoing: ServerResponse,
-  method: string,
-  logger: Pick<Logger, "warn" | "error">,
-  boundedStall: boolean,
-): Promise<boolean> {
+  responseRequestId: string | undefined,
+): void {
+  outgoing.statusCode = response.status;
+  outgoing.statusMessage = response.statusText;
+  for (const [name, value] of response.headers) outgoing.setHeader(name, value);
+  if (responseRequestId !== undefined) outgoing.setHeader("x-request-id", responseRequestId);
+  const cookies = response.headers.getSetCookie();
+  if (cookies.length > 0) outgoing.setHeader("set-cookie", cookies);
+  if (response.headers.get("content-type")?.startsWith("text/event-stream"))
+    outgoing.removeHeader("connection");
+  else if (!outgoing.shouldKeepAlive) outgoing.setHeader("connection", "close");
+}
+
+interface ForwardResponseBodyOptions {
+  body: ReadableStream<Uint8Array>;
+  outgoing: ServerResponse;
+  method: string;
+  logger: Pick<Logger, "warn" | "error">;
+  boundedStall: boolean;
+}
+
+async function forwardResponseBody(options: ForwardResponseBodyOptions): Promise<boolean> {
+  const { body, outgoing, method, logger, boundedStall } = options;
   const reader = body.getReader();
   let canceled = false;
   const cancelReader = () => {
@@ -265,21 +303,23 @@ async function forwardResponseBody(
   outgoing.once("close", cancelReader);
   outgoing.once("error", onError);
   try {
-    if (outgoing.destroyed || outgoing.writableEnded) {
+    if (isResponseClosed(outgoing)) {
       cancelReader();
       return false;
     }
     for (;;) {
       const chunk = await reader.read();
       if (chunk.done || canceled || outgoing.destroyed) break;
-      if (!outgoing.write(chunk.value) && !canceled) {
-        if (!(await waitForResponseDrain(outgoing, boundedStall))) {
-          cancelReader();
-          break;
-        }
+      if (
+        !outgoing.write(chunk.value) &&
+        !canceled &&
+        !(await waitForResponseDrain(outgoing, boundedStall))
+      ) {
+        cancelReader();
+        break;
       }
     }
-    return !canceled && !outgoing.destroyed;
+    return completedResponseBody(outgoing, canceled);
   } catch (error) {
     cancelReader();
     outgoing.destroy();
@@ -289,6 +329,14 @@ async function forwardResponseBody(
     outgoing.off("error", onError);
     reader.releaseLock();
   }
+}
+
+function isResponseClosed(outgoing: ServerResponse): boolean {
+  return outgoing.destroyed || outgoing.writableEnded;
+}
+
+function completedResponseBody(outgoing: ServerResponse, canceled: boolean): boolean {
+  return !canceled && !outgoing.destroyed;
 }
 
 function waitForResponseDrain(outgoing: ServerResponse, boundedStall: boolean): Promise<boolean> {
@@ -446,14 +494,18 @@ function requestBody(
     pull: onReadable,
     cancel() {
       cleanup();
-      incoming.read(0);
-      incoming.pause();
-      incoming.socket.pause();
-      outgoing.shouldKeepAlive = false;
-      if (!outgoing.headersSent) outgoing.setHeader("connection", "close");
+      cancelRequestBody(incoming, outgoing);
     },
   } satisfies UnderlyingByteSource;
   return new ReadableStream(source);
+}
+
+function cancelRequestBody(incoming: IncomingMessage, outgoing: ServerResponse): void {
+  incoming.read(0);
+  incoming.pause();
+  incoming.socket.pause();
+  outgoing.shouldKeepAlive = false;
+  if (!outgoing.headersSent) outgoing.setHeader("connection", "close");
 }
 
 function readChunk(value: unknown): Uint8Array<ArrayBuffer> {
