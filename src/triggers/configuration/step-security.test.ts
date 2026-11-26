@@ -118,3 +118,54 @@ describe("step ids that expressions cannot read", () => {
     assert.equal(refusal(withStep("planner")), undefined);
   });
 });
+
+describe("input names that expressions cannot read", () => {
+  const on = onBlock("slack.mention", "[alice]");
+
+  function withInputs(names: readonly string[], base = multiStep(on)): string {
+    const declared = names.map((name) => `  ${name}: { type: string }\n`).join("");
+    return base.replace("target:", `inputs:\n${declared}target:`);
+  }
+
+  it.each(["constructor", "prototype"])("refuses a declared input named %s", (name) => {
+    assert.match(
+      refusal(withInputs([name])) ?? "",
+      new RegExp(`input name on trigger probe ${name} is reserved`, "u"),
+    );
+  });
+
+  it("refuses an undeclared reference that names an inherited key", () => {
+    const yaml = multiStep(on).replace(
+      "    prompt: Fix it.",
+      '    prompt: Fix it.\n    if: "${{ paseo.inputs.constructor }}"',
+    );
+    assert.match(refusal(yaml) ?? "", /references undeclared input constructor/u);
+  });
+
+  it("refuses an input filter that names an inherited key", () => {
+    const filtered = multiStep(
+      on.replace(
+        "      from_users: [alice]\n",
+        "      from_users: [alice]\n      inputs: { constructor: x }\n",
+      ),
+    );
+    assert.match(refusal(withInputs(["ticket"], filtered)) ?? "", /undeclared input constructor/u);
+  });
+
+  it("refuses a stored contract with an input named constructor", () => {
+    const stored = storedConfig(withInputs(["ticket"]));
+    const widened = (name: string) => stored.replace('"inputs":{"ticket"', `"inputs":{"${name}"`);
+    assert.doesNotThrow(() => parseCompiledHubConfig(JSON.parse(widened("other"))));
+    assert.throws(() => parseCompiledHubConfig(JSON.parse(widened("constructor"))), STORED_REFUSAL);
+  });
+
+  it("still accepts a declared input, a reference to it and a filter on it", () => {
+    const yaml = multiStep(
+      on.replace(
+        "      from_users: [alice]\n",
+        "      from_users: [alice]\n      inputs: { ticket: x }\n",
+      ),
+    ).replace("    prompt: Fix it.", '    prompt: Fix it.\n    if: "${{ paseo.inputs.ticket }}"');
+    assert.equal(refusal(withInputs(["ticket"], yaml)), undefined);
+  });
+});

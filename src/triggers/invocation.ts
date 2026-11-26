@@ -188,7 +188,9 @@ export function matchesInputFilters(
   filters: Readonly<Record<string, JsonPrimitive>> | undefined,
 ): boolean {
   if (filters === undefined) return true;
-  return Object.entries(filters).every(([name, value]) => inputs[name] === value);
+  return Object.entries(filters).every(
+    ([name, value]) => Object.hasOwn(inputs, name) && inputs[name] === value,
+  );
 }
 
 function consumeDeclaredHeaders(
@@ -200,7 +202,7 @@ function consumeDeclaredHeaders(
   while (offset < message.length) {
     const token = readNextToken(message, offset);
     if (token === undefined) break;
-    const definition = definitions[token.name];
+    const definition = Object.hasOwn(definitions, token.name) ? definitions[token.name] : undefined;
     if (definition === undefined) break;
     if (Object.hasOwn(inputs, token.name)) {
       return {

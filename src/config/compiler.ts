@@ -979,7 +979,7 @@ function compileValues(trigger: AuthoredTrigger): Readonly<Record<string, Expres
 function compileInputs(trigger: AuthoredTrigger): Readonly<Record<string, CompiledInput>> {
   const compiled: Record<string, CompiledInput> = {};
   for (const [name, input] of Object.entries(trigger.inputs ?? {})) {
-    assertIdentifier(name, `input name on trigger ${trigger.name}`);
+    assertContextName(name, `input name on trigger ${trigger.name}`);
     if (input.required === true && input.default !== undefined) {
       throw new Error(
         `trigger ${trigger.name} input ${name} cannot be both required and defaulted`,
@@ -1017,7 +1017,7 @@ function validateInputFilters(
   inputs: Readonly<Record<string, CompiledInput>>,
 ): void {
   for (const [name, value] of Object.entries(trigger.filters?.inputs ?? {})) {
-    const definition = inputs[name];
+    const definition = declaredInput(inputs, name);
     if (definition === undefined) {
       throw new Error(`trigger ${trigger.name} input filter references undeclared input ${name}`);
     }
@@ -1058,6 +1058,7 @@ function validateEnvironmentInputChoices(
 function validateCompiledInputs(trigger: CompiledTrigger): void {
   for (const [name, input] of Object.entries(trigger.inputs)) {
     if (!INPUT_NAME.test(name)) throw new Error(`invalid input name: ${name}`);
+    if (isReservedContextKey(name)) throw new Error(`input name ${name} is reserved`);
     if (!matchesInputType(input.default, input.type)) {
       throw new Error(`input ${name} default does not match type`);
     }
@@ -1071,7 +1072,7 @@ function validateCompiledInputs(trigger: CompiledTrigger): void {
 
 function validateCompiledInputFilters(trigger: CompiledTrigger): void {
   for (const [name, value] of Object.entries(trigger.filters?.inputs ?? {})) {
-    const input = trigger.inputs[name];
+    const input = declaredInput(trigger.inputs, name);
     if (input === undefined || !matchesInputType(value, input.type)) {
       throw new Error(`input filter ${name} does not match a declared input`);
     }
@@ -1300,7 +1301,7 @@ function finiteInputPathValues(
   path: Extract<ExpressionPath, { namespace: "paseo" }>["path"],
 ): readonly JsonValue[] | undefined {
   if (!Array.isArray(path)) return undefined;
-  const input = inputs[path[1]];
+  const input = declaredInput(inputs, path[1]);
   if (input?.choices === undefined) return undefined;
   return input.required || input.default !== undefined ? input.choices : [...input.choices, null];
 }
@@ -1387,7 +1388,7 @@ function validatePaseoReference(
     );
   }
   const inputName = referencePath[1];
-  const input = inputs[inputName];
+  const input = declaredInput(inputs, inputName);
   if (input === undefined) throw new Error(`${path} references undeclared input ${inputName}`);
   if (authorityBearing && input.choices === undefined) {
     throw new Error(`${path} uses input ${inputName} without finite choices`);
@@ -1443,7 +1444,7 @@ function isFiniteAuthorityReference(
   if (reference.namespace === "paseo") {
     return (
       reference.path !== "prompt" &&
-      contract.trigger.inputs[reference.path[1]]?.choices !== undefined
+      declaredInput(contract.trigger.inputs, reference.path[1])?.choices !== undefined
     );
   }
   if (reference.namespace === "values") {
@@ -1646,7 +1647,7 @@ function environmentInputChoices(
   inputs: Readonly<Record<string, CompiledInput>>,
 ): readonly JsonPrimitive[] {
   const inputName = DYNAMIC_INPUT_REFERENCE.exec(environment)?.[1];
-  return inputName === undefined ? [] : (inputs[inputName]?.choices ?? []);
+  return inputName === undefined ? [] : (declaredInput(inputs, inputName)?.choices ?? []);
 }
 
 function validateStepEnvironmentContract(
@@ -1834,6 +1835,13 @@ function validateExternalTriggerLaunch(trigger: CompiledTrigger): void {
       `trigger ${trigger.name} requires a non-empty filters.from_users allowlist for externally sourced events`,
     );
   }
+}
+
+function declaredInput(
+  inputs: Readonly<Record<string, CompiledInput>>,
+  name: string,
+): CompiledInput | undefined {
+  return Object.hasOwn(inputs, name) ? inputs[name] : undefined;
 }
 
 function assertIdentifier(value: string, kind: string): void {
