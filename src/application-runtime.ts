@@ -23,6 +23,11 @@ import type { BillingRuntime } from "./billing/index.js";
 import type { ConnectionResolver } from "./config/connections.js";
 import type { Database } from "./db/types.js";
 import type { QueryHandle } from "./db/runtime/index.js";
+import {
+  revokeTriggerWebhookKeyPath,
+  rotateTriggerWebhookKeyPath,
+  triggerWebhookKeyPath,
+} from "./auth/api-key-contract.js";
 import { withInteractiveSessionAccountFeature } from "./auth/organization-access.js";
 import { resolveRouteTenant } from "./projects/access.js";
 import { capabilitiesFor } from "./auth/organization-policy.js";
@@ -780,6 +785,12 @@ function createInteractiveSessionServices(input: InteractiveSessionServiceOption
   return { coordinator, service, stream };
 }
 
+const TRIGGER_WEBHOOK_KEY_PATHS: ReadonlySet<string> = new Set([
+  triggerWebhookKeyPath,
+  rotateTriggerWebhookKeyPath,
+  revokeTriggerWebhookKeyPath,
+]);
+
 function browserAccount(
   { database, auth }: ApplicationCompositionOptions,
   request: Request,
@@ -787,6 +798,10 @@ function browserAccount(
 ): Promise<Response> {
   if (database === null || auth?.browserAccount === undefined) {
     return Promise.resolve(Response.json({ error: "auth_unavailable" }, { status: 503 }));
+  }
+  if (TRIGGER_WEBHOOK_KEY_PATHS.has(new URL(request.url).pathname)) {
+    const rejected = auth.rejectCookieMutation(request, { requireOrigin: true });
+    if (rejected !== undefined) return Promise.resolve(rejected);
   }
   const response = auth.browserAccount(request);
   if (

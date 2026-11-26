@@ -16,8 +16,9 @@ export const apiKeyScopesSchema = z.array(apiKeyScopeSchema).min(1).max(API_KEY_
 export type ApiKeyScope = (typeof API_KEY_SCOPES)[number];
 
 export const apiKeyActorSchema = z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,62}$/u);
+const triggerNameSchema = z.string().regex(/^[a-z][a-z0-9_-]*$/u);
 export const apiKeyAllowedTriggersSchema = z
-  .array(z.string().regex(/^[a-z][a-z0-9_-]*$/u))
+  .array(triggerNameSchema)
   .max(50)
   .refine((names) => new Set(names).size === names.length, {
     message: "Allowed trigger names must be unique",
@@ -99,6 +100,7 @@ export const apiKeySummarySchema = z.object({
   createdAt: z.string(),
   lastUsedAt: z.string().nullable(),
   revokedAt: z.string().nullable(),
+  expiresAt: z.string().nullable(),
 });
 
 export const apiKeyCreateResultSchema = z.union([
@@ -118,6 +120,28 @@ export const apiKeyCreateResultSchema = z.union([
     })
     .strict(),
 ]);
+
+export const triggerWebhookKeyPath = "/api/auth/paseo/trigger-webhook-keys";
+export const rotateTriggerWebhookKeyPath = "/api/auth/paseo/rotate-trigger-webhook-key";
+export const revokeTriggerWebhookKeyPath = "/api/auth/paseo/revoke-trigger-webhook-key";
+
+export const triggerWebhookKeyListSchema = z.object({ triggerName: triggerNameSchema }).strict();
+export const triggerWebhookKeyCreateSchema = triggerWebhookKeyListSchema.extend({
+  actor: apiKeyActorSchema.optional(),
+});
+export const triggerWebhookKeyRevokeSchema = triggerWebhookKeyListSchema.extend({ id: z.uuid() });
+export const triggerWebhookKeyRotateSchema = z
+  .object({ id: z.uuid(), overlapSeconds: z.number().int().min(0).max(86400).default(3600) })
+  .strict();
+
+export const triggerWebhookKeyListResultSchema = z.object({ keys: z.array(apiKeySummarySchema) });
+export const triggerWebhookKeyRevealSchema = z.object({
+  summary: apiKeySummarySchema,
+  secret: z.string().min(1),
+  actorAllowedByTrigger: z.boolean(),
+});
+
+export type TriggerWebhookKeyCreate = z.input<typeof triggerWebhookKeyCreateSchema>;
 
 export const rotateSigningSecretSchema = z
   .object({

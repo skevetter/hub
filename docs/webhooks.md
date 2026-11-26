@@ -4,7 +4,24 @@ Send a message and data from a service you control to a named Hub trigger. Each 
 only that trigger. To start several triggers, call each URL. This is a server to server API;
 there is no CORS or browser preflight support.
 
-## Create a Bearer sender key
+## Create a key for one trigger
+
+An organization owner or admin can create a webhook key for an enabled **Manual run** trigger.
+The key can send events only to that trigger. Choose an actor allowed by `from_users`. If you omit
+it, Hub normalizes your account name, then tries the local part of your email if the name does not
+produce a valid actor. Hub warns if the trigger does not allow the resulting actor.
+
+Copy the secret on creation. Hub shows it once and stores only a hash. Set `HUB_KEY` in the
+sender's secret store and send `Authorization: Bearer <HUB_KEY>` to the trigger's webhook URL.
+
+Rotate the key to reveal a replacement. Both keys work during the overlap, one hour by default.
+You can choose 0 to 86,400 seconds. Zero expires the old key immediately. Switch the sender to
+the new key before the overlap ends. Revoke either key to stop it immediately.
+
+Expired or revoked keys return `401 unauthorized`. An unknown, disabled or disallowed trigger,
+or a key whose actor the trigger does not allow, returns the same `404 trigger_not_found`.
+
+## Create a Bearer sender key in organization settings
 
 1. Open **Settings**, then **API keys** in the organization that owns the trigger. Create a key
    named `CI partner`.
@@ -22,9 +39,10 @@ there is no CORS or browser preflight support.
 The key belongs to one organization. Hub uses its bound actor, ignoring any actor in the request
 body or other headers. `from_users` must allow that actor. Trigger names do not cross organization
 boundaries, even if another organization uses the same name. Unknown, disabled, wrong event kind,
-and disallowed triggers all return the same `404 trigger_not_found`.
+and disallowed triggers all return the same `404 trigger_not_found` as an actor the trigger does not allow.
 
-Keys have no expiry. To rotate, create another key, switch the sender, then revoke the old key on
+Keys created directly in organization settings do not expire unless rotated as per-trigger keys.
+To rotate a general key, create another key, switch the sender, then revoke the old key on
 the API keys page. Revoked keys return `401`. Last used is updated at most once per minute, not
 on every delivery; use it as a coarse signal of unexpected use, not an exact request timestamp.
 
@@ -164,12 +182,13 @@ UTF-8 JSON. The `Authorization` and `X-Paseo-Signature` headers are rejected on 
 route. Hub v1, SHA-1-only signing, dual authentication and other signed sender formats are unsupported.
 
 Hub uses the SHA-256 digest of the raw body to record a delivery permanently for the signing
-key. Reuse the exact bytes to retry. A duplicate returns the original run identity or filtered
-result, even after secret rotation. If supplied, `Idempotency-Key` must equal `github-sha256:`
+key. Reuse the exact bytes to retry. A duplicate returns `200` with `duplicate: true` and the
+original run identity or filtered result, even after secret rotation. No second run is created. If supplied, `Idempotency-Key` must equal `github-sha256:`
 followed by the lowercase raw-body SHA-256 hex digest. `X-GitHub-Delivery` and `X-GitHub-Event`
 are unsigned and have no effect on routing, authorization or deduplication.
 
-GitHub signs the body without a timestamp. An unseen captured request can be accepted later
+GitHub signs the body without a timestamp, so Hub does not enforce a timestamp window. An unseen
+captured request can be accepted later
 while its secret remains eligible. Identical legitimate payloads collapse. Different bytes
 signed by an authorized sender count as a separate delivery. Replacing the entire key
 starts a new delivery history and generates a new secret.
@@ -354,8 +373,7 @@ key is how to discover whether the original event was accepted.
 | `401`       | `unauthorized`               | Check the API key or the GitHub signature and signing key. Invalid Bearer credentials receive a Bearer challenge. |
 | `403`       | `insufficient_scope`         | Create a key with events:send.                                                                                    |
 | `403`       | `key_actor_required`         | Use an API key with a bound actor, not a CLI credential or a legacy unbound key.                                  |
-| `403`       | `actor_forbidden`            | Add the key's actor to the trigger's from_users audience.                                                         |
-| `404`       | `trigger_not_found`          | Check the organization, exact name, enabled state, manual.run event and allowed trigger names.                    |
+| `404`       | `trigger_not_found`          | Check the organization, trigger name, enabled state, manual.run event, key restrictions and from_users audience.  |
 | `405`       | `method_not_allowed`         | Use POST. The response includes Allow: POST.                                                                      |
 | `409`       | `dispatch_conflict`          | Retry the same Bearer delivery key or the same signed body after a concurrent dispatch race.                      |
 | `413`       | `payload_too_large`          | Reduce the raw body or message to the limits below.                                                               |
@@ -425,6 +443,8 @@ events:send. Perform this procedure before switching binaries:
 
 1. While the current binary is still running, explicitly revoke every key containing events:send
    in every organization, including keys with a mixture of old and new scopes. Stop senders.
+   This also covers per-trigger keys that are still in a rotation overlap: earlier binaries do not
+   enforce `expires_at`, so an expired key would work again until revoked.
 2. Stop all Hub processes and other database writers. Keep them stopped through cleanup and the
    binary switch. Keep the additive schema and migration history; do not drop columns or undo
    migrations.

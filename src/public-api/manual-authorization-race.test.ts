@@ -443,8 +443,8 @@ describe("manual authorization against the persisted revision", () => {
       });
       const outsider = await hub.createKey(["events:send"], { actor: "outsider" });
       const denied = await hub.send(trigger.name, {}, { secret: outsider.secret, deliveryKey });
-      assert.equal(denied.status, 403);
-      assert.equal(ProblemSchema.parse(await denied.json()).code, "actor_forbidden");
+      assert.equal(denied.status, 404);
+      assert.equal(ProblemSchema.parse(await denied.json()).code, "trigger_not_found");
       assert.deepEqual(await hub.database.findTriggerRunsByProviderEventReceiptId(receiptId), []);
       assert.deepEqual(
         (await hub.database.findProviderEventReceiptById(receiptId))?.payload,

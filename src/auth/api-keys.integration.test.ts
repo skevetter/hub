@@ -465,14 +465,13 @@ describe("organization API-key boundary", () => {
     operation: PublicOperation,
   ): Promise<void> {
     const keys = auth.apiKeys!;
-    const valid = await keys.create(
-      "organization-a",
-      "user-a",
-      `valid-${operation.scope}-${randomUUID()}`,
-      [operation.scope],
-      undefined,
-      { actor: "automation" },
-    );
+    const valid = await keys.createWith({
+      organizationId: "organization-a",
+      createdByUserId: "user-a",
+      name: `valid-${operation.scope}-${randomUUID()}`,
+      scopes: [operation.scope],
+      identity: { actor: "automation" },
+    });
     const insufficientScope =
       operation.scope === "configuration:install" ? "runs:dispatch" : "configuration:install";
     const insufficient = await keys.create(

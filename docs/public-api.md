@@ -20,7 +20,10 @@ Create a scoped API key in the Hub dashboard or approve `paseo hub login` in the
 The available API key scopes are `projects:read`, `configuration:validate`, `configuration:install`,
 `runs:dispatch`, `runs:read`, `events:send`, and `daemons:enroll`. Grant only the scopes a sender needs.
 `events:send` authorizes hooks only, not manual-runs. Hooks require an API key with a bound actor;
-optional allowed trigger names further restrict it. If GitHub SHA-256 is enabled, a separate
+optional allowed trigger names further restrict it. Bearer hooks return `404 trigger_not_found`
+for unknown, disabled or disallowed targets, including an actor the trigger does not allow. A key
+without a bound actor returns `403 key_actor_required`. Expired keys
+return `401 unauthorized`. If GitHub SHA-256 is enabled, a separate
 HMAC-only signing key can call `POST /api/v1/hooks/{trigger}/signers/{keyId}`. It signs the
 exact JSON bytes, is bound to one trigger, and deduplicates the same body permanently per key.
 See [authenticated webhook triggers](webhooks.md) for setup, examples, rotation and limitations.

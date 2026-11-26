@@ -167,6 +167,13 @@ describe("GitHub signer webhook intake", () => {
       200,
     );
     assert.deepEqual(duplicate, { ...first, duplicate: true });
+    const runs = await hub.database.findTriggerRunsByProviderEventReceiptId(
+      first.providerEventReceiptId,
+    );
+    assert.deepEqual(
+      runs.map(({ id }) => id),
+      [first.triggerRunId],
+    );
     const distinct = await result(await signed(hub, signer, body), 202);
     assert.ok("triggerRunId" in distinct);
     assert.notEqual(distinct.triggerRunId, first.triggerRunId);

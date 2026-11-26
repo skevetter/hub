@@ -248,9 +248,9 @@ permission to run code there. Hub refuses to save a script trigger that is not s
 - **Schedules.** A `schedule.tick` script needs no audience. Only Hub starts it.
 - **Manual runs and webhooks.** A `manual.run` script must name its allowed actors in
   `filters.from_users`; a wildcard or empty audience is refused. Both the hooks and manual-runs
-  endpoints require an API key with a bound actor for script actions, returning
-  `403 key_actor_required` for an unbound key or CLI credential. Hooks always uses the bound
-  actor. Manual-runs permits no different body actor and returns `403 actor_forbidden` for one.
+  endpoints require an API key with a bound actor for script actions. Hooks returns
+  `403 key_actor_required` without a bound actor and `404 trigger_not_found` for an actor the trigger does not allow. Manual-runs returns
+  `403 key_actor_required` without a bound actor and `403 actor_forbidden` for a different body actor.
   Event data reaches the script only through `HUB_EVENT_JSON`, never through command templates.
 
 The same event can still start an agent trigger for everyone. The checks apply to the script
@@ -273,7 +273,7 @@ every daemon that grants Hub the permissions above, so give that role carefully.
 | The daemon is not connected to this Hub, so it cannot run the script.                                                                                          | Connect the daemon. A script runs only on a daemon connected to this Hub process.           |
 | trigger `<name>` runs a script, so `<event>` needs filters.from_users...                                                                                       | Name the people allowed to start it.                                                        |
 | trigger `<name>` runs a script on github.notification...                                                                                                       | Set both `filters.repo` and `filters.reason`, and use a reason that is not a mention.       |
-| key_actor_required on a manual or webhook script run                                                                                                           | Use an API key with a bound actor named in filters.from_users, not a CLI credential.        |
+| key_actor_required on a manual script run                                                                                                                      | Use an API key with a bound actor named in filters.from_users, not a CLI credential.        |
 | script text is not templated...                                                                                                                                | Remove the `${{ }}` and read `HUB_EVENT_JSON` in the script.                                |
 
 ## Ownership
