@@ -7,6 +7,7 @@ import { useSnapshotQuery } from "../queries/index.js";
 import { webhookSettings } from "../webhooks/functions.js";
 import { TriggerDocumentSchema } from "./configuration/schema.js";
 import { WebhookInvocation } from "./webhook-card.js";
+import { WebhookKeys } from "./webhook-keys.js";
 
 export function canInvokeManually(yaml: string): boolean {
   try {
@@ -22,24 +23,35 @@ export function TriggerInvocation({
   triggerName,
   manual,
   enabled,
+  canManage,
 }: {
   organizationSlug: string;
   triggerName: string;
   manual: boolean;
   enabled: boolean;
+  canManage: boolean;
 }) {
   return (
-    <Section title="How to invoke">
-      {manual ? (
-        <ManualInvocation
+    <>
+      <Section title="How to invoke">
+        {manual ? (
+          <ManualInvocation
+            organizationSlug={organizationSlug}
+            triggerName={triggerName}
+            enabled={enabled}
+          />
+        ) : (
+          <p>This trigger runs when its configured event arrives.</p>
+        )}
+      </Section>
+      {manual && canManage ? (
+        <WebhookKeys
           organizationSlug={organizationSlug}
           triggerName={triggerName}
           enabled={enabled}
         />
-      ) : (
-        <p>This trigger runs when its configured event arrives.</p>
-      )}
-    </Section>
+      ) : null}
+    </>
   );
 }
 

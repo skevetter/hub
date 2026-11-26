@@ -53,10 +53,24 @@ export function TriggerReadPanel(scope: TriggerReadScope) {
       />
     );
   }
-  return <TriggerReadView scope={scope} trigger={trigger} />;
+  return (
+    <TriggerReadView
+      scope={scope}
+      trigger={trigger}
+      canManage={snapshot.data?.canManage === true}
+    />
+  );
 }
 
-function TriggerReadView({ scope, trigger }: { scope: TriggerReadScope; trigger: Trigger }) {
+function TriggerReadView({
+  scope,
+  trigger,
+  canManage,
+}: {
+  scope: TriggerReadScope;
+  trigger: Trigger;
+  canManage: boolean;
+}) {
   const manual = canInvokeManually(trigger.yaml);
   const state = triggerState(trigger);
   const runner = useManualRun(scope);
@@ -82,6 +96,7 @@ function TriggerReadView({ scope, trigger }: { scope: TriggerReadScope; trigger:
             triggerName={trigger.name}
             manual={manual}
             enabled={trigger.enabled}
+            canManage={canManage}
           />
         </div>
         <TriggerFacts trigger={trigger} />
