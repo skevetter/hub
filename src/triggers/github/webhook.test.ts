@@ -80,9 +80,13 @@ describe("normalizeWebhookEvent", () => {
 });
 
 describe("GitHub webhook", () => {
-  it("preserves the legacy issues shape for a signed non-object body", async () => {
+  it.each([
+    ["null", "null"],
+    ['"x"', "string"],
+    ["[]", "array"],
+    ["1", "number"],
+  ])("preserves the exact invalid-payload response for signed body %s", async (body, type) => {
     const endpoint = createWebhookSource(SECRET, webhookOptions());
-    const body = "[]";
     const response = await endpoint.handle(
       new Request("http://localhost/webhook", {
         method: "POST",
@@ -91,10 +95,13 @@ describe("GitHub webhook", () => {
       }),
     );
     assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), {
-      error: "invalid webhook payload",
-      issues: { _errors: ["Invalid input: expected object, received array"] },
-    });
+    assert.equal(
+      await response.text(),
+      JSON.stringify({
+        error: "invalid webhook payload",
+        issues: { _errors: [`Invalid input: expected object, received ${type}`] },
+      }),
+    );
   });
 
   it("requires an installation id after authenticating the signed body", async () => {
