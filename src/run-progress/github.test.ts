@@ -31,6 +31,43 @@ const { privateKey } = generateKeyPairSync("rsa", {
 
 afterEach(() => vi.restoreAllMocks());
 
+function fixtureResponseState() {
+  return {
+    private: true,
+    locked: false,
+    metadata: true,
+    oauthScopes: "",
+    comments: [] as { id: number; body: string; user: { id: number }; issue_url: string }[],
+    nextWrite: undefined as Response | undefined,
+    writeError: undefined as Error | undefined,
+    onRefresh: () => {},
+    respond: (_request: Request): Response | undefined => undefined,
+  };
+}
+
+function fixtureReadResponse(
+  url: URL,
+  state: ReturnType<typeof fixtureResponseState>,
+): Response | undefined {
+  const headers = { "x-oauth-scopes": state.oauthScopes };
+  if (url.pathname === repoPath) {
+    return Response.json(state.metadata ? { id: 31, private: state.private } : {}, { headers });
+  }
+  if (url.pathname === issuePath) return Response.json({ locked: state.locked });
+  if (url.pathname === "/user" || decodeURIComponent(url.pathname) === "/users/paseo[bot]")
+    return Response.json({ id: 23 });
+  if (url.pathname === commentsPath) {
+    assert.equal(url.searchParams.get("per_page"), "100");
+    assert.equal(url.searchParams.has("since"), true);
+    return Response.json(state.comments);
+  }
+  return undefined;
+}
+
+function assertFixtureWritePath(request: Request, url: URL): void {
+  assert.equal(url.pathname, request.method === "POST" ? commentsPath : editPath);
+}
+
 async function fixture(path: "app" | "token" = "token") {
   const time = { value: Date.now() };
   const clock: ProgressClock = {
@@ -78,17 +115,7 @@ async function fixture(path: "app" | "token" = "token") {
     .spyOn(database, "findGitHubRepositoryForOrganization")
     .mockImplementation(async () => ({ ...repository }));
   const requests: Request[] = [];
-  const state = {
-    private: true,
-    locked: false,
-    metadata: true,
-    oauthScopes: "",
-    comments: [] as { id: number; body: string; user: { id: number }; issue_url: string }[],
-    nextWrite: undefined as Response | undefined,
-    writeError: undefined as Error | undefined,
-    onRefresh: () => {},
-    respond: (_request: Request): Response | undefined => undefined,
-  };
+  const state = fixtureResponseState();
   const fetch: typeof globalThis.fetch = async (input, init) => {
     const request = new Request(input, init);
     const url = new URL(request.url);
@@ -109,18 +136,8 @@ async function fixture(path: "app" | "token" = "token") {
     const override = state.respond(request);
     if (override !== undefined) return override;
     if (request.method === "GET") {
-      const headers = { "x-oauth-scopes": state.oauthScopes };
-      if (url.pathname === repoPath) {
-        return Response.json(state.metadata ? { id: 31, private: state.private } : {}, { headers });
-      }
-      if (url.pathname === issuePath) return Response.json({ locked: state.locked });
-      if (url.pathname === "/user" || decodeURIComponent(url.pathname) === "/users/paseo[bot]")
-        return Response.json({ id: 23 });
-      if (url.pathname === commentsPath) {
-        assert.equal(url.searchParams.get("per_page"), "100");
-        assert.equal(url.searchParams.has("since"), true);
-        return Response.json(state.comments);
-      }
+      const response = fixtureReadResponse(url, state);
+      if (response !== undefined) return response;
     }
     if (state.writeError !== undefined) throw state.writeError;
     const response = state.nextWrite;
@@ -128,7 +145,7 @@ async function fixture(path: "app" | "token" = "token") {
       state.nextWrite = undefined;
       return response;
     }
-    assert.equal(url.pathname, request.method === "POST" ? commentsPath : editPath);
+    assertFixtureWritePath(request, url);
     const body = z.object({ body: z.string() }).parse(await request.clone().json()).body;
     if (request.method === "POST") {
       const comment = {
