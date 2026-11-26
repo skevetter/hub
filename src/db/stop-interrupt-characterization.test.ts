@@ -72,3 +72,11 @@ it("retains prior coverage and start results without changing their query argume
     ],
   ]);
 });
+
+it("resets an owned unsent attempt without returning the update result", async () => {
+  const { store, query } = interrupts([], 1);
+  expect(await store.resetUnsent("execution", "token")).toBe(undefined);
+  expect(querySignature(query.mock.calls)).toEqual([
+    ["16564155eb510bdf16963cadcba1f5b0d7dfb859d33adc140c9e57622330117c", ["execution", "token"]],
+  ]);
+});
