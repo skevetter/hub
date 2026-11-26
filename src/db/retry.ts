@@ -63,10 +63,7 @@ export async function retryWithBackoff<T>(
   operation: (attempt: number) => Promise<T>,
   options: RetryOptions = {},
 ): Promise<T> {
-  const policy = options.policy ?? DEFAULT_BACKOFF;
-  const isRetryable = options.isRetryable ?? isTransientDatabaseError;
-  const sleep = options.sleep ?? defaultSleep;
-  const random = options.random ?? Math.random;
+  const { policy, isRetryable, sleep, random } = resolveRetryOptions(options);
   for (let attempt = 1; ; attempt++) {
     try {
       return await operation(attempt);
@@ -79,6 +76,15 @@ export async function retryWithBackoff<T>(
       await sleep(delayMs);
     }
   }
+}
+
+function resolveRetryOptions(options: RetryOptions) {
+  return {
+    policy: options.policy ?? DEFAULT_BACKOFF,
+    isRetryable: options.isRetryable ?? isTransientDatabaseError,
+    sleep: options.sleep ?? defaultSleep,
+    random: options.random ?? Math.random,
+  };
 }
 
 /** The attempt count to add to a failure report, when the failure used up its retries. */
