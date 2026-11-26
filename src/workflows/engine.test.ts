@@ -1557,7 +1557,7 @@ run:
     )[0]!;
     assert.equal(run.outcome, "accepted");
     const step = (await fixture.database.listWorkflowStepRunsForTriggerRun(run.id))[0]!;
-    assert.equal(run.status, "failed");
+    assert.equal(run.status, "timed_out");
     assert.equal(run.deadlineKind, "step_hard");
     assert.equal(step.status, "timed_out");
     assert.equal(step.deadlineKind, "step_hard");
@@ -1656,7 +1656,7 @@ run:
     });
     assert.equal(completion.deadlineKind, "step_hard");
     assert.equal(completion.execution.status, "failed");
-    assert.equal((await fixture.database.findTriggerRunById(run.id))?.status, "failed");
+    assert.equal((await fixture.database.findTriggerRunById(run.id))?.status, "timed_out");
   });
 
   it("meters one unit per execution, not once per trigger, across a multi-step workflow", async () => {

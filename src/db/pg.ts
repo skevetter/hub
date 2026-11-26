@@ -6905,7 +6905,7 @@ async function timeoutWorkflowStepWithoutExecution(
   );
   await client.query(
     `update trigger_runs
-               set status = 'failed', deadline_kind = $2, failure_reason = $3, completed_at = $4
+               set status = 'timed_out', deadline_kind = $2, failure_reason = $3, completed_at = $4
                where id = $1 and status = 'running'`,
     [run.id, deadlineKind, reason, now],
   );
@@ -6971,7 +6971,7 @@ async function timeoutWorkflowStepOnClient(
   if (run.status === "running") {
     await client.query(
       `update trigger_runs
-       set status = 'failed', deadline_kind = $2, failure_reason = $3, completed_at = $4,
+       set status = 'timed_out', deadline_kind = $2, failure_reason = $3, completed_at = $4,
            terminal_notification_pending_at = coalesce(terminal_notification_pending_at, $4),
            terminal_notification_lease_expires_at = null
        where id = $1 and status = 'running'`,
@@ -7091,9 +7091,8 @@ async function finishWorkflowStepAndRun(
     await client.query(
       `update trigger_runs
        set status = case
-             when $5 = 'whole_run' then 'timed_out'
-             when $5 is null then $2
-             else 'failed'
+             when $5::text is not null then 'timed_out'
+             else $2
            end,
            deadline_kind = coalesce($5, deadline_kind), failure_reason = $3, completed_at = $4,
            terminal_notification_pending_at = coalesce(terminal_notification_pending_at, $4),

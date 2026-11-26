@@ -345,7 +345,7 @@ describe("observed workflow database", () => {
       (await rows(run.id)).find((row) => row.kind === "step_finished")?.data["status"],
       "timed_out",
     );
-    assert.equal((await database.findTriggerRunById(run.id))?.status, "failed");
+    assert.equal((await database.findTriggerRunById(run.id))?.status, "timed_out");
     await reconciler.stop();
     await timeline.stop();
   });
