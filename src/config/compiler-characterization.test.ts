@@ -283,3 +283,73 @@ describe("trigger launch security", () => {
     assertIssue(() => compileHubConfig(configuration(trigger)), message);
   });
 });
+
+function workflowSteps(...overrides: readonly Record<string, unknown>[]) {
+  const step = configuration().triggers[0]?.steps[0];
+  return overrides.map((fields) => Object.assign({}, step, fields));
+}
+
+function expressionTemplate(expression: string): string {
+  return "${{ " + expression + " }}";
+}
+
+const workPath = ["triggers", "run", "steps", "work"] as const;
+
+describe("workflow reference validation", () => {
+  it.each([
+    ["paseo.prompt", "uses paseo.prompt in an authority-bearing field"],
+    ["paseo.context", "uses paseo.context outside a step prompt"],
+    [
+      "paseo.execution.id",
+      "uses paseo.execution outside environment worktree.newBranch or a step title",
+    ],
+    ["paseo.inputs.missing", "references undeclared input missing"],
+    ["steps.missing.outputs.target", "references unknown step missing"],
+    ["steps.later.outputs.target", "cannot reference forward step later"],
+    [
+      "steps.prepare.outputs.target",
+      "references output from step prepare without an output schema",
+    ],
+    [
+      "steps.unbounded.outputs.target",
+      "uses agent output without provable finite choices for authority; use a finite enum or const",
+    ],
+  ] as const)("rejects %s in an environment selector", (expression, message) => {
+    const steps = workflowSteps(
+      { id: "prepare" },
+      {
+        id: "unbounded",
+        output: { schema: { type: "object", properties: { target: { type: "string" } } } },
+      },
+      { environment: expressionTemplate(expression) },
+      { id: "later" },
+    );
+    assertIssue(
+      () => compileHubConfig(configuration({ steps })),
+      `step work environment ${message}`,
+      [...workPath, "environment"],
+    );
+  });
+
+  it("reports conditions before environments and references from left to right", () => {
+    const environment = expressionTemplate("paseo.prompt ?? paseo.inputs.missing");
+    assertIssue(
+      () => compileHubConfig(configuration({}, { if: "paseo.context", environment })),
+      "step work if uses paseo.context outside a step prompt",
+      [...workPath, "if"],
+    );
+    assertIssue(
+      () => compileHubConfig(configuration({}, { environment })),
+      "step work environment uses paseo.prompt in an authority-bearing field",
+      [...workPath, "environment"],
+    );
+    assertIssue(
+      () =>
+        compileHubConfig(
+          configuration({}, { environment: expressionTemplate("paseo.inputs.missing") }),
+        ),
+      "step work environment references undeclared input missing",
+      [...workPath, "environment"],
+    );
+  });
+});
