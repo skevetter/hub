@@ -39,11 +39,27 @@ const LINEAR_HOST_PATH = /linear\.app\.?(?::\d{1,5})?(\/[^\s<>()[\]"'`\\?#]*)/gi
 const LINEAR_MENTION_PATH = /\/(?:profiles|users|agents)(?:\/|$)/iu;
 const MENTION_SIGN = /[@\uFF20]|&(?:#0*64|#x0*40|commat);/giu;
 const USER_TAG = /(?:<|&lt;)\/?user\b[^<>\r\n]*?(?:>|&gt;|$)/gimu;
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/u;
+const FENCE_CLOSE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/u;
 
 export interface FormatOptions {
   now?: () => number;
   // Called once per reply that took the plain-text path. Carries no content.
   onFallback?: (reason: "structure" | "budget") => void;
+}
+
+interface RenderState {
+  limit: number;
+  truncated: boolean;
+  plainText: boolean;
+  defang: boolean;
+}
+
+interface RenderContext {
+  deadline: number;
+  now: () => number;
+  report: NonNullable<FormatOptions["onFallback"]>;
+  redact: ReturnType<typeof createAssistantTextRedactor>;
 }
 
 export function formatRunReply(
@@ -60,41 +76,64 @@ export function formatRunReply(
     reported = true;
   };
   const redact = createAssistantTextRedactor(secrets);
-  let truncated = answer.truncated || text.length > MAX_REPLY_CHARS;
-  let limit = truncated ? TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN : MAX_REPLY_CHARS;
-  let plainText = false;
-  let defang = false;
+  const truncated = answer.truncated || text.length > MAX_REPLY_CHARS;
+  const state = {
+    truncated,
+    limit: truncated ? TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN : MAX_REPLY_CHARS,
+    plainText: false,
+    defang: false,
+  };
+  const context = { deadline, now, report, redact };
   for (let attempt = 0; attempt < MAX_RENDER_ATTEMPTS; attempt += 1) {
-    const prefix = text.length <= limit ? text : clipSource(text, limit);
-    const [redacted] = redact.redact([prefix], truncated);
-    const source = cleanSource(redacted!);
-    const markdown: string | undefined = plainText
-      ? undefined
-      : renderMarkdown(source, deadline, now, report);
-    plainText = markdown === undefined;
-    const safe = markdown ?? renderPlainText(source, defang);
-    if (safe === "") return safe;
-    const whole = !truncated && safe.length <= MAX_REPLY_CHARS;
-    if (whole || safe.length <= TRUNCATED_TEXT_LIMIT) {
-      // Parsing is superlinear on escape-heavy text, so only the reply that will post is checked.
-      if (hasUnsafeNode(safe)) {
-        if (plainText && defang)
-          throw new Error("Linear reply contains an unsafe link after rendering");
-        defang = plainText;
-        plainText = true;
-        report("structure");
-        continue;
-      }
-      return whole ? safe : safe + TRUNCATION;
-    }
-    truncated = true;
-    limit = Math.floor(
-      (prefix.length * (TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN)) / safe.length,
-    );
+    const result = renderAttempt(text, state, context);
+    if (result !== undefined) return result;
   }
+  return renderLastResort(text, state.limit, context);
+}
+
+function renderAttempt(
+  text: string,
+  state: RenderState,
+  context: RenderContext,
+): string | undefined {
+  const { deadline, now, report, redact } = context;
+  const prefix = text.length <= state.limit ? text : clipSource(text, state.limit);
+  const [redacted] = redact.redact([prefix], state.truncated);
+  const source = cleanSource(redacted);
+  const markdown = state.plainText ? undefined : renderMarkdown(source, deadline, now, report);
+  state.plainText = markdown === undefined;
+  const safe = markdown ?? renderPlainText(source, state.defang);
+  if (safe === "") return safe;
+  const whole = !state.truncated && safe.length <= MAX_REPLY_CHARS;
+  if (whole || safe.length <= TRUNCATED_TEXT_LIMIT)
+    return finishAttempt(safe, whole, state, report);
+  state.truncated = true;
+  state.limit = Math.floor(
+    (prefix.length * (TRUNCATED_TEXT_LIMIT - RAW_TRUNCATION_MARGIN)) / safe.length,
+  );
+  return undefined;
+}
+
+function finishAttempt(
+  safe: string,
+  whole: boolean,
+  state: RenderState,
+  report: RenderContext["report"],
+): string | undefined {
+  // Parsing is superlinear on escape-heavy text, so only the reply that will post is checked.
+  if (!hasUnsafeNode(safe)) return whole ? safe : safe + TRUNCATION;
+  if (state.plainText && state.defang)
+    throw new Error("Linear reply contains an unsafe link after rendering");
+  state.defang = state.plainText;
+  state.plainText = true;
+  report("structure");
+  return undefined;
+}
+
+function renderLastResort(text: string, limit: number, { redact, report }: RenderContext): string {
   report("structure");
   const [redacted] = redact.redact([text.slice(0, Math.min(limit, SHORT_PLAIN_PREFIX))], true);
-  const safe = renderPlainText(cleanSource(redacted!), true);
+  const safe = renderPlainText(cleanSource(redacted), true);
   if (safe.length > TRUNCATED_TEXT_LIMIT)
     throw new Error("Linear reply exceeds the rendering limit");
   if (hasUnsafeNode(safe)) throw new Error("Linear reply contains an unsafe link after rendering");
@@ -116,7 +155,9 @@ function clipSource(text: string, limit: number): string {
   return opening === undefined ? prefix : prefix.slice(0, line + 1 + opening.index);
 }
 
-function cleanSource(text: string): string {
+function cleanSource(text: string | undefined): string {
+  if (text === undefined)
+    throw new TypeError("Cannot read properties of undefined (reading 'replaceAll')");
   return text
     .replaceAll("\0", "")
     .replace(/\p{Cf}/gu, "")
@@ -157,6 +198,26 @@ function renderMarkdown(
   return undefined;
 }
 
+interface Fence {
+  char: string;
+  size: number;
+  info: string;
+}
+
+function readFence(match: RegExpExecArray | null): Fence | undefined {
+  const ticks = match?.[1];
+  const info = match?.[2];
+  if (ticks === undefined || info === undefined) return undefined;
+  const char = ticks.charAt(0);
+  // An info string after a backtick fence cannot hold a backtick.
+  return char === "`" && info.includes("`") ? undefined : { char, info, size: ticks.length };
+}
+
+function closesFence(line: string, fence: Fence): boolean {
+  const ticks = FENCE_CLOSE.exec(line)?.[1];
+  return ticks !== undefined && ticks[0] === fence.char && ticks.length >= fence.size;
+}
+
 // Estimated container depth of every line outside a fence: its markers, with or without a space
 // between them, plus one level per 2 columns of indentation after the mandatory single space of a
 // marker (a tab is up to 4 columns, and indentation counts after every marker, not only before the
@@ -165,26 +226,25 @@ function renderMarkdown(
 // marker characters and indentation in the first 40 columns of every line, fences or not, so a
 // fence trick cannot hide a deep document. The decision depends on the text only, never on timing.
 export function nestingTooDeep(source: string): boolean {
-  let fence: { char: string; size: number } | undefined;
+  let fence: Fence | undefined;
   let deepLines = 0;
   let weight = 0;
   for (const line of source.split(/\r\n|\r|\n/u)) {
     weight += containerWeight(line);
     if (weight > MAX_CONTAINER_WEIGHT) return true;
-    const marks = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+    const marks = FENCE_OPEN.exec(line);
     if (fence !== undefined) {
-      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/u.exec(line);
-      if (close && close[1]![0] === fence.char && close[1]!.length >= fence.size) fence = undefined;
+      if (closesFence(line, fence)) fence = undefined;
       continue;
     }
-    // An info string after a backtick fence cannot hold a backtick.
-    if (marks && !(marks[1]![0] === "`" && marks[2]!.includes("`"))) {
-      fence = { char: marks[1]![0]!, size: marks[1]!.length };
-      continue;
-    }
+    fence = readFence(marks);
+    if (fence !== undefined) continue;
     const depth = lineDepth(line);
-    if (depth > MAX_CONTAINER_DEPTH) return true;
-    if (depth > DEEP_LINE_DEPTH && (deepLines += 1) > MAX_DEEP_LINES) return true;
+    if (
+      depth > MAX_CONTAINER_DEPTH ||
+      (depth > DEEP_LINE_DEPTH && (deepLines += 1) > MAX_DEEP_LINES)
+    )
+      return true;
   }
   return false;
 }
@@ -193,7 +253,7 @@ function containerWeight(line: string): number {
   let weight = 0;
   let column = 0;
   for (let index = 0; index < line.length && column < 40; index += 1) {
-    const char = line[index]!;
+    const char = line[index];
     if (char === "\t") {
       weight += 4 - (column % 4);
       column += 4 - (column % 4);
@@ -211,7 +271,7 @@ function lineDepth(line: string): number {
   let column = 0;
   let index = 0;
   while (index < line.length) {
-    const char = line[index]!;
+    const char = line[index];
     if (char === " " || char === "\t") {
       const width = char === "\t" ? 4 - (column % 4) : 1;
       column += width;
@@ -229,12 +289,19 @@ function lineDepth(line: string): number {
 }
 
 function markerLength(line: string, index: number): number {
-  const char = line[index]!;
+  const char = line.charAt(index);
   if (char === ">") return 1;
   if (char === "-" || char === "+" || char === "*") return markerEnds(line, index + 1);
-  if (char < "0" || char > "9") return 0;
+  return isDigit(char) ? numberedMarkerLength(line, index) : 0;
+}
+
+function isDigit(char: string): boolean {
+  return char >= "0" && char <= "9";
+}
+
+function numberedMarkerLength(line: string, index: number): number {
   let digits = index;
-  while (line[digits]! >= "0" && line[digits]! <= "9") digits += 1;
+  while (isDigit(line.charAt(digits))) digits += 1;
   if (digits - index > 9 || (line[digits] !== "." && line[digits] !== ")")) return 0;
   return markerEnds(line, digits + 1) === 0 ? 0 : digits + 1 - index;
 }
@@ -248,6 +315,22 @@ function markerEnds(line: string, next: number): number {
 // answers are full of brackets, parentheses and underscores.
 function boundedStructure(source: string): boolean {
   if (OPENER_RUN.test(source)) return false;
+  const { square, round, emphasis, footnotes, rows, pipes } = countDelimiters(source);
+  return (
+    square <= MAX_UNMATCHED_BRACKETS &&
+    round <= MAX_UNMATCHED_BRACKETS &&
+    emphasis <= MAX_EMPHASIS_CHARS &&
+    footnotes <= MAX_FOOTNOTE_LABELS &&
+    rows <= MAX_TABLE_ROWS &&
+    pipes <= MAX_PIPES
+  );
+}
+
+function startsRow(source: string, index: number): boolean {
+  return index === 0 || source[index - 1] === "\n";
+}
+
+function countDelimiters(source: string) {
   let square = 0;
   let round = 0;
   let emphasis = 0;
@@ -258,7 +341,7 @@ function boundedStructure(source: string): boolean {
     switch (source[index]) {
       case "[":
         square += 1;
-        if (source[index + 1] === "^") footnotes += 1;
+        footnotes += Number(source[index + 1] === "^");
         break;
       case "]":
         square = Math.max(0, square - 1);
@@ -275,70 +358,79 @@ function boundedStructure(source: string): boolean {
         break;
       case "|":
         pipes += 1;
-        if (index === 0 || source[index - 1] === "\n") rows += 1;
+        rows += Number(startsRow(source, index));
+        break;
+      case undefined:
         break;
     }
   }
-  return (
-    square <= MAX_UNMATCHED_BRACKETS &&
-    round <= MAX_UNMATCHED_BRACKETS &&
-    emphasis <= MAX_EMPHASIS_CHARS &&
-    footnotes <= MAX_FOOTNOTE_LABELS &&
-    rows <= MAX_TABLE_ROWS &&
-    pipes <= MAX_PIPES
-  );
+  return { square, round, emphasis, footnotes, rows, pipes };
+}
+
+interface PlainTextState {
+  out: string[];
+  fence?: Fence | undefined;
+  code: string[];
+  inList: boolean;
 }
 
 // Keeps fenced code verbatim and the line structure of the rest, and escapes inline Markdown
 // outside fences. Only mention and link text is rewritten.
-function renderPlainText(source: string, defang = false): string {
-  const out: string[] = [];
-  let fence: { char: string; size: number; info: string } | undefined;
-  let code: string[] = [];
-  let inList = false;
-  const flush = () => {
-    if (fence === undefined) return;
-    const longest = Math.max(
-      0,
-      ...[...code.join("\n").matchAll(/`+/gu)].map((run) => run[0].length),
-    );
-    const ticks = "`".repeat(Math.max(3, longest + 1));
-    out.push(ticks + fence.info, ...code, ticks);
-    fence = undefined;
-    code = [];
-  };
+function renderPlainText(source: string, defang: boolean): string {
+  const state: PlainTextState = { out: [], code: [], inList: false };
   for (const line of source.split(/\r\n|\r|\n/u)) {
-    if (fence !== undefined) {
-      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/u.exec(line);
-      if (close && close[1]![0] === fence.char && close[1]!.length >= fence.size) flush();
-      else code.push(neutralizeCode(line));
-      continue;
-    }
-    const open = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
-    if (open && !(open[1]![0] === "`" && open[2]!.includes("`"))) {
-      const info = /^[\w+#.-]{1,20}/u.exec(open[2]!.trim())?.[0] ?? "";
-      fence = { char: open[1]![0]!, size: open[1]!.length, info };
-      continue;
-    }
-    const item = /^( *)([-*+]|\d{1,9}[.)])( +)(.*)$/u.exec(line);
-    const indent = /^ */u.exec(line)![0].length;
-    if (item) {
-      inList = true;
-      const kept = Math.min(item[1]!.length, MAX_LIST_INDENT);
-      out.push(`${" ".repeat(kept)}${item[2]} ${escapeInline(item[4]!, defang)}`);
-    } else if (line.trim() === "") {
-      out.push("");
-    } else {
-      // Deep indentation outside a list would become code, where escapes show as backslashes.
-      const kept = inList && indent >= 4 ? Math.min(indent, MAX_LIST_INDENT) : 0;
-      if (indent === 0) inList = false;
-      out.push(" ".repeat(kept) + escapeInline(line.trim(), defang));
-    }
+    renderPlainLine(line, state, defang);
   }
-  flush();
-  const result = out.join("\n").trim();
+  flushFence(state);
+  const result = state.out.join("\n").trim();
   if (!hasSafeProse(result)) throw new Error("Linear reply contains unsafe text after rendering");
   return result;
+}
+
+function flushFence(state: PlainTextState): void {
+  const { fence, code, out } = state;
+  if (fence === undefined) return;
+  const longest = Math.max(0, ...[...code.join("\n").matchAll(/`+/gu)].map((run) => run[0].length));
+  const ticks = "`".repeat(Math.max(3, longest + 1));
+  out.push(ticks + fence.info, ...code, ticks);
+  state.fence = undefined;
+  state.code = [];
+}
+
+function renderPlainLine(line: string, state: PlainTextState, defang: boolean): void {
+  if (state.fence !== undefined) {
+    if (closesFence(line, state.fence)) flushFence(state);
+    else state.code.push(neutralizeCode(line));
+    return;
+  }
+  const open = readFence(FENCE_OPEN.exec(line));
+  if (open !== undefined) {
+    open.info = /^[\w+#.-]{1,20}/u.exec(open.info.trim())?.[0] ?? "";
+    state.fence = open;
+    return;
+  }
+  renderProseLine(line, state, defang);
+}
+
+function renderProseLine(line: string, state: PlainTextState, defang: boolean): void {
+  const item = /^( *)([-*+]|\d{1,9}[.)])( +)(.*)$/u.exec(line);
+  const indent = /^ */u.exec(line)?.[0].length ?? 0;
+  if (item) {
+    state.inList = true;
+    state.out.push(renderListItem(item, defang));
+  } else if (line.trim() === "") {
+    state.out.push("");
+  } else {
+    // Deep indentation outside a list would become code, where escapes show as backslashes.
+    const kept = state.inList && indent >= 4 ? Math.min(indent, MAX_LIST_INDENT) : 0;
+    if (indent === 0) state.inList = false;
+    state.out.push(" ".repeat(kept) + escapeInline(line.trim(), defang));
+  }
+}
+
+function renderListItem(item: RegExpExecArray, defang: boolean): string {
+  const kept = Math.min(item[1]?.length ?? 0, MAX_LIST_INDENT);
+  return `${" ".repeat(kept)}${item[2]} ${escapeInline(item[4] ?? "", defang)}`;
 }
 
 // Code is not decoded by Markdown, but the final check reads the whole reply once decoded, so an
@@ -386,33 +478,7 @@ function sanitizeMarkdown(markdown: Root): void {
   const labels = new Map<string, string>();
   const pending: Parents[] = [markdown];
   for (const parent of pending) {
-    for (let index = parent.children.length - 1; index >= 0; index -= 1) {
-      const node = parent.children[index]!;
-      if (node.type === "link" && (!safeLink(node.url) || node.url.includes("[redacted]"))) {
-        // Keep the label; a redacted or unsafe destination is not worth the whole sentence.
-        parent.children.splice(index, 1, ...node.children);
-        index += node.children.length;
-        continue;
-      }
-      if (removeNode(node)) {
-        parent.children.splice(index, 1);
-        continue;
-      }
-      if ("value" in node) node.value = neutralizeMentions(node.value);
-      if ("title" in node && node.title != null) node.title = neutralizeMentions(node.title);
-      if ("identifier" in node) {
-        const label = labels.get(node.identifier) ?? `ref-${labels.size + 1}`;
-        labels.set(node.identifier, label);
-        node.identifier = label;
-        node.label = label;
-        if (node.type === "linkReference") node.referenceType = "full";
-      }
-      if (node.type === "code") {
-        if (node.lang != null) node.lang = neutralizeMentions(node.lang);
-        if (node.meta != null) node.meta = neutralizeMentions(node.meta);
-      }
-      if ("children" in node) pending.push(node);
-    }
+    sanitizeChildren(parent, labels, pending);
   }
   // Removing an image, tag or user tag can leave an empty "~~~~" or "****", which re-parses as a
   // fence or a thematic break. Children come after their parents in the list, so walk it backwards.
@@ -425,6 +491,42 @@ function sanitizeMarkdown(markdown: Root): void {
             child.children.length === 0)
         ),
     );
+  }
+}
+
+function sanitizeChildren(parent: Parents, labels: Map<string, string>, pending: Parents[]): void {
+  for (let index = parent.children.length - 1; index >= 0; index -= 1) {
+    const node = parent.children[index];
+    if (node === undefined)
+      throw new TypeError("Cannot read properties of undefined (reading 'type')");
+    if (node.type === "link" && (!safeLink(node.url) || node.url.includes("[redacted]"))) {
+      // Keep the label; a redacted or unsafe destination is not worth the whole sentence.
+      parent.children.splice(index, 1, ...node.children);
+      index += node.children.length;
+      continue;
+    }
+    if (removeNode(node)) {
+      parent.children.splice(index, 1);
+      continue;
+    }
+    sanitizeNode(node, labels);
+    if ("children" in node) pending.push(node);
+  }
+}
+
+function sanitizeNode(node: RootContent, labels: Map<string, string>): void {
+  if ("value" in node) node.value = neutralizeMentions(node.value);
+  if ("title" in node && node.title != null) node.title = neutralizeMentions(node.title);
+  if ("identifier" in node) {
+    const label = labels.get(node.identifier) ?? `ref-${labels.size + 1}`;
+    labels.set(node.identifier, label);
+    node.identifier = label;
+    node.label = label;
+    if (node.type === "linkReference") node.referenceType = "full";
+  }
+  if (node.type === "code") {
+    if (node.lang != null) node.lang = neutralizeMentions(node.lang);
+    if (node.meta != null) node.meta = neutralizeMentions(node.meta);
   }
 }
 
@@ -441,7 +543,9 @@ function removeUnsafeUrls(value: string): string {
   const unsafe: [number, number][] = [];
   for (const start of value.matchAll(URL_START)) {
     URL_RUN.lastIndex = start.index;
-    const run = URL_RUN.exec(value)![0];
+    const match = URL_RUN.exec(value);
+    if (match === null) throw new TypeError("Cannot read properties of null (reading '0')");
+    const run = match[0];
     const absolute = run.includes("://") ? run : `https://${run}`;
     if (!safeLink(absolute)) unsafe.push([start.index, start.index + run.length]);
   }
