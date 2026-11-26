@@ -114,8 +114,15 @@ describe("Hub bundle path validation", () => {
     `${workflow}/`,
   ])("rejects unsafe path %j without rewriting it", (path) => {
     const files = [{ path, content: "" }, ...fixture()];
-    expect(issues(files)).toEqual([{ path: [path], message: "unsafe bundle path" }]);
-    expect(() => compileHubBundle(files)).toThrow(new Error(`${path}: unsafe bundle path`));
+    try {
+      compileHubBundle(files);
+    } catch (error) {
+      if (!(error instanceof HubBundleError)) throw error;
+      expect(error.issues).toEqual([{ path: [path], message: "unsafe bundle path" }]);
+      expect(error.message).toBe(`${path}: unsafe bundle path`);
+      return;
+    }
+    throw new Error("expected bundle compilation to reject the path");
   });
 
   it.each([hub, workflow, partial])("accepts canonical path %s", (path) => {
