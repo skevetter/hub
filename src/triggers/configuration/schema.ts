@@ -28,7 +28,7 @@ const WorktreeTargetSchema = z.discriminatedUnion("mode", [
 export const IDENTIFIER = /^[a-z][a-z0-9_-]*$/u;
 const EVENT_NAME = /^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*$/u;
 const CONNECTION_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
-const InputValueSchema = z.union([z.string(), z.number().finite(), z.boolean()]);
+const InputValueSchema = z.union([z.string(), z.number(), z.boolean()]);
 
 export const TriggerInputSchema = z
   .object({
@@ -186,16 +186,20 @@ export const TriggerRunSchema = z.unknown().transform((value, context): TriggerR
     issue([], "run must be an object with a target and an action: agent and prompt, or script.");
     return z.NEVER;
   }
-  if (!("script" in value)) {
-    if (!("agent" in value) && !("prompt" in value)) {
-      issue([], "run needs an action: agent with prompt, or script.");
-      return z.NEVER;
-    }
-    const parsed = TriggerAgentRunSchema.safeParse(value);
-    if (parsed.success) return parsed.data;
-    for (const found of parsed.error.issues) issue(issuePath(found.path), found.message);
+  return "script" in value ? parseScriptRun(value, issue) : parseAgentRun(value, issue);
+});
+
+type RunIssue = (path: (string | number)[], message: string) => void;
+
+function parseAgentRun(value: object, issue: RunIssue): TriggerRun {
+  if (!("agent" in value) && !("prompt" in value)) {
+    issue([], "run needs an action: agent with prompt, or script.");
     return z.NEVER;
   }
+  return readRunResult(TriggerAgentRunSchema.safeParse(value), issue);
+}
+
+function parseScriptRun(value: object, issue: RunIssue): TriggerRun {
   const refused = Object.entries(SCRIPT_REJECTED_OPTIONS).filter(([key]) => key in value);
   for (const [key, message] of refused) issue([key], message);
   const target: unknown = "target" in value ? value.target : undefined;
@@ -207,11 +211,14 @@ export const TriggerRunSchema = z.unknown().transform((value, context): TriggerR
     );
   }
   if (refused.length > 0 || worktree) return z.NEVER;
-  const parsed = TriggerScriptRunSchema.safeParse(value);
+  return readRunResult(TriggerScriptRunSchema.safeParse(value), issue);
+}
+
+function readRunResult(parsed: z.ZodSafeParseResult<TriggerRun>, issue: RunIssue): TriggerRun {
   if (parsed.success) return parsed.data;
   for (const found of parsed.error.issues) issue(issuePath(found.path), found.message);
   return z.NEVER;
-});
+}
 
 function issuePath(path: readonly PropertyKey[]): (string | number)[] {
   return path.map((segment) =>
@@ -253,49 +260,13 @@ export const TriggerDocumentSchema = z
   })
   .superRefine((trigger, context) => {
     for (const [event, definition] of Object.entries(trigger.on)) {
-      if (event === "schedule.tick") {
-        if (
-          definition.recurrence === undefined ||
-          definition.connection !== undefined ||
-          definition.filters !== undefined
-        ) {
-          context.addIssue({
-            code: "custom",
-            path: ["on", event],
-            message: "Schedule requires recurrence and does not accept connection or filters.",
-          });
-        }
-        // A tick supplies no inputs; it runs with the declared defaults.
-        for (const [name, input] of Object.entries(trigger.inputs ?? {})) {
-          if (input.required !== true) continue;
-          context.addIssue({
-            code: "custom",
-            path: ["inputs", name],
-            message: "A trigger with a schedule cannot require an input; give it a default.",
-          });
-        }
-      } else if (definition.recurrence !== undefined) {
-        context.addIssue({
-          code: "custom",
-          path: ["on", event, "recurrence"],
-          message: "Recurrence is only supported for schedule.tick.",
-        });
-      }
+      recurrenceIssues(event, definition, trigger.inputs, context);
       notificationIssues(definition, event, context);
-      const addedLabel = isEditorEvent(event)
-        ? eventDefinition(event).qualifiers.find(({ key }) => key === "label")
-        : undefined;
-      if (addedLabel?.required && !definition.filters?.label?.trim()) {
-        context.addIssue({
-          code: "custom",
-          path: ["on", event, "filters", "label"],
-          message: `${addedLabel.label} is required.`,
-        });
-      }
+      requiredLabelIssue(event, definition, context);
     }
     if (Object.keys(trigger.on).length === 0) {
       context.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: "custom",
         path: ["on"],
         message: "at least one event is required",
       });
@@ -306,7 +277,7 @@ export const TriggerDocumentSchema = z
       Object.keys(trigger.run.agent.choices).length === 0
     ) {
       context.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: "custom",
         path: ["run", "agent", "choices"],
         message: "at least one agent choice is required",
       });
@@ -314,6 +285,59 @@ export const TriggerDocumentSchema = z
   });
 
 export type TriggerDocument = z.infer<typeof TriggerDocumentSchema>;
+
+function requiredLabelIssue(
+  event: string,
+  definition: z.infer<typeof TriggerEventSchema>,
+  context: z.RefinementCtx,
+): void {
+  const addedLabel = isEditorEvent(event)
+    ? eventDefinition(event).qualifiers.find(({ key }) => key === "label")
+    : undefined;
+  if (addedLabel?.required && !definition.filters?.label?.trim()) {
+    context.addIssue({
+      code: "custom",
+      path: ["on", event, "filters", "label"],
+      message: `${addedLabel.label} is required.`,
+    });
+  }
+}
+
+function recurrenceIssues(
+  event: string,
+  definition: z.infer<typeof TriggerEventSchema>,
+  inputs: TriggerDocument["inputs"],
+  context: z.RefinementCtx,
+): void {
+  if (event === "schedule.tick") {
+    if (
+      definition.recurrence === undefined ||
+      definition.connection !== undefined ||
+      definition.filters !== undefined
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["on", event],
+        message: "Schedule requires recurrence and does not accept connection or filters.",
+      });
+    }
+    // A tick supplies no inputs; it runs with the declared defaults.
+    for (const [name, input] of Object.entries(inputs ?? {})) {
+      if (input.required !== true) continue;
+      context.addIssue({
+        code: "custom",
+        path: ["inputs", name],
+        message: "A trigger with a schedule cannot require an input; give it a default.",
+      });
+    }
+  } else if (definition.recurrence !== undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["on", event, "recurrence"],
+      message: "Recurrence is only supported for schedule.tick.",
+    });
+  }
+}
 
 /** The poll has no connection and no actor; a filter it cannot evaluate must not pass silently. */
 function notificationIssues(

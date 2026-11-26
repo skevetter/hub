@@ -8,7 +8,7 @@ const LinearIssueSchema = z.object({
   identifier: z.string().min(1).optional(),
   title: z.string(),
   description: z.string().nullable(),
-  url: z.string().url().optional(),
+  url: z.url().optional(),
   projectId: LinearIdSchema.nullable(),
   stateId: LinearIdSchema.nullable(),
   assigneeId: LinearIdSchema.nullable(),
@@ -31,7 +31,7 @@ export const NormalizedLinearIssueEventSchema = z.object({
   actor: LinearActorSchema.nullable(),
   issue: LinearIssueSchema,
   updatedFrom: LinearIssuePreviousSchema,
-  occurredAt: z.string().datetime().optional(),
+  occurredAt: z.iso.datetime().optional(),
 });
 
 export const NormalizedLinearCommentEventSchema = z.object({
@@ -42,7 +42,7 @@ export const NormalizedLinearCommentEventSchema = z.object({
   actor: LinearActorSchema.nullable(),
   comment: z.object({ id: LinearIdSchema, body: z.string(), issueId: LinearIdSchema }),
   issue: LinearIssueSchema.nullable(),
-  occurredAt: z.string().datetime().optional(),
+  occurredAt: z.iso.datetime().optional(),
 });
 
 export const NormalizedLinearEventSchema = z.discriminatedUnion("type", [
@@ -156,15 +156,20 @@ function normalizeCommentEvent(
     action: envelope.action,
     id: commentId,
     organizationId: envelope.organizationId,
-    actor:
-      normalizeActor(envelope.payload["actor"]) ??
-      normalizeActor(envelope.data["user"]) ??
-      actorFromUserId(envelope.data) ??
-      null,
+    actor: normalizeCommentActor(envelope),
     comment: { id: commentId, body: readString(envelope.data["body"]) ?? "", issueId },
     issue: normalizeIssue(asRecord(envelope.data["issue"]) ?? {}, hydratedIssue) ?? null,
     ...(envelope.occurredAt === undefined ? {} : { occurredAt: envelope.occurredAt }),
   });
+}
+
+function normalizeCommentActor(envelope: LinearEnvelope): NormalizedLinearEvent["actor"] {
+  return (
+    normalizeActor(envelope.payload["actor"]) ??
+    normalizeActor(envelope.data["user"]) ??
+    actorFromUserId(envelope.data) ??
+    null
+  );
 }
 
 function normalizeIssue(
@@ -175,19 +180,36 @@ function normalizeIssue(
   if (id === undefined) return undefined;
   const title = firstDefined(readString(data["title"]), hydrated?.title);
   if (title === undefined) return undefined;
+  return issueFields(data, hydrated, { id, title });
+}
+
+function issueFields(
+  data: Record<string, unknown>,
+  hydrated: LinearIssueDetails | undefined,
+  core: Pick<NormalizedLinearIssue, "id" | "title">,
+): NormalizedLinearIssue {
   const identifier = firstDefined(readString(data["identifier"]), hydrated?.identifier);
   const url = firstDefined(readString(data["url"]), hydrated?.url);
   return {
-    id,
+    id: core.id,
     ...optionalProperty("identifier", identifier),
-    title,
+    title: core.title,
     description: nullableValue(data, "description", hydrated?.description ?? null),
     ...optionalProperty("url", url),
+    ...issueRelations(data, hydrated),
+    labelIds: firstDefined(readLabelIds(data), hydrated?.labelIds) ?? [],
+  };
+}
+
+function issueRelations(
+  data: Record<string, unknown>,
+  hydrated: LinearIssueDetails | undefined,
+): Pick<NormalizedLinearIssue, "projectId" | "stateId" | "assigneeId" | "delegateId"> {
+  return {
     projectId: relatedId(data, "projectId", "project", hydrated?.projectId ?? null),
     stateId: relatedId(data, "stateId", "state", hydrated?.stateId ?? null),
     assigneeId: relatedId(data, "assigneeId", "assignee", hydrated?.assigneeId ?? null),
     delegateId: relatedId(data, "delegateId", "delegate", null),
-    labelIds: firstDefined(readLabelIds(data), hydrated?.labelIds) ?? [],
   };
 }
 
@@ -230,22 +252,30 @@ function normalizePreviousIssue(value: unknown): z.infer<typeof LinearIssuePrevi
   const previous = asRecord(value);
   if (previous === undefined) return {};
   return {
-    ...(hasOwn(previous, "projectId") || hasOwn(previous, "project")
+    ...(hasPreviousField(previous, "projectId", "project")
       ? { projectId: readPreviousRelatedId(previous, "projectId", "project") }
       : {}),
-    ...(hasOwn(previous, "stateId") || hasOwn(previous, "state")
+    ...(hasPreviousField(previous, "stateId", "state")
       ? { stateId: readPreviousRelatedId(previous, "stateId", "state") }
       : {}),
-    ...(hasOwn(previous, "assigneeId") || hasOwn(previous, "assignee")
+    ...(hasPreviousField(previous, "assigneeId", "assignee")
       ? { assigneeId: readPreviousRelatedId(previous, "assigneeId", "assignee") }
       : {}),
-    ...(hasOwn(previous, "delegateId") || hasOwn(previous, "delegate")
+    ...(hasPreviousField(previous, "delegateId", "delegate")
       ? { delegateId: readPreviousRelatedId(previous, "delegateId", "delegate") }
       : {}),
-    ...(hasOwn(previous, "labelIds") || hasOwn(previous, "labels")
+    ...(hasPreviousField(previous, "labelIds", "labels")
       ? { labelIds: readLabelIds(previous) ?? [] }
       : {}),
   };
+}
+
+function hasPreviousField(
+  previous: Record<string, unknown>,
+  direct: string,
+  nested: string,
+): boolean {
+  return hasOwn(previous, direct) || hasOwn(previous, nested);
 }
 
 function readPreviousRelatedId(

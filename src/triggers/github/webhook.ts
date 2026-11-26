@@ -1,7 +1,9 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import type { NormalizedGitHubEvent } from "../../auth/github-events.js";
-import { WebhookPayloadSchema } from "../../auth/github-events.js";
-import type { WebhookPayload } from "../../auth/github-events.js";
+import {
+  type NormalizedGitHubEvent,
+  type WebhookPayload,
+  WebhookPayloadSchema,
+} from "../../auth/github-events.js";
 import { isDatabaseUnavailableError } from "../../db/errors.js";
 import type { ProviderEventAcceptance } from "../../db/types.js";
 import { reportFailure } from "../../failures/index.js";
@@ -119,11 +121,12 @@ async function handleVerifiedWebhook(
     return new Response("Bad Request", { status: 400 });
   }
 
-  if (eventType === "installation" || eventType === "installation_repositories") {
+  if (isLifecycleEvent(eventType)) {
     return handleLifecycle(options, verified, installationId, eventType);
   }
 
   const event = normalizeWebhookEvent({ body, deliveryId, eventType });
+  let response: Promise<Response> | undefined;
   if (event === undefined) {
     logger.info({ deliveryId, eventType }, "skipping webhook event without repo or installation");
     const acceptance = await options.accept({
@@ -141,42 +144,66 @@ async function handleVerifiedWebhook(
       deliveryId,
       acceptance,
     });
-    return new Response("OK", { status: 200 });
+  } else {
+    const acceptance = await options.accept(webhookAcceptanceInput(verified, event, handlers));
+    logNormalizedIntake(verified, event, acceptance);
+    if (!isExpiredRejection(acceptance)) {
+      if (eventType === "push" && options.synchronizePush !== undefined) {
+        await options.synchronizePush({
+          installationId: event.installationId,
+          repositoryId: event.repositoryId,
+          deliveryId,
+          payload: body,
+        });
+      }
+      if (acceptance.status === "accepted") response = dispatchWebhook(handlers, acceptance.events);
+    }
   }
 
-  const acceptance = await options.accept({
+  return response ?? new Response("OK", { status: 200 });
+}
+
+function isLifecycleEvent(
+  eventType: string,
+): eventType is "installation" | "installation_repositories" {
+  return eventType === "installation" || eventType === "installation_repositories";
+}
+
+function webhookAcceptanceInput(
+  verified: VerifiedWebhook,
+  event: NormalizedGitHubEvent,
+  handlers: Set<TriggerHandler>,
+): Parameters<WebhookSourceOptions["accept"]>[0] {
+  return {
     installationId: event.installationId,
     repositoryId: event.repositoryId,
-    deliveryId,
-    signatureHash,
-    source: `github.${eventType}`,
+    deliveryId: verified.deliveryId,
+    signatureHash: verified.signatureHash,
+    source: `github.${verified.eventType}`,
     repo: event.repo,
     payload: event,
     receivedAt: new Date(event.createdAt),
     ...(handlers.size === 0 ? { dropReason: "configuration_unavailable" } : {}),
-  });
+  };
+}
+
+function logNormalizedIntake(
+  verified: VerifiedWebhook,
+  event: NormalizedGitHubEvent,
+  acceptance: ProviderEventAcceptance,
+): void {
   logProviderEventIntake({
     provider: "github",
-    source: `github.${eventType}`,
-    deliveryId,
+    source: `github.${verified.eventType}`,
+    deliveryId: verified.deliveryId,
     repository: event.repo,
     resourceId: String(event.repositoryId),
     acceptance,
   });
-  if (acceptance.status !== "accepted" && acceptance.payloadExpiryState !== undefined)
-    return new Response("OK", { status: 200 });
-  if (eventType === "push" && options.synchronizePush !== undefined) {
-    await options.synchronizePush({
-      installationId: event.installationId,
-      repositoryId: event.repositoryId,
-      deliveryId,
-      payload: body,
-    });
-  }
+}
 
-  if (acceptance.status !== "accepted") return new Response("OK", { status: 200 });
-
-  return dispatchWebhook(handlers, acceptance.events);
+function isExpiredRejection(acceptance: ProviderEventAcceptance): boolean {
+  return acceptance.status !== "accepted" && acceptance.payloadExpiryState !== undefined;
 }
 
 async function verifyWebhookRequest(
@@ -192,7 +219,15 @@ async function verifyWebhookRequest(
 
   const captured = await readBoundedRequestBody(request, MAX_WEBHOOK_BYTES);
   if (captured instanceof Response) return captured;
+  return verifyCapturedWebhook(request, captured, secret, signature);
+}
 
+function verifyCapturedWebhook(
+  request: Request,
+  captured: Uint8Array,
+  secret: string,
+  signature: string,
+): VerifiedWebhook | Response {
   if (!verifySignature(secret, captured, signature)) {
     reportGitHubRejection("signature_verification_failed", 401, secret, signature);
     return new Response("Unauthorized", { status: 401 });
@@ -202,18 +237,24 @@ async function verifyWebhookRequest(
   const eventType = request.headers.get("X-GitHub-Event") ?? undefined;
   const deliveryId = request.headers.get("X-GitHub-Delivery") ?? undefined;
 
-  if (
-    eventType === undefined ||
-    deliveryId === undefined ||
-    eventType.length > MAX_HEADER_LENGTH ||
-    deliveryId.length > MAX_HEADER_LENGTH ||
-    eventType.length === 0 ||
-    deliveryId.length === 0
-  ) {
+  if (!isWebhookHeader(eventType) || !isWebhookHeader(deliveryId)) {
     reportGitHubRejection("required_headers_missing", 400, secret, signature);
     return new Response("Bad Request", { status: 400 });
   }
 
+  const body = parseWebhookBody(captured, secret, signature);
+  return body instanceof Response ? body : { body, deliveryId, eventType, signatureHash };
+}
+
+function isWebhookHeader(value: string | undefined): value is string {
+  return value !== undefined && value.length <= MAX_HEADER_LENGTH && value.length > 0;
+}
+
+function parseWebhookBody(
+  captured: Uint8Array,
+  secret: string,
+  signature: string,
+): WebhookPayload | Response {
   let rawJson: unknown;
 
   try {
@@ -231,13 +272,12 @@ async function verifyWebhookRequest(
 
   if (!parsedBody.success) {
     reportGitHubRejection("invalid_payload", 400, secret, signature);
-    return Response.json(
-      { error: "invalid webhook payload", issues: parsedBody.error.format() },
-      { status: 400 },
-    );
+    // All nested fields catch parse failures, so the legacy issues shape is root-only.
+    const issues = { _errors: parsedBody.error.issues.map((issue) => issue.message) };
+    return Response.json({ error: "invalid webhook payload", issues }, { status: 400 });
   }
 
-  return { body: parsedBody.data, deliveryId, eventType, signatureHash };
+  return parsedBody.data;
 }
 
 /** A refused delivery is an unsigned one (401), an unconfigured endpoint (503), or malformed. */

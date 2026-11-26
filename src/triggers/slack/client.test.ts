@@ -173,12 +173,13 @@ describe("Slack Web API client", () => {
       beforeTs: "1700000000.000456",
     });
 
-    assert.equal(hydrated?.messages.length, 50);
-    assert.equal(hydrated?.messages[0]?.content, "root request");
-    assert.equal(hydrated?.messages[1]?.content, "reply-407");
-    assert.equal(hydrated?.messages.at(-1)?.content, "reply-455");
-    assert.deepEqual(hydrated?.messages.at(-1)?.author, { id: "B455" });
-    assert.equal(hydrated?.complete, true);
+    assert(hydrated);
+    assert.equal(hydrated.messages.length, 50);
+    assert.equal(hydrated.messages[0]?.content, "root request");
+    assert.equal(hydrated.messages[1]?.content, "reply-407");
+    assert.equal(hydrated.messages.at(-1)?.content, "reply-455");
+    assert.deepEqual(hydrated.messages.at(-1)?.author, { id: "B455" });
+    assert.equal(hydrated.complete, true);
     assert.equal(requests.length, 5);
     assert.deepEqual(
       requests.map(({ method, body }) => ({ method, body })),
@@ -301,3 +302,39 @@ function requestUrl(input: RequestInfo | URL): string {
   if (typeof input === "string") return input;
   return input instanceof URL ? input.toString() : input.url;
 }
+
+it("accepts Slack extension fields and stops on a repeated replies cursor", async () => {
+  const cursors: Array<string | null> = [];
+  const client = createSlackBotClient({
+    tokenForWorkspace: () => Promise.resolve("test-token"),
+    fetch: (input) => {
+      const cursor = new URL(requestUrl(input)).searchParams.get("cursor");
+      cursors.push(cursor);
+      const message =
+        cursor === null
+          ? { ts: "1.0", files: [{ id: "F1", future_file_field: true }], future_message_field: 1 }
+          : { ts: "2.0", text: "reply" };
+      return Promise.resolve(
+        Response.json({
+          ok: true,
+          messages: [message],
+          future_response_field: true,
+          response_metadata: { next_cursor: "page" },
+        }),
+      );
+    },
+  });
+  const thread = await client.readThreadMessages?.({
+    organizationId: "org",
+    teamId: "team",
+    channelId: "channel",
+    threadTs: "1.0",
+    beforeTs: "3.0",
+  });
+
+  assert.deepEqual(cursors, [null, "page"]);
+  assert.equal(thread?.complete, false);
+  assert.deepEqual(thread?.messages[0]?.attachments, [
+    { id: "F1", filename: "F1", contentType: null, size: null },
+  ]);
+});
