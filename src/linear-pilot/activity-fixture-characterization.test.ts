@@ -3,7 +3,7 @@ import { activity, conversation } from "./test-fixtures.js";
 
 describe("Linear history row fixture", () => {
   it("defaults actors by kind without losing an explicit actor", () => {
-    expect(activity("id", 1, "prompt", "")).toEqual({
+    expect(activity({ id: "id", second: 1, kind: "prompt", body: "" })).toEqual({
       id: "id",
       agentSession: { id: conversation.nativeSessionId },
       user: { id: conversation.ownerId },
@@ -12,13 +12,19 @@ describe("Linear history row fixture", () => {
       signal: null,
       content: { type: "prompt", __typename: "AgentActivityPromptContent", body: "" },
     });
-    expect(activity("id", 61, "response", "reply").user.id).toBe(conversation.appUserId);
-    expect(activity("id", -1, "action", "text", "other")).toMatchObject({
+    expect(activity({ id: "id", second: 61, kind: "response", body: "reply" }).user.id).toBe(
+      conversation.appUserId,
+    );
+    expect(
+      activity({ id: "id", second: -1, kind: "action", body: "text", actor: "other" }),
+    ).toMatchObject({
       user: { id: "other" },
       createdAt: "2025-12-31T23:59:59.000Z",
       promptAuthor: null,
       content: { __typename: "AgentActivityActionContent" },
     });
-    expect(() => activity("id", Number.NaN, "prompt", "")).toThrow("Invalid time value");
+    expect(() => activity({ id: "id", second: Number.NaN, kind: "prompt", body: "" })).toThrow(
+      "Invalid time value",
+    );
   });
 });
