@@ -105,6 +105,22 @@ interface ApiExecutionOptions {
   hook: WebhookRoute | undefined;
 }
 
+interface ApiRequest {
+  request: Request;
+  requestId: string;
+  options: ApiExecutionOptions;
+}
+
+interface ApiRuntime {
+  composition: PublicApiComposition;
+  operations: PublicOperations | null;
+}
+
+interface SignedWebhookRoute {
+  trigger: string;
+  keyId: string;
+}
+
 interface StreamingRequestInit extends RequestInit {
   duplex: "half";
 }
@@ -124,9 +140,10 @@ function webhookRoute(pathname: string): WebhookRoute | undefined {
     /^\/api\/v1\/hooks\/([^/]+)(?:\/signers\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))?$/u.exec(
       pathname,
     );
-  if (match === null) return undefined;
+  const segment = match?.[1];
+  if (match === null || segment === undefined) return undefined;
   try {
-    const trigger = decodeURIComponent(match[1]!);
+    const trigger = decodeURIComponent(segment);
     if (!/^[a-z][a-z0-9_-]*$/u.test(trigger)) return undefined;
     return { trigger, ...(match[2] === undefined ? {} : { keyId: match[2] }) };
   } catch {
@@ -161,15 +178,15 @@ export function createPublicApi(
       : undefined;
     const execution = { webhookOptions, limiter, log, hook };
     const response = await routeRequest(
-      request,
-      requestId,
-      composition,
-      operations,
-      execution,
+      { request, requestId, options: execution },
+      { composition, operations },
       operationId,
     );
     if (log !== undefined) {
-      logWebhookResponse(logger, log, response, Math.max(0, now() - startedAt), webhookOptions);
+      logWebhookResponse(logger, log, response, {
+        durationMs: Math.max(0, now() - startedAt),
+        webhookOptions,
+      });
     }
     return response;
   }
@@ -185,85 +202,82 @@ export function createPublicApi(
 }
 
 async function routeRequest(
-  request: Request,
-  requestId: string,
-  composition: PublicApiComposition,
-  operations: PublicOperations | null,
-  options: ApiExecutionOptions,
+  context: ApiRequest,
+  runtime: ApiRuntime,
   operationId?: PublicOperationId,
 ): Promise<Response> {
-  if (options.log !== undefined) {
-    if (request.method.toUpperCase() !== "POST") {
-      return problem(
-        requestId,
-        405,
-        "method_not_allowed",
-        "Method not allowed",
-        "Use POST.",
-        undefined,
-        { Allow: "POST" },
-      );
-    }
-    if (options.log.trigger === null) {
-      return problem(
-        requestId,
-        404,
-        "trigger_not_found",
-        "Trigger not found",
-        "No matching webhook trigger exists.",
-      );
-    }
-    const id = options.hook?.keyId === undefined ? "receiveWebhook" : "receiveGitHubWebhook";
-    return executeSafely(id, request, requestId, composition, operations, options);
-  }
-  if (operationId !== undefined) {
-    return executeSafely(operationId, request, requestId, composition, operations, options);
-  }
+  const { request, requestId, options } = context;
+  if (options.log !== undefined) return routeWebhook(context, runtime, options.log);
+  if (operationId !== undefined) return executeSafely(operationId, context, runtime);
   const pathname = new URL(request.url).pathname;
   const routes = publicOperationManifest.filter(
     (route) => operationPathMatch(route, pathname) !== undefined,
   );
   if (routes.length === 0) {
-    return problem(
-      requestId,
-      404,
-      "not_found",
-      "Not found",
-      "No canonical API route matches this path.",
-    );
+    return problem(requestId, {
+      status: 404,
+      code: "not_found",
+      title: "Not found",
+      detail: "No canonical API route matches this path.",
+    });
   }
   const route = routes.find(
     (candidate) => candidate.method.toUpperCase() === request.method.toUpperCase(),
   );
   if (route === undefined) {
-    return problem(
-      requestId,
-      405,
-      "method_not_allowed",
-      "Method not allowed",
-      "Use one of the methods listed in the Allow response header.",
-      undefined,
-      { Allow: routes.map(({ method }) => method.toUpperCase()).join(", ") },
-    );
+    return problem(requestId, {
+      status: 405,
+      code: "method_not_allowed",
+      title: "Method not allowed",
+      detail: "Use one of the methods listed in the Allow response header.",
+      headers: { Allow: routes.map(({ method }) => method.toUpperCase()).join(", ") },
+    });
   }
-  return executeSafely(route.id, request, requestId, composition, operations, options);
+  return executeSafely(route.id, context, runtime);
+}
+
+function routeWebhook(
+  context: ApiRequest,
+  runtime: ApiRuntime,
+  log: WebhookRequestLog,
+): Response | Promise<Response> {
+  const { request, requestId, options } = context;
+  if (request.method.toUpperCase() !== "POST") {
+    return problem(requestId, {
+      status: 405,
+      code: "method_not_allowed",
+      title: "Method not allowed",
+      detail: "Use POST.",
+      headers: { Allow: "POST" },
+    });
+  }
+  if (log.trigger === null) {
+    return problem(requestId, {
+      status: 404,
+      code: "trigger_not_found",
+      title: "Trigger not found",
+      detail: "No matching webhook trigger exists.",
+    });
+  }
+  const { hook } = options;
+  if (hook?.keyId !== undefined) {
+    return executeSafely("receiveGitHubWebhook", context, runtime, {
+      keyId: hook.keyId,
+      trigger: hook.trigger,
+    });
+  }
+  return executeSafely("receiveWebhook", context, runtime);
 }
 
 function logWebhookResponse(
   logger: Pick<Logger, "info" | "warn">,
   log: WebhookRequestLog,
   response: Response,
-  durationMs: number,
-  options: WebhookOptions,
+  { durationMs, webhookOptions }: { durationMs: number; webhookOptions: WebhookOptions },
 ): void {
   const metadata = responseMetadata.get(response);
   const code = metadata?.code ?? null;
-  let limit: string | undefined;
-  if (response.status === 413) {
-    limit = log.bytes > options.maxBytes ? "maxBytes" : "messageBytes";
-  } else if (response.status === 429) {
-    limit = code === "trigger_busy" ? "maxActiveRuns" : "ratePerMinute";
-  }
+  const limit = webhookLogLimit(response.status, code, log, webhookOptions);
   const fields = {
     operation: "webhook.received",
     ...log,
@@ -276,9 +290,23 @@ function logWebhookResponse(
     duplicate: metadata?.duplicate ?? null,
     ...(limit === undefined ? {} : { limit }),
   };
-  if (response.status >= 400 && response.status < 500 && response.status !== 401)
-    logger.warn(fields);
+  if (isWebhookWarning(response.status)) logger.warn(fields);
   else logger.info(fields);
+}
+
+function webhookLogLimit(
+  status: number,
+  code: string | null,
+  log: WebhookRequestLog,
+  options: WebhookOptions,
+): string | undefined {
+  if (status === 413) return log.bytes > options.maxBytes ? "maxBytes" : "messageBytes";
+  if (status === 429) return code === "trigger_busy" ? "maxActiveRuns" : "ratePerMinute";
+  return undefined;
+}
+
+function isWebhookWarning(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 401;
 }
 
 function signedFailureCategory(status: number): string {
@@ -290,63 +318,63 @@ function signedFailureCategory(status: number): string {
 
 async function executeSafely(
   id: PublicOperationId,
-  request: Request,
-  requestId: string,
-  composition: PublicApiComposition,
-  operations: PublicOperations | null,
-  options: ApiExecutionOptions,
+  context: ApiRequest,
+  { composition, operations }: ApiRuntime,
+  signedRoute?: SignedWebhookRoute,
 ): Promise<Response> {
+  const { requestId } = context;
   try {
     if (composition.status === "unavailable" || operations === null) {
-      return problem(
-        requestId,
-        503,
-        "infrastructure_unavailable",
-        "Service unavailable",
-        "Public API authentication or storage is currently unavailable.",
-      );
+      return problem(requestId, {
+        status: 503,
+        code: "infrastructure_unavailable",
+        title: "Service unavailable",
+        detail: "Public API authentication or storage is currently unavailable.",
+      });
+    }
+    if (signedRoute !== undefined) {
+      return await executeSignedWebhook(context, operations, signedRoute, composition.webhookKeys);
     }
     if (id === "receiveGitHubWebhook") {
-      return await executeSignedWebhook(
-        request,
-        requestId,
-        operations,
-        options,
-        options.hook!.keyId!,
-        composition.webhookKeys,
-      );
+      throw new TypeError("Cannot read properties of undefined (reading 'keyId')");
     }
-    return await execute(id, request, requestId, composition.authenticator, operations, options);
+    return await execute(id, context, composition.authenticator, operations);
   } catch (error) {
-    reportFailure(
-      options.hook?.keyId === undefined ? error : new Error("Signed webhook operation failed"),
-      {
-        operation: `public-api.${id}`,
-        component: "public-api",
-        requestId,
-        status: isDatabaseUnavailableError(error) ? 503 : 500,
-      },
-      { status: isDatabaseUnavailableError(error) ? 503 : 500 },
-    );
-    if (isDatabaseUnavailableError(error)) return infrastructureProblem(requestId);
-    return problem(
-      requestId,
-      500,
-      "internal_error",
-      "Internal server error",
-      "The operation failed unexpectedly. Contact the Hub operator with the request ID.",
-    );
+    return operationFailure(id, context, error);
   }
+}
+
+function operationFailure(
+  id: PublicOperationId,
+  { requestId, options }: ApiRequest,
+  error: unknown,
+): Response {
+  reportFailure(
+    options.hook?.keyId === undefined ? error : new Error("Signed webhook operation failed"),
+    {
+      operation: `public-api.${id}`,
+      component: "public-api",
+      requestId,
+      status: isDatabaseUnavailableError(error) ? 503 : 500,
+    },
+    { status: isDatabaseUnavailableError(error) ? 503 : 500 },
+  );
+  if (isDatabaseUnavailableError(error)) return infrastructureProblem(requestId);
+  return problem(requestId, {
+    status: 500,
+    code: "internal_error",
+    title: "Internal server error",
+    detail: "The operation failed unexpectedly. Contact the Hub operator with the request ID.",
+  });
 }
 
 async function execute(
   id: PublicOperationId,
-  request: Request,
-  requestId: string,
+  context: ApiRequest,
   authenticator: OperationAuthenticator,
   operations: PublicOperations,
-  options: ApiExecutionOptions,
 ): Promise<Response> {
+  const { request, requestId } = context;
   const definition = publicOperation(id);
   const scope = definition.scope;
   let authorization;
@@ -354,61 +382,81 @@ async function execute(
     authorization = await authenticator.authorize(request, scope);
   } catch (error) {
     if (!isDatabaseUnavailableError(error)) throw error;
-    return problem(
-      requestId,
-      503,
-      "authentication_unavailable",
-      "Authentication unavailable",
-      "Bearer-credential authentication is currently unavailable. Retry the request later.",
-    );
+    return problem(requestId, {
+      status: 503,
+      code: "authentication_unavailable",
+      title: "Authentication unavailable",
+      detail: "Bearer-credential authentication is currently unavailable. Retry the request later.",
+    });
   }
   if (authorization.status === "unauthorized") {
-    return problem(
-      requestId,
-      401,
-      "unauthorized",
-      "Authentication required",
-      "Provide an active Paseo organization credential in the Authorization: Bearer header.",
-    );
+    return problem(requestId, {
+      status: 401,
+      code: "unauthorized",
+      title: "Authentication required",
+      detail:
+        "Provide an active Paseo organization credential in the Authorization: Bearer header.",
+    });
   }
   if (authorization.status === "forbidden") {
-    return problem(
-      requestId,
-      403,
-      "insufficient_scope",
-      "Insufficient scope",
-      `This operation requires the ${scope} scope.`,
-    );
+    return problem(requestId, {
+      status: 403,
+      code: "insufficient_scope",
+      title: "Insufficient scope",
+      detail: `This operation requires the ${scope} scope.`,
+    });
   }
-  const access: PublicAuthorization = authorization.access;
-  if (definition.webhook) {
-    if (options.log !== undefined) options.log.keyId = access.credentialId;
-    if (access.kind !== "apiKey" || !access.actor) {
-      return problem(
-        requestId,
-        403,
-        "key_actor_required",
-        "Bound actor required",
-        "Use an API key with a bound actor.",
-      );
-    }
-    const parsed = await readWebhook(request, requestId, options);
-    if (parsed instanceof Response) return parsed;
-    return deliverWebhook(requestId, operations, options, access, parsed);
+  const { access } = authorization;
+  if (definition.webhook) return executeBearerWebhook(context, operations, access);
+  return executeAuthorized(context, operations, { id, definition, access });
+}
+
+async function executeBearerWebhook(
+  context: ApiRequest,
+  operations: PublicOperations,
+  access: PublicAuthorization,
+): Promise<Response> {
+  const { request, requestId, options } = context;
+  if (options.log !== undefined) options.log.keyId = access.credentialId;
+  if (access.kind !== "apiKey" || !access.actor) {
+    return problem(requestId, {
+      status: 403,
+      code: "key_actor_required",
+      title: "Bound actor required",
+      detail: "Use an API key with a bound actor.",
+    });
   }
+  const parsed = await readWebhook(request, requestId, options);
+  if (parsed instanceof Response) return parsed;
+  return deliverWebhook(context, operations, access, { input: parsed });
+}
+
+async function executeAuthorized(
+  context: ApiRequest,
+  operations: PublicOperations,
+  {
+    id,
+    definition,
+    access,
+  }: {
+    id: PublicOperationId;
+    definition: PublicOperationDefinition;
+    access: PublicAuthorization;
+  },
+): Promise<Response> {
+  const { request, requestId, options } = context;
   let input: unknown;
   if (definition.pathSchema !== undefined) {
     const parsed = definition.pathSchema.safeParse(
       operationPathMatch(definition, new URL(request.url).pathname),
     );
     if (!parsed.success)
-      return problem(
-        requestId,
-        400,
-        "invalid_request",
-        "Invalid run ID",
-        "Use a UUID for the run ID.",
-      );
+      return problem(requestId, {
+        status: 400,
+        code: "invalid_request",
+        title: "Invalid run ID",
+        detail: "Use a UUID for the run ID.",
+      });
     input = parsed.data;
   }
   if (definition.requestSchema !== undefined) {
@@ -416,24 +464,7 @@ async function execute(
       request,
       id === "dispatchManualRun" ? options.webhookOptions.maxBytes : undefined,
     );
-    if (!parsedBody.success && parsedBody.tooLarge) {
-      return problem(
-        requestId,
-        413,
-        "payload_too_large",
-        "Payload too large",
-        "The request body exceeds the byte limit.",
-      );
-    }
-    if (!parsedBody.success) {
-      return problem(
-        requestId,
-        400,
-        "invalid_json",
-        "Invalid JSON",
-        "Send a JSON request body using Content-Type: application/json.",
-      );
-    }
+    if (!parsedBody.success) return invalidOperationBody(requestId, parsedBody.tooLarge);
     const parsed = definition.requestSchema.safeParse(parsedBody.value);
     if (!parsed.success) {
       return validationProblem(requestId, parsed.error.issues);
@@ -444,66 +475,100 @@ async function execute(
   return mapOperationResult(definition.resultMapping, requestId, result);
 }
 
+function invalidOperationBody(requestId: string, tooLarge: boolean | undefined): Response {
+  if (tooLarge) {
+    return problem(requestId, {
+      status: 413,
+      code: "payload_too_large",
+      title: "Payload too large",
+      detail: "The request body exceeds the byte limit.",
+    });
+  }
+  return problem(requestId, {
+    status: 400,
+    code: "invalid_json",
+    title: "Invalid JSON",
+    detail: "Send a JSON request body using Content-Type: application/json.",
+  });
+}
+
+type OperationResponse = (requestId: string, result: PublicOperationResult) => Response;
+
 function mapOperationResult(
   mapping: PublicOperationDefinition["resultMapping"],
   requestId: string,
   result: PublicOperationResult,
-) {
-  if (mapping === "run-stop") return stopRunResponse(requestId, result);
-  if (mapping === "triggers") {
-    if (!isTriggersResult(result)) throw new Error("invalid triggers operation result");
-    return triggersResponse(requestId, result);
-  }
-  return operationResponse(mapping, requestId, result);
-}
-
-function checkedWebhookResponse(requestId: string, result: PublicOperationResult): Response {
-  if (!isWebhookResult(result)) throw new Error("invalid webhook operation result");
-  return webhookResponse(requestId, result);
-}
-
-function operationResponse(
-  mapping: Exclude<PublicOperationDefinition["resultMapping"], "triggers" | "run-stop">,
-  requestId: string,
-  result: PublicOperationResult,
 ): Response {
-  switch (mapping) {
-    case "trigger-validation":
-      if (!isTriggerValidationResult(result)) throw new Error("invalid trigger validation result");
-      return triggerValidationResponse(requestId, result);
-    case "trigger-installation":
-      if (!isTriggerInstallationResult(result)) {
-        throw new Error("invalid trigger installation result");
-      }
-      return triggerInstallationResponse(requestId, result);
-    case "projects":
-      if (!isProjectsResult(result)) throw new Error("invalid projects operation result");
-      return projectsResponse(requestId, result);
-    case "configuration-resources":
-      if (!isConfigurationResourcesResult(result))
-        throw new Error("invalid configuration resources operation result");
-      return configurationResourcesResponse(requestId, result);
-    case "setup-resources":
-      if (!isSetupResourcesResult(result))
-        throw new Error("invalid setup resources operation result");
-      return setupResourcesResponse(requestId, result);
-    case "validation":
-      if (!isValidationResult(result)) throw new Error("invalid validation operation result");
-      return validationResponse(requestId, result);
-    case "configuration":
-      if (!isInstallationResult(result)) throw new Error("invalid configuration operation result");
-      return installationResponse(requestId, result);
-    case "manual-run":
-      if (!isManualRunResult(result)) throw new Error("invalid manual-run operation result");
-      return manualRunResponse(requestId, result);
-    case "webhook":
-      return checkedWebhookResponse(requestId, result);
-    case "enrollment-token":
-      if (!isEnrollmentResult(result)) throw new Error("invalid enrollment operation result");
-      return enrollmentResponse(requestId, result);
-  }
-  return assertNever(mapping);
+  const respond = lookupOperationStatus(operationResponses, mapping);
+  if (respond === undefined) return unhandledResult(mapping);
+  return respond(requestId, result);
 }
+
+function checkedResponse<T extends PublicOperationResult>(
+  accepts: (result: PublicOperationResult) => result is T,
+  respond: (requestId: string, result: T) => Response,
+  error: string,
+): OperationResponse {
+  return (requestId, result) => {
+    if (!accepts(result)) throw new Error(error);
+    return respond(requestId, result);
+  };
+}
+
+const operationResponses = {
+  "run-stop": stopRunResponse,
+  triggers: checkedResponse(
+    isTriggersResult,
+    triggersResponse,
+    "invalid triggers operation result",
+  ),
+  "trigger-validation": checkedResponse(
+    isTriggerValidationResult,
+    triggerValidationResponse,
+    "invalid trigger validation result",
+  ),
+  "trigger-installation": checkedResponse(
+    isTriggerInstallationResult,
+    triggerInstallationResponse,
+    "invalid trigger installation result",
+  ),
+  projects: checkedResponse(
+    isProjectsResult,
+    projectsResponse,
+    "invalid projects operation result",
+  ),
+  "configuration-resources": checkedResponse(
+    isConfigurationResourcesResult,
+    configurationResourcesResponse,
+    "invalid configuration resources operation result",
+  ),
+  "setup-resources": checkedResponse(
+    isSetupResourcesResult,
+    setupResourcesResponse,
+    "invalid setup resources operation result",
+  ),
+  validation: checkedResponse(
+    isValidationResult,
+    validationResponse,
+    "invalid validation operation result",
+  ),
+  configuration: checkedResponse(
+    isInstallationResult,
+    installationResponse,
+    "invalid configuration operation result",
+  ),
+  "manual-run": checkedResponse(
+    isManualRunResult,
+    manualRunResponse,
+    "invalid manual-run operation result",
+  ),
+  webhook: checkedResponse(isWebhookResult, webhookResponse, "invalid webhook operation result"),
+  "enrollment-token": checkedResponse(
+    isEnrollmentResult,
+    enrollmentResponse,
+    "invalid enrollment operation result",
+  ),
+} satisfies Record<PublicOperationDefinition["resultMapping"], OperationResponse>;
 
 function triggersResponse(requestId: string, result: ListTriggersResult): Response {
   return result.status === "listed"
@@ -516,14 +581,13 @@ function triggerValidationResponse(requestId: string, result: ValidateTriggerRes
     case "valid":
       return success(requestId, 200, ValidatedTriggerSchema, { name: result.name, valid: true });
     case "invalid_trigger":
-      return problem(
-        requestId,
-        422,
-        "invalid_trigger",
-        "Invalid trigger",
-        "Correct the self-contained trigger YAML.",
-        result.issues,
-      );
+      return problem(requestId, {
+        status: 422,
+        code: "invalid_trigger",
+        title: "Invalid trigger",
+        detail: "Correct the self-contained trigger YAML.",
+        issues: result.issues,
+      });
     case "infrastructure_unavailable":
       return infrastructureProblem(requestId);
   }
@@ -541,14 +605,13 @@ function triggerInstallationResponse(requestId: string, result: InstallTriggerRe
         active: true,
       });
     case "invalid_trigger":
-      return problem(
-        requestId,
-        422,
-        "invalid_trigger",
-        "Invalid trigger",
-        "Correct the self-contained trigger YAML and submit it again.",
-        result.issues,
-      );
+      return problem(requestId, {
+        status: 422,
+        code: "invalid_trigger",
+        title: "Invalid trigger",
+        detail: "Correct the self-contained trigger YAML and submit it again.",
+        issues: result.issues,
+      });
     case "infrastructure_unavailable":
       return infrastructureProblem(requestId);
   }
@@ -595,31 +658,28 @@ function validationResponse(requestId: string, result: ValidateConfigurationResu
         ...(result.wouldCreateProject === true ? { wouldCreateProject: true } : {}),
       });
     case "project_not_found":
-      return problem(
-        requestId,
-        404,
-        "project_not_found",
-        "Project not found",
-        "No active project with that slug exists in the credential's organization.",
-      );
+      return problem(requestId, {
+        status: 404,
+        code: "project_not_found",
+        title: "Project not found",
+        detail: "No active project with that slug exists in the credential's organization.",
+      });
     case "invalid_bundle":
-      return problem(
-        requestId,
-        422,
-        "invalid_configuration_bundle",
-        "Invalid configuration bundle",
-        "Correct the canonical Hub bundle files.",
-        result.issues,
-      );
+      return problem(requestId, {
+        status: 422,
+        code: "invalid_configuration_bundle",
+        title: "Invalid configuration bundle",
+        detail: "Correct the canonical Hub bundle files.",
+        issues: result.issues,
+      });
     case "invalid_configuration":
-      return problem(
-        requestId,
-        422,
-        "invalid_configuration",
-        "Invalid configuration",
-        "See issues for configuration errors.",
-        result.issues,
-      );
+      return problem(requestId, {
+        status: 422,
+        code: "invalid_configuration",
+        title: "Invalid configuration",
+        detail: "See issues for configuration errors.",
+        issues: result.issues,
+      });
     case "infrastructure_unavailable":
       return infrastructureProblem(requestId);
   }
@@ -627,18 +687,17 @@ function validationResponse(requestId: string, result: ValidateConfigurationResu
 }
 
 async function executeSignedWebhook(
-  request: Request,
-  requestId: string,
+  context: ApiRequest,
   operations: PublicOperations,
-  options: ApiExecutionOptions,
-  keyId: string,
+  route: SignedWebhookRoute,
   keys: OrganizationApiKeys | undefined,
 ): Promise<Response> {
+  const { request, requestId, options } = context;
   if (options.log !== undefined) {
     options.log.authenticationMode = "hmac";
     options.log.signatureProfile = "github_sha256";
   }
-  const proof = await authenticateSignedWebhook(request, requestId, options, keyId, keys);
+  const proof = await authenticateSignedWebhook(context, route.keyId, keys);
   if (proof instanceof Response) return proof;
   const { access, bytes } = proof;
   const text = decodeWebhookText(bytes, requestId);
@@ -649,61 +708,44 @@ async function executeSignedWebhook(
   const deliveryKey = `github-sha256:${bodyDigest}`;
   const requestedKey = request.headers.get("idempotency-key");
   if (requestedKey !== null && requestedKey !== deliveryKey) {
-    return problem(
-      requestId,
-      400,
-      "invalid_request",
-      "Invalid request",
-      "Idempotency-Key must match the signed body's delivery key when supplied.",
-    );
+    return problem(requestId, {
+      status: 400,
+      code: "invalid_request",
+      title: "Invalid request",
+      detail: "Idempotency-Key must match the signed body's delivery key when supplied.",
+    });
   }
-  return deliverWebhook(
-    requestId,
-    operations,
-    options,
-    access,
-    {
+  return deliverWebhook(context, operations, access, {
+    input: {
       ...payload,
-      trigger: options.hook!.trigger,
+      trigger: route.trigger,
       deliveryKey,
       githubSignature: { targetTriggerId: access.targetTriggerId, bodyDigest },
     },
-    proof.keys,
-  );
+    signingKeys: proof.keys,
+  });
 }
 
 async function authenticateSignedWebhook(
-  request: Request,
-  requestId: string,
-  options: ApiExecutionOptions,
+  { request, requestId, options }: ApiRequest,
   keyId: string,
-  keys: OrganizationApiKeys | undefined,
+  configuredKeys: OrganizationApiKeys | undefined,
 ): Promise<{ access: WebhookSigner; bytes: Uint8Array; keys: OrganizationApiKeys } | Response> {
-  const signature = parseGitHubSignature(request.headers.get("x-hub-signature-256"));
-  if (
-    signature === undefined ||
-    request.headers.has("authorization") ||
-    request.headers.has("x-paseo-signature")
-  )
-    return signedUnauthorized(requestId);
+  const signature = signedRequestSignature(request);
+  if (signature === undefined) return signedUnauthorized(requestId);
 
-  const state = keys?.signing.availability();
-  if (keys === undefined || state === "disabled") return signedUnauthorized(requestId);
-  if (state === "unavailable") return signedUnavailable(requestId);
+  const keys = availableSigningKeys(configuredKeys, requestId);
+  if (keys instanceof Response) return keys;
 
   try {
     if ((await keys.signing.findSigner(keyId)) === undefined) return signedUnauthorized(requestId);
-    if (
-      webhookMediaType(request.headers.get("content-type")) !== "application/json" ||
-      ![null, "identity"].includes(request.headers.get("content-encoding")?.toLowerCase() ?? null)
-    ) {
-      return problem(
-        requestId,
-        415,
-        "unsupported_media_type",
-        "Unsupported media type",
-        "Use identity-encoded application/json with UTF-8.",
-      );
+    if (!hasSignedWebhookMediaType(request)) {
+      return problem(requestId, {
+        status: 415,
+        code: "unsupported_media_type",
+        title: "Unsupported media type",
+        detail: "Use identity-encoded application/json with UTF-8.",
+      });
     }
     const body = await readWebhookBytes(request, requestId, options);
     if (body instanceof Response) return body;
@@ -715,54 +757,81 @@ async function authenticateSignedWebhook(
     }
     return { access: verified.signer, bytes: body, keys };
   } catch (error) {
-    if (error instanceof SigningRequestError || isDatabaseUnavailableError(error)) {
-      return signedUnavailable(requestId);
-    }
-    throw error;
+    return signedAuthenticationFailure(requestId, error);
   }
 }
 
-function signedUnauthorized(requestId: string): Response {
-  const response = problem(
-    requestId,
-    401,
-    "unauthorized",
-    "Authentication required",
-    "Provide a valid GitHub SHA-256 signature for this signer.",
+function availableSigningKeys(
+  keys: OrganizationApiKeys | undefined,
+  requestId: string,
+): OrganizationApiKeys | Response {
+  const state = keys?.signing.availability();
+  if (keys === undefined || state === "disabled") return signedUnauthorized(requestId);
+  if (state === "unavailable") return signedUnavailable(requestId);
+
+  return keys;
+}
+
+function signedAuthenticationFailure(requestId: string, error: unknown): Response {
+  if (error instanceof SigningRequestError || isDatabaseUnavailableError(error)) {
+    return signedUnavailable(requestId);
+  }
+  throw error;
+}
+
+function signedRequestSignature(request: Request): Buffer | undefined {
+  const signature = parseGitHubSignature(request.headers.get("x-hub-signature-256"));
+  if (
+    signature === undefined ||
+    request.headers.has("authorization") ||
+    request.headers.has("x-paseo-signature")
+  )
+    return undefined;
+  return signature;
+}
+
+function hasSignedWebhookMediaType(request: Request): boolean {
+  return (
+    webhookMediaType(request.headers.get("content-type")) === "application/json" &&
+    [null, "identity"].includes(request.headers.get("content-encoding")?.toLowerCase() ?? null)
   );
+}
+
+function signedUnauthorized(requestId: string): Response {
+  const response = problem(requestId, {
+    status: 401,
+    code: "unauthorized",
+    title: "Authentication required",
+    detail: "Provide a valid GitHub SHA-256 signature for this signer.",
+  });
   response.headers.delete("www-authenticate");
   return response;
 }
 
 function signedUnavailable(requestId: string): Response {
-  return problem(
-    requestId,
-    503,
-    "authentication_unavailable",
-    "Authentication unavailable",
-    "Webhook signature authentication is currently unavailable. Retry the request later.",
-  );
+  return problem(requestId, {
+    status: 503,
+    code: "authentication_unavailable",
+    title: "Authentication unavailable",
+    detail: "Webhook signature authentication is currently unavailable. Retry the request later.",
+  });
 }
 
 async function deliverWebhook(
-  requestId: string,
+  { requestId, options }: ApiRequest,
   operations: PublicOperations,
-  options: ApiExecutionOptions,
   access: PublicAuthorization,
-  input: ReceiveWebhookInput,
-  signingKeys?: OrganizationApiKeys,
+  { input, signingKeys }: { input: ReceiveWebhookInput; signingKeys?: OrganizationApiKeys },
 ): Promise<Response> {
   const bucket = options.limiter.take(access.credentialId);
   if (!bucket.allowed) {
-    return problem(
-      requestId,
-      429,
-      "rate_limited",
-      "Rate limited",
-      "The API key has exceeded its webhook rate limit.",
-      undefined,
-      { "Retry-After": String(bucket.retryAfter) },
-    );
+    return problem(requestId, {
+      status: 429,
+      code: "rate_limited",
+      title: "Rate limited",
+      detail: "The API key has exceeded its webhook rate limit.",
+      headers: { "Retry-After": String(bucket.retryAfter) },
+    });
   }
   if (signingKeys !== undefined) {
     try {
@@ -793,13 +862,12 @@ async function readWebhook(
 ): Promise<ReceiveWebhookInput | Response> {
   const type = webhookMediaType(request.headers.get("content-type"));
   if (type === undefined) {
-    return problem(
-      requestId,
-      415,
-      "unsupported_media_type",
-      "Unsupported media type",
-      "Use application/json or text/plain with UTF-8.",
-    );
+    return problem(requestId, {
+      status: 415,
+      code: "unsupported_media_type",
+      title: "Unsupported media type",
+      detail: "Use application/json or text/plain with UTF-8.",
+    });
   }
   const bytes = await readWebhookBytes(request, requestId, options);
   if (bytes instanceof Response) return bytes;
@@ -809,13 +877,12 @@ async function readWebhook(
   if (payload instanceof Response) return payload;
   const idempotencyKey = request.headers.get("idempotency-key");
   if (idempotencyKey !== null && !/^[\x20-\x7e]{1,200}$/u.test(idempotencyKey)) {
-    return problem(
-      requestId,
-      400,
-      "invalid_request",
-      "Invalid request",
-      "Idempotency-Key must contain 1 to 200 printable ASCII characters.",
-    );
+    return problem(requestId, {
+      status: 400,
+      code: "invalid_request",
+      title: "Invalid request",
+      detail: "Idempotency-Key must contain 1 to 200 printable ASCII characters.",
+    });
   }
   const deliveryKey = idempotencyKey ?? randomUUID();
   if (options.log !== undefined) {
@@ -875,13 +942,12 @@ async function readWebhookBytes(
   }
   const bytes = await readBoundedRequestBody(countedRequest, options.webhookOptions.maxBytes);
   if (bytes instanceof Response) {
-    return problem(
-      requestId,
-      413,
-      "payload_too_large",
-      "Payload too large",
-      "The request body exceeds the byte limit.",
-    );
+    return problem(requestId, {
+      status: 413,
+      code: "payload_too_large",
+      title: "Payload too large",
+      detail: "The request body exceeds the byte limit.",
+    });
   }
   return bytes;
 }
@@ -890,89 +956,125 @@ function decodeWebhookText(bytes: Uint8Array, requestId: string): string | Respo
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    return problem(
-      requestId,
-      400,
-      "invalid_request",
-      "Invalid request",
-      "The request body must be valid UTF-8.",
-    );
+    return problem(requestId, {
+      status: 400,
+      code: "invalid_request",
+      title: "Invalid request",
+      detail: "The request body must be valid UTF-8.",
+    });
   }
 }
+
+type WebhookPayload = Pick<ReceiveWebhookInput, "input" | "data">;
 
 function parseWebhookPayload(
   text: string,
   type: "application/json" | "text/plain",
   requestId: string,
-): Pick<ReceiveWebhookInput, "input" | "data"> | Response {
-  let data: Record<string, unknown> | undefined;
-  let input = text;
-  if (type === "application/json") {
-    let value: unknown;
-    try {
-      value = JSON.parse(text) as unknown;
-    } catch {
-      return problem(requestId, 400, "invalid_json", "Invalid JSON", "Send a valid JSON object.");
-    }
-    if (!isWebhookObject(value)) {
-      return problem(
-        requestId,
-        422,
-        "invalid_body",
-        "Invalid body",
-        "Send a JSON object with Unicode scalar strings and keys without NUL, finite numbers, maximum depth 20, and at most 1000 keys per object.",
-      );
-    }
-    data = value;
-    const message = data["message"];
-    if (message !== undefined && typeof message !== "string") {
-      return problem(
-        requestId,
-        422,
-        "invalid_input",
-        "Invalid trigger input",
-        "message must be a string.",
-        [{ path: ["message"], message: "Expected a string." }],
-      );
-    }
-    input = message ?? "";
-  } else if (text.length === 0 || !hasPostgresText(text)) {
-    return problem(
-      requestId,
-      400,
-      "invalid_request",
-      "Invalid request",
-      "Send a nonempty text body with Unicode scalar text without NUL.",
-    );
+): WebhookPayload | Response {
+  const payload =
+    type === "application/json"
+      ? parseWebhookJson(text, requestId)
+      : parseWebhookText(text, requestId);
+  if (payload instanceof Response) return payload;
+  if (Buffer.byteLength(payload.input, "utf8") > 65_536) {
+    return problem(requestId, {
+      status: 413,
+      code: "payload_too_large",
+      title: "Payload too large",
+      detail: "The prompt exceeds the 64 KiB byte limit.",
+    });
   }
-  if (Buffer.byteLength(input, "utf8") > 65_536) {
-    return problem(
-      requestId,
-      413,
-      "payload_too_large",
-      "Payload too large",
-      "The prompt exceeds the 64 KiB byte limit.",
-    );
-  }
-  return { input, ...(data === undefined ? {} : { data }) };
+  return payload;
 }
 
-function isWebhookResult(result: PublicOperationResult): result is ReceiveWebhookResult {
-  switch (result.status) {
-    case "dispatched":
-      return "duplicate" in result && typeof result.duplicate === "boolean";
-    case "filtered":
-    case "invalid_input":
-    case "trigger_busy":
-    case "key_actor_required":
-    case "actor_forbidden":
-    case "trigger_not_found":
-    case "dispatch_conflict":
-    case "infrastructure_unavailable":
-      return true;
-    default:
-      return false;
+function parseWebhookText(text: string, requestId: string): WebhookPayload | Response {
+  if (text.length === 0 || !hasPostgresText(text)) {
+    return problem(requestId, {
+      status: 400,
+      code: "invalid_request",
+      title: "Invalid request",
+      detail: "Send a nonempty text body with Unicode scalar text without NUL.",
+    });
   }
+  return { input: text };
+}
+
+function parseWebhookJson(text: string, requestId: string): WebhookPayload | Response {
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch {
+    return problem(requestId, {
+      status: 400,
+      code: "invalid_json",
+      title: "Invalid JSON",
+      detail: "Send a valid JSON object.",
+    });
+  }
+  if (!isWebhookObject(value)) {
+    return problem(requestId, {
+      status: 422,
+      code: "invalid_body",
+      title: "Invalid body",
+      detail:
+        "Send a JSON object with Unicode scalar strings and keys without NUL, finite numbers, maximum depth 20, and at most 1000 keys per object.",
+    });
+  }
+  const message = value["message"];
+  if (message !== undefined && typeof message !== "string") {
+    return problem(requestId, {
+      status: 422,
+      code: "invalid_input",
+      title: "Invalid trigger input",
+      detail: "message must be a string.",
+      issues: [{ path: ["message"], message: "Expected a string." }],
+    });
+  }
+  return { input: message ?? "", data: value };
+}
+
+const webhookResultStatus: Record<
+  Exclude<PublicOperationResult["status"], "dispatched">,
+  boolean
+> = {
+  actor_forbidden: true,
+  configuration_not_found: false,
+  conflict: false,
+  credential_revoked: false,
+  daemon_offline: false,
+  dispatch_conflict: true,
+  expected_configuration_not_current: false,
+  filtered: true,
+  forbidden: false,
+  infrastructure_unavailable: true,
+  installed: false,
+  invalid_bundle: false,
+  invalid_configuration: false,
+  invalid_input: true,
+  invalid_trigger: false,
+  issued: false,
+  key_actor_required: true,
+  listed: false,
+  project_not_found: false,
+  run_not_found: false,
+  stopped: false,
+  trigger_busy: true,
+  trigger_not_found: true,
+  valid: false,
+};
+
+function isWebhookResult(result: PublicOperationResult): result is ReceiveWebhookResult {
+  const { status } = result;
+  if (status === "dispatched") {
+    return "duplicate" in result && typeof result.duplicate === "boolean";
+  }
+  return lookupOperationStatus(webhookResultStatus, status) === true;
+}
+
+function lookupOperationStatus<T>(statuses: Readonly<Record<string, T>>, status: unknown) {
+  if (typeof status !== "string" || !Object.hasOwn(statuses, status)) return undefined;
+  return statuses[status];
 }
 
 function isWebhookObject(value: unknown): value is Record<string, unknown> {
@@ -989,64 +1091,71 @@ function webhookResponse(
   result: ReceiveWebhookResult,
   signed = false,
 ): Response {
-  switch (result.status) {
-    case "dispatched":
-      return success(requestId, result.duplicate ? 200 : 202, ReceivedWebhookSchema, {
-        deliveryKey: result.deliveryKey,
-        providerEventReceiptId: result.providerEventReceiptId,
-        triggerRunId: result.triggerRunId,
-        configuredTriggerName: result.configuredTriggerName,
-        workflowStatus: result.workflowStatus,
-        duplicate: result.duplicate,
-      });
-    case "filtered":
-      return success(requestId, result.duplicate ? 200 : 202, ReceivedWebhookSchema, result);
-    case "invalid_input":
-      return problem(
-        requestId,
-        422,
-        "invalid_input",
-        "Invalid trigger input",
-        "The submitted input does not match the trigger's declared inputs.",
-        result.issues,
-      );
+  const { status } = result;
+  if (status === "dispatched") {
+    return success(requestId, result.duplicate ? 200 : 202, ReceivedWebhookSchema, {
+      deliveryKey: result.deliveryKey,
+      providerEventReceiptId: result.providerEventReceiptId,
+      triggerRunId: result.triggerRunId,
+      configuredTriggerName: result.configuredTriggerName,
+      workflowStatus: result.workflowStatus,
+      duplicate: result.duplicate,
+    });
+  }
+  if (status === "filtered") {
+    return success(requestId, result.duplicate ? 200 : 202, ReceivedWebhookSchema, result);
+  }
+  if (status === "invalid_input") {
+    return problem(requestId, {
+      status: 422,
+      code: "invalid_input",
+      title: "Invalid trigger input",
+      detail: "The submitted input does not match the trigger's declared inputs.",
+      issues: result.issues,
+    });
+  }
+  return webhookProblem(requestId, status, result, signed);
+}
+
+function webhookProblem(
+  requestId: string,
+  status: Exclude<ReceiveWebhookResult["status"], "dispatched" | "filtered" | "invalid_input">,
+  result: ReceiveWebhookResult,
+  signed: boolean,
+): Response {
+  switch (status) {
     case "trigger_busy":
-      return problem(
-        requestId,
-        429,
-        "trigger_busy",
-        "Trigger busy",
-        "The trigger has reached its active-run limit.",
-        undefined,
-        { "Retry-After": "30" },
-      );
+      return problem(requestId, {
+        status: 429,
+        code: "trigger_busy",
+        title: "Trigger busy",
+        detail: "The trigger has reached its active-run limit.",
+        headers: { "Retry-After": "30" },
+      });
     case "key_actor_required":
     case "actor_forbidden":
-      return problem(
-        requestId,
-        403,
-        result.status,
-        "Actor forbidden",
-        "This credential's actor cannot dispatch the trigger.",
-      );
+      return problem(requestId, {
+        status: 403,
+        code: result.status,
+        title: "Actor forbidden",
+        detail: "This credential's actor cannot dispatch the trigger.",
+      });
     case "trigger_not_found":
-      return problem(
-        requestId,
-        404,
-        result.status,
-        "Trigger not found",
-        "No allowed enabled manual trigger matches this name.",
-      );
+      return problem(requestId, {
+        status: 404,
+        code: result.status,
+        title: "Trigger not found",
+        detail: "No allowed enabled manual trigger matches this name.",
+      });
     case "dispatch_conflict":
-      return problem(
-        requestId,
-        409,
-        result.status,
-        "Run not dispatched",
-        signed
+      return problem(requestId, {
+        status: 409,
+        code: result.status,
+        title: "Run not dispatched",
+        detail: signed
           ? "Retry with the exact same body and a valid GitHub signature."
           : "Retry the request with the same Idempotency-Key.",
-      );
+      });
     case "infrastructure_unavailable":
       return infrastructureProblem(requestId);
   }
@@ -1075,57 +1184,91 @@ async function readJson(
   }
 }
 
+const stopRunProblemStatus: Record<
+  Exclude<PublicOperationResult["status"], "stopped" | "infrastructure_unavailable">,
+  403 | 404 | null
+> = {
+  actor_forbidden: null,
+  configuration_not_found: null,
+  conflict: null,
+  credential_revoked: null,
+  daemon_offline: null,
+  dispatch_conflict: null,
+  dispatched: null,
+  expected_configuration_not_current: null,
+  filtered: null,
+  forbidden: 403,
+  installed: null,
+  invalid_bundle: null,
+  invalid_configuration: null,
+  invalid_input: null,
+  invalid_trigger: null,
+  issued: null,
+  key_actor_required: null,
+  listed: null,
+  project_not_found: null,
+  run_not_found: 404,
+  trigger_busy: null,
+  trigger_not_found: null,
+  valid: null,
+};
+
 function stopRunResponse(requestId: string, result: PublicOperationResult): Response {
-  switch (result.status) {
-    case "stopped": {
-      let note =
-        result.cleanupState === "waiting_for_daemon" ? stopCleanupNotes.waiting_for_daemon : null;
-      if (result.coalesced) note = stopCoalescedNote;
-      return success(requestId, 200, StoppedRunSchema, {
-        runId: result.runId,
-        status: result.runStatus,
-        cleanupState: result.cleanupState,
-        ...(note === null ? {} : { note }),
-      });
-    }
-    case "forbidden":
-      return problem(
-        requestId,
-        403,
-        "forbidden",
-        "Forbidden",
-        "Only the person who started the run or an organization admin can stop it.",
-      );
-    case "run_not_found":
-      return problem(
-        requestId,
-        404,
-        "run_not_found",
-        "Run not found",
-        "The run does not exist in this organization.",
-      );
-    case "infrastructure_unavailable":
-      return infrastructureProblem(requestId);
-    default:
-      throw new Error("invalid run stop result");
+  const { status } = result;
+  if (status === "stopped") return stoppedRunResponse(requestId, result);
+  if (status === "infrastructure_unavailable") return infrastructureProblem(requestId);
+  return stopRunProblem(requestId, lookupOperationStatus(stopRunProblemStatus, status));
+}
+
+function stoppedRunResponse(
+  requestId: string,
+  result: Extract<StopRunResult, { status: "stopped" }>,
+): Response {
+  let note =
+    result.cleanupState === "waiting_for_daemon" ? stopCleanupNotes.waiting_for_daemon : null;
+  if (result.coalesced) note = stopCoalescedNote;
+  return success(requestId, 200, StoppedRunSchema, {
+    runId: result.runId,
+    status: result.runStatus,
+    cleanupState: result.cleanupState,
+    ...(note === null ? {} : { note }),
+  });
+}
+
+function stopRunProblem(requestId: string, status: 403 | 404 | null | undefined): Response {
+  if (status === 403) {
+    return problem(requestId, {
+      status: 403,
+      code: "forbidden",
+      title: "Forbidden",
+      detail: "Only the person who started the run or an organization admin can stop it.",
+    });
   }
+  if (status === 404) {
+    return problem(requestId, {
+      status: 404,
+      code: "run_not_found",
+      title: "Run not found",
+      detail: "The run does not exist in this organization.",
+    });
+  }
+  throw new Error("invalid run stop result");
 }
 
 function validationProblem(
   requestId: string,
   issues: readonly { path: readonly PropertyKey[]; message: string }[],
 ): Response {
-  return problem(
-    requestId,
-    400,
-    "invalid_request",
-    "Invalid request",
-    "The request body contains invalid fields.",
-    issues.map((issue) => ({
+  return problem(requestId, {
+    status: 400,
+    code: "invalid_request",
+    title: "Invalid request",
+    detail: "The request body contains invalid fields.",
+    issues: issues.map((issue) => ({
       path: issue.path.flatMap((part) => (typeof part === "symbol" ? [] : [part])),
       message: issue.message,
     })),
-  );
+  });
 }
 
 function installationResponse(requestId: string, result: InstallConfigurationResult): Response {
@@ -1138,124 +1281,116 @@ function installationResponse(requestId: string, result: InstallConfigurationRes
         active: result.active,
       });
     case "project_not_found":
-      return problem(
-        requestId,
-        404,
-        "project_not_found",
-        "Project not found",
-        "No active project with that slug exists in the credential's organization.",
-      );
+      return problem(requestId, {
+        status: 404,
+        code: "project_not_found",
+        title: "Project not found",
+        detail: "No active project with that slug exists in the credential's organization.",
+      });
     case "invalid_bundle":
-      return problem(
-        requestId,
-        422,
-        "invalid_configuration_bundle",
-        "Invalid configuration bundle",
-        "Correct the canonical Hub bundle files and submit them again.",
-        result.issues,
-      );
+      return problem(requestId, {
+        status: 422,
+        code: "invalid_configuration_bundle",
+        title: "Invalid configuration bundle",
+        detail: "Correct the canonical Hub bundle files and submit them again.",
+        issues: result.issues,
+      });
     case "invalid_configuration":
-      return problem(
-        requestId,
-        422,
-        "invalid_configuration",
-        "Invalid configuration",
-        `Configuration revision ${result.versionId} was recorded but not activated.`,
-        result.issues,
-      );
+      return problem(requestId, {
+        status: 422,
+        code: "invalid_configuration",
+        title: "Invalid configuration",
+        detail: `Configuration revision ${result.versionId} was recorded but not activated.`,
+        issues: result.issues,
+      });
     case "infrastructure_unavailable":
       return infrastructureProblem(requestId);
   }
   return assertNever(result);
 }
 
+const manualRunProblems = {
+  project_not_found: {
+    status: 404,
+    code: "project_not_found",
+    title: "Project not found",
+    detail: "No active project with that slug exists in the credential's organization.",
+  },
+  key_actor_required: {
+    status: 403,
+    code: "key_actor_required",
+    title: "Bound actor required",
+    detail: "This trigger requires an API key with a bound actor.",
+  },
+  actor_forbidden: {
+    status: 403,
+    code: "actor_forbidden",
+    title: "Actor forbidden",
+    detail: "The configured manual trigger does not allow this actor.",
+  },
+  configuration_not_found: {
+    status: 404,
+    code: "configuration_not_found",
+    title: "Configuration not found",
+    detail: "The requested configuration revision is not available.",
+  },
+  trigger_not_found: {
+    status: 404,
+    code: "trigger_not_found",
+    title: "Trigger not found",
+    detail: "The active configuration has no matching manual trigger.",
+  },
+  expected_configuration_not_current: {
+    status: 409,
+    code: "configuration_changed",
+    title: "Configuration changed",
+    detail: "expectedVersionId is not the configuration version selected for this delivery.",
+  },
+  daemon_offline: {
+    status: 409,
+    code: "daemon_offline",
+    title: "Daemon offline",
+    detail: "The selected daemon is not connected. Reconnect it before retrying.",
+  },
+  dispatch_conflict: {
+    status: 409,
+    code: "dispatch_conflict",
+    title: "Run not dispatched",
+    detail:
+      "The durable event exists but no matching run is available yet. Retry with the same deliveryKey.",
+  },
+} satisfies Record<
+  Exclude<
+    DispatchManualRunResult["status"],
+    "dispatched" | "invalid_input" | "infrastructure_unavailable"
+  >,
+  OperationProblem
+>;
+
 function manualRunResponse(requestId: string, result: DispatchManualRunResult): Response {
-  switch (result.status) {
-    case "dispatched":
-      return success(requestId, 200, DispatchedManualRunSchema, {
-        deliveryKey: result.deliveryKey,
-        providerEventReceiptId: result.providerEventReceiptId,
-        triggerRunId: result.triggerRunId,
-        configuredTriggerName: result.configuredTriggerName,
-        workflowStatus: result.workflowStatus,
-      });
-    case "project_not_found":
-      return problem(
-        requestId,
-        404,
-        "project_not_found",
-        "Project not found",
-        "No active project with that slug exists in the credential's organization.",
-      );
-    case "key_actor_required":
-      return problem(
-        requestId,
-        403,
-        "key_actor_required",
-        "Bound actor required",
-        "This trigger requires an API key with a bound actor.",
-      );
-    case "actor_forbidden":
-      return problem(
-        requestId,
-        403,
-        "actor_forbidden",
-        "Actor forbidden",
-        "The configured manual trigger does not allow this actor.",
-      );
-    case "configuration_not_found":
-      return problem(
-        requestId,
-        404,
-        "configuration_not_found",
-        "Configuration not found",
-        "The requested configuration revision is not available.",
-      );
-    case "trigger_not_found":
-      return problem(
-        requestId,
-        404,
-        "trigger_not_found",
-        "Trigger not found",
-        "The active configuration has no matching manual trigger.",
-      );
-    case "expected_configuration_not_current":
-      return problem(
-        requestId,
-        409,
-        "configuration_changed",
-        "Configuration changed",
-        "expectedVersionId is not the configuration version selected for this delivery.",
-      );
-    case "daemon_offline":
-      return problem(
-        requestId,
-        409,
-        "daemon_offline",
-        "Daemon offline",
-        "The selected daemon is not connected. Reconnect it before retrying.",
-      );
-    case "invalid_input":
-      return problem(
-        requestId,
-        400,
-        "invalid_input",
-        "Invalid trigger input",
-        "The submitted input does not match the trigger's declared inputs.",
-        result.issues,
-      );
-    case "dispatch_conflict":
-      return problem(
-        requestId,
-        409,
-        "dispatch_conflict",
-        "Run not dispatched",
-        "The durable event exists but no matching run is available yet. Retry with the same deliveryKey.",
-      );
-    case "infrastructure_unavailable":
-      return infrastructureProblem(requestId);
+  const { status } = result;
+  if (status === "dispatched") {
+    return success(requestId, 200, DispatchedManualRunSchema, {
+      deliveryKey: result.deliveryKey,
+      providerEventReceiptId: result.providerEventReceiptId,
+      triggerRunId: result.triggerRunId,
+      configuredTriggerName: result.configuredTriggerName,
+      workflowStatus: result.workflowStatus,
+    });
   }
-  return assertNever(result);
+  if (status === "invalid_input") {
+    return problem(requestId, {
+      status: 400,
+      code: "invalid_input",
+      title: "Invalid trigger input",
+      detail: "The submitted input does not match the trigger's declared inputs.",
+      issues: result.issues,
+    });
+  }
+  if (status === "infrastructure_unavailable") return infrastructureProblem(requestId);
+  const rejection = lookupOperationStatus(manualRunProblems, status);
+  if (rejection === undefined) return unhandledResult(result);
+  return problem(requestId, rejection);
 }
 
 function enrollmentResponse(requestId: string, result: IssueEnrollmentTokenResult): Response {
@@ -1266,13 +1401,13 @@ function enrollmentResponse(requestId: string, result: IssueEnrollmentTokenResul
         expiresAt: result.expiresAt.toISOString(),
       });
     case "credential_revoked":
-      return problem(
-        requestId,
-        401,
-        "unauthorized",
-        "Authentication required",
-        "The organization credential was revoked before the enrollment token could be issued.",
-      );
+      return problem(requestId, {
+        status: 401,
+        code: "unauthorized",
+        title: "Authentication required",
+        detail:
+          "The organization credential was revoked before the enrollment token could be issued.",
+      });
     case "infrastructure_unavailable":
       return infrastructureProblem(requestId);
   }
@@ -1280,13 +1415,12 @@ function enrollmentResponse(requestId: string, result: IssueEnrollmentTokenResul
 }
 
 function infrastructureProblem(requestId: string): Response {
-  return problem(
-    requestId,
-    503,
-    "infrastructure_unavailable",
-    "Service unavailable",
-    "The operation could not reach durable storage. Retry the request later.",
-  );
+  return problem(requestId, {
+    status: 503,
+    code: "infrastructure_unavailable",
+    title: "Service unavailable",
+    detail: "The operation could not reach durable storage. Retry the request later.",
+  });
 }
 
 function success(
@@ -1308,17 +1442,25 @@ function success(
 }
 
 function assertNever(value: never): never {
+  return unhandledResult(value);
+}
+
+function unhandledResult(value: unknown): never {
   throw new Error(`Unhandled public operation result: ${String(value)}`);
+}
+
+interface OperationProblem {
+  status: number;
+  code: string;
+  title: string;
+  detail: string;
+  issues?: readonly { path: readonly (string | number)[]; message: string }[];
+  headers?: Readonly<Record<string, string>>;
 }
 
 function problem(
   requestId: string,
-  status: number,
-  code: string,
-  title: string,
-  detail: string,
-  issues?: readonly { path: readonly (string | number)[]; message: string }[],
-  headers?: Readonly<Record<string, string>>,
+  { status, code, title, detail, issues, headers }: OperationProblem,
 ): Response {
   const response = problemResponse(requestId, status, code, title, detail, issues, headers);
   responseMetadata.set(response, { code, duplicate: null });
