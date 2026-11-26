@@ -104,8 +104,7 @@ function event(
   provider: EventDefinition["provider"],
   label: string,
   qualifiers: readonly QualifierDefinition[],
-  audience: EventDefinition["audience"],
-  receiptSource?: string,
+  { audience, receiptSource }: Pick<EventDefinition, "audience" | "receiptSource">,
 ): EventDefinition {
   return {
     provider,
@@ -150,7 +149,7 @@ function github(label: string, subject: string, addedLabel?: "required" | "optio
       text("exclude_contains", `${subject} excludes`, "Skip events containing this literal text."),
       INPUTS,
     ],
-    "wildcard",
+    { audience: "wildcard" },
   );
 }
 
@@ -172,8 +171,10 @@ function linear(label: string, kind: "scope" | "assignment" | "comment") {
       ...(kind === "comment" ? textFilters("Comment") : []),
       INPUTS,
     ],
-    kind === "scope" ? "optional" : "named",
-    kind === "comment" ? "linear.comment" : "linear.issue",
+    {
+      audience: kind === "scope" ? "optional" : "named",
+      receiptSource: kind === "comment" ? "linear.comment" : "linear.issue",
+    },
   );
 }
 
@@ -192,7 +193,7 @@ function mention(provider: "slack" | "discord", label: string, scope: QualifierD
       ),
       INPUTS,
     ],
-    "wildcard",
+    { audience: "wildcard" },
   );
 }
 
@@ -230,7 +231,7 @@ const EVENTS = {
   "github.pull_request": github("GitHub pull request webhook", "Pull request text", "optional"),
   "github.pull_request_review": github("GitHub pull request review webhook", "Review"),
   "github.pull_request_review_comment": github("GitHub review comment webhook", "Comment"),
-  "github.push": event("github", "GitHub push", [REPO, INPUTS], "wildcard"),
+  "github.push": event("github", "GitHub push", [REPO, INPUTS], { audience: "wildcard" }),
   "linear.issue_entered_scope": linear("Linear issue entered scope", "scope"),
   "linear.issue_assigned": linear("Linear issue assigned", "assignment"),
   "linear.comment_created": linear("Linear comment created", "comment"),
@@ -246,10 +247,13 @@ const EVENTS = {
       ),
       ...textFilters("Title"),
     ],
-    "none",
+    { audience: "none" },
   ),
-  "schedule.tick": event("schedule", "Schedule", [], "none"),
-  "manual.run": event("manual", "Manual run", [INPUTS], "wildcard", "webhook.received"),
+  "schedule.tick": event("schedule", "Schedule", [], { audience: "none" }),
+  "manual.run": event("manual", "Manual run", [INPUTS], {
+    audience: "wildcard",
+    receiptSource: "webhook.received",
+  }),
 };
 
 export type EditorEvent = keyof typeof EVENTS;
