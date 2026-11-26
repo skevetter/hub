@@ -97,14 +97,7 @@ export async function createStreamHarness(
   const services = streamServices(database);
   const streams: RunStream[] = [];
   const stream = streamFactory({ ...storage, ...services, auth: session.auth, streams });
-  const key =
-    backend === "memory"
-      ? "synthetic-key"
-      : (
-          await requireStreamApiKeys(apiKeys).create(ORGANIZATION, "stream-owner", "reader", [
-            "runs:read",
-          ])
-        ).secret;
+  const key = backend === "memory" ? "synthetic-key" : (await createReaderKey(apiKeys)).secret;
   return {
     database,
     runtime: storage.runtime,
@@ -200,9 +193,14 @@ function postgresStreamStorage({ runtime, locks }: DatabaseRuntimeBundle): Strea
   return { database, runtime, apiKeys, cliCredentials, credentials };
 }
 
-function requireStreamApiKeys(apiKeys: OrganizationApiKeys | undefined): OrganizationApiKeys {
+function createReaderKey(apiKeys: OrganizationApiKeys | undefined) {
   if (apiKeys === undefined) throw new Error("Stream API keys are missing");
-  return apiKeys;
+  return apiKeys.create({
+    organizationId: ORGANIZATION,
+    createdByUserId: "stream-owner",
+    name: "reader",
+    scopes: ["runs:read"],
+  });
 }
 
 function streamSession(credentials: OperationAuthenticator) {

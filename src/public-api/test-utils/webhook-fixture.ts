@@ -77,7 +77,7 @@ function keyFactory(keys: OrganizationApiKeys) {
     identity: ApiKeyIdentityOptions = { actor: "sender" },
     organizationId = "webhook-a",
   ) =>
-    keys.createWith({
+    keys.create({
       organizationId,
       createdByUserId: "webhook-owner",
       name: `Sender ${randomUUID()}`,

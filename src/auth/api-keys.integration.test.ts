@@ -67,13 +67,18 @@ describe("organization API-key boundary", () => {
   }, 120_000);
 
   it("reveals a secret once and keeps key authentication tenant-scoped", async () => {
-    const keyA = await auth.apiKeys!.create("organization-a", "user-a", "deployment A", [
-      "configuration:install",
-      "runs:dispatch",
-    ]);
-    const keyB = await auth.apiKeys!.create("organization-b", "user-b", "deployment B", [
-      "configuration:install",
-    ]);
+    const keyA = await auth.apiKeys!.create({
+      organizationId: "organization-a",
+      createdByUserId: "user-a",
+      name: "deployment A",
+      scopes: ["configuration:install", "runs:dispatch"],
+    });
+    const keyB = await auth.apiKeys!.create({
+      organizationId: "organization-b",
+      createdByUserId: "user-b",
+      name: "deployment B",
+      scopes: ["configuration:install"],
+    });
 
     const listed = await auth.apiKeys!.list("organization-a");
     assert.deepEqual(
@@ -130,9 +135,12 @@ describe("organization API-key boundary", () => {
   });
 
   it("keeps last-use evidence conditional on successful authentication", async () => {
-    const key = await auth.apiKeys!.create("organization-a", "user-a", `last-use-${randomUUID()}`, [
-      "configuration:install",
-    ]);
+    const key = await auth.apiKeys!.create({
+      organizationId: "organization-a",
+      createdByUserId: "user-a",
+      name: `last-use-${randomUUID()}`,
+      scopes: ["configuration:install"],
+    });
     const before = (await auth.apiKeys!.list("organization-a")).find(
       ({ id }) => id === key.summary.id,
     );
@@ -161,12 +169,18 @@ describe("organization API-key boundary", () => {
   });
 
   it("issues run readers without granting dispatch and keeps dispatch separate", async () => {
-    const reader = await auth.apiKeys!.create("organization-a", "user-a", "Timeline reader", [
-      "runs:read",
-    ]);
-    const sender = await auth.apiKeys!.create("organization-a", "user-a", "Run sender", [
-      "runs:dispatch",
-    ]);
+    const reader = await auth.apiKeys!.create({
+      organizationId: "organization-a",
+      createdByUserId: "user-a",
+      name: "Timeline reader",
+      scopes: ["runs:read"],
+    });
+    const sender = await auth.apiKeys!.create({
+      organizationId: "organization-a",
+      createdByUserId: "user-a",
+      name: "Run sender",
+      scopes: ["runs:dispatch"],
+    });
     try {
       assert.equal(
         (await auth.apiKeys!.authorize(request(reader.secret), "runs:read")).status,
@@ -253,12 +267,12 @@ describe("organization API-key boundary", () => {
     const client = await createPostgresQueryRuntime(databaseUrl);
 
     try {
-      const revokedFirst = await auth.apiKeys!.create(
-        "organization-a",
-        "user-a",
-        `revoked-first-${randomUUID()}`,
-        ["daemons:enroll"],
-      );
+      const revokedFirst = await auth.apiKeys!.create({
+        organizationId: "organization-a",
+        createdByUserId: "user-a",
+        name: `revoked-first-${randomUUID()}`,
+        scopes: ["daemons:enroll"],
+      });
       const { revokeFirst, rejectedIssue } = await client.transaction(async (transaction) => {
         await transaction.query(`select id from organization_api_keys where id = $1 for update`, [
           revokedFirst.summary.id,
@@ -278,12 +292,12 @@ describe("organization API-key boundary", () => {
       assert.equal(await revokeFirst, true);
       assert.equal(await rejectedIssue, false);
 
-      const issuedFirst = await auth.apiKeys!.create(
-        "organization-a",
-        "user-a",
-        `issued-first-${randomUUID()}`,
-        ["daemons:enroll"],
-      );
+      const issuedFirst = await auth.apiKeys!.create({
+        organizationId: "organization-a",
+        createdByUserId: "user-a",
+        name: `issued-first-${randomUUID()}`,
+        scopes: ["daemons:enroll"],
+      });
       const issuedTokenId = randomUUID();
       const { acceptedIssue, revokeAfterIssue } = await client.transaction(async (transaction) => {
         await transaction.query(`select id from organization_api_keys where id = $1 for update`, [
@@ -465,7 +479,7 @@ describe("organization API-key boundary", () => {
     operation: PublicOperation,
   ): Promise<void> {
     const keys = auth.apiKeys!;
-    const valid = await keys.createWith({
+    const valid = await keys.create({
       organizationId: "organization-a",
       createdByUserId: "user-a",
       name: `valid-${operation.scope}-${randomUUID()}`,
@@ -474,18 +488,18 @@ describe("organization API-key boundary", () => {
     });
     const insufficientScope =
       operation.scope === "configuration:install" ? "runs:dispatch" : "configuration:install";
-    const insufficient = await keys.create(
-      "organization-a",
-      "user-a",
-      `insufficient-${operation.scope}-${randomUUID()}`,
-      [insufficientScope],
-    );
-    const revoked = await keys.create(
-      "organization-a",
-      "user-a",
-      `revoked-${operation.scope}-${randomUUID()}`,
-      [operation.scope],
-    );
+    const insufficient = await keys.create({
+      organizationId: "organization-a",
+      createdByUserId: "user-a",
+      name: `insufficient-${operation.scope}-${randomUUID()}`,
+      scopes: [insufficientScope],
+    });
+    const revoked = await keys.create({
+      organizationId: "organization-a",
+      createdByUserId: "user-a",
+      name: `revoked-${operation.scope}-${randomUUID()}`,
+      scopes: [operation.scope],
+    });
     assert.equal(await keys.revoke("organization-a", revoked.summary.id), true);
     for (const [name, credential, expected] of [
       ["missing", undefined, 401],

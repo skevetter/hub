@@ -383,7 +383,7 @@ run:
     const before = (await auth.apiKeys!.list("identity-a")).length;
     for (const identity of invalidIdentities) {
       await assert.rejects(
-        auth.apiKeys!.createWith({
+        auth.apiKeys!.create({
           organizationId: "identity-a",
           createdByUserId: "identity-owner-a",
           name: "Invalid sender",
@@ -400,7 +400,7 @@ run:
       assert.equal(response.status, 400);
     }
     await assert.rejects(
-      auth.apiKeys!.createWith({
+      auth.apiKeys!.create({
         organizationId: "identity-a",
         createdByUserId: "identity-owner-a",
         name: "!!!",
@@ -731,9 +731,9 @@ run:
     assert.equal((await browserRequest("/api/auth/paseo/revoke-api-key", { id })).status, 200);
   });
 
-  it("preserves positional transactions and permits identities on other scopes", async () => {
-    const positional = await runtime.transaction((client) =>
-      auth.apiKeys!.createWith({
+  it("accepts a supplied transaction and permits identities on other scopes", async () => {
+    const transactional = await runtime.transaction((client) =>
+      auth.apiKeys!.create({
         organizationId: "identity-a",
         createdByUserId: "identity-owner-a",
         name: "Positional reader",
@@ -741,9 +741,9 @@ run:
         client,
       }),
     );
-    assert.equal(positional.summary.actor, "positional-reader");
-    assert.equal(positional.summary.allowedTriggers, null);
-    const explicit = await auth.apiKeys!.createWith({
+    assert.equal(transactional.summary.actor, "positional-reader");
+    assert.equal(transactional.summary.allowedTriggers, null);
+    const explicit = await auth.apiKeys!.create({
       organizationId: "identity-a",
       createdByUserId: "identity-owner-a",
       name: "Bound dispatcher",
@@ -752,7 +752,7 @@ run:
     });
     assert.equal(explicit.summary.actor, "ci-partner");
     assert.deepEqual(explicit.summary.allowedTriggers, []);
-    const unbound = await auth.apiKeys!.createWith({
+    const unbound = await auth.apiKeys!.create({
       organizationId: "identity-a",
       createdByUserId: "identity-owner-a",
       name: "Unbound reader",
@@ -763,14 +763,14 @@ run:
   });
 
   it("keeps API-key authorization tenant-scoped, header-only, scope-checked, and revocable", async () => {
-    const created = await auth.apiKeys!.createWith({
+    const created = await auth.apiKeys!.create({
       organizationId: "identity-a",
       createdByUserId: "identity-owner-a",
       name: "Tenant sender",
       scopes: ["events:send"],
       identity: { actor: "tenant-a", allowedTriggers: ["build-finished"] },
     });
-    const other = await auth.apiKeys!.createWith({
+    const other = await auth.apiKeys!.create({
       organizationId: "identity-b",
       createdByUserId: "identity-owner-b",
       name: "Tenant sender",
@@ -879,7 +879,7 @@ run:
   });
 
   it("writes last use once per minute under a burst and refreshes stale rows only after successful authorization", async () => {
-    const created = await auth.apiKeys!.createWith({
+    const created = await auth.apiKeys!.create({
       organizationId: "identity-a",
       createdByUserId: "identity-owner-a",
       name: "Burst sender",

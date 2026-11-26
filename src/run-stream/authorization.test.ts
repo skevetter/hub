@@ -132,19 +132,22 @@ for (const backend of ["embedded", "pooled"] as const) {
 
     it("requires the independent read scope and refuses revoked keys and CLI credentials", async () => {
       const run = await harness.createRun();
-      const dispatch = await harness.apiKeys!.create(
-        ORGANIZATION,
-        "stream-owner",
-        "dispatch only",
-        ["runs:dispatch"],
-      );
+      const dispatch = await harness.apiKeys!.create({
+        organizationId: ORGANIZATION,
+        createdByUserId: "stream-owner",
+        name: "dispatch only",
+        scopes: ["runs:dispatch"],
+      });
       const service = stream();
       const insufficient = await service.handle(streamRequest(run.id, dispatch.secret), run.id);
       assert.equal(insufficient.status, 403);
       assert.equal(ProblemSchema.parse(await insufficient.json()).code, "insufficient_scope");
-      const read = await harness.apiKeys!.create(ORGANIZATION, "stream-owner", "revoked", [
-        "runs:read",
-      ]);
+      const read = await harness.apiKeys!.create({
+        organizationId: ORGANIZATION,
+        createdByUserId: "stream-owner",
+        name: "revoked",
+        scopes: ["runs:read"],
+      });
       await harness.apiKeys!.revoke(ORGANIZATION, read.summary.id);
       assert.equal((await service.handle(streamRequest(run.id, read.secret), run.id)).status, 401);
       const cli = await harness.cli();
@@ -180,9 +183,12 @@ for (const backend of ["embedded", "pooled"] as const) {
       const run = await harness.createRun();
       const cli = await harness.cli();
       const service = stream();
-      const other = await harness.apiKeys!.create(FOREIGN, "stream-owner", "foreign read", [
-        "runs:read",
-      ]);
+      const other = await harness.apiKeys!.create({
+        organizationId: FOREIGN,
+        createdByUserId: "stream-owner",
+        name: "foreign read",
+        scopes: ["runs:read"],
+      });
       const factories = [
         (id: string) => streamRequest(id, other.secret),
         (id: string) => streamRequest(id, cli.token),
@@ -229,9 +235,12 @@ for (const backend of ["embedded", "pooled"] as const) {
       "member removal",
     ])("ends an open stream after %s without updating last use", async (mode) => {
       const run = await harness.createRun();
-      const key = await harness.apiKeys!.create(ORGANIZATION, "stream-owner", "reauthorize", [
-        "runs:read",
-      ]);
+      const key = await harness.apiKeys!.create({
+        organizationId: ORGANIZATION,
+        createdByUserId: "stream-owner",
+        name: "reauthorize",
+        scopes: ["runs:read"],
+      });
       const cli = await harness.cli();
       const isCli = mode.startsWith("CLI") || mode.startsWith("owner");
       const isBrowser = mode.startsWith("session") || mode === "member removal";
@@ -279,9 +288,12 @@ for (const backend of ["embedded", "pooled"] as const) {
     });
 
     it("binds read-only credential checks to organization and kind", async () => {
-      const key = await harness.apiKeys!.create(ORGANIZATION, "stream-owner", "read check", [
-        "runs:read",
-      ]);
+      const key = await harness.apiKeys!.create({
+        organizationId: ORGANIZATION,
+        createdByUserId: "stream-owner",
+        name: "read check",
+        scopes: ["runs:read"],
+      });
       const cli = await harness.cli();
       for (const token of [key.secret, cli.token]) {
         const result = await harness.credentials.authorize(

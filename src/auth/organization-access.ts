@@ -409,7 +409,7 @@ export class OrganizationAccess {
     const organizationId = access.organization.id;
     if (input.authentication === undefined) {
       const created = await this.withApiKeyManager(access, (client) =>
-        apiKeys.createWith({
+        apiKeys.create({
           organizationId,
           createdByUserId: session.userId,
           name: input.name,

@@ -77,12 +77,12 @@ it("runs the bootstrap, credential lock, and lease claim flows on embedded stora
     const identity = owner.rows[0];
     assert.ok(identity);
 
-    const apiKey = await auth.apiKeys!.create(
-      identity.organization_id,
-      identity.user_id,
-      "embedded smoke",
-      ["daemons:enroll"],
-    );
+    const apiKey = await auth.apiKeys!.create({
+      organizationId: identity.organization_id,
+      createdByUserId: identity.user_id,
+      name: "embedded smoke",
+      scopes: ["daemons:enroll"],
+    });
     const tokenIssued = await database.issueEnrollmentToken({
       id: randomUUID(),
       verifier: "embedded-smoke-enrollment",
