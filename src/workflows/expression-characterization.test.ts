@@ -17,13 +17,13 @@ const context: ExpressionContext = {
   },
 };
 
-function evaluate(source: string) {
-  return evaluateExpression(parseExpression(source), context);
+function evaluate(source: string, evaluationContext = context) {
+  return evaluateExpression(parseExpression(source), evaluationContext);
 }
 
-function expectEvaluationError(source: string, message: string): void {
+function expectEvaluationError(source: string, message: string, evaluationContext = context): void {
   try {
-    evaluate(source);
+    evaluate(source, evaluationContext);
   } catch (error) {
     if (!(error instanceof Error)) throw error;
     expect(error.message).toBe(message);
@@ -101,27 +101,105 @@ describe("workflow expression characterization", () => {
   });
 });
 
-describe("workflow input key characterization", () => {
+describe("workflow context keys", () => {
+  it.each(["constructor", "prototype", "__proto__"] as const)(
+    "refuses input %s from an explicit AST",
+    (key) => {
+      expect(
+        evaluateExpression(
+          { kind: "path", value: { namespace: "paseo", path: ["inputs", key] } },
+          context,
+        ),
+      ).toBe(null);
+    },
+  );
+
+  it.each(["constructor", "prototype"])("refuses input %s from source", (key) => {
+    expect(evaluate(`paseo.inputs.${key}`)).toBe(null);
+  });
+
+  it("renders a refused input as null", () => {
+    expect(renderExpressionTemplate("${{ paseo.inputs.constructor }}", context)).toBe("null");
+  });
+
+  it("accepts an ordinary own input but refuses an own constructor", () => {
+    const own = { ...context, inputs: { a: 1, constructor: 2 } };
+    expect(evaluate("paseo.inputs.a", own)).toBe(1);
+    expect(evaluate("paseo.inputs.constructor", own)).toBe(null);
+  });
+
+  it("reads inputs without an object prototype", () => {
+    const empty: unknown = Object.create(null);
+    if (typeof empty !== "object" || empty === null) throw new Error("expected an object");
+    const inputs = Object.assign(empty, { a: 1 });
+    expect(evaluate("paseo.inputs.a", { ...context, inputs })).toBe(1);
+    expect(evaluate("paseo.inputs.missing", { ...context, inputs })).toBe(null);
+  });
+
   it.each([
-    ["constructor", Object],
-    ["__proto__", Object.prototype],
-  ] as const)("reads inherited input %s from an explicit AST", (key, result: unknown) => {
-    expect(
-      evaluateExpression(
-        { kind: "path", value: { namespace: "paseo", path: ["inputs", key] } },
-        context,
-      ),
-    ).toBe(result);
+    ["values.constructor", "value constructor is unavailable"],
+    ["steps.constructor.outputs.result", "output from step constructor is unavailable"],
+  ] as const)("reports %s as unavailable", (source, message) => {
+    expectEvaluationError(source, `workflow expression could not be evaluated: ${message}`);
   });
 
-  it("reads the inherited constructor from source", () => {
-    expect(evaluate("paseo.inputs.constructor")).toBe(Object);
-  });
-
-  it("rejects the leading underscore of __proto__ in source", () => {
+  it.each(["constructor", "prototype"])("refuses own value and step named %s", (key) => {
+    const own: ExpressionContext = {
+      ...context,
+      values: { [key]: { kind: "literal", value: 1 } },
+      steps: { [key]: { status: "succeeded", output: { result: 2 } } },
+    };
+    const prefix = "workflow expression could not be evaluated:";
+    expectEvaluationError(`values.${key}`, `${prefix} value ${key} is unavailable`, own);
     expectEvaluationError(
-      "paseo.inputs.__proto__",
-      "invalid workflow expression: unexpected token _",
+      `steps.${key}.outputs.result`,
+      `${prefix} output from step ${key} is unavailable`,
+      own,
+    );
+  });
+
+  it.each([
+    [
+      "paseo.inputs.constructor.constructor",
+      "unsupported path paseo.inputs.constructor.constructor",
+    ],
+    ["paseo.inputs.__proto__", "unexpected token _"],
+    ["steps.toString.outputs.result", "unexpected token S"],
+  ] as const)("rejects invalid source path %s", (source, message) => {
+    expectEvaluationError(source, `invalid workflow expression: ${message}`);
+  });
+});
+
+function withPollutedPrototype(check: () => void): void {
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, "polluted");
+  expect(
+    Reflect.defineProperty(Object.prototype, "polluted", {
+      configurable: true,
+      value: { kind: "literal", value: "inherited", status: "succeeded", output: { result: 5 } },
+    }),
+  ).toBe(true);
+  try {
+    check();
+  } finally {
+    const restored =
+      original === undefined
+        ? Reflect.deleteProperty(Object.prototype, "polluted")
+        : Reflect.defineProperty(Object.prototype, "polluted", original);
+    expect(restored).toBe(true);
+  }
+}
+
+describe("workflow inherited context keys", () => {
+  it("does not read an inherited input", () => {
+    withPollutedPrototype(() => expect(evaluate("paseo.inputs.polluted")).toBe(null));
+  });
+
+  it.each([
+    ["values.polluted", "value polluted is unavailable"],
+    ["steps.polluted.outputs.result", "output from step polluted is unavailable"],
+  ] as const)("does not read %s", (source, message) => {
+    withPollutedPrototype(() =>
+      expectEvaluationError(source, `workflow expression could not be evaluated: ${message}`),
     );
   });
 });
