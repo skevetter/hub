@@ -94,9 +94,67 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
     createdByUserId: null,
   });
   await database.activateProjectConfigurationRevision(project.id, revision.id);
+  return createFixture(options, { project, revision });
+}
+
+interface FixtureProject {
+  project: Awaited<ReturnType<Database["createProject"]>>;
+  revision: Awaited<ReturnType<Database["insertProjectConfigurationRevision"]>>;
+}
+
+function createFixture(options: TurnEndFixtureOptions, project: FixtureProject) {
+  const { database } = options;
   const clock = new ManualClock();
   const executionIds: string[] = [];
   const failures = new FailureLogStream();
+  const { state, sends, controls, emit, agents } = createFixtureAgent(options);
+  const lifecycle = createFixtureLifecycle(options, agents, clock, failures);
+  const { stream, events } = createFixtureEvents(clock);
+  const dispatch = createFixtureDispatch(options, project, clock, {
+    lifecycle,
+    executionIds,
+  });
+
+  /** Delivers an event the way the daemon would, then lets Hub's handlers finish. */
+  async function deliver(event: AgentEvent): Promise<void> {
+    emit(event);
+    await handled();
+  }
+
+  /** Waits on Hub's own per-execution event queue instead of guessing how long it takes. */
+  async function handled(): Promise<void> {
+    await Promise.all(executionIds.map((id) => lifecycle.waitForPendingStreamHandlers(id)));
+  }
+
+  return {
+    database,
+    lifecycle,
+    clock,
+    state,
+    sends,
+    controls,
+    failures,
+    agents,
+    dispatch,
+    deliver,
+    stream,
+    flush: handled,
+    events,
+    /** A turn that ran, said `text` and ended normally, the way a real one is reported. */
+    async endTurn(text?: string): Promise<void> {
+      state.status = "running";
+      await deliver(this.events.turnStarted());
+      await deliver(this.events.status("running"));
+      if (text !== undefined) await deliver(this.events.text(text));
+      state.status = "idle";
+      await deliver(this.events.turnCompleted());
+      await deliver(this.events.status("idle"));
+    },
+    ...fixtureControls({ deliver, stream, lifecycle, database }),
+  };
+}
+
+function createFixtureAgent(options: TurnEndFixtureOptions) {
   const state = {
     status: "idle" as "idle" | "running",
     statusFails: false,
@@ -132,6 +190,16 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
       sends.push(messageId);
     },
   };
+  return { state, sends, controls, emit, agents };
+}
+
+function createFixtureLifecycle(
+  options: TurnEndFixtureOptions,
+  agents: AgentConnection,
+  clock: ManualClock,
+  failures: FailureLogStream,
+): DaemonDispatchLifecycle {
+  const { database } = options;
   const executionCapabilities = new OutputExecutorRegistry();
   executionCapabilities.register({
     type: "slack.reply",
@@ -142,7 +210,7 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
     },
     execute: async () => {},
   });
-  const lifecycle: DaemonDispatchLifecycle = createDaemonDispatchLifecycle({
+  return createDaemonDispatchLifecycle({
     database,
     executionCapabilities,
     ...(options.timeline === undefined ? {} : { timeline: options.timeline }),
@@ -162,8 +230,17 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
     completionTokenSecret: "test-secret",
     test: { deadlineClock: clock, logger: createLogger(failures) },
   });
+}
 
-  async function dispatch(): Promise<{
+function createFixtureDispatch(
+  options: TurnEndFixtureOptions,
+  records: FixtureProject,
+  clock: ManualClock,
+  { lifecycle, executionIds }: { lifecycle: DaemonDispatchLifecycle; executionIds: string[] },
+) {
+  const { database, organizationId } = options;
+  const { project, revision } = records;
+  return async function dispatch(): Promise<{
     execution: AgentExecutionRecord;
     step: WorkflowStepRunRecord | undefined;
   }> {
@@ -194,46 +271,58 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
     ).run;
     const step =
       options.workflow === true
-        ? (await database.findWorkflowStepRunByTriggerRun(run.id))!
+        ? await database.findWorkflowStepRunByTriggerRun(run.id)
         : undefined;
-    const intent: LaunchMachineIntent = {
-      kind: "launch_machine",
-      organizationId,
-      projectId: project.id,
-      triggerRunId: run.id,
-      ...(step === undefined ? {} : { workflowStepRunId: step.id }),
-      triggerName: "turn-end",
-      environmentName: "runner",
-      environment: {
-        kind: "daemon",
-        daemonId: TEST_DAEMON_ID,
-        authoredSlug: "runner",
-        cwd: "/repo",
-      },
-      agent: { provider: "claude" },
-      prompt: "Do the work",
-      allowOutputs:
-        options.requiredOutput === true ? [{ type: "slack.reply", max: 1, required: true }] : [],
-      timeoutMs: 60 * 60_000,
-      idleTimeoutMs: IDLE_TIMEOUT_MS,
-      autoArchive: options.autoArchive === true,
-      background: false,
-      ...(options.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
-      ...(options.onRunReplyAnswer === undefined ? {} : { replyMessage: true }),
-      ...(options.outputSchema === undefined ? {} : { outputSchema: options.outputSchema }),
-      ...(options.continuationKey === undefined
-        ? {}
-        : { continuation: { key: options.continuationKey, compatibility: {} } }),
-      triggerContext: options.triggerContext ?? {},
-      outputContext: options.outputContext ?? {},
-      configurationRevisionId: revision.id,
-      hubConfig: {},
-    };
+    const intent = launchIntent(options, records, run.id, step);
     const { execution } = await lifecycle.dispatchLaunchMachineIntent(intent);
     executionIds.push(execution.id);
     return { execution, step };
-  }
+  };
+}
 
+function launchIntent(
+  options: TurnEndFixtureOptions,
+  { project, revision }: FixtureProject,
+  runId: string,
+  step: WorkflowStepRunRecord | undefined,
+): LaunchMachineIntent {
+  const { organizationId } = options;
+  return {
+    kind: "launch_machine",
+    organizationId,
+    projectId: project.id,
+    triggerRunId: runId,
+    ...(step === undefined ? {} : { workflowStepRunId: step.id }),
+    triggerName: "turn-end",
+    environmentName: "runner",
+    environment: {
+      kind: "daemon",
+      daemonId: TEST_DAEMON_ID,
+      authoredSlug: "runner",
+      cwd: "/repo",
+    },
+    agent: { provider: "claude" },
+    prompt: "Do the work",
+    allowOutputs:
+      options.requiredOutput === true ? [{ type: "slack.reply", max: 1, required: true }] : [],
+    timeoutMs: 60 * 60_000,
+    idleTimeoutMs: IDLE_TIMEOUT_MS,
+    autoArchive: options.autoArchive === true,
+    background: false,
+    ...(options.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
+    ...(options.onRunReplyAnswer === undefined ? {} : { replyMessage: true }),
+    ...(options.outputSchema === undefined ? {} : { outputSchema: options.outputSchema }),
+    ...(options.continuationKey === undefined
+      ? {}
+      : { continuation: { key: options.continuationKey, compatibility: {} } }),
+    triggerContext: options.triggerContext ?? {},
+    outputContext: options.outputContext ?? {},
+    configurationRevisionId: revision.id,
+    hubConfig: {},
+  };
+}
+
+function createFixtureEvents(clock: ManualClock) {
   const timestamp = () => new Date(clock.now()).toISOString();
   const stream = (event: DaemonAgentStreamEvent): AgentEvent => ({
     type: "agent_stream",
@@ -243,61 +332,40 @@ export async function turnEndFixture(options: TurnEndFixtureOptions) {
   });
   const provider = "claude";
 
-  /** Delivers an event the way the daemon would, then lets Hub's handlers finish. */
-  async function deliver(event: AgentEvent): Promise<void> {
-    emit(event);
-    await handled();
-  }
-
-  /** Waits on Hub's own per-execution event queue instead of guessing how long it takes. */
-  async function handled(): Promise<void> {
-    await Promise.all(executionIds.map((id) => lifecycle.waitForPendingStreamHandlers(id)));
-  }
-
-  return {
-    database,
-    lifecycle,
-    clock,
-    state,
-    sends,
-    controls,
-    failures,
-    agents,
-    dispatch,
-    deliver,
-    stream,
-    flush: handled,
-    events: {
-      turnStarted: () => stream({ type: "turn_started", provider }),
-      turnCompleted: () => stream({ type: "turn_completed", provider }),
-      turnFailed: () => stream({ type: "turn_failed", provider, error: "boom" }),
-      turnCanceled: () => stream({ type: "turn_canceled", provider, reason: "interrupted" }),
-      permissionRequested: () =>
-        stream({ type: "permission_requested", provider, request: { id: "permission-1" } }),
-      text: (text: string, messageId = "message-1") =>
-        stream({
-          type: "timeline",
-          provider,
-          item: { type: "assistant_message", text, messageId },
-        }),
-      toolCall: (name: string, status: string, callId = `call-${name}`) =>
-        stream({ type: "timeline", provider, item: { type: "tool_call", name, status, callId } }),
-      status: (status: "idle" | "running" | "error"): AgentEvent => ({
-        type: "agent_update",
-        agent: { id: AGENT_ID, workspaceId: "workspace-turn-end", status },
-        timestamp: timestamp(),
+  const events = {
+    turnStarted: () => stream({ type: "turn_started", provider }),
+    turnCompleted: () => stream({ type: "turn_completed", provider }),
+    turnFailed: () => stream({ type: "turn_failed", provider, error: "boom" }),
+    turnCanceled: () => stream({ type: "turn_canceled", provider, reason: "interrupted" }),
+    permissionRequested: () =>
+      stream({ type: "permission_requested", provider, request: { id: "permission-1" } }),
+    text: (text: string, messageId = "message-1") =>
+      stream({
+        type: "timeline",
+        provider,
+        item: { type: "assistant_message", text, messageId },
       }),
-    },
-    /** A turn that ran, said `text` and ended normally, the way a real one is reported. */
-    async endTurn(text?: string): Promise<void> {
-      state.status = "running";
-      await deliver(this.events.turnStarted());
-      await deliver(this.events.status("running"));
-      if (text !== undefined) await deliver(this.events.text(text));
-      state.status = "idle";
-      await deliver(this.events.turnCompleted());
-      await deliver(this.events.status("idle"));
-    },
+    toolCall: (name: string, status: string, callId = `call-${name}`) =>
+      stream({ type: "timeline", provider, item: { type: "tool_call", name, status, callId } }),
+    status: (status: "idle" | "running" | "error"): AgentEvent => ({
+      type: "agent_update",
+      agent: { id: AGENT_ID, workspaceId: "workspace-turn-end", status },
+      timestamp: timestamp(),
+    }),
+  };
+  return { stream, events };
+}
+
+interface FixtureControls {
+  deliver: (event: AgentEvent) => Promise<void>;
+  stream: ReturnType<typeof createFixtureEvents>["stream"];
+  lifecycle: DaemonDispatchLifecycle;
+  database: Database;
+}
+
+function fixtureControls({ deliver, stream, lifecycle, database }: FixtureControls) {
+  const provider = "claude";
+  return {
     /**
      * A finish_execution call as the hub sees it: the MCP handler tells the registry which
      * execution made it, and the agent's stream reports the same call without that name.
