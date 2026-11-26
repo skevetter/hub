@@ -260,17 +260,7 @@ export class InteractiveSessionService {
     const { coordinator } = this.options;
     const principal = await this.mutationPrincipal(request, input.organizationSlug);
     if (typeof principal === "string") return sessionRefusal(principal);
-    if (input.kind === "start") {
-      const { profileId, profileVersion, idempotencyKey, message, participants } = input;
-      if (!validMessage(message)) return sessionRefusal("message_too_long");
-      return coordinator.start(principal, {
-        profileId,
-        profileVersion,
-        idempotencyKey,
-        message,
-        participants,
-      });
-    }
+    if (input.kind === "start") return startCommand(coordinator, principal, input);
 
     const access = await this.sessionAccess(principal, input.sessionId);
     if (access === undefined) return sessionRefusal("not_found");
@@ -343,10 +333,8 @@ export class InteractiveSessionService {
     if (!capabilitiesFor(principal.role).manageResources) return sessionRefusal("forbidden");
     const { organizationSlug: _scope, ...profile } = form;
     const input = { ...profile, providerOptions: {}, principal, now: this.now() };
-    const invalid = profileValidation(input);
+    const invalid = profileSaveValidation(input);
     if (invalid !== undefined) return sessionRefusal(invalid);
-    if (input.mode === "full" && !input.fullAccessAcknowledged)
-      return sessionRefusal("invalid_mode");
 
     const { database } = this.options;
     const editRefusal = await this.profileEditRefusal(principal, input.id, input.version);
@@ -355,25 +343,26 @@ export class InteractiveSessionService {
       principal.organizationId,
       input.daemonId,
     );
-    if (daemon?.status !== "active" || !daemon.permissions.includes("hub.execute"))
-      return sessionRefusal("daemon_unavailable");
+    if (!isProfileDaemonAvailable(daemon)) return sessionRefusal("daemon_unavailable");
     if (!(await this.canUseDaemonForProfile(principal, daemon.registeredByCliCredentialId)))
       return sessionRefusal("forbidden");
     const connection = this.options.connectionForDaemon(daemon.id);
     if (!connection) return sessionRefusal("daemon_unavailable");
     let valid: boolean;
     try {
-      ({ valid } = await connection.validateAgentConfiguration({
-        provider: input.provider,
-        model: input.model ?? undefined,
-        mode: input.mode ?? undefined,
-        thinkingOptionId: input.thinkingOptionId ?? undefined,
-      }));
+      ({ valid } = await connection.validateAgentConfiguration(agentConfiguration(input)));
     } catch {
       return sessionRefusal("daemon_unavailable");
     }
     if (!valid) return sessionRefusal("invalid_mode");
     const saved = await database.saveSessionProfile(input);
+    return this.profileSaved(saved, daemon);
+  }
+
+  private profileSaved(
+    saved: Awaited<ReturnType<Database["saveSessionProfile"]>>,
+    daemon: ProfileDaemon,
+  ): ProfileSaveOutcome {
     if (typeof saved === "string")
       return sessionRefusal(saved === "version_conflict" ? "profile_changed" : saved);
     return { outcome: "saved", profile: this.profileView(saved, daemon.slug) };
@@ -619,22 +608,22 @@ export class InteractiveSessionService {
       daemon: {
         id: session.daemonId,
         slug: daemon?.slug ?? "",
-        connection:
-          daemon?.status === "active" && this.options.connectionForDaemon(daemon.id)
-            ? ("online" as const)
-            : ("offline" as const),
+        connection: this.daemonPresence(daemon),
       },
       provider: session.launch.provider,
       model: session.launch.model,
       mode: session.launch.mode,
-      startedBy:
-        session.startedByUserId !== null && startedByName !== undefined
-          ? { userId: session.startedByUserId, name: startedByName }
-          : null,
+      startedBy: sessionStarter(session, startedByName),
       createdAt: session.createdAt.toISOString(),
       lastActivityAt: session.lastActivityAt.toISOString(),
       closedAt: session.closedAt?.toISOString() ?? null,
     };
+  }
+
+  private daemonPresence(daemon: ProfileDaemon | undefined): "online" | "offline" {
+    return daemon?.status === "active" && this.options.connectionForDaemon(daemon.id)
+      ? "online"
+      : "offline";
   }
 
   private messageView(message: SessionMessageRecord, names: Map<string, string>) {
@@ -710,10 +699,7 @@ export class InteractiveSessionService {
     const id: unknown = decoded[1];
     if (typeof timestamp !== "string" || typeof id !== "string" || !isSessionId(id))
       throw new SessionReadError("invalid_request");
-    const lastActivityAt = new Date(timestamp);
-    if (!Number.isFinite(lastActivityAt.getTime()) || lastActivityAt.toISOString() !== timestamp)
-      throw new SessionReadError("invalid_request");
-    return { lastActivityAt, id };
+    return { lastActivityAt: parseListTimestamp(timestamp), id };
   }
 
   private async agentHistory(
@@ -739,4 +725,57 @@ export class InteractiveSessionService {
       };
     }
   }
+}
+
+type ProfileDaemon = NonNullable<Awaited<ReturnType<Database["findDaemonForOrganization"]>>>;
+
+function startCommand(
+  coordinator: SessionCoordinator,
+  principal: SessionPrincipal,
+  input: StartCommand,
+) {
+  const { profileId, profileVersion, idempotencyKey, message, participants } = input;
+  if (!validMessage(message)) return sessionRefusal("message_too_long");
+  return coordinator.start(principal, {
+    profileId,
+    profileVersion,
+    idempotencyKey,
+    message,
+    participants,
+  });
+}
+
+function profileSaveValidation(input: Parameters<typeof profileValidation>[0]) {
+  const invalid = profileValidation(input);
+  if (invalid !== undefined) return invalid;
+  if (input.mode === "full" && !input.fullAccessAcknowledged) return "invalid_mode";
+  return undefined;
+}
+
+function isProfileDaemonAvailable(daemon: ProfileDaemon | undefined): daemon is ProfileDaemon {
+  return daemon?.status === "active" && daemon.permissions.includes("hub.execute");
+}
+
+function agentConfiguration(
+  input: Pick<SaveProfileForm, "provider" | "model" | "mode" | "thinkingOptionId">,
+) {
+  return {
+    provider: input.provider,
+    model: input.model ?? undefined,
+    mode: input.mode ?? undefined,
+    thinkingOptionId: input.thinkingOptionId ?? undefined,
+  };
+}
+
+function sessionStarter(session: SessionRecord, name: string | undefined) {
+  return session.startedByUserId !== null && name !== undefined
+    ? { userId: session.startedByUserId, name }
+    : null;
+}
+
+function parseListTimestamp(timestamp: string): Date {
+  const value = new Date(timestamp);
+  if (!Number.isFinite(value.getTime()) || value.toISOString() !== timestamp)
+    throw new SessionReadError("invalid_request");
+  return value;
 }
