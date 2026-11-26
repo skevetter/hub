@@ -127,11 +127,16 @@ describe("input names that expressions cannot read", () => {
     return base.replace("target:", `inputs:\n${declared}target:`);
   }
 
-  it.each(["constructor", "prototype"])("refuses a declared input named %s", (name) => {
-    assert.match(
-      refusal(withInputs([name])) ?? "",
-      new RegExp(`input name on trigger probe ${name} is reserved`, "u"),
+  it.each(["constructor", "prototype"])("still declares an input named %s", (name) => {
+    assert.equal(refusal(withInputs([name])), undefined);
+  });
+
+  it.each(["constructor", "prototype"])("refuses an expression that reads input %s", (name) => {
+    const yaml = withInputs([name]).replace(
+      "    prompt: Fix it.",
+      `    prompt: Fix it.\n    if: "\${{ paseo.inputs.${name} }}"`,
     );
+    assert.match(refusal(yaml) ?? "", /which expressions cannot read/u);
   });
 
   it("refuses an undeclared reference that names an inherited key", () => {
@@ -152,11 +157,11 @@ describe("input names that expressions cannot read", () => {
     assert.match(refusal(withInputs(["ticket"], filtered)) ?? "", /undeclared input constructor/u);
   });
 
-  it("refuses a stored contract with an input named constructor", () => {
+  it("keeps a stored contract with an input named constructor", () => {
     const stored = storedConfig(withInputs(["ticket"]));
-    const widened = (name: string) => stored.replace('"inputs":{"ticket"', `"inputs":{"${name}"`);
-    assert.doesNotThrow(() => parseCompiledHubConfig(JSON.parse(widened("other"))));
-    assert.throws(() => parseCompiledHubConfig(JSON.parse(widened("constructor"))), STORED_REFUSAL);
+    const renamed = stored.replace('"inputs":{"ticket"', '"inputs":{"constructor"');
+    assert.notEqual(renamed, stored);
+    assert.doesNotThrow(() => parseCompiledHubConfig(JSON.parse(renamed)));
   });
 
   it("still accepts a declared input, a reference to it and a filter on it", () => {

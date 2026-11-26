@@ -979,7 +979,7 @@ function compileValues(trigger: AuthoredTrigger): Readonly<Record<string, Expres
 function compileInputs(trigger: AuthoredTrigger): Readonly<Record<string, CompiledInput>> {
   const compiled: Record<string, CompiledInput> = {};
   for (const [name, input] of Object.entries(trigger.inputs ?? {})) {
-    assertContextName(name, `input name on trigger ${trigger.name}`);
+    assertIdentifier(name, `input name on trigger ${trigger.name}`);
     if (input.required === true && input.default !== undefined) {
       throw new Error(
         `trigger ${trigger.name} input ${name} cannot be both required and defaulted`,
@@ -1058,7 +1058,6 @@ function validateEnvironmentInputChoices(
 function validateCompiledInputs(trigger: CompiledTrigger): void {
   for (const [name, input] of Object.entries(trigger.inputs)) {
     if (!INPUT_NAME.test(name)) throw new Error(`invalid input name: ${name}`);
-    if (isReservedContextKey(name)) throw new Error(`input name ${name} is reserved`);
     if (!matchesInputType(input.default, input.type)) {
       throw new Error(`input ${name} default does not match type`);
     }
@@ -1390,6 +1389,9 @@ function validatePaseoReference(
   const inputName = referencePath[1];
   const input = declaredInput(inputs, inputName);
   if (input === undefined) throw new Error(`${path} references undeclared input ${inputName}`);
+  if (isReservedContextKey(inputName)) {
+    throw new Error(`${path} references input ${inputName}, which expressions cannot read`);
+  }
   if (authorityBearing && input.choices === undefined) {
     throw new Error(`${path} uses input ${inputName} without finite choices`);
   }

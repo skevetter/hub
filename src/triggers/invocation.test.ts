@@ -312,6 +312,9 @@ describe("inherited object keys are not declared inputs", () => {
   });
 
   it("does not match an input filter against an inherited key", () => {
+    const inherited: Record<string, string> = {};
+    Object.setPrototypeOf(inherited, { repo: "hub" });
+    assert.equal(matchesInputFilters(inherited, { repo: "hub" }), false);
     assert.equal(matchesInputFilters({}, { constructor: "x" }), false);
     assert.equal(matchesInputFilters({ repo: "hub" }, { repo: "hub" }), true);
   });
