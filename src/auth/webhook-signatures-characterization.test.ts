@@ -79,7 +79,15 @@ describe("webhook signing configuration", () => {
 
 describe("webhook signing derivation", () => {
   it("matches the legacy vector and rejects malformed material", () => {
-    expect(deriveSigningSecret(master, "master", salt, "org", "key", "version")).toBe(
+    const options = {
+      master,
+      masterKeyId: "master",
+      salt,
+      organizationId: "org",
+      apiKeyId: "key",
+      versionId: "version",
+    };
+    expect(deriveSigningSecret(options)).toBe(
       "paseo_whsec_pIDTVUUhAkezxGDiOD-3yuvg73uwNTfDk3y0O1LMe80",
     );
     for (const [inputMaster, inputSalt] of [
@@ -88,7 +96,7 @@ describe("webhook signing derivation", () => {
       [master, `${salt}=`],
     ] as const) {
       expect(() =>
-        deriveSigningSecret(inputMaster, "master", inputSalt, "org", "key", "version"),
+        deriveSigningSecret({ ...options, master: inputMaster, salt: inputSalt }),
       ).toThrow("Invalid webhook signing material");
     }
   });

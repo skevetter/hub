@@ -22,31 +22,8 @@ export function readWebhookSigningSettings(
     );
   }
 
-  const organizationsName = "PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS";
-  const organizations = parseSetting(env[organizationsName], organizationsName, []);
-  if (
-    !Array.isArray(organizations) ||
-    !organizations.every((id) => typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(id)) ||
-    new Set(organizations).size !== organizations.length
-  ) {
-    throw new Error(`${organizationsName} must be a JSON array of distinct organization ids.`);
-  }
-
-  const ringName = "PASEO_HUB_WEBHOOK_HMAC_KEYRING";
-  const ring = parseSetting(env[ringName], ringName, {});
-  if (ring === null || typeof ring !== "object" || Array.isArray(ring)) {
-    throw new Error(`${ringName} must be a JSON object.`);
-  }
-  const keyring = new Map<string, Buffer>();
-  const entries = Object.entries(ring);
-  if (entries.length > 2) throw new Error(`${ringName} supports at most two online keys.`);
-  for (const [id, value] of entries) {
-    const key = typeof value === "string" ? Buffer.from(value, "base64") : null;
-    if (!KEY_ID.test(id) || key?.length !== 32 || key.toString("base64") !== value) {
-      throw new Error(`${ringName} requires key ids and canonical base64 32-byte keys.`);
-    }
-    keyring.set(id, key);
-  }
+  const organizations = readSigningOrganizations(env["PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS"]);
+  const keyring = readSigningKeyring(env["PASEO_HUB_WEBHOOK_HMAC_KEYRING"]);
   const activeKeyId = env["PASEO_HUB_WEBHOOK_HMAC_ACTIVE_KEY_ID"];
   if (
     (activeKeyId !== undefined && !keyring.has(activeKeyId)) ||
@@ -61,6 +38,47 @@ export function readWebhookSigningSettings(
     keyring,
     activeKeyId,
   };
+}
+
+function readSigningOrganizations(value: string | undefined): string[] {
+  const organizationsName = "PASEO_HUB_WEBHOOK_HMAC_ORGANIZATION_IDS";
+  const organizations = parseSetting(value, organizationsName, []);
+  if (
+    !Array.isArray(organizations) ||
+    !organizations.every(isOrganizationId) ||
+    new Set(organizations).size !== organizations.length
+  ) {
+    throw new Error(`${organizationsName} must be a JSON array of distinct organization ids.`);
+  }
+  return organizations;
+}
+
+function isOrganizationId(id: unknown): id is string {
+  return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(id);
+}
+
+function readSigningKeyring(setting: string | undefined): Map<string, Buffer> {
+  const ringName = "PASEO_HUB_WEBHOOK_HMAC_KEYRING";
+  const ring = parseSetting(setting, ringName, {});
+  if (ring === null || typeof ring !== "object" || Array.isArray(ring)) {
+    throw new Error(`${ringName} must be a JSON object.`);
+  }
+  const keyring = new Map<string, Buffer>();
+  const entries = Object.entries(ring);
+  if (entries.length > 2) throw new Error(`${ringName} supports at most two online keys.`);
+  for (const [id, value] of entries) {
+    const key = readSigningKey(id, value, ringName);
+    keyring.set(id, key);
+  }
+  return keyring;
+}
+
+function readSigningKey(id: string, value: unknown, ringName: string): Buffer {
+  const key = typeof value === "string" ? Buffer.from(value, "base64") : null;
+  if (!KEY_ID.test(id) || key?.length !== 32 || key.toString("base64") !== value) {
+    throw new Error(`${ringName} requires key ids and canonical base64 32-byte keys.`);
+  }
+  return key;
 }
 
 function flag(env: Readonly<Record<string, string | undefined>>, name: string): boolean {
@@ -79,14 +97,23 @@ function parseSetting(value: string | undefined, name: string, fallback: unknown
   }
 }
 
-export function deriveSigningSecret(
-  master: Buffer,
-  masterKeyId: string,
-  salt: string,
-  organizationId: string,
-  apiKeyId: string,
-  versionId: string,
-): string {
+interface SigningSecretOptions {
+  master: Buffer;
+  masterKeyId: string;
+  salt: string;
+  organizationId: string;
+  apiKeyId: string;
+  versionId: string;
+}
+
+export function deriveSigningSecret({
+  master,
+  masterKeyId,
+  salt,
+  organizationId,
+  apiKeyId,
+  versionId,
+}: SigningSecretOptions): string {
   const decoded = Buffer.from(salt, "base64url");
   if (master.length !== 32 || decoded.length !== 32 || decoded.toString("base64url") !== salt) {
     throw new Error("Invalid webhook signing material");
