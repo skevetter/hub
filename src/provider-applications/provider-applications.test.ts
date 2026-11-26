@@ -812,11 +812,9 @@ class BlockingRuntime implements ProviderRuntimeOwner {
   }
 
   prepare(
-    provider: Provider,
-    configuration: ProviderApplicationConfiguration,
-    _callbackOrigin: string,
-    _identity: ProviderApplicationIdentity,
-    configurationVersion: number,
+    ...[provider, configuration, , , configurationVersion]: Parameters<
+      ProviderRuntimeOwner["prepare"]
+    >
   ): Promise<ProviderRuntimeCandidate> {
     const candidate = new Candidate(
       provider,
