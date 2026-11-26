@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { z } from "zod";
@@ -96,7 +96,11 @@ export class HubFaultProxy {
     socket.send(
       JSON.stringify({
         type: "session",
-        message: { type: "get_providers_snapshot_request", requestId, cwd },
+        message: {
+          type: "get_providers_snapshot_request",
+          requestId,
+          cwd,
+        },
       }),
     );
     return observed;
@@ -179,10 +183,7 @@ export class HubFaultProxy {
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
 
-  private async forwardHttp(
-    request: IncomingMessage,
-    response: import("node:http").ServerResponse,
-  ): Promise<void> {
+  private async forwardHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
     try {
       const body = await readRequestBody(request);
       const upstream = await fetch(new URL(request.url ?? "/", this.targetOrigin), {
@@ -255,10 +256,7 @@ export class HubFaultProxy {
   private observeHubMessage(raw: string): void {
     const message = sessionMessage(parseRecord(raw));
     if (message?.["type"] !== "create_agent_request") return;
-    const config = recordAt(message, "config");
-    const servers = config && recordAt(config, "mcpServers");
-    const hub = servers && recordAt(servers, "hub");
-    const url = hub && readString(hub, "url");
+    const url = createRequestUrl(message);
     const requestId = readString(message, "requestId");
     if (!url || !requestId) return;
     const path = new URL(url).pathname.split("/");
@@ -286,10 +284,7 @@ export class HubFaultProxy {
   }
 
   private recordDaemonEvidence(message: Record<string, unknown> | undefined): void {
-    if (
-      typeof message?.["type"] === "string" &&
-      (message["type"].startsWith("hub.") || message["type"] === "rpc_error")
-    ) {
+    if (isEvidenceMessage(message)) {
       const payload = recordAt(message, "payload");
       const event = payload && recordAt(payload, "event");
       const item = event && recordAt(event, "item");
@@ -323,25 +318,47 @@ export class HubFaultProxy {
     if (payload?.["status"] !== "agent_created") return false;
     const requestId = readString(payload, "requestId");
     const executionId = requestId && this.creationExecutions.get(requestId);
-    const agentId = payload && readString(payload, "agentId");
-    if (executionId && agentId) {
-      const ids = this.agentIdsByExecution.get(executionId) ?? new Set<string>();
-      ids.add(agentId);
-      this.agentIdsByExecution.set(executionId, ids);
-      const agent = recordAt(payload, "agent");
-      const status = agent ? (readString(agent, "status") ?? null) : null;
-      this.createdAgentsByExecution.set(executionId, {
-        agentId,
-        hasCurrentState: agent !== undefined,
-        status,
-      });
-    }
+    const agentId = readString(payload, "agentId");
+    if (executionId && agentId) this.recordCreatedAgent(payload, executionId, agentId);
     if (!this.loseCreateResponse) return false;
     this.loseCreateResponse = false;
     this.createResponseDropped?.();
     this.createResponseDropped = undefined;
     return true;
   }
+
+  private recordCreatedAgent(
+    payload: Record<string, unknown>,
+    executionId: string,
+    agentId: string,
+  ): void {
+    const ids = this.agentIdsByExecution.get(executionId) ?? new Set<string>();
+    ids.add(agentId);
+    this.agentIdsByExecution.set(executionId, ids);
+    const agent = recordAt(payload, "agent");
+    const status = agent ? (readString(agent, "status") ?? null) : null;
+    this.createdAgentsByExecution.set(executionId, {
+      agentId,
+      hasCurrentState: agent !== undefined,
+      status,
+    });
+  }
+}
+
+function createRequestUrl(message: Record<string, unknown>): string | undefined {
+  const config = recordAt(message, "config");
+  const servers = config && recordAt(config, "mcpServers");
+  const hub = servers && recordAt(servers, "hub");
+  return hub && readString(hub, "url");
+}
+
+function isEvidenceMessage(
+  message: Record<string, unknown> | undefined,
+): message is Record<string, unknown> & { type: string } {
+  return (
+    typeof message?.["type"] === "string" &&
+    (message["type"].startsWith("hub.") || message["type"] === "rpc_error")
+  );
 }
 
 function forwardedHeaders(request: IncomingMessage): Record<string, string> {
