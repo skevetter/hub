@@ -184,7 +184,7 @@ describe("dynamic provider runtime", () => {
       auth: testAuth(),
       applicationBaseUrl: "https://hub.test",
       registrationFactory: ({ configuration }) =>
-        fakeRegistration(configurationId(configuration), started, stopped, completed),
+        fakeRegistration(configurationId(configuration), { started, stopped, completed }),
     });
     const stable = runtime
       .registrations()
@@ -486,9 +486,7 @@ describe("dynamic provider runtime", () => {
       registrationFactory: ({ configuration }) =>
         fakeRegistration(
           configurationId(configuration),
-          [],
-          [],
-          [],
+          { started: [], stopped: [], completed: [] },
           configurationId(configuration) === "A2",
         ),
     });
@@ -765,9 +763,7 @@ function configurationId(configuration: ProviderApplicationConfiguration): strin
 
 function fakeRegistration(
   id: string,
-  started: string[],
-  stopped: string[],
-  completed: string[],
+  { started, stopped, completed }: { started: string[]; stopped: string[]; completed: string[] },
   failStart = false,
 ): ProviderRegistration {
   const trigger: TriggerProvider<"slack", { id: string }, { id: string }> = {
