@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, expect, it, vi } from "vitest";
+import {
+  revokeTriggerWebhookKeyPath,
+  rotateTriggerWebhookKeyPath,
+  triggerWebhookKeyPath,
+} from "./auth/api-key-contract.js";
 import type { AuthServer } from "./auth/server.js";
 import type { OrganizationAccessValue } from "./auth/organization-access.js";
 import { createMemoryDatabase } from "./db/memory.js";
@@ -238,6 +243,38 @@ describe("application runtime provider composition", () => {
       await (await runtime.connectionStatus(new Request(scopedStatusUrl()))).json(),
       { canManage: false, fake: { status: "connected" } },
     );
+    await runtime.stop();
+  });
+
+  it("requires a same-origin request before reaching trigger webhook key routes", async () => {
+    const database = await runtimeDatabase("owner");
+    const reached: string[] = [];
+    const auth = Object.assign(new RuntimeAuth(), {
+      browserAccount: (request: Request) => {
+        reached.push(new URL(request.url).pathname);
+        return Promise.resolve(Response.json({ ok: true }));
+      },
+      rejectCookieMutation: (request: Request, options?: { requireOrigin?: boolean }) =>
+        options?.requireOrigin === true && request.headers.get("origin") !== "http://hub.test"
+          ? new Response(null, { status: 403 })
+          : undefined,
+    });
+    const runtime = await createApplicationRuntime({
+      database,
+      auth,
+      entitlements: entitlementsForTest(database),
+      billing: null,
+      close: () => Promise.resolve(),
+    });
+    const paths = [triggerWebhookKeyPath, rotateTriggerWebhookKeyPath, revokeTriggerWebhookKeyPath];
+    for (const path of paths) {
+      const post = (headers: Record<string, string>) =>
+        runtime.browserAccount!(new Request(`http://hub.test${path}`, { method: "POST", headers }));
+      assert.equal((await post({ origin: "https://cross-origin.test" })).status, 403);
+      assert.equal((await post({})).status, 403);
+      assert.equal((await post({ origin: "http://hub.test" })).status, 200);
+    }
+    assert.deepEqual(reached, paths);
     await runtime.stop();
   });
 

@@ -20,6 +20,15 @@ import {
   rotateSigningSecretSchema,
   retireSigningSecretSchema,
   webhookSigningSummarySchema,
+  revokeTriggerWebhookKeyPath,
+  rotateTriggerWebhookKeyPath,
+  triggerWebhookKeyPath,
+  triggerWebhookKeyCreateSchema,
+  triggerWebhookKeyListSchema,
+  triggerWebhookKeyListResultSchema,
+  triggerWebhookKeyRevealSchema,
+  triggerWebhookKeyRevokeSchema,
+  triggerWebhookKeyRotateSchema,
 } from "./api-key-contract.js";
 import { organizationSlugSchema, routeOrganizationInput } from "./route-organization.js";
 import { parseEntitlementDenial, type EntitlementDenialPayload } from "../entitlements/denial.js";
@@ -378,6 +387,76 @@ export const createApiKey = createServerFn({ method: "POST" })
     }
   });
 
+export const listTriggerWebhookKeys = createServerFn({ method: "GET" })
+  .validator(routeOrganizationInput(triggerWebhookKeyListSchema))
+  .handler(async ({ data }) =>
+    triggerWebhookKeyResult(
+      await sendAccountQuery(triggerWebhookKeyPath, data.organizationSlug, data.input),
+      triggerWebhookKeyListResultSchema,
+    ),
+  );
+
+export const createTriggerWebhookKey = createServerFn({ method: "POST" })
+  .validator(routeOrganizationInput(triggerWebhookKeyCreateSchema))
+  .handler(async ({ data }) => revealTriggerWebhookKey(triggerWebhookKeyPath, routeBody(data)));
+
+export const rotateTriggerWebhookKey = createServerFn({ method: "POST" })
+  .validator(routeOrganizationInput(triggerWebhookKeyRotateSchema))
+  .handler(async ({ data }) =>
+    revealTriggerWebhookKey(rotateTriggerWebhookKeyPath, routeBody(data)),
+  );
+
+export const revokeTriggerWebhookKey = createServerFn({ method: "POST" })
+  .validator(routeOrganizationInput(triggerWebhookKeyRevokeSchema))
+  .handler(async ({ data }) =>
+    triggerWebhookKeyResult(
+      await sendAccountCommand(revokeTriggerWebhookKeyPath, routeBody(data)),
+      z.object({ revoked: z.literal(true) }),
+    ),
+  );
+
+async function revealTriggerWebhookKey(path: string, body: Record<string, unknown>) {
+  markSecretResponse();
+  return triggerWebhookKeyResult(
+    await sendAccountCommand(path, body),
+    triggerWebhookKeyRevealSchema,
+  );
+}
+
+const triggerWebhookKeyErrors = {
+  trigger_not_found: "The selected manual trigger is unavailable. Reload the trigger list.",
+  forbidden: "You need permission to manage API keys in this organization.",
+  rotation_in_progress: "This key is already expiring or revoked. Reload the key list.",
+  api_key_unavailable: "This webhook key is unavailable. Reload the key list.",
+  invalid_request: "Check the webhook key details and try again.",
+};
+
+async function triggerWebhookKeyResult<T>(
+  response: Response | AccountRequestError,
+  schema: z.ZodType<T>,
+): Promise<Result<T>> {
+  const fallback = "Hub couldn't complete the request. Reload the key list to check its status.";
+  if (response instanceof AccountRequestError) return respondError({ message: fallback });
+  const payload: unknown = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = z
+      .object({
+        error: z.enum([
+          "trigger_not_found",
+          "forbidden",
+          "rotation_in_progress",
+          "api_key_unavailable",
+          "invalid_request",
+        ]),
+      })
+      .safeParse(payload);
+    const message = error.success ? triggerWebhookKeyErrors[error.data.error] : undefined;
+    return respondError({ message: message ?? fallback });
+  }
+  const parsed = schema.safeParse(payload);
+  return parsed.success ? respondOk(parsed.data) : respondError({ message: fallback });
+}
+
 export const rotateApiKeySigningSecret = createServerFn({ method: "POST" })
   .validator(routeOrganizationInput(rotateSigningSecretSchema))
   .handler(async ({ data }): Promise<Result<z.infer<typeof rotatedSigningSecretSchema>>> => {
@@ -723,11 +802,12 @@ async function sendAccountCommand(
 async function sendAccountQuery(
   path: string,
   organizationSlug: string,
+  query: Record<string, string> = {},
 ): Promise<Response | AccountRequestError> {
   const incoming = getRequest();
   try {
     const url = new URL(path, incoming.url);
-    url.searchParams.set("organizationSlug", organizationSlug);
+    url.search = new URLSearchParams({ ...query, organizationSlug }).toString();
     const response = await (
       await getApplication()
     ).browserAccount?.(new Request(url, { headers: incoming.headers }));

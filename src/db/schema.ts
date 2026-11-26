@@ -1753,6 +1753,7 @@ export const organizationApiKeys = pgTable(
     webhookAuthMode: text("webhook_auth_mode").$type<"hmac">(),
     webhookSignatureProfile: text("webhook_signature_profile").$type<"github_sha256">(),
     webhookTargetTriggerId: uuid("webhook_target_trigger_id"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
     createdByUserId: text("created_by_user_id").references(() => users.id, {
       onDelete: "set null",
     }),

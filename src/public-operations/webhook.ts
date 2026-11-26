@@ -60,7 +60,7 @@ async function resolveActiveTarget(
   projectId: string,
   name: string,
   actor: string,
-): Promise<WebhookTarget | { status: "trigger_not_found" | "actor_forbidden" }> {
+): Promise<WebhookTarget | { status: "trigger_not_found" }> {
   const stored = await capabilities.configurationForProject(projectId).getActive();
   if (stored === undefined) return { status: "trigger_not_found" };
   const trigger = stored.configuration.triggers.find(
@@ -68,7 +68,7 @@ async function resolveActiveTarget(
   );
   if (trigger === undefined) return { status: "trigger_not_found" };
   const users = trigger.filters?.from_users;
-  if (!users?.includes("*") && !users?.includes(actor)) return { status: "actor_forbidden" };
+  if (!users?.includes("*") && !users?.includes(actor)) return { status: "trigger_not_found" };
   return {
     status: "resolved",
     projectId,

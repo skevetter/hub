@@ -8,7 +8,7 @@ import type {
 import type { Locks } from "../db/runtime/locks/index.js";
 import { z } from "zod";
 import { reportFailure } from "../failures/index.js";
-import { type OrganizationApiKeys, type ApiKeySummary } from "./api-keys.js";
+import type { ApiKeySummary, CreatedTriggerWebhookKey, OrganizationApiKeys } from "./api-keys.js";
 import { SigningRequestError } from "./webhook-secret-store.js";
 import { logger } from "../logger.js";
 import type { OrganizationCliCredentials } from "./cli-credentials.js";
@@ -16,6 +16,13 @@ import {
   apiKeyCreateSchema,
   retireSigningSecretSchema,
   rotateSigningSecretSchema,
+  revokeTriggerWebhookKeyPath,
+  rotateTriggerWebhookKeyPath,
+  triggerWebhookKeyPath,
+  triggerWebhookKeyCreateSchema,
+  triggerWebhookKeyListSchema,
+  triggerWebhookKeyRevokeSchema,
+  triggerWebhookKeyRotateSchema,
 } from "./api-key-contract.js";
 import type { InstanceAuthPolicy } from "./instance-policy.js";
 import type { InstanceSetup } from "../instance-setup/index.js";
@@ -182,6 +189,7 @@ export class OrganizationAccess {
   private readonly getRoutes: Readonly<Record<string, RouteHandler>> = {
     "/api/auth/paseo/state": (request) => this.state(request),
     "/api/auth/paseo/api-keys": (request) => this.listApiKeys(request),
+    [triggerWebhookKeyPath]: (request) => this.listTriggerWebhookKeys(request),
     "/api/auth/paseo/team": (request) => this.organizationTeam(request),
   };
 
@@ -194,6 +202,9 @@ export class OrganizationAccess {
     "/api/auth/paseo/change-member-role": (request) => this.changeMemberRole(request),
     "/api/auth/paseo/remove-member": (request) => this.removeMember(request),
     "/api/auth/paseo/api-keys": (request) => this.createApiKey(request),
+    [triggerWebhookKeyPath]: (request) => this.createTriggerWebhookKey(request),
+    [rotateTriggerWebhookKeyPath]: (request) => this.rotateTriggerWebhookKey(request),
+    [revokeTriggerWebhookKeyPath]: (request) => this.revokeTriggerWebhookKey(request),
     "/api/auth/paseo/revoke-api-key": (request) => this.revokeApiKey(request),
     "/api/auth/paseo/revoke-cli-credential": (request) => this.revokeCliCredential(request),
     "/api/auth/paseo/rotate-api-key-signing-secret": (request) => this.rotateSigningSecret(request),
@@ -398,9 +409,13 @@ export class OrganizationAccess {
     const organizationId = access.organization.id;
     if (input.authentication === undefined) {
       const created = await this.withApiKeyManager(access, (client) =>
-        apiKeys.create(organizationId, session.userId, input.name, input.scopes, client, {
-          actor: input.actor,
-          allowedTriggers: input.allowedTriggers,
+        apiKeys.createWith({
+          organizationId,
+          createdByUserId: session.userId,
+          name: input.name,
+          scopes: input.scopes,
+          client,
+          identity: { actor: input.actor, allowedTriggers: input.allowedTriggers },
         }),
       );
       return Response.json(
@@ -410,7 +425,13 @@ export class OrganizationAccess {
     }
     const authentication = input.authentication;
     const created = await this.withApiKeyManager(access, (client) =>
-      apiKeys.createSigned(client, organizationId, session.userId, input, authentication),
+      apiKeys.createSigned({
+        client,
+        organizationId,
+        createdByUserId: session.userId,
+        input,
+        authentication,
+      }),
     );
     logger.info({
       event: "webhook_signing.created",
@@ -426,6 +447,74 @@ export class OrganizationAccess {
       },
       { status: 201, headers: secretResponseHeaders },
     );
+  }
+
+  private async listTriggerWebhookKeys(request: Request): Promise<Response> {
+    const session = await this.requireSession(request);
+    const access = await this.requireRouteAccess(session, queryOrganizationSlug(request));
+    if (!access.capabilities.manageResources) throw new ProductRequestError(403, "forbidden");
+    const parsed = triggerWebhookKeyListSchema.safeParse({
+      triggerName: new URL(request.url).searchParams.get("triggerName"),
+    });
+    if (!parsed.success) throw new ProductRequestError(400, "invalid_request");
+    const keys = await this.options.apiKeys.listTriggerWebhookKeys(
+      access.organization.id,
+      parsed.data.triggerName,
+    );
+    return Response.json({ keys: keys.map(apiKeyJson) });
+  }
+
+  private async createTriggerWebhookKey(request: Request): Promise<Response> {
+    const session = await this.requireSession(request);
+    const { organizationSlug, input } = await parseOrganizationBody(
+      request,
+      triggerWebhookKeyCreateSchema,
+    );
+    const access = await this.requireRouteAccess(session, organizationSlug);
+    const created = await this.withApiKeyManager(access, (client) =>
+      this.options.apiKeys.createTriggerWebhookKey(
+        access.organization.id,
+        session.userId,
+        input,
+        client,
+      ),
+    );
+    return triggerWebhookKeyResponse(created);
+  }
+
+  private async rotateTriggerWebhookKey(request: Request): Promise<Response> {
+    const session = await this.requireSession(request);
+    const { organizationSlug, input } = await parseOrganizationBody(
+      request,
+      triggerWebhookKeyRotateSchema,
+    );
+    const access = await this.requireRouteAccess(session, organizationSlug);
+    const rotated = await this.withApiKeyManager(access, (client) =>
+      this.options.apiKeys.rotateTriggerWebhookKey(
+        access.organization.id,
+        session.userId,
+        input.id,
+        {
+          overlapSeconds: input.overlapSeconds,
+          transaction: client,
+        },
+      ),
+    );
+    return triggerWebhookKeyResponse(rotated);
+  }
+
+  private async revokeTriggerWebhookKey(request: Request): Promise<Response> {
+    const session = await this.requireSession(request);
+    const { organizationSlug, input } = await parseOrganizationBody(
+      request,
+      triggerWebhookKeyRevokeSchema,
+    );
+    const access = await this.requireRouteAccess(session, organizationSlug);
+    const revoked = await this.withApiKeyManager(access, (client) =>
+      this.options.apiKeys.revokeTriggerWebhookKey(access.organization.id, input, client),
+    );
+    if (!revoked) throw new ProductRequestError(404, "api_key_unavailable");
+    return Response.json({ revoked: true });
   }
 
   private async rotateSigningSecret(request: Request): Promise<Response> {
@@ -1183,6 +1272,13 @@ async function protectLastOwner(
 
 const secretResponseHeaders = { "Cache-Control": "no-store", Pragma: "no-cache" };
 
+function triggerWebhookKeyResponse(created: CreatedTriggerWebhookKey): Response {
+  return Response.json(
+    { ...created, summary: apiKeyJson(created.summary) },
+    { status: 201, headers: secretResponseHeaders },
+  );
+}
+
 function apiKeyJson(key: ApiKeySummary) {
   return {
     id: key.id,
@@ -1194,6 +1290,7 @@ function apiKeyJson(key: ApiKeySummary) {
     createdAt: key.createdAt.toISOString(),
     lastUsedAt: key.lastUsedAt?.toISOString() ?? null,
     revokedAt: key.revokedAt?.toISOString() ?? null,
+    expiresAt: key.expiresAt?.toISOString() ?? null,
     ...(key.authentication === undefined ? {} : { authentication: key.authentication }),
   };
 }

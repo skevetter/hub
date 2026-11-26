@@ -41,6 +41,14 @@ async function error(response: Response, status: number, code: string) {
   assert.equal(ProblemSchema.parse(await response.json()).code, code);
 }
 
+async function hiddenTrigger(response: Response) {
+  assert.equal(response.status, 404);
+  const { requestId, ...problem } = ProblemSchema.parse(await response.json());
+  assert.equal(requestId, response.headers.get("x-request-id"));
+  assert.equal(problem.code, "trigger_not_found");
+  return problem;
+}
+
 describe("embedded authenticated webhook intake", () => {
   it("starts only the named trigger for text and JSON with bound identity and rendered context", async () => {
     const hub = await webhookFixture();
@@ -284,9 +292,21 @@ describe("embedded authenticated webhook intake", () => {
       await hub.save("disabled", { enabled: false });
       await hub.save("scheduled", { event: "schedule.tick" });
       await hub.save("forbidden", { actor: "other" });
-      for (const name of ["missing", "disabled", "scheduled"])
-        await error(await hub.send(name, {}), 404, "trigger_not_found");
-      await error(await hub.send("forbidden", { actor: "other" }), 403, "actor_forbidden");
+      const allowed = await hub.save("allowed");
+      const restricted = await hub.keys.createTriggerWebhookKey("webhook-a", "webhook-owner", {
+        triggerName: allowed.name,
+        actor: "sender",
+      });
+      assert.equal((await hub.send(allowed.name, {}, { secret: restricted.secret })).status, 202);
+      const expected = await hiddenTrigger(await hub.send("missing", {}));
+      for (const response of [
+        await hub.send("disabled", {}),
+        await hub.send("scheduled", {}),
+        await hub.send("forbidden", { actor: "other" }),
+        await hub.send("forbidden", {}, { secret: restricted.secret }),
+      ]) {
+        assert.deepEqual(await hiddenTrigger(response), expected);
+      }
       const empty = await hub.save("unconfigured");
       await hub.runtime.query(
         "update projects set active_configuration_revision_id = null where id = $1",

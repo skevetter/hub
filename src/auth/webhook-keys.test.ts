@@ -15,6 +15,11 @@ import {
   defaultApiKeyActor,
   type ApiKeyIdentityOptions,
   webhookSigningSummarySchema,
+  revokeTriggerWebhookKeyPath,
+  rotateTriggerWebhookKeyPath,
+  triggerWebhookKeyPath,
+  triggerWebhookKeyListResultSchema,
+  triggerWebhookKeyRevealSchema,
 } from "./api-key-contract.js";
 import { createDatabase } from "../db/pg.js";
 import type { Locks } from "../db/runtime/locks/index.js";
@@ -218,18 +223,173 @@ run:
     if (directory !== undefined) await rm(directory, { recursive: true, force: true });
   }, 120_000);
 
+  it("issues a hash-only bearer key scoped to one trigger and warns about its default actor", async () => {
+    const created = await issueTriggerKey();
+    assert.equal(created.summary.name, "webhook:signed-trigger");
+    assert.equal(created.summary.actor, "browser-owner");
+    assert.equal(created.actorAllowedByTrigger, false);
+    assert.equal(created.summary.expiresAt, null);
+    assert.deepEqual(created.summary.scopes, ["events:send"]);
+    assert.deepEqual(created.summary.allowedTriggers, ["signed-trigger"]);
+    const stored = await runtime.query<{ verifier: string }>(
+      "select verifier from organization_api_keys where id = $1",
+      [created.summary.id],
+    );
+    assert.equal(stored.rows[0]?.verifier, verifier(created.secret));
+
+    await browserRequest("/api/auth/paseo/api-keys", signedKeyInput("Excluded signer"));
+    const listed = await browserRequest(`${triggerWebhookKeyPath}?triggerName=signed-trigger`);
+    assert.equal(listed.status, 200);
+    const raw = await listed.text();
+    assert.deepEqual(triggerWebhookKeyListResultSchema.parse(JSON.parse(raw)).keys, [
+      created.summary,
+    ]);
+    assert.ok(!raw.includes(created.secret) && !raw.includes("verifier"));
+    const access = await auth.apiKeys!.authorize(bearerRequest(created.secret), "events:send");
+    assert.equal(access.status, "authorized");
+    if (access.status === "authorized") {
+      assert.deepEqual(access.access.allowedTriggers, ["signed-trigger"]);
+    }
+    assert.equal(
+      (await auth.apiKeys!.authorize(bearerRequest(created.secret), "runs:dispatch")).status,
+      "forbidden",
+    );
+  });
+
+  it("rotates atomically, expires the old credential, and revokes only the selected trigger key", async () => {
+    const first = await issueTriggerKey("ci-partner");
+    assert.equal(first.actorAllowedByTrigger, true);
+    const id = first.summary.id;
+    const oldAccess = await auth.apiKeys!.authorize(bearerRequest(first.secret), "events:send");
+    assert.equal(oldAccess.status, "authorized");
+    assert.equal(
+      (await browserRequest(rotateTriggerWebhookKeyPath, { id, overlapSeconds: 86401 })).status,
+      400,
+    );
+    const rotation = await browserRequest(rotateTriggerWebhookKeyPath, { id });
+    const next = await revealedKey(rotation);
+    assert.notEqual(next.summary.id, id);
+    assert.notEqual(next.secret, first.secret);
+    assert.equal(next.summary.actor, first.summary.actor);
+    assert.equal(next.summary.name, first.summary.name);
+    assert.deepEqual(next.summary.allowedTriggers, first.summary.allowedTriggers);
+    const old = (await auth.apiKeys!.list("identity-a")).find((key) => key.id === id);
+    assert.ok(old?.expiresAt);
+    assert.equal(old.expiresAt.getTime() - Date.parse(next.summary.createdAt), 3600000);
+    for (const { secret } of [first, next]) {
+      assert.equal(
+        (await auth.apiKeys!.authorize(bearerRequest(secret), "events:send")).status,
+        "authorized",
+      );
+    }
+    const repeated = await browserRequest(rotateTriggerWebhookKeyPath, { id });
+    await expectKeyError(repeated, 409, "rotation_in_progress");
+    await runtime.query("update organization_api_keys set expires_at = now() where id = $1", [id]);
+    assert.equal(
+      (await auth.apiKeys!.authorize(bearerRequest(first.secret), "events:send")).status,
+      "unauthorized",
+    );
+    if (oldAccess.status === "authorized") {
+      assert.equal(await auth.apiKeys!.reauthorize(oldAccess.access, "events:send"), false);
+    }
+
+    const keyId = next.summary.id;
+    const wrong = await browserRequest(revokeTriggerWebhookKeyPath, {
+      id: keyId,
+      triggerName: "other",
+    });
+    await expectKeyError(wrong, 404, "api_key_unavailable");
+    const revoked = await browserRequest(revokeTriggerWebhookKeyPath, {
+      id: keyId,
+      triggerName: "signed-trigger",
+    });
+    assert.equal(revoked.status, 200);
+    assert.deepEqual(await revoked.json(), { revoked: true });
+    assert.equal(
+      (await auth.apiKeys!.authorize(bearerRequest(next.secret), "events:send")).status,
+      "unauthorized",
+    );
+    await expectKeyError(
+      await browserRequest(rotateTriggerWebhookKeyPath, { id: keyId }),
+      409,
+      "rotation_in_progress",
+    );
+  });
+
+  it("checks enabled targets and organization membership", async () => {
+    const created = await issueTriggerKey("ci-partner");
+    const id = created.summary.id;
+    const input = { triggerName: "signed-trigger" };
+    await expectKeyError(
+      await browserRequest(triggerWebhookKeyPath, { triggerName: "unknown" }),
+      404,
+      "trigger_not_found",
+    );
+    await runtime.query("update organization_triggers set enabled = false where id = $1", [
+      targetTriggerId,
+    ]);
+    await expectKeyError(
+      await browserRequest(triggerWebhookKeyPath, input),
+      404,
+      "trigger_not_found",
+    );
+    await runtime.query("update organization_triggers set enabled = true where id = $1", [
+      targetTriggerId,
+    ]);
+    const listPath = `${triggerWebhookKeyPath}?triggerName=signed-trigger`;
+    const foreign = await browserRequest(listPath, undefined, auth, "identity-b");
+    await expectKeyError(foreign, 404, "organization_unavailable");
+    await expectKeyError(
+      await browserRequest(rotateTriggerWebhookKeyPath, { id }, auth, "identity-b"),
+      404,
+      "organization_unavailable",
+    );
+    assert.deepEqual(
+      await auth.apiKeys!.listTriggerWebhookKeys("identity-b", input.triggerName),
+      [],
+    );
+    await assert.rejects(
+      auth.apiKeys!.rotateTriggerWebhookKey("identity-b", "identity-owner-b", id),
+      {
+        code: "api_key_unavailable",
+      },
+    );
+    await runtime.query("update member set role = 'member' where id = 'identity-browser-member'");
+    try {
+      await expectKeyError(await browserRequest(triggerWebhookKeyPath, input), 403, "forbidden");
+      await expectKeyError(await browserRequest(listPath), 403, "forbidden");
+      await expectKeyError(
+        await browserRequest(rotateTriggerWebhookKeyPath, { id }),
+        403,
+        "forbidden",
+      );
+      await expectKeyError(
+        await browserRequest(revokeTriggerWebhookKeyPath, { ...input, id }),
+        403,
+        "forbidden",
+      );
+    } finally {
+      await runtime.query("update member set role = 'owner' where id = 'identity-browser-member'");
+    }
+  });
+
+  async function issueTriggerKey(actor?: string) {
+    return revealedKey(
+      await browserRequest(triggerWebhookKeyPath, { triggerName: "signed-trigger", actor }),
+    );
+  }
+
   it("rejects invalid actors and trigger lists at creation without storing keys", async () => {
     const before = (await auth.apiKeys!.list("identity-a")).length;
     for (const identity of invalidIdentities) {
       await assert.rejects(
-        auth.apiKeys!.create(
-          "identity-a",
-          "identity-owner-a",
-          "Invalid sender",
-          ["events:send"],
-          undefined,
+        auth.apiKeys!.createWith({
+          organizationId: "identity-a",
+          createdByUserId: "identity-owner-a",
+          name: "Invalid sender",
+          scopes: ["events:send"],
           identity,
-        ),
+        }),
         z.ZodError,
       );
       const response = await browserRequest("/api/auth/paseo/api-keys", {
@@ -240,7 +400,12 @@ run:
       assert.equal(response.status, 400);
     }
     await assert.rejects(
-      auth.apiKeys!.create("identity-a", "identity-owner-a", "!!!", ["events:send"]),
+      auth.apiKeys!.createWith({
+        organizationId: "identity-a",
+        createdByUserId: "identity-owner-a",
+        name: "!!!",
+        scopes: ["events:send"],
+      }),
       z.ZodError,
     );
     assert.equal((await auth.apiKeys!.list("identity-a")).length, before);
@@ -568,49 +733,49 @@ run:
 
   it("preserves positional transactions and permits identities on other scopes", async () => {
     const positional = await runtime.transaction((client) =>
-      auth.apiKeys!.create(
-        "identity-a",
-        "identity-owner-a",
-        "Positional reader",
-        ["projects:read"],
+      auth.apiKeys!.createWith({
+        organizationId: "identity-a",
+        createdByUserId: "identity-owner-a",
+        name: "Positional reader",
+        scopes: ["projects:read"],
         client,
-      ),
+      }),
     );
     assert.equal(positional.summary.actor, "positional-reader");
     assert.equal(positional.summary.allowedTriggers, null);
-    const explicit = await auth.apiKeys!.create(
-      "identity-a",
-      "identity-owner-a",
-      "Bound dispatcher",
-      ["runs:dispatch"],
-      undefined,
-      { actor: "ci-partner", allowedTriggers: [] },
-    );
+    const explicit = await auth.apiKeys!.createWith({
+      organizationId: "identity-a",
+      createdByUserId: "identity-owner-a",
+      name: "Bound dispatcher",
+      scopes: ["runs:dispatch"],
+      identity: { actor: "ci-partner", allowedTriggers: [] },
+    });
     assert.equal(explicit.summary.actor, "ci-partner");
     assert.deepEqual(explicit.summary.allowedTriggers, []);
-    const unbound = await auth.apiKeys!.create(
-      "identity-a",
-      "identity-owner-a",
-      "Unbound reader",
-      ["projects:read"],
-      undefined,
-      { actor: null },
-    );
+    const unbound = await auth.apiKeys!.createWith({
+      organizationId: "identity-a",
+      createdByUserId: "identity-owner-a",
+      name: "Unbound reader",
+      scopes: ["projects:read"],
+      identity: { actor: null },
+    });
     assert.equal(unbound.summary.actor, null);
   });
 
   it("keeps API-key authorization tenant-scoped, header-only, scope-checked, and revocable", async () => {
-    const created = await auth.apiKeys!.create(
-      "identity-a",
-      "identity-owner-a",
-      "Tenant sender",
-      ["events:send"],
-      undefined,
-      { actor: "tenant-a", allowedTriggers: ["build-finished"] },
-    );
-    const other = await auth.apiKeys!.create("identity-b", "identity-owner-b", "Tenant sender", [
-      "events:send",
-    ]);
+    const created = await auth.apiKeys!.createWith({
+      organizationId: "identity-a",
+      createdByUserId: "identity-owner-a",
+      name: "Tenant sender",
+      scopes: ["events:send"],
+      identity: { actor: "tenant-a", allowedTriggers: ["build-finished"] },
+    });
+    const other = await auth.apiKeys!.createWith({
+      organizationId: "identity-b",
+      createdByUserId: "identity-owner-b",
+      name: "Tenant sender",
+      scopes: ["events:send"],
+    });
     const authorized = await auth.publicCredentials!.authorize(
       bearerRequest(created.secret),
       "events:send",
@@ -714,9 +879,12 @@ run:
   });
 
   it("writes last use once per minute under a burst and refreshes stale rows only after successful authorization", async () => {
-    const created = await auth.apiKeys!.create("identity-a", "identity-owner-a", "Burst sender", [
-      "events:send",
-    ]);
+    const created = await auth.apiKeys!.createWith({
+      organizationId: "identity-a",
+      createdByUserId: "identity-owner-a",
+      name: "Burst sender",
+      scopes: ["events:send"],
+    });
     const lastUsed = async () =>
       (await auth.apiKeys!.list("identity-a")).find(({ id }) => id === created.summary.id)
         ?.lastUsedAt;
@@ -820,6 +988,18 @@ run:
     );
   }
 });
+
+async function expectKeyError(response: Response, status: number, error: string) {
+  assert.equal(response.status, status, await response.clone().text());
+  assert.deepEqual(await response.json(), { error });
+}
+
+async function revealedKey(response: Response) {
+  assert.equal(response.status, 201, await response.clone().text());
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(response.headers.get("pragma"), "no-cache");
+  return triggerWebhookKeyRevealSchema.parse(await response.json());
+}
 
 function bearerRequest(secret: string): Request {
   return new Request(`${ORIGIN}/api/v1/hooks/build-finished`, {

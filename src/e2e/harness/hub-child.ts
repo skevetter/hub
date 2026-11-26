@@ -79,20 +79,19 @@ async function main(): Promise<void> {
     policy: readInstanceAuthPolicy(process.env),
   });
   await auth.initialize?.();
-  const createdApiKey = await auth.apiKeys?.create(
+  const createdApiKey = await auth.apiKeys?.createWith({
     organizationId,
-    "hub-e2e",
-    "hub e2e automation",
-    [
+    createdByUserId: "hub-e2e",
+    name: "hub e2e automation",
+    scopes: [
       "projects:read",
       "configuration:validate",
       "configuration:install",
       "runs:dispatch",
       "daemons:enroll",
     ],
-    undefined,
-    { actor: null },
-  );
+    identity: { actor: null },
+  });
   if (createdApiKey === undefined) throw new Error("API key service unavailable");
   await writeFile(requiredEnvironment("HUB_E2E_MACHINE_KEY_FILE"), createdApiKey.secret, "utf8");
   const seededDaemonId = "00000000-0000-4000-8000-0000000000dd";

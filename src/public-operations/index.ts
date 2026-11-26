@@ -320,9 +320,7 @@ async function receiveWebhook(
     });
   } catch (error) {
     if (error instanceof ManualRunRejected) {
-      if (error.code === "actor_forbidden" || error.code === "key_actor_required") {
-        return { status: error.code };
-      }
+      if (error.code === "key_actor_required") return { status: error.code };
       return { status: "trigger_not_found" };
     }
     return storageUnavailableOrThrow(error);
