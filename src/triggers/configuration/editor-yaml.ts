@@ -48,6 +48,18 @@ export function yamlAliases(document: Document): Map<Alias, Node> {
   return aliases;
 }
 
+export function yamlAliasTargetsChanged(document: Document, before: Map<Alias, Node>): boolean {
+  let changed = false;
+  visit(document, {
+    Alias(_key, alias) {
+      if (alias.resolve(document) === before.get(alias)) return undefined;
+      changed = true;
+      return visit.BREAK;
+    },
+  });
+  return changed;
+}
+
 export function sharedYamlPath(
   document: Document,
   path: YamlPath,

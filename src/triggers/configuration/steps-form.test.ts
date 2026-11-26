@@ -13,6 +13,7 @@ import {
   remapStepErrors,
   removeStep,
   sharedYamlField,
+  stepListEditError,
   triggerFormErrors,
   type TriggerFormValue,
   type TriggerStepFormValue,
@@ -58,6 +59,10 @@ steps:
     prompt: Fix it.
     continuation: { mode: conversation }
 `;
+
+const ANCHORED_STEPS = STEPS.replace("prompt: Plan it.", "prompt: &p Plan it.")
+  .replace("prompt: Fix it.", "prompt: *p")
+  .replace("    if: \"${{ steps.plan.outputs.verdict == 'fix' }}\"\n", "");
 
 function form(yaml: string): TriggerFormValue {
   const projection = projectTriggerForm(yaml);
@@ -218,6 +223,26 @@ steps:
     expect(document.steps?.[1]).toMatchObject({ env: { MODE: "plan" } });
   });
 
+  it("does not inherit hidden fields when a new step reuses a removed ID", () => {
+    const source = STEPS.replace("env: { MODE: plan }", "env: { KEEP: hidden }");
+    const value = withStep(form(source), 2, { runIf: "" });
+    const added = addStep(removeStep(value, 0));
+    const replacement = complete(withStep(added, 2, { id: "plan" }));
+    const document = parseTriggerDocument(patched(source, replacement));
+    expect(document.steps?.[2]).toMatchObject({ id: "plan" });
+    expect(document.steps?.[2]).not.toHaveProperty("env");
+  });
+
+  it("refuses to patch a list with an orphaned alias without throwing", () => {
+    const value = form(ANCHORED_STEPS);
+    const changed = { ...value, steps: value.steps.slice(1) };
+    expect(patchTriggerYaml(ANCHORED_STEPS, changed)).toBe(ANCHORED_STEPS);
+    expect(mergeTriggerForm(ANCHORED_STEPS, changed)).toEqual({
+      status: "incomplete",
+      reason: "This change would break a YAML alias. Edit the anchor or alias in YAML first.",
+    });
+  });
+
   it("adds a step, writes the whole-run deadline, and drops a cleared condition", () => {
     const value = complete(addStep(form(STEPS), "script"));
     const yaml = patched(STEPS, withStep({ ...value, runMaxRuntime: "" }, 2, { runIf: "" }));
@@ -254,6 +279,15 @@ steps:
     const added = patched(RUN, withStep(form(RUN), 0, { outputSchema: '{"type":"object"}' }));
     expect(added).toContain("steps:");
   });
+
+  it("keeps shorthand when an existing output schema is edited", () => {
+    const yaml = `${RUN}  output:\n    schema: { type: object }\n`;
+    const outputSchema = '{"type":"object","properties":{"verdict":{"type":"string"}}}';
+    const saved = patched(yaml, withStep(form(yaml), 0, { outputSchema }));
+    expect(parseTriggerDocument(saved).run).toMatchObject({
+      output: { schema: { properties: { verdict: { type: "string" } } } },
+    });
+  });
 });
 
 describe("the step list helpers", () => {
@@ -264,6 +298,20 @@ describe("the step list helpers", () => {
     for (let count = 0; count < 25; count++) many = addStep(many);
     expect(many.steps).toHaveLength(20);
     expect(new Set(many.steps.map(({ id }) => id)).size).toBe(20);
+  });
+
+  it("refuses to remove the anchor of a surviving alias", () => {
+    const value = structuredClone(form(ANCHORED_STEPS));
+    expect(removeStep(value, 0)).toBe(value);
+    expect(stepListEditError(value, { kind: "remove", index: 0 })).toContain("YAML alias");
+    expect(stepListEditError(value, { kind: "remove", index: 2 })).toBeUndefined();
+    expect(removeStep(value, 2).steps).toHaveLength(2);
+  });
+
+  it("refuses to put an alias before its anchor and allows safe moves", () => {
+    const value = form(ANCHORED_STEPS);
+    expect(moveStep(value, 0, 2)).toBe(value);
+    expect(moveStep(value, 1, 0).steps.map(({ id }) => id)).toEqual(["build", "plan", "fix"]);
   });
 
   it("lists the fields earlier agent steps declare, and nothing for invalid JSON", () => {
@@ -306,6 +354,12 @@ describe("step errors", () => {
     );
   });
 
+  it("rejects surrounding whitespace on step IDs", () => {
+    expect(triggerFormErrors(withStep(form(STEPS), 1, { id: " build " }))["steps.1.id"]).toBe(
+      "Step ID cannot start or end with a space.",
+    );
+  });
+
   it("flags a condition that reads a removed or later step, and never rewrites it", () => {
     const value = form(STEPS);
     const removed = removeStep(value, 0);
@@ -314,6 +368,22 @@ describe("step errors", () => {
     const moved = moveStep(value, 2, 0);
     expect(triggerFormErrors(moved)["steps.0.runIf"]).toContain('Step "plan"');
     expect(triggerFormErrors(value)["steps.2.runIf"]).toBeUndefined();
+  });
+
+  it("ignores step paths in quoted strings just like the compiler", () => {
+    const runIf = "${{ paseo.prompt == 'steps.missing.outputs.foo' }}";
+    const value = withStep(form(STEPS), 2, { runIf });
+    expect(triggerFormErrors(value)["steps.2.runIf"]).toBeUndefined();
+    expect(() => compileTriggerDocument(patched(STEPS, value))).not.toThrow();
+  });
+
+  it("detects a forward reference with whitespace around path separators", () => {
+    const runIf = "  ${{ steps . plan . outputs . verdict == 'fix' }}  ";
+    const value = withStep(form(STEPS), 2, { runIf });
+    const moved = moveStep(value, 2, 0);
+    expect(triggerFormErrors(moved)["steps.0.runIf"]).toContain('Step "plan"');
+    expect(step(moved, 0).runIf).toBe(runIf);
+    expect(step(form(patched(STEPS, value)), 2).runIf).toBe(runIf);
   });
 
   it("checks the output schema, the step count and each step's own fields", () => {

@@ -26,6 +26,10 @@ import {
   sharedStepFields,
   stepDocument,
   stepFormErrors,
+  stepListEditError,
+  stepOrderError,
+  stepOrderMetadata,
+  type StepOrderMetadata,
   type TriggerAction,
   type TriggerStepField,
   type TriggerStepFormValue,
@@ -72,11 +76,12 @@ export {
   remapStepErrors,
   removeStep,
   SHARED_YAML_FIELD,
+  stepListEditError,
 };
 export type { TriggerAction, TriggerStepField, TriggerStepFormValue };
 export { joinAgentId, parseProviderOptions, splitAgentId } from "./editor-text.js";
 
-export interface TriggerFormValue {
+export interface TriggerFormValue extends StepOrderMetadata {
   name: string;
   enabled: boolean;
   progressMessage?: boolean;
@@ -98,7 +103,7 @@ export interface TriggerFormValue {
 }
 
 export type TriggerFormField =
-  | keyof TriggerFormValue
+  | Exclude<keyof TriggerFormValue, keyof StepOrderMetadata>
   | `qualifiers.${QualifierKey}`
   | `steps.${number}.${TriggerStepField}`;
 
@@ -133,12 +138,13 @@ export function projectTriggerForm(yaml: string): TriggerFormProjection {
   if (events.length !== 1 || entry === undefined) {
     return { status: "yaml_only", reason: "The form supports exactly one event." };
   }
-  return projectEditorEvent(parsed, entry);
+  return projectEditorEvent(parsed, entry, yaml);
 }
 
 function projectEditorEvent(
   parsed: ParsedEditorDocument,
   [event, definition]: [string, TriggerDocument["on"][string]],
+  yaml: string,
 ): TriggerFormProjection {
   const trigger = parsed.data;
   if (!isEditorEvent(event)) {
@@ -171,6 +177,7 @@ function projectEditorEvent(
       ),
     ),
     ...metadata,
+    ...stepOrderMetadata(parsed.source, yaml),
   };
   return { status: "editable", value };
 }
@@ -246,22 +253,31 @@ function messageFormFields(trigger: TriggerDocument) {
 
 /** Patch only form-owned YAML nodes, retaining comments, ordering, and advanced nodes. */
 export function patchTriggerYaml(yaml: string, value: TriggerFormValue): string {
+  return patchExistingTrigger(yaml, value).yaml;
+}
+
+function patchExistingTrigger(
+  yaml: string,
+  value: TriggerFormValue,
+): { yaml: string; refusal?: string } {
   const projection = projectTriggerForm(yaml);
   if (projection.status !== "editable") throw new Error(projection.reason);
   const previous = projection.value;
   const unchanged = sameFormValue(previous, value);
-  if (unchanged && value.progressMessage !== false && value.replyMessage !== false) return yaml;
+  if (unchanged && value.progressMessage !== false && value.replyMessage !== false) return { yaml };
+  const refusal = stepOrderError(previous, value.steps);
+  if (refusal !== undefined) return { yaml, refusal };
   if (!unchanged) validateFormValue(value);
 
   const document = parseDocument(yaml, { compat: ["timestamp"] });
   assertDocument(document);
   patchMessageFlags(document, previous, value);
-  if (unchanged) return document.toString({ lineWidth: 0 });
+  if (unchanged) return { yaml: document.toString({ lineWidth: 0 }) };
   if (previous.name !== value.name) setIfChanged(document, ["name"], value.name);
   if (previous.enabled !== value.enabled) setIfChanged(document, ["enabled"], value.enabled);
   patchEvent(document, previous, value);
   patchRun(document, previous, value);
-  return document.toString({ lineWidth: 0 });
+  return { yaml: document.toString({ lineWidth: 0 }) };
 }
 
 function patchMessageFlags(
@@ -407,7 +423,10 @@ export type TriggerYamlResult =
 export function mergeTriggerForm(yaml: string, value: TriggerFormValue): TriggerYamlResult {
   let patched: string;
   try {
-    patched = yaml.trim() === "" ? createTriggerYaml(value) : patchTriggerYaml(yaml, value);
+    const result =
+      yaml.trim() === "" ? { yaml: createTriggerYaml(value) } : patchExistingTrigger(yaml, value);
+    if (result.refusal !== undefined) return { status: "incomplete", reason: result.refusal };
+    patched = result.yaml;
   } catch (cause) {
     return { status: "incomplete", reason: incompleteReason(cause) };
   }

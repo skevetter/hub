@@ -1,4 +1,5 @@
-import { isMap, isSeq, type Document } from "yaml";
+import { isMap, isSeq, parseDocument, type Document } from "yaml";
+import { expressionPaths, parseExpression } from "../../workflows/expression.js";
 import { ContinuationSchema } from "../continuation.js";
 import type { TriggerFieldErrors } from "./editor.js";
 import {
@@ -13,10 +14,12 @@ import {
 import {
   deleteIfPresent,
   requireWritableYaml,
+  SHARED_YAML_FIELD,
   setIfChanged,
   setOptional,
   sharedYamlPath,
   yamlAliases,
+  yamlAliasTargetsChanged,
   type YamlPath,
 } from "./editor-yaml.js";
 import {
@@ -178,14 +181,7 @@ function projectAgentStep(
 
 /** One step with the plain id and no condition or output schema is the `run` shorthand. */
 export function isShorthandSteps(steps: readonly TriggerStepFormValue[]): boolean {
-  const [only] = steps;
-  return (
-    steps.length === 1 &&
-    only !== undefined &&
-    only.id === SHORTHAND_STEP_ID &&
-    only.runIf.trim() === "" &&
-    only.outputSchema.trim() === ""
-  );
+  return staysShorthand(undefined, steps);
 }
 
 /** A trigger form always holds at least one step. */
@@ -207,6 +203,14 @@ export function hasScriptStep(value: { steps: readonly TriggerStepFormValue[] })
 }
 
 // -- Editing the list ---------------------------------------------------------------------------
+
+export interface StepOrderMetadata {
+  stepOrderSource?: { yaml: string; count: number; shared: boolean };
+}
+
+interface StepListValue extends StepOrderMetadata {
+  steps: TriggerStepFormValue[];
+}
 
 function nextStepId(steps: readonly TriggerStepFormValue[]): string {
   const taken = new Set(steps.map((step) => step.id));
@@ -235,8 +239,7 @@ export function removeStep<T extends { steps: TriggerStepFormValue[] }>(
   value: T,
   index: number,
 ): T {
-  if (value.steps.length <= 1 || value.steps[index] === undefined) return value;
-  return { ...value, steps: value.steps.filter((_, position) => position !== index) };
+  return changeStepList(value, { kind: "remove", index });
 }
 
 export function moveStep<T extends { steps: TriggerStepFormValue[] }>(
@@ -244,11 +247,49 @@ export function moveStep<T extends { steps: TriggerStepFormValue[] }>(
   from: number,
   to: number,
 ): T {
-  const moved = value.steps[from];
-  if (moved === undefined || from === to || to < 0 || to >= value.steps.length) return value;
-  const steps = value.steps.filter((_, position) => position !== from);
-  steps.splice(to, 0, moved);
+  return changeStepList(value, { kind: "move", from, to });
+}
+
+function changeStepList<T extends StepListValue>(value: T, change: StepListChange): T {
+  const steps = proposedStepOrder(value.steps, change);
+  if (steps === undefined || stepOrderError(value, steps) !== undefined) return value;
   return { ...value, steps };
+}
+
+export function stepListEditError(
+  value: StepListValue,
+  change: StepListChange,
+): string | undefined {
+  const steps = proposedStepOrder(value.steps, change);
+  return steps === undefined ? undefined : stepOrderError(value, steps);
+}
+
+export function stepOrderError(
+  previous: StepOrderMetadata,
+  next: readonly TriggerStepFormValue[],
+): string | undefined {
+  const source = previous.stepOrderSource;
+  if (source === undefined) return undefined;
+  const matches = matchStepOrigins(source.count, next);
+  if (sameStepOrder(source.count, matches)) return undefined;
+  if (source.shared) return SHARED_YAML_FIELD;
+  return prospectiveStepOrderError(source.yaml, matches);
+}
+
+function proposedStepOrder(
+  previous: readonly TriggerStepFormValue[],
+  change: StepListChange,
+): TriggerStepFormValue[] | undefined {
+  if (change.kind === "remove") {
+    if (previous.length <= 1 || previous[change.index] === undefined) return undefined;
+    return previous.filter((_, position) => position !== change.index);
+  }
+  const { from, to } = change;
+  const moved = previous[from];
+  if (moved === undefined || from === to || to < 0 || to >= previous.length) return undefined;
+  const steps = previous.filter((_, position) => position !== from);
+  steps.splice(to, 0, moved);
+  return steps;
 }
 
 /**
@@ -398,8 +439,10 @@ function idErrors(
   steps: readonly TriggerStepFormValue[],
   index: number,
 ): Partial<Record<TriggerStepField, string>> {
-  const id = steps[index]?.id.trim() ?? "";
+  const raw = steps[index]?.id ?? "";
+  const id = raw.trim();
   if (id.length === 0) return { id: "Step ID is required." };
+  if (id !== raw) return { id: "Step ID cannot start or end with a space." };
   if (!IDENTIFIER.test(id)) {
     return { id: "Use lowercase letters, digits, and hyphens, starting with a letter." };
   }
@@ -407,24 +450,30 @@ function idErrors(
   return earlier ? { id: "Another step already uses this ID." } : {};
 }
 
-const STEP_REFERENCE = /\bsteps\.([A-Za-z0-9_-]+)/gu;
-
 /** A condition reads only steps that run before it. The form flags a stale reference, never edits it. */
 function runIfErrors(
   steps: readonly TriggerStepFormValue[],
   index: number,
 ): Partial<Record<TriggerStepField, string>> {
-  const runIf = steps[index]?.runIf ?? "";
-  const earlier = new Set(steps.slice(0, index).map((step) => step.id.trim()));
-  for (const match of runIf.matchAll(STEP_REFERENCE)) {
-    const id = match[1] ?? "";
-    if (!earlier.has(id)) {
-      return {
-        runIf: `Step "${id}" does not run before this step, so its outputs are not available.`,
-      };
+  const condition = conditionText(steps[index]?.runIf ?? "");
+  if (condition === undefined) return {};
+  const error = refused(() => validateRunIfOrder(condition, steps.slice(0, index)));
+  return error === undefined ? {} : { runIf: error };
+}
+
+function validateRunIfOrder(condition: string, earlier: readonly TriggerStepFormValue[]): void {
+  const ids = new Set(earlier.map((step) => step.id));
+  for (const path of expressionPaths(parseExpression(condition))) {
+    if (path.namespace === "steps" && !ids.has(path.stepId)) {
+      throw new Error(
+        `Step "${path.stepId}" does not run before this step, so its outputs are not available.`,
+      );
     }
   }
-  return {};
+}
+
+function conditionText(text: string): string | undefined {
+  return text.trim() === "" ? undefined : text;
 }
 
 export function parseOutputSchema(text: string): Record<string, unknown> | undefined {
@@ -512,7 +561,7 @@ export function stepDocument(
   step: TriggerStepFormValue,
   shorthand: boolean,
 ): Record<string, unknown> {
-  const runIf = blankToUndefined(step.runIf);
+  const runIf = conditionText(step.runIf);
   const head = shorthand ? {} : { id: step.id, ...(runIf === undefined ? {} : { if: runIf }) };
   if (step.action === "script") {
     return { ...head, script: step.script, max_runtime: step.maxRuntime.trim() };
@@ -573,11 +622,9 @@ export function patchStepLayout(
   next: readonly TriggerStepFormValue[],
 ): StepLayout {
   if (document.has("run")) {
-    if (staysShorthand(previous, next)) {
-      return {
-        targetBase: ["run", "target"],
-        steps: [{ base: ["run"], previous: previous[0], shorthand: true }],
-      };
+    const [only] = next;
+    if (only !== undefined && staysShorthand(previous[0], next)) {
+      return patchShorthandLayout(document, previous[0], only);
     }
     convertRunToSteps(document, previous[0]);
   }
@@ -589,13 +636,37 @@ export function patchStepLayout(
  * had stays on it; one the form adds moves the document to a list, like an id or a condition.
  */
 function staysShorthand(
-  previous: readonly TriggerStepFormValue[],
+  previous: TriggerStepFormValue | undefined,
   next: readonly TriggerStepFormValue[],
 ): boolean {
   const [only] = next;
   if (only === undefined) return false;
-  const kept = only.outputSchema === previous[0]?.outputSchema;
-  return isShorthandSteps(next.map((step) => (kept ? { ...step, outputSchema: "" } : step)));
+  const existingSchema = previous !== undefined && previous.outputSchema.trim() !== "";
+  return (
+    next.length === 1 &&
+    only.id === SHORTHAND_STEP_ID &&
+    conditionText(only.runIf) === undefined &&
+    (existingSchema || only.outputSchema.trim() === "")
+  );
+}
+
+function patchShorthandLayout(
+  document: Document,
+  previous: TriggerStepFormValue | undefined,
+  next: TriggerStepFormValue,
+): StepLayout {
+  const kept = next.origin === 0;
+  if (!kept) {
+    requireWritableYaml(document, ["run"]);
+    const target = document.getIn(["run", "target"], true);
+    const run = document.createNode(stepDocument(next, true));
+    run.items.unshift(document.createPair("target", target));
+    document.set("run", run);
+  }
+  return {
+    targetBase: ["run", "target"],
+    steps: [{ base: ["run"], previous: kept ? previous : undefined, shorthand: true }],
+  };
 }
 
 function convertRunToSteps(document: Document, previous: TriggerStepFormValue | undefined): void {
@@ -622,9 +693,7 @@ function patchStepList(
   const sequence = document.get("steps", true);
   if (!isSeq(sequence)) throw new Error("Expected a list of steps.");
   const matches = matchSteps(previous, next);
-  const inPlace =
-    matches.length === sequence.items.length && matches.every((match, index) => match === index);
-  if (!inPlace) {
+  if (!sameStepOrder(sequence.items.length, matches)) {
     requireWritableYaml(document, ["steps"]);
     const items = next.map((step, index) => {
       const match = matches[index];
@@ -648,35 +717,33 @@ function patchStepList(
 }
 
 /**
- * For each step of the form, the step of the document it came from. A step keeps its place in the
- * document through a move or a rename; one the form has no origin for matches by its id.
+ * Match by source identity so moves and renames retain nodes and new steps start fresh.
  */
 export function matchSteps(
   previous: readonly TriggerStepFormValue[],
   next: readonly TriggerStepFormValue[],
 ): (number | undefined)[] {
+  return matchStepOrigins(previous.length, next);
+}
+
+function matchStepOrigins(
+  count: number,
+  next: readonly TriggerStepFormValue[],
+): (number | undefined)[] {
   const claimed = new Set<number>();
   return next.map((step) => {
-    const index = sourceIndex(previous, step, claimed);
-    if (index !== undefined) claimed.add(index);
-    return index;
+    const { origin } = step;
+    if (origin === undefined || !Number.isInteger(origin) || origin < 0 || origin >= count) {
+      return undefined;
+    }
+    if (claimed.has(origin)) return undefined;
+    claimed.add(origin);
+    return origin;
   });
 }
 
-function sourceIndex(
-  previous: readonly TriggerStepFormValue[],
-  step: TriggerStepFormValue,
-  claimed: ReadonlySet<number>,
-): number | undefined {
-  if (step.origin !== undefined) {
-    return previous[step.origin] !== undefined && !claimed.has(step.origin)
-      ? step.origin
-      : undefined;
-  }
-  const byId = previous.findIndex(
-    (candidate, index) => candidate.id === step.id && !claimed.has(index),
-  );
-  return byId === -1 ? undefined : byId;
+function sameStepOrder(count: number, matches: readonly (number | undefined)[]): boolean {
+  return matches.length === count && matches.every((match, index) => match === index);
 }
 
 /** Writes what changed in one step, leaving every key the form does not own as it was. */
@@ -689,7 +756,7 @@ export function patchStep(
   if (previous === undefined) return;
   if (!shorthand && previous.id !== next.id) setIfChanged(document, [...base, "id"], next.id);
   if (previous.runIf !== next.runIf) {
-    setOptional(document, [...base, "if"], blankToUndefined(next.runIf));
+    setOptional(document, [...base, "if"], conditionText(next.runIf));
   }
   patchOutputSchema(document, base, previous, next);
   const actionChanged = previous.action !== next.action;
@@ -823,6 +890,34 @@ function patchGitHubAuthority(
 }
 
 // -- YAML anchors -------------------------------------------------------------------------------
+
+export function stepOrderMetadata(source: Document, yaml: string): StepOrderMetadata {
+  const sequence = source.get("steps", true);
+  if (!isSeq(sequence)) return {};
+  const aliases = yamlAliases(source);
+  if (aliases.size === 0) return {};
+  return {
+    stepOrderSource: {
+      yaml,
+      count: sequence.items.length,
+      shared: sharedYamlPath(source, ["steps"], aliases),
+    },
+  };
+}
+
+function prospectiveStepOrderError(
+  yaml: string,
+  matches: readonly (number | undefined)[],
+): string | undefined {
+  const document = parseDocument(yaml, { compat: ["timestamp"] });
+  const sequence = document.get("steps", true);
+  if (!isSeq(sequence)) return undefined;
+  const aliases = yamlAliases(document);
+  sequence.items = matches.map((match) => (match === undefined ? null : sequence.items[match]));
+  return yamlAliasTargetsChanged(document, aliases)
+    ? "This change would break a YAML alias. Edit the anchor or alias in YAML first."
+    : undefined;
+}
 
 const STEP_FIELD_PATHS: [TriggerStepField, ...string[]][] = [
   ["id", "id"],
