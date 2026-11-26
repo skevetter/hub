@@ -123,3 +123,46 @@ test("operators enter instance settings without leaving the organization shell",
   await navigation.leaveInstance();
   await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
 });
+
+test("links every breadcrumb but the current page up the chain", async ({ hub, page }) => {
+  const { navigation } = projectApp(page);
+  await hub.signUpAs("owner", owner);
+  await hub.createOrganization("owner", "Acme");
+  await expect(page).toHaveURL(/\/o\/[^/]+\/home$/u);
+  const home = page.url();
+  await hub.grantOperator("owner");
+  await navigation.openInstanceSection("Operator");
+  const trail = page.getByRole("navigation", { name: "Breadcrumb" });
+
+  await test.step("every item above the page is a link and the page is plain text", async () => {
+    await expect(trail.getByRole("link")).toHaveText(["Acme", "Settings", "Instance"]);
+    await expect(trail.getByRole("link", { name: "Acme" })).toHaveAttribute(
+      "href",
+      new URL("home", home).pathname,
+    );
+    await expect(trail.getByRole("link", { name: "Settings" })).toHaveAttribute(
+      "href",
+      new URL("settings", home).pathname,
+    );
+    await expect(trail.locator('[aria-current="page"]')).toHaveText("Operator");
+    await expect(trail.getByRole("link", { name: "Operator" })).toHaveCount(0);
+  });
+
+  await test.step("a crumb opens the section it names", async () => {
+    await trail.getByRole("link", { name: "Settings" }).click();
+    await expect(page).toHaveURL(new URL("settings/team", home).href);
+    await expect(trail.locator('[aria-current="page"]')).toHaveText("Team");
+    await trail.getByRole("link", { name: "Acme" }).click();
+    await expect(page).toHaveURL(home);
+    await expect(page.getByRole("heading", { name: "Home", level: 1 })).toBeVisible();
+  });
+
+  await test.step("the phone header links the organization and the parent", async () => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await navigation.openMobileOrganizationSection("Settings");
+    await expect(trail.getByRole("link")).toHaveText(["Acme", "Settings"]);
+    await expect(trail.locator('[aria-current="page"]')).toHaveText("Team");
+    await trail.getByRole("link", { name: "Acme" }).click();
+    await expect(page).toHaveURL(home);
+  });
+});

@@ -10,12 +10,18 @@ declare module "@tanstack/react-router" {
   }
 }
 
+/** A breadcrumb names a route in the presented tree and says where that route lives. */
+export interface Crumb {
+  label: string;
+  to: string;
+}
+
 /** Shared layout context comes from the routes TanStack is presenting, including pending UI. */
 export function usePageContext() {
   return useMatches({
     select: (matches) => ({
-      breadcrumbs: matches.flatMap(({ staticData }) =>
-        staticData.breadcrumb === undefined ? [] : [staticData.breadcrumb],
+      breadcrumbs: matches.flatMap(({ staticData, pathname }): Crumb[] =>
+        staticData.breadcrumb === undefined ? [] : [{ label: staticData.breadcrumb, to: pathname }],
       ),
       tabs: matches.some(({ staticData }) => staticData.tabs === true),
       projectSection:

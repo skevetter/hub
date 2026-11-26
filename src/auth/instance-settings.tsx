@@ -19,7 +19,7 @@ export function InstanceSettingsLayout() {
   const { organization } = useRouteTenant();
   const items = useMemo(() => instanceSettingsItems(organization.slug), [organization.slug]);
   const { breadcrumbs } = usePageContext();
-  if (!account.isInstanceOperator) return <InstanceRefusal section={breadcrumbs.at(-1)} />;
+  if (!account.isInstanceOperator) return <InstanceRefusal section={breadcrumbs.at(-1)?.label} />;
 
   return (
     <>
