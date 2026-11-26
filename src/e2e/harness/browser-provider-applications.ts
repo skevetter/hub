@@ -17,13 +17,13 @@ import {
   type ProviderApplicationVerifier,
 } from "../../provider-applications/index.js";
 import {
-  BrowserDiscordBot,
+  type BrowserDiscordBot,
   BrowserDiscordConnections,
   BrowserGitHubAuth,
   BrowserGitHubConnections,
-  BrowserGitHubConfiguration,
+  type BrowserGitHubConfiguration,
   BrowserGitHubReactions,
-  BrowserSlackBot,
+  type BrowserSlackBot,
   type BrowserProviderScenario,
 } from "./browser-providers.js";
 
@@ -86,7 +86,9 @@ export class BrowserSlackSocketFixture {
   }
 
   verifier() {
-    return createSlackSocketInstallationVerifier({ apiBaseUrl: this.apiBaseUrl });
+    return createSlackSocketInstallationVerifier({
+      apiBaseUrl: this.apiBaseUrl,
+    });
   }
 
   async deliverMention(eventId: string): Promise<void> {
@@ -130,7 +132,12 @@ export class BrowserSlackSocketFixture {
 }
 
 export const FIXTURE_APP_IDENTITIES: Readonly<Record<Provider, ProviderApplicationIdentity>> = {
-  github: { provider: "github", id: "42", name: "Paseo Hub", ownerLogin: "acme-inc" },
+  github: {
+    provider: "github",
+    id: "42",
+    name: "Paseo Hub",
+    ownerLogin: "acme-inc",
+  },
   discord: { provider: "discord", id: "900", name: "Paseo" },
   slack: { provider: "slack", id: "browser-slack-app", name: "Paseo" },
   linear: { provider: "linear", id: "browser-linear-client", name: "Paseo" },
@@ -156,63 +163,75 @@ export class BrowserProviderApplicationVerifier implements ProviderApplicationVe
     if (provider !== configuration.provider) {
       return Promise.reject(new ProviderVerificationError("credentialsRejected"));
     }
-    if (configuration.provider === "github") {
-      if (this.scenario === "github-verification-internal") {
-        return Promise.reject(new Error("fixture github verification fault"));
-      }
-      const expected = FIXTURE_APP_CREDENTIALS.github;
-      if (configuration.privateKey !== expected.privateKey) {
-        return Promise.reject(
-          new ProviderVerificationError("credentialsRejected", 401, { subject: "privateKey" }),
-        );
-      }
-      // The key authenticated an App; the App ID names which one. A mismatch is its own answer.
-      return configuration.appId === expected.appId
-        ? Promise.resolve(FIXTURE_APP_IDENTITIES.github)
-        : Promise.reject(
-            new ProviderVerificationError("credentialsRejected", undefined, {
-              subject: "identityMismatch",
-            }),
-          );
+    if (configuration.provider === "github") return this.verifyGithub(configuration);
+    if (configuration.provider === "discord") return this.verifyDiscord(configuration);
+    return Promise.reject(new ProviderVerificationError("credentialsRejected"));
+  }
+
+  private verifyGithub(
+    configuration: Extract<ProviderApplicationConfiguration, { provider: "github" }>,
+  ): Promise<ProviderApplicationIdentity> {
+    if (this.scenario === "github-verification-internal") {
+      return Promise.reject(new Error("fixture github verification fault"));
     }
-    if (configuration.provider === "discord") {
-      if (this.scenario === "discord-verification-network") {
-        return Promise.reject(new ProviderVerificationError("network"));
-      }
-      if (this.scenario === "discord-rate-limited") {
-        return Promise.reject(new ProviderVerificationError("rateLimited", 429));
-      }
-      if (
-        this.scenario === "discord-disallowed-intents" &&
-        configuration.applicationId === FIXTURE_APP_CREDENTIALS.discord.applicationId
-      ) {
-        return Promise.resolve(FIXTURE_APP_IDENTITIES.discord);
-      }
-      const expected = FIXTURE_APP_CREDENTIALS.discord;
-      if (configuration.botToken !== expected.botToken) {
-        return Promise.reject(
-          new ProviderVerificationError("credentialsRejected", 401, { subject: "botToken" }),
-        );
-      }
-      if (configuration.applicationId !== expected.applicationId) {
-        return Promise.reject(
+    const expected = FIXTURE_APP_CREDENTIALS.github;
+    if (configuration.privateKey !== expected.privateKey) {
+      return Promise.reject(
+        new ProviderVerificationError("credentialsRejected", 401, {
+          subject: "privateKey",
+        }),
+      );
+    }
+    // The key authenticated an App; the App ID names which one. A mismatch is its own answer.
+    return configuration.appId === expected.appId
+      ? Promise.resolve(FIXTURE_APP_IDENTITIES.github)
+      : Promise.reject(
           new ProviderVerificationError("credentialsRejected", undefined, {
             subject: "identityMismatch",
           }),
         );
-      }
-      // Discord's client credentials grant is the only thing that can prove the Client Secret,
-      // so the fixture checks it too — otherwise "Verified" would mean less here than in production.
-      return this.scenario === "discord-client-secret-rejected" ||
-        configuration.clientSecret !== expected.clientSecret
-        ? Promise.reject(
-            new ProviderVerificationError("credentialsRejected", 401, { subject: "clientSecret" }),
-          )
-        : Promise.resolve(FIXTURE_APP_IDENTITIES.discord);
+  }
+
+  private verifyDiscord(
+    configuration: Extract<ProviderApplicationConfiguration, { provider: "discord" }>,
+  ): Promise<ProviderApplicationIdentity> {
+    if (this.scenario === "discord-verification-network") {
+      return Promise.reject(new ProviderVerificationError("network"));
     }
-    // Slack matches production: client credentials have no honest verification endpoint, so the
-    // installation callback is the only thing that can accept them.
-    return Promise.reject(new ProviderVerificationError("credentialsRejected"));
+    if (this.scenario === "discord-rate-limited") {
+      return Promise.reject(new ProviderVerificationError("rateLimited", 429));
+    }
+    if (
+      this.scenario === "discord-disallowed-intents" &&
+      configuration.applicationId === FIXTURE_APP_CREDENTIALS.discord.applicationId
+    ) {
+      return Promise.resolve(FIXTURE_APP_IDENTITIES.discord);
+    }
+    const expected = FIXTURE_APP_CREDENTIALS.discord;
+    if (configuration.botToken !== expected.botToken) {
+      return Promise.reject(
+        new ProviderVerificationError("credentialsRejected", 401, {
+          subject: "botToken",
+        }),
+      );
+    }
+    if (configuration.applicationId !== expected.applicationId) {
+      return Promise.reject(
+        new ProviderVerificationError("credentialsRejected", undefined, {
+          subject: "identityMismatch",
+        }),
+      );
+    }
+    // Discord's client credentials grant is the only thing that can prove the Client Secret,
+    // so the fixture checks it too — otherwise "Verified" would mean less here than in production.
+    return this.scenario === "discord-client-secret-rejected" ||
+      configuration.clientSecret !== expected.clientSecret
+      ? Promise.reject(
+          new ProviderVerificationError("credentialsRejected", 401, {
+            subject: "clientSecret",
+          }),
+        )
+      : Promise.resolve(FIXTURE_APP_IDENTITIES.discord);
   }
 }
 
@@ -295,7 +314,9 @@ export function browserRegistrationFactory(fixtures: BrowserProviderApplicationF
         connectionClient: new BrowserLinearConnections(input.callbackOrigin),
         ...(input.expectedConfigurationVersion === undefined
           ? {}
-          : { expectedConfigurationVersion: input.expectedConfigurationVersion }),
+          : {
+              expectedConfigurationVersion: input.expectedConfigurationVersion,
+            }),
         activateConfiguration: input.activateConfiguration,
         onVerifiedInstallation: input.onVerifiedLinearInstallation,
       });
@@ -307,10 +328,14 @@ export function browserRegistrationFactory(fixtures: BrowserProviderApplicationF
       connectionClient: new BrowserSlackConnections(input.callbackOrigin, fixtures.scenario),
       ...(input.expectedConfigurationVersion === undefined
         ? {}
-        : { expectedConfigurationVersion: input.expectedConfigurationVersion }),
+        : {
+            expectedConfigurationVersion: input.expectedConfigurationVersion,
+          }),
       activateConfiguration: input.activateConfiguration,
       onVerifiedInstallation: input.onVerifiedSlackInstallation,
-      socket: { apiUrl: `${fixtures.slackSocket.apiBaseUrl}/apps.connections.open` },
+      socket: {
+        apiUrl: `${fixtures.slackSocket.apiBaseUrl}/apps.connections.open`,
+      },
     });
   };
 }
