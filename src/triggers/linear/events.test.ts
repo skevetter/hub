@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
-import { normalizeLinearEvent } from "./events.js";
+import { NormalizedLinearEventSchema, normalizeLinearEvent } from "./events.js";
 
 describe("Linear event normalization", () => {
   it.each([
@@ -139,3 +139,17 @@ function normalizeComment(extraData: Record<string, unknown>) {
     },
   });
 }
+
+it.each([
+  ["https://linear.app/team/issue/X-1", "2026-01-02T00:00Z", true],
+  ["mailto:author@example.com", "2024-02-29T00:00:00.123Z", true],
+  ["relative/path", "2026-01-02T00:00:00Z", false],
+  ["https://linear.app", "2026-01-02T00:00:00+01:00", false],
+])("validates normalized URL %s with timestamp %s", (url, occurredAt, accepted) => {
+  const event = normalizeComment({ issue: { id: "issue-1", title: "Issue" } });
+  assert.equal(
+    NormalizedLinearEventSchema.safeParse({ ...event, issue: { ...event?.issue, url }, occurredAt })
+      .success,
+    accepted,
+  );
+});
