@@ -156,23 +156,25 @@ export class FakeTerminalDaemon {
       });
     }
     if (type === "capture_terminal_request") return this.capture(message);
-    if (type === "kill_terminal_request") {
-      const id = String(message["terminalId"]);
-      this.killAttempts.push(id);
-      if (this.failKills > 0) {
-        this.failKills -= 1;
-        return this.reply("rpc_error", { requestId, error: "terminal worker busy" });
-      }
-      const terminal = this.terminals.get(id);
-      if (!this.killSucceeds) {
-        return this.reply("kill_terminal_response", { requestId, terminalId: id, success: false });
-      }
-      this.killed.push(id);
-      const success = terminal?.listed === true;
-      if (terminal !== undefined) terminal.listed = false;
-      return this.reply("kill_terminal_response", { requestId, terminalId: id, success });
-    }
+    if (type === "kill_terminal_request") return this.kill(message, requestId);
     throw new Error(`unexpected terminal request ${type}`);
+  }
+
+  private kill(message: Record<string, unknown>, requestId: unknown): void {
+    const id = String(message["terminalId"]);
+    this.killAttempts.push(id);
+    if (this.failKills > 0) {
+      this.failKills -= 1;
+      return this.reply("rpc_error", { requestId, error: "terminal worker busy" });
+    }
+    const terminal = this.terminals.get(id);
+    if (!this.killSucceeds) {
+      return this.reply("kill_terminal_response", { requestId, terminalId: id, success: false });
+    }
+    this.killed.push(id);
+    const success = terminal?.listed === true;
+    if (terminal !== undefined) terminal.listed = false;
+    return this.reply("kill_terminal_response", { requestId, terminalId: id, success });
   }
 
   private create(message: Record<string, unknown>): void {
