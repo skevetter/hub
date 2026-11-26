@@ -54,13 +54,10 @@ function insertExecution(database: Database, id: string, deadlineAt?: Date) {
 async function fixture() {
   const database = createMemoryDatabase();
   const execution = await insertExecution(database, "execution", new Date(1000));
-  const sessions = new AgentSessions(
-    database,
-    "fixture-secret",
-    "https://hub.test",
-    new OutputExecutorRegistry(),
-    () => 0,
-  );
+  const sessions = new AgentSessions(database, "fixture-secret", "https://hub.test", {
+    outputs: new OutputExecutorRegistry(),
+    now: () => 0,
+  });
   const events: unknown[][] = [];
   const unsubscribe = () => {
     events.push(["unsubscribe"]);

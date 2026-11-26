@@ -35,7 +35,7 @@ async function fixture(
       replies.push({ executionId: input.agentExecutionId, context: input.outputContext });
     },
   });
-  const sessions = new AgentSessions(database, "secret", "https://hub.test", outputs, now);
+  const sessions = new AgentSessions(database, "secret", "https://hub.test", { outputs, now });
   const capabilities = createExecutionCapabilityServer({
     database,
     outputs,
