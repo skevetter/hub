@@ -249,10 +249,12 @@ export class LinearRunReplyWriter {
     const { linearOrganizationId, issueId, linear } = source;
     const authority = await authorizeLinearCommentConnection(
       this.options.connectionForLinearOrganization,
-      linearOrganizationId,
-      run.organizationId,
-      "comments:create",
-      signal,
+      {
+        linearOrganizationId,
+        organizationId: run.organizationId,
+        requiredScope: "comments:create",
+        signal,
+      },
     );
     if (!("connection" in authority)) {
       if ("unavailable" in authority && authority.unavailable === "scope_missing")

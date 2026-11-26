@@ -9,16 +9,14 @@ const repositorySchema = z
     full_name: z.string().min(1),
     default_branch: z.string().min(1),
   })
-  .passthrough();
-const repositoryListSchema = z.object({ repositories: z.array(repositorySchema) }).passthrough();
-const referenceSchema = z.object({ object: z.object({ sha: z.string().min(1) }) }).passthrough();
+  .loose();
+const repositoryListSchema = z.object({ repositories: z.array(repositorySchema) }).loose();
+const referenceSchema = z.object({ object: z.object({ sha: z.string().min(1) }) }).loose();
 const contentSchema = z.discriminatedUnion("type", [
-  z
-    .object({ type: z.literal("file"), encoding: z.literal("base64"), content: z.string() })
-    .passthrough(),
-  z.object({ type: z.literal("dir") }).passthrough(),
-  z.object({ type: z.literal("symlink") }).passthrough(),
-  z.object({ type: z.literal("submodule") }).passthrough(),
+  z.object({ type: z.literal("file"), encoding: z.literal("base64"), content: z.string() }).loose(),
+  z.object({ type: z.literal("dir") }).loose(),
+  z.object({ type: z.literal("symlink") }).loose(),
+  z.object({ type: z.literal("submodule") }).loose(),
 ]);
 const treeSchema = z
   .object({
@@ -30,45 +28,18 @@ const treeSchema = z
           mode: z.string(),
           type: z.enum(["blob", "tree", "commit"]),
         })
-        .passthrough(),
+        .loose(),
     ),
   })
-  .passthrough();
+  .loose();
 
 export function createGitHubConfigurationProvider(auth: GitHubAuth): GitHubConfigurationProvider {
-  async function repository(installationId: number, repositoryId: number) {
-    const octokit = await auth.createInstallationOctokit(installationId);
-    const response = await octokit.request("GET /repositories/{repository_id}", {
-      repository_id: repositoryId,
-    });
-    const parsed = repositorySchema.parse(response.data);
-    const [owner, name] = splitFullName(parsed.full_name);
-    return { octokit, owner, name, repository: parsed };
-  }
-
   return {
-    async listInstallationRepositories({ installationId }) {
-      const octokit = await auth.createInstallationOctokit(installationId);
-      const repositories: Array<{ repositoryId: number; fullName: string; defaultBranch: string }> =
-        [];
-      for (let page = 1; ; page += 1) {
-        const response = await octokit.request("GET /installation/repositories", {
-          per_page: 100,
-          page,
-        });
-        const listed = repositoryListSchema.parse(response.data).repositories;
-        repositories.push(
-          ...listed.map((item) => ({
-            repositoryId: item.id,
-            fullName: item.full_name,
-            defaultBranch: item.default_branch,
-          })),
-        );
-        if (listed.length < 100) return repositories;
-      }
+    listInstallationRepositories(input) {
+      return listInstallationRepositories(auth, input);
     },
     async readDefaultBranchHead({ installationId, repositoryId, defaultBranch }) {
-      const resolved = await repository(installationId, repositoryId);
+      const resolved = await repository(auth, installationId, repositoryId);
       const response = await resolved.octokit.request("GET /repos/{owner}/{repo}/git/ref/{ref}", {
         owner: resolved.owner,
         repo: resolved.name,
@@ -77,7 +48,7 @@ export function createGitHubConfigurationProvider(auth: GitHubAuth): GitHubConfi
       return referenceSchema.parse(response.data).object.sha;
     },
     async listFilesAtCommit({ installationId, repositoryId, commitSha, prefix }) {
-      const resolved = await repository(installationId, repositoryId);
+      const resolved = await repository(auth, installationId, repositoryId);
       const response = await resolved.octokit.request(
         "GET /repos/{owner}/{repo}/git/trees/{tree_sha}",
         {
@@ -95,7 +66,7 @@ export function createGitHubConfigurationProvider(auth: GitHubAuth): GitHubConfi
         .map(({ path, type, mode }) => ({ path, kind: gitTreeEntryKind(type, mode) }));
     },
     async readFileAtCommit({ installationId, repositoryId, commitSha, path }) {
-      const resolved = await repository(installationId, repositoryId);
+      const resolved = await repository(auth, installationId, repositoryId);
       try {
         const response = await resolved.octokit.request(
           "GET /repos/{owner}/{repo}/contents/{path}",
@@ -114,6 +85,39 @@ export function createGitHubConfigurationProvider(auth: GitHubAuth): GitHubConfi
       }
     },
   };
+}
+
+async function repository(auth: GitHubAuth, installationId: number, repositoryId: number) {
+  const octokit = await auth.createInstallationOctokit(installationId);
+  const response = await octokit.request("GET /repositories/{repository_id}", {
+    repository_id: repositoryId,
+  });
+  const parsed = repositorySchema.parse(response.data);
+  const [owner, name] = splitFullName(parsed.full_name);
+  return { octokit, owner, name, repository: parsed };
+}
+
+async function listInstallationRepositories(
+  auth: GitHubAuth,
+  { installationId }: Parameters<GitHubConfigurationProvider["listInstallationRepositories"]>[0],
+) {
+  const octokit = await auth.createInstallationOctokit(installationId);
+  const repositories: Array<{ repositoryId: number; fullName: string; defaultBranch: string }> = [];
+  for (let page = 1; ; page += 1) {
+    const response = await octokit.request("GET /installation/repositories", {
+      per_page: 100,
+      page,
+    });
+    const listed = repositoryListSchema.parse(response.data).repositories;
+    repositories.push(
+      ...listed.map((item) => ({
+        repositoryId: item.id,
+        fullName: item.full_name,
+        defaultBranch: item.default_branch,
+      })),
+    );
+    if (listed.length < 100) return repositories;
+  }
 }
 
 function gitTreeEntryKind(
@@ -139,10 +143,11 @@ function toFileAtCommit(content: z.infer<typeof contentSchema>): PromptPartialRe
 
 function splitFullName(fullName: string): [string, string] {
   const parts = fullName.split("/");
-  if (parts.length !== 2 || parts[0]?.length === 0 || parts[1]?.length === 0) {
+  const [owner, name] = parts;
+  if (parts.length !== 2 || !owner || !name) {
     throw new Error("GitHub returned an invalid repository identity");
   }
-  return [parts[0]!, parts[1]!];
+  return [owner, name];
 }
 
 function hasStatus(error: unknown, status: number): boolean {
