@@ -395,11 +395,16 @@ async function seedPlanHistory(world: World, fixture: Trigger) {
   return { projectId, revisionId: project.activeConfigurationRevisionId, route };
 }
 
+const HISTORY_ROWS = 5064;
+const HISTORY_BATCH = 1000;
+
 async function seedWindowHistory(world: World, fixture: Trigger) {
   const { projectId, revisionId, route } = await seedPlanHistory(world, fixture);
   // Mostly old history, a small window: the plan must follow the window, not the table.
-  await pg.runtime.query(
-    `with receipts as (
+  // The pool cancels a statement after a few seconds, so history goes in as small batches.
+  for (let first = 1; first <= HISTORY_ROWS; first += HISTORY_BATCH) {
+    await pg.runtime.query(
+      `with receipts as (
        insert into provider_event_receipts
          (organization_id, provider, delivery_id, source, payload, received_at, dropped_reason,
           accepted_routes)
@@ -409,15 +414,25 @@ async function seedWindowHistory(world: World, fixture: Trigger) {
               else $3::timestamptz + interval '1 day' end,
          case when n > 5032 then 'trigger_filters_rejected' end,
          case when n > 5032 then $6::jsonb end
-       from generate_series(1, 5064) n returning id, received_at, dropped_reason
+       from generate_series($7::int, $8::int) n returning id, received_at, dropped_reason
      )
      insert into trigger_runs
        (organization_id, project_id, configuration_revision_id, provider_event_receipt_id,
         configured_trigger_name, status, prompt, deadline_at, created_at)
      select $1, $4, $5, id, 'plan', 'succeeded', '', received_at + interval '1 hour', received_at
      from receipts where dropped_reason is null`,
-    [world.org, window.previousStart, window.recentStart, projectId, revisionId, route],
-  );
+      [
+        world.org,
+        window.previousStart,
+        window.recentStart,
+        projectId,
+        revisionId,
+        route,
+        first,
+        Math.min(first + HISTORY_BATCH - 1, HISTORY_ROWS),
+      ],
+    );
+  }
   await pg.runtime.query("analyze provider_event_receipts, trigger_runs");
 }
 
