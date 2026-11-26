@@ -117,20 +117,17 @@ describe.each(backends)("idempotent retained accounting (%s)", (_name, open) => 
         data: { status: "succeeded" },
         origin: "captured" as const,
       };
-      try {
-        if (sealedBeforeAccounting) await database.appendRunTimelineEvent(finishedEvent);
-        queue.recordDrops(scope, 3);
-        assert.equal(await queue.flush(), true);
-        assert.equal(
-          (await database.readRunTimelineState(ORGANIZATION, run.id))?.droppedCount ?? 0,
-          committed ? 3 : 0,
-        );
-        assert.equal(queue.accountingStats().retainedEntries, 1);
-        assert.equal(notifications.length, 0);
-        if (!sealedBeforeAccounting) await database.appendRunTimelineEvent(finishedEvent);
-        const sealed = await database.readRunTimelineState(ORGANIZATION, run.id);
-        await vi.advanceTimersByTimeAsync(30_000);
-        assert.equal(await queue.flush(), true);
+      function verifyNotices(
+        notices: Awaited<ReturnType<Database["listRunTimelineEvents"]>>,
+        hasNotice: boolean,
+        state: Awaited<ReturnType<Database["readRunTimelineState"]>>,
+      ): void {
+        assert.equal(notices.length, hasNotice ? 1 : 0);
+        assert.deepEqual(notifications, hasNotice ? [notices[0]!.seq] : []);
+        if (hasNotice) assert.notEqual(notices[0]!.seq, state?.eventCount);
+      }
+
+      async function verifyRecovery(sealed: Awaited<ReturnType<Database["readRunTimelineState"]>>) {
         const state = await database.readRunTimelineState(ORGANIZATION, run.id);
         assert.equal(state?.droppedCount, 3);
         assert.equal(state?.sealedSeq, sealed?.sealedSeq);
@@ -145,9 +142,7 @@ describe.each(backends)("idempotent retained accounting (%s)", (_name, open) => 
         });
         const notices = rows.filter((row) => row.kind === "truncated");
         const hasNotice = committed && !sealedBeforeAccounting;
-        assert.equal(notices.length, hasNotice ? 1 : 0);
-        assert.deepEqual(notifications, hasNotice ? [notices[0]!.seq] : []);
-        if (hasNotice) assert.notEqual(notices[0]!.seq, state?.eventCount);
+        verifyNotices(notices, hasNotice, state);
         assert.deepEqual(await write.mock.results[1]!.value, {
           seq: state?.eventCount,
           inserted: false,
@@ -159,6 +154,23 @@ describe.each(backends)("idempotent retained accounting (%s)", (_name, open) => 
           giveUps: 0,
           abandonedDrops: 0,
         });
+      }
+
+      try {
+        if (sealedBeforeAccounting) await database.appendRunTimelineEvent(finishedEvent);
+        queue.recordDrops(scope, 3);
+        assert.equal(await queue.flush(), true);
+        assert.equal(
+          (await database.readRunTimelineState(ORGANIZATION, run.id))?.droppedCount ?? 0,
+          committed ? 3 : 0,
+        );
+        assert.equal(queue.accountingStats().retainedEntries, 1);
+        assert.equal(notifications.length, 0);
+        if (!sealedBeforeAccounting) await database.appendRunTimelineEvent(finishedEvent);
+        const sealed = await database.readRunTimelineState(ORGANIZATION, run.id);
+        await vi.advanceTimersByTimeAsync(30_000);
+        assert.equal(await queue.flush(), true);
+        await verifyRecovery(sealed);
       } finally {
         unsubscribe();
         await queue.stop();
@@ -194,6 +206,30 @@ describe.each(backends)("idempotent retained accounting (%s)", (_name, open) => 
       });
       const queue = new RunTimelineQueue(database, { bus });
       const controls: Promise<void>[] = [];
+      async function verifyAdditionalDrops() {
+        const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, {
+          afterSeq: 0,
+          limit: 5110,
+        });
+        const notice = rows.find((row) => row.kind === "truncated");
+        assert.ok(notice);
+        assert.ok(notifications.includes(notice.seq));
+        for (let index = 0; index < 20; index++) {
+          queue.recordDrops(scope, 1);
+          assert.equal(await queue.flush(), true);
+        }
+        assert.equal(new Set(write.mock.calls.slice(2).map((call) => call[4])).size, 21);
+        assert.equal((await database.readRunTimelineState(ORGANIZATION, run.id))?.droppedCount, 63);
+        await vi.advanceTimersByTimeAsync(300_000);
+        assert.equal(write.mock.calls.length, 23);
+        assert.deepEqual(queue.accountingStats(), {
+          queueEntries: 0,
+          retainedEntries: 0,
+          giveUps: 0,
+          abandonedDrops: 0,
+        });
+      }
+
       try {
         queue.recordDrops(scope, 3);
         assert.equal(await queue.flush(), true);
@@ -222,27 +258,7 @@ describe.each(backends)("idempotent retained accounting (%s)", (_name, open) => 
         );
         assert.notEqual(write.mock.calls[0]?.[4], write.mock.calls[2]?.[4]);
         assert.equal((await database.readRunTimelineState(ORGANIZATION, run.id))?.droppedCount, 43);
-        const rows = await database.listRunTimelineEvents(ORGANIZATION, run.id, {
-          afterSeq: 0,
-          limit: 5110,
-        });
-        const notice = rows.find((row) => row.kind === "truncated");
-        assert.ok(notice);
-        assert.ok(notifications.includes(notice.seq));
-        for (let index = 0; index < 20; index++) {
-          queue.recordDrops(scope, 1);
-          assert.equal(await queue.flush(), true);
-        }
-        assert.equal(new Set(write.mock.calls.slice(2).map((call) => call[4])).size, 21);
-        assert.equal((await database.readRunTimelineState(ORGANIZATION, run.id))?.droppedCount, 63);
-        await vi.advanceTimersByTimeAsync(300_000);
-        assert.equal(write.mock.calls.length, 23);
-        assert.deepEqual(queue.accountingStats(), {
-          queueEntries: 0,
-          retainedEntries: 0,
-          giveUps: 0,
-          abandonedDrops: 0,
-        });
+        await verifyAdditionalDrops();
       } finally {
         unsubscribe();
         release.resolve();
