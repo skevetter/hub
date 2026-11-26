@@ -12,14 +12,30 @@ const input = {
 };
 
 describe("script runner boundaries", () => {
-  it("rethrows a non-Error rejection from polling after cleanup", async () => {
+  it("rethrows the same Error from polling after cleanup", async () => {
     const daemon = new FakeTerminalDaemon();
     const clock = new FakeClock();
-    const reason = { detail: "sleep failed" };
+    const reason = new RangeError("sleep failed");
     clock.sleep = async () => Promise.reject(reason);
     await expect(runScript(daemon.client, input, clock)).rejects.toBe(reason);
     expect(daemon.killed).toEqual(["terminal-1"]);
   });
+
+  it.each([{ detail: "sleep failed" }, "sleep failed"])(
+    "wraps a non-Error rejection from polling after cleanup (%s)",
+    async (reason) => {
+      const daemon = new FakeTerminalDaemon();
+      const clock = new FakeClock();
+      clock.sleep = async () => Promise.reject(reason);
+      const run = runScript(daemon.client, input, clock);
+      await expect(run).rejects.toThrow("Script run failed with a non-Error value");
+      const error: unknown = await run.catch((failure: unknown) => failure);
+      expect(error).toBeInstanceOf(Error);
+      if (!(error instanceof Error)) throw new Error("Expected a wrapped rejection");
+      expect(error.cause).toBe(reason);
+      expect(daemon.killed).toEqual(["terminal-1"]);
+    },
+  );
 
   it("uses its fallback failure when polling rejects with undefined", async () => {
     const daemon = new FakeTerminalDaemon();
