@@ -491,14 +491,17 @@ describe("authored contract precedence", () => {
     assertIssue(
       () => compileHubConfig(configuration({}, { ...step, output, idle_timeout: "11m" })),
       "step work idle_timeout must not exceed max_runtime",
+      ["triggers", "run", "steps", "work", "idle_timeout"],
     );
     assertIssue(
       () => compileHubConfig(configuration({}, { ...step, output })),
       "step work complete_on_turn_end cannot be combined with output.schema: a finished turn has no structured output",
+      ["triggers", "run", "steps", "work", "complete_on_turn_end"],
     );
     assertIssue(
       () => compileHubConfig(configuration({}, step)),
       "step work complete_on_turn_end cannot be combined with a required output: the agent must emit it before it finishes",
+      ["triggers", "run", "steps", "work", "complete_on_turn_end"],
     );
   });
 

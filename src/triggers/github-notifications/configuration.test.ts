@@ -15,6 +15,7 @@ import {
 import { EDITOR_EVENTS, eventDefinition } from "../configuration/events.js";
 import { summarizeTrigger } from "../../projects/activity-summary.js";
 import { notificationYaml } from "./test-fixture.js";
+import { documentRun } from "../configuration/steps.js";
 
 const FILTERED = `# poll my mentions
 ${notificationYaml("webapp-mentions", "      repo: acme/webapp\n      reason: mention\n      contains: deploy\n")}`;
@@ -119,7 +120,9 @@ describe("github.notification configuration", () => {
     const edited = patchTriggerYaml(FILTERED, {
       ...projection.value,
       name: "renamed",
-      prompt: "Changed.",
+      steps: projection.value.steps.map((step, index) =>
+        index === 0 ? { ...step, prompt: "Changed." } : step,
+      ),
     });
     expect(edited).toContain("# poll my mentions");
     const document = parseTriggerDocument(edited);
@@ -127,7 +130,7 @@ describe("github.notification configuration", () => {
     expect(document.on["github.notification"]).toEqual({
       filters: { repo: "acme/webapp", reason: "mention", contains: "deploy" },
     });
-    expect(agentRun(parseTriggerDocument(edited).run).prompt).toBe("Changed.");
+    expect(agentRun(documentRun(parseTriggerDocument(edited))).prompt).toBe("Changed.");
 
     const merged = mergeTriggerForm(FILTERED, { ...projection.value, cwd: "/elsewhere" });
     if (merged.status !== "ok") throw new Error(merged.reason);

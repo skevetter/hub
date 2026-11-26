@@ -87,6 +87,97 @@ const defaults: ProgressRenderInput = {
   organizationSlug: "acme",
 };
 
+function largeBodyExpectation(
+  provider: ProgressRenderInput["provider"],
+  status: "running" | "failed" | "timed_out" | "succeeded",
+): string[] {
+  const statuses = {
+    running: "Running",
+    failed: "Failed in 4m 02s: the run failed (failed).",
+    timed_out: "Timed out in 4m 02s: the run reached its time limit (run_timeout).",
+    succeeded: "Succeeded in 4m 02s",
+  };
+  const linearStatuses = {
+    running: "Running",
+    failed: "`Failed` in `4m 02s`: `the run failed` (`failed`).",
+    timed_out: "`Timed out` in `4m 02s`: `the run reached its time limit` (`run_timeout`).",
+    succeeded: "Succeeded in `4m 02s`",
+  };
+  const expected = [];
+  const linear = provider === "linear";
+  expected.push(`Paseo run: ${(linear ? linearStatuses : statuses)[status]}`);
+  if (status === "running") {
+    expected.push(
+      linear
+        ? "Started `10:02:11 UTC`. Updated `10:02:14 UTC`."
+        : "Started 10:02:11 UTC. Updated 10:02:14 UTC.",
+      "Now: waiting for permission",
+    );
+  } else {
+    expected.push(linear ? "Finished `10:06:13 UTC`." : "Finished 10:06:13 UTC.");
+  }
+  if (linear) {
+    expected.push(
+      "Activity: `556 commands`, `556 reads`, `556 edits`, `556 web calls`, `556 subagents`, `555 plans`, `555 MCP calls`, `555 finish calls`, `555 other calls`. `5001 tool calls`, `5001` failed.",
+      status === "running"
+        ? "Step `149` of `150` running since `10:02:14 UTC`."
+        : "Steps: `148 succeeded`, `2 not run` of `150`.",
+      `Run details: \`https://hub.example.org/base/o/acme/activity/${RUN_ID}\``,
+    );
+  } else {
+    expected.push(
+      "Activity: 556 commands, 556 reads, 556 edits, 556 web calls, 556 subagents, 555 plans, 555 MCP calls, 555 finish calls, 555 other calls. 5001 tool calls, 5001 failed.",
+      status === "running"
+        ? "Step 149 of 150 running since 10:02:14 UTC."
+        : "Steps: 148 succeeded, 2 not run of 150.",
+      `Run details: https://hub.example.org/base/o/acme/activity/${RUN_ID}`,
+    );
+  }
+  return expected;
+}
+
+function assertLargeBody(
+  provider: ProgressRenderInput["provider"],
+  status: Parameters<typeof largeBodyExpectation>[1],
+  fixture: {
+    steps: WorkflowStepRunRecord[];
+    activity: RunTimelineEvent[];
+    adversarial: string;
+    authored: Set<string>;
+  },
+): void {
+  const { steps, activity, adversarial, authored } = fixture;
+  const maxBodyChars = provider === "slack" ? 3000 : 4000;
+  const body = renderProgress({
+    ...defaults,
+    provider,
+    maxBodyChars,
+    steps,
+    events: [
+      events[0]!,
+      ...activity,
+      event("tool_finished", 5002, working, {
+        callId: "invalid",
+        category: adversarial,
+        status: "failed",
+      }),
+      event("permission_requested", 5003, working, { request: adversarial }),
+    ],
+    run: {
+      ...run,
+      status,
+      completedAt: status === "running" ? null : finish,
+      failureReason: adversarial,
+    },
+  });
+  const expected = largeBodyExpectation(provider, status);
+  assert.equal(body, expected.join("\n"));
+  for (const fragment of authored) assert.equal(body.includes(fragment), false);
+  assert.doesNotMatch(body, /@everyone|<!channel>|secret\.example/u);
+  assert.equal(Buffer.byteLength(body, "utf8"), body.length);
+  assert.ok(body.length <= maxBodyChars);
+}
+
 describe("progress message vocabulary", () => {
   it("describes a canceled run as stopped by a person", () => {
     const body = renderProgress({
@@ -171,18 +262,6 @@ describe("progress message vocabulary", () => {
         subject: adversarial,
       }),
     );
-    const statuses = {
-      running: "Running",
-      failed: "Failed in 4m 02s: the run failed (failed).",
-      timed_out: "Timed out in 4m 02s: the run reached its time limit (run_timeout).",
-      succeeded: "Succeeded in 4m 02s",
-    };
-    const linearStatuses = {
-      running: "Running",
-      failed: "`Failed` in `4m 02s`: `the run failed` (`failed`).",
-      timed_out: "`Timed out` in `4m 02s`: `the run reached its time limit` (`run_timeout`).",
-      succeeded: "Succeeded in `4m 02s`",
-    };
     const authored = new Set(
       Array.from({ length: AUTHOR_TEXT.length - 3 }, (_, index) =>
         AUTHOR_TEXT.slice(index, index + 4),
@@ -190,64 +269,7 @@ describe("progress message vocabulary", () => {
     );
     for (const provider of ["github", "linear", "slack"] as const) {
       for (const status of ["running", "failed", "timed_out", "succeeded"] as const) {
-        const maxBodyChars = provider === "slack" ? 3000 : 4000;
-        const body = renderProgress({
-          ...defaults,
-          provider,
-          maxBodyChars,
-          steps,
-          events: [
-            events[0]!,
-            ...activity,
-            event("tool_finished", 5002, working, {
-              callId: "invalid",
-              category: adversarial,
-              status: "failed",
-            }),
-            event("permission_requested", 5003, working, { request: adversarial }),
-          ],
-          run: {
-            ...run,
-            status,
-            completedAt: status === "running" ? null : finish,
-            failureReason: adversarial,
-          },
-        });
-        const expected = [];
-        const linear = provider === "linear";
-        expected.push(`Paseo run: ${(linear ? linearStatuses : statuses)[status]}`);
-        if (status === "running") {
-          expected.push(
-            linear
-              ? "Started `10:02:11 UTC`. Updated `10:02:14 UTC`."
-              : "Started 10:02:11 UTC. Updated 10:02:14 UTC.",
-            "Now: waiting for permission",
-          );
-        } else {
-          expected.push(linear ? "Finished `10:06:13 UTC`." : "Finished 10:06:13 UTC.");
-        }
-        if (linear) {
-          expected.push(
-            "Activity: `556 commands`, `556 reads`, `556 edits`, `556 web calls`, `556 subagents`, `555 plans`, `555 MCP calls`, `555 finish calls`, `555 other calls`. `5001 tool calls`, `5001` failed.",
-            status === "running"
-              ? "Step `149` of `150` running since `10:02:14 UTC`."
-              : "Steps: `148 succeeded`, `2 not run` of `150`.",
-            `Run details: \`https://hub.example.org/base/o/acme/activity/${RUN_ID}\``,
-          );
-        } else {
-          expected.push(
-            "Activity: 556 commands, 556 reads, 556 edits, 556 web calls, 556 subagents, 555 plans, 555 MCP calls, 555 finish calls, 555 other calls. 5001 tool calls, 5001 failed.",
-            status === "running"
-              ? "Step 149 of 150 running since 10:02:14 UTC."
-              : "Steps: 148 succeeded, 2 not run of 150.",
-            `Run details: https://hub.example.org/base/o/acme/activity/${RUN_ID}`,
-          );
-        }
-        assert.equal(body, expected.join("\n"));
-        for (const fragment of authored) assert.equal(body.includes(fragment), false);
-        assert.doesNotMatch(body, /@everyone|<!channel>|secret\.example/u);
-        assert.equal(Buffer.byteLength(body, "utf8"), body.length);
-        assert.ok(body.length <= maxBodyChars);
+        assertLargeBody(provider, status, { steps, activity, adversarial, authored });
       }
     }
   });

@@ -8,6 +8,7 @@ import {
   catalogAgentValidator,
   disconnectedAgentValidator,
 } from "../test-utils/agent-validator.js";
+import { TriggerDocumentError } from "./configuration/index.js";
 import { OrganizationTriggerStore } from "./store.js";
 
 describe("organization trigger store", () => {
@@ -259,6 +260,72 @@ describe("organization trigger store", () => {
       }),
       /run\.agent\.choices\.slow\.mode: Mode 'default' is not available/u,
     );
+  });
+});
+
+describe("steps documents through the save path", () => {
+  const stepsYaml = (extra = "", target = "devbox") => `name: manual-task
+on:
+  manual.run:
+    filters: { from_users: [alice] }
+target: { daemon: ${target}, cwd: /workspace }
+steps:
+  - id: plan
+    agent: { provider: codex, mode: full-access }
+    prompt: Plan it
+${extra}`;
+  const reviewStep = `  - id: review
+    agent: { provider: codex, mode: full-access }
+    prompt: Review it
+    max_runtime: 25h
+`;
+
+  async function issuesOf(promise: Promise<unknown>): Promise<{ path: string; message: string }[]> {
+    try {
+      await promise;
+    } catch (error) {
+      if (error instanceof TriggerDocumentError) {
+        return error.issues.map(({ path, message }) => ({ path: path.join("."), message }));
+      }
+      throw error;
+    }
+    return [];
+  }
+
+  it("reports a step deadline over the limit as an issue on that step", async () => {
+    const store = new OrganizationTriggerStore(
+      await enrolledDatabase(),
+      "org",
+      acceptingAgentValidator(),
+    );
+    assert.deepEqual(await issuesOf(store.save({ yaml: stepsYaml(reviewStep), userId: null })), [
+      { path: "steps.1.max_runtime", message: "step review max_runtime must not exceed 24h" },
+    ]);
+  });
+
+  it("puts an unknown daemon on the target", async () => {
+    const store = new OrganizationTriggerStore(
+      await enrolledDatabase(),
+      "org",
+      acceptingAgentValidator(),
+    );
+    const [issue] = await issuesOf(store.save({ yaml: stepsYaml("", "ghost"), userId: null }));
+    assert.equal(issue?.path, "target.daemon");
+    assert.match(issue?.message ?? "", /"ghost" does not match any daemon/u);
+  });
+
+  it("saves an added script step while the daemon is offline when the agents are unchanged", async () => {
+    const database = await enrolledDatabase();
+    const connected = new OrganizationTriggerStore(database, "org", acceptingAgentValidator());
+    const trigger = await connected.save({ yaml: stepsYaml(), userId: null });
+    const offline = new OrganizationTriggerStore(database, "org", disconnectedAgentValidator());
+
+    const edited = await offline.save({
+      triggerId: trigger.id,
+      yaml: stepsYaml("  - id: notify\n    script: ./notify.sh\n"),
+      userId: null,
+    });
+    assert.equal((await offline.activeRevision(edited)).version, 2);
   });
 });
 

@@ -106,7 +106,7 @@ test("respects opacity for schedule and reply fields", () => {
   assert.equal(
     describeTrigger(
       schedule,
-      (path) => !["recurrence", "daemon", "provider"].includes(path.at(-1) ?? ""),
+      (path) => !["recurrence", "daemon", "provider"].includes(String(path.at(-1))),
     ),
     "On the configured schedule, run the selected agent on the configured host.",
   );

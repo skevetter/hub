@@ -40,7 +40,7 @@ import { validateConnectionTemplate } from "./connection-template.js";
 const IDENTIFIER = /^[a-z][a-z0-9_-]*$/u;
 const EVENT_NAME = /^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*$/u;
 const DURATION = /^([1-9][0-9]*)(ms|s|m|h)$/u;
-const MAX_DURATION_MS = 24 * 60 * 60_000;
+export const MAX_DURATION_MS = 24 * 60 * 60_000;
 const INPUT_NAME = /^[a-z][a-z0-9_-]*$/u;
 const DYNAMIC_INPUT_REFERENCE = /^\$\{\{\s*paseo\.inputs\.([a-z][a-z0-9_-]*)\s*\}\}$/u;
 const MAX_SCRIPT_BYTES = 64 * 1024;
@@ -765,14 +765,20 @@ function compileAgentStep(
   const { maxRuntimeMs, idleTimeoutMs } = compileAgentRuntimes(trigger, step, stepPath);
   const condition = compileStepCondition(step.if, stepPath);
   const outputDeclaration =
-    step.output === undefined ? undefined : { schema: cloneJsonValue(step.output.schema) };
-  if (outputDeclaration !== undefined)
-    validateOutputSchema(outputDeclaration.schema, `step ${step.id} output.schema`);
-  assertTurnEndCompletionAllowed(step.id, {
-    enabled: step.complete_on_turn_end === true,
-    structuredOutput: outputDeclaration !== undefined,
-    requiredOutputs: (step.allow_outputs ?? []).some((output) => output.required === true),
-  });
+    step.output === undefined
+      ? undefined
+      : compileAt([...stepPath, "output", "schema"], () => {
+          const schema = cloneJsonValue(step.output?.schema);
+          validateOutputSchema(schema, `step ${step.id} output.schema`);
+          return { schema };
+        });
+  compileAt([...stepPath, "complete_on_turn_end"], () =>
+    assertTurnEndCompletionAllowed(step.id, {
+      enabled: step.complete_on_turn_end === true,
+      structuredOutput: outputDeclaration !== undefined,
+      requiredOutputs: (step.allow_outputs ?? []).some((output) => output.required === true),
+    }),
+  );
   const { env, github } = compileAgentEnvironment(trigger, step);
   const agent = compileAt([...stepPath, "agent"], () =>
     compileAgentSelection(trigger.name, step.id, step.agent, namedAgents),
@@ -816,7 +822,10 @@ function compileAgentRuntimes(
     parseDurationMs(step.idle_timeout, `trigger ${trigger.name} step ${step.id} idle_timeout`),
   );
   if (idleTimeoutMs > maxRuntimeMs) {
-    throw new Error(`step ${step.id} idle_timeout must not exceed max_runtime`);
+    throw new HubConfigurationCompilationError(
+      [...stepPath, "idle_timeout"],
+      `step ${step.id} idle_timeout must not exceed max_runtime`,
+    );
   }
   return { maxRuntimeMs, idleTimeoutMs };
 }

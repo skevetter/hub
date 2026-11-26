@@ -1,4 +1,4 @@
-import type { AcceptedTriggerRunRecord } from "../db/types.js";
+import type { AcceptedTriggerRunRecord, ProviderEventReceiptRecord } from "../db/types.js";
 import type { RunTimelineBus } from "../run-timeline/bus.js";
 import { CredentialBackoff } from "./backoff.js";
 import { MessageSchedule } from "./schedule.js";
@@ -111,8 +111,8 @@ export class ProgressReporter {
         receipt.payloadExpiryState != null
       )
         return;
-      const name = receipt.provider === "github_notification" ? "github" : receipt.provider;
-      if (name !== "github" && name !== "linear" && name !== "slack") return;
+      const name = progressProviderName(receipt);
+      if (name === undefined) return;
       if (!this.providers().has(name)) return;
       const row = await database.insertRunProgressMessageIfAbsent({
         ...scope,
@@ -139,7 +139,10 @@ export class ProgressReporter {
           this.schedule.track(row, wakeAt);
         }
         if (batch.length < BATCH_SIZE) break;
-        afterRunId = batch.at(-1)!.triggerRunId;
+        const last = batch.at(-1);
+        if (last === undefined)
+          throw new TypeError("Cannot read properties of undefined (reading 'triggerRunId')");
+        afterRunId = last.triggerRunId;
       }
     } catch {
       this.report("startup_read_failed");
@@ -182,6 +185,13 @@ export class ProgressReporter {
       this.options.reportFailure?.(code, scope);
     } catch {}
   }
+}
+
+function progressProviderName(
+  receipt: ProviderEventReceiptRecord,
+): ProgressProvider["name"] | undefined {
+  const name = receipt.provider === "github_notification" ? "github" : receipt.provider;
+  return name === "github" || name === "linear" || name === "slack" ? name : undefined;
 }
 
 function indexProviders(providers: readonly ProgressProvider[]) {
