@@ -53,7 +53,6 @@ async function invalidateScope(
   scope: { organizationSlug: string },
 ) {
   await Promise.all([
-    queryClient.invalidateQueries({ queryKey: ["attention"] }),
     queryClient.invalidateQueries({ queryKey: ["organization"] }),
     queryClient.invalidateQueries({ queryKey: ["project"] }),
     queryClient.invalidateQueries({ queryKey: ["tenant", scope.organizationSlug] }),

@@ -1,12 +1,13 @@
 import { parseDocument } from "yaml";
 import { expect, type Page } from "@playwright/test";
 import type { BuiltApplication } from "./hub.js";
+import { shellLink } from "./shell-links.js";
 
 export class OrganizationTriggers {
   constructor(private readonly page: Page) {}
 
   async open() {
-    await this.page.getByRole("link", { name: "Triggers", exact: true }).click();
+    await shellLink(this.page, "Triggers").click();
     await this.page.reload();
     await expect(this.page.getByRole("heading", { name: "Triggers", level: 1 })).toBeVisible();
   }
@@ -333,7 +334,7 @@ export class OrganizationTriggers {
       })
       .toEqual([{ status: "running", failure_reason: null }]);
     await this.page.setViewportSize({ width: 1280, height: 900 });
-    await this.page.getByRole("link", { name: "Activity", exact: true }).click();
+    await shellLink(this.page, "Activity").click();
     await this.page.reload();
     const row = this.page.getByRole("row").filter({ hasText: name });
     await expect(row.getByRole("cell", { name: "schedule", exact: true })).toBeVisible();

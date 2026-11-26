@@ -74,11 +74,14 @@ const record: ApiKeyRecord = {
   createdAt: "2026-11-14T12:00:00.000Z",
   lastUsedAt: null,
   revokedAt: null,
+  expiresAt: null,
 };
+
+const NOW = Date.parse("2026-11-26T12:00:00.000Z");
 
 const renderTable = (records: ApiKeyRecord[]) =>
   renderToStaticMarkup(
-    <ApiKeyTable records={records} canManage={false} busy={false} onRevoke={noop} />,
+    <ApiKeyTable records={records} canManage={false} busy={false} onRevoke={noop} now={NOW} />,
   );
 
 function input(markup: string, name: string): string {
@@ -236,6 +239,26 @@ describe("API key table", () => {
     assert.match(markup, /paseo_pk_example/u);
     assert.match(markup, /Never/u);
     assert.match(markup, /Actions for Legacy key/u);
+  });
+
+  it("reads a key past its expiry as Expired, not Active", () => {
+    const markup = renderTable([{ ...record, expiresAt: "2026-11-26T11:00:00.000Z" }]);
+    assert.match(markup, />Expired</u);
+    assert.doesNotMatch(markup, />Active</u);
+  });
+
+  it("keeps a key with a future or no expiry live", () => {
+    assert.match(renderTable([{ ...record }]), />Active</u);
+    const expiring = renderTable([{ ...record, expiresAt: "2026-11-26T13:00:00.000Z" }]);
+    assert.match(expiring, />Expiring</u);
+    assert.doesNotMatch(expiring, />Expired</u);
+  });
+
+  it("reads a revoked key as Revoked even when its expiry has passed", () => {
+    const markup = renderTable([
+      { ...record, revokedAt: "2026-11-15T12:00:00.000Z", expiresAt: "2026-11-26T11:00:00.000Z" },
+    ]);
+    assert.match(markup, />Revoked</u);
   });
 
   it("offers details to read-only members and for revoked keys", () => {

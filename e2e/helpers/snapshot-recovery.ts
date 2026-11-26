@@ -1,5 +1,6 @@
 import { expect, type Page } from "@playwright/test";
 import type { BuiltApplication } from "./hub.js";
+import { shellLink } from "./shell-links.js";
 
 type ReadEndpoint = "triggers" | "tenant" | "daemons" | "usage";
 
@@ -33,7 +34,7 @@ export class SnapshotRecovery {
   }
 
   async visitTriggers() {
-    await this.page.getByRole("link", { name: "Triggers", exact: true }).click();
+    await shellLink(this.page, "Triggers").click();
   }
 
   async openTriggers() {
@@ -172,7 +173,7 @@ export class SnapshotRecovery {
   async openDaemons() {
     await Promise.all([
       this.watchRead("daemons", '"daemons","canManage"'),
-      this.page.getByRole("link", { name: "Daemons", exact: true }).click(),
+      shellLink(this.page, "Daemons").click(),
     ]);
     await this.expectDaemons();
   }
@@ -191,7 +192,7 @@ export class SnapshotRecovery {
   }
 
   async openUsage() {
-    await this.page.getByRole("link", { name: "Settings", exact: true }).click();
+    await shellLink(this.page, "Settings").click();
     await Promise.all([
       this.watchRead("usage", '"organization","limits","history"'),
       this.page.getByRole("link", { name: "Usage", exact: true }).click(),
