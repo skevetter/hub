@@ -120,8 +120,8 @@ for (const backend of ["embedded", "pooled"] as const) {
       }
       for (const request of [
         new Request(`http://localhost/api/v1/runs/${run.id}/events`),
-        streamRequest(run.id, "invalid", "", { cookie: "session=member" }),
-        streamRequest(run.id, "", "", { authorization: "", cookie: "session=member" }),
+        streamRequest(run.id, "invalid", { headers: { cookie: "session=member" } }),
+        streamRequest(run.id, "", { headers: { authorization: "", cookie: "session=member" } }),
       ]) {
         const response = await service.handle(request, run.id);
         assert.equal(response.status, 401);
