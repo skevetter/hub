@@ -1979,6 +1979,10 @@ export class PaseoHub {
     await this.requireUser(alias).expectMemberBoundary(organizationName);
   }
 
+  browserPage(alias: string): Page {
+    return this.requireUser(alias).browserPage();
+  }
+
   async changeMemberRole(
     actorAlias: string,
     memberName: string,
@@ -2787,6 +2791,10 @@ class HubUser {
     private readonly page: Page,
   ) {
     this.navigation = new ProjectNavigation(page);
+  }
+
+  browserPage(): Page {
+    return this.page;
   }
 
   async signUp(account: Account): Promise<void> {
