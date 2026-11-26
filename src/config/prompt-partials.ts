@@ -104,18 +104,20 @@ export function collectPromptPartialPaths(configuration: unknown): readonly stri
   if (!isRecord(configuration) || !Array.isArray(configuration["triggers"])) return [];
   for (const trigger of configuration["triggers"]) {
     if (!isRecord(trigger) || !Array.isArray(trigger["steps"])) continue;
-    for (const step of trigger["steps"]) {
-      if (!isRecord(step) || !Array.isArray(step["prompt"])) continue;
-      for (const block of step["prompt"]) {
-        if (!isRecord(block) || !Object.hasOwn(block, "include")) continue;
-        if (typeof block["include"] !== "string") {
-          throw new PromptPartialResolutionError("include path must be a string");
-        }
-        paths.add(validatePromptPartialPath(block["include"]));
-      }
-    }
+    for (const step of trigger["steps"]) collectStepPartialPaths(step, paths);
   }
   return [...paths];
+}
+
+function collectStepPartialPaths(step: unknown, paths: Set<string>): void {
+  if (!isRecord(step) || !Array.isArray(step["prompt"])) return;
+  for (const block of step["prompt"]) {
+    if (!isRecord(block) || !Object.hasOwn(block, "include")) continue;
+    if (typeof block["include"] !== "string") {
+      throw new PromptPartialResolutionError("include path must be a string");
+    }
+    paths.add(validatePromptPartialPath(block["include"]));
+  }
 }
 
 export async function resolvePromptPartials(input: {
@@ -144,8 +146,34 @@ export async function resolvePromptPartialsFromBundle(input: {
   configuration: unknown;
   files: readonly PromptPartialBundleFile[];
 }): Promise<ResolvedPromptPartials> {
-  const normalizedFiles = new Map<string, { index: number; content: string }>();
   const issues: PromptPartialBundleIssue[] = [];
+  const normalizedFiles = normalizeBundlePartials(input, issues);
+  checkBundleReferences(input, normalizedFiles, issues);
+  if (issues.length > 0) throw new PromptPartialBundleError(issues);
+
+  try {
+    return await resolvePromptPartials({
+      configuration: input.configuration,
+      read: async (path) => {
+        const file = normalizedFiles.get(path);
+        return file === undefined ? undefined : { kind: "file", content: file.content };
+      },
+    });
+  } catch (error) {
+    if (error instanceof PromptPartialResolutionError) {
+      throw new PromptPartialBundleError([{ path: ["partials"], message: error.message }]);
+    }
+    throw error;
+  }
+}
+
+type NormalizedBundlePartials = Map<string, { index: number; content: string }>;
+
+function normalizeBundlePartials(
+  input: { files: readonly PromptPartialBundleFile[] },
+  issues: PromptPartialBundleIssue[],
+): NormalizedBundlePartials {
+  const normalizedFiles = new Map<string, { index: number; content: string }>();
   let bundleBytes = 0;
 
   if (input.files.length > MAX_PROMPT_PARTIAL_COUNT) {
@@ -198,6 +226,14 @@ export async function resolvePromptPartialsFromBundle(input: {
     });
   }
 
+  return normalizedFiles;
+}
+
+function checkBundleReferences(
+  input: { configuration: unknown },
+  normalizedFiles: NormalizedBundlePartials,
+  issues: PromptPartialBundleIssue[],
+): void {
   let requestedPaths: readonly string[] = [];
   try {
     requestedPaths = collectPromptPartialPaths(input.configuration);
@@ -226,23 +262,6 @@ export async function resolvePromptPartialsFromBundle(input: {
         message: `partial file is not referenced by the configuration: ${path}`,
       });
     }
-  }
-
-  if (issues.length > 0) throw new PromptPartialBundleError(issues);
-
-  try {
-    return await resolvePromptPartials({
-      configuration: input.configuration,
-      read: async (path) => {
-        const file = normalizedFiles.get(path);
-        return file === undefined ? undefined : { kind: "file", content: file.content };
-      },
-    });
-  } catch (error) {
-    if (error instanceof PromptPartialResolutionError) {
-      throw new PromptPartialBundleError([{ path: ["partials"], message: error.message }]);
-    }
-    throw error;
   }
 }
 
