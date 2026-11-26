@@ -4171,7 +4171,7 @@ class MemoryDatabase implements Database {
           !excludedRunIds.includes(run.id) &&
           run.outcome === "accepted" &&
           run.status !== "running" &&
-          run.payloadExpiredAt == null &&
+          run.payloadExpiryState == null &&
           run.terminalNotificationPendingAt !== null &&
           run.terminalNotificationDeliveredAt === null &&
           (run.terminalNotificationLeaseExpiresAt === null ||
@@ -4235,7 +4235,7 @@ class MemoryDatabase implements Database {
     if (
       run === undefined ||
       run.outcome !== "accepted" ||
-      run.payloadExpiredAt != null ||
+      run.payloadExpiryState != null ||
       run.terminalNotificationGeneration !== generation ||
       run.terminalNotificationLeaseExpiresAt === null ||
       run.terminalNotificationPendingAt === null ||
@@ -4253,7 +4253,7 @@ class MemoryDatabase implements Database {
 
   async setWorkflowRunReactionState(triggerRunId: string, reactionState: JsonValue | null) {
     const run = this.triggerRuns.get(triggerRunId);
-    if (run === undefined || run.outcome !== "accepted" || run.payloadExpiredAt != null)
+    if (run === undefined || run.outcome !== "accepted" || run.payloadExpiryState != null)
       return undefined;
     const updated = { ...run, reactionState };
     this.triggerRuns.set(run.id, updated);
@@ -6751,19 +6751,18 @@ class MemoryDatabase implements Database {
   }
 
   async organizationConnectionUsage(organizationId: string): Promise<OrganizationConnectionUsage> {
+    const inOrganization = <T extends { organizationId: string; id: string }>(
+      connections: Iterable<T>,
+      name: (connection: T) => string,
+    ) =>
+      Array.from(connections)
+        .filter((connection) => connection.organizationId === organizationId)
+        .sort((a, b) => name(a).localeCompare(name(b)) || a.id.localeCompare(b.id));
     return {
-      github: Array.from(this.githubConnections.values()).filter(
-        (connection) => connection.organizationId === organizationId,
-      ),
-      discord: Array.from(this.discordConnections.values()).filter(
-        (connection) => connection.organizationId === organizationId,
-      ),
-      slack: Array.from(this.slackConnections.values()).filter(
-        (connection) => connection.organizationId === organizationId,
-      ),
-      linear: Array.from(this.linearConnections.values()).filter(
-        (connection) => connection.organizationId === organizationId,
-      ),
+      github: inOrganization(this.githubConnections.values(), (c) => c.accountLogin),
+      discord: inOrganization(this.discordConnections.values(), (c) => c.guildName),
+      slack: inOrganization(this.slackConnections.values(), (c) => c.teamName),
+      linear: inOrganization(this.linearConnections.values(), (c) => c.linearOrganizationName),
     };
   }
 

@@ -5,6 +5,7 @@ import {
   TERMINAL_TEST_ORG,
 } from "../db/test-utils/terminal-notification.js";
 import type { TriggerRunRecord } from "../db/types.js";
+import type { JsonValue } from "../config/compiler.js";
 import { RunTimelineBus } from "../run-timeline/bus.js";
 import { RunTimeline } from "../run-timeline/index.js";
 import { RunTimelineReconciler } from "../run-timeline/reconcile.js";
@@ -24,6 +25,7 @@ async function fixture(hungRuns: number, options: { reconcile?: boolean } = {}) 
   }
   const hung = new Set(runIds.slice(0, hungRuns));
   const calls: string[] = [];
+  const gates: PromiseWithResolvers<JsonValue>[] = [];
   const logger = {
     error: vi.fn<(record: unknown, message?: unknown) => void>(),
     warn: vi.fn<(record: unknown, message?: unknown) => void>(),
@@ -37,11 +39,14 @@ async function fixture(hungRuns: number, options: { reconcile?: boolean } = {}) 
     terminalNotificationStopGraceMs: GRACE_MS,
     onWorkflowRunTerminal: (run: TriggerRunRecord) => {
       calls.push(run.id);
-      return hung.has(run.id) ? new Promise<never>(() => undefined) : Promise.resolve();
+      if (!hung.has(run.id)) return Promise.resolve();
+      const gate = Promise.withResolvers<JsonValue>();
+      gates.push(gate);
+      return gate.promise;
     },
     ...(options.reconcile ? { timelineReconciler: hangingReconciler(database) } : {}),
   });
-  return { engine, database, runIds, calls, logger };
+  return { engine, database, runIds, calls, gates, logger };
 }
 
 function hangingReconciler(database: ReturnType<typeof createMemoryDatabase>) {
@@ -171,6 +176,49 @@ describe("hung terminal notification handler", () => {
     await vi.advanceTimersByTimeAsync(HOLD_MS);
     expect(work.calls).toEqual([]);
     expect(reports(work, "workflow.notification.terminal.timeout")).toHaveLength(1);
+    await stopEngine(work);
+  });
+  it("fences a hook that finishes after a re-claim so the run is delivered once", async () => {
+    const work = await fixture(1);
+    const pass = work.engine.processAvailable();
+    await vi.advanceTimersByTimeAsync(HOLD_MS);
+    await pass;
+    await work.engine.processAvailable();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(work.gates).toHaveLength(2);
+    const read = () => work.database.findTriggerRunById(work.runIds[0] ?? "");
+    const before = await read();
+    work.gates[0]?.resolve({ by: "first claim" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await read()).toEqual(before);
+    expect(before).toMatchObject({ terminalNotificationDeliveredAt: null });
+    work.gates[1]?.resolve({ by: "second claim" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await read()).toMatchObject({
+      reactionState: { by: "second claim" },
+      terminalNotificationDeliveredAt: new Date(),
+    });
+    expect(work.calls).toEqual([work.runIds[0], work.runIds[1], work.runIds[0]]);
+    await stopEngine(work);
+  });
+
+  it("warns once three abandoned handlers are pending", async () => {
+    const work = await fixture(3);
+    const backlog = () =>
+      work.logger.warn.mock.calls.filter(
+        ([record]) =>
+          typeof record === "object" &&
+          record !== null &&
+          "operation" in record &&
+          record.operation === "workflow.notification.terminal.abandoned_backlog",
+      );
+    void work.engine.processAvailable();
+    await vi.advanceTimersByTimeAsync(2 * HOLD_MS);
+    expect(backlog()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(HOLD_MS);
+    expect(backlog()).toEqual([
+      [expect.objectContaining({ abandonedPending: 3 }), expect.any(String)],
+    ]);
     await stopEngine(work);
   });
 });

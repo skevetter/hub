@@ -8,6 +8,7 @@ interface TerminalLeaseOptions {
 
 export const DEFAULT_TERMINAL_NOTIFICATION_HOLD_MS = 5 * 60_000;
 export const DEFAULT_TERMINAL_NOTIFICATION_STOP_GRACE_MS = 10_000;
+export const ABANDONED_TERMINAL_WARN_AT = 3;
 
 /** Resolves true when the work settles in time and false at the deadline; the work is not cancelled. */
 export async function settlesWithin(work: Promise<void>, ms: number): Promise<boolean> {
