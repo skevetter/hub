@@ -67,12 +67,33 @@ describe("locally admitted Linear turn", () => {
       { ...grant, authority: { ...authority, ownerUserId: "other" } },
       { ...grant, profileVersion: 8 },
     ]) {
-      expect(await authorizeBoundPilotTurn(find, rejected, session, "command", 2)).toBe(false);
+      expect(
+        await authorizeBoundPilotTurn({
+          findBinding: find,
+          grant: rejected,
+          session,
+          commandId: "command",
+          expectedBindingGeneration: 2,
+        }),
+      ).toBe(false);
     }
     expect(
-      await authorizeBoundPilotTurn(find, grant, { ...session, origin: "web" }, "command"),
+      await authorizeBoundPilotTurn({
+        findBinding: find,
+        grant,
+        session: { ...session, origin: "web" },
+        commandId: "command",
+      }),
     ).toBe(false);
-    expect(await authorizeBoundPilotTurn(find, grant, session, "command", 3)).toBe(false);
+    expect(
+      await authorizeBoundPilotTurn({
+        findBinding: find,
+        grant,
+        session,
+        commandId: "command",
+        expectedBindingGeneration: 3,
+      }),
+    ).toBe(false);
   });
 
   it("checks current binding, generation and session and preserves lookup errors", async () => {
@@ -88,14 +109,16 @@ describe("locally admitted Linear turn", () => {
         expect(args).toEqual([authority, origin]);
         return row;
       };
-      expect(await authorizeBoundPilotTurn(find, grant, session, "command")).toBe(expected);
+      expect(
+        await authorizeBoundPilotTurn({ findBinding: find, grant, session, commandId: "command" }),
+      ).toBe(expected);
     }
     const find = async () => {
       throw new TypeError("lookup failed");
     };
-    await expect(authorizeBoundPilotTurn(find, grant, session, "command")).rejects.toThrow(
-      "lookup failed",
-    );
+    await expect(
+      authorizeBoundPilotTurn({ findBinding: find, grant, session, commandId: "command" }),
+    ).rejects.toThrow("lookup failed");
   });
 
   it("reads the local command first and uses its query handle for the binding", async () => {
