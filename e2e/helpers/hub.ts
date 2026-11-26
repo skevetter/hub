@@ -3143,8 +3143,13 @@ class HubUser {
       .getByRole("table", { name: "API keys" })
       .getByRole("row")
       .filter({ hasText: "Production deployer" });
-    await expect(row).toContainText("Install configuration, Start runs");
     await expect(row).toContainText("Active");
+    await row.getByRole("button", { name: "Actions for Production deployer" }).click();
+    await this.page.getByRole("menuitem", { name: "View details" }).click();
+    const details = this.page.getByRole("dialog", { name: "Production deployer" });
+    await expect(details).toContainText("Install configuration, Start runs");
+    await details.getByRole("button", { name: "Close" }).click();
+    await expect(details).toBeHidden();
     await row.getByRole("button", { name: "Actions for Production deployer" }).click();
     await this.page.getByRole("menuitem", { name: "Revoke" }).click();
     const confirmation = this.page.getByRole("alertdialog");
@@ -3153,9 +3158,10 @@ class HubUser {
     ).toBeVisible();
     await confirmation.getByRole("button", { name: "Revoke key" }).click();
     await expect(row).toContainText("Revoked");
-    await expect(row.getByRole("button", { name: "Actions for Production deployer" })).toHaveCount(
-      0,
-    );
+    await row.getByRole("button", { name: "Actions for Production deployer" }).click();
+    await expect(this.page.getByRole("menuitem", { name: "View details" })).toBeVisible();
+    await expect(this.page.getByRole("menuitem", { name: "Revoke" })).toHaveCount(0);
+    await this.page.keyboard.press("Escape");
     await expect(
       this.page.evaluate(async (key) => {
         const response = await fetch(`${window.location.origin}/api/v1/daemons/enrollment-tokens`, {
