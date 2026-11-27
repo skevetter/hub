@@ -560,6 +560,33 @@ describe("durable Hub action acknowledgement state", () => {
     },
   );
 
+  it("stops observing once recovery archives an execution whose acknowledgements are all durable", async () => {
+    const fixture = await acknowledgementFixture();
+    const observedAt = ACKNOWLEDGED_AT;
+    await fixture.database.recordAgentExecutionHubAcknowledgement(EXECUTION_ID, {
+      kind: "finish_execution",
+      callId: "finish-call",
+      status: "completed",
+      observedAt,
+    });
+    await fixture.database.recordAgentExecutionHubAcknowledgement(EXECUTION_ID, {
+      kind: "terminal",
+      observedAt,
+    });
+    await fixture.database.recordAgentExecutionHubAcknowledgement(EXECUTION_ID, {
+      kind: "idle",
+      observedAt,
+    });
+
+    await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);
+
+    const execution = await fixture.database.findAgentExecutionById(EXECUTION_ID);
+    assert.deepEqual(fixture.connection.actions, ["archive"]);
+    assert.notEqual(execution?.hubActionCompletedAt, null);
+    assert.equal(fixture.lifecycle.activeExecutionObservationCount(), 0);
+    await fixture.lifecycle.stop();
+  });
+
   it("resumes durable partial signals across restart and archives exactly once", async () => {
     const fixture = await acknowledgementFixture();
     await fixture.lifecycle.recoverPendingHubActions(DAEMON_ID);

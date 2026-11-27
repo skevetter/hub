@@ -1394,9 +1394,17 @@ export class DaemonDispatchLifecycle {
         this.dispatchTimeoutMs,
         (callback, delayMs) => this.scheduleDeadline(async () => callback(), delayMs),
       );
-      if (settled !== undefined)
-        await this.options.database.completeHubAction(execution.id, action);
+      if (settled !== undefined) await this.completeHubAction(execution.id, action);
     }
+  }
+
+  private async completeHubAction(
+    executionId: string,
+    action: NonNullable<AgentExecutionRecord["hubAction"]>,
+  ): Promise<void> {
+    await this.options.database.completeHubAction(executionId, action);
+    // Either the idle event or recovery can mark the archive ready, and only the first released.
+    if (action === "archive") this.releaseExecutionResources(executionId);
   }
 
   private async sendStopInterrupt(
