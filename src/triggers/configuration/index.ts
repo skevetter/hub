@@ -4,6 +4,7 @@ import type { TriggerDocument } from "./schema.js";
 export {
   parseTriggerDocument,
   TriggerDocumentError,
+  type TriggerDocumentErrorOptions,
   type TriggerDocumentIssue,
 } from "./document.js";
 export { TriggerDocumentSchema, type TriggerDocument } from "./schema.js";
