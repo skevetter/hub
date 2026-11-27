@@ -78,8 +78,9 @@ timed out`, `Connection terminated due to connection timeout`, `timeout exceeded
 connect` or `the database system is starting up`. This covers a suite that cannot start as well as
 a failing test, including a query deadline hit inside a test. Vitest's JSON report leaves out hook
 failures and keeps only the bare message of a suite that fails to start, so the runner also reads
-the first error line of each failure block in `vitest.log`. The whole message must be that
-timeout: extra message lines block the retry. A bare message counts only when the log names the
+the error message of each failure block in `vitest.log`. The whole message must be that
+timeout: extra message lines block the retry. The log cannot tell a message line that imitates a
+stack frame from a real frame, so a message whose only extra text is such a line still retries. A bare message counts only when the log names the
 same timeout. The `Caused by: Error: Connection terminated unexpectedly` line that follows
 a connection timeout belongs to it; any other cause blocks the retry. Each such file runs alone in its own
 Vitest process. Each retry prints a `::warning::` line (or `::error::` if it fails again) and shows

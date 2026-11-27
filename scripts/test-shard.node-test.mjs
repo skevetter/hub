@@ -487,6 +487,35 @@ test("reporter message lines that start with the frame glyph are kept", () => {
   assert.deepEqual(retryableFiles(report, ["hook.test.ts"], { root, headers }), []);
 });
 
+test("message text after a line that imitates a frame still blocks the retry", () => {
+  const message = "timeout exceeded when trying to connect";
+  const log = [
+    " FAIL  hook.test.ts > hook",
+    `Error: ${message}`,
+    " \u276F config/startup.yaml:12:7",
+    "  Configuration error: wrong endpoint",
+    " \u276F hook.test.ts:4:11",
+    '      2| describe("hook", () => {',
+    "       |           ^",
+    "",
+  ].join("\n");
+  const headers = logFailureHeaders(log);
+  assert.deepEqual(headers.get("hook.test.ts"), [
+    `Error: ${message}\n  Configuration error: wrong endpoint`,
+  ]);
+  const report = reportOf(
+    suiteFailure("hook.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  assert.deepEqual(retryableFiles(report, ["hook.test.ts"], { root, headers }), []);
+  const clean = log
+    .replace("  Configuration error: wrong endpoint\n", "")
+    .replace(" \u276F config/startup.yaml:12:7\n", "");
+  assert.deepEqual(
+    retryableFiles(report, ["hook.test.ts"], { root, headers: logFailureHeaders(clean) }),
+    ["hook.test.ts"],
+  );
+});
+
 test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
   const timeout = "Error: Connection terminated due to connection timeout";
   const log = (cause) =>

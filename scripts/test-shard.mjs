@@ -162,6 +162,7 @@ const HINT_LINE =
   /^If this is a long-running (?:test|hook), pass a timeout value as the last argument or configure it globally with "(?:testTimeout|hookTimeout)"\.$/u;
 const FRAME_LINE = /^\s+at\s.+(?::\d+:\d+|\(<anonymous>\))\)?\s*$/u;
 const REPORTER_FRAME = /^ \u276F /u;
+const EXCERPT_LINE = /^\s+\d*\|/u;
 
 /** A JSON failure message cut at its first V8 stack frame. Reporter text never goes through this. */
 function withoutStack(text) {
@@ -195,44 +196,47 @@ function extendHeader(headers, files, line) {
   }
 }
 
-function continuesMessage(line) {
-  return /^\s+\S/u.test(line) && !REPORTER_FRAME.test(line);
+function indentedKind(line, mode) {
+  if (REPORTER_FRAME.test(line)) return "frame";
+  if (mode === "message") return "continuation";
+  if (mode === "frames" && !EXCERPT_LINE.test(line)) return "continuation";
+  return "ignored";
 }
 
-function lineKind(line, { files, inMessage }) {
+function lineKind(line, { files, mode }) {
   if (FAIL_LINE.test(line)) return "fail";
   if (SEPARATOR_LINE.test(line)) return "separator";
-  if (files.length === 0 || line === "") return "ignored";
-  if (inMessage && continuesMessage(line)) return "continuation";
-  if (!/^\s/u.test(line) && !HINT_LINE.test(line)) return "header";
-  return "other";
+  if (files.length === 0 || line === "" || HINT_LINE.test(line)) return "ignored";
+  return /^\s/u.test(line) ? indentedKind(line, mode) : "header";
 }
 
 /**
  * Error lines the default reporter printed for each failing test file, keyed by file.
  * A failure block starts with one or more FAIL lines. Every unindented line after them, up
- * to the next rule line, is an error header for all of those files. Indented lines that follow
- * a header before the reporter's first frame marker are more of the same message.
+ * to the next rule line, is an error header for all of those files. Indented lines after a
+ * header are more of that message. Once a frame line appeared, an indented line that is not
+ * another frame or a code excerpt line is treated as message text too, so text that imitates a
+ * frame cannot hide what follows it.
  */
 export function logFailureHeaders(logText) {
   const headers = new Map();
-  const state = { files: [], inErrors: false, inMessage: false };
+  const state = { files: [], inErrors: false, mode: "none" };
   for (const raw of logText.replace(ANSI_PATTERN, "").split("\n")) {
     const line = raw.trimEnd();
     const kind = lineKind(line, state);
     if (kind === "fail") {
       if (state.inErrors) state.files = [];
       state.files.push(FAIL_LINE.exec(line)[1]);
-      Object.assign(state, { inErrors: false, inMessage: false });
+      Object.assign(state, { inErrors: false, mode: "none" });
     } else if (kind === "separator") {
-      Object.assign(state, { files: [], inErrors: false, inMessage: false });
+      Object.assign(state, { files: [], inErrors: false, mode: "none" });
     } else if (kind === "continuation") {
       extendHeader(headers, state.files, line);
     } else if (kind === "header") {
       addHeader(headers, state.files, line);
-      Object.assign(state, { inErrors: true, inMessage: true });
-    } else if (kind === "other") {
-      state.inMessage = false;
+      Object.assign(state, { inErrors: true, mode: "message" });
+    } else if (kind === "frame") {
+      state.mode = "frames";
     }
   }
   return headers;
