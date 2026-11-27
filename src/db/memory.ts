@@ -10,6 +10,7 @@ import {
   runStatusesFor,
 } from "../triggers/run-status.js";
 import { MemorySurfaceStore } from "../surfaces/memory-store.js";
+import { TriggerNameConflictError } from "./errors.js";
 import {
   linearRoutesForConnection,
   linearTriggerRoutesLock,
@@ -6384,7 +6385,7 @@ class MemoryDatabase implements Database {
           trigger.id !== input.triggerId,
       )
     ) {
-      throw new Error("trigger name already exists");
+      throw new TriggerNameConflictError();
     }
     return existing;
   }

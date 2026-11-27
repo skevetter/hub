@@ -77,7 +77,7 @@ import {
   entitlementOverridesSchema,
   mergeOverrides,
 } from "../entitlements/catalog.js";
-import { toDatabaseError } from "./errors.js";
+import { isUniqueViolation, toDatabaseError, TriggerNameConflictError } from "./errors.js";
 import { withApiKeySerialization } from "./api-key-serialization.js";
 import { ConnectionRepository } from "./connections.js";
 import { ProviderEventAcceptanceRepository } from "./trigger-acceptance.js";
@@ -3609,22 +3609,29 @@ class PgDatabase implements Database {
   async saveOrganizationTrigger(
     input: SaveOrganizationTriggerInput,
   ): Promise<OrganizationTriggerRecord> {
-    return this.pool.transaction(async (client) => {
-      // Validation resolves routes before this transaction, while connections can change concurrently.
-      await this.locks.withTxLock(client, linearTriggerRoutesLock(input.organizationId));
-      const configuration = parseCompiledHubConfig(input.normalizedConfiguration);
-      const routes = await resolveSavedTriggerRoutes(client, input, configuration);
-      const trigger = await upsertSavedTrigger(client, input);
-      const revision = await insertSavedRevision(client, input, trigger.id);
-      const rows = { input, trigger, revision, routes };
-      await replaceSavedOrganizationRoutes(client, rows);
-      const runtimeRevision = await insertSavedRuntimeRevision(client, input, trigger);
-      await replaceSavedRuntimeRoutes(client, rows, {
-        configuration,
-        runtimeRevisionId: runtimeRevision.id,
+    try {
+      return await this.pool.transaction(async (client) => {
+        // Validation resolves routes before this transaction, while connections can change concurrently.
+        await this.locks.withTxLock(client, linearTriggerRoutesLock(input.organizationId));
+        const configuration = parseCompiledHubConfig(input.normalizedConfiguration);
+        const routes = await resolveSavedTriggerRoutes(client, input, configuration);
+        const trigger = await upsertSavedTrigger(client, input);
+        const revision = await insertSavedRevision(client, input, trigger.id);
+        const rows = { input, trigger, revision, routes };
+        await replaceSavedOrganizationRoutes(client, rows);
+        const runtimeRevision = await insertSavedRuntimeRevision(client, input, trigger);
+        await replaceSavedRuntimeRoutes(client, rows, {
+          configuration,
+          runtimeRevisionId: runtimeRevision.id,
+        });
+        return activateSavedTrigger(client, rows, runtimeRevision.id);
       });
-      return activateSavedTrigger(client, rows, runtimeRevision.id);
-    });
+    } catch (error) {
+      if (isUniqueViolation(error, "organization_triggers_organization_name_unique")) {
+        throw new TriggerNameConflictError();
+      }
+      throw error;
+    }
   }
 
   async findProjectForOrganization(organizationId: string, projectId: string) {
@@ -4848,12 +4855,7 @@ function requireReturnedRow<T extends QueryRow>(row: T | undefined, description:
 }
 
 function isDaemonSlugConflict(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const postgresError = error as { code?: unknown; constraint?: unknown };
-  return (
-    postgresError.code === "23505" &&
-    postgresError.constraint === "daemons_organization_slug_unique"
-  );
+  return isUniqueViolation(error, "daemons_organization_slug_unique");
 }
 
 function agentExecutionInsertParameters(input: InsertAgentExecutionInput): unknown[] {
