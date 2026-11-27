@@ -1659,7 +1659,7 @@ export class DaemonDispatchLifecycle {
         connection: connection.agents,
         beforePromptSend: () => {
           this.watchForTurnEnd(input.executionId, input.intent);
-          if (input.intent.replyMessage === true) {
+          if (input.intent.replyMessage === true || input.intent.replyCaptureCandidate === true) {
             this.replyCapture?.begin(input.executionId, {
               organizationId: input.intent.organizationId,
               runId: input.intent.triggerRunId,

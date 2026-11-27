@@ -146,6 +146,35 @@ describe("execution capability MCP boundary", () => {
     }
   });
 
+  it("gives a step that only watches the run reply no reply tool to post with", async () => {
+    const fixture = await capabilityFixture({
+      intentOverrides: { allowOutputs: [], replyCaptureCandidate: true },
+    });
+    const call = async (method: string, params?: unknown) => {
+      const response = await fixture.server.handle(
+        new Request(`https://hub.test/agent-executions/${fixture.executionId}/mcp`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            authorization: "Bearer token",
+          },
+          body: mcpRequest(method, params),
+        }),
+        fixture.executionId,
+      );
+      return RpcResponseSchema.parse(await response.json());
+    };
+    const listed = ToolsListSchema.parse((await call("tools/list")).result);
+    assert.deepEqual(
+      listed.tools.map((tool) => tool.name),
+      ["finish_execution"],
+    );
+    const posted = await call("tools/call", { name: "reply", arguments: { content: "hello" } });
+    assert.equal(ToolResultSchema.parse(posted.result).isError, true);
+    assert.deepEqual(fixture.outbound, []);
+  });
+
   it("interoperates with the official MCP client for discovery and completion", async () => {
     const fixture = await capabilityFixture();
     const endpoint = await serveFixture(fixture);
@@ -770,7 +799,9 @@ async function capabilityFixture({
   outputTool = replyOutputTool,
   additionalCapabilities = [],
   finishCalls,
+  intentOverrides,
 }: {
+  intentOverrides?: Partial<LaunchMachineIntent>;
   execute?: () => Promise<void>;
   completionStatus?: "succeeded" | "failed";
   maxReplies?: number | null;
@@ -784,7 +815,10 @@ async function capabilityFixture({
   const database = createMemoryDatabase();
   const executionId = randomUUID();
   const token = "token";
-  const intent = launchIntent(maxReplies, outputSchema, autoArchive, requiredOutputTypes);
+  const intent = {
+    ...launchIntent(maxReplies, outputSchema, autoArchive, requiredOutputTypes),
+    ...intentOverrides,
+  };
   await database.insertAgentExecution({
     id: executionId,
     organizationId: "org-1",

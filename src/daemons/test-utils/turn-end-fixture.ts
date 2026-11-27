@@ -68,6 +68,10 @@ export interface TurnEndFixtureOptions {
     executionId: string,
     answer: FinalReplyAnswer | null,
   ) => void;
+  /** Watch the reply as an earlier candidate step: the intent has no replyMessage flag. */
+  replyCaptureCandidate?: boolean;
+  /** Further step runs of the same workflow run, left pending after the first step. */
+  laterStepIds?: readonly string[];
   autoArchive?: boolean;
   outputSchema?: JsonValue;
   requiredOutput?: boolean;
@@ -266,7 +270,7 @@ function createFixtureDispatch(
         outputContext: options.outputContext ?? {},
         ...(options.onRunReplyAnswer === undefined ? {} : { replyMessage: true }),
         deadlineAt: new Date(clock.now() + 2 * 60 * 60_000),
-        stepIds: ["step"],
+        stepIds: ["step", ...(options.laterStepIds ?? [])],
       })
     ).run;
     const step =
@@ -278,6 +282,13 @@ function createFixtureDispatch(
     executionIds.push(execution.id);
     return { execution, step };
   };
+}
+
+function replyFlags(
+  options: TurnEndFixtureOptions,
+): Pick<LaunchMachineIntent, "replyMessage" | "replyCaptureCandidate"> {
+  if (options.replyCaptureCandidate === true) return { replyCaptureCandidate: true };
+  return options.onRunReplyAnswer === undefined ? {} : { replyMessage: true };
 }
 
 function launchIntent(
@@ -310,7 +321,7 @@ function launchIntent(
     autoArchive: options.autoArchive === true,
     background: false,
     ...(options.completeOnTurnEnd === true ? { completeOnTurnEnd: true } : {}),
-    ...(options.onRunReplyAnswer === undefined ? {} : { replyMessage: true }),
+    ...replyFlags(options),
     ...(options.outputSchema === undefined ? {} : { outputSchema: options.outputSchema }),
     ...(options.continuationKey === undefined
       ? {}
