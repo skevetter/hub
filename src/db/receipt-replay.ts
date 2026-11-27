@@ -37,13 +37,22 @@ export function requireManualReceiptReplayBinding(
     receipt.provider !== "manual" ||
     receipt.source !== target.source ||
     binding === null ||
-    binding.projectId !== target.projectId ||
-    binding.triggerName !== (target.publicTriggerName ?? target.boundWebhookTrigger?.name) ||
-    binding.triggerId !== (target.boundWebhookTrigger?.id ?? null)
+    !matchesReplayTarget(binding, target)
   ) {
     throw new ManualRunRejected("configuration_not_found");
   }
   return binding;
+}
+
+function matchesReplayTarget(
+  binding: ManualReceiptReplayBinding,
+  target: ManualReceiptReplayTarget,
+): boolean {
+  return (
+    binding.projectId === target.projectId &&
+    binding.triggerName === (target.publicTriggerName ?? target.boundWebhookTrigger?.name) &&
+    binding.triggerId === (target.boundWebhookTrigger?.id ?? null)
+  );
 }
 
 export function markedProviderReplay(

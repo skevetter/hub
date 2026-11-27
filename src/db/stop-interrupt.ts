@@ -63,66 +63,9 @@ function withState(update: string) {
 
 export function postgresStopInterrupts(database: QueryHandle): StopInterruptStore {
   return {
-    async claim(id, token, generation) {
-      const result = await database.query<{ state: unknown; expired: boolean }>(
-        `update agent_executions
-         set hub_action_acknowledgements = jsonb_set(jsonb_set(jsonb_set(
-           ${acknowledgements}, '{stop_interrupt_claim}', ${claimValue}),
-           '{stop_interrupt_generation}', to_jsonb($2::text)),
-           '{stop_interrupt_checked_at}', to_jsonb(clock_timestamp()))
-         where id = $1 and ${pending}
-           and (${acknowledgements}->>'stop_interrupt_generation') is not distinct from $3::text
-           and (${claim} is null or not (${live}))
-         returning ${state} as state, coalesce(${expired}, false) as expired`,
-        [id, token, generation],
-      );
-      const row = result.rows[0];
-      if (row === undefined) return undefined;
-      return {
-        state: row.state == null ? null : stopInterruptStateSchema.parse(row.state),
-        expired: row.expired,
-      };
-    },
-    async coverage(id, agentId) {
-      const result = await database.query<{ outcome: StopInterruptCoverage }>(
-        `with current_stop as (
-           select daemon_id, (hub_action_acknowledgements->'stop_interrupt'->>'requestedAt')::timestamptz as accepted_at
-           from agent_executions where id = $1
-         ), candidates as (
-           select
-             prior.hub_action_acknowledgements->'stop_interrupt_write' as written,
-             prior.hub_action_acknowledgements->'stop_interrupt' as attempt,
-             prior.daemon_agent_id, current_stop.accepted_at
-           from current_stop join agent_executions prior on prior.daemon_id = current_stop.daemon_id
-           where prior.id <> $1
-         ), coverage as (
-           select coalesce(written->>'agentId' = $2
-               and (written->>'startedAt')::timestamptz >= accepted_at, false) as wrote,
-             coalesce(coalesce(attempt->>'startedAgentId', daemon_agent_id) = $2
-               and (attempt->>'startedAt')::timestamptz >= accepted_at, false) as started,
-             attempt ? 'acknowledgedPeerIds' as acknowledged
-           from candidates
-         )
-         select case when wrote or (started and acknowledged) then 'coalesced'
-                     else 'delivery_unconfirmed' end as outcome
-         from coverage where wrote or started
-         order by (wrote or (started and coalesce(acknowledged, false))) desc limit 1`,
-        [id, agentId],
-      );
-      return result.rows[0]?.outcome;
-    },
-    async start(id, token, agentId) {
-      const result = await database.query(
-        `update agent_executions
-         set hub_action_acknowledgements = jsonb_set(
-           ${withState("|| jsonb_build_object('startedAt', clock_timestamp()) || jsonb_strip_nulls(jsonb_build_object('startedAgentId', $3::text))")},
-           '{stop_interrupt_claim}', ${claimValue})
-         where id = $1 and ${pending} and ${owns} and ${live} and not (${expired})
-           and ${state}->>'startedAt' is null and ${state}->'target' is null`,
-        [id, token, agentId ?? null],
-      );
-      return result.rowCount === 1;
-    },
+    claim: (id, token, generation) => claimStopInterrupt(database, id, token, generation),
+    coverage: (id, agentId) => stopInterruptCoverage(database, id, agentId),
+    start: (id, token, agentId) => startStopInterrupt(database, id, token, agentId),
     async recordWrite(id, token) {
       await database.query(
         `update agent_executions
@@ -131,13 +74,7 @@ export function postgresStopInterrupts(database: QueryHandle): StopInterruptStor
         [id, token],
       );
     },
-    async resetUnsent(id, token) {
-      await database.query(
-        `update agent_executions set hub_action_acknowledgements = ${withState("- 'startedAt' - 'startedAgentId'")}
-         where id = $1 and ${pending} and ${owns}`,
-        [id, token],
-      );
-    },
+    resetUnsent: (id, token) => resetUnsentStopInterrupt(database, id, token),
     async acknowledge(id, token, peers) {
       const result = await database.query(
         `update agent_executions set hub_action_acknowledgements =
@@ -179,4 +116,85 @@ export function postgresStopInterrupts(database: QueryHandle): StopInterruptStor
       );
     },
   };
+}
+
+async function claimStopInterrupt(
+  database: QueryHandle,
+  id: string,
+  token: string,
+  generation: string | null,
+) {
+  const result = await database.query<{ state: unknown; expired: boolean }>(
+    `update agent_executions
+         set hub_action_acknowledgements = jsonb_set(jsonb_set(jsonb_set(
+           ${acknowledgements}, '{stop_interrupt_claim}', ${claimValue}),
+           '{stop_interrupt_generation}', to_jsonb($2::text)),
+           '{stop_interrupt_checked_at}', to_jsonb(clock_timestamp()))
+         where id = $1 and ${pending}
+           and (${acknowledgements}->>'stop_interrupt_generation') is not distinct from $3::text
+           and (${claim} is null or not (${live}))
+         returning ${state} as state, coalesce(${expired}, false) as expired`,
+    [id, token, generation],
+  );
+  const row = result.rows[0];
+  if (row === undefined) return undefined;
+  return {
+    state: row.state == null ? null : stopInterruptStateSchema.parse(row.state),
+    expired: row.expired,
+  };
+}
+
+async function stopInterruptCoverage(database: QueryHandle, id: string, agentId: string) {
+  const result = await database.query<{ outcome: StopInterruptCoverage }>(
+    `with current_stop as (
+           select daemon_id, (hub_action_acknowledgements->'stop_interrupt'->>'requestedAt')::timestamptz as accepted_at
+           from agent_executions where id = $1
+         ), candidates as (
+           select
+             prior.hub_action_acknowledgements->'stop_interrupt_write' as written,
+             prior.hub_action_acknowledgements->'stop_interrupt' as attempt,
+             prior.daemon_agent_id, current_stop.accepted_at
+           from current_stop join agent_executions prior on prior.daemon_id = current_stop.daemon_id
+           where prior.id <> $1
+         ), coverage as (
+           select coalesce(written->>'agentId' = $2
+               and (written->>'startedAt')::timestamptz >= accepted_at, false) as wrote,
+             coalesce(coalesce(attempt->>'startedAgentId', daemon_agent_id) = $2
+               and (attempt->>'startedAt')::timestamptz >= accepted_at, false) as started,
+             attempt ? 'acknowledgedPeerIds' as acknowledged
+           from candidates
+         )
+         select case when wrote or (started and acknowledged) then 'coalesced'
+                     else 'delivery_unconfirmed' end as outcome
+         from coverage where wrote or started
+         order by (wrote or (started and coalesce(acknowledged, false))) desc limit 1`,
+    [id, agentId],
+  );
+  return result.rows[0]?.outcome;
+}
+
+async function startStopInterrupt(
+  database: QueryHandle,
+  id: string,
+  token: string,
+  agentId: string | undefined,
+) {
+  const result = await database.query(
+    `update agent_executions
+         set hub_action_acknowledgements = jsonb_set(
+           ${withState("|| jsonb_build_object('startedAt', clock_timestamp()) || jsonb_strip_nulls(jsonb_build_object('startedAgentId', $3::text))")},
+           '{stop_interrupt_claim}', ${claimValue})
+         where id = $1 and ${pending} and ${owns} and ${live} and not (${expired})
+           and ${state}->>'startedAt' is null and ${state}->'target' is null`,
+    [id, token, agentId ?? null],
+  );
+  return result.rowCount === 1;
+}
+
+async function resetUnsentStopInterrupt(database: QueryHandle, id: string, token: string) {
+  await database.query(
+    `update agent_executions set hub_action_acknowledgements = ${withState("- 'startedAt' - 'startedAgentId'")}
+         where id = $1 and ${pending} and ${owns}`,
+    [id, token],
+  );
 }
