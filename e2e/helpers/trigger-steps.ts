@@ -187,6 +187,9 @@ export class TriggerSteps {
       expect((button?.x ?? 0) + (button?.width ?? 0), name).toBeLessThanOrEqual(
         (row?.x ?? 0) + (row?.width ?? 0),
       );
+      expect((button?.x ?? 0) + (button?.width ?? 0), name).toBeLessThanOrEqual(
+        this.page.viewportSize()?.width ?? 0,
+      );
     }
     if (pageFits) await this.expectNoHorizontalScroll();
   }
