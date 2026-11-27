@@ -28,18 +28,25 @@ function discordProvider(
     const authorization = new Headers(init?.headers).get("authorization") ?? "";
     const body = typeof init?.body === "string" ? init.body : "";
     calls.push({ url, authorization, body });
-    if (url.endsWith("/users/@me")) {
-      return Promise.resolve(overrides.identity?.() ?? Response.json(DISCORD_IDENTITY));
-    }
-    if (url.endsWith("/oauth2/token")) {
-      return Promise.resolve(
-        overrides.token?.(authorization, body) ??
-          Response.json({ access_token: "minted", token_type: "Bearer", expires_in: 604800 }),
-      );
-    }
-    return Promise.resolve(new Response(null, { status: 200 }));
+    return discordResponse({ url, authorization, body }, overrides);
   };
   return { calls, fetch: fetchLike };
+}
+
+function discordResponse(
+  { url, authorization, body }: { url: string; authorization: string; body: string },
+  overrides: NonNullable<Parameters<typeof discordProvider>[0]>,
+): Promise<Response> {
+  if (url.endsWith("/users/@me")) {
+    return Promise.resolve(overrides.identity?.() ?? Response.json(DISCORD_IDENTITY));
+  }
+  if (url.endsWith("/oauth2/token")) {
+    return Promise.resolve(
+      overrides.token?.(authorization, body) ??
+        Response.json({ access_token: "minted", token_type: "Bearer", expires_in: 604800 }),
+    );
+  }
+  return Promise.resolve(new Response(null, { status: 200 }));
 }
 
 describe("provider application verification", () => {

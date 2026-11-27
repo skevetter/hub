@@ -32,8 +32,7 @@ async function githubEnvironment(
     appSlug === undefined ||
     clientId === undefined ||
     clientSecret === undefined ||
-    webhookSecret === undefined ||
-    (inlinePrivateKey === undefined && privateKeyPath === undefined)
+    webhookSecret === undefined
   ) {
     return undefined;
   }
@@ -52,6 +51,14 @@ async function githubEnvironment(
   };
 }
 
+interface SlackEnvironmentFields {
+  appId: string | undefined;
+  appToken: string | undefined;
+  clientId: string | undefined;
+  clientSecret: string | undefined;
+  signingSecret: string | undefined;
+}
+
 function slackEnvironment(
   environment: Record<string, string | undefined>,
 ): ProviderApplicationConfiguration | undefined {
@@ -66,24 +73,42 @@ function slackEnvironment(
   );
   if (!supplied) return undefined;
 
-  const socketComplete =
+  const fields = { appId, appToken, clientId, clientSecret, signingSecret };
+  if (transport === "socket") return slackSocketEnvironment(fields);
+  if (transport !== undefined && transport !== "webhook") {
+    throw new Error("Slack environment configuration has an unknown SLACK_TRANSPORT value.");
+  }
+  return slackWebhookEnvironment(fields);
+}
+
+function slackSocketEnvironment({
+  appId,
+  appToken,
+  clientId,
+  clientSecret,
+  signingSecret,
+}: SlackEnvironmentFields): ProviderApplicationConfiguration {
+  if (
     appId !== undefined &&
     appToken !== undefined &&
     clientId === undefined &&
     clientSecret === undefined &&
-    signingSecret === undefined;
-  if (transport === "socket" && socketComplete) {
-    return { provider: "slack", transport, appId, appToken };
+    signingSecret === undefined
+  ) {
+    return { provider: "slack", transport: "socket", appId, appToken };
   }
-  if (transport === "socket") {
-    throw new Error(
-      "Slack environment configuration for Socket Mode requires exactly SLACK_TRANSPORT=socket, SLACK_APP_ID, and SLACK_APP_TOKEN.",
-    );
-  }
+  throw new Error(
+    "Slack environment configuration for Socket Mode requires exactly SLACK_TRANSPORT=socket, SLACK_APP_ID, and SLACK_APP_TOKEN.",
+  );
+}
 
-  if (transport !== undefined && transport !== "webhook") {
-    throw new Error("Slack environment configuration has an unknown SLACK_TRANSPORT value.");
-  }
+function slackWebhookEnvironment({
+  appId,
+  appToken,
+  clientId,
+  clientSecret,
+  signingSecret,
+}: SlackEnvironmentFields): ProviderApplicationConfiguration {
   if (
     appId !== undefined &&
     appToken === undefined &&
