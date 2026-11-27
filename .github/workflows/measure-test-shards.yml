@@ -29,6 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -55,12 +56,10 @@ jobs:
     name: static-and-built-only
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      TEST_SHARD_TOTAL: 6
-      TEST_SHARD_REPORT_DIR: ${{ github.workspace }}/shard-report
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -84,12 +83,16 @@ jobs:
         run: npm run test:scripts
 
       - name: Check shard coverage
+        env:
+          TEST_SHARD_TOTAL: 6
         run: npm run test:parallel -- --check-coverage
 
       - name: Build production application
         run: npm run build
 
       - name: Run built-server tests
+        env:
+          TEST_SHARD_REPORT_DIR: ${{ github.workspace }}/shard-report
         run: npm run test:parallel -- --built-only
 
       - name: Upload built-only report
