@@ -33,14 +33,19 @@ vi.mock("@tanstack/react-start", async (importOriginal) => ({
 vi.mock("@tanstack/react-router", () => ({
   Link: ({
     to,
+    search,
     children,
     "aria-label": label,
   }: {
     to: string;
+    search?: Record<string, string>;
     children: ReactNode;
     "aria-label"?: string;
   }) => (
-    <a href={to} {...(label === undefined ? {} : { "aria-label": label })}>
+    <a
+      href={search === undefined ? to : `${to}?${new URLSearchParams(search).toString()}`}
+      {...(label === undefined ? {} : { "aria-label": label })}
+    >
       {children}
     </a>
   ),
