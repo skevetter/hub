@@ -46,6 +46,26 @@ export class TriggerNameConflictError extends Error {
   }
 }
 
+/** The trigger an author asked to change is gone, or belongs to another organization. */
+export class OrganizationTriggerNotFoundError extends Error {
+  readonly code = "notFound";
+
+  constructor() {
+    super("organization trigger not found");
+    this.name = "OrganizationTriggerNotFoundError";
+  }
+}
+
+/** A project already holds this slug in the organization. */
+export class ProjectSlugConflictError extends Error {
+  readonly code = "conflict";
+
+  constructor() {
+    super("project slug already exists");
+    this.name = "ProjectSlugConflictError";
+  }
+}
+
 const UniqueViolationSchema = z
   .object({ code: z.string(), constraint: z.string().optional() })
   .loose();

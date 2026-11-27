@@ -21,6 +21,7 @@ import {
   HubDaemonHelloSchema,
   HubDaemonServerInfoEnvelopeSchema,
 } from "../hub/protocol.js";
+import { DaemonDisconnectedError } from "./disconnected-error.js";
 import { type DaemonConnection } from "./protocol.js";
 import type { HubProviderSnapshot } from "../hub/protocol.js";
 
@@ -309,7 +310,7 @@ export class ActiveDaemonRegistry {
     await Promise.all(sockets);
     await Promise.all(this.presenceWrites);
     for (const [daemonId, pending] of this.pendingByDaemon) {
-      for (const request of pending.values()) request.reject(new Error("daemon disconnected"));
+      for (const request of pending.values()) request.reject(new DaemonDisconnectedError());
       this.pendingByDaemon.delete(daemonId);
     }
   }
@@ -596,7 +597,7 @@ export class ActiveDaemonRegistry {
     for (const [requestId, request] of pending) {
       if (request.generation !== generation) continue;
       pending.delete(requestId);
-      request.reject(new Error("daemon disconnected"));
+      request.reject(new DaemonDisconnectedError());
     }
   }
 }

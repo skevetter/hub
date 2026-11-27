@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { describe, it } from "vitest";
 import { isScriptStep, parseCompiledHubConfig } from "../config/compiler.js";
 import { createMemoryDatabase } from "../db/memory.js";
+import { OrganizationTriggerNotFoundError } from "../db/errors.js";
 import type { Database } from "../db/types.js";
 import {
   acceptingAgentValidator,
@@ -228,6 +230,17 @@ describe("organization trigger store", () => {
       }),
       /"devbox" is not connected/u,
     );
+  });
+
+  it("refuses an update for a trigger that is gone before it checks the daemon", async () => {
+    const database = await enrolledDatabase();
+    const store = new OrganizationTriggerStore(database, "org", disconnectedAgentValidator());
+
+    await assert.rejects(
+      store.save({ triggerId: randomUUID(), yaml: triggerYaml(true), userId: null }),
+      OrganizationTriggerNotFoundError,
+    );
+    assert.deepEqual(await store.list(), []);
   });
 
   it("validates every agent choice against the daemon", async () => {

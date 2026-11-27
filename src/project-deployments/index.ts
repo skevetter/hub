@@ -1,3 +1,4 @@
+import { ProjectSlugConflictError } from "../db/errors.js";
 import type { Database, ProjectRecord } from "../db/types.js";
 
 export type DeploymentProjectResolution =
@@ -40,22 +41,42 @@ export class DeploymentProjects {
           input.organizationId,
           projectSlug,
         );
-        if (raced !== undefined) {
-          const project =
-            raced.status === "active"
-              ? raced
-              : await this.database.restoreProject(input.organizationId, raced.id);
-          return { status: "resolved", project, created: false };
-        }
-        const project = await this.database.createProject({
-          organizationId: input.organizationId,
-          name: projectSlug,
-          slug: projectSlug,
-          createdByUserId: null,
-        });
-        return { status: "resolved", project, created: true };
+        if (raced !== undefined) return this.resolveExisting(raced);
+        return this.createOrResolve(input.organizationId, projectSlug);
       },
     );
+  }
+
+  /** A writer outside the lock can take the slug between the check and the insert. */
+  private async createOrResolve(
+    organizationId: string,
+    projectSlug: string,
+  ): Promise<DeploymentProjectResolution> {
+    try {
+      const project = await this.database.createProject({
+        organizationId,
+        name: projectSlug,
+        slug: projectSlug,
+        createdByUserId: null,
+      });
+      return { status: "resolved", project, created: true };
+    } catch (error) {
+      if (!(error instanceof ProjectSlugConflictError)) throw error;
+      const existing = await this.database.findProjectBySlugForOrganization(
+        organizationId,
+        projectSlug,
+      );
+      if (existing === undefined) throw error;
+      return this.resolveExisting(existing);
+    }
+  }
+
+  private async resolveExisting(existing: ProjectRecord): Promise<DeploymentProjectResolution> {
+    const project =
+      existing.status === "active"
+        ? existing
+        : await this.database.restoreProject(existing.organizationId, existing.id);
+    return { status: "resolved", project, created: false };
   }
 
   private async findActive(

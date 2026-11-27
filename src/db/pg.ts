@@ -77,7 +77,13 @@ import {
   entitlementOverridesSchema,
   mergeOverrides,
 } from "../entitlements/catalog.js";
-import { isUniqueViolation, toDatabaseError, TriggerNameConflictError } from "./errors.js";
+import {
+  isUniqueViolation,
+  OrganizationTriggerNotFoundError,
+  ProjectSlugConflictError,
+  toDatabaseError,
+  TriggerNameConflictError,
+} from "./errors.js";
 import { withApiKeySerialization } from "./api-key-serialization.js";
 import { ConnectionRepository } from "./connections.js";
 import { ProviderEventAcceptanceRepository } from "./trigger-acceptance.js";
@@ -3015,16 +3021,7 @@ class PgDatabase implements Database {
   }
 
   async createProject(input: CreateProjectInput): Promise<ProjectRecord> {
-    const rows = await query<ProjectRow>(
-      this.pool,
-      `insert into projects (organization_id, name, slug, created_by_user_id)
-       select $1, $2, $3, $4
-       where $4::text is null or exists (
-         select 1 from member where organization_id = $1 and user_id = $4
-       )
-       returning *`,
-      [input.organizationId, input.name, input.slug, input.createdByUserId],
-    );
+    const rows = await insertProject(this.pool, input);
     const project = rows.rows[0];
     if (project === undefined) throw new Error("project access denied");
     await query(
@@ -4854,6 +4851,26 @@ function requireReturnedRow<T extends QueryRow>(row: T | undefined, description:
   return row;
 }
 
+async function insertProject(pool: QueryHandle, input: CreateProjectInput) {
+  try {
+    return await query<ProjectRow>(
+      pool,
+      `insert into projects (organization_id, name, slug, created_by_user_id)
+       select $1, $2, $3, $4
+       where $4::text is null or exists (
+         select 1 from member where organization_id = $1 and user_id = $4
+       )
+       returning *`,
+      [input.organizationId, input.name, input.slug, input.createdByUserId],
+    );
+  } catch (error) {
+    if (isUniqueViolation(error, "projects_organization_slug_unique")) {
+      throw new ProjectSlugConflictError();
+    }
+    throw error;
+  }
+}
+
 function isDaemonSlugConflict(error: unknown): boolean {
   return isUniqueViolation(error, "daemons_organization_slug_unique");
 }
@@ -5544,7 +5561,7 @@ async function upsertSavedTrigger(
            where id = $1 and organization_id = $2 returning *`,
     [input.triggerId, input.organizationId, input.name, input.enabled, input.format],
   );
-  if (updated.rows[0] === undefined) throw new Error("organization trigger not found");
+  if (updated.rows[0] === undefined) throw new OrganizationTriggerNotFoundError();
   return updated.rows[0];
 }
 

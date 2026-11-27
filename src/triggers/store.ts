@@ -1,3 +1,4 @@
+import { OrganizationTriggerNotFoundError } from "../db/errors.js";
 import type {
   Database,
   OrganizationTriggerRecord,
@@ -59,7 +60,7 @@ export class OrganizationTriggerStore {
     trigger: OrganizationTriggerRecord,
   ): Promise<OrganizationTriggerRevisionRecord> {
     if (trigger.organizationId !== this.organizationId) {
-      throw new Error("organization trigger not found");
+      throw new OrganizationTriggerNotFoundError();
     }
     const revision = await this.database.findOrganizationTriggerRevision(
       trigger.id,
@@ -125,7 +126,7 @@ export class OrganizationTriggerStore {
   private async activeYaml(triggerId: string | undefined): Promise<string | undefined> {
     if (triggerId === undefined) return undefined;
     const trigger = await this.find(triggerId);
-    if (trigger === undefined) return undefined;
+    if (trigger === undefined) throw new OrganizationTriggerNotFoundError();
     return (await this.activeRevision(trigger)).yaml;
   }
 
