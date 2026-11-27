@@ -118,3 +118,62 @@ describe("step ids that expressions cannot read", () => {
     assert.equal(refusal(withStep("planner")), undefined);
   });
 });
+
+describe("input names that expressions cannot read", () => {
+  const on = onBlock("slack.mention", "[alice]");
+
+  function withInputs(names: readonly string[], base = multiStep(on)): string {
+    const declared = names.map((name) => `  ${name}: { type: string }\n`).join("");
+    return base.replace("target:", `inputs:\n${declared}target:`);
+  }
+
+  it.each(["constructor", "prototype"])("still declares an input named %s", (name) => {
+    assert.equal(refusal(withInputs([name])), undefined);
+  });
+
+  it.each(["constructor", "prototype"])(
+    "keeps a fallback expression on declared input %s working",
+    (name) => {
+      const yaml = withInputs([name]).replace(
+        "    prompt: Fix it.",
+        `    prompt: Fix it.\n    if: "\${{ paseo.inputs.${name} ?? true }}"`,
+      );
+      assert.equal(refusal(yaml), undefined);
+    },
+  );
+
+  it("refuses an undeclared reference that names an inherited key", () => {
+    const yaml = multiStep(on).replace(
+      "    prompt: Fix it.",
+      '    prompt: Fix it.\n    if: "${{ paseo.inputs.constructor }}"',
+    );
+    assert.match(refusal(yaml) ?? "", /references undeclared input constructor/u);
+  });
+
+  it("refuses an input filter that names an inherited key", () => {
+    const filtered = multiStep(
+      on.replace(
+        "      from_users: [alice]\n",
+        "      from_users: [alice]\n      inputs: { constructor: x }\n",
+      ),
+    );
+    assert.match(refusal(withInputs(["ticket"], filtered)) ?? "", /undeclared input constructor/u);
+  });
+
+  it("keeps a stored contract with an input named constructor", () => {
+    const stored = storedConfig(withInputs(["ticket"]));
+    const renamed = stored.replace('"inputs":{"ticket"', '"inputs":{"constructor"');
+    assert.notEqual(renamed, stored);
+    assert.doesNotThrow(() => parseCompiledHubConfig(JSON.parse(renamed)));
+  });
+
+  it("still accepts a declared input, a reference to it and a filter on it", () => {
+    const yaml = multiStep(
+      on.replace(
+        "      from_users: [alice]\n",
+        "      from_users: [alice]\n      inputs: { ticket: x }\n",
+      ),
+    ).replace("    prompt: Fix it.", '    prompt: Fix it.\n    if: "${{ paseo.inputs.ticket }}"');
+    assert.equal(refusal(withInputs(["ticket"], yaml)), undefined);
+  });
+});

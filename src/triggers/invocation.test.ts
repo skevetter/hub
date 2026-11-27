@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "vitest";
 import {
+  matchesInputFilters,
   parseInvocation,
   parseStructuredInvocation,
   type InvocationInputDefinitions,
@@ -291,5 +292,30 @@ describe("structured invocation parser", () => {
     assert.equal(Object.hasOwn(result.inputs, "__proto__"), true);
     assert.equal(result.inputs["__proto__"], "value");
     assert.equal(Object.hasOwn(result.inputs, "constructor"), false);
+  });
+});
+
+describe("inherited object keys are not declared inputs", () => {
+  it.each(["constructor", "toString", "hasOwnProperty", "valueOf"])(
+    "treats %s=x as ordinary text",
+    (name) => {
+      const result = parseInvocation(`${name}=x investigate`, inputs);
+      assert.equal(result.status, "accepted");
+      assert.deepEqual(result.inputs, { agent: "codex" });
+    },
+  );
+
+  it("still parses declared inputs that precede an inherited name", () => {
+    const result = parseInvocation("repo=hub constructor=x investigate", inputs);
+    assert.equal(result.status, "accepted");
+    assert.deepEqual(result.inputs, { repo: "hub", agent: "codex" });
+  });
+
+  it("does not match an input filter against an inherited key", () => {
+    const inherited: Record<string, string> = {};
+    Object.setPrototypeOf(inherited, { repo: "hub" });
+    assert.equal(matchesInputFilters(inherited, { repo: "hub" }), false);
+    assert.equal(matchesInputFilters({}, { constructor: "x" }), false);
+    assert.equal(matchesInputFilters({ repo: "hub" }, { repo: "hub" }), true);
   });
 });
