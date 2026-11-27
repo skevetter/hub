@@ -6,12 +6,12 @@ function decimalText(value: number): string {
   if (!Number.isFinite(value)) throw new TypeError("Timeline numbers must be finite");
   const text = String(value);
   if (!/[eE]/u.test(text)) return text;
-  const [mantissa, exponentText] = text.split(/[eE]/u);
-  const negative = mantissa!.startsWith("-");
-  const unsigned = negative ? mantissa!.slice(1) : mantissa!;
-  const [whole, fraction = ""] = unsigned.split(".");
-  const digits = whole! + fraction;
-  const point = whole!.length + Number(exponentText);
+  const [mantissa = "", exponentText] = text.split(/[eE]/u);
+  const negative = mantissa.startsWith("-");
+  const unsigned = negative ? mantissa.slice(1) : mantissa;
+  const [whole = "", fraction = ""] = unsigned.split(".");
+  const digits = whole + fraction;
+  const point = whole.length + Number(exponentText);
   let expanded: string;
   if (point <= 0) expanded = `0.${"0".repeat(-point)}${digits}`;
   else if (point >= digits.length) expanded = digits + "0".repeat(point - digits.length);
@@ -31,6 +31,11 @@ function quoted(value: string): string {
   return JSON.stringify(value);
 }
 
+function jsonbMemberText(value: JsonValue | undefined): string {
+  if (value === undefined) throw new TypeError("Cannot convert undefined or null to object");
+  return jsonbText(value);
+}
+
 export function jsonbText(value: JsonValue): string {
   if (value === null) return "null";
   if (typeof value === "string") return quoted(value);
@@ -43,7 +48,7 @@ export function jsonbText(value: JsonValue): string {
         Buffer.byteLength(a) - Buffer.byteLength(b) ||
         Buffer.compare(Buffer.from(a), Buffer.from(b)),
     )
-    .map((key) => `${quoted(key)}: ${jsonbText(value[key]!)}`)
+    .map((key) => `${quoted(key)}: ${jsonbMemberText(value[key])}`)
     .join(", ")}}`;
 }
 
@@ -124,13 +129,19 @@ export function timelineCallIdText(data: TimelineData): string | null {
   return typeof callId === "string" ? callId : jsonbText(callId);
 }
 
-export function timelineBudgetExceeded(
-  state: RunTimelineState,
-  kind: TimelineKind,
-  bytes: number,
-  maxEvents: number,
-  notice: boolean,
-): boolean {
+export function timelineBudgetExceeded({
+  state,
+  kind,
+  bytes,
+  maxEvents,
+  notice,
+}: {
+  state: RunTimelineState;
+  kind: TimelineKind;
+  bytes: number;
+  maxEvents: number;
+  notice: boolean;
+}): boolean {
   if (isOrdinary(kind)) {
     const count = state.eventCount - state.stepEndCount - Number(notice);
     return count >= maxEvents || state.byteCount + bytes > 196608;

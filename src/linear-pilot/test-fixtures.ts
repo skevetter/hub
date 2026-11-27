@@ -40,13 +40,21 @@ export function fixturePromptId(n: number) {
   return `00000000-0000-4000-8000-${n.toString(16).padStart(12, "0")}`;
 }
 
-export function activity(
-  id: string,
-  second: number,
-  kind: keyof typeof typenames,
-  body: string,
+interface ActivityOptions {
+  id: string;
+  second: number;
+  kind: keyof typeof typenames;
+  body: string;
+  actor?: string;
+}
+
+export function activity({
+  id,
+  second,
+  kind,
+  body,
   actor = kind === "prompt" ? conversation.ownerId : conversation.appUserId,
-): FixtureActivity {
+}: ActivityOptions): FixtureActivity {
   return {
     id,
     agentSession: { id: conversation.nativeSessionId },
@@ -68,14 +76,19 @@ export function activityPage(nodes: FixtureActivity[]) {
 }
 
 export const current = { activityId: fixturePromptId(50), body: "What should we do next?" };
-export const currentRow = activity(current.activityId, 50, "prompt", current.body);
+export const currentRow = activity({
+  id: current.activityId,
+  second: 50,
+  kind: "prompt",
+  body: current.body,
+});
 
 export const initialRows = [
-  activity(
-    fixtureActivityIds(conversation.nativeSessionId, fixturePromptId(1)).response,
-    2,
-    "response",
-    "initial application response",
-  ),
-  activity(fixturePromptId(1), 1, "prompt", "initial owner prompt"),
+  activity({
+    id: fixtureActivityIds(conversation.nativeSessionId, fixturePromptId(1)).response,
+    second: 2,
+    kind: "response",
+    body: "initial application response",
+  }),
+  activity({ id: fixturePromptId(1), second: 1, kind: "prompt", body: "initial owner prompt" }),
 ];
