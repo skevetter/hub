@@ -104,6 +104,9 @@ jobs:
       - name: Install E2E agent CLIs
         run: npm install -g @getpaseo/cli opencode-ai
 
+      - name: Build
+        run: npm run build
+
       - name: Run tests
         run: npm test
 
