@@ -7,7 +7,11 @@ import {
 import { compareBundlePaths } from "../config/bundle-contract.js";
 import { rawConfigurationHash } from "../config/compiler.js";
 import type { PromptPartialReadResult } from "../config/prompt-partials.js";
-import type { Database, ProjectConfigurationRevisionRecord } from "../db/types.js";
+import type {
+  Database,
+  GitHubConfigurationTarget,
+  ProjectConfigurationRevisionRecord,
+} from "../db/types.js";
 import { reportFailure } from "../failures/index.js";
 import { ConfigurationActivationValidationError, ProjectConfigurationStore } from "./store.js";
 
@@ -70,6 +74,15 @@ export async function synchronizeGitHubProjectConfiguration(input: {
     });
     return { outcome: "fetch_failed" };
   }
+  return synchronizeListedBundle(input, listed);
+}
+
+type ProjectSyncInput = Parameters<typeof synchronizeGitHubProjectConfiguration>[0];
+
+async function synchronizeListedBundle(
+  input: ProjectSyncInput,
+  listed: readonly { path: string; kind: PromptPartialReadResult["kind"] }[],
+): Promise<GitHubConfigurationSyncResult> {
   if (!listed.some(({ path }) => path === HUB_RESOURCE_PATH)) {
     await recordAttempt(input, "fetch_failed", { reason: "hub_resource_not_found_at_commit" });
     return { outcome: "fetch_failed" };
@@ -119,6 +132,13 @@ export async function synchronizeGitHubProjectConfiguration(input: {
     await recordAttempt(input, "invalid", { revisionId: revision.id, stage: "bundle" });
     return { outcome: "invalid", revision };
   }
+  return activateBundle(input, files);
+}
+
+async function activateBundle(
+  input: ProjectSyncInput,
+  files: readonly HubBundleFile[],
+): Promise<GitHubConfigurationSyncResult> {
   const store =
     input.configurationForProject?.(input.projectId) ??
     new ProjectConfigurationStore(input.database, input.projectId);
@@ -193,7 +213,15 @@ export async function synchronizeGitHubDefaultBranch(input: {
     });
     return { outcome: "superseded" };
   }
-  return synchronizeGitHubProjectConfiguration({
+  return synchronizeGitHubProjectConfiguration(projectSyncInput(input, target, branchHead));
+}
+
+function projectSyncInput(
+  input: Parameters<typeof synchronizeGitHubDefaultBranch>[0],
+  target: GitHubConfigurationTarget,
+  branchHead: string,
+): ProjectSyncInput {
+  return {
     database: input.database,
     client: input.client,
     projectId: input.projectId,
@@ -208,11 +236,11 @@ export async function synchronizeGitHubDefaultBranch(input: {
     ...(input.configurationForProject === undefined
       ? {}
       : { configurationForProject: input.configurationForProject }),
-  });
+  };
 }
 
 async function recordInvalidBundle(
-  input: Parameters<typeof synchronizeGitHubProjectConfiguration>[0],
+  input: ProjectSyncInput,
   files: readonly HubBundleFile[],
   issues: readonly { path: readonly (string | number)[]; message: string }[],
 ) {

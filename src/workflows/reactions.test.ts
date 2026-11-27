@@ -441,10 +441,7 @@ async function runTwoStepWorkflow<
     }).engine;
   const engine = createEngine();
 
-  try {
-    const acceptedState = await lifecycle.notifyWorkflowRunAccepted(run);
-    await database.setWorkflowRunReactionState(run.id, acceptedState);
-    await engine.processAvailable();
+  async function settleScenario(): Promise<void> {
     if (options.retry !== undefined) {
       assert.ok(peer);
       await exerciseWireRetry({
@@ -495,6 +492,13 @@ async function runTwoStepWorkflow<
       now = new Date();
       await engine.processAvailable();
     }
+  }
+
+  try {
+    const acceptedState = await lifecycle.notifyWorkflowRunAccepted(run);
+    await database.setWorkflowRunReactionState(run.id, acceptedState);
+    await engine.processAvailable();
+    await settleScenario();
     await waitForTerminalRun(database, run.id);
     now = new Date();
     await engine.processAvailable();
@@ -653,18 +657,22 @@ async function exerciseWireRetry({
       assert.deepEqual(controls, ["interrupt"]);
       assert.equal((await database.findTriggerRunById(newer.id))?.status, "running");
     } else {
-      await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
-      assert.deepEqual(controls, ["interrupt"]);
-      assert.equal((await database.findTriggerRunById(peer.id))?.status, "running");
-      const details = await database.readRunStopDetails(run.organizationId, run.id);
-      assert.equal(details?.cleanupState, "delivery_unconfirmed");
-      assert.ok(details.retryAttemptId);
-      await engine.stopRun(actor, run.id, details.otherAttachedRunCount, details.retryAttemptId);
-      assert.deepEqual(controls, ["interrupt", "interrupt"]);
-      assert.equal((await database.findTriggerRunById(peer.id))?.status, "failed");
+      await retryFromRunStopDetails();
     }
   }
   assert.deepEqual(await database.findPendingHubActions(TEST_DAEMON_ID), []);
+
+  async function retryFromRunStopDetails(): Promise<void> {
+    await lifecycle.recoverPendingHubActions(TEST_DAEMON_ID);
+    assert.deepEqual(controls, ["interrupt"]);
+    assert.equal((await database.findTriggerRunById(peer.id))?.status, "running");
+    const details = await database.readRunStopDetails(run.organizationId, run.id);
+    assert.equal(details?.cleanupState, "delivery_unconfirmed");
+    assert.ok(details.retryAttemptId);
+    await engine.stopRun(actor, run.id, details.otherAttachedRunCount, details.retryAttemptId);
+    assert.deepEqual(controls, ["interrupt", "interrupt"]);
+    assert.equal((await database.findTriggerRunById(peer.id))?.status, "failed");
+  }
 }
 
 async function exerciseParallelRecovery({

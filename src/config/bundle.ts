@@ -89,6 +89,33 @@ export function compileHubBundle(input: readonly HubBundleFile[]): CompiledHubBu
   const bundleName = projectName(resource["name"]);
   const environments = namedResources(resource["environments"], "environment", HUB_RESOURCE_PATH);
   const agents = namedAgents(resource["agents"]);
+  const { triggers, sourceFiles, workflowSourceFiles } = collectAuthoredWorkflows(files);
+  const rawConfiguration = { environments, triggers };
+  const partials = resolvePartials(rawConfiguration, files);
+  let configuration: CompiledHubConfig;
+  try {
+    configuration = compileHubConfig(rawConfiguration, {
+      namedAgents: agents,
+      sourceFiles,
+      resolvedPromptPartials: partials,
+    });
+  } catch (error) {
+    throw issue(
+      sourcePathForError({ error, sourceFiles, triggers, workflowSourceFiles, environments }),
+      errorMessage(error),
+    );
+  }
+  const authoredFiles = [...files.values()].sort(byPath);
+  return {
+    ...(bundleName === undefined ? {} : { name: bundleName }),
+    configuration,
+    agentValidationTargets: collectAgentValidationTargets(triggers, configuration, agents),
+    files: authoredFiles,
+    authoredHash: hashAuthoredFiles(authoredFiles),
+  };
+}
+
+function collectAuthoredWorkflows(files: ReadonlyMap<string, HubBundleFile>) {
   const workflowFiles = [...files.values()]
     .filter((file) => isWorkflowPath(file.path))
     .sort(byPath);
@@ -115,29 +142,7 @@ export function compileHubBundle(input: readonly HubBundleFile[]): CompiledHubBu
     }
     triggers.push(trigger);
   }
-  const rawConfiguration = { environments, triggers };
-  const partials = resolvePartials(rawConfiguration, files);
-  let configuration: CompiledHubConfig;
-  try {
-    configuration = compileHubConfig(rawConfiguration, {
-      namedAgents: agents,
-      sourceFiles,
-      resolvedPromptPartials: partials,
-    });
-  } catch (error) {
-    throw issue(
-      sourcePathForError(error, sourceFiles, triggers, workflowSourceFiles, environments),
-      errorMessage(error),
-    );
-  }
-  const authoredFiles = [...files.values()].sort(byPath);
-  return {
-    ...(bundleName === undefined ? {} : { name: bundleName }),
-    configuration,
-    agentValidationTargets: collectAgentValidationTargets(triggers, configuration, agents),
-    files: authoredFiles,
-    authoredHash: hashAuthoredFiles(authoredFiles),
-  };
+  return { triggers, sourceFiles, workflowSourceFiles };
 }
 
 function collectAgentValidationTargets(
@@ -156,25 +161,34 @@ function collectAgentValidationTargets(
     for (const [stepIndex, authoredStep] of authoredSteps.entries()) {
       const compiledStep = compiledTrigger.steps[stepIndex];
       if (!isRecord(authoredStep) || compiledStep === undefined) continue;
-      const authoredAgent = authoredStep["agent"];
-      if (typeof authoredAgent !== "string") continue;
-      let names: readonly string[] = [];
-      if (authoredAgent.includes("${{")) names = Object.keys(agentDefinitions);
-      else if (Object.hasOwn(agentDefinitions, authoredAgent)) names = [authoredAgent];
-      const authoredEnvironment = authoredStep["environment"];
-      const environmentNames =
-        typeof authoredEnvironment === "string" && !authoredEnvironment.includes("${{")
-          ? [authoredEnvironment]
-          : allDaemonEnvironments;
-      for (const name of names) {
-        const agent = agentDefinitions[name];
-        if (agent === undefined) continue;
-        const key = `${name}\0${environmentNames.join("\0")}`;
-        targets.set(key, { name, agent, environmentNames });
-      }
+      addStepValidationTargets(authoredStep, agentDefinitions, allDaemonEnvironments, targets);
     }
   }
   return [...targets.values()];
+}
+
+function addStepValidationTargets(
+  authoredStep: Record<string, unknown>,
+  agentDefinitions: Readonly<Record<string, CompiledAgent>>,
+  allDaemonEnvironments: readonly string[],
+  targets: Map<string, HubBundleAgentValidationTarget>,
+): void {
+  const authoredAgent = authoredStep["agent"];
+  if (typeof authoredAgent !== "string") return;
+  let names: readonly string[] = [];
+  if (authoredAgent.includes("${{")) names = Object.keys(agentDefinitions);
+  else if (Object.hasOwn(agentDefinitions, authoredAgent)) names = [authoredAgent];
+  const authoredEnvironment = authoredStep["environment"];
+  const environmentNames =
+    typeof authoredEnvironment === "string" && !authoredEnvironment.includes("${{")
+      ? [authoredEnvironment]
+      : allDaemonEnvironments;
+  for (const name of names) {
+    const agent = agentDefinitions[name];
+    if (agent === undefined) continue;
+    const key = `${name}\0${environmentNames.join("\0")}`;
+    targets.set(key, { name, agent, environmentNames });
+  }
 }
 
 function normalizeBundleFiles(input: readonly HubBundleFile[]): Map<string, HubBundleFile> {
@@ -193,14 +207,7 @@ function normalizeBundleFiles(input: readonly HubBundleFile[]): Map<string, HubB
 }
 
 function validateBundlePath(path: string): void {
-  if (
-    path.length === 0 ||
-    path.startsWith("/") ||
-    path.includes("\\") ||
-    path.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
-  ) {
-    throw issue([path], "unsafe bundle path");
-  }
+  validateSafeBundlePath(path);
   if (path === ".paseo/hub.toml" || path.endsWith(".toml")) {
     throw issue([path], "TOML is not accepted; use .paseo/hub.yml and workflow .yml files");
   }
@@ -211,6 +218,21 @@ function validateBundlePath(path: string): void {
     }
     return;
   }
+  validateWorkflowBundlePath(path);
+}
+
+function validateSafeBundlePath(path: string): void {
+  if (
+    path.length === 0 ||
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    path.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    throw issue([path], "unsafe bundle path");
+  }
+}
+
+function validateWorkflowBundlePath(path: string): void {
   if (path.startsWith(`${WORKFLOW_DIRECTORY}/`)) {
     const relative = path.slice(`${WORKFLOW_DIRECTORY}/`.length);
     if (relative.includes("/")) {
@@ -323,6 +345,29 @@ function resolvePartials(
   const supplied = [...files.values()].filter((file) =>
     file.path.startsWith(`${WORKFLOW_PARTIAL_DIRECTORY}/`),
   );
+  validateSuppliedPartialLimits(supplied);
+  const requestedSet = new Set(requested);
+  for (const file of supplied) {
+    if (!requestedSet.has(file.path)) {
+      throw issue([file.path], `partial file is not referenced by any workflow`);
+    }
+  }
+  for (const path of requested.toSorted()) {
+    if (!path.startsWith(`${WORKFLOW_PARTIAL_DIRECTORY}/`)) {
+      throw issue([path], "prompt includes must resolve under .paseo/workflows/partials/");
+    }
+    const file = files.get(path);
+    if (file === undefined) throw issue([path], "prompt partial is missing from the bundle");
+    resolved.set(path, {
+      path,
+      content: file.content,
+      contentHash: hashPromptPartialContent(file.content),
+    });
+  }
+  return resolved;
+}
+
+function validateSuppliedPartialLimits(supplied: readonly HubBundleFile[]): void {
   if (supplied.length > MAX_PROMPT_PARTIAL_COUNT) {
     throw issue(
       [WORKFLOW_PARTIAL_DIRECTORY],
@@ -352,25 +397,6 @@ function resolvePartials(
       `combined content exceeds the ${MAX_PROMPT_PARTIAL_BUNDLE_BYTES}-byte limit`,
     );
   }
-  const requestedSet = new Set(requested);
-  for (const file of supplied) {
-    if (!requestedSet.has(file.path)) {
-      throw issue([file.path], `partial file is not referenced by any workflow`);
-    }
-  }
-  for (const path of requested.toSorted()) {
-    if (!path.startsWith(`${WORKFLOW_PARTIAL_DIRECTORY}/`)) {
-      throw issue([path], "prompt includes must resolve under .paseo/workflows/partials/");
-    }
-    const file = files.get(path);
-    if (file === undefined) throw issue([path], "prompt partial is missing from the bundle");
-    resolved.set(path, {
-      path,
-      content: file.content,
-      contentHash: hashPromptPartialContent(file.content),
-    });
-  }
-  return resolved;
 }
 
 function isWorkflowPath(path: string): boolean {
@@ -381,25 +407,23 @@ function isWorkflowPath(path: string): boolean {
   );
 }
 
+interface AuthoredConfigurationPaths {
+  sourceFiles: Readonly<Record<string, string>>;
+  triggers: readonly unknown[];
+  workflowSourceFiles: readonly string[];
+  environments: readonly unknown[];
+}
+
 function sourcePathForError(
-  error: unknown,
-  sourceFiles: Readonly<Record<string, string>>,
-  triggers: readonly unknown[],
-  workflowSourceFiles: readonly string[],
-  environments: readonly unknown[],
+  options: AuthoredConfigurationPaths & { error: unknown },
 ): readonly (string | number)[] {
+  const { error, sourceFiles } = options;
   if (error instanceof HubConfigurationCompilationError) {
     return conceptualAuthoredPath(error.path, sourceFiles);
   }
   const zodIssue = firstZodIssue(error);
   if (zodIssue !== undefined) {
-    const authored = zodAuthoredPath(
-      zodIssue.path,
-      sourceFiles,
-      triggers,
-      workflowSourceFiles,
-      environments,
-    );
+    const authored = zodAuthoredPath({ path: zodIssue.path, authored: options });
     if (authored !== undefined) return authored;
   }
   return [HUB_RESOURCE_PATH];
@@ -416,13 +440,12 @@ function conceptualAuthoredPath(
   return [HUB_RESOURCE_PATH, ...path];
 }
 
-function zodAuthoredPath(
-  path: readonly PropertyKey[],
-  sourceFiles: Readonly<Record<string, string>>,
-  triggers: readonly unknown[],
-  workflowSourceFiles: readonly string[],
-  environments: readonly unknown[],
-): readonly (string | number)[] | undefined {
+function zodAuthoredPath(options: {
+  path: readonly PropertyKey[];
+  authored: AuthoredConfigurationPaths;
+}): readonly (string | number)[] | undefined {
+  const { path, authored } = options;
+  const { triggers, workflowSourceFiles, environments } = authored;
   const normalized = path.filter(
     (part): part is string | number => typeof part === "string" || typeof part === "number",
   );
@@ -431,24 +454,7 @@ function zodAuthoredPath(
     const triggerRecord = isRecord(trigger) ? trigger : undefined;
     const source = workflowSourceFiles[normalized[1]];
     if (source === undefined) return undefined;
-    const sourcePath: (string | number)[] = [source];
-    const remainder = normalized.slice(2);
-    for (let index = 0; index < remainder.length; index += 1) {
-      const part = remainder[index];
-      const next = remainder[index + 1];
-      if (part === "steps" && typeof next === "number") {
-        const steps = Array.isArray(triggerRecord?.["steps"]) ? triggerRecord["steps"] : [];
-        const step: unknown = steps[next];
-        sourcePath.push(
-          "steps",
-          isRecord(step) && typeof step["id"] === "string" ? step["id"] : next,
-        );
-        index += 1;
-      } else if (typeof part === "string" || typeof part === "number") {
-        sourcePath.push(part);
-      }
-    }
-    return sourcePath;
+    return authoredWorkflowPath(source, normalized.slice(2), triggerRecord);
   }
   if (normalized[0] === "environments" && typeof normalized[1] === "number") {
     const environment = environments[normalized[1]];
@@ -461,6 +467,30 @@ function zodAuthoredPath(
     ];
   }
   return undefined;
+}
+
+function authoredWorkflowPath(
+  source: string,
+  remainder: readonly (string | number)[],
+  triggerRecord: Record<string, unknown> | undefined,
+): readonly (string | number)[] {
+  const sourcePath: (string | number)[] = [source];
+  for (let index = 0; index < remainder.length; index += 1) {
+    const part = remainder[index];
+    const next = remainder[index + 1];
+    if (part === "steps" && typeof next === "number") {
+      const steps = Array.isArray(triggerRecord?.["steps"]) ? triggerRecord["steps"] : [];
+      const step: unknown = steps[next];
+      sourcePath.push(
+        "steps",
+        isRecord(step) && typeof step["id"] === "string" ? step["id"] : next,
+      );
+      index += 1;
+    } else if (typeof part === "string" || typeof part === "number") {
+      sourcePath.push(part);
+    }
+  }
+  return sourcePath;
 }
 
 function firstZodIssue(
