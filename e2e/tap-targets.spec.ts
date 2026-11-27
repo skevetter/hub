@@ -100,8 +100,9 @@ test("the role Selects on the team page are 44 px on a phone and keep their desk
   await hub.createOrganization("owner", "Acme");
   const org = /\/o\/[^/]+\//u.exec(page.url())?.[0] ?? "/";
   await page.goto(new URL(`${org}settings/team`, page.url()).toString());
+  await expect(page.getByRole("combobox").first()).toBeVisible();
   await expectFieldHeights(page, 1);
   await page.getByRole("button", { name: "Invite member" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
-  await expectFieldHeights(page, 3);
+  await expectFieldHeights(page, 2);
 });

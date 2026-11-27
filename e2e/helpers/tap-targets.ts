@@ -14,7 +14,11 @@ export interface Size {
 export async function fieldSizes(page: Page): Promise<Size[]> {
   return page.locator(FIELDS).evaluateAll((elements) =>
     elements
-      .filter((element) => element.getBoundingClientRect().width > 0)
+      .filter(
+        (element) =>
+          element.getBoundingClientRect().width > 0 &&
+          element.closest("[aria-hidden='true']") === null,
+      )
       .map((element) => {
         const box = element.getBoundingClientRect();
         const slot = element.getAttribute("data-slot") ?? element.getAttribute("type") ?? "";
