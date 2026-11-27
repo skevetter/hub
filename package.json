@@ -34,7 +34,7 @@
     "typecheck:e2e": "tsgo --noEmit -p tsconfig.e2e.json",
     "start": "node dist/index.js",
     "test": "npm run test:scripts && vitest run",
-    "test:scripts": "node --test scripts/release-metadata.node-test.mjs scripts/paseo-workspace.node-test.mjs scripts/lint-strict.node-test.mjs scripts/lefthook.node-test.mjs scripts/oxlint/hub-strict-plugin.node-test.mjs scripts/test-parallel.node-test.mjs scripts/test-changed.node-test.mjs scripts/test-receipt.node-test.mjs",
+    "test:scripts": "node --test scripts/release-metadata.node-test.mjs scripts/paseo-workspace.node-test.mjs scripts/lint-strict.node-test.mjs scripts/lefthook.node-test.mjs scripts/oxlint/hub-strict-plugin.node-test.mjs scripts/test-parallel.node-test.mjs scripts/test-shard.node-test.mjs scripts/test-changed.node-test.mjs scripts/test-receipt.node-test.mjs",
     "test:replies:fuzz": "HUB_REPLY_FUZZ=1 HUB_REPLY_PERF=1 vitest run --maxWorkers=1 src/run-replies/format.test.ts src/run-replies/format.fuzz.test.ts src/run-replies/format.perf.test.ts",
     "test:parallel": "node scripts/test-parallel.mjs",
     "test:changed": "node scripts/test-changed.mjs",

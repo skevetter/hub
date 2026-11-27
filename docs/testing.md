@@ -53,6 +53,37 @@ runner. The summary counts files without results separately from failed tests. O
 shard's `vitest.log` includes Vitest's own diagnostics and `results.json` contains the test report
 if Vitest could write it. A failure that passes on rerun can be sensitive to machine load.
 
+## Run one shard on its own machine
+
+CI splits the suite across machines. Each machine runs one shard:
+
+```sh
+npm run test:parallel -- --shard 3/6
+TEST_SHARD_INDEX=3 TEST_SHARD_TOTAL=6 npm run test:parallel
+```
+
+`--shard` wins over the environment pair. A bad value exits 2. The split uses only
+`scripts/test-timings.json` and file sizes, so every machine computes the same shards. It ignores
+the local timing cache and the machine load.
+
+The three built-server suites listed under `.output/server/` in `scripts/test-runtime-files.json`
+are not in any shard. Run them after `npm run build` with `npm run test:parallel -- --built-only`.
+`npm run test:parallel -- --check-coverage` runs no tests. It exits 0 when the shards plus the
+built-only suites cover every discovered file exactly once, 1 when they do not, and 2 on bad
+arguments. `TEST_SHARD_TOTAL` sets the shard count for the check, 6 by default.
+
+A file whose failures are all `Port <n>/tcp not bound after <n>ms` or `Hook timed out in <n>ms` is
+retried once, alone, in a second Vitest process. Each retry prints a `::warning::` line and shows
+in the step summary. Any other failure is final. More than 5 such files in one shard fails the
+shard without a retry.
+
+With `TEST_SHARD_REPORT_DIR` set, the run writes `shard-<i>.json` (or `built-only.json`), a
+`.summary.json` next to it, `vitest.log` and, after a retry, `vitest.retry.log`. Values of
+environment variables whose names suggest secrets, plus the host name, are replaced with
+`[redacted]` in those files and in the step summary. To refresh `scripts/test-timings.json`, run
+`node scripts/generate-test-timings.mjs` on the downloaded `shard-<i>.json` files of one
+complete run.
+
 The test commands and runtime-file map generator print the target root, branch, HEAD, worktree
 status, current directory and planned action. Calling a script by path from a different Git
 worktree requires `--root <path>` to identify the worktree to test. The runners use that
