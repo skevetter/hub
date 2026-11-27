@@ -283,43 +283,55 @@ export function sensitiveValues(env = process.env, host = hostname()) {
     .sort((a, b) => b.length - a.length);
 }
 
-function occurrences(text, needle, secret) {
-  const spans = [];
-  for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + needle.length)) {
-    spans.push({ start: at, end: at + needle.length, secret });
-  }
-  return spans;
+function nextHit(text, needle, from) {
+  return text.indexOf(needle.text, from);
 }
 
-function mergeSpans(spans) {
-  const sorted = [...spans].sort((x, y) => x.start - y.start || y.end - x.end);
-  const merged = [];
-  for (const span of sorted) {
-    const last = merged.at(-1);
-    if (last && span.start < last.end) {
-      last.end = Math.max(last.end, span.end);
-      last.secret ||= span.secret;
-    } else merged.push({ ...span });
+function absorbHits(text, needles, hits, span) {
+  let grew = false;
+  for (const [index, needle] of needles.entries()) {
+    while (hits[index] !== -1 && hits[index] < span.end) {
+      span.end = Math.max(span.end, hits[index] + needle.text.length);
+      span.secret ||= needle.secret;
+      hits[index] = nextHit(text, needle, hits[index] + 1);
+      grew = true;
+    }
   }
-  return merged;
+  return grew;
+}
+
+function firstSpan(text, needles, hits) {
+  let first = -1;
+  for (const [index, hit] of hits.entries()) {
+    if (hit !== -1 && (first === -1 || hit < hits[first])) first = index;
+  }
+  if (first === -1) return null;
+  const start = hits[first];
+  const span = { start, end: start + needles[first].text.length, secret: needles[first].secret };
+  hits[first] = nextHit(text, needles[first], start + 1);
+  while (absorbHits(text, needles, hits, span));
+  return span;
 }
 
 /**
  * Replaces env values with [redacted] and repository root paths with a dot. Overlapping
  * matches merge into one span, and a span that touches an env value is always redacted.
+ * It keeps one pending hit per needle, so memory stays flat on huge logs.
  */
 export function redactText(text, { values, roots = [] }) {
-  const spans = [
-    ...values.flatMap((value) => occurrences(text, value, true)),
-    ...roots.flatMap((root) => occurrences(text, root, false)),
+  const needles = [
+    ...values.filter(Boolean).map((value) => ({ text: value, secret: true })),
+    ...roots.filter(Boolean).map((root) => ({ text: root, secret: false })),
   ];
-  let result = "";
+  const hits = needles.map((needle) => nextHit(text, needle, 0));
+  const parts = [];
   let at = 0;
-  for (const span of mergeSpans(spans)) {
-    result += text.slice(at, span.start) + (span.secret ? "[redacted]" : ".");
+  for (let span = firstSpan(text, needles, hits); span; span = firstSpan(text, needles, hits)) {
+    parts.push(text.slice(at, span.start), span.secret ? "[redacted]" : ".");
     at = span.end;
   }
-  return result + text.slice(at);
+  parts.push(text.slice(at));
+  return parts.join("");
 }
 
 export function redactDeep(value, scrubber) {

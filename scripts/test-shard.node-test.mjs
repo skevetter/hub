@@ -638,6 +638,12 @@ test("overlapping env values and root paths merge and stay redacted", () => {
   assert.equal(scrub("p=/repo/x?k=1&t", ["/repo/x?k=1"], ["/repo"]), "p=[redacted]&t");
   assert.equal(scrub("a /repo/b and tok", ["tok"], ["/repo"]), "a ./b and [redacted]");
   assert.equal(scrub("pw%21123 pw!123", ["pw%21123", "pw!123"], []), "[redacted] [redacted]");
+  assert.equal(scrub("aSYNTHa aSYNTHaSYNTHa", ["aSYNTHa"], []), "[redacted] [redacted]");
+  assert.equal(scrub("aSYNTHaSYNTHa", ["aSYNTHa"], []), "[redacted]");
+  assert.equal(scrub("keep this", ["", "zzz"], [""]), "keep this");
+  assert.equal(scrub("x.y x+y", ["x.y"], []), "[redacted] x+y");
+  assert.equal(scrub("abcd", ["ab", "cd"], []), "[redacted][redacted]");
+  assert.equal(scrub("abcd", ["abc", "bcd"], []), "[redacted]");
 });
 
 test("a named project prefix on the FAIL line still names the file", () => {
