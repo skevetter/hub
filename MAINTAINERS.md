@@ -32,7 +32,8 @@ uses Oxfmt, not Prettier.
 
 [Main](.github/workflows/main.yml) checks the pushed commit and packs that exact commit in a
 scratch checkout. The version comes from Conventional Commits. The checkout's version stays
-unchanged. The tarball includes a shrinkwrap and the package job checks the installed tree before
+unchanged. The package job extracts the tarball, runs `npm ci --omit=dev --legacy-peer-deps`,
+and checks the production tree against the bundled shrinkwrap before
 it can be published. The build branch produces a workflow artifact. Only `main` creates a tag and
 GitHub Release with the tarball and its checksum.
 
@@ -43,8 +44,10 @@ manually from `main` with its exact SHA.
 
 Automatic deploys take a backup, install, and check the service. A failed smoke check rolls back
 and pauses deployment. Mark incompatible migrations and persisted data changes `rollback-unsafe`
-on the PR. The pipeline publishes those releases and waits for a manual start. Manual deployments
-do not roll back automatically. See the `cd-alert` issues for failed or held releases.
+on the PR. The pipeline publishes held releases as prereleases. It keeps the hold on subsequent
+releases until a successful manual deploy promotes a prerelease. Held deployments do not roll back
+automatically. Only the repository owner can unpause. See the `cd-alert` issues for failed or held
+releases.
 
 ## Update public documentation
 

@@ -1,12 +1,10 @@
-import { commitSubjects, git, latestTag } from "./git.mjs";
+import { commitSubjects, git, latestTag, releaseTag } from "./git.mjs";
 
 export const conventional = /^([a-z]+)(?:\([^()\n]+\))?(!)?: /u;
-export const releaseTag = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
 
 export function nextVersion(tag, subjects, bodies = []) {
-  if (tag === "") return "v1.0.0";
   const match = releaseTag.exec(tag);
-  if (!match) throw new Error("Last release tag must use v<major>.<minor>.<patch>");
+  if (!match || match[1] === "0") return "v1.0.0";
   const [major, minor, patch] = match.slice(1).map(BigInt);
   if (subjects.some((subject) => conventional.exec(subject)?.[2]) || bodies.some(isBreaking)) {
     return `v${major + 1n}.0.0`;

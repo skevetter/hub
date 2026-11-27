@@ -3,10 +3,13 @@ set -euo pipefail
 
 artifact="$1"
 source_dir="$PWD"
-prefix="$RUNNER_TEMP/hub-install"
+scratch=$(mktemp -d "$RUNNER_TEMP/hub-install.XXXXXXXX")
+trap 'rm -r -- "$scratch"' EXIT
 
-tar -xOzf "$artifact" package/npm-shrinkwrap.json | cmp - npm-shrinkwrap.json
-cd "$prefix"
-npm_config_userconfig="$prefix/user.npmrc" npm_config_globalconfig="$prefix/global.npmrc" \
-  npm install --global --prefix "$prefix" --legacy-peer-deps=false --no-audit --no-fund "$artifact"
-node "$source_dir/scripts/cd/verify-install.mjs" "$source_dir/npm-shrinkwrap.json" "$prefix"
+tar -xzf "$artifact" -C "$scratch"
+cmp npm-shrinkwrap.json "$scratch/package/npm-shrinkwrap.json"
+cd "$scratch/package"
+[[ ! -e .npmrc ]]
+npm_config_userconfig="$scratch/user.npmrc" npm_config_globalconfig="$scratch/global.npmrc" \
+  npm ci --omit=dev --legacy-peer-deps --no-audit --no-fund
+node "$source_dir/scripts/cd/verify-install.mjs" "$PWD"

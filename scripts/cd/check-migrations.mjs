@@ -1,25 +1,100 @@
 import { readFileSync } from "node:fs";
-import { diffPaths, shaPattern } from "./git.mjs";
+import { diffPaths, git, releaseTag, shaPattern } from "./git.mjs";
 
+const identifier = String.raw`(?:"(?:[^"]|"")+"|[\w$]+)`;
+const tableName = String.raw`(?:${identifier}\s*\.\s*)?${identifier}`;
 const unsafe = [
-  /\b(?:drop|rename)\s+\b/iu,
-  /\balter\b[^;]*\b(?:type|set\s+not\s+null)\s*\b/iu,
-  /\b(?:update\s+(?!cascade\b|restrict\b|no\s+action\b|set\s+null\b|set\s+default\b)|delete\s+from\s+)[^;]+/iu,
+  /\b(?:truncate|drop|rename)\s+/iu,
+  /\balter\s+(?:column\s+)?(?:"(?:[^"]|"")+"|[\w$]+)\s+(?:set\s+data\s+)?type\b/iu,
+  /\bset\s+not\s+null\b/iu,
+  /\balter\s+type\b[^;]*\badd\s+value\b/iu,
+  /\b(?:insert\s+into|delete\s+from)\s+/iu,
+  new RegExp(
+    String.raw`\bupdate\s+(?:only\s+)?${tableName}(?:\s+(?:as\s+)?${identifier})?\s+set\b`,
+    "iu",
+  ),
 ];
 
-export function needsRollbackReview(sql) {
-  const statements = sql.replaceAll(/--[^\n]*|\/\*[\s\S]*?\*\//gu, " ");
-  return unsafe.some((pattern) => pattern.test(statements));
+const createTable = new RegExp(String.raw`^\s*create\s+table\s+(${tableName})\s*\(`, "iu");
+const alterTable = new RegExp(String.raw`^\s*alter\s+table\s+(?:only\s+)?(${tableName})\s+`, "iu");
+const uniqueIndex = new RegExp(
+  String.raw`^\s*create\s+unique\s+index\b[^;]*?\bon\s+(?:only\s+)?(${tableName})`,
+  "iu",
+);
+
+function canonicalTable(name) {
+  const parts = name.match(new RegExp(identifier, "gu"));
+  return JSON.stringify(
+    parts.map((part) =>
+      part.startsWith('"') ? part.slice(1, -1).replaceAll('""', '"') : part.toLowerCase(),
+    ),
+  );
+}
+
+function isUnsafe(statement, newTables, existingTables) {
+  if (unsafe.some((pattern) => pattern.test(statement))) return true;
+  const created = createTable.exec(statement);
+  if (created) {
+    const table = canonicalTable(created[1]);
+    if (!existingTables.has(table)) newTables.add(table);
+  }
+
+  const added = statement
+    .split(/,\s*(?=(?:add|alter|drop|rename)\b)/iu)
+    .filter((clause) =>
+      /\badd\s+(?!constraint\b|unique\b|check\b|foreign\b|primary\b)/iu.test(clause),
+    );
+  if (added.some((column) => /\bnot\s+null\b/iu.test(column) && !/\bdefault\b/iu.test(column))) {
+    return true;
+  }
+  const index = uniqueIndex.exec(statement);
+  if (index) return !newTables.has(canonicalTable(index[1]));
+  const alter = alterTable.exec(statement);
+  return Boolean(
+    alter && /\badd\b[^;]*\bunique\b/iu.test(statement) && !newTables.has(canonicalTable(alter[1])),
+  );
+}
+
+function statements(sql) {
+  const stripped = sql.replaceAll(/'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\//gu, " ");
+  return stripped.split(";");
+}
+
+export function needsRollbackReview(sql, newTables = new Set(), existingTables = new Set()) {
+  return statements(sql).some((statement) => isUnsafe(statement, newTables, existingTables));
+}
+
+function migrationPaths(base, filter) {
+  const paths = base ? diffPaths(base, filter) : git("ls-files", "-z", "--", "drizzle").split("\0");
+  return paths.filter((path) => /^drizzle\/[^/]+\.sql$/u.test(path)).sort();
+}
+
+function previouslyCreated(base) {
+  if (!base) return new Set();
+  const found = migrationPaths(base, "M").flatMap((file) => {
+    const created = statements(git("show", `${base}:${file}`)).map((sql) => createTable.exec(sql));
+    return created.filter(Boolean).map((match) => canonicalTable(match[1]));
+  });
+  return new Set(found);
 }
 
 if (import.meta.main && process.env.ROLLBACK_UNSAFE !== "true") {
+  const release = process.argv[2] === "--release";
   const base = process.env.BASE_SHA ?? "";
-  if (!shaPattern.test(base)) throw new Error("Missing migration comparison base");
-  const changed = diffPaths(base, "AM").filter((path) => /^drizzle\/[^/]+\.sql$/u.test(path));
-  for (const file of changed) {
+  if (!shaPattern.test(base) && !(release && (!base || releaseTag.test(base)))) {
+    throw new Error("Invalid migration comparison base");
+  }
+  const newTables = new Set();
+  const existingTables = previouslyCreated(base);
+  for (const file of migrationPaths(base, "AM")) {
     const sql = readFileSync(file, "utf8");
-    if (!needsRollbackReview(sql)) continue;
+    if (!needsRollbackReview(sql, newTables, existingTables)) continue;
+    if (release) {
+      console.log("true");
+      process.exit(0);
+    }
     console.error(`${JSON.stringify(file)} needs rollback review and the rollback-unsafe label`);
     process.exitCode = 1;
   }
+  if (release) console.log("false");
 }

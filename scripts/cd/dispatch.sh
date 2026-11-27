@@ -2,13 +2,10 @@
 set -euo pipefail
 
 find_release_tag() {
-  local tag
-  local -a tags=()
-  while IFS= read -r tag; do
-    if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then tags+=("$tag"); fi
-  done < <(git tag --points-at "$DEPLOY_SHA" --list 'v[0-9]*')
-  [[ "${#tags[@]}" == 1 ]] || return 1
-  printf '%s\n' "${tags[0]}"
+  local tags
+  tags=$(node scripts/cd/git.mjs at "$DEPLOY_SHA") || return
+  [[ -n "$tags" && "$tags" != *$'\n'* ]] || return 1
+  printf '%s\n' "$tags"
 }
 
 confirm_ci() {
@@ -26,16 +23,21 @@ confirm_ci() {
 }
 
 read_release() {
-  local tag="$1" version="${1#v}" file digest listing
+  local tag="$1" version="${1#v}" file digest listing prerelease
   file="getpaseo-hub-$version.tgz"
   listing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag")
-  digest=$(jq -er --arg file "$file" '
-    select(.draft == false) | .assets[] | select(.name == $file and .state == "uploaded") |
-    .digest | select(test("^sha256:[0-9a-f]{64}$")) | ltrimstr("sha256:")
+  digest=$(jq -er --arg file "$file" --arg tag "$tag" '
+    def bot: . == "github-actions[bot]";
+    def asset($name): [.assets[] | select(.name == $name and .state == "uploaded" and (.uploader.login | bot))] |
+      select(length == 1) | .[0];
+    select(.draft == false and .tag_name == $tag and (.author.login | bot)) |
+    select(asset($file + ".sha256")) |
+    asset($file).digest | select(type == "string" and test("\\Asha256:[0-9a-f]{64}\\z")) | ltrimstr("sha256:")
   ' <<< "$listing")
+  prerelease=$(jq -r '.prerelease | if type == "boolean" then . else error("Invalid release type") end' <<< "$listing")
   gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$file.sha256" --dir "$RUNNER_TEMP"
-  grep -Fx -- "$digest  $file" "$RUNNER_TEMP/$file.sha256" >/dev/null
-  printf 'version=%s\nchecksum=%s\n' "$version" "$digest" >> "$GITHUB_OUTPUT"
+  cmp -s "$RUNNER_TEMP/$file.sha256" <(printf '%s  %s\n' "$digest" "$file")
+  printf 'version=%s\nchecksum=%s\nprerelease=%s\n' "$version" "$digest" "$prerelease" >> "$GITHUB_OUTPUT"
 }
 
 [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]

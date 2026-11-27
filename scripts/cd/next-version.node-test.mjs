@@ -15,10 +15,11 @@ test("uses the largest conventional bump", () => {
   assert.equal(nextVersion("v2.3.4", ["remove a warning"]), "v2.3.5");
 });
 
-test("uses breaking footers and rejects malformed tags", () => {
+test("uses breaking footers and starts fresh after an upstream v0 tag", () => {
   assert.equal(
     nextVersion("v2.3.4", ["chore: rename"], ["Notes\n\nBREAKING CHANGE: rename"]),
     "v3.0.0",
   );
-  assert.throws(() => nextVersion("v2.3", []), /Last release tag/u);
+  assert.equal(nextVersion("v0.11.0", ["feat!: breaking"]), "v1.0.0");
+  assert.equal(nextVersion("v2.3", []), "v1.0.0");
 });
