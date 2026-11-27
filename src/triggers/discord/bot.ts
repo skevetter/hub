@@ -124,11 +124,20 @@ export function createDiscordBotClient(options: CreateDiscordBotClientOptions): 
         GatewayIntentBits.MessageContent,
       ],
     });
+  const subscriptions = discordSubscriptions(client, options);
+  return {
+    ...discordLifecycle(client, options),
+    ...discordMessageOperations(client),
+    ...subscriptions,
+  };
+}
+
+function discordSubscriptions(
+  client: Client,
+  options: CreateDiscordBotClientOptions,
+): Pick<DiscordBotClient, "onMessageCreate" | "onGuildDelete"> {
   const handlers = new Set<DiscordRawMessageHandler>();
   const guildDeleteHandlers = new Set<DiscordGuildDeleteHandler>();
-  const pendingReplyDestinations = new Map<string, Promise<DiscordSendableChannel>>();
-  let started = false;
-
   client.on("messageCreate", (message: Message) => {
     void Promise.all(Array.from(handlers, (handler) => handler(message))).catch(
       (error: unknown) => {
@@ -162,6 +171,25 @@ export function createDiscordBotClient(options: CreateDiscordBotClientOptions): 
     );
   });
 
+  return {
+    onMessageCreate(handler) {
+      handlers.add(handler);
+      return () => {
+        handlers.delete(handler);
+      };
+    },
+    onGuildDelete(handler) {
+      guildDeleteHandlers.add(handler);
+      return () => guildDeleteHandlers.delete(handler);
+    },
+  };
+}
+
+function discordLifecycle(
+  client: Client,
+  options: CreateDiscordBotClientOptions,
+): Pick<DiscordBotClient, "start" | "stop" | "getSelfUserId"> {
+  let started = false;
   return {
     async start() {
       if (started) {
@@ -197,6 +225,22 @@ export function createDiscordBotClient(options: CreateDiscordBotClientOptions): 
       }
       return DiscordSnowflakeSchema.parse(id);
     },
+  };
+}
+
+function discordMessageOperations(
+  client: Client,
+): Pick<
+  DiscordBotClient,
+  | "createReaction"
+  | "deleteOwnReaction"
+  | "sendChannelMessage"
+  | "sendConversationReply"
+  | "readMessage"
+  | "readThreadMessages"
+> {
+  const pendingReplyDestinations = new Map<string, Promise<DiscordSendableChannel>>();
+  return {
     async createReaction(input) {
       await ignoreDeletedMessage(async () => {
         const message = await fetchMessage(
@@ -239,36 +283,33 @@ export function createDiscordBotClient(options: CreateDiscordBotClientOptions): 
       );
       return normalizeContextMessage(message);
     },
-    async readThreadMessages(input) {
-      const channelId = DiscordSnowflakeSchema.parse(input.channelId);
-      const beforeMessageId = DiscordSnowflakeSchema.parse(input.beforeMessageId);
-      const channel = await client.channels.fetch(channelId);
-      if (channel === null || !isThreadChannel(channel)) {
-        throw new Error(`discord channel is not a readable thread: ${input.channelId}`);
-      }
-      const [starter, page] = await Promise.all([
-        channel.fetchStarterMessage(),
-        channel.messages.fetch({ before: beforeMessageId, limit: DISCORD_THREAD_CONTEXT_LIMIT }),
-      ]);
-      if (starter === null) throw new Error("Discord thread starter unavailable");
-      const replies = Array.from(page.values())
-        .filter((message) => message.id !== beforeMessageId && message.id !== starter.id)
-        .map(normalizeContextMessage)
-        .sort(compareThreadMessages)
-        .slice(-(DISCORD_THREAD_CONTEXT_LIMIT - 1));
-      return [normalizeContextMessage(starter), ...replies];
-    },
-    onMessageCreate(handler) {
-      handlers.add(handler);
-      return () => {
-        handlers.delete(handler);
-      };
-    },
-    onGuildDelete(handler) {
-      guildDeleteHandlers.add(handler);
-      return () => guildDeleteHandlers.delete(handler);
+    readThreadMessages(input) {
+      return readThreadMessages(client, input);
     },
   };
+}
+
+async function readThreadMessages(
+  client: Client,
+  input: Parameters<DiscordBotClient["readThreadMessages"]>[0],
+): ReturnType<DiscordBotClient["readThreadMessages"]> {
+  const channelId = DiscordSnowflakeSchema.parse(input.channelId);
+  const beforeMessageId = DiscordSnowflakeSchema.parse(input.beforeMessageId);
+  const channel = await client.channels.fetch(channelId);
+  if (channel === null || !isThreadChannel(channel)) {
+    throw new Error(`discord channel is not a readable thread: ${input.channelId}`);
+  }
+  const [starter, page] = await Promise.all([
+    channel.fetchStarterMessage(),
+    channel.messages.fetch({ before: beforeMessageId, limit: DISCORD_THREAD_CONTEXT_LIMIT }),
+  ]);
+  if (starter === null) throw new Error("Discord thread starter unavailable");
+  const replies = Array.from(page.values())
+    .filter((message) => message.id !== beforeMessageId && message.id !== starter.id)
+    .map(normalizeContextMessage)
+    .sort(compareThreadMessages)
+    .slice(-(DISCORD_THREAD_CONTEXT_LIMIT - 1));
+  return [normalizeContextMessage(starter), ...replies];
 }
 
 async function ignoreDeletedMessage(operation: () => Promise<void>): Promise<void> {

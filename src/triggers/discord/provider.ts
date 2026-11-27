@@ -1,4 +1,7 @@
-import type { ProjectConfigurationStore } from "../../configuration/store.js";
+import type {
+  ProjectConfigurationStore,
+  StoredProjectConfiguration,
+} from "../../configuration/store.js";
 import type {
   AttachmentCapabilityRegistry,
   AttachmentDescriptor,
@@ -6,6 +9,8 @@ import type {
 import { reportFailure } from "../../failures/index.js";
 import { agentFailureNotice, missingBillingUrl } from "../failure-notice.js";
 import {
+  type ExternalTrigger,
+  type TriggerContextMaterialization,
   type TriggerProvider,
   type TriggerProviderMatch,
   type TriggerProviderReactionState,
@@ -90,137 +95,179 @@ export interface DiscordOutputContext {
 
 type DiscordReactionPhase = "accepted" | "started";
 
-export function createDiscordTriggerProvider(options: {
-  configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
-  bot: DiscordBotClient;
-  attachments?: AttachmentCapabilityRegistry;
-  billingUrlForOrganization?: (organizationId: string) => Promise<string>;
-}): TriggerProvider<
+type DiscordProvider = TriggerProvider<
   "discord",
   DiscordTriggerContext,
   DiscordOutputContext,
   DiscordMaterializedContext
-> {
+>;
+
+interface DiscordProviderOptions {
+  configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
+  bot: DiscordBotClient;
+  attachments?: AttachmentCapabilityRegistry;
+  billingUrlForOrganization?: (organizationId: string) => Promise<string>;
+}
+
+export function createDiscordTriggerProvider(options: DiscordProviderOptions): DiscordProvider {
   return {
     name: "discord",
     eventNames: ["discord.mention"],
-    async match(externalTrigger) {
-      const event = NormalizedDiscordMessageEventSchema.parse(externalTrigger.payload);
-      const stored = await options
-        .configurationStoreForProject(externalTrigger.projectId)
-        .getRevision(externalTrigger.configurationRevisionId);
-      if (stored === undefined) return "configuration_unavailable";
-      if (
-        !stored.configuration.triggers.some((candidate) => candidate.on === externalTrigger.source)
-      )
-        return "no_trigger_for_source";
-      const botClientId = options.bot.getSelfUserId();
-      const matches: TriggerProviderMatch<DiscordTriggerContext, DiscordOutputContext>[] = [];
+    match(externalTrigger) {
+      return matchDiscordTrigger(options, externalTrigger);
+    },
+    materializeContext(launch) {
+      return materializeDiscordContext(options, launch);
+    },
+    ...discordReactionHooks(options),
+  };
+}
 
-      for (const match of matchDiscordTriggers(
-        stored.configuration,
-        event,
-        botClientId,
-        externalTrigger.connectionId,
-      )) {
-        const compiledTrigger = stored.configuration.triggers.find(
-          (candidate) => candidate.name === match.trigger.name,
-        );
-        if (compiledTrigger === undefined)
-          throw new Error(`compiled trigger not found: ${match.trigger.name}`);
-        const outputContext: DiscordOutputContext = {
-          provider: "discord",
-          guildId: event.guildId,
-          channelId: event.channelId,
-          threadId: event.threadId,
-          messageId: event.messageId,
-        };
-        const triggerContext: DiscordTriggerContext = {
-          provider: "discord",
-          organizationId: externalTrigger.organizationId,
-          target: outputContext,
-          event: buildDiscordMergeData(event, botClientId, externalTrigger.connectionId),
-        };
-        const invocation = parseInvocation(
-          event.content,
-          compiledTrigger.inputs,
-          undefined,
-          readDiscordInvocationParserMessage(event, botClientId, compiledTrigger.filters),
-        );
-        if (invocation.status === "accepted") {
-          if (!matchesInputFilters(invocation.inputs, compiledTrigger.filters?.inputs)) continue;
-        }
-        if (invocation.status === "rejected") {
-          matches.push({
-            conversation: {
-              key: JSON.stringify(["discord", event.guildId, event.threadId ?? event.messageId]),
-              label: "Discord thread",
-            },
-            triggerName: match.trigger.name,
-            triggerContext,
-            outputContext,
-            configurationRevisionId: stored.revision.id,
-            hubConfig: stored.configuration,
-            invocation,
-          });
-          continue;
-        }
-        matches.push({
-          conversation: {
-            key: JSON.stringify(["discord", event.guildId, event.threadId ?? event.messageId]),
-            label: "Discord thread",
-          },
-          triggerName: match.trigger.name,
-          triggerContext,
-          outputContext,
-          configurationRevisionId: stored.revision.id,
-          hubConfig: stored.configuration,
-          invocation,
+async function matchDiscordTrigger(
+  options: DiscordProviderOptions,
+  externalTrigger: ExternalTrigger,
+): ReturnType<DiscordProvider["match"]> {
+  const event = NormalizedDiscordMessageEventSchema.parse(externalTrigger.payload);
+  const stored = await options
+    .configurationStoreForProject(externalTrigger.projectId)
+    .getRevision(externalTrigger.configurationRevisionId);
+  if (stored === undefined) return "configuration_unavailable";
+  if (!stored.configuration.triggers.some((candidate) => candidate.on === externalTrigger.source))
+    return "no_trigger_for_source";
+  const botClientId = options.bot.getSelfUserId();
+  const matchedTriggers = matchDiscordTriggers(
+    stored.configuration,
+    event,
+    botClientId,
+    externalTrigger.connectionId,
+  );
+  const matches: TriggerProviderMatch<DiscordTriggerContext, DiscordOutputContext>[] = [];
+  for (const { trigger: matchedTrigger } of matchedTriggers) {
+    const match = buildDiscordMatch({
+      triggerName: matchedTrigger.name,
+      stored,
+      event,
+      botClientId,
+      externalTrigger,
+    });
+    if (match !== undefined) matches.push(match);
+  }
+  return matches.length === 0 ? "trigger_filters_rejected" : matches;
+}
+
+function buildDiscordMatch({
+  triggerName,
+  stored,
+  event,
+  botClientId,
+  externalTrigger,
+}: {
+  triggerName: string;
+  stored: StoredProjectConfiguration;
+  event: NormalizedDiscordMessageEvent;
+  botClientId: string;
+  externalTrigger: ExternalTrigger;
+}): TriggerProviderMatch<DiscordTriggerContext, DiscordOutputContext> | undefined {
+  const compiledTrigger = stored.configuration.triggers.find(
+    (candidate) => candidate.name === triggerName,
+  );
+  if (compiledTrigger === undefined) throw new Error(`compiled trigger not found: ${triggerName}`);
+  const outputContext: DiscordOutputContext = {
+    provider: "discord",
+    guildId: event.guildId,
+    channelId: event.channelId,
+    threadId: event.threadId,
+    messageId: event.messageId,
+  };
+  const triggerContext: DiscordTriggerContext = {
+    provider: "discord",
+    organizationId: externalTrigger.organizationId,
+    target: outputContext,
+    event: buildDiscordMergeData(event, botClientId, externalTrigger.connectionId),
+  };
+  const invocation = parseInvocation(
+    event.content,
+    compiledTrigger.inputs,
+    undefined,
+    readDiscordInvocationParserMessage(event, botClientId, compiledTrigger.filters),
+  );
+  if (
+    invocation.status === "accepted" &&
+    !matchesInputFilters(invocation.inputs, compiledTrigger.filters?.inputs)
+  ) {
+    return undefined;
+  }
+  const base = {
+    conversation: {
+      key: JSON.stringify(["discord", event.guildId, event.threadId ?? event.messageId]),
+      label: "Discord thread",
+    },
+    triggerName,
+    triggerContext,
+    outputContext,
+    configurationRevisionId: stored.revision.id,
+    hubConfig: stored.configuration,
+  };
+  if (invocation.status === "rejected") return { ...base, invocation };
+  return { ...base, invocation };
+}
+
+async function materializeDiscordContext(
+  options: DiscordProviderOptions,
+  launch: TriggerContextMaterialization<DiscordTriggerContext>,
+): Promise<DiscordMaterializedContext> {
+  const event = launch.triggerContext.event.discord;
+  const messages =
+    event.trigger_message.thread === null
+      ? []
+      : await options.bot.readThreadMessages({
+          channelId: event.trigger_message.thread.id,
+          beforeMessageId: event.trigger_message.id,
         });
-      }
-
-      return matches.length === 0 ? "trigger_filters_rejected" : matches;
+  const contextMessages = await Promise.all(
+    messages.map((message) =>
+      materializeDiscordMessage(message, {
+        providerEventReceiptId: launch.providerEventReceiptId,
+        organizationId: launch.organizationId,
+        connectionId: launch.triggerContext.event.discord.connection_id,
+        executionId: launch.executionId,
+        attachments: options.attachments,
+      }),
+    ),
+  );
+  const referencedMessage = await materializeReferencedMessage(
+    event.trigger_message.referenced_message,
+    { source: messages, materialized: contextMessages },
+    {
+      launch,
+      bot: options.bot,
+      attachments: options.attachments,
+      connectionId: event.connection_id,
     },
-    async materializeContext(launch) {
-      const event = launch.triggerContext.event.discord;
-      const messages =
+  );
+  return {
+    discord: {
+      referenced_message: referencedMessage,
+      thread:
         event.trigger_message.thread === null
-          ? []
-          : await options.bot.readThreadMessages({
-              channelId: event.trigger_message.thread.id,
-              beforeMessageId: event.trigger_message.id,
-            });
-      const contextMessages = await Promise.all(
-        messages.map((message) =>
-          materializeDiscordMessage(
-            message,
-            launch.providerEventReceiptId,
-            launch.organizationId,
-            launch.triggerContext.event.discord.connection_id,
-            launch.executionId,
-            options.attachments,
-          ),
-        ),
-      );
-      const referencedMessage = await materializeReferencedMessage(
-        event.trigger_message.referenced_message,
-        messages,
-        contextMessages,
-        launch,
-        options.bot,
-        options.attachments,
-        event.connection_id,
-      );
-      return {
-        discord: {
-          referenced_message: referencedMessage,
-          thread:
-            event.trigger_message.thread === null
-              ? null
-              : { ...event.trigger_message.thread, messages: contextMessages },
-        },
-      };
+          ? null
+          : { ...event.trigger_message.thread, messages: contextMessages },
     },
+  };
+}
+
+type DiscordReactionHooks = Pick<
+  DiscordProvider,
+  | "onDispatchAccepted"
+  | "onAgentExecutionStarted"
+  | "onAgentExecutionCompleted"
+  | "onWorkflowRunCanceled"
+  | "onAgentExecutionFailed"
+  | "onMachineTerminated"
+>;
+
+function discordReactionHooks(options: DiscordProviderOptions): DiscordReactionHooks {
+  return {
     async onDispatchAccepted(triggerContext, _outputContext, reactionState) {
       if (discordReactionPhase(reactionState) !== undefined) return reactionState;
       await reactSafely(options.bot, triggerContext.target, "eyes");
@@ -271,37 +318,58 @@ export function createDiscordTriggerProvider(options: {
   };
 }
 
+type DiscordAttachmentContext = Pick<
+  TriggerContextMaterialization<DiscordTriggerContext>,
+  "executionId" | "organizationId" | "providerEventReceiptId"
+> & {
+  connectionId: string | null;
+  attachments: AttachmentCapabilityRegistry | undefined;
+};
+
+interface DiscordThreadMessages {
+  source: NormalizedDiscordContextMessage[];
+  materialized: DiscordMaterializedMessage[];
+}
+
+interface DiscordReferenceContext {
+  launch: TriggerContextMaterialization<DiscordTriggerContext>;
+  bot: DiscordBotClient;
+  attachments: AttachmentCapabilityRegistry | undefined;
+  connectionId: string | null;
+}
+
+// Materialization creates one result per source message, in index order.
+function materializeReferencedMessage(
+  reference: DiscordMergeMessage["referenced_message"],
+  messages: DiscordThreadMessages,
+  context: DiscordReferenceContext,
+): Promise<DiscordMaterializedMessage | null>;
 async function materializeReferencedMessage(
   reference: DiscordMergeMessage["referenced_message"],
-  sourceMessages: NormalizedDiscordContextMessage[],
-  materializedMessages: DiscordMaterializedMessage[],
-  launch: {
-    executionId: string;
-    organizationId: string;
-    providerEventReceiptId: string;
-  },
-  bot: DiscordBotClient,
-  attachments: AttachmentCapabilityRegistry | undefined,
-  connectionId: string | null,
-): Promise<DiscordMaterializedMessage | null> {
+  messages: DiscordThreadMessages,
+  { launch, bot, attachments, connectionId }: DiscordReferenceContext,
+): Promise<DiscordMaterializedMessage | null | undefined> {
   if (reference === null) return null;
-  const existingIndex = sourceMessages.findIndex(
+  const existingIndex = messages.source.findIndex(
     (message) => message.id === reference.id && message.channelId === reference.channel_id,
   );
-  if (existingIndex !== -1) return materializedMessages[existingIndex]!;
+  if (existingIndex !== -1) {
+    const existing = messages.materialized[existingIndex];
+    if (existing === undefined) return undefined;
+    return existing;
+  }
 
   const message = await bot.readMessage({
     channelId: reference.channel_id,
     messageId: reference.id,
   });
-  return materializeDiscordMessage(
-    message,
-    launch.providerEventReceiptId,
-    launch.organizationId,
+  return materializeDiscordMessage(message, {
+    providerEventReceiptId: launch.providerEventReceiptId,
+    organizationId: launch.organizationId,
     connectionId,
-    launch.executionId,
+    executionId: launch.executionId,
     attachments,
-  );
+  });
 }
 
 async function deleteReactionForPhase(
@@ -395,11 +463,13 @@ function buildDiscordMergeMessage(
 
 async function registerAttachments(
   source: NormalizedDiscordContextMessage["attachments"],
-  providerEventReceiptId: string,
-  organizationId: string,
-  connectionId: string | null,
-  executionId: string,
-  attachments: AttachmentCapabilityRegistry | undefined,
+  {
+    providerEventReceiptId,
+    organizationId,
+    connectionId,
+    executionId,
+    attachments,
+  }: DiscordAttachmentContext,
 ): Promise<AttachmentDescriptor[]> {
   if (source.length === 0) return [];
   if (attachments === undefined) throw new Error("attachment capability unavailable");
@@ -426,20 +496,9 @@ async function registerAttachments(
 
 async function materializeDiscordMessage(
   message: NormalizedDiscordContextMessage,
-  providerEventReceiptId: string,
-  organizationId: string,
-  connectionId: string | null,
-  executionId: string,
-  attachments: AttachmentCapabilityRegistry | undefined,
+  context: DiscordAttachmentContext,
 ): Promise<DiscordMaterializedMessage> {
-  const materializedAttachments = await registerAttachments(
-    message.attachments,
-    providerEventReceiptId,
-    organizationId,
-    connectionId,
-    executionId,
-    attachments,
-  );
+  const materializedAttachments = await registerAttachments(message.attachments, context);
   return Object.assign(buildDiscordMergeMessage(message), {
     attachments: materializedAttachments,
   });

@@ -156,15 +156,23 @@ function createEvent(
     parentChannelId: overrides.parentChannelId ?? null,
     messageId: "300",
     content: overrides.content ?? `<@${BOT_ID}> ping`,
-    author: {
-      id: overrides.authorId ?? "400",
-      username: overrides.authorUsername ?? "author",
-      bot: overrides.authorBot ?? false,
-    },
+    author: createAuthor(overrides),
     mentionedUserIds: overrides.mentionedUserIds ?? [BOT_ID],
     mentionedBotRoleIds: overrides.mentionedBotRoleIds ?? [],
     attachments: [],
     referencedMessage: null,
     createdAt: "2026-05-19T00:00:00.000Z",
+  };
+}
+
+function createAuthor(overrides: {
+  authorId?: string;
+  authorUsername?: string;
+  authorBot?: boolean;
+}): NormalizedDiscordMessageEvent["author"] {
+  return {
+    id: overrides.authorId ?? "400",
+    username: overrides.authorUsername ?? "author",
+    bot: overrides.authorBot ?? false,
   };
 }
