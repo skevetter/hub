@@ -11,6 +11,10 @@ const ssh = `#!/usr/bin/env bash
 command=\${@: -1}
 printf '%s\\n' "\${command%% *}" >> "$RUNNER_TEMP/calls"
 echo "$VPS2_SSH_HOST $RUNNER_TEMP/hub-deploy-key" >&2
+if [[ "$command" == "wait 60" && "$CLEAR_ROLLBACK_PAUSE" == yes ]] &&
+    grep -qx rollback "$RUNNER_TEMP/calls"; then
+  rm -f -- "$RUNNER_TEMP/paused"
+fi
 if [[ "$command" == "$SLOW_CALL" ]]; then
   node -p 'Date.now()' > "$RUNNER_TEMP/signal-time"
   kill -s "$SLOW_SIGNAL" "$DEPLOY_PID"
@@ -49,13 +53,24 @@ case "$command" in
         invalid) echo '{"ok":false,"state":"failed","code":"ok"}'; exit 3 ;;
       esac
     fi
-    if grep -qx rollback "$RUNNER_TEMP/calls"; then echo cd-failed > "$RUNNER_TEMP/paused"; fi
+    if grep -qx rollback "$RUNNER_TEMP/calls"; then
+      if [[ "$ROLLBACK_WAIT_FAIL" == yes ]]; then
+        echo '{"ok":false,"state":"failed","code":"restart"}'; exit 3
+      fi
+      if [[ "$CLEAR_ROLLBACK_PAUSE" != yes ]]; then echo cd-failed > "$RUNNER_TEMP/paused"; fi
+    fi
     echo '{"ok":true,"state":"done","operation":"rollback"}' ;;
   wait*) echo '{"ok":true,"state":"done"}' ;;
   record*) if [[ "$RECORD_FAIL" == yes ]]; then echo '{"ok":false}'; exit 4; fi
     echo '{"ok":true}' ;;
   pause*)
     [[ " $* " == *" ConnectTimeout=5 "* ]] || exit 4
+    if grep -qx rollback "$RUNNER_TEMP/calls"; then
+      case "$REPAUSE" in
+        fail) echo '{"ok":false}'; exit 4 ;;
+        no-write) echo '{"ok":true}'; exit 0 ;;
+      esac
+    fi
     node -p 'Date.now()' > "$RUNNER_TEMP/pause-time"
     printf '%s\\n' "\${command#pause }" > "$RUNNER_TEMP/paused"
     echo '{"ok":true}' ;;
@@ -63,7 +78,10 @@ case "$command" in
     if [[ "$SMOKE_FAIL" == yes ]]; then echo '{"ok":false,"checks":{"local_health":false}}'; exit 3; fi
     echo '{"ok":true,"checks":{"local_health":true}}' ;;
   rollback)
-    if [[ "$REFUSE_ROLLBACK" == yes ]]; then echo '{"ok":false,"reason":"no-previous"}'; exit 2; fi
+    if [[ "$REFUSE_ROLLBACK" == yes ]]; then
+      rm -f -- "$RUNNER_TEMP/paused"
+      echo '{"ok":false,"reason":"no-previous"}'; exit 2
+    fi
     jq -cn --arg to "\${ROLLBACK_TO:-1.0.0}" --argjson started "\${ROLLBACK_STARTED:-true}" \\
       '{ok:true, started:$started, to:$to}' ;;
   "smoke \${ROLLBACK_TO:-1.0.0}")
@@ -267,26 +285,51 @@ test("waits and smokes even when the host reports a no-op rollback", () => {
   assert.equal(result.pauseReason, "cd-failed");
 });
 
-for (const [label, options, expectedCalls] of [
-  ["success", {}, ["pause", "rollback", "wait", "status", "smoke"]],
-  [
-    "smoke failure",
-    { ROLLBACK_SMOKE_FAIL: "yes" },
-    ["pause", "rollback", "wait", "status", "smoke"],
-  ],
-  ["refusal", { REFUSE_ROLLBACK: "yes" }, ["pause", "rollback"]],
-  ["wrong running version", { STATUS_VERSION: "1.1.0" }, ["pause", "rollback", "wait", "status"]],
+for (const [label, options, rollbackCalls] of [
+  ["success", {}, ["wait", "status", "smoke"]],
+  ["smoke failure", { ROLLBACK_SMOKE_FAIL: "yes" }, ["wait", "status", "smoke"]],
+  ["wait failure", { ROLLBACK_WAIT_FAIL: "yes" }, ["wait"]],
+  ["refusal", { REFUSE_ROLLBACK: "yes" }, []],
+  ["wrong running version", { STATUS_VERSION: "1.1.0" }, ["wait", "status"]],
 ]) {
-  test(`manual rollback leaves deploys paused on ${label}`, () => {
-    const result = execute("rollback", { ROLLBACK_TO: bootstrap, ...options });
+  test(`manual rollback restores and verifies the pause on ${label}`, () => {
+    const result = execute("rollback", {
+      CLEAR_ROLLBACK_PAUSE: "yes",
+      ROLLBACK_TO: bootstrap,
+      ...options,
+    });
     const success = label === "success";
     assert.equal(result.status, success ? 0 : 1, result.stderr);
-    assert.deepEqual(result.calls, expectedCalls);
+    assert.deepEqual(result.calls, ["pause", "rollback", ...rollbackCalls, "pause", "status"]);
     assert.equal(result.pauseReason, "cd-failed");
     assert.ok(result.summary.includes(success ? "Rollback completed." : "Rollback failed."));
     if (label === "refusal") assert.match(result.summary, /"reason":"no-previous"/u);
   });
 }
+
+test("manual rollback fails loudly if re-pausing fails or is not confirmed", () => {
+  for (const [REPAUSE, error] of [
+    ["fail", /::error::Unable to re-pause/u],
+    ["no-write", /::error::Unable to verify/u],
+  ]) {
+    const result = execute("rollback", { CLEAR_ROLLBACK_PAUSE: "yes", REPAUSE });
+    assert.equal(result.status, 1);
+    assert.equal(result.pauseReason, null);
+    assert.match(result.stderr, error);
+    assert.match(result.summary, /Rollback failed/u);
+  }
+});
+
+test("manual rollback re-pauses on TERM while wait is in flight", () => {
+  const result = execute("rollback", {
+    CLEAR_ROLLBACK_PAUSE: "yes",
+    SLOW_CALL: "wait 60",
+    SLOW_SIGNAL: "TERM",
+  });
+  assert.equal(result.status, 143, result.stderr);
+  assert.deepEqual(result.calls, ["pause", "rollback", "wait", "pause", "status", "slow-reply"]);
+  assert.equal(result.pauseReason, "cd-failed");
+});
 
 test("rolls back a dispatched stable release but never a held prerelease", () => {
   for (const PRERELEASE of ["false", "true"]) {
@@ -373,8 +416,28 @@ test("rejects malformed installed versions in smoke arguments and rollback repli
     assert.deepEqual(result.calls, []);
     const rollback = execute("rollback", { ROLLBACK_TO: version });
     assert.equal(rollback.status, 1);
-    assert.deepEqual(rollback.calls, ["pause", "rollback", "wait"]);
+    assert.deepEqual(rollback.calls, ["pause", "rollback", "wait", "pause", "status"]);
     assert.match(rollback.summary, /"to":null/u);
+  }
+});
+
+test("filters bootstrap out of the proposed precheck version but keeps it as the running version", () => {
+  for (const [version, expected] of [
+    ["1.1.0", "1.1.0"],
+    [bootstrap, null],
+  ]) {
+    const result = execute([
+      "-c",
+      'jq -c --arg verb precheck --argjson exit 0 -f "$CD_DIR/reply.jq" <<< "$1"',
+      "test",
+      JSON.stringify({ ok: true, version, running_version: bootstrap }),
+    ]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      ok: true,
+      version: expected,
+      running_version: bootstrap,
+    });
   }
 });
 

@@ -66,13 +66,18 @@ or held releases.
 
 ### Deployment runbook
 
+Check the Actions run list after dispatching `rollback` or `unpause`. GitHub may cancel an older
+pending job in the same concurrency group when a newer one queues. An owner control can replace a
+pending deploy, and a later deploy can replace a pending owner control.
+
 1. The first release after the legacy baseline is held without scanning historical migrations or
    PR labels. Run `cd-control status` and `selftest`, then `unpause`. Dispatch
    [Main](.github/workflows/main.yml) from `main` with the held release's exact SHA.
 2. If the first deploy or a later held release fails before it is recorded, dispatch `rollback`
    in [CD control](.github/workflows/cd-control.yml) from `main`. The job waits for recovery and
    runs host smoke on the restored version, which can be the bootstrap build. Check the step
-   summary. Deploys stay paused even if rollback fails.
+   summary. The job re-applies and verifies the pause even if rollback fails. If it cannot
+   confirm the pause, check `cd-control status` and pause deploys before proceeding.
 3. If the workflow is unavailable, an administrator can run
    `sudo /usr/local/sbin/hub-deploy-root rollback` on the host. Run
    `sudo /usr/local/sbin/hub-deploy-root wait 60` until it reports `done`; stop on `failed`.
@@ -92,10 +97,15 @@ or held releases.
   baseline and its own migrations are not scanned.
 - Path classification trusts release tags. The settings step applies a ruleset that protects
   `v*` tags.
-- Store deploy secrets only in the `production` environment, never at repository level.
-- The `production` environment limits deployment to `main`.
 - A runner killed without running its signal traps can leave an accepted install unrecorded.
   Use `cd-control status` to see the running version and reconcile it.
+
+### GitHub settings checklist
+
+- [ ] Store deploy secrets only in the `production` environment, never at repository level.
+- [ ] In the `production` environment, set **Deployment branches and tags** to
+      **Selected branches and tags** and allow only the branch `main`. A workflow edited on another
+      branch must not be able to use the production secrets.
 
 ## Update public documentation
 

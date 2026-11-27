@@ -80,17 +80,31 @@ smoke() {
 verify_rollback() {
   local status version
   status=$(logged status) || return 1
-  version=$(jq -er --arg to "$1" 'select(.paused and .version == $to) | .version' <<< "$status") ||
-    { echo "Rollback target is not running or deploys are not paused" >&2; return 1; }
+  version=$(jq -er --arg to "$1" 'select(.version == $to) | .version' <<< "$status") ||
+    { echo "Rollback target is not running" >&2; return 1; }
   wait_bg logged smoke "$version" >/dev/null
+}
+
+ensure_rollback_paused() {
+  pause_failed ||
+    { echo "::error::Unable to re-pause deployment after rollback" >&2; return 1; }
+  logged status | jq -e '.paused == true' >/dev/null ||
+    { echo "::error::Unable to verify deployment is paused after rollback" >&2; return 1; }
+}
+
+interrupt_rollback() {
+  trap '' INT TERM
+  ensure_rollback_paused || :
+  exit "$1"
 }
 
 manual_rollback() {
   local result=completed code=0
-  if ! { pause_failed && rollback_release verify_rollback; }; then
-    result=failed
-    code=1
-  fi
+  trap 'interrupt_rollback 130' INT
+  trap 'interrupt_rollback 143' TERM
+  pause_failed && rollback_release verify_rollback || code=1
+  ensure_rollback_paused || code=1
+  if [[ "$code" != 0 ]]; then result=failed; fi
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     printf '\nRollback %s.\n' "$result" >> "$GITHUB_STEP_SUMMARY" || :
   fi

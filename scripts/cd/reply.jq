@@ -1,8 +1,9 @@
 def filtered($pattern):
   if type == "string" and test("\\A(?:" + $pattern + ")\\z") then . else null end;
-def version:
-  "(0|[1-9][0-9]*)" as $part |
-  filtered([$part, $part, $part] | join("\\.") + "|0\\.11\\.0-notifications\\." + $part);
+def version_part: "(0|[1-9][0-9]*)";
+def semver_pattern: [version_part, version_part, version_part] | join("\\.");
+def semver: filtered(semver_pattern);
+def version: filtered(semver_pattern + "|0\\.11\\.0-notifications\\." + version_part);
 def number: if type == "number" then . else null end;
 def boolean: if type == "boolean" then . else null end;
 def reason: filtered("refused|paused|not-newer|no-space|install-running|no-previous|no-tarball");
@@ -48,7 +49,7 @@ select(valid) | {ok} + (
       ok: (.restore_test.ok|boolean)
     } end)
   }
-  elif $verb == "precheck" then {version: (.version|version), running_version: (.running_version|version)}
+  elif $verb == "precheck" then {version: (.version|semver), running_version: (.running_version|version)}
   elif $verb == "quiet" then {waited: (.waited|number), quiet: (.quiet|boolean)}
   elif $verb == "backup" then {entries: (.entries|number), bytes: (.bytes|number)}
   elif $verb == "install" then {started: (.started|boolean)}
