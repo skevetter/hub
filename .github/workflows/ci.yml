@@ -87,7 +87,8 @@ jobs:
       - run: npm run test:scripts
       - run: npm pack --dry-run
       - run: npm run test:parallel -- --built-only
-      - run: npm run test:parallel -- --check-coverage
+      - name: Check shard coverage
+        run: npm run test:parallel -- --check-coverage
 
   docker-smoke:
     name: docker-smoke
@@ -117,22 +118,6 @@ jobs:
       matrix:
         index: [1, 2, 3, 4, 5, 6]
         total: [6]
-    env:
-      RUN_RUNG_E_E2E: ${{ vars.RUN_RUNG_E_E2E }}
-    services:
-      postgres:
-        image: postgres:17@sha256:97fb53376be3e4fb1a8a61421daa69dcc3bf2fa39bda3259f5245f9a455af1a9
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -143,21 +128,25 @@ jobs:
           node-version: "24"
           cache: "npm"
       - run: npm ci
-      - name: Install E2E agent CLIs
-        run: npm install -g @getpaseo/cli@0.18.1 opencode-ai@1.19.6
       - name: Build
         run: npm run build
       - name: Run unit shard
         env:
-          SHARD: ${{ matrix.index }}/${{ matrix.total }}
+          TEST_SHARD_INDEX: ${{ matrix.index }}
+          TEST_SHARD_TOTAL: ${{ matrix.total }}
           TEST_SHARD_REPORT_DIR: ${{ runner.temp }}/shard
-        run: npm run test:parallel -- --shard "$SHARD"
+        run: npm run test:parallel
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: unit-shard-${{ matrix.index }}
-          path: ${{ runner.temp }}/shard
+          path: |
+            ${{ runner.temp }}/shard/shard-${{ matrix.index }}.json
+            ${{ runner.temp }}/shard/shard-${{ matrix.index }}.summary.json
+            ${{ runner.temp }}/shard/vitest.log
+            ${{ runner.temp }}/shard/vitest.retry-*.log
           retention-days: 7
+          if-no-files-found: warn
 
   browser:
     name: browser (${{ matrix.index }})
