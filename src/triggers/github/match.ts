@@ -105,6 +105,24 @@ function matchesFilter(
     return false;
   }
 
+  if (!matchesRoute(filter, event, connectionId)) return false;
+
+  if (!matchesText(classified.text, filter)) {
+    return false;
+  }
+
+  if (!filter.from_users.includes("*") && !filter.from_users.includes(classified.actor)) {
+    return false;
+  }
+
+  return matchesLabels(classified, filter);
+}
+
+function matchesRoute(
+  filter: TriggerFilter,
+  event: NormalizedGitHubEvent,
+  connectionId?: string | null,
+): boolean {
   if (filter.connectionId !== undefined && filter.connectionId !== connectionId) {
     return false;
   }
@@ -119,14 +137,13 @@ function matchesFilter(
     return false;
   }
 
-  if (!matchesText(classified.text, filter)) {
-    return false;
-  }
+  return true;
+}
 
-  if (!filter.from_users.includes("*") && !filter.from_users.includes(classified.actor)) {
-    return false;
-  }
-
+function matchesLabels(
+  classified: ReturnType<typeof classifyGitHubEvent>,
+  filter: TriggerFilter,
+): boolean {
   const label = readStringFilter(filter, "label");
   if (label !== undefined && !sameLabel(label, classified.changedLabel)) {
     return false;

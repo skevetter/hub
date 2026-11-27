@@ -137,7 +137,7 @@ export class GitHubNotificationRepository implements GitHubNotificationStore {
           deferred = true;
           break;
         }
-        started += await deliverThread(transaction, matches, payload, now, optedIn);
+        started += await deliverThread({ transaction, matches, payload, now, optedIn });
         delivered++;
         const updated = Date.parse(thread.updated_at);
         lastDelivered = Number.isFinite(updated) ? new Date(updated) : undefined;
@@ -223,41 +223,32 @@ async function organizationsWithoutReceipt(
   return new Set(organizations.filter((organizationId) => !have.has(organizationId)));
 }
 
-async function deliverThread(
-  transaction: QueryHandle,
-  matches: readonly TriggerMatch[],
-  payload: NotificationPayload,
-  now: Date,
-  optedIn: Parameters<NotificationProgressRequest>[0][] | undefined,
-): Promise<number> {
+interface DeliverThreadOptions {
+  transaction: QueryHandle;
+  matches: readonly TriggerMatch[];
+  payload: NotificationPayload;
+  now: Date;
+  optedIn: Parameters<NotificationProgressRequest>[0][] | undefined;
+}
+
+async function deliverThread({
+  transaction,
+  matches,
+  payload,
+  now,
+  optedIn,
+}: DeliverThreadOptions): Promise<number> {
   let started = 0;
   for (const organizationId of new Set(matches.map(({ row }) => row.organization_id))) {
     const own = matches.filter(({ row }) => row.organization_id === organizationId);
     const deliveryId = notificationDeliveryId(payload);
     const event = { github_notification: payload };
     const receiptId = randomUUID();
-    const inserted = await transaction.query(
-      `insert into provider_event_receipts
-      (id, organization_id, provider, delivery_id, source, repo, payload, received_at, accepted_routes)
-      values ($1, $2, 'github_notification', $3, $4, $5, $6, $7, $8)
-      on conflict (organization_id, delivery_id) do nothing`,
-      [
-        receiptId,
-        organizationId,
-        deliveryId,
-        NOTIFICATION_EVENT,
-        payload.repo,
-        event,
-        now,
-        JSON.stringify(
-          own.map(({ row }) => ({
-            projectId: row.runtime_project_id,
-            configurationRevisionId: row.configuration_revision_id,
-            connectionId: null,
-            resourceId: null,
-          })),
-        ),
-      ],
+    const inserted = await insertReceipt(
+      transaction,
+      { receiptId, organizationId, deliveryId, event },
+      own,
+      now,
     );
     // The organization already received this thread update on an earlier or overlapping poll.
     if (inserted.rowCount === 0) continue;
@@ -284,4 +275,41 @@ async function deliverThread(
     }
   }
   return started;
+}
+
+function insertReceipt(
+  transaction: QueryHandle,
+  receipt: {
+    receiptId: string;
+    organizationId: string;
+    deliveryId: string;
+    event: { github_notification: NotificationPayload };
+  },
+  own: readonly TriggerMatch[],
+  now: Date,
+) {
+  const { receiptId, organizationId, deliveryId, event } = receipt;
+  return transaction.query(
+    `insert into provider_event_receipts
+      (id, organization_id, provider, delivery_id, source, repo, payload, received_at, accepted_routes)
+      values ($1, $2, 'github_notification', $3, $4, $5, $6, $7, $8)
+      on conflict (organization_id, delivery_id) do nothing`,
+    [
+      receiptId,
+      organizationId,
+      deliveryId,
+      NOTIFICATION_EVENT,
+      event.github_notification.repo,
+      event,
+      now,
+      JSON.stringify(
+        own.map(({ row }) => ({
+          projectId: row.runtime_project_id,
+          configurationRevisionId: row.configuration_revision_id,
+          connectionId: null,
+          resourceId: null,
+        })),
+      ),
+    ],
+  );
 }

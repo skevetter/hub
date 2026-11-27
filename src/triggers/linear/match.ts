@@ -37,27 +37,36 @@ export function readLinearCommentInvocationParserMessage(
     return body;
   }
   if (consumedPatternEnd !== undefined) {
-    const overlappingContainsEnd = findOverlappingContainsEnd(body, contains, consumedPatternEnd);
-    if (overlappingContainsEnd !== undefined) {
-      return contains!.includes("=")
-        ? body.slice(skipLeadingWhitespace(body, consumedPatternEnd))
-        : body.slice(overlappingContainsEnd).trimStart();
-    }
-
-    const parserStart = skipLeadingWhitespace(body, consumedPatternEnd);
-    const containsIndex = findBoundaryDelimitedMarker(body, contains, parserStart);
-    return containsIndex === undefined
-      ? body.slice(parserStart)
-      : parserMessageAfterContains(body, containsIndex, contains!);
+    return parserMessageAfterPattern(body, contains, consumedPatternEnd);
   }
-
+  if (contains === undefined) return body;
   const containsIndex = findBoundaryDelimitedMarker(body, contains);
   if (containsIndex === undefined) return body;
 
-  const parserMessage = parserMessageAfterContains(body, containsIndex, contains!);
+  const parserMessage = parserMessageAfterContains(body, containsIndex, contains);
   return isLeadingInputShapedPattern(body, pattern) && containsIndex > 0
     ? `${pattern} ${parserMessage}`
     : parserMessage;
+}
+
+function parserMessageAfterPattern(
+  body: string,
+  contains: string | undefined,
+  consumedPatternEnd: number,
+): string {
+  if (contains === undefined) return body.slice(skipLeadingWhitespace(body, consumedPatternEnd));
+  const overlappingContainsEnd = findOverlappingContainsEnd(body, contains, consumedPatternEnd);
+  if (overlappingContainsEnd !== undefined) {
+    return contains.includes("=")
+      ? body.slice(skipLeadingWhitespace(body, consumedPatternEnd))
+      : body.slice(overlappingContainsEnd).trimStart();
+  }
+
+  const parserStart = skipLeadingWhitespace(body, consumedPatternEnd);
+  const containsIndex = findBoundaryDelimitedMarker(body, contains, parserStart);
+  return containsIndex === undefined
+    ? body.slice(parserStart)
+    : parserMessageAfterContains(body, containsIndex, contains);
 }
 
 /**
@@ -156,6 +165,10 @@ export function matchesIssueScope(
   if (filter.assignees !== undefined && !matchesOptionalId(filter.assignees, issue.assigneeId)) {
     return false;
   }
+  return matchesIssueLabels(issue, filter);
+}
+
+function matchesIssueLabels(issue: NormalizedLinearIssue, filter: TriggerFilter): boolean {
   if (
     filter.labels !== undefined &&
     !filter.labels.every((label) => issue.labelIds.includes(label))
@@ -180,18 +193,23 @@ function matchesLinearEvent(
     return event.type === "issue" && (event.action === "create" || event.action === "update");
   }
   if (eventName === "linear.issue_assigned") {
-    return (
-      event.type === "issue" &&
-      event.action === "update" &&
-      ((event.issue.assigneeId !== null && Object.hasOwn(event.updatedFrom, "assigneeId")) ||
-        (appUserId !== undefined &&
-          event.issue.delegateId === appUserId &&
-          Object.hasOwn(event.updatedFrom, "delegateId") &&
-          event.updatedFrom.delegateId !== appUserId))
-    );
+    return event.type === "issue" && event.action === "update" && isNewAssignment(event, appUserId);
   }
   return (
     eventName === "linear.comment_created" && event.type === "comment" && event.action === "create"
+  );
+}
+
+function isNewAssignment(
+  event: NormalizedLinearIssueEvent,
+  appUserId: string | undefined,
+): boolean {
+  return (
+    (event.issue.assigneeId !== null && Object.hasOwn(event.updatedFrom, "assigneeId")) ||
+    (appUserId !== undefined &&
+      event.issue.delegateId === appUserId &&
+      Object.hasOwn(event.updatedFrom, "delegateId") &&
+      event.updatedFrom.delegateId !== appUserId)
   );
 }
 
@@ -207,11 +225,10 @@ function matchesTriggerFilter(
       matchesActorIfPresent(event, trigger.filters?.from_users)
     );
   }
-  const issue = event.type === "issue" ? event.issue : event.issue;
+  const issue = event.issue;
   if (issue === null || !matchesIssueScope(issue, trigger.filters, connectionId)) return false;
   if (!matchesActor(event, trigger.filters?.from_users)) return false;
-  if (event.type === "comment" && !matchesCommentText(event, trigger.filters)) return false;
-  return true;
+  return event.type !== "comment" || matchesCommentText(event, trigger.filters);
 }
 
 /** The filter-specific edge check, separated to keep the generic event selection readable. */
@@ -223,7 +240,11 @@ function enteredConfiguredScope(
   if (!matchesIssueScope(event.issue, filter, connectionId)) return false;
   if (event.action === "create") return true;
   if (event.action !== "update") return false;
-  const before: NormalizedLinearIssue = {
+  return !matchesIssueScope(previousIssue(event), filter, connectionId);
+}
+
+function previousIssue(event: NormalizedLinearIssueEvent): NormalizedLinearIssue {
+  return {
     ...event.issue,
     ...(Object.hasOwn(event.updatedFrom, "projectId")
       ? { projectId: event.updatedFrom.projectId ?? null }
@@ -238,7 +259,6 @@ function enteredConfiguredScope(
       ? { labelIds: event.updatedFrom.labelIds ?? [] }
       : {}),
   };
-  return !matchesIssueScope(before, filter, connectionId);
 }
 
 function matchesActorIfPresent(
@@ -282,12 +302,12 @@ function consumeLeadingLinearCommandMarker(
 
 function findOverlappingContainsEnd(
   message: string,
-  marker: string | undefined,
+  marker: string,
   consumedPatternEnd: number,
 ): number | undefined {
   const markerIndex = findBoundaryDelimitedMarker(message, marker);
   if (markerIndex === undefined || markerIndex >= consumedPatternEnd) return undefined;
-  return Math.max(consumedPatternEnd, markerIndex + marker!.length);
+  return Math.max(consumedPatternEnd, markerIndex + marker.length);
 }
 
 function parserMessageAfterContains(message: string, markerIndex: number, marker: string): string {
@@ -310,10 +330,9 @@ function isLeadingInputShapedPattern(
 
 function findBoundaryDelimitedMarker(
   message: string,
-  marker: string | undefined,
+  marker: string,
   from = 0,
 ): number | undefined {
-  if (marker === undefined) return undefined;
   let start = from;
   while (start < message.length) {
     const index = message.indexOf(marker, start);
@@ -337,7 +356,7 @@ function hasTrailingMarkerBoundary(message: string, end: number): boolean {
 
 function skipLeadingWhitespace(message: string, from: number): number {
   let start = from;
-  while (start < message.length && /\s/u.test(message[start]!)) start += 1;
+  while (start < message.length && /\s/u.test(message[start] ?? "")) start += 1;
   return start;
 }
 
