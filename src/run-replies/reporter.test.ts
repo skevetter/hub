@@ -105,6 +105,45 @@ describe("run reply reporting", () => {
     }
   });
 
+  it("does not post a candidate step's answer when the run did not succeed", async () => {
+    const database = createMemoryDatabase();
+    const organizationId = "org";
+    const fake = fakeLinearReplies(organizationId, database);
+    const writer = new LinearRunReplyWriter({
+      database,
+      client: fake.client,
+      clientSecret: "fake-client-secret",
+      providerApplicationId: "app",
+      connectionForLinearOrganization: fake.connectionForLinearOrganization,
+    });
+    const reporter = new RunReplyReporter({ database, writer: () => writer, perHour: 60 });
+    const fixture = await turnEndFixture({
+      database,
+      organizationId,
+      workflow: true,
+      completeOnTurnEnd: true,
+      replyCaptureCandidate: true,
+      onRunReplyAnswer: reporter.capture,
+      ...replyEvidence,
+    });
+    try {
+      const { execution } = await fixture.dispatch();
+      const runId = execution.launchIntent?.triggerRunId;
+      assert.ok(runId);
+      await fixture.endTurn("An answer from a run that then failed.");
+      await fixture.clock.advance(TURN_END_SETTLE_MS);
+      await database.cancelTriggerRun(organizationId, runId);
+      await reporter.processAvailable();
+      await reporter.processAvailable();
+      const delivery = await database.runReplies.find({ organizationId, runId });
+      assert.equal(delivery?.failure, "run_unsuccessful");
+      assert.deepEqual(fake.writes, []);
+    } finally {
+      await fixture.lifecycle.stop();
+      await reporter.stop();
+    }
+  });
+
   describe("polling", () => {
     afterEach(() => vi.useRealTimers());
 

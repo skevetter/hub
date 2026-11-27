@@ -42,14 +42,20 @@ describe("run reply capture on the daemon stream", () => {
     }
   });
 
-  it.each([null, "Final answer after finish."])(
-    "waits for the turn after explicit finish (%s)",
-    async (text) => {
+  it.each([
+    { text: null, candidate: false },
+    { text: "Final answer after finish.", candidate: false },
+    { text: null, candidate: true },
+    { text: "Final answer after finish.", candidate: true },
+  ])(
+    "waits for the turn after explicit finish (answer $text, candidate only $candidate)",
+    async ({ text, candidate }) => {
       const onRunReplyAnswer = vi.fn();
       const fixture = await turnEndFixture({
         database: createMemoryDatabase(),
         organizationId: "reply-org",
         workflow: true,
+        replyCaptureCandidate: candidate,
         onRunReplyAnswer,
       });
       try {

@@ -1231,6 +1231,30 @@ run:
     assert.deepEqual(dispatches, []);
   });
 
+  it("settles the reply at once when every agent step was skipped", async () => {
+    const raw = allSkippedConfiguration();
+    const compiled = structuredClone(compileHubConfig(raw));
+    for (const trigger of compiled.triggers) trigger.replyMessage = true;
+    const fixture = await workflowFixture({
+      rawConfiguration: raw,
+      compiledConfiguration: compiled,
+    });
+    const { handler, engine } = engineFor(fixture, []);
+
+    await handler(fixture.trigger("run"));
+    await engine.processAvailable();
+
+    const run = (
+      await fixture.database.findTriggerRunsByProviderEventReceiptId(fixture.providerEventReceiptId)
+    )[0]!;
+    assert.equal(run.status, "succeeded");
+    const delivery = await fixture.database.runReplies.find({
+      organizationId: run.organizationId,
+      runId: run.id,
+    });
+    assert.deepEqual([delivery?.state, delivery?.failure], ["refused", "no_agent_step"]);
+  });
+
   it.each([
     { name: "a later step can be skipped", later: "${{ false }}", candidate: true },
     { name: "the later step always runs", later: undefined, candidate: false },

@@ -24,14 +24,15 @@ A step without that grant can have its final message posted by Hub, but it canno
 post through the tool. To let an earlier step reply with the tool, grant it that
 output yourself.
 
-Because an earlier step's final message can now be posted, give each step that
-could be last only context you are willing to show the issue's readers.
+A step can be last when every agent step after it has an `if`. Because that
+step's final message can now be posted, give such steps the same or less context
+than the last step, and only context you are willing to show the issue's readers.
 
 After a successful call to `finish_execution`, Hub waits up to 10 seconds for
 that turn to end. A missing turn end produces a refusal on the run.
 
 The answer leaves Hub for the source issue as a new Paseo app comment. Anyone
-who can read the issue can read the answer. Hub retains only delivery
+who can read the issue can read the answer. The reply delivery record retains only
 metadata, including the comment ID, length and hash. For an opted-in run,
 inferred turn completion on the last agent step by position records the
 completion status in its execution result and step output, without the message.
