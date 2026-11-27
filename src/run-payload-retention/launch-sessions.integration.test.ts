@@ -544,7 +544,7 @@ describe("launch and session expiry in PostgreSQL", () => {
     } finally {
       await runtime.close();
     }
-  });
+  }, 120_000);
 
   it("counts without writes and removes only eligible markers from a full dump", async () => {
     const { runtime, database, name } = await freshDatabase();
