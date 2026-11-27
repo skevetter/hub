@@ -92,7 +92,7 @@ export function Combobox<T extends ComboboxOption>(props: ComboboxProps<T>) {
           {...comboboxAria(props)}
           disabled={props.disabled ?? false}
           data-value={value}
-          className="h-auto min-h-8 w-full min-w-0 justify-between py-1 text-left whitespace-normal"
+          className="h-auto min-h-8 w-full min-w-0 justify-between py-1 text-left whitespace-normal max-md:min-h-8"
         >
           <ComboboxTriggerContent
             options={options}

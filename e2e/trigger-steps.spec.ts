@@ -17,6 +17,7 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
   hub,
   page,
 }) => {
+  test.setTimeout(90_000);
   await hub.signUpAs("owner", owner);
   await hub.createOrganization("owner", "Acme");
   const daemon = await hub.connectProviderDaemon("owner", "Acme");
@@ -121,6 +122,33 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
 
   await test.step("the cards read cleanly at desktop and phone width in both themes", async () => {
     await steps.captureThemes(SHOTS, "steps");
+  });
+
+  await test.step("the row controls are 44 px on a phone and keep their desktop size above it", async () => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const desktop = await steps.rowControlSizes();
+    expect(desktop.length).toBeGreaterThanOrEqual(4);
+    for (const { name, height } of desktop) expect(height, name).toBeLessThan(36);
+    await page.setViewportSize({ width: 390, height: 844 });
+    const phone = await steps.rowControlSizes();
+    expect(phone.map(({ name }) => name)).toEqual(desktop.map(({ name }) => name));
+    for (const { name, width, height } of phone) {
+      expect(width, name).toBeGreaterThanOrEqual(44);
+      expect(height, name).toBeGreaterThanOrEqual(44);
+    }
+    await page.setViewportSize({ width: 1280, height: 900 });
+  });
+
+  await test.step("a collapsed row with a long ID and a condition still holds both 44 px buttons", async () => {
+    await steps.rename(2, "a-step-id-that-is-much-too-long-for-one-line");
+    await steps.edit(1);
+    await steps.expectSummary(2, "Agent: Gateway Model v1", true);
+    for (const width of [1280, 390, 320]) {
+      await page.setViewportSize({ width, height: 900 });
+      await steps.expectRowControlsFit(2, width >= 390);
+    }
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await steps.rename(2, "fix");
   });
 
   await test.step("a conversation that two steps cannot share is marked on the step the save check names", async () => {

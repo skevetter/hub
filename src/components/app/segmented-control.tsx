@@ -127,7 +127,7 @@ function Segment({
       disabled={option.disabled === true}
       onClick={select}
       className={cn(
-        "inline-flex h-7 items-center gap-1.5 rounded-sm px-2.5 text-xs whitespace-nowrap transition-colors duration-150 disabled:pointer-events-none disabled:opacity-50 [&_svg]:size-3.5",
+        "inline-flex h-7 items-center gap-1.5 max-md:min-h-11 max-md:min-w-11 rounded-sm px-2.5 text-xs whitespace-nowrap transition-colors duration-150 disabled:pointer-events-none disabled:opacity-50 [&_svg]:size-3.5",
         active ? "bg-background text-foreground" : "text-muted-foreground hover:text-foreground",
       )}
     >
