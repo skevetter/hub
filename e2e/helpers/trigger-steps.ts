@@ -173,8 +173,8 @@ export class TriggerSteps {
     );
   }
 
-  /** A collapsed row keeps its Edit and menu buttons inside the card; the page may be checked for sideways scroll too. */
-  async expectRowControlsFit(position: number, pageFits = true) {
+  /** A collapsed row keeps its Edit and menu buttons inside the card, and the page does not scroll sideways. */
+  async expectRowControlsFit(position: number) {
     const number = String(position);
     const row = await this.step(position).boundingBox();
     expect(row).not.toBeNull();
@@ -191,7 +191,7 @@ export class TriggerSteps {
         this.page.viewportSize()?.width ?? 0,
       );
     }
-    if (pageFits) await this.expectNoHorizontalScroll();
+    await this.expectNoHorizontalScroll();
   }
 
   /** A viewport tall enough to hold the list, so fixed bars are drawn once instead of per slice. */

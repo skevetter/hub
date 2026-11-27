@@ -101,7 +101,7 @@ function RowsPerPage({ value, accountId, onChange, busy }: PageSizeControl & { b
       <label htmlFor={id}>Rows per page</label>
       <select
         id={id}
-        className="h-7 rounded-sm border border-input bg-background px-2.5 text-foreground"
+        className="h-7 rounded-sm max-md:h-11 border border-input bg-background px-2.5 text-foreground"
         value={value}
         onChange={select}
         aria-disabled={busy}
