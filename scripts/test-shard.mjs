@@ -131,8 +131,9 @@ export function coverageProblems(files, { groups, builtOnly, total }) {
 
 const ANSI_PATTERN = /\u001B\[[0-9;]*m/gu;
 const FAIL_LINE =
-  /^\s*FAIL\s+(?:\[[^\]]*\]\s+)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+>.*)?\s*$/u;
+  /^\s*FAIL\s+(?:\[[^\]]*\]\s+)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+(?:>|\[).*)?\s*$/u;
 const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
+const HINT_LINE = /^If this is a long-running (?:test|hook)/u;
 
 function firstLine(text) {
   return (
@@ -148,17 +149,32 @@ function isContainerStartHeader(text) {
   return CONTAINER_START_PATTERNS.some((pattern) => pattern.test(header));
 }
 
-/** First error line of each failure block the default reporter printed, keyed by test file. */
+function addHeader(headers, files, line) {
+  for (const file of files) headers.set(file, [...(headers.get(file) ?? []), line]);
+}
+
+/**
+ * Error lines the default reporter printed for each failing test file, keyed by file.
+ * A failure block starts with one or more FAIL lines. Every unindented line after them, up
+ * to the next rule line, is an error header for all of those files.
+ */
 export function logFailureHeaders(logText) {
   const headers = new Map();
-  let pending;
-  for (const line of logText.replace(ANSI_PATTERN, "").split("\n")) {
+  let files = [];
+  let inErrors = false;
+  for (const raw of logText.replace(ANSI_PATTERN, "").split("\n")) {
+    const line = raw.trimEnd();
     const failed = FAIL_LINE.exec(line);
-    if (failed) pending = failed[1];
-    else if (SEPARATOR_LINE.test(line)) pending = undefined;
-    else if (pending && line.trim() !== "") {
-      headers.set(pending, [...(headers.get(pending) ?? []), line.trim()]);
-      pending = undefined;
+    if (failed) {
+      if (inErrors) files = [];
+      files.push(failed[1]);
+      inErrors = false;
+    } else if (SEPARATOR_LINE.test(line)) {
+      files = [];
+      inErrors = false;
+    } else if (files.length > 0 && line !== "" && !/^\s/u.test(line) && !HINT_LINE.test(line)) {
+      addHeader(headers, files, line);
+      inErrors = true;
     }
   }
   return headers;
@@ -310,6 +326,32 @@ export function stepSummary({ title, line, report, root, retried }) {
   return `${lines.join("\n")}\n`;
 }
 
+function redactStrings(list, scrubber) {
+  return list.map((item) => redactText(item, scrubber));
+}
+
+function redactAssertion(entry, scrubber) {
+  const copy = { ...entry };
+  for (const key of ["title", "fullName"]) {
+    if (typeof copy[key] === "string") copy[key] = redactText(copy[key], scrubber);
+  }
+  for (const key of ["ancestorTitles", "failureMessages"]) {
+    if (Array.isArray(copy[key])) copy[key] = redactStrings(copy[key], scrubber);
+  }
+  if (copy.meta) copy.meta = redactDeep(copy.meta, scrubber);
+  return copy;
+}
+
+/** Redacts the free-text fields only, so short env values cannot rewrite file names or keys. */
+export function redactReport(report, scrubber) {
+  const testResults = report.testResults.map((entry) => ({
+    ...entry,
+    ...(typeof entry.message === "string" && { message: redactText(entry.message, scrubber) }),
+    assertionResults: (entry.assertionResults ?? []).map((item) => redactAssertion(item, scrubber)),
+  }));
+  return { ...report, testResults };
+}
+
 /** Report file names relative to the repository, so artifacts carry no runner paths. */
 export function relativizeReport(report, root) {
   const testResults = report.testResults.map((entry) => ({
@@ -322,9 +364,8 @@ export function relativizeReport(report, root) {
 /** Writes the artifact files. Env values, the host name and the root path are removed. */
 export function writeShardArtifacts(directory, label, { report, summary, logs }, scrubber) {
   mkdirSync(directory, { recursive: true });
-  const write = (name, data) =>
-    writeFileSync(join(directory, name), `${JSON.stringify(redactDeep(data, scrubber))}\n`);
-  if (report) write(`${label}.json`, report);
+  const write = (name, data) => writeFileSync(join(directory, name), `${JSON.stringify(data)}\n`);
+  if (report) write(`${label}.json`, redactReport(report, scrubber));
   write(`${label}.summary.json`, summary);
   for (const [name, path] of logs.filter(([, path]) => path && existsSync(path))) {
     writeFileSync(join(directory, name), redactText(readFileSync(path, "utf8"), scrubber));

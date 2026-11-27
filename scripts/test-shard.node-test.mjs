@@ -182,7 +182,7 @@ function logWith(blocks) {
   const text = blocks
     .map(
       ([file, header]) =>
-        `\n\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF Failed Suites 1 \u23AF\u23AF\u23AF\u23AF\n\n \u001B[41m\u001B[1m FAIL \u001B[22m\u001B[49m  ${file} > suite\n${header}\nstack line\n`,
+        `\n\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF Failed Suites 1 \u23AF\u23AF\u23AF\u23AF\n\n \u001B[41m\u001B[1m FAIL \u001B[22m\u001B[49m  ${file} > suite\n${header}\n \u276F x.test.ts:3:3\n`,
     )
     .join("");
   logCount += 1;
@@ -227,6 +227,44 @@ test("the default reporter's real hook failure output is understood", () => {
     "Error: Hook timed out in 100ms.",
     "Error: Port 5432/tcp not bound after 20000ms",
   ]);
+});
+
+test("file-level failures, shared errors and extra error lines in one block", () => {
+  const rule = "\u23AF".repeat(6);
+  const log = [
+    `${rule} Failed Suites 2 ${rule}`,
+    "",
+    " FAIL  a.test.ts [ a.test.ts ]",
+    " FAIL  b.test.ts [ b.test.ts ]",
+    "Error: Port 5432/tcp not bound after 20000ms",
+    " \u276F a.test.ts:3:3",
+    "",
+    `${rule}[1/2]${"\u23AF"}`,
+    "",
+    " FAIL  c.test.ts > suite",
+    "Error: Hook timed out in 100ms.",
+    "If this is a long-running hook, pass a timeout value as the last argument.",
+    " \u276F c.test.ts:3:3",
+    "Error: cleanup failed",
+    " \u276F c.test.ts:9:3",
+    "",
+  ].join("\n");
+  const headers = logFailureHeaders(log);
+  assert.deepEqual(headers.get("a.test.ts"), ["Error: Port 5432/tcp not bound after 20000ms"]);
+  assert.deepEqual(headers.get("b.test.ts"), ["Error: Port 5432/tcp not bound after 20000ms"]);
+  assert.deepEqual(headers.get("c.test.ts"), [
+    "Error: Hook timed out in 100ms.",
+    "Error: cleanup failed",
+  ]);
+  const hookOnly = (file) => ({
+    name: `${root}/${file}`,
+    status: "failed",
+    message: "",
+    assertionResults: [{ status: "skipped", failureMessages: [] }],
+  });
+  const report = reportOf(hookOnly("a.test.ts"), hookOnly("c.test.ts"));
+  assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers }), ["a.test.ts"]);
+  assert.deepEqual(retryableFiles(report, ["c.test.ts"], { root, headers }), []);
 });
 
 test("only a container-start header makes a file retryable", () => {
@@ -513,6 +551,38 @@ test("artifacts and the summary hide env values, short secrets and the host name
     await readFile(summaryPath, "utf8"),
     /Retried once after a container-start timeout/u,
   );
+});
+
+test("a short env value cannot rewrite file names or report keys", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "hub-shard-short-"));
+  t.after(() => rm(directory, { recursive: true }));
+  const logPath = join(directory, "in.log");
+  await writeFile(logPath, "x\n");
+  const first = { ...firstRun([["a.test.ts", portTimeout]]), log: logPath };
+  const { execute } = executor(first, (files) => ({ ...retryRun(files), log: logPath }));
+  await runShardJob({
+    title: "Shard 1/6",
+    label: "shard-1",
+    files: ["ok.test.ts", "a.test.ts"],
+    root,
+    execute,
+    env: { API_KEY: "test" },
+    host: "h",
+    reportDir: join(directory, "out"),
+    print: () => {},
+  });
+  const saved = JSON.parse(await readFile(join(directory, "out", "shard-1.json"), "utf8"));
+  assert.deepEqual(Object.keys(saved).sort(), [
+    "numFailedTests",
+    "numPassedTests",
+    "numTotalTests",
+    "success",
+    "testResults",
+  ]);
+  assert.deepEqual(timingEntries(saved, root).sort(), [
+    ["a.test.ts", 1500],
+    ["ok.test.ts", 1500],
+  ]);
 });
 
 test("redaction covers short values and object keys but not trivial values", () => {
