@@ -269,7 +269,66 @@ test("file-level failures, shared errors and extra error lines in one block", ()
   assert.deepEqual(retryableFiles(report, ["c.test.ts"], { root, headers }), []);
 });
 
-test("only a container-start header makes a file retryable", () => {
+const SLOW_DATABASE_LOG = [
+  " ✓ src/runtime-files.test.ts (1 test) 0ms",
+  "",
+  "\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF Failed Suites 1 \u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF",
+  "",
+  " FAIL  src/db/activity-paging.integration.test.ts > activity page SQL on postgres",
+  "DatabaseUnavailableError: database query timed out",
+  " \u276F Timeout.<anonymous> src/db/runtime/internal/pool.ts:112:27",
+  "    110|         new Promise<never>((_, reject) => {",
+  "",
+  "\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF\u23AF[1/1]\u23AF",
+].join("\n");
+
+function suiteFailure(file, message, assertionResults) {
+  return { name: `${root}/${file}`, status: "failed", message, assertionResults };
+}
+
+test("a suite that cannot start on a slow database is retried", () => {
+  const file = "src/db/activity-paging.integration.test.ts";
+  const skipped = Array.from({ length: 9 }, () => ({ status: "skipped", failureMessages: [] }));
+  const passed = Array.from({ length: 7 }, () => ({ status: "passed", failureMessages: [] }));
+  const report = reportOf(suiteFailure(file, "", [...skipped, ...passed]));
+  const headers = logFailureHeaders(SLOW_DATABASE_LOG);
+  assert.deepEqual(headers.get(file), ["DatabaseUnavailableError: database query timed out"]);
+  assert.deepEqual(retryableFiles(report, [file], { root, headers }), [file]);
+  assert.deepEqual(retryableFiles(report, [file], { root }), []);
+});
+
+test("a suite that fails to load is retried on a database start timeout in its message", () => {
+  const messages = [
+    "DatabaseUnavailableError: database query timed out\n    at Timeout.<anonymous> (pool.ts:112:27)",
+    "Error: Connection terminated due to connection timeout",
+    "Error: timeout exceeded when trying to connect",
+    "error: the database system is starting up",
+  ];
+  for (const message of messages) {
+    const report = reportOf(suiteFailure("a.test.ts", message, []));
+    assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root }), ["a.test.ts"], message);
+  }
+});
+
+test("other database errors and a mixed failure are not retried", () => {
+  const messages = [
+    "DatabaseUnavailableError: database unavailable",
+    "Error: connect ECONNREFUSED 127.0.0.1:5432",
+    'error: relation "runs" does not exist',
+    "AssertionError: expected 'database query timed out' to be null",
+  ];
+  for (const message of messages) {
+    const report = reportOf(suiteFailure("a.test.ts", message, []));
+    assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root }), [], message);
+  }
+  const mixed = reportOf(
+    suiteFailure("a.test.ts", "DatabaseUnavailableError: database query timed out", []),
+    failedEntry("b.test.ts", "AssertionError: nope"),
+  );
+  assert.deepEqual(retryableFiles(mixed, ["a.test.ts", "b.test.ts"], { root }), []);
+});
+
+test("only a start timeout header makes a file retryable", () => {
   const hookFailure = {
     name: `${root}/e.test.ts`,
     status: "failed",
@@ -372,6 +431,27 @@ test("a timed-out file is retried once alone and the shard then passes", async (
   assert.equal(result.durationMs, 1500);
 });
 
+test("a slow database start counts as a retry and toward the per-shard limit", async () => {
+  const slow = "DatabaseUnavailableError: database query timed out";
+  const { execute, calls } = executor(firstRun([["a.test.ts", slow]]), (files) => retryRun(files));
+  const result = await runWithRetry({ label: "shard-1", files: ["a.test.ts"], root, execute });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(result.retried, ["a.test.ts"]);
+  assert.equal(result.exitCode, 0);
+
+  const many = Array.from({ length: RETRY_CAP + 1 }, (_, index) => [`f${index}.test.ts`, slow]);
+  const capped = executor(firstRun(many), (files) => retryRun(files));
+  const refused = await runWithRetry({
+    label: "shard-1",
+    files: many.map(([file]) => file),
+    root,
+    execute: capped.execute,
+  });
+  assert.equal(capped.calls.length, 1);
+  assert.equal(refused.exitCode, 1);
+  assert.match(retryAnnotations(refused).join("\n"), /Too many start timeouts/u);
+});
+
 test("each retried file runs in its own process and reports its own outcome", async () => {
   const failures = [
     ["a.test.ts", portTimeout],
@@ -397,8 +477,8 @@ test("each retried file runs in its own process and reports its own outcome", as
   assert.equal(result.report.success, false);
   assert.deepEqual(result.failedFiles, ["b.test.ts"]);
   assert.deepEqual(retryAnnotations(result), [
-    "::warning title=Retried after a container-start timeout::a.test.ts passed on a serial retry",
-    "::error title=Failed again after a container-start retry::b.test.ts",
+    "::warning title=Retried after a start timeout::a.test.ts passed on a serial retry",
+    "::error title=Failed again after a start timeout retry::b.test.ts",
   ]);
 });
 
@@ -471,8 +551,8 @@ test("workflow command text in file names and diagnostics is escaped", () => {
     diagnostic: "six\r\nfiles",
   });
   assert.deepEqual(lines, [
-    "::warning title=Retried after a container-start timeout::a%25b%0A::add-mask::x.test.ts passed on a serial retry",
-    "::error title=Too many container-start timeouts::six%0D%0Afiles",
+    "::warning title=Retried after a start timeout::a%25b%0A::add-mask::x.test.ts passed on a serial retry",
+    "::error title=Too many start timeouts::six%0D%0Afiles",
   ]);
 });
 
@@ -545,14 +625,8 @@ test("artifacts and the summary hide env values, short secrets and the host name
     ["a.test.ts", 1500],
     ["ok.test.ts", 1500],
   ]);
-  assert.match(
-    printed.join("\n"),
-    /::warning title=Retried after a container-start timeout::a\.test\.ts/u,
-  );
-  assert.match(
-    await readFile(summaryPath, "utf8"),
-    /Retried once after a container-start timeout/u,
-  );
+  assert.match(printed.join("\n"), /::warning title=Retried after a start timeout::a\.test\.ts/u);
+  assert.match(await readFile(summaryPath, "utf8"), /Retried once after a start timeout/u);
 });
 
 test("a short env value cannot rewrite file names or report keys", async (t) => {

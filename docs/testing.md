@@ -72,9 +72,12 @@ are not in any shard. Run them after `npm run build` with `npm run test:parallel
 built-only suites cover every discovered file exactly once, 1 when they do not, and 2 on bad
 arguments. `TEST_SHARD_TOTAL` sets the shard count for the check, 6 by default.
 
-A file is retried once when every failure in it starts with `Port <n>/tcp not bound after <n>ms` or
-`Hook timed out in <n>ms`. Vitest's JSON report leaves out hook failures, so the runner also reads
-the first error line of each failure block in `vitest.log`. Each such file runs alone in its own
+A file is retried once when every failure in it starts with `Port <n>/tcp not bound after <n>ms`,
+`Hook timed out in <n>ms` or a database start timeout: `DatabaseUnavailableError: database query
+timed out`, `Connection terminated due to connection timeout`, `timeout exceeded when trying to
+connect` or `the database system is starting up`. This covers a suite that cannot start as well as
+a failing test. Vitest's JSON report leaves out hook failures, so the runner also reads the first
+error line of each failure block in `vitest.log`. Each such file runs alone in its own
 Vitest process. Each retry prints a `::warning::` line (or `::error::` if it fails again) and shows
 in the step summary. Nothing is retried when the shard has any other failure, a process error, an
 incomplete report or an unhandled error. More than 5 candidate files in one shard fails the shard

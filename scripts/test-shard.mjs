@@ -22,9 +22,13 @@ const SENSITIVE_NAME =
   /TOKEN|SECRET|KEY|PASS|CREDENTIAL|PRIVATE|AUTH|COOKIE|SESSION|URL|URI|DSN|JWT|BEARER|SALT|SIG|CONN|WEBHOOK|CERT|SEED/iu;
 const PUBLIC_NAMES = new Set(["GITHUB_SERVER_URL", "GITHUB_API_URL", "GITHUB_GRAPHQL_URL"]);
 const HOST_NAMES = ["HOSTNAME", "RUNNER_NAME", "COMPUTERNAME"];
-const CONTAINER_START_PATTERNS = [
+const START_TIMEOUT_PATTERNS = [
   /^(?:\w*Error: )?Port \d+\/tcp not bound after \d+ ?ms\b/u,
   /^(?:\w*Error: )?Hook timed out in \d+ ?ms\b/u,
+  /^DatabaseUnavailableError: database query timed out$/u,
+  /^Error: Connection terminated due to connection timeout$/u,
+  /^Error: timeout exceeded when trying to connect$/u,
+  /^(?:\w*[Ee]rror: )?the database system is starting up$/u,
 ];
 
 /** A bad command line or environment: the process exits 2 instead of 1. */
@@ -151,9 +155,9 @@ function firstLine(text) {
   );
 }
 
-function isContainerStartHeader(text) {
+function isStartTimeoutHeader(text) {
   const header = firstLine(text);
-  return CONTAINER_START_PATTERNS.some((pattern) => pattern.test(header));
+  return START_TIMEOUT_PATTERNS.some((pattern) => pattern.test(header));
 }
 
 function addHeader(headers, files, line) {
@@ -197,25 +201,25 @@ function reportedFailures(file) {
 }
 
 /**
- * True when every failure of the file starts with a container-start timeout header.
+ * True when every failure of the file starts with a container or database start timeout header.
  * Vitest's JSON report omits hook failures, so the log blocks count as evidence too.
  */
-export function containerStartFailure(file, logHeaders = []) {
+export function startTimeoutFailure(file, logHeaders = []) {
   const { texts, unexplained } = reportedFailures(file);
   const pending = (file.assertionResults ?? []).some(({ status }) => status === "pending");
   if (pending || unexplained) return false;
   const headers = [...texts, ...logHeaders];
-  return headers.length > 0 && headers.every(isContainerStartHeader);
+  return headers.length > 0 && headers.every(isStartTimeoutHeader);
 }
 
-/** The failed files, when every one of them failed only on a container start. Otherwise empty. */
+/** The failed files, when every one of them failed only on a container or database start timeout. Otherwise empty. */
 export function retryableFiles(report, failedFiles, { root, headers = new Map() }) {
   if (failedFiles.length === 0) return [];
   const failed = new Set(failedFiles);
   const results = report.testResults.filter(({ name }) => failed.has(relative(root, name)));
   const retryable =
     results.length === failed.size &&
-    results.every((file) => containerStartFailure(file, headers.get(relative(root, file.name))));
+    results.every((file) => startTimeoutFailure(file, headers.get(relative(root, file.name))));
   return retryable ? failedFiles : [];
 }
 export function countAssertions(testResults) {
@@ -387,11 +391,7 @@ export function stepSummary({ title, line, report, root, retried }) {
     ...rows,
   ];
   if (retried.length > 0) {
-    lines.push(
-      "",
-      "Retried once after a container-start timeout:",
-      ...retried.map((f) => `- \`${f}\``),
-    );
+    lines.push("", "Retried once after a start timeout:", ...retried.map((f) => `- \`${f}\``));
   }
   return `${lines.join("\n")}\n`;
 }
@@ -496,14 +496,14 @@ function singleRun(first, retried = []) {
   };
 }
 
-/** Runs the files once. Retries the failed ones once each, serially, only after container-start timeouts. */
+/** Runs the files once. Retries the failed ones once each, serially, only after start timeouts. */
 export async function runWithRetry({ label, files, root, execute }) {
   const first = await execute(label, files);
   if (first.exitCode === 0) return singleRun(first);
   const candidates = await retryCandidates(first, root);
   if (candidates.length === 0) return singleRun(first);
   if (candidates.length > RETRY_CAP) {
-    const diagnostic = `${candidates.length} files failed on container-start timeouts, more than ${RETRY_CAP}. Not retried.`;
+    const diagnostic = `${candidates.length} files failed on start timeouts, more than ${RETRY_CAP}. Not retried.`;
     return { ...singleRun(first), tooManyRetries: candidates.length, diagnostic };
   }
   return afterRetries(first, await retryEachFile(candidates, { label, execute }));
@@ -512,11 +512,11 @@ export async function runWithRetry({ label, files, root, execute }) {
 export function retryAnnotations(result) {
   const lines = (result.retryOutcomes ?? []).map(({ file, passed }) =>
     passed
-      ? `::warning title=Retried after a container-start timeout::${escapeData(file)} passed on a serial retry`
-      : `::error title=Failed again after a container-start retry::${escapeData(file)}`,
+      ? `::warning title=Retried after a start timeout::${escapeData(file)} passed on a serial retry`
+      : `::error title=Failed again after a start timeout retry::${escapeData(file)}`,
   );
   if (result.tooManyRetries) {
-    lines.push(`::error title=Too many container-start timeouts::${escapeData(result.diagnostic)}`);
+    lines.push(`::error title=Too many start timeouts::${escapeData(result.diagnostic)}`);
   }
   return lines;
 }
