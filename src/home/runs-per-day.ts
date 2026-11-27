@@ -7,7 +7,8 @@ const DAY_MS = 86_400_000;
 
 // One range scan of trigger_runs_organization_created_id_idx, so the cost follows the runs inside
 // the window. Failed means did not finish, the Activity filter of that name. Days are UTC calendar days; a day without runs has no row and is filled in later.
-export const RUNS_PER_DAY_SQL = `select (created_at at time zone 'UTC')::date::text as day,
+// to_char keeps the key ISO under any DateStyle, which a date cast to text does not.
+export const RUNS_PER_DAY_SQL = `select to_char(created_at at time zone 'UTC', 'YYYY-MM-DD') as day,
     count(*)::int as total,
     (count(*) filter (where status = any($4::text[])))::int as failed
   from trigger_runs
