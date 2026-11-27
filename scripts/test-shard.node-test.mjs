@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { timingEntries } from "./generate-test-timings.mjs";
 import { partitionFiles } from "./test-parallel.mjs";
 import {
   RETRY_CAP,
@@ -341,6 +342,12 @@ test("artifacts and the summary hide env values and the host name", async (t) =>
     assert.ok(!everything.includes(secret), secret);
   }
   assert.match(everything, /\[redacted\]/u);
+  const saved = JSON.parse(await readFile(join(directory, "out", "shard-1.json"), "utf8"));
+  assert.deepEqual(saved.testResults.map(({ name }) => name).sort(), ["a.test.ts", "ok.test.ts"]);
+  assert.deepEqual(timingEntries(saved, root).sort(), [
+    ["a.test.ts", 1500],
+    ["ok.test.ts", 1500],
+  ]);
   assert.match(
     printed.join("\n"),
     /::warning title=Retried after a container-start timeout::a\.test\.ts/u,

@@ -242,6 +242,15 @@ export function stepSummary({ title, line, report, root, retried }) {
   return `${lines.join("\n")}\n`;
 }
 
+/** Report file names relative to the repository, so artifacts carry no runner paths. */
+export function relativizeReport(report, root) {
+  const testResults = report.testResults.map((entry) => ({
+    ...entry,
+    name: relative(root, entry.name),
+  }));
+  return { ...report, testResults };
+}
+
 /** Writes the artifact files. Env values and the host name are removed from every file. */
 export function writeShardArtifacts(directory, label, { report, summary, logs }, values) {
   mkdirSync(directory, { recursive: true });
@@ -374,7 +383,8 @@ export async function runShardJob(options) {
       ["vitest.log", result.logs[0]],
       ["vitest.retry.log", result.logs[1] ?? ""],
     ];
-    writeShardArtifacts(reportDir, label, { report: result.report, summary, logs }, values);
+    const report = relativizeReport(result.report, root);
+    writeShardArtifacts(reportDir, label, { report, summary, logs }, values);
   }
   const markdown = stepSummary({ title, line, report: result.report, root, retried });
   appendStepSummary(summaryPath, redactText(markdown, values));

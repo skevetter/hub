@@ -81,8 +81,9 @@ With `TEST_SHARD_REPORT_DIR` set, the run writes `shard-<i>.json` (or `built-onl
 `.summary.json` next to it, `vitest.log` and, after a retry, `vitest.retry.log`. Values of
 environment variables whose names suggest secrets, plus the host name, are replaced with
 `[redacted]` in those files and in the step summary. To refresh `scripts/test-timings.json`, run
-`node scripts/generate-test-timings.mjs` on the downloaded `shard-<i>.json` files of one
-complete run.
+`node scripts/generate-test-timings.mjs <dir>`, where `<dir>` holds the downloaded
+`shard-<i>.json` files of one complete run and a copy of `built-only.json` named
+`shard-<n>.json`.
 
 The test commands and runtime-file map generator print the target root, branch, HEAD, worktree
 status, current directory and planned action. Calling a script by path from a different Git
