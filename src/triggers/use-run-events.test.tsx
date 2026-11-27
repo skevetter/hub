@@ -60,6 +60,20 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+const deliveryOrders = [
+  ["snapshot", "known", "seal"],
+  ["snapshot", "seal", "known"],
+  ["known", "snapshot", "seal"],
+  ["known", "seal", "snapshot"],
+  ["seal", "snapshot", "known"],
+  ["seal", "known", "snapshot"],
+] as const;
+const deliveries = [false, true].flatMap((initiallyAvailable) =>
+  (["captured", "derived"] as const).flatMap((origin) =>
+    deliveryOrders.map((order) => ({ initiallyAvailable, origin, order })),
+  ),
+);
+
 describe("run event subscription", () => {
   it("orders and deduplicates replay and merges calls within a step only", () => {
     const { subscription, sources } = fixture();
@@ -367,80 +381,68 @@ describe("run event subscription", () => {
     streamEnabled: false,
     origin: null,
   };
-  const deliveryOrders = [
-    ["snapshot", "known", "seal"],
-    ["snapshot", "seal", "known"],
-    ["known", "snapshot", "seal"],
-    ["known", "seal", "snapshot"],
-    ["seal", "snapshot", "known"],
-    ["seal", "known", "snapshot"],
-  ] as const;
-  for (const initiallyAvailable of [false, true]) {
-    for (const origin of ["captured", "derived"] as const) {
-      for (const order of deliveryOrders) {
-        it(`retains ${origin} evidence across ${initiallyAvailable ? "on-to-off" : "off-to-on"} ${order.join("/")}`, () => {
-          const initial = {
-            ...absent,
-            timelineEnabled: initiallyAvailable,
-            timelineUnavailable: !initiallyAvailable,
-          };
-          const staleSnapshot = { ...absent, status: "succeeded" };
-          const known = {
-            ...emptyTimeline,
-            status: "succeeded",
-            streamEnabled: false,
-            origin,
-            timelineEnabled: !initiallyAvailable,
-            stepRowsOmitted: 7,
-            droppedCount: 9,
-            events: [runEvent(1, "run_started")],
-          };
-          const { subscription, seal } = fixture(initial);
-          try {
-            for (const operation of order) {
-              if (operation === "snapshot") subscription.acceptSnapshot(staleSnapshot, 1);
-              else if (operation === "known") subscription.acceptPage(known, 2);
-              else
-                subscription.acceptPage(
-                  {
-                    ...known,
-                    sealedSeq: 2,
-                    events: [runEvent(2, "run_finished", { status: "succeeded" })],
-                  },
-                  3,
-                );
-            }
-            const state = subscription.snapshot();
-            assert.equal(state.connection, null);
-            assert.equal(state.timelineUnavailable, false);
-            assert.equal(state.origin, origin);
-            assert.equal(state.status, "succeeded");
-            assert.equal(state.stepRowsOmitted, 7);
-            assert.equal(state.droppedCount, 9);
-            assert.equal(state.lastSeq, 2);
-            assert.equal(state.sealedSeq, 2);
-            assert.equal(seal.mock.calls.length, 1);
-            subscription.acceptSnapshot(staleSnapshot, 1);
-            subscription.acceptPage(absent, 0);
-            assert.deepEqual(
-              subscription.snapshot().events.map((event) => event.seq),
-              [1, 2],
+  for (const { initiallyAvailable, origin, order } of deliveries) {
+    it(`retains ${origin} evidence across ${initiallyAvailable ? "on-to-off" : "off-to-on"} ${order.join("/")}`, () => {
+      const initial = {
+        ...absent,
+        timelineEnabled: initiallyAvailable,
+        timelineUnavailable: !initiallyAvailable,
+      };
+      const staleSnapshot = { ...absent, status: "succeeded" };
+      const known = {
+        ...emptyTimeline,
+        status: "succeeded",
+        streamEnabled: false,
+        origin,
+        timelineEnabled: !initiallyAvailable,
+        stepRowsOmitted: 7,
+        droppedCount: 9,
+        events: [runEvent(1, "run_started")],
+      };
+      const { subscription, seal } = fixture(initial);
+      try {
+        for (const operation of order) {
+          if (operation === "snapshot") subscription.acceptSnapshot(staleSnapshot, 1);
+          else if (operation === "known") subscription.acceptPage(known, 2);
+          else
+            subscription.acceptPage(
+              {
+                ...known,
+                sealedSeq: 2,
+                events: [runEvent(2, "run_finished", { status: "succeeded" })],
+              },
+              3,
             );
-            assert.equal(subscription.snapshot().sealedSeq, 2);
-            assert.equal(subscription.snapshot().lastSeq, 2);
-            assert.equal(subscription.snapshot().stepRowsOmitted, 7);
-            assert.equal(subscription.snapshot().droppedCount, 9);
-            assert.equal(subscription.snapshot().status, "succeeded");
-            assert.equal(subscription.snapshot().origin, origin);
-            assert.equal(subscription.snapshot().timelineUnavailable, false);
-            assert.equal(subscription.snapshot().connection, null);
-            assert.equal(seal.mock.calls.length, 1);
-          } finally {
-            subscription.stop();
-          }
-        });
+        }
+        const state = subscription.snapshot();
+        assert.equal(state.connection, null);
+        assert.equal(state.timelineUnavailable, false);
+        assert.equal(state.origin, origin);
+        assert.equal(state.status, "succeeded");
+        assert.equal(state.stepRowsOmitted, 7);
+        assert.equal(state.droppedCount, 9);
+        assert.equal(state.lastSeq, 2);
+        assert.equal(state.sealedSeq, 2);
+        assert.equal(seal.mock.calls.length, 1);
+        subscription.acceptSnapshot(staleSnapshot, 1);
+        subscription.acceptPage(absent, 0);
+        assert.deepEqual(
+          subscription.snapshot().events.map((event) => event.seq),
+          [1, 2],
+        );
+        assert.equal(subscription.snapshot().sealedSeq, 2);
+        assert.equal(subscription.snapshot().lastSeq, 2);
+        assert.equal(subscription.snapshot().stepRowsOmitted, 7);
+        assert.equal(subscription.snapshot().droppedCount, 9);
+        assert.equal(subscription.snapshot().status, "succeeded");
+        assert.equal(subscription.snapshot().origin, origin);
+        assert.equal(subscription.snapshot().timelineUnavailable, false);
+        assert.equal(subscription.snapshot().connection, null);
+        assert.equal(seal.mock.calls.length, 1);
+      } finally {
+        subscription.stop();
       }
-    }
+    });
   }
 
   const evidence: { name: string; patch: Partial<RunEventPage> }[] = [
