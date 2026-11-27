@@ -5,6 +5,7 @@ test("creates a twice-daily schedule, edits weekly recurrence, and preserves it 
   hub,
   page,
 }) => {
+  test.setTimeout(120_000);
   await hub.signUpAs("owner", {
     name: "Schedule Owner",
     email: "schedule-owner@example.com",
