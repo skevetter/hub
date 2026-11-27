@@ -1,0 +1,55 @@
+name: CD control
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Production control command
+        type: choice
+        required: true
+        options: [status, pause, unpause, selftest]
+
+permissions: {}
+
+jobs:
+  control:
+    name: control
+    if: github.ref == 'refs/heads/main' && github.repository == 'skevetter/hub'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - name: Require a production control event
+        run: |
+          [[ "$GITHUB_REPOSITORY" == skevetter/hub && "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+      - name: Write SSH credentials
+        env:
+          VPS2_SSH_PRIVATE_KEY: ${{ secrets.VPS2_SSH_PRIVATE_KEY }}
+          VPS2_SSH_KNOWN_HOSTS: ${{ secrets.VPS2_SSH_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          [[ -n "$VPS2_SSH_PRIVATE_KEY" && -n "$VPS2_SSH_KNOWN_HOSTS" ]]
+          printf '%s\n' "$VPS2_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/hub-deploy-key"
+          printf '%s\n' "$VPS2_SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/hub-deploy-known-hosts"
+      - name: Run control command
+        env:
+          CONTROL_ACTION: ${{ inputs.action }}
+          VPS2_SSH_HOST: ${{ secrets.VPS2_SSH_HOST }}
+          VPS2_SSH_PORT: ${{ secrets.VPS2_SSH_PORT }}
+        run: |
+          case "$CONTROL_ACTION" in
+            status|pause|unpause|selftest) bash scripts/cd/deploy.sh "$CONTROL_ACTION" ;;
+            *) exit 2 ;;
+          esac
+      - name: Remove SSH credentials
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/hub-deploy-key" "$RUNNER_TEMP/hub-deploy-known-hosts"
