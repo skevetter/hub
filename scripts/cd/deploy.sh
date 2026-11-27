@@ -7,8 +7,6 @@ source "$CD_DIR/ssh.sh"
 
 install_attempted=false
 deployed=false
-recording=false
-interrupted=0
 
 logged() {
   local result code=0
@@ -19,6 +17,12 @@ logged() {
   fi
   printf '%s\n' "$result"
   return "$code"
+}
+
+# Wait in the parent shell so its signal trap can run while the call is in flight.
+wait_bg() {
+  "$@" &
+  wait "$!"
 }
 
 external_smoke() {
@@ -37,15 +41,18 @@ wait_for_release() {
   local attempt code
   for ((attempt=1; attempt<=15; attempt++)); do
     code=0
-    logged wait 60 >/dev/null || code=$?
+    wait_bg logged wait 60 >/dev/null || code=$?
     if [[ "$code" != 5 ]]; then return "$code"; fi
   done
   return 5
 }
 
 rollback_release() {
-  local recovery to
-  if ! { recovery=$(logged rollback) && wait_for_release && to=$(jq -er '.to' <<< "$recovery"); }; then
+  local reply to code=0
+  reply=$(mktemp "$RUNNER_TEMP/hub-rollback.XXXXXXXX") || return 1
+  wait_bg logged rollback > "$reply" && wait_for_release && to=$(jq -er '.to' "$reply") || code=$?
+  rm -f -- "$reply"
+  if [[ "$code" != 0 ]]; then
     echo "Rollback did not complete" >&2
     return 1
   fi
@@ -67,7 +74,7 @@ fail_deploy() {
 }
 
 smoke() {
-  logged smoke "$1" >/dev/null && external_smoke
+  wait_bg logged smoke "$1" >/dev/null && wait_bg external_smoke
 }
 
 mark_output() {
@@ -75,30 +82,21 @@ mark_output() {
 }
 
 handle_interruption() {
-  if [[ "$recording" == true ]]; then
-    interrupted="$1"
-    return
-  fi
   trap '' INT TERM
   if [[ "$install_attempted" == true && "$deployed" != true ]]; then
-    mark_output outcome interrupted || :
     pause_failed || echo "Unable to pause deployment after interruption" >&2
+    mark_output outcome interrupted || :
   fi
   exit "$1"
 }
 
 record_deployment() {
-  local code=0
-  # Finish handling the bounded record reply before deciding whether to pause.
-  recording=true
-  if logged record "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null; then
-    deployed=true
-    mark_output deployed || code=$?
+  if ! wait_bg logged record "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null; then
+    fail_deploy pause record-failed
+    return
   fi
-  recording=false
-  if [[ "$interrupted" != 0 ]]; then handle_interruption "$interrupted"; fi
-  if [[ "$deployed" != true ]]; then fail_deploy pause record-failed; return; fi
-  return "$code"
+  deployed=true
+  mark_output deployed
 }
 
 finish_install() {
@@ -140,15 +138,12 @@ check_running() {
 }
 
 install_release() {
-  local pid code=0
+  local code=0
   trap 'handle_interruption 130' INT
   trap 'handle_interruption 143' TERM
   mark_output install_attempted
   install_attempted=true
-  # Waiting on a child lets Bash run the trap before the SSH reply arrives.
-  logged install "$DEPLOY_VERSION" "$DEPLOY_CHECKSUM" >/dev/null &
-  pid=$!
-  wait "$pid" || code=$?
+  wait_bg logged install "$DEPLOY_VERSION" "$DEPLOY_CHECKSUM" >/dev/null || code=$?
   case "$code" in
     0) finish_install ;;
     2)

@@ -81,6 +81,10 @@ releases.
 
 - Holds are stored in the GitHub Release prerelease flag. Anyone with repository write access
   can change that flag.
+- If the newest legacy `v0.*` tag is itself a held prerelease, it becomes the legacy scan
+  baseline and its own migrations are not scanned.
+- Path classification trusts release tags. The settings step applies a ruleset that protects
+  `v*` tags.
 - Store deploy secrets only in the `production` environment, never at repository level.
 - The `production` environment limits deployment to `main`.
 - A runner killed without running its signal traps can leave an accepted install unrecorded.

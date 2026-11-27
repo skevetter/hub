@@ -3,9 +3,10 @@
 cd_version='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
 
 cd_ssh() {
-  local seconds=120
+  local seconds=120 connect_seconds=20 timeout_option=--kill-after=1
   case "$1" in
-    status|precheck\ *|pause\ *) seconds=15 ;;
+    status|precheck\ *) seconds=15 ;;
+    pause\ *) seconds=8; connect_seconds=5; timeout_option=--signal=KILL ;;
     install\ *|rollback|record\ *) seconds=30 ;;
     backup\ *) seconds=330 ;;
     smoke\ *) seconds=150 ;;
@@ -13,10 +14,10 @@ cd_ssh() {
     wait\ 60) seconds=100 ;;
     wait\ *) seconds=150 ;;
   esac
-  timeout --foreground --kill-after=1 "$seconds" \
+  timeout --foreground "$timeout_option" "$seconds" \
     ssh -q -n -T -F /dev/null -p "$VPS2_SSH_PORT" -i "$RUNNER_TEMP/hub-deploy-key" \
     -o BatchMode=yes -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
-    -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    -o "ConnectTimeout=$connect_seconds" -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
     -o ClearAllForwardings=yes -o GlobalKnownHostsFile=/dev/null \
     -o "UserKnownHostsFile=$RUNNER_TEMP/hub-deploy-known-hosts" \
     -- "hub-deploy@$VPS2_SSH_HOST" "$1" 2>/dev/null

@@ -11,6 +11,12 @@ const ssh = `#!/usr/bin/env bash
 command=\${@: -1}
 printf '%s\\n' "\${command%% *}" >> "$RUNNER_TEMP/calls"
 echo "$VPS2_SSH_HOST $RUNNER_TEMP/hub-deploy-key" >&2
+if [[ "$command" == "$SLOW_CALL" ]]; then
+  node -p 'Date.now()' > "$RUNNER_TEMP/signal-time"
+  kill -s "$SLOW_SIGNAL" "$DEPLOY_PID"
+  sleep 4
+  printf '%s\\n' slow-reply >> "$RUNNER_TEMP/calls"
+fi
 case "$command" in
   status) echo "{\\"ok\\":true,\\"commit\\":$RUNNING,\\"private\\":\\"$VPS2_SSH_HOST\\",\\"version\\":\\"1.0.0\\\\n$VPS2_SSH_HOST\\"}" ;;
   backup*) echo '{"ok":true,"entries":5,"bytes":99,"file":"/private/database.dump"}' ;;
@@ -37,7 +43,10 @@ case "$command" in
     echo '{"ok":true,"state":"done"}' ;;
   wait*) echo '{"ok":true,"state":"done"}' ;;
   record*) if [[ "$RECORD_FAIL" == yes ]]; then echo '{"ok":false}'; exit 4; fi
-    if [[ "$INTERRUPT_RECORD" == yes ]]; then kill -TERM "$DEPLOY_PID"; fi
+    echo '{"ok":true}' ;;
+  pause*)
+    [[ " $* " == *" ConnectTimeout=5 "* ]] || exit 4
+    node -p 'Date.now()' > "$RUNNER_TEMP/pause-time"
     echo '{"ok":true}' ;;
   smoke\\ 1.1.0)
     if [[ "$SMOKE_FAIL" == yes ]]; then echo '{"ok":false,"checks":{"local_health":false}}'; exit 3; fi
@@ -108,7 +117,12 @@ function execute(action, options = {}) {
       result.stdout + result.stderr,
       /sensitive\.example|hub-deploy-key|database\.dump|15123/u,
     );
-    return { ...result, calls, output: readFileSync(outputPath, "utf8") };
+    const pauseDelay =
+      options.SLOW_CALL && calls.includes("pause")
+        ? Number(readFileSync(join(temp, "pause-time"), "utf8")) -
+          Number(readFileSync(join(temp, "signal-time"), "utf8"))
+        : undefined;
+    return { ...result, calls, pauseDelay, output: readFileSync(outputPath, "utf8") };
   } finally {
     rmSync(temp, { recursive: true, force: true });
   }
@@ -170,12 +184,23 @@ test("clears the attempted flag without pausing when install is refused", () => 
   assert.deepEqual(result.calls, deployCalls.slice(0, 5));
 });
 
-test("does not pause when cancellation arrives during a successful record", () => {
-  const result = execute("deploy", { INTERRUPT_RECORD: "yes" });
-  assert.equal(result.status, 143, result.stderr);
-  assert.equal(result.output, "install_attempted=true\ndeployed=true\n");
-  assert.deepEqual(result.calls, [...deployCalls, "record"]);
-});
+for (const [SLOW_CALL, SLOW_SIGNAL, code] of [
+  ["wait 60", "INT", 130],
+  ["smoke 1.1.0", "TERM", 143],
+  [`record 1.1.0 ${"a".repeat(40)}`, "TERM", 143],
+]) {
+  const verb = SLOW_CALL.split(" ")[0];
+  test(`pauses within 3 seconds while ${verb} is in flight`, () => {
+    const result = execute("deploy", { SLOW_CALL, SLOW_SIGNAL });
+    assert.equal(result.status, code, result.stderr);
+    assert.equal(result.output, "install_attempted=true\noutcome=interrupted\n");
+    assert.ok(
+      result.pauseDelay >= 0 && result.pauseDelay < 3000,
+      `pause took ${result.pauseDelay}ms`,
+    );
+    assert.deepEqual(result.calls.slice(-3), [verb, "pause", "slow-reply"]);
+  });
+}
 
 test("fails closed when git cannot establish ancestry", () => {
   const result = execute("deploy", { RUNNING: JSON.stringify("c".repeat(40)), ANCESTRY: "128" });
