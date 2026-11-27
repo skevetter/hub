@@ -1,0 +1,102 @@
+name: Measure test shards (temporary)
+
+# Remove this file before the pull request merges.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/measure-test-shards.yml
+
+concurrency:
+  group: measure-test-shards-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit-shard-${{ matrix.index }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4, 5, 6]
+    env:
+      TEST_SHARD_INDEX: ${{ matrix.index }}
+      TEST_SHARD_TOTAL: 6
+      TEST_SHARD_REPORT_DIR: ${{ runner.temp }}/shard-report
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run shard
+        run: npm run test:parallel
+
+      - name: Upload shard report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unit-shard-${{ matrix.index }}
+          path: ${{ runner.temp }}/shard-report
+          retention-days: 7
+          if-no-files-found: warn
+
+  static:
+    name: static-and-built-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TEST_SHARD_TOTAL: 6
+      TEST_SHARD_REPORT_DIR: ${{ runner.temp }}/shard-report
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Script tests
+        run: npm run test:scripts
+
+      - name: Check shard coverage
+        run: npm run test:parallel -- --check-coverage
+
+      - name: Build production application
+        run: npm run build
+
+      - name: Run built-server tests
+        run: npm run test:parallel -- --built-only
+
+      - name: Upload built-only report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unit-built-only
+          path: ${{ runner.temp }}/shard-report
+          retention-days: 7
+          if-no-files-found: warn
