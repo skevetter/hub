@@ -15,7 +15,10 @@ import {
 } from "./runtime/index.js";
 import { drainReceiptSweep } from "./test-utils/receipt-expiry.js";
 import { CUTOFF, NOW, OLD } from "./test-utils/receipt-proof-fixture.js";
-import { createTimelinePostgresHarness } from "./test-utils/run-timeline-postgres.js";
+import {
+  createTimelinePostgresHarness,
+  type TimelinePostgresConnection,
+} from "./test-utils/run-timeline-postgres.js";
 import type { Database, GitHubConnectionRecord } from "./types.js";
 
 const organizationId = "receipt-auxiliary";
@@ -135,6 +138,40 @@ async function verifyPair(database: Database) {
       hasCopy ? OLD.getTime() : undefined,
     );
   }
+  await verifyLifecycleSweep(database, copy);
+  const markedCopy = await database.findProviderEventReceiptById(copy.id);
+  assert.equal(markedCopy?.payloadExpiryState, "expired");
+  assert.equal(markedCopy?.signatureHash, input.signatureHash);
+  assert.equal(markedCopy?.payload, null);
+  assert.deepEqual(
+    await database.claimGitHubLifecycleReceipt({ ...input, deliveryId: "changed-header" }),
+    {
+      status: "duplicate",
+      installationSyncId: claim.installationSyncId,
+    },
+  );
+  await database.retryGitHubInstallationSync(owner, claim.installationSyncId);
+  await database.applyGitHubInstallationSync(owner, claim, {
+    status: "present",
+    identity,
+    repositories: [],
+  });
+  assert.equal(await database.findGitHubConnection(41), undefined);
+  assert.equal(
+    (await database.findProviderEventReceiptById(copy.id))?.payloadExpiryState,
+    "expired",
+  );
+  assert.deepEqual(
+    await database.expireGitHubSyncPayload(claim.installationSyncId, syncCutoff, syncExpiry),
+    {
+      status: "skipped",
+      disposition: "changed_or_missing",
+    },
+  );
+  return { claim, copy, unbound, unresolved };
+}
+
+async function verifyLifecycleSweep(database: Database, copy: { id: string }) {
   const firstReceiptPage = await database.scanReceiptPayloads(null, syncCutoff, 1);
   assert.deepEqual(firstReceiptPage.candidates, []);
   assert.ok(firstReceiptPage.nextCursor);
@@ -172,36 +209,6 @@ async function verifyPair(database: Database) {
     count: 1,
     oldestAgeMs: syncExpiry.getTime() - OLD.getTime(),
   });
-  const markedCopy = await database.findProviderEventReceiptById(copy.id);
-  assert.equal(markedCopy?.payloadExpiryState, "expired");
-  assert.equal(markedCopy?.signatureHash, input.signatureHash);
-  assert.equal(markedCopy?.payload, null);
-  assert.deepEqual(
-    await database.claimGitHubLifecycleReceipt({ ...input, deliveryId: "changed-header" }),
-    {
-      status: "duplicate",
-      installationSyncId: claim.installationSyncId,
-    },
-  );
-  await database.retryGitHubInstallationSync(owner, claim.installationSyncId);
-  await database.applyGitHubInstallationSync(owner, claim, {
-    status: "present",
-    identity,
-    repositories: [],
-  });
-  assert.equal(await database.findGitHubConnection(41), undefined);
-  assert.equal(
-    (await database.findProviderEventReceiptById(copy.id))?.payloadExpiryState,
-    "expired",
-  );
-  assert.deepEqual(
-    await database.expireGitHubSyncPayload(claim.installationSyncId, syncCutoff, syncExpiry),
-    {
-      status: "skipped",
-      disposition: "changed_or_missing",
-    },
-  );
-  return { claim, copy, unbound, unresolved };
 }
 
 async function verifyDiagnostic(database: Database, runtime?: QueryHandle) {
@@ -460,35 +467,7 @@ it.each(["success", "failure"] as const)(
           },
         });
         const second = await harness.connect();
-        if (expiryFirst) {
-          const expiring = first.database.expireGitHubCursorDiagnostic(
-            "notifications",
-            CUTOFF,
-            NOW,
-          );
-          await Promise.race([held.promise, expiring.then(() => assert.fail("no cursor barrier"))]);
-          const updating = change(second.database);
-          try {
-            assert.equal(await harness.waitForLockOrRead(second.pid), "blocked");
-          } finally {
-            release.resolve();
-            await Promise.all([expiring, updating]);
-          }
-        } else {
-          await first.runtime.query("begin");
-          try {
-            await change(first.database);
-            assert.deepEqual(
-              await second.database.expireGitHubCursorDiagnostic("notifications", CUTOFF, NOW),
-              {
-                status: "skipped",
-                disposition: "locked",
-              },
-            );
-          } finally {
-            await first.runtime.query("commit");
-          }
-        }
+        await raceCursorExpiry(harness, first, second, { change, expiryFirst, held, release });
         const status = await harness.database.githubNotifications.readStatus();
         assert.equal(status.lastError, transition === "success" ? null : "replacement-diagnostic");
         assert.equal(
@@ -506,6 +485,49 @@ it.each(["success", "failure"] as const)(
   },
   120_000,
 );
+
+async function raceCursorExpiry(
+  harness: Awaited<ReturnType<typeof createTimelinePostgresHarness>>,
+  first: TimelinePostgresConnection,
+  second: TimelinePostgresConnection,
+  {
+    change,
+    expiryFirst,
+    held,
+    release,
+  }: {
+    change: (database: Database) => Promise<unknown>;
+    expiryFirst: boolean;
+    held: PromiseWithResolvers<void>;
+    release: PromiseWithResolvers<void>;
+  },
+) {
+  if (expiryFirst) {
+    const expiring = first.database.expireGitHubCursorDiagnostic("notifications", CUTOFF, NOW);
+    await Promise.race([held.promise, expiring.then(() => assert.fail("no cursor barrier"))]);
+    const updating = change(second.database);
+    try {
+      assert.equal(await harness.waitForLockOrRead(second.pid), "blocked");
+    } finally {
+      release.resolve();
+      await Promise.all([expiring, updating]);
+    }
+  } else {
+    await first.runtime.query("begin");
+    try {
+      await change(first.database);
+      assert.deepEqual(
+        await second.database.expireGitHubCursorDiagnostic("notifications", CUTOFF, NOW),
+        {
+          status: "skipped",
+          disposition: "locked",
+        },
+      );
+    } finally {
+      await first.runtime.query("commit");
+    }
+  }
+}
 
 it("uses sync-before-receipt ordering and commits both lifecycle markers together", async () => {
   const harness = await createTimelinePostgresHarness();

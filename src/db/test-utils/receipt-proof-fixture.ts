@@ -112,30 +112,17 @@ export async function seedProofReceipt(
   input: SeedInput,
 ) {
   const marker = "receipt-body-" + input.key + "-marker";
-  const {
-    provider,
-    source,
-    route,
-    repo = null,
-    droppedReason = null,
-    preRoutingDrop = null,
-  } = input;
+  const metadata = proofReceiptMetadata(input);
+  const { provider, route } = metadata;
   const deliveryId = input.deliveryId ?? input.key;
   const receivedAt = input.receivedAt ?? OLD;
-  const payload = {
-    ...input.payload,
-    sentinel: marker,
-    fixture: {
-      actor: marker + "-actor",
-      data: { content: marker + "-content", deliveryKey: marker + "-key" },
-    },
-  };
+  const payload = proofReceiptPayload(input, marker);
   const signatureHash =
     provider === "github" || provider === "linear" ? "signature-" + input.key : null;
   const received = await database.persistManualEvent({
     organizationId: MATRIX_ORG,
     projectId: route.projectId,
-    source,
+    source: metadata.source,
     deliveryId,
     signatureHash,
     payload,
@@ -148,6 +135,54 @@ export async function seedProofReceipt(
     routeMarker === null
       ? null
       : [{ ...route, fixture: routeMarker }, ...(input.additionalRoutes ?? [])];
+  await updateProofReceipt(database, runtime, metadata, { id, acceptedRoutes });
+  const runs: string[] = [];
+  for (const reference of input.references ?? []) {
+    runs.push(await seedProofBranch(database, runtime, { id, route, reference }));
+  }
+  return {
+    id,
+    key: input.key,
+    marker,
+    routeMarker,
+    deliveryId,
+    signatureHash,
+    disposition: input.disposition,
+    route,
+    runs,
+  };
+}
+
+function proofReceiptMetadata(input: SeedInput) {
+  const {
+    provider,
+    source,
+    route,
+    repo = null,
+    droppedReason = null,
+    preRoutingDrop = null,
+  } = input;
+  return { provider, source, route, repo, droppedReason, preRoutingDrop };
+}
+
+function proofReceiptPayload(input: SeedInput, marker: string) {
+  return {
+    ...input.payload,
+    sentinel: marker,
+    fixture: {
+      actor: marker + "-actor",
+      data: { content: marker + "-content", deliveryKey: marker + "-key" },
+    },
+  };
+}
+
+async function updateProofReceipt(
+  database: Database,
+  runtime: QueryHandle | undefined,
+  metadata: ReturnType<typeof proofReceiptMetadata>,
+  { id, acceptedRoutes }: { id: string; acceptedRoutes: ProviderEventRouteSnapshot[] | null },
+) {
+  const { provider, route, repo, droppedReason, preRoutingDrop } = metadata;
   if (runtime !== undefined) {
     await runtime.query(
       `update provider_event_receipts set provider = $2, connection_id = $3, resource_id = $4, repo = $5,
@@ -176,29 +211,20 @@ export async function seedProofReceipt(
       acceptedRoutes,
     });
   }
-  const runs: string[] = [];
-  for (const reference of input.references ?? []) {
-    runs.push(await seedProofBranch(database, runtime, id, route, reference));
-  }
-  return {
-    id,
-    key: input.key,
-    marker,
-    routeMarker,
-    deliveryId,
-    signatureHash,
-    disposition: input.disposition,
-    route,
-    runs,
-  };
 }
 
 async function seedProofBranch(
   database: Database,
   runtime: QueryHandle | undefined,
-  id: string,
-  route: ProviderEventRouteSnapshot,
-  reference: NonNullable<SeedInput["references"]>[number],
+  {
+    id,
+    route,
+    reference,
+  }: {
+    id: string;
+    route: ProviderEventRouteSnapshot;
+    reference: NonNullable<SeedInput["references"]>[number];
+  },
 ) {
   const branch = reference.route ?? route;
   const runInput = {
@@ -221,7 +247,18 @@ async function seedProofBranch(
           rejection: { code: "missing_required", inputName: "required" },
         })
       : await database.createAcceptedTriggerRun(runInput);
-  const state = reference.state ?? "expired";
+  await finishProofBranch(database, runtime, run, reference.state ?? "expired");
+  return run.id;
+}
+
+async function finishProofBranch(
+  database: Database,
+  runtime: QueryHandle | undefined,
+  run: { id: string },
+  state: FixtureState,
+) {
+  const expiryState = state === "intact" ? null : state;
+  const expiredAt = state === "intact" ? null : NOW;
   if (runtime !== undefined) {
     await runtime.query("delete from workflow_wakeups where trigger_run_id = $1", [run.id]);
     await runtime.query(
@@ -230,8 +267,8 @@ async function seedProofBranch(
       [
         run.id,
         NOW,
-        state === "intact" ? null : state,
-        state === "intact" ? null : NOW,
+        expiryState,
+        expiredAt,
         state === "intact"
           ? null
           : { stepCounts: {}, repository: null, links: [], completion: null },
@@ -244,12 +281,11 @@ async function seedProofBranch(
     const complete = await database.findTriggerRunById(run.id);
     assert.ok(complete);
     Object.assign(complete, {
-      payloadExpiryState: state === "intact" ? null : state,
-      payloadExpiredAt: state === "intact" ? null : NOW,
+      payloadExpiryState: expiryState,
+      payloadExpiredAt: expiredAt,
       terminalNotificationPendingAt: null,
     });
   }
-  return run.id;
 }
 
 export function githubBody(id: string, actor = "sender", type = "issues") {
@@ -267,6 +303,24 @@ export function githubBody(id: string, actor = "sender", type = "issues") {
 export async function seedProofMatrix(database: Database, runtime?: QueryHandle) {
   const seed = (input: SeedInput) => seedProofReceipt(database, runtime, input);
   const sender = { from_users: ["sender"] };
+  const githubCases = await seedGithubCases(database, seed, sender);
+  const linearCases = await seedLinearCases(database, seed, sender);
+  const manualCases = await seedManualCases(database, seed, sender);
+  const lastCases = await seedRemainingCases(database, seed);
+  return [...githubCases, ...linearCases, ...manualCases, ...lastCases];
+}
+
+type SeedReceipt = (input: SeedInput) => ReturnType<typeof seedProofReceipt>;
+interface SenderFilter {
+  from_users: string[];
+}
+interface GithubRoutes {
+  github: ProviderEventRouteSnapshot;
+  githubRejected: ProviderEventRouteSnapshot;
+  githubOther: ProviderEventRouteSnapshot;
+}
+
+async function seedGithubCases(database: Database, seed: SeedReceipt, sender: SenderFilter) {
   const github = {
     ...(await createRevision(database, "github.issue_created", sender)),
     connectionId: CONNECTION_ID,
@@ -282,8 +336,26 @@ export async function seedProofMatrix(database: Database, runtime?: QueryHandle)
     connectionId: CONNECTION_ID,
     resourceId: "1",
   };
-  const githubBase = { provider: "github", source: "github.issues", repo: "owner/repo" } as const;
+  const routes = { github, githubRejected, githubOther };
   const githubCases = await Promise.all([
+    ...seedGithubMatchCases(seed, routes),
+    ...seedGithubRevisionCases(seed, routes),
+    ...seedGithubDropCases(seed, routes),
+  ]);
+  await createRevision(database, "github.pull_request_created", sender, {
+    projectId: github.projectId,
+  });
+
+  return githubCases;
+}
+
+const githubBase = { provider: "github", source: "github.issues", repo: "owner/repo" } as const;
+
+function seedGithubMatchCases(
+  seed: SeedReceipt,
+  { github, githubRejected, githubOther }: GithubRoutes,
+) {
+  return [
     seed({
       ...githubBase,
       key: "github-accepted",
@@ -334,6 +406,14 @@ export async function seedProofMatrix(database: Database, runtime?: QueryHandle)
       references: [{}, { route: githubRejected, state: "expiring", outcome: "rejected" }],
       disposition: "run_payload_pending",
     }),
+  ];
+}
+
+function seedGithubRevisionCases(
+  seed: SeedReceipt,
+  { github, githubRejected, githubOther }: GithubRoutes,
+) {
+  return [
     seed({
       ...githubBase,
       key: "github-young-sibling",
@@ -374,6 +454,11 @@ export async function seedProofMatrix(database: Database, runtime?: QueryHandle)
       references: [{}],
       disposition: "not_old_enough",
     }),
+  ];
+}
+
+function seedGithubDropCases(seed: SeedReceipt, { github }: GithubRoutes) {
+  return [
     seed({
       ...githubBase,
       key: "github-push",
@@ -424,11 +509,10 @@ export async function seedProofMatrix(database: Database, runtime?: QueryHandle)
       noRoutes: true,
       disposition: "drop_unproven",
     }),
-  ]);
-  await createRevision(database, "github.pull_request_created", sender, {
-    projectId: github.projectId,
-  });
+  ];
+}
 
+async function seedLinearCases(database: Database, seed: SeedReceipt, sender: SenderFilter) {
   const linear = {
     ...(await createRevision(database, "linear.issue_assigned", sender)),
     connectionId: CONNECTION_ID,
@@ -452,7 +536,7 @@ export async function seedProofMatrix(database: Database, runtime?: QueryHandle)
     issue,
     updatedFrom: { assigneeId: null },
   };
-  const linearCases = await Promise.all([
+  return Promise.all([
     seed({
       key: "linear",
       provider: "linear",
@@ -475,7 +559,9 @@ export async function seedProofMatrix(database: Database, runtime?: QueryHandle)
       disposition: "match_evidence_missing",
     }),
   ]);
+}
 
+async function seedManualCases(database: Database, seed: SeedReceipt, sender: SenderFilter) {
   const triggerId = randomUUID();
   const manual = await createRevision(database, "manual.run", sender, { triggerId });
   const manualFilter = await createRevision(
@@ -495,106 +581,167 @@ export async function seedProofMatrix(database: Database, runtime?: QueryHandle)
   const digest = "a".repeat(64);
   const signedId = signedWebhookDeliveryId(MATRIX_ORG, "key", digest);
   const signedBody = { ...identity, publicDeliveryKey: "github-sha256:" + digest };
-  const manualCases = [
-    await seed({
-      key: "manual",
-      provider: "manual",
-      source: "manual.run",
-      route: manual,
-      payload: manualBody,
-      references: [{}],
-      disposition: "eligible",
-    }),
-    await seed({
-      key: "manual-orphan",
-      provider: "manual",
-      source: "manual.run",
-      route: manual,
-      payload: manualBody,
-      disposition: "pending_admission",
-    }),
-    await seed({
-      key: "manual-synthetic",
-      provider: "manual",
-      source: "discord.mention",
-      route: manual,
-      payload: manualBody,
-      disposition: "unknown_shape",
-    }),
-    await seed({
-      key: "bearer",
-      provider: "manual",
-      source: "webhook.received",
-      route: manual,
-      deliveryId: bearer(manual, "bearer-key"),
-      payload: { ...identity, publicDeliveryKey: "bearer-key" },
-      references: [{}],
-      disposition: "eligible",
-    }),
-    await seed({
-      key: "bearer-pending",
-      provider: "manual",
-      source: "webhook.received",
-      route: manual,
-      deliveryId: bearer(manual, "pending-key"),
-      payload: { ...identity, publicDeliveryKey: "pending-key" },
-      disposition: "pending_admission",
-    }),
-    await seed({
-      key: "bearer-filtered",
-      provider: "manual",
-      source: "webhook.received",
-      route: manualFilter,
-      deliveryId: bearer(manualFilter, "filter-key"),
-      payload: {
-        ...identity,
-        publicDeliveryKey: "filter-key",
-        input: { message: "body", required: "skip" },
-      },
-      droppedReason: "trigger_filters_rejected",
-      disposition: "eligible",
-    }),
-    await seed({
-      key: "signed",
-      provider: "manual",
-      source: "webhook.received",
-      route: manual,
-      deliveryId: signedId,
-      payload: signedBody,
-      references: [{}],
-      disposition: "eligible",
-    }),
-    await seed({
-      key: "signed-unproved",
-      provider: "manual",
-      source: "webhook.received",
-      route: missingSigner,
-      deliveryId: signedWebhookDeliveryId(MATRIX_ORG, "other", digest),
-      payload: {
-        ...signedBody,
-        authenticatedBy: { ...identity.authenticatedBy, credentialId: "other" },
-      },
-      references: [{}],
-      disposition: "drop_unproven",
-    }),
-    await seed({
-      key: "slack",
-      provider: "slack",
-      source: "slack.mention",
-      route: manual,
-      payload: {},
-      disposition: "match_evidence_missing",
-    }),
-    await seed({
-      key: "discord",
-      provider: "discord",
-      source: "discord.mention",
-      route: manual,
-      payload: {},
-      disposition: "match_evidence_missing",
-    }),
-  ];
+  const cases = manualCaseInputs({
+    manual,
+    manualFilter,
+    manualBody,
+    identity,
+    bearer,
+    missingSigner,
+    digest,
+    signedId,
+    signedBody,
+  });
+  const seeded = [];
+  for (const input of cases) seeded.push(await seed(input));
+  return seeded;
+}
 
+interface ManualBody {
+  trigger: string;
+  actor: string;
+  input: string;
+}
+interface ManualIdentity extends ManualBody {
+  authenticatedBy: { kind: string; boundActor: string; credentialId: string };
+}
+interface ManualCaseInputs {
+  manual: ProviderEventRouteSnapshot;
+  manualFilter: ProviderEventRouteSnapshot;
+  missingSigner: ProviderEventRouteSnapshot;
+  manualBody: ManualBody;
+  identity: ManualIdentity;
+  bearer: (route: ProviderEventRouteSnapshot, key: string) => string;
+  digest: string;
+  signedId: string;
+  signedBody: ManualIdentity & { publicDeliveryKey: string };
+}
+
+function* manualCaseInputs(options: ManualCaseInputs): Generator<SeedInput> {
+  yield* manualTriggerInputs(options);
+  yield* bearerInputs(options);
+  yield* signedAndChatInputs(options);
+}
+
+function* manualTriggerInputs({ manual, manualBody }: ManualCaseInputs): Generator<SeedInput> {
+  yield {
+    key: "manual",
+    provider: "manual",
+    source: "manual.run",
+    route: manual,
+    payload: manualBody,
+    references: [{}],
+    disposition: "eligible",
+  };
+  yield {
+    key: "manual-orphan",
+    provider: "manual",
+    source: "manual.run",
+    route: manual,
+    payload: manualBody,
+    disposition: "pending_admission",
+  };
+  yield {
+    key: "manual-synthetic",
+    provider: "manual",
+    source: "discord.mention",
+    route: manual,
+    payload: manualBody,
+    disposition: "unknown_shape",
+  };
+}
+
+function* bearerInputs({
+  manual,
+  manualFilter,
+  identity,
+  bearer,
+}: ManualCaseInputs): Generator<SeedInput> {
+  yield {
+    key: "bearer",
+    provider: "manual",
+    source: "webhook.received",
+    route: manual,
+    deliveryId: bearer(manual, "bearer-key"),
+    payload: { ...identity, publicDeliveryKey: "bearer-key" },
+    references: [{}],
+    disposition: "eligible",
+  };
+  yield {
+    key: "bearer-pending",
+    provider: "manual",
+    source: "webhook.received",
+    route: manual,
+    deliveryId: bearer(manual, "pending-key"),
+    payload: { ...identity, publicDeliveryKey: "pending-key" },
+    disposition: "pending_admission",
+  };
+  yield {
+    key: "bearer-filtered",
+    provider: "manual",
+    source: "webhook.received",
+    route: manualFilter,
+    deliveryId: bearer(manualFilter, "filter-key"),
+    payload: {
+      ...identity,
+      publicDeliveryKey: "filter-key",
+      input: { message: "body", required: "skip" },
+    },
+    droppedReason: "trigger_filters_rejected",
+    disposition: "eligible",
+  };
+}
+
+function* signedAndChatInputs({
+  manual,
+  missingSigner,
+  identity,
+  digest,
+  signedId,
+  signedBody,
+}: ManualCaseInputs): Generator<SeedInput> {
+  yield {
+    key: "signed",
+    provider: "manual",
+    source: "webhook.received",
+    route: manual,
+    deliveryId: signedId,
+    payload: signedBody,
+    references: [{}],
+    disposition: "eligible",
+  };
+  yield {
+    key: "signed-unproved",
+    provider: "manual",
+    source: "webhook.received",
+    route: missingSigner,
+    deliveryId: signedWebhookDeliveryId(MATRIX_ORG, "other", digest),
+    payload: {
+      ...signedBody,
+      authenticatedBy: { ...identity.authenticatedBy, credentialId: "other" },
+    },
+    references: [{}],
+    disposition: "drop_unproven",
+  };
+  yield {
+    key: "slack",
+    provider: "slack",
+    source: "slack.mention",
+    route: manual,
+    payload: {},
+    disposition: "match_evidence_missing",
+  };
+  yield {
+    key: "discord",
+    provider: "discord",
+    source: "discord.mention",
+    route: manual,
+    payload: {},
+    disposition: "match_evidence_missing",
+  };
+}
+
+async function seedRemainingCases(database: Database, seed: SeedReceipt) {
   const scheduleId = randomUUID();
   const schedule = await createRevision(database, "schedule.tick", undefined, {
     triggerId: scheduleId,
@@ -603,17 +750,8 @@ export async function seedProofMatrix(database: Database, runtime?: QueryHandle)
   const tickPayload = (time: Date) => ({
     schedule: { trigger_id: scheduleId, scheduled_at: time.toISOString(), timezone: "UTC" },
   });
-  const notificationPayload = {
-    repo: "owner/repo",
-    thread_id: "thread",
-    subject_type: "PullRequest",
-    title: "Private title",
-    number: 1,
-    html_url: "https://github.com/owner/repo/pull/1",
-    reason: "mention",
-    updated_at: OLD.toISOString(),
-  };
-  const lastCases = await Promise.all([
+  const notificationPayload = notificationFixturePayload();
+  return Promise.all([
     seed({
       key: "schedule",
       provider: "schedule",
@@ -655,5 +793,17 @@ export async function seedProofMatrix(database: Database, runtime?: QueryHandle)
       disposition: "fan_out_unresolved",
     }),
   ]);
-  return [...githubCases, ...linearCases, ...manualCases, ...lastCases];
+}
+
+function notificationFixturePayload() {
+  return {
+    repo: "owner/repo",
+    thread_id: "thread",
+    subject_type: "PullRequest",
+    title: "Private title",
+    number: 1,
+    html_url: "https://github.com/owner/repo/pull/1",
+    reason: "mention",
+    updated_at: OLD.toISOString(),
+  };
 }

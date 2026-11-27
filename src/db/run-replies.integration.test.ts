@@ -21,6 +21,14 @@ describe.each(["memory", "postgres"])("run reply admissions (%s)", (driver) => {
     await harness?.close();
   }, 120_000);
 
+  function primaryDatabase() {
+    return harness?.database ?? memory;
+  }
+
+  async function peerDatabase() {
+    return (await harness?.connect())?.database ?? memory;
+  }
+
   async function createRun(replyMessage = true) {
     if (harness)
       return harness.createRun({ ...replyEvidence, ...(replyMessage ? { replyMessage } : {}) });
@@ -42,8 +50,8 @@ describe.each(["memory", "postgres"])("run reply admissions (%s)", (driver) => {
   }
 
   it("reserves one comment across independent clients and retains only delivery metadata", async () => {
-    const database = harness?.database ?? memory;
-    const peer = (await harness?.connect())?.database ?? memory;
+    const database = primaryDatabase();
+    const peer = await peerDatabase();
     const run = await createRun();
     const key = { organizationId: run.organizationId, runId: run.id };
     const input = {
@@ -66,12 +74,28 @@ describe.each(["memory", "postgres"])("run reply admissions (%s)", (driver) => {
     ]);
     assert.deepEqual(attempts.toSorted(), ["already_handled", "reserved"]);
 
-    const freshClient = (await harness?.connect())?.database ?? memory;
+    const freshClient = await peerDatabase();
     const reserved = await freshClient.runReplies.find(key);
     assert.equal(reserved?.state, "sending");
     assert.equal(reserved?.commentId, pending?.commentId);
     assert.equal(reserved?.length, 42);
     assert.equal(reserved?.hash, input.hash);
+    await verifyReplyCompletion(database, freshClient, { run, key, input });
+  });
+
+  async function verifyReplyCompletion(
+    database: ReturnType<typeof primaryDatabase>,
+    freshClient: ReturnType<typeof primaryDatabase>,
+    {
+      run,
+      key,
+      input,
+    }: {
+      run: Awaited<ReturnType<typeof createRun>>;
+      key: { organizationId: string; runId: string };
+      input: Parameters<ReturnType<typeof primaryDatabase>["runReplies"]["reserve"]>[0];
+    },
+  ) {
     const recoverable = await freshClient.runReplies.recoverable(new Date(Date.now() + 1_000));
     assert.ok(recoverable.some(({ runId }) => runId === run.id));
     assert.equal(
@@ -80,7 +104,7 @@ describe.each(["memory", "postgres"])("run reply admissions (%s)", (driver) => {
     );
     assert.equal(await database.runReplies.reserve(input), "already_handled");
     assert.equal((await database.runReplies.find(key))?.state, "sent");
-  });
+  }
 
   it("does not reserve for failed or canceled runs and charges concurrent sends against the cap", async () => {
     const database = harness?.database ?? memory;
@@ -114,10 +138,27 @@ describe.each(["memory", "postgres"])("run reply admissions (%s)", (driver) => {
     );
   });
 
+  async function finishAcceptedRun(database: ReturnType<typeof primaryDatabase>, runId: string) {
+    const terminal = await database.succeedTriggerRun(runId);
+    assert.equal(terminal?.run.outcome, "accepted");
+    if (terminal?.run.outcome !== "accepted") throw new Error("expected accepted run");
+    return terminal.run;
+  }
+
+  async function verifyRepairResult(
+    restarted: ReturnType<typeof primaryDatabase>,
+    key: { organizationId: string; runId: string },
+    retainMarker: boolean,
+  ) {
+    const result = await restarted.runReplies.find(key);
+    assert.equal(result?.state, retainMarker ? "sent" : "refused");
+    assert.equal(result?.failure, retainMarker ? null : "delivery_unconfirmed");
+  }
+
   it.each([true, false])(
     "repairs without another create after a lost response (marker retained: %s)",
     async (retainMarker) => {
-      const database = harness?.database ?? memory;
+      const database = primaryDatabase();
       const run = await createRun();
       const fake = fakeLinearReplies(run.organizationId, database);
       fake.loseCreateResponse();
@@ -127,32 +168,28 @@ describe.each(["memory", "postgres"])("run reply admissions (%s)", (driver) => {
         clientSecret: "fake-client-secret",
         providerApplicationId: "app",
       };
-      const terminal = await database.succeedTriggerRun(run.id);
-      assert.equal(terminal?.run.outcome, "accepted");
-      if (terminal?.run.outcome !== "accepted") throw new Error("expected accepted run");
+      const finishedRun = await finishAcceptedRun(database, run.id);
       const key = { organizationId: run.organizationId, runId: run.id };
       const answer = { text: "Example final answer.", truncated: false };
       const signal = new AbortController().signal;
       await new LinearRunReplyWriter({ ...options, database }).post(
-        terminal.run,
+        finishedRun,
         answer,
         60,
         signal,
       );
 
-      const restarted = (await harness?.connect())?.database ?? memory;
+      const restarted = await peerDatabase();
       const record = await restarted.runReplies.find(key);
       assert.equal(record?.state, "sending");
       assert.doesNotMatch(JSON.stringify(record), /Example final answer/u);
       if (!retainMarker)
         fake.comments.get(record.commentId)!.body = "A comment without the marker.";
       const recoveredWriter = new LinearRunReplyWriter({ ...options, database: restarted });
-      await recoveredWriter.repair(terminal.run, record, signal);
-      await recoveredWriter.post(terminal.run, answer, 60, signal);
+      await recoveredWriter.repair(finishedRun, record, signal);
+      await recoveredWriter.post(finishedRun, answer, 60, signal);
       assert.equal(fake.calls.filter((call) => call === "create").length, 1);
-      const result = await restarted.runReplies.find(key);
-      assert.equal(result?.state, retainMarker ? "sent" : "refused");
-      assert.equal(result?.failure, retainMarker ? null : "delivery_unconfirmed");
+      await verifyRepairResult(restarted, key, retainMarker);
     },
   );
 });
