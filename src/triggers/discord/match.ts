@@ -53,29 +53,30 @@ function matchesFilter(
     return false;
   }
 
+  return matchesAllowlist(event, filter);
+}
+
+function matchesAllowlist(event: NormalizedDiscordMessageEvent, filter: TriggerFilter): boolean {
   if (filter.from_users === undefined || filter.from_users.length === 0) {
     return false;
   }
 
+  return (
+    matchesLocation(event, filter) &&
+    (filter.from_users.includes("*") ||
+      filter.from_users.includes(event.author.username) ||
+      filter.from_users.includes(event.author.id))
+  );
+}
+
+function matchesLocation(event: NormalizedDiscordMessageEvent, filter: TriggerFilter): boolean {
   const guild = readStringFilter(filter, "guild");
   if (guild !== undefined && guild !== event.guildId) {
     return false;
   }
 
   const channels = readStringArrayFilter(filter, "channels");
-  if (channels !== undefined && !matchesChannel(event, channels)) {
-    return false;
-  }
-
-  if (
-    !filter.from_users.includes("*") &&
-    !filter.from_users.includes(event.author.username) &&
-    !filter.from_users.includes(event.author.id)
-  ) {
-    return false;
-  }
-
-  return true;
+  return channels === undefined || matchesChannel(event, channels);
 }
 
 export function readDiscordPromptBody(

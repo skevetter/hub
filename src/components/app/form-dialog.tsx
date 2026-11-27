@@ -1,4 +1,4 @@
-import type { FormEvent, ReactNode } from "react";
+import type { SubmitEvent, ReactNode } from "react";
 
 import { Button } from "../ui/button.js";
 import {
@@ -43,7 +43,7 @@ export function FormDialog({
    */
   secondary?: { label: string; name: string; value: string };
   busy: boolean;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (event: SubmitEvent<HTMLFormElement>) => void;
   children: ReactNode;
 }) {
   return (

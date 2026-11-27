@@ -102,6 +102,40 @@ describe("Slack Phase 1 trigger provider", () => {
     assert.equal(rejected, "trigger_filters_rejected");
   });
 
+  it("validates before lookup, resolves bot identity before configuration, and propagates errors", async () => {
+    const { project, revision, store } = await createActiveProjectConfiguration(
+      createMemoryDatabase(),
+      configuration(),
+      { organizationId: "org-1" },
+    );
+    const resolveBot = vi
+      .fn<() => Promise<string | undefined>>()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("identity lookup failed"))
+      .mockResolvedValueOnce("UBOT");
+    const resolveStore = vi.fn(() => store);
+    const provider = createSlackTriggerProvider({
+      configurationStoreForProject: resolveStore,
+      botUserIdForWorkspace: resolveBot,
+      client: new RecordingSlackClient(),
+    });
+    const trigger = external(project.id, revision.id);
+    await assert.rejects(
+      provider.match({ ...trigger, payload: null }),
+      /expected object, received null/u,
+    );
+    assert.equal(resolveBot.mock.calls.length, 0);
+
+    assert.equal(await provider.match(trigger), "configuration_unavailable");
+    await assert.rejects(provider.match(trigger), { message: "identity lookup failed" });
+    assert.equal(resolveStore.mock.calls.length, 0);
+    assert.equal(
+      await provider.match({ ...trigger, source: "slack.other" }),
+      "no_trigger_for_source",
+    );
+    assert.equal(resolveStore.mock.calls.length, 1);
+  });
+
   it("normalizes typed inputs identically at the provider boundary", async () => {
     const database = createMemoryDatabase();
     const { project, revision, store } = await createActiveProjectConfiguration(

@@ -17,19 +17,21 @@ async function probeStream(url: string, signal: AbortSignal) {
   return response.status;
 }
 
+interface UseRunEventsOptions {
+  organizationSlug: string;
+  runId: string;
+  after: number;
+  initial: RunEventPage;
+  initialSequence: number;
+}
+
 export function useRunEvents({
   organizationSlug,
   runId,
   after,
   initial,
   initialSequence,
-}: {
-  organizationSlug: string;
-  runId: string;
-  after: number;
-  initial: RunEventPage;
-  initialSequence: number;
-}) {
+}: UseRunEventsOptions) {
   const queryClient = useQueryClient();
   const load = useServerFn(runEventsSnapshot);
   const requests = runReadClock(queryClient);
@@ -39,20 +41,9 @@ export function useRunEvents({
       { cancelRefetch: false },
     );
   }, [queryClient, organizationSlug, runId]);
-  const seed = useRef({ initial, after, initialSequence });
-  seed.current = { initial, after, initialSequence };
-  const subscription = useMemo(
-    () =>
-      new RunEventSubscription({
-        url: `/api/v1/runs/${encodeURIComponent(runId)}/events?organization=${encodeURIComponent(organizationSlug)}`,
-        initial: seed.current.initial,
-        initialSequence: seed.current.initialSequence,
-        after: seed.current.after,
-        source: (url) => new EventSource(url),
-        probe: probeStream,
-        onSeal: refreshDetail,
-      }),
-    [organizationSlug, runId, refreshDetail],
+  const subscription = useRunEventSubscription(
+    { organizationSlug, runId, after, initial, initialSequence },
+    refreshDetail,
   );
   const state = useSyncExternalStore(
     subscription.subscribe,
@@ -88,4 +79,25 @@ export function useRunEvents({
     if (initial.status === "running" && state.status !== "running") refreshDetail();
   }, [initial.status, state.status, refreshDetail]);
   return state;
+}
+
+function useRunEventSubscription(
+  { organizationSlug, runId, initial, after, initialSequence }: UseRunEventsOptions,
+  refreshDetail: () => void,
+) {
+  const seed = useRef({ initial, after, initialSequence });
+  seed.current = { initial, after, initialSequence };
+  return useMemo(
+    () =>
+      new RunEventSubscription({
+        url: `/api/v1/runs/${encodeURIComponent(runId)}/events?organization=${encodeURIComponent(organizationSlug)}`,
+        initial: seed.current.initial,
+        initialSequence: seed.current.initialSequence,
+        after: seed.current.after,
+        source: (url) => new EventSource(url),
+        probe: probeStream,
+        onSeal: refreshDetail,
+      }),
+    [organizationSlug, runId, refreshDetail],
+  );
 }

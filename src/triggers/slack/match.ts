@@ -33,6 +33,12 @@ function matchesFilters(
   connectionId?: string | null,
 ): boolean {
   if (filters === undefined || !event.content.includes(`<@${botUserId}>`)) return false;
+  if (!matchesAuthor(event, filters)) return false;
+  if (filters.connectionId !== undefined && filters.connectionId !== connectionId) return false;
+  return matchesLocation(event, filters) && matchesPattern(event, filters, botUserId);
+}
+
+function matchesAuthor(event: NormalizedSlackMentionEvent, filters: TriggerFilter): boolean {
   if (
     filters.from_users === undefined ||
     (!filters.from_users.includes("*") &&
@@ -40,12 +46,22 @@ function matchesFilters(
       (event.author.username === undefined || !filters.from_users.includes(event.author.username)))
   )
     return false;
-  if (filters.connectionId !== undefined && filters.connectionId !== connectionId) return false;
+  return true;
+}
+
+function matchesLocation(event: NormalizedSlackMentionEvent, filters: TriggerFilter): boolean {
   const workspace = readString(filters, "workspace");
   if (workspace !== undefined && workspace !== event.teamId) return false;
   const channels = readStrings(filters, "channels");
-  if (channels !== undefined && !channels.includes(event.channelId)) return false;
-  const pattern = readString(filters, "pattern") ?? readString(filters, "contains");
+  return channels === undefined || channels.includes(event.channelId);
+}
+
+function matchesPattern(
+  event: NormalizedSlackMentionEvent,
+  filters: TriggerFilter,
+  botUserId: string,
+): boolean {
+  const pattern = readPatternMarker(filters);
   if (pattern === undefined || pattern.length === 0) return true;
   const body = readSlackPromptBody(event, botUserId);
   if (!body.startsWith(pattern)) return false;

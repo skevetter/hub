@@ -29,9 +29,7 @@ export function TwoLine({
   /** Give a card a heading and let its identity wrap on a narrow screen. */
   heading?: boolean;
 }) {
-  const Frame = heading ? "div" : "span";
-  const Primary = heading ? "h2" : "span";
-  const overflow = heading ? "break-words" : "truncate";
+  const { Frame, Primary, overflow } = lineElements(heading);
   return (
     // In a filling cell the record also takes the row it sits in, beside a glyph or not, so its
     // secondary line has the whole column to give way in rather than the primary line's width.
@@ -55,7 +53,7 @@ export function TwoLine({
             // neighbouring column needs for the fact a reader is scanning for.
             overflow,
             "text-xs text-muted-foreground in-data-[slot=fill-cell]:w-0 in-data-[slot=fill-cell]:min-w-full",
-            (mono || path) && "font-mono",
+            monoClass(mono, path),
             path && "text-left",
           )}
           title={titleOf(secondary)}
@@ -68,6 +66,18 @@ export function TwoLine({
       )}
     </Frame>
   );
+}
+
+function monoClass(mono: boolean, path: boolean) {
+  return (mono || path) && "font-mono";
+}
+
+function lineElements(heading: boolean) {
+  return {
+    Frame: heading ? "div" : "span",
+    Primary: heading ? "h2" : "span",
+    overflow: heading ? "break-words" : "truncate",
+  } as const;
 }
 
 function titleOf(line: ReactNode): string | undefined {

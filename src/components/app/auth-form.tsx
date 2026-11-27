@@ -1,4 +1,4 @@
-import type { FormEvent, ReactNode } from "react";
+import type { SubmitEvent, ReactNode } from "react";
 
 import { Button } from "../ui/button.js";
 import { FieldSet } from "../ui/field.js";
@@ -24,7 +24,7 @@ export function AuthForm({
   label: string;
   busy: boolean;
   submitLabel: string;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (event: SubmitEvent<HTMLFormElement>) => void;
   /**
    * The way out of this form, e.g. "Back to sign in". Two flat props rather than one object:
    * an object literal is a new value on every render, so every caller had to memoize one.

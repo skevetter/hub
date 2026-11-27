@@ -7,6 +7,18 @@ const render = (output: unknown, status = "succeeded") =>
   renderToStaticMarkup(<ScriptStepOutput stepId="step-1" status={status} output={output} />);
 
 describe("script step output in the run history", () => {
+  it("renders nothing for an unrelated value", () => {
+    assert.equal(render(null), "");
+    assert.equal(render({ repo: "paseo" }), "");
+  });
+
+  it("shows more only when the output exceeds 4096 characters", () => {
+    const short = render({ exit_code: 0, output_tail: "a".repeat(4096), truncated: false });
+    const long = render({ exit_code: 0, output_tail: "b" + "a".repeat(4096), truncated: false });
+    assert.doesNotMatch(short, /Show more/u);
+    assert.match(long, /Show more/u);
+    assert.doesNotMatch(long, /ba{4096}/u);
+  });
   it("shows the exit code and a collapsed output tail", () => {
     const markup = render({ exit_code: 3, output_tail: "line one\nline two", truncated: false });
     assert.match(markup, /Exit code 3/u);

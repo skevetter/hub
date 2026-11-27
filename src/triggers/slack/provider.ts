@@ -1,4 +1,7 @@
-import type { ProjectConfigurationStore } from "../../configuration/store.js";
+import type {
+  ProjectConfigurationStore,
+  StoredProjectConfiguration,
+} from "../../configuration/store.js";
 import type { CompiledTriggerConfig } from "../../config/index.js";
 import type {
   AttachmentCapabilityRegistry,
@@ -7,6 +10,8 @@ import type {
 import { reportFailure } from "../../failures/index.js";
 import { agentFailureNotice, missingBillingUrl } from "../failure-notice.js";
 import {
+  type ExternalTrigger,
+  type TriggerContextMaterialization,
   type TriggerProvider,
   type TriggerProviderMatch,
   type TriggerProviderReactionState,
@@ -98,166 +103,207 @@ export interface SlackOutputContext {
 
 type SlackReactionPhase = "accepted" | "started";
 
-export function createSlackTriggerProvider(options: {
+type SlackProvider = TriggerProvider<
+  "slack",
+  SlackTriggerContext,
+  SlackOutputContext,
+  SlackMaterializedContext
+>;
+
+interface SlackProviderOptions {
   configurationStoreForProject: (projectId: string) => ProjectConfigurationStore;
   botUserIdForWorkspace(organizationId: string, teamId: string): Promise<string | undefined>;
   client: SlackBotClient;
   attachments?: AttachmentCapabilityRegistry;
   billingUrlForOrganization?: (organizationId: string) => Promise<string>;
-}): TriggerProvider<"slack", SlackTriggerContext, SlackOutputContext, SlackMaterializedContext> {
+}
+
+export function createSlackTriggerProvider(options: SlackProviderOptions): SlackProvider {
   return {
     name: "slack",
     eventNames: ["slack.mention"],
-    async match(trigger) {
-      const rawEvent = NormalizedSlackMentionEventSchema.parse(trigger.payload);
-      const botUserId = await options.botUserIdForWorkspace(
-        trigger.organizationId,
-        rawEvent.teamId,
-      );
-      if (botUserId === undefined) return "configuration_unavailable";
-      const stored = await options
-        .configurationStoreForProject(trigger.projectId)
-        .getRevision(trigger.configurationRevisionId);
-      if (stored === undefined) return "configuration_unavailable";
-      if (!stored.configuration.triggers.some((candidate) => candidate.on === trigger.source))
-        return "no_trigger_for_source";
-      const event = needsSlackUsername(stored.configuration.triggers, rawEvent.author.id)
-        ? await enrichSlackAuthor(rawEvent, trigger.organizationId, options.client)
-        : rawEvent;
-      const matchedTriggers = matchSlackTriggers(
-        stored.configuration,
-        event,
-        botUserId,
-        trigger.connectionId,
-      );
-      if (matchedTriggers.length === 0) return "trigger_filters_rejected";
-      const matches: TriggerProviderMatch<SlackTriggerContext, SlackOutputContext>[] = [];
-
-      for (const match of matchedTriggers) {
-        const compiledTrigger = stored.configuration.triggers.find(
-          (candidate) => candidate.name === match.trigger.name,
-        );
-        if (compiledTrigger === undefined)
-          throw new Error(`compiled trigger not found: ${match.trigger.name}`);
-        const outputContext: SlackOutputContext = {
-          provider: "slack",
-          organizationId: trigger.organizationId,
-          teamId: rawEvent.teamId,
-          channelId: rawEvent.channelId,
-          threadTs: rawEvent.threadTs ?? rawEvent.messageTs,
-          messageTs: rawEvent.messageTs,
-        };
-        const triggerContext: SlackTriggerContext = {
-          provider: "slack",
-          target: outputContext,
-          event: buildSlackMergeData(rawEvent, botUserId, trigger.connectionId),
-        };
-        const invocation = parseInvocation(
-          rawEvent.content,
-          compiledTrigger.inputs,
-          undefined,
-          readSlackInvocationParserMessage(rawEvent, botUserId, compiledTrigger.filters),
-        );
-        if (invocation.status === "accepted") {
-          if (!matchesInputFilters(invocation.inputs, compiledTrigger.filters?.inputs)) continue;
-        }
-        if (invocation.status === "rejected") {
-          matches.push({
-            conversation: {
-              key: JSON.stringify([
-                "slack",
-                rawEvent.teamId,
-                rawEvent.channelId,
-                rawEvent.threadTs ?? rawEvent.messageTs,
-              ]),
-              label: "Slack thread",
-            },
-            triggerName: match.trigger.name,
-            triggerContext,
-            outputContext,
-            configurationRevisionId: stored.revision.id,
-            hubConfig: stored.configuration,
-            invocation,
-          });
-          continue;
-        }
-        matches.push({
-          conversation: {
-            key: JSON.stringify([
-              "slack",
-              rawEvent.teamId,
-              rawEvent.channelId,
-              rawEvent.threadTs ?? rawEvent.messageTs,
-            ]),
-            label: "Slack thread",
-          },
-          triggerName: match.trigger.name,
-          triggerContext,
-          outputContext,
-          configurationRevisionId: stored.revision.id,
-          hubConfig: stored.configuration,
-          invocation,
-        });
-      }
-      return matches.length === 0 ? "trigger_filters_rejected" : matches;
+    match(trigger) {
+      return matchSlackTrigger(options, trigger);
     },
-    async materializeContext(launch): Promise<SlackMaterializedContext> {
-      const locator = launch.triggerContext.event.slack.trigger_thread_context;
-      if (locator.status === "not_applicable") {
-        return { slack: { thread: { status: "not_applicable", messages: [] } } };
-      }
-      if (options.client.readThreadMessages === undefined) {
-        return { slack: { thread: { status: "unavailable", messages: [] } } };
-      }
-      let history;
-      try {
-        history = await options.client.readThreadMessages({
-          organizationId: launch.organizationId,
+    materializeContext(launch) {
+      return materializeSlackContext(options, launch);
+    },
+    ...slackReactionHooks(options),
+  };
+}
+
+async function matchSlackTrigger(
+  options: SlackProviderOptions,
+  trigger: ExternalTrigger,
+): ReturnType<SlackProvider["match"]> {
+  const rawEvent = NormalizedSlackMentionEventSchema.parse(trigger.payload);
+  const botUserId = await options.botUserIdForWorkspace(trigger.organizationId, rawEvent.teamId);
+  if (botUserId === undefined) return "configuration_unavailable";
+  const stored = await options
+    .configurationStoreForProject(trigger.projectId)
+    .getRevision(trigger.configurationRevisionId);
+  if (stored === undefined) return "configuration_unavailable";
+  if (!stored.configuration.triggers.some((candidate) => candidate.on === trigger.source))
+    return "no_trigger_for_source";
+  const event = needsSlackUsername(stored.configuration.triggers, rawEvent.author.id)
+    ? await enrichSlackAuthor(rawEvent, trigger.organizationId, options.client)
+    : rawEvent;
+  const matchedTriggers = matchSlackTriggers(
+    stored.configuration,
+    event,
+    botUserId,
+    trigger.connectionId,
+  );
+  const matches: TriggerProviderMatch<SlackTriggerContext, SlackOutputContext>[] = [];
+  for (const { trigger: matchedTrigger } of matchedTriggers) {
+    const match = buildSlackMatch({
+      triggerName: matchedTrigger.name,
+      stored,
+      rawEvent,
+      botUserId,
+      trigger,
+    });
+    if (match !== undefined) matches.push(match);
+  }
+  return matches.length === 0 ? "trigger_filters_rejected" : matches;
+}
+
+interface SlackMatchOptions {
+  triggerName: string;
+  stored: StoredProjectConfiguration;
+  rawEvent: NormalizedSlackMentionEvent;
+  botUserId: string;
+  trigger: ExternalTrigger;
+}
+
+function buildSlackMatch({
+  triggerName,
+  stored,
+  rawEvent,
+  botUserId,
+  trigger,
+}: SlackMatchOptions): TriggerProviderMatch<SlackTriggerContext, SlackOutputContext> | undefined {
+  const compiledTrigger = stored.configuration.triggers.find(
+    (candidate) => candidate.name === triggerName,
+  );
+  if (compiledTrigger === undefined) throw new Error(`compiled trigger not found: ${triggerName}`);
+  const outputContext: SlackOutputContext = {
+    provider: "slack",
+    organizationId: trigger.organizationId,
+    teamId: rawEvent.teamId,
+    channelId: rawEvent.channelId,
+    threadTs: rawEvent.threadTs ?? rawEvent.messageTs,
+    messageTs: rawEvent.messageTs,
+  };
+  const triggerContext: SlackTriggerContext = {
+    provider: "slack",
+    target: outputContext,
+    event: buildSlackMergeData(rawEvent, botUserId, trigger.connectionId),
+  };
+  const invocation = parseInvocation(
+    rawEvent.content,
+    compiledTrigger.inputs,
+    undefined,
+    readSlackInvocationParserMessage(rawEvent, botUserId, compiledTrigger.filters),
+  );
+  if (
+    invocation.status === "accepted" &&
+    !matchesInputFilters(invocation.inputs, compiledTrigger.filters?.inputs)
+  ) {
+    return undefined;
+  }
+  const base = {
+    conversation: {
+      key: JSON.stringify([
+        "slack",
+        rawEvent.teamId,
+        rawEvent.channelId,
+        rawEvent.threadTs ?? rawEvent.messageTs,
+      ]),
+      label: "Slack thread",
+    },
+    triggerName,
+    triggerContext,
+    outputContext,
+    configurationRevisionId: stored.revision.id,
+    hubConfig: stored.configuration,
+  };
+  if (invocation.status === "rejected") return { ...base, invocation };
+  return { ...base, invocation };
+}
+
+async function materializeSlackContext(
+  options: SlackProviderOptions,
+  launch: TriggerContextMaterialization<SlackTriggerContext>,
+): Promise<SlackMaterializedContext> {
+  const locator = launch.triggerContext.event.slack.trigger_thread_context;
+  if (locator.status === "not_applicable") {
+    return { slack: { thread: { status: "not_applicable", messages: [] } } };
+  }
+  if (options.client.readThreadMessages === undefined) {
+    return { slack: { thread: { status: "unavailable", messages: [] } } };
+  }
+  let history;
+  try {
+    history = await options.client.readThreadMessages({
+      organizationId: launch.organizationId,
+      teamId: launch.triggerContext.event.slack.team.id,
+      channelId: locator.channel.id,
+      threadTs: locator.thread.ts,
+      beforeTs: locator.before.ts,
+    });
+  } catch (error) {
+    reportFailure(
+      error,
+      { operation: "slack.thread.hydrate", component: "triggers", provider: "slack" },
+      {
+        diagnostic: {
           teamId: launch.triggerContext.event.slack.team.id,
           channelId: locator.channel.id,
-          threadTs: locator.thread.ts,
-          beforeTs: locator.before.ts,
-        });
-      } catch (error) {
-        reportFailure(
-          error,
-          { operation: "slack.thread.hydrate", component: "triggers", provider: "slack" },
-          {
-            diagnostic: {
-              teamId: launch.triggerContext.event.slack.team.id,
-              channelId: locator.channel.id,
-            },
-          },
-        );
-        return { slack: { thread: { status: "unavailable", messages: [] } } };
-      }
-      const messages = await Promise.all(
-        history.messages.map(async (message) => ({
-          ts: message.ts,
-          content: message.content,
-          author: message.author,
-          channel: { id: locator.channel.id },
-          created_at: message.createdAt,
-          attachments: await registerAttachments(
-            message.attachments,
-            launch.providerEventReceiptId,
-            launch.organizationId,
-            launch.triggerContext.event.slack.team.id,
-            launch.triggerContext.event.slack.connection_id,
-            launch.executionId,
-            options.attachments,
-          ),
-        })),
-      );
-      return {
-        slack: {
-          thread: {
-            status: history.complete ? "available" : "incomplete",
-            messages,
-          },
         },
-      };
+      },
+    );
+    return { slack: { thread: { status: "unavailable", messages: [] } } };
+  }
+  const messages = await Promise.all(
+    history.messages.map(async (message) => ({
+      ts: message.ts,
+      content: message.content,
+      author: message.author,
+      channel: { id: locator.channel.id },
+      created_at: message.createdAt,
+      attachments: await registerAttachments(message.attachments, {
+        providerEventReceiptId: launch.providerEventReceiptId,
+        organizationId: launch.organizationId,
+        teamId: launch.triggerContext.event.slack.team.id,
+        connectionId: launch.triggerContext.event.slack.connection_id,
+        executionId: launch.executionId,
+        attachments: options.attachments,
+      }),
+    })),
+  );
+  return {
+    slack: {
+      thread: {
+        status: history.complete ? "available" : "incomplete",
+        messages,
+      },
     },
+  };
+}
+
+function slackReactionHooks(
+  options: SlackProviderOptions,
+): Pick<
+  SlackProvider,
+  | "onDispatchAccepted"
+  | "onAgentExecutionStarted"
+  | "onAgentExecutionCompleted"
+  | "onWorkflowRunCanceled"
+  | "onAgentExecutionFailed"
+  | "onMachineTerminated"
+> {
+  return {
     async onDispatchAccepted(_triggerContext, _outputContext, reactionState) {
       if (slackReactionPhase(reactionState) !== undefined) return reactionState;
       return { phase: "accepted" };
@@ -413,12 +459,21 @@ function buildSlackMergeData(
 
 async function registerAttachments(
   source: SlackThreadMessage["attachments"],
-  providerEventReceiptId: string,
-  organizationId: string,
-  teamId: string,
-  connectionId: string | null,
-  executionId: string,
-  attachments: AttachmentCapabilityRegistry | undefined,
+  {
+    providerEventReceiptId,
+    organizationId,
+    teamId,
+    connectionId,
+    executionId,
+    attachments,
+  }: {
+    providerEventReceiptId: string;
+    organizationId: string;
+    teamId: string;
+    connectionId: string | null;
+    executionId: string;
+    attachments: AttachmentCapabilityRegistry | undefined;
+  },
 ): Promise<AttachmentDescriptor[]> {
   if (source.length === 0) return [];
   if (attachments === undefined) throw new Error("attachment capability unavailable");
