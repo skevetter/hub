@@ -347,6 +347,37 @@ test("the log must name the same timeout and the whole message must be that time
   assert.deepEqual(retryable(extra, log("Error: timeout exceeded when trying to connect")), []);
 });
 
+test("a start timeout with more message text is not retried from a test or a hook", () => {
+  const message = "timeout exceeded when trying to connect";
+  const extra = "  Configuration error: wrong endpoint";
+  const log = ["hook", "body"]
+    .map((name) =>
+      [
+        ` FAIL  ${name}.test.ts > ${name}`,
+        `Error: ${message}`,
+        extra,
+        ` \u276F ${name}.test.ts:4:11`,
+        '      2| describe("hook", () => {',
+        "",
+      ].join("\n"),
+    )
+    .join("\n");
+  const headers = logFailureHeaders(log);
+  assert.deepEqual(headers.get("body.test.ts"), [`Error: ${message}\n${extra}`]);
+  const report = reportOf(
+    failedEntry("body.test.ts", `Error: ${message}\n${extra}\n    at body.test.ts:3:9`),
+    suiteFailure("hook.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  for (const file of ["body.test.ts", "hook.test.ts"]) {
+    assert.deepEqual(retryableFiles(report, [file], { root, headers }), [], file);
+  }
+  const plain = reportOf(failedEntry("body.test.ts", `Error: ${message}\n    at body.test.ts:3:9`));
+  const plainHeaders = logFailureHeaders(failureLog("body.test.ts", `Error: ${message}`));
+  assert.deepEqual(retryableFiles(plain, ["body.test.ts"], { root, headers: plainHeaders }), [
+    "body.test.ts",
+  ]);
+});
+
 test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
   const timeout = "Error: Connection terminated due to connection timeout";
   const log = (cause) =>

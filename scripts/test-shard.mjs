@@ -159,34 +159,50 @@ const FAIL_LINE =
   /^\s*FAIL\s+(?:(?:\[[^\]]*\]|\|[^|]*\|)\s*)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+(?:>|\[).*)?\s*$/u;
 const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
 const HINT_LINE = /^If this is a long-running (?:test|hook)/u;
+const STACK_LINE = /^\s*(?:at\s|\u276F)/u;
 
-function firstLine(text) {
-  return (
-    String(text)
-      .split("\n")
-      .find((line) => line.trim() !== "")
-      ?.trim() ?? ""
+/** The error message without its stack frames and Vitest's timeout hint. */
+function messageLines(text) {
+  const lines = String(text).split("\n");
+  const stack = lines.findIndex((line, index) => index > 0 && STACK_LINE.test(line));
+  return (stack === -1 ? lines : lines.slice(0, stack)).filter(
+    (line) => line.trim() !== "" && !HINT_LINE.test(line.trim()),
   );
 }
 
 function isStartTimeoutHeader(text) {
-  const header = firstLine(text);
-  return START_TIMEOUT_PATTERNS.some((pattern) => pattern.test(header));
+  const lines = messageLines(text);
+  return (
+    lines.length === 1 && START_TIMEOUT_PATTERNS.some((pattern) => pattern.test(lines[0].trim()))
+  );
 }
 
 function addHeader(headers, files, line) {
   for (const file of files) headers.set(file, [...(headers.get(file) ?? []), line]);
 }
 
+function extendHeader(headers, files, line) {
+  for (const file of files) {
+    const list = headers.get(file);
+    list[list.length - 1] += `\n${line}`;
+  }
+}
+
+function continuesMessage(line) {
+  return /^\s+\S/u.test(line) && !STACK_LINE.test(line);
+}
+
 /**
  * Error lines the default reporter printed for each failing test file, keyed by file.
  * A failure block starts with one or more FAIL lines. Every unindented line after them, up
- * to the next rule line, is an error header for all of those files.
+ * to the next rule line, is an error header for all of those files. Indented lines that follow
+ * a header before its first stack frame are more of the same message.
  */
 export function logFailureHeaders(logText) {
   const headers = new Map();
   let files = [];
   let inErrors = false;
+  let inMessage = false;
   for (const raw of logText.replace(ANSI_PATTERN, "").split("\n")) {
     const line = raw.trimEnd();
     const failed = FAIL_LINE.exec(line);
@@ -194,12 +210,19 @@ export function logFailureHeaders(logText) {
       if (inErrors) files = [];
       files.push(failed[1]);
       inErrors = false;
+      inMessage = false;
     } else if (SEPARATOR_LINE.test(line)) {
       files = [];
       inErrors = false;
+      inMessage = false;
+    } else if (files.length > 0 && inMessage && continuesMessage(line)) {
+      extendHeader(headers, files, line);
     } else if (files.length > 0 && line !== "" && !/^\s/u.test(line) && !HINT_LINE.test(line)) {
       addHeader(headers, files, line);
       inErrors = true;
+      inMessage = true;
+    } else {
+      inMessage = false;
     }
   }
   return headers;
