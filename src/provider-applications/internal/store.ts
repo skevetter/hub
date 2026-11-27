@@ -106,86 +106,20 @@ export function createProviderApplicationStore(
   >,
 ): ProviderApplicationStore {
   return {
-    async read(provider) {
-      const result = await database.query<ProviderConfigurationRow>(
-        `select provider, configuration, verified_external_identity, version,
-                verified_at, updated_at, updated_by_user_id
-         from runtime_provider_configuration where provider = $1`,
-        [provider],
-      );
-      return result.rows[0] === undefined ? undefined : parseRow(result.rows[0]);
+    read(provider) {
+      return readConfiguration(database, provider);
     },
-    async readAll() {
-      const result = await database.query<ProviderConfigurationRow>(
-        `select provider, configuration, verified_external_identity, version,
-                verified_at, updated_at, updated_by_user_id
-         from runtime_provider_configuration order by provider`,
-      );
-      return result.rows.map(parseRow);
+    readAll() {
+      return readConfigurations(database);
     },
     save(input) {
       return locks.withLock(`provider-configuration:${input.provider}`, () =>
-        database.transaction(async (transaction) => {
-          await lockProviderActivation(locks, transaction, input.provider);
-          await requireCompatibleConnections(transaction, input.provider, input.identity.id);
-          const existing = await transaction.query<{ version: number }>(
-            `select version from runtime_provider_configuration where provider = $1 for update`,
-            [input.provider],
-          );
-          const currentVersion = existing.rows[0]?.version;
-          if (currentVersion !== input.expectedVersion) {
-            throw new ProviderConfigurationConflictError();
-          }
-          const result = await transaction.query<ProviderConfigurationRow>(
-            currentVersion === undefined
-              ? `insert into runtime_provider_configuration
-                 (provider, configuration, verified_external_identity, version, verified_at,
-                  updated_at, updated_by_user_id)
-               values ($1, $2, $3, 1, now(), now(), $4)
-               returning provider, configuration, verified_external_identity, version,
-                         verified_at, updated_at, updated_by_user_id`
-              : `update runtime_provider_configuration
-               set configuration = $2,
-                   verified_external_identity = $3,
-                   version = version + 1,
-                   verified_at = now(),
-                   updated_at = now(),
-                   updated_by_user_id = $4
-               where provider = $1
-               returning provider, configuration, verified_external_identity, version,
-                         verified_at, updated_at, updated_by_user_id`,
-            [
-              input.provider,
-              JSON.stringify(input.configuration),
-              JSON.stringify(input.identity),
-              input.updatedByUserId,
-            ],
-          );
-          const saved = result.rows[0];
-          if (saved === undefined) throw new Error("provider configuration save returned no row");
-          const parsed = parseRow(saved);
-          await writeProviderActivation(
-            transaction,
-            input.provider,
-            input.identity.id,
-            parsed.version,
-          );
-          return parsed;
-        }),
+        database.transaction((transaction) => saveConfiguration(transaction, locks, input)),
       );
     },
     activate(input) {
       return locks.withLock(`provider-configuration:${input.provider}`, () =>
-        database.transaction(async (transaction) => {
-          await lockProviderActivation(locks, transaction, input.provider);
-          await requireCompatibleConnections(transaction, input.provider, input.identity.id);
-          await writeProviderActivation(
-            transaction,
-            input.provider,
-            input.identity.id,
-            input.configurationVersion,
-          );
-        }),
+        database.transaction((transaction) => activateConfiguration(transaction, locks, input)),
       );
     },
     completeSlackInstallation(input) {
@@ -214,77 +148,179 @@ export function createProviderApplicationStore(
     },
     completeSlackSocketApplication(input) {
       return locks.withLock("provider-configuration:slack", () =>
-        database.transaction(async (transaction) => {
-          await lockProviderActivation(locks, transaction, "slack");
-          await requireCompatibleConnections(transaction, "slack", input.identity.id);
-          await locks.withTxLock(transaction, JSON.stringify(["slack", input.installation.teamId]));
-          const existingConfiguration = await transaction.query<{ version: number }>(
-            `select version from runtime_provider_configuration where provider = 'slack' for update`,
-          );
-          const currentVersion = existingConfiguration.rows[0]?.version;
-          if (currentVersion !== input.expectedVersion) {
-            throw new ProviderConfigurationConflictError();
-          }
-          const existingConnection = await transaction.query<{ organization_id: string }>(
-            `select organization_id from slack_connections where team_id = $1 for update`,
-            [input.installation.teamId],
-          );
-          if (
-            existingConnection.rows[0] !== undefined &&
-            existingConnection.rows[0].organization_id !== input.organizationId
-          ) {
-            const error = new Error("Slack workspace belongs to another organization");
-            error.name = "ProviderApplicationIdentityConflictError";
-            throw error;
-          }
-          await transaction.query(
-            `insert into slack_connections (organization_id, team_id, team_name, slug, bot_user_id,
+        database.transaction((transaction) => completeSlackSocket(transaction, locks, input)),
+      );
+    },
+  };
+}
+
+type Transaction = Parameters<Locks["withTxLock"]>[0];
+type SaveInput = Parameters<ProviderApplicationStore["save"]>[0];
+type SlackSocketInput = Parameters<ProviderApplicationStore["completeSlackSocketApplication"]>[0];
+
+async function readConfiguration(
+  database: DatabaseRuntime,
+  provider: Provider,
+): Promise<StoredProviderApplication | undefined> {
+  const result = await database.query<ProviderConfigurationRow>(
+    `select provider, configuration, verified_external_identity, version,
+                verified_at, updated_at, updated_by_user_id
+         from runtime_provider_configuration where provider = $1`,
+    [provider],
+  );
+  return result.rows[0] === undefined ? undefined : parseRow(result.rows[0]);
+}
+
+async function readConfigurations(database: DatabaseRuntime): Promise<StoredProviderApplication[]> {
+  const result = await database.query<ProviderConfigurationRow>(
+    `select provider, configuration, verified_external_identity, version,
+                verified_at, updated_at, updated_by_user_id
+         from runtime_provider_configuration order by provider`,
+  );
+  return result.rows.map(parseRow);
+}
+
+async function activateConfiguration(
+  transaction: Transaction,
+  locks: Locks,
+  input: Parameters<ProviderApplicationStore["activate"]>[0],
+): Promise<void> {
+  await lockProviderActivation(locks, transaction, input.provider);
+  await requireCompatibleConnections(transaction, input.provider, input.identity.id);
+  await writeProviderActivation(
+    transaction,
+    input.provider,
+    input.identity.id,
+    input.configurationVersion,
+  );
+}
+
+async function saveConfiguration(
+  transaction: Transaction,
+  locks: Locks,
+  input: SaveInput,
+): Promise<StoredProviderApplication> {
+  await lockProviderActivation(locks, transaction, input.provider);
+  await requireCompatibleConnections(transaction, input.provider, input.identity.id);
+  const existing = await transaction.query<{ version: number }>(
+    `select version from runtime_provider_configuration where provider = $1 for update`,
+    [input.provider],
+  );
+  const currentVersion = existing.rows[0]?.version;
+  if (currentVersion !== input.expectedVersion) {
+    throw new ProviderConfigurationConflictError();
+  }
+  const result = await transaction.query<ProviderConfigurationRow>(
+    currentVersion === undefined
+      ? `insert into runtime_provider_configuration
+                 (provider, configuration, verified_external_identity, version, verified_at,
+                  updated_at, updated_by_user_id)
+               values ($1, $2, $3, 1, now(), now(), $4)
+               returning provider, configuration, verified_external_identity, version,
+                         verified_at, updated_at, updated_by_user_id`
+      : `update runtime_provider_configuration
+               set configuration = $2,
+                   verified_external_identity = $3,
+                   version = version + 1,
+                   verified_at = now(),
+                   updated_at = now(),
+                   updated_by_user_id = $4
+               where provider = $1
+               returning provider, configuration, verified_external_identity, version,
+                         verified_at, updated_at, updated_by_user_id`,
+    [
+      input.provider,
+      JSON.stringify(input.configuration),
+      JSON.stringify(input.identity),
+      input.updatedByUserId,
+    ],
+  );
+  const saved = result.rows[0];
+  if (saved === undefined) throw new Error("provider configuration save returned no row");
+  const parsed = parseRow(saved);
+  await writeProviderActivation(transaction, input.provider, input.identity.id, parsed.version);
+  return parsed;
+}
+
+async function completeSlackSocket(
+  transaction: Transaction,
+  locks: Locks,
+  input: SlackSocketInput,
+): Promise<StoredProviderApplication> {
+  await lockProviderActivation(locks, transaction, "slack");
+  await requireCompatibleConnections(transaction, "slack", input.identity.id);
+  await locks.withTxLock(transaction, JSON.stringify(["slack", input.installation.teamId]));
+  const existingConfiguration = await transaction.query<{ version: number }>(
+    `select version from runtime_provider_configuration where provider = 'slack' for update`,
+  );
+  const currentVersion = existingConfiguration.rows[0]?.version;
+  if (currentVersion !== input.expectedVersion) {
+    throw new ProviderConfigurationConflictError();
+  }
+  const existingConnection = await transaction.query<{ organization_id: string }>(
+    `select organization_id from slack_connections where team_id = $1 for update`,
+    [input.installation.teamId],
+  );
+  if (
+    existingConnection.rows[0] !== undefined &&
+    existingConnection.rows[0].organization_id !== input.organizationId
+  ) {
+    const error = new Error("Slack workspace belongs to another organization");
+    error.name = "ProviderApplicationIdentityConflictError";
+    throw error;
+  }
+  await writeSlackWorkspace(transaction, input);
+  const saved = await saveSlackConfiguration(transaction, input, currentVersion);
+  const row = saved.rows[0];
+  if (row === undefined) throw new Error("Slack Socket Mode save returned no row");
+  const parsed = parseRow(row);
+  await writeProviderActivation(transaction, "slack", input.identity.id, parsed.version);
+  return parsed;
+}
+
+function writeSlackWorkspace(transaction: Transaction, input: SlackSocketInput) {
+  return transaction.query(
+    `insert into slack_connections (organization_id, team_id, team_name, slug, bot_user_id,
                bot_access_token, scopes, provider_application_id, connected_by_user_id)
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9) on conflict (team_id) do update set
                team_name = excluded.team_name, bot_user_id = excluded.bot_user_id,
                bot_access_token = excluded.bot_access_token, scopes = excluded.scopes,
                provider_application_id = excluded.provider_application_id,
                connected_by_user_id = excluded.connected_by_user_id, updated_at = now()`,
-            [
-              input.organizationId,
-              input.installation.teamId,
-              input.installation.teamName,
-              `slack-${input.installation.teamId.toLowerCase()}`,
-              input.installation.botUserId,
-              input.installation.botAccessToken,
-              JSON.stringify(input.installation.scopes),
-              input.identity.id,
-              input.updatedByUserId,
-            ],
-          );
-          const saved = await transaction.query<ProviderConfigurationRow>(
-            currentVersion === undefined
-              ? `insert into runtime_provider_configuration (provider, configuration,
+    [
+      input.organizationId,
+      input.installation.teamId,
+      input.installation.teamName,
+      `slack-${input.installation.teamId.toLowerCase()}`,
+      input.installation.botUserId,
+      input.installation.botAccessToken,
+      JSON.stringify(input.installation.scopes),
+      input.identity.id,
+      input.updatedByUserId,
+    ],
+  );
+}
+
+function saveSlackConfiguration(
+  transaction: Transaction,
+  input: SlackSocketInput,
+  currentVersion: number | undefined,
+) {
+  return transaction.query<ProviderConfigurationRow>(
+    currentVersion === undefined
+      ? `insert into runtime_provider_configuration (provider, configuration,
                    verified_external_identity, version, verified_at, updated_at, updated_by_user_id)
                  values ('slack', $1, $2, 1, now(), now(), $3)
                  returning provider, configuration, verified_external_identity, version, verified_at,
                            updated_at, updated_by_user_id`
-              : `update runtime_provider_configuration set configuration = $1,
+      : `update runtime_provider_configuration set configuration = $1,
                    verified_external_identity = $2, version = version + 1, verified_at = now(),
                    updated_at = now(), updated_by_user_id = $3
                  where provider = 'slack'
                  returning provider, configuration, verified_external_identity, version, verified_at,
                            updated_at, updated_by_user_id`,
-            [
-              JSON.stringify(input.configuration),
-              JSON.stringify(input.identity),
-              input.updatedByUserId,
-            ],
-          );
-          const row = saved.rows[0];
-          if (row === undefined) throw new Error("Slack Socket Mode save returned no row");
-          const parsed = parseRow(row);
-          await writeProviderActivation(transaction, "slack", input.identity.id, parsed.version);
-          return parsed;
-        }),
-      );
-    },
-  };
+    [JSON.stringify(input.configuration), JSON.stringify(input.identity), input.updatedByUserId],
+  );
 }
 
 async function lockProviderActivation(

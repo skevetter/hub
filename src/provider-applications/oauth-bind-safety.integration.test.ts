@@ -64,13 +64,11 @@ async function rejectsStoredReplacement(bundle: DatabaseRuntimeBundle, provider:
     expectedVersion: undefined,
     updatedByUserId: "operator",
   });
-  const state = await startAttempt(
-    database,
-    provider,
-    first.configuration,
-    1,
-    `${provider}-stored`,
-  );
+  const state = await startAttempt(database, provider, {
+    configuration: first.configuration,
+    configurationVersion: 1,
+    name: `${provider}-stored`,
+  });
   await store.save({
     provider,
     configuration: replacement.configuration,
@@ -79,17 +77,18 @@ async function rejectsStoredReplacement(bundle: DatabaseRuntimeBundle, provider:
     updatedByUserId: "operator",
   });
 
-  await assertStaleBindRollsBack(bundle, database, provider, state, first.identity.id);
+  await assertStaleBindRollsBack(bundle, database, provider, {
+    stateVerifier: state,
+    applicationId: first.identity.id,
+  });
   assert.equal((await store.read(provider))?.identity.id, replacement.identity.id);
   assert.equal((await store.read(provider))?.version, 2);
 
-  const current = await startAttempt(
-    database,
-    provider,
-    replacement.configuration,
-    2,
-    `${provider}-stored-current`,
-  );
+  const current = await startAttempt(database, provider, {
+    configuration: replacement.configuration,
+    configurationVersion: 2,
+    name: `${provider}-stored-current`,
+  });
   await bind(database, provider, current, replacement.identity.id);
   assert.equal(await connectionApplicationId(bundle, provider), replacement.identity.id);
 }
@@ -106,7 +105,11 @@ async function serializesReplacementRace(bundle: DatabaseRuntimeBundle, provider
     expectedVersion: undefined,
     updatedByUserId: "operator",
   });
-  const state = await startAttempt(database, provider, first.configuration, 1, `${provider}-race`);
+  const state = await startAttempt(database, provider, {
+    configuration: first.configuration,
+    configurationVersion: 1,
+    name: `${provider}-race`,
+  });
 
   const [saved, bound] = await Promise.allSettled([
     store.save({
@@ -157,13 +160,11 @@ async function rejectsEnvironmentFallback(bundle: DatabaseRuntimeBundle, provide
     }),
     [],
   );
-  const state = await startAttempt(
-    database,
-    provider,
-    environment.configuration,
-    0,
-    `${provider}-environment`,
-  );
+  const state = await startAttempt(database, provider, {
+    configuration: environment.configuration,
+    configurationVersion: 0,
+    name: `${provider}-environment`,
+  });
   assert.deepEqual(
     await activateProviderApplicationsAtStartup({
       store,
@@ -176,16 +177,17 @@ async function rejectsEnvironmentFallback(bundle: DatabaseRuntimeBundle, provide
     [],
   );
 
-  await assertStaleBindRollsBack(bundle, database, provider, state, environment.identity.id);
+  await assertStaleBindRollsBack(bundle, database, provider, {
+    stateVerifier: state,
+    applicationId: environment.identity.id,
+  });
   assert.equal(runtime.published.at(-1), provider);
 
-  const current = await startAttempt(
-    database,
-    provider,
-    fallback.configuration,
-    1,
-    `${provider}-fallback-current`,
-  );
+  const current = await startAttempt(database, provider, {
+    configuration: fallback.configuration,
+    configurationVersion: 1,
+    name: `${provider}-fallback-current`,
+  });
   await bind(database, provider, current, fallback.identity.id);
   assert.equal(await connectionApplicationId(bundle, provider), fallback.identity.id);
 }
@@ -194,8 +196,7 @@ async function assertStaleBindRollsBack(
   bundle: DatabaseRuntimeBundle,
   database: Database,
   provider: Provider,
-  stateVerifier: string,
-  applicationId: string,
+  { stateVerifier, applicationId }: { stateVerifier: string; applicationId: string },
 ) {
   await assert.rejects(() => bind(database, provider, stateVerifier, applicationId));
   assert.equal(await connectionApplicationId(bundle, provider), undefined);
@@ -244,9 +245,15 @@ function callbackPhase(provider: Provider) {
 async function startAttempt(
   database: Database,
   provider: Provider,
-  configuration: ProviderApplicationConfiguration,
-  configurationVersion: number,
-  name: string,
+  {
+    configuration,
+    configurationVersion,
+    name,
+  }: {
+    configuration: ProviderApplicationConfiguration;
+    configurationVersion: number;
+    name: string;
+  },
 ): Promise<string> {
   const initialState = `${name}-initial`;
   await database.startConnectionAttempt({
@@ -458,7 +465,9 @@ async function databaseFixture(engine: "PGlite" | "PostgreSQL"): Promise<{
 class RecordingRuntime implements ProviderRuntimeOwner {
   readonly published: Provider[] = [];
 
-  prepare(provider: Provider): Promise<ProviderRuntimeCandidate> {
+  prepare({
+    provider,
+  }: Parameters<ProviderRuntimeOwner["prepare"]>[0]): Promise<ProviderRuntimeCandidate> {
     return Promise.resolve({
       start: () => Promise.resolve(),
       publish: () => this.published.push(provider),
