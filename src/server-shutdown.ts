@@ -14,30 +14,67 @@ export interface ShutdownBudgets {
 export function readShutdownBudgets(
   environment: Readonly<Record<string, string | undefined>>,
 ): ShutdownBudgets {
-  const graceMs = readBudget(environment, "PASEO_HUB_SHUTDOWN_GRACE_MS", 10_000, 1_000, 40_000);
-  const hardExitMs = readBudget(
-    environment,
-    "PASEO_HUB_SHUTDOWN_HARD_EXIT_MS",
-    15_000,
-    1_001,
-    44_000,
-  );
+  const graceMs = readBudget(environment, {
+    name: "PASEO_HUB_SHUTDOWN_GRACE_MS",
+    fallback: 10_000,
+    minimum: 1_000,
+    maximum: 40_000,
+  });
+  const hardExitMs = readBudget(environment, {
+    name: "PASEO_HUB_SHUTDOWN_HARD_EXIT_MS",
+    fallback: 15_000,
+    minimum: 1_001,
+    maximum: 44_000,
+  });
   if (hardExitMs <= graceMs) {
     throw new Error("PASEO_HUB_SHUTDOWN_HARD_EXIT_MS must exceed PASEO_HUB_SHUTDOWN_GRACE_MS");
   }
   return { graceMs, hardExitMs };
 }
 
+type ShutdownLogger = Pick<Logger, "info" | "warn" | "error">;
+type Stage = (name: string, action: () => Promise<void>) => Promise<void>;
+
+interface ShutdownOptions extends ShutdownBudgets {
+  logger?: ShutdownLogger;
+  beginShutdown?: () => Promise<void>;
+  exit: (code: number) => void;
+}
+
+interface Connections {
+  sockets: Set<Socket>;
+  upgrades: Set<Duplex>;
+  release: () => void;
+}
+
+interface ShutdownContext {
+  server: Server;
+  stopRuntime: () => Promise<void>;
+  options: ShutdownOptions;
+  connections: Connections;
+  logger: ShutdownLogger;
+}
+
+interface Deadlines {
+  state: { expired: boolean; hardExited: boolean };
+  clear: () => void;
+}
+
 export function createServerShutdown(
   server: Server,
   stopRuntime: () => Promise<void>,
-  options: ShutdownBudgets & {
-    logger?: Pick<Logger, "info" | "warn" | "error">;
-    beginShutdown?: () => Promise<void>;
-    exit: (code: number) => void;
-  },
+  options: ShutdownOptions,
 ): () => Promise<boolean> {
   const logger = options.logger ?? defaultLogger;
+  const connections = trackConnections(server);
+  let shutdown: Promise<boolean> | undefined;
+  return () => {
+    shutdown ??= runShutdown({ server, stopRuntime, options, connections, logger });
+    return shutdown;
+  };
+}
+
+function trackConnections(server: Server): Connections {
   const sockets = new Set<Socket>();
   const upgrades = new Set<Duplex>();
   const trackUpgrade = (_request: IncomingMessage, socket: Duplex) => {
@@ -50,91 +87,128 @@ export function createServerShutdown(
   };
   server.on("connection", trackSocket);
   server.on("upgrade", trackUpgrade);
-  let shutdown: Promise<boolean> | undefined;
-  return () => {
-    shutdown ??= stop();
-    return shutdown;
-  };
-
-  async function stop(): Promise<boolean> {
-    const started = performance.now();
-    const pending = new Set<string>();
-    const requests = beginHttpShutdown(server);
-    let expired = false;
-    let hardExited = false;
-    const destroySockets = (flushing: ReadonlySet<Socket> = new Set()) => {
-      if (flushing.size === 0) server.closeAllConnections();
-      for (const socket of sockets) {
-        if (!flushing.has(socket)) socket.destroy();
-      }
-    };
-    const grace = setTimeout(() => {
-      expired = true;
-      logger.warn(
-        { pendingStages: [...pending], elapsedMs: performance.now() - started },
-        "shutdown grace deadline reached; destroying remaining connections",
-      );
-      destroySockets(requests.expire());
-    }, options.graceMs);
-    const watchdog = setTimeout(() => {
-      hardExited = true;
-      logger.error(
-        { pendingStages: [...pending], elapsedMs: performance.now() - started },
-        "shutdown hard deadline reached; exiting",
-      );
-      destroySockets();
-      options.exit(1);
-    }, options.hardExitMs);
-    watchdog.unref();
-    try {
-      const streamOutcomes =
-        options.beginShutdown === undefined
-          ? []
-          : await Promise.allSettled([stage("streams.close", options.beginShutdown)]);
-      const httpClose = stage("http.close", () => {
-        const { promise, resolve, reject } = Promise.withResolvers<void>();
-        server.close((error) => {
-          if (error !== undefined) reject(error);
-          else resolve();
-        });
-        server.closeIdleConnections();
-        for (const socket of upgrades) socket.destroy();
-        return promise;
-      });
-      const runtimeStop = (async () => {
-        await stage("http.requests", () => requests.drained);
-        server.closeIdleConnections();
-        await stage("runtime.stop", stopRuntime);
-      })();
-      const outcomes = [...streamOutcomes, ...(await Promise.allSettled([httpClose, runtimeStop]))];
-      const clean = !expired && outcomes.every((outcome) => outcome.status === "fulfilled");
-      if (!hardExited) options.exit(clean ? 0 : 1);
-      return clean;
-    } finally {
-      clearTimeout(grace);
-      clearTimeout(watchdog);
+  return {
+    sockets,
+    upgrades,
+    release: () => {
       server.off("connection", trackSocket);
       server.off("upgrade", trackUpgrade);
-    }
+    },
+  };
+}
 
-    async function stage(name: string, action: () => Promise<void>): Promise<void> {
-      const stageStarted = performance.now();
-      pending.add(name);
-      logger.info({ stage: name, phase: "start", elapsedMs: 0 }, "shutdown stage started");
-      try {
-        await action();
-      } catch (error) {
-        reportFailure(error, { operation: "server.shutdown", component: "server" }, { logger });
-        throw error;
-      } finally {
-        pending.delete(name);
-        logger.info(
-          { stage: name, phase: "end", elapsedMs: performance.now() - stageStarted },
-          "shutdown stage ended",
-        );
-      }
-    }
+async function runShutdown(context: ShutdownContext): Promise<boolean> {
+  const { server, stopRuntime, options, connections, logger } = context;
+  const started = performance.now();
+  const pending = new Set<string>();
+  const stage = createStage(logger, pending);
+  const requests = beginHttpShutdown(server);
+  const deadlines = startDeadlines({
+    context,
+    requests,
+    logger,
+    report: () => ({ pendingStages: [...pending], elapsedMs: performance.now() - started }),
+  });
+  try {
+    const streamOutcomes =
+      options.beginShutdown === undefined
+        ? []
+        : await Promise.allSettled([stage("streams.close", options.beginShutdown)]);
+    const httpClose = stage("http.close", () => closeHttp(server, connections.upgrades));
+    const runtimeStop = drainThenStopRuntime({ stage, requests, server, stopRuntime });
+    const outcomes = [...streamOutcomes, ...(await Promise.allSettled([httpClose, runtimeStop]))];
+    const clean =
+      !deadlines.state.expired && outcomes.every((outcome) => outcome.status === "fulfilled");
+    if (!deadlines.state.hardExited) options.exit(clean ? 0 : 1);
+    return clean;
+  } finally {
+    deadlines.clear();
+    connections.release();
   }
+}
+
+function destroySockets(
+  server: Server,
+  sockets: ReadonlySet<Socket>,
+  flushing: ReadonlySet<Socket> = new Set(),
+): void {
+  if (flushing.size === 0) server.closeAllConnections();
+  for (const socket of sockets) {
+    if (!flushing.has(socket)) socket.destroy();
+  }
+}
+
+function startDeadlines(input: {
+  context: ShutdownContext;
+  requests: ReturnType<typeof beginHttpShutdown>;
+  logger: ShutdownLogger;
+  report: () => { pendingStages: string[]; elapsedMs: number };
+}): Deadlines {
+  const { context, requests, logger, report } = input;
+  const { server, options, connections } = context;
+  const state = { expired: false, hardExited: false };
+  const grace = setTimeout(() => {
+    state.expired = true;
+    logger.warn(report(), "shutdown grace deadline reached; destroying remaining connections");
+    destroySockets(server, connections.sockets, requests.expire());
+  }, options.graceMs);
+  const watchdog = setTimeout(() => {
+    state.hardExited = true;
+    logger.error(report(), "shutdown hard deadline reached; exiting");
+    destroySockets(server, connections.sockets);
+    options.exit(1);
+  }, options.hardExitMs);
+  watchdog.unref();
+  return {
+    state,
+    clear: () => {
+      clearTimeout(grace);
+      clearTimeout(watchdog);
+    },
+  };
+}
+
+function createStage(logger: ShutdownLogger, pending: Set<string>): Stage {
+  return async (name, action) => {
+    const stageStarted = performance.now();
+    pending.add(name);
+    logger.info({ stage: name, phase: "start", elapsedMs: 0 }, "shutdown stage started");
+    try {
+      await action();
+    } catch (error) {
+      reportFailure(error, { operation: "server.shutdown", component: "server" }, { logger });
+      throw error;
+    } finally {
+      pending.delete(name);
+      logger.info(
+        { stage: name, phase: "end", elapsedMs: performance.now() - stageStarted },
+        "shutdown stage ended",
+      );
+    }
+  };
+}
+
+function closeHttp(server: Server, upgrades: ReadonlySet<Duplex>): Promise<void> {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  server.close((error) => {
+    if (error !== undefined) reject(error);
+    else resolve();
+  });
+  server.closeIdleConnections();
+  for (const socket of upgrades) socket.destroy();
+  return promise;
+}
+
+async function drainThenStopRuntime(input: {
+  stage: Stage;
+  requests: ReturnType<typeof beginHttpShutdown>;
+  server: Server;
+  stopRuntime: () => Promise<void>;
+}): Promise<void> {
+  const { stage, requests, server, stopRuntime } = input;
+  await stage("http.requests", () => requests.drained);
+  server.closeIdleConnections();
+  await stage("runtime.stop", stopRuntime);
 }
 
 export interface ShutdownSignals {
@@ -163,11 +237,9 @@ export function installShutdownSignals(
 
 function readBudget(
   environment: Readonly<Record<string, string | undefined>>,
-  name: string,
-  fallback: number,
-  minimum: number,
-  maximum: number,
+  spec: { name: string; fallback: number; minimum: number; maximum: number },
 ): number {
+  const { name, fallback, minimum, maximum } = spec;
   const raw = environment[name]?.trim();
   if (raw === undefined || raw === "") return fallback;
   const value = /^\d+$/u.test(raw) ? Number(raw) : Number.NaN;
