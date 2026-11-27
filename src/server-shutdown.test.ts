@@ -78,6 +78,14 @@ describe("production shutdown", () => {
     }
   });
 
+  it("does not wait for grace when a client leaves with a late request queued", async () => {
+    assert.equal(await shutDownWithQueuedRejections({ late: 1, disconnect: true }), true);
+  });
+
+  it("does not wait for grace when two late requests are pipelined", async () => {
+    assert.equal(await shutDownWithQueuedRejections({ late: 2, disconnect: false }), true);
+  });
+
   it("rejects upgrades after HTTP admission closes", async () => {
     const upgraded = vi.fn();
     const server = createFetchServer(() => new Response("unexpected"), {
@@ -384,6 +392,53 @@ async function listen(server: Server): Promise<number> {
   const address = server.address();
   if (address === null || typeof address === "string") throw new Error("server did not bind");
   return address.port;
+}
+
+async function shutDownWithQueuedRejections(options: {
+  late: number;
+  disconnect: boolean;
+}): Promise<boolean> {
+  const admitted = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const arrived = Promise.withResolvers<void>();
+  const connectionClosed = Promise.withResolvers<void>();
+  let requests = 0;
+  const server = createFetchServer(async () => {
+    admitted.resolve();
+    await release.promise;
+    return new Response("admitted");
+  });
+  server.on("connection", (socket) => {
+    socket.once("close", () => connectionClosed.resolve());
+  });
+  server.on("request", () => {
+    requests++;
+    if (requests === options.late + 1) arrived.resolve();
+  });
+  const stop = createServerShutdown(server, async () => {}, { ...budgets, logger, exit: () => {} });
+  const client = connect(await listen(server), "127.0.0.1");
+  client.on("error", ignoreError);
+  try {
+    await once(client, "connect");
+    client.write("GET /admitted HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    await admitted.promise;
+    const stopped = stop();
+    for (let index = 0; index < options.late; index++) {
+      client.write(`GET /late-${index} HTTP/1.1\r\nHost: localhost\r\n\r\n`);
+    }
+    await arrived.promise;
+    if (options.disconnect) {
+      client.destroy();
+      await connectionClosed.promise;
+    }
+    release.resolve();
+    return await stopped;
+  } finally {
+    release.resolve();
+    client.destroy();
+    server.closeAllConnections();
+    server.close();
+  }
 }
 
 function ignoreError(): void {}
