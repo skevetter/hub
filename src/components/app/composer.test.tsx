@@ -20,6 +20,23 @@ function render(props: Partial<Parameters<typeof Composer>[0]> = {}): string {
 }
 
 describe("composer actions by agent state", () => {
+  it("renders enabled controls and notes for each agent state", () => {
+    const idle = render({ agentState: "idle", initialDraft: " hello " });
+    const running = render({ agentState: "running", initialDraft: " hello " });
+    const waiting = render({ agentState: "waiting_permission", initialDraft: " hello " });
+    assert.match(idle, /type="submit"[^>]*>Send<\/button>/u);
+    assert.doesNotMatch(idle, /Queue for next turn/u);
+    assert.match(running, /type="submit"[^>]*>Steer now<\/button>/u);
+    assert.match(running, /Queue for next turn/u);
+    assert.match(running, /Steer now sends at once/u);
+    assert.match(waiting, /type="submit"[^>]*disabled=""[^>]*>Steer now<\/button>/u);
+    assert.match(waiting, /waiting for a permission answer/u);
+    assert.match(waiting, /Queue for next turn/u);
+    for (const markup of [idle, running, waiting]) {
+      assert.match(markup, /aria-invalid="false"/u);
+      assert.match(markup, / hello /u);
+    }
+  });
   it("offers Steer now and Queue for next turn while the agent runs", () => {
     const actions = composerActions("running", false);
     assert.deepEqual(actions, {

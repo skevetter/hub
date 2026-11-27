@@ -4,7 +4,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
-  type FormEvent,
+  type SubmitEvent,
   type KeyboardEvent,
   type ReactNode,
 } from "react";
@@ -78,6 +78,25 @@ export function composerKeyIntent(event: {
   return event.key === "Enter" && (event.metaKey || event.ctrlKey) ? "submit" : "none";
 }
 
+interface ComposerProps {
+  agentState: ComposerAgentState;
+  /** A send is in flight. */
+  busy?: boolean;
+  /** The session cannot take messages at all; says why. */
+  disabledReason?: string | undefined;
+  error?: string | undefined;
+  initialDraft?: string;
+  messageLabel?: string;
+  primaryLabel?: string;
+  placeholder?: string;
+  hint?: string | undefined;
+  secondaryAction?: ReactNode;
+  /** In `idle` this is the one Send. */
+  onSteer: (text: string) => Promise<boolean>;
+  onQueue: (text: string) => Promise<boolean>;
+  onStop?: () => void;
+}
+
 /**
  * The reply box. Presentational: a handler resolves `true` when the message was accepted, which
  * clears the draft, and `false` when it was not, which keeps it. The caller shows why in `error`.
@@ -96,24 +115,63 @@ export function Composer({
   onSteer,
   onQueue,
   onStop,
-}: {
+}: ComposerProps) {
+  const state = useComposer({ agentState, busy, disabledReason, initialDraft, onSteer, onQueue });
+  const description = counterNote(state.used, disabledReason) ?? hint;
+
+  return (
+    <form className="grid min-w-0 gap-3" onSubmit={state.onSubmit}>
+      {error === undefined ? null : (
+        <FailureAlert title="Message not sent" error={error} fallback="Message not sent." />
+      )}
+      <FormField
+        id={state.fieldId}
+        label={messageLabel}
+        {...(description === undefined ? {} : { description })}
+        {...(state.over ? { error: OVER_LIMIT } : {})}
+      >
+        {(control) => (
+          <Textarea
+            {...control}
+            ref={state.textarea}
+            rows={3}
+            placeholder={placeholder}
+            value={state.draft}
+            disabled={state.locked}
+            onChange={state.onChange}
+            onKeyDown={state.onKeyDown}
+          />
+        )}
+      </FormField>
+      <ComposerButtons
+        actions={state.actions}
+        primaryLabel={primaryLabel}
+        queue={state.queue}
+        secondaryAction={secondaryAction}
+        onStop={onStop}
+      />
+      <ComposerNote actions={state.actions} agentState={agentState} />
+    </form>
+  );
+}
+
+interface ComposerOptions {
   agentState: ComposerAgentState;
-  /** A send is in flight. */
-  busy?: boolean;
-  /** The session cannot take messages at all; says why. */
-  disabledReason?: string | undefined;
-  error?: string | undefined;
-  initialDraft?: string;
-  messageLabel?: string;
-  primaryLabel?: string;
-  placeholder?: string;
-  hint?: string | undefined;
-  secondaryAction?: ReactNode;
-  /** In `idle` this is the one Send. */
+  busy: boolean;
+  disabledReason: string | undefined;
+  initialDraft: string;
   onSteer: (text: string) => Promise<boolean>;
   onQueue: (text: string) => Promise<boolean>;
-  onStop?: () => void;
-}) {
+}
+
+function useComposer({
+  agentState,
+  busy,
+  disabledReason,
+  initialDraft,
+  onSteer,
+  onQueue,
+}: ComposerOptions) {
   const fieldId = useId();
   const [draft, setDraft] = useState(initialDraft);
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -147,70 +205,81 @@ export function Composer({
     [primary.enabled, steer],
   );
   const onSubmit = useCallback(
-    (event: FormEvent) => {
+    (event: SubmitEvent<HTMLFormElement>) => {
       event.preventDefault();
       if (primary.enabled) steer();
     },
     [primary.enabled, steer],
   );
-  const description = counterNote(used, disabledReason) ?? hint;
+  return {
+    fieldId,
+    draft,
+    textarea,
+    locked,
+    actions,
+    over,
+    queue,
+    onChange,
+    onKeyDown,
+    onSubmit,
+    used,
+  };
+}
 
+function ComposerNote({
+  actions,
+  agentState,
+}: {
+  actions: ComposerActions;
+  agentState: ComposerAgentState;
+}) {
+  return actions.mode === "split" ? (
+    <p className="text-xs text-muted-foreground">
+      {agentState === "waiting_permission" ? STEER_PERMISSION_MESSAGE : STEER_NOTE}
+    </p>
+  ) : null;
+}
+
+function ComposerButtons({
+  actions,
+  primaryLabel,
+  queue,
+  secondaryAction,
+  onStop,
+}: {
+  actions: ComposerActions;
+  primaryLabel: string;
+  queue: () => void;
+  secondaryAction: ReactNode;
+  onStop: (() => void) | undefined;
+}) {
   return (
-    <form className="grid min-w-0 gap-3" onSubmit={onSubmit}>
-      {error === undefined ? null : (
-        <FailureAlert title="Message not sent" error={error} fallback="Message not sent." />
+    <div className="flex flex-wrap items-center gap-2">
+      {actions.mode === "single" ? (
+        <Button type="submit" disabled={!actions.send.enabled}>
+          {primaryLabel}
+        </Button>
+      ) : (
+        <>
+          <Button type="submit" disabled={!actions.steer.enabled}>
+            Steer now
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            disabled={!actions.queue.enabled}
+            onClick={queue}
+          >
+            Queue for next turn
+          </Button>
+        </>
       )}
-      <FormField
-        id={fieldId}
-        label={messageLabel}
-        {...(description === undefined ? {} : { description })}
-        {...(over ? { error: OVER_LIMIT } : {})}
-      >
-        {(control) => (
-          <Textarea
-            {...control}
-            ref={textarea}
-            rows={3}
-            placeholder={placeholder}
-            value={draft}
-            disabled={locked}
-            onChange={onChange}
-            onKeyDown={onKeyDown}
-          />
-        )}
-      </FormField>
-      <div className="flex flex-wrap items-center gap-2">
-        {actions.mode === "single" ? (
-          <Button type="submit" disabled={!actions.send.enabled}>
-            {primaryLabel}
-          </Button>
-        ) : (
-          <>
-            <Button type="submit" disabled={!actions.steer.enabled}>
-              Steer now
-            </Button>
-            <Button
-              type="button"
-              variant="secondary"
-              disabled={!actions.queue.enabled}
-              onClick={queue}
-            >
-              Queue for next turn
-            </Button>
-          </>
-        )}
-        {secondaryAction}
-        {onStop === undefined ? null : (
-          <Button type="button" variant="outline" onClick={onStop}>
-            Stop
-          </Button>
-        )}
-      </div>
-      {actions.mode === "split" ? (
-        <p className="text-xs text-muted-foreground">
-          {agentState === "waiting_permission" ? STEER_PERMISSION_MESSAGE : STEER_NOTE}
-        </p>
-      ) : null}
-    </form>
+      {secondaryAction}
+      {onStop === undefined ? null : (
+        <Button type="button" variant="outline" onClick={onStop}>
+          Stop
+        </Button>
+      )}
+    </div>
   );
 }
