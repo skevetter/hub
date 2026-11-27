@@ -653,10 +653,17 @@ async function runMode(mode, context) {
   return runFullSuite(context);
 }
 
+/** Colors split the project label in FAIL lines, so shard runs print plain text. */
+export function usePlainOutput(env = process.env) {
+  delete env.FORCE_COLOR;
+  env.NO_COLOR = "1";
+}
+
 async function main(signal) {
   const { values, mode } = parseCommandLine();
   const root = repositoryFor(import.meta.url, values.root);
   const { head } = printRunContext(root, ACTIONS[mode.kind]);
+  if (mode.kind === "shard" || mode.kind === "built-only") usePlainOutput();
   const cacheRoot = join(root, "node_modules/.vite/vitest");
   const failedFileList = join(cacheRoot, "test-parallel", "failed.json");
   const shardOverride =

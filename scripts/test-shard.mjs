@@ -251,10 +251,18 @@ function isSensitiveName(name) {
   return SENSITIVE_NAME.test(name) || HOST_NAMES.includes(name);
 }
 
+function decoded(text) {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
 function urlParts(value) {
   try {
     const { hostname: name, username, password } = new URL(value);
-    return [name, decodeURIComponent(username), decodeURIComponent(password)];
+    return [name, username, decoded(username), password, decoded(password)];
   } catch {
     return [];
   }
@@ -275,10 +283,43 @@ export function sensitiveValues(env = process.env, host = hostname()) {
     .sort((a, b) => b.length - a.length);
 }
 
-/** Replaces env values with [redacted], then each repository root path with a dot. */
+function occurrences(text, needle, secret) {
+  const spans = [];
+  for (let at = text.indexOf(needle); at >= 0; at = text.indexOf(needle, at + needle.length)) {
+    spans.push({ start: at, end: at + needle.length, secret });
+  }
+  return spans;
+}
+
+function mergeSpans(spans) {
+  const sorted = [...spans].sort((x, y) => x.start - y.start || y.end - x.end);
+  const merged = [];
+  for (const span of sorted) {
+    const last = merged.at(-1);
+    if (last && span.start < last.end) {
+      last.end = Math.max(last.end, span.end);
+      last.secret ||= span.secret;
+    } else merged.push({ ...span });
+  }
+  return merged;
+}
+
+/**
+ * Replaces env values with [redacted] and repository root paths with a dot. Overlapping
+ * matches merge into one span, and a span that touches an env value is always redacted.
+ */
 export function redactText(text, { values, roots = [] }) {
-  const hidden = values.reduce((result, value) => result.split(value).join("[redacted]"), text);
-  return roots.reduce((result, root) => result.split(root).join("."), hidden);
+  const spans = [
+    ...values.flatMap((value) => occurrences(text, value, true)),
+    ...roots.flatMap((root) => occurrences(text, root, false)),
+  ];
+  let result = "";
+  let at = 0;
+  for (const span of mergeSpans(spans)) {
+    result += text.slice(at, span.start) + (span.secret ? "[redacted]" : ".");
+    at = span.end;
+  }
+  return result + text.slice(at);
 }
 
 export function redactDeep(value, scrubber) {

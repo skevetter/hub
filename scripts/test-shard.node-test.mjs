@@ -8,7 +8,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { timingEntries } from "./generate-test-timings.mjs";
-import { partitionFiles, weighFiles } from "./test-parallel.mjs";
+import { partitionFiles, usePlainOutput, weighFiles } from "./test-parallel.mjs";
 import {
   RETRY_CAP,
   UsageError,
@@ -616,7 +616,7 @@ test("env values are redacted before the root path and URL parts count as values
     },
     "h",
   );
-  for (const part of ["db.internal.example", "pw!123", "app", "123456789"]) {
+  for (const part of ["db.internal.example", "pw!123", "pw%21123", "app", "123456789"]) {
     assert.ok(values.includes(part), part);
   }
   const text = redactText("file:/repo/x?key=abc at /repo/y", {
@@ -624,6 +624,20 @@ test("env values are redacted before the root path and URL parts count as values
     roots: ["/repo"],
   });
   assert.equal(text, "[redacted] at ./y");
+});
+
+test("shard runs turn colors off for the Vitest subprocess", () => {
+  const env = { FORCE_COLOR: "1", KEEP: "x" };
+  usePlainOutput(env);
+  assert.deepEqual(env, { NO_COLOR: "1", KEEP: "x" });
+});
+
+test("overlapping env values and root paths merge and stay redacted", () => {
+  const scrub = (text, values, roots) => redactText(text, { values, roots });
+  assert.equal(scrub("at /tmp/test-repo/a.ts", ["test"], ["/tmp/test-repo"]), "at [redacted]/a.ts");
+  assert.equal(scrub("p=/repo/x?k=1&t", ["/repo/x?k=1"], ["/repo"]), "p=[redacted]&t");
+  assert.equal(scrub("a /repo/b and tok", ["tok"], ["/repo"]), "a ./b and [redacted]");
+  assert.equal(scrub("pw%21123 pw!123", ["pw%21123", "pw!123"], []), "[redacted] [redacted]");
 });
 
 test("a named project prefix on the FAIL line still names the file", () => {

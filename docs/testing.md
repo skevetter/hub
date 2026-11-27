@@ -84,7 +84,9 @@ With `TEST_SHARD_REPORT_DIR` set, the run writes `shard-<i>.json` (or `built-onl
 `.summary.json` next to it, `vitest.log` and, after retries, `vitest.retry-<n>.log`. Values of
 environment variables whose names suggest secrets (token, key, password, URL, DSN and similar) of
 3 or more characters, plus the host name, are replaced with `[redacted]` in those files and in the
-step summary. The repository path becomes `.`. To refresh `scripts/test-timings.json`, run
+step summary. Values of one to four digits and the words true, false, yes, no, on, off, null and
+undefined are left alone. The hostname, user name and password inside a URL value count as values
+too. The repository path becomes `.`. Shard runs set `NO_COLOR` so the log has no color codes. To refresh `scripts/test-timings.json`, run
 `node scripts/generate-test-timings.mjs <dir>`, where `<dir>` holds the downloaded
 `shard-<i>.json` files of one complete run and a copy of `built-only.json` named
 `shard-<n>.json`.
