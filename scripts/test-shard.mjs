@@ -159,12 +159,13 @@ const FAIL_LINE =
   /^\s*FAIL\s+(?:(?:\[[^\]]*\]|\|[^|]*\|)\s*)?(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)(?:\s+(?:>|\[).*)?\s*$/u;
 const SEPARATOR_LINE = /^\s*\u23AF{3,}/u;
 const HINT_LINE = /^If this is a long-running (?:test|hook)/u;
-const STACK_LINE = /^\s*(?:at\s|\u276F)/u;
+const FRAME_LINE = /^\s+at\s.+:\d+:\d+\)?\s*$/u;
+const REPORTER_FRAME = /^\s*\u276F/u;
 
 /** The error message without its stack frames and Vitest's timeout hint. */
 function messageLines(text) {
   const lines = String(text).split("\n");
-  const stack = lines.findIndex((line, index) => index > 0 && STACK_LINE.test(line));
+  const stack = lines.findIndex((line, index) => index > 0 && FRAME_LINE.test(line));
   return (stack === -1 ? lines : lines.slice(0, stack)).filter(
     (line) => line.trim() !== "" && !HINT_LINE.test(line.trim()),
   );
@@ -189,40 +190,43 @@ function extendHeader(headers, files, line) {
 }
 
 function continuesMessage(line) {
-  return /^\s+\S/u.test(line) && !STACK_LINE.test(line);
+  return /^\s+\S/u.test(line) && !REPORTER_FRAME.test(line);
+}
+
+function lineKind(line, { files, inMessage }) {
+  if (FAIL_LINE.test(line)) return "fail";
+  if (SEPARATOR_LINE.test(line)) return "separator";
+  if (files.length === 0 || line === "") return "ignored";
+  if (inMessage && continuesMessage(line)) return "continuation";
+  if (!/^\s/u.test(line) && !HINT_LINE.test(line)) return "header";
+  return "other";
 }
 
 /**
  * Error lines the default reporter printed for each failing test file, keyed by file.
  * A failure block starts with one or more FAIL lines. Every unindented line after them, up
  * to the next rule line, is an error header for all of those files. Indented lines that follow
- * a header before its first stack frame are more of the same message.
+ * a header before the reporter's first frame marker are more of the same message.
  */
 export function logFailureHeaders(logText) {
   const headers = new Map();
-  let files = [];
-  let inErrors = false;
-  let inMessage = false;
+  const state = { files: [], inErrors: false, inMessage: false };
   for (const raw of logText.replace(ANSI_PATTERN, "").split("\n")) {
     const line = raw.trimEnd();
-    const failed = FAIL_LINE.exec(line);
-    if (failed) {
-      if (inErrors) files = [];
-      files.push(failed[1]);
-      inErrors = false;
-      inMessage = false;
-    } else if (SEPARATOR_LINE.test(line)) {
-      files = [];
-      inErrors = false;
-      inMessage = false;
-    } else if (files.length > 0 && inMessage && continuesMessage(line)) {
-      extendHeader(headers, files, line);
-    } else if (files.length > 0 && line !== "" && !/^\s/u.test(line) && !HINT_LINE.test(line)) {
-      addHeader(headers, files, line);
-      inErrors = true;
-      inMessage = true;
-    } else {
-      inMessage = false;
+    const kind = lineKind(line, state);
+    if (kind === "fail") {
+      if (state.inErrors) state.files = [];
+      state.files.push(FAIL_LINE.exec(line)[1]);
+      Object.assign(state, { inErrors: false, inMessage: false });
+    } else if (kind === "separator") {
+      Object.assign(state, { files: [], inErrors: false, inMessage: false });
+    } else if (kind === "continuation") {
+      extendHeader(headers, state.files, line);
+    } else if (kind === "header") {
+      addHeader(headers, state.files, line);
+      Object.assign(state, { inErrors: true, inMessage: true });
+    } else if (kind === "other") {
+      state.inMessage = false;
     }
   }
   return headers;

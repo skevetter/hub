@@ -326,7 +326,11 @@ test("a bare JSON message needs a matching log header", () => {
   const other = logFailureHeaders(failureLog("a.test.ts", "AssertionError: nope"));
   assert.deepEqual(retryableFiles(report, ["a.test.ts"], { root, headers: other }), []);
   const typed = reportOf(
-    suiteFailure("a.test.ts", "DatabaseUnavailableError: database query timed out\n  at x", []),
+    suiteFailure(
+      "a.test.ts",
+      "DatabaseUnavailableError: database query timed out\n    at x (/repo/x.ts:1:2)",
+      [],
+    ),
   );
   assert.deepEqual(retryableFiles(typed, ["a.test.ts"], { root }), ["a.test.ts"]);
 });
@@ -376,6 +380,37 @@ test("a start timeout with more message text is not retried from a test or a hoo
   assert.deepEqual(retryableFiles(plain, ["body.test.ts"], { root, headers: plainHeaders }), [
     "body.test.ts",
   ]);
+});
+
+test("message text after a blank line or starting with at still blocks the retry", () => {
+  const message = "timeout exceeded when trying to connect";
+  const block = (name, ...lines) =>
+    [
+      ` FAIL  ${name}.test.ts > ${name}`,
+      `Error: ${message}`,
+      ...lines,
+      ` \u276F ${name}.test.ts:4:11`,
+      "",
+    ].join("\n");
+  const log = [
+    block("blank", "", "  Configuration error: wrong endpoint"),
+    block("athook", "  at startup: wrong endpoint"),
+    block("atbody", "  at startup: wrong endpoint"),
+  ].join("\n");
+  const headers = logFailureHeaders(log);
+  assert.deepEqual(headers.get("blank.test.ts"), [
+    `Error: ${message}\n  Configuration error: wrong endpoint`,
+  ]);
+  const frame = "    at /repo/atbody.test.ts:3:9";
+  const report = reportOf(
+    failedEntry("atbody.test.ts", `Error: ${message}\n  at startup: wrong endpoint\n${frame}`),
+    suiteFailure("athook.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+    suiteFailure("blank.test.ts", "", [{ status: "skipped", failureMessages: [] }]),
+  );
+  for (const file of ["atbody", "athook", "blank"]) {
+    const name = `${file}.test.ts`;
+    assert.deepEqual(retryableFiles(report, [name], { root, headers }), [], name);
+  }
 });
 
 test("the cause pg-pool attaches to a connection timeout is part of that failure", () => {
