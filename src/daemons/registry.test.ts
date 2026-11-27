@@ -386,9 +386,13 @@ describe("daemon socket deadlines", () => {
 
   it.each(["disconnect", "stop"] as const)("clears the provider deadline on %s", async (event) => {
     const { connection, registry, socket } = setupProviderRead();
-    const rejected = assert.rejects(connection.getProviderSnapshot({}), {
-      message: "daemon disconnected",
-    });
+    const rejected = assert.rejects(
+      connection.getProviderSnapshot({}),
+      (error) =>
+        error instanceof DaemonDisconnectedError &&
+        error.message === "daemon disconnected" &&
+        classifyFailure(error) === "upstreamUnavailable",
+    );
     if (event === "disconnect") socket.emit("close", 1000, Buffer.alloc(0));
     else await registry.stop();
 

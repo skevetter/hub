@@ -109,6 +109,21 @@ describe.each(["pglite", "memory"] as const)("refused writes on %s", (engine) =>
     assert.match(log, new RegExp(`"level":${WARN}`, "u"));
   });
 
+  it("reports a trigger ID that no longer exists as not found and creates nothing", async () => {
+    const error = await rejection(
+      saveTrigger(database, {
+        organizationId: "org-a",
+        name: "ghost",
+        triggerId: "6f1d1e0a-7a5b-4a53-9a0e-2f9d4f3f6c11",
+      }),
+    );
+
+    assert.ok(error instanceof OrganizationTriggerNotFoundError);
+    assert.equal(classifyFailure(error), "notFound");
+    const names = (await database.listOrganizationTriggers("org-a")).map((row) => row.name);
+    assert.ok(!names.includes("ghost"));
+  });
+
   it("reports a project slug that is taken as a conflict", async () => {
     const project = {
       organizationId: "org-a",

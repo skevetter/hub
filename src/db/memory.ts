@@ -6378,7 +6378,8 @@ class MemoryDatabase implements Database {
   ): OrganizationTriggerRecord | undefined {
     const existing =
       input.triggerId === undefined ? undefined : this.organizationTriggers.get(input.triggerId);
-    if (existing !== undefined && existing.organizationId !== input.organizationId) {
+    const missing = input.triggerId !== undefined && existing === undefined;
+    if (missing || (existing !== undefined && existing.organizationId !== input.organizationId)) {
       throw new OrganizationTriggerNotFoundError();
     }
     if (

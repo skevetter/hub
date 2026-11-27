@@ -125,7 +125,7 @@ export class OrganizationTriggerStore {
   private async activeYaml(triggerId: string | undefined): Promise<string | undefined> {
     if (triggerId === undefined) return undefined;
     const trigger = await this.find(triggerId);
-    if (trigger === undefined) return undefined;
+    if (trigger === undefined) throw new OrganizationTriggerNotFoundError();
     return (await this.activeRevision(trigger)).yaml;
   }
 
