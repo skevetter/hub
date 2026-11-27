@@ -1,21 +1,40 @@
 import { spawnSync } from "node:child_process";
 import { diffPaths, latestTag, shaPattern } from "./git.mjs";
 
-const shared = /^(?:package(?:-lock)?\.json|\.npmrc|\.github\/workflows\/(?:ci|nightly)\.yml)$/u;
-const ui =
-  /^(?:e2e\/|src\/(?:routes\/|components\/|styles\.css$|routeTree\.gen\.ts$)|(?:vite|playwright)\.config\.ts$)/u;
-const e2e = /^(?:src\/e2e\/|scripts\/(?:paseo-workspace|ci-paseo-source)\.|vitest\.config\.ts$)/u;
+const all = { ui: true, e2e: true, workflows: true };
+const suites = { ui: true, e2e: true, workflows: false };
+const none = { ui: false, e2e: false, workflows: false };
+const rules = [
+  [/^(?:package(?:-lock)?\.json|\.npmrc|\.github\/workflows\/(?:ci|nightly)\.yml)$/u, all],
+  [/^(?:\.github|scripts\/cd)\//u, { ui: false, e2e: false, workflows: true }],
+  [/^src\/e2e\/harness\//u, suites],
+  [/^src\/e2e\//u, { ui: false, e2e: true, workflows: false }],
+  [/^(?:docs|examples)\//u, none],
+  [/\.md$/u, none],
+  [
+    /^(?:LICENSE|\.gitignore|lefthook\.yml|oxlint(?:\.strict)?\.json|\.oxfmtrc\.json|\.env\.example|hub\.yml\.example|fly\.example\.toml)$/u,
+    none,
+  ],
+  [/^scripts\/.*\.node-test\.mjs$/u, none],
+  [/^src\/(?:.*\/)?(?:__tests__|__snapshots__|test-fixtures)\//u, none],
+  [/^src\/.*\.(?:test|node-test|spec)\.[^/]+$/u, none],
+  [/^e2e\//u, { ui: true, e2e: false, workflows: false }],
+  [/^(?:Dockerfile|(?:drizzle|vite|vitest|playwright)\.config\.ts|tsconfig[^/]*\.json)$/u, suites],
+  [/^(?:bin|drizzle|scripts)\//u, suites],
+  // Both suites boot the whole Hub, so any server or UI code can affect them.
+  [/^src\//u, suites],
+];
 
 export function changedFlags(paths) {
-  if (paths === null) return { ui: true, e2e: true, workflows: true };
-  const sharedChange = paths.some((path) => shared.test(path));
-  return {
-    ui:
-      sharedChange ||
-      paths.some((path) => ui.test(path) || (path.startsWith("src/") && path.endsWith(".tsx"))),
-    e2e: sharedChange || paths.some((path) => e2e.test(path)),
-    workflows: paths.some((path) => path.startsWith(".github/") || path.startsWith("scripts/cd/")),
-  };
+  if (paths === null) return { ...all };
+  const flags = { ...none };
+  for (const path of paths) {
+    const [, change] = rules.find(([pattern]) => pattern.test(path)) ?? [null, all];
+    flags.ui ||= change.ui;
+    flags.e2e ||= change.e2e;
+    flags.workflows ||= change.workflows;
+  }
+  return flags;
 }
 
 function reachable(base) {

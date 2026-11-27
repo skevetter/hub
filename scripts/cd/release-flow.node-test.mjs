@@ -98,8 +98,8 @@ function setupFixture({ dir, save, git, exec }) {
   const base = commit("chore: base");
   git("update-ref", "HEAD", base);
   git("update-ref", "refs/tags/v1.0.0", base);
-  const push = (content, message = "fix: test release") => {
-    save("src/index.ts", content);
+  const push = (content, message = "fix: test release", file = "src/index.ts") => {
+    save(file, content);
     const sha = commit(message, git("rev-parse", "HEAD"));
     git("update-ref", "HEAD", sha);
     git("update-ref", "refs/remotes/origin/main", sha);
@@ -182,7 +182,7 @@ test("push path classification includes changes from prior pushes since the newe
   save("src/e2e/contract.ts", "e2e change");
   const previous = push("previous push");
   git("update-ref", "refs/tags/v9.0.0-rc.1", previous);
-  const tip = push("latest push");
+  const tip = push("latest push", "fix: test release", "src/notes.md");
   git("update-ref", "refs/tags/v10.0.0", push("unreachable push"));
   git("checkout", "--detach", tip);
   const classify = () =>
