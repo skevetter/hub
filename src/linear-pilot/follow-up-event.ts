@@ -5,6 +5,14 @@ import type { LinearPilotEvent } from "./intake.js";
 
 const activityId = z.uuid();
 
+function matchesInstallation(event: LinearPilotEvent, installation: PilotConnection) {
+  return (
+    installation.workspaceId === event.workspaceId &&
+    installation.applicationId === event.applicationId &&
+    installation.appUserId === event.appUserId
+  );
+}
+
 /** Use only after verifying the webhook signature, timestamp and pilot intake. */
 export function adaptSignedPilotFollowUp(
   event: LinearPilotEvent,
@@ -15,9 +23,7 @@ export function adaptSignedPilotFollowUp(
     event.kind === "created" ||
     !id.success ||
     !event.teamId ||
-    installation.workspaceId !== event.workspaceId ||
-    installation.applicationId !== event.applicationId ||
-    installation.appUserId !== event.appUserId
+    !matchesInstallation(event, installation)
   )
     return undefined;
 

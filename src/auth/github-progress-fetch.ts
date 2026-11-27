@@ -16,40 +16,53 @@ export function githubProgressFetch(request: typeof fetch): typeof fetch {
         throw new Error("Unexpected GitHub redirect");
       }
       const body = await readBody(response, signal);
-      const headers = new Headers();
-      const retryAfter = response.headers.get("retry-after");
-      if (
-        retryAfter !== null &&
-        (/^\d+$/u.test(retryAfter) || Number.isFinite(Date.parse(retryAfter)))
-      )
-        headers.set("retry-after", retryAfter);
-      for (const name of ["x-ratelimit-remaining", "x-ratelimit-reset"]) {
-        const value = response.headers.get(name);
-        if (value !== null && /^\d+$/u.test(value)) headers.set(name, value);
-      }
-      if (response.headers.has("x-github-sso")) headers.set("x-github-sso", "required");
-      if (
-        response.headers
-          .get("x-oauth-scopes")
-          ?.split(",")
-          .some((scope) => scope.trim() === "repo" || scope.trim().startsWith("admin:"))
-      )
-        headers.set("x-oauth-scopes", "repo");
-      // Octokit can copy upstream error bodies into exceptions. Keep only rejection evidence.
-      if (response.status >= 300) {
-        headers.set("content-type", "application/json");
-        return new Response(JSON.stringify(errorEvidence(body, response.status)), {
-          status: response.status,
-          headers,
-        });
-      }
-      const contentType = response.headers.get("content-type");
-      if (contentType !== null) headers.set("content-type", contentType.split(";")[0]!);
-      return new Response(body, { status: response.status, headers });
+      return progressResponse(response, body);
     } catch {
       throw new Error("GitHub progress request failed");
     }
   };
+}
+
+function progressResponse(response: Response, body: string | null): Response {
+  const headers = progressHeaders(response);
+  // Octokit can copy upstream error bodies into exceptions. Keep only rejection evidence.
+  if (response.status >= 300) {
+    headers.set("content-type", "application/json");
+    return new Response(JSON.stringify(errorEvidence(body, response.status)), {
+      status: response.status,
+      headers,
+    });
+  }
+  const contentType = response.headers.get("content-type");
+  if (contentType !== null) {
+    const [mediaType] = contentType.split(";");
+    headers.set("content-type", String(mediaType));
+  }
+  return new Response(body, { status: response.status, headers });
+}
+
+function progressHeaders(response: Response): Headers {
+  const headers = new Headers();
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter !== null && (/^\d+$/u.test(retryAfter) || Number.isFinite(Date.parse(retryAfter))))
+    headers.set("retry-after", retryAfter);
+  for (const name of ["x-ratelimit-remaining", "x-ratelimit-reset"]) {
+    const value = response.headers.get(name);
+    if (value !== null && /^\d+$/u.test(value)) headers.set(name, value);
+  }
+  if (response.headers.has("x-github-sso")) headers.set("x-github-sso", "required");
+  if (hasPrivilegedScope(response.headers.get("x-oauth-scopes"))) {
+    headers.set("x-oauth-scopes", "repo");
+  }
+  return headers;
+}
+
+function hasPrivilegedScope(value: string | null): boolean {
+  return (
+    value
+      ?.split(",")
+      .some((scope) => scope.trim() === "repo" || scope.trim().startsWith("admin:")) ?? false
+  );
 }
 
 function errorEvidence(
@@ -61,11 +74,7 @@ function errorEvidence(
     const value: unknown = JSON.parse(body);
     if (value === null || typeof value !== "object" || Array.isArray(value))
       return { rejected: false, partial: false };
-    const partial =
-      ("status" in value && value.status !== status && value.status !== String(status)) ||
-      Object.keys(value).some(
-        (key) => !["message", "documentation_url", "status", "errors"].includes(key),
-      );
+    const partial = isPartialEvidence(value, status);
     return {
       rejected:
         !partial && !("errors" in value) && "message" in value && typeof value.message === "string",
@@ -74,6 +83,15 @@ function errorEvidence(
   } catch {
     return { rejected: false, partial: false };
   }
+}
+
+function isPartialEvidence(value: object, status: number): boolean {
+  return (
+    ("status" in value && value.status !== status && value.status !== String(status)) ||
+    Object.keys(value).some(
+      (key) => !["message", "documentation_url", "status", "errors"].includes(key),
+    )
+  );
 }
 
 async function readBody(

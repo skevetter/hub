@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useState, type SyntheticEvent } from "react";
 import { AuthCard, AuthLayout } from "../components/app/auth-layout.js";
 import { AuthForm } from "../components/app/auth-form.js";
 import { failureMessage } from "../components/app/failure-alert.js";
@@ -38,7 +38,7 @@ export function PasswordChangeEntry({
     },
   });
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       const data = new FormData(event.currentTarget);
       const currentPassword = formValue(data, "currentPassword");
@@ -79,7 +79,7 @@ interface PasswordChangeFormProps {
   email: string;
   message: string | undefined;
   busy: boolean;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (event: SyntheticEvent<HTMLFormElement>) => void;
   onSignOut: () => void;
 }
 

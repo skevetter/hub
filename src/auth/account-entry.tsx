@@ -1,7 +1,7 @@
 import { ChevronRight, Plus } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type SyntheticEvent } from "react";
 import { AuthCard, AuthLayout } from "../components/app/auth-layout.js";
 import { AuthForm } from "../components/app/auth-form.js";
 import { failureMessage } from "../components/app/failure-alert.js";
@@ -66,6 +66,48 @@ export function AccountEntry({ account }: { account: AccountState & { status: "s
     }
   }, [invitationContext, invitationId, invitationSignInRequested]);
   const invitationSignup = invitationContext && mode === "signUp";
+  const { signInMutation, signUpMutation } = useAuthenticationMutations(setVerificationEmail);
+  const busy = signInMutation.isPending || signUpMutation.isPending;
+  const toggle = useCallback(() => {
+    setMode((current) => (current === "signIn" ? "signUp" : "signIn"));
+  }, []);
+  const showForgotPassword = useCallback(() => setForgotPassword(true), []);
+  const showSignIn = useCallback(() => {
+    setForgotPassword(false);
+    setVerificationEmail(undefined);
+    setMode("signIn");
+  }, []);
+  const submit = useAuthenticationSubmit({ account, mode, signInMutation, signUpMutation });
+  const mutation = mode === "signIn" ? signInMutation : signUpMutation;
+  const message =
+    mutation.isError || mutation.data?.status === "error"
+      ? failureMessage(
+          mutation.data,
+          mode === "signIn"
+            ? "Hub did not receive the sign-in result. Check your connection and submit again."
+            : "Hub did not receive the account-creation result. Check your connection and invitation before submitting again.",
+        )
+      : undefined;
+  const { title, description } = accountEntryPresentation(account, mode, invitationSignup);
+
+  return renderAccountEntry({
+    account,
+    mode,
+    busy,
+    message,
+    title,
+    description,
+    invitationContext,
+    forgotPassword,
+    verificationEmail,
+    showSignIn,
+    submit,
+    toggle,
+    showForgotPassword,
+  });
+}
+
+function useAuthenticationMutations(setVerificationEmail: (email: string) => void) {
   const queryClient = useQueryClient();
   const signInMutation = useMutation({
     mutationFn: useServerFn(signIn) as (
@@ -93,18 +135,20 @@ export function AccountEntry({ account }: { account: AccountState & { status: "s
       await queryClient.invalidateQueries({ queryKey: ["account"] });
     },
   });
-  const busy = signInMutation.isPending || signUpMutation.isPending;
-  const toggle = useCallback(() => {
-    setMode((current) => (current === "signIn" ? "signUp" : "signIn"));
-  }, []);
-  const showForgotPassword = useCallback(() => setForgotPassword(true), []);
-  const showSignIn = useCallback(() => {
-    setForgotPassword(false);
-    setVerificationEmail(undefined);
-    setMode("signIn");
-  }, []);
-  const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+  return { signInMutation, signUpMutation };
+}
+
+function useAuthenticationSubmit({
+  account,
+  mode,
+  signInMutation,
+  signUpMutation,
+}: ReturnType<typeof useAuthenticationMutations> & {
+  account: AccountState & { status: "signedOut" };
+  mode: "signIn" | "signUp";
+}) {
+  return useCallback(
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       const data = new FormData(event.currentTarget);
       const email = formValue(data, "email");
@@ -130,18 +174,39 @@ export function AccountEntry({ account }: { account: AccountState & { status: "s
     },
     [account.invitation, mode, signInMutation, signUpMutation],
   );
-  const mutation = mode === "signIn" ? signInMutation : signUpMutation;
-  const message =
-    mutation.isError || mutation.data?.status === "error"
-      ? failureMessage(
-          mutation.data,
-          mode === "signIn"
-            ? "Hub did not receive the sign-in result. Check your connection and submit again."
-            : "Hub did not receive the account-creation result. Check your connection and invitation before submitting again.",
-        )
-      : undefined;
-  const { title, description } = accountEntryPresentation(account, mode, invitationSignup);
+}
 
+interface AccountEntryView {
+  account: AccountState & { status: "signedOut" };
+  mode: "signIn" | "signUp";
+  busy: boolean;
+  message: string | undefined;
+  title: string;
+  description: string;
+  invitationContext: boolean;
+  forgotPassword: boolean;
+  verificationEmail: string | undefined;
+  showSignIn: () => void;
+  submit: (event: SyntheticEvent<HTMLFormElement>) => void;
+  toggle: () => void;
+  showForgotPassword: () => void;
+}
+
+function renderAccountEntry({
+  account,
+  mode,
+  busy,
+  message,
+  title,
+  description,
+  invitationContext,
+  forgotPassword,
+  verificationEmail,
+  showSignIn,
+  submit,
+  toggle,
+  showForgotPassword,
+}: AccountEntryView) {
   if (forgotPassword) return <ForgotPasswordEntry onBack={showSignIn} />;
   if (verificationEmail !== undefined) {
     return (
@@ -225,24 +290,7 @@ function SignedOutFooter({
   onToggle: () => void;
   onForgotPassword: () => void;
 }) {
-  if (invitationContext) {
-    return (
-      <div className="grid gap-2 text-center text-sm text-muted-foreground">
-        <p>
-          This invitation is bound to the invited email address.{" "}
-          {mode === "signIn" ? "Need an account?" : "Already have an account?"}{" "}
-          <Button type="button" variant="link" disabled={busy} onClick={onToggle}>
-            {mode === "signIn" ? "Create an account" : "Sign in"}
-          </Button>
-        </p>
-        {mode === "signIn" && (
-          <Button type="button" variant="link" disabled={busy} onClick={onForgotPassword}>
-            Forgot password?
-          </Button>
-        )}
-      </div>
-    );
-  }
+  if (invitationContext) return renderInvitedFooter({ mode, busy, onToggle, onForgotPassword });
   if (registration === "open") {
     return (
       <div className="grid gap-2 text-center text-sm text-muted-foreground">
@@ -276,6 +324,35 @@ function SignedOutFooter({
   );
 }
 
+function renderInvitedFooter({
+  mode,
+  busy,
+  onToggle,
+  onForgotPassword,
+}: {
+  mode: "signIn" | "signUp";
+  busy: boolean;
+  onToggle: () => void;
+  onForgotPassword: () => void;
+}) {
+  return (
+    <div className="grid gap-2 text-center text-sm text-muted-foreground">
+      <p>
+        This invitation is bound to the invited email address.{" "}
+        {mode === "signIn" ? "Need an account?" : "Already have an account?"}{" "}
+        <Button type="button" variant="link" disabled={busy} onClick={onToggle}>
+          {mode === "signIn" ? "Create an account" : "Sign in"}
+        </Button>
+      </p>
+      {mode === "signIn" && (
+        <Button type="button" variant="link" disabled={busy} onClick={onForgotPassword}>
+          Forgot password?
+        </Button>
+      )}
+    </div>
+  );
+}
+
 export function InvitationEntry({
   account: _account,
   invitation,
@@ -295,7 +372,7 @@ export function InvitationEntry({
   const leave = useLeaveAccount();
   const busy = accept.isPending || leave.isPending;
   const submit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       accept.mutate({
         data: { invitationId: formValue(new FormData(event.currentTarget), "invitationId") },
@@ -360,7 +437,7 @@ function useOrganizationCommands() {
   const busy = select.isPending || createOrganizationMutation.isPending || leave.isPending;
   const message = useAccountMutationError();
   const selectSubmit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       select.mutate({
         data: { organizationId: formValue(new FormData(event.currentTarget), "organizationId") },
@@ -369,7 +446,7 @@ function useOrganizationCommands() {
     [select],
   );
   const createSubmit = useCallback(
-    (event: FormEvent<HTMLFormElement>) => {
+    (event: SyntheticEvent<HTMLFormElement>) => {
       event.preventDefault();
       createOrganizationMutation.mutate({
         data: { name: formValue(new FormData(event.currentTarget), "name") },
@@ -463,7 +540,7 @@ function OrganizationChoices({
 }: {
   memberships: OrganizationAccount["memberships"];
   busy: boolean;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (event: SyntheticEvent<HTMLFormElement>) => void;
 }) {
   if (memberships.length === 0) return null;
   return (
