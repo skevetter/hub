@@ -14,13 +14,27 @@ echo "$VPS2_SSH_HOST $RUNNER_TEMP/hub-deploy-key" >&2
 case "$command" in
   status) echo "{\\"ok\\":true,\\"commit\\":$RUNNING,\\"private\\":\\"$VPS2_SSH_HOST\\",\\"version\\":\\"1.0.0\\\\n$VPS2_SSH_HOST\\"}" ;;
   backup*) echo '{"ok":true,"entries":5,"bytes":99,"file":"/private/database.dump"}' ;;
+  wait\\ 60)
+    if ! grep -qx rollback "$RUNNER_TEMP/calls"; then
+      case "$WAIT" in
+        running) echo '{"ok":false,"state":"running"}'; exit 5 ;;
+        failed) echo '{"ok":false,"state":"failed","code":"interrupted"}'; exit 3 ;;
+        invalid) echo '{"ok":false,"state":"failed","code":"ok"}'; exit 3 ;;
+      esac
+    fi
+    echo '{"ok":true,"state":"done"}' ;;
   wait*) echo '{"ok":true,"state":"done"}' ;;
+  record*) if [[ "$RECORD_FAIL" == yes ]]; then echo '{"ok":false}'; exit 4; fi
+    echo '{"ok":true}' ;;
   smoke\\ 1.1.0)
     if [[ "$SMOKE_FAIL" == yes ]]; then echo '{"ok":false,"checks":{"local_health":false}}'; exit 3; fi
     echo '{"ok":true,"checks":{"local_health":true}}' ;;
   rollback) echo '{"ok":true,"to":"1.0.0"}' ;;
   unknown|precheck\\ 0.0.1*|000*)
-    if [[ "$ACCEPT" != yes ]]; then echo '{"ok":false,"reason":"refused"}'; exit 2; fi
+    if [[ "$ACCEPT" != yes ]]; then
+      printf '{"ok":false,"reason":"%s"}\\n' "\${REFUSAL:-refused}"
+      exit 2
+    fi
     echo '{"ok":true}' ;;
   *) echo '{"ok":true}' ;;
 esac
@@ -42,13 +56,16 @@ function execute(action, options = {}) {
     writeFileSync(join(temp, "ssh"), ssh, { mode: 0o700 });
     writeFileSync(join(temp, "curl"), curl, { mode: 0o700 });
     writeFileSync(join(temp, "git"), '#!/usr/bin/env bash\nexit "$ANCESTRY"\n', { mode: 0o700 });
-    const result = spawnSync("bash", [source, action], {
+    writeFileSync(join(temp, "calls"), "");
+    const args = typeof action === "string" ? [source, action] : action;
+    const result = spawnSync("bash", args, {
       encoding: "utf8",
       env: {
         ...process.env,
         PATH: `${temp}:${process.env.PATH}`,
         RUNNER_TEMP: temp,
         RUNNING: "null",
+        CD_DIR: fileURLToPath(new URL(".", import.meta.url)),
         ANCESTRY: "0",
         VPS2_SSH_HOST: "sensitive.example.test",
         VPS2_SSH_PORT: "15123",
@@ -60,7 +77,7 @@ function execute(action, options = {}) {
         ...options,
       },
     });
-    const calls = readFileSync(join(temp, "calls"), "utf8").trim().split("\n");
+    const calls = readFileSync(join(temp, "calls"), "utf8").trim().split("\n").filter(Boolean);
     assert.doesNotMatch(
       result.stdout + result.stderr,
       /sensitive\.example|hub-deploy-key|database\.dump|15123/u,
@@ -115,4 +132,59 @@ test("reports each refusal and fails if any probe is accepted", () => {
   const accepted = execute("selftest", { ACCEPT: "yes" });
   assert.equal(accepted.status, 1);
   assert.match(accepted.stdout, /FAIL older-version/u);
+});
+
+test("polls exit 5 exactly 15 times, then pauses without rollback", () => {
+  const result = execute("deploy", { WAIT: "running" });
+  assert.equal(result.status, 1);
+  assert.deepEqual(result.calls, [...deployCalls.slice(0, 5), ...Array(15).fill("wait"), "pause"]);
+});
+
+test("recovers from a terminal install failure and pauses on ambiguous failures", () => {
+  const failed = execute("deploy", { WAIT: "failed" });
+  assert.equal(failed.status, 1);
+  assert.deepEqual(failed.calls, [
+    ...deployCalls.slice(0, 6),
+    "rollback",
+    "wait",
+    "smoke",
+    "pause",
+  ]);
+  const invalid = execute("deploy", { WAIT: "invalid" });
+  assert.equal(invalid.status, 1);
+  assert.deepEqual(invalid.calls, [...deployCalls.slice(0, 6), "pause"]);
+  const record = execute("deploy", { RECORD_FAIL: "yes" });
+  assert.equal(record.status, 1);
+  assert.deepEqual(record.calls, [...deployCalls, "record", "pause"]);
+});
+
+function call(...args) {
+  return execute(["-c", 'source "$CD_DIR/ssh.sh"; cd_call "$@"', "test", ...args]);
+}
+
+test("validates wait bounds and rejects malformed arguments locally", () => {
+  for (const value of ["0", "121", "060", "900", "60 60"]) {
+    const result = call("wait", value);
+    assert.equal(result.status, 2, value);
+    assert.deepEqual(result.calls, []);
+  }
+  for (const value of ["1", "120"]) assert.equal(call("wait", value).status, 0);
+  assert.deepEqual(call("install", "01.0.0", "a".repeat(64)).calls, []);
+  assert.deepEqual(call("quiet", "601").calls, []);
+  assert.deepEqual(call("pause", "A").calls, []);
+});
+
+test("rejects malformed refusal replies and accepts the protocol reasons", () => {
+  for (const REFUSAL of [
+    "refused",
+    "paused",
+    "not-newer",
+    "no-space",
+    "install-running",
+    "no-previous",
+    "no-tarball",
+  ]) {
+    assert.equal(execute("selftest", { REFUSAL }).status, 0);
+  }
+  assert.equal(execute("selftest", { REFUSAL: "unknown-reason" }).status, 1);
 });

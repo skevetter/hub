@@ -10,7 +10,7 @@ logged() {
   result=$(cd_call "$@") || code=$?
   printf '%s %s\n' "$1" "$result" >&2
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    printf -- "- \`%s\`: \`%s\`\n" "$1" "$result" >> "$GITHUB_STEP_SUMMARY"
+    printf -- "- \`%s\`: \`%s\`\n" "$1" "$result" >> "$GITHUB_STEP_SUMMARY" || :
   fi
   printf '%s\n' "$result"
   return "$code"
@@ -18,7 +18,7 @@ logged() {
 
 external_smoke() {
   local health code url="${HUB_PUBLIC_URL%/}"
-  health=$(mktemp "$RUNNER_TEMP/hub-health.XXXXXXXX")
+  health=$(mktemp "$RUNNER_TEMP/hub-health.XXXXXXXX") || return 1
   code=$(curl --silent --proto '=https' --max-time 20 -o /dev/null -w '%{http_code}' "$url") &&
     [[ "$code" == 200 ]] &&
     code=$(curl --silent --proto '=https' --max-time 20 -o "$health" -w '%{http_code}' "$url/health") &&
@@ -29,30 +29,58 @@ external_smoke() {
 }
 
 wait_for_release() {
-  local result
-  result=$(logged wait 900) && jq -e '.state == "done"' <<< "$result" >/dev/null
+  local attempt code
+  for ((attempt=1; attempt<=15; attempt++)); do
+    code=0
+    logged wait 60 >/dev/null || code=$?
+    if [[ "$code" != 5 ]]; then return "$code"; fi
+  done
+  return 5
 }
 
-recover() {
+rollback_release() {
   local recovery to
-  if [[ "$MANUAL_DEPLOY" != true ]]; then
-    if recovery=$(logged rollback) && wait_for_release; then
-      if to=$(jq -er '.to' <<< "$recovery"); then
-        logged smoke "$to" >/dev/null && external_smoke || echo "Rollback smoke failed" >&2
-      else
-        echo "Rollback returned no version" >&2
-      fi
-    else
-      echo "Rollback did not complete" >&2
-    fi
+  if ! { recovery=$(logged rollback) && wait_for_release && to=$(jq -er '.to' <<< "$recovery"); }; then
+    echo "Rollback did not complete" >&2
+    return 1
   fi
-  logged pause "cd-failed-${DEPLOY_SHA:0:12}" >/dev/null || echo "Unable to pause deployment" >&2
+  smoke "$to" || echo "Rollback smoke failed" >&2
+}
+
+fail_deploy() {
+  if [[ "$1" == rollback && "$MANUAL_DEPLOY" != true ]]; then
+    rollback_release || :
+  fi
+  logged pause cd-failed >/dev/null || echo "Unable to pause deployment" >&2
   return 1
 }
 
+smoke() {
+  logged smoke "$1" >/dev/null && external_smoke
+}
+
+mark_deployed() {
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then printf 'deployed=true\n' >> "$GITHUB_OUTPUT"; fi
+}
+
+finish_install() {
+  local code=0
+  wait_for_release || code=$?
+  case "$code" in
+    0) ;;
+    3) fail_deploy rollback; return ;;
+    5) echo "Install still running after 15 polls" >&2; fail_deploy pause; return ;;
+    *) fail_deploy pause; return ;;
+  esac
+  smoke "$DEPLOY_VERSION" || { fail_deploy rollback; return; }
+  logged record "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null || { fail_deploy pause; return; }
+  mark_deployed || fail_deploy pause
+}
+
 validate_release() {
-  [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ && "$DEPLOY_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-  [[ "$DEPLOY_CHECKSUM" =~ ^[0-9a-f]{64}$ && "$HUB_PUBLIC_URL" == https://* ]]
+  cd_valid precheck "$DEPLOY_VERSION" "$DEPLOY_SHA" &&
+    cd_valid install "$DEPLOY_VERSION" "$DEPLOY_CHECKSUM" &&
+    [[ "$HUB_PUBLIC_URL" == https://* ]]
 }
 
 deploy() {
@@ -69,24 +97,30 @@ deploy() {
     [[ "$ancestry" == 0 ]]
     if [[ "$running" == "$DEPLOY_SHA" ]]; then
       echo "::notice::Release already recorded"
+      if [[ "$MANUAL_DEPLOY" == true ]]; then
+        if ! { smoke "$DEPLOY_VERSION" && mark_deployed; }; then
+          fail_deploy pause
+          return
+        fi
+      fi
       return 0
     fi
   fi
   logged precheck "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null
   logged quiet 600 >/dev/null
   logged backup "$DEPLOY_VERSION" >/dev/null
-  logged install "$DEPLOY_VERSION" "$DEPLOY_CHECKSUM" >/dev/null
-  wait_for_release
-  if logged smoke "$DEPLOY_VERSION" >/dev/null && external_smoke; then
-    logged record "$DEPLOY_VERSION" "$DEPLOY_SHA" >/dev/null
-  else
-    recover
-  fi
+  local code=0
+  logged install "$DEPLOY_VERSION" "$DEPLOY_CHECKSUM" >/dev/null || code=$?
+  case "$code" in
+    0) finish_install ;;
+    2) return 2 ;;
+    *) fail_deploy pause ;;
+  esac
 }
 
 probe() {
   local code=0
-  cd_call "$2" >/dev/null || code=$?
+  cd_selftest_probe "$1" >/dev/null || code=$?
   if [[ "$code" == 2 ]]; then
     printf 'PASS %s\n' "$1"
   else
@@ -96,11 +130,10 @@ probe() {
 }
 
 selftest() {
-  local failed=0 long
-  printf -v long '%0300d' 0
-  probe unknown-verb 'unknown' || failed=1
-  probe overlong "$long" || failed=1
-  probe older-version 'precheck 0.0.1 0000000000000000000000000000000000000000' || failed=1
+  local failed=0
+  probe unknown-verb || failed=1
+  probe overlong || failed=1
+  probe older-version || failed=1
   return "$failed"
 }
 
