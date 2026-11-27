@@ -184,6 +184,37 @@ test("builds a step list in the form, flags a stale condition, and saves it as w
     await triggers.switchToForm();
   });
 
+  await test.step("switching a step to Script and back keeps its output schema", async () => {
+    const schema = steps.step(1).getByLabel("Output schema (JSON)", { exact: true });
+    await steps.openConditions(1);
+    const before = await schema.inputValue();
+    await steps.chooseAction(1, "Script");
+    await expect(steps.step(1).getByLabel("Script", { exact: true })).toBeVisible();
+    await steps.chooseAction(1, "Prompt");
+    await steps.openConditions(1);
+    await expect(schema).toHaveValue(before);
+    await triggers.save("triage-chain");
+    await triggers.openTrigger("triage-chain");
+    await steps.edit(1);
+    await steps.openConditions(1);
+    expect(JSON.parse(await schema.inputValue())).toEqual(JSON.parse(SCHEMA));
+  });
+
+  await test.step("a script step saved with a kept schema writes no output schema", async () => {
+    await steps.setCondition(2, "");
+    await steps.chooseAction(1, "Script");
+    await steps.step(1).getByLabel("Script", { exact: true }).fill("npm run check");
+    await triggers.save("triage-chain");
+    await triggers.openTrigger("triage-chain");
+    await steps.edit(1);
+    await expect(steps.step(1).getByLabel("Script", { exact: true })).toHaveValue("npm run check");
+    await triggers.switchToYaml();
+    await expect(page.getByRole("textbox", { name: "Trigger YAML" })).not.toContainText("schema");
+    await page.getByRole("radio", { name: "Form" }).click();
+    await steps.chooseAction(1, "Prompt");
+    await steps.fillAgent(1, { agent: AGENT, mode: "full-access", prompt: "Review the request." });
+  });
+
   await test.step("a step is removed after confirming, and the last one cannot be", async () => {
     await steps.remove(3);
     await expect(steps.step(2).getByRole("button", { name: "Actions for step 2" })).toBeFocused();

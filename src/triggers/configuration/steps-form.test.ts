@@ -298,16 +298,52 @@ steps:
     ).toBe("1h");
   });
 
-  it("drops a script's output schema and the agent keys when the action changes", () => {
+  it("keeps the output schema in the form while a step is a script, and writes none for it", () => {
     const value = changeStepAction(form(STEPS), 0, "script");
-    expect(step(value, 0).outputSchema).toBe("");
+    expect(step(value, 0).outputSchema).toBe(step(form(STEPS), 0).outputSchema);
     expect(step(value, 0).agent).toBe("codex");
-    const yaml = patched(STEPS, withStep(value, 0, { script: "make" }));
+    const scripted = withStep(value, 0, { script: "make" });
+    expect(triggerFormErrors(scripted)).toEqual({});
+    const yaml = patched(STEPS, scripted);
     const [first] = parseTriggerDocument(yaml).steps ?? [];
     expect(first).toMatchObject({ id: "plan", script: "make", max_runtime: "10m" });
     for (const key of ["agent", "prompt", "env", "title", "output"]) {
       expect(first).not.toHaveProperty(key);
     }
+  });
+
+  it("restores a prompt step unchanged after a round trip through script", () => {
+    const original = form(STEPS);
+    const back = changeStepAction(changeStepAction(original, 0, "script"), 0, "prompt");
+    expect(step(back, 0)).toEqual(step(original, 0));
+    expect(patched(STEPS, back)).toBe(STEPS);
+    expect(JSON.parse(step(back, 0).outputSchema)).toMatchObject({
+      properties: { verdict: { enum: ["ok", "fix"] } },
+    });
+  });
+
+  it("restores a script step unchanged after a round trip through prompt", () => {
+    const original = form(STEPS);
+    const back = changeStepAction(changeStepAction(original, 1, "prompt"), 1, "script");
+    expect(step(back, 1)).toEqual(step(original, 1));
+    expect(patched(STEPS, back)).toBe(STEPS);
+  });
+
+  it("keeps a run's schema byte for byte through a round trip, and a script run stays a run", () => {
+    const withSchema = RUN.replace(
+      "  prompt: Review it.\n",
+      "  prompt: Review it.\n  output:\n    schema: { type: object }\n",
+    );
+    const original = form(withSchema);
+    const script = changeStepAction(original, 0, "script");
+    const back = changeStepAction(script, 0, "prompt");
+    expect(patched(withSchema, back)).toBe(withSchema);
+    const scripted = parseTriggerDocument(
+      patched(withSchema, withStep(script, 0, { script: "make" })),
+    );
+    expect(scripted.run).toMatchObject({ script: "make" });
+    expect(scripted.run).not.toHaveProperty("output");
+    expect(scripted.steps).toBeUndefined();
   });
 
   it("keeps a run's existing output schema on the run, and moves to steps for a new one", () => {

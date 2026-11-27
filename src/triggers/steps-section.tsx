@@ -328,8 +328,11 @@ function StepConditionFields(props: StepAgentProps) {
   const ifError = errors[ifKey] ?? stale;
   const schemaError = errors[schemaKey];
   const flagged = ifError !== undefined || schemaError !== undefined;
-  const [open, setOpen] = useFlaggedOpen(flagged, step.runIf !== "" || step.outputSchema !== "");
   const agent = step.action === "prompt";
+  const [open, setOpen] = useFlaggedOpen(
+    flagged,
+    step.runIf !== "" || (agent && step.outputSchema !== ""),
+  );
   return (
     <Disclosure
       id={stepFieldId("trigger-step-conditions", index)}
