@@ -399,7 +399,7 @@ export class OrganizationTriggers {
 
   async switchToForm() {
     await this.page.getByRole("radio", { name: "Form" }).click();
-    await expect(this.page.getByLabel("Agent", { exact: true })).toBeVisible();
+    await expect(this.page.getByLabel("Agent", { exact: true }).first()).toBeVisible();
   }
 
   async replaceYaml(yaml: string) {

@@ -84,7 +84,7 @@ async function fixture() {
       const row = rows.find(({ id }) => id === activityId);
       assert.ok(row);
       add({
-        ...activity(ids.busy, 0, "response", body),
+        ...activity({ id: ids.busy, second: 0, kind: "response", body }),
         createdAt: new Date(Date.parse(row.createdAt) + 1).toISOString(),
         signal: "continue",
       });
@@ -151,7 +151,7 @@ async function fixture() {
         turnId: expected.daemonTurnId,
         reason: "interrupt",
       });
-      add(activity(ids.stop, 9, "response", "Stopped."));
+      add(activity({ id: ids.stop, second: 9, kind: "response", body: "Stopped." }));
       turn = { ...expected, state: "complete", preceding: { activityId, kind: "stop" } };
       return "stopped";
     },
@@ -161,7 +161,7 @@ async function fixture() {
   }
   function prompt(second: number, body: string): SignedPilotPrompted {
     const id = fixturePromptId(second);
-    add(activity(id, second, "prompt", body));
+    add(activity({ id, second, kind: "prompt", body }));
     return {
       ...scope,
       action: "prompted",
@@ -179,7 +179,7 @@ async function fixture() {
       turnId: turn.daemonTurnId,
     });
     const { response } = fixtureActivityIds(scope.nativeSessionId, event.activityId);
-    add(activity(response, second, "response", `Completed ${event.body}`));
+    add(activity({ id: response, second, kind: "response", body: `Completed ${event.body}` }));
     turn = {
       ...turn,
       state: "complete",
@@ -255,12 +255,12 @@ describe("Linear pilot follow-up seams with local fakes", () => {
       activityId: fixturePromptId(8),
       signal: "stop",
       body: null,
-      createdAt: activity("stop-1", 8, "prompt", "").createdAt,
+      createdAt: activity({ id: "stop-1", second: 8, kind: "prompt", body: "" }).createdAt,
     };
     const staleStop = {
       ...stop,
       activityId: fixturePromptId(5),
-      createdAt: activity("delayed-stop", 5, "prompt", "").createdAt,
+      createdAt: activity({ id: "delayed-stop", second: 5, kind: "prompt", body: "" }).createdAt,
     };
     expect(await restarted(scope, staleStop)).toBe("ignored");
     const { createdAt: _createdAt, ...withoutTime } = stop;
@@ -330,7 +330,7 @@ describe("Linear pilot follow-up seams with local fakes", () => {
       activityId: fixturePromptId(4),
       signal: "stop",
       body: null,
-      createdAt: activity("stop", 4, "prompt", "").createdAt,
+      createdAt: activity({ id: "stop", second: 4, kind: "prompt", body: "" }).createdAt,
     };
     expect(await handle(scope, stop)).toBe("unconfirmed");
     expect(await f.handler()(scope, { ...stop, activityId: fixturePromptId(5) })).toBe("ignored");

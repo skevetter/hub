@@ -271,9 +271,9 @@ it("does not let an unpublished app candidate consume the active app's pending s
       .registrations()
       .find((registration) => registration.connection.name === "github")!;
     await stable.sources[0]!.start(async () => undefined);
-    const candidate = await owner.prepare(
-      "github",
-      {
+    const candidate = await owner.prepare({
+      provider: "github",
+      configuration: {
         provider: "github",
         appId: "84",
         appSlug: "other-app",
@@ -282,10 +282,10 @@ it("does not let an unpublished app candidate consume the active app's pending s
         privateKey: "unused",
         webhookSecret: "secret",
       },
-      "https://hub.test",
-      { provider: "github", id: "84", name: "Other", ownerLogin: "other" },
-      1,
-    );
+      callbackOrigin: "https://hub.test",
+      identity: { provider: "github", id: "84", name: "Other", ownerLogin: "other" },
+      configurationVersion: 1,
+    });
     try {
       await candidate.start();
     } finally {
